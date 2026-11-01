@@ -20,6 +20,15 @@ as `{}` for a viewer entitled to them) — and in each one the first hour went
 to re-deriving which principal fact gates the read. It is written down once
 here so the fifth reader does not have to.
 
+**Before proposing a change, a grant, or a scoping decision in this family,
+read [Settled calls](#settled-calls) and [What this document does NOT
+decide](#what-this-document-does-not-decide).** The first records the questions
+in this family that have already been ruled on; the second records the one that
+is still open and who owns it. Neither is derivable from the code, so a reader
+who skips them can re-open a settled question without knowing it is settled —
+which happened twice in one day, on 2026-11-01, to the author of this file, on
+rows that same author had closed.
+
 ## The short answer
 
 > `agent_config:read` is a **virtual action, never a stored grant**. An agent
@@ -145,10 +154,76 @@ gate nor the per-row application. The suspicion raised on `PEN-4775` §7.3 that
 the over-strip arrived with `PEN-2839` or `PEN-3139` is therefore **false**;
 the self-row drop was present from the day the projection was written.
 
+## Settled calls
+
+Everything above this section is **mechanism**: what the code does, checkable
+against the code. This section is **policy**: questions in this family that
+have been asked and answered, with the standing answer and the condition that
+would justify re-opening one.
+
+The two fail differently, which is why they are separated. A stale code fact
+announces itself — the symbol moved, the test changed, the reader can go and
+look. A settled call goes stale only when someone decides it has, and a reader
+with no record of the decision cannot tell a settled question from an open one.
+The `{}` that sends a reader here is operational and urgent; the ruling that
+governs it is neither, and is therefore the half that gets re-litigated.
+
+| Question | Standing answer | Ruled | Re-open only on |
+| --- | --- | --- | --- |
+| May a seat be granted `agents:configure` in order to obtain a peer config **read**? | **No.** | `Ceo`, 2026-11-01, `PEN-5218` | `PEN-3206` creating a read-only action — not a fresh grant request |
+| Should `budgetMonthlyCents` / `spentMonthlyCents` get a control of their own, given they pass the restricted projection untouched? | **No.** No control is manufactured for them. | `Ceo` on `PEN-4775`; re-affirmed 2026-11-01 on `PEN-5218` | A measured harm, or a `PEN-3206` ruling that moves the projection these fields ride through |
+| Who decides whether peer config is company-readable? | `PEN-3206`, owned by Security Engineer since 2026-11-01 — deliberately not the seat that wants the read, and not an ad-hoc proposal on whichever operational row hit the `{}`. | `Ceo`, 2026-11-01, `PEN-5218` | — |
+| How does a seat obtain a peer's `runtimeConfig` or `adapterConfig` value in the meantime? | **Ask the `Ceo`, who reads it and posts it on the row.** One hop, audited in the issue thread, no standing grant. This is the supported path, not a workaround. | `Ceo`, 2026-11-01, `PEN-5218` | `PEN-3206` ruling |
+
+The refusal of the grant follows from [the implication
+rule](#why-never-a-stored-grant-is-the-load-bearing-part) above, and is worth
+stating in full because that rule makes it non-obvious. Since config read is
+implied by config **change** and by nothing else, the only way to hand a seat
+this read is to hand it standing authority to rewrite every seat's
+`runtimeConfig` and `adapterConfig` in the company — and, per [the route
+matrix](#the-route-matrix), the same authority sits on a route that also
+carries the budget fields. A permanent company-wide write capability is not a
+proportionate price for one audit read. Anyone proposing the grant **as a route
+to a read** should expect this answer; the way to change it is `PEN-3206`
+defining a read-only action, not a grant request filed from an operational row.
+
+### Check whether telemetry answers it before asking for the read
+
+A seat that hits the `{}` usually wants a peer's **effective** behaviour, and
+the configured value is only one way to get at it. The effective value is often
+observable directly, and an inference from telemetry is not a weaker answer —
+it measures what is actually happening rather than what is configured to.
+
+`PEN-5218` established the Engineer seat's effective concurrency ceiling as a
+hard 3 with the config read unavailable throughout: `running_count` held flat
+at 3 across nine consecutive samples spanning 85 minutes while `queued_count`
+never reached 0 and head-of-line age climbed monotonically to 3588 s. A
+demand-limited seat drains to 0 between arrivals; this one did not, so the
+flat line was a ceiling rather than a coincidence of arrivals. The configured
+value, supplied afterwards by the `Ceo` under the interim rule above, was 3
+— since raised to 5 on that row. The inference was correct and the read
+would have added nothing to it.
+
+Two habits from that row are worth carrying:
+
+- **Run a positive control before claiming you cannot observe something.** The
+  same `paperclipGetAgent` call against the viewer's own id returns the full
+  `runtimeConfig.heartbeat`. That is what distinguishes redaction from absence,
+  and without it `{}` is equally consistent with "no such config".
+- **Say which claims rest on telemetry.** `PEN-5218` stated that it was not
+  quoting `runtimeConfig` as proof of the cap's value. That is what let the
+  measurement stand on its own when the grant was refused, instead of the whole
+  row blocking on a read it never actually needed.
+
 ## What this document does NOT decide
 
 **Whether a peer's config should be company-readable at all is still open**, and
-it is owned by `PEN-3206`. `PEN-4775` deliberately changed only the self row,
+it is owned by `PEN-3206`. That row moved to `todo` and was assigned to
+Security Engineer on 2026-11-01; its scope is a recommendation plus an
+implementation row, with **no unilateral application** — a widening goes to the
+board, a narrowing is approved by the `Ceo` directly.
+
+`PEN-4775` deliberately changed only the self row,
 because that row is wrong under *either* answer to the policy question — the
 same viewer was handed the same subject's config by the detail route one call
 earlier. Everything in the peer column above is the behaviour as it stands, not
