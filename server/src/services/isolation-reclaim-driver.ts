@@ -15,6 +15,7 @@ import {
 } from "./isolation-reclaim-runner.js";
 import {
   DEFAULT_MAX_DELETES_PER_TICK,
+  MAX_FOREIGN_PLAN_AGE_MS,
   type IsolationReclaimExecutionResult,
   type IsolationReclaimPlan,
   type ReclaimableClaim,
@@ -74,6 +75,29 @@ import {
  * to grant, rather than leaving the executor to its in-process default. An
  * explicit `maxPlanAgeMs` from the caller still wins; it is the *absence* that
  * now resolves to something coherent instead of to 10 minutes.
+ *
+ * ## …but the derivation is CLAMPED, and the residual gap is deliberate
+ *
+ * The derivation reads `activeDeadlineSeconds`, and the executor's own
+ * rationale says that value "does NOT cover this and must not be mistaken for
+ * it". That warning binds here: `activeDeadlineSeconds` is a **liveness** knob
+ * and a public option on this driver, so an unclamped derivation would let an
+ * operator who raised it for a slow MDS silently widen the window in which a
+ * resurrected workspace can still be unlinked — a liveness setting becoming a
+ * fail-open safety setting. `MAX_FOREIGN_PLAN_AGE_MS` (15 min) holds the
+ * derived bound constant under that knob; see its own docblock for why 15.
+ *
+ * That leaves a real residual: the startup grace is 10 minutes and the ceiling
+ * is 15, so a pod that consumes the entire grace before starting has only ~5
+ * minutes of plan life left for the unlink loop, and long loops will still
+ * refuse entries as `plan_stale`. This is **bounded and visible** rather than
+ * fail-open, which is the trade taken deliberately — a refusal retains a
+ * directory, and the opposite error deletes a live one.
+ *
+ * The eventual shape, recorded rather than built here: bound the *wait* by the
+ * plan's life instead of the plan's life by the wait — give up on a pod that
+ * has not started inside the plan's window and re-inventory next tick, rather
+ * than waiting 25 minutes for one that can no longer act.
  *
  * In the other direction, nothing here loops. A failed `execute` is **not**
  * re-issued, and the reason is specific rather than general caution: the plan
@@ -399,11 +423,22 @@ export async function driveIsolationReclaim(
     // read off the manifest the builder actually emitted, so a template that
     // overrides `activeDeadlineSeconds` moves the deadline and the plan's
     // lifetime together instead of letting them drift. Both calls are pure.
+    // Clamped, not just derived. `reclaimWaitBudgetMs` reads
+    // `activeDeadlineSeconds` -- a LIVENESS knob, public on this driver -- and
+    // the executor's own rationale says that value "must not be mistaken for"
+    // the plan-age bound. Unclamped, an operator raising the deadline to give a
+    // slow MDS more time would silently widen the resurrection window too.
+    // `MAX_FOREIGN_PLAN_AGE_MS` keeps the derived bound constant under that
+    // knob. An explicit caller value is NOT clamped: that parameter is the
+    // safety knob itself, named as such.
     const resolvedMaxPlanAgeMs =
       maxPlanAgeMs ??
-      reclaimWaitBudgetMs(
-        buildIsolationReclaimJobManifest(executeSpec(undefined)),
-        startupGraceMs ?? DEFAULT_RECLAIM_STARTUP_GRACE_MS,
+      Math.min(
+        reclaimWaitBudgetMs(
+          buildIsolationReclaimJobManifest(executeSpec(undefined)),
+          startupGraceMs ?? DEFAULT_RECLAIM_STARTUP_GRACE_MS,
+        ),
+        MAX_FOREIGN_PLAN_AGE_MS,
       );
 
     executeManifest = buildIsolationReclaimJobManifest(executeSpec(resolvedMaxPlanAgeMs));
