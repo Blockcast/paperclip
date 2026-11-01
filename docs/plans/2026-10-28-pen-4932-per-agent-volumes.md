@@ -1847,7 +1847,7 @@ opted in to the `dataClaimName` swap — which, as of 2026-10-31, is itself merg
 |---|---|
 | 1 — two agent pods on one node report **distinct** volume IDs | **UNMET, and no longer blocked — the gate is now turnable-on and unproven, which is a different state from blocked.** The swap LANDED 2026-10-31 behind the default-off `enablePerAgentWorkspaceVolume` gate (§4 stage 4b), and invariant 5's collector landed the same day, so enabling it no longer empties the run's stdout by construction. Nothing has yet run on it, and the toggle's own hint says so. The last fleet read still shows one handle, `csi-vol-3bdd0e68-1704-4f81-b3d8-55920cabf82c`, which is the correct reading of a gate nothing has opted into. After invariant 5: the server rolled onto that commit, ≥2 agents opted in through `adapter_config`, and a `findmnt` read from inside two live pods **co-located on one node**. Do not record this as met off a merge. **Re-checked 2026-11-01: the server HAS rolled onto that commit (`deployed_commit=2ebaa3cf`, ahead 51 / behind 0 of `90b558e`), and the adapter RBAC is in place (`paperclip-k8s-adapters` carries `persistentvolumeclaims: create,delete,get` and `pods/log: get`). Two things now stand in the way, neither of them the swap.** ⛔ **No agent seat can opt an agent in**: `PATCH /agents/<peer>` returns `403 Missing permission: agents:configure or agents:suggest-changes` (`deny_no_grant`), and `agents:suggest-changes` is granted to the `reflection-coach` built-in, not to ordinary agents — so this step belongs to a principal holding `agents:configure`. A **self**-`PATCH` does succeed, and is the wrong route: see invariant 6, which makes the CTO seat the worst possible first opt-in. No `agent-workspace-*` claim exists yet, which is the correct reading of a gate nothing has opted into. |
 | 2 — the fleet-wide tooling row is a separate read-only claim **or** baked into the image, with the choice recorded | **MET on `master`, NOT YET OBSERVABLE in the fleet.** Choice: **baked into the image**, reasoned in §3.3-§3.6. |
-| 3 — recurrence re-measured against the 3-wedges-in-30h baseline, caveats stated | not started, and **it cannot be done before 1** — the measurement is of the swap's effect, and a gate nobody has opted into produces no effect to measure. Note the two caveats §4.1 attaches to the baseline survive into the re-measure and must be stated rather than glossed: Prometheus retains ~7 days, not 30, and counter resets on the agent-heavy nodes hide history. |
+| 3 — recurrence re-measured against the 3-wedges-in-30h baseline, caveats stated | **pre-change point taken 2026-11-01 (§5.1); still UNMET, and the MET state cannot be reached before 1** — the measurement that MATTERS is of the swap's effect, and a gate nobody has opted into produces no effect to measure. What *can* be done before 1, and now has been, is pinning the status-quo end of the comparison while the retention window still covers it: see §5.1. The two caveats §4.1 attaches to the baseline survive into the re-measure and are stated there rather than glossed — Prometheus retains ~7 days, not 30 (confirmed empirically in §5.1, not assumed), and counter resets on the agent-heavy nodes hide history. |
 | 4 — this §5 acceptance table updated to reflect 1 being met | blocked on 1, by construction. This row is the one that must NOT be ticked on the strength of the swap landing. |
 
 **Done-when 2, measured rather than asserted.** Six of the issue's seven fleet-wide paths are now
@@ -1882,6 +1882,55 @@ pods on one node reporting distinct volume IDs* — is the `dataClaimName` swap 
 still downstream of invariants 3 and 4. Every agent pod continues to mount `paperclip-data`, so
 ceph-csi lock exposure is unchanged from the day this issue opened. The work so far is
 prerequisite removal, and should not be read as partial delivery of the criterion.
+
+### 5.1 Recurrence, status-quo end of the comparison (measured 2026-11-01)
+
+Done-when 3 compares post-change recurrence against the 3-wedges-in-30h baseline. The post-change
+half is blocked on done-when 1, but the **status-quo** half is not, and it decays: Prometheus
+retains ~7 days, so a status-quo read taken after the swap is enabled is no longer a read of the
+status quo. Taken now, on all 21 nodes, with `rbd_wedge_exporter_up == 1` on 21/21:
+
+| signal | 7d result | September baseline |
+|---|---|---|
+| `Aborted` on cephfs `NodeUnstageVolume` | **0** | 3 wedges / 30h |
+| `DeadlineExceeded` on cephfs `NodeUnstageVolume` | **0** | — |
+| max `rbd_wedge_csi_op_age_seconds{op="unmount"}` fleet-wide | **119.5 s** (`k8s-paperclip-6`); next 63.3 s (`k8s-paperclip-3`) | 30h26m |
+| `rbd_wedge_csi_op_inflight{op="unmount"}` peak | 1–5 per node | — |
+| `rbd_wedge_process_uninterruptible_by_comm{comm="umount"}` | **non-zero on 16 of 21 nodes** | non-zero on every paperclip node |
+
+⛔ **D-state `umount` presence is a routine condition, not a wedge indicator.** It is non-zero on
+16 of 21 nodes across a week in which nothing wedged. PEN-3199 cited this signal when rejecting
+direction (b); that rejection is unaffected, because it rests on the `internal/util/idlocker.go`
+source reading (no TTL, no reaper, `Release` only on handler return). But the metric cannot serve
+as a wedge *detector* — a rule keyed on its presence fires continuously on three quarters of the
+fleet.
+
+**The discriminator is the unmount AGE, and the tell is PERSISTENCE rather than magnitude.**
+Sampled as instants at a 6h step across the whole retained window,
+`max(rbd_wedge_csi_op_age_seconds{op="unmount"})` reads 0 at every step but one (a single 0.1),
+while `max_over_time[7d]` over the same window catches spikes to 119.5 s: these events are shorter
+than the gap between coarse samples. A genuine wedge is the opposite — September's held 30h26m and
+would appear as a ramp across ~5 consecutive 6h samples, visible at any step. So `max_over_time`
+finding spikes while a coarse-step range query reads flat zero is the signature of *transient*
+unmounts. Run both and compare them; neither alone answers the question.
+
+Caveats, stated rather than glossed:
+
+- **Retention is ~6.9 days, confirmed rather than assumed.** A range query starting
+  2026-10-22T00:00Z returned its first sample only at ~2026-10-25T12:00Z. Nothing here speaks to
+  anything older, and the September incident is far outside the window.
+- **Counter resets** still apply to the `csi_operations_seconds_count` row; the `rbd_wedge_*`
+  gauges are not subject to that caveat, which is part of why the supply-side read is the more
+  trustworthy of the two.
+- **The zeros are real absence, not missing data** — `rbd_wedge_exporter_up == 1` on 21/21. The
+  2026-10-28 demand-side read could not distinguish those two; this one can.
+- **Nothing has changed yet.** The gate is off and no `agent-workspace-*` claim exists, so §4.1's
+  "the improvement is unexplained and therefore unreliable" reasoning is untouched by this read.
+
+This is a **supply-side** read — it observes a hung unmount whether or not anything is trying to
+mount — so it does not carry the demand-driven coverage ceiling the 2026-10-28 `Aborted`-only read
+did. That closes the gap in the **measurement** only; the shipped `PaperclipAgentPodsCannotStart`
+detector is demand-driven and its alerting ceiling is unchanged. See §6.
 
 Both questions this document originally raised are **resolved**, and neither needed a preference
 call in the end — each turned out to have a measurable answer:
@@ -1940,3 +1989,10 @@ over time.
 
 Alerting on `rbd_wedge_csi_op_age_seconds{op="unmount"}` — PEN-4932 separates it deliberately; it
 belongs in `deploy/observability/prometheusrule.yaml` in `penstock-llm-proxy-core`.
+
+Still out of scope, but §5.1 now supplies the design that rule was missing, so whoever writes it
+need not re-derive it: **key it on the unmount AGE with a threshold above ~5 min, never on D-state
+presence.** D-state `umount` is non-zero on 16 of 21 nodes in a quiet week, so a presence-keyed
+rule is a permanent false positive; an age-keyed rule at that threshold is silent across the same
+7 days and would have fired for 30h in September. Being supply-side, it also closes the
+demand-driven coverage ceiling that `PaperclipAgentPodsCannotStart` cannot.
