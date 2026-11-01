@@ -10,7 +10,14 @@ import type {
   ReclaimClaimTemplate,
 } from "../services/isolation-reclaim-driver.js";
 import type { ReclaimJobPort, ReclaimRunOutcome } from "../services/isolation-reclaim-runner.js";
-import { DEFAULT_MAX_DELETES_PER_TICK } from "../services/isolation-workspace-reaper.js";
+import {
+  DEFAULT_RECLAIM_STARTUP_GRACE_MS,
+  reclaimWaitBudgetMs,
+} from "../services/isolation-reclaim-runner.js";
+import {
+  DEFAULT_MAX_DELETES_PER_TICK,
+  DEFAULT_MAX_PLAN_AGE_MS,
+} from "../services/isolation-workspace-reaper.js";
 import type {
   IsolationReclaimExecutionResult,
   ReclaimableClaim,
@@ -461,6 +468,69 @@ describe("driveIsolationReclaim", () => {
     // Stamping AFTER the read would describe the snapshot as newer than it is,
     // which is the fail-open direction: the plan outlives the evidence.
     expect(stamped).toBeLessThanOrEqual(observed[0]!);
+  });
+
+  // --- the plan must outlive the wait -------------------------------------
+  //
+  // The executor re-checks the plan's age per entry against a control-plane
+  // stamp, and its own default is 10 minutes. This driver waits startup grace
+  // (10 min) + activeDeadlineSeconds (15 min) = 25 min. Left to the default,
+  // an execute Job is handed a plan that expires well inside the wait, and the
+  // whole tick comes back `notAttempted`/`plan_stale` while REPORTING SUCCESS.
+
+  it("gives the execute Job a plan lifetime covering the wait it is willing to grant", async () => {
+    const { runJob, calls } = scriptedRun({
+      inventory: (m) => ranOk(m, inventoryReport([IDLE_A], NOW - 30 * DAY)),
+      execute: (m) => ranOk(m, { v: 1, kind: "execute", ok: true, result: executionResult() }),
+    });
+
+    await drive({ runJob });
+
+    const executeManifest = calls[1]!.manifest;
+    const budget = reclaimWaitBudgetMs(executeManifest, DEFAULT_RECLAIM_STARTUP_GRACE_MS);
+    // Derived from the manifest actually emitted, not restated: a template that
+    // overrides activeDeadlineSeconds must move both together.
+    expect(planEnvOf(executeManifest).maxPlanAgeMs).toBe(budget);
+    // The point of the fix: strictly longer than what the executor would have
+    // defaulted to on its own.
+    expect(budget).toBeGreaterThan(DEFAULT_MAX_PLAN_AGE_MS);
+  });
+
+  it("derives that lifetime from the actual startup grace, not from a constant", async () => {
+    const { runJob, calls } = scriptedRun({
+      inventory: (m) => ranOk(m, inventoryReport([IDLE_A], NOW - 30 * DAY)),
+      execute: (m) => ranOk(m, { v: 1, kind: "execute", ok: true, result: executionResult() }),
+    });
+
+    const startupGraceMs = DEFAULT_RECLAIM_STARTUP_GRACE_MS + 5 * 60_000;
+    await drive({ runJob, startupGraceMs });
+
+    const executeManifest = calls[1]!.manifest;
+    expect(planEnvOf(executeManifest).maxPlanAgeMs).toBe(
+      reclaimWaitBudgetMs(executeManifest, startupGraceMs),
+    );
+    // A driver willing to wait longer must hand over a plan that lives longer;
+    // pinning the delta proves the grace is read rather than ignored.
+    expect(planEnvOf(executeManifest).maxPlanAgeMs).toBe(
+      reclaimWaitBudgetMs(executeManifest, DEFAULT_RECLAIM_STARTUP_GRACE_MS) + 5 * 60_000,
+    );
+  });
+
+  it("lets an explicit caller value win over the derived one", async () => {
+    const { runJob, calls } = scriptedRun({
+      inventory: (m) => ranOk(m, inventoryReport([IDLE_A], NOW - 30 * DAY)),
+      execute: (m) => ranOk(m, { v: 1, kind: "execute", ok: true, result: executionResult() }),
+    });
+
+    const maxPlanAgeMs = 90 * 60_000;
+    await drive({ runJob, maxPlanAgeMs });
+
+    const executeManifest = calls[1]!.manifest;
+    expect(planEnvOf(executeManifest).maxPlanAgeMs).toBe(maxPlanAgeMs);
+    // Guards the override against being silently replaced by the derivation.
+    expect(maxPlanAgeMs).not.toBe(
+      reclaimWaitBudgetMs(executeManifest, DEFAULT_RECLAIM_STARTUP_GRACE_MS),
+    );
   });
 
   it("gives the two phases distinct Job names under one invocation id", async () => {

@@ -7,8 +7,10 @@ import {
   buildIsolationReclaimJobManifest,
 } from "./isolation-reclaim-job.js";
 import {
+  DEFAULT_RECLAIM_STARTUP_GRACE_MS,
   type ReclaimJobPort,
   type ReclaimRunOutcome,
+  reclaimWaitBudgetMs,
   runIsolationReclaimJob,
 } from "./isolation-reclaim-runner.js";
 import {
@@ -36,10 +38,42 @@ import {
  *
  * ## The sequence is one tick, and it never retries itself
  *
- * A plan is only valid for `DEFAULT_MAX_PLAN_AGE_MS` (10 minutes), so the
- * inventory and the execute that acts on it have to be the same tick — a daily
- * cadence that inventoried on one tick and executed on the next would hand the
- * executor a plan a day stale, and it would refuse every entry.
+ * A plan has a bounded lifetime, so the inventory and the execute that acts on
+ * it have to be the same tick — a daily cadence that inventoried on one tick
+ * and executed on the next would hand the executor a plan a day stale, and it
+ * would refuse every entry.
+ *
+ * ## The plan must outlive the wait, and the executor's default does not
+ *
+ * Same tick is necessary and **not sufficient**. `executeIsolationReclaimPlan`
+ * re-checks the plan's age *per entry inside the unlink loop*, against a
+ * `planBuiltAtMs` stamped here on the control plane; with no database the
+ * executor cannot re-read `lastUsedAt`, so that bound is its entire safety
+ * margin. Its default, `DEFAULT_MAX_PLAN_AGE_MS`, is 10 minutes — sound for an
+ * in-process caller that builds and spends a plan in one breath, and unsound
+ * across a Job. The numbers settle it without estimating:
+ *
+ * - `DEFAULT_RECLAIM_STARTUP_GRACE_MS` is **10 minutes**, and it exists
+ *   precisely because admission, scheduling and the image pull all happen
+ *   *before* `activeDeadlineSeconds` starts counting from pod start.
+ * - `DEFAULT_RECLAIM_ACTIVE_DEADLINE_SECONDS` adds **15 minutes** once it does.
+ *
+ * So this driver waits up to `reclaimWaitBudgetMs` = **25 minutes** for an
+ * execute Job carrying a plan that expired after 10. A pod that takes longer
+ * than the grace to start is handed a plan **stale on arrival**; even one that
+ * starts instantly goes stale mid-loop, since 10 minutes is not long to
+ * recursively unlink up to `DEFAULT_MAX_DELETES_PER_TICK` (200) trees on an
+ * MDS-metadata-bound filesystem.
+ *
+ * **The failure is quiet in the worst direction**: the Job succeeds, the report
+ * parses, every id comes back `notAttempted` with `stopReason: "plan_stale"`,
+ * and the tick records a clean pass that reclaimed nothing — which is exactly
+ * the number the ≈3.7-month ceiling PEN-5125 accepted is tracked by.
+ *
+ * So the driver derives the plan's lifetime from the wait it is itself willing
+ * to grant, rather than leaving the executor to its in-process default. An
+ * explicit `maxPlanAgeMs` from the caller still wins; it is the *absence* that
+ * now resolves to something coherent instead of to 10 minutes.
  *
  * In the other direction, nothing here loops. A failed `execute` is **not**
  * re-issued, and the reason is specific rather than general caution: the plan
@@ -350,15 +384,29 @@ export async function driveIsolationReclaim(
   base.phase = "execute";
   let executeManifest: IsolationReclaimJobManifest;
   try {
-    executeManifest = buildIsolationReclaimJobManifest(
+    const executeSpec = (planAgeMs: number | undefined): IsolationReclaimJobSpec =>
       jobSpec("execute", {
         planBuiltAtMs,
         eligibleIds: plan.eligibleIds,
         maxDeletes,
-        ...(maxPlanAgeMs === undefined ? {} : { maxPlanAgeMs }),
+        ...(planAgeMs === undefined ? {} : { maxPlanAgeMs: planAgeMs }),
         ...(dryRun ? { dryRun: true } : {}),
-      }),
-    );
+      });
+
+    // The plan's lifetime has to cover the wait THIS driver is willing to
+    // grant, not the executor's in-process default -- see the header section
+    // "The plan must outlive the wait". Built twice on purpose: the budget is
+    // read off the manifest the builder actually emitted, so a template that
+    // overrides `activeDeadlineSeconds` moves the deadline and the plan's
+    // lifetime together instead of letting them drift. Both calls are pure.
+    const resolvedMaxPlanAgeMs =
+      maxPlanAgeMs ??
+      reclaimWaitBudgetMs(
+        buildIsolationReclaimJobManifest(executeSpec(undefined)),
+        startupGraceMs ?? DEFAULT_RECLAIM_STARTUP_GRACE_MS,
+      );
+
+    executeManifest = buildIsolationReclaimJobManifest(executeSpec(resolvedMaxPlanAgeMs));
   } catch (error) {
     // Refused before any Job existed, so the outcome is a known zero.
     return { ...base, failureKind: "execute_manifest_refused", detail: messageOf(error) };
