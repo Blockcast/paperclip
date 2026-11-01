@@ -8,7 +8,9 @@ import type { PaperclipSkillEntry } from "@paperclipai/adapter-utils/server-util
 
 import {
   PROMPT_BUNDLE_ESCALATION_RATIO,
+  PROMPT_BUNDLE_INSTRUCTIONS_DIR,
   PROMPT_BUNDLE_INSTRUCTIONS_PATH,
+  PROMPT_BUNDLE_MAX_INSTRUCTION_SIBLINGS,
   PROMPT_BUNDLE_SECRET_MAX_BYTES,
   PROMPT_BUNDLE_SKILLS_DIR,
   PromptBundleOverBudgetError,
@@ -17,6 +19,7 @@ import {
   PromptBundleTooManyDirsError,
   PromptBundleTooManyFilesError,
   buildPromptBundleSecretProjection,
+  resolveNamedInstructionSiblings,
   skillSourceNeedsProjection,
 } from "./prompt-bundle-projection.js";
 
@@ -631,5 +634,221 @@ describe("buildPromptBundleSecretProjection", () => {
 
   it("defaults the budget to the Kubernetes MaxSecretSize", () => {
     expect(PROMPT_BUNDLE_SECRET_MAX_BYTES).toBe(1024 * 1024);
+  });
+});
+
+describe("resolveNamedInstructionSiblings — invariant 6 (PEN-5183)", () => {
+  /** Writes an instructions root and returns `{ root, entry }`. */
+  async function writeCharter(files: Record<string, string>): Promise<{ root: string; entry: string }> {
+    const root = path.join(tmpRoot, "agents", "cto");
+    await fs.mkdir(root, { recursive: true });
+    for (const [rel, contents] of Object.entries(files)) {
+      const abs = path.join(root, rel);
+      await fs.mkdir(path.dirname(abs), { recursive: true });
+      await fs.writeFile(abs, contents, "utf-8");
+    }
+    return { root, entry: path.join(root, "AGENTS.md") };
+  }
+
+  it("resolves the three forms a charter uses to name a sibling", async () => {
+    const { root, entry: entryPath } = await writeCharter({
+      "AGENTS.md": [
+        "- `$AGENT_HOME/HEARTBEAT.md` -- execution checklist.",
+        "- read ./SOUL.md for who you are",
+        "- TOOLS.md lists your tools",
+      ].join("\n"),
+      "HEARTBEAT.md": "checklist",
+      "SOUL.md": "persona",
+      "TOOLS.md": "tools",
+    });
+    await expect(
+      resolveNamedInstructionSiblings({
+        entryContents: await fs.readFile(entryPath, "utf-8"),
+        instructionsRootPath: root,
+        instructionsFilePath: entryPath,
+      }),
+    ).resolves.toEqual(["HEARTBEAT.md", "SOUL.md", "TOOLS.md"]);
+  });
+
+  it("does NOT project an unnamed file sitting beside the charter", async () => {
+    // The defect this whole function exists for. The tree is agent-writable, so a
+    // listing-based set is a function of the agent's editor hygiene rather than of its
+    // charter — measured at 1.9 MB against a 1 MiB cap on the live CTO tree.
+    const { root, entry: entryPath } = await writeCharter({
+      "AGENTS.md": "read ./HEARTBEAT.md",
+      "HEARTBEAT.md": "checklist",
+      // Not dot-prefixed, and that is the point: two live snapshots were written this
+      // way, so "skip dotfiles" would have admitted both.
+      "HEARTBEAT.md.bak-20261101T073910Z": "x".repeat(4096),
+      "HEARTBEAT-CASELAW.md": "y".repeat(4096),
+    });
+    await expect(
+      resolveNamedInstructionSiblings({
+        entryContents: await fs.readFile(entryPath, "utf-8"),
+        instructionsRootPath: root,
+        instructionsFilePath: entryPath,
+      }),
+    ).resolves.toEqual(["HEARTBEAT.md"]);
+  });
+
+  it("does not follow a transitive reference", async () => {
+    // One level, deliberately: HEARTBEAT.md names the 674 KB caselaw, and following that
+    // edge re-admits exactly the payload the declared set rules out.
+    const { root, entry: entryPath } = await writeCharter({
+      "AGENTS.md": "read ./HEARTBEAT.md",
+      "HEARTBEAT.md": "see ./HEARTBEAT-CASELAW.md for the evidence",
+      "HEARTBEAT-CASELAW.md": "evidence",
+    });
+    await expect(
+      resolveNamedInstructionSiblings({
+        entryContents: await fs.readFile(entryPath, "utf-8"),
+        instructionsRootPath: root,
+        instructionsFilePath: entryPath,
+      }),
+    ).resolves.toEqual(["HEARTBEAT.md"]);
+  });
+
+  it("drops a named file that does not exist, rather than projecting a missing key", async () => {
+    // An `items[]` entry whose key has no Secret value is a pod that cannot start, so a
+    // named-but-absent file must be silent here — the same ENOENT today's shared-claim
+    // path already shows.
+    const { root, entry: entryPath } = await writeCharter({
+      "AGENTS.md": "read ./HEARTBEAT.md and docs/architecture-template.md",
+      "HEARTBEAT.md": "checklist",
+    });
+    await expect(
+      resolveNamedInstructionSiblings({
+        entryContents: await fs.readFile(entryPath, "utf-8"),
+        instructionsRootPath: root,
+        instructionsFilePath: entryPath,
+      }),
+    ).resolves.toEqual(["HEARTBEAT.md"]);
+  });
+
+  it("refuses a reference that escapes the instructions root", async () => {
+    const { root, entry: entryPath } = await writeCharter({
+      "AGENTS.md": "read ../devops/HEARTBEAT.md",
+      "HEARTBEAT.md": "mine",
+    });
+    await fs.mkdir(path.join(tmpRoot, "agents", "devops"), { recursive: true });
+    await fs.writeFile(path.join(tmpRoot, "agents", "devops", "HEARTBEAT.md"), "theirs", "utf-8");
+    const resolved = await resolveNamedInstructionSiblings({
+      entryContents: await fs.readFile(entryPath, "utf-8"),
+      instructionsRootPath: root,
+      instructionsFilePath: entryPath,
+    });
+    expect(resolved).not.toContain("../devops/HEARTBEAT.md");
+    expect(resolved.every((rel) => !rel.includes(".."))).toBe(true);
+  });
+
+  it("never projects the entry file as its own sibling", async () => {
+    const { root, entry: entryPath } = await writeCharter({
+      "AGENTS.md": "this file is AGENTS.md; also read ./SOUL.md",
+      "SOUL.md": "persona",
+    });
+    await expect(
+      resolveNamedInstructionSiblings({
+        entryContents: await fs.readFile(entryPath, "utf-8"),
+        instructionsRootPath: root,
+        instructionsFilePath: entryPath,
+      }),
+    ).resolves.toEqual(["SOUL.md"]);
+  });
+
+  it("refuses rather than truncating past the sibling ceiling", async () => {
+    const names = Array.from({ length: PROMPT_BUNDLE_MAX_INSTRUCTION_SIBLINGS + 1 }, (_, i) => `doc${i}.md`);
+    const files: Record<string, string> = { "AGENTS.md": names.map((n) => `read ./${n}`).join("\n") };
+    for (const n of names) files[n] = "x";
+    const { root, entry: entryPath } = await writeCharter(files);
+    await expect(
+      resolveNamedInstructionSiblings({
+        entryContents: await fs.readFile(entryPath, "utf-8"),
+        instructionsRootPath: root,
+        instructionsFilePath: entryPath,
+      }),
+    ).rejects.toBeInstanceOf(PromptBundleTooManyFilesError);
+  });
+});
+
+describe("buildPromptBundleSecretProjection — instruction siblings (PEN-5183)", () => {
+  async function charter(): Promise<{ root: string; entry: string; contents: string }> {
+    const root = path.join(tmpRoot, "agents", "cto");
+    await fs.mkdir(root, { recursive: true });
+    const contents = "- `$AGENT_HOME/HEARTBEAT.md`\n- `$AGENT_HOME/SOUL.md`\n";
+    await fs.writeFile(path.join(root, "AGENTS.md"), contents, "utf-8");
+    await fs.writeFile(path.join(root, "HEARTBEAT.md"), "checklist", "utf-8");
+    await fs.writeFile(path.join(root, "SOUL.md"), "persona", "utf-8");
+    return { root, entry: path.join(root, "AGENTS.md"), contents };
+  }
+
+  it("carries the named siblings beside the entry file", async () => {
+    const { root, entry: entryPath, contents } = await charter();
+    const projection = await buildPromptBundleSecretProjection({
+      companyId: "co",
+      runLabel: "run",
+      skills: [],
+      instructionsContents: contents,
+      instructionsRootPath: root,
+      instructionsFilePath: entryPath,
+    });
+    expect(projection!.items.map((i) => i.path)).toEqual([
+      PROMPT_BUNDLE_INSTRUCTIONS_PATH,
+      `${PROMPT_BUNDLE_INSTRUCTIONS_DIR}/HEARTBEAT.md`,
+      `${PROMPT_BUNDLE_INSTRUCTIONS_DIR}/SOUL.md`,
+    ]);
+    const key = projection!.items.find((i) => i.path.endsWith("HEARTBEAT.md"))!.key;
+    expect(valueBytes(projection!, key).toString("utf8")).toBe("checklist");
+  });
+
+  it("NEGATIVE CONTROL: omitting the root carries the entry file alone, exactly as before", async () => {
+    // The pre-PEN-5183 projection, byte-for-byte. This is the shape the measurement
+    // branch still takes, and the shape every caller with no root to offer keeps.
+    const { contents } = await charter();
+    const projection = await buildPromptBundleSecretProjection({
+      companyId: "co",
+      runLabel: "run",
+      skills: [],
+      instructionsContents: contents,
+    });
+    expect(projection!.items).toEqual([{ key: "bundle-0", path: PROMPT_BUNDLE_INSTRUCTIONS_PATH }]);
+    expect(projection!.fileCount).toBe(1);
+  });
+
+  it("counts sibling bytes against the budget", async () => {
+    const { root, entry: entryPath, contents } = await charter();
+    const withSiblings = await buildPromptBundleSecretProjection({
+      companyId: "co",
+      runLabel: "run",
+      skills: [],
+      instructionsContents: contents,
+      instructionsRootPath: root,
+      instructionsFilePath: entryPath,
+    });
+    const without = await buildPromptBundleSecretProjection({
+      companyId: "co",
+      runLabel: "run",
+      skills: [],
+      instructionsContents: contents,
+    });
+    // "checklist" (9) + "persona" (7). The budget and the §4.2 escalation trigger are
+    // both evaluated on `totalValueBytes`, so siblings must land in it or the trigger
+    // under-reports exactly the payload this change adds.
+    expect(withSiblings!.totalValueBytes).toBe(without!.totalValueBytes + 16);
+  });
+
+  it("refuses rather than truncating when a sibling pushes the run over budget", async () => {
+    const { root, entry: entryPath, contents } = await charter();
+    await fs.writeFile(path.join(root, "HEARTBEAT.md"), "x".repeat(4096), "utf-8");
+    await expect(
+      buildPromptBundleSecretProjection({
+        companyId: "co",
+        runLabel: "run",
+        skills: [],
+        instructionsContents: contents,
+        instructionsRootPath: root,
+        instructionsFilePath: entryPath,
+        maxBytes: 512,
+      }),
+    ).rejects.toBeInstanceOf(PromptBundleOverBudgetError);
   });
 });
