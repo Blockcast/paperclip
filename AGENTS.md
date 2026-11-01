@@ -193,6 +193,17 @@ still run on every push.
   onto a follow-up, or an unreadable verdict block, leaves the findings
   check-run `neutral`, and no automatic release comes at that head. Push the fix
   (a clean review of the new head releases it), or request validation with a trusted human `/test`.
+- **`; its retirement predates the review it names.`** is the one red that
+  neither a push nor another comment clears. GitHub's `submitted_at` does not
+  order reviews the way they were created, so a review drafted earlier and
+  submitted later carries a timestamp *after* the ledger entry that already
+  retired its finding — and a ledger entry may only retire findings that
+  existed when it was written, so the retirement is refused. The entry is on
+  the right surface and from the right author; only its timestamp is wrong, and
+  nothing on the PR can move it. **Remedy: ask Ally for one more review of the
+  same head carrying the same dispositions.** It needs no new head, and Ally
+  has done it unprompted. Do not push — a push voids the exact-head review and
+  re-burns the heavy lane set for nothing (PEN-5188).
 - A draft is held until it is ready for review or a trusted human requests `/test`. A fork PR is not held: no
   release path acts on a head outside this repository, so it runs its heavy
   jobs on every push, as before this gate.
