@@ -1705,6 +1705,127 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   // `nextAttemptCount > maxAttempts` where `nextAttemptCount = prior + 1`, which
   // is equivalent to `prior >= maxAttempts`. One attempt below the ceiling must
   // still dispatch normally.
+  // PEN-5170: an explicit `maxAttempts` must survive the monitor FIRING.
+  //
+  // `buildIssueMonitorTriggeredPatch` runs the fired policy through
+  // `stripMonitorFromExecutionPolicy`, which returns null outright for the
+  // monitor-only arming shape, so after one fire the budget lives in
+  // `executionState.monitor` and only there. Dispatch resolved the bound off the
+  // stripped side and judged the row against DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  // while `tickExpiredIssueMonitors` (below) and `readIssueMonitorBounds`
+  // (terminal-gate-reconciler.ts) both read the real grant — one bound, two
+  // answers for the same row, which is PEN-3803's defect at a site PEN-3803 did
+  // not touch. For a long-running poll the grant is the whole point of the
+  // operator control, and the first firing consumed it.
+  //
+  // The fire here is real, not simulated: the first tick is the production write
+  // that strips the policy. Re-pointing `monitorNextCheckAt` afterwards is the
+  // drift state dispatch already names twice ("the executionPolicy/monitor_*
+  // column drift the claim query does not exclude"), and is the shape PEN-4427
+  // was found in live — `executionPolicy` null, `monitorAttemptCount` 26, a live
+  // next check that would have been retired without ever firing.
+  it("judges a fired monitor against its explicit maxAttempts, not the default ceiling (PEN-5170)", async () => {
+    const grantedMaxAttempts = DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS + 16;
+    const { issueId } = await seedFixture({
+      monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS - 1,
+      monitor: { maxAttempts: grantedMaxAttempts, recoveryPolicy: "wake_owner" },
+    });
+    const heartbeat = createHeartbeat();
+
+    const firstTick = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    expect(firstTick.enqueued).toBe(1);
+    // Settle the first wake's run before re-arming: a still-queued run would let
+    // the second wake coalesce into it rather than enqueue, which would read as a
+    // suppressed dispatch and measure the wrong thing.
+    await waitForHeartbeatIdle();
+
+    const fired = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    // The fire stripped the budget out of the policy...
+    expect(normalizeIssueExecutionPolicy(fired.executionPolicy ?? null)?.monitor ?? null).toBeNull();
+    expect(fired.monitorAttemptCount).toBe(DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS);
+    // ...and carried it into the state, which is now its only home.
+    expect(parseIssueExecutionState(fired.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      maxAttempts: grantedMaxAttempts,
+    });
+
+    // Well inside ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS (4h), so the expired
+    // sweep leaves the row alone and this measures the dispatch path only.
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date("2026-04-11T13:30:00.000Z") })
+      .where(eq(issues.id, issueId));
+
+    const secondTick = await heartbeat.tickTimers(new Date("2026-04-11T13:31:00.000Z"));
+
+    // 24 attempts made against a 40 grant: there is road left, so the wake fires.
+    // Resolving the bound off the stripped policy made this 24-against-24 and
+    // retired the row as `max_attempts_exhausted` without ever dispatching it.
+    expect(secondTick.enqueued).toBe(1);
+    expect(secondTick.skipped).toBe(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorAttemptCount).toBe(DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS + 1);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "triggered",
+      attemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS + 1,
+      maxAttempts: grantedMaxAttempts,
+    });
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(actions).not.toContain("issue.monitor_exhausted");
+  });
+
+  // The other half of the same parity claim: dispatch must keep clearing a fired
+  // monitor whose budget really is spent. The fix prefers the state's bound only
+  // when the policy has no monitor, so a grant the row has now reached still
+  // retires LOUDLY through `clearIssueMonitorAndRecover` — the state's 40 is
+  // honoured in both directions, not just the permissive one.
+  it("still exhausts a fired monitor once its explicit maxAttempts is reached (PEN-5170)", async () => {
+    const grantedMaxAttempts = DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS + 16;
+    const { issueId } = await seedFixture({
+      monitorAttemptCount: grantedMaxAttempts - 1,
+      monitor: { maxAttempts: grantedMaxAttempts, recoveryPolicy: "escalate_to_board" },
+    });
+    const heartbeat = createHeartbeat();
+
+    const firstTick = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    expect(firstTick.enqueued).toBe(1);
+    await waitForHeartbeatIdle();
+
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date("2026-04-11T13:30:00.000Z") })
+      .where(eq(issues.id, issueId));
+
+    const secondTick = await heartbeat.tickTimers(new Date("2026-04-11T13:31:00.000Z"));
+
+    expect(secondTick.enqueued).toBe(0);
+    expect(secondTick.skipped).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "max_attempts_exhausted",
+      maxAttempts: grantedMaxAttempts,
+    });
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(actions).toContain("issue.monitor_exhausted");
+    // The recoveryPolicy also survives the fire now, so exhaustion routes through
+    // the configured escalation instead of the `wake_owner` default.
+    expect(actions).toContain("issue.monitor_escalated_to_board");
+  });
+
   it("still dispatches one attempt below the default monitor ceiling", async () => {
     const { issueId } = await seedFixture({
       monitorAttemptCount: DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS - 1,
