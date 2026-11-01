@@ -42,6 +42,8 @@
     "src/__tests__/isolation-reclaim-sweep-metrics.test.ts",
     "src/__tests__/isolation-reclaim-transport.test.ts",
     "src/__tests__/issue-list-description-truncation-flag.test.ts",
+    "src/__tests__/issue-list-timeout-explain-postgres.test.ts",
+    "src/__tests__/issue-list-timeout-explain.test.ts",
     "src/__tests__/issue-park-expiry-sweep.test.ts",
     "src/__tests__/stranded-sweep-park-suppression.test.ts",
     "src/__tests__/issue-tree-hold-metrics.test.ts",

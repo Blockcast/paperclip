@@ -91,6 +91,11 @@ export const ISSUE_LIST_EXPLAIN_OPTIONS = "FORMAT TEXT, VERBOSE, COSTS, SETTINGS
  * already waiting on. Applied as `SET LOCAL` inside the diagnostic's own
  * transaction, so it reverts with that transaction and can never leak onto a
  * pooled connection serving ordinary traffic.
+ *
+ * ⚠️ It bounds the EXPLAIN, NOT the connection checkout that precedes it — and
+ * a `57014` burst is precisely when the pool is most contended, so that wait
+ * can be long. The caller does not await this capture for exactly that reason,
+ * so the delay lands on the diagnostic rather than on the tenant's response.
  */
 export const ISSUE_LIST_EXPLAIN_TIMEOUT_MS = 2_000;
 
@@ -193,7 +198,7 @@ function renderExplain(query: SQL): { sql: string; params: unknown[] } | null {
 }
 
 /**
- * Replace every bound parameter value with its placeholder in `EXPLAIN` output.
+ * Strip user data out of `EXPLAIN` output, in two passes.
  *
  * ⚠️ **PostgreSQL inlines the bound values into the plan text.** Because this
  * statement is always planned *custom* (see the module doc), `Index Cond` and
@@ -205,41 +210,82 @@ function renderExplain(query: SQL): { sql: string; params: unknown[] } | null {
  *
  * So rendering the statement with placeholders is NOT sufficient to honour the
  * "never log bound parameter values" constraint — the plan leaks them on its
- * own, with nothing at the call site hinting that it does. Caught by
- * `issue-list-timeout-explain-postgres.test.ts` against a real server; a mocked
- * database returns a canned plan string and cannot see this.
+ * own, with nothing at the call site hinting that it does. Caught against a
+ * real server; a mocked database returns a canned plan string and cannot see it.
  *
- * Every string parameter is redacted regardless of length. A short, common
- * value will over-redact and cost some plan detail — that is the deliberate
- * direction, since under-redaction leaks a user-entered search term and the
- * plan SHAPE (node types, costs, index names, join order) is what this capture
- * is for. Non-strings are left alone: redacting `50` would mangle every cost
- * and row estimate in the plan.
+ * ## Pass 1 — map known parameters to their placeholders, LONGEST FIRST
  *
- * Values are matched both raw and PG-quoted (`'` doubled), which is how the
- * server renders a literal containing a quote.
+ * Order is load-bearing, and index order is wrong. A short parameter that is a
+ * substring of a longer one fragments it: `?status=blocked&q=blocked prod
+ * deploy` binds `'blocked'` BEFORE `'%blocked prod deploy%'` (status is pushed
+ * into `conditions` ahead of `issueSearchMatchCondition` in `list()`), so
+ * substituting in index order yields
+ *
+ * ```
+ * Filter: (issues.title ~~* '%$1 prod deploy%'::text)
+ * ```
+ *
+ * — the rest of the user's search term, in clear. Worse, the whole pattern no
+ * longer appears, so a fail-closed check that looks for the WHOLE parameter is
+ * satisfied and the plan is logged. Longest-first removes the containing value
+ * before anything can fragment it.
+ *
+ * ## Pass 2 — blank every literal that is not exactly a placeholder
+ *
+ * Pass 1 alone would still be an argument about substring order, and the leak
+ * above is what that argument costs when it is wrong. This pass does not depend
+ * on knowing the parameters at all: any single-quoted literal whose content is
+ * not exactly `$n` is replaced with `'?'`, so a fragment left by ANY mechanism —
+ * a future change to pass 1, a constant the planner inlined from somewhere else
+ * — is removed regardless.
+ *
+ * Nothing load-bearing is lost. PostgreSQL double-quotes identifiers, so table,
+ * column, index and function names survive, and costs, row estimates, widths,
+ * node types and operators are never quoted. The plan SHAPE, which is the whole
+ * artifact, is untouched.
  */
 export function redactBoundValues(text: string, params: readonly unknown[]): string {
+  const stringParams = params
+    .map((param, index) => ({ param, placeholder: `$${index + 1}` }))
+    .filter((entry): entry is { param: string; placeholder: string } =>
+      typeof entry.param === "string" && entry.param.length > 0)
+    // Longest first. See pass 1 above — index order fragments.
+    .sort((a, b) => b.param.length - a.param.length);
+
   let redacted = text;
-  params.forEach((param, index) => {
-    if (typeof param !== "string" || param.length === 0) return;
-    const placeholder = `$${index + 1}`;
+  for (const { param, placeholder } of stringParams) {
+    // Matched both raw and PG-quoted (`'` doubled), which is how the server
+    // renders a literal containing a quote.
     for (const form of [param.replaceAll("'", "''"), param]) {
       redacted = redacted.split(form).join(placeholder);
     }
-  });
-  return redacted;
+  }
+  return stripNonPlaceholderLiterals(redacted);
+}
+
+/**
+ * Replace every single-quoted literal whose content is not exactly a `$n`
+ * placeholder with `'?'`. Pass 2 of {@link redactBoundValues}.
+ *
+ * `(?:[^']|'')*` consumes PG's doubled-quote escape, so a literal containing a
+ * quote is matched whole rather than ending early and leaving its tail behind.
+ */
+function stripNonPlaceholderLiterals(text: string): string {
+  return text.replace(/'((?:[^']|'')*)'/g, (literal, inner: string) =>
+    /^\$\d+$/.test(inner) ? literal : "'?'");
 }
 
 /**
  * Fail-closed check that redaction actually worked.
  *
- * The redaction above is a string substitution, and a substitution is only as
- * good as its assumption about how the server rendered the value. This makes
- * the constraint a property of the code rather than of that assumption: if any
- * string parameter still appears, the plan is withheld entirely rather than
- * logged. Losing a diagnostic is recoverable; logging a user's search term is
- * not.
+ * Deliberately a DIFFERENT mechanism from the redaction above — it looks for a
+ * surviving parameter anywhere in the text, including outside a quoted literal,
+ * where neither pass would have reached it. A check that merely inverted the
+ * redaction could only ever agree with it, which is how the fragmentation leak
+ * above went unnoticed: the plan was logged with a satisfied guard.
+ *
+ * If any string parameter still appears, the plan is withheld entirely. Losing
+ * a diagnostic is recoverable; logging a user's search term is not.
  */
 export function containsBoundValue(text: string, params: readonly unknown[]): boolean {
   return params.some((param) => typeof param === "string" && param.length > 0 && text.includes(param));
