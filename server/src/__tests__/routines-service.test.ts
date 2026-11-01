@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, getTableColumns, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -979,9 +979,14 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
   //
   // So the asymmetry that CAN bite is the other direction: `list` enumerates its trigger fields by
   // hand, so a column added to the schema reaches `getDetail` for free and silently never reaches
-  // `list`. That is the drift a routine-health predicate would read as `null`. This pins both
-  // surfaces against one fixture: every schedule field must be present, non-null, and EQUAL on
-  // both, and every key `list` emits must survive on `getDetail` with the same value.
+  // `list`. That is the drift a routine-health predicate would read as `null`.
+  //
+  // Pinning that direction needs the SCHEMA as the oracle, not either response. A loop over the
+  // keys `list` already emits cannot see a column `list` never projects — it is vacuous in exactly
+  // the direction named above. So the key-set assertion below is driven by
+  // `getTableColumns(routineTriggers)` minus an explicit omit-list: add a column to the table and
+  // this test fails until someone either projects it in `list` or consciously records it as
+  // omitted. The per-key value loop stays, but it pins value agreement, not coverage.
   it("exposes the same non-null schedule fields on the list and detail surfaces", async () => {
     const { companyId, routine, svc } = await seedFixture();
     const created = await svc.createTrigger(routine.id, {
@@ -1030,18 +1035,57 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(detailTrigger?.nextRunAt).toEqual(nextRunAt);
     expect(detailTrigger?.lastFiredAt).toEqual(lastFiredAt);
 
-    // Guards the drift direction that is actually reachable: `list` hand-projects, `getDetail`
-    // spreads the row. Any key `list` emits must still resolve on the detail surface.
+    // Columns `list` deliberately does NOT project. Each needs a reason, because the whole point
+    // of this set is that adding to it is a conscious act rather than an oversight.
+    const LIST_OMITTED_TRIGGER_COLUMNS = new Set<string>([
+      "companyId", // the caller supplied it; the list is already scoped to it
+      "routineId", // implied by the enclosing routine row
+      "publicId", // webhook addressing material, not schedule health
+      "secretId", // credential reference; must not widen to a list response
+      "signingMode", // webhook verification detail, not schedule health
+      "replayWindowSec", // webhook verification detail, not schedule health
+      "lastRotatedAt", // secret lifecycle, not schedule health
+      "createdByAgentId",
+      "createdByUserId",
+      "updatedByAgentId",
+      "updatedByUserId",
+      "createdAt",
+      "updatedAt",
+    ]);
+
+    // The real guard. The oracle is the table, so a column added to `routineTriggers` that nobody
+    // adds to the `list` projection (or to the omit-list above) fails HERE — which is the drift
+    // the header comment names and the one a key loop over the response cannot reach.
+    const triggerSchemaColumns = Object.keys(getTableColumns(routineTriggers));
+    const stale = [...LIST_OMITTED_TRIGGER_COLUMNS].filter((c) => !triggerSchemaColumns.includes(c));
+    expect(stale, "LIST_OMITTED_TRIGGER_COLUMNS names columns that no longer exist").toEqual([]);
+    const expectedListKeys = triggerSchemaColumns
+      .filter((column) => !LIST_OMITTED_TRIGGER_COLUMNS.has(column))
+      .sort();
+    expect(
+      Object.keys(listedTrigger ?? {}).sort(),
+      "list trigger projection drifted from the routineTriggers schema: project the new column in `list` or record it in LIST_OMITTED_TRIGGER_COLUMNS",
+    ).toEqual(expectedListKeys);
+
+    // `getDetail` spreads the whole row, so it must carry every column — including the omitted
+    // ones. This is what makes the omit-list safe: nothing above can hide a column from BOTH
+    // surfaces at once.
+    for (const column of triggerSchemaColumns) {
+      expect(detailTrigger, `detail trigger must carry schema column ${column}`).toHaveProperty(column);
+    }
+
+    // Value agreement on the keys both surfaces emit (coverage is pinned above, not here).
     for (const key of Object.keys(listedTrigger ?? {}) as Array<keyof typeof listedTrigger>) {
-      expect(detailTrigger, `detail trigger dropped list key ${String(key)}`).toHaveProperty(String(key));
       expect(detailTrigger?.[key as keyof typeof detailTrigger]).toEqual(listedTrigger?.[key]);
     }
 
     // Both surfaces carry `activeIssue`, but their VALUES are deliberately not pinned to each
     // other: `list` computes it with `listLiveIssueByRoutineIds` (an inner join requiring a live
     // `heartbeatRuns` row) while `getDetail` uses `findLiveExecutionIssue`, which applies a
-    // fire-age horizon and fingerprint conditions. A wedged execution row is reported by the
-    // detail surface and missed by the list one — so asserting equality here would pin an
+    // fire-age horizon and fingerprint conditions. The two can disagree in EITHER direction: a
+    // wedged execution row with no live run is reported by the detail surface and missed by the
+    // list one, while the horizon in `liveHeartbeatRunConditionForRoutineDispatch` (`:1696`) can
+    // drop an old live run that `list` still reports. So asserting equality here would pin an
     // invariant that is false by design. Assert presence only.
     expect(listed).toHaveProperty("activeIssue");
     expect(detail).toHaveProperty("activeIssue");
