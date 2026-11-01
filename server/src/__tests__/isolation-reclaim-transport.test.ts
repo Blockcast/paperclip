@@ -1,6 +1,8 @@
+import { spawn } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ISOLATION_RECLAIM_REPORT_MARKER,
@@ -18,6 +20,10 @@ import { REAPABLE_LAYOUT } from "../services/isolation-workspace-reaper.js";
 
 const UUID_A = "11111111-1111-4111-8111-111111111111";
 const UUID_B = "22222222-2222-4222-8222-222222222222";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const executorEntry = path.resolve(here, "..", "cli", "isolation-reclaim-executor.ts");
+const tsxBin = path.resolve(here, "..", "..", "node_modules", ".bin", "tsx");
 
 let root: string;
 
@@ -128,6 +134,48 @@ describe("reclaim report wire format (PEN-5151)", () => {
     const bad = `${ISOLATION_RECLAIM_REPORT_MARKER}{"v":${ISOLATION_RECLAIM_REPORT_VERSION},"kind":"inventory","ok":true,"inventory":[{"name":42,"mtimeMs":1}]}`;
     expect(parseIsolationReclaimReport(bad)).toMatchObject({ ok: false, failure: "malformed" });
   });
+
+  it("refuses an execute result whose counters never arrived", () => {
+    // `{"result":{}}` is an object, so a container-only check passes it, and
+    // every counter is then `undefined` downstream. Nothing is deleted on the
+    // strength of it — the executor has already finished — but it is the whole
+    // of what an operator learns, and "said nothing" must not read as "deleted
+    // nothing". The same collapse the empty-inventory test above forbids.
+    const hollow = `${ISOLATION_RECLAIM_REPORT_MARKER}{"v":${ISOLATION_RECLAIM_REPORT_VERSION},"kind":"execute","ok":true,"result":{}}`;
+    expect(parseIsolationReclaimReport(hollow)).toMatchObject({ ok: false, failure: "malformed" });
+
+    // Complete but for `stopReason`, which is the field that says whether the
+    // executor finished or refused. An unknown value is refused, not coerced.
+    const counters = {
+      requested: 1,
+      deleted: 0,
+      wouldDelete: 1,
+      skippedUnsafeName: 0,
+      skippedLayout: 0,
+      retainedNestedCheckout: 0,
+      vanished: 0,
+      failed: 0,
+      notAttempted: 0,
+      capped: false,
+    };
+    const unknownStop = `${ISOLATION_RECLAIM_REPORT_MARKER}${JSON.stringify({
+      v: ISOLATION_RECLAIM_REPORT_VERSION,
+      kind: "execute",
+      ok: true,
+      result: { ...counters, stopReason: "finished-ish" },
+    })}`;
+    expect(parseIsolationReclaimReport(unknownStop)).toMatchObject({ ok: false, failure: "malformed" });
+
+    // And the same payload with a known one is accepted, so the check above is
+    // rejecting the field rather than the shape.
+    const good = encodeIsolationReclaimReport({
+      v: ISOLATION_RECLAIM_REPORT_VERSION,
+      kind: "execute",
+      ok: true,
+      result: { ...counters, stopReason: "complete" },
+    });
+    expect(parseIsolationReclaimReport(good)).toMatchObject({ ok: true });
+  });
 });
 
 describe("reclaim executor argument and plan parsing (PEN-5151)", () => {
@@ -227,6 +275,35 @@ describe("reclaim executor end to end over a real tree (PEN-5151)", () => {
     if (parsed.ok) expect(parsed.report.ok).toBe(false);
   });
 
+  it("refuses an inventory root that is not there, instead of reporting it empty", async () => {
+    // The executor's own version of the collapse the parser refuses above.
+    // `collectIsolationWorkspaceInventory` answers `[]` for a missing root,
+    // which is right for the mounted sweep — a deployment may have no isolation
+    // tree yet — and wrong here, where something mounted a volume at `--root`
+    // precisely to reclaim it. An absent root means the manifest's mount path
+    // and the flag disagree, or the PVC never attached. Reported as `[]` it is
+    // a valid "nothing to reclaim", so nothing is deleted and nothing is wrong
+    // anywhere: a reclaimer blind forever with every signal green.
+    const missing = path.join(root, "not-mounted");
+    const report = await runReclaimExecutor({ argv: ["inventory", "--root", missing], env: {} });
+    expect(report.ok).toBe(false);
+    expect(report.kind).toBe("inventory");
+    if (!report.ok) expect(report.error).toContain(missing);
+
+    // A root that exists but is not a directory is the same misconfiguration
+    // wearing different clothes, and `readdir` would have thrown ENOTDIR.
+    const file = path.join(root, "a-file");
+    await fs.writeFile(file, "");
+    const onFile = await runReclaimExecutor({ argv: ["inventory", "--root", file], env: {} });
+    expect(onFile.ok).toBe(false);
+
+    // The control: a real, empty root still reports an empty inventory, which
+    // is the valid answer this check must not have swallowed.
+    const empty = await runReclaimExecutor({ argv: ["inventory", "--root", root], env: {} });
+    expect(empty.ok).toBe(true);
+    if (empty.kind === "inventory" && empty.ok) expect(empty.inventory).toEqual([]);
+  });
+
   it("reports an unusable plan as a result, not as a crash", async () => {
     // A unit mismatch at the transport: microseconds where ms were meant lands
     // decades ahead, and the age bound's false branch is the permissive one.
@@ -247,4 +324,67 @@ describe("reclaim executor end to end over a real tree (PEN-5151)", () => {
       expect(report.result.deleted).toBe(0);
     }
   });
+});
+
+describe("reclaim executor as a real entrypoint (PEN-5151)", () => {
+  // The guard that decides whether `main` runs at all is `c8 ignore`d and
+  // nothing else in this file executes it. Its failure mode is silent — a
+  // mismatch means no output and exit 0, which the parser can only call
+  // `absent` under a green Job — so the only test that can see it is one that
+  // actually starts the process. (Ally, review of #3189.)
+  it("runs main and puts exactly one marked report on stdout", async () => {
+    await makeReapable(UUID_A);
+
+    // A sibling of the sweep root, never a child of it. The module graph opens
+    // `server.log` under `PAPERCLIP_HOME` at import whether or not anything
+    // logs — see the executor's output contract — so a home inside `root`
+    // would materialize a directory the inventory then reports, and this test
+    // would be asserting against its own side effect.
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "reclaim-home-"));
+
+    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>(
+      (resolve, reject) => {
+        const child = spawn(process.execPath, ["--import", "tsx", executorEntry, "inventory", "--root", root], {
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, PAPERCLIP_HOME: home },
+        });
+        let stdout = "";
+        let stderr = "";
+        const watchdog = setTimeout(() => {
+          child.kill("SIGKILL");
+          reject(new Error("reclaim executor entrypoint timed out"));
+        }, 30_000);
+
+        child.stdout.setEncoding("utf8");
+        child.stderr.setEncoding("utf8");
+        child.stdout.on("data", (chunk: string) => {
+          stdout += chunk;
+        });
+        child.stderr.on("data", (chunk: string) => {
+          stderr += chunk;
+        });
+        child.on("error", (error) => {
+          clearTimeout(watchdog);
+          reject(error);
+        });
+        child.on("close", (code) => {
+          clearTimeout(watchdog);
+          resolve({ code, stdout, stderr });
+        });
+      },
+    );
+
+    expect(result.code).toBe(0);
+
+    // Parsed from the interleaved view, because that is what `pods/log` gives
+    // the server — and it is also how this test notices a second marked line.
+    const parsed = parseIsolationReclaimReport(`${result.stdout}\n${result.stderr}`);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.report.kind).toBe("inventory");
+    if (parsed.report.kind !== "inventory" || !parsed.report.ok) return;
+    expect(parsed.report.inventory.map((e) => e.name)).toEqual([UUID_A]);
+
+    await fs.rm(home, { recursive: true, force: true });
+  }, 40_000);
 });

@@ -40,17 +40,40 @@
  *
  * ## Output contract
  *
- * Exactly one line on stdout: the framed report (`isolation-reclaim-report.ts`).
- * Everything else — including every diagnostic — goes to stderr. The two share
- * one interleaved view through `pods/log`, so the marker is what separates
- * them; see that module. The report is emitted on the failure path too, because
- * a Job that fails silently and a Job that reports why are the same exit code
- * to the control plane and very different things to an operator.
+ * Exactly one line on stdout: the framed report (`isolation-reclaim-report.ts`),
+ * found by its marker. `pods/log` serves one interleaved view of fd 1 and fd 2
+ * and has no stream selector, so the marker — not the file descriptor — is what
+ * separates the report from everything else the pod says; see that module.
+ *
+ * The executor's own diagnostics go to stderr, and that takes an explicit
+ * logger rather than a default. `executeIsolationReclaimPlan` falls back to
+ * `middleware/logger.ts`, whose transport has a `pino-pretty` target on
+ * **fd 1** at `info` — so `plan_unusable` and `plan_stale` would otherwise be
+ * written to *stdout*. Harmless to the parser, which keys on the marker, but
+ * the opposite of what this section promises, and asynchronous enough that the
+ * `process.exit` below would likely drop them anyway. `main` passes
+ * `stderrLogger` to close both. (Ally, review of #3189.)
+ *
+ * One side effect is not closed: importing `middleware/logger.ts` — which the
+ * reaper does transitively, so this file cannot avoid it without a module split
+ * — reads the config file, `mkdirSync`s a logs directory under
+ * `PAPERCLIP_HOME` and opens `server.log` for writing, all at import. Benign
+ * while `PAPERCLIP_HOME` is container-local; worth revisiting if it ever
+ * resolves onto the mounted claim, where this process would be writing into the
+ * tree it is reclaiming.
+ *
+ * The report is emitted on the failure path too, because a Job that fails
+ * silently and a Job that reports why are the same exit code to the control
+ * plane and very different things to an operator.
  *
  * Exit 0 when the report says `ok`, 1 otherwise. The report is written before
  * the exit in both cases.
  */
 
+import { realpathSync } from "node:fs";
+import fs from "node:fs/promises";
+import { pathToFileURL } from "node:url";
+import pino from "pino";
 import {
   type IsolationReclaimReport,
   type IsolationReclaimReportKind,
@@ -61,6 +84,21 @@ import {
   collectIsolationWorkspaceInventory,
   executeIsolationReclaimPlan,
 } from "../services/isolation-workspace-reaper.js";
+
+/**
+ * Where this process's diagnostics go.
+ *
+ * Passed explicitly into `executeIsolationReclaimPlan` so it does not fall back
+ * to the server's default logger, which writes `info` and above to fd 1 — see
+ * the output contract in the header. `sync: true` because `main` calls
+ * `process.exit` immediately after the report, and an asynchronous transport
+ * loses whatever has not drained; on this path the diagnostic is the only thing
+ * that says *why* a plan was refused.
+ */
+const stderrLogger = pino(
+  { level: "warn", serializers: { error: pino.stdSerializers.err } },
+  pino.destination({ dest: 2, sync: true }),
+);
 
 /** Env var carrying the plan on the `execute` path. */
 export const RECLAIM_PLAN_ENV = "PAPERCLIP_RECLAIM_PLAN_JSON";
@@ -185,6 +223,29 @@ export async function runReclaimExecutor(input: {
     mode = args.mode;
 
     if (args.mode === "inventory") {
+      // The root has to exist *here*, even though
+      // `collectIsolationWorkspaceInventory` is content to answer `[]` for a
+      // missing one. That answer is right for the mounted sweep, where a
+      // deployment may simply have no isolation tree yet. In this process it
+      // cannot be: something mounted a volume at `--root` for the express
+      // purpose of reclaiming it, so an absent root means the manifest's mount
+      // path and this flag disagree, or the PVC never attached. Passed through
+      // as `[]` it becomes `{ok: true, inventory: []}` — "this claim has
+      // nothing to reclaim", the valid answer `isolation-reclaim-report.ts`
+      // says must never be producible by a fault. It fails safe on data, since
+      // nothing is deleted, and that is the trap: the reclaimer goes blind
+      // permanently with every signal green, which is the failure PEN-5151
+      // exists to end, reintroduced on the executor's side.
+      //
+      // The shared helper keeps its `ENOENT -> []`; the mounted sweep needs it.
+      // (Ally, review of #3189.)
+      const rootStat = await fs.stat(args.root).catch((err: NodeJS.ErrnoException) => {
+        throw new Error(`--root '${args.root}' could not be read: ${err.code ?? err.message}`);
+      });
+      if (!rootStat.isDirectory()) {
+        throw new Error(`--root '${args.root}' is not a directory`);
+      }
+
       const inventory = await collectIsolationWorkspaceInventory(args.root);
       return { v: ISOLATION_RECLAIM_REPORT_VERSION, kind: "inventory", ok: true, inventory };
     }
@@ -197,6 +258,7 @@ export async function runReclaimExecutor(input: {
       maxDeletes: plan.maxDeletes,
       maxPlanAgeMs: plan.maxPlanAgeMs,
       dryRun: plan.dryRun,
+      logger: stderrLogger,
     });
     return { v: ISOLATION_RECLAIM_REPORT_VERSION, kind: "execute", ok: true, result };
   } catch (err) {
@@ -223,8 +285,29 @@ async function main(): Promise<void> {
   process.exit(report.ok ? 0 : 1);
 }
 
-// `import.meta.url` guard so importing this module in a test does not run it.
-if (process.argv[1] && import.meta.url === `file://${process.argv[1]}`) {
+// Run only when this module *is* the entry point, so importing it in a test
+// does not. Both sides are normalized first: `import.meta.url` is already
+// realpath'd by the ESM loader and percent-encoded, while `process.argv[1]` is
+// the path exactly as spelled on the command line. A bare
+// `file://${process.argv[1]}` therefore misses on any path needing URL encoding
+// and on a symlinked entry — and the miss is silent, which is what makes it
+// worth the two calls: `main` never runs, the process exits 0 having written
+// nothing at all, and the parser can only call that `absent` under a green Job.
+// (Ally, review of #3189.)
+function isEntryPoint(entryPath: string | undefined): boolean {
+  if (!entryPath) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(entryPath)).href;
+  } catch {
+    // `realpathSync` throws only if argv[1] has gone away, which cannot happen
+    // for a module Node loaded *as* the entry. It can happen to an importer's
+    // argv[1], and this runs at import — so it falls back to the un-resolved
+    // comparison rather than taking the whole module down on the way past.
+    return import.meta.url === pathToFileURL(entryPath).href;
+  }
+}
+
+if (isEntryPoint(process.argv[1])) {
   void main();
 }
 /* c8 ignore stop */

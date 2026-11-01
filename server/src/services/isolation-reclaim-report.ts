@@ -55,6 +55,7 @@
 
 import type {
   IsolationReclaimExecutionResult,
+  IsolationReclaimStopReason,
   IsolationWorkspaceInventoryEntry,
 } from "./isolation-workspace-reaper.js";
 
@@ -105,6 +106,35 @@ export type IsolationReclaimReportParse =
   | { ok: false; failure: IsolationReclaimReportParseFailure; detail: string };
 
 /**
+ * Every numeric counter an execution result carries.
+ *
+ * Spelled out rather than derived from the object's own keys, because the
+ * question this list answers is whether the *expected* fields arrived — and an
+ * object's own keys can only describe what it happens to contain, which is the
+ * thing in doubt. `satisfies` ties it to the interface, so a counter added
+ * there without being added here fails the build rather than going unchecked.
+ */
+const EXECUTION_RESULT_COUNTERS = [
+  "requested",
+  "deleted",
+  "wouldDelete",
+  "skippedUnsafeName",
+  "skippedLayout",
+  "retainedNestedCheckout",
+  "vanished",
+  "failed",
+  "notAttempted",
+] as const satisfies ReadonlyArray<keyof IsolationReclaimExecutionResult>;
+
+/** The closed set of `stopReason` values this build knows how to read. */
+const EXECUTION_STOP_REASONS = [
+  "complete",
+  "capped",
+  "plan_stale",
+  "plan_unusable",
+] as const satisfies ReadonlyArray<IsolationReclaimStopReason>;
+
+/**
  * Render a report as the single line the executor writes to stdout.
  *
  * One line, not pretty-printed, because the recovery rule on the other side is
@@ -128,10 +158,13 @@ export function encodeIsolationReclaimReport(report: IsolationReclaimReport): st
 export function parseIsolationReclaimReport(logText: string): IsolationReclaimReportParse {
   const marked: string[] = [];
   for (const line of logText.split("\n")) {
-    // `trimStart` only. A trailing `\r` from a CRLF writer is left on the
-    // payload and handled by `JSON.parse`, which tolerates trailing
-    // whitespace; trimming the end here would also silently repair a line the
-    // kubelet clipped mid-token, which is the one case that must stay visible.
+    // `trimStart` only, and nothing rests on that. A trailing `\r` from a CRLF
+    // writer is left on the payload because `JSON.parse` treats it as trailing
+    // whitespace and accepts it, so stripping it would buy nothing. Trimming
+    // the end would not endanger a clipped line either: a line the kubelet cut
+    // mid-token is invalid JSON with or without trailing whitespace, and
+    // `trimEnd` cannot supply the `}` it lost. What keeps a clip visible is
+    // `JSON.parse` below, reported as `malformed`. (Ally, review of #3189.)
     const trimmed = line.trimStart();
     if (trimmed.startsWith(ISOLATION_RECLAIM_REPORT_MARKER)) {
       marked.push(trimmed.slice(ISOLATION_RECLAIM_REPORT_MARKER.length));
@@ -210,8 +243,42 @@ export function parseIsolationReclaimReport(logText: string): IsolationReclaimRe
     return { ok: true, report: candidate as unknown as IsolationReclaimReport };
   }
 
-  if (typeof candidate.result !== "object" || candidate.result === null) {
+  // Checked field by field, for the reason the inventory entries above are.
+  // This payload never drives a deletion — by the time it is read the executor
+  // has finished — but it is the whole of what an operator and every downstream
+  // counter learn about what happened. Accepting any object at all lets
+  // `{"result":{}}` through as `ok:true`, after which `deleted` and
+  // `stopReason` are `undefined`, and a report that says nothing becomes
+  // indistinguishable from one that says "considered the plan, deleted
+  // nothing". That is the same collapse the header refuses for an empty
+  // inventory, one level down. (Ally, review of #3189.)
+  //
+  // Note what is deliberately *not* checked here: that `kind` matches the mode
+  // the Job was asked to run. This function is handed a log, not an
+  // invocation, and has nothing to compare against — the driver that chose the
+  // mode is the only thing that can, and must.
+  if (typeof candidate.result !== "object" || candidate.result === null || Array.isArray(candidate.result)) {
     return { ok: false, failure: "malformed", detail: "execute report carries no result object" };
+  }
+  const result = candidate.result as Record<string, unknown>;
+  for (const counter of EXECUTION_RESULT_COUNTERS) {
+    if (!Number.isFinite(result[counter])) {
+      return {
+        ok: false,
+        failure: "malformed",
+        detail: `execute result field '${counter}' is not a finite number`,
+      };
+    }
+  }
+  if (typeof result.capped !== "boolean") {
+    return { ok: false, failure: "malformed", detail: "execute result carries no boolean capped" };
+  }
+  if (!EXECUTION_STOP_REASONS.includes(result.stopReason as IsolationReclaimStopReason)) {
+    return {
+      ok: false,
+      failure: "malformed",
+      detail: `execute result carries unknown stopReason ${String(result.stopReason)}`,
+    };
   }
   return { ok: true, report: candidate as unknown as IsolationReclaimReport };
 }
