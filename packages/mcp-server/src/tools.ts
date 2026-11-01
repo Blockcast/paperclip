@@ -829,7 +829,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipAddComment",
-      "Add a comment to an issue; include resume=true when intentionally requesting follow-up on resumable closed work",
+      "Add a comment to an issue; include resume=true when intentionally requesting follow-up on resumable closed work. \u26a0 A plain `@Name` in the body MENTIONS NOBODY and raises no wake \u2014 only a markdown link whose href is `agent://<uuid>` (`[@Ceo](agent://<uuid>)`) binds. The bare form still returns 200 and renders normally, so the absence of a reply is your only other evidence and it looks exactly like a busy recipient. The response reports every `@`-shaped token that bound to nobody in `unboundMentions`: read it back, and re-send with the link form when it is non-empty. An empty list means every `@` token bound; the field being absent means the server predates this report. (PEN-5180)",
       addCommentToolSchema,
       async ({ issueId, ...body }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/comments`, { body }),

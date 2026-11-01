@@ -35,6 +35,7 @@ import {
   createIssueAttachmentMetadataSchema,
   createIssueThreadInteractionSchema,
   unrecognizedInteractionPayloadKeys,
+  extractUnboundMentionTokens,
   createIssueWorkProductSchema,
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
@@ -16496,10 +16497,55 @@ export function issueRoutes(
       throw new Error("Issue comment was not persisted");
     }
 
+    // PEN-5180: a body containing a plain `@Ceo` matches no mention extractor,
+    // binds to nobody and raises no wake — yet the write returned a bare 200
+    // with nothing the author could read saying so, and the absence of a reply
+    // is indistinguishable from a busy recipient. Measured on PEN-2918: the
+    // plain form drew zero CEO actions in 24h, the `agent://` form was answered
+    // in ~5 minutes. Report the tokens that bound to nothing on the create
+    // response — the same channel `unrecognizedPayloadKeys` uses for its class
+    // of silent drop. Deliberately NOT fixed by teaching the extractor to match
+    // plain names: an unambiguous href is a defensible contract, and name
+    // matching buys false wakes.
+    //
+    // `comment` is re-read into a const so the closures below keep the
+    // not-null narrowing, and the resolution is memoized so the wake path and
+    // the response share one lookup rather than querying twice.
+    const persistedComment = comment;
+    let resolvedMentionAgentIds: string[] | null = null;
+    const resolveMentionedAgentIds = async (): Promise<string[]> => {
+      if (resolvedMentionAgentIds) return resolvedMentionAgentIds;
+      try {
+        resolvedMentionAgentIds = await svc.findMentionedAgents(
+          currentIssue.companyId,
+          persistedComment.body,
+        );
+      } catch (err) {
+        logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
+        resolvedMentionAgentIds = [];
+      }
+      return resolvedMentionAgentIds;
+    };
+    // Always present on the response, never conditional: an absent key cannot
+    // be told apart from a server that predates this report, which is the
+    // ambiguity the `unrecognizedPayloadKeys` note calls out. An empty array
+    // means "every `@` token in this body reached somebody".
+    const commentResponseBody = async () => {
+      let unboundMentions: string[] = [];
+      try {
+        unboundMentions = extractUnboundMentionTokens(persistedComment.body, {
+          boundAgentIds: await resolveMentionedAgentIds(),
+        });
+      } catch (err) {
+        logger.warn({ err, issueId: id }, "failed to scan comment for unbound @-mentions");
+      }
+      return { ...persistedComment, unboundMentions };
+    };
+
     if ("deduplicated" in comment && comment.deduplicated) {
       idempotentReplay = true;
       if (comment.idempotencyProcessedAt) {
-        res.status(200).json(comment);
+        res.status(200).json(await commentResponseBody());
         return;
       }
     }
@@ -16522,7 +16568,7 @@ export function issueRoutes(
         }
       }
       await processKeyedCommentEffects(comment.id);
-      res.status(idempotentReplay ? 200 : 201).json(comment);
+      res.status(idempotentReplay ? 200 : 201).json(await commentResponseBody());
       return;
     }
 
@@ -16740,12 +16786,7 @@ export function issueRoutes(
         }
       }
 
-      let mentionedIds: string[] = [];
-      try {
-        mentionedIds = await svc.findMentionedAgents(issue.companyId, comment.body);
-      } catch (err) {
-        logger.warn({ err, issueId: id }, "failed to resolve @-mentions");
-      }
+      const mentionedIds = await resolveMentionedAgentIds();
 
       let authorUserIsActiveMember = false;
       if (mentionedIds.length > 0 && actor.actorType === "user") {
@@ -16862,7 +16903,7 @@ export function issueRoutes(
     })();
 
     await queueTaskWatchdogEvaluation(currentIssue, actor.runId);
-    res.status(idempotentReplay ? 200 : 201).json(comment);
+    res.status(idempotentReplay ? 200 : 201).json(await commentResponseBody());
   });
 
   router.post("/issues/:id/feedback-votes", validate(upsertIssueFeedbackVoteSchema), async (req, res) => {

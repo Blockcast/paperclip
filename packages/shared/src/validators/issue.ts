@@ -927,8 +927,28 @@ export const issueCommentMetadataSchema = z.object({
 
 export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
 
+/**
+ * PEN-5180. Same channel, same class of defect as the note above: a body
+ * containing a plain `@Ceo` matches no mention extractor, binds to nobody and
+ * raises no wake, while the write still returns 200. Measured on PEN-2918, the
+ * plain form drew zero CEO actions in 24h and the `agent://` form was answered
+ * in ~5 minutes.
+ */
+export const COMMENT_UNBOUND_MENTIONS_NOTE =
+  "⚠ A plain `@Name` MENTIONS NOBODY. The extractor binds only a markdown link "
+  + "whose href is `agent://<uuid>` — `[@Ceo](agent://<uuid>)` — so a bare `@Ceo` "
+  + "raises no wake at all, and the write still returns 200 and renders normally. "
+  + "Your only other evidence of the drop is the absence of a reply, which looks "
+  + "exactly like a busy recipient; measured on PEN-2918, the plain form drew zero "
+  + "actions in 24h while the link form was answered in ~5 minutes. The create "
+  + "response reports every `@`-shaped token that bound to nobody in "
+  + "`unboundMentions` — READ IT BACK. A non-empty list means those names reached "
+  + "no one and you must re-send using the link form; an empty list means every "
+  + "`@` token bound. The field being ABSENT from the response means the server "
+  + "predates this report and can tell you nothing either way. (PEN-5180)";
+
 export const addIssueCommentSchema = z.object({
-  body: multilineTextSchema.pipe(z.string().min(1)),
+  body: multilineTextSchema.pipe(z.string().min(1)).describe(COMMENT_UNBOUND_MENTIONS_NOTE),
   idempotencyKey: z.string().trim().min(1).max(255).optional(),
   authorType: issueCommentAuthorTypeSchema.optional(),
   presentation: issueCommentPresentationSchema.nullable().optional(),

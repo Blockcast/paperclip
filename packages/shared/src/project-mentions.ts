@@ -320,3 +320,164 @@ function normalizeSkillSlug(input: string | null | undefined): string | null {
   if (!trimmed || !SKILL_SLUG_RE.test(trimmed)) return null;
   return trimmed;
 }
+
+// ---------------------------------------------------------------------------
+// PEN-5180: unbound `@`-mention reporting.
+//
+// `extractAgentMentionIds` above requires a markdown link whose href is
+// `agent://<id>`. A plain `@Ceo` — the form a human writes — matches nothing,
+// binds to nobody, and raises no wake. The comment write still returns 200 and
+// renders normally, so the author's only evidence of failure is the absence of
+// a reply, which is indistinguishable from a busy recipient. Measured on
+// PEN-2918: a plain `@Ceo` drew zero CEO actions in 24h while the same ask as
+// `[@Ceo](agent://<uuid>)` was answered in ~5 minutes.
+//
+// The remedy is NOT to make the extractor match plain names — an unambiguous
+// href is a defensible contract, and name matching buys false wakes (similar
+// names, a name inside prose, a quoted prior comment). The remedy is to tell
+// the author the mention bound to nothing, so a silent drop becomes a readable
+// one. Same shape as the `unrecognizedPayloadKeys` precedent on interaction
+// creates, which exists for exactly this class of silent drop.
+//
+// Fail toward reporting: a false "this may not have reached anyone" costs a
+// re-send, a false silence costs a day. Where this scanner is unsure it
+// reports.
+// ---------------------------------------------------------------------------
+
+/** Cap on reported tokens, so a pathological body cannot inflate a response. */
+export const MAX_UNBOUND_MENTION_TOKENS = 20;
+
+/** Cap on the reported length of any single token. */
+const MAX_UNBOUND_MENTION_TOKEN_LENGTH = 64;
+
+/**
+ * An `@`-shaped token. Deliberately starts with a letter: `@1`, `@_` and the
+ * `@` in `a@b` are not plausible names, and reporting them would be noise.
+ */
+const AT_TOKEN_RE = /@([A-Za-z][A-Za-z0-9._-]*)/g;
+
+/** Any mention link, whatever its scheme. Used to locate well-formed mentions. */
+const ANY_MENTION_LINK_RE =
+  /\[([^\]]*)]\(((?:project|agent|user|skill|routine|pipeline):\/\/[^)\s]+)\)/gi;
+
+/** Fenced code blocks — ``` or ~~~ delimited, including an unterminated tail. */
+const FENCED_CODE_RE = /(^|\n)[ \t]*(```|~~~)[^\n]*\n[\s\S]*?(?:\n[ \t]*\2[^\n]*(?=\n|$)|$)/g;
+
+/** Inline code spans. */
+const INLINE_CODE_RE = /`[^`\n]*`/g;
+
+/** Blockquote lines — a quoted prior comment is not a fresh mention. */
+const BLOCKQUOTE_LINE_RE = /^[ \t]*>[^\n]*/gm;
+
+/** Bare URLs and autolinks, whose userinfo or fragment can look like a token. */
+const URL_RE = /<?\b(?:https?|mailto):\/{0,2}[^\s<>)]+>?/gi;
+
+/** Email addresses — `ops@example.com` is not a mention of `@example`. */
+const EMAIL_RE = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g;
+
+/**
+ * Blank out a region while preserving every character offset, so later passes
+ * over the same string still line up with the original.
+ */
+function maskRange(chars: string[], start: number, end: number): void {
+  for (let i = start; i < end && i < chars.length; i += 1) {
+    chars[i] = " ";
+  }
+}
+
+function maskPattern(chars: string[], source: string, re: RegExp): void {
+  const scanner = new RegExp(re.source, re.flags.includes("g") ? re.flags : `${re.flags}g`);
+  let match: RegExpExecArray | null;
+  while ((match = scanner.exec(source)) !== null) {
+    maskRange(chars, match.index, match.index + match[0].length);
+    if (match[0].length === 0) scanner.lastIndex += 1;
+  }
+}
+
+export interface UnboundMentionScanOptions {
+  /**
+   * Agent ids that actually resolved to a real agent the wake could be
+   * delivered to. A mention link whose target is in this set is bound, and its
+   * label is not reported; every other `@` token is.
+   */
+  boundAgentIds?: readonly string[];
+}
+
+/**
+ * Return the `@`-shaped tokens in `markdown` that bound to no agent.
+ *
+ * A token is treated as BOUND only when it is the label of a mention link
+ * whose target actually resolved:
+ *
+ *   - `[@Ceo](agent://<id>)` where `<id>` is in `boundAgentIds` — bound, silent.
+ *   - `[@Ceo](agent://<unknown>)` — well formed but resolved to nobody, so the
+ *     wake is dropped just as silently as a plain name. Reported.
+ *   - `[@taylor](user://<id>)` and the other non-agent schemes — well-formed
+ *     mention syntax for a different subject. Out of scope here, not reported.
+ *   - plain `@Ceo` — reported. This is the defect of record.
+ *
+ * Code spans, fenced blocks, blockquotes, URLs and email addresses are masked
+ * first: a name inside a quoted prior comment or a `user@host` is not somebody
+ * asking for a wake, and reporting it would train readers to ignore the field.
+ */
+export function extractUnboundMentionTokens(
+  markdown: string,
+  options: UnboundMentionScanOptions = {},
+): string[] {
+  if (!markdown) return [];
+
+  const bound = new Set(options.boundAgentIds ?? []);
+  // Indexed by UTF-16 code unit, which is the offset space every `RegExp`
+  // below reports in, so masking stays aligned with the original string.
+  const units = markdown.split("");
+
+  maskPattern(units, markdown, FENCED_CODE_RE);
+  const afterFences = units.join("");
+  maskPattern(units, afterFences, INLINE_CODE_RE);
+  maskPattern(units, units.join(""), BLOCKQUOTE_LINE_RE);
+  maskPattern(units, units.join(""), URL_RE);
+  maskPattern(units, units.join(""), EMAIL_RE);
+
+  // Mask the labels of mention links that are NOT an unresolved agent link.
+  // Scan the original text so a link is still located even if a later pass
+  // blanked part of its href.
+  const linkScanner = new RegExp(ANY_MENTION_LINK_RE.source, ANY_MENTION_LINK_RE.flags);
+  let link: RegExpExecArray | null;
+  while ((link = linkScanner.exec(markdown)) !== null) {
+    const href = link[2] ?? "";
+    const isAgentLink = href.toLowerCase().startsWith(AGENT_MENTION_SCHEME);
+    if (isAgentLink) {
+      const parsed = parseAgentMentionHref(href);
+      // An agent link that resolved is bound. One that did not is left visible
+      // so its label is reported — a well-formed href pointing at nobody drops
+      // the wake exactly as silently as a plain name does.
+      if (!parsed || !bound.has(parsed.agentId)) continue;
+    }
+    maskRange(units, link.index, link.index + link[0].length);
+  }
+
+  const scanned = units.join("");
+  const seen = new Set<string>();
+  const tokens: string[] = [];
+  const tokenScanner = new RegExp(AT_TOKEN_RE.source, AT_TOKEN_RE.flags);
+  let match: RegExpExecArray | null;
+  while ((match = tokenScanner.exec(scanned)) !== null) {
+    // `foo@bar` is not a mention; require the `@` to open a word.
+    const prev = match.index > 0 ? scanned[match.index - 1] : "";
+    if (prev && /[A-Za-z0-9]/.test(prev)) continue;
+
+    // Trim trailing punctuation that markdown prose attaches to a name:
+    // "@Ceo." and "@Ceo-" both mean `Ceo`.
+    const raw = (match[1] ?? "").replace(/[._-]+$/, "");
+    if (!raw) continue;
+
+    const token = raw.slice(0, MAX_UNBOUND_MENTION_TOKEN_LENGTH);
+    const key = token.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    tokens.push(token);
+    if (tokens.length >= MAX_UNBOUND_MENTION_TOKENS) break;
+  }
+
+  return tokens;
+}

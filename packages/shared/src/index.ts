@@ -1674,6 +1674,7 @@ export {
   requestItemVerdictsResultSchema,
   createIssueThreadInteractionSchema,
   INTERACTION_PAYLOAD_KNOWN_KEYS,
+  COMMENT_UNBOUND_MENTIONS_NOTE,
   INTERACTION_PAYLOAD_UNRECOGNIZED_KEYS_NOTE,
   MAX_REPORTED_UNRECOGNIZED_PAYLOAD_KEYS,
   unrecognizedInteractionPayloadKeys,
@@ -2176,7 +2177,9 @@ export {
   extractProjectMentionIds,
   extractRoutineMentionIds,
   extractSkillMentionIds,
+  extractUnboundMentionTokens,
   extractUserMentionIds,
+  MAX_UNBOUND_MENTION_TOKENS,
   parseAgentMentionHref,
   parsePipelineMentionHref,
   parseProjectMentionHref,
@@ -2189,6 +2192,7 @@ export {
   type ParsedRoutineMention,
   type ParsedSkillMention,
   type ParsedUserMention,
+  type UnboundMentionScanOptions,
 } from "./project-mentions.js";
 
 export {
