@@ -331,6 +331,29 @@ jobs:
         run: node --test ./scripts/cgroup-residual-teardown-fit.test.mjs
         timeout-minutes: 1
 
+      - name: Test the D1 broker soak queries (PEN-5181)
+        # PEN-5016 §5.3 makes these queries a stage-0 exit item: "a silent
+        # broker and a broker nobody asked to publish are the same
+        # observation". The tests are regression pins on the two ways that
+        # fails quietly, not coverage of the arithmetic.
+        #
+        # First, the LogQL matchers are asserted in BOTH directions against
+        # message strings copied verbatim from github-publish-broker.ts and
+        # -policy.ts -- every refusal matches, no accept or startup line does.
+        # Refusal messages reach stderr UNPREFIXED (the handler passes
+        # error.message through), so the matcher is anchored; reword a refusal
+        # and these fixtures must be re-copied or the query silently stops
+        # counting.
+        #
+        # Second, child non-zero exits are pinned as NOT observable. sendExit()
+        # frames the exit code to the socket and nothing writes it to stderr,
+        # so a query for it can only ever return 0 -- which is byte-identical
+        # to "no child ever failed". The test fails if anyone marks that
+        # category observable without the broker gaining the log line.
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/github-publish-broker-soak-queries.test.mjs
+        timeout-minutes: 1
+
       - name: Guard migration-number collision with base (BLO-39490)
         # The one migration check that cannot be made from a single tree.
         # packages/db/src/check-migration-numbering.ts (BLO-27927) covers

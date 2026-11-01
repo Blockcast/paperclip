@@ -186,3 +186,12 @@ platform cannot resolve automatically. Each runbook should be:
   `plugins.status='error'` past the grace period, distinct from an
   operator-disabled plugin. Trigger: alert `PaperclipPluginCriticalErrored` or
   `PaperclipPluginErrored`, or `paperclip_plugin_error == 1`.
+- [`github-publish-broker-soak-queries.md`](github-publish-broker-soak-queries.md)
+  — reading the `github-publish-broker` sidecar's logs during the PEN-5016 D1
+  soak, and the three ways this surface reports "nothing wrong" when it has
+  measured nothing. Covers why child non-zero exits are **not observable at
+  all** (the exit code is framed to the socket, never written to stderr), why
+  an empty stream is not a clean stream, and why `ttlSecondsAfterFinished: 300`
+  means evidence must be collected inside the window. Trigger: a soak stage is
+  starting, or `enableGitHubPublishBroker` is on and you need to know whether
+  the broker is working.
