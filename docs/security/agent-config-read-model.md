@@ -291,7 +291,7 @@ one:
 | column | `project_workspaces.metadata.runtimeConfig` | `agents.runtime_config` |
 | route | `GET /projects/:id/workspaces` | `GET /api/agents/:id` |
 | gate | `workspace_runtime:read` | `agent_config:read` |
-| projection | `publicProjectWorkspace` | `redactForRestrictedAgentView` |
+| projection | `publicProjectWorkspace` | `redactForRestrictedAgentView` (ungranted) / `redactAgentSecrets` (granted) |
 
 `PEN-3206` ruled **narrow** on its own question and closed `done` on
 2026-11-01. It never owned this one, and a pointer to it from this section
@@ -306,9 +306,11 @@ application** — a narrowing goes to the `Ceo`, who approves it directly; a
 widening goes to the `Ceo` **first** and then to the board, because the `Ceo`
 is the step at which a widening gets refused cheaply.
 
-> **Successor row: _id pending._** It is being filed as of 2026-11-01T21:40Z.
-> This document should not merge with this line unresolved — every
-> "successor row" reference in [Settled calls](#settled-calls) resolves here.
+> **Successor row: [`PEN-5228`](https://paperclip.blockcast.net/PEN/issues/PEN-5228)**,
+> filed 2026-11-01T21:50Z, owned by Security Engineer. Every "successor row"
+> reference in [Settled calls](#settled-calls) resolves here, and this is the
+> only place in this file the id appears — so if this question is ever
+> re-routed again, one line changes and no reference goes stale behind it.
 
 `PEN-4775` deliberately changed only the self row,
 because that row is wrong under *either* answer to the policy question — the
