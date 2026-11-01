@@ -1,4 +1,7 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
 import {
   buildJobManifest,
@@ -233,5 +236,117 @@ describe("buildJobManifest mounts the per-agent claim (PEN-4932 done-when 1)", (
     // Every `data` mount the agent container holds is a subPath bind; none of
     // them is the volume root.
     expect(dataMounts.every((m) => (m.subPath ?? "") !== "")).toBe(true);
+  });
+});
+
+describe("the session-resume predicate is gated on the claim (PEN-4932 invariant 7 / PEN-5189)", () => {
+  // `resolveResumableClaudeSessionId` decides whether to resume by stat-ing the
+  // transcript — in the SERVER process, at a POD address. On the shared claim
+  // those are one file. On a per-agent claim they are two volumes, and because
+  // the opt-in migrates nothing the server's copy is still THERE: the check
+  // returns a false POSITIVE, not a false negative.
+  //
+  // These two tests are deliberately the same fixture, same transcript on disk,
+  // differing ONLY in the claim — which is what makes the second one a statement
+  // about the volume rather than about a missing file.
+  const SESSION_ID = "11111111-2222-3333-4444-555555555555";
+  const MODEL = "claude-opus-5";
+  const WORKSPACE_ROOT = "/paperclip/instances/default/projects/co1/proj-1/_default";
+  const PROMPT_MARKER = "PEN-5189-FULL-PROMPT-TEMPLATE";
+  const INSTRUCTIONS_PATH = "/paperclip/instances/default/companies/co1/agents/test/AGENTS.md";
+
+  let sessionRoot = "";
+
+  beforeEach(() => {
+    sessionRoot = mkdtempSync(path.join(tmpdir(), "pen5189-"));
+    const projects = path.join(
+      sessionRoot,
+      ".claude",
+      "projects",
+      // Mirrors `encodeClaudeCwd`, which is module-private. Pinning the encoder
+      // is not this test's job; reaching the same directory is.
+      WORKSPACE_ROOT.replace(/[^a-zA-Z0-9-]/g, "-"),
+    );
+    mkdirSync(projects, { recursive: true });
+    writeFileSync(path.join(projects, `${SESSION_ID}.jsonl`), '{"type":"summary"}\n');
+  });
+
+  afterEach(() => {
+    if (sessionRoot) rmSync(sessionRoot, { recursive: true, force: true });
+  });
+
+  function build(config: Record<string, unknown> = {}) {
+    const ctx = makeCtx({
+      model: MODEL,
+      promptTemplate: `${PROMPT_MARKER} for {{agent.id}}`,
+      instructionsFilePath: INSTRUCTIONS_PATH,
+      ...config,
+    });
+    ctx.runtime.sessionId = SESSION_ID;
+    ctx.runtime.sessionParams = { sessionId: SESSION_ID, model: MODEL };
+    (ctx.runtime.isolation as unknown as Record<string, unknown>).sessionRoot = sessionRoot;
+    // Non-empty so `shouldUseResumeDeltaPrompt` can fire — without a wake there
+    // is no delta to collapse the main template into, and the third assertion
+    // below would pass for the wrong reason.
+    ctx.context = { paperclipWake: { reason: "issue_monitor_due" } };
+    return buildJobManifest({ ctx, selfPod });
+  }
+
+  it("NEGATIVE CONTROL: on the server's own claim a resumable session still resumes", () => {
+    // Today's entire fleet. This change must be inert here, and the three
+    // suppressions are CORRECT here — the pod really can read that transcript.
+    const built = build();
+    expect(dataVolume(built.job)?.persistentVolumeClaim?.claimName).toBe(selfPod.pvcClaimName);
+    expect(built.claudeArgs).toContain("--resume");
+    expect(built.claudeArgs).toContain(SESSION_ID);
+    expect(built.claudeArgs).not.toContain("--append-system-prompt-file");
+    expect(built.prompt).not.toContain(PROMPT_MARKER);
+  });
+
+  it("refuses to resume on a claim the server does not hold, even though the file is right there", () => {
+    const built = build({ enablePerAgentWorkspaceVolume: true });
+    // The file the predicate stats is UNCHANGED and still present — the only
+    // thing that moved is which volume the pod will mount. That is the whole
+    // point: an `existsSync`-based answer cannot be right here at any path.
+    expect(
+      existsSync(
+        path.join(
+          sessionRoot,
+          ".claude",
+          "projects",
+          WORKSPACE_ROOT.replace(/[^a-zA-Z0-9-]/g, "-"),
+          `${SESSION_ID}.jsonl`,
+        ),
+      ),
+    ).toBe(true);
+    expect(dataVolume(built.job)?.persistentVolumeClaim?.claimName).toBe(agentWorkspaceClaimName(AGENT_ID));
+    expect(built.claudeArgs).not.toContain("--resume");
+  });
+
+  it("delivers all four things the false positive used to suppress", () => {
+    // Each of these is suppressed by `claudeResumeSessionId` being truthy, and
+    // each is justified in source by "it is already in the session" — the
+    // premise that is false once the pod cannot read the transcript. A run
+    // missing them still exits 0 and still emits parseable stdout, so without
+    // this assertion the degradation is invisible.
+    const built = build({ enablePerAgentWorkspaceVolume: true });
+    // 1. the `--resume` target
+    expect(built.claudeArgs).not.toContain("--resume");
+    // 2 + 3. the instructions file, and the FULL prompt template rather than
+    //        the wake delta alone
+    expect(built.claudeArgs).toContain("--append-system-prompt-file");
+    expect(built.claudeArgs).toContain(INSTRUCTIONS_PATH);
+    expect(built.prompt).toContain(PROMPT_MARKER);
+    // 4. the wake delta is still there — the fix ADDS the template back, it does
+    //    not swap one for the other.
+    expect(built.prompt).toContain("issue_monitor_due");
+  });
+
+  it("keeps the bootstrap prompt, which the resume path zeroes out", () => {
+    const built = build({ enablePerAgentWorkspaceVolume: true, bootstrapPromptTemplate: "PEN-5189-BOOTSTRAP" });
+    expect(built.prompt).toContain("PEN-5189-BOOTSTRAP");
+    // Meaningful only against the control: the same fixture on the shared claim
+    // resumes, and therefore drops it.
+    expect(build({ bootstrapPromptTemplate: "PEN-5189-BOOTSTRAP" }).prompt).not.toContain("PEN-5189-BOOTSTRAP");
   });
 });

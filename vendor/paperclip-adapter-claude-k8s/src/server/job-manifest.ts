@@ -1269,9 +1269,51 @@ function resolveResumableClaudeSessionId(input: {
   config: Record<string, unknown>;
   selfPod: SelfPodInfo;
   claudeConfigDir?: string | null;
+  serverHoldsDataClaim: boolean;
 }): string {
   const sessionId = input.requestedSessionId.trim();
   if (!sessionId) return "";
+  // PEN-4932 invariant 7 (PEN-5189). The `existsSync` below runs in the SERVER
+  // process, against a path that for an isolated run is a POD address: the call
+  // site passes `${isolation.sessionRoot}/.claude`, and `isolation.sessionRoot`
+  // is rooted at `resolveDataMountPath(config)` — the pod's mount. The
+  // transcript it stats is written by claude-code IN THE POD. Those are the same
+  // bytes only while the two mounts are the same VOLUME, which is exactly
+  // `serverHoldsJobDataClaim` — the same identity invariant 1's prompt-bundle
+  // channel rests on, asked here about a different artifact.
+  //
+  // THE FAILURE IS A FALSE POSITIVE, which is what makes it dangerous. The
+  // opt-in migrates nothing, so an opted-in agent's old transcripts stay at the
+  // byte-identical path on the SERVER's volume (measured 2026-11-01: 72 files,
+  // 105 MB for one agent), and `encodeClaudeCwd(workingDir)` does not change
+  // across the swap — the cwd is derived from the project path, not the claim.
+  // So the server keeps answering "resume" for a transcript the pod cannot open.
+  //
+  // That one boolean then suppresses FOUR separate things, every one of them
+  // justified in source by "it is already in the session" — the `--resume`
+  // target, the bootstrap prompt, the WHOLE main prompt template
+  // (`shouldUseResumeDeltaPrompt` collapses it to the wake delta), and
+  // `--append-system-prompt-file`. The premise is false the moment the pod
+  // cannot read the transcript, so the pod gets none of them — and the Job still
+  // succeeds and still emits complete parseable stdout, so the run looks normal
+  // while the agent ran with no prompt, no bootstrap and no instructions.
+  //
+  // ⛔ Do NOT "fix" this by translating the path to a server address, the way
+  // `serverRootDir` does for the prompt bundle. That is sound THERE because one
+  // volume is reachable from both processes at two roots. Here the pod's volume
+  // is not reachable from the server at ANY path — the problem is a different
+  // VOLUME, not a different root — so a translation would turn a wrong answer
+  // into a confidently wrong one. Same reason PEN-4932 §2 refused a shared
+  // read-only tooling claim and PEN-5120 refused `run-logs` as a server subPath.
+  //
+  // Refusing to resume costs an opted-in agent its session continuity, which is
+  // strictly better than silently withholding all four. Moving the existence
+  // check into the pod is the eventual shape, and the four suppressions have to
+  // move with it.
+  //
+  // INERT TODAY: every agent resolves `dataClaimName` to the server's own PVC,
+  // so this is true fleet-wide and resume behaviour is unchanged.
+  if (!input.serverHoldsDataClaim) return "";
   const requestedModel = input.requestedModel.trim();
   if (requestedModel && input.sessionModel.trim() !== requestedModel) return "";
   const sessionFile = path.join(
@@ -3313,6 +3355,29 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const hash = shortHash(`${agent.id}:${runId}`);
   const jobName = `ac-${agentSlug}-${runSlug}-${hash}`;
 
+  // Hoisted above the prompt block for PEN-5189 (PEN-4932 invariant 7).
+  //
+  // `resolveResumableClaudeSessionId` below has to know whether the Job's volume
+  // is the server's own, because its `existsSync` runs server-side against a pod
+  // address. The derivation itself is unchanged and still belongs to the volume
+  // block further down — it is MOVED, not copied. A second copy here would be
+  // free to drift from the one the mount actually uses, and this predicate
+  // deciding "resume" off a different claim than the Pod mounts is precisely the
+  // class of bug invariant 7 is.
+  const agentWorkspaceClaim = resolveAgentWorkspaceClaimName({
+    config: rawConfig,
+    agentId: agent?.id,
+  });
+  const dataClaimName = resolveDataClaimName({
+    workspaceVolumeClaim: config.workspaceVolumeClaim,
+    agentWorkspaceClaimName: agentWorkspaceClaim,
+    selfPodPvcClaimName: selfPod.pvcClaimName,
+  });
+  const serverHoldsDataClaim = serverHoldsJobDataClaim({
+    dataClaimName,
+    selfPodPvcClaimName: selfPod.pvcClaimName,
+  });
+
   // Build prompt (same logic as claude_local)
   const promptTemplate = asString(
     config.promptTemplate,
@@ -3330,6 +3395,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     config,
     selfPod,
     claudeConfigDir: isolation.enabled ? `${isolation.sessionRoot}/.claude` : null,
+    serverHoldsDataClaim,
   });
   const templateData = {
     agentId: agent.id,
@@ -3519,15 +3585,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // when the agent is opted in. `execute.ts` provisions it from the SAME pure
   // derivation before calling this builder, which is the only thing keeping the
   // Job from mounting a claim nothing created.
-  const agentWorkspaceClaim = resolveAgentWorkspaceClaimName({
-    config: rawConfig,
-    agentId: agent?.id,
-  });
-  const dataClaimName = resolveDataClaimName({
-    workspaceVolumeClaim: config.workspaceVolumeClaim,
-    agentWorkspaceClaimName: agentWorkspaceClaim,
-    selfPodPvcClaimName: selfPod.pvcClaimName,
-  });
+  //
+  // `agentWorkspaceClaim` / `dataClaimName` / `serverHoldsDataClaim` are
+  // resolved ABOVE the prompt block rather than here — see the hoist comment
+  // there. They are the same values; only the position moved.
   const dataMountPath = resolveDataMountPath(config);
   // Kubernetes rejects a Pod outright when one container declares two
   // volumeMounts at the same `mountPath`, so an operator-supplied
@@ -3626,10 +3687,9 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // already required a non-empty claim — but the claim-identity half now has a
   // name, because the prompt-bundle delivery channel below asks the SAME
   // question for a different reason and the two must not drift apart.
-  const serverHoldsDataClaim = serverHoldsJobDataClaim({
-    dataClaimName,
-    selfPodPvcClaimName: selfPod.pvcClaimName,
-  });
+  //
+  // `serverHoldsDataClaim` itself is computed in the hoisted block above the
+  // prompt assembly (PEN-5189 needs it there); this is the same binding.
   const serverCanPreCreate = narrowWritableSurface && serverHoldsDataClaim;
   // Hoisted above its historical position so the prompt-bundle block below can
   // use it: that block has to run before the `data_claim_foreign` warning, which
