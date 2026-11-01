@@ -5,6 +5,7 @@ import {
   mountCoversPath,
   readReclaimSelfPodIdentity,
   resolveSelfDataClaimName,
+  resolveSelfImage,
   resolveSelfPodName,
   selectSelfContainer,
 } from "../services/isolation-reclaim-self.js";
@@ -296,5 +297,80 @@ describe("readReclaimSelfPodIdentity", () => {
       namespace: "paperclip",
     });
     expect(result).toMatchObject({ ok: true, identity: { claimName: "paperclip-data" } });
+  });
+});
+
+/**
+ * Two LITERAL digests, neither derived from the other or from the fixture's
+ * spec image. The whole point of this resolver is that the kubelet's answer
+ * and the operator's can disagree, so a test in which they are spelled from
+ * one source cannot see the disagreement.
+ */
+const SERVER_DIGEST = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+const SIDECAR_DIGEST = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+describe("resolveSelfImage", () => {
+  it("prefers the digest the kubelet resolved over the reference the operator wrote", () => {
+    expect(resolveSelfImage("harbor.example/paperclip:main", `harbor.example/paperclip@${SERVER_DIGEST}`)).toBe(
+      `harbor.example/paperclip@${SERVER_DIGEST}`,
+    );
+  });
+
+  it("strips a docker-pullable:// scheme prefix before judging the reference", () => {
+    expect(
+      resolveSelfImage("harbor.example/paperclip:main", `docker-pullable://harbor.example/paperclip@${SERVER_DIGEST}`),
+    ).toBe(`harbor.example/paperclip@${SERVER_DIGEST}`);
+  });
+
+  it.each([
+    // Names a build, cannot be pulled: no repository. This is the one a
+    // credulous `imageID ?? specImage` would hand to the Job verbatim, and the
+    // Job would then never start -- reported as a deadline, not as a manifest
+    // problem.
+    ["a bare digest with no repository", SERVER_DIGEST],
+    ["a reference carrying no digest at all", "harbor.example/paperclip:main"],
+    ["a truncated digest", "harbor.example/paperclip@sha256:abc"],
+    ["an empty string", ""],
+    ["whitespace", "   "],
+    ["undefined", undefined],
+  ])("falls back to the spec image for %s", (_label, imageID) => {
+    expect(resolveSelfImage("harbor.example/paperclip:main", imageID as string | undefined)).toBe(
+      "harbor.example/paperclip:main",
+    );
+  });
+});
+
+describe("readReclaimSelfPodIdentity image resolution", () => {
+  /**
+   * `containerStatuses` is NOT ordered to match `spec.containers`, so both
+   * orderings are asserted with the same expected answer. With only one, a
+   * positional read is green and the Job is launched from a sidecar's build on
+   * exactly the multi-container pod the name match exists to survive.
+   */
+  it.each([
+    ["statuses in spec order", ["istio-proxy", "paperclip"]],
+    ["statuses in reverse order", ["paperclip", "istio-proxy"]],
+  ])("matches the container status by name, not position (%s)", async (_label, order) => {
+    const digests: Record<string, string> = {
+      paperclip: `harbor.example/paperclip@${SERVER_DIGEST}`,
+      "istio-proxy": `mesh/proxy@${SIDECAR_DIGEST}`,
+    };
+    const result = await read({
+      spec: podSpec(),
+      status: { containerStatuses: order.map((name) => ({ name, imageID: digests[name] })) },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.identity.image).toBe(`harbor.example/paperclip@${SERVER_DIGEST}`);
+  });
+
+  it("keeps the spec image when this pod has no status for its own container", async () => {
+    const result = await read({
+      spec: podSpec(),
+      status: { containerStatuses: [{ name: "istio-proxy", imageID: `mesh/proxy@${SIDECAR_DIGEST}` }] },
+    });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.identity.image).toBe("harbor.example/paperclip@sha256:abc");
   });
 });
