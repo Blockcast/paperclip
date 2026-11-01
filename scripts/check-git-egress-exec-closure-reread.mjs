@@ -278,9 +278,18 @@ function readRange(base, head) {
   // moved or deleted cannot leave this check watching an address with nothing
   // at it. Pathspec-limited rather than a whole-tree listing: the repo is ~5.7k
   // entries and only two of them are the question being asked.
+  //
+  // `--full-tree` is required for correctness, not tidiness. `ls-tree` resolves
+  // pathspecs RELATIVE TO THE CURRENT DIRECTORY, while `git diff --name-only`
+  // always prints repo-root paths -- so without it the two reads disagree on
+  // path base and running this from a subdirectory matches nothing, which the
+  // staleness arm would report as both watched files missing. Measured from
+  // `scripts/`: no flag yields [], `--full-tree` yields the path. The failure
+  // is closed (a false red, not a false green), but a security guard that
+  // reds spuriously is a security guard someone deletes.
   const headPaths = execFileSync(
     "git",
-    ["ls-tree", "-r", "--name-only", head, "--", ...WATCHED_PATHS],
+    ["ls-tree", "-r", "--full-tree", "--name-only", head, "--", ...WATCHED_PATHS],
     { encoding: "utf8" },
   )
     .split("\n")
