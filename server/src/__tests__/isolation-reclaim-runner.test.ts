@@ -4,7 +4,11 @@ import { describe, expect, it } from "vitest";
 import {
   RECLAIM_JOB_CLAIM_ANNOTATION,
   RECLAIM_JOB_CONTAINER_NAME,
+  RECLAIM_JOB_MODE_LABEL,
+  RECLAIM_TARGET_VOLUME_NAME,
   buildIsolationReclaimJobManifest,
+  reclaimJobModeOf,
+  reclaimMountedClaimOf,
 } from "../services/isolation-reclaim-job.js";
 import type {
   IsolationReclaimJobManifest,
@@ -46,14 +50,42 @@ function job(overrides: {
   conditions?: k8s.V1JobCondition[];
   active?: number;
   succeeded?: number;
+  /** The claim the Job MOUNTS. `null` drops the volume entirely. */
+  mountedClaim?: string | null;
+  /**
+   * The claim the Job's annotation CLAIMS, independently of what it mounts.
+   *
+   * Decoupled on purpose. When the fixture stamped this from `mountedClaim`,
+   * the two could never disagree, and swapping the adoption check between them
+   * passed every test — the mutation that caught it is `N4`.
+   */
   claimAnnotation?: string | null;
 }): k8s.V1Job {
-  const annotations: Record<string, string> = {};
-  if (overrides.claimAnnotation !== null) {
-    annotations[RECLAIM_JOB_CLAIM_ANNOTATION] = overrides.claimAnnotation ?? CLAIM;
-  }
+  const mounted = overrides.mountedClaim === undefined ? CLAIM : overrides.mountedClaim;
+  const annotated =
+    overrides.claimAnnotation === undefined ? mounted : overrides.claimAnnotation;
   return {
-    metadata: { name: "pc-reclaim-inv-x", namespace: NAMESPACE, annotations },
+    metadata: {
+      name: "pc-reclaim-inv-x",
+      namespace: NAMESPACE,
+      annotations: annotated === null ? {} : { [RECLAIM_JOB_CLAIM_ANNOTATION]: annotated },
+    },
+    spec: {
+      template: {
+        spec: {
+          containers: [],
+          volumes:
+            mounted === null
+              ? []
+              : [
+                  {
+                    name: RECLAIM_TARGET_VOLUME_NAME,
+                    persistentVolumeClaim: { claimName: mounted },
+                  },
+                ],
+        },
+      },
+    },
     status: {
       conditions: overrides.conditions ?? [],
       active: overrides.active ?? 0,
@@ -149,20 +181,17 @@ function fakeClock(startMs = 1_762_000_000_000) {
   };
 }
 
+/**
+ * `mode` is passed only to pick the manifest; the runner is never told it. That
+ * is the point of the signature — see `derives its identity from the manifest`.
+ */
 function run(
   manifest: IsolationReclaimJobManifest,
-  mode: "inventory" | "execute",
+  _mode: "inventory" | "execute",
   port: ReclaimJobPort,
   clock = fakeClock(),
 ) {
-  return runIsolationReclaimJob({
-    manifest,
-    claimName: CLAIM,
-    mode,
-    port,
-    now: clock.now,
-    sleep: clock.sleep,
-  });
+  return runIsolationReclaimJob({ manifest, port, now: clock.now, sleep: clock.sleep });
 }
 
 describe("reclaimWaitBudgetMs", () => {
@@ -240,7 +269,7 @@ describe("runIsolationReclaimJob — adoption", () => {
   it("refuses an existing Job that mounts a different claim", async () => {
     const port = fakePort({
       create: "already_exists",
-      jobs: [job({ conditions: COMPLETE, claimAnnotation: "agent-workspace-someone-else" })],
+      jobs: [job({ conditions: COMPLETE, mountedClaim: "agent-workspace-someone-else" })],
     });
     const outcome = await run(manifestFor("execute"), "execute", port);
     expect(outcome.ok).toBe(false);
@@ -251,10 +280,10 @@ describe("runIsolationReclaimJob — adoption", () => {
     expect(outcome.deletionOutcomeUnknown).toBe(false);
   });
 
-  it("refuses an existing Job that records no claim at all", async () => {
+  it("refuses an existing Job that mounts no readable claim at all", async () => {
     const port = fakePort({
       create: "already_exists",
-      jobs: [job({ conditions: COMPLETE, claimAnnotation: null })],
+      jobs: [job({ conditions: COMPLETE, mountedClaim: null })],
     });
     const outcome = await run(manifestFor("inventory"), "inventory", port);
     expect(outcome.ok).toBe(false);
@@ -262,11 +291,51 @@ describe("runIsolationReclaimJob — adoption", () => {
     expect(outcome.kind).toBe("name_collision");
   });
 
+  it("refuses a Job whose annotation agrees but whose volume does not", async () => {
+    // The whole reason the check reads the volume: the annotation is a *claim
+    // about* the mount, and a Job can carry a right-looking one while mounting
+    // something else. Reading the annotation here adopts the wrong volume and,
+    // on `execute`, waits on a pod deleting from a different tree.
+    const port = fakePort({
+      create: "already_exists",
+      jobs: [job({ conditions: COMPLETE, mountedClaim: "someone-elses-claim", claimAnnotation: CLAIM })],
+    });
+    const outcome = await run(manifestFor("execute"), "execute", port);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.kind).toBe("name_collision");
+    expect(outcome.detail).toContain("someone-elses-claim");
+  });
+
+  it("adopts a Job whose volume agrees even when its annotation does not", async () => {
+    // The other direction, so the test cannot pass by refusing everything.
+    const port = fakePort({
+      create: "already_exists",
+      jobs: [job({ conditions: COMPLETE, mountedClaim: CLAIM, claimAnnotation: "stale-annotation" })],
+    });
+    const outcome = await run(manifestFor("inventory"), "inventory", port);
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.adopted).toBe(true);
+  });
+
+  it("refuses a Job that mounts nothing readable even when it is annotated", async () => {
+    const port = fakePort({
+      create: "already_exists",
+      jobs: [job({ conditions: COMPLETE, mountedClaim: null, claimAnnotation: CLAIM })],
+    });
+    const outcome = await run(manifestFor("inventory"), "inventory", port);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.kind).toBe("name_collision");
+    expect(outcome.detail).toContain("no readable claim");
+  });
+
   it("does not read a pod log for a refused adoption", async () => {
     let logReads = 0;
     const port = fakePort({
       create: "already_exists",
-      jobs: [job({ conditions: COMPLETE, claimAnnotation: "other" })],
+      jobs: [job({ conditions: COMPLETE, mountedClaim: "other" })],
     });
     port.readPodLog = async () => {
       logReads += 1;
@@ -274,6 +343,127 @@ describe("runIsolationReclaimJob — adoption", () => {
     };
     await run(manifestFor("execute"), "execute", port);
     expect(logReads).toBe(0);
+  });
+});
+
+describe("runIsolationReclaimJob — identity comes from the manifest", () => {
+  // The finding this block exists for (Ally, #3196): mode and claim used to be
+  // parameters beside the manifest, so a caller could hand an `execute`
+  // manifest and say `inventory`, and every failure would then report
+  // deletionOutcomeUnknown: false for a Job that unlinks.
+  it("takes the mode from the Job's own label, with nothing else to take it from", () => {
+    expect(reclaimJobModeOf(manifestFor("execute").job)).toBe("execute");
+    expect(reclaimJobModeOf(manifestFor("inventory").job)).toBe("inventory");
+  });
+
+  it("picks the target volume by name, not by position", () => {
+    // `volumes[0]` happens to be the target in a real manifest, so a reader
+    // that indexed instead of searching passed every other test here (mutation
+    // `N6`). The home emptyDir carries no claim, so an off-by-position read
+    // would silently answer `null` and refuse every adoption.
+    const reordered = manifestFor("execute");
+    const spec = reordered.job.spec?.template.spec;
+    if (spec?.volumes) spec.volumes = [...spec.volumes].reverse();
+    expect(spec?.volumes?.[0]?.name).not.toBe(RECLAIM_TARGET_VOLUME_NAME);
+    expect(reclaimMountedClaimOf(reordered.job)).toBe(CLAIM);
+  });
+
+  it("takes the claim from the mounted volume, not from the annotation", () => {
+    const manifest = manifestFor("execute");
+    expect(reclaimMountedClaimOf(manifest.job)).toBe(CLAIM);
+    // Rewrite the annotation and leave the volume alone: the volume still wins,
+    // because the volume is what the pod mounts.
+    const annotations = manifest.job.metadata?.annotations ?? {};
+    annotations[RECLAIM_JOB_CLAIM_ANNOTATION] = "a-different-claim";
+    expect(reclaimMountedClaimOf(manifest.job)).toBe(CLAIM);
+  });
+
+  it("cannot be told a claim that disagrees with what its pod mounts", async () => {
+    // Same probe through the runner: the annotation is wrong, the volume is
+    // right, and the adoption comparison tracks the volume.
+    const manifest = manifestFor("inventory");
+    const annotations = manifest.job.metadata?.annotations ?? {};
+    annotations[RECLAIM_JOB_CLAIM_ANNOTATION] = "a-different-claim";
+    const clock = fakeClock();
+    const outcome = await runIsolationReclaimJob({
+      manifest,
+      port: fakePort({ create: "already_exists" }),
+      now: clock.now,
+      sleep: clock.sleep,
+    });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(outcome.claimName).toBe(CLAIM);
+  });
+
+  it("reports an execute manifest as an unknown even though no caller said execute", async () => {
+    const outcome = await run(manifestFor("execute"), "execute", fakePort({ logError: new Error("x") }));
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.mode).toBe("execute");
+    expect(outcome.deletionOutcomeUnknown).toBe(true);
+  });
+
+  it("refuses a manifest with no mode label, before creating anything", async () => {
+    const manifest = manifestFor("execute");
+    delete manifest.job.metadata?.labels?.[RECLAIM_JOB_MODE_LABEL];
+    let creates = 0;
+    const port = fakePort({});
+    port.createJob = async () => {
+      creates += 1;
+      return "created";
+    };
+    const outcome = await runIsolationReclaimJob({ manifest, port });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.kind).toBe("manifest_unreadable");
+    expect(outcome.detail).toContain(RECLAIM_JOB_MODE_LABEL);
+    expect(creates).toBe(0);
+    // Refused before the create, so nothing can have deleted.
+    expect(outcome.deletionOutcomeUnknown).toBe(false);
+  });
+
+  it("refuses a manifest with no target volume", async () => {
+    const manifest = manifestFor("execute");
+    const spec = manifest.job.spec?.template.spec;
+    if (spec) spec.volumes = spec.volumes?.filter((v) => v.name !== RECLAIM_TARGET_VOLUME_NAME);
+    const outcome = await runIsolationReclaimJob({ manifest, port: fakePort({}) });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.kind).toBe("manifest_unreadable");
+    expect(outcome.detail).toContain(RECLAIM_TARGET_VOLUME_NAME);
+  });
+
+  it("names both gaps when a manifest records neither", async () => {
+    const manifest = manifestFor("execute");
+    delete manifest.job.metadata?.labels?.[RECLAIM_JOB_MODE_LABEL];
+    const spec = manifest.job.spec?.template.spec;
+    if (spec) spec.volumes = [];
+    const outcome = await runIsolationReclaimJob({ manifest, port: fakePort({}) });
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.detail).toContain(" or ");
+  });
+
+  it("ignores an extraLabels attempt to rewrite the mode", () => {
+    // The builder spreads caller labels first, so the identifying ones win.
+    const manifest = buildIsolationReclaimJobManifest({
+      claimName: CLAIM,
+      namespace: NAMESPACE,
+      image: "harbor.blockcast.net/paperclip/paperclip@sha256:abc",
+      invocationId: "20261101T0300Z-a1b2c3",
+      mode: "execute",
+      plan: { planBuiltAtMs: 1_762_000_000_000, eligibleIds: [] },
+      extraLabels: { [RECLAIM_JOB_MODE_LABEL]: "inventory" },
+    });
+    expect(reclaimJobModeOf(manifest.job)).toBe("execute");
+  });
+
+  it("refuses an unrecognized mode label rather than passing it through", () => {
+    const manifest = manifestFor("inventory");
+    const labels = manifest.job.metadata?.labels ?? {};
+    labels[RECLAIM_JOB_MODE_LABEL] = "wipe-everything";
+    expect(reclaimJobModeOf(manifest.job)).toBeNull();
   });
 });
 
@@ -434,10 +624,22 @@ describe("runIsolationReclaimJob — the Job vanishing", () => {
     expect(outcome.deletionOutcomeUnknown).toBe(true);
   });
 
-  it("reports an AlreadyExists whose Job is unreadable as a known-zero", async () => {
-    // Nothing of ours started: the name was taken and the taker is gone.
+  it("reports an AlreadyExists whose Job vanished as an UNKNOWN on execute", async () => {
+    // The Job name embeds the invocation id, so the likeliest owner of a Job
+    // under this exact name is our own earlier attempt. If that attempt was an
+    // `execute` that ran and was then TTL-cleaned in this window, deletions
+    // happened — "it never ran" is an assumption, not an observation.
     const port = fakePort({ create: "already_exists", jobs: [null] });
     const outcome = await run(manifestFor("execute"), "execute", port);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.kind).toBe("job_failed");
+    expect(outcome.deletionOutcomeUnknown).toBe(true);
+  });
+
+  it("reports the same vanished AlreadyExists as a known-zero on inventory", async () => {
+    const port = fakePort({ create: "already_exists", jobs: [null] });
+    const outcome = await run(manifestFor("inventory"), "inventory", port);
     expect(outcome.ok).toBe(false);
     if (outcome.ok) return;
     expect(outcome.deletionOutcomeUnknown).toBe(false);
