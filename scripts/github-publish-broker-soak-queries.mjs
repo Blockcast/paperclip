@@ -67,7 +67,10 @@
 //   - Lines the broker writes about ITSELF are prefixed `paperclip-github-broker: `
 //     -- the listen line (runtime.ts:39), the known startup throw (runtime.ts:33),
 //     the per-invocation accept line (broker.ts:417), and the non-refusal parse
-//     failure (broker.ts:364).
+//     failure (broker.ts:366). That last one is counted as (b): it ends in
+//     refuse(), so it is a rejected request, and it is the only prefixed shape
+//     with no fixed text -- hence it is matched as the COMPLEMENT of the other
+//     three rather than by a pattern of its own.
 //   - `PublishBrokerRefusal` messages pass through UNPREFIXED (broker.ts:363
 //     takes `error.message` verbatim). Every one of them in
 //     github-publish-broker-policy.ts begins either "refusing " or "the broker
@@ -98,6 +101,25 @@ export const SELF_PREFIX = "paperclip-github-broker: ";
 export const REFUSAL_OPENINGS = ["refusing ", "the broker performs pushes, and this is "];
 
 /**
+ * The two fixed prefixed shapes, named once so the LogQL matchers and
+ * `classifyBrokerLine` cannot drift apart. The third prefixed shape is the
+ * per-tool accept line, built from BROKERED_TOOLS.
+ */
+export const SELF_LISTEN = "listening on";
+export const SELF_WORKSPACE_UNSET = "PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset";
+
+/**
+ * Every prefixed shape the broker is KNOWN to write, as LogQL alternation
+ * fragments. `request_error_other` is defined as the complement of this list
+ * within the prefixed family, so this is the single place the two must agree.
+ */
+const KNOWN_SELF_SHAPES = [
+  escapeForLogqlRegex(SELF_LISTEN),
+  escapeForLogqlRegex(SELF_WORKSPACE_UNSET),
+  `(${BROKERED_TOOLS.map(escapeForLogqlRegex).join("|")}) in /`,
+];
+
+/**
  * The saved query set. `observable: false` entries are the §5.3 categories the
  * broker cannot currently emit -- they are kept here, with the query that would
  * work, so the gap travels with the tooling.
@@ -108,7 +130,7 @@ export const BROKER_QUERIES = [
     category: "a",
     label: "startup OK (broker reached listen)",
     observable: true,
-    logql: `${BROKER_STREAM} |= \`${SELF_PREFIX}listening on\``,
+    logql: `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX + SELF_LISTEN)}\``,
     note: "runtime.ts:39. The denominator for (a): a brokered pod with no listen line did not start.",
   },
   {
@@ -116,7 +138,7 @@ export const BROKER_QUERIES = [
     category: "a",
     label: "startup FAILURE (workspace root unset)",
     observable: true,
-    logql: `${BROKER_STREAM} |= \`${SELF_PREFIX}PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset\``,
+    logql: `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX + SELF_WORKSPACE_UNSET)}\``,
     note: "runtime.ts:33 throw, surfaced by :55. The only named startup failure.",
   },
   {
@@ -127,8 +149,11 @@ export const BROKER_QUERIES = [
     // runtime.ts:55 writes a raw `error.message` for anything createPublishBrokerServer
     // throws (EADDRINUSE on a stale socket, mkdir failure, ...). Those are Node
     // messages and carry no prefix, and refusals are the only other unprefixed
-    // lines -- hence both exclusions.
-    logql: `${BROKER_STREAM} != \`${SELF_PREFIX}\` !~ \`(?i)^(${REFUSAL_OPENINGS.map(escapeForLogqlRegex).join("|")})\``,
+    // lines -- hence both exclusions. Both are ANCHORED and case-SENSITIVE so
+    // this matcher mirrors classifyBrokerLine's startsWith exactly; an
+    // unanchored `!=` excluded a line merely CONTAINING the prefix, which the
+    // classifier counts here.
+    logql: `${BROKER_STREAM} !~ \`^${escapeForLogqlRegex(SELF_PREFIX)}\` !~ \`^(${REFUSAL_OPENINGS.map(escapeForLogqlRegex).join("|")})\``,
     note: "runtime.ts:55. Residual bucket: unprefixed and not a refusal ⇒ an unnamed startup error.",
   },
   {
@@ -138,6 +163,28 @@ export const BROKER_QUERIES = [
     observable: true,
     logql: `${BROKER_STREAM} |~ \`^(${REFUSAL_OPENINGS.map(escapeForLogqlRegex).join("|")})\``,
     note: "broker.ts:366 logging a policy.ts refusal. Anchored because the messages are unprefixed.",
+  },
+  {
+    id: "request_error_other",
+    category: "b",
+    label: "request rejected (unexpected error — not a policy refusal)",
+    observable: true,
+    // broker.ts:366, the NON-refusal branch. Anything parsePublishBrokerRequest
+    // or startChild throws that is NOT a PublishBrokerRefusal is logged with the
+    // self prefix and then refused, so it is a request rejection and belongs to
+    // (b). Before this row existed those rejections were uncounted AND tripped
+    // the partition check's "a new log line has been added" warning, which was
+    // wrong: nothing had been added. Defined as the complement of the known
+    // prefixed shapes, because the message is an arbitrary Node error string
+    // with no distinguishing text of its own.
+    logql:
+      `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}\`` +
+      ` !~ \`^${escapeForLogqlRegex(SELF_PREFIX)}(${KNOWN_SELF_SHAPES.join("|")})\``,
+    note:
+      "broker.ts:366 non-refusal branch — a malformed request, or a workspace-prep failure in " +
+      "startChild. ⚠ This is ALSO where a NEWLY ADDED prefixed line would land: the two are " +
+      "textually indistinguishable, so this count is the novelty signal. If it moves and no " +
+      "publish was rejected, re-read the broker's stderr sites.",
   },
   {
     id: "protocol_refusal",
@@ -197,12 +244,14 @@ export function classifyBrokerLine(line) {
   const text = String(line ?? "");
   if (text.startsWith(SELF_PREFIX)) {
     const rest = text.slice(SELF_PREFIX.length);
-    if (rest.startsWith("listening on")) return "startup_listening";
-    if (rest.startsWith("PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset")) return "startup_failure_workspace_root";
+    if (rest.startsWith(SELF_LISTEN)) return "startup_listening";
+    if (rest.startsWith(SELF_WORKSPACE_UNSET)) return "startup_failure_workspace_root";
     for (const tool of BROKERED_TOOLS) {
       if (rest.startsWith(`${tool} in /`)) return "invocation_accepted";
     }
-    return "self_reported_other";
+    // broker.ts:366's non-refusal branch. NOT a residual "we do not know what
+    // this is" bucket -- it is a known, counted site. See request_error_other.
+    return "request_error_other";
   }
   for (const opening of REFUSAL_OPENINGS) {
     if (text.startsWith(opening)) return "policy_refusal";
@@ -227,10 +276,13 @@ export function formatReport(rows, { window, streamTotal, newest }) {
   const out = [];
   out.push(`broker soak queries — ${BROKER_STREAM} — window ${window}`);
   out.push("");
+  // Width is computed, not a literal: a label longer than a hardcoded pad
+  // silently breaks the column alignment of every row below it.
+  const labelWidth = rows.reduce((w, r) => Math.max(w, r.label.length), 0);
   for (const r of rows) {
     const value = r.observable ? String(r.count) : "NOT OBSERVABLE";
     const tag = `[${r.category}]`.padEnd(14);
-    out.push(`  ${tag} ${r.label.padEnd(48)} ${value.padStart(15)}`);
+    out.push(`  ${tag} ${r.label.padEnd(labelWidth)} ${value.padStart(15)}`);
   }
   out.push("");
   // The liveness control. §5.3's whole point is that silence and absence are
@@ -247,7 +299,10 @@ export function formatReport(rows, { window, streamTotal, newest }) {
   if (streamTotal > 0 && classified !== streamTotal) {
     out.push("");
     out.push(`  ⚠ ${streamTotal - classified} line(s) matched no category — the partition is incomplete.`);
-    out.push("    Re-read the broker's stderr sites; a new log line has been added.");
+    out.push("    The categories are a TOTAL partition by construction, so this does not mean a");
+    out.push("    new log line was added: a new prefixed line is counted as 'request rejected");
+    out.push("    (unexpected error)' and a new unprefixed one as 'startup FAILURE (unexpected)'.");
+    out.push("    It means a shipped matcher does not behave in Loki as classifyBrokerLine does.");
   }
   return out.join("\n");
 }

@@ -46,8 +46,16 @@ pasting LogQL into Grafana.
 
 The script also checks that the categories **partition** the stream: if the
 counted categories do not sum to the stream total, it says how many lines
-matched nothing. That is the signal that someone added a log line and these
-queries have gone stale.
+matched nothing.
+
+⚠️ **That is not a "someone added a log line" signal, and it used to say it
+was.** The categories are a *total* partition by construction — every prefixed
+line the matchers do not recognise is counted as **request rejected
+(unexpected error)**, and every unprefixed one as **startup FAILURE
+(unexpected)**. So a novel line is always counted somewhere, and a non-zero
+residual instead means a shipped LogQL matcher does not behave in Loki's RE2
+engine the way `classifyBrokerLine` does in JS. **Novelty shows up as one of
+those two counts moving, not as a partition gap.**
 
 ## What reaches the broker container's stderr, and what does not
 
@@ -58,7 +66,7 @@ had already rotted to `:278,366,417` by the time this was written.
 | §5.3 category | Observable in Loki? | Where |
 |---|---|---|
 | (a) startup failures | ✅ yes | `github-publish-broker-runtime.ts` — the listen line, and `process.stderr.write` on the catch |
-| (b) policy refusals | ⚠️ **partly** | `PublishBrokerRefusal` from `github-publish-broker-policy.ts`, logged via `ctx.log` in `github-publish-broker.ts`. The four protocol-level `refuse()` calls are **socket-only** |
+| (b) policy refusals | ⚠️ **partly** | Two observable sites, both through `ctx.log` in `github-publish-broker.ts`: a `PublishBrokerRefusal` from `github-publish-broker-policy.ts` (unprefixed), and the **non-refusal** branch of the same `catch` — anything `parsePublishBrokerRequest` or `startChild` throws, prefixed. The four protocol-level `refuse()` calls are **socket-only** |
 | (c) child non-zero exits | ⛔ **no** | `sendExit()` frames the exit code to the **socket**. Nothing writes it to stderr |
 
 ⚠️ **§5.3 states the broker "writes refusals and child stderr to its own
@@ -93,20 +101,28 @@ Copy-pasteable equivalents:
 
 ```logql
 # (a) startup OK — the denominator. A brokered pod with no listen line did not start.
-{namespace="paperclip",container="github-publish-broker"} |= `paperclip-github-broker: listening on`
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: listening on`
 
 # (a) startup FAILURE, named
-{namespace="paperclip",container="github-publish-broker"} |= `paperclip-github-broker: PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset`
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset`
 
 # (a) startup FAILURE, unexpected — unprefixed, and not a refusal
-{namespace="paperclip",container="github-publish-broker"} != `paperclip-github-broker: ` !~ `(?i)^(refusing |the\ broker\ performs\ pushes,\ and\ this\ is\ )`
+{namespace="paperclip",container="github-publish-broker"} !~ `^paperclip-github-broker: ` !~ `^(refusing |the broker performs pushes, and this is )`
 
 # (b) policy refusal
-{namespace="paperclip",container="github-publish-broker"} |~ `^(refusing |the\ broker\ performs\ pushes,\ and\ this\ is\ )`
+{namespace="paperclip",container="github-publish-broker"} |~ `^(refusing |the broker performs pushes, and this is )`
+
+# (b) request rejected by a NON-refusal error (malformed request, workspace-prep failure)
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: ` !~ `^paperclip-github-broker: (listening on|PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset|(git|gh|github-mcp-server) in /)`
 
 # denominator: publish attempts, per door
-{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip\-github\-broker:\ (git|gh|github\-mcp\-server) in /`
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: (git|gh|github-mcp-server) in /`
 ```
+
+Every matcher above is **anchored** at `^` and **case-sensitive**, because
+`classifyBrokerLine` partitions with `startsWith` and the test suite asserts the
+two agree line-for-line. An unanchored `|=` or `!=` matches the prefix anywhere
+in the line, which a refusal quoting an agent-supplied path can satisfy.
 
 **Why the refusal matcher is anchored and unprefixed.** Lines the broker writes
 about *itself* carry `paperclip-github-broker: `. `PublishBrokerRefusal`
@@ -115,17 +131,44 @@ every refusal in the policy module opens with `refusing ` or `the broker
 performs pushes, and this is `. Anchoring stops a refusal that *quotes* a
 command from being counted as an invocation.
 
+## ⚠️ These counters are agent-forgeable today
+
+Refusal messages interpolate agent-supplied values verbatim — the working
+directory and argument tokens in `github-publish-broker-policy.ts` — and
+nothing on the path to `ctx.log` strips CR/LF. An agent that sends a `cwd`
+containing a newline plus a line of its own choosing gets that line into
+`container="github-publish-broker"`, indistinguishable from one the broker
+wrote. It can inflate any counter here, including a forged accept line.
+
+**Read a mid-soak spike with that in mind.** The impact today is bounded to
+these counters, which are a dashboard — this is **not** a merge or soak
+blocker, and the same primitive was rated non-blocking on review of
+[#3205](https://github.com/Blockcast/paperclip/pull/3205) at that scope.
+
+⛔ **It stops being bounded the moment category (c) lands.** That change makes
+these lines the durable record of publish *outcomes*, and the principal who can
+forge them is the one the broker exists to constrain. **PEN-5185 owns the
+sanitiser and must land it in the same change as the (c) logging**, not as a
+follow-up: a sanitiser that arrives afterwards leaves a window in which the
+lines are trusted and still forgeable.
+
 ## Verifying the tooling itself
 
 ```bash
 node --test scripts/github-publish-broker-soak-queries.test.mjs
 ```
 
-The tests assert the shipped LogQL regexes against message strings copied
-verbatim from the broker source, in both directions (every refusal matches, no
-accept or startup line does). If a broker message is reworded, re-copy the
-fixtures from source — they are the guard against the queries silently ceasing
-to match.
+The tests assert the shipped LogQL against message strings copied verbatim from
+the broker source. The central one evaluates each query's **actual line-filter
+chain** and requires that **exactly one** observable query match each fixture,
+and that it be the one `classifyBrokerLine` picks — so a line the broker really
+writes can neither go uncounted (which is what produced the false "queries have
+gone stale" alarm) nor be counted twice. The LogQL fences in this file are
+checked against `BROKER_QUERIES` by the same suite, so this runbook cannot drift
+from the shipped queries.
+
+If a broker message is reworded, re-copy the fixtures from source — they are the
+guard against the queries silently ceasing to match.
 
 ## Related
 
