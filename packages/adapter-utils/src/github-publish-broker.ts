@@ -35,6 +35,7 @@ import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, unlinkSync } f
 import net from "node:net";
 import path from "node:path";
 import { EGRESS_GUARD_BIN_DIR } from "./egress-guard-path.js";
+import { scrubGitHubEgressText } from "./github-egress-scrub.js";
 
 import {
   BROKER_ROLE_ENV,
@@ -265,6 +266,115 @@ export function prepareBrokeredInvocation(options: {
   };
 }
 
+/**
+ * How a brokered connection ended, as a closed set.
+ *
+ * PEN-5185. §5.3 of the enablement plan asks the soak for a query separating
+ * (a) startup failures, (b) policy refusals and (c) child non-zero exits. Until
+ * this existed the broker reported every OUTCOME to the socket — back to the
+ * agent — and wrote only its INPUTS to its own stderr, so (c) was not quiet,
+ * it was structurally absent, and a dashboard panel for it printed `0` forever.
+ * `0` and "no child ever failed" are byte-identical, which is the exact
+ * confusion §5.3 exists to prevent.
+ *
+ * A closed set rather than free text because the query has to PARTITION the
+ * stream: a line that matches no category and a category that counts no line
+ * are the same reading mistake one level up.
+ */
+export type PublishBrokerOutcome =
+  /** The child ran and exited. `code` is its own exit status. */
+  | "exit"
+  /** The child never started — exec failed. The tool did no work at all. */
+  | "spawn-failed"
+  /** The broker refused, before or instead of running anything. */
+  | "refused";
+
+/**
+ * The one line the broker writes about how a connection ended.
+ *
+ * ⛔ **It carries the exit code and the tool name. It never carries the child's
+ * bytes.** The broker's stderr reaches Loki, which outlives the pod's
+ * `ttlSecondsAfterFinished: 300` — so relaying `git`/`gh` output here would
+ * turn an observability fix into a durable credential-disclosure path (a push
+ * URL can embed a token). `child.stderr` stays socket-only, which is where the
+ * agent that asked for the publish already reads it.
+ *
+ * `refused` carries its reason because that text is the broker's own prose, not
+ * the child's. It is still passed through {@link scrubGitHubEgressText} first:
+ * several refusals interpolate caller argv (a `-c` spelling, a `cwd`, a path
+ * token), and this is the same scrubber the push door itself uses — one
+ * definition of what may leave, as the header comment requires. The agent's
+ * copy over the socket is deliberately NOT scrubbed or collapsed: it is the
+ * diagnostic, and it never leaves the pod.
+ *
+ * `refused` and `exit` are spelled differently on purpose. `refuse` defaults to
+ * code 64 and a child can genuinely return 64, so the code alone cannot
+ * separate them — the verb is what the query anchors on.
+ *
+ * The detail is capped at {@link MAX_OUTCOME_DETAIL_CHARS}. It is caller-
+ * controlled up to `MAX_REQUEST_BYTES` (1 MiB) — `unknown tool
+ * ${JSON.stringify(candidate.tool)}` echoes whatever JSON arrived — so without
+ * a cap one refusal can emit a one-megabyte Loki line, and `sendExit` is now
+ * the single chokepoint every connection passes through.
+ */
+export function formatBrokerOutcomeLine(fields: {
+  outcome: PublishBrokerOutcome;
+  tool: BrokeredTool | null;
+  code: number;
+  detail?: string;
+}): string {
+  // `-` when the connection was refused before a request was parsed: there is
+  // no tool, and naming one would invent a door that was never asked for.
+  const parts = [`paperclip-github-broker: ${fields.outcome} ${fields.tool ?? "-"} code=${fields.code}`];
+  if (fields.detail !== undefined) {
+    // Collapsed to one physical line: the partition check counts LINES, so a
+    // multi-line reason would read as several uncategorised entries.
+    //
+    // The emptiness test is on the SCRUBBED text, and that one test is enough:
+    // an empty input and an input that was entirely whitespace both land here
+    // as "", so a second guard on the raw value is unreachable (mutating it
+    // alone kills no test, because this line already covers it).
+    const scrubbed = scrubGitHubEgressText(fields.detail).text.replace(/\s+/g, " ").trim();
+    if (scrubbed !== "") parts.push(`detail=${truncateOutcomeDetail(scrubbed)}`);
+  }
+  return parts.join(" ");
+}
+
+/**
+ * The cap on a refusal reason, in characters.
+ *
+ * Sized by measurement, not by taste: the longest refusal the policy module can
+ * author is 341 characters of static prose, and the interpolating ones add a
+ * `cwd`, a resolved path and a roots list on top. 1024 keeps every legitimate
+ * refusal whole — the reason is the security-relevant half of the line, since a
+ * bare count cannot separate a client stutter from an attempted policy bypass —
+ * while bounding the caller-controlled case from 1 MiB to 1 KiB.
+ */
+export const MAX_OUTCOME_DETAIL_CHARS = 1024;
+
+/**
+ * Spelled so it cannot be confused with {@link redactionMarker}'s output. A
+ * reader who sees a cut-off line has to be able to tell "the rest was too long"
+ * from "the rest was a credential"; collapsing those two into one marker would
+ * make a scrub look like a length accident.
+ */
+export const OUTCOME_DETAIL_TRUNCATION_MARKER = "[paperclip-github-broker: detail truncated]";
+
+/**
+ * ⚠ Truncation happens AFTER the scrub, and the order is the security property
+ * — not a style choice.
+ *
+ * Cutting first can sever a credential below the length its detector matches
+ * on, so the scrubber then finds nothing and the surviving prefix is emitted
+ * verbatim: a token that straddles the cap would leak its first bytes into a
+ * log that outlives the pod. Scrubbing first replaces the whole token with a
+ * marker, and only then is the (now safe) text cut to length.
+ */
+function truncateOutcomeDetail(scrubbed: string): string {
+  if (scrubbed.length <= MAX_OUTCOME_DETAIL_CHARS) return scrubbed;
+  return `${scrubbed.slice(0, MAX_OUTCOME_DETAIL_CHARS)}${OUTCOME_DETAIL_TRUNCATION_MARKER}`;
+}
+
 export interface PublishBrokerServer {
   /** The listening socket path. */
   socketPath: string;
@@ -326,15 +436,52 @@ function handleConnection(ctx: {
   let child: ReturnType<typeof spawn> | null = null;
   let finished = false;
 
-  const sendExit = (code: number) => {
+  // One chokepoint, so there is exactly one outcome line per connection and no
+  // path off this process that reports a result without being counted.
+  // `child.on("error")` and `child.on("close")` both funnel through here, which
+  // is what makes (c) and spawn failure one place rather than two.
+  const sendExit = (code: number, outcome: PublishBrokerOutcome = "exit", detail?: string) => {
     if (finished) return;
     finished = true;
+    // ⚠ The EXIT frame goes FIRST, and the log is wrapped. Both halves matter,
+    // and neither is defensive decoration.
+    //
+    // `finished` latches above, so there is no second attempt at either side
+    // effect. Every caller of this — the `socket.on("data")` handler,
+    // `child.on("close")`, `child.on("error")` — is an EventEmitter callback
+    // with no `try` above it, so a throw escaping here is an
+    // `uncaughtException`: it does not fail this connection, it kills the
+    // broker process, and with it every publish for the remaining life of the
+    // Job. The default `ctx.log` is `process.stderr.write`, which throws on a
+    // broken pipe, and `formatBrokerOutcomeLine` runs the scrubber's whole
+    // regex battery — so this is a reachable throw, not a theoretical one.
+    //
+    // §6's rollback standard is the other half: "a Job that never renders is
+    // indistinguishable from 'the broker broke dispatch'". A dead sidecar is
+    // exactly that shape, so it must not be reachable from a log failure.
+    //
+    // Ordering is belt and braces for the same hazard: the client's exit must
+    // not be downstream of the log even if the guard below is ever removed.
+    // The log reaching Loki after the socket closed costs nothing — the
+    // partition counts lines, not their arrival order.
     socket.end(encodeFrame(ServerFrameKind.EXIT, JSON.stringify({ code })));
+    try {
+      ctx.log(formatBrokerOutcomeLine({ outcome, tool: request?.tool ?? null, code, detail }));
+    } catch {
+      // Deliberately silent: the thing that failed IS the way this process
+      // reports. The loss is not invisible — the §5.3 partition compares accept
+      // lines against outcome lines, and a dropped outcome shows up there as an
+      // imbalance rather than as a miscount inside a category.
+    }
   };
   const refuse = (message: string, code = 64) => {
     if (finished) return;
     socket.write(encodeFrame(ServerFrameKind.STDERR, `${message}\n`));
-    sendExit(code);
+    // The agent's copy is written above, unscrubbed and unwrapped. The log copy
+    // goes through `sendExit` so a refusal cannot be counted twice, and so the
+    // four protocol refusals that never touched the policy module are observable
+    // for the first time.
+    sendExit(code, "refused", message);
   };
 
   socket.on("error", () => {
@@ -363,7 +510,9 @@ function handleConnection(ctx: {
             error instanceof PublishBrokerRefusal
               ? error.message
               : `paperclip-github-broker: ${error instanceof Error ? error.message : String(error)}`;
-          ctx.log(message);
+          // No `ctx.log` here: `refuse` logs. Logging in both places made every
+          // policy refusal two Loki lines and one socket frame, which no
+          // partition can balance.
           refuse(message);
           return;
         }
@@ -405,7 +554,7 @@ function startChild(
   },
   request: PublishBrokerRequest,
   socket: net.Socket,
-  sendExit: (code: number) => void,
+  sendExit: (code: number, outcome?: PublishBrokerOutcome, detail?: string) => void,
 ): ReturnType<typeof spawn> {
   const prepared = prepareBrokeredInvocation({
     request,
@@ -432,7 +581,11 @@ function startChild(
         `paperclip-github-broker: unable to start ${request.tool} (${error.code ?? error.message})\n`,
       ),
     );
-    sendExit(1);
+    // Its own outcome, not an `exit` of 1: the tool never ran, so counting it
+    // as a child failure would overstate (c) and hide the class §5.3 does not
+    // name at all. `error.code` is Node's own (`ENOENT`, `EACCES`), not child
+    // output.
+    sendExit(1, "spawn-failed", error.code ?? error.message);
   });
   child.on("close", (code, signal) => {
     prepared.cleanup();

@@ -440,20 +440,92 @@ quietly, so a soak that watches only "did PRs get opened" would pass a broker th
 
 ### 5.3 Observability, and its one real gap
 
-The broker writes refusals and child stderr to **its own container's stderr**
-(`github-publish-broker.ts:271,329,419`; `github-publish-broker-runtime.ts:39,55`), which reaches Loki
-as `container="github-publish-broker"`. There is **no metric** — no counter of brokered publishes,
+The broker writes to **its own container's stderr**, which reaches Loki as
+`container="github-publish-broker"`. There is **no metric** — no counter of brokered publishes,
 refusals, or errors.
+
+⚠ **Anchors are symbols, not line numbers.** This paragraph used to cite
+`github-publish-broker.ts:271,329,419`; by 2026-11-01 those had rotted to `:278,366,417` without a
+line of this section changing, and the PEN-5185 fix below moved them again. Grep the symbol
+(PEN-5091).
+
+**What reaches that stderr, as of PEN-5185:**
+
+| Site | Class |
+|---|---|
+| `main()` in `github-publish-broker-runtime.ts` — the listen line and the `catch` | **(a) startup**, success and failure |
+| `ctx.log` in `startChild` | the **denominator** — one line per accepted invocation, per door |
+| `formatBrokerOutcomeLine` via `sendExit` | **(b) refusals and (c) child exits** — one line per connection, carrying the outcome verb, the tool and the code |
+
+⛔ **What is deliberately NOT written there: the child's bytes.** `child.stderr` is relayed to the
+socket, back to the agent that asked for the publish, and nowhere else. It is `git`/`gh` output and
+can carry a URL with an embedded token; Loki outlives the pod's `ttlSecondsAfterFinished: 300`, so
+teeing it into the container log would convert this observability surface into a durable
+credential-disclosure path. The outcome line carries the exit code and the tool name only. A refusal
+also carries its own prose reason, passed through `scrubGitHubEgressText` first because several
+refusals interpolate caller argv.
+
+Two properties a query writer has to know about that reason:
+
+- **It is capped** at `MAX_OUTCOME_DETAIL_CHARS` (1024) and a cut line ends in
+  `[paperclip-github-broker: detail truncated]`. The reason is caller-influenced up to the 1 MiB
+  request cap, so without a bound one refusal could emit a one-megabyte Loki line. The truncation
+  marker is spelled so it cannot be read as `[paperclip-egress-scrub redacted: …]`: *"the rest was
+  too long"* and *"the rest was a credential"* are different facts and must not share a marker.
+  Scrubbing happens **before** truncation, because cutting first could sever a token below the
+  length its detector matches on and emit the surviving prefix verbatim.
+- **It is best-effort.** A throw from the log call cannot cost the connection its `EXIT` frame and
+  cannot kill the sidecar — these are EventEmitter callbacks, so an uncaught throw there would end
+  the broker process and every publish for the rest of the Job's life, which is precisely the §6
+  *"a Job that never renders is indistinguishable from 'the broker broke dispatch'"* shape. The
+  consequence for a reader: a dropped outcome line shows up as an **imbalance between the accept
+  count and the outcome count**, not as a miscount inside a category. Compare the two.
+
+**Corrected by PEN-5185; recorded because the error was load-bearing.** This section
+previously claimed the broker "writes refusals and child stderr to its own container's stderr".
+Both halves were wrong. Child stderr went to the socket and never to the log — and the broker framed
+every publish *outcome* to the socket too, so its own stderr carried only the *inputs*. Three
+classes were therefore structurally unobservable, not merely quiet: **(c) in its entirety**, **spawn
+failures** (which this section did not name at all), and the **protocol half of (b)** — four of
+`refuse`'s five call sites never touched the policy module and so never reached a log. A dashboard
+panel for (c) would have printed `0` forever, and `0` is byte-identical to *"no child ever failed"*,
+which is the exact confusion this section exists to prevent. `sendExit` and `refuse` now log through
+one chokepoint. ⛔ The outcome verb, not the exit code, separates a refusal from a child exit:
+`refuse` defaults to `64` and a child can genuinely return `64`.
 
 With `ttlSecondsAfterFinished: 300`, **Loki is the only durable record** of what the broker did; the
 pod is gone five minutes after the run. This is the same completeness argument PEN-4988 makes for
 trigger 2, and it has the same consequence: soak evidence must be collected from Loki inside the
 window, not reconstructed from the cluster afterwards.
 
-**Minimum soak instrumentation, which does not exist yet and is in scope for stage 0:** a saved query
-over `{namespace="paperclip",container="github-publish-broker"}` separating (a) startup failures,
+**Minimum soak instrumentation, in scope for stage 0:** a saved query over
+`{namespace="paperclip",container="github-publish-broker"}` separating (a) startup failures,
 (b) policy refusals, (c) child non-zero exits. Without it stage 1 is unfalsifiable — a silent broker
-and a broker nobody asked to publish look identical.
+and a broker nobody asked to publish look identical. Shipped by PEN-5181 as
+`scripts/github-publish-broker-soak-queries.mjs` and `runbooks/github-publish-broker-soak-queries.md`;
+that tool prints `NOT OBSERVABLE` rather than `0` for any category the broker cannot yet emit, which
+is the right stopgap and is why a stage-1 reading of it is honest even where this section was not.
+
+⛔ **Stage 1 still confirms its own observations agent-side.** PEN-5185 lands *between stage 1 and
+stage 2*, deliberately: changing the logging of the component under test days before its first
+real-traffic soak would mean the thing soaked is not the thing reviewed, and §7 is explicit that
+stage 0 carries no PR merges. So §7's observations (b) a real `git push`, (c) a real non-push `gh`
+and (d) an MCP tool call are confirmed from the run log and from the PR existing — not from the
+broker container. §5.2 already predicts that asymmetry for `gh` and MCP. From stage 2 on, where the
+population is a whole company and confirming every publish outcome agent-side stops being
+affordable, the broker's own logs carry it.
+
+**The window is a predicate, not a date** (Security, under §11.3): *after stage-1 exit is declared,
+before stage-2 start*. It moves when stage 1 moves — §11.3 re-set stages 2 and 3 as `stage-1
+exit + 1 working day` for exactly this reason, and a fixed date here would repeat the mistake one
+level down. In the earliest case that window is a **single working day**, so the review is done
+*during* stage 1 and only the merge is held.
+
+⛔ **Decided fallback, recorded now rather than settled under time pressure:** if this change is not
+ready to land when stage 2 would otherwise start, **stage 2 starts on time** and the change slides
+to the stage-2 → stage-3 boundary. It is not landed mid-stage, and no stage is delayed to fit it.
+The soak is the only part of this plan that produces evidence (§11.3); an observability improvement
+must not compress it.
 
 ## 6. Rollback — who decides, and on what evidence
 
