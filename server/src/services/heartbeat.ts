@@ -43305,19 +43305,65 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   ] as const;
 
   /**
+   * The SQL form of "no successor has picked this failed wake back up", built
+   * from the same TERMINAL_FAILED_WAKE_SUCCESSOR_* constants as the JS path.
+   * Shared by the uncapped age aggregate and the no-action probe selection
+   * (BLO-51129, Ally): probing a key a successor already resolved spends
+   * GitHub calls on a row that can never reach the gauge.
+   */
+  function terminalFailedWakeSuccessorPredicates(cutoff: Date) {
+    const successorStatusList = (statuses: readonly string[]) =>
+      sql.join(
+        statuses.map((status) => sql`${status}`),
+        sql`, `,
+      );
+    return [
+      sql`not exists (
+        select 1
+        from agent_wakeup_requests successor_wake
+        where lower(successor_wake.payload ->> 'taskKey') = lower(${agentWakeupRequests.payload} ->> 'taskKey')
+          and successor_wake.id <> ${agentWakeupRequests.id}
+          and successor_wake.requested_at > ${agentWakeupRequests.finishedAt}
+          and successor_wake.requested_at > ${cutoff.toISOString()}::timestamptz
+          and successor_wake.status in (${successorStatusList(
+            TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES,
+          )})
+      )`,
+      sql`not exists (
+        select 1
+        from heartbeat_runs successor_run
+        where lower(successor_run.context_task_key) = lower(${agentWakeupRequests.payload} ->> 'taskKey')
+          and successor_run.created_at > ${cutoff.toISOString()}::timestamptz
+          and (
+            (successor_run.created_at > ${agentWakeupRequests.finishedAt}
+              and successor_run.status in (${successorStatusList(
+                TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES,
+              )}))
+            or (successor_run.status = 'succeeded'
+              and successor_run.created_at > ${agentWakeupRequests.requestedAt})
+          )
+      )`,
+    ];
+  }
+
+  /**
    * BLO-51129: GitHub-side resolution for unresolved `pr_review` rows. Measured
    * 2026-11-01, every row behind the page needed no action: its PR was closed,
    * or a trusted review already sat at the current head. Neither fact is in the
    * DB, so the publisher asks GitHub, with the same predicate the failed-gate
    * notice uses (`prReviewGateNoticeSuppression`, `sha: null` = current head).
    *
-   * Bounded so a tick cannot fan out: oldest keys first (they set the paged
-   * age), at most PROBES_PER_TICK uncached probes, results cached for TTL. A
-   * probe error resolves nothing, so the failure direction is still "page".
+   * Bounded so a tick cannot fan out: only keys with a row no successor has
+   * resolved (the rows that can actually page), oldest first (they set the
+   * paged age), at most PROBES_PER_TICK uncached probes, results cached for
+   * TTL, and no new probes while a previous tick's probes are still in flight
+   * (a slow GitHub would otherwise let overlapping ticks probe the same keys).
+   * A probe error resolves nothing, so the failure direction is still "page".
    */
   const PR_REVIEW_NO_ACTION_PROBE_TTL_MS = 10 * 60 * 1000;
   const PR_REVIEW_NO_ACTION_PROBES_PER_TICK = 10;
   const prReviewNoActionProbeCache = new Map<string, { checkedAt: number; noAction: boolean }>();
+  let prReviewNoActionProbing = false;
 
   async function selectNoActionPrReviewTaskKeys(cutoff: Date, now: Date): Promise<Set<string>> {
     for (const [key, entry] of prReviewNoActionProbeCache) {
@@ -43332,23 +43378,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           eq(agentWakeupRequests.status, "failed"),
           gte(agentWakeupRequests.finishedAt, cutoff),
           sql`coalesce(${agentWakeupRequests.payload} ->> 'taskKey' like 'pr\\_review:%', false)`,
+          ...terminalFailedWakeSuccessorPredicates(cutoff),
         ),
       )
       .groupBy(taskKeyLower)
       .orderBy(sql`min(${agentWakeupRequests.finishedAt}) asc`);
     const noAction = new Set<string>();
-    let probes = 0;
-    for (const { taskKey } of keys) {
-      if (!taskKey) continue;
-      const cached = prReviewNoActionProbeCache.get(taskKey);
-      if (!cached) {
-        const pr = parsePrReviewTaskKey(taskKey);
-        if (!pr || probes >= PR_REVIEW_NO_ACTION_PROBES_PER_TICK) continue;
-        probes += 1;
-        const verdict = await prReviewGateNoticeSuppression({ ...pr, sha: null });
-        prReviewNoActionProbeCache.set(taskKey, { checkedAt: now.getTime(), noAction: verdict !== null });
+    const mayProbe = !prReviewNoActionProbing;
+    if (mayProbe) prReviewNoActionProbing = true;
+    try {
+      let probes = 0;
+      for (const { taskKey } of keys) {
+        if (!taskKey) continue;
+        const cached = prReviewNoActionProbeCache.get(taskKey);
+        if (!cached) {
+          const pr = parsePrReviewTaskKey(taskKey);
+          if (!mayProbe || !pr || probes >= PR_REVIEW_NO_ACTION_PROBES_PER_TICK) continue;
+          probes += 1;
+          const verdict = await prReviewGateNoticeSuppression({ ...pr, sha: null });
+          prReviewNoActionProbeCache.set(taskKey, { checkedAt: now.getTime(), noAction: verdict !== null });
+        }
+        if (prReviewNoActionProbeCache.get(taskKey)?.noAction) noAction.add(taskKey);
       }
-      if (prReviewNoActionProbeCache.get(taskKey)?.noAction) noAction.add(taskKey);
+    } finally {
+      if (mayProbe) prReviewNoActionProbing = false;
     }
     return noAction;
   }
@@ -43486,11 +43539,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
        * truth. A row with a null taskKey cannot be matched by either subquery,
        * so `not exists` holds and it counts as unresolved, matching the JS path.
        */
-      const successorStatusList = (statuses: readonly string[]) =>
-        sql.join(
-          statuses.map((status) => sql`${status}`),
-          sql`, `,
-        );
       const selectOldestUnresolvedFinishedAt = async () => {
         const scopeExpr = sql<boolean>`${isPrReviewTaskKey}`;
         const aggregated = await db
@@ -43504,31 +43552,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(agentWakeupRequests.status, "failed"),
               gte(agentWakeupRequests.finishedAt, cutoff),
               notNoActionPrReview,
-              sql`not exists (
-                select 1
-                from agent_wakeup_requests successor_wake
-                where lower(successor_wake.payload ->> 'taskKey') = lower(${wakeTaskKey})
-                  and successor_wake.id <> ${agentWakeupRequests.id}
-                  and successor_wake.requested_at > ${agentWakeupRequests.finishedAt}
-                  and successor_wake.requested_at > ${cutoff.toISOString()}::timestamptz
-                  and successor_wake.status in (${successorStatusList(
-                    TERMINAL_FAILED_WAKE_SUCCESSOR_WAKE_STATUSES,
-                  )})
-              )`,
-              sql`not exists (
-                select 1
-                from heartbeat_runs successor_run
-                where lower(successor_run.context_task_key) = lower(${wakeTaskKey})
-                  and successor_run.created_at > ${cutoff.toISOString()}::timestamptz
-                  and (
-                    (successor_run.created_at > ${agentWakeupRequests.finishedAt}
-                      and successor_run.status in (${successorStatusList(
-                        TERMINAL_FAILED_WAKE_SUCCESSOR_RUN_STATUSES,
-                      )}))
-                    or (successor_run.status = 'succeeded'
-                      and successor_run.created_at > ${agentWakeupRequests.requestedAt})
-                  )
-              )`,
+              ...terminalFailedWakeSuccessorPredicates(cutoff),
             ),
           )
           .groupBy(scopeExpr);
