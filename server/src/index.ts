@@ -2961,7 +2961,10 @@ export async function startServer(): Promise<StartedServer> {
       // set is reachable either way. The cost is duplicated MDS unlink load
       // and ENOENT races between the two executors, not wider deletion. Closing
       // it properly means an abort flag the per-claim loop checks between
-      // claims, which belongs in the sweep rather than in this call site.
+      // claims, which belongs in the sweep rather than in this call site:
+      // tracked as PEN-5216, which also carries what the executor reports on
+      // an ENOENT race with a second executor -- read as a failure, that would
+      // make a successful reclaim look broken.
       superviseLeased("isolation-reclaim-sweep", () =>
         startIsolationReclaimSweep(
           db,
