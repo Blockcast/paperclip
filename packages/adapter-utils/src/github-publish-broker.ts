@@ -310,6 +310,12 @@ export type PublishBrokerOutcome =
  * `refused` and `exit` are spelled differently on purpose. `refuse` defaults to
  * code 64 and a child can genuinely return 64, so the code alone cannot
  * separate them — the verb is what the query anchors on.
+ *
+ * The detail is capped at {@link MAX_OUTCOME_DETAIL_CHARS}. It is caller-
+ * controlled up to `MAX_REQUEST_BYTES` (1 MiB) — `unknown tool
+ * ${JSON.stringify(candidate.tool)}` echoes whatever JSON arrived — so without
+ * a cap one refusal can emit a one-megabyte Loki line, and `sendExit` is now
+ * the single chokepoint every connection passes through.
  */
 export function formatBrokerOutcomeLine(fields: {
   outcome: PublishBrokerOutcome;
@@ -329,9 +335,44 @@ export function formatBrokerOutcomeLine(fields: {
     // as "", so a second guard on the raw value is unreachable (mutating it
     // alone kills no test, because this line already covers it).
     const scrubbed = scrubGitHubEgressText(fields.detail).text.replace(/\s+/g, " ").trim();
-    if (scrubbed !== "") parts.push(`detail=${scrubbed}`);
+    if (scrubbed !== "") parts.push(`detail=${truncateOutcomeDetail(scrubbed)}`);
   }
   return parts.join(" ");
+}
+
+/**
+ * The cap on a refusal reason, in characters.
+ *
+ * Sized by measurement, not by taste: the longest refusal the policy module can
+ * author is 341 characters of static prose, and the interpolating ones add a
+ * `cwd`, a resolved path and a roots list on top. 1024 keeps every legitimate
+ * refusal whole — the reason is the security-relevant half of the line, since a
+ * bare count cannot separate a client stutter from an attempted policy bypass —
+ * while bounding the caller-controlled case from 1 MiB to 1 KiB.
+ */
+export const MAX_OUTCOME_DETAIL_CHARS = 1024;
+
+/**
+ * Spelled so it cannot be confused with {@link redactionMarker}'s output. A
+ * reader who sees a cut-off line has to be able to tell "the rest was too long"
+ * from "the rest was a credential"; collapsing those two into one marker would
+ * make a scrub look like a length accident.
+ */
+export const OUTCOME_DETAIL_TRUNCATION_MARKER = "[paperclip-github-broker: detail truncated]";
+
+/**
+ * ⚠ Truncation happens AFTER the scrub, and the order is the security property
+ * — not a style choice.
+ *
+ * Cutting first can sever a credential below the length its detector matches
+ * on, so the scrubber then finds nothing and the surviving prefix is emitted
+ * verbatim: a token that straddles the cap would leak its first bytes into a
+ * log that outlives the pod. Scrubbing first replaces the whole token with a
+ * marker, and only then is the (now safe) text cut to length.
+ */
+function truncateOutcomeDetail(scrubbed: string): string {
+  if (scrubbed.length <= MAX_OUTCOME_DETAIL_CHARS) return scrubbed;
+  return `${scrubbed.slice(0, MAX_OUTCOME_DETAIL_CHARS)}${OUTCOME_DETAIL_TRUNCATION_MARKER}`;
 }
 
 export interface PublishBrokerServer {
@@ -402,8 +443,36 @@ function handleConnection(ctx: {
   const sendExit = (code: number, outcome: PublishBrokerOutcome = "exit", detail?: string) => {
     if (finished) return;
     finished = true;
-    ctx.log(formatBrokerOutcomeLine({ outcome, tool: request?.tool ?? null, code, detail }));
+    // ⚠ The EXIT frame goes FIRST, and the log is wrapped. Both halves matter,
+    // and neither is defensive decoration.
+    //
+    // `finished` latches above, so there is no second attempt at either side
+    // effect. Every caller of this — the `socket.on("data")` handler,
+    // `child.on("close")`, `child.on("error")` — is an EventEmitter callback
+    // with no `try` above it, so a throw escaping here is an
+    // `uncaughtException`: it does not fail this connection, it kills the
+    // broker process, and with it every publish for the remaining life of the
+    // Job. The default `ctx.log` is `process.stderr.write`, which throws on a
+    // broken pipe, and `formatBrokerOutcomeLine` runs the scrubber's whole
+    // regex battery — so this is a reachable throw, not a theoretical one.
+    //
+    // §6's rollback standard is the other half: "a Job that never renders is
+    // indistinguishable from 'the broker broke dispatch'". A dead sidecar is
+    // exactly that shape, so it must not be reachable from a log failure.
+    //
+    // Ordering is belt and braces for the same hazard: the client's exit must
+    // not be downstream of the log even if the guard below is ever removed.
+    // The log reaching Loki after the socket closed costs nothing — the
+    // partition counts lines, not their arrival order.
     socket.end(encodeFrame(ServerFrameKind.EXIT, JSON.stringify({ code })));
+    try {
+      ctx.log(formatBrokerOutcomeLine({ outcome, tool: request?.tool ?? null, code, detail }));
+    } catch {
+      // Deliberately silent: the thing that failed IS the way this process
+      // reports. The loss is not invisible — the §5.3 partition compares accept
+      // lines against outcome lines, and a dropped outcome shows up there as an
+      // imbalance rather than as a miscount inside a category.
+    }
   };
   const refuse = (message: string, code = 64) => {
     if (finished) return;

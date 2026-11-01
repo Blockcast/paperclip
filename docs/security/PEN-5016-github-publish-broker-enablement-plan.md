@@ -465,6 +465,22 @@ credential-disclosure path. The outcome line carries the exit code and the tool 
 also carries its own prose reason, passed through `scrubGitHubEgressText` first because several
 refusals interpolate caller argv.
 
+Two properties a query writer has to know about that reason:
+
+- **It is capped** at `MAX_OUTCOME_DETAIL_CHARS` (1024) and a cut line ends in
+  `[paperclip-github-broker: detail truncated]`. The reason is caller-influenced up to the 1 MiB
+  request cap, so without a bound one refusal could emit a one-megabyte Loki line. The truncation
+  marker is spelled so it cannot be read as `[paperclip-egress-scrub redacted: …]`: *"the rest was
+  too long"* and *"the rest was a credential"* are different facts and must not share a marker.
+  Scrubbing happens **before** truncation, because cutting first could sever a token below the
+  length its detector matches on and emit the surviving prefix verbatim.
+- **It is best-effort.** A throw from the log call cannot cost the connection its `EXIT` frame and
+  cannot kill the sidecar — these are EventEmitter callbacks, so an uncaught throw there would end
+  the broker process and every publish for the rest of the Job's life, which is precisely the §6
+  *"a Job that never renders is indistinguishable from 'the broker broke dispatch'"* shape. The
+  consequence for a reader: a dropped outcome line shows up as an **imbalance between the accept
+  count and the outcome count**, not as a miscount inside a category. Compare the two.
+
 **Corrected by PEN-5185; recorded because the error was load-bearing.** This section
 previously claimed the broker "writes refusals and child stderr to its own container's stderr".
 Both halves were wrong. Child stderr went to the socket and never to the log — and the broker framed
@@ -498,6 +514,18 @@ and (d) an MCP tool call are confirmed from the run log and from the PR existing
 broker container. §5.2 already predicts that asymmetry for `gh` and MCP. From stage 2 on, where the
 population is a whole company and confirming every publish outcome agent-side stops being
 affordable, the broker's own logs carry it.
+
+**The window is a predicate, not a date** (Security, under §11.3): *after stage-1 exit is declared,
+before stage-2 start*. It moves when stage 1 moves — §11.3 re-set stages 2 and 3 as `stage-1
+exit + 1 working day` for exactly this reason, and a fixed date here would repeat the mistake one
+level down. In the earliest case that window is a **single working day**, so the review is done
+*during* stage 1 and only the merge is held.
+
+⛔ **Decided fallback, recorded now rather than settled under time pressure:** if this change is not
+ready to land when stage 2 would otherwise start, **stage 2 starts on time** and the change slides
+to the stage-2 → stage-3 boundary. It is not landed mid-stage, and no stage is delayed to fit it.
+The soak is the only part of this plan that produces evidence (§11.3); an observability improvement
+must not compress it.
 
 ## 6. Rollback — who decides, and on what evidence
 
