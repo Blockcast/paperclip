@@ -970,6 +970,82 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(listed?.triggers[0]?.cronExpression).toBe(cronExpression);
   });
 
+  // PEN-5179: a routine-health read of `GET /routines/:id` reported `triggers[]` absent and every
+  // schedule field `null` — indistinguishable from a disabled trigger — on a routine that had fired
+  // on time 93 minutes earlier. The serializers were not at fault: `getDetail` selects the FULL
+  // `routineTriggers` row, a strict superset of the nine fields `list` hand-projects. The reading
+  // was an artifact of a truncated read of a ~59 KB body in which `triggers` begins ~79% of the way
+  // in, behind the routine's own `description`.
+  //
+  // So the asymmetry that CAN bite is the other direction: `list` enumerates its trigger fields by
+  // hand, so a column added to the schema reaches `getDetail` for free and silently never reaches
+  // `list`. That is the drift a routine-health predicate would read as `null`. This pins both
+  // surfaces against one fixture: every schedule field must be present, non-null, and EQUAL on
+  // both, and every key `list` emits must survive on `getDetail` with the same value.
+  it("exposes the same non-null schedule fields on the list and detail surfaces", async () => {
+    const { companyId, routine, svc } = await seedFixture();
+    const created = await svc.createTrigger(routine.id, {
+      kind: "schedule",
+      label: "Daily capacity re-check",
+      cronExpression: "0 6 * * *",
+      timezone: "UTC",
+    }, {});
+
+    // The dispatcher, not `createTrigger`, stamps these. Set them so the test distinguishes
+    // "field carried a real value" from "field happened to be null on both surfaces".
+    const nextRunAt = new Date("2026-11-02T06:00:00.000Z");
+    const lastFiredAt = new Date("2026-11-01T06:00:00.000Z");
+    await db
+      .update(routineTriggers)
+      .set({ nextRunAt, lastFiredAt, lastResult: "Created execution issue" })
+      .where(eq(routineTriggers.id, created.trigger.id));
+
+    const [listed] = await svc.list(companyId);
+    const detail = await svc.getDetail(routine.id);
+
+    const listedTrigger = listed?.triggers[0];
+    const detailTrigger = detail?.triggers.find((entry) => entry.id === created.trigger.id);
+    expect(listedTrigger).toBeDefined();
+    expect(detailTrigger).toBeDefined();
+
+    // The field set a routine-health predicate reads. Absent and `false`/`null` are not the same
+    // thing, and on this set the detail surface must never be the one that cannot tell them apart.
+    const scheduleFields = [
+      "enabled",
+      "cronExpression",
+      "timezone",
+      "nextRunAt",
+      "lastFiredAt",
+      "lastResult",
+    ] as const;
+    for (const field of scheduleFields) {
+      expect(detailTrigger, `detail trigger must carry ${field}`).toHaveProperty(field);
+      expect(detailTrigger?.[field], `detail ${field} must not be null`).not.toBeNull();
+      expect(detailTrigger?.[field], `detail ${field} must equal the list projection`).toEqual(
+        listedTrigger?.[field],
+      );
+    }
+    expect(detailTrigger?.enabled).toBe(true);
+    expect(detailTrigger?.cronExpression).toBe("0 6 * * *");
+    expect(detailTrigger?.nextRunAt).toEqual(nextRunAt);
+    expect(detailTrigger?.lastFiredAt).toEqual(lastFiredAt);
+
+    // Guards the drift direction that is actually reachable: `list` hand-projects, `getDetail`
+    // spreads the row. Any key `list` emits must still resolve on the detail surface.
+    for (const key of Object.keys(listedTrigger ?? {}) as Array<keyof typeof listedTrigger>) {
+      expect(detailTrigger, `detail trigger dropped list key ${String(key)}`).toHaveProperty(String(key));
+      expect(detailTrigger?.[key as keyof typeof detailTrigger]).toEqual(listedTrigger?.[key]);
+    }
+
+    // `activeIssue` is carried by both. `lastRun` is list-only by design — the detail surface
+    // answers it with `recentRuns`, a superset — so assert the superset relationship rather than
+    // the key, or the two drift apart the moment one is renamed.
+    expect(listed).toHaveProperty("activeIssue");
+    expect(detail).toHaveProperty("activeIssue");
+    expect(detail?.activeIssue).toEqual(listed?.activeIssue);
+    expect(Array.isArray(detail?.recentRuns)).toBe(true);
+  });
+
   it("blocks agents from restoring routine revisions assigned to another agent", async () => {
     const { companyId, routine, svc } = await seedFixture();
     const otherAgentId = randomUUID();
