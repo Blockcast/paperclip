@@ -814,13 +814,15 @@ describe.sequential("agent permission routes", () => {
       expect(populated.body.withheldByAction).toBeDefined();
       expect(empty.body.withheldFields).toBeDefined();
       expect(empty.body.withheldByAction).toBeDefined();
-      expect(populated.body.withheldFields).toEqual(empty.body.withheldFields);
-      expect(populated.body.withheldByAction).toBe(empty.body.withheldByAction);
-      // And the withheld objects are indistinguishable too, as they were
-      // before this change — the markers added a statement about the READER,
-      // not about the subject.
-      expect(populated.body.adapterConfig).toEqual(empty.body.adapterConfig);
-      expect(populated.body.runtimeConfig).toEqual(empty.body.runtimeConfig);
+      // THE zero-bit assertion, and it must be the WHOLE body rather than a
+      // list of fields. Naming fields only pins the fields you thought of: an
+      // added `hasRuntimeConfig` presence bit — the exact mutation the comment
+      // above warns against — kept every named assertion green, because none
+      // of them looked at it (Ally, PR #3241). The two subjects are the same
+      // fixture differing ONLY in the two config columns, and `chainOfCommand`
+      // /`access` come from the same mocks, so byte-identical bodies IS the
+      // claim: nothing in this response varies with the subject's config.
+      expect(populated.body).toEqual(empty.body);
     }, 60_000);
 
     it("cannot be PATCHed back onto the agent row", async () => {
