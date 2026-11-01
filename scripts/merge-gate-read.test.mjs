@@ -14,13 +14,13 @@ const READER = fileURLToPath(new URL("./merge-gate-read.sh", import.meta.url));
  * exit is an expected outcome here and must not be read as a harness failure —
  * the VERDICT IS THE LINES. Use `read()` unless you are asserting on rc itself.
  */
-function readRc(rows, dead = "__none__", pend = "", wdead = "", renamed = "") {
+function readRc(rows, dead = "__none__", pend = "", wdead = "", renamed = "", required = "") {
   const stdin = rows.length ? rows.map((r) => r.join("\t")).join("\n") + "\n" : "";
   const opts = { input: stdin, encoding: "utf8" };
   let rc = 0;
   let out;
   try {
-    out = execFileSync("bash", [READER, "--rows", dead, pend, wdead, renamed], opts);
+    out = execFileSync("bash", [READER, "--rows", dead, pend, wdead, renamed, required], opts);
   } catch (e) {
     rc = e.status;
     out = e.stdout;
@@ -1897,7 +1897,7 @@ describe("merge-gate reader", () => {
         "WDEAD no longer computed from the witness arm alone",
       );
       assert.ok(
-        lines.some((l) => /^\} \| verdicts "\$DEAD" "\$PENDING" "\$WDEAD" "\$RENAMED"$/.test(l)),
+        lines.some((l) => /^\} \| verdicts "\$DEAD" "\$PENDING" "\$WDEAD" "\$RENAMED" "\$REQUIRED"$/.test(l)),
         "live verdicts() call lost WDEAD",
       );
     });
@@ -1914,6 +1914,7 @@ describe("merge-gate reader", () => {
         "/contents/.github/workflows/dispatch",
         "/contents/.github/workflows?ref", // a directory listing: one object, <=1000 entries
         "/contents/$p?ref",
+        '"repos/$R" --jq .default_branch', // BLO-51266: one repo object
       ];
       const isSingle = (l) => SINGLE_OBJECT.some((p) => l.includes(p));
       const singles = SOURCE.split("\n").filter((l) => l.includes('gh api "repos/') && isSingle(l));
@@ -1921,7 +1922,7 @@ describe("merge-gate reader", () => {
       const fetches = SOURCE.split("\n").filter(
         (l) => l.includes('gh api "repos/') && !isSingle(l),
       );
-      assert.equal(fetches.length, 5, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
+      assert.equal(fetches.length, 7, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
       // The collector matches `gh api "repos/` on ONE line, so a fetch written
       // `gh api "$url"` or split across a continuation is collected by NEITHER
       // line: the count above stays 3 and this test passes while that fetch goes
@@ -1954,9 +1955,12 @@ describe("merge-gate reader", () => {
         .split("\n")
         .filter((l) => !l.trimStart().startsWith("#"))
         .flatMap((l) => l.match(/gh\s+api/g) ?? []);
+      // BLO-51266: one GraphQL read (refUpdateRule for ONE ref) — no pages.
+      const graphql = SOURCE.split("\n").filter((l) => /gh api graphql /.test(l));
+      assert.equal(graphql.length, 1, "graphql read lost or doubled?");
       assert.equal(
         ghApi.length,
-        fetches.length + singles.length,
+        fetches.length + singles.length + graphql.length,
         `gh api call the collector missed — variable URL or line continuation? got ${JSON.stringify(ghApi)}`,
       );
       for (const call of fetches) {
@@ -2202,6 +2206,8 @@ describe("live mode: check-runs page error fails closed (BLO-48833)", () => {
       join(dir, "gh"),
       `#!/usr/bin/env bash
 case "$2" in
+  */rules/branches/*|graphql) ;;
+  repos/o/r) echo master ;;
   */check-runs*) printf '%s' '{"total_count":2,"check_runs":[{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}]}'
                  printf '%s' '{"message":"API rate limit exceeded","status":"403"}'; exit 1 ;;
   */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
@@ -2246,6 +2252,8 @@ describe("live mode: a bodiless later-page failure fails closed (BLO-49040)", ()
         join(dir, "gh"),
         `#!/usr/bin/env bash
 case "$2" in
+  */rules/branches/*|graphql) ;;
+  repos/o/r) echo master ;;
 ${arm("*/check-runs*", "check-runs")}
   */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
 ${arm("*/actions/runs*", "actions/runs")}
@@ -2306,7 +2314,9 @@ describe("live mode: pulls and statuses-list partial reads fail closed (BLO-4904
       writeFileSync(
         join(dir, "gh"),
         `#!/usr/bin/env bash
-case "$2" in${arms}
+case "$2" in
+  */rules/branches/*|graphql) ;;
+  repos/o/r) echo master ;;${arms}
   repos/o/r/commits/*) echo ${sha} ;;
   *) echo "unexpected: $*" >&2; exit 1 ;;
 esac
@@ -2327,6 +2337,88 @@ esac
       }
       assert.ok(rc > 1, `expected exit > 1, got ${rc}; out=${out}`);
       assert.match(out, new RegExp(`^STOP\\t<${surface} fetch failed for ${sha} \\(rc 1\\); refusing on a partial read>\\tFETCH-FAILED\\trun=-$`, "m"));
+    });
+  }
+});
+
+describe("BLO-51266: a required context with no row at the head", () => {
+  // multicast#1281 @ a5844ff5: the matrix job ran only under its templated
+  // placeholder name, so 5 required shard contexts never existed. Master's
+  // reader printed only NOT-EVALUATED (rc 0) and a lander tried to squash.
+  const shards = ["file", "file +doTrailer", "entity", "entity +doTrailer", "AllConfigsProxy"]
+    .map((s) => `integration-tests (${s})`);
+  const required = ["wasm-build", "unit-tests-race", ...shards, "review/ally-complete"].join("\n");
+  const rows = [
+    ["wasm-build", "success", "2026-11-01T20:10:00Z", "101"],
+    ["unit-tests-race", "success", "2026-11-01T20:10:00Z", "101"],
+    ["integration-tests (${{ matrix.name }})", "skipped", "2026-11-01T20:10:00Z", "102"],
+    ["gate/ally-comment-findings", "neutral", "2026-11-01T20:10:00Z", "app:allyblockcast"],
+    ["review/ally-complete", "success", "2026-11-01T20:10:00Z", "status"],
+  ];
+
+  it("prints one ABSENT STOP per missing required context and exits 1", () => {
+    const { rc, lines } = readRc(rows, "__none__", "", "", "", required);
+    assert.deepEqual(stops(lines).sort(), shards.map((s) => `STOP\t${s}\tABSENT\trun=-`).sort());
+    assert.equal(rc, 1);
+  });
+
+  it("is the red-on-master shape: with no required list the same rows print no STOP", () => {
+    const { rc, lines } = readRc(rows);
+    assert.deepEqual(stops(lines), []);
+    assert.equal(rc, 0);
+  });
+
+  it("adds nothing when every required context is present", () => {
+    const green = [...rows, ...shards.map((s) => [s, "success", "2026-11-01T20:30:00Z", "103"])];
+    const { rc, lines } = readRc(green, "__none__", "", "", "", required);
+    assert.deepEqual(stops(lines), []);
+    assert.equal(rc, 0);
+  });
+
+  it("counts a context whose only rows were dropped as superseded as absent", () => {
+    const { lines } = readRc([...rows, [shards[0], "failure", "2026-11-01T20:05:00Z", "99"]], "99", "", "", "", required);
+    assert.ok(lines.includes(`STOP\t${shards[0]}\tABSENT\trun=-`));
+  });
+});
+
+describe("live mode: an unreadable required-context list fails closed (BLO-51266)", () => {
+  const sha = "a".repeat(40);
+  for (const broken of ["*/rules/branches/*", "graphql"]) {
+    it(`STOPs with rc > 1 when ${broken} fails`, () => {
+      const dir = mkdtempSync(join(tmpdir(), "mgr-gh-"));
+      const ok = broken === "graphql" ? "*/rules/branches/*" : "graphql";
+      writeFileSync(
+        join(dir, "gh"),
+        `#!/usr/bin/env bash
+case "$2" in
+  ${broken}) echo "gh: Forbidden (HTTP 403)" >&2; exit 1 ;;
+  ${ok}) ;;
+  repos/o/r) echo master ;;
+  */check-runs*) printf '%s' '{"total_count":1,"check_runs":[{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}]}' ;;
+  */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */pulls*) ;;
+  */status*) printf '%s' '{"state":"success","statuses":[]}' ;;
+  repos/o/r/commits/*) echo ${sha} ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`,
+        { mode: 0o755 },
+      );
+      let rc = 0;
+      let out = "";
+      try {
+        out = execFileSync("bash", [READER, "o/r", sha], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        });
+      } catch (e) {
+        rc = e.status;
+        out = e.stdout;
+      }
+      assert.ok(rc > 1, `expected exit > 1, got ${rc}; out=${out}`);
+      assert.match(out, /^STOP\t<required-contexts fetch failed for a{40} \(rc 1\); refusing on a partial read>\tFETCH-FAILED\trun=-$/m);
     });
   }
 });
