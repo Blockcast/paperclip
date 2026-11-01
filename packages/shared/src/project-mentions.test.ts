@@ -204,6 +204,49 @@ describe("extractUnboundMentionTokens", () => {
     it("still reports a token whose slash opens nothing", () => {
       expect(extractUnboundMentionTokens("ask @Ceo/ about this")).toEqual(["Ceo"]);
     });
+
+    // The scope-char class is lowercase-and-digit, because npm scope segments
+    // and GitHub team slugs are lowercase while agent names here are
+    // capitalized. These two are the mentions a wider class silently swallowed,
+    // and a swallowed real mention is the failure PEN-5180 exists to end.
+    it("POSITIVE CONTROL: reports a capitalized name before a slash", () => {
+      expect(extractUnboundMentionTokens("cc @Ceo/Cto for a ruling")).toEqual(["Ceo"]);
+    });
+
+    it("POSITIVE CONTROL: reports a capitalized name before a slashed role", () => {
+      expect(extractUnboundMentionTokens("cc @Ceo/PlatformSRE please")).toEqual(["Ceo"]);
+    });
+
+    // An npm name cannot begin with `.`, `_` or `-`, so none of these opens a
+    // real scope path and the token before them is still a candidate name.
+    it("reports a name whose slash opens a character npm cannot start with", () => {
+      expect(extractUnboundMentionTokens("@Ceo/. then @Cto/-x then @Ceo/_y")).toEqual([
+        "Ceo",
+        "Cto",
+      ]);
+    });
+
+    // ACCEPTED COST of the lowercase narrowing, asserted so it is visible
+    // rather than discovered. A capitalized repo segment reports its org again.
+    // That is a false positive costing one glance, bought with a false
+    // negative; the lowercase paths this corpus actually writes stay suppressed.
+    it("ACCEPTED: an org path with a capitalized repo segment reports the org", () => {
+      expect(extractUnboundMentionTokens("see @Blockcast/Network-Operator-Portal")).toEqual([
+        "Blockcast",
+      ]);
+    });
+
+    it("keeps suppressing the lowercase org paths this corpus actually writes", () => {
+      expect(
+        extractUnboundMentionTokens("@Blockcast/paperclip and @Blockcast/penstock-llm-proxy-core"),
+      ).toEqual([]);
+    });
+
+    // Remaining residual, stated rather than hidden: an all-lowercase pair is
+    // lexically indistinguishable from a scope and stays dropped.
+    it("RESIDUAL: an all-lowercase slashed pair is still read as a scope", () => {
+      expect(extractUnboundMentionTokens("ping @ceo/cto")).toEqual([]);
+    });
   });
 
   it("returns nothing for an empty or mention-free body", () => {

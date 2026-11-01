@@ -345,18 +345,25 @@ function normalizeSkillSlug(input: string | null | undefined): string | null {
 //
 // PEN-5187 refines that in one place and declines to refine it in another.
 //
-// REFINED: a token directly followed by `/<name-char>` is skipped. `@types/node`
+// REFINED: a token directly followed by `/<scope-char>` is skipped. `@types/node`
 // and `@paperclipai/shared` in prose used to report `["types"]` / `["paperclipai"]`,
 // and engineering comments here name scoped packages and GitHub org paths
 // constantly, so that was a systematic false entry rather than an occasional
 // one. A field that is usually wrong is a field people learn to skip, which
 // returns us to the silent drop above while looking like it works. The rule is
 // safe because an agent name is never followed by a slash, and it is narrowed
-// to `/<name-char>` so the mention-pair form `@Ceo/@Cto` keeps reporting.
+// to `/<scope-char>` so the mention-pair form `@Ceo/@Cto` keeps reporting.
 //
-// Residual, stated rather than hidden: `@Ceo/Cto` — a slash-separated pair
-// written without the second `@` — is lexically a scope and is now dropped. No
-// rule can separate the two, and the scope form is far commoner in this corpus.
+// The class is narrowed again to `[a-z0-9]`, because npm scope segments and
+// GitHub team slugs are lowercase while agent names here are capitalized. That
+// recovers `@Ceo/Cto` and `@Ceo/PlatformSRE`, which the wider class swallowed.
+//
+// Residual, stated rather than hidden, and now smaller: the all-lowercase pair
+// `@ceo/cto` is still read as a scope and dropped. No lexical rule separates it
+// from `@types/node`. The narrowing also costs one false positive in the other
+// direction — a capitalized repo segment (`@Blockcast/Network-Operator-Portal`)
+// reports `Blockcast` again — which is the cheap failure being bought with the
+// expensive one.
 //
 // ACCEPTED, NOT FIXED: a bare decorator, `@Injectable`. It is lexically
 // IDENTICAL to a bare name mention, and agent names here are capitalized too
@@ -388,8 +395,25 @@ const AT_TOKEN_RE = /@([A-Za-z][A-Za-z0-9._-]*)/g;
  * The character class that can open the second half of a scoped package or org
  * path — `@types/node`, `@Blockcast/onprem-k8s-ally-reviewer`. Deliberately
  * excludes `@`, which is what keeps the mention-pair form `@Ceo/@Cto` reported.
+ *
+ * Lowercase-and-digit only, which is narrower than it looks and deliberate. An
+ * npm scope path segment MUST be lowercase, and a GitHub team slug is always
+ * lowercased, so a real scope path essentially always opens lowercase. Agent
+ * names here open with a capital. Narrowing to `[a-z0-9]` therefore recovers
+ * `@Ceo/Cto` and `@Ceo/PlatformSRE`, which a wider class swallows as scopes —
+ * and a swallowed real mention is the expensive failure, per the asymmetry
+ * above. `.`, `_` and `-` are excluded for a stronger reason: an npm name
+ * cannot begin with any of them, so they never open a real scope path.
+ *
+ * Stated cost, measured not assumed: an org path whose repo segment is
+ * capitalized (`@Blockcast/Network-Operator-Portal`) reports `Blockcast` again.
+ * That is a false positive costing one glance, bought with a false negative. The
+ * paths this corpus actually writes — `@Blockcast/paperclip`,
+ * `@Blockcast/penstock-llm-proxy-core`, `@Blockcast/onprem-k8s-ally-reviewer` —
+ * are lowercase and stay suppressed. The all-lowercase pair `@ceo/cto` is the
+ * remaining residual and is unreachable by any lexical rule.
  */
-const SCOPE_PATH_CHAR_RE = /[A-Za-z0-9._-]/;
+const SCOPE_PATH_CHAR_RE = /[a-z0-9]/;
 
 /** Any mention link, whatever its scheme. Used to locate well-formed mentions. */
 const ANY_MENTION_LINK_RE =
@@ -454,7 +478,7 @@ export interface UnboundMentionScanOptions {
  * Code spans, fenced blocks, blockquotes, URLs and email addresses are masked
  * first: a name inside a quoted prior comment or a `user@host` is not somebody
  * asking for a wake, and reporting it would train readers to ignore the field.
- * A token directly followed by `/<name-char>` is skipped for the same reason —
+ * A token directly followed by `/<scope-char>` is skipped for the same reason —
  * `@types/node` is a package, not a person (PEN-5187).
  */
 export function extractUnboundMentionTokens(
@@ -503,16 +527,18 @@ export function extractUnboundMentionTokens(
     const prev = match.index > 0 ? scanned[match.index - 1] : "";
     if (prev && /[A-Za-z0-9]/.test(prev)) continue;
 
-    // PEN-5187: a token directly followed by `/<name-char>` is a scoped
+    // PEN-5187: a token directly followed by `/<scope-char>` is a scoped
     // package or an org path, not a name — `@types/node`, `@paperclipai/shared`,
     // `@Blockcast/onprem-k8s-ally-reviewer`. An agent name is never followed by
     // a slash, so this costs no real mention.
     //
-    // The `<name-char>` half is load-bearing, not decoration. Skipping on a
-    // bare `/` would also drop `@Ceo/@Cto`, which is ordinary prose for
-    // addressing two people — and dropping a real unbound mention is the
-    // expensive failure here, where a spurious token costs one glance. `/` then
-    // `@` is therefore kept.
+    // The `<scope-char>` half is load-bearing, not decoration, in two ways.
+    // Skipping on a bare `/` would also drop `@Ceo/@Cto`, ordinary prose for
+    // addressing two people. Admitting uppercase would drop `@Ceo/Cto`, the
+    // same address written without the second `@`. Both are real unbound
+    // mentions, and dropping one is the expensive failure here, where a
+    // spurious token costs one glance. See `SCOPE_PATH_CHAR_RE` for why
+    // lowercase-and-digit is the discriminator and what it costs.
     const after = scanned.slice(match.index + match[0].length, match.index + match[0].length + 2);
     if (after[0] === "/" && after[1] !== undefined && SCOPE_PATH_CHAR_RE.test(after[1])) continue;
 
