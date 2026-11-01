@@ -2940,11 +2940,28 @@ export async function startServer(): Promise<StartedServer> {
         },
         "Foreign-claim isolation reclaimer enabled (PEN-5151)",
       );
-      // BLO-46694: lease holder only -- and here that is load-bearing rather
-      // than boilerplate. The worker tier is a StatefulSet of more than one
-      // pod, so `paperclipNodeRole !== "api"` alone admits every worker, and
-      // two workers sweeping at once is the concurrent-unlink case the
-      // `seed-writable-dirs` shape was refused over.
+      // BLO-46694: lease holder only -- load-bearing rather than boilerplate,
+      // because the worker tier is a StatefulSet of more than one pod and
+      // `paperclipNodeRole !== "api"` alone admits every worker.
+      //
+      // What the lease gives is STEADY-STATE exclusion: one holder ticks. It
+      // is NOT a guarantee that two holders never drive a claim at once, and
+      // the comment here used to say it was (PEN-5151, Ally). The stop handle
+      // `startIsolationReclaimSweep` returns only clears the interval timer --
+      // it neither awaits nor aborts an in-flight drive, and a drive is a Job
+      // run to completion, so it can be ~25 minutes long. On a lease handoff
+      // mid-tick the old holder keeps driving while the new holder ticks
+      // immediately with a fresh invocation id and a null cursor; because Job
+      // names embed the invocation id, neither adopts the other's Job and both
+      // can have executors against the same claim.
+      //
+      // That window is bounded, which is why it is documented rather than
+      // closed here: both holders apply the SAME `{home, session}` allowlist
+      // and the SAME `lastUsedAt` predicate, so nothing outside the eligible
+      // set is reachable either way. The cost is duplicated MDS unlink load
+      // and ENOENT races between the two executors, not wider deletion. Closing
+      // it properly means an abort flag the per-claim loop checks between
+      // claims, which belongs in the sweep rather than in this call site.
       superviseLeased("isolation-reclaim-sweep", () =>
         startIsolationReclaimSweep(
           db,
