@@ -88,6 +88,33 @@ export function touchedWatchedPaths(changedPaths) {
 }
 
 /**
+ * Which watched files are NOT present in the tree at head.
+ *
+ * This is the arm that keeps the watch from dying quietly. Every other clause
+ * here asks "did the watched files change"; none of them can tell that a
+ * watched file is GONE — and a watch pointing at a path nothing occupies
+ * reports clear forever, which is byte-identical to a clean repository. That
+ * is the PEN-4988 failure this row exists not to repeat.
+ *
+ * ⛔ A trailer does NOT clear this. The trailer attests to a change; this says
+ * the detector no longer knows where to look. The only fix is to re-point
+ * `WATCHED_PATHS` at wherever the closure now lives — or, if the closure is
+ * genuinely gone, to re-open residual 4 rather than delete the watch.
+ *
+ * `headPaths` is REQUIRED and has no default on purpose: any default would be
+ * a value that reads as "present", and a guard that passes when it was never
+ * given its input is the vacuous pin this same PR removed from
+ * `github-publish-broker-policy.test.ts`.
+ */
+export function missingWatchedPaths(headPaths) {
+  if (!Array.isArray(headPaths)) {
+    throw new Error(`headPaths must be an array of paths at head; got ${headPaths}`);
+  }
+  const set = new Set(headPaths);
+  return WATCHED_PATHS.filter((p) => !set.has(p));
+}
+
+/**
  * Trailer values present in a commit-message blob.
  *
  * Deliberately tolerant about WHERE the trailer sits (any line, any leading
@@ -138,17 +165,23 @@ export function reviewOwed(today, due = REVIEW_DUE, lastCompleted = REVIEW_LAST_
 }
 
 /** The whole verdict, as data, so the renderer and the tests read the same thing. */
-export function evaluate({ changedPaths, commitMessages, today }) {
+export function evaluate({ changedPaths, commitMessages, today, headPaths }) {
   const touched = touchedWatchedPaths(changedPaths);
   const attestations = rereadAttestations(commitMessages);
   const trailerOwed = touched.length > 0 && attestations.length === 0;
   const calendarOwed = reviewOwed(today);
+  // Deliberately NOT part of `trailerOwed`: an attestation cannot clear a stale
+  // watch, so this arm stands on its own in the verdict.
+  const missing = missingWatchedPaths(headPaths);
+  const watchStale = missing.length > 0;
   return {
     touched,
     attestations,
     trailerOwed,
     calendarOwed,
-    verdict: trailerOwed || calendarOwed ? "owed" : "clear",
+    missing,
+    watchStale,
+    verdict: trailerOwed || calendarOwed || watchStale ? "owed" : "clear",
   };
 }
 
@@ -160,6 +193,7 @@ export function renderReport(result, { base, head, today } = {}) {
     `watched        = ${WATCHED_PATHS.join(", ")}`,
     `touched        = ${result.touched.length ? result.touched.join(", ") : "(none)"}`,
     `attestations   = ${result.attestations.length}`,
+    `missing_at_head= ${result.missing?.length ? result.missing.join(", ") : "(none)"}`,
     `review_due     = ${REVIEW_DUE}  last_completed = ${REVIEW_LAST_COMPLETED ?? "(never)"}`,
     `verdict        = ${result.verdict}`,
   ];
@@ -187,6 +221,26 @@ export function renderReport(result, { base, head, today } = {}) {
     );
   }
 
+  if (result.watchStale) {
+    lines.push(
+      "",
+      "THIS CHECK HAS STOPPED WATCHING SOMETHING — a watched file is not present at",
+      `head: ${result.missing.join(", ")}`,
+      "",
+      "Either it moved, or it was deleted. Both are changes to a file that closes an",
+      "exec route, and neither is cleared by a trailer: a trailer attests to a change,",
+      "while this says the detector no longer knows where to look.",
+      "",
+      "If the closure MOVED, re-point WATCHED_PATHS in",
+      "scripts/check-git-egress-exec-closure-reread.mjs at its new home, and check that",
+      "the mechanical pins in",
+      "packages/adapter-utils/src/github-publish-broker-policy.test.ts moved with it.",
+      "",
+      "If the closure is GONE, residual 4 is re-opened and PEN-5186 is the row to say",
+      "so on. Deleting the watch is not the remedy for the thing it watches going away.",
+    );
+  }
+
   if (result.calendarOwed) {
     lines.push(
       "",
@@ -206,9 +260,29 @@ export function renderReport(result, { base, head, today } = {}) {
 }
 
 function readRange(base, head) {
-  const changedPaths = execFileSync("git", ["diff", "--name-only", `${base}...${head}`], {
-    encoding: "utf8",
-  })
+  // `--no-renames` is load-bearing, not tidiness. Rename detection is ON by
+  // default (`diff.renames`, since git 2.9), and under it a renamed watched
+  // file is reported ONLY at its new path — so the old path never appears,
+  // `touchedWatchedPaths` returns empty, and the move sails through with no
+  // attestation. With `--no-renames` the same move is a delete plus an add, the
+  // watched path appears, and the per-change arm fires as it should.
+  const changedPaths = execFileSync(
+    "git",
+    ["diff", "--no-renames", "--name-only", `${base}...${head}`],
+    { encoding: "utf8" },
+  )
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  // Which of the watched paths actually exist at head, so one that has been
+  // moved or deleted cannot leave this check watching an address with nothing
+  // at it. Pathspec-limited rather than a whole-tree listing: the repo is ~5.7k
+  // entries and only two of them are the question being asked.
+  const headPaths = execFileSync(
+    "git",
+    ["ls-tree", "-r", "--name-only", head, "--", ...WATCHED_PATHS],
+    { encoding: "utf8" },
+  )
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
@@ -218,7 +292,7 @@ function readRange(base, head) {
     encoding: "utf8",
   });
   const commitMessages = log.split("\0").map((m) => m.trim()).filter(Boolean);
-  return { changedPaths, commitMessages };
+  return { changedPaths, commitMessages, headPaths };
 }
 
 async function main() {

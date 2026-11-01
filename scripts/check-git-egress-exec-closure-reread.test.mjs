@@ -16,6 +16,7 @@ import {
   UNREADABLE,
   WATCHED_PATHS,
   evaluate,
+  missingWatchedPaths,
   rereadAttestations,
   renderReport,
   reviewOwed,
@@ -25,6 +26,11 @@ import {
 const SHIM = "packages/adapter-utils/src/github-git-egress-shim.ts";
 const RUNTIME = "packages/adapter-utils/src/github-git-egress-runtime.ts";
 const BEFORE = "2026-11-01";
+// The tree at head with both watched files still in place. Spelled out at every
+// `evaluate` call rather than defaulted inside it: a default here would be a
+// value that reads as "present", which is the vacuous pin this detector's own
+// PR removed from the broker policy suite.
+const BOTH_PRESENT = [SHIM, RUNTIME, "README.md"];
 
 test("the watched set is exactly §8 residual 4's two files", () => {
   // Residual 4 is ONE residual naming TWO files. §11.5 flags specifically that
@@ -46,6 +52,66 @@ test("touchedWatchedPaths reports each watched file independently", () => {
   assert.deepEqual(touchedWatchedPaths([SHIM]), [SHIM]);
   assert.deepEqual(touchedWatchedPaths([RUNTIME]), [RUNTIME]);
   assert.deepEqual(touchedWatchedPaths([RUNTIME, SHIM, "README.md"]).sort(), [RUNTIME, SHIM].sort());
+});
+
+test("missingWatchedPaths names each watched file absent from head", () => {
+  assert.deepEqual(missingWatchedPaths([SHIM, RUNTIME]), []);
+  assert.deepEqual(missingWatchedPaths([SHIM, RUNTIME, "README.md"]), []);
+  assert.deepEqual(missingWatchedPaths([RUNTIME]), [SHIM]);
+  assert.deepEqual(missingWatchedPaths([SHIM]), [RUNTIME]);
+  assert.deepEqual([...missingWatchedPaths([])].sort(), [RUNTIME, SHIM].sort());
+});
+
+test("a head tree that was never supplied is refused, not read as present", () => {
+  // The whole point of the arm is that it cannot pass by default. If this ever
+  // starts returning [] for a missing input, the guard is vacuous again.
+  assert.throws(() => missingWatchedPaths(undefined), /headPaths must be an array/);
+  assert.throws(() => missingWatchedPaths(null), /headPaths must be an array/);
+});
+
+test("a DELETED watched file owes a re-read even with a trailer", () => {
+  // A trailer attests to a change. It cannot answer "where should this check
+  // look now", so it must not clear a watch that has lost its target.
+  const result = evaluate({
+    changedPaths: [SHIM],
+    commitMessages: [`chore: drop the shim\n\n${TRAILER}: removed it deliberately`],
+    today: BEFORE,
+    headPaths: [RUNTIME, "README.md"],
+  });
+  assert.equal(result.trailerOwed, false, "the trailer does satisfy the per-change arm");
+  assert.equal(result.watchStale, true, "but the watch has lost a target");
+  assert.deepEqual(result.missing, [SHIM]);
+  assert.equal(result.verdict, "owed");
+});
+
+test("a RENAMED watched file is caught at both arms", () => {
+  // Under `--no-renames` the move appears as the old path (a delete) plus the
+  // new one, so the per-change arm fires; the old path is also gone from head,
+  // so the staleness arm fires too and survives someone adding a trailer.
+  const moved = "packages/adapter-utils/src/github-git-egress-shim-v2.ts";
+  const result = evaluate({
+    changedPaths: [SHIM, moved],
+    commitMessages: ["refactor: move the shim"],
+    today: BEFORE,
+    headPaths: [moved, RUNTIME],
+  });
+  assert.deepEqual(result.touched, [SHIM], "the OLD path is what the watch knows");
+  assert.equal(result.trailerOwed, true);
+  assert.equal(result.watchStale, true);
+  assert.equal(result.verdict, "owed");
+});
+
+test("the stale-watch report says re-point the watch, not add a trailer", () => {
+  const report = renderReport(
+    evaluate({ changedPaths: [], commitMessages: [], today: BEFORE, headPaths: [RUNTIME] }),
+    { base: "a", head: "b", today: BEFORE },
+  );
+  assert.match(report, /STOPPED WATCHING/);
+  assert.match(report, new RegExp(SHIM.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.match(report, /re-point WATCHED_PATHS/);
+  // It must not send the reader to the trailer, which cannot fix this.
+  assert.doesNotMatch(report, /Add a trailer to any commit in this range/);
+  assert.match(report, /residual 4 is re-opened/i);
 });
 
 test("a near-miss path does not count as the watched file", () => {
@@ -85,7 +151,7 @@ test("attestations are collected across every commit in the range", () => {
 });
 
 test("touching a watched file without a trailer owes a re-read", () => {
-  const result = evaluate({ changedPaths: [SHIM], commitMessages: ["fix: tidy"], today: BEFORE });
+  const result = evaluate({ changedPaths: [SHIM], commitMessages: ["fix: tidy"], today: BEFORE, headPaths: BOTH_PRESENT });
   assert.equal(result.trailerOwed, true);
   assert.equal(result.verdict, "owed");
 });
@@ -95,13 +161,14 @@ test("touching a watched file WITH a trailer is clear", () => {
     changedPaths: [RUNTIME],
     commitMessages: [`fix: tidy\n\n${TRAILER}: comment-only; injection unchanged`],
     today: BEFORE,
+    headPaths: BOTH_PRESENT,
   });
   assert.equal(result.trailerOwed, false);
   assert.equal(result.verdict, "clear");
 });
 
 test("touching nothing watched is clear even with no trailer", () => {
-  const result = evaluate({ changedPaths: ["README.md"], commitMessages: ["docs: x"], today: BEFORE });
+  const result = evaluate({ changedPaths: ["README.md"], commitMessages: ["docs: x"], today: BEFORE, headPaths: BOTH_PRESENT });
   assert.equal(result.trailerOwed, false);
   assert.equal(result.verdict, "clear");
 });
@@ -135,7 +202,7 @@ test("an unparseable date is refused rather than compared", () => {
 test("the calendar arm fires independently of the per-change arm", () => {
   // Once due, a PR that touches nothing watched is still owed — otherwise the
   // date would only surface on PRs that happen to touch these two files.
-  const result = evaluate({ changedPaths: ["README.md"], commitMessages: ["docs: x"], today: "2027-02-01" });
+  const result = evaluate({ changedPaths: ["README.md"], commitMessages: ["docs: x"], today: "2027-02-01", headPaths: BOTH_PRESENT });
   assert.equal(result.trailerOwed, false);
   assert.equal(result.calendarOwed, true);
   assert.equal(result.verdict, "owed");
@@ -143,7 +210,7 @@ test("the calendar arm fires independently of the per-change arm", () => {
 
 test("the report names the remedy for whichever arm fired", () => {
   const trailerOnly = renderReport(
-    evaluate({ changedPaths: [SHIM], commitMessages: ["fix: x"], today: BEFORE }),
+    evaluate({ changedPaths: [SHIM], commitMessages: ["fix: x"], today: BEFORE, headPaths: BOTH_PRESENT }),
     { base: "a", head: "b", today: BEFORE },
   );
   assert.match(trailerOnly, /RE-READ IS OWED/);
@@ -151,7 +218,7 @@ test("the report names the remedy for whichever arm fired", () => {
   assert.doesNotMatch(trailerOnly, /REVIEW IS DUE/);
 
   const calendarOnly = renderReport(
-    evaluate({ changedPaths: [], commitMessages: [], today: "2027-02-01" }),
+    evaluate({ changedPaths: [], commitMessages: [], today: "2027-02-01", headPaths: BOTH_PRESENT }),
     { base: "a", head: "b", today: "2027-02-01" },
   );
   assert.match(calendarOnly, /REVIEW IS DUE/);
@@ -163,7 +230,7 @@ test("the calendar report preserves §8's framing of residual 1", () => {
   // that re-reads it. The reviewer reads this text at the moment they start, so
   // the constraint has to survive in it.
   const report = renderReport(
-    evaluate({ changedPaths: [], commitMessages: [], today: "2027-02-01" }),
+    evaluate({ changedPaths: [], commitMessages: [], today: "2027-02-01", headPaths: BOTH_PRESENT }),
     { today: "2027-02-01" },
   );
   assert.match(report, /A LIST OF VECTORS CLOSED/);
@@ -172,7 +239,7 @@ test("the calendar report preserves §8's framing of residual 1", () => {
 
 test("the report always states the watched set and the verdict", () => {
   const report = renderReport(
-    evaluate({ changedPaths: [], commitMessages: [], today: BEFORE }),
+    evaluate({ changedPaths: [], commitMessages: [], today: BEFORE, headPaths: BOTH_PRESENT }),
     { base: "a", head: "b", today: BEFORE },
   );
   assert.match(report, /verdict\s+= clear/);
