@@ -50,12 +50,28 @@ interface FakeRows {
  * Dispatches on the table object rather than on call order, so a future change
  * that reorders the two queries does not silently feed agent rows to the
  * environment arm and pass anyway.
+ *
+ * It IGNORES both the `where` and the `orderBy`, so the SQL predicates are
+ * never exercised here and these tests must not be read as covering them.
+ * Nothing below proves the self-exclusion or the `= 'true'::jsonb` opt-in
+ * hold IN POSTGRES — what it proves is that the JS-side re-checks hold, and
+ * those are the real guard: every row the SQL lets through is re-tested in
+ * TypeScript before it becomes a claim. The `orderBy` is likewise taken on
+ * trust; the fixtures below are written in the order the database is asked
+ * for, so an attribution assertion reads the same either way.
  */
 function fakeDb(rows: FakeRows) {
+  const resolve = (table: unknown) =>
+    table === environments ? (rows.environments ?? []) : (rows.agents ?? []);
   return {
     select: () => ({
       from: (table: unknown) => ({
-        where: async () => (table === environments ? (rows.environments ?? []) : (rows.agents ?? [])),
+        // Thenable so a caller can `await` the `where` directly or chain
+        // `.orderBy()` onto it, matching drizzle's builder.
+        where: () =>
+          Object.assign(Promise.resolve(resolve(table)), {
+            orderBy: async () => resolve(table),
+          }),
       }),
     }),
   };
@@ -139,6 +155,36 @@ describe("listReclaimableClaims (PEN-5151)", () => {
     ]);
   });
 
+  it("skips an id that slugs cleanly but the adapter refuses as a label value", async () => {
+    // These are the ones a slug-only check would MISS. `-abc` and `abc_` both
+    // survive the slug pipeline, and an id over 63 characters survives the
+    // 200-char truncation -- yet `assertLabelSafeAgentId` throws on all three
+    // BEFORE the adapter provisions anything, so no claim with these names was
+    // ever created. Naming one is the "Job sits Pending on an unbound claim"
+    // case: the sweep reports that it launched while the tree keeps growing.
+    const claims = await listed({
+      agents: [
+        { id: "-abc", config: { enablePerAgentWorkspaceVolume: true } },
+        { id: "abc_", config: { enablePerAgentWorkspaceVolume: true } },
+        { id: `a${"b".repeat(63)}`, config: { enablePerAgentWorkspaceVolume: true } },
+        { id: AGENT_B, config: { enablePerAgentWorkspaceVolume: true } },
+      ],
+    });
+    expect(claims).toEqual([
+      { claimName: `agent-workspace-${AGENT_B}`, source: "agent_per_agent_volume", agentId: AGENT_B },
+    ]);
+  });
+
+  it("still derives for an id at the label-length limit", async () => {
+    // The boundary in the other direction, so the length check cannot drift to
+    // `>= 63` and silently drop valid ids. A UUID is 36, well inside this.
+    const id = `a${"b".repeat(62)}`;
+    expect(id).toHaveLength(63);
+    expect(await listed({ agents: [{ id, config: { enablePerAgentWorkspaceVolume: true } }] })).toEqual([
+      { claimName: `agent-workspace-${id}`, source: "agent_per_agent_volume", agentId: id },
+    ]);
+  });
+
   it("skips an unslugabble agent id without taking the sweep down", async () => {
     // The adapter THROWS on this id, and should: there, refusing is what stops
     // an opted-in Job mounting the shared claim. Here the equivalent mistake
@@ -164,6 +210,19 @@ describe("claim-name agreement with the adapter (PEN-5151)", () => {
     expect(match, "adapter's agentWorkspaceClaimName no longer returns a `<prefix>${slug}` template")
       .not.toBeNull();
     expect(AGENT_WORKSPACE_CLAIM_PREFIX).toBe(match?.[1]);
+  });
+
+  it("refuses the same ids the adapter's label-value rule refuses", () => {
+    // The label regex is duplicated too, and drifts the same silent way: a
+    // reaper rule LOOSER than the adapter's names claims that were never
+    // provisioned, a STRICTER one drops trees that exist. Both sides are read
+    // from disk so neither is derived from the other.
+    const rule = /\/\^\[a-zA-Z0-9\]\(\[a-zA-Z0-9\._-\]\*\[a-zA-Z0-9\]\)\?\$\//;
+    expect(adapterPvcSource, "adapter's label-value rule changed shape").toMatch(rule);
+    expect(reaperSource, "reaper's label-value rule no longer matches the adapter's").toMatch(rule);
+    // The length bound travels with it, and is the half a regex cannot carry.
+    expect(adapterPvcSource).toMatch(/agentId\.length > 63/);
+    expect(reaperSource).toMatch(/id\.length > 63/);
   });
 
   it("slugs an agent id through the same pipeline the adapter does", () => {
