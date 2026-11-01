@@ -242,18 +242,26 @@ test("an unmeasured staleness arm is not reported as a clean watch", () => {
   // "(none)" there would assert something nothing checked — the exact
   // false-clear shape this detector exists to avoid.
   const unread = renderReport(
-    { touched: [], attestations: [], trailerOwed: false, calendarOwed: true, missing: null, watchStale: false, verdict: "owed" },
+    { touched: null, attestations: null, trailerOwed: false, calendarOwed: true, missing: null, watchStale: false, verdict: "owed" },
     { base: undefined, head: undefined, today: "2027-02-01" },
   );
+  // All three measured fields, not just the one that prompted this.
+  assert.match(unread, /touched        = \(not measured\)/);
+  assert.match(unread, /attestations   = \(not measured\)/);
   assert.match(unread, /missing_at_head= \(not measured\)/);
-  assert.doesNotMatch(unread, /missing_at_head= \(none\)/);
+  assert.doesNotMatch(unread, /= \(none\)/);
+  assert.doesNotMatch(unread, /attestations   = 0/);
 
-  // ...and a measured-clean watch still says so.
+  // ...and a measured-clean read still says so, so "(not measured)" has not
+  // simply replaced the clean wording everywhere.
   const measured = renderReport(
     evaluate({ changedPaths: [], commitMessages: [], today: BEFORE, headPaths: BOTH_PRESENT }),
     { base: "a", head: "b", today: BEFORE },
   );
+  assert.match(measured, /touched        = \(none\)/);
+  assert.match(measured, /attestations   = 0/);
   assert.match(measured, /missing_at_head= \(none\)/);
+  assert.doesNotMatch(measured, /not measured/);
 });
 
 test("the report always states the watched set and the verdict", () => {
