@@ -155,18 +155,29 @@
  * extracted on, applied to the retention checks: the foreign path's failure
  * mode is a second, weaker transcription of a rule that exists to keep files.
  *
- * ⛔ Nothing SCHEDULES this yet, and the presence of these functions must not
- * be read as reclamation. The wire and the entrypoint landed in #3189
- * (`isolation-reclaim-report.ts`, `cli/isolation-reclaim-executor.ts`) and the
- * Job manifest in `isolation-reclaim-job.ts`, so a pod that mounts a foreign
- * claim is now describable — but nothing CREATES one. `listReclaimableClaims`
- * below answers the driver's first question, WHICH claims, so the remaining
- * gap is narrower than it was: what is still missing is the acting half —
- * creating the two Jobs, waiting on them, and recovering each report off
- * `pods/log`. Until that exists a foreign claim is unreclaimed and
- * `unreachableAgents` is still the standing record of it. ⚠ In particular, do
- * not read a non-empty `listReclaimableClaims` as a list of claims that WILL
- * be swept; today it is a list of claims that COULD be.
+ * ⛔ The presence of these functions is not reclamation — but the distance
+ * between the two has now shrunk twice, so read it off the call site rather
+ * than off this paragraph. #3189 landed the executor wire and entrypoint
+ * (`isolation-reclaim-report.ts`, `cli/isolation-reclaim-executor.ts`) and
+ * `isolation-reclaim-job.ts` the manifest, making a pod that mounts a foreign
+ * claim describable. The acting half that revision then named as missing —
+ * creating the two Jobs, waiting on them, recovering each report off
+ * `pods/log` — is `isolation-reclaim-driver.ts` / `-runner.ts` /
+ * `-job-port.ts`, with `startIsolationReclaimSweep`
+ * (`isolation-reclaim-sweep.ts`) rotating over `listReclaimableClaims` on an
+ * interval. So the live question is no longer whether an acting half exists,
+ * but whether `index.ts` starts that scheduler and under what flag (#3228):
+ * grep the call site, because a tense written here goes stale one increment
+ * later and this paragraph has already done so once.
+ *
+ * What does NOT move with the call site is the shape of the link: it is
+ * OPT-IN, on the same ground as property 2 above — deploying the code and
+ * performing the deletion must not be one act, and a sweep that mounts someone
+ * else's volume to unlink from it has more of that argument against it, not
+ * less. ⚠ So `listReclaimableClaims` is a list of claims that COULD be swept,
+ * never one that WILL be; wherever the sweep is unwired or left disabled, a
+ * foreign claim is unreclaimed and `unreachableAgents` is still the standing
+ * record of it.
  *
  * A fourth shape was weighed while building these two ends and is refused, so
  * it is recorded beside the other three: *hand the executor a fleet-wide list
