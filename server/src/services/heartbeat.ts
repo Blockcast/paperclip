@@ -2623,9 +2623,9 @@ const EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS = AGENT_POD_BUSY_MAX_STALE_MS;
 // to confirm within it leaves the evidence unproven and the run terminal, so
 // these values only trade promptness of a legitimate retry, never safety.
 const STALE_KILL_QUIESCE_ATTEMPTS = 3;
+const STALE_KILL_QUIESCE_DELAY_MS = 2000;
 // BLO-51107: one per-run reap call this slow logs its run, call and step ms.
 const ORPHAN_REAP_SLOW_PER_RUN_CALL_MS = 10_000;
-const STALE_KILL_QUIESCE_DELAY_MS = 2000;
 // BLO-12564: cold-boot reattach grace. On a fresh worker boot the in-cluster
 // kube client may not be serving yet, so the startup reap (server/src/index.ts)
 // and the first periodic ticks can run with BOTH listAgentJobRunStatuses() and
