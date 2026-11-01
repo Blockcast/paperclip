@@ -1370,6 +1370,14 @@ export function readCarriedInteractionDecision(contextSnapshot: unknown): Carrie
   if (!interactionId) return null;
   const interactionStatus = readNonEmptyString(context.interactionStatus);
   if (!interactionStatus) return null;
+  // Breadth, but not unbounded breadth: gate on the same resolved set
+  // `isResolvedInteractionContinuationWakeContext` uses rather than on "any non-empty
+  // status". Both measured instances (`accepted`, `answered`) are in it, so this costs
+  // no coverage -- what it buys is that a future snapshot writer cannot put a
+  // non-terminal status here and have the notice report a decision that was never
+  // made. A notice reading "was resolved pending" would be worse than silence: it
+  // would send a human to re-ask a question nobody had answered.
+  if (!RESOLVED_INTERACTION_CONTINUATION_STATUSES.has(interactionStatus)) return null;
   return {
     interactionId,
     interactionKind: readNonEmptyString(context.interactionKind),
