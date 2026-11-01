@@ -2623,6 +2623,8 @@ const EXTERNAL_LIFECYCLE_BUSY_POD_MAX_STALE_MS = AGENT_POD_BUSY_MAX_STALE_MS;
 // to confirm within it leaves the evidence unproven and the run terminal, so
 // these values only trade promptness of a legitimate retry, never safety.
 const STALE_KILL_QUIESCE_ATTEMPTS = 3;
+// BLO-51107: one per-run reap call this slow logs its run, call and step ms.
+const ORPHAN_REAP_SLOW_PER_RUN_CALL_MS = 10_000;
 const STALE_KILL_QUIESCE_DELAY_MS = 2000;
 // BLO-12564: cold-boot reattach grace. On a fresh worker boot the in-cluster
 // kube client may not be serving yet, so the startup reap (server/src/index.ts)
@@ -26777,6 +26779,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
   }
 
+  // BLO-51107: per-call attribution inside one run's finalize. The reap loop
+  // passes `stepMs` and logs it when the whole call runs long; nothing else
+  // reads it. Records from a `finally` so a call that throws is still named.
+  async function timeFinalizeStep<T>(
+    stepMs: Record<string, number> | undefined,
+    name: string,
+    fn: () => Promise<T>,
+  ): Promise<T> {
+    if (!stepMs) return fn();
+    const startedAt = Date.now();
+    try {
+      return await fn();
+    } finally {
+      stepMs[name] = (stepMs[name] ?? 0) + Date.now() - startedAt;
+    }
+  }
+
   async function finalizeExternalLifecycleTerminalRun(input: {
     run: typeof heartbeatRuns.$inferSelect;
     adapterType: string;
@@ -26784,7 +26803,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     jobStatus: AgentJobRunStatus | null;
     now: Date;
     staleKill?: boolean;
+    stepMs?: Record<string, number>;
   }) {
+    const step = <T>(name: string, fn: () => Promise<T>) => timeFinalizeStep(input.stepMs, name, fn);
     let preserveRecordedOutcome = false;
     // PEN-2421: set when the run's own pod-written terminal result
     // is what rescued the outcome, so the run record distinguishes an
@@ -26811,7 +26832,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         parseObject(input.run.contextSnapshot),
         { resultJson: parseObject(input.run.resultJson) },
       );
-      reviewEvidence = await resolvePrReviewEvidenceWithGithubAuthor(
+      reviewEvidence = await step("github_pr_author", () => resolvePrReviewEvidenceWithGithubAuthor(
         parseObject(input.run.contextSnapshot),
         // `resultSummary` as well as `resultJson`: a self-skip whose text lives
         // only in the summary column would otherwise spend the GitHub round-trip
@@ -26823,13 +26844,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           summary: input.run.resultSummary ?? null,
         },
         reviewEvidence,
-      );
+      ));
       const claimedReview =
         reviewEvidence.status === "posted_review" || reviewEvidence.status === "already_reviewed";
       if (reviewEvidence.status === "missing" || claimedReview) {
-        const verification = await verifyGithubReviewerEvidence(
+        const verification = await step("github_reviewer_evidence", () => verifyGithubReviewerEvidence(
           parseObject(input.run.contextSnapshot),
-        );
+        ));
         await appendRunEvent(input.run, await nextRunEventSeq(input.run.id), {
           eventType: "lifecycle",
           stream: "system",
@@ -26896,11 +26917,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (
       !input.staleKill && !input.jobStatus && !preserveRecordedOutcome && !prReviewIncompleteOverride
     ) {
-      const recovered = await readOrphanedRunTerminalResult({
+      const recovered = await step("terminal_result_artifact", () => readOrphanedRunTerminalResult({
         companyId: input.run.companyId,
         agentId: input.run.agentId,
         runId: input.run.id,
-      });
+      }));
       const rescued = recovered.outcome === "found" && recovered.succeeded;
       if (rescued) {
         preserveRecordedOutcome = true;
@@ -26949,13 +26970,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const adapterInvocationStarted =
         baseTerminalOutcome?.errorCode === "job_failed" || baseTerminalOutcome?.errorCode === "job_missing"
-      ? await hasAdapterInvocationEvent(input.run.id)
+      ? await step("adapter_invocation_lookup", () => hasAdapterInvocationEvent(input.run.id))
       : null;
 
     // Read the pod's terminal container state while the pod still exists. This
     // is the only point in the lifecycle where it is still available.
     const containerDiagnostics = terminalOutcome.errorCode === "job_failed"
-      ? await captureFailedJobContainerDiagnostics(input.run, input.jobStatus)
+      ? await step("container_diagnostics", () => captureFailedJobContainerDiagnostics(input.run, input.jobStatus))
       : null;
     const containerFailureCode = classifyAgentJobFailureErrorCode(containerDiagnostics);
     if (containerFailureCode) {
@@ -26986,7 +27007,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // require. Retry admission, every metric bucket and the census stay
     // bit-identical; only the run's recoverable explanation changes.
     const providerCapacityRefusal = terminalOutcome.errorCode === "job_failed"
-      ? await readExternalLifecycleProviderCapacityRefusal(input.run, input.now.getTime())
+      ? await step("provider_capacity_refusal", () =>
+        readExternalLifecycleProviderCapacityRefusal(input.run, input.now.getTime()))
       : null;
     const providerCapacityParkAt =
       providerCapacityRefusal?.horizon.kind === "usable"
@@ -27003,7 +27025,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       providerCapacityParkAt &&
       input.jobStatus?.phase !== "active" &&
       isPrReviewRetryContext(parseObject(input.run.contextSnapshot))
-        ? await probeStaleKillReviewEvidence(input.run)
+        ? await step("github_provider_capacity_review_probe", () => probeStaleKillReviewEvidence(input.run))
         : null;
 
     const terminalClaimToken = randomUUID();
@@ -27091,7 +27113,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // concurrent re-arm either committed before this read or waits behind the
     // CAS and then sees the run is no longer `running`), re-read the
     // reservation, and abort when the owner has moved past this Job.
-    const claim = await db.transaction(async (tx) => {
+    const claim = await step("terminal_claim_tx", () => db.transaction(async (tx) => {
       await tx
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
@@ -27107,7 +27129,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: input.now,
         resultJson,
       }, tx);
-    });
+    }));
     if ("consumedByOwner" in claim) {
       logger.debug(
         { runId: input.run.id, jobName: input.jobStatus?.name ?? null, jobPhase: input.jobStatus?.phase ?? null },
@@ -27143,7 +27165,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // the slot (and node CPU) is reclaimed and the dispatcher's
       // hasActiveJobForAgent gate stops blocking newly-queued high-priority work.
       try {
-        const deleted = await deleteExactExternalRuntimeJob(input.run);
+        const deleted = await step("stale_kill_job_delete", () => deleteExactExternalRuntimeJob(input.run));
         terminalJobQuiesced = deleted === "deleted" || deleted === "missing";
         logger.warn(
           { runId: input.run.id, adapterType: input.adapterType, deletionResult: deleted },
@@ -27165,8 +27187,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // returns while the pod is still draining and a still-live agent could
       // post between a negative probe and actual termination. Unconfirmed
       // quiescence records no flag, leaving the run terminal.
-      if (await confirmStaleKilledJobQuiesced(input.run)) {
-        staleKillReviewEvidenceFound = await probeStaleKillReviewEvidence(input.run);
+      if (await step("stale_kill_quiesce", () => confirmStaleKilledJobQuiesced(input.run))) {
+        staleKillReviewEvidenceFound =
+          await step("github_stale_kill_review_probe", () => probeStaleKillReviewEvidence(input.run));
         if (staleKillReviewEvidenceFound !== null) {
           const recovery = parseObject(parseObject(resultJson).externalLifecycleRecovery);
           const mergedResultJson = {
@@ -27214,7 +27237,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       finalizedAt: input.now,
     });
 
-    finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, resultJson) ?? finalizedRun;
+    finalizedRun = await step("liveness_classify", () => classifyAndPersistRunLiveness(finalizedRun!, resultJson))
+      ?? finalizedRun;
 
     // BLO-10448: job_missing (and any other automatically-retryable terminal
     // errorCode) is stamped here, in the vanished-Job reconciler — NOT on the
@@ -27233,11 +27257,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       shouldScheduleAutomaticRunRetry(finalizedRun) &&
       finalizationAgent
     ) {
-      await scheduleBoundedRetryForRun(
-        finalizedRun,
+      const retryRun = finalizedRun;
+      await step("bounded_retry", () => scheduleBoundedRetryForRun(
+        retryRun,
         finalizationAgent,
-        resolveAutomaticRunRetryOpts(finalizedRun),
-      );
+        resolveAutomaticRunRetryOpts(retryRun),
+      ));
       finalizedRun = (await getRun(finalizedRun.id)) ?? finalizedRun;
     }
 
@@ -27261,15 +27286,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const deferredCheckoutRestoreIssueId = finalizedRun.status === "succeeded"
       ? issueIdFromRunContext(finalizedRun.contextSnapshot) ?? null
       : null;
-    const promotedRunDispatched = await releaseIssueExecutionAndPromote(finalizedRun, {
-      deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
-    });
+    const promotedRun = finalizedRun;
+    const promotedRunDispatched = await step("release_and_promote", () =>
+      releaseIssueExecutionAndPromote(promotedRun, {
+        deferPrimaryCheckoutRestoration: deferredCheckoutRestoreIssueId !== null,
+      }));
     let livenessContinuationOwnsCheckout = false;
     let successfulHandoffOwnsCheckout = false;
     if (!persistedDecision.pipelineStageExited) {
-      livenessContinuationOwnsCheckout = await handleRunLivenessContinuation(finalizedRun);
+      livenessContinuationOwnsCheckout =
+        await step("liveness_continuation", () => handleRunLivenessContinuation(promotedRun));
       if (finalizationAgent) {
-        successfulHandoffOwnsCheckout = await handleSuccessfulRunHandoff(finalizedRun, finalizationAgent);
+        successfulHandoffOwnsCheckout =
+          await step("successful_handoff", () => handleSuccessfulRunHandoff(promotedRun, finalizationAgent));
       }
     }
     if (
@@ -27303,7 +27332,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
     if (!promotedRunDispatched) {
-      await startNextQueuedRunForAgent(input.run.agentId);
+      await step("start_next_queued", () => startNextQueuedRunForAgent(input.run.agentId));
     }
     runningProcesses.delete(input.run.id);
     activeRunExecutions.delete(input.run.id);
@@ -29240,10 +29269,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     let perRunDispatchMs = 0;
     let perRunCleanupMs = 0;
     type PerRunBucket = "liveness" | "finalize" | "dispatch" | "cleanup";
+    // BLO-51107: the buckets say WHICH stage is slow, never which run or call.
+    // One run's finalize held whole sweeps past 300 s with nothing naming it, so
+    // any single per-run call past this threshold logs its run, call and ms --
+    // plus, for the external-lifecycle finalize, the ms of each step inside it.
+    let currentReapRunId: string | null = null;
+    // Fresh per timed call. A callee that times its own steps reads it (only
+    // the external-lifecycle finalize does); calls are sequential, never nested.
+    let currentPerRunStepMs: Record<string, number> = {};
     // Records from a `finally` for the same reason `timeOrphanReapCall` does:
     // the call most worth attributing is the one that threw.
-    const timePerRun = async <T>(bucket: PerRunBucket, fn: () => Promise<T>): Promise<T> => {
+    const timePerRun = async <T>(
+      bucket: PerRunBucket,
+      fn: () => Promise<T>,
+      callName: string,
+    ): Promise<T> => {
       const startedAt = Date.now();
+      const stepMs: Record<string, number> = {};
+      currentPerRunStepMs = stepMs;
       try {
         return await fn();
       } finally {
@@ -29252,12 +29295,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         else if (bucket === "finalize") perRunFinalizeMs += elapsedMs;
         else if (bucket === "dispatch") perRunDispatchMs += elapsedMs;
         else perRunCleanupMs += elapsedMs;
+        if (elapsedMs >= ORPHAN_REAP_SLOW_PER_RUN_CALL_MS) {
+          logger.warn(
+            {
+              runId: currentReapRunId,
+              bucket,
+              call: callName,
+              elapsedMs,
+              ...(Object.keys(stepMs).length > 0
+                ? {
+                    stepMs,
+                    unattributedMs: elapsedMs - Object.values(stepMs).reduce((sum, ms) => sum + ms, 0),
+                  }
+                : {}),
+            },
+            "reapOrphanedRuns: slow per-run call",
+          );
+        }
       }
     };
     const timedPerRunCall = <A extends readonly unknown[], R>(
       bucket: PerRunBucket,
       fn: (...args: A) => Promise<R>,
-    ) => (...args: A): Promise<R> => timePerRun(bucket, () => fn(...args));
+    ) => (...args: A): Promise<R> => timePerRun(bucket, () => fn(...args), fn.name || "anonymous");
 
     // `liveness`: read-only probes that ask whether this run's Job/pod is still
     // alive. Mixed kube and Postgres on purpose -- that mix is the bucket's
@@ -29322,7 +29382,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             ));
           for (const row of rows) runsWithAdapterInvocation.add(row.runId);
         }
-      });
+      }, "adapterInvocationBatchProbe");
     }
 
     // `finalize`: committing a terminal verdict for the run. The five
@@ -29330,8 +29390,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // process_lost mint below them, which is the same act written inline --
     // splitting those two apart would put half of one decision in each of two
     // buckets and make neither readable.
-    const timedFinalizeExternalLifecycleTerminalRun =
-      timedPerRunCall("finalize", finalizeExternalLifecycleTerminalRun);
+    const timedFinalizeExternalLifecycleTerminalRun = timedPerRunCall(
+      "finalize",
+      function finalizeExternalLifecycleTerminalRunWithSteps(
+        input: Parameters<typeof finalizeExternalLifecycleTerminalRun>[0],
+      ) {
+        return finalizeExternalLifecycleTerminalRun({ ...input, stepMs: currentPerRunStepMs });
+      },
+    );
     const timedSetRunStatus = timedPerRunCall("finalize", setRunStatus);
     const timedSetRunStatusIfRunning = timedPerRunCall("finalize", setRunStatusIfRunning);
     const timedSetWakeupStatus = timedPerRunCall("finalize", setWakeupStatus);
@@ -29371,6 +29437,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const timedCleanupNextRunEventSeq = timedPerRunCall("cleanup", nextRunEventSeq);
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
+      currentReapRunId = run.id;
       if (runningProcesses.has(run.id)) continue;
       if (ambiguousExternalRunIds.has(run.id)) continue;
       if (duplicateJobsCleanedRunIds.has(run.id)) continue;
