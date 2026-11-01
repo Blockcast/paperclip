@@ -2872,6 +2872,115 @@ export async function startServer(): Promise<StartedServer> {
     );
   }
 
+  // Foreign-claim isolation reclaimer (PEN-5151). Worker-tier singleton, opt-IN.
+  //
+  // The reaper above walks the isolation tree on the claim THIS pod mounts. A
+  // per-agent claim (PEN-4932 stage 4b) or an environment `workspaceVolumeClaim`
+  // is a different volume that no server process has mounted, so that tree has
+  // never been swept by anything -- which is what
+  // `paperclip_isolation_workspace_reaper_unreachable_agents` counts. This
+  // block is the other half: the same `{home, session}` allowlist and the same
+  // `lastUsedAt` predicate, executed by a Job that holds the foreign claim.
+  //
+  // `maxAgeDays` and `maxDeletesPerTick` are deliberately the REAPER's
+  // settings, not twins of them. The requirement is that a foreign claim is
+  // swept by the same predicate as a mounted one; two independently tunable
+  // thresholds would make that true only by coincidence, and silently false
+  // the first time an operator tuned one.
+  //
+  // Opt-in for the reaper's own stated reason: this deletes files irreversibly,
+  // so "deploy the code" and "perform the deletion" must not be the same act.
+  // Enable with `dryRun` first.
+  if (config.isolationReclaimSweepEnabled && config.paperclipNodeRole !== "api") {
+    const [{ readInClusterReclaimSelfPodIdentity, resolveSelfPodName }, { createInClusterIsolationReclaimJobPort }] =
+      await Promise.all([
+        import("./services/isolation-reclaim-self.js"),
+        import("./services/isolation-reclaim-job-port.js"),
+      ]);
+    // Same namespace convention as the agent Jobs this server already creates
+    // (`k8s-job-liveness.ts`), which is also where the RBAC Role that permits
+    // these creates is bound.
+    const namespace = process.env.PAPERCLIP_K8S_NAMESPACE ?? "paperclip";
+    const podName = resolveSelfPodName(process.env, () => os.hostname());
+    const port = createInClusterIsolationReclaimJobPort();
+    // Every branch below declines to START, and names its own reason rather
+    // than a shared one. A server that cannot name its own claim must not
+    // sweep: `selfClaimName` is what keeps the sweep off the volume the reaper
+    // is already walking, so guessing it is the one failure that reaches the
+    // wrong filesystem.
+    const self = podName && port.ok
+      ? await readInClusterReclaimSelfPodIdentity({ podName, namespace })
+      : null;
+    if (!podName) {
+      logger.warn(
+        "Foreign-claim isolation reclaimer NOT started: could not determine this pod's name (PEN-5151)",
+      );
+    } else if (!port.ok) {
+      logger.warn(
+        { reason: port.reason },
+        "Foreign-claim isolation reclaimer NOT started: no in-cluster kube client (PEN-5151)",
+      );
+    } else if (!self || !self.ok) {
+      logger.warn(
+        { reason: self?.reason },
+        "Foreign-claim isolation reclaimer NOT started: cannot identify this pod (PEN-5151)",
+      );
+    } else {
+      const { startIsolationReclaimSweep } = await import("./services/isolation-reclaim-sweep.js");
+      logger.info(
+        {
+          intervalMinutes: config.isolationReclaimSweepIntervalMinutes,
+          maxClaimsPerTick: config.isolationReclaimSweepMaxClaimsPerTick,
+          maxAgeDays: config.isolationWorkspaceReaperMaxAgeDays,
+          maxDeletes: config.isolationWorkspaceReaperMaxDeletesPerTick,
+          dryRun: config.isolationReclaimSweepDryRun,
+          namespace,
+          selfClaimName: self.identity.claimName,
+          image: self.identity.image,
+        },
+        "Foreign-claim isolation reclaimer enabled (PEN-5151)",
+      );
+      // BLO-46694: lease holder only -- and here that is load-bearing rather
+      // than boilerplate. The worker tier is a StatefulSet of more than one
+      // pod, so `paperclipNodeRole !== "api"` alone admits every worker, and
+      // two workers sweeping at once is the concurrent-unlink case the
+      // `seed-writable-dirs` shape was refused over.
+      superviseLeased("isolation-reclaim-sweep", () =>
+        startIsolationReclaimSweep(
+          db,
+          config.isolationReclaimSweepIntervalMinutes * 60 * 1000,
+          {
+            template: {
+              namespace,
+              image: self.identity.image,
+              // No `serviceAccountName`: the executor needs no API access, and
+              // the manifest already sets `automountServiceAccountToken: false`.
+              // The rest is inherited from a pod that is demonstrably
+              // schedulable here -- without the selector, the toleration and
+              // the pull secret the Job is admitted and then sits Pending until
+              // its deadline, which reports as a timeout rather than as the
+              // manifest problem it is.
+              ...(self.identity.imagePullPolicy
+                ? { imagePullPolicy: self.identity.imagePullPolicy }
+                : {}),
+              ...(self.identity.imagePullSecrets
+                ? { imagePullSecrets: self.identity.imagePullSecrets }
+                : {}),
+              ...(self.identity.nodeSelector ? { nodeSelector: self.identity.nodeSelector } : {}),
+              ...(self.identity.tolerations ? { tolerations: self.identity.tolerations } : {}),
+            },
+            port: port.port,
+            selfClaimName: self.identity.claimName,
+            maxAgeDays: config.isolationWorkspaceReaperMaxAgeDays,
+            maxClaimsPerTick: config.isolationReclaimSweepMaxClaimsPerTick,
+            maxDeletes: config.isolationWorkspaceReaperMaxDeletesPerTick,
+            dryRun: config.isolationReclaimSweepDryRun,
+          },
+        ),
+      );
+    }
+  }
+
   // Terminal-run pod-log sweeper (BLO-48193). Worker-tier singleton. Reaps
   // `<runId>.pod.ndjson` the adapter never unlinked because its owner died
   // (restart, eviction, OOM). Default-on: it deletes only files the adapter

@@ -37,6 +37,7 @@
     "src/__tests__/isolation-reclaim-job-port.test.ts",
     "src/__tests__/isolation-reclaim-job.test.ts",
     "src/__tests__/isolation-reclaim-runner.test.ts",
+    "src/__tests__/isolation-reclaim-self.test.ts",
     "src/__tests__/isolation-reclaim-sweep.test.ts",
     "src/__tests__/isolation-reclaim-transport.test.ts",
     "src/__tests__/issue-list-description-truncation-flag.test.ts",
