@@ -28,6 +28,7 @@ import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { heartbeatService, parsePrReviewTaskKey } from "../services/heartbeat.js";
+import { githubGetPullRequestGate } from "../services/github-app-auth.js";
 import {
   AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC,
   AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC,
@@ -1014,6 +1015,46 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
       expect(await gaugeTotal({ errorCode: "pr_review_verification_unavailable", scope: "pr_review" })).toBe(1);
       expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(1_800);
+    });
+
+    it("still counts a null-taskKey row while the no-action exclusion set is non-empty", async () => {
+      // `not in (...)` is null for a null taskKey; the coalesce keeps it counted.
+      await seedPair({ state: "closed", merged: false, reviewedAtHead: false }, 7300);
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: new Date(now.getTime() - 60_000),
+        taskKey: null,
+        errorCode: "job_failed",
+      });
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+      expect(await gaugeTotal({ errorCode: "job_failed", scope: "other" })).toBe(1);
+      expect(await gaugeTotal({ errorCode: "pr_review_output_missing", scope: "pr_review" })).toBe(0);
+    });
+
+    it("does not probe GitHub for a key a successor already resolved", async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const failedAt = new Date(now.getTime() - 600_000);
+      const taskKey = "pr_review:Blockcast/onprem-k8s:7400";
+      githubPrs.set("blockcast/onprem-k8s#7400", { state: "closed", merged: false, reviewedAtHead: false });
+      await seedFailedWake({ companyId, agentId, finishedAt: failedAt, taskKey, errorCode: "adapter_failed" });
+      await db.insert(agentWakeupRequests).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "github_pr_synchronized",
+        status: "queued",
+        requestedAt: new Date(failedAt.getTime() + 30_000),
+        payload: { taskKey },
+      });
+      vi.mocked(githubGetPullRequestGate).mockClear();
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+      expect(vi.mocked(githubGetPullRequestGate).mock.calls.map(([input]) => input.prNumber)).not.toContain(7400);
     });
   });
 
