@@ -218,6 +218,8 @@ export const RECLAIM_JOB_ROOT_ANNOTATION = "paperclip.io/reclaim-root";
 export const RECLAIM_JOB_DRY_RUN_ANNOTATION = "paperclip.io/reclaim-dry-run";
 /** The container the report is read from. One container, named here so the log reader cannot guess. */
 export const RECLAIM_JOB_CONTAINER_NAME = "reclaim";
+/** The volume carrying the foreign claim. See {@link reclaimMountedClaimOf}. */
+export const RECLAIM_TARGET_VOLUME_NAME = "reclaim-target";
 
 /**
  * Ceiling on the serialized plan, in bytes.
@@ -427,7 +429,7 @@ export function buildIsolationReclaimJobManifest(
     args: [RECLAIM_EXECUTOR_PATH, spec.mode, "--root", RECLAIM_WORKSPACES_ROOT],
     env,
     volumeMounts: [
-      { name: "reclaim-target", mountPath: RECLAIM_CLAIM_MOUNT_PATH },
+      { name: RECLAIM_TARGET_VOLUME_NAME, mountPath: RECLAIM_CLAIM_MOUNT_PATH },
       { name: "reclaim-home", mountPath: RECLAIM_HOME_MOUNT_PATH },
     ],
     securityContext: {
@@ -493,7 +495,10 @@ export function buildIsolationReclaimJobManifest(
           ...(spec.tolerations?.length ? { tolerations: spec.tolerations } : {}),
           containers: [container],
           volumes: [
-            { name: "reclaim-target", persistentVolumeClaim: { claimName: spec.claimName } },
+            {
+              name: RECLAIM_TARGET_VOLUME_NAME,
+              persistentVolumeClaim: { claimName: spec.claimName },
+            },
             // Small: it holds a log file the executor barely writes to, and
             // sizing it generously would only let a runaway logger consume node
             // ephemeral storage.
@@ -511,4 +516,47 @@ export function buildIsolationReclaimJobManifest(
     root: RECLAIM_WORKSPACES_ROOT,
     planBytes: planJson ? Buffer.byteLength(planJson, "utf8") : 0,
   };
+}
+
+/**
+ * The mode a built Job will actually run, read off the Job itself.
+ *
+ * Exists so `isolation-reclaim-runner.ts` can take the mode from the manifest
+ * rather than from a parameter beside it. The two could disagree, and the
+ * consequence of a disagreement is specific and bad: the runner's
+ * `deletionOutcomeUnknown` is derived from the mode, so an `execute` manifest
+ * described by its caller as `inventory` reports every failure as a known zero
+ * for a Job that unlinks. One source of truth removes the question. (Ally,
+ * review of #3196.)
+ *
+ * The label cannot be spoofed by `extraLabels` — the builder spreads caller
+ * labels *first*, so the identifying ones always win — and an unrecognized
+ * value returns `null` rather than being passed through, because the only
+ * consumer branches on it.
+ */
+export function reclaimJobModeOf(job: k8s.V1Job): IsolationReclaimReportKind | null {
+  const raw = job.metadata?.labels?.[RECLAIM_JOB_MODE_LABEL];
+  return raw === "inventory" || raw === "execute" ? raw : null;
+}
+
+/**
+ * The claim a built Job's pod will actually mount, read off its volume.
+ *
+ * Deliberately the **volume**, not {@link RECLAIM_JOB_CLAIM_ANNOTATION}. Both
+ * are stamped from the same field by the builder, so on a Job this module
+ * produced they agree — but they are not equally good evidence. The annotation
+ * is a *claim about* what is mounted; `persistentVolumeClaim.claimName` **is**
+ * what is mounted. The check this feeds decides whether a reclaim Job is
+ * deleting from the volume its caller meant, so it reads the thing that
+ * determines the answer rather than a field that describes it.
+ *
+ * The annotation keeps its place as the untruncated operator-readable record
+ * — one `kubectl get job -o jsonpath` away, where the volume needs a walk
+ * through the pod template.
+ */
+export function reclaimMountedClaimOf(job: k8s.V1Job): string | null {
+  const volumes = job.spec?.template?.spec?.volumes ?? [];
+  const target = volumes.find((volume) => volume.name === RECLAIM_TARGET_VOLUME_NAME);
+  const claimName = target?.persistentVolumeClaim?.claimName;
+  return typeof claimName === "string" && claimName.length > 0 ? claimName : null;
 }

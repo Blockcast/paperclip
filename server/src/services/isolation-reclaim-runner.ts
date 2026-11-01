@@ -7,8 +7,11 @@ import {
 } from "./isolation-reclaim-report.js";
 import {
   type IsolationReclaimJobManifest,
-  RECLAIM_JOB_CLAIM_ANNOTATION,
   RECLAIM_JOB_CONTAINER_NAME,
+  RECLAIM_JOB_MODE_LABEL,
+  RECLAIM_TARGET_VOLUME_NAME,
+  reclaimJobModeOf,
+  reclaimMountedClaimOf,
 } from "./isolation-reclaim-job.js";
 import { classifyAgentJobRunStatus } from "./k8s-job-liveness.js";
 
@@ -29,9 +32,23 @@ import { classifyAgentJobRunStatus } from "./k8s-job-liveness.js";
  * returns a report it does not interpret, so the inventory → plan → execute
  * orchestration stays above it and remains testable without a cluster.
  *
+ * ## The mode and the claim are read off the manifest, never passed beside it
+ *
+ * `runIsolationReclaimJob` takes the manifest and derives both the mode and the
+ * claim from the Job it is about to create — the mode from
+ * `paperclip.io/reclaim-mode`, the claim from the `reclaim-target` volume's
+ * `persistentVolumeClaim.claimName`. Neither is a parameter, because a
+ * parameter beside the manifest is a second source of truth that can disagree
+ * with it, and the disagreement is not cosmetic: `deletionOutcomeUnknown` below
+ * is derived from the mode, so an `execute` manifest described by its caller as
+ * `inventory` would report every failure as a known zero for a Job that
+ * unlinks — exactly the thing this module exists to prevent. A manifest that
+ * answers neither question is refused rather than guessed at. (Ally, review of
+ * #3196.)
+ *
  * ## The cluster is behind a port, and that is not only for tests
  *
- * {@link ReclaimJobPort} is five methods with no Kubernetes error types in
+ * {@link ReclaimJobPort} is four methods with no Kubernetes error types in
  * their signatures. Translating a `409 AlreadyExists` or a `404` into a value
  * happens at the adapter, so the policy below — when an adoption is safe, when
  * a missing pod is fatal — reads as a decision rather than as a chain of
@@ -88,10 +105,14 @@ import { classifyAgentJobRunStatus } from "./k8s-job-liveness.js";
  * sharing a long prefix produce the same Job name under the same invocation id.
  * A create would come back `AlreadyExists` and adopting it would read the wrong
  * volume's report — and on `execute`, would wait on a pod deleting from a
- * different claim. So an adoption is verified against the untruncated
- * `paperclip.io/reclaim-claim-name` annotation, which exists for precisely this
- * ("the label is for selecting and the annotation is for reading"). A
- * disagreement is refused, never resolved.
+ * different claim. So an adoption is verified by comparing what the existing
+ * Job **mounts** against what this manifest mounts, both read from the
+ * `reclaim-target` volume. The untruncated `paperclip.io/reclaim-claim-name`
+ * annotation says the same thing and is the field an operator reads, but it is
+ * a *claim about* the mount where the volume *is* the mount, and this check
+ * decides whether a pod deletes from the wrong tree. A disagreement is refused,
+ * never resolved; so is an existing Job whose volume cannot be read at all,
+ * which means the name was taken by something this module did not build.
  */
 
 /** How long a Job may take to get from `create` to a running pod. */
@@ -101,7 +122,7 @@ export const DEFAULT_RECLAIM_STARTUP_GRACE_MS = 10 * 60 * 1000;
 export const DEFAULT_RECLAIM_POLL_INTERVAL_MS = 5_000;
 
 /**
- * The cluster, as the five operations this needs and nothing else.
+ * The cluster, as the four operations this needs and nothing else.
  *
  * `readJob` returns `null` for a Job that is not there, and `createJob`
  * reports an existing name as a value rather than an error, so no caller of
@@ -150,7 +171,9 @@ export type ReclaimRunFailureKind =
   /** A report from an image this build cannot read. */
   | "report_unsupported_version"
   /** A well-formed report for the other mode — an adoption or a manifest bug. */
-  | "report_mode_mismatch";
+  | "report_mode_mismatch"
+  /** The manifest does not say which mode it runs, or which claim it mounts. */
+  | "manifest_unreadable";
 
 export interface ReclaimRunSuccess {
   ok: true;
@@ -184,9 +207,8 @@ export interface ReclaimRunFailure {
 export type ReclaimRunOutcome = ReclaimRunSuccess | ReclaimRunFailure;
 
 export interface RunIsolationReclaimJobOptions {
+  /** The mode and the claim are read from this; see the header on why neither is a parameter. */
   manifest: IsolationReclaimJobManifest;
-  claimName: string;
-  mode: IsolationReclaimReportKind;
   port: ReclaimJobPort;
   /** Added to the Job's own `activeDeadlineSeconds` to bound the wait. */
   startupGraceMs?: number;
@@ -223,12 +245,6 @@ export function reclaimWaitBudgetMs(
   return startupGraceMs + deadlineMs;
 }
 
-/** The untruncated claim this Job says it mounts, or `null` if it does not say. */
-function claimAnnotationOf(job: k8s.V1Job): string | null {
-  const raw = job.metadata?.annotations?.[RECLAIM_JOB_CLAIM_ANNOTATION];
-  return typeof raw === "string" && raw.length > 0 ? raw : null;
-}
-
 /**
  * Create the Job, wait for it, and recover the one report its pod log carries.
  *
@@ -240,8 +256,6 @@ export async function runIsolationReclaimJob(
 ): Promise<ReclaimRunOutcome> {
   const {
     manifest,
-    claimName,
-    mode,
     port,
     startupGraceMs = DEFAULT_RECLAIM_STARTUP_GRACE_MS,
     pollIntervalMs = DEFAULT_RECLAIM_POLL_INTERVAL_MS,
@@ -250,11 +264,20 @@ export async function runIsolationReclaimJob(
   } = options;
 
   const { jobName, namespace } = manifest;
+  // Both read off the Job this run is about to create, so neither can disagree
+  // with what actually gets scheduled. See the header.
+  const mode = reclaimJobModeOf(manifest.job);
+  const claimName = reclaimMountedClaimOf(manifest.job);
   // `execute` is the only mode that unlinks, so it is the only mode where a
   // failure leaves an unknown behind. Captured once, here, rather than decided
   // at each `fail` call site where one omission would silently report an
   // unknown as a zero.
-  const couldHaveDeleted = mode === "execute";
+  //
+  // An unreadable mode is treated as `execute` for this purpose even though the
+  // run is about to be refused: the refusal happens before `createJob`, so
+  // nothing can have deleted — but the conservative default is what keeps a
+  // future reordering of these two statements from re-opening the hole.
+  const couldHaveDeleted = mode !== "inventory";
 
   let adopted = false;
   const fail = (
@@ -268,12 +291,28 @@ export async function runIsolationReclaimJob(
     detail,
     jobName,
     namespace,
-    mode,
-    claimName,
+    mode: mode ?? "execute",
+    claimName: claimName ?? "",
     podName,
     adopted,
     deletionOutcomeUnknown,
   });
+
+  // Refused before anything is created: a manifest that cannot say what it runs
+  // or what it mounts is one no check below can be applied to.
+  if (mode === null || claimName === null) {
+    return fail(
+      "manifest_unreadable",
+      `manifest for Job ${jobName} does not record ${[
+        mode === null ? `a ${RECLAIM_JOB_MODE_LABEL} label` : null,
+        claimName === null ? `a ${RECLAIM_TARGET_VOLUME_NAME} volume claim` : null,
+      ]
+        .filter((part): part is string => part !== null)
+        .join(" or ")}; it was not built by buildIsolationReclaimJobManifest`,
+      null,
+      false,
+    );
+  }
 
   const created = await port.createJob(namespace, manifest.job);
   if (created === "already_exists") {
@@ -281,23 +320,30 @@ export async function runIsolationReclaimJob(
     const existing = await port.readJob(namespace, jobName);
     if (!existing) {
       // Created-then-gone between two calls: a TTL expiry or an operator
-      // delete. Nothing of ours ran, and nothing of ours is running.
+      // delete. The Job name embeds the invocation id, so the likeliest owner
+      // of a Job under this exact name is *our own earlier attempt* — a tick
+      // that crashed after `createJob`. If that attempt was an `execute` that
+      // ran and was then cleaned up in this window, deletions happened. "It
+      // never ran" would be an assumption, where every other branch here
+      // reports an observation, so this takes the conservative answer. (Ally,
+      // review of #3196.)
       return fail(
         "job_failed",
         `Job ${jobName} reported AlreadyExists but is not readable; it was deleted between the create and the read`,
         null,
-        false,
+        couldHaveDeleted,
       );
     }
-    const existingClaim = claimAnnotationOf(existing);
-    // Refused, not resolved. An absent annotation is refused too: it means the
-    // Job under this name was not built by this module, so there is no evidence
-    // it mounts the claim we were asked about.
+    const existingClaim = reclaimMountedClaimOf(existing);
+    // Refused, not resolved, and compared mount-to-mount rather than
+    // annotation-to-annotation: see the header. An unreadable volume is refused
+    // too, because it means the Job under this name was not built by this
+    // module and there is no evidence about what it mounts.
     if (existingClaim !== claimName) {
       return fail(
         "name_collision",
         `Job ${jobName} already exists and mounts ${
-          existingClaim === null ? "an unrecorded claim" : JSON.stringify(existingClaim)
+          existingClaim === null ? "no readable claim" : JSON.stringify(existingClaim)
         }, not ${JSON.stringify(claimName)}; pick a different invocationId`,
         null,
         false,
