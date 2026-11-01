@@ -486,7 +486,7 @@ describe("scrubGitHubCliInvocation", () => {
     });
 
     it("leaves the documented base64 fleet write path working", () => {
-      // AGENTS.md:300 — `contents/{path}` PUT with base64 content and a prose
+      // AGENTS.md:467 — `contents/{path}` PUT with base64 content and a prose
       // commit message. Standard base64 has no `-`, so `sk-` cannot survive the
       // encoding; the message beside it is prose and must still be scrubbed.
       const encoded = Buffer.from(SOURCE_WITH_FIXTURE, "utf8").toString("base64");
