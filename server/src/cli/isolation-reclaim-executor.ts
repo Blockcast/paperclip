@@ -77,7 +77,9 @@ import pino from "pino";
 import {
   type IsolationReclaimReport,
   type IsolationReclaimReportKind,
+  type ReclaimPlanEnvelope,
   ISOLATION_RECLAIM_REPORT_VERSION,
+  RECLAIM_PLAN_ENV,
   encodeIsolationReclaimReport,
 } from "../services/isolation-reclaim-report.js";
 import {
@@ -100,26 +102,11 @@ const stderrLogger = pino(
   pino.destination({ dest: 2, sync: true }),
 );
 
-/** Env var carrying the plan on the `execute` path. */
-export const RECLAIM_PLAN_ENV = "PAPERCLIP_RECLAIM_PLAN_JSON";
-
-/**
- * The plan as it crosses into the pod.
- *
- * Carried in the environment rather than a ConfigMap because the server's Role
- * (`paperclip-k8s-adapters`) has **no** `configmaps` verb in any form, so a
- * ConfigMap would need an RBAC change in `onprem-k8s` ahead of this — and it
- * buys nothing: `maxDeletes` already bounds `eligibleIds` to a few hundred
- * uuids, ~7 KB, far inside the kernel's 128 KiB limit on a single environment
- * string (`MAX_ARG_STRLEN`, see `job-manifest.ts`).
+/*
+ * `RECLAIM_PLAN_ENV` and `ReclaimPlanEnvelope` used to be declared here. They
+ * moved to `isolation-reclaim-report.ts` so that both directions of the wire —
+ * the plan in, the report out — are stated in one module; see the note there.
  */
-export interface ReclaimPlanEnvelope {
-  planBuiltAtMs: number;
-  eligibleIds: string[];
-  maxDeletes?: number;
-  maxPlanAgeMs?: number;
-  dryRun?: boolean;
-}
 
 export interface ParsedArgs {
   mode: IsolationReclaimReportKind;
@@ -222,30 +209,49 @@ export async function runReclaimExecutor(input: {
     const args = parseReclaimArgs(input.argv);
     mode = args.mode;
 
-    if (args.mode === "inventory") {
-      // The root has to exist *here*, even though
-      // `collectIsolationWorkspaceInventory` is content to answer `[]` for a
-      // missing one. That answer is right for the mounted sweep, where a
-      // deployment may simply have no isolation tree yet. In this process it
-      // cannot be: something mounted a volume at `--root` for the express
-      // purpose of reclaiming it, so an absent root means the manifest's mount
-      // path and this flag disagree, or the PVC never attached. Passed through
-      // as `[]` it becomes `{ok: true, inventory: []}` — "this claim has
-      // nothing to reclaim", the valid answer `isolation-reclaim-report.ts`
-      // says must never be producible by a fault. It fails safe on data, since
-      // nothing is deleted, and that is the trap: the reclaimer goes blind
-      // permanently with every signal green, which is the failure PEN-5151
-      // exists to end, reintroduced on the executor's side.
-      //
-      // The shared helper keeps its `ENOENT -> []`; the mounted sweep needs it.
-      // (Ally, review of #3189.)
-      const rootStat = await fs.stat(args.root).catch((err: NodeJS.ErrnoException) => {
-        throw new Error(`--root '${args.root}' could not be read: ${err.code ?? err.message}`);
-      });
-      if (!rootStat.isDirectory()) {
-        throw new Error(`--root '${args.root}' is not a directory`);
-      }
+    // The root has to exist *here*, for BOTH modes, even though the two
+    // functions below are each content to answer for a missing one. That
+    // tolerance is right where it lives — the mounted sweep may simply have no
+    // isolation tree yet — and wrong in this process: something mounted a
+    // volume at `--root` for the express purpose of reclaiming it, so an
+    // absent root means the manifest's mount path and this flag disagree, or
+    // the PVC never attached.
+    //
+    // Hoisted above the mode branch rather than checked only on `inventory`,
+    // because the same misconfiguration is invisible in BOTH directions and
+    // neither is self-correcting:
+    //
+    //   inventory — `collectIsolationWorkspaceInventory` maps ENOENT to `[]`,
+    //     which encodes as `{ok: true, inventory: []}`: "this claim has
+    //     nothing to reclaim", the valid answer `isolation-reclaim-report.ts`
+    //     says must never be producible by a fault.
+    //   execute  — `readdir`'s ENOENT is the concurrency-tolerant `vanished`
+    //     case, so every planned id resolves `vanished` and the result reads
+    //     `ok: true, stopReason: "complete"` — indistinguishable from "already
+    //     gone".
+    //
+    // Both fail safe on data, since nothing is deleted, and that is exactly
+    // the trap: the reclaimer goes blind permanently with every signal green,
+    // which is the failure PEN-5151 exists to end, reintroduced on the
+    // executor's side. Ally raised the `execute` half as non-blocking on
+    // #3189, noting the next inventory tick would catch it *only if the two
+    // Jobs share a manifest*. They do — `buildIsolationReclaimJobManifest`
+    // builds both from one spec and differs only in `args` and the plan env
+    // var — so the premise now holds. The check is kept anyway: a guard that
+    // depends on a sibling Job running later is weaker than one that refuses
+    // at the point of damage, and the manifest is free to grow a mode-specific
+    // mount without this file knowing.
+    //
+    // The shared helpers keep their ENOENT tolerance; the mounted sweep needs
+    // it. (Ally, reviews of #3189.)
+    const rootStat = await fs.stat(args.root).catch((err: NodeJS.ErrnoException) => {
+      throw new Error(`--root '${args.root}' could not be read: ${err.code ?? err.message}`);
+    });
+    if (!rootStat.isDirectory()) {
+      throw new Error(`--root '${args.root}' is not a directory`);
+    }
 
+    if (args.mode === "inventory") {
       const inventory = await collectIsolationWorkspaceInventory(args.root);
       return { v: ISOLATION_RECLAIM_REPORT_VERSION, kind: "inventory", ok: true, inventory };
     }
