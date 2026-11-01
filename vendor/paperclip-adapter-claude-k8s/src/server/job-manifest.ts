@@ -100,8 +100,18 @@ function assertSafeAbsolutePath(field: string, value: string): void {
   }
 }
 
-/** One nested rw re-mount of the shared `data` volume, scoped to `subPath`. */
-export type ScopedWritableMount = { subPath: string; mountPath: string };
+/**
+ * One nested re-mount of the shared `data` volume, scoped to `subPath`.
+ *
+ * `readOnly` is the PEN-5191 exception and is set for exactly one candidate —
+ * the agent's own instructions root, and only on a claim the server does not
+ * hold. The entry stays in this list rather than moving out of it because every
+ * other property still holds: it is derived the same way, it is seeded the same
+ * way, and it has to be declared in the same parent-first order the BLO-40401
+ * backstop checks. Only the bind's direction changes. See
+ * `resolveScopedWritableMounts`.
+ */
+export type ScopedWritableMount = { subPath: string; mountPath: string; readOnly?: true };
 
 /**
  * Agent-ad-hoc scratch trees directly under `dataMountPath`. These are not
@@ -337,6 +347,34 @@ export function resolveScopedWritableMounts(input: {
   claudeCodeRuntimeRoot?: string;
   /** Where this process reaches the same volume; see `resolveLinkedWorktreeCommonDir`. */
   serverDataMountPath?: string;
+  /**
+   * PEN-5191 (invariant 8), the WRITE direction. Does the server hold the very
+   * volume this Job mounts (`serverHoldsJobDataClaim`)? Defaults to `true`,
+   * which is today's fleet and preserves every existing caller.
+   *
+   * When FALSE, the agent's own instructions root is emitted READ-ONLY instead
+   * of read-write. It is not dropped: dropping it would leave the path inside
+   * the pod-local root overlay `emptyDir`, where a write succeeds and dies with
+   * the pod — a silent loss, which is the failure being closed, not a fix for it.
+   *
+   * Measured 2026-11-01 (PEN-5191): with the flag on, this mount came out
+   * BYTE-IDENTICAL to the shared-claim one — same `mountPath`, same `subPath`,
+   * no `readOnly`. So the tree was never read-only on an opted-in run, as the
+   * issue title supposed; it was WRITABLE, EMPTY and SEVERED. A per-agent claim
+   * is a fresh subvolume, so the subtree starts with nothing in it, and the
+   * server reads the canonical charter through its OWN mount
+   * (`SELF_POD_DATA_MOUNT_PATH`, and `execute.ts` reads `config.instructionsFilePath`
+   * from there) — so an edit made on the per-agent claim persists on a volume
+   * nothing consults when the next run's instructions are assembled.
+   *
+   * That is the harness-memory shape one layer down, which the CTO charter
+   * records as *"the costlier half is the false record — the run truthfully
+   * reports 'I recorded it' and nothing was recorded."* A read-only bind turns
+   * it into `EROFS` at the call site, which the run can see and act on. The
+   * tree is empty on such a claim, so the refusal costs that run nothing it
+   * actually had.
+   */
+  serverHoldsDataClaim?: boolean;
 }): ScopedWritableMount[] {
   const { dataMountPath, isolation, podLogPath, instructionsFilePath, addDir, companyId, serverDataMountPath } = input;
   const prefix = dataMountPath.endsWith("/") ? dataMountPath : `${dataMountPath}/`;
@@ -403,14 +441,29 @@ export function resolveScopedWritableMounts(input: {
   };
   for (const [field, raw] of candidates) accept(field, raw);
 
+  // The ONE path that becomes read-only on a foreign claim. Derived from the
+  // same helper the candidate list uses, not re-spelled: two derivations of
+  // this path could disagree, and the permissive direction of that
+  // disagreement is the rw mount this exists to withdraw.
+  const readOnlyInstructionsRoot =
+    input.serverHoldsDataClaim === false ? agentBundleRoot(input.agentInstructionsFilePath ?? null, dataMountPath) : "";
+
   const toMounts = (): ScopedWritableMount[] => {
     // Drop any target an ancestor target already covers.
     const minimal = onVolume.filter(
       (candidate) => !onVolume.some((other) => other !== candidate && candidate.startsWith(`${other}/`)),
     );
-    const mounts: ScopedWritableMount[] = minimal
-      .sort()
-      .map((absolute) => ({ subPath: absolute.slice(prefix.length), mountPath: absolute }));
+    const mounts: ScopedWritableMount[] = minimal.sort().map((absolute) => ({
+      subPath: absolute.slice(prefix.length),
+      mountPath: absolute,
+      // Matched on the resolved path rather than on which candidate produced
+      // it. With a prompt bundle the `instructionsFilePath` candidate is the
+      // prompt-cache COPY — writable by design, and the thing the run actually
+      // reads — while without one it resolves to this same canonical root. The
+      // path is what decides, so the copy is never caught and the canonical
+      // root is never missed.
+      ...(readOnlyInstructionsRoot && absolute === readOnlyInstructionsRoot ? { readOnly: true as const } : {}),
+    }));
     for (const name of SCRATCH_DIR_NAMES) {
       mounts.push({ subPath: `${name}/${companyId}`, mountPath: `${prefix}${name}` });
     }
@@ -4110,6 +4163,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         addDir: promptBundle?.addDir ?? null,
         companyId: logPathCompanyId,
         claudeCodeRuntimeRoot: claudeCodeVersion ? claudeCodeRuntimeRoot(dataMountPath, logPathCompanyId) : "",
+        // PEN-5191. Same predicate the delivery channel and `serverCanPreCreate`
+        // read, through the same resolver, so a third answer to "whose volume is
+        // this" cannot drift into the permissive direction.
+        serverHoldsDataClaim,
       })
     : [];
   // Absolute paths the SERVER must create before the Job exists. Without
@@ -4170,7 +4227,14 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // specifically so append sites do NOT each re-implement the condition — see
   // its comment. Adding a check here would be the second copy it argues against.
   for (const mount of scopedWritableMounts) {
-    volumeMounts.push({ name: "data", mountPath: mount.mountPath, subPath: mount.subPath });
+    volumeMounts.push({
+      name: "data",
+      mountPath: mount.mountPath,
+      subPath: mount.subPath,
+      // Absent for every mount but the PEN-5191 one, so the emitted manifest is
+      // byte-identical on the shared claim.
+      ...(mount.readOnly ? { readOnly: true } : {}),
+    });
   }
   if (companySkillsMount) volumeMounts.push(companySkillsMount);
   // Refresh OAuth credentials via ccrotate before invoking claude. The shared
@@ -4782,6 +4846,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
       name: "data",
       mountPath: mount.mountPath,
       subPath: mount.subPath,
+      // The init container gets the same direction as the agent container. It
+      // has no business writing the agent's charter either, and a container
+      // holding the tree rw while the agent holds it ro is a boundary that is
+      // only as strong as the init script.
+      ...(mount.readOnly ? { readOnly: true } : {}),
     })),
     ...(companySkillsMount ? [companySkillsMount] : []),
   ];
