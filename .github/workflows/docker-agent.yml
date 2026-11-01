@@ -23,7 +23,6 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     outputs:
       image_short: ${{ steps.sha.outputs.short }}
-      image_digest: ${{ steps.build.outputs.digest }}
     # BLO-48930: the paperclip-only `arc-paperclip-dind` lane (onprem-k8s#6708,
     # org group 28), a prod-cluster copy of arc-dind. Its group is
     # restrictedToWorkflows and pins exactly this file at refs/heads/master, so
@@ -609,7 +608,9 @@ jobs:
   bump-agent-image:
     needs: build-and-push
     if: ${{ github.event_name != 'workflow_dispatch' && needs.build-and-push.result == 'success' }}
-    runs-on: arc-paperclip-deploy
+    runs-on:
+      group: arc-paperclip-dind
+      labels: arc-paperclip-dind
     environment: paperclip-production
     timeout-minutes: 10
     env:
@@ -716,7 +717,8 @@ jobs:
     needs: [build-and-push, bump-agent-image]
     if: >-
       always() && github.event_name != 'workflow_dispatch' &&
-      (needs.build-and-push.result == 'failure' || needs.bump-agent-image.result == 'failure')
+      (needs.build-and-push.result == 'failure' || needs.build-and-push.result == 'cancelled' ||
+      needs.bump-agent-image.result == 'failure' || needs.bump-agent-image.result == 'cancelled')
     runs-on: arc-paperclip-light
     steps:
       - uses: actions/checkout@v5
@@ -728,7 +730,7 @@ jobs:
           BRANCH: master
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
-          FAILED_JOB: ${{ needs.build-and-push.result == 'failure' && 'build-and-push' || 'bump-agent-image' }}
+          FAILED_JOB: ${{ (needs.build-and-push.result == 'failure' || needs.build-and-push.result == 'cancelled') && 'build-and-push' || 'bump-agent-image' }}
         run: node .github/scripts/post-docker-agent-alert.mjs
 
   # The other half of an honest alert: without it, `endsAt` would be the only
