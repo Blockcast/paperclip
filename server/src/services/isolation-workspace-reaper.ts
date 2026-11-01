@@ -1047,8 +1047,35 @@ export async function buildIsolationReclaimPlan(input: {
  * for it: it starts counting when the pod starts, so it bounds execution time
  * while leaving queueing and image pull — the unbounded part — outside the
  * measurement entirely.
+ *
+ * ⚠ The foreign-claim path (PEN-5151) has a caller that raises this, and it is
+ * held to `MAX_FOREIGN_PLAN_AGE_MS` below rather than being free to pick.
  */
 export const DEFAULT_MAX_PLAN_AGE_MS = 10 * 60_000;
+
+/**
+ * Hard ceiling on a *derived* plan-age bound, for callers that compute one.
+ *
+ * `driveIsolationReclaim` (PEN-5151) runs this executor as a Job and must give
+ * the plan a lifetime that survives admission, scheduling and the image pull —
+ * so it derives one from the wait it grants. Left unbounded, that derivation
+ * reads `activeDeadlineSeconds`, which the paragraph above says in so many
+ * words must not be mistaken for this bound: it is a **liveness** knob, public
+ * on the driver, and an operator raising it to give a slow MDS more time would
+ * silently widen the window in which a resurrected workspace can still be
+ * unlinked. That is a liveness setting quietly becoming a fail-open safety
+ * setting, which is the shape this module refuses everywhere else.
+ *
+ * Fifteen minutes keeps the derived bound "comparable to the mounted sweep's
+ * own snapshot-to-unlink window, which is minutes" — 1.5× the default rather
+ * than the 2.5× an unclamped default budget produces, and, more importantly,
+ * **constant**: it does not move when a liveness knob moves.
+ *
+ * This ceiling binds derivations only. An explicit `maxPlanAgeMs` from a caller
+ * passes through untouched, because that parameter *is* the safety knob, named
+ * as such — the hazard is a bound inferred from something that is not.
+ */
+export const MAX_FOREIGN_PLAN_AGE_MS = 15 * 60_000;
 
 /**
  * How far in the FUTURE a plan's timestamp may sit before it is refused.

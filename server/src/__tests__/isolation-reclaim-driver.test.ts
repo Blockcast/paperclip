@@ -17,6 +17,7 @@ import {
 import {
   DEFAULT_MAX_DELETES_PER_TICK,
   DEFAULT_MAX_PLAN_AGE_MS,
+  MAX_FOREIGN_PLAN_AGE_MS,
 } from "../services/isolation-workspace-reaper.js";
 import type {
   IsolationReclaimExecutionResult,
@@ -488,32 +489,63 @@ describe("driveIsolationReclaim", () => {
 
     const executeManifest = calls[1]!.manifest;
     const budget = reclaimWaitBudgetMs(executeManifest, DEFAULT_RECLAIM_STARTUP_GRACE_MS);
-    // Derived from the manifest actually emitted, not restated: a template that
-    // overrides activeDeadlineSeconds must move both together.
-    expect(planEnvOf(executeManifest).maxPlanAgeMs).toBe(budget);
-    // The point of the fix: strictly longer than what the executor would have
-    // defaulted to on its own.
-    expect(budget).toBeGreaterThan(DEFAULT_MAX_PLAN_AGE_MS);
+    const shipped = planEnvOf(executeManifest).maxPlanAgeMs;
+
+    // On defaults the budget (25 min) exceeds the ceiling, so the ceiling is
+    // what ships. Both halves asserted: the ceiling binds, AND it is still
+    // strictly longer than what the executor would have defaulted to -- a clamp
+    // that collapsed back to 10 min would restore the liveness defect.
+    expect(budget).toBeGreaterThan(MAX_FOREIGN_PLAN_AGE_MS);
+    expect(shipped).toBe(MAX_FOREIGN_PLAN_AGE_MS);
+    expect(shipped).toBeGreaterThan(DEFAULT_MAX_PLAN_AGE_MS);
   });
 
-  it("derives that lifetime from the actual startup grace, not from a constant", async () => {
+  it("does not let a longer activeDeadlineSeconds widen the resurrection window", async () => {
     const { runJob, calls } = scriptedRun({
       inventory: (m) => ranOk(m, inventoryReport([IDLE_A], NOW - 30 * DAY)),
       execute: (m) => ranOk(m, { v: 1, kind: "execute", ok: true, result: executionResult() }),
     });
 
-    const startupGraceMs = DEFAULT_RECLAIM_STARTUP_GRACE_MS + 5 * 60_000;
-    await drive({ runJob, startupGraceMs });
+    // An operator giving a slow MDS an hour of unlink time. That is a LIVENESS
+    // knob; the executor's own rationale says activeDeadlineSeconds "must not be
+    // mistaken for" the plan-age bound. Unclamped this derivation would hand the
+    // Job a 70-minute plan life.
+    await drive({
+      runJob,
+      template: { ...TEMPLATE, activeDeadlineSeconds: 3600 },
+    });
 
     const executeManifest = calls[1]!.manifest;
-    expect(planEnvOf(executeManifest).maxPlanAgeMs).toBe(
-      reclaimWaitBudgetMs(executeManifest, startupGraceMs),
+    expect(executeManifest.job.spec?.activeDeadlineSeconds).toBe(3600);
+    expect(reclaimWaitBudgetMs(executeManifest, DEFAULT_RECLAIM_STARTUP_GRACE_MS)).toBe(
+      DEFAULT_RECLAIM_STARTUP_GRACE_MS + 3600_000,
     );
-    // A driver willing to wait longer must hand over a plan that lives longer;
-    // pinning the delta proves the grace is read rather than ignored.
-    expect(planEnvOf(executeManifest).maxPlanAgeMs).toBe(
-      reclaimWaitBudgetMs(executeManifest, DEFAULT_RECLAIM_STARTUP_GRACE_MS) + 5 * 60_000,
-    );
+    // The deadline moved; the safety window did not.
+    expect(planEnvOf(executeManifest).maxPlanAgeMs).toBe(MAX_FOREIGN_PLAN_AGE_MS);
+  });
+
+  it("tracks the wait below the ceiling, so the budget is read and not assumed", async () => {
+    const { runJob, calls } = scriptedRun({
+      inventory: (m) => ranOk(m, inventoryReport([IDLE_A], NOW - 30 * DAY)),
+      execute: (m) => ranOk(m, { v: 1, kind: "execute", ok: true, result: executionResult() }),
+    });
+
+    // Deliberately chosen so the budget lands UNDER the ceiling: 1 min grace +
+    // 5 min deadline = 6 min. Above the ceiling every input maps to the same
+    // output, so only this region can distinguish "derived from the wait" from
+    // "returns a constant".
+    await drive({
+      runJob,
+      startupGraceMs: 60_000,
+      template: { ...TEMPLATE, activeDeadlineSeconds: 5 * 60 },
+    });
+
+    const executeManifest = calls[1]!.manifest;
+    const budget = reclaimWaitBudgetMs(executeManifest, 60_000);
+    expect(budget).toBe(6 * 60_000);
+    expect(budget).toBeLessThan(MAX_FOREIGN_PLAN_AGE_MS);
+    // Follows the wait exactly here -- a constant-returning derivation fails.
+    expect(planEnvOf(executeManifest).maxPlanAgeMs).toBe(budget);
   });
 
   it("lets an explicit caller value win over the derived one", async () => {
@@ -526,11 +558,10 @@ describe("driveIsolationReclaim", () => {
     await drive({ runJob, maxPlanAgeMs });
 
     const executeManifest = calls[1]!.manifest;
+    // Above the ceiling on purpose: an explicit value is the safety knob itself
+    // and is deliberately NOT clamped, so this also pins that asymmetry.
+    expect(maxPlanAgeMs).toBeGreaterThan(MAX_FOREIGN_PLAN_AGE_MS);
     expect(planEnvOf(executeManifest).maxPlanAgeMs).toBe(maxPlanAgeMs);
-    // Guards the override against being silently replaced by the derivation.
-    expect(maxPlanAgeMs).not.toBe(
-      reclaimWaitBudgetMs(executeManifest, DEFAULT_RECLAIM_STARTUP_GRACE_MS),
-    );
   });
 
   it("gives the two phases distinct Job names under one invocation id", async () => {
