@@ -110,6 +110,8 @@ function buildFakeAlertmanagerStore() {
     return issue;
   }
 
+  const attendance: Array<Record<string, unknown>> = [];
+
   function openMemberCount(coverIssueId: string): number {
     let count = 0;
     for (const m of members.values()) if (m.cover_issue_id === coverIssueId && m.resolved_at === null) count += 1;
@@ -120,6 +122,14 @@ function buildFakeAlertmanagerStore() {
     namespace: "ns",
     async execute(sql: string, params: unknown[] = []) {
       const text = sql.replace(/\s+/g, " ").trim();
+      // PEN-2918 attendance observations are append-only; keep them so tests
+      // can assert the determination rather than only its side effects.
+      if (text.includes("alert_attendance_observations")) {
+        const [id, company_id, alert_issue_id, alertname, disposition, escalation_attempt, notified_agent_id, wake_outcome, wake_detail, alert_liveness] =
+          params as [string, string, string, string, string, number | null, string | null, string, string | null, string];
+        attendance.push({ id, company_id, alert_issue_id, alertname, disposition, escalation_attempt, notified_agent_id, wake_outcome, wake_detail, alert_liveness });
+        return { rowCount: 1 };
+      }
       if (text.includes("alertmanager_aggregate_lifecycle_fences")) {
         return { rowCount: 1 };
       }
@@ -238,7 +248,7 @@ function buildFakeAlertmanagerStore() {
     },
   };
 
-  return { issuesList, issuesCreate, db, coverIssuesById, covers, members, openMemberCount };
+  return { issuesList, issuesCreate, db, coverIssuesById, covers, members, openMemberCount, attendance };
 }
 
 function sweepContext(
@@ -1629,5 +1639,199 @@ describe("resolveAlertmanagerApiUrl", () => {
 
   it("is empty when neither is set, so the read stays 'unknown' (fail closed)", () => {
     expect(resolveAlertmanagerApiUrl(cfg(), {})).toBe("");
+  });
+});
+
+/**
+ * PEN-2918 — the ladder's attendance determination is persisted, so that
+ * "delivered", "acknowledged" and "executed" stop being three words for one
+ * unreadable state.
+ *
+ * Two properties carry most of the weight here, and both are about the
+ * DIRECTION a wrong implementation would fail in:
+ *
+ *  - `acknowledged` must come from an OBSERVATION OF ATTENDANCE, never from a
+ *    wake having been dispatched successfully. This row's founding measurement
+ *    is ~4,900 perfect deliveries and zero action, so an `acknowledged` derived
+ *    from delivery ships the same defect with a schema on it.
+ *  - the record must be able to say "never delivered". A rung whose wake is
+ *    refused posts a comment reading "waking current owner <name>" and then
+ *    swallows the refusal; before this, that discrepancy existed only as a log
+ *    line next to a thread asserting the opposite.
+ */
+describe("PEN-2918 attendance observations", () => {
+  const due = (overrides: Partial<AlertStateRecord> = {}): AlertStateRecord => ({
+    paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null,
+    assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical",
+    firstSeenAt: "2026-07-11T00:00:00Z", lastFiredAt: "2026-07-11T00:10:00Z", resolvedAt: null,
+    nextEscalationAt: "2026-07-11T00:30:00Z", escalationAttempt: 0, ...overrides,
+  });
+  const NOW = new Date("2026-07-11T01:00:00Z");
+  const ARMED = "2026-07-11T09:00:00.000Z";
+
+  const servers: Server[] = [];
+  afterEach(async () => {
+    await Promise.all(servers.splice(0).map((server) => {
+      server.closeAllConnections();
+      return new Promise((resolve) => server.close(resolve));
+    }));
+  });
+  /** A loopback Alertmanager answering every `/api/v2/alerts` read with `payload`. */
+  const alertmanagerServing = async (payload: unknown) => {
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify(payload));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    return config({ alertmanagerApiUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/` });
+  };
+
+  it("records an armed monitor as attended, without claiming anything was delivered", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx } = sweepContext(due(), "cto", store, ARMED);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance).toHaveLength(1);
+    expect(store.attendance[0]).toMatchObject({
+      alert_issue_id: "issue-1",
+      alertname: "SyntheticAlert",
+      disposition: "attended_monitor",
+      wake_outcome: "not_attempted",
+      // Both attendance branches short-circuit ahead of the liveness read, so
+      // this is the honest value rather than a gap: the determination was made
+      // without consulting Alertmanager.
+      alert_liveness: "not_read",
+    });
+  });
+
+  it("records an unresolved blocker as attended, and distinguishes it from the monitor case", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store, null);
+    mocks.issues.relations.get = vi.fn(async () => ({ blockedBy: [{ id: "blocker-1", status: "in_progress" }], blocks: [] }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance).toHaveLength(1);
+    expect(store.attendance[0]).toMatchObject({ disposition: "attended_blocker", wake_outcome: "not_attempted" });
+  });
+
+  it("records a rung whose wake the host accepted as unattended and enqueued", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx } = sweepContext(due(), "cto", store);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance).toHaveLength(1);
+    expect(store.attendance[0]).toMatchObject({
+      disposition: "unattended_rung",
+      wake_outcome: "enqueued",
+      escalation_attempt: 1,
+      notified_agent_id: "engineer",
+      wake_detail: null,
+    });
+  });
+
+  /**
+   * C4 — the cell a three-state model does not have.
+   *
+   * The comment posted immediately before the wake says "waking current owner
+   * Engineer". The wake is then refused and swallowed. Everything a reader of
+   * the thread can see says the owner was woken; this row is the only place
+   * that says otherwise.
+   */
+  it("records a REFUSED wake as such, while the thread still claims the owner was woken", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => { throw new Error("Issue is not wakeable in status: backlog"); });
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance).toHaveLength(1);
+    expect(store.attendance[0]).toMatchObject({ disposition: "unattended_rung", wake_outcome: "refused" });
+    // The discrepancy this column exists to expose, pinned from both sides.
+    expect(mocks.issues.createComment).toHaveBeenCalledWith("issue-1", expect.stringContaining("waking current owner Engineer"), "company-1");
+    // Fixed sentence only — never the raw error, which is operator-readable here.
+    expect(String(store.attendance[0].wake_detail)).not.toContain("not wakeable in status");
+  });
+
+  /**
+   * C3 — the direction that matters. A successful dispatch must never be
+   * recorded as acknowledgement.
+   */
+  it("never records attendance from a wake that merely succeeded", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(mocks.issues.requestWakeup).toHaveBeenCalled();
+    expect(store.attendance.map((row) => row.disposition)).toEqual(["unattended_rung"]);
+    expect(store.attendance.some((row) => String(row.disposition).startsWith("attended_"))).toBe(false);
+  });
+
+  it("records a reassign rung against the agent it escalated TO, not the one it came from", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx } = sweepContext(due({ escalationAttempt: 1 }), "cto", store);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance).toHaveLength(1);
+    expect(store.attendance[0]).toMatchObject({ disposition: "unattended_rung", escalation_attempt: 2, notified_agent_id: "cto" });
+  });
+
+  it("records the cover rung when the agent chain is exhausted", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx } = sweepContext(due({ escalationAttempt: 1 }), null, store);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance).toHaveLength(1);
+    expect(store.attendance[0]).toMatchObject({ disposition: "unattended_cover", wake_outcome: "not_attempted" });
+  });
+
+  /**
+   * The hold is the determination most easily mistaken for the ladder having
+   * stopped: nothing is reassigned, and after the first pass no comment is
+   * posted either, because the marker dedups for the life of the issue.
+   */
+  it("records a hold when Alertmanager says the alert is not firing", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx } = sweepContext(due(), "cto", store);
+    await runAlertEscalationSweep(ctx, await alertmanagerServing([]), NOW);
+
+    expect(store.attendance).toHaveLength(1);
+    expect(store.attendance[0]).toMatchObject({ disposition: "held_alert_clear", alert_liveness: "not_firing", wake_outcome: "not_attempted" });
+  });
+
+  it("carries the live liveness verdict onto the rung record", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx } = sweepContext(due(), "cto", store);
+    const firing = await alertmanagerServing([{ labels: { alertname: "SyntheticAlert" }, status: { state: "active" } }]);
+    await runAlertEscalationSweep(ctx, firing, NOW);
+
+    expect(store.attendance[0]).toMatchObject({ disposition: "unattended_rung", alert_liveness: "firing" });
+  });
+
+  /**
+   * The fail-safe, and the reason the write is a function rather than an
+   * inline INSERT. This record audits the ladder, so it must never be able to
+   * break it: an unmigrated namespace has to cost the row and nothing else.
+   * Failing the other way would let a bookkeeping write suppress a real
+   * escalation, which is strictly worse than the gap being closed.
+   */
+  it("does not disturb the ladder when the observation cannot be written", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.db = {
+      namespace: "ns",
+      query: store.db.query,
+      execute: vi.fn(async (sql: string, params: unknown[] = []) => {
+        if (sql.includes("alert_attendance_observations")) throw new Error('relation "ns.alert_attendance_observations" does not exist');
+        return store.db.execute(sql, params);
+      }),
+    } as unknown as PluginContext["db"];
+
+    await expect(runAlertEscalationSweep(ctx, config(), NOW)).resolves.toBeUndefined();
+    // The rung still happened in full.
+    expect(mocks.state.set).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ escalationAttempt: 1 }), casArg(due()));
+    expect(mocks.issues.createComment).toHaveBeenCalledTimes(1);
+    expect(mocks.issues.requestWakeup).toHaveBeenCalled();
+    expect(store.attendance).toHaveLength(0);
+    expect(mocks.logger.warn).toHaveBeenCalledWith(expect.stringContaining("attendance observation"));
   });
 });

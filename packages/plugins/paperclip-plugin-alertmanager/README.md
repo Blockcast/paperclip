@@ -259,6 +259,62 @@ minutes. Override these globally with `escalationDeadlineMinutes` or per route
 with `issueRouteMap.<label>.<value>.escalationDeadlineMinutes`. Repeat firing
 deliveries preserve ladder state; resolving an alert clears its schedule.
 
+### Every ladder pass leaves a queryable record (PEN-2918)
+
+Each time the sweep reaches a decision about an alert row it appends one row to
+`alert_attendance_observations` in this plugin's namespace. The ladder already
+made this determination on every pass and then discarded it, so this adds a
+record, **not** a decision: rung timing, climb order, who is woken, auto-cancel
+withholding and the PEN-4337 monitor deferral are all unchanged.
+
+| `disposition` | the sweep decided | raises a wake |
+|---|---|---|
+| `attended_monitor` | the owner has armed a monitor (PEN-4337) | no |
+| `attended_blocker` | an unresolved `blockedBy` edge (BLO-40673) | no |
+| `unattended_rung` | neither held; a rung advanced | yes |
+| `unattended_cover` | neither held; the agent chain was exhausted | no — the `[user-cover]` assignment is the notification |
+| `held_alert_clear` | Alertmanager says the alert is not firing (BLO-40739) | no |
+
+`wake_outcome` is `enqueued`, `refused`, or `not_attempted`.
+
+**Read `enqueued` narrowly: the host accepted the wake.** It is not evidence
+that a run started, and it is not acknowledgement. Acknowledgement is recorded
+only from the `attended_*` dispositions — an *observation of attendance* — and
+never from a dispatch having succeeded. That direction is deliberate. The
+measurement behind this table is an alert delivered ~4,900 times over 96h with
+zero delivery failures and zero action, so an `acknowledged` derived from
+successful delivery would restate the defect rather than expose it.
+
+**`refused` is the state a three-state model cannot express.** The rung posts
+`"waking current owner <name>"` *before* calling `issues.requestWakeup`, and
+swallows a refusal by design so the rung does not repeat. A paused agent, a
+budget block or an unresolved blocker therefore leaves a thread asserting a
+wake that never happened. This column is where that discrepancy lands; the
+comment text is deliberately unchanged.
+
+```sql
+-- Escalation passes whose wake was refused: everything this platform
+-- believed it had delivered and had not.
+SELECT observed_at, alert_issue_id, alertname, escalation_attempt
+  FROM plugin_alertmanager_184163d1ba.alert_attendance_observations
+ WHERE company_id = $1 AND wake_outcome = 'refused'
+ ORDER BY observed_at DESC;
+
+-- Attended vs unattended over a window.
+SELECT disposition, wake_outcome, count(*)
+  FROM plugin_alertmanager_184163d1ba.alert_attendance_observations
+ WHERE company_id = $1 AND observed_at > now() - interval '7 days'
+ GROUP BY 1, 2 ORDER BY 3 DESC;
+```
+
+⛔ **What this does not do.** It makes non-acknowledgement *visible and
+queryable*. It does not make non-acknowledgement *oblige anybody*, and it does
+not record whether the resulting work was **executed** — that is a different
+question with a different source. A query over this table is not an on-call
+rota. It is also not a second place to look: the record lives in this plugin's
+namespace and is read through Paperclip's own API, adding no channel and no
+notification.
+
 ### Liveness is pulled, not assumed (BLO-40739)
 
 Before a rung posts or reassigns anything, the sweep reads
