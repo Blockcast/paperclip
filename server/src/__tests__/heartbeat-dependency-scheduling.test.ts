@@ -2601,4 +2601,255 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(issueLock?.executionRunId).toBe(resolvedWake?.id);
     expect(getDepBlockedMetric("dep_blocked_reset")).toBe(1);
   });
+  // ---------------------------------------------------------------------------
+  // PEN-5206: a terminated dep-blocked park that was carrying a resolved human
+  // decision must say so on the row.
+  //
+  // Measured on PEN-2145: card `176818c6` (`wake_assignee_on_accept`) was accepted
+  // 2026-10-31T15:11:45.527Z; run `cd4dfc7e` was created 291 ms later, never started,
+  // burned 12 `dependency_blocked` attempts and was cancelled 10h20m on. The wake
+  // fired correctly — the termination is what lost the decision, and it lost it
+  // silently in BOTH directions: the human saw a card they had actioned, and the
+  // assignee saw no wake, because the wake had happened and had been consumed. The
+  // card still reads `accepted` and will never be re-presented, so no later sweep of
+  // the interaction table can tell a delivered decision from a stranded one.
+  //
+  // These tests assert on the COMMENT, not on the metric alone, because the comment
+  // is the only output that reaches the two parties who need it. A counter nobody is
+  // alerting on would satisfy a weaker reading of "surfaces somewhere" while leaving
+  // the row exactly as silent as it is today.
+  // ---------------------------------------------------------------------------
+
+  /** The context snapshot `queueResolvedInteractionContinuationWakeup` writes. */
+  const carriedDecisionSnapshot = (issueId: string, interactionId: string) => ({
+    issueId,
+    taskId: issueId,
+    interactionId,
+    interactionKind: "request_confirmation",
+    interactionStatus: "accepted",
+    sourceCommentId: null,
+    sourceRunId: null,
+    wakeReason: "issue_commented",
+    source: "issue.interaction",
+  });
+
+  /**
+   * The payload half of the same wake. `mutation: "interaction"` is load-bearing:
+   * without it `normalizeInteractionContinuationWakeContext` DELETES interactionId,
+   * interactionKind and interactionStatus from the snapshot before the park is
+   * written, so a test that omits it silently asserts against a park carrying
+   * nothing — which is how the first draft of these tests failed.
+   */
+  const carriedDecisionPayload = (issueId: string, interactionId: string) => ({
+    issueId,
+    interactionId,
+    interactionKind: "request_confirmation",
+    interactionStatus: "accepted",
+    sourceCommentId: null,
+    sourceRunId: null,
+    mutation: "interaction",
+  });
+
+  /**
+   * Seed a blocked issue and drive one dep-blocked park onto it, with whatever
+   * context snapshot the caller wants that park to be carrying.
+   */
+  async function seedBlockedIssueWithPark(
+    buildSnapshot: (blockedIssueId: string) => Record<string, unknown>,
+    buildPayload?: (blockedIssueId: string) => Record<string, unknown>,
+  ) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const blockerId = randomUUID();
+    const blockedIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Blocker", status: "in_progress", priority: "high" },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked",
+        status: "todo",
+        priority: "medium",
+        assigneeAgentId: agentId,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+    });
+
+    await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: buildPayload?.(blockedIssueId) ?? { issueId: blockedIssueId },
+      contextSnapshot: buildSnapshot(blockedIssueId),
+    });
+
+    const park = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "scheduled_retry"),
+          eq(heartbeatRuns.scheduledRetryReason, DEP_BLOCKED_RETRY_REASON),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    expect(park).not.toBeNull();
+    return { companyId, agentId, blockerId, blockedIssueId, park: park! };
+  }
+
+  /** The stranded-decision notices written to a row. */
+  async function readStrandedDecisionNotices(issueId: string) {
+    const rows = await db
+      .select({ body: issueComments.body })
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    return rows
+      .map((row) => row.body ?? "")
+      .filter((body) => body.includes("consumed but never delivered"));
+  }
+
+  it("writes a stranded-decision notice when the attempt budget terminates a park carrying an acceptance", async () => {
+    const interactionId = randomUUID();
+    const seeded = await seedBlockedIssueWithPark(
+      (issueId) => carriedDecisionSnapshot(issueId, interactionId),
+      (issueId) => carriedDecisionPayload(issueId, interactionId),
+    );
+    // The park must actually be carrying the decision, or the assertions below would
+    // pass against a build that writes the notice unconditionally.
+    expect(seeded.park.contextSnapshot).toMatchObject({
+      interactionId,
+      interactionStatus: "accepted",
+    });
+
+    // Drive straight to the ceiling rather than cycling 12 backoffs: this test is
+    // about what termination WRITES, and the 12-attempt walk is already pinned by
+    // "pins the dependency retry budget used before recovery handoff" above. The park
+    // stays seconds old, so the age ceiling (12h, evaluated FIRST) cannot be what
+    // fires here — only the attempt ceiling can.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        scheduledRetryAttempt: DEP_BLOCKED_MAX_RETRY_ATTEMPTS,
+        scheduledRetryAt: new Date(Date.now() - 60_000),
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, seeded.park.id));
+
+    await heartbeat.promoteDueScheduledRetries(new Date());
+
+    const terminated = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.park.id))
+      .then((rows) => rows[0] ?? null);
+    expect(terminated?.status).toBe("cancelled");
+    expect(terminated?.errorCode).toBe("issue_dependencies_blocked");
+    expect(terminated?.error).toContain("exhausted");
+
+    const notices = await readStrandedDecisionNotices(seeded.blockedIssueId);
+    expect(notices).toHaveLength(1);
+    const notice = notices[0]!;
+    // Everything a reader needs in order to re-issue the decision, and nothing inferred.
+    expect(notice).toContain(interactionId);
+    expect(notice).toContain("accepted");
+    expect(notice).toContain("request_confirmation");
+    expect(notice).toContain(seeded.park.id);
+    expect(notice).toContain(seeded.blockerId);
+    expect(notice).toContain(`${DEP_BLOCKED_MAX_RETRY_ATTEMPTS} attempts`);
+    expect(getDepBlockedMetric("dep_blocked_terminated_carrying_decision")).toBe(1);
+    expect(getDepBlockedMetric("dep_blocked_exhausted")).toBe(1);
+  });
+
+  it("writes a stranded-decision notice when the age ceiling terminates a park carrying an acceptance", async () => {
+    // The second terminal branch. It is reached by a DIFFERENT bound (blocker-set
+    // churn outrunning the attempt budget), so covering only the attempt ceiling would
+    // leave the churn path silent — and churn is the path a long-lived blocked row is
+    // most likely to take.
+    const interactionId = randomUUID();
+    const seeded = await seedBlockedIssueWithPark(
+      (issueId) => carriedDecisionSnapshot(issueId, interactionId),
+      (issueId) => carriedDecisionPayload(issueId, interactionId),
+    );
+    expect(seeded.park.contextSnapshot).toMatchObject({
+      interactionId,
+      interactionStatus: "accepted",
+    });
+    // Attempt count stays far below the ceiling, so only the age bound can fire.
+    expect(seeded.park.scheduledRetryAttempt).toBeLessThan(DEP_BLOCKED_MAX_RETRY_ATTEMPTS);
+
+    await heartbeat.promoteDueScheduledRetries(
+      new Date(seeded.park.createdAt.getTime() + DEP_BLOCKED_MAX_PARK_AGE_MS + 2 * 60 * 60 * 1000),
+    );
+
+    const terminated = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.park.id))
+      .then((rows) => rows[0] ?? null);
+    expect(terminated?.status).toBe("cancelled");
+    expect(terminated?.error).toContain("maximum age");
+
+    const notices = await readStrandedDecisionNotices(seeded.blockedIssueId);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]!).toContain(interactionId);
+    expect(notices[0]!).toContain("maximum age");
+    expect(getDepBlockedMetric("dep_blocked_terminated_carrying_decision")).toBe(1);
+    expect(getDepBlockedMetric("dep_blocked_age_expired")).toBe(1);
+  });
+
+  it("stays silent when an ordinary dep-blocked park is terminated carrying no decision", async () => {
+    // The noise control, and the reason the notice keys on the SNAPSHOT rather than on
+    // termination alone. Dep-blocked terminations are routine — PEN-2145 alone carried
+    // four — and an ordinary park holds nothing a later wake could not reconstruct. A
+    // notice on every one of those would bury the rare case this exists to surface.
+    const seeded = await seedBlockedIssueWithPark((issueId) => ({
+      issueId,
+      wakeReason: "issue_assigned",
+    }));
+    await db
+      .update(heartbeatRuns)
+      .set({
+        scheduledRetryAttempt: DEP_BLOCKED_MAX_RETRY_ATTEMPTS,
+        scheduledRetryAt: new Date(Date.now() - 60_000),
+        updatedAt: new Date(),
+      })
+      .where(eq(heartbeatRuns.id, seeded.park.id));
+
+    await heartbeat.promoteDueScheduledRetries(new Date());
+
+    const terminated = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, seeded.park.id))
+      .then((rows) => rows[0] ?? null);
+    expect(terminated?.status).toBe("cancelled");
+
+    expect(await readStrandedDecisionNotices(seeded.blockedIssueId)).toHaveLength(0);
+    expect(getDepBlockedMetric("dep_blocked_terminated_carrying_decision")).toBe(0);
+  });
 });
