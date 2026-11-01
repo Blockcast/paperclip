@@ -1052,7 +1052,7 @@ has a stated failing value, so "I checked" is falsifiable.
 | 2 | §11.1 ledger | six of six on `master` | ✅ **six of six — PASSES** as measured 2026-10-30T11:1xZ on `584068888`. ⚠ The sixth is discharged by **content on `master`**, #3112 having been closed unmerged — a check that reads `merged` fails this row wrongly (§11.1, §11.2) |
 | 3 | §4 trigger-2 query, re-read over a window overlapping stage 0 | zero broad renders, with the liveness control | ✅ **pass** (§11.7) |
 | 4 | §3.5a privilege pre-flight across the stage-1 population | no privileged container beside the broker | ✅ **pass** (§11.7) |
-| 5 | #3089's env-credential refusal is live on `master` | `findAgentGitHubCredentialEnvNames` is called under `brokerEnabled` in `job-manifest.ts`, **and** its test asserts the throw for all four credential names with the positive control intact | ✅ **pass** — read at source 2026-11-01 (§3.4, PEN-5184) |
+| 5 | #3089's env-credential refusal is live on `master` | `findAgentGitHubCredentialEnvNames` is called under `brokerEnabled` in `job-manifest.ts`, **and** `job-manifest.github-publish-broker.test.ts` **passes**, asserting the throw for all four credential names with the positive control intact | ✅ **pass** — read at source 2026-11-01 (§3.4, PEN-5184) |
 
 ⭐ **Check 5 is new (2026-11-01, PEN-5184), and it is a tightening rather than an addition for its own
 sake.** §3.4's board-level env read was the gate standing in this position, and no agent seat can
