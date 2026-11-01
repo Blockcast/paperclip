@@ -1005,6 +1005,40 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .set({ nextRunAt, lastFiredAt, lastResult: "Created execution issue" })
       .where(eq(routineTriggers.id, created.trigger.id));
 
+    // `lastRun` (list) and `recentRuns` (detail) answer the same question under different keys, so
+    // the only thing worth asserting between them is the superset relation. That assertion needs
+    // runs to EXIST: `Array.isArray(detail.recentRuns)` passes on `[]`, which shows the key is
+    // present and nothing else (Ally, suggestion 1 on #3199). Two runs with distinct `createdAt`
+    // also pin WHICH run each surface picks, which is the part that can actually drift: `list`
+    // takes the newest per routine via `selectDistinctOn` ordered `createdAt desc, id desc`
+    // (`services/routines.ts:1272`), while `getDetail` takes the head of a plain `createdAt desc`
+    // page (`:3103`). Those are two different orderings of the same table, and if they stop
+    // agreeing then `lastRun` is no longer the run the detail surface shows first.
+    const olderRunId = randomUUID();
+    const newerRunId = randomUUID();
+    await db.insert(routineRuns).values([
+      {
+        id: olderRunId,
+        companyId,
+        routineId: routine.id,
+        triggerId: created.trigger.id,
+        source: "schedule",
+        status: "issue_created",
+        triggeredAt: new Date("2026-10-31T06:00:00.000Z"),
+        createdAt: new Date("2026-10-31T06:00:00.000Z"),
+      },
+      {
+        id: newerRunId,
+        companyId,
+        routineId: routine.id,
+        triggerId: created.trigger.id,
+        source: "schedule",
+        status: "issue_created",
+        triggeredAt: lastFiredAt,
+        createdAt: lastFiredAt,
+      },
+    ]);
+
     const [listed] = await svc.list(companyId);
     const detail = await svc.getDetail(routine.id);
 
@@ -1091,9 +1125,17 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(detail).toHaveProperty("activeIssue");
     // `lastRun` is list-only by design; the detail surface answers it with `recentRuns`, a
     // superset. Assert the superset relationship rather than the key, or the two read as drifted
-    // the moment one is renamed.
-    expect(listed).toHaveProperty("lastRun");
-    expect(Array.isArray(detail?.recentRuns)).toBe(true);
+    // the moment one is renamed. Both runs seeded above must be here, newest first, and the head
+    // of that page must be the very run `list` calls `lastRun`.
+    expect(listed?.lastRun?.id, "list lastRun must be the newest run").toBe(newerRunId);
+    expect(
+      detail?.recentRuns.map((run) => run.id),
+      "detail recentRuns must carry every run for the routine, newest first",
+    ).toEqual([newerRunId, olderRunId]);
+    expect(
+      detail?.recentRuns[0]?.id,
+      "detail recentRuns[0] must be the same run the list surface reports as lastRun",
+    ).toBe(listed?.lastRun?.id);
   });
 
   it("blocks agents from restoring routine revisions assigned to another agent", async () => {
