@@ -40,6 +40,7 @@
     "src/__tests__/orphan-artifact-path-agreement.test.ts",
     "src/__tests__/orphan-reap-adapter-invoke-probe-batching.test.ts",
     "src/__tests__/orphan-reap-per-run-sub-stage-audit.test.ts",
+    "src/__tests__/orphan-reap-slow-per-run-call-log.test.ts",
     "src/__tests__/metrics-model-profile-unapplied.test.ts",
     "src/__tests__/pen3288-null-prototype-accumulators.test.ts",
     "src/__tests__/pen3954-membership-role-write-bars.test.ts",
