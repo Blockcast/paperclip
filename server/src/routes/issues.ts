@@ -16509,8 +16509,20 @@ export function issueRoutes(
     // matching buys false wakes.
     //
     // `comment` is re-read into a const so the closures below keep the
-    // not-null narrowing, and the resolution is memoized so the wake path and
-    // the response share one lookup rather than querying twice.
+    // not-null narrowing, and the resolution is memoized.
+    //
+    // That memo spans the UNKEYED path only, where the wake (below) and the
+    // response share one lookup. The idempotency-keyed path resolves
+    // separately inside `buildKeyedCommentEffectIntents`, which calls
+    // `svc.findMentionedAgents` directly, and then again here via
+    // `commentResponseBody()` — so a keyed first write makes two queries. (A
+    // keyed replay whose effects already exist makes one.) Both sites pass the
+    // same company and the same body to the same resolver, so they ask the
+    // same question and only use the answer differently: one builds wake
+    // intents, one reports which tokens bound. They are left separate because
+    // threading the memo through the effect builder would couple the two for
+    // no gain, and the duplicate read is cheap — not because the lookups
+    // differ.
     const persistedComment = comment;
     let resolvedMentionAgentIds: string[] | null = null;
     const resolveMentionedAgentIds = async (): Promise<string[]> => {

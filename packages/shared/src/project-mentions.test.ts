@@ -140,6 +140,115 @@ describe("extractUnboundMentionTokens", () => {
     expect(extractUnboundMentionTokens(body)).toHaveLength(MAX_UNBOUND_MENTION_TOKENS);
   });
 
+  // PEN-5187: `AT_TOKEN_RE` treated any `@`-shaped token as a candidate, so a
+  // scoped package written in unquoted prose reported a name nobody wrote.
+  // Engineering comments here name scoped packages and GitHub org paths
+  // constantly, which made that a SYSTEMATIC false entry rather than an
+  // occasional one — and a field that is usually wrong is a field people learn
+  // to skip, which is the silent drop PEN-5180 exists to end, wearing a better
+  // outfit.
+  describe("scoped packages and org paths written in prose (PEN-5187)", () => {
+    it("does not report an npm scope written in unquoted prose", () => {
+      expect(extractUnboundMentionTokens("we should pin @types/node to match CI")).toEqual([]);
+    });
+
+    it("does not report a first-party scope written in unquoted prose", () => {
+      expect(extractUnboundMentionTokens("the helper lives in @paperclipai/shared now")).toEqual([]);
+    });
+
+    it("does not report a GitHub org path written in unquoted prose", () => {
+      expect(
+        extractUnboundMentionTokens("review is owned by @Blockcast/onprem-k8s-ally-reviewer"),
+      ).toEqual([]);
+    });
+
+    // The load-bearing half of the rule. Skipping on a bare `/` would also drop
+    // this, and dropping a REAL unbound mention is the expensive failure.
+    it("POSITIVE CONTROL: still reports a slash-separated mention pair", () => {
+      expect(extractUnboundMentionTokens("cc @Ceo/@Cto for a ruling")).toEqual(["Ceo", "Cto"]);
+    });
+
+    // Done-when: the suppression must not have cost the signal it protects.
+    it("POSITIVE CONTROL: a genuine unbound @Name beside a scope is still reported", () => {
+      expect(
+        extractUnboundMentionTokens("@Ceo please rule on pinning @types/node in CI"),
+      ).toEqual(["Ceo"]);
+    });
+
+    it("POSITIVE CONTROL: a resolved agent:// mention beside a scope still reports nothing", () => {
+      expect(
+        extractUnboundMentionTokens(`[@Ceo](${boundHref}) owns the @types/node pin`, {
+          boundAgentIds: [BOUND_AGENT_ID],
+        }),
+      ).toEqual([]);
+    });
+
+    // ACCEPTED, NOT FIXED — asserted so the decision is executable rather than
+    // merely written down. A bare decorator is lexically identical to a bare
+    // name mention, and agent names here are capitalized too, so every
+    // candidate discriminator would also drop real mentions. Reporting it costs
+    // one glance; suppressing it would cost a class of real mention. If this
+    // test ever fails, the suppression that broke it is the regression.
+    it("ACCEPTED: a bare decorator in prose is still reported, by decision", () => {
+      expect(extractUnboundMentionTokens("mark the provider @Injectable first")).toEqual([
+        "Injectable",
+      ]);
+    });
+
+    it("masks the common backticked decorator form, as before", () => {
+      expect(extractUnboundMentionTokens("mark the provider `@Injectable` first")).toEqual([]);
+    });
+
+    // A trailing slash with nothing after it is not a scope, so the scanner
+    // keeps reporting — unchanged fail-toward-reporting posture.
+    it("still reports a token whose slash opens nothing", () => {
+      expect(extractUnboundMentionTokens("ask @Ceo/ about this")).toEqual(["Ceo"]);
+    });
+
+    // The scope-char class is lowercase-and-digit, because npm scope segments
+    // and GitHub team slugs are lowercase while agent names here are
+    // capitalized. These two are the mentions a wider class silently swallowed,
+    // and a swallowed real mention is the failure PEN-5180 exists to end.
+    it("POSITIVE CONTROL: reports a capitalized name before a slash", () => {
+      expect(extractUnboundMentionTokens("cc @Ceo/Cto for a ruling")).toEqual(["Ceo"]);
+    });
+
+    it("POSITIVE CONTROL: reports a capitalized name before a slashed role", () => {
+      expect(extractUnboundMentionTokens("cc @Ceo/PlatformSRE please")).toEqual(["Ceo"]);
+    });
+
+    // An npm name cannot begin with `.`, `_` or `-`, so none of these opens a
+    // real scope path and the token before them is still a candidate name.
+    it("reports a name whose slash opens a character npm cannot start with", () => {
+      expect(extractUnboundMentionTokens("@Ceo/. then @Cto/-x then @Ceo/_y")).toEqual([
+        "Ceo",
+        "Cto",
+      ]);
+    });
+
+    // ACCEPTED COST of the lowercase narrowing, asserted so it is visible
+    // rather than discovered. A capitalized repo segment reports its org again.
+    // That is a false positive costing one glance, bought with a false
+    // negative; the lowercase paths this corpus actually writes stay suppressed.
+    it("ACCEPTED: an org path with a capitalized repo segment reports the org", () => {
+      expect(extractUnboundMentionTokens("see @Blockcast/Network-Operator-Portal")).toEqual([
+        "Blockcast",
+      ]);
+    });
+
+    it("keeps suppressing the lowercase org paths this corpus actually writes", () => {
+      expect(
+        extractUnboundMentionTokens("@Blockcast/paperclip and @Blockcast/penstock-llm-proxy-core"),
+      ).toEqual([]);
+    });
+
+    // Remaining residual, stated rather than hidden: an all-lowercase pair is
+    // lexically indistinguishable from a scope and stays dropped.
+    it("RESIDUAL: an all-lowercase slashed pair is still read as a scope", () => {
+      expect(extractUnboundMentionTokens("ping @ceo/cto")).toEqual([]);
+    });
+  });
+
   it("returns nothing for an empty or mention-free body", () => {
     expect(extractUnboundMentionTokens("")).toEqual([]);
     expect(extractUnboundMentionTokens("a comment with no mentions at all")).toEqual([]);
