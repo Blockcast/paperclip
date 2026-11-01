@@ -1313,6 +1313,132 @@ export function readDepBlockedFirstParkedAt(run: {
   return run.createdAt;
 }
 
+/**
+ * The resolved interaction decision a dep-blocked park is carrying, if any (PEN-5206).
+ *
+ * ## Why a park can be the sole carrier of a decision
+ *
+ * When a human resolves an interaction card whose `continuationPolicy` is
+ * `wake_assignee` or `wake_assignee_on_accept`, the route layer consumes that
+ * resolution into exactly one wake: the card is stamped `resolvedAt`, so it is
+ * decided and will never be re-presented, and the only thing carrying the decision
+ * onward is the run that wake created. If the issue is `blocked`, that run is parked
+ * `dependency_blocked` rather than dispatched. Terminate the park and the decision is
+ * gone — not deferred. No later wake reconstructs it, because nothing is left in a
+ * pending state for anything to notice.
+ *
+ * Measured (PEN-5206): on PEN-2145, card `176818c6` (`wake_assignee_on_accept`) was
+ * accepted 2026-10-31T15:11:45.527Z; run `cd4dfc7e` was created 291 ms later, never
+ * started, burned 12 `dependency_blocked` attempts and was cancelled 10h20m on. The
+ * wake fired correctly and promptly — it was the termination that lost the decision,
+ * silently in both directions: the human saw a card they had actioned, and the
+ * assignee saw no wake, because the wake had happened and had been consumed.
+ *
+ * ## Why this reads the snapshot rather than the interaction row
+ *
+ * The snapshot is what the wake actually carried, which is the thing being destroyed.
+ * The interaction row still exists and still reads `accepted` — that is precisely why
+ * the gap is invisible from the card's side, so re-reading the card could not tell a
+ * delivered decision from a stranded one.
+ *
+ * Any non-empty `interactionId` with a status qualifies, not only `accepted`. The
+ * route layer has already filtered to resolved decisions by the time a wake exists
+ * (`expired` returns early; `wake_assignee_on_accept` fires only on `accepted`), so
+ * every carrier reaching here holds a real human decision.
+ *
+ * That breadth is load-bearing, not defensive. A sweep of all 4,656 issues
+ * (2026-11-01) found 494 resolved cards carrying a continuation wake and two
+ * stranded this way — and only ONE was an acceptance. The other, on PEN-2657, was
+ * an `ask_user_questions` card resolved `answered`: a human answered at
+ * 2026-10-21T03:21:32Z, the carrier was killed at 13:38 the same day, and the row
+ * closed `done` four days later having never received the answer. Scoping this to
+ * `accepted` would have left that one exactly as silent as it was. It is also the
+ * case `accepted-interaction-outcome-sweep.ts` structurally cannot see:
+ * `ask_user_questions` is outside `ACCEPTED_OUTCOME_SWEEP_KINDS` by construction,
+ * so no alert on that gauge could ever have raised it.
+ */
+export type CarriedInteractionDecision = {
+  interactionId: string;
+  interactionKind: string | null;
+  interactionStatus: string;
+  sourceCommentId: string | null;
+};
+
+export function readCarriedInteractionDecision(contextSnapshot: unknown): CarriedInteractionDecision | null {
+  const context = parseObject(contextSnapshot);
+  const interactionId = readNonEmptyString(context.interactionId);
+  if (!interactionId) return null;
+  const interactionStatus = readNonEmptyString(context.interactionStatus);
+  if (!interactionStatus) return null;
+  // Breadth, but not unbounded breadth: gate on the same resolved set
+  // `isResolvedInteractionContinuationWakeContext` uses rather than on "any non-empty
+  // status". Both measured instances (`accepted`, `answered`) are in it, so this costs
+  // no coverage -- what it buys is that a future snapshot writer cannot put a
+  // non-terminal status here and have the notice report a decision that was never
+  // made. A notice reading "was resolved pending" would be worse than silence: it
+  // would send a human to re-ask a question nobody had answered.
+  if (!RESOLVED_INTERACTION_CONTINUATION_STATUSES.has(interactionStatus)) return null;
+  return {
+    interactionId,
+    interactionKind: readNonEmptyString(context.interactionKind),
+    interactionStatus,
+    sourceCommentId: readNonEmptyString(context.sourceCommentId),
+  };
+}
+
+/**
+ * How a dep-blocked park ended. Both terminations destroy a carrier identically; they
+ * are reported separately because they mean different things about the wait (attempt
+ * budget spent vs. blocker-set churn outrunning it), and a reader deciding whether to
+ * re-ask the human wants to know which.
+ */
+export type DepBlockedTermination = "attempt_budget_exhausted" | "max_park_age_exceeded";
+
+/**
+ * The notice written to the issue thread when a termination strands a decision.
+ *
+ * This is the "fails loudly" half of PEN-5206. The platform cannot deliver the wake —
+ * the row is still blocked, so re-waking would only re-park — so the obligation it
+ * discharges is to leave a durable, human-readable and agent-readable record on the
+ * row itself, at the moment the information would otherwise be lost. It states what
+ * was decided, that the decision never reached the assignee, and what remains blocked,
+ * and it asks for a human re-ask rather than inferring one: re-deriving intent from a
+ * consumed card is exactly the judgement this platform must not make for itself.
+ */
+export function buildDepBlockedCarriedDecisionNotice(input: {
+  decision: CarriedInteractionDecision;
+  termination: DepBlockedTermination;
+  runId: string;
+  attempt: number;
+  unresolvedBlockerIssueIds: string[];
+}): string {
+  const { decision, termination, runId, attempt, unresolvedBlockerIssueIds } = input;
+  const cause =
+    termination === "attempt_budget_exhausted"
+      ? `its dependency-blocked retry budget was spent (${attempt} of ${DEP_BLOCKED_MAX_RETRY_ATTEMPTS} attempts)`
+      : `its dependency-blocked park exceeded the ${Math.round(
+          DEP_BLOCKED_MAX_PARK_AGE_MS / 3_600_000,
+        )}h maximum age`;
+  const kind = decision.interactionKind ? ` (\`${decision.interactionKind}\`)` : "";
+  const blockers =
+    unresolvedBlockerIssueIds.length > 0
+      ? unresolvedBlockerIssueIds.map((id) => `\`${id}\``).join(", ")
+      : "none recorded at termination";
+  return [
+    "⚠️ **A decision on this row was consumed but never delivered.**",
+    "",
+    `Interaction \`${decision.interactionId}\`${kind} was resolved **${decision.interactionStatus}**, and the wake carrying that decision to the assignee was parked because this issue was blocked. That wake has now been terminated: ${cause}. The run never started and did nothing.`,
+    "",
+    "The card still reads as resolved and will not be presented again, so nothing else will surface this.",
+    "",
+    `- Terminated run: \`${runId}\``,
+    `- Unresolved blockers at termination: ${blockers}`,
+    ...(decision.sourceCommentId ? [`- Source comment: \`${decision.sourceCommentId}\``] : []),
+    "",
+    "**What is needed:** whoever owns this row should confirm what that decision was meant to set in motion and re-issue it once the blockers clear. Paperclip will not re-derive it — the decision was a human's and re-inferring it from a consumed card is not a call the platform may make.",
+  ].join("\n");
+}
+
 // errorCode stamped by the inline cancel in the `blockedInteractionWake` branch. Named
 // because origin recovery matches on it: it is the one terminal reason that means "this
 // park was interrupted mid-wait", as opposed to ended.
@@ -22262,6 +22388,81 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return cancelled;
   }
 
+  /**
+   * Leave a durable notice on the row when a dep-blocked termination strands a
+   * resolved human decision (PEN-5206). No-op for the ordinary park, which carries
+   * nothing.
+   *
+   * Deliberately comment-only. The platform must not act on the stranded decision:
+   * the record it destroyed was a human's judgement, and a sweep that re-derived and
+   * executed one would be performing a decision nobody delegated to it — the same
+   * line `accepted-interaction-outcome-sweep.ts` draws. Nor does it re-wake: the row
+   * is still blocked by construction (that is why the park existed), so a wake would
+   * only re-park and burn another budget. A comment is the one output that survives
+   * the termination, is visible to the human who decided and to the assignee whenever
+   * it next reads the thread, and claims nothing it has not checked.
+   *
+   * Never allowed to throw. By the time this runs the termination has already been
+   * committed and the issue lock released; letting a comment-insert failure propagate
+   * would turn a stranded decision into a stranded decision AND a wedged row. A failed
+   * insert is logged at error and the metric still counts the loss, so the event is
+   * never silently downgraded to "did not happen".
+   */
+  async function recordDepBlockedCarriedDecisionLoss(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    issueId: string;
+    termination: DepBlockedTermination;
+    attempt: number;
+    unresolvedBlockerIssueIds: string[];
+    now: Date;
+  }): Promise<void> {
+    const decision = readCarriedInteractionDecision(input.run.contextSnapshot);
+    if (!decision) return;
+
+    incrementDepBlockedMetric("dep_blocked_terminated_carrying_decision");
+    logger.warn(
+      {
+        runId: input.run.id,
+        issueId: input.issueId,
+        companyId: input.run.companyId,
+        agentId: input.run.agentId,
+        interactionId: decision.interactionId,
+        interactionKind: decision.interactionKind,
+        interactionStatus: decision.interactionStatus,
+        termination: input.termination,
+        scheduledRetryAttempt: input.attempt,
+        unresolvedBlockerIssueIds: input.unresolvedBlockerIssueIds,
+      },
+      "dependency-blocked park terminated while carrying a resolved interaction decision; decision stranded",
+    );
+
+    try {
+      await db.insert(issueComments).values({
+        companyId: input.run.companyId,
+        issueId: input.issueId,
+        body: buildDepBlockedCarriedDecisionNotice({
+          decision,
+          termination: input.termination,
+          runId: input.run.id,
+          attempt: input.attempt,
+          unresolvedBlockerIssueIds: input.unresolvedBlockerIssueIds,
+        }),
+        createdAt: input.now,
+        updatedAt: input.now,
+      });
+    } catch (err) {
+      logger.error(
+        {
+          err,
+          runId: input.run.id,
+          issueId: input.issueId,
+          interactionId: decision.interactionId,
+        },
+        "failed to write the stranded-decision notice for a terminated dependency-blocked park",
+      );
+    }
+  }
+
   async function promoteScheduledRetryRun(
     dueRun: typeof heartbeatRuns.$inferSelect,
     now: Date,
@@ -22779,6 +22980,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 issueId: depIssueId,
                 companyId: expired.companyId,
               });
+              // PEN-5206. Last, and never able to throw: the termination is already
+              // committed above, so a notice failure must not strand the cleanup.
+              await recordDepBlockedCarriedDecisionLoss({
+                run: expired,
+                issueId: depIssueId,
+                termination: "max_park_age_exceeded",
+                attempt: dueRun.scheduledRetryAttempt ?? 0,
+                unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+                now,
+              });
             }
             return { outcome: "not_promoted", run: expired };
           }
@@ -22841,6 +23052,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               await restoreCheckoutPromotedStatus(db, {
                 issueId: depIssueId,
                 companyId: exhausted.companyId,
+              });
+              // PEN-5206. Last, and never able to throw: see the sibling branch above.
+              await recordDepBlockedCarriedDecisionLoss({
+                run: exhausted,
+                issueId: depIssueId,
+                termination: "attempt_budget_exhausted",
+                attempt: dueRun.scheduledRetryAttempt ?? 0,
+                unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
+                now,
               });
             }
             return { outcome: "not_promoted", run: exhausted };
