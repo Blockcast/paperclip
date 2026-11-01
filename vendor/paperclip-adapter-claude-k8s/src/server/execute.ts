@@ -17,6 +17,7 @@ import {
   toPodAddress,
 } from "./prompt-cache.js";
 import {
+  PROMPT_BUNDLE_INSTRUCTIONS_DIR,
   PROMPT_BUNDLE_SECRET_MAX_BYTES,
   PromptBundleOverBudgetError,
   PromptBundleTooManyFilesError,
@@ -3176,15 +3177,47 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await onLog("stdout", `[paperclip] Skills bundled (${desiredSkills.length}): ${skillSummary}\n`);
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const instructionsFileDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
+  // `instructionsRootPath` arrives from instance scope, so an agent whose own
+  // `adapterConfig` is `{}` still has one. Falling back to the entry file's directory
+  // keeps the two in agreement when it is absent — that directory is what the mount is
+  // rooted at either way.
+  const instructionsRootPath = asString(config.instructionsRootPath, "").trim() ||
+    (instructionsFilePath ? path.dirname(instructionsFilePath) : "");
+  // Hoisted above the directive (PEN-5183). The claim decides whether the instructions
+  // DIRECTORY is reachable from the pod, and therefore whether the directive may name
+  // it — so the predicate has to be known before the directive is written, not only
+  // before the bundle is staged. Same resolver, same inputs, one evaluation.
+  const serverHoldsDataClaim = serverHoldsJobDataClaim({
+    dataClaimName: resolvedDataClaim,
+    selfPodPvcClaimName: selfPod.pvcClaimName,
+  });
   let instructionsContents: string | null = null;
   if (instructionsFilePath) {
     try {
       const raw = await fs.readFile(instructionsFilePath, "utf-8");
-      const pathDirective =
-        `\nThe above agent instructions were loaded from ${instructionsFilePath}. ` +
-        `Resolve any relative file references from ${instructionsFileDir}. ` +
-        `This base directory is authoritative for sibling instruction files such as ` +
-        `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.`;
+      // Invariant 6 (PEN-5183). The shared-claim directive is kept BYTE-IDENTICAL — it is
+      // correct there, and it is the negative control the done-when asks for.
+      //
+      // On a foreign claim it was worse than absent: the instructions root is a `subPath`
+      // of a volume this pod no longer mounts, so every `./HEARTBEAT.md` the run was told
+      // to resolve ENOENTs while the Job still exits 0. The Secret channel carries the
+      // named siblings into `PROMPT_BUNDLE_INSTRUCTIONS_DIR` beside this file, so the
+      // directive names THAT, relative to the file it is appended to.
+      //
+      // Relative, not absolute, and not by preference: the bundle root is content-addressed
+      // by a key derived from these very bytes, so naming it absolutely would make the
+      // directive depend on its own content.
+      const pathDirective = serverHoldsDataClaim
+        ? `\nThe above agent instructions were loaded from ${instructionsFilePath}. ` +
+          `Resolve any relative file references from ${instructionsFileDir}. ` +
+          `This base directory is authoritative for sibling instruction files such as ` +
+          `./HEARTBEAT.md, ./SOUL.md, and ./TOOLS.md; do not resolve those from the parent agent directory.`
+        : `\nThe above agent instructions were loaded from ${instructionsFilePath} on the server. ` +
+          `That directory is NOT mounted in this pod, so do not try to read from it. ` +
+          `The sibling instruction files it names — such as ./HEARTBEAT.md, ./SOUL.md and ./TOOLS.md — ` +
+          `have been delivered into the "${PROMPT_BUNDLE_INSTRUCTIONS_DIR}/" directory beside this file; ` +
+          `resolve every relative instruction reference from there. ` +
+          `A file named by these instructions but absent from that directory was not delivered and does not exist in this pod.`;
       instructionsContents = raw + pathDirective;
     } catch (err) {
       await onLog(
@@ -3305,12 +3338,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Gated on claim IDENTITY, through the same resolver `buildJobManifest` uses,
   // so the two cannot drift into the permissive direction — this process
   // deciding its own write is visible to a pod that cannot see it.
-  const promptBundleNeedsSecretDelivery =
-    promptBundle !== null &&
-    !serverHoldsJobDataClaim({
-      dataClaimName: resolvedDataClaim,
-      selfPodPvcClaimName: selfPod.pvcClaimName,
-    });
+  // `serverHoldsDataClaim` is the same evaluation, hoisted above the instructions
+  // directive by PEN-5183 so the directive and the delivery decision cannot disagree
+  // about whether the instructions directory is reachable.
+  const promptBundleNeedsSecretDelivery = promptBundle !== null && !serverHoldsDataClaim;
   if (promptBundleNeedsSecretDelivery) {
     // NOT cached, and that is not an oversight. The sizing cache holds a summary,
     // not the bytes, so a hit would leave this path with nothing to deliver; and
@@ -3336,6 +3367,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         runLabel: ctx.runId,
         skills: desiredSkills,
         instructionsContents,
+        // Invariant 6 (PEN-5183): the DELIVERY path, and the only path that carries them.
+        // The measurement branch below deliberately does not pass these — it sizes what
+        // ships today, and siblings only ship when the pod cannot reach the directory.
+        instructionsRootPath,
+        instructionsFilePath,
         serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
         catalogBackedSkillKeys,
       });

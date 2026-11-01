@@ -4813,3 +4813,52 @@ describe("describeProjectionRefusal (PEN-4932 stage 4b)", () => {
     });
   });
 });
+
+describe("execute: instructions path directive (PEN-5183, invariant 6)", () => {
+  // Source-level, in the same idiom and for the same reason as the PEN-5120 block
+  // above: the directive is built inside `execute()`, before the Claude CLI is
+  // spawned, and driving that by behaviour needs a live-pod harness. The property
+  // that matters IS reachable by structure.
+
+  it("NEGATIVE CONTROL: the shared-claim directive is unchanged, byte for byte", async () => {
+    // Done-when #2. Today's fleet is entirely on the shared claim, so this string is
+    // what every live run receives and it must not move.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(
+      /`\\nThe above agent instructions were loaded from \$\{instructionsFilePath\}\. ` \+\s*\n\s*`Resolve any relative file references from \$\{instructionsFileDir\}\. ` \+\s*\n\s*`This base directory is authoritative for sibling instruction files such as ` \+\s*\n\s*`\.\/HEARTBEAT\.md, \.\/SOUL\.md, and \.\/TOOLS\.md; do not resolve those from the parent agent directory\.`/,
+    );
+  });
+
+  it("branches the directive on the claim, not on anything else", async () => {
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/const pathDirective = serverHoldsDataClaim\s*\n?\s*\?/);
+  });
+
+  it("stops pointing at the server directory on a foreign claim", async () => {
+    // The defect: the delivered bytes actively instructed the run to resolve siblings
+    // from a path that is an empty mount in the pod. Worse than absent, because every
+    // read ENOENTs while the Job still exits 0.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/That directory is NOT mounted in this pod/);
+    expect(source).toMatch(/PROMPT_BUNDLE_INSTRUCTIONS_DIR\}\/" directory beside this file/);
+  });
+
+  it("evaluates the claim predicate once and reuses it", async () => {
+    // A second derivation could disagree with the one that shaped delivery, and the
+    // permissive direction of that disagreement is a directive naming an unreachable
+    // directory on a run whose bundle went by Secret — i.e. the original defect.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/const serverHoldsDataClaim = serverHoldsJobDataClaim\(\{/);
+    expect(source).toMatch(/promptBundleNeedsSecretDelivery = promptBundle !== null && !serverHoldsDataClaim;/);
+    // Exactly one call site for the resolver in this file.
+    expect(source.match(/serverHoldsJobDataClaim\(\{/g)?.length ?? 0).toBe(1);
+  });
+
+  it("hands the instructions root to the delivery projection only", async () => {
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/instructionsRootPath,\s*\n\s*instructionsFilePath,/);
+    // Falls back to the entry file's own directory, because `instructionsRootPath`
+    // arrives from instance scope and an agent's own `adapterConfig` may be `{}`.
+    expect(source).toMatch(/asString\(config\.instructionsRootPath, ""\)\.trim\(\) \|\|/);
+  });
+});

@@ -108,6 +108,27 @@ export const PROMPT_BUNDLE_INSTRUCTIONS_PATH = "agent-instructions.md";
 export const PROMPT_BUNDLE_SKILLS_DIR = ".claude/skills";
 
 /**
+ * Bundle-relative directory holding the instruction files the entry file NAMES —
+ * invariant 6 (PEN-5183).
+ *
+ * `agent-instructions.md` carries the entry file's own bytes and nothing else, so on a
+ * foreign claim the agent's instructions *directory* is an empty mount while the
+ * delivered bytes actively point into it: the generated path directive tells the run to
+ * resolve `./HEARTBEAT.md`, `./SOUL.md` and `./TOOLS.md` from a server path this pod
+ * cannot reach. Every such read ENOENTs, the Job still exits 0, and the run completes
+ * looking normal — the same silent degradation this channel exists to prevent, in the
+ * one tree the channel did not carry.
+ *
+ * Sits beside `agent-instructions.md` rather than replacing it so the existing
+ * `--append-system-prompt-file` target is untouched, and so the rewritten directive can
+ * name this directory RELATIVE to the entry file. That relative form is not a style
+ * choice: the bundle root is content-addressed by a key derived from the instructions
+ * contents, so an absolute directive would have to name a path that depends on the
+ * directive's own bytes.
+ */
+export const PROMPT_BUNDLE_INSTRUCTIONS_DIR = "agent-instructions";
+
+/**
  * Hard ceiling on files walked per skill entry.
  *
  * Not a budget — the budget is bytes, below — but a bound on the *walk itself*. A
@@ -423,6 +444,107 @@ export function skillSourceNeedsProjection(
 }
 
 /**
+ * Hard ceiling on instruction siblings projected for one run — invariant 6 (PEN-5183).
+ *
+ * The entry file is small and names a handful of siblings, so this is a bound on a
+ * pathological entry file rather than a shape for a lawful one. Like every other bound
+ * in this module it REFUSES rather than truncating: a silently dropped instruction file
+ * is the failure invariant 6 is about.
+ */
+export const PROMPT_BUNDLE_MAX_INSTRUCTION_SIBLINGS = 32;
+
+/**
+ * Resolves the instruction files the entry file NAMES, relative to the instructions root.
+ *
+ * ⚠️ The set is derived from the entry file's own text, NOT from a directory listing, and
+ * that is the whole design. The instructions root is **agent-writable** (a scoped-writable
+ * `data` `subPath`), so a listing makes the server's delivery payload a function of
+ * whatever the agent last wrote there. Measured on the live CTO tree, 2026-11-01:
+ *
+ * | set | files | bytes | vs. the 1 MiB cap |
+ * |---|---|---|---|
+ * | whole root, dot-prefixed entries excluded | 9 | 1,942,995 | **185 % — over cap** |
+ * | what `AGENTS.md` actually names | 3 | 29,755 | 2.8 % |
+ *
+ * The 1.9 MB is editor hygiene, not instructions: two `HEARTBEAT.md.bak-*` snapshots of
+ * 620 KB and 610 KB, plus a 674 KB evidence log whose own header says *"you should never
+ * need to open the case law to execute a heartbeat"*.
+ *
+ * ⛔ And note WHY a cheaper filter does not work. The documented backup convention is
+ * dot-prefixed (`.HEARTBEAT.md.bak-<UTC>`), so "skip dotfiles" looks sufficient — but two
+ * of the live snapshots were written WITHOUT the leading dot. A name-shaped filter
+ * therefore misclassifies, and it misclassifies in the EXPANSIVE direction: it would have
+ * shipped 1.2 MB of backups and pushed the run over a cap that refuses, turning a silent
+ * degradation into a hard failure for every run of the opted-in agent. Deriving the set
+ * from the charter cannot be polluted by what the agent writes beside it.
+ *
+ * Naming is necessary but NOT sufficient — each candidate must also resolve to a regular
+ * file inside the root. A named file that is absent is simply not projected: this function
+ * reports what it resolved and never invents a path, because an `items[]` entry whose key
+ * has no Secret value is a pod that cannot start.
+ *
+ * ONE LEVEL, deliberately. Transitive references are not followed: `HEARTBEAT.md` names
+ * `HEARTBEAT-CASELAW.md`, and following that edge re-admits the 674 KB the first table
+ * rules out. "What the charter itself names" is the line, and it is the line the
+ * done-when is written against.
+ */
+export async function resolveNamedInstructionSiblings(input: {
+  /** The entry file's raw bytes as text, BEFORE the generated path directive is appended. */
+  entryContents: string;
+  /** Absolute path of the instructions root directory. */
+  instructionsRootPath: string;
+  /** Absolute path of the entry file itself, which is carried separately and excluded here. */
+  instructionsFilePath: string;
+  maxSiblings?: number;
+}): Promise<string[]> {
+  const root = input.instructionsRootPath.trim();
+  if (!root || !input.entryContents) return [];
+  const maxSiblings = input.maxSiblings ?? PROMPT_BUNDLE_MAX_INSTRUCTION_SIBLINGS;
+
+  // `$AGENT_HOME/X`, `./X` and a bare `X` are the three forms the charters use. The
+  // pattern is deliberately permissive — `docs/architecture-template.md` matches too —
+  // because the existence test below is the real filter, and a permissive pattern that
+  // then fails to resolve is cheap, while a strict one silently misses a named file.
+  const NAMED = /(?:\$AGENT_HOME\/|\.\/)?((?:[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_-]+\.[A-Za-z0-9]+)/g;
+  const entryRealPath = path.resolve(input.instructionsFilePath);
+  const rootResolved = path.resolve(root);
+  const prefix = rootResolved.endsWith(path.sep) ? rootResolved : `${rootResolved}${path.sep}`;
+
+  const seen = new Set<string>();
+  const resolved: string[] = [];
+  for (const match of input.entryContents.matchAll(NAMED)) {
+    const candidate = match[1];
+    if (!candidate || seen.has(candidate)) continue;
+    seen.add(candidate);
+    const abs = path.resolve(rootResolved, candidate);
+    // Containment, checked on the RESOLVED path so a `../` inside the reference cannot
+    // walk out of the tree and project something the agent never had access to.
+    if (!abs.startsWith(prefix)) continue;
+    // The entry file travels as `agent-instructions.md`; projecting it again here would
+    // deliver the same bytes twice and charge the budget for both.
+    if (abs === entryRealPath) continue;
+    try {
+      const st = await fs.stat(abs);
+      if (!st.isFile()) continue;
+    } catch {
+      // Named but absent, or unreadable. Not an error: a charter may name a file the
+      // agent has not written yet, and today's shared-claim path shows the same ENOENT.
+      continue;
+    }
+    resolved.push(path.relative(rootResolved, abs).split(path.sep).join("/"));
+    if (resolved.length > maxSiblings) {
+      // Reuses the skill-tree refusal rather than minting a new one: the message already
+      // says "refusing rather than truncating", which is the posture, and `skillKey` is
+      // the only field — the bundle directory names the tree precisely enough.
+      throw new PromptBundleTooManyFilesError(PROMPT_BUNDLE_INSTRUCTIONS_DIR, maxSiblings);
+    }
+  }
+  // Sorted so the projection — and therefore the content-addressed bundle key — is stable
+  // across runs with the same charter, for the same prompt-cache reason the skill walk sorts.
+  return resolved.sort((left, right) => left.localeCompare(right));
+}
+
+/**
  * Strict UTF-8 decode, or null when the bytes are not valid UTF-8.
  *
  * `fatal: true` is what makes this a *test* rather than a lossy conversion:
@@ -637,6 +759,17 @@ export async function buildPromptBundleSecretProjection(input: {
   runLabel: string;
   skills: PaperclipSkillEntry[];
   instructionsContents: string | null;
+  /**
+   * Absolute path of the instructions ROOT directory — invariant 6 (PEN-5183).
+   *
+   * Supplying it projects the instruction files the entry file names (see
+   * `resolveNamedInstructionSiblings`) into `PROMPT_BUNDLE_INSTRUCTIONS_DIR`. Omitting it
+   * carries the entry file alone, which is the pre-PEN-5183 behaviour and is what every
+   * caller that has no root to offer still gets.
+   */
+  instructionsRootPath?: string;
+  /** Absolute path of the entry file, needed to exclude it from its own sibling set. */
+  instructionsFilePath?: string;
   /** Where THIS process reaches the data volume (`SELF_POD_DATA_MOUNT_PATH`). */
   serverDataMountPath?: string;
   /**
@@ -669,6 +802,35 @@ export async function buildPromptBundleSecretProjection(input: {
       utf8: decodeUtf8Strict(instructions),
       skillKey: null,
     });
+
+    // Invariant 6 (PEN-5183). The entry file's bytes alone are not its instructions: the
+    // directive appended to them names sibling files, and on a foreign claim the directory
+    // holding those siblings is an empty mount. Carry the ones the charter names, beside
+    // the entry file, so the rewritten directive has something true to point at.
+    //
+    // Gated on `instructionsRootPath` being supplied rather than on the claim, because
+    // this module does not know about claims — the caller already made that decision by
+    // reaching the delivery path at all.
+    if (input.instructionsRootPath && input.instructionsFilePath) {
+      const siblings = await resolveNamedInstructionSiblings({
+        entryContents: input.instructionsContents,
+        instructionsRootPath: input.instructionsRootPath,
+        instructionsFilePath: input.instructionsFilePath,
+      });
+      for (const relPath of siblings) {
+        const contents = await fs.readFile(path.resolve(input.instructionsRootPath, relPath));
+        files.push({
+          bundlePath: path.posix.join(PROMPT_BUNDLE_INSTRUCTIONS_DIR, relPath),
+          contents,
+          byteLength: contents.length,
+          utf8: decodeUtf8Strict(contents),
+          // Not a skill, and deliberately not given a synthetic key: `bytesBySkillKey` is
+          // the per-skill attribution an over-budget refusal reports, and inventing an
+          // entry there would make a charter look like a skill in that breakdown.
+          skillKey: null,
+        });
+      }
+    }
   }
 
   const bytesBySkillKey: Record<string, number> = {};
