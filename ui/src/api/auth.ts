@@ -166,7 +166,11 @@ export const authApi = {
   },
 
   signInOAuth2: async (input: { providerId: string; callbackURL: string }): Promise<{ url: string }> => {
-    const payload = (await authPost("/sign-in/oauth2", input)) as { url?: unknown } | null;
+    // Better Auth 1.7 exposes generic OAuth providers through sign-in/social.
+    const payload = (await authPost("/sign-in/social", {
+      provider: input.providerId,
+      callbackURL: input.callbackURL,
+    })) as { url?: unknown } | null;
     const url = typeof payload?.url === "string" ? payload.url : null;
     if (!url) {
       throw new AuthApiError("OAuth sign-in did not return a redirect URL.", 502, payload);

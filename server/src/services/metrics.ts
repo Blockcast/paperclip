@@ -4779,7 +4779,7 @@ function logPluginWebhookDeliveryRejection(input: {
 
 export function classifyAuthOperation(requestUrl: string): AuthOperation {
   const pathname = requestUrl.split("?", 1)[0]?.replace(/\/+$/, "") ?? "";
-  if (pathname.endsWith("/sign-in/oauth2")) return "oidc_start";
+  if (pathname.endsWith("/sign-in/oauth2") || pathname.endsWith("/sign-in/social")) return "oidc_start";
   if (/\/(?:oauth2\/callback|callback)\/[^/]+$/.test(pathname)) return "oidc_callback";
   if (pathname.endsWith("/sign-in/email")) return "password_sign_in";
   if (pathname.endsWith("/sign-up/email")) return "password_sign_up";
