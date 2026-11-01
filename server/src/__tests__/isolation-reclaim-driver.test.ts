@@ -288,12 +288,32 @@ describe("driveIsolationReclaim", () => {
           },
         }).runJob,
       ],
+      [
+        // The branch the title would otherwise overclaim: a report the runner
+        // recovered whose `kind` is not `execute`. The driver forces the flag
+        // here -- the runner's outcome says `ok`, so there is nothing to
+        // propagate. (Ally, review of #3198.)
+        "execute kind mismatch",
+        scriptedRun({
+          inventory: (m) => ranOk(m, inventoryReport([IDLE_A], NOW - 30 * DAY)),
+          execute: (m) => ({
+            ...ranOk(m, { v: 1, kind: "execute", ok: true, result: executionResult() }),
+            report: {
+              v: 1,
+              kind: "inventory",
+              ok: true,
+              inventory: [],
+            } as IsolationReclaimReport,
+          }),
+        }).runJob,
+      ],
     ];
 
     for (const [label, runJob] of kinds) {
       const outcome = await drive({ runJob });
       expect(outcome.ok, label).toBe(false);
       expect(outcome.deletionOutcomeUnknown, label).toBe(true);
+      expect(outcome.phase, label).toBe("execute");
     }
   });
 
