@@ -193,7 +193,10 @@ export function renderReport(result, { base, head, today } = {}) {
     `watched        = ${WATCHED_PATHS.join(", ")}`,
     `touched        = ${result.touched.length ? result.touched.join(", ") : "(none)"}`,
     `attestations   = ${result.attestations.length}`,
-    `missing_at_head= ${result.missing?.length ? result.missing.join(", ") : "(none)"}`,
+    // "(none)" is a MEASUREMENT; the unreadable-range path renders a result whose
+    // staleness arm never ran, and printing "(none)" there would assert a clean
+    // watch that nothing checked.
+    `missing_at_head= ${result.missing == null ? "(not measured)" : result.missing.length ? result.missing.join(", ") : "(none)"}`,
     `review_due     = ${REVIEW_DUE}  last_completed = ${REVIEW_LAST_COMPLETED ?? "(never)"}`,
     `verdict        = ${result.verdict}`,
   ];
@@ -334,7 +337,7 @@ async function main() {
     }
     console.error(`::error::cannot read the commit range, so the per-change arm could not run: ${rangeError}`);
     if (calendarOwed) {
-      console.log(renderReport({ touched: [], attestations: [], trailerOwed: false, calendarOwed, verdict: "owed" }, { base, head, today }));
+      console.log(renderReport({ touched: [], attestations: [], trailerOwed: false, calendarOwed, missing: null, watchStale: false, verdict: "owed" }, { base, head, today }));
     }
     process.exit(UNREADABLE);
   }

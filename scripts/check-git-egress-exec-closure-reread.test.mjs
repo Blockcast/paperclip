@@ -237,6 +237,25 @@ test("the calendar report preserves §8's framing of residual 1", () => {
   assert.match(report, /forbids promoting it to a proof/);
 });
 
+test("an unmeasured staleness arm is not reported as a clean watch", () => {
+  // The unreadable-range path renders a result whose staleness arm never ran.
+  // "(none)" there would assert something nothing checked — the exact
+  // false-clear shape this detector exists to avoid.
+  const unread = renderReport(
+    { touched: [], attestations: [], trailerOwed: false, calendarOwed: true, missing: null, watchStale: false, verdict: "owed" },
+    { base: undefined, head: undefined, today: "2027-02-01" },
+  );
+  assert.match(unread, /missing_at_head= \(not measured\)/);
+  assert.doesNotMatch(unread, /missing_at_head= \(none\)/);
+
+  // ...and a measured-clean watch still says so.
+  const measured = renderReport(
+    evaluate({ changedPaths: [], commitMessages: [], today: BEFORE, headPaths: BOTH_PRESENT }),
+    { base: "a", head: "b", today: BEFORE },
+  );
+  assert.match(measured, /missing_at_head= \(none\)/);
+});
+
 test("the report always states the watched set and the verdict", () => {
   const report = renderReport(
     evaluate({ changedPaths: [], commitMessages: [], today: BEFORE, headPaths: BOTH_PRESENT }),
