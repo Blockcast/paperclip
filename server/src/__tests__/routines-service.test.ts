@@ -1037,12 +1037,18 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       expect(detailTrigger?.[key as keyof typeof detailTrigger]).toEqual(listedTrigger?.[key]);
     }
 
-    // `activeIssue` is carried by both. `lastRun` is list-only by design — the detail surface
-    // answers it with `recentRuns`, a superset — so assert the superset relationship rather than
-    // the key, or the two drift apart the moment one is renamed.
+    // Both surfaces carry `activeIssue`, but their VALUES are deliberately not pinned to each
+    // other: `list` computes it with `listLiveIssueByRoutineIds` (an inner join requiring a live
+    // `heartbeatRuns` row) while `getDetail` uses `findLiveExecutionIssue`, which applies a
+    // fire-age horizon and fingerprint conditions. A wedged execution row is reported by the
+    // detail surface and missed by the list one — so asserting equality here would pin an
+    // invariant that is false by design. Assert presence only.
     expect(listed).toHaveProperty("activeIssue");
     expect(detail).toHaveProperty("activeIssue");
-    expect(detail?.activeIssue).toEqual(listed?.activeIssue);
+    // `lastRun` is list-only by design; the detail surface answers it with `recentRuns`, a
+    // superset. Assert the superset relationship rather than the key, or the two read as drifted
+    // the moment one is renamed.
+    expect(listed).toHaveProperty("lastRun");
     expect(Array.isArray(detail?.recentRuns)).toBe(true);
   });
 
