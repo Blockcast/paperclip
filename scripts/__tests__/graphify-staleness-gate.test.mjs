@@ -83,7 +83,7 @@ function commitFile(cwd, rel, content, msg) {
 // commit detached, as actions/checkout does with the merge ref.
 // `advance` commits to master AFTER the PR's event, i.e. what a re-run or a
 // late run sees but `pull_request.base.sha` never does.
-function scenario(t, advance, baseRef = "master") {
+function scenario(t, advance, baseRef = "master", mode = "pristine") {
   const root = mkdtempSync(path.join(os.tmpdir(), "graphify-staleness-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const origin = path.join(root, "origin.git");
@@ -105,11 +105,41 @@ function scenario(t, advance, baseRef = "master") {
     commitFile(author, advance.path, advance.content, "master moves on");
     git(author, "push", "-q", "origin", "master");
   }
+  const tip = git(author, "rev-parse", "master");
 
-  git(author, "push", "-q", "origin", `${pr}:refs/pull/1/head`);
+  // `graphify` stamps built_at_commit with HEAD at build time, so the two
+  // recovery shapes below differ only in WHERE the rebuild happened.
+  let head = pr;
+  if (mode === "merged") {
+    // What `gh pr update-branch` does, then a rebuild in place: HEAD is the
+    // merge commit, which is not on master, so built_at_commit leaves the base
+    // line entirely.
+    git(author, "checkout", "-q", "bot/graphify-reindex");
+    git(author, "merge", "-q", "--no-edit", "master");
+    const merge = git(author, "rev-parse", "HEAD");
+    head = commitFile(
+      author,
+      "server/src/graphify-out/graph.json",
+      JSON.stringify({ built_at_commit: merge, nodes: [], links: [] }),
+      "rebuild in place on the updated branch",
+    );
+    git(author, "checkout", "-q", "master");
+  } else if (mode === "regenerated") {
+    // The documented recovery: one graph commit straight onto the base tip.
+    git(author, "checkout", "-q", "-B", "bot/graphify-reindex", tip);
+    head = commitFile(
+      author,
+      "server/src/graphify-out/graph.json",
+      JSON.stringify({ built_at_commit: tip, nodes: [], links: [] }),
+      "regenerate at the base tip",
+    );
+    git(author, "checkout", "-q", "master");
+  }
+
+  git(author, "push", "-q", "origin", `${head}:refs/pull/1/head`);
   git(root, "clone", "-q", origin, runner);
   git(runner, "fetch", "-q", "origin", "refs/pull/1/head");
-  git(runner, "checkout", "-q", "--detach", pr);
+  git(runner, "checkout", "-q", "--detach", head);
   // Leave the runner's remote-tracking ref at the event-time base, as a
   // single-branch or shallow checkout would: the gate must fetch the tip itself.
   git(runner, "update-ref", "refs/remotes/origin/master", base);
@@ -149,4 +179,47 @@ test("fails closed when the base branch tip cannot be resolved", (t) => {
   const r = scenario(t, null, "no-such-branch");
   assert.equal(r.status, 1, r.out);
   assert.match(r.out, /cannot resolve the current tip of base branch 'no-such-branch'/);
+});
+
+// PEN-5042. Measured on Paperclip #3005: the gate was green when the bot opened
+// the PR and went red the moment `gh pr update-branch` merged master into the
+// branch. Bringing a graphify PR up to date is not a git operation — neither a
+// merge nor a rebase moves `built_at_commit`, because it is a field inside
+// graph.json. Rebuilding in place on the updated branch then trades the STALE
+// verdict for an ancestry failure, which is what the gate's old remedy text
+// ("Rebuild: graphify update <scope> --force") walked you into.
+test("merging the base into the branch and rebuilding leaves the base line", (t) => {
+  const r = scenario(t, { path: "server/src/a.ts", content: "export const a = 2;\n" }, "master", "merged");
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /is not an ancestor of base/);
+  assert.match(r.out, /the graph was built on this branch, not on master/);
+});
+
+test("a failing verdict prints the regenerate-from-the-tip recovery", (t) => {
+  const r = scenario(t, { path: "server/src/a.ts", content: "export const a = 2;\n" });
+  assert.equal(r.status, 1, r.out);
+  assert.match(r.out, /How to clear this gate/);
+  assert.match(r.out, /git checkout --no-track -B graphify-regen origin\/master/);
+  // The literal `$(...)` has to survive the heredoc so it is runnable as printed.
+  assert.match(r.out, /git rev-parse --short origin\/master/);
+  assert.doesNotMatch(r.out, /Rebuild: graphify update/);
+  // The push must name its remote and refspec. A bare `git push` here resolves
+  // against the upstream `-B <branch> origin/master` would have set, which git
+  // answers by suggesting `git push origin HEAD:master` — i.e. the graph commit
+  // onto the base branch. A bare `--force-with-lease` leases against the
+  // tracking ref and protects nothing, so the printed lease must name a sha.
+  assert.match(r.out, /git push --force-with-lease=refs\/heads\/<pr-branch>:<expected> origin graphify-regen:<pr-branch>/);
+  assert.doesNotMatch(r.out, /git push --force-with-lease\s*$/m);
+  assert.doesNotMatch(r.out, /git checkout -B <branch>/);
+  // Only the base ref is fetched above, so the lease sha has to come from the
+  // remote, not from a tracking ref that is stale or absent.
+  assert.match(r.out, /git ls-remote origin refs\/heads\/<pr-branch>/);
+  assert.doesNotMatch(r.out, /git rev-parse origin\/<pr-branch>/);
+});
+
+test("regenerating the branch at the base tip clears the gate", (t) => {
+  const r = scenario(t, { path: "server/src/a.ts", content: "export const a = 2;\n" }, "master", "regenerated");
+  assert.equal(r.status, 0, r.out);
+  assert.match(r.out, /is fresh/);
+  assert.doesNotMatch(r.out, /How to clear this gate/);
 });
