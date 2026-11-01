@@ -203,12 +203,27 @@ describe("createIsolationReclaimJobPort — readPodLog", () => {
     await expect(port.readPodLog(NAMESPACE, "p", "reclaim")).resolves.toBe("@@PCRECLAIM@@ {}\n");
   });
 
-  it("coerces a non-string body to empty rather than passing it on", async () => {
+  it("THROWS on a non-string body rather than coercing it to empty", async () => {
     for (const body of [undefined, null, { stream: true }]) {
       const { clients } = fakeClients({ readNamespacedPodLog: () => body });
       const port = createIsolationReclaimJobPort(clients);
-      await expect(port.readPodLog(NAMESPACE, "p", "reclaim")).resolves.toBe("");
+      // Coercing to "" would reach the runner as `report_absent` — "go and look
+      // at the pod" — for what is really the client changing shape, and the pod
+      // would have nothing to say. Throwing reaches it as `log_unreadable`,
+      // which names `pods/log`. (Ally, #3201.)
+      await expect(port.readPodLog(NAMESPACE, "p", "reclaim")).rejects.toThrow(
+        "log return type has changed",
+      );
     }
+  });
+
+  it("returns an EMPTY string unchanged — a log with nothing in it is not a shape change", async () => {
+    const { clients } = fakeClients({ readNamespacedPodLog: () => "" });
+    const port = createIsolationReclaimJobPort(clients);
+
+    // The guard is on the TYPE, not on emptiness: a pod that genuinely wrote
+    // nothing yet is `report_absent`, which is the correct reading there.
+    await expect(port.readPodLog(NAMESPACE, "p", "reclaim")).resolves.toBe("");
   });
 
   it("does not swallow a read failure", async () => {
