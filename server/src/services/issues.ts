@@ -2101,44 +2101,25 @@ const ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS = [
   "issue.inbox_unarchived",
 ] as const;
 
-function issueLatestCommentAtExpr(companyId: string) {
-  return sql<Date | null>`
-    (
-      SELECT MAX(${issueComments.createdAt})
-      FROM ${issueComments}
-      WHERE ${issueComments.issueId} = ${issues.id}
-        AND ${issueComments.companyId} = ${companyId}
-    )
-  `;
-}
-
-function issueLatestLogAtExpr(companyId: string) {
-  return sql<Date | null>`
-    (
-      SELECT MAX(${activityLog.createdAt})
-      FROM ${activityLog}
-      WHERE ${activityLog.companyId} = ${companyId}
-        AND ${activityLog.entityType} = 'issue'
-        AND ${activityLog.entityId} = ${issues.id}::text
-        AND ${activityLog.action} NOT IN (${sql.join(
-          ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS.map((action) => sql`${action}`),
-          sql`, `,
-        )})
-    )
-  `;
-}
-
-function issueCanonicalLastActivityAtExpr(companyId: string) {
-  const latestCommentAt = issueLatestCommentAtExpr(companyId);
-  const latestLogAt = issueLatestLogAtExpr(companyId);
-  return sql<Date>`
-    GREATEST(
-      ${issues.updatedAt},
-      COALESCE(${latestCommentAt}, to_timestamp(0)),
-      COALESCE(${latestLogAt}, to_timestamp(0))
-    )
-  `;
-}
+// PEN-5213: `issueCanonicalLastActivityAtExpr(companyId)` lived here and
+// computed `GREATEST(updated_at, MAX(issue_comments.created_at),
+// MAX(activity_log.created_at WHERE action NOT IN ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS))`
+// via two correlated subqueries, as the second sort key of the issues list.
+// Because the whole expression had to be evaluated for every candidate row
+// before the sort, `LIMIT` bought nothing and cost scaled with candidate-set
+// size rather than page size.
+//
+// It is gone. The ordering is served from the materialized
+// `issues.last_activity_at` column that migration 0076 added for the sibling
+// predicate (`inboxVisibleForUserCondition`, below) and that 0270 completed by
+// adding the missing `activity_log` maintenance arm. The column is now the one
+// definition of "last activity on this issue" -- do not reintroduce an inline
+// second one.
+//
+// `ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS` is still live: `lastActivityStatsForIssues`
+// uses it for the per-page attribution read, which is bounded by the page's
+// issue ids and is not an ORDER BY input. 0270's trigger honours the same four
+// actions in SQL.
 
 function unreadForUserCondition(companyId: string, userId: string) {
   const touchedCondition = touchedByUserCondition(companyId, userId);
@@ -2364,7 +2345,6 @@ function activeInboxArchiveFields(
 }
 
 function issueListOrderBy(
-  companyId: string,
   {
     hasSearch,
     priorityOrder,
@@ -2379,7 +2359,9 @@ function issueListOrderBy(
     sortDir?: IssueFilters["sortDir"];
   },
 ) {
-  const canonicalLastActivityAt = issueCanonicalLastActivityAtExpr(companyId);
+  // PEN-5213: the materialized column, not a recomputed GREATEST(...). See the
+  // note above `ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS`.
+  const lastActivityAt = issues.lastActivityAt;
   if (sortField === "id") {
     // Total order on an immutable unique column, so concurrent activity cannot move a
     // row between pages. Relevance ranking is deliberately dropped: a stable walk that
@@ -2391,8 +2373,8 @@ function issueListOrderBy(
   }
   if (sortField === "updated") {
     const activityOrder = sortDir === "asc"
-      ? asc(canonicalLastActivityAt)
-      : desc(canonicalLastActivityAt);
+      ? asc(lastActivityAt)
+      : desc(lastActivityAt);
     const updatedOrder = sortDir === "asc" ? asc(issues.updatedAt) : desc(issues.updatedAt);
     const idOrder = sortDir === "asc" ? asc(issues.id) : desc(issues.id);
     return hasSearch
@@ -2403,7 +2385,7 @@ function issueListOrderBy(
   return [
     hasSearch ? asc(searchOrder) : asc(priorityOrder),
     asc(priorityOrder),
-    desc(canonicalLastActivityAt),
+    desc(lastActivityAt),
     desc(issues.updatedAt),
     desc(issues.id),
   ];
@@ -6136,7 +6118,7 @@ async function listBlockedInboxIssues(
     .select(issueListSelect)
     .from(issues)
     .where(and(...conditions))
-    .orderBy(desc(issueCanonicalLastActivityAtExpr(companyId)), desc(issues.updatedAt), desc(issues.id)))
+    .orderBy(desc(issues.lastActivityAt), desc(issues.updatedAt), desc(issues.id)))
     .map((row: any) => ({
       ...row,
       ...projectIssueListDescription(row.description),
@@ -8659,7 +8641,7 @@ export function issueService(db: Db) {
         .select(issueListSelect)
         .from(issues)
         .where(and(...conditions))
-        .orderBy(...issueListOrderBy(companyId, {
+        .orderBy(...issueListOrderBy({
           hasSearch,
           priorityOrder,
           searchOrder,

@@ -61,10 +61,17 @@
  *      production post-deploy, and the one 0269 is structurally incapable of
  *      touching (no `body` predicate ⇒ no trigram index is reachable).
  *   D. shape C with the ORDER BY served from `issues.last_activity_at`
- *      instead of the `GREATEST(...)`. Quantifies the option the CTO has not
- *      yet picked; see the comment on PEN-3596 2026-10-30T14:04Z. ⛔ NOT a
- *      proposal to ship — one arm of that column (activity_log) is
- *      unmaintained, so D is NOT semantically equal to C.
+ *      instead of the `GREATEST(...)`. ⭐ UPDATED 2026-11-01 (PEN-5213): the
+ *      CTO picked this option and it is now the SHIPPED default ordering. The
+ *      "D is not semantically equal to C" caveat recorded below was true when
+ *      D was measured and is now closed: migration 0270 adds the missing
+ *      `activity_log` maintenance arm and repairs the accumulated drift, and
+ *      `issues-last-activity-at-activity-log-maintenance.test.ts` asserts the
+ *      column equals the (now deleted) expression on every maintenance path.
+ *   E. the `sortField=updated` ordering, before (E1) and after (E2) the same
+ *      repoint. This is the ONLY no-search ordering that
+ *      `issues_company_last_activity_idx` can serve: the default ordering
+ *      leads with the priority CASE, which that index does not carry.
  *
  * ── MEASURED 2026-10-30, at the seed counts this file's defaults produce ───
  *
@@ -514,7 +521,35 @@ async function main() {
                  OR issues.origin_kind LIKE 'plugin:%:operation:%')
       ORDER BY ${PRIORITY_ORDER} ASC, issues.last_activity_at DESC, issues.updated_at DESC, issues.id DESC
       LIMIT ${LIMIT}`;
-    results.push(await explain(sql, "D · NO-SEARCH ordered by issues.last_activity_at (NOT semantically equal to C)", noSearchMaterialized, [COMPANY]));
+    results.push(await explain(sql, "D · NO-SEARCH ordered by issues.last_activity_at (SHIPPED by PEN-5213)", noSearchMaterialized, [COMPANY]));
+
+    // ── E. the `sortField=updated` path, where last_activity_at LEADS ─────
+    // This is the only no-search ordering `issues_company_last_activity_idx`
+    // can serve, because the default ordering leads with priority and the
+    // index does not carry it. E1/E2 are the before/after of the same repoint
+    // on that path; if the index is ever extended, this is the pair that moves.
+    const sortedByActivity = (order: string) => `
+      SELECT issues.id, substring(issues.description, 1, 1200), issues.title, issues.status, issues.priority,
+             issues.updated_at, issues.last_activity_at
+      FROM issues
+      WHERE issues.company_id = $1
+        AND issues.hidden_at IS NULL AND issues.harness_kind IS NULL
+        AND NOT (issues.origin_kind LIKE 'plugin:%:operation'
+                 OR issues.origin_kind LIKE 'plugin:%:operation:%')
+      ORDER BY ${order} DESC, issues.updated_at DESC, issues.id DESC
+      LIMIT ${LIMIT}`;
+    results.push(await explain(
+      sql,
+      "E1 · NO-SEARCH sortField=updated · pre-PEN-5213 GREATEST(...) ORDER BY",
+      sortedByActivity(CANONICAL_LAST_ACTIVITY),
+      [COMPANY],
+    ));
+    results.push(await explain(
+      sql,
+      "E2 · NO-SEARCH sortField=updated · PEN-5213 issues.last_activity_at ORDER BY",
+      sortedByActivity("issues.last_activity_at"),
+      [COMPANY],
+    ));
 
     console.log(`\n${"=".repeat(78)}\nSUMMARY — execution ms (last of 3 runs)\n${"=".repeat(78)}`);
     for (const r of results) console.log(`  ${r.label.padEnd(72)} ${r.execution} ms`);
