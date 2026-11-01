@@ -527,6 +527,28 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
     expect(migrations).toHaveLength(1);
   });
 
+  it("binds an array parameter as one value for = ANY($n::text[])", async () => {
+    const pluginManifest = manifest();
+    const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+    const packageRoot = await createPluginPackage(
+      pluginManifest,
+      `CREATE TABLE ${namespace}.tags (id uuid PRIMARY KEY, label text NOT NULL);`,
+    );
+    const pluginId = await installPluginRecord(pluginManifest);
+    const pluginDb = pluginDatabaseService(db);
+    await pluginDb.applyMigrations(pluginId, pluginManifest, packageRoot);
+    for (const label of ["a", "b", "c"]) {
+      await pluginDb.execute(pluginId, `INSERT INTO ${namespace}.tags (id, label) VALUES ($1, $2)`, [randomUUID(), label]);
+    }
+
+    const rows = await pluginDb.query<{ label: string }>(
+      pluginId,
+      `SELECT label FROM ${namespace}.tags WHERE NOT (label = ANY($1::text[])) ORDER BY label`,
+      [["a", "b"]],
+    );
+    expect(rows).toEqual([{ label: "c" }]);
+  });
+
   it("rejects runtime writes to public core tables", async () => {
     const pluginManifest = manifest();
     const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
