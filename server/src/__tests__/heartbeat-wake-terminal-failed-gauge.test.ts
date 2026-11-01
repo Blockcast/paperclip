@@ -985,6 +985,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
         errorCode: "adapter_failed",
       });
       await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+      return { agentId, companyId };
     }
 
     it("excludes a row whose PR is closed (onprem-k8s#7132 shape) from count and age", async () => {
@@ -1019,8 +1020,8 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
 
     it("still counts a null-taskKey row while the no-action exclusion set is non-empty", async () => {
       // `not in (...)` is null for a null taskKey; the coalesce keeps it counted.
-      await seedPair({ state: "closed", merged: false, reviewedAtHead: false }, 7300);
-      const { agentId, companyId } = await seedCompanyAndAgent();
+      // Reuse the pair's company: a second seed collides on the BLO issue prefix.
+      const { agentId, companyId } = await seedPair({ state: "closed", merged: false, reviewedAtHead: false }, 7300);
       const now = new Date();
       await seedFailedWake({
         companyId,
