@@ -150,6 +150,54 @@ export const ISOLATION_WORKSPACES_CLAIM_SUBPATH =
 /** `--root` for a claim mounted at {@link RECLAIM_CLAIM_MOUNT_PATH}. */
 export const RECLAIM_WORKSPACES_ROOT = `${RECLAIM_CLAIM_MOUNT_PATH}/${ISOLATION_WORKSPACES_CLAIM_SUBPATH}`;
 
+/**
+ * The executor entrypoint inside the image, and the loader that has to be in
+ * front of it.
+ *
+ * ⚠ The loader is not optional and is not a dev-only convenience. The executor
+ * imports `isolation-workspace-reaper.ts`, which imports `@paperclipai/db` as
+ * a VALUE (the drizzle table objects). In the runtime image that package's
+ * `exports` is `{".": "./src/index.ts"}` — TypeScript source — and its own
+ * relative imports are spelled `./client.js`, the extension TypeScript wants
+ * and the file that does not exist. Node's built-in type stripping does not
+ * rewrite `.js` to `.ts`, so bare Node gets as far as the re-export and stops:
+ *
+ *   ERR_MODULE_NOT_FOUND: Cannot find module '/app/packages/db/src/client.js'
+ *   imported from /app/packages/db/src/index.ts
+ *
+ * Measured, not inferred: that is the literal output of
+ * `node --input-type=module -e 'import("@paperclipai/db")'` run from
+ * `/app/server` in the shipped image (Node v24.16.0). The same import under
+ * `node --import <loader>` resolves and yields 207 exports.
+ *
+ * So a bare `node <executor>` dies at import time, before `main` runs and
+ * before any report line is written — which the transport reads as `absent`,
+ * whose remedy is "go and look at the pod". The image's own `CMD`
+ * (`Dockerfile.runtime`) and the MCP bridge in `statefulset.yaml` both carry
+ * this same `--import` for this same reason.
+ *
+ * Setting `command` overrides the image ENTRYPOINT, so nothing else is left to
+ * add the loader on our behalf — it has to be spelled here. Both paths are
+ * absolute rather than `WORKDIR`-relative, matching how `statefulset.yaml`
+ * spells the bridge: the manifest never sets `workingDir`, so a relative form
+ * would quietly depend on the image's `WORKDIR` staying `/app`.
+ *
+ * No unit test can catch a module-resolution failure that only exists inside
+ * the image. The test below pins this argv so it cannot drift; to check the
+ * argv itself against a shipped tag, one container run is enough:
+ *
+ *   docker run --rm --entrypoint node <image> \
+ *     --import /app/server/node_modules/tsx/dist/loader.mjs \
+ *     /app/server/dist/cli/isolation-reclaim-executor.js \
+ *     inventory --root /nonexistent
+ *
+ * A reachable import graph gets as far as the executor's own
+ * `--root '/nonexistent' is not a directory`; a broken one dies before that,
+ * with a resolution error naming a file under `node_modules`.
+ */
+export const RECLAIM_TSX_LOADER_PATH = "/app/server/node_modules/tsx/dist/loader.mjs";
+export const RECLAIM_EXECUTOR_PATH = "/app/server/dist/cli/isolation-reclaim-executor.js";
+
 /** Marks a Job this module owns, for listing and for the driver's own reads. */
 export const RECLAIM_JOB_MANAGED_BY_LABEL = "app.kubernetes.io/managed-by";
 export const RECLAIM_JOB_COMPONENT_LABEL = "app.kubernetes.io/component";
@@ -227,11 +275,17 @@ export interface IsolationReclaimJobManifest {
 /**
  * DNS-1123 Job name for one reclaim invocation.
  *
- * Kubernetes caps a Job name at 63 characters, and the Job controller appends
- * its own suffix to derive pod names, so this is kept comfortably under. The
- * claim name is the part that can be long (`agent-workspace-<uuid>` is 52), so
- * it is the part that is truncated — the invocation id is what makes the name
- * unique and must survive intact.
+ * Kubernetes caps a Job name at 63 characters, and this uses the whole budget
+ * rather than reserving a margin under it — deliberately, because there is
+ * nothing the margin would protect. The Job controller does not append its
+ * suffix to a name that must stay ≤63: pod names come from a `generateName`
+ * whose base the apiserver truncates itself, and the `job-name` /
+ * `batch.kubernetes.io/job-name` labels take the Job name unchanged, which at
+ * 63 is exactly at the label-value limit and not over it.
+ *
+ * The claim name is the part that can be long (`agent-workspace-<uuid>` is
+ * 52), so it is the part that is truncated — the invocation id is what makes
+ * the name unique and must survive intact.
  */
 export function reclaimJobName(input: {
   mode: IsolationReclaimReportKind;
@@ -352,13 +406,11 @@ export function buildIsolationReclaimJobManifest(
     name: "reclaim",
     image: spec.image,
     imagePullPolicy: spec.imagePullPolicy ?? "IfNotPresent",
-    command: ["node"],
-    args: [
-      "/app/server/dist/cli/isolation-reclaim-executor.js",
-      spec.mode,
-      "--root",
-      RECLAIM_WORKSPACES_ROOT,
-    ],
+    // See {@link RECLAIM_TSX_LOADER_PATH}: without the loader this container
+    // exits non-zero at import time, with no report line for the transport to
+    // read.
+    command: ["node", "--import", RECLAIM_TSX_LOADER_PATH],
+    args: [RECLAIM_EXECUTOR_PATH, spec.mode, "--root", RECLAIM_WORKSPACES_ROOT],
     env,
     volumeMounts: [
       { name: "reclaim-target", mountPath: RECLAIM_CLAIM_MOUNT_PATH },
