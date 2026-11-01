@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Canonical fleet merge-gate reader
 # (BLO-26572 → BLO-34035 → BLO-34114 → BLO-34263 → BLO-34367 → BLO-37887
-#  → BLO-38577).
+#  → BLO-38577 → BLO-51266).
 #
 # Reads BOTH check surfaces at a head and prints one line per row that is not a
 # pass. Empty output means "nothing to stop on", and is trustworthy only because
@@ -23,8 +23,9 @@
 #                          ci.yml (PEN-4416) publishes these on the legacy
 #                          `pull_request` arm by design: they refuse without
 #                          running, under a name penstock intends to be
-#                          non-required (this reader cannot verify that:
-#                          required contexts are 403 to the App token). NOT
+#                          non-required (REST branch protection 403s to the
+#                          App token; GraphQL refUpdateRule does not, see
+#                          BLO-51266, but this label predates it). NOT
 #                          blocking, and not a surviving verdict either. With
 #                          no twin, or in any other conclusion, it STOPs: the
 #                          refusal is then the only signal that the trusted
@@ -69,7 +70,7 @@
 # one-way signal at best. Never write `merge-gate-read.sh … && merge`.
 #
 #   merge-gate-read.sh <owner/repo> <sha|pr-head>     # live
-#   merge-gate-read.sh --rows <DEAD> [PENDING] [WDEAD] [RENAMED] # fixture mode, rows on stdin
+#   merge-gate-read.sh --rows <DEAD> [PENDING] [WDEAD] [RENAMED] [REQUIRED] # fixture mode, rows on stdin
 #   merge-gate-read.sh --renamed <base-text-file>     # fixture mode, bare job names on stdin
 #   merge-gate-read.sh --dead [witnesses] [w]         # fixture mode, runs on stdin;
 #                                                     # any 3rd arg: witness arm only
@@ -674,7 +675,18 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses; $2 non-empty = print o
     | sort -n | paste -sd'|' -
 }
 
-verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be empty)
+verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD, $4 = RENAMED,
+            # $5 = REQUIRED contexts, newline-separated (all may be empty)
+  # BLO-51266. A REQUIRED context with no surviving row at this head prints
+  # `STOP <ctx> ABSENT` and exits 1. Every other guard here judges rows that
+  # EXIST; a required context nobody has published yet is no row at all, so the
+  # reader printed nothing while GitHub held the PR BLOCKED. Measured at
+  # Blockcast/multicast#1281 @ a5844ff5: 5 of 11 required
+  # `integration-tests (<shard>)` contexts absent (the matrix job was skipped
+  # under its templated name `integration-tests (${{ matrix.name }})`), reader
+  # printed only NOT-EVALUATED, and a lander made three refused squash attempts.
+  # Presence is judged on the POST-filter rows (`twin`): a context whose only
+  # rows were dropped as superseded has no live verdict and must STOP too.
   # Normalised HERE and nowhere else — the live path pipes dead_runs() straight
   # in, and it prints nothing when no run is stale. An empty alternation is not
   # inert: `()` is an empty sub-expression, so `^()$` matches an empty field
@@ -702,7 +714,7 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
       END { exit !k }' \
     | sort -t$'\t' -k1,1 -k4,4 -k3,3r \
     | awk -F'\t' '!seen[$1 FS $4]++' \
-    | PEND="${2:-}" RENAMED="${4:-}" awk -F'\t' -v dead="$dead" '
+    | PEND="${2:-}" RENAMED="${4:-}" REQUIRED="${5:-}" awk -F'\t' -v dead="$dead" '
         # NO APOSTROPHES anywhere below: this awk program is single-quoted in the
         # surrounding shell, so one inside a comment ends the script mid-word and
         # bash reports a syntax error on an unrelated line further down.
@@ -792,6 +804,10 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
             for (i = 1; i <= lq; i++)
               { b = substr(lname[i], 1, length(lname[i]) - 36)
                 print ((b in twin) ? "REFUSED-LEGACY" : (b in renamed) ? "RENAMED-LEGACY" : "STOP") "\t" lrow[i] }
+            nq = split(ENVIRON["REQUIRED"], rq, "\n")
+            for (i = 1; i <= nq; i++) if (rq[i] != "" && !(rq[i] in twin) && !(rq[i] in rqs)) {
+              rqs[rq[i]] = 1; miss = 1
+              printf "STOP\t%s\tABSENT\trun=-\n", rq[i] }
             if(!n) print "STOP\t<" (dead!="__none__" \
               ? "every check-run at this head dropped as superseded-run" \
               : "no check-run verdict at this head") ">\tABSENT\trun=-"
@@ -815,13 +831,14 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD (all may be 
             for (i = 1; i <= k; i++) if (!(prid[i] in contributed) \
                                          && prid[i] !~ ("^(" dead ")$"))
               printf "STOP\t<%s: run %s, no check-run published>\tNO-VERDICT\trun=%s\n", \
-                     (pname[i] == "" ? "?" : pname[i]), pstat[i], prid[i]}'
+                     (pname[i] == "" ? "?" : pname[i]), pstat[i], prid[i]
+            exit miss}'
 }
 
 # `--rows` propagates the pipeline status rather than swallowing it. Hardcoding
 # `exit 0` here made the exit contract unobservable by construction, so no
 # fixture could catch the header claiming an exactness it did not have.
-if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}" "${3:-}" "${4:-}" "${5:-}"; exit $?; fi
+if [ "${1:-}" = "--rows" ]; then verdicts "${2:-}" "${3:-}" "${4:-}" "${5:-}" "${6:-}"; exit $?; fi
 if [ "${1:-}" = "--renamed" ]; then renamed_jobs "${2:-}"; exit 0; fi
 if [ "${1:-}" = "--dead" ]; then dead_runs "${2:-}" "${3:-}"; exit 0; fi
 if [ "${1:-}" = "--pending" ]; then pending_runs; exit 0; fi
@@ -935,9 +952,27 @@ if [ -n "$ORPHANS" ]; then
   fi
 fi
 
+# BLO-51266: required contexts for the base of the unique OPEN PR at this head
+# (default branch otherwise). Open only: a head can sit in an open PR into
+# master and a closed one into a stacked branch (onprem-k8s #7271/#7283), and
+# only the open one is still being merged. Union of the rules API (rulesets) and GraphQL
+# refUpdateRule (classic protection; readable without admin, unlike REST
+# branches/<b>/protection, which 403s to the App token). A failed read STOPs.
+BREF=$(gh api "repos/$R/commits/$H/pulls?per_page=100" --paginate \
+         --jq ".[]|select(.head.sha==\"$H\" and .state==\"open\")|.base.ref" 2>/dev/null | sort -u) || fetch_failed pulls $?
+[ "$(printf '%s\n' "$BREF" | grep -c .)" = 1 ] \
+  || BREF=$(gh api "repos/$R" --jq .default_branch) || fetch_failed repo $?
+REQUIRED=$( { gh api "repos/$R/rules/branches/$BREF?per_page=100" --paginate \
+                --jq '.[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context' \
+              || exit 1
+              gh api graphql -f owner="${R%%/*}" -f name="${R#*/}" -f ref="refs/heads/$BREF" \
+                -f query='query($owner:String!,$name:String!,$ref:String!){repository(owner:$owner,name:$name){ref(qualifiedName:$ref){refUpdateRule{requiredStatusCheckContexts}}}}' \
+                --jq '.data.repository.ref.refUpdateRule.requiredStatusCheckContexts // [] | .[]'
+            } | sort -u) || fetch_failed required-contexts $?
+
 { printf '%s' "$STATUSES" | status_extract
   printf '%s' "$CHECKS" | extract
-} | verdicts "$DEAD" "$PENDING" "$WDEAD" "$RENAMED"
+} | verdicts "$DEAD" "$PENDING" "$WDEAD" "$RENAMED" "$REQUIRED"
 rc=$?
 # BLO-48830: the status LIST (it carries `creator`) costs a call, so only on a
 # gated head whose combined status names the context at all.
