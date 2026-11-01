@@ -298,6 +298,7 @@ describe("run dispatch-wait metrics (BLO-25024)", () => {
 describe("authentication request metrics", () => {
   it("classifies auth paths and response outcomes into bounded labels", () => {
     expect(classifyAuthOperation("/api/auth/sign-in/oauth2?next=%2F")).toBe("oidc_start");
+    expect(classifyAuthOperation("/api/auth/sign-in/social?next=%2F")).toBe("oidc_start");
     expect(classifyAuthOperation("/api/auth/oauth2/callback/dex?code=redacted")).toBe("oidc_callback");
     expect(classifyAuthOperation("/api/auth/sign-in/email")).toBe("password_sign_in");
     expect(classifyAuthOperation("/api/auth/sign-up/email")).toBe("password_sign_up");
