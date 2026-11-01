@@ -25,9 +25,9 @@
 // `server-startup-feedback-export.test.ts`.
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { agents, agentWakeupRequests, companies, createDb, heartbeatRuns } from "@paperclipai/db";
-import { heartbeatService } from "../services/heartbeat.js";
+import { heartbeatService, parsePrReviewTaskKey } from "../services/heartbeat.js";
 import {
   AGENT_WAKEUP_TERMINAL_FAILED_OLDEST_AGE_METRIC,
   AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC,
@@ -38,6 +38,32 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+
+// BLO-51129: the publisher asks GitHub whether an unresolved pr_review row
+// needs action. Keyed `owner/repo#n` (lowercased); an unlisted PR reads as a
+// GitHub error, i.e. the pre-BLO-51129 "count it" behaviour every other test
+// in this file relies on.
+const githubPrs = vi.hoisted(
+  () => new Map<string, { state: "open" | "closed"; merged: boolean; reviewedAtHead: boolean }>(),
+);
+vi.mock("../services/github-app-auth.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/github-app-auth.js")>(
+    "../services/github-app-auth.js",
+  );
+  const lookup = (input: { repoFullName: string; prNumber: number }) =>
+    githubPrs.get(`${input.repoFullName}#${input.prNumber}`.toLowerCase());
+  return {
+    ...actual,
+    githubGetPullRequestGate: vi.fn(async (input: { repoFullName: string; prNumber: number }) => {
+      const pr = lookup(input);
+      return pr ? { state: pr.state, merged: pr.merged } : { error: "no_token" };
+    }),
+    githubHasReviewerEvidenceForPr: vi.fn(async (input: { repoFullName: string; prNumber: number }) => {
+      const pr = lookup(input);
+      return pr ? { found: pr.reviewedAtHead } : { error: "no_token" };
+    }),
+  };
+});
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -928,5 +954,119 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
     expect(await gaugeTotal({ scope: "pr_review" })).toBeGreaterThanOrEqual(500);
     // The age must be the real oldest row, not the newest 500's floor.
     expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(7_000);
+  });
+
+  describe("BLO-51129: rows that need no action do not page", () => {
+    afterEach(() => githubPrs.clear());
+
+    // Each test uses its own PR numbers: the probe cache lives for the life of
+    // the service instance, which this file shares across tests.
+    async function seedPair(closedOrReviewed: { state: "open" | "closed"; merged: boolean; reviewedAtHead: boolean }, n: number) {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      const noActionKey = `pr_review:Blockcast/onprem-k8s:${n}`;
+      const liveKey = `pr_review:Blockcast/onprem-k8s:${n + 1}`;
+      githubPrs.set(`blockcast/onprem-k8s#${n}`, closedOrReviewed);
+      // Control: open, no review at head -- must still page.
+      githubPrs.set(`blockcast/onprem-k8s#${n + 1}`, { state: "open", merged: false, reviewedAtHead: false });
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: new Date(now.getTime() - 3_600_000),
+        taskKey: noActionKey,
+        errorCode: "pr_review_output_missing",
+      });
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: new Date(now.getTime() - 600_000),
+        taskKey: liveKey,
+        errorCode: "adapter_failed",
+      });
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+    }
+
+    it("excludes a row whose PR is closed (onprem-k8s#7132 shape) from count and age", async () => {
+      await seedPair({ state: "closed", merged: false, reviewedAtHead: false }, 7132);
+      expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
+      expect(await gaugeTotal({ errorCode: "pr_review_output_missing", scope: "pr_review" })).toBe(0);
+      // The paged age is the control's (~600s), not the closed row's (~3600s).
+      expect(await oldestAgeSeconds("pr_review")).toBeLessThan(1_800);
+    });
+
+    it("excludes a row whose PR already has a trusted review at the current head", async () => {
+      await seedPair({ state: "open", merged: false, reviewedAtHead: true }, 7187);
+      expect(await gaugeTotal({ scope: "pr_review" })).toBe(1);
+      expect(await gaugeTotal({ errorCode: "pr_review_output_missing", scope: "pr_review" })).toBe(0);
+      expect(await oldestAgeSeconds("pr_review")).toBeLessThan(1_800);
+    });
+
+    it("still counts a row when the GitHub probe errors (fails toward paging)", async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: new Date(now.getTime() - 3_600_000),
+        taskKey: "pr_review:Blockcast/onprem-k8s:9001",
+        errorCode: "pr_review_verification_unavailable",
+      });
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+      expect(await gaugeTotal({ errorCode: "pr_review_verification_unavailable", scope: "pr_review" })).toBe(1);
+      expect(await oldestAgeSeconds("pr_review")).toBeGreaterThan(1_800);
+    });
+  });
+
+  describe("BLO-51129: the bounded retry stops on a closed PR", () => {
+    afterEach(() => githubPrs.clear());
+
+    async function seedFailedReviewRun(prNumber: number) {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "failed",
+        errorCode: "pr_review_output_missing",
+        finishedAt: new Date(),
+        contextSnapshot: {
+          reviewKind: "pr_review",
+          wakeReason: "github_pr_synchronized",
+          taskKey: `pr_review:Blockcast/onprem-k8s:${prNumber}`,
+          githubRepoFullName: "Blockcast/onprem-k8s",
+          githubPrNumber: prNumber,
+        },
+      });
+      return { companyId, runId };
+    }
+
+    it("declines to re-drive a review of a closed PR (onprem-k8s#7132: 1 run, not 5)", async () => {
+      githubPrs.set("blockcast/onprem-k8s#7132", { state: "closed", merged: false, reviewedAtHead: false });
+      const { companyId, runId } = await seedFailedReviewRun(7132);
+      const result = await heartbeat.scheduleBoundedRetry(runId, { random: () => 0.5 });
+      expect(result).toMatchObject({ outcome: "not_scheduled", errorCode: "pr_review_pull_request_closed" });
+      const runs = await db.select().from(heartbeatRuns).where(sql`${heartbeatRuns.companyId} = ${companyId}`);
+      expect(runs).toHaveLength(1);
+    });
+
+    it("control: an open PR is not declined for being closed", async () => {
+      githubPrs.set("blockcast/onprem-k8s#7134", { state: "open", merged: false, reviewedAtHead: false });
+      const { runId } = await seedFailedReviewRun(7134);
+      const result = await heartbeat.scheduleBoundedRetry(runId, { random: () => 0.5 });
+      expect(result).not.toMatchObject({ errorCode: "pr_review_pull_request_closed" });
+    });
+
+    it("parses only well-formed pr_review task keys", () => {
+      expect(parsePrReviewTaskKey("pr_review:Blockcast/onprem-k8s:7132")).toEqual({
+        repoFullName: "Blockcast/onprem-k8s",
+        prNumber: 7132,
+      });
+      expect(parsePrReviewTaskKey("pr_review:unknown:7132")).toBeNull();
+      expect(parsePrReviewTaskKey("issue:BLO-1")).toBeNull();
+      expect(parsePrReviewTaskKey(null)).toBeNull();
+    });
   });
 });
