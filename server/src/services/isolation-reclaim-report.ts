@@ -80,6 +80,44 @@ export const ISOLATION_RECLAIM_REPORT_MARKER = "@@PCRECLAIM@@";
  */
 export const ISOLATION_RECLAIM_REPORT_VERSION = 1;
 
+/**
+ * Env var carrying the plan on the `execute` path — the INBOUND half of this
+ * wire.
+ *
+ * Lives here, beside the report, because both directions of one boundary are
+ * one contract: the Job manifest writes this variable, the executor reads it,
+ * and a disagreement about its name or shape is the same class of defect as a
+ * disagreement about the marker. It was first declared in
+ * `cli/isolation-reclaim-executor.ts` (#3189) and moved here when the manifest
+ * builder needed it too — a long-lived server service importing a CLI
+ * entrypoint for a string constant would drag that module's import-time
+ * `pino.destination` into the API server for nothing.
+ */
+export const RECLAIM_PLAN_ENV = "PAPERCLIP_RECLAIM_PLAN_JSON";
+
+/**
+ * The plan as it crosses into the pod.
+ *
+ * Carried in the environment rather than a ConfigMap because the server's Role
+ * (`paperclip-k8s-adapters`) has **no** `configmaps` verb in any form —
+ * verified against the live Role, which holds only `batch/jobs`, `pods`,
+ * `pods/log`, `metrics.k8s.io/pods`, `secrets` and
+ * `persistentvolumeclaims` — so a ConfigMap would need an RBAC change in
+ * `onprem-k8s` ahead of this. And it buys nothing: `maxDeletes` already bounds
+ * `eligibleIds` to a few hundred uuids, ~7 KB, far inside the kernel's 128 KiB
+ * limit on a single environment string (`MAX_ARG_STRLEN`). That bound is
+ * enforced at manifest-build time by `isolation-reclaim-job.ts` rather than
+ * left to the kubelet, where exceeding it surfaces as an opaque container
+ * create failure.
+ */
+export interface ReclaimPlanEnvelope {
+  planBuiltAtMs: number;
+  eligibleIds: string[];
+  maxDeletes?: number;
+  maxPlanAgeMs?: number;
+  dryRun?: boolean;
+}
+
 /** What the executor was asked to do, and therefore how to read its payload. */
 export type IsolationReclaimReportKind = "inventory" | "execute";
 
@@ -111,8 +149,13 @@ export type IsolationReclaimReportParse =
  * Spelled out rather than derived from the object's own keys, because the
  * question this list answers is whether the *expected* fields arrived — and an
  * object's own keys can only describe what it happens to contain, which is the
- * thing in doubt. `satisfies` ties it to the interface, so a counter added
- * there without being added here fails the build rather than going unchecked.
+ * thing in doubt.
+ *
+ * The exhaustiveness that matters is checked below rather than by `satisfies`.
+ * `as const satisfies ReadonlyArray<keyof ...>` rejects a listed name that is
+ * not a key — the direction that was never in doubt — and says nothing at all
+ * about a key added to the interface and left off the list, which is the
+ * direction that silently stops being validated. (Ally, review of #3189.)
  */
 const EXECUTION_RESULT_COUNTERS = [
   "requested",
@@ -124,7 +167,7 @@ const EXECUTION_RESULT_COUNTERS = [
   "vanished",
   "failed",
   "notAttempted",
-] as const satisfies ReadonlyArray<keyof IsolationReclaimExecutionResult>;
+] as const;
 
 /** The closed set of `stopReason` values this build knows how to read. */
 const EXECUTION_STOP_REASONS = [
@@ -132,7 +175,49 @@ const EXECUTION_STOP_REASONS = [
   "capped",
   "plan_stale",
   "plan_unusable",
-] as const satisfies ReadonlyArray<IsolationReclaimStopReason>;
+] as const;
+
+/**
+ * The `number`-typed keys of an execution result — the ones the loop below can
+ * meaningfully check with `Number.isFinite`. `capped` (boolean) and
+ * `stopReason` (a string union) are excluded by construction rather than by
+ * being remembered, and each is checked on its own terms further down.
+ */
+type NumericResultKey = {
+  [K in keyof IsolationReclaimExecutionResult]-?: IsolationReclaimExecutionResult[K] extends number
+    ? K
+    : never;
+}[keyof IsolationReclaimExecutionResult];
+
+/**
+ * Build-time exhaustiveness, in both directions and as two separate
+ * assertions so the compiler error names which way it broke.
+ *
+ * A failure is a `true` assigned to `never`, i.e. a TS2322 at this line. The
+ * second of each pair is the one that earns its place: without it, adding a
+ * counter to `IsolationReclaimExecutionResult` or a value to
+ * `IsolationReclaimStopReason` leaves this module quietly validating a subset.
+ * For a counter that is a silent fail-OPEN — the new field is never checked,
+ * so a report carrying `undefined` for it parses `ok: true`. For a stop reason
+ * it fails closed but only at runtime, where every report from a newer image
+ * reads `malformed`; a build-time guarantee is the entire point of this block.
+ */
+const _everyListedCounterIsANumericKey: (typeof EXECUTION_RESULT_COUNTERS)[number] extends NumericResultKey
+  ? true
+  : never = true;
+const _everyNumericKeyIsListed: NumericResultKey extends (typeof EXECUTION_RESULT_COUNTERS)[number]
+  ? true
+  : never = true;
+const _everyListedStopReasonIsReal: (typeof EXECUTION_STOP_REASONS)[number] extends IsolationReclaimStopReason
+  ? true
+  : never = true;
+const _everyStopReasonIsListed: IsolationReclaimStopReason extends (typeof EXECUTION_STOP_REASONS)[number]
+  ? true
+  : never = true;
+void _everyListedCounterIsANumericKey;
+void _everyNumericKeyIsListed;
+void _everyListedStopReasonIsReal;
+void _everyStopReasonIsListed;
 
 /**
  * Render a report as the single line the executor writes to stdout.

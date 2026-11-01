@@ -155,11 +155,14 @@
  * extracted on, applied to the retention checks: the foreign path's failure
  * mode is a second, weaker transcription of a rule that exists to keep files.
  *
- * ⛔ The TRANSPORT between them is still missing — nothing creates a Job, and
- * nothing calls either end on the reap path. What a foreign claim still lacks
- * is a pod that mounts it, not a decision about what to do once mounted. Until
- * that exists a foreign claim is unreclaimed and `unreachableAgents` is still
- * the standing record of it.
+ * ⛔ Nothing SCHEDULES this yet, and the presence of these functions must not
+ * be read as reclamation. The wire and the entrypoint landed in #3189
+ * (`isolation-reclaim-report.ts`, `cli/isolation-reclaim-executor.ts`) and the
+ * Job manifest in `isolation-reclaim-job.ts`, so a pod that mounts a foreign
+ * claim is now describable — but nothing CREATES one. What is still missing is
+ * the driver: the thing that builds a plan, creates the two Jobs, waits, and
+ * recovers each report off `pods/log`. Until that exists a foreign claim is
+ * unreclaimed and `unreachableAgents` is still the standing record of it.
  *
  * A fourth shape was weighed while building these two ends and is refused, so
  * it is recorded beside the other three: *hand the executor a fleet-wide list

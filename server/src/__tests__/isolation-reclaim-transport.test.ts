@@ -7,11 +7,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   ISOLATION_RECLAIM_REPORT_MARKER,
   ISOLATION_RECLAIM_REPORT_VERSION,
+  RECLAIM_PLAN_ENV,
   encodeIsolationReclaimReport,
   parseIsolationReclaimReport,
 } from "../services/isolation-reclaim-report.js";
 import {
-  RECLAIM_PLAN_ENV,
   parseReclaimArgs,
   parseReclaimPlan,
   runReclaimExecutor,
@@ -23,7 +23,6 @@ const UUID_B = "22222222-2222-4222-8222-222222222222";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const executorEntry = path.resolve(here, "..", "cli", "isolation-reclaim-executor.ts");
-const tsxBin = path.resolve(here, "..", "..", "node_modules", ".bin", "tsx");
 
 let root: string;
 
@@ -342,49 +341,77 @@ describe("reclaim executor as a real entrypoint (PEN-5151)", () => {
     // would be asserting against its own side effect.
     const home = await fs.mkdtemp(path.join(os.tmpdir(), "reclaim-home-"));
 
-    const result = await new Promise<{ code: number | null; stdout: string; stderr: string }>(
-      (resolve, reject) => {
-        const child = spawn(process.execPath, ["--import", "tsx", executorEntry, "inventory", "--root", root], {
-          stdio: ["ignore", "pipe", "pipe"],
-          env: { ...process.env, PAPERCLIP_HOME: home },
-        });
-        let stdout = "";
-        let stderr = "";
-        const watchdog = setTimeout(() => {
-          child.kill("SIGKILL");
-          reject(new Error("reclaim executor entrypoint timed out"));
-        }, 30_000);
+    try {
+      const result = await runEntrypoint(root, home);
 
-        child.stdout.setEncoding("utf8");
-        child.stderr.setEncoding("utf8");
-        child.stdout.on("data", (chunk: string) => {
-          stdout += chunk;
-        });
-        child.stderr.on("data", (chunk: string) => {
-          stderr += chunk;
-        });
-        child.on("error", (error) => {
-          clearTimeout(watchdog);
-          reject(error);
-        });
-        child.on("close", (code) => {
-          clearTimeout(watchdog);
-          resolve({ code, stdout, stderr });
-        });
-      },
-    );
+      expect(result.code).toBe(0);
 
-    expect(result.code).toBe(0);
+      // The test name says "on stdout", and until now nothing held that: the
+      // parse below reads the INTERLEAVED view, which would pass just as well
+      // with the report on fd 2. These two lines are what pin the split that
+      // the executor's `pino.destination({dest: 2, sync: true})` exists to
+      // create. (Ally, review of #3189.)
+      expect(result.stdout).toContain(ISOLATION_RECLAIM_REPORT_MARKER);
+      expect(result.stderr).not.toContain(ISOLATION_RECLAIM_REPORT_MARKER);
 
-    // Parsed from the interleaved view, because that is what `pods/log` gives
-    // the server — and it is also how this test notices a second marked line.
-    const parsed = parseIsolationReclaimReport(`${result.stdout}\n${result.stderr}`);
-    expect(parsed.ok).toBe(true);
-    if (!parsed.ok) return;
-    expect(parsed.report.kind).toBe("inventory");
-    if (parsed.report.kind !== "inventory" || !parsed.report.ok) return;
-    expect(parsed.report.inventory.map((e) => e.name)).toEqual([UUID_A]);
-
-    await fs.rm(home, { recursive: true, force: true });
+      // Parsed from the interleaved view, because that is what `pods/log` gives
+      // the server — and it is also how this test notices a second marked line.
+      const parsed = parseIsolationReclaimReport(`${result.stdout}\n${result.stderr}`);
+      expect(parsed.ok).toBe(true);
+      if (!parsed.ok) return;
+      expect(parsed.report.kind).toBe("inventory");
+      if (parsed.report.kind !== "inventory" || !parsed.report.ok) return;
+      expect(parsed.report.inventory.map((e) => e.name)).toEqual([UUID_A]);
+    } finally {
+      // `finally`, so a failed assertion above does not leak the tmpdir into
+      // the runner's /tmp for the rest of the suite. (Ally, review of #3189.)
+      await fs.rm(home, { recursive: true, force: true });
+    }
   }, 40_000);
 });
+
+/**
+ * Spawn the executor entrypoint, collecting its two streams SEPARATELY.
+ *
+ * Kept apart rather than merged, because the fd split is itself under test:
+ * a helper that returned one interleaved string could not express the
+ * assertion above.
+ */
+function runEntrypoint(
+  sweepRoot: string,
+  home: string,
+): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      ["--import", "tsx", executorEntry, "inventory", "--root", sweepRoot],
+      {
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PAPERCLIP_HOME: home },
+      },
+    );
+    let stdout = "";
+    let stderr = "";
+    const watchdog = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error("reclaim executor entrypoint timed out"));
+    }, 30_000);
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.on("error", (error) => {
+      clearTimeout(watchdog);
+      reject(error);
+    });
+    child.on("close", (code) => {
+      clearTimeout(watchdog);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
