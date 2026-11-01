@@ -97,7 +97,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
         with:
           fetch-depth: 0
           ref: ${{ steps.target.outputs.full }}
@@ -386,7 +386,7 @@ jobs:
       blocked: ${{ steps.check.outputs.blocked }}
     steps:
       - name: Checkout workflow scripts
-        uses: actions/checkout@v5
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
         with:
           fetch-depth: 1
       - name: Check for an existing pending production approval
@@ -424,7 +424,7 @@ jobs:
       blocked: ${{ steps.check.outputs.blocked }}
     steps:
       - name: Checkout workflow scripts
-        uses: actions/checkout@v5
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
         with:
           fetch-depth: 1
       - name: Re-check for a pending production approval right before deploy
@@ -490,7 +490,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && needs.build-and-push.outputs.target_sha || github.sha }}
@@ -628,7 +628,7 @@ jobs:
       # checkout stays in place: the Helm chart and application artifact must
       # still come from the historical commit being rolled out.
       - name: Checkout release tooling at trusted revision
-        uses: actions/checkout@v5
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-tooling
