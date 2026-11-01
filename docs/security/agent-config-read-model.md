@@ -1,10 +1,12 @@
 # Agent configuration read model (`agent_config:read`)
 
-Status: **descriptive**. Every claim below was read out of
-`server/src/services/authorization.ts` and `server/src/routes/agents.ts` at the
-commit that added this file, and the two live-seat readings in
-["Measured confirmation"](#measured-confirmation) were taken against the
-Penstock instance on 2026-10-26. Nothing here is aspirational.
+Status: **descriptive**, with one ruling recorded as such. Every claim below was
+read out of `server/src/services/authorization.ts` and
+`server/src/routes/agents.ts` at the commit that added this file, and the two
+live-seat readings in ["Measured confirmation"](#measured-confirmation) were
+taken against the Penstock instance on 2026-10-26. The withheld-is-not-absent
+signal and the `tools:manage_runtime` strike were re-read at source on
+2026-11-01 (`PEN-5230`). Nothing here is aspirational.
 
 Code is cited **by symbol name, never by line number**. The first draft of
 this file carried line anchors and five of them did not point at what they
@@ -117,6 +119,44 @@ hold the implication**, with the subject in the same company:
 | `GET /api/companies/:id/agents` | self | **`{}`** | **populated, secrets masked** |
 | `GET /api/companies/:id/agents` | peer | `{}` | unchanged |
 
+### The withheld-is-not-absent signal (`PEN-5230`)
+
+`{}` is a legal **stored** value for both columns, so every `{}` in the table
+above was ambiguous: a reader could not tell "this agent has no runtime config"
+from "you are not entitled to see it". That ambiguity was misread at least
+twice, once by the `Ceo` seat, and cost each reader an own-id positive control
+to resolve.
+
+The restricted projection now labels itself. Every response that reaches
+`redactForRestrictedAgentView` — i.e. every `{}` row in the peer lines above,
+on **both** routes — carries:
+
+| Field | Value | Is a fact about |
+| --- | --- | --- |
+| `withheldFields` | `["adapterConfig", "runtimeConfig"]`, always both | the projection |
+| `withheldByAction` | `"agent_config:read"` | the **reader**'s missing entitlement |
+
+Both are module constants (`WITHHELD_AGENT_CONFIG_FIELDS` /
+`WITHHELD_AGENT_CONFIG_ACTION`, `routes/agents.ts`), never computed from the
+stored value. `withheldFields` names both columns unconditionally rather than
+only the populated ones, so the pair discloses **zero bits** about the subject
+— which is what makes the signal disclosure-neutral rather than a one-bit
+widening. Do not "improve" it into a `hasAdapterConfig` / `hasRuntimeConfig`
+presence bit: the list route returns one row per seat, so a per-subject bit
+there is a company-wide map of which seats carry a heartbeat override.
+
+The markers appear on the restricted arm **only**. Their absence beside a `{}`
+is therefore itself the signal that the `{}` is real, so a client reads
+`{}`-with-no-marker as genuinely empty. Declared optional on the shared `Agent`
+interface (`packages/shared/src/types/agent.ts`), which both `AgentDetail` and
+the list row extend.
+
+This matches the idiom the codebase already applies to strictly more sensitive
+material: `hasWorkspaceRuntimeConfig` beside the withheld blob for
+`workspace_runtime:read` (`PEN-3206` §2), and `withheldFields` on the approval
+card from `withholdAgentConfigKeys`. The agents route had been the
+weaker-signalling projection guarding the lesser secret.
+
 The axis is **(viewer × subject × route)**, not any one of the three. The
 detail route asks the per-subject question (`canReadSensitiveDetail = isSelf ?
 true : ...` in `routes/agents.ts`); the list route asked the company-wide
@@ -145,21 +185,42 @@ gate nor the per-row application. The suspicion raised on `PEN-4775` §7.3 that
 the over-strip arrived with `PEN-2839` or `PEN-3139` is therefore **false**;
 the self-row drop was present from the day the projection was written.
 
-## What this document does NOT decide
+## The policy question is SETTLED, and it was never `PEN-3206`'s
 
-**Whether a peer's config should be company-readable at all is still open**, and
-it is owned by `PEN-3206`. `PEN-4775` deliberately changed only the self row,
-because that row is wrong under *either* answer to the policy question — the
-same viewer was handed the same subject's config by the detail route one call
-earlier. Everything in the peer column above is the behaviour as it stands, not
-a ruling that it is correct.
+**`PEN-5228` ruled: KEEP THE WITHHOLD.** A peer's `adapterConfig` /
+`runtimeConfig` stay unreadable to an agent actor that does not hold the
+implication. The ground is that `agent_config:read` and `agent_config:update`
+are governed by the identical grant pair (`agents:configure` or
+`agents:suggest-changes`), so a non-holder's `{}` is the read side matching the
+write side rather than an over-correction. The peer column of the table above
+is now a ruling, not merely the behaviour as it stands.
 
-If `PEN-3206` lands on "company-readable", the change belongs in
-`decideWithAgentConfigReadGrant` or in the list route's peer arm, and this table
-needs rewriting. If it lands on "not readable", the live gap it leaves is the
-one `PEN-4775` §6 recorded: a seat holding `tools:manage_runtime` can **write**
-a peer's `runtimeConfig` and cannot read it back to verify the write, and that
-asymmetry then needs its own answer.
+⚠️ **This row is NOT `PEN-3206`, and earlier revisions of this file said it
+was.** That pointer is what the parent row was opened to correct. `PEN-3206`
+ruled on `project_workspaces.metadata.runtimeConfig` behind
+`workspace_runtime:read` — a different column, a different gate and a different
+projection that merely shares a name. Its §2 is still cited here, but only as
+the *precedent for the withheld-is-not-absent signal*, never as the owner of
+this question. Conflating the two has cost readers twice.
+
+`PEN-4775` deliberately changed only the self row, because that row was wrong
+under either answer — the same viewer was handed the same subject's config by
+the detail route one call earlier. `PEN-5230` then added the signal above,
+which is disclosure-neutral: it returns no config byte that was withheld before
+it.
+
+### The `tools:manage_runtime` asymmetry is struck, not live
+
+`PEN-4775` §6 recorded a gap that would follow from the "not readable" ruling:
+a seat holding `tools:manage_runtime` can **write** a peer's `runtimeConfig`
+and cannot read it back to verify the write. **That gap does not exist.**
+Re-checked at source on `PEN-5230` and independently confirmed in review:
+`tools:manage_runtime` has four non-test call sites — `tool-gateway.ts` × 3 via
+`assertBoardPermission`, and `tool-access.ts` via `assertBoardToolPermission`.
+Both helpers call `assertBoard(req)` first and then check a **`user`**
+principal, and the string occurs zero times in `services/authorization.ts`. No
+agent-actor route exercises it, so no agent seat can reach the write half. The
+asymmetry needs no answer because it has no holder.
 
 ## Regression tests
 
@@ -171,3 +232,11 @@ asymmetry then needs its own answer.
 - `server/src/__tests__/agent-secret-redaction.test.ts` — `agent metadata
   containment on the spread-based redactors`: both projections, including that
   the restricted one is reached via a **peer** row.
+- `server/src/__tests__/agent-permissions-routes.test.ts` — ``the peer `{}`
+  says it was withheld (PEN-5230)``: the markers on both routes, their
+  **absence** for a grant holder and on the self row, that no config byte
+  widened, and that they cannot be PATCHed back onto the agent row.
+  Its disclosure-budget case asserts the populated and the genuinely-empty
+  subject return **byte-identical bodies** — whole-body equality, not a list of
+  named fields, because a named-field comparison let a `hasRuntimeConfig`
+  presence bit through while claiming to catch it.
