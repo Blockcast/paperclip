@@ -33,6 +33,7 @@
     "src/__tests__/http-metrics-transient-db-sqlstate.test.ts",
     "src/__tests__/http-request-duration-histogram.test.ts",
     "src/__tests__/isolation-reclaim-claims.test.ts",
+    "src/__tests__/isolation-reclaim-cycle.test.ts",
     "src/__tests__/isolation-reclaim-job.test.ts",
     "src/__tests__/isolation-reclaim-runner.test.ts",
     "src/__tests__/isolation-reclaim-transport.test.ts",
