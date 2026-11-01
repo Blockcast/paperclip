@@ -204,6 +204,20 @@ export const RECLAIM_JOB_COMPONENT_LABEL = "app.kubernetes.io/component";
 export const RECLAIM_JOB_COMPONENT = "isolation-reclaim";
 export const RECLAIM_JOB_MODE_LABEL = "paperclip.io/reclaim-mode";
 export const RECLAIM_JOB_CLAIM_LABEL = "paperclip.io/reclaim-claim";
+/**
+ * Annotation carrying the claim name UNTRUNCATED.
+ *
+ * Exported because `isolation-reclaim-runner.ts` verifies an adopted Job
+ * against it: {@link reclaimJobName} truncates the claim to fit 63 characters, so the label
+ * cannot distinguish two claims sharing a long prefix and this is the only
+ * field that can. Both sides read the same constant rather than two copies of
+ * the string.
+ */
+export const RECLAIM_JOB_CLAIM_ANNOTATION = "paperclip.io/reclaim-claim-name";
+export const RECLAIM_JOB_ROOT_ANNOTATION = "paperclip.io/reclaim-root";
+export const RECLAIM_JOB_DRY_RUN_ANNOTATION = "paperclip.io/reclaim-dry-run";
+/** The container the report is read from. One container, named here so the log reader cannot guess. */
+export const RECLAIM_JOB_CONTAINER_NAME = "reclaim";
 
 /**
  * Ceiling on the serialized plan, in bytes.
@@ -403,7 +417,7 @@ export function buildIsolationReclaimJobManifest(
   ];
 
   const container: k8s.V1Container = {
-    name: "reclaim",
+    name: RECLAIM_JOB_CONTAINER_NAME,
     image: spec.image,
     imagePullPolicy: spec.imagePullPolicy ?? "IfNotPresent",
     // See {@link RECLAIM_TSX_LOADER_PATH}: without the loader this container
@@ -446,14 +460,16 @@ export function buildIsolationReclaimJobManifest(
       annotations: {
         // Untruncated, unlike the label — this is the one place an operator can
         // read which volume the pod actually mounted.
-        "paperclip.io/reclaim-claim-name": spec.claimName,
-        "paperclip.io/reclaim-root": RECLAIM_WORKSPACES_ROOT,
+        [RECLAIM_JOB_CLAIM_ANNOTATION]: spec.claimName,
+        [RECLAIM_JOB_ROOT_ANNOTATION]: RECLAIM_WORKSPACES_ROOT,
         // `dryRun` defaults to TRUE in the executor and only a JSON `false`
         // disables it, so this says what the Job will actually do rather than
         // what the field literally held. Stamped because "did this Job delete
         // anything" is the first question asked of it, and reading it off the
         // plan env var means parsing JSON out of a pod spec.
-        ...(spec.plan ? { "paperclip.io/reclaim-dry-run": String(spec.plan.dryRun !== false) } : {}),
+        ...(spec.plan
+          ? { [RECLAIM_JOB_DRY_RUN_ANNOTATION]: String(spec.plan.dryRun !== false) }
+          : {}),
       },
     },
     spec: {
