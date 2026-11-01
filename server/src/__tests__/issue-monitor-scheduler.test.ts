@@ -1820,6 +1820,80 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(actions).toContain("issue.monitor_escalated_to_board");
   });
 
+  // PEN-5171: the companion pin for the fallback the two tests above added. When
+  // the policy monitor is absent, `derivePersistedMonitorState` reads
+  // `executionState.monitor` REGARDLESS of that monitor's status — `cleared`
+  // included — so a monitor that was already retired leaves its bounds behind,
+  // and a subsequently re-pointed `monitorNextCheckAt` is judged against them.
+  //
+  // This test records that as the intended behaviour, not an accident. The full
+  // reasoning sits at the dispatch call site in heartbeat.ts; in short, the
+  // retired monitor's metadata is the only declared bound such a row carries,
+  // `monitorAttemptCount` survives a clear so its ceiling has to survive with it
+  // or a 26-attempt row is judged against the default 24, and the row's own next
+  // write (`buildIssueMonitorClearedPatch`) derives its `previous` through this
+  // same unfiltered helper. A `status !== "cleared"` filter flips this test to a
+  // dispatch, and would have to move those builders in the same commit — the
+  // lesson of PEN-5170, applied to the siblings that actually share this helper
+  // rather than to the expiry sweep, which never meets a row holding a live
+  // `monitorNextCheckAt`.
+  //
+  // The clear here is real rather than seeded: the first tick is the production
+  // retirement, driven by a `timeoutAt` already past at the armed check time.
+  // Re-pointing the column afterwards is the same out-of-band drift the two tests
+  // above exercise one state earlier.
+  it("retires a re-pointed wake against a cleared monitor's stale timeoutAt (PEN-5171)", async () => {
+    const staleTimeoutAt = "2026-04-11T12:00:00.000Z";
+    const { issueId } = await seedFixture({
+      monitor: { timeoutAt: staleTimeoutAt, recoveryPolicy: "wake_owner" },
+    });
+    const heartbeat = createHeartbeat();
+
+    const firstTick = await heartbeat.tickTimers(new Date("2026-04-11T12:31:00.000Z"));
+    expect(firstTick.enqueued).toBe(0);
+    // Settle the recovery wake this retirement queued before re-pointing, so the
+    // second tick measures the dispatch path rather than racing a live run.
+    await waitForHeartbeatIdle();
+
+    const cleared = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    // Policy stripped, state retired, bound left behind on the retired state.
+    expect(normalizeIssueExecutionPolicy(cleared.executionPolicy ?? null)?.monitor ?? null).toBeNull();
+    expect(parseIssueExecutionState(cleared.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "timeout_exceeded",
+      timeoutAt: staleTimeoutAt,
+    });
+
+    await db
+      .update(issues)
+      .set({ monitorNextCheckAt: new Date("2026-04-11T13:30:00.000Z") })
+      .where(eq(issues.id, issueId));
+
+    const secondTick = await heartbeat.tickTimers(new Date("2026-04-11T13:31:00.000Z"));
+
+    // The retired monitor's `timeoutAt` still binds, so the re-pointed wake is
+    // retired at dispatch instead of delivered. Filtering the cleared state out
+    // would leave this row with no bound at all and enqueue it.
+    expect(secondTick.enqueued).toBe(0);
+    expect(secondTick.skipped).toBe(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "timeout_exceeded",
+      timeoutAt: staleTimeoutAt,
+    });
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    // Never delivered on either tick — the stale bound was honoured both times.
+    expect(actions).not.toContain("issue.monitor_triggered");
+  });
+
   // Characterization test pinning the exact exhaustion boundary, so the shared
   // limit helper cannot silently shift it by one. The scheduler compares
   // `nextAttemptCount > maxAttempts` where `nextAttemptCount = prior + 1`, which

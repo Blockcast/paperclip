@@ -16653,6 +16653,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // fields (`gateSignals`) and rebuilds (`{...monitor, nextCheckAt}`) that only
     // a live policy monitor can supply, and both already guard the drifted row
     // explicitly.
+    //
+    // PEN-5171: the fallback side is deliberately NOT filtered on
+    // `executionState.monitor.status`, so a `cleared` monitor's metadata is read
+    // here too. That is load-bearing, not an oversight.
+    //
+    // The shape it governs is the drifted row again, one state further on: policy
+    // stripped, `executionState.monitor` retired as `cleared`, and
+    // `monitorNextCheckAt` subsequently re-pointed out of band. No in-tree writer
+    // produces it — every write of that column routes through the
+    // issue-execution-policy patch builders, which only ever arm it alongside a
+    // policy monitor — so the bound the retired monitor left behind is the ONLY
+    // declared bound such a row carries. Honouring it retires the re-pointed wake
+    // early; dropping it would leave that wake bounded by nothing but the default
+    // ceiling. On a timer, early is the safe side.
+    //
+    // `maxAttempts` is what makes that decisive rather than merely conservative. A
+    // clear does not reset `monitorAttemptCount` — the column survives a clear
+    // exactly as it survives a re-arm — so filtering the bound while keeping the
+    // count would judge a 26-attempt row against the default 24 and retire it
+    // instantly as `max_attempts_exhausted`. That is PEN-3803/PEN-4427's defect,
+    // reintroduced by the very filter that looks like a fix. The count and its
+    // ceiling have to be read from the same place or neither reading is coherent.
+    //
+    // It also matches what this row's own next write records:
+    // `buildIssueMonitorClearedPatch` and `buildIssueMonitorTriggeredPatch` both
+    // derive their `previous` through this same helper, unfiltered, and carry that
+    // metadata forward. Filtering here and not there would reinstate the PEN-5170
+    // contradiction from the other end — a decision reported against one monitor
+    // and persisted against another.
+    //
+    // Note the expiry sweep below is NOT the twin to keep in step at this site, in
+    // spite of the symmetry above: it requires `currentMonitorState.status ===
+    // "triggered"`, and a row with a live `monitorNextCheckAt` derives as
+    // `scheduled`, so the sweep never meets this row at all. The twins are the four
+    // builders that share the helper — which is also why any future status filter
+    // belongs inside `derivePersistedMonitorState`, where it moves all of them at
+    // once, rather than at one call site. Pinned by "retires a re-pointed wake
+    // against a cleared monitor's stale timeoutAt" in
+    // issue-monitor-scheduler.test.ts.
     const persistedMonitor = derivePersistedMonitorState({
       issue: claimed,
       state: parsedExecutionState,
