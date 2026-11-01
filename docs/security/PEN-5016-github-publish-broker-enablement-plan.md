@@ -678,6 +678,40 @@ given a carrier row before stage 3 exits.** A review date recorded only in this 
 defect PEN-4988 exists to encode: a date with no owner is not a review, and the acceptance it
 succeeds is the thing that would quietly take it down.
 
+✅ **That carrier row is PEN-5186**, filed 2026-11-01 and owned by Security. It carries all four rows
+above and the 2027-01-31 date. It is **not** closed by stage 3 exiting — it succeeds §7.1's
+acceptance rather than being part of this rollout, which is the whole reason §11.5 asks for it
+separately.
+
+**Residual 4 now has a standing detector**, because its trigger — *"and on any change to those two
+files"* — has been live since this plan merged, with nothing watching it.
+`scripts/check-git-egress-exec-closure-reread.mjs` runs in the `policy` job on every pull request
+and merge group, and has two arms:
+
+- **Per change.** A commit range that touches either file must carry a `Residual-4-Reread:` trailer
+  saying what was checked. The trigger is deliberately as broad as this table's wording — *any*
+  change, not a change to the closures — because the set of exec-reachable config keys is not
+  enumerable. That is residual 1, and the detector does not narrow it.
+- **Calendar.** From 2027-01-31 the check reports the review as due until Security records it in
+  that script. It runs on every PR rather than on a cron deliberately: a cron's failure mode is
+  silence, and silence is byte-identical to clear — which is the PEN-4988 defect this row exists not
+  to repeat.
+
+⚠ **The trailer is an attestation, not a proof,** and it is exactly as good as the person who writes
+it. What it buys is that the attestation is *recorded*, per change, with a name on it. The two
+closures themselves are pinned mechanically, and independently of any judgement, by *"exec routes
+the broker relies on but does not itself close"* in `github-publish-broker-policy.test.ts`.
+
+⛔ **One of those two pins was vacuous until 2026-11-01, and it is recorded here because it failed in
+the direction that looks fine.** The `core.hooksPath` arm asserted only that the string appeared
+somewhere in `github-git-egress-runtime.ts`. Measured by deleting the injection itself from
+`buildGitArgv`: that assertion still **passed**, because the string survives in 16 comments and
+refusal messages. The closure was in fact still enforced — by the runtime's *own* suite, which went
+red — but a backstop whose whole purpose is to make a change *there* surface *here* cannot rely on
+that, since one edit can remove an injection and its own tests together. It now reads the built argv
+back and asserts the injection is present and ahead of the subcommand. The `--no-textconv` arm was
+tested the same way and was already sound.
+
 ⚠ **This successor residual is strictly smaller than §7.1's and must not be described as equivalent.**
 Under §7.1 the agent simply holds the token. Under D1 it must win a race or find an unenumerated
 config key. That is a real improvement and it is still not "the broker cannot be made to run
@@ -976,6 +1010,12 @@ carrier is the failure mode, not the discharge.
 row is explicitly *"and on any change to those two files"*, and that trigger is live today. It is
 **one** residual row naming **two files** — do not read it as two residuals. The carrier row owns that
 watch too.
+
+✅ **Filed 2026-11-01 as PEN-5186**, ahead of stage 3 rather than at it, precisely because of the
+sentence above: three of the four residuals are genuinely 2027 work and the fourth was a standing
+watch with no watcher, and waiting for stage 3 would have left that open for the whole soak. The
+live trigger now has a detector (§8); the 2027-01-31 date is scheduled against that row rather than
+against §8's table.
 
 **The standing blind spot stays the CTO's**, unchanged and not re-granted: no cluster-wide exec
 telemetry, trigger 4 has a measurement and not a detector (PEN-4989). D1 does not close it; it makes
