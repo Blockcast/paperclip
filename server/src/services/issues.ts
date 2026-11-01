@@ -8690,7 +8690,13 @@ export function issueService(db: Db) {
       try {
         pageRows = await pageQuery;
       } catch (error) {
-        await captureTimedOutIssueListPlan({
+        // Deliberately NOT awaited. The tenant's request has already failed;
+        // awaiting would add pool-checkout wait plus up to 2s of planning to a
+        // response that is going to be a 503 either way — and a 57014 burst is
+        // exactly when the pool is most contended. `captureTimedOutIssueListPlan`
+        // never rejects (it swallows everything), so this cannot become an
+        // unhandled rejection.
+        void captureTimedOutIssueListPlan({
           db,
           query: pageQuery,
           error,

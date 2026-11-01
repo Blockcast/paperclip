@@ -257,6 +257,43 @@ describe("redactBoundValues", () => {
   // PostgreSQL inlines bound values into EXPLAIN output, so the plan leaks them
   // even when the rendered statement carries only placeholders. Proven against a
   // real server in `issue-list-timeout-explain-postgres.test.ts`; pinned here.
+  // Ally review on #3237: substituting in INDEX order let a short parameter
+  // fragment a longer one, after which the whole-parameter fail-closed check
+  // passed and the plan was logged with the rest of the user's search term in
+  // clear. This is the realistic binding order, not a contrived one.
+  it("does not fragment the search pattern with a shorter param bound earlier", () => {
+    // `?status=blocked&q=blocked prod deploy` — `eq(issues.status, ...)` is
+    // pushed into `conditions` before `issueSearchMatchCondition` in `list()`,
+    // so 'blocked' binds as $1 and the pattern as $2.
+    const params = ["blocked", "%blocked prod deploy%"];
+    const plan = "Filter: ((issues.title ~~* '%blocked prod deploy%'::text))";
+    const redacted = redactBoundValues(plan, params);
+    expect(redacted).not.toContain("prod deploy");
+    expect(containsBoundValue(redacted, params)).toBe(false);
+    expect(redacted).toBe("Filter: ((issues.title ~~* '$2'::text))");
+  });
+
+  it("blanks a literal it cannot attribute to any parameter", () => {
+    // Pass 2 does not depend on knowing the parameters, so a fragment left by
+    // ANY mechanism — a future change to pass 1, or a constant the planner
+    // inlined from elsewhere — is removed regardless.
+    expect(redactBoundValues("Filter: (title ~~* '%unattributed%'::text)", []))
+      .toBe("Filter: (title ~~* '?'::text)");
+  });
+
+  it("keeps the plan shape while blanking literals", () => {
+    const plan = "Index Scan using issues_company_priority_idx on public.issues  (cost=0.14..8.17 rows=1 width=48)\n"
+      + "  Output: id, \"substring\"(description, 1, 1201)\n"
+      + "  Index Cond: (issues.company_id = 'a-uuid'::uuid)";
+    const redacted = redactBoundValues(plan, []);
+    // Identifiers are double-quoted and costs/rows are unquoted, so nothing
+    // structural is inside a single-quoted literal.
+    expect(redacted).toContain("Index Scan using issues_company_priority_idx");
+    expect(redacted).toContain("cost=0.14..8.17 rows=1 width=48");
+    expect(redacted).toContain('"substring"(description, 1, 1201)');
+    expect(redacted).not.toContain("a-uuid");
+  });
+
   it("replaces a bound value with its placeholder wherever it appears", () => {
     const plan = "Filter: ((title ~~* '%term%'::text) OR (description ~~* '%term%'::text))";
     expect(redactBoundValues(plan, ["company-1", "%term%"])).toBe(

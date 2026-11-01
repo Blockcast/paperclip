@@ -200,6 +200,48 @@ describeEmbeddedPostgres("captureTimedOutIssueListPlan against real PostgreSQL (
     expect(JSON.stringify(call![0])).not.toContain("100");
   });
 
+  it("the driver never names a prepared statement, so production plans custom", async () => {
+    // This is the property that makes the captured plan the plan production
+    // CHOSE rather than a proxy for it. PostgreSQL flips a NAMED prepared
+    // statement to a generic plan after five executions (`plan_cache_mode =
+    // auto`), while a fresh EXPLAIN is always custom — so if this statement
+    // were ever named, the capture would show a good plan production never ran.
+    // That failure reads identically to the finding this instrument is set up
+    // to accept ("plan shape matches the bench"), i.e. it fails toward a
+    // confident wrong answer rather than a visible error.
+    //
+    // The property belongs to the DRIVER PATH, not the query, so nothing in the
+    // SQL reveals it: drizzle routes everything through postgres-js
+    // `client.unsafe()`, which hardcodes `prepare: false`. Pinned behaviourally
+    // rather than by reading node_modules, so a dependency bump or a switch to
+    // `.prepare()` fails here instead of silently making the instrument lie.
+    //
+    // `max: 1` because `pg_prepared_statements` is session-local — on a larger
+    // pool the probe could land on a different connection than the queries and
+    // read an empty table for the wrong reason.
+    const pinned = createDb(tempDb!.connectionString, 1);
+    try {
+      for (let i = 0; i < 7; i += 1) {
+        await pinned.select({ id: issues.id }).from(issues).where(sql`${issues.companyId} = ${companyId}`);
+      }
+      const prepared = (await pinned.execute(
+        sql.raw("SELECT statement FROM pg_prepared_statements"),
+      )) as unknown as { statement: string }[];
+      // Asserted against APPLICATION statements, not against an empty table:
+      // postgres-js names one bootstrap statement per connection for its own
+      // array-type discovery (`from pg_catalog.pg_type ... typcategory = 'A'`),
+      // so `count(*) = 0` would fail for a reason that has nothing to do with
+      // the property under test.
+      // Positive control: that bootstrap row must be PRESENT. Without it, an
+      // unreadable or always-empty `pg_prepared_statements` would satisfy the
+      // real assertion below for entirely the wrong reason.
+      expect(prepared.some((row) => /pg_catalog\.pg_type/.test(row.statement))).toBe(true);
+      expect(prepared.every((row) => !/\bfrom "issues"/.test(row.statement))).toBe(true);
+    } finally {
+      await pinned.$client?.end?.({ timeout: 0 });
+    }
+  });
+
   it("reverts the tightened statement_timeout with its transaction", async () => {
     // SET LOCAL, not SET: the diagnostic's own bound must not leak onto a
     // pooled connection that goes on to serve ordinary traffic.
