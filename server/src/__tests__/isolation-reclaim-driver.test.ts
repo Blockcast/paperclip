@@ -241,9 +241,60 @@ describe("driveIsolationReclaim", () => {
     expect(outcome.ok).toBe(false);
     expect(outcome.failureKind).toBe("execute_refused");
     expect(outcome.result).toBeNull();
-    // The executor writes this report before the unlink loop, so it is a known
-    // zero rather than an unknown.
-    expect(outcome.deletionOutcomeUnknown).toBe(false);
+    // Still an unknown. Every cause that reaches this branch today is pre-loop,
+    // but the executor CLI wraps the whole `executeIsolationReclaimPlan` call in
+    // one `catch`, so a throw raised INSIDE the loop — after some `fs.rm` calls
+    // — would arrive here as the same `ok: false` payload. Narrowing would rest
+    // on an invariant of a module this one does not own, and it is the only
+    // branch here that would. (Ally, review of #3198.)
+    expect(outcome.deletionOutcomeUnknown).toBe(true);
+  });
+
+  it("carries the unknown on EVERY execute-phase failure, with no narrowable branch", async () => {
+    // The rule stated without an exception, asserted over every way the execute
+    // phase can fail: a reported refusal, a run failure, and a port throw.
+    const kinds: Array<[string, DriveIsolationReclaimOptions["runJob"]]> = [
+      [
+        "execute_refused",
+        scriptedRun({
+          inventory: (m) => ranOk(m, inventoryReport([IDLE_A], NOW - 30 * DAY)),
+          execute: (m) => ranOk(m, { v: 1, kind: "execute", ok: false, error: "refused" }),
+        }).runJob,
+      ],
+      [
+        "execute_run_failed (reported)",
+        scriptedRun({
+          inventory: (m) => ranOk(m, inventoryReport([IDLE_A], NOW - 30 * DAY)),
+          execute: (m) => ({
+            ok: false,
+            kind: "job_failed",
+            detail: "no report",
+            jobName: m.jobName,
+            namespace: m.namespace,
+            mode: "execute",
+            claimName: CLAIM.claimName,
+            podName: null,
+            adopted: false,
+            deletionOutcomeUnknown: true,
+          }),
+        }).runJob,
+      ],
+      [
+        "execute_run_failed (thrown)",
+        scriptedRun({
+          inventory: (m) => ranOk(m, inventoryReport([IDLE_A], NOW - 30 * DAY)),
+          execute: () => {
+            throw new Error("boom");
+          },
+        }).runJob,
+      ],
+    ];
+
+    for (const [label, runJob] of kinds) {
+      const outcome = await drive({ runJob });
+      expect(outcome.ok, label).toBe(false);
+      expect(outcome.deletionOutcomeUnknown, label).toBe(true);
+    }
   });
 
   it("propagates deletionOutcomeUnknown from a failed execute run", async () => {

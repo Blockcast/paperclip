@@ -106,6 +106,14 @@ import {
  * throw during the `execute` phase is reported with the unknown set, because
  * from outside the runner a failure to create (nothing ran) is indistinguishable
  * from a failure to poll (a pod that may be halfway through the plan).
+ *
+ * **Every `execute`-phase failure carries the unknown, including a refusal the
+ * executor reported itself.** That branch looks narrowable — each cause that
+ * reaches it today happens before the unlink loop — but the executor CLI wraps
+ * the whole `executeIsolationReclaimPlan` call in one `catch`, so a future throw
+ * raised inside the loop would arrive as the same `ok: false` payload. The rule
+ * is therefore stated without an exception: nothing in this file narrows an
+ * unknown using an invariant of a module it does not own.
  */
 
 /** Cluster-shaped inputs shared by both of a drive's Jobs. */
@@ -389,10 +397,26 @@ export async function driveIsolationReclaim(
 
   const executeReport = executeRun.report;
   if (!executeReport.ok) {
-    // A refusal the executor reported itself. It writes the report before it
-    // exits non-zero, and every refusal it reports this way happens before the
-    // unlink loop, so this is a known zero.
-    return { ...base, failureKind: "execute_refused", detail: executeReport.error };
+    // A refusal the executor reported itself, and still an unknown. Today every
+    // cause reaches this branch before the unlink loop — a `--root` that cannot
+    // be read, a plan env that will not parse; a stale or unusable plan does not
+    // even come back `ok: false`, it comes back as a successful result carrying
+    // `stopReason`. But the executor CLI wraps the whole
+    // `executeIsolationReclaimPlan` call in one `catch` that emits `ok: false`,
+    // so a throw raised INSIDE the loop, after some `fs.rm` calls, would arrive
+    // here indistinguishable from a pre-loop refusal.
+    //
+    // Narrowing here would rest on an invariant of another module that nothing
+    // enforces, and it is the only branch in this file that would. The cost of
+    // not narrowing is bounded and cheap: two pre-loop causes reported as
+    // unknown rather than as a known zero. The cost of narrowing wrongly is the
+    // measurement that was never taken. (Ally, review of #3198.)
+    return {
+      ...base,
+      failureKind: "execute_refused",
+      detail: executeReport.error,
+      deletionOutcomeUnknown: true,
+    };
   }
   if (executeReport.kind !== "execute") {
     return {
