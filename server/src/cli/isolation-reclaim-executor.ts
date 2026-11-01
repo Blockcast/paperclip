@@ -2,8 +2,16 @@
  * The reclaim executor's entrypoint — the process that runs inside the Job
  * holding a foreign claim (PEN-5151).
  *
- *   node /app/server/dist/cli/isolation-reclaim-executor.js inventory --root <path>
- *   node /app/server/dist/cli/isolation-reclaim-executor.js execute   --root <path>
+ *   node --import /app/server/node_modules/tsx/dist/loader.mjs \
+ *     /app/server/dist/cli/isolation-reclaim-executor.js inventory --root <path>
+ *   node --import /app/server/node_modules/tsx/dist/loader.mjs \
+ *     /app/server/dist/cli/isolation-reclaim-executor.js execute   --root <path>
+ *
+ * The `--import` is load-bearing, not boilerplate: this file's import graph
+ * reaches `@paperclipai/db`, which the runtime image resolves to TypeScript
+ * source, and bare `node` dies on it before `main` runs. See
+ * `RECLAIM_TSX_LOADER_PATH` in `isolation-reclaim-job.ts` — the Job manifest
+ * is what actually spells this argv, and it has the measurement.
  *
  * PEN-4932 moves an opted-in agent's runs onto a per-agent PVC, and the
  * server's isolation sweep goes blind on it: it can enumerate no directory it

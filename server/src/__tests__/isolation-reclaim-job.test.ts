@@ -6,7 +6,9 @@ import {
   DEFAULT_RECLAIM_TTL_SECONDS,
   MAX_RECLAIM_PLAN_ENV_BYTES,
   RECLAIM_CLAIM_MOUNT_PATH,
+  RECLAIM_EXECUTOR_PATH,
   RECLAIM_HOME_MOUNT_PATH,
+  RECLAIM_TSX_LOADER_PATH,
   RECLAIM_WORKSPACES_ROOT,
   buildIsolationReclaimJobManifest,
   reclaimJobName,
@@ -47,7 +49,7 @@ describe("reclaim Job manifest (PEN-5151)", () => {
     const container = built.job.spec?.template.spec?.containers[0];
 
     expect(container?.args).toEqual([
-      "/app/server/dist/cli/isolation-reclaim-executor.js",
+      RECLAIM_EXECUTOR_PATH,
       "inventory",
       "--root",
       RECLAIM_WORKSPACES_ROOT,
@@ -59,6 +61,37 @@ describe("reclaim Job manifest (PEN-5151)", () => {
     // recursive unlink at the claim the mounted sweep already owns.
     expect(RECLAIM_WORKSPACES_ROOT).not.toBe(DEFAULT_ISOLATION_WORKSPACE_ROOT);
     expect(RECLAIM_WORKSPACES_ROOT.startsWith(`${RECLAIM_CLAIM_MOUNT_PATH}/`)).toBe(true);
+  });
+
+  it("puts the tsx loader in front of the executor, in both modes", () => {
+    // Regression guard for a failure no amount of unit testing of the executor
+    // itself can catch, because it happens before `main`: the executor's import
+    // graph reaches `@paperclipai/db`, whose runtime-image `exports` points at
+    // TypeScript source whose own re-exports are spelled `.js`, so bare Node
+    // dies with ERR_MODULE_NOT_FOUND on `src/client.js`. A loader-less
+    // container exits non-zero having written no report line, which the
+    // transport reads as `absent` — "go and look at the pod" — for every Job
+    // this module builds. See RECLAIM_TSX_LOADER_PATH for the measurement.
+    for (const mode of ["inventory", "execute"] as const) {
+      const container = podSpec(
+        mode,
+        mode === "execute" ? { plan: { planBuiltAtMs: 1, eligibleIds: [UUID_A] } } : {},
+      ).containers[0];
+
+      expect(container?.command).toEqual(["node", "--import", RECLAIM_TSX_LOADER_PATH]);
+      // The loader must precede the script: `--import` is a node option, and
+      // anything after the entry path is argv for the program.
+      expect(container?.args?.[0]).toBe(RECLAIM_EXECUTOR_PATH);
+      expect([...(container?.command ?? []), ...(container?.args ?? [])]).toEqual([
+        "node",
+        "--import",
+        RECLAIM_TSX_LOADER_PATH,
+        RECLAIM_EXECUTOR_PATH,
+        mode,
+        "--root",
+        RECLAIM_WORKSPACES_ROOT,
+      ]);
+    }
   });
 
   it("mounts the named claim, and nothing else that can carry a credential", () => {
