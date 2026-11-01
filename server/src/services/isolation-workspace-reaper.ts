@@ -159,10 +159,14 @@
  * be read as reclamation. The wire and the entrypoint landed in #3189
  * (`isolation-reclaim-report.ts`, `cli/isolation-reclaim-executor.ts`) and the
  * Job manifest in `isolation-reclaim-job.ts`, so a pod that mounts a foreign
- * claim is now describable — but nothing CREATES one. What is still missing is
- * the driver: the thing that builds a plan, creates the two Jobs, waits, and
- * recovers each report off `pods/log`. Until that exists a foreign claim is
- * unreclaimed and `unreachableAgents` is still the standing record of it.
+ * claim is now describable — but nothing CREATES one. `listReclaimableClaims`
+ * below answers the driver's first question, WHICH claims, so the remaining
+ * gap is narrower than it was: what is still missing is the acting half —
+ * creating the two Jobs, waiting on them, and recovering each report off
+ * `pods/log`. Until that exists a foreign claim is unreclaimed and
+ * `unreachableAgents` is still the standing record of it. ⚠ In particular, do
+ * not read a non-empty `listReclaimableClaims` as a list of claims that WILL
+ * be swept; today it is a list of claims that COULD be.
  *
  * A fourth shape was weighed while building these two ends and is refused, so
  * it is recorded beside the other three: *hand the executor a fleet-wide list
@@ -414,6 +418,190 @@ export function createDbUnreachableAgentCount(
       );
     return rows[0]?.count ?? 0;
   };
+}
+
+/**
+ * One foreign claim a reclaim Job should be launched against, and why.
+ *
+ * `source` is kept because the two arms carry different certainty and an
+ * operator reading a sweep's log needs to tell them apart. An
+ * `agent_per_agent_volume` row names a claim this control plane derives and
+ * can therefore predict exactly; an `environment_claim` row names one an
+ * operator typed, which is authoritative but opaque — nothing here knows
+ * whether it was ever provisioned.
+ */
+export interface ReclaimableClaim {
+  /** The PVC to mount. Non-empty, DNS-1123, deduped across the whole result. */
+  claimName: string;
+  source: "agent_per_agent_volume" | "agent_workspace_claim" | "environment_claim";
+  /**
+   * The agent this claim belongs to, when that is knowable.
+   *
+   * `null` on every `environment_claim` row, and that is a property of the
+   * data rather than a gap to fill later — see `listReclaimableClaims`.
+   */
+  agentId: string | null;
+}
+
+/**
+ * Prefix of a claim name derived by the per-agent volume gate.
+ *
+ * ⚠ RE-DERIVED, not imported. The authority is
+ * `agentWorkspaceClaimName`
+ * (`vendor/paperclip-adapter-claude-k8s/src/server/workspace-pvc.ts`), and the
+ * server does not import vendor code at runtime. Two places computing a claim
+ * name independently is exactly how a Job ends up mounting a claim nothing
+ * provisioned — which is why the duplication is pinned by a source-agreement
+ * test (`isolation-reclaim-claims.test.ts`) that reads the adapter's own
+ * source, on the `orphan-artifact-path-agreement.test.ts` precedent, rather
+ * than by this comment.
+ *
+ * The failure this guards is quiet in the worse direction: a drifted prefix
+ * does not throw, it names a claim that does not exist, and the reclaim Job
+ * then sits `Pending` on an unbound PVC while the real tree keeps growing and
+ * the sweep reports that it launched.
+ */
+export const AGENT_WORKSPACE_CLAIM_PREFIX = "agent-workspace-";
+
+/**
+ * Every claim holding an isolation tree this server cannot walk.
+ *
+ * This is the input the reclaim driver needs and the one
+ * `createDbUnreachableAgentCount` deliberately does not produce. The gauge
+ * answers "is there a gap"; a sweep needs "which volumes, by name". They are
+ * computed from the same two arms and must not drift, but they are different
+ * questions and the arms do not answer them equally well.
+ *
+ * **Arm B is enumerable here even though it is UNKNOWN there, and that
+ * asymmetry is the point.** `createDbUnreachableAgentCount` returns
+ * `UNREACHABLE_AGENTS_UNKNOWN` for a k8s environment naming a claim because it
+ * cannot say WHICH AGENTS land on it — the environment is chosen per run
+ * (`executionWorkspaceSettings.environmentId` overrides
+ * `agents.defaultEnvironmentId`), so no agent-shaped count is sound. But the
+ * CLAIM NAME is a literal in `environments.config`, and it is the claim, not
+ * the agent, that this sweep mounts. So the gauge's blind spot is not the
+ * reclaimer's: a tree the gauge can only report doubt about is one this
+ * function can name and reclaim. Do not "fix" the gauge by reading this
+ * function's output into it — the count it owes is of agents, and that is
+ * still underivable.
+ *
+ * The arm-B caveat recorded on the gauge carries over unchanged: `driver =
+ * 'k8s'` is necessary but not sufficient, so an environment only ever bound to
+ * non-k8s adapters yields a claim that moves no Job. Here that is a wasted
+ * inventory Job against a PVC that may not exist, not a wrong deletion — the
+ * executor's own allowlist and `lastUsedAt` predicate still gate every unlink
+ * — so it is tolerated for the same reason, and for the extra one that a
+ * claim named by an operator is the last thing to silently skip.
+ *
+ * **`selfClaimName` is REQUIRED, where the gauge's is optional, and the
+ * direction of the unknown flips.** For a gauge, "I do not know my own claim"
+ * must fail open — count a claim that might be mine, over-report doubt. For a
+ * list that launches `rm -rf`, failing open means launching a deletion Job
+ * against the volume the mounted sweep is already walking: two sweeps racing
+ * on one tree, with no cross-process re-read between them (the whole reason
+ * `DEFAULT_MAX_PLAN_AGE_MS` exists). So the caller must state it. Passing
+ * `null` is a deliberate "this deployment holds no claim to exclude", not a
+ * shrug — and the driver is the one caller that can always answer, because it
+ * holds a Kubernetes client by necessity and the adapter resolves the server's
+ * own claim from a live pod read (`k8s-client.ts`). The thing the gauge could
+ * not get is free to the driver.
+ *
+ * **Deduped by claim name, and that is correctness rather than tidiness.** Two
+ * agents can name one claim, and an environment can name a claim an agent
+ * already names. Launching two Jobs against one `ReadWriteMany` PVC gets two
+ * executors unlinking the same tree from two plans built at different
+ * instants, which is precisely the concurrent-sibling case
+ * `seed-writable-dirs` was refused over. First writer wins so the more
+ * specific attribution survives: an agent-attributed row is never replaced by
+ * an environment row naming the same claim.
+ *
+ * Not filtered by `agents.status` / `environments.status`, matching the gauge:
+ * a paused agent's tree is exactly as unreachable, and is the one least likely
+ * to be noticed.
+ */
+export async function listReclaimableClaims(
+  db: Db,
+  selfClaimName: string | null,
+): Promise<ReclaimableClaim[]> {
+  const self = selfClaimName?.trim() || null;
+  const byClaim = new Map<string, ReclaimableClaim>();
+  // First writer wins, so call order encodes attribution preference: agent
+  // rows are added before environment rows.
+  const add = (claim: ReclaimableClaim): void => {
+    if (!claim.claimName || claim.claimName === self) return;
+    if (!byClaim.has(claim.claimName)) byClaim.set(claim.claimName, claim);
+  };
+
+  const agentRows = await db
+    .select({ id: agents.id, config: agents.adapterConfig })
+    .from(agents)
+    .where(
+      // Same two predicates as the gauge's arm A, including `= 'true'::jsonb`
+      // rather than a text comparison: only a JSON boolean `true` opts an
+      // agent in, mirroring `asBoolean`. A looser match would name a claim
+      // that no Job mounts.
+      sql`${agents.adapterConfig} -> ${PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY}::text = 'true'::jsonb
+          OR (btrim(coalesce(${agents.adapterConfig} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text, '')) <> ''
+              AND btrim(${agents.adapterConfig} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text) IS DISTINCT FROM ${self})`,
+    );
+
+  for (const row of agentRows) {
+    const config = (row.config ?? {}) as Record<string, unknown>;
+    // An explicit claim WINS over the derived one, matching the adapter: the
+    // manifest builder reads `workspaceVolumeClaim` as an override, so an
+    // agent carrying both is on the named volume and the derived name is a
+    // claim nothing mounts.
+    const named = typeof config[WORKSPACE_VOLUME_CLAIM_CONFIG_KEY] === "string"
+      ? (config[WORKSPACE_VOLUME_CLAIM_CONFIG_KEY] as string).trim()
+      : "";
+    if (named) {
+      add({ claimName: named, source: "agent_workspace_claim", agentId: row.id });
+      continue;
+    }
+    if (config[PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY] !== true) continue;
+    const derived = deriveAgentWorkspaceClaimName(row.id);
+    // An id that cannot be slugged is skipped rather than thrown on. The
+    // adapter THROWS here, and deliberately — there, refusing is what stops an
+    // opted-in Job silently mounting the shared claim. Here the equivalent of
+    // that mistake is sweeping the wrong volume, and skipping is what avoids
+    // it; one unslugabble id must not take the whole sweep down with it.
+    if (derived) add({ claimName: derived, source: "agent_per_agent_volume", agentId: row.id });
+  }
+
+  const envRows = await db
+    .select({ config: environments.config })
+    .from(environments)
+    .where(
+      sql`${environments.driver} = 'k8s'
+          AND btrim(coalesce(${environments.config} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text, '')) <> ''
+          AND btrim(${environments.config} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text) IS DISTINCT FROM ${self}`,
+    );
+
+  for (const row of envRows) {
+    const config = (row.config ?? {}) as Record<string, unknown>;
+    const named = typeof config[WORKSPACE_VOLUME_CLAIM_CONFIG_KEY] === "string"
+      ? (config[WORKSPACE_VOLUME_CLAIM_CONFIG_KEY] as string).trim()
+      : "";
+    if (named) add({ claimName: named, source: "environment_claim", agentId: null });
+  }
+
+  return [...byClaim.values()];
+}
+
+/**
+ * The server's copy of the adapter's claim-name derivation.
+ *
+ * Returns `""` for an id that carries no DNS-1123 characters, where the
+ * adapter throws — see the call site for why the two differ. Kept beside
+ * `AGENT_WORKSPACE_CLAIM_PREFIX` so the agreement test has one place to read.
+ */
+function deriveAgentWorkspaceClaimName(agentId: string): string {
+  const slug = (agentId ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9-]/g, "")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 200);
+  return slug ? `${AGENT_WORKSPACE_CLAIM_PREFIX}${slug}` : "";
 }
 
 export interface IsolationWorkspaceReapOptions {
