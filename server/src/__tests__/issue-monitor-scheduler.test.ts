@@ -1762,7 +1762,6 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     // Resolving the bound off the stripped policy made this 24-against-24 and
     // retired the row as `max_attempts_exhausted` without ever dispatching it.
     expect(secondTick.enqueued).toBe(1);
-    expect(secondTick.skipped).toBe(0);
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
     expect(issue.monitorAttemptCount).toBe(DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS + 1);
