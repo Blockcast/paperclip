@@ -90,6 +90,7 @@ import {
   restoreCheckoutPromotedStatus,
 } from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
+import { captureTimedOutIssueListPlan } from "../lib/issue-list-timeout-explain.js";
 import { recordProjectPrimaryWorkspaceFallback } from "./metrics.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -8674,7 +8675,39 @@ export function issueService(db: Db) {
       // the mapper here would ship 1201 code points and no flag; it is also the path whose
       // description must stay byte-identical to `listBlockedInboxIssues` (the cross-endpoint
       // equality test couples them).
-      const rows = (await pageQuery).map((row: any) => ({
+      // PEN-5223: the ONE place that holds both the executed statement and its
+      // parameters. `auto_explain` cannot log a statement cancelled by
+      // `statement_timeout` (the portal is left PORTAL_FAILED, so `ExecutorEnd`
+      // — its only emit site — never runs), so this await is the only seam from
+      // which the >30s issues-list plan is reachable at all. Default-off; see
+      // `captureTimedOutIssueListPlan` for why the captured plan is the plan
+      // production chose rather than a proxy for it.
+      //
+      // `list()` is deliberately NOT wrapped in `withDbRetry`, so a 57014
+      // surfaces here once. Adding a retry wrapper above this would fire the
+      // capture per attempt — bound it there if that ever changes.
+      let pageRows: any[];
+      try {
+        pageRows = await pageQuery;
+      } catch (error) {
+        // Deliberately NOT awaited. The tenant's request has already failed;
+        // awaiting would add pool-checkout wait plus up to 2s of planning to a
+        // response that is going to be a 503 either way — and a 57014 burst is
+        // exactly when the pool is most contended. `captureTimedOutIssueListPlan`
+        // never rejects (it swallows everything), so this cannot become an
+        // unhandled rejection.
+        void captureTimedOutIssueListPlan({
+          db,
+          query: pageQuery,
+          error,
+          companyId,
+          hasSearch,
+          // The LENGTH, never the term: these are user-entered search strings.
+          searchTermLength: rawSearch.length,
+        });
+        throw error;
+      }
+      const rows = pageRows.map((row: any) => ({
         ...row,
         ...projectIssueListDescription(row.description),
       }));
