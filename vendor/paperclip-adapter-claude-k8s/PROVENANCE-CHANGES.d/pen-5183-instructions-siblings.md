@@ -45,9 +45,58 @@ Deriving the set from the charter cannot be polluted by what the agent writes be
 
 Naming is necessary but not sufficient: each candidate must also resolve to a regular file inside
 the root. A named-but-absent file is simply not projected — an `items[]` entry whose key has no
-Secret value is a pod that cannot start, so inventing one would trade this bug for a worse one.
-`..` escapes are rejected on the resolved path, and the entry file is excluded from its own sibling
-set (it already travels as `agent-instructions.md`).
+Secret value is a pod that cannot start, so inventing one would trade this bug for a worse one. The
+entry file is excluded from its own sibling set (it already travels as `agent-instructions.md`).
+
+### ⛔ Containment is checked on REALPATHS, because the root is agent-writable
+
+The same premise that rules out a directory listing also rules out a **lexical** containment check,
+and the first revision of this change got that wrong (caught in review). `path.resolve` +
+`startsWith` proves nothing on its own, because the `stat` and the `readFile` that follow both
+**follow symlinks**. An agent could therefore name `HEARTBEAT.md` in its own charter, replace that
+name in its own tree with a link to another company's tree — or to any path the **server** process
+can read — and the server would copy those bytes into a Secret mounted in that agent's own pod.
+That crosses the server→pod boundary in the *agent's* favour, which is the reverse of what this
+channel is for.
+
+The module already had the right primitive, and this now reuses it rather than re-deriving a weaker
+one: `fs.realpath` the root once, `fs.realpath` each candidate, compare with `isWithinTree` (path
+**boundaries**, so `/agents/cto-evil` is not inside `/agents/cto`), and refuse an escape with
+`PromptBundleSymlinkEscapesTreeError` — already classified by `isProjectionRefusal`, so it reports
+as a typed `k8s_prompt_bundle_projection_refused` rather than an anonymous `adapter_failed`. The
+resolver returns `{ relPath, realPath }` and the caller **reads `realPath`**, which closes the
+second-traversal TOCTOU: re-joining `root + relPath` would walk the name again and could follow a
+link swapped since the check.
+
+Three dispositions, and the asymmetry between the first two is deliberate:
+
+| case | disposition | why |
+|---|---|---|
+| lexical `../x.md` in the charter text | **dropped** | the name regex is permissive by design, so this is ordinary prose quoting a path in another tree; it names a file the agent never claimed to hold, and refusing would abort runs that work today |
+| a named sibling that **is** a symlink resolving outside the root | **refused** | not prose, no innocent reading — and it delivers its target's bytes on today's shared claim, so stepping over it would *also* be a silent delivery regression |
+| a named sibling whose symlink dangles | **dropped** | delivers nothing to the pod today either, so it is the one symlink case that cannot be a delivery regression |
+
+A **within-tree** link is projected under the *link's* path carrying the *target's* bytes — matching
+`collectSkillFiles`, and matching what the pod reads on the shared claim today. `realpath`/`stat`
+failures are narrowed to `ENOENT`/`ENOTDIR`/`ELOOP`; `EACCES`, `EIO` and a transient CephFS fault
+are rethrown, because "absent" is a **silent** disposition here and a blanket catch would turn one
+blip into a missing instruction file that nothing recorded.
+
+### The set is derived from the CHARTER, not from the directive appended to it
+
+Also caught in review. `instructionsContents` is `raw + pathDirective`, and the foreign-claim
+directive **names `./HEARTBEAT.md`, `./SOUL.md` and `./TOOLS.md` itself**. Deriving the sibling set
+from that string therefore projects those three whenever they happen to exist, whether or not the
+charter ever mentioned one — the directive selecting its own payload, the sizing table above
+measured on a different set than the one that ships, and "derived from the charter" quietly ceasing
+to be true.
+
+`execute.ts` now passes the raw charter bytes separately as `instructionsEntryContents`, and the
+sibling derivation reads **only** that. The gate is a conjunction: withholding it degrades to the
+pre-PEN-5183 entry-file-alone shape rather than falling back to the delivered string, because that
+fallback is precisely the bug. The projection-level tests previously passed `fs.readFile(entryPath)`
+as *both* arguments, which is why this could not be seen; they now carry the production-shaped pair,
+with a `TOOLS.md` present in the tree and unnamed by the charter as the discriminator.
 
 **One level, deliberately.** Transitive references are not followed. `HEARTBEAT.md` names
 `HEARTBEAT-CASELAW.md`, and following that edge re-admits the 674 KB the table above rules out.
@@ -98,13 +147,16 @@ folded in here.
 
 ## Verification
 
-`tsc --noEmit` clean; full adapter suite green. **8 mutations, 8 caught**, each applied by a script
-that aborts loudly if the pattern did not match or the file did not change:
+`tsc --noEmit` clean; full adapter suite green (**35 files / 1977 tests**). **10 mutations, 10
+caught**, each applied by a script that aborts loudly if the pattern did not match or the file did
+not change:
 
 | mutation | caught by |
 |---|---|
 | drop the sibling projection block | `carries the named siblings beside the entry file` |
-| drop the `..` containment check | `refuses a reference that escapes the instructions root` |
+| disable the **realpath** containment check | `REFUSES a named sibling that is a symlink escaping the instructions root` |
+| derive from `instructionsContents` instead of the raw charter | 4 tests, incl. `derives the set from the CHARTER, not from the directive appended to it` |
+| drop the `..` containment check | `DROPS a lexical ../ reference that escapes the instructions root` |
 | drop the entry-file exclusion | `never projects the entry file as its own sibling` |
 | drop the sibling-count refusal | `refuses rather than truncating past the sibling ceiling` |
 | directive always takes the shared-claim form | `branches the directive on the claim` |

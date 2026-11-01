@@ -3192,9 +3192,17 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     selfPodPvcClaimName: selfPod.pvcClaimName,
   });
   let instructionsContents: string | null = null;
+  // Hoisted out of the try alongside `instructionsContents` (PEN-5183, Ally review). The
+  // sibling set must be derived from the charter's OWN bytes: `instructionsContents` is
+  // `raw + pathDirective`, and the foreign-claim directive below names `./HEARTBEAT.md`,
+  // `./SOUL.md` and `./TOOLS.md` itself — so deriving from it would project those three
+  // whether or not this agent's charter ever named one, with the directive selecting its
+  // own payload.
+  let instructionsEntryContents: string | null = null;
   if (instructionsFilePath) {
     try {
       const raw = await fs.readFile(instructionsFilePath, "utf-8");
+      instructionsEntryContents = raw;
       // Invariant 6 (PEN-5183). The shared-claim directive is kept BYTE-IDENTICAL — it is
       // correct there, and it is the negative control the done-when asks for.
       //
@@ -3372,6 +3380,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // ships today, and siblings only ship when the pod cannot reach the directory.
         instructionsRootPath,
         instructionsFilePath,
+        // The charter's raw bytes, NOT `instructionsContents`. See the hoist above.
+        instructionsEntryContents: instructionsEntryContents ?? undefined,
         serverDataMountPath: SELF_POD_DATA_MOUNT_PATH,
         catalogBackedSkillKeys,
       });

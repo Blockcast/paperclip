@@ -650,6 +650,20 @@ describe("resolveNamedInstructionSiblings — invariant 6 (PEN-5183)", () => {
     return { root, entry: path.join(root, "AGENTS.md") };
   }
 
+  /**
+   * The resolved RELATIVE paths only.
+   *
+   * `resolveNamedInstructionSiblings` returns `{ relPath, realPath }` so the caller can
+   * read the path whose containment was approved rather than re-joining the name. Most
+   * assertions below are about WHICH files are selected, so they project that away; the
+   * tests that care about the realpath read it explicitly.
+   */
+  async function siblingRelPaths(
+    input: Parameters<typeof resolveNamedInstructionSiblings>[0],
+  ): Promise<string[]> {
+    return (await resolveNamedInstructionSiblings(input)).map((entry) => entry.relPath);
+  }
+
   it("resolves the three forms a charter uses to name a sibling", async () => {
     const { root, entry: entryPath } = await writeCharter({
       "AGENTS.md": [
@@ -662,7 +676,7 @@ describe("resolveNamedInstructionSiblings — invariant 6 (PEN-5183)", () => {
       "TOOLS.md": "tools",
     });
     await expect(
-      resolveNamedInstructionSiblings({
+      siblingRelPaths({
         entryContents: await fs.readFile(entryPath, "utf-8"),
         instructionsRootPath: root,
         instructionsFilePath: entryPath,
@@ -683,7 +697,7 @@ describe("resolveNamedInstructionSiblings — invariant 6 (PEN-5183)", () => {
       "HEARTBEAT-CASELAW.md": "y".repeat(4096),
     });
     await expect(
-      resolveNamedInstructionSiblings({
+      siblingRelPaths({
         entryContents: await fs.readFile(entryPath, "utf-8"),
         instructionsRootPath: root,
         instructionsFilePath: entryPath,
@@ -700,7 +714,7 @@ describe("resolveNamedInstructionSiblings — invariant 6 (PEN-5183)", () => {
       "HEARTBEAT-CASELAW.md": "evidence",
     });
     await expect(
-      resolveNamedInstructionSiblings({
+      siblingRelPaths({
         entryContents: await fs.readFile(entryPath, "utf-8"),
         instructionsRootPath: root,
         instructionsFilePath: entryPath,
@@ -717,7 +731,7 @@ describe("resolveNamedInstructionSiblings — invariant 6 (PEN-5183)", () => {
       "HEARTBEAT.md": "checklist",
     });
     await expect(
-      resolveNamedInstructionSiblings({
+      siblingRelPaths({
         entryContents: await fs.readFile(entryPath, "utf-8"),
         instructionsRootPath: root,
         instructionsFilePath: entryPath,
@@ -725,7 +739,11 @@ describe("resolveNamedInstructionSiblings — invariant 6 (PEN-5183)", () => {
     ).resolves.toEqual(["HEARTBEAT.md"]);
   });
 
-  it("refuses a reference that escapes the instructions root", async () => {
+  it("DROPS a lexical `../` reference that escapes the instructions root", async () => {
+    // Dropped, not refused, and the asymmetry with the symlink case below is deliberate.
+    // The name regex is permissive on purpose, so a `../` token is ordinary charter prose
+    // quoting a path in another tree; refusing would abort runs that work today over a
+    // reference that names a file the agent never claimed to hold.
     const { root, entry: entryPath } = await writeCharter({
       "AGENTS.md": "read ../devops/HEARTBEAT.md",
       "HEARTBEAT.md": "mine",
@@ -737,8 +755,65 @@ describe("resolveNamedInstructionSiblings — invariant 6 (PEN-5183)", () => {
       instructionsRootPath: root,
       instructionsFilePath: entryPath,
     });
-    expect(resolved).not.toContain("../devops/HEARTBEAT.md");
-    expect(resolved.every((rel) => !rel.includes(".."))).toBe(true);
+    expect(resolved.map((entry) => entry.relPath)).toEqual([]);
+  });
+
+  it("REFUSES a named sibling that is a symlink escaping the instructions root", async () => {
+    // ⛔ The containment check that matters. The instructions root is AGENT-WRITABLE, and
+    // both the stat and the read follow links — so without a realpath check an agent could
+    // name `HEARTBEAT.md`, point it at another agent's tree (or anything the SERVER can
+    // read) and have those bytes delivered into a Secret mounted in its own pod.
+    const { root, entry: entryPath } = await writeCharter({
+      "AGENTS.md": "read ./HEARTBEAT.md",
+    });
+    const foreign = path.join(tmpRoot, "agents", "devops");
+    await fs.mkdir(foreign, { recursive: true });
+    await fs.writeFile(path.join(foreign, "secrets.md"), "another agent's bytes", "utf-8");
+    await fs.symlink(path.join(foreign, "secrets.md"), path.join(root, "HEARTBEAT.md"));
+    await expect(
+      resolveNamedInstructionSiblings({
+        entryContents: await fs.readFile(entryPath, "utf-8"),
+        instructionsRootPath: root,
+        instructionsFilePath: entryPath,
+      }),
+    ).rejects.toBeInstanceOf(PromptBundleSymlinkEscapesTreeError);
+  });
+
+  it("projects a WITHIN-tree symlink under the link's path, carrying the target's bytes", async () => {
+    // The other half of the symlink rule, and the half that keeps this from being a
+    // delivery regression: a link inside the tree already delivers its target's bytes on
+    // today's shared claim, so it must keep doing so here. `realPath` is the resolved
+    // target, which is what the caller reads.
+    const { root, entry: entryPath } = await writeCharter({
+      "AGENTS.md": "read ./HEARTBEAT.md",
+      "canonical/checklist.md": "the real checklist",
+    });
+    await fs.symlink(path.join(root, "canonical", "checklist.md"), path.join(root, "HEARTBEAT.md"));
+    const resolved = await resolveNamedInstructionSiblings({
+      entryContents: await fs.readFile(entryPath, "utf-8"),
+      instructionsRootPath: root,
+      instructionsFilePath: entryPath,
+    });
+    expect(resolved.map((entry) => entry.relPath)).toEqual(["HEARTBEAT.md"]);
+    await expect(fs.readFile(resolved[0]!.realPath, "utf-8")).resolves.toBe("the real checklist");
+  });
+
+  it("drops a named sibling whose symlink dangles, rather than refusing", async () => {
+    // A dangling link delivers nothing to the pod today either, so stepping over it is
+    // the one symlink case that cannot be a delivery regression — and refusing would
+    // abort runs that currently work. Same disposition as `collectSkillFiles`.
+    const { root, entry: entryPath } = await writeCharter({
+      "AGENTS.md": "read ./HEARTBEAT.md and ./SOUL.md",
+      "SOUL.md": "persona",
+    });
+    await fs.symlink(path.join(root, "nowhere.md"), path.join(root, "HEARTBEAT.md"));
+    await expect(
+      siblingRelPaths({
+        entryContents: await fs.readFile(entryPath, "utf-8"),
+        instructionsRootPath: root,
+        instructionsFilePath: entryPath,
+      }),
+    ).resolves.toEqual(["SOUL.md"]);
   });
 
   it("never projects the entry file as its own sibling", async () => {
@@ -747,7 +822,7 @@ describe("resolveNamedInstructionSiblings — invariant 6 (PEN-5183)", () => {
       "SOUL.md": "persona",
     });
     await expect(
-      resolveNamedInstructionSiblings({
+      siblingRelPaths({
         entryContents: await fs.readFile(entryPath, "utf-8"),
         instructionsRootPath: root,
         instructionsFilePath: entryPath,
@@ -771,25 +846,43 @@ describe("resolveNamedInstructionSiblings — invariant 6 (PEN-5183)", () => {
 });
 
 describe("buildPromptBundleSecretProjection — instruction siblings (PEN-5183)", () => {
-  async function charter(): Promise<{ root: string; entry: string; contents: string }> {
+  /**
+   * The exact pair `execute()` hands over: `raw` for derivation, `raw + directive` for
+   * delivery.
+   *
+   * ⚠️ These are DIFFERENT STRINGS in production and the tests used to pass `raw` as
+   * both, which is why an earlier revision could derive the sibling set from the
+   * delivered bytes and still look correct. The directive below is the real
+   * foreign-claim one, including its literal mention of `./TOOLS.md` — and `TOOLS.md`
+   * exists in this tree while the charter never names it, so any derivation that reads
+   * the delivered string projects a file it should not.
+   */
+  async function charter(): Promise<{ root: string; entry: string; contents: string; delivered: string }> {
     const root = path.join(tmpRoot, "agents", "cto");
     await fs.mkdir(root, { recursive: true });
     const contents = "- `$AGENT_HOME/HEARTBEAT.md`\n- `$AGENT_HOME/SOUL.md`\n";
     await fs.writeFile(path.join(root, "AGENTS.md"), contents, "utf-8");
     await fs.writeFile(path.join(root, "HEARTBEAT.md"), "checklist", "utf-8");
     await fs.writeFile(path.join(root, "SOUL.md"), "persona", "utf-8");
-    return { root, entry: path.join(root, "AGENTS.md"), contents };
+    await fs.writeFile(path.join(root, "TOOLS.md"), "NOT NAMED BY THE CHARTER", "utf-8");
+    const delivered =
+      contents +
+      `\nThe above agent instructions were loaded from ${path.join(root, "AGENTS.md")} on the server. ` +
+      `The sibling instruction files it names — such as ./HEARTBEAT.md, ./SOUL.md and ./TOOLS.md — ` +
+      `have been delivered into the "${PROMPT_BUNDLE_INSTRUCTIONS_DIR}/" directory beside this file.`;
+    return { root, entry: path.join(root, "AGENTS.md"), contents, delivered };
   }
 
   it("carries the named siblings beside the entry file", async () => {
-    const { root, entry: entryPath, contents } = await charter();
+    const { root, entry: entryPath, contents, delivered } = await charter();
     const projection = await buildPromptBundleSecretProjection({
       companyId: "co",
       runLabel: "run",
       skills: [],
-      instructionsContents: contents,
+      instructionsContents: delivered,
       instructionsRootPath: root,
       instructionsFilePath: entryPath,
+      instructionsEntryContents: contents,
     });
     expect(projection!.items.map((i) => i.path)).toEqual([
       PROMPT_BUNDLE_INSTRUCTIONS_PATH,
@@ -803,32 +896,33 @@ describe("buildPromptBundleSecretProjection — instruction siblings (PEN-5183)"
   it("NEGATIVE CONTROL: omitting the root carries the entry file alone, exactly as before", async () => {
     // The pre-PEN-5183 projection, byte-for-byte. This is the shape the measurement
     // branch still takes, and the shape every caller with no root to offer keeps.
-    const { contents } = await charter();
+    const { delivered } = await charter();
     const projection = await buildPromptBundleSecretProjection({
       companyId: "co",
       runLabel: "run",
       skills: [],
-      instructionsContents: contents,
+      instructionsContents: delivered,
     });
     expect(projection!.items).toEqual([{ key: "bundle-0", path: PROMPT_BUNDLE_INSTRUCTIONS_PATH }]);
     expect(projection!.fileCount).toBe(1);
   });
 
   it("counts sibling bytes against the budget", async () => {
-    const { root, entry: entryPath, contents } = await charter();
+    const { root, entry: entryPath, contents, delivered } = await charter();
     const withSiblings = await buildPromptBundleSecretProjection({
       companyId: "co",
       runLabel: "run",
       skills: [],
-      instructionsContents: contents,
+      instructionsContents: delivered,
       instructionsRootPath: root,
       instructionsFilePath: entryPath,
+      instructionsEntryContents: contents,
     });
     const without = await buildPromptBundleSecretProjection({
       companyId: "co",
       runLabel: "run",
       skills: [],
-      instructionsContents: contents,
+      instructionsContents: delivered,
     });
     // "checklist" (9) + "persona" (7). The budget and the §4.2 escalation trigger are
     // both evaluated on `totalValueBytes`, so siblings must land in it or the trigger
@@ -837,18 +931,60 @@ describe("buildPromptBundleSecretProjection — instruction siblings (PEN-5183)"
   });
 
   it("refuses rather than truncating when a sibling pushes the run over budget", async () => {
-    const { root, entry: entryPath, contents } = await charter();
+    const { root, entry: entryPath, contents, delivered } = await charter();
     await fs.writeFile(path.join(root, "HEARTBEAT.md"), "x".repeat(4096), "utf-8");
     await expect(
       buildPromptBundleSecretProjection({
         companyId: "co",
         runLabel: "run",
         skills: [],
-        instructionsContents: contents,
+        instructionsContents: delivered,
         instructionsRootPath: root,
         instructionsFilePath: entryPath,
+        instructionsEntryContents: contents,
         maxBytes: 512,
       }),
     ).rejects.toBeInstanceOf(PromptBundleOverBudgetError);
+  });
+
+  it("derives the set from the CHARTER, not from the directive appended to it", async () => {
+    // The directive names `./TOOLS.md` and this tree has one, but the charter never
+    // mentions it. Deriving from the delivered string would project it — the directive
+    // selecting its own payload, and a budget measured on a different set than the one
+    // that ships. `instructionsEntryContents` is what keeps "derived from the charter"
+    // true, and this is the test that holds it.
+    const { root, entry: entryPath, contents, delivered } = await charter();
+    expect(delivered).toContain("./TOOLS.md");
+    const projection = await buildPromptBundleSecretProjection({
+      companyId: "co",
+      runLabel: "run",
+      skills: [],
+      instructionsContents: delivered,
+      instructionsRootPath: root,
+      instructionsFilePath: entryPath,
+      instructionsEntryContents: contents,
+    });
+    expect(projection!.items.map((i) => i.path)).toEqual([
+      PROMPT_BUNDLE_INSTRUCTIONS_PATH,
+      `${PROMPT_BUNDLE_INSTRUCTIONS_DIR}/HEARTBEAT.md`,
+      `${PROMPT_BUNDLE_INSTRUCTIONS_DIR}/SOUL.md`,
+    ]);
+  });
+
+  it("carries nothing but the entry file when the raw charter bytes are withheld", async () => {
+    // The gate is a conjunction: without `instructionsEntryContents` there is nothing to
+    // derive a charter-named set FROM, and falling back to `instructionsContents` is the
+    // bug above. Withholding it must therefore degrade to the pre-PEN-5183 shape rather
+    // than quietly re-admitting the directive's own three names.
+    const { root, entry: entryPath, delivered } = await charter();
+    const projection = await buildPromptBundleSecretProjection({
+      companyId: "co",
+      runLabel: "run",
+      skills: [],
+      instructionsContents: delivered,
+      instructionsRootPath: root,
+      instructionsFilePath: entryPath,
+    });
+    expect(projection!.items.map((i) => i.path)).toEqual([PROMPT_BUNDLE_INSTRUCTIONS_PATH]);
   });
 });
