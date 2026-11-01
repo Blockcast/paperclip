@@ -543,7 +543,13 @@ export async function listReclaimableClaims(
       sql`${agents.adapterConfig} -> ${PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY}::text = 'true'::jsonb
           OR (btrim(coalesce(${agents.adapterConfig} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text, '')) <> ''
               AND btrim(${agents.adapterConfig} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text) IS DISTINCT FROM ${self})`,
-    );
+    )
+    // Ordered because "first writer wins" below is an ATTRIBUTION rule, and an
+    // unordered scan makes it a coin flip: two agents naming one claim would
+    // hand `agentId` to whichever row the database returned first, which can
+    // change between runs with no change to the data. The claim SET is
+    // order-independent; the attribution and the returned order are not.
+    .orderBy(agents.id);
 
   for (const row of agentRows) {
     const config = (row.config ?? {}) as Record<string, unknown>;
@@ -560,11 +566,11 @@ export async function listReclaimableClaims(
     }
     if (config[PER_AGENT_WORKSPACE_VOLUME_CONFIG_KEY] !== true) continue;
     const derived = deriveAgentWorkspaceClaimName(row.id);
-    // An id that cannot be slugged is skipped rather than thrown on. The
+    // An id the adapter would REFUSE is skipped rather than thrown on. The
     // adapter THROWS here, and deliberately — there, refusing is what stops an
     // opted-in Job silently mounting the shared claim. Here the equivalent of
     // that mistake is sweeping the wrong volume, and skipping is what avoids
-    // it; one unslugabble id must not take the whole sweep down with it.
+    // it; one refused id must not take the whole sweep down with it.
     if (derived) add({ claimName: derived, source: "agent_per_agent_volume", agentId: row.id });
   }
 
@@ -575,7 +581,8 @@ export async function listReclaimableClaims(
       sql`${environments.driver} = 'k8s'
           AND btrim(coalesce(${environments.config} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text, '')) <> ''
           AND btrim(${environments.config} ->> ${WORKSPACE_VOLUME_CLAIM_CONFIG_KEY}::text) IS DISTINCT FROM ${self}`,
-    );
+    )
+    .orderBy(environments.id);
 
   for (const row of envRows) {
     const config = (row.config ?? {}) as Record<string, unknown>;
@@ -589,14 +596,39 @@ export async function listReclaimableClaims(
 }
 
 /**
+ * The adapter's label-value rule (`assertLabelSafeAgentId`), which it checks
+ * BEFORE deriving the name. Duplicated for the same reason the slug pipeline
+ * below is, and pinned by the same agreement test.
+ */
+const LABEL_SAFE_AGENT_ID = /^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$/;
+
+/**
  * The server's copy of the adapter's claim-name derivation.
  *
- * Returns `""` for an id that carries no DNS-1123 characters, where the
- * adapter throws — see the call site for why the two differ. Kept beside
- * `AGENT_WORKSPACE_CLAIM_PREFIX` so the agreement test has one place to read.
+ * Returns `""` wherever the adapter REFUSES, so that "name only what the
+ * adapter would have provisioned" holds for every input rather than for most
+ * of them. The two differ only in HOW they refuse — the adapter throws, this
+ * skips; see the call site for why.
+ *
+ * The label-value check is the load-bearing half. Ids like `-abc`, `abc_`, or
+ * anything over 63 characters slug CLEANLY, so without it this would return
+ * `agent-workspace-abc` for an agent the adapter threw on before provisioning
+ * anything — naming a claim that does not exist, which is the "Job sits
+ * `Pending` on an unbound claim" failure the caller's docstring warns about.
+ * UUID ids never reach either refusal; both are backstops.
+ *
+ * The empty-slug ternary is the adapter's own backstop carried over, and is
+ * UNREACHABLE for the reason it is unreachable there: a label-safe id starts
+ * with an alphanumeric, and an alphanumeric always survives the filter above.
+ * Kept because it guards this derivation directly rather than by implication.
+ *
+ * Kept beside `AGENT_WORKSPACE_CLAIM_PREFIX` so the agreement tests have one
+ * place to read.
  */
 function deriveAgentWorkspaceClaimName(agentId: string): string {
-  const slug = (agentId ?? "")
+  const id = agentId ?? "";
+  if (id.length > 63 || !LABEL_SAFE_AGENT_ID.test(id)) return "";
+  const slug = id
     .toLowerCase()
     .replace(/[^a-z0-9-]/g, "")
     .replace(/^-+|-+$/g, "")
