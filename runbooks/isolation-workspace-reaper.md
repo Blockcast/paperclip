@@ -40,8 +40,9 @@ to one metric: `sweeps_total{stop_reason="complete"}` and every `entries_total` 
 
 This matters most here because the Triage block is step 0 of a
 `PaperclipIsolationWorkspaceReaperCoverageGap` investigation, where a zero reads as *"the reaper
-did nothing"* for a sweep that ran and worked — the fails-toward-broken direction, which costs an
-operator a wrong diagnosis rather than a missed one, but at the worst-placed surface on the page.
+did nothing"* for a sweep that ran and worked. **That is a false "the reaper is dead" reading, not
+a missed outage** — a wrong diagnosis rather than an absent one, and it lands on the sentence an
+operator reads first.
 
 ⚠ **The fix is not a `max_over_time` substitution.** On a counter it reports the *current
 process's* high-water mark, which after a restart is a partial total and not a window total. It is
