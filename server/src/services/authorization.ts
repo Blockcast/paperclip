@@ -1957,6 +1957,29 @@ export function authorizationService(db: Db) {
     // the string `agent_config:read` therefore always comes back empty, for an
     // entitled principal exactly as much as for a denied one (PEN-4775).
     // Keep in step with docs/security/agent-config-read-model.md.
+    //
+    // The two tiers do NOT imply the same read, and that asymmetry is the
+    // point (PEN-5231). `agents:configure` is company-reaching on both sides,
+    // so its read matches its write and the symmetry is correct.
+    // `agents:suggest-changes` is the consented-diff tier: its WRITE is bound
+    // to named target keys, to a run, and to an accepted consent record
+    // (`decideWithProtectedChangeGrants` + `assertCanApplyProtectedAgentChange`).
+    // Its read is therefore admitted only against ONE NAMED SUBJECT — the
+    // agent being diffed — and never against a `company` resource, which is
+    // what the bulk config-list routes pass. Before PEN-5231 the suggest tier
+    // bought the same unconditional company-wide read as `agents:configure`,
+    // i.e. read authority strictly exceeding its own write authority, which is
+    // the divergence the PEN-3206 §5 test condemns.
+    //
+    // RESIDUAL, deliberately not closed here: this admits the subject, not the
+    // diff. Binding the read to an accepted consent record is infeasible
+    // today and would brick the tier — `changeConsentGateService.assertConsented`
+    // requires a consent created in a PREVIOUS run whose payload already
+    // DISPLAYS a diff, and it CONSUMES the record on use. An agent cannot
+    // display a diff it was never allowed to read, so a consent-gated read has
+    // no first step. Tracked separately; do not "finish the job" by calling
+    // `assertConsented` from a read path, which would also burn the one-shot
+    // token the subsequent write needs.
     async function decideWithAgentConfigReadGrant(
       principalType: PrincipalType,
       principalId: string,
@@ -1981,7 +2004,21 @@ export function authorizationService(db: Db) {
         permissionKey: "agents:suggest-changes",
         scope: input.scope,
       });
-      if (suggestDecision.allowed || suggestDecision.reason === "deny_missing_grant") {
+      if (suggestDecision.allowed) {
+        if (input.resource.type === "agent" && input.resource.agentId) {
+          return suggestDecision;
+        }
+        return deny({
+          action: input.action,
+          reason: "deny_scope",
+          explanation:
+            "Permission agents:suggest-changes reads the configuration of one named agent — the subject of a "
+            + "proposed diff — and does not carry a company-wide configuration read. Request this read against a "
+            + "specific agent, or hold agents:configure.",
+          grant: suggestDecision.grant,
+        });
+      }
+      if (suggestDecision.reason === "deny_missing_grant") {
         return suggestDecision;
       }
       return configureDecision;
