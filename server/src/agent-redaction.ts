@@ -102,9 +102,57 @@ export function keepSanitizedAgentMetadata(meta: unknown): unknown {
  *
  * Coverage is the sanitizer's, not this function's: `{type:"plain",value}`
  * bindings, `env` maps, Tier-1 key names at any depth, URI-embedded
- * credentials and JWT-shaped strings are masked. A bare string under an
- * innocuous key (`metadata.note = "sk-ant-…"`) matches no rule and survives —
- * closing that needs a write-side key allowlist, not a read-side redactor.
+ * credentials and JWT-shaped strings are masked — the last two at *any* key,
+ * so the Tier-0 fallthrough is not shape-blind.
+ *
+ * What survives is narrower than "a bare string", and sharper: a *non-JWT,
+ * non-URI* credential under an innocuous key, at any depth. Measured, not
+ * inferred (PEN-5253): `{note: "sk-ant-…"}`, `{note: "AKIA…"}` and a whole
+ * PEM private-key block all egress verbatim, while `{token: …}`,
+ * `{secret: …}`, a JWT and a `user:pass@` URI do not.
+ *
+ * That residual is ACCEPTED AND UNENFORCED — a decision, not a pending fix.
+ * `agents.metadata` is contractually non-secret-bearing: nothing stops a
+ * caller storing a credential under an innocuous key, and nothing will.
+ * Decided for the sanitizer's admission generally, so it covers all three
+ * columns `sanitizeRecord` serves. `adapterConfig` / `runtimeConfig` are not
+ * differently covered here; they differ only in that their *designed*
+ * credential channels — `env`, `headers`, `{type:"plain"}` bindings — are
+ * masked structurally, whereas `metadata` has no designed credential channel
+ * at all.
+ *
+ * Two measured reasons, so neither is re-litigated here:
+ *
+ *  - A value-shape test cannot be both safe and complete at a Tier-0 key.
+ *    `looksLikeCredentialValue` (`redaction.ts`) is exactly that instrument
+ *    and already runs — but only behind a Tier-1/2 *key* match, which is why
+ *    `{secret: "sk-ant-…"}` is masked and `{note: …}` is not. Run as-is at
+ *    every key it blanks 7 of 12 real stored config values, including the
+ *    live `paperclipBuiltInAgent` marker this column exists to hold, plus
+ *    UUIDs and git SHAs. Narrowed to high-confidence prefixes it reaches 0
+ *    false positives but misses every *prefixless* secret — AWS secret access
+ *    keys, passphrases, hex HMAC keys, base64 blobs. Same dial, opposite
+ *    ends: the test is sound only where the KEY already says "secret", and
+ *    the residual is by construction where it does not.
+ *  - A write-side pass that *masked* would collide with the shared restore
+ *    path. All three columns route through {@link restoreRedactedAgentMetadata}
+ *    → {@link restoreRedactedAdapterValue}, and `containsRedactedAdapterValue`
+ *    SUBSTRING-tests for the sentinel — so a persisted mask makes that key
+ *    permanently unwritable: stored `***` restores from a prior that is itself
+ *    `***`, with no escape hatch for a false positive. Masking is therefore
+ *    out, and *vaulting* (PEN-3726 tick 4's named instrument) needs a
+ *    secret-store binding this column does not have.
+ *
+ * An earlier revision of this docblock said closing the residual "needs a
+ * write-side key allowlist, not a read-side redactor". Both halves were
+ * wrong, in opposite directions: a key allowlist was already rejected
+ * (PEN-3726 tick 4 — `pluginManagedAgent` needs arbitrary keys), and a
+ * read-side value-shape pass *can* see this case. It is not that no control
+ * could reach it; it is that every control that reaches it costs more than
+ * the hazard, which has no confirmed instance.
+ * `__tests__/agent-secret-redaction.test.ts` pins both sides of this
+ * boundary, so a future shape pass fails a test rather than silently
+ * widening the column.
  */
 export function containAgentMetadata(value: unknown): unknown {
   // `?? {}` is a type narrowing, not a live branch: the argument is always a

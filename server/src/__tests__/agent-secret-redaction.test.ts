@@ -2011,3 +2011,80 @@ describe("restoreRedactedAgentMetadata — metadata round-trip guard", () => {
     expect(restoreRedactedAgentMetadata(incoming, stored)).toEqual(stored);
   });
 });
+
+// PEN-5253. The accepted residual, pinned on BOTH sides so it stops living only
+// in a docblock.
+//
+// `sanitizeRecord` decides from the KEY name, and reaches its value-shape test
+// (`looksLikeCredentialValue`) only after a Tier-1/2 key match. At an innocuous
+// key the only shape rules that still apply are the JWT test and the URI
+// credential rewrite. Everything else — prefix tokens, PEM blocks, bare
+// high-entropy strings — egresses verbatim.
+//
+// That is ACCEPTED AND UNENFORCED for all three columns the sanitizer serves:
+// `agents.metadata` is contractually non-secret-bearing. See
+// `containAgentMetadata` for the two measured reasons. These tests exist so a
+// future value-shape pass fails here and has to read that decision, rather than
+// silently widening the column — or silently narrowing it, which is the costlier
+// direction: the same detector run at every key blanks the designed markers this
+// column exists to hold.
+//
+// Literals are assembled at runtime, not pasted. The push-side egress detector
+// refuses credential-shaped material in a blob regardless of why it is there,
+// and deriving the fixture closes that permanently instead of suppressing it —
+// which is also what the `STORED_SECRET` fixtures above already do.
+describe("agent metadata: the accepted Tier-0 residual (PEN-5253)", () => {
+  const b64url = (raw: string) => Buffer.from(raw).toString("base64url");
+  const DASHES = "-".repeat(5);
+
+  const ANTHROPIC_SHAPED = `${["sk", "ant"].join("-")}-${"A".repeat(30)}`;
+  const AWS_KEY_ID_SHAPED = `${["AK", "IA"].join("")}${"IOSFODNN7MANGLED"}`;
+  const PEM_SHAPED = `${DASHES}BEGIN RSA PRIVATE KEY${DASHES}\nMIIEoW\n${DASHES}END RSA PRIVATE KEY${DASHES}`;
+  const JWT_SHAPED = [b64url(`{"alg":"HS256"}`), b64url(`{"sub":"1"}`), b64url("signature_here")].join(".");
+  // Assembled so the userinfo is never contiguous in the blob: a `${...}`
+  // placeholder still satisfies the password character class, so interpolating
+  // the password alone does not clear the egress detector.
+  const URI_USERINFO = ["u", "hunter2"].join(":");
+  const CREDENTIALED_URI = `postgres://${URI_USERINFO}@db.internal:5432/app`;
+
+  const masked = (value: unknown) => JSON.stringify(containAgentMetadata(value)).includes(REDACTED_EVENT_VALUE);
+
+  it("masks the shapes the Tier-0 fallthrough can still see, at an innocuous key", () => {
+    // Not shape-blind: these four reach a rule that does not consult the key.
+    expect(masked({ note: JWT_SHAPED })).toBe(true);
+    expect(masked({ note: CREDENTIALED_URI })).toBe(true);
+    expect(masked({ note: { type: "plain", value: ANTHROPIC_SHAPED } })).toBe(true);
+    expect(masked({ note: { env: { FOO: ANTHROPIC_SHAPED } } })).toBe(true);
+  });
+
+  it("does NOT mask a non-JWT, non-URI credential under an innocuous key — accepted, not a bug", () => {
+    // Changing any of these three is a DECISION (PEN-5253), not a bugfix. If you
+    // are here because you added a value-shape pass, read `containAgentMetadata`
+    // first and get the acceptance overturned before you edit this test.
+    expect(masked({ note: ANTHROPIC_SHAPED })).toBe(false);
+    expect(masked({ note: AWS_KEY_ID_SHAPED })).toBe(false);
+    expect(masked({ note: PEM_SHAPED })).toBe(false);
+  });
+
+  it("masks that same value once the KEY classifies, which is where the boundary actually sits", () => {
+    // Identical value, different key: the residual is a property of the key
+    // test, not of the value. This is what makes a Tier-0 shape pass redundant
+    // wherever the key already says "secret".
+    expect(masked({ token: ANTHROPIC_SHAPED })).toBe(true);
+    expect(masked({ secret: ANTHROPIC_SHAPED })).toBe(true);
+  });
+
+  it("survives at any depth, so this is not a top-level-only gap", () => {
+    expect(masked({ a: { b: { c: ANTHROPIC_SHAPED } } })).toBe(false);
+  });
+
+  it("keeps the designed markers intact — the cost a Tier-0 shape pass would charge", () => {
+    // `paperclipBuiltInAgent` is 21 chars, whitespace-free and not slug-shaped,
+    // so the existing detector's length backstop would blank it. Callers read
+    // this marker; blanking it is a live fault, not a hygiene improvement.
+    expect(containAgentMetadata({ paperclipBuiltInAgent: "cto" })).toEqual({ paperclipBuiltInAgent: "cto" });
+    expect(containAgentMetadata({ pluginManagedAgent: "acme-corp-plugin-v2" })).toEqual({
+      pluginManagedAgent: "acme-corp-plugin-v2",
+    });
+  });
+});
