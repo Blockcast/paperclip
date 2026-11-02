@@ -1,4 +1,4 @@
-import { describe, expect, it, afterEach } from "vitest";
+import { describe, expect, it, afterEach, vi } from "vitest";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +15,7 @@ describe("orphaned run terminal result recovery", () => {
   const previousBasePath = process.env.RUN_LOG_BASE_PATH;
 
   afterEach(() => {
+    vi.restoreAllMocks();
     if (previousBasePath === undefined) delete process.env.RUN_LOG_BASE_PATH;
     else process.env.RUN_LOG_BASE_PATH = previousBasePath;
   });
@@ -171,5 +172,16 @@ describe("orphaned run terminal result recovery", () => {
       recursive: true,
     });
     expect(await readOrphanedRunTerminalResult(input)).toMatchObject({ outcome: "absent" });
+  });
+
+  // BLO-51107: a stalled shared-volume read once held the start-lock reap for
+  // up to 776 s. The reader must give up and keep the run's job_missing verdict.
+  it("gives up as timed_out when the artifact read stalls", async () => {
+    const input = await seedArtifact(JSON.stringify({ type: "result", subtype: "success", is_error: false }));
+    vi.spyOn(fs, "stat").mockImplementation(() => new Promise(() => {}));
+    expect(await readOrphanedRunTerminalResult(input, { deadlineMs: 20 })).toEqual({
+      outcome: "absent",
+      reason: "timed_out",
+    });
   });
 });

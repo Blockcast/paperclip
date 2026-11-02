@@ -37,8 +37,24 @@ const TERMINAL_RESULT_TAIL_BYTES = 256 * 1024;
 /** Pod-written sibling of the server's own `<runId>.ndjson` run log. */
 const POD_LOG_SUFFIX = ".pod.ndjson";
 
+/**
+ * BLO-51107. This read runs inside the start-lock-held orphan reap, so a
+ * stalled shared-volume read holds dispatch for every agent. Measured
+ * 2026-11-02: single reads took 100-776 s and pushed reap waiters past their
+ * 120 s bound. Past this deadline the run is treated as `absent`, i.e. it keeps
+ * its `job_missing` verdict -- the same outcome as before PEN-2421 existed.
+ *
+ * ponytail: the abandoned fs call keeps its libuv thread until the kernel
+ * returns; only the sweep stops waiting. Add a per-sweep circuit breaker if
+ * timeouts stack within one sweep.
+ */
+export const TERMINAL_RESULT_READ_DEADLINE_MS = 5_000;
+
 export type OrphanedRunTerminalResult =
-  | { outcome: "absent"; reason: "no_artifact" | "empty_artifact" | "no_result_event" | "unreadable" }
+  | {
+      outcome: "absent";
+      reason: "no_artifact" | "empty_artifact" | "no_result_event" | "unreadable" | "timed_out";
+    }
   | { outcome: "found"; succeeded: boolean; subtype: string | null; artifactPath: string };
 
 export function runLogBasePath() {
@@ -108,7 +124,25 @@ function readOptionalString(value: unknown) {
  * verdict only, so a recovered outcome cannot leak agent output into logs or run
  * records.
  */
-export async function readOrphanedRunTerminalResult(input: {
+export async function readOrphanedRunTerminalResult(
+  input: { companyId: string; agentId: string; runId: string },
+  options: { deadlineMs?: number } = {},
+): Promise<OrphanedRunTerminalResult> {
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<OrphanedRunTerminalResult>((resolve) => {
+    timer = setTimeout(
+      () => resolve({ outcome: "absent", reason: "timed_out" }),
+      options.deadlineMs ?? TERMINAL_RESULT_READ_DEADLINE_MS,
+    );
+  });
+  try {
+    return await Promise.race([readTerminalResult(input), timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readTerminalResult(input: {
   companyId: string;
   agentId: string;
   runId: string;
