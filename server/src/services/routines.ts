@@ -526,6 +526,13 @@ function nextResultText(status: string, issueId?: string | null) {
   if (status === "skipped_paused") return "Skipped because the project is paused";
   if (status === "skipped") return "Skipped because a live execution issue already exists";
   if (status === "completed") return "Execution issue completed";
+  // PEN-5281: `blocked` on this fleet is usually a temporary wait on a
+  // dependency, not a failed firing. The run row still goes `failed` (it did
+  // before this issue too), but the trigger is the carrier-health surface, and
+  // reporting a waiting routine as failed there is the same habituation risk
+  // that made the stale "Execution failed" expensive in the first place.
+  if (status === "blocked") return "Execution issue blocked";
+  if (status === "cancelled") return "Execution issue cancelled";
   if (status === "failed") return "Execution failed";
   return status;
 }
@@ -2382,31 +2389,37 @@ export function routineService(
   // trigger, so `lastResult` reports what the execution issue actually did
   // rather than whatever the dispatch attempt last wrote there.
   //
-  // Guarded on this run still being the trigger's newest fire. A later firing
-  // owns the trigger's reported outcome, and rewriting it from an older run
-  // would both clobber that result and rewind `lastFiredAt` -- the same
-  // don't-clobber-a-newer-fire rule `reconcileRolledBackDispatch` keeps.
-  // `issueId` and `nextRunAt` are deliberately left undefined so
-  // `lastEnqueuedAt` and `nextRunAt` are untouched: this is a correction to an
-  // already-recorded fire, not a new one.
+  // This writes `lastResult` and NOTHING else, deliberately. It is a correction
+  // to a fire that is already recorded, not a new fire, so every "when did this
+  // last run" column has to be left alone: `lastFiredAt`, `nextRunAt`,
+  // `lastEnqueuedAt`, and -- the one that is easy to miss -- the ROUTINE row's
+  // `lastTriggeredAt`. That is why this does not go through
+  // `updateRoutineTouchedState`, which always writes `routines.lastTriggeredAt`
+  // unconditionally (`:1443`). A newer fire on the same routine can come from a
+  // path this trigger knows nothing about -- a manual or API run, which carries
+  // `triggerId: null` but still advances `lastTriggeredAt`, or a second trigger
+  // on the routine -- so routing a correction through that helper would rewind
+  // the routine to an older fire and make a live routine read as if it had not
+  // run since. That is this very defect, one table over (Ally review, #3276).
+  //
+  // The newest-fire test is the UPDATE's own predicate rather than a preceding
+  // SELECT: check-then-act would still lose to a fire landing in between, and
+  // this costs one round trip instead of two.
   async function syncTriggerResultForFinalizedRun(
     run: typeof routineRuns.$inferSelect,
     status: string,
   ) {
     if (!run.triggerId) return;
-    const trigger = await db
-      .select({ id: routineTriggers.id, lastFiredAt: routineTriggers.lastFiredAt })
-      .from(routineTriggers)
-      .where(eq(routineTriggers.id, run.triggerId))
-      .then((rows) => rows[0] ?? null);
-    if (!trigger) return;
-    if (trigger.lastFiredAt && trigger.lastFiredAt.getTime() > run.triggeredAt.getTime()) return;
-    await updateRoutineTouchedState({
-      routineId: run.routineId,
-      triggerId: run.triggerId,
-      triggeredAt: run.triggeredAt,
-      status,
-    });
+    await db
+      .update(routineTriggers)
+      .set({ lastResult: nextResultText(status), updatedAt: new Date() })
+      .where(and(
+        eq(routineTriggers.id, run.triggerId),
+        or(
+          isNull(routineTriggers.lastFiredAt),
+          lte(routineTriggers.lastFiredAt, run.triggeredAt),
+        ),
+      ));
   }
 
   async function createWebhookSecret(
@@ -4212,18 +4225,27 @@ export function routineService(
       // is not handed keeps its old value -- a fire whose dispatch aborted
       // carries a `failureReason` from that abort, and omitting the key here
       // left the row reading `completed` with a stale failure string on it.
+      //
+      // `runStatus` and `triggerResult` are separate on purpose: the run row
+      // records `blocked`/`cancelled` as `failed` (it did before this issue
+      // too), while the trigger -- the carrier-health surface -- says which of
+      // the two actually happened.
       const outcome = issue.status === "done"
-        ? { status: "completed", failureReason: null }
+        ? { runStatus: "completed", failureReason: null, triggerResult: "completed" }
         : issue.status === "blocked" || issue.status === "cancelled"
-          ? { status: "failed", failureReason: `Execution issue moved to ${issue.status}` }
+          ? {
+              runStatus: "failed",
+              failureReason: `Execution issue moved to ${issue.status}`,
+              triggerResult: issue.status,
+            }
           : null;
       if (!outcome) return null;
       const run = await finalizeRun(issue.originRunId, {
-        status: outcome.status,
+        status: outcome.runStatus,
         failureReason: outcome.failureReason,
         completedAt: new Date(),
       });
-      if (run) await syncTriggerResultForFinalizedRun(run, outcome.status);
+      if (run) await syncTriggerResultForFinalizedRun(run, outcome.triggerResult);
       return run;
     },
   };
