@@ -2067,6 +2067,9 @@ describe("startServer feedback export wiring", () => {
     // The watchdog's threshold is `10 * interval`; overshoot it generously so
     // the assertion does not depend on wall-clock drift during the test.
     const pastStallMs = 10 * schedulerIntervalMs + 100000;
+    // Strictly after the crossing: the pass settles while already past the
+    // threshold, which is the whole point of the case.
+    const settleAtMs = pastStallMs + 20000;
     loadConfigMock.mockReturnValue(buildTestConfig({
       heartbeatSchedulerEnabled: true,
       heartbeatSchedulerIntervalMs: schedulerIntervalMs,
@@ -2113,6 +2116,16 @@ describe("startServer feedback export wiring", () => {
       expect(watchdogCallback).not.toBeNull();
       const stalledBefore = (await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)) ?? 0;
 
+      // Pin the clock BEFORE the pass starts, so `heartbeatRecoveryChainStartedAt`
+      // is stamped at a known origin and both the stall crossing and the settle
+      // below land on exact, asserted values rather than on real elapsed
+      // milliseconds. That matters most for the duration gauge: it is seeded
+      // with 0 at registry init, so a `>= 0` floor would pass even if the settle
+      // path never recorded at all.
+      const startedAt = Date.now();
+      let clock = startedAt;
+      nowSpy = vi.spyOn(Date, "now").mockImplementation(() => clock);
+
       // Park the chain's tail so a pass is genuinely outstanding.
       heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementationOnce(
         () => new Promise((resolve) => {
@@ -2122,21 +2135,21 @@ describe("startServer feedback export wiring", () => {
       intervalCallback?.();
       await vi.waitFor(() => expect(releaseTail).not.toBeNull());
 
-      // Jump the clock past the stall threshold and run one watchdog tick. Only
-      // the watchdog reads the clock here, so the spy is scoped to that call.
-      const realNow = Date.now();
-      nowSpy = vi.spyOn(Date, "now").mockReturnValue(realNow + pastStallMs);
+      // Jump the clock past the stall threshold and run one watchdog tick.
+      clock = startedAt + pastStallMs;
       watchdogCallback?.();
-      nowSpy.mockRestore();
-      nowSpy = null;
 
-      // The crossing is counted once, while the pass is still open.
+      // The crossing is counted once, while the pass is still open, and the
+      // in-flight gauge reports exactly how far past the threshold it is.
       expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)).toBe(stalledBefore + 1);
-      const inflightAtStall = (await readSeries(HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC)) ?? 0;
-      expect(inflightAtStall).toBeGreaterThanOrEqual(10 * (schedulerIntervalMs / 1000));
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC))
+        .toBe(pastStallMs / 1000);
 
       // Now the pass settles, which is the case the old help text said could
-      // not happen once this counter had moved.
+      // not happen once this counter had moved. Settling later than the
+      // crossing, so the duration asserted below cannot be confused with the
+      // in-flight value read at the crossing.
+      clock = startedAt + settleAtMs;
       releaseTail?.();
       releaseTail = null;
       await vi.waitFor(async () => {
@@ -2146,11 +2159,12 @@ describe("startServer feedback export wiring", () => {
       // A settle does NOT retract the increment -- the counter is monotonic, so
       // `stalled_total > 0` stays true forever and must not be used as an alert
       // condition. It also does not suppress the duration gauge: the pass
-      // completed and is reported like any other.
+      // completed and is reported like any other. Asserted as the exact value
+      // the settle path must have written, because the seeded 0 makes any
+      // not-null / `>= 0` check vacuous.
       expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)).toBe(stalledBefore + 1);
-      const duration = await readSeries(HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC);
-      expect(duration).not.toBeNull();
-      expect(duration).toBeGreaterThanOrEqual(0);
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC))
+        .toBe(settleAtMs / 1000);
     } finally {
       nowSpy?.mockRestore();
       releaseTail?.();
@@ -2261,10 +2275,11 @@ describe("startServer feedback export wiring", () => {
 
   // PEN-3314, from Ally's review of 0cbb0915 (Suggestion): raising the stall
   // report to `error` was right, but it fired once per watchdog sample for as
-  // long as the halt lasted. "Keeps saying so" is the correct intent — the halt
-  // does not resolve itself — but unbounded at `error` it is a page storm
-  // against a worker that is already down, and moving the watchdog to a shorter
-  // sampling period than the scheduler interval would have tripled it.
+  // long as the pass stayed open. "Keeps saying so" is the correct intent — the
+  // pass is still outstanding — but unbounded at `error` it is a page storm
+  // against a worker that may simply be slow (PEN-5259), and moving the
+  // watchdog to a shorter sampling period than the scheduler interval would
+  // have tripled it.
   //
   // This pins the compromise: the first crossing reports immediately, then at
   // most one line per re-log window, on its OWN clock rather than the sample
@@ -2306,7 +2321,7 @@ describe("startServer feedback export wiring", () => {
     };
 
     const stallMessage =
-      "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running";
+      "periodic heartbeat recovery chain still in flight across many ticks; new recovery passes are skipped until it settles";
     const stallLogCount = () =>
       vi.mocked(logger.error).mock.calls.filter((call) => call[1] === stallMessage).length;
 
