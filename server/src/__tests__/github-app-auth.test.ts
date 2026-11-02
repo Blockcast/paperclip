@@ -235,6 +235,122 @@ describe("githubGetPullRequestGate", () => {
 });
 
 /**
+ * PEN-5254 — a 404 on `/pulls/{n}` has two opposite causes and only one of them is
+ * the caller's fault.
+ *
+ * `notFound` is the single result that reaches the file-time refusal, so it must be
+ * set ONLY when the repository is confirmed readable. The alternative — an App that
+ * is not installed, mid-reinstall, or whose access was revoked — 404s identically,
+ * and refusing that card would tell an agent its PR number is wrong when it is not.
+ *
+ * ⚠ The 404-only narrowness is the point and is pinned below. Keying the refusal on
+ * `retryable === false` instead would also catch 401 and non-rate-limit 403, so a
+ * broken installation token would refuse every PR-gated escalation at the door.
+ */
+describe("githubGetPullRequestGate 404 disambiguation", () => {
+  const stubFetch = (prStatus: number, repoStatus: number, repoBody: unknown = {}) => {
+    const fetchMock = vi.fn(async (url: string | URL) => {
+      const u = String(url);
+      if (u.includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      if (u.includes("/pulls/")) {
+        return jsonResponse({ message: "Not Found" }, false, prStatus);
+      }
+      return jsonResponse(repoBody, repoStatus >= 200 && repoStatus < 300, repoStatus);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  };
+
+  it("reports notFound only once the repository is confirmed readable", async () => {
+    setCreds();
+    const fetchMock = stubFetch(404, 200, { full_name: "Blockcast/paperclip" });
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 999999,
+    })).resolves.toEqual({ error: "pull_request_not_found", notFound: true });
+
+    // The repo probe is what makes the pull request's absence positive evidence.
+    expect(fetchMock.mock.calls.some(([url]) => /\/repos\/Blockcast\/paperclip$/.test(String(url))))
+      .toBe(true);
+  });
+
+  it.each([404, 403, 401])(
+    "withholds notFound when the repository answers %i",
+    async (repoStatus) => {
+      setCreds();
+      stubFetch(404, repoStatus);
+
+      const result = await githubGetPullRequestGate({
+        repoFullName: "Blockcast/private-repo",
+        prNumber: 1,
+      });
+
+      // Still an error, so every existing caller keeps deferring — but WITHOUT
+      // `notFound`, so the file-time guard lets the card through.
+      expect(result).toEqual({ error: `pull_request_repo_inaccessible_${repoStatus}` });
+      expect(result).not.toHaveProperty("notFound");
+    },
+  );
+
+  it("withholds notFound when the repository probe itself fails transiently", async () => {
+    setCreds();
+    stubFetch(404, 503);
+
+    const result = await githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1,
+    });
+    expect(result).not.toHaveProperty("notFound");
+    expect(result).toMatchObject({ error: expect.stringContaining("pull_request_repo") });
+  });
+
+  it.each([401, 403, 429, 500, 503])(
+    "never sets notFound for a %i, which is not a 404 at all",
+    async (prStatus) => {
+      setCreds();
+      // No repo probe should even be attempted: only a 404 is ambiguous.
+      const fetchMock = stubFetch(prStatus, 200, { full_name: "Blockcast/paperclip" });
+
+      const result = await githubGetPullRequestGate({
+        repoFullName: "Blockcast/paperclip",
+        prNumber: 847,
+      });
+
+      expect(result).not.toHaveProperty("notFound");
+      expect(fetchMock.mock.calls.some(([url]) => /\/repos\/Blockcast\/paperclip$/.test(String(url))))
+        .toBe(false);
+    },
+  );
+
+  it("threads the caller's signal into the repo probe as well as the PR read", async () => {
+    setCreds();
+    const signals: Array<AbortSignal | null | undefined> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      signals.push(init?.signal);
+      if (u.includes("/access_tokens")) {
+        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      }
+      if (u.includes("/pulls/")) return jsonResponse({ message: "Not Found" }, false, 404);
+      return jsonResponse({ full_name: "Blockcast/paperclip" });
+    }));
+
+    await githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 999999,
+      signal: AbortSignal.abort(new Error("already-aborted")),
+    });
+
+    // Three hops now (mint, PR, repo probe) and the probe is the one this PR adds.
+    expect(signals).toHaveLength(3);
+    expect(signals.every((signal) => signal?.aborted === true)).toBe(true);
+  });
+});
+
+/**
  * PEN-3487: whether a status context blocks the merge is per-repository, and a
  * reader of a red gate cannot derive it. Measured 2026-09-24,
  * `review/ally-complete` is one of ten required contexts on

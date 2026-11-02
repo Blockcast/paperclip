@@ -218,14 +218,22 @@ function budgetAssertionRefusal(type: string, payload: unknown) {
 // dead on arrival, reproducing PEN-5103 at the new default rate. The mirror below is
 // what keeps the door and the sweep agreeing for both kinds.
 //
-// Deliberately narrow, and deliberately fails OPEN. It refuses exactly one thing: a
-// gate that is *already terminal* — a finished run, or a pull request already merged
-// or already closed — which can never be acted on by anyone and so is never a
-// legitimate ask. It does NOT try to decide whether a live gate "relates to"
-// the ask — the ask is free text and that judgement is not mechanisable. A live gate,
-// an unreadable one, a rate-limited lookup, or any thrown error all pass: a throttled
-// GitHub must not be able to block escalations, the same fail-safe direction the
-// reconciler takes when it declines to retire gates it cannot read.
+// Deliberately narrow, and deliberately fails OPEN. It refuses exactly two things,
+// both of which describe a card that can never be acted on by anyone:
+//
+//   1. a gate that is *already terminal* — a finished run, or a pull request already
+//      merged or already closed;
+//   2. PEN-5254 — a `github_pr_merged` gate naming a pull request that DOES NOT EXIST,
+//      established by a 404 whose repository probe came back readable. That card is
+//      not dead on arrival, it is undead: nothing can ever resolve its gate, so every
+//      sweep defers it for ever.
+//
+// It does NOT try to decide whether a live gate "relates to" the ask — the ask is free
+// text and that judgement is not mechanisable. A live gate, a rate-limited lookup, a
+// 401, a 403, a 404 on a repository this installation cannot read, or any thrown error
+// all still pass: a throttled or mis-installed GitHub must not be able to block
+// escalations, the same fail-safe direction the reconciler takes when it declines to
+// retire gates it cannot read.
 async function gateAlreadyTerminalRefusal(payload: unknown) {
   const gate = parseApprovalGate(payload);
   if (!gate) return null;
@@ -249,10 +257,47 @@ async function gateAlreadyTerminalRefusal(payload: unknown) {
   } catch {
     return null;
   }
-  if (disposition.kind !== "terminal") return null;
 
   const ref = approvalGateRef(gate);
   const subject = gate.kind === "github_pr_merged" ? "pull request" : "run";
+  const gateDetail =
+    gate.kind === "github_actions_run"
+      ? { repoFullName: gate.repoFullName, runId: gate.runId }
+      : { repoFullName: gate.repoFullName, prNumber: gate.prNumber };
+
+  // PEN-5254: a gate naming a pull request that does not EXIST is refused too, and
+  // for a different reason than an already-terminal one. Such a card is filed `201`,
+  // then deferred by every sweep for ever — it can never be retired by its own gate,
+  // because there is nothing for the gate to resolve to. That is a worse outcome than
+  // the dead-on-arrival card this guard was built for: at least that one closes.
+  //
+  // ⚠ Narrow on purpose, and narrower than "the lookup failed". Only a 404 whose
+  // repository probe came back readable reaches here (see `classifyPullRequestNotFound`).
+  // Refusing on `retryable === false` instead would also catch 401 and non-rate-limit
+  // 403 — so a broken installation token would refuse EVERY PR-gated escalation at the
+  // door, which is precisely what the fail-open contract above forbids. A rate limit, a
+  // 5xx, a 403, a transport error and a 404 on an unreadable repo all still file.
+  if (disposition.kind === "unreadable") {
+    return {
+      error:
+        `payload.gate names ${ref}, which does not exist. The repository is readable, so this ` +
+        "is not a transient lookup failure: a card gated on a pull request that is not there " +
+        "can never be retired by that gate and would be deferred on every sweep indefinitely",
+      details: {
+        code: "approval_gate_unreadable",
+        gate: gateDetail,
+        remediation:
+          "Check the number. `payload.gate` for a `github_pr_merged` kind takes a PULL REQUEST " +
+          "number, and `/pulls/{n}` returns 404 for an ISSUE number — which is the likeliest " +
+          "way this fires, since the issue number is the one you have to hand. Confirm the PR " +
+          "exists and is open, then re-file. If you cannot name a live pull request, do not set " +
+          "`payload.gate` at all: put the link in `payload.title`, where it informs a human " +
+          "without binding the card's lifetime to it.",
+      },
+    };
+  }
+
+  if (disposition.kind !== "terminal") return null;
 
   return {
     error:
@@ -261,10 +306,7 @@ async function gateAlreadyTerminalRefusal(payload: unknown) {
       "its next sweep and can never be approved",
     details: {
       code: "approval_gate_already_terminal",
-      gate:
-        gate.kind === "github_actions_run"
-          ? { repoFullName: gate.repoFullName, runId: gate.runId }
-          : { repoFullName: gate.repoFullName, prNumber: gate.prNumber },
+      gate: gateDetail,
       remediation:
         "`payload.gate` means the gate IS the ask, and the card is retired the moment the named " +
         "event ends whether or not your ask was ever read. Pick the kind that matches what you " +

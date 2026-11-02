@@ -359,11 +359,77 @@ describe("a card may not be filed against an already-finished gate (PEN-5103)", 
     expect(mockApprovalService.create).toHaveBeenCalledOnce();
   });
 
-  it("fails OPEN when the pull request cannot be read", async () => {
+  /**
+   * PEN-5254 — the one lookup failure that is NOT a fail-open case.
+   *
+   * A gate naming a pull request that does not exist is worse than the dead-on-
+   * arrival card this guard was built for. That one at least closes; this one can
+   * never be retired by its own gate, so it is filed 201 and then deferred by every
+   * sweep for ever. The reader proves absence by probing the repository first, and
+   * only that proven case carries `notFound`.
+   */
+  it("refuses a gate naming a pull request that does not exist", async () => {
+    mockGetPullRequestGate.mockResolvedValue({
+      error: "pull_request_not_found",
+      notFound: true,
+    });
+
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: PR_ASK_PAYLOAD,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    // A DISTINCT code: conflating it with `already_terminal` would tell an agent its
+    // pull request is finished when it never existed.
+    expect(res.body.details.code).toBe("approval_gate_unreadable");
+    expect(res.body.details.code).not.toBe("approval_gate_already_terminal");
+    expect(res.body.details.gate).toEqual({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1122,
+    });
+    // The likeliest way this fires is an issue number, so the remediation says so.
+    expect(res.body.details.remediation).toContain("ISSUE number");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("files a card when a 404 could not be proven to mean the PR is absent", async () => {
+    // The other half of the ambiguity, and the reason the refusal is not keyed on
+    // the 404 alone: a repository this installation cannot see 404s identically.
+    // The reader withholds `notFound` there, and this card must still file.
+    mockGetPullRequestGate.mockResolvedValue({ error: "pull_request_repo_inaccessible_404" });
+
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: PR_ASK_PAYLOAD,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.create).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * ⚠ The refusal predicate is 404-and-repo-readable, NOT `retryable === false`.
+   *
+   * `isRetryableGithubHttpStatus` is `408 || 409 || 429 || >= 500`, so 401 and a
+   * non-rate-limit 403 are ALSO non-retryable. Refusing on "non-retryable" would
+   * mean that the moment the App installation's credentials break or are revoked,
+   * every PR-gated escalation is refused at the door — the exact failure this
+   * guard's own contract forbids. These cases must keep filing.
+   */
+  it.each([
+    ["an unauthenticated lookup", "pull_request_http_401"],
+    ["a forbidden lookup", "pull_request_http_403"],
+    ["a rate-limited lookup", "pull_request_rate_limited"],
+    ["a throttled lookup", "pull_request_http_429"],
+    ["a server error", "pull_request_http_503"],
+    ["an unreadable body", "pull_request_state_missing"],
+    ["a transport failure", "pull_request_fetch_failed"],
+  ])("fails OPEN on %s", async (_label, reason) => {
     // Unmeasurable is not terminal. A throttled or unreachable GitHub must not be
     // able to block escalations — the same direction the reconciler takes when it
     // declines to retire a gate it could not read.
-    mockGetPullRequestGate.mockResolvedValue({ error: "pull_request_http_404" });
+    mockGetPullRequestGate.mockResolvedValue({ error: reason });
 
     const res = await postApproval(await createAgentApp(), {
       type: "request_board_approval",
