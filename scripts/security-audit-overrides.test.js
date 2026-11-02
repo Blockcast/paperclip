@@ -58,7 +58,7 @@ async function main() {
     const packageJson = JSON.parse(
       await readFile(join(fixtureRoot, "package.json"), "utf8"),
     );
-    assert.equal(packageJson.pnpm.overrides["fast-uri"], "^3.1.6");
+    assert.equal(packageJson.pnpm.overrides["fast-uri"], ">=3.1.9 <4");
 
     const lockfile = await readFile(
       join(fixtureRoot, "pnpm-lock.yaml"),
