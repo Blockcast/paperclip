@@ -93,6 +93,7 @@ import {
 import { claimFirstInstanceAdmin } from "../first-admin-claim.js";
 import { getStorageService } from "../storage/index.js";
 import { secretService } from "../services/secrets.js";
+import { membershipColumns, principalGrantColumns } from "../services/access-columns.js";
 
 function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -1275,7 +1276,7 @@ async function loadCompanyMemberRecords(
   options: { includeArchived?: boolean } = {},
 ) {
   const members = await db
-    .select()
+    .select(membershipColumns)
     .from(companyMemberships)
     .where(
       and(
@@ -1291,7 +1292,7 @@ async function loadCompanyMemberRecords(
     loadUsersById(db, userIds),
     userIds.length > 0
       ? db
-          .select()
+          .select(principalGrantColumns)
           .from(principalPermissionGrants)
           .where(
             and(
@@ -4722,7 +4723,7 @@ export function accessRoutes(
         `);
 
         const existing = await tx
-          .select()
+          .select(membershipColumns)
           .from(companyMemberships)
           .where(
             and(
@@ -4770,7 +4771,7 @@ export function accessRoutes(
             updatedAt: new Date(),
           })
           .where(eq(companyMemberships.id, existing.id))
-          .returning()
+          .returning(membershipColumns)
           .then((rows) => rows[0] ?? existing);
       });
       if (!updated) throw notFound("Member not found");
@@ -4819,7 +4820,7 @@ export function accessRoutes(
         `);
 
         const existing = await tx
-          .select()
+          .select(membershipColumns)
           .from(companyMemberships)
           .where(
             and(
@@ -4868,7 +4869,7 @@ export function accessRoutes(
             updatedAt: now,
           })
           .where(eq(companyMemberships.id, existing.id))
-          .returning()
+          .returning(membershipColumns)
           .then((rows) => rows[0] ?? existing);
 
         await tx

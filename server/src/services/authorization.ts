@@ -34,6 +34,7 @@ import {
 import { ACTIVE_RECOVERY_ACTION_STATUSES, RECOVERY_HANDOFF_COMMENT_GRANT_TTL_MS, recoveryHandoffGrantIsWithinTtl } from "./issue-recovery-actions.js";
 import { RECOVERY_ORIGIN_KINDS } from "./recovery/origins.js";
 import { membershipRoleIsNonViewer } from "./company-member-roles.js";
+import { membershipColumns, principalGrantColumns } from "./access-columns.js";
 import { logger } from "../middleware/logger.js";
 
 export type AuthorizationActor =
@@ -714,7 +715,7 @@ export function getActiveCompanyMembership(
   principalId: string,
 ) {
   return db
-    .select()
+    .select(membershipColumns)
     .from(companyMemberships)
     .where(
       and(
@@ -880,7 +881,7 @@ export function authorizationService(db: Db) {
     permissionKey: PermissionKey,
   ) {
     return db
-      .select()
+      .select(principalGrantColumns)
       .from(principalPermissionGrants)
       .where(
         and(

@@ -95,6 +95,7 @@ import { isIP } from "node:net";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
+import { principalGrantColumns } from "./access-columns.js";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { resolveApprovalWithSideEffects } from "./approval-resolution.js";
 import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
@@ -3135,7 +3136,7 @@ export function buildHostServices(
         const rows = await access.listMembers(companyId);
         const visibleRows = params.includeArchived ? rows : rows.filter((row) => row.status !== "archived");
         const grants = await db
-          .select()
+          .select(principalGrantColumns)
           .from(principalPermissionGrants)
           .where(eq(principalPermissionGrants.companyId, companyId));
         const grantsByPrincipal = new Map<string, typeof grants>();
@@ -3278,7 +3279,7 @@ export function buildHostServices(
           params.principalId ? eq(principalPermissionGrants.principalId, params.principalId) : undefined,
         ].filter((condition): condition is NonNullable<typeof condition> => Boolean(condition));
         const rows = await db
-          .select()
+          .select(principalGrantColumns)
           .from(principalPermissionGrants)
           .where(and(...conditions))
           .orderBy(principalPermissionGrants.principalType, principalPermissionGrants.principalId, principalPermissionGrants.permissionKey);
