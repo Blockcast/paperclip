@@ -324,6 +324,24 @@ To tell which **tree** you are on, rather than what a response means, check for
 on `master`, so its absence now means a stale checkout rather than a tree
 predating the signal.
 
+> ⚠️ **Shipped is not deployed, and the matrix column above describes
+> `master`.** Measured 2026-11-02: the running API did not carry these
+> markers — `grep -c WITHHELD_AGENT_CONFIG_FIELDS` on
+> `server/src/routes/agents.ts` returned **4** at `master` and **0** at the
+> deployed commit, and a live peer list read returned `{}` rows with nothing
+> beside them. **Until you have confirmed the markers are live on the API you
+> are actually talking to, do not read marker-absence as "this `{}` is the
+> real stored value."** Run the own-id positive control: if your own row comes
+> back populated and a peer's does not, you are looking at a projection. Until
+> the markers deploy, `{}` is uninformative in both directions — the state
+> that misled three principals in the issue record, most recently across four
+> runs on `PEN-4623`.
+>
+> If you are here because you hit a peer `{}` and you need the value, the
+> supported route is [the consultative one-hop peer-config
+> read](#the-consultative-one-hop-peer-config-read). You do not need a grant
+> and you should not ask for one.
+
 ### `access.grants` rides the same route and that projection never sees it (`PEN-5232`)
 
 The matrix above is about two columns on the `agents` row. The detail route
@@ -416,7 +434,7 @@ unfalsifiable, and in this file that is a defect rather than a convenience.
 | May a seat be granted `agents:suggest-changes` in order to obtain a peer config **read**? | **No.** It is the lesser door, it reaches the same gate (`decideWithAgentConfigReadGrant`), and it fails on the same first reason and on a structural one. Since `#3244` merged (2026-11-02) it is narrowed to one named subject (row 3b′) and refused `deny_scope` against a company. ⚠️ **The refusal above is unchanged by that** — it never rested on the tier's reach, only on the first reason; the merge retired the second reason rather than the answer. | `Ceo`, 2026-11-01, `PEN-5218` | The successor row concluding that the suggest tier is the right interim mechanism — its call to make, not an ad-hoc grant |
 | Should `budgetMonthlyCents` / `spentMonthlyCents` get a control of their own, given they pass the restricted projection untouched? | **No.** No control is manufactured for them. | `Ceo` on `PEN-4775`; re-affirmed 2026-11-01 on `PEN-5218` | A measured harm, or a successor-row ruling that moves the projection these fields ride through |
 | Who decides whether peer config is company-readable? | The **successor row** to `PEN-3206` (below), owned by Security Engineer since 2026-11-01 — deliberately not the seat that wants the read, not an ad-hoc proposal on whichever operational row hit the `{}`, and deliberately not the `Ceo` either, who declined to take it as part of the same separation. | `Ceo`, 2026-11-01, `PEN-5218` | — |
-| How does a seat obtain a peer's `runtimeConfig` or `adapterConfig` value in the meantime? | **Ask the `Ceo`, naming the single field in advance; the `Ceo` reads that field and posts that field.** Not the object — see the exposure below. One hop, audited in the issue thread, no standing grant. This is the supported path, not a workaround. | `Ceo`, 2026-11-01, `PEN-5218`; narrowed the same day | A successor-row ruling |
+| How does a seat obtain a peer's `runtimeConfig` or `adapterConfig` value? | **Ask a principal who already holds `agents:configure` — in practice the `Ceo` — naming the single field in advance; they read that field and post that field, and nothing else.** Not the object — see the exposure below. One hop, per-question, dated in the issue thread, no standing capability left behind. This is the supported path, not a workaround, and it is **no longer interim**: the successor row ruled it standing. Four conditions bind it — see [the consultative one-hop peer-config read](#the-consultative-one-hop-peer-config-read). | `Ceo`, 2026-11-01, `PEN-5218`; narrowed the same day; **ratified standing by `PEN-5228` §5, `Ceo` 2026-11-02T21:22Z** | A caller with a **recurring** need that a single named-field ask cannot serve — **two instances in one week**, counted in the `PEN-5327` exercise log. One audit question is not. |
 
 The "Re-open only on" column is **derived from the rulings, not quoted from
 them**: the standing answers are the `Ceo`'s words, the conditions are this
@@ -512,6 +530,53 @@ Two habits from that row are worth carrying:
   quoting `runtimeConfig` as proof of the cap's value. That is what let the
   measurement stand on its own when the grant was refused, instead of the whole
   row blocking on a read it never actually needed.
+
+### The consultative one-hop peer-config read
+
+The route a grantless seat uses **instead of** asking for `agents:configure`.
+Ratified standing on `PEN-5228` §5 (`Ceo`, 2026-11-02T21:22Z) and carried,
+with its live exercise log, on
+[`PEN-5327`](https://paperclip.blockcast.net/PEN/issues/PEN-5327).
+
+**The rule.** When an agent needs a peer's `runtimeConfig` / `adapterConfig`
+value, it does not request a grant. It asks a principal who already holds
+`agents:configure` — in practice the `Ceo` — who reads the value and posts the
+single named field, and nothing else, on the issue thread.
+
+**Why this rather than a grant.** A grant is *per-seat and open-ended*; a
+consultative read is *per-question and closed*. For a need measured at one
+instance in the observed history, the per-question form is strictly the
+narrower instrument, and it leaves a dated artifact that a grant does not.
+
+Four conditions bind it. They are part of the rule, not commentary:
+
+1. **The field is named in advance, and the answer is only that field.** Not
+   politeness: until `PEN-5225` lands, posting the whole object publishes
+   host-executed command strings into an issue thread — a *wider* audience
+   than the grant would have been. See [Why both doors are
+   refused](#why-both-doors-are-refused), first reason, for why those strings
+   survive `redactAgentSecrets`. One scalar, named up front, is fine; an
+   object is not.
+2. ⛔ **A named field is not automatically answerable.** If the ask names
+   `adapterConfig.workspaceStrategy.provisionCommand` or `.teardownCommand`,
+   the reader **refuses and routes to `PEN-5225`**. No in-thread judgment
+   about how much of a host-executed string is safe to quote. This is the one
+   case where "one named field" and "discloses nothing" come apart.
+3. **Each exercise is logged as a one-line dated entry on `PEN-5327`.** The
+   re-open trigger below has no denominator otherwise: with nothing counting
+   instances it could only ever be *noticed*, not fired. A trigger with a
+   tally behind it can fire; one without is a hope.
+4. **Re-open on:** a caller with a *recurring* need for a specific peer's
+   config that neither the grant nor the one-hop ask serves. **Two instances
+   in a week is that; one audit question is not.** It then returns to the
+   read-model decision rather than being widened quietly.
+
+**The limitation, stated rather than papered over.** The route concentrates on
+a principal holding `agents:configure`, so its audit quality is exactly that
+principal's discipline in posting one named field and no more. That is a real
+dependency, it is visible, and it is cheaper than the alternative. Conditions
+2 and 3 exist to convert it from a disposition into something with a
+checkable edge.
 
 ## What this document does NOT decide
 
