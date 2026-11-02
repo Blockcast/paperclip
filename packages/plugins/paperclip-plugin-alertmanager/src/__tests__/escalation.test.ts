@@ -125,9 +125,9 @@ function buildFakeAlertmanagerStore() {
       // PEN-2918 attendance observations are append-only; keep them so tests
       // can assert the determination rather than only its side effects.
       if (text.includes("alert_attendance_observations")) {
-        const [id, company_id, alert_issue_id, alertname, disposition, escalation_attempt, notified_agent_id, wake_outcome, wake_detail, alert_liveness] =
+        const [id, company_id, alert_issue_id, alertname, disposition, escalation_attempt, subject_agent_id, wake_outcome, wake_detail, alert_liveness] =
           params as [string, string, string, string, string, number | null, string | null, string, string | null, string];
-        attendance.push({ id, company_id, alert_issue_id, alertname, disposition, escalation_attempt, notified_agent_id, wake_outcome, wake_detail, alert_liveness });
+        attendance.push({ id, company_id, alert_issue_id, alertname, disposition, escalation_attempt, subject_agent_id, wake_outcome, wake_detail, alert_liveness });
         return { rowCount: 1 };
       }
       if (text.includes("alertmanager_aggregate_lifecycle_fences")) {
@@ -1655,9 +1655,15 @@ describe("resolveAlertmanagerApiUrl", () => {
  *    is ~4,900 perfect deliveries and zero action, so an `acknowledged` derived
  *    from delivery ships the same defect with a schema on it.
  *  - the record must be able to say "never delivered". A rung whose wake is
- *    refused posts a comment reading "waking current owner <name>" and then
- *    swallows the refusal; before this, that discrepancy existed only as a log
- *    line next to a thread asserting the opposite.
+ *    dropped posts a comment reading "waking current owner <name>" and then
+ *    swallows the drop; before this, that discrepancy existed only as a log
+ *    line next to a thread asserting the opposite. The host drops a wake in
+ *    TWO ways and only one of them throws, so there are two tokens and two
+ *    tests: `refused` (it rejected) and `declined` (it resolved
+ *    `{ queued: false }` — heartbeats disabled, cooldown, inactive company,
+ *    suppression, worktree cutoff, capacity deferral). A caller that merely
+ *    awaits the promise records the second, commoner case as `enqueued`,
+ *    which is this row's own defect in the direction that reads clean.
  */
 describe("PEN-2918 attendance observations", () => {
   const due = (overrides: Partial<AlertStateRecord> = {}): AlertStateRecord => ({
@@ -1725,7 +1731,7 @@ describe("PEN-2918 attendance observations", () => {
       disposition: "unattended_rung",
       wake_outcome: "enqueued",
       escalation_attempt: 1,
-      notified_agent_id: "engineer",
+      subject_agent_id: "engineer",
       wake_detail: null,
     });
   });
@@ -1753,6 +1759,51 @@ describe("PEN-2918 attendance observations", () => {
   });
 
   /**
+   * C4, second arm — the half a caller that only `await`s the call cannot see.
+   *
+   * `issues.requestWakeup` resolves `{ queued: false }` without throwing
+   * whenever the host declines to enqueue a run: `wakeOnDemand.disabled`, the
+   * heartbeat cooldown, `company.inactive`, `scheduling_suppressed`,
+   * `worktree_execution_cutoff`, or a provider-capacity deferral. Recording
+   * that as `enqueued` would file the larger and quieter half of the dropped
+   * wakes under "the host accepted it", leaving the undelivered query reading
+   * clean while wakes are dropped — the exact failure PEN-2918 measures.
+   */
+  it("records a DECLINED wake (resolved queued=false, never threw) as undelivered, not enqueued", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance).toHaveLength(1);
+    expect(store.attendance[0]).toMatchObject({ disposition: "unattended_rung", wake_outcome: "declined" });
+    // The point of the separate token: this did NOT throw, so the pre-fix
+    // implementation reached its `return "enqueued"` on exactly this input.
+    expect(store.attendance[0].wake_outcome).not.toBe("enqueued");
+    // Same discrepancy as the refused case, pinned from both sides.
+    expect(mocks.issues.createComment).toHaveBeenCalledWith("issue-1", expect.stringContaining("waking current owner Engineer"), "company-1");
+    // `declined` must not borrow the refused sentence: nothing threw.
+    expect(String(store.attendance[0].wake_detail)).toContain("queued=false");
+    expect(String(store.attendance[0].wake_detail)).not.toContain("threw");
+  });
+
+  /**
+   * The converse, and the reason the predicate is `=== false` rather than a
+   * falsiness check: a host (or a fake) that resolves without the field is
+   * making no claim either way and must not be reported as a drop. This is
+   * also what keeps every pre-existing test in this file passing unmodified —
+   * their shared fake resolves `{}`.
+   */
+  it("treats a resolution that omits `queued` as enqueued, not as a drop", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({}));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance[0]).toMatchObject({ wake_outcome: "enqueued", wake_detail: null });
+  });
+
+  /**
    * C3 — the direction that matters. A successful dispatch must never be
    * recorded as acknowledgement.
    */
@@ -1772,7 +1823,7 @@ describe("PEN-2918 attendance observations", () => {
     await runAlertEscalationSweep(ctx, config(), NOW);
 
     expect(store.attendance).toHaveLength(1);
-    expect(store.attendance[0]).toMatchObject({ disposition: "unattended_rung", escalation_attempt: 2, notified_agent_id: "cto" });
+    expect(store.attendance[0]).toMatchObject({ disposition: "unattended_rung", escalation_attempt: 2, subject_agent_id: "cto" });
   });
 
   it("records the cover rung when the agent chain is exhausted", async () => {
