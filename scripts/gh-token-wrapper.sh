@@ -35,6 +35,16 @@ GIT_BIN="${GH_TOKEN_WRAPPER_GIT:-/usr/bin/git}"
 # Bearer, gets 401, and concludes the credential is dead. Naming the real source
 # costs one stderr line and removes the whole false trail.
 WRAPPER_TOKEN_SOURCE="none — this wrapper supplied no credential; gh is on ambient auth"
+# Whether this wrapper exported GH_TOKEN/GITHUB_TOKEN into the child. It does
+# not in the ambient-auth fall-through at the tail of this file, which `exec`s
+# the real binary with no override — so there `gh` authenticates with whatever
+# the *caller* already had (its own GH_TOKEN/GITHUB_TOKEN, or
+# ~/.config/gh/hosts.yml). The "(GH_TOKEN) is not set in your shell" correction
+# below is true only when we exported it, and is exactly backwards otherwise:
+# in the ambient case a "(GH_TOKEN)" line names a variable the caller DOES have
+# set. A diagnostic that disagrees with the path it diagnoses is the defect this
+# whole change exists to remove, so the two cases get two messages.
+WRAPPER_EXPORTED_TOKEN=no
 
 # `gh auth setup-git` asks the running `gh` binary to report its own on-disk
 # path (via /proc/self/exe, not argv[0]) and writes that path into git's
@@ -57,7 +67,11 @@ exec_real_gh() {
   # of the misdirection. stderr, so no parser of gh's stdout changes behaviour.
   case "${1:-} ${2:-}" in
     "auth status")
-      echo "gh-token-wrapper: credential source is ${WRAPPER_TOKEN_SOURCE}. Any \"(GH_TOKEN)\" below names the variable this wrapper exported into gh, NOT one set in your shell — \$GH_TOKEN is empty there, so curl-ing with it returns 401 regardless of credential health. Run \`gh paperclip-auth-check\` to test the credential itself (PEN-5241)." >&2
+      if [ "${WRAPPER_EXPORTED_TOKEN}" = yes ]; then
+        echo "gh-token-wrapper: credential source is ${WRAPPER_TOKEN_SOURCE}. Any \"(GH_TOKEN)\" below names the variable this wrapper exported into gh, NOT one set in your shell — \$GH_TOKEN is empty there, so curl-ing with it returns 401 regardless of credential health. Run \`gh paperclip-auth-check\` to test the credential itself (PEN-5241)." >&2
+      else
+        echo "gh-token-wrapper: credential source is ${WRAPPER_TOKEN_SOURCE}. This wrapper exported nothing, so any \"(GH_TOKEN)\" below names a variable from your OWN environment and gh is authenticating with ambient auth (your GH_TOKEN/GITHUB_TOKEN, or ~/.config/gh/hosts.yml). \`gh paperclip-auth-check\` reports this wrapper's own credential paths and does NOT probe ambient auth (PEN-5241)." >&2
+      fi
       ;;
   esac
   case "${1:-} ${2:-}" in
@@ -383,16 +397,35 @@ GITHUB_API_BASE="${GH_TOKEN_WRAPPER_API_BASE:-https://api.github.com}"
 # different fact from any status GitHub returns, and collapsing the two is the
 # mistake this whole subcommand exists to stop. The token, when present, travels
 # in a 0600 config file rather than argv, so it is never visible in `ps`.
+#
+# `-q` is passed first on both calls, and must stay first: curl reads ~/.curlrc
+# unless -q is the *first* argument, and a .curlrc — in a HOME on a writable
+# shared path, or just stray operator config — could inject proxy/insecure/extra
+# headers into the request that carries the live Bearer. Same "do not trust what
+# another uid could have planted" model as BLO-40279.
 auth_check_probe() {
   probe_path="$1"
   probe_cfg="${2:-}"
-  probe_hdr="$(mktemp "${TMPDIR:-/tmp}/gh-auth-check.XXXXXX")"
+  # A read-only or full TMPDIR must produce a named failure rather than `set -e`
+  # killing the diagnostic with a bare shell error — the one tool an agent
+  # reaches for when nothing else works cannot die without saying why.
+  probe_hdr="$(mktemp "${TMPDIR:-/tmp}/gh-auth-check.XXXXXX" 2>/dev/null)" || {
+    echo "gh-token-wrapper: paperclip-auth-check cannot create a temp file in ${TMPDIR:-/tmp}; cannot run the probe (PEN-5241)" >&2
+    exit 70
+  }
+  # Scoped to this probe: an interrupt during the up-to-15s curl must not leave
+  # the header file behind. Setting it here also replaces the caller's EXIT trap
+  # for the duration of this command-substitution subshell, so the caller's
+  # cleanup cannot run early against its own still-in-use temp file.
+  trap 'rm -f "${probe_hdr}"' EXIT
+  trap 'rm -f "${probe_hdr}"; exit 130' INT
+  trap 'rm -f "${probe_hdr}"; exit 143' TERM
   probe_code=000
   if [ -n "${probe_cfg}" ]; then
-    probe_code="$(curl -sS --max-time 15 --config "${probe_cfg}" -o /dev/null -D "${probe_hdr}" \
+    probe_code="$(curl -q -sS --max-time 15 --config "${probe_cfg}" -o /dev/null -D "${probe_hdr}" \
       -w '%{http_code}' "${GITHUB_API_BASE}${probe_path}" 2>/dev/null)" || probe_code=000
   else
-    probe_code="$(curl -sS --max-time 15 -o /dev/null -D "${probe_hdr}" \
+    probe_code="$(curl -q -sS --max-time 15 -o /dev/null -D "${probe_hdr}" \
       -w '%{http_code}' "${GITHUB_API_BASE}${probe_path}" 2>/dev/null)" || probe_code=000
   fi
   [ -n "${probe_code}" ] || probe_code=000
@@ -419,9 +452,20 @@ auth_check_mount_generation() {
   fi
 }
 
+# Removes the probe config file, which is the one temp file here that carries
+# the token. 0600 and short-lived, but "short-lived" stops being true the moment
+# the probe is interrupted, so the cleanup is a trap rather than a trailing rm.
+auth_check_cleanup() {
+  [ -n "${check_cfg:-}" ] && rm -f "${check_cfg}"
+  return 0
+}
+
 paperclip_auth_check() {
   check_source="none" check_state="absent" check_gen="-" check_written="-"
-  check_hash="-" check_bytes="-" check_token="" would_refuse=no
+  check_hash="-" check_bytes="-" check_token="" would_refuse=no check_cfg=""
+  trap 'auth_check_cleanup' EXIT
+  trap 'auth_check_cleanup; exit 130' INT
+  trap 'auth_check_cleanup; exit 143' TERM
 
   # Mirrors the precedence the branches below actually implement (value > file).
   # Reporting a source the wrapper would not have used is the same class of
@@ -489,8 +533,14 @@ paperclip_auth_check() {
   # healthy is what turns a 401 into evidence instead of a guess, and proving it
   # is *un*healthy is what stops a network fault being reported as a dead
   # credential. An anonymous caller is rate-limited at 60/hr, so this doubles as
-  # the reference value for the anonymous-fallthrough arm below.
+  # the reference value for the ambient-auth arm below.
+  #
+  # `set -f` first: the second field is a response header value, and an
+  # unquoted expansion also globs — a `*` would expand to cwd filenames and
+  # shift $2 out from under the verdict logic.
+  set -f
   set -- $(auth_check_probe "/rate_limit")
+  set +f
   anon_code="$1" anon_limit="$2"
 
   auth_code="-" auth_limit="-"
@@ -499,12 +549,18 @@ paperclip_auth_check() {
     # token authenticates there and is refused per-endpoint elsewhere (403 on
     # /user, per PEN-3193), so a 200 here is positive proof of the identity this
     # pod is supposed to hold rather than merely "some credential was accepted".
-    check_cfg="$(mktemp "${TMPDIR:-/tmp}/gh-auth-check-cfg.XXXXXX")"
+    check_cfg="$(mktemp "${TMPDIR:-/tmp}/gh-auth-check-cfg.XXXXXX" 2>/dev/null)" || {
+      echo "gh-token-wrapper: paperclip-auth-check cannot create a temp file in ${TMPDIR:-/tmp}; cannot run the authenticated probe (PEN-5241)" >&2
+      exit 70
+    }
     chmod 600 "${check_cfg}"
     printf 'header = "Authorization: Bearer %s"\n' "${check_token}" > "${check_cfg}"
+    set -f
     set -- $(auth_check_probe "/installation/repositories" "${check_cfg}")
+    set +f
     auth_code="$1" auth_limit="$2"
     rm -f "${check_cfg}"
+    check_cfg=""
   fi
 
   if [ "${anon_code}" = 000 ]; then
@@ -522,7 +578,7 @@ paperclip_auth_check() {
       verdict="NO_CREDENTIAL — no usable token (${check_state}); \`gh\` will refuse with exit 64, it will NOT fall back to ambient auth"
       verdict_code=2
     else
-      verdict="ANONYMOUS — no token and none was named, so \`gh\` falls through to unauthenticated GitHub (rate limit ${anon_limit}/hr)"
+      verdict="AMBIENT_AUTH — this wrapper supplied no credential and none was named, so \`gh\` runs on whatever auth the caller already had (its own GH_TOKEN/GITHUB_TOKEN, or ~/.config/gh/hosts.yml); this check does NOT probe that. With no ambient credential either, gh is unauthenticated (rate limit ${anon_limit}/hr)"
       verdict_code=3
     fi
   elif [ "${auth_code}" = 000 ]; then
@@ -654,6 +710,7 @@ if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
   export GH_TOKEN="${TOKEN}"
   export GITHUB_TOKEN="${TOKEN}"
   WRAPPER_TOKEN_SOURCE="GH_SEAT_TOKEN_VALUE (agent-scoped secret binding)"
+  WRAPPER_EXPORTED_TOKEN=yes
   exec_real_gh "$@"
 fi
 
@@ -766,6 +823,7 @@ elif [ -r "${TOKEN_FILE}" ]; then
     else
       WRAPPER_TOKEN_SOURCE="the compiled-in default token file (${TOKEN_FILE}); PAPERCLIP_GITHUB_TOKEN_FILE is unset"
     fi
+    WRAPPER_EXPORTED_TOKEN=yes
   elif require_token_file; then
     reject_token_file "is empty"
   fi
