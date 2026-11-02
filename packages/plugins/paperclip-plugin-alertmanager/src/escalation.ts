@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
 import { isNonHumanUserSentinel } from "@paperclipai/shared";
 import { DEFAULT_COVER_CLOSE_HOLD_MINUTES, DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, alertStateRef } from "./constants.js";
+import { type WakeOutcome, recordAttendanceObservation } from "./attendance-record.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
 
@@ -360,6 +361,20 @@ async function holdLadderForClearedAlert(
       companyId,
     );
   }
+  // PEN-2918: the hold is a determination too, and it is the one most easily
+  // mistaken for inaction — nothing is reassigned and, after the first, no
+  // comment is posted either, because the marker dedups for the life of the
+  // issue. Without this row a long hold is indistinguishable from a ladder
+  // that stopped running.
+  await recordAttendanceObservation(ctx, {
+    companyId,
+    alertIssueId: issue.id,
+    alertname: state.alertname,
+    disposition: "held_alert_clear",
+    alertLiveness: "not_firing",
+    wakeOutcome: "not_attempted",
+    escalationAttempt: state.escalationAttempt ?? 0,
+  });
 }
 
 
@@ -869,6 +884,27 @@ async function advanceIssueLadder(
     ctx.logger.info(
       `alert-escalation: deferred rung for ${issue.identifier ?? issue.id}; attended by ${monitorArmed ? "armed monitor" : "unresolved blocker"}; next attempt ${deferredTo}`,
     );
+    // PEN-2918: this is the acknowledgement signal, and until now it existed
+    // only as the log line above. It is recorded from an OBSERVATION OF
+    // ATTENDANCE — an armed monitor or a live blocker — never from a wake
+    // having been dispatched successfully. That direction is the whole point:
+    // this row's founding measurement is ~4,900 perfect deliveries and zero
+    // action, so an `acknowledged` derived from delivery would be the same
+    // defect with a schema on it.
+    //
+    // `alertLiveness: "not_read"` is accurate rather than lazy: both branches
+    // above short-circuit ahead of `readLiveness`, so the determination
+    // genuinely was made without consulting Alertmanager.
+    await recordAttendanceObservation(ctx, {
+      companyId,
+      alertIssueId: issue.id,
+      alertname: state.alertname,
+      disposition: monitorArmed ? "attended_monitor" : "attended_blocker",
+      alertLiveness: "not_read",
+      wakeOutcome: "not_attempted",
+      escalationAttempt: state.escalationAttempt ?? 0,
+      subjectAgentId: issue.assigneeAgentId ?? null,
+    });
     return;
   }
 
@@ -926,6 +962,18 @@ async function advanceIssueLadder(
       return;
     }
     await ctx.issues.createComment(issue.id, `[alert-escalation] Agent chain exhausted with this issue still open; created a [user-cover] escalation.\n\n${livenessLine(liveness, state, now)}`, companyId);
+    await recordAttendanceObservation(ctx, {
+      companyId,
+      alertIssueId: issue.id,
+      alertname: state.alertname,
+      disposition: "unattended_cover",
+      alertLiveness: liveness.state,
+      // The cover rung raises no wake of its own: it mints a board-assigned
+      // [user-cover] row, whose own assignment is the notification.
+      wakeOutcome: "not_attempted",
+      escalationAttempt: MAX_ATTEMPTS,
+      subjectAgentId: issue.assigneeAgentId ?? null,
+    });
     return;
   }
 
@@ -949,27 +997,114 @@ async function advanceIssueLadder(
     return;
   }
 
+  // PEN-2918 — the wake outcome is captured rather than discarded. Note the
+  // ORDER this records, because it is the defect being made visible: the
+  // escalation comment above asserts "waking current owner <name>" and is
+  // posted BEFORE the wake is attempted, and `requestWakeupBestEffort`
+  // swallows a refusal by design so the rung does not repeat. A paused agent,
+  // a budget block or an unresolved blocker therefore produced a thread
+  // claiming a wake, a log line nobody reads, and nothing else. The
+  // `wake_outcome` column is where "we said we woke them and we did not" now
+  // lands.
+  //
+  // The comment text is deliberately NOT changed here. That would be a
+  // behaviour change, and this change is behaviour-neutral by construction;
+  // making the thread itself honest is a separate decision with a separate
+  // blast radius.
+  let notified: string | null = null;
+  let wake: WakeOutcome = "not_attempted";
   if (attempt === 0 && current) {
+    notified = current.id ?? issue.assigneeAgentId ?? null;
     await ctx.issues.createComment(issue.id, `[alert-escalation 1/${MAX_ATTEMPTS}] Escalation deadline reached with this issue still open; waking current owner ${current.name}.\n\n${livenessLine(liveness, state, now)}`, companyId);
-    await requestWakeupBestEffort(ctx, issue, companyId, next);
+    wake = await requestWakeupBestEffort(ctx, issue, companyId, next);
   } else if (current?.reportsTo) {
     const manager = await ctx.agents.get(current.reportsTo, companyId);
+    notified = current.reportsTo;
     await ctx.issues.update(issue.id, { assigneeAgentId: current.reportsTo, assigneeUserId: null }, companyId);
     await ctx.issues.createComment(issue.id, `[alert-escalation ${next}/${MAX_ATTEMPTS}] Escalation deadline reached again with this issue still open; reassigned from ${current.name} to ${manager?.name ?? current.reportsTo}.\n\n${livenessLine(liveness, state, now)}`, companyId);
     // Plugin-side issues.update does not fire core's assignment wake, so the
     // new owner is woken explicitly — otherwise the reassignment just sits in
     // their backlog until the next scheduled heartbeat.
-    await requestWakeupBestEffort(ctx, issue, companyId, next);
+    wake = await requestWakeupBestEffort(ctx, issue, companyId, next);
+  }
+  await recordAttendanceObservation(ctx, {
+    companyId,
+    alertIssueId: issue.id,
+    alertname: state.alertname,
+    disposition: "unattended_rung",
+    alertLiveness: liveness.state,
+    wakeOutcome: wake,
+    wakeDetail: wakeDetailFor(wake),
+    escalationAttempt: next,
+    subjectAgentId: notified,
+  });
+}
+
+/**
+ * The operator-readable sentence for a wake outcome. Fixed strings only — never
+ * raw error text (same discipline as the `wake_detail` column comment).
+ *
+ * `refused` and `declined` get DIFFERENT sentences because they are different
+ * events with different remedies: a refusal is about this issue (terminal
+ * status, blocker, budget), a decline is about the agent or the company
+ * (heartbeats disabled, cooldown, suppression, capacity). One sentence saying
+ * "threw" would have been false for every decline.
+ */
+function wakeDetailFor(wake: WakeOutcome): string | null {
+  switch (wake) {
+    case "refused":
+      return "issues.requestWakeup threw; the error is in the plugin log. The escalation comment posted immediately before this asserts the wake regardless.";
+    case "declined":
+      return "issues.requestWakeup resolved queued=false: the host accepted the call and enqueued no run (heartbeats disabled, cooldown, inactive company, scheduling suppressed, worktree cutoff, or a capacity deferral). The escalation comment posted immediately before this asserts the wake regardless.";
+    default:
+      return null;
   }
 }
 
-async function requestWakeupBestEffort(ctx: PluginContext, issue: SweepIssue, companyId: string, rung: number): Promise<void> {
+/**
+ * Returns the outcome rather than discarding it (PEN-2918). The swallow itself
+ * is unchanged and deliberate — a dropped wake must not repeat the rung — but
+ * the caller now records which outcome occurred, so "the wake never happened"
+ * stops being visible only as a log line next to a comment claiming it
+ * succeeded.
+ *
+ * ⛔ **The resolved value is READ, not merely awaited, and that is the point of
+ * this function.** The host drops a wake in two different ways and only one of
+ * them throws:
+ *
+ *  - it **rejects** on a terminal status, an unresolved blocker or a budget
+ *    block ⇒ `refused`;
+ *  - it **resolves `{ queued: false }`** when `enqueueWakeup` returns `null` —
+ *    `heartbeat.wakeOnDemand.disabled`, the heartbeat cooldown,
+ *    `company.inactive`, `heartbeat.scheduling_suppressed`,
+ *    `worktree_execution_cutoff`, and the provider-capacity deferral ⇒
+ *    `declined`.
+ *
+ * Awaiting without reading files that second, larger and quieter population
+ * under `enqueued`, i.e. under "the host accepted the wake" — which would put
+ * this row's own founding defect inside the table built to measure it, in the
+ * direction that reads clean. `undelivered_idx` covers both tokens for the
+ * same reason.
+ *
+ * `enqueued` means the host accepted the request. It is not evidence that a run
+ * started, and it is not acknowledgement.
+ */
+async function requestWakeupBestEffort(ctx: PluginContext, issue: SweepIssue, companyId: string, rung: number): Promise<WakeOutcome> {
   try {
-    await ctx.issues.requestWakeup(issue.id, companyId, { reason: "alert_escalation_deadline", contextSource: "alertmanager-escalation", idempotencyKey: `alert-escalation:${issue.id}:${rung}` });
+    const result = await ctx.issues.requestWakeup(issue.id, companyId, { reason: "alert_escalation_deadline", contextSource: "alertmanager-escalation", idempotencyKey: `alert-escalation:${issue.id}:${rung}` });
+    // Tested against `=== false` rather than falsiness on purpose: a host (or
+    // a fake) that resolves without the field is making no claim either way,
+    // and must not be reported as a drop.
+    if ((result as { queued?: boolean } | null | undefined)?.queued === false) {
+      ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} was declined by the host (queued=false)`);
+      return "declined";
+    }
+    return "enqueued";
   } catch (err) {
     // The escalation comment already landed and the ladder state already
     // advanced; a refused wake (paused agent, budget block) must not repeat
     // the rung.
     ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} failed: ${String(err)}`);
+    return "refused";
   }
 }

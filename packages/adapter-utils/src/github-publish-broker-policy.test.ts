@@ -18,6 +18,7 @@ import {
   stripGitConfigAssignments,
   WRAPPER_CREDENTIAL_CONFIG_ASSIGNMENTS,
 } from "./github-publish-broker-policy.js";
+import { buildGitArgv } from "./github-git-egress-runtime.js";
 
 // PEN-4933 / PEN-3183 D1. Every case here is a route from "the broker runs a
 // command for me" back to "I hold the token", which is the failure the decision
@@ -370,10 +371,30 @@ describe("exec routes the broker relies on but does not itself close", () => {
   });
 
   it("keeps the runtime's `core.hooksPath` injection, which is what stops a repo-config hook swap", () => {
-    const runtime = readFileSync(
-      path.join(repoRoot, "packages/adapter-utils/src/github-git-egress-runtime.ts"),
-      "utf8",
-    );
-    expect(runtime).toContain("core.hooksPath");
+    // ⚠ READ THIS BEFORE SIMPLIFYING IT BACK TO A GREP. Until PEN-5186 this was
+    // `expect(runtime).toContain("core.hooksPath")`, and that assertion was
+    // VACUOUS as a read-back: measured 2026-11-01 by deleting the injection
+    // itself from `buildGitArgv` and running this file, it still PASSED, because
+    // the string survives in 16 comments and refusal messages in that module.
+    // The closure was in fact still enforced — by the runtime's OWN suite, which
+    // went red — but that is precisely what this test is not allowed to rely on.
+    // It exists so a change THERE surfaces HERE, and a backstop that greens
+    // whenever the prose survives is not a backstop against an edit that removes
+    // the injection and its own tests together.
+    //
+    // So assert the BEHAVIOUR: build the argv the runtime would publish with and
+    // read the injection out of it. Comments cannot satisfy this.
+    const argv = buildGitArgv(["push", "origin", "main"], {
+      hooksDir: "/hooks",
+      hookPresent: () => true,
+    });
+    const injected = argv.indexOf("core.hooksPath=/hooks");
+    expect(injected).toBeGreaterThan(-1);
+    // Ahead of the subcommand, or git reads it as an argument and the hook that
+    // scans the published objects never runs at all.
+    expect(injected).toBeLessThan(argv.indexOf("push"));
+    // Last wins in git, so the guard's own value must be the final one: an
+    // earlier caller-supplied spelling must not be the one git reads.
+    expect(argv.lastIndexOf("core.hooksPath=/hooks")).toBe(injected);
   });
 });
