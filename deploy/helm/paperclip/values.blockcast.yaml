@@ -474,6 +474,42 @@ env:
     - name: PAPERCLIP_EXPLAIN_TIMED_OUT_ISSUE_LIST
       value: "true"
 
+    # PEN-5296 box 2: the DELIBERATE counterpart to the capture above.
+    #
+    # That one plans a statement that FAILED, and it answered its question --
+    # production picks the GOOD plan: every search arm index-served, no
+    # `Seq Scan`, estimated cost ~4,100-4,400. It cannot say where the 30s went,
+    # because `EXPLAIN` without `ANALYZE` reports estimates and never actuals.
+    # The live hypothesis is an `Append` estimated at ~70 rows driving a
+    # `Nested Loop` over 2,842-byte-wide pkey fetches, and actual-vs-estimated
+    # rows is the only thing that can confirm or refute it.
+    #
+    # ⛔ This does NOT relax PEN-5223's "never ANALYZE a timed-out statement".
+    # The probe runs only on the SUCCESS path, so a statement that hit 57014
+    # cannot reach it -- structurally, not by convention.
+    #
+    # ⭐ THE VALUE IS THE SEARCH TERM TO PROBE, NOT A BOOLEAN. Setting it to
+    # "true" would probe the literal term `true` and measure nothing. Empty or
+    # unset is OFF. `the` is chosen because it is the most expensive term
+    # measured on this workload (24.2s on Penstock, against 0.34s for a
+    # non-matching term), so it is the case the hypothesis is about.
+    #
+    # Bounded: at most 3 probes per process, only on an exact term match, and
+    # read-only. ⚠️ Each probe re-executes the statement, so a matching request
+    # costs ~2x -- that is the sanctioned price of the measurement and it is
+    # why the budget is 3 rather than 5. The probe is not awaited, so no
+    # tenant response waits on it.
+    #
+    # ⚠️ It is company-agnostic on purpose: if a search on `aaced805-...`
+    # (the company whose statements actually cross 30s) completes under the
+    # timeout with this term, the probe captures THAT company's actuals rather
+    # than the Penstock proxy. Read `companyId` off the log line.
+    #
+    # ⏳ PEN-5296 box 4 turns this back to "" once a probe has landed. Leaving
+    # it on is a decision that has to be recorded there, not a default.
+    - name: PAPERCLIP_EXPLAIN_ANALYZE_ISSUE_LIST_TERM
+      value: "the"
+
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
 # headroom for Alertmanager webhooks and health probes to complete.

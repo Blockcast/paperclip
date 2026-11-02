@@ -320,7 +320,15 @@ export function containsBoundValue(text: string, params: readonly unknown[]): bo
   return params.some((param) => typeof param === "string" && param.length > 0 && text.includes(param));
 }
 
-function planTextFromRows(rows: unknown): string | null {
+/**
+ * Pull the `QUERY PLAN` column out of an `EXPLAIN` result set and join it back
+ * into one text block.
+ *
+ * Exported for the PEN-5296 `ANALYZE` probe, which shares this and the
+ * redaction helpers deliberately: a second copy of the redaction logic would be
+ * a second place for the fragmentation leak those two passes exist to close.
+ */
+export function planTextFromRows(rows: unknown): string | null {
   if (!Array.isArray(rows)) return null;
   const lines = rows
     .map((row) => (row && typeof row === "object" ? (row as Record<string, unknown>)["QUERY PLAN"] : null))

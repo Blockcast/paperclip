@@ -90,6 +90,7 @@ import {
   restoreCheckoutPromotedStatus,
 } from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
+import { captureIssueListAnalyzeProbe } from "../lib/issue-list-analyze-probe.js";
 import { captureTimedOutIssueListPlan } from "../lib/issue-list-timeout-explain.js";
 import { recordProjectPrimaryWorkspaceFallback } from "./metrics.js";
 import { parseObject } from "../adapters/utils.js";
@@ -8695,6 +8696,28 @@ export function issueService(db: Db) {
           searchTermLength: rawSearch.length,
         });
         throw error;
+      }
+      // PEN-5296: the deliberate counterpart to the capture above. That one
+      // plans a statement that FAILED; this one measures a statement that
+      // SUCCEEDED, which is the only way to get actual-vs-estimated row counts
+      // -- and `EXPLAIN` without `ANALYZE` has none. Reaching it requires an
+      // operator to have named this exact search term in
+      // `PAPERCLIP_EXPLAIN_ANALYZE_ISSUE_LIST_TERM`, so it cannot fire on
+      // arbitrary tenant traffic, and its placement HERE rather than in the
+      // `catch` is what keeps PEN-5223's "never ANALYZE a timed-out statement"
+      // rule structurally true rather than merely observed.
+      //
+      // Deliberately NOT awaited, for a different reason than the capture
+      // above: this one re-executes a ~25s statement, and the tenant's response
+      // is already complete. Never rejects (it swallows everything).
+      if (hasSearch) {
+        void captureIssueListAnalyzeProbe({
+          db,
+          query: pageQuery,
+          companyId,
+          searchTerm: rawSearch,
+          rowsReturned: pageRows.length,
+        });
       }
       const rows = pageRows.map((row: any) => ({
         ...row,
