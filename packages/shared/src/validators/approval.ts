@@ -7,7 +7,28 @@ const approvalTitleMessage =
   "Include a short, human-readable payload.title so the card is decidable in the board queue.";
 
 /**
- * Machine-readable pointer from a card to the external gate a human must act on.
+ * GitHub `owner/repo`, in the one charset GitHub actually uses.
+ *
+ * Shared by every gate kind because the value is interpolated into an
+ * authenticated API URL (`github-app-auth.ts`): a traversal-shaped repo name
+ * should not be expressible on any gate, not just the first one written. The
+ * looser `[^/\s]+/[^/\s]+` accepted `.` and `..` as segments.
+ */
+const gateRepoFullNameSchema = z
+  .string()
+  .trim()
+  .regex(
+    /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+$/,
+    "gate.repoFullName must be in owner/repo form",
+  )
+  // The repo half legitimately allows dots, so `.`/`..` still need an explicit reject.
+  .refine(
+    (value) => !value.split("/").some((segment) => segment === "." || segment === ".."),
+    "gate.repoFullName must not contain `.` or `..` path segments",
+  );
+
+/**
+ * The ask is a human clicking a GitHub Actions deployment gate.
  *
  * Cards that escalate a CI/deploy gate have only ever carried the run as prose in
  * `payload.title` / `summary` / `recommendedAction`, so nothing could tell whether
@@ -15,34 +36,92 @@ const approvalTitleMessage =
  * recorded three `paperclip-production` gates dying unclicked in 24h, one card
  * pointing approvers at a cancelled run for ~19h, and an approver had no way to
  * see that was what happened.
- *
- * Supplying this lets `approval-gate-reconciler` close the card when the run
- * reaches a terminal state. It stays optional because most approval types have no
- * external gate — absence means "nothing to reconcile", never "gate is healthy".
  */
-export const approvalGateSchema = z.object({
+export const approvalActionsRunGateSchema = z.object({
   kind: z.literal("github_actions_run"),
-  repoFullName: z
-    .string()
-    .trim()
-    // GitHub's real charset, not just "no slashes or spaces". The looser
-    // `[^/\s]+/[^/\s]+` accepted `.` and `..` as segments, and this value is
-    // interpolated into an authenticated API URL (`github-app-auth.ts`), so a
-    // traversal-shaped repo name should not be expressible in the first place.
-    .regex(
-      /^[A-Za-z0-9][A-Za-z0-9-]*\/[A-Za-z0-9._-]+$/,
-      "gate.repoFullName must be in owner/repo form",
-    )
-    // The repo half legitimately allows dots, so `.`/`..` still need an explicit reject.
-    .refine(
-      (value) => !value.split("/").some((segment) => segment === "." || segment === ".."),
-      "gate.repoFullName must not contain `.` or `..` path segments",
-    ),
+  repoFullName: gateRepoFullNameSchema,
   runId: z.number().int().positive(),
   url: z.string().trim().url().optional(),
 });
 
+/**
+ * The ask is a human merging (or otherwise closing out) a pull request.
+ *
+ * PEN-5254. `payload.gate` is the only server-checked retirement field, and until
+ * this kind existed it could express exactly one event. Measured across all 854
+ * cards in the originating company: 7 carried a well-formed gate, 6 of those 7
+ * auto-retired, and all 6 `cancelled` cards in the corpus were gate carriers — so
+ * every automatic card retirement on record came from this field, while it was set
+ * on 0.8% of cards. The other 124 hand-rolled a prose substitute ("I withdraw this
+ * card when #N merges") which is void in exactly the branch where the ask succeeds,
+ * because `withdraw` accepts only the undecided set and returns 409 once a card is
+ * decided. Six of six requesting agents independently wrote that sentence.
+ *
+ * ⇒ The fleet did not fail to use the mechanism; the mechanism did not cover the
+ * event. A capability gap does not surface as an error, it surfaces as six people
+ * writing the same sentence.
+ *
+ * Named `github_pr_merged` to match the ref shape already carried by
+ * `interactions.payload.expectedOutcome`, so the two surfaces spell the same event
+ * the same way. The resolver is NOT shared with that surface: `expectedOutcome` is
+ * evaluated by inline SQL over the webhook-fed `issue_pull_requests` mirror, while
+ * this gate is read live from the GitHub API by `githubGetPullRequestGate` — the
+ * same trust model as the Actions kind beside it, which is the property that
+ * matters on a field that retires cards without an actor.
+ */
+export const approvalPullRequestGateSchema = z.object({
+  kind: z.literal("github_pr_merged"),
+  repoFullName: gateRepoFullNameSchema,
+  prNumber: z.number().int().positive(),
+  url: z.string().trim().url().optional(),
+});
+
+/**
+ * Machine-readable pointer from a card to the external gate a human must act on.
+ *
+ * Supplying this lets `approval-gate-reconciler` close the card when the gate
+ * reaches a terminal state. It stays optional because most approval types have no
+ * external gate — absence means "nothing to reconcile", never "gate is healthy".
+ *
+ * ⚠️ It is not a general "related link" field. The card is retired the moment the
+ * named gate terminates, whether or not the ask was ever read, so the gate must BE
+ * the ask. Naming a CI run on the PR a card asks a human to *review* is the
+ * measured failure mode (PEN-5103): two such cards died in under eight minutes
+ * each. `routes/approvals.ts` refuses an already-terminal gate of either kind at
+ * file time for that reason.
+ */
+export const approvalGateSchema = z.discriminatedUnion("kind", [
+  approvalActionsRunGateSchema,
+  approvalPullRequestGateSchema,
+]);
+
 export type ApprovalGate = z.infer<typeof approvalGateSchema>;
+export type ApprovalGateKind = ApprovalGate["kind"];
+
+/**
+ * Every gate kind, for consumers that must enumerate them — notably the
+ * reconciler's jsonb candidate predicate, which cannot read the zod union.
+ *
+ * The two assertions below make this list TOTAL at compile time in both
+ * directions: adding a kind to `approvalGateSchema` without adding it here is a
+ * type error, and so is listing a kind the schema does not accept. A plain list
+ * would still fail safe — an unlisted kind is simply never reconciled — but it
+ * would fail *silently*, which is the same shape of invisible coverage gap that
+ * `RECONCILABLE_BY_APPROVAL_TYPE` is a total map to avoid.
+ */
+export const APPROVAL_GATE_KINDS = ["github_actions_run", "github_pr_merged"] as const;
+
+// Every listed kind is a real one.
+const _approvalGateKindsAreValid: readonly ApprovalGateKind[] = APPROVAL_GATE_KINDS;
+void _approvalGateKindsAreValid;
+// Every real kind is listed.
+const _approvalGateKindsAreTotal: Exclude<
+  ApprovalGateKind,
+  (typeof APPROVAL_GATE_KINDS)[number]
+> extends never
+  ? true
+  : never = true;
+void _approvalGateKindsAreTotal;
 
 /**
  * Read a gate out of a persisted `payload` jsonb blob.

@@ -32,8 +32,14 @@ import {
 } from "../services/approval-enforcement-reconciler.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
-import { classifyGateLookup } from "../services/approval-gate-reconciler.js";
-import { githubGetWorkflowRun } from "../services/github-app-auth.js";
+import {
+  classifyGateLookup,
+  classifyPullRequestGateLookup,
+} from "../services/approval-gate-reconciler.js";
+import {
+  githubGetPullRequestGate,
+  githubGetWorkflowRun,
+} from "../services/github-app-auth.js";
 import { applyApprovalEnforcement } from "../services/approval-enforcement-executor.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
@@ -211,36 +217,75 @@ function budgetAssertionRefusal(type: string, payload: unknown) {
 // an unreadable one, a rate-limited lookup, or any thrown error all pass: a throttled
 // GitHub must not be able to block escalations, the same fail-safe direction the
 // reconciler takes when it declines to retire gates it cannot read.
+//
+// ⚠️ PEN-5254 widened `payload.gate` to `github_pr_merged`, and that makes THIS guard
+// load-bearing in a way it was not before. Until then the field's safety rested partly
+// on scarcity: an agent has an Actions `runId` only when the ask really is a deployment
+// gate, which is why just 7 of 854 cards carried a gate at all. An agent has a PR
+// number for almost every card it files. So the misuse surface moves from rare to
+// default, and the already-terminal case — filing against a PR that merged yesterday —
+// goes from an edge case to the most likely first mistake. Both kinds are checked here
+// for that reason; shipping the new kind without this mirror would have reproduced
+// PEN-5103 on the wider surface on day one.
 async function gateAlreadyTerminalRefusal(payload: unknown) {
   const gate = parseApprovalGate(payload);
   if (!gate) return null;
 
-  let lookup;
+  let disposition;
   try {
-    lookup = await githubGetWorkflowRun({ repoFullName: gate.repoFullName, runId: gate.runId });
+    disposition =
+      gate.kind === "github_actions_run"
+        ? classifyGateLookup(
+            await githubGetWorkflowRun({
+              repoFullName: gate.repoFullName,
+              runId: gate.runId,
+            }),
+          )
+        : classifyPullRequestGateLookup(
+            await githubGetPullRequestGate({
+              repoFullName: gate.repoFullName,
+              prNumber: gate.prNumber,
+            }),
+          );
   } catch {
     return null;
   }
-  const disposition = classifyGateLookup(lookup);
   if (disposition.kind !== "terminal") return null;
+
+  const ref =
+    gate.kind === "github_actions_run"
+      ? `${gate.repoFullName} run ${gate.runId}`
+      : `${gate.repoFullName} PR #${gate.prNumber}`;
+  const subject =
+    gate.kind === "github_actions_run"
+      ? "a run that is already over"
+      : "a pull request that is already closed";
 
   return {
     error:
-      `payload.gate names ${gate.repoFullName} run ${gate.runId}, which is not a live gate ` +
-      `(${disposition.summary}). A card bound to a run that is already over is closed by the ` +
+      `payload.gate names ${ref}, which is not a live gate ` +
+      `(${disposition.summary}). A card bound to ${subject} is closed by the ` +
       "approval-gate reconciler on its next sweep and can never be approved",
     details: {
       code: "approval_gate_already_terminal",
-      gate: { repoFullName: gate.repoFullName, runId: gate.runId },
+      gate:
+        gate.kind === "github_actions_run"
+          ? { kind: gate.kind, repoFullName: gate.repoFullName, runId: gate.runId }
+          : { kind: gate.kind, repoFullName: gate.repoFullName, prNumber: gate.prNumber },
       remediation:
-        "If the ask is literally a human clicking an Actions deployment gate, name the run that " +
-        "is actually WAITING on that gate — not a CI run on the same PR, and not a run that has " +
-        "already finished. If the ask is anything else — a PR review, a merge click, a " +
-        "credential grant, an operator action — do not set `payload.gate` at all. It is not a " +
-        "general 'related link' field: it means the ask IS a human clicking that Actions gate, " +
-        "and the card is retired the moment that run ends, whether or not your ask was ever " +
-        "read. Put the PR or run URL in `payload.title` instead, where it informs a human " +
-        "without binding the card's lifetime to it.",
+        "`payload.gate` means the ask IS the named gate, and the card is retired the moment that " +
+        "gate terminates, whether or not your ask was ever read. Pick the form that matches your " +
+        "ask. If the ask is a human clicking an Actions deployment gate: " +
+        '`{kind: "github_actions_run", repoFullName, runId}`, naming the run that is actually ' +
+        "WAITING on that gate — not a CI run on the same PR, and not a run that has already " +
+        "finished. If the ask is a human merging a pull request: " +
+        '`{kind: "github_pr_merged", repoFullName, prNumber}`, naming a PR that is still OPEN — ' +
+        "if it has already merged or closed, the thing you are asking for has already happened " +
+        "or can no longer happen, and the card is dead on arrival. If the ask is anything else " +
+        "— a credential grant, an operator action, a review that is not itself the merge — do " +
+        "not set `payload.gate` at all; it is not a general 'related link' field. Put the PR or " +
+        "run URL in `payload.title` instead, where it informs a human without binding the " +
+        "card's lifetime to it.",
     },
   };
 }

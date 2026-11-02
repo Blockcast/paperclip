@@ -30,6 +30,7 @@ import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issueComments } from "@paperclipai/db";
 import {
+  APPROVAL_GATE_KINDS,
   APPROVAL_TYPES,
   APPROVAL_UNDECIDED_STATUSES,
   parseApprovalGate,
@@ -39,7 +40,12 @@ import {
 } from "@paperclipai/shared";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
-import { githubGetWorkflowRun, type WorkflowRunLookup } from "./github-app-auth.js";
+import {
+  githubGetPullRequestGate,
+  githubGetWorkflowRun,
+  type PullRequestGateResult,
+  type WorkflowRunLookup,
+} from "./github-app-auth.js";
 
 /** Cards examined per DB batch. */
 const CANDIDATE_BATCH_SIZE = 100;
@@ -156,6 +162,18 @@ export type ApprovalGateReconcilerOptions = {
   logger?: typeof defaultLogger;
   /** Seam for tests; defaults to the real GitHub App call. */
   fetchRun?: (input: { repoFullName: string; runId: number }) => Promise<WorkflowRunLookup>;
+  /**
+   * Seam for tests; defaults to the real GitHub App call (PEN-5254).
+   *
+   * A separate seam rather than one polymorphic fetch: the two gate kinds have
+   * different result types with different fail-closed properties, and collapsing
+   * them behind one signature would hide that `githubGetPullRequestGate` has no
+   * card-closing failure branch at all while `githubGetWorkflowRun` has exactly one.
+   */
+  fetchPullRequest?: (input: {
+    repoFullName: string;
+    prNumber: number;
+  }) => Promise<PullRequestGateResult>;
   now?: () => Date;
 };
 
@@ -215,9 +233,73 @@ export function classifyGateLookup(lookup: WorkflowRunLookup): GateDisposition {
   };
 }
 
+/**
+ * Turn a pull-request lookup into a decision about the card (PEN-5254).
+ *
+ * ## Fail-closed, and more strongly than the Actions path
+ *
+ * `githubGetPullRequestGate` maps **every** non-2xx to `{ error }` — it has no
+ * `not_found` branch. So unlike {@link classifyGateLookup}, there is no input on
+ * which this retires a card it could not read: a deleted PR, a revoked
+ * installation, a rate limit and a network fault all defer identically. That is
+ * the property `githubGetWorkflowRun` needs 404 disambiguation to reach, and it is
+ * why this classifier is deliberately shorter rather than symmetric.
+ *
+ * ## The deliberate divergence from `terminal-gate-reconciler`, and why
+ *
+ * That module's header states the opposite rule as a fail-closed invariant: *"Only
+ * `merged` counts as satisfied. A PR closed without merging is equally terminal but
+ * the work did not land … it must not read as 'done, go close the issue', and must
+ * not suppress oversight."* Both halves of that rule are kept here, and only the
+ * disposition differs, because the two modules act on different objects:
+ *
+ *   - **`satisfied` keeps its narrow meaning.** Only `merged` sets it. A PR closed
+ *     without merging reports `satisfied: false` and gets its own summary string
+ *     and its own announcement, so nothing downstream can read it as success.
+ *   - **`terminal` is where we diverge.** That module decides whether to tell a
+ *     human an *issue* looks finished, and closed-unmerged means the work is not.
+ *     This module decides the fate of a *card* whose ask is "merge #N" — and once
+ *     #N is closed unmerged that ask is **unsatisfiable**, not merely unmet. No
+ *     human can ever approve it. Leaving it pending forever is the worse failure
+ *     and is precisely the PEN-2043 supersession shape (#1058 closed, the work
+ *     landed as #1122), where the gate token dies while the work ships.
+ *
+ * Stated rather than inherited silently: without this note two files would carry
+ * opposite rules on the same predicate with nothing saying why.
+ */
+export function classifyPullRequestGateLookup(lookup: PullRequestGateResult): GateDisposition {
+  if ("error" in lookup) {
+    return { kind: "deferred", reason: lookup.error };
+  }
+  if (lookup.state === "open") {
+    return { kind: "live" };
+  }
+  if (lookup.merged) {
+    return {
+      kind: "terminal",
+      summary: "the pull request has merged",
+      satisfied: true,
+      url: null,
+    };
+  }
+  return {
+    kind: "terminal",
+    summary: "the pull request was closed without merging",
+    satisfied: false,
+    url: null,
+  };
+}
+
+/** Human-readable name of the gate a card points at, independent of markup. */
+function gateRef(gate: ApprovalGate): string {
+  return gate.kind === "github_actions_run"
+    ? `${gate.repoFullName} run ${gate.runId}`
+    : `${gate.repoFullName} PR #${gate.prNumber}`;
+}
+
 function gateLabel(gate: ApprovalGate, fallbackUrl: string | null): string {
   const url = gate.url ?? fallbackUrl;
-  const name = `${gate.repoFullName} run ${gate.runId}`;
+  const name = gateRef(gate);
   return url ? `[${name}](${url})` : `\`${name}\``;
 }
 
@@ -228,24 +310,52 @@ function announcementBody(input: {
 }): string {
   const label = gateLabel(input.gate, input.disposition.url);
   const title = input.approvalTitle ? ` — *${input.approvalTitle}*` : "";
-  const headline = input.disposition.satisfied
-    ? "Approval card closed: the gate it pointed at has already completed"
-    : "Approval card closed: the gate it pointed at died undecided";
-  const consequence = input.disposition.satisfied
-    ? [
-        "**This does not say the card's ask was met.** The only thing read here is the named",
-        "run's own outcome: it finished green, so there is no longer a gate for anyone to click",
-        "and this card can no longer be approved. If the thing the card actually asked for has",
-        "not happened, it still has not happened. Re-file it — and attach `payload.gate` only",
-        "when the ask is literally a human clicking that Actions gate, never for a PR review, a",
-        "credential grant, or an operator action, because the card dies when that run ends.",
-      ].join(" ")
-    : [
-        "**Nobody approved or rejected it — the run ended first.** The card was closed as",
-        "`cancelled` rather than left pointing at a dead gate. If this work still needs a",
-        "deploy, a *new* run must be dispatched and a new card filed; this card can no",
-        "longer be approved.",
-      ].join(" ");
+  const isPullRequest = input.gate.kind === "github_pr_merged";
+  const headline = isPullRequest
+    ? input.disposition.satisfied
+      ? "Approval card closed: the pull request it pointed at has merged"
+      : "Approval card closed: the pull request it pointed at was closed without merging"
+    : input.disposition.satisfied
+      ? "Approval card closed: the gate it pointed at has already completed"
+      : "Approval card closed: the gate it pointed at died undecided";
+
+  // Four texts rather than two, because the PR kind's unsatisfied branch is NOT
+  // "the gate died before anyone could act" — it is "the gate became unsatisfiable
+  // while the work possibly shipped elsewhere" (PEN-2043). Collapsing them would
+  // send a reader looking for an abandoned gate instead of a successor PR.
+  const consequence = isPullRequest
+    ? input.disposition.satisfied
+      ? [
+          "**This does not say the card's ask was met.** The only thing read here is the named",
+          "pull request's own state: it merged, so the merge this card was waiting on has",
+          "happened and the card can no longer be approved. If the card asked for anything",
+          "beyond that merge, it still has not happened — re-file it.",
+        ].join(" ")
+      : [
+          "**The work did not land, and nobody approved or rejected this card.** The pull",
+          "request was closed without merging, which makes this card's gate *unsatisfiable*:",
+          "no human can ever merge that PR now, so the card was closed as `cancelled` rather",
+          "than left asking for something impossible. **This is not a success.** If the work",
+          "was superseded by a different pull request, file a new card naming that one; if it",
+          "was abandoned, nothing further is owed.",
+        ].join(" ")
+    : input.disposition.satisfied
+      ? [
+          "**This does not say the card's ask was met.** The only thing read here is the named",
+          "run's own outcome: it finished green, so there is no longer a gate for anyone to click",
+          "and this card can no longer be approved. If the thing the card actually asked for has",
+          "not happened, it still has not happened. Re-file it — and attach `payload.gate` only",
+          "when the gate IS the ask, because the card dies when that gate ends. For an Actions",
+          "deployment gate use `{kind: \"github_actions_run\", runId}`; for a merge click use",
+          "`{kind: \"github_pr_merged\", prNumber}`; for a credential grant or an operator",
+          "action use neither.",
+        ].join(" ")
+      : [
+          "**Nobody approved or rejected it — the run ended first.** The card was closed as",
+          "`cancelled` rather than left pointing at a dead gate. If this work still needs a",
+          "deploy, a *new* run must be dispatched and a new card filed; this card can no",
+          "longer be approved.",
+        ].join(" ");
 
   return [
     `## ${headline}${title}`,
@@ -304,16 +414,19 @@ function announcementMetadata(input: {
           { type: "key_value", label: RECONCILED_CARD_LABEL, value: input.approvalId },
           {
             type: "key_value",
-            label: "GitHub run",
-            value: `${input.gate.repoFullName} run ${input.gate.runId}`,
+            label: input.gate.kind === "github_pr_merged" ? "GitHub pull request" : "GitHub run",
+            value: gateRef(input.gate),
           },
-          // Labelled for what it measures — the run's outcome — not for whether the
-          // card got what it asked for. The old label read `Gate satisfied`, which a
-          // reader of a mis-attached gate reasonably took as "the escalation landed"
+          // Labelled for what it measures — the gate's own outcome — not for whether
+          // the card got what it asked for. The old label read `Gate satisfied`, which
+          // a reader of a mis-attached gate reasonably took as "the escalation landed"
           // (PEN-5103). Nothing outside this sweep's own tests reads the label.
           {
             type: "key_value",
-            label: "Named run finished green",
+            label:
+              input.gate.kind === "github_pr_merged"
+                ? "Named pull request merged"
+                : "Named run finished green",
             value: input.satisfied ? "yes" : "no",
           },
         ],
@@ -332,7 +445,11 @@ async function listCandidateApprovals(
     // Cascade-bearing types are excluded here, not downstream: see
     // RECONCILABLE_APPROVAL_TYPES. A gated `hire_agent` card must stay pending.
     inArray(approvals.type, [...RECONCILABLE_APPROVAL_TYPES]),
-    sql`${approvals.payload}->'gate'->>'kind' = 'github_actions_run'`,
+    // Both gate kinds (PEN-5254). Derived from the schema's own union rather than
+    // re-spelled here: a kind added to `approvalGateSchema` that is not added to
+    // this list is silently never reconciled, which is the exact shape of silent
+    // coverage gap `RECONCILABLE_BY_APPROVAL_TYPE` is a total map to avoid.
+    inArray(sql`${approvals.payload}->'gate'->>'kind'`, [...APPROVAL_GATE_KINDS]),
   ];
   if (cursor) {
     // postgres.js will not bind a Date into a raw `sql` fragment (it only accepts
@@ -379,8 +496,10 @@ async function closeAndAnnounce(
   const payload = (candidate.payload ?? {}) as Record<string, unknown>;
   const approvalTitle = typeof payload.title === "string" ? payload.title : null;
   const note = disposition.satisfied
-    ? `Gate completed before a decision was recorded (${gate.repoFullName} run ${gate.runId}: ${disposition.summary}). Closed by the approval-gate reconciler.`
-    : `Gate died undecided (${gate.repoFullName} run ${gate.runId}: ${disposition.summary}). Closed by the approval-gate reconciler.`;
+    ? `Gate completed before a decision was recorded (${gateRef(gate)}: ${disposition.summary}). Closed by the approval-gate reconciler.`
+    : gate.kind === "github_pr_merged"
+      ? `Gate became unsatisfiable (${gateRef(gate)}: ${disposition.summary}). Closed by the approval-gate reconciler.`
+      : `Gate died undecided (${gateRef(gate)}: ${disposition.summary}). Closed by the approval-gate reconciler.`;
 
   return db.transaction(async (tx) => {
     const txDb = tx as unknown as Db;
@@ -451,7 +570,13 @@ async function closeAndAnnounce(
         type: row.type,
         reason: note,
         repoFullName: gate.repoFullName,
-        runId: gate.runId,
+        gateKind: gate.kind,
+        // Only ever one of these, and the absent one is omitted rather than null:
+        // a `runId: null` on a PR-gated card reads as "we looked for a run and
+        // there wasn't one" to anything querying this log.
+        ...(gate.kind === "github_actions_run"
+          ? { runId: gate.runId }
+          : { prNumber: gate.prNumber }),
         gateSatisfied: disposition.satisfied,
         announcedIssues: announced,
       },
@@ -477,6 +602,7 @@ export async function reconcileApprovalGates(
   const maxLookups = Math.max(1, options.maxLookups ?? MAX_LOOKUPS_PER_SWEEP);
   const log = options.logger ?? defaultLogger;
   const fetchRun = options.fetchRun ?? githubGetWorkflowRun;
+  const fetchPullRequest = options.fetchPullRequest ?? githubGetPullRequestGate;
   const now = options.now ?? (() => new Date());
 
   const result: ApprovalGateReconcileResult = {
@@ -518,19 +644,31 @@ export async function reconcileApprovalGates(
       cursor = { createdAt: candidate.createdAt, id: candidate.id };
       result.examined += 1;
 
-      let lookup: WorkflowRunLookup;
+      // Dispatch by kind. Each arm pairs its own fetch with its own classifier:
+      // the two result shapes have different fail-closed properties (see
+      // `classifyPullRequestGateLookup`) and must not be narrowed to a common one.
+      let disposition: GateDisposition;
       try {
-        lookup = await fetchRun({ repoFullName: gate.repoFullName, runId: gate.runId });
+        disposition =
+          gate.kind === "github_actions_run"
+            ? classifyGateLookup(
+                await fetchRun({ repoFullName: gate.repoFullName, runId: gate.runId }),
+              )
+            : classifyPullRequestGateLookup(
+                await fetchPullRequest({
+                  repoFullName: gate.repoFullName,
+                  prNumber: gate.prNumber,
+                }),
+              );
       } catch (err) {
         result.deferred += 1;
         log.warn(
-          { err, approvalId: candidate.id, repoFullName: gate.repoFullName, runId: gate.runId },
-          "approval-gate reconciler could not read a workflow run; leaving the card pending",
+          { err, approvalId: candidate.id, gate: gateRef(gate) },
+          "approval-gate reconciler could not read the gate; leaving the card pending",
         );
         continue;
       }
 
-      const disposition = classifyGateLookup(lookup);
       if (disposition.kind === "live") {
         result.live += 1;
         continue;
@@ -540,8 +678,7 @@ export async function reconcileApprovalGates(
         log.warn(
           {
             approvalId: candidate.id,
-            repoFullName: gate.repoFullName,
-            runId: gate.runId,
+            gate: gateRef(gate),
             reason: disposition.reason,
           },
           "approval-gate reconciler deferred a card because GitHub was unreadable (BLO-29359)",
@@ -563,7 +700,7 @@ export async function reconcileApprovalGates(
         // through a different door.
         result.failed += 1;
         log.error(
-          { err, approvalId: candidate.id, repoFullName: gate.repoFullName, runId: gate.runId },
+          { err, approvalId: candidate.id, gate: gateRef(gate) },
           "approval-gate reconciler could not close a card; left it pending and continued (BLO-29359)",
         );
         continue;

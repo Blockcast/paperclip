@@ -47,10 +47,11 @@
  *
  * - **Blocker-premise** reads `issue_relations` + the blockers' `status`.
  * - **Approval-gate** reads `issue_approvals` + `approvals.status`. It does
- *   *not* re-call the GitHub API for `gate.kind: github_actions_run` cards,
- *   because `approval-gate-reconciler.ts` already polls those runs and closes
- *   the card when the run terminates. Reading the card's status reuses that
- *   audited mechanism instead of building a second, disagreeing one.
+ *   *not* re-call the GitHub API for cards carrying a `payload.gate` of any
+ *   kind, because `approval-gate-reconciler.ts` already polls those artifacts
+ *   (Actions runs and pull requests alike, PEN-5254) and closes the card when
+ *   one terminates. Reading the card's status reuses that audited mechanism
+ *   instead of building a second, disagreeing one.
  * - **Pending-interaction** (BLO-30627) reads `issue_thread_interactions`.
  *
  * ## Why the third probe is interactions, not permission/RBAC (BLO-30627)
@@ -486,9 +487,11 @@ export function probeBlockerPremise(input: GateEvidenceInput): ProbeResult | nul
 /**
  * Approval-gate probe.
  *
- * Reads the linked cards' own statuses. For `gate.kind: github_actions_run`
- * cards that status is already maintained against the live run by
- * `approval-gate-reconciler.ts`, so this needs no GitHub call of its own.
+ * Reads the linked cards' own statuses. For any card carrying a `payload.gate`
+ * that status is already maintained against the live artifact by
+ * `approval-gate-reconciler.ts`, so this needs no GitHub call of its own. This
+ * probe branches on card status only and never on `gate.kind`, which is why
+ * PEN-5254 adding a second kind needed no change here beyond this sentence.
  *
  * Four outcomes (PEN-3089 split the last three out of one):
  *
