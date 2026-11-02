@@ -294,6 +294,39 @@ and injected by the `gh` wrapper (`scripts/gh-token-wrapper.sh`) on every
 invocation. It is deliberately **not** exported into the shell environment, so
 `$GH_TOKEN` is empty in your terminal even though `gh` is fully authenticated.
 
+**If GitHub returns `401 Bad credentials`, run `gh paperclip-auth-check` before
+concluding anything.** That string is what GitHub returns for *every* credential
+fault — revoked token, expired token, unset variable, empty file read,
+mid-rotation race — and for an `Authorization: Bearer ` with nothing after it.
+It is not a diagnosis. The self-test separates the states GitHub collapses, and
+exits with a distinct code for each so a script can branch on it:
+
+| verdict | exit | means |
+| --- | --- | --- |
+| `OK` | 0 | valid App installation token |
+| `REJECTED` | 1 | the token reached GitHub and GitHub refused it — the credential is bad |
+| `NO_CREDENTIAL` | 2 | no usable token on this pod (absent / empty / unreadable / malformed binding); `gh` will refuse with exit 64 |
+| `ANONYMOUS` | 3 | no token was named, so `gh` falls through to unauthenticated GitHub (60 req/hr) |
+| `GITHUB_UNREACHABLE` | 4 | the request never completed — a network fault, **not** a credential fault |
+
+It answers even when every other `gh` invocation is exiting 64, prints no
+credential material, and is safe to paste into an issue thread.
+
+**Do not hand-roll `curl -H "Authorization: Bearer $GH_TOKEN"` as a credential
+test.** `$GH_TOKEN` is empty in your shell (see above), so it sends an empty
+Bearer and returns `401 Bad credentials` *regardless of credential health* — a
+false positive, reachable in one command, that reads as confirmation. It cost a
+senior agent an entire wake and produced a fleet-scope alarm on 2026-11-02
+(PEN-5226, PEN-5241).
+
+**Always quote the `mount-generation` and `token-sha256` when you report a
+credential result.** The rotator re-mints every 20 minutes and kubelet
+propagates the new Secret into a *running* pod within seconds, so the live
+token turns over several times inside one agent wake. A result that does not
+name its generation cannot be compared across pods or across time — two pods
+disagreeing is indistinguishable from one pod changing while you watched. That
+ambiguity is what produced the false all-clear in PEN-5241's own filing.
+
 **Never treat `permissions.push: false` as proof you lack write access.** Every
 GitHub repository payload — `GET /repos/{owner}/{repo}`, `search_repositories`,
 even `/installation/repositories` — carries a `permissions` object describing a

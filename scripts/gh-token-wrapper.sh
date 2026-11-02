@@ -27,6 +27,15 @@ GH_SELF="${GH_TOKEN_WRAPPER_SELF:-/usr/bin/gh}"
 # a shadowing `git` could behave arbitrarily differently underneath us here.
 GIT_BIN="${GH_TOKEN_WRAPPER_GIT:-/usr/bin/git}"
 
+# PEN-5241: which credential this wrapper actually supplied, for `gh auth
+# status` to report. `gh` prints "Logged in ... (GH_TOKEN)" because GH_TOKEN is
+# what it was handed — but GH_TOKEN does not exist in the caller's environment,
+# this wrapper exports it into the child only. An agent reading that line
+# reasonably runs `curl -H "Authorization: Bearer $GH_TOKEN"`, gets an empty
+# Bearer, gets 401, and concludes the credential is dead. Naming the real source
+# costs one stderr line and removes the whole false trail.
+WRAPPER_TOKEN_SOURCE="none — this wrapper supplied no credential; gh is on ambient auth"
+
 # `gh auth setup-git` asks the running `gh` binary to report its own on-disk
 # path (via /proc/self/exe, not argv[0]) and writes that path into git's
 # credential.*.helper. Because this wrapper delegates by `exec`, the running
@@ -42,6 +51,15 @@ GIT_BIN="${GH_TOKEN_WRAPPER_GIT:-/usr/bin/git}"
 # the regression or silently skipping a command the caller explicitly asked
 # for.
 exec_real_gh() {
+  # PEN-5241: `gh auth status` is the one command whose whole job is to answer
+  # "where is my credential coming from", and stock gh answers it with the name
+  # of a variable that is not set in the caller's shell. Correct it at the point
+  # of the misdirection. stderr, so no parser of gh's stdout changes behaviour.
+  case "${1:-} ${2:-}" in
+    "auth status")
+      echo "gh-token-wrapper: credential source is ${WRAPPER_TOKEN_SOURCE}. Any \"(GH_TOKEN)\" below names the variable this wrapper exported into gh, NOT one set in your shell — \$GH_TOKEN is empty there, so curl-ing with it returns 401 regardless of credential health. Run \`gh paperclip-auth-check\` to test the credential itself (PEN-5241)." >&2
+      ;;
+  esac
   case "${1:-} ${2:-}" in
     "pr merge") squash_merge_without_ai_trailers "$@" ;;
     "pr ready") refuse_ready_on_held_draft "$@" ;;
@@ -299,6 +317,257 @@ fix_setup_git_credential_helper() {
   echo "gh-token-wrapper: gh auth setup-git (directly or via gh auth login) wrote a credential helper pointing at ${REAL_GH} (its own on-disk path, per BLO-25702); rewrote the global git config to route through ${GH_SELF} instead" >&2
 }
 
+# BLO-40279: never read a credential off the fleet-shared data volume. Every
+# agent uid can write there, so a readable file on it proves nothing about who
+# put it there — a vacated /paperclip/.secrets/<name>/ is a bare, group-writable
+# directory, and a token planted in it would run `gh` as an identity the caller
+# never chose. A Secret mounted *under* the volume is its own tmpfs with its own
+# device, so it still passes. Compared by device rather than by path prefix,
+# because a symlink or any other pinned path reaches the same filesystem. Fails
+# closed when either side cannot be stat'ed.
+#
+# Defined up here with the other functions, rather than beside its first use in
+# the branch chain below, so `paperclip_auth_check` can reach it too (PEN-5241).
+# The self-test has to report the same shared-volume verdict the real path would
+# reach, and deriving that from a second implementation is how a diagnostic ends
+# up disagreeing with the thing it diagnoses.
+SHARED_VOLUME="${PAPERCLIP_HOME:-/paperclip}"
+token_file_on_shared_volume() {
+  [ -d "${SHARED_VOLUME}" ] || return 1
+  shared_dev="$(stat -L -c %d -- "${SHARED_VOLUME}" 2>/dev/null)" || return 0
+  file_dev="$(stat -L -c %d -- "${TOKEN_FILE}" 2>/dev/null)" || return 0
+  [ "${file_dev}" = "${shared_dev}" ]
+}
+
+# PEN-5241: `gh paperclip-auth-check` — a one-shot GitHub credential self-test.
+#
+# `401 Bad credentials` is the byte-identical response GitHub returns for every
+# credential fault there is: revoked token, expired token, unset variable, empty
+# file read, mid-rotation race, and an `Authorization: Bearer ` with nothing
+# after it. It is not a diagnosis. It reads like one, and on 2026-11-02 two
+# agents reached opposite wrong conclusions from it inside fifteen minutes —
+# one hand-rolled a five-probe isolation and still could not tell its own seat
+# from the fleet (PEN-5239), the other measured a 200 on a *later* token
+# generation and wrote a false all-clear into a bug report (PEN-5241).
+#
+# The self-test an agent reaches for first cannot work here. `curl -H
+# "Authorization: Bearer $GH_TOKEN" ...` reads a variable that does not exist in
+# an agent pod — this wrapper exports GH_TOKEN into the child it execs, never
+# into the caller's shell — so it sends an empty Bearer and gets 401 regardless
+# of credential health. That is a false credential-death signal reachable in one
+# command, and it reads as confirmation.
+#
+# Three properties this has to have, each one bought by a specific past failure:
+#
+#  1. It is dispatched BEFORE every credential branch below, so it still answers
+#     on a pod where those branches exit 64. A diagnostic that needs a working
+#     credential to tell you the credential is broken is not a diagnostic.
+#  2. It separates "GitHub said no" from "we never reached GitHub", using
+#     PEN-5239's control — an *unauthenticated* /rate_limit beside the
+#     authenticated probe. A bare authenticated 401 cannot tell those apart, and
+#     PEN-5239 had to establish that by hand mid-incident. (This is where
+#     PEN-5239's own "detector exists" item is satisfied.)
+#  3. It prints the mount generation and a truncated SHA-256. The rotator
+#     re-mints every 20 minutes and kubelet propagates into a *running* pod
+#     within seconds, so the live token turns over several times inside one
+#     agent wake. Without naming which generation a result describes, two pods
+#     disagreeing is indistinguishable from one pod changing over time — which
+#     is precisely the false clear that PEN-5241 was filed with.
+#
+# Never prints credential material: a truncated hash identifies a generation
+# without revealing it, which is what makes two reports comparable at all.
+GITHUB_API_BASE="${GH_TOKEN_WRAPPER_API_BASE:-https://api.github.com}"
+
+# Emits "<http_code> <x-ratelimit-limit>". http_code is 000 when the request
+# never completed (DNS, TLS, proxy, timeout) — curl's transport failure is a
+# different fact from any status GitHub returns, and collapsing the two is the
+# mistake this whole subcommand exists to stop. The token, when present, travels
+# in a 0600 config file rather than argv, so it is never visible in `ps`.
+auth_check_probe() {
+  probe_path="$1"
+  probe_cfg="${2:-}"
+  probe_hdr="$(mktemp "${TMPDIR:-/tmp}/gh-auth-check.XXXXXX")"
+  probe_code=000
+  if [ -n "${probe_cfg}" ]; then
+    probe_code="$(curl -sS --max-time 15 --config "${probe_cfg}" -o /dev/null -D "${probe_hdr}" \
+      -w '%{http_code}' "${GITHUB_API_BASE}${probe_path}" 2>/dev/null)" || probe_code=000
+  else
+    probe_code="$(curl -sS --max-time 15 -o /dev/null -D "${probe_hdr}" \
+      -w '%{http_code}' "${GITHUB_API_BASE}${probe_path}" 2>/dev/null)" || probe_code=000
+  fi
+  [ -n "${probe_code}" ] || probe_code=000
+  probe_limit="$(awk 'tolower($1) == "x-ratelimit-limit:" { v = $2 }
+    END { gsub(/\r/, "", v); print (v == "" ? "-" : v) }' "${probe_hdr}" 2>/dev/null)" || probe_limit="-"
+  [ -n "${probe_limit}" ] || probe_limit="-"
+  rm -f "${probe_hdr}"
+  printf '%s %s\n' "${probe_code}" "${probe_limit}"
+}
+
+# Reports the kubelet atomic-writer generation backing a mounted Secret. kubelet
+# writes each version into a `..<timestamp>.<nonce>` directory and flips a
+# `..data` symlink at it, so the symlink target IS the generation identifier and
+# it is readable from inside the pod with no API access. Prints "-" for a token
+# file that is not a Secret mount (a path a caller wrote itself, or the test
+# harness's temp file), which is itself the answer to "is this pod reading a
+# managed credential or something someone left here".
+auth_check_mount_generation() {
+  gen_dir="$(dirname -- "$1")"
+  if [ -L "${gen_dir}/..data" ]; then
+    readlink "${gen_dir}/..data" 2>/dev/null || printf '%s\n' "-"
+  else
+    printf '%s\n' "-"
+  fi
+}
+
+paperclip_auth_check() {
+  check_source="none" check_state="absent" check_gen="-" check_written="-"
+  check_hash="-" check_bytes="-" check_token="" would_refuse=no
+
+  # Mirrors the precedence the branches below actually implement (value > file).
+  # Reporting a source the wrapper would not have used is the same class of
+  # misdirection as `gh auth status` naming GH_TOKEN, so this follows the real
+  # order rather than checking whichever is cheaper.
+  if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
+    check_source="GH_SEAT_TOKEN_VALUE (agent-scoped secret binding)"
+    # Same trim as the real branch: surrounding whitespace only, never a delete.
+    check_token="${GH_SEAT_TOKEN_VALUE}"
+    while :; do
+      case "${check_token}" in
+        [[:space:]]*) check_token="${check_token#?}" ;;
+        *[[:space:]]) check_token="${check_token%?}" ;;
+        *) break ;;
+      esac
+    done
+    if [ -z "${check_token}" ]; then
+      check_state="set-but-whitespace-only"
+      would_refuse=yes
+    else
+      case "${check_token}" in
+        *[[:space:]]*)
+          check_state="set-but-contains-embedded-whitespace"
+          would_refuse=yes
+          check_token=""
+          ;;
+        *) check_state="present" ;;
+      esac
+    fi
+  else
+    if [ "${PAPERCLIP_GITHUB_TOKEN_FILE+x}" = x ]; then
+      check_source="PAPERCLIP_GITHUB_TOKEN_FILE=${TOKEN_FILE}"
+      # `+x` not `-n`, matching require_token_file: a set-but-empty variable has
+      # still named a credential, and treating it as unset is the fail-open this
+      # wrapper exists to kill.
+      would_refuse=yes
+    else
+      check_source="compiled-in default ${TOKEN_FILE} (PAPERCLIP_GITHUB_TOKEN_FILE unset)"
+    fi
+
+    if [ -r "${TOKEN_FILE}" ] && token_file_on_shared_volume; then
+      check_state="on-shared-${SHARED_VOLUME}-volume-not-trusted"
+    elif [ -r "${TOKEN_FILE}" ]; then
+      check_token="$(tr -d '\r\n' < "${TOKEN_FILE}" 2>/dev/null || true)"
+      case "${check_token}" in
+        *[![:space:]]*) check_state="present" ;;
+        *) check_state="empty"; check_token="" ;;
+      esac
+      check_gen="$(auth_check_mount_generation "${TOKEN_FILE}")"
+      check_written="$(stat -L -c %y -- "${TOKEN_FILE}" 2>/dev/null | cut -d. -f1)" || check_written="-"
+      check_bytes="$(printf '%s' "${check_token}" | wc -c | tr -d ' ')"
+    elif [ -e "${TOKEN_FILE}" ]; then
+      check_state="exists-but-unreadable"
+    else
+      check_state="absent"
+    fi
+  fi
+
+  if [ -n "${check_token}" ]; then
+    check_hash="$(printf '%s' "${check_token}" | sha256sum 2>/dev/null | cut -c1-8)" || check_hash="-"
+    [ -n "${check_hash}" ] || check_hash="-"
+  fi
+
+  # PEN-5239's control, and it runs unconditionally: proving egress to GitHub is
+  # healthy is what turns a 401 into evidence instead of a guess, and proving it
+  # is *un*healthy is what stops a network fault being reported as a dead
+  # credential. An anonymous caller is rate-limited at 60/hr, so this doubles as
+  # the reference value for the anonymous-fallthrough arm below.
+  set -- $(auth_check_probe "/rate_limit")
+  anon_code="$1" anon_limit="$2"
+
+  auth_code="-" auth_limit="-"
+  if [ -n "${check_token}" ]; then
+    # /installation/repositories, not /rate_limit: a healthy *App installation*
+    # token authenticates there and is refused per-endpoint elsewhere (403 on
+    # /user, per PEN-3193), so a 200 here is positive proof of the identity this
+    # pod is supposed to hold rather than merely "some credential was accepted".
+    check_cfg="$(mktemp "${TMPDIR:-/tmp}/gh-auth-check-cfg.XXXXXX")"
+    chmod 600 "${check_cfg}"
+    printf 'header = "Authorization: Bearer %s"\n' "${check_token}" > "${check_cfg}"
+    set -- $(auth_check_probe "/installation/repositories" "${check_cfg}")
+    auth_code="$1" auth_limit="$2"
+    rm -f "${check_cfg}"
+  fi
+
+  if [ "${anon_code}" = 000 ]; then
+    github_reachable="NO (unauthenticated ${GITHUB_API_BASE}/rate_limit did not complete)"
+  else
+    github_reachable="yes (unauthenticated /rate_limit -> ${anon_code}, x-ratelimit-limit ${anon_limit})"
+  fi
+
+  # Verdicts are deliberately four distinct states with four distinct exit
+  # codes, because the whole defect is that GitHub collapses them into one
+  # string. Order matters: a transport failure is decided before anything is
+  # read as a statement by GitHub.
+  if [ -z "${check_token}" ]; then
+    if [ "${would_refuse}" = yes ]; then
+      verdict="NO_CREDENTIAL — no usable token (${check_state}); \`gh\` will refuse with exit 64, it will NOT fall back to ambient auth"
+      verdict_code=2
+    else
+      verdict="ANONYMOUS — no token and none was named, so \`gh\` falls through to unauthenticated GitHub (rate limit ${anon_limit}/hr)"
+      verdict_code=3
+    fi
+  elif [ "${auth_code}" = 000 ]; then
+    verdict="GITHUB_UNREACHABLE — a token is present and intact, but the authenticated request never completed; this is NOT a credential fault"
+    verdict_code=4
+  elif [ "${auth_code}" = 200 ]; then
+    verdict="OK — valid GitHub App installation token (rate limit ${auth_limit}/hr)"
+    verdict_code=0
+  elif [ "${auth_code}" = 401 ]; then
+    if [ "${anon_code}" = 000 ]; then
+      verdict="GITHUB_UNREACHABLE — authenticated 401, but unauthenticated GitHub is unreachable too, so the 401 is not trustworthy evidence about the credential"
+      verdict_code=4
+    else
+      verdict="REJECTED — the token reached GitHub and GitHub refused it, while unauthenticated GitHub answered ${anon_code}; the credential itself is bad"
+      verdict_code=1
+    fi
+  else
+    verdict="UNEXPECTED — authenticated /installation/repositories -> ${auth_code}; not a known state, report it with the generation above"
+    verdict_code=5
+  fi
+
+  printf 'gh paperclip-auth-check (PEN-5241)\n'
+  printf '  source:             %s\n' "${check_source}"
+  printf '  credential:         %s%s\n' "${check_state}" \
+    "$([ "${check_bytes}" = "-" ] && printf '' || printf ' (%s bytes)' "${check_bytes}")"
+  printf '  mount-generation:   %s\n' "${check_gen}"
+  printf '  mount-written:      %s\n' "${check_written}"
+  printf '  token-sha256:       %s\n' "${check_hash}"
+  printf '  github-reachable:   %s\n' "${github_reachable}"
+  printf '  authenticated:      /installation/repositories -> %s, x-ratelimit-limit %s\n' "${auth_code}" "${auth_limit}"
+  printf '  verdict:            %s\n' "${verdict}"
+  exit "${verdict_code}"
+}
+
+# PEN-5241: dispatched here, above every credential branch, on purpose. Each
+# branch below can exit 64 for a credential it refuses to use, and the one
+# moment an agent needs this subcommand is the moment those refusals are firing.
+# It is also deliberately not routed through exec_real_gh: `gh` has no such
+# subcommand and would exit 1 with a usage error.
+case "${1:-}" in
+  paperclip-auth-check | --paperclip-auth-check)
+    paperclip_auth_check
+    ;;
+esac
+
 # GH_SEAT_TOKEN_VALUE carries a token *value* rather than a path, for
 # credentials delivered by the scoped secret-binding path (agent-scoped env
 # bindings only) instead of by a mounted secret volume. Project, environment and
@@ -369,7 +638,7 @@ if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
   # that cat fail and leave the variable set-but-empty, so the refusal fires
   # here and never reaches reject_token_file()'s path-specific hint below.
   if [ -z "${TOKEN}" ]; then
-    echo "gh-token-wrapper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth. If it was filled by cat-ing a token file, that read failed: a path under /paperclip/.secrets is stale since BLO-40279, and the token Secrets now mount at /etc/paperclip/secrets/<name>/token" >&2
+    echo "gh-token-wrapper: GH_SEAT_TOKEN_VALUE is set but holds only whitespace; refusing to run with ambient auth. If it was filled by cat-ing a token file, that read failed: a path under /paperclip/.secrets is stale since BLO-40279, and the token Secrets now mount at /etc/paperclip/secrets/<name>/token. Run \`gh paperclip-auth-check\` for a full credential diagnosis (PEN-5241)" >&2
     exit 64
   fi
   case "${TOKEN}" in
@@ -384,6 +653,7 @@ if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
 
   export GH_TOKEN="${TOKEN}"
   export GITHUB_TOKEN="${TOKEN}"
+  WRAPPER_TOKEN_SOURCE="GH_SEAT_TOKEN_VALUE (agent-scoped secret binding)"
   exec_real_gh "$@"
 fi
 
@@ -460,24 +730,8 @@ reject_token_file() {
       moved=". That path is stale: the token Secrets moved to /etc/paperclip/secrets/<name>/token in BLO-40279, out from under the shared /paperclip volume. Point PAPERCLIP_GITHUB_TOKEN_FILE at the new path — this wrapper will not pick a credential for you, because the App token and the merge seat are different identities"
       ;;
   esac
-  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set, so a token file is required, but ${TOKEN_FILE} ${1}; refusing to run with ambient auth. GH_TOKEN/GITHUB_TOKEN are not used as a fallback; to run under a specific token, set GH_SEAT_TOKEN_VALUE${moved}" >&2
+  echo "gh-token-wrapper: PAPERCLIP_GITHUB_TOKEN_FILE is set, so a token file is required, but ${TOKEN_FILE} ${1}; refusing to run with ambient auth. GH_TOKEN/GITHUB_TOKEN are not used as a fallback; to run under a specific token, set GH_SEAT_TOKEN_VALUE${moved}. Run \`gh paperclip-auth-check\` for a full credential diagnosis (PEN-5241)" >&2
   exit 64
-}
-
-# BLO-40279: never read a credential off the fleet-shared data volume. Every
-# agent uid can write there, so a readable file on it proves nothing about who
-# put it there — a vacated /paperclip/.secrets/<name>/ is a bare, group-writable
-# directory, and a token planted in it would run `gh` as an identity the caller
-# never chose. A Secret mounted *under* the volume is its own tmpfs with its own
-# device, so it still passes. Compared by device rather than by path prefix,
-# because a symlink or any other pinned path reaches the same filesystem. Fails
-# closed when either side cannot be stat'ed.
-SHARED_VOLUME="${PAPERCLIP_HOME:-/paperclip}"
-token_file_on_shared_volume() {
-  [ -d "${SHARED_VOLUME}" ] || return 1
-  shared_dev="$(stat -L -c %d -- "${SHARED_VOLUME}" 2>/dev/null)" || return 0
-  file_dev="$(stat -L -c %d -- "${TOKEN_FILE}" 2>/dev/null)" || return 0
-  [ "${file_dev}" = "${shared_dev}" ]
 }
 
 if [ -r "${TOKEN_FILE}" ] && token_file_on_shared_volume; then
@@ -507,6 +761,11 @@ elif [ -r "${TOKEN_FILE}" ]; then
     # from stock `gh`, worth this comment so it isn't a surprise.
     export GH_TOKEN="${TOKEN}"
     export GITHUB_TOKEN="${TOKEN}"
+    if [ "${PAPERCLIP_GITHUB_TOKEN_FILE+x}" = x ]; then
+      WRAPPER_TOKEN_SOURCE="the file named by PAPERCLIP_GITHUB_TOKEN_FILE (${TOKEN_FILE})"
+    else
+      WRAPPER_TOKEN_SOURCE="the compiled-in default token file (${TOKEN_FILE}); PAPERCLIP_GITHUB_TOKEN_FILE is unset"
+    fi
   elif require_token_file; then
     reject_token_file "is empty"
   fi

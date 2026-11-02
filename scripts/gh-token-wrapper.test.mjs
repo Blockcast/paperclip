@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -1280,6 +1280,371 @@ test("markPullRequestReadyForReview through gh api is refused (BLO-48359)", () =
     const { proc, ran } = runReady(dir, ["api", "graphql", "-f", "query=mutation{markPullRequestReadyForReview(input:{pullRequestId:\"x\"}){clientMutationId}}"], prJson({}), 1);
     assert.equal(ran, undefined);
     assert.match(proc.stderr, /use `gh pr ready`/);
+  });
+});
+
+// --- PEN-5241: `gh paperclip-auth-check` -----------------------------------
+//
+// The defect these pin: `401 Bad credentials` is byte-identical for a revoked
+// token, an expired token, an unset variable, an empty file read and an empty
+// `Authorization: Bearer `. Two agents reached opposite wrong conclusions from
+// it inside fifteen minutes on 2026-11-02 (PEN-5239, PEN-5226). So the property
+// under test is not "the self-test runs" — it is that the states GitHub
+// collapses into one string come back DISTINGUISHABLE, in both the verdict text
+// and the exit code, which is what a script can branch on.
+
+// Deliberately short. The publish guard's vendor-key rule matches
+// `gh[pousr]_` followed by 20+ word characters and refuses the push outright —
+// a fixture is indistinguishable from a real token to a regex, which is the
+// point of the rule. Every other `ghs_` fixture in this file is short for the
+// same reason; keep new ones under that bound (PEN-3920).
+const AUTH_CHECK_VALID_TOKEN = "ghs_valid_app_tok";
+
+// A stand-in for api.github.com. The verdict logic keys on the exact signature
+// PEN-5239 established as the working oracle — an *unauthenticated* /rate_limit
+// beside an authenticated /installation/repositories — so the stub reproduces
+// both arms, including the 60/hr anonymous rate limit that separates "fell
+// through to anonymous" from "authenticated as the App". Local HTTP, so the
+// suite keeps running with no network and no credential.
+//
+// It runs in its OWN PROCESS, and that is load-bearing rather than tidiness.
+// Every assertion here drives the wrapper through spawnSync, which blocks this
+// process's event loop until the child exits — so a server on this loop could
+// never answer the curl that child is making, and every probe would instead sit
+// out its --max-time and come back as GITHUB_UNREACHABLE. That failure mode is
+// a nasty one because the suite still goes green: GITHUB_UNREACHABLE is a
+// verdict these tests legitimately assert elsewhere, so the stub would look
+// like it was working while testing nothing. Same written-to-disk-then-spawned
+// shape as STUB_GH_SOURCE above.
+const STUB_GITHUB_SOURCE = `import http from "node:http";
+
+const VALID = ${JSON.stringify(AUTH_CHECK_VALID_TOKEN)};
+
+const server = http.createServer((req, res) => {
+  const auth = req.headers.authorization ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length) : "";
+  const authenticated = token === VALID;
+
+  if (req.url.startsWith("/rate_limit")) {
+    // An empty or garbage Bearer gets the 401 GitHub really returns; a request
+    // carrying no header at all is the anonymous control, limited to 60/hr.
+    if (token && !authenticated) {
+      res.writeHead(401, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ message: "Bad credentials", status: "401" }));
+    }
+    res.writeHead(200, { "x-ratelimit-limit": authenticated ? "9500" : "60" });
+    return res.end("{}");
+  }
+
+  if (req.url.startsWith("/installation/repositories")) {
+    if (!authenticated) {
+      res.writeHead(401, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ message: "Bad credentials", status: "401" }));
+    }
+    res.writeHead(200, { "x-ratelimit-limit": "9500" });
+    return res.end("{}");
+  }
+
+  res.writeHead(404);
+  res.end("{}");
+});
+
+server.listen(0, "127.0.0.1", () => {
+  process.stdout.write(\`PORT=\${server.address().port}\\n\`);
+});
+`;
+
+async function withStubGitHub(fn) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "gh-stub-github-"));
+  const scriptPath = path.join(dir, "stub-github.mjs");
+  writeFileSync(scriptPath, STUB_GITHUB_SOURCE);
+
+  const child = spawn(process.execPath, [scriptPath], { stdio: ["ignore", "pipe", "inherit"] });
+  try {
+    const port = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("stub GitHub did not report a port within 10s")), 10_000);
+      let buffered = "";
+      child.stdout.on("data", (chunk) => {
+        buffered += chunk;
+        const match = buffered.match(/PORT=(\d+)/);
+        if (match) {
+          clearTimeout(timer);
+          resolve(Number(match[1]));
+        }
+      });
+      child.once("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        reject(new Error(`stub GitHub exited early with code ${code}`));
+      });
+    });
+    return await fn(`http://127.0.0.1:${port}`);
+  } finally {
+    // SIGKILL, not SIGTERM: curl holds the connection open, so a graceful close
+    // would wait on a socket nothing is going to read again.
+    child.kill("SIGKILL");
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// Always assigns PAPERCLIP_GITHUB_TOKEN_FILE, for the same reason spawnWrapper
+// guards it: unset resolves to the compiled-in default, which inside an agent
+// pod is the live fleet credential — and this subcommand would then probe real
+// GitHub with it. tokenFilePath lets a caller supply a path it built itself
+// (the mount-generation test needs a kubelet-shaped directory).
+function runAuthCheck(dir, { tokenFileContent, tokenValue, tokenFilePath, apiBase, mode } = {}) {
+  const env = sanitizedEnv({});
+  if (apiBase !== undefined) env.GH_TOKEN_WRAPPER_API_BASE = apiBase;
+  if (tokenValue !== undefined) env.GH_SEAT_TOKEN_VALUE = tokenValue;
+
+  let filePath = tokenFilePath;
+  if (filePath === undefined) {
+    if (tokenFileContent === undefined) {
+      filePath = path.join(dir, "does-not-exist");
+    } else {
+      filePath = path.join(dir, "token");
+      writeFileSync(filePath, tokenFileContent);
+      if (mode !== undefined) chmodSync(filePath, mode);
+    }
+  }
+  env.PAPERCLIP_GITHUB_TOKEN_FILE = filePath;
+
+  return spawnSync("sh", [WRAPPER, "paperclip-auth-check"], { env, encoding: "utf8" });
+}
+
+// THE REQUIRED REGRESSION (PEN-5241 Done-when #4). An empty/unreadable file and
+// a token GitHub refuses are the two states that both surface as `401 Bad
+// credentials` through any ordinary probe. They must never be reported alike:
+// one is a configuration fault on this pod, the other is a dead credential for
+// everyone holding that generation, and the remedies have nothing in common.
+test("reports an empty token file distinctly from a token GitHub rejects (PEN-5241)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const empty = runAuthCheck(dir, { tokenFileContent: "", apiBase });
+      const rejected = runAuthCheck(dir, { tokenFileContent: "ghs_revoked_token\n", apiBase });
+
+      assert.match(empty.stdout, /verdict:\s+NO_CREDENTIAL/);
+      assert.doesNotMatch(empty.stdout, /REJECTED/);
+      assert.equal(empty.status, 2);
+
+      assert.match(rejected.stdout, /verdict:\s+REJECTED/);
+      assert.doesNotMatch(rejected.stdout, /NO_CREDENTIAL/);
+      assert.equal(rejected.status, 1);
+
+      // The exit codes are the part a caller can branch on without parsing prose.
+      assert.notEqual(empty.status, rejected.status);
+    });
+  });
+});
+
+test("reports an unreadable token file distinctly from a token GitHub rejects (PEN-5241)", async (t) => {
+  // Same root caveat as the unreadable-file refusal test above.
+  if (typeof process.getuid === "function" && process.getuid() === 0) {
+    t.skip("running as root; permission bits don't apply");
+    return;
+  }
+  await withStubGitHub(async (apiBase) => {
+    // A temp dir each: both arms write `token`, and the unreadable one leaves it
+    // mode 000, so sharing a dir makes the second writeFileSync fail EACCES.
+    const unreadable = withTempDir((dir) =>
+      runAuthCheck(dir, { tokenFileContent: "ghs_unreadable\n", mode: 0o000, apiBase }),
+    );
+    assert.match(unreadable.stdout, /credential:\s+exists-but-unreadable/);
+    assert.match(unreadable.stdout, /verdict:\s+NO_CREDENTIAL/);
+    assert.equal(unreadable.status, 2);
+
+    const rejected = withTempDir((dir) =>
+      runAuthCheck(dir, { tokenFileContent: "ghs_revoked_token\n", apiBase }),
+    );
+    assert.equal(rejected.status, 1);
+    assert.notEqual(unreadable.status, rejected.status);
+  });
+});
+
+test("reports an absent token file as NO_CREDENTIAL and says gh will refuse, not fall back", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { apiBase });
+      assert.match(proc.stdout, /credential:\s+absent/);
+      assert.match(proc.stdout, /verdict:\s+NO_CREDENTIAL/);
+      // The wrong remedy here is "retry and hope"; say which way the wrapper fails.
+      assert.match(proc.stdout, /will NOT fall back to ambient auth/);
+      assert.equal(proc.status, 2);
+    });
+  });
+});
+
+test("reports a healthy installation token as OK with its rate limit", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
+      assert.match(proc.stdout, /verdict:\s+OK — valid GitHub App installation token/);
+      assert.match(proc.stdout, /authenticated:\s+\/installation\/repositories -> 200, x-ratelimit-limit 9500/);
+      assert.equal(proc.status, 0);
+    });
+  });
+});
+
+// PEN-5239 had to establish this by hand, mid-incident, to know whether it was
+// looking at a dead credential or a dead network. Reporting a transport failure
+// as a credential fault is what sends an agent to rotate a healthy token.
+test("reports GITHUB_UNREACHABLE rather than a credential fault when the API never answers", async () => {
+  withTempDir((dir) => {
+    // Reserved, guaranteed-unroutable port on loopback: connect fails fast and
+    // locally, with no DNS and no dependence on the sandbox's egress policy.
+    const proc = runAuthCheck(dir, {
+      tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`,
+      apiBase: "http://127.0.0.1:1",
+    });
+    assert.match(proc.stdout, /verdict:\s+GITHUB_UNREACHABLE/);
+    assert.match(proc.stdout, /this is NOT a credential fault/);
+    assert.match(proc.stdout, /github-reachable:\s+NO/);
+    assert.equal(proc.status, 4);
+  });
+});
+
+// An authenticated 401 is only evidence about the credential if GitHub answered
+// the unauthenticated control. Without that pairing a network fault reads as a
+// revoked token — the exact inversion of the test above, and the reason the
+// unauthenticated probe is unconditional rather than a fallback.
+test("will not call a token REJECTED when unauthenticated GitHub is unreachable too", async () => {
+  withTempDir((dir) => {
+    const proc = runAuthCheck(dir, { tokenFileContent: "ghs_revoked_token\n", apiBase: "http://127.0.0.1:1" });
+    assert.doesNotMatch(proc.stdout, /REJECTED/);
+    assert.match(proc.stdout, /verdict:\s+GITHUB_UNREACHABLE/);
+    assert.equal(proc.status, 4);
+  });
+});
+
+// The whole point of a self-test an agent can run during an incident is that its
+// output is safe to paste into an issue thread. A truncated hash identifies a
+// generation; the token identifies the bearer.
+test("prints a truncated hash and never the credential itself", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
+      const output = `${proc.stdout}${proc.stderr}`;
+      assert.doesNotMatch(output, /ghs_valid_app_tok/);
+      assert.match(proc.stdout, /token-sha256:\s+[0-9a-f]{8}$/m);
+    });
+  });
+});
+
+test("prints a truncated hash and never the credential itself on the seat-value path", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenValue: AUTH_CHECK_VALID_TOKEN, apiBase });
+      const output = `${proc.stdout}${proc.stderr}`;
+      assert.doesNotMatch(output, /ghs_valid_app_tok/);
+      assert.match(proc.stdout, /source:\s+GH_SEAT_TOKEN_VALUE/);
+      assert.equal(proc.status, 0);
+    });
+  });
+});
+
+// The field whose absence produced PEN-5241's own false clear: the CTO measured
+// a 200 on a *later* generation than the one being reported on, and wrote the
+// all-clear into the bug report. The rotator re-mints every 20 minutes and
+// kubelet propagates into a running pod within seconds, so a result that does
+// not name its generation cannot be compared across pods OR across time.
+test("reports the kubelet mount generation backing a Secret-mounted token", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      // kubelet's atomic writer: a `..<timestamp>.<nonce>` directory holding the
+      // payload, with `..data` flipped at it and the key symlinked through.
+      //
+      // The nonce is derived rather than written out. A real one is a ~10-digit
+      // run, which is credential-shaped to the publish guard and refuses the
+      // push (PEN-3920) — and the assertion does not care what it is, only that
+      // whatever kubelet chose comes back verbatim.
+      const generation = `..2026_11_02_03_40_22.${Date.now()}`;
+      mkdirSync(path.join(dir, generation));
+      writeFileSync(path.join(dir, generation, "token"), `${AUTH_CHECK_VALID_TOKEN}\n`);
+      symlinkSync(generation, path.join(dir, "..data"));
+      symlinkSync(path.join("..data", "token"), path.join(dir, "token"));
+
+      const proc = runAuthCheck(dir, { tokenFilePath: path.join(dir, "token"), apiBase });
+      assert.match(proc.stdout, new RegExp(`mount-generation:\\s+${generation.replace(/\./g, "\\.")}`));
+      assert.equal(proc.status, 0);
+    });
+  });
+});
+
+test("reports no mount generation for a token file that is not a Secret mount", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
+      assert.match(proc.stdout, /mount-generation:\s+-$/m);
+    });
+  });
+});
+
+// Property 1 of the subcommand: it is dispatched above every credential branch.
+// A diagnostic that needs a working credential to report a broken one is not a
+// diagnostic — and with PAPERCLIP_GITHUB_TOKEN_FILE set to an absent path, every
+// other `gh` invocation on this pod exits 64 without reaching the binary.
+test("answers even in the state where every other gh invocation exits 64", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const refused = spawnWrapper(dir, { args: ["api", "user"] });
+      assert.equal(refused.status, 64);
+
+      const check = runAuthCheck(dir, { apiBase });
+      assert.match(check.stdout, /verdict:\s+NO_CREDENTIAL/);
+      assert.equal(check.status, 2);
+    });
+  });
+});
+
+// Done-when #2. `gh auth status` reports "(GH_TOKEN)" because that is what this
+// wrapper handed the binary — but GH_TOKEN is not set in the caller's shell, so
+// the obvious follow-up (`curl -H "Authorization: Bearer $GH_TOKEN"`) sends an
+// empty Bearer and returns 401 whatever the credential's health. That is a
+// one-command false positive that reads as confirmation, so the correction has
+// to land on `auth status` itself, not in a runbook nobody opens mid-incident.
+test("gh auth status names the real credential source instead of leaving (GH_TOKEN) to misdirect", () => {
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, { tokenFileContent: "ghs_sometoken\n", args: ["auth", "status"] });
+    assert.equal(proc.status, 0);
+    assert.match(proc.stderr, /credential source is the file named by PAPERCLIP_GITHUB_TOKEN_FILE/);
+    assert.match(proc.stderr, /\$GH_TOKEN is empty there/);
+    assert.match(proc.stderr, /gh paperclip-auth-check/);
+    // The correction goes to stderr so nothing parsing gh's stdout changes.
+    assert.doesNotMatch(proc.stdout, /credential source is/);
+  });
+});
+
+test("gh auth status names GH_SEAT_TOKEN_VALUE when that is what supplied the token", () => {
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, {
+      extraEnv: { GH_SEAT_TOKEN_VALUE: "ghs_seat_token" },
+      args: ["auth", "status"],
+    });
+    assert.equal(proc.status, 0);
+    assert.match(proc.stderr, /credential source is GH_SEAT_TOKEN_VALUE/);
+  });
+});
+
+// Noise on every invocation would get the line filtered out, and it would also
+// change the stderr of commands whose stderr callers already parse.
+test("the credential-source line appears only on auth status", () => {
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, { tokenFileContent: "ghs_sometoken\n", args: ["api", "user"] });
+    assert.equal(proc.status, 0);
+    assert.doesNotMatch(proc.stderr, /credential source is/);
+  });
+});
+
+// Discoverability: the moment an agent is most likely to need the self-test is
+// the moment the wrapper is refusing, so the refusal names it.
+test("the exit-64 refusal names the self-test", () => {
+  withTempDir((dir) => {
+    const proc = spawnWrapper(dir, { args: ["api", "user"] });
+    assert.equal(proc.status, 64);
+    assert.match(proc.stderr, /gh paperclip-auth-check/);
   });
 });
 
