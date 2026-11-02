@@ -1289,6 +1289,24 @@ function fetchOpenPrs(repo) {
       // Only PRs that actually carry a request can be scoped by ownership, so
       // the extra call is spent only where it can change a verdict.
       files: (row.reviewRequests ?? []).length > 0 ? fetchPrFiles(repo, row.number) : [],
+      // No `--paginate` here, and none is needed: `gh pr view` does not accept
+      // the flag because it paginates the rollup's `contexts` connection
+      // itself. Measured 2026-11-02 on gh 2.102.0 against
+      // Blockcast/penstock-llm-proxy-core#3034 — `contexts.totalCount` 142,
+      // 142 entries returned, `review/ally-complete` among them; 0 of 30 PRs
+      // sampled on that repo came back short, six of them over the 100-context
+      // cap (101-142). The `--paginate` two lines below is load-bearing; its
+      // absence here is not the same omission.
+      //
+      // ⛔ Do not "fix" this into a hand-rolled GraphQL query.
+      // `contexts(first: 100)` is where the cap actually bites, and it bites
+      // silently: a head with more than 100 contexts returns exactly 100 with
+      // nothing marking the read as a prefix. On this fleet
+      // `review/ally-complete` has been observed falling off that end, and it
+      // is REQUIRED. Losing a required context reads as absent and holds a
+      // ready PR; the same truncated read drops a FAILING context just as
+      // silently, and in a routine whose action is `enqueue` that direction
+      // merges.
       statusCheckRollup: JSON.parse(
         gh(["pr", "view", String(row.number), "--repo", repo, "--json", "statusCheckRollup"]),
       ).statusCheckRollup,
