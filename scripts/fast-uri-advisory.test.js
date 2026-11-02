@@ -156,6 +156,10 @@ test("every encoded advisory contributes at least one live range", () => {
 // published advisory raises the 3.x bound past the recorded floor this fails
 // in a pr.yml-registered gate -- which is exactly what did not happen when the
 // 2026-09-13 snapshot aged out from under 3.1.7 and both gates stayed green.
+// The resolution this floor supersedes: what both lockfiles carried when the
+// 2026-09-13 snapshot went stale under them.
+const SUPERSEDED_RESOLUTION = "3.1.7";
+
 test("the securityAuditRemediations floor clears this table exactly", () => {
   const rootPackageJson = JSON.parse(
     readFileSync(new URL("../package.json", import.meta.url), "utf8"),
@@ -169,13 +173,35 @@ test("the securityAuditRemediations floor clears this table exactly", () => {
 
   const floor = /^>=(\d+\.\d+\.\d+) </.exec(entry.patchedRange)?.[1];
   assert.ok(floor, `unreadable patchedRange ${entry.patchedRange}`);
-
-  // The floor is clean, and it is the LOWEST clean version -- a floor pinned
-  // arbitrarily high would also pass the first check while hiding which
-  // advisory it is actually avoiding.
   assert.equal(isVulnerableFastUri(floor), false, `${floor} must be accepted`);
-  const below = v(justBelow(parseVersion(floor)));
-  assert.equal(isVulnerableFastUri(below), true, `${below} must be rejected`);
+
+  // The floor must be the LOWEST clean version at or above the resolution it
+  // supersedes -- derived by walking the union up from 3.1.7, never compared
+  // against a literal, so a newly published advisory that extends that range
+  // moves the expectation and fails here.
+  //
+  // "clean, and one patch below it is vulnerable" is NOT enough and this was
+  // measured, not assumed: a floor of `>=4.2.3 <5` satisfies both (4.2.2 is
+  // vulnerable, 4.2.3 is not) and survived that weaker pair, while being a
+  // major-version jump away from the line this override actually pins.
+  const cmp = (a, b) => {
+    for (let i = 0; i < 3; i += 1) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+    return 0;
+  };
+  let lowestClean = parseVersion(SUPERSEDED_RESOLUTION);
+  for (const range of FAST_URI_VULNERABLE_RANGES) {
+    if (
+      cmp(lowestClean, range.introduced) >= 0 &&
+      cmp(lowestClean, range.fixed) < 0
+    ) {
+      lowestClean = [...range.fixed];
+    }
+  }
+  assert.equal(
+    floor,
+    v(lowestClean),
+    `floor must be the fix for the range covering ${SUPERSEDED_RESOLUTION}`,
+  );
 
   // Every recorded ID is a real entry above -- a typo'd or retired GHSA ID
   // reads as documentation and asserts nothing.
@@ -188,7 +214,7 @@ test("the securityAuditRemediations floor clears this table exactly", () => {
   // that merely contains the advisory you came for is the failure mode.
   assert.deepEqual(
     entry.advisories.slice().sort(),
-    fastUriAdvisoriesFor("3.1.7").slice().sort(),
+    fastUriAdvisoriesFor(SUPERSEDED_RESOLUTION).slice().sort(),
   );
 });
 
