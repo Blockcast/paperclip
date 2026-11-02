@@ -1308,7 +1308,40 @@ export type JoinRequestStatus = (typeof JOIN_REQUEST_STATUSES)[number];
 
 export const PERMISSION_KEYS = [
   "agents:create",
+  // PEN-5323: the direct configuration tier, and the wider of the two config
+  // doors on BOTH axes. `agent_config:read` is a virtual action with no
+  // permission key of its own; read authority is implied by config CHANGE
+  // authority (`decideWithAgentConfigReadGrant`), so this grant buys the bulk
+  // config list, the `/config-revisions` history, and the current config of
+  // any named peer, in addition to direct writes. Strictly greater than
+  // `agents:suggest-changes` on three of those four axes and EQUAL on the
+  // fourth — see the note on that key before treating it as the safe
+  // substitute.
   "agents:configure",
+  // PEN-5323: the consented-diff tier. It is NOT uniformly lesser than
+  // `agents:configure`, and the half that is lesser is the half that gets
+  // quoted when the grant is handed out. Two clauses, both load-bearing:
+  //
+  //   LESSER on WRITE — consent-gated, bound to named target keys and to a
+  //   run (`decideWithProtectedChangeGrants` +
+  //   `assertCanApplyProtectedAgentChange`) — and on BULK and HISTORICAL
+  //   reads: the company agent roster and both `/config-revisions` routes
+  //   pass a `company` resource and are refused `deny_scope`.
+  //
+  //   NOT LESSER on WHICH peers' CURRENT configuration can be read. That is
+  //   every agent in the company, one request each.
+  //   `decideWithAgentConfigReadGrant` admits on
+  //   `resource.type === "agent" && resource.agentId` — *a* named subject,
+  //   not *the* subject of a proposed diff — and subject ids cost nothing,
+  //   since `agent:read` is standard same-company visibility and the
+  //   restricted peer projection withholds the config columns while keeping
+  //   `id`.
+  //
+  // PEN-5231 carries that residual and records why binding the read to an
+  // accepted consent record is infeasible today (`assertConsented` wants a
+  // prior-run consent whose payload already displays a diff, and consumes it
+  // on use, so a consent-gated read has no first step). If it closes, the
+  // second clause changes and must be REWRITTEN, not deleted.
   "agents:suggest-changes",
   "skills:create",
   "skills:suggest-changes",
