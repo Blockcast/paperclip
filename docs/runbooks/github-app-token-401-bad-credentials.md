@@ -24,12 +24,14 @@ truncated `token-sha256`, an unauthenticated reachability probe, and the
 authenticated verdict. It reads no credential value into your output.
 
 ```
+  source:             PAPERCLIP_GITHUB_TOKEN_FILE=/etc/paperclip/secrets/github-token/token
   credential:         present (390 bytes)
-  mount-generation:   ..2026_11_02_21_23_49.3562890036
+  mount-generation:   ..2026_11_02_21_37_06.2080447267
+  mount-written:      2026-11-02 21:37:06
   token-sha256:       bf65aa6d
   github-reachable:   yes (unauthenticated /rate_limit -> 200, x-ratelimit-limit 60)
   authenticated:      /installation/repositories -> 200, x-ratelimit-limit 9500
-  verdict:            OK — valid GitHub App installation token
+  verdict:            OK — valid GitHub App installation token (rate limit 9500/hr)
 ```
 
 The pairing is the point: an unauthenticated `200` beside an authenticated
@@ -59,8 +61,9 @@ and the mounted value was 390 bytes, masked `ghs_9999999_aaaa….aaaa…`. That
 lead is **falsified**. A token measured healthy on 2026-11-02T21:2xZ —
 `/installation/repositories` 200 at 9500 req/hr — has the *identical* shape:
 390 bytes, `ghs_<7 digits>_…`, two `.` separators. The minter is not emitting
-a non-GitHub value. Length and separator count carry no diagnostic signal;
-only `token-sha256` and `mount-generation` do.
+a non-GitHub value. Length and separator count carry no diagnostic signal.
+`token-sha256` is the only field that identifies the credential —
+`mount-generation` does not, for the reason given in §5.
 
 **Comment silence is not an outage instrument.** Across
 2026-11-01T22:00Z → 2026-11-02T09:32:51Z there were zero `allyblockcast[bot]`
@@ -74,19 +77,33 @@ with the auth check or with push/PR timestamps, never with comment density.
 
 ## 4. Root cause, as far as it is established
 
-PEN-5239 named three candidates. Two are closed:
+PEN-5239 named three candidates. **One is closed; the other two are not
+separated by the evidence.**
 
-- ~~the 390-byte two-part value is not a GitHub token~~ — falsified in §3.
-- ~~the App installation was suspended or revoked~~ — a suspended installation
-  cannot mint a working token, and tokens minted roughly two hours after the
-  last measured `401` performed authenticated pushes and an API write. If the
-  installation was ever suspended it was restored inside that window with
-  nothing recorded.
-- **the minter emitted an invalid credential for one mount generation** — what
-  remains, and what the evidence fits. Generation
-  `..2026_11_02_01_52_54` (`token-sha256 cfc3d245`) was refused continuously
-  from `01:56:57Z` to `02:01:21Z`; a later generation carried a working
-  credential with a different sha.
+- ~~the 390-byte two-part value is not a GitHub token~~ — **falsified** in §3,
+  against a measured-healthy control.
+
+- **the App installation was suspended or revoked** — *still open: not
+  distinguished by the available evidence.* It is tempting to close this,
+  because a suspended installation cannot mint a working token and tokens
+  minted roughly two hours after the last measured `401` performed
+  authenticated pushes and an API write. That argument does not hold: a
+  suspension **lifted** anywhere inside the `02:01:21Z` → `04:00:23Z` gap
+  produces exactly the same timeline as a bad minted value. Nor does the sha
+  changing in a later generation separate them — the minter rotates regardless
+  of *why* the previous value was refused. Nobody held an installation-level
+  read open across the window.
+
+  **Discriminate it next time:** with an App JWT,
+  `GET /app/installations/{installation_id}` returns `suspended_at`. Capture it
+  *while the `401` is live*. Afterwards the two hypotheses are observationally
+  identical.
+
+- **the minter emitted one invalid credential** — the best fit for what was
+  observed, but **not established** against the candidate above.
+  `token-sha256 cfc3d245` (seen at mount generation `..2026_11_02_01_52_54`)
+  was refused continuously from `01:56:57Z` to `02:01:21Z`; a later mount
+  carried a working credential under a *different* sha.
 
 > Bound: the `401` was measured in **one** pod. The fleet-wide blast radius
 > asserted in PEN-5239 was inferred from the mount being fleet-wide, never
@@ -94,20 +111,42 @@ PEN-5239 named three candidates. Two are closed:
 
 ## 5. Recovery, and how an in-flight run should park
 
-**The credential self-heals on the next kubelet rotation of the projected
-Secret.** On 2026-11-02 the refusal window closed without intervention inside
-about two hours. So the default action is to *park on the rotation*, not to
-retry and not to escalate immediately.
+**The refusal window closed on its own.** On 2026-11-02 the `401` was gone
+within about two hours. No intervention is recorded — but nobody was watching
+the minter, so that is *unrecorded*, not *established*. The default action is
+still to park and re-check rather than retry or escalate immediately.
 
 - Re-run `gh paperclip-auth-check` rather than retrying the failed `gh`
-  command. A retry against a bad generation is indistinguishable at the call
+  command. A retry against a bad credential is indistinguishable at the call
   site from a pending CI gate — the same observability conflation as
   PEN-2502's `relay_failed`/`credential_quarantined`.
-- Park the issue with the mount generation in the park reason, so the waking
-  run can tell *the same bad credential* from *a new one*.
-- Escalate only if the verdict is still `rejected` across **two distinct**
-  mount generations. One bad generation is self-correcting; two is a minter
-  fault.
+
+- **Key the park on `token-sha256`, never on `mount-generation`.** Record both,
+  but only the sha identifies the credential. `mount-generation` is the
+  kubelet's projection timestamp *for this pod*, reset whenever a pod starts —
+  so an unchanged credential shows a **new** generation to every run, and every
+  agent run is a fresh Job pod. Measured 2026-11-02 across three pods:
+  generations `..21_23_49`, `..21_34_52` and `..21_37_06`, all carrying
+  `token-sha256 bf65aa6d`. Generation is per-pod forensics only.
+
+- **Escalate when either condition holds:**
+  - the verdict is `rejected` under **two distinct `token-sha256` values** —
+    the minter rotated and still emitted a bad credential; or
+  - the **same** rejected sha persists past **90 minutes**. Installation tokens
+    live at most an hour, so a sha that has not moved in 90 minutes means the
+    minter has stopped rotating. That failure never produces a second sha, so
+    without this bound the first condition waits forever.
+
+  A single bad sha replaced inside that bound is self-correcting. Note the rule
+  the first condition replaces — "two distinct mount generations" — would have
+  escalated on the **second run every time**, because the generation always
+  differs between pods.
+
+- **Park as `todo` with an explicit re-check time, or arm a monitor. Do not use
+  `blocked`.** `blocked` with no `blockedBy` edge strands the row — nothing
+  resolves it and no wake fires. Do not add a `blockedBy` edge to fix that
+  either: an unresolved blocker *suppresses* the monitor wake, so the two
+  mechanisms cancel.
 
 > **Capture forensics while it is live.** The mount retains exactly **one**
 > generation directory — the next rotation destroys the evidence. If the
