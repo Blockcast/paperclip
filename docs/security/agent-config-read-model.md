@@ -157,8 +157,9 @@ future merger is not a wake.** Three lessons, in the order they cost something:
 - ⛔ **A `grep '3244'` sweep reported itself complete while four sites stayed
   stale.** Seven of the eleven carried the literal; the other four did not —
   row 3b's own cells, the *"Rows 3a and 3b are not the same authority"*
-  blockquote, the tree-identification note ending *"at the time of writing"*,
-  and the `Regression tests` bullet beginning *"On `master` today"*.
+  blockquote, the `PEN-5230` tree-identification note under the route matrix
+  (which then ended *"at the time of writing"*; it says `Shipped` now), and the
+  `Regression tests` bullet beginning *"On `master` today"*.
 - ⛔ **Naming the sites in a table did not fix that either.** The table listed
   ten; Ally found the eleventh — the `Regression tests` bullet — on review. An
   enumeration maintained by hand has the same failure mode as the grep it was
@@ -228,13 +229,18 @@ are not causal; the `agents:configure` row is.
 `adapterConfig` / `runtimeConfig` as returned to an **agent actor that does not
 hold the implication**, with the subject in the same company:
 
-| Route | Subject | Before `PEN-4775` | After |
-| --- | --- | --- | --- |
-| `GET /api/agents/me` | self | populated, secrets masked | unchanged |
-| `GET /api/agents/:id` | self | populated, secrets masked | unchanged |
-| `GET /api/agents/:id` | peer | `{}` | unchanged |
-| `GET /api/companies/:id/agents` | self | **`{}`** | **populated, secrets masked** |
-| `GET /api/companies/:id/agents` | peer | `{}` | unchanged |
+| Route | Subject | Before `PEN-4775` | After | Withheld marker (`PEN-5230`) |
+| --- | --- | --- | --- | --- |
+| `GET /api/agents/me` | self | populated, secrets masked | unchanged | not emitted |
+| `GET /api/agents/:id` | self | populated, secrets masked | unchanged | not emitted |
+| `GET /api/agents/:id` | peer | `{}` | unchanged | `withheldFields` + `withheldByAction` |
+| `GET /api/companies/:id/agents` | self | **`{}`** | **populated, secrets masked** | not emitted |
+| `GET /api/companies/:id/agents` | peer | `{}` | unchanged | `withheldFields` + `withheldByAction` |
+
+The last column is emitted on the restricted arm **only**, so its absence is
+itself a signal: a response with no `withheldFields` had nothing withheld by
+this gate. Read it that way rather than as "this build predates the marker" —
+for that question, check the tree (below), not the response.
 
 The axis is **(viewer × subject × route)**, not any one of the three. The
 detail route asks the per-subject question (`canReadSensitiveDetail = isSelf ?
@@ -254,16 +260,21 @@ Note also that the strip is **narrow**: `budgetMonthlyCents` and
 `spentMonthlyCents` pass through the restricted projection untouched. Whatever
 the peer rule is for, it is not a general "peer-sensitive data" rule.
 
-> ⚠️ **Pending — `PEN-5230` (`Blockcast/paperclip#3241`), open and unmerged at
-> the time of writing.** It adds `withheldFields: ["adapterConfig",
-> "runtimeConfig"]` and `withheldByAction: "agent_config:read"` beside the
-> withheld objects on both **peer** rows above, so a `{}` that means *withheld*
-> becomes distinguishable from a `{}` that is the stored value — today they are
-> byte-identical on the wire, which is why a reader needs the own-id positive
-> control. **The matrix itself is unchanged by it:** no config byte widens, and
-> both markers are module constants describing the *reader*, not the subject.
-> Check for `WITHHELD_AGENT_CONFIG_FIELDS` in `server/src/routes/agents.ts` —
-> absent means you are on a tree without the signal, which is `master` today.
+> **Shipped — `PEN-5230` (`Blockcast/paperclip#3241`), merged
+> `2026-11-02T09:28:08Z`.** The right-hand column above is what it added:
+> `withheldFields: ["adapterConfig", "runtimeConfig"]` and `withheldByAction:
+> "agent_config:read"` beside the withheld objects on both **peer** rows, so a
+> `{}` that means *withheld* is distinguishable from a `{}` that is the stored
+> value. Before it the two were byte-identical on the wire, which is why older
+> notes in this family tell a reader to run an own-id read as a positive
+> control; that control is no longer what establishes the distinction, though
+> it remains a fair check that a projection ran at all. **The config columns
+> are unchanged by it:** no config byte widens, and both markers are module
+> constants describing the *reader*, not the subject — they vary with who is
+> asking, never with whom they ask about. Check for
+> `WITHHELD_AGENT_CONFIG_FIELDS` in `server/src/routes/agents.ts`; it is
+> present on `master`, so its absence now means a stale tree rather than a tree
+> before the signal.
 
 ### Archaeology
 
@@ -479,3 +490,11 @@ asymmetry then needs its own answer.
 - `server/src/__tests__/agent-secret-redaction.test.ts` — `agent metadata
   containment on the spread-based redactors`: both projections, including that
   the restricted one is reached via a **peer** row.
+- `server/src/__tests__/agent-permissions-routes.test.ts` — ``the peer `{}`
+  says it was withheld (PEN-5230)``, which pins the right-hand matrix column:
+  the markers on both peer routes, **absent** on the viewer's own row and for a
+  grant holder, and both config columns still `{}`. Its last case,
+  ``emits IDENTICAL markers for a populated and a genuinely empty subject``, is
+  the disclosure-budget proof — whole-body equality between the two subjects,
+  behind positive controls so it cannot pass against a build with the markers
+  stripped. On `master` since 2026-11-02.
