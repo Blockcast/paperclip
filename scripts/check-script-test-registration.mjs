@@ -110,14 +110,20 @@ const ALLOWLIST = [
       "Terminal assertion is `pnpm audit --prod` against the live advisory " +
       "feed, so this file can turn red with no change to this repository -- " +
       "registering it makes every PR hostage to upstream advisory " +
-      "publication. It is also red on master today: it asserts " +
-      "`@connectrpc/connect-node@1.7.0` resolves undici 6.29.1, and that " +
-      "package is in no package.json and no lockfile entry, so the assertion " +
-      "is unsatisfiable. Its live half (fast-uri over both lockfiles) is " +
+      "publication. That is not hypothetical: `pnpm audit --prod` on master " +
+      "reports 38 moderate advisories as of 2026-11-02, so registering this " +
+      "file anywhere -- pr.yml or a scheduled lane -- lands an " +
+      "immediately-red gate. Its live half (fast-uri over both lockfiles) is " +
       "already covered by scripts/fast-uri-advisory.test.js and " +
-      "scripts/designer-fast-uri-security.test.js, both of which pr.yml runs. " +
+      "scripts/designer-fast-uri-security.test.js, both of which pr.yml runs, " +
+      "and its override/ledger half by the CI-run " +
+      "server/src/__tests__/security-audit-overrides.test.ts. " +
       "Run on demand with `pnpm run test:security-audit-overrides`. " +
-      "Assertion repair is tracked by PEN-5277.",
+      "PEN-5277 repairs this file's stale @connectrpc/connect-node " +
+      "assertions in #3278. That repair does NOT make it registerable -- the " +
+      "live-feed reason above is permanent -- so do not read PEN-5277 " +
+      "closing as a cue to delete this entry. It is permanent, not pending, " +
+      "which is why it carries no pendingRegistrationPr.",
   },
   {
     file: "scripts/github-publish-broker-soak-queries.test.mjs",
