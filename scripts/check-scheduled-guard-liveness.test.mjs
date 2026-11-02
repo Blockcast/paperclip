@@ -1673,6 +1673,15 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         // "producer stopped emitting" and "nothing to report" are already
         // indistinguishable at its own query. Its liveness is what separates them.
         "git-egress-residual-trigger-check.yml",
+        // PEN-5263. The only detector for a PR that is landABLE and unlanded
+        // — `CLEAN`, Ally-clean at its exact head, no outstanding reviewer,
+        // and therefore invisible to review-gate-sweep.yml AND to the landing
+        // routine's own stale-hold report, which enumerates reasons for
+        // inaction and finds none. Watched rather than exempt because its
+        // subject's failure mode is silence: the routine simply not firing
+        // looks exactly like a repo with nothing to land, so a dark detector
+        // here is two layers of nothing rather than one.
+        "landing-sweep.yml",
         "lockfile-drift-monitor.yml",
         "master-health.yml",
         "production-environment-protection-guard.yml",

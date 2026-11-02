@@ -1,0 +1,120 @@
+name: landing-sweep
+
+# Reconciler for stranded LANDINGS (PEN-5263), the one-stage-later sibling of
+# review-gate-sweep.yml.
+#
+# review-gate-sweep.yml backstops a lost REVIEW wake. Nothing backstopped a
+# lost LANDING. A PR that is `CLEAN`, reviewed by Ally at its exact head with
+# no blocking findings, and carrying no outstanding reviewer satisfies the
+# review sweep's predicate — there is nothing stranded about its review — and
+# is therefore invisible to it. It is also invisible to the landing routine's
+# OWN report: `stalledHolds` enumerates reasons for inaction, and a PR the
+# classifier said yes to has none. So an unheld, unlanded PR appeared in no
+# report anywhere.
+#
+# Measured 2026-11-02 on this repo: #3241 and #3255 both classified `enqueue`,
+# and the routine's stale-hold block printed 8 rows — neither of them. #3241's
+# head landed 2026-11-01T23:51:30Z and Ally returned a clean verdict against
+# it at 00:05:01Z; 21 PRs merged to `master` past it while it sat eligible.
+# The damage is not only latency: PEN-5232 was parked 48h on a diagnosis built
+# around a human approver who was not in the path, because the stall had no
+# stated reason to read.
+#
+# THIS IS A DETECTOR, NEVER A LANDER. It runs `--alarm`, which the script
+# refuses to combine with `--apply`. Two reasons, and the second is the
+# load-bearing one:
+#
+#   1. A second actor enqueuing PRs would race the routine's per-fire cap
+#      (MAX_ENQUEUES_PER_FIRE), whose whole guarantee is that a classifier bug
+#      costs at most N PRs per fire. Two independent spenders void it.
+#   2. The thing being reported on must not be the thing doing the reporting.
+#      That is exactly the defect this closes — the existing report lives
+#      inside the landing routine, so a fire that never happens produces no
+#      report either, and silence is indistinguishable from health. This
+#      workflow is on GitHub's own cron precisely so it does not share a
+#      failure domain with the routine it watches.
+#
+# AC4, inherited from review-gate-sweep.yml / BLO-22892: the stranded
+# condition must surface without a human noticing by hand. `--alarm` exits
+# non-zero when the cohort is non-empty, turning this schedule visibly red.
+#
+# Registered in WATCHED_GUARDS (scripts/check-scheduled-guard-liveness.mjs) at
+# the hourly 2.75h bar, so this detector is itself watched for going dark.
+
+on:
+  schedule:
+    # Hourly, and :27 is chosen rather than inherited.
+    #
+    # COST, counted rather than estimated. A dry run on this repo
+    # 2026-11-02T09:3xZ, with every `gh` invocation logged through a counting
+    # shim, made exactly 97 calls over 32 open PRs:
+    #
+    #     35  pr view (statusCheckRollup, plus resolveMergeState re-reads)
+    #     26  pulls/{n}/reviews        --paginate
+    #     26  issues/{n}/timeline      --paginate
+    #      8  pulls/{n}/files          --paginate
+    #      1  pr list
+    #      1  contents/.github/CODEOWNERS
+    #
+    # So the shape is 1 list + 1 CODEOWNERS, then up to 4 calls per PR that
+    # survives `classifyFromListing` (26 of 32 here) — `files` only where a
+    # review request exists. It scales with the open set that reaches the
+    # expensive path, NOT with any threshold, so unlike review-gate-sweep.yml
+    # there is no predicate-level cut to claim.
+    #
+    # ⚠ 97 is INVOCATIONS, which is a FLOOR on HTTP requests: 60 of them carry
+    # `--paginate` and a long thread costs a request per page. The obvious
+    # cross-check does not settle it either — the `rate_limit` delta over that
+    # run was 770, but this installation token is shared, and its idle drift
+    # measured ~51 requests per 20s from other consumers, which over the 203s
+    # run accounts for ~520 of them. ~250 is the attributable estimate; 97 is
+    # the number that reproduces.
+    #
+    # Against `github.token`'s documented 1,000/hour/repository budget, shared
+    # with the other workflows here, hourly is ~10-25% of it depending on which
+    # of those two figures you take. Half-hourly doubles that, which is not
+    # affordable beside review-gate-sweep.yml's own ~315/hour (its header's
+    # 2026-09-19 figure, likewise a floor). So: hourly, same cadence and same
+    # arithmetic as its sibling. Re-measure rather than inherit — 97 is one
+    # snapshot at 32 open PRs, and the shim that produced it is three lines.
+    #
+    # :27 is clear of every cron minute the watched guards already occupy
+    # (:09 x2, :17, :23, :31, :41, :47), so this does not pile onto their
+    # burst — the same spacing rule scheduled-guard-liveness.yml applies.
+    - cron: "27 * * * *"
+  workflow_dispatch: {}
+
+# Read-only, deliberately and permanently. This job detects; it must never
+# acquire the ability to land anything (see the header). `--alarm` makes no
+# writes, so nothing here needs more than read.
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: read
+
+# No `concurrency` block, for the reason review-gate-sweep.yml records at
+# length (BLO-31818): GitHub holds at most ONE pending run per group, so a
+# group cannot serialise a starved backlog — it EVICTS it, and a run that
+# never starts cannot exit non-zero, which would silence the AC4 alarm. Runs
+# accumulating costs latency; runs evicting costs the alarm.
+
+jobs:
+  detect:
+    name: Detect landable PRs that nothing has landed
+    runs-on: arc-paperclip-light
+    # A hang detector for a job that has STARTED. It cannot bound a run
+    # starved in `queued` — that is what the liveness guard registration
+    # above is for. The measured dry run took 203s at 32 open PRs.
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Unit tests for the detector's pure decision logic
+        run: node --test ./scripts/land-clean-prs.test.mjs
+
+      - name: Alarm on PRs that have been landable for hours and are still open
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LAND_CLEAN_PRS_REPO: ${{ github.repository }}
+        run: node scripts/land-clean-prs.mjs --alarm
