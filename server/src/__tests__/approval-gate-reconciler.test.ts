@@ -508,9 +508,10 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
   it("keeps sweeping when one card cannot be closed, instead of starving the queue", async () => {
     const { companyId, agentId } = await createCompany("AGRF");
     const issueId = await insertIssue(companyId, "AGRF-1");
-    // The earliest card is the one that fails. Every sweep restarts at `cursor = null`
-    // ordered by `(createdAt, id)`, so an unguarded throw here would re-block this same
-    // card first on every tick and no later card would ever be reached again.
+    // The earliest card is the one that fails. A sweep that threw returns no
+    // `nextCursor`, so the ticker would keep the resume point it already had and
+    // re-walk this same region — hitting this card first on every tick and never
+    // reaching anything behind it.
     const doomed = await insertApproval({
       companyId,
       agentId,
@@ -899,6 +900,188 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     tick?.();
     await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(2));
     stop();
+  });
+
+  // PEN-5265. The budget caps work per tick; before this it capped work outright.
+  // Each tick restarted at the oldest card, so any card sitting behind a head of
+  // `maxLookups` cards whose gates never terminate was not "reached later" — it was
+  // re-dropped on every tick, forever, while `truncated` reported the same tail
+  // each time and read like a queue draining.
+  describe("lookup-budget resume point", () => {
+    /** Head of `liveCount` cards that never terminate, then one dead card behind it. */
+    async function starvedQueue(prefix: string, liveCount: number) {
+      const { companyId, agentId } = await createCompany(prefix);
+      const base = Date.parse("2026-09-01T00:00:00.000Z");
+      const liveRunIds: number[] = [];
+      const liveIds: string[] = [];
+      for (let i = 0; i < liveCount; i += 1) {
+        liveRunIds.push(900 + i);
+        liveIds.push(
+          await insertApproval({
+            companyId,
+            agentId,
+            gate: gateFor(900 + i),
+            createdAt: new Date(base + i * 1000),
+          }),
+        );
+      }
+      const deadRunId = 999;
+      const deadId = await insertApproval({
+        companyId,
+        agentId,
+        gate: gateFor(deadRunId),
+        createdAt: new Date(base + liveCount * 1000),
+      });
+      // The head never terminates; only the card behind the budget is closeable.
+      const fetchRun = vi.fn(async ({ runId }: { repoFullName: string; runId: number }) =>
+        runId === deadRunId ? found("completed", "cancelled") : found("waiting", null),
+      );
+      return { companyId, agentId, deadId, deadRunId, liveIds, liveRunIds, fetchRun };
+    }
+
+    it("reports where a truncated sweep stopped instead of only that it stopped", async () => {
+      const { deadId, liveIds, fetchRun } = await starvedQueue("AGRC", 2);
+
+      const result = await reconcileApprovalGates(db, {
+        fetchRun,
+        maxLookups: 2,
+        batchSize: 2,
+        logger: silentLogger,
+      });
+
+      expect(result).toMatchObject({ examined: 2, live: 2, closed: 0, truncated: true });
+      // Pinned to the id of the last card actually checked — so resuming from it
+      // starts at the first card that was not. Asserting only "not null" would pass
+      // against a build that never set the field at all.
+      expect(result.nextCursor?.id).toBe(liveIds[1]);
+      expect((await approvalRow(deadId))?.status).toBe("pending");
+    });
+
+    it("resumes from a supplied cursor rather than re-walking the head", async () => {
+      const { deadId, deadRunId, fetchRun } = await starvedQueue("AGRD", 2);
+
+      const first = await reconcileApprovalGates(db, {
+        fetchRun,
+        maxLookups: 2,
+        batchSize: 2,
+        logger: silentLogger,
+      });
+      fetchRun.mockClear();
+
+      const second = await reconcileApprovalGates(db, {
+        fetchRun,
+        maxLookups: 2,
+        batchSize: 2,
+        logger: silentLogger,
+        resumeFrom: first.nextCursor,
+      });
+
+      // The second sweep spent its budget on the card the first one could not reach,
+      // and on nothing else.
+      expect(fetchRun.mock.calls.map(([input]) => input.runId)).toEqual([deadRunId]);
+      expect(second).toMatchObject({ examined: 1, closed: 1, truncated: false });
+      expect((await approvalRow(deadId))?.status).toBe("cancelled");
+    });
+
+    it("starts the rotation over once a pass reaches the end", async () => {
+      const { fetchRun } = await starvedQueue("AGRE", 2);
+
+      // Budget large enough to walk every card: nothing was left unchecked, so the
+      // next sweep must go back to the oldest rather than park at the tail.
+      const result = await reconcileApprovalGates(db, {
+        fetchRun,
+        maxLookups: 50,
+        batchSize: 2,
+        logger: silentLogger,
+      });
+
+      expect(result).toMatchObject({ examined: 3, truncated: false });
+      expect(result.nextCursor).toBeNull();
+    });
+
+    it("does not park at the tail when the budget runs out with nothing behind it", async () => {
+      const { fetchRun } = await starvedQueue("AGRF2", 2);
+
+      // Budget lands exactly on the last card. `budgetExhausted` is true but nothing
+      // was skipped, so this is a completed pass, not a truncated one.
+      const result = await reconcileApprovalGates(db, {
+        fetchRun,
+        maxLookups: 3,
+        batchSize: 2,
+        logger: silentLogger,
+      });
+
+      expect(result).toMatchObject({ examined: 3, truncated: false });
+      expect(result.nextCursor).toBeNull();
+    });
+
+    // The one that fails without the fix: the ticker must carry the cursor across
+    // ticks. With a 2-card budget and 2 permanently-live cards at the head, a sweep
+    // that restarts at the oldest card can never reach the third.
+    it("reaches a card behind the budget on a later tick instead of never", async () => {
+      const { deadId, deadRunId, fetchRun } = await starvedQueue("AGRG", 2);
+      let tick: (() => void) | null = null;
+      const scheduler: ApprovalGateReconcilerScheduler = {
+        setInterval: (cb) => {
+          tick = cb;
+          return 0 as unknown as ReturnType<typeof setInterval>;
+        },
+        clearInterval: () => {},
+      };
+
+      const stop = startApprovalGateReconciler(
+        db,
+        60_000,
+        { fetchRun, maxLookups: 2, batchSize: 2, logger: silentLogger },
+        scheduler,
+      );
+      // Tick 1 spends the whole budget on the live head and never sees the dead card.
+      await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(2));
+      expect(fetchRun.mock.calls.map(([input]) => input.runId)).not.toContain(deadRunId);
+      expect((await approvalRow(deadId))?.status).toBe("pending");
+
+      tick?.();
+
+      // Tick 2 resumes behind the head and retires it.
+      await vi.waitFor(async () =>
+        expect((await approvalRow(deadId))?.status).toBe("cancelled"),
+      );
+      stop();
+    });
+
+    it("returns to the oldest card after the rotation completes", async () => {
+      const { deadRunId, liveRunIds, fetchRun } = await starvedQueue("AGRH", 2);
+      let tick: (() => void) | null = null;
+      const scheduler: ApprovalGateReconcilerScheduler = {
+        setInterval: (cb) => {
+          tick = cb;
+          return 0 as unknown as ReturnType<typeof setInterval>;
+        },
+        clearInterval: () => {},
+      };
+
+      const stop = startApprovalGateReconciler(
+        db,
+        60_000,
+        { fetchRun, maxLookups: 2, batchSize: 2, logger: silentLogger },
+        scheduler,
+      );
+      await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(2));
+
+      // Tick 2 finishes the pass (one card left), so tick 3 wraps to the head again.
+      tick?.();
+      await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(3));
+      fetchRun.mockClear();
+
+      tick?.();
+      await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(2));
+      // Back at the oldest two cards — the head is re-checked, not abandoned. A card
+      // whose gate dies while it sits in the head must still be retired eventually,
+      // which is what rotating rather than advancing-forever buys.
+      expect(fetchRun.mock.calls.map(([input]) => input.runId)).toEqual(liveRunIds);
+      expect(fetchRun.mock.calls.map(([input]) => input.runId)).not.toContain(deadRunId);
+      stop();
+    });
   });
 });
 

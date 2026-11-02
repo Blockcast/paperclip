@@ -288,6 +288,45 @@ export type ReviewerEvidenceResult =
  * correct. Keeping the discriminator intact means the widening changes behaviour at
  * exactly one call site — the one that asked for it — and `reason` still carries
  * `pull_request_http_404` for their logs.
+ *
+ * ## Why `closed_at` is NOT surfaced here (DECISION, PEN-5265, 2026-11-03)
+ *
+ * Ally and @Cto both proposed hardening the closed-unmerged retirement in
+ * `classifyPullRequestGateLookup` by requiring the PR to have been closed for longer
+ * than one sweep interval, so a PR closed and reopened inside one tick could not
+ * retire a card in the gap. GitHub sends `closed_at` in this payload; adding it is one
+ * line here. It is declined anyway. Reason 1 below has EXPIRED since this decision was
+ * first written, and is recorded as expired rather than quietly dropped, because what
+ * retired it is also the re-open trigger: reasons 2 and 3 carry the decline on their own.
+ *
+ *   1. ⛔ EXPIRED — was: "nothing would read it". When this was first written the
+ *      closed-unmerged retirement lived in an unmerged PR, so the field would have
+ *      shipped with no consumer and had its semantics fixed before the code depending
+ *      on it existed. PEN-5254 has since landed that retirement on master
+ *      (`classifyPullRequestGateLookup`), so a consumer now exists. This reason no
+ *      longer supports the decline.
+ *   2. It narrows a window; it does not close the hole. A PR closed for longer than one
+ *      interval and then reopened still retires its card, and nothing reopens a card
+ *      when its PR reopens — `classifyPullRequestGateLookup`'s own docblock says so and
+ *      tells the reader to file a new card naming the reopened PR. The guard converts a
+ *      certainty into a probability while leaving the failure mode intact, so the
+ *      residual stays where it is already handled: in prose, at the point a reader
+ *      learns the card retired.
+ *   3. Cost lands on a shared reader. SEVEN call sites today — the approvals sweep,
+ *      `routes/approvals.ts` (the file-time gate check PEN-5254 added),
+ *      `terminal-gate-reconciler.ts`, `issues.ts`, and three in `heartbeat.ts`. Six of
+ *      the seven want `{ state, merged }` and nothing more, and every test double of
+ *      this reader inherits whatever is added here. (The count was five when this
+ *      decision was first written; it has grown once already, which is the argument.)
+ *
+ * Re-open the decision on EVIDENCE, not on a schedule: a card observed retired by a
+ * close/reopen race. That was originally the second half of a two-part trigger whose
+ * first half was "a closed-unmerged retirement has landed on master"; that half is now
+ * satisfied, so the evidence half is the whole trigger.
+ *
+ * (A fourth consideration, noted and NOT relied on: the guard compares GitHub's clock
+ * against the server's. At the 10-minute sweep interval, ordinary NTP skew is far
+ * inside the margin, so this is a design note rather than an objection.)
  */
 export type PullRequestGateResult =
   | { state: "open" | "closed"; merged: boolean }

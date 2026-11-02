@@ -64,6 +64,13 @@ const CANDIDATE_BATCH_SIZE = 100;
  * GitHub lookups per sweep. One card costs one REST call, so this is the sweep's
  * hard budget against the App's rate limit. Hitting it is logged, never silent —
  * a truncated sweep that reported success would read as "all gates verified".
+ *
+ * Hitting it is also not the end of those cards: the sweep returns a `nextCursor`
+ * and `startApprovalGateReconciler` resumes the next tick there, so the budget
+ * caps the work per tick rather than the work overall. Before that resume point
+ * existed every tick restarted at the oldest card, which made this a *permanent*
+ * cut rather than a per-tick one — any card behind a head of `maxLookups` cards
+ * that never terminate was never reached again (PEN-5265).
  */
 const MAX_LOOKUPS_PER_SWEEP = 200;
 
@@ -157,6 +164,20 @@ export interface ApprovalGateReconcileResult {
   failed: number;
   /** True when the lookup budget cut the sweep short. */
   truncated: boolean;
+  /**
+   * Where the next sweep should resume, or `null` to start from the oldest card.
+   *
+   * Non-null exactly when `truncated` is true: the budget stopped this sweep with
+   * cards still unchecked behind it, so the next sweep must continue from here
+   * rather than re-walking the head. `null` means the pass completed and the
+   * rotation starts over.
+   *
+   * ⚠️ This is returned, never stored. `reconcileApprovalGates` stays stateless so
+   * it remains directly testable; `startApprovalGateReconciler` is what carries the
+   * value from one tick to the next, and it carries it IN MEMORY — see that
+   * function for what a process restart costs.
+   */
+  nextCursor: CandidateCursor | null;
 }
 
 export type ApprovalGateReconcilerScheduler = {
@@ -183,9 +204,14 @@ export type ApprovalGateReconcilerOptions = {
     prNumber: number;
   }) => Promise<PullRequestGateResult>;
   now?: () => Date;
+  /**
+   * Resume point from the previous sweep's `nextCursor`. `null`/omitted starts at
+   * the oldest candidate.
+   */
+  resumeFrom?: CandidateCursor | null;
 };
 
-type CandidateCursor = { createdAt: Date | string; id: string };
+export type CandidateCursor = { createdAt: Date | string; id: string };
 
 type CandidateRow = {
   id: string;
@@ -634,6 +660,10 @@ async function closeAndAnnounce(
 /**
  * One sweep. Idempotent and safe to run concurrently with itself or with a human
  * using the board: every write re-checks that the card is still undecided.
+ *
+ * Stateless by design: pass `options.resumeFrom` to continue a previous sweep and
+ * read `result.nextCursor` to find where this one stopped. Callers that want the
+ * rotation carried for them should use `startApprovalGateReconciler`.
  */
 export async function reconcileApprovalGates(
   db: Db,
@@ -654,9 +684,10 @@ export async function reconcileApprovalGates(
     deferred: 0,
     failed: 0,
     truncated: false,
+    nextCursor: null,
   };
   const closedSamples: string[] = [];
-  let cursor: CandidateCursor | null = null;
+  let cursor: CandidateCursor | null = options.resumeFrom ?? null;
   let budgetExhausted = false;
 
   while (!budgetExhausted) {
@@ -741,11 +772,12 @@ export async function reconcileApprovalGates(
         // Symmetric with the guarded `fetchRun` above, and for a sharper reason: an
         // unguarded throw here (deadlock, an FK violation on the comment insert, an
         // outbox failure in logActivity) propagates out of the sweep and is swallowed
-        // by the caller's `.catch`. Because every sweep restarts at `cursor = null`
-        // ordered by `(createdAt, id)`, the same early card would be re-encountered
-        // first on every tick and would starve every card behind it indefinitely —
-        // the silent-cap failure the `truncated` counter exists to prevent, arriving
-        // through a different door.
+        // by the caller's `.catch`. A sweep that throws returns no `nextCursor`, so
+        // `startApprovalGateReconciler` keeps the resume point it already had and the
+        // next tick re-walks this same region — hitting this same card first and
+        // starving every card behind it indefinitely. Catching here is what keeps the
+        // rotation advancing: the cursor is already past this card, so continuing
+        // leaves it behind rather than re-blocking on it.
         result.failed += 1;
         log.error(
           { err, approvalId: candidate.id, gate: approvalGateRef(gate) },
@@ -779,22 +811,41 @@ export async function reconcileApprovalGates(
     result.truncated = (await listCandidateApprovals(db, 1, cursor)).length > 0;
   }
 
+  // Resume exactly when something was genuinely left unchecked. Keying this on
+  // `truncated` rather than on `budgetExhausted` matters at the boundary: a budget
+  // that ran out with nothing behind it completed the pass, so the next sweep
+  // should start at the oldest card, not sit parked at the tail re-probing an
+  // empty remainder.
+  result.nextCursor = result.truncated ? cursor : null;
+
+  // `nextCursor` carries a Date and is machinery, not a metric. Log the card id it
+  // points at instead, so an operator reading consecutive truncated sweeps can see
+  // the rotation advancing (a value that never moves is the starvation this resume
+  // point exists to remove, re-appearing some other way).
+  const { nextCursor, ...counters } = result;
+  const logFields = { ...counters, nextCursorId: nextCursor?.id ?? null };
+
   if (result.closed > 0) {
     log.info(
-      { ...result, sample: closedSamples },
+      { ...logFields, sample: closedSamples },
       "approval-gate reconciler closed approval cards whose GitHub gate had terminated (BLO-29359)",
     );
   }
   if (result.failed > 0) {
     log.warn(
-      { ...result },
+      { ...logFields },
       "approval-gate reconciler left cards pending after close failures; they retry next sweep (BLO-29359)",
     );
   }
   if (result.truncated) {
     log.warn(
-      { ...result, maxLookups },
-      "approval-gate reconciler hit its GitHub lookup budget; remaining cards are checked next sweep",
+      { ...logFields, maxLookups },
+      // Says what is true of the cards behind the cut, and names the one thing that
+      // can still drop them. The old wording — "remaining cards are checked next
+      // sweep" — was an unconditional promise the sweep could not keep: every tick
+      // restarted at the oldest card, so the tail was re-dropped, not resumed
+      // (PEN-5265). It is now kept across ticks, but only in this process.
+      "approval-gate reconciler hit its GitHub lookup budget; the next sweep in this process resumes at nextCursorId — a restart loses the resume point and returns the sweep to the oldest card",
     );
   }
 
@@ -805,6 +856,24 @@ export async function reconcileApprovalGates(
  * Start the periodic sweep. Mirrors `startStrandedBlockedIssueReconciler`: one
  * immediate pass so existing debris clears without waiting a full interval, then on
  * the configured cadence. Returns a stop function.
+ *
+ * Carries the lookup-budget resume point from one tick to the next (PEN-5265). The
+ * sweep walks candidates oldest-first by `(createdAt, id)` and spends at most
+ * `maxLookups` GitHub calls per tick; without a resume point every tick restarted
+ * at the oldest card, so a head of `maxLookups` cards whose gates never terminate
+ * would hide every card behind it *permanently* — the `truncated` counter would
+ * report the same tail being dropped forever and read like a queue draining. With
+ * the resume point the sweep rotates: each tick continues where the last stopped
+ * and starts over only once it reaches the end.
+ *
+ * ⚠️ The resume point lives in this closure, so a process restart returns the sweep
+ * to the oldest card. That is a deliberate stopping point, not an oversight: a
+ * durable cursor needs a row to live in, and the population that would make it
+ * matter does not exist yet (measured 2026-11-02: zero undecided Penstock cards
+ * carry a `payload.gate` at all). The in-memory point is enough whenever the
+ * process outlives one full rotation — `ceil(population / maxLookups)` ticks. Spend
+ * the migration when a sweep is observed truncating across a restart boundary, or
+ * when the population makes a rotation longer than the deploy cadence.
  */
 export function startApprovalGateReconciler(
   db: Db,
@@ -813,13 +882,21 @@ export function startApprovalGateReconciler(
   scheduler: ApprovalGateReconcilerScheduler = defaultScheduler,
 ): () => void {
   let inFlight: Promise<void> | null = null;
+  // Seeded from the caller so a resume point can be injected; thereafter this is
+  // the rotation's only state.
+  let resumeFrom: CandidateCursor | null = options.resumeFrom ?? null;
   const runTick = () => {
     if (inFlight) return;
-    inFlight = reconcileApprovalGates(db, options)
+    inFlight = reconcileApprovalGates(db, { ...options, resumeFrom })
+      // Advancing on success only. A sweep that threw returned no cursor, and
+      // inventing one would skip the region it failed on; holding the previous
+      // value re-walks exactly what was not finished.
+      .then((result) => {
+        resumeFrom = result.nextCursor;
+      })
       .catch((err) => {
         defaultLogger.error({ err }, "approval-gate reconciler sweep failed");
       })
-      .then(() => undefined)
       .finally(() => {
         inFlight = null;
       });
