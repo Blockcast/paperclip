@@ -126,16 +126,22 @@ export function keepSanitizedAgentMetadata(meta: unknown): unknown {
  *  - A value-shape test cannot be both safe and complete at a Tier-0 key.
  *    `looksLikeCredentialValue` (`redaction.ts`) is exactly that instrument
  *    and already runs — but only behind a Tier-1/2 *key* match, which is why
- *    `{secret: "sk-ant-…"}` is masked and `{note: …}` is not. Run as-is at
- *    every key, its length backstop (`MIN_OPAQUE_TOKEN_LENGTH`, 20, minus the
- *    readable-slug exemption) blanks the ordinary long opaque identifiers this
- *    column and its two siblings legitimately hold: UUIDs, 40-hex git SHAs and
- *    image references all classify as credential-shaped. Narrowed to
- *    high-confidence prefixes it stops over-redacting but misses every
- *    *prefixless* secret — AWS secret access keys, passphrases, hex HMAC keys,
- *    base64 blobs. Same dial, opposite ends: the test is sound only where the
- *    KEY already says "secret", and the residual is by construction where it
- *    does not.
+ *    `{secret: "sk-ant-…"}` is masked and `{note: …}` is not. Run *as-is* at
+ *    every key, its length backstop (`MIN_OPAQUE_TOKEN_LENGTH`, 20,
+ *    minus the readable-slug exemption) blanks the ordinary long opaque
+ *    identifiers this column and its two siblings legitimately hold: UUIDs,
+ *    40-hex git SHAs and image references all classify as credential-shaped.
+ *    "As-is" is load-bearing, and the honest cost is smaller than that list:
+ *    `redaction.ts` ALREADY has `HEX_IDENTIFIER_RE` / `UUID_RE` exemptions and
+ *    applies them inside `hasOpaqueUrlPathSegment` but not in the bare-value
+ *    branch, so a Tier-0 pass that simply reused them would stop blanking the
+ *    UUID and the SHA. What survives that cheap refinement — image references
+ *    and other long non-hex, non-UUID identifiers — is the durable cost.
+ *    Smaller, not zero. Narrowed instead to high-confidence prefixes the pass
+ *    stops over-redacting but misses every *prefixless* secret — AWS secret
+ *    access keys, passphrases, hex HMAC keys, base64 blobs. Same dial,
+ *    opposite ends: the test is sound only where the KEY already says
+ *    "secret", and the residual is by construction where it does not.
  *  - A write-side pass that *masked* would collide with the shared restore
  *    path. All three columns share {@link restoreRedactedAdapterValue} /
  *    {@link containsRedactedAdapterValue}, by two entry points rather than
@@ -165,7 +171,10 @@ export function keepSanitizedAgentMetadata(meta: unknown): unknown {
  * with the *value* `looksLikeCredentialValue` actually tests. The real marker
  * values (`cto`, `security-engineer`, …) are short readable slugs and survive
  * untouched. The over-redaction cost is real but sits elsewhere — on the long
- * opaque identifiers named above — so that is what the tests now pin.
+ * opaque identifiers named above — so that is what the tests now pin. The
+ * "as-is" qualifier on that cost was then added on review (#3292), for the
+ * same reason: stated without it, the cost overstates in the same
+ * decision-flattering direction a second time.
  * `__tests__/agent-secret-redaction.test.ts` pins both sides of this
  * boundary, so a future shape pass fails a test rather than silently
  * widening the column.
