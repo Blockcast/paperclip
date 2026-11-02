@@ -87,7 +87,21 @@ on:
 # Read-only, deliberately and permanently. This job detects; it must never
 # acquire the ability to land anything (see the header). `--alarm` makes no
 # writes, so nothing here needs more than read.
+#
+# `checks: read` is LOAD-BEARING, not boilerplate. An explicit `permissions`
+# block sets every unlisted scope to `none`, and the detector's whole clock
+# (`judgeableAgeHours` -> `newestCheckStamp`) reads `statusCheckRollup`, which
+# is a union: `CheckRun` nodes need `checks`, `StatusContext` nodes need
+# `statuses`. Measured on #3270 itself, the rollup was 19 `CheckRun` to 2
+# `StatusContext` — this repo publishes nearly all of its CI as check-runs.
+# Omitting the scope does not fail loudly; the rollup comes back missing those
+# 19 entries and the rows classify `checks:none`/`skip`, so nothing ever reads
+# `enqueue` and the alarm stays green FOR STRUCTURAL REASONS. That is the
+# silence-means-health failure this workflow exists to remove, reproduced
+# inside the remedy. The sibling review-gate-sweep.yml grants it to its own
+# rollup-reading job for the same reason.
 permissions:
+  checks: read
   contents: read
   pull-requests: read
   statuses: read

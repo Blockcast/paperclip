@@ -997,7 +997,15 @@ export function classifyPr(pr, { now = Date.now(), settleMinutes = CHECK_SETTLE_
 
   const failing = failingChecks(checks);
   if (failing.length > 0) {
-    return row("skip", `checks:${failing[0].split("=")[1]}`, failing.join(", "));
+    // `pop`, not `[1]`: `failingChecks` formats each entry as `name=STATE` and
+    // a check NAME may itself contain `=`. Measured on this repo 2026-11-02,
+    // `Worktree install (NODE_ENV=production)=QUEUED` split to the reason
+    // `checks:production)`. That was survivable while the reason was a receipt
+    // column; `stateHold` now puts it in a sentence on the PR ("is not
+    // enqueuing this PR: `checks:production)`"), and it also keys that
+    // comment's marker, so a mis-split reason is both unreadable and a
+    // slug nobody can predict. The state is the LAST field by construction.
+    return row("skip", `checks:${failing[0].split("=").pop()}`, failing.join(", "));
   }
 
   const settlement = checkSettlement(checks, { now, settleMinutes });
@@ -1371,10 +1379,20 @@ export function renderUnlandedEligible(
  *
  * `commentOnce` makes it idempotent, and `statedHoldMarker` keys it by reason,
  * so the ceiling is one comment per PR per distinct durable reason — not one
- * per fire. The two bespoke comments keep their own markers and are not
- * duplicated here: they state a reason this function cannot (an action the
- * routine TOOK, in `stale-enqueue`'s case), and they are posted from
- * `applyRow` at the moment of the action rather than from the age report.
+ * per fire.
+ *
+ * The two bespoke `applyRow` comments are not duplicated here, and that is
+ * ENFORCED by `BESPOKE_COMMENT_ACTIONS` in the caller rather than assumed. It
+ * reads like it should fall out of the cohorts and it does not:
+ * `stale-enqueue` is excluded for free (`NON_HOLD_ACTIONS`), but
+ * `codeowner-review-requested` is in neither that set nor
+ * `DELIBERATE_HOLD_REASON_RE`, so it reaches `stalledHolds` and would collect
+ * a second comment under `stated-hold:owner-approval-pending` beside its
+ * `CODEOWNER_REQUEST_MARKER` one. Both say the PR is held on an owner; only
+ * the bespoke one names the owner, and it is posted on the first fire rather
+ * than after STALE_HOLD_HOURS. The skip is in the caller because this
+ * function takes a `{ number, reason, ageHours }` row and the discriminator
+ * is the `action`, which that shape deliberately does not carry.
  */
 export function stateHold(repo, { number, reason, ageHours }, run = gh) {
   const age =
@@ -1765,9 +1783,37 @@ export function markFailure(row, message) {
   return row;
 }
 
-function runRepo(repo, apply, settleMinutes, spent, rotted, stranded = []) {
-  const prs = fetchOpenPrs(repo);
-  const rows = classifyAll(prs, { settleMinutes, spent });
+/**
+ * Actions that already state their own reason on the PR, from `applyRow`, at
+ * the moment of the hold rather than from the age report. `stateHold` must
+ * skip them or the PR carries two comments saying the same thing under two
+ * markers.
+ *
+ * `codeowner-review-requested` is the live case: it is not in
+ * `NON_HOLD_ACTIONS` and its reason does not match `DELIBERATE_HOLD_REASON_RE`,
+ * so it reaches `stalledHolds` and would pick up a second comment under
+ * `stated-hold:owner-approval-pending` beside its `CODEOWNER_REQUEST_MARKER`
+ * one. The bespoke comment is the better of the two — it names the owner — and
+ * it is posted on the FIRST fire rather than after STALE_HOLD_HOURS, so the
+ * duplicate adds a worse sentence, later.
+ *
+ * The row stays in the stale-hold REPORT: the receipt is for a human reading
+ * the fire, and a code-owner hold that has outlived its window belongs there.
+ * It is only the PR comment that is suppressed.
+ */
+const BESPOKE_COMMENT_ACTIONS = new Set(["codeowner-review-requested", "stale-enqueue"]);
+
+export function runRepo(
+  repo,
+  apply,
+  settleMinutes,
+  spent,
+  rotted,
+  stranded = [],
+  { fetch = fetchOpenPrs, classify = classifyAll, applyOne = applyRow, state = stateHold } = {},
+) {
+  const prs = fetch(repo);
+  const rows = classify(prs, { settleMinutes, spent });
 
   for (const row of rows) {
     if (row.action === "approval-rotted") rotted.push(`${repo}#${row.number} (${row.detail})`);
@@ -1776,7 +1822,7 @@ function runRepo(repo, apply, settleMinutes, spent, rotted, stranded = []) {
   for (const row of rows) {
     if (!apply) continue;
     try {
-      const outcome = applyRow(repo, row);
+      const outcome = applyOne(repo, row);
       if (outcome) row.detail = [row.detail, outcome].filter(Boolean).join(" — ");
     } catch (error) {
       const message = error?.stderr?.toString() || error?.message || String(error);
@@ -1801,7 +1847,30 @@ function runRepo(repo, apply, settleMinutes, spent, rotted, stranded = []) {
   const stalled = renderStalledHolds(repo, held);
   // Disjoint from `stalled` by construction: that block reports rows with a
   // reason for inaction, this one rows with none. A PR can never be in both.
-  const eligible = unlandedEligible(prs, rows);
+  //
+  // DRY RUNS ONLY, and this is the same post-apply meaning flip that `main`
+  // refuses `--alarm` + `--apply` over — it just reaches further than that
+  // refusal covers. After the loop above, a row still reading `enqueue` is
+  // not "nothing took this in UNLANDED_ELIGIBLE_HOURS"; it is "this fire took
+  // it, seconds ago". There is no third case: every `enqueue` row entered
+  // `applyRow`, which leaves the action alone on success, renames it to
+  // `enqueue-failed` on a non-fatal throw (and `stalledHolds` owns it from
+  // there), and exits the process on a fatal one. Capped rows never reach
+  // here at all — `classifyAll` rewrites them to `skip`/`cap:`.
+  //
+  // So in an applying run this cohort is a tautology over the rows just acted
+  // on, and acting on it was actively wrong: `stateHold` posted "The landing
+  // routine is not enqueuing this PR" on PRs the same fire had just enqueued,
+  // permanently, because `commentOnce` never repeats. The trigger is ordinary
+  // rather than exotic — any PR whose CI finished more than
+  // UNLANDED_ELIGIBLE_HOURS before its review or owner approval arrived is
+  // eligible on the very fire that first enqueues it.
+  //
+  // Nothing is lost by the cut. The cohort's subject is "fires are not
+  // enqueuing this", which an applying fire has just disproved for every row
+  // it holds, and the persistent case is owned by the hourly `--alarm`
+  // detector that cannot apply by construction.
+  const eligible = apply ? [] : unlandedEligible(prs, rows);
   for (const row of eligible) stranded.push(`${repo}#${row.number}`);
 
   // Stated on the PR, not just in this receipt — and only on `--apply`, since
@@ -1812,9 +1881,11 @@ function runRepo(repo, apply, settleMinutes, spent, rotted, stranded = []) {
   // limit reached while commenting has already let the reads through, so the
   // receipt is trustworthy and worth printing.
   if (apply) {
-    for (const row of [...held, ...eligible]) {
+    const byNumber = new Map(rows.map((row) => [row?.number, row]));
+    for (const row of held) {
+      if (BESPOKE_COMMENT_ACTIONS.has(byNumber.get(row?.number)?.action)) continue;
       try {
-        stateHold(repo, row);
+        state(repo, row);
       } catch (error) {
         const message = error?.stderr?.toString() || error?.message || String(error);
         console.error(
