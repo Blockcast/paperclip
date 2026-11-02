@@ -92,8 +92,9 @@ export const REVIEW_LAST_COMPLETED = null;
  * happen before it costs anyone anything, and a repo-wide freeze that arrives
  * with no warning is the version of this that gets the step deleted rather than
  * discharged. So this prints `::warning::` for the window before the due date
- * and changes NO exit code. 2026-12-15 gives 47 days of yellow on every `policy`
- * run before the hard stop.
+ * and leaves every exit code alone. 2026-12-15 gives 47 days of yellow on every
+ * `policy` run before the hard stop. (Setting it on or after `REVIEW_DUE` is
+ * refused outright — see `reviewNoticeDue`.)
  *
  * Explicit ISO, not derived from `REVIEW_DUE`. This file compares dates as ISO
  * strings on purpose and holds no date arithmetic anywhere; adding some here to
@@ -196,13 +197,21 @@ export function reviewOwed(today, due = REVIEW_DUE, lastCompleted = REVIEW_LAST_
  * a warning riding alongside a failure is noise that teaches people to skim the
  * annotation that matters.
  *
- * ⛔ This arm never reaches the verdict and never changes an exit code. It is a
- * notice. If it ever gains one, it has become a second gate nobody agreed to.
+ * ⛔ This arm never reaches the verdict, and never changes the exit code of a
+ * correctly configured file. It is a notice. If it ever gains one, it has
+ * become a second gate nobody agreed to.
  *
  * `notice >= due` is REFUSED rather than compared, because it is the only way to
  * misconfigure these three constants that fails silent: the window is empty, no
  * warning ever fires, and the result is byte-identical to a correct file in a
  * year with nothing due. Every other mistake here is loud.
+ *
+ * ⚠ That refusal THROWS, and both `main` paths route the throw to UNREADABLE —
+ * exit 2, which is not the clear bucket. So the sentence above is scoped to a
+ * correctly configured file on purpose, and the two statements do not conflict:
+ * a misconfigured constant is refused, it is not the notice gating. Do NOT
+ * delete the throw to make a comment read more simply — a guard removed to
+ * satisfy its own docstring is this file's whole subject matter.
  */
 export function reviewNoticeDue(today, notice = REVIEW_NOTICE, due = REVIEW_DUE) {
   const iso = /^\d{4}-\d{2}-\d{2}$/;
