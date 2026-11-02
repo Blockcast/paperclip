@@ -198,6 +198,54 @@ const EXTERNAL_LIFECYCLE_ADAPTER_TYPE_SET = new Set<string>(EXTERNAL_LIFECYCLE_A
 const WITHHELD_AGENT_CONFIG_FIELDS = ["adapterConfig", "runtimeConfig"] as const;
 const WITHHELD_AGENT_CONFIG_ACTION = "agent_config:read";
 
+/**
+ * The access-state withholds, named for the same reason as the two above
+ * (PEN-5232, implementing the `Ceo`'s NARROW ruling).
+ *
+ * The restricted detail response drops the subject's `access.grants` and
+ * projects `access.membership` to `status` alone. Without these names the
+ * SAME response would withhold four things and declare two, and a reader
+ * applying the contract stated on `WITHHELD_AGENT_CONFIG_FIELDS` — that the
+ * markers' absence is itself the signal nothing was withheld — would conclude
+ * the authorization state it is holding is complete. That is the identical
+ * false-complete shape PEN-5230 closed for the config columns; it would be
+ * worse here, because authorization metadata is the more security-relevant of
+ * the two.
+ *
+ * `access.membership` names a NARROWED field, not a dropped one: `status`
+ * survives. The marker says "something here was withheld", which is true of a
+ * projection as much as of a drop, and a reader that needs to know what
+ * survived can read the key set it was given.
+ *
+ * ## This list is appended AT THE CALL SITE, and that is deliberate
+ *
+ * Do NOT "tidy" these into `WITHHELD_AGENT_CONFIG_FIELDS`. That constant is
+ * consumed by `redactForRestrictedAgentView`, which is shared by BOTH peer
+ * routes — `GET /agents/:id` and the company list. Only `buildAgentDetail`
+ * attaches `access` at all; the list route never offers it. Folding these in
+ * would make the list route claim to withhold an inventory it never carried,
+ * which is a false statement in the opposite direction and a worse one,
+ * because it would be false on a route that is behaving correctly.
+ *
+ * So the withheld set is ROUTE-dependent while the redactor is not, and the
+ * append belongs where the route composes its response.
+ *
+ * ## Constant, unconditional, zero bits — same invariant as the pair above
+ *
+ * Never condition this on whether the subject holds any grants, how many, or
+ * whether `membership` is non-null. Over-claiming is the correct direction and
+ * the config markers already set it: they name `adapterConfig` even when that
+ * column was genuinely `{}`. A marker that appeared only when there was
+ * something to withhold would be a per-subject oracle on every seat's
+ * authorization posture — precisely the disclosure this row narrows.
+ *
+ * `withheldByAction` is NOT extended: `agent_config:read` is the decision that
+ * routed the response to the restricted arm, so it is accurate for these
+ * withholds too, and it remains a fact about the READER rather than about the
+ * subject. Do not invent a second action.
+ */
+const WITHHELD_AGENT_ACCESS_FIELDS = ["access.grants", "access.membership"] as const;
+
 // Defined in `../agent-redaction.js` alongside the redactors they must stay in
 // lockstep with; re-exported here because this module is their established
 // import path. The write-side restore pair moved there in PEN-3757 so
@@ -844,55 +892,117 @@ export function agentRoutes(
     return Boolean((agent.permissions as Record<string, unknown>).canCreateAgents);
   }
 
-  async function buildAgentAccessState(agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>) {
+  /**
+   * The subject's access state, in one of two shapes.
+   *
+   * `restricted: true` is the PEER answer, and it is a deliberate narrowing
+   * ruled by the `Ceo` on PEN-5232: a reader that fails `agent_config:read`
+   * gets the DERIVED answer — "may this seat assign me work, and on what
+   * basis" — and not the inventory that answer was derived from.
+   *
+   * ## Why the inventory goes
+   *
+   * The row this closes found that `buildAgentDetail` attached the subject's
+   * complete `access.grants` OUTSIDE the restricted projection, so a reader
+   * denied every configuration byte was nonetheless told, per key, which seats
+   * hold `agents:configure` — i.e. exactly which seat to compromise or
+   * persuade to obtain the thing just withheld. Across `PERMISSION_KEYS` the
+   * same read is a general capability map, including `runs:read_transcript`,
+   * which PEN-3142 withdrew from standing company-wide peer read precisely
+   * because run logs have carried vendor credential material.
+   *
+   * Three facts decided it, and the third is why a `keep` was not available:
+   *
+   * 1. Nothing operational is lost. `canAssignTasks` + `taskAssignSource`
+   *    already answer the escalation-routing question in derived form, using
+   *    an idiom that was already in this function.
+   * 2. There is no read/write counterweight (PEN-3206 §5). A grant is writable
+   *    only with `users:manage_permissions`, and nobody on the restricted path
+   *    holds it — unlike the `tools:manage_runtime` asymmetry PEN-4775 §6
+   *    found for the config columns, where a seat could write what it could
+   *    not read back. So narrowing here creates no contradiction anywhere.
+   * 3. `listPrincipalGrants` is a bare `select *`. Keeping the inventory would
+   *    have licensed not today's nine columns of `principal_permission_grants`
+   *    but every column anyone adds later — among them the uncontained,
+   *    operator-authored `scope` jsonb, sitting beside the
+   *    `containAgentMetadata` call added three lines away in
+   *    `redactForRestrictedAgentView` to fix this exact shape (PEN-3726).
+   *    PEN-5258 gives both that function and `getMembership` an explicit
+   *    column projection; this arm does not wait on it.
+   *
+   * ## The residual, stated rather than glossed
+   *
+   * This response is NOT zero-bit about the subject's grants, and must not be
+   * described as if it were. `taskAssignSource: "explicit_grant"` discloses
+   * one derived bit — whether the subject holds `tasks:assign`. That bit is
+   * kept deliberately: it is the operational answer, and it is the half of the
+   * disclosure that has a consumer.
+   *
+   * If a real consumer of the inventory appears, bring the use case and widen
+   * deliberately. This is a two-way door; what the row objected to was that
+   * nobody had chosen.
+   */
+  async function buildAgentAccessState(
+    agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+    options?: { restricted?: boolean },
+  ) {
     const membership = await access.getMembership(agent.companyId, "agent", agent.id);
+    // NOT conditional on `options.restricted`, and that is load-bearing.
+    // `grants` is an INPUT to `taskAssignSource` via the line below, so
+    // skipping the query for a restricted reader would silently flip
+    // `explicit_grant` into `simple_default`/`none` for exactly those readers
+    // — a behaviour change wearing a narrowing's clothes, and invisible in
+    // review. The query stays; only the DISCLOSURE narrows.
     const grants = membership
       ? await access.listPrincipalGrants(agent.companyId, "agent", agent.id)
       : [];
     const hasExplicitTaskAssignGrant = grants.some((grant) => grant.permissionKey === "tasks:assign");
 
-    if (agent.role === "ceo") {
+    const derived = agent.role === "ceo"
+      ? { canAssignTasks: true, taskAssignSource: "ceo_role" as const }
+      : canCreateAgents(agent)
+      ? { canAssignTasks: true, taskAssignSource: "agent_creator" as const }
+      : hasExplicitTaskAssignGrant
+      ? { canAssignTasks: true, taskAssignSource: "explicit_grant" as const }
+      : membership?.status === "active"
+      ? { canAssignTasks: true, taskAssignSource: "simple_default" as const }
+      : { canAssignTasks: false, taskAssignSource: "none" as const };
+
+    if (options?.restricted) {
+      // Constructed EXPLICITLY, never a spread with deletions. A spread is how
+      // the defect this closes arrived in the first place, and it is why a
+      // column added to either joined table would reach a peer by default.
+      //
+      // `grants` is ABSENT, not `[]`. An empty array is indistinguishable from
+      // "this agent holds no grants" — the withheld-is-not-absent ambiguity
+      // PEN-5230 closed one field over. The response declares the withhold
+      // through `WITHHELD_AGENT_ACCESS_FIELDS`, not through a sentinel value.
+      //
+      // The `satisfies` below enforces that at COMPILE time, and `grants?:
+      // never` is the clause doing the work: `satisfies` runs an excess-
+      // property check on an object literal, so re-adding `grants` here — in
+      // ANY form, including `[]` — fails the build rather than shipping.
+      // Verified by injecting `grants: []` and observing `error TS2322`.
+      //
+      // It is spelled structurally rather than as the shared
+      // `AgentAccessStateRestricted` (which carries the same `grants?: never`)
+      // on purpose: `access` returns drizzle rows whose enum columns are plain
+      // `string` while the shared type narrows them, so naming the shared type
+      // here would couple this route to a service-layer looseness PEN-5258
+      // owns, and break the build for a reason unrelated to this projection.
       return {
-        canAssignTasks: true,
-        taskAssignSource: "ceo_role" as const,
-        membership,
-        grants,
+        canAssignTasks: derived.canAssignTasks,
+        taskAssignSource: derived.taskAssignSource,
+        membership: membership ? { status: membership.status } : null,
+      } satisfies {
+        canAssignTasks: boolean;
+        taskAssignSource: string;
+        membership: { status: string } | null;
+        grants?: never;
       };
     }
 
-    if (canCreateAgents(agent)) {
-      return {
-        canAssignTasks: true,
-        taskAssignSource: "agent_creator" as const,
-        membership,
-        grants,
-      };
-    }
-
-    if (hasExplicitTaskAssignGrant) {
-      return {
-        canAssignTasks: true,
-        taskAssignSource: "explicit_grant" as const,
-        membership,
-        grants,
-      };
-    }
-
-    if (membership?.status === "active") {
-      return {
-        canAssignTasks: true,
-        taskAssignSource: "simple_default" as const,
-        membership,
-        grants,
-      };
-    }
-
-    return {
-      canAssignTasks: false,
-      taskAssignSource: "none" as const,
-      membership,
-      grants,
-    };
+    return { ...derived, membership, grants };
   }
 
   async function buildAgentDetail(
@@ -901,13 +1011,32 @@ export function agentRoutes(
   ) {
     const [chainOfCommand, accessState] = await Promise.all([
       svc.getChainOfCommand(agent.id),
-      buildAgentAccessState(agent),
+      // PEN-5232: THE defect this row closed was that `options.restricted`
+      // reached the spread below and nothing else, so the restricted
+      // projection withheld both config columns and the function then attached
+      // the subject's complete authorization state beside it. The flag must
+      // reach every field this function composes, not only the agent row.
+      buildAgentAccessState(agent, { restricted: options?.restricted }),
     ]);
 
-    return {
+    const detail = {
       ...(options?.restricted ? redactForRestrictedAgentView(agent) : redactAgentSecrets(agent)),
       chainOfCommand,
       access: accessState,
+    };
+
+    if (!options?.restricted) return detail;
+
+    // Declare the access withholds alongside the config ones, so this
+    // response's `withheldFields` is a COMPLETE statement about this response.
+    // Appended here rather than folded into `WITHHELD_AGENT_CONFIG_FIELDS`
+    // because the redactor is shared with the company-list route, which
+    // attaches no `access` and therefore withholds no grants — see the block
+    // on `WITHHELD_AGENT_ACCESS_FIELDS` before moving this.
+    return {
+      ...detail,
+      withheldFields: [...WITHHELD_AGENT_CONFIG_FIELDS, ...WITHHELD_AGENT_ACCESS_FIELDS],
+      withheldByAction: WITHHELD_AGENT_CONFIG_ACTION,
     };
   }
 
@@ -2375,6 +2504,29 @@ export function agentRoutes(
    * ruled on `project_workspaces.metadata.runtimeConfig` behind
    * `workspace_runtime:read` — a different column, gate and projection that
    * merely shares a name. See docs/security/agent-config-read-model.md.
+   *
+   * ## What this helper GOVERNS, and what it does not (PEN-5232)
+   *
+   * The boundary is `inside vs outside the spread`, NOT `config vs not-config`
+   * — and reading it the second way is how an unreviewed disclosure survived
+   * in this response for as long as it did.
+   *
+   * GOVERNED: every column on the agent row, because they all arrive through
+   * `{...agent}`. That includes columns this helper passes through UNTOUCHED —
+   * `orgChainHealth`, `permissions`, and `budgetMonthlyCents` /
+   * `spentMonthlyCents` (PEN-4775 §6 owns those two; untouched here in either
+   * direction). Being governed is not being withheld.
+   *
+   * NOT GOVERNED: `chainOfCommand` and `access`, which `buildAgentDetail`
+   * attaches as SIBLINGS of this spread. This helper never sees them. `access`
+   * is narrowed by `buildAgentAccessState`'s own restricted arm, and
+   * `buildAgentDetail` declares that withhold in `withheldFields`; neither is
+   * anything this function can enforce.
+   *
+   * So this is a TWO-KEY projection on the agent row, not a general peer
+   * boundary. Any field attached beside it is outside it and reaches a peer by
+   * default unless its own composer narrows it — which is the trap worth
+   * naming, because it is the one that was walked into.
    */
   function redactForRestrictedAgentView(agent: Awaited<ReturnType<typeof svc.getById>>) {
     if (!agent) return null;

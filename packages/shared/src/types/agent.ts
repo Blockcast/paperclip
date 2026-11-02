@@ -65,12 +65,56 @@ export interface AgentInstructionsBundle {
   files: AgentInstructionsFileSummary[];
 }
 
-export interface AgentAccessState {
+/**
+ * Why an agent may assign tasks. Derived server-side from the subject's role,
+ * permissions, grants and membership — it answers "who do I escalate to, and
+ * on what basis" WITHOUT the inventory it was derived from, which is what lets
+ * `AgentAccessStateRestricted` drop `grants` and stay useful (PEN-5232).
+ */
+export type AgentTaskAssignSource =
+  | "simple_default"
+  | "explicit_grant"
+  | "agent_creator"
+  | "ceo_role"
+  | "none";
+
+/** The access state a reader entitled to the subject's configuration receives. */
+export interface AgentAccessStateFull {
   canAssignTasks: boolean;
-  taskAssignSource: "simple_default" | "explicit_grant" | "agent_creator" | "ceo_role" | "none";
+  taskAssignSource: AgentTaskAssignSource;
   membership: CompanyMembership | null;
   grants: PrincipalPermissionGrant[];
 }
+
+/**
+ * The access state a PEER reader receives — one that fails `agent_config:read`
+ * and is therefore served by `redactForRestrictedAgentView` (PEN-5232).
+ *
+ * `grants` is ABSENT, not empty. `grants?: never` is load-bearing: an empty
+ * array is indistinguishable from "this agent holds no grants", which is the
+ * withheld-is-not-absent defect PEN-5230 closed one field over, so the type
+ * forbids the shape rather than trusting a comment. The response says the
+ * inventory was withheld through `withheldFields`, not through a sentinel
+ * value.
+ *
+ * `membership` is projected to `status` alone. The full row is a bare
+ * `select *` over `company_memberships` (PEN-5258), so passing it through
+ * whole would let a column added later reach a peer by default — the same
+ * default-open shape this projection exists to close.
+ */
+export interface AgentAccessStateRestricted {
+  canAssignTasks: boolean;
+  taskAssignSource: AgentTaskAssignSource;
+  membership: { status: CompanyMembership["status"] } | null;
+  grants?: never;
+}
+
+/**
+ * Discriminate on `grants` before reading it. A restricted response carries
+ * the derived `canAssignTasks` / `taskAssignSource` answer and nothing else
+ * about the subject's authorization.
+ */
+export type AgentAccessState = AgentAccessStateFull | AgentAccessStateRestricted;
 
 export interface AgentChainOfCommandEntry {
   id: string;

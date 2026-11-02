@@ -724,8 +724,16 @@ describe.sequential("agent permission routes", () => {
       const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${peerAgentId}`));
 
       expect(res.status).toBe(200);
-      // The signal.
-      expect(res.body.withheldFields).toEqual(["adapterConfig", "runtimeConfig"]);
+      // The signal. The detail route also narrows `access` (PEN-5232) and
+      // declares that here, so this list is four names on THIS route and two
+      // on the company list — see the list test below, which is the control
+      // proving the access names did not leak into the shared redactor.
+      expect(res.body.withheldFields).toEqual([
+        "adapterConfig",
+        "runtimeConfig",
+        "access.grants",
+        "access.membership",
+      ]);
       expect(res.body.withheldByAction).toBe("agent_config:read");
       // Nothing widened: both columns are still withheld outright, and no
       // config byte reached the response anywhere in it.
@@ -751,8 +759,15 @@ describe.sequential("agent permission routes", () => {
       const self = rows.find((row) => row.id === agentId);
       const peer = rows.find((row) => row.id === peerAgentId);
 
+      // EXACTLY two names, and this is a PEN-5232 control as much as a
+      // PEN-5230 one: the list route attaches no `access` at all, so it
+      // withholds no grant inventory and must not claim to. If the access
+      // names ever appear here, someone folded them into
+      // `WITHHELD_AGENT_CONFIG_FIELDS` and this route now makes a false
+      // statement about a response that is behaving correctly.
       expect(peer?.withheldFields).toEqual(["adapterConfig", "runtimeConfig"]);
       expect(peer?.withheldByAction).toBe("agent_config:read");
+      expect(peer).not.toHaveProperty("access");
       expect(peer?.adapterConfig).toEqual({});
       expect(peer?.runtimeConfig).toEqual({});
 
@@ -823,6 +838,181 @@ describe.sequential("agent permission routes", () => {
       // /`access` come from the same mocks, so byte-identical bodies IS the
       // claim: nothing in this response varies with the subject's config.
       expect(populated.body).toEqual(empty.body);
+    }, 60_000);
+
+    // ---- PEN-5232: the access state is narrowed on the same arm ----
+    //
+    // The row these pin: `buildAgentDetail` composed the restricted projection
+    // and then attached the subject's COMPLETE `access.grants` outside it, so
+    // a reader denied every config byte still received a per-key map of which
+    // seats hold which permission. The `Ceo` ruled NARROW.
+    //
+    // Deliberately NOT written as the whole-body equality the marker test
+    // above uses: `taskAssignSource` legitimately varies with the subject's
+    // grants — it is the derived answer the narrowing KEEPS — so body equality
+    // across a grant/no-grant pair would be a false assertion, and the obvious
+    // repair for it is deleting `taskAssignSource`, which would gut the half
+    // of this change that leaves the route useful. The claims are split: the
+    // markers are the zero-bit assertion, the key sets are the durable control.
+
+    const TASK_ASSIGN_GRANT = {
+      id: "grant-pen5232",
+      companyId,
+      principalType: "agent" as const,
+      principalId: peerAgentId,
+      permissionKey: "tasks:assign" as const,
+      scope: { secretOperatorNote: "pen5232-scope-must-not-reach-a-peer" },
+      grantedByUserId: "user-pen5232",
+      createdAt: new Date("2026-03-19T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+    };
+
+    it("withholds the subject's grant inventory from a peer, and says it did", async () => {
+      denyAgentConfigRead();
+      mockAgentService.getById.mockResolvedValue(peerRow());
+      mockAccessService.listPrincipalGrants.mockResolvedValue([TASK_ASSIGN_GRANT]);
+
+      const app = await agentActorApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      expect(res.status).toBe(200);
+      // ABSENT, not `[]`. An empty array is indistinguishable from "this agent
+      // holds no grants" — the withheld-is-not-absent defect PEN-5230 closed
+      // one field over, which is why this is `not.toHaveProperty`.
+      expect(res.body.access).not.toHaveProperty("grants");
+      // Nothing leaked by another route through the same body. `scope` is the
+      // sharp end: free-form, operator-authored, and uncontained at source.
+      expect(JSON.stringify(res.body)).not.toContain("pen5232-scope-must-not-reach-a-peer");
+      expect(JSON.stringify(res.body)).not.toContain("user-pen5232");
+      // The withhold is DECLARED, so `withheldFields` is a complete statement
+      // about its own response rather than naming two of the four.
+      expect(res.body.withheldFields).toEqual([
+        "adapterConfig",
+        "runtimeConfig",
+        "access.grants",
+        "access.membership",
+      ]);
+      expect(res.body.withheldByAction).toBe("agent_config:read");
+    }, 60_000);
+
+    it("projects a peer's membership to `status` alone", async () => {
+      // THE DURABLE HALF. The drop above is a one-time fix; this key-set
+      // assertion is what makes a column added later to `company_memberships`
+      // fail a test instead of reaching a peer by default. `getMembership` is
+      // a bare `select *` (PEN-5258), so without this the next column ships.
+      denyAgentConfigRead();
+      mockAgentService.getById.mockResolvedValue(peerRow());
+
+      const app = await agentActorApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      expect(res.status).toBe(200);
+      expect(Object.keys(res.body.access).sort()).toEqual([
+        "canAssignTasks",
+        "membership",
+        "taskAssignSource",
+      ]);
+      expect(Object.keys(res.body.access.membership)).toEqual(["status"]);
+      expect(res.body.access.membership.status).toBe("active");
+    }, 60_000);
+
+    it("keeps the DERIVED answer intact — `explicit_grant` survives the narrowing", async () => {
+      // The specific regression caused by "optimising" the grants fetch away
+      // on the restricted path: `grants` is an INPUT to `taskAssignSource`, so
+      // skipping the query would silently flip `explicit_grant` into
+      // `simple_default` for exactly the readers this projection serves. That
+      // is a behaviour change wearing a narrowing's clothes.
+      //
+      // Asserted against the UNRESTRICTED read of the same subject, so the
+      // claim is "the derivation did not shift", not merely "it is a string".
+      mockAgentService.getById.mockResolvedValue(peerRow());
+      mockAccessService.listPrincipalGrants.mockResolvedValue([TASK_ASSIGN_GRANT]);
+
+      // ONE app, two reads. `accessService` is resolved per request, so the
+      // same app serves both entitlement states — and `createApp` is heavy
+      // enough that one per request exhausts a memory-capped worker.
+      const app = await agentActorApp();
+
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by explicit grant agents:configure.",
+      });
+      const full = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      denyAgentConfigRead();
+      const peer = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      expect(full.status).toBe(200);
+      expect(peer.status).toBe(200);
+      expect(full.body.access.taskAssignSource).toBe("explicit_grant");
+      expect(peer.body.access.taskAssignSource).toBe("explicit_grant");
+      expect(peer.body.access.canAssignTasks).toBe(full.body.access.canAssignTasks);
+    }, 60_000);
+
+    it("emits IDENTICAL access markers for a granted and an ungranted subject", async () => {
+      // The zero-bit claim for the new markers, and the reason they are a
+      // constant appended at the call site rather than computed. If a later
+      // edit conditions them on whether the subject actually holds grants, or
+      // on `membership` being non-null, this fails — which is the point: the
+      // detail route returns one seat per call, so a per-subject marker is an
+      // oracle on that seat's authorization posture.
+      denyAgentConfigRead();
+      mockAgentService.getById.mockResolvedValue(peerRow());
+
+      const app = await agentActorApp();
+
+      mockAccessService.listPrincipalGrants.mockResolvedValue([TASK_ASSIGN_GRANT]);
+      const granted = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      mockAccessService.listPrincipalGrants.mockResolvedValue([]);
+      const ungranted = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      expect(granted.status).toBe(200);
+      expect(ungranted.status).toBe(200);
+      // Positive control first, so this cannot pass vacuously on two absent
+      // markers (`undefined === undefined`) — the failure mode Ally caught on
+      // the config-marker test in #3241.
+      expect(granted.body.withheldFields).toBeDefined();
+      expect(ungranted.body.withheldFields).toBeDefined();
+      expect(granted.body.withheldFields).toEqual(ungranted.body.withheldFields);
+      expect(granted.body.withheldByAction).toEqual(ungranted.body.withheldByAction);
+      // Membership is non-null on both above; a null membership must not
+      // change the markers either.
+      mockAccessService.getMembership.mockResolvedValue(null);
+      const unmembered = await requestApp(app, (baseUrl) =>
+        request(baseUrl).get(`/api/agents/${peerAgentId}`));
+      expect(unmembered.status).toBe(200);
+      expect(unmembered.body.withheldFields).toEqual(granted.body.withheldFields);
+      expect(unmembered.body.access.membership).toBeNull();
+      expect(unmembered.body.access).not.toHaveProperty("grants");
+    }, 60_000);
+
+    it("does NOT narrow the unrestricted read — no widening, and the negative control", async () => {
+      // A reader that holds the grant still receives the full inventory and
+      // the whole membership row. This change is a narrowing of ONE arm; if
+      // this test ever goes red the fix leaked onto the entitled path.
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by explicit grant agents:configure.",
+      });
+      mockAgentService.getById.mockResolvedValue(peerRow());
+      mockAccessService.listPrincipalGrants.mockResolvedValue([TASK_ASSIGN_GRANT]);
+
+      const app = await agentActorApp();
+      const res = await requestApp(app, (baseUrl) => request(baseUrl).get(`/api/agents/${peerAgentId}`));
+
+      expect(res.status).toBe(200);
+      expect(res.body.access.grants).toHaveLength(1);
+      expect(res.body.access.grants[0].permissionKey).toBe("tasks:assign");
+      expect(res.body.access.membership).toMatchObject({ status: "active", membershipRole: "member" });
+      expect(res.body).not.toHaveProperty("withheldFields");
+      expect(res.body).not.toHaveProperty("withheldByAction");
     }, 60_000);
 
     it("cannot be PATCHed back onto the agent row", async () => {
