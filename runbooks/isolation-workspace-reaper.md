@@ -70,15 +70,27 @@ has been opted in — until then the coverage gap is visible only by running the
 
 ### What you can actually do about it today
 
-**Nothing in this repo reclaims a foreign claim yet**, so the remedies below are the whole list.
-[PEN-5151](https://paperclip.blockcast.net/PEN/issues/PEN-5151) owns the reclaimer. Three of its
-pieces are now in the tree — `buildIsolationReclaimPlan` (decide),
-`collectIsolationWorkspaceInventory` (enumerate) and `executeIsolationReclaimPlan` (unlink) — and
-**none of them has a caller**: nothing creates the Job that would mount a foreign claim and carry an
-inventory one way and a plan the other. So do not go looking for a sweep that might have run, and do
-not read the presence of those functions as reclamation. If one ever does run, its record is a log
-line `isolation reclaim execution complete`; there is no metric for it yet, which is itself a sign
-nothing is calling it.
+[PEN-5151](https://paperclip.blockcast.net/PEN/issues/PEN-5151) built the reclaimer and it is in
+the tree end to end: `isolation-reclaim-sweep.ts` (the fleet loop), `isolation-reclaim-driver.ts`
+(one claim), `isolation-reclaim-job-port.ts` (creates the Job that mounts a claim this process does
+not), and `isolation-reclaim-report.ts` (carries an inventory one way and a plan the other), over
+the same `buildIsolationReclaimPlan` / `collectIsolationWorkspaceInventory` /
+`executeIsolationReclaimPlan` the mounted sweep uses.
+
+⚠️ **Whether it RUNS here is a config read, and the remedies below are the whole list wherever it
+does not.** The sweep is opt-in — `isolationReclaimSweepEnabled`
+(`PAPERCLIP_ISOLATION_RECLAIM_SWEEP_ENABLED`), read at `server/src/index.ts`, plus
+`paperclipNodeRole != "api"` and the `superviseLeased` holder — because deleting files irreversibly
+must not be the same act as deploying the code. **Check the flag for the deployment in front of you
+rather than this page**; as of 2026-11-02 `values.blockcast.yaml` does not set it, so on Blockcast
+nothing reclaims a foreign claim and the ceiling below applies unchanged.
+
+Do not infer a sweep from the presence of those modules. The evidence that one ran is
+`paperclip_isolation_reclaim_last_sweep_timestamp_seconds` being fresh, with
+`paperclip_isolation_reclaim_reclaimed_total` and
+`paperclip_isolation_reclaim_unknown_outcome_claims_total` beside it; the log line is
+`isolation reclaim execution complete`. An absent series means the sweep never started — which on a
+server with the flag unset is the expected reading, not a fault.
 
 - **Opt the agent back out.** Clearing `enablePerAgentWorkspaceVolume` (or the agent's
   `workspaceVolumeClaim`) returns its next run to the shared claim, where this reaper reaches its
@@ -103,9 +115,12 @@ root, and the root stays present and populated by every agent still on the share
 
 ### This alert is a standing record, not a transient (PEN-5125 / PEN-5151)
 
-While [PEN-5151](https://paperclip.blockcast.net/PEN/issues/PEN-5151) is open there is **no
-reclaimer for an unreachable tree**, so a `> 0` here does not clear on its own and is not expected
-to. It was accepted deliberately, with a ceiling:
+**A `> 0` here does not clear on its own and is not expected to — and that stays true after the
+reclaimer is enabled**, because this gauge counts agents whose trees the MOUNTED sweep cannot
+reach. That is a property of where the tree lives, not of whether anything reclaimed it. Read it
+against `paperclip_isolation_reclaim_last_sweep_timestamp_seconds`: fresh means *unreachable but
+reclaimed*, stale or absent means unreclaimed. Where it is unreclaimed, it was accepted
+deliberately, with a ceiling:
 
 > ≈10 GiB/agent/month against a **50 Gi** claim already carrying ≈13.2 G of duplicated company
 > trees ⇒ ≈36.8 GiB headroom ⇒ **one opted-in agent fills its own claim in ≈3.7 months.**
