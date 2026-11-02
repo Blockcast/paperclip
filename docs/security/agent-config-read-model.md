@@ -34,11 +34,12 @@ rows that same author had closed.
 > `agent_config:read` is a **virtual action, never a stored grant**. An agent
 > reaches it on exactly two paths: the subject **is** the actor, or the actor
 > holds `agents:configure` **or** `agents:suggest-changes` in the subject's
-> company — the first reaching **every** seat, the second only the **one agent
-> it names** (rows 3a/3b in [the allow-path
-> table](#the-two-allow-paths-in-evaluation-order); they are not the same
-> authority). Nothing else implies it — not `role`, not `reportsTo`, not
-> `permissions.canCreateAgents`, not `permissions.canCreateSkills`.
+> company. **Today both of those reach every seat** (rows 3a/3b in [the
+> allow-path table](#the-two-allow-paths-in-evaluation-order)); narrowing the
+> suggest tier to the one agent it names is `PEN-5231` / `#3244`, **open and
+> unmerged** — do not assume it. Nothing else implies it — not `role`, not
+> `reportsTo`, not `permissions.canCreateAgents`, not
+> `permissions.canCreateSkills`.
 
 ## Why "never a stored grant" is the load-bearing part
 
@@ -62,34 +63,45 @@ sent `PEN-4775` looking for an implication rule keyed on `role` or on org-root.
 
 `decideBase` reaches them in this order for an **agent** actor:
 
-| Order | Where | Condition | Result |
-| --- | --- | --- | --- |
-| 1 | `decideLowTrustAccess` | actor resolves to the low-trust review preset | **deny** `deny_low_trust_boundary`, unconditionally — preempts both paths below |
-| 2 | `decideBase`, its `if (input.action === "agent_config:read")` branch | `resource.type === "agent"` **and** `resource.agentId === actorAgentId` | **allow** `allow_self` |
-| 3a | `decideWithAgentConfigReadGrant`, called from that same branch | actor holds `agents:configure` | **allow** `allow_explicit_grant` — against an `agent` resource **or** a `company` one |
-| 3b | the same function, reached only when 3a did not allow | actor holds `agents:suggest-changes` **and** `resource.type === "agent"` carrying an `agentId` | **allow** `allow_explicit_grant`, for that **one named subject** |
-| 3c | the same function, same grant | actor holds `agents:suggest-changes` and the resource is a `company` | **deny** `deny_scope` |
+| Order | Where | Condition | Result | On `master`? |
+| --- | --- | --- | --- | --- |
+| 1 | `decideLowTrustAccess` | actor resolves to the low-trust review preset | **deny** `deny_low_trust_boundary`, unconditionally — preempts both paths below | in effect |
+| 2 | `decideBase`, its `if (input.action === "agent_config:read")` branch | `resource.type === "agent"` **and** `resource.agentId === actorAgentId` | **allow** `allow_self` | in effect |
+| 3a | `decideWithAgentConfigReadGrant`, called from that same branch | actor holds `agents:configure` | **allow** `allow_explicit_grant` — against an `agent` resource **or** a `company` one | in effect |
+| 3b | the same function, reached only when 3a did not allow | actor holds `agents:suggest-changes` — **today against either resource type**, exactly as 3a | **allow** `allow_explicit_grant`, company-reaching | in effect |
+| 3b′ | as 3b, but admitted only when `resource.type === "agent"` carries an `agentId` | actor holds `agents:suggest-changes` | **allow** `allow_explicit_grant`, for that **one named subject** | **pending — `#3244`** |
+| 3c | the same function, same grant | actor holds `agents:suggest-changes` and the resource is a `company` | **deny** `deny_scope` | **pending — `#3244`** |
 
-> **Rows 3a and 3b are not the same authority, and recording them as one row is
-> what this split corrects.** `agents:configure` is company-reaching on both
-> sides, so its read matches its write and the symmetry is correct.
+> **Rows 3a and 3b are not the same authority, and today the code treats them
+> as one — which is the defect `PEN-5231` exists to correct, not a property of
+> the current tree.** `agents:configure` is company-reaching on both sides, so
+> its read matches its write and the symmetry is correct.
 > `agents:suggest-changes` is the *consented-diff* tier: its **write** is bound
 > to named target keys, to a run, and to an accepted consent record
 > (`decideWithProtectedChangeGrants`, `assertCanApplyProtectedAgentChange`), so
-> its **read** is admitted only against the subject being diffed. Row 3c is what
-> keeps the bulk surfaces — `GET /api/companies/:id/agent-configurations`, the
-> company agent list, the approval/issue `includeAgentConfig` projection — out
-> of the suggest tier entirely.
+> its **read** ought to be admitted only against the subject being diffed. Rows
+> 3b′ and 3c are what *would* keep the bulk surfaces — `GET
+> /api/companies/:id/agent-configurations`, the company agent list, the
+> approval/issue `includeAgentConfig` projection — out of the suggest tier
+> entirely.
 >
-> **Row 3c landed in `PEN-5231` (`Blockcast/paperclip#3244`).** Before that
-> commit the suggest tier took row 3a's unconditional company-wide allow — read
-> authority strictly exceeding its own write authority, which is the divergence
-> the `PEN-3206` §5 test condemns. A reader checking this table against a tree
-> that predates #3244 will find one row where this says three; that is the
-> behaviour change, not a transcription error.
+> ⚠️ **Rows 3b′ and 3c are NOT on `master` as of 2026-11-02.** They are
+> `PEN-5231`, proposed in `Blockcast/paperclip#3244`, which is **open and
+> unmerged**. Until it lands, the suggest tier takes row 3a's unconditional
+> company-wide allow — read authority strictly exceeding its own write
+> authority, which is the divergence the `PEN-3206` §5 test condemns. **Do not
+> read this table as a control that is protecting you today.**
 >
-> The residual is **named rather than closed**: row 3b admits the *subject*, not
-> the *diff*. Binding the read to an accepted consent record is infeasible
+> **Check it yourself rather than trusting this paragraph's date** — per the
+> inline-citation rule above. Open `decideWithAgentConfigReadGrant`
+> (`server/src/services/authorization.ts`) and look at the
+> `agents:suggest-changes` branch: if it returns `suggestDecision` straight out
+> of `decidePrincipalGrant` without an `input.resource.type === "agent"` test,
+> you are on a tree where the suggest tier is **company-wide** and rows 3b′/3c
+> do not exist. That is the state of `master` at the time of writing.
+>
+> The residual, once #3244 lands, is **named rather than closed**: row 3b′
+> admits the *subject*, not the *diff*. Binding the read to an accepted consent record is infeasible
 > today — `changeConsentGateService.assertConsented` requires a consent created
 > in a **previous** run whose payload **already displays** a diff, and it
 > **consumes** the record on use. An agent cannot display a diff it was never
@@ -178,6 +190,17 @@ Note also that the strip is **narrow**: `budgetMonthlyCents` and
 `spentMonthlyCents` pass through the restricted projection untouched. Whatever
 the peer rule is for, it is not a general "peer-sensitive data" rule.
 
+> ⚠️ **Pending — `PEN-5230` (`Blockcast/paperclip#3241`), open and unmerged at
+> the time of writing.** It adds `withheldFields: ["adapterConfig",
+> "runtimeConfig"]` and `withheldByAction: "agent_config:read"` beside the
+> withheld objects on both **peer** rows above, so a `{}` that means *withheld*
+> becomes distinguishable from a `{}` that is the stored value — today they are
+> byte-identical on the wire, which is why a reader needs the own-id positive
+> control. **The matrix itself is unchanged by it:** no config byte widens, and
+> both markers are module constants describing the *reader*, not the subject.
+> Check for `WITHHELD_AGENT_CONFIG_FIELDS` in `server/src/routes/agents.ts` —
+> absent means you are on a tree without the signal, which is `master` today.
+
 ### Archaeology
 
 The restricted projection and the company-wide gate that feeds it both arrived
@@ -216,7 +239,7 @@ unfalsifiable, and in this file that is a defect rather than a convenience.
 | Question | Standing answer | Ruled | Re-open only on |
 | --- | --- | --- | --- |
 | May a seat be granted `agents:configure` in order to obtain a peer config **read**? | **No.** | `Ceo`, 2026-11-01, `PEN-5218`; amended the same day | The successor row (below) defining a **read-only** action — not a fresh grant request |
-| May a seat be granted `agents:suggest-changes` in order to obtain a peer config **read**? | **No.** It is the lesser door and it reaches the same gate (`decideWithAgentConfigReadGrant`) — though since `PEN-5231` only for one named subject, never company-wide (row 3b) — but it fails on the same first reason, and on a structural one. | `Ceo`, 2026-11-01, `PEN-5218` | The successor row concluding that the suggest tier is the right interim mechanism — its call to make, not an ad-hoc grant |
+| May a seat be granted `agents:suggest-changes` in order to obtain a peer config **read**? | **No.** It is the lesser door, it reaches the same gate (`decideWithAgentConfigReadGrant`), and it fails on the same first reason and on a structural one. Today it is company-wide; `PEN-5231` / `#3244` would narrow it to one named subject (row 3b′), but that is unmerged, so the refusal does not rest on it. | `Ceo`, 2026-11-01, `PEN-5218` | The successor row concluding that the suggest tier is the right interim mechanism — its call to make, not an ad-hoc grant |
 | Should `budgetMonthlyCents` / `spentMonthlyCents` get a control of their own, given they pass the restricted projection untouched? | **No.** No control is manufactured for them. | `Ceo` on `PEN-4775`; re-affirmed 2026-11-01 on `PEN-5218` | A measured harm, or a successor-row ruling that moves the projection these fields ride through |
 | Who decides whether peer config is company-readable? | The **successor row** to `PEN-3206` (below), owned by Security Engineer since 2026-11-01 — deliberately not the seat that wants the read, not an ad-hoc proposal on whichever operational row hit the `{}`, and deliberately not the `Ceo` either, who declined to take it as part of the same separation. | `Ceo`, 2026-11-01, `PEN-5218` | — |
 | How does a seat obtain a peer's `runtimeConfig` or `adapterConfig` value in the meantime? | **Ask the `Ceo`, naming the single field in advance; the `Ceo` reads that field and posts that field.** Not the object — see the exposure below. One hop, audited in the issue thread, no standing grant. This is the supported path, not a workaround. | `Ceo`, 2026-11-01, `PEN-5218`; narrowed the same day | A successor-row ruling |
@@ -232,14 +255,14 @@ rather than treating them as a quotation.
 applies identically to both permissions.** A reader who passes the gate is
 served by `redactAgentSecrets` (`agent-redaction.ts`), not by the restricted
 projection. `canReadSensitiveDetail` on the detail route selects between them,
-and for a peer it delegates to `actorCanReadConfigurationsForAgent` — since
-`PEN-5231` the **subject-scoped** twin of
-`actorCanReadConfigurationsForCompany`, i.e. `agent_config:read` evaluated
-against the named agent rather than the company. Both tiers pass that question
-(rows 3a and 3b), so `allow_explicit_grant` from *either* permission still
-lands on `buildAgentDetail` without `restricted`, which is the
-`redactAgentSecrets` arm. Row 3c changes which **bulk** surfaces the suggest
-tier reaches; it does not change this one.
+and for a peer it delegates to `actorCanReadConfigurationsForCompany`
+(`server/src/routes/agents.ts:3037-3039`) — `agent_config:read` evaluated
+against the **company**. (`PEN-5231` / `#3244` would add a subject-scoped twin;
+that function does not exist on `master` today, so do not go looking for it.)
+Both tiers pass that question, so `allow_explicit_grant` from *either*
+permission lands on `buildAgentDetail` without `restricted`, which is the
+`redactAgentSecrets` arm. Rows 3b′/3c would change which **bulk** surfaces the
+suggest tier reaches; neither changes this one.
 `redactAgentSecrets` masks `adapterConfig.env` values and routes the rest
 through `containAgentConfig` → `redactAgentConfigPayload`, whose coverage is
 structural — plain bindings, `env` maps at any depth, Tier-1 key names,
@@ -368,19 +391,23 @@ asymmetry then needs its own answer.
   keeps the viewer's own row (PEN-4775)`: self row populated, peer row `{}`,
   low-trust self row still `{}`, and the holder-of-the-grant path unnarrowed.
 - `server/src/__tests__/agent-permissions-routes.test.ts` — `agent configuration
-  read gate`: which **resource** each route names, and therefore which tier
-  reaches it — `asks the SUBJECT-SCOPED question for a suggest-tier peer config
-  read`, `names the actor itself as the subject on a self configuration read
-  (PEN-5231)`, `keeps the COMPANY-WIDE question on the config-revision routes
-  (PEN-5231)`, `names the subject on /skills so the suggest tier keeps its
-  diff-prep read (PEN-5231)`, and `keeps the COMPANY-WIDE question on the bulk
-  configuration list (PEN-5231)`. The first of those replaced an `allows an
-  agent actor with agents:suggest-changes grant to read peer config` case whose
-  comment described a scope the code did not implement — which is what made the
+  read gate`, which pins which **resource** each route names and therefore which
+  tier reaches it. **On `master` today** that block carries `allows an agent
+  actor with agents:suggest-changes grant to read peer config` — a case whose
+  comment describes a scope the code does not implement, which is what makes the
   gap read as deliberate to the next reader.
+- ⚠️ **The five `(PEN-5231)` cases that would replace it are not in the tree.**
+  `asks the SUBJECT-SCOPED question for a suggest-tier peer config read`, `names
+  the actor itself as the subject on a self configuration read (PEN-5231)`,
+  `keeps the COMPANY-WIDE question on the config-revision routes (PEN-5231)`,
+  `names the subject on /skills so the suggest tier keeps its diff-prep read
+  (PEN-5231)`, and `keeps the COMPANY-WIDE question on the bulk configuration
+  list (PEN-5231)` arrive with `#3244`. `grep -c PEN-5231` on that file returns
+  **0** on `master` and **5** on the `#3244` branch; that difference is the
+  cheapest check of which tree you are reading.
 - `server/src/__tests__/authorization-service.test.ts` — the engine-level proof
-  that rows 3a and 3b diverge: the same grant allowed against an `agent`
-  resource and refused `deny_scope` against a `company` one.
+  that rows 3a and 3b′ diverge (same grant allowed against an `agent` resource,
+  refused `deny_scope` against a `company` one) **also arrives with `#3244`**.
 - `server/src/__tests__/agent-secret-redaction.test.ts` — `agent metadata
   containment on the spread-based redactors`: both projections, including that
   the restricted one is reached via a **peer** row.
