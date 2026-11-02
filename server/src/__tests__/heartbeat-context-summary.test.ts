@@ -3179,6 +3179,42 @@ describe("merge-queue eviction wake (BLO-23395)", () => {
     expect(markdown).not.toContain("and re-enqueue.");
   });
 
+  it("gates the own-PR remedy on a standing-hold re-read, and never presents itself as authorisation (PEN-5119)", () => {
+    // Blockcast/paperclip#3205: a "no push to this head" instruction was
+    // standing and recorded in the issue's monitor note. This directive woke
+    // the assignee with "rebase the branch ... and re-enqueue"; the assignee
+    // confirmed the diagnosis (correct) and executed the remedy as though the
+    // directive authorised it, force-pushing over the frozen head. The remedy
+    // must therefore be reachable only after an explicit hold re-read.
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      prReview: {
+        wakeReason: "github_pr_merge_queue_evicted",
+        prNumber: 3205,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        prAuthorLogin: "allyblockcast[bot]",
+        mergeQueueEvictionBody: evictionNotice,
+      },
+    });
+
+    expect(markdown).toContain("GitHub merge-queue eviction directive:");
+    // It must disclaim its own authority...
+    expect(markdown).toContain("NOT an authorisation");
+    expect(markdown).toContain("cannot grant, widen or retract one");
+    // ...name both cheap records of a standing hold...
+    expect(markdown).toContain("monitor note");
+    expect(markdown).toContain("the last comment you yourself posted about this PR");
+    // ...cover every write verb, not just the one the directive suggests...
+    expect(markdown).toContain("force-push");
+    expect(markdown).toContain("review-request removal");
+    // ...and make reporting, not remedying, the action when a hold stands.
+    expect(markdown).toContain("REPORT the eviction, not to remedy it");
+    // The remedy still exists -- it is gated, not removed.
+    expect(markdown).toContain("and re-enqueue.");
+  });
+
   it("points at the event URL when the notice body was not captured", () => {
     const markdown = buildPaperclipTaskMarkdown({
       issue: null,
