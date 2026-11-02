@@ -231,6 +231,9 @@ export type {
 export type {
   Agent,
   AgentAccessState,
+  AgentAccessStateFull,
+  AgentAccessStateRestricted,
+  AgentTaskAssignSource,
   AgentChainOfCommandEntry,
   AgentDetail,
   ClearAgentErrorResponse,
