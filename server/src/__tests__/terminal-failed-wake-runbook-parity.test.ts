@@ -26,6 +26,7 @@ import {
   KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES,
   TERMINAL_FAILED_WAKE_ERROR_CODE_NONE,
   UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE,
+  normalizeTerminalFailedWakeErrorCode,
 } from "../services/metrics.js";
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
@@ -97,5 +98,16 @@ describe("BLO-35668: terminal-failed wake error codes match their runbook rows",
     expect(runbookCodes.length).toBeGreaterThan(5);
     expect(runbookCodes).toContain("adapter_failed");
     expect(runbookCodes).toContain("process_lost");
+  });
+
+  // BLO-51129: these used to collapse to `other`, hiding the setup-failure
+  // window of BLO-51377 behind the escape hatch.
+  it("emits the BLO-51129 codes as their own label, not `other`", () => {
+    for (const code of ["setup_failed", "pr_review_output_missing", "pr_review_verification_unavailable"]) {
+      expect(normalizeTerminalFailedWakeErrorCode(code)).toBe(code);
+    }
+    expect(normalizeTerminalFailedWakeErrorCode("definitely_not_a_code")).toBe(
+      UNKNOWN_TERMINAL_FAILED_WAKE_ERROR_CODE,
+    );
   });
 });
