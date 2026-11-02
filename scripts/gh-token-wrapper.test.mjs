@@ -1093,6 +1093,17 @@ test("carried trailers are not duplicated and also reach a caller-supplied body 
   });
 });
 
+test("an AI-identity Signed-off-by in a branch commit is dropped, not carried into a refused body (BLO-51471)", () => {
+  withTempDir((dir) => {
+    const { args, body } = runMerge(dir, ["pr", "merge", "9", "--squash"], {
+      prCommits: "values-ack: k\nSigned-off-by: Paperclip <noreply@paperclip.ing>\nSigned-off-by: Claude <noreply@anthropic.com>",
+    });
+    assert.notEqual(args, undefined, "the real merge must run");
+    assertClean(body);
+    assert.match(body, /^values-ack: k$/m);
+  });
+});
+
 test("squash merge is refused when the PR commits cannot be read (BLO-51471)", () => {
   withTempDir((dir) => {
     const { proc, args } = runMerge(dir, ["pr", "merge", "9", "--squash"], { commitsFail: true, status: 1 });
