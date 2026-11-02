@@ -4234,6 +4234,8 @@ const issueListSelect = {
   // `executionPolicy` is deliberately ABSENT from list rows (not null): it is unbounded, and
   // `PATCH /issues/:id` replaces it whole, so a trimmed copy would be a lost-update trap for
   // anyone who reads it here and writes it back (BLO-40082). Read the single-issue surface.
+  // PEN-5295 carved out the one key a list consumer could not do without as a flat scalar,
+  // `productivityReviewDisabled` below; that is the pattern for any future need here.
   //
   // `executionState` is server-owned, so it CAN be trimmed: only the keys below are copied, and
   // only when present. The multi-KB `reviewRequest`, `completedStageIds`, `lastDecisionId` and
@@ -4245,6 +4247,36 @@ const issueListSelect = {
       WHERE key IN (${sql.join(ISSUE_LIST_EXECUTION_STATE_KEYS.map((key) => sql`${key}`), sql`, `)})
     ), '{}'::jsonb)
   END`,
+  // PEN-5295: the ONE key of `execution_policy` a list consumer actually needs, projected
+  // as a flat boolean rather than by relaxing the deliberate omission above.
+  //
+  // Why a scalar and not the object: the attendance predicate every stall sweep runs is
+  // `activeRun | monitorNextCheckAt | scheduledRetryAt | parkedUntil`, and a row stood down
+  // on a human gate carries none of them — so a ratified hold scored identically to an
+  // abandoned one (221/221 rows, 2026-11-02). The object cannot come back: it is unbounded,
+  // and PATCH replaces it whole, so a trimmed copy is a lost-update trap (BLO-40082).
+  //
+  // ALWAYS PRESENT, explicitly `false` when unset. `coalesce` is load-bearing, not tidiness:
+  // `->` on a NULL policy (or a missing key) yields SQL NULL, and a NULL here would ship the
+  // very absent-vs-false ambiguity this projection exists to remove. Both `OR` arms are
+  // NULL-safe by the same route — `false OR NULL` is NULL and coalesces to false, while
+  // `true OR NULL` is already true.
+  //
+  // Mirrors `isProductivityReviewOptedOut` exactly, including which homes count and how
+  // strictly: `= 'true'::jsonb` is the SQL spelling of that predicate's `=== true`, so a
+  // stored `"true"` string reads false on BOTH surfaces instead of disagreeing across them.
+  // Change the two together or the list surface starts lying about the review it describes.
+  //
+  // Cost: two `->` lookups on a column this row already carries — no join, no new scan, and
+  // strictly less work than the `jsonb_each` + `jsonb_object_agg` the sibling `executionState`
+  // projection above already pays on every row. It is NOT the PEN-4450 detoast hazard, which
+  // was `description` (66% of rows > 2KB, ~14% of pg CPU in pglz_decompress); `execution_policy`
+  // is small and stays inline on a tuple whose description has been toasted out ahead of it.
+  productivityReviewDisabled: sql<boolean>`coalesce(
+    (${issues.executionPolicy} -> 'productivityReviewDisabled') = 'true'::jsonb
+      or (${issues.executionPolicy} -> 'monitor' -> 'productivityReviewDisabled') = 'true'::jsonb,
+    false
+  )`,
   monitorNextCheckAt: issues.monitorNextCheckAt,
   monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
   monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
