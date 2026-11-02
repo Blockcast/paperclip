@@ -82,7 +82,7 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           # On workflow_run the default ref is the workflow file's branch,
           # not the head SHA of the triggering run. Pin to the SHA the
@@ -798,7 +798,7 @@ jobs:
       needs.bump-agent-image.result == 'failure' || needs.bump-agent-image.result == 'cancelled')
     runs-on: arc-paperclip-light
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Report the failed build to Alertmanager
         env:
           ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
@@ -831,7 +831,7 @@ jobs:
       (needs.bump-agent-image.result == 'success' || needs.bump-agent-image.result == 'skipped')
     runs-on: arc-paperclip-light
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       - name: Resolve the delivery-lane alert (and prove the channel still works)
         env:
           ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}

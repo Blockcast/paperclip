@@ -84,7 +84,7 @@ jobs:
       deployment: false
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # Same implicit-`success()` trap as the kubeconfig step below, one step
       # earlier: a failed install aborts the job and the alert never fires. Here
