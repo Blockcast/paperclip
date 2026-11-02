@@ -16,10 +16,37 @@ The gauge advances at the **end of every sweep, including one that deletes nothi
 # Which mode was last seen ticking, and how long ago.
 time() - max by (dry_run) (paperclip_isolation_workspace_reaper_last_sweep_timestamp_seconds)
 
-# Did the last sweeps do anything, and did they finish?
-increase(paperclip_isolation_workspace_reaper_scanned_total[7d])
+# What has it done, and how did its sweeps end? A LOWER BOUND -- read a
+# non-zero answer only, and see the warning below before reading a zero.
+sum by (dry_run) (increase(paperclip_isolation_workspace_reaper_scanned_total[7d]))
 sum by (stop_reason) (increase(paperclip_isolation_workspace_reaper_sweeps_total[7d]))
 ```
+
+⚠ **A zero from either `increase()` above is "no evidence", never "it did nothing".** The first
+query is the liveness answer; these two are not. `increase()` cannot see a counter series' first
+sample, the reaper creates its label children lazily on a process's first sweep, and the scrape
+adds a full set of per-process labels (`instance`, `pod`, `node`) — so a process that sweeps once
+and is replaced (the boot sweep, then turnover before the 12-hourly tick) is invisible to both
+queries for its entire life. That is why both queries above keep only the one label each is
+actually asking about — `dry_run`, `stop_reason` — and collapse the rest: dropping `instance`
+while keeping `pod` and `node` looks aggregated and is not.
+
+Measured on this deployment over the 7d to 2026-11-02: **13 of 20** `scanned_total` series read
+`increase(…[7d]) == 0` while `max_over_time` over the same window is non-zero, and **12 of those
+13 had no sample at all at the window's start**, so their whole value is work done inside it —
+**26,633 scans reported as zero**, against the 28,140 the query does report. It is not confined
+to one metric: `sweeps_total{stop_reason="complete"}` and every `entries_total` outcome split
+13/20 the same way.
+
+This matters most here because the Triage block is step 0 of a
+`PaperclipIsolationWorkspaceReaperCoverageGap` investigation, where a zero reads as *"the reaper
+did nothing"* for a sweep that ran and worked — the fails-toward-broken direction, which costs an
+operator a wrong diagnosis rather than a missed one, but at the worst-placed surface on the page.
+
+⚠ **The fix is not a `max_over_time` substitution.** On a counter it reports the *current
+process's* high-water mark, which after a restart is a partial total and not a window total. It is
+a sound **existence witness** — it is what proves the undercount above — and not a window sum.
+Where you need liveness, use the freshness query above, which is correct as written.
 
 1. **Is it still enabled?** `PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED=true` must be on the **worker** StatefulSet — the reaper is gated to `paperclipNodeRole !== "api"`. It is opt-in and defaults off, so a values change or a rollback silently stops it.
 2. **Is it pointed at a root that exists?** `stop_reason="root_absent"` means the sweep ran and found no tree at all. On a non-k8s-isolation deployment that is correct and expected. On **this** cluster it is a misconfiguration: the reaper is enabled, ticking, and reporting success over a path that is not the tree — while the real tree grows unreclaimed. That is the BLO-31222 shape, and it is why this stop reason is not folded into `complete` ([BLO-36814](https://paperclip.blockcast.net/BLO/issues/BLO-36814)). Confirm the worker's `PAPERCLIP_ISOLATION_WORKSPACE_ROOT` (or the `DEFAULT_ISOLATION_WORKSPACE_ROOT` fallback) against the live mount.
@@ -256,7 +283,7 @@ Neither is part of this alert; both are non-routine when non-zero.
 
   Note this walks the whole tree, while the counter only covers the directories a sweep actually reached — a `stop_reason="capped"` sweep reports a fraction of both populations (23 of the 50 above, on the 2026-10-11 tick).
   A directory whose top level *did* match but which holds a nested git checkout or worktree state is **not** counted here — it was examined, so it is `paperclip_isolation_workspace_reaper_entries_total{outcome="retained_nested_checkout"}` (routine). Read that series with these three properties in mind:
-  - **One increment per such directory the sweep reaches, on every sweep.** Only a directory that already passed the age gate (root `mtime`, and the owning row's `lastUsedAt` when it has one) and the `{home, session}` allowlist is probed; each hit also logs `retained a layout-compliant directory holding a nested git checkout` with its path. A retained directory is counted again by the next sweep, so divide `increase()` over a window by the sweeps in it — `sum(increase(paperclip_isolation_workspace_reaper_sweeps_total[…]))` — rather than reading it as new arrivals.
+  - **One increment per such directory the sweep reaches, on every sweep.** Only a directory that already passed the age gate (root `mtime`, and the owning row's `lastUsedAt` when it has one) and the `{home, session}` allowlist is probed; each hit also logs `retained a layout-compliant directory holding a nested git checkout` with its path. A retained directory is counted again by the next sweep, so normalize by the sweeps in the window — `sum(increase(paperclip_isolation_workspace_reaper_sweeps_total[…]))` — rather than reading it as new arrivals. ⚠ Collapse **every** per-process label (`instance`, `pod`, `node`) on **both** sides before dividing — as written the numerator is per-process and the denominator fleet-wide, which understates the quotient by roughly the number of processes in the window (20 over the 7d to 2026-11-02) — and treat the result as a lower bound even then: `increase()` misses each series' first sample (13 of 20 series for this very metric over the 7d to 2026-11-02; see [Triage](#triage)), and numerator and denominator lose it on *different* series sets — the `entries_total` child is created on a process's first retention, the `sweeps_total` child on its first completed sweep — so the two errors do not cancel.
   - **A capped sweep undercounts it.** The probe runs before the per-tick cap, so a retention spends no unlink budget, but the sweep stops at the first directory that would take `eligible` past `PAPERCLIP_ISOLATION_WORKSPACE_REAPER_MAX_DELETES_PER_TICK` (100 here, 200 by default) and never reaches anything after it. A sweep that ends `stop_reason="capped"` (or `stop_reason="lookup_faulted"`) therefore reports only the nested checkouts it reached; only a `stop_reason="complete"` sweep covers the whole set. Under `dry_run="true"` nothing is unlinked, so while the eligible backlog exceeds the cap **every** dry-run sweep ends capped and this count stays partial.
   - **The 2026-10-09 figure is a floor for a complete sweep, not a per-sweep value.** BLO-36735 found 13 of the 503-directory match set by measuring the live tree directly, not from a sweep's counter, and with an earlier probe; the current one also checks `<side>/.git` and the `.paperclip/worktrees` parent, which can only retain more. A capped sweep should report roughly 13/490 of its `eligible` — about 3 at the 100 cap, if those directories are spread evenly through directory order — so a low count on a capped sweep is not evidence the guard stopped firing. On a `complete` sweep, fewer than 13 is worth checking against the tree: a directory reused since is counted `retained_in_use` instead, and one cleaned up by hand is simply gone.
 
