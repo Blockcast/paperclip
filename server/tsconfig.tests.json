@@ -20,6 +20,7 @@
     "src/__tests__/approval-gate-already-terminal.test.ts",
     "src/__tests__/budget-consumption-metric.test.ts",
     "src/__tests__/cold-in-review-issue-metrics.test.ts",
+    "src/__tests__/dep-blocked-retry-dispersion.test.ts",
     "src/__tests__/gc-flags-metrics.test.ts",
     "src/__tests__/github-api-refusal-metric.test.ts",
     "src/__tests__/github-webhook-dedicated-pool.test.ts",

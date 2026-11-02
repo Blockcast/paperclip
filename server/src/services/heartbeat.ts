@@ -23234,13 +23234,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             random: promotionOpts.random,
           });
           const nextDueAt = nextDue.dueAt;
-          // PEN-5307 / PEN-4145 trap #3: emit the decision so this lane has a
-          // denominator at all. The alignment instrument PEN-4145 built CANNOT
-          // be extended to cover it — see `recordDepBlockedRetryDispersion` for
-          // why the signature here is a cross-run tie rather than a grid
-          // alignment, and why reading that counter on this lane would report
-          // 100% healthy both before and after this fix.
-          recordDepBlockedRetryDispersion({ jitterMs: nextDue.jitterMs });
           const nextContextSnapshot = {
             ...parseObject(dueRun.contextSnapshot),
             unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
@@ -23265,6 +23258,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .then((rows) => rows[0] ?? null);
           if (rescheduled) {
             incrementDepBlockedMetric("dep_blocked_redeferred");
+            // PEN-5307 / PEN-4145 trap #3: emit the decision so this lane has a
+            // denominator at all. The alignment instrument PEN-4145 built CANNOT
+            // be extended to cover it — see `recordDepBlockedRetryDispersion` for
+            // why the signature here is a cross-run tie rather than a grid
+            // alignment, and why reading that counter on this lane would report
+            // 100% healthy both before and after this fix.
+            //
+            // Inside the `rescheduled` guard, not before the UPDATE above: that
+            // UPDATE is a compare-and-set on `status='scheduled_retry' AND
+            // scheduledRetryAt <= now`, so a concurrent sweep or an operator
+            // retry that already moved the row makes it a no-op. Counting the
+            // dispersion before it would score a re-park that never happened,
+            // inflating the denominator and making the dispersed share read
+            // LOWER than reality — the healthy-looking direction, on the very
+            // instrument this row added because the previous one read healthy
+            // off accounting nobody had checked.
+            recordDepBlockedRetryDispersion({ jitterMs: nextDue.jitterMs });
             await appendRunEvent(rescheduled, await nextRunEventSeq(rescheduled.id), {
               eventType: "lifecycle",
               stream: "system",
