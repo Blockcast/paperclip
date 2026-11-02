@@ -5131,15 +5131,34 @@ export function issueRoutes(
     });
   }
 
-  // BLO-19087: an @-mention wakes the mentioned agent (`issue_comment_mentioned`,
-  // fired below) but does not by itself authorize it to reply. The wake path
-  // applies no gate on who wrote the mention; the grant path
-  // (`agentHasMentionGrantOnIssue`) only grants `issue:comment` when the
-  // mentioning comment's author is that issue's own assignee, or a board user.
-  // A mention written by anyone else therefore wakes an agent onto a thread it
-  // provably cannot post to. That author gate is deliberate — it stops mention
-  // grants chaining agent-to-agent — so the fix is not to widen it but to stop
-  // the invitation being silent about its own terms.
+  // BLO-19087: an @-mention does not by itself authorize the mentioned agent to
+  // reply. The author gate is `commentAuthorCanGrantIssueMention`: only the
+  // issue's own assignee, or an active-membership user, can grant. It is
+  // deliberate — it stops mention grants chaining agent-to-agent — so the fix is
+  // not to widen it but to stop the invitation being silent about its terms.
+  //
+  // PEN-5334: this block used to say the wake path applied NO gate, and the
+  // remediation below told a blocked agent that a non-assignee mention "wakes you
+  // but does not authorize you". Both are wrong as shipped. Every mention-wake
+  // site (`:4645`, `:14468`, `:16816`) runs the SAME predicate and skips a
+  // mention that fails it, so a non-entitled author's mention raises no wake at
+  // all — and because it still BINDS, it is also absent from the create
+  // response's `unboundMentions`, which is PEN-5180's only signal. Its author
+  // therefore sees a 201 and an empty unbound list, the mentioned agent is never
+  // woken, and nothing anywhere names the reason: more silent than the failure
+  // the old text described, not less. Pinned by "does not wake a mentioned agent
+  // when an agent comment cannot grant reply access" and "does not enqueue a
+  // keyed mention wake when an agent cannot grant reply access" in
+  // __tests__/issue-update-comment-wakeup-routes.test.ts, each with a positive
+  // control.
+  //
+  // The wake and the grant are co-extensive only AT CREATE TIME. The grant is
+  // re-derived per request against the issue's CURRENT assignee
+  // (`services/authorization.ts:2725`), so REASSIGNING the row revokes a mention
+  // the previous assignee wrote while its wake has already fired. That is the one
+  // real "woken but not authorized" path, and it is staleness, not a hole in the
+  // author gate. Model: docs/security/issue-authorization-model.md, "Who may
+  // grant a mention".
   //
   // This names the one action that actually clears the denial. BLO-18152 got as
   // far as labelling the boundary "grant" and its own note suggests "retry with
@@ -5195,8 +5214,10 @@ export function issueRoutes(
       `this issue that @-mentions you as a markdown link of the form [@name](agent://<agent-id>), ` +
       `where <agent-id> is ${input.actorAgentId}. A bare agent://${input.actorAgentId} in the ` +
       `comment body is not a mention — it neither wakes you nor grants anything. A mention written ` +
-      `by any other agent wakes you but does not authorize you. Until then, respond on an issue ` +
-      `you are assigned to and reference this one, or ask the assignee to mention you here. If ` +
+      `by any other agent is inert on both halves: it neither wakes you nor authorizes you, and it ` +
+      `reports nothing to whoever wrote it, so asking a peer to post one achieves nothing. Until ` +
+      `then, respond on an issue you are assigned to and reference this one, or ask the assignee ` +
+      `to mention you here. If ` +
       `you need to reach this assignee across many issues at once, do not collect grants one ` +
       `issue at a time: escalate the batch to an agent above them in the reportsTo chain, ` +
       `which carries issue:comment on their assignees' issues without any grant.`
