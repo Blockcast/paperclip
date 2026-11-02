@@ -952,13 +952,15 @@ Four things a reader should not infer from that paragraph:
    a symlink to `scripts/gh-token-wrapper.sh` (`Dockerfile.runtime:53-55`
    (`ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh`)), and
    the decisive conjunct is its `TOKEN_FILE_REQUIRED`, set to `yes` **iff
-   `PAPERCLIP_GITHUB_TOKEN_FILE` is present in the environment** (`:404-406`
-   (`if [ "${PAPERCLIP_GITHUB_TOKEN_FILE+x}" = x ]; then`), tested with
+   `PAPERCLIP_GITHUB_TOKEN_FILE` is present in the environment** (`:806-807`
+   (`TOKEN_FILE_REQUIRED=yes`), tested with
    `${VAR+x}`, so set-empty counts). `auth git-credential` is not
-   in the exempt list that follows (`:412` (`TOKEN_FILE_REQUIRED=no`)), so with the variable set and the
-   file absent the wrapper reaches `reject_token_file "is absent"` (`:525`) and
+   in the exempt list that follows (`:813`
+   (`"auth setup-git" | "auth login") TOKEN_FILE_REQUIRED=no ;;`)), so with the variable set and the
+   file absent the wrapper reaches `reject_token_file "is absent"` (`:916`) and
    exits non-zero. With the variable **unset** it falls through to
-   `exec_real_gh` (`:528`) under whatever ambient auth exists.
+   the unconditional `exec_real_gh "$@"` (`:919`) that ends the wrapper, under
+   whatever ambient auth exists.
    ⚠ That mechanism is now **asserted**, not merely probable — which was the
    whole of §5's objection to the paragraph above.
 

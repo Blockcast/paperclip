@@ -139,7 +139,7 @@ anchor whose construct it can place unambiguously, and reports the rest rather t
 
 <!-- anchor-file: vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts -->
 
-Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3468`**
+Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3504`**
 (`asBoolean(config.enableGitHubPublishBroker, false)`). Every anchor below is a line in that
 same vendored file — not the `opencode-k8s` adapter's same-named `job-manifest.ts` — and each
 is re-resolved against the tree by `scripts/check-doc-line-anchors.mjs` on every PR, so these
@@ -147,9 +147,9 @@ numbers are checked continuously rather than as of any one reading:
 
 | | Gate off (today) | Gate on |
 |---|---|---|
-| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:4278`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
+| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:4342`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
 | Agent publish path | `git`/`gh`/MCP authenticate locally | agent asks the broker over a unix socket; `PAPERCLIP_GITHUB_BROKER_SOCKET` is set |
-| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:4895`** (`!narrowWritableSurface`)) — fail closed, not degrade |
+| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:4959`** (`!narrowWritableSurface`)) — fail closed, not degrade |
 | Pod shape | one container | `+1` native sidecar (initContainer, `restartPolicy: Always`), uid 1001, gid 1000, same image |
 
 Two properties make staging possible, and both were verified in the source rather than assumed:
@@ -462,9 +462,9 @@ looked".
 **What changed on 2026-10-20 is named in the source, not inferred.** `BLO-47526` gave a `shared`
 runtime descriptor agent-scoped persistent roots so that `narrowWritableSurface` holds — the
 `mode === "shared"` branch and its rationale comment in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:1273-1286`**
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:1309-1322`**
 (`if (mode === "shared") {`), with
-`narrowWritableSurface` itself defined at **`:3887`**
+`narrowWritableSurface` itself defined at **`:3923`**
 (`const narrowWritableSurface = isolation.enabled && dataClaimName !== "";`); before it, a shared run returned
 `enabled:false` and kept the whole PVC mounted rw. `isolation_disabled` being the *only* leg that
 ever fired, and its stopping dead at that change, is consistent with that and with nothing else.
@@ -472,10 +472,10 @@ ever fired, and its stopping dead at that change, is consistent with that and wi
 ⚠ **The surviving broad path, which the zero does not cover.** `resolveJobIsolation` falls through to
 `SHARED_JOB_ISOLATION` (`enabled: false`) when a run arrives with **no runtime isolation descriptor**
 and `config.isolationMode` is not `isolated`/`isolate` — in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1228`**
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1264`**
 (`const SHARED_JOB_ISOLATION: JobIsolation = {`)
-and returned at **`:1353`** (`return SHARED_JOB_ISOLATION`). The comment at
-**`:3865`** (`only a config-only run`) names it: *"only a config-only run
+and returned at **`:1389`** (`return SHARED_JOB_ISOLATION`). The comment at
+**`:3901`** (`only a config-only run`) names it: *"only a config-only run
 with no descriptor and no `isolationMode` still reaches this fallback."* The measured zero is
 therefore a property of **the server supplying a descriptor on every render**, not of configuration.
 A run path that stops supplying one renders broad — and once the gate is on, that stops being a
@@ -827,8 +827,8 @@ on PEN-5016 at 2026-10-29T20:23Z). It is written here so that it survives the th
 <!-- anchor-file: scripts/gh-token-wrapper.sh -->
 
 **Independently verified against `master` for this revision**, rather than carried on the CTO's word:
-`scripts/gh-token-wrapper.sh:405` guards the token-file path on `${PAPERCLIP_GITHUB_TOKEN_FILE+x}`
-being set, and `:528` is an unconditional `exec_real_gh "$@"` fallthrough. With the variable unset
+`scripts/gh-token-wrapper.sh:806` guards the token-file path on `${PAPERCLIP_GITHUB_TOKEN_FILE+x}`
+being set, and `:919` is an unconditional `exec_real_gh "$@"` fallthrough. With the variable unset
 the wrapper execs the real `gh` under whatever ambient auth exists, and both fallbacks §5 names are
 live again.
 
@@ -1356,7 +1356,7 @@ complete the configuration half of this pre-flight.**
 
 **(c) …and the render-time observation covers what the config read cannot. This is why (b) does not
 block.** The §4 warn is emitted from `resolveJobIsolation`, which reads `config.isolationMode` off
-the **merged** config (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:1351`
+the **merged** config (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:1387`
 (`asString(config.isolationMode, "shared")`)) — after
 every scope has been applied. So a broad render caused by an *environment*-scope setting fires
 exactly the same warn as an agent-scope one. The
@@ -1391,9 +1391,9 @@ zero is evidence about the mechanism, not about the sample.
 negative over Loki's retained window, liveness-controlled — it is **not** a configuration proof, and
 §4's surviving broad path is untouched by it: a run arriving with no runtime isolation descriptor and
 no `isolationMode` still reaches the `SHARED_JOB_ISOLATION` fallback — in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1228`**
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1264`**
 (`const SHARED_JOB_ISOLATION: JobIsolation = {`)
-and returned at **`:1353`** (`return SHARED_JOB_ISOLATION`). The zero is a property of the server supplying a descriptor on every
+and returned at **`:1389`** (`return SHARED_JOB_ISOLATION`). The zero is a property of the server supplying a descriptor on every
 render. A run path that stops supplying one renders broad — and once the gate is on, that is a
 hard build failure, not a quiet annotation.
 ⇒ **Check 3 of §11.6 re-runs this at every widening. It is not cleared once.**
