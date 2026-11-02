@@ -146,6 +146,16 @@ run_extract() { # stdin: actions/runs API body (one object per page) -> run rows
                            .status,.name,.updated_at,.display_title]|@tsv'
 }
 
+# A filter that returns without reading stdin leaves its caller writing into a
+# pipe nobody will read, so the caller gets EPIPE/SIGPIPE. A payload that fits
+# the 64 KiB pipe buffer hides it -- the write lands before we exit -- so it
+# surfaces only when the writer loses that race: an intermittent failure in a
+# caller that did nothing wrong. PEN-5247: that race took the `policy` job red
+# in a merge_group run and evicted an unrelated PR from the queue. EVERY early
+# return in a stdin filter must drain first. Skipped on a tty so an interactive
+# invocation does not block waiting for EOF.
+drain_stdin() { [ -t 0 ] || cat >/dev/null 2>&1; }
+
 renamed_jobs() { # stdin: twin-less legacy bare names; $1 = file of base workflow text
   # BLO-48833. Prints the names that appear NOWHERE in the base workflows. A
   # missing or EMPTY file prints nothing, so an unreadable base fails CLOSED
@@ -162,13 +172,9 @@ renamed_jobs() { # stdin: twin-less legacy bare names; $1 = file of base workflo
   # that is ONLY an expression matches everything -> STOP (fails closed).
   # ponytail: textual, not YAML-parsed: any line carrying `name:` counts (step,
   # workflow), which only ever adds STOPs.
-  # Drain stdin before returning: this is a filter, and a caller piping
-  # names in gets EPIPE/SIGPIPE if we exit without reading them. The
-  # payload normally fits the pipe buffer, so the write only fails when it
-  # loses the race with our exit -- an intermittent failure in a caller
-  # that did nothing wrong. Skip the drain on a tty so an interactive
-  # invocation does not block waiting for EOF.
-  [ -s "${1:-}" ] || { [ -t 0 ] || cat >/dev/null 2>&1; return 0; }
+  # Unreadable base: nothing to match against, so print nothing (fails closed).
+  # Drain first -- see drain_stdin().
+  [ -s "${1:-}" ] || { drain_stdin; return 0; }
   while IFS= read -r j; do
     [ -n "$j" ] && ! grep -qF -- "$j" "$1" && ! grep -qF -- "${j%% (*}" "$1" \
       && ! templated_name "$j" "$1" && printf '%s\n' "$j"
@@ -214,8 +220,10 @@ gated_lanes() { # stdin: run rows; $1 = head sha, $2 non-empty = repo is gated
   # (Network-Operator-Portal#1450 @ 82913582, docs-only: `Scheduled: none`), and
   # absence of runs cannot tell it from "never fired". $3 is the POSITIVE
   # witness from empty_witness(); without it this still fails closed.
-  [ -n "${2:-}" ] || return 0
-  [ -z "${3:-}" ] || return 0
+  # PEN-5247: both of these return before the awk below consumes stdin, so both
+  # must drain -- see drain_stdin(). The live caller pipes run rows in.
+  [ -n "${2:-}" ] || { drain_stdin; return 0; }
+  [ -z "${3:-}" ] || { drain_stdin; return 0; }
   awk -F'\t' -v h="$1" '$2 == "workflow_dispatch" && $9 ~ ("^CI PR #[0-9]+ @" h "$") { found = 1 }
     END { if (!found) printf "STOP\t<approval-gated CI lanes: no dispatched CI PR run at this head>\tABSENT\trun=-\n" }'
 }

@@ -2202,6 +2202,29 @@ describe("merge-gate reader", () => {
       assert.equal(emptyWitness([{ message: "API rate limit exceeded", status: "403" }]), "");
       assert.equal(execFileSync("bash", [READER, "--empty-witness"], { input: "not json\n", encoding: "utf8" }), "");
     });
+
+    // PEN-5247: gated_lanes() returns BEFORE the awk that consumes stdin on
+    // BOTH the not-gated and witnessed-empty paths, so both must drain --
+    // otherwise the caller piping run rows in races our exit and gets EPIPE.
+    // Same defect as the renamed_jobs() one above, on a second arm: it took
+    // the `policy` job red in merge_group run 41378107779, and then again on
+    // this PR's own head (the NOP#1450 test above, `status: 0`). A payload
+    // that fits the 64 KiB pipe buffer hides it, so these go far over it to
+    // make the race deterministic. Asserting [] also pins that the drain adds
+    // no verdict: both paths printed nothing before and print nothing now.
+    for (const [what, isGated, witness] of [
+      ["not gated", false, ""],
+      ["witnessed empty", true, "1"],
+    ]) {
+      it(`drains a stdin payload larger than the pipe buffer (${what})`, () => {
+        const many = Array.from({ length: 20_000 }, (_, i) => [...nop.slice(0, 8), `filler ${i}`]);
+        assert.ok(
+          many.map((r) => r.join("\t")).join("\n").length > 256 * 1024,
+          "payload must exceed any plausible pipe buffer",
+        );
+        assert.deepEqual(gated(many, H1450, isGated, witness), []);
+      });
+    }
   });
 });
 
