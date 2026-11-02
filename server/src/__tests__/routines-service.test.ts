@@ -4454,4 +4454,157 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(reconciledRun).toMatchObject({ routineId: routine.id, status: "failed" });
     expect(reconciledRun?.failureReason).toBeTruthy();
   });
+
+  // PEN-5281: the sibling of the test above. That one stops at "the run row
+  // still resolves"; this one follows the same aborted fire all the way to the
+  // agent closing its execution issue `done`, which is what actually happened
+  // on routine 2eae26b3 / run 6a75b5ee. The recovery left three fields
+  // disagreeing about one run: `status: "completed"` next to the abort's
+  // `failureReason`, and a trigger still reading "Execution failed".
+  //
+  // Asserting only the run's `status` passes against the broken code, so the
+  // pre-state is asserted too: the test has to show the fire really was red
+  // before it can mean anything by the fire being green afterwards.
+  describe("carrying a terminal execution issue back onto its run and trigger", () => {
+    async function abortDispatchWithTrigger() {
+      const fixture = await seedFixture({
+        wakeup: async () => {
+          await db.execute(sql`
+            select pg_terminate_backend(pid)
+            from pg_stat_activity
+            where datname = current_database()
+              and pid <> pg_backend_pid()
+              and state = 'idle in transaction'
+          `);
+          return null;
+        },
+      });
+      const { trigger } = await fixture.svc.createTrigger(fixture.routine.id, {
+        kind: "schedule",
+        label: "Daily capacity re-check",
+        cronExpression: "0 6 * * *",
+        timezone: "UTC",
+      }, {});
+
+      await expect(
+        fixture.svc.runRoutine(fixture.routine.id, { source: "manual", triggerId: trigger.id }),
+      ).rejects.toThrow();
+
+      const executionIssue = await db
+        .select({ id: issues.id, originRunId: issues.originRunId })
+        .from(issues)
+        .where(and(eq(issues.companyId, fixture.companyId), eq(issues.originId, fixture.routine.id)))
+        .then((rows) => rows[0] ?? null);
+      expect(executionIssue?.originRunId).toBeTruthy();
+
+      return { ...fixture, trigger, executionIssue: executionIssue! };
+    }
+
+    const readRun = (runId: string) =>
+      db.select().from(routineRuns).where(eq(routineRuns.id, runId)).then((rows) => rows[0] ?? null);
+    const readTrigger = (triggerId: string) =>
+      db.select().from(routineTriggers).where(eq(routineTriggers.id, triggerId)).then((rows) => rows[0] ?? null);
+
+    // The two defects are asserted in SEPARATE tests on purpose. They are
+    // independent -- one is the run row, one is the trigger -- and a single
+    // test stops at its first failing assertion, so the second leg would never
+    // be exercised against broken code and could ship uncovered.
+    async function recoverViaDoneIssue() {
+      const fixture = await abortDispatchWithTrigger();
+
+      // Pre-state: the abort is correctly red everywhere. Without this the
+      // green assertions below cannot distinguish "corrected" from
+      // "never was red".
+      const abortedRun = await readRun(fixture.executionIssue.originRunId!);
+      expect(abortedRun?.status).toBe("failed");
+      expect(abortedRun?.failureReason).toBeTruthy();
+      expect((await readTrigger(fixture.trigger.id))?.lastResult).toBe("Execution failed");
+
+      // The issue survives the abort, so the agent still runs the work and
+      // closes it. `routes/issues.ts` calls the service exactly like this.
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, fixture.executionIssue.id));
+      await fixture.svc.syncRunStatusForIssue(fixture.executionIssue.id);
+      return fixture;
+    }
+
+    it("clears the dispatch abort's failureReason once the execution issue closes done", async () => {
+      const { executionIssue } = await recoverViaDoneIssue();
+
+      const recoveredRun = await readRun(executionIssue.originRunId!);
+      expect(recoveredRun?.status).toBe("completed");
+      // The part a bare `.set(patch)` does not do: the abort's reason has to go.
+      expect(recoveredRun?.failureReason).toBeNull();
+      expect(recoveredRun?.completedAt).toBeTruthy();
+    });
+
+    it("corrects the trigger's lastResult once the execution issue closes done", async () => {
+      const { trigger } = await recoverViaDoneIssue();
+
+      // The §S8 carrier-health surface, which the run row alone never reaches.
+      expect((await readTrigger(trigger.id))?.lastResult).toBe("Execution issue completed");
+    });
+
+    it("reports the fire red on the trigger when the execution issue is blocked", async () => {
+      // Deliberately NOT the aborted fire: an abort already leaves the trigger
+      // reading "Execution failed", so asserting that here would pass whether
+      // or not this arm touches the trigger. Start from a clean dispatch, where
+      // the trigger reads "Created execution issue ...", and the flip is real.
+      const { svc, routine } = await seedFixture();
+      const { trigger } = await svc.createTrigger(routine.id, {
+        kind: "schedule",
+        label: "Daily capacity re-check",
+        cronExpression: "0 6 * * *",
+        timezone: "UTC",
+      }, {});
+
+      const run = await svc.runRoutine(routine.id, { source: "manual", triggerId: trigger.id });
+      expect(run.status).toBe("issue_created");
+      expect(run.linkedIssueId).toBeTruthy();
+      expect((await readTrigger(trigger.id))?.lastResult).toMatch(/^Created execution issue /);
+
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, run.linkedIssueId!));
+      await svc.syncRunStatusForIssue(run.linkedIssueId!);
+
+      const blockedRun = await readRun(run.id);
+      expect(blockedRun?.status).toBe("failed");
+      expect(blockedRun?.failureReason).toBe("Execution issue moved to blocked");
+      expect((await readTrigger(trigger.id))?.lastResult).toBe("Execution failed");
+    });
+
+    it("leaves a newer fire's result on the trigger when an older issue closes late", async () => {
+      const { companyId, routine, svc, trigger, executionIssue } = await abortDispatchWithTrigger();
+      const runId = executionIssue.originRunId!;
+      const abortedRun = await readRun(runId);
+
+      // A later firing now owns what the trigger reports. Correcting the
+      // trigger from the older run would clobber that result and rewind
+      // `lastFiredAt` to the older fire.
+      const newerFiredAt = new Date(abortedRun!.triggeredAt.getTime() + 60 * 60 * 1000);
+      await db.insert(routineRuns).values({
+        id: randomUUID(),
+        companyId,
+        routineId: routine.id,
+        triggerId: trigger.id,
+        source: "schedule",
+        status: "issue_created",
+        triggeredAt: newerFiredAt,
+      });
+      await db
+        .update(routineTriggers)
+        .set({ lastFiredAt: newerFiredAt, lastResult: "Created execution issue NEWER" })
+        .where(eq(routineTriggers.id, trigger.id));
+
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, executionIssue.id));
+      await svc.syncRunStatusForIssue(executionIssue.id);
+
+      const triggerRow = await readTrigger(trigger.id);
+      expect(triggerRow?.lastResult).toBe("Created execution issue NEWER");
+      expect(triggerRow?.lastFiredAt).toEqual(newerFiredAt);
+
+      // The older run itself is still corrected -- it is its own row.
+      const recoveredRun = await readRun(runId);
+      expect(recoveredRun?.status).toBe("completed");
+      expect(recoveredRun?.failureReason).toBeNull();
+    });
+  });
 });

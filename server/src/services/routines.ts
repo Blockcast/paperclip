@@ -2378,6 +2378,37 @@ export function routineService(
       .then((rows) => rows[0] ?? null);
   }
 
+  // PEN-5281: carry a run's late-arriving terminal status back onto its
+  // trigger, so `lastResult` reports what the execution issue actually did
+  // rather than whatever the dispatch attempt last wrote there.
+  //
+  // Guarded on this run still being the trigger's newest fire. A later firing
+  // owns the trigger's reported outcome, and rewriting it from an older run
+  // would both clobber that result and rewind `lastFiredAt` -- the same
+  // don't-clobber-a-newer-fire rule `reconcileRolledBackDispatch` keeps.
+  // `issueId` and `nextRunAt` are deliberately left undefined so
+  // `lastEnqueuedAt` and `nextRunAt` are untouched: this is a correction to an
+  // already-recorded fire, not a new one.
+  async function syncTriggerResultForFinalizedRun(
+    run: typeof routineRuns.$inferSelect,
+    status: string,
+  ) {
+    if (!run.triggerId) return;
+    const trigger = await db
+      .select({ id: routineTriggers.id, lastFiredAt: routineTriggers.lastFiredAt })
+      .from(routineTriggers)
+      .where(eq(routineTriggers.id, run.triggerId))
+      .then((rows) => rows[0] ?? null);
+    if (!trigger) return;
+    if (trigger.lastFiredAt && trigger.lastFiredAt.getTime() > run.triggeredAt.getTime()) return;
+    await updateRoutineTouchedState({
+      routineId: run.routineId,
+      triggerId: run.triggerId,
+      triggeredAt: run.triggeredAt,
+      status,
+    });
+  }
+
   async function createWebhookSecret(
     companyId: string,
     routineId: string,
@@ -4176,20 +4207,24 @@ export function routineService(
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue || issue.originKind !== "routine_execution" || !issue.originRunId) return null;
-      if (issue.status === "done") {
-        return finalizeRun(issue.originRunId, {
-          status: "completed",
-          completedAt: new Date(),
-        });
-      }
-      if (issue.status === "blocked" || issue.status === "cancelled") {
-        return finalizeRun(issue.originRunId, {
-          status: "failed",
-          failureReason: `Execution issue moved to ${issue.status}`,
-          completedAt: new Date(),
-        });
-      }
-      return null;
+      // PEN-5281: both arms must write `failureReason` explicitly and then
+      // correct the trigger. `finalizeRun` is a bare `.set(patch)`, so a key it
+      // is not handed keeps its old value -- a fire whose dispatch aborted
+      // carries a `failureReason` from that abort, and omitting the key here
+      // left the row reading `completed` with a stale failure string on it.
+      const outcome = issue.status === "done"
+        ? { status: "completed", failureReason: null }
+        : issue.status === "blocked" || issue.status === "cancelled"
+          ? { status: "failed", failureReason: `Execution issue moved to ${issue.status}` }
+          : null;
+      if (!outcome) return null;
+      const run = await finalizeRun(issue.originRunId, {
+        status: outcome.status,
+        failureReason: outcome.failureReason,
+        completedAt: new Date(),
+      });
+      if (run) await syncTriggerResultForFinalizedRun(run, outcome.status);
+      return run;
     },
   };
 }
