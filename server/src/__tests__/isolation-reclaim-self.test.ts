@@ -308,6 +308,8 @@ describe("readReclaimSelfPodIdentity", () => {
  */
 const SERVER_DIGEST = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 const SIDECAR_DIGEST = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+/** What the operator pinned, for the case where the kubelet resolved something else. */
+const OPERATOR_DIGEST = "sha256:3333333333333333333333333333333333333333333333333333333333333333";
 
 describe("resolveSelfImage", () => {
   it("prefers the digest the kubelet resolved over the reference the operator wrote", () => {
@@ -327,6 +329,13 @@ describe("resolveSelfImage", () => {
     // credulous `imageID ?? specImage` would hand to the Job verbatim, and the
     // Job would then never start -- reported as a deadline, not as a manifest
     // problem.
+    //
+    // It stays a fallback even though the resolver now pins the runtime's
+    // digest onto the SPEC repository and could therefore build a reference
+    // from a bare digest. Having no `RepoDigest` is the runtime saying no
+    // registry is known to serve this content under any name; synthesizing
+    // `harbor.example/paperclip@sha256:...` would assert the registry serves
+    // it anyway -- exactly what the runtime reports it cannot confirm.
     ["a bare digest with no repository", SERVER_DIGEST],
     ["a reference carrying no digest at all", "harbor.example/paperclip:main"],
     ["a truncated digest", "harbor.example/paperclip@sha256:abc"],
@@ -337,6 +346,48 @@ describe("resolveSelfImage", () => {
     expect(resolveSelfImage("harbor.example/paperclip:main", imageID as string | undefined)).toBe(
       "harbor.example/paperclip:main",
     );
+  });
+
+  /**
+   * The digest and the repository come from DIFFERENT sources on purpose, so
+   * every case below feeds a runtime repository that disagrees with the
+   * spec's. A fixture that spelled both from one string could not tell the
+   * two-source rule apart from `return imageID`.
+   *
+   * The risk being closed is a credential one: the Job inherits this pod's
+   * `imagePullSecrets`, which are proven against the spec repository and
+   * promise nothing about a mirror or a second registry.
+   */
+  it("keeps the spec repository when the runtime reports the content under another name", () => {
+    expect(
+      resolveSelfImage("harbor.example/paperclip:main", `mirror.internal/cache/paperclip@${SERVER_DIGEST}`),
+    ).toBe(`harbor.example/paperclip@${SERVER_DIGEST}`);
+  });
+
+  it("does not mistake a registry port for a tag", () => {
+    // The last `:` is in `harbor.example:5000`, before the last `/`. Cutting
+    // there would yield `harbor.example@sha256:...` -- a different registry.
+    expect(
+      resolveSelfImage("harbor.example:5000/paperclip:main", `mirror.internal/paperclip@${SERVER_DIGEST}`),
+    ).toBe(`harbor.example:5000/paperclip@${SERVER_DIGEST}`);
+  });
+
+  it("replaces the digest when the spec is already digest-pinned and the kubelet disagrees", () => {
+    // Production is digest-pinned; this is the skew the resolver exists for.
+    expect(
+      resolveSelfImage(`harbor.example/paperclip@${OPERATOR_DIGEST}`, `mirror.internal/paperclip@${SERVER_DIGEST}`),
+    ).toBe(`harbor.example/paperclip@${SERVER_DIGEST}`);
+  });
+
+  it("handles a spec reference carrying no tag at all", () => {
+    expect(resolveSelfImage("harbor.example/paperclip", `mirror.internal/paperclip@${SERVER_DIGEST}`)).toBe(
+      `harbor.example/paperclip@${SERVER_DIGEST}`,
+    );
+  });
+
+  it("falls back when the spec reference has no repository to pin onto", () => {
+    // Degenerate, but the alternative is returning a bare `@sha256:...`.
+    expect(resolveSelfImage(":main", `harbor.example/paperclip@${SERVER_DIGEST}`)).toBe(":main");
   });
 });
 
