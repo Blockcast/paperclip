@@ -28,7 +28,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       # The default Actions GITHUB_TOKEN does not carry environments read; the
       # allyblockcast App installation token does (verified 2026-08-14 against

@@ -672,7 +672,7 @@ test("policy declares every permission the classifier needs, checkout included",
 // That tolerance is what lets BLO-31690 document the checkout bound in place;
 // the invariant is that the `uses:` found is still THAT step's, so anything
 // which is not a comment — a permissions block, another step — breaks the match.
-const CHECKOUT_STEP = /\n {6}- name: Checkout repository\n(?: {8}#[^\n]*\n|\n)* {8}uses: actions\/checkout@v6\n/;
+const CHECKOUT_STEP = /\n {6}- name: Checkout repository\n(?: {8}#[^\n]*\n|\n)* {8}uses: actions\/checkout@[0-9a-f]{40}[^\n]*\n/;
 
 test("policy still checks out the repository under that permissions block", () => {
   assert.match(policyRegion(), CHECKOUT_STEP, "the permissions block must not have displaced the checkout step");
@@ -692,7 +692,7 @@ test("the checkout assertion still fails when the step is displaced or removed",
   assert.doesNotMatch(displaced, CHECKOUT_STEP);
 
   // Removed outright.
-  const without = region.replace(/\n {8}uses: actions\/checkout@v6\n/, "\n");
+  const without = region.replace(/\n {8}uses: actions\/checkout@[0-9a-f]{40}[^\n]*\n/, "\n");
   assert.notEqual(without, region, "the removal mutation must have applied");
   assert.doesNotMatch(without, CHECKOUT_STEP);
 });
