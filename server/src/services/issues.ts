@@ -1033,11 +1033,12 @@ type IssueScheduledRetryRow = {
   error?: string | null;
   errorCode?: string | null;
 };
-type IssueWithLabels = IssueRow & {
+type IssueLabelAttachments = {
   labels: IssueLabelRow[];
   labelIds: string[];
   watchdog?: IssueWatchdogSummary | null;
 };
+type IssueWithLabels = IssueRow & IssueLabelAttachments;
 /**
  * BLO-28843: the third liveness path, flattened onto every list row.
  *
@@ -1093,9 +1094,35 @@ const EMPTY_SCHEDULED_RETRY_PROJECTION: IssueScheduledRetryProjection = {
   scheduledRetryAgentId: null,
   scheduledRetryParkedRuns: [],
 };
+/**
+ * PEN-5295: the productivity-review opt-out, flattened onto every list row.
+ *
+ * `issueListSelect` computes this in SQL, so it is NOT on `IssueRow` — that is
+ * `typeof issues.$inferSelect`, the *table* type, which by construction cannot carry a
+ * projected column. Without this declaration the key exists at runtime and is invisible
+ * to every TypeScript consumer of a list row, which is the half of the absent-key defect
+ * that `tsc` is supposed to catch.
+ *
+ * Present on every list row, explicitly `false` when the row carries no opt-out — the
+ * same key-presence rule `IssueScheduledRetryProjection` above states, for the same
+ * reason: absent-vs-false is the defect, and here it fails toward *alarming* (a ratified
+ * stand-down reads as an abandoned row). Non-optional precisely so a consumer cannot
+ * silently read `undefined` where the projection guarantees a boolean.
+ */
+type IssueProductivityReviewProjection = {
+  productivityReviewDisabled: boolean;
+};
+/**
+ * A row as `issueListSelect` actually returns it: every table column, plus the columns that
+ * projection computes in SQL. `dbOrTx` is untyped, so the select's shape cannot be inferred
+ * at the call sites and has to be stated — state it as this, never as the bare `IssueRow`,
+ * which silently drops the computed keys and is what hid PEN-5295's projection from `tsc`.
+ */
+type IssueListSelectRow = IssueRow & IssueProductivityReviewProjection;
 type IssueWithLabelsAndRun = IssueWithLabels
   & { activeRun: IssueActiveRunRow | null }
-  & IssueScheduledRetryProjection;
+  & IssueScheduledRetryProjection
+  & IssueProductivityReviewProjection;
 type IssueUserCommentStats = {
   issueId: string;
   myLastCommentAt: Date | null;
@@ -2422,7 +2449,10 @@ async function labelMapForIssues(dbOrTx: any, issueIds: string[]): Promise<Map<s
   return map;
 }
 
-async function withIssueLabels(dbOrTx: any, rows: IssueRow[]): Promise<IssueWithLabels[]> {
+async function withIssueLabels<T extends IssueRow>(
+  dbOrTx: any,
+  rows: T[],
+): Promise<(T & IssueLabelAttachments)[]> {
   if (rows.length === 0) return [];
   const issueIds = rows.map((row) => row.id);
   const [labelsByIssueId, watchdogByIssueId] = await Promise.all([
@@ -4327,7 +4357,7 @@ const issueListSelect = {
  * field.
  */
 function withActiveRuns(
-  issueRows: IssueWithLabels[],
+  issueRows: (IssueWithLabels & IssueProductivityReviewProjection)[],
   runMap: Map<string, IssueActiveRunRow>,
   retryMap: Map<string, IssueScheduledRetryProjection>,
 ): IssueWithLabelsAndRun[] {
@@ -6163,7 +6193,7 @@ async function listBlockedInboxIssues(
       ...row,
       ...projectIssueListDescription(row.description),
     }));
-  const withLabels = await withIssueLabels(dbOrTx, rows);
+  const withLabels = await withIssueLabels(dbOrTx, rows as IssueListSelectRow[]);
   const withRuns = withActiveRuns(
     withLabels,
     await activeRunMapForIssues(dbOrTx, withLabels),
@@ -8733,7 +8763,7 @@ export function issueService(db: Db) {
         ...projectIssueListDescription(row.description),
       }));
       // BLO-44407: list rows carry no `executionPolicy` key at runtime (see issueListSelect).
-      const withLabels = await withIssueLabels(db, rows as IssueRow[]);
+      const withLabels = await withIssueLabels(db, rows as IssueListSelectRow[]);
       // Both derived maps are built from the already-paginated page, so this
       // stays additive to the row shape and neutral to `limit`/`offset`.
       const [runMap, retryMap] = await Promise.all([
