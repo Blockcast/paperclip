@@ -14,8 +14,9 @@ import { resolveMigrationConnection } from "./migration-runtime.js";
  *     with the exact `CREATE INDEX CONCURRENTLY` remediation.
  *  2. BLO-48353: execute the pending set in one transaction and ROLL BACK, so a
  *     data-dependent RAISE or constraint violation fails the deploy here
- *     instead of crash-looping the worker. A timeout is INCONCLUSIVE and does
- *     not block: it says nothing about whether the migration is correct.
+ *     instead of crash-looping the worker. A lock race or budget exhaustion is
+ *     INCONCLUSIVE and does not block; a single statement outliving its own
+ *     timeout FAILS, because at deploy it is a lock outage (BLO-51377).
  */
 async function main(): Promise<void> {
   const resolved = await resolveMigrationConnection();
@@ -52,7 +53,7 @@ async function main(): Promise<void> {
       case "inconclusive":
         console.log(
           `migration dry-run: INCONCLUSIVE${dryRun.migration ? ` at ${dryRun.migration}` : ""} — ${dryRun.detail}. ` +
-            "Rolled back; NOT blocking the deploy (a timeout is not a migration verdict).",
+            "Rolled back; NOT blocking the deploy (a lock race or budget cap is not a migration verdict).",
         );
         return;
       case "fail":

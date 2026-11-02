@@ -1371,9 +1371,15 @@ export async function inspectMigrations(url: string): Promise<MigrationState> {
  *    at what is left of `budgetMs`, so the locks the real migration takes (0263:
  *    ACCESS EXCLUSIVE on `cost_events` + a full-table UPDATE) are held for at
  *    most `budgetMs`, never minutes.
- *  - A timeout, deadlock or an error the single-transaction shape itself causes
- *    (55P04: an enum value added by one pending migration used by a later one,
- *    which the runner commits in between) is INCONCLUSIVE, not FAIL.
+ *  - A lock race, deadlock, budget exhaustion or an error the single-transaction
+ *    shape itself causes (55P04: an enum value added by one pending migration used
+ *    by a later one, which the runner commits in between) is INCONCLUSIVE, not FAIL.
+ *  - BLO-51377: a statement killed by its OWN full `statementTimeoutMs` (a real
+ *    Postgres 57014, not the budget cap) is FAIL. It ran past the role's own 30s
+ *    `statement_timeout` while holding its locks, and at deploy it holds them for
+ *    up to `MIGRATION_STATEMENT_TIMEOUT_MS`, timing out every other session behind
+ *    it. 0270 did exactly that: dry-run 57014 waved through, ~35 min of fleet-wide
+ *    `activity_log` lock timeouts at deploy.
  *  - Non-transactional statements (`... CONCURRENTLY`, `VACUUM`) are NOT skipped:
  *    the runner executes them inside a transaction too, so their 25001 is a real FAIL.
  *  - Nothing is recorded in the migration journal; the journal row count is
@@ -1442,6 +1448,7 @@ export async function dryRunPendingMigrations(
 
     let current: string | undefined;
     let outcome: MigrationDryRunResult | undefined;
+    let timeoutCappedByBudget = false;
     const started = Date.now();
     await sql.unsafe("BEGIN");
     try {
@@ -1456,6 +1463,7 @@ export async function dryRunPendingMigrations(
           if (remainingMs <= 0) {
             throw Object.assign(new Error(`dry-run exceeded its ${budgetMs}ms budget`), { code: "57014" });
           }
+          timeoutCappedByBudget = remainingMs < statementTimeoutMs;
           await sql.unsafe(`SET LOCAL statement_timeout = '${Math.trunc(Math.min(statementTimeoutMs, remainingMs))}ms'`);
           await executeMigrationStatement(sql, statement);
         }
@@ -1466,11 +1474,18 @@ export async function dryRunPendingMigrations(
       const { code, message } = error as { code?: string; message?: string };
       const isPostgres = error instanceof postgres.PostgresError || code === "57014";
       if (!isPostgres) throw error;
+      // Only when lock_timeout fires first can a 57014 not be a lock wait.
+      const slowStatement = code === "57014" && error instanceof postgres.PostgresError
+        && !timeoutCappedByBudget && lockTimeoutMs < statementTimeoutMs;
       outcome = {
-        verdict: DRY_RUN_INCONCLUSIVE_CODES.has(code ?? "") ? "inconclusive" : "fail",
+        verdict: slowStatement || !DRY_RUN_INCONCLUSIVE_CODES.has(code ?? "") ? "fail" : "inconclusive",
         executed,
         migration: current,
-        detail: `${code ?? "?"}: ${message ?? String(error)}`,
+        detail: slowStatement
+          ? `${code}: ${message ?? String(error)} — one statement ran past ${statementTimeoutMs}ms holding its locks; ` +
+            "at deploy it holds them for up to the migrator's 10-minute statement_timeout and every other session " +
+            "times out behind it (BLO-51377). Batch the work outside the migration transaction."
+          : `${code ?? "?"}: ${message ?? String(error)}`,
       };
     } finally {
       try {
