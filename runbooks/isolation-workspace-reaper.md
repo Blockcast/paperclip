@@ -46,10 +46,13 @@ reports `-1` rather than a count, because which agents that moves is not derivab
 
 Read the two values differently:
 
-- **`> 0`** — that many agents' trees are outside this sweep's reach, and **nothing reclaims them**.
-  They grow at the rate this reaper exists to contain (≈10 GiB/agent/month measured over the
-  July → 2026-09-02 fill). This is a capacity finding, not an outage: `allowVolumeExpansion` is
-  `true`, so it surfaces as an operator resizing a PVC rather than a run losing data.
+- **`> 0`** — that many agents' trees are outside *this* sweep's reach. **Whether anything else
+  reclaims them is a config read, not a property of this number** — see
+  [*What you can actually do about it today*](#what-you-can-actually-do-about-it-today); where the foreign-claim
+  sweep is not enabled, nothing does, and they grow at the rate this reaper exists to contain
+  (≈10 GiB/agent/month measured over the July → 2026-09-02 fill). This is a capacity finding, not
+  an outage: `allowVolumeExpansion` is `true`, so it surfaces as an operator resizing a PVC rather
+  than a run losing data.
 - **`-1`** — the probe was absent, threw, **or** found a k8s environment supplying a
   `workspaceVolumeClaim`, which makes the agent-level count untrustworthy. Either way this sweep
   cannot describe its own coverage.
@@ -118,9 +121,24 @@ root, and the root stays present and populated by every agent still on the share
 **A `> 0` here does not clear on its own and is not expected to — and that stays true after the
 reclaimer is enabled**, because this gauge counts agents whose trees the MOUNTED sweep cannot
 reach. That is a property of where the tree lives, not of whether anything reclaimed it. Read it
-against `paperclip_isolation_reclaim_last_sweep_timestamp_seconds`: fresh means *unreachable but
-reclaimed*, stale or absent means unreclaimed. Where it is unreclaimed, it was accepted
-deliberately, with a ceiling:
+against `paperclip_isolation_reclaim_last_sweep_timestamp_seconds` — but read that series at
+`{dry_run="false"}`, and read it as liveness rather than coverage. Both qualifiers fail toward
+*"reclaimed"*, which is the dangerous direction:
+
+- `recordIsolationReclaimSweep` sets the gauge with a `dry_run` label and sets it
+  **unconditionally**, so a dry-run sweep leaves the timestamp fresh having reclaimed nothing — and
+  `server/src/index.ts` tells you to *"Enable with `dryRun` first"*, so that is the first state a
+  correct rollout is in, not an edge case.
+- Even at `{dry_run="false"}`, a fresh timestamp says the sweep ran, not that it drove *this* claim.
+  `sweepIsolationReclaim` slices to `maxClaimsPerTick` and rotates, and the timestamp advances on
+  `outcome="failed"` and `"deferred"` sweeps too.
+
+The per-claim evidence is `paperclip_isolation_reclaim_claims_total` by `outcome` (with
+`stop_reason="claims_capped"` naming the rotation) and
+`paperclip_isolation_reclaim_unknown_outcome_claims_total`. With those read: fresh
+`{dry_run="false"}` plus this claim driven `ok` means *unreachable but reclaimed*; stale, absent, or
+dry-run-only means unreclaimed. Where it is unreclaimed, it was accepted deliberately, with a
+ceiling:
 
 > ≈10 GiB/agent/month against a **50 Gi** claim already carrying ≈13.2 G of duplicated company
 > trees ⇒ ≈36.8 GiB headroom ⇒ **one opted-in agent fills its own claim in ≈3.7 months.**
