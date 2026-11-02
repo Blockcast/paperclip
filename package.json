@@ -58,6 +58,8 @@
     "test:http-cache-semantics-security-override": "node --test scripts/http-cache-semantics-security-override.test.js",
     "test:proxy-addr-security-override": "node --test scripts/proxy-addr-security-override.test.js",
     "test:hono-node-server-security-override": "node --test scripts/hono-node-server-security-override.test.js",
+    "test:brace-expansion-security-override": "node --test scripts/brace-expansion-security-override.test.js",
+    "test:postcss-security-override": "node --test scripts/postcss-security-override.test.js",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
     "smoke:hermes-gateway-join": "./scripts/smoke/hermes-gateway-join.sh",
