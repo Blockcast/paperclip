@@ -476,13 +476,16 @@ env:
 
     # PEN-5296 box 2: the DELIBERATE counterpart to the capture above.
     #
-    # That one plans a statement that FAILED, and it answered its question --
-    # production picks the GOOD plan: every search arm index-served, no
-    # `Seq Scan`, estimated cost ~4,100-4,400. It cannot say where the 30s went,
+    # That one plans a statement that FAILED. It cannot say where the 30s went,
     # because `EXPLAIN` without `ANALYZE` reports estimates and never actuals.
-    # The live hypothesis is an `Append` estimated at ~70 rows driving a
-    # `Nested Loop` over 2,842-byte-wide pkey fetches, and actual-vs-estimated
-    # rows is the only thing that can confirm or refute it.
+    #
+    # ⚠️ Its first write-up read "production picks the GOOD plan, estimated cost
+    # ~4,100". Five captures later that is known to describe only ONE of two
+    # shapes: a 6-8 char term gets a `Nested Loop` with the `Append` estimated
+    # at 73 (cost ~1,700), a 3-char term gets a `Hash Join` with the `Append`
+    # estimated at 17,500-21,585 (cost ~38,500). BOTH have been seen timing out,
+    # and they have opposite fixes -- one wants better estimates, the other
+    # wants less candidate work. Only actual-vs-estimated rows separates them.
     #
     # ⛔ This does NOT relax PEN-5223's "never ANALYZE a timed-out statement".
     # The probe runs only on the SUCCESS path, so a statement that hit 57014
@@ -492,7 +495,11 @@ env:
     # "true" would probe the literal term `true` and measure nothing. Empty or
     # unset is OFF. `the` is chosen because it is the most expensive term
     # measured on this workload (24.2s on Penstock, against 0.34s for a
-    # non-matching term), so it is the case the hypothesis is about.
+    # non-matching term) AND because it reliably COMPLETES at offset 0 --
+    # re-verified 2026-11-02T15:3xZ. That second property is load-bearing: the
+    # probe only fires on the success path, so a term that tips over 30s
+    # measures nothing. ⚠️ It selects the EXPENSIVE (`Hash Join`) shape. The
+    # cheap-shape timeouts are a second population and need their own term.
     #
     # Bounded: at most 3 probes per process, only on an exact term match, and
     # read-only. ⚠️ Each probe re-executes the statement, so a matching request
