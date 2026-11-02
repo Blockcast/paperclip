@@ -166,8 +166,21 @@ sat evicted from the merge queue for 9h13m unnoticed — added
 `2026-08-08T09:24:35Z`, removed `13:55:45Z`, six issues blocked behind it).
 
 If `master` advances far enough past a queued entry's merge base while it
-waits, the entry goes `CONFLICTING`/`DIRTY` and the queue **cannot stage it
-at all**. This is neither of the two shapes above:
+waits, the queue **cannot stage the entry at all**. In the BLO-23395 shape the
+entry also *reports* that, going `CONFLICTING`/`DIRTY`.
+
+> ⚠ **`CONFLICTING`/`DIRTY` is how *this* shape reports, not how
+> un-stageability reports in general — do not use it as the probe.** On this
+> repo's `mergeMethod: REBASE` queue an entry can be un-stageable while
+> `mergeable`/`mergeStateStatus` read `CLEAN` throughout, because what fails is
+> the commit-by-commit replay, not the merge of the final tree. Two
+> reproductions — #920 and #3205 — are in
+> ["A fourth eviction cause the detector already gets right, but a human probe
+> won't"](#a-fourth-eviction-cause-the-detector-already-gets-right-but-a-human-probe-wont-rebase-unstageable-history)
+> below. **Read that section before diagnosing any eviction by hand.** The
+> detector is unaffected either way.
+
+This is neither of the two shapes above:
 
 - It is not a failing required check — no check ever ran, so there is
   nothing to fail. **Zero `merge_group` runs are created for that PR.**
@@ -178,8 +191,10 @@ at all**. This is neither of the two shapes above:
 The only trace is a `removed_from_merge_queue` timeline event, with no PR
 comment, no check-run, and no reviewer wake. This is a foreseeable
 recurrence, not a one-off: any PR that sits in a queue behind a busy `master`
-long enough will eventually go `CONFLICTING` — the longer the queue, the more
-likely it is.
+long enough will eventually become un-stageable — the longer the queue, the
+more likely it is. ⚠ It will not necessarily *say* `CONFLICTING` when it does:
+under `REBASE` it commonly reads `CLEAN` right through the eviction, per the
+forward reference above.
 
 **Detection is automated** (`.github/workflows/merge-queue-eviction-detector.yml`,
 `scripts/merge-queue-eviction-detector.mjs`): GitHub fires
@@ -435,6 +450,39 @@ this detector; it is in a human (or an agent) manually diagnosing an eviction
 by checking `mergeable` first, the way the two-shape framing at the top of
 this doc might suggest, and concluding "clean, so it's not that."
 
+**Second reproduction: [#3205](https://github.com/Blockcast/paperclip/pull/3205),
+2026-11-02 — and it widens the cause.** Measured on a full-history clone,
+`master` at `ebe1b4c6`, head `eb2dc7376`. The rebase stops on the first commit
+with three `add/add` conflicts:
+
+| conflicted path | `origin/master` | `#3205` head | replayed commit `20b6bfd0` |
+|---|---|---|---|
+| `runbooks/github-publish-broker-soak-queries.md` | `1e522d35c` | `1e522d35c` | `aceb94ea6` |
+| `scripts/github-publish-broker-soak-queries.mjs` | `6b115e6d4` | `6b115e6d4` | `b6cddba0a` |
+| `scripts/github-publish-broker-soak-queries.test.mjs` | `f6e10c24e` | `f6e10c24e` | `ed690c59a` |
+
+`master` and the PR head are **byte-identical on every conflicted path** — the
+final tree is a no-op for all three, and `git merge-tree --write-tree
+origin/master <head>` exits `0` with no conflict at all. The replay still
+fails, because the *intermediate* commit's versions differ from both.
+
+⚠ **This instance carries ZERO merge commits**, so the mechanism described
+above is **sufficient but not necessary**. #3205 became un-stageable because
+its own content reached `master` by a *second route*:
+[#3225](https://github.com/Blockcast/paperclip/pull/3225) split four of its
+files off — copied unmodified from #3205 at this very head — and merged first
+(commit `624204193`, 2026-11-01). The parent's first commit is now a duplicate
+add, so it cannot replay, even though the two trees agree byte for byte.
+
+**Splitting a PR and landing the split half makes the parent un-stageable on a
+`REBASE` queue.** That is worth knowing in this repo specifically, because the
+code-owner hold makes splitting the standard way to land the unowned part of a
+change. ⚠ **The parent reports nothing when it happens** — it keeps reading
+`CLEAN`. So re-probe the parent after any split of it merges, and expect to
+drop or rewrite the now-duplicated commit rather than to rebase cleanly. This
+is also what makes the structural precondition check below one-sided; see the
+warning there.
+
 **The standard remedy is self-inflicted under `REBASE`.** "Merge `master`
 into your branch to stay mergeable" is correct advice under `mergeMethod:
 MERGE` and actively counterproductive under `mergeMethod: REBASE` — each
@@ -451,12 +499,28 @@ git rev-list --min-parents=2 --count origin/master..<head>
 ```
 
 A nonzero count on a `REBASE` queue is a leading indicator of this risk, not
-a confirmed conflict — confirm with a throwaway rebase before concluding
-anything is actually unstageable:
+a confirmed conflict. ⚠ **A zero count is NOT an all-clear** — #3205 read `0`
+and was un-stageable anyway (second reproduction above). The check is
+one-sided in the fail-open direction, so only the throwaway rebase decides:
 
 ```
 git rebase --onto origin/master origin/master <head>   # in a throwaway worktree; abort after
 ```
+
+⛔ **Run that probe on FULL history.** A shallow clone has no reachable common
+ancestor, so `git merge-base` finds nothing and the rebase tries to replay the
+entire grafted range onto `master`, manufacturing `add/add` conflicts on every
+file it re-adds. Measured on #3205 — same head, same `master`, only the fetch
+depth differs:
+
+| fetch | `git merge-base` | commits replayed | conflicted paths |
+|---|---|---|---|
+| `--depth 60` | *(none found)* | 60 | **133** (11 under `vendor/**`) |
+| full history | `8be49203` | 2 | **3** |
+
+⇒ a depth-60 probe reports ≈44× the true conflict set and names files the PR
+never touched. Clone with `--filter=blob:none` (full history, no blobs — a few
+seconds on this repo) or `git fetch --unshallow` before probing.
 
 **Manual diagnosis**, if you need to confirm or replay a specific eviction by
 hand — this is exactly what the detector automates:
