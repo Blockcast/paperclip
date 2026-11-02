@@ -2093,14 +2093,22 @@ describe("agent metadata: the accepted Tier-0 residual (PEN-5253)", () => {
   });
 
   it("keeps ordinary long opaque identifiers intact — the cost a Tier-0 shape pass WOULD charge", () => {
-    // These three are what the existing detector actually blanks when run at
-    // every key: each is whitespace-free, >= MIN_OPAQUE_TOKEN_LENGTH and not
-    // slug-shaped, so the length backstop classifies all of them as
+    // These three are what the existing detector actually blanks when run
+    // AS-IS at every key: each is whitespace-free, >= MIN_OPAQUE_TOKEN_LENGTH
+    // and not slug-shaped, so the length backstop classifies all of them as
     // credential-shaped. They are also ordinary content these columns
     // legitimately hold, which is why a Tier-0 pass is a live fault rather
-    // than a hygiene improvement. Measured against `looksLikeCredentialValue`
-    // directly (PEN-5253); this test is the pin, so adding a Tier-0 pass
-    // turns the cost into a red test instead of silent data loss.
+    // than a hygiene improvement.
+    //
+    // "AS-IS" IS LOAD-BEARING, and the honest cost is smaller than these three
+    // (Ally review, #3292). `redaction.ts` already defines `HEX_IDENTIFIER_RE`
+    // and `UUID_RE` but applies them only inside `hasOpaqueUrlPathSegment`,
+    // not in the bare-value branch — so a Tier-0 pass that merely reused those
+    // two existing exemptions would stop blanking `UUID` and `GIT_SHA`, and
+    // those two assertions would pass again without the cost going away.
+    // `IMAGE_REF` is the durable example: no existing exemption covers it.
+    // Stating the cost without this qualifier overstates it in the same
+    // decision-flattering direction the docblock already records once.
     const UUID = "550e8400-e29b-41d4-a716-446655440000";
     const GIT_SHA = "0c3f0498b188573f729f83a4e3a2737ba3a3bfa3";
     const IMAGE_REF = "ghcr.io/blockcast/paperclip-claude-k8s:v1.2.3";
@@ -2108,5 +2116,16 @@ describe("agent metadata: the accepted Tier-0 residual (PEN-5253)", () => {
     expect(masked({ lastSeenRunId: UUID })).toBe(false);
     expect(masked({ deployedSha: GIT_SHA })).toBe(false);
     expect(masked({ image: IMAGE_REF })).toBe(false);
+  });
+
+  it("pins the array element too, so either placement of a Tier-0 pass fails a test", () => {
+    // The object-keyed pins above only catch a pass placed in `sanitizeRecord`'s
+    // key loop. An array element never reaches that loop: `sanitizeValue`
+    // recurses into arrays and sends each string straight to
+    // `redactUriCredentialsInValue`, so a pass placed at THAT string branch
+    // would blank array elements while leaving every assertion above green.
+    // This pin closes that gap (Ally review, #3292).
+    const IMAGE_REF = "ghcr.io/blockcast/paperclip-claude-k8s:v1.2.3";
+    expect(masked({ images: [IMAGE_REF] })).toBe(false);
   });
 });
