@@ -974,9 +974,15 @@ export function resolveSeedShape(input: {
  * `paperclip_isolation_reclaim_reclaimed_total` and
  * `paperclip_isolation_reclaim_last_sweep_timestamp_seconds`.
  *
- * ⚠️ **Read that timestamp at `{dry_run="false"}`, and read it as liveness, not
- * as coverage.** Both qualifiers are load-bearing, and each fails toward
- * "reclaimed" — the dangerous direction:
+ * ⚠️ **Read the WHOLE `paperclip_isolation_reclaim_*` family at
+ * `{dry_run="false"}`, and read the timestamp as liveness, not as coverage.**
+ * All five series carry the `dry_run` label and each qualifier fails toward
+ * "reclaimed" — the dangerous direction. `reclaimed_total` is the one most
+ * likely to be read unqualified and is incremented with
+ * `options.dryRun ? result.wouldReclaim : result.reclaimed`
+ * (`server/src/services/metrics.ts`), so a dry-run rollout publishes a
+ * NON-ZERO reclaimed figure having deleted nothing; `claims_total{outcome="ok"}`
+ * counts dry-run drives on the same footing. On the timestamp specifically:
  *
  * - `recordIsolationReclaimSweep` sets that gauge with a `dry_run` label and
  *   sets it UNCONDITIONALLY (`server/src/services/metrics.ts`), so a dry-run
@@ -989,14 +995,28 @@ export function resolveSeedShape(input: {
  *   rotates, so a fleet larger than one tick is covered across several; and the
  *   timestamp advances on `outcome="failed"` and `"deferred"` sweeps too.
  *
- * So the per-claim evidence is `paperclip_isolation_reclaim_claims_total`
- * by `outcome` (with `stop_reason="claims_capped"` naming the rotation) and
- * `paperclip_isolation_reclaim_unknown_outcome_claims_total`, not the
- * timestamp. With those read: `unreachable_agents != 0` alongside a fresh
- * `{dry_run="false"}` sweep that drove this claim `ok` is *unreachable but
- * reclaimed*; a stale, absent, or dry-run-only timestamp is the standing record
- * that an unreclaimed tree exists, and there opt an agent in only together with
- * an owner for its claim's capacity.
+ * NO COUNTER CARRIES CLAIM IDENTITY, so none of them can answer "was THIS
+ * claim driven". `paperclip_isolation_reclaim_claims_total` is
+ * `Counter<"dry_run" | "outcome">` — a fleet aggregate, where zero increase in
+ * `outcome="failed"` and `"deferred"` at `{dry_run="false"}` over the window
+ * means every claim the sweep listed was driven. The rotation lives on a
+ * DIFFERENT series: `stop_reason` is a label on
+ * `paperclip_isolation_reclaim_sweeps_total`, not on `claims_total`, so
+ * `claims_total{stop_reason="claims_capped"}` matches nothing — and an empty
+ * result there reads as "never capped", i.e. fails toward "every claim was
+ * covered", which is the direction this whole block exists to close.
+ *
+ * The per-claim evidence is therefore a LOG LINE, not a metric:
+ * `isolation reclaim drive complete`
+ * (`server/src/services/isolation-reclaim-driver.ts`), keyed on `claim`,
+ * `agentId`, `dryRun` and `deleted`. (`isolation reclaim execution complete` is
+ * the executor-side line and is keyed on `root`, so it identifies the claim no
+ * better than the counter does.) With that read: `unreachable_agents != 0`
+ * alongside a fresh `{dry_run="false"}` sweep and a `drive complete` line for
+ * this claim at `dryRun=false` is *unreachable but reclaimed*; a stale, absent,
+ * or dry-run-only timestamp is the standing record that an unreclaimed tree
+ * exists, and there opt an agent in only together with an owner for its claim's
+ * capacity.
  *
  * The cheapest remedy there is to opt the agent
  * back out: its FUTURE runs return to the shared claim, where the existing

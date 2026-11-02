@@ -91,9 +91,20 @@ nothing reclaims a foreign claim and the ceiling below applies unchanged.
 Do not infer a sweep from the presence of those modules. The evidence that one ran is
 `paperclip_isolation_reclaim_last_sweep_timestamp_seconds` being fresh, with
 `paperclip_isolation_reclaim_reclaimed_total` and
-`paperclip_isolation_reclaim_unknown_outcome_claims_total` beside it; the log line is
-`isolation reclaim execution complete`. An absent series means the sweep never started — which on a
-server with the flag unset is the expected reading, not a fault.
+`paperclip_isolation_reclaim_unknown_outcome_claims_total` beside it — and **read every
+`paperclip_isolation_reclaim_*` series at `{dry_run="false"}`**, which is the same point this page
+makes for the mounted reaper under *Check the mode before acting on `deleted`*. The qualifier is
+load-bearing on more than the timestamp: `reclaimed_total` is incremented with
+`options.dryRun ? result.wouldReclaim : result.reclaimed` (`metrics.ts`), so a dry-run rollout
+shows a **non-zero** reclaimed figure having deleted nothing, and `claims_total{outcome="ok"}`
+counts dry-run drives too.
+
+Two log lines, and they answer different questions. `isolation reclaim drive complete`
+(`isolation-reclaim-driver.ts`) is the server-side, **per-claim** record — keyed on `claim`,
+`agentId`, `dryRun` and `deleted`. `isolation reclaim execution complete`
+(`isolation-workspace-reaper.ts`) is the executor-side line and is keyed on `root`, so it says a
+sweep ran without saying which claim it ran against. An absent series means the sweep never started
+— which on a server with the flag unset is the expected reading, not a fault.
 
 - **Opt the agent back out.** Clearing `enablePerAgentWorkspaceVolume` (or the agent's
   `workspaceVolumeClaim`) returns its next run to the shared claim, where this reaper reaches its
@@ -133,12 +144,20 @@ against `paperclip_isolation_reclaim_last_sweep_timestamp_seconds` — but read 
   `sweepIsolationReclaim` slices to `maxClaimsPerTick` and rotates, and the timestamp advances on
   `outcome="failed"` and `"deferred"` sweeps too.
 
-The per-claim evidence is `paperclip_isolation_reclaim_claims_total` by `outcome` (with
-`stop_reason="claims_capped"` naming the rotation) and
-`paperclip_isolation_reclaim_unknown_outcome_claims_total`. With those read: fresh
-`{dry_run="false"}` plus this claim driven `ok` means *unreachable but reclaimed*; stale, absent, or
-dry-run-only means unreclaimed. Where it is unreclaimed, it was accepted deliberately, with a
-ceiling:
+**No counter carries claim identity**, so none of them can show that *this* claim was driven.
+`paperclip_isolation_reclaim_claims_total` is `Counter<"dry_run" | "outcome">` — a fleet
+aggregate. Read it at `{dry_run="false"}`: zero increase in `outcome="failed"` and
+`outcome="deferred"` over the window means every claim the sweep listed was driven. The rotation is
+a **different series** — `paperclip_isolation_reclaim_sweeps_total{stop_reason="claims_capped"}`,
+because `stop_reason` is a label on `sweeps_total`, not on `claims_total`. Querying
+`claims_total{stop_reason="claims_capped"}` matches nothing, and an empty result there reads as
+*"never capped"*, which is the fails-toward-covered direction this section exists to close.
+
+The per-claim evidence is a **log line, not a metric**: `isolation reclaim drive complete`
+(`isolation-reclaim-driver.ts`), filtered on `claim=` and `dryRun=false`. With that read: a fresh
+`{dry_run="false"}` timestamp plus a `drive complete` line for this claim at `dryRun=false` and
+`deleted` accounted for means *unreachable but reclaimed*; stale, absent, or dry-run-only means
+unreclaimed. Where it is unreclaimed, it was accepted deliberately, with a ceiling:
 
 > ≈10 GiB/agent/month against a **50 Gi** claim already carrying ≈13.2 G of duplicated company
 > trees ⇒ ≈36.8 GiB headroom ⇒ **one opted-in agent fills its own claim in ≈3.7 months.**
