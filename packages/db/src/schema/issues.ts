@@ -118,7 +118,7 @@ export const issues = pgTable(
     // Materialized "last activity on this issue" timestamp, and the ONE
     // definition of it (PEN-5213). Maintained by DB triggers: 0076 mirrors
     // updated_at on insert/update and bumps to comment.created_at on
-    // issue_comments insert (rewritten statement-level by 0229); 0270 adds the
+    // issue_comments insert (rewritten statement-level by 0229); 0271 adds the
     // activity_log arm, excluding the four local-inbox actions, and repairs the
     // drift that accumulated while it was missing.
     //

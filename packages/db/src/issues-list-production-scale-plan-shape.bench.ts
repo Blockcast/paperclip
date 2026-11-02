@@ -64,7 +64,7 @@
  *      instead of the `GREATEST(...)`. ⭐ UPDATED 2026-11-01 (PEN-5213): the
  *      CTO picked this option and it is now the SHIPPED default ordering. The
  *      "D is not semantically equal to C" caveat recorded below was true when
- *      D was measured and is now closed: migration 0270 adds the missing
+ *      D was measured and is now closed: migration 0271 adds the missing
  *      `activity_log` maintenance arm and repairs the accumulated drift, and
  *      `issues-last-activity-at-activity-log-maintenance.test.ts` asserts the
  *      column equals the (now deleted) expression on every maintenance path.
@@ -189,7 +189,7 @@
  *
  * ⭐ BOTH of those caveats were CLOSED by PEN-5213 and are kept above as the
  * state of knowledge on 2026-10-30, not as current advice. The decision was
- * taken (D is now the shipped default ordering); migration 0270 adds the
+ * taken (D is now the shipped default ordering); migration 0271 adds the
  * missing `activity_log` maintenance arm, so D IS semantically equal to C; and
  * the write-amplification worry turned out to be smaller than stated — the bump
  * is guarded by `last_activity_at < latest_at` and the dominant producer writes

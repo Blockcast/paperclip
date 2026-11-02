@@ -1830,10 +1830,10 @@
       "breakpoints": true
     },
     {
-      "idx": 270,
+      "idx": 271,
       "version": "7",
-      "when": 1792003701477,
-      "tag": "0270_issues_last_activity_at_from_activity_log",
+      "when": 1792003801477,
+      "tag": "0271_issues_last_activity_at_activity_log_trigger",
       "breakpoints": true
     }
   ]

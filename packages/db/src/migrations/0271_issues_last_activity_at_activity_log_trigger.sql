@@ -16,10 +16,42 @@
 -- advances the inline expression and NOT the column -- which is exactly the
 -- divergence that made repointing the ORDER BY unsafe.
 --
--- This migration adds the missing arm and then repairs the drift that
--- accumulated while it was missing. After it, the column IS the definition of
--- "last activity on this issue"; `issueCanonicalLastActivityAtExpr` is deleted
--- in the same change.
+-- ─────────────────────────────────────────────────────────────────────────────
+-- ⛔ THIS MIGRATION ARMS THE TRIGGER AND NOTHING ELSE. DO NOT ADD THE DRIFT
+-- REPAIR BACK INTO IT.
+--
+-- Its predecessor (0270, deleted by this change and never committed to any
+-- database) armed this same trigger AND ran the whole-table drift repair in the
+-- SAME statement list. `applyPendingMigrationsManually` wraps every statement of
+-- one migration file in a single `runInTransaction`, so those two shared one
+-- lock hold: `CREATE TRIGGER` on activity_log takes SHARE ROW EXCLUSIVE, which
+-- conflicts with the ROW EXCLUSIVE every INSERT takes, and the transaction then
+-- held it for the length of a 55,903-issue repair reading 3.4M activity rows.
+--
+-- Production outage 2026-11-02 02:41-03:16Z: every `insert into activity_log`
+-- failed `55P03`, every agent run failed in setup, and API writes returned 503
+-- after committing (duplicate comments). Each pod was killed by the startup
+-- probe at 30 x 10s, Postgres kept the orphaned backend holding the lock, and
+-- the next pod queued behind it -- so attempts accumulated faster than
+-- MIGRATION_STATEMENT_TIMEOUT_MS (10min) could retire them.
+--
+-- Note which controls did NOT save it, because they look like they should:
+-- MIGRATION_DDL_LOCK_TIMEOUT_MS (3s) bounds how long this migration WAITS to
+-- acquire a lock, not how long it HOLDS one. Batching the repair bounded
+-- statement duration and WAL record size, and 0270's own comment said so --
+-- but row locks taken by batch 1 are still held at batch N inside one
+-- transaction, so batching bought nothing that mattered here.
+--
+-- The repair now lives in `packages/db/src/issues-last-activity-drift-repair.ts`,
+-- committed per batch, off the startup path entirely. Run it with
+-- `scripts/pen-5213-last-activity-drift-repair.ts`.
+-- ─────────────────────────────────────────────────────────────────────────────
+--
+-- ORDERING IS SAFE WITHOUT THE REPAIR. The trigger is armed first and the
+-- repair runs afterwards, which is the only order that cannot lose a row: a row
+-- repaired while the arm was still missing could drift straight back out. The
+-- reverse -- arm now, repair later -- only ever leaves a row stale, and the
+-- column is monotone, so a later repair still converges.
 --
 -- WHY INSERT ONLY. last_activity_at is monotone non-decreasing by construction
 -- (every maintenance path is a `<` guarded bump). An activity_log UPDATE or
@@ -72,6 +104,10 @@
 -- digest's reader. Accepted deliberately: the alternative is to guard first and
 -- lock second, which re-opens the two-pass cycle above, and the hold is one
 -- row for the length of one short write transaction.
+--
+-- Every statement below is idempotent (`CREATE OR REPLACE`, `DROP ... IF
+-- EXISTS`), so this migration is a no-op against a database that somehow did
+-- apply 0270 before it was withdrawn.
 CREATE OR REPLACE FUNCTION "activity_log_bump_issue_last_activity_at"()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -149,102 +185,3 @@ AFTER INSERT ON "activity_log"
 REFERENCING NEW TABLE AS "activity_log_last_activity_inserted"
 FOR EACH STATEMENT
 EXECUTE FUNCTION "activity_log_bump_issue_last_activity_at"();
---> statement-breakpoint
-
--- ── one-shot drift repair ────────────────────────────────────────────────────
---
--- Re-runs 0076's backfill expression over every issue, in keyset batches by id,
--- and advances the column where it has fallen behind. This is a REPAIR of drift
--- that could only accumulate while the arm above was missing, not a new
--- backfill: it runs after the trigger is armed, so no row can drift back out
--- between the two.
---
--- ⚠️ WHAT THE BATCHING DOES AND DOES NOT BUY. Each migration file runs inside a
--- single transaction, so row locks taken by batch 1 are still held at batch N.
--- The batching bounds statement duration, per-statement memory and WAL record
--- size -- it does NOT shorten lock hold time. It is the same keyset shape 0154
--- uses, and it acquires in ascending `id` order, which is the order every
--- trigger above locks in.
---
--- The guard is `<`, never `<>`: the column is monotone and a disagreement in
--- the other direction (a deleted comment, an activity row removed) is the
--- column being deliberately ahead, not drift.
---
--- `created_at` is in the GREATEST because 0076's backfill has it. It can only
--- matter for a row whose `created_at` postdates its `updated_at`, which no
--- live write path produces; it is kept so this expression stays byte-comparable
--- with the one it re-runs.
-DO $$
-DECLARE
-  last_issue_id uuid := '00000000-0000-0000-0000-000000000000'::uuid;
-  next_issue_id uuid;
-BEGIN
-  LOOP
-    next_issue_id := NULL;
-
-    WITH batch AS MATERIALIZED (
-      SELECT
-        i."id",
-        i."company_id",
-        i."created_at",
-        i."updated_at",
-        i."last_activity_at"
-      FROM "issues" i
-      WHERE i."id" > last_issue_id
-      ORDER BY i."id"
-      LIMIT 2000
-    ),
-    computed AS (
-      SELECT
-        b."id",
-        GREATEST(
-          b."last_activity_at",
-          b."updated_at",
-          b."created_at",
-          COALESCE(
-            (
-              SELECT MAX(c."created_at")
-              FROM "issue_comments" c
-              WHERE c."issue_id" = b."id"
-                AND c."company_id" = b."company_id"
-            ),
-            to_timestamp(0)
-          ),
-          COALESCE(
-            (
-              SELECT MAX(al."created_at")
-              FROM "activity_log" al
-              WHERE al."company_id" = b."company_id"
-                AND al."entity_type" = 'issue'
-                AND al."entity_id" = b."id"::text
-                AND al."action" NOT IN (
-                  'issue.read_marked',
-                  'issue.read_unmarked',
-                  'issue.inbox_archived',
-                  'issue.inbox_unarchived'
-                )
-            ),
-            to_timestamp(0)
-          )
-        ) AS "canonical_at"
-      FROM batch b
-    ),
-    repaired AS (
-      UPDATE "issues" AS i
-      SET "last_activity_at" = c."canonical_at"
-      FROM computed c
-      WHERE i."id" = c."id"
-        AND i."last_activity_at" < c."canonical_at"
-      RETURNING i."id"
-    )
-    SELECT b."id"
-    INTO next_issue_id
-    FROM batch b
-    LEFT JOIN repaired r ON r."id" = b."id"
-    ORDER BY b."id" DESC
-    LIMIT 1;
-
-    EXIT WHEN next_issue_id IS NULL;
-    last_issue_id := next_issue_id;
-  END LOOP;
-END $$;

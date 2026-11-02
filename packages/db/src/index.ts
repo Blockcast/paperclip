@@ -76,6 +76,17 @@ export {
   ensureLinuxSharedLibraryAliases,
   prepareEmbeddedPostgresNativeRuntime,
 } from "./embedded-postgres-native.js";
+export {
+  DEFAULT_DRIFT_REPAIR_BATCH_SIZE,
+  DRIFT_REPAIR_BATCH_SQL,
+  DRIFT_REPAIR_LOCK_TIMEOUT_MS,
+  DRIFT_REPAIR_STATEMENT_TIMEOUT_MS,
+  countIssuesLastActivityDrift,
+  repairIssuesLastActivityDrift,
+  runIssuesLastActivityDriftRepair,
+  type DriftRepairOptions,
+  type DriftRepairProgress,
+} from "./issues-last-activity-drift-repair.js";
 export { issueRelations } from "./schema/issue_relations.js";
 export { issueReferenceMentions } from "./schema/issue_reference_mentions.js";
 export * from "./schema/index.js";

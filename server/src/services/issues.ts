@@ -2112,14 +2112,14 @@ const ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS = [
 //
 // It is gone. The ordering is served from the materialized
 // `issues.last_activity_at` column that migration 0076 added for the sibling
-// predicate (`inboxVisibleForUserCondition`, below) and that 0270 completed by
+// predicate (`inboxVisibleForUserCondition`, below) and that 0271 completes by
 // adding the missing `activity_log` maintenance arm. The column is now the one
 // definition of "last activity on this issue" -- do not reintroduce an inline
 // second one.
 //
 // `ISSUE_LOCAL_INBOX_ACTIVITY_ACTIONS` is still live: `lastActivityStatsForIssues`
 // uses it for the per-page attribution read, which is bounded by the page's
-// issue ids and is not an ORDER BY input. 0270's trigger honours the same four
+// issue ids and is not an ORDER BY input. 0271's trigger honours the same four
 // actions in SQL.
 
 function unreadForUserCondition(companyId: string, userId: string) {

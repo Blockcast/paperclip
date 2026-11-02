@@ -16,19 +16,32 @@
  * plus the exclusion set, statement-level multi-row inserts, monotonicity, and
  * the drift repair.
  *
- * ⚠️ The drift test runs the repair block EXTRACTED FROM THE MIGRATION FILE,
- * not a copy of it. A copy would drift from the shipped SQL silently, which is
- * the exact failure mode this row exists to close.
+ * ⚠️ The drift test calls the SHIPPED repair, `repairIssuesLastActivityDrift`,
+ * not a copy of its SQL. A copy would drift from the shipped statement
+ * silently, which is the exact failure mode this row exists to close.
+ *
+ * That repair is deliberately NOT in a migration. 0270 armed this trigger and
+ * ran the repair in the same statement list, and because
+ * `applyPendingMigrationsManually` wraps one migration file in one
+ * transaction, the `CREATE TRIGGER`'s SHARE ROW EXCLUSIVE lock on
+ * `activity_log` was held for the length of the whole repair -- blocking every
+ * insert for 35 minutes on 2026-11-02. The trigger now ships alone in
+ * `0271_issues_last_activity_at_activity_log_trigger.sql`; the repair commits
+ * per batch from `issues-last-activity-drift-repair.ts`.
  */
 import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
 import {
+  countIssuesLastActivityDrift,
+  repairIssuesLastActivityDrift,
+} from "./issues-last-activity-drift-repair.js";
+import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./test-embedded-postgres.js";
 
-const MIGRATION_SUFFIX = "_issues_last_activity_at_from_activity_log.sql";
+const TRIGGER_MIGRATION_SUFFIX = "_issues_last_activity_at_activity_log_trigger.sql";
 
 /**
  * The expression deleted from `server/src/services/issues.ts` by this change:
@@ -57,32 +70,77 @@ const cleanups: Array<() => Promise<void>> = [];
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
-function migrationSql(): string {
+/** The trigger migration's top-level statements, with SQL comments stripped. */
+function triggerMigrationStatements(): string[] {
   const migrationsDir = new URL("./migrations/", import.meta.url);
   const matches = fs
     .readdirSync(migrationsDir)
-    .filter((file) => file.endsWith(MIGRATION_SUFFIX))
+    .filter((file) => file.endsWith(TRIGGER_MIGRATION_SUFFIX))
     .sort();
   if (matches.length !== 1) {
     throw new Error(
-      `expected exactly one migration ending in ${MIGRATION_SUFFIX}, found ${matches.length}: ${matches.join(", ")}`,
+      `expected exactly one migration ending in ${TRIGGER_MIGRATION_SUFFIX}, `
+      + `found ${matches.length}: ${matches.join(", ")}`,
     );
   }
-  return fs.readFileSync(new URL(matches[0]!, migrationsDir), "utf8");
+
+  // Split on the breakpoint BEFORE stripping comments: `--> statement-breakpoint`
+  // is itself `--`-prefixed, so stripping first would delete every delimiter
+  // and collapse the file into one statement.
+  return fs
+    .readFileSync(new URL(matches[0]!, migrationsDir), "utf8")
+    .split(/-->\s*statement-breakpoint/g)
+    // Comments go before any structural assertion below, so that *describing*
+    // the repair in prose -- which this migration does at length -- cannot trip
+    // a check meant to catch the repair being executed.
+    .map((part) =>
+      part
+        .replace(/\/\*[\s\S]*?\*\//g, " ")
+        .split("\n")
+        .map((line) => line.replace(/--.*$/, ""))
+        .join("\n")
+        .trim())
+    .filter((part) => part.length > 0);
 }
 
-/** The batched one-shot repair, lifted from the shipped migration. */
-function driftRepairStatement(): string {
-  const statements = migrationSql()
-    .split(/-->\s*statement-breakpoint/g)
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0);
-  const repair = statements.filter((statement) => /^DO \$\$/m.test(statement));
-  if (repair.length !== 1) {
-    throw new Error(`expected exactly one DO block in the migration, found ${repair.length}`);
-  }
-  return repair[0]!;
-}
+/**
+ * The regression guard for the 2026-11-02 02:41-03:16Z outage.
+ *
+ * One migration file is one transaction (`applyPendingMigrationsManually`), so
+ * anything else in that file is holding the `CREATE TRIGGER`'s SHARE ROW
+ * EXCLUSIVE lock on `activity_log` -- which conflicts with the ROW EXCLUSIVE
+ * every INSERT takes. 0270 put a 55,903-issue repair in there and blocked
+ * every `insert into activity_log` for 35 minutes.
+ *
+ * `check-migration-safety.ts` does NOT cover this. Its mutation rules key on
+ * the MUTATED table's size bucket, and `issues` is bucketed `medium`
+ * (1,609 local rows x 250 = 402,250 estimated, under the 1,000,000 `largeRows`
+ * threshold), so 0270's loop was never examined -- measured, not assumed:
+ * `analyzeMigrationSafety` returns zero findings for 0270's exact bytes.
+ * Nothing there models a blocking DDL lock on one table held across bulk DML
+ * on another.
+ */
+describe("the trigger migration stays DDL-only", () => {
+  it("runs no DO block", () => {
+    for (const statement of triggerMigrationStatements()) {
+      expect(statement).not.toMatch(/\bDO\s+\$\$/i);
+    }
+  });
+
+  it("runs no top-level DML", () => {
+    // A CREATE FUNCTION body legitimately contains an UPDATE: it runs per
+    // statement over a transition table, not in bulk, and it does not run at
+    // migration time at all. Only top-level statements are in scope.
+    const topLevel = triggerMigrationStatements()
+      .filter((part) => !/^CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\b/i.test(part));
+
+    expect(topLevel.length).toBeGreaterThan(0);
+    for (const statement of topLevel) {
+      expect(statement).not.toMatch(/^(INSERT|UPDATE|DELETE|MERGE)\b/i);
+      expect(statement).toMatch(/^(CREATE|DROP|ALTER|COMMENT)\b/i);
+    }
+  });
+});
 
 type Divergence = { id: string; column_at: Date; canonical_at: Date };
 
@@ -252,7 +310,7 @@ describeEmbeddedPostgres("issues.last_activity_at maintenance (PEN-5213)", () =>
   );
 
   it(
-    "repairs pre-0270 drift with the migration's own batched one-shot",
+    "repairs pre-trigger drift with the shipped batched one-shot",
     async () => {
       const sql = await freshDatabase();
       await insertIssue(sql, ISSUE_A, 1);
@@ -275,14 +333,30 @@ describeEmbeddedPostgres("issues.last_activity_at maintenance (PEN-5213)", () =>
       const beforeRepair = await divergences(sql);
       expect(beforeRepair.map((row) => row.id).sort()).toEqual([ISSUE_A, ISSUE_B].sort());
 
-      await sql.unsafe(driftRepairStatement());
+      // The dry-run count restates the repair's GREATEST(...) in a second
+      // place, which is the "two definitions of last activity" hazard this row
+      // exists to remove. Pin them to each other: whatever the count says is
+      // drifted must be exactly what the repair then advances.
+      const predicted = await countIssuesLastActivityDrift(sql);
+      expect(predicted).toBe(beforeRepair.length);
+
+      // batchSize 1 so the keyset cursor has to advance across several
+      // batches: a cursor that failed to advance would loop forever, and one
+      // advanced by REPAIRED rather than SCANNED rows would re-scan an
+      // already-correct row forever. A single-batch run would hide both.
+      const firstPass = await repairIssuesLastActivityDrift(sql, { batchSize: 1 });
+      expect(firstPass.batches).toBeGreaterThan(1);
+      expect(firstPass.repaired).toBe(2);
+      expect(firstPass.repaired).toBe(predicted);
+      expect(await countIssuesLastActivityDrift(sql)).toBe(0);
 
       expect(await divergences(sql)).toEqual([]);
       expect((await columnAt(sql, ISSUE_A)).getTime()).toBe(drifted.getTime());
 
       // Idempotent: a second pass is a no-op, not a second advance.
       const repaired = await columnAt(sql, ISSUE_B);
-      await sql.unsafe(driftRepairStatement());
+      const secondPass = await repairIssuesLastActivityDrift(sql, { batchSize: 1 });
+      expect(secondPass.repaired).toBe(0);
       expect((await columnAt(sql, ISSUE_B)).getTime()).toBe(repaired.getTime());
       expect(await divergences(sql)).toEqual([]);
     },
