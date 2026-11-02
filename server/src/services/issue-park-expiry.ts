@@ -113,6 +113,25 @@ export const ISSUE_PARK_EXPIRED_WAKE_REASON = "issue_park_expired";
  *    no unresolved blocker is drained to `todo` by the stranded-blocked reconciler — after
  *    which this sweep covers it on `todo`. Waking the assignee of a genuinely blocked row
  *    on a timer is the poll this module exists to avoid being.
+ *
+ *    PEN-5291: that drain is CONDITIONAL, and the sentence above read as unconditional is
+ *    what turned correct behaviour into a filed high-priority defect.
+ *    `listBlockedIssueAutoResumeSuppressions` keeps a row `blocked` despite zero unresolved
+ *    blockers for a pending interaction or approval, a latest agent comment awaiting user
+ *    input, an executive hold, a workspace preflight failure, an active recovery action, a
+ *    live monitor gate, a convergence stall, or a declared external wait. Such a row gets
+ *    NEITHER the drain NOR this sweep, so its park lapses having fired nothing — by design,
+ *    not by breakage.
+ *
+ *    That is not a dark row, which is the part worth keeping: what it waits on is a human
+ *    decision, and that decision carries its own wake — answering an interaction
+ *    (`continuationPolicy: wake_assignee`) or deciding an approval (`requesterWakeActorType`)
+ *    wakes the assignee directly. A timer wake would add nothing a human answer does not.
+ *
+ *    Measured 2026-11-02: 5 such rows, each behind an unanswered card 0.6-7.3 d old, while
+ *    the reconciler was demonstrably live — it flipped PEN-5217 at 13:15:27Z the same day.
+ *    So do NOT infer from an undrained row that the reconciler is wedged; read
+ *    `issue.stranded_blocked_reconciled` in `activity_log` before concluding that.
  */
 export const ISSUE_PARK_EXPIRY_WAKE_STATUSES = [
   "backlog",
