@@ -158,8 +158,9 @@ future merger is not a wake.** Three lessons, in the order they cost something:
   stale.** Seven of the eleven carried the literal; the other four did not —
   row 3b's own cells, the *"Rows 3a and 3b are not the same authority"*
   blockquote, the `PEN-5230` tree-identification note under the route matrix
-  (which then ended *"at the time of writing"*; it says `Shipped` now), and the
-  `Regression tests` bullet beginning *"On `master` today"*.
+  (which then ended *"at the time of writing"*; it is now the closing paragraph
+  of [The withheld-is-not-absent signal](#the-withheld-is-not-absent-signal-pen-5230)),
+  and the `Regression tests` bullet beginning *"On `master` today"*.
 - ⛔ **Naming the sites in a table did not fix that either.** The table listed
   ten; Ally found the eleventh — the `Regression tests` bullet — on review. An
   enumeration maintained by hand has the same failure mode as the grep it was
@@ -237,10 +238,8 @@ hold the implication**, with the subject in the same company:
 | `GET /api/companies/:id/agents` | self | **`{}`** | **populated, secrets masked** | not emitted |
 | `GET /api/companies/:id/agents` | peer | `{}` | unchanged | `withheldFields` + `withheldByAction` |
 
-The last column is emitted on the restricted arm **only**, so its absence is
-itself a signal: a response with no `withheldFields` had nothing withheld by
-this gate. Read it that way rather than as "this build predates the marker" —
-for that question, check the tree (below), not the response.
+The last column is the `PEN-5230` signal, described in full below the next two
+paragraphs.
 
 The axis is **(viewer × subject × route)**, not any one of the three. The
 detail route asks the per-subject question (`canReadSensitiveDetail = isSelf ?
@@ -260,21 +259,59 @@ Note also that the strip is **narrow**: `budgetMonthlyCents` and
 `spentMonthlyCents` pass through the restricted projection untouched. Whatever
 the peer rule is for, it is not a general "peer-sensitive data" rule.
 
-> **Shipped — `PEN-5230` (`Blockcast/paperclip#3241`), merged
-> `2026-11-02T09:28:08Z`.** The right-hand column above is what it added:
-> `withheldFields: ["adapterConfig", "runtimeConfig"]` and `withheldByAction:
-> "agent_config:read"` beside the withheld objects on both **peer** rows, so a
-> `{}` that means *withheld* is distinguishable from a `{}` that is the stored
-> value. Before it the two were byte-identical on the wire, which is why older
-> notes in this family tell a reader to run an own-id read as a positive
-> control; that control is no longer what establishes the distinction, though
-> it remains a fair check that a projection ran at all. **The config columns
-> are unchanged by it:** no config byte widens, and both markers are module
-> constants describing the *reader*, not the subject — they vary with who is
-> asking, never with whom they ask about. Check for
-> `WITHHELD_AGENT_CONFIG_FIELDS` in `server/src/routes/agents.ts`; it is
-> present on `master`, so its absence now means a stale tree rather than a tree
-> before the signal.
+### The withheld-is-not-absent signal (`PEN-5230`)
+
+`{}` is a legal **stored** value for both columns, so every `{}` in the table
+above used to be ambiguous: a reader could not tell *"this agent has no runtime
+config"* from *"you are not entitled to see it"*, and nothing on the response
+said a projection had run at all. That was misread at least twice, once by the
+`Ceo` seat, which is why `PEN-5228` had to tell its readers to run an own-id
+read as a positive control. A withhold that costs every reader a control
+experiment has a recurring bill.
+
+Shipped in `Blockcast/paperclip#3241`, merged `2026-11-02T09:28:08Z`. Every
+response that reaches `redactForRestrictedAgentView` — i.e. every `{}` in the
+**peer** rows above, on **both** routes — now carries:
+
+| Field | Value | Is a fact about |
+| --- | --- | --- |
+| `withheldFields` | `["adapterConfig", "runtimeConfig"]`, always both | the projection |
+| `withheldByAction` | `"agent_config:read"` | the **reader**'s missing entitlement |
+
+Both are module constants (`WITHHELD_AGENT_CONFIG_FIELDS` /
+`WITHHELD_AGENT_CONFIG_ACTION`, `routes/agents.ts`), never computed from the
+stored value, and both are declared optional on the shared `Agent` interface
+(`packages/shared/src/types/agent.ts`). They are emitted on the restricted arm
+**only**, so their absence beside a `{}` is itself the signal that the `{}` is
+the real stored value.
+
+**No config byte widened.** `withheldFields` names both columns
+unconditionally rather than only the populated ones, and `withheldByAction`
+names a gate the reader lacks, so the pair discloses **zero bits** about the
+subject — which is what makes the signal disclosure-neutral rather than a
+one-bit widening.
+
+> ⛔ **Standing condition on that neutrality — do not "improve" this.** Filtering
+> `withheldFields` to the columns that are actually populated, or adding a
+> `hasAdapterConfig` / `hasRuntimeConfig` presence bit beside it, turns a
+> constant into a per-subject oracle. The list route returns one row per seat,
+> so a single call would then hand back a company-wide map of which seats carry
+> a heartbeat override — the same shape as the `access.grants` disclosure on
+> `PEN-5232`, in the same projection, and a widening of exactly the peer read
+> `PEN-5228` ruled should stay closed. The `Ceo`'s approval of these markers is
+> conditioned on their staying constant; it does not carry to a subject-varying
+> successor.
+
+This is the idiom the codebase already applies to strictly more sensitive
+material — `hasWorkspaceRuntimeConfig` beside the withheld blob for
+`workspace_runtime:read` (`PEN-3206` §2), and `withheldFields` from
+`withholdAgentConfigKeys` on the approval card. Until `#3241` the agents route
+was the weaker-signalling projection guarding the lesser secret.
+
+To tell which **tree** you are on, rather than what a response means, check for
+`WITHHELD_AGENT_CONFIG_FIELDS` in `server/src/routes/agents.ts`; it is present
+on `master`, so its absence now means a stale checkout rather than a tree
+predating the signal.
 
 ### Archaeology
 
