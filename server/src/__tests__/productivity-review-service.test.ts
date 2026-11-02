@@ -1318,6 +1318,156 @@ describeEmbeddedPostgres("productivity review service", () => {
       });
     });
 
+    // BLO-51422. In the clean post-BLO-46732 window 8 of 8 `high_churn` reviews
+    // closed "productive": a fresh attributed PR, both streaks at 0, every run
+    // `advanced` — the burst came from webhook/review-loop/human wakes, not a
+    // loop. Each cell below differs from the suppressed BLO-50158 shape in
+    // exactly one conjunct, so reverting any single conjunct turns one red.
+    describe("high-churn suppression by a progress burst (BLO-51422)", () => {
+      const now = new Date("2026-04-30T12:00:00.000Z");
+
+      // 10 commented, `advanced` runs inside the hour: `runCountLastHour` hits
+      // `highChurnHourly` (10) and nothing else fires.
+      async function churn(seeded: Awaited<ReturnType<typeof seedAssignedIssue>>, at = now) {
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 10,
+          now: at,
+          withRunComments: true,
+        });
+      }
+      const freshMergedPr = () =>
+        seedIssueWithPullRequest({ prUpdatedAt: new Date(now.getTime() - 10 * 60 * 1000), status: "merged" });
+      const reconcile = (companyId: string) =>
+        productivityReviewService(db).reconcileProductivityReviews({ now, companyId });
+      async function expectHighChurn(companyId: string) {
+        const result = await reconcile(companyId);
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(companyId);
+        expect(review?.description).toContain("Primary trigger: `high_churn`");
+      }
+
+      it("does not generate a review for the BLO-50158 shape", async () => {
+        const seeded = await freshMergedPr();
+        await churn(seeded);
+        const result = await reconcile(seeded.companyId);
+        expect(result.created).toBe(0);
+        expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+      });
+
+      it("still fires with the same run count and no PR", async () => {
+        const seeded = await seedAssignedIssue();
+        await churn(seeded);
+        await expectHighChurn(seeded.companyId);
+      });
+
+      it("still fires once the PR is past the freshness window", async () => {
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 30 * 60 * 60 * 1000),
+          status: "merged",
+        });
+        await churn(seeded);
+        await expectHighChurn(seeded.companyId);
+      });
+
+      // Most recent terminal run executed a turn and left no comment.
+      it("still fires when the no-comment streak is 1", async () => {
+        const seeded = await freshMergedPr();
+        await churn(seeded, new Date(now.getTime() - 60 * 1000));
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 1,
+          now,
+        });
+        await expectHighChurn(seeded.companyId);
+      });
+
+      // Most recent terminal run never got a model turn.
+      it("still fires when the runtime-failure streak is 1", async () => {
+        const seeded = await freshMergedPr();
+        await churn(seeded, new Date(now.getTime() - 60 * 1000));
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 1,
+          now,
+          status: "failed",
+          livenessState: "failed",
+          usageJson: null,
+          logBytes: 0,
+        });
+        await expectHighChurn(seeded.companyId);
+      });
+
+      it("still fires when one sampled run is not `advanced`", async () => {
+        const seeded = await freshMergedPr();
+        await churn(seeded, new Date(now.getTime() - 60 * 1000));
+        await insertRuns({
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          issueId: seeded.issueId,
+          count: 1,
+          now,
+          withRunComments: true,
+          livenessState: "needs_followup",
+        });
+        await expectHighChurn(seeded.companyId);
+      });
+
+      // The guard sits BEFORE `choosePrimaryTrigger`. A post-hoc `return null`
+      // on `trigger === "high_churn"` would also drop this co-fired runaway run,
+      // because `high_churn` outranks it in the ladder. Churn here is the
+      // comment arm (10 comments from the one live run): fresh dispatches would
+      // re-anchor the episode and keep `runaway_execution` from firing at all.
+      it("keeps a co-fired runaway_execution", async () => {
+        const startedAt = new Date(now.getTime() - 13 * 60 * 60 * 1000);
+        const seeded = await seedIssueWithPullRequest({
+          prUpdatedAt: new Date(now.getTime() - 10 * 60 * 1000),
+          status: "merged",
+          issue: { status: "in_progress", startedAt, monitorNextCheckAt: null, monitorLastTriggeredAt: null },
+        });
+        const runId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId: seeded.companyId,
+          agentId: seeded.coderId,
+          status: "running",
+          invocationSource: "assignment",
+          triggerDetail: "system",
+          startedAt,
+          lastOutputAt: new Date(now.getTime() - 60 * 1000),
+          contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+          livenessState: "advanced",
+          nextAction: null,
+          createdAt: startedAt,
+          updatedAt: startedAt,
+        });
+        await db.insert(issueComments).values(
+          Array.from({ length: 10 }, (_, index) => {
+            const at = new Date(now.getTime() - (index + 1) * 60 * 1000);
+            return {
+              companyId: seeded.companyId,
+              issueId: seeded.issueId,
+              authorAgentId: seeded.coderId,
+              createdByRunId: runId,
+              body: `Progress update ${index}`,
+              createdAt: at,
+              updatedAt: at,
+            };
+          }),
+        );
+        const result = await reconcile(seeded.companyId);
+        expect(result.created).toBe(1);
+        const [review] = await listProductivityReviews(seeded.companyId);
+        expect(review?.description).toContain("Primary trigger: `runaway_execution`");
+      });
+    });
+
     describe("a fresh assignee-filed linked issue (A2)", () => {
       async function seedLinkedIssue(opts: {
         companyId: string;
