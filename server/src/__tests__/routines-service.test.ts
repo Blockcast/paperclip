@@ -4568,7 +4568,10 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       const blockedRun = await readRun(run.id);
       expect(blockedRun?.status).toBe("failed");
       expect(blockedRun?.failureReason).toBe("Execution issue moved to blocked");
-      expect((await readTrigger(trigger.id))?.lastResult).toBe("Execution failed");
+      // Not "Execution failed": the run row records blocked as failed, but the
+      // trigger is the carrier-health surface and a dependency wait is not a
+      // failed firing.
+      expect((await readTrigger(trigger.id))?.lastResult).toBe("Execution issue blocked");
     });
 
     it("leaves a newer fire's result on the trigger when an older issue closes late", async () => {
@@ -4605,6 +4608,50 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       const recoveredRun = await readRun(runId);
       expect(recoveredRun?.status).toBe("completed");
       expect(recoveredRun?.failureReason).toBeNull();
+    });
+
+    // Ally review on #3276: the trigger-level guard above does not cover the
+    // ROUTINE row. A newer fire can arrive on a path this trigger never sees --
+    // a manual run carries `triggerId: null` yet still advances
+    // `routines.lastTriggeredAt` -- so a correction that went through
+    // `updateRoutineTouchedState` would rewind the routine to the older fire
+    // and make a live routine read as if it had not run since. Same defect,
+    // one table over.
+    it("does not rewind the routine's lastTriggeredAt when a newer untriggered run exists", async () => {
+      const { companyId, routine, svc, trigger, executionIssue } = await abortDispatchWithTrigger();
+      const runId = executionIssue.originRunId!;
+      const abortedRun = await readRun(runId);
+
+      const readRoutine = () =>
+        db.select().from(routines).where(eq(routines.id, routine.id)).then((rows) => rows[0] ?? null);
+
+      // The newer fire is seeded rather than dispatched: this fixture's wakeup
+      // hook aborts EVERY dispatch, so a second `runRoutine` would abort too
+      // and never advance anything. What matters is the shape -- a manual run
+      // carries `triggerId: null`, and the dispatch path still advances
+      // `routines.lastTriggeredAt` for it.
+      const newerTriggeredAt = new Date(abortedRun!.triggeredAt.getTime() + 60 * 60 * 1000);
+      await db.insert(routineRuns).values({
+        id: randomUUID(),
+        companyId,
+        routineId: routine.id,
+        triggerId: null,
+        source: "manual",
+        status: "issue_created",
+        triggeredAt: newerTriggeredAt,
+      });
+      await db.update(routines).set({ lastTriggeredAt: newerTriggeredAt })
+        .where(eq(routines.id, routine.id));
+
+      await db.update(issues).set({ status: "done" }).where(eq(issues.id, executionIssue.id));
+      await svc.syncRunStatusForIssue(executionIssue.id);
+
+      // The routine must still report the manual fire as its latest.
+      expect((await readRoutine())?.lastTriggeredAt).toEqual(newerTriggeredAt);
+      // The trigger's OWN newest fire is still the aborted one, so its
+      // `lastResult` is corrected -- the two guards are independent.
+      expect((await readTrigger(trigger.id))?.lastResult).toBe("Execution issue completed");
+      expect((await readRun(runId))?.status).toBe("completed");
     });
   });
 });
