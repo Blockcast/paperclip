@@ -758,6 +758,35 @@ export interface IssueExecutionPolicy {
   productivityReviewDisabled?: boolean;
 }
 
+/**
+ * Does this execution policy opt its issue out of automated productivity review?
+ *
+ * BLO-39945 / PEN-5295. THE single derivation of the opt-out, honouring both homes:
+ * the durable top-level `IssueExecutionPolicy.productivityReviewDisabled` and the
+ * older monitor-scoped `IssueExecutionMonitorPolicy.productivityReviewDisabled`,
+ * which dies with the monitor it hangs off. Callers must not re-derive either
+ * expression inline — `productivity-review.ts` reads it to decide whether to file a
+ * review, and `issueListSelect` mirrors it in SQL so a list consumer can ask the same
+ * question without an N+1 `getById` fan-out. Two copies of a predicate is how one of
+ * them silently loses an arm.
+ *
+ * Deliberately `=== true`, not truthy: the SQL mirror compares against `'true'::jsonb`,
+ * so a stored `"true"` string or `1` reads `false` on both surfaces rather than
+ * disagreeing across them.
+ *
+ * Accepts `unknown` because its two callers hold the policy at different types (a
+ * parsed `IssueExecutionPolicy` and a raw jsonb column), and a narrowing cast at each
+ * call site is exactly the per-site divergence this function exists to remove.
+ */
+export function isProductivityReviewOptedOut(policy: unknown): boolean {
+  if (!policy || typeof policy !== "object" || Array.isArray(policy)) return false;
+  const record = policy as Record<string, unknown>;
+  if (record.productivityReviewDisabled === true) return true;
+  const monitor = record.monitor;
+  if (!monitor || typeof monitor !== "object" || Array.isArray(monitor)) return false;
+  return (monitor as Record<string, unknown>).productivityReviewDisabled === true;
+}
+
 export interface IssueExecutionMonitorState {
   status: IssueExecutionMonitorStateStatus;
   nextCheckAt: string | null;
@@ -933,6 +962,35 @@ export interface Issue {
   scheduledRetryAt?: Date | null;
   scheduledRetryReason?: string | null;
   scheduledRetryAttempt?: number | null;
+  /**
+   * PEN-5295: the effective productivity-review opt-out, projected onto every issue
+   * **list** row as a flat boolean — `true` when this row is deliberately stood down.
+   *
+   * ## Present on every list row, never absent
+   *
+   * Explicitly `false` when the row carries no opt-out, for the BLO-34421 key-presence
+   * reason the four attendance fields above already honour. Absent-vs-false is the whole
+   * defect this closes, and it fails in the ALARMING direction: a sweep whose attendance
+   * predicate is `activeRun | monitorNextCheckAt | scheduledRetryAt | parkedUntil` scores a
+   * ratified hold — monitor retired on purpose, because polling cannot move a human gate —
+   * identically to an abandoned row. Measured 2026-11-02 over 221 non-terminal rows: the
+   * key was absent 221/221, so a flat read returned `false` everywhere and every deliberate
+   * stand-down published as a stall. Gate on key presence (`has(...)`) before trusting a
+   * `false` from any deployment, and treat absent as "this server predates PEN-5295", not
+   * as "not stood down".
+   *
+   * ## Scope: this is a LIST-row projection
+   *
+   * `executionPolicy` is absent from list rows by design (unbounded, and whole-replaced on
+   * PATCH — see `issueListSelect`), which is what made the flag unreachable there. The
+   * single-issue read carries the full policy instead and does NOT carry this key; derive it
+   * there with {@link isProductivityReviewOptedOut}, the one predicate the SQL mirrors.
+   *
+   * ⚠️ `true` means review is suppressed, NOT that the row is attended. It is an
+   * independent axis from the attendance fields: it says a human deliberately stood this row
+   * down, which is the distinction the predicate above cannot otherwise draw.
+   */
+  productivityReviewDisabled?: boolean;
   executionWorkspaceId: string | null;
   executionWorkspacePreference: string | null;
   executionWorkspaceSettings: IssueExecutionWorkspaceSettings | null;

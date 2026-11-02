@@ -1,7 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { and, asc, desc, eq, gt, gte, inArray, isNotNull, isNull, lt, lte, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db, DbTransaction } from "@paperclipai/db";
-import { clampIssueRequestDepth, ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS, NON_HUMAN_USER_SENTINEL_IDS } from "@paperclipai/shared";
+import {
+  clampIssueRequestDepth,
+  isProductivityReviewOptedOut as isPolicyProductivityReviewOptedOut,
+  ISSUE_PRODUCTIVITY_REVIEW_TRIGGERS,
+  NON_HUMAN_USER_SENTINEL_IDS,
+} from "@paperclipai/shared";
 import type { IssueProductivityReviewTrigger } from "@paperclipai/shared";
 import {
   activityLog,
@@ -5637,14 +5642,11 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     return rows[0]?.userId ?? null;
   }
 
+  // PEN-5295: the body of this moved to `@paperclipai/shared` so the issue-list SQL
+  // projection can mirror ONE predicate instead of re-deriving the opt-out. Kept as a
+  // named local so the `IssueRow`-shaped call sites below read unchanged.
   function isProductivityReviewOptedOut(issue: IssueRow) {
-    const policy = issue.executionPolicy;
-    if (!policy || typeof policy !== "object" || Array.isArray(policy)) return false;
-    // BLO-39945: top-level form, reachable without arming a monitor.
-    if ((policy as Record<string, unknown>).productivityReviewDisabled === true) return true;
-    const monitor = (policy as Record<string, unknown>).monitor;
-    if (!monitor || typeof monitor !== "object" || Array.isArray(monitor)) return false;
-    return (monitor as Record<string, unknown>).productivityReviewDisabled === true;
+    return isPolicyProductivityReviewOptedOut(issue.executionPolicy);
   }
 
   function buildReviewMarkdown(evidence: ProductivityReviewEvidence, prefix: string) {
