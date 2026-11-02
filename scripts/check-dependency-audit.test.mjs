@@ -12,11 +12,13 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
   DEFAULT_FAIL_SEVERITIES,
+  SEVERITY_ORDER,
   advisoryKey,
   evaluateAudit,
   formatReport,
@@ -297,4 +299,55 @@ test("an expired entry whose advisory has fallen BELOW the fail threshold does n
   });
   assert.deepEqual(violations, [], "a below-threshold advisory must not fail on expiry");
   assert.deepEqual(notices, [], "it is baselined, so it is not a below-threshold notice either");
+});
+
+test("a typo in failSeverities is refused, and cannot invert the threshold into a fail-open", () => {
+  // Ally's measured case on #3290: `{failSeverities:["hgih"]}` validated clean
+  // and a live HIGH advisory with no entry produced ZERO violations. The cause
+  // is that severityRank fails CLOSED for advisories (unknown ranks above
+  // critical) — applied to the threshold, that same rule means nothing can ever
+  // meet it. validateBaseline now refuses the typo at the PR gate.
+  const problems = validateBaseline(baselineOf([], { failSeverities: ["hgih"] }));
+  assert.ok(problems.some((p) => /failSeverities contains "hgih"/.test(p)));
+
+  assert.ok(
+    validateBaseline(baselineOf([], { failSeverities: [] }))
+      .some((p) => /non-empty array/.test(p)),
+  );
+  assert.ok(
+    validateBaseline(baselineOf([], { failSeverities: "moderate" }))
+      .some((p) => /non-empty array/.test(p)),
+  );
+  // Omitted is legal — the default applies.
+  assert.deepEqual(validateBaseline({ version: 1, entries: [] }), []);
+});
+
+test("failSeverities is a SET: reordering it cannot raise the threshold", () => {
+  // Taking element [0] let `["critical","moderate"]` silently gate at critical
+  // while reading as though moderate were still covered. The min is
+  // order-independent, so both spellings gate identically.
+  const high = auditDoc(advisory({ id: 13, ghsa: "GHSA-hi01-aaaa-bbbb", pkg: "left-pad", severity: "high" }));
+  const moderate = auditDoc(advisory({ id: 14, ghsa: "GHSA-mo01-aaaa-bbbb", pkg: "left-pad" }));
+
+  for (const order of [["moderate", "high", "critical"], ["critical", "moderate", "high"]]) {
+    const baseline = baselineOf([], { failSeverities: order });
+    assert.equal(evaluateAudit({ audit: high, baseline, now: NOW }).violations.length, 1, `high, order ${order}`);
+    assert.equal(evaluateAudit({ audit: moderate, baseline, now: NOW }).violations.length, 1, `moderate, order ${order}`);
+  }
+
+  // A genuinely raised threshold still works: gating only at critical lets a
+  // moderate through as a notice, and that must stay true.
+  const criticalOnly = baselineOf([], { failSeverities: ["critical"] });
+  assert.deepEqual(evaluateAudit({ audit: moderate, baseline: criticalOnly, now: NOW }).violations, []);
+  assert.equal(evaluateAudit({ audit: high, baseline: criticalOnly, now: NOW }).violations.length, 0);
+});
+
+test("the checked-in baseline's failSeverities is itself valid", () => {
+  // The whole point of validating this knob is that the REAL file is checked on
+  // every PR, so a typo cannot reach the scheduled lane.
+  const baseline = JSON.parse(
+    readFileSync(new URL("./dependency-audit-baseline.json", import.meta.url), "utf8"),
+  );
+  assert.deepEqual(validateBaseline(baseline), []);
+  assert.ok(baseline.failSeverities.every((s) => SEVERITY_ORDER.includes(s)));
 });

@@ -70,8 +70,36 @@ test("the TTL outlives the daily cadence so a persistent advisory deduplicates",
 });
 
 test("an unreadable report still produces a deliverable alert", () => {
-  // Losing the detail must not lose the page.
+  // Losing the detail must not lose the page -- it only changes which alert.
   const alert = buildAlert({ ...base, violations: null });
   assert.match(alert.annotations.description, /see the run log/);
-  assert.equal(alert.labels.alertname, "DependencyAdvisoryUnaccounted");
+  assert.equal(alert.labels.alertname, "DependencyAuditIncomplete");
+  assert.match(alert.annotations.runbook_url, /runbooks\/dependency-audit\.md$/);
+});
+
+test("a lane that could not COMPLETE gets a different alertname than one that found an advisory", () => {
+  // The two failures route to different people: an unaccounted advisory is a
+  // triage task, a lane that could not run at all (registry unreachable, pnpm
+  // error document, malformed baseline, unrecognized audit shape) is an infra
+  // task. One alertname for both sent the on-call hunting for an advisory that
+  // was never reported. Raised by Ally on #3290.
+  const found = buildAlert({ ...base, violations: ["[unbaselined] NEW advisory GHSA-x"] });
+  const incomplete = buildAlert({ ...base, violations: null });
+
+  assert.equal(found.labels.alertname, "DependencyAdvisoryUnaccounted");
+  assert.equal(incomplete.labels.alertname, "DependencyAuditIncomplete");
+  assert.notEqual(found.labels.alertname, incomplete.labels.alertname);
+
+  assert.match(found.annotations.summary, /dependency advisory with no triage entry/);
+  assert.match(incomplete.annotations.summary, /could not complete/);
+  assert.doesNotMatch(
+    incomplete.annotations.summary,
+    /advisory with no triage entry/,
+    "an infra failure must not be described as an advisory finding",
+  );
+
+  // An empty array is the same condition as null: extractViolations found none.
+  assert.equal(buildAlert({ ...base, violations: [] }).labels.alertname, "DependencyAuditIncomplete");
+  // Both still deduplicate on the same service label.
+  assert.equal(found.labels.service, incomplete.labels.service);
 });

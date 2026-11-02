@@ -107,8 +107,14 @@ node ./scripts/check-dependency-audit.mjs ; echo "exit=$?"
 ## Known limitation: not watched by `scheduled-guard-liveness.yml`
 
 A scheduled guard that silently stops running emits nothing anywhere (PEN-3281), and this one is
-not yet in `WATCHED_GUARDS`. That registry requires a threshold derived from the guard's **own**
-measured completion-gap distribution, and says so emphatically — registering this workflow with
-an invented number would reproduce the PEN-3379 defect inside a new guard. It should be added
-once a few weeks of completions exist to derive one from. Until then, a silent stop of this lane
-is undetected.
+registered in `EXEMPT_SCHEDULED_WORKFLOWS` rather than `WATCHED_GUARDS`. That registry requires a
+threshold derived from the guard's **own** measured completion-gap distribution and says so
+emphatically; a workflow with no completion history has none to derive, and inventing a number
+would reproduce the PEN-3379 defect inside a new guard.
+
+**This exemption is not like the other three.** They are exempt because they are *not guards* (or,
+for `scheduled-guard-liveness.yml` itself, because a stopped job cannot report on itself). This one
+*is* a guard, so **a silent stop of this lane is currently undetected** — a real, temporary coverage
+gap. It is owned by **PEN-5304**, which carries the measurement method and the one honest
+alternative outcome: that a once-daily guard may not admit a sound bar from an hourly detector at
+all, in which case the exemption stands on that finding rather than on "no history yet".
