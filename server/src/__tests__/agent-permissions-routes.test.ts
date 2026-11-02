@@ -2181,6 +2181,98 @@ describe.sequential("agent permission routes", () => {
       }));
     });
 
+    it("keeps the COMPANY-WIDE question on the config-revision routes (PEN-5231)", async () => {
+      // PEN-5228 ruling §B option 1. These two routes name ONE agent but must
+      // still ask the company question, which is the opposite of what the rest
+      // of this PR does — so it is pinned rather than left to be "tidied up".
+      //
+      // Reason: naming the subject makes `allow_self` reachable, and config
+      // HISTORY is the one object class here a grantless agent could not
+      // already read (`GET /api/agents/:id` returns the current config but
+      // never a revision). Subject-scoping these would be a genuine 403 -> 200
+      // widening, unlike the inert one on `/configuration`. Keeping the
+      // company resource loses nothing: it is exactly the question the suggest
+      // tier is refused.
+      const peerAgentId = "55555555-5555-4555-8555-555555555555";
+      mockAgentService.getById.mockImplementation(async (id: string) => (
+        id === peerAgentId ? { ...baseAgent, id: peerAgentId } : null
+      ));
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        reason: "deny_scope",
+        explanation:
+          "Permission agents:suggest-changes reads the configuration of one named agent.",
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+
+      const list = await request(app).get(`/api/agents/${peerAgentId}/config-revisions`);
+      expect(list.status).toBe(403);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "company", companyId },
+      }));
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+      }));
+
+      mockAccessService.decide.mockClear();
+
+      const one = await request(app).get(
+        `/api/agents/${peerAgentId}/config-revisions/66666666-6666-4666-8666-666666666666`,
+      );
+      expect(one.status).toBe(403);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "company", companyId },
+      }));
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+      }));
+    });
+
+    it("names the subject on /skills so the suggest tier keeps its diff-prep read (PEN-5231)", async () => {
+      // `reflection-coach` is the only principal granted `agents:suggest-changes`
+      // in this repo's defaults (`BUILT_IN_AGENT_DEFAULT_GRANTS`), and step 1 of
+      // its bundled skill calls GET /api/agents/<targetAgentId>/skills on the
+      // agent it is about to diff. Putting this route back on a `company`
+      // resource would 403 that shipped workflow on its first request, so the
+      // subject stays named here even though the revision routes above do not.
+      const peerAgentId = "77777777-7777-4777-8777-777777777777";
+      mockAgentService.getById.mockImplementation(async (id: string) => (
+        id === peerAgentId ? { ...baseAgent, id: peerAgentId } : null
+      ));
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by grant agents:suggest-changes.",
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+
+      const res = await request(app).get(`/api/agents/${peerAgentId}/skills`);
+
+      expect(res.status).not.toBe(403);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+      }));
+    });
+
     it("keeps the COMPANY-WIDE question on the bulk configuration list (PEN-5231)", async () => {
       // The counterpart to the case above, and the reason the narrowing bites:
       // this route answers with every agent's configuration in one response,

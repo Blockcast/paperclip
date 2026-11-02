@@ -997,11 +997,25 @@ export function agentRoutes(
     // suggest tier is admitted against a named subject and refused against a
     // `company` resource, because its write is consent-gated and target-key
     // bound (see `decideWithAgentConfigReadGrant`). Omitting the subject on a
-    // single-agent route therefore silently buys the caller the WIDER
-    // company-wide test, so omit it only on genuinely company-wide routes.
-    // It also restores `allow_self`, which is unreachable on a `company`
-    // resource because that branch tests
-    // `resource.type === "agent" && resource.agentId === actorAgentId`.
+    // single-agent route therefore buys the caller the WIDER company-wide
+    // test, which is the stricter answer for the suggest tier and the same
+    // answer for `agents:configure`.
+    //
+    // Naming the subject also makes `allow_self` reachable — it is structurally
+    // unreachable on a `company` resource, because that branch tests
+    // `resource.type === "agent" && resource.agentId === actorAgentId`. That is
+    // a read WIDENING for a grantless actor on its own row, so it is a decision
+    // per route, not a mechanical substitution:
+    //
+    //   - `/agents/:id`, `/agents/:id/configuration`, `/agents/:id/skills`
+    //     pass the subject. Self-disclosure is inert (the current config is
+    //     already returned by `GET /api/agents/:id` through
+    //     `redactAgentSecrets`; the skill list is already in the actor's own
+    //     prompt), and `/skills` additionally has a live suggest-tier caller.
+    //   - the two `/config-revisions` routes deliberately do NOT. Config
+    //     history is not reachable from any other self route, so naming the
+    //     subject there would be a genuine widening, and `redactConfigRevision`
+    //     spreads rather than enumerates. See those call sites.
     assertCompanyAccess(req, companyId);
     if (req.actor.type === "agent") {
       const decision = await access.decide({
@@ -2573,6 +2587,18 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
+    // SUBJECT-scoped, and this one has a concrete diff-prep reason the
+    // revision routes above do not (PEN-5231, PEN-5228 ruling §B).
+    //
+    // `reflection-coach` is the ONLY principal granted `agents:suggest-changes`
+    // anywhere in this repo's defaults (`BUILT_IN_AGENT_DEFAULT_GRANTS`), and
+    // step 1 of its bundled skill calls exactly this route on the agent it is
+    // about to propose a diff for. Putting this back on a `company` resource
+    // would hand that shipped workflow a 403 on its first request — i.e. it
+    // would break the one caller the suggest tier exists to serve.
+    //
+    // The `allow_self` consequence here is inert: the material is the actor's
+    // own assigned skill list, which it already carries in its own prompt.
     await assertCanReadConfigurations(req, agent.companyId, agent.id);
 
     const adapter = findActiveServerAdapter(agent.adapterType);
@@ -3116,7 +3142,26 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId, agent.id);
+    // Deliberately COMPANY-scoped, unlike its `/configuration` sibling one
+    // route up (PEN-5231, per the PEN-5228 ruling §B option 1).
+    //
+    // Naming the subject here would make `allow_self` reachable, and config
+    // HISTORY is the one object class on these routes that a grantless agent
+    // genuinely could not already read: `GET /api/agents/:id` returns the
+    // current config under every projection but never a revision, so this
+    // would be a real 403 -> 200 widening rather than the inert one on
+    // `/configuration`. Keeping the company resource preserves the whole
+    // narrowing — it is exactly the question the suggest tier is now refused
+    // (`deny_scope`) — while leaving grantless self at 403 as before.
+    //
+    // Second reason, and the one that outlives this row: `redactConfigRevision`
+    // SPREADS `...revision` and masks only `beforeConfig` / `afterConfig`, so
+    // every other column ships verbatim and any future column on
+    // `agent_config_revisions` ships to this caller set BY DEFAULT. That is the
+    // opposite polarity to `redactAgentConfiguration`, which enumerates. Do not
+    // widen the readership of a spread-based projection without changing it to
+    // an enumerated one first.
+    await assertCanReadConfigurations(req, agent.companyId);
     const revisions = await svc.listConfigRevisions(id);
     res.json(revisions.map((revision) => redactConfigRevision(revision)));
   });
@@ -3129,7 +3174,9 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId, agent.id);
+    // COMPANY-scoped for the same reason as the list route above — same object
+    // class, same spread-based projection, same decision (PEN-5231).
+    await assertCanReadConfigurations(req, agent.companyId);
     const revision = await svc.getConfigRevision(id, revisionId);
     if (!revision) {
       res.status(404).json({ error: "Revision not found" });
