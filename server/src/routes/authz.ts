@@ -195,6 +195,15 @@ type AgentConfigReadDecider = {
  * that embeds a hire's config, and the issue→approvals projection. PEN-2777 was
  * exactly a copy of this gate existing on one path and not its sibling; a
  * single definition is what keeps the next reader from reopening that.
+ *
+ * Deliberately COMPANY-scoped, and the resource type is pinned in
+ * `AgentConfigReadDecider` above so a caller cannot quietly narrow it
+ * (PEN-5231). Its callers project config for whichever agents a card or an
+ * issue happens to reference, not for one subject the caller named, so the
+ * company resource is the question actually being asked. The consequence is
+ * intended: a holder of `agents:suggest-changes` alone is refused here and
+ * sees `includeAgentConfig: false`, because that tier's read is admitted only
+ * against a named diff subject. `agents:configure` is unaffected.
  */
 export async function actorCanReadAgentConfig(
   req: Request,

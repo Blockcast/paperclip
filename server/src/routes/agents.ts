@@ -977,7 +977,11 @@ export function agentRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
-  async function assertCanReadConfigurations(req: Request, companyId: string) {
+  async function assertCanReadConfigurations(
+    req: Request,
+    companyId: string,
+    subjectAgentId?: string | null,
+  ) {
     // Reading agent configurations, skills, and config revisions is a
     // read-only operation available to any board (human) member of the
     // company. Responses go through `redactAgentConfiguration` so secrets
@@ -987,12 +991,25 @@ export function agentRoutes(
     // For AGENT actors we keep a stricter gate: an agent must have either
     // agents:configure or agents:suggest-changes before it can inspect peer
     // agent configuration for a proposed diff.
+    //
+    // PEN-5231: pass `subjectAgentId` whenever the route names ONE agent.
+    // The two grants that reach this action are not interchangeable — the
+    // suggest tier is admitted against a named subject and refused against a
+    // `company` resource, because its write is consent-gated and target-key
+    // bound (see `decideWithAgentConfigReadGrant`). Omitting the subject on a
+    // single-agent route therefore silently buys the caller the WIDER
+    // company-wide test, so omit it only on genuinely company-wide routes.
+    // It also restores `allow_self`, which is unreachable on a `company`
+    // resource because that branch tests
+    // `resource.type === "agent" && resource.agentId === actorAgentId`.
     assertCompanyAccess(req, companyId);
     if (req.actor.type === "agent") {
       const decision = await access.decide({
         actor: req.actor,
         action: "agent_config:read",
-        resource: { type: "company", companyId },
+        resource: subjectAgentId
+          ? { type: "agent", companyId, agentId: subjectAgentId }
+          : { type: "company", companyId },
       });
       if (!decision.allowed) {
         throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
@@ -1016,6 +1033,36 @@ export function agentRoutes(
     // throwing. Board actors only need company access; agent actors must pass
     // the agent configuration read grant ladder so peer agents cannot snoop
     // each others' configurations.
+    //
+    // PEN-5231: deliberately COMPANY-scoped. Its one remaining caller is the
+    // company agent roster, which answers for every seat at once, so the
+    // company resource is the honest question there — and it is the question
+    // the suggest tier is now refused. Single-agent callers want
+    // `actorCanReadConfigurationsForAgent` below.
+    return actorCanReadAgentConfigForResource(req, companyId, null);
+  }
+
+  /**
+   * The single-subject form of the test above (PEN-5231).
+   *
+   * A holder of `agents:suggest-changes` alone passes this for a named agent
+   * and fails `actorCanReadConfigurationsForCompany`, because its write tier
+   * is bound to a consented diff against one subject. A holder of
+   * `agents:configure` passes both, unchanged.
+   */
+  async function actorCanReadConfigurationsForAgent(
+    req: Request,
+    companyId: string,
+    subjectAgentId: string,
+  ) {
+    return actorCanReadAgentConfigForResource(req, companyId, subjectAgentId);
+  }
+
+  async function actorCanReadAgentConfigForResource(
+    req: Request,
+    companyId: string,
+    subjectAgentId: string | null,
+  ) {
     try {
       assertCompanyAccess(req, companyId);
     } catch {
@@ -1025,7 +1072,9 @@ export function agentRoutes(
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:read",
-      resource: { type: "company", companyId },
+      resource: subjectAgentId
+        ? { type: "agent", companyId, agentId: subjectAgentId }
+        : { type: "company", companyId },
     });
     return decision.allowed;
   }
@@ -1117,7 +1166,7 @@ export function agentRoutes(
     }
     assertCompanyAccess(req, targetAgent.companyId);
     if (req.actor.type === "board") {
-      await assertCanReadConfigurations(req, targetAgent.companyId);
+      await assertCanReadConfigurations(req, targetAgent.companyId, targetAgent.id);
       return;
     }
     if (!req.actor.agentId) throw forbidden("Agent authentication required");
@@ -2524,7 +2573,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
+    await assertCanReadConfigurations(req, agent.companyId, agent.id);
 
     const adapter = findActiveServerAdapter(agent.adapterType);
     if (!adapter?.listSkills) {
@@ -2809,6 +2858,11 @@ export function agentRoutes(
 
   router.get("/companies/:companyId/agent-configurations", async (req, res) => {
     const companyId = req.params.companyId as string;
+    // Deliberately company-scoped (PEN-5231): this route answers with EVERY
+    // agent's configuration in one response, so there is no single subject to
+    // name and the company resource is the honest question. It is also the
+    // sharpest form of the exposure this row closes — a suggest-tier holder is
+    // now refused here (`deny_scope`) and must read a named agent instead.
     await assertCanReadConfigurations(req, companyId);
     const rows = await svc.list(companyId);
     res.json(rows.map((row) => redactAgentConfiguration(row)));
@@ -3036,7 +3090,7 @@ export function agentRoutes(
     }
     const canReadSensitiveDetail = isSelf
       ? true
-      : await actorCanReadConfigurationsForCompany(req, agent.companyId);
+      : await actorCanReadConfigurationsForAgent(req, agent.companyId, agent.id);
     if (!canReadSensitiveDetail) {
       res.json(await buildAgentDetail(agent, { restricted: true }));
       return;
@@ -3051,7 +3105,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
+    await assertCanReadConfigurations(req, agent.companyId, agent.id);
     res.json(redactAgentConfiguration(agent));
   });
 
@@ -3062,7 +3116,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
+    await assertCanReadConfigurations(req, agent.companyId, agent.id);
     const revisions = await svc.listConfigRevisions(id);
     res.json(revisions.map((revision) => redactConfigRevision(revision)));
   });
@@ -3075,7 +3129,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
+    await assertCanReadConfigurations(req, agent.companyId, agent.id);
     const revision = await svc.getConfigRevision(id, revisionId);
     if (!revision) {
       res.status(404).json({ error: "Revision not found" });
