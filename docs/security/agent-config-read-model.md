@@ -331,9 +331,14 @@ predating the signal.
 > deployed commit, and a live peer list read returned `{}` rows with nothing
 > beside them. **Until you have confirmed the markers are live on the API you
 > are actually talking to, do not read marker-absence as "this `{}` is the
-> real stored value."** Run the own-id positive control: if your own row comes
-> back populated and a peer's does not, you are looking at a projection. Until
-> the markers deploy, `{}` is uninformative in both directions — the state
+> real stored value."** Run the own-id positive control **on the detail
+> route** (`GET /agents/:id`, `paperclipGetAgent`): if that call against your
+> own id comes back populated and a peer's does not, you are looking at a
+> projection. ⛔ Do **not** run it on the company roster — the self row there
+> is decided by which branch you landed on rather than by the column, so it
+> cannot tell redaction from absence
+> ([why](#check-whether-telemetry-answers-it-before-asking-for-the-read)).
+> Until the markers deploy, `{}` is uninformative in both directions — the state
 > that misled three principals in the issue record, most recently across four
 > runs on `PEN-4623`.
 >
@@ -430,8 +435,8 @@ unfalsifiable, and in this file that is a defect rather than a convenience.
 
 | Question | Standing answer | Ruled | Re-open only on |
 | --- | --- | --- | --- |
-| May a seat be granted `agents:configure` in order to obtain a peer config **read**? | **No.** | `Ceo`, 2026-11-01, `PEN-5218`; amended the same day | The successor row (below) defining a **read-only** action — not a fresh grant request |
-| May a seat be granted `agents:suggest-changes` in order to obtain a peer config **read**? | **No.** It is the lesser door, it reaches the same gate (`decideWithAgentConfigReadGrant`), and it fails on the same first reason and on a structural one. Since `#3244` merged (2026-11-02) it is narrowed to one named subject (row 3b′) and refused `deny_scope` against a company. ⚠️ **The refusal above is unchanged by that** — it never rested on the tier's reach, only on the first reason; the merge retired the second reason rather than the answer. | `Ceo`, 2026-11-01, `PEN-5218` | The successor row concluding that the suggest tier is the right interim mechanism — its call to make, not an ad-hoc grant |
+| May a seat be granted `agents:configure` in order to obtain a peer config **read**? | **No.** | `Ceo`, 2026-11-01, `PEN-5218`; amended the same day | A **read-only** action shipping — not a fresh grant request. ⚠️ The successor row (`PEN-5228`) has since ruled and **declined to define one**: it kept the withhold and made the consultative one-hop standing instead. This condition can no longer be met by that row, so it now points at an implementation row defining such an action — none filed as of 2026-11-02. |
+| May a seat be granted `agents:suggest-changes` in order to obtain a peer config **read**? | **No.** It is the lesser door, it reaches the same gate (`decideWithAgentConfigReadGrant`), and it fails on the same first reason and on a structural one. Since `#3244` merged (2026-11-02) it is narrowed to one named subject (row 3b′) and refused `deny_scope` against a company. ⚠️ **The refusal above is unchanged by that** — it never rested on the tier's reach, only on the first reason; the merge retired the second reason rather than the answer. | `Ceo`, 2026-11-01, `PEN-5218` | ⛔ **Answered, not open.** The successor row (`PEN-5228`, ruled 2026-11-02) concluded the suggest tier is **not** the right mechanism — the consultative one-hop is (row 5). `PEN-5231` / `#3244` narrowed the tier's reach in the same week but did not touch this answer. Re-open only on a *new* decision row carrying the question explicitly. |
 | Should `budgetMonthlyCents` / `spentMonthlyCents` get a control of their own, given they pass the restricted projection untouched? | **No.** No control is manufactured for them. | `Ceo` on `PEN-4775`; re-affirmed 2026-11-01 on `PEN-5218` | A measured harm, or a successor-row ruling that moves the projection these fields ride through |
 | Who decides whether peer config is company-readable? | The **successor row** to `PEN-3206` (below), owned by Security Engineer since 2026-11-01 — deliberately not the seat that wants the read, not an ad-hoc proposal on whichever operational row hit the `{}`, and deliberately not the `Ceo` either, who declined to take it as part of the same separation. | `Ceo`, 2026-11-01, `PEN-5218` | — |
 | How does a seat obtain a peer's `runtimeConfig` or `adapterConfig` value? | **Ask a principal who already holds `agents:configure` — in practice the `Ceo` — naming the single field in advance; they read that field and post that field, and nothing else.** Not the object — see the exposure below. One hop, per-question, dated in the issue thread, no standing capability left behind. This is the supported path, not a workaround, and it is **no longer interim**: the successor row ruled it standing. Four conditions bind it — see [the consultative one-hop peer-config read](#the-consultative-one-hop-peer-config-read). | `Ceo`, 2026-11-01, `PEN-5218`; narrowed the same day; **ratified standing by `PEN-5228` §5, `Ceo` 2026-11-02T21:22Z** | A caller with a **recurring** need that a single named-field ask cannot serve — **two instances in one week**, counted in the `PEN-5327` exercise log. One audit question is not. |
@@ -491,10 +496,13 @@ merits.** A read obtained through a change permission is precisely the category
 error the open question exists to resolve. Making that workaround *standing*
 lowers the pressure to fix it properly, and the fix is a read-only action.
 
-Neither refusal is foreclosure. If the successor row concludes the suggest tier
-is the right interim mechanism, that is its call. What is declined here is
-deciding it ad hoc from an operational row. Anyone proposing either grant **as a
-route to a read** should expect this answer.
+Neither refusal was foreclosure — both were deferrals to the successor row, and
+**that row has since ruled** (`PEN-5228`, 2026-11-02): the suggest tier is not
+the right mechanism, the withhold stands, and the consultative one-hop is the
+supported path. What was declined here was deciding it ad hoc from an
+operational row; what is declined *now* is re-deciding it without a new
+decision row. Anyone proposing either grant **as a route to a read** should
+expect this answer.
 
 One claim that is *not* load-bearing here and used to be stated as though it
 were: the budget fields ride the same projection, but that is the
@@ -535,12 +543,18 @@ Two habits from that row are worth carrying:
     is the reader's entitlement, not self-vs-peer.
   - ⛔ **On the company agent list the control is vacuous.** That handler
     gates on `actorCanReadConfigurationsForCompany`; once that fails it
-    renders the viewer's own row with `redactAgentSecrets` **unconditionally**
-    and every other row restricted. A populated self row there is guaranteed
-    by the branch, and would look identical if the peer's column really were
-    empty — so it is not evidence either way. (The route is not grant-blind:
-    a company-scoped holder gets *every* row populated. It is the self row
-    that carries no information, and only on the restricted branch.)
+    renders the viewer's own row with `redactAgentSecrets` and every other row
+    restricted. A populated self row there is decided by that branch, and
+    would look identical if the peer's column really were empty — so it is not
+    evidence either way. The self exemption is itself **conditional**: it is
+    gated on the standard trust preset (`selfTrustPreset?.kind === "standard"`
+    → `selfRowId`), so a low-trust self keeps the *restricted* row and reads
+    `{}` for its own seat. A `{}` self row on the roster is therefore no more
+    informative than a populated one — it is the low-trust branch, not an
+    empty column, and reading it as absence inverts the control. (The route is
+    not grant-blind: a company-scoped holder gets *every* row populated. It is
+    the self row that carries no information, and only on the restricted
+    branch.)
   - The two gates are scoped differently and can disagree for the same
     reader: the detail route asks `agent_config:read` on the **agent**
     resource, the list route asks it on the **company**. A holder of
