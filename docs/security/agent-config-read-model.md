@@ -120,8 +120,10 @@ but it is deliberate and the suggest-tier half is tested: an agent preparing a
 consented config diff must be able to read what it is diffing. The rule to
 carry away is that **config read authority is implied by config change
 authority** — in both tiers, but each only *at the reach of that tier's own
-write*: company-wide for `agents:configure`, one named subject for
-`agents:suggest-changes`.
+write*: company-wide for `agents:configure`, and one named subject for
+`agents:suggest-changes`. **That second half is the rule, not the tree**: on
+`master` the suggest tier reads company-wide (row 3b), and it narrows to one
+subject only once `#3244` lands (row 3b′).
 
 ## What does NOT imply it
 
