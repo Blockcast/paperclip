@@ -24,6 +24,31 @@ const UUID_B = "22222222-2222-4222-8222-222222222222";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const executorEntry = path.resolve(here, "..", "cli", "isolation-reclaim-executor.ts");
 
+/**
+ * How long the spawned entrypoint gets before the watchdog kills it, and the
+ * suite budget that has to stay above it.
+ *
+ * Sized as headroom, not as a steady-state measurement. The shipped Job runs
+ * the *compiled* `dist/cli/isolation-reclaim-executor.js`; this test runs the
+ * TypeScript source under `--import tsx`, so the child additionally pays a
+ * cold transpile of the whole executor graph -- which reaches
+ * `@paperclipai/db` -- in a fresh process with no warm cache, while the other
+ * general-server workers compete for the same runner CPU.
+ *
+ * 30_000 was too thin a margin for that. On 2026-11-01 the watchdog fired
+ * inside the merge queue (run 41353633008) and ejected #3226, a PR whose diff
+ * touched none of this; the rejection said only "timed out", so its owner had
+ * no way to tell a slow spawn from a hung one. That is why the rejection below
+ * now carries the elapsed time and both partial streams -- the next occurrence
+ * measures itself instead of having to be re-derived from this comment.
+ *
+ * The suite budget stays strictly above the watchdog so that the watchdog's
+ * diagnostic rejection is what fails the test; vitest's own timeout would fire
+ * first and print neither stream.
+ */
+const ENTRYPOINT_WATCHDOG_MS = 90_000;
+const ENTRYPOINT_TEST_TIMEOUT_MS = ENTRYPOINT_WATCHDOG_MS + 15_000;
+
 let root: string;
 
 /** A directory with the exact `{home, session}` top level the reaper requires. */
@@ -367,7 +392,7 @@ describe("reclaim executor as a real entrypoint (PEN-5151)", () => {
       // the runner's /tmp for the rest of the suite. (Ally, review of #3189.)
       await fs.rm(home, { recursive: true, force: true });
     }
-  }, 40_000);
+  }, ENTRYPOINT_TEST_TIMEOUT_MS);
 });
 
 /**
@@ -392,10 +417,22 @@ function runEntrypoint(
     );
     let stdout = "";
     let stderr = "";
+    const startedAt = Date.now();
     const watchdog = setTimeout(() => {
       child.kill("SIGKILL");
-      reject(new Error("reclaim executor entrypoint timed out"));
-    }, 30_000);
+      // Both streams go into the message. A bare "timed out" cannot tell a
+      // slow spawn from a hung one, and the reader of this failure is usually
+      // whoever got ejected from the merge queue behind it -- someone with no
+      // context on this file at all.
+      reject(
+        new Error(
+          `reclaim executor entrypoint timed out after ${Date.now() - startedAt}ms ` +
+            `(watchdog ${ENTRYPOINT_WATCHDOG_MS}ms)\n` +
+            `stdout so far: ${tailForDiagnostics(stdout)}\n` +
+            `stderr so far: ${tailForDiagnostics(stderr)}`,
+        ),
+      );
+    }, ENTRYPOINT_WATCHDOG_MS);
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -414,4 +451,13 @@ function runEntrypoint(
       resolve({ code, stdout, stderr });
     });
   });
+}
+
+/**
+ * The last `max` characters of a captured stream, so a timeout message cannot
+ * flood the shard log with a runaway child's output.
+ */
+function tailForDiagnostics(stream: string, max = 2_000): string {
+  if (stream.length === 0) return "(empty)";
+  return stream.length <= max ? stream : `...${stream.slice(-max)}`;
 }
