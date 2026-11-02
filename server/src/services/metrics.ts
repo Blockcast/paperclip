@@ -4216,10 +4216,11 @@ export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   // review at the current head or was on a closed PR.
   "pr_review_output_missing",
   "pr_review_verification_unavailable",
-  // BLO-51129: the generic catch-all of heartbeat execution setup — the run
-  // failed before any Job started (measured 2026-11-02: migration 0270 held
-  // `activity_log` locks ~35 min, BLO-51377, and every pr_review run in that
-  // window failed here). Never started, so same disposition as `job_missing`.
+  // BLO-51129: the generic catch-all of heartbeat execution setup — usually
+  // the run failed before any Job started (measured 2026-11-02: migration 0270
+  // held `activity_log` locks ~35 min, BLO-51377, and every pr_review run in
+  // that window failed here). The same outer catch also records a DB write
+  // that throws after the adapter ran, so check the PR before re-driving.
   "setup_failed",
 ] as const;
 
