@@ -34,6 +34,7 @@ import {
   renderStalledHolds,
   stalledHolds,
   repoRunner,
+  runRepo,
   settleMinutesFrom,
   sweepRepos,
   targetRepos,
@@ -146,6 +147,23 @@ describe("classifyPr rule order", () => {
     assert.equal(row.action, "skip");
     assert.equal(row.reason, "checks:FAILURE");
     assert.match(row.detail, /e2e=FAILURE/);
+  });
+
+  it("names the STATE when the check's own name contains an `=`", () => {
+    // `failingChecks` formats `name=STATE`, and splitting on the FIRST `=`
+    // reads the middle of the name instead. Live on this repo 2026-11-02:
+    // `Worktree install (NODE_ENV=production)=QUEUED` produced the reason
+    // `checks:production)`. Cosmetic while the reason was only a receipt
+    // column; `stateHold` now posts it as a sentence on the PR and keys the
+    // comment's marker off it, so a mis-split reason is unreadable AND
+    // unpredictable as a slug.
+    const row = classify({
+      statusCheckRollup: [
+        { name: "Worktree install (NODE_ENV=production)", conclusion: null, status: "QUEUED" },
+      ],
+    });
+    assert.equal(row.reason, "checks:QUEUED");
+    assert.match(row.detail, /Worktree install \(NODE_ENV=production\)=QUEUED/);
   });
 
   it("treats a check still in flight as not passing", () => {
@@ -1946,5 +1964,118 @@ describe("stated holds on the PR (PEN-5263)", () => {
     stateHold("a/one", { number: 8, reason: "checks:none", ageHours: null }, run);
     assert.match(calls[1][6], /an unknown time \(no dated check on this head\)/);
     assert.doesNotMatch(calls[1][6], /NaN|null|undefined/);
+  });
+});
+
+describe("runRepo apply wiring (PEN-5263)", () => {
+  // The cohort tests above call `unlandedEligible` and `stateHold` directly,
+  // so none of them can see what `runRepo` does with the results. That gap is
+  // where the review found the write-path defect this block pins.
+  const NOW_ISO = "2026-09-13T12:00:00Z";
+  const OLD = "2026-09-12T20:00:00Z"; // 16h before NOW_ISO, so well past both bars
+  const checkAt = (iso) => [
+    { __typename: "CheckRun", name: "verify", conclusion: "SUCCESS", completedAt: iso },
+  ];
+  const prAt = (number, iso) => ({ number, statusCheckRollup: checkAt(iso) });
+
+  // `judgeableAgeHours` reads the wall clock, and `runRepo` does not take a
+  // `now`. Pinning it is what makes OLD mean "16h" rather than "whenever the
+  // suite happened to run".
+  const atNow = (fn) => {
+    const real = Date.now;
+    Date.now = () => Date.parse(NOW_ISO);
+    try {
+      return fn();
+    } finally {
+      Date.now = real;
+    }
+  };
+
+  const harness = ({ prs, rows, apply }) => {
+    const stated = [];
+    const applied = [];
+    const stranded = [];
+    const log = console.log;
+    console.log = () => {};
+    try {
+      atNow(() =>
+        runRepo("a/one", apply, 0, 0, [], stranded, {
+          fetch: () => prs,
+          classify: () => rows,
+          applyOne: (_repo, row) => (applied.push(row.number), "merge requested"),
+          state: (_repo, row) => stated.push(row),
+        }),
+      );
+    } finally {
+      console.log = log;
+    }
+    return { stated, applied, stranded, rows };
+  };
+
+  it("never tells a PR it just enqueued that it is not being enqueued", () => {
+    // The defect: `applyRow` leaves a successful enqueue reading `enqueue`
+    // (only `markFailure` renames it), `unlandedEligible` keys on exactly that
+    // action, and it ran AFTER the apply loop — so the cohort collected the
+    // rows the fire had just acted on and `stateHold` posted "The landing
+    // routine is not enqueuing this PR" on them. Permanently, because
+    // `commentOnce` never repeats.
+    //
+    // The trigger is the ordinary case, not an exotic one: a PR whose CI
+    // finished long before its review or owner approval arrived is already
+    // past UNLANDED_ELIGIBLE_HOURS on the very first fire that can enqueue it.
+    const rows = [{ number: 3241, action: "enqueue", reason: "mergestate:CLEAN" }];
+    const { stated, applied } = harness({
+      prs: [prAt(3241, OLD)],
+      rows,
+      apply: true,
+    });
+    assert.deepEqual(applied, [3241], "the fire did enqueue it");
+    assert.deepEqual(stated, [], "and said nothing contradicting that");
+    assert.equal(rows[0].action, "enqueue", "a successful apply leaves the action alone");
+    assert.match(rows[0].detail ?? "", /merge requested/);
+  });
+
+  it("still states a durable hold that the fire did NOT act on", () => {
+    // The other side of the cut: suppressing the just-enqueued cohort must not
+    // take the real holds with it, or the fix trades one silent hold for all
+    // of them.
+    const { stated } = harness({
+      prs: [prAt(7, OLD)],
+      rows: [{ number: 7, action: "skip", reason: "mergestate:DIRTY" }],
+      apply: true,
+    });
+    assert.deepEqual(stated, [{ number: 7, reason: "mergestate:DIRTY", ageHours: 16 }]);
+  });
+
+  it("does not post a second hold comment where applyRow already posted one", () => {
+    // `codeowner-review-requested` is in neither NON_HOLD_ACTIONS nor
+    // DELIBERATE_HOLD_REASON_RE, so it reaches `stalledHolds` on age and used
+    // to collect a `stated-hold:owner-approval-pending` comment beside the
+    // bespoke CODEOWNER_REQUEST_MARKER one. Two comments, same claim, and only
+    // the bespoke one names the owner.
+    const { stated, applied } = harness({
+      prs: [prAt(3102, OLD)],
+      rows: [
+        { number: 3102, action: "codeowner-review-requested", reason: "owner-approval-pending" },
+      ],
+      apply: true,
+    });
+    assert.deepEqual(applied, [3102], "applyRow still posts its own comment");
+    assert.deepEqual(stated, [], "and the age report does not repeat it");
+  });
+
+  it("reports the cohort on a dry run, where the action still means what it says", () => {
+    // The suppression is apply-only. On a dry run nothing has acted, so a row
+    // reading `enqueue` really does mean "no fire has taken this" — which is
+    // the whole detector, and what `--alarm` exits non-zero on.
+    const { stated, applied, stranded } = harness({
+      prs: [prAt(3241, OLD)],
+      rows: [{ number: 3241, action: "enqueue", reason: "mergestate:CLEAN" }],
+      apply: false,
+    });
+    assert.deepEqual(applied, [], "a dry run writes nothing");
+    assert.deepEqual(stated, []);
+    assert.deepEqual(stranded, ["a/one#3241"], "and the alarm can still see it");
+    assert.equal(alarmExitCode(stranded), 1);
   });
 });
