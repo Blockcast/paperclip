@@ -93,7 +93,58 @@ export function buildAlert({ state, repo, branch, runUrl, headSha, failedJob, no
   };
 }
 
+/**
+ * BLO-33389 (2026-11-02). `build-and-push` uses job-level concurrency with
+ * `cancel-in-progress: false`, so GitHub parks one run PENDING per group and
+ * evicts it when a newer master commit arrives. That eviction is the intended
+ * supersession (see the concurrency comment in docker-agent.yml), but it still
+ * reports `result == 'cancelled'` — the same value a `timeout-minutes` kill
+ * reports, which BLO-43939 deliberately pages on. Run 41363953835 (a99782fd8)
+ * was evicted after 29 min pending with no runner and no steps, and paged.
+ *
+ * The discriminator is whether the job ever reached a runner: an evicted pending
+ * job has an empty `runner_name` and no steps; a timed-out build has both.
+ */
+export function wasEvictedBeforeStart(job) {
+  return Boolean(job) && job.conclusion === 'cancelled' && !job.runner_name && !(job.steps?.length > 0);
+}
+
+/**
+ * Fail-closed toward ALERTING: any lookup error returns false, so an API outage
+ * can only ever produce a page, never suppress one.
+ */
+async function buildJobEvictedBeforeStart() {
+  const { GITHUB_API_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_TOKEN } = process.env;
+  if (!GITHUB_TOKEN || !GITHUB_REPOSITORY || !GITHUB_RUN_ID) return false;
+  const url =
+    `${GITHUB_API_URL || 'https://api.github.com'}/repos/${GITHUB_REPOSITORY}/actions/runs/` +
+    `${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT || 1}/jobs?per_page=100`;
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' },
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return false;
+    const { jobs = [] } = await res.json();
+    return wasEvictedBeforeStart(jobs.find((j) => j.name === 'build-and-push'));
+  } catch {
+    return false;
+  }
+}
+
 async function main() {
+  if (
+    process.env.STATE !== 'resolved' &&
+    process.env.BUILD_RESULT === 'cancelled' &&
+    (await buildJobEvictedBeforeStart())
+  ) {
+    console.log(
+      '::notice::build-and-push was evicted from the concurrency queue before it reached a runner ' +
+        '(superseded by a newer master commit). Not a delivery failure; not paging (BLO-33389).',
+    );
+    return;
+  }
+
   const state = process.env.STATE === 'resolved' ? 'resolved' : 'firing';
   const repo = process.env.GH_REPO ?? process.env.GITHUB_REPOSITORY ?? 'unknown/unknown';
   const branch = process.env.BRANCH || 'master';

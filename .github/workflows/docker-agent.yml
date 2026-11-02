@@ -797,10 +797,17 @@ jobs:
       (needs.build-and-push.result == 'failure' || needs.build-and-push.result == 'cancelled' ||
       needs.bump-agent-image.result == 'failure' || needs.bump-agent-image.result == 'cancelled')
     runs-on: arc-paperclip-light
+    # actions: read lets the script tell an evicted-pending build (no runner)
+    # from a timed-out one; both report `cancelled` (BLO-33389).
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v5
       - name: Report the failed build to Alertmanager
         env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
           ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
           STATE: firing
           GH_REPO: ${{ github.repository }}
