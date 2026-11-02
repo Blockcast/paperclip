@@ -128,6 +128,13 @@ test("a guard failure cites every advisory that matched, not one", () => {
   // the floor has to clear the HIGHEST patch point, not the first one.
   assert.equal(isVulnerableFastUri("3.1.8"), true);
   assert.equal(isVulnerableFastUri("3.1.9"), false);
+
+  // GHSA-58mr-gqgx-xq4g is encoded as three `= X` exact pins. Assert it from
+  // the derived verdict rather than from parseRange alone: a pin that parses
+  // but never reaches the table protects nothing, and 3.1.6 is a version the
+  // previous table declared PATCHED, so this is a real reversal.
+  assert.ok(fastUriAdvisoriesFor("3.1.6").includes("GHSA-58mr-gqgx-xq4g"));
+  assert.ok(!fastUriAdvisoriesFor("3.1.7").includes("GHSA-58mr-gqgx-xq4g"));
 });
 
 test("every encoded advisory contributes at least one live range", () => {
@@ -238,8 +245,6 @@ test("parseRange normalises GitHub bounds and fails closed", () => {
     introduced: [2, 4, 5],
     fixed: [2, 4, 6],
   });
-  // An exact pin covers exactly its one version and neither neighbour.
-  assert.equal(isVulnerableFastUri("3.1.6"), true);
   for (const bad of [
     "3.1.6",
     ">= 3.1.6",
