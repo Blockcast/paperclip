@@ -101,6 +101,16 @@ describe("securityAuditRemediations ledger", () => {
       // membership check in scripts/multer-security-override.test.js
       "multer",
     ],
+    "PEN-5284": [
+      // scripts/fast-uri-advisory.test.js, "the securityAuditRemediations
+      // floor clears this table exactly" — covers BOTH halves of the entry.
+      // patchedRange: asserted equal to the live pnpm override, and pinned to
+      // sit exactly on the advisory table's patch boundary (floor accepted,
+      // floor-minus-one rejected), so it cannot drift or be set arbitrarily
+      // high. advisories: asserted to be exactly the IDs that cover 3.1.7, the
+      // resolution this floor supersedes — set equality, not containment.
+      "fast-uri",
+    ],
   };
 
   it("has a guard wired for every ticket bucket", () => {

@@ -1,13 +1,24 @@
-// Every npm advisory published against fast-uri, read live from
-// `GET /advisories?ecosystem=npm&affects=fast-uri` on 2026-09-13.
+// Every npm advisory published against fast-uri -- all 17 of them -- read live
+// from `GET /advisories?ecosystem=npm&affects=fast-uri` on 2026-11-02.
 //
 // Encode each advisory SEPARATELY, verbatim in GitHub's own range syntax, and
 // derive the union below. Three tickets in a row hand-merged this table and
-// each one missed an advisory: the version before this commit encoded
+// each one missed an advisory: the version before BLO-31492 encoded
 // GHSA-5jgf alone and therefore accepted 3.0.0-3.1.2 and 4.0.0, which five
 // other live advisories declare vulnerable. A hand-merged summary cannot be
 // diffed against the advisory page; a verbatim copy can, and adding the next
 // advisory is one appended entry rather than a re-derivation of the union.
+//
+// PEN-5284 is the SAME defect arriving by a different route, and the one the
+// paragraph above does not guard against: nothing was mis-transcribed, the
+// read simply AGED. Eight advisories were published after the 2026-09-13
+// snapshot, five of them covering the 3.1.7 both lockfiles resolved, so both
+// gates stayed green over a live exposure. Re-read the feed and compare the
+// COUNT -- a table that merely contains the advisory you came for is the
+// failure mode, not the fix. A hardcoded table cannot see an advisory
+// published after it was written; only a live feed can, and no workflow here
+// runs one. That detector gap is filed separately -- this table is a snapshot
+// and re-dating it is a recurring chore, not a solved problem.
 //
 // Re-read the source of truth with:
 //   gh api 'advisories?ecosystem=npm&affects=fast-uri&per_page=100' \
@@ -50,6 +61,38 @@ export const FAST_URI_ADVISORIES = [
     id: "GHSA-q3j6-qgpj-74h6",
     ranges: [">= 3.0.0, <= 3.1.0", "<= 2.4.0"],
   },
+  {
+    id: "GHSA-w74x-v6f9-j3xg",
+    ranges: ["< 2.4.8", ">= 3.0.0, < 3.1.9", ">= 4.0.0, < 4.2.3"],
+  },
+  {
+    id: "GHSA-xhq7-xmqj-769h",
+    ranges: ["< 2.4.8", ">= 3.0.0, < 3.1.9", ">= 4.0.0, < 4.2.3"],
+  },
+  {
+    id: "GHSA-wjr9-j795-jxcr",
+    ranges: [">= 2.4.2, < 2.4.8", ">= 3.1.3, < 3.1.9", ">= 4.0.1, < 4.2.3"],
+  },
+  {
+    id: "GHSA-333x-w4r6-6crp",
+    ranges: ["< 2.4.8", ">= 3.0.0, < 3.1.9", ">= 4.0.0, < 4.2.3"],
+  },
+  {
+    id: "GHSA-hrr3-gc8f-f4qj",
+    ranges: ["< 2.4.7", ">= 3.0.0, < 3.1.8", ">= 4.0.0, < 4.1.5"],
+  },
+  {
+    id: "GHSA-jvvf-x445-j334",
+    ranges: [">= 4.1.3, < 4.1.5"],
+  },
+  {
+    id: "GHSA-qw65-cvwx-89v3",
+    ranges: ["< 2.4.6", ">= 3.0.0, < 3.1.7", ">= 4.0.0, < 4.1.4"],
+  },
+  {
+    id: "GHSA-58mr-gqgx-xq4g",
+    ranges: ["= 2.4.5", "= 3.1.6", "= 4.1.3"],
+  },
 ];
 
 function compare(a, b) {
@@ -67,23 +110,39 @@ export function parseVersion(version) {
   return parts.slice(0, 3);
 }
 
-// GitHub writes both inclusive and exclusive upper bounds, and omits the lower
-// bound entirely on the oldest advisories. Normalise to a half-open
-// [introduced, fixed) pair so every comparison downstream is the same shape --
-// doing that `<= X` -> `< X+1` arithmetic by hand at transcription time is
-// precisely what this module keeps getting wrong.
+// GitHub writes both inclusive and exclusive upper bounds, omits the lower
+// bound entirely on the oldest advisories, and pins a lone affected release as
+// `= X`. Normalise all three to a half-open [introduced, fixed) pair so every
+// comparison downstream is the same shape -- doing that `<= X` -> `< X+1`
+// arithmetic by hand at transcription time is precisely what this module keeps
+// getting wrong.
 const RANGE = /^(?:(>=?)\s*(\d+\.\d+\.\d+)\s*,\s*)?(<=?)\s*(\d+\.\d+\.\d+)$/;
+// `= X` is a whole range rather than a bound, so it does not fit RANGE's
+// optional-lower-bound shape and needs its own pattern. GHSA-58mr-gqgx-xq4g is
+// the first advisory here to use it. Note the failure mode this avoids: the
+// table is read at module load, so an unparseable entry does not fail a gate,
+// it throws on import and takes every importer down with it.
+const EXACT = /^=\s*(\d+\.\d+\.\d+)$/;
 
 export function parseRange(range) {
-  const match = RANGE.exec(String(range).trim());
-  if (!match) throw new Error(`unparseable fast-uri range ${range}`);
-  const [, lowOp, low, highOp, high] = match;
+  const text = String(range).trim();
+  const exact = EXACT.exec(text);
+  const match = exact ? null : RANGE.exec(text);
+  if (!exact && !match) throw new Error(`unparseable fast-uri range ${range}`);
 
-  const introduced = low ? parseVersion(low) : [0, 0, 0];
-  if (lowOp === ">") introduced[2] += 1;
-
-  const fixed = parseVersion(high);
-  if (highOp === "<=") fixed[2] += 1;
+  let introduced;
+  let fixed;
+  if (exact) {
+    introduced = parseVersion(exact[1]);
+    fixed = parseVersion(exact[1]);
+    fixed[2] += 1;
+  } else {
+    const [, lowOp, low, highOp, high] = match;
+    introduced = low ? parseVersion(low) : [0, 0, 0];
+    if (lowOp === ">") introduced[2] += 1;
+    fixed = parseVersion(high);
+    if (highOp === "<=") fixed[2] += 1;
+  }
 
   if (compare(introduced, fixed) >= 0) {
     throw new Error(`empty fast-uri range ${range}`);
