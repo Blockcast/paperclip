@@ -216,13 +216,14 @@ gated_lanes() { # stdin: run rows; $1 = head sha, $2 non-empty = repo is gated
 
 empty_witness() { # stdin: commit statuses LIST pages + check-runs pages -> "1" or nothing
   # BLO-48830. pr-ci-dispatch (`post-status: "true"`) posts `ci/dispatched-lanes`
-  # (or NOP's equivalent `ci/web-lanes`) = success
-  # "(base <ref>) no dispatched lane applies to this head" when it
-  # selects no lane. Accepted only when the ACTIONS app wrote it: a session
+  # = success "(base <ref>) no dispatched lane applies to this head" when it
+  # selects no lane; NOP's web-lanes-status.py posts `ci/web-lanes` = success
+  # "no web lane applies to this head" (no base prefix). Accepted only when the ACTIONS app wrote it: a session
   # writes as allyblockcast[bot] (290875700) or its User seat, never as
   # github-actions[bot] (41898282) / app `github-actions` — the same identity
   # fence as the shim's review/ally-* guard. Newest Actions-written entry per
-  # surface wins, so a later pending/failure re-judge withdraws the witness.
+  # context wins, and EVERY context present must be the empty success, so a
+  # later pending/failure re-judge of either context withdraws the witness.
   # Residual: any workflow in the repo holding statuses/checks write can still
   # write as the Actions app.
   # Only the EMPTY wording counts: "N lane(s) passed" means runs exist, and
@@ -230,11 +231,12 @@ empty_witness() { # stdin: commit statuses LIST pages + check-runs pages -> "1" 
   # Status LIST endpoint, not the combined one: combined drops `creator`.
   jq -rs '
     ([.[]|arrays|.[]|select(type=="object" and (.context=="ci/dispatched-lanes" or .context=="ci/web-lanes")
-                             and .creator.id==41898282)]|max_by(.id)) as $s
+                             and .creator.id==41898282)]|group_by(.context)|map(max_by(.id))) as $s
     | ([.[]|objects|.check_runs[]?|select((.name=="ci/dispatched-lanes" or .name=="ci/web-lanes")
-                                          and .app.slug=="github-actions")]|max_by(.id)) as $c
-    | if ($s.state=="success" and (($s.description // "")|test("no (dispatched|web) lane applies to this head")))
-         or ($c.conclusion=="success" and (($c.output.title // "")|test("no (dispatched|web) lane applies to this head")))
+                                          and .app.slug=="github-actions")]|group_by(.name)|map(max_by(.id))) as $c
+    | def empty_ok(st; d): st=="success" and ((d // "")|test("no (dispatched|web) lane applies to this head"));
+      if ($s|length>0 and all(empty_ok(.state; .description)))
+         or ($c|length>0 and all(empty_ok(.conclusion; .output.title)))
       then "1" else empty end' 2>/dev/null
 }
 

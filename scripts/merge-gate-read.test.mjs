@@ -2149,6 +2149,22 @@ describe("merge-gate reader", () => {
       renamed.check_runs[0].name = "ci/web-lanes";
       renamed.check_runs[0].output.title = "no web lane applies to this head";
       assert.equal(emptyWitness([[], renamed]), "1");
+      assert.equal(emptyWitness([[st(2, "success", EMPTY_DESC, ACTIONS, "ci/foo-lanes")]]), "");
+      const foo = cr(5, "success", EMPTY_DESC);
+      foo.check_runs[0].name = "ci/foo-lanes";
+      assert.equal(emptyWitness([[], foo]), "");
+    });
+
+    it("a newer empty web-lanes cannot mask a withdrawing dispatched-lanes re-judge", () => {
+      assert.equal(emptyWitness([[
+        st(9, "success", "no web lane applies to this head", ACTIONS, "ci/web-lanes"),
+        st(7, "pending", "waiting: ci=not dispatched"),
+        st(2, "success", EMPTY_DESC),
+      ]]), "");
+      assert.equal(emptyWitness([[
+        st(9, "success", "no web lane applies to this head", ACTIONS, "ci/web-lanes"),
+        st(2, "success", EMPTY_DESC),
+      ]]), "1");
     });
 
     it("fails closed on an API error body or garbage", () => {
