@@ -117,16 +117,37 @@ export const ISSUE_PARK_EXPIRED_WAKE_REASON = "issue_park_expired";
  *    PEN-5291: that drain is CONDITIONAL, and the sentence above read as unconditional is
  *    what turned correct behaviour into a filed high-priority defect.
  *    `listBlockedIssueAutoResumeSuppressions` keeps a row `blocked` despite zero unresolved
- *    blockers for a pending interaction or approval, a latest agent comment awaiting user
- *    input, an executive hold, a workspace preflight failure, an active recovery action, a
- *    live monitor gate, a convergence stall, or a declared external wait. Such a row gets
- *    NEITHER the drain NOR this sweep, so its park lapses having fired nothing — by design,
- *    not by breakage.
+ *    blockers for any reason in `BlockedIssueAutoResumeSuppressionReason` (`issues.ts`) —
+ *    that union is the authoritative list and it GROWS (`external_wait` was a later
+ *    addition, BLO-30445), so read the type rather than any prose enumeration of it,
+ *    including this one. Such a row gets NEITHER the drain NOR this sweep, so its park
+ *    lapses having fired nothing — by design, not by breakage.
  *
- *    That is not a dark row, which is the part worth keeping: what it waits on is a human
- *    decision, and that decision carries its own wake — answering an interaction
- *    (`continuationPolicy: wake_assignee`) or deciding an approval (`requesterWakeActorType`)
- *    wakes the assignee directly. A timer wake would add nothing a human answer does not.
+ *    Do NOT read that as "suppressed, therefore attended". The reasons do not share a wake
+ *    path and only some carry one, so the inverse misdiagnosis — calling a genuinely dark
+ *    row "by design" — is as available here as the one this note exists to stop. Classify
+ *    before concluding:
+ *
+ *      - `pending_interaction` / `pending_approval` — the shape all 5 measured rows took,
+ *        and the only shape the "a human answer is the wake" argument covers. Deciding an
+ *        approval wakes the requester (`requesterWakeActorType`, `approval-resolution.ts`).
+ *        An interaction wakes the assignee ONLY at `continuationPolicy` `wake_assignee` /
+ *        `wake_assignee_on_accept` (`queueResolvedInteractionContinuationWakeup`,
+ *        `routes/issues.ts`) — and `request_confirmation` prefaults to `none`
+ *        (`packages/mcp-server/src/tools.ts`), so even here the wake is not automatic.
+ *        Where it holds, a timer wake adds nothing a human answer does not.
+ *      - `convergence_stalled` — the opposite case, and the one to be most careful with.
+ *        The assignee is barred from re-arming its own stalled monitor
+ *        (`MONITOR_CONVERGENCE_RESET_REQUIRES_NON_ASSIGNEE_MESSAGE`,
+ *        `issue-execution-policy.ts`), so nothing the assignee can do re-enters the row: it
+ *        needs a non-assignee actor, and no human decision is pending to supply one.
+ *      - everything else — check the wake path per reason before calling the row attended.
+ *        Some carry one structurally: `monitor_gate` suppresses only while a live armed
+ *        monitor passes `hasValidBlockerMonitor`, and `active_recovery_action` suppresses on
+ *        `active` alone, with `escalated` deliberately excluded as wake-exhausted
+ *        (`BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES`, BLO-21523). Others
+ *        (`workspace_preflight_blocked`, `external_wait`) are waits on an operator with no
+ *        timer behind them.
  *
  *    Measured 2026-11-02: 5 such rows, each behind an unanswered card 0.6-7.3 d old, while
  *    the reconciler was demonstrably live — it flipped PEN-5217 at 13:15:27Z the same day.
