@@ -16,13 +16,16 @@
  * plus the exclusion set, statement-level multi-row inserts, monotonicity, and
  * the drift repair.
  *
- * ⚠️ The drift test runs the repair block EXTRACTED FROM THE MIGRATION FILE,
- * not a copy of it. A copy would drift from the shipped SQL silently, which is
- * the exact failure mode this row exists to close.
+ * BLO-51379: the drift repair is no longer in the migration (it held
+ * activity_log's insert lock for ~35 min in prod). The drift test runs the
+ * shipped `repairIssuesLastActivityDrift`, and a guard below fails if a DO
+ * block ever creeps back into the migration file.
  */
 import fs from "node:fs";
 import { afterEach, describe, expect, it } from "vitest";
 import postgres from "postgres";
+import { createDbFromPostgresClient } from "./client.js";
+import { repairIssuesLastActivityDrift } from "./issues-last-activity-drift-repair.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -71,19 +74,6 @@ function migrationSql(): string {
   return fs.readFileSync(new URL(matches[0]!, migrationsDir), "utf8");
 }
 
-/** The batched one-shot repair, lifted from the shipped migration. */
-function driftRepairStatement(): string {
-  const statements = migrationSql()
-    .split(/-->\s*statement-breakpoint/g)
-    .map((part) => part.trim())
-    .filter((part) => part.length > 0);
-  const repair = statements.filter((statement) => /^DO \$\$/m.test(statement));
-  if (repair.length !== 1) {
-    throw new Error(`expected exactly one DO block in the migration, found ${repair.length}`);
-  }
-  return repair[0]!;
-}
-
 type Divergence = { id: string; column_at: Date; canonical_at: Date };
 
 async function divergences(sql: postgres.Sql): Promise<Divergence[]> {
@@ -100,7 +90,9 @@ async function columnAt(sql: postgres.Sql, issueId: string): Promise<Date> {
     `SELECT "last_activity_at" FROM "issues" WHERE "id" = $1`,
     [issueId],
   )) as unknown as Array<{ last_activity_at: Date }>;
-  return rows[0]!.last_activity_at;
+  // new Date(): a drizzle wrapper over this client re-registers the timestamp
+  // parser to return strings.
+  return new Date(rows[0]!.last_activity_at);
 }
 
 async function freshDatabase() {
@@ -157,6 +149,14 @@ if (!embeddedPostgresSupport.supported) {
     `Skipping PEN-5213 last_activity_at maintenance tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
   );
 }
+
+describe("last_activity_at migration shape (BLO-51379)", () => {
+  it("arms the trigger only: no whole-table repair inside the migration transaction", () => {
+    // CREATE TRIGGER holds SHARE ROW EXCLUSIVE on activity_log to commit, so
+    // anything long after it in the same file blocks every activity insert.
+    expect(migrationSql()).not.toMatch(/^\s*DO \$\$/m);
+  });
+});
 
 describeEmbeddedPostgres("issues.last_activity_at maintenance (PEN-5213)", () => {
   it(
@@ -252,7 +252,7 @@ describeEmbeddedPostgres("issues.last_activity_at maintenance (PEN-5213)", () =>
   );
 
   it(
-    "repairs pre-0270 drift with the migration's own batched one-shot",
+    "repairs pre-trigger drift in autocommit batches, outside the migration",
     async () => {
       const sql = await freshDatabase();
       await insertIssue(sql, ISSUE_A, 1);
@@ -275,14 +275,18 @@ describeEmbeddedPostgres("issues.last_activity_at maintenance (PEN-5213)", () =>
       const beforeRepair = await divergences(sql);
       expect(beforeRepair.map((row) => row.id).sort()).toEqual([ISSUE_A, ISSUE_B].sort());
 
-      await sql.unsafe(driftRepairStatement());
+      // batchSize 1 forces the keyset to walk across batches.
+      const db = createDbFromPostgresClient(sql);
+      const first = await repairIssuesLastActivityDrift(db, { batchSize: 1, pauseMs: 0 });
+      expect(first).toMatchObject({ repaired: 2, failedBatches: 0 });
 
       expect(await divergences(sql)).toEqual([]);
       expect((await columnAt(sql, ISSUE_A)).getTime()).toBe(drifted.getTime());
 
       // Idempotent: a second pass is a no-op, not a second advance.
       const repaired = await columnAt(sql, ISSUE_B);
-      await sql.unsafe(driftRepairStatement());
+      const second = await repairIssuesLastActivityDrift(db, { pauseMs: 0 });
+      expect(second.repaired).toBe(0);
       expect((await columnAt(sql, ISSUE_B)).getTime()).toBe(repaired.getTime());
       expect(await divergences(sql)).toEqual([]);
     },

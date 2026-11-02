@@ -28,6 +28,7 @@ import {
   ensurePendingConcurrentIndexes,
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
+  repairIssuesLastActivityDrift,
   reconcilePendingMigrationHistory,
   readInheritedTimeoutSettings,
   formatInheritedTimeoutSettings,
@@ -3009,6 +3010,27 @@ export async function startServer(): Promise<StartedServer> {
   if (config.paperclipNodeRole !== "api") {
     const { startPodLogSweeper } = await import("./services/pod-log-sweeper.js");
     superviseLeased("pod-log-sweeper", () => startPodLogSweeper(db as any, 60 * 60 * 1000));
+  }
+
+  // issues.last_activity_at drift repair (BLO-51379). Moved out of migration
+  // 0270, where it held activity_log's insert lock for ~35 min in prod. One
+  // pass of short autocommit batches per lease acquisition; idempotent.
+  // ponytail: re-scans every issue each time the lease is (re)acquired; add a
+  // completion marker if that scan ever shows up in DB load.
+  if (config.paperclipNodeRole !== "api") {
+    superviseLeased("issues-last-activity-drift-repair", () => {
+      let stopped = false;
+      void repairIssuesLastActivityDrift(db as any, {
+        shouldStop: () => stopped,
+        onBatchError: (err, afterId) =>
+          logger.warn({ err, afterId }, "issues.last_activity_at drift repair batch failed; skipped"),
+      })
+        .then((result) => logger.info(result, "issues.last_activity_at drift repair pass finished"))
+        .catch((err) => logger.error({ err }, "issues.last_activity_at drift repair pass failed"));
+      return () => {
+        stopped = true;
+      };
+    });
   }
 
   // Human-gated ageing digest (BLO-29420). Worker-tier singleton. BLO-19130's
