@@ -146,9 +146,26 @@ against `paperclip_isolation_reclaim_last_sweep_timestamp_seconds` — but read 
 
 **No counter carries claim identity**, so none of them can show that *this* claim was driven.
 `paperclip_isolation_reclaim_claims_total` is `Counter<"dry_run" | "outcome">` — a fleet
-aggregate. Read it at `{dry_run="false"}`: zero increase in `outcome="failed"` and
-`outcome="deferred"` over the window means every claim the sweep listed was driven. The rotation is
-a **different series** — `paperclip_isolation_reclaim_sweeps_total{stop_reason="claims_capped"}`,
+aggregate. ⚠ **Do not read a zero `increase()` on it as "every claim the sweep listed was
+driven".** `recordIsolationReclaimSweep` creates the `{dry_run, outcome}` children lazily, on the
+first sweep of a process, and the scrape adds the pod's `instance` — so where a process's first
+sweep is also the one that failed or deferred, that series' **first sample already carries the
+count**, and `increase()`, which measures change between samples and has no created-timestamp
+ingestion to fall back on here, reads it as **0**. That is not hypothetical on this deployment. The
+control plane turns over ≈55 processes a week against a **daily** tick, so most sweeps are the
+first — often the only — sample of their series:
+
+```promql
+count(count_over_time(process_start_time_seconds{job="paperclip-control-plane"}[7d]))  # → 55
+```
+
+Measured on the sibling counter that already uses this idiom, **6 of 19** live series read
+`increase(paperclip_isolation_workspace_reaper_deleted_total[7d]) == 0` while `max_over_time` of
+the same series over the same window is non-zero — 5, 4, 3, 6, 2 and 1 deletions each, every one of
+them invisible to `increase()`. The undercount is in the fails-toward-covered direction.
+
+The rotation is a **different series** —
+`paperclip_isolation_reclaim_sweeps_total{stop_reason="claims_capped"}`,
 because `stop_reason` is a label on `sweeps_total`, not on `claims_total`. Querying
 `claims_total{stop_reason="claims_capped"}` matches nothing, and an empty result there reads as
 *"never capped"*, which is the fails-toward-covered direction this section exists to close.
@@ -156,8 +173,38 @@ because `stop_reason` is a label on `sweeps_total`, not on `claims_total`. Query
 The per-claim evidence is a **log line, not a metric**: `isolation reclaim drive complete`
 (`isolation-reclaim-driver.ts`), filtered on `claim=` and `dryRun=false`. With that read: a fresh
 `{dry_run="false"}` timestamp plus a `drive complete` line for this claim at `dryRun=false` and
-`deleted` accounted for means *unreachable but reclaimed*; stale, absent, or dry-run-only means
-unreclaimed. Where it is unreclaimed, it was accepted deliberately, with a ceiling:
+`deleted` accounted for means *unreachable but reclaimed*; a stale, absent, or dry-run-only
+timestamp means unreclaimed.
+
+⚠ **A missing `drive complete` line is not on its own the unreclaimed reading.** A claim with
+nothing eligible — every entry still inside `maxAgeDays` by `mtime` (`fresh`) or by `lastUsedAt`
+(`in_use`), or no named entries at all — returns at the driver's `nothingEligible` branch, which
+sits *before* the module's only `drive complete` site, and that quiet tick still counts into
+`claims_total{outcome="ok"}`. So a **covered** claim with nothing to do emits no line at all, and
+the rule above read backwards would class it as skipped.
+
+Absence stops being evidence of an unreclaimed tree only when **both** of the following hold.
+Neither implies the other, and dropping either one makes the test conclude *covered* in a state
+where nothing has been reclaimed:
+
+1. **The window holds at least one `isolation reclaim sweep complete` line at `dryRun=false`, and
+   every such line in it reads `claimsFailed: 0` and `claimsDeferred: 0`.**
+   (`isolation-reclaim-sweep.ts`, one site, on the completion path.) This is a **log** read, not the
+   counter read above, for the reason given there: the line carries each sweep's own `claimsFound`,
+   `claimsFailed` and `claimsDeferred`, so it does not depend on series identity and a pod's first
+   sweep counts like any other. Its existence at `dryRun=false` is also what makes the zeros mean
+   anything — under a dry-run-only rollout, the first state a correct rollout occupies, there are no
+   `dryRun=false` sweeps at all, and any "nothing failed" read is zero **vacuously**. It must be
+   *every* line and not their sum: a tick that deferred claims is a tick this claim may have been
+   the deferred one on, and `claimsDeferred > 0` is ordinary rather than exceptional — deferral is
+   how the rotation covers a fleet larger than one tick.
+2. **The claim is one the sweep lists.** `listReclaimableClaims` names only claims belonging to
+   opted-in agents or to k8s environments, so a claim left behind by opting an agent back out —
+   the remedy named above — is not listed at all. It produces no `drive complete` line and no
+   `failed`/`deferred` increment, so for it absence **is** the unreclaimed reading. That is exactly
+   the claim this page tells you to write down when you opt an agent out.
+
+Where it is unreclaimed, it was accepted deliberately, with a ceiling:
 
 > ≈10 GiB/agent/month against a **50 Gi** claim already carrying ≈13.2 G of duplicated company
 > trees ⇒ ≈36.8 GiB headroom ⇒ **one opted-in agent fills its own claim in ≈3.7 months.**

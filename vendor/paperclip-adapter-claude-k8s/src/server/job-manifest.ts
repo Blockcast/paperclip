@@ -1018,6 +1018,42 @@ export function resolveSeedShape(input: {
  * exists, and there opt an agent in only together with an owner for its claim's
  * capacity.
  *
+ * ⚠️ A MISSING `drive complete` LINE IS NOT ON ITS OWN THAT STANDING RECORD.
+ * A claim with nothing eligible -- every entry still inside `maxAgeDays` by
+ * `mtime` (`fresh`) or by `lastUsedAt` (`in_use`), or no named entries at all
+ * -- returns at the driver's `nothingEligible` branch, which sits BEFORE that
+ * module's only `drive complete` site, while still counting into
+ * `claims_total{outcome="ok"}`. So on an ordinary quiet tick a COVERED claim
+ * emits no line, and the rule above read backwards would call it skipped.
+ *
+ * Absence stops being evidence of an unreclaimed tree only where BOTH hold,
+ * and neither implies the other:
+ *
+ * 1. The window holds at least one `isolation reclaim sweep complete` line at
+ *    `dryRun=false`, AND every such line in it reads `claimsFailed: 0` and
+ *    `claimsDeferred: 0` (`isolation-reclaim-sweep.ts`, one site, on the
+ *    completion path). This is a LOG read and deliberately not a counter read:
+ *    `recordIsolationReclaimSweep` creates the `claims_total{dry_run, outcome}`
+ *    children lazily on a process's first sweep and the scrape adds the pod's
+ *    `instance`, so a sweep that failed or deferred on a process's first tick
+ *    lands as that series' FIRST SAMPLE, which `increase()` cannot see -- it
+ *    reads 0. The control plane turns over ~55 processes a week against a daily
+ *    tick, so that is the common case here, not the edge one, and it errs
+ *    toward COVERED. The sweep line carries each tick's own `claimsFound`,
+ *    `claimsFailed` and `claimsDeferred`, so it is immune to series identity.
+ *    Its existence at `dryRun=false` is also the non-vacuity precondition:
+ *    under a dry-run-only rollout -- the first state a correct rollout occupies
+ *    -- there are no `dryRun=false` sweeps at all and any "nothing failed" read
+ *    is zero VACUOUSLY. EVERY line, not their sum: a tick that deferred claims
+ *    is a tick this claim may have been the deferred one on, and
+ *    `claimsDeferred > 0` is ordinary -- deferral is how the rotation covers a
+ *    fleet larger than one tick.
+ * 2. The claim is one the sweep LISTS. `listReclaimableClaims` names only
+ *    claims belonging to opted-in agents or k8s environments, so a claim left
+ *    behind by opting an agent back out -- the remedy immediately below -- is
+ *    not listed, produces no line and no `failed`/`deferred` increment, and for
+ *    it absence IS the unreclaimed reading.
+ *
  * The cheapest remedy there is to opt the agent
  * back out: its FUTURE runs return to the shared claim, where the existing
  * reaper reaches them with its predicate unchanged. ⚠️ It does NOT reclaim
