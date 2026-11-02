@@ -91,6 +91,7 @@ import {
 } from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
 import { captureTimedOutIssueListPlan } from "../lib/issue-list-timeout-explain.js";
+import { captureIssueListExplainAnalyzeProbe } from "../lib/issue-list-explain-analyze-probe.js";
 import { recordProjectPrimaryWorkspaceFallback } from "./metrics.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -8676,6 +8677,10 @@ export function issueService(db: Db) {
       // surfaces here once. Adding a retry wrapper above this would fire the
       // capture per attempt — bound it there if that ever changes.
       let pageRows: any[];
+      // PEN-5296: the served request's own duration selects which executions are
+      // worth re-measuring. Started here, not before the builder, so it times the
+      // statement rather than the query construction around it.
+      const pageStartedAt = Date.now();
       try {
         pageRows = await pageQuery;
       } catch (error) {
@@ -8696,6 +8701,27 @@ export function issueService(db: Db) {
         });
         throw error;
       }
+      // PEN-5296: the SAME seam, on the success path. `EXPLAIN` without `ANALYZE`
+      // (above) reports the planner's estimates; this re-runs a slow execution
+      // under `EXPLAIN (ANALYZE, BUFFERS)` to report the ACTUAL row counts, which
+      // is the discriminator for the estimate -> nested-loop hypothesis and the
+      // one thing neither that capture nor `auto_explain` can produce.
+      //
+      // Deliberately NOT awaited, for the same reason as the capture above: the
+      // tenant's rows are already in hand and must not wait on a diagnostic. The
+      // probe never rejects (it swallows everything), so this cannot become an
+      // unhandled rejection. Default-off, company-scoped, duration-floored and
+      // budget-capped — see the module doc for why `ANALYZE` is admissible here
+      // when the timeout path forbids it.
+      void captureIssueListExplainAnalyzeProbe({
+        db,
+        query: pageQuery,
+        companyId,
+        hasSearch,
+        // The LENGTH, never the term: these are user-entered search strings.
+        searchTermLength: rawSearch.length,
+        elapsedMs: Date.now() - pageStartedAt,
+      });
       const rows = pageRows.map((row: any) => ({
         ...row,
         ...projectIssueListDescription(row.description),

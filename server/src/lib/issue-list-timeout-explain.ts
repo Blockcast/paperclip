@@ -187,8 +187,10 @@ export function buildIssueListExplainQuery(query: ExplainableQuery): SQL {
  * plan as the issues-list SEARCH variant (the class-A discriminator PEN-3596
  * keys on). The parameters are read ONLY to redact them back out of the plan
  * (see {@link redactBoundValues}) — they are never logged.
+ * PEN-5296 reuses this: the deliberate `EXPLAIN (ANALYZE)` probe needs the same
+ * statement text and the same parameter list to drive the same redaction.
  */
-function renderExplain(query: SQL): { sql: string; params: unknown[] } | null {
+export function renderExplainStatement(query: SQL): { sql: string; params: unknown[] } | null {
   try {
     const { sql: text, params } = new PgDialect().sqlToQuery(query);
     return { sql: text, params };
@@ -320,7 +322,11 @@ export function containsBoundValue(text: string, params: readonly unknown[]): bo
   return params.some((param) => typeof param === "string" && param.length > 0 && text.includes(param));
 }
 
-function planTextFromRows(rows: unknown): string | null {
+/**
+ * Join a driver result set into the plan text. Exported for PEN-5296, which
+ * reads the same `QUERY PLAN` column off the same driver.
+ */
+export function planTextFromRows(rows: unknown): string | null {
   if (!Array.isArray(rows)) return null;
   const lines = rows
     .map((row) => (row && typeof row === "object" ? (row as Record<string, unknown>)["QUERY PLAN"] : null))
@@ -379,7 +385,7 @@ export async function captureTimedOutIssueListPlan(options: {
       );
       return;
     }
-    const rendered = renderExplain(explain);
+    const rendered = renderExplainStatement(explain);
     const params = rendered?.params ?? [];
     const plan = redactBoundValues(rawPlan, params);
     const statement = rendered ? redactBoundValues(rendered.sql, params) : null;

@@ -473,6 +473,37 @@ env:
     # change in onprem-k8s instead -- so keep flags `PAPERCLIP_`-prefixed.
     - name: PAPERCLIP_EXPLAIN_TIMED_OUT_ISSUE_LIST
       value: "true"
+    # PEN-5296 box 2: the deliberate `EXPLAIN (ANALYZE, BUFFERS)` probe.
+    #
+    # Separate flag from the capture above ON PURPOSE. That one asks the planner
+    # for a plan and does not execute; this one RE-EXECUTES a statement that has
+    # already completed, to report its ACTUAL row counts — the discriminator for
+    # the estimate -> nested-loop hypothesis, and the one artifact neither that
+    # capture nor `auto_explain` (PEN-5220) can produce. One flag for both would
+    # mean enabling the cheap instrument also enabled a re-execution.
+    #
+    # Bounded in four independent ways, all server-side defaults that this values
+    # entry only narrows: SEARCH lists only, 2 captures per company per process
+    # (6 total), and only for an execution that ALREADY took >= the floor below.
+    # Worst case per pod generation is a handful of extra read-only queries.
+    #
+    # ⚠️ Box 4 flips this to "false". That flip is the whole revert — the code is
+    # default-off, so this entry is the only thing that turns it on.
+    - name: PAPERCLIP_EXPLAIN_ANALYZE_ISSUE_LIST
+      value: "true"
+    # The company whose issues-list statements actually cross the 30s timeout
+    # (both PEN-5223 captures), plus Penstock as the control the Engineer's
+    # 9.2-25.1s cost curve was measured on. Scoped rather than left unset:
+    # unset admits EVERY company, which is the wrong default for a probe that
+    # re-executes a slow query.
+    - name: PAPERCLIP_EXPLAIN_ANALYZE_ISSUE_LIST_COMPANY_IDS
+      value: "aaced805-3491-4ee5-9b14-cdf70cb81d47,b1d3f3d3-adc9-48af-beb1-013a18368d84"
+    # Duration floor. Without it the per-company budget is spent on the first two
+    # trivial list requests the process happens to serve, which are not the shape
+    # in question. 5000ms is well above a healthy list and well below the 30s
+    # budget, so it selects the slow-but-completing population.
+    - name: PAPERCLIP_EXPLAIN_ANALYZE_ISSUE_LIST_MIN_MS
+      value: "5000"
 
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
