@@ -85,6 +85,12 @@ and a `drive complete` line for this claim at `dryRun=false` is *unreachable but
 timestamp is the standing record that an unreclaimed tree exists. Only the second carries the "opt
 an agent in only together with an owner for its claim's capacity" obligation.
 
+**Superseded in one respect by [`pen-5151-quiet-tick-is-not-a-skipped-claim.md`](./pen-5151-quiet-tick-is-not-a-skipped-claim.md):**
+a missing `drive complete` line is not on its own that standing record. A claim with nothing
+eligible returns at the driver's `nothingEligible` branch, which precedes the module's only
+`drive complete` site, so a covered claim emits no line on a quiet tick — the pair above read
+backwards would call it skipped. See that entry.
+
 ## What is deliberately NOT changed
 
 - **The FIRST precondition — invariant 5 / PEN-5120 — is untouched and still BLOCKS the flip.** The

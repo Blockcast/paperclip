@@ -156,8 +156,20 @@ because `stop_reason` is a label on `sweeps_total`, not on `claims_total`. Query
 The per-claim evidence is a **log line, not a metric**: `isolation reclaim drive complete`
 (`isolation-reclaim-driver.ts`), filtered on `claim=` and `dryRun=false`. With that read: a fresh
 `{dry_run="false"}` timestamp plus a `drive complete` line for this claim at `dryRun=false` and
-`deleted` accounted for means *unreachable but reclaimed*; stale, absent, or dry-run-only means
-unreclaimed. Where it is unreclaimed, it was accepted deliberately, with a ceiling:
+`deleted` accounted for means *unreachable but reclaimed*; a stale, absent, or dry-run-only
+timestamp means unreclaimed.
+
+⚠ **A missing `drive complete` line is not on its own the unreclaimed reading.** A claim with
+nothing eligible — every entry still inside `maxAgeDays` by `mtime` (`fresh`) or by `lastUsedAt`
+(`in_use`), or an empty tree — returns at the driver's `nothingEligible` branch, which sits
+*before* the module's only `drive complete` site, and that quiet tick still counts into
+`claims_total{outcome="ok"}`. So a **covered** claim with nothing to do emits no line at all, and
+the rule above read backwards would class it as skipped. An absent line is evidence of an
+unreclaimed tree only when the aggregate does not already account for the claim: zero `failed` and
+zero `deferred` increase at `{dry_run="false"}` over the window says every claim the sweep listed
+was driven, and a claim driven with nothing eligible is covered.
+
+Where it is unreclaimed, it was accepted deliberately, with a ceiling:
 
 > ≈10 GiB/agent/month against a **50 Gi** claim already carrying ≈13.2 G of duplicated company
 > trees ⇒ ≈36.8 GiB headroom ⇒ **one opted-in agent fills its own claim in ≈3.7 months.**
