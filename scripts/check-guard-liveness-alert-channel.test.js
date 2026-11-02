@@ -288,3 +288,38 @@ test("routing does not depend on the deploy-attempt gauge, which cannot see a di
     /paperclip_api_deploy_failed_since_success|PaperclipProductionDeployFailing/,
   );
 });
+
+// `stale_hours` is a debugging dial that flattens every per-guard threshold at
+// once, so a run that used it is answering a hypothetical rather than measuring
+// the fleet. Neither routing step may fire on such a run.
+//
+// The RESOLVE side is the one this test exists for. A low dial reds the
+// detector and would mint a false firing alert — loud, and retired by the next
+// hourly cron. A high dial GREENS it and would push `resolved`, clearing a
+// genuinely firing alert about a guard that is still dead. That direction is
+// silent, so a gate on the firing step alone would leave the worse half open.
+test("a debugging dispatch routes nothing, in either direction", () => {
+  for (const step of [ROUTE_STEP, RESOLVE_STEP]) {
+    assert.match(
+      executableLines(getStepBlock(step)),
+      /if:.*inputs\.stale_hours == ''/,
+      `${step} must not route when the stale_hours dial was overridden`,
+    );
+  }
+});
+
+// The gate must not cost the scheduled runs, which are the entire point of the
+// channel: on a `schedule` event `inputs` is null, and an `event_name` test
+// would be the obvious-looking way to write this that silently also excludes a
+// blank-dial manual dispatch — a legitimate on-demand sample of the real
+// thresholds. Pin the comparison shape rather than the intent.
+test("the routing gate excludes only an overridden dial, not scheduled runs", () => {
+  for (const step of [ROUTE_STEP, RESOLVE_STEP]) {
+    const guard = executableLines(getStepBlock(step));
+    assert.doesNotMatch(
+      guard,
+      /if:.*github\.event_name/,
+      `${step} must gate on the dial, not on the event that set it`,
+    );
+  }
+});
