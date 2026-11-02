@@ -2078,13 +2078,35 @@ describe("agent metadata: the accepted Tier-0 residual (PEN-5253)", () => {
     expect(masked({ a: { b: { c: ANTHROPIC_SHAPED } } })).toBe(false);
   });
 
-  it("keeps the designed markers intact — the cost a Tier-0 shape pass would charge", () => {
-    // `paperclipBuiltInAgent` is 21 chars, whitespace-free and not slug-shaped,
-    // so the existing detector's length backstop would blank it. Callers read
-    // this marker; blanking it is a live fault, not a hygiene improvement.
+  it("keeps the designed markers intact — a plain regression pin, not a Tier-0 cost", () => {
+    // Deliberately NOT framed as the cost a Tier-0 shape pass would charge: it
+    // cannot fail under one. `looksLikeCredentialValue` tests the VALUE, and
+    // these values are short readable slugs well under
+    // `MIN_OPAQUE_TOKEN_LENGTH` (20) — a Tier-0 pass leaves both green. An
+    // earlier revision claimed otherwise off the 21-character *key* length;
+    // that was a key/value confusion (Ally review, paperclip#3259). The real
+    // over-redaction cost is pinned in the next test.
     expect(containAgentMetadata({ paperclipBuiltInAgent: "cto" })).toEqual({ paperclipBuiltInAgent: "cto" });
     expect(containAgentMetadata({ pluginManagedAgent: "acme-corp-plugin-v2" })).toEqual({
       pluginManagedAgent: "acme-corp-plugin-v2",
     });
+  });
+
+  it("keeps ordinary long opaque identifiers intact — the cost a Tier-0 shape pass WOULD charge", () => {
+    // These three are what the existing detector actually blanks when run at
+    // every key: each is whitespace-free, >= MIN_OPAQUE_TOKEN_LENGTH and not
+    // slug-shaped, so the length backstop classifies all of them as
+    // credential-shaped. They are also ordinary content these columns
+    // legitimately hold, which is why a Tier-0 pass is a live fault rather
+    // than a hygiene improvement. Measured against `looksLikeCredentialValue`
+    // directly (PEN-5253); this test is the pin, so adding a Tier-0 pass
+    // turns the cost into a red test instead of silent data loss.
+    const UUID = "550e8400-e29b-41d4-a716-446655440000";
+    const GIT_SHA = "0c3f0498b188573f729f83a4e3a2737ba3a3bfa3";
+    const IMAGE_REF = "ghcr.io/blockcast/paperclip-claude-k8s:v1.2.3";
+
+    expect(masked({ lastSeenRunId: UUID })).toBe(false);
+    expect(masked({ deployedSha: GIT_SHA })).toBe(false);
+    expect(masked({ image: IMAGE_REF })).toBe(false);
   });
 });

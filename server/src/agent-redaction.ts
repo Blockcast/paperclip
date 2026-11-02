@@ -127,21 +127,28 @@ export function keepSanitizedAgentMetadata(meta: unknown): unknown {
  *    `looksLikeCredentialValue` (`redaction.ts`) is exactly that instrument
  *    and already runs — but only behind a Tier-1/2 *key* match, which is why
  *    `{secret: "sk-ant-…"}` is masked and `{note: …}` is not. Run as-is at
- *    every key it blanks 7 of 12 real stored config values, including the
- *    live `paperclipBuiltInAgent` marker this column exists to hold, plus
- *    UUIDs and git SHAs. Narrowed to high-confidence prefixes it reaches 0
- *    false positives but misses every *prefixless* secret — AWS secret access
- *    keys, passphrases, hex HMAC keys, base64 blobs. Same dial, opposite
- *    ends: the test is sound only where the KEY already says "secret", and
- *    the residual is by construction where it does not.
+ *    every key, its length backstop (`MIN_OPAQUE_TOKEN_LENGTH`, 20, minus the
+ *    readable-slug exemption) blanks the ordinary long opaque identifiers this
+ *    column and its two siblings legitimately hold: UUIDs, 40-hex git SHAs and
+ *    image references all classify as credential-shaped. Narrowed to
+ *    high-confidence prefixes it stops over-redacting but misses every
+ *    *prefixless* secret — AWS secret access keys, passphrases, hex HMAC keys,
+ *    base64 blobs. Same dial, opposite ends: the test is sound only where the
+ *    KEY already says "secret", and the residual is by construction where it
+ *    does not.
  *  - A write-side pass that *masked* would collide with the shared restore
- *    path. All three columns route through {@link restoreRedactedAgentMetadata}
- *    → {@link restoreRedactedAdapterValue}, and `containsRedactedAdapterValue`
- *    SUBSTRING-tests for the sentinel — so a persisted mask makes that key
- *    permanently unwritable: stored `***` restores from a prior that is itself
- *    `***`, with no escape hatch for a false positive. Masking is therefore
- *    out, and *vaulting* (PEN-3726 tick 4's named instrument) needs a
- *    secret-store binding this column does not have.
+ *    path. All three columns share {@link restoreRedactedAdapterValue} /
+ *    {@link containsRedactedAdapterValue}, by two entry points rather than
+ *    one: `metadata` and `runtimeConfig` via
+ *    {@link restoreRedactedAgentMetadata} (of which
+ *    {@link restoreRedactedAgentRuntimeConfig} is a direct alias), and
+ *    `adapterConfig` via {@link stripRedactedEnvBindingsFromAdapterConfig}.
+ *    `containsRedactedAdapterValue` SUBSTRING-tests for the sentinel — so a
+ *    persisted mask makes that key permanently unwritable: stored `***`
+ *    restores from a prior that is itself `***`, with no escape hatch for a
+ *    false positive. Masking is therefore out, and *vaulting* (PEN-3726 tick
+ *    4's named instrument) needs a secret-store binding this column does not
+ *    have.
  *
  * An earlier revision of this docblock said closing the residual "needs a
  * write-side key allowlist, not a read-side redactor". Both halves were
@@ -150,6 +157,15 @@ export function keepSanitizedAgentMetadata(meta: unknown): unknown {
  * read-side value-shape pass *can* see this case. It is not that no control
  * could reach it; it is that every control that reaches it costs more than
  * the hazard, which has no confirmed instance.
+ *
+ * The first revision of *this* decision then got the over-redaction example
+ * wrong in a third way, worth recording because it ran in the direction that
+ * flatters the decision: it claimed the detector run at every key would blank
+ * "the live `paperclipBuiltInAgent` marker", confusing the 21-character *key*
+ * with the *value* `looksLikeCredentialValue` actually tests. The real marker
+ * values (`cto`, `security-engineer`, …) are short readable slugs and survive
+ * untouched. The over-redaction cost is real but sits elsewhere — on the long
+ * opaque identifiers named above — so that is what the tests now pin.
  * `__tests__/agent-secret-redaction.test.ts` pins both sides of this
  * boundary, so a future shape pass fails a test rather than silently
  * widening the column.
