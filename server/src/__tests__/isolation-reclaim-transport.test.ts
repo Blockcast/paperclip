@@ -393,10 +393,14 @@ describe("reclaim executor as a real entrypoint (PEN-5151)", () => {
       // `scripts/run-vitest-stable.mjs` passes no `--reporter` and the root
       // config only ever adds `json` beside it. Verified both ways on v4.1.8:
       // under `--reporter=verbose` a `console.info` shows up, under the
-      // default it is gone, while the executor's own pino lines -- fd 2,
-      // uninterrupted -- survive either. So the channel is the whole point
-      // here, not a style choice; routing this back through `console` would
-      // leave a test that still passes and still reports nothing.
+      // default it is gone, while a direct fd-2 write like the one below
+      // survives either. The executor's own pino lines are NOT the witness
+      // for that: `runEntrypoint` spawns it `stdio: ["ignore", "pipe",
+      // "pipe"]`, so they are captured into `result.stderr` and never reach
+      // a reporter at all. So the channel is the whole point here, not a
+      // style choice; routing this back through `console` would leave a test
+      // that still passes and still reports nothing.
+      // (Ally, review of #3260.)
       process.stderr.write(
         `reclaim executor entrypoint exited in ${result.elapsedMs}ms ` +
           `(watchdog ${ENTRYPOINT_WATCHDOG_MS}ms)\n`,
