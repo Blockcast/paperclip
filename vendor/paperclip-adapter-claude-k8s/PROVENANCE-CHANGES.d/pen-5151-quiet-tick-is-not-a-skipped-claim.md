@@ -43,17 +43,16 @@ What the header owed instead is the condition under which absence *is* evidence.
 review of this PR at head `f556f3e8`, and worth recording because the half-stated form moved the
 failure to the *unsafe* direction while purporting to fix the safe one:
 
-1. **The window contains a fresh `{dry_run="false"}` sweep timestamp**, and `failed`/`deferred`
-   show zero increase at `{dry_run="false"}` across it. Without the freshness the zero is
-   **vacuous**: `recordIsolationReclaimSweep` labels the entire `paperclip_isolation_reclaim_*`
-   family — counters and the `last_sweep` gauge alike — with the sweep's *own* `dry_run`
-   (`metrics.ts`, `const dry_run = options.dryRun ? "true" : "false"`). Under the dry-run-only
-   rollout the runbook calls *"the first state a correct rollout is in"*, no `{dry_run="false"}`
-   series exists at all, so every count read there is zero, no `drive complete` line exists at
-   `dryRun=false`, and the half-stated rule concluded *covered* for a deployment that had reclaimed
-   nothing — while the sentence immediately above it concluded *unreclaimed* for the same state.
-   Freshness is a non-vacuity precondition only; it is not a coverage claim, since the timestamp
-   advances on `deferred` sweeps too.
+1. **The window holds at least one `isolation reclaim sweep complete` line at `dryRun=false`**, and
+   every such line in it reads `claimsFailed: 0` and `claimsDeferred: 0`
+   (`isolation-reclaim-sweep.ts`, one site, on the completion path). The line's existence at
+   `dryRun=false` is the non-vacuity precondition: `recordIsolationReclaimSweep` labels the entire
+   `paperclip_isolation_reclaim_*` family — counters and the `last_sweep` gauge alike — with the
+   sweep's *own* `dry_run` (`metrics.ts`, `const dry_run = options.dryRun ? "true" : "false"`), so
+   under the dry-run-only rollout the runbook calls *"the first state a correct rollout is in"*
+   nothing exists at `dryRun=false` at all and every read there is zero vacuously — which is how
+   the half-stated rule concluded *covered* for a deployment that had reclaimed nothing, while the
+   sentence immediately above it concluded *unreclaimed* for the same state.
 2. **The claim is one the sweep lists.** `listReclaimableClaims` selects agents with
    `enablePerAgentWorkspaceVolume` true or a `workspaceVolumeClaim` distinct from the server's own,
    so a claim left behind by **opting an agent back out** is not listed. The runbook names opting
@@ -62,14 +61,64 @@ failure to the *unsafe* direction while purporting to fix the safe one:
 
 With both stated, the direction is preserved: the rule still fails toward *unreclaimed*.
 
+## Why condition 1 is a log read and not a counter read
+
+The *second* draft stated the conjunction correctly but hung condition 1 on a metric: a fresh
+`{dry_run="false"}` timestamp plus **zero `increase()`** in `claims_total{outcome="failed"}` and
+`{outcome="deferred"}`. Ally caught that at head `bd701333`, and it is the same unsafe direction
+reached through the other half of the test — **`increase()` cannot see a counter series' first
+value.**
+
+`recordIsolationReclaimSweep` creates the `{dry_run, outcome}` children lazily, with
+`inc(byOutcome[outcome])` on the first sweep of a process, and the scrape adds the pod's `instance`.
+So a sweep that failed or deferred on a process's *first* tick lands as that series' first sample,
+already carrying the count; `increase()` measures change between samples, and with no
+created-timestamp ingestion on this Prometheus it reads that first value as **0**. Freshness does
+not repair it — the window genuinely does contain a fresh `{dry_run="false"}` timestamp — so the
+conjunction concluded *covered* for a claim that was deferred or failed.
+
+It is the common case here rather than an edge one, and unlike the first draft this was measured
+rather than argued:
+
+```promql
+count(count_over_time(process_start_time_seconds{job="paperclip-control-plane"}[7d]))  # → 55
+```
+
+≈55 process lifetimes a week against a **daily** sweep tick means most sweeps are the first — often
+the only — sample of their series. The reclaim family has no series yet (the sweep is not enabled),
+so the demonstration is on the **sibling** counter that already carries this idiom at
+`runbooks/isolation-workspace-reaper.md`: **6 of 19** live
+`paperclip_isolation_workspace_reaper_deleted_total` series read `increase(...[7d]) == 0` while
+`max_over_time(...[7d])` over the same window is non-zero (5, 4, 3, 6, 2 and 1 deletions), and two
+more read 7 against 16 and 21 against 26. Every one of those gaps is a deletion `increase()` did
+not count.
+
+The fix moves condition 1 onto the per-sweep `isolation reclaim sweep complete` line at
+`dryRun=false`, which carries `claimsFound`, `claimsFailed` and `claimsDeferred` for each tick and
+does not depend on series identity, so a pod's first sweep counts like any other. The counter
+paragraph that the bad condition derived from — pre-existing, and wrong in the same way — is
+corrected at its source in the same commit rather than left to be re-derived, since leaving the
+premise standing under a corrected conclusion is the drift PEN-5151 exists to remove.
+
+One consequence worth naming: the rule now requires **every** sweep line in the window to read zero,
+not their sum. A tick that deferred claims is a tick this claim may have been the deferred one on,
+and `claimsDeferred > 0` is ordinary rather than exceptional — deferral is the mechanism by which
+the rotation covers a fleet larger than one tick (`metrics.ts` says so where it derives
+`stop_reason`). The strictness is the point: it is the fails-toward-unreclaimed direction.
+
 ## Where the same clause went
 
 Three surfaces carried the rule and all three now carry the correction — leaving one uncorrected
-would recreate the drift PEN-5151 exists to remove:
+would recreate the drift PEN-5151 exists to remove. A fourth, pre-existing paragraph is corrected
+alongside them for the same reason:
 
 - `runbooks/isolation-workspace-reaper.md`, the per-claim evidence paragraph. Its negative clause
   also read *"stale, absent, or dry-run-only means unreclaimed"*, where "absent" could attach to
   the line rather than the timestamp; it is now scoped to the timestamp explicitly.
+- `runbooks/isolation-workspace-reaper.md`, the `claims_total` paragraph — **not** one of the three
+  carrying the rule, and pre-existing, but the source of the `increase()` read the second draft's
+  condition 1 derived from. Corrected here with the measurement, because a corrected conclusion over
+  a standing bad premise is the drift this row removes.
 - `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the DO-NOT-ENABLE header (this
   entry's vendored change).
 - `PROVENANCE-CHANGES.d/pen-5151-ceiling-becomes-a-config-read.md`, pointed here rather than
