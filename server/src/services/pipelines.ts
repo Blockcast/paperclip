@@ -49,7 +49,7 @@ import { logger } from "../middleware/logger.js";
 import { routineService } from "./routines.js";
 import { secretService } from "./secrets.js";
 import type { IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
-import { heartbeatService } from "./heartbeat.js";
+import { heartbeatService, PIPELINE_STAGE_EXIT_CANCELLATION_REASON } from "./heartbeat.js";
 import { logActivity } from "./activity-log.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { authorizationService } from "./authorization.js";
@@ -2297,7 +2297,7 @@ export function pipelineService(
       try {
         await heartbeat.cancelRun(
           runId,
-          "Cancelled because the pipeline case left the automation issue's originating stage",
+          PIPELINE_STAGE_EXIT_CANCELLATION_REASON,
           {
             errorCode: "pipeline_stage_exited",
             eventMessage: "run cancelled after pipeline stage exit",
@@ -3151,7 +3151,7 @@ export function pipelineService(
       });
     if (!cancelledIssue) return;
 
-    const cancellationReason = "Cancelled because the pipeline case left the automation issue's originating stage";
+    const cancellationReason = PIPELINE_STAGE_EXIT_CANCELLATION_REASON;
     const cancelledRuns = await tx
       .update(heartbeatRuns)
       .set({

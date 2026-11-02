@@ -742,8 +742,8 @@ const QUEUED_RUN_DISPATCH_RESUME_CAP_RETRY_DELAY_MS = 1_000;
  * convention used by execution-workspaces / issue-tree-control / routines.
  */
 const PIPELINE_STAGE_EXIT_ERROR_CODE = "pipeline_stage_exited";
-const PIPELINE_STAGE_EXIT_CANCELLATION_REASON =
-  "Cancelled because the pipeline case left the automation issue's originating stage";
+export const PIPELINE_STAGE_EXIT_CANCELLATION_REASON =
+  "Cancelled because the pipeline item left the automation issue's originating stage";
 const LIVENESS_BOOKKEEPING_ACTIVITY_ACTIONS = [
   "environment.lease_acquired",
   "environment.lease_released",
@@ -31085,7 +31085,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     for (const run of pendingStageExitCancellations) {
       await cancelRunInternal(
         run.id,
-        "Cancelled because the pipeline case left the automation issue's originating stage",
+        PIPELINE_STAGE_EXIT_CANCELLATION_REASON,
         {
           errorCode: "pipeline_stage_exited",
           eventMessage: "run cancelled after pipeline stage exit",
