@@ -67,7 +67,7 @@ chain, at any depth.
 | Agent — **creator**, someone else assigned | A | — | — |
 | Agent — **manager** of the assignee | A | **—** | — (grant missing) |
 | Agent — **manager** of the assignee **+ `tasks:assign` grant** | A | **—** | A (via `issue:coordination_metadata`) |
-| Agent — `agent://` **mentioned** on the thread | A | — | — |
+| Agent — `agent://` **mentioned** on the thread **by the issue's assignee, or by a user with an active membership** | A | — | — |
 | Agent — holds a **recovery handoff** on the issue | A | — | — |
 | Agent — assigned the issue's **productivity review** | A | **A** | A (via `issue:mutate`) |
 | Agent — assignee of an issue joined to this one by a **`blocks` edge**, either direction | A | — | — |
@@ -149,7 +149,7 @@ and a reason disagree, trust the reason. It is also what the tests assert on.
 | `allow_company_agent` | `:2438` | A | A | — | issue has no assignee, and is not a review/escalation shell |
 | `allow_issue_creator` | `:2449` | A | — | — | `resource.createdByAgentId === actor` |
 | `allow_manager_chain` | `:2466` | A | — | — | `isManagerOf(actor, resource.assigneeAgentId)` |
-| `allow_issue_mention_grant` | `:2481` | A | — | — | a live, non-deleted `agent://<actor>` mention from a principal entitled to grant it |
+| `allow_issue_mention_grant` | `:2481` | A | — | — | a live, non-deleted `agent://<actor>` **markdown-link** mention whose **comment author** is the issue's own assignee agent, or a user with an active company membership. No other author grants anything — not the manager, not the creator, not the CEO, not the mentioned agent itself (`commentAuthorCanGrantIssueMention`, `:697`). See "Who may grant a mention" below |
 | `allow_recovery_handoff_grant` | `:2493` | A | — | — | an open recovery handoff naming the actor |
 | `allow_dependency_edge` | `agentHoldsIssueAcrossDependencyEdge` | A | — | — | a `blocks` row joins the target T and a non-terminal issue X whose **current** assignee is the actor. In **either** direction the edge's creator must have had standing on T — a board user, T's assignee or creator, or a manager of T's assignee. Neither blocker set is written only by T's side: X's set needs no relation to T, and T's set is also written by child-create with `blockParentUntilDone`, which needs only read on T. Derived at decision time: cutting the edge, reassigning X, or closing X revokes it (`BLO-30968`) |
 | `allow_productivity_review_grant` | `:2518` | A | **A** | — | the actor is assigned the review whose `originId` is this issue |
@@ -195,6 +195,99 @@ Terminal denials:
   are relationship-gated, not grant-gated, and mapping them would make every agent
   holding `tasks:assign` — which is nearly all of them, unscoped — a writer on every
   issue in the company.
+
+## Who may grant a mention
+
+`allow_issue_mention_grant` is the only allow-path whose condition is about **who
+wrote the comment** rather than about the actor's own relation to the issue. Nothing
+else in this file works that way, so the rule is not recoverable by analogy with any
+other row — which is why it is spelled out here rather than left to the word
+"entitled". The predicate is `commentAuthorCanGrantIssueMention`
+(`server/src/services/authorization.ts:697`), and it is the whole rule:
+
+| Author of the mentioning comment | Grants the mentioned agent `issue:comment`? |
+| --- | :---: |
+| The issue's **assignee agent** | yes |
+| A **user** with an active company membership | yes |
+| The **mentioned agent itself** | no |
+| **Any other agent** — manager, creator, CEO, peer | **no** |
+
+Two consequences follow from the `null` handling and are the ones that surprise
+readers:
+
+- **On an issue with an agent assignee, only that assignee can grant.** Being the
+  manager of the assignee is not enough, being the issue's creator is not enough,
+  and being the CEO is not enough: none of them is the assignee, and none holds a
+  user membership. Each of those principals already holds `issue:comment` itself
+  (`allow_manager_chain`, `allow_issue_creator`) — holding it does not make it
+  grantable.
+- **On an issue with no agent assignee, no agent can grant it at all**, because
+  `null` never equals an author id; only a board or cloud-tenant user can. That is
+  moot on an ordinary unassigned issue, where `allow_company_agent` already carries
+  comment to every same-company agent, and load-bearing on a review or escalation
+  shell, where it deliberately does not (`BLO-19094`).
+
+### Binding and entitlement are different mechanisms, and only binding is reported
+
+Mention **binding** asks "does this href resolve to a live agent?". Mention
+**entitlement** asks "may this author grant?". They are evaluated in different
+places and only the first is ever reported back to the author. A well-formed
+`[@Name](agent://<id>)` written by a **non-entitled** author therefore:
+
+- **binds** — so it is **absent from the create response's `unboundMentions`**, whose
+  contract is "every `@` token bound" (`PEN-5180`). That statement is true and says
+  nothing whatever about entitlement;
+- raises **no** `issue_comment_mentioned` wake — the wake is gated on this same
+  predicate at all three comment-create paths (`server/src/routes/issues.ts:4645`,
+  `:14468`, `:16816`), each with a positive control in
+  `server/src/__tests__/issue-update-comment-wakeup-routes.test.ts`;
+- confers **no** grant.
+
+So such a mention is **wholly inert, and silent on every surface its author can
+read**: a 201, an empty `unboundMentions`, no wake, no grant, and no field anywhere
+naming the reason. The would-be granter has every available signal saying the
+invitation was delivered. The blocked agent is never woken and stays blocked, so the
+failure does not even surface as a refused run — it surfaces as nothing at all.
+
+This is the same shape as the `issue:mutate` silence recorded above, which cost
+`PEN-2394` / `PEN-3940` / `PEN-4462` a run each, and the remedy is the same: make the
+rule legible rather than widen it. `PEN-5334` was filed from a live instance on
+`PEN-4623` / `PEN-5319`, where a link-form mention was asked for three times and
+amplified by the CEO without anyone stating that **only the assignee can discharge
+it** — leaving two other principals positioned to "help" with a mention that cannot
+work and reports nothing when it does not.
+
+### Why the rule stays narrow
+
+Widening it is not on the table. If a mentioned agent could in turn mention another,
+two agents could hand each other a voice on any issue in the company and the negative
+controls below would be unenforceable — the identical argument the dependency-edge
+control already states ("Otherwise any two agents could hand each other a voice on any
+issue"). Excluding the mentioned agent's own self-mention is that same argument at
+depth one. The cost is accepted: a blocked agent cannot be unblocked by a sympathetic
+peer, only by the assignee or a human.
+
+### What revokes a mention grant
+
+The grant is **re-derived at decision time**, not stamped on the comment, and the
+assignee it compares against is the issue's **current** one
+(`resource.assigneeAgentId`, `:2725`). Three consequences:
+
+- **Reassigning the issue revokes it.** A mention the previous assignee wrote stops
+  granting the moment the row changes hands, because the author is no longer the
+  assignee. This is the one real path to "woken but not authorized": the wake fired
+  at create time against the then-current assignee and cannot be unfired, while the
+  grant is evaluated fresh on every request. An agent in that state is not reading a
+  stale denial — its access genuinely ended.
+- **Deleting the comment revokes it.** The lookup filters `deletedAt IS NULL`.
+- **For the user arm, revocation is by membership status, not by role.** The test is
+  `getActiveCompanyMembership` — `status = 'active'`, with **no role predicate**
+  (`:1570`). A seat must have been non-`viewer` to post the mention at all, since
+  `viewer` and `support` hold no `issue:comment` (`:1916`), but a later downgrade to
+  either does **not** revoke a grant the seat already issued. Deactivating the
+  membership does. A downgraded seat cannot issue new ones, so this is a
+  persistence property rather than a reachable escalation — but it is asymmetric
+  with the agent arm above, where reassignment revokes.
 
 ## Why `comment` and `description` are deliberately asymmetric
 
@@ -281,6 +374,13 @@ without re-deciding the model itself:
 - A `tasks:assign` holder who does **not** manage the assignee: denied
   `issue:coordination_metadata` (`deny_scope`).
 - A mentioned agent: denied `issue:mutate` — the mention grants reply, not rewrite.
+- An agent mentioned by **anyone other than the issue's assignee or an
+  active-membership user** — a manager, the creator, the CEO, a peer, or itself:
+  denied `issue:comment`. Otherwise mention grants would chain agent-to-agent and
+  every control in this list would be reachable by two agents mentioning each
+  other. This control is **silent on both halves** — the mention still binds, so it
+  is absent from `unboundMentions`, and no wake is raised either, so neither party
+  learns anything; see "Who may grant a mention".
 - An agent assigned a parent or sibling issue: denied on the target issue.
   Ancestry is not a declared dependency; only a `blocks` edge is.
 - An agent across a `blocks` edge: denied `issue:mutate` — the edge grants a
@@ -303,6 +403,33 @@ the five board principals included, and the parent-or-sibling row split into two
 asserting every action verdict in the allow-path table, including the denials. The
 four historical incidents are rows in that table rather than separate cases, which
 is the specific thing that was missing when each of them shipped.
+
+The author condition on `allow_issue_mention_grant` is pinned by five cases in the
+same file. They are named here because the rule is a property of the *comment's
+author*, so a reader looking for it under the mentioned agent's relations will not
+find it:
+
+- **"comment mention grant predicate"** (`:176`) — the unit test over
+  `commentAuthorCanGrantIssueMention` itself: unrelated agent `false`, assignee
+  `true`, active member `true`. The direct pin, and the cheapest one to read.
+- **"allows a mentioned non-assignee to comment when the mention author is the issue
+  assignee"** — the positive path, end to end through `decide`.
+- **"does not grant mention-scoped issue access from self-authored or
+  unauthorized-author comments"** — both negative author arms in one case. It asserts
+  through the low-trust arm, where a mention grant is the only escape from the
+  boundary (`:1266`), so the author condition is exactly what the denial measures.
+- **"requires an active board-user membership for mention-scoped issue grants"** — the
+  user arm, asserting the denial before the membership row exists and
+  `allow_issue_mention_grant` after it is inserted.
+- **"grants only on the markdown mention link, not on a bare `agent://` string from the
+  same assignee"** — the binding half held against the right author: correct granter,
+  wrong form, no grant (`PEN-2394`).
+
+The wake half is pinned in
+`server/src/__tests__/issue-update-comment-wakeup-routes.test.ts` by **"does not wake a
+mentioned agent when an agent comment cannot grant reply access"** and **"does not
+enqueue a keyed mention wake when an agent cannot grant reply access"**, each paired
+with a positive control that asserts the entitled author *does* wake it.
 
 Escape hatch 3's scope is pinned by the sibling case **"blocker edge (escape hatch 3)
 gates checkout and in_progress, not done"** in the same describe block. It fails if
