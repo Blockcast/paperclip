@@ -71,7 +71,7 @@ sent `PEN-4775` looking for an implication rule keyed on `role` or on org-root.
 | Order | Where | Condition | Result | On `master`? |
 | --- | --- | --- | --- | --- |
 | 1 | `decideLowTrustAccess` | actor resolves to the low-trust review preset | **deny** `deny_low_trust_boundary`, unconditionally — preempts both paths below | in effect |
-| 2 | `decideBase`, its `if (input.action === "agent_config:read")` branch | `resource.type === "agent"` **and** `resource.agentId === actorAgentId` | **allow** `allow_self` | in effect |
+| 2 | `decideBase`, its `if (input.action === "agent_config:read")` branch | `resource.type === "agent"` **and** `resource.agentId === actorAgentId` | **allow** `allow_self` | in effect — **reachable on this action's call sites only since `#3244`**, and deliberately still not on all of them; see the note below |
 | 3a | `decideWithAgentConfigReadGrant`, called from that same branch | actor holds `agents:configure` | **allow** `allow_explicit_grant` — against an `agent` resource **or** a `company` one | in effect |
 | 3b | the same function, reached only when 3a did not allow | actor held `agents:suggest-changes` — against **either** resource type, exactly as 3a | **allow** `allow_explicit_grant`, company-reaching | **history — pre-`#3244`** |
 | 3b′ | as 3b, but admitted only when `resource.type === "agent"` carries an `agentId` | actor holds `agents:suggest-changes` | **allow** `allow_explicit_grant`, for that **one named subject** | in effect |
@@ -117,6 +117,46 @@ sent `PEN-4775` looking for an implication rule keyed on `role` or on org-root.
 > allowed to read, so a consent-gated read has no first step, and calling
 > `assertConsented` from a read path would burn the one-shot token the
 > subsequent write needs.
+
+> **Row 2 was *structurally unreachable* on this action's single-agent call
+> sites until `#3244`, and that is the second half of the same fix.**
+> `decideBase`'s `allow_self` branch requires `resource.type === "agent"`
+> **and** `resource.agentId === actorAgentId`; every `agent_config:read` caller
+> in `routes/agents.ts` passed `{ type: "company", companyId }`
+> unconditionally, so the branch could never match on them. Row 2 was live in
+> the policy engine and dead on these paths. Self-read survived only because
+> `GET /api/agents/:id` short-circuits with
+> `canReadSensitiveDetail = isSelf ? true : …` *before* consulting the policy
+> engine — the route table below records that mechanism but not this
+> consequence.
+>
+> What made row 2 reachable again is the **caller** change, not the
+> `deny_scope` arm. `#3244` replaced those call sites with
+> `resource: subjectAgentId ? { type: "agent", companyId, agentId: subjectAgentId } : { type: "company", companyId }`
+> — in `assertCanReadConfigurations` and in the newly extracted shared helper
+> `actorCanReadAgentConfigForResource`. The two halves should not be
+> conflated: the caller ternary **reopens row 2**, the `deny_scope` arm **shuts
+> the bulk door**. A tree carrying one without the other has only half of
+> `PEN-5231`, and the "check, rather than assume" test above does not detect it
+> — it tests for rows 3b′/3c only.
+>
+> **The subject is passed per route, not mechanically, so row 2 is reachable on
+> only some of this action's call sites.** `/agents/:id`,
+> `/agents/:id/configuration` and `/agents/:id/skills` name the subject.
+> `GET /companies/:companyId/agent-configurations` keeps the company resource
+> because it honestly answers for every seat at once — and that is precisely
+> the question the suggest tier is now refused. The two
+> `/agents/:id/config-revisions` routes keep it **deliberately**: config
+> history is reachable from no other self route, so naming the subject there
+> would be a genuine widening. For the same reason
+> `actorCanReadConfigurationsForCompany` was **not** renamed away — `#3244`
+> extracted the shared implementation into `actorCanReadAgentConfigForResource`
+> and added `actorCanReadConfigurationsForAgent` beside it, leaving the
+> company-scoped entry point for its one remaining bulk caller.
+>
+> This is the same root cause as `PEN-4775`'s list-route self-row drop. That row
+> patched the symptom — the self row — and left the gate shape, which is what
+> this note records.
 
 A **board** (human) actor takes a different door entirely — company membership
 is sufficient, via `actorCanReadConfigurationsForCompany`
