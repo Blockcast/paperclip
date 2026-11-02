@@ -5,11 +5,11 @@
 // `PaperclipReaperSignalMissing` fired. This drives the REAL owner finalization
 // through `invoke` and pins that it observes exactly once.
 import { randomUUID } from "node:crypto";
-import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { agents, companies, createDb } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import * as metricsModule from "../services/metrics.js";
+import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -67,15 +67,42 @@ describeEmbeddedPostgres("owner finalization observes the silence-gap histogram 
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   const spy = vi.mocked(metricsModule.recordExternalLifecycleRunSilenceGap);
+  // `runOnce` mints a service per case, so cleanup has no single handle to
+  // drain. Collect them (as heartbeat-workspace-finalize-branch does).
+  const heartbeatServices = new Set<ReturnType<typeof heartbeatService>>();
 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-owner-silence-gap-");
     db = createDb(tempDb.connectionString);
   });
 
+  // PEN-5300: this suite used to `spy.mockClear()` and then issue a bare
+  // `TRUNCATE TABLE "companies" CASCADE` directly. Both halves were racy
+  // against the fire-and-forget `executeRun` tail this suite deliberately
+  // drives, and the two halves produced two different red shards:
+  //
+  //  - TRUNCATE takes AccessExclusiveLock on the whole cascade while a
+  //    still-finalizing run holds RowShareLock on a child table -> 40P01
+  //    deadlock (run 41421341606). This is the v513 saga exactly; see the
+  //    `inFlightExecutions` comment in heartbeat.ts.
+  //  - `mockClear()` before the tail had landed let the PREVIOUS case's
+  //    observation arrive afterwards and count against the NEXT case's spy
+  //    (run 41446392171: "records nothing for a local adapter" saw one call
+  //    carrying `adapter: "claude_k8s"`).
+  //
+  // `cleanupHeartbeatTestState` is the canonical sequence for any suite that
+  // exercises heartbeatService: cancel active runs, await
+  // `drainInFlightExecutions`, then TRUNCATE under a transaction-scoped
+  // advisory lock. Clearing the spy after the drain closes the second half.
   afterEach(async () => {
+    const servicesToDrain = [...heartbeatServices];
+    heartbeatServices.clear();
+    await cleanupHeartbeatTestState(db, {
+      async drainInFlightExecutions(timeoutMs) {
+        await Promise.all(servicesToDrain.map((service) => service.drainInFlightExecutions(timeoutMs)));
+      },
+    }, { errorLabel: "owner silence-gap cleanup", drainTimeoutMs: 30_000 });
     spy.mockClear();
-    await db.execute(sql.raw(`TRUNCATE TABLE "companies" CASCADE`));
   });
 
   afterAll(async () => {
@@ -106,9 +133,28 @@ describeEmbeddedPostgres("owner finalization observes the silence-gap histogram 
     const heartbeat = heartbeatService(db, {
       penstockAvailabilityGate: { async checkAdapter() { return { allow: true }; }, _resetForTesting() {} },
     });
+    heartbeatServices.add(heartbeat);
     const run = await heartbeat.invoke(agentId, "on_demand", {}, "manual");
     expect(run).not.toBeNull();
-    return waitForRunToFinish(heartbeat, run!.id);
+    // PEN-5300: explicit, generous budget. The default is 5s, but this suite
+    // drives a REAL finalization whose tail alone measured 1-3s locally, so on
+    // a loaded 6-way-sharded runner the default is marginal and times out --
+    // a third way for this file to red-light a shard it has nothing to do
+    // with. Per BLO-33449 this budget is wall-clock, not a behavioural
+    // assertion, so widening it hides no regression; the `it` timeout below
+    // remains the real bound.
+    const finished = await waitForRunToFinish(heartbeat, run!.id, 25_000);
+    // PEN-5300: `waitForRunToFinish` polls run STATUS, and status is written by
+    // the `setRunStatusIfRunning` CAS that elects the single finalizer -- the
+    // whole finalization tail, including this suite's
+    // `recordExternalLifecycleRunSilenceGap` call, runs AFTER that write. So a
+    // terminal status is not evidence the observation has happened, and
+    // asserting on the spy here is a race the test loses under load
+    // ("expected [] to have a length of 1"). The helper cannot close this gap:
+    // the status write has to come first for the election to work. Draining the
+    // fire-and-forget `executeRun` promise is what makes the tail observable.
+    await heartbeat.drainInFlightExecutions(30_000);
+    return finished;
   }
 
   it("records one succeeded observation for an external-lifecycle run", async () => {
