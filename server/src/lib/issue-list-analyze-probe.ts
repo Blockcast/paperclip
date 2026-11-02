@@ -24,11 +24,38 @@ import {
  * without `ANALYZE` reports the planner's **estimates** and never what the
  * executor actually did.
  *
- * The live hypothesis needs the other half: an `Append` estimated at ~70 rows
- * driving a `Nested Loop` over 2,842-byte-wide pkey fetches, plus a `Sort`,
- * with `SubPlan 3` re-scanning the comment-body arm. An underestimate there
- * turns into N wide random fetches, and **actual-vs-estimated rows is the only
- * discriminator**. Only `ANALYZE` carries it.
+ * ## ⚠️ There are TWO plan shapes, and only one of them was reported first
+ *
+ * Five captures read 2026-11-02 (three more than the pair the first PEN-3596
+ * write-up generalised from) show the planner flipping on term selectivity:
+ *
+ * | search term | shape | `Append` estimate | total cost |
+ * |---|---|---|---|
+ * | 6-8 chars | `Nested Loop` over `issues_pkey` | **73** | 1,554 - 1,798 |
+ * | 3 chars | **`Hash Join`** over a `HashAggregate` | **17,500 - 21,585** | **~38,500** |
+ *
+ * ⛔ So "production picks the good plan, estimated cost ~4,100" describes the
+ * CHEAP shape only. For a common short term the planner picks a different plan
+ * an order of magnitude more expensive, and on one company it drops the
+ * dedicated search index on two of the four arms (`issues_company_priority_idx`
+ * for the description arm, `issue_comments_company_idx` for the body arm) in
+ * favour of scanning the company's rows and filtering.
+ *
+ * **Both shapes have been observed timing out**, which is why the hypothesis
+ * needs actuals rather than more estimates:
+ *
+ *   - On the CHEAP shape a >30 s run IS a blowup — an `Append` estimated at 73
+ *     driving a `Nested Loop` over 2,842-byte-wide pkey fetches, with
+ *     `SubPlan 3` re-scanning the comment-body arm. If the actual count is far
+ *     above 73, that is N wide random fetches the planner never priced.
+ *   - On the EXPENSIVE shape the estimate may simply be RIGHT: ~20 k candidates
+ *     out of ~6 k company issues and ~15 k company comments is plausible for a
+ *     term like `the`, and then 30 s is honest work rather than a mistake.
+ *
+ * Those two have opposite fixes — one wants better estimates or a different
+ * join, the other wants less candidate work — and **nothing in an `EXPLAIN`
+ * without `ANALYZE` can tell them apart**, because the only discriminator is
+ * actual-vs-estimated rows. Only `ANALYZE` carries it.
  *
  * ## ⛔ Why this does NOT reopen PEN-5223's `ANALYZE` prohibition
  *
@@ -128,7 +155,8 @@ export const ISSUE_LIST_ANALYZE_PROBE_TIMEOUT_MS = 60_000;
  *
  * Lower than the PEN-5223 capture's 5, because each of these *executes* a
  * statement that costs ~25 s of database time rather than planning one that
- * costs ~0.4 s. The question needs one good reading; three allows for a
+ * costs ~0.4 s. The two budgets are independent, but they draw on the same
+ * database: a window that burns both is ~25 x the load of a PEN-5223 window. The question needs one good reading; three allows for a
  * capture landing on a cold cache or racing a deploy. Deliberately not
  * configurable — a flag plus an operator's intention is not a bound.
  *
