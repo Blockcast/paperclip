@@ -443,8 +443,17 @@ env:
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_INTERVAL_MINUTES
       value: "720"
 
-    # PEN-5223 box 4 -- a TIME-BOXED diagnostic, not a standing behaviour.
-    # Turn this back to "false" once a plan is captured (box 5).
+    # PEN-5223 box 5 -- the time-boxed diagnostic is DONE; this is OFF again.
+    # Two class-A plans were captured in production on 2026-11-02 (09:39:11Z,
+    # searchTermLength 26; 11:36:54Z, searchTermLength 6), both the SEARCH
+    # variant, both from statements that really hit the 30s timeout, and both
+    # posted to PEN-3596. They answered box 4's question: production is NOT
+    # choosing a bad plan -- every search arm is index-served, no Seq Scan,
+    # total estimated cost ~4,100-4,400. The remaining question is where the
+    # 30s is actually SPENT, and `EXPLAIN` without `ANALYZE` structurally
+    # cannot answer it, so leaving this on buys nothing and only widens an
+    # error-path side effect. Flip to "true" again if a future reader needs a
+    # plan from a different tenant or query shape; it is a one-line change.
     #
     # When a `/api/issues` list query is cancelled by the 30s statement_timeout
     # (57014), the server asks the planner for that exact statement's plan with
@@ -472,7 +481,7 @@ env:
     # NOT `PAPERCLIP_`-prefixed, or that needs `valueFrom`, is a reviewed policy
     # change in onprem-k8s instead -- so keep flags `PAPERCLIP_`-prefixed.
     - name: PAPERCLIP_EXPLAIN_TIMED_OUT_ISSUE_LIST
-      value: "true"
+      value: "false"
 
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
