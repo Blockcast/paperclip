@@ -162,7 +162,13 @@ renamed_jobs() { # stdin: twin-less legacy bare names; $1 = file of base workflo
   # that is ONLY an expression matches everything -> STOP (fails closed).
   # ponytail: textual, not YAML-parsed: any line carrying `name:` counts (step,
   # workflow), which only ever adds STOPs.
-  [ -s "${1:-}" ] || return 0
+  # Drain stdin before returning: this is a filter, and a caller piping
+  # names in gets EPIPE/SIGPIPE if we exit without reading them. The
+  # payload normally fits the pipe buffer, so the write only fails when it
+  # loses the race with our exit -- an intermittent failure in a caller
+  # that did nothing wrong. Skip the drain on a tty so an interactive
+  # invocation does not block waiting for EOF.
+  [ -s "${1:-}" ] || { [ -t 0 ] || cat >/dev/null 2>&1; return 0; }
   while IFS= read -r j; do
     [ -n "$j" ] && ! grep -qF -- "$j" "$1" && ! grep -qF -- "${j%% (*}" "$1" \
       && ! templated_name "$j" "$1" && printf '%s\n' "$j"
