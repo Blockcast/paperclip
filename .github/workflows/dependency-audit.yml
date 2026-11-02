@@ -1,0 +1,96 @@
+name: Dependency Audit
+
+on:
+  schedule:
+    # Daily, off the hour and off :00/:30. An advisory feed does not move fast
+    # enough to justify the hourly cadence the drift monitors use, and this job
+    # resolves nothing — it only reads the committed lockfile — so a missed run
+    # costs at most a day of detection latency on a feed whose publication
+    # latency is already measured in days.
+    - cron: "37 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# PEN-5285: nothing in CI ran a dependency audit at all. The repo's whole
+# dependency-security posture was static — `pnpm.overrides` floors, a
+# `securityAuditRemediations` ledger, and per-package guard tests asserting the
+# lockfile honours those floors — and every one of those compares the tree
+# against a number a human wrote into the repo. None can see an advisory
+# published after the number was written. That is not hypothetical: when this
+# landed, `pnpm.overrides` pinned `hono: ^4.12.21` and `qs: ^6.15.2`, both
+# green, while the live feed wanted >=4.13.11 and >=6.16.1.
+#
+# WHY SCHEDULED AND NOT pr.yml. The input is a live external feed, so a PR gate
+# would go red for reasons no PR caused — every PR hostage to upstream
+# publication timing. That is also why `scripts/security-audit-overrides.test.js`
+# is deliberately reachable from no workflow (PEN-5272). The COMPARISON LOGIC is
+# static, though, and is gated on every PR: pr.yml runs
+# scripts/check-dependency-audit.test.mjs, which is offline and clock-free. The
+# split is the point — logic on the PR gate, live feed on the schedule.
+#
+# WHY IT IS GREEN ON DAY ONE WITHOUT HIDING THE NEXT ONE. 36 moderate
+# advisories were already on master at 6ce2ed8f0. Each is enumerated in
+# scripts/dependency-audit-baseline.json by (advisory, package) with a verdict,
+# a reason and a review-by date. There is no wildcard and no severity-level
+# blanket, so a 37th advisory matches nothing and fails the lane. Past its
+# review-by, a still-live entry fails too, which is what keeps an accepted risk
+# from decaying into the same invisible silence as the static tables. The full
+# reasoning, including the two criteria that were rejected, is in the header of
+# scripts/check-dependency-audit.mjs.
+#
+# NOT YET WATCHED BY scheduled-guard-liveness.yml. That registry requires a
+# threshold derived from a guard's OWN measured completion-gap distribution and
+# says so emphatically ("THRESHOLDS ARE MEASURED PER GUARD, NOT GUESSED AND NOT
+# SHARED"); this workflow has no history to derive one from. Registering it with
+# an invented number would reproduce the PEN-3379 defect inside a new guard. It
+# is tracked for registration once a few weeks of completions exist.
+jobs:
+  audit-master-dependencies:
+    runs-on: arc-paperclip-light
+    timeout-minutes: 10
+    steps:
+      - name: Checkout master
+        uses: actions/checkout@v5
+        with:
+          ref: master
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+          run_install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      # No `pnpm install`: `pnpm audit` reads the committed lockfile directly.
+      # Installing would let a floating range resolve to something master does
+      # not actually ship, which would make the lane report on a tree nobody has.
+      # The report is captured to a file rather than piped, so the alert step
+      # can quote the actual violations. A `| tee` here would make the step's
+      # exit status tee's, silently masking the failure this job exists to emit.
+      - name: Audit prod dependencies against the triage baseline
+        id: audit
+        continue-on-error: true
+        run: |
+          status=0
+          node ./scripts/check-dependency-audit.mjs > "$RUNNER_TEMP/dependency-audit.txt" 2>&1 || status=$?
+          cat "$RUNNER_TEMP/dependency-audit.txt"
+          exit "$status"
+
+      - name: Push dependency advisory alert to Alertmanager
+        if: steps.audit.outcome == 'failure'
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          AUDIT_REPORT_FILE: ${{ runner.temp }}/dependency-audit.txt
+        run: node ./.github/scripts/post-dependency-audit-alert.mjs
+
+      - name: Fail the run when an advisory is unaccounted for
+        if: steps.audit.outcome == 'failure'
+        run: exit 1

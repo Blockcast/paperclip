@@ -1206,6 +1206,30 @@ jobs:
         run: node --test ./scripts/check-lockfile-overrides-consistency.test.mjs
         timeout-minutes: 1
 
+      # PEN-5285. The COMPARISON LOGIC of the scheduled dependency-audit lane.
+      # The lane itself is scheduled, never a PR gate, because its input is the
+      # live advisory feed and a PR gate on that goes red for reasons no PR
+      # caused. But the baseline-vs-feed comparison is pure and offline, and it
+      # is where the fail-open shapes live — in particular that the baseline is
+      # keyed on (advisory, package) rather than advisory alone, because one
+      # GHSA id is reported under two packages in this very tree, so the
+      # weaker key would let one entry silently suppress the other's finding.
+      # These tests inject their own clock; nothing here reads the real date,
+      # so an entry's review-by passing can never turn the merge gate red.
+      - name: Test dependency audit baseline comparison
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-dependency-audit.test.mjs
+        timeout-minutes: 1
+
+      # The escalation half, same reasoning as the lockfile drift alert below:
+      # the delivery path runs only inside the scheduled job and only on a day
+      # master is already carrying an unaccounted advisory, so a regression in
+      # it is invisible until the one run that needed it.
+      - name: Test dependency audit alert payload
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/post-dependency-audit-alert.test.mjs
+        timeout-minutes: 1
+
       # BLO-27611. The escalation half of the guard above: the hourly drift
       # monitor's only recipient. Its delivery path runs exclusively inside the
       # scheduled job, and only on the branch where master is ALREADY drifted,

@@ -195,3 +195,12 @@ platform cannot resolve automatically. Each runbook should be:
   means evidence must be collected inside the window. Trigger: a soak stage is
   starting, or `enableGitHubPublishBroker` is on and you need to know whether
   the broker is working.
+
+- [`dependency-audit.md`](dependency-audit.md) — the daily scheduled
+  `pnpm audit --prod` lane and the triage baseline it compares against. Covers
+  why the live feed is scheduled while its comparison logic is PR-gated, the
+  three conditions that fail the lane (`unbaselined`, `expired`,
+  `severity-escalated`), why an expired entry must be **re-triaged rather than
+  re-dated**, and why the baseline is keyed on (advisory, package) rather than
+  advisory alone. Trigger: `DependencyAdvisoryUnaccounted` fired, or you are
+  adding/retiring a baseline entry.
