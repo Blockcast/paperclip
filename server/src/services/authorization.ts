@@ -1965,12 +1965,12 @@ export function authorizationService(db: Db) {
     // `agents:suggest-changes` is the consented-diff tier: its WRITE is bound
     // to named target keys, to a run, and to an accepted consent record
     // (`decideWithProtectedChangeGrants` + `assertCanApplyProtectedAgentChange`).
-    // Its read is therefore admitted only against ONE NAMED SUBJECT — the
-    // agent being diffed — and never against a `company` resource, which is
-    // what the bulk config-list routes pass. Before PEN-5231 the suggest tier
-    // bought the same unconditional company-wide read as `agents:configure`,
-    // i.e. read authority strictly exceeding its own write authority, which is
-    // the divergence the PEN-3206 §5 test condemns.
+    // Its read is therefore admitted only against ONE NAMED SUBJECT, and never
+    // against a `company` resource, which is what the bulk config-list routes
+    // pass. Before PEN-5231 the suggest tier bought the same unconditional
+    // company-wide read as `agents:configure`, i.e. read authority strictly
+    // exceeding its own write authority, which is the divergence the PEN-3206
+    // §5 test condemns.
     //
     // RESIDUAL, deliberately not closed here: this admits the subject, not the
     // diff. Binding the read to an accepted consent record is infeasible
@@ -2013,9 +2013,9 @@ export function authorizationService(db: Db) {
           action: input.action,
           reason: "deny_scope",
           explanation:
-            "Permission agents:suggest-changes reads the configuration of one named agent — the subject of a "
-            + "proposed diff — and does not carry a company-wide configuration read. Request this read against a "
-            + "specific agent, or hold agents:configure.",
+            "Permission agents:suggest-changes reads the configuration of one named agent, and does not carry "
+            + "a company-wide configuration read. Request this read against a specific agent, or hold "
+            + "agents:configure.",
           grant: suggestDecision.grant,
         });
       }
