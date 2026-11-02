@@ -7,6 +7,12 @@ import {
   MAX_ENQUEUES_PER_FIRE,
   STALE_ENQUEUE_HOURS,
   STALE_HOLD_HOURS,
+  UNLANDED_ELIGIBLE_HOURS,
+  alarmExitCode,
+  stateHold,
+  statedHoldMarker,
+  renderUnlandedEligible,
+  unlandedEligible,
   allyVerdictAtHead,
   approvalLanes,
   checkSettlement,
@@ -315,19 +321,25 @@ describe("per-fire cap", () => {
     // carry. This one composes the real `repoRunner` with a spy in place of
     // `runRepo`: passing a literal 0 would make the cap per repo again.
     const rotted = [];
+    const stranded = [];
     const calls = [];
     const spy = (...args) => {
       calls.push(args);
       return classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent: args[3] });
     };
-    sweepRepos(["a/one", "a/two"], repoRunner(true, 7, rotted, spy));
+    sweepRepos(["a/one", "a/two"], repoRunner(true, 7, rotted, stranded, spy));
     assert.deepEqual(calls, [
-      ["a/one", true, 7, 0, rotted],
-      ["a/two", true, 7, 3, rotted],
+      ["a/one", true, 7, 0, rotted, stranded],
+      ["a/two", true, 7, 3, rotted, stranded],
     ]);
-    // deepEqual is structural, so an empty `rotted` above matches any empty
-    // array. Identity is what main's `finally` relies on to report the cohort.
-    for (const call of calls) assert.equal(call[4], rotted);
+    // deepEqual is structural, so the empty `rotted`/`stranded` above match
+    // any empty array. Identity is what main relies on: `rotted` for the
+    // `finally` cohort, `stranded` for the --alarm exit code, and a copy in
+    // either position would report an empty cohort and exit 0 forever.
+    for (const call of calls) {
+      assert.equal(call[4], rotted);
+      assert.equal(call[5], stranded);
+    }
   });
 });
 
@@ -1680,5 +1692,259 @@ describe("resolveMergeState (PEN-5057)", () => {
     const { sleep } = sleeps();
     assert.equal(resolveMergeState("o/r", 1, undefined, { run, sleep }), "CLEAN");
     assert.equal(calls.length, 1);
+  });
+});
+
+describe("unlanded-eligible PRs (PEN-5263)", () => {
+  const checkAt = (iso) => [
+    { __typename: "CheckRun", name: "verify", conclusion: "SUCCESS", completedAt: iso },
+  ];
+  const pr = (number, iso) => ({ number, statusCheckRollup: iso === null ? [] : checkAt(iso) });
+  const row = (number, action, reason) => ({ number, action, reason });
+
+  const FRESH = "2026-09-13T11:00:00Z"; // 1h before NOW
+  const OLD = "2026-09-12T20:00:00Z"; // 16h before NOW
+
+  it("reports a PR the classifier said yes to that is still open hours later", () => {
+    // #3241's shape, 2026-11-02: `enqueue` / `mergestate:CLEAN`, Ally clean at
+    // the exact head, no outstanding reviewer — and 21 PRs merged past it
+    // while it sat there. It appeared in no report anywhere, because the only
+    // report in the routine enumerates reasons for inaction and it had none.
+    assert.deepEqual(
+      unlandedEligible([pr(3241, OLD)], [row(3241, "enqueue", "mergestate:CLEAN")], { now: NOW }),
+      [{ number: 3241, reason: "mergestate:CLEAN", ageHours: 16 }],
+    );
+  });
+
+  it("does not report a PR that is about to land — the normal case", () => {
+    // The overwhelming majority of `enqueue` rows are this. A detector that
+    // named them would fire on its own normal operation and be ignored.
+    assert.deepEqual(
+      unlandedEligible([pr(1, FRESH)], [row(1, "enqueue", "mergestate:CLEAN")], { now: NOW }),
+      [],
+    );
+  });
+
+  it("is disjoint from stalledHolds — a PR is in exactly one cohort", () => {
+    // The two blocks print together, so an overlap would name one PR twice
+    // under two mechanisms. `stalledHolds` takes rows WITH a reason for
+    // inaction, this one takes rows with none; the split is on `action`, so
+    // it is total.
+    const prs = [pr(1, OLD), pr(2, OLD)];
+    const rows = [
+      row(1, "enqueue", "mergestate:CLEAN"),
+      row(2, "codeowner-review-requested", "owner-approval-pending"),
+    ];
+    assert.deepEqual(unlandedEligible(prs, rows, { now: NOW }), [
+      { number: 1, reason: "mergestate:CLEAN", ageHours: 16 },
+    ]);
+    assert.deepEqual(stalledHolds(prs, rows, { now: NOW }), [
+      { number: 2, reason: "owner-approval-pending", ageHours: 16 },
+    ]);
+  });
+
+  it("leaves the cohorts that already have a clock to someone else", () => {
+    // `already-enqueued` is bounded by STALE_ENQUEUE_HOURS off the auto-merge
+    // request's own `enabledAt`, which is a better clock than this one;
+    // `enqueue-failed` falls out of NON_HOLD_ACTIONS and is aged by
+    // `stalledHolds`. Claiming either here would name one PR twice.
+    const prs = [pr(1, OLD), pr(2, OLD), pr(3, OLD)];
+    const rows = [
+      row(1, "already-enqueued", "auto-merge armed 1.0h ago"),
+      row(2, "stale-enqueue", "auto-merge armed 20.0h ago"),
+      row(3, "enqueue-failed", "mergestate:CLEAN"),
+    ];
+    assert.deepEqual(unlandedEligible(prs, rows, { now: NOW }), []);
+    assert.deepEqual(
+      stalledHolds(prs, rows, { now: NOW }).map((held) => held.number),
+      [3],
+      "enqueue-failed is the one of the three stalledHolds owns",
+    );
+  });
+
+  it("does NOT claim the cap-deferred row — a stated residual, not an oversight", () => {
+    // `classifyAll` rewrites an over-budget `enqueue` into `skip`/`cap:`, so
+    // the row no longer reads `enqueue` and is excluded here by action.
+    // `stalledHolds` excludes it by reason, deliberately: the deferred rows
+    // are selected for old check stamps, so this clock is biased against them.
+    // That leaves cap-starvation uncovered BY DESIGN — see the comment on
+    // `unlandedEligible`. Pinned so widening the predicate has to be a choice.
+    const prs = [pr(1, OLD)];
+    const rows = [row(1, "skip", `cap:${MAX_ENQUEUES_PER_FIRE}-per-fire`)];
+    assert.deepEqual(unlandedEligible(prs, rows, { now: NOW }), []);
+    assert.deepEqual(stalledHolds(prs, rows, { now: NOW }), []);
+  });
+
+  it("never claims a deliberate hold, including #3209's do-not-merge label", () => {
+    // #3209 was PEN-5263's one unexplained residual. It is explained: the
+    // `do-not-merge` label was applied 2026-11-01T11:55:56Z, 2m56s after its
+    // head commit and ~20h before the measurement, so it classified
+    // `skip`/`label:do-not-merge` throughout. An explicit opt-out, not a
+    // strand — and it must never reach this cohort, whose whole claim is that
+    // nothing is holding the row.
+    assert.deepEqual(
+      unlandedEligible([pr(3209, OLD)], [row(3209, "skip", "label:do-not-merge")], { now: NOW }),
+      [],
+    );
+  });
+
+  it("does not claim a row whose merge state GitHub has not computed", () => {
+    // Measured 2026-11-02: #3241 and #3255 read `enqueue`/`mergestate:CLEAN`
+    // at 09:0xZ and `skip`/`mergestate:UNKNOWN` at 09:2xZ, after
+    // `resolveMergeState` had spent its retries. UNKNOWN is UNREAD, so this
+    // cohort — whose entire content is "nothing is holding this" — must not
+    // claim it. Costs one sample; `stalledHolds` owns the row from
+    // STALE_HOLD_HOURS. Pinned so a later widening has to argue past it.
+    const prs = [pr(3241, OLD)];
+    const rows = [row(3241, "skip", "mergestate:UNKNOWN")];
+    assert.deepEqual(unlandedEligible(prs, rows, { now: NOW }), []);
+    assert.deepEqual(stalledHolds(prs, rows, { now: NOW }), [
+      { number: 3241, reason: "mergestate:UNKNOWN", ageHours: 16 },
+    ]);
+  });
+
+  it("REPORTS an undatable eligible row rather than dropping it", () => {
+    // Same §4l posture as `stalledHolds`: an instrument that cannot see
+    // something must not report clean. Narrow — it needs a non-empty rollup
+    // with no timestamp on any entry — and a row that persists here is a true
+    // finding twice over: nothing landed it, and nothing dated it.
+    assert.deepEqual(
+      unlandedEligible(
+        [{ number: 1, statusCheckRollup: [{ name: "verify", conclusion: "SUCCESS" }] }],
+        [row(1, "enqueue", "mergestate:CLEAN")],
+        { now: NOW },
+      ),
+      [{ number: 1, reason: "mergestate:CLEAN", ageHours: null }],
+    );
+    assert.deepEqual(
+      unlandedEligible([], [row(9, "enqueue", "mergestate:CLEAN")], { now: NOW }),
+      [{ number: 9, reason: "mergestate:CLEAN", ageHours: null }],
+      "a row whose PR is missing entirely is still reported",
+    );
+  });
+
+  it("renders nothing when none is stranded, and names each one when they are", () => {
+    assert.equal(renderUnlandedEligible("a/one", []), "");
+    const text = renderUnlandedEligible("a/one", [
+      { number: 3241, reason: "mergestate:CLEAN", ageHours: 9.3 },
+      { number: 8, reason: "mergestate:CLEAN", ageHours: null },
+    ]);
+    assert.match(text, /unlanded-eligible \(judgeable >6h, nothing holding it\)/);
+    // The remedy has to point AWAY from the PR: every one of these rows is
+    // clean, so a reader sent to inspect the PR finds nothing and concludes
+    // the report is noise.
+    assert.match(text, /the landing itself, not a decision about it/);
+    assert.match(text, /a\/one#3241 — `mergestate:CLEAN`, 9\.3h/);
+    assert.match(text, /a\/one#8 — `mergestate:CLEAN`, age unknown/);
+  });
+
+  it("shares the settle floor's clock, so the two cannot drift apart", () => {
+    assert.equal(UNLANDED_ELIGIBLE_HOURS < STALE_HOLD_HOURS, true);
+    const withMirror = {
+      number: 1,
+      statusCheckRollup: [
+        { __typename: "CheckRun", name: "verify", conclusion: "SUCCESS", completedAt: OLD },
+        {
+          __typename: "StatusContext",
+          context: "gate/ally-comment-findings",
+          state: "SUCCESS",
+          createdAt: FRESH,
+        },
+      ],
+    };
+    // #1981's shape: an Ally verdict mirror posted after CI finished must not
+    // restart the clock on a PR that has not moved.
+    assert.deepEqual(
+      unlandedEligible([withMirror], [row(1, "enqueue", "mergestate:CLEAN")], { now: NOW }),
+      [{ number: 1, reason: "mergestate:CLEAN", ageHours: 16 }],
+    );
+  });
+
+  it("turns the schedule red only when something is stranded (AC4)", () => {
+    // The whole point of the scheduled detector: a stranded PR must surface
+    // without a human noticing by hand. Exiting 0 on a non-empty cohort is
+    // the failure this guards, and it is silent.
+    assert.equal(alarmExitCode([]), 0);
+    assert.equal(alarmExitCode(undefined), 0);
+    assert.equal(alarmExitCode(["a/one#3241"]), 1);
+    assert.equal(alarmExitCode(["a/one#3241", "a/one#3255"]), 1);
+  });
+});
+
+describe("stated holds on the PR (PEN-5263)", () => {
+  it("keys the marker by reason, so a later hold is not silenced by an earlier one", () => {
+    // Keyed by PR alone, a row that waited on CI and then sat on a code-owner
+    // request would carry a comment naming the CI and nothing naming the
+    // owner — the exact silent-hold shape this closes.
+    assert.notEqual(
+      statedHoldMarker("checks:FAILURE"),
+      statedHoldMarker("owner-approval-pending"),
+    );
+    assert.equal(
+      statedHoldMarker("mergestate:DIRTY"),
+      "<!-- landing-routine:stated-hold:mergestate-dirty -->",
+    );
+  });
+
+  it("cannot be made to close its own HTML comment", () => {
+    // Reasons carry free text (`cap:10-per-fire`, a detail string), so the
+    // marker slugs rather than interpolates. A `-->` reaching the marker
+    // would terminate it early and leave the rest of the body as visible
+    // noise — and, worse, break the idempotency substring match so the
+    // routine re-posted every fire.
+    const marker = statedHoldMarker("evil --> <script>x</script>");
+    assert.equal(marker.match(/-->/g).length, 1);
+    assert.equal(marker.endsWith(" -->"), true);
+    assert.equal(marker.includes("<script>"), false);
+  });
+
+  it("slugs a reason the vocabulary does not cover without colliding", () => {
+    assert.equal(statedHoldMarker(undefined), "<!-- landing-routine:stated-hold:unknown -->");
+    assert.notEqual(statedHoldMarker("checks:none"), statedHoldMarker("checks:FAILURE"));
+  });
+
+  it("posts once per reason and never again", () => {
+    const calls = [];
+    const marker = statedHoldMarker("owner-approval-pending");
+    const run = (args) => {
+      calls.push(args);
+      if (args[0] === "api") return JSON.stringify([]);
+      return "";
+    };
+    assert.equal(
+      stateHold("a/one", { number: 7, reason: "owner-approval-pending", ageHours: 40.2 }, run),
+      "posted",
+    );
+    const [read, write] = calls;
+    assert.deepEqual(read, ["api", "repos/a/one/issues/7/comments", "--paginate"]);
+    assert.deepEqual(write.slice(0, 5), ["pr", "comment", "7", "--repo", "a/one"]);
+    assert.match(write[6], /^<!-- landing-routine:stated-hold:owner-approval-pending -->/);
+    assert.match(write[6], /`owner-approval-pending`/);
+    assert.match(write[6], /last reported 40\.2h ago/);
+    // The reader has to know this will not repeat, or the natural response to
+    // a routine comment is to mute the routine.
+    assert.match(write[6], /once per reason, not once per fire/);
+
+    // Second fire, same reason: the marker is already there.
+    const seen = (args) =>
+      args[0] === "api" ? JSON.stringify([{ body: `${marker}\nanything` }]) : "";
+    const after = [];
+    assert.equal(
+      stateHold(
+        "a/one",
+        { number: 7, reason: "owner-approval-pending", ageHours: 64 },
+        (args) => (after.push(args), seen(args)),
+      ),
+      "already-posted",
+    );
+    assert.equal(after.length, 1, "reads the comments, writes nothing");
+  });
+
+  it("states an undatable hold without claiming a duration it does not have", () => {
+    const calls = [];
+    const run = (args) => (calls.push(args), args[0] === "api" ? JSON.stringify([]) : "");
+    stateHold("a/one", { number: 8, reason: "checks:none", ageHours: null }, run);
+    assert.match(calls[1][6], /an unknown time \(no dated check on this head\)/);
+    assert.doesNotMatch(calls[1][6], /NaN|null|undefined/);
   });
 });

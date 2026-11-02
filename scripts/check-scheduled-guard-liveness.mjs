@@ -107,6 +107,18 @@ export const WATCHED_GUARDS = [
   { workflow: "codeowners-guard.yml", staleHours: 2.75 },
   { workflow: "relay-ssl-multicert-guard.yml", staleHours: 2.75 },
   { workflow: "lockfile-drift-monitor.yml", staleHours: 2.75 },
+  // PEN-5263. Hourly on the same bar as the cohort above, and for the same
+  // reason the bar exists: it is an hourly cron on this lane, so the measured
+  // jitter band applies to it unchanged. Note it is NOT part of the frozen
+  // PEN-3281 six — it postdates that record and shares none of its cron
+  // minute (:27), so it cannot participate in the simultaneity the magnitude
+  // argument above declines to rely on anyway.
+  //
+  // Watching it matters more than for most rows here: it is the only detector
+  // for unheld-and-unlanded PRs, and its own subject is a routine whose
+  // failure mode is silence. A dark detector for a silent defect is two
+  // layers of nothing.
+  { workflow: "landing-sweep.yml", staleHours: 2.75 },
   // adapter-pin-drift-monitor.yml was RETIRED by PEN-3916 and removed here
   // deliberately, which is the path the 404 branch below names. It watched for
   // `ARG OPENCODE_K8S_REF` rotting retroactively when a squash-merge in

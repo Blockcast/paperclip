@@ -156,6 +156,27 @@ export const EJECTIONS_BEFORE_HOLD = 2;
 export const CODEOWNER_REQUEST_MARKER = "<!-- landing-routine:codeowner-request -->";
 export const STALE_ENQUEUE_MARKER = "<!-- landing-routine:stale-enqueue -->";
 
+/**
+ * Marker for the stated-hold comment, keyed by the REASON and not just by the
+ * PR.
+ *
+ * Keying it by PR alone would state the first durable hold a PR ever acquired
+ * and stay silent through every later one: a PR that waits on CI, goes green,
+ * then sits on a code-owner request would carry a comment naming the CI and
+ * nothing naming the owner. Keying by reason costs at most one comment per
+ * distinct durable reason per PR, which is bounded by the reason vocabulary
+ * (a handful) rather than by the number of fires.
+ *
+ * The reason is slugged rather than interpolated raw because reasons carry
+ * `:` and free text (`cap:10-per-fire`, `mergestate:DIRTY`), and an HTML
+ * comment must not be able to carry anything that closes it early.
+ */
+export const statedHoldMarker = (reason) =>
+  `<!-- landing-routine:stated-hold:${String(reason ?? "unknown")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")} -->`;
+
 /** Either label is an explicit human "not this one". */
 export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
 
@@ -1202,6 +1223,177 @@ export function renderStalledHolds(repo, held, { staleHours = STALE_HOLD_HOURS }
   );
 }
 
+/**
+ * How long a PR may classify `enqueue` — the routine's own "nothing is holding
+ * this" — and still be open before it is reported as stranded rather than as
+ * about to land.
+ *
+ * ## Why a second cohort, when `stalledHolds` already ages the receipt
+ *
+ * `stalledHolds` enumerates REASONS FOR INACTION and ages them. A row that
+ * reads `enqueue` has no such reason, so it is in `NON_HOLD_ACTIONS` and is
+ * structurally invisible to it — correctly, for the fire that acts on it.
+ * The invisibility is wrong only for a row that reads `enqueue` fire after
+ * fire and never lands, and nothing in this repo could see that case.
+ *
+ * Measured 2026-11-02T09:0xZ on Blockcast/paperclip (PEN-5263, sharpened by
+ * Devops on PEN-5260): a dry run classified #3241 and #3255 `enqueue`, and
+ * the stale-hold block printed 8 rows — none of them these two. #3241's head
+ * landed 2026-11-01T23:51:30Z and Ally returned a clean verdict against it at
+ * 00:05:01Z; **21 PRs merged to `master` past it** while it sat eligible. It
+ * appeared in no report anywhere, because it was not held.
+ *
+ * ## Why this clock, and why six hours
+ *
+ * `judgeableAgeHours` — the same clock as `stalledHolds`, for the same reason
+ * (see its comment). The threshold is the part that differs, and it is
+ * deliberately SHORTER than `STALE_HOLD_HOURS`.
+ *
+ * `STALE_HOLD_HOURS` is 13 because a hold waits on a human and 13h clears an
+ * overnight queue. This cohort's defining property is that it waits on NOBODY:
+ * the classifier has already said yes. So the only thing it can be waiting on
+ * is the routine itself, and the right scale is the routine's own cadence.
+ * Measured over the 30 most recent merges to `master` (2026-11-01T18:20Z →
+ * 2026-11-02T08:41Z): median gap ~20 min, longest 144.8 min. Six hours is
+ * ~2.5x the worst observed gap, so a row still eligible at that age has been
+ * passed over by several fires that demonstrably merged other PRs — which is
+ * the measured shape of the defect, not a slow afternoon.
+ *
+ * It is a detection threshold, never a deadline: a PR landing in ten minutes
+ * is the normal case and is reported nowhere.
+ */
+export const UNLANDED_ELIGIBLE_HOURS = 6;
+
+/**
+ * The PRs the classifier said yes to and that are still open well past the
+ * window in which this repo lands anything, as `{ number, reason, ageHours }`.
+ *
+ * ## What is deliberately NOT in this cohort
+ *
+ * `already-enqueued` — bounded already, and by a better clock: a wedged
+ * auto-merge request is reported as `stale-enqueue` off its own `enabledAt`
+ * after STALE_ENQUEUE_HOURS. Adding it here would name one PR twice.
+ *
+ * `enqueue-failed` — `markFailure` renames the action, which drops it out of
+ * `NON_HOLD_ACTIONS`, so `stalledHolds` already ages it. Covered.
+ *
+ * `cap:N-per-fire` — a STATED residual, not an oversight. `stalledHolds`
+ * excludes it because the deferred rows are selected for old check stamps
+ * (the budget is spent on PRs that reported more recently), so this clock is
+ * biased against them at any threshold; aging them would fire hardest exactly
+ * when the queue is deepest and the routine is working. That reasoning holds
+ * here unchanged, so a cap-STARVED PR is invisible to both detectors. It is
+ * accepted because starvation is not reachable at today's figures — the cap
+ * is MAX_ENQUEUES_PER_FIRE per fire against a measured 18-34 merges/day — and
+ * it wants its own detector with its own clock if it ever becomes so. Do not
+ * close that gap by widening this predicate.
+ *
+ * ## A sampling gap, measured rather than assumed
+ *
+ * `mergeStateStatus: UNKNOWN` is deliberately NOT claimed here. GitHub
+ * computes mergeability lazily and a CLEAN row flaps to UNKNOWN under load:
+ * measured 2026-11-02, #3241 and #3255 classified `enqueue`/`mergestate:CLEAN`
+ * at 09:0xZ and `skip`/`mergestate:UNKNOWN` at 09:2xZ, with `resolveMergeState`
+ * having already spent its retries. While a row reads UNKNOWN its state is
+ * UNREAD, so claiming "nothing is holding this" about it would be a statement
+ * the data does not support — and this cohort's whole content is that claim.
+ *
+ * The cost is one missed sample, not a blind spot: the condition persists for
+ * hours, the sweep is hourly, and `stalledHolds` owns `mergestate:UNKNOWN`
+ * outright from STALE_HOLD_HOURS. What is genuinely uncovered is a PR that
+ * reads UNKNOWN on every sample between the two thresholds. Stated here
+ * rather than papered over, because the fix for it is a better merge-state
+ * read, not a looser predicate.
+ *
+ * An undatable row (`ageHours === null`) is REPORTED, matching `stalledHolds`
+ * and for the same §4l reason: an instrument that cannot see something must
+ * not report clean. The case is narrow — it needs a rollup that is non-empty
+ * but carries no timestamp on any entry — and a row that persists in it is a
+ * true finding twice over, because nothing landed it AND nothing dated it.
+ */
+export function unlandedEligible(
+  prs,
+  rows,
+  { now = Date.now(), staleHours = UNLANDED_ELIGIBLE_HOURS } = {},
+) {
+  const byNumber = new Map((prs ?? []).map((pr) => [pr?.number, pr]));
+  const stranded = [];
+  for (const row of rows ?? []) {
+    if (row?.action !== "enqueue") continue;
+    const ageHours = judgeableAgeHours(byNumber.get(row?.number), { now });
+    if (ageHours !== null && ageHours < staleHours) continue;
+    stranded.push({ number: row?.number, reason: row?.reason, ageHours });
+  }
+  return stranded;
+}
+
+/** The unlanded-eligible block for one repo's receipt, or "" when there is none. */
+export function renderUnlandedEligible(
+  repo,
+  stranded,
+  { staleHours = UNLANDED_ELIGIBLE_HOURS } = {},
+) {
+  if ((stranded ?? []).length === 0) return "";
+  const line = ({ number, reason, ageHours }) =>
+    `  ${repo}#${number} — \`${reason}\`, ` +
+    (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`);
+  return (
+    `unlanded-eligible (judgeable >${staleHours}h, nothing holding it) — ${stranded.length}:\n` +
+    stranded.map(line).join("\n") +
+    "\nThese carry no hold at all — the classifier said enqueue. So the thing " +
+    "that has not happened is the landing itself, not a decision about it. " +
+    "Check that the routine is firing and that its enqueues are succeeding " +
+    "before looking at the PRs."
+  );
+}
+
+/**
+ * The sentence a durable hold gets on its own PR.
+ *
+ * ## Why only the DURABLE holds, when PEN-5263 asked for every decline
+ *
+ * "Every landing decline states its reason on the PR" is the right goal and
+ * the literal reading is self-defeating. Measured on this repo 2026-11-02, one
+ * fire declined 31 of 33 open PRs, 20 of them on `checks:QUEUED` or
+ * `checks:IN_PROGRESS` — states that clear in minutes without anyone reading
+ * anything. Commenting on each, each fire, buries the two comments that matter
+ * under hundreds that do not, and the end state of an alarm that fires on its
+ * own normal operation is that nobody reads it. That failure is already
+ * recorded twice in this file (`DELIBERATE_HOLD_REASON_RE`, `reportRotted`).
+ *
+ * So the line is drawn where the existing detectors already draw it: a decline
+ * is stated on the PR once it has stopped being a wait — once `stalledHolds`
+ * or `unlandedEligible` names it. Both are aged on `judgeableAgeHours`, so a
+ * transient decline is never stated and a durable one always is. `#3102`'s
+ * code-owner comment is the template and is unchanged; this generalises it to
+ * every reason that outlives its window, rather than the two that happened to
+ * have a bespoke comment.
+ *
+ * `commentOnce` makes it idempotent, and `statedHoldMarker` keys it by reason,
+ * so the ceiling is one comment per PR per distinct durable reason — not one
+ * per fire. The two bespoke comments keep their own markers and are not
+ * duplicated here: they state a reason this function cannot (an action the
+ * routine TOOK, in `stale-enqueue`'s case), and they are posted from
+ * `applyRow` at the moment of the action rather than from the age report.
+ */
+export function stateHold(repo, { number, reason, ageHours }, run = gh) {
+  const age =
+    ageHours === null || ageHours === undefined
+      ? "an unknown time (no dated check on this head)"
+      : `${ageHours.toFixed(1)}h`;
+  return commentOnce(
+    repo,
+    number,
+    statedHoldMarker(reason),
+    `The landing routine is not enqueuing this PR: \`${reason}\`.\n\n` +
+      `This head last reported ${age} ago, so the reason has stopped being a wait and is ` +
+      `stated here rather than left in the routine's receipt. Clear it, or say on this PR why ` +
+      `it stands.\n\n` +
+      `Posted once per reason, not once per fire — the routine will not repeat this.`,
+    run,
+  );
+}
+
 const PR_LIST_FIELDS =
   "number,headRefOid,author,labels,isDraft,autoMergeRequest,mergeStateStatus,reviewRequests";
 
@@ -1573,7 +1765,7 @@ export function markFailure(row, message) {
   return row;
 }
 
-function runRepo(repo, apply, settleMinutes, spent, rotted) {
+function runRepo(repo, apply, settleMinutes, spent, rotted, stranded = []) {
   const prs = fetchOpenPrs(repo);
   const rows = classifyAll(prs, { settleMinutes, spent });
 
@@ -1605,8 +1797,34 @@ function runRepo(repo, apply, settleMinutes, spent, rotted) {
   // After the apply loop, so a row this fire just enqueued (or just renamed to
   // `enqueue-failed`) is aged on what it ENDED as, not on the classification
   // it entered with.
-  const stalled = renderStalledHolds(repo, stalledHolds(prs, rows));
-  console.log(`## ${repo}\n\n${renderReceipt(rows)}${stalled ? `\n\n${stalled}` : ""}`);
+  const held = stalledHolds(prs, rows);
+  const stalled = renderStalledHolds(repo, held);
+  // Disjoint from `stalled` by construction: that block reports rows with a
+  // reason for inaction, this one rows with none. A PR can never be in both.
+  const eligible = unlandedEligible(prs, rows);
+  for (const row of eligible) stranded.push(`${repo}#${row.number}`);
+
+  // Stated on the PR, not just in this receipt — and only on `--apply`, since
+  // it is a write. A failure here is recorded against the row and never
+  // aborts: the report above is the load-bearing output, and losing it
+  // because one comment POST failed would trade the whole fire's visibility
+  // for one PR's. `isFatalGhError` is deliberately NOT consulted — a rate
+  // limit reached while commenting has already let the reads through, so the
+  // receipt is trustworthy and worth printing.
+  if (apply) {
+    for (const row of [...held, ...eligible]) {
+      try {
+        stateHold(repo, row);
+      } catch (error) {
+        const message = error?.stderr?.toString() || error?.message || String(error);
+        console.error(
+          `  (could not state the hold on ${repo}#${row.number}: ${message.trim().split("\n")[0]})`,
+        );
+      }
+    }
+  }
+  const blocks = [renderReceipt(rows), stalled, renderUnlandedEligible(repo, eligible)];
+  console.log(`## ${repo}\n\n${blocks.filter(Boolean).join("\n\n")}`);
   return rows;
 }
 
@@ -1631,9 +1849,9 @@ export function sweepRepos(repos, runOne) {
  * the cap per repo again) without running `main`. `run` is a test seam.
  */
 export const repoRunner =
-  (apply, settleMinutes, rotted, run = runRepo) =>
+  (apply, settleMinutes, rotted, stranded = [], run = runRepo) =>
   (repo, spent) => {
-    const rows = run(repo, apply, settleMinutes, spent, rotted);
+    const rows = run(repo, apply, settleMinutes, spent, rotted, stranded);
     console.log("");
     return rows;
   };
@@ -1652,10 +1870,33 @@ function reportRotted(rotted) {
   );
 }
 
+/**
+ * The exit code for an alarm run: 1 when any repo carried an unlanded-eligible
+ * PR, 0 otherwise.
+ *
+ * Separated from `main` so the AC4 contract — go visibly red rather than
+ * relying on someone noticing by hand — is pinned by a test rather than by
+ * reading the shape of `main`.
+ */
+export function alarmExitCode(stranded) {
+  return (stranded ?? []).length > 0 ? 1 : 0;
+}
+
 function main() {
   const apply = process.argv.includes("--apply");
+  const alarm = process.argv.includes("--alarm");
+  // Refused rather than merged, because the two readings of a post-apply
+  // `enqueue` row are opposite: in an alarm run it means "nothing took this in
+  // UNLANDED_ELIGIBLE_HOURS", in an applying run it means "this fire is taking
+  // it right now". A combined mode would report the fire that RESCUED a PR as
+  // the fire that stranded it.
+  if (alarm && apply) {
+    console.error("--alarm is a dry-run detector; it cannot be combined with --apply");
+    process.exit(2);
+  }
   const settleMinutes = settleMinutesFrom();
   const rotted = [];
+  const stranded = [];
 
   // `finally`, because the cohort is the expensive half of the output and the
   // likeliest thrower is `fetchOpenPrs` — outside `runRepo`'s try, one list
@@ -1663,12 +1904,22 @@ function main() {
   // run the only `gh` traffic there is. The explicit call before `process.exit`
   // in `runRepo` stays: `exit` does not unwind, so this block never runs there.
   try {
-    sweepRepos(targetRepos(), repoRunner(apply, settleMinutes, rotted));
+    sweepRepos(targetRepos(), repoRunner(apply, settleMinutes, rotted, stranded));
   } finally {
     reportRotted(rotted);
   }
 
   if (!apply) console.log("\n(dry run — pass --apply to act)");
+
+  if (alarm && stranded.length > 0) {
+    console.error(
+      `\nALARM: ${stranded.length} PR(s) have been landable for over ` +
+        `${UNLANDED_ELIGIBLE_HOURS}h and are still open — ${stranded.join(", ")}.\n` +
+        "Nothing is holding them, so the landing routine is what has not run. " +
+        "See the unlanded-eligible block above.",
+    );
+  }
+  if (alarm) process.exit(alarmExitCode(stranded));
 }
 
 export function isMainModule(argvPath = process.argv[1], moduleUrl = import.meta.url) {
