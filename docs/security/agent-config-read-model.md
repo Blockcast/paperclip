@@ -727,10 +727,7 @@ is the step at which a widening gets refused cheaply.
 > historical, they stay correct across a re-route, and they are not pointers —
 > which is why the one-line property holds despite them.
 >
-> (An earlier revision of this line claimed this was the only place the id
-> appeared in the file. That was false at the commit that introduced it, not
-> merely stale, and it was then repeated as a verified reading on the issue
-> thread. Do not restore it: a self-referential count is the one claim a file
+> (Do not restore a self-referential count here: it is the one claim a file
 > promising *descriptive* in its Status line cannot make and keep.)
 
 `PEN-4775` deliberately changed only the self row,
