@@ -42,6 +42,15 @@ const executorEntry = path.resolve(here, "..", "cli", "isolation-reclaim-executo
  * now carries the elapsed time and both partial streams -- the next occurrence
  * measures itself instead of having to be re-derived from this comment.
  *
+ * "Headroom, not a measurement" is itself what made 30_000 hard to re-size: a
+ * green run reported nothing, so the steady state was never anything but a
+ * guess, and the first number anyone saw was the one printed by an ejection.
+ * The success path now reports its own elapsed time too (see `runEntrypoint`
+ * and the fd-2 write at its call site), on the same clock the watchdog uses --
+ * so the next sizing of this constant is a read off the shard logs, and a
+ * drift toward 90_000 is visible while it is still drift. (Ally, review of
+ * #3249.)
+ *
  * The suite budget stays strictly above the watchdog so that the watchdog's
  * diagnostic rejection is what fails the test; vitest's own timeout would fire
  * first and print neither stream.
@@ -369,6 +378,30 @@ describe("reclaim executor as a real entrypoint (PEN-5151)", () => {
     try {
       const result = await runEntrypoint(root, home);
 
+      // The watchdog only speaks when it fires, which is the one moment its
+      // number arrives too late to act on -- by then a shard is already out of
+      // the merge queue. This reports the same measurement on the way through,
+      // so the cost is in the log of every green run as well. It sits before
+      // the assertions deliberately: a failure on any of them is exactly when
+      // the reading is worth having, and after them it would be skipped.
+      // (Ally, review of #3249.)
+      //
+      // Written to fd 2 rather than through `console.info`, which would make
+      // this line inert in the only place it is meant to be read. Vitest
+      // intercepts the console and its DEFAULT reporter drops what a PASSING
+      // test wrote -- and the default is what CI runs, since
+      // `scripts/run-vitest-stable.mjs` passes no `--reporter` and the root
+      // config only ever adds `json` beside it. Verified both ways on v4.1.8:
+      // under `--reporter=verbose` a `console.info` shows up, under the
+      // default it is gone, while the executor's own pino lines -- fd 2,
+      // uninterrupted -- survive either. So the channel is the whole point
+      // here, not a style choice; routing this back through `console` would
+      // leave a test that still passes and still reports nothing.
+      process.stderr.write(
+        `reclaim executor entrypoint exited in ${result.elapsedMs}ms ` +
+          `(watchdog ${ENTRYPOINT_WATCHDOG_MS}ms)\n`,
+      );
+
       expect(result.code).toBe(0);
 
       // The test name says "on stdout", and until now nothing held that: the
@@ -401,11 +434,15 @@ describe("reclaim executor as a real entrypoint (PEN-5151)", () => {
  * Kept apart rather than merged, because the fd split is itself under test:
  * a helper that returned one interleaved string could not express the
  * assertion above.
+ *
+ * `elapsedMs` is measured from the same instant the watchdog is armed, so it
+ * reads directly against `ENTRYPOINT_WATCHDOG_MS` rather than against some
+ * other origin a caller would have to correct for.
  */
 function runEntrypoint(
   sweepRoot: string,
   home: string,
-): Promise<{ code: number | null; stdout: string; stderr: string }> {
+): Promise<{ code: number | null; stdout: string; stderr: string; elapsedMs: number }> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -448,7 +485,7 @@ function runEntrypoint(
     });
     child.on("close", (code) => {
       clearTimeout(watchdog);
-      resolve({ code, stdout, stderr });
+      resolve({ code, stdout, stderr, elapsedMs: Date.now() - startedAt });
     });
   });
 }
