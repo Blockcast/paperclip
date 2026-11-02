@@ -139,7 +139,7 @@ anchor whose construct it can place unambiguously, and reports the rest rather t
 
 <!-- anchor-file: vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts -->
 
-Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3240`**
+Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3468`**
 (`asBoolean(config.enableGitHubPublishBroker, false)`). Every anchor below is a line in that
 same vendored file — not the `opencode-k8s` adapter's same-named `job-manifest.ts` — and each
 is re-resolved against the tree by `scripts/check-doc-line-anchors.mjs` on every PR, so these
@@ -147,9 +147,9 @@ numbers are checked continuously rather than as of any one reading:
 
 | | Gate off (today) | Gate on |
 |---|---|---|
-| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:3955`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
+| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:4278`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
 | Agent publish path | `git`/`gh`/MCP authenticate locally | agent asks the broker over a unix socket; `PAPERCLIP_GITHUB_BROKER_SOCKET` is set |
-| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:4513`** (`!narrowWritableSurface`)) — fail closed, not degrade |
+| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:4895`** (`!narrowWritableSurface`)) — fail closed, not degrade |
 | Pod shape | one container | `+1` native sidecar (initContainer, `restartPolicy: Always`), uid 1001, gid 1000, same image |
 
 Two properties make staging possible, and both were verified in the source rather than assumed:
@@ -214,28 +214,28 @@ The chain, read at `47d01a4bf`:
 
 <!-- anchor-file: server/src/services/heartbeat.ts -->
 
-1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8320`
+1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8446`
    (`function parseIssueAssigneeAdapterOverrides(`), parses
    `issue.assigneeAdapterOverrides.adapterConfig` with `parseObject` and **no key allowlist** —
    arbitrary keys pass.
-2. `mergeModelProfileAdapterConfig`, defined at `:7084`
+2. `mergeModelProfileAdapterConfig`, defined at `:7210`
    (`export function mergeModelProfileAdapterConfig(input: {`), is a **shallow spread** with `issueAdapterConfig`
    **last**, so an issue override beats agent config for any top-level key.
-3. The merged object becomes `executionRunConfig` at `:34453`
+3. The merged object becomes `executionRunConfig` at `:34894`
    (`stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig)`) and reaches the adapter as `ctx.config`
    — the same object `buildJobManifest` reads the gate from.
-4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:2793`
+4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:2922`
    (`function withAgentScopedEnvProvenance(`), re-asserts agent values for
    `AGENT_SCOPE_ONLY_ENV_KEYS` — three keys, **inside `env`**. It does nothing for top-level
    `adapterConfig` keys.
 
 So `assigneeAdapterOverrides.adapterConfig.enableGitHubPublishBroker = false` on an issue assigned to
 the agent yields a pod with the credential back in the agent container. The overlay applies only when
-`issueContext.assigneeAgentId === agent.id` (`:33889`) — which is not a mitigation, since an agent can
+`issueContext.assigneeAgentId === agent.id` (`:34330`) — which is not a mitigation, since an agent can
 file an issue assigned to itself, and `paperclipCreateIssue` exposes `assigneeAdapterOverrides`
 directly.
 
-The code already knows this class of problem. The comment at `:2776`
+The code already knows this class of problem. The comment at `:2905`
 (`is issue.assigneeAdapterOverrides.adapterConfig.`) says it in as many words:
 
 > `issueAdapterConfig` is `issue.assigneeAdapterOverrides.adapterConfig`.
@@ -462,9 +462,9 @@ looked".
 **What changed on 2026-10-20 is named in the source, not inferred.** `BLO-47526` gave a `shared`
 runtime descriptor agent-scoped persistent roots so that `narrowWritableSurface` holds — the
 `mode === "shared"` branch and its rationale comment in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:1087-1100`**
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:1273-1286`**
 (`if (mode === "shared") {`), with
-`narrowWritableSurface` itself defined at **`:3581`**
+`narrowWritableSurface` itself defined at **`:3887`**
 (`const narrowWritableSurface = isolation.enabled && dataClaimName !== "";`); before it, a shared run returned
 `enabled:false` and kept the whole PVC mounted rw. `isolation_disabled` being the *only* leg that
 ever fired, and its stopping dead at that change, is consistent with that and with nothing else.
@@ -472,10 +472,10 @@ ever fired, and its stopping dead at that change, is consistent with that and wi
 ⚠ **The surviving broad path, which the zero does not cover.** `resolveJobIsolation` falls through to
 `SHARED_JOB_ISOLATION` (`enabled: false`) when a run arrives with **no runtime isolation descriptor**
 and `config.isolationMode` is not `isolated`/`isolate` — in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1042`**
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1228`**
 (`const SHARED_JOB_ISOLATION: JobIsolation = {`)
-and returned at **`:1167`** (`return SHARED_JOB_ISOLATION`). The comment at
-**`:3559`** (`only a config-only run`) names it: *"only a config-only run
+and returned at **`:1353`** (`return SHARED_JOB_ISOLATION`). The comment at
+**`:3865`** (`only a config-only run`) names it: *"only a config-only run
 with no descriptor and no `isolationMode` still reaches this fallback."* The measured zero is
 therefore a property of **the server supplying a descriptor on every render**, not of configuration.
 A run path that stops supplying one renders broad — and once the gate is on, that stops being a
@@ -983,12 +983,12 @@ precondition as outstanding, which is the *conservative* direction but still wro
 distinction matters: #3112's content reached `master` through #3123 and #3133 while #3112 itself was
 closed unmerged. A ledger that reads `merged` as the discharge condition would call this row
 outstanding forever. Re-verified at source on `47d01a4bf` — `AGENT_SCOPE_ONLY_CONFIG_KEYS`
-(`server/src/services/heartbeat.ts:2842`
+(`server/src/services/heartbeat.ts:2971`
 (`const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([`)), `withAgentScopedConfigProvenance`
-(defined `server/src/services/heartbeat.ts:3007`
-(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7094`
+(defined `server/src/services/heartbeat.ts:3136`
+(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7220`
 (`return withAgentScopedConfigProvenance(`)), `BROKERED_POD_COMPOSITION_CONFIG_KEYS`
-(`server/src/services/heartbeat.ts:2945`
+(`server/src/services/heartbeat.ts:3074`
 (`const BROKERED_POD_COMPOSITION_CONFIG_KEYS = new Set([`), three keys),
 `vendor/paperclip-adapter-claude-k8s/src/server/config-schema.ts:216`
 (`key: "enableGitHubPublishBroker"`) — **not** from the closing
@@ -1356,7 +1356,7 @@ complete the configuration half of this pre-flight.**
 
 **(c) …and the render-time observation covers what the config read cannot. This is why (b) does not
 block.** The §4 warn is emitted from `resolveJobIsolation`, which reads `config.isolationMode` off
-the **merged** config (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:1165`
+the **merged** config (`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts:1351`
 (`asString(config.isolationMode, "shared")`)) — after
 every scope has been applied. So a broad render caused by an *environment*-scope setting fires
 exactly the same warn as an agent-scope one. The
@@ -1391,9 +1391,9 @@ zero is evidence about the mechanism, not about the sample.
 negative over Loki's retained window, liveness-controlled — it is **not** a configuration proof, and
 §4's surviving broad path is untouched by it: a run arriving with no runtime isolation descriptor and
 no `isolationMode` still reaches the `SHARED_JOB_ISOLATION` fallback — in
-`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1042`**
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1228`**
 (`const SHARED_JOB_ISOLATION: JobIsolation = {`)
-and returned at **`:1167`** (`return SHARED_JOB_ISOLATION`). The zero is a property of the server supplying a descriptor on every
+and returned at **`:1353`** (`return SHARED_JOB_ISOLATION`). The zero is a property of the server supplying a descriptor on every
 render. A run path that stops supplying one renders broad — and once the gate is on, that is a
 hard build failure, not a quiet annotation.
 ⇒ **Check 3 of §11.6 re-runs this at every widening. It is not cleared once.**
