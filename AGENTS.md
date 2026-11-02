@@ -306,7 +306,7 @@ exits with a distinct code for each so a script can branch on it:
 | `OK` | 0 | valid App installation token |
 | `REJECTED` | 1 | the token reached GitHub and GitHub refused it — the credential is bad |
 | `NO_CREDENTIAL` | 2 | no usable token on this pod (absent / empty / unreadable / malformed binding); `gh` will refuse with exit 64 |
-| `ANONYMOUS` | 3 | no token was named, so `gh` falls through to unauthenticated GitHub (60 req/hr) |
+| `AMBIENT_AUTH` | 3 | the wrapper supplied no token and none was named, so `gh` uses whatever auth you already had (your own `GH_TOKEN`/`GITHUB_TOKEN`, or `~/.config/gh/hosts.yml`) — **the self-test does not probe that**; with no ambient credential, `gh` is unauthenticated (60 req/hr) |
 | `GITHUB_UNREACHABLE` | 4 | the request never completed — a network fault, **not** a credential fault |
 
 It answers even when every other `gh` invocation is exiting 64, prints no

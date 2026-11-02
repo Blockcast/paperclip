@@ -1599,6 +1599,83 @@ test("answers even in the state where every other gh invocation exits 64", async
   });
 });
 
+// The ambient-auth arm: PAPERCLIP_GITHUB_TOKEN_FILE unset AND the compiled-in
+// default absent. The tail of the wrapper then `exec`s the real binary with no
+// override, so `gh` authenticates with whatever the CALLER had — its own
+// GH_TOKEN/GITHUB_TOKEN, or ~/.config/gh/hosts.yml. Two outputs used to claim
+// otherwise: the verdict said gh "falls through to unauthenticated GitHub", and
+// the `auth status` notice said "$GH_TOKEN is empty there" when in this branch
+// it is the caller's own variable and is set. A diagnostic that contradicts the
+// path it diagnoses is worse than no diagnostic, which is the entire premise of
+// PEN-5241 — so this arm gets coverage rather than staying the one branch
+// runAuthCheck structurally cannot reach (it always assigns the file variable).
+//
+// Reaching it needs the compiled-in default redirected, because the real one is
+// the live fleet credential inside an agent pod. Rewriting it in a copy of the
+// script keeps the test hermetic instead of skipping wherever the mount exists.
+function wrapperWithRedirectedDefault(dir) {
+  const source = readFileSync(WRAPPER, "utf8");
+  const redirected = source.replace(
+    COMPILED_IN_DEFAULT_TOKEN_FILE,
+    path.join(dir, "no-such-compiled-in-default"),
+  );
+  assert.notEqual(redirected, source, "compiled-in default path not found in the wrapper");
+  assert.ok(
+    !redirected.includes(COMPILED_IN_DEFAULT_TOKEN_FILE),
+    "a reference to the live default token file survived the redirect",
+  );
+  const copy = path.join(dir, "gh-token-wrapper-ambient.sh");
+  writeFileSync(copy, redirected);
+  return copy;
+}
+
+test("the no-credential-supplied arm reports ambient auth, and does not claim gh goes unauthenticated", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const env = sanitizedEnv({ GH_TOKEN_WRAPPER_API_BASE: apiBase });
+      // The premise of the branch: the caller HAS ambient auth of its own.
+      env.GH_TOKEN = "caller_supplied_token";
+      const proc = spawnSync("sh", [wrapperWithRedirectedDefault(dir), "paperclip-auth-check"], {
+        env,
+        encoding: "utf8",
+      });
+
+      assert.equal(proc.status, 3);
+      assert.match(proc.stdout, /verdict:\s+AMBIENT_AUTH/);
+      // The claim that was false: this check never probed the caller's token.
+      assert.match(proc.stdout, /does NOT probe that/);
+      assert.doesNotMatch(proc.stdout, /falls through to unauthenticated GitHub/);
+      // And it still must not print credential material on this path.
+      assert.doesNotMatch(proc.stdout, /caller_supplied_token/);
+      assert.doesNotMatch(proc.stderr, /caller_supplied_token/);
+    });
+  });
+});
+
+test("gh auth status does not claim $GH_TOKEN is empty when the wrapper exported nothing", () => {
+  withTempDir((dir) => {
+    const stubGhPath = path.join(dir, "gh.real");
+    writeFileSync(stubGhPath, STUB_GH_SOURCE);
+    chmodSync(stubGhPath, 0o755);
+
+    const env = sanitizedEnv({ GH_TOKEN_WRAPPER_REAL_GH: stubGhPath });
+    env.GH_TOKEN = "caller_supplied_token";
+    const proc = spawnSync("sh", [wrapperWithRedirectedDefault(dir), "auth", "status"], {
+      env,
+      encoding: "utf8",
+    });
+
+    assert.equal(proc.status, 0);
+    // gh really does see the caller's GH_TOKEN here — the wrapper did not
+    // override it — so the "(GH_TOKEN) is not set in your shell" correction
+    // would be backwards. Assert on the stub rather than trusting the branch.
+    assert.match(proc.stdout, /GH_TOKEN=caller_supplied_token/);
+    assert.doesNotMatch(proc.stderr, /\$GH_TOKEN is empty there/);
+    assert.match(proc.stderr, /this wrapper supplied no credential/i);
+    assert.match(proc.stderr, /does NOT probe ambient auth/);
+  });
+});
+
 // Done-when #2. `gh auth status` reports "(GH_TOKEN)" because that is what this
 // wrapper handed the binary — but GH_TOKEN is not set in the caller's shell, so
 // the obvious follow-up (`curl -H "Authorization: Bearer $GH_TOKEN"`) sends an
