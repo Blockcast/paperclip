@@ -941,7 +941,13 @@ before the key rename and is true after it.
 ### Not fixed here
 
 Making the bypassing writers record is a behaviour change per path and is
-deliberately not bundled with this description.
+deliberately not bundled with this description. It is tracked in two rows:
+**`PEN-5332`** inverts the recording default and brings the four non-budget
+bypassing writers (plus `agentService.create`) onto it, and **`PEN-5333`** covers
+the two budget mirrors below. `PEN-5332` goes first — not because budget matters
+less, but because an unrecorded budget write is still recoverable from
+`activity_log` (see above) while an unrecorded `runtimeConfig` write is blind on
+both surfaces at once.
 
 **The lock order is not what stops the budget mirrors**, though it is the
 plausible wrong answer and was the one this section first reached for. The
@@ -965,7 +971,8 @@ a policy upsert naming a not-yet-approved hire, reachable through
 `pending_approval_agent_config_frozen` from inside a budget write. And
 `upsertPolicy` receives only `actorUserId`, so `createdByAgentId` would be null
 on every row it produced until the callers thread an agent actor through. Both
-are tractable; both are behaviour changes that want their own row.
+are tractable; both are behaviour changes, which is why they are a design row
+(`PEN-5333`) rather than a queued fix.
 
 ## Regression tests
 
