@@ -1627,12 +1627,16 @@ export function partitionByMergeEligibility(failing, prs, now = Date.now()) {
 // retried rather than turning the hourly verdict red: that one failure class
 // was 10 of 40 scheduled runs in the window measured above, and each paged
 // ScheduledWorkflowTrunkRed for a trunk nothing was wrong with (BLO-48423).
-function gh(args) {
-  return withRetry(`gh ${args.slice(0, 2).join(" ")}`, () =>
-    execFileSync("gh", args, {
-      encoding: "utf8",
-      maxBuffer: 64 * 1024 * 1024,
-    }),
+// Exported with an injectable exec so a test can prove the retry is wired.
+export function gh(args, exec = execFileSync, retryOptions = undefined) {
+  return withRetry(
+    `gh ${args.slice(0, 2).join(" ")}`,
+    () =>
+      exec("gh", args, {
+        encoding: "utf8",
+        maxBuffer: 64 * 1024 * 1024,
+      }),
+    retryOptions,
   );
 }
 

@@ -51,6 +51,7 @@ import {
   scopeSummary,
   supersedingAttestation,
   violationFingerprint,
+  gh,
 } from "./check-ally-review-consistency.mjs";
 
 const HEAD = "ff1c72dbfd18014c838cf1373b1640dd17378f3e";
@@ -3147,5 +3148,28 @@ describe("parseMaxIdleDays", () => {
 
   it("refuses a non-numeric value rather than silently never deferring", () => {
     assert.throws(() => parseMaxIdleDays("abc"), /ALLY_REVIEW_MAX_IDLE_DAYS/);
+  });
+});
+
+describe("gh (BLO-48423)", () => {
+  it("retries a transient failure instead of failing the run", () => {
+    let calls = 0;
+    const exec = () => {
+      calls += 1;
+      if (calls === 1) throw new Error("HTTP 502: Bad Gateway");
+      return "ok";
+    };
+    assert.equal(gh(["pr", "list"], exec, { delayMs: 0 }), "ok");
+    assert.equal(calls, 2);
+  });
+
+  it("still throws once retries are exhausted", () => {
+    let calls = 0;
+    const exec = () => {
+      calls += 1;
+      throw new Error("HTTP 502: Bad Gateway");
+    };
+    assert.throws(() => gh(["pr", "list"], exec, { delayMs: 0 }), /502/);
+    assert.equal(calls, 3);
   });
 });
