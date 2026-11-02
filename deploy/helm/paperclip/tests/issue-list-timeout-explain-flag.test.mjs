@@ -5,14 +5,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 /**
- * PEN-5223 box 4: the timed-out issues-list `EXPLAIN` capture is enabled in
- * production for a bounded diagnostic window.
+ * PEN-5223 box 5: the timed-out issues-list `EXPLAIN` capture window is CLOSED
+ * again -- the diagnostic ran, two class-A plans were captured in production
+ * on 2026-11-02 and posted to PEN-3596, and the flag is back to "false".
  *
  * The flag is default-OFF in the server (`issueListExplainEnabled`), so this
- * values entry is the only thing that turns it on. Box 5 flips it back to
- * "false" -- at which point the ENABLED test below is the one assertion that
- * has to change, and it changing is the point: the flip should be a deliberate
- * edit with a reviewer looking at it, not a silent drift.
+ * values entry is the only thing that can turn it on. Box 4 asserted it was
+ * "true"; this is the box-5 flip that file header predicted, and the DISABLED
+ * assertion below is the one that changed. Pinning "false" explicitly -- as
+ * opposed to deleting the entry -- keeps the flip a deliberate, reviewed edit
+ * in both directions rather than a silent drift.
  *
  * Why the shape asserts are separate from the value assert: the admission
  * policy admits this var because it is `PAPERCLIP_`-prefixed with a PLAIN
@@ -27,7 +29,7 @@ const VALUES_FILE = "deploy/helm/paperclip/values.blockcast.yaml";
 const FLAG = "PAPERCLIP_EXPLAIN_TIMED_OUT_ISSUE_LIST";
 
 const PRESENCE_PATTERN = new RegExp(`- name: ${FLAG}\\n`);
-const ENABLED_PATTERN = new RegExp(`- name: ${FLAG}\\n\\s+value: "true"`);
+const DISABLED_PATTERN = new RegExp(`- name: ${FLAG}\\n\\s+value: "false"`);
 /** A `valueFrom` would be denied by admission for a non-secret-bound name. */
 const VALUE_FROM_PATTERN = new RegExp(`- name: ${FLAG}\\n\\s+valueFrom:`);
 
@@ -54,8 +56,8 @@ function render(showOnly) {
 const api = render("templates/deployment-api.yaml");
 const worker = render("templates/statefulset.yaml");
 
-test("the EXPLAIN capture flag is enabled on the API tier (PEN-5223 box 4; box 5 flips this)", () => {
-  assert.match(api, ENABLED_PATTERN);
+test("the EXPLAIN capture flag is disabled on the API tier (PEN-5223 box 5)", () => {
+  assert.match(api, DISABLED_PATTERN);
 });
 
 test("the EXPLAIN capture flag reaches the worker tier too, so captures can land on either", () => {
@@ -68,7 +70,7 @@ test("the EXPLAIN capture flag reaches the worker tier too, so captures can land
 test("the flag is a plain-value entry, which is what makes it admissible", () => {
   // `PAPERCLIP_`-prefixed plain values are explicitly allowed by the policy's
   // env contract; a `valueFrom` on a name outside the 11 secret-bound names is
-  // not. Pinned separately from the value so the box-5 flip cannot drop it.
+  // not. Pinned separately from the value so the box-5 flip could not drop it.
   assert.match(api, PRESENCE_PATTERN);
   assert.doesNotMatch(api, VALUE_FROM_PATTERN);
   assert.ok(FLAG.startsWith("PAPERCLIP_"), `${FLAG} must be PAPERCLIP_-prefixed to be admissible`);
