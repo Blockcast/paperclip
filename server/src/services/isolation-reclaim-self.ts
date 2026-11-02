@@ -56,8 +56,10 @@ import { DEFAULT_ISOLATION_WORKSPACE_ROOT } from "./isolation-workspace-reaper.j
  * silently, and in exactly the direction "same build by construction" claims
  * to rule out. `status.containerStatuses[].imageID` is what the kubelet
  * actually resolved and pulled, so it is preferred whenever it is usable as a
- * reference. Production is digest-pinned already and the two agree there;
- * this closes the case where they do not.
+ * reference -- but only where the spec is MUTABLE, which is the only place a
+ * tag CAN have moved. Production is digest-pinned, and a digest-pinned spec
+ * is left exactly as the operator wrote it: it already names its own content,
+ * so there is nothing for the kubelet to correct. See the subsection below.
  *
  * "Usable" is checked rather than assumed, because `imageID` is not specified
  * to be a pullable reference. Container runtimes have reported it with a
@@ -67,6 +69,53 @@ import { DEFAULT_ISOLATION_WORKSPACE_ROOT } from "./isolation-workspace-reaper.j
  * discarded and the spec image stands — a wrong image is a Job that cannot
  * start, which the runner reports as a deadline rather than as the manifest
  * problem it is.
+ *
+ * ### Only the digest is taken from the runtime; the REPOSITORY stays the spec's
+ *
+ * `imageID` carries containerd's FIRST `RepoDigest`, which is not promised to
+ * be the repository the operator wrote. The same content can be known locally
+ * under a second name — a pull-through cache, a mirror, a registry the image
+ * was also pushed to — and that name then rides into the Job's manifest.
+ * The Job inherits THIS pod's `imagePullSecrets`, which are demonstrably
+ * sufficient for the spec repository (they pulled this pod) and promise
+ * nothing about a different one. So the two halves are taken from different
+ * places on purpose: the digest from the kubelet, because that is the build
+ * question; the repository from the spec, because that is the credential
+ * question. A digest is content-addressed, so pinning the kubelet's digest
+ * onto the operator's repository still names the build the server is running.
+ *
+ * ### A spec that ALREADY carries a digest is left completely alone
+ *
+ * The rule above applies only when the spec names a mutable reference. A
+ * digest pull is content-addressed and verified, so a pod started from
+ * `harbor/paperclip@sha256:X` IS running X -- no tag can have moved under it,
+ * and there is no skew for this resolver to correct. If `imageID` reports a
+ * different digest Y, that is not a newer build: it is containerd's first
+ * `RepoDigest` naming the SAME image config under a different MANIFEST,
+ * because a mirror or a second registry re-pushed or converted it. Pinning Y
+ * onto the spec repository would then ask Harbor for a manifest it never
+ * stored -- usually served when the mirror only re-pushed a platform manifest
+ * under X's index, and NOT served once the mirror rewrote it (media-type
+ * conversion, recompression). So the swap would trade a reference that is
+ * certain to pull for one that might not, in the single branch production
+ * actually runs, since production is digest-pinned.
+ *
+ * The residual it gives up is a pod whose spec image was mutated in place and
+ * whose container has not restarted onto it yet. That one is worth giving up:
+ * it is a BUILD skew, which `report_unsupported_version` names and reports,
+ * whereas a manifest the registry will not serve is a Job that never starts
+ * and is reported as `deadline_exceeded` -- after the controller has deleted
+ * the pod and the log with it. A diagnosable failure in place of a silent one
+ * is the trade this whole module is built around.
+ *
+ * A bare `sha256:<hex>` is NOT rescued by this, even though the digest alone
+ * would now be enough to build a reference. The absence of a `RepoDigest` is
+ * itself the evidence: it says no registry is known to serve this content
+ * under any name, so synthesizing `<spec repository>@sha256:<hex>` would
+ * assert exactly the thing the runtime is reporting it cannot confirm. The
+ * spec image is the reference that demonstrably started this pod, and
+ * falling back to it keeps the invariant the rest of this resolver is built
+ * on: an unrecognised `imageID` yields today's spec-image behaviour.
  *
  * ## The claim is found by MOUNT PATH, not by volume name or position
  *
@@ -220,20 +269,54 @@ export interface ReadReclaimSelfPodIdentityOptions {
  *
  * Prefers the digest the kubelet actually resolved over the reference the
  * operator wrote, and falls back silently when the runtime's `imageID` is not
- * a pullable reference. Exported for its own test: the fallback is the branch
- * that matters, because an unusable value used verbatim produces a Job that
- * never starts and reports as a deadline.
+ * a pullable reference. Only the DIGEST is taken from `imageID`; the
+ * repository is always the spec's, so the Job cannot be sent to a registry
+ * the inherited `imagePullSecrets` do not cover. A spec that already carries
+ * a well-formed digest is returned unchanged, because a content-addressed
+ * reference has no skew to correct and is the one name whose credentials are
+ * proven. Exported for its own test: the fallback is the branch that matters,
+ * because an unusable value used verbatim produces a Job that never starts
+ * and reports as a deadline.
  */
 export function resolveSelfImage(
   specImage: string,
   imageID: string | undefined,
 ): string {
+  // A well-formed digest-pinned spec is returned UNCHANGED. A digest pull is
+  // content-addressed, so this pod is running exactly the build the spec
+  // names and there is no skew left to correct. A runtime digest that
+  // disagrees is therefore not a newer build -- it is the same content under
+  // a different MANIFEST, from a mirror that re-pushed or converted it, and
+  // the spec's registry is under no obligation to serve that manifest. See
+  // the module header.
+  if (/@sha256:[0-9a-f]{64}$/.test(specImage.trim())) return specImage;
   const resolved = (imageID ?? "").trim().replace(/^docker-pullable:\/\//, "");
   // `<repository>@sha256:<64 hex>`. A bare `sha256:...` has no repository and
   // is deliberately rejected by the leading `.+@`: it identifies a build but
-  // cannot be pulled.
-  if (/^.+@sha256:[0-9a-f]{64}$/.test(resolved)) return resolved;
-  return specImage;
+  // is not evidence that any registry serves it -- see the module header.
+  const digest = /^.+@(sha256:[0-9a-f]{64})$/.exec(resolved)?.[1];
+  if (!digest) return specImage;
+  // Only the DIGEST is taken from the runtime. The repository stays the
+  // operator's, because that is the one the inherited `imagePullSecrets` are
+  // known to cover.
+  const repository = imageRepositoryOf(specImage);
+  return repository ? `${repository}@${digest}` : specImage;
+}
+
+/**
+ * The repository half of an image reference: everything before the tag and
+ * before the digest.
+ *
+ * The tag separator is the last `:`, but ONLY when it falls after the last
+ * `/`. `harbor.example:5000/paperclip` is a registry port and not a tag, and
+ * cutting at that colon would yield `harbor.example` -- a Job that cannot
+ * start, reported as a deadline rather than as the manifest problem it is.
+ */
+function imageRepositoryOf(reference: string): string {
+  const at = reference.indexOf("@");
+  const withoutDigest = at === -1 ? reference : reference.slice(0, at);
+  const colon = withoutDigest.lastIndexOf(":");
+  return colon > withoutDigest.lastIndexOf("/") ? withoutDigest.slice(0, colon) : withoutDigest;
 }
 
 /** Read this pod and derive everything the sweep needs from it. */

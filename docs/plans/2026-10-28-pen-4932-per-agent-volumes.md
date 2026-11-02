@@ -903,10 +903,12 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      about it today" carries both, with the cold-start cost of opting back out —
      neither needs a reclaimer.
 
-     ⚠️ **Reclamation is still open, and the ≈3.7-month ceiling above still
-     stands.** The *first* clause of PEN-5125's done-when 2 — an opted-in agent's
-     tree swept by *something* — is NOT closed by the detection described above.
-     What closed is the silence: the gap is now measurable and alertable
+     ⚠️ **The ≈3.7-month ceiling above applies wherever the reclaim sweep is
+     OFF — which is a config read, not a property of this plan.** The *first*
+     clause of PEN-5125's done-when 2 — an opted-in agent's tree swept by
+     *something* — is not closed by the detection described above; it is closed
+     by the sweep described below, and only in a deployment that enables it.
+     What the detection closed is the silence: the gap is now measurable and alertable
      before the opt-in count grows, which is the half whose absence was
      dangerous. The chosen shape for the reclaimer is a dedicated executor
      holding the agent's claim, off the run hot path, with the eligible set
@@ -934,12 +936,31 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      failure is a weaker transcription of a rule that exists to keep files, and
      co-locating them is what makes that impossible rather than merely discouraged.
 
-     ⚠️ **What is still missing is the TRANSPORT, so no foreign claim is reclaimed
-     and the capacity clause on `resolveAgentWorkspaceClaimName` stays.** Nothing
-     creates a Job, nothing carries an inventory back, nothing carries a plan out.
-     What a foreign claim lacks now is a pod that mounts it, not a decision about
-     what to do once mounted. Two consequences of the split were design
-     constraints on those two ends, and are recorded as answered rather than open:
+     **The TRANSPORT has landed, so what decides whether a foreign claim is
+     reclaimed is a CONFIG READ rather than a sentence here.** The pieces:
+     `isolation-reclaim-job-port.ts` creates the Job, `isolation-reclaim-report.ts`
+     carries an inventory back and a plan out, `isolation-reclaim-driver.ts` runs
+     one claim end to end, and `isolation-reclaim-sweep.ts` is the fleet loop over
+     claims this process does not mount.
+
+     The live question — does a given server START that loop, and under what
+     bounds — is answered at the CALL SITE, `server/src/index.ts`, which gates it
+     on `isolationReclaimSweepEnabled` and on `paperclipNodeRole !== "api"`, then
+     holds it under `superviseLeased`. **Read the flag there; do not read a tense
+     here.** A paragraph that names what is still missing needs an edit per
+     increment and will eventually miss one — which this section has already done
+     once, and `isolation-workspace-reaper.ts`'s own header did too (#3234).
+
+     ⚠️ **Wired is not on, and that is deliberate rather than incidental.** The
+     flag is opt-in for the reaper's own stated reason: this deletes files
+     irreversibly, so *deploy the code* and *perform the deletion* must not be the
+     same act, and `dryRun` exists to be used first. A deployment that does not
+     set it reclaims nothing, and the ceiling above applies to that deployment
+     unchanged. `values.blockcast.yaml` does not set it today — check it, rather
+     than this clause, before concluding either way.
+
+     Two consequences of the split were design constraints on the executor's two
+     ends, and are recorded as answered rather than open:
 
      - **`execution_workspaces` has no agent column**, so a plan cannot be scoped
        to one agent's claim from the rows alone. The intersection has to happen

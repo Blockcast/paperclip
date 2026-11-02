@@ -46,10 +46,13 @@ reports `-1` rather than a count, because which agents that moves is not derivab
 
 Read the two values differently:
 
-- **`> 0`** — that many agents' trees are outside this sweep's reach, and **nothing reclaims them**.
-  They grow at the rate this reaper exists to contain (≈10 GiB/agent/month measured over the
-  July → 2026-09-02 fill). This is a capacity finding, not an outage: `allowVolumeExpansion` is
-  `true`, so it surfaces as an operator resizing a PVC rather than a run losing data.
+- **`> 0`** — that many agents' trees are outside *this* sweep's reach. **Whether anything else
+  reclaims them is a config read, not a property of this number** — see
+  [*What you can actually do about it today*](#what-you-can-actually-do-about-it-today); where the foreign-claim
+  sweep is not enabled, nothing does, and they grow at the rate this reaper exists to contain
+  (≈10 GiB/agent/month measured over the July → 2026-09-02 fill). This is a capacity finding, not
+  an outage: `allowVolumeExpansion` is `true`, so it surfaces as an operator resizing a PVC rather
+  than a run losing data.
 - **`-1`** — the probe was absent, threw, **or** found a k8s environment supplying a
   `workspaceVolumeClaim`, which makes the agent-level count untrustworthy. Either way this sweep
   cannot describe its own coverage.
@@ -70,15 +73,38 @@ has been opted in — until then the coverage gap is visible only by running the
 
 ### What you can actually do about it today
 
-**Nothing in this repo reclaims a foreign claim yet**, so the remedies below are the whole list.
-[PEN-5151](https://paperclip.blockcast.net/PEN/issues/PEN-5151) owns the reclaimer. Three of its
-pieces are now in the tree — `buildIsolationReclaimPlan` (decide),
-`collectIsolationWorkspaceInventory` (enumerate) and `executeIsolationReclaimPlan` (unlink) — and
-**none of them has a caller**: nothing creates the Job that would mount a foreign claim and carry an
-inventory one way and a plan the other. So do not go looking for a sweep that might have run, and do
-not read the presence of those functions as reclamation. If one ever does run, its record is a log
-line `isolation reclaim execution complete`; there is no metric for it yet, which is itself a sign
-nothing is calling it.
+[PEN-5151](https://paperclip.blockcast.net/PEN/issues/PEN-5151) built the reclaimer and it is in
+the tree end to end: `isolation-reclaim-sweep.ts` (the fleet loop), `isolation-reclaim-driver.ts`
+(one claim), `isolation-reclaim-job-port.ts` (creates the Job that mounts a claim this process does
+not), and `isolation-reclaim-report.ts` (carries an inventory one way and a plan the other), over
+the same `buildIsolationReclaimPlan` / `collectIsolationWorkspaceInventory` /
+`executeIsolationReclaimPlan` the mounted sweep uses.
+
+⚠️ **Whether it RUNS here is a config read, and the remedies below are the whole list wherever it
+does not.** The sweep is opt-in — `isolationReclaimSweepEnabled`
+(`PAPERCLIP_ISOLATION_RECLAIM_SWEEP_ENABLED`), read at `server/src/index.ts`, plus
+`paperclipNodeRole != "api"` and the `superviseLeased` holder — because deleting files irreversibly
+must not be the same act as deploying the code. **Check the flag for the deployment in front of you
+rather than this page**; as of 2026-11-02 `values.blockcast.yaml` does not set it, so on Blockcast
+nothing reclaims a foreign claim and the ceiling below applies unchanged.
+
+Do not infer a sweep from the presence of those modules. The evidence that one ran is
+`paperclip_isolation_reclaim_last_sweep_timestamp_seconds` being fresh, with
+`paperclip_isolation_reclaim_reclaimed_total` and
+`paperclip_isolation_reclaim_unknown_outcome_claims_total` beside it — and **read every
+`paperclip_isolation_reclaim_*` series at `{dry_run="false"}`**, which is the same point this page
+makes for the mounted reaper under *Check the mode before acting on `deleted`*. The qualifier is
+load-bearing on more than the timestamp: `reclaimed_total` is incremented with
+`options.dryRun ? result.wouldReclaim : result.reclaimed` (`metrics.ts`), so a dry-run rollout
+shows a **non-zero** reclaimed figure having deleted nothing, and `claims_total{outcome="ok"}`
+counts dry-run drives too.
+
+Two log lines, and they answer different questions. `isolation reclaim drive complete`
+(`isolation-reclaim-driver.ts`) is the server-side, **per-claim** record — keyed on `claim`,
+`agentId`, `dryRun` and `deleted`. `isolation reclaim execution complete`
+(`isolation-workspace-reaper.ts`) is the executor-side line and is keyed on `root`, so it says a
+sweep ran without saying which claim it ran against. An absent series means the sweep never started
+— which on a server with the flag unset is the expected reading, not a fault.
 
 - **Opt the agent back out.** Clearing `enablePerAgentWorkspaceVolume` (or the agent's
   `workspaceVolumeClaim`) returns its next run to the shared claim, where this reaper reaches its
@@ -103,9 +129,35 @@ root, and the root stays present and populated by every agent still on the share
 
 ### This alert is a standing record, not a transient (PEN-5125 / PEN-5151)
 
-While [PEN-5151](https://paperclip.blockcast.net/PEN/issues/PEN-5151) is open there is **no
-reclaimer for an unreachable tree**, so a `> 0` here does not clear on its own and is not expected
-to. It was accepted deliberately, with a ceiling:
+**A `> 0` here does not clear on its own and is not expected to — and that stays true after the
+reclaimer is enabled**, because this gauge counts agents whose trees the MOUNTED sweep cannot
+reach. That is a property of where the tree lives, not of whether anything reclaimed it. Read it
+against `paperclip_isolation_reclaim_last_sweep_timestamp_seconds` — but read that series at
+`{dry_run="false"}`, and read it as liveness rather than coverage. Both qualifiers fail toward
+*"reclaimed"*, which is the dangerous direction:
+
+- `recordIsolationReclaimSweep` sets the gauge with a `dry_run` label and sets it
+  **unconditionally**, so a dry-run sweep leaves the timestamp fresh having reclaimed nothing — and
+  `server/src/index.ts` tells you to *"Enable with `dryRun` first"*, so that is the first state a
+  correct rollout is in, not an edge case.
+- Even at `{dry_run="false"}`, a fresh timestamp says the sweep ran, not that it drove *this* claim.
+  `sweepIsolationReclaim` slices to `maxClaimsPerTick` and rotates, and the timestamp advances on
+  `outcome="failed"` and `"deferred"` sweeps too.
+
+**No counter carries claim identity**, so none of them can show that *this* claim was driven.
+`paperclip_isolation_reclaim_claims_total` is `Counter<"dry_run" | "outcome">` — a fleet
+aggregate. Read it at `{dry_run="false"}`: zero increase in `outcome="failed"` and
+`outcome="deferred"` over the window means every claim the sweep listed was driven. The rotation is
+a **different series** — `paperclip_isolation_reclaim_sweeps_total{stop_reason="claims_capped"}`,
+because `stop_reason` is a label on `sweeps_total`, not on `claims_total`. Querying
+`claims_total{stop_reason="claims_capped"}` matches nothing, and an empty result there reads as
+*"never capped"*, which is the fails-toward-covered direction this section exists to close.
+
+The per-claim evidence is a **log line, not a metric**: `isolation reclaim drive complete`
+(`isolation-reclaim-driver.ts`), filtered on `claim=` and `dryRun=false`. With that read: a fresh
+`{dry_run="false"}` timestamp plus a `drive complete` line for this claim at `dryRun=false` and
+`deleted` accounted for means *unreachable but reclaimed*; stale, absent, or dry-run-only means
+unreclaimed. Where it is unreclaimed, it was accepted deliberately, with a ceiling:
 
 > ≈10 GiB/agent/month against a **50 Gi** claim already carrying ≈13.2 G of duplicated company
 > trees ⇒ ≈36.8 GiB headroom ⇒ **one opted-in agent fills its own claim in ≈3.7 months.**

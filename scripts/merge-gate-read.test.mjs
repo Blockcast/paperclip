@@ -2167,6 +2167,20 @@ describe("merge-gate reader", () => {
       ]]), "1");
     });
 
+    it("check-run twin: a newer empty web-lanes cannot mask a withdrawing dispatched-lanes re-judge", () => {
+      const run = (id, name, conclusion, title, status = "completed") =>
+        ({ id, name, status, conclusion, output: { title }, app: { slug: "github-actions" } });
+      assert.equal(emptyWitness([[], { check_runs: [
+        run(9, "ci/web-lanes", "success", "no web lane applies to this head"),
+        run(7, "ci/dispatched-lanes", null, "waiting: ci=not dispatched", "in_progress"),
+        run(2, "ci/dispatched-lanes", "success", EMPTY_DESC),
+      ] }]), "");
+      assert.equal(emptyWitness([[], { check_runs: [
+        run(9, "ci/web-lanes", "success", "no web lane applies to this head"),
+        run(2, "ci/dispatched-lanes", "success", EMPTY_DESC),
+      ] }]), "1");
+    });
+
     it("fails closed on an API error body or garbage", () => {
       assert.equal(emptyWitness([{ message: "API rate limit exceeded", status: "403" }]), "");
       assert.equal(execFileSync("bash", [READER, "--empty-witness"], { input: "not json\n", encoding: "utf8" }), "");
