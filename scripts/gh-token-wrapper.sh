@@ -222,6 +222,29 @@ refuse_api_ready() {
   done
 }
 
+# BLO-51471: the body above replaces GitHub's COMMIT_MESSAGES default, so a
+# functional trailer written only in a branch commit (the place the
+# values-drift and orphan-on-delete gates tell authors to put it) would never
+# reach the merge commit, and the gate passes on the PR but reds master. Carry
+# those trailers over from the PR's commits, once each. Fail closed like the
+# body fetch: a dropped ack reds master on every acked removal.
+FUNCTIONAL_TRAILER_RE='^[-*>[:blank:]]*(values-ack|orphan-ack|signed-off-by):'
+carry_commit_trailers() {
+  if ! "${REAL_GH}" pr view ${selector:+"${selector}"} ${repo:+--repo "${repo}"} --json commits --jq '.commits[].messageBody' > "$1.commits"; then
+    rm -f "$1" "$1.commits"
+    echo "gh-token-wrapper: could not read the PR commits to carry their values-ack/Orphan-Ack/Signed-off-by trailers into the squash message (BLO-51471); merge again" >&2
+    exit 1
+  fi
+  grep -iE "${FUNCTIONAL_TRAILER_RE}" "$1.commits" | sed 's/^[-*>[:blank:]]*//' | awk '!seen[$0]++' | while IFS= read -r t; do
+    grep -qFx -- "${t}" "$1" </dev/null || printf '%s\n' "${t}"
+  done > "$1.carry"
+  if [ -s "$1.carry" ]; then
+    printf '\n' >> "$1"
+    cat "$1.carry" >> "$1"
+  fi
+  rm -f "$1.commits" "$1.carry"
+}
+
 squash_merge_without_ai_trailers() {
   squash=no
   for a in "$@"; do
@@ -285,6 +308,7 @@ squash_merge_without_ai_trailers() {
     strip_ai_trailers < "${body_file}.raw" > "${body_file}"
     rm -f "${body_file}.raw"
   fi
+  carry_commit_trailers "${body_file}"
   refuse_if_ai_attribution_left "${body_file}"
 
   status=0

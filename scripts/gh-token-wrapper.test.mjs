@@ -975,13 +975,17 @@ const PR_BODY = [
   "🤖 Generated with [Claude Code](https://claude.com/claude-code)",
 ].join("\n");
 const MERGE_STUB_GH = `#!/bin/sh
-if [ "$1 $2" = "pr view" ]; then echo "VIEW=$*" >&2; printf '%s\\n' "$PR_BODY"; exit 0; fi
+if [ "$1 $2" = "pr view" ]; then
+  echo "VIEW=$*" >&2
+  case "$*" in *"--json commits"*) [ -z "$COMMITS_FAIL" ] || exit 1; printf '%s\\n' "$PR_COMMITS" ;; *) printf '%s\\n' "$PR_BODY" ;; esac
+  exit 0
+fi
 echo "ARGS=$*"
 prev=""
 for a; do [ "$prev" = --body-file ] && { echo "BODY<<"; cat "$a"; echo ">>BODY"; }; prev="$a"; done
 `;
 
-function runMerge(dir, args, { input, prBody = PR_BODY, status = 0 } = {}) {
+function runMerge(dir, args, { input, prBody = PR_BODY, prCommits = "", commitsFail = false, status = 0 } = {}) {
   const stub = path.join(dir, "gh.real");
   writeFileSync(stub, MERGE_STUB_GH);
   chmodSync(stub, 0o755);
@@ -991,6 +995,8 @@ function runMerge(dir, args, { input, prBody = PR_BODY, status = 0 } = {}) {
     GH_TOKEN_WRAPPER_REAL_GH: stub,
     PAPERCLIP_GITHUB_TOKEN_FILE: tokenFile,
     PR_BODY: prBody,
+    PR_COMMITS: prCommits,
+    COMMITS_FAIL: commitsFail ? "1" : "",
     TMPDIR: dir,
   });
   const proc = spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8", input });
@@ -1027,7 +1033,7 @@ for (const [label, flags] of [
       const { proc, args, body } = runMerge(dir, ["pr", "merge", "-s", ...flags(PR_BODY)]);
       assertClean(body);
       assert.match(body, /^values-ack: chart-1\.2$/m);
-      assert.doesNotMatch(proc.stderr, /VIEW=/, "must not fetch the PR body when the caller gave one");
+      assert.doesNotMatch(proc.stderr, /VIEW=.*--json body/, "must not fetch the PR body when the caller gave one");
       assert.doesNotMatch(args, /--body |-b /);
     });
   });
@@ -1043,6 +1049,55 @@ test("squash merge scrubs a caller-supplied --body-file, including stdin (BLO-47
     const fromStdin = runMerge(dir, ["pr", "merge", "--squash", "-F", "-"], { input: PR_BODY });
     assertClean(fromStdin.body);
     assert.match(fromStdin.body, /^values-ack: chart-1\.2$/m);
+  });
+});
+
+// BLO-51471: the injected body replaces GitHub's COMMIT_MESSAGES default, so a
+// `values-ack:` written only in a branch commit (where the values-drift gate
+// tells authors to put it) used to vanish and re-red master (onprem-k8s
+// dce5180cf). Functional trailers are carried over from the PR's commits.
+const COMMIT_BODIES = [
+  "Drop the route namespaces.",
+  "",
+  "values-ack: relay.gatewayAPI.routeNamespaces",
+  "Orphan-Ack: argocd/apps/old.yaml",
+  "Signed-off-by: Dev <dev@example.com>",
+  "Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>",
+  "",
+  "values-ack: relay.gatewayAPI.routeNamespaces",
+].join("\n");
+
+test("squash merge carries branch-commit values-ack/Orphan-Ack trailers the PR body lacks (BLO-51471)", () => {
+  withTempDir((dir) => {
+    const { proc, body } = runMerge(dir, ["pr", "merge", "7356", "--squash", "-R", "Blockcast/onprem-k8s"], {
+      prBody: "Revert the relay watch.",
+      prCommits: COMMIT_BODIES,
+    });
+    assertClean(body);
+    assert.match(proc.stderr, /VIEW=pr view 7356 --repo Blockcast\/onprem-k8s --json commits/);
+    assert.equal(body.match(/^values-ack: relay\.gatewayAPI\.routeNamespaces$/gm)?.length, 1, body);
+    assert.match(body, /^Orphan-Ack: argocd\/apps\/old\.yaml$/m);
+    assert.match(body, /^Signed-off-by: Dev <dev@example\.com>$/m);
+    assert.doesNotMatch(body, /Drop the route namespaces/, "only trailers are carried, not commit prose");
+  });
+});
+
+test("carried trailers are not duplicated and also reach a caller-supplied body (BLO-51471)", () => {
+  withTempDir((dir) => {
+    const { body } = runMerge(dir, ["pr", "merge", "-s", "--body", PR_BODY], {
+      prCommits: "values-ack: chart-1.2\nvalues-ack: other.key",
+    });
+    assertClean(body);
+    assert.equal(body.match(/^values-ack: chart-1\.2$/gm)?.length, 1, body);
+    assert.match(body, /^values-ack: other\.key$/m);
+  });
+});
+
+test("squash merge is refused when the PR commits cannot be read (BLO-51471)", () => {
+  withTempDir((dir) => {
+    const { proc, args } = runMerge(dir, ["pr", "merge", "9", "--squash"], { commitsFail: true, status: 1 });
+    assert.equal(args, undefined, "the real merge must not run");
+    assert.match(proc.stderr, /could not read the PR commits/);
   });
 });
 
