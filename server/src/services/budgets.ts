@@ -1319,14 +1319,30 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       // here via `POST /companies/:id/budgets/policies` — and it is the measured
       // cause of a cap change that the revision log could not attribute.
       //
-      // NOT a one-line fix, which is why it is documented rather than patched
-      // in passing. `upsertPolicy` runs inside caller transactions that have a
-      // stated lock order (policy row first, then agent), and the two call sites
-      // that DO record a revision — `PATCH /agents/:id/budgets` in
-      // `routes/costs.ts` and the approval executor — add a companion
-      // `agentService.update(..., { recordRevision })` AROUND this call for
-      // exactly that reason. Adding the update inside here would invert the
-      // order against them and reintroduce the BLO-32796 ABBA deadlock.
+      // NOT a one-line fix — but NOT because of the lock order, which is the
+      // plausible wrong answer. Swapping this raw UPDATE for
+      // `agentService(db).update(..., { recordRevision })` IN PLACE would take
+      // the same `agents` row lock at the same point, after this function's own
+      // policy UPDATE, so the pair order stays policy → agent and the
+      // BLO-32796 rule stated above is not violated; the extra write lands in
+      // `agent_config_revisions`, which holds no policy lock. The two call
+      // sites that DO record — `PATCH /agents/:id/budgets` in `routes/costs.ts`
+      // and `applyApprovalEnforcement` — would not double up either: each
+      // writes the equal value through `agentService.update` first, so
+      // `diffConfigSnapshot` yields no `changedKeys` and the second insert is
+      // skipped by the `changedKeys.length > 0` guard.
+      //
+      // What actually holds it up is semantics and attribution.
+      // `agentService.update` is not a thin setter: it throws `conflict` when
+      // the target is `pending_approval` and the patch moves any
+      // `CONFIG_REVISION_FIELDS` column — and `budgetMonthlyCents` is one. A
+      // policy upsert naming a not-yet-approved hire, reachable today through
+      // `POST /companies/:id/budgets/policies`, would start answering 409
+      // `pending_approval_agent_config_frozen` from inside a budget write.
+      // Separately, this signature carries only `actorUserId`; there is no
+      // agent actor to pass, so `createdByAgentId` would be null on every row
+      // until the callers thread one through. Both are tractable. Neither is
+      // free, which is why this is documented rather than patched in passing.
       //
       // Until that is done: the actor for a cap change IS recoverable, just not
       // from `config-revisions` — `activity_log` carries
