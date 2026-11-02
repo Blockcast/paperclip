@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -1768,6 +1769,150 @@ test("the exit-64 refusal names the self-test", () => {
     const proc = spawnWrapper(dir, { args: ["api", "user"] });
     assert.equal(proc.status, 64);
     assert.match(proc.stderr, /gh paperclip-auth-check/);
+  });
+});
+
+// --- PEN-5255: the self-test must not drift away from the path it diagnoses --
+//
+// `paperclip_auth_check` reports what the GH_SEAT_TOKEN_VALUE branch WOULD do.
+// It used to say so by re-implementing that branch's precedence and trimming
+// instead of sharing it, and nothing held the two together: Ally mutated the
+// check's copy three ways — dropped the leading-whitespace trim, swapped
+// `${GH_SEAT_TOKEN_VALUE+x}` for `-n`, disabled the embedded-whitespace
+// refusal — and the suite stayed green through every one. A diagnostic that
+// disagrees with the path it diagnoses is worse than no diagnostic because it
+// is confident, which is the entire thesis of PEN-5241; shipping an unpinned
+// duplicate of its subject quietly reopened it.
+//
+// `trim_seat_token` now gives both sites one implementation, which closes the
+// two trim mutations by construction. It cannot reach the third: WHICH BRANCH
+// is selected for a set-but-empty value is not trimming, and no amount of
+// extraction pins it. So that one is asserted directly, as the biconditional a
+// caller actually relies on —
+//
+//     verdict is NO_CREDENTIAL   <=>   `gh api user` exits 64
+//
+// — over the four values whose handling differs between the two states GitHub
+// collapses into one string.
+//
+// Each case runs twice, with and without a VALID token file also present, and
+// that second column is the part that earns its keep. It is what pins branch
+// selection: with a good readable file behind it, a check that fell through to
+// the file branch reports OK while the real path still exits 64. With no file
+// there the same mutation is INVISIBLE — the file branch's own refusal then
+// yields NO_CREDENTIAL for an unrelated reason and the biconditional still
+// holds. Measured, not assumed: against mutation (b) this test fails on the
+// with-file column and passes with that column removed.
+const SEAT_TOKEN_PARITY_CASES = [
+  // Set-but-empty is the sharp one: it is a *named* credential that is not
+  // usable, so the real path refuses rather than falling back, and the check
+  // has to agree that nothing usable was supplied.
+  { name: "set but empty", tokenValue: "", expectNoCredential: true },
+  { name: "whitespace only", tokenValue: "  ", expectNoCredential: true },
+  // The one value in the table that is usable, and only after trimming — so it
+  // is also the only case that can show the two sides trimming differently.
+  { name: "surrounded by whitespace", tokenValue: " ghs_x\n", expectNoCredential: false, trimsTo: "ghs_x" },
+  { name: "embedded whitespace", tokenValue: "a b", expectNoCredential: true },
+];
+
+// Drives both halves of the biconditional under one identical environment —
+// same value, same token file, same stub GitHub — because the claim is about
+// the two agreeing, and building their premises separately is how they would
+// come to disagree without the test noticing.
+function runSeatTokenParity(dir, { tokenValue, apiBase, withValidTokenFile }) {
+  const stubGhPath = path.join(dir, "gh.real");
+  writeFileSync(stubGhPath, STUB_GH_SOURCE);
+  chmodSync(stubGhPath, 0o755);
+
+  let tokenFilePath = path.join(dir, "does-not-exist");
+  if (withValidTokenFile) {
+    tokenFilePath = path.join(dir, "token");
+    writeFileSync(tokenFilePath, `${AUTH_CHECK_VALID_TOKEN}\n`);
+  }
+
+  // Assigned through sanitizedEnv's overrides, so GH_SEAT_TOKEN_VALUE arrives
+  // set-but-empty for the "" case rather than unset — which is the whole
+  // premise of that row, and the difference `+x` reads and `-n` does not.
+  const env = sanitizedEnv({
+    GH_SEAT_TOKEN_VALUE: tokenValue,
+    PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
+    GH_TOKEN_WRAPPER_API_BASE: apiBase,
+    GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
+  });
+
+  return {
+    check: spawnSync("sh", [WRAPPER, "paperclip-auth-check"], { env, encoding: "utf8" }),
+    real: spawnSync("sh", [WRAPPER, "api", "user"], { env, encoding: "utf8" }),
+  };
+}
+
+test("the self-test's verdict and the real path's exit code agree on every seat-token shape (PEN-5255)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    for (const parityCase of SEAT_TOKEN_PARITY_CASES) {
+      for (const withValidTokenFile of [false, true]) {
+        withTempDir((dir) => {
+          const { check, real } = runSeatTokenParity(dir, {
+            tokenValue: parityCase.tokenValue,
+            apiBase,
+            withValidTokenFile,
+          });
+          const premise = `${parityCase.name}${withValidTokenFile ? " + valid token file behind it" : " + no token file"}`;
+
+          // A check that died before printing would make every comparison below
+          // vacuously true, and 70 (temp-dir fault) is the realistic way that
+          // happens in CI. Fail on it explicitly rather than measuring nothing.
+          assert.notEqual(check.status, 70, `${premise}: self-test hit a temp-dir fault\n${check.stderr}`);
+          assert.match(check.stdout, /verdict:\s+\S/, `${premise}: self-test printed no verdict\n${check.stderr}`);
+
+          const saysNoCredential = /verdict:\s+NO_CREDENTIAL\b/.test(check.stdout);
+          const realRefuses = real.status === 64;
+
+          // Both absolute expectations AND the biconditional. The pair alone
+          // would still pass a mutation that moved both sides together; the
+          // biconditional alone would not say which side went wrong.
+          assert.equal(
+            saysNoCredential,
+            parityCase.expectNoCredential,
+            `${premise}: self-test verdict is wrong on its own terms\n${check.stdout}`,
+          );
+          assert.equal(
+            realRefuses,
+            parityCase.expectNoCredential,
+            `${premise}: real path exited ${real.status}, expected ${parityCase.expectNoCredential ? 64 : "not 64"}\n${real.stdout}${real.stderr}`,
+          );
+          assert.equal(
+            saysNoCredential,
+            realRefuses,
+            `${premise}: self-test and real path disagree — verdict NO_CREDENTIAL=${saysNoCredential}, real path exit ${real.status}\n${check.stdout}`,
+          );
+
+          // The exit code is what a script branches on, so it has to carry the
+          // same answer as the prose a human reads.
+          assert.equal(
+            check.status === 2,
+            saysNoCredential,
+            `${premise}: verdict text and exit code disagree — exit ${check.status}\n${check.stdout}`,
+          );
+
+          if (parityCase.trimsTo !== undefined) {
+            // The only case that can catch the two sides trimming differently,
+            // and it reads each side where that side's trim actually lands:
+            // the check's reported hash, and the value the real path exported.
+            const expectedHash = createHash("sha256").update(parityCase.trimsTo).digest("hex").slice(0, 8);
+            assert.match(
+              check.stdout,
+              new RegExp(`token-sha256:\\s+${expectedHash}$`, "m"),
+              `${premise}: self-test hashed something other than the trimmed token\n${check.stdout}`,
+            );
+            assert.match(
+              real.stdout,
+              new RegExp(`^GH_TOKEN=${parityCase.trimsTo}$`, "m"),
+              `${premise}: real path exported something other than the trimmed token\n${real.stdout}`,
+            );
+          }
+        });
+      }
+    }
   });
 });
 

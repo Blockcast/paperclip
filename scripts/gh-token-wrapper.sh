@@ -414,9 +414,18 @@ auth_check_probe() {
     exit 70
   }
   # Scoped to this probe: an interrupt during the up-to-15s curl must not leave
-  # the header file behind. Setting it here also replaces the caller's EXIT trap
-  # for the duration of this command-substitution subshell, so the caller's
-  # cleanup cannot run early against its own still-in-use temp file.
+  # the header file behind.
+  #
+  # These traps REPLACE the caller's, so this function must only ever be called
+  # inside `$( )`. A subshell gets a fresh trap environment, so the caller's
+  # EXIT trap is untouched out here and cannot fire early against its own
+  # still-in-use temp file — verified under dash and bash: a parent
+  # `trap ... EXIT` does not fire when `$(f)` ends, and a trap set inside `$(g)`
+  # fires only in that subshell. A DIRECT call would instead overwrite
+  # paperclip_auth_check's own EXIT trap and drop the check_cfg cleanup, leaving
+  # the one temp file that carries the token behind. Both call sites (the two
+  # `set -- $(auth_check_probe ...)` lines below) are command substitutions;
+  # there are no others.
   trap 'rm -f "${probe_hdr}"' EXIT
   trap 'rm -f "${probe_hdr}"; exit 130' INT
   trap 'rm -f "${probe_hdr}"; exit 143' TERM
@@ -452,6 +461,40 @@ auth_check_mount_generation() {
   fi
 }
 
+# The ONE implementation of the GH_SEAT_TOKEN_VALUE trim, shared by the real
+# credential branch below and by `paperclip_auth_check`'s report of what that
+# branch would do. It is a function rather than two matching copies because the
+# copies were the defect: PEN-5255 showed the suite stayed green under three
+# independent mutations of the self-test's copy, so nothing was holding the
+# diagnostic to the path it diagnoses, and a drifted diagnostic is worse than
+# none because it is confident. Extraction closes two of those three drift
+# classes outright; the third (branch-selection order) is pinned by the parity
+# test in scripts/gh-token-wrapper.test.mjs.
+#
+# Trims surrounding whitespace only — a secret that arrives via a templated env
+# binding routinely picks up a trailing newline, and tabs/spaces are just as
+# likely as CR/LF from a YAML block scalar. Deliberately a trim rather than a
+# delete: `tr -d` would silently splice "ghu_aaa\nbbb" into the single
+# plausible-looking token "ghu_aaabbb" and authenticate as nobody-in-particular,
+# which is the failure mode the calling branch exists to avoid.
+#
+# Returns through TRIMMED_SEAT_TOKEN rather than stdout, for two reasons.
+# Command substitution strips trailing newlines, so a `$(trim_seat_token ...)`
+# contract would be partly enforced by the caller's substitution rather than by
+# this function — it would read as correct here while the real trimming moved
+# somewhere unreviewed. And an out-parameter keeps a live credential inside this
+# shell: no subshell, no pipe, no fork while it is in hand.
+trim_seat_token() {
+  TRIMMED_SEAT_TOKEN="$1"
+  while :; do
+    case "${TRIMMED_SEAT_TOKEN}" in
+      [[:space:]]*) TRIMMED_SEAT_TOKEN="${TRIMMED_SEAT_TOKEN#?}" ;;
+      *[[:space:]]) TRIMMED_SEAT_TOKEN="${TRIMMED_SEAT_TOKEN%?}" ;;
+      *) break ;;
+    esac
+  done
+}
+
 # Removes the probe config file, which is the one temp file here that carries
 # the token. 0600 and short-lived, but "short-lived" stops being true the moment
 # the probe is interrupted, so the cleanup is a trap rather than a trailing rm.
@@ -473,15 +516,9 @@ paperclip_auth_check() {
   # order rather than checking whichever is cheaper.
   if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
     check_source="GH_SEAT_TOKEN_VALUE (agent-scoped secret binding)"
-    # Same trim as the real branch: surrounding whitespace only, never a delete.
-    check_token="${GH_SEAT_TOKEN_VALUE}"
-    while :; do
-      case "${check_token}" in
-        [[:space:]]*) check_token="${check_token#?}" ;;
-        *[[:space:]]) check_token="${check_token%?}" ;;
-        *) break ;;
-      esac
-    done
+    # The real branch's trim itself, not a copy of it — see trim_seat_token.
+    trim_seat_token "${GH_SEAT_TOKEN_VALUE}"
+    check_token="${TRIMMED_SEAT_TOKEN}"
     if [ -z "${check_token}" ]; then
       check_state="set-but-whitespace-only"
       would_refuse=yes
@@ -579,10 +616,15 @@ paperclip_auth_check() {
     github_reachable="yes (unauthenticated /rate_limit -> ${anon_code}, x-ratelimit-limit ${anon_limit})"
   fi
 
-  # Verdicts are deliberately four distinct states with four distinct exit
-  # codes, because the whole defect is that GitHub collapses them into one
-  # string. Order matters: a transport failure is decided before anything is
-  # read as a statement by GitHub.
+  # Verdicts are deliberately distinct states with distinct exit codes, because
+  # the whole defect is that GitHub collapses them into one string. Six of them:
+  # OK 0 - REJECTED 1 - NO_CREDENTIAL 2 - AMBIENT_AUTH 3 - GITHUB_UNREACHABLE 4
+  # - UNEXPECTED 5, beside the 70 a temp-dir fault exits with above. Keep this
+  # list in step with the arms below; a stale count here is the same class of
+  # confidently-wrong diagnostic the subcommand exists to end.
+  #
+  # Order matters: a transport failure is decided before anything is read as a
+  # statement by GitHub.
   if [ -z "${check_token}" ]; then
     if [ "${would_refuse}" = yes ]; then
       verdict="NO_CREDENTIAL — no usable token (${check_state}); \`gh\` will refuse with exit 64, it will NOT fall back to ambient auth"
@@ -683,20 +725,10 @@ esac
 # GH_TOKEN unconditionally (BLO-13241), so GH_TOKEN cannot double as an input
 # without reopening that bug.
 if [ "${GH_SEAT_TOKEN_VALUE+x}" = x ]; then
-  # Trim surrounding whitespace only — a secret that arrives via a templated
-  # env binding routinely picks up a trailing newline, and tabs/spaces are just
-  # as likely as CR/LF from a YAML block scalar. Deliberately a trim rather than
-  # a delete: `tr -d` would silently splice "ghu_aaa\nbbb" into the single
-  # plausible-looking token "ghu_aaabbb" and authenticate as nobody-in-
-  # particular, which is the failure mode this whole branch exists to avoid.
-  TOKEN="${GH_SEAT_TOKEN_VALUE}"
-  while :; do
-    case "${TOKEN}" in
-      [[:space:]]*) TOKEN="${TOKEN#?}" ;;
-      *[[:space:]]) TOKEN="${TOKEN%?}" ;;
-      *) break ;;
-    esac
-  done
+  # Shared with paperclip_auth_check, which reports what this branch would do;
+  # trim_seat_token carries the reasoning for trimming rather than deleting.
+  trim_seat_token "${GH_SEAT_TOKEN_VALUE}"
+  TOKEN="${TRIMMED_SEAT_TOKEN}"
 
   # Both rejections below must exit rather than fall through to the token file
   # or to the real binary: a malformed binding is a misconfiguration, and
