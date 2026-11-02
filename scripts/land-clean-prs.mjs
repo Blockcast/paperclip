@@ -155,6 +155,7 @@ export const EJECTIONS_BEFORE_HOLD = 2;
 
 export const CODEOWNER_REQUEST_MARKER = "<!-- landing-routine:codeowner-request -->";
 export const STALE_ENQUEUE_MARKER = "<!-- landing-routine:stale-enqueue -->";
+export const STALE_QUEUED_MARKER = "<!-- landing-routine:stale-queued -->";
 
 /**
  * Marker for the stated-hold comment, keyed by the REASON and not just by the
@@ -865,6 +866,65 @@ export function classifyFromListing(pr, { now = Date.now() } = {}) {
   // sequencing constraint still holds.
   if (pr?.isDraft === true) return row("skip", "draft");
 
+  // Membership in the merge queue is read BEFORE `autoMergeRequest`, because
+  // it is a direct observation of where the PR is right now, while an
+  // auto-merge request only says what was asked for earlier. The two are not
+  // redundant and neither implies the other: a PR enqueued DIRECTLY — which is
+  // what a queue-enabled base produces once checks are green — carries
+  // `autoMergeRequest: null`. Verified live 2026-11-02T08:49Z on #3241/#3255
+  // at queue positions 3 and 2, and again at 23:4xZ on #3275/#3288/#3268, all
+  // five reading `autoMergeRequest: null` while sitting in `MQ_kwDOSc-KOc4AA6vt`.
+  //
+  // Without this branch such a PR missed `already-enqueued` entirely and
+  // re-classified `enqueue` on every fire. `applyRow` then re-issued
+  // `gh pr merge --auto`, GitHub answered `! Pull request #N is already queued
+  // to merge` at EXIT 0 so nothing threw, and the row stayed `enqueue` — which
+  // `sweepRepos` counts against MAX_ENQUEUES_PER_FIRE. Every fire spent cap
+  // slots on PRs that needed nothing, and a deep enough queue could consume the
+  // whole budget while starving the PRs that did need it (PEN-5279).
+  //
+  // ⛔ Do not key this on `mergeStateStatus` instead. A queued PR is not a
+  // distinct merge state: #3241/#3255 read CLEAN while queued at 09:0xZ and
+  // UNKNOWN at 09:2xZ, and #3275/#3288 read UNKNOWN while queued at 23:3xZ.
+  // The field flaps under load and answers a different question.
+  //
+  // ## Precedence, and what it changes
+  //
+  // Living in `classifyFromListing` puts this AHEAD of every rule in
+  // `classifyPr` — the merge-state hold, the check rules, and the code-owner
+  // hold. That is deliberate and it matches the `autoMergeRequest` branch
+  // directly below, which has always short-circuited those same rules: once
+  // GitHub has the PR, this routine has nothing left to decide, and a receipt
+  // saying it "holds it here rather than enqueuing it" would be false.
+  //
+  // Measured consequence, dry run 2026-11-02T23:5xZ against Blockcast/paperclip
+  // with a 4-deep queue: #3275 and #3268 moved `codeowner-review-requested` ->
+  // `already-enqueued`, and #3288 moved `skip`/`mergestate:UNKNOWN` ->
+  // `already-enqueued`. `enqueue` was 3 before and 3 after, so nothing that
+  // needed enqueuing stopped being enqueued. Note those three were NOT spending
+  // cap slots in that window — other rules were already holding them — so that
+  // run is evidence the DETECTION works, not a reproduction of the cap burn.
+  // The cap burn is the 09:0xZ observation on #3241/#3255, which needs the
+  // queued PR to have no outstanding owner request and a CLEAN merge state.
+  if (pr?.mergeQueueEntry) {
+    const enqueuedAt = Date.parse(pr.mergeQueueEntry.enqueuedAt ?? "");
+    // Same rule as the auto-merge clock below: an unparseable timestamp reads
+    // as fresh, which leaves the PR alone.
+    const ageHours = Number.isFinite(enqueuedAt) ? (now - enqueuedAt) / 3_600_000 : 0;
+    const position = pr.mergeQueueEntry.position;
+    const where = Number.isFinite(position) ? `queue position ${position}` : "in merge queue";
+    // Bounded by the same threshold as a wedged auto-merge request, and for
+    // the same reason — but reported under its OWN action, because the
+    // `stale-enqueue` remedy is `gh pr merge --disable-auto`, which on a
+    // directly-enqueued PR disarms nothing and would post a comment claiming a
+    // disarm that never happened. `gh` exposes no dequeue flag (checked on
+    // 2.102.0), so this one states the finding and leaves the queue alone.
+    if (ageHours > STALE_ENQUEUE_HOURS) {
+      return row("stale-queued", `${where}, enqueued ${ageHours.toFixed(1)}h ago`);
+    }
+    return row("already-enqueued", `${where}, enqueued ${ageHours.toFixed(1)}h ago`);
+  }
+
   if (pr?.autoMergeRequest) {
     const enabledAt = Date.parse(pr.autoMergeRequest.enabledAt ?? "");
     // An unparseable timestamp must not read as infinitely old: treating it as
@@ -1242,6 +1302,9 @@ const NON_HOLD_ACTIONS = new Set([
   // on each one saying the routine is not enqueuing it. True, useless, and
   // forever.
   "notify-only",
+  // Same argument, different clock: a PR wedged in the merge queue is reported
+  // by `classifyFromListing` off the queue entry's own `enqueuedAt`.
+  "stale-queued",
 ]);
 
 /**
@@ -1366,9 +1429,25 @@ export const UNLANDED_ELIGIBLE_HOURS = 6;
  *
  * ## What is deliberately NOT in this cohort
  *
- * `already-enqueued` — bounded already, and by a better clock: a wedged
- * auto-merge request is reported as `stale-enqueue` off its own `enabledAt`
- * after STALE_ENQUEUE_HOURS. Adding it here would name one PR twice.
+ * `already-enqueued` — bounded already, and by a better clock, in BOTH of the
+ * two ways a PR reaches that verdict. A wedged auto-merge request is reported
+ * as `stale-enqueue` off its own `enabledAt`; a PR wedged in the merge queue
+ * is reported as `stale-queued` off its queue entry's `enqueuedAt`. Both fire
+ * after STALE_ENQUEUE_HOURS, and adding either here would name one PR twice.
+ *
+ * ⚠ That second clock is why this carve-out is sound, and it did not exist
+ * before PEN-5279. Until then `already-enqueued` was reachable ONLY through
+ * `autoMergeRequest`, so a DIRECTLY-enqueued PR — the normal product of a
+ * queue-enabled base — never classified `already-enqueued` at all. It
+ * classified `enqueue`, which is exactly this cohort's predicate, so a PR
+ * sitting healthily in the queue was INSIDE this detector rather than carved
+ * out of it, and `--alarm` exits non-zero on a non-empty cohort. It needed
+ * `judgeableAgeHours > UNLANDED_ELIGIBLE_HOURS` on top, which is the only
+ * reason it was not observed firing: measured 2026-11-02, #3241 reached ~4.3h
+ * of judgeable age while queued, ~1.7h under the bar, and what held it under
+ * was an unrelated re-run on its head. Luck, not design. Reading queue
+ * membership closes that; do not reintroduce it by making `already-enqueued`
+ * depend on `autoMergeRequest` again.
  *
  * `enqueue-failed` — `markFailure` renames the action, which drops it out of
  * `NON_HOLD_ACTIONS`, so `stalledHolds` already ages it. Covered.
@@ -1726,7 +1805,14 @@ export function stateHold(repo, { number, reason, ageHours, detail }, run = gh) 
 }
 
 const PR_LIST_FIELDS =
-  "number,headRefOid,author,labels,isDraft,autoMergeRequest,reviewRequests";
+  // `baseRefName` is here for the merge-queue lookup: a queue belongs to a
+  // branch, so the PRs have to be grouped by base before it can be read.
+  //
+  // `mergeStateStatus` is deliberately NOT here: PEN-5442 moved it to
+  // `fetchMergeStates` below, because a 100-item `gh pr list` page carrying
+  // it 502s on a repo with >=100 open PRs. The merge-queue branch does not
+  // need it anyway — see the ⛔ note in `classifyFromListing`.
+  "number,headRefOid,author,labels,isDraft,autoMergeRequest,reviewRequests,baseRefName";
 
 /**
  * Open PRs per page when reading merge states.
@@ -1805,7 +1891,6 @@ export function fetchMergeStates(repo, { run = gh, pageSize = MERGE_STATE_PAGE_S
   }
   return states;
 }
-
 function execGh(args) {
   return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
 }
@@ -1913,6 +1998,105 @@ export function fetchCodeownerRules(repo, run = gh) {
   return null;
 }
 
+/** How many queue entries one page asks for. GitHub caps `first` at 100. */
+const MERGE_QUEUE_PAGE = 100;
+
+/** A bound on the paging loop, so a broken cursor cannot spin forever. */
+const MERGE_QUEUE_MAX_PAGES = 10;
+
+/**
+ * The merge queue for one base branch as `Map<prNumber, entry>`, or `null`
+ * when it could not be read.
+ *
+ * `null` must stay distinguishable from an empty Map, and the two fail in
+ * opposite directions. An empty Map is the measured "nothing is queued on this
+ * branch", and it is the common case — `mergeQueue(branch:)` answers `null`
+ * for a branch with no queue configured at all, which is also an empty queue
+ * for our purposes. `null` here means UNREAD, and the caller degrades to the
+ * pre-PEN-5279 behaviour: the PR classifies `enqueue`, `applyRow` re-issues an
+ * enqueue that GitHub no-ops at exit 0, and a cap slot is spent. That is
+ * wasteful and it is exactly what this function exists to stop — but it is the
+ * direction that cannot stall a PR.
+ *
+ * ⛔ The opposite direction is the one to protect. Claiming a PR IS queued when
+ * it is not classifies it `already-enqueued`, which is in `NON_HOLD_ACTIONS`
+ * and is excluded from `unlandedEligible` — so the PR would never be enqueued
+ * and no detector in this script would age it. A read that is uncertain must
+ * return `null`, never a Map that is missing entries.
+ *
+ * That is why an exhausted page budget returns `null` rather than the pages it
+ * did collect: a truncated queue is a Map whose absent entries are
+ * indistinguishable from "not queued", which is precisely the fail-closed
+ * claim above.
+ */
+export function fetchMergeQueueEntries(repo, branch, run = gh) {
+  const [owner, name] = String(repo ?? "").split("/");
+  if (!owner || !name || !branch) return null;
+
+  const entries = new Map();
+  let cursor = null;
+  for (let page = 0; page < MERGE_QUEUE_MAX_PAGES; page += 1) {
+    let response;
+    try {
+      response = JSON.parse(
+        run([
+          "api",
+          "graphql",
+          "-f",
+          `query=query($owner:String!,$name:String!,$branch:String!,$cursor:String){
+            repository(owner:$owner,name:$name){
+              mergeQueue(branch:$branch){
+                entries(first:${MERGE_QUEUE_PAGE},after:$cursor){
+                  pageInfo{ hasNextPage endCursor }
+                  nodes{ position state enqueuedAt pullRequest{ number } }
+                }
+              }
+            }
+          }`,
+          "-f",
+          `owner=${owner}`,
+          "-f",
+          `name=${name}`,
+          "-f",
+          `branch=${branch}`,
+          ...(cursor ? ["-f", `cursor=${cursor}`] : []),
+        ]),
+      );
+    } catch {
+      return null;
+    }
+
+    // A GraphQL 200 can still carry errors with a null payload; that is an
+    // unread queue, not an empty one.
+    if (Array.isArray(response?.errors) && response.errors.length > 0) return null;
+
+    const queue = response?.data?.repository?.mergeQueue;
+    // No queue configured on this branch. Measured, not unread: every PR on
+    // this base is genuinely not sitting in a queue.
+    if (queue == null) return entries;
+
+    const connection = queue?.entries;
+    if (connection == null) return null;
+
+    for (const node of connection?.nodes ?? []) {
+      const number = node?.pullRequest?.number;
+      if (!Number.isFinite(number)) continue;
+      entries.set(number, {
+        position: node?.position,
+        state: node?.state,
+        enqueuedAt: node?.enqueuedAt,
+      });
+    }
+
+    if (connection?.pageInfo?.hasNextPage !== true) return entries;
+    cursor = connection?.pageInfo?.endCursor;
+    // `hasNextPage` with no cursor to follow is a truncated read.
+    if (!cursor) return null;
+  }
+  // Page budget exhausted with more pages outstanding: see the docblock.
+  return null;
+}
+
 /** Changed paths for one PR, or `null` if the listing failed or GitHub truncated it. */
 export function fetchPrFiles(repo, number, run = gh) {
   try {
@@ -1947,8 +2131,30 @@ export function fetchOpenPrs(repo, { run = gh, mergeStates = fetchMergeStates } 
   const states = mergeStates(repo, { run });
   // One fetch per repo, not per PR: the rules are a property of the base branch.
   const codeownerRules = fetchCodeownerRules(repo, run);
-  return rows.map((row) => {
-    assertHeadSha(row, repo);
+
+  // One merge-queue read per DISTINCT BASE, not per PR: a queue belongs to a
+  // branch, so every PR targeting that branch is answered by the same read.
+  // On this fleet that is one extra GraphQL call per repo in the normal case.
+  //
+  // This is hydrated BEFORE `classifyFromListing` is consulted, unlike
+  // `codeownerRules` and the per-PR fetches below, because queue membership is
+  // one of the cheap rules — it DECIDES whether a PR needs the expensive
+  // hydration at all, rather than refining a verdict afterwards. A queued PR
+  // short-circuits to `already-enqueued` and pays nothing further.
+  const queueByBase = new Map();
+  const mergeQueueEntryFor = (row) => {
+    const base = row?.baseRefName;
+    if (!base) return null;
+    if (!queueByBase.has(base)) queueByBase.set(base, fetchMergeQueueEntries(repo, base));
+    // `null` is an unread queue, and must not read as "this PR is not queued"
+    // in a way that could ever be mistaken for a measurement — but the verdict
+    // it produces is the same `null` entry the pre-PEN-5279 code implied, so
+    // the degradation is to the old behaviour and nothing worse.
+    return queueByBase.get(base)?.get(row?.number) ?? null;
+  };
+
+  return rows.map((listed) => {
+    assertHeadSha(listed, repo);
     // ⛔ The join, and the `??` is load-bearing in the fail-CLOSED direction.
     //
     // The two calls are not atomic: a PR open for the listing can merge, or be
@@ -1963,7 +2169,15 @@ export function fetchOpenPrs(repo, { run = gh, mergeStates = fetchMergeStates } 
     // the row: dropping it would hide a PR from the receipt and from the
     // unlanded-eligible detector, which is how a strand becomes invisible.
     // The cost of the hold is one cycle; the next fire reads it again.
-    const joined = { ...row, mergeStateStatus: states.get(row?.number) ?? "UNKNOWN" };
+    //
+    // `mergeQueueEntry` rides the same join. It is independent of
+    // `mergeStateStatus` and must stay so — a queued PR has been observed at
+    // CLEAN and at UNKNOWN, so neither value identifies one.
+    const joined = {
+      ...listed,
+      mergeStateStatus: states.get(listed?.number) ?? "UNKNOWN",
+      mergeQueueEntry: mergeQueueEntryFor(listed),
+    };
     if (classifyFromListing(joined)) return joined;
     return {
       ...joined,
@@ -2110,6 +2324,55 @@ export function liveHeadSha(repo, number, run = gh) {
   return typeof raw === "string" && raw.length > 0 ? raw : null;
 }
 
+/**
+ * This PR's merge-queue entry right now, or `null` if it is not queued or the
+ * read failed.
+ *
+ * A second, single-PR read of what `fetchMergeQueueEntries` already answered in
+ * bulk, taken immediately before the enqueue for the same check-then-act reason
+ * as `liveHeadSha`: the bulk read happens once at the top of the fire, and
+ * something else — a human, or a classic auto-merge request firing — can enqueue
+ * the PR in between. Without this, that race re-issues an enqueue GitHub no-ops
+ * at exit 0, and the row still reads `enqueue` and still spends a cap slot
+ * (PEN-5279, done-when 4).
+ *
+ * ⛔ `null` on failure is deliberate and it is the SAFE direction here, which is
+ * the opposite of `fetchMergeQueueEntries`'s contract — read that one's docblock
+ * before assuming they should match. There, `null` means "unread" and suppresses
+ * a verdict. Here, `null` means "go ahead and enqueue", so an unreadable queue
+ * degrades to the pre-PEN-5279 behaviour: one wasted no-op and one wasted cap
+ * slot, on one fire. Failing the other way would hold a PR that nothing has
+ * enqueued.
+ */
+export function liveMergeQueueEntry(repo, number, run = gh) {
+  const [owner, name] = String(repo ?? "").split("/");
+  if (!owner || !name) return null;
+  try {
+    const response = JSON.parse(
+      run([
+        "api",
+        "graphql",
+        "-f",
+        `query=query($owner:String!,$name:String!,$number:Int!){
+          repository(owner:$owner,name:$name){
+            pullRequest(number:$number){ mergeQueueEntry{ position state enqueuedAt } }
+          }
+        }`,
+        "-f",
+        `owner=${owner}`,
+        "-f",
+        `name=${name}`,
+        "-F",
+        `number=${number}`,
+      ]),
+    );
+    if (Array.isArray(response?.errors) && response.errors.length > 0) return null;
+    return response?.data?.repository?.pullRequest?.mergeQueueEntry ?? null;
+  } catch {
+    return null;
+  }
+}
+
 const short = (sha) => (typeof sha === "string" ? sha.slice(0, 7) : String(sha));
 
 /**
@@ -2159,6 +2422,14 @@ const short = (sha) => (typeof sha === "string" ? sha.slice(0, 7) : String(sha))
  * must not claim "armed" for a merge that already happened — this whole defect
  * was a receipt reporting an action it had not taken.
  *
+ * ⚠ "A queue-enabled base is unaffected" scopes THIS paragraph's subject — the
+ * `--auto` immediate-merge behaviour on an unprotected base — and nothing
+ * else. It is NOT a statement that queued PRs are handled correctly in
+ * general, and it was misread that way once (PEN-5279): detecting that a PR is
+ * ALREADY in the queue is a separate rule living in `classifyFromListing`, off
+ * `mergeQueueEntry`. Before that rule existed, a queued PR arrived here every
+ * fire and this function re-issued its enqueue, which GitHub no-ops at exit 0.
+ *
  * ponytail: that costs one doomed call per stacked PR per fire on an
  * unprotected base. Acceptable because it self-heals the moment the base is
  * protected or the PR is retargeted, and it needs no per-repo config. If the
@@ -2195,6 +2466,32 @@ export function applyRow(repo, row, run = gh) {
     // current head oid (enablePullRequestAutoMerge)` and auto-merge was NOT
     // armed. So the flag composes with `--auto` and is enforced server-side on
     // the auto-merge path, not just on an immediate merge.
+    // Last check before acting: the bulk queue read happened at the top of the
+    // fire and something else may have enqueued this PR since. GitHub answers a
+    // re-enqueue with `! Pull request #N is already queued to merge` at EXIT 0,
+    // so `run` does not throw, the row stays `enqueue`, and `sweepRepos` spends
+    // a MAX_ENQUEUES_PER_FIRE slot on a PR that needed nothing (PEN-5279).
+    //
+    // Renaming the action is what actually fixes the accounting: `enqueue` is
+    // the cap's predicate (`sweepRepos`) AND `unlandedEligible`'s, so a row
+    // that leaves here as `already-enqueued` is correctly excluded from both.
+    // Detecting the no-op from the message instead would be guesswork about
+    // which stream `gh` writes it to; this asks GitHub directly.
+    const queued = liveMergeQueueEntry(repo, row.number, run);
+    if (queued) {
+      row.action = "already-enqueued";
+      const position = queued?.position;
+      row.detail = [
+        row.detail,
+        Number.isFinite(position)
+          ? `already at queue position ${position}; not re-enqueued`
+          : "already in the merge queue; not re-enqueued",
+      ]
+        .filter(Boolean)
+        .join(" — ");
+      return null;
+    }
+
     run([
       "pr", "merge", String(row.number), "--repo", repo,
       "--auto", "--rebase", "--match-head-commit", row.headSha,
@@ -2211,6 +2508,24 @@ export function applyRow(repo, row, run = gh) {
       STALE_ENQUEUE_MARKER,
       `Auto-merge had been armed for over ${STALE_ENQUEUE_HOURS}h without landing, so the landing ` +
         `routine disarmed it. It will re-arm on the next fire once this PR classifies clean.`,
+      run,
+    );
+  }
+  if (row.action === "stale-queued") {
+    // Comment only. The auto-merge sibling above disarms the request it is
+    // complaining about, but there is no equivalent here: `gh` exposes no
+    // dequeue flag (2.102.0), and ejecting a PR from the queue by hand is a
+    // destructive act on shared state that this routine has no standing to
+    // take unasked. State the finding and leave the queue alone.
+    return commentOnce(
+      repo,
+      row.number,
+      STALE_QUEUED_MARKER,
+      `This PR has been sitting in the merge queue for over ${STALE_ENQUEUE_HOURS}h without ` +
+        `landing (${row.detail}). The landing routine does not remove PRs from the queue, so it ` +
+        `is reporting this rather than acting on it: either the queue is wedged, or a required ` +
+        `check on the queue branch never reported. Dequeue and re-enqueue it, or say here why it ` +
+        `stands.\n\nPosted once, not once per fire — the routine will not repeat this.`,
       run,
     );
   }
@@ -2507,7 +2822,7 @@ export function markFailure(row, message) {
  * the fire, and a code-owner hold that has outlived its window belongs there.
  * It is only the PR comment that is suppressed.
  */
-const BESPOKE_COMMENT_ACTIONS = new Set(["codeowner-review-requested", "stale-enqueue"]);
+const BESPOKE_COMMENT_ACTIONS = new Set(["codeowner-review-requested", "stale-enqueue", "stale-queued"]);
 
 export function runRepo(
   repo,
