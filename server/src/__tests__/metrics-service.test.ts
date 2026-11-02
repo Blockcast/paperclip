@@ -1629,10 +1629,10 @@ describe("heartbeat recovery chain gate metrics (PEN-3314)", () => {
   });
 
   it("counts a stalled pass separately from a skipped tick", async () => {
-    // A stall means a pass stopped settling entirely and every recovery pass on
-    // the worker is halted until it returns. It is a page; a skip is not.
-    // Folding it into the skip counter would bury it under the skips that
-    // necessarily precede it.
+    // Both are duration signals on the same pass and differ only in degree
+    // (PEN-5259): a skip is one tick arriving while a pass is open, a stall is
+    // that same pass still open ten ticks later. They stay separate so the
+    // crossing is not buried under the skips that necessarily precede it.
     recordHeartbeatRecoveryChainSkipped();
     recordHeartbeatRecoveryChainStalled();
 

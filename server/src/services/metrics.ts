@@ -8290,10 +8290,18 @@ function ensureRegistry(): {
     heartbeatRecoveryChainStalled = new Counter({
       name: HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC,
       help:
-        "Recovery-chain passes still outstanding past the stall threshold, counted once per "
-        + "stalled pass (PEN-3314/PEN-3365). Non-zero means a pass stopped settling entirely "
-        + "rather than merely running slow, so EVERY recovery pass on this worker is halted. "
-        + "The gate does not self-clear, so this does not resolve itself. Page on this.",
+        "Recovery-chain passes that were still outstanding past the stall threshold "
+        + "(10x heartbeatSchedulerIntervalMs), counted once per crossing pass "
+        + "(PEN-3314/PEN-3365/PEN-5259). This is a DURATION threshold on the live pass, NOT a "
+        + "liveness verdict: it increments while the pass is still open, from a watchdog that "
+        + "cannot see whether that pass will return, so a pass that runs long and then "
+        + "completes normally is counted exactly like one that never settles. Do NOT read "
+        + "non-zero as \"the chain stopped settling\", and do NOT alert on \"> 0\": this is a "
+        + "monotonic counter, so that condition stays true forever after the first crossing. "
+        + "Use increase(...[30m]) > 0, at a severity that means \"slow\" rather than \"halted\". "
+        + "To tell slow from halted, read " + HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC + ", "
+        + "which returns to 0 on a pass that settles and climbs without bound on one that "
+        + "does not.",
       registers: [registry],
     });
     heartbeatRecoveryChainStalled.inc(0);

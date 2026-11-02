@@ -1902,14 +1902,14 @@ export async function startServer(): Promise<StartedServer> {
           // an operator's attention either way, and because it lets a log-based
           // alert reach the same conclusion as a metric-based one.
           //
-          // Re-logged on its own coarse clock rather than once per sample. The
-          // halt does not resolve itself, so it must keep saying so; but at
+          // Re-logged on its own coarse clock rather than once per sample.
+          // While the pass is outstanding it must keep saying so; but at
           // `error`, and at a watchdog period deliberately shorter than the
           // scheduler interval, one line per sample is an unbounded page storm
-          // against a worker that is already down. Nothing is lost by the
+          // against a worker that may simply be slow. Nothing is lost by the
           // suppressed lines: `inFlightMs` is monotonic for the life of the
           // pass, so each line that does survive already says how far into the
-          // same unresolved stall it is.
+          // same outstanding pass it is.
           const now = Date.now();
           if (
             heartbeatRecoveryChainStallLoggedAt === 0 ||
@@ -1922,7 +1922,7 @@ export async function startServer(): Promise<StartedServer> {
                 stallAfterMs: HEARTBEAT_RECOVERY_CHAIN_STALL_MS,
                 relogAfterMs: HEARTBEAT_RECOVERY_CHAIN_RELOG_MS,
               },
-              "periodic heartbeat recovery chain still in flight across many ticks; recovery passes are not running",
+              "periodic heartbeat recovery chain still in flight across many ticks; new recovery passes are skipped until it settles",
             );
           }
         }
