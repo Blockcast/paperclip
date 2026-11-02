@@ -12,6 +12,7 @@ import {
   CLEAR,
   OWED,
   REVIEW_DUE,
+  REVIEW_NOTICE,
   TRAILER,
   UNREADABLE,
   WATCHED_PATHS,
@@ -19,6 +20,7 @@ import {
   missingWatchedPaths,
   rereadAttestations,
   renderReport,
+  reviewNoticeDue,
   reviewOwed,
   touchedWatchedPaths,
 } from "./check-git-egress-exec-closure-reread.mjs";
@@ -206,6 +208,65 @@ test("the calendar arm fires independently of the per-change arm", () => {
   assert.equal(result.trailerOwed, false);
   assert.equal(result.calendarOwed, true);
   assert.equal(result.verdict, "owed");
+});
+
+test("the notice window opens at REVIEW_NOTICE and closes at REVIEW_DUE", () => {
+  // It closes ON the due date on purpose: from there the calendar arm reds, and
+  // a warning alongside a failure teaches people to skim the annotation that
+  // matters.
+  assert.equal(reviewNoticeDue("2026-12-14", "2026-12-15", "2027-01-31"), false);
+  assert.equal(reviewNoticeDue("2026-12-15", "2026-12-15", "2027-01-31"), true, "the notice opens ON the notice date");
+  assert.equal(reviewNoticeDue("2027-01-30", "2026-12-15", "2027-01-31"), true);
+  assert.equal(reviewNoticeDue("2027-01-31", "2026-12-15", "2027-01-31"), false, "the gate has taken over on the due date");
+  assert.equal(reviewNoticeDue("2027-06-01", "2026-12-15", "2027-01-31"), false);
+});
+
+test("the SHIPPED constants put the notice window ahead of the due date", () => {
+  // Pinned against the real values, not only against the function's arguments:
+  // a correct predicate fed a stranded constant is still a notice that never
+  // fires, and the discharge edit moves all three of these at once.
+  assert.ok(REVIEW_NOTICE < REVIEW_DUE, `REVIEW_NOTICE ${REVIEW_NOTICE} must precede REVIEW_DUE ${REVIEW_DUE}`);
+  assert.equal(reviewNoticeDue(REVIEW_NOTICE), true, "the window is open on its own first day");
+  assert.equal(reviewNoticeDue(REVIEW_DUE), false, "the window has closed by the due date");
+});
+
+test("an empty notice window is refused rather than silently never firing", () => {
+  // notice >= due is the one way to get these three constants wrong that is
+  // indistinguishable from a correct file in a quiet year. Refusing routes it to
+  // UNREADABLE, which is not the clear bucket.
+  assert.throws(() => reviewNoticeDue("2026-12-20", "2027-01-31", "2027-01-31"), /strictly before/);
+  assert.throws(() => reviewNoticeDue("2026-12-20", "2027-02-01", "2027-01-31"), /strictly before/);
+  assert.throws(() => reviewNoticeDue("not-a-date"), /YYYY-MM-DD/);
+  assert.throws(() => reviewNoticeDue("2026-12-20", "2026-12-1", "2027-01-31"), /YYYY-MM-DD/);
+});
+
+test("the notice arm changes no verdict", () => {
+  // The whole point of the arm. The exit code is `verdict === "clear" ? 0 : 1`,
+  // so pinning the verdict inside the window is what pins the exit code — if
+  // this ever reads "owed", the notice has become a gate nobody agreed to.
+  const inWindow = evaluate({ changedPaths: ["README.md"], commitMessages: ["docs: x"], today: REVIEW_NOTICE, headPaths: BOTH_PRESENT });
+  assert.equal(inWindow.noticeDue, true);
+  assert.equal(inWindow.calendarOwed, false, "the notice must not be riding on the calendar arm");
+  assert.equal(inWindow.verdict, "clear");
+
+  const before = evaluate({ changedPaths: ["README.md"], commitMessages: ["docs: x"], today: BEFORE, headPaths: BOTH_PRESENT });
+  assert.equal(before.noticeDue, false);
+  assert.equal(before.verdict, "clear");
+});
+
+test("the notice report warns without claiming the review is already due", () => {
+  const notice = renderReport(
+    evaluate({ changedPaths: [], commitMessages: [], today: REVIEW_NOTICE, headPaths: BOTH_PRESENT }),
+    { base: "a", head: "b", today: REVIEW_NOTICE },
+  );
+  assert.match(notice, /REVIEW IS APPROACHING/);
+  assert.match(notice, /nothing is blocked by/);
+  assert.match(notice, new RegExp(`review_notice  = ${REVIEW_NOTICE}`));
+  // The wording the calendar arm owns must not appear while that arm is still
+  // quiet. A notice that reads like the failure is a notice people learn to
+  // ignore, and then the failure reads like the notice.
+  assert.doesNotMatch(notice, /REVIEW IS DUE/);
+  assert.match(notice, /verdict\s+= clear/);
 });
 
 test("the report names the remedy for whichever arm fired", () => {
