@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { ALERTNAME, buildAlert } from "../.github/scripts/post-docker-agent-alert.mjs";
+import { ALERTNAME, buildAlert, wasEvictedBeforeStart } from "../.github/scripts/post-docker-agent-alert.mjs";
 
 const workflow = readFileSync(new URL("../.github/workflows/docker-agent.yml", import.meta.url), "utf8");
 const alertScript = readFileSync(
@@ -518,4 +518,24 @@ test("the agent image bump runs off the dind lane, serialized in build order", (
   assert.doesNotMatch(bumpJob, /arc-paperclip-dind/, "the bump is a curl; it must not wait for the one dind runner");
   assert.match(bumpJob, /^\s*group: docker-agent-bump-\$\{\{ github\.ref \}\}$/m);
   assert.match(bumpJob, /^\s*cancel-in-progress: false$/m);
+});
+
+// BLO-33389: an evicted PENDING build (superseded in the concurrency queue)
+// reports `cancelled` exactly like a timeout kill. Only the timeout is a
+// delivery failure. Shapes are from runs 41363953835 (evicted) and
+// 41223154006 (cancelled mid-build on a runner).
+test("an evicted-pending build is not a failure; a cancelled running build still is", () => {
+  assert.equal(wasEvictedBeforeStart({ conclusion: "cancelled", runner_name: null, steps: [] }), true);
+  assert.equal(
+    wasEvictedBeforeStart({ conclusion: "cancelled", runner_name: "arc-paperclip-dind-x", steps: [{}] }),
+    false,
+    "a timeout/mid-build cancel must still page (BLO-43939)",
+  );
+  assert.equal(wasEvictedBeforeStart({ conclusion: "failure", runner_name: null, steps: [] }), false);
+  assert.equal(wasEvictedBeforeStart(undefined), false, "a missing job must fail toward paging");
+
+  const alertJob = getJobBlock("alert-on-failure");
+  assert.match(alertJob, /BUILD_RESULT: \$\{\{ needs\.build-and-push\.result \}\}/);
+  assert.match(alertJob, /actions: read/, "the script needs actions:read to look up the job");
+  assert.match(alertScript, /BUILD_RESULT === 'cancelled'/, "only a cancel may be suppressed, never a failure");
 });
