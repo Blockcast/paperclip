@@ -225,10 +225,21 @@ The two seats also differ in `role`, `reportsTo`, `permissions.canCreateAgents`
 and the `skills:create` grant. Per the section above, those four differences
 are not causal; the `agents:configure` row is.
 
+**That table is itself an instance of the disclosure recorded under
+`PEN-5232`.** The reading seat was answered `{}` for peer config and, in the
+same response body, the peer's whole `access.grants` array — which is where the
+grant and its 2026-07-19 date came from. The grant counts in column 1 have the
+same provenance. So this evidence does not survive the narrowing below: once
+`#3274` lands, a seat in the `Cto`'s position can no longer reproduce this
+table, and a re-derivation needs either a seat holding `agents:configure` or a
+direct database read.
+
 ## The route matrix
 
 `adapterConfig` / `runtimeConfig` as returned to an **agent actor that does not
-hold the implication**, with the subject in the same company:
+hold the implication**, with the subject in the same company. Those two columns
+are all this table governs — the same response carries a sibling object the
+projection never sees, tabled separately under `PEN-5232` below:
 
 | Route | Subject | Before `PEN-4775` | After | Withheld marker (`PEN-5230`) |
 | --- | --- | --- | --- | --- |
@@ -312,6 +323,57 @@ To tell which **tree** you are on, rather than what a response means, check for
 `WITHHELD_AGENT_CONFIG_FIELDS` in `server/src/routes/agents.ts`; it is present
 on `master`, so its absence now means a stale checkout rather than a tree
 predating the signal.
+
+### `access.grants` rides the same route and that projection never sees it (`PEN-5232`)
+
+The matrix above is about two columns on the `agents` row. The detail route
+returns a second object beside them which the restricted projection does not
+reach: `buildAgentDetail` composes the projection and then attaches `access`
+**outside** the spread, and `buildAgentAccessState` returns the subject's grant
+list on every one of its arms. `options.restricted` is consulted by the spread
+only. So the peer read answered `adapterConfig: {}` is answered in the same body
+with the subject's complete grant inventory — and `listPrincipalGrants` is a
+bare `db.select()`, so each entry is the whole 9-column row, `permissionKey`,
+`scope`, `grantedByUserId` and `createdAt` among them.
+
+| Route | Subject | config columns | `access.grants` | On `master`? |
+| --- | --- | --- | --- | --- |
+| `GET /api/agents/me` | self | populated, secrets masked | full inventory | in effect |
+| `GET /api/agents/:id` | self | populated, secrets masked | full inventory | in effect |
+| `GET /api/agents/:id` | peer | `{}` + both markers | **full inventory** | in effect — the finding |
+| `GET /api/agents/:id` | peer | `{}` + both markers | key absent; `canAssignTasks` / `taskAssignSource` / `membership.status` only | **pending — `#3274`** |
+| `GET /api/companies/:id/agents` | peer | `{}` + both markers | **no `access` key at all** | in effect |
+| `GET /api/agents/:id/configuration` | peer | enumerated `redactAgentConfiguration` shape | **no `access` key at all** | in effect |
+| `PATCH /api/agents/:id/permissions` | peer | populated, secrets masked | full inventory | in effect — write-gated |
+
+Two readings of that table are wrong in opposite directions, so take neither
+from the row count:
+
+- **The list route is not stricter by decision.** It attaches no `access`
+  because it maps the projections directly and never calls `buildAgentDetail`,
+  not because anyone scoped access state off it. The same accident that
+  discloses on the detail route withholds here.
+- **The narrowing is a property of one call site, not of the helper.**
+  `buildAgentDetail` has four call sites and exactly one passes
+  `restricted: true`. The last row is a write route, where returning the
+  inventory is coherent — a caller that can rewrite the permission set may read
+  it — but it is coherent by where the route sits, not by anything the
+  projection enforces.
+
+To settle which **tree** you are on, grep `server/src/routes/agents.ts` for
+`WITHHELD_AGENT_ACCESS_FIELDS`: absent on `master` at `7fafb2ed2`
+(2026-11-02), present once `#3274` lands. The sibling
+`WITHHELD_AGENT_CONFIG_FIELDS` is already there, so finding one without the
+other is the in-between state, not a stale checkout.
+
+**`PEN-5228` does not cover this field in either direction.** That ruling is
+about the two config columns and it said keep the withhold; this object was
+outside it, and the decision on it is `PEN-5232`'s — recorded beside
+`buildAgentAccessState` once `#3274` lands, per that row's own requirement that
+the reason live in the module rather than only on the issue. `PEN-5258`
+(`#3267`) narrows `listPrincipalGrants` to an explicit column list, which bounds
+what a grant row *contains*; it does not decide who may read the list, and
+should not be cited as if it had.
 
 ### Archaeology
 
