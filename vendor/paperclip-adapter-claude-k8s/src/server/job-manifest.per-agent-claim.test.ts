@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -348,6 +348,140 @@ describe("the session-resume predicate is gated on the claim (PEN-4932 invariant
     // Meaningful only against the control: the same fixture on the shared claim
     // resumes, and therefore drops it.
     expect(build({ bootstrapPromptTemplate: "PEN-5189-BOOTSTRAP" }).prompt).not.toContain("PEN-5189-BOOTSTRAP");
+  });
+});
+
+describe("the foreign-claim warn names WHICH session outcome happened (PEN-5238)", () => {
+  // `sessionResume` was two-valued over a three-valued fact: anything that did
+  // not resume was reported `refused_foreign_claim`, including a cold wake that
+  // never asked to resume anything. That is the failure this warn exists to
+  // prevent, turned on itself — an operator reading a refusal goes looking for
+  // the session it lost, and there was never one.
+  //
+  // The arms cannot be told apart from the resolver's RESULT: it returns "" for
+  // "nothing requested", for "claim is foreign" and for the model/transcript
+  // checks alike. They are told apart by the REQUEST, which is why these tests
+  // vary `runtime.sessionId` and hold everything else fixed.
+  const SESSION_ID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const MODEL = "claude-opus-5";
+  const WORKSPACE_ROOT = "/paperclip/instances/default/projects/co1/proj-1/_default";
+
+  let sessionRoot = "";
+
+  beforeEach(() => {
+    // A REAL resumable transcript, present in every case below. Without it the
+    // `refused_foreign_claim` test would pass for the wrong reason — the
+    // resolver would return "" because the file is missing rather than because
+    // the claim is foreign, and the assertion would say nothing about claims.
+    sessionRoot = mkdtempSync(path.join(tmpdir(), "pen5238-"));
+    const projects = path.join(
+      sessionRoot,
+      ".claude",
+      "projects",
+      WORKSPACE_ROOT.replace(/[^a-zA-Z0-9-]/g, "-"),
+    );
+    mkdirSync(projects, { recursive: true });
+    writeFileSync(path.join(projects, `${SESSION_ID}.jsonl`), '{"type":"summary"}\n');
+  });
+
+  afterEach(() => {
+    if (sessionRoot) rmSync(sessionRoot, { recursive: true, force: true });
+  });
+
+  /** Build on the agent's own (foreign) claim and return the warn's payload.
+   *
+   *  `requestedSessionId` null means the run asked for no session at all; the
+   *  transcript above stays on disk either way, so the only thing varying
+   *  across these tests is the request. */
+  function warnFor(requestedSessionId: string | null, config: Record<string, unknown> = {}) {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ctx = makeCtx({ model: MODEL, enablePerAgentWorkspaceVolume: true, ...config });
+      ctx.runtime.sessionId = requestedSessionId;
+      ctx.runtime.sessionParams = requestedSessionId ? { sessionId: requestedSessionId, model: MODEL } : null;
+      (ctx.runtime.isolation as unknown as Record<string, unknown>).sessionRoot = sessionRoot;
+      buildJobManifest({ ctx, selfPod });
+      const entries = warn.mock.calls
+        .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
+        .filter((entry) => entry?.event === "claude_k8s.data_claim_foreign");
+      // One warn, always — the field is only meaningful if the warn fired at
+      // all, and a silent build would make every assertion below vacuous.
+      expect(entries).toHaveLength(1);
+      return entries[0];
+    } finally {
+      warn.mockRestore();
+    }
+  }
+
+  it("reports `none_requested` for a run that never asked to resume anything", () => {
+    // The defect. Nothing was refused here, because nothing was requested: the
+    // resolver returned "" at its `!sessionId` guard, above the claim gate it
+    // never reached.
+    expect(warnFor(null).sessionResume).toBe("none_requested");
+    expect(warnFor(null).sessionResume).not.toBe("refused_foreign_claim");
+  });
+
+  it("reports `refused_foreign_claim` only when a session WAS requested and taken", () => {
+    // Same fixture, same transcript still on disk, differing only in the
+    // request — so this is a statement about the request, not about the file.
+    expect(
+      existsSync(
+        path.join(
+          sessionRoot,
+          ".claude",
+          "projects",
+          WORKSPACE_ROOT.replace(/[^a-zA-Z0-9-]/g, "-"),
+          `${SESSION_ID}.jsonl`,
+        ),
+      ),
+    ).toBe(true);
+    expect(warnFor(SESSION_ID).sessionResume).toBe("refused_foreign_claim");
+    // The claim gate is specifically the thing that took it: that `return ""`
+    // sits ABOVE both the model-mismatch and the transcript-existence checks,
+    // so on this line no other cause can be the one that refused.
+    expect(warnFor(SESSION_ID).sessionResume).not.toBe("none_requested");
+  });
+
+  it("treats a whitespace-only session id as no request, the way the resolver does", () => {
+    // `asString` does not trim but `resolveResumableClaudeSessionId` does, so
+    // an untrimmed predicate here reports a refusal the run never suffered —
+    // the same class of confidently-wrong diagnostic, one layer down.
+    expect(warnFor("   ").sessionResume).toBe("none_requested");
+  });
+
+  it("never reports `resumed` on a foreign claim, which is why that arm is unreachable today", () => {
+    // This block is `narrowWritableSurface && !serverCanPreCreate`, and
+    // `serverCanPreCreate` is `narrowWritableSurface && serverHoldsDataClaim` —
+    // so reaching this line means the claim is foreign, and the resolver has
+    // therefore already returned "". The `resumed` arm is written anyway so the
+    // field reports what happened rather than a constant; this test pins that
+    // it stays unreachable, and is the one to revisit if the PEN-5189 gate is
+    // ever moved into the pod.
+    for (const requested of [SESSION_ID, null, "   "]) {
+      expect(warnFor(requested).sessionResume).not.toBe("resumed");
+    }
+  });
+
+  it("is silent on the server's own claim, where a resumable session genuinely resumes", () => {
+    // The control that makes the three values above mean something: the warn
+    // only exists on a foreign claim, so there is no `sessionResume` to report
+    // when the pod really can read the transcript.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const ctx = makeCtx({ model: MODEL });
+      ctx.runtime.sessionId = SESSION_ID;
+      ctx.runtime.sessionParams = { sessionId: SESSION_ID, model: MODEL };
+      (ctx.runtime.isolation as unknown as Record<string, unknown>).sessionRoot = sessionRoot;
+      const built = buildJobManifest({ ctx, selfPod });
+      expect(built.claudeArgs).toContain("--resume");
+      expect(
+        warn.mock.calls
+          .map(([line]) => (typeof line === "string" && line.startsWith("{") ? JSON.parse(line) : null))
+          .filter((entry) => entry?.event === "claude_k8s.data_claim_foreign"),
+      ).toEqual([]);
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
 
