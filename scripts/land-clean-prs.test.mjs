@@ -11,6 +11,7 @@ import {
   alarmExitCode,
   stateHold,
   statedHoldMarker,
+  reviewGateRemedy,
   renderUnlandedEligible,
   unlandedEligible,
   allyVerdictAtHead,
@@ -1965,6 +1966,67 @@ describe("stated holds on the PR (PEN-5263)", () => {
     assert.match(calls[1][6], /an unknown time \(no dated check on this head\)/);
     assert.doesNotMatch(calls[1][6], /NaN|null|undefined/);
   });
+
+  // PEN-5263: `checks:FAILURE` on the bare `review` context reads as "go fix
+  // the code" and is the one hold in this repo that an author can usually
+  // clear alone. `#3032` sat on it six days; `#3238` cleared in ~2 minutes.
+  it("names the quality-gate remedy when the red check is the bare `review`", () => {
+    const body = reviewGateRemedy("review=FAILURE, Build=SUCCESS");
+    assert.match(body, /PR-quality gate/);
+    assert.match(body, /commitperclip PR Review/);
+    assert.match(body, /not CI and not a code finding/);
+  });
+
+  // The half the obvious one-liner gets wrong. Three of the six gates read
+  // `files`/`commits`, so "edit the description, no push required" would send
+  // a trailer or coverage failure round the edit loop forever.
+  it("does not promise a description edit clears the gates that read the diff", () => {
+    const body = reviewGateRemedy("review=FAILURE");
+    assert.match(body, /template sections, linked issue, dedup search/);
+    assert.match(body, /test coverage, lockfile, commit trailers/);
+    assert.match(body, /they need a push/);
+    // Must point at the only thing that knows which of the six actually fired.
+    assert.match(body, /gate's own comment on this PR names which ones failed/);
+  });
+
+  // `failingChecks` emits `name=STATE`, and this repo also publishes
+  // `security-review`. A substring test would claim the quality-gate remedy
+  // for a red security review, which has no such remedy.
+  it("matches the check name exactly and not as a substring", () => {
+    assert.equal(reviewGateRemedy("security-review=FAILURE"), "");
+    assert.equal(reviewGateRemedy("gate/ally-comment-findings=FAILURE"), "");
+    assert.equal(reviewGateRemedy("review-gate=FAILURE"), "");
+    assert.equal(reviewGateRemedy("mergestate:DIRTY"), "");
+    assert.equal(reviewGateRemedy(undefined), "");
+    assert.equal(reviewGateRemedy(null), "");
+  });
+
+  // A check name may itself contain `=` (the measured
+  // `Worktree install (NODE_ENV=production)=QUEUED` case), so the name is
+  // everything BEFORE the last `=`, not the first field.
+  it("recovers the name when the check name itself contains `=`", () => {
+    assert.equal(reviewGateRemedy("Worktree install (NODE_ENV=production)=QUEUED"), "");
+    assert.match(
+      reviewGateRemedy("Worktree install (NODE_ENV=production)=QUEUED, review=FAILURE"),
+      /PR-quality gate/,
+    );
+  });
+
+  it("appends the remedy to the stated hold, keeping the marker keyed on reason alone", () => {
+    const calls = [];
+    const run = (args) => (calls.push(args), args[0] === "api" ? JSON.stringify([]) : "");
+    stateHold(
+      "a/one",
+      { number: 3032, reason: "checks:FAILURE", ageHours: 144, detail: "review=FAILURE" },
+      run,
+    );
+    const body = calls[1][6];
+    assert.match(body, /^<!-- landing-routine:stated-hold:checks-failure -->/);
+    assert.match(body, /PR-quality gate/);
+    // The generic sentence and the once-per-reason promise both survive.
+    assert.match(body, /is not enqueuing this PR: `checks:FAILURE`/);
+    assert.match(body, /once per reason, not once per fire/);
+  });
 });
 
 describe("runRepo apply wiring (PEN-5263)", () => {
@@ -2035,6 +2097,42 @@ describe("runRepo apply wiring (PEN-5263)", () => {
     assert.match(rows[0].detail ?? "", /merge requested/);
   });
 
+  // The unit tests above call `stateHold` with a `detail` the caller has to
+  // supply. `stalledHolds` deliberately does not carry one, so if the join in
+  // `runRepo` is wrong the remedy is silently never reached and every unit
+  // test still passes.
+  it("joins the classification detail onto the stated hold so the remedy is reachable", () => {
+    const { stated } = harness({
+      prs: [prAt(3032, OLD)],
+      rows: [
+        {
+          number: 3032,
+          action: "skip",
+          reason: "checks:FAILURE",
+          detail: "review=FAILURE",
+        },
+      ],
+      apply: true,
+    });
+    // The apply loop appends its outcome to `detail`, so what reaches
+    // `stateHold` is a COMPOSITE, not the bare classification string. (Here
+    // that suffix comes from the harness stub; the real `applyRow` returns
+    // null for a `skip`. It is asserted anyway because `enqueue-failed` rows
+    // DO arrive composite in production, via `markFailure`.)
+    assert.deepEqual(stated, [
+      {
+        number: 3032,
+        reason: "checks:FAILURE",
+        ageHours: 16,
+        detail: "review=FAILURE — merge requested",
+      },
+    ]);
+    // ...and the remedy must still fire on that composite, which is the whole
+    // point of the join. A name parser that took the FIRST `=` field of the
+    // whole string, or split on whitespace, would miss it.
+    assert.match(reviewGateRemedy(stated[0].detail), /PR-quality gate/);
+  });
+
   it("still states a durable hold that the fire did NOT act on", () => {
     // The other side of the cut: suppressing the just-enqueued cohort must not
     // take the real holds with it, or the fix trades one silent hold for all
@@ -2044,7 +2142,14 @@ describe("runRepo apply wiring (PEN-5263)", () => {
       rows: [{ number: 7, action: "skip", reason: "mergestate:DIRTY" }],
       apply: true,
     });
-    assert.deepEqual(stated, [{ number: 7, reason: "mergestate:DIRTY", ageHours: 16 }]);
+    // `detail` rides along since PEN-5263 so `reviewGateRemedy` can read the
+    // failing check names. The value here is the HARNESS's `applyOne` stub,
+    // which returns an outcome for every action; the real `applyRow` returns
+    // null for a `skip`, so a production DIRTY row reaches `stateHold` with
+    // its classification detail (here, none) and no key is added at all.
+    assert.deepEqual(stated, [
+      { number: 7, reason: "mergestate:DIRTY", ageHours: 16, detail: "merge requested" },
+    ]);
   });
 
   it("does not post a second hold comment where applyRow already posted one", () => {

@@ -1356,6 +1356,63 @@ export function renderUnlandedEligible(
 }
 
 /**
+ * The remedy paragraph for a hold whose failing check is the bare `review`
+ * context, or `""` for every other hold.
+ *
+ * ## Why this one check earns a bespoke sentence
+ *
+ * `checks:FAILURE` reads as "a check is red, go fix the code", and for this
+ * check that is wrong in a way that costs days. The bare `review` context is
+ * `commitperclip PR Review` — the PR-QUALITY gate, not CI and not a code
+ * finding. Measured on this repo 2026-11-02, `#3032` sat red on it from
+ * 10-26 and `#3238` from 08:02:16Z, both clearable by their own author in
+ * about two minutes, both costed as unclearable because the hold did not say
+ * so. `commitperclip-review.yml`'s own header records four more of the same
+ * shape sitting 7h, 10h, ~21h and ~7h (`#1328`, `#1359`, `#1696`, `#1873`).
+ *
+ * ## Why the sentence does NOT say "edit the description, no push required"
+ *
+ * That is the natural one-liner and it is true of only HALF the gate.
+ * `run-quality-gates.mjs` fails the check on SIX gates, and they split on
+ * what they read:
+ *
+ *   - body/title only — `checkTemplate`, `checkLinkedIssue`,
+ *     `checkDedupSearch`. These do clear on an edit with no head move, which
+ *     is why the workflow subscribes to `edited` at all (BLO-26636).
+ *   - the diff itself — `checkTestCoverage(files)`, `checkLockfile(files)`,
+ *     `checkCommitTrailers(commits)`. An edit RE-RUNS these and they fail
+ *     again identically, because a description edit changes neither files nor
+ *     commits. A missing commit trailer is only fixable by rewriting the
+ *     commit — exactly the push the one-liner says is unnecessary.
+ *
+ * So the sentence names the split and points at the gate's own comment, which
+ * is the only thing that knows which of the six actually failed. Telling an
+ * author "no push required" on a trailer failure would send them round the
+ * edit loop indefinitely — a worse hold than the generic one it replaces.
+ *
+ * Matched on the EXACT check name. `failingChecks` formats entries as
+ * `name=STATE`, and this repo also publishes `security-review` and
+ * `gate/ally-comment-findings`; a substring test would claim the quality-gate
+ * remedy for a red security review, which has no such remedy.
+ */
+export function reviewGateRemedy(detail) {
+  const failed = String(detail ?? "")
+    .split(",")
+    .map((entry) => entry.trim().split("=").slice(0, -1).join("=").trim());
+  if (!failed.includes("review")) return "";
+  return (
+    `The red check is \`review\` — this repo's PR-quality gate ` +
+    `(\`commitperclip PR Review\`), which is not CI and not a code finding. It fails on six ` +
+    `gates that split in two. Three read only the PR body and title (template sections, ` +
+    `linked issue, dedup search) and clear on a description or title EDIT, with no push and ` +
+    `no head move — the workflow listens for \`edited\` precisely so that fix re-runs it. ` +
+    `The other three read the diff (test coverage, lockfile, commit trailers); an edit ` +
+    `re-runs those unchanged and they fail again, so they need a push. The gate's own ` +
+    `comment on this PR names which ones failed — read that before choosing.\n\n`
+  );
+}
+
+/**
  * The sentence a durable hold gets on its own PR.
  *
  * ## Why only the DURABLE holds, when PEN-5263 asked for every decline
@@ -1394,7 +1451,7 @@ export function renderUnlandedEligible(
  * function takes a `{ number, reason, ageHours }` row and the discriminator
  * is the `action`, which that shape deliberately does not carry.
  */
-export function stateHold(repo, { number, reason, ageHours }, run = gh) {
+export function stateHold(repo, { number, reason, ageHours, detail }, run = gh) {
   const age =
     ageHours === null || ageHours === undefined
       ? "an unknown time (no dated check on this head)"
@@ -1407,6 +1464,7 @@ export function stateHold(repo, { number, reason, ageHours }, run = gh) {
       `This head last reported ${age} ago, so the reason has stopped being a wait and is ` +
       `stated here rather than left in the routine's receipt. Clear it, or say on this PR why ` +
       `it stands.\n\n` +
+      reviewGateRemedy(detail) +
       `Posted once per reason, not once per fire — the routine will not repeat this.`,
     run,
   );
@@ -1883,9 +1941,22 @@ export function runRepo(
   if (apply) {
     const byNumber = new Map(rows.map((row) => [row?.number, row]));
     for (const row of held) {
-      if (BESPOKE_COMMENT_ACTIONS.has(byNumber.get(row?.number)?.action)) continue;
+      const classified = byNumber.get(row?.number);
+      if (BESPOKE_COMMENT_ACTIONS.has(classified?.action)) continue;
       try {
-        state(repo, row);
+        // `detail` is attached HERE rather than carried on the `stalledHolds`
+        // row: that row shape is the receipt's contract and several tests
+        // deep-compare it, so widening it to serve one comment would break
+        // callers that have nothing to do with commenting. The join is the
+        // same `byNumber` lookup the skip above already does.
+        //
+        // Absent detail leaves the object IDENTICAL rather than adding
+        // `detail: undefined`. `deepStrictEqual` counts a present key holding
+        // `undefined` as a difference, so spreading unconditionally would
+        // break every existing deep-compare of this row for no gain — there
+        // is nothing for `reviewGateRemedy` to read in that case anyway.
+        const detail = classified?.detail;
+        state(repo, detail === undefined || detail === null ? row : { ...row, detail });
       } catch (error) {
         const message = error?.stderr?.toString() || error?.message || String(error);
         console.error(
