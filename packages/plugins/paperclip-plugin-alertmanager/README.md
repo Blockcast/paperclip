@@ -275,7 +275,7 @@ withholding and the PEN-4337 monitor deferral are all unchanged.
 | `unattended_cover` | neither held; the agent chain was exhausted | no — the `[user-cover]` assignment is the notification |
 | `held_alert_clear` | Alertmanager says the alert is not firing (BLO-40739) | no |
 
-`wake_outcome` is `enqueued`, `refused`, or `not_attempted`.
+`wake_outcome` is `enqueued`, `refused`, `declined`, or `not_attempted`.
 
 **Read `enqueued` narrowly: the host accepted the wake.** It is not evidence
 that a run started, and it is not acknowledgement. Acknowledgement is recorded
@@ -285,19 +285,30 @@ measurement behind this table is an alert delivered ~4,900 times over 96h with
 zero delivery failures and zero action, so an `acknowledged` derived from
 successful delivery would restate the defect rather than expose it.
 
-**`refused` is the state a three-state model cannot express.** The rung posts
-`"waking current owner <name>"` *before* calling `issues.requestWakeup`, and
-swallows a refusal by design so the rung does not repeat. A paused agent, a
-budget block or an unresolved blocker therefore leaves a thread asserting a
-wake that never happened. This column is where that discrepancy lands; the
-comment text is deliberately unchanged.
+**`refused` and `declined` are the state a three-state model cannot express.**
+The rung posts `"waking current owner <name>"` *before* calling
+`issues.requestWakeup`, and swallows a dropped wake by design so the rung does
+not repeat. The thread is then asserting a wake that never happened. This column
+is where that discrepancy lands; the comment text is deliberately unchanged.
+
+⛔ **They are two tokens because the host drops a wake in two ways and only one
+of them throws.** `requestWakeup` *rejects* on a terminal status, an unresolved
+blocker or a budget block (`refused`) — but it *resolves* `{ queued: false }`
+when `enqueueWakeup` returns `null`, which it does without throwing on
+`heartbeat.wakeOnDemand.disabled`, the heartbeat cooldown, `company.inactive`,
+`heartbeat.scheduling_suppressed`, `worktree_execution_cutoff` and the
+provider-capacity deferral (`declined`). That second set is the commoner one,
+and a caller that merely awaits the promise files all of it under `enqueued` —
+"the host accepted the wake" — leaving the undelivered query reading clean while
+wakes are dropped. **Query both tokens; the partial index covers both.**
 
 ```sql
--- Escalation passes whose wake was refused: everything this platform
--- believed it had delivered and had not.
-SELECT observed_at, alert_issue_id, alertname, escalation_attempt
+-- Escalation passes whose wake never reached a run: everything this platform
+-- believed it had delivered and had not. Both tokens — querying only
+-- 'refused' silently omits the larger half (see above).
+SELECT observed_at, alert_issue_id, alertname, escalation_attempt, wake_outcome
   FROM plugin_alertmanager_184163d1ba.alert_attendance_observations
- WHERE company_id = $1 AND wake_outcome = 'refused'
+ WHERE company_id = $1 AND wake_outcome IN ('refused', 'declined')
  ORDER BY observed_at DESC;
 
 -- Attended vs unattended over a window.
@@ -312,8 +323,9 @@ queryable*. It does not make non-acknowledgement *oblige anybody*, and it does
 not record whether the resulting work was **executed** — that is a different
 question with a different source. A query over this table is not an on-call
 rota. It is also not a second place to look: the record lives in this plugin's
-namespace and is read through Paperclip's own API, adding no channel and no
-notification.
+own namespace and is queryable there with the SQL above, adding no channel and
+no notification. (There is deliberately no route or SDK read for this table —
+"queryable in the plugin namespace" is the whole claim.)
 
 ### Liveness is pulled, not assumed (BLO-40739)
 

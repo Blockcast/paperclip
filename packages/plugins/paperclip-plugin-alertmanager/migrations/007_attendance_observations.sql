@@ -4,7 +4,9 @@
 --
 -- WHAT THIS IS NOT. It adds no notification, no channel, no obligation and no
 -- second place to look: the record lives in this plugin's own namespace and is
--- read through Paperclip's own API. It makes non-acknowledgement VISIBLE and
+-- queryable there in SQL. There is deliberately no route or SDK read for it —
+-- "queryable in the plugin namespace" is the whole claim, and the README's
+-- examples are raw SQL for that reason. It makes non-acknowledgement VISIBLE and
 -- QUERYABLE. It does not make non-acknowledgement OBLIGE anybody, and a query
 -- over this table is not an on-call rota. See the module header in
 -- `src/attendance-record.ts`.
@@ -44,22 +46,40 @@ CREATE TABLE plugin_alertmanager_184163d1ba.alert_attendance_observations (
   -- branch has no rung concept.
   escalation_attempt integer,
 
-  -- Who the rung was aimed at, when there was one. Deliberately NOT a foreign
+  -- The agent this determination was ABOUT — not, in general, an agent who was
+  -- notified. On `unattended_rung` it is both. On `attended_*` it is the
+  -- attendee, who was deliberately NOT woken; on `unattended_cover` the board
+  -- was notified and this agent was not. It is named `subject_` rather than
+  -- `notified_` so that `WHERE subject_agent_id = $1` cannot be misread as a
+  -- count of notifications to that agent — read `wake_outcome` to tell the
+  -- cases apart. Deliberately NOT a foreign
   -- key: this plugin declares `coreReadTables: ["companies", "issues"]`, and
   -- widening that to `agents` to buy referential integrity on an audit column
   -- would widen a capability grant for a convenience. An agent row that is
   -- later deleted leaves a dangling id here, which is the correct outcome for
   -- an append-only record of what was determined at the time.
-  notified_agent_id uuid,
+  subject_agent_id uuid,
 
   -- PEN-2918 C4 — the cell a three-state model does not have: "never
   -- delivered at all". One of:
-  --   enqueued       — `issues.requestWakeup` returned without throwing.
-  --   refused        — it threw (paused agent, budget block, unresolved
-  --                    blocker). The ladder swallows this by design; before
+  --   enqueued       — `issues.requestWakeup` resolved and did NOT report
+  --                    `queued: false`, i.e. the host queued a run.
+  --   refused        — it threw (terminal status, unresolved blocker, budget
+  --                    block). The ladder swallows this by design; before
   --                    this column its only trace was a plugin log line,
   --                    while the issue comment posted immediately beforehand
   --                    said "waking current owner <name>".
+  --   declined       — it resolved `{ queued: false }`: the call SUCCEEDED
+  --                    and no run was enqueued. `enqueueWakeup` returns null
+  --                    without throwing on `heartbeat.wakeOnDemand.disabled`,
+  --                    the heartbeat cooldown, `company.inactive`,
+  --                    `heartbeat.scheduling_suppressed`,
+  --                    `worktree_execution_cutoff` and the provider-capacity
+  --                    deferral. This is the larger and quieter half of
+  --                    "we said we woke them and we did not", and it is a
+  --                    separate token from `refused` because it neither
+  --                    throws nor shares a remedy: a refusal is about this
+  --                    issue, a decline is about the agent or the company.
   --   not_attempted  — this branch raises no wake (a deferral, a hold).
   -- `enqueued` means the host ACCEPTED the wake, and nothing more. It is not
   -- evidence that a run started, still less that a human read anything.
@@ -88,9 +108,17 @@ CREATE INDEX alert_attendance_observations_issue_idx
 CREATE INDEX alert_attendance_observations_company_window_idx
   ON plugin_alertmanager_184163d1ba.alert_attendance_observations (company_id, observed_at DESC);
 
--- Partial index for the sharpest query of the set: every pass whose wake was
--- refused, i.e. every escalation this platform believed it had delivered and
--- had not. Expected to stay small, which is exactly why it is worth having.
+-- Partial index for the sharpest query of the set: every pass whose wake never
+-- reached a run, i.e. every escalation this platform believed it had delivered
+-- and had not. Expected to stay small, which is exactly why it is worth having.
+--
+-- ⛔ BOTH tokens, deliberately. `refused` alone was the original predicate and
+-- it was wrong in the direction that reads CLEAN: a declined wake is the
+-- commoner of the two (every heartbeat cooldown, every suppressed or inactive
+-- company, every capacity deferral) and would have been filed under `enqueued`
+-- and excluded from this index — the undelivered query returning zero while
+-- wakes were being dropped. Keep this list in step with
+-- `UNDELIVERED_WAKE_OUTCOMES` in `src/attendance-record.ts`.
 CREATE INDEX alert_attendance_observations_undelivered_idx
   ON plugin_alertmanager_184163d1ba.alert_attendance_observations (company_id, observed_at DESC)
-  WHERE wake_outcome = 'refused';
+  WHERE wake_outcome IN ('refused', 'declined');

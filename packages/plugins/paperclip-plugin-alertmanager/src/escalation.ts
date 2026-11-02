@@ -903,7 +903,7 @@ async function advanceIssueLadder(
       alertLiveness: "not_read",
       wakeOutcome: "not_attempted",
       escalationAttempt: state.escalationAttempt ?? 0,
-      notifiedAgentId: issue.assigneeAgentId ?? null,
+      subjectAgentId: issue.assigneeAgentId ?? null,
     });
     return;
   }
@@ -972,7 +972,7 @@ async function advanceIssueLadder(
       // [user-cover] row, whose own assignment is the notification.
       wakeOutcome: "not_attempted",
       escalationAttempt: MAX_ATTEMPTS,
-      notifiedAgentId: issue.assigneeAgentId ?? null,
+      subjectAgentId: issue.assigneeAgentId ?? null,
     });
     return;
   }
@@ -1034,27 +1034,71 @@ async function advanceIssueLadder(
     disposition: "unattended_rung",
     alertLiveness: liveness.state,
     wakeOutcome: wake,
-    wakeDetail: wake === "refused"
-      ? "issues.requestWakeup threw; the error is in the plugin log. The escalation comment posted immediately before this asserts the wake regardless."
-      : null,
+    wakeDetail: wakeDetailFor(wake),
     escalationAttempt: next,
-    notifiedAgentId: notified,
+    subjectAgentId: notified,
   });
 }
 
 /**
+ * The operator-readable sentence for a wake outcome. Fixed strings only — never
+ * raw error text (same discipline as the `wake_detail` column comment).
+ *
+ * `refused` and `declined` get DIFFERENT sentences because they are different
+ * events with different remedies: a refusal is about this issue (terminal
+ * status, blocker, budget), a decline is about the agent or the company
+ * (heartbeats disabled, cooldown, suppression, capacity). One sentence saying
+ * "threw" would have been false for every decline.
+ */
+function wakeDetailFor(wake: WakeOutcome): string | null {
+  switch (wake) {
+    case "refused":
+      return "issues.requestWakeup threw; the error is in the plugin log. The escalation comment posted immediately before this asserts the wake regardless.";
+    case "declined":
+      return "issues.requestWakeup resolved queued=false: the host accepted the call and enqueued no run (heartbeats disabled, cooldown, inactive company, scheduling suppressed, worktree cutoff, or a capacity deferral). The escalation comment posted immediately before this asserts the wake regardless.";
+    default:
+      return null;
+  }
+}
+
+/**
  * Returns the outcome rather than discarding it (PEN-2918). The swallow itself
- * is unchanged and deliberate — a refused wake must not repeat the rung — but
- * the caller now records which of the two happened, so "the wake was refused"
+ * is unchanged and deliberate — a dropped wake must not repeat the rung — but
+ * the caller now records which outcome occurred, so "the wake never happened"
  * stops being visible only as a log line next to a comment claiming it
  * succeeded.
+ *
+ * ⛔ **The resolved value is READ, not merely awaited, and that is the point of
+ * this function.** The host drops a wake in two different ways and only one of
+ * them throws:
+ *
+ *  - it **rejects** on a terminal status, an unresolved blocker or a budget
+ *    block ⇒ `refused`;
+ *  - it **resolves `{ queued: false }`** when `enqueueWakeup` returns `null` —
+ *    `heartbeat.wakeOnDemand.disabled`, the heartbeat cooldown,
+ *    `company.inactive`, `heartbeat.scheduling_suppressed`,
+ *    `worktree_execution_cutoff`, and the provider-capacity deferral ⇒
+ *    `declined`.
+ *
+ * Awaiting without reading files that second, larger and quieter population
+ * under `enqueued`, i.e. under "the host accepted the wake" — which would put
+ * this row's own founding defect inside the table built to measure it, in the
+ * direction that reads clean. `undelivered_idx` covers both tokens for the
+ * same reason.
  *
  * `enqueued` means the host accepted the request. It is not evidence that a run
  * started, and it is not acknowledgement.
  */
 async function requestWakeupBestEffort(ctx: PluginContext, issue: SweepIssue, companyId: string, rung: number): Promise<WakeOutcome> {
   try {
-    await ctx.issues.requestWakeup(issue.id, companyId, { reason: "alert_escalation_deadline", contextSource: "alertmanager-escalation", idempotencyKey: `alert-escalation:${issue.id}:${rung}` });
+    const result = await ctx.issues.requestWakeup(issue.id, companyId, { reason: "alert_escalation_deadline", contextSource: "alertmanager-escalation", idempotencyKey: `alert-escalation:${issue.id}:${rung}` });
+    // Tested against `=== false` rather than falsiness on purpose: a host (or
+    // a fake) that resolves without the field is making no claim either way,
+    // and must not be reported as a drop.
+    if ((result as { queued?: boolean } | null | undefined)?.queued === false) {
+      ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} was declined by the host (queued=false)`);
+      return "declined";
+    }
     return "enqueued";
   } catch (err) {
     // The escalation comment already landed and the ladder state already

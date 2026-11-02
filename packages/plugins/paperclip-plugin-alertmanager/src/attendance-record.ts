@@ -39,8 +39,10 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  *    about attendance. Whether the resulting work was actually done is a
  *    different question with a different source, and nothing here answers it.
  * 3. **It is not a second obligation surface.** The record lives in this
- *    plugin's own namespace and is read through Paperclip's own API — no new
- *    channel, no new notification, no new place to look. That distinction is
+ *    plugin's own namespace and is queryable there — no new channel, no new
+ *    notification, no new place to look. (No route or SDK read exposes this
+ *    table; the README's queries are raw SQL against that namespace, and this
+ *    sentence claims nothing more.) That distinction is
  *    load-bearing: the 2026-10-03 ruling on PEN-3315 refused a GitHub-issue
  *    audit trail *beside* Paperclip. This removes a place where a computed fact
  *    was discarded; it does not add a place to look.
@@ -60,8 +62,20 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  * *then* calls `issues.requestWakeup`, whose failure it swallows by design (a
  * refused wake must not repeat the rung). So a paused agent, a budget block or
  * an unresolved blocker produces a thread that asserts a wake, a plugin log
- * line nobody reads, and no other trace. `wake_outcome: "refused"` is that
+ * line nobody reads, and no other trace. `refused` and `declined` are that
  * missing cell.
+ *
+ * **They are two tokens because the host drops a wake in two different ways,
+ * and only one of them throws.** `requestWakeup` rejects on a terminal status,
+ * an unresolved blocker or a budget block — that is `refused`. But it also
+ * resolves `{ queued: false }`, perfectly normally, when `enqueueWakeup`
+ * returns `null`: `heartbeat.wakeOnDemand.disabled`, the heartbeat cooldown,
+ * `company.inactive`, `heartbeat.scheduling_suppressed`,
+ * `worktree_execution_cutoff`, and the provider-capacity deferral. Treating
+ * that resolution as success would file the larger and quieter population of
+ * dropped wakes in the column that means "the host accepted it" — this row's
+ * own defect, one layer down, in the direction that reads clean. So the result
+ * is READ, not merely awaited.
  *
  * Note what `enqueued` does and does not claim: the host **accepted** the wake.
  * It is not evidence that a run started, and certainly not that anyone read
@@ -90,7 +104,10 @@ export type AttendanceDisposition =
   | "held_alert_clear";
 
 /** See the `wake_outcome` column comment in the migration. */
-export type WakeOutcome = "enqueued" | "refused" | "not_attempted";
+export type WakeOutcome = "enqueued" | "refused" | "declined" | "not_attempted";
+
+/** Every `wake_outcome` that means the wake did NOT reach the host's queue. */
+export const UNDELIVERED_WAKE_OUTCOMES: readonly WakeOutcome[] = ["refused", "declined"];
 
 /** What Alertmanager said on this pass. `not_read` is a real answer, not a gap. */
 export type ObservedAlertLiveness = "firing" | "not_firing" | "unknown" | "not_read";
@@ -105,7 +122,16 @@ export interface AttendanceObservation {
   /** Fixed sentence only — never raw error text. See the migration's column comment. */
   wakeDetail?: string | null;
   escalationAttempt?: number | null;
-  notifiedAgentId?: string | null;
+  /**
+   * The agent this determination was ABOUT — not, in general, an agent who was
+   * notified. On the `unattended_rung` branches it is both. On `attended_*` it
+   * is the attendee, who was deliberately NOT woken; on `unattended_cover` the
+   * board was notified and this agent was not. Naming it `notified_*` would
+   * make `WHERE notified_agent_id = $1` count deferrals and covers as
+   * notifications to that agent — a false record of exactly the kind this
+   * table exists to prevent. Read `wake_outcome` to tell them apart.
+   */
+  subjectAgentId?: string | null;
 }
 
 /**
@@ -129,7 +155,7 @@ export async function recordAttendanceObservation(
     await ctx.db.execute(
       `INSERT INTO ${ctx.db.namespace}.${ATTENDANCE_TABLE}
          (id, company_id, alert_issue_id, alertname, disposition, escalation_attempt,
-          notified_agent_id, wake_outcome, wake_detail, alert_liveness)
+          subject_agent_id, wake_outcome, wake_detail, alert_liveness)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         randomUUID(),
@@ -138,7 +164,7 @@ export async function recordAttendanceObservation(
         observation.alertname,
         observation.disposition,
         observation.escalationAttempt ?? null,
-        observation.notifiedAgentId ?? null,
+        observation.subjectAgentId ?? null,
         observation.wakeOutcome,
         observation.wakeDetail ?? null,
         observation.alertLiveness,
