@@ -705,6 +705,21 @@ jobs:
         run: node --test ./scripts/check-scheduled-guard-liveness.test.mjs
         timeout-minutes: 1
 
+      # PEN-5261: the detector above was never the problem. On 2026-11-02 it
+      # went red at 04:51:24Z naming the exact cause — the production-deploy
+      # dispatcher had been set `disabled_manually` — and stayed red every hour
+      # while the 07:23Z daily deploy silently did not fire and production
+      # drifted 77 commits behind. A red scheduled run is not a channel. This
+      # pins the routing that carries that verdict to Alertmanager, and with it
+      # the two properties that make the routing honest: one stable alert
+      # identity (so a shared-lane outage is one issue, not six), and an
+      # explicit resolve on the healthy path (so the lane clears on a fix rather
+      # than on a timer, and the channel cannot rot unnoticed).
+      - name: Validate scheduled-guard alert channel (PEN-5261)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-guard-liveness-alert-channel.test.js
+        timeout-minutes: 1
+
       - name: Test merge-group orphan sweeper classifier (BLO-41174)
         if: ${{ !cancelled() }}
         run: node --test ./.github/scripts/tests/sweep-orphaned-merge-group-runs.test.mjs

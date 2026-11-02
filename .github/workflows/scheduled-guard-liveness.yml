@@ -202,8 +202,40 @@
 #      name. It is watched now, on its own 16h threshold. refresh-shard-manifest
 #      is exempted deliberately and in writing.
 #
+# THE VERDICT IS ROUTED, NOT JUST PRINTED (PEN-5261)
+#
+# Everything above is about DETECTING a stopped guard. None of it was the
+# problem on 2026-11-02, and the distinction is the whole point of that row.
+#
+# At 03:52:34Z a human set scheduled-production-deploy.yml to
+# `disabled_manually` — very likely the RIGHT call, since migration 0270 was
+# still on master and an unattended 07:23Z deploy would have re-run the
+# migration behind that morning's ~35-minute activity_log outage (PEN-5250 /
+# PEN-5251). This job noticed within the hour: red at 04:51:24Z, naming the
+# cause exactly, and red every hour after.
+#
+# Nobody acted on it. The 07:23Z daily production deploy silently did not fire,
+# production stayed on `2ebaa3cf` 77 commits behind master, and
+# paperclip_api_oldest_missing_commit_age_hours climbed through its 24h bar.
+# A workflow `state` flip is a GitHub API field, not a commit, so the disable
+# left no issue, no comment and no PR — and a red scheduled run is not a
+# channel. This was the SECOND such silent disable of that same workflow in
+# three weeks; the first is recorded in its own WATCHED_GUARDS entry
+# (`updated_at` 2026-10-11T14:32:32Z).
+#
+# So the verdict is now pushed to Alertmanager, which fans it to the
+# paperclip-plugin-alertmanager webhook and becomes a Paperclip issue in the
+# platform lane — the delivery path docker-agent.yml (BLO-33382) and the
+# production-environment guard (BLO-22329) already run on. The healthy path
+# pushes a `resolved` with the identical label set, so the lane clears on a fix
+# rather than on a timer AND every green run re-proves the channel.
+#
+# No new detector was added, deliberately: one already works, and adding a
+# second opinion is how two surfaces start disagreeing about the same fact.
+#
 # Logic and its tests: scripts/check-scheduled-guard-liveness.mjs
-# Cost is at most 12 read-only API calls an hour.
+# Routing and its tests: .github/scripts/post-guard-liveness-alert.mjs
+# Cost is at most 12 read-only API calls an hour, plus one Alertmanager POST.
 name: Scheduled Guard Liveness
 
 on:
@@ -269,9 +301,78 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
+      # PEN-5261: the verdict is CAPTURED rather than allowed to abort the job,
+      # so the routing steps below are guaranteed to run before the job reds.
+      # The detector's own exit code is preserved verbatim and re-applied in the
+      # final step, so this job still reds exactly when the detector reds —
+      # nothing about detection or its threshold is changed here.
+      #
+      # `2>&1` is load-bearing: the summary headline is written to STDERR on the
+      # red path (the per-guard annotations go to stdout), and the headline is
+      # the line an operator needs first.
       - name: Report scheduled guards that have stopped executing
+        id: liveness
         env:
           GH_TOKEN: ${{ github.token }}
           GUARD_LIVENESS_REPO: ${{ github.repository }}
           GUARD_LIVENESS_STALE_HOURS: ${{ inputs.stale_hours }}
-        run: node scripts/check-scheduled-guard-liveness.mjs
+        run: |
+          set +e
+          node scripts/check-scheduled-guard-liveness.mjs 2>&1 | tee "${RUNNER_TEMP}/guard-liveness.txt"
+          code=${PIPESTATUS[0]}
+          echo "exit_code=${code}" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      # PEN-5261. A red scheduled run is not a channel. This carries the verdict
+      # the step above already reached into Alertmanager, which fans it to the
+      # paperclip-plugin-alertmanager webhook and becomes a Paperclip issue in
+      # the platform lane — the same delivery path docker-agent.yml (BLO-33382)
+      # and the production-environment guard (BLO-22329) already run on.
+      #
+      # This adds NO detector. PEN-5261's own closing constraint is "do not add
+      # a new detector — one already works", and the 2026-11-02 failure was not
+      # a detection gap: this job went red at 04:51:24Z naming the exact cause
+      # and stayed red every hour, while the daily production deploy silently
+      # did not fire at 07:23Z and production drifted 77 commits behind.
+      - name: Route a stopped-guard verdict to Alertmanager (PEN-5261)
+        if: ${{ steps.liveness.outputs.exit_code != '0' }}
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: firing
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          GUARD_LIVENESS_DETAIL="$(cat "${RUNNER_TEMP}/guard-liveness.txt")" \
+            node .github/scripts/post-guard-liveness-alert.mjs
+
+      # The other half of an honest alert. Without it `endsAt` would be the only
+      # thing retiring the firing alert, so the lane would go quiet on a TIMER
+      # rather than on a fix.
+      #
+      # It is also the continuous capability probe BLO-33382 went undetected for
+      # want of: every HEALTHY hourly run exercises the exact delivery path the
+      # failure path depends on, so a channel that rots is caught within the
+      # hour instead of by the next outage.
+      #
+      # If THIS step fails the job reds while the guards are healthy. That is
+      # intended and is not ambiguous in practice: the script's failure output
+      # says the liveness verdict is UNROUTED, which is a real fault needing a
+      # real fix — a routing layer that fails silently is the whole defect this
+      # change closes.
+      - name: Resolve the stopped-guard alert and prove the channel still works (PEN-5261)
+        if: ${{ steps.liveness.outputs.exit_code == '0' }}
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: resolved
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: node .github/scripts/post-guard-liveness-alert.mjs
+
+      # Re-apply the detector's verdict. Keeping this LAST is what lets the
+      # routing steps above run on the red path; keeping it AT ALL is what stops
+      # the capture above from silently turning this guard green forever.
+      - name: Fail the run if a watched guard has stopped
+        if: ${{ steps.liveness.outputs.exit_code != '0' }}
+        run: |
+          echo "::error::A watched scheduled guard has stopped executing; see the verdict above."
+          exit 1
