@@ -103,6 +103,7 @@
     "PEN-1198": {
       "@connectrpc/connect-node>undici": {
         "patchedRange": ">=6.29.1 <7",
+        "note": "PEN-5277: @cursor/sdk 1.0.40 swapped @connectrpc/connect-node for @connectrpc/connect-web, so this path resolves nothing today. The override is kept deliberately — it is dormant, not dead, and re-arms this floor if anything pulls the subtree back in. Do not read its presence as evidence that undici 6.x is in the graph.",
         "advisories": [
           "GHSA-xjj6-f33q-929c",
           "GHSA-rfgv-xxqx-mfg5",
