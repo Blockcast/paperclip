@@ -1020,15 +1020,29 @@ export function resolveSeedShape(input: {
  *
  * ⚠️ A MISSING `drive complete` LINE IS NOT ON ITS OWN THAT STANDING RECORD.
  * A claim with nothing eligible -- every entry still inside `maxAgeDays` by
- * `mtime` (`fresh`) or by `lastUsedAt` (`in_use`), or an empty tree -- returns
- * at the driver's `nothingEligible` branch, which sits BEFORE that module's
- * only `drive complete` site, while still counting into
+ * `mtime` (`fresh`) or by `lastUsedAt` (`in_use`), or no named entries at all
+ * -- returns at the driver's `nothingEligible` branch, which sits BEFORE that
+ * module's only `drive complete` site, while still counting into
  * `claims_total{outcome="ok"}`. So on an ordinary quiet tick a COVERED claim
- * emits no line, and the rule above read backwards would call it skipped. The
- * absence is evidence only where the aggregate does not already account for the
- * claim: zero `failed` and zero `deferred` increase at `{dry_run="false"}` over
- * the window says every claim the sweep listed was driven, and a claim driven
- * with nothing eligible is covered.
+ * emits no line, and the rule above read backwards would call it skipped.
+ *
+ * Absence stops being evidence of an unreclaimed tree only where BOTH hold,
+ * and neither implies the other:
+ *
+ * 1. The window contains a FRESH `{dry_run="false"}` sweep timestamp, AND
+ *    `failed` and `deferred` show zero increase at `{dry_run="false"}` across
+ *    it. The freshness is what makes the zero mean anything: the whole
+ *    `paperclip_isolation_reclaim_*` family carries the sweep's own `dry_run`
+ *    label, so under a dry-run-only rollout -- the first state a correct
+ *    rollout occupies -- the `{dry_run="false"}` series do not exist and every
+ *    count read there is zero VACUOUSLY. It is a non-vacuity precondition, not
+ *    a stand-in for coverage: a fresh timestamp advances on `deferred` sweeps
+ *    too, so it cannot carry this alone.
+ * 2. The claim is one the sweep LISTS. `listReclaimableClaims` names only
+ *    claims belonging to opted-in agents or k8s environments, so a claim left
+ *    behind by opting an agent back out -- the remedy immediately below -- is
+ *    not listed, produces no line and no `failed`/`deferred` increment, and for
+ *    it absence IS the unreclaimed reading.
  *
  * The cheapest remedy there is to opt the agent
  * back out: its FUTURE runs return to the shared claim, where the existing

@@ -161,13 +161,27 @@ timestamp means unreclaimed.
 
 ⚠ **A missing `drive complete` line is not on its own the unreclaimed reading.** A claim with
 nothing eligible — every entry still inside `maxAgeDays` by `mtime` (`fresh`) or by `lastUsedAt`
-(`in_use`), or an empty tree — returns at the driver's `nothingEligible` branch, which sits
-*before* the module's only `drive complete` site, and that quiet tick still counts into
+(`in_use`), or no named entries at all — returns at the driver's `nothingEligible` branch, which
+sits *before* the module's only `drive complete` site, and that quiet tick still counts into
 `claims_total{outcome="ok"}`. So a **covered** claim with nothing to do emits no line at all, and
-the rule above read backwards would class it as skipped. An absent line is evidence of an
-unreclaimed tree only when the aggregate does not already account for the claim: zero `failed` and
-zero `deferred` increase at `{dry_run="false"}` over the window says every claim the sweep listed
-was driven, and a claim driven with nothing eligible is covered.
+the rule above read backwards would class it as skipped.
+
+Absence stops being evidence of an unreclaimed tree only when **both** of the following hold.
+Neither implies the other, and dropping either one makes the test conclude *covered* in a state
+where nothing has been reclaimed:
+
+1. **The window contains a fresh `{dry_run="false"}` sweep timestamp, and `failed` and `deferred`
+   show zero increase at `{dry_run="false"}` across it.** The freshness is what makes the zero mean
+   anything: the whole `paperclip_isolation_reclaim_*` family is labelled with the sweep's own
+   `dry_run`, so under a dry-run-only rollout — the first state a correct rollout occupies — the
+   `{dry_run="false"}` series do not exist and every count read there is zero **vacuously**.
+   Freshness is a non-vacuity precondition here and is *not* standing in for coverage; a fresh
+   timestamp advances on `deferred` sweeps too, which is why it cannot carry this on its own.
+2. **The claim is one the sweep lists.** `listReclaimableClaims` names only claims belonging to
+   opted-in agents or to k8s environments, so a claim left behind by opting an agent back out —
+   the remedy named above — is not listed at all. It produces no `drive complete` line and no
+   `failed`/`deferred` increment, so for it absence **is** the unreclaimed reading. That is exactly
+   the claim this page tells you to write down when you opt an agent out.
 
 Where it is unreclaimed, it was accepted deliberately, with a ceiling:
 
