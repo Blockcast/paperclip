@@ -1888,12 +1888,18 @@ export async function startServer(): Promise<StartedServer> {
           // acted on — see the latch declaration for why clearing it would
           // re-admit the overlap the latch exists to remove.
           //
-          // `error`, not `warn`, to match what the matching series already
-          // documents ({@link HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC}: "Page
-          // on this. It is rare by design and it does not resolve itself").
-          // Every recovery pass on this worker is halted by the time this
-          // fires, and it lets a log-based alert reach the same conclusion as a
-          // metric-based one.
+          // ⚠ Crossing this threshold does NOT mean the pass has stopped
+          // settling, and neither this log nor the counter beside it can tell
+          // the two apart: both fire on DURATION, from a watchdog that cannot
+          // see the future of the pass it is describing. Measured 2026-11-02
+          // (PEN-5259), all 8 crossings of one episode belonged to passes that
+          // went on to complete. A reader who needs "slow" vs "halted" must
+          // read the in-flight gauge: it returns to 0 on a pass that settles
+          // and climbs without bound on one that does not.
+          //
+          // `error` rather than `warn` because a pass over ten ticks is worth
+          // an operator's attention either way, and because it lets a log-based
+          // alert reach the same conclusion as a metric-based one.
           //
           // Re-logged on its own coarse clock rather than once per sample. The
           // halt does not resolve itself, so it must keep saying so; but at

@@ -477,24 +477,52 @@ export const HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC = "paperclip_heartbeat_rec
 export const HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC = "paperclip_heartbeat_recovery_chain_inflight_seconds";
 /**
  * Recovery-chain passes that were still outstanding past the stall threshold
- * (PEN-3314 / PEN-3365). Counted once per stalled pass, not once per tick.
+ * (PEN-3314 / PEN-3365). Counted once per crossing pass, not once per tick.
  *
- * Non-zero means a pass stopped settling entirely — not merely ran slow, which
- * shows up as skips instead — and therefore that **every recovery pass on this
- * worker is halted**: orphan reaping, retry promotion, stranded-issue
- * reconciliation, watchdogs, the lot. The latch deliberately does not self-clear
- * (force-clearing would re-admit the overlapping passes that cause the heap
- * leak, under exactly the saturated-pool conditions that raised the alarm), so
- * this state persists until the chain returns or the process restarts.
+ * ⚠ THIS IS A DURATION THRESHOLD ON THE LIVE PASS, NOT A LIVENESS VERDICT,
+ * and the difference has already cost a mis-triage (PEN-5259). The watchdog
+ * increments as soon as a pass has been in flight for
+ * `10 * heartbeatSchedulerIntervalMs` (300 s at the default) and then latches
+ * for the rest of THAT pass. At the moment it increments it has no way to know
+ * whether the pass will go on to settle, so a pass that runs 400 s and then
+ * finishes normally is counted here exactly like one that never returns.
  *
- * **Page on this.** It is rare by design and it does not resolve itself.
+ * Do NOT read non-zero as "the chain stopped settling". Measured 2026-11-02 on
+ * `paperclip-0`, all 8 increments of one episode mapped 1:1 onto passes that
+ * COMPLETED and wrote their duration (830.6 / 1170.7 / 947.3 / 670.6 / 685.8 /
+ * 760.4 / 867.8 / 411.9 s), and the chain returned to 50-220 s passes on its
+ * own, with no restart and no intervention. The sibling claim that a slow pass
+ * "shows up as skips instead" is likewise false: a pass over 300 s produces
+ * BOTH skips and an increment here.
+ *
+ * To tell a slow pass from a halted one, read the gauges — this counter cannot
+ * replace them. A pass that settles drives
+ * {@link HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC} back to 0 and advances
+ * {@link HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC}. A genuine halt is the
+ * in-flight gauge climbing and never returning to 0, which is what
+ * `PaperclipRecoveryChainWedged` keys on — and is why that alert is built on
+ * the gauge rather than on this counter.
+ *
+ * Alerting: do NOT alert on `... > 0`. This is a monotonic counter, so that
+ * condition stays true forever after the first crossing, and on the episode
+ * above it would have paged for a self-limiting leadership-takeover cost
+ * (BLO-45212 — on ACQUISITION the chain runs crash reconciliation and a
+ * threshold-0 reap of the dead holder's rows, which is expensive exactly once).
+ * `increase(...[30m]) > 0` is the shape that says "a pass is crossing the
+ * threshold right now", and it belongs at a severity that means "slow", not
+ * "halted".
+ *
+ * The latch itself deliberately does not force-clear mid-pass — force-clearing
+ * would re-admit the overlapping passes that cause the heap leak, under exactly
+ * the saturated-pool conditions that raised the alarm — and is reset when the
+ * next pass starts.
  *
  * The companion `error` log ("periodic heartbeat recovery chain still in flight
  * across many ticks") reports the first crossing immediately and then re-reports
- * at most once per stall threshold while the halt lasts. So log-line count is a
- * measure of DURATION, not of severity or of how many passes stalled — read the
- * count off this counter, and read "how long" off `inFlightMs` on the newest
- * line.
+ * at most once per stall threshold while the pass is outstanding. So log-line
+ * count is a measure of DURATION, not of severity or of how many passes
+ * crossed — read the count off this counter, and read "how long" off
+ * `inFlightMs` on the newest line.
  */
 export const HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC = "paperclip_heartbeat_recovery_chain_stalled_total";
 
@@ -11697,7 +11725,11 @@ export function recordHeartbeatRecoveryChainInflight(elapsedMs: number): void {
   ensureRegistry().heartbeatRecoveryChainInflightGauge.set(Math.max(0, elapsedMs) / 1000);
 }
 
-/** PEN-3314: a recovery-chain pass passed the stall threshold without settling. */
+/**
+ * PEN-3314: a recovery-chain pass has been outstanding past the stall
+ * threshold. PEN-5259: this says nothing about whether it will settle -- see
+ * {@link HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC}.
+ */
 export function recordHeartbeatRecoveryChainStalled(): void {
   ensureRegistry().heartbeatRecoveryChainStalledCounter.inc();
 }
