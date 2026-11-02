@@ -695,6 +695,55 @@ jobs:
         run: node --test ./scripts/__tests__/penstock-publish-drift.test.mjs
         timeout-minutes: 1
 
+      # PEN-5272 registers the rest of scripts/__tests__. Each of these was on
+      # master, passing, and run by nothing.
+      - name: Test CI tooling under scripts/__tests__ (PEN-5272)
+        if: ${{ !cancelled() }}
+        run: |
+          node --test \
+            ./scripts/__tests__/ci-mass-cancellation-detector.test.mjs \
+            ./scripts/__tests__/pr-test-request.test.mjs \
+            ./scripts/__tests__/release-dry-run-notes.test.mjs \
+            ./scripts/__tests__/run-typecheck-build-gaps.test.mjs \
+            ./scripts/__tests__/serve-storybook-static.test.mjs \
+            ./scripts/__tests__/storybook-visual-baseline.test.mjs \
+            ./scripts/__tests__/stranded-approval-lock-alert.test.mjs
+        timeout-minutes: 3
+
+      # Same cut, for scripts/ itself. Three of these are agent-image controls,
+      # each enforcing a different boundary, and not one of them ran:
+      # `gh-token-wrapper` reads the live GitHub App token from the refreshed
+      # secret volume on every `gh` call (BLO-13241) and carries 106 tests;
+      # `safe-env-inspect` is the sanctioned environment read the PEN-1305
+      # env-guard points agents at (BLO-20989); `measure-absolute-path-git`
+      # counts `git` calls that bypass the egress wrapper, which is the PEN-3183
+      # section 8 measurement its section 7.1 residual acceptance turns on.
+      - name: Test scripts/ tooling and credential boundary (PEN-5272)
+        if: ${{ !cancelled() }}
+        run: |
+          node --test \
+            ./scripts/bootstrap-npm-package.test.mjs \
+            ./scripts/check-relay-ssl-multicert.test.mjs \
+            ./scripts/gh-token-wrapper.test.js \
+            ./scripts/guard-pending-deploy.test.js \
+            ./scripts/measure-absolute-path-git.test.mjs \
+            ./scripts/safe-env-inspect.test.mjs \
+            ./scripts/seed_bank.test.mjs \
+            ./scripts/verify-review-gate-capture-promotion.test.mjs
+        timeout-minutes: 4
+
+      # The guard that keeps this list honest, plus its own tests. pr.yml names
+      # script tests literally, so writing one and forgetting the step leaves a
+      # test-shaped file CI never runs -- 27 of 132 at 269bdc0d. Registered in
+      # the same PR that adds it, because an unregistered registration guard is
+      # the joke PEN-5272 is about.
+      - name: Check every script test is reachable from CI (PEN-5272)
+        if: ${{ !cancelled() }}
+        run: |
+          node ./scripts/check-script-test-registration.mjs
+          node --test ./scripts/check-script-test-registration.test.mjs
+        timeout-minutes: 2
+
       - name: Test Ally agent instruction contract
         if: ${{ !cancelled() }}
         run: node --test ./scripts/ally-agent-idempotency-contract.test.mjs ./scripts/check-ally-bundle-anchors.test.mjs
@@ -804,6 +853,25 @@ jobs:
         if: ${{ !cancelled() }}
         run: node --test ./.github/scripts/tests/check-pr-security.test.mjs
         timeout-minutes: 2
+
+      # PEN-5272: these five gates decide whether a PR may merge, and nothing
+      # ran their tests -- `check-pr-security`, `check-pr-test-coverage` and
+      # `check-pr-commit-trailers` above were registered and these five were
+      # not, so the family read as covered. `fetch-pr-files` is the paginating
+      # fetcher behind `check-pr-security.mjs` and `run-quality-gates.mjs`:
+      # both consumers are gated above and the fetcher's own test was not, so a
+      # pagination regression there is a silent false PASS in both.
+      - name: Test PR-gate checks and their shared fetcher (PEN-5272)
+        if: ${{ !cancelled() }}
+        run: |
+          node --test \
+            ./.github/scripts/tests/check-pr-dedup-search.test.mjs \
+            ./.github/scripts/tests/check-pr-dependencies.test.mjs \
+            ./.github/scripts/tests/check-pr-linked-issue.test.mjs \
+            ./.github/scripts/tests/check-pr-lockfile.test.mjs \
+            ./.github/scripts/tests/check-pr-template.test.mjs \
+            ./.github/scripts/tests/fetch-pr-files.test.mjs
+        timeout-minutes: 3
 
       # Guards the one property of the BLO-28888 soak workflow that cannot be
       # re-checked after the fact: that it stays dispatch-only. Adding its
@@ -1177,6 +1245,29 @@ jobs:
         run: pnpm run test:hono-node-server-security-override
         timeout-minutes: 1
 
+      # PEN-5272: the two members of this family that had neither an npm script
+      # nor a step. The seven above were registered; these read as covered by
+      # association and were not.
+      - name: Test brace-expansion security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:brace-expansion-security-override
+        timeout-minutes: 1
+
+      - name: Test postcss security override
+        if: ${{ !cancelled() }}
+        run: pnpm run test:postcss-security-override
+        timeout-minutes: 1
+
+      # Named "smoke" but it reaches no network: it extracts shell functions
+      # from scripts/smoke/*.sh and docker/hermes-gateway-smoke/entrypoint.sh
+      # and asserts them offline -- including the loopback-vs-remote plain-HTTP
+      # split that decides whether the gateway will talk cleartext to a remote
+      # host. The name is why nobody registered it (PEN-5272).
+      - name: Test hermes-gateway smoke shell helpers (PEN-5272)
+        if: ${{ !cancelled() }}
+        run: pnpm run test:hermes-gateway-smoke
+        timeout-minutes: 2
+
       - name: Test agent-health preflight fixtures
         if: ${{ !cancelled() }}
         run: pnpm run test:agent-health-preflight
@@ -1510,6 +1601,13 @@ jobs:
 
       - name: Test undefined-identifier guard failure modes
         run: node --test scripts/check-test-undefined-symbols.test.mjs
+
+      # PEN-5272. This one is registered HERE, not in `policy`, because it
+      # imports the `typescript` package and `policy` never runs `pnpm install`
+      # -- registering it there would fail on ERR_MODULE_NOT_FOUND rather than
+      # on anything about the extractor.
+      - name: Test proposed-telemetry extractor (PEN-5272)
+        run: node --test scripts/extract-proposed-events.test.mjs
 
       # BLO-38582: server's `typecheck` script runs this config, but NOTHING on
       # pull_request or merge_group runs that script -- `typecheck:build-gaps`
