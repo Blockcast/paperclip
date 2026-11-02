@@ -122,6 +122,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { withRetry } from "./mirror-comment-review-gate-to-merge-group.mjs";
 
 // GitHub exposes this App as either its bot login or `app/<slug>` depending on
 // the API surface. The bare `allyblockcast` login is the distinct User seat.
@@ -1622,11 +1623,17 @@ export function partitionByMergeEligibility(failing, prs, now = Date.now()) {
   return { failing: live, deferred };
 }
 
+// Every call here is an idempotent read, so a transient GraphQL 502/504 is
+// retried rather than turning the hourly verdict red: that one failure class
+// was 10 of 40 scheduled runs in the window measured above, and each paged
+// ScheduledWorkflowTrunkRed for a trunk nothing was wrong with (BLO-48423).
 function gh(args) {
-  return execFileSync("gh", args, {
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-  });
+  return withRetry(`gh ${args.slice(0, 2).join(" ")}`, () =>
+    execFileSync("gh", args, {
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    }),
+  );
 }
 
 /**
