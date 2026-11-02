@@ -5208,11 +5208,36 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // of just narrowing the small genuinely-new case this issue targets.
     const longActive =
       elapsedMs !== null && elapsedMs >= thresholds.longActiveMs && !noExecutableTurnDominantAndOpen;
+    // BLO-51422: a churn burst that is demonstrably making progress is the wake
+    // producer's cost (webhook / review-loop / human-comment wakes, owned by
+    // BLO-46732 / BLO-19881), not the assignee's conduct — 8 of 8 such reviews
+    // in the clean post-BLO-46732 window closed "productive". All four conjuncts
+    // are required, and the streaks are EXACTLY 0, not "below threshold", so a
+    // loop with any silent or failed run stays detectable. `livenessState` null
+    // (in flight / unclassified) fails closed. Bounded like BLO-27698 A1: the PR
+    // ages out of `isProgressPullRequest` once it stops moving, and the trigger
+    // fires again.
+    //
+    // `runtimeFailureStreak === 0` is implied today by the all-`advanced` arm
+    // (`isInfraFailureRun` requires `livenessState === "failed"`), so no fixture
+    // can isolate it; it stays so the guard survives a change to that predicate.
+    //
+    // Folded into the boolean BEFORE `choosePrimaryTrigger`, never applied as a
+    // post-hoc `return null` on `trigger === "high_churn"`: `high_churn`
+    // outranks `runaway_execution` and `long_active_duration`, so suppressing
+    // after the ladder would discard a co-fired trigger with it.
+    const progressBurst =
+      isProgressPullRequest(latestPullRequest) &&
+      runtimeFailureStreak === 0 &&
+      noCommentStreak === 0 &&
+      latestRuns.length > 0 &&
+      latestRuns.every((run) => run.livenessState === "advanced");
     const highChurn =
-      runCountLastHour >= thresholds.highChurnHourly ||
-      churnCommentCountLastHour >= thresholds.highChurnHourly ||
-      runCountLastSixHours >= thresholds.highChurnSixHours ||
-      churnCommentCountLastSixHours >= thresholds.highChurnSixHours;
+      (runCountLastHour >= thresholds.highChurnHourly ||
+        churnCommentCountLastHour >= thresholds.highChurnHourly ||
+        runCountLastSixHours >= thresholds.highChurnSixHours ||
+        churnCommentCountLastSixHours >= thresholds.highChurnSixHours) &&
+      !progressBurst;
     // BLO-27698 B3b: the escape hatch B3 owes. Keyed on a single run's own
     // still-live execution span, not on the episode, so it survives B3's
     // narrowing of `long_active_duration` to the unattended bucket — an episode
