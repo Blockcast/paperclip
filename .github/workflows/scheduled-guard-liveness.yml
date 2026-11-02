@@ -334,8 +334,27 @@ jobs:
       # a detection gap: this job went red at 04:51:24Z naming the exact cause
       # and stayed red every hour, while the daily production deploy silently
       # did not fire at 07:23Z and production drifted 77 commits behind.
+      #
+      # A DEBUGGING DISPATCH MUST NOT TOUCH THE LANE. `stale_hours` is an
+      # operator dial that flattens every per-guard threshold at once, so a run
+      # that used it is answering a hypothetical ("what would be stale at 1h?"),
+      # not measuring the fleet. Routing it would put a fabricated verdict into
+      # the platform lane under the same alertname a real outage uses.
+      #
+      # BOTH routing steps are gated, and the resolve side is the one that
+      # matters more. A low dial reds the detector and would mint a false
+      # firing alert — visible, and self-correcting at the next hourly cron. A
+      # HIGH dial greens it and would push `resolved`, CLEARING a genuinely
+      # firing alert about a guard that is still dead. That direction is silent
+      # and is the dangerous one, so neither side routes.
+      #
+      # `== ''` is the correct test rather than an `event_name` check: on a
+      # `schedule` run `inputs` is null, and Actions coerces null and '' alike
+      # to 0, so scheduled runs pass. A dispatch that LEAVES THE DIAL BLANK ran
+      # the real thresholds and also passes — it is a legitimate manual sample.
+      # Only a run that actually overrode the thresholds is excluded.
       - name: Route a stopped-guard verdict to Alertmanager (PEN-5261)
-        if: ${{ steps.liveness.outputs.exit_code != '0' }}
+        if: ${{ steps.liveness.outputs.exit_code != '0' && inputs.stale_hours == '' }}
         env:
           ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
           STATE: firing
@@ -360,7 +379,7 @@ jobs:
       # real fix — a routing layer that fails silently is the whole defect this
       # change closes.
       - name: Resolve the stopped-guard alert and prove the channel still works (PEN-5261)
-        if: ${{ steps.liveness.outputs.exit_code == '0' }}
+        if: ${{ steps.liveness.outputs.exit_code == '0' && inputs.stale_hours == '' }}
         env:
           ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
           STATE: resolved
