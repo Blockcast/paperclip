@@ -925,28 +925,55 @@ export function resolveSeedShape(input: {
  * 120-line diagnostic, and the container's own stdout carries no NDJSON anyway
  * (the pipeline ends `| tee <file> | <failFastFilter> > /dev/null`).
  *
- * ⛔ **Second precondition, and it is a CAPACITY one — it does not block the
- * flip, it prices it (PEN-5125, decided 2026-10-31).** Nothing reclaims an
- * opted-in agent's `k8s-isolation/workspaces/*` tree. The isolation-workspace
- * reaper walks that path through the SERVER's mount, so moving the tree to this
- * claim moves it out of the only sweep there is — and the miss is silent by
- * construction: the enumeration is directory-driven, so an unreachable
- * workspace lands in no outcome bucket and the pass still reports
- * `stop_reason="complete"`. **The accepted ceiling is ≈10 GiB/agent/month
- * against a 50 Gi claim already carrying ≈13.2 G, i.e. one opted-in agent fills
- * its own claim in ≈3.7 months.** `allowVolumeExpansion` is `true`, so the
- * terminal state is an operator resizing a PVC rather than a run losing data,
- * which is why this is priced rather than refused.
+ * **Second precondition, formerly a standing CAPACITY price, now a CONFIG READ
+ * (PEN-5125 priced it 2026-10-31; PEN-5151 built the reclaimer).** The
+ * isolation-workspace reaper walks `k8s-isolation/workspaces/*` through the
+ * SERVER's mount, so a tree on this claim is outside it — and the miss is
+ * silent by construction: that enumeration is directory-driven, so an
+ * unreachable workspace lands in no outcome bucket and the pass still reports
+ * `stop_reason="complete"`. What covers a claim the server does not mount is
+ * the foreign-claim sweep (`isolation-reclaim-sweep.ts`), which reaches it by
+ * launching an executor that DOES mount it, under the same `REAPABLE_LAYOUT`
+ * allowlist and the same `classifyIsolationWorkspaceAge` predicate — shared
+ * functions, not a second transcription.
+ *
+ * ⚠️ **So the price is no longer unconditional, but it is not gone: it now
+ * tracks a flag.** That sweep is opt-in (`isolationReclaimSweepEnabled`, read
+ * at `server/src/index.ts`), because deleting files irreversibly must not be
+ * the same act as deploying the code. **In a deployment that does not enable
+ * it, nothing reclaims an opted-in agent's tree and the accepted ceiling below
+ * applies unchanged: ≈10 GiB/agent/month against a 50 Gi claim already
+ * carrying ≈13.2 G, i.e. one opted-in agent fills its own claim in ≈3.7
+ * months.** `allowVolumeExpansion` is `true`, so the terminal state is an
+ * operator resizing a PVC rather than a run losing data, which is why this was
+ * priced rather than refused.
+ *
+ * **Check the flag, not this comment.** A comment that asserts what is missing
+ * goes stale one increment at a time and gives no sign that it has; the flag is
+ * readable now and answers the question for the deployment actually in front of
+ * you. As of this writing `values.blockcast.yaml` does not set it.
  *
  * What makes that ceiling checkable instead of remembered is
  * `paperclip_isolation_workspace_reaper_unreachable_agents`, whose agent arm
  * counts exactly this population:
  * `PaperclipIsolationWorkspaceReaperCoverageGap` fires on `!= 0`, so the FIRST
  * opt-in raises it within one sweep and it stays raised — 12-hourly as
- * Blockcast deploys it, 24 h on the code fallback. **Do not read
- * that alert as informational while PEN-5151 is open** — it is the standing
- * record that an unreclaimed tree exists, so opt an agent in only together with
- * an owner for its claim's capacity. The cheapest remedy is to opt the agent
+ * Blockcast deploys it, 24 h on the code fallback.
+ *
+ * ⚠️ **That gauge does not go back to `0` when the foreign-claim sweep is
+ * enabled, and must not be read as if it did.** It counts agents the MOUNTED
+ * sweep cannot reach, which is a property of where the tree lives, not of
+ * whether anything reclaimed it — an opted-in agent is unreachable from the
+ * server's mount whether or not an executor is sweeping its claim. Whether
+ * something reclaimed it is the separate question answered by
+ * `paperclip_isolation_reclaim_reclaimed_total` and
+ * `paperclip_isolation_reclaim_last_sweep_timestamp_seconds`. So read the two
+ * together: `unreachable_agents != 0` with a fresh sweep timestamp is
+ * *unreachable but reclaimed*; with a stale or absent one it is the standing
+ * record that an unreclaimed tree exists, and there opt an agent in only
+ * together with an owner for its claim's capacity.
+ *
+ * The cheapest remedy there is to opt the agent
  * back out: its FUTURE runs return to the shared claim, where the existing
  * reaper reaches them with its predicate unchanged. ⚠️ It does NOT reclaim
  * anything already written — those bytes stay on the agent's claim, and because
