@@ -68,14 +68,39 @@ export const TRAILER = "Residual-4-Reread";
  * §8's calendar review date, bound by the CTO 2026-10-30 (§11.5).
  *
  * `REVIEW_LAST_COMPLETED` is null because the review has never been performed —
- * this row is its first carrier. Discharging it is a two-line edit here by the
- * owner (Security) AFTER the review: set the completion date, and set the next
- * `REVIEW_DUE`. Leaving the completion date alone and moving `REVIEW_DUE` out is
- * the one edit that defeats the purpose, and it is the edit this comment exists
- * to make visible in a diff.
+ * this row is its first carrier. Discharging it is a THREE-line edit here by the
+ * owner (Security) AFTER the review: set the completion date, set the next
+ * `REVIEW_DUE`, and move `REVIEW_NOTICE` along with it. Leaving the completion
+ * date alone and moving `REVIEW_DUE` out is the one edit that defeats the
+ * purpose, and it is the edit this comment exists to make visible in a diff.
+ *
+ * ⚠ Three constants is three things to get wrong, so note which way each fails.
+ * Forgetting `REVIEW_NOTICE` strands it in the past, and the advisory warning
+ * then fires on every run until the next window — loud, harmless, and obviously
+ * wrong to anyone who reads it. Forgetting `REVIEW_LAST_COMPLETED` is the silent
+ * one, which is why it is named first above. The remaining ordering mistake is
+ * enforced rather than trusted: see `reviewNoticeDue`.
  */
 export const REVIEW_DUE = "2027-01-31";
 export const REVIEW_LAST_COMPLETED = null;
+
+/**
+ * When the advisory notice starts, ahead of `REVIEW_DUE`. Added at the CTO's ask
+ * on PEN-5186 2026-11-02, with the gate itself left exactly as merged.
+ *
+ * The gate guarantees the review happens eventually. It does nothing to make it
+ * happen before it costs anyone anything, and a repo-wide freeze that arrives
+ * with no warning is the version of this that gets the step deleted rather than
+ * discharged. So this prints `::warning::` for the window before the due date
+ * and changes NO exit code. 2026-12-15 gives 47 days of yellow on every `policy`
+ * run before the hard stop.
+ *
+ * Explicit ISO, not derived from `REVIEW_DUE`. This file compares dates as ISO
+ * strings on purpose and holds no date arithmetic anywhere; adding some here to
+ * save one constant would put the single unreviewable thing in the file into the
+ * arm whose entire job is to be read by someone who has not seen it before.
+ */
+export const REVIEW_NOTICE = "2026-12-15";
 
 export const CLEAR = 0;
 export const OWED = 1;
@@ -164,12 +189,41 @@ export function reviewOwed(today, due = REVIEW_DUE, lastCompleted = REVIEW_LAST_
   return lastCompleted < due;
 }
 
+/**
+ * Is the advisory notice window open? `REVIEW_NOTICE <= today < REVIEW_DUE`.
+ *
+ * It closes ON the due date, deliberately: from there the calendar arm reds, and
+ * a warning riding alongside a failure is noise that teaches people to skim the
+ * annotation that matters.
+ *
+ * ⛔ This arm never reaches the verdict and never changes an exit code. It is a
+ * notice. If it ever gains one, it has become a second gate nobody agreed to.
+ *
+ * `notice >= due` is REFUSED rather than compared, because it is the only way to
+ * misconfigure these three constants that fails silent: the window is empty, no
+ * warning ever fires, and the result is byte-identical to a correct file in a
+ * year with nothing due. Every other mistake here is loud.
+ */
+export function reviewNoticeDue(today, notice = REVIEW_NOTICE, due = REVIEW_DUE) {
+  const iso = /^\d{4}-\d{2}-\d{2}$/;
+  if (!iso.test(String(today ?? "")) || !iso.test(String(notice ?? "")) || !iso.test(String(due ?? ""))) {
+    throw new Error(`dates must be YYYY-MM-DD; got today=${today} notice=${notice} due=${due}`);
+  }
+  if (notice >= due) {
+    throw new Error(`REVIEW_NOTICE must be strictly before REVIEW_DUE; got notice=${notice} due=${due}`);
+  }
+  return today >= notice && today < due;
+}
+
 /** The whole verdict, as data, so the renderer and the tests read the same thing. */
 export function evaluate({ changedPaths, commitMessages, today, headPaths }) {
   const touched = touchedWatchedPaths(changedPaths);
   const attestations = rereadAttestations(commitMessages);
   const trailerOwed = touched.length > 0 && attestations.length === 0;
   const calendarOwed = reviewOwed(today);
+  // Advisory only, and deliberately absent from `verdict` below — the ask was a
+  // notice arm with no exit-code change, and this is the line that keeps it one.
+  const noticeDue = reviewNoticeDue(today);
   // Deliberately NOT part of `trailerOwed`: an attestation cannot clear a stale
   // watch, so this arm stands on its own in the verdict.
   const missing = missingWatchedPaths(headPaths);
@@ -179,6 +233,7 @@ export function evaluate({ changedPaths, commitMessages, today, headPaths }) {
     attestations,
     trailerOwed,
     calendarOwed,
+    noticeDue,
     missing,
     watchStale,
     verdict: trailerOwed || calendarOwed || watchStale ? "owed" : "clear",
@@ -211,6 +266,7 @@ export function renderReport(result, { base, head, today } = {}) {
     `attestations   = ${result.attestations == null ? "(not measured)" : result.attestations.length}`,
     `missing_at_head= ${fieldOrUnmeasured(result.missing)}`,
     `review_due     = ${REVIEW_DUE}  last_completed = ${REVIEW_LAST_COMPLETED ?? "(never)"}`,
+    `review_notice  = ${REVIEW_NOTICE}`,
     `verdict        = ${result.verdict}`,
   ];
 
@@ -272,7 +328,49 @@ export function renderReport(result, { base, head, today } = {}) {
     );
   }
 
+  if (result.noticeDue) {
+    lines.push(
+      "",
+      `THE ${REVIEW_DUE} REVIEW IS APPROACHING. This is a NOTICE — nothing is blocked by`,
+      "it, and it changes no exit code.",
+      "",
+      "It is here so the review can be done while it still costs nothing. From",
+      `${REVIEW_DUE} this same check reds on every PR and every merge group in the`,
+      "repository until Security records the review, and a freeze that arrives with no",
+      "warning is the version of this that gets the step deleted instead of discharged.",
+      "",
+      "All four §8 residuals are due for re-read, by Security, on PEN-5186. Residual 1",
+      "is re-read as A LIST OF VECTORS CLOSED — §8 forbids promoting it to a proof that",
+      "no other git config key can reach an exec during a publish.",
+      "",
+      "Recording it is a three-line edit in",
+      "scripts/check-git-egress-exec-closure-reread.mjs: REVIEW_LAST_COMPLETED to the",
+      "date the review was done, REVIEW_DUE to the next one, REVIEW_NOTICE ahead of",
+      "that. Moving REVIEW_DUE alone is the edit that defeats the purpose.",
+    );
+  }
+
   return lines.join("\n");
+}
+
+/**
+ * The advisory annotation.
+ *
+ * ONE line, and that is a constraint rather than a style choice: a `::warning::`
+ * is terminated by the newline, so a multi-line message delivers only its first
+ * line to the Actions UI and silently drops the rest. The detail lives in the
+ * report, which is printed in full; this is the part that has to survive being
+ * rendered as a single annotation.
+ */
+function emitReviewNotice(noticeDue) {
+  if (!noticeDue) return;
+  console.error(
+    `::warning::PEN-5186: the ${REVIEW_DUE} re-read of the four §8 residuals is not yet ` +
+      "recorded. This is advisory and blocks nothing today. From " +
+      `${REVIEW_DUE} this check reds on every PR and merge group until Security records ` +
+      "it in scripts/check-git-egress-exec-closure-reread.mjs (REVIEW_LAST_COMPLETED, " +
+      "REVIEW_DUE, REVIEW_NOTICE).",
+  );
 }
 
 function readRange(base, head) {
@@ -342,16 +440,19 @@ async function main() {
 
   if (!range) {
     let calendarOwed;
+    let noticeDue;
     try {
       calendarOwed = reviewOwed(today);
+      noticeDue = reviewNoticeDue(today);
     } catch (error) {
       console.error(`::error::${error.message}`);
       process.exit(UNREADABLE);
     }
     console.error(`::error::cannot read the commit range, so the per-change arm could not run: ${rangeError}`);
     if (calendarOwed) {
-      console.log(renderReport({ touched: null, attestations: null, trailerOwed: false, calendarOwed, missing: null, watchStale: false, verdict: "owed" }, { base, head, today }));
+      console.log(renderReport({ touched: null, attestations: null, trailerOwed: false, calendarOwed, noticeDue, missing: null, watchStale: false, verdict: "owed" }, { base, head, today }));
     }
+    emitReviewNotice(noticeDue);
     process.exit(UNREADABLE);
   }
 
@@ -364,6 +465,7 @@ async function main() {
   }
 
   console.log(renderReport(result, { base, head, today }));
+  emitReviewNotice(result.noticeDue);
   process.exit(result.verdict === "clear" ? CLEAR : OWED);
 }
 
