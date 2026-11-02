@@ -56,8 +56,10 @@ import { DEFAULT_ISOLATION_WORKSPACE_ROOT } from "./isolation-workspace-reaper.j
  * silently, and in exactly the direction "same build by construction" claims
  * to rule out. `status.containerStatuses[].imageID` is what the kubelet
  * actually resolved and pulled, so it is preferred whenever it is usable as a
- * reference. Production is digest-pinned already and the two agree there;
- * this closes the case where they do not.
+ * reference -- but only where the spec is MUTABLE, which is the only place a
+ * tag CAN have moved. Production is digest-pinned, and a digest-pinned spec
+ * is left exactly as the operator wrote it: it already names its own content,
+ * so there is nothing for the kubelet to correct. See the subsection below.
  *
  * "Usable" is checked rather than assumed, because `imageID` is not specified
  * to be a pullable reference. Container runtimes have reported it with a
@@ -81,6 +83,30 @@ import { DEFAULT_ISOLATION_WORKSPACE_ROOT } from "./isolation-workspace-reaper.j
  * question; the repository from the spec, because that is the credential
  * question. A digest is content-addressed, so pinning the kubelet's digest
  * onto the operator's repository still names the build the server is running.
+ *
+ * ### A spec that ALREADY carries a digest is left completely alone
+ *
+ * The rule above applies only when the spec names a mutable reference. A
+ * digest pull is content-addressed and verified, so a pod started from
+ * `harbor/paperclip@sha256:X` IS running X -- no tag can have moved under it,
+ * and there is no skew for this resolver to correct. If `imageID` reports a
+ * different digest Y, that is not a newer build: it is containerd's first
+ * `RepoDigest` naming the SAME image config under a different MANIFEST,
+ * because a mirror or a second registry re-pushed or converted it. Pinning Y
+ * onto the spec repository would then ask Harbor for a manifest it never
+ * stored -- usually served when the mirror only re-pushed a platform manifest
+ * under X's index, and NOT served once the mirror rewrote it (media-type
+ * conversion, recompression). So the swap would trade a reference that is
+ * certain to pull for one that might not, in the single branch production
+ * actually runs, since production is digest-pinned.
+ *
+ * The residual it gives up is a pod whose spec image was mutated in place and
+ * whose container has not restarted onto it yet. That one is worth giving up:
+ * it is a BUILD skew, which `report_unsupported_version` names and reports,
+ * whereas a manifest the registry will not serve is a Job that never starts
+ * and is reported as `deadline_exceeded` -- after the controller has deleted
+ * the pod and the log with it. A diagnosable failure in place of a silent one
+ * is the trade this whole module is built around.
  *
  * A bare `sha256:<hex>` is NOT rescued by this, even though the digest alone
  * would now be enough to build a reference. The absence of a `RepoDigest` is
@@ -245,14 +271,25 @@ export interface ReadReclaimSelfPodIdentityOptions {
  * operator wrote, and falls back silently when the runtime's `imageID` is not
  * a pullable reference. Only the DIGEST is taken from `imageID`; the
  * repository is always the spec's, so the Job cannot be sent to a registry
- * the inherited `imagePullSecrets` do not cover. Exported for its own test:
- * the fallback is the branch that matters, because an unusable value used
- * verbatim produces a Job that never starts and reports as a deadline.
+ * the inherited `imagePullSecrets` do not cover. A spec that already carries
+ * a well-formed digest is returned unchanged, because a content-addressed
+ * reference has no skew to correct and is the one name whose credentials are
+ * proven. Exported for its own test: the fallback is the branch that matters,
+ * because an unusable value used verbatim produces a Job that never starts
+ * and reports as a deadline.
  */
 export function resolveSelfImage(
   specImage: string,
   imageID: string | undefined,
 ): string {
+  // A well-formed digest-pinned spec is returned UNCHANGED. A digest pull is
+  // content-addressed, so this pod is running exactly the build the spec
+  // names and there is no skew left to correct. A runtime digest that
+  // disagrees is therefore not a newer build -- it is the same content under
+  // a different MANIFEST, from a mirror that re-pushed or converted it, and
+  // the spec's registry is under no obligation to serve that manifest. See
+  // the module header.
+  if (/@sha256:[0-9a-f]{64}$/.test(specImage.trim())) return specImage;
   const resolved = (imageID ?? "").trim().replace(/^docker-pullable:\/\//, "");
   // `<repository>@sha256:<64 hex>`. A bare `sha256:...` has no repository and
   // is deliberately rejected by the leading `.+@`: it identifies a build but
