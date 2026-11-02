@@ -5642,12 +5642,18 @@ describeEmbeddedPostgres("heartbeat dispatch priority sort (BLO-12990)", () => {
       contextSnapshot: { issueId: runnableIssueId, wakeReason: "issue_assigned" },
     });
 
-    const timestampRows = await db.execute(sql<{ createdAtText: string }>`
-      select created_at::text as "createdAtText"
-      from ${heartbeatRuns}
-      where id = ${blockedRunId}::uuid
+    // Precondition: created_at keeps microseconds, so default-generated keys can
+    // differ below a millisecond. Read the column's declared precision, not the
+    // row's ::text -- Postgres trims trailing fractional zeros, so a row stamped
+    // on a whole millisecond prints `.031` and a row check flakes ~1 in 1000 (BLO-46894).
+    const precisionRows = await db.execute(sql<{ datetimePrecision: number }>`
+      select datetime_precision as "datetimePrecision"
+      from information_schema.columns
+      where table_name = 'heartbeat_runs'
+        and column_name = 'created_at'
+      limit 1
     `);
-    expect(timestampRows[0]?.createdAtText).toMatch(/\.\d{4,}/);
+    expect(Number(precisionRows[0]?.datetimePrecision)).toBe(6);
 
     await boundedHeartbeat.resumeQueuedRuns();
     const runnableRun = await waitForRunToSettle(boundedHeartbeat, runnableRunId, 60_000);
