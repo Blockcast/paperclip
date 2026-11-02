@@ -286,6 +286,39 @@ test("the report names the remedy for whichever arm fired", () => {
   assert.doesNotMatch(calendarOnly, /RE-READ IS OWED/);
 });
 
+test("both discharge instructions name the same three constants", () => {
+  // The test above pins which HEADLINE fired, not what the remedy under it says,
+  // and that gap let the calendar arm go stale: it was written when there were
+  // two constants and kept naming two after REVIEW_NOTICE was added. The arm a
+  // late discharger reads is this one — under a repo-wide freeze — so it is the
+  // worse of the two to leave naming an incomplete edit.
+  //
+  // Pinned as one shared set rather than two literal lists, so a fourth constant
+  // cannot land in one arm and silently miss the other.
+  const CONSTANTS = ["REVIEW_LAST_COMPLETED", "REVIEW_DUE", "REVIEW_NOTICE"];
+
+  const calendar = renderReport(
+    evaluate({ changedPaths: [], commitMessages: [], today: "2027-02-01", headPaths: BOTH_PRESENT }),
+    { today: "2027-02-01" },
+  );
+  const notice = renderReport(
+    evaluate({ changedPaths: [], commitMessages: [], today: REVIEW_NOTICE, headPaths: BOTH_PRESENT }),
+    { today: REVIEW_NOTICE },
+  );
+
+  // Each report carries exactly one of the two remedies, so neither assertion
+  // can be satisfied by the other arm's text.
+  assert.match(calendar, /REVIEW IS DUE/);
+  assert.doesNotMatch(calendar, /IS APPROACHING/);
+  assert.match(notice, /IS APPROACHING/);
+  assert.doesNotMatch(notice, /REVIEW IS DUE and has not been recorded/);
+
+  for (const name of CONSTANTS) {
+    assert.ok(calendar.includes(name), `the calendar remedy must name ${name}`);
+    assert.ok(notice.includes(name), `the notice remedy must name ${name}`);
+  }
+});
+
 test("the calendar report preserves §8's framing of residual 1", () => {
   // §8 forbids residual 1 being written up as a proof, including by the review
   // that re-reads it. The reviewer reads this text at the moment they start, so
