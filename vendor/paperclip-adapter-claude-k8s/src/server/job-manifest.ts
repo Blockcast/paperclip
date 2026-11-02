@@ -951,7 +951,12 @@ export function resolveSeedShape(input: {
  * **Check the flag, not this comment.** A comment that asserts what is missing
  * goes stale one increment at a time and gives no sign that it has; the flag is
  * readable now and answers the question for the deployment actually in front of
- * you. As of this writing `values.blockcast.yaml` does not set it.
+ * you. Grep the deployment's env lists for
+ * `PAPERCLIP_ISOLATION_RECLAIM_SWEEP_ENABLED` rather than looking for a values
+ * key: unlike `PAPERCLIP_ISOLATION_WORKSPACE_REAPER_ENABLED`
+ * (`values.blockcast.yaml:368`), the chart has no first-class key for this one,
+ * so an env list is the only place it can be set. As of this writing
+ * `values.blockcast.yaml` does not set it.
  *
  * What makes that ceiling checkable instead of remembered is
  * `paperclip_isolation_workspace_reaper_unreachable_agents`, whose agent arm
@@ -967,11 +972,31 @@ export function resolveSeedShape(input: {
  * server's mount whether or not an executor is sweeping its claim. Whether
  * something reclaimed it is the separate question answered by
  * `paperclip_isolation_reclaim_reclaimed_total` and
- * `paperclip_isolation_reclaim_last_sweep_timestamp_seconds`. So read the two
- * together: `unreachable_agents != 0` with a fresh sweep timestamp is
- * *unreachable but reclaimed*; with a stale or absent one it is the standing
- * record that an unreclaimed tree exists, and there opt an agent in only
- * together with an owner for its claim's capacity.
+ * `paperclip_isolation_reclaim_last_sweep_timestamp_seconds`.
+ *
+ * ⚠️ **Read that timestamp at `{dry_run="false"}`, and read it as liveness, not
+ * as coverage.** Both qualifiers are load-bearing, and each fails toward
+ * "reclaimed" — the dangerous direction:
+ *
+ * - `recordIsolationReclaimSweep` sets that gauge with a `dry_run` label and
+ *   sets it UNCONDITIONALLY (`server/src/services/metrics.ts`), so a dry-run
+ *   sweep leaves the timestamp fresh having reclaimed zero bytes. That is not
+ *   an edge case: `server/src/index.ts` tells the operator to "Enable with
+ *   `dryRun` first", so it is the FIRST state a correctly-run rollout is in.
+ *   The unlabelled series name matches that sample too.
+ * - Even at `{dry_run="false"}`, freshness says the sweep RAN, never that it
+ *   drove this claim. `sweepIsolationReclaim` slices to `maxClaimsPerTick` and
+ *   rotates, so a fleet larger than one tick is covered across several; and the
+ *   timestamp advances on `outcome="failed"` and `"deferred"` sweeps too.
+ *
+ * So the per-claim evidence is `paperclip_isolation_reclaim_claims_total`
+ * by `outcome` (with `stop_reason="claims_capped"` naming the rotation) and
+ * `paperclip_isolation_reclaim_unknown_outcome_claims_total`, not the
+ * timestamp. With those read: `unreachable_agents != 0` alongside a fresh
+ * `{dry_run="false"}` sweep that drove this claim `ok` is *unreachable but
+ * reclaimed*; a stale, absent, or dry-run-only timestamp is the standing record
+ * that an unreclaimed tree exists, and there opt an agent in only together with
+ * an owner for its claim's capacity.
  *
  * The cheapest remedy there is to opt the agent
  * back out: its FUTURE runs return to the shared claim, where the existing
