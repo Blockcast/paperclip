@@ -52,8 +52,76 @@ test("arm 1: a `./`-prefixed registration satisfies it", () => {
   );
 });
 
-test("arm 1: a bare-basename reference satisfies it", () => {
-  assert.deepEqual(errorsFor(world({ workflows: ["run: node --test a.test.mjs\n"] })), []);
+test("arm 1: a bare basename does NOT satisfy it -- matching is by full path", () => {
+  const errors = errorsFor(world({ workflows: ["run: node --test a.test.mjs\n"] }));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a registered test does not cover one whose name is its SUFFIX", () => {
+  // Ally's finding on PR #3275, pinned. With `check-pr-template.test.mjs`
+  // registered, a substring match marked an unrun `scripts/pr-template.test.mjs`
+  // reachable -- a fail-open in this guard's own defect class.
+  const errors = errorsFor(
+    world({
+      tracked: [
+        ".github/scripts/tests/check-pr-template.test.mjs",
+        "scripts/pr-template.test.mjs",
+      ],
+      workflows: [
+        "run: node --test ./.github/scripts/tests/check-pr-template.test.mjs\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/pr-template\.test\.mjs/);
+});
+
+test("arm 1: the same suffix hazard one level up, at PATH level, is closed too", () => {
+  // No such pair exists in the tree today; tokenising removes the class.
+  const errors = errorsFor(
+    world({
+      tracked: [".github/scripts/tests/x.test.mjs", "scripts/tests/x.test.mjs"],
+      workflows: ["run: node --test .github/scripts/tests/x.test.mjs\n"],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/tests\/x\.test\.mjs/);
+});
+
+test("arm 1: a mention in a step `name:` is not a registration", () => {
+  // Only a command can run a test. `- name: Test foo.test.mjs` with a `run:`
+  // that does something else used to read as reachable.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "      - name: Test scripts/a.test.mjs\n        run: echo skipped\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a `run: |` block scalar registers every file it names", () => {
+  assert.deepEqual(
+    errorsFor(
+      world({
+        tracked: ["scripts/a.test.mjs", "scripts/b.test.mjs"],
+        workflows: [
+          "        run: |\n          node --test \\\n            ./scripts/a.test.mjs \\\n            ./scripts/b.test.mjs\n",
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a quoted path still registers", () => {
+  assert.deepEqual(
+    errorsFor(world({ workflows: ['run: node --test "scripts/a.test.mjs"\n'] })),
+    [],
+  );
 });
 
 test("arm 1: a file named ONLY in a whole-line comment is still unregistered", () => {
@@ -220,14 +288,18 @@ test("arm 4: a pendingRegistrationPr entry still exempts a file that is NOT yet 
   assert.deepEqual(notices, []);
 });
 
-test("arm 5: a basename collision is refused, because arm 1 matches basenames", () => {
+test("arm 1: identical basenames in different directories are judged independently", () => {
+  // Previously refused outright by an arm-5 collision check; exact-path
+  // matching makes the pair perfectly decidable, so it is allowed and each
+  // file stands on its own registration.
   const errors = errorsFor(
     world({
       tracked: ["scripts/a.test.mjs", "scripts/__tests__/a.test.mjs"],
       workflows: ["run: node --test scripts/a.test.mjs\n"],
     }),
   );
-  assert.ok(errors.some((e) => /^arm 5: basename "a\.test\.mjs" is shared by 2/.test(e)));
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/__tests__\/a\.test\.mjs/);
 });
 
 test("arm 5: a workflow glob covering a guarded directory is refused", () => {

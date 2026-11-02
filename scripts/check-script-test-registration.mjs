@@ -22,19 +22,34 @@
  * omission produces no symptom -- every required check stays green. That is the
  * shape of a defect a guard can hold and a reviewer cannot.
  *
- * REACHABILITY, defined so the verdict is falsifiable:
+ * REACHABILITY, defined so the verdict is falsifiable. A file is reachable iff
+ * its repo-relative path appears as a WHOLE COMMAND TOKEN in:
  *
- *   (a) the file path (bare or `./`-prefixed) or its basename appears in the
- *       text of some `.github/workflows/*.y{a,}ml`, with WHOLE-LINE COMMENTS
- *       STRIPPED -- a file named only in a `#` comment is documented, not run;
- *   (b) or it appears in the body of a root `package.json` script that is
- *       transitively reachable from one a workflow actually invokes
- *       (`pnpm run X` / `pnpm X` / `npm run X` / `yarn X`).
+ *   (a) the body of a `run:` step in some `.github/workflows/*.y{a,}ml`, with
+ *       whole-line comments stripped; or
+ *   (b) the body of a root `package.json` script transitively reachable from
+ *       one such `run:` body (`pnpm run X` / `pnpm X` / `npm run X` / `yarn X`).
  *
- * Comment-stripping is a strengthening that costs nothing here: measured at
- * 269bdc0d, ZERO of the 105 reachable files were reachable only via a comment,
- * so (a) and its loose variant agreed exactly. It is in force to keep a future
- * comment from being mistaken for a registration.
+ * Three deliberate narrowings, each of which closes a way this guard could pass
+ * a file CI never runs. All three were measured against the tree before being
+ * adopted, and all three cost NOTHING: 131 of 131 reachable files satisfy the
+ * strict form.
+ *
+ *   - WHOLE TOKEN, not substring. `text.includes(basename)` fails OPEN for any
+ *     unregistered test whose name is a suffix of a registered one: with
+ *     `check-pr-template.test.mjs` registered, an unrun `scripts/pr-template.
+ *     test.mjs` reads as reachable. That is this guard's own defect class, and
+ *     the population is full of suffix-shaped names (`*-security-override.
+ *     test.js`, `check-pr-*.test.mjs`). The same hazard exists one level up at
+ *     path level (`scripts/tests/x` inside `.github/scripts/tests/x`); there
+ *     are no such pairs today, but tokenizing removes the class rather than the
+ *     instance. Found by Ally on PR #3275 with a working reproduction.
+ *   - `run:` BODIES ONLY, not whole workflow text. Otherwise `- name: Test
+ *     foo.test.mjs` with `run: echo skipped` registers nothing and still reads
+ *     as reachable. Only a command can run a test, so only commands count.
+ *   - COMMENTS STRIPPED. A file named in a `#` comment is documented, not run,
+ *     and being documented as runnable is PEN-5272's failure mode rather than
+ *     an exception to it.
  *
  * KNOWN CEILING, stated rather than buried. The match is LITERAL, so a runner
  * that builds a path dynamically reads as unregistered here; the one
@@ -68,10 +83,9 @@
  *                      so it only prints a notice telling you to delete it. That
  *                      exemption exists so landing the PR named there does not
  *                      need a second push to this allowlist.
- *   5. method intact -- basenames across the population are unique (arm 1 may
- *                      match on basename) and no second glob covers these
- *                      directories. Either would make a verdict here unsound, so
- *                      it is refused loudly instead of reported quietly.
+ *   5. method intact -- no glob covers these directories. One would silently run
+ *                      files this guard reports as unregistered, making every
+ *                      verdict unsound, so it is refused loudly instead.
  *
  * This guard is itself registered in `pr.yml`, in the PR that added it. An
  * unregistered registration guard is the joke PEN-5272 is about.
@@ -175,11 +189,43 @@ function workflowInvokedScripts(scripts, workflowText) {
   return reachable;
 }
 
-function mentions(text, file) {
-  return (
-    text.includes(file) ||
-    text.includes(`./${file}`) ||
-    text.includes(path.basename(file))
+/**
+ * The text of every `run:` step body. Only a command can run a test, so a
+ * mention anywhere else in the YAML (a step `name:`, a `with:` input) is not a
+ * registration. Handles both `run: <inline>` and `run: |` block scalars.
+ */
+export function runCommands(workflowSource) {
+  const lines = stripCommentLines(workflowSource).split("\n");
+  const out = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const match = /^(\s*)-?\s*run:\s*(.*)$/.exec(lines[i]);
+    if (!match) continue;
+    const indent = match[1].length;
+    const inline = match[2].trim();
+    if (inline !== "" && !/^[|>][-+]?\d*$/.test(inline)) {
+      out.push(inline);
+      continue;
+    }
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (lines[j].trim() === "") continue;
+      if (lines[j].length - lines[j].trimStart().length <= indent) break;
+      out.push(lines[j]);
+    }
+  }
+  return out.join("\n");
+}
+
+/**
+ * Command text split into whole argument tokens, each normalised by dropping a
+ * leading `./`. Substring matching fails OPEN on suffix-shaped names -- see the
+ * header -- so reachability is decided by exact membership in this set.
+ */
+export function commandTokens(text) {
+  return new Set(
+    text
+      .split(/[\s'"`;|&()<>]+/)
+      .map((token) => token.replace(/^\.\//, ""))
+      .filter(Boolean),
   );
 }
 
@@ -188,26 +234,15 @@ export function analyze({ tracked, workflowSources, packageScripts }) {
     .filter((f) => SCOPES.some((s) => f.startsWith(s)) && TEST_FILE.test(f))
     .sort();
 
-  const workflowText = stripCommentLines(workflowSources.join("\n"));
-  const invoked = workflowInvokedScripts(packageScripts, workflowText);
+  const runText = workflowSources.map(runCommands).join("\n");
+  const invoked = workflowInvokedScripts(packageScripts, runText);
   const invokedText = [...invoked].map((n) => packageScripts[n]).join("\n");
 
-  const reachable = new Set(
-    candidates.filter(
-      (f) => mentions(workflowText, f) || mentions(invokedText, f),
-    ),
-  );
+  const tokens = commandTokens(`${runText}\n${invokedText}`);
+  const reachable = new Set(candidates.filter((f) => tokens.has(f)));
 
-  // Arm 5a: basename uniqueness, which arm 1's basename match relies on.
-  const byBase = new Map();
-  for (const f of candidates) {
-    const b = path.basename(f);
-    byBase.set(b, [...(byBase.get(b) ?? []), f]);
-  }
-  const collisions = [...byBase.entries()].filter(([, v]) => v.length > 1);
-
-  // Arm 5b: a second glob over these directories would silently cover files
-  // this guard reports as unregistered.
+  // Arm 5: a glob over these directories would silently cover files this guard
+  // reports as unregistered, making every verdict here unsound.
   const globs = [];
   for (const src of workflowSources) {
     for (const m of stripCommentLines(src).matchAll(
@@ -219,21 +254,14 @@ export function analyze({ tracked, workflowSources, packageScripts }) {
     }
   }
 
-  return { candidates, reachable, invoked, collisions, globs };
+  return { candidates, reachable, invoked, globs };
 }
 
 export function evaluate(analysis, allowlist) {
-  const { candidates, reachable, collisions, globs } = analysis;
+  const { candidates, reachable, globs } = analysis;
   const errors = [];
   const notices = [];
 
-  for (const [base, files] of collisions) {
-    errors.push(
-      `arm 5: basename "${base}" is shared by ${files.length} candidate files ` +
-        `(${files.join(", ")}). Registration is matched by basename, so a ` +
-        `verdict here would be unsound. Rename one.`,
-    );
-  }
   for (const glob of [...new Set(globs)]) {
     errors.push(
       `arm 5: workflow glob "${glob}" covers a guarded directory. This guard ` +
@@ -318,10 +346,10 @@ function main() {
   const analysis = analyze({ tracked, workflowSources, packageScripts });
   const { errors, notices } = evaluate(analysis, ALLOWLIST);
 
-  const registered = analysis.candidates.length - analysis.reachable.size;
+  const unreachableCount = analysis.candidates.length - analysis.reachable.size;
   console.log(
     `script-test registration: ${analysis.candidates.length} candidate files, ` +
-      `${analysis.reachable.size} reachable from CI, ${registered} not ` +
+      `${analysis.reachable.size} reachable from CI, ${unreachableCount} not ` +
       `(${ALLOWLIST.length} allowlisted), across ${workflowPaths.length} workflows.`,
   );
 
