@@ -34,9 +34,20 @@ type MembershipRow = typeof companyMemberships.$inferSelect;
 // These lists are the full current column set of each table, because every
 // field is already read by some consumer (see PEN-5258 for the per-consumer
 // survey) — the point is not to narrow today's response, it is that the NEXT
-// column must be added here deliberately before it can reach anyone.
+// column must be added here deliberately before it can reach `getMembership`'s
+// or `listPrincipalGrants`' callers.
 // ⇒ Adding a column to either table does NOT belong in these lists by
 //    default. Add it only once you have decided every consumer should see it.
+//
+// SCOPE OF THAT GUARANTEE — it is these two read paths, not the tables.
+// `company_memberships` is still read bare elsewhere in this file
+// (`listMembers`, `getMemberById`, `listActiveUserMemberships`), and
+// `ensureMembership` returns `.returning()` full rows from both its update and
+// its insert path. A new column therefore still reaches those by default. It
+// does not currently leak: every `ensureMembership` caller
+// (`routes/access.ts`, `routes/agents.ts`) discards the returned row. Giving
+// those call sites the same projection is the obvious next ratchet step and is
+// deliberately out of PEN-5258's scope, which is these two functions only.
 export const membershipColumns = {
   id: companyMemberships.id,
   companyId: companyMemberships.companyId,

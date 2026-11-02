@@ -14,6 +14,14 @@ import { membershipColumns, principalGrantColumns } from "../services/access.js"
 // the projection, having decided every consumer should see it, or adding it to
 // the `deliberatelyOmitted` set below with a reason.
 //
+// `deliberatelyOmitted` is not free, and the compiler will tell you so before
+// this test does. Dropping a column from `membershipColumns` narrows the row
+// type, which breaks two places that assert the FULL row: `getMembership`'s
+// `Promise<MembershipRow | null>` annotation (`services/access.ts`) and
+// `redactGrant`'s `$inferSelect` parameter (`services/plugin-host-services.ts`).
+// Both need retyping to whatever you narrowed to. That cost is the point — a
+// narrower projection should be a typed decision, not a silent one.
+//
 // Refs PEN-5258, PEN-5232.
 describe("access service column projections", () => {
   it("getMembership projects a decided column set", () => {
