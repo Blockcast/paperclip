@@ -47,8 +47,13 @@ updates:
   # and "lockfile insulation" is one of the three stated reasons for vendoring
   # the service at all. There is no integrity manifest over this directory. The
   # one CI check that reads this lockfile,
-  # scripts/designer-fast-uri-security.test.js, asserts a version FLOOR
-  # (fast-uri >= 3.1.5), which an upward bump satisfies by construction.
+  # scripts/designer-fast-uri-security.test.js, asserts a version FLOOR, which
+  # an upward bump satisfies by construction. The floor itself is deliberately
+  # NOT restated here. It moves whenever a new advisory lands -- this comment
+  # said `>= 3.1.5` while the override had already moved to `^3.1.6`, and
+  # PEN-5284 then took it to `>=3.1.9 <4` -- so a version copied into prose
+  # goes stale silently and reads as current forever. Read it from `overrides`
+  # in that package's package.json, which is what the guard actually pins.
   - package-ecosystem: npm
     directory: "/packages/services/designer"
     schedule:
