@@ -350,6 +350,7 @@ describe("describeSharedCheckoutOccupancy", () => {
  * them checked the warning was observable where the code claimed to put it.
  */
 describe("buildPaperclipWorkspaceContext", () => {
+  const FALLBACK_AGENT_ID = "11111111-2222-3333-4444-555555555555";
   const executionWorkspace = {
     cwd: CWD,
     source: "project_primary",
@@ -368,6 +369,7 @@ describe("buildPaperclipWorkspaceContext", () => {
       warnings,
       realization: null,
       agentHome: "/home/agent",
+      agentId: FALLBACK_AGENT_ID,
     });
 
   it("delivers the contention warning to the agent's own context", () => {
@@ -390,6 +392,78 @@ describe("buildPaperclipWorkspaceContext", () => {
     const context = build(warnings);
     warnings.push("added after the context was built");
     expect(context.warnings).toEqual(["added after the context was built"]);
+  });
+
+  // PEN-5234 (PEN-4932 invariant 9). The adapter refuses to dispatch an
+  // opted-in run whose working tree the server realized onto its own volume,
+  // and this field is the only thing that tells it which runs those are. A run
+  // handed a workspace-less fallback directory is MEANT to find it empty, so
+  // refusing those would make the whole opt-in unobservable; shipping `true`
+  // for a realized tree is what makes the refusal fire at all.
+  it("reports a server-realized tree, which is what the invariant-9 refusal keys on", () => {
+    expect(build([]).serverRealizedTree).toBe(true);
+  });
+
+  it("reports NO server-realized tree for either workspace-less fallback directory", () => {
+    // Both of them, not just the agent home: BLO-18760 added the second
+    // (repo-less) directory precisely because a check keyed on one silently
+    // skipped the other, and the direction of that miss here is a refused
+    // dispatch for a run that would have worked.
+    for (const cwd of [
+      resolveDefaultAgentWorkspaceDir(FALLBACK_AGENT_ID),
+      resolveAgentEmptyWorkspaceSourceDir(FALLBACK_AGENT_ID),
+    ]) {
+      expect(
+        buildPaperclipWorkspaceContext({
+          executionWorkspace: { ...executionWorkspace, cwd },
+          mode: "shared_workspace",
+          warnings: [],
+          realization: null,
+          agentHome: "/home/agent",
+          agentId: FALLBACK_AGENT_ID,
+        }).serverRealizedTree,
+        cwd,
+      ).toBe(false);
+    }
+  });
+
+  it("keys on the PATH, so a resumed stateless run is not reclassified", () => {
+    // Only the FIRST workspace-less run carries `source: "agent_home"`; that
+    // cwd is persisted into the task session and every resume resolves the
+    // identical directory back as `source: "task_session"`. A label-keyed
+    // answer would clear run 1 of a stateless agent and refuse runs 2..n.
+    expect(
+      buildPaperclipWorkspaceContext({
+        executionWorkspace: {
+          ...executionWorkspace,
+          cwd: resolveAgentEmptyWorkspaceSourceDir(FALLBACK_AGENT_ID),
+          source: "task_session",
+        },
+        mode: "shared_workspace",
+        warnings: [],
+        realization: null,
+        agentHome: "/home/agent",
+        agentId: FALLBACK_AGENT_ID,
+      }).serverRealizedTree,
+    ).toBe(false);
+  });
+
+  it("reports a realized tree for ANOTHER agent's fallback directory", () => {
+    // The directories are per-agent, so the comparison has to be too —
+    // otherwise one agent's cwd would clear the refusal for a different agent.
+    expect(
+      buildPaperclipWorkspaceContext({
+        executionWorkspace: {
+          ...executionWorkspace,
+          cwd: resolveAgentEmptyWorkspaceSourceDir(FALLBACK_AGENT_ID),
+        },
+        mode: "shared_workspace",
+        warnings: [],
+        realization: null,
+        agentHome: "/home/agent",
+        agentId: "99999999-8888-7777-6666-555555555555",
+      }).serverRealizedTree,
+    ).toBe(true);
   });
 
   it("survives the shallow spread the adapter context is built with", () => {
