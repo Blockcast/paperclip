@@ -334,7 +334,13 @@ predating the signal.
 > real stored value."** Run the own-id positive control **on the detail
 > route** (`GET /agents/:id`, `paperclipGetAgent`): if that call against your
 > own id comes back populated and a peer's does not, you are looking at a
-> projection. ⛔ Do **not** run it on the company roster — the self row there
+> projection. ⛔ **That control is only valid if your own read came back
+> populated at all.** Own-id is sufficient *on the standard trust preset
+> only*: the `isSelf` branch short-circuits before the gate, answering a
+> `low_trust_review` actor with `buildLowTrustSelfView` — a shape carrying no
+> config — and a `denied` actor with a **403**. So an empty own-id read means
+> the control did not run; it is **never** evidence that your own column is
+> empty. ⛔ Do **not** run it on the company roster — the self row there
 > is decided by which branch you landed on rather than by the column, so it
 > cannot tell redaction from absence
 > ([why](#check-whether-telemetry-answers-it-before-asking-for-the-read)).
@@ -541,6 +547,14 @@ Two habits from that row are worth carrying:
     entitled to the subject gets a populated **peer** read too. "It came back
     populated, so that must have been my own row" does not follow — the axis
     is the reader's entitlement, not self-vs-peer.
+  - ⛔ **But own-id is sufficient only on the standard trust preset.** The
+    `isSelf` branch short-circuits *before* that gate: a `low_trust_review`
+    actor is answered with `buildLowTrustSelfView`, a shape that carries no
+    config, and a `denied` actor gets a **403**. The detail route therefore
+    carries the same trust condition as the roster bullet below, and an empty
+    own-id read is evidence the control did not run — never evidence that
+    your own column is empty. Reading it the other way is the same inversion
+    the roster bullet warns about, on the route this section recommends.
   - ⛔ **On the company agent list the control is vacuous.** That handler
     gates on `actorCanReadConfigurationsForCompany`; once that fails it
     renders the viewer's own row with `redactAgentSecrets` and every other row
