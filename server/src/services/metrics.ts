@@ -2400,6 +2400,75 @@ export const TRANSIENT_RETRY_FLOOR_DISPOSITIONS = [
 ] as const;
 
 export type TransientRetryFloorDisposition = (typeof TRANSIENT_RETRY_FLOOR_DISPOSITIONS)[number];
+
+/**
+ * Count of dependency-blocked re-park dispersion decisions (PEN-5307).
+ *
+ * ## Why this is a SEPARATE metric and not a label on the transient counter
+ *
+ * Not for cardinality reasons — because {@link TRANSIENT_RETRY_FLOOR_METRIC}'s
+ * instrument does not work on this lane. That counter's numerator is
+ * {@link RETRY_INSTANT_ALIGNMENTS}: a clamped transient floor is an instant the
+ * PROVIDER computed off a bucket edge, so it carries a whole-second or
+ * 10-minute-grid signature that jitter would not produce. A dependency-blocked
+ * park has no provider in it. Its instant is `sweepNow + f(attempt)`, and
+ * `sweepNow` is an ordinary `new Date()` with an arbitrary millisecond — so an
+ * UNDISPERSED dep-blocked park classifies `off_grid`, which is that detector's
+ * HEALTHY reading. The measured collision (`…T17:18:01.457Z`, PEN-5307) is
+ * off-grid by construction.
+ *
+ * ⇒ Extending `alignment` to `reason="dependency_blocked"` would have reported
+ * ~100% healthy both before and after this fix. The signature on this lane is a
+ * cross-run TIE on a shared sweep instant, not alignment to a grid, so it needs
+ * its own numerator. Recorded because "just add a reason label" is the obvious
+ * move and it is wrong.
+ *
+ * ## Read it as a share, and always carry the denominator
+ *
+ *     sum(increase(paperclip_dep_blocked_retry_dispersion_total{disposition="undispersed"}[24h]))
+ *     / sum(increase(paperclip_dep_blocked_retry_dispersion_total[24h]))
+ *
+ * PEN-4145 trap #3 applies here verbatim: a zero numerator over a zero
+ * denominator is an empty lane, NOT a healthy scheduler. Before this metric the
+ * lane had no denominator at all, which is how it carried 100% of the live park
+ * population while the only clamp detector in the fleet watched the lane that
+ * had gone empty.
+ *
+ * ## Residual, stated rather than asserted away
+ *
+ * Both series are written at the same call site as the dispersion itself, so a
+ * regression that deletes the `jitterTransientRetryFloor` call deletes the
+ * denominator with it and this reads 0/0, not a spike. That is the same
+ * residual {@link TRANSIENT_RETRY_FLOOR_METRIC} carries and it is why the real
+ * catch for a removed call is the regression test in
+ * `dep-blocked-retry-dispersion.test.ts`, not this counter. What this counter
+ * DOES catch is the live-traffic shape the test cannot see: a dispersion that
+ * runs but produces no spread, because the window collapsed or the draw is
+ * degenerate.
+ */
+export const DEP_BLOCKED_RETRY_DISPERSION_METRIC = "paperclip_dep_blocked_retry_dispersion_total";
+
+/**
+ * How one dependency-blocked re-park's dispersion came out.
+ *
+ * Two values, not three: there is no "exempt" shape on this lane. Every
+ * dep-blocked re-park goes through the same curve and the same jitter, so the
+ * only question is whether the jitter actually moved the instant.
+ */
+export const DEP_BLOCKED_RETRY_DISPERSION_DISPOSITIONS = [
+  /** Jitter moved the instant off the sweep's shared base. The healthy reading. */
+  "dispersed",
+  /**
+   * Jitter resolved to 0 ms, so this re-park landed exactly on `sweepNow +
+   * f(attempt)` — the tie-capable instant. Expected to be ~0: the window is at
+   * least 2 min wide on every attempt, so a zero draw is ~1-in-120,000. A
+   * non-trivial share here means the window collapsed or the draw is degenerate.
+   */
+  "undispersed",
+] as const;
+
+export type DepBlockedRetryDispersionDisposition =
+  (typeof DEP_BLOCKED_RETRY_DISPERSION_DISPOSITIONS)[number];
 export const RETRY_SCHEDULE_OUTCOME_METRIC = "paperclip_retry_schedule_outcome_total";
 /**
  * Retry-scheduling outcomes, as an allow-list so a future branch cannot mint a
@@ -5399,6 +5468,7 @@ let heartbeatRunFailed: Counter<HeartbeatRunFailedLabel> | null = null;
 let ccrotateCapacityDeferred: Counter<"adapter" | "provider"> | null = null;
 let retryScheduleOutcome: Counter<"outcome" | "retry_reason"> | null = null;
 let transientRetryFloor: Counter<"disposition" | "alignment"> | null = null;
+let depBlockedRetryDispersion: Counter<"disposition"> | null = null;
 let startLockReapDisposition: Counter<"disposition"> | null = null;
 let orphanReapStageSeconds: Histogram<"stage"> | null = null;
 let penstockGateProbe: Counter<"path" | "outcome" | "provider" | "model"> | null = null;
@@ -5633,6 +5703,7 @@ function ensureRegistry(): {
   capacityDeferredCounter: Counter<"adapter" | "provider">;
   retryScheduleOutcomeCounter: Counter<"outcome" | "retry_reason">;
   transientRetryFloorCounter: Counter<"disposition" | "alignment">;
+  depBlockedRetryDispersionCounter: Counter<"disposition">;
   startLockReapDispositionCounter: Counter<"disposition">;
   orphanReapStageSecondsHistogram: Histogram<"stage">;
   penstockGateProbeCounter: Counter<"path" | "outcome" | "provider" | "model">;
@@ -5800,6 +5871,7 @@ function ensureRegistry(): {
     || !ccrotateCapacityDeferred
     || !retryScheduleOutcome
     || !transientRetryFloor
+    || !depBlockedRetryDispersion
     || !startLockReapDisposition
     || !orphanReapStageSeconds
     || !penstockGateProbe
@@ -6286,6 +6358,30 @@ function ensureRegistry(): {
       for (const alignment of RETRY_INSTANT_ALIGNMENTS) {
         transientRetryFloor.inc({ disposition, alignment }, 0);
       }
+    }
+    depBlockedRetryDispersion = new Counter({
+      name: DEP_BLOCKED_RETRY_DISPERSION_METRIC,
+      help:
+        "Count of dependency_blocked re-park dispersion decisions (PEN-5307), by disposition. "
+        + "ALWAYS read as a share with the denominator carried: undispersed / total. A zero "
+        + "numerator over a zero denominator is an empty lane, NOT a healthy scheduler "
+        + "(PEN-4145 trap #3) -- that conflation is exactly how this lane carried 100% of the "
+        + "live park population while the fleet's only clamp detector watched the lane that had "
+        + "gone empty. This is deliberately NOT a label on paperclip_transient_retry_floor_total: "
+        + "that counter's numerator is grid ALIGNMENT, and an undispersed dep-blocked instant is "
+        + "sweepNow + f(attempt) with an arbitrary millisecond, so it classifies off_grid -- that "
+        + "detector's healthy reading -- both before and after the fix. The signature here is a "
+        + "cross-run TIE on a shared sweep instant. Both series are zero-seeded at start so "
+        + "increase() can see the first event after a restart; a 0 is a real reading, do NOT "
+        + "alert on absent(). Cardinality is fixed at 2 forever.",
+      labelNames: ["disposition"],
+      registers: [registry],
+    });
+    // PEN-5307, same load-bearing reason as the grid above: a series born at 1
+    // evaluates to 0 under increase() forever, which would put the blindness
+    // this metric exists to remove back inside the metric itself.
+    for (const disposition of DEP_BLOCKED_RETRY_DISPERSION_DISPOSITIONS) {
+      depBlockedRetryDispersion.inc({ disposition }, 0);
     }
     orphanReapStageSeconds = new Histogram({
       name: ORPHAN_REAP_STAGE_SECONDS_METRIC,
@@ -8756,6 +8852,7 @@ function ensureRegistry(): {
     capacityDeferredCounter: ccrotateCapacityDeferred,
     retryScheduleOutcomeCounter: retryScheduleOutcome,
     transientRetryFloorCounter: transientRetryFloor,
+    depBlockedRetryDispersionCounter: depBlockedRetryDispersion,
     startLockReapDispositionCounter: startLockReapDisposition,
     orphanReapStageSecondsHistogram: orphanReapStageSeconds,
     penstockGateProbeCounter: penstockGateProbe,
@@ -9185,6 +9282,33 @@ export function recordTransientRetryFloorDisposition(input: {
   };
   ensureRegistry().transientRetryFloorCounter.inc(labels);
   return labels;
+}
+
+/**
+ * Record one dependency-blocked re-park dispersion decision (PEN-5307).
+ *
+ * Takes the applied `jitterMs` rather than a pre-resolved disposition so the
+ * caller cannot classify its own outcome: "did the jitter move it" is a property
+ * of the number the helper returned, and deriving it here keeps the one
+ * definition next to the metric it labels.
+ *
+ * Carries no `agent_id`, for the same reason the transient counter does not: the
+ * signature is a COHORT of runs across agents sharing one instant, so per-agent
+ * series would split exactly the population whose concentration is the signal.
+ *
+ * A non-finite `jitterMs` counts as `undispersed`. That is the fail-loud
+ * direction here (the opposite of {@link classifyRetryInstantAlignment}'s
+ * fail-quiet choice) and deliberately so: a NaN jitter means the instant written
+ * to `scheduled_retry_at` is itself suspect, which is a scheduler defect this
+ * lane should surface rather than absorb.
+ */
+export function recordDepBlockedRetryDispersion(input: { jitterMs: number }): {
+  disposition: DepBlockedRetryDispersionDisposition;
+} {
+  const disposition: DepBlockedRetryDispersionDisposition =
+    Number.isFinite(input.jitterMs) && input.jitterMs > 0 ? "dispersed" : "undispersed";
+  ensureRegistry().depBlockedRetryDispersionCounter.inc({ disposition });
+  return { disposition };
 }
 
 /** Observe one {@link ORPHAN_REAP_STAGE_SECONDS_METRIC} sample. Unknown stages are dropped. */
@@ -12192,6 +12316,8 @@ export function __resetMetricsForTest(): void {
   // of the process. That is the trap this metric exists to avoid, reintroduced
   // through the test path.
   transientRetryFloor = null;
+  // PEN-5307, same reason as the line above.
+  depBlockedRetryDispersion = null;
   startLockReapDisposition = null;
   orphanReapStageSeconds = null;
   penstockGateProbe = null;
