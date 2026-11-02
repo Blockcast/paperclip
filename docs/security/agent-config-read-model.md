@@ -692,17 +692,38 @@ at 3 across nine consecutive samples spanning 85 minutes while `queued_count`
 never reached 0 and head-of-line age climbed monotonically to 3588 s. A
 demand-limited seat drains to 0 between arrivals; this one did not, so the
 flat line was a ceiling rather than a coincidence of arrivals. The configured
-value, supplied afterwards by the `Ceo` under the interim rule above — the
+value, supplied afterwards by the `Ceo` under the one-hop rule above — the
 single field `heartbeat.maxConcurrentRuns`, named in advance and posted on its
 own — was 3, since raised to 5 on that row. The inference was correct and the
 read would have added nothing to it.
 
 Two habits from that row are worth carrying:
 
-- **Run a positive control before claiming you cannot observe something.** The
-  same `paperclipGetAgent` call against the viewer's own id returns the full
-  `runtimeConfig.heartbeat`. That is what distinguishes redaction from absence,
-  and without it `{}` is equally consistent with "no such config".
+- **Run a positive control before claiming you cannot observe something — and
+  run it on the right route.** On the detail route (`GET /agents/:id`,
+  `paperclipGetAgent`) the same call against the viewer's own id returns the
+  full `runtimeConfig.heartbeat`. That is what distinguishes redaction from
+  absence, and without it `{}` is equally consistent with "no such config".
+  Three things bound that control, all read off `server/src/routes/agents.ts`:
+  - **Own-id is sufficient, not necessary.** The gate is
+    `isSelf ? true : actorCanReadConfigurationsForAgent(...)`, so a reader
+    entitled to the subject gets a populated **peer** read too. "It came back
+    populated, so that must have been my own row" does not follow — the axis
+    is the reader's entitlement, not self-vs-peer.
+  - ⛔ **On the company agent list the control is vacuous.** That handler
+    gates on `actorCanReadConfigurationsForCompany`; once that fails it
+    renders the viewer's own row with `redactAgentSecrets` **unconditionally**
+    and every other row restricted. A populated self row there is guaranteed
+    by the branch, and would look identical if the peer's column really were
+    empty — so it is not evidence either way. (The route is not grant-blind:
+    a company-scoped holder gets *every* row populated. It is the self row
+    that carries no information, and only on the restricted branch.)
+  - The two gates are scoped differently and can disagree for the same
+    reader: the detail route asks `agent_config:read` on the **agent**
+    resource, the list route asks it on the **company**. A holder of
+    `agents:suggest-changes` alone passes the first for a named subject and
+    fails the second (`PEN-5231`), so it reads a populated peer on
+    `/agents/:id` and `{}` for that same peer on the roster.
 - **Say which claims rest on telemetry.** `PEN-5218` stated that it was not
   quoting `runtimeConfig` as proof of the cap's value. That is what let the
   measurement stand on its own when the grant was refused, instead of the whole
