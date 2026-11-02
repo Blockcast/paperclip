@@ -133,12 +133,106 @@ test("arm 1: a file named ONLY in a whole-line comment is still unregistered", (
   assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
 });
 
-test("arm 1: an inline `#` inside a run block is shell, not a comment", () => {
-  // Only WHOLE-LINE comments are stripped; stripping inline `#` would discard
-  // real shell and make a registered file read as unregistered.
+test("arm 1: a path BEFORE an inline `#` is real shell and still registers", () => {
+  // The half of an inline-comment line that precedes the `#` is a command, so
+  // stripping the comment must not cost this registration. This is the
+  // fail-CLOSED direction of the PEN-5282 fix and the reason it is anchored at
+  // the `#` rather than dropping the whole line.
   assert.deepEqual(
     errorsFor(
       world({ workflows: ["        run: node --test scripts/a.test.mjs # pinned\n"] }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a file named only AFTER an inline `#` is a comment, not a run", () => {
+  // PEN-5282 shape 1, fail-OPEN before the fix: the command is `echo hi`, which
+  // runs nothing, yet the trailing path read as a registration. Reverting
+  // `stripInlineComment` fails here.
+  const errors = errorsFor(
+    world({ workflows: ["        run: echo hi # scripts/a.test.mjs\n"] }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: an inline `#` in a `run: |` BODY line is a comment too", () => {
+  // Same shape one level in. The body of a block scalar is shell, where `#`
+  // starts a comment exactly as it does on the inline form.
+  const errors = errorsFor(
+    world({
+      workflows: ["        run: |\n          echo hi # node --test scripts/a.test.mjs\n"],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a block indicator followed by a comment still opens a block", () => {
+  // `run: | # why` is legal YAML: the comment follows the indicator rather
+  // than replacing it. The indicator is therefore tested AFTER the comment is
+  // stripped, so the body is still slurped and still registers what it names.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: ["        run: | # see PEN-5272\n          node --test scripts/a.test.mjs\n"],
+      }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a `#` INSIDE a token is not a comment and truncates nothing", () => {
+  // The strip is anchored to a `#` at a word boundary, so an action pin, a URL
+  // fragment or a `--grep '#tag'` does not eat the rest of the command. A
+  // naive split on the first `#` would lose this registration.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: [
+          "        run: curl -sf https://example.test/a#frag && node --test scripts/a.test.mjs\n",
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a `run:` nested under `with:` is an action input, not a run step", () => {
+  // PEN-5282 shape 2, fail-OPEN before the fix. `run` here is an INPUT to the
+  // action; the action decides whether it is ever executed, and most never
+  // execute it as a shell command. Reverting the `withIndent` anchor fails here.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "jobs:\n  a:\n    steps:\n      - uses: some/action@v1\n        with:\n          run: node --test scripts/a.test.mjs\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a step-level `run:` still registers after a JOB-level `with:` closes", () => {
+  // The anchor is scoped to the enclosing `with:`, not latched for the rest of
+  // the file. This is the shape that makes the dedent clear load-bearing, and
+  // it is a real one: a reusable-workflow call puts `with:` at JOB indent (4),
+  // shallower than any step `run:` (8) in every job after it --
+  // `.github/workflows/release.yml` does exactly this, twice. Drop the clear
+  // and every `run:` body below the first such call is silently discarded.
+  //
+  // Note the sibling-step form (`with:` and `run:` at the SAME indent) does NOT
+  // exercise this: there `indent > withIndent` is already false, so it passes
+  // with or without the clear. It has to be a DEEPER `run:` after a shallower
+  // `with:` or the fixture is vacuous.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: [
+          "jobs:\n  verify:\n    uses: ./.github/workflows/release-verify.yml\n    with:\n      ref: main\n  unit:\n    steps:\n      - name: unit\n        run: node --test scripts/a.test.mjs\n",
+        ],
+      }),
     ),
     [],
   );

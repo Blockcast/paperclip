@@ -25,14 +25,15 @@
  * REACHABILITY, defined so the verdict is falsifiable. A file is reachable iff
  * its repo-relative path appears as a WHOLE COMMAND TOKEN in:
  *
- *   (a) the body of a `run:` step in some `.github/workflows/*.y{a,}ml`, with
- *       whole-line comments stripped; or
+ *   (a) the body of a `run:` STEP in some `.github/workflows/*.y{a,}ml`, with
+ *       comments stripped (whole-line and inline) and action `with:` inputs
+ *       excluded; or
  *   (b) the body of a root `package.json` script transitively reachable from
  *       one such `run:` body (`pnpm run X` / `pnpm X` / `npm run X` / `yarn X`).
  *
- * Three deliberate narrowings, each of which closes a way this guard could pass
- * a file CI never runs. All three were measured against the tree before being
- * adopted, and all three cost NOTHING: 131 of 131 reachable files satisfy the
+ * Four deliberate narrowings, each of which closes a way this guard could pass
+ * a file CI never runs. All four were measured against the tree before being
+ * adopted, and all four cost NOTHING: 131 of 131 reachable files satisfy the
  * strict form.
  *
  *   - WHOLE TOKEN, not substring. `text.includes(basename)` fails OPEN for any
@@ -47,9 +48,18 @@
  *   - `run:` BODIES ONLY, not whole workflow text. Otherwise `- name: Test
  *     foo.test.mjs` with `run: echo skipped` registers nothing and still reads
  *     as reachable. Only a command can run a test, so only commands count.
- *   - COMMENTS STRIPPED. A file named in a `#` comment is documented, not run,
- *     and being documented as runnable is PEN-5272's failure mode rather than
- *     an exception to it.
+ *   - COMMENTS STRIPPED, whole-line AND inline. A file named in a `#` comment
+ *     is documented, not run, and being documented as runnable is PEN-5272's
+ *     failure mode rather than an exception to it. `run: echo hi # scripts/a.
+ *     test.mjs` runs nothing, so the trailing path is not a registration; a
+ *     path BEFORE the `#` still is, because that half is real shell. Found by
+ *     Ally on PR #3275, fixed under PEN-5282.
+ *   - STEP COMMANDS ONLY, not action inputs. A `run:` nested under `with:` is
+ *     an INPUT to an action, not a shell command -- the action decides whether
+ *     it ever runs, and most never run it as one. A line-based scan cannot tell
+ *     the two apart by name, so it tells them apart by INDENT: a `run:` deeper
+ *     than the nearest enclosing `with:` is an input and is skipped. Also found
+ *     by Ally on PR #3275, fixed under PEN-5282.
  *
  * KNOWN CEILING, stated rather than buried. The match is LITERAL, so a runner
  * that builds a path dynamically reads as unregistered here; the one
@@ -60,6 +70,23 @@
  * from unreachable to reachable, so this guard can demand a registration that
  * a nested script already provides. The allowlist is the escape hatch for that,
  * and `reason` is where it gets said.
+ *
+ * The remaining ceiling is that this is a LINE-BASED SCAN, not a YAML parse, so
+ * `run:`, `with:` and `#` are recognised by shape rather than by structure. The
+ * one residual this is known to cost, verified by probe rather than reasoned
+ * about: a `#` inside a QUOTED shell string (`run: echo " # x" && node --test
+ * scripts/a.test.mjs`) is stripped as a comment and the real token after it is
+ * lost. That direction is the SAFE one, and is what licenses the blunt rule --
+ * it demands a registration that already exists, which is loud and fixable in
+ * one line, rather than passing a file CI never runs, which is the failure that
+ * is silent. No such line exists in the workflow set today.
+ *
+ * Closing it needs a real YAML parse plus shell-aware quoting, a larger
+ * instrument than the defect warrants; the measurement is what holds that
+ * decision honest instead. Re-run the guard after any change here -- it must
+ * still report every currently-reachable file as reachable. 133 candidates /
+ * 131 reachable / 2 allowlisted at the PEN-5282 commit, which is where each of
+ * the four narrowings above was measured to cost nothing.
  *
  * Reachability is NOT a claim that the test is any good, only that CI runs it.
  * PEN-5205 is an open defect in one of the files this guard now protects.
@@ -157,12 +184,32 @@ function trackedFiles(root) {
     .filter(Boolean);
 }
 
-/** Whole-line YAML comments only. An inline `#` inside a `run:` block is shell. */
+/** Whole-line YAML comments. Inline `#` is handled by `stripInlineComment`. */
 function stripCommentLines(text) {
   return text
     .split("\n")
     .filter((line) => !/^\s*#/.test(line))
     .join("\n");
+}
+
+/**
+ * Drop an inline comment: everything from a `#` that starts the line or follows
+ * whitespace. `run: echo hi # scripts/a.test.mjs` is a shell comment, and a
+ * file named only there is documented, not run -- the same failure mode as a
+ * whole-line comment, which is why both are stripped.
+ *
+ * Over-stripping is SAFE HERE and that is what licenses the blunt rule. The
+ * result is only ever membership-tested for file paths, so a token lost can
+ * make this guard STRICTER -- demand a registration that already exists, which
+ * is loud and immediately fixable -- but never LOOSER. It cannot pass a file CI
+ * never runs, which is the only direction that fails silently.
+ *
+ * Anchoring to `#` at a word boundary keeps a `#` INSIDE a token out of scope:
+ * a pinned `uses: ...@sha`, a URL fragment, a `--grep '#tag'`. Measured at the
+ * adopting commit: no `run:` body in the workflow set loses a token to this.
+ */
+function stripInlineComment(line) {
+  return line.replace(/(^|\s)#.*$/, "$1");
 }
 
 function invocationPattern(scriptName) {
@@ -196,18 +243,41 @@ function workflowInvokedScripts(scripts, workflowText) {
 }
 
 /**
- * The text of every `run:` step body. Only a command can run a test, so a
+ * The text of every `run:` STEP body. Only a command can run a test, so a
  * mention anywhere else in the YAML (a step `name:`, a `with:` input) is not a
  * registration. Handles both `run: <inline>` and `run: |` block scalars.
+ *
+ * Two shapes read as a step command and are not one. Both fail OPEN -- a file
+ * CI never runs reads as reachable -- so both are refused here:
+ *
+ *   - An inline `#` comment. `run: echo hi # scripts/a.test.mjs` runs nothing.
+ *     Stripped from every command line, inline and block-scalar body alike; a
+ *     path BEFORE the `#` still registers, because that half is real shell.
+ *   - A `run:` nested under `with:`. That is an ACTION INPUT, not a step
+ *     command -- the action decides whether it ever runs, and most do not run
+ *     it as a shell command at all. A line-based scan cannot tell the two
+ *     apart by name, so it is told apart by INDENT: a `run:` indented deeper
+ *     than the nearest enclosing `with:` is an input and is skipped.
  */
 export function runCommands(workflowSource) {
   const lines = stripCommentLines(workflowSource).split("\n");
   const out = [];
+  // Indent of the nearest enclosing `with:` block, or null outside one. A
+  // `run:` deeper than this is an action input rather than a step command.
+  let withIndent = null;
   for (let i = 0; i < lines.length; i += 1) {
+    const indent = lines[i].length - lines[i].trimStart().length;
+    if (lines[i].trim() !== "") {
+      if (withIndent !== null && indent <= withIndent) withIndent = null;
+      if (/^\s*with:\s*$/.test(lines[i])) {
+        withIndent = indent;
+        continue;
+      }
+    }
     const match = /^(\s*)-?\s*run:\s*(.*)$/.exec(lines[i]);
     if (!match) continue;
-    const indent = match[1].length;
-    const inline = match[2].trim();
+    if (withIndent !== null && indent > withIndent) continue;
+    const inline = stripInlineComment(match[2]).trim();
     if (inline !== "" && !/^[|>][-+]?\d*$/.test(inline)) {
       out.push(inline);
       continue;
@@ -215,7 +285,7 @@ export function runCommands(workflowSource) {
     for (let j = i + 1; j < lines.length; j += 1) {
       if (lines[j].trim() === "") continue;
       if (lines[j].length - lines[j].trimStart().length <= indent) break;
-      out.push(lines[j]);
+      out.push(stripInlineComment(lines[j]));
     }
   }
   return out.join("\n");
