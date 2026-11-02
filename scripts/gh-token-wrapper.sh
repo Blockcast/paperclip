@@ -222,12 +222,16 @@ refuse_api_ready() {
   done
 }
 
-# BLO-51471: the body above replaces GitHub's COMMIT_MESSAGES default, so a
+# BLO-51471: the body built in squash_merge_without_ai_trailers replaces GitHub's COMMIT_MESSAGES default, so a
 # functional trailer written only in a branch commit (the place the
 # values-drift and orphan-on-delete gates tell authors to put it) would never
 # reach the merge commit, and the gate passes on the PR but reds master. Carry
 # those trailers over from the PR's commits, once each. Fail closed like the
-# body fetch: a dropped ack reds master on every acked removal.
+# body fetch: a dropped ack reds master on every acked removal. An AI-identity
+# sign-off is dropped, not carried: carrying it would trip
+# refuse_if_ai_attribution_left on every body, caller-supplied or not.
+# ponytail: `pr view --json commits` reads at most 100 commits; a trailer only
+# in a later commit is lost. Page pulls/{n}/commits if PRs grow that long.
 FUNCTIONAL_TRAILER_RE='^[-*>[:blank:]]*(values-ack|orphan-ack|signed-off-by):'
 carry_commit_trailers() {
   if ! "${REAL_GH}" pr view ${selector:+"${selector}"} ${repo:+--repo "${repo}"} --json commits --jq '.commits[].messageBody' > "$1.commits"; then
@@ -235,7 +239,7 @@ carry_commit_trailers() {
     echo "gh-token-wrapper: could not read the PR commits to carry their values-ack/Orphan-Ack/Signed-off-by trailers into the squash message (BLO-51471); merge again" >&2
     exit 1
   fi
-  grep -iE "${FUNCTIONAL_TRAILER_RE}" "$1.commits" | sed 's/^[-*>[:blank:]]*//' | awk '!seen[$0]++' | while IFS= read -r t; do
+  grep -iE "${FUNCTIONAL_TRAILER_RE}" "$1.commits" | sed 's/^[-*>[:blank:]]*//' | { grep -viE "${AI_ATTRIBUTION_RE}" || true; } | awk '!seen[$0]++' | while IFS= read -r t; do
     grep -qFx -- "${t}" "$1" </dev/null || printf '%s\n' "${t}"
   done > "$1.carry"
   if [ -s "$1.carry" ]; then
