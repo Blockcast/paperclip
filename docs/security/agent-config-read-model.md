@@ -544,8 +544,17 @@ is the step at which a widening gets refused cheaply.
 > **Successor row: [`PEN-5228`](https://paperclip.blockcast.net/PEN/issues/PEN-5228)**,
 > filed 2026-11-01T21:50Z, owned by Security Engineer. Every "successor row"
 > reference in [Settled calls](#settled-calls) resolves here, and this is the
-> only place in this file the id appears — so if this question is ever
+> only *routing pointer* to that row in this file — so if this question is ever
 > re-routed again, one line changes and no reference goes stale behind it.
+> Elsewhere the id appears as a citation of what `PEN-5228` **ruled**. Those are
+> historical, they stay correct across a re-route, and they are not pointers —
+> which is why the one-line property holds despite them.
+>
+> (An earlier revision of this line claimed this was the only place the id
+> appeared in the file. That was false at the commit that introduced it, not
+> merely stale, and it was then repeated as a verified reading on the issue
+> thread. Do not restore it: a self-referential count is the one claim a file
+> promising *descriptive* in its Status line cannot make and keep.)
 
 `PEN-4775` deliberately changed only the self row,
 because that row is wrong under *either* answer to the policy question — the
