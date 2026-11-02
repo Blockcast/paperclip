@@ -154,6 +154,24 @@ export function validateBaseline(baseline) {
   if (baseline?.version !== 1) {
     problems.push(`baseline.version must be 1, got ${JSON.stringify(baseline?.version)}`);
   }
+  // The threshold knob. Unvalidated, a typo here ranks above critical and
+  // inverts severityRank's fail-closed behaviour into a fail-open: nothing
+  // would ever meet the threshold and every advisory would read as a notice.
+  const failSeverities = baseline?.failSeverities;
+  if (failSeverities !== undefined) {
+    if (!Array.isArray(failSeverities) || failSeverities.length === 0) {
+      problems.push("baseline.failSeverities must be a non-empty array when present");
+    } else {
+      for (const severity of failSeverities) {
+        if (!SEVERITY_ORDER.includes(severity)) {
+          problems.push(
+            `baseline.failSeverities contains ${JSON.stringify(severity)}, which is not one of ` +
+              SEVERITY_ORDER.join(", "),
+          );
+        }
+      }
+    }
+  }
   if (!Array.isArray(baseline?.entries)) {
     problems.push("baseline.entries must be an array");
     return problems;
@@ -199,9 +217,20 @@ export function validateBaseline(baseline) {
  * Returns { violations, notices } — violations fail the lane, notices do not.
  */
 export function evaluateAudit({ audit, baseline, now = new Date() }) {
-  const failFrom = severityRank(
-    baseline?.failSeverities?.[0] ?? DEFAULT_FAIL_SEVERITIES[0],
-  );
+  // MINIMUM rank, not element [0]. Taking [0] let a misordered
+  // `["critical","moderate"]` silently raise the bar to critical while reading
+  // as though moderate were still gated. The min is order-independent, so the
+  // array is a SET of gated severities and cannot be reordered into a weaker
+  // gate. validateBaseline additionally refuses any unrecognized member --
+  // without that, a typo ranks above critical (severityRank fails closed for
+  // advisories) and inverts into a fail-open HERE, where nothing would ever
+  // meet the threshold. Ally review of #3290 measured exactly that:
+  // `{failSeverities:["hgih"]}` validated clean and a live HIGH advisory with
+  // no baseline entry evaluated to zero violations.
+  const failSeverities = baseline?.failSeverities?.length
+    ? baseline.failSeverities
+    : DEFAULT_FAIL_SEVERITIES;
+  const failFrom = Math.min(...failSeverities.map(severityRank));
   const live = normalizeAudit(audit);
   const byKey = new Map(
     (baseline?.entries ?? []).map((entry) => [advisoryKey(entry.ghsa, entry.package), entry]),
@@ -233,7 +262,7 @@ export function evaluateAudit({ audit, baseline, now = new Date() }) {
         notices.push({
           kind: "below-threshold",
           key,
-          detail: `${advisory.ghsa} (${advisory.severity}) on ${advisory.package} is below the ${baseline?.failSeverities?.[0] ?? "moderate"} fail threshold; reported only.`,
+          detail: `${advisory.ghsa} (${advisory.severity}) on ${advisory.package} is below the ${SEVERITY_ORDER[failFrom]} fail threshold; reported only.`,
         });
       }
       continue;

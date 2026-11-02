@@ -32,10 +32,20 @@ export function extractViolations(report) {
 }
 
 export function buildAlert({ violations, runUrl, repo, now }) {
-  const lines = violations?.length ? violations : ['(violation list unavailable - see the run log)'];
+  // The lane fails for TWO unrelated reasons and they route to different
+  // people. Either it found an unaccounted advisory -- a triage task -- or it
+  // could not complete at all: registry unreachable, pnpm emitting an error
+  // document, a malformed baseline, normalizeAudit refusing an unrecognized
+  // shape. Failing closed on the second is right, but labelling it
+  // `DependencyAdvisoryUnaccounted` sends the on-call hunting for an advisory
+  // that was never reported. Raised by Ally on #3290.
+  const incomplete = !violations?.length;
+  const lines = incomplete
+    ? ['the lane did not produce a violation list - see the run log for why it could not complete']
+    : violations;
   return {
     labels: {
-      alertname: 'DependencyAdvisoryUnaccounted',
+      alertname: incomplete ? 'DependencyAuditIncomplete' : 'DependencyAdvisoryUnaccounted',
       severity: 'warning',
       namespace: 'paperclip',
       service: 'paperclip-dependency-audit',
@@ -43,7 +53,9 @@ export function buildAlert({ violations, runUrl, repo, now }) {
       branch: 'master',
     },
     annotations: {
-      summary: `${repo} master has a dependency advisory with no triage entry`,
+      summary: incomplete
+        ? `${repo} master dependency audit could not complete`
+        : `${repo} master has a dependency advisory with no triage entry`,
       description: lines.map((line) => `  - ${line}`).join('\n'),
       run_url: runUrl,
       runbook_url: 'https://github.com/Blockcast/paperclip/blob/master/runbooks/dependency-audit.md',

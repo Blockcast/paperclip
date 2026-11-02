@@ -459,6 +459,22 @@ export const EXEMPT_SCHEDULED_WORKFLOWS = [
       "also has no completion-gap history to derive a threshold from.",
   },
   {
+    workflow: "dependency-audit.yml",
+    reason:
+      "THE ONE EXEMPTION HERE THAT IS A REAL COVERAGE GAP, not a category exclusion -- PEN-5285 " +
+      "added it as a daily security guard, so unlike the three entries around it, it IS a guard " +
+      "and its silent stop genuinely goes unreported. It is exempt only because WATCHED_GUARDS " +
+      "requires a threshold derived from the guard's OWN measured completion-gap distribution and " +
+      "a workflow added yesterday has no legs to measure. Inventing one is precisely the PEN-3379 " +
+      "defect (a bar justified against the jitter ceiling alone shipped outside the admissible " +
+      "window and caught 1 of 6 outage legs instead of 5 of 6), and the alternative -- watching it " +
+      "from its first run, when it has no completed run yet -- is the born-red defect this file " +
+      "argues against everywhere else. Promote it once ~3-4 weeks of completions exist; note its " +
+      "DAILY cadence means the G-B > 60 sampling arithmetic must be redone against an hourly " +
+      "detector rather than read across from the hourly six, and that the honest outcome may be " +
+      "that no sound bar exists for a once-daily guard. Owned by PEN-5304.",
+  },
+  {
     workflow: "scheduled-guard-liveness.yml",
     reason:
       "This job itself. Surfaced by the BLO-42887 widening of the coverage invariant beyond the " +

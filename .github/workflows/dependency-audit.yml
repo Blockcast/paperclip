@@ -40,27 +40,35 @@ permissions:
 # reasoning, including the two criteria that were rejected, is in the header of
 # scripts/check-dependency-audit.mjs.
 #
-# NOT YET WATCHED BY scheduled-guard-liveness.yml. That registry requires a
-# threshold derived from a guard's OWN measured completion-gap distribution and
-# says so emphatically ("THRESHOLDS ARE MEASURED PER GUARD, NOT GUESSED AND NOT
-# SHARED"); this workflow has no history to derive one from. Registering it with
-# an invented number would reproduce the PEN-3379 defect inside a new guard. It
-# is tracked for registration once a few weeks of completions exist.
+# NOT YET WATCHED BY scheduled-guard-liveness.yml, and REGISTERED AS EXEMPT
+# rather than merely undiscussed. That registry requires a threshold derived
+# from a guard's OWN measured completion-gap distribution and says so
+# emphatically ("THRESHOLDS ARE MEASURED PER GUARD, NOT GUESSED AND NOT
+# SHARED"); this workflow has no history to derive one from, and an invented
+# number would reproduce the PEN-3379 defect inside a new guard. So it sits in
+# EXEMPT_SCHEDULED_WORKFLOWS with that reason and a named promotion condition —
+# machine-visible and reviewable, which a comment here would not be. Unlike the
+# other exempt entries this one IS a guard, so the exemption is a real and
+# temporary coverage gap, owned by PEN-5304.
 jobs:
   audit-master-dependencies:
     runs-on: arc-paperclip-light
-    timeout-minutes: 10
+    # 15m, not the 10m this first carried: the setup-pnpm wrapper's measured
+    # slow-success floor is 15m (MIN_TIMEOUT_MINUTES_FOR_RETRY, BLO-28813), and
+    # a budget under it turns a slow registry into a timeout instead of a retry.
+    timeout-minutes: 15
     steps:
       - name: Checkout master
         uses: actions/checkout@v5
         with:
           ref: master
 
+      # The retrying wrapper, not pnpm/action-setup directly. Only e2e.yml,
+      # refresh-lockfile.yml and release-smoke.yml are grandfathered at @v4;
+      # everything else goes through the wrapper so the registry fetch gets a
+      # retry (BLO-28813).
       - name: Setup pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 9.15.4
-          run_install: false
+        uses: ./.github/actions/setup-pnpm
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
