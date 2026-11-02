@@ -5,6 +5,9 @@ Status: **descriptive**. Every claim below was read out of
 commit that added this file, and the two live-seat readings in
 ["Measured confirmation"](#measured-confirmation) were taken against the
 Penstock instance on 2026-10-26. Nothing here is aspirational.
+This file is keyed in ten places to `Blockcast/paperclip#3244`, which is
+open. ["When `#3244` merges, this file is wrong in ten places"](#when-3244-merges-this-file-is-wrong-in-ten-places)
+enumerates them; a `grep` finds only seven.
 
 Code is cited **by symbol name, never by line number**. The first draft of
 this file carried line anchors and five of them did not point at what they
@@ -124,6 +127,58 @@ write*: company-wide for `agents:configure`, and one named subject for
 `agents:suggest-changes`. **That second half is the rule, not the tree**: on
 `master` the suggest tier reads company-wide (row 3b), and it narrows to one
 subject only once `#3244` lands (row 3b′).
+
+## When `#3244` merges, this file is wrong in ten places
+
+⚠️ Everything above about the suggest tier is keyed to a **pending PR**, and a
+merge is not an event this document can observe. Each claim below is correct
+today and becomes false the moment `Blockcast/paperclip#3244` lands. Whoever
+merges `#3244` owns this list; `PEN-5231` is the row that tracks it. It is
+written down here, rather than registered on a row, because the previous three
+wrong-tree claims in this file were all caught by a reader of the file.
+
+Sites are cited by **quoted phrase, not line number**, per the rule in the
+Status block.
+
+⛔ **`grep '3244'` does not find them all, and that is the trap.** Exactly
+**seven** of the ten sites carry the literal string; the other **three** do not,
+so a grep-driven sweep leaves them stale while reporting itself complete. They
+are marked ⛔ in the table: row **3b**'s own cells, the blockquote beginning
+*"Rows 3a and 3b are not the same authority"*, and the tree-identification note
+ending *"at the time of writing"*. The table below — not the grep — is the list.
+
+⚠️ No raw line count is quoted here on purpose: this section and the Status
+pointer both name `#3244` themselves, so any such number counts its own
+bookkeeping and was wrong the moment it was written. Seven-of-ten is a property
+of the sites, not of the file's current length.
+
+| Where | What it says today | What `#3244` makes it |
+| --- | --- | --- |
+| `Why "never a stored grant"…` blockquote | *"Today both of those reach every seat"*; *"open and unmerged — do not assume it"* | **false** — the suggest tier reaches one named subject |
+| allow-path table, row **3b** ⛔ no literal `3244` | `On master?` = `in effect`; *"today against either resource type"* | **false** — 3b becomes history, 3b′ is the live row |
+| allow-path table, rows **3b′** and **3c** | `On master?` = `pending — #3244` | **false** — both become `in effect` |
+| blockquote under that table ⛔ no literal `3244` | *"today the code treats them as one"* | **false** — the defect `PEN-5231` names is fixed |
+| the ⚠️ note after it | *"Rows 3b′ and 3c are NOT on `master` as of 2026-11-02"* | **false** |
+| tree-identification note ⛔ no literal `3244` | *"That is the state of `master` at the time of writing"* | survives (self-dated) but misleads — re-date it |
+| the takeaway paragraph | *"That second half is the rule, not the tree"* | **false** — rule and tree agree once it lands |
+| `Settled calls`, the `agents:suggest-changes` row | *"Today it is company-wide"*; *"but that is unmerged, so the refusal does not rest on it"* | **false** — ⚠️ the refusal itself is **unaffected**; only its second reason is |
+| the detail-route paragraph | *"that function does not exist on `master` today, so do not go looking for it"* | **false** — `actorCanReadConfigurationsForAgent` exists |
+| `Regression tests` | *"`grep -c PEN-5231` … **0** on `master` and **5** on the `#3244` branch"*; *"also arrives with `#3244`"* | **false** — the check stops discriminating; both trees read **5** |
+
+**One claim deliberately survives.** The residual note (*"The residual, once
+#3244 lands, is **named rather than closed**"*) is already written for the
+post-merge tree and needs only its tense: row 3b′ admits the *subject*, not the
+*diff*, before and after. Do not delete it as part of this sweep.
+
+⇒ **The direction of the error flips, and that is why this list exists.**
+Before `#3244`, this file's risk was **understating** the suggest tier's reach —
+the reassuring direction, and exactly what the review of `cbf89a9` caught. After
+an unattended merge every row above is wrong the other way: the file would
+describe a **wider** reach than the code has. That is the less dangerous
+direction (`Ceo`, `PEN-5228`, 2026-11-02) and still a defect — a read model that
+overstates a control routes readers away from a path that is in fact safe, and a
+file whose Status line promises *descriptive* keeps that promise or stops being
+worth citing.
 
 ## What does NOT imply it
 
