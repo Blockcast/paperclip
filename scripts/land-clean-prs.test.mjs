@@ -64,6 +64,8 @@ import {
   unsatisfiedOwners,
   codeownersPatternToRegExp,
   fetchCodeownerRules,
+  fetchMergeQueueEntries,
+  liveMergeQueueEntry,
   impliedOwners,
   isNotFoundGhError,
   ownersForFiles,
@@ -4075,5 +4077,348 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442 + 
       !argsOf(UNMEASURED_CALL, unreported).includes("starved"),
       "the probe SEES an unreported cohort",
     );
+  });
+});
+/**
+ * PEN-5279. A PR enqueued DIRECTLY — which is what a queue-enabled base
+ * produces once checks go green — carries `autoMergeRequest: null`. Verified
+ * live 2026-11-02 on five PRs sitting in `MQ_kwDOSc-KOc4AA6vt`: #3241, #3255,
+ * #3275, #3288 and #3268, every one of them with a null `autoMergeRequest`.
+ *
+ * The `already-enqueued` branch used to key on that field alone, so those PRs
+ * missed it, re-classified `enqueue` every fire, and spent a cap slot on a
+ * re-enqueue GitHub no-ops at exit 0.
+ */
+describe("merge-queue membership is read, not inferred from autoMergeRequest (PEN-5279)", () => {
+  const queued = (overrides = {}) => ({
+    position: 2,
+    state: "AWAITING_CHECKS",
+    enqueuedAt: "2026-09-13T11:00:00Z",
+    ...overrides,
+  });
+
+  it("reports a directly-enqueued PR as already-enqueued, with autoMergeRequest null", () => {
+    const row = classify({ autoMergeRequest: null, mergeQueueEntry: queued() });
+    assert.equal(row.action, "already-enqueued");
+    assert.match(row.reason, /queue position 2/);
+  });
+
+  it("decides it from the listing alone, so the PR never pays for checks and reviews", () => {
+    const row = classifyFromListing(
+      pr({ autoMergeRequest: null, mergeQueueEntry: queued() }),
+      { now: NOW },
+    );
+    assert.equal(row.action, "already-enqueued");
+  });
+
+  it(`reports a queue entry older than ${STALE_ENQUEUE_HOURS}h as stale-queued, not stale-enqueue`, () => {
+    // Its own action, because `stale-enqueue`'s remedy is `--disable-auto`,
+    // which on a directly-enqueued PR disarms nothing and would post a comment
+    // claiming a disarm that never happened.
+    const row = classify({ mergeQueueEntry: queued({ enqueuedAt: "2026-09-12T22:00:00Z" }) });
+    assert.equal(row.action, "stale-queued");
+  });
+
+  it("reads an unparseable enqueuedAt as fresh, matching the auto-merge clock", () => {
+    // Treating it as infinitely old would report a staleness finding the data
+    // does not support. Fresh leaves the PR alone, which is recoverable.
+    const row = classify({ mergeQueueEntry: queued({ enqueuedAt: "not-a-date" }) });
+    assert.equal(row.action, "already-enqueued");
+  });
+
+  it("still names the queue when the entry carries no position", () => {
+    const row = classify({ mergeQueueEntry: queued({ position: null }) });
+    assert.equal(row.action, "already-enqueued");
+    assert.match(row.reason, /in merge queue/);
+  });
+
+  it("is NOT keyed on mergeStateStatus, which flaps under load", () => {
+    // Measured 2026-11-02: #3241/#3255 read CLEAN while queued at 09:0xZ and
+    // UNKNOWN at 09:2xZ; #3275/#3288 read UNKNOWN while queued at 23:3xZ. The
+    // verdict must not move with it.
+    for (const mergeStateStatus of ["CLEAN", "UNKNOWN", "BLOCKED"]) {
+      const row = classify({ mergeStateStatus, mergeQueueEntry: queued() });
+      assert.equal(row.action, "already-enqueued");
+    }
+  });
+
+  it("leaves a PR that is in no queue exactly as it was", () => {
+    // The whole fix must be inert on the common case.
+    const withField = classify({ mergeQueueEntry: null, mergeStateStatus: "CLEAN" });
+    const without = classify({ mergeStateStatus: "CLEAN" });
+    assert.equal(withField.action, "enqueue");
+    assert.deepEqual(withField, without);
+  });
+});
+
+/**
+ * PEN-5279 done-when 2. The cap exists to be a ceiling on work actually
+ * requested; spending it on PRs already in the queue starves the PRs that need
+ * it, and does so hardest exactly when the queue is deepest.
+ */
+describe("a queued PR does not consume a per-fire enqueue slot (PEN-5279)", () => {
+  it("spends no slot, leaving the whole budget for PRs that need enqueuing", () => {
+    const queuedPrs = Array.from({ length: MAX_ENQUEUES_PER_FIRE }, (_, i) =>
+      pr({
+        number: 100 + i,
+        mergeStateStatus: "CLEAN",
+        mergeQueueEntry: { position: i + 1, state: "QUEUED", enqueuedAt: "2026-09-13T11:00:00Z" },
+      }),
+    );
+    const needsEnqueue = pr({ number: 999, mergeStateStatus: "CLEAN" });
+
+    const rows = classifyAll([...queuedPrs, needsEnqueue], { now: NOW });
+
+    assert.equal(rows.filter((r) => r.action === "already-enqueued").length, MAX_ENQUEUES_PER_FIRE);
+    // Before the fix every one of those classified `enqueue`, exhausting the
+    // budget and rewriting this last row to `skip`/`cap:`.
+    const last = rows.at(-1);
+    assert.equal(last.action, "enqueue");
+    assert.equal(rows.filter((r) => r.action === "enqueue").length, 1);
+  });
+
+  it("is excluded from the unlanded-eligible cohort rather than alarming on it", () => {
+    // `unlandedEligible`'s predicate is `action !== "enqueue"`, so a queued PR
+    // used to be INSIDE the cohort — and `--alarm` exits non-zero on a
+    // non-empty one.
+    const queuedPr = pr({
+      number: 42,
+      mergeStateStatus: "CLEAN",
+      mergeQueueEntry: { position: 1, state: "QUEUED", enqueuedAt: "2026-09-13T11:00:00Z" },
+      statusCheckRollup: [
+        { name: "verify", conclusion: "SUCCESS", completedAt: "2026-09-10T05:00:00Z" },
+      ],
+    });
+    const rows = classifyAll([queuedPr], { now: NOW });
+    assert.equal(rows[0].action, "already-enqueued");
+    assert.deepEqual(unlandedEligible([queuedPr], rows, { now: NOW }), []);
+  });
+});
+
+/**
+ * PEN-5279. `fetchMergeQueueEntries` has the same two-valued contract as
+ * `fetchCodeownerRules` and the same reason for it: an empty Map is the
+ * measured "nothing is queued here", `null` is UNREAD.
+ *
+ * The directions are asymmetric and only one of them is dangerous. A `null`
+ * degrades to the pre-PEN-5279 behaviour — one wasted no-op enqueue and one
+ * wasted cap slot. A Map that is merely INCOMPLETE claims a PR is not queued
+ * when it is, which classifies it `enqueue`... which is also the old
+ * behaviour. The genuinely unsafe direction is the reverse — claiming a PR IS
+ * queued when it is not, since `already-enqueued` is in `NON_HOLD_ACTIONS` and
+ * carved out of `unlandedEligible`, so nothing would ever age it.
+ */
+describe("fetchMergeQueueEntries keeps 'unread' distinguishable from 'empty' (PEN-5279)", () => {
+  function ghError(stderr) {
+    return Object.assign(new Error("Command failed"), { stderr: Buffer.from(stderr) });
+  }
+
+  const page = (nodes, { hasNextPage = false, endCursor = null } = {}) =>
+    JSON.stringify({
+      data: {
+        repository: { mergeQueue: { entries: { pageInfo: { hasNextPage, endCursor }, nodes } } },
+      },
+    });
+
+  const entry = (number, position) => ({
+    position,
+    state: "QUEUED",
+    enqueuedAt: "2026-09-13T11:00:00Z",
+    pullRequest: { number },
+  });
+
+  it("maps the queue by PR number", () => {
+    const queue = fetchMergeQueueEntries("Blockcast/paperclip", "master", () =>
+      page([entry(3275, 1), entry(3288, 2)]),
+    );
+    assert.equal(queue.size, 2);
+    assert.equal(queue.get(3288).position, 2);
+    assert.equal(queue.get(9999), undefined);
+  });
+
+  it("returns an EMPTY map, not null, for a branch with no queue configured", () => {
+    // `mergeQueue(branch:)` answers null for an unqueued branch. Verified live
+    // 2026-11-02. That is a measurement: no PR on this base is queued.
+    const queue = fetchMergeQueueEntries("Blockcast/paperclip", "some-branch", () =>
+      JSON.stringify({ data: { repository: { mergeQueue: null } } }),
+    );
+    assert.equal(queue.size, 0);
+    assert.notEqual(queue, null);
+  });
+
+  it("returns null when the read throws", () => {
+    assert.equal(
+      fetchMergeQueueEntries("Blockcast/paperclip", "master", () => {
+        throw ghError("gh: Internal Server Error (HTTP 500)\n");
+      }),
+      null,
+    );
+  });
+
+  it("returns null on a GraphQL 200 that carries errors", () => {
+    // A 200 with a null payload and an `errors` array is an unread queue, not
+    // an empty one.
+    assert.equal(
+      fetchMergeQueueEntries("Blockcast/paperclip", "master", () =>
+        JSON.stringify({ data: { repository: null }, errors: [{ message: "RATE_LIMITED" }] }),
+      ),
+      null,
+    );
+  });
+
+  it("returns null rather than a PREFIX when the page budget runs out", () => {
+    // A truncated queue is a Map whose absent entries are indistinguishable
+    // from "not queued". Hand back nothing rather than a partial answer.
+    let calls = 0;
+    const queue = fetchMergeQueueEntries("Blockcast/paperclip", "master", () => {
+      calls += 1;
+      return page([entry(calls, calls)], { hasNextPage: true, endCursor: `c${calls}` });
+    });
+    assert.equal(queue, null);
+    assert.ok(calls > 1 && calls <= 10, `paged ${calls} times, expected a bounded loop`);
+  });
+
+  it("returns null when hasNextPage is set but no cursor follows it", () => {
+    assert.equal(
+      fetchMergeQueueEntries("Blockcast/paperclip", "master", () =>
+        page([entry(1, 1)], { hasNextPage: true, endCursor: null }),
+      ),
+      null,
+    );
+  });
+
+  it("follows the cursor and accumulates across pages", () => {
+    const pages = [
+      page([entry(1, 1)], { hasNextPage: true, endCursor: "c1" }),
+      page([entry(2, 2)]),
+    ];
+    const seen = [];
+    const queue = fetchMergeQueueEntries("Blockcast/paperclip", "master", (args) => {
+      seen.push(args.join(" "));
+      return pages.shift();
+    });
+    assert.equal(queue.size, 2);
+    assert.match(seen[1], /cursor=c1/);
+  });
+
+  it("returns null for a malformed repo slug rather than querying nonsense", () => {
+    assert.equal(fetchMergeQueueEntries("not-a-slug", "master", () => assert.fail("queried")), null);
+    assert.equal(
+      fetchMergeQueueEntries("Blockcast/paperclip", "", () => assert.fail("queried")),
+      null,
+    );
+  });
+});
+
+/**
+ * PEN-5279 done-when 4. The bulk queue read happens once at the top of the
+ * fire; something else can enqueue the PR before `applyRow` reaches it.
+ * GitHub answers the re-enqueue `! Pull request #N is already queued to merge`
+ * at EXIT 0, so nothing throws and the row keeps its `enqueue` action — which
+ * is the predicate BOTH `sweepRepos`'s cap and `unlandedEligible` key on.
+ */
+describe("applyRow does not spend a slot re-enqueuing a queued PR (PEN-5279)", () => {
+  const enqueueRow = () => ({
+    number: 1418,
+    headSha: HEAD,
+    action: "enqueue",
+    reason: "mergestate:CLEAN",
+    detail: null,
+  });
+
+  /** Answers the head re-read, the queue probe, and records every call. */
+  function runner({ queued }, calls = []) {
+    return (args) => {
+      calls.push(args.join(" "));
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ headRefOid: HEAD });
+      if (args[0] === "api" && args[1] === "graphql") {
+        return JSON.stringify({
+          data: { repository: { pullRequest: { mergeQueueEntry: queued } } },
+        });
+      }
+      return "";
+    };
+  }
+
+  it("renames the row to already-enqueued instead of re-issuing the merge", () => {
+    const calls = [];
+    const row = enqueueRow();
+    applyRow("Blockcast/paperclip", row, runner({ queued: { position: 3 } }, calls));
+
+    assert.equal(row.action, "already-enqueued");
+    assert.match(row.detail, /queue position 3/);
+    // The accounting is the point: `sweepRepos` counts `enqueue` rows.
+    assert.equal([row].filter((r) => r.action === "enqueue").length, 0);
+    assert.ok(
+      !calls.some((c) => c.startsWith("pr merge")),
+      `expected no merge call, got: ${calls.join(" | ")}`,
+    );
+  });
+
+  it("enqueues normally when the PR is not in the queue", () => {
+    const calls = [];
+    const row = enqueueRow();
+    const outcome = applyRow("Blockcast/paperclip", row, runner({ queued: null }, calls));
+
+    assert.equal(row.action, "enqueue");
+    assert.equal(outcome, "merge requested");
+    assert.ok(calls.some((c) => c.startsWith("pr merge")));
+  });
+
+  it("enqueues when the queue probe fails — an unreadable probe must not hold a PR", () => {
+    // The opposite of `fetchMergeQueueEntries`'s contract, deliberately: here
+    // `null` means "go ahead", so a failed probe costs one wasted no-op rather
+    // than stranding a PR nothing has enqueued.
+    const calls = [];
+    const row = enqueueRow();
+    applyRow("Blockcast/paperclip", row, (args) => {
+      calls.push(args.join(" "));
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ headRefOid: HEAD });
+      if (args[0] === "api") throw new Error("graphql exploded");
+      return "";
+    });
+
+    assert.equal(row.action, "enqueue");
+    assert.ok(calls.some((c) => c.startsWith("pr merge")));
+  });
+
+  it("still fails closed on a moved head, before the queue is ever probed", () => {
+    // PEN-4887's guard must keep precedence: a head that moved invalidates
+    // every verdict in the row, queued or not.
+    assert.throws(
+      () =>
+        applyRow("Blockcast/paperclip", enqueueRow(), (args) =>
+          args[1] === "view" ? JSON.stringify({ headRefOid: OTHER }) : "",
+        ),
+      /head moved since classification/,
+    );
+  });
+});
+
+/** PEN-5279: `liveMergeQueueEntry` answers "not queued" on anything it could not read. */
+describe("liveMergeQueueEntry fails toward enqueuing (PEN-5279)", () => {
+  it("returns the entry when GitHub reports one", () => {
+    const entry = liveMergeQueueEntry("Blockcast/paperclip", 3275, () =>
+      JSON.stringify({
+        data: { repository: { pullRequest: { mergeQueueEntry: { position: 1 } } } },
+      }),
+    );
+    assert.equal(entry.position, 1);
+  });
+
+  it("returns null on a throw, on GraphQL errors, and on a malformed slug", () => {
+    assert.equal(
+      liveMergeQueueEntry("Blockcast/paperclip", 1, () => {
+        throw new Error("boom");
+      }),
+      null,
+    );
+    assert.equal(
+      liveMergeQueueEntry("Blockcast/paperclip", 1, () =>
+        JSON.stringify({ data: null, errors: [{ message: "RATE_LIMITED" }] }),
+      ),
+      null,
+    );
+    assert.equal(liveMergeQueueEntry("nope", 1, () => assert.fail("queried")), null);
   });
 });
