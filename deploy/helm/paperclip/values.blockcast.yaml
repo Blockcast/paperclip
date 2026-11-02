@@ -159,8 +159,21 @@ env:
     # user-authored PR URL. The compatibility code (#1604, 7abd6d3a0) is an
     # ancestor of the deployed commit on both the API Deployment and the
     # StatefulSet, so every pod now runs it and the guard is enabled.
-    # Flip the VALUE, never remove the var: the live admission policy pins an
-    # exact container env-list length, so a removal is inadmissible.
+    # Flip the VALUE rather than removing the var -- but NOT because removal is
+    # inadmissible. It is admissible, and the claim that it is not was wrong
+    # (PEN-5223). ValidatingAdmissionPolicy/paperclip-core-service-routing
+    # validation 3 (`isCanonicalApiEnvContract`) applies no `.size()` to
+    # `c.env`: it requires each of its 52 protected names exactly once,
+    # restricts `valueFrom` to 11 secret-bound names, and otherwise admits
+    # anything `PAPERCLIP_`-prefixed. This var is not one of the protected
+    # names, so the policy neither requires nor forbids it. The policy's own
+    # denial message says as much: "Additive PAPERCLIP_-prefixed plain-value
+    # env vars are ALLOWED and are never the cause of this denial (BLO-27506)
+    # -- do not start by counting env vars."
+    #
+    # Keep it present anyway, for a reason the policy has nothing to do with:
+    # a documented knob parked at "false" beats a knob a future reader has to
+    # rediscover. tests/pr-review-rollout.test.mjs pins both value and presence.
     - name: PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD
       value: "false"
     # Designated Dependabot remediation agent (Release Engineer). The
@@ -429,6 +442,37 @@ env:
       value: "100"
     - name: PAPERCLIP_ISOLATION_WORKSPACE_REAPER_INTERVAL_MINUTES
       value: "720"
+
+    # PEN-5223 box 4 -- a TIME-BOXED diagnostic, not a standing behaviour.
+    # Turn this back to "false" once a plan is captured (box 5).
+    #
+    # When a `/api/issues` list query is cancelled by the 30s statement_timeout
+    # (57014), the server asks the planner for that exact statement's plan with
+    # `EXPLAIN` -- never `EXPLAIN ANALYZE`, which would re-execute a query that
+    # already burned 30s -- and logs the plan. This is the one artifact PEN-3596
+    # box 1 has wanted since 2026-10-30 and that nothing else can produce:
+    # `auto_explain` STRUCTURALLY cannot see a timed-out statement, because its
+    # only emit site is reached through `ExecutorEnd`, which `PortalCleanup`
+    # skips for a PORTAL_FAILED portal ("we skip this during error abort"), and
+    # PG18 ships no `pg_log_query_plan()`.
+    #
+    # Bounded three ways, so leaving it on by accident is cheap rather than
+    # dangerous: default-off in code, at most 5 captures per process, and its
+    # own `SET LOCAL statement_timeout` well under the 30s the statement just
+    # exhausted. Failure is swallowed -- the tenant already has its 503 and a
+    # diagnostic must not add a second fault on the error path.
+    #
+    # `env.extra` renders on BOTH tiers (deployment-api.yaml and
+    # statefulset.yaml), so the capture log line lands on whichever pod served
+    # the 57014: check every API replica, not just one.
+    #
+    # Admissible as an ordinary values change: `PAPERCLIP_`-prefixed with a
+    # plain value, which the admission policy explicitly allows (see the note on
+    # PAPERCLIP_DISABLE_PR_REVIEW_DUPLICATE_GUARD above). A future flag that is
+    # NOT `PAPERCLIP_`-prefixed, or that needs `valueFrom`, is a reviewed policy
+    # change in onprem-k8s instead -- so keep flags `PAPERCLIP_`-prefixed.
+    - name: PAPERCLIP_EXPLAIN_TIMED_OUT_ISSUE_LIST
+      value: "true"
 
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough

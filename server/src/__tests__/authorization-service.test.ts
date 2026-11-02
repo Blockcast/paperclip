@@ -265,7 +265,10 @@ describeEmbeddedPostgres("authorization service", () => {
     expect(decision.explanation).toContain("Allowed by explicit grant tasks:assign");
   });
 
-  it("allows suggest grants to read peer agent configuration", async () => {
+  it("allows suggest grants to read ONE NAMED peer agent's configuration", async () => {
+    // PEN-5231: the `agent` resource is load-bearing, not incidental. The
+    // suggest tier is the consented-diff tier, so it reads the subject it is
+    // diffing. The company-wide form of the same read is refused below.
     const company = await createCompany(db, "AgentReadGrant");
     const actorAgent = await createAgent(db, company.id);
     const targetAgent = await createAgent(db, company.id);
@@ -286,6 +289,90 @@ describeEmbeddedPostgres("authorization service", () => {
         permissionKey: "agents:suggest-changes",
       },
     });
+  });
+
+  it("refuses a suggest-only grant the company-wide agent configuration read (PEN-5231)", async () => {
+    // The regression this row exists for. `agents:suggest-changes` writes
+    // only through an accepted consent record bound to named target keys and
+    // to a run; before PEN-5231 it nonetheless bought an unconditional
+    // company-wide config READ — read authority strictly exceeding its own
+    // write authority, which is the divergence the PEN-3206 §5 test condemns.
+    //
+    // The `company` resource is what the BULK routes pass
+    // (`GET /companies/:id/agent-configurations`, the company agent roster,
+    // and the approval/issue `includeAgentConfig` projection), so refusing it
+    // here is what removes "every agent's config in one call" from the tier.
+    const company = await createCompany(db, "AgentReadGrantCompanyWide");
+    const actorAgent = await createAgent(db, company.id);
+    await grantAgentPermission(db, company.id, actorAgent.id, "agents:suggest-changes");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "agent_config:read",
+      resource: { type: "company", companyId: company.id },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reason: "deny_scope",
+      grant: {
+        principalType: "agent",
+        principalId: actorAgent.id,
+        permissionKey: "agents:suggest-changes",
+      },
+    });
+    expect(decision.explanation).toContain("one named agent");
+  });
+
+  it("keeps the company-wide agent configuration read for agents:configure (PEN-5231)", async () => {
+    // The direct tier is deliberately untouched: its read and its write are
+    // both company-reaching, so it is symmetric on the §5 test and PEN-5228
+    // ruled it correct as-is. This pins that the narrowing above is
+    // tier-specific rather than a blanket company-resource refusal.
+    const company = await createCompany(db, "AgentConfigureCompanyWide");
+    const actorAgent = await createAgent(db, company.id);
+    await grantAgentPermission(db, company.id, actorAgent.id, "agents:configure");
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "agent_config:read",
+      resource: { type: "company", companyId: company.id },
+    });
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reason: "allow_explicit_grant",
+      grant: { permissionKey: "agents:configure" },
+    });
+  });
+
+  it("reaches allow_self for an own-config read once the resource names the subject (PEN-5231)", async () => {
+    // The `{type:"company"}` resource on the read call sites made the
+    // `allow_self` branch in `decideBase` structurally unreachable, because
+    // that branch tests `resource.type === "agent" && resource.agentId ===
+    // actorAgentId`. Self-read survived only because `GET /api/agents/:id`
+    // short-circuits with `canReadSensitiveDetail = isSelf ? true : ...`
+    // BEFORE consulting the policy engine — the same root cause as the
+    // PEN-4775 list-route self-row drop. Subject-scoping the call sites makes
+    // the branch reachable, so the engine no longer depends on a route-layer
+    // short-circuit to answer an agent about itself.
+    const company = await createCompany(db, "AgentReadSelfNoGrant");
+    const actorAgent = await createAgent(db, company.id);
+    await db.insert(companyMemberships).values({
+      companyId: company.id,
+      principalType: "agent",
+      principalId: actorAgent.id,
+      status: "active",
+      membershipRole: "member",
+    });
+
+    const decision = await authorizationService(db).decide({
+      actor: { type: "agent", agentId: actorAgent.id, companyId: company.id, source: "agent_key" },
+      action: "agent_config:read",
+      resource: { type: "agent", companyId: company.id, agentId: actorAgent.id },
+    });
+
+    expect(decision).toMatchObject({ allowed: true, reason: "allow_self" });
   });
 
   it("falls back to the direct config-read grant decision when a suggest read grant is scoped away", async () => {

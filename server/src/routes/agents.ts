@@ -977,7 +977,11 @@ export function agentRoutes(
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
-  async function assertCanReadConfigurations(req: Request, companyId: string) {
+  async function assertCanReadConfigurations(
+    req: Request,
+    companyId: string,
+    subjectAgentId?: string | null,
+  ) {
     // Reading agent configurations, skills, and config revisions is a
     // read-only operation available to any board (human) member of the
     // company. Responses go through `redactAgentConfiguration` so secrets
@@ -987,12 +991,39 @@ export function agentRoutes(
     // For AGENT actors we keep a stricter gate: an agent must have either
     // agents:configure or agents:suggest-changes before it can inspect peer
     // agent configuration for a proposed diff.
+    //
+    // PEN-5231: pass `subjectAgentId` whenever the route names ONE agent.
+    // The two grants that reach this action are not interchangeable — the
+    // suggest tier is admitted against a named subject and refused against a
+    // `company` resource, because its write is consent-gated and target-key
+    // bound (see `decideWithAgentConfigReadGrant`). Omitting the subject on a
+    // single-agent route therefore buys the caller the WIDER company-wide
+    // test, which is the stricter answer for the suggest tier and the same
+    // answer for `agents:configure`.
+    //
+    // Naming the subject also makes `allow_self` reachable — it is structurally
+    // unreachable on a `company` resource, because that branch tests
+    // `resource.type === "agent" && resource.agentId === actorAgentId`. That is
+    // a read WIDENING for a grantless actor on its own row, so it is a decision
+    // per route, not a mechanical substitution:
+    //
+    //   - `/agents/:id`, `/agents/:id/configuration`, `/agents/:id/skills`
+    //     pass the subject. Self-disclosure is inert (the current config is
+    //     already returned by `GET /api/agents/:id` through
+    //     `redactAgentSecrets`; the skill list is already in the actor's own
+    //     prompt), and `/skills` additionally has a live suggest-tier caller.
+    //   - the two `/config-revisions` routes deliberately do NOT. Config
+    //     history is not reachable from any other self route, so naming the
+    //     subject there would be a genuine widening, and `redactConfigRevision`
+    //     spreads rather than enumerates. See those call sites.
     assertCompanyAccess(req, companyId);
     if (req.actor.type === "agent") {
       const decision = await access.decide({
         actor: req.actor,
         action: "agent_config:read",
-        resource: { type: "company", companyId },
+        resource: subjectAgentId
+          ? { type: "agent", companyId, agentId: subjectAgentId }
+          : { type: "company", companyId },
       });
       if (!decision.allowed) {
         throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
@@ -1016,6 +1047,36 @@ export function agentRoutes(
     // throwing. Board actors only need company access; agent actors must pass
     // the agent configuration read grant ladder so peer agents cannot snoop
     // each others' configurations.
+    //
+    // PEN-5231: deliberately COMPANY-scoped. Its one remaining caller is the
+    // company agent roster, which answers for every seat at once, so the
+    // company resource is the honest question there — and it is the question
+    // the suggest tier is now refused. Single-agent callers want
+    // `actorCanReadConfigurationsForAgent` below.
+    return actorCanReadAgentConfigForResource(req, companyId, null);
+  }
+
+  /**
+   * The single-subject form of the test above (PEN-5231).
+   *
+   * A holder of `agents:suggest-changes` alone passes this for a named agent
+   * and fails `actorCanReadConfigurationsForCompany`, because its write tier
+   * is bound to a consented diff against one subject. A holder of
+   * `agents:configure` passes both, unchanged.
+   */
+  async function actorCanReadConfigurationsForAgent(
+    req: Request,
+    companyId: string,
+    subjectAgentId: string,
+  ) {
+    return actorCanReadAgentConfigForResource(req, companyId, subjectAgentId);
+  }
+
+  async function actorCanReadAgentConfigForResource(
+    req: Request,
+    companyId: string,
+    subjectAgentId: string | null,
+  ) {
     try {
       assertCompanyAccess(req, companyId);
     } catch {
@@ -1025,7 +1086,9 @@ export function agentRoutes(
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:read",
-      resource: { type: "company", companyId },
+      resource: subjectAgentId
+        ? { type: "agent", companyId, agentId: subjectAgentId }
+        : { type: "company", companyId },
     });
     return decision.allowed;
   }
@@ -1117,7 +1180,7 @@ export function agentRoutes(
     }
     assertCompanyAccess(req, targetAgent.companyId);
     if (req.actor.type === "board") {
-      await assertCanReadConfigurations(req, targetAgent.companyId);
+      await assertCanReadConfigurations(req, targetAgent.companyId, targetAgent.id);
       return;
     }
     if (!req.actor.agentId) throw forbidden("Agent authentication required");
@@ -2524,7 +2587,19 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
+    // SUBJECT-scoped, and this one has a concrete diff-prep reason the
+    // revision routes above do not (PEN-5231, PEN-5228 ruling §B).
+    //
+    // `reflection-coach` is the ONLY principal granted `agents:suggest-changes`
+    // anywhere in this repo's defaults (`BUILT_IN_AGENT_DEFAULT_GRANTS`), and
+    // step 1 of its bundled skill calls exactly this route on the agent it is
+    // about to propose a diff for. Putting this back on a `company` resource
+    // would hand that shipped workflow a 403 on its first request — i.e. it
+    // would break the one caller the suggest tier exists to serve.
+    //
+    // The `allow_self` consequence here is inert: the material is the actor's
+    // own assigned skill list, which it already carries in its own prompt.
+    await assertCanReadConfigurations(req, agent.companyId, agent.id);
 
     const adapter = findActiveServerAdapter(agent.adapterType);
     if (!adapter?.listSkills) {
@@ -2809,6 +2884,11 @@ export function agentRoutes(
 
   router.get("/companies/:companyId/agent-configurations", async (req, res) => {
     const companyId = req.params.companyId as string;
+    // Deliberately company-scoped (PEN-5231): this route answers with EVERY
+    // agent's configuration in one response, so there is no single subject to
+    // name and the company resource is the honest question. It is also the
+    // sharpest form of the exposure this row closes — a suggest-tier holder is
+    // now refused here (`deny_scope`) and must read a named agent instead.
     await assertCanReadConfigurations(req, companyId);
     const rows = await svc.list(companyId);
     res.json(rows.map((row) => redactAgentConfiguration(row)));
@@ -3036,7 +3116,7 @@ export function agentRoutes(
     }
     const canReadSensitiveDetail = isSelf
       ? true
-      : await actorCanReadConfigurationsForCompany(req, agent.companyId);
+      : await actorCanReadConfigurationsForAgent(req, agent.companyId, agent.id);
     if (!canReadSensitiveDetail) {
       res.json(await buildAgentDetail(agent, { restricted: true }));
       return;
@@ -3051,7 +3131,7 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
-    await assertCanReadConfigurations(req, agent.companyId);
+    await assertCanReadConfigurations(req, agent.companyId, agent.id);
     res.json(redactAgentConfiguration(agent));
   });
 
@@ -3062,6 +3142,25 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
+    // Deliberately COMPANY-scoped, unlike its `/configuration` sibling one
+    // route up (PEN-5231, per the PEN-5228 ruling §B option 1).
+    //
+    // Naming the subject here would make `allow_self` reachable, and config
+    // HISTORY is the one object class on these routes that a grantless agent
+    // genuinely could not already read: `GET /api/agents/:id` returns the
+    // current config under every projection but never a revision, so this
+    // would be a real 403 -> 200 widening rather than the inert one on
+    // `/configuration`. Keeping the company resource preserves the whole
+    // narrowing — it is exactly the question the suggest tier is now refused
+    // (`deny_scope`) — while leaving grantless self at 403 as before.
+    //
+    // Second reason, and the one that outlives this row: `redactConfigRevision`
+    // SPREADS `...revision` and masks only `beforeConfig` / `afterConfig`, so
+    // every other column ships verbatim and any future column on
+    // `agent_config_revisions` ships to this caller set BY DEFAULT. That is the
+    // opposite polarity to `redactAgentConfiguration`, which enumerates. Do not
+    // widen the readership of a spread-based projection without changing it to
+    // an enumerated one first.
     await assertCanReadConfigurations(req, agent.companyId);
     const revisions = await svc.listConfigRevisions(id);
     res.json(revisions.map((revision) => redactConfigRevision(revision)));
@@ -3075,6 +3174,8 @@ export function agentRoutes(
       res.status(404).json({ error: "Agent not found" });
       return;
     }
+    // COMPANY-scoped for the same reason as the list route above — same object
+    // class, same spread-based projection, same decision (PEN-5231).
     await assertCanReadConfigurations(req, agent.companyId);
     const revision = await svc.getConfigRevision(id, revisionId);
     if (!revision) {

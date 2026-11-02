@@ -2081,13 +2081,24 @@ describe.sequential("agent permission routes", () => {
       expect(res.status).toBe(403);
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
         action: "agent_config:read",
-        resource: { type: "company", companyId },
+        resource: { type: "agent", companyId, agentId: peerAgentId },
       }));
     });
 
-    it("allows an agent actor with agents:suggest-changes grant to read peer config", async () => {
+    it("asks the SUBJECT-SCOPED question for a suggest-tier peer config read", async () => {
       // Suggest-tier authority implies read access so the agent can prepare a
-      // consented diff without receiving direct change authority.
+      // consented diff without receiving direct change authority — but only
+      // for the subject it is diffing (PEN-5231). The route must therefore
+      // name that subject in the resource; passing `{type:"company"}` here
+      // would buy the caller the WIDER company-wide test, which this tier is
+      // now refused (`deny_scope`) because its write is consent-gated and
+      // target-key bound while that read would not be.
+      //
+      // This case previously asserted `{type:"company"}` and its comment
+      // described a scope the code did not implement, which is what made the
+      // gap read as deliberate to the next reader. The engine-level proof that
+      // the two resources now diverge lives in authorization-service.test.ts;
+      // this one pins only that the route asks the narrower question.
       const peerAgentId = "44444444-4444-4444-8444-444444444444";
       const peerAgent = { ...baseAgent, id: peerAgentId };
       mockAgentService.getById.mockImplementation(async (id: string) => {
@@ -2120,6 +2131,174 @@ describe.sequential("agent permission routes", () => {
       const res = await request(app).get(`/api/agents/${peerAgentId}/configuration`);
 
       expect(res.status).toBe(200);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+      }));
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "company", companyId },
+      }));
+    });
+
+    it("names the actor itself as the subject on a self configuration read (PEN-5231)", async () => {
+      // Consequence of subject-scoping, recorded deliberately rather than left
+      // to be discovered. `allow_self` was structurally UNREACHABLE on this
+      // route while it passed `{type:"company"}`, so a grantless agent got 403
+      // reading its OWN configuration here — while `GET /api/agents/:id`
+      // answered the same agent with its full config, because that route
+      // short-circuits (`canReadSensitiveDetail = isSelf ? true : ...`) before
+      // the policy engine. Naming the subject makes the two agree.
+      //
+      // This discloses nothing new: `buildAgentDetail` already returns the
+      // self row through `redactAgentSecrets` (adapterConfig / runtimeConfig
+      // present, secrets masked), so the material was self-readable one route
+      // over. It is the same (viewer × subject × route) contradiction PEN-4775
+      // fixed on the company agent list, in the direction that row settled.
+      mockAgentService.getById.mockImplementation(async (id: string) => (
+        id === agentId ? { ...baseAgent, permissions: { canCreateAgents: false } } : null
+      ));
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        reason: "allow_self",
+        explanation: "Allowed because the actor is reading its own agent configuration.",
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+
+      const res = await request(app).get(`/api/agents/${agentId}/configuration`);
+
+      expect(res.status).toBe(200);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId },
+      }));
+    });
+
+    it("keeps the COMPANY-WIDE question on the config-revision routes (PEN-5231)", async () => {
+      // PEN-5228 ruling §B option 1. These two routes name ONE agent but must
+      // still ask the company question, which is the opposite of what the rest
+      // of this PR does — so it is pinned rather than left to be "tidied up".
+      //
+      // Reason: naming the subject makes `allow_self` reachable, and config
+      // HISTORY is the one object class here a grantless agent could not
+      // already read (`GET /api/agents/:id` returns the current config but
+      // never a revision). Subject-scoping these would be a genuine 403 -> 200
+      // widening, unlike the inert one on `/configuration`. Keeping the
+      // company resource loses nothing: it is exactly the question the suggest
+      // tier is refused.
+      const peerAgentId = "55555555-5555-4555-8555-555555555555";
+      mockAgentService.getById.mockImplementation(async (id: string) => (
+        id === peerAgentId ? { ...baseAgent, id: peerAgentId } : null
+      ));
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        reason: "deny_scope",
+        explanation:
+          "Permission agents:suggest-changes reads the configuration of one named agent.",
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+
+      const list = await request(app).get(`/api/agents/${peerAgentId}/config-revisions`);
+      expect(list.status).toBe(403);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "company", companyId },
+      }));
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+      }));
+
+      mockAccessService.decide.mockClear();
+
+      const one = await request(app).get(
+        `/api/agents/${peerAgentId}/config-revisions/66666666-6666-4666-8666-666666666666`,
+      );
+      expect(one.status).toBe(403);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "company", companyId },
+      }));
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+      }));
+    });
+
+    it("names the subject on /skills so the suggest tier keeps its diff-prep read (PEN-5231)", async () => {
+      // `reflection-coach` is the only principal granted `agents:suggest-changes`
+      // in this repo's defaults (`BUILT_IN_AGENT_DEFAULT_GRANTS`), and step 1 of
+      // its bundled skill calls GET /api/agents/<targetAgentId>/skills on the
+      // agent it is about to diff. Putting this route back on a `company`
+      // resource would 403 that shipped workflow on its first request, so the
+      // subject stays named here even though the revision routes above do not.
+      const peerAgentId = "77777777-7777-4777-8777-777777777777";
+      mockAgentService.getById.mockImplementation(async (id: string) => (
+        id === peerAgentId ? { ...baseAgent, id: peerAgentId } : null
+      ));
+      mockAccessService.decide.mockResolvedValue({
+        allowed: true,
+        reason: "allow_explicit_grant",
+        explanation: "Allowed by grant agents:suggest-changes.",
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+
+      const res = await request(app).get(`/api/agents/${peerAgentId}/skills`);
+
+      expect(res.status).not.toBe(403);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId: peerAgentId },
+      }));
+    });
+
+    it("keeps the COMPANY-WIDE question on the bulk configuration list (PEN-5231)", async () => {
+      // The counterpart to the case above, and the reason the narrowing bites:
+      // this route answers with every agent's configuration in one response,
+      // so there is no single subject to name. It must keep asking the company
+      // question — which `agents:suggest-changes` is now refused and
+      // `agents:configure` still passes. If this ever drifts to an `agent`
+      // resource the bulk read silently becomes reachable from the suggest
+      // tier again.
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        reason: "deny_scope",
+        explanation:
+          "Permission agents:suggest-changes reads the configuration of one named agent.",
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+
+      const res = await request(app).get(`/api/companies/${companyId}/agent-configurations`);
+
+      expect(res.status).toBe(403);
       expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
         action: "agent_config:read",
         resource: { type: "company", companyId },

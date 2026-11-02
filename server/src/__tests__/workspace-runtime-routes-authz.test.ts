@@ -437,6 +437,129 @@ describe.sequential("workspace runtime service route authorization", () => {
     expect(mockProjectService.updateWorkspace).not.toHaveBeenCalled();
   });
 
+  // PEN-5226 — the write guard must mirror the read mask: BOTH project-workspace command
+  // columns are agent-immutable, at every route that writes them. `setupCommand` has no
+  // executor today and is guarded in advance; see `collectProjectWorkspaceCommandPaths`
+  // in `routes/workspace-command-authz.ts` for why removing it is not a simplification.
+  describe("PEN-5226 project workspace command columns are agent-immutable", () => {
+    const COMMAND_COLUMNS = ["setupCommand", "cleanupCommand"] as const;
+    const AGENT_ACTOR = {
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    };
+
+    it.each(COMMAND_COLUMNS)(
+      "refuses an agent that sets %s through the project-create workspace sub-object",
+      async (column) => {
+        const app = await createProjectApp(AGENT_ACTOR);
+
+        const res = await request(app)
+          .post("/api/companies/company-1/projects")
+          .send({
+            name: "Exploit",
+            workspace: {
+              name: "Workspace",
+              cwd: "/tmp/project",
+              [column]: "touch /tmp/paperclip-rce",
+            },
+          });
+
+        expect(res.status).toBe(403);
+        expect(res.body.error).toContain("host-executed workspace commands");
+        // The guard runs before any persistence on this route.
+        expect(res.body.error).toContain(`workspace.${column}`);
+        expect(mockProjectService.create).not.toHaveBeenCalled();
+        expect(mockProjectService.createWorkspace).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(COMMAND_COLUMNS)(
+      "refuses an agent that sets %s on POST /projects/:id/workspaces",
+      async (column) => {
+        mockProjectService.getById.mockResolvedValue(buildProject({ id: projectId }));
+        const app = await createProjectApp(AGENT_ACTOR);
+
+        const res = await request(app)
+          .post(`/api/projects/${projectId}/workspaces`)
+          .send({
+            name: "Workspace",
+            cwd: "/tmp/project",
+            [column]: "touch /tmp/paperclip-rce",
+          });
+
+        expect(res.status).toBe(403);
+        expect(res.body.error).toContain("host-executed workspace commands");
+        expect(res.body.error).toContain(column);
+        expect(mockProjectService.createWorkspace).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(COMMAND_COLUMNS)(
+      "refuses an agent that sets %s on PATCH /projects/:id/workspaces/:workspaceId",
+      async (column) => {
+        mockProjectService.getById.mockResolvedValue(buildProject({ id: projectId }));
+        const app = await createProjectApp(AGENT_ACTOR);
+
+        const res = await request(app)
+          .patch(`/api/projects/${projectId}/workspaces/${workspaceId}`)
+          .send({ [column]: "touch /tmp/paperclip-rce" });
+
+        expect(res.status).toBe(403);
+        expect(res.body.error).toContain("host-executed workspace commands");
+        expect(res.body.error).toContain(column);
+        expect(mockProjectService.updateWorkspace).not.toHaveBeenCalled();
+      },
+    );
+
+    it("names both columns when an agent sets them together", async () => {
+      mockProjectService.getById.mockResolvedValue(buildProject({ id: projectId }));
+      const app = await createProjectApp(AGENT_ACTOR);
+
+      const res = await request(app)
+        .patch(`/api/projects/${projectId}/workspaces/${workspaceId}`)
+        .send({
+          setupCommand: "touch /tmp/paperclip-rce",
+          cleanupCommand: "rm -rf /tmp/paperclip-rce",
+        });
+
+      expect(res.status).toBe(403);
+      expect(res.body.error).toContain("setupCommand");
+      expect(res.body.error).toContain("cleanupCommand");
+      expect(mockProjectService.updateWorkspace).not.toHaveBeenCalled();
+    });
+
+    // The guard is scoped to agent actors only — it must not reach board callers, who own
+    // this configuration. A non-agent actor returns early from
+    // `assertNoAgentHostWorkspaceCommandMutation`, so the request proceeds to the handler.
+    it.each(COMMAND_COLUMNS)(
+      "lets a board caller set %s",
+      async (column) => {
+        mockProjectService.getById.mockResolvedValue(buildProject({ id: projectId }));
+        const app = await createProjectApp({
+          type: "board",
+          userId: "board-1",
+          companyIds: ["company-1"],
+          source: "session",
+          isInstanceAdmin: false,
+        });
+
+        const res = await request(app)
+          .patch(`/api/projects/${projectId}/workspaces/${workspaceId}`)
+          .send({ [column]: "pnpm install" });
+
+        expect(res.status).toBe(200);
+        expect(mockProjectService.updateWorkspace).toHaveBeenCalledWith(
+          projectId,
+          workspaceId,
+          expect.objectContaining({ [column]: "pnpm install" }),
+        );
+      },
+    );
+  });
+
   it("allows board callers through the project workspace runtime auth gate", async () => {
     mockProjectService.getById.mockResolvedValue(null);
     const app = await createProjectApp({

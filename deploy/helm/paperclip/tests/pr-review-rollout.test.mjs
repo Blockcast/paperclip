@@ -39,13 +39,27 @@ test("Blockcast enables the PR-review duplicate guard now compatibility pods hav
   assert.match(rendered, VALUE_PATTERN);
 });
 
-// Separate from the value assertion on purpose: the live admission policy pins an
-// exact container env-list length, so DELETING the var is inadmissible even though
-// an absent var and `"false"` are equivalent to the guard's own parser. Both asserts
-// fail if the var is removed (this pattern is a strict prefix of the one above); this
-// one additionally pins presence independently of the expected value, so a later
-// change to that value cannot silently also drop the var the admission policy
-// requires. The next test executes that split against mutated values files.
+// Separate from the value assertion on purpose. ⚠️ The reason recorded here until
+// PEN-5223 was FALSE and had already cost a blocked box: it claimed "the live
+// admission policy pins an exact container env-list length, so DELETING the var is
+// inadmissible". It does not, and it is not.
+// ValidatingAdmissionPolicy/paperclip-core-service-routing validation 3
+// (`isCanonicalApiEnvContract`) applies no `.size()` to `c.env` at all -- it requires
+// each of its 52 protected names exactly once, restricts `valueFrom` to 11
+// secret-bound names, and otherwise admits anything `PAPERCLIP_`-prefixed. This var
+// is not among the protected names, so removing it would be admitted. The policy's
+// denial message anticipates exactly this misreading: "Additive PAPERCLIP_-prefixed
+// plain-value env vars are ALLOWED and are never the cause of this denial
+// (BLO-27506) -- do not start by counting env vars."
+//
+// The SPLIT is still worth keeping, on its own merits rather than a borrowed one: an
+// absent var and `"false"` are equivalent to the guard's own parser, so nothing in
+// the server would notice a removal, and this repo wants the knob to stay documented
+// where a reader will find it. Both asserts fail if the var is removed (this pattern
+// is a strict prefix of the one above); this one additionally pins presence
+// independently of the expected value, so a later change to that value cannot
+// silently also drop the var. The next test executes that split against mutated
+// values files.
 test("Blockcast keeps the PR-review guard kill switch present in the env list", () => {
   assert.match(rendered, PRESENCE_PATTERN);
 });
