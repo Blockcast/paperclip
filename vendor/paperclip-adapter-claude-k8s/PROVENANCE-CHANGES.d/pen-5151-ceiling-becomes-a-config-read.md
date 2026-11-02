@@ -60,19 +60,28 @@ fix the gauge by reading the reclaimer's output into it.
 So the reading is a **pair** — and the second half of that pair needs two qualifiers, because
 without them it fails toward *"reclaimed"*:
 
-- **Read the timestamp at `{dry_run="false"}`.** `recordIsolationReclaimSweep` sets the gauge with a
-  `dry_run` label, unconditionally, so a dry-run sweep leaves it fresh having reclaimed nothing —
-  and `server/src/index.ts` instructs the operator to *"Enable with `dryRun` first"*, making that
-  the first state a correct rollout occupies rather than an edge case.
-- **Freshness is liveness, not coverage.** `sweepIsolationReclaim` slices to `maxClaimsPerTick` and
-  rotates, and the timestamp advances on `outcome="failed"` and `"deferred"` sweeps too, so a fresh
-  series does not establish that *this* claim was driven. That is what
-  `paperclip_isolation_reclaim_claims_total{outcome}` and
-  `paperclip_isolation_reclaim_unknown_outcome_claims_total` are for.
+- **Read the timestamp — and the whole `paperclip_isolation_reclaim_*` family — at
+  `{dry_run="false"}`.** `recordIsolationReclaimSweep` sets the gauge with a `dry_run` label,
+  unconditionally, so a dry-run sweep leaves it fresh having reclaimed nothing — and
+  `server/src/index.ts` instructs the operator to *"Enable with `dryRun` first"*, making that the
+  first state a correct rollout occupies rather than an edge case. The qualifier is not specific to
+  the timestamp: `reclaimed_total` is incremented with
+  `options.dryRun ? result.wouldReclaim : result.reclaimed`, so an unqualified read of a dry-run
+  rollout shows a non-zero reclaimed figure having deleted nothing, and `claims_total{outcome="ok"}`
+  counts dry-run drives on the same footing.
+- **Freshness is liveness, not coverage — and no counter closes that gap.**
+  `sweepIsolationReclaim` slices to `maxClaimsPerTick` and rotates, and the timestamp advances on
+  `outcome="failed"` and `"deferred"` sweeps too, so a fresh series does not establish that *this*
+  claim was driven. Neither does any counter: `paperclip_isolation_reclaim_claims_total` is
+  `Counter<"dry_run" | "outcome">`, a fleet aggregate with no claim or agent label, and `stop_reason`
+  is a label on `sweeps_total` rather than on it — so `claims_total{stop_reason="claims_capped"}`
+  matches nothing and reads as *"never capped"*. The per-claim record is the server log
+  `isolation reclaim drive complete` (`isolation-reclaim-driver.ts`), keyed on `claim`, `agentId`,
+  `dryRun` and `deleted`.
 
 With both applied, this is what satisfies PEN-5151's done-when 2 companion: `unreachable_agents
 != 0` alongside a fresh `paperclip_isolation_reclaim_last_sweep_timestamp_seconds{dry_run="false"}`
-whose sweep drove this claim `ok` is *unreachable but reclaimed*; a stale, absent, or dry-run-only
+and a `drive complete` line for this claim at `dryRun=false` is *unreachable but reclaimed*; a stale, absent, or dry-run-only
 timestamp is the standing record that an unreclaimed tree exists. Only the second carries the "opt
 an agent in only together with an owner for its claim's capacity" obligation.
 
