@@ -38,9 +38,29 @@ candidate fix, and it is rejected here for the reason the early return names its
 launches no Job, so there is no execution to report, and logging one per claim per daily tick for
 the fleet buys nothing the aggregate does not already carry.
 
-What the header owed instead is the condition under which absence *is* evidence, which is what this
-adds: zero `failed` and zero `deferred` increase at `{dry_run="false"}` over the window says every
-claim the sweep listed was driven, and a claim driven with nothing eligible is covered.
+What the header owed instead is the condition under which absence *is* evidence. That condition is a
+**conjunction**, and the first draft of this change stated only half of it — caught by Ally in
+review of this PR at head `f556f3e8`, and worth recording because the half-stated form moved the
+failure to the *unsafe* direction while purporting to fix the safe one:
+
+1. **The window contains a fresh `{dry_run="false"}` sweep timestamp**, and `failed`/`deferred`
+   show zero increase at `{dry_run="false"}` across it. Without the freshness the zero is
+   **vacuous**: `recordIsolationReclaimSweep` labels the entire `paperclip_isolation_reclaim_*`
+   family — counters and the `last_sweep` gauge alike — with the sweep's *own* `dry_run`
+   (`metrics.ts`, `const dry_run = options.dryRun ? "true" : "false"`). Under the dry-run-only
+   rollout the runbook calls *"the first state a correct rollout is in"*, no `{dry_run="false"}`
+   series exists at all, so every count read there is zero, no `drive complete` line exists at
+   `dryRun=false`, and the half-stated rule concluded *covered* for a deployment that had reclaimed
+   nothing — while the sentence immediately above it concluded *unreclaimed* for the same state.
+   Freshness is a non-vacuity precondition only; it is not a coverage claim, since the timestamp
+   advances on `deferred` sweeps too.
+2. **The claim is one the sweep lists.** `listReclaimableClaims` selects agents with
+   `enablePerAgentWorkspaceVolume` true or a `workspaceVolumeClaim` distinct from the server's own,
+   so a claim left behind by **opting an agent back out** is not listed. The runbook names opting
+   out as the cheapest remedy and tells the operator to *"write down the claim you left behind"* —
+   so this is a case the page creates itself, and for it absence **is** the unreclaimed reading.
+
+With both stated, the direction is preserved: the rule still fails toward *unreclaimed*.
 
 ## Where the same clause went
 
