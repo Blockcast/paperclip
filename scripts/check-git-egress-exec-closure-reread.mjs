@@ -332,8 +332,11 @@ export function renderReport(result, { base, head, today } = {}) {
       "no other git config key can reach an exec during a publish, and the re-read must",
       "not be written up as one.",
       "",
-      "After the review, record it in scripts/check-git-egress-exec-closure-reread.mjs:",
-      "set REVIEW_LAST_COMPLETED to the date it was done and REVIEW_DUE to the next one.",
+      "After the review, record it in scripts/check-git-egress-exec-closure-reread.mjs.",
+      "It is a THREE-line edit: REVIEW_LAST_COMPLETED to the date the review was done,",
+      "REVIEW_DUE to the next one, and REVIEW_NOTICE ahead of that. Moving REVIEW_DUE",
+      "alone is the edit that defeats the purpose; leaving REVIEW_NOTICE in the past",
+      "clears this freeze but warns on every run until the next window opens.",
     );
   }
 
