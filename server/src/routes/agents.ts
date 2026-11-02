@@ -2631,22 +2631,53 @@ export function agentRoutes(
     // returns `undefined` only for a non-object, which the gate above has
     // already excluded.
     const contained = containAgentConfig(snapshot, viewer) ?? {};
-    const meta = contained.metadata;
-    return {
-      // Shape contract preserved exactly: absent or non-object config still
-      // normalizes to `{}`, and absent metadata still to `null`. These sub-field
-      // gates are `isPlainObject` for the same reason as above — `sanitizeValue`
-      // also passes a nested non-plain object through unchanged, so the mismatch
-      // recurs one level down.
-      ...contained,
-      adapterConfig: isPlainObject(contained.adapterConfig) ? contained.adapterConfig : {},
-      runtimeConfig: isPlainObject(contained.runtimeConfig) ? contained.runtimeConfig : {},
+    // ⚠️ RESHAPE WHAT WAS STORED; DO NOT MANUFACTURE WHAT WAS NOT (PEN-5321).
+    //
+    // These three lines used to run unconditionally, so a snapshot that never
+    // carried `runtimeConfig` was answered with `runtimeConfig: {}` — and `{}`
+    // is a LEGAL STORED VALUE for that column. Not every revision stores a full
+    // row: `patchAgentImage` (`services/agent-image-bump.ts`) writes a PARTIAL
+    // snapshot naming only the column it changed, and 1331 of the `Ceo` seat's
+    // 1341 revisions are its `auto-retry-on-completion` rows. Every one of them
+    // arrived advertising an empty runtime config the writer had never looked
+    // at, which is indistinguishable from an agent whose heartbeat override is
+    // genuinely empty. That read cost a real false conclusion on PEN-5321 —
+    // an "untracked write" on a seat that had none.
+    //
+    // This is the same withheld-is-not-absent hazard PEN-5230 closed on
+    // `redactForRestrictedAgentView`, one surface out, but the CAUSE differs
+    // and so does the remedy. There the `{}` was a REDACTION, the reader's
+    // entitlement was the missing fact, and the fix was a constant
+    // `withheldFields` marker. Here nothing is withheld from anybody: the fact
+    // the response was missing is *what the WRITE covered*, which the row
+    // already states in `changedKeys`. So the repair is not another marker —
+    // it is to stop fabricating a key the snapshot does not have, and let
+    // absent mean absent. See `docs/security/agent-config-read-model.md`
+    // § "`config-revisions` is not a complete audit".
+    //
+    // CONTAINMENT IS UNCHANGED, and that is the part to preserve under any
+    // later edit. The gate added here is PRESENCE ONLY; the value gate stays
+    // `isPlainObject`, so a present-but-non-plain config is still replaced with
+    // `{}` rather than emitted uncontained, exactly as before. Gating on
+    // `contained` rather than on `snapshot` is deliberate: this function emits
+    // `contained`, so asking the question of the object it does not emit would
+    // reintroduce `undefined` for any key a future redactor drops.
+    const stored = (key: string) => Object.prototype.hasOwnProperty.call(contained, key);
+    const projected: Record<string, unknown> = { ...contained };
+    if (stored("adapterConfig")) {
+      projected.adapterConfig = isPlainObject(contained.adapterConfig) ? contained.adapterConfig : {};
+    }
+    if (stored("runtimeConfig")) {
+      projected.runtimeConfig = isPlainObject(contained.runtimeConfig) ? contained.runtimeConfig : {};
+    }
+    if (stored("metadata")) {
       // `metadata` gets the shared fail-closed rule rather than its own copy:
       // `keepSanitizedAgentMetadata` is the single definition of what an
       // already-sanitized `metadata` may become, so this path and the two
       // spread-based redactors cannot drift apart on the same column.
-      metadata: keepSanitizedAgentMetadata(meta),
-    };
+      projected.metadata = keepSanitizedAgentMetadata(contained.metadata);
+    }
+    return projected;
   }
 
   // ⚠️ FAIL-OPEN BY CONSTRUCTION. This SPREADS `...revision` and masks exactly

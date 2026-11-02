@@ -802,6 +802,64 @@ describe("agent secret redaction on mutating responses", () => {
     expectNoPlaintextSecrets(res.body);
   });
 
+  // PEN-5321. `redactRevisionSnapshot` used to assign `adapterConfig`,
+  // `runtimeConfig` and `metadata` unconditionally, so a PARTIAL snapshot came
+  // back advertising columns the writer never looked at. `{}` is a legal stored
+  // value for both config columns, so the response could not be told apart from
+  // a row whose runtime config really is empty — and it was not told apart: the
+  // fabricated `runtimeConfig: {}` on the image-bump rows produced a reported
+  // "untracked write" on a seat that had none.
+  //
+  // `patchAgentImage` is the live producer of this shape (1331 of 1341
+  // revisions on one measured seat), so the fixture is its shape exactly.
+  it("does not manufacture config keys a PARTIAL revision snapshot never stored", async () => {
+    const partial = { adapterConfig: { image: "ghcr.io/acme/agent:v2" } };
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      ...revisionRow(),
+      source: "auto-retry-on-completion",
+      beforeConfig: { adapterConfig: { image: "ghcr.io/acme/agent:v1" } },
+      afterConfig: partial,
+    });
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions/${revisionId}`);
+
+    expect(res.status).toBe(200);
+    // The column the snapshot DID store is still projected.
+    expect(res.body.afterConfig.adapterConfig).toEqual({ image: "ghcr.io/acme/agent:v2" });
+    // The two it did not must be ABSENT, not `{}` / `null`. `toBeUndefined`
+    // would also pass on an explicit `undefined`, which JSON cannot carry, so
+    // assert on the key set instead.
+    expect(Object.prototype.hasOwnProperty.call(res.body.afterConfig, "runtimeConfig")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(res.body.afterConfig, "metadata")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(res.body.beforeConfig, "runtimeConfig")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(res.body.beforeConfig, "metadata")).toBe(false);
+  });
+
+  // The presence gate above is PRESENCE ONLY. A snapshot that genuinely stores
+  // a non-plain-object config must still be contained to `{}` rather than
+  // emitted uncontained — that is the fail-closed half of the same function and
+  // the half an over-eager "just spread it" simplification would delete.
+  it("still contains a stored but non-plain-object config to {}", async () => {
+    const snapshot = {
+      ...snapshotWithUnnamedConfigField(),
+      runtimeConfig: ["not", "a", "record"],
+    };
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      ...revisionRow(),
+      beforeConfig: snapshot,
+      afterConfig: snapshot,
+    });
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions/${revisionId}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.afterConfig.runtimeConfig).toEqual({});
+    expect(res.body.beforeConfig.runtimeConfig).toEqual({});
+    expectNoPlaintextSecrets(res.body);
+  });
+
   // The old `metadata` branch gated on `typeof x === "object" && x !== null`,
   // which is TRUE for an array, and the redactor returns a non-plain-object
   // argument unchanged — so an array-valued `metadata` went out verbatim. This
