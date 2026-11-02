@@ -13450,6 +13450,19 @@ export function buildPaperclipTaskMarkdown(input: {
       // references that issue. Telling that agent to rebase and re-enqueue a
       // third party's branch is the #953 damage path, so drop the remediation
       // instruction in that case and route it as a comment instead.
+      //
+      // PEN-5119: the own-PR branch below still carries an imperative remedy
+      // ("rebase the branch ... and re-enqueue"), and an imperative reads as an
+      // authorisation. Observed live on Blockcast/paperclip#3205: a standing
+      // "no push to this head" instruction was in force and recorded in the
+      // issue's own monitor note; this directive woke the assignee with the
+      // remedy, the assignee confirmed the technical diagnosis (which was
+      // correct) and executed the remedy as though the directive licensed it,
+      // force-pushing over the frozen head. A directive that is right about the
+      // mechanism is not thereby right about the authority. The remedy is
+      // therefore gated on an explicit re-read of the two cheapest records of a
+      // standing hold -- the issue's monitor note and the agent's own last
+      // comment on that PR -- before any write.
       const evictionThirdPartyAuthor = resolveThirdPartyPrAuthor(prReview);
       lines.push(
         "",
@@ -13458,7 +13471,7 @@ export function buildPaperclipTaskMarkdown(input: {
         "No review has been submitted by this event — do not read it as review findings.",
         evictionThirdPartyAuthor
           ? `This PR was authored by ${quoteTaskScalar(evictionThirdPartyAuthor)}, NOT by you — it is linked to you only because it references your issue. Do NOT push to its branch or re-enqueue it. Confirm state with \`gh pr view ${prReview.prNumber} --repo ${prReview.repoFullName ?? "<owner>/<repo>"} --json state,mergeable,mergeStateStatus,mergedAt\`, then say on the PR (or on your issue) that it was evicted and is not landing, so its author can act.`
-          : `Confirm current state, then act: \`gh pr view ${prReview.prNumber} --repo ${prReview.repoFullName ?? "<owner>/<repo>"} --json state,mergeable,mergeStateStatus,mergedAt\`. If the cause below is a conflict or un-stageable rebase, rebase the branch (on a REBASE-method queue do NOT merge the base branch in — that makes it less landable, see runbooks/merge-queue-stalled-head.md) and re-enqueue. If it is a failing check, fix the check first. If it was a manual dequeue, find out why before re-enqueueing.`,
+          : `Confirm current state, then act: \`gh pr view ${prReview.prNumber} --repo ${prReview.repoFullName ?? "<owner>/<repo>"} --json state,mergeable,mergeStateStatus,mergedAt\`. This directive is an automated diagnosis, NOT an authorisation — it is generated from a queue event and knows nothing about any instruction standing on this PR, so it cannot grant, widen or retract one. Before any write to this PR (push, force-push, rebase, enqueue, auto-merge, review-request removal), re-read your issue's monitor note AND the last comment you yourself posted about this PR; if either records a hold, freeze or pending authorisation, the hold stands and your action on this wake is to REPORT the eviction, not to remedy it. Only once nothing holds it: if the cause below is a conflict or un-stageable rebase, rebase the branch (on a REBASE-method queue do NOT merge the base branch in — that makes it less landable, see runbooks/merge-queue-stalled-head.md) and re-enqueue. If it is a failing check, fix the check first. If it was a manual dequeue, find out why before re-enqueueing.`,
       );
       if (prReview.mergeQueueEvictionBody) {
         lines.push("", "The eviction notice:", fenceTaskText(prReview.mergeQueueEvictionBody));
