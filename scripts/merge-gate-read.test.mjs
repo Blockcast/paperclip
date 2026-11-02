@@ -295,6 +295,23 @@ describe("merge-gate reader", () => {
       });
     }
 
+    // PEN-5247: the unreadable-base path returns before the read loop, so it
+    // must still DRAIN stdin -- otherwise the caller writing names into the
+    // pipe races our exit and gets EPIPE. A payload that fits the 64 KiB pipe
+    // buffer hides this (the write lands before we exit), which is why it
+    // surfaced only as an intermittent `policy` failure that evicted unrelated
+    // PRs from the merge queue. Going over the buffer makes it deterministic.
+    for (const [what, file] of [
+      ["missing", join(tmp, "nope")],
+      ["empty", null],
+    ]) {
+      it(`drains a stdin payload larger than the pipe buffer (${what} file)`, () => {
+        const many = Array.from({ length: 20_000 }, (_, i) => `job-name-number-${i}`);
+        assert.ok(many.join("\n").length > 256 * 1024, "payload must exceed any plausible pipe buffer");
+        assert.deepEqual(renamed(many, file ?? baseFile("")), []);
+      });
+    }
+
     // A templated name renders text found nowhere literally, and its stem
     // (`shard-3`, `chromium e2e`) is not in the file either. Both RED with only
     // the literal + stem guards.
