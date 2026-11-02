@@ -216,7 +216,8 @@ gated_lanes() { # stdin: run rows; $1 = head sha, $2 non-empty = repo is gated
 
 empty_witness() { # stdin: commit statuses LIST pages + check-runs pages -> "1" or nothing
   # BLO-48830. pr-ci-dispatch (`post-status: "true"`) posts `ci/dispatched-lanes`
-  # = success "(base <ref>) no dispatched lane applies to this head" when it
+  # (or NOP's equivalent `ci/web-lanes`) = success
+  # "(base <ref>) no dispatched lane applies to this head" when it
   # selects no lane. Accepted only when the ACTIONS app wrote it: a session
   # writes as allyblockcast[bot] (290875700) or its User seat, never as
   # github-actions[bot] (41898282) / app `github-actions` — the same identity
@@ -227,13 +228,13 @@ empty_witness() { # stdin: commit statuses LIST pages + check-runs pages -> "1" 
   # Only the EMPTY wording counts: "N lane(s) passed" means runs exist, and
   # those are judged by the title match and by verdicts(), not by this.
   # Status LIST endpoint, not the combined one: combined drops `creator`.
-  jq -rs --arg p "no dispatched lane applies to this head" '
-    ([.[]|arrays|.[]|select(type=="object" and .context=="ci/dispatched-lanes"
+  jq -rs '
+    ([.[]|arrays|.[]|select(type=="object" and (.context=="ci/dispatched-lanes" or .context=="ci/web-lanes")
                              and .creator.id==41898282)]|max_by(.id)) as $s
-    | ([.[]|objects|.check_runs[]?|select(.name=="ci/dispatched-lanes"
+    | ([.[]|objects|.check_runs[]?|select((.name=="ci/dispatched-lanes" or .name=="ci/web-lanes")
                                           and .app.slug=="github-actions")]|max_by(.id)) as $c
-    | if ($s.state=="success" and (($s.description // "")|contains($p)))
-         or ($c.conclusion=="success" and (($c.output.title // "")|contains($p)))
+    | if ($s.state=="success" and (($s.description // "")|test("no (dispatched|web) lane applies to this head")))
+         or ($c.conclusion=="success" and (($c.output.title // "")|test("no (dispatched|web) lane applies to this head")))
       then "1" else empty end' 2>/dev/null
 }
 
@@ -979,7 +980,7 @@ rc=$?
 SLIST='[]'
 # BLO-49045: guarded, not argued. A partial list can hold a stale success
 # witness whose withdrawing re-judge sat on the page that failed.
-if [ -n "$GATED" ] && printf '%s' "$STATUSES" | grep -q '"ci/dispatched-lanes"'; then
+if [ -n "$GATED" ] && printf '%s' "$STATUSES" | grep -Eq '"ci/(dispatched|web)-lanes"'; then
   SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
 fi
 EMPTY=$(printf '%s\n%s\n' "$SLIST" "$CHECKS" | empty_witness)
