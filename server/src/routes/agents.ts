@@ -2428,6 +2428,27 @@ export function agentRoutes(
     };
   }
 
+  // ⚠️ FAIL-OPEN BY CONSTRUCTION. This SPREADS `...revision` and masks exactly
+  // two columns, so every other column on `agent_config_revisions` ships
+  // verbatim and any column added later ships to this caller set BY DEFAULT —
+  // nobody has to decide to disclose it. That is the opposite polarity to
+  // `redactAgentConfiguration`, which ENUMERATES what it returns and therefore
+  // withholds a new column until someone adds it.
+  //
+  // So: adding a column to `agent_config_revisions` is a disclosure decision
+  // taken HERE, whether or not you come to this file. If the new column can
+  // carry a secret, a credential, a command line, or anything else the
+  // restricted projection withholds, mask it below or convert this function to
+  // an enumerated projection first.
+  //
+  // The same warning sits at the `/config-revisions` list call site, which is
+  // where it was originally written (PEN-5231). It is repeated on the
+  // definition because that is the end a column author actually opens: the
+  // call-site copy is only read by someone already thinking about readership,
+  // and a reader who arrives here sees seven lines with no hazard in them.
+  //
+  // Do not widen the readership of a spread-based projection without changing
+  // it to an enumerated one first.
   function redactConfigRevision(
     revision: Record<string, unknown> & { beforeConfig: unknown; afterConfig: unknown },
   ) {

@@ -2239,6 +2239,76 @@ describe.sequential("agent permission routes", () => {
       }));
     });
 
+    it("keeps a SELF-target config-revision read on the company question too (PEN-5231)", async () => {
+      // The companion to the peer case above, and the one the peer case cannot
+      // express. That test pins the RESOURCE, so it catches someone retyping
+      // these routes to `{type:"agent"}`. It does not catch the other way in:
+      // an `isSelf` short-circuit placed BEFORE the policy engine, exactly like
+      // `canReadSensitiveDetail = isSelf ? true : ...` on `GET /api/agents/:id`.
+      // That precedent lives in this same file, so it is the edit a maintainer
+      // reaches for when a grantless agent complains it cannot read its own
+      // history — and it would leave the peer test entirely green.
+      //
+      // Why that must stay 403 rather than being "made consistent" with
+      // `/configuration`: config HISTORY is the one object class here a
+      // grantless agent cannot already read by another door. `GET
+      // /api/agents/:id` returns the CURRENT config under every projection but
+      // never a revision, so admitting self here is a genuine 403 -> 200
+      // widening — unlike the inert one on `/configuration`, where the material
+      // was already self-readable one route over. Revisions also carry
+      // `beforeConfig`, i.e. values that have since been rotated out.
+      //
+      // So the asymmetry between this route and `/configuration` is the
+      // decision, not an oversight to be tidied away. Pinned so that tidying it
+      // fails here with this comment attached.
+      mockAgentService.getById.mockImplementation(async (id: string) => (
+        id === agentId ? { ...baseAgent } : null
+      ));
+      mockAccessService.decide.mockResolvedValue({
+        allowed: false,
+        reason: "deny_missing_grant",
+        explanation: "Allowed only with agents:configure in the subject's company.",
+      });
+
+      const app = await createApp({
+        type: "agent",
+        agentId,
+        companyId,
+        runId: "run-1",
+        source: "agent_key",
+      });
+
+      const list = await request(app).get(`/api/agents/${agentId}/config-revisions`);
+      expect(list.status).toBe(403);
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "company", companyId },
+      }));
+      // The subject IS the actor and it still must not be named here, because
+      // naming it is what would make `allow_self` reachable.
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId },
+      }));
+
+      mockAccessService.decide.mockClear();
+
+      const one = await request(app).get(
+        `/api/agents/${agentId}/config-revisions/66666666-6666-4666-8666-666666666666`,
+      );
+      expect(one.status).toBe(403);
+      // The engine was consulted at all: a short-circuit that skipped it would
+      // leave this at zero calls, which is the failure this case exists for.
+      expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "company", companyId },
+      }));
+      expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+        action: "agent_config:read",
+        resource: { type: "agent", companyId, agentId },
+      }));
+    });
+
     it("names the subject on /skills so the suggest tier keeps its diff-prep read (PEN-5231)", async () => {
       // `reflection-coach` is the only principal granted `agents:suggest-changes`
       // in this repo's defaults (`BUILT_IN_AGENT_DEFAULT_GRANTS`), and step 1 of
