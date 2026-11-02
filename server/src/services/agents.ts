@@ -784,6 +784,26 @@ export function agentService(db: Db) {
         );
       }
 
+      // ⚠️ REVISION RECORDING IS OPT-IN PER CALL SITE, so `agent_config_revisions`
+      // is NOT a complete audit of config writes and must not be cited as one
+      // (PEN-5321). A caller that omits `recordRevision` updates the row and
+      // leaves no audit trace, and several live callers do exactly that —
+      // `company-portability` import, `activatePendingApproval` below, the
+      // instructions-bundle materializer and the join-request replay in
+      // `routes/`, plus the two raw `budget_monthly_cents` mirrors in
+      // `services/budgets.ts` that never come through this function at all.
+      //
+      // The consequence is a log whose rows are individually true and
+      // collectively incomplete: a reader chaining `before`/`after` across
+      // revisions sees a column jump with no row explaining it. Two such gaps
+      // are recorded with their brackets in
+      // `docs/security/agent-config-read-model.md`
+      // § "`config-revisions` is not a complete audit", which also names where
+      // the actor for an unrecorded budget write IS still recoverable.
+      //
+      // If you are adding a config write path: pass `recordRevision`. If you
+      // are reading this log to answer "who changed X and when", read that
+      // section first — the answer may not be in this table.
       const shouldRecordRevision = Boolean(options?.recordRevision) && hasConfigPatchFields(txPatch);
       const beforeConfig = shouldRecordRevision ? buildConfigSnapshot(locked) : null;
       const updated = await tx

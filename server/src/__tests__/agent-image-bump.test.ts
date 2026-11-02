@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
+import { agentConfigRevisions, agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
@@ -316,6 +316,44 @@ describeEmbeddedPostgres("applyImageBumpToAgent", () => {
 
     const [refetched] = await db.select().from(agents).where(eq(agents.id, agent.id));
     expect(refetched!.pendingImageBump).toBe("harbor.example/a:Y");
+  });
+
+  // PEN-5321. The audit row this writer emits used to key its snapshot
+  // `adapter_config`, which matches no column any reader looks for —
+  // `changedKeys` on the same row says `adapterConfig`, `buildConfigSnapshot`
+  // emits `adapterConfig`, `configPatchFromSnapshot` reads `adapterConfig`. The
+  // documented way to chain a column through this log is to filter to the
+  // revisions whose `changedKeys` names it and then read that key, and on these
+  // rows — the overwhelming majority of them on a long-lived seat — that
+  // procedure selected the row and then found nothing in it.
+  it("writes the revision snapshot under the camelCase column name", async () => {
+    const { agent } = await createCompanyAndAgent({
+      image: "harbor.example/a:old",
+      extraConfig: { model: "claude-opus" },
+    });
+
+    await applyImageBumpToAgent(db, {
+      agentId: agent.id,
+      targetImage: "harbor.example/a:new",
+      source: "auto-retry-on-completion",
+    });
+
+    const [revision] = await db
+      .select()
+      .from(agentConfigRevisions)
+      .where(eq(agentConfigRevisions.agentId, agent.id));
+    expect(revision).toBeDefined();
+    expect(revision!.changedKeys).toEqual(["adapterConfig"]);
+    // The key the row declares is the key the snapshot carries, on both sides.
+    const before = revision!.beforeConfig as Record<string, unknown>;
+    const after = revision!.afterConfig as Record<string, unknown>;
+    expect(before.adapterConfig).toEqual({ image: "harbor.example/a:old", model: "claude-opus" });
+    expect(after.adapterConfig).toEqual({ image: "harbor.example/a:new", model: "claude-opus" });
+    expect(Object.prototype.hasOwnProperty.call(before, "adapter_config")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(after, "adapter_config")).toBe(false);
+    // The snapshot stays PARTIAL on purpose: it declares one column and carries
+    // exactly that column. Nothing here should start storing the whole row.
+    expect(Object.keys(after)).toEqual(["adapterConfig"]);
   });
 });
 

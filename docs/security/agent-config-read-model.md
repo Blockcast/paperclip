@@ -863,6 +863,172 @@ no agent can hold, so "company-readable" would widen the row and not those
 values. `PEN-3206` ratified that posture and `PEN-5225` is the agents route
 catching up to it.
 
+## `config-revisions` is not a complete audit
+
+Status: **descriptive**. Read out of `agentService.update`, `diffConfigSnapshot`
+and `activatePendingApproval` (`services/agents.ts`), `upsertPolicy` and
+`resolveIncident` (`services/budgets.ts`), `patchAgentImage`
+(`services/agent-image-bump.ts`), the agent import in
+`services/company-portability.ts`, and `redactRevisionSnapshot`
+(`routes/agents.ts`), at the commit that added this section. The two live gaps
+it cites were measured on the Penstock instance on 2026-11-02 and are recorded
+on `PEN-5321`; the bracket windows are the reporter's, not re-derived here.
+
+> `GET /api/agents/:id/config-revisions` may **NOT** be cited as a complete
+> record of agent configuration writes, and nothing on the endpoint says so.
+> Revision recording is **opt-in per call site**. Several live write paths do
+> not opt in, and two of the columns most often chained through this log —
+> `budgetMonthlyCents` and `runtimeConfig` — each have at least one writer that
+> records nothing. A column that moves with no revision row is the expected
+> behaviour of this table, not evidence of a lost row or of tampering.
+
+Two confirmed instances, both found while answering an ordinary provenance
+question:
+
+| Seat | Column | Change | Bracketed to | Row in the log |
+| --- | --- | --- | --- | --- |
+| `Ceo` | `budgetMonthlyCents` | 0 → 1,200,000 | (2026-10-28, 2026-10-31] | none |
+| `Cto` | `runtimeConfig.heartbeat.maxConcurrentRuns` | 1 → 3 | 2026-07-11 → 2026-08-17 | none |
+
+### It is (a) a bypassing write path — not dropped keys, not retention
+
+`PEN-5321` asked which of three causes this is. It is the first, and the other
+two are positively excluded rather than merely unobserved:
+
+- **Not (b), dropped `changedKeys`.** When a revision *is* recorded,
+  `diffConfigSnapshot` compares **every** entry of `CONFIG_REVISION_FIELDS`
+  between the before and after snapshots. There is no per-key filter it could
+  drop a column through. The one writer that does not diff —
+  `patchAgentImage`, which hardcodes `changedKeys: ["adapterConfig"]` — is
+  correct for the single column it writes.
+- **Not (c), retention or compaction.** Nothing anywhere deletes, prunes or
+  rewrites `agent_config_revisions`. The only `ON DELETE cascade` on the table
+  is from `agents`, i.e. the agent itself being deleted, and
+  `listConfigRevisions` applies no `LIMIT` — the endpoint returns the whole
+  array, which is why a non-round row count is not a truncated page.
+- **(a).** `agentService.update` records only when the caller passes
+  `recordRevision`, and the raw `db.update(agents)` writers never reach that
+  function at all.
+
+### The writers that record nothing
+
+Everything below changes a column in `CONFIG_REVISION_FIELDS` and leaves no
+revision row. Cited by symbol; grep for it.
+
+| Writer | Columns it can move | Reached by |
+| --- | --- | --- |
+| `upsertPolicy` agent mirror (`services/budgets.ts`) | `budgetMonthlyCents` | `POST /companies/:id/budgets/policies` — the budgets pane and `pc cost budget policy:upsert` |
+| `resolveIncident` agent mirror (same file) | `budgetMonthlyCents` | `POST /companies/:id/budget-incidents/:id/resolve` with `raise` |
+| the agent import in `services/company-portability.ts` | every config column, including `runtimeConfig` and `reportsTo` | company import / restore |
+| `activatePendingApproval` (`services/agents.ts`) | every config column the board edited on the hire card | board approval of a hire |
+| the instructions-bundle materializer (`routes/agents.ts`) | `adapterConfig` | `PATCH /agents/:id/instructions-bundle`, and the lazy migration off a legacy prompt template |
+| the join-request replay (`routes/access.ts`) | `adapterType`, `adapterConfig` | approving a company join request |
+| `agentService.create` | all of them — **there is no creation revision at all** | every hire |
+
+**The two columns are affected differently, and the difference matters when you
+are deciding how much to trust a chain.**
+
+- `budgetMonthlyCents` has unrecorded writers on the **ordinary, routine path**.
+  Setting an agent cap through the budgets UI is the normal way to do it and it
+  is unrecorded; the two paths that *do* record (`PATCH /agents/:id/budgets`,
+  which gained it on 2026-08-26 for `BLO-20121`, and the approval executor) are
+  the exceptions. Expect gaps here as a matter of course.
+- `runtimeConfig` has unrecorded writers only on **exceptional** paths —
+  import, hire activation. The everyday editor, `PATCH /api/agents/:id`,
+  records. A `runtimeConfig` gap is therefore a much stronger signal that
+  something unusual wrote the column, and is worth chasing rather than shrugging
+  at.
+
+`agentService.create` writing nothing is the quietest of these. It means every
+seat's chain begins unanchored: the earliest revision's `before` is the first
+state anyone recorded, never the state the agent was hired with, and the two are
+not the same object.
+
+### Where the actor IS still recoverable
+
+The endpoint cannot answer "who changed this", but for the budget column that is
+not the end of the inquiry — it is the wrong table. Both unrecorded budget
+writers log and stamp:
+
+- `activity_log` — `budget.policy_upserted` (`entity_type: budget_policy`,
+  scope in `details`) and `budget.incident_resolved`, each carrying the actor.
+- `budget_policies` — `updated_by_user_id`, plus `amount_updated_at`, which is
+  stamped only when the amount actually changed and so dates the cap move rather
+  than the row write.
+
+So "not recoverable from this surface" is accurate about `config-revisions` and
+should not be carried forward as "not recoverable". For `runtimeConfig` there is
+no equivalent: the import and activation paths log an activity row for the
+*operation*, not for the column, so an unrecorded `runtimeConfig` move genuinely
+has no attributed actor.
+
+### Reading this endpoint without being misled
+
+Three rules, each of which has already caught someone:
+
+1. **Chain one column at a time, filtered to the revisions whose `changedKeys`
+   contains it.** Snapshots are not all full rows (next rule), so chaining
+   across every revision compares a column against rows that never stored it and
+   manufactures roughly eleven spurious gaps per seat.
+2. **Snapshots come in two shapes.** A `patch`-sourced revision carries a full
+   row. `patchAgentImage` writes a **partial** snapshot naming only
+   `adapterConfig` — and on a long-lived seat its `auto-retry-on-completion`
+   rows are the overwhelming majority, 1331 of 1341 on the measured `Ceo` seat.
+   `changedKeys` is the snapshot's coverage declaration; treat it as such.
+3. **`jq '.beforeConfig.runtime_config'` is a trap.** The column is
+   `runtimeConfig`; `runtime_config` has never existed. A `// {}` fallback on a
+   misspelled key manufactures an empty config out of `null` and reads as a real
+   observation. This is how `PEN-5321`'s first pass briefly reported an
+   untracked write on a seat that had none.
+
+### The partial-snapshot `{}`: decided, and not with a `withheldFields` marker
+
+`PEN-5321` asked whether the `{}` on this endpoint warrants the
+withheld-is-not-absent treatment `PEN-5230` gave `redactForRestrictedAgentView`.
+**It does not, and giving it one would have been wrong** — but the filter rule
+above was not sufficient either, so the answer is a third thing.
+
+The signature was identical and the cause was not. On the peer projection the
+`{}` is a **redaction**: the value exists, the reader is not entitled to it, and
+the missing fact is about the *reader* — so a constant `withheldFields` /
+`withheldByAction` pair states it while disclosing nothing about the subject.
+Here nothing is withheld from anybody. The missing fact is *what the write
+covered*, which is a property of the row, and the row already states it in
+`changedKeys`. A `withheldFields` marker would have asserted a withholding that
+never happened.
+
+What was actually wrong is that `redactRevisionSnapshot` **assigned
+`adapterConfig`, `runtimeConfig` and `metadata` unconditionally**, so a partial
+snapshot was answered with keys the writer had never looked at. That is a
+fabrication, not a projection, and `{}` is a legal stored value for both config
+columns, so it was indistinguishable from an observation. It now reshapes only
+the keys the stored snapshot actually carries; absent stays absent. The value
+gate is untouched — a *present* but non-plain-object config is still contained
+to `{}` rather than emitted uncontained, which is the fail-closed half of that
+function.
+
+The naming split is fixed at the source rather than papered over on read:
+`patchAgentImage` now writes its snapshot under `adapterConfig`, matching the
+`changedKeys` on the same row and every other reader of the table. Rows written
+before that change keep the old `adapter_config` key and rule 1 does not work on
+them; there is no backfill.
+
+One consequence of partial snapshots is unchanged and is recorded here so it is
+not rediscovered as a regression: **"Restore" on a partial revision answers
+422.** `configPatchFromSnapshot` requires `name`, `role`, `adapterType` and
+`budgetMonthlyCents`, and a partial snapshot carries none of them. That was true
+before the key rename and is true after it.
+
+### Not fixed here
+
+Making the bypassing writers record is a behaviour change per path and is
+deliberately not bundled with this description. The budget mirrors in particular
+are not a one-line fix: `upsertPolicy` runs inside caller transactions with a
+stated lock order (policy row, then agent), which is exactly why the two call
+sites that *do* record wrap it in a companion `agentService.update` rather than
+putting the update inside it. Moving it inside would invert that order and
+reintroduce the `BLO-32796` ABBA deadlock.
+
 ## Regression tests
 
 - `server/src/__tests__/agent-permissions-routes.test.ts` — `company agent list
@@ -919,6 +1085,14 @@ catching up to it.
   board reader still disclosed. The `workspaceStrategy` carrier sits on the
   file's **shared** fixture, so every case in it would catch a re-disclosure.
 
+- `server/src/__tests__/agent-secret-redaction.test.ts` — `does not manufacture
+  config keys a PARTIAL revision snapshot never stored`, and its fail-closed
+  twin `still contains a stored but non-plain-object config to {}`. The pair is
+  the point: the first pins that absent stays absent, the second that the
+  containment it sits next to was not weakened to get there.
+- `server/src/__tests__/agent-image-bump.test.ts` — `writes the revision
+  snapshot under the camelCase column name`: the key the row declares in
+  `changedKeys` is the key its snapshot carries, and the snapshot stays partial.
 - `server/src/__tests__/agent-permissions-routes.test.ts` — ``the peer `{}`
   says it was withheld (PEN-5230)``, which pins the right-hand matrix column:
   the markers on both peer routes, **absent** on the viewer's own row and for a

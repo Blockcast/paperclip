@@ -1310,6 +1310,30 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           .where(eq(companies.id, input.scopeId));
       }
 
+      // ⚠️ THIS MIRROR WRITES `agents.budget_monthly_cents` AND RECORDS NO
+      // CONFIG REVISION (PEN-5321). It is a raw UPDATE, not
+      // `agentService.update`, so nothing reaches the `recordRevision` path and
+      // the cap moves with no row in `agent_config_revisions`. This is the
+      // dominant human-facing way an agent cap gets set — the budgets pane
+      // (`ui/src/api/budgets.ts`) and `pc cost budget policy:upsert` both land
+      // here via `POST /companies/:id/budgets/policies` — and it is the measured
+      // cause of a cap change that the revision log could not attribute.
+      //
+      // NOT a one-line fix, which is why it is documented rather than patched
+      // in passing. `upsertPolicy` runs inside caller transactions that have a
+      // stated lock order (policy row first, then agent), and the two call sites
+      // that DO record a revision — `PATCH /agents/:id/budgets` in
+      // `routes/costs.ts` and the approval executor — add a companion
+      // `agentService.update(..., { recordRevision })` AROUND this call for
+      // exactly that reason. Adding the update inside here would invert the
+      // order against them and reintroduce the BLO-32796 ABBA deadlock.
+      //
+      // Until that is done: the actor for a cap change IS recoverable, just not
+      // from `config-revisions` — `activity_log` carries
+      // `budget.policy_upserted` with the scope in `details`, and
+      // `budget_policies` carries `updated_by_user_id` / `amount_updated_at`.
+      // See `docs/security/agent-config-read-model.md`
+      // § "`config-revisions` is not a complete audit".
       if (input.scopeType === "agent" && windowKind === "calendar_month_utc") {
         await db
           .update(agents)
@@ -1716,6 +1740,11 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
             .where(eq(companies.id, policy.scopeId));
         }
 
+        // Second unrecorded writer of the same column, same reasoning as the
+        // mirror in `upsertPolicy` above (PEN-5321): a board resolving a budget
+        // incident with `raise` moves the agent cap and writes no config
+        // revision. Its actor is recoverable from the `budget.incident_resolved`
+        // activity row rather than from `agent_config_revisions`.
         if (writesCap && policy.scopeType === "agent" && policy.windowKind === "calendar_month_utc") {
           await db
             .update(agents)
