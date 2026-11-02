@@ -17,8 +17,8 @@
 // COUNT -- a table that merely contains the advisory you came for is the
 // failure mode, not the fix. A hardcoded table cannot see an advisory
 // published after it was written; only a live feed can, and no workflow here
-// runs one. That detector gap is filed separately -- this table is a snapshot
-// and re-dating it is a recurring chore, not a solved problem.
+// runs one. That detector gap is PEN-5285 -- this table is a snapshot and
+// re-dating it is a recurring chore, not a solved problem.
 //
 // Re-read the source of truth with:
 //   gh api 'advisories?ecosystem=npm&affects=fast-uri&per_page=100' \
