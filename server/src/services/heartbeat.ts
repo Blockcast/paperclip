@@ -479,6 +479,7 @@ import {
   setCrashRecoveryCandidateIndexPresent,
   CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
   recordTransientRetryFloorDisposition,
+  recordDepBlockedRetryDispersion,
 } from "./metrics.js";
 import type { DispatchDeclineReason, TransientRetryFloorDisposition } from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
@@ -1247,6 +1248,122 @@ function depBlockedRetryDelayMs(attempt: number): number {
   return Math.min(DEP_BLOCKED_BASE_DELAY_MS * Math.pow(2, attempt), DEP_BLOCKED_MAX_DELAY_MS);
 }
 
+// PEN-5307: dependency-blocked wake synchronization is NOT intended, and the
+// curve above is not on its own enough to prevent it. Recording the decision
+// here because `depBlockedRetryDelayMs` is where the next reader will look.
+//
+// The curve is a function of `attempt` alone, so the instant it produces is
+// `now + f(attempt)` with nothing per-run in it. `promoteDueScheduledRetries`
+// binds ONE `now` and loops up to 50 due runs against it
+// (`promoteScheduledRetryRun(dueRun, now)`), so every run re-parked in a single
+// sweep pass is handed a byte-identical `scheduledRetryAt` — and because
+// 5 x 2^4 = 80 min exceeds DEP_BLOCKED_MAX_DELAY_MS, attempts 4..12 are a FLAT
+// 60 min, so the attempt term stops discriminating as well. Measured
+// 2026-11-02: two runs on two different agents, both attempt 10, parked 25.1 s
+// apart, sharing `2026-11-02T17:18:01.457Z` to the millisecond across two
+// independent reads; a three-run tie across three agents 45 min earlier.
+//
+// Why synchronizing is wrong HERE specifically, since the distinction matters:
+// the dependency re-CHECK is a cheap internal DB read and batching those is
+// defensible. What costs is the WAKE that follows a check which still finds the
+// blocker unresolved — a cohort that resumes in one instant contends for the
+// same dispatch slots, and if still blocked re-parks together, preserving the
+// cohort indefinitely. So the fix disperses the next wake, not the check.
+//
+// This is the same defect PEN-2509 fixed on the `transient_failure` lane, which
+// is why the remedy reuses that lane's helper rather than growing a second
+// implementation of it: see `jitterTransientRetryFloor`, and the call site in
+// `promoteScheduledRetryRun`.
+
+/**
+ * Jitter as a fraction of the delay still to be served on a dependency-blocked
+ * re-park (PEN-5307). Mirrors {@link TRANSIENT_RETRY_FLOOR_JITTER_RATIO}.
+ */
+export const DEP_BLOCKED_RETRY_JITTER_RATIO = 0.2;
+
+/**
+ * Ceiling on the dep-blocked jitter window (PEN-5307).
+ *
+ * NOT inherited from {@link TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS} (5 min), whose
+ * derivation does not transfer: that value is sized to the upstream provider's
+ * flap period, so a dispersed cohort straddles more than one flap verdict. A
+ * dep-blocked park waits on a blocker resolving in our own database. There is
+ * no flap to straddle, so the sibling's number would be a copied constant with
+ * its reasoning left behind.
+ *
+ * Derived instead from the one bound this jitter can actually violate.
+ * {@link DEP_BLOCKED_MAX_PARK_AGE_MS} (12 h) is required to exceed the full
+ * attempt budget, or it would terminate rows still legitimately inside it — and
+ * every millisecond of jitter is added to that budget. Requiring the margin to
+ * stay at or above one hour after jitter, the largest whole minute that
+ * qualifies is 3:
+ *
+ *   max 3 min -> worst case +35 min -> 650 min total, margin 70 min  <= qualifies
+ *   max 4 min -> worst case +46 min -> 661 min total, margin 59 min  <- too thin
+ *
+ * (Worst case is not 12 x the ceiling: the ratio binds below it on the early
+ * attempts. {@link depBlockedRetryJitterWorstCaseMs} computes it from the
+ * constants so the bound is pinned by arithmetic rather than by this comment.)
+ *
+ * 3 minutes is ample for the purpose. The sweep promotes at most 50 runs per
+ * pass, so a full pass disperses over ~180,000 ms — mean spacing ~3.5 s for a
+ * 50-run burst, against the 0 ms measured on 2026-11-02 — and the chance that
+ * any two runs in such a cohort land on the same millisecond is negligible.
+ */
+export const DEP_BLOCKED_RETRY_JITTER_MAX_MS = 3 * 60 * 1000;
+
+/**
+ * The next `scheduledRetryAt` for a dependency-blocked re-park (PEN-5307).
+ *
+ * A named function rather than two lines at the call site, because the property
+ * that matters is only observable across two CALLS: `promoteDueScheduledRetries`
+ * binds one `now` and loops up to 50 due runs against it, so "same `now`, same
+ * attempt, different instant" is the whole fix and it cannot be asserted on an
+ * expression inlined inside a DB transaction. `dep-blocked-retry-dispersion.test.ts`
+ * calls this directly; delete the jitter below and that test fails.
+ *
+ * Returns the base alongside the dispersed instant so a caller (and the test)
+ * can assert the additive-only property against the curve it came from rather
+ * than against a re-derived copy of it.
+ */
+export function computeDepBlockedRetryDueAt(input: {
+  now: Date;
+  nextAttempt: number;
+  random?: () => number;
+}): { dueAt: Date; baseDueAt: Date; jitterMs: number } {
+  const baseDueAt = new Date(input.now.getTime() + depBlockedRetryDelayMs(input.nextAttempt));
+  const { dueAt, jitterMs } = jitterTransientRetryFloor({
+    dueAt: baseDueAt,
+    now: input.now,
+    random: input.random,
+    jitterRatio: DEP_BLOCKED_RETRY_JITTER_RATIO,
+    maxJitterMs: DEP_BLOCKED_RETRY_JITTER_MAX_MS,
+  });
+  return { dueAt, baseDueAt, jitterMs };
+}
+
+/**
+ * Worst-case total jitter addable across one full dependency-blocked attempt
+ * budget, computed from the constants rather than asserted (PEN-5307).
+ *
+ * Exists so {@link DEP_BLOCKED_MAX_PARK_AGE_MS}'s margin is pinned by a test
+ * against the live values: the previous derivation lived only in a comment, and
+ * a comment cannot fail when someone re-tunes the ratio or the ceiling. Sums the
+ * per-attempt window `min(delay * ratio, maxJitter)` over every attempt that can
+ * produce a re-park (1..DEP_BLOCKED_MAX_RETRY_ATTEMPTS), which is exactly the
+ * set `promoteScheduledRetryRun` jitters.
+ */
+export function depBlockedRetryJitterWorstCaseMs(): number {
+  let total = 0;
+  for (let attempt = 1; attempt <= DEP_BLOCKED_MAX_RETRY_ATTEMPTS; attempt += 1) {
+    total += Math.min(
+      depBlockedRetryDelayMs(attempt) * DEP_BLOCKED_RETRY_JITTER_RATIO,
+      DEP_BLOCKED_RETRY_JITTER_MAX_MS,
+    );
+  }
+  return total;
+}
+
 // Wall-clock ceiling on a dependency-blocked park, enforced independently of
 // `scheduledRetryAttempt` (BLO-29055).
 //
@@ -1261,11 +1378,23 @@ function depBlockedRetryDelayMs(attempt: number): number {
 //   initial park            DEP_BLOCKED_BASE_DELAY_MS                    =   5 min
 //   attempts 1..3           10 + 20 + 40                                 =  70 min
 //   attempts 4..12          9 x DEP_BLOCKED_MAX_DELAY_MS (60 min capped) = 540 min
-//                                                                   total = 615 min ≈ 10.25 h
+//                                                              base total = 615 min ≈ 10.25 h
+//   PEN-5307 dispersion     depBlockedRetryJitterWorstCaseMs()           =  35 min
+//                                                          jittered total = 650 min ≈ 10.83 h
 // The ceiling must exceed that, or it would terminate rows still legitimately inside
 // their attempt budget. 12h is the smallest whole number of hours strictly greater
 // than 10.25h, so this bound can only ever fire on a row whose attempt counter was
 // reset — which is exactly the leak it exists to close.
+//
+// PEN-5307 re-derivation. The dispersion added to each re-park is served INSIDE this
+// budget, so it moves the number the ceiling has to clear: 615 → 650 min, leaving 70
+// min of margin rather than 105. The ceiling still holds and the property above is
+// unchanged — but it is now 12h against 10.83h, so the margin is no longer wide
+// enough to absorb a casual re-tune. DEP_BLOCKED_RETRY_JITTER_MAX_MS is derived from
+// exactly this constraint (see its comment), and `dep-blocked-retry-dispersion.test.ts`
+// pins the inequality against the live constants so a future change to the ratio, the
+// jitter ceiling, the delay curve or the attempt count fails a test rather than
+// silently eating the margin. Do not widen the jitter without re-reading that test.
 export const DEP_BLOCKED_MAX_PARK_AGE_MS = 12 * 60 * 60 * 1000;
 
 // Lineage-stable origin for the age ceiling. `createdAt` is NOT usable on its own:
@@ -22488,7 +22617,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     now: Date,
     // BLO-25944: set only by `retryScheduledRetryNow`. An operator press may
     // shorten a capacity park; it must never spend its retry budget or end it.
-    promotionOpts: { operatorRequested?: boolean } = {},
+    // PEN-5307: `random` is a test seam for the dep-blocked re-park dispersion
+    // below, mirroring the `opts.random` seam the transient lane already carries.
+    // Production never passes it; it defaults to `Math.random` inside the helper.
+    promotionOpts: { operatorRequested?: boolean; random?: () => number } = {},
   ): Promise<
     | { outcome: "promoted"; run: typeof heartbeatRuns.$inferSelect }
     | {
@@ -23085,7 +23217,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             }
             return { outcome: "not_promoted", run: exhausted };
           }
-          const nextDueAt = new Date(now.getTime() + depBlockedRetryDelayMs(nextAttempt));
+          // PEN-5307: the curve is `f(attempt)` only, and `now` is the SWEEP's
+          // instant shared across every run this pass promotes, so adopting it
+          // verbatim re-parks a whole cohort on one millisecond. Disperse it
+          // forward before it becomes `scheduledRetryAt`.
+          //
+          // Additive-only, for the same reason the transient lane's is: the
+          // curve is the minimum wait this attempt is owed, so pulling a retry
+          // in front of it would re-check a blocker sooner than the backoff
+          // intends and spend an attempt on it. Delaying past it is always
+          // safe. The added time is served inside the attempt budget, which is
+          // why DEP_BLOCKED_MAX_PARK_AGE_MS was re-derived alongside this.
+          const nextDue = computeDepBlockedRetryDueAt({
+            now,
+            nextAttempt,
+            random: promotionOpts.random,
+          });
+          const nextDueAt = nextDue.dueAt;
+          // PEN-5307 / PEN-4145 trap #3: emit the decision so this lane has a
+          // denominator at all. The alignment instrument PEN-4145 built CANNOT
+          // be extended to cover it — see `recordDepBlockedRetryDispersion` for
+          // why the signature here is a cross-run tie rather than a grid
+          // alignment, and why reading that counter on this lane would report
+          // 100% healthy both before and after this fix.
+          recordDepBlockedRetryDispersion({ jitterMs: nextDue.jitterMs });
           const nextContextSnapshot = {
             ...parseObject(dueRun.contextSnapshot),
             unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
