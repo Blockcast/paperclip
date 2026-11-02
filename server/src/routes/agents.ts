@@ -2637,12 +2637,18 @@ export function agentRoutes(
     // carried `runtimeConfig` was answered with `runtimeConfig: {}` — and `{}`
     // is a LEGAL STORED VALUE for that column. Not every revision stores a full
     // row: `patchAgentImage` (`services/agent-image-bump.ts`) writes a PARTIAL
-    // snapshot naming only the column it changed, and 1331 of the `Ceo` seat's
-    // 1341 revisions are its `auto-retry-on-completion` rows. Every one of them
-    // arrived advertising an empty runtime config the writer had never looked
-    // at, which is indistinguishable from an agent whose heartbeat override is
-    // genuinely empty. That read cost a real false conclusion on PEN-5321 —
-    // an "untracked write" on a seat that had none.
+    // snapshot naming only the column it changed, and on a long-lived seat its
+    // rows are the overwhelming majority — 1331 of 1341 on `Ceo`, 1302 of 1324
+    // on `Cto`. Every one of them arrived advertising an empty runtime config
+    // the writer had never looked at, which is indistinguishable from an agent
+    // whose heartbeat override is genuinely empty. That read cost a real false
+    // conclusion on PEN-5321 — an "untracked write" on a seat that had none.
+    //
+    // Identify that population by SHAPE (`changedKeys`), never by the `source`
+    // label: `source` is free-form caller text — the bump route takes it from
+    // the request body and suffixes `@<buildSha>` — so the same writer's rows
+    // land under many labels (four on `Cto`) and no equality filter catches
+    // them all. See the doc's rule 2.
     //
     // This is the same withheld-is-not-absent hazard PEN-5230 closed on
     // `redactForRestrictedAgentView`, one surface out, but the CAUSE differs

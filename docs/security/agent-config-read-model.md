@@ -858,16 +858,38 @@ Three rules, each of which has already caught someone:
    contains it.** Snapshots are not all full rows (next rule), so chaining
    across every revision compares a column against rows that never stored it and
    manufactures roughly eleven spurious gaps per seat.
-2. **Snapshots come in two shapes.** A `patch`-sourced revision carries a full
-   row. `patchAgentImage` writes a **partial** snapshot naming only
-   `adapterConfig` — and on a long-lived seat its `auto-retry-on-completion`
-   rows are the overwhelming majority, 1331 of 1341 on the measured `Ceo` seat.
-   `changedKeys` is the snapshot's coverage declaration; treat it as such.
-3. **`jq '.beforeConfig.runtime_config'` is a trap.** The column is
-   `runtimeConfig`; `runtime_config` has never existed. A `// {}` fallback on a
-   misspelled key manufactures an empty config out of `null` and reads as a real
-   observation. This is how `PEN-5321`'s first pass briefly reported an
-   untracked write on a seat that had none.
+2. **Snapshots come in two shapes, and the shape is not the `source` label.**
+   `patchAgentImage` (`services/agent-image-bump.ts`) writes a **partial**
+   snapshot naming only `adapterConfig`; every other writer of this table
+   snapshots the whole row. Identify the partial population by its **shape** —
+   `changedKeys` is the row's own coverage declaration — and never by `source`.
+   `source` is free-form caller text, so it cannot key a filter: the retry path
+   hardcodes `auto-retry-on-completion` (`agent-image-bump.ts:264`), but
+   `POST /admin/agents/bump-agent-image` takes the value from the request body
+   (`z.string().min(1).max(120).prefault("admin:manual")`) and *suffixes* it with
+   `@<buildSha>` when one is supplied, so even an exact match on a label you have
+   already seen misses the same writer's next row. Measured: the identical
+   partial shape arrives on the `Cto` seat under four labels —
+   `auto-retry-on-completion` 927, `ci:docker-agent.yml` 373, `manual:BLO-10409`
+   1, `manual:PEN-388` 1. Filtering on `auto-retry-on-completion` there misses
+   375 of 1302 partial rows (29%), and the missed ones are the CI rows — exactly
+   where a reader chasing an image bump would look.
+   **Corollary, because the citation below is wrong about this:** `PEN-5321`'s
+   description groups "`patch` / CI revisions" together as full row snapshots.
+   `patch` rows are full; **CI rows are not** — they are this writer's partial
+   rows under a CI label. Do not carry that grouping forward.
+3. **A `// {}` fallback on a key you have not confirmed exists manufactures an
+   observation.** The fallback cannot tell "stored empty" from "no such key", so
+   a typo or a guessed name is answered with a value that reads as a real
+   reading of an empty config. The known instances are a naming split and a
+   guess: the column is `runtimeConfig` and `runtime_config` has never existed
+   (`jq '.beforeConfig.runtime_config // {}'` is how `PEN-5321`'s first pass
+   briefly reported an untracked write on a seat that had none), and on the
+   activity log the actor is `actorId`, so `.actorUserId // "-"` reports an
+   absent actor for every row. Neither is a fact about those two key names; it is
+   a property of `// fallback` over any unverified key. The positive control is
+   cheap — re-read with the key you believe is correct and watch a non-empty
+   value appear; if it stays empty under both spellings, *then* it is a reading.
 
 ### The partial-snapshot `{}`: decided, and not with a `withheldFields` marker
 
@@ -900,6 +922,15 @@ The naming split is fixed at the source rather than papered over on read:
 `changedKeys` on the same row and every other reader of the table. Rows written
 before that change keep the old `adapter_config` key and rule 1 does not work on
 them; there is no backfill.
+
+State the scope of that as a number rather than as a caveat: the fix is
+**forward-only**, so `changedKeys` becomes a sound coverage declaration only for
+rows written after it. On the measured `Cto` seat that leaves **1302 of 1324
+existing revisions (98%) unreadable by rule 1** — they declare `adapterConfig`
+and store `adapter_config` — and the same ratio holds on the `Ceo` seat (1331 of
+1341). The back-catalogue stays unreadable by the documented procedure. A reader
+who needs a pre-rename row must fall back to reading `adapter_config` directly,
+and must not conclude from rule 1's silence that the column never moved.
 
 One consequence of partial snapshots is unchanged and is recorded here so it is
 not rediscovered as a regression: **"Restore" on a partial revision answers
