@@ -722,17 +722,22 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     );
   });
 
-  it("closes a card whose pull request was closed unmerged: the ask became unsatisfiable", async () => {
+  it("closes a card whose pull request was closed unmerged, without claiming it can never merge", async () => {
     const { companyId, agentId } = await createCompany("AGRP");
     const issueId = await insertIssue(companyId, "AGRP-3");
     // The PEN-2043 supersession shape: #1058 closed, the work landed as #1122. The
     // gate token is now unreachable while the work ships, so a card standing on it
-    // asks humans forever for something nobody can do.
+    // asks humans forever about a pull request nobody is working on.
     //
     // This is the deliberate divergence from `terminal-gate-reconciler`, which holds
     // that only `merged` satisfies — correct there, because its subject is an ISSUE
     // and closed-unmerged means the work did not land. Here the subject is a CARD
-    // and the question is whether the ask can still be granted. It cannot.
+    // and the question is whether the ask is still live.
+    //
+    // ⚠ What is terminal is the CARD, not the pull request: a closed PR can be
+    // reopened and merged while its head branch survives. The disposition is right
+    // and the old prose ("nobody can merge it any more") was false — Ally on #3261,
+    // extended by the CTO. Both are pinned below.
     const approvalId = await insertApproval({
       companyId,
       agentId,
@@ -750,13 +755,26 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
 
     const row = await approvalRow(approvalId);
     expect(row?.status).toBe("cancelled");
-    expect(row?.decisionNote).toContain("unsatisfiable");
+    expect(row?.decisionNote).toContain("no live ask left");
+    expect(row?.decisionNote).toContain("reopened");
 
     const comments = await commentsFor(issueId);
     expect(comments[0]?.body).toContain("closed without merging");
-    expect(comments[0]?.body).toContain("unsatisfiable");
     // A reader must not take this as "the merge happened".
     expect(comments[0]?.body).not.toContain("has merged");
+    // Nor as "this pull request can never merge" — it can be reopened. The card is
+    // what is terminal, and the announcement must say what to do if that happens.
+    expect(comments[0]?.body).toContain("reopened");
+    expect(comments[0]?.body).toContain("file a new one");
+    for (const falseClaim of [
+      "nobody can merge",
+      "can no longer happen",
+      "unsatisfiable",
+      "No human can ever",
+    ]) {
+      expect(comments[0]?.body).not.toContain(falseClaim);
+      expect(row?.decisionNote ?? "").not.toContain(falseClaim);
+    }
     expect(issueCommentMetadataSchema.parse(comments[0]?.metadata).sections[0]?.rows).toEqual(
       expect.arrayContaining([
         { type: "key_value", label: "Named pull request merged", value: "no" },
@@ -766,11 +784,16 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
 
   // ⭐ PEN-5254 "Done when" #2, asserted rather than inferred from source reading.
   //
-  // `githubGetPullRequestGate` maps EVERY non-ok response to `{ error }` — there is
-  // no `not_found` branch to mistake a deleted PR, a private repo, a revoked
-  // installation or a rate limit for positive evidence. That makes fail-closed
-  // structural here rather than constructed, which is precisely why it needs a test:
-  // an emergent property is one a later refactor can remove without noticing.
+  // `githubGetPullRequestGate` maps every non-ok response to `{ error }`, so no read
+  // failure can mistake a private repo, a revoked installation or a rate limit for
+  // positive evidence. That makes fail-closed structural here rather than
+  // constructed, which is precisely why it needs a test: an emergent property is one
+  // a later refactor can remove without noticing.
+  //
+  // The 404-with-readable-repo case added by Ally'"'"'s review on #3263 carries
+  // `notFound`, and it is covered too — at SWEEP time it defers exactly like the
+  // rest. It differs only at file time, where the card is refused rather than
+  // created. Both halves are listed here so a refactor cannot quietly promote it.
   it.each([
     ["a pull request that does not exist", "pull_request_http_404"],
     ["a repository the installation cannot see", "pull_request_http_403"],
@@ -778,17 +801,18 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     ["a rate-limited lookup", "pull_request_rate_limited"],
     ["an unreadable body", "pull_request_state_missing"],
     ["a transport failure", "pull_request_fetch_failed"],
-  ])("never retires a card when the gate names %s", async (_label, reason) => {
+    ["a pull request proven absent", "pull_request_not_found", true],
+  ])("never retires a card when the gate names %s", async (_label, reason, notFound) => {
     const { companyId, agentId } = await createCompany("AGRP");
     const issueId = await insertIssue(companyId, "AGRP-4");
     const approvalId = await insertApproval({ companyId, agentId, gate: prGateFor(999999), issueId });
 
     const result = await reconcileApprovalGates(db, {
-      fetchPullRequest: async () => ({ error: reason }),
+      fetchPullRequest: async () => (notFound ? { error: reason, notFound: true } : { error: reason }),
       logger: silentLogger,
     });
 
-    // Deferred, never closed: unmeasurable is not satisfied.
+    // Deferred, never closed: unmeasurable is not satisfied, and neither is absent.
     expect(result).toMatchObject({ examined: 1, closed: 0, deferred: 1, announced: 0 });
     expect(await approvalRow(approvalId)).toMatchObject({ status: "pending", decidedAt: null });
     // And it says nothing on the issue — a card left open must not be announced as
@@ -983,12 +1007,33 @@ describe("classifyPullRequestGateLookup", () => {
       "pull_request_rate_limited",
       "pull_request_state_missing",
       "pull_request_fetch_failed",
+      "pull_request_repo_inaccessible_404",
     ]) {
       expect(classifyPullRequestGateLookup({ error: reason })).toEqual({
         kind: "deferred",
         reason,
       });
     }
+  });
+
+  it("maps a proven-absent pull request to `unreadable`, never to `terminal`", () => {
+    // PEN-5254 / Ally on #3263. `notFound` is the one failure the file-time guard
+    // refuses, and it STILL must not retire a live card: cancelling somebody's
+    // escalation on the strength of a number nobody can resolve is the opposite
+    // error, and a worse one. `unreadable` is how one disposition says both.
+    expect(
+      classifyPullRequestGateLookup({ error: "pull_request_not_found", notFound: true }),
+    ).toEqual({ kind: "unreadable", reason: "pull_request_not_found" });
+  });
+
+  it("reads `notFound` as a refinement of the error arm, so order is load-bearing", () => {
+    // `notFound` is set alongside `error`, not instead of it — a bare `{ error }`
+    // with the same reason string must stay `deferred`. If the general error branch
+    // were tested first, the refinement would be unreachable and the file-time
+    // refusal would silently never fire.
+    expect(classifyPullRequestGateLookup({ error: "pull_request_not_found" }).kind).toBe(
+      "deferred",
+    );
   });
 
   it("summarises PR state distinctly from run state", () => {

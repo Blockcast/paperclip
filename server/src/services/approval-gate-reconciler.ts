@@ -198,6 +198,19 @@ type CandidateRow = {
 type GateDisposition =
   | { kind: "live" }
   | { kind: "deferred"; reason: string }
+  /**
+   * The gate names something that does not exist, confirmed rather than inferred
+   * (PEN-5254). Distinct from `deferred` on one axis only: the SWEEP treats the two
+   * identically — defer, never retire — while the file-time guard refuses this one
+   * and passes `deferred`. A card whose gate names nothing can never be retired by
+   * that gate, so it would otherwise be filed and then deferred on every sweep for
+   * ever; but a gate that merely could not be READ this second must still file.
+   *
+   * Only `classifyPullRequestGateLookup` can produce it. The Actions arm keeps
+   * live/deferred/terminal: its absent-run case is already `not_found` -> terminal,
+   * which is a different rule and not this PR's to change.
+   */
+  | { kind: "unreadable"; reason: string }
   | { kind: "terminal"; summary: string; satisfied: boolean; url: string | null };
 
 function toRows<T>(rows: unknown): T[] {
@@ -244,13 +257,22 @@ export function classifyGateLookup(lookup: WorkflowRunLookup): GateDisposition {
 /**
  * Turn a pull-request lookup into a decision about the card (PEN-5254).
  *
- * `githubGetPullRequestGate` maps EVERY non-ok response — 404, 403, a transport
- * failure, an unparseable body — to `{ error }`, so there is no input on which this
- * retires a card it could not read. That is the same fail-closed posture
- * `classifyGateLookup` has to construct deliberately, and here it is structural:
- * this function has no `not_found` branch because the reader cannot produce one.
- * `approval-gate-reconciler.test.ts` asserts it rather than leaving it emergent —
- * an emergent property is one a later refactor can remove without noticing.
+ * `githubGetPullRequestGate` maps every non-ok response — 403, a transport failure,
+ * an unparseable body — to `{ error }`, so no failure reason retires a card this
+ * function could not read. That is the same fail-closed posture `classifyGateLookup`
+ * has to construct deliberately, and here it is structural rather than chosen.
+ * `approval-gate-reconciler.test.ts` asserts it rather than leaving it emergent — an
+ * emergent property is one a later refactor can remove without noticing.
+ *
+ * ## The one 404 that is not a read failure, and what it may and may not do
+ *
+ * A 404 whose repository probe came back readable is positive evidence the pull
+ * request does not exist — a typo, or an issue number where a PR number was meant.
+ * The reader marks exactly that case `notFound`, and it maps here to `unreadable`,
+ * NOT to `terminal`: at sweep time it still defers and never retires, because a card
+ * must not be cancelled on the strength of a number nobody can resolve. What it does
+ * buy is the file-time refusal — such a card can never be retired by its own gate,
+ * so filing it creates a row that defers for ever (the defect Ally found on #3263).
  *
  * ## The divergence from `terminal-gate-reconciler`, stated on purpose
  *
@@ -266,13 +288,20 @@ export function classifyGateLookup(lookup: WorkflowRunLookup): GateDisposition {
  *     A PR closed unmerged means the work did NOT land, so closing the issue would
  *     be a false completion. Closed-unmerged must not satisfy it.
  *
- *   - Here the subject is a CARD, and the question is "can this ask still be
- *     granted?". A card asking "merge #N" becomes UNSATISFIABLE the moment #N is
- *     closed unmerged — nobody can merge it any more. Leaving it standing asks
- *     humans forever for something that can never happen, which is BLO-29359's
- *     failure mode arriving through a different door. Retiring it is the safe
- *     direction; the work shipping elsewhere is the PEN-2043 supersession shape
- *     (`#1058` closed, the work landed as `#1122`).
+ *   - Here the subject is a CARD, and the question is "is this ask still live?".
+ *     A card asking "merge #N" has no live ask left the moment #N is closed
+ *     unmerged: the overwhelmingly common sequel is that the work moved to a
+ *     different pull request, which is the PEN-2043 supersession shape (`#1058`
+ *     closed, the work landed as `#1122`). Retiring is the safe direction;
+ *     leaving it standing asks humans forever about a pull request nobody is
+ *     working on, which is BLO-29359's failure mode arriving through a different
+ *     door.
+ *
+ *     ⚠ Note what is NOT claimed. A closed pull request can be REOPENED and merged
+ *     while its head branch survives, so closed-unmerged is not "impossible to
+ *     merge" — it is terminal for this CARD, not for that pull request. The card
+ *     is cheap and re-filable and the announcement says so; this reconciler does
+ *     not watch for a reopen, so if #N comes back, file a new card naming it.
  *
  * So both terminal states retire the card, and they are kept apart by `satisfied`:
  * merged is satisfied, closed-unmerged is not. `satisfied` carries the same narrow
@@ -282,6 +311,11 @@ export function classifyGateLookup(lookup: WorkflowRunLookup): GateDisposition {
  * which rule produced it.
  */
 export function classifyPullRequestGateLookup(lookup: PullRequestGateResult): GateDisposition {
+  // Checked before the general error branch: `notFound` is a refinement OF `{error}`,
+  // not an alternative to it, so order is load-bearing here.
+  if ("error" in lookup && lookup.notFound === true) {
+    return { kind: "unreadable", reason: lookup.error };
+  }
   if ("error" in lookup) return { kind: "deferred", reason: lookup.error };
   // An open pull request is a live gate: it can still merge, so the ask can still
   // be granted. Same unknown-means-live direction the run classifier takes.
@@ -338,11 +372,12 @@ function announcementBody(input: {
           gateRule,
         ].join(" ")
       : [
-          "**Nobody approved or rejected it — the pull request was closed unmerged first.** A",
-          "card asking for that merge became unsatisfiable at that moment: nobody can merge a",
-          "closed pull request, so the card was closed as `cancelled` rather than left asking",
-          "forever for something that can no longer happen. If the work is still wanted it has",
-          "most likely moved to a different pull request — name that one in a new card.",
+          "**Nobody approved or rejected it — the pull request was closed unmerged first.** The",
+          "card was closed as `cancelled` rather than left asking forever about a pull request",
+          "nobody is working on. If the work is still wanted it has most likely moved to a",
+          "different pull request — name that one in a new card. A closed pull request can also",
+          "be reopened and merged while its branch still exists; nothing re-opens this card if",
+          "that happens, so file a new one naming it.",
         ].join(" ")
     : input.disposition.satisfied
       ? [
@@ -505,7 +540,7 @@ async function closeAndAnnounce(
     gate.kind === "github_pr_merged"
       ? disposition.satisfied
         ? `The gated pull request merged before a decision was recorded (${ref}: ${disposition.summary}). Closed by the approval-gate reconciler.`
-        : `The gated pull request was closed without merging, so the ask became unsatisfiable (${ref}: ${disposition.summary}). Closed by the approval-gate reconciler.`
+        : `The gated pull request was closed without merging, so the card has no live ask left (${ref}: ${disposition.summary}). If it is reopened and merged, file a new card. Closed by the approval-gate reconciler.`
       : disposition.satisfied
         ? `Gate completed before a decision was recorded (${ref}: ${disposition.summary}). Closed by the approval-gate reconciler.`
         : `Gate died undecided (${ref}: ${disposition.summary}). Closed by the approval-gate reconciler.`;
@@ -680,13 +715,19 @@ export async function reconcileApprovalGates(
         result.live += 1;
         continue;
       }
-      if (disposition.kind === "deferred") {
+      // `unreadable` joins `deferred` here and nowhere else. The two differ only at
+      // file time; at sweep time the rule is the same one BLO-29359 established and
+      // Ally restated on #3263 — defer, never retire. A gate naming a pull request
+      // that does not exist is the strongest evidence this sweep can get, and it is
+      // still not grounds to cancel somebody's escalation (PEN-5254).
+      if (disposition.kind === "deferred" || disposition.kind === "unreadable") {
         result.deferred += 1;
         log.warn(
           {
             approvalId: candidate.id,
             gate: approvalGateRef(gate),
             reason: disposition.reason,
+            unresolvable: disposition.kind === "unreadable",
           },
           "approval-gate reconciler deferred a card because GitHub was unreadable (BLO-29359)",
         );

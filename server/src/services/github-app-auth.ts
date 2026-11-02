@@ -269,9 +269,29 @@ export type ReviewerEvidenceResult =
   | { found: false }
   | { error: string };
 
+/**
+ * The result of reading a pull request's gate state.
+ *
+ * ## Why `notFound` refines the error arm rather than forming a third one (PEN-5254)
+ *
+ * A 404 here has two opposite causes — a pull request number that names nothing
+ * (a typo, or an ISSUE number, which `/pulls/{n}` also 404s on), and a repository
+ * this installation cannot see. `notFound` is set ONLY for the first, and only
+ * after the repository has been confirmed readable; see `classifyPullRequestNotFound`.
+ *
+ * It is an optional refinement of `{ error }` and not a separate arm on purpose.
+ * Four callers outside the approvals path discriminate on `"error" in result`
+ * (`terminal-gate-reconciler`, and three sites in `heartbeat.ts`), and for every one
+ * of them a PR that does not exist IS an error: do not resolve the issue, do not
+ * suppress the retry, do not cancel the run. A third arm would compile-error at each
+ * of those sites and invite a semantic decision where the existing one is already
+ * correct. Keeping the discriminator intact means the widening changes behaviour at
+ * exactly one call site — the one that asked for it — and `reason` still carries
+ * `pull_request_http_404` for their logs.
+ */
 export type PullRequestGateResult =
   | { state: "open" | "closed"; merged: boolean }
-  | { error: string };
+  | { error: string; notFound?: true };
 
 export type GitHubCommitEvidenceResult =
   | { found: true }
@@ -297,6 +317,39 @@ export async function githubHasCommitEvidence(input: {
   }
 }
 
+/**
+ * Disambiguate a 404 on a pull-request lookup (PEN-5254).
+ *
+ * `/repos/{owner}/{repo}/pulls/{n}` 404s for two opposite reasons, exactly as the
+ * Actions arm's does: the pull request genuinely does not exist, or the repository
+ * is invisible to this installation. Only the first is a caller error, and only the
+ * first may ever reach the file-time refusal — telling an agent its PR number is
+ * wrong while the App is mid-reinstall would refuse a correct card for a platform
+ * fault.
+ *
+ * ⚠ The repo probe is what separates them, and it is why this is not implemented as
+ * `retryable === false`. `isRetryableGithubHttpStatus` is `408 || 409 || 429 || >=500`,
+ * so 401 and a non-rate-limit 403 are also non-retryable — a broken or revoked
+ * installation token would then refuse every PR-gated escalation at the door, which
+ * is the exact failure the refusal's own contract forbids. Only a 404 whose repo
+ * probe came back readable sets `notFound`.
+ *
+ * ⭐ The most likely way this fires in practice is not a typo: `/pulls/{n}` 404s when
+ * `n` is an ISSUE number rather than a pull request, and an agent has the issue
+ * number to hand when it files the card.
+ */
+async function classifyPullRequestNotFound(input: {
+  apiBase: string;
+  repoFullName: string;
+  token: string;
+  signal?: AbortSignal;
+}): Promise<PullRequestGateResult> {
+  const probe = await probeRepoReadability({ ...input, reasonPrefix: "pull_request" });
+  // The repo is readable, so the pull request really is absent.
+  if (probe.readable) return { error: "pull_request_not_found", notFound: true };
+  return { error: probe.reason };
+}
+
 export async function githubGetPullRequestGate(input: {
   repoFullName: string;
   prNumber: number;
@@ -314,6 +367,14 @@ export async function githubGetPullRequestGate(input: {
     });
   } catch {
     return { error: "pull_request_fetch_failed" };
+  }
+  if (res.status === 404) {
+    return await classifyPullRequestNotFound({
+      apiBase,
+      repoFullName: input.repoFullName,
+      token: tokenResult.token,
+      signal: input.signal,
+    });
   }
   if (!res.ok) {
     const classified = await classifyGithubHttpFailure("pull_request", res);
@@ -1055,29 +1116,58 @@ async function classifyWorkflowRunNotFound(input: {
   repoFullName: string;
   token: string;
 }): Promise<WorkflowRunLookup> {
+  const probe = await probeRepoReadability({ ...input, reasonPrefix: "workflow_run" });
+  // The repo is readable, so the run really is gone.
+  if (probe.readable) return { outcome: "not_found" };
+  return { outcome: "error", retryable: probe.retryable, reason: probe.reason };
+}
+
+type RepoReadabilityProbe =
+  | { readable: true }
+  | { readable: false; retryable: boolean; reason: string };
+
+/**
+ * Is this repository readable by the installation token right now?
+ *
+ * Extracted from `classifyWorkflowRunNotFound` (PEN-5254) so the pull-request arm
+ * can reuse it rather than re-derive it. Nothing about the probe was run-specific
+ * except its `reason` prefix, which is now a parameter — the Actions arm's reason
+ * strings are byte-identical to before, so its behaviour is unchanged.
+ *
+ * The caller's 404 is the only interesting input: a readable repo turns that 404
+ * into positive evidence the named thing is absent, and anything else leaves the
+ * two causes indistinguishable and must defer.
+ */
+async function probeRepoReadability(input: {
+  apiBase: string;
+  repoFullName: string;
+  token: string;
+  reasonPrefix: string;
+  signal?: AbortSignal;
+}): Promise<RepoReadabilityProbe> {
   let res: Response;
   try {
     res = await ghFetch(`${input.apiBase}/repos/${input.repoFullName}`, {
       headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${input.token}` },
+      signal: input.signal,
     });
   } catch {
-    return { outcome: "error", retryable: true, reason: "workflow_run_repo_probe_failed" };
+    return { readable: false, retryable: true, reason: `${input.reasonPrefix}_repo_probe_failed` };
   }
-  // The repo is readable, so the run really is gone.
-  if (res.ok) return { outcome: "not_found" };
+  if (res.ok) return { readable: true };
   if (res.status === 404 || res.status === 403 || res.status === 401) {
     // Not retryable in the sense that waiting will not fix it — it needs an
     // installation or permission change. Deferring (never closing) is the safe
     // direction: a stale card costs a queue row, a wrongly-cancelled one costs a
     // production deploy gate that cannot be un-cancelled.
     return {
-      outcome: "error",
+      readable: false,
       retryable: false,
-      reason: `workflow_run_repo_inaccessible_${res.status}`,
+      reason: `${input.reasonPrefix}_repo_inaccessible_${res.status}`,
     };
   }
-  const classified = await classifyGithubHttpFailure("workflow_run_repo", res);
-  return { outcome: "error", retryable: classified.retryable, reason: classified.reason };
+  const classified = await classifyGithubHttpFailure(`${input.reasonPrefix}_repo`, res);
+  return { readable: false, retryable: classified.retryable, reason: classified.reason };
 }
 
 export async function githubGetWorkflowRun(input: {
