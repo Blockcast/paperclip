@@ -4127,7 +4127,35 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         // off the resolved value rather than written as the constant it is
         // today, so that if that gate is ever changed this line reports what
         // happened instead of what used to.
-        sessionResume: claudeResumeSessionId ? "resumed" : "refused_foreign_claim",
+        //
+        // PEN-5238: THREE-valued, because the fact it reports is. The earlier
+        // two-valued form labelled a run that never asked to resume anything
+        // `refused_foreign_claim`, which sends an operator looking for a
+        // refusal that did not occur — the failure mode this whole warn exists
+        // to remove. `resolveResumableClaudeSessionId` returns "" for both
+        // cases and cannot be told apart from its result alone, so the arms
+        // are distinguished by the REQUEST instead:
+        //   - `resumed`                -> unreachable here today and emitted
+        //     anyway, per the paragraph above: `serverCanPreCreate` is
+        //     `narrowWritableSurface && serverHoldsDataClaim` and this block is
+        //     `narrowWritableSurface && !serverCanPreCreate`, so the claim is
+        //     always foreign on this line and the resolver always returns "".
+        //     It goes wrong loudly if that ever stops holding.
+        //   - `refused_foreign_claim`  -> a session WAS requested, and the
+        //     claim gate is what took it: that `return ""` sits above both the
+        //     model-mismatch and the transcript-existence checks, so on this
+        //     line no other cause can be the one that refused.
+        //   - `none_requested`         -> nothing was asked for, so nothing was
+        //     refused. A cold wake, not a loss.
+        // Trimmed to match the resolver's own admission: `asString` does not
+        // trim, so a whitespace-only session id is truthy here while the
+        // resolver treats it as absent and returns "" at its `!sessionId`
+        // guard. Untrimmed, that run reports a refusal it never suffered.
+        sessionResume: claudeResumeSessionId
+          ? "resumed"
+          : runtimeSessionId.trim()
+            ? "refused_foreign_claim"
+            : "none_requested",
         runId,
         jobName,
         dataClaimName,
