@@ -336,7 +336,7 @@ export function renderReport(result, { base, head, today } = {}) {
       "It is a THREE-line edit: REVIEW_LAST_COMPLETED to the date the review was done,",
       "REVIEW_DUE to the next one, and REVIEW_NOTICE ahead of that. Moving REVIEW_DUE",
       "alone is the edit that defeats the purpose; leaving REVIEW_NOTICE in the past",
-      "clears this freeze but warns on every run until the next window opens.",
+      "clears this freeze but warns on every run from the edit to the new REVIEW_DUE.",
     );
   }
 
