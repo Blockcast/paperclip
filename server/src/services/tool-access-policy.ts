@@ -44,6 +44,7 @@ import { toolPolicyConditionsSchema } from "@paperclipai/shared";
 import { badRequest, conflict, notFound, unprocessable } from "../errors.js";
 import { narrowestScopeBindings, profileIdsInBindingOrder } from "./tool-profile-binding-precedence.js";
 import { recordToolRuntimeAuditWriteFailure } from "./tool-runtime-metrics.js";
+import { principalGrantColumns } from "./access-columns.js";
 
 type ToolAccessContext = {
   companyId: string;
@@ -1022,7 +1023,7 @@ export function toolAccessPolicyService(db: Db) {
     const principalId = ctx.actorType === "agent" ? ctx.agentId : ctx.actorId;
     if (!principalType || !principalId) return false;
     const grants = await db
-      .select()
+      .select(principalGrantColumns)
       .from(principalPermissionGrants)
       .where(and(
         eq(principalPermissionGrants.companyId, ctx.companyId),

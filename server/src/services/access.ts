@@ -13,63 +13,16 @@ import { logActivity, type LogActivityInput } from "./activity-log.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
 import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
+import { membershipColumns, principalGrantColumns } from "./access-columns.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
 
-// Both column lists below are a DECISION, not a convenience.
-//
-// A bare `db.select()` means a column added to either table reaches every
-// consumer of these functions by default — including the two routes that
-// serialise the row straight out to an API client
-// (`routes/access.ts` agent-permissions response, `routes/agents.ts`
-// `buildAgentAccessState`). That is reach granted by the shape of the query
-// rather than by anyone deciding it, which is the same defect PEN-5232
-// records one layer up.
-//
-// `principal_permission_grants.scope` is the concrete reason this matters
-// more than "nobody would add a sensitive column": it is an uncontained
-// `jsonb` whose shape is not pinned by its type, so its *contents* can widen
-// with no migration at all.
-//
-// These lists are the full current column set of each table, because every
-// field is already read by some consumer (see PEN-5258 for the per-consumer
-// survey) — the point is not to narrow today's response, it is that the NEXT
-// column must be added here deliberately before it can reach `getMembership`'s
-// or `listPrincipalGrants`' callers.
-// ⇒ Adding a column to either table does NOT belong in these lists by
-//    default. Add it only once you have decided every consumer should see it.
-//
-// SCOPE OF THAT GUARANTEE — it is these two read paths, not the tables.
-// `company_memberships` is still read bare elsewhere in this file
-// (`listMembers`, `getMemberById`, `listActiveUserMemberships`), and
-// `ensureMembership` returns `.returning()` full rows from both its update and
-// its insert path. A new column therefore still reaches those by default. It
-// does not currently leak: every `ensureMembership` caller
-// (`routes/access.ts`, `routes/agents.ts`) discards the returned row. Giving
-// those call sites the same projection is the obvious next ratchet step and is
-// deliberately out of PEN-5258's scope, which is these two functions only.
-export const membershipColumns = {
-  id: companyMemberships.id,
-  companyId: companyMemberships.companyId,
-  principalType: companyMemberships.principalType,
-  principalId: companyMemberships.principalId,
-  status: companyMemberships.status,
-  membershipRole: companyMemberships.membershipRole,
-  createdAt: companyMemberships.createdAt,
-  updatedAt: companyMemberships.updatedAt,
-} as const;
-
-export const principalGrantColumns = {
-  id: principalPermissionGrants.id,
-  companyId: principalPermissionGrants.companyId,
-  principalType: principalPermissionGrants.principalType,
-  principalId: principalPermissionGrants.principalId,
-  permissionKey: principalPermissionGrants.permissionKey,
-  scope: principalPermissionGrants.scope,
-  grantedByUserId: principalPermissionGrants.grantedByUserId,
-  createdAt: principalPermissionGrants.createdAt,
-  updatedAt: principalPermissionGrants.updatedAt,
-} as const;
+// The two column lists live in `./access-columns.js` so that
+// `services/authorization.ts` can import them without a cycle (this module
+// imports `authorization.ts`). They are re-exported here because this is where
+// callers — and `access-column-projections.test.ts` — have always found them.
+// Read that module for why the lists are a decision rather than a convenience.
+export { membershipColumns, principalGrantColumns } from "./access-columns.js";
 
 type GrantInput = {
   permissionKey: PermissionKey;
@@ -152,7 +105,7 @@ export function accessService(db: Db) {
 
   async function listMembers(companyId: string) {
     return db
-      .select()
+      .select(membershipColumns)
       .from(companyMemberships)
       .where(eq(companyMemberships.companyId, companyId))
       .orderBy(sql`${companyMemberships.createdAt} desc`);
@@ -160,7 +113,7 @@ export function accessService(db: Db) {
 
   async function getMemberById(companyId: string, memberId: string) {
     return db
-      .select()
+      .select(membershipColumns)
       .from(companyMemberships)
       .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
       .then((rows) => rows[0] ?? null);
@@ -168,7 +121,7 @@ export function accessService(db: Db) {
 
   async function listActiveUserMemberships(companyId: string) {
     return db
-      .select()
+      .select(membershipColumns)
       .from(companyMemberships)
       .where(
         and(
@@ -240,7 +193,7 @@ export function accessService(db: Db) {
       `);
 
       const existing = await tx
-        .select()
+        .select(membershipColumns)
         .from(companyMemberships)
         .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
         .then((rows) => rows[0] ?? null);
@@ -282,7 +235,7 @@ export function accessService(db: Db) {
           updatedAt: now,
         })
         .where(eq(companyMemberships.id, existing.id))
-        .returning()
+        .returning(membershipColumns)
         .then((rows) => rows[0] ?? existing);
 
       await tx
@@ -389,7 +342,7 @@ export function accessService(db: Db) {
       `);
 
       const existing = await tx
-        .select()
+        .select(membershipColumns)
         .from(companyMemberships)
         .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
         .then((rows) => rows[0] ?? null);
@@ -470,7 +423,7 @@ export function accessService(db: Db) {
           updatedAt: now,
         })
         .where(eq(companyMemberships.id, existing.id))
-        .returning()
+        .returning(membershipColumns)
         .then((rows) => rows[0] ?? existing);
 
       return {
@@ -507,7 +460,7 @@ export function accessService(db: Db) {
 
   async function listUserCompanyAccess(userId: string) {
     return db
-      .select()
+      .select(membershipColumns)
       .from(companyMemberships)
       .where(and(eq(companyMemberships.principalType, "user"), eq(companyMemberships.principalId, userId)))
       .orderBy(sql`${companyMemberships.createdAt} desc`);
@@ -640,7 +593,7 @@ export function accessService(db: Db) {
           .update(companyMemberships)
           .set({ status, membershipRole, updatedAt: new Date() })
           .where(eq(companyMemberships.id, existing.id))
-          .returning()
+          .returning(membershipColumns)
           .then((rows) => rows[0] ?? null);
         return updated ?? existing;
       }
@@ -656,7 +609,7 @@ export function accessService(db: Db) {
         status,
         membershipRole,
       })
-      .returning()
+      .returning(membershipColumns)
       .then((rows) => rows[0]);
   }
 
@@ -817,7 +770,7 @@ export function accessService(db: Db) {
       });
 
       const grants = await tx
-        .select()
+        .select(principalGrantColumns)
         .from(principalPermissionGrants)
         .where(
           and(
@@ -856,8 +809,10 @@ export function accessService(db: Db) {
 
     await ensureMembership(companyId, principalType, principalId, "member", "active");
 
+    // Existence check only — this reads nothing but the id it updates by, so
+    // it does not need (and should not inherit) the whole-row projection.
     const existing = await db
-      .select()
+      .select({ id: principalPermissionGrants.id })
       .from(principalPermissionGrants)
       .where(
         and(
@@ -913,7 +868,7 @@ export function accessService(db: Db) {
       `);
 
       const existing = await tx
-        .select()
+        .select(membershipColumns)
         .from(companyMemberships)
         .where(and(eq(companyMemberships.companyId, companyId), eq(companyMemberships.id, memberId)))
         .then((rows) => rows[0] ?? null);
@@ -954,7 +909,7 @@ export function accessService(db: Db) {
           updatedAt: new Date(),
         })
         .where(eq(companyMemberships.id, existing.id))
-        .returning()
+        .returning(membershipColumns)
         .then((rows) => rows[0] ?? existing);
     });
   }
