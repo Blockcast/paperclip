@@ -308,6 +308,8 @@ exits with a distinct code for each so a script can branch on it:
 | `NO_CREDENTIAL` | 2 | no usable token on this pod (absent / empty / unreadable / malformed binding); `gh` will refuse with exit 64 |
 | `AMBIENT_AUTH` | 3 | the wrapper supplied no token and none was named, so `gh` uses whatever auth you already had (your own `GH_TOKEN`/`GITHUB_TOKEN`, or `~/.config/gh/hosts.yml`) — **the self-test does not probe that**; with no ambient credential, `gh` is unauthenticated (60 req/hr) |
 | `GITHUB_UNREACHABLE` | 4 | the request never completed — a network fault, **not** a credential fault |
+| `UNEXPECTED` | 5 | the authenticated probe returned a status none of the above covers — report it with the generation line |
+| _(no verdict)_ | 70 | the self-test could not run: it cannot create a temp file under `$TMPDIR`. A local fault in the diagnostic, which says nothing either way about the credential |
 
 It answers even when every other `gh` invocation is exiting 64, prints no
 credential material, and is safe to paste into an issue thread.
