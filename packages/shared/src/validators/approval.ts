@@ -7,22 +7,47 @@ const approvalTitleMessage =
   "Include a short, human-readable payload.title so the card is decidable in the board queue.";
 
 /**
- * Machine-readable pointer from a card to the external gate a human must act on.
+ * Machine-readable pointer from a card to the external event that ends its ask.
  *
- * Cards that escalate a CI/deploy gate have only ever carried the run as prose in
+ * Cards that escalate a CI/deploy gate had only ever carried the run as prose in
  * `payload.title` / `summary` / `recommendedAction`, so nothing could tell whether
  * the gate a card names is still alive. Cards then outlive their runs: BLO-29359
  * recorded three `paperclip-production` gates dying unclicked in 24h, one card
  * pointing approvers at a cancelled run for ~19h, and an approver had no way to
  * see that was what happened.
  *
- * Supplying this lets `approval-gate-reconciler` close the card when the run
- * reaches a terminal state. It stays optional because most approval types have no
- * external gate — absence means "nothing to reconcile", never "gate is healthy".
+ * Supplying this lets `approval-gate-reconciler` close the card when the named
+ * event reaches a terminal state. It stays optional because many asks have no
+ * machine-checkable event — absence means "nothing to reconcile", never "gate is
+ * healthy".
+ *
+ * ## Two kinds, one rule (PEN-5254)
+ *
+ * The rule governing BOTH kinds is: **the gate IS the ask**, not a related link.
+ * The card is retired the moment the named event terminates, whether or not anyone
+ * read the ask — so a gate attached to an event that merely provides context
+ * retires the card for a reason that has nothing to do with it (PEN-5103).
+ *
+ *   - `github_actions_run` — the ask is a human clicking that Actions gate.
+ *   - `github_pr_merged`   — the ask is that pull request merging.
+ *
+ * `github_pr_merged` exists because the Actions-only shape did not cover the event
+ * most cards are actually about. Measured on the DevOps seat: 0 of 98 cards carried
+ * a gate, while 19 of its 36 self-retiring cards keyed their retirement on a PR
+ * merge and said so only in prose. A prose promise is void in exactly the branch
+ * where the ask succeeds, because `withdraw` accepts only the undecided set and
+ * returns 409 on a decided card — so those cards could never be retired by anyone.
+ *
+ * ⚠️ Widening this field also widens its blast radius, and deliberately so. An
+ * agent has an Actions `runId` only when the ask genuinely is a deployment gate; it
+ * has a PR number for nearly every card it files. The scarcity of the ref shape was
+ * doing real safety work (7 well-formed gates across 854 cards), and that is why
+ * `gateAlreadyTerminalRefusal` in `routes/approvals.ts` is mirrored for this kind
+ * in the same change: without a file-time refusal, the first PR-gated card naming
+ * yesterday's merge is dead on arrival.
  */
-export const approvalGateSchema = z.object({
-  kind: z.literal("github_actions_run"),
-  repoFullName: z
+const gateRepoFullNameSchema = () =>
+  z
     .string()
     .trim()
     // GitHub's real charset, not just "no slashes or spaces". The looser
@@ -37,12 +62,57 @@ export const approvalGateSchema = z.object({
     .refine(
       (value) => !value.split("/").some((segment) => segment === "." || segment === ".."),
       "gate.repoFullName must not contain `.` or `..` path segments",
-    ),
+    );
+
+/** The ask is a human clicking a specific GitHub Actions deployment gate. */
+export const approvalActionsRunGateSchema = z.object({
+  kind: z.literal("github_actions_run"),
+  repoFullName: gateRepoFullNameSchema(),
   runId: z.number().int().positive(),
   url: z.string().trim().url().optional(),
 });
 
+/** The ask is a specific pull request merging. */
+export const approvalPullRequestGateSchema = z.object({
+  kind: z.literal("github_pr_merged"),
+  repoFullName: gateRepoFullNameSchema(),
+  prNumber: z.number().int().positive(),
+  url: z.string().trim().url().optional(),
+});
+
+export const approvalGateSchema = z.discriminatedUnion("kind", [
+  approvalActionsRunGateSchema,
+  approvalPullRequestGateSchema,
+]);
+
+/**
+ * Every kind the reconciler is expected to sweep.
+ *
+ * Exported so the candidate predicate in `approval-gate-reconciler.ts` is derived
+ * from this list rather than hand-repeating the literals in SQL. A kind added here
+ * but missing from that predicate would be accepted at the door and then never
+ * reconciled — a card that advertises self-retirement and silently never retires,
+ * which is the exact defect PEN-5254 exists to remove.
+ */
+export const APPROVAL_GATE_KINDS = ["github_actions_run", "github_pr_merged"] as const;
+
+export type ApprovalGateKind = (typeof APPROVAL_GATE_KINDS)[number];
+export type ApprovalActionsRunGate = z.infer<typeof approvalActionsRunGateSchema>;
+export type ApprovalPullRequestGate = z.infer<typeof approvalPullRequestGateSchema>;
 export type ApprovalGate = z.infer<typeof approvalGateSchema>;
+
+/**
+ * Human-readable identity of the event a gate names, in one place.
+ *
+ * Both the reconciler's announcements and the route's refusal print this, and they
+ * must agree: a card refused at the door naming `owner/repo#12` and later closed
+ * naming `owner/repo run 12` would read as two different gates.
+ */
+export function approvalGateRef(gate: ApprovalGate): string {
+  return gate.kind === "github_actions_run"
+    ? `${gate.repoFullName} run ${gate.runId}`
+    : `${gate.repoFullName}#${gate.prNumber}`;
+}
 
 /**
  * Read a gate out of a persisted `payload` jsonb blob.

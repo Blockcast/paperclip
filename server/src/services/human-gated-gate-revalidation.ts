@@ -47,7 +47,7 @@
  *
  * - **Blocker-premise** reads `issue_relations` + the blockers' `status`.
  * - **Approval-gate** reads `issue_approvals` + `approvals.status`. It does
- *   *not* re-call the GitHub API for `gate.kind: github_actions_run` cards,
+ *   *not* re-call the GitHub API for cards carrying a `payload.gate`,
  *   because `approval-gate-reconciler.ts` already polls those runs and closes
  *   the card when the run terminates. Reading the card's status reuses that
  *   audited mechanism instead of building a second, disagreeing one.
@@ -486,9 +486,10 @@ export function probeBlockerPremise(input: GateEvidenceInput): ProbeResult | nul
 /**
  * Approval-gate probe.
  *
- * Reads the linked cards' own statuses. For `gate.kind: github_actions_run`
- * cards that status is already maintained against the live run by
- * `approval-gate-reconciler.ts`, so this needs no GitHub call of its own.
+ * Reads the linked cards' own statuses. For any card carrying a `payload.gate`
+ * that status is already maintained against the live event by
+ * `approval-gate-reconciler.ts` — a workflow run for `github_actions_run`, a pull
+ * request for `github_pr_merged` — so this needs no GitHub call of its own.
  *
  * Four outcomes (PEN-3089 split the last three out of one):
  *
