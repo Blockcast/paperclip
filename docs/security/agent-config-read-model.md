@@ -804,6 +804,7 @@ revision row. Cited by symbol; grep for it.
 | the instructions-bundle materializer (`routes/agents.ts`) | `adapterConfig` | `PATCH /agents/:id/instructions-bundle`, and the lazy migration off a legacy prompt template |
 | the join-request replay (`routes/access.ts`) | `adapterType`, `adapterConfig` | approving a company join request |
 | `agentService.create` | all of them — **there is no creation revision at all** | every hire |
+| `agentService.remove` (`services/agents.ts`) | `reportsTo`, on every *direct report* of the deleted agent — not on the agent being deleted | `DELETE /api/agents/:id` |
 
 **The two columns are affected differently, and the difference matters when you
 are deciding how much to trust a chain.**
@@ -818,6 +819,13 @@ are deciding how much to trust a chain.**
   records. A `runtimeConfig` gap is therefore a much stronger signal that
   something unusual wrote the column, and is worth chasing rather than shrugging
   at.
+
+`agentService.remove` is the one that moves a column on a seat **other** than
+the one being written to. Deleting a manager runs
+`tx.update(agents).set({ reportsTo: null })` over all of its reports, so in a
+`reportsTo` chain the gap appears as an unexplained jump to `null` on agents
+nobody edited — and the agent whose deletion caused it is gone from the table by
+the time anyone reads the chain.
 
 `agentService.create` writing nothing is the quietest of these. It means every
 seat's chain begins unanchored: the earliest revision's `before` is the first
@@ -902,12 +910,31 @@ before the key rename and is true after it.
 ### Not fixed here
 
 Making the bypassing writers record is a behaviour change per path and is
-deliberately not bundled with this description. The budget mirrors in particular
-are not a one-line fix: `upsertPolicy` runs inside caller transactions with a
-stated lock order (policy row, then agent), which is exactly why the two call
-sites that *do* record wrap it in a companion `agentService.update` rather than
-putting the update inside it. Moving it inside would invert that order and
-reintroduce the `BLO-32796` ABBA deadlock.
+deliberately not bundled with this description.
+
+**The lock order is not what stops the budget mirrors**, though it is the
+plausible wrong answer and was the one this section first reached for. The
+mirror inside `upsertPolicy` already issues its `UPDATE agents` *after* that
+function's own policy write, so the pair order there is already policy → agent.
+Replacing it in place with
+`agentService.update(..., { recordRevision })` takes the same agent row lock at
+the same point and adds an insert into `agent_config_revisions`, which holds no
+policy lock — nothing moves ahead of the policy lock and the `BLO-32796` rule is
+not violated. The two call sites that *do* record would not produce duplicate
+rows either: each writes the equal value first, so `diffConfigSnapshot` returns
+an empty `changedKeys` and the `changedKeys.length > 0` guard in
+`agentService.update` skips the second insert. Anyone picking this gap up should
+not be warned off by a deadlock that is not there.
+
+The real cost is semantics and attribution. `agentService.update` is not a thin
+setter: it throws `conflict` when the target is `pending_approval` and the patch
+moves any `CONFIG_REVISION_FIELDS` column, and `budgetMonthlyCents` is one — so
+a policy upsert naming a not-yet-approved hire, reachable through
+`POST /companies/:id/budgets/policies`, would begin answering 409
+`pending_approval_agent_config_frozen` from inside a budget write. And
+`upsertPolicy` receives only `actorUserId`, so `createdByAgentId` would be null
+on every row it produced until the callers thread an agent actor through. Both
+are tractable; both are behaviour changes that want their own row.
 
 ## Regression tests
 

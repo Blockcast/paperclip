@@ -790,8 +790,10 @@ export function agentService(db: Db) {
       // leaves no audit trace, and several live callers do exactly that —
       // `company-portability` import, `activatePendingApproval` below, the
       // instructions-bundle materializer and the join-request replay in
-      // `routes/`, plus the two raw `budget_monthly_cents` mirrors in
-      // `services/budgets.ts` that never come through this function at all.
+      // `routes/`, plus the raw writers that never come through this function
+      // at all: the two `budget_monthly_cents` mirrors in `services/budgets.ts`
+      // and the `reportsTo` null-out in `remove` below, which clears that
+      // column on every direct report of a deleted agent.
       //
       // The consequence is a log whose rows are individually true and
       // collectively incomplete: a reader chaining `before`/`after` across
