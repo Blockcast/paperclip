@@ -482,7 +482,33 @@ export function resolveScopedWritableMounts(input: {
   // identity-mapped (`subPath` = its own path), which is right on the read-only
   // base but, under a scratch mount, re-opens the legacy unscoped `wt/<x>` or
   // `work/<x>` tree over the company-scoped one.
-  const common = resolveLinkedWorktreeCommonDir(isolation.workspaceRoot, dataMountPath, mounts, serverDataMountPath);
+  //
+  // PEN-5234 (PEN-4932 invariant 9). Skipped outright on a foreign claim. Every
+  // read in there is a server-side `readFileSync` of a POD path landed on
+  // `serverRoot`, and once the Job's volume is the agent's own there is nothing
+  // of the pod's at that address — all three reads ENOENT. The first failure
+  // takes the `if (!pointer) return null` early return, which is ABOVE the
+  // `worktree_gitdir_rejected` warn, so the answer is not merely wrong but
+  // indistinguishable from the legitimate "ordinary checkout, no linked
+  // worktree" one, and even the diagnostic is lost. Worse, the server's own
+  // volume may hold a VERIFIABLE registration at that exact path — the
+  // identically-spelled tree it realized — in which case the function returns a
+  // confident `common` for a worktree this pod will never see, and the manifest
+  // grows a writable mount covering another volume's git dir. This gate also
+  // makes the function's remaining reads sound by construction rather than by
+  // accident: it is called only where `serverRoot` and the pod's volume are the
+  // same one. Every other crossing found in this sweep got the same guard —
+  // `resolveScopedWritableMounts` already takes `serverHoldsDataClaim` and uses
+  // it for PEN-5191's read-only instructions root; this call simply did not
+  // consult it.
+  //
+  // Nothing is lost by skipping it: the mount it adds exists to keep git writes
+  // off EROFS, and an opted-in run with a server-realized tree is refused at
+  // dispatch (see `buildJobManifest`) rather than reaching a worktree at all.
+  const common =
+    input.serverHoldsDataClaim === false
+      ? null
+      : resolveLinkedWorktreeCommonDir(isolation.workspaceRoot, dataMountPath, mounts, serverDataMountPath);
   if (!common || coveringMount(mounts, common)) return mounts;
   accept("isolation.workspaceRoot git common dir", common);
   return toMounts();
@@ -3431,6 +3457,65 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
     selfPodPvcClaimName: selfPod.pvcClaimName,
   });
 
+  // PEN-5234 — PEN-4932 invariant 9, and the largest of them: the artifact that
+  // crosses the volume here is THE WORKING TREE THE RUN OPERATES ON.
+  //
+  // The writer is the SERVER. `realizeExecutionWorkspace` clones, fetches and
+  // (for `git_worktree`, the default strategy for `isolated_workspace`) runs
+  // `git worktree add` against server-local paths — rooted at the server's own
+  // `/paperclip` mount. The reader is the POD, which reaches that tree only as
+  // a `data`-volume `subPath` bind. Those are the same bytes only while the two
+  // processes mount the same VOLUME, which is exactly `serverHoldsDataClaim`.
+  // Nothing in the realization path is claim-aware: `agentWorkspaceClaim` and
+  // friends appear here, in the isolation-reclaim services and in the reaper,
+  // and in NONE of `workspace-runtime.ts`, `workspace-realization.ts` or
+  // `execution-workspace-policy.ts`. So on a per-agent claim the server writes
+  // to a volume the pod does not mount, and the two NEVER converge — the only
+  // writer is on the wrong side of the boundary.
+  //
+  // ⛔ Refused, for the standing reason invariants 5 and 7 both record: do not
+  // fix this by translating `workspaceCwd` to a server address. A prefix swap
+  // is sound only where one volume is reachable from both processes at two
+  // roots. Here the pod's volume is not reachable from the server at ANY path,
+  // so a translation turns a wrong answer into a confidently wrong one.
+  //
+  // The failure is PERMISSIVE and SILENT in both isolation modes, which is why
+  // it is refused at dispatch rather than reported. Under `run` isolation the
+  // bootstrap below is guarded on the source repo existing and falls to its
+  // `else` branch — written for stateless runs that legitimately start outside
+  // a repository — handing the run an empty directory with no error, no
+  // warning, exit 0 and complete parseable stdout. Every other isolation mode
+  // mounts the execution workspace directly, so the cwd simply IS the empty
+  // `subPath`. Either way the run has no code at all and still scores a PASS
+  // against PEN-4932's done-when 1 ("two co-located pods report distinct volume
+  // IDs"), which is the false-PASS this refusal exists to prevent.
+  //
+  // Scoped by `serverRealizedTree`, supplied by the server (`heartbeat.ts`,
+  // `isWorkspaceLessFallbackWorkspaceDir`). A run that resolved no project and
+  // no session is handed a workspace-less fallback directory precisely BECAUSE
+  // it is empty, and that expectation holds on a per-agent claim exactly as it
+  // does on the server's own — so those runs are unaffected, and an operator
+  // nominating such an agent can still observe done-when 1 on a genuinely
+  // working run. The discriminator is not re-derived here on purpose: `source`,
+  // `repoUrl` and `workspaceId` each leak in one direction or the other (see
+  // that helper), and only the server knows which directory it resolved.
+  //
+  // Absent means REFUSE. A server too old to send the field tells us nothing
+  // about which case this is, and the costly direction is the silent empty run,
+  // not a named refusal on a claim nobody has opted into yet.
+  const serverRealizedTree = asBoolean(workspaceContext.serverRealizedTree, true);
+  if (!serverHoldsDataClaim && workspaceCwd && serverRealizedTree) {
+    throw new Error(
+      `Refusing to dispatch: this Job's data volume is claim "${dataClaimName}", not the server's own `
+        + `("${selfPod.pvcClaimName ?? ""}"), but its execution workspace "${workspaceCwd}" was realized by the `
+        + `server onto the server's volume. The pod cannot reach it, so the run would start from an EMPTY `
+        + `working tree and still exit 0 (PEN-5234, PEN-4932 invariant 9). Realization is not claim-aware; `
+        + `moving it into the pod is the fix, and until then an agent with a project or session execution `
+        + `workspace cannot run on a per-agent volume. Clear "enablePerAgentWorkspaceVolume" on this `
+        + `agent, or nominate an agent that resolves no execution workspace.`,
+    );
+  }
+
   // Build prompt (same logic as claude_local)
   const promptTemplate = asString(
     config.promptTemplate,
@@ -3953,6 +4038,24 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         // run with skills but zero of both is the shape to go looking at.
         promptBundleProjectedFiles: promptBundleProjection?.fileCount ?? 0,
         promptBundleRelinkedSkills: promptBundleSkillLinkStep ? (promptBundleSkillLinks?.length ?? 0) : 0,
+        // What this run gave up to reach a foreign claim, named rather than
+        // left to be inferred from an absence. PEN-5189 recorded exactly this
+        // as its residual: a refusal that is not published has no observable
+        // except a missing flag in the Job spec.
+        //
+        // `executionWorkspace` is the PEN-5234 verdict. Reaching this line at
+        // all means it is `workspace_less_fallback`: the only other value the
+        // dispatch admits is refused above, and this warn is downstream of
+        // that throw. It is emitted anyway so a reader does not have to know
+        // that, and so the field goes wrong loudly if the refusal is ever
+        // narrowed.
+        executionWorkspace: serverRealizedTree ? "server_realized_unreachable" : "workspace_less_fallback",
+        // PEN-5189: the session is never resumed on a foreign claim, because
+        // the transcript the predicate stats is on the server's volume. READ
+        // off the resolved value rather than written as the constant it is
+        // today, so that if that gate is ever changed this line reports what
+        // happened instead of what used to.
+        sessionResume: claudeResumeSessionId ? "resumed" : "refused_foreign_claim",
         runId,
         jobName,
         dataClaimName,
@@ -4458,6 +4561,10 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // chain is guarded and each breadcrumb reports the exit code, so 124 (killed
   // by the wall-clock bound) stays distinguishable from git's own 128.
   const boundedRunWorkspaceGit = `timeout 60 ${runWorkspaceGit} -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=15`;
+  // PEN-5234: the degenerate combination the `else` branch below must not
+  // absorb silently — the server realized a tree, and this pod mounts a
+  // different volume from the one it realized onto.
+  const workspaceSourceSevered = serverRealizedTree && !serverHoldsDataClaim;
   const workspaceSetup = isolation.mode === "run" && workspaceCwd && workspaceCwd !== isolation.workspaceRoot
     ? [
         `if git -C ${quoteShellArg(workspaceCwd)} rev-parse --verify HEAD >/dev/null 2>&1; then`,
@@ -4530,7 +4637,51 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         // Stateless PR-review agents may start from the generic per-agent fallback
         // directory, which is intentionally not a repository. Give those runs a
         // clean private cwd; the review workflow clones its target repository.
-        `else rm -rf ${quoteShellArg(isolation.workspaceRoot)} && mkdir -p ${quoteShellArg(isolation.workspaceRoot)};`,
+        //
+        // PEN-5234 (PEN-4932 invariant 9) — this branch is now SAID OUT LOUD.
+        //
+        // Three very different runs arrive here and, until this line, produced
+        // byte-identical behaviour: a run that was never meant to find a
+        // repository; a run whose project workspace is a `local_path`
+        // directory that is not a git checkout; and an opted-in run whose
+        // server-realized tree is on a volume this pod does not mount. Only
+        // the third has no code at all, and it still exits 0 — which is how it
+        // would have scored a PASS against PEN-4932's done-when 1. The server
+        // knows which it is at manifest build time, so the pod states it
+        // rather than leaving a reader to infer it from an absence.
+        //
+        // The severed case is `serverRealizedTree && !serverHoldsDataClaim` —
+        // BOTH conjuncts, and getting that wrong is easy in the costly
+        // direction. `serverRealizedTree` alone is routinely true on the
+        // server's own claim for the `local_path` case above, where this
+        // branch is the correct, working outcome; failing on it would turn a
+        // run that works today into a hard pod failure.
+        //
+        // The severed case is unreachable: `buildJobManifest` refuses that
+        // dispatch before this script is written. It is emitted anyway, and it
+        // EXITS NON-ZERO, because the value of this branch is precisely that
+        // it stops being silent if the refusal is ever narrowed or bypassed.
+        // An empty working tree is not a degraded run to be reported
+        // afterwards; it is a run that cannot do anything, and failing the pod
+        // is the only outcome that cannot be mistaken for success.
+        `else echo ${quoteShellArg(
+          JSON.stringify({
+            level: workspaceSourceSevered ? "error" : "info",
+            event: "claude_k8s.workspace_source_absent",
+            msg: workspaceSourceSevered
+              ? "execution workspace is absent from this pod's volume; the server realized it onto its own claim (PEN-5234, PEN-4932 invariant 9), so this run would start from an empty working tree"
+              : serverRealizedTree
+                ? "execution workspace is present but is not a repository; starting from a clean private cwd"
+                : "no execution workspace was resolved for this run; starting from a clean private cwd as intended",
+            expected: serverRealizedTree ? "server_realized_tree" : "workspace_less_fallback",
+            dataClaimForeign: !serverHoldsDataClaim,
+            workspaceCwd,
+            dataClaimName,
+            runId,
+          }),
+        )} >&2;`,
+        ...(workspaceSourceSevered ? ["exit 1;"] : []),
+        `rm -rf ${quoteShellArg(isolation.workspaceRoot)} && mkdir -p ${quoteShellArg(isolation.workspaceRoot)};`,
         `fi && cd ${quoteShellArg(isolation.workspaceRoot)}`,
       ].join(" ")
     : "";

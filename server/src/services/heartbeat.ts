@@ -265,6 +265,7 @@ import { companySkillService } from "./company-skills.js";
 import { budgetService, type BudgetEnforcementScope } from "./budgets.js";
 import { secretService, type MissingRuntimeBinding } from "./secrets.js";
 import {
+  isWorkspaceLessFallbackWorkspaceDir,
   resolveAgentEmptyWorkspaceSourceDir,
   resolveDefaultAgentWorkspaceDir,
   resolveManagedProjectWorkspaceDir,
@@ -4871,26 +4872,23 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
 }) {
   const k8sIssue = input.issue;
   const effectiveCwd = readNonEmptyString(input.executionWorkspace.cwd);
-  const agentFallbackCwd = resolveDefaultAgentWorkspaceDir(input.agentId);
   // claude_k8s only clones the source checkout for per-run isolation. Key the
   // invariant on that effective source path, not the resolver label: a missing
   // project cwd can retain source="project_primary" while falling back here.
   //
-  // BLO-18760: also cover source="agent_home" by label. That fallback now
-  // resolves to a repo-less sibling dir rather than the persistent agent home,
-  // so a path-only check would silently stop probing it. Probing it is the
-  // point — the run is allowed through precisely *because* the probe confirms
-  // "not_a_checkout", so if that directory ever acquires a `.git` we park
-  // instead of handing the pod a clone source that can exit 128.
-  const cwdIsAgentHomeFallback =
-    effectiveCwd !== null && path.resolve(effectiveCwd) === path.resolve(agentFallbackCwd);
-  // BLO-18760: the repo-less fallback source is a second directory that means
-  // "this run resolved no project or session workspace". Every check keyed on
-  // the agent-home path must treat it the same way, or the new path silently
-  // escapes guards the old one was subject to.
-  const cwdIsWorkspaceLessFallback =
-    cwdIsAgentHomeFallback ||
-    sameResolvedPath(effectiveCwd, resolveAgentEmptyWorkspaceSourceDir(input.agentId));
+  // BLO-18760: there are TWO workspace-less fallback directories — the
+  // persistent per-agent home and the repo-less sibling — and every check
+  // keyed on one must treat the other the same way, or the second path
+  // silently escapes guards the first was subject to. Probing them is the
+  // point: the run is allowed through precisely *because* the probe confirms
+  // "not_a_checkout", so if either ever acquires a `.git` we park instead of
+  // handing the pod a clone source that can exit 128.
+  //
+  // PEN-5234 moved the two-directory test into `home-paths.ts`, beside both
+  // producers, because the adapter's invariant-9 dispatch refusal needs the
+  // same answer and a second spelling of it would be free to drift. Behaviour
+  // here is unchanged — same two directories, same resolved-path comparison.
+  const cwdIsWorkspaceLessFallback = isWorkspaceLessFallbackWorkspaceDir(effectiveCwd, input.agentId);
   // Gate on the *path*, not just the "agent_home" label, or a resumed run
   // walks straight past this probe. Only the first workspace-less run carries
   // source="agent_home": that cwd is then persisted into the task session, and
@@ -8719,6 +8717,7 @@ export function buildPaperclipWorkspaceContext(input: {
   warnings: string[];
   realization: unknown;
   agentHome: string;
+  agentId: string;
 }) {
   const { executionWorkspace } = input;
   return {
@@ -8735,6 +8734,27 @@ export function buildPaperclipWorkspaceContext(input: {
     worktreePath: executionWorkspace.worktreePath,
     realization: input.realization,
     agentHome: input.agentHome,
+    // PEN-5234 (PEN-4932 invariant 9). Did the SERVER materialize content at
+    // `cwd` that this run is expected to find there?
+    //
+    // Realization is server-side: `realizeExecutionWorkspace` clones, fetches
+    // and runs `git worktree add` against the server's own `/paperclip` mount.
+    // The pod reaches the result only as a `data`-volume `subPath` bind, which
+    // works today solely because the two processes mount the SAME volume. On a
+    // per-agent claim they do not, and the pod's identically-spelled path
+    // resolves on a volume the server cannot write to — so the run gets an
+    // empty cwd, exits 0, and emits complete parseable stdout.
+    //
+    // The adapter owns the claim identity (`serverHoldsJobDataClaim`) and has
+    // to refuse such a dispatch, but only for a run that was supposed to find
+    // something. It cannot tell the two apart on its own: a run handed a
+    // workspace-less fallback directory is MEANT to find it empty, and that
+    // expectation holds on a per-agent claim exactly as on the server's own.
+    // Only this process knows which of the two it resolved, so it says so
+    // rather than leaving the adapter to re-derive it from `source`, `repoUrl`
+    // or `workspaceId` — none of which separate the cases (see
+    // `isWorkspaceLessFallbackWorkspaceDir`).
+    serverRealizedTree: !isWorkspaceLessFallbackWorkspaceDir(executionWorkspace.cwd, input.agentId),
   };
 }
 
@@ -35908,6 +35928,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       mode: effectiveExecutionWorkspaceMode,
       warnings: runtimeWorkspaceWarnings,
       realization: workspaceRealization,
+      agentId: agent.id,
       agentHome: await (async () => {
         const home = resolveDefaultAgentWorkspaceDir(agent.id);
         await fs.mkdir(home, { recursive: true });

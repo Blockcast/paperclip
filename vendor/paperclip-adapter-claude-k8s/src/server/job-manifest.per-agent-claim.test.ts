@@ -350,3 +350,140 @@ describe("the session-resume predicate is gated on the claim (PEN-4932 invariant
     expect(build({ bootstrapPromptTemplate: "PEN-5189-BOOTSTRAP" }).prompt).not.toContain("PEN-5189-BOOTSTRAP");
   });
 });
+
+describe("the EXECUTION WORKSPACE is gated on the claim (PEN-4932 invariant 9 / PEN-5234)", () => {
+  // The largest of the stage-4b crossings: what crosses the volume here is the
+  // working tree the run operates on. `realizeExecutionWorkspace` clones,
+  // fetches and runs `git worktree add` in the SERVER process against the
+  // server's own `/paperclip` mount; the pod reaches the result only as a
+  // `data`-volume `subPath` bind. Once the Job's claim is the agent's own those
+  // are different volumes, and nothing in the realization path is claim-aware —
+  // so the server writes to a volume the pod does not mount and the two never
+  // converge.
+  //
+  // The reason it is a DISPATCH refusal rather than a report: the run otherwise
+  // starts from an empty directory, exits 0 and emits complete parseable
+  // stdout, which is a PASS against PEN-4932's done-when 1 on a run that had no
+  // code at all.
+  const PROJECT_CWD = "/paperclip/instances/default/projects/co1/proj-1/penstock-llm-proxy-core";
+  const FALLBACK_CWD = `/paperclip/instances/default/empty-workspaces/${AGENT_ID}`;
+
+  function build(workspace: Record<string, unknown>, config: Record<string, unknown> = {}) {
+    const ctx = makeCtx(config);
+    ctx.context = { paperclipWorkspace: workspace };
+    return buildJobManifest({ ctx, selfPod });
+  }
+
+  it("NEGATIVE CONTROL: the same workspace on the server's own claim dispatches normally", () => {
+    // Today's entire fleet. The refusal must be inert here — the pod and the
+    // server mount one volume, so the realized tree really is reachable.
+    const built = build({ cwd: PROJECT_CWD, serverRealizedTree: true });
+    expect(dataVolume(built.job)?.persistentVolumeClaim?.claimName).toBe(selfPod.pvcClaimName);
+  });
+
+  it("refuses to dispatch an opted-in run whose tree the server realized onto its own volume", () => {
+    expect(() => build({ cwd: PROJECT_CWD, serverRealizedTree: true }, { enablePerAgentWorkspaceVolume: true }))
+      .toThrow(/EMPTY working tree/);
+  });
+
+  it("names the claim, the workspace and the remedy, because the operator has to act on it", () => {
+    // A refusal an operator cannot act on parks the agent with no wake path.
+    let message = "";
+    try {
+      build({ cwd: PROJECT_CWD, serverRealizedTree: true }, { enablePerAgentWorkspaceVolume: true });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain(agentWorkspaceClaimName(AGENT_ID));
+    expect(message).toContain(PROJECT_CWD);
+    expect(message).toContain("enablePerAgentWorkspaceVolume");
+  });
+
+  it("still dispatches an opted-in run that resolved NO execution workspace", () => {
+    // The scoping that keeps PEN-4932's done-when 1 reachable. A run handed a
+    // workspace-less fallback directory is MEANT to find it empty, and that
+    // expectation holds on a per-agent claim exactly as on the server's own —
+    // so an operator can nominate such an agent and observe two co-located pods
+    // with distinct volume IDs on a run that genuinely works.
+    const built = build({ cwd: FALLBACK_CWD, serverRealizedTree: false }, { enablePerAgentWorkspaceVolume: true });
+    expect(dataVolume(built.job)?.persistentVolumeClaim?.claimName).toBe(agentWorkspaceClaimName(AGENT_ID));
+  });
+
+  it("refuses when the server sent no verdict at all, because absent is not 'fallback'", () => {
+    // Deploy skew fails CLOSED. A server too old to send the field tells us
+    // nothing about which case this is, and the costly direction is the silent
+    // empty run, not a named refusal on a claim nobody has opted into.
+    expect(() => build({ cwd: PROJECT_CWD }, { enablePerAgentWorkspaceVolume: true })).toThrow(/EMPTY working tree/);
+  });
+
+  it("does not fire on a run with no workspace cwd at all", () => {
+    // Nothing was realized, so nothing is unreachable. `context: {}` is also
+    // every other fixture in this file, which is why they are unaffected.
+    expect(() => buildJobManifest({ ctx: makeCtx({ enablePerAgentWorkspaceVolume: true }), selfPod })).not.toThrow();
+  });
+
+  it("tells the pod WHICH of the three cases its empty cwd is (done-when 3)", () => {
+    // The `else` branch of the run-isolated bootstrap absorbs three very
+    // different runs, and until PEN-5234 produced byte-identical behaviour for
+    // all three. These are the two that remain REACHABLE after the dispatch
+    // refusal, and they have to be told apart in the pod log — which is the
+    // only place an operator sees a run that produced no work.
+    const runIsolated = (workspace: Record<string, unknown>, config: Record<string, unknown> = {}) => {
+      const ctx = makeCtx(config);
+      ctx.context = { paperclipWorkspace: workspace };
+      const isolation = ctx.runtime.isolation as unknown as Record<string, unknown>;
+      isolation.isolationMode = "run";
+      isolation.isolationKey = "run:run-abc12345";
+      isolation.workspaceRoot = "/runtime-cache/paperclip-runs/run-abc12345/workspace";
+      isolation.homeRoot = "/runtime-cache/paperclip-runs/run-abc12345/home";
+      isolation.sessionRoot = "/runtime-cache/paperclip-runs/run-abc12345/session";
+      const built = buildJobManifest({ ctx, selfPod });
+      return built.job.spec?.template?.spec?.containers?.[0]?.command?.join(" ") ?? "";
+    };
+
+    // Server's own claim, realized tree that is simply not a repository — a
+    // working run today, which must keep working.
+    const present = runIsolated({ cwd: PROJECT_CWD, serverRealizedTree: true });
+    expect(present).toContain('"expected":"server_realized_tree"');
+    expect(present).toContain('"dataClaimForeign":false');
+    expect(present).toContain('"level":"info"');
+
+    // Opted-in stateless run: the one an operator actually sees after the
+    // flip, and the one that must NOT read as a severed volume.
+    const fallback = runIsolated(
+      { cwd: FALLBACK_CWD, serverRealizedTree: false },
+      { enablePerAgentWorkspaceVolume: true },
+    );
+    expect(fallback).toContain('"expected":"workspace_less_fallback"');
+    expect(fallback).toContain('"dataClaimForeign":true');
+    expect(fallback).toContain('"level":"info"');
+
+    // Neither reachable case fails the pod. The severed one would, and is
+    // unreachable precisely because the dispatch refusal above fires first —
+    // which is the assertion two tests up, not a claim made here.
+    //
+    // Read from the diagnostic to the `rm -rf` that follows it rather than
+    // scanning the whole command for `exit 1;`: the container command carries
+    // that string in unrelated preambles, so a whole-command search passes or
+    // fails on something this test is not about.
+    const betweenDiagnosticAndCleanup = (command: string) => {
+      const marker = command.indexOf("claude_k8s.workspace_source_absent");
+      expect(marker, "diagnostic not emitted").toBeGreaterThan(-1);
+      const afterEcho = command.indexOf(">&2;", marker);
+      expect(afterEcho, "diagnostic not redirected to stderr").toBeGreaterThan(-1);
+      return command.slice(afterEcho + ">&2;".length, command.indexOf("rm -rf", afterEcho));
+    };
+    for (const command of [present, fallback]) expect(betweenDiagnosticAndCleanup(command).trim()).toBe("");
+  });
+
+  // The claim gate on `resolveLinkedWorktreeCommonDir` is pinned in
+  // `job-manifest.test.ts` ("resolves no common dir on a claim the server does
+  // not hold"), not here, and deliberately so. A manifest-level assertion over
+  // this fixture cannot discriminate: there is no worktree registration on disk
+  // at `isolation.workspaceRoot`, so the function returns null with or without
+  // the gate and the test passes under its own mutation. The discriminating
+  // test needs a REAL registration that verifies — which is exactly the case
+  // that matters, since on a foreign claim the server's own volume may still
+  // hold one at the identically-spelled path and answer confidently for a
+  // worktree the pod will never see.
+});

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
@@ -1285,7 +1285,21 @@ describe("buildJobManifest", () => {
       // Nothing that presumes a remote may leak onto the no-upstream path.
       expect(command).not.toContain("remote set-head");
       expect(command).toContain("config paperclip.originRemoved");
-      expect(command).toContain("else rm -rf '/runtime-cache/paperclip-runs/run-abc12345/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
+      // PEN-5234: the `else` branch now opens with a diagnostic naming WHICH of
+      // the three runs that reach it this is, so the literal is no longer
+      // `else rm -rf`. The clean-cwd behaviour it guards is unchanged, and the
+      // assertions are split so a regression names which half moved.
+      expect(command).toContain("else echo '{\"level\":\"info\",\"event\":\"claude_k8s.workspace_source_absent\"");
+      expect(command).toContain("rm -rf '/runtime-cache/paperclip-runs/run-abc12345/workspace' && mkdir -p '/runtime-cache/paperclip-runs/run-abc12345/workspace'");
+      // On the server's own claim the branch never exits: this fixture has a
+      // server-realized tree that simply is not a repository, which is a
+      // working run today and must stay one. Read between the diagnostic and
+      // the cleanup rather than scanning the whole command — `exit 1;` appears
+      // in unrelated preambles, so a whole-command search decides on something
+      // this assertion is not about.
+      const afterDiagnostic = command.indexOf(">&2;", command.indexOf("claude_k8s.workspace_source_absent"));
+      expect(afterDiagnostic).toBeGreaterThan(-1);
+      expect(command.slice(afterDiagnostic + 4, command.indexOf("rm -rf", afterDiagnostic)).trim()).toBe("");
       expect(command).toContain("fi && cd '/runtime-cache/paperclip-runs/run-abc12345/workspace' || exit $?");
       const syntaxCheck = spawnSync("/bin/sh", ["-n", "-c", command], { encoding: "utf8" });
       expect(syntaxCheck.stderr).toBe("");
@@ -5954,11 +5968,12 @@ describe("scoped writable mounts (BLO-32734)", () => {
       git(repo, "worktree", "add", "-q", "-b", "br", worktree);
       return { repo, worktree };
     }
-    function scopedFor(workspaceRoot: string) {
+    function scopedFor(workspaceRoot: string, serverHoldsDataClaim?: boolean) {
       const isolationRoot = join(volume, "instances/default/data/k8s-isolation/workspaces/ws-1");
       return resolveScopedWritableMounts({
         dataMountPath: volume,
         serverDataMountPath: volume,
+        ...(serverHoldsDataClaim === undefined ? {} : { serverHoldsDataClaim }),
         isolation: {
           enabled: true,
           mode: "workspace",
@@ -6078,6 +6093,44 @@ describe("scoped writable mounts (BLO-32734)", () => {
       // Scratch is rw, so a read-only claim would send the operator the wrong way.
       expect(rejected()[0].msg).toContain("not a read-only failure");
       expect(rejected()[0].coveredBy).toEqual({ subPath: "wt/co1", mountPath: join(volume, "wt") });
+    });
+
+    // PEN-5234 (PEN-4932 invariant 9). Every read in
+    // `resolveLinkedWorktreeCommonDir` is a server-side `readFileSync` of a POD
+    // path landed on `serverRoot`. Once the Job's claim is the agent's own,
+    // nothing of the pod's is at that address — but the SERVER's volume may
+    // still hold a perfectly verifiable registration there, because the server
+    // is what realized the tree. So the function does not merely fail to
+    // resolve; it resolves CONFIDENTLY, for a worktree this pod will never see,
+    // and the manifest grows a writable mount covering another volume's git
+    // dir.
+    //
+    // Same fixture, same files on disk, differing ONLY in the claim — which is
+    // what makes this a statement about the volume rather than about a missing
+    // file. Both directions are asserted: dropping the gate makes the first
+    // expectation fail, and gating unconditionally makes the control fail.
+    it("resolves no common dir on a claim the server does not hold, though the registration verifies", () => {
+      const { worktree } = repoWithWorktree("co1");
+      const gitDir = git(worktree, "rev-parse", "--path-format=absolute", "--git-dir");
+
+      // CONTROL: the server's own claim. The registration is read, accepted,
+      // and the mount that keeps git off EROFS is emitted.
+      const own = scopedFor(worktree, true).map((m) => m.mountPath);
+      expect(covered(own, gitDir), JSON.stringify(own)).toBe(true);
+      expect(rejections()).toEqual([]);
+
+      // The same registration is STILL THERE and still verifies; only the
+      // claim moved.
+      expect(existsSync(join(worktree, ".git"))).toBe(true);
+      const foreign = scopedFor(worktree, false).map((m) => m.mountPath);
+      expect(covered(foreign, gitDir), JSON.stringify(foreign)).toBe(false);
+      // Not a rejection either: the function is not reached at all, so no
+      // `worktree_gitdir_rejected` is emitted for a tree that was never read.
+      expect(rejections()).toEqual([]);
+      // ...and the gate withdraws ONLY that mount. Everything the candidate
+      // list produced is unchanged, so this cannot pass by returning nothing.
+      expect(foreign).toEqual(own.filter((m) => !covered([m], gitDir) || m === worktree));
+      expect(foreign).toContain(worktree);
     });
   });
 });
