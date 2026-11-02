@@ -1018,6 +1018,18 @@ export function resolveSeedShape(input: {
  * exists, and there opt an agent in only together with an owner for its claim's
  * capacity.
  *
+ * ⚠️ A MISSING `drive complete` LINE IS NOT ON ITS OWN THAT STANDING RECORD.
+ * A claim with nothing eligible -- every entry still inside `maxAgeDays` by
+ * `mtime` (`fresh`) or by `lastUsedAt` (`in_use`), or an empty tree -- returns
+ * at the driver's `nothingEligible` branch, which sits BEFORE that module's
+ * only `drive complete` site, while still counting into
+ * `claims_total{outcome="ok"}`. So on an ordinary quiet tick a COVERED claim
+ * emits no line, and the rule above read backwards would call it skipped. The
+ * absence is evidence only where the aggregate does not already account for the
+ * claim: zero `failed` and zero `deferred` increase at `{dry_run="false"}` over
+ * the window says every claim the sweep listed was driven, and a claim driven
+ * with nothing eligible is covered.
+ *
  * The cheapest remedy there is to opt the agent
  * back out: its FUTURE runs return to the shared claim, where the existing
  * reaper reaches them with its predicate unchanged. ⚠️ It does NOT reclaim
