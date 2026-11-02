@@ -350,9 +350,12 @@ describe("resolveSelfImage", () => {
 
   /**
    * The digest and the repository come from DIFFERENT sources on purpose, so
-   * every case below feeds a runtime repository that disagrees with the
-   * spec's. A fixture that spelled both from one string could not tell the
-   * two-source rule apart from `return imageID`.
+   * every case in this group feeds a runtime repository that disagrees with
+   * the spec's. A fixture that spelled both from one string could not tell
+   * the two-source rule apart from `return imageID`.
+   *
+   * This group covers MUTABLE spec references only. A spec that already
+   * carries a digest takes an earlier branch -- see the group below it.
    *
    * The risk being closed is a credential one: the Job inherits this pod's
    * `imagePullSecrets`, which are proven against the spec repository and
@@ -372,10 +375,39 @@ describe("resolveSelfImage", () => {
     ).toBe(`harbor.example:5000/paperclip@${SERVER_DIGEST}`);
   });
 
-  it("replaces the digest when the spec is already digest-pinned and the kubelet disagrees", () => {
-    // Production is digest-pinned; this is the skew the resolver exists for.
+  /**
+   * A digest-pinned spec is the one input that CANNOT skew. The pull is
+   * content-addressed, so this pod is running exactly what the spec names and
+   * no tag can have moved under it. A runtime digest that disagrees is the
+   * same image config under a different MANIFEST -- a mirror's re-push or
+   * conversion -- which the spec's own registry need not serve. Swapping it
+   * in would trade a reference certain to pull for one that might not, in the
+   * branch production actually runs, since production is digest-pinned.
+   */
+  it("keeps a digest-pinned spec verbatim even when the kubelet reports another digest", () => {
     expect(
       resolveSelfImage(`harbor.example/paperclip@${OPERATOR_DIGEST}`, `mirror.internal/paperclip@${SERVER_DIGEST}`),
+    ).toBe(`harbor.example/paperclip@${OPERATOR_DIGEST}`);
+  });
+
+  it("keeps a digest-pinned spec verbatim when it also carries a tag", () => {
+    // `repo:tag@sha256:...` is still content-addressed -- the tag is
+    // decoration on a reference that already names its own content.
+    expect(
+      resolveSelfImage(
+        `harbor.example/paperclip:main@${OPERATOR_DIGEST}`,
+        `mirror.internal/paperclip@${SERVER_DIGEST}`,
+      ),
+    ).toBe(`harbor.example/paperclip:main@${OPERATOR_DIGEST}`);
+  });
+
+  it("still pins onto the spec repository when the spec's digest is malformed", () => {
+    // This is why the guard matches a well-formed 64-hex digest rather than a
+    // bare `@`: a truncated digest is not a reference this pod could have
+    // started from, so returning it verbatim would hand the Job something
+    // unpullable -- the deadline-shaped failure, not the skew-shaped one.
+    expect(
+      resolveSelfImage("harbor.example/paperclip@sha256:abc", `mirror.internal/paperclip@${SERVER_DIGEST}`),
     ).toBe(`harbor.example/paperclip@${SERVER_DIGEST}`);
   });
 
