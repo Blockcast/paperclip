@@ -2,7 +2,12 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 
-import { ALERTNAME, buildAlert, wasEvictedBeforeStart } from "../.github/scripts/post-docker-agent-alert.mjs";
+import {
+  ALERTNAME,
+  buildAlert,
+  buildJobEvictedBeforeStart,
+  wasEvictedBeforeStart,
+} from "../.github/scripts/post-docker-agent-alert.mjs";
 
 const workflow = readFileSync(new URL("../.github/workflows/docker-agent.yml", import.meta.url), "utf8");
 const alertScript = readFileSync(
@@ -524,18 +529,58 @@ test("the agent image bump runs off the dind lane, serialized in build order", (
 // reports `cancelled` exactly like a timeout kill. Only the timeout is a
 // delivery failure. Shapes are from runs 41363953835 (evicted) and
 // 41223154006 (cancelled mid-build on a runner).
+const EVICTED = { id: 125020049319, name: "build-and-push", conclusion: "cancelled", runner_name: "", steps: [] };
+// Verbatim from check-runs/125020049319/annotations (run 41363953835).
+const EVICTION = [{ message: "Canceling since a higher priority waiting request for docker-agent-refs/heads/master exists" }];
+
 test("an evicted-pending build is not a failure; a cancelled running build still is", () => {
-  assert.equal(wasEvictedBeforeStart({ conclusion: "cancelled", runner_name: null, steps: [] }), true);
+  assert.equal(wasEvictedBeforeStart(EVICTED, EVICTION), true);
   assert.equal(
-    wasEvictedBeforeStart({ conclusion: "cancelled", runner_name: "arc-paperclip-dind-x", steps: [{}] }),
+    wasEvictedBeforeStart({ ...EVICTED, runner_name: "arc-paperclip-dind-x", steps: [{}] }, EVICTION),
     false,
     "a timeout/mid-build cancel must still page (BLO-43939)",
   );
-  assert.equal(wasEvictedBeforeStart({ conclusion: "failure", runner_name: null, steps: [] }), false);
-  assert.equal(wasEvictedBeforeStart(undefined), false, "a missing job must fail toward paging");
+  assert.equal(wasEvictedBeforeStart({ ...EVICTED, conclusion: "failure" }, EVICTION), false);
+  assert.equal(wasEvictedBeforeStart(undefined, EVICTION), false, "a missing job must fail toward paging");
 
   const alertJob = getJobBlock("alert-on-failure");
   assert.match(alertJob, /BUILD_RESULT: \$\{\{ needs\.build-and-push\.result \}\}/);
   assert.match(alertJob, /actions: read/, "the script needs actions:read to look up the job");
+  assert.match(alertJob, /checks: read/, "the script needs checks:read to read the eviction annotation");
   assert.match(alertScript, /BUILD_RESULT === 'cancelled'/, "only a cancel may be suppressed, never a failure");
+});
+
+test("a job cancelled after waiting for a runner that never came still pages", () => {
+  // Same no-runner/no-steps shape as an eviction, but no supersession annotation:
+  // a dead runner pool is the outage this alert exists for.
+  assert.equal(wasEvictedBeforeStart(EVICTED, []), false);
+  assert.equal(
+    wasEvictedBeforeStart(EVICTED, [{ message: "The job was not acquired by Runner of type self-hosted even after multiple attempts" }]),
+    false,
+  );
+});
+
+function fakeFetch(routes) {
+  return async (url) => {
+    const hit = Object.entries(routes).find(([k]) => url.includes(k));
+    if (!hit) throw new Error(`unexpected ${url}`);
+    const v = hit[1];
+    if (v instanceof Error) throw v;
+    return { ok: v.status === undefined || v.status < 300, status: v.status ?? 200, json: async () => v.body };
+  };
+}
+const ENV = { GITHUB_TOKEN: "t", GITHUB_REPOSITORY: "o/r", GITHUB_RUN_ID: "1" };
+
+test("the eviction lookup fails toward paging on every error branch", async () => {
+  const jobs = { "/jobs": { body: { jobs: [EVICTED] } } };
+  const ann = { "/annotations": { body: EVICTION } };
+  assert.equal(await buildJobEvictedBeforeStart(ENV, fakeFetch({ ...jobs, ...ann })), true, "control: real eviction suppresses");
+
+  assert.equal(await buildJobEvictedBeforeStart({}, fakeFetch({ ...jobs, ...ann })), false, "missing env");
+  assert.equal(await buildJobEvictedBeforeStart(ENV, fakeFetch({ "/jobs": { status: 500 }, ...ann })), false, "jobs non-2xx");
+  assert.equal(await buildJobEvictedBeforeStart(ENV, fakeFetch({ "/jobs": new Error("net"), ...ann })), false, "jobs throws");
+  assert.equal(await buildJobEvictedBeforeStart(ENV, fakeFetch({ "/jobs": { body: { jobs: [] } }, ...ann })), false, "no build-and-push job");
+  assert.equal(await buildJobEvictedBeforeStart(ENV, fakeFetch({ ...jobs, "/annotations": { status: 403 } })), false, "annotations non-2xx");
+  assert.equal(await buildJobEvictedBeforeStart(ENV, fakeFetch({ ...jobs, "/annotations": new Error("net") })), false, "annotations throws");
+  assert.equal(await buildJobEvictedBeforeStart(ENV, fakeFetch({ ...jobs, "/annotations": { body: [] } })), false, "no annotation");
 });

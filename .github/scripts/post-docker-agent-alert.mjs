@@ -102,31 +102,49 @@ export function buildAlert({ state, repo, branch, runUrl, headSha, failedJob, no
  * reports, which BLO-43939 deliberately pages on. Run 41363953835 (a99782fd8)
  * was evicted after 29 min pending with no runner and no steps, and paged.
  *
- * The discriminator is whether the job ever reached a runner: an evicted pending
- * job has an empty `runner_name` and no steps; a timed-out build has both.
+ * "No runner, no steps" is necessary but NOT sufficient: a job stuck in the
+ * runner queue because the pool is down looks identical when GitHub finally
+ * cancels it, and that is exactly the outage this alert exists for. The field
+ * that proves supersession is the job's check-run annotation, which GitHub
+ * writes only on a concurrency eviction:
+ *   "Canceling since a higher priority waiting request for docker-agent-… exists"
  */
-export function wasEvictedBeforeStart(job) {
-  return Boolean(job) && job.conclusion === 'cancelled' && !job.runner_name && !(job.steps?.length > 0);
+export const EVICTION_ANNOTATION = /higher priority waiting request for '?docker-agent-/;
+
+export function wasEvictedBeforeStart(job, annotations = []) {
+  return (
+    Boolean(job) &&
+    job.conclusion === 'cancelled' &&
+    !job.runner_name &&
+    !(job.steps?.length > 0) &&
+    annotations.some((a) => EVICTION_ANNOTATION.test(a?.message ?? ''))
+  );
 }
 
 /**
  * Fail-closed toward ALERTING: any lookup error returns false, so an API outage
  * can only ever produce a page, never suppress one.
  */
-async function buildJobEvictedBeforeStart() {
-  const { GITHUB_API_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_TOKEN } = process.env;
+export async function buildJobEvictedBeforeStart(env = process.env, fetchFn = fetch) {
+  const { GITHUB_API_URL, GITHUB_REPOSITORY, GITHUB_RUN_ID, GITHUB_RUN_ATTEMPT, GITHUB_TOKEN } = env;
   if (!GITHUB_TOKEN || !GITHUB_REPOSITORY || !GITHUB_RUN_ID) return false;
-  const url =
-    `${GITHUB_API_URL || 'https://api.github.com'}/repos/${GITHUB_REPOSITORY}/actions/runs/` +
-    `${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT || 1}/jobs?per_page=100`;
-  try {
-    const res = await fetch(url, {
+  const api = `${GITHUB_API_URL || 'https://api.github.com'}/repos/${GITHUB_REPOSITORY}`;
+  const get = async (path) => {
+    const res = await fetchFn(`${api}${path}`, {
       headers: { Authorization: `Bearer ${GITHUB_TOKEN}`, Accept: 'application/vnd.github+json' },
       signal: AbortSignal.timeout(15_000),
     });
-    if (!res.ok) return false;
-    const { jobs = [] } = await res.json();
-    return wasEvictedBeforeStart(jobs.find((j) => j.name === 'build-and-push'));
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+  };
+  try {
+    const { jobs = [] } = await get(
+      `/actions/runs/${GITHUB_RUN_ID}/attempts/${GITHUB_RUN_ATTEMPT || 1}/jobs?per_page=100`,
+    );
+    const job = jobs.find((j) => j.name === 'build-and-push');
+    if (!job?.id) return false;
+    const annotations = await get(`/check-runs/${job.id}/annotations?per_page=100`);
+    return wasEvictedBeforeStart(job, Array.isArray(annotations) ? annotations : []);
   } catch {
     return false;
   }
