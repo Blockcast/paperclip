@@ -541,6 +541,13 @@ paperclip_auth_check() {
   set -f
   set -- $(auth_check_probe "/rate_limit")
   set +f
+  # The probe's `exit 70` only ends the command-substitution subshell, so a
+  # failed mktemp arrives here as an empty `set --`, not as an exit. Re-raise it
+  # at the call site: without this, `anon_code="$1"` trips `set -u` and the
+  # wrapper dies with rc 2 — which is the NO_CREDENTIAL verdict code, so a
+  # read-only TMPDIR would read as a missing credential. Checking the arity also
+  # fails closed on any other malformed probe output.
+  [ $# -eq 2 ] || exit 70
   anon_code="$1" anon_limit="$2"
 
   auth_code="-" auth_limit="-"
@@ -558,6 +565,9 @@ paperclip_auth_check() {
     set -f
     set -- $(auth_check_probe "/installation/repositories" "${check_cfg}")
     set +f
+    # Same arity guard as the unauthenticated probe above, for the same reason.
+    # The EXIT trap removes check_cfg on the way out.
+    [ $# -eq 2 ] || exit 70
     auth_code="$1" auth_limit="$2"
     rm -f "${check_cfg}"
     check_cfg=""
@@ -578,7 +588,11 @@ paperclip_auth_check() {
       verdict="NO_CREDENTIAL — no usable token (${check_state}); \`gh\` will refuse with exit 64, it will NOT fall back to ambient auth"
       verdict_code=2
     else
-      verdict="AMBIENT_AUTH — this wrapper supplied no credential and none was named, so \`gh\` runs on whatever auth the caller already had (its own GH_TOKEN/GITHUB_TOKEN, or ~/.config/gh/hosts.yml); this check does NOT probe that. With no ambient credential either, gh is unauthenticated (rate limit ${anon_limit}/hr)"
+      # `-` means the unauthenticated probe never returned a limit header, so
+      # "(rate limit -/hr)" would dress an unknown up as a measurement.
+      anon_rate=""
+      [ "${anon_limit}" = "-" ] || anon_rate=" (rate limit ${anon_limit}/hr)"
+      verdict="AMBIENT_AUTH — this wrapper supplied no credential and none was named, so \`gh\` runs on whatever auth the caller already had (its own GH_TOKEN/GITHUB_TOKEN, or ~/.config/gh/hosts.yml); this check does NOT probe that. With no ambient credential either, gh is unauthenticated${anon_rate}"
       verdict_code=3
     fi
   elif [ "${auth_code}" = 000 ]; then

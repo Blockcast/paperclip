@@ -1676,6 +1676,52 @@ test("gh auth status does not claim $GH_TOKEN is empty when the wrapper exported
   });
 });
 
+// PEN-5241 re-review, suggestion 1. `auth_check_probe` runs inside `$(…)`, so
+// its `exit 70` ends only the subshell: the caller saw an empty `set --`,
+// `anon_code="$1"` tripped `set -u`, and the wrapper died with rc 2 — which is
+// the NO_CREDENTIAL verdict code. A caller branching on the exit status would
+// have read a broken TMPDIR as a missing credential, which is exactly the
+// collapse-two-faults-into-one-signal bug this subcommand exists to end.
+// TMPDIR points at a path that is not a directory rather than a read-only one,
+// so mktemp fails for root too and the test does not depend on the uid of CI.
+test("a temp-dir fault exits 70, not the NO_CREDENTIAL code (PEN-5241)", () => {
+  withTempDir((dir) => {
+    const tokenFile = path.join(dir, "token");
+    writeFileSync(tokenFile, `${AUTH_CHECK_VALID_TOKEN}\n`);
+    const env = sanitizedEnv({});
+    env.PAPERCLIP_GITHUB_TOKEN_FILE = tokenFile;
+    env.TMPDIR = path.join(dir, "not-a-directory");
+    const proc = spawnSync("sh", [WRAPPER, "paperclip-auth-check"], { env, encoding: "utf8" });
+
+    assert.equal(proc.status, 70);
+    assert.notEqual(proc.status, 2, "a temp-dir fault must not share the NO_CREDENTIAL exit code");
+    assert.match(proc.stderr, /cannot create a temp file in/);
+    // The `set -u` death this guard replaced. It named a line number and a
+    // positional parameter, which tells an agent mid-incident nothing at all.
+    assert.doesNotMatch(proc.stderr, /parameter not set/);
+  });
+});
+
+// PEN-5241 re-review, suggestion 2. `-` is the probe's "no limit header seen",
+// so rendering it as "(rate limit -/hr)" dresses an unknown up as a reading —
+// the same category error as reporting an unreachable API as a bad credential.
+test("the ambient verdict omits the rate limit when the anonymous probe never answered", () => {
+  withTempDir((dir) => {
+    const env = sanitizedEnv({ GH_TOKEN_WRAPPER_API_BASE: "http://127.0.0.1:1" });
+    const proc = spawnSync("sh", [wrapperWithRedirectedDefault(dir), "paperclip-auth-check"], {
+      env,
+      encoding: "utf8",
+    });
+
+    assert.equal(proc.status, 3);
+    assert.match(proc.stdout, /verdict:\s+AMBIENT_AUTH/);
+    assert.doesNotMatch(proc.stdout, /rate limit -\/hr/);
+    // The reachability line still reports the transport failure in full; it is
+    // only the verdict's parenthetical that had nothing to say.
+    assert.match(proc.stdout, /did not complete/);
+  });
+});
+
 // Done-when #2. `gh auth status` reports "(GH_TOKEN)" because that is what this
 // wrapper handed the binary — but GH_TOKEN is not set in the caller's shell, so
 // the obvious follow-up (`curl -H "Authorization: Bearer $GH_TOKEN"`) sends an
