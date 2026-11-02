@@ -55,8 +55,10 @@ const mockSecretService = vi.hoisted(() => ({
 const mockLogActivity = vi.hoisted(() => vi.fn());
 const mockDeferredActivityPublish = vi.hoisted(() => vi.fn());
 const mockAccessService = vi.hoisted(() => ({ decide: vi.fn() }));
-/** The one GitHub call the guard makes. Every case here drives it from this stub. */
+/** The GitHub calls the guard makes. Every case here drives it from these stubs. */
 const mockGetWorkflowRun = vi.hoisted(() => vi.fn());
+/** PEN-5254: the `github_pr_merged` reader, dispatched on `gate.kind`. */
+const mockGetPullRequestGate = vi.hoisted(() => vi.fn());
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => ({
@@ -76,6 +78,7 @@ function registerModuleMocks() {
   vi.doMock("../services/github-app-auth.js", async (importOriginal) => ({
     ...(await importOriginal<typeof import("../services/github-app-auth.js")>()),
     githubGetWorkflowRun: mockGetWorkflowRun,
+    githubGetPullRequestGate: mockGetPullRequestGate,
   }));
 }
 
@@ -297,23 +300,156 @@ describe("a card may not be filed against an already-finished gate (PEN-5103)", 
     expect(mockGetWorkflowRun).not.toHaveBeenCalled();
   });
 
-  it("leaves a malformed gate to schema validation, and still never calls GitHub", async () => {
+  // ── PEN-5254: the same door, for `github_pr_merged` ─────────────────────────
+  //
+  // Widening `payload.gate` to PR merges removes the brake that was doing most of
+  // the safety work here. An agent has an Actions `runId` only when the ask really
+  // is a deployment gate — 7 well-formed gates across 854 cards — but it has a PR
+  // number for nearly every card it files. Without this mirror, the first PR-gated
+  // card naming yesterday's merge is dead on arrival: PEN-5103 again, at the new
+  // default rate. These pin the mirror in both directions.
+
+  const PR_GATE = {
+    kind: "github_pr_merged" as const,
+    repoFullName: "Blockcast/paperclip",
+    prNumber: 1122,
+    url: "https://github.com/Blockcast/paperclip/pull/1122",
+  };
+
+  const PR_ASK_PAYLOAD = {
+    title: "PEN-5254 · merge paperclip#1122",
+    ask: "Merge Blockcast/paperclip#1122 once Ally has reviewed it.",
+    gate: PR_GATE,
+  };
+
+  it.each([
+    ["already merged", { state: "closed" as const, merged: true }],
+    ["already closed unmerged", { state: "closed" as const, merged: false }],
+  ])("refuses a gate naming a pull request that is %s", async (_label, lookup) => {
+    mockGetPullRequestGate.mockResolvedValue(lookup);
+
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: PR_ASK_PAYLOAD,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details.code).toBe("approval_gate_already_terminal");
+    expect(res.body.details.gate).toEqual({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 1122,
+    });
+    // The run-shaped key must not leak onto a PR refusal.
+    expect(res.body.details.gate).not.toHaveProperty("runId");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+    // Dispatched on kind: the Actions reader is not consulted for a PR gate.
+    expect(mockGetWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it("files a card whose gated pull request is still open", async () => {
+    // The legitimate case the kind exists for: an open PR a human must merge.
+    mockGetPullRequestGate.mockResolvedValue({ state: "open", merged: false });
+
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: PR_ASK_PAYLOAD,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.create).toHaveBeenCalledOnce();
+  });
+
+  it("fails OPEN when the pull request cannot be read", async () => {
+    // Unmeasurable is not terminal. A throttled or unreachable GitHub must not be
+    // able to block escalations — the same direction the reconciler takes when it
+    // declines to retire a gate it could not read.
+    mockGetPullRequestGate.mockResolvedValue({ error: "pull_request_http_404" });
+
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: PR_ASK_PAYLOAD,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.create).toHaveBeenCalledOnce();
+  });
+
+  it("fails OPEN when the pull-request lookup throws", async () => {
+    mockGetPullRequestGate.mockRejectedValue(new Error("socket hang up"));
+
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: PR_ASK_PAYLOAD,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.create).toHaveBeenCalledOnce();
+  });
+
+  it("teaches both kinds in the remediation, not just the one that was refused", async () => {
+    // The generator of this defect is agents not knowing the mechanism covers their
+    // event: six of six requesting agents hand-rolled a prose substitute instead.
+    // A refusal that names only the kind you got wrong leaves that gap intact.
+    mockGetPullRequestGate.mockResolvedValue({ state: "closed", merged: true });
+
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: PR_ASK_PAYLOAD,
+    });
+
+    const remediation: string = res.body.details.remediation;
+    expect(remediation).toContain("github_pr_merged");
+    expect(remediation).toContain("github_actions_run");
+    expect(remediation).toContain("the gate IS the ask");
+    expect(remediation).toMatch(/not a general .related link. field/i);
+  });
+
+  it("rejects an unknown gate kind by naming the kinds that exist", async () => {
     // `createApprovalSchema` validates `payload.gate` at the HTTP layer, so a
     // malformed gate is a 400 before this guard is reached. Pinned because the guard
     // reads as though it handles the case — `parseApprovalGate` is total and returns
-    // null on junk — and that path is in fact unreachable from this route. The part
-    // that matters either way is the second assertion: a gate the server cannot even
-    // parse must not cost a GitHub round trip.
+    // null on junk — and that path is in fact unreachable from this route.
+    //
+    // PEN-5254 turned the gate schema into a discriminated union, which changed this
+    // error for the better and the change is worth pinning. It used to report every
+    // field of the one legal shape; it now short-circuits on the discriminator and
+    // ENUMERATES the kinds. That is the more useful failure for the defect this row
+    // is about — six of six agents hand-rolled a prose substitute because they did
+    // not know what the field covers, and a caller who guesses the kind wrong now
+    // learns the whole vocabulary from the refusal.
     const res = await postApproval(await createAgentApp(), {
       type: "request_board_approval",
       payload: { title: "Card with a junk gate", gate: { kind: "something_else", runId: "not-a-number" } },
     });
 
     expect(res.status, JSON.stringify(res.body)).toBe(400);
-    expect(res.body.details.map((d: { path: string[] }) => d.path.join("."))).toEqual(
-      expect.arrayContaining(["payload.gate.kind", "payload.gate.repoFullName", "payload.gate.runId"]),
+    const issues = res.body.details as Array<{ path: string[]; message: string }>;
+    expect(issues.map((d) => d.path.join("."))).toEqual(
+      expect.arrayContaining(["payload.gate.kind"]),
     );
+    const kindIssue = issues.find((d) => d.path.join(".") === "payload.gate.kind");
+    expect(kindIssue?.message).toContain("github_actions_run");
+    expect(kindIssue?.message).toContain("github_pr_merged");
     expect(mockGetWorkflowRun).not.toHaveBeenCalled();
+  });
+
+  it("still reports the missing field once the kind is recognised", async () => {
+    // The union must not trade per-field precision for the enumeration above: a
+    // caller who picks the right kind and omits its ref still needs to be told which
+    // field is missing, by name.
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: {
+        title: "Merge paperclip#1122",
+        gate: { kind: "github_pr_merged", repoFullName: "Blockcast/paperclip" },
+      },
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(400);
+    expect(
+      (res.body.details as Array<{ path: string[] }>).map((d) => d.path.join(".")),
+    ).toEqual(expect.arrayContaining(["payload.gate.prNumber"]));
+    expect(mockGetPullRequestGate).not.toHaveBeenCalled();
   });
 
   // ---------------------------------------------------------------------------

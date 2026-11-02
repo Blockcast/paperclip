@@ -209,9 +209,9 @@ export function approvalService(db: Db) {
    * Not applied to `requestRevision`: `revision_requested` is undecided, the card can
    * still return to `pending`, and the invariant only speaks about terminal states.
    * The approval-gate reconciler's `cancelled` write is a third terminal path but is
-   * unreachable for these cards — it selects on
-   * `payload->'gate'->>'kind' = 'github_actions_run'` and a watcher card is filed
-   * through `insertApproval()` with no gate.
+   * unreachable for these cards — it selects on a `payload->'gate'->>'kind'` in
+   * `APPROVAL_GATE_KINDS`, and a watcher card is filed through `insertApproval()`
+   * with no gate at all.
    */
   async function assertNoOpenBudgetIncident(id: string, type: string, dbClient: Db) {
     if (type !== "budget_override_required") return;

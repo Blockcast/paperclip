@@ -576,7 +576,11 @@ export {
 } from "./goal.js";
 
 export {
+  APPROVAL_GATE_KINDS,
+  approvalActionsRunGateSchema,
+  approvalGateRef,
   approvalGateSchema,
+  approvalPullRequestGateSchema,
   createApprovalSchema,
   listApprovalsQuerySchema,
   parseApprovalGate,
@@ -585,7 +589,10 @@ export {
   resubmitApprovalSchema,
   withdrawApprovalSchema,
   addApprovalCommentSchema,
+  type ApprovalActionsRunGate,
   type ApprovalGate,
+  type ApprovalGateKind,
+  type ApprovalPullRequestGate,
   type CreateApproval,
   type ListApprovalsQuery,
   type ResolveApproval,

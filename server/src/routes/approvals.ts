@@ -3,6 +3,7 @@ import { and, eq } from "drizzle-orm";
 import { heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import {
   addApprovalCommentSchema,
+  approvalGateRef,
   createApprovalSchema,
   isUuidLike,
   listApprovalsQuerySchema,
@@ -32,8 +33,11 @@ import {
 } from "../services/approval-enforcement-reconciler.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
-import { classifyGateLookup } from "../services/approval-gate-reconciler.js";
-import { githubGetWorkflowRun } from "../services/github-app-auth.js";
+import {
+  classifyGateLookup,
+  classifyPullRequestGateLookup,
+} from "../services/approval-gate-reconciler.js";
+import { githubGetPullRequestGate, githubGetWorkflowRun } from "../services/github-app-auth.js";
 import { applyApprovalEnforcement } from "../services/approval-enforcement-executor.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
@@ -177,13 +181,14 @@ function budgetAssertionRefusal(type: string, payload: unknown) {
   };
 }
 
-// PEN-5103: refuse a card whose `payload.gate` names a run that is ALREADY over.
+// PEN-5103: refuse a card whose `payload.gate` names an event that is ALREADY over.
 //
-// `payload.gate` means one specific thing: "the ask IS a human clicking this Actions
-// gate". The approval-gate reconciler then closes the card the moment that run
-// terminates — correct, and the whole point of BLO-29359. But it is only correct when
-// the gate IS the ask. Attach a gate to an ask it does not describe and the card is
-// retired by an event that has nothing to do with it.
+// `payload.gate` means one specific thing: "the ask IS this event" — a human clicking
+// this Actions gate, or this pull request merging. The approval-gate reconciler then
+// closes the card the moment that event terminates — correct, and the whole point of
+// BLO-29359. But it is only correct when the gate IS the ask. Attach a gate to an ask
+// it does not describe and the card is retired by an event that has nothing to do
+// with it.
 //
 // Measured twice in eight days, by two different agents, both on the same shape —
 // the ask was "a human must put an approving review on PR #N", the gate named an
@@ -204,9 +209,19 @@ function budgetAssertionRefusal(type: string, payload: unknown) {
 // author stops running, which is why this refusal is synchronous — it is the only
 // point at which the rule reaches the agent that needs it.
 //
+// PEN-5254 extended this to `github_pr_merged`, and the extension is not optional.
+// Until then the field's safety came substantially from SCARCITY: an agent has an
+// Actions `runId` only when the ask genuinely is a deployment gate, which is why only
+// 7 of 854 cards carried a well-formed gate at all. A PR number is available for
+// nearly every card an agent files, so the new kind removes that accidental brake —
+// and without a file-time refusal the first PR-gated card naming yesterday's merge is
+// dead on arrival, reproducing PEN-5103 at the new default rate. The mirror below is
+// what keeps the door and the sweep agreeing for both kinds.
+//
 // Deliberately narrow, and deliberately fails OPEN. It refuses exactly one thing: a
-// gate that is *already terminal*, which can never be clicked by anyone and so is
-// never a legitimate ask. It does NOT try to decide whether a live gate "relates to"
+// gate that is *already terminal* — a finished run, or a pull request already merged
+// or already closed — which can never be acted on by anyone and so is never a
+// legitimate ask. It does NOT try to decide whether a live gate "relates to"
 // the ask — the ask is free text and that judgement is not mechanisable. A live gate,
 // an unreadable one, a rate-limited lookup, or any thrown error all pass: a throttled
 // GitHub must not be able to block escalations, the same fail-safe direction the
@@ -215,32 +230,53 @@ async function gateAlreadyTerminalRefusal(payload: unknown) {
   const gate = parseApprovalGate(payload);
   if (!gate) return null;
 
-  let lookup;
+  let disposition;
   try {
-    lookup = await githubGetWorkflowRun({ repoFullName: gate.repoFullName, runId: gate.runId });
+    disposition =
+      gate.kind === "github_actions_run"
+        ? classifyGateLookup(
+            await githubGetWorkflowRun({
+              repoFullName: gate.repoFullName,
+              runId: gate.runId,
+            }),
+          )
+        : classifyPullRequestGateLookup(
+            await githubGetPullRequestGate({
+              repoFullName: gate.repoFullName,
+              prNumber: gate.prNumber,
+            }),
+          );
   } catch {
     return null;
   }
-  const disposition = classifyGateLookup(lookup);
   if (disposition.kind !== "terminal") return null;
+
+  const ref = approvalGateRef(gate);
+  const subject = gate.kind === "github_pr_merged" ? "pull request" : "run";
 
   return {
     error:
-      `payload.gate names ${gate.repoFullName} run ${gate.runId}, which is not a live gate ` +
-      `(${disposition.summary}). A card bound to a run that is already over is closed by the ` +
-      "approval-gate reconciler on its next sweep and can never be approved",
+      `payload.gate names ${ref}, which is not a live gate (${disposition.summary}). A card ` +
+      `bound to a ${subject} that is already over is closed by the approval-gate reconciler on ` +
+      "its next sweep and can never be approved",
     details: {
       code: "approval_gate_already_terminal",
-      gate: { repoFullName: gate.repoFullName, runId: gate.runId },
+      gate:
+        gate.kind === "github_actions_run"
+          ? { repoFullName: gate.repoFullName, runId: gate.runId }
+          : { repoFullName: gate.repoFullName, prNumber: gate.prNumber },
       remediation:
-        "If the ask is literally a human clicking an Actions deployment gate, name the run that " +
-        "is actually WAITING on that gate — not a CI run on the same PR, and not a run that has " +
-        "already finished. If the ask is anything else — a PR review, a merge click, a " +
+        "`payload.gate` means the gate IS the ask, and the card is retired the moment the named " +
+        "event ends whether or not your ask was ever read. Pick the kind that matches what you " +
+        "are actually asking for. If the ask is a human clicking an Actions deployment gate, use " +
+        "`github_actions_run` and name the run that is actually WAITING on that gate — not a CI " +
+        "run on the same PR, and not a run that has already finished. If the ask is a specific " +
+        "pull request merging, use `github_pr_merged` with `{repoFullName, prNumber}` — and name " +
+        "a PR that is still open, because one already merged or already closed retires the card " +
+        "immediately. If the ask is anything else — a PR review that is not itself the merge, a " +
         "credential grant, an operator action — do not set `payload.gate` at all. It is not a " +
-        "general 'related link' field: it means the ask IS a human clicking that Actions gate, " +
-        "and the card is retired the moment that run ends, whether or not your ask was ever " +
-        "read. Put the PR or run URL in `payload.title` instead, where it informs a human " +
-        "without binding the card's lifetime to it.",
+        "general 'related link' field. Put the PR or run URL in `payload.title` instead, where " +
+        "it informs a human without binding the card's lifetime to it.",
     },
   };
 }

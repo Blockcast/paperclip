@@ -18,11 +18,15 @@ import {
 } from "./helpers/embedded-postgres.js";
 import {
   classifyGateLookup,
+  classifyPullRequestGateLookup,
   reconcileApprovalGates,
   startApprovalGateReconciler,
   type ApprovalGateReconcilerScheduler,
 } from "../services/approval-gate-reconciler.js";
-import type { WorkflowRunLookup } from "../services/github-app-auth.js";
+import type {
+  PullRequestGateResult,
+  WorkflowRunLookup,
+} from "../services/github-app-auth.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -142,6 +146,14 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     repoFullName: "Blockcast/paperclip",
     runId,
     url: `https://github.com/Blockcast/paperclip/actions/runs/${runId}`,
+  });
+
+  /** PEN-5254: the other gate kind — the ask IS this pull request merging. */
+  const prGateFor = (prNumber: number) => ({
+    kind: "github_pr_merged",
+    repoFullName: "Blockcast/paperclip",
+    prNumber,
+    url: `https://github.com/Blockcast/paperclip/pull/${prNumber}`,
   });
 
   async function approvalRow(id: string) {
@@ -641,6 +653,208 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     expect(await commentsFor(secondIssue)).toHaveLength(1);
   });
 
+  // ── PEN-5254: `github_pr_merged` gates ──────────────────────────────────────
+  //
+  // 19 of this seat's 36 self-retiring cards keyed retirement on a PR merge and
+  // could say so only in prose — a promise that is void in exactly the branch where
+  // the ask succeeds, because `withdraw` 409s on a decided card. These pin the
+  // mechanism that replaces that prose, in both directions.
+
+  const prFound = (state: "open" | "closed", merged: boolean): PullRequestGateResult => ({
+    state,
+    merged,
+  });
+
+  it("leaves a card alone while its gated pull request is still open", async () => {
+    const { companyId, agentId } = await createCompany("AGRP");
+    const issueId = await insertIssue(companyId, "AGRP-1");
+    const approvalId = await insertApproval({ companyId, agentId, gate: prGateFor(1122), issueId });
+
+    const result = await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => prFound("open", false),
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ examined: 1, closed: 0, live: 1, announced: 0 });
+    expect(await approvalRow(approvalId)).toMatchObject({ status: "pending", decidedAt: null });
+    expect(await commentsFor(issueId)).toHaveLength(0);
+  });
+
+  it("closes a card whose gated pull request merged, without claiming the ask was met", async () => {
+    const { companyId, agentId } = await createCompany("AGRP");
+    const issueId = await insertIssue(companyId, "AGRP-2");
+    const approvalId = await insertApproval({
+      companyId,
+      agentId,
+      gate: prGateFor(1122),
+      issueId,
+      title: "Merge the approval-gate PR-merge kind",
+    });
+
+    const result = await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => prFound("closed", true),
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ examined: 1, closed: 1, announced: 1, deferred: 0 });
+
+    const row = await approvalRow(approvalId);
+    expect(row?.status).toBe("cancelled");
+    expect(row?.decisionNote).toContain("pull request merged");
+    expect(row?.decisionNote).toContain("Blockcast/paperclip#1122");
+
+    const comments = await commentsFor(issueId);
+    expect(comments[0]?.body).toContain("has merged");
+    expect(comments[0]?.body).toContain("Merge the approval-gate PR-merge kind");
+    expect(comments[0]?.body).toContain("pull/1122");
+    // Same PEN-5103 discipline the run announcement carries: closing the card is a
+    // statement about the named PR, never about whether the ask was granted.
+    expect(comments[0]?.body).toContain("does not say the card's ask was met");
+    expect(issueCommentMetadataSchema.parse(comments[0]?.metadata).sections[0]?.rows).toEqual(
+      expect.arrayContaining([
+        {
+          type: "key_value",
+          label: "GitHub pull request",
+          value: "Blockcast/paperclip#1122",
+        },
+        { type: "key_value", label: "Named pull request merged", value: "yes" },
+      ]),
+    );
+  });
+
+  it("closes a card whose pull request was closed unmerged: the ask became unsatisfiable", async () => {
+    const { companyId, agentId } = await createCompany("AGRP");
+    const issueId = await insertIssue(companyId, "AGRP-3");
+    // The PEN-2043 supersession shape: #1058 closed, the work landed as #1122. The
+    // gate token is now unreachable while the work ships, so a card standing on it
+    // asks humans forever for something nobody can do.
+    //
+    // This is the deliberate divergence from `terminal-gate-reconciler`, which holds
+    // that only `merged` satisfies — correct there, because its subject is an ISSUE
+    // and closed-unmerged means the work did not land. Here the subject is a CARD
+    // and the question is whether the ask can still be granted. It cannot.
+    const approvalId = await insertApproval({
+      companyId,
+      agentId,
+      gate: prGateFor(1058),
+      issueId,
+      title: "Merge the superseded PR",
+    });
+
+    const result = await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => prFound("closed", false),
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ examined: 1, closed: 1, announced: 1 });
+
+    const row = await approvalRow(approvalId);
+    expect(row?.status).toBe("cancelled");
+    expect(row?.decisionNote).toContain("unsatisfiable");
+
+    const comments = await commentsFor(issueId);
+    expect(comments[0]?.body).toContain("closed without merging");
+    expect(comments[0]?.body).toContain("unsatisfiable");
+    // A reader must not take this as "the merge happened".
+    expect(comments[0]?.body).not.toContain("has merged");
+    expect(issueCommentMetadataSchema.parse(comments[0]?.metadata).sections[0]?.rows).toEqual(
+      expect.arrayContaining([
+        { type: "key_value", label: "Named pull request merged", value: "no" },
+      ]),
+    );
+  });
+
+  // ⭐ PEN-5254 "Done when" #2, asserted rather than inferred from source reading.
+  //
+  // `githubGetPullRequestGate` maps EVERY non-ok response to `{ error }` — there is
+  // no `not_found` branch to mistake a deleted PR, a private repo, a revoked
+  // installation or a rate limit for positive evidence. That makes fail-closed
+  // structural here rather than constructed, which is precisely why it needs a test:
+  // an emergent property is one a later refactor can remove without noticing.
+  it.each([
+    ["a pull request that does not exist", "pull_request_http_404"],
+    ["a repository the installation cannot see", "pull_request_http_403"],
+    ["an unauthenticated lookup", "pull_request_http_401"],
+    ["a rate-limited lookup", "pull_request_rate_limited"],
+    ["an unreadable body", "pull_request_state_missing"],
+    ["a transport failure", "pull_request_fetch_failed"],
+  ])("never retires a card when the gate names %s", async (_label, reason) => {
+    const { companyId, agentId } = await createCompany("AGRP");
+    const issueId = await insertIssue(companyId, "AGRP-4");
+    const approvalId = await insertApproval({ companyId, agentId, gate: prGateFor(999999), issueId });
+
+    const result = await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => ({ error: reason }),
+      logger: silentLogger,
+    });
+
+    // Deferred, never closed: unmeasurable is not satisfied.
+    expect(result).toMatchObject({ examined: 1, closed: 0, deferred: 1, announced: 0 });
+    expect(await approvalRow(approvalId)).toMatchObject({ status: "pending", decidedAt: null });
+    // And it says nothing on the issue — a card left open must not be announced as
+    // retired, which is the half that made BLO-29359 silent in the other direction.
+    expect(await commentsFor(issueId)).toHaveLength(0);
+  });
+
+  it("defers when the pull-request fetch throws", async () => {
+    const { companyId, agentId } = await createCompany("AGRP");
+    const issueId = await insertIssue(companyId, "AGRP-5");
+    const approvalId = await insertApproval({ companyId, agentId, gate: prGateFor(7), issueId });
+
+    const result = await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => {
+        throw new Error("socket hang up");
+      },
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ examined: 1, closed: 0, deferred: 1 });
+    expect((await approvalRow(approvalId))?.status).toBe("pending");
+  });
+
+  it("sweeps both gate kinds in one pass, each through its own reader", async () => {
+    // The candidate predicate is derived from APPROVAL_GATE_KINDS. If it ever
+    // narrows back to one literal, the omitted kind is accepted at the door and then
+    // never reconciled — a card that advertises self-retirement and silently never
+    // retires, which is the defect this whole row exists to remove.
+    const { companyId, agentId } = await createCompany("AGRM");
+    const runIssue = await insertIssue(companyId, "AGRM-1");
+    const prIssue = await insertIssue(companyId, "AGRM-2");
+    const runCard = await insertApproval({
+      companyId,
+      agentId,
+      gate: gateFor(42),
+      issueId: runIssue,
+    });
+    const prCard = await insertApproval({
+      companyId,
+      agentId,
+      gate: prGateFor(43),
+      issueId: prIssue,
+    });
+
+    const fetchRun = vi.fn(async () => found("completed", "success"));
+    const fetchPullRequest = vi.fn(async () => prFound("closed", true));
+    const result = await reconcileApprovalGates(db, {
+      fetchRun,
+      fetchPullRequest,
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ examined: 2, closed: 2, announced: 2 });
+    // Each kind went to its own reader exactly once — no cross-dispatch.
+    expect(fetchRun).toHaveBeenCalledExactlyOnceWith({
+      repoFullName: "Blockcast/paperclip",
+      runId: 42,
+    });
+    expect(fetchPullRequest).toHaveBeenCalledExactlyOnceWith({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 43,
+    });
+    expect((await approvalRow(runCard))?.status).toBe("cancelled");
+    expect((await approvalRow(prCard))?.status).toBe("cancelled");
+  });
+
   it("runs immediately on start and again on the interval", async () => {
     const { companyId, agentId } = await createCompany();
     await insertApproval({ companyId, agentId, gate: gateFor(13) });
@@ -731,5 +945,59 @@ describe("classifyGateLookup", () => {
       kind: "terminal",
       satisfied: false,
     });
+  });
+});
+
+// Pure classification for the PR kind, asserted separately from the DB suite so the
+// fail-closed direction holds on a host without embedded Postgres.
+describe("classifyPullRequestGateLookup", () => {
+  it("treats an open pull request as a live gate", () => {
+    expect(classifyPullRequestGateLookup({ state: "open", merged: false }).kind).toBe("live");
+  });
+
+  it("treats a merged pull request as terminal and satisfied", () => {
+    expect(classifyPullRequestGateLookup({ state: "closed", merged: true })).toMatchObject({
+      kind: "terminal",
+      satisfied: true,
+    });
+  });
+
+  it("treats a closed-unmerged pull request as terminal but NOT satisfied", () => {
+    // Terminal because a card asking for that merge can never be granted once the PR
+    // is closed; not satisfied because the merge did not happen. `terminal-gate-
+    // reconciler` reaches the opposite conclusion on the same input for an ISSUE —
+    // see the docblock on this function for why both are right.
+    expect(classifyPullRequestGateLookup({ state: "closed", merged: false })).toMatchObject({
+      kind: "terminal",
+      satisfied: false,
+    });
+  });
+
+  it("never reaches a terminal disposition from a read failure", () => {
+    // Structural, not incidental: the reader collapses every non-ok response to
+    // `{ error }`, so there is no input that both fails to read and retires a card.
+    for (const reason of [
+      "pull_request_http_404",
+      "pull_request_http_403",
+      "pull_request_http_401",
+      "pull_request_rate_limited",
+      "pull_request_state_missing",
+      "pull_request_fetch_failed",
+    ]) {
+      expect(classifyPullRequestGateLookup({ error: reason })).toEqual({
+        kind: "deferred",
+        reason,
+      });
+    }
+  });
+
+  it("summarises PR state distinctly from run state", () => {
+    // The two kinds must be tellable apart in an announcement: a run reads
+    // `status=`/`conclusion=`, a pull request reads `state=`/`merged=`.
+    const disposition = classifyPullRequestGateLookup({ state: "closed", merged: true });
+    expect(disposition).toMatchObject({ kind: "terminal" });
+    if (disposition.kind !== "terminal") throw new Error("expected terminal");
+    expect(disposition.summary).toContain("merged=");
+    expect(disposition.summary).not.toContain("conclusion=");
   });
 });
