@@ -2023,9 +2023,11 @@ describe("startServer feedback export wiring", () => {
 
       expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_SKIPPED_METRIC)).toBe(skippedBefore + 1);
       // Still well inside the 10-tick stall threshold, so the skip must NOT be
-      // reported as a stall. These two mean different things: a skip is the
-      // chain running slow, a stall is it having stopped settling altogether,
-      // and only the second is a page.
+      // reported as a stall. The two are both DURATION signals and differ only
+      // in degree: a skip is one tick arriving while a pass is open, a stall is
+      // that same pass still being open ten ticks later. Neither says the pass
+      // will not settle — see the test below, which pins that a pass can cross
+      // the stall threshold and still complete normally.
       expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)).toBe(0);
 
       // The pass settles: the in-flight gauge must return to 0, or the overlap
@@ -2039,6 +2041,118 @@ describe("startServer feedback export wiring", () => {
       expect(duration).not.toBeNull();
       expect(duration).toBeGreaterThanOrEqual(0);
     } finally {
+      releaseTail?.();
+      setIntervalSpy.mockRestore();
+    }
+  });
+
+  // PEN-5259. `stalled_total` is a DURATION threshold on the live pass, not a
+  // liveness verdict, and until this nothing pinned that. The metric's own help
+  // used to claim non-zero meant "a pass stopped settling entirely" and that a
+  // merely-slow pass "shows up as skips instead"; both are false, and both were
+  // quoted verbatim to justify paging during the 2026-11-02 episode on
+  // `paperclip-0`, where all 8 increments belonged to passes that COMPLETED and
+  // wrote their duration (830.6 / 1170.7 / 947.3 / 670.6 / 685.8 / 760.4 /
+  // 867.8 / 411.9 s) and the chain recovered with no restart.
+  //
+  // The watchdog increments the moment a pass passes `10 * interval`; it cannot
+  // see whether that pass will return. So the behaviour to hold is: crossing
+  // the threshold increments, and a LATER normal settle neither retracts the
+  // increment nor is prevented by it. A reader who needs "slow" vs "halted"
+  // must use the in-flight gauge, which this asserts returns to 0.
+  it("counts a pass that crosses the stall threshold even when it then settles normally", async () => {
+    const schedulerIntervalMs = 30000;
+    // Mirrors the watchdog's own `max(1s, interval / 3)`.
+    const watchdogIntervalMs = Math.max(1000, Math.floor(schedulerIntervalMs / 3));
+    // The watchdog's threshold is `10 * interval`; overshoot it generously so
+    // the assertion does not depend on wall-clock drift during the test.
+    const pastStallMs = 10 * schedulerIntervalMs + 100000;
+    loadConfigMock.mockReturnValue(buildTestConfig({
+      heartbeatSchedulerEnabled: true,
+      heartbeatSchedulerIntervalMs: schedulerIntervalMs,
+    }));
+
+    let intervalCallback: (() => void) | null = null;
+    let watchdogCallback: (() => void) | null = null;
+    const setIntervalSpy = vi
+      .spyOn(globalThis, "setInterval")
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === schedulerIntervalMs) intervalCallback = callback;
+        if (delay === watchdogIntervalMs) watchdogCallback = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      }) as typeof setInterval);
+
+    const idleReconcile = {
+      assignmentDispatched: 0,
+      dispatchRequeued: 0,
+      continuationRequeued: 0,
+      successfulRunHandoffEscalated: 0,
+      escalated: 0,
+      skipped: 0,
+      issueIds: [],
+    };
+
+    const readSeries = async (metric: string): Promise<number | null> => {
+      const { body } = await renderMetrics();
+      const line = body
+        .split("\n")
+        .find((candidate) => candidate.startsWith(`${metric} `));
+      return line ? Number(line.slice(metric.length + 1)) : null;
+    };
+
+    let releaseTail: (() => void) | null = null;
+    let nowSpy: { mockRestore: () => void } | null = null;
+    try {
+      await startServer();
+      await vi.waitFor(() =>
+        expect(heartbeatServiceMock.reconcileStrandedAssignedIssues).toHaveBeenCalledTimes(1));
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockClear();
+
+      // The watchdog is registered on its own timer, not the scheduler's. If
+      // this is null the delay filter above has drifted from the source.
+      expect(watchdogCallback).not.toBeNull();
+      const stalledBefore = (await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)) ?? 0;
+
+      // Park the chain's tail so a pass is genuinely outstanding.
+      heartbeatServiceMock.reconcileStrandedAssignedIssues.mockImplementationOnce(
+        () => new Promise((resolve) => {
+          releaseTail = () => resolve(idleReconcile);
+        }),
+      );
+      intervalCallback?.();
+      await vi.waitFor(() => expect(releaseTail).not.toBeNull());
+
+      // Jump the clock past the stall threshold and run one watchdog tick. Only
+      // the watchdog reads the clock here, so the spy is scoped to that call.
+      const realNow = Date.now();
+      nowSpy = vi.spyOn(Date, "now").mockReturnValue(realNow + pastStallMs);
+      watchdogCallback?.();
+      nowSpy.mockRestore();
+      nowSpy = null;
+
+      // The crossing is counted once, while the pass is still open.
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)).toBe(stalledBefore + 1);
+      const inflightAtStall = (await readSeries(HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC)) ?? 0;
+      expect(inflightAtStall).toBeGreaterThanOrEqual(10 * (schedulerIntervalMs / 1000));
+
+      // Now the pass settles, which is the case the old help text said could
+      // not happen once this counter had moved.
+      releaseTail?.();
+      releaseTail = null;
+      await vi.waitFor(async () => {
+        expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_INFLIGHT_METRIC)).toBe(0);
+      });
+
+      // A settle does NOT retract the increment -- the counter is monotonic, so
+      // `stalled_total > 0` stays true forever and must not be used as an alert
+      // condition. It also does not suppress the duration gauge: the pass
+      // completed and is reported like any other.
+      expect(await readSeries(HEARTBEAT_RECOVERY_CHAIN_STALLED_METRIC)).toBe(stalledBefore + 1);
+      const duration = await readSeries(HEARTBEAT_RECOVERY_CHAIN_DURATION_METRIC);
+      expect(duration).not.toBeNull();
+      expect(duration).toBeGreaterThanOrEqual(0);
+    } finally {
+      nowSpy?.mockRestore();
       releaseTail?.();
       setIntervalSpy.mockRestore();
     }
