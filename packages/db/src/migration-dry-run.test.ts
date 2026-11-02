@@ -112,6 +112,36 @@ describeEmbeddedPostgres("pending-migration dry-run (BLO-48353)", () => {
     expect((await untouched(sql)).column).toBe(0);
   }, 120_000);
 
+  it("FAILS (57014) when one statement outlives its own statement_timeout: at deploy that is a lock outage (BLO-51377)", async () => {
+    const { url, sql } = await startDatabase();
+    const before = await untouched(sql);
+
+    const result = await dryRunPendingMigrations(url, {
+      statementTimeoutMs: 200,
+      lockTimeoutMs: 100,
+      readMigration: async () => "SELECT pg_sleep(2);",
+    });
+
+    expect(result.verdict).toBe("fail");
+    expect(result.detail).toMatch(/^57014/);
+    expect(result.detail).toMatch(/BLO-51377/);
+    expect(await untouched(sql)).toEqual(before);
+  }, 120_000);
+
+  it("stays INCONCLUSIVE when the 57014 came from the dry-run's own budget cap, not the statement's timeout", async () => {
+    const { url, sql } = await startDatabase();
+
+    const result = await dryRunPendingMigrations(url, {
+      budgetMs: 300,
+      statementTimeoutMs: 30_000,
+      readMigration: async () => "SELECT pg_sleep(2);",
+    });
+
+    expect(result.verdict).toBe("inconclusive");
+    expect(result.detail).toMatch(/^57014/);
+    expect((await untouched(sql)).column).toBe(0);
+  }, 120_000);
+
   it("FAILS (25001), not skips, a non-transactional statement the runner would also crash on", async () => {
     const { url, sql } = await startDatabase();
     await seed(sql, "metered_api");
