@@ -22,15 +22,15 @@ name: landing-sweep
 # because it reads as landing latency when it is not. CI at that head
 # (da94f2885) stayed RED until `General tests (workspaces-b)` went green at
 # 04:45:06Z, `verify` following at 04:45:26Z — so the PR became LANDABLE
-# there, not at the verdict. The next scheduled landing fire enqueued it at
-# 08:48:41Z and it merged at 09:28:08Z: roughly 4h03m of ordinary schedule
-# wait plus 39m in the merge queue. The ~9h23m from verdict to merge is NOT
-# landing latency and must never be cited as such.
+# there, not at the verdict. The next scheduled landing fire was at 08:45Z,
+# it enqueued the PR at 08:48:41Z, and it merged at 09:28:08Z — 4h42m42s in
+# total, decomposing as 3h59m34s of ordinary schedule wait, 3m41s of
+# within-fire processing, and 39m27s in the merge queue. The ~9h23m from
+# verdict to merge is NOT landing latency and must never be cited as such.
 #
 # The cost that remains real here is diagnostic rather than duration: PEN-5232
 # was parked 48h on a diagnosis built around a human approver who was not in
 # the path, because the stall had no stated reason to read.
-# stated reason to read.
 #
 # THIS IS A DETECTOR, NEVER A LANDER. It runs `--alarm`, which the script
 # refuses to combine with `--apply`. Two reasons, and the second is the
