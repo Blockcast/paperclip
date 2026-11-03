@@ -1329,6 +1329,11 @@ jobs:
         run: pnpm run test:agent-health-preflight
         timeout-minutes: 1
 
+      - name: Test cancelled-monitor recovery measurement predicates (PEN-5346)
+        if: ${{ !cancelled() }}
+        run: pnpm run test:measure-cancelled-monitor-recovery
+        timeout-minutes: 1
+
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}
         run: |
