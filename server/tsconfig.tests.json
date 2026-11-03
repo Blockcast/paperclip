@@ -43,6 +43,7 @@
     "src/__tests__/isolation-reclaim-sweep.test.ts",
     "src/__tests__/isolation-reclaim-sweep-metrics.test.ts",
     "src/__tests__/isolation-reclaim-transport.test.ts",
+    "src/__tests__/issue-adoption-execution-agent-name-key.test.ts",
     "src/__tests__/issue-list-analyze-probe-postgres.test.ts",
     "src/__tests__/issue-list-analyze-probe.test.ts",
     "src/__tests__/issue-list-description-truncation-flag.test.ts",
