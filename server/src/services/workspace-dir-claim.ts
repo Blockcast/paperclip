@@ -515,6 +515,14 @@ const CLAIM_SUCCESSOR_PREFIX = ".dir-claim-successor-";
  * that exactly one run can inherit from it in turn. Every step still needs a
  * positive terminal determination, so no amount of waiting advances the chain
  * and nothing is ever broken on suspicion.
+ *
+ * `inherited` reports the tokens of the generations below the one elected --
+ * every one of them held by a run this election positively determined to be
+ * terminal. They are NOT removed here, and must not be: while this takeover
+ * is in flight, a gen-N token is still what stops a fresh run being elected
+ * at gen-N on the dead claim that is still sitting at `claimPath`. See
+ * `reapInheritedSuccessorTokens` for the one point at which they are safe to
+ * remove.
  */
 async function electClaimSuccessor(input: {
   scratchDir: string;
@@ -522,8 +530,12 @@ async function electClaimSuccessor(input: {
   selfRunId: string;
   deadRunId: string;
   readOwnerLiveness: (runId: string) => Promise<ClaimOwnerLiveness>;
-}): Promise<{ kind: "elected"; tokenPath: string } | { kind: "refused"; reason: string }> {
+}): Promise<
+  | { kind: "elected"; tokenPath: string; inherited: string[] }
+  | { kind: "refused"; reason: string }
+> {
   let chain = "";
+  const inherited: string[] = [];
   // Bounded only to keep a pathological chain from spinning: each step needs a
   // real run to have really died, so reaching the bound is not a timing
   // artefact and refusing there is honest.
@@ -533,7 +545,7 @@ async function electClaimSuccessor(input: {
     const body = `${JSON.stringify({ runId: input.selfRunId, deadRunId: input.deadRunId, generation })}\n`;
 
     const taken = await linkClaimExclusively(tokenPath, input.scratchDir, body);
-    if (taken.kind === "created") return { kind: "elected", tokenPath };
+    if (taken.kind === "created") return { kind: "elected", tokenPath, inherited };
     if (taken.kind === "failed") return { kind: "refused", reason: taken.reason };
 
     const raw = await fs.readFile(tokenPath, "utf8").catch(() => null);
@@ -553,7 +565,7 @@ async function electClaimSuccessor(input: {
     if (!holder) {
       return { kind: "refused", reason: "a takeover token is present but could not be read" };
     }
-    if (holder === input.selfRunId) return { kind: "elected", tokenPath };
+    if (holder === input.selfRunId) return { kind: "elected", tokenPath, inherited };
 
     const liveness = await input.readOwnerLiveness(holder).catch(() => "unknown" as const);
     if (liveness !== "terminal") {
@@ -563,6 +575,7 @@ async function electClaimSuccessor(input: {
       };
     }
     chain += `:${holder}`;
+    inherited.push(tokenPath);
   }
   return {
     kind: "refused",
@@ -690,7 +703,9 @@ async function takeOverDeadClaim(input: {
 
     const linked = await linkClaimExclusively(input.claimPath, input.scratchDir, input.content);
     if (linked.kind === "created") {
-      await pruneClaimEvidence(input.scratchDir, input.readOwnerLiveness);
+      // Only now, with our own claim back at the path: see the helper.
+      await reapInheritedSuccessorTokens(elected.inherited);
+      await pruneClaimEvidence(input.scratchDir);
       return { kind: "acquired" };
     }
     if (linked.kind === "exists") {
@@ -715,31 +730,18 @@ async function takeOverDeadClaim(input: {
  * Best-effort and never fatal -- failing to prune must not fail a takeover
  * that otherwise succeeded.
  *
- * Two kinds of file are eligible, on two different rules.
- *
  * `released` evidence is pruned oldest-first past a cap. It is inert: a copy
  * of a claim whose owner was positively terminal when it was taken.
  *
- * `successor` election tokens are pruned ONLY when their holder is itself
- * positively terminal, and never on age. A live token is the election -- it is
- * what stops two breakers removing one claim -- so pruning one on age would
- * reintroduce the two-winner race this module measured. Ally raised the leak
- * on PR #3334: a successor that dies between its `rm` and its `link` strands
- * its token permanently, because the token is keyed on the digest of bytes
- * that no longer exist anywhere and so can never be recomputed by a later
- * run. The same holds for a dead gen-N token once gen-N+1 has succeeded,
- * since `finally` removes only the caller's own token. Harmless but unbounded
- * on a parent every agent pod shares, and a positive terminal determination
- * is exactly the evidence the rest of this module already requires before it
- * removes anything anyone else created.
+ * Election tokens are NOT pruned here, on any rule this function could apply.
+ * A directory scan cannot tell a stranded token from a load-bearing one: the
+ * tokens on this parent belong to many different claims, and the only thing
+ * that makes a token removable is knowing the chain it keys has finished.
+ * `reapInheritedSuccessorTokens` is the one caller that knows that.
  */
-async function pruneClaimEvidence(
-  scratchDir: string,
-  readOwnerLiveness?: (runId: string) => Promise<ClaimOwnerLiveness>,
-): Promise<void> {
+async function pruneClaimEvidence(scratchDir: string): Promise<void> {
   const names = await fs.readdir(scratchDir).catch(() => null);
   if (!names) return;
-  if (readOwnerLiveness) await pruneDeadSuccessorTokens(scratchDir, names, readOwnerLiveness);
   const evidence = names.filter(
     (name) => name.startsWith(CLAIM_EVIDENCE_PREFIX) && name.endsWith(".json"),
   );
@@ -759,41 +761,49 @@ async function pruneClaimEvidence(
 }
 
 /**
- * Remove election tokens whose holder is positively terminal.
+ * Remove the election tokens of the generations THIS takeover inherited,
+ * after it has succeeded.
  *
- * Deliberately NOT age-based. The only safe statement about a successor token
- * is the one the module makes everywhere else: the run named inside it has
- * finished. `unknown` leaves the token alone, which is the same fail-closed
- * posture `classifyWorkspaceDirClaim` takes -- a token we cannot attribute is
- * a token we must assume is live.
+ * Ally raised the leak on PR #3334: a dead gen-N token outlives the chain,
+ * because `finally` removes only the caller's own token. The obvious reaper
+ * -- scan the parent, remove any token whose holder reads `terminal` -- is
+ * unsound, and Ally's review of this PR caught it. "Holder terminal" is
+ * equally true of a gen-N token while a gen-N+1 successor is mid-takeover,
+ * and that token is exactly what stops a fresh run being elected at gen-N on
+ * the dead claim still sitting at `claimPath`. Reaping it reopens the
+ * two-winner race: the fresh run links gen-N, passes the same
+ * `keptRaw === vettedRaw` check the in-flight successor passed, and both
+ * proceed to remove a claim and link their own.
+ *
+ * The predicate that IS sound is finishing the chain rather than inspecting
+ * it. On this path the caller has just re-linked `claimPath` with its own
+ * content, so:
+ *
+ *   * every generation below it was positively terminal when the election
+ *     walked past it, and no live run can be elected below us now -- a run
+ *     that had been would have held the token we created;
+ *   * the vetted bytes are gone from `claimPath` for good, so any run that
+ *     vetted them earlier and is only now being elected at a freed generation
+ *     fails its own `keptRaw === vettedRaw` check and refuses. That check is
+ *     load-bearing here, which is why this runs after the `link` and not
+ *     before it: between the `rm` and the `link` the path is empty, and a
+ *     late-elected run would instead find the claim gone and refuse there.
+ *
+ * Our own token is not in this set; `finally` still releases that.
+ *
+ * This does not reach every stranded token. A successor killed between its
+ * `rm` and its `link` leaves one keyed on bytes that no longer exist
+ * anywhere, so no later run can recompute the name -- it is unreachable
+ * garbage, and collecting it needs a token that records the claim it belongs
+ * to. That is a separate design and belongs in its own change.
+ *
+ * Best-effort and never fatal: failing to reap must not fail a takeover that
+ * has already succeeded.
  */
-async function pruneDeadSuccessorTokens(
-  scratchDir: string,
-  names: string[],
-  readOwnerLiveness: (runId: string) => Promise<ClaimOwnerLiveness>,
-): Promise<void> {
-  const tokens = names.filter(
-    (name) => name.startsWith(CLAIM_SUCCESSOR_PREFIX) && name.endsWith(".json"),
-  );
-  if (tokens.length === 0) return;
+async function reapInheritedSuccessorTokens(tokenPaths: string[]): Promise<void> {
+  if (tokenPaths.length === 0) return;
   await Promise.all(
-    tokens.map(async (name) => {
-      const tokenPath = path.join(scratchDir, name);
-      const raw = await fs.readFile(tokenPath, "utf8").catch(() => null);
-      if (raw === null) return;
-      let holder: string | null = null;
-      try {
-        const runId = (JSON.parse(raw) as { runId?: unknown } | null)?.runId;
-        holder = typeof runId === "string" && runId.trim() ? runId : null;
-      } catch {
-        holder = null;
-      }
-      // Unparseable is not evidence of death. Leave it.
-      if (!holder) return;
-      const liveness = await readOwnerLiveness(holder).catch(() => "unknown" as const);
-      if (liveness !== "terminal") return;
-      await fs.rm(tokenPath, { force: true }).catch(() => {});
-    }),
+    tokenPaths.map((tokenPath) => fs.rm(tokenPath, { force: true }).catch(() => {})),
   );
 }
 

@@ -713,32 +713,70 @@ describe("acquireWorkspaceDirClaim", () => {
     ).toBe(SECOND_DEAD);
   });
 
-  it("reaps an election token whose holder is positively terminal, and leaves a live one", async () => {
+  /**
+   * Ally's review of this PR caught the earlier reaper deleting a token that
+   * a takeover still in flight was relying on. The chain below is exactly
+   * that shape -- a TERMINAL gen-0 holder under a LIVE gen-1 successor -- and
+   * it belongs to a different claim than the one being taken over here. A
+   * sibling takeover sharing this parent must leave the whole chain alone:
+   * removing gen-0 would let a fresh run be elected there on a dead claim
+   * that is still present, and two runs would then break one claim.
+   */
+  it("leaves another claim's election chain alone while its successor is still running", async () => {
     const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
-    const STRANDED = "00000000-str1-str1-str1-000000000000";
-    const LIVE_ELSEWHERE = "00000000-1ive-1ive-1ive-000000000000";
+    const FOREIGN_DEAD = "00000000-f0f0-f0f0-f0f0-000000000000";
+    const GONE = "00000000-gone-gone-gone-000000000000";
+    const BUSY = "00000000-busy-busy-busy-000000000000";
     const scratch = path.dirname(dirA);
-    const raw = claimOf(DEAD_RUN, OTHER_AGENT);
-    await fs.writeFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), raw);
+    await fs.writeFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), claimOf(DEAD_RUN, OTHER_AGENT));
 
-    // Two tokens from OTHER claims, stranded on the shared parent. Neither is
-    // keyed on bytes this acquire will ever recompute.
-    const strandedToken = path.join(scratch, ".dir-claim-successor-aaaa1111.json");
-    const liveToken = path.join(scratch, ".dir-claim-successor-bbbb2222.json");
-    await fs.writeFile(strandedToken, `${JSON.stringify({ runId: STRANDED, generation: 0 })}\n`);
-    await fs.writeFile(liveToken, `${JSON.stringify({ runId: LIVE_ELSEWHERE, generation: 0 })}\n`);
+    // A different claim's chain: gen-0 was elected by GONE, which died, and
+    // BUSY inherited it at gen-1 and is mid-takeover right now.
+    const foreignRaw = claimOf(FOREIGN_DEAD, OTHER_AGENT);
+    const gen0 = successorTokenPath(scratch, foreignRaw);
+    const gen1 = successorTokenPath(scratch, foreignRaw, `:${GONE}`);
+    await fs.writeFile(gen0, `${JSON.stringify({ runId: GONE, deadRunId: FOREIGN_DEAD, generation: 0 })}\n`);
+    await fs.writeFile(gen1, `${JSON.stringify({ runId: BUSY, deadRunId: FOREIGN_DEAD, generation: 1 })}\n`);
 
     const outcome = await acquireWorkspaceDirClaim({
       dirPath: dirA,
       self: identity(),
-      readOwnerLiveness: async (runId) => (runId === LIVE_ELSEWHERE ? "live" : "terminal"),
+      readOwnerLiveness: async (runId) => (runId === BUSY ? "live" : "terminal"),
     });
     expect(outcome.acquired).toBe(true);
 
-    // The dead holder's token is gone; the live holder's election is intact,
-    // because removing it would reintroduce the two-winner race.
-    await expect(fs.stat(strandedToken)).rejects.toThrow();
-    expect(await fs.readFile(liveToken, "utf8")).toContain(LIVE_ELSEWHERE);
+    // Both survive. GONE being positively terminal is NOT a licence to reap
+    // its token: BUSY's election is chained off it.
+    expect(await fs.readFile(gen0, "utf8")).toContain(GONE);
+    expect(await fs.readFile(gen1, "utf8")).toContain(BUSY);
+  });
+
+  /**
+   * The other half: a chain IS collected, by the run that finished it, once
+   * its own claim is back at the path. After that the vetted bytes are gone
+   * for good, so a run elected late at a freed generation fails its own bytes
+   * check instead of breaking anything.
+   */
+  it("clears the chain it inherited once its own claim is back at the path", async () => {
+    const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
+    const DEAD_SUCCESSOR = "00000000-gone-gone-gone-000000000000";
+    const scratch = path.dirname(dirA);
+    const raw = claimOf(DEAD_RUN, OTHER_AGENT);
+    await fs.writeFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), raw);
+    const gen0 = successorTokenPath(scratch, raw);
+    await fs.writeFile(gen0, `${JSON.stringify({ runId: DEAD_SUCCESSOR, deadRunId: DEAD_RUN, generation: 0 })}\n`);
+
+    const outcome = await acquireWorkspaceDirClaim({
+      dirPath: dirA,
+      self: identity(),
+      readOwnerLiveness: async () => "terminal",
+    });
+    expect(outcome.acquired).toBe(true);
+
+    // The inherited gen-0 token is gone, and so is our own gen-1 -- the whole
+    // chain, not just the caller's own link.
+    await expect(fs.stat(gen0)).rejects.toThrow();
+    await expect(fs.stat(successorTokenPath(scratch, raw, `:${DEAD_SUCCESSOR}`))).rejects.toThrow();
   });
 
   it("inherits the takeover when the elected successor itself died part-way", async () => {
