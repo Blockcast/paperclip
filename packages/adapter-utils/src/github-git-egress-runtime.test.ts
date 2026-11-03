@@ -1349,13 +1349,13 @@ describe("PEN-3907: a force-push after a rebase reports only the author's own co
 
 describe("buildGitArgv worktree prune refusal (BLO-51647)", () => {
   it("refuses a repo-global prune, including behind global options", () => {
-    for (const argv of [["worktree", "prune"], ["worktree", "prune", "-v"], ["-C", "/repo", "worktree", "prune", "--expire", "now"]]) {
+    for (const argv of [["worktree", "prune"], ["worktree", "prune", "-v"], ["-C", "/repo", "worktree", "prune", "--expire", "now"], ["worktree", "prune", "-n", "--no-dry-run"]]) {
       expect(() => buildGitArgv(argv, { ...PRESENT })).toThrow(/refusing to run `git worktree prune`/);
     }
   });
 
   it("passes a dry run and every other worktree verb through untouched", () => {
-    for (const argv of [["worktree", "prune", "-n"], ["worktree", "prune", "--dry-run", "-v"], ["worktree", "list"], ["worktree", "remove", "/x"]]) {
+    for (const argv of [["worktree", "prune", "-n"], ["worktree", "prune", "--dry-run", "-v"], ["worktree", "prune", "--no-dry-run", "-n"], ["worktree", "list"], ["worktree", "remove", "/x"]]) {
       expect(buildGitArgv(argv, { ...PRESENT })).toEqual(argv);
     }
   });
