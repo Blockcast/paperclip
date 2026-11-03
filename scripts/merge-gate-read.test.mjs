@@ -2000,16 +2000,21 @@ describe("merge-gate reader", () => {
           },
           {
             statuses: [
-              { context: "review/ally", state: "failure", updated_at: "t3" },
+              {
+                context: "review/ally-complete",
+                state: "success",
+                updated_at: "t3",
+                creator: { login: "github-actions[bot]", id: 41898282, type: "Bot" },
+              },
               { context: "sign", state: "pending", updated_at: "t4" },
             ],
           },
         ]),
         [
-          "ci-gate\tsuccess\tt1\tstatus",
-          "build\tsuccess\tt2\tstatus",
-          "review/ally\tfailure\tt3\tstatus",
-          "sign\tpending\tt4\tstatus",
+          "ci-gate\tsuccess\tt1\tstatus\t\t\t",
+          "build\tsuccess\tt2\tstatus\t\t\t",
+          "review/ally-complete\tsuccess\tt3\tstatus\tgithub-actions[bot]\t41898282\tBot",
+          "sign\tpending\tt4\tstatus\t\t\t",
         ],
       );
     });
@@ -2236,7 +2241,15 @@ describe("merge-gate reader", () => {
 describe("review/ally-ledger", () => {
   const build = ["build", "success", "2026-10-21T20:00Z", "111"];
   const ledger = (state) => ["review/ally-ledger", state, "2026-10-21T20:09Z", "status"];
-  const complete = (state, at = "2026-10-21T20:31Z") => ["review/ally-complete", state, at, "status"];
+  const complete = (state, at = "2026-10-21T20:31Z") => [
+    "review/ally-complete",
+    state,
+    at,
+    "status",
+    "github-actions[bot]",
+    "41898282",
+    "Bot",
+  ];
   const stops = (lines) => lines.filter((l) => l.startsWith("STOP"));
 
   it("is ADVISORY, not STOP, when review/ally-complete is success at the head", () => {
@@ -2419,13 +2432,14 @@ describe("BLO-51266: a required context with no row at the head", () => {
   // reader printed only NOT-EVALUATED (rc 0) and a lander tried to squash.
   const shards = ["file", "file +doTrailer", "entity", "entity +doTrailer", "AllConfigsProxy"]
     .map((s) => `integration-tests (${s})`);
+  const actionsBot = ["github-actions[bot]", "41898282", "Bot"];
   const required = ["wasm-build", "unit-tests-race", ...shards, "review/ally-complete"].join("\n");
   const rows = [
     ["wasm-build", "success", "2026-11-01T20:10:00Z", "101"],
     ["unit-tests-race", "success", "2026-11-01T20:10:00Z", "101"],
     ["integration-tests (${{ matrix.name }})", "skipped", "2026-11-01T20:10:00Z", "102"],
     ["gate/ally-comment-findings", "neutral", "2026-11-01T20:10:00Z", "app:allyblockcast"],
-    ["review/ally-complete", "success", "2026-11-01T20:10:00Z", "status"],
+    ["review/ally-complete", "success", "2026-11-01T20:10:00Z", "status", ...actionsBot],
   ];
 
   it("prints one ABSENT STOP per missing required context and exits 1", () => {
@@ -2450,6 +2464,33 @@ describe("BLO-51266: a required context with no row at the head", () => {
   it("counts a context whose only rows were dropped as superseded as absent", () => {
     const { lines } = readRc([...rows, [shards[0], "failure", "2026-11-01T20:05:00Z", "99"]], "99", "", "", "", required);
     assert.ok(lines.includes(`STOP\t${shards[0]}\tABSENT\trun=-`));
+  });
+
+  it("requires the authoritative status, not a same-named check-run", () => {
+    const checkRunOnly = rows.filter((row) => row[0] !== "review/ally-complete");
+    checkRunOnly.push(["review/ally-complete", "success", "2026-11-01T20:10:00Z", "103"]);
+    const { rc, lines } = readRc(checkRunOnly, "__none__", "", "", "", "review/ally-complete");
+    assert.deepEqual(stops(lines), ["STOP\treview/ally-complete\tABSENT\trun=-"]);
+    assert.equal(rc, 1);
+  });
+
+  it("ignores a same-named check-run when the authoritative status is green", () => {
+    const rowsWithTwin = [
+      ...rows,
+      ["review/ally-complete", "failure", "2026-11-01T20:20:00Z", "103"],
+    ];
+    const { rc, lines } = readRc(rowsWithTwin, "__none__", "", "", "", "review/ally-complete");
+    assert.deepEqual(stops(lines), []);
+    assert.equal(rc, 0);
+  });
+
+  it("does not accept an untrusted success as the required Ally status", () => {
+    const untrusted = [
+      ...rows.filter((row) => row[0] !== "review/ally-complete"),
+      ["review/ally-complete", "success", "2026-11-01T20:20:00Z", "status", "allyblockcast[bot]", "290875700", "Bot"],
+    ];
+    const { lines } = readRc(untrusted, "__none__", "", "", "", "review/ally-complete");
+    assert.deepEqual(stops(lines), ["STOP\treview/ally-complete\tsuccess\trun=status"]);
   });
 });
 
