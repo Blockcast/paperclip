@@ -186,6 +186,70 @@ Only two things still show `"other"`: output **captured** before the change
 **deployment predating** it. Attribute those by structure instead — park-fire
 latency band off a known `parkedUntil`, plus `source: "automation"`.
 
+## The row is `blocked`: nothing fired, and that is usually correct
+
+Check `status` before anything else. `ISSUE_PARK_EXPIRY_WAKE_STATUSES` is
+`backlog | todo | in_progress | in_review`, so **a park on a `blocked` row fires
+nothing at all** — no stamp, no wake request, no log line. The candidate query
+filters on `status`, so such a row never becomes a candidate and never reaches
+the claim. Absence is total, which means **a down sweep and a correctly-excluded
+`blocked` row are indistinguishable after the fact.** Only a control parked to
+the same millisecond in a wake status tells them apart.
+
+Measured 2026-11-03 (PEN-5291), three rows parked to `09:00:00.000Z`:
+
+| row | status | stamp | wake request | claimed |
+|---|---|---|---|---|
+| PEN-4828 | `in_progress` | 09:01:04.154Z | `issue_park_expired` 09:02:06.920Z | ✅ 09:03:33.037Z |
+| PEN-5291 | `in_progress` | 09:00:34.152Z | `issue_park_expired` 09:02:01.596Z | ✅ 09:06:47.010Z |
+| PEN-4554 | **`blocked`** | — | **none, any reason** | — |
+
+The compensating control for `blocked` is the **stranded-blocked reconciler**
+(`server/src/services/stranded-blocked-issue-reconciler.ts`, default-on,
+worker-tier, lease-held, 15-minute interval), which drains a `blocked` row with
+no unresolved blocker to `todo`, after which the park sweep covers it there.
+
+**That drain is conditional, so an undrained row is not evidence the reconciler
+is down.** It skips any row with a live run, a future `monitorNextCheckAt`, a
+dependency-readiness failure, or any `BlockedIssueAutoResumeSuppressionReason`.
+Before concluding it is wedged, look for `issue.stranded_blocked_reconciled` in
+`activity_log`, or for its announcement comment (idempotency key prefixed
+`stranded-blocked-issue-reconciler:`). On 2026-11-02 it flipped PEN-5217 at
+13:15:27Z — roughly twenty minutes before it was reported dead.
+
+### Finding out what is actually holding the row
+
+The suppression reason is computed per sweep and never stored, so no issue field
+carries it, and `paperclipInboxLite` reports `unresolvedBlockerCount` without any
+of it. The blocked inbox does name it:
+
+```
+GET /api/companies/:id/issues?attention=blocked&includeBlockedInboxAttention=true
+```
+
+`blockedInboxAttention` gives a `reason`, an `owner`/`action` pair, and the id of
+the thing being waited on (`approvalId`, `interactionId`, `overdueInteractionId`).
+Across its 81 rows on 2026-11-03 it accounted for all five reported rows:
+PEN-5122/5137/5141 as `pending_board_decision` with their live `approvalId`,
+PEN-2208 as `blocked_chain_stalled` carrying `overdueInteractionId` `e3934a88`,
+and PEN-4554 behind interaction `1c293b07`.
+
+Two limits, both easy to trip:
+
+- **It pages by offset and flags no truncation.** PEN-5122 was on page 2 and
+  absent from the first 60 rows, which reads exactly like "not held".
+- **Its `reason` is its own vocabulary**, not
+  `BlockedIssueAutoResumeSuppressionReason` — `blocked_chain_stalled` is not a
+  member of that union. Use it to find the hold and its id, then confirm the
+  suppression against the union rather than mapping the two by name.
+
+⚠️ **"Suppressed" does not mean "attended".** Only `pending_interaction` /
+`pending_approval` carry a human answer that is itself a wake, and even an
+interaction wakes the assignee only at `continuationPolicy` `wake_assignee` /
+`wake_assignee_on_accept`. `convergence_stalled` is the opposite case: the
+assignee is barred from re-arming its own monitor, so nothing it can do re-enters
+the row. Classify per reason before calling a dark row fine.
+
 ## Design decisions, so they are not silently re-litigated
 
 **Preserving the stamp across a re-park was considered and declined.** It is
