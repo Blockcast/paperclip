@@ -5160,21 +5160,28 @@ export function normalizeDispatchDeclineReason(reason: string | null | undefined
  * `claimQueuedRun` or in the dispatch loop before the claim (PEN-5316).
  *
  * Named arms rather than a single "refused" because the fork this metric exists
- * to settle turns entirely on WHICH screen fired. The arms split into three
+ * to settle turns entirely on WHICH screen fired. The arms split into four
  * populations, and the split is the answer:
  *
  *   - Arms `isDispatchRankReady` ALSO applies (`admission_deferred`,
  *     `dependency_blocked`) mean the two predicates agree and the disagreement
  *     is elsewhere — a refresh-window race, not a drift.
- *   - Arms it does NOT apply (`pause_hold`, `stale_issue`,
- *     `pr_review_task_held`, `pr_review_task_in_flight`,
- *     `duplicate_dispatch_suppressed`,
+ *   - Arms it does NOT apply, WHERE THE ROW STAYS `queued` (`pause_hold`,
+ *     `stale_issue`, `pr_review_task_held`, `pr_review_task_in_flight`,
  *     `external_lifecycle_pr_review_task_held`, the budget and cap arms) mean a
  *     row the gauge is aging as dispatch wait is one the claim path will never
  *     take. Those are the gauge over-reporting, which is fork (a).
  *   - `claim_cas_lost` means the row WAS claimable and the pass lost a race for
  *     it; `external_lifecycle_slots_exhausted` means it was claimable and the
  *     GLOBAL pool, not this seat's ceiling, refused it. Those are fork (b).
+ *   - The duplicate-dispatch arms are NEITHER. The row leaves the queue on that
+ *     path, so the gauge stops aging it and the pass did not pass over
+ *     claimable work — it declined a duplicate. Counting them as fork (a)
+ *     would inflate the gauge's error with rows the gauge is not reporting on.
+ *
+ * "Row stays `queued`" is load bearing in that second bullet, not decoration:
+ * it is the whole reason an arm is evidence ABOUT the gauge. An arm whose row
+ * left the queue says nothing about a gauge that only reads queued rows.
  *
  * A single undifferentiated counter cannot tell those apart, which is why
  * `no_claimable_run`'s bare reason has left the question open since PEN-3948.
@@ -5234,11 +5241,22 @@ export const KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS = [
   "pr_review_task_in_flight",
   /**
    * The dispatch loop skipped this candidate BEFORE the claim because a running
-   * sibling already owns its issue. Usually the row is cancelled here, but when
-   * a concurrent pass wins that cancel the row stays `queued` — and
-   * `isDispatchRankReady` screens neither case, so the gauge can age it. Fork (a).
+   * sibling already owns its issue, and the `status = 'queued'` CAS to cancel
+   * it LOST — a concurrent pass or replica had already moved the row.
+   *
+   * NEITHER fork. The row is no longer `queued`, so the gauge is not aging it
+   * and this is not the gauge over-reporting; and the pass did not pass over
+   * claimable work, because the work was a duplicate. What a rate here measures
+   * is overlapping dispatch passes racing on one agent — worth watching on a
+   * multi-replica control plane, but it must not be added to the fork (a) tally.
    */
   "duplicate_dispatch_suppressed",
+  /**
+   * Same screen, but THIS pass won the CAS and cancelled the duplicate.
+   * Also neither fork, and for the same reason: the row left the queue. Split
+   * from its sibling above only to say which pass moved it.
+   */
+  "duplicate_dispatch_cancelled",
   /**
    * The external-lifecycle slot pool refused the claim and did not say why.
    * Residual only: the pool now names its cause, so a non-zero rate here means
@@ -6256,15 +6274,18 @@ function ensureRegistry(): {
         + "paperclip_queued_run_oldest_claimable_age_seconds, whose screen is "
         + "isDispatchRankReady: that gauge and no_claimable_run both read positive on the "
         + "same seat for 27-31% of an 8h window, and the arm label is what says which of "
-        + "them is wrong. Arms isDispatchRankReady does NOT apply (pause_hold, "
-        + "stale_issue, pr_review_task_held, pr_review_task_in_flight, "
-        + "duplicate_dispatch_suppressed, external_lifecycle_pr_review_task_held, "
+        + "them is wrong. Arms isDispatchRankReady does NOT apply AND whose row stays "
+        + "queued (pause_hold, stale_issue, pr_review_task_held, "
+        + "pr_review_task_in_flight, external_lifecycle_pr_review_task_held, "
         + "budget_blocked, daily_cap) mean the GAUGE is "
         + "over-reporting — it is aging a row the claim path will never take. "
         + "claim_cas_lost means the row was genuinely claimable and this pass lost a "
         + "race; external_lifecycle_slots_exhausted means it was claimable and the GLOBAL "
         + "external pool refused it, so this seat's free slot was never the constraint. "
         + "Both are fork (b). "
+        + "The duplicate_dispatch_* arms are NEITHER fork and must be excluded from both "
+        + "tallies: the row leaves the queue on that path, so the gauge is not reporting "
+        + "on it and no claimable work was passed over. "
         + "admission_deferred and dependency_blocked are screened by BOTH predicates, so "
         + "a rate there is a refresh-window race rather than a drift between them. The "
         + "run id is on the structured log line, not a label, to keep cardinality bounded. "

@@ -324,6 +324,18 @@ describe("dispatch candidate loop skips", () => {
     expect(loopSource).toContain("\"duplicate_dispatch_suppressed\"");
   });
 
+  it("splits the duplicate skip by which pass moved the row", () => {
+    // Neither duplicate arm is fork (a): the row leaves the queue on that path,
+    // so the gauge is not aging it and counting them as gauge error would
+    // inflate it with rows the gauge never reported on. They are split only to
+    // say whether THIS pass cancelled the duplicate or lost the CAS to a
+    // concurrent one — which measures replica contention, not the fork.
+    expect(loopSource).toContain("\"duplicate_dispatch_cancelled\"");
+    expect(loopSource).toContain(
+      "cancelled ? \"duplicate_dispatch_cancelled\" : \"duplicate_dispatch_suppressed\"",
+    );
+  });
+
   it("marks a pass that stopped early, so untried candidates are not read as refused", () => {
     expect(loopSource).toContain("passStoppedEarly = \"slots_filled\"");
     expect(loopSource).toContain("passStoppedEarly = \"dispatch_stopped\"");

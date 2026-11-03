@@ -339,10 +339,12 @@ async function refreshClaimableQueuedRunAgeMetrics(
  *
  * Reading the pair: a seat recording `no_claimable_run` while this names a run
  * means one of two things, and the arm says which. If the refusal for THIS run
- * id is on an arm `isDispatchRankReady` does not apply (`pause_hold`,
- * `stale_issue`, the PR-review and duplicate-dispatch arms, the budget and cap
+ * id is on an arm `isDispatchRankReady` does not apply AND whose row stays
+ * `queued` (`pause_hold`, `stale_issue`, the PR-review arms, the budget and cap
  * arms), the gauge is aging a row the claim path will never take — the gauge is
- * wrong.
+ * wrong. The duplicate-dispatch arms look similar but are NOT that: the row
+ * leaves the queue there, so the gauge stops reporting on it and the refusal is
+ * evidence for neither fork.
  *
  * The converse does NOT hold symmetrically, and reading it as though it did
  * would bias the verdict toward "the dispatcher is wrong". An absent refusal
@@ -356,10 +358,10 @@ async function refreshClaimableQueuedRunAgeMetrics(
  *     way.
  *
  * The loop's two pre-claim screens used to live in that silence as well, and
- * they are fork (a) rather than fork (b) — a running run holding the same
- * PR-review task key, or a running sibling owning the same issue, neither of
- * which `isDispatchRankReady` screens. Both now report an arm, so they are
- * counted on the correct side instead of inflating the absent-refusal bucket.
+ * the PR-review one is fork (a) rather than fork (b) — a running run holding
+ * the same task key, which `isDispatchRankReady` does not screen and which
+ * leaves the row `queued`. Both now report an arm, so they are counted on the
+ * correct side instead of inflating the absent-refusal bucket.
  */
 export function planClaimableSubjectLogs(
   oldestClaimableByAgent: ReadonlyMap<string | null, ClaimableQueuedRunSubject>,

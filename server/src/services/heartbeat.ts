@@ -34256,7 +34256,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
               );
             }
-            await notePreClaimSkip(queuedRun, queuedIssueId, "duplicate_dispatch_suppressed");
+            // Which pass moved the row, not whether it moved: `cancelled` means
+            // THIS pass cancelled it; null means the `status = 'queued'` CAS
+            // lost, so a concurrent pass or replica had already moved it. The
+            // row is out of the queue either way, which is why neither arm is
+            // fork (a) — see the allow-list.
+            await notePreClaimSkip(
+              queuedRun,
+              queuedIssueId,
+              cancelled ? "duplicate_dispatch_cancelled" : "duplicate_dispatch_suppressed",
+            );
             continue;
           }
           const queuedTaskKey = readNonEmptyString(queuedSnapshot.taskKey);
