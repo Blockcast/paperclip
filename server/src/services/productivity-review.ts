@@ -36,6 +36,7 @@ import {
   LinearIssueCreateUnconfirmedError,
 } from "./identifier-allocator.js";
 import { withIssueMonitorQueueLock } from "./issue-monitor-queue-lock.js";
+import { isDeliberateParkActive } from "./issue-park-expiry.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import {
@@ -327,6 +328,37 @@ type DependencyGating = {
   nonClosableTriggers: ProductivityReviewTrigger[];
 };
 
+/**
+ * PEN-4522: a deliberate park (`issues.parked_until` / `parked_at` /
+ * `parked_by_agent_id` / `parked_reason`) measured against an active episode.
+ *
+ * The elapsed accounting had buckets for monitor-gated and executing time and
+ * dumped everything else into `unattended`. A park is neither, so every park
+ * longer than `longActiveMs` was a scheduled false positive: three measured
+ * instances (PEN-4441 at 23h, PEN-2343 at 6h24m, PEN-3551 at 6h03m), each
+ * reporting a figure equal to park-to-scan to the minute, each rendering
+ * "no monitor armed during this episode" — true, and about the wrong switch.
+ *
+ * Carries the whole park, not just a duration: the `long_active_duration`
+ * decision menu already offers "continue with a snooze window", and on all three
+ * instances that verdict was reachable only by leaving the evidence block and
+ * reading `parkedUntil` off the row by hand.
+ */
+type DeliberateParkEvidence = {
+  parkedAt: Date;
+  parkedUntil: Date;
+  parkedByAgentId: string | null;
+  parkedReason: string | null;
+  // Whether the park was set by the very agent this review is about. The most
+  // decision-relevant fact in the clause and the one a manager would otherwise
+  // have to resolve by hand: a self-declared wait is the assignee managing its
+  // own row, which is the conduct the rubric wants, while a park someone else
+  // imposed is a different situation with the same timestamps.
+  parkedByAssignee: boolean;
+  /** `parkedUntil > now` — `isDeliberateParkActive`'s reading, for the rendered clause. */
+  live: boolean;
+};
+
 type PullRequestEvidence = {
   title: string;
   url: string | null;
@@ -488,10 +520,21 @@ type ProductivityReviewEvidence = {
   monitorGating: {
     gatedMs: number;
     // BLO-27698 B1: episode time a run was demonstrably executing, taken out of
-    // `unattendedMs` (never out of `gatedMs`). The three buckets partition the
-    // episode: `gatedMs + executingMs + unattendedMs === elapsedMs`.
+    // `unattendedMs` (never out of `gatedMs`). The four buckets partition the
+    // episode: `gatedMs + executingMs + parkedMs + unattendedMs === elapsedMs`.
     executingMs: number;
+    // PEN-4522: episode time covered by a deliberate park (`issues.parked_until`),
+    // taken out of `unattendedMs` on the same terms as `executingMs` and never out
+    // of `gatedMs`. Disjoint from `executingMs` by construction — park time that
+    // overlaps a live run span is counted as executing, not twice. 0 when the row
+    // carries no park, or when the park covers none of the unwatched window.
+    parkedMs: number;
     unattendedMs: number;
+    // PEN-4522: the park itself, when one covers any part of the unwatched window.
+    // Carried so the rendered line can name the switch that is actually set — a
+    // manager reading only "no monitor armed during this episode" was being told
+    // something true and irrelevant about a correctly-parked row.
+    park: DeliberateParkEvidence | null;
     lapsedAt: Date | null;
     priorLapseAt: Date | null;
     armedUntil: Date | null;
@@ -1284,6 +1327,51 @@ function deliberatePendingMonitor(
 }
 
 /**
+ * PEN-4522: the measurable span of a deliberate park, clamped to `now`, or null
+ * when this row has no park to measure.
+ *
+ * Deliberately an INTERVAL, not `isDeliberateParkActive`'s boolean. That
+ * predicate is the right shape for the wake paths that defer to it — they ask
+ * "is the brake on right now?" — but a bucket in a partition of wall-clock needs
+ * a start and an end, and keying this on the boolean alone would score an
+ * episode that merely *ends* inside a park as parked throughout.
+ *
+ * Clamping the end at `min(parkedUntil, now)` is what bounds the suppression
+ * this feeds (BLO-22331 AC2). An expired park keeps the window it actually
+ * covered and nothing after it, so the post-expiry residue accrues to
+ * `unattendedMs` and `long_active_duration` fires again on its own once that
+ * residue crosses the threshold — no second predicate, no release edge, nothing
+ * to re-arm. A park whose deadline is still in the future covers up to `now` and
+ * the trigger stays suppressed for exactly as long as the assignee declared.
+ *
+ * Requires BOTH columns and fails closed without them. `parkedDisposition` is
+ * the only writer and sets the four park columns atomically on each arm
+ * (`services/issues.ts`), so a deadline with no `parkedAt` is unreachable rather
+ * than merely unusual — and inventing a start for one would be suppression a row
+ * fell into rather than earned, which is the posture `isDeliberateParkActive`
+ * takes for the same column.
+ */
+function deliberateParkWindow(issue: IssueRow, now: Date) {
+  const parkedUntil = coerceDate(issue.parkedUntil);
+  const parkedAt = coerceDate(issue.parkedAt);
+  if (!parkedUntil || !parkedAt) return null;
+  const end = Math.min(parkedUntil.getTime(), now.getTime());
+  if (end <= parkedAt.getTime()) return null;
+  return {
+    start: parkedAt.getTime(),
+    end,
+    park: {
+      parkedAt,
+      parkedUntil,
+      parkedByAgentId: issue.parkedByAgentId ?? null,
+      parkedReason: issue.parkedReason ?? null,
+      parkedByAssignee: Boolean(issue.parkedByAgentId) && issue.parkedByAgentId === issue.assigneeAgentId,
+      live: isDeliberateParkActive(parkedUntil, now.getTime()),
+    } satisfies DeliberateParkEvidence,
+  };
+}
+
+/**
  * Splits an active episode into the portion an armed monitor was accounting for
  * and the portion nobody was watching, so a manager adjudicating a
  * `long_active_duration` review can tell a deliberate monitor-gated wait from an
@@ -1330,14 +1418,43 @@ function monitorGatingBreakdown(
   const liveSpans = latestRuns
     .map((run) => runLiveInterval(run, now))
     .filter((span): span is { start: number; end: number } => span !== null);
-  /** Splits an episode whose monitor-gated prefix is `gatedMs` into the three buckets. */
+  // PEN-4522: a deliberate park is a fourth thing the unwatched window can be,
+  // alongside executing and genuinely unattended. Resolved once here and shared
+  // by every branch below, exactly as `liveSpans` is.
+  const parkWindow = deliberateParkWindow(issue, now);
+  /** Splits an episode whose monitor-gated prefix is `gatedMs` into the four buckets. */
   const splitExecuting = (gatedMs: number) => {
     const boundaryMs = Math.min(episodeEndMs, episodeStartMs + gatedMs);
     const executingMs =
       episodeEndMs > boundaryMs
         ? episodeEndMs - boundaryMs - msOutsideLiveSpans(boundaryMs, episodeEndMs, liveSpans)
         : 0;
-    return { gatedMs, executingMs, unattendedMs: Math.max(0, elapsedMs - gatedMs) - executingMs };
+    // PEN-4522: park time inside the unwatched window, with any part of it that
+    // a run was executing through already removed by `msOutsideLiveSpans` — the
+    // same subtraction `executingMs` uses, applied so the two buckets are
+    // disjoint rather than merely both correct. Without it an episode that was
+    // parked AND executing would be double-subtracted and `unattendedMs` could
+    // go negative, breaking the partition the manager-facing line reads as a sum.
+    //
+    // Scoped to the unwatched window for the reason B1 gives for `executingMs`:
+    // park time inside the monitor-gated prefix is unremarkable, because the
+    // monitor was already accounting for it, and taking it out of `gatedMs`
+    // would move time between two buckets that both mean "attended".
+    const parkStartMs = parkWindow ? Math.max(parkWindow.start, boundaryMs) : 0;
+    const parkEndMs = parkWindow ? Math.min(parkWindow.end, episodeEndMs) : 0;
+    const parkOverlapsWindow = Boolean(parkWindow) && parkEndMs > parkStartMs;
+    const parkedMs = parkOverlapsWindow ? msOutsideLiveSpans(parkStartMs, parkEndMs, liveSpans) : 0;
+    return {
+      gatedMs,
+      executingMs,
+      parkedMs,
+      // Reported whenever the park overlaps the unwatched window at all, including
+      // when `parkedMs` comes out zero because a run was executing through the
+      // whole of it: the park is still the state the row is in, and the line's job
+      // is to name the switch, not only to size it.
+      park: parkOverlapsWindow && parkWindow ? parkWindow.park : null,
+      unattendedMs: Math.max(0, elapsedMs - gatedMs) - executingMs - parkedMs,
+    };
   };
 
   // Still armed for a future check. There is no arm-time column, so a monitor
@@ -1437,6 +1554,29 @@ function monitorGatingBreakdown(
   };
 }
 
+/**
+ * PEN-4522: the park clause, which goes FIRST inside the parenthetical.
+ *
+ * Order is the whole point. Every clause below it is about the monitor, and on a
+ * parked row the monitor clause is true and irrelevant — "no monitor armed during
+ * this episode" is what three measured reviews told a manager about rows whose
+ * assignee had done exactly the right thing. A manager who reads the first clause
+ * and stops should stop on the switch that is actually set.
+ *
+ * Names all four park columns, per AC1. The reason is what carries the `ON WAKE:`
+ * instruction these parks are written with, so it is quoted rather than counted.
+ */
+function formatDeliberatePark(park: DeliberateParkEvidence) {
+  const deadline = park.live
+    ? `live until ${park.parkedUntil.toISOString()}`
+    : `expired at ${park.parkedUntil.toISOString()}`;
+  const by = park.parkedByAgentId
+    ? ` by agent \`${park.parkedByAgentId}\`${park.parkedByAssignee ? " (the assignee)" : ""}`
+    : "";
+  const reason = park.parkedReason ? `, reason: "${truncateInline(park.parkedReason, 300)}"` : "";
+  return `deliberate park set${by} at ${park.parkedAt.toISOString()}, ${deadline}${reason}`;
+}
+
 function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["monitorGating"]>) {
   // An upper-bound gated figure implies a lower-bound unattended figure; both
   // carry a qualifier so neither half of the split reads as measured.
@@ -1446,25 +1586,33 @@ function formatMonitorGating(gating: NonNullable<ProductivityReviewEvidence["mon
   // qualifier even when the gated half is an upper bound. Omitted entirely at
   // zero so the common no-overlap case reads exactly as it did before.
   const executing = gating.executingMs > 0 ? `${msToHumanFine(gating.executingMs)} executing, ` : "";
-  const split = `${gated}, ${executing}${unattended}`;
-  if (gating.armedUntil) {
-    return `${split} (monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound)`;
-  }
-  // BLO-25877: a monitor that fired at its scheduled check and enqueued a
-  // successor demands the opposite reader action from one that silently
-  // stopped — do not collapse the two into "never re-armed".
-  if (gating.firedAt) {
-    const successor = gating.successorRunId ? ` (run \`${gating.successorRunId}\`)` : "";
-    return `${split} (monitor fired on schedule at ${gating.firedAt.toISOString()} and enqueued a successor run${successor}; nothing has re-armed it since)`;
-  }
-  if (gating.awaitingServiceSince) {
-    return `${split} (monitor came due at ${gating.awaitingServiceSince.toISOString()} and is still inside the dispatch service grace, so its wake has not been missed yet)`;
-  }
-  if (gating.lapsedAt) return `${split} (monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed)`;
-  if (gating.priorLapseAt) {
-    return `${split} (no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began)`;
-  }
-  return `${split} (no monitor armed during this episode)`;
+  // PEN-4522: same treatment, and for the same reason — measured from the row's own
+  // park columns, omitted at zero so every un-parked row renders byte-identically to
+  // the way it did before this bucket existed.
+  const parked = gating.parkedMs > 0 ? `${msToHumanFine(gating.parkedMs)} park-gated, ` : "";
+  const split = `${gated}, ${executing}${parked}${unattended}`;
+  // The monitor half of the parenthetical, unchanged in wording. Composed with the
+  // park clause rather than replaced by it: a parked row can also have a monitor
+  // that lapsed mid-episode, and the gated figure beside it still needs its own
+  // explanation.
+  const monitorClause = gating.armedUntil
+    ? `monitor armed until ${gating.armedUntil.toISOString()}; arm time is not recorded, so monitor-gated time is an upper bound`
+    // BLO-25877: a monitor that fired at its scheduled check and enqueued a
+    // successor demands the opposite reader action from one that silently
+    // stopped — do not collapse the two into "never re-armed".
+    : gating.firedAt
+      ? `monitor fired on schedule at ${gating.firedAt.toISOString()} and enqueued a successor run${
+          gating.successorRunId ? ` (run \`${gating.successorRunId}\`)` : ""
+        }; nothing has re-armed it since`
+      : gating.awaitingServiceSince
+        ? `monitor came due at ${gating.awaitingServiceSince.toISOString()} and is still inside the dispatch service grace, so its wake has not been missed yet`
+        : gating.lapsedAt
+          ? `monitor lapsed at ${gating.lapsedAt.toISOString()}, never re-armed`
+          : gating.priorLapseAt
+            ? `no monitor armed during this episode; previous monitor lapsed at ${gating.priorLapseAt.toISOString()}, before it began`
+            : "no monitor armed during this episode";
+  const clauses = gating.park ? [formatDeliberatePark(gating.park), monitorClause] : [monitorClause];
+  return `${split} (${clauses.join("; ")})`;
 }
 
 // BLO-22887 AC2: the dependency-blocked bucket, rendered next to the elapsed
@@ -1673,10 +1821,16 @@ function describeNoExecutableTurnMechanismMix(mechanismMs: Record<NoExecutableTu
 }
 
 // BLO-25722 (a): the `Elapsed accounting` split is a partition of the episode
-// (`gatedMs + executingMs + unattendedMs === elapsedMs`, BLO-27698 B1). This
-// figure is not one of its buckets — it is measured per run, over a different
-// basis, and a queued/parked span lands in BOTH it and the split's unattended
-// remainder. Unlabelled, the body therefore stated that the same span was and
+// (`gatedMs + executingMs + parkedMs + unattendedMs === elapsedMs`, BLO-27698 B1
+// plus PEN-4522's park bucket). This figure is not one of its buckets — it is
+// measured per run, over a different basis, and a queued/parked span lands in
+// BOTH it and the split's unattended remainder.
+//
+// PEN-4522 does not change that, and the two senses of "park" here are different
+// states: this figure counts RUN-level parks (`scheduled_retry`, dispatch backlog,
+// throttle), while the split's new bucket counts the ISSUE-level deliberate park
+// (`parked_until`). A row can be in both at once and the figures still do not sum,
+// which is what the caveat below exists to say. Unlabelled, the body therefore stated that the same span was and
 // was not attributable to the assignee, one line apart. Subtracting it is not
 // the fix: that would break B1's identity and lose the disclosure. Say what the
 // two lines are instead — the same discipline, and for the same reason, as
@@ -5497,6 +5651,23 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // recovered. That is intended, on the same ground the B2 clause below
       // takes — an executing-dominant episode is explained — but do not read
       // B3b as full coverage and widen this narrowing on that basis.
+      //
+      // PEN-4522 rides this arm rather than adding a parallel gate, and that is
+      // the design rather than an economy. B3 already states the rule — the
+      // trigger fires on the time NOBODY was accounting for — and a deliberate
+      // park is somebody accounting for it. Once `parkedMs` is its own bucket,
+      // `unattendedMs` means what B3 says it means and this comparison needs no
+      // park term at all. A second `parkedUntil > now` predicate here would be a
+      // restatement of `deliberateParkWindow`'s clamp in a second place, which is
+      // exactly the drift `isDeliberateParkActive`'s docblock records this column
+      // already suffering once.
+      //
+      // Boundedness (BLO-22331 AC2) comes from the same clamp and needs no extra
+      // guard: the park bucket stops growing at `min(parkedUntil, now)`, so an
+      // expired park's residue accrues to `unattendedMs` and this arm stops
+      // suppressing on its own once that residue reaches the threshold. Unlike B2
+      // below there is nothing here that can freeze — the bucket is bounded by a
+      // timestamp the assignee wrote, not by a ratio against a clock that may stop.
       (monitorGating.unattendedMs < thresholds.longActiveMs ||
         // BLO-27698 B2: the episode is more than half executing time. Same
         // dominance shape as `noExecutableTurnDominant`, through the shared
