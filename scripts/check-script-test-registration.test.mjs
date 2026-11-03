@@ -215,11 +215,14 @@ test("arm 1: a `run:` nested under `with:` is an action input, not a run step", 
 });
 
 test("arm 1: a `with:` carrying a trailing comment still anchors its inputs", () => {
-  // PEN-5282 shape 2, variant 1 -- fail-OPEN until the `with:` detector was
-  // matched on the STRIPPED line. `with: # inputs` is an ordinary, common
-  // shape; testing the raw line fails the `\s*$` anchor, so `withIndent` was
-  // never set and every nested input registered. Revert the strip in the
-  // `with:` detector and this test goes green-to-red. Found by Ally on #3281.
+  // PEN-5282 shape 2, variant 1 -- fail-OPEN until the `\s*$` anchor was
+  // dropped from the `with:` detector. `with: # inputs` is an ordinary, common
+  // shape; the trailing comment defeats that anchor, so `withIndent` was never
+  // set and every nested input registered. What this pins is the ABSENCE of
+  // the right-hand anchor: re-add `\s*$` at `:308` and this goes green-to-red.
+  // It does NOT pin a comment strip -- the detector reads the raw line on
+  // purpose (see `:299-303`), so do not go looking for one. Found by Ally on
+  // #3281, and the stale wording here caught by Ally on the follow-up head.
   const errors = errorsFor(
     world({
       workflows: [
@@ -245,6 +248,45 @@ test("arm 1: `with` as the FIRST key of a step list item anchors its inputs", ()
   );
   assert.equal(errors.length, 1);
   assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a `with:` nested INSIDE a `with:` block does not move the anchor", () => {
+  // PEN-5282 shape 2, variant 4 -- fail-OPEN, and subtler than the others:
+  // the anchor is set the whole time, it just points at the wrong block. An
+  // action input literally named `with` overwrote `withIndent` with its own
+  // deeper column; the next line back at the OUTER input depth then tripped
+  // the dedent clear, reset the anchor to null, and every later sibling input
+  // registered. Keeping the OUTERMOST anchor makes the nested key just another
+  // input. Drop the `withIndent === null` guard and this test fails.
+  // Found by Ally on #3281.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "jobs:\n  a:\n    steps:\n      - uses: a/b@v1\n        with:\n          with:\n            x: 1\n          run: node --test scripts/a.test.mjs\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: the outer `with:` anchor still CLEARS on a real dedent", () => {
+  // Companion to the test above. `withIndent === null` must not turn the
+  // anchor into a latch that survives the block it was opened for: the next
+  // step's real `run:` sits at step depth, shallower than the `with:`, so the
+  // dedent clear has to fire and release it. Without this, variant 4 could be
+  // "closed" by never letting go -- trading a fail-open for a fail-closed that
+  // silently eats every command after the first `with:` in the file.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: [
+          "jobs:\n  a:\n    steps:\n      - uses: a/b@v1\n        with:\n          with:\n            x: 1\n      - run: node --test scripts/a.test.mjs\n",
+        ],
+      }),
+    ),
+    [],
+  );
 });
 
 test("arm 1: a multi-line flow `with: {` anchors the inputs below it", () => {
