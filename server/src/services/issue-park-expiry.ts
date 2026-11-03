@@ -57,17 +57,40 @@
  *    because the PATCH leaves the park live. Two wakes from one intent.
  *  - -> `in_progress`: silent at the transition, woken once at the deadline.
  *
- * Nothing in the API surfaces that difference, so prefer `in_progress` when one wake at the
- * deadline is what you meant. One caveat, read from source and NOT measured: the
- * `long_active_duration` trigger (`services/productivity-review.ts`) contains no reference to
- * `parked_until` or `isDeliberateParkActive` at all — the "park" its code names is a
- * run-liveness gap, a different thing — and its elapsed clock is gated on `in_progress`. It
- * clamps the episode end to `nonLiveExecutionHoldSince`, which returns null when
- * `issue.executionRunId` is null, so a previously-checked-out row (non-null `issues.started_at`,
- * which is stamped at CHECKOUT and not by a status PATCH) left on `in_progress` with no holder
- * accrues elapsed time across the park. A row never checked out reads null and cannot trip it,
- * and a `todo` row is outside the trigger by construction. Nobody has observed this firing;
- * check it before recommending `in_progress` as a general pattern.
+ * Nothing in the API surfaces that difference. Which one to prefer is CONDITIONAL, though,
+ * and the condition is the caveat below: `in_progress` buys one wake instead of two at the
+ * cost of starting an un-suppressed `long_active_duration` clock.
+ *
+ * ⚠️ Read from source, NOT measured. That trigger (`services/productivity-review.ts`)
+ * contains no reference to `parked_until` or `isDeliberateParkActive` at all — the "park"
+ * its code names (`leadingParkMs`, `liveSegmentStartedAt`) is a run-liveness gap, a
+ * different object — and its elapsed clock is gated on `in_progress`. Two conditions bound
+ * the episode, and only the second is an exit:
+ *
+ *  - the episode START is `issues.started_at`, which any status write of `in_progress`
+ *    RE-STAMPS to now (`applyStatusSideEffects`, `services/issues.ts:427`). The patch
+ *    spreads the request body, so a status-only PATCH leaves `patch.startedAt` unset and
+ *    takes `new Date()`. That happens on EVERY row moved this way, previously checked out
+ *    or not. There is no "never checked out, so it reads null" exemption — and null would
+ *    not be one anyway, since `activeStartedAt` falls back to `executionLockedAt` and to
+ *    the most recent dispatch.
+ *  - the episode END is clamped to `nonLiveExecutionHoldSince`, which returns null ONLY
+ *    when `issue.executionRunId` is null. A row still carrying a holder pointer is clamped
+ *    at that holder's last attributable moment and accrues nothing across the park. This is
+ *    the exit. A row with no holder accrues the whole park as "active".
+ *
+ * ⇒ the exposed shape is: moved by hand to `in_progress`, no execution holder, park longer
+ * than `longActiveMs` (`DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS` = 6 h, shorter than
+ * most parks written here). The PATCH cannot land without an assignee (`in_progress issues
+ * require an assignee`), so there is always someone for a resulting review to be filed
+ * against. The module's one "deliberate wait" discount, `monitorGatingBreakdown`, keys on
+ * the monitor columns and is reporting-only — it neither sees a park nor gates the fire.
+ *
+ * So prefer `in_progress` when one wake at the deadline is what you meant AND the row keeps
+ * its holder, or the park is short; otherwise take the double wake on `todo`, which is
+ * outside this trigger by construction. Nobody has observed the trigger firing on a parked
+ * row and the suppression paths downstream of the bar are not traced: unmeasured, not
+ * disproven.
  *
  * The `blocked` arm is the one the exclusion below depends on, because that is not how a row
  * normally reaches `todo`, and conflating the two writers is the trap.
