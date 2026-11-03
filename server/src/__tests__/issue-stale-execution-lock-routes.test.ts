@@ -684,6 +684,9 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     );
     // Must steer the caller away from the two responses that wasted runs.
     expect(res.body.remediation).toContain("Do NOT retry or re-file");
+    // PEN-5342: this branch already attributes the holder in prose ("your own
+    // agent"), and the label must agree with it rather than contradict it.
+    expect(res.body.remediation).toContain(`${liveHolderRunId} — agent CodexCoder`);
 
     const holder = (res.body.details?.lockHolders ?? []).find(
       (entry: { runId: string }) => entry.runId === liveHolderRunId,
@@ -692,6 +695,81 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     expect(holder.live).toBe(true);
     expect(holder.status).toBe("running");
     expect(holder.sameAgentAsActor).toBe(true);
+    expect(holder.agentName).toBe("CodexCoder");
+  });
+
+  // PEN-5342: the foreign-agent branch of the same 409 named the holder as a
+  // bare run id. The reader has to supply the missing half from somewhere, and
+  // the only sibling relationship the framing suggests is "another run of
+  // mine" — which is exactly the reading this branch exists to refute.
+  // Measured on PEN-5082 cmt `e87c9e8b`: a DevOps run read a foreign holder id
+  // off the in-pod push guard and reported, in good faith, "another DevOps run
+  // is on this row right now". The holder was an Engineer run.
+  it("names WHICH agent holds the lock when the holder is a different agent (PEN-5342)", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const otherAgentId = randomUUID();
+    const otherAgentRunId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId,
+      name: "Devops",
+      role: "devops",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: otherAgentRunId,
+      companyId,
+      agentId: otherAgentId,
+      status: "running",
+      invocationSource: "manual",
+      startedAt: new Date(),
+      createdAt: new Date("2026-01-01T00:00:30.000Z"),
+    });
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Foreign-agent lock holder attribution",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: otherAgentRunId,
+      executionRunId: otherAgentRunId,
+      executionAgentNameKey: "devops",
+      executionLockedAt: new Date(),
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details?.holderLiveness, JSON.stringify(res.body)).toBe("live");
+    expect(res.body.details?.concurrentSiblingRun).toBe(false);
+
+    // The assertion that matters: `remediation` is the string hoisted to the
+    // top level and read by the agent. The run id alone is what produced the
+    // misread, so the agent must appear in the same breath as the id it
+    // qualifies — not merely as a field somewhere in `details`.
+    expect(res.body.remediation, JSON.stringify(res.body)).toContain(
+      `${otherAgentRunId} — agent Devops`,
+    );
+    expect(res.body.remediation).toContain("Another agent's live run");
+    // The pre-PEN-5342 rendering: a bare id with nothing attached.
+    expect(res.body.remediation).not.toContain(`(${otherAgentRunId})`);
+
+    const holder = (res.body.details?.lockHolders ?? []).find(
+      (entry: { runId: string }) => entry.runId === otherAgentRunId,
+    );
+    expect(holder, JSON.stringify(res.body)).toBeTruthy();
+    expect(holder.agentId).toBe(otherAgentId);
+    expect(holder.agentName).toBe("Devops");
+    expect(holder.sameAgentAsActor).toBe(false);
   });
 
   it("allows the rightful assignee to release after the owning run failed", async () => {

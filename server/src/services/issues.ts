@@ -8207,6 +8207,33 @@ export function issueService(db: Db) {
    * the lock released on its own within 200ms. Reporting liveness here is what
    * makes those two indistinguishable-by-run-id cases self-diagnosing.
    */
+  /**
+   * PEN-5342: render a lock holder as `<run id> (agent <name>)`, never bare.
+   *
+   * A bare run id does not carry what it takes to be read correctly, and the
+   * default a reader supplies for the missing half is "another run of mine".
+   * Measured on PEN-5082 (cmt `e87c9e8b`): a DevOps run read a foreign holder
+   * id off the in-pod push guard and reported, in good faith, "another DevOps
+   * run is on this row right now" — the holder was an Engineer run. The cost
+   * is not only forensic: in PEN-5082 instance 3 a run opened by correcting a
+   * comment its SIBLING had written, then reasoned forward from that
+   * corrupted belief about its own history.
+   *
+   * The name is already in hand from the join above, so this is free. When the
+   * join found no agent row the id is still printed — an unnamed holder is
+   * weaker evidence, not absent evidence, and the `agentId` field on the
+   * structured `lockHolders[]` entry remains the machine-readable answer.
+   */
+  function holderAgentLabel(holder: { agentName: string | null; agentId: string | null }): string {
+    if (holder.agentName) return `agent ${holder.agentName}`;
+    if (holder.agentId) return `agent id ${holder.agentId}`;
+    return "holding agent unknown";
+  }
+
+  function holderLabel(holder: { runId: string; agentName: string | null; agentId: string | null }): string {
+    return `${holder.runId} — ${holderAgentLabel(holder)}`;
+  }
+
   async function describeIssueLockConflict(input: {
     checkoutRunId: string | null;
     executionRunId: string | null;
@@ -8231,20 +8258,27 @@ export function issueService(db: Db) {
     let runRows: {
       id: string;
       agentId: string | null;
+      agentName: string | null;
       status: string;
       startedAt: Date | null;
     }[] = [];
     let lookupFailed = false;
     if (lookupRunIds.length > 0) {
       try {
+        // PEN-5342: `agentName` joins onto the SAME round trip that already
+        // reads the holder rows — no extra query, no extra latency on the 409
+        // path. A bare run id is the input to the measured misread this join
+        // exists to prevent (see `holderAgentLabel`).
         runRows = await db
           .select({
             id: heartbeatRuns.id,
             agentId: heartbeatRuns.agentId,
+            agentName: agents.name,
             status: heartbeatRuns.status,
             startedAt: heartbeatRuns.startedAt,
           })
           .from(heartbeatRuns)
+          .leftJoin(agents, and(eq(agents.companyId, heartbeatRuns.companyId), eq(agents.id, heartbeatRuns.agentId)))
           .where(inArray(heartbeatRuns.id, lookupRunIds))
           .orderBy(asc(heartbeatRuns.id));
       } catch {
@@ -8291,6 +8325,7 @@ export function issueService(db: Db) {
         lockHolders: ownerRunIds.map((runId) => ({
           runId,
           agentId: null,
+          agentName: null,
           status: null,
           live: null,
           sameAgentAsActor: false,
@@ -8308,6 +8343,7 @@ export function issueService(db: Db) {
       return {
         runId,
         agentId: run?.agentId ?? null,
+        agentName: run?.agentName ?? null,
         status: run?.status ?? null,
         // "Live" is the exact complement of reapable: a terminal run, or a
         // never-started queued/scheduled_retry one, holds no real claim.
@@ -8335,8 +8371,13 @@ export function issueService(db: Db) {
       remediation: actorRunRemediation ?? (liveHolders.length === 0
         ? "The lock holder was not live in this snapshot. Retry once so a terminal or queued holder can be reaped; escalate only if the conflict persists."
         : liveSiblings.length > 0
-          ? `Expected: a concurrent run of your own agent (${liveSiblings.map((holder) => holder.runId).join(", ")}) is live and holds this issue. Do NOT retry or re-file a platform bug — yield this issue to the sibling run, or wait for it to finish and the lock releases automatically.`
-          : `Another agent's live run (${liveHolders.map((holder) => holder.runId).join(", ")}) holds this issue. Comment instead of mutating, or wait for that run to finish.`),
+          ? `Expected: a concurrent run of your own agent (${liveSiblings.map(holderLabel).join(", ")}) is live and holds this issue. Do NOT retry or re-file a platform bug — yield this issue to the sibling run, or wait for it to finish and the lock releases automatically.`
+          // PEN-5342: name WHICH agent. This branch is reached precisely when
+          // the holder is NOT your own seat, and a reader handed a bare id
+          // defaults to "another run of mine" — the one reading this branch
+          // cannot afford, because it is the reading this branch exists to
+          // refute.
+          : `Another agent's live run (${liveHolders.map(holderLabel).join(", ")}) holds this issue. Comment instead of mutating, or wait for that run to finish.`),
     };
   }
 
