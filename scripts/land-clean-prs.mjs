@@ -1861,9 +1861,39 @@ export function applyRow(repo, row, run = gh) {
       run,
     );
   }
-  if (row.action === "codeowner-review-requested") return codeownerRequestComment(repo, row, run);
+  if (row.action === "codeowner-review-requested") {
+    return codeownerRequestComment(repo, row, run, LAND_REPO_HOLD_REASON);
+  }
   return null;
 }
+
+/**
+ * Why a LAND repo's clean PR is being held rather than enqueued: the routine
+ * would land it, and is declining because CODEOWNERS is advisory here and
+ * enqueuing would merge past an owner who was asked to look.
+ */
+const LAND_REPO_HOLD_REASON =
+  "GitHub does not enforce CODEOWNERS on this repository, so the landing routine holds it here " +
+  "rather than enqueuing it.";
+
+/**
+ * Why a NOTIFY-ONLY repo's clean PR is being held: because this routine does
+ * not land anything here at all.
+ *
+ * The reason MUST be passed in rather than shared, and the land-repo sentence
+ * is actively false in the repo this notify list was built for. Measured on
+ * `Blockcast/penstock-llm-proxy-core`#2959 (2026-11-03): `mergeStateStatus:
+ * BLOCKED`, `reviewDecision: REVIEW_REQUIRED`, `.github/CODEOWNERS` reading
+ * `* @Blockcast/onprem-k8s-ally-reviewer @kkroo`. GitHub enforces the owner
+ * review there. Posting "GitHub does not enforce CODEOWNERS on this
+ * repository" would tell the one human the notification exists to reach that
+ * their review is unenforced — and `commentOnce` dedupes on the marker, so
+ * that sentence would be permanent per PR and unreplaceable without changing
+ * the marker. (Ally review, PR #3365.)
+ */
+const NOTIFY_ONLY_HOLD_REASON =
+  "This routine does not land pull requests in this repository — it only reports holds — so " +
+  "nothing here will merge it. It is waiting on the requested review.";
 
 /**
  * The code-owner notification, lifted out of `applyRow` so that
@@ -1871,15 +1901,18 @@ export function applyRow(repo, row, run = gh) {
  * `gh pr merge`. That separation is the whole structural claim of PEN-5430:
  * the notify-only path is not a flag checked inside the lander, it is a
  * different applier with no reachable merge call to get wrong.
+ *
+ * `holdReason` is a required argument rather than a default, so adding a third
+ * applier cannot inherit a sentence that is untrue in its repo by forgetting
+ * to override one.
  */
-function codeownerRequestComment(repo, row, run) {
+function codeownerRequestComment(repo, row, run, holdReason) {
   return commentOnce(
     repo,
     row.number,
     CODEOWNER_REQUEST_MARKER,
     `This PR is clean at its current head but still has an outstanding code-owner review ` +
-      `request (${row.detail}). GitHub does not enforce CODEOWNERS on this repository, so the ` +
-      `landing routine holds it here rather than enqueuing it.`,
+      `request (${row.detail}). ${holdReason}`,
     run,
   );
 }
@@ -1903,7 +1936,9 @@ function codeownerRequestComment(repo, row, run) {
  * reaches here reading `enqueue`, and nothing here could act on it if it did.
  */
 export function applyRowNotifyOnly(repo, row, run = gh) {
-  if (row?.action === "codeowner-review-requested") return codeownerRequestComment(repo, row, run);
+  if (row?.action === "codeowner-review-requested") {
+    return codeownerRequestComment(repo, row, run, NOTIFY_ONLY_HOLD_REASON);
+  }
   return null;
 }
 
@@ -2155,7 +2190,17 @@ export function runRepo(
     console.log(`## ${repo}\n\nAborted while collecting PRs: ${message.trim().split("\n")[0]}`);
     throw error;
   }
-  const rows = classify(prs, { settleMinutes, spent });
+  // The per-fire cap is applied INSIDE `classifyAll`, which rewrites an
+  // `enqueue` past the ceiling to `skip`/`cap:N-per-fire` before
+  // `demoteMergeActions` can see it. In a notify-only repo that prints a
+  // throttle which cannot apply there — the repo spends no budget and arms
+  // nothing — and it would do so routinely: once the land repos spend the cap,
+  // or once the notify repo holds more than MAX_ENQUEUES_PER_FIRE clean PRs.
+  // Opting out of the cap here is what makes `sweepOrder`'s "notify-only repos
+  // spend nothing" literally true rather than nearly true. (Ally review,
+  // PR #3365.)
+  const budget = landable ? { spent } : { spent: 0, maxEnqueues: Infinity };
+  const rows = classify(prs, { settleMinutes, ...budget });
   // Before the apply loop, before the receipt, and before `sweepRepos` reads
   // the returned rows — every consumer of `enqueue` must see the demoted name.
   if (!landable) demoteMergeActions(rows);

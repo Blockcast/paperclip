@@ -963,6 +963,78 @@ describe("notify-only repos (PEN-5430)", () => {
     );
   });
 
+  it("does not tell a notify-only repo that CODEOWNERS is unenforced there", () => {
+    // Ally review, PR #3365. The land-repo sentence — "GitHub does not enforce
+    // CODEOWNERS on this repository" — is FALSE in the repo this notify list
+    // was built for: `penstock-llm-proxy-core`#2959 reads BLOCKED /
+    // REVIEW_REQUIRED against a CODEOWNERS of
+    // `* @Blockcast/onprem-k8s-ally-reviewer @kkroo`. Posting it would tell the
+    // one human the notification exists to reach that their review does not
+    // count, and `commentOnce` dedupes on the marker, so it would be permanent
+    // per PR and unreplaceable without changing the marker.
+    const bodyFrom = (applier) => {
+      let posted = null;
+      applier(
+        "o/r",
+        { number: 2959, action: "codeowner-review-requested", detail: "@Blockcast/team" },
+        (args) => {
+          if (args[0] === "api") return "[]";
+          posted = args.at(-1);
+          return "";
+        },
+      );
+      return posted;
+    };
+
+    const notifyBody = bodyFrom(applyRowNotifyOnly);
+    const landBody = bodyFrom(applyRow);
+
+    assert.doesNotMatch(notifyBody, /does not enforce CODEOWNERS/);
+    assert.match(notifyBody, /does not land pull requests in this repository/);
+    assert.match(notifyBody, /waiting on the requested review/);
+    // Control: the land-repo wording is unchanged, and the two really do differ.
+    assert.match(landBody, /does not enforce CODEOWNERS/);
+    assert.notEqual(notifyBody, landBody);
+    // Both still carry the dedupe marker and the outstanding owner.
+    for (const body of [notifyBody, landBody]) {
+      assert.ok(body.startsWith(CODEOWNER_REQUEST_MARKER));
+      assert.match(body, /@Blockcast\/team/);
+    }
+  });
+
+  it("does not print a per-fire cap in a repo the cap cannot throttle", () => {
+    // Ally review, PR #3365. `classifyAll` applies MAX_ENQUEUES_PER_FIRE and
+    // rewrites the overflow to `skip`/`cap:N-per-fire` BEFORE
+    // `demoteMergeActions` can see it, so a notify-only repo would print a
+    // throttle that does not apply to it — routinely, since it happens as soon
+    // as the land repos spend the cap or the notify repo holds more than N
+    // clean PRs. Here the budget is pre-spent to the ceiling, which is exactly
+    // the state a land repo would leave behind.
+    const many = () => Array.from({ length: MAX_ENQUEUES_PER_FIRE + 2 }, (_, i) => pr({ number: 700 + i }));
+    const actionsIn = (landableRepo) =>
+      quiet(() =>
+        atNow(() =>
+          runRepo("b/repo", true, 0, MAX_ENQUEUES_PER_FIRE, [], [], {
+            landable: landableRepo,
+            fetch: many,
+            applyOne: () => null,
+            state: () => {},
+          }),
+        ),
+      ).map((row) => row.reason);
+
+    // Control: a land repo arriving with the budget spent DOES print the cap.
+    assert.ok(
+      actionsIn(true).every((reason) => /^cap:/.test(reason)),
+      "control: the cap is real and visible in a land repo",
+    );
+    assert.deepEqual(
+      actionsIn(false).filter((reason) => /^cap:/.test(reason)),
+      [],
+      "a notify-only repo never names a throttle it is not subject to",
+    );
+  });
+
   it("spends no enqueue budget, so a notify repo cannot starve the lander", () => {
     // `sweepRepos` tallies rows still reading `enqueue` against
     // MAX_ENQUEUES_PER_FIRE. If a notify-only repo kept that name, adding a
