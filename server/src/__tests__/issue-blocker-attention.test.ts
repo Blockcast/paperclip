@@ -1669,21 +1669,20 @@ describeEmbeddedPostgres("issue blocker attention", () => {
   });
 
   // ---------------------------------------------------------------------------------
-  // PEN-5105: the `assigneeUserId` arm covers unconditionally -- no staleness term, no
-  // upper bound on how long it holds. PEN-5021 and PEN-5105 carry the sweeps attributing
-  // the false-`covered` population to this arm; the figures stay on those rows rather than
-  // being inlined here, where a snapshot would go stale silently.
+  // PEN-5105: the `assigneeUserId` arm. It used to cover unconditionally and for ever; it
+  // now covers until the blocker goes stale, unless a deliberate park is still live.
   //
-  // What the count below measures is an UPPER BOUND, not an exact delta: this arm returns
-  // ahead of the `in_review` arm, the downstream recursion and the leaf monitor/run/park
-  // checks, so a blocker failing a future staleness conjunct could still be covered by one
-  // of those. It can only overstate the flood, which is the safe direction for sizing it.
+  // The OBSERVATION tests below (`humanAssignedCoveredBlockerCount` /
+  // `oldestHumanAssignedCoveredIdleHours`) predate the conjunct and still assert that
+  // `state` is untouched. Their idle spans are deliberately kept UNDER the threshold so
+  // they keep measuring what they were written to measure -- per-edge counting and
+  // max-not-min aggregation -- rather than silently becoming threshold tests. The
+  // threshold itself is covered by the controls further down.
   //
-  // Taking the conjunct un-covers every human-assigned blocker company-wide at once, which
-  // is the flood shape the CEO flagged on PEN-5021. So this ships the MEASUREMENT only.
-  // Every test below therefore asserts the observation AND that `state` is untouched --
-  // the second half is the point, not boilerplate: the moment one of these flips a `state`
-  // the change has silently become the flood it exists to size.
+  // The count remains an UPPER BOUND on what a HIGHER threshold would un-cover: this arm
+  // returns ahead of the `in_review` arm, the downstream recursion and the leaf
+  // monitor/run/park checks, so a blocker that stops covering here could still be covered
+  // by one of those. It can only overstate, which is the safe direction for sizing.
   // ---------------------------------------------------------------------------------
   const HOUR_MS = 60 * 60 * 1000;
 
@@ -1823,7 +1822,9 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       title: "Stale human-assigned blocker",
       status: "todo",
       assigneeUserId: "user-phe-b",
-      lastActivityAt: new Date(Date.now() - 120 * HOUR_MS),
+      // Under HUMAN_ASSIGNED_BLOCKER_STALE_HOURS on purpose: this test is about reporting
+      // the MAX idle span rather than the min, not about the staleness conjunct.
+      lastActivityAt: new Date(Date.now() - 48 * HOUR_MS),
     });
     await block({ companyId, blockerIssueId: freshId, blockedIssueId: parentId });
     await block({ companyId, blockerIssueId: staleId, blockedIssueId: parentId });
@@ -1834,7 +1835,7 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     // Two TOP-LEVEL edges, so two -- the count is per edge, which is what "how many
     // blockers would stop reading covered" actually asks.
     expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(2);
-    expect(parent?.blockerAttention?.oldestHumanAssignedCoveredIdleHours).toBeGreaterThanOrEqual(119.9);
+    expect(parent?.blockerAttention?.oldestHumanAssignedCoveredIdleHours).toBeGreaterThanOrEqual(47.9);
   });
 
   // Per-edge, not per-node. A chain holding two stale human-assigned nodes still flips
@@ -1857,7 +1858,9 @@ describeEmbeddedPostgres("issue blocker attention", () => {
       title: "Human-assigned leaf",
       status: "todo",
       assigneeUserId: "user-phf-b",
-      lastActivityAt: new Date(Date.now() - 90 * HOUR_MS),
+      // Under the threshold on purpose -- see the note on PHE-3. A stale leaf here would
+      // make the chain `stalled` and stop exercising per-edge counting.
+      lastActivityAt: new Date(Date.now() - 40 * HOUR_MS),
     });
     await block({ companyId, blockerIssueId: midId, blockedIssueId: parentId });
     await block({ companyId, blockerIssueId: leafId, blockedIssueId: midId });
@@ -1888,6 +1891,142 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(solo?.blockerAttention).toHaveProperty("humanAssignedCoveredBlockerCount", 0);
     expect(solo?.blockerAttention).toHaveProperty("oldestHumanAssignedCoveredIdleHours", null);
   });
+
+  // -------------------------------------------------------------------------------
+  // PEN-5105: the staleness conjunct itself. Each control below names the precise
+  // mutation it catches, per the PEN-5021 pattern -- a control nobody can point a
+  // mutation at is decoration.
+  // -------------------------------------------------------------------------------
+
+  // THE change. Deleting the conjunct (restoring the unconditional `covered: true`)
+  // turns this back into `covered` and is the whole regression.
+  it("stalls a human-assigned blocker idle past the threshold (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHH");
+    const parentId = await insertIssue({ companyId, identifier: "PHH-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PHH-2",
+      title: "Long-abandoned human-assigned blocker",
+      status: "todo",
+      assigneeUserId: "user-phh",
+      lastActivityAt: new Date(Date.now() - 240 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "stalled",
+      coveredBlockerCount: 0,
+      stalledBlockerCount: 1,
+      sampleStalledBlockerIdentifier: "PHH-2",
+    });
+    // It stopped covering, so it is no longer counted as a human-assigned COVERED blocker.
+    expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(0);
+  });
+
+  // Boundary control. A row just inside the window still covers. Mutating `>=` to `>`
+  // leaves this green; mutating the constant down to 24 turns it `stalled`.
+  it("keeps covering a human-assigned blocker still inside the window (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHI");
+    const parentId = await insertIssue({ companyId, identifier: "PHI-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PHI-2",
+      title: "Recently-touched human-assigned blocker",
+      status: "todo",
+      assigneeUserId: "user-phi",
+      lastActivityAt: new Date(Date.now() - 60 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({ state: "covered", coveredBlockerCount: 1 });
+    expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(1);
+  });
+
+  // The term that stops this being a false-positive machine, and it is NOT hypothetical:
+  // 11 of the 36 otherwise-stale rows measured on 2026-11-03 are covered by two blockers
+  // parked to 2027-01-20. Dropping `isDeliberateParkActive` from the conjunct turns this
+  // `stalled` and mints a false attention item against work a human deliberately deferred.
+  it("keeps covering a stale human-assigned blocker on a live deliberate park (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHJ");
+    const parentId = await insertIssue({ companyId, identifier: "PHJ-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PHJ-2",
+      title: "Deliberately deferred human-assigned blocker",
+      status: "todo",
+      assigneeUserId: "user-phj",
+      lastActivityAt: new Date(Date.now() - 240 * HOUR_MS),
+      parkedUntil: new Date(Date.now() + 30 * 24 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({ state: "covered", coveredBlockerCount: 1 });
+    expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(1);
+  });
+
+  // The other half of the park term: suppression has to EXPIRE on its own. Reading
+  // `parkedUntil != null` instead of `isDeliberateParkActive` leaves this `covered`
+  // for ever, which is the original unbounded bug wearing a park.
+  it("stalls a stale human-assigned blocker whose park has lapsed (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHK");
+    const parentId = await insertIssue({ companyId, identifier: "PHK-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PHK-2",
+      title: "Lapsed-park human-assigned blocker",
+      status: "todo",
+      assigneeUserId: "user-phk",
+      lastActivityAt: new Date(Date.now() - 240 * HOUR_MS),
+      parkedUntil: new Date(Date.now() - 2 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({ state: "stalled", stalledBlockerCount: 1 });
+  });
+
+  // ⭐ The verdict-SHAPE control, and the reason the arm returns `stalled` rather than the
+  // `{covered:false, stalled:false}` fall-through. The recursion tests `hardAttention`
+  // BEFORE `stalledEntry`, so a non-stalled fall-through here would outrank a genuinely
+  // stalled sibling and drop the whole row from the operator feed -- `attention.ts` reads
+  // `state === "stalled"` only. Mutating the arm to the fall-through makes this row
+  // `needs_attention` with `sampleStalledBlockerIdentifier: null`: strictly worse than
+  // before the change, which is what makes this the control that matters most.
+  it("does not mask a stalled sibling behind a stale human-assigned blocker (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHL");
+    const parentId = await insertIssue({ companyId, identifier: "PHL-1", title: "Parent", status: "blocked" });
+    const staleHumanId = await insertIssue({
+      companyId,
+      identifier: "PHL-2",
+      title: "Stale human-assigned blocker",
+      status: "todo",
+      assigneeUserId: "user-phl",
+      lastActivityAt: new Date(Date.now() - 240 * HOUR_MS),
+    });
+    const stalledReviewId = await insertIssue({
+      companyId,
+      identifier: "PHL-3",
+      title: "Genuinely stalled in_review blocker",
+      status: "in_review",
+    });
+    await block({ companyId, blockerIssueId: staleHumanId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: stalledReviewId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    // Still reaches the feed, and still names a stalled blocker to act on.
+    expect(parent?.blockerAttention?.state).toBe("stalled");
+    expect(parent?.blockerAttention?.sampleStalledBlockerIdentifier).not.toBeNull();
+    expect(parent?.blockerAttention?.stalledBlockerCount).toBeGreaterThanOrEqual(1);
+  });
+
 
   it("applies assigneeAgentId='null' as an IS NULL filter on the blocked-inbox path", async () => {
     const { companyId, agentId } = await createCompany("BAN");
