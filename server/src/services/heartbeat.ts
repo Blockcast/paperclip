@@ -8835,9 +8835,18 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
  * no warnings", and that silently dropped every warning appended after this
  * point -- the session-reset notices a few hundred lines below, for one. The
  * array is live; the object holding it has to exist for the late entries to
- * have anywhere to arrive. An all-empty patch costs nothing: the wake
- * normalizer discards an execution workspace with no branch and no warnings,
- * so the payload still reads as absent downstream.
+ * have anywhere to arrive.
+ *
+ * An all-empty patch is then DISCARDED DOWNSTREAM rather than being free
+ * here, and that is a per-adapter fact, not a single guarantee: the shared
+ * `normalizePaperclipWakeExecutionWorkspace` drops a workspace with no branch
+ * and no warnings, and `paperclip-adapter-claude-k8s` -- which keeps a LOCAL
+ * `stringifyPaperclipWakePayload` whose only emptiness test is `=== "{}"` --
+ * strips the empty workspace itself before serialising, for the same reason.
+ * Both are pinned by tests. A new adapter that reads this payload is not
+ * covered by either until someone checks it; without such a strip it would
+ * put a `PAPERCLIP_WAKE_PAYLOAD_JSON` saying nothing on every timer
+ * heartbeat, which `skills/paperclip/SKILL.md` tells agents to read first.
  */
 export function buildPaperclipWakeExecutionWorkspacePatch(input: {
   branchName: string | null;

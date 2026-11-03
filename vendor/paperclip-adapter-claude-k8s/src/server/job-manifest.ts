@@ -1638,13 +1638,65 @@ function boundLiteralEnvValue(name: string, value: string, shedBytes: Record<str
   return shedOversizeLiteralEnvValue(value, budget) ?? "";
 }
 
+/**
+ * Drop an `executionWorkspace` that conveys nothing, so an all-empty patch
+ * does not become a wake payload.
+ *
+ * PEN-5336: the server attaches the execution-workspace patch UNCONDITIONALLY
+ * (`heartbeat.ts`, `buildPaperclipWakeExecutionWorkspacePatch`) because
+ * `warnings` is a live array that later code still pushes onto -- the object
+ * has to exist for those late entries to have anywhere to arrive. On a pure
+ * timer heartbeat nothing ever arrives, so the payload stays
+ * `{"executionWorkspace":{"branchName":null,"warnings":[]}}`.
+ *
+ * The SHARED normalizer discards that shape, so adapters using adapter-utils
+ * see no payload. This package does NOT use it -- it keeps a local
+ * `stringifyPaperclipWakePayload`, whose only emptiness test is `=== "{}"`,
+ * which that shape does not match. Without this strip every claude_k8s pod,
+ * including every timer heartbeat that previously had no wake key at all,
+ * gets a `PAPERCLIP_WAKE_PAYLOAD_JSON` saying nothing -- and `SKILL.md` tells
+ * agents to inspect that variable FIRST when it is present and to read it as
+ * a comment wake. The prompt is unaffected (the local renderer emits "" for
+ * this shape); the cost is a misleading read on every run.
+ *
+ * Deciding this at SERIALISATION time rather than at attach time is what
+ * keeps the live-array reasoning intact: by the time this runs, dispatch has
+ * happened and every late warning is already in the array.
+ *
+ * Deliberately STRICTER than the shared normalizer, which keys only on
+ * `branchName`/`warnings` and drops every other key. A future field on this
+ * patch would be invisible to that test, and this package passes the payload
+ * through RAW -- so an unrecognised key with a value keeps the workspace here
+ * rather than being silently eaten.
+ */
+function wakePayloadWithoutEmptyExecutionWorkspace(wake: Record<string, unknown>): Record<string, unknown> {
+  const workspace = wake.executionWorkspace;
+  if (!workspace || typeof workspace !== "object" || Array.isArray(workspace)) return wake;
+  const entries = Object.entries(workspace as Record<string, unknown>);
+  const conveysSomething = entries.some(([key, value]) => {
+    if (key === "warnings") return readWakeExecutionWorkspaceWarnings(wake).length > 0;
+    if (key === "branchName") {
+      return (
+        typeof value === "string" &&
+        value.replace(/[\u0000-\u001f\u007f]/g, "").trim().length > 0
+      );
+    }
+    // Any other key: keep the workspace unless the value is plainly absent.
+    return value !== null && value !== undefined;
+  });
+  if (conveysSomething) return wake;
+  const { executionWorkspace: _dropped, ...rest } = wake;
+  return rest;
+}
+
 function stringifyPaperclipWakePayload(wake: unknown): string | null {
   if (!wake || typeof wake !== "object") return null;
   try {
-    const json = JSON.stringify(wake);
+    const payload = wakePayloadWithoutEmptyExecutionWorkspace(wake as Record<string, unknown>);
+    const json = JSON.stringify(payload);
     if (json === "{}") return null;
     if (Buffer.byteLength(json, "utf8") <= WAKE_PAYLOAD_MAX_VALUE_BYTES) return json;
-    return shedOversizeWakePayload(wake as Record<string, unknown>);
+    return shedOversizeWakePayload(payload);
   } catch {
     return null;
   }
