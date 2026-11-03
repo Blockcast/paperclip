@@ -67,7 +67,7 @@ to reach a busy assignee, which is the behaviour the carve-out exists to provide
 
 ## Can a stale `executionRunId` wedge a row?
 
-No, and three independent mechanisms are why. This is worth knowing before proposing a control
+No, and five independent mechanisms are why. This is worth knowing before proposing a control
 keyed on the column, because "it would fail closed and wedge the row" is the usual objection and
 the design already answers it.
 
@@ -94,9 +94,39 @@ the design already answers it.
    it would destroy the continuation rather than delay it: the promotion path gates on the lock
    under `FOR UPDATE`, and the pre-start staleness check cancels the run outright with
    `issue_execution_lock_changed` if the column moved underneath it. That population's lock is
-   bounded by the promotion path (`requiresIssueExecutionRetryLock`), not by a clock — which is a
-   handoff, not a gap, but it is the one holder state where "6h and it releases" is the wrong
-   mental model.
+   bounded by the promotion path (`requiresIssueExecutionRetryLock`), not by a clock — a handoff,
+   not a gap, but it is the one holder state where "6h and it releases" is the wrong mental model.
+   Mechanisms 4 and 5 are what make that handoff a bound rather than a promise.
+4. **A never-started holder is reaped regardless of reason.**
+   `ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES` (`issue-execution-lock.ts`) is
+   `["queued", "scheduled_retry"]`, and `issues.checkout()` cancels and adopts such a row **while
+   `startedAt` is null** — independent of the sweep and independent of `scheduledRetryReason`. So
+   a continuous-lock reason does not protect a holder that never ran; only a *started* one reaches
+   the handoff in 3.
+5. **A refused promotion releases the lock in the same transaction.** This is the bound on the
+   started holder, and it is the mechanism the "promotion owns the lifecycle" wording hides. When
+   the promotion gate declines — `issue_not_found`, assignee mismatch, `issue_cancelled`,
+   `issue_terminal_status`, `issue_not_in_progress`, or `issue_execution_lock_changed` — the
+   `gate_suppressed` branch sets the run `cancelled` **and** nulls `executionRunId`,
+   `executionAgentNameKey` and `executionLockedAt` in the same `db.transaction`, guarded by
+   `eq(issues.executionRunId, cancelled.id)` (`heartbeat.ts`, search `gate_suppressed`). A gate
+   refusal therefore cannot strand the column; the two outcomes are "promoted, lock legitimately
+   retained" and "cancelled, lock cleared".
+
+   **The residual that closes:** the only remaining unbounded shape would be a started
+   continuous-lock holder whose promotion sweep never selects it, since that sweep selects on
+   `lte(heartbeatRuns.scheduledRetryAt, now)` — which a NULL never satisfies. It is not reachable.
+   All four writers that park a run into `scheduled_retry` stamp a non-null `scheduledRetryAt` at
+   insert, so every park carries a concrete due time and every holder eventually reaches the gate
+   in 5. Grepping `status: "scheduled_retry"` returns **seven** sites, not four — the inserts are
+   `heartbeat.ts` ×3 and `recovery/service.ts` ×1; the other three are a type union and a `SELECT`
+   re-tag in `issues.ts` plus a comment in `queued-run-age-metrics.ts`. Nothing writes
+   `scheduledRetryAt: null` to the database at all: all five hits for that literal are in-memory
+   return shapes.
+
+   This is the population BLO-20983 stranded for ~4 days, so the claim is worth checking rather
+   than trusting: that incident's cause was the **basis** `isPreClaimLockExpired` measured from,
+   fixed in BLO-21309 by re-basing on `lockedAt`, not an absence of mechanism 5.
 
 A related but separate defect is that `executionAgentNameKey` can go stale against a fresh
 `executionRunId` (PEN-5351). That misattributes the holder's **name**, which is a legibility
