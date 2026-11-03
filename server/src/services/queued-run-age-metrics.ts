@@ -340,10 +340,26 @@ async function refreshClaimableQueuedRunAgeMetrics(
  * Reading the pair: a seat recording `no_claimable_run` while this names a run
  * means one of two things, and the arm says which. If the refusal for THIS run
  * id is on an arm `isDispatchRankReady` does not apply (`pause_hold`,
- * `stale_issue`, `pr_review_task_held`, the budget and cap arms), the gauge is
- * aging a row the claim path will never take — the gauge is wrong. If no
- * refusal is recorded for this run id at all, the dispatcher never reached it —
- * the dispatcher is wrong.
+ * `stale_issue`, the PR-review and duplicate-dispatch arms, the budget and cap
+ * arms), the gauge is aging a row the claim path will never take — the gauge is
+ * wrong.
+ *
+ * The converse does NOT hold symmetrically, and reading it as though it did
+ * would bias the verdict toward "the dispatcher is wrong". An absent refusal
+ * means the claim path never ruled on this run, which has two causes:
+ *
+ *   - The dispatch loop offered it and nothing refused it — the dispatcher
+ *     genuinely passed over claimable work. That is the fork (b) reading.
+ *   - The loop never offered it at all, because the pass stopped early. Check
+ *     `candidatesNotAttempted` and `stoppedEarly` on the `no_claimable_run`
+ *     line before concluding anything; a truncated pass is not evidence either
+ *     way.
+ *
+ * The loop's two pre-claim screens used to live in that silence as well, and
+ * they are fork (a) rather than fork (b) — a running run holding the same
+ * PR-review task key, or a running sibling owning the same issue, neither of
+ * which `isDispatchRankReady` screens. Both now report an arm, so they are
+ * counted on the correct side instead of inflating the absent-refusal bucket.
  */
 export function planClaimableSubjectLogs(
   oldestClaimableByAgent: ReadonlyMap<string | null, ClaimableQueuedRunSubject>,
