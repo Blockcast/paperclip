@@ -1,9 +1,13 @@
+import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { promisify } from "node:util";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   WORKSPACE_CLAIM_FILENAME,
+  WORKSPACE_CLAIM_GIT_FILENAME,
   WORKSPACE_CLAIM_VERSION,
   acquireWorkspaceDirClaim,
   classifyWorkspaceDirClaim,
@@ -12,9 +16,12 @@ import {
   parseWorkspaceDirClaim,
   refuseUnlockedIssueDirectory,
   releaseWorkspaceDirClaim,
+  resolveWorkspaceClaimLocation,
   type ClaimOwnerLiveness,
   type WorkspaceDirClaimIdentity,
 } from "../services/workspace-dir-claim.js";
+
+const run = promisify(execFile);
 
 const AGENT = "29033747-e513-46d5-8a13-dcb5dac10017";
 const OTHER_AGENT = "11b9c48f-aee6-4ac4-8f4a-5ba60c73fb9c";
@@ -89,6 +96,22 @@ describe("classifyWorkspaceDirClaim", () => {
   it("classifies a live run of the SAME agent as a sibling run", () => {
     const verdict = classifyWorkspaceDirClaim({ ...base, rawClaim: claimOf(RUN_B, AGENT) });
     expect(verdict.kind).toBe("sibling_run");
+  });
+
+  /**
+   * The acquire-level positive control cannot catch a classifier re-key: those
+   * two runs use different `dirPath`s and never meet here. This is the pure
+   * assertion that the ISSUE field is not an input to the verdict -- same seat,
+   * different run, DIFFERENT issue, one directory is still a sibling run.
+   */
+  it("keys a sibling run on the agent alone, never on the issue", () => {
+    expect(
+      classifyWorkspaceDirClaim({
+        rawClaim: claimOf(RUN_B, AGENT, "a-completely-different-issue"),
+        self: identity({ runId: RUN_A, issueId: ISSUE }),
+        ownerLiveness: "live",
+      }),
+    ).toMatchObject({ kind: "sibling_run" });
   });
 
   it("classifies a live run of a DIFFERENT agent as another agent", () => {
@@ -452,6 +475,304 @@ describe("acquireWorkspaceDirClaim", () => {
     );
     const outcomes = await Promise.all(runs);
     expect(outcomes.filter((outcome) => outcome.acquired)).toHaveLength(1);
+  });
+
+  /**
+   * The same guarantee on the TAKEOVER path, which is the one the restart
+   * scenario actually walks: a seat at `maxConcurrentRuns: 5` waking several
+   * runs after a crash, all of them looking at one orphaned claim.
+   *
+   * The staggered liveness reads are the whole point. `rename` moves whatever
+   * sits at the PATH, not the claim that was classified -- so a slow taker
+   * that finishes classifying the dead owner only AFTER a fast one has already
+   * broken in will rename the WINNER's live claim aside and link over it.
+   * Both then report `acquired: true`, which is PEN-5352 reproduced by the
+   * module written to prevent it.
+   */
+  it("admits exactly one winner when runs race to take over ONE terminal claim", async () => {
+    const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
+    await fs.writeFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), claimOf(DEAD_RUN, OTHER_AGENT));
+
+    // Only the incumbent is dead. The racing runs are live -- a stub that
+    // reported every run terminal would be saying the callers themselves are
+    // dead, and a late arrival taking over a fresh winner's claim would then
+    // be CORRECT behaviour rather than the defect under test.
+    const taker = (runId: string, latencyMs: number) =>
+      acquireWorkspaceDirClaim({
+        dirPath: dirA,
+        self: identity({ runId }),
+        readOwnerLiveness: async (lookedUp) => {
+          await new Promise((resolve) => setTimeout(resolve, latencyMs));
+          return lookedUp === DEAD_RUN ? "terminal" : "live";
+        },
+      });
+
+    const outcomes = await Promise.all([taker(RUN_A, 1), taker(RUN_B, 50)]);
+    const winners = outcomes.filter((outcome) => outcome.acquired);
+    expect(winners).toHaveLength(1);
+
+    // The directory must end up holding the winner's claim, and the loser must
+    // have been told why rather than left to infer it.
+    const onDisk = parseWorkspaceDirClaim(
+      await fs.readFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), "utf8"),
+    );
+    expect([RUN_A, RUN_B]).toContain(onDisk?.runId);
+    const loser = outcomes.find((outcome) => !outcome.acquired);
+    expect(loser?.refusal).toBeTruthy();
+
+    // Evidence must be labelled with the run whose claim it actually is. The
+    // mislabelling is not cosmetic: a `.dir-claim-released-<dead>` file that
+    // in fact holds a LIVE run's claim is the artefact an operator would read
+    // to decide the directory was safely free.
+    const parent = path.dirname(dirA);
+    const evidence = (await fs.readdir(parent)).filter((name) => name.includes("released"));
+    for (const name of evidence) {
+      const claim = parseWorkspaceDirClaim(await fs.readFile(path.join(parent, name), "utf8"));
+      expect(name).toContain(claim?.runId ?? "unparseable");
+      expect(claim?.runId).toBe(DEAD_RUN);
+    }
+  });
+
+  /**
+   * The same takeover race widened: five runs, scattered liveness latencies,
+   * one dead incumbent. This is the shape of the restart the module exists for
+   * -- a seat at `maxConcurrentRuns: 5` waking every run at once against one
+   * orphaned claim -- and it is run repeatedly because a concurrency guarantee
+   * that holds for one interleaving is not a guarantee.
+   */
+  it("admits exactly one winner no matter how the takeover attempts interleave", async () => {
+    const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
+    for (let round = 0; round < 12; round += 1) {
+      const dir = path.join(root, `round-${round}`);
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(path.join(dir, WORKSPACE_CLAIM_FILENAME), claimOf(DEAD_RUN, OTHER_AGENT));
+
+      const outcomes = await Promise.all(
+        [0, 1, 2, 3, 5, 8].map(async (latencyMs, index) => {
+          const runId = `race-${round}-${index}`;
+          const outcome = await acquireWorkspaceDirClaim({
+            dirPath: dir,
+            self: identity({ runId }),
+            readOwnerLiveness: async (lookedUp) => {
+              await new Promise((resolve) => setTimeout(resolve, latencyMs));
+              return lookedUp === DEAD_RUN ? "terminal" : "live";
+            },
+          });
+          return { runId, outcome };
+        }),
+      );
+
+      const winners = outcomes.filter(({ outcome }) => outcome.acquired);
+      expect(winners).toHaveLength(1);
+      // The directory must be held by the run that was TOLD it won -- a later
+      // breaker linking over the winner is the defect, and it leaves exactly
+      // one winner in the return values while the claim on disk says someone
+      // else.
+      const held = parseWorkspaceDirClaim(
+        await fs.readFile(path.join(dir, WORKSPACE_CLAIM_FILENAME), "utf8"),
+      );
+      expect(held?.runId).toBe(winners[0].runId);
+      for (const { outcome } of outcomes.filter(({ outcome }) => !outcome.acquired)) {
+        expect(outcome.refusal).toBeTruthy();
+      }
+    }
+  });
+
+  /**
+   * The election that makes the takeover single-flight is itself a file a
+   * killed run can leave behind, and "a stale lock nothing can clear" is the
+   * failure this module exists to prevent. These two pin the way out: a LIVE
+   * successor blocks, and a TERMINAL one is inherited -- on a positive
+   * determination, never on a clock.
+   *
+   * The token name is recomputed here rather than exported, because the
+   * property under test IS the naming: the election is keyed on the dead
+   * claim's own bytes, so breaking a different claim never contends for it.
+   */
+  const successorTokenPath = (scratchDir: string, vettedRaw: string, chain = "") =>
+    path.join(
+      scratchDir,
+      `.dir-claim-successor-${createHash("sha256").update(vettedRaw).update(chain).digest("hex").slice(0, 32)}.json`,
+    );
+
+  it("refuses while another run is already taking over the same claim", async () => {
+    const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
+    const raw = claimOf(DEAD_RUN, OTHER_AGENT);
+    await fs.writeFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), raw);
+    await fs.writeFile(
+      successorTokenPath(path.dirname(dirA), raw),
+      `${JSON.stringify({ runId: RUN_B, deadRunId: DEAD_RUN, generation: 0 })}\n`,
+    );
+
+    const outcome = await acquireWorkspaceDirClaim({
+      dirPath: dirA,
+      self: identity(),
+      // The dead owner is terminal; the run holding the election is not.
+      readOwnerLiveness: async (runId) => (runId === RUN_B ? "live" : "terminal"),
+    });
+    expect(outcome.acquired).toBe(false);
+    expect(outcome.refusal).toContain(RUN_B);
+    // And it did not touch the claim it was refused from taking.
+    expect(
+      parseWorkspaceDirClaim(await fs.readFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), "utf8"))?.runId,
+    ).toBe(DEAD_RUN);
+  });
+
+  it("inherits the takeover when the elected successor itself died part-way", async () => {
+    const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
+    const DEAD_SUCCESSOR = "00000000-gone-gone-gone-000000000000";
+    const raw = claimOf(DEAD_RUN, OTHER_AGENT);
+    await fs.writeFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), raw);
+    await fs.writeFile(
+      successorTokenPath(path.dirname(dirA), raw),
+      `${JSON.stringify({ runId: DEAD_SUCCESSOR, deadRunId: DEAD_RUN, generation: 0 })}\n`,
+    );
+
+    const outcome = await acquireWorkspaceDirClaim({
+      dirPath: dirA,
+      self: identity(),
+      readOwnerLiveness: async () => "terminal",
+    });
+    // Inherited, because the stranded successor was POSITIVELY terminal. No
+    // timeout was involved and none would have helped.
+    expect(outcome.acquired).toBe(true);
+    expect(
+      parseWorkspaceDirClaim(await fs.readFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), "utf8"))?.runId,
+    ).toBe(RUN_A);
+  });
+
+  it("names the actual errno instead of blaming the mount", async () => {
+    const missing = path.join(root, "does-not-exist", "repo");
+    const outcome = await acquireWorkspaceDirClaim({
+      dirPath: missing,
+      self: identity(),
+      readOwnerLiveness: live,
+    });
+    expect(outcome.acquired).toBe(false);
+    expect(outcome.verdict).toMatchObject({ kind: "indeterminate" });
+    // ENOENT must not read as "hard links unavailable": that sends a run
+    // hunting for a mount problem when the directory simply is not there.
+    expect(outcome.refusal).toContain("ENOENT");
+    expect(outcome.refusal).not.toContain("hard links unavailable");
+  });
+
+  it("bounds the takeover evidence it leaves in a shared parent", async () => {
+    const parent = path.dirname(dirA);
+    for (let i = 0; i < 40; i += 1) {
+      await fs.writeFile(path.join(parent, `.dir-claim-released-stale-${i}.json`), "{}\n");
+    }
+    await fs.writeFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), claimOf(RUN_B, OTHER_AGENT));
+
+    const outcome = await acquireWorkspaceDirClaim({
+      dirPath: dirA,
+      self: identity(),
+      readOwnerLiveness: terminal,
+    });
+    expect(outcome.acquired).toBe(true);
+
+    const evidence = (await fs.readdir(parent)).filter((name) =>
+      name.startsWith(".dir-claim-released-"),
+    );
+    expect(evidence.length).toBeLessThanOrEqual(20);
+    // The newest is the one that was just written -- pruning keeps what a
+    // reader would actually want.
+    expect(evidence.some((name) => name.includes(RUN_B))).toBe(true);
+  });
+});
+
+/**
+ * Criterion from Ally's review: once this is wired in generally, the claim is
+ * an untracked file in whatever repository the agent chose. `git add -A` would
+ * commit the mutex into that repo's PR and `git clean -fd` would delete it --
+ * after which a concurrent run reads `available`, which is PEN-5352 again with
+ * the guard installed.
+ */
+describe("acquireWorkspaceDirClaim in a git checkout", () => {
+  let root: string;
+  let repo: string;
+
+  beforeEach(async () => {
+    root = await fs.mkdtemp(path.join(os.tmpdir(), "pen5352-git-"));
+    repo = path.join(root, "repo");
+    await fs.mkdir(repo, { recursive: true });
+    await run("git", ["init", "-q", "-b", "main"], { cwd: repo });
+    await run("git", ["config", "user.email", "t@example.com"], { cwd: repo });
+    await run("git", ["config", "user.name", "t"], { cwd: repo });
+    await fs.writeFile(path.join(repo, "tracked.txt"), "x\n");
+    await run("git", ["add", "-A"], { cwd: repo });
+    await run("git", ["commit", "-qm", "init"], { cwd: repo });
+  });
+
+  afterEach(async () => {
+    await fs.rm(root, { recursive: true, force: true });
+  });
+
+  it("puts the claim in the git dir, where add -A and clean -fdx cannot reach it", async () => {
+    const outcome = await acquireWorkspaceDirClaim({
+      dirPath: repo,
+      self: identity(),
+      readOwnerLiveness: async () => "live",
+    });
+    expect(outcome.acquired).toBe(true);
+
+    const claimPath = path.join(repo, ".git", WORKSPACE_CLAIM_GIT_FILENAME);
+    expect(parseWorkspaceDirClaim(await fs.readFile(claimPath, "utf8"))?.runId).toBe(RUN_A);
+
+    // Nothing untracked in the tree at all -- so there is no file for a
+    // routine `git add -A` to sweep into somebody else's commit.
+    const { stdout: dirty } = await run("git", ["status", "--porcelain"], { cwd: repo });
+    expect(dirty.trim()).toBe("");
+
+    // And the most destructive routine cleanup leaves the mutex standing.
+    await run("git", ["clean", "-fdx"], { cwd: repo });
+    expect(parseWorkspaceDirClaim(await fs.readFile(claimPath, "utf8"))?.runId).toBe(RUN_A);
+
+    // Still mutually exclusive after all of that.
+    const second = await acquireWorkspaceDirClaim({
+      dirPath: repo,
+      self: identity({ runId: RUN_B }),
+      readOwnerLiveness: async () => "live",
+    });
+    expect(second.acquired).toBe(false);
+    expect(second.verdict.kind).toBe("sibling_run");
+  });
+
+  it("gives a linked worktree its own claim rather than the main checkout's", async () => {
+    const linked = path.join(root, "wt");
+    await run("git", ["worktree", "add", "-q", "-b", "side", linked], { cwd: repo });
+
+    const main = await resolveWorkspaceClaimLocation(repo);
+    const side = await resolveWorkspaceClaimLocation(linked);
+    expect(main.inGitDir).toBe(true);
+    expect(side.inGitDir).toBe(true);
+    // A `.git` FILE is followed to the per-worktree gitdir. Resolving both to
+    // one claim would make two runs in two different worktrees exclude each
+    // other for no reason.
+    expect(side.claimPath).not.toBe(main.claimPath);
+
+    expect((await acquireWorkspaceDirClaim({
+      dirPath: repo, self: identity(), readOwnerLiveness: async () => "live",
+    })).acquired).toBe(true);
+    expect((await acquireWorkspaceDirClaim({
+      dirPath: linked, self: identity({ runId: RUN_B }), readOwnerLiveness: async () => "live",
+    })).acquired).toBe(true);
+  });
+
+  it("releases its own claim from the git dir", async () => {
+    await acquireWorkspaceDirClaim({
+      dirPath: repo,
+      self: identity(),
+      readOwnerLiveness: async () => "live",
+    });
+    expect(await releaseWorkspaceDirClaim({ dirPath: repo, runId: RUN_B })).toMatchObject({
+      released: false,
+    });
+    expect(await releaseWorkspaceDirClaim({ dirPath: repo, runId: RUN_A })).toMatchObject({
+      released: true,
+    });
+    expect(
+      await fs.readFile(path.join(repo, ".git", WORKSPACE_CLAIM_GIT_FILENAME), "utf8").catch(() => null),
+    ).toBeNull();
   });
 });
 

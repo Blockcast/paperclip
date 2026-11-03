@@ -101,7 +101,12 @@ seat in **another** pod — and `ListAgents` cannot see those either; it reports
 subagents, teammates and local sessions, so an empty result means *that tool
 cannot answer the question*, never *nobody else is here*.
 
+The claim lives in the checkout's **git dir**, not in the working tree, so that
+`git add -A` cannot commit it and `git clean -fdx` cannot delete it. A directory
+that is not itself a checkout keeps the claim at its root instead, so read both:
+
 ```sh
+cat "$(git -C <worktree> rev-parse --git-dir)/paperclip-dir-claim.json" 2>/dev/null
 cat <worktree>/.paperclip-dir-claim.json 2>/dev/null
 ```
 

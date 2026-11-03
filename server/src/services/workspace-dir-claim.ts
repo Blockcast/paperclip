@@ -67,22 +67,111 @@
  *     terminal. Not when it is old, not when it is quiet. "I could not look" is
  *     not a determination, and it refuses -- the same fail-closed posture, for
  *     the same reason: the cost of a wrong break-in is another run's work.
+ *   * **Taking over a dead claim is single-flight** (`electClaimSuccessor`).
+ *     Verifying before removing is not sufficient on its own: POSIX has no
+ *     "unlink only if this path is still that inode", so two runs that both
+ *     vet one dead claim both proceed, and any scheme that removes the claim
+ *     and re-creates it leaves the path briefly empty for a third run to win.
+ *     Both were measured here, at two takers and at six. An exclusive-create
+ *     election keyed on the dead claim's own bytes is what makes the removal
+ *     single-flight, and it stays scoped to that one claim so a seat's
+ *     concurrency is never serialised generally.
  *
  * It is deliberately NOT a lease with a timeout. An expiring lease would have
  * handed the incident directory to the second run on a clock rather than on a
- * fact, which is the failure mode this exists to prevent.
+ * fact, which is the failure mode this exists to prevent. That holds for the
+ * election too: a successor stranded by a killed run is inherited only on a
+ * positive terminal determination about that successor, never on its age.
+ *
+ * ## Where the claim lives
+ *
+ * In the git dir for a checkout, in the directory itself otherwise. See
+ * `resolveWorkspaceClaimLocation` -- a claim in a working tree is an untracked
+ * file in somebody else's repository, which `git add -A` commits and
+ * `git clean -fd` deletes.
  */
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 /**
- * The claim lives inside the directory it claims, so a run that `cd`s there
- * finds it without being told where to look, and so `rm -rf` of the workspace
- * takes the claim with it rather than stranding one.
+ * The claim for a directory that is NOT a git checkout. It lives inside the
+ * directory it claims, so a run that `cd`s there finds it without being told
+ * where to look, and so `rm -rf` of the workspace takes the claim with it
+ * rather than stranding one.
  */
 export const WORKSPACE_CLAIM_FILENAME = ".paperclip-dir-claim.json";
+
+/** The same claim, when the directory IS a git checkout. See `resolveWorkspaceClaimLocation`. */
+export const WORKSPACE_CLAIM_GIT_FILENAME = "paperclip-dir-claim.json";
+
+/** Prefix for the evidence file a takeover leaves behind. */
+const CLAIM_EVIDENCE_PREFIX = ".dir-claim-released-";
+
+/**
+ * How many takeover-evidence files to keep in one scratch directory.
+ *
+ * For a non-git workspace the scratch directory is the shared `/paperclip`
+ * volume and nothing else ever removes these, so an unbounded set is a slow
+ * leak on a mount every agent pod shares. The newest are the only ones anybody
+ * would read.
+ */
+const MAX_RETAINED_CLAIM_EVIDENCE = 20;
+
+/**
+ * Where the claim for `dirPath` lives, and where this module may put its
+ * scratch and evidence files for it.
+ *
+ * For a git checkout the claim goes in the repository's own git directory, NOT
+ * in the working tree. A claim in the tree is an untracked file in somebody
+ * else's repository as soon as this is wired in generally: a routine
+ * `git add -A` commits the mutex into their PR, and `git clean -fd` deletes it
+ * -- after which a concurrent run reads `available` and PEN-5352 happens again,
+ * this time with the guard installed. Inside the git dir it is invisible to
+ * both, while `rm -rf` of the workspace still takes it, which was the whole
+ * reason for putting it in the tree in the first place.
+ *
+ * Only `<dirPath>/.git` counts. This deliberately does NOT walk up the way
+ * `rev-parse --git-dir` does: for a subdirectory of a repository that would
+ * resolve every subdirectory to ONE claim, and two runs working in two
+ * different subtrees would then exclude each other for no reason. A `.git`
+ * FILE is followed, because that is a linked worktree or a submodule and its
+ * gitdir is per-worktree -- exactly the granularity this wants.
+ */
+export async function resolveWorkspaceClaimLocation(dirPath: string): Promise<{
+  claimPath: string;
+  /** Directory for staging and evidence files. Always on the claim's own filesystem. */
+  scratchDir: string;
+  inGitDir: boolean;
+}> {
+  const dotGit = path.join(dirPath, ".git");
+  const marker = await fs.stat(dotGit).catch(() => null);
+  let gitDir: string | null = null;
+  if (marker?.isDirectory()) {
+    gitDir = dotGit;
+  } else if (marker?.isFile()) {
+    const pointer = await fs.readFile(dotGit, "utf8").catch(() => null);
+    const match = pointer?.match(/^\s*gitdir:\s*(.+?)\s*$/m);
+    if (match) gitDir = path.resolve(dirPath, match[1]);
+  }
+  if (gitDir && (await fs.stat(gitDir).catch(() => null))?.isDirectory()) {
+    return {
+      claimPath: path.join(gitDir, WORKSPACE_CLAIM_GIT_FILENAME),
+      scratchDir: gitDir,
+      inGitDir: true,
+    };
+  }
+  return {
+    claimPath: path.join(dirPath, WORKSPACE_CLAIM_FILENAME),
+    // The parent, not the directory itself: a staging or evidence file sitting
+    // inside a tree someone is about to run `git status` in reads as a stray
+    // edit, which is the kind of noise a run in a contended tree is least
+    // equipped to interpret.
+    scratchDir: path.dirname(dirPath),
+    inGitDir: false,
+  };
+}
 
 /** Schema marker, so a future shape change is detectable rather than silently mis-parsed. */
 export const WORKSPACE_CLAIM_VERSION = 1;
@@ -328,6 +417,12 @@ export function refuseUnlockedIssueDirectory(input: {
   ].join("");
 }
 
+/** `errno` if we have one, so a refusal names the actual failure. */
+function errnoOf(error: unknown): string {
+  const code = (error as NodeJS.ErrnoException | null)?.code;
+  return typeof code === "string" && code ? code : "unknown error";
+}
+
 /**
  * Write the claim so that it is never observable without its contents.
  *
@@ -337,31 +432,253 @@ export function refuseUnlockedIssueDirectory(input: {
  * measured the `wx` race at 0.075% of contended pairs, rising under threadpool
  * pressure.
  *
- * The staging file lives in the PARENT of the claimed directory: same
- * filesystem (so `link` cannot fail EXDEV), but outside the checkout, so a hard
- * kill between `link` and the cleanup cannot leave untracked noise in a working
- * tree that someone is about to run `git status` in.
+ * The staging file lives in `scratchDir`, which is chosen by
+ * `resolveWorkspaceClaimLocation` to be on the claim's own filesystem and
+ * outside any working tree -- so a hard kill between `link` and the cleanup
+ * cannot leave untracked noise in a tree someone is about to run `git status`
+ * in. For a git checkout that is the git dir, where EXDEV is impossible
+ * because it is the same directory. For anything else it is the parent, which
+ * is the same filesystem in every layout this runs in but is NOT guaranteed to
+ * be: a `dirPath` that is itself a mount point (a PVC mounted at the workspace
+ * path) would cross devices. That fails closed -- EXDEV is not EEXIST, so it
+ * is reported as a refusal, never as a concurrent winner.
  */
 async function linkClaimExclusively(
   claimPath: string,
+  scratchDir: string,
   content: string,
-): Promise<"created" | "exists" | "unsupported"> {
-  const staged = path.join(path.dirname(path.dirname(claimPath)), `.dir-claim-${randomUUID()}.tmp`);
+): Promise<{ kind: "created" } | { kind: "exists" } | { kind: "failed"; reason: string }> {
+  const staged = path.join(scratchDir, `.dir-claim-${randomUUID()}.tmp`);
   try {
     await fs.writeFile(staged, content);
-  } catch {
-    return "unsupported";
+  } catch (error) {
+    return {
+      kind: "failed",
+      reason: `the claim could not be staged in "${scratchDir}" (${errnoOf(error)})`,
+    };
   }
   try {
     await fs.link(staged, claimPath);
-    return "created";
+    return { kind: "created" };
   } catch (error) {
-    // Only EEXIST is "another run won". Anything else is the mount declining
-    // hard links, which must not be reported as a concurrent winner.
-    return (error as NodeJS.ErrnoException | null)?.code === "EEXIST" ? "exists" : "unsupported";
+    // Only EEXIST is "another run won". Anything else -- a missing directory,
+    // a read-only mount, a full filesystem, a mount that declines hard links
+    // -- must not be reported as a concurrent winner, and must say which it
+    // was: "hard links unavailable" sends an agent hunting for a mount problem
+    // when the directory simply does not exist.
+    if (errnoOf(error) === "EEXIST") return { kind: "exists" };
+    return {
+      kind: "failed",
+      reason: `the claim could not be linked into place (${errnoOf(error)})`,
+    };
   } finally {
     await fs.rm(staged, { force: true }).catch(() => {});
   }
+}
+
+/** Prefix for the takeover-election token. See `electClaimSuccessor`. */
+const CLAIM_SUCCESSOR_PREFIX = ".dir-claim-successor-";
+
+/**
+ * Elect ONE successor to a specific dead claim.
+ *
+ * Breaking a stale claim is the only operation here that removes a file
+ * somebody else created, and it cannot be made safe by checking before
+ * removing: POSIX has no "unlink only if this path is still that inode", so
+ * two breakers that both vet the same dead claim will both proceed. An
+ * exclusive-create on a name both of them compute is therefore the only
+ * primitive that can elect between them, and this is it. The name is the
+ * digest of the dead claim's own bytes, so the election is scoped to exactly
+ * the claim being broken: a run breaking a DIFFERENT claim never contends for
+ * it, which is what keeps a seat's concurrency from serialising generally.
+ *
+ * The usual objection to an election token is that it is a lock a killed run
+ * leaves behind, and "a stale lock nothing can clear" is the failure this
+ * module exists to prevent -- clearing one normally needs a timeout, which the
+ * module header rules out. That is answered by chaining rather than by a
+ * clock: if the elected successor is itself positively TERMINAL, it died
+ * mid-takeover, and the next generation is keyed on the dead successor's id so
+ * that exactly one run can inherit from it in turn. Every step still needs a
+ * positive terminal determination, so no amount of waiting advances the chain
+ * and nothing is ever broken on suspicion.
+ */
+async function electClaimSuccessor(input: {
+  scratchDir: string;
+  vettedRaw: string;
+  selfRunId: string;
+  deadRunId: string;
+  readOwnerLiveness: (runId: string) => Promise<ClaimOwnerLiveness>;
+}): Promise<{ kind: "elected"; tokenPath: string } | { kind: "refused"; reason: string }> {
+  let chain = "";
+  // Bounded only to keep a pathological chain from spinning: each step needs a
+  // real run to have really died, so reaching the bound is not a timing
+  // artefact and refusing there is honest.
+  for (let generation = 0; generation < 5; generation += 1) {
+    const digest = createHash("sha256").update(input.vettedRaw).update(chain).digest("hex").slice(0, 32);
+    const tokenPath = path.join(input.scratchDir, `${CLAIM_SUCCESSOR_PREFIX}${digest}.json`);
+    const body = `${JSON.stringify({ runId: input.selfRunId, deadRunId: input.deadRunId, generation })}\n`;
+
+    const taken = await linkClaimExclusively(tokenPath, input.scratchDir, body);
+    if (taken.kind === "created") return { kind: "elected", tokenPath };
+    if (taken.kind === "failed") return { kind: "refused", reason: taken.reason };
+
+    const raw = await fs.readFile(tokenPath, "utf8").catch(() => null);
+    // Released between our link and our read: the previous successor finished.
+    // Re-try the same generation rather than inheriting from a run that is not
+    // dead.
+    if (raw === null) continue;
+
+    let holder: string | null = null;
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      const runId = (parsed as { runId?: unknown } | null)?.runId;
+      holder = typeof runId === "string" && runId.trim() ? runId : null;
+    } catch {
+      holder = null;
+    }
+    if (!holder) {
+      return { kind: "refused", reason: "a takeover token is present but could not be read" };
+    }
+    if (holder === input.selfRunId) return { kind: "elected", tokenPath };
+
+    const liveness = await input.readOwnerLiveness(holder).catch(() => "unknown" as const);
+    if (liveness !== "terminal") {
+      return {
+        kind: "refused",
+        reason: `run ${holder} is already taking over this claim`,
+      };
+    }
+    chain += `:${holder}`;
+  }
+  return {
+    kind: "refused",
+    reason: "this claim has had several takeovers die part-way through; it needs a human look",
+  };
+}
+
+/**
+ * Take over a claim whose owner is KNOWN terminal, and leave the directory
+ * held by exactly one run.
+ *
+ * Two defects live on this path, and they need different answers.
+ *
+ * The first is that `rename` moves whatever is at the PATH, not the claim that
+ * was classified: two runs that both find one dead owner would otherwise BOTH
+ * acquire, the second renaming the FIRST's live claim aside and linking over
+ * it. Measured on this module at liveness latencies of 1 ms and 50 ms:
+ * `[ true, true ]`, with the winner's live claim left in the parent
+ * mislabelled as the dead owner's. The answer is to verify the bytes before
+ * removing anything -- here, by `link`ing the evidence copy first, which
+ * leaves `claimPath` exactly where it is, so a mismatch costs nothing and
+ * disturbs nobody.
+ *
+ * The second only shows up with more than two runs, and byte-verification
+ * alone does NOT fix it: any scheme that removes the claim and then re-creates
+ * it leaves `claimPath` momentarily empty, and a FRESH run arriving in that
+ * window links its own claim and acquires while the earlier winner still
+ * believes it holds. Measured with six takers: two winners. So the removal has
+ * to be single-flight, which is what `electClaimSuccessor` provides -- and the
+ * remaining window, between our unlink and our link, is then safe, because
+ * whoever fills it wins the ordinary EEXIST election and we refuse.
+ */
+async function takeOverDeadClaim(input: {
+  claimPath: string;
+  scratchDir: string;
+  /** The exact bytes that were classified `releasable`. */
+  vettedRaw: string;
+  deadRunId: string;
+  selfRunId: string;
+  content: string;
+  readOwnerLiveness: (runId: string) => Promise<ClaimOwnerLiveness>;
+}): Promise<{ kind: "acquired" } | { kind: "refused"; reason: string }> {
+  const elected = await electClaimSuccessor({
+    scratchDir: input.scratchDir,
+    vettedRaw: input.vettedRaw,
+    selfRunId: input.selfRunId,
+    deadRunId: input.deadRunId,
+    readOwnerLiveness: input.readOwnerLiveness,
+  });
+  if (elected.kind === "refused") return elected;
+
+  try {
+    // Keep the evidence BEFORE removing anything, and keep it with `link` so
+    // `claimPath` never moves. Renaming rather than deleting is the posture
+    // `ensureGitIndexIsUnlocked` takes for the same reason: one inode keeps
+    // the evidence if we were wrong about the owner. `link` is strictly
+    // better here -- it keeps that inode without ever emptying the path.
+    const evidence = path.join(
+      input.scratchDir,
+      `${CLAIM_EVIDENCE_PREFIX}${input.deadRunId}-${randomUUID()}.json`,
+    );
+    const kept = await fs.link(input.claimPath, evidence).then(() => true).catch(() => false);
+    if (!kept) {
+      return { kind: "refused", reason: "the claim vanished while this run was taking it over" };
+    }
+
+    const keptRaw = await fs.readFile(evidence, "utf8").catch(() => null);
+    if (keptRaw !== input.vettedRaw) {
+      // Not the claim we vetted. We have touched nothing but our own copy, so
+      // there is nothing to undo.
+      await fs.rm(evidence, { force: true }).catch(() => {});
+      return { kind: "refused", reason: "the claim changed owner while this run was trying to take it" };
+    }
+
+    // Safe to remove now: we hold the election, so no other breaker can be
+    // here, and no fresh run can alter a path that is still occupied.
+    const removed = await fs.rm(input.claimPath, { force: true }).then(() => true).catch(() => false);
+    if (!removed) {
+      await fs.rm(evidence, { force: true }).catch(() => {});
+      return { kind: "refused", reason: "the dead claim could not be removed" };
+    }
+
+    const linked = await linkClaimExclusively(input.claimPath, input.scratchDir, input.content);
+    if (linked.kind === "created") {
+      await pruneClaimEvidence(input.scratchDir);
+      return { kind: "acquired" };
+    }
+    if (linked.kind === "exists") {
+      // A fresh run linked into the window between our unlink and our link.
+      // It won the ordinary election; the evidence stays, and we refuse.
+      return { kind: "refused", reason: "another run claimed the directory as this run was taking it over" };
+    }
+    return { kind: "refused", reason: linked.reason };
+  } finally {
+    // Released on every path, so an ordinary takeover leaves no token behind.
+    // One only survives a run that was KILLED mid-takeover, which is exactly
+    // the case the next generation of the election is there to inherit.
+    await fs.rm(elected.tokenPath, { force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Cap the retained evidence files. Nothing else removes them, and for a
+ * non-git workspace they land on the shared `/paperclip` volume, so an
+ * unbounded set is a slow leak on a mount every agent pod shares.
+ *
+ * Best-effort and never fatal -- failing to prune must not fail a takeover
+ * that otherwise succeeded. Only `released` files are eligible: a `breaking`
+ * file may be another run's break in flight, and it holds the only copy of
+ * that run's claim while it is there.
+ */
+async function pruneClaimEvidence(scratchDir: string): Promise<void> {
+  const names = await fs.readdir(scratchDir).catch(() => null);
+  if (!names) return;
+  const evidence = names.filter(
+    (name) => name.startsWith(CLAIM_EVIDENCE_PREFIX) && name.endsWith(".json"),
+  );
+  if (evidence.length <= MAX_RETAINED_CLAIM_EVIDENCE) return;
+  const dated = await Promise.all(
+    evidence.map(async (name) => ({
+      name,
+      mtimeMs: (await fs.stat(path.join(scratchDir, name)).catch(() => null))?.mtimeMs ?? 0,
+    })),
+  );
+  dated.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  await Promise.all(
+    dated
+      .slice(MAX_RETAINED_CLAIM_EVIDENCE)
+      .map(({ name }) => fs.rm(path.join(scratchDir, name), { force: true }).catch(() => {})),
+  );
 }
 
 export type WorkspaceDirClaimOutcome = {
@@ -386,7 +703,7 @@ export async function acquireWorkspaceDirClaim(input: {
   readOwnerLiveness: (runId: string) => Promise<ClaimOwnerLiveness>;
   now?: () => Date;
 }): Promise<WorkspaceDirClaimOutcome> {
-  const claimPath = path.join(input.dirPath, WORKSPACE_CLAIM_FILENAME);
+  const { claimPath, scratchDir } = await resolveWorkspaceClaimLocation(input.dirPath);
   const record: WorkspaceDirClaim = {
     version: WORKSPACE_CLAIM_VERSION,
     runId: input.self.runId,
@@ -402,16 +719,18 @@ export async function acquireWorkspaceDirClaim(input: {
   // aside, and a third run linked its own claim in between. Retrying further
   // would be a spin against a live holder.
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const linked = await linkClaimExclusively(claimPath, content);
-    if (linked === "created") {
+    const linked = await linkClaimExclusively(claimPath, scratchDir, content);
+    if (linked.kind === "created") {
       return { acquired: true, verdict: { kind: "available" }, refusal: null };
     }
-    if (linked === "unsupported") {
-      // The mount cannot give us exclusive-create. Say so rather than falling
-      // back to a non-atomic write that would silently stop being a mutex.
+    if (linked.kind === "failed") {
+      // We could not get exclusive-create. Say exactly what failed rather than
+      // falling back to a non-atomic write that would silently stop being a
+      // mutex -- and rather than blaming the mount for what may be a missing
+      // directory or a full disk.
       const verdict: WorkspaceDirClaimVerdict = {
         kind: "indeterminate",
-        reason: "this filesystem does not support the atomic claim (hard links unavailable)",
+        reason: linked.reason,
         claim: null,
       };
       return { acquired: false, verdict, refusal: describeWorkspaceDirClaimRefusal(verdict, input.dirPath) };
@@ -445,32 +764,46 @@ export async function acquireWorkspaceDirClaim(input: {
     if (verdict.kind === "self") return { acquired: true, verdict, refusal: null };
 
     if (verdict.kind === "releasable" && attempt > 0) {
-      // A SECOND terminal owner inside one acquire means the claim changed
-      // hands while we were taking it. Report that rather than falling through:
-      // `releasable` is a permitting verdict, so `describeWorkspaceDirClaimRefusal`
-      // returns null for it, and returning `acquired: false` with a null refusal
-      // would hand the caller a silent failure -- the one outcome this module
-      // must never produce.
+      // Reaching here means the claim vanished under us on the first attempt
+      // and a SECOND terminal owner's claim has appeared in its place. The
+      // directory is changing hands faster than one acquire can follow, so
+      // report that rather than breaking a second claim on the strength of a
+      // verdict about the first.
+      //
+      // `break` rather than `return verdict`: `releasable` is a permitting
+      // verdict, so `describeWorkspaceDirClaimRefusal` returns null for it,
+      // and returning `acquired: false` with a null refusal would hand the
+      // caller a silent failure -- the one outcome this module must never
+      // produce. The tail below supplies a real one.
       break;
     }
 
     if (verdict.kind === "releasable") {
-      // Move it aside rather than delete it, for the same reason
-      // `ensureGitIndexIsUnlocked` renames: the verdict is evidential and this
-      // is the only destructive act on the path. One inode keeps the evidence
-      // if we were wrong about the owner.
-      // Aside means OUT of the working tree, not next to the claim: a
-      // `.released-*` file left inside a checkout shows up in every subsequent
-      // `git status` and reads as a stray edit, which is the kind of noise a run
-      // standing in a contended tree is least equipped to interpret.
-      const abandoned = path.join(
-        path.dirname(path.dirname(claimPath)),
-        `.dir-claim-released-${existing?.runId ?? "unknown"}-${randomUUID()}.json`,
-      );
-      const moved = await fs.rename(claimPath, abandoned).then(() => true).catch(() => false);
-      if (moved) continue;
-      // Someone else cleared it first; let the next attempt re-read the truth.
-      continue;
+      const taken = await takeOverDeadClaim({
+        claimPath,
+        scratchDir,
+        vettedRaw: rawClaim,
+        deadRunId: verdict.claim.runId,
+        selfRunId: input.self.runId,
+        content,
+        readOwnerLiveness: input.readOwnerLiveness,
+      });
+      if (taken.kind === "acquired") {
+        return { acquired: true, verdict, refusal: null };
+      }
+      // Every refusal here is a race we lost or a claim that moved under us.
+      // None of them permits a retry: the verdict we are holding is about a
+      // claim that is no longer the one at the path.
+      const failed: WorkspaceDirClaimVerdict = {
+        kind: "indeterminate",
+        reason: taken.reason,
+        claim: verdict.claim,
+      };
+      return {
+        acquired: false,
+        verdict: failed,
+        refusal: describeWorkspaceDirClaimRefusal(failed, input.dirPath),
+      };
     }
 
     return {
@@ -498,7 +831,7 @@ export async function releaseWorkspaceDirClaim(input: {
   dirPath: string;
   runId: string;
 }): Promise<{ released: boolean; reason: string | null }> {
-  const claimPath = path.join(input.dirPath, WORKSPACE_CLAIM_FILENAME);
+  const { claimPath } = await resolveWorkspaceClaimLocation(input.dirPath);
   const raw = await fs.readFile(claimPath, "utf8").catch(() => null);
   if (raw === null) return { released: false, reason: "no claim present" };
   const claim = parseWorkspaceDirClaim(raw);
