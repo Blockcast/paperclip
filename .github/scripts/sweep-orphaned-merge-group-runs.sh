@@ -35,10 +35,13 @@
 # a new merge_group check, i.e. a new ALLGREEN ejection path (see the workflow
 # header), or a per-job `actions: write` grant on every heavy lane. Measured
 # 2026-11-03 on run 41685616129: `e2e` failed 18:27Z and two server shards were
-# still running 40+ min later with the queue ref alive. A failed job is a final
-# verdict for that run, so this sweep cancels it. Scoped to `pr.yml`, the only
-# workflow measured: 0 of 30 successful merge_group runs of it carried a
-# `failure`/`timed_out` job, and it has no job-level `continue-on-error`.
+# still running 40+ min later with the queue ref alive. Only a failed job that
+# `verify` aggregates decides the run: `e2e` and `Canary Dry Run` are outside
+# `verify.needs`, and that same run merged with `e2e` red. So only GATING_JOBS
+# count -- `verify`'s own `lane_job_names`, plus `policy` (its failure skips
+# every lane, which `verify` reads as red) and `ally-verdict`. The test pins
+# this list to `pr.yml`. Scoped to `pr.yml`; it has no job-level
+# `continue-on-error`.
 # The gate cannot soften: a cancelled run's `verify` reads `cancelled`, never
 # `success` (runs 41684074606, 41676078687). Same fail-closed rule: if the jobs
 # read fails, the run is left alone.
@@ -62,12 +65,31 @@ classify_ref_probe() {
   esac
 }
 
-# stdin: "<conclusion>\t<name>" per job. Prints the names of jobs whose
+# Jobs whose failure reds `verify` in pr.yml. "General tests" covers its matrix
+# legs ("General tests (server 1/6)"). Kept in sync by the test.
+GATING_JOBS=(
+  "Helm chart"
+  "Typecheck + Release Registry"
+  "General tests"
+  "Worktree install (NODE_ENV=production)"
+  "OpenCode Responses replay"
+  "k8s-ro seed transport cold start"
+  "Build"
+  "Vendored claude_k8s adapter"
+  "Vendored opencode_k8s adapter"
+  "policy"
+  "ally-verdict"
+)
+
+# stdin: "<conclusion>\t<name>" per job. Prints the names of gating jobs whose
 # conclusion already decides the run red; empty output = not decided.
 decided_failed_jobs() {
-  local conclusion name
+  local conclusion name g
   while IFS=$'\t' read -r conclusion name; do
-    case "$conclusion" in failure|timed_out) echo "$name" ;; esac
+    case "$conclusion" in failure|timed_out) ;; *) continue ;; esac
+    for g in "${GATING_JOBS[@]}"; do
+      if [ "$name" = "$g" ] || [[ "$name" == "$g ("* ]]; then echo "$name"; break; fi
+    done
   done
 }
 
@@ -88,7 +110,7 @@ while IFS=$'\t' read -r id branch path; do
     *) echo "::notice::run $id: head_branch '$branch' is outside $QUEUE_PREFIX, leaving alone"; continue ;;
   esac
 
-  err="$(gh api "repos/$R/git/ref/heads/$branch" 2>&1 >/dev/null)"; rc=$?
+  err="$(gh api "repos/$R/git/ref/heads/$branch" 2>&1 >/dev/null </dev/null)"; rc=$?
   reason="branch '$branch' no longer exists"
   case "$(classify_ref_probe "$rc" "$err")" in
     alive)
@@ -106,7 +128,7 @@ while IFS=$'\t' read -r id branch path; do
       continue ;;
   esac
 
-  if gh api -X POST "repos/$R/actions/runs/$id/cancel" --silent; then
+  if gh api -X POST "repos/$R/actions/runs/$id/cancel" --silent </dev/null; then
     echo "::notice::cancelled merge_group run $id ($branch) -- $reason"
     cancelled=$((cancelled + 1))
   else
