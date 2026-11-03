@@ -8188,6 +8188,34 @@ export function issueService(db: Db) {
   }
 
   /**
+   * PEN-5342: render a lock holder as `<run id> (agent <name>)`, never bare.
+   *
+   * A bare run id does not carry what it takes to be read correctly, and the
+   * default a reader supplies for the missing half is "another run of mine".
+   * Measured on PEN-5082 (cmt `e87c9e8b`): a DevOps run read a foreign holder
+   * id off the in-pod push guard and reported, in good faith, "another DevOps
+   * run is on this row right now" — the holder was an Engineer run. The cost
+   * is not only forensic: in PEN-5082 instance 3 a run opened by correcting a
+   * comment its SIBLING had written, then reasoned forward from that
+   * corrupted belief about its own history.
+   *
+   * The name costs nothing: `describeIssueLockConflict` below joins `agents`
+   * onto the round trip it already makes to read the holder rows. When that
+   * join finds no agent row the id is still printed — an unnamed holder is
+   * weaker evidence, not absent evidence — and the `agentId` field on the
+   * structured `lockHolders[]` entry remains the machine-readable answer.
+   */
+  function holderAgentLabel(holder: { agentName: string | null; agentId: string | null }): string {
+    if (holder.agentName) return `agent ${holder.agentName}`;
+    if (holder.agentId) return `agent id ${holder.agentId}`;
+    return "holding agent unknown";
+  }
+
+  function holderLabel(holder: { runId: string; agentName: string | null; agentId: string | null }): string {
+    return `${holder.runId} — ${holderAgentLabel(holder)}`;
+  }
+
+  /**
    * Diagnostic detail for a 409 raised after the reap ladder above has already
    * declined to release the lock (BLO-28219).
    *
@@ -8208,33 +8236,6 @@ export function issueService(db: Db) {
    * the lock released on its own within 200ms. Reporting liveness here is what
    * makes those two indistinguishable-by-run-id cases self-diagnosing.
    */
-  /**
-   * PEN-5342: render a lock holder as `<run id> (agent <name>)`, never bare.
-   *
-   * A bare run id does not carry what it takes to be read correctly, and the
-   * default a reader supplies for the missing half is "another run of mine".
-   * Measured on PEN-5082 (cmt `e87c9e8b`): a DevOps run read a foreign holder
-   * id off the in-pod push guard and reported, in good faith, "another DevOps
-   * run is on this row right now" — the holder was an Engineer run. The cost
-   * is not only forensic: in PEN-5082 instance 3 a run opened by correcting a
-   * comment its SIBLING had written, then reasoned forward from that
-   * corrupted belief about its own history.
-   *
-   * The name is already in hand from the join above, so this is free. When the
-   * join found no agent row the id is still printed — an unnamed holder is
-   * weaker evidence, not absent evidence, and the `agentId` field on the
-   * structured `lockHolders[]` entry remains the machine-readable answer.
-   */
-  function holderAgentLabel(holder: { agentName: string | null; agentId: string | null }): string {
-    if (holder.agentName) return `agent ${holder.agentName}`;
-    if (holder.agentId) return `agent id ${holder.agentId}`;
-    return "holding agent unknown";
-  }
-
-  function holderLabel(holder: { runId: string; agentName: string | null; agentId: string | null }): string {
-    return `${holder.runId} — ${holderAgentLabel(holder)}`;
-  }
-
   async function describeIssueLockConflict(input: {
     checkoutRunId: string | null;
     executionRunId: string | null;
