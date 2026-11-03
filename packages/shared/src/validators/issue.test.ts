@@ -675,6 +675,15 @@ describe("issue validators", () => {
       // lost. Guidance that sells the yield without this ordering rule teaches data loss.
       expect(text).toMatch(/terminated at this PATCH/i);
       expect(text).toMatch(/Commit, push/i);
+
+      // PEN-5372: the description used to list `executionPolicy` as a flat requirement of the
+      // yield. That conjunct exists only on `PATCH /api/issues/:id`; the dedicated monitor route
+      // has no such body field, so stated unconditionally it told a caller following the adjacent
+      // "PREFER THE DEDICATED MONITOR WRITE PATH" advice that the mechanism could not work. Pin
+      // the per-route form so a trim cannot restore the unconditional claim.
+      expect(text).toContain("/api/issues/:id/monitor");
+      expect(text).not.toMatch(/this PATCH must carry `executionPolicy`/);
+      expect(text).toMatch(/BOTH write paths fire it/i);
     });
 
     // The pointer matters as much as the target: an agent arming a monitor reads the `monitor`
