@@ -76,6 +76,22 @@ export const PIPELINE_CASE_EVENTS_MAX_LIMIT = 100;
 export const PIPELINE_CONTEXT_PACK_EVENT_LIMIT = 20;
 export { PIPELINE_AUTOMATION_DEFAULT_TITLE_TEMPLATE };
 
+/**
+ * PEN-5061. Sibling of `PIPELINE_STAGE_EXIT_CANCELLATION_REASON`: the same
+ * stage-exit cancellation that produces that run-cancellation reason also posts
+ * this notice on the stage-entry automation issue. It is operator-facing copy on
+ * the same surface, so it takes the board's prosumer noun (*item*) rather than
+ * the internal *case* — see `expectProsumerVocabulary` in
+ * `tests/e2e/pipelines-tutorial-flow.spec.ts`.
+ */
+export function pipelineStageExitAutomationCancellationNotice(input: {
+  caseTitle: string;
+  caseKey: string;
+  stageName: string;
+}) {
+  return `Pipeline item "${input.caseTitle}" (${input.caseKey}) left stage "${input.stageName}". This stage-entry automation issue was cancelled because its work is no longer current.`;
+}
+
 function legacyPipelineAutomationTitle(stageName: string) {
   return `${stageName} automation`;
 }
@@ -3232,7 +3248,7 @@ export function pipelineService(
       companyId: input.companyId,
       issueId: cancelledIssue.id,
       authorType: "system",
-      body: `Pipeline case "${input.caseTitle}" (${input.caseKey}) left stage "${input.stageName}". This stage-entry automation issue was cancelled because its work is no longer current.`,
+      body: pipelineStageExitAutomationCancellationNotice(input),
     });
     await finalizeSummarySlotsForTerminalIssue(tx, {
       ...cancelledIssue,

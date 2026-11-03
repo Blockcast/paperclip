@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { PIPELINE_STAGE_EXIT_CANCELLATION_REASON } from "../services/heartbeat.js";
+import { pipelineStageExitAutomationCancellationNotice } from "../services/pipelines.js";
 
 /**
  * PEN-5061. This reason is rendered verbatim to the operator: it reaches the UI
@@ -42,5 +43,38 @@ describe("pipeline stage-exit cancellation reason", () => {
 
   it("does not leak a bare HTTP status code", () => {
     expect(reason).not.toMatch(/\b(?:400|401|403|404|409|422|500)\b/);
+  });
+});
+
+/**
+ * The run-cancellation reason is not the only copy this event emits. The same
+ * stage exit also posts a notice on the stage-entry automation issue, and the
+ * original sweep missed it because `git grep "pipeline case"` is case-sensitive
+ * and the notice opens with a capitalised "Pipeline case". Both strings are
+ * operator-facing, so both are held to the same three rules.
+ */
+describe("pipeline stage-exit automation cancellation notice", () => {
+  const notice = pipelineStageExitAutomationCancellationNotice({
+    caseTitle: "Renew the Hadley lease",
+    caseKey: "PIPE-204",
+    stageName: "Drafting",
+  });
+
+  it("renders the operator's own values back to them", () => {
+    expect(notice).toContain("Renew the Hadley lease");
+    expect(notice).toContain("PIPE-204");
+    expect(notice).toContain("Drafting");
+  });
+
+  it("does not leak the internal noun `case` into operator-facing copy", () => {
+    expect(notice).not.toMatch(/\bcase\b/i);
+  });
+
+  it("does not leak internal transition vocabulary", () => {
+    expect(notice).not.toMatch(/\breview_decided\b|\btransition_forced\b/);
+  });
+
+  it("does not leak a bare HTTP status code", () => {
+    expect(notice).not.toMatch(/\b(?:400|401|403|404|409|422|500)\b/);
   });
 });
