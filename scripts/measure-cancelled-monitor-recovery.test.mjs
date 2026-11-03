@@ -11,6 +11,7 @@ import {
   isLiveMonitorOnCancelledRow,
   isMainModule,
   isOwnerlessSource,
+  nextCursor,
   summarize,
 } from "./measure-cancelled-monitor-recovery.mjs";
 
@@ -188,6 +189,31 @@ describe("destroyedDueTimes", () => {
     ];
     assert.deepEqual(destroyedDueTimes(withoutDue).map((row) => row.dueAt), [null]);
     assert.deepEqual(destroyedDueTimes([]), []);
+  });
+});
+
+describe("nextCursor", () => {
+  const page = (ids) => ids.map((id) => ({ id }));
+
+  it("stops on a short page, which is the only sound completeness rule", () => {
+    // NOT on the absence of a `truncated` flag: a server predating the envelope
+    // returns a bare array even when the cap bit.
+    assert.deepEqual(nextCursor(page(["a", "b"]), 3, undefined), { done: true, afterId: null });
+    assert.deepEqual(nextCursor([], 3, "z"), { done: true, afterId: null });
+  });
+
+  it("advances to the last id of a full page", () => {
+    assert.deepEqual(nextCursor(page(["a", "b", "c"]), 3, undefined), { done: false, afterId: "c" });
+    assert.deepEqual(nextCursor(page(["d", "e", "f"]), 3, "c"), { done: false, afterId: "f" });
+  });
+
+  it("throws when a full page did not advance past the cursor", () => {
+    // afterId never reached the query, so the walk would re-serve this page
+    // forever. Silently returning a partial scan is the failure to avoid.
+    assert.throws(
+      () => nextCursor(page(["a", "b", "c"]), 3, "c"),
+      /keyset cursor did not advance/,
+    );
   });
 });
 
