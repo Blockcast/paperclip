@@ -129,13 +129,21 @@ export interface CostByAgent {
   apiRunCount: number;
   subscriptionRunCount: number;
   /**
-   * PEN-4902: distinct heartbeat runs in the window, with NO `billingType` branch — the
-   * denominator for any per-run quantity. `apiRunCount` and `subscriptionRunCount` above
-   * cover only CLASSIFIED rows, and both read 0 while `unknown` is the fleet's normal
-   * value (it is the default in `createEvent` and what brokered lanes deliberately
-   * resolve to). A zero there reads as "this scope made no runs" and is not that.
+   * PEN-4902: distinct heartbeat runs IN THIS WINDOW THAT PRODUCED A COST EVENT, with no
+   * `billingType` branch. `apiRunCount` and `subscriptionRunCount` above cover only
+   * CLASSIFIED rows, and both read 0 while `unknown` is the fleet's normal value (it is
+   * the default in `createEvent` and what brokered lanes deliberately resolve to). A zero
+   * there reads as "this scope made no runs" and is not that.
+   *
+   * ⚠️ This is a LOWER BOUND on runs, not the run count, and it is deliberately NOT named
+   * `runCount`: {@link IssueCostSummary.runCount} carries that name for a different
+   * population — runs counted `FROM heartbeat_runs`, with no `cost_events` join.
+   * `heartbeat.ts` writes a cost event only when a run reports spend or token usage, so a
+   * run that produced neither is absent here and present there. For a true per-run
+   * denominator over a window, count `heartbeat_runs`
+   * (`GET /companies/:id/heartbeat-runs?from=…&to=…&countOnly=true`) rather than this.
    */
-  runCount: number;
+  costEventRunCount: number;
   /**
    * PEN-4902: rows in the window carrying no `heartbeatRunId`. The column is nullable and
    * `count(distinct …)` skips NULL, so these are in the numerator of cost-per-run and not
@@ -165,13 +173,21 @@ export interface CostByProviderModel {
   apiRunCount: number;
   subscriptionRunCount: number;
   /**
-   * PEN-4902: distinct heartbeat runs in the window, with NO `billingType` branch — the
-   * denominator for any per-run quantity. `apiRunCount` and `subscriptionRunCount` above
-   * cover only CLASSIFIED rows, and both read 0 while `unknown` is the fleet's normal
-   * value (it is the default in `createEvent` and what brokered lanes deliberately
-   * resolve to). A zero there reads as "this scope made no runs" and is not that.
+   * PEN-4902: distinct heartbeat runs IN THIS WINDOW THAT PRODUCED A COST EVENT, with no
+   * `billingType` branch. `apiRunCount` and `subscriptionRunCount` above cover only
+   * CLASSIFIED rows, and both read 0 while `unknown` is the fleet's normal value (it is
+   * the default in `createEvent` and what brokered lanes deliberately resolve to). A zero
+   * there reads as "this scope made no runs" and is not that.
+   *
+   * ⚠️ This is a LOWER BOUND on runs, not the run count, and it is deliberately NOT named
+   * `runCount`: {@link IssueCostSummary.runCount} carries that name for a different
+   * population — runs counted `FROM heartbeat_runs`, with no `cost_events` join.
+   * `heartbeat.ts` writes a cost event only when a run reports spend or token usage, so a
+   * run that produced neither is absent here and present there. For a true per-run
+   * denominator over a window, count `heartbeat_runs`
+   * (`GET /companies/:id/heartbeat-runs?from=…&to=…&countOnly=true`) rather than this.
    */
-  runCount: number;
+  costEventRunCount: number;
   /**
    * PEN-4902: rows in the window carrying no `heartbeatRunId`. The column is nullable and
    * `count(distinct …)` skips NULL, so these are in the numerator of cost-per-run and not
@@ -198,13 +214,21 @@ export interface CostByBiller {
   apiRunCount: number;
   subscriptionRunCount: number;
   /**
-   * PEN-4902: distinct heartbeat runs in the window, with NO `billingType` branch — the
-   * denominator for any per-run quantity. `apiRunCount` and `subscriptionRunCount` above
-   * cover only CLASSIFIED rows, and both read 0 while `unknown` is the fleet's normal
-   * value (it is the default in `createEvent` and what brokered lanes deliberately
-   * resolve to). A zero there reads as "this scope made no runs" and is not that.
+   * PEN-4902: distinct heartbeat runs IN THIS WINDOW THAT PRODUCED A COST EVENT, with no
+   * `billingType` branch. `apiRunCount` and `subscriptionRunCount` above cover only
+   * CLASSIFIED rows, and both read 0 while `unknown` is the fleet's normal value (it is
+   * the default in `createEvent` and what brokered lanes deliberately resolve to). A zero
+   * there reads as "this scope made no runs" and is not that.
+   *
+   * ⚠️ This is a LOWER BOUND on runs, not the run count, and it is deliberately NOT named
+   * `runCount`: {@link IssueCostSummary.runCount} carries that name for a different
+   * population — runs counted `FROM heartbeat_runs`, with no `cost_events` join.
+   * `heartbeat.ts` writes a cost event only when a run reports spend or token usage, so a
+   * run that produced neither is absent here and present there. For a true per-run
+   * denominator over a window, count `heartbeat_runs`
+   * (`GET /companies/:id/heartbeat-runs?from=…&to=…&countOnly=true`) rather than this.
    */
-  runCount: number;
+  costEventRunCount: number;
   /**
    * PEN-4902: rows in the window carrying no `heartbeatRunId`. The column is nullable and
    * `count(distinct …)` skips NULL, so these are in the numerator of cost-per-run and not
