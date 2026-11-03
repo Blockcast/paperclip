@@ -31,14 +31,22 @@
  * guaranteed rather than accidental and unreliable. Suppression while the park is LIVE is
  * unchanged by this module and must stay that way.
  *
- * ## The one place a live park is NOT read, and must not be assumed to be (PEN-5291)
+ * ## The API transitions where a live park is NOT read (PEN-5291)
  *
- * The `blocked` -> `todo` transition through `PATCH /api/issues/:id` wakes the assignee
- * immediately and carries NO park term (`routes/issues.ts`: `statusChangedFromBlockedToTodo`
- * -> `reason: "issue_status_changed"`). A hand-written transition on a parked row therefore
- * KEEPS the park and gets dispatched about a second later.
+ * Three status-change flags in `PATCH /api/issues/:id` share ONE
+ * `addWakeup(... reason: "issue_status_changed")` call (`routes/issues.ts`), and that call
+ * carries NO park term. A park can be set on any status, so on all three a parked row KEEPS
+ * its park and is dispatched about a second later:
  *
- * That is not how a row normally reaches `todo`, and conflating the two writers is the trap.
+ *  - `statusChangedFromBlockedToTodo` — `blocked` -> `todo`, by explicit status or `reopened`.
+ *  - `statusChangedFromBacklog` — `backlog` -> ANY other status, not only `todo`.
+ *  - `statusChangedFromClosedToTodo` — `done`/`cancelled` -> `todo`.
+ *
+ * Only the first is MEASURED (below). The other two are read from source — same call site,
+ * same missing term — and carry no telemetry here; do not cite them as observed.
+ *
+ * The `blocked` arm is the one the exclusion below depends on, because that is not how a row
+ * normally reaches `todo`, and conflating the two writers is the trap.
  * `stranded-blocked-issue-reconciler.ts` flips with a bare `UPDATE` and enqueues nothing, so
  * a reconciler-drained row lands on `todo` silently, is held there by the dispatch sweep's
  * filter above, and fires once at its deadline — which is exactly the behaviour the `blocked`
@@ -51,12 +59,12 @@
  *  - reconciler flip at 02:30:29.412Z → NO wake request of any kind;
  *  - manual PATCH flip at 06:29:11.676Z → wake request 06:29:13.311Z, run claimed 06:29:18.
  *
- * Generalise neither half. "A live park suppresses dispatch" is false for the API transition;
- * "a park is only a timer, never a suppressor" is false for the four readers above, and that
- * reading is what turned the correct measurement into a proposal to stop draining rows at all.
- * The unguarded site's cost is bounded — one run per transition, after which the dispatch
- * filter resumes holding the row — so it is recorded here rather than closed by suppressing a
- * wake that an operator moving a row to `todo` by hand may well have intended.
+ * Generalise neither half. "A live park suppresses dispatch" is false for these API
+ * transitions; "a park is only a timer, never a suppressor" is false for the four readers
+ * above, and that reading is what turned the correct measurement into a proposal to stop
+ * draining rows at all. The cost is bounded — one run per transition, after which the
+ * dispatch filter resumes holding the row — so it is recorded here rather than closed by
+ * suppressing a wake that an operator moving a row by hand may well have intended.
  *
  * ## Why this is not a monitor
  *
