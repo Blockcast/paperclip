@@ -1154,6 +1154,12 @@ const NON_HOLD_ACTIONS = new Set([
   // `classifyFromListing`, which has a better clock for it than this one: the
   // request's own `enabledAt`.
   "stale-enqueue",
+  // PEN-5430. A notify-only repo's clean PR is held by POLICY — we do not land
+  // there — and that hold never clears. Aging it would park every clean PR in
+  // the repo in the stale-hold cohort permanently and, on `--apply`, comment
+  // on each one saying the routine is not enqueuing it. True, useless, and
+  // forever.
+  "notify-only",
 ]);
 
 /**
@@ -1855,18 +1861,126 @@ export function applyRow(repo, row, run = gh) {
       run,
     );
   }
-  if (row.action === "codeowner-review-requested") {
-    return commentOnce(
-      repo,
-      row.number,
-      CODEOWNER_REQUEST_MARKER,
-      `This PR is clean at its current head but still has an outstanding code-owner review ` +
-        `request (${row.detail}). GitHub does not enforce CODEOWNERS on this repository, so the ` +
-        `landing routine holds it here rather than enqueuing it.`,
-      run,
-    );
-  }
+  if (row.action === "codeowner-review-requested") return codeownerRequestComment(repo, row, run);
   return null;
+}
+
+/**
+ * The code-owner notification, lifted out of `applyRow` so that
+ * `applyRowNotifyOnly` can post it WITHOUT sharing a function body with
+ * `gh pr merge`. That separation is the whole structural claim of PEN-5430:
+ * the notify-only path is not a flag checked inside the lander, it is a
+ * different applier with no reachable merge call to get wrong.
+ */
+function codeownerRequestComment(repo, row, run) {
+  return commentOnce(
+    repo,
+    row.number,
+    CODEOWNER_REQUEST_MARKER,
+    `This PR is clean at its current head but still has an outstanding code-owner review ` +
+      `request (${row.detail}). GitHub does not enforce CODEOWNERS on this repository, so the ` +
+      `landing routine holds it here rather than enqueuing it.`,
+    run,
+  );
+}
+
+/**
+ * The applier for a NOTIFY-ONLY repo: it posts the code-owner notification and
+ * can do nothing else.
+ *
+ * PEN-5430. `targetRepos()` used to answer two unrelated questions with one
+ * list — "where do we notify a human-gated hold" and "where do we arm
+ * `gh pr merge --auto`" — so adding a repo in order to get the first silently
+ * bought the second. `Blockcast/penstock-llm-proxy-core` wants the
+ * notification and must never get the arming: it is PR-gated and human-owned,
+ * and agent PRs there land only on a human's click.
+ *
+ * Note what this function does NOT contain: any call to `run(["pr", "merge",
+ * ...])`. A notify-only repo is incapable of enqueuing because the code that
+ * enqueues is not on its path, not because a classifier declined to ask for
+ * it. `runRepo` additionally demotes the merge-shaped actions before this is
+ * ever called (`demoteMergeActions`), so the guarantee is doubled: nothing
+ * reaches here reading `enqueue`, and nothing here could act on it if it did.
+ */
+export function applyRowNotifyOnly(repo, row, run = gh) {
+  if (row?.action === "codeowner-review-requested") return codeownerRequestComment(repo, row, run);
+  return null;
+}
+
+/**
+ * Which applier a repo gets. A named function rather than a ternary buried in
+ * `runRepo`'s parameter defaults, so the choice is assertable on its own.
+ *
+ * That is not a style preference. The two guards protecting a notify-only repo
+ * — this selection and `demoteMergeActions` — are REDUNDANT by construction:
+ * the demotion renames every merge-shaped row before any applier sees it, so
+ * after it has run both appliers behave identically on every action that
+ * exists. No stub can therefore tell them apart through `runRepo`, and an edit
+ * reverting this selection to `applyRow` passed the entire suite when the
+ * choice lived in a default expression. Hoisting it here makes the edit
+ * visible to a test.
+ *
+ * The redundancy is deliberate and both halves are kept: the demotion is
+ * required for reasons that have nothing to do with safety (the enqueue cap,
+ * the `--alarm` cohort, the receipt tally — see its own comment), and this
+ * selection is what makes "a notify-only repo cannot merge" true even if the
+ * demotion is one day bypassed or a new merge-shaped action is added without
+ * being added to MERGE_MUTATING_ACTIONS.
+ */
+export function applierFor(landable) {
+  return landable ? applyRow : applyRowNotifyOnly;
+}
+
+/** The action a merge-shaped row becomes in a notify-only repo. */
+export const NOTIFY_ONLY_ACTION = "notify-only";
+
+/**
+ * The actions `applyRow` serves by MUTATING MERGE STATE — `enqueue` arms
+ * auto-merge, `stale-enqueue` disarms it. Both are refused in a notify-only
+ * repo: we are a guest there, and disarming a human's auto-merge is as much
+ * not-ours-to-do as arming one.
+ */
+const MERGE_MUTATING_ACTIONS = new Set(["enqueue", "stale-enqueue"]);
+
+/**
+ * Rewrites the merge-shaped rows of a notify-only repo to `notify-only`, in
+ * place, before anything reads them.
+ *
+ * This is not cosmetic, and it is not the structural guard either (that is
+ * `applyRowNotifyOnly`). It exists because three separate readers key on the
+ * literal action `enqueue` and all three would be WRONG about a notify-only
+ * repo if the row kept that name:
+ *
+ *   - `sweepRepos` tallies `enqueue` rows as spend against
+ *     MAX_ENQUEUES_PER_FIRE. A notify-only repo arms nothing, so counting its
+ *     clean PRs would let it starve the repos that actually land — a repo
+ *     added for NOTIFICATIONS silently throttling the lander is the same
+ *     class of coupling this whole row exists to remove.
+ *   - `unlandedEligible` reports a long-lived `enqueue` row as stranded and
+ *     `--alarm` exits non-zero on it. A clean PR in a notify-only repo is not
+ *     stranded; it is held by policy, and alarming on it would turn the
+ *     detector permanently red for working as designed.
+ *   - `renderReceipt` tallies by action, so the fire would print `enqueue: N`
+ *     for a repo in which it enqueued nothing — the #2020 shape, a receipt
+ *     naming an action nobody took.
+ *
+ * `notify-only` joins NON_HOLD_ACTIONS for a fourth reason: `stalledHolds`
+ * would otherwise age every clean PR in the repo into the stale-hold cohort
+ * forever, since the "hold" never clears by design.
+ */
+export function demoteMergeActions(rows) {
+  for (const row of rows ?? []) {
+    if (!MERGE_MUTATING_ACTIONS.has(row?.action)) continue;
+    const suppressed = row.action;
+    row.action = NOTIFY_ONLY_ACTION;
+    row.detail = [
+      row.detail,
+      `notify-only repo: would have \`${suppressed}\`, but this fire does not touch merge state here`,
+    ]
+      .filter(Boolean)
+      .join(" — ");
+  }
+  return rows;
 }
 
 /**
@@ -1875,13 +1989,76 @@ export function applyRow(repo, row, run = gh) {
  * times (BLO-29984 multicast, BLO-31321 trafficcontrol, BLO-32205 onprem-k8s,
  * BLO-33208) and regrown in the same repos every time. A single-repo sweep is
  * how the other two stay unobserved between cleanups.
+ *
+ * This list is the LAND list, and since PEN-5430 that is all it is. A repo
+ * named here has `gh pr merge --auto` armed on its clean PRs. To get a repo's
+ * code-owner holds NOTIFIED without that, name it in `notifyRepos()` below —
+ * the two questions used to share this one list, which made widening it for a
+ * notification a policy change wearing a config edit's clothes.
  */
 export function targetRepos(value = process.env.LAND_CLEAN_PRS_REPO) {
+  return parseRepoList(value, ["Blockcast/paperclip"]);
+}
+
+/**
+ * Repos this fire NOTIFIES but must never land in. Comma-separated, defaulting
+ * to EMPTY — the notify list is opt-in, and an unset variable must leave the
+ * routine behaving exactly as it did before PEN-5430.
+ *
+ * ## Why this is a second list and not another entry in the first one
+ *
+ * `targetRepos()` answers two unrelated questions at once: where do we post
+ * `CODEOWNER_REQUEST_MARKER` when a PR's only remaining gate is a human, and
+ * where do we arm `gh pr merge --auto` on a clean one. Adding a repo for the
+ * first silently buys the second, which is a policy change wearing a config
+ * edit's clothes.
+ *
+ * `Blockcast/penstock-llm-proxy-core` is the case that forced the split. It is
+ * PR-gated and human-owned: agent PRs there land on a human's click and on
+ * nothing else. It wants the notification badly — PEN-1942 ("DO NOT CLOSE:
+ * prod has NO backup") sat green on an unnotified single human reviewer from
+ * 2026-10-29 — and must not acquire an autolander as the price of getting it.
+ *
+ * ## A repo in BOTH lists is notify-only
+ *
+ * The restrictive reading wins, deliberately. A repo is in the notify list
+ * precisely to say "do not land here", so honouring that over an overlapping
+ * grant fails in the safe direction: the worst case is that nothing lands
+ * somewhere it could have, which the receipt shows plainly as `notify-only`
+ * rows. The opposite precedence makes a typo arm an autolander, which is the
+ * failure this row exists to make unreachable.
+ */
+export function notifyRepos(value = process.env.LAND_CLEAN_PRS_NOTIFY_REPO) {
+  return parseRepoList(value, []);
+}
+
+function parseRepoList(value, fallback) {
   const repos = String(value ?? "")
     .split(",")
     .map((repo) => repo.trim())
     .filter(Boolean);
-  return repos.length > 0 ? repos : ["Blockcast/paperclip"];
+  return repos.length > 0 ? repos : fallback;
+}
+
+/**
+ * The repos one fire visits, land-list first, deduplicated.
+ *
+ * Land-first is not arbitrary: `sweepRepos` carries the enqueue spend forward
+ * in list order, so visiting the repos that can actually spend it first keeps
+ * MAX_ENQUEUES_PER_FIRE meaning what it says. (Notify-only repos spend nothing
+ * — `demoteMergeActions` sees to that — so this is belt-and-braces rather than
+ * load-bearing today. It stops being free the moment anything else is counted
+ * per repo in list order.)
+ */
+export function sweepOrder(targets, notifies) {
+  const order = [];
+  const seen = new Set();
+  for (const repo of [...(targets ?? []), ...(notifies ?? [])]) {
+    if (seen.has(repo)) continue;
+    seen.add(repo);
+    order.push(repo);
+  }
+  return order;
 }
 
 /**
@@ -1951,7 +2128,21 @@ export function runRepo(
   spent,
   rotted,
   stranded = [],
-  { fetch = fetchOpenPrs, classify = classifyAll, applyOne = applyRow, state = stateHold } = {},
+  {
+    fetch = fetchOpenPrs,
+    classify = classifyAll,
+    // PEN-5430. `false` for a notify-only repo. Note the applier DEFAULT is
+    // derived from it rather than branched on inside the applier: in a
+    // notify-only repo `applyRow` is never referenced at all, so there is no
+    // in-function flag for a later edit to get wrong.
+    landable = true,
+    applyOne = applierFor(landable),
+    // The `gh` seam handed to whichever applier was selected above, so a test
+    // can assert over the invocations that applier makes without replacing it
+    // (which would stop testing the selection).
+    applyRun = gh,
+    state = stateHold,
+  } = {},
 ) {
   let prs;
   try {
@@ -1965,6 +2156,9 @@ export function runRepo(
     throw error;
   }
   const rows = classify(prs, { settleMinutes, spent });
+  // Before the apply loop, before the receipt, and before `sweepRepos` reads
+  // the returned rows — every consumer of `enqueue` must see the demoted name.
+  if (!landable) demoteMergeActions(rows);
 
   for (const row of rows) {
     if (row.action === "approval-rotted") rotted.push(`${repo}#${row.number} (${row.detail})`);
@@ -1973,7 +2167,7 @@ export function runRepo(
   for (const row of rows) {
     if (!apply) continue;
     try {
-      const outcome = applyOne(repo, row);
+      const outcome = applyOne(repo, row, applyRun);
       if (outcome) row.detail = [row.detail, outcome].filter(Boolean).join(" — ");
     } catch (error) {
       const message = error?.stderr?.toString() || error?.message || String(error);
@@ -2031,7 +2225,13 @@ export function runRepo(
   // for one PR's. `isFatalGhError` is deliberately NOT consulted — a rate
   // limit reached while commenting has already let the reads through, so the
   // receipt is trustworthy and worth printing.
-  if (apply) {
+  //
+  // `landable` gates this too (PEN-5430): in a notify-only repo the ONLY write
+  // this routine makes is the code-owner notification. A `stated-hold:*`
+  // comment there would be the routine explaining its own inaction in a repo
+  // where its inaction is the policy — and we are a guest in that repo, so the
+  // narrowest possible write surface is the one worth asking a human to grant.
+  if (apply && landable) {
     const byNumber = new Map(rows.map((row) => [row?.number, row]));
     for (const row of held) {
       const classified = byNumber.get(row?.number);
@@ -2084,9 +2284,14 @@ export function sweepRepos(repos, runOne) {
  * the cap per repo again) without running `main`. `run` is a test seam.
  */
 export const repoRunner =
-  (apply, settleMinutes, rotted, stranded = [], run = runRepo) =>
+  (apply, settleMinutes, rotted, stranded = [], run = runRepo, notify = new Set()) =>
   (repo, spent) => {
-    const rows = run(repo, apply, settleMinutes, spent, rotted, stranded);
+    // Spread rather than an unconditional 7th argument, so a fire with no
+    // notify list calls `runRepo` with exactly the arguments it always did.
+    // That keeps the carry test's deep-compare of the argument vector honest
+    // instead of making it assert `undefined` in a new slot.
+    const options = notify.has(repo) ? [{ landable: false }] : [];
+    const rows = run(repo, apply, settleMinutes, spent, rotted, stranded, ...options);
     console.log("");
     return rows;
   };
@@ -2138,8 +2343,15 @@ function main() {
   // call plus two per undecided PR, multiplied by the repo count, and in a dry
   // run the only `gh` traffic there is. The explicit call before `process.exit`
   // in `runRepo` stays: `exit` does not unwind, so this block never runs there.
+  // PEN-5430: two lists, one sweep. `notify` is the set the fire may comment
+  // in and must not land in; `targetRepos()` is unchanged, so an unset
+  // LAND_CLEAN_PRS_NOTIFY_REPO leaves behaviour exactly as it was.
+  const notify = new Set(notifyRepos());
   try {
-    sweepRepos(targetRepos(), repoRunner(apply, settleMinutes, rotted, stranded));
+    sweepRepos(
+      sweepOrder(targetRepos(), [...notify]),
+      repoRunner(apply, settleMinutes, rotted, stranded, runRepo, notify),
+    );
   } finally {
     reportRotted(rotted);
   }

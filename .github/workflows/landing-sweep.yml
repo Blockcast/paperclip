@@ -131,4 +131,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LAND_CLEAN_PRS_REPO: ${{ github.repository }}
+          # PEN-5430 deliberately does NOT set LAND_CLEAN_PRS_NOTIFY_REPO here,
+          # and adding it would not work. The notify list exists so the
+          # `--apply` landing routine can post CODEOWNER_REQUEST_MARKER in a
+          # human-gated repo without acquiring the ability to land in it. This
+          # arm runs on `secrets.GITHUB_TOKEN`, which GitHub scopes to the
+          # workflow's own repository, so every sibling repo named in either
+          # list 403s regardless of which list it is in. Widening the sweep
+          # from Actions needs a cross-repo App credential first.
+          #
+          # It is also the wrong arm on purpose: this job is a DETECTOR and
+          # makes no writes (see the header), while a notification IS a write.
         run: node scripts/land-clean-prs.mjs --alarm
