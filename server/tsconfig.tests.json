@@ -47,6 +47,7 @@
     "src/__tests__/heartbeat-timer-pre-dispatch-exclusions.test.ts",
     "src/__tests__/http-metrics-transient-db-sqlstate.test.ts",
     "src/__tests__/http-request-duration-histogram.test.ts",
+    "src/__tests__/issues-last-activity-drift-repair-metrics.test.ts",
     "src/__tests__/isolation-reclaim-claims.test.ts",
     "src/__tests__/isolation-reclaim-driver.test.ts",
     "src/__tests__/isolation-reclaim-job-port.test.ts",
