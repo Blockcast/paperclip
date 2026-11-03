@@ -432,12 +432,13 @@ export interface IssueBlockerAttention {
    * `covered` by being `done`, by carrying a pending interaction, by holding a live
    * run/monitor/park, or by the downstream recursion.
    *
-   * ⚠ A blocker that goes stale LEAVES this count, because it stops covering. So the count
-   * no longer sizes "what a conjunct would un-cover" -- that question is settled -- but
-   * remains an **UPPER BOUND on what a HIGHER threshold would un-cover**. This arm returns
-   * BEFORE the `in_review` arm, the downstream recursion and the leaf monitor/run/park
-   * checks, so a blocker that stopped covering here could still be covered by one of those.
-   * The true delta is `<=` this number: it can only overstate, which is the safe direction.
+   * ⚠ A blocker that goes stale LEAVES this count, because it stops covering *here*. So the
+   * count no longer sizes "what a conjunct would un-cover" -- that question is settled --
+   * but remains an **UPPER BOUND on what a HIGHER threshold would un-cover**. A blocker that
+   * stops covering at this arm does not return: it falls through to the `in_review` monitor
+   * check, the `activeIssueIds` check and the downstream recursion, any of which may still
+   * cover it. The true delta is `<=` this number -- it can only overstate, which is the safe
+   * direction.
    */
   humanAssignedCoveredBlockerCount: number;
   /**

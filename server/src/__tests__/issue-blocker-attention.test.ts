@@ -1992,6 +1992,66 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     expect(parent?.blockerAttention).toMatchObject({ state: "stalled", stalledBlockerCount: 1 });
   });
 
+  // ⭐⭐ THE FALL-THROUGH control (Ally, #3346). The stale branch does NOT return: this arm
+  // sits ahead of the `in_review` monitor check, the `activeIssueIds` check and the
+  // downstream recursion, and while it always returned `covered` its position could not
+  // matter. A human-assigned row waiting on an agent's PR is the normal shape here --
+  // nobody writes the human row while the agent works, so it goes stale WHILE being
+  // attended. Reinstating an early `return {covered:false, stalled:true}` in the arm turns
+  // this `stalled` and mints a false attention item against live work.
+  it("keeps covering a stale human-assigned blocker whose own blocker is being worked (PEN-5105)", async () => {
+    const { companyId, agentId } = await createCompany("PHN");
+    const parentId = await insertIssue({ companyId, identifier: "PHN-1", title: "Parent", status: "blocked" });
+    const staleHumanId = await insertIssue({
+      companyId,
+      identifier: "PHN-2",
+      title: "Stale human-assigned blocker, waiting on agent work",
+      status: "blocked",
+      assigneeUserId: "user-phn",
+      lastActivityAt: new Date(Date.now() - 240 * HOUR_MS),
+    });
+    const workedId = await insertIssue({
+      companyId,
+      identifier: "PHN-3",
+      title: "Agent row with a live run",
+      status: "in_progress",
+      assigneeAgentId: agentId,
+    });
+    await block({ companyId, blockerIssueId: staleHumanId, blockedIssueId: parentId });
+    await block({ companyId, blockerIssueId: workedId, blockedIssueId: staleHumanId });
+    await activeRun({ companyId, agentId, issueId: workedId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({ state: "covered", coveredBlockerCount: 1 });
+    // Covered by the downstream run, NOT by the human-assigned arm -- so it is not counted
+    // as human-assigned coverage. Counting it here would overstate the arm's reach.
+    expect(parent?.blockerAttention?.humanAssignedCoveredBlockerCount).toBe(0);
+  });
+
+  // The `in_review` arm's own `Boolean(node.assigneeUserId)` waiting-path term is now
+  // reachable-as-true only via the stale fall-through, and must not cover there -- a stale
+  // human assignee is precisely not a waiting path. Removing the `&& !humanAssignedStale`
+  // gate on that term leaves this `covered` and makes the change inert for `in_review`
+  // blockers, which is where the measured critical case (PEN-2631) lives.
+  it("stalls a stale human-assigned in_review blocker with no other waiting path (PEN-5105)", async () => {
+    const { companyId } = await createCompany("PHO");
+    const parentId = await insertIssue({ companyId, identifier: "PHO-1", title: "Parent", status: "blocked" });
+    const blockerId = await insertIssue({
+      companyId,
+      identifier: "PHO-2",
+      title: "Stale human-assigned in_review blocker",
+      status: "in_review",
+      assigneeUserId: "user-pho",
+      lastActivityAt: new Date(Date.now() - 240 * HOUR_MS),
+    });
+    await block({ companyId, blockerIssueId: blockerId, blockedIssueId: parentId });
+
+    const parent = ((await svc.list(companyId, { status: "blocked" })) as IssueListItem[]).find((issue) => issue.id === parentId);
+
+    expect(parent?.blockerAttention).toMatchObject({ state: "stalled", stalledBlockerCount: 1 });
+  });
+
   // ⭐ The verdict-SHAPE control, and the reason the arm returns `stalled` rather than the
   // `{covered:false, stalled:false}` fall-through. The recursion tests `hardAttention`
   // BEFORE `stalledEntry`, so a non-stalled fall-through here would outrank a genuinely
