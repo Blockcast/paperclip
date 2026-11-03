@@ -335,7 +335,14 @@ const billerSpendRows: Array<{
       outputTokens: 477_000,
       apiRunCount: 7,
       subscriptionRunCount: 38,
-      costEventRunCount: 45,
+      // PEN-4902: 41, NOT 45. `costEventRunCount` is `count(distinct heartbeatRunId)`
+      // evaluated within each row's group, so it is not additive across rows: this
+      // biller's two provider-model rows below read 38 and 7, and 4 runs used both
+      // models, so the biller sees 41 distinct runs rather than their sum. This is the
+      // one frame that makes that visible — a fixture where every row happened to sum
+      // would teach the opposite. Same reason it is below `apiRunCount +
+      // subscriptionRunCount`: those 4 runs are counted in each classified counter.
+      costEventRunCount: 41,
       runlessEventCount: 0,
       subscriptionCachedInputTokens: 210_000,
       subscriptionCacheCreationInputTokens: 0,
