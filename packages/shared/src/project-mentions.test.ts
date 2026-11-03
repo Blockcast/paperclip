@@ -11,6 +11,7 @@ import {
   extractSkillMentionIds,
   extractUnboundMentionTokens,
   extractUserMentionIds,
+  scanMentionTokens,
   MAX_UNBOUND_MENTION_TOKENS,
   parseAgentMentionHref,
   parseProjectMentionHref,
@@ -252,5 +253,73 @@ describe("extractUnboundMentionTokens", () => {
   it("returns nothing for an empty or mention-free body", () => {
     expect(extractUnboundMentionTokens("")).toEqual([]);
     expect(extractUnboundMentionTokens("a comment with no mentions at all")).toEqual([]);
+  });
+});
+
+// PEN-5364. The unbound arm dedupes by NAME, so when one body uses BOTH forms
+// for the SAME agent it reports that name even though the wake fired — a
+// receipt byte-identical to the body where nothing bound. The case above,
+// "reports the plain token when both forms appear in one body", uses two
+// DIFFERENT names and so cannot see this. These assert the pair separates them.
+describe("scanMentionTokens — the bound arm (PEN-5364)", () => {
+  const BOUND_AGENT_ID = "agent-ceo-1";
+  const boundHref = buildAgentMentionHref(BOUND_AGENT_ID, null);
+
+  it("⚠ the ambiguous pair: same name, both forms, vs bare-only", () => {
+    const delivered = scanMentionTokens(
+      `[@Ceo](${boundHref}) please rule — @Ceo also owns the follow-up`,
+      { boundAgentIds: [BOUND_AGENT_ID] },
+    );
+    const dropped = scanMentionTokens("@Ceo please rule — @Ceo also owns the follow-up");
+
+    // Identical on the arm that predates this change. This is the defect.
+    expect(delivered.unbound).toEqual(["Ceo"]);
+    expect(dropped.unbound).toEqual(["Ceo"]);
+    expect(delivered.unbound).toEqual(dropped.unbound);
+
+    // Separated only here.
+    expect(delivered.bound).toEqual(["Ceo"]);
+    expect(dropped.bound).toEqual([]);
+  });
+
+  it("reports the label as written, minus the leading @", () => {
+    expect(
+      scanMentionTokens(`[@UX Designer](${boundHref}) take a look`, {
+        boundAgentIds: [BOUND_AGENT_ID],
+      }).bound,
+    ).toEqual(["UX Designer"]);
+  });
+
+  it("does not credit an agent link whose target resolved to nobody", () => {
+    // Same rule as the unbound arm: a well-formed href pointing at no agent
+    // drops the wake exactly as silently as a plain name, so it is not bound.
+    const result = scanMentionTokens(
+      `[@Ghost](${buildAgentMentionHref("agent-gone", null)}) are you there`,
+      { boundAgentIds: [BOUND_AGENT_ID] },
+    );
+    expect(result.bound).toEqual([]);
+    expect(result.unbound).toEqual(["Ghost"]);
+  });
+
+  it("dedupes repeated bound links by name", () => {
+    expect(
+      scanMentionTokens(`[@Ceo](${boundHref}) and again [@Ceo](${boundHref})`, {
+        boundAgentIds: [BOUND_AGENT_ID],
+      }).bound,
+    ).toEqual(["Ceo"]);
+  });
+
+  it("returns both arms empty for an empty or mention-free body", () => {
+    expect(scanMentionTokens("")).toEqual({ bound: [], unbound: [] });
+    expect(scanMentionTokens("a comment with no mentions at all")).toEqual({
+      bound: [],
+      unbound: [],
+    });
+  });
+
+  it("extractUnboundMentionTokens stays the unbound arm exactly", () => {
+    const body = `[@Ceo](${boundHref}) and @Cfo should both see this`;
+    const opts = { boundAgentIds: [BOUND_AGENT_ID] };
+    expect(extractUnboundMentionTokens(body, opts)).toEqual(scanMentionTokens(body, opts).unbound);
   });
 });

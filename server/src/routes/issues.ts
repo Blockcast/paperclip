@@ -35,7 +35,7 @@ import {
   createIssueAttachmentMetadataSchema,
   createIssueThreadInteractionSchema,
   unrecognizedInteractionPayloadKeys,
-  extractUnboundMentionTokens,
+  scanMentionTokens,
   createIssueWorkProductSchema,
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
@@ -16538,20 +16538,31 @@ export function issueRoutes(
       }
       return resolvedMentionAgentIds;
     };
-    // Always present on the response, never conditional: an absent key cannot
-    // be told apart from a server that predates this report, which is the
-    // ambiguity the `unrecognizedPayloadKeys` note calls out. An empty array
-    // means "every `@` token in this body reached somebody".
+    // Both keys are always present, never conditional: an absent key cannot be
+    // told apart from a server that predates this report, which is the
+    // ambiguity the `unrecognizedPayloadKeys` note calls out. An empty
+    // `unboundMentions` means "every `@` token in this body reached somebody".
+    //
+    // PEN-5364: `boundMentions` is what makes `unboundMentions` readable. The
+    // unbound arm dedupes by NAME, so a body that uses the link form AND bare
+    // `@Name` for the same agent reports that name as unbound even though the
+    // wake fired -- byte-identical to a body where nothing bound and no wake
+    // fired. Only the pair separates them:
+    //   unbound ["Cfo"] + bound ["Cfo"] -> delivered, bare tokens are noise
+    //   unbound ["Cfo"] + bound []      -> NOT delivered, re-send in link form
     const commentResponseBody = async () => {
       let unboundMentions: string[] = [];
+      let boundMentions: string[] = [];
       try {
-        unboundMentions = extractUnboundMentionTokens(persistedComment.body, {
+        const scanned = scanMentionTokens(persistedComment.body, {
           boundAgentIds: await resolveMentionedAgentIds(),
         });
+        unboundMentions = scanned.unbound;
+        boundMentions = scanned.bound;
       } catch (err) {
         logger.warn({ err, issueId: id }, "failed to scan comment for unbound @-mentions");
       }
-      return { ...persistedComment, unboundMentions };
+      return { ...persistedComment, unboundMentions, boundMentions };
     };
 
     if ("deduplicated" in comment && comment.deduplicated) {

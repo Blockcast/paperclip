@@ -453,6 +453,17 @@ function maskPattern(chars: string[], source: string, re: RegExp): void {
   }
 }
 
+/**
+ * Normalise an `@`-token or a mention-link label to the form reported to
+ * callers: trailing prose punctuation trimmed (`@Ceo.` and `@Ceo-` both mean
+ * `Ceo`) and capped in length. Returns "" for anything left empty.
+ */
+function normalizeMentionToken(raw: string): string {
+  const trimmed = raw.replace(/[._-]+$/, "");
+  if (!trimmed) return "";
+  return trimmed.slice(0, MAX_UNBOUND_MENTION_TOKEN_LENGTH);
+}
+
 export interface UnboundMentionScanOptions {
   /**
    * Agent ids that actually resolved to a real agent the wake could be
@@ -463,7 +474,32 @@ export interface UnboundMentionScanOptions {
 }
 
 /**
- * Return the `@`-shaped tokens in `markdown` that bound to no agent.
+ * Both arms of a mention scan. `unbound` is the defect report of PEN-5180;
+ * `bound` is what PEN-5364 added, and the two are only useful together.
+ *
+ * A name can appear in BOTH, and that is the case the pair exists for: a body
+ * that writes `[@Cfo](agent://<resolved id>)` once and bare `@Cfo` in prose
+ * binds (the wake fires) AND leaves an unbound token. Before `bound` existed
+ * that receipt was byte-identical to one where nothing bound and no wake fired
+ * -- opposite outcomes, same bytes -- because `unbound` dedupes by name rather
+ * than by occurrence. Read them together:
+ *
+ *   - `unbound: ["Cfo"], bound: ["Cfo"]` -- delivered; the bare tokens are noise.
+ *   - `unbound: ["Cfo"], bound: []`      -- NOT delivered; re-send in link form.
+ */
+export interface MentionScanResult {
+  /**
+   * Names whose mention link resolved to a real agent, so the wake WAS raised.
+   * Reported as the link label was written, minus a leading `@`.
+   */
+  bound: string[];
+  /** `@`-shaped tokens that reached nobody. */
+  unbound: string[];
+}
+
+/**
+ * Scan `markdown` for `@`-shaped tokens and split them into the ones that
+ * reached an agent and the ones that reached nobody.
  *
  * A token is treated as BOUND only when it is the label of a mention link
  * whose target actually resolved:
@@ -481,13 +517,15 @@ export interface UnboundMentionScanOptions {
  * A token directly followed by `/<scope-char>` is skipped for the same reason —
  * `@types/node` is a package, not a person (PEN-5187).
  */
-export function extractUnboundMentionTokens(
+export function scanMentionTokens(
   markdown: string,
   options: UnboundMentionScanOptions = {},
-): string[] {
-  if (!markdown) return [];
+): MentionScanResult {
+  if (!markdown) return { bound: [], unbound: [] };
 
   const bound = new Set(options.boundAgentIds ?? []);
+  const boundSeen = new Set<string>();
+  const boundTokens: string[] = [];
   // Indexed by UTF-16 code unit, which is the offset space every `RegExp`
   // below reports in, so masking stays aligned with the original string.
   const units = markdown.split("");
@@ -513,6 +551,14 @@ export function extractUnboundMentionTokens(
       // so its label is reported — a well-formed href pointing at nobody drops
       // the wake exactly as silently as a plain name does.
       if (!parsed || !bound.has(parsed.agentId)) continue;
+      // PEN-5364: record what DID bind. Without this the caller cannot tell a
+      // mixed-form body (link bound, bare prose tokens left over) from one
+      // where nothing bound at all -- both report the same name below.
+      const label = normalizeMentionToken((link[1] ?? "").replace(/^@/, ""));
+      if (label && !boundSeen.has(label.toLowerCase())) {
+        boundSeen.add(label.toLowerCase());
+        if (boundTokens.length < MAX_UNBOUND_MENTION_TOKENS) boundTokens.push(label);
+      }
     }
     maskRange(units, link.index, link.index + link[0].length);
   }
@@ -544,10 +590,9 @@ export function extractUnboundMentionTokens(
 
     // Trim trailing punctuation that markdown prose attaches to a name:
     // "@Ceo." and "@Ceo-" both mean `Ceo`.
-    const raw = (match[1] ?? "").replace(/[._-]+$/, "");
-    if (!raw) continue;
+    const token = normalizeMentionToken(match[1] ?? "");
+    if (!token) continue;
 
-    const token = raw.slice(0, MAX_UNBOUND_MENTION_TOKEN_LENGTH);
     const key = token.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -555,5 +600,16 @@ export function extractUnboundMentionTokens(
     if (tokens.length >= MAX_UNBOUND_MENTION_TOKENS) break;
   }
 
-  return tokens;
+  return { bound: boundTokens, unbound: tokens };
+}
+
+/**
+ * Back-compat wrapper: the unbound arm alone, which is what every caller
+ * predating PEN-5364 asked for.
+ */
+export function extractUnboundMentionTokens(
+  markdown: string,
+  options: UnboundMentionScanOptions = {},
+): string[] {
+  return scanMentionTokens(markdown, options).unbound;
 }

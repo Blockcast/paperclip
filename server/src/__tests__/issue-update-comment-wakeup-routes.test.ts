@@ -1378,4 +1378,99 @@ describe("issue update comment wakeups", () => {
       expect(res.body.unboundMentions).toEqual(["Ceo"]);
     });
   });
+
+  // PEN-5364. `unboundMentions` dedupes by NAME, not by occurrence, so a body
+  // that uses the link form AND a bare `@Name` for the SAME agent reports that
+  // name as unbound even though the wake fired. That receipt is byte-identical
+  // to one where nothing bound and no wake fired -- opposite outcomes, same
+  // bytes. The existing "both forms" case above uses two DIFFERENT names, which
+  // is why it never caught this. `boundMentions` is the arm that separates them,
+  // and the asymmetry is why it matters: misreading the undelivered case as the
+  // delivered one costs the whole wake, which is the loss PEN-5180 exists to end.
+  describe("boundMentions disambiguates a mixed-form body (PEN-5364)", () => {
+    const sameNameMixedBody =
+      `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this -- @QA is also the right ` +
+      "seat for the follow-up";
+
+    it("DELIVERED: same name in both forms reports it unbound, and bound proves the wake fired", async () => {
+      const existing = makeIssue({ assigneeUserId: "active-user", status: "in_progress" });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-same-name-mixed",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: sameNameMixedBody,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp({
+        type: "board",
+        userId: "active-user",
+        companyIds: [existing.companyId],
+        source: "session",
+        isInstanceAdmin: false,
+      }))
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: sameNameMixedBody });
+
+      expect(res.status).toBe(201);
+      // The unbound arm alone is indistinguishable from the undelivered case below.
+      expect(res.body.unboundMentions).toEqual(["QA"]);
+      expect(res.body.boundMentions).toEqual(["QA"]);
+      await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        MENTIONED_AGENT_ID,
+        expect.objectContaining({ reason: "issue_comment_mentioned" }),
+      ));
+    });
+
+    it("NOT DELIVERED: the bare-only twin returns the SAME unboundMentions and an empty boundMentions", async () => {
+      const existing = makeIssue({ status: "in_progress" });
+      const body = "@QA please inspect this -- @QA is also the right seat for the follow-up";
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-same-name-bare-only",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([]);
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body });
+
+      expect(res.status).toBe(201);
+      // Byte-identical to the delivered case on this key -- that is the defect.
+      expect(res.body.unboundMentions).toEqual(["QA"]);
+      // ...and this is the only thing that tells them apart.
+      expect(res.body.boundMentions).toEqual([]);
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ reason: "issue_comment_mentioned" }),
+      );
+    });
+
+    it("is present and empty on a body with no mentions at all, never absent", async () => {
+      // Same contract as unboundMentions: an absent key cannot be told apart
+      // from a server that predates this report.
+      const existing = makeIssue({ status: "in_progress" });
+      const body = "Recording the measurement here for the next reader.";
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-no-mentions-bound-arm",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([]);
+
+      const res = await request(await createApp())
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body });
+
+      expect(res.status).toBe(201);
+      expect(res.body).toHaveProperty("boundMentions");
+      expect(res.body.boundMentions).toEqual([]);
+    });
+  });
 });

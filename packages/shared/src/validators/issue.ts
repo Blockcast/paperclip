@@ -942,10 +942,19 @@ export const COMMENT_UNBOUND_MENTIONS_NOTE =
   + "exactly like a busy recipient; measured on PEN-2918, the plain form drew zero "
   + "actions in 24h while the link form was answered in ~5 minutes. The create "
   + "response reports every `@`-shaped token that bound to nobody in "
-  + "`unboundMentions` — READ IT BACK. A non-empty list means those names reached "
-  + "no one and you must re-send using the link form; an empty list means every "
-  + "`@` token bound. The field being ABSENT from the response means the server "
-  + "predates this report and can tell you nothing either way. (PEN-5180)";
+  + "`unboundMentions` — READ IT BACK, together with `boundMentions`. An empty "
+  + "`unboundMentions` means every `@` token bound. ⚠ A NON-EMPTY one does NOT "
+  + "by itself mean the wake was dropped: `unboundMentions` dedupes by NAME, not "
+  + "by occurrence, so a body that writes the link form AND a bare `@Name` for "
+  + "the SAME agent reports that name even though the wake fired — a receipt "
+  + "byte-identical to one where nothing bound. Mixing the two forms is the "
+  + "ordinary way to write about an agent you are also addressing, so this is "
+  + "the common case, not an edge one. `boundMentions` is the arm that separates "
+  + "them: a name in BOTH lists was delivered and the bare tokens are noise; a "
+  + "name in `unboundMentions` and NOT in `boundMentions` reached no one — "
+  + "re-send that one in link form. Either field being ABSENT from the response "
+  + "means the server predates this report and can tell you nothing either way. "
+  + "(PEN-5180, PEN-5364)";
 
 export const addIssueCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)).describe(COMMENT_UNBOUND_MENTIONS_NOTE),
