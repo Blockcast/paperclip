@@ -1247,6 +1247,9 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
                 ? expect.objectContaining({
                     id: claimantRunId,
                     status: "running",
+                    // PEN-5342: the id travels with the agent that owns it.
+                    agentId,
+                    agentName: "Codex Coder",
                   })
                 : null,
             }),
@@ -1258,6 +1261,28 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
           }),
         },
       });
+
+      // PEN-5342: `safeRepair.reason` is the prose a reader actually sees. A
+      // run id in it with no agent attached is read as "another run of mine"
+      // by default, and that default is wrong across seats (measured, PEN-5082
+      // cmt `e87c9e8b`). Assert the emitted string, not just the field above:
+      // a key surviving onto a structured object is not a delivery test
+      // (PEN-5336 / BLO-27858).
+      if (claimantRunId) {
+        await expect(svc.reconcileExecutionWorkspaceBranch(executionWorkspaceId, {
+          mode: "quarantine_restore",
+          reason: "should refuse branch claimant",
+          actor: { actorType: "user", actorId: "local-board", agentId: null, runId: null },
+        })).rejects.toMatchObject({
+          details: {
+            workspaceValidation: expect.objectContaining({
+              safeRepair: expect.objectContaining({
+                reason: expect.stringContaining(`active run ${claimantRunId} of agent Codex Coder`),
+              }),
+            }),
+          },
+        });
+      }
 
       await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe("feature/live");
       await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBeNull();

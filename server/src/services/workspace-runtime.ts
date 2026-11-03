@@ -2329,9 +2329,24 @@ function branchIncoherenceValidationFailure(evidence: GitWorktreeBranchIncoheren
   );
 }
 
+/**
+ * PEN-5342: an execution-run id is printed with the agent that owns it, or not
+ * printed. A bare id leaves the reader to supply the missing half, and the only
+ * sibling relationship the framing suggests is "another run of mine" — wrong
+ * whenever the holder belongs to a different seat (measured on PEN-5082 cmt
+ * `e87c9e8b`). Returns "" when there is no run at all, so callers keep their
+ * own "no active run" wording.
+ */
+function formatContendingRunAgent(activeRun: NonNullable<GitWorktreeBranchContention>["activeRun"]): string {
+  if (!activeRun) return "";
+  if (activeRun.agentName) return ` of agent ${activeRun.agentName}`;
+  if (activeRun.agentId) return ` of agent id ${activeRun.agentId}`;
+  return " (holding agent unknown — do not assume it is another run of your own agent)";
+}
+
 function formatDirtyQuarantineContentionRefusal(contention: GitWorktreeBranchContention) {
   const activeRunText = contention.activeRun
-    ? ` with active run ${contention.activeRun.id}`
+    ? ` with active run ${contention.activeRun.id}${formatContendingRunAgent(contention.activeRun)}`
     : " with no active run";
   return `dirty quarantine repair refused because workspace ${contention.claimedByWorkspaceId} already claims the live branch${activeRunText}`;
 }
@@ -2377,7 +2392,7 @@ function formatDirtyQuarantineAuditComment(input: {
       : []),
     `- Fingerprint: \`${input.evidence.fingerprint}\``,
     input.claimant
-      ? `- Claimant: workspace \`${input.claimant.claimedByWorkspaceId}\` on issue ${formatIssueReference(input.claimant.claimedByIssueId, input.claimant.claimedByIssueIdentifier)}${input.claimant.activeRun ? ` with active run \`${input.claimant.activeRun.id}\`` : " with no active run"}`
+      ? `- Claimant: workspace \`${input.claimant.claimedByWorkspaceId}\` on issue ${formatIssueReference(input.claimant.claimedByIssueId, input.claimant.claimedByIssueIdentifier)}${input.claimant.activeRun ? ` with active run \`${input.claimant.activeRun.id}\`${formatContendingRunAgent(input.claimant.activeRun)}` : " with no active run"}`
       : "- Claimant: none",
   ].join("\n");
 }

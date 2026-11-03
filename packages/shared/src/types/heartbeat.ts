@@ -40,6 +40,21 @@ export interface GitWorktreeBranchIncoherenceEvidence {
       status: "queued" | "running";
       issueId: string | null;
       issueIdentifier: string | null;
+      /**
+       * PEN-5342. The messages built from this print the run id, and a bare run
+       * id is read as "another run of mine" by default — wrong whenever the
+       * holder belongs to a different seat (measured, PEN-5082 cmt `e87c9e8b`).
+       *
+       * OPTIONAL as well as nullable, and the two mean different things.
+       * Absent = this evidence was recorded before PEN-5342, which matters
+       * because `workspaceValidation` is persisted as JSON and old rows are
+       * read back through this type. Null = the join ran and found no agent.
+       * Either way the renderer refuses to fall back to a bare id and says the
+       * holder is unknown instead — an unnamed holder is weaker evidence, not
+       * absent evidence.
+       */
+      agentId?: string | null;
+      agentName?: string | null;
     } | null;
   } | null;
   /**
