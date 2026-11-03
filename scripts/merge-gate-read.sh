@@ -82,6 +82,7 @@
 #   merge-gate-read.sh --sha-guard <sha>              # fixture mode, validates one sha
 #
 # Row shape     (TSV): name <TAB> conclusion <TAB> timestamp <TAB> run-id|app:<slug>|status
+#                      [<TAB> creator-login <TAB> creator-id <TAB> creator-type]
 # Run shape     (TSV): workflow-id <TAB> event <TAB> run-id <TAB> conclusion <TAB>
 #                      run-started-at <TAB> status <TAB> workflow-name
 # Pend shape    (TSV): run-id <TAB> status-or-conclusion <TAB> workflow-name
@@ -104,7 +105,8 @@ extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
 }
 
 status_extract() { # stdin: commit-status API body (one object per page) -> rows
-  jq -r '.statuses[]|[.context,.state,.updated_at,"status"]|@tsv'
+  jq -r '.statuses[]|[.context,.state,.updated_at,"status",
+                        (.creator.login // ""),(.creator.id // ""),(.creator.type // "")]|@tsv'
 }
 
 witness_extract() { # stdin: commit-status API body -> run-id <TAB> updated_at
@@ -757,8 +759,13 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD, $4 = RENAME
                  pseen[f[1]] = 1; k++
                  prid[k] = f[1]; pstat[k] = f[2]; pname[k] = f[3] }
                nr = split(ENVIRON["RENAMED"], rl, "\n")
-               for (i = 1; i <= nr; i++) if (rl[i] != "") renamed[rl[i]] = 1 }
+               for (i = 1; i <= nr; i++) if (rl[i] != "") renamed[rl[i]] = 1
+               nq = split(ENVIRON["REQUIRED"], rq, "\n")
+               for (i = 1; i <= nq; i++) if (rq[i] != "") required[rq[i]] = 1 }
         NF==0{next}
+        # Once required, `review/ally-complete` is authoritative on the commit
+        # status surface. A same-named check-run cannot satisfy or override it.
+        $1 == "review/ally-complete" && ($1 in required) && $4 != "status" {next}
         # Set on SURVIVING rows only — after DEAD, after dedup — so "contributed"
         # means "this run published a check-run that is still standing", which is
         # the question. Set BEFORE the label rules below so a row that is itself a
@@ -814,14 +821,23 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD, $4 = RENAME
         # session posting a forged `success` to the context). The verdict over that
         # ledger is `review/ally-complete`, so the ledger row is held to END and
         # stays STOP unless that verdict is `success` at this same head.
-        $4=="status"&&$1=="review/ally-complete"{acs = $2}
+        # Only github-actions[bot] may publish the positive Ally verdict. The
+        # reconciler may publish pending or failure through another token, so
+        # those states remain blocking while an untrusted success stays blocking.
+        $4=="status"&&$1=="review/ally-complete"{
+          acs = $2
+          acs_trusted = ($5 == "github-actions[bot]" && $6 == "41898282" && $7 == "Bot")
+          if ($2 == "success" && !acs_trusted) {
+            print "STOP\t" $1 "\t" $2 "\trun=" $4
+            next
+          }
+        }
         $4=="status"&&$1=="review/ally-ledger"&&$2=="pending"{ledger = 1; next}
         $2!="success"&&$2!="skipped"{print ($1~/\$\{\{/?"MALFORMED":($2=="neutral"?"NOT-EVALUATED":"STOP"))"\t"$1"\t"$2"\trun="$4}
-        END{if(ledger) print (acs == "success" ? "ADVISORY" : "STOP") "\treview/ally-ledger\tpending\trun=status"
+        END{if(ledger) print (acs == "success" && acs_trusted ? "ADVISORY" : "STOP") "\treview/ally-ledger\tpending\trun=status"
             for (i = 1; i <= lq; i++)
               { b = substr(lname[i], 1, length(lname[i]) - 36)
                 print ((b in twin) ? "REFUSED-LEGACY" : (b in renamed) ? "RENAMED-LEGACY" : "STOP") "\t" lrow[i] }
-            nq = split(ENVIRON["REQUIRED"], rq, "\n")
             for (i = 1; i <= nq; i++) if (rq[i] != "" && !(rq[i] in twin) && !(rq[i] in rqs)) {
               rqs[rq[i]] = 1; miss = 1
               printf "STOP\t%s\tABSENT\trun=-\n", rq[i] }
