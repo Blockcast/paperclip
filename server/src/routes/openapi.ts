@@ -2973,8 +2973,11 @@ registry.registerPath({
   description:
     "view=full (default) returns whole payload bodies. Use view=count or view=summary for a cheap " +
     "existence check before filing a new approval — summary omits payload and adds a derived label. " +
-    "Both full and summary carry `decidedByUserId` populated on decided rows (PEN-5432); a non-null " +
-    "value is the human who decided the card, and null means no human user did. A server predating " +
+    "Both full and summary carry `decidedByUserId` populated on decided rows (PEN-5432). A non-null " +
+    "value is who last wrote a decision — a user id, or the literal sentinel `board` for a board " +
+    "actor with no user id — and null means no human user did. On `withdrawn` rows the value is the " +
+    "board's preserved attribution OR the withdrawer, so it is not evidence of a board decision. " +
+    "A server predating " +
     "PEN-5432 omits the key from summary rows entirely, where an absent key is not the same claim as " +
     "a null one — read the decider from GET /api/approvals/{id} rather than inferring from its absence.",
   request: {
