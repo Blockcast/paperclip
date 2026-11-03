@@ -5,7 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { and, asc, desc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
+import { agents, executionWorkspaces, heartbeatRuns, issueComments, issues, projects, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import type {
   ExecutionWorkspace,
   ExecutionWorkspaceSummary,
@@ -100,6 +100,13 @@ export type ExecutionWorkspaceGitWorktreeContention = {
     status: "queued" | "running";
     issueId: string | null;
     issueIdentifier: string | null;
+    // PEN-5342: a run id rendered without its agent is read as "another run of
+    // mine" by default, and that default is wrong across seats. Both messages
+    // built from this (`formatDirtyQuarantineContentionRefusal` and the audit
+    // comment) print the id, so the agent travels with it. Optional to match
+    // the persisted shared shape — see `GitWorktreeBranchIncoherenceEvidence`.
+    agentId?: string | null;
+    agentName?: string | null;
   } | null;
 } | null;
 
@@ -1342,12 +1349,18 @@ export function executionWorkspaceService(db: Db) {
         let activeRun: NonNullable<ExecutionWorkspaceGitWorktreeContention>["activeRun"] = null;
         const runIds = [...runToIssue.keys()];
         if (runIds.length > 0) {
+          // PEN-5342: the agent joins onto the query that already reads this
+          // run — no extra round trip on a path that runs during workspace
+          // thrash.
           const [row] = await db
             .select({
               id: heartbeatRuns.id,
               status: heartbeatRuns.status,
+              agentId: heartbeatRuns.agentId,
+              agentName: agents.name,
             })
             .from(heartbeatRuns)
+            .leftJoin(agents, and(eq(agents.companyId, heartbeatRuns.companyId), eq(agents.id, heartbeatRuns.agentId)))
             .where(and(
               eq(heartbeatRuns.companyId, input.companyId),
               inArray(heartbeatRuns.id, runIds),
@@ -1362,6 +1375,8 @@ export function executionWorkspaceService(db: Db) {
               status: row.status,
               issueId: issue?.id ?? null,
               issueIdentifier: issue?.identifier ?? null,
+              agentId: row.agentId ?? null,
+              agentName: row.agentName ?? null,
             };
           }
         }
