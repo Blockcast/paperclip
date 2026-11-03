@@ -1563,10 +1563,18 @@ deployed. "Merged" is three steps short of "detecting".
 ## Dep-blocked retry dispersion (PEN-5307)
 
 `PaperclipDepBlockedRetryDispersionDegraded` fires when the **undispersed
-share** of `dependency_blocked` re-park decisions over 24h reaches 0.05, across
-at least 30 such decisions. It means this lane's per-run dispersion has stopped
-working, and the herd the section above describes is re-forming — on the lane
-that actually carries the parks.
+share** of `dependency_blocked` re-park decisions over 24h reaches the
+configured ratio, across at least the configured sample floor. It means this
+lane's per-run dispersion has stopped working, and the herd the section above
+describes is re-forming — on the lane that actually carries the parks.
+
+Both numbers are Helm values, not constants — **defaults `0.05` and `30`**, set
+by `depBlockedRetryDispersionRatio` and `depBlockedRetryDispersionMinSamples` in
+`deploy/helm/paperclip/values.yaml` (each carries its own derivation in a doc
+comment). The figures quoted throughout this section are those defaults; if the
+page you are holding disagrees, the values file wins. Note the deployed copy is
+`Blockcast/onprem-k8s`, where the thresholds are literals rather than values —
+check there for what actually fired.
 
 ### Read this first: why this is a second metric, not a label on the first
 
