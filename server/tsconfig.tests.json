@@ -80,6 +80,7 @@
     "src/__tests__/workspace-dir-claims-route.test.ts",
     "src/__tests__/ws-upgrade-url-log-guard.test.ts",
     "src/__tests__/zoned-cron-equivalence.test.ts",
+    "src/__tests__/work-product-external-id-lookup-routes.test.ts",
     "src/__tests__/zoned-cron-work-bound.test.ts",
     "src/__tests__/queued-run-claim-refusal-instrumentation.test.ts"
   ],
