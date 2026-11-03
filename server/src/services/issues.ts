@@ -7579,6 +7579,54 @@ export function issueService(db: Db) {
     );
   }
 
+  // PEN-5351: `executionAgentNameKey` is not an independent column. It is the
+  // name half of the (run id, agent name) pair that identifies the issue's
+  // execution-lock holder, and the two writers that got it right —
+  // `runningCheckoutExecutionPatch` above and the heartbeat claim
+  // (`heartbeat.ts`) — set both halves in one `.set()`.
+  //
+  // The four `adopt*` writers below moved `executionRunId` and left whatever
+  // name the PREVIOUS holder wrote, so the row read "run <new holder>" beside
+  // "agent <previous holder>". The holder genuinely can change agent: the
+  // heartbeat claim can hand the lock to an execution-review participant who is
+  // not the assignee and stamp that agent's name, and when that run goes
+  // terminal the assignee's own run adopts the lock back through
+  // `adoptStaleCheckoutRun` — which carries no agent check. Every reader that
+  // trusts the column then names a foreign seat as the owner of the reader's
+  // own sibling run, which is the misattribution PEN-5342 exists to remove.
+  //
+  // Derived from the ADOPTING RUN's agent rather than from `input.actorAgentId`,
+  // for the same reason `runningCheckoutExecutionPatch` reads it off the run
+  // row: the column describes whose run holds `executionRunId`, so it has to
+  // come from that run. A missing run row or a nameless agent yields `null`,
+  // which CLEARS the stale name instead of keeping it — a column that says
+  // nothing is recoverable by the reader, one that confidently names the wrong
+  // agent is not.
+  //
+  // No `for update`: this is a denormalized label whose authoritative key
+  // (`executionRunId`) is written in the same statement under the issue
+  // ownership lock the callers already hold. A second row lock here would add a
+  // lock edge for a value that arbitrates nothing.
+  //
+  // `actorRunId` is nullable on `StaleExecutionLockInput`, and a null one writes
+  // a null `executionRunId` — no holder, so no holder name either.
+  async function adoptedExecutionAgentNameKey(
+    dbOrTx: Pick<Db, "select">,
+    actorRunId: string | null | undefined,
+  ) {
+    if (!actorRunId) return null;
+    const row = await dbOrTx
+      .select({ agentName: agents.name })
+      .from(heartbeatRuns)
+      .leftJoin(
+        agents,
+        and(eq(agents.companyId, heartbeatRuns.companyId), eq(agents.id, heartbeatRuns.agentId)),
+      )
+      .where(eq(heartbeatRuns.id, actorRunId))
+      .then((rows) => rows[0] ?? null);
+    return normalizeAgentNameKey(row?.agentName);
+  }
+
   async function adoptActiveActorIssueRun(input: {
     issueId: string;
     companyId: string;
@@ -7648,12 +7696,14 @@ export function issueService(db: Db) {
         }))) return null;
       }
 
+      const adoptedAgentNameKey = await adoptedExecutionAgentNameKey(tx, input.actorRunId);
       const now = new Date();
       return tx
         .update(issues)
         .set({
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
+          executionAgentNameKey: adoptedAgentNameKey,
           executionLockedAt: now,
           checkoutRestoreStatus: checkoutRestoreStatusExpression,
           updatedAt: now,
@@ -7788,12 +7838,14 @@ export function issueService(db: Db) {
         return { adopted: null, latest: lockedIssue };
       }
 
+      const adoptedAgentNameKey = await adoptedExecutionAgentNameKey(tx, input.actorRunId);
       const now = new Date();
       const adopted = await tx
         .update(issues)
         .set({
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
+          executionAgentNameKey: adoptedAgentNameKey,
           executionLockedAt: now,
           checkoutRestoreStatus: checkoutRestoreStatusExpression,
           updatedAt: now,
@@ -7888,12 +7940,14 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (actorRun?.status !== "running") return null;
 
+      const adoptedAgentNameKey = await adoptedExecutionAgentNameKey(tx, input.actorRunId);
       const now = new Date();
       return tx
         .update(issues)
         .set({
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
+          executionAgentNameKey: adoptedAgentNameKey,
           executionLockedAt: now,
           checkoutRestoreStatus: checkoutRestoreStatusExpression,
           updatedAt: now,
@@ -8492,11 +8546,13 @@ export function issueService(db: Db) {
       const cleared = await clearStaleExecutionLockInTx(tx, input);
       if (!cleared) return null;
 
+      const adoptedAgentNameKey = await adoptedExecutionAgentNameKey(tx, input.actorRunId);
       return tx
         .update(issues)
         .set({
           checkoutRunId: input.actorRunId,
           executionRunId: input.actorRunId,
+          executionAgentNameKey: adoptedAgentNameKey,
           executionLockedAt: new Date(),
           checkoutRestoreStatus: checkoutRestoreStatusExpression,
           updatedAt: new Date(),
