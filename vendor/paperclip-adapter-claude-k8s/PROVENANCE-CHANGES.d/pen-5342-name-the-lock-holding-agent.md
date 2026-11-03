@@ -17,11 +17,17 @@ What changed:
 
 - New `describeHolderAgent(issue, holder, selfAgentId)` resolves the holding
   agent from the response `foreignLockHolder()` has **already fetched** — no
-  second request, no new field, no schema change. `executionAgentNameKey` is
-  co-written with `executionRunId` in the same `UPDATE .set()`, so it
-  describes this holder by construction and survives the holder's run row
-  going terminal; `activeRun.agentId` is used only when `activeRun.id ===
-  holder`, so a skewed payload cannot attribute the wrong seat.
+  second request, no new field, no schema change.
+- Precedence is **id first, name second**, and that ordering is load-bearing.
+  `activeRun.agentId` is authoritative (`activeRun` is hydrated by keying off
+  `executionRunId`) and is used only when `activeRun.id === holder`, so a
+  skewed payload cannot attribute the wrong seat. `executionAgentNameKey` can
+  be **stale**: only `runningCheckoutExecutionPatch` and the heartbeat claim
+  write it alongside `executionRunId`, while four adoption writers in
+  `issues.ts` set the run id alone and leave the previous holder's name
+  behind. An earlier revision of this change asserted the opposite invariant;
+  Ally caught it in review on PR #3314. When the name is the only source it is
+  reported as UNVERIFIED rather than as attribution.
 - `PAPERCLIP_AGENT_ID` (already in the job manifest) turns the attribution
   into the verdict the reader was guessing at: "which is YOUR OWN agent" vs
   "which is a DIFFERENT agent from yours".

@@ -1057,12 +1057,13 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
     });
 
     /**
-     * `executionAgentNameKey` is co-written with `executionRunId` in the same
-     * UPDATE, so it outlives the holder's run row going terminal while the
-     * lock column still points at it. That is the case `activeRun` cannot
-     * serve, and the one where a bare id would otherwise survive.
+     * `executionAgentNameKey` is the FALLBACK, and it may be stale: only
+     * `runningCheckoutExecutionPatch` and the heartbeat claim write it with
+     * `executionRunId`, while four adoption writers set the run id alone and
+     * leave the previous holder's name behind. So when it is the only source
+     * it must be reported as a lead, never as attribution.
      */
-    it("falls back to executionAgentNameKey when activeRun is gone", async () => {
+    it("reports a name-key-only holder as UNVERIFIED, not as attribution", async () => {
       await withApi(
         {
           status: 200,
@@ -1076,10 +1077,54 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
         },
         async (vars) => {
           const { stderr } = await run("git push", { ...vars, PAPERCLIP_AGENT_ID: SELF_AGENT });
-          expect(stderr).toContain('that run belongs to agent "devops"');
-          // No agent id to compare against, so it must claim neither.
+          expect(stderr).toContain("devops");
+          expect(stderr).toContain("MAY BE STALE");
+          expect(stderr).toContain("do NOT assume it is another run of your own agent");
+          // Must NOT read as settled attribution — that phrasing is reserved
+          // for the id-derived verdict.
+          expect(stderr).not.toContain('that run belongs to agent "devops"');
           expect(stderr).not.toContain("a DIFFERENT agent from yours");
           expect(stderr).not.toContain("YOUR OWN agent");
+        },
+      );
+    });
+
+    /**
+     * The adoption path Ally identified on PR #3314, and the reason the
+     * precedence is id-first rather than name-first.
+     *
+     * The heartbeat claim can give the lock to an execution-review
+     * participant who is not the assignee, stamping THAT agent's
+     * `executionAgentNameKey`. When that run goes terminal the assignee's run
+     * adopts the lock via `adoptStaleCheckoutRun`, which carries no agent
+     * check and does not rewrite the name — so the row ends up holding the
+     * reviewer's NAME against the assignee's run ID.
+     *
+     * Here the stale name says "reviewer" while the live run says the holder
+     * is the reading agent itself. Trusting the name would print a foreign
+     * seat for what is actually your own sibling run: the exact cross-seat
+     * misattribution this change exists to remove.
+     */
+    it("trusts the live run's agent id over a stale executionAgentNameKey (adoption path)", async () => {
+      await withApi(
+        {
+          status: 200,
+          body: {
+            id: "task-1",
+            identifier: "BLO-1",
+            executionRunId: "run-other",
+            // Left behind by a previous holder; NOT the agent of `run-other`.
+            executionAgentNameKey: "reviewer-seat",
+            activeRun: { id: "run-other", agentId: SELF_AGENT },
+          },
+        },
+        async (vars) => {
+          const { stderr } = await run("git push", { ...vars, PAPERCLIP_AGENT_ID: SELF_AGENT });
+          // The id decides: this really is a sibling run of the reading agent.
+          expect(stderr).toContain("which is YOUR OWN agent");
+          expect(stderr).not.toContain("a DIFFERENT agent from yours");
+          // And the id is printed, so the verdict is checkable against it.
+          expect(stderr).toContain(SELF_AGENT);
         },
       );
     });
