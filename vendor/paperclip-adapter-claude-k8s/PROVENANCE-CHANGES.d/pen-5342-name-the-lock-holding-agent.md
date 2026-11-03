@@ -28,6 +28,20 @@ What changed:
   behind. An earlier revision of this change asserted the opposite invariant;
   Ally caught it in review on PR #3314. When the name is the only source it is
   reported as UNVERIFIED rather than as attribution.
+- When the id IS available it is printed **alone**; the name key is not
+  appended beside it. The two live in different namespaces — a name key
+  (`"engineer"`) against a run's agent uuid — so nothing at this surface can
+  tell a pair that agrees from one that contradicts, and on the adoption path
+  above they genuinely contradict. A second revision of this change printed
+  `agent "reviewer-seat" (<your own run's agent id>)`, naming a foreign seat
+  as the owner of the reader's own sibling run: the same cross-seat
+  misattribution the change exists to remove, reintroduced by the fix for it.
+  Ally caught that too, on the same PR. Caveating the name was rejected over
+  dropping it — the pair agrees in the common case, so a warning printed on
+  every message is one readers learn to skip. The readable name is a real
+  loss; `activeRun` carries no agent name today, and adding one means a join
+  on the issues-list hot path that PEN-3596 is separately fighting for
+  latency, so it is left out rather than bought at that price.
 - `PAPERCLIP_AGENT_ID` (already in the job manifest) turns the attribution
   into the verdict the reader was guessing at: "which is YOUR OWN agent" vs
   "which is a DIFFERENT agent from yours".

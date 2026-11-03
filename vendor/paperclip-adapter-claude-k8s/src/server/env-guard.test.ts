@@ -1008,7 +1008,7 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
     const SELF_AGENT = "agent-mine";
     const OTHER_AGENT = "agent-theirs";
 
-    it("names a foreign agent by name AND says it is NOT your own seat", async () => {
+    it("names a foreign holder by agent id AND says it is NOT your own seat", async () => {
       await withApi(
         {
           status: 200,
@@ -1024,13 +1024,17 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
           const { status, stderr } = await run("git push", { ...vars, PAPERCLIP_AGENT_ID: SELF_AGENT });
           expect(status).toBe(2);
           expect(stderr).toContain("run-other");
-          // The id alone is what produced the misread; the agent must appear
-          // in the same breath as the id it qualifies.
-          expect(stderr).toContain('run run-other — that run belongs to agent "engineer"');
-          expect(stderr).toContain(OTHER_AGENT);
+          // The bare run id is what produced the misread; the agent must
+          // appear in the same breath as the id it qualifies.
+          expect(stderr).toContain("run run-other — that run belongs to agent " + OTHER_AGENT);
           expect(stderr).toContain("a DIFFERENT agent from yours");
           // ...and must not be left for the reader to guess at.
           expect(stderr).not.toMatch(/held by run run-other\./);
+          // The name key is NOT printed beside the id, even when the two
+          // happen to agree: nothing here can tell agreement from conflict,
+          // so a message that sounds corroborated would be sounding so by
+          // luck. Ally on #3314.
+          expect(stderr).not.toContain("engineer");
         },
       );
     });
@@ -1125,6 +1129,11 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
           expect(stderr).not.toContain("a DIFFERENT agent from yours");
           // And the id is printed, so the verdict is checkable against it.
           expect(stderr).toContain(SELF_AGENT);
+          // The stale name names a seat that does NOT own this run. Printing
+          // it beside the id — as an earlier revision of this fix did — says
+          // 'agent "reviewer-seat" (<your own agent id>)', which attributes
+          // your own sibling run to a foreign seat. Ally on #3314.
+          expect(stderr).not.toContain("reviewer-seat");
         },
       );
     });
@@ -1187,7 +1196,8 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
         },
         async (vars) => {
           const { stderr } = await run("git push", vars);
-          expect(stderr).toContain('that run belongs to agent "engineer"');
+          expect(stderr).toContain("that run belongs to agent " + OTHER_AGENT);
+          expect(stderr).not.toContain("engineer");
           expect(stderr).not.toContain("a DIFFERENT agent from yours");
           expect(stderr).not.toContain("YOUR OWN agent");
         },
