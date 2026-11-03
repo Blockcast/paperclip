@@ -39,12 +39,15 @@ Two consequences are load-bearing and are the source of most confusion:
 | --- | --- | --- |
 | `issue:comment` | posting a comment | route → `access.decide` |
 | `issue:mutate` | `description`, `title`, `status`, `assigneeAgentId` — every field, including the six below | route → `access.decide` |
-| `issue:coordination_metadata` | `blockedByIssueIds`, `priority`, `projectId`, `parentId`, `milestoneId`, `projectWorkspaceId` | `COORDINATION_METADATA_FIELDS`, `server/src/routes/issues.ts:560` |
+| `issue:coordination_metadata` | `blockedByIssueIds`, `priority`, `projectId`, `parentId`, `milestoneId`, `projectWorkspaceId` | `COORDINATION_METADATA_FIELDS` in `server/src/routes/issues.ts` |
 
 `issue:coordination_metadata` is a **narrower** action than `issue:mutate`, not a
 weaker one: the field allowlist is enforced by the route, and it **fails closed on
 mixing** — a PATCH carrying any key outside that set does not take the coordination
-path at all and falls back to `issue:mutate` (`server/src/routes/issues.ts:6105`).
+path at all and falls back to `issue:mutate`: `coordinationMetadataPatchFields`
+(`server/src/routes/issues.ts`) returns `null` unless **every** key present is in
+that set, and a `null` there means the request takes the standard mutation
+boundary instead.
 
 ## Principal × field
 
@@ -136,37 +139,46 @@ reach. A seat that turns out to need write is restored with an explicit
 ## Allow-paths, enumerated from source
 
 Every path that can return `allowed: true` for `issue:comment` / `issue:mutate` /
-`issue:coordination_metadata`, in evaluation order. Line numbers are as of
-`98839e63` and will drift. The reason string is authoritative: when a line number
-and a reason disagree, trust the reason. It is also what the tests assert on.
+`issue:coordination_metadata`, in evaluation order. The reason string is the
+anchor, and the only one: it is a string literal in
+`server/src/services/authorization.ts`, it is what the tests assert on, and it
+does not move. To find any row below, grep for it —
+`grep -n '"allow_self"' server/src/services/authorization.ts`.
 
-| Reason | `authorization.ts` | comment | mutate | coordination metadata | Condition |
-| --- | --- | :---: | :---: | :---: | --- |
-| `allow_local_board` | `:1872` | A | A | A | `actor.source === "local_implicit"` |
-| `allow_instance_admin` | `:1886` | A | A | A | instance-admin row, never for `cloud_tenant` |
-| `allow_company_member` | `:1916` | A | A | — | cloud-tenant board user (`actor.type === "board"`, `:1867`; `actor.source === "cloud_tenant" && actor.userId`, `:1895`) with active membership, `membershipRole !== "viewer"` |
-| `allow_self` | `:2420` | A | A | — | `resource.assigneeAgentId === actor` |
-| `allow_company_agent` | `:2438` | A | A | — | issue has no assignee, and is not a review/escalation shell |
-| `allow_issue_creator` | `:2449` | A | — | — | `resource.createdByAgentId === actor` |
-| `allow_manager_chain` | `:2466` | A | — | — | `isManagerOf(actor, resource.assigneeAgentId)` |
-| `allow_issue_mention_grant` | `:2481` | A | — | — | a live, non-deleted `agent://<actor>` **markdown-link** mention whose **comment author** is the issue's own assignee agent, or a user with an active company membership. No other author grants anything — not the manager, not the creator, not the CEO, not the mentioned agent itself (`commentAuthorCanGrantIssueMention`, `:697`). See "Who may grant a mention" below |
-| `allow_recovery_handoff_grant` | `:2493` | A | — | — | an open recovery handoff naming the actor |
-| `allow_dependency_edge` | `agentHoldsIssueAcrossDependencyEdge` | A | — | — | a `blocks` row joins the target T and a non-terminal issue X whose **current** assignee is the actor. In **either** direction the edge's creator must have had standing on T — a board user, T's assignee or creator, or a manager of T's assignee. Neither blocker set is written only by T's side: X's set needs no relation to T, and T's set is also written by child-create with `blockParentUntilDone`, which needs only read on T. Derived at decision time: cutting the edge, reassigning X, or closing X revokes it (`BLO-30968`) |
-| `allow_productivity_review_grant` | `:2518` | A | **A** | — | the actor is assigned the review whose `originId` is this issue |
-| `allow_explicit_grant` | `:857` via `:2411` | n/a | n/a | A | **coordination metadata only** — `tasks:assign`/`tasks:assign_scope` **and** `isManagerOf(assignee)` |
+This table deliberately carries **no line numbers**. It used to, and by `PEN-5401`
+every one of them was stale by a uniform +249 lines — a reader following the grid
+during an incident landed 249 lines from every allow-path they looked up. Do not
+reintroduce them: the next edit to `authorization.ts` rots them again.
+
+| Reason | comment | mutate | coordination metadata | Condition |
+| --- | :---: | :---: | :---: | --- |
+| `allow_local_board` | A | A | A | `actor.source === "local_implicit"` |
+| `allow_instance_admin` | A | A | A | instance-admin row, never for `cloud_tenant` |
+| `allow_company_member` | A | A | — | cloud-tenant board user — `decideBase`'s board branch, entered on `input.actor.type === "board"` and narrowed by `input.actor.source === "cloud_tenant" && input.actor.userId` — with active membership, `membershipRole !== "viewer"` |
+| `allow_self` | A | A | — | `resource.assigneeAgentId === actor` |
+| `allow_company_agent` | A | A | — | issue has no assignee, and is not a review/escalation shell |
+| `allow_issue_creator` | A | — | — | `resource.createdByAgentId === actor` |
+| `allow_manager_chain` | A | — | — | `isManagerOf(actor, resource.assigneeAgentId)` |
+| `allow_issue_mention_grant` | A | — | — | a live, non-deleted `agent://<actor>` **markdown-link** mention whose **comment author** is the issue's own assignee agent, or a user with an active company membership. No other author grants anything — not the manager, not the creator, not the CEO, not the mentioned agent itself (`commentAuthorCanGrantIssueMention`). See "Who may grant a mention" below |
+| `allow_recovery_handoff_grant` | A | — | — | an open recovery handoff naming the actor |
+| `allow_dependency_edge` | A | — | — | (`agentHoldsIssueAcrossDependencyEdge`) a `blocks` row joins the target T and a non-terminal issue X whose **current** assignee is the actor. In **either** direction the edge's creator must have had standing on T — a board user, T's assignee or creator, or a manager of T's assignee. Neither blocker set is written only by T's side: X's set needs no relation to T, and T's set is also written by child-create with `blockParentUntilDone`, which needs only read on T. Derived at decision time: cutting the edge, reassigning X, or closing X revokes it (`BLO-30968`) |
+| `allow_productivity_review_grant` | A | **A** | — | the actor is assigned the review whose `originId` is this issue |
+| `allow_explicit_grant` | n/a | n/a | A | **coordination metadata only** — `tasks:assign`/`tasks:assign_scope` **and** `isManagerOf(assignee)`. Reached from `decideBase`'s `issue:coordination_metadata` branch, which checks `isManagerOf` itself and then delegates to `decideWithTaskAssignmentGrants` → `decidePrincipalGrant` |
 
 Terminal denials:
 
-- `:2004` `deny_unsupported_action` — the board-branch fallthrough (`:1965`) for an
-  action with no board mapping. That covers `issue:coordination_metadata` for every
-  cloud-tenant user, and `issue:comment` / `issue:mutate` for a `viewer`. The route
-  never asks `issue:coordination_metadata` for a non-agent
-  (`server/src/routes/issues.ts:6168`), so a cloud-tenant user reaches the
-  coordination fields through `issue:mutate` instead.
-- `:2523` `deny_missing_grant` — generic unassigned-issue access cannot claim a
-  recovery or review shell (`BLO-19094`).
-- `:2398`, `:2404` `deny_scope` — coordination metadata on a self-owned, unassigned,
-  or unmanaged issue.
+- `deny_unsupported_action` — the board-branch fallthrough (the `if (!permissionKey)`
+  arm inside `decideBase`'s board branch) for an action with no board mapping. That
+  covers `issue:coordination_metadata` for every cloud-tenant user, and
+  `issue:comment` / `issue:mutate` for a `viewer`. The route never asks
+  `issue:coordination_metadata` for a non-agent — `decideCoordinationMetadataPatch`
+  (`server/src/routes/issues.ts`) opens with
+  `if (req.actor.type !== "agent" || !req.actor.agentId) return null` — so a
+  cloud-tenant user reaches the coordination fields through `issue:mutate` instead.
+- `deny_missing_grant` on the `unassignedClaimSuppressed` branch — generic
+  unassigned-issue access cannot claim a recovery or review shell (`BLO-19094`).
+- `deny_scope`, both arms of the `issue:coordination_metadata` branch — coordination
+  metadata on a self-owned, unassigned, or unmanaged issue.
 - `deny_missing_grant` for `issue:comment` — returned at the end of the agent
   issue block with `details.evaluatedRelations` (`ISSUE_COMMENT_EVALUATED_RELATIONS`),
   the ordered list of every relation checked, so a refusal is diagnosable from
@@ -189,7 +201,7 @@ Terminal denials:
 - `deny_missing_grant` at the end of `decideBase` — the fallthrough. Since `PEN-4495`
   no issue action reaches it (`issue:comment` and `issue:mutate` both return their own
   denial above). `permissionForAction` returns
-  `null` for all three issue actions (`:186`, `:192`), so the generic
+  `null` for all three issue actions, so the generic
   `permissionKey` grant fallback never fires for them. **No permission
   grant of any kind can satisfy `issue:mutate`.** That is deliberate: issue writes
   are relationship-gated, not grant-gated, and mapping them would make every agent
@@ -203,7 +215,7 @@ wrote the comment** rather than about the actor's own relation to the issue. Not
 else in this file works that way, so the rule is not recoverable by analogy with any
 other row — which is why it is spelled out here rather than left to the word
 "entitled". The predicate is `commentAuthorCanGrantIssueMention`
-(`server/src/services/authorization.ts:697`), and it is the whole rule:
+(`server/src/services/authorization.ts`), and it is the whole rule:
 
 | Author of the mentioning comment | Grants the mentioned agent `issue:comment`? |
 | --- | :---: |
@@ -356,9 +368,9 @@ In order of cost. All three are supported today; none requires a code change.
    issue it manages, so it can post the exact replacement text and ask. The assignee
    holds `allow_self` over every field. This is the normal path.
 2. **Route it through a named human.** A board user, or any cloud-tenant user with
-   an active non-`viewer` membership, holds `issue:mutate` (`:1916`). Setting
-   `assigneeUserId` hands the row to that person's queue; a board session can edit
-   the description directly.
+   an active non-`viewer` membership, holds `issue:mutate`
+   (`allow_company_member`). Setting `assigneeUserId` hands the row to that
+   person's queue; a board session can edit the description directly.
 3. **Attach the criterion as a dependency.** Blocker edges *are* reachable by a
    manager holding `tasks:assign` (`issue:coordination_metadata`), so the criterion
    can be filed as its own issue and attached with `blockedByIssueIds`. It is the
@@ -424,7 +436,7 @@ same file. They are named here because the rule is a property of the *comment's
 author*, so a reader looking for it under the mentioned agent's relations will not
 find it:
 
-- **"comment mention grant predicate"** (`:176`) — the unit test over
+- **"comment mention grant predicate"** — the unit test over
   `commentAuthorCanGrantIssueMention` itself: unrelated agent `false`, assignee
   `true`, active member `true`. The direct pin, and the cheapest one to read.
 - **"allows a mentioned non-assignee to comment when the mention author is the issue
@@ -432,7 +444,9 @@ find it:
 - **"does not grant mention-scoped issue access from self-authored or
   unauthorized-author comments"** — both negative author arms in one case. It asserts
   through the low-trust arm, where a mention grant is the only escape from the
-  boundary (`:1266`), so the author condition is exactly what the denial measures.
+  boundary — the low-trust issue branch allows `issueResourceWithinLowTrustBoundary`
+  or `agentHasMentionGrantOnIssue` and nothing else — so the author condition is
+  exactly what the denial measures.
 - **"requires an active board-user membership for mention-scoped issue grants"** — the
   user arm, asserting the denial before the membership row exists and
   `allow_issue_mention_grant` after it is inserted.
