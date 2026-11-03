@@ -278,7 +278,9 @@ and the attractive one is wrong. All three verified at `9488baa`.
 **`blocked` → `in_progress` is the one that does what you want.** The
 status-change wake fires on `statusChangedFromBacklog ‖
 statusChangedFromBlockedToTodo ‖ statusChangedFromClosedToTodo`
-(`routes/issues.ts:14380`, defined at `:14258`, `:13855`, `:14262`).
+(the wake condition in `routes/issues.ts`, with the three predicates defined
+alongside it — `:14401` and `:14279` / `:13876` / `:14283` as of `master`
+2026-11-03, but cite the symbols: these numbers have drifted twice already).
 `blocked` → `in_progress` matches none of the three — the first needs
 `existing.status === "backlog"`, the third a closed `existing.status`, and the
 second requires `issue.status === "todo"` — so it is **silent**, while
@@ -312,6 +314,18 @@ deadline from the state the system was converging on anyway. What
 that a direct PATCH to `todo` costs. The mechanism and precise timing of the
 reversion are uncharacterised; only the before/after states above were measured.
 
+⚠️ **"Silent" means no wake was spent — it does not mean the row is unselectable.**
+A park does not hide a row from work selection, and that is deliberate:
+`agent-inbox-lite.ts` states it outright — *"Nothing in selection has ever keyed on
+`parkedUntil` and this change does not start"* — because a live park answers "is
+anyone accountable for this row?", not "should it be offered as work?". Filtering
+on it there would strand the row on the one surface that still reaches it. So a
+reverted `todo` row sits in its assignee's `paperclipInboxLite` carrying
+`parkedUntil`/`parkedReason`, and any unscoped heartbeat may pick it up before the
+deadline. What the technique buys is the absence of a *wake request*, not quiet.
+If the row must not be worked before its deadline, the park note has to say so —
+the park alone will not enforce it.
+
 ⚠️ **`blocked` → `todo` is the trap, and it is attractive rather than careless.**
 Both halves of the reasoning are true — `blocked` really has no automatic wake,
 and `todo` really has no hold — so a run reading the row fresh re-derives it.
@@ -340,7 +354,8 @@ past it easily — budget for the cut rather than discovering it as a failed wri
 ⚠️ One side effect of `in_progress`, and a correction to an earlier revision
 of this section. `applyStatusSideEffects` writes `startedAt = new Date()` whenever
 a PATCH sets `in_progress` and carries no `startedAt` of its own
-(`services/issues.ts:432`), and a status-only PATCH never does. So the move does
+(the `!patch.startedAt` branch of `applyStatusSideEffects`, `services/issues.ts:433-434`
+as of `master` 2026-11-03), and a status-only PATCH never does. So the move does
 restart the `long_active_duration` clock, whose bar is 6 h
 (`DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS`).
 
