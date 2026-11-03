@@ -3854,6 +3854,75 @@ describe("execution workspace warnings reach the pod prompt (PEN-5336)", () => {
     const result = buildJobManifest({ ctx, selfPod: makeSelfPod() });
     expect(result.prompt).not.toContain("Execution workspace warning:");
   });
+
+  // PEN-5336 review follow-up. The server attaches the execution-workspace
+  // patch UNCONDITIONALLY, because `warnings` is a live array that later code
+  // still pushes onto. On a pure timer heartbeat nothing ever arrives, so the
+  // payload stays `{"executionWorkspace":{"branchName":null,"warnings":[]}}`.
+  //
+  // The SHARED normalizer discards that shape. This package does not use it --
+  // its local `stringifyPaperclipWakePayload` tests only `=== "{}"`, which that
+  // shape does not match -- so without an explicit strip EVERY claude_k8s pod,
+  // including every timer heartbeat that previously had no wake key at all,
+  // gets a wake payload saying nothing. `skills/paperclip/SKILL.md` tells
+  // agents to inspect that variable FIRST when present and to read it as a
+  // comment wake, so this is a misleading read on every run in the fleet.
+  const wakePayloadEnvOf = (ctx: Parameters<typeof buildJobManifest>[0]["ctx"]) => {
+    const { job } = buildJobManifest({ ctx, selfPod: makeSelfPod() });
+    return job.spec?.template?.spec?.containers?.[0]?.env?.find((e) => e.name === "PAPERCLIP_WAKE_PAYLOAD_JSON")
+      ?.value;
+  };
+
+  it("sets no wake payload env var at all when the only content is an empty execution workspace", () => {
+    // Exactly the shape a timer heartbeat produces.
+    const ctx = makeCtx({ context: { paperclipWake: { executionWorkspace: { branchName: null, warnings: [] } } } });
+    expect(
+      wakePayloadEnvOf(ctx),
+      "a timer heartbeat got a wake payload saying nothing — SKILL.md tells the agent to read it as a wake",
+    ).toBeUndefined();
+  });
+
+  // The three directions that prove the strip is not too wide. Each one reds
+  // if `wakePayloadWithoutEmptyExecutionWorkspace` starts dropping content.
+  it("still emits the wake payload when the execution workspace carries a warning", () => {
+    const ctx = makeCtx({ context: { paperclipWake: { executionWorkspace: { branchName: null, warnings: [CONTENTION] } } } });
+    const value = wakePayloadEnvOf(ctx);
+    expect(value, "a real warning was dropped from the wake payload").toBeDefined();
+    expect(JSON.parse(value!).executionWorkspace.warnings).toEqual([CONTENTION]);
+  });
+
+  it("still emits the wake payload when the execution workspace carries a branch pin", () => {
+    const ctx = makeCtx({ context: { paperclipWake: { executionWorkspace: { branchName: "PEN-5336-x", warnings: [] } } } });
+    const value = wakePayloadEnvOf(ctx);
+    expect(value, "a real branch pin was dropped from the wake payload").toBeDefined();
+    expect(JSON.parse(value!).executionWorkspace.branchName).toBe("PEN-5336-x");
+  });
+
+  it("keeps the rest of the payload when only the execution workspace is empty", () => {
+    const ctx = makeCtx({
+      context: {
+        paperclipWake: { reason: "issue_commented", executionWorkspace: { branchName: null, warnings: [] } },
+      },
+    });
+    const value = wakePayloadEnvOf(ctx);
+    expect(value).toBeDefined();
+    const parsed = JSON.parse(value!);
+    expect(parsed.reason).toBe("issue_commented");
+    // The empty workspace is gone, but it took nothing with it.
+    expect(parsed.executionWorkspace).toBeUndefined();
+  });
+
+  // This package passes the payload through RAW, so the strip is deliberately
+  // STRICTER than the shared normalizer -- which keys only on branchName and
+  // warnings and would silently eat any future field on this patch.
+  it("keeps an execution workspace carrying an unrecognised field with a value", () => {
+    const ctx = makeCtx({
+      context: { paperclipWake: { executionWorkspace: { branchName: null, warnings: [], futureField: "matters" } } },
+    });
+    const value = wakePayloadEnvOf(ctx);
+    expect(value, "a future execution-workspace field was silently eaten by the empty-workspace strip").toBeDefined();
+    expect(JSON.parse(value!).executionWorkspace.futureField).toBe("matters");
+  });
 });
 
 describe("fail-closed sensitive-env guard covers every container on the pod", () => {
