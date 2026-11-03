@@ -95,6 +95,32 @@ describe("access service column projections", () => {
       bareReturning: /\.returning\(\s*\)/,
     });
 
+    // EVERY step that decides whether a bare `.returning()` is reported lives in
+    // here, not just the regex: the mutation match, the `start` it yields, and the
+    // `start` -> `";"` slice that is all `bareReturning` ever sees. The scan below
+    // and the positive control both call THIS, so a regression in any of those
+    // steps fails the control instead of silently emptying `findings`.
+    //
+    // Mutating the slice terminator `";"` to `")"` is the worked case: the slice
+    // stops at `.insert(companyMemberships`, the probe goes false, and the scan
+    // can never report a bare `.returning()` again. Probing `bareReturning`
+    // straight at a whole literal does NOT catch that — it leaves the slicing
+    // step outside the control, which is the gap PEN-5361 closed. Refs PEN-5318
+    // (the regex half), PEN-5361 (this, the glue half).
+    const bareReturningHits = (text: string, table: string): number[] => {
+      const { mutation, bareReturning } = patternsFor(table);
+      const starts: number[] = [];
+      for (const match of text.matchAll(mutation)) {
+        const start = match.index ?? 0;
+        const end = text.indexOf(";", start);
+        const statement = text.slice(start, end === -1 ? text.length : end);
+        if (bareReturning.test(statement)) {
+          starts.push(start);
+        }
+      }
+      return starts;
+    };
+
     const sourceFiles = (dir: string): string[] =>
       readdirSync(dir).flatMap((entry) => {
         const full = join(dir, entry);
@@ -111,19 +137,14 @@ describe("access service column projections", () => {
       const hits: string[] = [];
 
       for (const table of TABLES) {
-        const { bareSelect, mutation, bareReturning } = patternsFor(table);
+        const { bareSelect } = patternsFor(table);
 
         for (const match of text.matchAll(bareSelect)) {
           hits.push(`${where(match.index ?? 0)} bare .select() on ${table}`);
         }
 
-        for (const match of text.matchAll(mutation)) {
-          const start = match.index ?? 0;
-          const end = text.indexOf(";", start);
-          const statement = text.slice(start, end === -1 ? text.length : end);
-          if (bareReturning.test(statement)) {
-            hits.push(`${where(start)} bare .returning() on ${table}`);
-          }
+        for (const start of bareReturningHits(text, table)) {
+          hits.push(`${where(start)} bare .returning() on ${table}`);
         }
       }
       return hits;
@@ -133,13 +154,13 @@ describe("access service column projections", () => {
       expect(findings).toEqual([]);
     });
 
-    it("the scan's own patterns still match a known-bad query", () => {
+    it("the scan's own patterns and slicing still flag a known-bad query", () => {
       // The vacuity guard below proves the walk REACHED the files. This proves
-      // the patterns can still FIRE on what they exist to find — the other half,
-      // and the one that is indistinguishable from success when it breaks: an
-      // escaping mistake or a changed query-builder idiom leaves `findings`
-      // permanently `[]`, and "finds no bare .select() or .returning()" goes on
-      // passing while guarding nothing.
+      // the scan can still FIRE on what it exists to find — the other half, and
+      // the one that is indistinguishable from success when it breaks: an
+      // escaping mistake, a changed query-builder idiom, or a regressed
+      // statement slice leaves `findings` permanently `[]`, and "finds no bare
+      // .select() or .returning()" goes on passing while guarding nothing.
       //
       // Driven off TABLES, so a table added to the scan is covered here too
       // rather than silently acquiring an untested pattern. The known-bad
@@ -152,16 +173,36 @@ describe("access service column projections", () => {
       expect(TABLES.length).toBeGreaterThan(0);
 
       for (const table of TABLES) {
-        const { bareSelect, mutation, bareReturning } = patternsFor(table);
+        const { bareSelect, mutation } = patternsFor(table);
         const bareRead = `const rows = await db.select()\n      .from(${table});`;
         const bareWrite = `await db.insert(${table}).values({}).returning();`;
+        // A `.returning()` in a LATER statement must NOT be attributed to this
+        // mutation. That is what the slice is FOR, and it takes its own literal:
+        // `bareWrite` alone cannot see a slice that was dropped altogether,
+        // because it reads one hit with or without one.
+        const boundedWrite = `await db.insert(${table}).values({});\nawait tx.returning();`;
 
+        // Both `.returning()` figures go through `bareReturningHits`, NOT straight
+        // at a literal: the slice decides what the probe ever sees, so testing the
+        // regex alone leaves it unguarded. The two literals pin it from opposite
+        // sides — measured against the shipped construction, cutting the slice
+        // short (`";"` -> `")"`) takes `bareReturning` 1 -> 0, and removing the
+        // slice takes `bareReturningBounded` 0 -> 1. Neither mutant is visible to
+        // the other literal. Counting hits rather than asserting a boolean also
+        // pins double-reporting. Refs PEN-5361.
         expect({
           table,
           bareSelect: [...bareRead.matchAll(bareSelect)].length,
           mutation: [...bareWrite.matchAll(mutation)].length,
-          bareReturning: bareReturning.test(bareWrite),
-        }).toEqual({ table, bareSelect: 1, mutation: 1, bareReturning: true });
+          bareReturning: bareReturningHits(bareWrite, table).length,
+          bareReturningBounded: bareReturningHits(boundedWrite, table).length,
+        }).toEqual({
+          table,
+          bareSelect: 1,
+          mutation: 1,
+          bareReturning: 1,
+          bareReturningBounded: 0,
+        });
       }
     });
 
