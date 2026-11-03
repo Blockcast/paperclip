@@ -6,6 +6,7 @@ import {
   applyIssueMonitorPolicyTransition,
   buildIssueMonitorClearedPatch,
   buildIssueMonitorEligibilityPatch,
+  derivePersistedMonitorState,
   exhaustedMonitorClearReason,
   isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
@@ -241,6 +242,121 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
       status: "scheduled",
       nextCheckAt: "2099-11-04T09:00:00.000Z",
       clearedNextCheckAt: null,
+    });
+  });
+
+  // The field is only useful if "not recorded" and "nothing was owed" stay
+  // apart. They are one `prefault(null)` away from collapsing: the validator
+  // would fill the key in at parse time, `parseIssueExecutionState` runs every
+  // stored blob through it, and the `cleared` branch of
+  // `derivePersistedMonitorState` spreads the parsed state straight back out —
+  // so the next write would materialise `null` on a row cleared before this
+  // field existed, and a sweep would read a destroyed monitor as a clean one.
+  // That is the false negative the field exists to remove, so pin it.
+  describe("a row cleared before this field existed stays 'not recorded'", () => {
+    // Verbatim shape of a pre-PEN-5343 cleared monitor: no `clearedNextCheckAt`
+    // key at all.
+    const legacyCleared = {
+      status: "cleared",
+      nextCheckAt: null,
+      lastTriggeredAt: null,
+      attemptCount: 0,
+      notes: "re-check the PEN-5294 gate",
+      scheduledBy: "assignee",
+      clearedAt: "2026-11-02T21:47:03.771Z",
+      clearReason: "cancelled",
+    } as const;
+
+    it("survives parseIssueExecutionState without materialising null", () => {
+      const parsed = parseIssueExecutionState(stateWithMonitor({ ...legacyCleared }));
+
+      expect(parsed?.monitor?.status).toBe("cleared");
+      expect(parsed?.monitor && "clearedNextCheckAt" in parsed.monitor).toBe(false);
+    });
+
+    it("is not materialised by the re-persist path", () => {
+      // This is the mechanism itself: the `cleared` branch of
+      // `derivePersistedMonitorState` spreads the parsed state straight back
+      // out, and `executionStateWithMonitor` re-persists that on any later
+      // stage or monitor write. If the key were prefaulted in at parse time,
+      // this is where the `null` would get written at rest.
+      const parsed = parseIssueExecutionState(stateWithMonitor({ ...legacyCleared }));
+      expect(parsed?.monitor?.status).toBe("cleared");
+
+      const derived = derivePersistedMonitorState({
+        issue: {
+          status: "cancelled",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: null,
+          monitorAttemptCount: 0,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        state: parsed,
+        policy: null,
+      });
+
+      expect(derived?.status).toBe("cleared");
+      expect(derived && "clearedNextCheckAt" in derived).toBe(false);
+
+      // And because `monitorStatesEqual` compares via `JSON.stringify`, which
+      // drops absent keys, the untouched row still compares equal to itself —
+      // so re-deriving it writes nothing rather than churning one row per clear.
+      expect(JSON.stringify(derived)).toBe(JSON.stringify(parsed?.monitor));
+    });
+
+    it("is not invented by a re-clear that has no due time to record", () => {
+      // The flap re-clears the row. `previous.nextCheckAt` is null and the
+      // original was never recorded, so there is nothing to carry forward —
+      // and writing `null` here would assert "no wake was owed" about a row
+      // whose wake we simply never captured.
+      const recleared = buildIssueMonitorClearedPatch({
+        issue: {
+          status: "cancelled",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          monitorNextCheckAt: null,
+          executionState: stateWithMonitor({ ...legacyCleared }),
+        },
+        policy: null,
+        clearReason: "done",
+      });
+
+      const monitor = monitorOf(recleared);
+      expect(monitor.status).toBe("cleared");
+      expect("clearedNextCheckAt" in monitor).toBe(false);
+    });
+
+    it("still records null when a clear genuinely finds nothing owed", () => {
+      // The contrast case: a monitor that really was holding no due time. This
+      // one must write `null`, not absence, or the two collapse the other way.
+      const triggered = {
+        ...legacyCleared,
+        status: "triggered",
+        clearedAt: null,
+        clearReason: null,
+        lastTriggeredAt: "2026-11-02T20:00:00.000Z",
+        attemptCount: 1,
+      } as const;
+
+      const monitor = monitorOf(
+        buildIssueMonitorClearedPatch({
+          issue: {
+            status: "cancelled",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            monitorNextCheckAt: null,
+            executionState: stateWithMonitor({ ...triggered }),
+          },
+          policy: null,
+          clearReason: "cancelled",
+        }),
+      );
+
+      expect(monitor).toMatchObject({ status: "cleared", clearedNextCheckAt: null });
+      expect("clearedNextCheckAt" in monitor).toBe(true);
     });
   });
 });
