@@ -453,6 +453,7 @@ import {
   recordOrphanReapStage,
   recordConcurrentRunBlocked,
   recordAgentDispatchDeclined,
+  recordQueuedRunClaimRefused,
   recordDuplicateDispatchSuppressed,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -481,7 +482,11 @@ import {
   recordTransientRetryFloorDisposition,
   recordDepBlockedRetryDispersion,
 } from "./metrics.js";
-import type { DispatchDeclineReason, TransientRetryFloorDisposition } from "./metrics.js";
+import type {
+  DispatchDeclineReason,
+  QueuedRunClaimRefusalArm,
+  TransientRetryFloorDisposition,
+} from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
 import { mapAdapterToCcrotateTarget, mapPenstockProviderToCcrotateTarget } from "./ccrotate-target.js";
@@ -25391,11 +25396,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return row !== null;
   }
 
-  async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
+  /**
+   * Try to take a queued run. Returns the claimed row, or `null` if any screen
+   * refused it.
+   *
+   * `onRefusal` names the screen that refused (PEN-5316). Before it, the only
+   * record a refusal left was the pass-level
+   * `paperclip_agent_dispatch_declined_total{reason="no_claimable_run"}`, which
+   * carries a reason but no subject — so it could not be joined against
+   * `paperclip_queued_run_oldest_claimable_age_seconds`, the gauge that screens
+   * on `isDispatchRankReady` and asserts a ready run HAS been waiting. Both
+   * read positive at once on a third of the samples on the busiest seats, and
+   * with no shared subject there was no way to tell whether the gauge is aging
+   * rows the claim path will never take, or the pass is skipping work it could
+   * have had. The callback is that subject: every arm below reports itself, so
+   * the two sides describe the same runs.
+   *
+   * It is a callback rather than a richer return type because ~20 call sites
+   * read this function's result and only the dispatch pass needs the arm;
+   * widening the return would have made every other caller handle a shape it
+   * does not use. Refusals that CANCEL the run report too — a cancelled row
+   * stops being counted by the gauge, so the arm is what explains the gap
+   * between one sample and the next.
+   */
+  async function claimQueuedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    companyAgents?: AgentOrgRow[],
+    onRefusal?: (arm: QueuedRunClaimRefusalArm) => void,
+  ) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
+      onRefusal?.("agent_missing");
       return null;
     }
     const invokability = companyAgents
@@ -25403,12 +25436,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : await getAgentInvokability(agent);
     if (!invokability.invokable) {
       await cancelRunInternal(run.id, `Cancelled because the agent is not invokable: ${invokability.reason}`);
+      onRefusal?.("agent_not_invokable");
       return null;
     }
 
     const context = parseObject(run.contextSnapshot);
     let issueDependencyReadyForAutoCheckout = true;
     if (isQueuedRunAdmissionDeferred(context)) {
+      onRefusal?.("admission_deferred");
       return null;
     }
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
@@ -25417,6 +25452,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     if (budgetBlock) {
       await cancelRunInternal(run.id, budgetBlock.reason);
+      onRefusal?.("budget_blocked");
       return null;
     }
 
@@ -25427,6 +25463,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     if (dailyCapBlock) {
       await cancelQueuedRunForHeartbeatDailyCap(run, dailyCapBlock);
+      onRefusal?.("daily_cap");
       return null;
     }
 
@@ -25457,6 +25494,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "claimQueuedRun: cancelled queued run with an unparseable context issue id",
         );
       }
+      onRefusal?.("unparseable_issue_id");
       return null;
     }
     if (issueId) {
@@ -25489,6 +25527,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
           },
         });
+        onRefusal?.("pause_hold");
         return null;
       }
 
@@ -25506,6 +25545,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { runId: run.id, issueId, unresolvedBlockerCount: readiness?.unresolvedBlockerCount ?? 0 },
           "claimQueuedRun: cancelled blocked queued run",
         );
+        onRefusal?.("dependency_blocked");
         return null;
       }
 
@@ -25516,6 +25556,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
         );
+        onRefusal?.("stale_issue");
         return null;
       }
     }
@@ -25531,6 +25572,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const exclusivePrReviewTaskKey = prReviewTaskKey && isPrReviewRetryContext(context)
       ? prReviewTaskKey
       : null;
+    // A holder rather than a bare `let`: the flag is set inside the
+    // transaction callback below, and TypeScript's flow analysis does not see
+    // assignments made in a nested function — a plain `let` would stay narrowed
+    // to `false` at the read site and silently collapse one arm into another.
+    const claimAttempt = { prReviewTaskHeld: false };
     const initiallyClaimed = hasExternalLifecycle(agent.adapterType)
       ? (await claimRunWithExternalRuntimeSlotPool(
           db,
@@ -25541,7 +25587,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ))?.run ?? null
       : exclusivePrReviewTaskKey
       ? await db.transaction(async (tx) => {
-          if (!(await canClaimPrReviewTask(tx, exclusivePrReviewTaskKey))) return null;
+          if (!(await canClaimPrReviewTask(tx, exclusivePrReviewTaskKey))) {
+            // Recorded here rather than inferred at the `!claimed` site below:
+            // that site cannot tell this refusal apart from the CAS losing to a
+            // concurrent pass, and the two are opposite findings — one is a row
+            // the gauge should never have aged, the other is work this pass
+            // could have had.
+            claimAttempt.prReviewTaskHeld = true;
+            return null;
+          }
           return tx
             .update(heartbeatRuns)
             .set({
@@ -25577,7 +25631,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .returning()
           .then((rows) => rows[0] ?? initiallyClaimed)
       : initiallyClaimed;
-    if (!claimed) return null;
+    if (!claimed) {
+      // Three distinct causes reach this one `null`, and they are not the same
+      // finding. Split them so the arm label can carry the difference.
+      onRefusal?.(
+        hasExternalLifecycle(agent.adapterType)
+          ? "external_lifecycle_claim_refused"
+          : claimAttempt.prReviewTaskHeld
+          ? "pr_review_task_held"
+          : "claim_cas_lost",
+      );
+      return null;
+    }
 
     recordPrReviewQueueWait({
       taskKey: claimed.contextTaskKey,
@@ -25638,6 +25703,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "claimQueuedRun: cancelled duplicate routine execution run",
         );
+        onRefusal?.("duplicate_routine_execution");
         return null;
       }
 
@@ -25778,6 +25844,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "claimQueuedRun: cancelled duplicate routine execution run after lock race",
         );
+        onRefusal?.("duplicate_routine_execution");
         return null;
       }
 
@@ -25791,6 +25858,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "claimQueuedRun: cancelled run because issue execution lock was not acquired",
         );
+        onRefusal?.("issue_execution_lock_unavailable");
         return null;
       }
     }
@@ -32639,6 +32707,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * bytes each against a set that is already bounded by the roster.
    */
   const DISPATCH_DECLINE_LOG_INTERVAL_MS = 10 * 60_000;
+
+  /**
+   * How many individual claim refusals the `no_claimable_run` line names
+   * (PEN-5316). The metric counts every refusal; this caps only the log. A
+   * wedged seat re-ranks the same bounded candidate window every tick, so the
+   * first few names identify the population — printing the whole window would
+   * scale the line with the incident it is reporting, which is the cost
+   * {@link DISPATCH_DECLINE_LOG_INTERVAL_MS} already exists to control.
+   */
+  const NO_CLAIMABLE_RUN_LOGGED_REFUSAL_LIMIT = 10;
   const dispatchDeclineLogState = new Map<
     string,
     { lastLoggedAt: number; suppressed: number }
@@ -32710,6 +32788,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       logger.debug(
         { agentId, reason, error },
         "startNextQueuedRunForAgent: failed to record dispatch decline",
+      );
+    }
+  }
+
+  /**
+   * Record one candidate's named claim refusal (PEN-5316). Same
+   * never-fail-dispatch contract as {@link noteDispatchDeclined}, and for the
+   * same reason: this runs inside the candidate loop, so a throwing roster read
+   * here would convert an ordinary refusal into a thrown pass.
+   */
+  async function noteQueuedRunClaimRefused(
+    agentId: string,
+    arm: QueuedRunClaimRefusalArm,
+    companyId: string | null,
+  ): Promise<void> {
+    try {
+      const knownAgentIds = companyId
+        ? await getActiveAgentIds(db, companyId)
+        : new Set<string>();
+      recordQueuedRunClaimRefused({ agentId, arm, knownAgentIds });
+    } catch (error) {
+      rethrowIfAgentStartLockAborted(error);
+      logger.debug(
+        { agentId, arm, error },
+        "startNextQueuedRunForAgent: failed to record queued-run claim refusal",
       );
     }
   }
@@ -33950,6 +34053,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      // PEN-5316: every candidate this pass tried and could not take, with the
+      // named arm that refused it. Read by the `no_claimable_run` branch below,
+      // which previously reported only that candidates existed and none could
+      // be claimed — true, and unjoinable against the claimable-age gauge.
+      const claimRefusals: Array<{
+        runId: string;
+        issueId: string | null;
+        arm: QueuedRunClaimRefusalArm;
+      }> = [];
       let scheduledEmergencyContinuationAfterRefusal = false;
       const scheduleEmergencyContinuationForStillQueuedRun = async (
         run: typeof heartbeatRuns.$inferSelect,
@@ -34063,7 +34175,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             continue;
           }
           markAgentStartLockPhase(agentId, "claim");
-          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          // PEN-5316: capture WHICH screen refused, and for which run. The arm
+          // goes on a bounded metric label; the run id stays on the log line
+          // because it is unbounded. Appending straight into the shared
+          // accumulator (rather than through a local the callback assigns) keeps
+          // this correct without asserting how many times the callback fires.
+          const refusalsBeforeClaim = claimRefusals.length;
+          const claimed = await claimQueuedRun(queuedRun, companyAgents, (arm) => {
+            claimRefusals.push({ runId: queuedRun.id, issueId: queuedIssueId ?? null, arm });
+          });
+          for (const refusal of claimRefusals.slice(refusalsBeforeClaim)) {
+            await noteQueuedRunClaimRefused(agentId, refusal.arm, agent.companyId);
+          }
           if (!claimed) {
             if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
               scheduledEmergencyContinuationAfterRefusal = true;
@@ -34132,11 +34255,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // unthrottled line here scales with the incident it is reporting.
         const noClaimLogSlot = takeDispatchDeclineLogSlot(agentId, "no_claimable_run");
         if (noClaimLogSlot.log) {
+          // PEN-5316: the subject, not just the reason. `refusalArmCounts` is
+          // the whole pass; `refusedRuns` is capped because the candidate
+          // window is bounded but not small, and a wedged seat emits this line
+          // for as long as it stays wedged. The cap is on the LOG only — the
+          // metric counted every one.
+          const refusalArmCounts: Record<string, number> = {};
+          for (const refusal of claimRefusals) {
+            refusalArmCounts[refusal.arm] = (refusalArmCounts[refusal.arm] ?? 0) + 1;
+          }
           logger.warn(
             {
               agentId,
               queuedRunCount: queuedRuns.length,
               availableSlots,
+              refusalArmCounts,
+              refusedRuns: claimRefusals
+                .slice(0, NO_CLAIMABLE_RUN_LOGGED_REFUSAL_LIMIT)
+                .map((refusal) => ({
+                  runId: refusal.runId,
+                  issueId: refusal.issueId,
+                  arm: refusal.arm,
+                })),
+              refusedRunsOmitted: Math.max(
+                0,
+                claimRefusals.length - NO_CLAIMABLE_RUN_LOGGED_REFUSAL_LIMIT,
+              ),
               suppressedSincePreviousLog: noClaimLogSlot.suppressedSincePreviousLog,
             },
             "startNextQueuedRunForAgent: declined — candidates were ranked but none could be claimed",
