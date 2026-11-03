@@ -104,8 +104,9 @@ extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
                          // ("app:" + (.app.slug // "?")))]|@tsv'
 }
 
-status_extract() { # stdin: commit-status API body (one object per page) -> rows
-  jq -r '.statuses[]|[.context,.state,.updated_at,"status",
+status_extract() { # stdin: /status or /statuses API body -> rows
+  jq -r '(if type == "array" then .[] else .statuses[] end)
+                       | [.context,.state,.updated_at,"status",
                         (.creator.login // ""),(.creator.id // ""),(.creator.type // "")]|@tsv'
 }
 
@@ -1003,7 +1004,20 @@ REQUIRED=$( { gh api "repos/$R/rules/branches/$BREF?per_page=100" --paginate \
                 --jq '.data.repository.ref.refUpdateRule.requiredStatusCheckContexts // [] | .[]'
             } | sort -u) || fetch_failed required-contexts $?
 
-{ printf '%s' "$STATUSES" | status_extract
+STATUS_ROWS=$(printf '%s' "$STATUSES" | status_extract)
+# `/status` is the cheap combined view, but it deliberately omits creator.
+# Once Ally is a required context, re-read `/statuses` and use its identity-
+# carrying row for that context. Otherwise a genuine github-actions[bot]
+# verdict is indistinguishable from an untrusted writer and is rejected.
+if printf '%s\n' "$REQUIRED" | grep -qx 'review/ally-complete'; then
+  SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
+  STATUS_ROWS=$(printf '%s\n' "$STATUS_ROWS" | awk -F'\t' '$1 != "review/ally-complete"')
+  STATUS_ROWS=$( {
+    printf '%s\n' "$STATUS_ROWS"
+    printf '%s' "$SLIST" | status_extract
+  } )
+fi
+{ printf '%s\n' "$STATUS_ROWS"
   printf '%s' "$CHECKS" | extract
 } | verdicts "$DEAD" "$PENDING" "$WDEAD" "$RENAMED" "$REQUIRED"
 rc=$?
