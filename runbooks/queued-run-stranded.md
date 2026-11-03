@@ -1560,6 +1560,143 @@ The counter itself has its own, separate gate: it ships in the server image, so
 it does not exist in Prometheus until a paperclip release carrying it is
 deployed. "Merged" is three steps short of "detecting".
 
+## Dep-blocked retry dispersion (PEN-5307)
+
+`PaperclipDepBlockedRetryDispersionDegraded` fires when the **undispersed
+share** of `dependency_blocked` re-park decisions over 24h reaches 0.05, across
+at least 30 such decisions. It means this lane's per-run dispersion has stopped
+working, and the herd the section above describes is re-forming — on the lane
+that actually carries the parks.
+
+### Read this first: why this is a second metric, not a label on the first
+
+This is the obvious thing to get wrong, so it is stated before the triage.
+
+`paperclip_transient_retry_floor_total`'s numerator is grid **alignment**. That
+works for `transient_failure` because a clamped floor there is an instant the
+*provider* computed off a bucket edge, so it carries a whole-second or
+10-minute-grid signature that jitter would not produce.
+
+A dependency-blocked park has no provider in it. Its instant is
+`sweepNow + f(attempt)`, and `sweepNow` is an ordinary `new Date()` with an
+arbitrary millisecond — so an **undispersed** dep-blocked park classifies
+`off_grid`, which is the alignment detector's *healthy* reading.
+
+> Extending `alignment` to `reason="dependency_blocked"` would have reported
+> ~100% healthy **both before and after** the fix. The measured collision
+> (`2026-11-02T17:18:01.457Z`) is off-grid by construction.
+
+The signature on this lane is a cross-run **tie on a shared sweep instant**.
+`promoteDueScheduledRetries` binds one `now` and loops up to 50 due runs against
+it, so before PR #3293 any two dep-blocked runs re-parked in one sweep received
+the same `scheduled_retry_at` — p = 1, not a coincidence.
+
+The counter does not measure ties directly. It measures the thing that *causes*
+them: a jitter draw that failed to move the instant.
+
+### Triage
+
+```promql
+sum by (disposition) (increase(paperclip_dep_blocked_retry_dispersion_total[24h]))
+```
+
+Cardinality is fixed at 2 — there is no `exempt` shape here, because every
+dep-blocked re-park goes through the same curve and the same jitter.
+
+- **`dispersed`** — jitter moved the instant off the sweep's shared base. The
+  healthy disposition, and normally ~100% of the population.
+- **`undispersed`** — jitter resolved to 0 ms, so this re-park landed exactly on
+  `sweepNow + f(attempt)`: the tie-capable instant. This is the alert's
+  numerator. A non-trivial share means the window collapsed or the draw is
+  degenerate — read `computeDepBlockedRetryDueAt` and
+  `DEP_BLOCKED_RETRY_JITTER_MAX_MS` in `server/src/services/heartbeat.ts`, and
+  the `random` injection in `jitterTransientRetryFloor`.
+
+Confirm against the rows, looking for agents sharing an instant to the
+millisecond:
+
+```sql
+select id, agent_id, scheduled_retry_at, scheduled_retry_reason, scheduled_retry_attempt
+from heartbeat_runs
+where scheduled_retry_reason = 'dependency_blocked'
+  and scheduled_retry_at is not null
+  and updated_at > now() - interval '24 hours'
+order by scheduled_retry_at;
+```
+
+### The threshold is derived, not picked
+
+`jitterTransientRetryFloor` adds `Math.floor(sample * windowMs)` ms over a window
+of `min(delay * DEP_BLOCKED_RETRY_JITTER_RATIO, DEP_BLOCKED_RETRY_JITTER_MAX_MS)`.
+The **narrowest** window on this lane is attempt 1 — delay 10 min → 120,000 ms;
+attempts 2..12 all sit at the 3 min ceiling.
+
+| | reading |
+|---|---|
+| healthy (a zero draw, `p <= 1/120,000`) | `8.3e-06` |
+| **alert threshold** | **`0.05`** — ~6,000× above healthy |
+| total regression (collapsed window / degenerate draw) | `1.0` — 20× above the threshold |
+
+The failure is binary: if the jitter stops moving the instant, **every** re-park
+classifies `undispersed`. Both ends of the threshold are therefore wide, and
+this is not a tuned number. Raise `depBlockedRetryDispersionRatio` rather than
+`depBlockedRetryDispersionFor` if it ever proves noisy.
+
+### The sample floor is the point of this row, not boilerplate
+
+PEN-4145 trap #3: a zero numerator over a zero denominator must not read as
+healthy. **PEN-5307 is that trap realised one lane over** — the `transient_failure`
+lane went empty, its detector sat on a zero denominator reading healthy
+indefinitely, and 100% of the live park population had moved to
+`dependency_blocked`, which had no denominator at all.
+
+So the `>= 30` is a conjunct of the expression, not a convention. At n=30 it takes
+**two** undispersed re-parks to cross 5% (2/30 = 6.7%); **one** reads 3.3% and
+deliberately does not cross, so a single chance draw cannot page —
+`P(>=2 | n=30, p=8.3e-06) ~ 3e-08`.
+
+**Below 30 this alert is silent, and that silence means *not measured*, not
+*measured healthy*.** If you need to know the lane is alive, read the
+denominator directly rather than inferring health from the absence of a page.
+
+### Verifying the signal is live
+
+Both dispositions are zero-seeded at registry construction, deliberately:
+`increase()` takes last-first, so a series **born at 1** evaluates to 0 forever
+and the alert reading it would be permanently silent — reproducing the very
+blindness this metric exists to remove. A `0` is a real reading. **Do not alert
+on `absent()`**; absence means the pod is not exporting, which the scrape-health
+alerts own.
+
+```promql
+# 2 series, each VALUED at the control-plane pod count (4 on 2026-11-03)
+count by (disposition) (paperclip_dep_blocked_retry_dispersion_total)
+```
+
+2 series at value 0 is the correct post-deploy reading on a quiet lane. **0
+series means the running image does not carry the counter yet.**
+
+### Residual, stated rather than asserted away
+
+Both series are written at the same call site as the dispersion itself, so a
+regression that **deletes** the `jitterTransientRetryFloor` call deletes the
+denominator with it and this reads 0/0, not a spike. The catch for a removed
+call is the regression test `dep-blocked-retry-dispersion.test.ts`, not this
+counter. What the counter catches is the live-traffic shape that test cannot
+see: a dispersion that *runs* but produces no spread.
+
+### ⚠️ Merging the chart does NOT make this alert live on Blockcast
+
+Same three gates as the section above: (1) the `Blockcast/onprem-k8s` merge into
+both lockstep files, (2) the manual `monitoring-rules` Argo sync (BLO-19095),
+and (3) **a paperclip release carrying the counter**, which ships in the server
+image. `prometheusRule.enabled` is `false` in `values.blockcast.yaml`, so this
+chart's copy does not deploy there at all.
+
+At authoring time `paperclip-0`'s `deployed-commit` annotation read `bf8cf335f`
+while the fix merged as `841bf1fa3` — so gate 3 was open and the alert was inert
+on merge, by design. "Merged" is three steps short of "detecting".
+
 ## References
 
 - `runbooks/README.md` — index
@@ -1570,3 +1707,4 @@ deployed. "Merged" is three steps short of "detecting".
 - [BLO-35522](https://paperclip.blockcast.net/BLO/issues/BLO-35522) — the routine-contention page that triggered the retune
 - `runbooks/agent-wakeup-terminal-failed.md` — the sibling alert
 - BLO-19095 — the manual Argo sync gate between merge and deployment
+- [PEN-5307](https://paperclip.blockcast.net/PEN/issues/PEN-5307) — the dep-blocked retry-dispersion alert above, and why its numerator is a tie rather than grid alignment

@@ -2990,6 +2990,48 @@ test("PaperclipTransientRetryClampSignature fits the Slack relay's 400-char lead
   assert.match(lead, /disposition/);
 });
 
+test("PaperclipDepBlockedRetryDispersionDegraded fits the Slack relay's 400-char lead (PEN-5307)", () => {
+  // The sibling of the PEN-4145 test above, pinned separately for the same
+  // stated reason: that test exists so the over-cap count does not grow past
+  // the 31 pre-existing offenders it measured, and an alert added later is
+  // exactly how that count grows. PEN-5307's first draft led at 703 chars.
+  const DESC_LEAD_MAX = 400;
+  const rendered = renderChart([
+    "--show-only",
+    "templates/prometheusrule.yaml",
+    "--set",
+    "prometheusRule.enabled=true",
+  ]);
+
+  const raw = rendered.match(
+    /- alert: PaperclipDepBlockedRetryDispersionDegraded\n[\s\S]*?description: "([^\n]*?)"\n/,
+  )?.[1];
+  assert.ok(raw, "PaperclipDepBlockedRetryDispersionDegraded must render a description");
+
+  const description = raw.replace(/\\n/g, "\n");
+  const lead = description.trim().split("\n\n", 1)[0].split(/\s+/).join(" ");
+
+  // Both threshold placeholders are HELM values, substituted at render time, so
+  // the scalar measured here is what Slack receives. A `{{ $labels.x }}` would
+  // not be -- it expands at fire time and would grow the lead only once the
+  // alert actually fires, which is unmeasurable from here.
+  assert.doesNotMatch(
+    lead,
+    /\{\{/,
+    "lead must contain no fire-time template expansion, or its true length is unmeasurable here",
+  );
+  assert.ok(
+    lead.length <= DESC_LEAD_MAX,
+    `PaperclipDepBlockedRetryDispersionDegraded: Slack lead is ${lead.length} chars, over the ${DESC_LEAD_MAX} cap -- break the description at a sentence boundary with a blank line. Lead: ${lead}`,
+  );
+
+  // Useful on its own, not merely short: a responder who sees only this
+  // paragraph still needs the drill-down, and `disposition` is the only label
+  // this metric carries.
+  assert.match(lead, /PEN-5307/);
+  assert.match(lead, /disposition/);
+});
+
 test("the three checkout-origin descriptions fit the Slack relay's 400-char lead at FIRE TIME", () => {
   // The relay forwards only the first blank-line-delimited paragraph of a
   // description, whitespace-collapsed and truncated at 400 chars (onprem-k8s

@@ -161,6 +161,44 @@
       detector that already exists. The manual Argo sync gate (BLO-19095)
       still separates "in the ConfigMap" from "deployed".
 
+  STATUS of the PEN-5307 dep-blocked retry-dispersion alert, same auditability
+  rule:
+
+    - ADDED HERE 2026-11-03 as PaperclipDepBlockedRetryDispersionDegraded. The
+      counter it reads (paperclip_dep_blocked_retry_dispersion_total,
+      server/src/services/metrics.ts) shipped EARLIER, in #3293 (merged
+      841bf1fa3), so unlike the PEN-4145 entry below this rule is not landing
+      alongside its own metric -- it is landing against a metric that has been
+      in master since 03:57Z that day and is still not deployed. That ordering
+      is the whole reason this row stayed open: the metric existed and nothing
+      consumed it.
+
+    - The companion PR against Blockcast/onprem-k8s is #7447, opened first.
+      Verify it landed in BOTH lockstep files -- and remember shard membership
+      is arbitrary, so grep all of
+      monitoring/prometheus-rules-{1..5}-configmap.yaml, not just shard 2:
+        gh api repos/Blockcast/onprem-k8s/contents/monitoring/prometheus-rules-2-configmap.yaml \
+          -H 'Accept: application/vnd.github.raw' \
+          | grep -c PaperclipDepBlockedRetryDispersionDegraded
+
+    - THREE GATES, same as the PEN-4145 entry: (1) the onprem-k8s merge, (2) the
+      manual `monitoring-rules` Argo sync (BLO-19095), and (3) a paperclip
+      release carrying the counter. Gate 3 was measurably OPEN at authoring
+      time: paperclip-0's deployed-commit annotation read bf8cf335f against the
+      fix's 841bf1fa3, and
+      `count by (disposition) (paperclip_dep_blocked_retry_dispersion_total)`
+      returned 0 series. Confirm it returns 2 -- dispersed and undispersed, each
+      valued at the control-plane pod count -- before recording this as
+      detecting anything.
+
+    - Why the lane matters more than the rule: PaperclipTransientRetryClampSignature
+      below watches `transient_failure`, which is EMPTY (all four dispositions
+      read 0), while `dependency_blocked` carries 100% of the live park
+      population. That is PEN-4145's own trap #3 realised -- not by a coding
+      error, but because the traffic moved after the instrument was scoped. A
+      detector on an empty lane reads healthy indefinitely. See the runbook
+      section `dep-blocked-retry-dispersion-pen-5307`.
+
   STATUS of the PEN-4145 transient-retry clamp-signature alert, same
   auditability rule:
 
@@ -1278,6 +1316,76 @@ spec:
             summary: "Paperclip transient_failure retry floors are landing on a shared grid again (aligned share of floor decisions over 24h >= {{ .Values.prometheusRule.transientRetryClampSignatureRatio }}, healthy is ~0.001)"
             description: "The aligned share of transient_failure retry-FLOOR decisions over the last 24h has reached {{ .Values.prometheusRule.transientRetryClampSignatureRatio }} across at least {{ .Values.prometheusRule.transientRetryClampSignatureMinSamples }} decisions (PEN-4145); healthy is ~0.001. The PEN-2509 herd is re-forming -- a cohort is being parked onto a shared wake instant and will resume in lockstep. FIRST break down by disposition, which says which failure this is.\n\n`sum by (disposition, alignment) (increase(paperclip_transient_retry_floor_total[24h]))`. Alignment concentrated in disposition=~\"exempt_.*\" means the exemption predicate is routing a verbatim provider instant down the exempt branch -- the PEN-2509 signature exactly; read `isCapacityGovernedRetryFloor` in services/ccrotate-capacity-retry.ts. The two exempt values are split on purpose: a predicate regression does not move the exempt SHARE, it moves which marker produces it, so compare exempt_capacity_governed against exempt_horizon_clamped rather than the pair against dispersed.\n\nAlignment in disposition=\"dispersed\" instead means the jitter itself has stopped working (check TRANSIENT_RETRY_FLOOR_JITTER_MAX_MS and the `random` injection) -- a different and rarer defect. alignment=\"ten_minute_grid\" implicates an advertised `retry_after_seconds` reset adopted verbatim, since that horizon is computed off a 10-minute bucket edge.\n\nConfirm against the rows, looking for agents sharing an instant to 0.000s: `select id, agent_id, scheduled_retry_at, scheduled_retry_reason, scheduled_retry_attempt from heartbeat_runs where scheduled_retry_reason = 'transient_failure' and scheduled_retry_at is not null and updated_at > now() - interval '24 hours' order by scheduled_retry_at`.\n\nA reading below {{ .Values.prometheusRule.transientRetryClampSignatureMinSamples }} samples is NOT a healthy reading -- it is an unmeasured one, which is how this regression hid for six weeks. Measured baselines: a dispersed population reads 0.0995% aligned, a verbatim one 100%; pre-fix was 20.43% (153/749) unconditional and 94.03% (126/134) within the clamped population."
             runbook_url: {{ .Values.prometheusRule.transientRetryClampSignatureRunbookUrl | quote }}
+    - name: paperclip-dep-blocked-retry-dispersion
+      rules:
+        - alert: PaperclipDepBlockedRetryDispersionDegraded
+          # PEN-5307. The sibling of PaperclipTransientRetryClampSignature
+          # above, for the lane that actually carries the parks. Read that
+          # rule's header first -- the reasoning about shares, sample floors and
+          # zero-seeding is the same and is not repeated here. What IS different
+          # is the numerator, and that difference is the whole reason this is a
+          # second metric rather than a label.
+          #
+          # WHY NOT just add reason="dependency_blocked" to the rule above. That
+          # rule's numerator is grid ALIGNMENT, and it works because a clamped
+          # transient floor is an instant the PROVIDER computed off a bucket
+          # edge, so it carries a whole-second or 10-minute-grid signature that
+          # jitter would not produce. A dependency-blocked park has no provider
+          # in it. Its instant is `sweepNow + f(attempt)`, and `sweepNow` is an
+          # ordinary `new Date()` with an arbitrary millisecond -- so an
+          # UNDISPERSED dep-blocked park classifies `off_grid`, which is that
+          # detector's HEALTHY reading. Extending alignment to this lane would
+          # have reported ~100% healthy both before and after the fix. The
+          # measured collision (2026-11-02T17:18:01.457Z, two agents,
+          # byte-identical across two reads) is off-grid by construction.
+          #
+          # The signature on THIS lane is a cross-run TIE on a shared sweep
+          # instant. `promoteDueScheduledRetries` binds one `now` and loops up to
+          # 50 due runs against it, so before the fix any two dep-blocked runs
+          # re-parked in one sweep received the same `scheduled_retry_at` --
+          # p = 1, not a coincidence. The counter does not measure ties directly;
+          # it measures the thing that CAUSES them, which is a jitter draw that
+          # failed to move the instant.
+          #
+          # THE THRESHOLD IS DERIVED. `jitterTransientRetryFloor` adds
+          # `Math.floor(sample * windowMs)` ms, windowMs =
+          # min(delay * DEP_BLOCKED_RETRY_JITTER_RATIO,
+          # DEP_BLOCKED_RETRY_JITTER_MAX_MS). The narrowest window on this lane
+          # is attempt 1 (delay 10 min -> 120,000 ms); attempts 2..12 all sit at
+          # the 3 min ceiling. A zero draw therefore has p <= 1/120,000 =
+          # 8.3e-06, so healthy is ~0. The regression direction is binary -- a
+          # collapsed window or a degenerate draw makes EVERY re-park
+          # undispersed, reading 1.0 -- so the default 0.05 sits ~6,000x above
+          # healthy and 20x below the weakest possible real failure.
+          #
+          # THE SAMPLE FLOOR IS THE POINT OF THIS ROW, not boilerplate copied
+          # from above. PEN-4145 trap #3 says a zero numerator over a zero
+          # denominator must not read as healthy. PEN-5307 IS that trap
+          # realised: the transient lane went empty, its detector sat on a zero
+          # denominator reading healthy indefinitely, and 100% of the live park
+          # population had moved to this lane, which had no denominator at all.
+          #
+          # DO NOT alert on absent(). Both dispositions are zero-seeded at
+          # registry construction, deliberately: a series born at 1 evaluates to
+          # 0 under `increase()` forever, which would put the blindness this
+          # metric exists to remove back inside the metric itself. A 0 is a real
+          # reading; absence means the pod is not exporting, which the
+          # scrape-health alerts own.
+          expr: |
+            (
+              sum(increase(paperclip_dep_blocked_retry_dispersion_total{disposition="undispersed"}[24h]))
+              /
+              clamp_min(sum(increase(paperclip_dep_blocked_retry_dispersion_total[24h])), 1)
+            ) >= {{ .Values.prometheusRule.depBlockedRetryDispersionRatio }}
+            and
+            sum(increase(paperclip_dep_blocked_retry_dispersion_total[24h])) >= {{ .Values.prometheusRule.depBlockedRetryDispersionMinSamples }}
+          for: {{ .Values.prometheusRule.depBlockedRetryDispersionFor }}
+          labels:
+            severity: warning
+          annotations:
+            summary: "Paperclip dependency_blocked re-parks are losing their per-run dispersion (undispersed share of re-park decisions over 24h >= {{ .Values.prometheusRule.depBlockedRetryDispersionRatio }}, healthy is ~0.000008)"
+            description: "The undispersed share of dependency_blocked re-park decisions over 24h has reached {{ .Values.prometheusRule.depBlockedRetryDispersionRatio }} across at least {{ .Values.prometheusRule.depBlockedRetryDispersionMinSamples }} decisions (PEN-5307); healthy is ~8.3e-06. An undispersed re-park is one whose jitter resolved to 0 ms, so its instant is exactly sweepNow + f(attempt) -- the tie-capable one. START: `sum by (disposition) (increase(paperclip_dep_blocked_retry_dispersion_total[24h]))`.\n\nWHY THAT MATTERS: `promoteDueScheduledRetries` binds ONE now and loops up to 50 due runs against it, so every undispersed run in a sweep lands on the SAME millisecond, wakes in lockstep, contends for slots together and re-parks together.\n\nAlways carry the denominator; never read the numerator alone. Cardinality is fixed at 2 -- `dispersed` is healthy, `undispersed` is the numerator here. There is no exempt shape on this lane: every dep-blocked re-park goes through the same curve and the same jitter, so the only question is whether the jitter moved the instant.\n\nDO NOT reach for the alignment instrument. paperclip_transient_retry_floor_total's numerator is grid ALIGNMENT, which works because a clamped transient floor is an instant the PROVIDER computed off a bucket edge. A dependency-blocked park has no provider in it -- its instant is sweepNow + f(attempt) with an arbitrary millisecond -- so an UNDISPERSED dep-blocked park classifies off_grid, that detector's HEALTHY reading, both before and after the fix.\n\nA reading below {{ .Values.prometheusRule.depBlockedRetryDispersionMinSamples }} samples is NOT a healthy reading -- it is an unmeasured one. That conflation is exactly how this lane carried 100% of the live park population while the fleet's only clamp detector watched transient_failure, which had gone empty (PEN-4145 trap #3).\n\nConfirm against the rows, looking for agents sharing an instant to the millisecond: `select id, agent_id, scheduled_retry_at, scheduled_retry_reason, scheduled_retry_attempt from heartbeat_runs where scheduled_retry_reason = 'dependency_blocked' and scheduled_retry_at is not null and updated_at > now() - interval '24 hours' order by scheduled_retry_at`. Read `computeDepBlockedRetryDueAt` in services/heartbeat.ts."
+            runbook_url: {{ .Values.prometheusRule.depBlockedRetryDispersionRunbookUrl | quote }}
     - name: paperclip-plugin-lifecycle
       rules:
         - alert: PaperclipPluginCriticalErrored
