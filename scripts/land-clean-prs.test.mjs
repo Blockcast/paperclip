@@ -42,6 +42,13 @@ import {
   settleMinutesFrom,
   sweepRepos,
   targetRepos,
+  notifyRepos,
+  sweepOrder,
+  applyRowNotifyOnly,
+  applierFor,
+  demoteMergeActions,
+  NOTIFY_ONLY_ACTION,
+  CODEOWNER_REQUEST_MARKER,
   unsatisfiedOwners,
   codeownersPatternToRegExp,
   fetchCodeownerRules,
@@ -707,6 +714,343 @@ describe("multi-repo sweep", () => {
       if (prior === undefined) delete process.env.LAND_CLEAN_PRS_REPO;
       else process.env.LAND_CLEAN_PRS_REPO = prior;
     }
+  });
+});
+
+describe("notify-only repos (PEN-5430)", () => {
+  // One list used to answer two unrelated questions — where to NOTIFY a
+  // human-gated hold, and where to ARM `gh pr merge --auto`. Adding a repo for
+  // the first silently bought the second. These pin the split.
+
+  const NOW_ISO = "2026-09-13T12:00:00Z";
+  const OLD_CHECK = "2026-09-12T20:00:00Z"; // 16h before NOW_ISO, past STALE_HOLD_HOURS
+  const atNow = (fn) => {
+    const real = Date.now;
+    Date.now = () => Date.parse(NOW_ISO);
+    try {
+      return fn();
+    } finally {
+      Date.now = real;
+    }
+  };
+  const quiet = (fn) => {
+    const log = console.log;
+    console.log = () => {};
+    try {
+      return fn();
+    } finally {
+      console.log = log;
+    }
+  };
+  /** Three PRs that really do classify `enqueue` through the real classifier. */
+  const landable = () => Array.from({ length: 3 }, (_, i) => pr({ number: 400 + i }));
+
+  it("parses the notify list and defaults to EMPTY, not to this repo", () => {
+    // The default matters as much as the parsing: an unset variable must leave
+    // the routine behaving exactly as it did before this split, and a notify
+    // list that defaulted to anything would start commenting somewhere nobody
+    // asked for on the next fire.
+    assert.deepEqual(notifyRepos("Blockcast/penstock-llm-proxy-core"), [
+      "Blockcast/penstock-llm-proxy-core",
+    ]);
+    assert.deepEqual(notifyRepos("Blockcast/one, Blockcast/two"), ["Blockcast/one", "Blockcast/two"]);
+    assert.deepEqual(notifyRepos(""), []);
+    assert.deepEqual(notifyRepos(null), []);
+    assert.deepEqual(notifyRepos("  ,, "), []);
+  });
+
+  it("reads the environment when called with no argument", () => {
+    const prior = process.env.LAND_CLEAN_PRS_NOTIFY_REPO;
+    try {
+      delete process.env.LAND_CLEAN_PRS_NOTIFY_REPO;
+      assert.deepEqual(notifyRepos(), [], "unset notifies nowhere");
+      process.env.LAND_CLEAN_PRS_NOTIFY_REPO = "Blockcast/penstock-llm-proxy-core";
+      assert.deepEqual(notifyRepos(), ["Blockcast/penstock-llm-proxy-core"]);
+    } finally {
+      if (prior === undefined) delete process.env.LAND_CLEAN_PRS_NOTIFY_REPO;
+      else process.env.LAND_CLEAN_PRS_NOTIFY_REPO = prior;
+    }
+  });
+
+  it("sweeps the union, land repos first, with no repo visited twice", () => {
+    assert.deepEqual(sweepOrder(["a/land"], ["b/notify"]), ["a/land", "b/notify"]);
+    assert.deepEqual(sweepOrder(["a/land"], []), ["a/land"]);
+    assert.deepEqual(sweepOrder([], ["b/notify"]), ["b/notify"]);
+    // A repo named in both is swept ONCE. Which mode it gets is the next test;
+    // what matters here is that it is not classified and reported twice.
+    assert.deepEqual(sweepOrder(["a/both", "a/land"], ["a/both"]), ["a/both", "a/land"]);
+  });
+
+  it("gives a repo named in BOTH lists the notify-only mode", () => {
+    // The restrictive reading wins on purpose. Worst case under this
+    // precedence is that nothing lands somewhere it could have, which the
+    // receipt prints as `notify-only`. Worst case under the other is that a
+    // typo in the notify list arms an autolander in a human-gated repo — the
+    // exact failure this row exists to make unreachable.
+    const seen = [];
+    const spy = (repo, _apply, _settle, _spent, _rotted, _stranded, options) => {
+      seen.push([repo, options?.landable ?? true]);
+      return [];
+    };
+    const notify = new Set(["a/both"]);
+    quiet(() =>
+      sweepRepos(
+        sweepOrder(["a/both", "a/land"], [...notify]),
+        repoRunner(true, 0, [], [], spy, notify),
+      ),
+    );
+    assert.deepEqual(seen, [
+      ["a/both", false],
+      ["a/land", true],
+    ]);
+  });
+
+  it("calls runRepo with the UNCHANGED argument vector when nothing is notify-only", () => {
+    // The options bag is spread in conditionally rather than always passed, so
+    // a fire with no notify list is byte-identical to the pre-split one. Pinned
+    // because the obvious implementation (always pass the bag) would make every
+    // existing argument-vector assertion assert a new trailing slot instead.
+    const calls = [];
+    const spy = (...args) => (calls.push(args), []);
+    quiet(() => sweepRepos(["a/one"], repoRunner(true, 7, [], [], spy)));
+    assert.equal(calls[0].length, 6, "no seventh argument when the notify list is empty");
+  });
+
+  // ---- The acceptance criterion: zero enqueues, structurally. ----
+
+  it("produces ZERO `enqueue` actions in a notify-only repo", () => {
+    // Driven through the REAL classifier on PRs that really are landable, so
+    // this cannot pass by stubbing the classification. The control asserts the
+    // same three PRs DO read `enqueue` in a land repo — without it, a test
+    // that broke the fixture would report the guarantee it stopped testing.
+    const run = (notifyOnly) =>
+      quiet(() =>
+        atNow(() =>
+          runRepo("a/repo", true, 0, 0, [], [], {
+            fetch: landable,
+            applyOne: () => null,
+            state: () => {},
+            ...(notifyOnly ? { landable: false } : {}),
+          }),
+        ),
+      );
+
+    const control = run(false);
+    assert.deepEqual(
+      control.map((row) => row.action),
+      ["enqueue", "enqueue", "enqueue"],
+      "control: these PRs are genuinely landable",
+    );
+
+    const rows = run(true);
+    assert.equal(
+      rows.filter((row) => row.action === "enqueue").length,
+      0,
+      "a notify-only repo enqueues nothing",
+    );
+    assert.deepEqual(
+      rows.map((row) => row.action),
+      [NOTIFY_ONLY_ACTION, NOTIFY_ONLY_ACTION, NOTIFY_ONLY_ACTION],
+    );
+    // The receipt must say why, not merely stop saying `enqueue`.
+    for (const row of rows) assert.match(row.detail, /notify-only repo: would have `enqueue`/);
+  });
+
+  it("has no reachable `gh pr merge` call on the notify-only path", () => {
+    // The structural half. `applyRowNotifyOnly` does not branch on a flag — it
+    // is a different function with no merge call in it — so this asserts over
+    // EVERY action the lander acts on, including ones a classifier bug could
+    // hand it in a repo where they should be impossible.
+    const issued = [];
+    const run = (args) => {
+      issued.push(args);
+      return "[]";
+    };
+    for (const action of ["enqueue", "stale-enqueue", "already-enqueued", "hold", "skip"]) {
+      assert.equal(
+        applyRowNotifyOnly("o/r", { number: 7, action, headSha: HEAD }, run),
+        null,
+        `${action} is a no-op on the notify-only path`,
+      );
+    }
+    assert.deepEqual(issued, [], "not one gh invocation of any kind");
+  });
+
+  it("selects the notify-only applier for a notify-only repo", () => {
+    // Defence in depth, asserted on the selection itself.
+    //
+    // Two guards stop a notify-only repo enqueuing: `demoteMergeActions`
+    // renames the row before the apply loop, and `applierFor` hands that loop
+    // an applier with no merge call in it. They are REDUNDANT by construction
+    // — after the demotion both appliers behave identically on every action
+    // that exists — so no stub driven through `runRepo` can distinguish them,
+    // and reverting the selection to `applyRow` passed the whole suite while
+    // it lived in a parameter default. This asserts the choice directly, which
+    // is the only place it is observable.
+    assert.equal(applierFor(false), applyRowNotifyOnly, "notify-only repos get the inert applier");
+    assert.equal(applierFor(true), applyRow, "land repos keep the real one");
+  });
+
+  it("merges nothing in a notify-only repo even when a row reaches apply reading `enqueue`", () => {
+    // Defence in depth, pinned at the WIRING level rather than by calling
+    // `applyRowNotifyOnly` directly.
+    //
+    // Two independent guards stop a notify-only repo enqueuing:
+    // `demoteMergeActions` renames the row before the apply loop, and
+    // `runRepo` hands that loop an applier with no merge call in it. Because
+    // the first fires on every ordinary path, the second is never exercised by
+    // a test that lets classification run — reverting the applier default to
+    // `applyRow` passed the whole suite until this test existed, which is to
+    // say the second guard was asserted nowhere.
+    //
+    // So: stub `classify` to hand the apply loop a live `enqueue` row, exactly
+    // as a future classifier bug or a dropped demotion would, and assert the
+    // merge still does not happen. `gh` is reached through `applyRow`'s own
+    // `run` seam, so a merge attempt would be visible here as an invocation.
+    const issued = [];
+    const run = (args) => {
+      issued.push(args);
+      if (args[0] === "pr" && args[1] === "view") return JSON.stringify({ headRefOid: HEAD });
+      if (args[0] === "api") return "[]";
+      return "";
+    };
+    quiet(() =>
+      atNow(() =>
+        runRepo("b/notify", true, 0, 0, [], [], {
+          landable: false,
+          fetch: () => [pr({ number: 600 })],
+          classify: () => [{ number: 600, action: "enqueue", reason: "mergestate:CLEAN", headSha: HEAD }],
+          // No `applyOne` override: the point is which applier `runRepo` picks.
+          applyRun: run,
+          state: () => {},
+        }),
+      ),
+    );
+    assert.deepEqual(
+      issued.filter((args) => args[0] === "pr" && args[1] === "merge"),
+      [],
+      "a notify-only repo issues no `gh pr merge`, even handed a live enqueue row",
+    );
+  });
+
+  it("still posts the code-owner notification, and still only once", () => {
+    // The whole point of the notify list: this comment is what a human-gated
+    // repo is being added for. The dedupe PEN-5263 built must survive the
+    // split, so the second fire against a PR that already carries the marker
+    // posts nothing.
+    const issued = [];
+    const run = (existing) => (args) => {
+      issued.push(args);
+      if (args[0] === "api") return JSON.stringify(existing);
+      return "";
+    };
+    const row = { number: 2959, action: "codeowner-review-requested", detail: "@Blockcast/team" };
+
+    assert.equal(applyRowNotifyOnly("o/r", row, run([])), "posted");
+    const posted = issued.find((args) => args[0] === "pr" && args[1] === "comment");
+    assert.ok(posted, "first fire comments");
+    assert.ok(posted.at(-1).startsWith(CODEOWNER_REQUEST_MARKER), "under the dedupe marker");
+
+    issued.length = 0;
+    assert.equal(
+      applyRowNotifyOnly("o/r", row, run([{ body: `${CODEOWNER_REQUEST_MARKER}\nalready here` }])),
+      "already-posted",
+    );
+    assert.deepEqual(
+      issued.filter((args) => args[0] === "pr"),
+      [],
+      "second fire posts nothing",
+    );
+  });
+
+  it("spends no enqueue budget, so a notify repo cannot starve the lander", () => {
+    // `sweepRepos` tallies rows still reading `enqueue` against
+    // MAX_ENQUEUES_PER_FIRE. If a notify-only repo kept that name, adding a
+    // repo for NOTIFICATIONS would throttle the repos that actually land —
+    // the same coupling this split removes, re-entering through the cap.
+    const notify = new Set(["b/notify"]);
+    const spent = quiet(() =>
+      atNow(() =>
+        sweepRepos(
+          sweepOrder(["a/land"], [...notify]),
+          repoRunner(true, 0, [], [], (repo, apply, settle, carried, rotted, stranded, options) =>
+            runRepo(repo, apply, settle, carried, rotted, stranded, {
+              ...options,
+              fetch: landable,
+              applyOne: () => null,
+              state: () => {},
+            }),
+          notify),
+        ),
+      ),
+    );
+    assert.equal(spent, 3, "only the land repo's three rows are spend");
+  });
+
+  it("makes no `stated-hold` write in a notify-only repo", () => {
+    // In a notify-only repo the ONLY write is the code-owner notification. A
+    // `stated-hold:*` comment there is the routine explaining its own inaction
+    // in a repo where that inaction is the policy — and the narrowest write
+    // surface is what makes this safe to ask a human to grant.
+    //
+    // The fixture must be a REAL stale hold or the test is vacuous: the first
+    // version of it used the default rollup stamp, 7h before NOW against a
+    // 13h bar, so `stalledHolds` returned nothing and the assertion held with
+    // the gate removed. `OLD_CHECK` is 16h, past STALE_HOLD_HOURS, and the
+    // land-repo control below is what proves the cohort is non-empty.
+    const held = () => [
+      pr({
+        number: 500,
+        mergeStateStatus: "DIRTY",
+        statusCheckRollup: [{ name: "verify", conclusion: "SUCCESS", completedAt: OLD_CHECK }],
+      }),
+    ];
+    const statedIn = (landableRepo) => {
+      const stated = [];
+      quiet(() =>
+        atNow(() =>
+          runRepo("b/repo", true, 0, 0, [], [], {
+            landable: landableRepo,
+            fetch: held,
+            applyOne: () => null,
+            state: (_repo, row) => stated.push(row),
+          }),
+        ),
+      );
+      return stated;
+    };
+
+    assert.equal(statedIn(true).length, 1, "control: this IS a stale hold a land repo states");
+    assert.deepEqual(statedIn(false), [], "no hold is stated in a repo we are a guest in");
+  });
+
+  it("does not age a notify-only row into the stale-hold cohort", () => {
+    // The hold never clears by design, so aging it would park every clean PR
+    // in the repo in the stale-hold cohort permanently.
+    const rows = demoteMergeActions([{ number: 1, action: "enqueue", reason: "mergestate:CLEAN" }]);
+    assert.equal(rows[0].action, NOTIFY_ONLY_ACTION);
+    assert.deepEqual(
+      stalledHolds([{ number: 1, statusCheckRollup: [] }], rows, { now: Date.parse(NOW_ISO) }),
+      [],
+    );
+  });
+
+  it("does not report a notify-only row as stranded, so --alarm stays honest", () => {
+    // `unlandedEligible` keys on `enqueue` and `--alarm` exits non-zero on a
+    // non-empty cohort. A clean PR in a notify-only repo is not stranded; it is
+    // held by policy, and alarming on it would turn the detector permanently
+    // red for working as designed.
+    const rows = demoteMergeActions([{ number: 1, action: "enqueue", reason: "mergestate:CLEAN" }]);
+    assert.deepEqual(unlandedEligible([{ number: 1, statusCheckRollup: [] }], rows), []);
+  });
+
+  it("refuses to disarm a human's auto-merge in a notify-only repo", () => {
+    // `stale-enqueue` runs `gh pr merge --disable-auto`. We never armed it
+    // there, so a wedged request belongs to a human — disarming it is as much
+    // not-ours-to-do as arming one.
+    const rows = demoteMergeActions([{ number: 2, action: "stale-enqueue", reason: "enqueued:30h" }]);
+    assert.equal(rows[0].action, NOTIFY_ONLY_ACTION);
+    assert.match(rows[0].detail, /would have `stale-enqueue`/);
   });
 });
 
