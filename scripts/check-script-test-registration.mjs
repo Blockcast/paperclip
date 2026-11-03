@@ -33,7 +33,7 @@
  *
  * Four deliberate narrowings, each of which closes a way this guard could pass
  * a file CI never runs. All four were measured against the tree before being
- * adopted, and all four cost NOTHING: 131 of 131 reachable files satisfy the
+ * adopted, and all four cost NOTHING: 134 of 134 reachable files satisfy the
  * strict form.
  *
  *   - WHOLE TOKEN, not substring. `text.includes(basename)` fails OPEN for any
@@ -61,6 +61,17 @@
  *     than the nearest enclosing `with:` is an input and is skipped. Also found
  *     by Ally on PR #3275, fixed under PEN-5282.
  *
+ *     RECOGNISING the `with:` is the whole of this narrowing, and three shapes
+ *     of it were missed at first -- each one re-opening the hole completely,
+ *     because an unrecognised `with:` anchors nothing: `with: # inputs` (a
+ *     trailing comment), `- with:` (`with` as a step item's opening key), and
+ *     `with: {` (a multi-line flow mapping). The first two were found by Ally
+ *     on PR #3281; the third by probing the mutant that review left surviving.
+ *     The pattern is therefore unanchored on the right and tolerant of a
+ *     leading `- `, and it anchors on the column of the `with` TOKEN rather
+ *     than of the dash -- a step's own keys sit at the token column, so the
+ *     dash column would skip a REAL step `run:` written there.
+ *
  * KNOWN CEILING, stated rather than buried. The match is LITERAL, so a runner
  * that builds a path dynamically reads as unregistered here; the one
  * glob-shaped `node --test` in the workflow set
@@ -84,9 +95,16 @@
  * Closing it needs a real YAML parse plus shell-aware quoting, a larger
  * instrument than the defect warrants; the measurement is what holds that
  * decision honest instead. Re-run the guard after any change here -- it must
- * still report every currently-reachable file as reachable. 133 candidates /
- * 131 reachable / 2 allowlisted at the PEN-5282 commit, which is where each of
- * the four narrowings above was measured to cost nothing.
+ * still report every currently-reachable file as reachable, which means
+ * comparing the reachable SET and not just its size. 136 candidates / 134
+ * reachable / 2 allowlisted across 44 workflows at the PEN-5282 commit, which
+ * is where each of the four narrowings above was measured to cost nothing.
+ *
+ * What is NOT left open, so nobody re-opens it looking: the `with:` shapes
+ * listed under the fourth narrowing are closed and each is pinned by its own
+ * named test. Every clause of the inline-comment and `with:`-anchoring logic
+ * carries a mutant that a named test kills; the sweep is in the sibling test
+ * file and is the thing to re-run, not re-derive, after touching either.
  *
  * Reachability is NOT a claim that the test is any good, only that CI runs it.
  * PEN-5205 is an open defect in one of the files this guard now protects.
@@ -269,8 +287,30 @@ export function runCommands(workflowSource) {
     const indent = lines[i].length - lines[i].trimStart().length;
     if (lines[i].trim() !== "") {
       if (withIndent !== null && indent <= withIndent) withIndent = null;
-      if (/^\s*with:\s*$/.test(lines[i])) {
-        withIndent = indent;
+      // Deliberately NOT anchored with `\s*$`, and matched on the RAW line.
+      // Three shapes are `with:` keys that an anchored form misses, and each
+      // one then lets every nested input register (fail-OPEN):
+      //   - `with: # inputs`  -- an ordinary trailing comment.
+      //   - `- with:`         -- `with` as the opening key of a step list
+      //     item; hence the `-?`.
+      //   - `with: {`         -- a multi-line flow mapping, whose inputs sit
+      //     on the lines BELOW it.
+      // Dropping the anchor cannot over-match: the line is only ever treated
+      // as OPENING a block, and the dedent clear above ends that block at the
+      // next same-or-shallower key -- so a flow mapping closed on its own line
+      // (`with: {a: 1}`) still releases the step's real `run:`.
+      //
+      // No `stripInlineComment` here, and that is not an oversight: whole-line
+      // comments are already gone, and this pattern reads only the prefix UP
+      // TO `with:`, which stripping from a later `#` cannot change. Measured
+      // redundant on every probed shape, so it is not kept as decoration --
+      // the anchored version that did need it is what this replaces.
+      const withKey = /^(\s*-?\s*)with:/.exec(lines[i]);
+      if (withKey) {
+        // Column of the `with` TOKEN, not of a leading `- `. For `- with:` the
+        // step's own sibling keys sit at the `with` column, so anchoring on the
+        // dash column would skip a REAL step `run:` written at that depth.
+        withIndent = withKey[1].length;
         continue;
       }
     }
