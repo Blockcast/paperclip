@@ -2009,12 +2009,21 @@ describe("merge-gate reader", () => {
               { context: "sign", state: "pending", updated_at: "t4" },
             ],
           },
+          [
+            {
+              context: "review/ally-complete",
+              state: "success",
+              updated_at: "t5",
+              creator: { login: "github-actions[bot]", id: 41898282, type: "Bot" },
+            },
+          ],
         ]),
         [
           "ci-gate\tsuccess\tt1\tstatus\t\t\t",
           "build\tsuccess\tt2\tstatus\t\t\t",
           "review/ally-complete\tsuccess\tt3\tstatus\tgithub-actions[bot]\t41898282\tBot",
           "sign\tpending\tt4\tstatus\t\t\t",
+          "review/ally-complete\tsuccess\tt5\tstatus\tgithub-actions[bot]\t41898282\tBot",
         ],
       );
     });
@@ -2534,4 +2543,47 @@ esac
       assert.match(out, /^STOP\t<required-contexts fetch failed for a{40} \(rc 1\); refusing on a partial read>\tFETCH-FAILED\trun=-$/m);
     });
   }
+});
+
+describe("live mode: Ally creator comes from the identity-bearing status list", () => {
+  const sha = "b".repeat(40);
+  function run(creator) {
+    const dir = mkdtempSync(join(tmpdir(), "mgr-ally-status-"));
+    writeFileSync(join(dir, "gh"), `#!/usr/bin/env bash
+case "$2" in
+  */statuses*) printf '%s' '[{"id":9,"context":"review/ally-complete","state":"success","updated_at":"2026-11-03T00:00:00Z","creator":${creator}}]' ;;
+  */status*) printf '%s' '{"state":"success","statuses":[{"context":"review/ally-complete","state":"success","updated_at":"2026-11-03T00:00:00Z"}]}' ;;
+  */check-runs*) printf '%s' '{"total_count":1,"check_runs":[{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-11-03T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}]}' ;;
+  repos/o/r/commits/*) echo ${sha} ;;
+  repos/o/r) echo master ;;
+  */rules/branches/*) printf '%s\n' 'review/ally-complete' ;;
+  graphql) ;;
+  */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */pulls*) printf '%s' '[]' ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`, { mode: 0o755 });
+    let rc = 0;
+    let out = "";
+    try {
+      out = execFileSync("bash", [READER, "o/r", sha], {
+        encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+      });
+    } catch (e) { rc = e.status; out = e.stdout; }
+    return { rc, out };
+  }
+
+  it("accepts a trusted success that exists only on /statuses", () => {
+    const { rc, out } = run('{"login":"github-actions[bot]","id":41898282,"type":"Bot"}');
+    assert.equal(rc, 0, out);
+    assert.doesNotMatch(out, /STOP\treview\/ally-complete/);
+  });
+
+  it("rejects an untrusted success from /statuses", () => {
+    const { rc, out } = run('{"login":"allyblockcast[bot]","id":290875700,"type":"Bot"}');
+    assert.equal(rc, 0, out);
+    assert.match(out, /STOP\treview\/ally-complete\tsuccess\trun=status/);
+  });
 });

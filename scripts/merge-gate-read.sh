@@ -1008,7 +1008,7 @@ STATUS_ROWS=$(printf '%s' "$STATUSES" | status_extract)
 SLIST='[]'
 # `/statuses` carries creator identity. Fetch it once when either the Ally
 # authority or the empty-lane witness needs it; both consumers share it.
-if printf '%s\n' "$REQUIRED" | grep -qx 'review/ally-complete' \
+if printf '%s' "$STATUSES" | grep -Eq '"context"[[:space:]]*:[[:space:]]*"review/ally-complete"' \
    || { [ -n "$GATED" ] && printf '%s' "$STATUSES" | grep -Eq '"ci/(dispatched|web)-lanes"'; }; then
   SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
 fi
@@ -1016,12 +1016,23 @@ fi
 # Once Ally is a required context, re-read `/statuses` and use its identity-
 # carrying row for that context. Otherwise a genuine github-actions[bot]
 # verdict is indistinguishable from an untrusted writer and is rejected.
-if printf '%s\n' "$REQUIRED" | grep -qx 'review/ally-complete'; then
-  STATUS_ROWS=$(printf '%s\n' "$STATUS_ROWS" | awk -F'\t' '$1 != "review/ally-complete"')
-  STATUS_ROWS=$( {
-    printf '%s\n' "$STATUS_ROWS"
-    printf '%s' "$SLIST" | status_extract
-  } )
+if printf '%s' "$STATUSES" | grep -Eq '"context"[[:space:]]*:[[:space:]]*"review/ally-complete"'; then
+  # The combined endpoint's Ally row is replaced by the newest identity-bearing
+  # list row only when one exists. Keeping the combined row on an empty/garbled
+  # list fails closed through the creator pin instead of silently dropping it.
+  ALLY_ROWS=$(printf '%s' "$SLIST" | jq -rs '
+    [ .[] as $page
+      | (if ($page|type) == "array" then $page[] else ($page.statuses // [])[] end)
+      | select(.context == "review/ally-complete") ]
+    | max_by(.id // 0)
+    | if . == null then empty else
+        [.context,.state,.updated_at,"status",
+         (.creator.login // ""),(.creator.id // ""),(.creator.type // "")]|@tsv
+      end')
+  if [ -n "$ALLY_ROWS" ]; then
+    STATUS_ROWS=$(printf '%s\n' "$STATUS_ROWS" | awk -F'\t' '$1 != "review/ally-complete"')
+    STATUS_ROWS=$(printf '%s\n%s\n' "$STATUS_ROWS" "$ALLY_ROWS")
+  fi
 fi
 { printf '%s\n' "$STATUS_ROWS"
   printf '%s' "$CHECKS" | extract
