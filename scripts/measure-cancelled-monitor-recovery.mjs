@@ -316,6 +316,10 @@ async function main() {
 
   let clears = 0;
   let withDueTime = 0;
+  // Counted, not skipped: a feed we could not read lowers `clears` without
+  // lowering the confidence anyone reads off it, which is the same dishonest
+  // output as a silently short scan.
+  const feedFailures = feeds.filter((feed) => !feed.ok);
   for (const feed of feeds) {
     if (!feed.ok) continue;
     for (const clear of feed.value.clears) {
@@ -342,12 +346,21 @@ async function main() {
   );
   console.log(
     `carriers=${carriers.length} lost=${lost.length} duplicated=${duplicated.length} ` +
-      `cancelled-clear-events-on-owed=${clears} carrying-due-time=${withDueTime}`,
+      `cancelled-clear-events-on-owed=${clears} carrying-due-time=${withDueTime} ` +
+      `unreadable-feeds=${feedFailures.length}`,
   );
 
-  if (failures.length > 0) {
-    console.error(`\nINCOMPLETE: ${failures.length} of ${ids.length} rows could not be read.`);
-    console.error(failures.slice(0, 5).map((row) => `  ${row.item}: ${row.error}`).join("\n"));
+  if (failures.length > 0 || feedFailures.length > 0) {
+    console.error(
+      `\nINCOMPLETE: ${failures.length} of ${ids.length} rows and ` +
+        `${feedFailures.length} of ${owedIssues.length} activity feeds could not be read.`,
+    );
+    console.error(
+      [...failures, ...feedFailures]
+        .slice(0, 5)
+        .map((row) => `  ${row.item?.identifier ?? row.item}: ${row.error}`)
+        .join("\n"),
+    );
     process.exit(1);
   }
   // A lost obligation is the one reading that falsifies #3352's design.
