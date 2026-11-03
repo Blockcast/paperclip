@@ -379,6 +379,7 @@ import {
   buildIssueMonitorTriggeredPatch,
   derivePersistedMonitorState,
   exhaustedMonitorClearReason,
+  issueAllowsMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
@@ -17061,6 +17062,162 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "skipped" as const, reason: input.clearReason };
   }
 
+
+  /**
+   * PEN-3554 — every monitor re-arm on this path is a write to a row the
+   * dispatcher last saw several statements ago, so it has to re-check that the
+   * row can still be dispatched before it re-arms.
+   *
+   * `dispatchClaimedIssueMonitor` re-arms from three branches (a suppressed
+   * dispatch, a dependency-blocked park, and the watchdog's re-dispatch), and
+   * all three used to write `buildIssueMonitorDispatchRearmPatch` straight out
+   * on `where id = claimed.id`. `claimed` is a snapshot taken by the claim
+   * UPDATE, whose own filter admits only agent-assigned `in_progress`/
+   * `in_review` rows — so the branches were deciding deliverability off a value
+   * that was true at claim time and never re-read. A write committing between
+   * the claim and the re-arm (the cancel this row was filed for, a reassignment,
+   * a recovery park to `blocked`) is invisible to them, and the re-arm then
+   * persists a future `monitorNextCheckAt` onto a row no later tick can claim:
+   * the claim filter excludes it, so the column is undispatchable, while
+   * `hasActiveMonitorPath` reads it as a live wake path regardless. That is the
+   * casualty shape PEN-3326 removed from the budget-pause path, reintroduced
+   * one race over — a row reading attended on every field an observer checks
+   * while nothing will ever attend it.
+   *
+   * The cancel is the sharpest case because it is self-announcing: the gate
+   * that declines the wake does so BECAUSE the issue is cancelled
+   * (`pipeline_stage_exit_cancellation_pending`), so the branch re-arming
+   * afterwards is overwriting a verdict it was just handed. It is not the only
+   * case, which is why this is one helper rather than a `status === "cancelled"`
+   * special-case at one call site: the dependency-blocked branch is reachable on
+   * a cancelled row with FEWER preconditions than the suppressed one, since that
+   * gate additionally requires a running execution run carrying a
+   * pipeline-stage-exit marker.
+   *
+   * `SELECT … FOR UPDATE` rather than a CAS on the eligibility tuple. The
+   * backstop sweep uses a CAS because it reads and writes in separate
+   * statements and must tolerate losing the row; here the read exists only to
+   * decide this one write, so taking the row lock makes the decision and the
+   * write atomic instead of leaving a re-read window a CAS would still have.
+   *
+   * Three outcomes, and the third is the one PR #1910 declined to add inline:
+   *
+   *  - `landed` — still deliverable, re-armed. Unchanged behaviour.
+   *  - `cleared` — no longer deliverable AND still holding a `monitorNextCheckAt`,
+   *    i.e. some writer demoted the row without clearing its monitor. Cleared
+   *    with the reason the row's own status/assignee implies, through the same
+   *    primitive (`buildIssueMonitorEligibilityPatch`) and reported under the
+   *    same activity action (`issue.monitor_cleared_undeliverable`) as the
+   *    periodic backstop, so the two agree by construction rather than by
+   *    matching comments.
+   *  - `already_cleared` — no longer deliverable and `monitorNextCheckAt` is
+   *    ALREADY null. This is the ordinary shape of the cancel race, not an edge
+   *    case: a cancel routed through `issuesSvc.update` runs
+   *    `applyMonitorTransition`, which clears the monitor on the spot. The
+   *    correct repair is therefore to write nothing at all — the row is already
+   *    right, and the only defect was this path putting the column back.
+   *
+   * Deliberately NOT routed through `clearIssueMonitorAndRecover`. That helper
+   * also runs `performIssueMonitorRecovery`, which escalates to an owner wake or
+   * a recovery issue; a deliberately cancelled row is not a strand and must not
+   * summon anyone to it.
+   */
+  async function rearmClaimedIssueMonitorIfDeliverable(input: {
+    claimed: IssueMonitorDispatchRow;
+    rearmPatch: Record<string, unknown>;
+    /** The instant each call site already stamped; kept so this refactor is behaviour-preserving there. */
+    updatedAt?: Date;
+    actorType: "user" | "agent" | "system";
+    actorId: string;
+    agentId: string | null;
+    runId: string | null;
+    activitySource: "manual" | "scheduled";
+  }): Promise<
+    | { kind: "landed" }
+    // `clearReason` is present on both non-landed variants (null on
+    // `already_cleared`) so a caller can report the verdict without narrowing
+    // member by member.
+    | { kind: "cleared"; clearReason: string | null }
+    | { kind: "already_cleared"; clearReason: null }
+  > {
+    const outcome = await db.transaction(async (tx) => {
+      const [fresh] = await tx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.claimed.id))
+        .limit(1)
+        .for("update");
+      // The row was deleted under us. Nothing to re-arm and nothing to repair.
+      if (!fresh) return { kind: "already_cleared" as const, clearReason: null };
+
+      // Delegated, not restated. `issueAllowsMonitor` is the same predicate the
+      // claim filters and the backstop's SQL complement are written from, and
+      // `monitorClearReasonForIssue` returns non-null for every status it
+      // rejects — so "declines to re-arm" and "the backstop would have cleared
+      // this" cannot drift apart. Re-stating it here would make that agreement
+      // only as good as a test that notices it breaking (the BLO-24782 /
+      // PEN-2853 lesson, one predicate over).
+      if (issueAllowsMonitor(fresh.status, fresh.assigneeAgentId, fresh.assigneeUserId)) {
+        await tx
+          .update(issues)
+          .set({ ...input.rearmPatch, updatedAt: input.updatedAt ?? new Date() })
+          .where(eq(issues.id, fresh.id));
+        return { kind: "landed" as const };
+      }
+
+      const clearPatch = buildIssueMonitorEligibilityPatch(fresh);
+      // Empty patch means `monitorNextCheckAt` is already null — the cancel (or
+      // whatever else demoted the row) cleared the monitor itself. Writing here
+      // would only risk disturbing state that is already correct.
+      if (Object.keys(clearPatch).length === 0) return { kind: "already_cleared" as const, clearReason: null };
+
+      await tx
+        .update(issues)
+        .set({ ...clearPatch, updatedAt: new Date() })
+        .where(eq(issues.id, fresh.id));
+
+      return {
+        kind: "cleared" as const,
+        clearReason: (clearPatch.executionState as { monitor?: { clearReason?: string } } | null)
+          ?.monitor?.clearReason ?? null,
+        identifier: fresh.identifier,
+        companyId: fresh.companyId,
+        status: fresh.status,
+        nextCheckAt: fresh.monitorNextCheckAt?.toISOString() ?? null,
+        attemptCount: fresh.monitorAttemptCount ?? 0,
+        notes: fresh.monitorNotes,
+      };
+    });
+
+    // Logged outside the transaction, matching every other activity write in
+    // this service: `logActivity` publishes as well as inserting, and no caller
+    // in this file hands it a `tx`.
+    if (outcome.kind === "cleared") {
+      await logActivity(db, {
+        companyId: outcome.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_cleared_undeliverable",
+        entityType: "issue",
+        entityId: input.claimed.id,
+        details: {
+          identifier: outcome.identifier,
+          clearReason: outcome.clearReason,
+          status: outcome.status,
+          nextCheckAt: outcome.nextCheckAt,
+          attemptCount: outcome.attemptCount,
+          notes: outcome.notes,
+          source: input.activitySource,
+        },
+      });
+      return { kind: "cleared", clearReason: outcome.clearReason };
+    }
+    if (outcome.kind === "landed") return { kind: "landed" };
+    return { kind: "already_cleared", clearReason: null };
+  }
+
   async function dispatchClaimedIssueMonitor(
     claimed: IssueMonitorDispatchRow,
     input: {
@@ -17298,17 +17455,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           monitor: { ...monitor, nextCheckAt: retryCheckAt.toISOString() },
         });
         if (retryPolicy?.monitor) {
-          await db
-            .update(issues)
-            .set({
-              ...buildIssueMonitorDispatchRearmPatch({
-                issue: claimed,
-                policy: retryPolicy,
-                attemptCount: nextAttemptCount,
-              }),
-              updatedAt: input.now,
-            })
-            .where(eq(issues.id, claimed.id));
+          // PEN-3554: guarded. The watchdog re-arms after an explicit dispatch
+          // pass, which is a wider claim→write window than either deferral.
+          const rearm = await rearmClaimedIssueMonitorIfDeliverable({
+            claimed,
+            rearmPatch: buildIssueMonitorDispatchRearmPatch({
+              issue: claimed,
+              policy: retryPolicy,
+              attemptCount: nextAttemptCount,
+            }),
+            updatedAt: input.now,
+            actorType: input.actorType,
+            actorId: input.actorId,
+            agentId: input.agentId,
+            runId: input.runId,
+            activitySource: input.activitySource,
+          });
+          if (rearm.kind !== "landed") {
+            return { outcome: "skipped" as const, reason: rearm.clearReason ?? "monitor_undeliverable" };
+          }
           await logActivity(db, {
             companyId: claimed.companyId,
             actorType: input.actorType,
@@ -17374,16 +17539,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     //
     // One more return-null writer exists, and it is the only `durableSkipReason`
     // set outside the funnel at `enqueueWakeup`'s single skip helper:
-    // `pipeline_stage_exit_cancellation_pending`. It fires only on
-    // `issue.status === "cancelled"`, which the tick's own claim filter excludes
-    // (`in_progress`/`in_review`), so reaching it needs a cancellation to commit
-    // in the window between the claim and the gate. It is deliberately NOT
-    // special-cased here: the deferral is still the least-wrong answer, since the
-    // alternative on this path is the triggered patch that asserts a wake nobody
-    // queued. Known consequence, tracked separately — the re-arm leaves a future
-    // `monitorNextCheckAt` on a cancelled row, no later tick can claim it back
-    // (same status filter), and nothing else nulls that column on cancellation,
-    // so `hasActiveMonitorPath` reads a wake path that will never dispatch.
+    // `pipeline_stage_exit_cancellation_pending`. It needs three conjuncts, not
+    // one — `issue.status === "cancelled"`, a RUNNING active execution run, and
+    // a `pipelineStageExitCancellationRequestedAt` marker on that run's
+    // `resultJson` — and the tick's own claim filter excludes `cancelled`, so
+    // reaching it needs a cancellation to commit in the window between the claim
+    // and the gate.
+    //
+    // PEN-3554 closed what that used to cost. The deferral below is now guarded
+    // by `rearmClaimedIssueMonitorIfDeliverable`, which re-reads the row under a
+    // lock and declines to re-arm one that has left the deliverable set, so this
+    // gate no longer leaves a future `monitorNextCheckAt` that no later tick can
+    // claim and `hasActiveMonitorPath` reads as live.
+    //
+    // Two corrections to the premise this comment used to carry, both load-bearing
+    // for anyone auditing "is this row attended?":
+    //
+    //  - "nothing else nulls that column on cancellation" is false of the system.
+    //    A cancel routed through `issuesSvc.update` runs `applyMonitorTransition`,
+    //    which clears the monitor via `monitorClearReasonForIssue` returning
+    //    `"cancelled"`. That is precisely WHY the re-arm was a defect: it was not
+    //    leaving a stale column, it was putting a cleared one back.
+    //  - `reconcileUndeliverableIssueMonitors` (BLO-33539) is a producer-agnostic
+    //    backstop selecting the exact complement of the scheduler's eligibility
+    //    predicate, and it runs every scheduler tick. It would have swept this
+    //    residue within one tick regardless; the guard removes the window rather
+    //    than the invariant, which the backstop already held.
+    //
+    // The special-case this once declined to add is therefore no longer a design
+    // change: `skipped` already models "declined, nothing queued", so the third
+    // outcome needed no new disposition in the dispatch union.
     //
     // `company.inactive` is the last gate that reaches here, and it is bounded
     // the same way — by a filter upstream of this function, not by anything in
@@ -17413,6 +17598,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         kind: "rearmed";
         result: { outcome: "dispatch_suppressed_deferred"; nextCheckAt: string; suppressionReason: string };
       }
+      // PEN-3554: the third outcome. The row left the monitor-deliverable set
+      // between the claim and this write, so there is nothing to re-arm and
+      // nothing to trigger — only a suppression to report.
+      | { kind: "undeliverable"; clearReason: string | null }
       | { kind: "unpersistable" }
     > => {
       // No exhaustion check here. The top-level `clearReason` above already ran
@@ -17439,17 +17628,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // count, i.e. the unbounded loop this bound exists to prevent.
       if (!retryPolicy?.monitor) return { kind: "unpersistable" };
 
-      await db
-        .update(issues)
-        .set({
-          ...buildIssueMonitorDispatchRearmPatch({
-            issue: claimed,
-            policy: retryPolicy,
-            attemptCount: nextAttemptCount,
-          }),
-          updatedAt: new Date(),
-        })
-        .where(eq(issues.id, claimed.id));
+      // PEN-3554: guarded. A cancellation committing between the claim and here
+      // is exactly what this gate just told us about, and re-arming over it
+      // would leave an undispatchable `monitorNextCheckAt` on a cancelled row.
+      const rearm = await rearmClaimedIssueMonitorIfDeliverable({
+        claimed,
+        rearmPatch: buildIssueMonitorDispatchRearmPatch({
+          issue: claimed,
+          policy: retryPolicy,
+          attemptCount: nextAttemptCount,
+        }),
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        activitySource: input.activitySource,
+      });
+      if (rearm.kind !== "landed") {
+        // The row left the deliverable set. Report the suppression as a skip
+        // rather than a deferral: there is no live timer to defer to, and the
+        // `unpersistable` fallthrough would reach the triggered patch, which
+        // asserts a wake nobody queued — the very thing PEN-3326 removed.
+        return { kind: "undeliverable", clearReason: rearm.clearReason ?? null };
+      }
       await logActivity(db, {
         companyId: claimed.companyId,
         actorType: input.actorType,
@@ -17574,17 +17775,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
       if (deferredRetryAt && deferredPolicy?.monitor) {
         const retryAt = deferredRetryAt;
-        await db
-          .update(issues)
-          .set({
-            ...buildIssueMonitorDispatchRearmPatch({
-              issue: claimed,
-              policy: deferredPolicy,
-              attemptCount: nextAttemptCount,
-            }),
-            updatedAt: new Date(),
-          })
-          .where(eq(issues.id, claimed.id));
+        // PEN-3554: guarded for the same reason as the suppressed-dispatch
+        // deferral above, and this branch is the WIDER of the two on a cancelled
+        // row — the suppression gate additionally requires a running execution
+        // run carrying a pipeline-stage-exit marker, while this one needs only an
+        // unresolved blocker.
+        const rearm = await rearmClaimedIssueMonitorIfDeliverable({
+          claimed,
+          rearmPatch: buildIssueMonitorDispatchRearmPatch({
+            issue: claimed,
+            policy: deferredPolicy,
+            attemptCount: nextAttemptCount,
+          }),
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          activitySource: input.activitySource,
+        });
+        if (rearm.kind !== "landed") {
+          return { outcome: "skipped" as const, reason: rearm.clearReason ?? "monitor_undeliverable" };
+        }
         await logActivity(db, {
           companyId: claimed.companyId,
           actorType: input.actorType,
@@ -17621,6 +17832,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (monitorSuppression.durableSkipReason) {
         const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, null);
         if (deferral.kind === "rearmed") return deferral.result;
+        // PEN-3554: the row is no longer monitor-deliverable (a cancel landed in
+        // the claim→gate window, most often). The monitor is already cleared, or
+        // has just been cleared; either way falling through to the triggered
+        // patch would re-assert a wake nobody queued on a row nobody is waiting
+        // on. Report the suppression instead.
+        if (deferral.kind === "undeliverable") {
+          return { outcome: "skipped" as const, reason: deferral.clearReason ?? monitorSuppression.durableSkipReason };
+        }
         // `unpersistable` — fall through to the triggered patch, which at least
         // terminates the row rather than leaving it re-claiming forever. This is
         // the pre-existing behaviour for policy drift, unchanged.
@@ -17678,6 +17897,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (input.clearOnClientError && monitorSuppression.durableSkipReason) {
           const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, err.message);
           if (deferral.kind === "rearmed") return deferral.result;
+          // PEN-3554: already cleared (or just cleared) because the row left the
+          // deliverable set. The clear below would re-clear it under the less
+          // accurate `dispatch_skipped` reason and log a second activity row for
+          // one event, so report the undeliverable verdict directly.
+          if (deferral.kind === "undeliverable") {
+            return { outcome: "skipped" as const, reason: deferral.clearReason ?? err.message };
+          }
           // `unpersistable` — fall through to the clear below, unchanged.
         }
         if (input.clearOnClientError) {
@@ -17815,7 +18041,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
-  async function tickDueIssueMonitors(now = new Date()) {
+  async function tickDueIssueMonitors(
+    now = new Date(),
+    opts?: {
+      /**
+       * PEN-3554 test seam: runs between the claim UPDATE and the dispatch,
+       * which is the exact window a cancellation has to land in to reach the
+       * `pipeline_stage_exit_cancellation_pending` gate. The race is otherwise
+       * unreachable from a test — the claim filter admits only
+       * `in_progress`/`in_review`, so an issue cancelled before the tick is
+       * never claimed at all, and one cancelled after it has already been
+       * dispatched.
+       */
+      beforeDispatch?: (issueId: string) => Promise<void>;
+    },
+  ) {
     const lapseThreshold = new Date(now.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS);
     const lapsed = await db
       .select({ issue: issueMonitorDispatchColumns, run: heartbeatRuns })
@@ -17963,6 +18203,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       if (!claimed) continue;
+      if (opts?.beforeDispatch) await opts.beforeDispatch(claimed.id);
 
       try {
         const result = await dispatchClaimedIssueMonitor(claimed, {
@@ -45953,7 +46194,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? { createdAt: cursor.createdAt, id: cursor.id, passes: cursor.passes }
         : null;
     },
-    __test_tickDueIssueMonitors: (now?: Date) => tickDueIssueMonitors(now),
+    __test_tickDueIssueMonitors: (
+      now?: Date,
+      opts?: { beforeDispatch?: (issueId: string) => Promise<void> },
+    ) => tickDueIssueMonitors(now, opts),
     __test_tickExpiredIssueParks: (now?: Date) => tickExpiredIssueParks(now),
     __test_tickExpiredIssueMonitors: (now?: Date) => tickExpiredIssueMonitors(now),
     // Override-aware scheduling-suppression check (honors the worktree
