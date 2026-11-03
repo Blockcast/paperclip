@@ -24,6 +24,10 @@ import {
   reviewOwed,
   touchedWatchedPaths,
 } from "./check-git-egress-exec-closure-reread.mjs";
+// Namespace import as well as the named ones: the constant-parity test below
+// derives its set from what this module actually exports, which named imports
+// cannot express.
+import * as reread from "./check-git-egress-exec-closure-reread.mjs";
 
 const SHIM = "packages/adapter-utils/src/github-git-egress-shim.ts";
 const RUNTIME = "packages/adapter-utils/src/github-git-egress-runtime.ts";
@@ -286,16 +290,36 @@ test("the report names the remedy for whichever arm fired", () => {
   assert.doesNotMatch(calendarOnly, /RE-READ IS OWED/);
 });
 
-test("both discharge instructions name the same three constants", () => {
+test("both discharge instructions name every REVIEW_* constant this module exports", () => {
   // The test above pins which HEADLINE fired, not what the remedy under it says,
   // and that gap let the calendar arm go stale: it was written when there were
   // two constants and kept naming two after REVIEW_NOTICE was added. The arm a
   // late discharger reads is this one — under a repo-wide freeze — so it is the
   // worse of the two to leave naming an incomplete edit.
   //
-  // Pinned as one shared set rather than two literal lists, so a fourth constant
-  // cannot land in one arm and silently miss the other.
-  const CONSTANTS = ["REVIEW_LAST_COMPLETED", "REVIEW_DUE", "REVIEW_NOTICE"];
+  // The set is DERIVED from the module's own exports, and the first version of
+  // this test used a literal list instead. That list pinned only the three names
+  // already written in it, which is the SAME gap one layer up: measured on
+  // d446f52, adding a fourth `REVIEW_*` export and naming it in the notice arm
+  // alone left this suite 32/32 green, while its own comment claimed "a fourth
+  // constant cannot land in one arm and silently miss the other". Deriving the
+  // set is what makes that claim true.
+  //
+  // ⚠ Consequence, accepted deliberately: a future `REVIEW_*` export that
+  // genuinely belongs in only one arm will red here. That is the intended
+  // direction — it forces the asymmetry to be argued for in a diff instead of
+  // being absorbed silently — but it is a cost, not a freebie. Narrow the regex
+  // or exempt the name explicitly; do not re-flatten this back to a literal.
+  const CONSTANTS = Object.keys(reread).filter((k) => /^REVIEW_[A-Z_]+$/.test(k));
+  // A derived set can also go EMPTY — a rename, a regex that stops matching —
+  // and an empty set passes the loop below by never entering it, which is the
+  // vacuous pin this detector's own PR removed from the broker policy suite. The
+  // three names known today are asserted as a FLOOR, not as the pin: the loop
+  // still runs over whatever the module actually exports, so the floor
+  // under-counting cannot weaken it.
+  for (const known of ["REVIEW_LAST_COMPLETED", "REVIEW_DUE", "REVIEW_NOTICE"]) {
+    assert.ok(CONSTANTS.includes(known), `the derived constant set must include ${known}`);
+  }
 
   const calendar = renderReport(
     evaluate({ changedPaths: [], commitMessages: [], today: "2027-02-01", headPaths: BOTH_PRESENT }),
