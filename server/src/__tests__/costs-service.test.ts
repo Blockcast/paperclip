@@ -497,9 +497,9 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
   // rows, and `unknown` is in neither set. On a fleet whose lanes are all brokered --
   // the live state of this tenant -- both read 0 while runs are happening, and a reader
   // who takes that as a run count concludes the seat is idle and divides by zero. This
-  // pins the unbranched `runCount` that answers the question those two cannot, and the
+  // pins the unbranched `costEventRunCount` that answers the question those two cannot, and the
   // `runlessEventCount` that keeps it from failing the opposite way.
-  it("reports an unbranched runCount when no row is classified and both billing-type counters read zero", async () => {
+  it("reports an unbranched costEventRunCount when no row is classified and both billing-type counters read zero", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runOneId = randomUUID();
@@ -544,7 +544,7 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     ]);
 
     // billingType omitted on purpose: `createEvent` defaults it to "unknown", which is
-    // also what `classifyBillingType` resolves every Penstock-brokered lane to.
+    // also what `resolveLedgerBillingType` resolves every Penstock-brokered lane to.
     const base = {
       agentId,
       provider: "anthropic",
@@ -569,7 +569,7 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(row?.apiRunCount).toBe(0);
     expect(row?.subscriptionRunCount).toBe(0);
 
-    expect(row?.runCount).toBe(2);
+    expect(row?.costEventRunCount).toBe(2);
     expect(row?.runlessEventCount).toBe(1);
 
     // cash and consumption still agree, because no lane is classified as a subscription.
