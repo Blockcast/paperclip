@@ -167,8 +167,8 @@ async function createAppWithActor(actor: any) {
 }
 
 async function loadCostParsers() {
-  const { parseCostDateRange, parseCostLimit } = await import("../routes/costs.js");
-  return { parseCostDateRange, parseCostLimit };
+  const { parseCostDateRange, parseCostLimit, parseCostAgentId } = await import("../routes/costs.js");
+  return { parseCostDateRange, parseCostLimit, parseCostAgentId };
 }
 
 beforeEach(() => {
@@ -239,6 +239,43 @@ describe("cost routes", () => {
   it("returns 400 for an invalid 'to' date string", async () => {
     const { parseCostDateRange } = await loadCostParsers();
     expect(() => parseCostDateRange({ to: "banana" })).toThrow(/invalid 'to' date/i);
+  });
+
+  // PEN-4902: `?agentId=` was accepted and ignored on the agent-keyed reports,
+  // so a per-seat request answered 200 with every seat in the company. The
+  // damage is not the extra rows -- it is that `rows[0]`, the natural read of
+  // a one-seat request, returns whichever seat sorts first by spend under the
+  // requested seat's name, and nothing at the call site can tell.
+  it("passes agentId through to the agent-keyed cost reports", async () => {
+    const app = await createApp();
+
+    const byAgent = await request(app)
+      .get("/api/companies/company-1/costs/by-agent")
+      .query({ agentId: "agent-7", from: "2026-11-02T00:00:00.000Z" });
+    expect(byAgent.status).toBe(200);
+    expect(mockCostService.byAgent.mock.calls[0]?.[2]).toEqual({ agentId: "agent-7" });
+
+    const byAgentModel = await request(app)
+      .get("/api/companies/company-1/costs/by-agent-model")
+      .query({ agentId: "agent-7" });
+    expect(byAgentModel.status).toBe(200);
+    expect(mockCostService.byAgentModel.mock.calls[0]?.[2]).toEqual({ agentId: "agent-7" });
+  });
+
+  it("leaves the agent filter unset when agentId is omitted", async () => {
+    const app = await createApp();
+    const res = await request(app).get("/api/companies/company-1/costs/by-agent");
+    expect(res.status).toBe(200);
+    expect((mockCostService.byAgent.mock.calls[0]?.[2] as { agentId?: string }).agentId).toBeUndefined();
+  });
+
+  it("reads the first agentId when the parameter repeats, and rejects a non-string", async () => {
+    const { parseCostAgentId } = await loadCostParsers();
+    expect(parseCostAgentId({ agentId: "agent-7" })).toBe("agent-7");
+    expect(parseCostAgentId({ agentId: ["agent-7", "agent-8"] })).toBe("agent-7");
+    expect(parseCostAgentId({})).toBeUndefined();
+    expect(parseCostAgentId({ agentId: "" })).toBeUndefined();
+    expect(() => parseCostAgentId({ agentId: { nested: "1" } })).toThrow(/invalid 'agentId'/i);
   });
 
   it("returns finance summary rows for valid requests", async () => {
@@ -1047,5 +1084,67 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(summary.estimatedDebitCents).toBe(2_000_000_000);
     expect(byKindRow?.debitCents).toBe(4_000_000_000);
     expect(byKindRow?.netCents).toBe(4_000_000_000);
+  });
+
+  // PEN-4902: the route now forwards `agentId`; this is the half that does the
+  // filtering. The must-trip control is the unfiltered call in the same test --
+  // a filter that was quietly dropped again would make both assertions read
+  // the same two rows, and only the comparison catches that.
+  it("narrows the agent report to one seat without changing the unfiltered answer", async () => {
+    const companyId = randomUUID();
+    const agentA = randomUUID();
+    const agentB = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    for (const [id, name] of [[agentA, "Seat A"], [agentB, "Seat B"]] as const) {
+      await db.insert(agents).values({
+        id,
+        companyId,
+        name,
+        role: "engineer",
+        status: "active",
+        adapterType: "claude_k8s",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      });
+    }
+
+    // B outspends A, so an ignored filter returns B first and `rows[0]` reads
+    // as a plausible answer for a request that named A.
+    await costs.createEvent(companyId, {
+      agentId: agentA,
+      provider: "anthropic",
+      biller: "anthropic",
+      model: "claude-opus-5",
+      costCents: 100,
+      occurredAt: new Date("2026-11-02T10:00:00.000Z"),
+    });
+    await costs.createEvent(companyId, {
+      agentId: agentB,
+      provider: "anthropic",
+      biller: "anthropic",
+      model: "claude-opus-5",
+      costCents: 900,
+      occurredAt: new Date("2026-11-02T10:00:00.000Z"),
+    });
+
+    const unfiltered = await costs.byAgent(companyId);
+    expect(unfiltered).toHaveLength(2);
+    expect(unfiltered[0]?.agentId).toBe(agentB);
+
+    const filtered = await costs.byAgent(companyId, undefined, { agentId: agentA });
+    expect(filtered).toHaveLength(1);
+    expect(filtered[0]?.agentId).toBe(agentA);
+    expect(filtered[0]?.costCents).toBe(100);
+
+    const filteredModel = await costs.byAgentModel(companyId, undefined, { agentId: agentA });
+    expect(filteredModel).toHaveLength(1);
+    expect(filteredModel[0]?.agentId).toBe(agentA);
   });
 });

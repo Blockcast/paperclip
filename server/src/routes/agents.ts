@@ -70,7 +70,7 @@ import {
   syncInstructionsBundleConfigFromFilePath,
   workspaceOperationService,
 } from "../services/index.js";
-import { conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { assertBoard, assertCompanyAccess, assertInstanceAdmin, boardActorIsTranscriptOperator, decideRunTranscriptRead, getAccessibleResource, getActorInfo, hasCompanyAccess, runTranscriptReadGate } from "./authz.js";
 import type { RunTranscriptReadOutcome } from "./authz.js";
 import {
@@ -321,6 +321,32 @@ function readRunIssueId(context: Record<string, unknown> | null) {
   const paperclipIssue = readObject(context?.paperclipIssue);
   const nestedIssueId = paperclipIssue?.id;
   return typeof nestedIssueId === "string" && isUuidLike(nestedIssueId) ? nestedIssueId : null;
+}
+
+/**
+ * PEN-4902: `from` / `to` for `GET /companies/:companyId/heartbeat-runs`,
+ * parsed into the HALF-OPEN `[from, to)` window the service applies to
+ * `created_at`.
+ *
+ * ⚠️ `to` is EXCLUSIVE here and INCLUSIVE on `/costs/*` (`parseCostDateRange`,
+ * `routes/costs.ts`). That is deliberate — see `heartbeatRunWindowPredicate`
+ * for why — but it is exactly the kind of same-name-different-meaning split
+ * that gets carried between endpoints by a caller who learned one of them, so
+ * it is stated in the OpenAPI summary too.
+ *
+ * A value that does not parse is a 400. The alternative — the status quo —
+ * was to ignore it and answer with the newest rows in the company, which a
+ * caller cannot tell apart from a correct answer.
+ */
+function parseRunCreatedAtWindow(query: Record<string, unknown>): { from?: Date; to?: Date } {
+  const read = (key: "from" | "to") => {
+    const raw = Array.isArray(query[key]) ? (query[key] as unknown[])[0] : query[key];
+    if (raw === undefined || raw === null || raw === "") return undefined;
+    const parsed = new Date(String(raw));
+    if (Number.isNaN(parsed.getTime())) throw badRequest(`invalid '${key}' date`);
+    return parsed;
+  };
+  return { from: read("from"), to: read("to") };
 }
 
 export function agentRoutes(
@@ -5126,10 +5152,20 @@ export function agentRoutes(
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
     const agentId = req.query.agentId as string | undefined;
+    // PEN-4902: `from` / `to` / `countOnly` used to be accepted and dropped on
+    // the floor. A caller date-ranging runs got a 200, a plausible shape, and
+    // the newest rows in the company under a window label — the answer looked
+    // like data, so nothing re-checked it. Honoured here; unparseable is now a
+    // 400 rather than a silent unbounded read.
+    const createdAtWindow = parseRunCreatedAtWindow(req.query);
     const limitParam = req.query.limit as string | undefined;
     const limit = limitParam ? Math.max(1, Math.min(1000, parseInt(limitParam, 10) || 200)) : undefined;
     const summary = req.query.summary === "true" || req.query.summary === "1";
-    const runs = await heartbeat.list(companyId, agentId, limit, { summary });
+    if (req.query.countOnly === "true" || req.query.countOnly === "1") {
+      res.json({ count: await heartbeat.countRuns(companyId, agentId, createdAtWindow) });
+      return;
+    }
+    const runs = await heartbeat.list(companyId, agentId, limit, { summary, ...createdAtWindow });
     // PEN-3149 ruling, folded into PEN-3142. This is the bulk feed: without
     // it, narrowing the per-run `/log` body would be decorative, since the
     // same prose leaves here for every run in the company at once via the
