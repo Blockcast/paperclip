@@ -138,6 +138,20 @@ const MAX_RETAINED_CLAIM_EVIDENCE = 20;
  * different subtrees would then exclude each other for no reason. A `.git`
  * FILE is followed, because that is a linked worktree or a submodule and its
  * gitdir is per-worktree -- exactly the granularity this wants.
+ *
+ * PRECONDITION FOR CALLERS, raised by Ally on PR #3334: take the claim only
+ * once the directory's final shape exists -- after the clone or worktree is
+ * materialised, not before. This resolver is intentionally stateless and
+ * re-reads the layout on every call, so a directory claimed at its root while
+ * it is still plain, and then turned into a checkout (`git init`, a clone into
+ * it), moves its OWN claim lookup to `<dir>/.git/`. The next run then reads
+ * `available` with the original root claim still sitting there -- PEN-5352
+ * again, with the guard installed. `releaseWorkspaceDirClaim` resolves the
+ * same way, so such a claim is also unreleasable by the run that took it.
+ *
+ * The fix is ordering at the call site, not state here: a stateful resolver
+ * would have to remember a location across processes, which is the kind of
+ * durable side-state this module exists to avoid.
  */
 export async function resolveWorkspaceClaimLocation(dirPath: string): Promise<{
   claimPath: string;
@@ -557,6 +571,49 @@ async function electClaimSuccessor(input: {
 }
 
 /**
+ * After losing a takeover race, read `claimPath` once and say who actually
+ * holds it now.
+ *
+ * Ally raised this on PR #3334, and it matters more than its size suggests:
+ * the scenario `electClaimSuccessor` elects between is several runs of ONE
+ * SEAT waking onto one orphaned claim, so the loser of that election is
+ * usually a SIBLING of the winner. Reporting the dead owner's claim as
+ * `indeterminate` hands that run "refusing rather than assuming it is dead"
+ * and leaves the `sibling_run` text -- the ListAgents blind-spot warning,
+ * which is the half of PEN-5352 that actually cost the money -- unreachable on
+ * the one path most likely to need it.
+ *
+ * Diagnosis only. Nothing here removes, breaks or retries anything, and a
+ * verdict is returned ONLY when the re-read is conclusive: a live foreign
+ * owner. Everything else -- path now empty, unreadable, unparseable, liveness
+ * unknown, or a new owner that is itself terminal -- returns null so the
+ * caller keeps `indeterminate`, which is the honest verdict for each of them.
+ * In particular a second terminal owner is NOT taken over here: breaking a
+ * second claim on the strength of a verdict about the first is the posture the
+ * retry loop already refuses.
+ */
+async function classifySettledClaimAfterLostRace(input: {
+  claimPath: string;
+  self: WorkspaceDirClaimIdentity;
+  readOwnerLiveness: (runId: string) => Promise<ClaimOwnerLiveness>;
+}): Promise<WorkspaceDirClaimVerdict | null> {
+  const raw = await fs.readFile(input.claimPath, "utf8").catch(() => null);
+  if (raw === null) return null;
+
+  const claim = parseWorkspaceDirClaim(raw);
+  // Our own claim here would mean we both lost the election and hold the path.
+  // That is not a state we can explain, and `self` is a PERMITTING verdict, so
+  // returning it would turn a refusal into a silent acquire. Fall through.
+  if (!claim || claim.runId === input.self.runId) return null;
+
+  const liveness = await input.readOwnerLiveness(claim.runId).catch(() => "unknown" as const);
+  if (liveness !== "live") return null;
+
+  const verdict = classifyWorkspaceDirClaim({ rawClaim: raw, self: input.self, ownerLiveness: liveness });
+  return verdict.kind === "sibling_run" || verdict.kind === "other_agent" ? verdict : null;
+}
+
+/**
  * Take over a claim whose owner is KNOWN terminal, and leave the directory
  * held by exactly one run.
  *
@@ -633,7 +690,7 @@ async function takeOverDeadClaim(input: {
 
     const linked = await linkClaimExclusively(input.claimPath, input.scratchDir, input.content);
     if (linked.kind === "created") {
-      await pruneClaimEvidence(input.scratchDir);
+      await pruneClaimEvidence(input.scratchDir, input.readOwnerLiveness);
       return { kind: "acquired" };
     }
     if (linked.kind === "exists") {
@@ -656,13 +713,33 @@ async function takeOverDeadClaim(input: {
  * unbounded set is a slow leak on a mount every agent pod shares.
  *
  * Best-effort and never fatal -- failing to prune must not fail a takeover
- * that otherwise succeeded. Only `released` files are eligible: a `breaking`
- * file may be another run's break in flight, and it holds the only copy of
- * that run's claim while it is there.
+ * that otherwise succeeded.
+ *
+ * Two kinds of file are eligible, on two different rules.
+ *
+ * `released` evidence is pruned oldest-first past a cap. It is inert: a copy
+ * of a claim whose owner was positively terminal when it was taken.
+ *
+ * `successor` election tokens are pruned ONLY when their holder is itself
+ * positively terminal, and never on age. A live token is the election -- it is
+ * what stops two breakers removing one claim -- so pruning one on age would
+ * reintroduce the two-winner race this module measured. Ally raised the leak
+ * on PR #3334: a successor that dies between its `rm` and its `link` strands
+ * its token permanently, because the token is keyed on the digest of bytes
+ * that no longer exist anywhere and so can never be recomputed by a later
+ * run. The same holds for a dead gen-N token once gen-N+1 has succeeded,
+ * since `finally` removes only the caller's own token. Harmless but unbounded
+ * on a parent every agent pod shares, and a positive terminal determination
+ * is exactly the evidence the rest of this module already requires before it
+ * removes anything anyone else created.
  */
-async function pruneClaimEvidence(scratchDir: string): Promise<void> {
+async function pruneClaimEvidence(
+  scratchDir: string,
+  readOwnerLiveness?: (runId: string) => Promise<ClaimOwnerLiveness>,
+): Promise<void> {
   const names = await fs.readdir(scratchDir).catch(() => null);
   if (!names) return;
+  if (readOwnerLiveness) await pruneDeadSuccessorTokens(scratchDir, names, readOwnerLiveness);
   const evidence = names.filter(
     (name) => name.startsWith(CLAIM_EVIDENCE_PREFIX) && name.endsWith(".json"),
   );
@@ -678,6 +755,45 @@ async function pruneClaimEvidence(scratchDir: string): Promise<void> {
     dated
       .slice(MAX_RETAINED_CLAIM_EVIDENCE)
       .map(({ name }) => fs.rm(path.join(scratchDir, name), { force: true }).catch(() => {})),
+  );
+}
+
+/**
+ * Remove election tokens whose holder is positively terminal.
+ *
+ * Deliberately NOT age-based. The only safe statement about a successor token
+ * is the one the module makes everywhere else: the run named inside it has
+ * finished. `unknown` leaves the token alone, which is the same fail-closed
+ * posture `classifyWorkspaceDirClaim` takes -- a token we cannot attribute is
+ * a token we must assume is live.
+ */
+async function pruneDeadSuccessorTokens(
+  scratchDir: string,
+  names: string[],
+  readOwnerLiveness: (runId: string) => Promise<ClaimOwnerLiveness>,
+): Promise<void> {
+  const tokens = names.filter(
+    (name) => name.startsWith(CLAIM_SUCCESSOR_PREFIX) && name.endsWith(".json"),
+  );
+  if (tokens.length === 0) return;
+  await Promise.all(
+    tokens.map(async (name) => {
+      const tokenPath = path.join(scratchDir, name);
+      const raw = await fs.readFile(tokenPath, "utf8").catch(() => null);
+      if (raw === null) return;
+      let holder: string | null = null;
+      try {
+        const runId = (JSON.parse(raw) as { runId?: unknown } | null)?.runId;
+        holder = typeof runId === "string" && runId.trim() ? runId : null;
+      } catch {
+        holder = null;
+      }
+      // Unparseable is not evidence of death. Leave it.
+      if (!holder) return;
+      const liveness = await readOwnerLiveness(holder).catch(() => "unknown" as const);
+      if (liveness !== "terminal") return;
+      await fs.rm(tokenPath, { force: true }).catch(() => {});
+    }),
   );
 }
 
@@ -793,7 +909,21 @@ export async function acquireWorkspaceDirClaim(input: {
       }
       // Every refusal here is a race we lost or a claim that moved under us.
       // None of them permits a retry: the verdict we are holding is about a
-      // claim that is no longer the one at the path.
+      // claim that is no longer the one at the path. But we can still say WHO
+      // is there now, and on this path that is usually a sibling run of our
+      // own seat -- see `classifySettledClaimAfterLostRace`.
+      const settled = await classifySettledClaimAfterLostRace({
+        claimPath,
+        self: input.self,
+        readOwnerLiveness: input.readOwnerLiveness,
+      });
+      if (settled) {
+        return {
+          acquired: false,
+          verdict: settled,
+          refusal: describeWorkspaceDirClaimRefusal(settled, input.dirPath),
+        };
+      }
       const failed: WorkspaceDirClaimVerdict = {
         kind: "indeterminate",
         reason: taken.reason,

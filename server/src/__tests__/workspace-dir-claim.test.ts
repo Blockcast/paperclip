@@ -618,6 +618,129 @@ describe("acquireWorkspaceDirClaim", () => {
     ).toBe(DEAD_RUN);
   });
 
+  /**
+   * The loser of the election is, in the scenario this module was built for,
+   * usually a SIBLING of the winner: several runs of one seat waking onto one
+   * orphaned claim. Reporting the dead owner as "unresolved" would hand that
+   * run the one message that does not carry the ListAgents warning -- the
+   * expensive half of PEN-5352 -- on the path most likely to need it.
+   */
+  it("names the sibling that won the takeover race instead of reporting it unresolved", async () => {
+    const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
+    const raw = claimOf(DEAD_RUN, OTHER_AGENT);
+    const claimFile = path.join(dirA, WORKSPACE_CLAIM_FILENAME);
+    await fs.writeFile(claimFile, raw);
+    await fs.writeFile(
+      successorTokenPath(path.dirname(dirA), raw),
+      `${JSON.stringify({ runId: RUN_B, deadRunId: DEAD_RUN, generation: 0 })}\n`,
+    );
+
+    const outcome = await acquireWorkspaceDirClaim({
+      dirPath: dirA,
+      self: identity(),
+      readOwnerLiveness: async (runId) => {
+        if (runId !== RUN_B) return "terminal";
+        // RUN_B holds the election, and by the time we lose it, it has
+        // finished the takeover: its own claim is at the path now. Same seat
+        // as us, which is the restart case the election exists to resolve.
+        await fs.writeFile(claimFile, claimOf(RUN_B, AGENT));
+        return "live";
+      },
+    });
+
+    expect(outcome.acquired).toBe(false);
+    expect(outcome.verdict.kind).toBe("sibling_run");
+    expect(outcome.refusal).toContain(RUN_B);
+    expect(outcome.refusal).toContain("ListAgents");
+    expect(outcome.refusal).toContain("issue thread");
+  });
+
+  it("stays indeterminate when the lost race leaves nothing conclusive at the path", async () => {
+    const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
+    const raw = claimOf(DEAD_RUN, OTHER_AGENT);
+    const claimFile = path.join(dirA, WORKSPACE_CLAIM_FILENAME);
+    await fs.writeFile(claimFile, raw);
+    await fs.writeFile(
+      successorTokenPath(path.dirname(dirA), raw),
+      `${JSON.stringify({ runId: RUN_B, deadRunId: DEAD_RUN, generation: 0 })}\n`,
+    );
+
+    const outcome = await acquireWorkspaceDirClaim({
+      dirPath: dirA,
+      self: identity(),
+      readOwnerLiveness: async (runId) => {
+        if (runId !== RUN_B) return "terminal";
+        // The winner has removed the dead claim but not yet linked its own.
+        await fs.rm(claimFile, { force: true });
+        return "live";
+      },
+    });
+
+    // Still a refusal, and still an honest one: we know we lost, and we
+    // cannot say to whom. It must never read as `available`.
+    expect(outcome.acquired).toBe(false);
+    expect(outcome.verdict.kind).toBe("indeterminate");
+    expect(outcome.refusal).not.toBeNull();
+  });
+
+  it("does not take over a second claim it merely happened to find on the re-read", async () => {
+    const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
+    const SECOND_DEAD = "00000000-dea2-dea2-dea2-000000000000";
+    const raw = claimOf(DEAD_RUN, OTHER_AGENT);
+    const claimFile = path.join(dirA, WORKSPACE_CLAIM_FILENAME);
+    await fs.writeFile(claimFile, raw);
+    await fs.writeFile(
+      successorTokenPath(path.dirname(dirA), raw),
+      `${JSON.stringify({ runId: RUN_B, deadRunId: DEAD_RUN, generation: 0 })}\n`,
+    );
+
+    const outcome = await acquireWorkspaceDirClaim({
+      dirPath: dirA,
+      self: identity(),
+      readOwnerLiveness: async (runId) => {
+        if (runId !== RUN_B) return "terminal";
+        await fs.writeFile(claimFile, claimOf(SECOND_DEAD, OTHER_AGENT));
+        return "live";
+      },
+    });
+
+    // The re-read is diagnosis only. A second terminal owner is reported, not
+    // broken: breaking it would be acting on a verdict about a different claim.
+    expect(outcome.acquired).toBe(false);
+    expect(outcome.verdict.kind).toBe("indeterminate");
+    expect(
+      parseWorkspaceDirClaim(await fs.readFile(claimFile, "utf8"))?.runId,
+    ).toBe(SECOND_DEAD);
+  });
+
+  it("reaps an election token whose holder is positively terminal, and leaves a live one", async () => {
+    const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
+    const STRANDED = "00000000-str1-str1-str1-000000000000";
+    const LIVE_ELSEWHERE = "00000000-1ive-1ive-1ive-000000000000";
+    const scratch = path.dirname(dirA);
+    const raw = claimOf(DEAD_RUN, OTHER_AGENT);
+    await fs.writeFile(path.join(dirA, WORKSPACE_CLAIM_FILENAME), raw);
+
+    // Two tokens from OTHER claims, stranded on the shared parent. Neither is
+    // keyed on bytes this acquire will ever recompute.
+    const strandedToken = path.join(scratch, ".dir-claim-successor-aaaa1111.json");
+    const liveToken = path.join(scratch, ".dir-claim-successor-bbbb2222.json");
+    await fs.writeFile(strandedToken, `${JSON.stringify({ runId: STRANDED, generation: 0 })}\n`);
+    await fs.writeFile(liveToken, `${JSON.stringify({ runId: LIVE_ELSEWHERE, generation: 0 })}\n`);
+
+    const outcome = await acquireWorkspaceDirClaim({
+      dirPath: dirA,
+      self: identity(),
+      readOwnerLiveness: async (runId) => (runId === LIVE_ELSEWHERE ? "live" : "terminal"),
+    });
+    expect(outcome.acquired).toBe(true);
+
+    // The dead holder's token is gone; the live holder's election is intact,
+    // because removing it would reintroduce the two-winner race.
+    await expect(fs.stat(strandedToken)).rejects.toThrow();
+    expect(await fs.readFile(liveToken, "utf8")).toContain(LIVE_ELSEWHERE);
+  });
+
   it("inherits the takeover when the elected successor itself died part-way", async () => {
     const DEAD_RUN = "00000000-dead-dead-dead-000000000000";
     const DEAD_SUCCESSOR = "00000000-gone-gone-gone-000000000000";
