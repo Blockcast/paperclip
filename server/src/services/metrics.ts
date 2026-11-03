@@ -100,6 +100,27 @@ export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_
  * agent row is loaded (those are not per-agent facts and must not look like it).
  */
 export const AGENT_DISPATCH_DECLINED_METRIC = "paperclip_agent_dispatch_declined_total";
+/**
+ * Per-candidate claim refusals inside a dispatch pass, labeled by bounded
+ * agent_id and the named {@link QueuedRunClaimRefusalArm} that refused.
+ *
+ * PEN-5316. {@link AGENT_DISPATCH_DECLINED_METRIC}'s `no_claimable_run` says a
+ * pass ranked candidates and claimed none; it carries a reason but no subject,
+ * so it cannot be joined against
+ * `paperclip_queued_run_oldest_claimable_age_seconds`, which screens on
+ * `isDispatchRankReady` and says a ready run HAS been waiting. Both series read
+ * positive simultaneously for 27-31% of an 8h window on the two busiest seats,
+ * and exactly one of them is wrong. This counter is the join: one increment per
+ * candidate refused, naming the arm, so the gauge's claim and the dispatcher's
+ * claim can be compared on the same population instead of inferred from two
+ * unlinked totals.
+ *
+ * This is the pass-level sibling of `no_claimable_run`, not a replacement: a
+ * pass increments this once per CANDIDATE and `no_claimable_run` once per PASS,
+ * so this one's rate runs higher by the candidate count and the two must never
+ * be summed together.
+ */
+export const QUEUED_RUN_CLAIM_REFUSED_METRIC = "paperclip_queued_run_claim_refused_total";
 // BLO-23379: routine dispatch bypassed a long-parked execution issue instead of
 // letting it gate the fire. Non-zero means a quota/capacity park was overridden;
 // zero while a routine is quiet means it is genuinely gated on in-flight work.
@@ -5065,6 +5086,98 @@ export function normalizeDispatchDeclineReason(reason: string | null | undefined
 }
 
 /**
+ * Bounded `arm` allow-list for {@link QUEUED_RUN_CLAIM_REFUSED_METRIC} — one
+ * entry per `return null` in `claimQueuedRun`, named after the screen that
+ * produced it (PEN-5316).
+ *
+ * Named arms rather than a single "refused" because the fork this metric exists
+ * to settle turns entirely on WHICH screen fired. The arms split into two
+ * populations, and the split is the answer:
+ *
+ *   - Arms `isDispatchRankReady` ALSO applies (`admission_deferred`,
+ *     `dependency_blocked`) mean the two predicates agree and the disagreement
+ *     is elsewhere — a refresh-window race, not a drift.
+ *   - Arms it does NOT apply (`pause_hold`, `stale_issue`,
+ *     `pr_review_task_held`, the budget and cap arms) mean a row the gauge is
+ *     aging as dispatch wait is one the claim path will never take. Those are
+ *     the gauge over-reporting, which is fork (a).
+ *   - `claim_cas_lost` and `external_lifecycle_claim_refused` mean the row WAS
+ *     claimable and the pass lost a race for it. Those are fork (b).
+ *
+ * A single undifferentiated counter cannot tell those three apart, which is why
+ * `no_claimable_run`'s bare reason has left the question open since PEN-3948.
+ */
+export const KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS = [
+  /** The agent row vanished between the queue read and the claim. Run cancelled. */
+  "agent_missing",
+  /** Paused, terminated, pending approval, or an invalid chain. Run cancelled. */
+  "agent_not_invokable",
+  /**
+   * A k8s-isolation or branch-claim retry stamp is still in the future.
+   * `isDispatchRankReady` screens this too, so the gauge should already have
+   * excluded the row — a non-zero rate here is the refresh-window race, since
+   * the two sides evaluate the same stamp at different instants.
+   */
+  "admission_deferred",
+  /** A budget invocation block. Run cancelled. */
+  "budget_blocked",
+  /** A heartbeat daily run/cost cap. Run cancelled. */
+  "daily_cap",
+  /** The context issue id is not a UUID. Run cancelled. */
+  "unparseable_issue_id",
+  /**
+   * An active pause hold covers the issue. NOT screened by
+   * `isDispatchRankReady`, and the run stays `queued` — so this arm recurs every
+   * tick while the gauge keeps aging the row as dispatch wait.
+   */
+  "pause_hold",
+  /** Unresolved dependency blockers. Screened by `isDispatchRankReady` too. */
+  "dependency_blocked",
+  /**
+   * The issue went terminal (or vanished) under the run. Deliberately NOT part
+   * of `isDispatchRankReady` — see that function's comment — so this arm is a
+   * known, intended divergence between the two predicates.
+   */
+  "stale_issue",
+  /** Another run already holds this PR-review task key. Row stays `queued`. */
+  "pr_review_task_held",
+  /**
+   * The external-lifecycle slot pool refused the claim (pool full, or the task
+   * key is held). Row stays `queued`; the work was claimable and the pass lost.
+   */
+  "external_lifecycle_claim_refused",
+  /**
+   * The `status = 'queued'` compare-and-set matched no row: a concurrent pass
+   * or replica claimed it first. The work was claimable — by someone else.
+   */
+  "claim_cas_lost",
+  /** A routine execution lock is already held by another issue. Run cancelled. */
+  "duplicate_routine_execution",
+  /**
+   * The row WAS claimed, then the issue execution lock could not be taken (its
+   * status, actor or execution-run condition failed, or the row moved under the
+   * transaction) and the run was cancelled. Post-claim, so it is neither a
+   * gauge over-report nor a lost race — it is work that was dispatchable right
+   * up to the lock and then was not.
+   */
+  "issue_execution_lock_unavailable",
+] as const;
+
+export const UNKNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARM = "other";
+
+const knownQueuedRunClaimRefusalArmSet: ReadonlySet<string> = new Set(
+  KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS,
+);
+
+export type QueuedRunClaimRefusalArm = (typeof KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS)[number];
+
+export function normalizeQueuedRunClaimRefusalArm(arm: string | null | undefined): string {
+  return typeof arm === "string" && knownQueuedRunClaimRefusalArmSet.has(arm)
+    ? arm
+    : UNKNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARM;
+}
+
+/**
  * Bounded `invocation_source` allow-list for `paperclip_heartbeat_run_failed_total`.
  * Anything outside this set collapses to "other".
  */
@@ -5392,6 +5505,7 @@ export const AGENT_ERROR_REASON_OLDEST_AGE_METRIC =
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let agentDispatchDeclined: Counter<"agent_id" | "reason"> | null = null;
+let queuedRunClaimRefused: Counter<"agent_id" | "arm"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
 type HeartbeatRunFailedLabel =
   | "agent_id"
@@ -5634,6 +5748,7 @@ function ensureRegistry(): {
   registry: Registry;
   counter: Counter<"agent_id" | "reason" | "isolation_mode">;
   dispatchDeclinedCounter: Counter<"agent_id" | "reason">;
+  queuedRunClaimRefusedCounter: Counter<"agent_id" | "arm">;
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
@@ -5801,6 +5916,7 @@ function ensureRegistry(): {
     !registry
     || !concurrentRunBlocked
     || !agentDispatchDeclined
+    || !queuedRunClaimRefused
     || !isolatedRunStarted
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
@@ -6012,6 +6128,29 @@ function ensureRegistry(): {
         + "dispatch kick lands here, leaving the run for the worker tick "
         + "(heartbeatSchedulerIntervalMs, default 30s) to claim.",
       labelNames: ["agent_id", "reason"],
+      registers: [registry],
+    });
+    queuedRunClaimRefused = new Counter({
+      name: QUEUED_RUN_CLAIM_REFUSED_METRIC,
+      help:
+        "Count of individual queued runs a dispatch pass tried and failed to claim, "
+        + "labeled by bounded agent_id and the named claimQueuedRun arm that refused "
+        + "(PEN-5316). Incremented once per CANDIDATE, where "
+        + AGENT_DISPATCH_DECLINED_METRIC + "{reason=\"no_claimable_run\"} is incremented "
+        + "once per PASS — so this series runs higher by the candidate count and the two "
+        + "must never be summed. Read it against "
+        + "paperclip_queued_run_oldest_claimable_age_seconds, whose screen is "
+        + "isDispatchRankReady: that gauge and no_claimable_run both read positive on the "
+        + "same seat for 27-31% of an 8h window, and the arm label is what says which of "
+        + "them is wrong. Arms isDispatchRankReady does NOT apply (pause_hold, "
+        + "stale_issue, pr_review_task_held, budget_blocked, daily_cap) mean the GAUGE is "
+        + "over-reporting — it is aging a row the claim path will never take. "
+        + "claim_cas_lost and external_lifecycle_claim_refused mean the row was genuinely "
+        + "claimable and this pass lost a race, which is a real capacity leak. "
+        + "admission_deferred and dependency_blocked are screened by BOTH predicates, so "
+        + "a rate there is a refresh-window race rather than a drift between them. The "
+        + "run id is on the structured log line, not a label, to keep cardinality bounded.",
+      labelNames: ["agent_id", "arm"],
       registers: [registry],
     });
     isolatedRunStarted = new Counter({
@@ -8757,6 +8896,7 @@ function ensureRegistry(): {
     registry,
     counter: concurrentRunBlocked,
     dispatchDeclinedCounter: agentDispatchDeclined,
+    queuedRunClaimRefusedCounter: queuedRunClaimRefused,
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
@@ -8984,6 +9124,29 @@ export function recordAgentDispatchDeclined(
     reason: normalizeDispatchDeclineReason(input.reason),
   };
   ensureRegistry().dispatchDeclinedCounter.inc(labels);
+  return labels;
+}
+
+export interface RecordQueuedRunClaimRefusedInput {
+  agentId: string | null | undefined;
+  arm: string | null | undefined;
+  /** Active company agent roster used to bound the `agent_id` label. */
+  knownAgentIds: ReadonlySet<string>;
+}
+
+/**
+ * Increment {@link QUEUED_RUN_CLAIM_REFUSED_METRIC}. Call once per candidate run
+ * that `claimQueuedRun` refused, at the pass that tried it.
+ * Returns the normalized labels emitted (useful for logging/tests).
+ */
+export function recordQueuedRunClaimRefused(
+  input: RecordQueuedRunClaimRefusedInput,
+): { agent_id: string; arm: string } {
+  const labels = {
+    agent_id: normalizeAgentId(input.agentId, input.knownAgentIds),
+    arm: normalizeQueuedRunClaimRefusalArm(input.arm),
+  };
+  ensureRegistry().queuedRunClaimRefusedCounter.inc(labels);
   return labels;
 }
 
