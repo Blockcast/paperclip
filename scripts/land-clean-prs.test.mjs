@@ -305,6 +305,17 @@ describe("per-fire cap", () => {
     assert.equal(rows.length, prs.length, "every PR gets exactly one row");
   });
 
+  it("spends the cap on the OLDEST PRs, not the newest listed first (BLO-51664)", () => {
+    // `gh pr list` is newest-first; allocating in that order starved the
+    // oldest landable PRs on every fire.
+    const rows = classifyAll([pr({ number: 3339 }), pr({ number: 3311 }), pr({ number: 3281 })], {
+      now: NOW,
+      maxEnqueues: 2,
+    });
+    assert.deepEqual(rows.map((r) => r.action), ["skip", "enqueue", "enqueue"]);
+    assert.equal(rows[0].reason, "cap:2-per-fire");
+  });
+
   it("does not spend cap on PRs that were not enqueueable anyway", () => {
     const rows = classifyAll([pr({ number: 1, mergeStateStatus: "DIRTY" }), pr({ number: 2 })], {
       now: NOW,
