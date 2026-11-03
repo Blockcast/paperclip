@@ -595,6 +595,53 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 
 The review gate also publishes a `ci/ally-head-attested` check-run on every PR. It is a schedule signal for heavy CI (`success` when an Ally comment attests this exact head and nothing blocks it, even where `gate/ally-comment-findings` is deliberately `neutral`), not review evidence and not a finding when `neutral`. Never add it to required contexts.
 
+### "It merged" is not review evidence on `master` (PEN-5362)
+
+Measured 2026-11-03 against the live API, read-only. `master` carries exactly two rulesets
+(`repos/Blockcast/paperclip/rules/branches/master`; the repo-wide `rulesets` list confirms there are
+no others, both `active`): a `merge_queue` rule and a `required_status_checks` rule naming **one**
+context, `gate/ally-comment-findings`. **There is no `pull_request` rule**, so no approving review is
+required to merge.
+
+Classic branch protection is a separate, additive mechanism and is `403` from an agent seat, so the
+ruleset read alone cannot prove a review requirement is absent. Three independent probes do:
+
+- 16 of 43 open PRs read `mergeStateStatus: CLEAN` while carrying zero approving reviews. `CLEAN`
+  means no blocking requirement remains.
+- `reviewDecision` never reads `REVIEW_REQUIRED` on any open PR. On a repo that does require a
+  review, an unapproved PR reads exactly that.
+- 739 of the 800 agent-authored merges in the last 1000 (92.4%) landed with no approving review of
+  any kind.
+
+The one required check is fail-open **by its own description**. At #3322's head `df4ab741`:
+
+```
+gate/ally-comment-findings :: success
+  "The only comment attesting this head is the PR author's own; nothing independent reviewed it."
+```
+
+That is not a bypass. It is the gate passing, as designed, on a head nothing read — absence of an
+independent review is one of its passing states.
+
+Four consequences, each easy to get backwards:
+
+- **"It merged" and "it was enqueued" are not review evidence.** Cite `reviewDecision` and the login
+  of an approving reviewer. Never cite the merge.
+- **A red *non-required* check does not block enqueue or merge.** `ALLGREEN` grouping evaluates the
+  required checks on the merge-group ref (`gh-readonly-queue/master/pr-NNNN-…`), not every check
+  reported on the PR head. Measured: #3291 (red `e2e` **and** red `review`), #3299 and #3300 (red
+  `review`) all merged. Do not read a red non-required check as "the enqueue will no-op" — the merge
+  will happen.
+- **An approval from `allyblockcast` is not an independent read.** Of the 299 approving reviews in
+  that window, 181 are `allyblockcast` (Bot) and 54 `allyblockcast` (User) — 78.6% from the identity
+  family that authored 80% of the PRs. `githubSharesReviewerIdentity` collapses all three spellings
+  of that slug to one (see §"This PAT is a different token, not a different *reviewer-independent*
+  identity", PEN-4275). 416 of 800 agent-authored merges (52%) were authored by `allyblockcast`,
+  merged by `allyblockcast`, with no independent approval at all.
+- **Do not flip `gate/ally-comment-findings` fail-closed before a reviewer identity whose slug
+  differs from `allyblockcast` exists** (PEN-4275). Today nothing could clear it, so the flip would
+  block every agent PR rather than cause one to be reviewed. The ordering is load-bearing.
+
 ### Never enqueue a PR whose head has just moved (PEN-4887)
 
 Landing a **stacked child** PR replaces its parent's head with the merge commit. Every check on the
