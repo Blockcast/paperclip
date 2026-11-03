@@ -29,6 +29,7 @@
 import { describe, expect, it } from "vitest";
 import { ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES } from "../services/recovery/zero-token-startup-failure.js";
 import {
+  countsTowardAdapterFailedCircuitBreaker,
   JOB_FAILED_EQUIVALENT_ERROR_CODES,
   RECOVERABLE_AGENT_STATUS_ERROR_CODES,
   readHeartbeatRunErrorFamily,
@@ -429,5 +430,60 @@ describe("BLO-45251: a pr_review 429 park retries once no review exists at head"
     const run = { errorCode: "job_failed", resultJson, contextSnapshot };
     expect(shouldScheduleAutomaticRunRetry(run)).toBe(false);
     expect(readPrReviewProviderCapacityRefusalRetryNotBefore(run)).toBeNull();
+  });
+});
+
+
+// PEN-5424 — `run_log_unwritable` is the same shape of rename as BLO-35668's:
+// one new code REPLACING `adapter_failed` at one emit site (`executeRun`, when
+// the run log cannot be opened). That post-mortem's lesson is that the enrolment
+// sites a test cannot reach are the ones a rename drifts at, so the two reachable
+// ones are pinned here, by COMPARISON against `adapter_failed` rather than a
+// literal `true` — if that code is ever removed from a set, this one should
+// follow it out rather than fail.
+describe("PEN-5424: run_log_unwritable is enrolled where adapter_failed is", () => {
+  // The site Ally raised as Important, and the one with teeth: the breaker
+  // counter is RESET by any code that is not counted, so a rename that stops
+  // short here does not merely fail to enrol — it disarms the control. A
+  // run-log permission fault does not heal on its own and the run is not
+  // retried, so without this every timer tick spawns another doomed run.
+  it("counts toward the crashloop circuit breaker", () => {
+    expect(countsTowardAdapterFailedCircuitBreaker("run_log_unwritable")).toBe(
+      countsTowardAdapterFailedCircuitBreaker("adapter_failed"),
+    );
+  });
+
+  it("does not count an unrelated terminal code toward the breaker", () => {
+    // The negative control: without it the assertion above passes vacuously the
+    // day the predicate is widened to return true for everything.
+    expect(countsTowardAdapterFailedCircuitBreaker("succeeded")).toBe(false);
+    expect(countsTowardAdapterFailedCircuitBreaker("job_failed")).toBe(false);
+    expect(countsTowardAdapterFailedCircuitBreaker(null)).toBe(false);
+    expect(countsTowardAdapterFailedCircuitBreaker(undefined)).toBe(false);
+  });
+
+  // The routing site. Without membership, an issue stranded by an unwritable
+  // run-log root is billed to the assignee and sent UP the manager ladder for a
+  // storage fault they had no part in — the BLO-20933 hazard the set exists for,
+  // and the exact failure BLO-35668 recorded for the previous rename.
+  it("is routed infra-class wherever adapter_failed is", () => {
+    expect(ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has("run_log_unwritable")).toBe(
+      ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES.has("adapter_failed"),
+    );
+  });
+
+  // The deliberate NON-enrolment, asserted so the divergence is a decision on
+  // the record rather than a second drift. Retrying re-attempts an identical
+  // mkdir against an identical root: the attempts buy nothing and the run ends
+  // in the same place later. Infra-class ROUTING and RETRYABILITY are separate
+  // questions, and this code answers them differently on purpose.
+  it("is not retried, unlike adapter_failed", () => {
+    expect(
+      shouldScheduleAutomaticRunRetry({
+        errorCode: "run_log_unwritable",
+        resultJson: null,
+        contextSnapshot: { reviewKind: "pr_review" },
+      }),
+    ).toBe(false);
   });
 });

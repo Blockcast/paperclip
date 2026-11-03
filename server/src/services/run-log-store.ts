@@ -121,18 +121,36 @@ export function isRunLogUnwritableError(error: unknown): boolean {
   return Boolean(error) && typeof error === "object" && RUN_LOG_UNWRITABLE_BRAND in (error as object);
 }
 
-function describeRunLogWriteFailure(err: unknown, target: string, basePath: string): unknown {
+function describeRunLogWriteFailure(
+  err: unknown,
+  target: string,
+  basePath: string,
+  basePathOrigin: string | undefined,
+): unknown {
   const code = (err as NodeJS.ErrnoException | null)?.code;
   if (!code || !RUN_LOG_PERMISSION_ERRNOS.has(code)) return err;
   // `process.getuid` is undefined on Windows; the uid is the single most useful
   // fact here, so report it when the platform has one and say nothing when not.
   const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
   const who = uid === undefined ? "this process" : `uid ${uid}`;
+  // "cannot write to the path" rather than "does not own the path": ownership is
+  // only one of the three ways to get here. EROFS says nothing about ownership
+  // at all, and an EACCES can land on a path the uid DOES own whose mode bits
+  // deny the write. The inaccurate half would send the reader to `chown` for a
+  // fault `chown` cannot fix.
   const detail =
-    `Run log store cannot write ${target} (${code}): ${who} does not own the path. ` +
+    `Run log store could not open ${target} for writing (${code}): ${who} cannot write to the path. ` +
     `The run-log root is ${basePath}` +
-    (process.env.RUN_LOG_BASE_PATH ? " (from RUN_LOG_BASE_PATH)." : " (derived from PAPERCLIP_HOME).") +
-    " Set RUN_LOG_BASE_PATH to a directory this process owns, or fix ownership of the root." +
+    // Provenance is passed in by whoever CHOSE the base path, not read back out
+    // of the environment: a store constructed with an explicit `basePath` (every
+    // test, and any caller that is not `getRunLogStore`) would otherwise be
+    // labelled with whatever RUN_LOG_BASE_PATH happens to hold, which may name a
+    // directory this store never used. This message exists to stop a
+    // misdiagnosis, so it says nothing rather than something it cannot support.
+    (basePathOrigin ? ` (${basePathOrigin})` : "") + "." +
+    // Remedy phrased as write ACCESS rather than ownership, for the same reason
+    // as the clause above: `chown` does not fix an EROFS or a denying mode bit.
+    " Set RUN_LOG_BASE_PATH to a directory this process can write, or fix permissions on the root." +
     " This is a storage-permission fault, not a run-scheduling fault.";
   const wrapped = new Error(detail, { cause: err });
   // Keep the errno readable by callers that branch on it (ENOENT fallbacks and
@@ -149,6 +167,11 @@ function normalizeKeyPrefix(prefix: string | undefined): string {
 
 export interface DurableRunLogStoreOptions {
   basePath: string;
+  // Human-readable provenance for `basePath`, used ONLY in the permission-failure
+  // message (e.g. "from RUN_LOG_BASE_PATH"). Supplied by the caller that chose
+  // the path; omitted when nobody can vouch for where it came from, in which
+  // case the message simply does not claim one.
+  basePathOrigin?: string;
   // When provided, completed logs are mirrored to object storage on finalize and
   // served from there on read whenever the local file is missing (e.g. the pod
   // rolled and wiped the emptyDir). When omitted, the store is local-only (the
@@ -166,7 +189,7 @@ export interface DurableRunLogStoreOptions {
 // emptyDir in cloud_tenant mode -- persistence is disabled to avoid the
 // operator's privileged selinux-relabel init container in our hardened ns).
 export function createDurableRunLogStore(options: DurableRunLogStoreOptions): RunLogStore {
-  const { basePath } = options;
+  const { basePath, basePathOrigin } = options;
   const s3 = options.s3;
   const s3Prefix = normalizeKeyPrefix(s3?.keyPrefix);
 
@@ -179,7 +202,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
     try {
       await fs.mkdir(dir, { recursive: true });
     } catch (err) {
-      throw describeRunLogWriteFailure(err, dir, basePath);
+      throw describeRunLogWriteFailure(err, dir, basePath, basePathOrigin);
     }
   }
 
@@ -267,7 +290,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
       } catch (err) {
         // The other half of "open the log": the directory can be present and
         // traversable while the file itself is not creatable.
-        throw describeRunLogWriteFailure(err, absPath, basePath);
+        throw describeRunLogWriteFailure(err, absPath, basePath, basePathOrigin);
       }
       return { store: "local_file", logRef: relPath };
     },
@@ -362,7 +385,11 @@ let cachedStore: RunLogStore | null = null;
 
 export function getRunLogStore() {
   if (cachedStore) return cachedStore;
-  const basePath = process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
-  cachedStore = createDurableRunLogStore({ basePath, s3: resolveRunLogS3() });
+  const overridden = process.env.RUN_LOG_BASE_PATH;
+  const basePath = overridden ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
+  // This is the one caller that KNOWS which branch the path came from, so it is
+  // the one that gets to say so.
+  const basePathOrigin = overridden ? "from RUN_LOG_BASE_PATH" : "derived from PAPERCLIP_HOME";
+  cachedStore = createDurableRunLogStore({ basePath, basePathOrigin, s3: resolveRunLogS3() });
   return cachedStore;
 }

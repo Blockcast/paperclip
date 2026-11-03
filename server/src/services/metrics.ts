@@ -4310,6 +4310,14 @@ export const KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES = [
   CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
   "job_missing",
   "adapter_failed",
+  // PEN-5424: `run_log_unwritable` is the RENAME of the `adapter_failed` above
+  // at the `executeRun` catch site (the run log could not be opened). Listed for
+  // the same reason as `caveman_proxy_not_ready` and the entry below: these runs
+  // WERE `adapter_failed` before the relabel, so omitting it silently moves them
+  // to `other` and changes this gauge's meaning with nothing upstream having
+  // changed. A literal rather than an import of run-log-store.js, which would
+  // pull the storage provider graph into the metrics module for one string.
+  "run_log_unwritable",
   // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) is the
   // RENAME of the `adapter_failed` directly above, at the one claude-k8s emit
   // site that names a skill-source fault — so like `caveman_proxy_not_ready`
