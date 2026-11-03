@@ -1005,12 +1005,18 @@ REQUIRED=$( { gh api "repos/$R/rules/branches/$BREF?per_page=100" --paginate \
             } | sort -u) || fetch_failed required-contexts $?
 
 STATUS_ROWS=$(printf '%s' "$STATUSES" | status_extract)
+SLIST='[]'
+# `/statuses` carries creator identity. Fetch it once when either the Ally
+# authority or the empty-lane witness needs it; both consumers share it.
+if printf '%s\n' "$REQUIRED" | grep -qx 'review/ally-complete' \
+   || { [ -n "$GATED" ] && printf '%s' "$STATUSES" | grep -Eq '"ci/(dispatched|web)-lanes"'; }; then
+  SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
+fi
 # `/status` is the cheap combined view, but it deliberately omits creator.
 # Once Ally is a required context, re-read `/statuses` and use its identity-
 # carrying row for that context. Otherwise a genuine github-actions[bot]
 # verdict is indistinguishable from an untrusted writer and is rejected.
 if printf '%s\n' "$REQUIRED" | grep -qx 'review/ally-complete'; then
-  SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
   STATUS_ROWS=$(printf '%s\n' "$STATUS_ROWS" | awk -F'\t' '$1 != "review/ally-complete"')
   STATUS_ROWS=$( {
     printf '%s\n' "$STATUS_ROWS"
@@ -1021,14 +1027,8 @@ fi
   printf '%s' "$CHECKS" | extract
 } | verdicts "$DEAD" "$PENDING" "$WDEAD" "$RENAMED" "$REQUIRED"
 rc=$?
-# BLO-48830: the status LIST (it carries `creator`) costs a call, so only on a
-# gated head whose combined status names the context at all.
-SLIST='[]'
-# BLO-49045: guarded, not argued. A partial list can hold a stale success
-# witness whose withdrawing re-judge sat on the page that failed.
-if [ -n "$GATED" ] && printf '%s' "$STATUSES" | grep -Eq '"ci/(dispatched|web)-lanes"'; then
-  SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
-fi
+# BLO-48830/BLO-49045: SLIST was fetched above and is shared with the empty
+# witness; a partial list still fails closed through fetch_failed.
 EMPTY=$(printf '%s\n%s\n' "$SLIST" "$CHECKS" | empty_witness)
 printf '%s\n' "$RUNS" | gated_lanes "$H" "$GATED" "$EMPTY"
 exit $rc
