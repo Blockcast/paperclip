@@ -222,6 +222,7 @@ import {
 import {
   bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlotPool,
+  type ExternalRuntimeClaimRefusal,
   ExternalRuntimeIsolationConflictError,
   ExternalRuntimeReservationReleasePendingError,
   externalRuntimeReservationCanRelease,
@@ -2506,6 +2507,45 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "pi_local",
 ]);
 const EXTERNAL_LIFECYCLE_ADAPTERS = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
+
+/**
+ * A ranked candidate a dispatch pass could not take, and the screen that
+ * refused it (PEN-5316).
+ */
+export type QueuedRunClaimRefusalRecord = {
+  runId: string;
+  issueId: string | null;
+  arm: QueuedRunClaimRefusalArm;
+};
+
+/**
+ * Build the subject half of the `no_claimable_run` log line: the per-arm tally
+ * for the whole pass, plus the first `limit` refusals named individually.
+ *
+ * Module-level and pure so the join this PR exists to create — a refusal that
+ * carries its run id, against the claimable gauge's named subject — is
+ * testable without standing up a dispatch pass. The cap applies to the LOG
+ * only; `paperclip_queued_run_claim_refused_total` counted every refusal.
+ */
+export function summarizeQueuedRunClaimRefusals(
+  refusals: readonly QueuedRunClaimRefusalRecord[],
+  limit: number,
+) {
+  const safeLimit = Math.max(0, limit);
+  const refusalArmCounts: Record<string, number> = {};
+  for (const refusal of refusals) {
+    refusalArmCounts[refusal.arm] = (refusalArmCounts[refusal.arm] ?? 0) + 1;
+  }
+  return {
+    refusalArmCounts,
+    refusedRuns: refusals.slice(0, safeLimit).map((refusal) => ({
+      runId: refusal.runId,
+      issueId: refusal.issueId,
+      arm: refusal.arm,
+    })),
+    refusedRunsOmitted: Math.max(0, refusals.length - safeLimit),
+  };
+}
 // Fallback staleness window for external-lifecycle (k8s Job) runs when the
 // kube API is unavailable (local dev, RBAC misconfig, transient failure).
 // In-cluster the reaper uses listLiveAgentJobRunIds() to identify dead
@@ -25272,13 +25312,24 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // assignments made in a nested function — a plain `let` would stay narrowed
     // to `false` at the read site and silently collapse one arm into another.
     const claimAttempt = { prReviewTaskHeld: false };
+    // PEN-5316 (review follow-up): the same hazard, one layer out. The external
+    // pool used to collapse three outcomes into one `null`, and the two busiest
+    // seats in the filing both run `claude_k8s` — so that single arm would have
+    // swallowed the whole population this PR exists to separate. A holder for
+    // the same flow-analysis reason as `claimAttempt`.
+    const externalRefusal: { cause: ExternalRuntimeClaimRefusal | null } = { cause: null };
     const initiallyClaimed = hasExternalLifecycle(agent.adapterType)
       ? (await claimRunWithExternalRuntimeSlotPool(
           db,
           run.id,
           claimedAt,
           resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
-          exclusivePrReviewTaskKey ? { exclusivePrReviewTaskKey } : {},
+          {
+            ...(exclusivePrReviewTaskKey ? { exclusivePrReviewTaskKey } : {}),
+            onRefusal: (cause) => {
+              externalRefusal.cause = cause;
+            },
+          },
         ))?.run ?? null
       : exclusivePrReviewTaskKey
       ? await db.transaction(async (tx) => {
@@ -25327,15 +25378,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .then((rows) => rows[0] ?? initiallyClaimed)
       : initiallyClaimed;
     if (!claimed) {
-      // Three distinct causes reach this one `null`, and they are not the same
-      // finding. Split them so the arm label can carry the difference.
-      onRefusal?.(
-        hasExternalLifecycle(agent.adapterType)
-          ? "external_lifecycle_claim_refused"
-          : claimAttempt.prReviewTaskHeld
-          ? "pr_review_task_held"
-          : "claim_cas_lost",
-      );
+      // Several distinct causes reach this one `null`, and they are not the
+      // same finding — on an external-lifecycle seat they sit on opposite sides
+      // of the fork. Split them so the arm label can carry the difference.
+      //
+      // Assigned to a named const rather than inlined into the call: the arm
+      // choice is the interesting part and it is four cases deep, while the
+      // refusal-naming guard reads the report that sits next to `return null`.
+      const refusedArm: QueuedRunClaimRefusalArm = hasExternalLifecycle(agent.adapterType)
+        ? externalRefusal.cause === "task_held"
+          ? "external_lifecycle_pr_review_task_held"
+          : externalRefusal.cause === "run_not_queued"
+          // Same meaning as the non-external CAS loss, so it shares that arm
+          // and the two adapter families stay directly comparable.
+          ? "claim_cas_lost"
+          : externalRefusal.cause === "slots_exhausted"
+          ? "external_lifecycle_slots_exhausted"
+          // The pool refused without naming a cause. Should be unreachable;
+          // kept so an unreported path is visible rather than misfiled.
+          : "external_lifecycle_claim_refused"
+        : claimAttempt.prReviewTaskHeld
+        ? "pr_review_task_held"
+        : "claim_cas_lost";
+      onRefusal?.(refusedArm);
       return null;
     }
 
@@ -33752,12 +33817,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // named arm that refused it. Read by the `no_claimable_run` branch below,
       // which previously reported only that candidates existed and none could
       // be claimed — true, and unjoinable against the claimable-age gauge.
-      const claimRefusals: Array<{
-        runId: string;
-        issueId: string | null;
-        arm: QueuedRunClaimRefusalArm;
-      }> = [];
+      const claimRefusals: QueuedRunClaimRefusalRecord[] = [];
       let scheduledEmergencyContinuationAfterRefusal = false;
+      // How far the candidate loop actually got. Read by the `no_claimable_run`
+      // line so an absent refusal can be told apart from a refusal that was
+      // never attempted (PEN-5316 review follow-up).
+      let candidatesConsidered = 0;
+      let passStoppedEarly: "slots_filled" | "dispatch_stopped" | null = null;
+      // PEN-5316 (review follow-up): the dispatch loop screens candidates
+      // BEFORE `claimQueuedRun` ever sees them, and those skips reported
+      // nothing. That silence was not neutral — the reading rule treated an
+      // absent refusal as "the dispatcher never reached it", i.e. fork (b),
+      // while `isDispatchRankReady` screens neither of these, so the gauge goes
+      // on aging the row and the honest reading is fork (a). Left unnamed, the
+      // pre-claim population would have pushed the verdict the wrong way.
+      const notePreClaimSkip = async (
+        run: typeof heartbeatRuns.$inferSelect,
+        skipIssueId: string | null,
+        arm: QueuedRunClaimRefusalArm,
+      ) => {
+        claimRefusals.push({ runId: run.id, issueId: skipIssueId, arm });
+        await noteQueuedRunClaimRefused(agentId, arm, agent.companyId);
+      };
       const scheduleEmergencyContinuationForStillQueuedRun = async (
         run: typeof heartbeatRuns.$inferSelect,
       ) => {
@@ -33835,8 +33916,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
       try {
         for (const queuedRun of prioritizedRuns) {
-          if (claimedRuns.length >= availableSlots) break;
-          if (dispatchStopped) break;
+          // PEN-5316 (review follow-up): a candidate the loop never reaches
+          // records no arm, so absence of a refusal must not be read as "the
+          // claim path declined it". The slot break cannot reach the
+          // `no_claimable_run` branch at all — `availableSlots <= 0` returns
+          // `no_available_slots` far above, so reaching this break means at
+          // least one claim succeeded — but the shutdown break can, and does so
+          // with an empty `claimedRuns`.
+          if (claimedRuns.length >= availableSlots) {
+            passStoppedEarly = "slots_filled";
+            break;
+          }
+          if (dispatchStopped) {
+            passStoppedEarly = "dispatch_stopped";
+            break;
+          }
+          candidatesConsidered += 1;
           const queuedSnapshot = parseObject(queuedRun.contextSnapshot);
           const queuedIssueId = readNonEmptyString(queuedSnapshot.issueId);
           if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
@@ -33856,6 +33951,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
               );
             }
+            await notePreClaimSkip(queuedRun, queuedIssueId, "duplicate_dispatch_suppressed");
             continue;
           }
           const queuedTaskKey = readNonEmptyString(queuedSnapshot.taskKey);
@@ -33867,6 +33963,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // Explicit review requests intentionally queue a follow-up while a
             // review is running. Keep that row queued, but do not let it run
             // concurrently with the review that already owns this PR task.
+            //
+            // The row stays `queued` and `isDispatchRankReady` does not screen
+            // this, so the claimable gauge keeps aging it: this arm is fork (a)
+            // evidence, and it was invisible before.
+            await notePreClaimSkip(queuedRun, queuedIssueId ?? null, "pr_review_task_in_flight");
             continue;
           }
           markAgentStartLockPhase(agentId, "claim");
@@ -33955,26 +34056,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // window is bounded but not small, and a wedged seat emits this line
           // for as long as it stays wedged. The cap is on the LOG only — the
           // metric counted every one.
-          const refusalArmCounts: Record<string, number> = {};
-          for (const refusal of claimRefusals) {
-            refusalArmCounts[refusal.arm] = (refusalArmCounts[refusal.arm] ?? 0) + 1;
-          }
           logger.warn(
             {
               agentId,
               queuedRunCount: queuedRuns.length,
               availableSlots,
-              refusalArmCounts,
-              refusedRuns: claimRefusals
-                .slice(0, NO_CLAIMABLE_RUN_LOGGED_REFUSAL_LIMIT)
-                .map((refusal) => ({
-                  runId: refusal.runId,
-                  issueId: refusal.issueId,
-                  arm: refusal.arm,
-                })),
-              refusedRunsOmitted: Math.max(
-                0,
-                claimRefusals.length - NO_CLAIMABLE_RUN_LOGGED_REFUSAL_LIMIT,
+              // Absence of a refusal for a run id is only evidence about the
+              // dispatcher for candidates this pass actually offered to the
+              // claim path. These two say how many it did not.
+              candidatesConsidered,
+              candidatesNotAttempted: Math.max(0, prioritizedRuns.length - candidatesConsidered),
+              stoppedEarly: passStoppedEarly,
+              ...summarizeQueuedRunClaimRefusals(
+                claimRefusals,
+                NO_CLAIMABLE_RUN_LOGGED_REFUSAL_LIMIT,
               ),
               suppressedSincePreviousLog: noClaimLogSlot.suppressedSincePreviousLog,
             },
