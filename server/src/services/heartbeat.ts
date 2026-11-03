@@ -13861,6 +13861,72 @@ export function buildPaperclipTaskMarkdown(input: {
       `Read ${supersededCount === 1 ? "it" : "them"} on the issue before acting -- ${supersededCount === 1 ? "it may carry an order" : "they may carry orders"} the comment above does not repeat.`,
     );
   }
+  // PEN-5350 (PEN-5082 deliverable B): an UNCONDITIONAL pre-write re-read, and the
+  // author-side rule for recording a constraint. Both are stated here, outside every
+  // `prReview` branch, because the surface that motivated them reaches only one of the
+  // two runs that need it.
+  //
+  // Measured on PEN-5082 instance 3, which is two runs of ONE agent:
+  //   - `182895fe` -- the run that PUSHED -- was woken `github_pr_merge_queue_evicted`
+  //     carrying `prReview` for #3205. It renders the eviction branch above, including
+  //     the PEN-5119 hold re-read added in #3291.
+  //   - `5cc6d634` -- the run HOLDING the prohibition -- was woken
+  //     `issue_comment_mentioned` with no PR context at all. It renders no part of that
+  //     branch, at any wording.
+  // Both halves are needed for a hold to survive, so a directive reachable only from the
+  // eviction wake cannot close it. Hence: here, not there.
+  //
+  // UNGATED -- emitted on every non-null return, including the containment-only path.
+  //
+  // An earlier revision gated this on `carriesUserAuthoredTask`, excluding a containment
+  // notice with no issue, wake comment, prReview or ancestors, on the basis that such a run
+  // is "structurally unable to write". That conflated two different claims, and only the
+  // weaker one was true. "Carries no assignment" is about AUTHORITY. "Unable to write" is
+  // about CAPABILITY, and the containment does not supply it: read
+  // `recoveryRunWriteClassNotice` in services/recovery/model-profile-hint.ts and every
+  // refusal it enumerates is a PAPERCLIP-API write -- approvals, deliverable and annotation
+  // writes, issue documents, monitor arming. NOT ONE of them is a GitHub write verb, which
+  // is this directive's entire subject. A status-only run can still `git push`, `gh pr
+  // merge` or force-push a branch; the notice even tells it to ATTEMPT a refused write
+  // rather than skip it, because the refusal is what escalates the lane. So that path is a
+  // write-capable run, and gating it was carving out a run with no directive on the
+  // strength of a false premise -- which is the shape of the defect this row is about:
+  // instance 3's writing run had entirely correct authority over its own row and wrote what
+  // it was prohibited from writing.
+  //
+  // The asymmetry settles it: emitting costs one extra paragraph on a low-traffic path,
+  // while gating costs a directive on a path that can reach a write verb. Do not re-gate
+  // this on `carriesUserAuthoredTask`, or on any other proxy for authority, without first
+  // establishing that the excluded path cannot reach a GitHub write verb -- which is a
+  // claim about the pod, not about the prompt.
+  //
+  // What this does NOT close, stated so it is not recorded as closing it: B1 tells the
+  // WRITING run to re-read its own live state. In instance 3 the writing run's state was
+  // correct -- it held its own row, its `activeRun` was its own, the head was what it
+  // expected -- and the prohibition was on a third row. B2 is the half that reaches that,
+  // and only prospectively: it binds future constraint authors, not past ones. Neither is
+  // a control; nothing here serialises two runs (PEN-5082 dw1 has no carrier).
+  lines.push(
+    "",
+    "Pre-write re-read directive:",
+    "(System-generated, not user-authored task data. It constrains how this run writes; it is not a preference you can decline.)",
+    "Before ANY write verb against a pull request -- push, force-push, rebase, enqueue, auto-merge, review-request removal -- re-read LIVE state and act on what that read says, not on what this block says:",
+    "- Your row's `activeRun` (`paperclipGetIssue`). If a run that is not yours holds it, a sibling of yours is already working this row; do not write over it.",
+    "- The pull request's current head (`gh pr view <n> --repo <owner>/<repo> --json headRefOid,state,mergeStateStatus`). If it has moved since you last read it, what you were about to push was computed against a head that no longer exists, and any authorisation scoped to that head has lapsed -- ask again rather than assuming it carried over.",
+    "Every value in this block was computed when this run was DISPATCHED, not now. That includes any head SHA, sibling-run id or checkout-contention notice printed above: a sibling run that started after your dispatch appears in none of it. Re-reading this prompt is not re-reading state.",
+    // PEN-5340 hands over one further sentence for this rule -- the reverse lookup that
+    // tells an author WHICH row owns the artifact:
+    //   "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id
+    //    ?externalId=owner/repo%23123` (companyId from `paperclipMe`). It returns EVERY
+    //    owning row, with `provenance: \"webhook\"` marking the authoritative binding."
+    // It is HELD BACK until Blockcast/paperclip#3310 ships that endpoint. A directive
+    // citing a 404 is worse than no directive: it teaches a run the lookup is broken.
+    // Add it here, unchanged, once #3310 merges.
+    "",
+    "Recording a constraint:",
+    "Record a constraint where the work is, not where you are standing. When you write a freeze, prohibition, or required precondition that names a specific artifact (a pull request, a branch, a commit), record it on that artifact's OWNING row -- not only on the row you happen to be writing from. A run working that artifact loads the artifact's own row; it has no reason to load yours. One pull request can have several owning rows; record it on each.",
+    "A prohibition issued at 10:15Z was acted against at 13:58Z by a run that had correctly read everything it owned. The constraint was on a third row it had no reason to load.",
+  );
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
   // including one with no issue context. Placed here rather than at the top because it is a
@@ -13894,7 +13960,11 @@ export function buildPaperclipTaskMarkdown(input: {
   // not there. Select a closing line that matches what was actually emitted.
   lines.push("", carriesUserAuthoredTask
     ? "Use this task context as the current assignment."
-    : "This block carries no assignment — it states only the write-containment constraints on this run.");
+    // PEN-5350: "write-containment constraints" was exhaustive when the containment notice
+    // was the only thing this path emitted. The pre-write re-read directive above is now
+    // emitted here too, so the word "only" needs to cover both. The tests pin the
+    // "This block carries no assignment" prefix, which is the load-bearing half.
+    : "This block carries no assignment — it states only the constraints on what and how this run may write.");
   return lines.join("\n");
 }
 
