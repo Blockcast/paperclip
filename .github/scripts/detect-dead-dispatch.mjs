@@ -189,6 +189,24 @@ export const DEPLOY_JOB_NAME = 'deploy';
 export const DEPLOY_GATE_JOB_NAME = 'guard-pending-deploy';
 
 /**
+ * The only ref a production deploy can run from.
+ *
+ * `guard-pending-deploy`'s condition has THREE conjuncts, and a skipped guard
+ * proves only that one of them was false — not which. `findLastCompletedDispatch`
+ * lists every `workflow_dispatch` run of `docker.yml` and does not filter by
+ * branch, so a human dispatching the workflow by hand from a feature branch
+ * produces this exact shape — green run, guard skipped — off the REF conjunct
+ * while `vars.PAPERCLIP_CI_DEPLOY` may be perfectly fine. That run then becomes
+ * the lane's "last word" and the report would name the wrong lever.
+ *
+ * Before the gated-off fate existed the same shape was harmless (`survived`);
+ * it is loud now, so the ref is checked rather than assumed. Measured
+ * 2026-11-03: all 100 most recent dispatch runs were on `master`, so this is
+ * latent rather than live — which is the right time to close it.
+ */
+export const DEPLOY_BRANCH = 'master';
+
+/**
  * Was the whole deploy lane gated off before it could start?
  *
  * `skipped` on the entry guard means the shared condition was false. ABSENT is
@@ -275,7 +293,16 @@ export function classifyDispatchRun(run, jobs) {
   //
   // The `success` conjunct is what keeps the supersede path out: a cancelled
   // run shows `cancelled` on the guard, not `skipped`, and must stay SURVIVED.
-  if (run.conclusion === 'success' && deployLaneGatedOff(jobs)) {
+  //
+  // The ref conjunct keeps a hand-dispatched feature branch out: that skips the
+  // guard too, off a DIFFERENT conjunct of the same condition, and blaming the
+  // variable for it would send a human to the wrong switch. Absent `head_branch`
+  // is not `master`, so it stays quiet — this module's standing direction.
+  if (
+    run.conclusion === 'success' &&
+    run.head_branch === DEPLOY_BRANCH &&
+    deployLaneGatedOff(jobs)
+  ) {
     return DISPATCH_FATE.LANE_GATED_OFF;
   }
   // `cancelled` with deploy never executed, or `success` with deploy skipped by

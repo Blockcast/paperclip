@@ -1001,10 +1001,17 @@ test('the dead-lane branch tells a switched-off lane apart from a dispatch that 
   assert.ok(!/::notice::/.test(branch), 'neither arm may downgrade to a notice');
 });
 
-test('the switched-off arm names the REAL lever and refuses to offer the dispatch', () => {
+test('the switched-off arm names the REAL lever, and the dispatch only as the SECOND step', () => {
   // The whole point of splitting the report. The gated-off arm is the text
-  // between the fate test and the `else`; the manual-dispatch lever lives in
-  // the other arm and must not leak into this one.
+  // between the fate test and the `else`; the other arm's UNCONDITIONAL
+  // manual-dispatch lever must not leak into this one, because while the
+  // variable is off a dispatch provably ships nothing.
+  //
+  // It must still name the dispatch as the step AFTER the variable is restored
+  // (Ally, review of c5e86458): this report reads the LAST COMPLETED dispatch,
+  // which is still the gated-off run once the variable comes back, so the
+  // hourly slots keep firing until a fresh dispatch exists. Saying only "the
+  // lever is the variable" leaves up to a day of self-inflicted hourly red.
   const branch = deadBranch();
   const gatedArm = branch.slice(
     branch.indexOf('if [ "$DEAD_FATE" = "lane-gated-off" ]'),
@@ -1019,7 +1026,17 @@ test('the switched-off arm names the REAL lever and refuses to offer the dispatc
   );
   assert.ok(
     !/regardless of the hour/.test(gatedArm),
-    'the manual-dispatch lever is the OTHER arm — offering it here rebuilds the gap one step on',
+    'the OTHER arm offers the dispatch unconditionally — that framing must not leak here',
+  );
+  // The qualifier is load-bearing: unqualified, the claim goes false the moment
+  // the variable is restored.
+  assert.ok(
+    /while the variable is off|until vars\.PAPERCLIP_CI_DEPLOY is restored/.test(gatedArm),
+    'the "re-dispatching does not help" claim must be scoped to the switch being off',
+  );
+  assert.ok(
+    /back to .true.|restored/.test(gatedArm) && /manually/.test(gatedArm),
+    'and the arm must name the restore-then-dispatch step that actually clears the hourly red',
   );
 });
 
