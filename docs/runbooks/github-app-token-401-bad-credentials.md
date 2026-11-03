@@ -30,7 +30,7 @@ authenticated verdict. It reads no credential value into your output.
   mount-written:      2026-11-02 21:37:06
   token-sha256:       bf65aa6d
   github-reachable:   yes (unauthenticated /rate_limit -> 200, x-ratelimit-limit 60)
-  authenticated:      /installation/repositories -> 200, x-ratelimit-limit 9500
+  authenticated:      /installation/repositories -> 200, x-ratelimit-limit 9500, remaining 4730, reset 2026-11-03T04:53:38Z (1793681618)
   verdict:            OK — valid GitHub App installation token (rate limit 9500/hr)
 ```
 
@@ -40,6 +40,38 @@ not hand-roll the probe — `$GH_TOKEN` is empty in your shell (the wrapper
 exports it into `gh` only), so curl-ing with it returns `401` whatever the
 credential's health, and an empty Bearer returns the same `401` as a revoked
 token.
+
+### 1a. A `403` is not a `401` — read the rate-limit plane (PEN-5355)
+
+That pairing is silent on the state this installation actually reaches most
+often. Under an exhausted shared budget the authenticated call to
+`/installation/repositories` returns **`403`, not `401`**, so §1's oracle says
+nothing and the two failures look identical at the call site: same command,
+same red, same "GitHub refused me". The rate-limit headers are what separate
+them. (This is a different `403` from §2's: there, a `403` on `/user` is the
+healthy per-endpoint refusal. Here it is `/installation/repositories`, which a
+healthy, unthrottled token answers `200`.)
+
+| state | authenticated code | `x-ratelimit-limit` | `x-ratelimit-remaining` | verdict / exit | correct action |
+|---|---|---|---|---|---|
+| healthy | 200 | 9500 | > 0 | `OK` / 0 | proceed |
+| **budget exhausted** | **403** | **9500** | **0** | `RATE_LIMITED` / 6 | **wait for the reset; GraphQL still works** |
+| permission refusal | 403 | 9500 | > 0 | `UNEXPECTED` / 5 | genuine authorization fault — escalate |
+| credential dead | 401 | absent / 60 | — | `REJECTED` / 1 | park; §2 onward |
+
+`limit: 9500` is itself positive evidence the credential **authenticated** —
+the unauthenticated plane is 60. A `403` quoting `9500` is a healthy token
+being throttled, not a permission loss. The exhaustion is tracked and owned
+(PEN-3776 measured installation `138085375` hitting zero ~94 min/24h across 8
+exporters; PEN-3852 is the App split, PEN-5087 the draw reduction). Do not
+file it as a credential incident.
+
+**GraphQL has an independent budget, so GitHub is not unreachable.** Measured
+2026-11-03T03:5xZ, at the moment core read `0/9500`, `graphql` read **9401
+remaining**. Anything expressible as a GraphQL query still works for the whole
+exhaustion window — worth saying out loud, because the reflex on a 403 storm
+is to conclude the API is gone and park the run. `gh api graphql` and
+`gh pr view`-style reads that go through GraphQL are the way through.
 
 ## 2. Healthy vs dead — read the right endpoint
 
