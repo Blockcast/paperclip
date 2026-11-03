@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { heartbeatRuns } from "@paperclipai/db";
 import { resolveAgentEmptyWorkspaceSourceDir, resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
-import { buildPaperclipWorkspaceContext } from "../services/heartbeat.js";
+import {
+  buildPaperclipWakeExecutionWorkspacePatch,
+  buildPaperclipWorkspaceContext,
+} from "../services/heartbeat.js";
 import {
   SHARED_CHECKOUT_WARNING_RUN_SAMPLE,
   describeSharedCheckoutOccupancy,
@@ -372,15 +375,24 @@ describe("buildPaperclipWorkspaceContext", () => {
       agentId: FALLBACK_AGENT_ID,
     });
 
-  it("delivers the contention warning to the agent's own context", () => {
+  // PEN-5336 renamed this test to what it actually asserts. It used to be
+  // called "delivers the contention warning to the agent's own context", and
+  // that name was false: `buildPaperclipWorkspaceContext` returns a SERVER-SIDE
+  // object, and no adapter ever projected its `warnings` field anywhere. The
+  // test passed for four months while the warning reached nothing.
+  //
+  // ⛔ Do not rename it back, and do not treat it as delivery coverage. The
+  // delivery assertion lives where a prompt is actually rendered:
+  // `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.test.ts`,
+  // "execution workspace warnings reach the pod prompt (PEN-5336)". What this
+  // test is still good for is the run-log drain, which does read this array.
+  it("keeps the warning on the server-side context array the run-log drain reads", () => {
     const warning = formatSharedCheckoutOccupancyWarning({
       cwd: CWD,
       strategyType: "project_primary",
       siblingRunIds: [SIBLING_RUN],
     });
     expect(warning).not.toBeNull();
-    // The destination the module docs name. Drop `warnings` from the context
-    // and this fails -- which is the regression that shipped last time.
     expect(build([warning as string]).warnings.join("\n")).toContain(SIBLING_RUN);
   });
 
@@ -474,5 +486,52 @@ describe("buildPaperclipWorkspaceContext", () => {
     const adapterContext = { ...{ paperclipWorkspace: context } };
     warnings.push("late");
     expect(adapterContext.paperclipWorkspace.warnings).toEqual(["contention", "late"]);
+  });
+});
+
+
+// PEN-5336. The channel this warning is actually delivered on. The server-side
+// context object above is NOT that channel -- no adapter projects its
+// `warnings` field -- so these assert composition of the wake-payload patch
+// instead. ⛔ These are still server-side: the proof that an adapter renders
+// the text is in `job-manifest.test.ts`, "execution workspace warnings reach
+// the pod prompt (PEN-5336)". A green run here with that test deleted means
+// nothing.
+describe("wake-payload execution workspace patch (PEN-5336)", () => {
+  it("carries the contention warning when there is no branch to pin", () => {
+    const warning = formatSharedCheckoutOccupancyWarning({
+      cwd: CWD,
+      strategyType: "project_primary",
+      siblingRunIds: [SIBLING_RUN],
+    });
+    expect(warning).not.toBeNull();
+
+    // The real shape: project_primary never pins a branch, and git_worktree --
+    // which does -- is exempt from this warning entirely. So "no branch, one
+    // warning" is the ONLY shape a contention warning ever arrives on, and
+    // gating the patch on branchName would have dropped every one of them.
+    const patch = buildPaperclipWakeExecutionWorkspacePatch({
+      branchName: null,
+      warnings: [warning as string],
+    });
+    expect(patch).not.toBeNull();
+    expect(patch?.warnings.join("\n")).toContain(SIBLING_RUN);
+  });
+
+  it("still carries the branch pin when there are no warnings", () => {
+    expect(
+      buildPaperclipWakeExecutionWorkspacePatch({ branchName: "PEN-5336-deliver", warnings: [] }),
+    ).toEqual({ branchName: "PEN-5336-deliver", warnings: [] });
+  });
+
+  it("returns null when there is nothing to say, so no empty payload is forced", () => {
+    expect(buildPaperclipWakeExecutionWorkspacePatch({ branchName: null, warnings: [] })).toBeNull();
+  });
+
+  it("binds warnings by reference, like the context object does", () => {
+    const warnings: string[] = ["first"];
+    const patch = buildPaperclipWakeExecutionWorkspacePatch({ branchName: null, warnings });
+    warnings.push("appended after the patch was built");
+    expect(patch?.warnings).toEqual(["first", "appended after the patch was built"]);
   });
 });

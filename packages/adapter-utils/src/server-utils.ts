@@ -680,6 +680,14 @@ type PaperclipWakeCheckboxSelection = {
 
 type PaperclipWakeExecutionWorkspace = {
   branchName: string | null;
+  /**
+   * Runtime workspace warnings computed at dispatch (heartbeat's
+   * `runtimeWorkspaceWarnings`). These ride the wake payload because that is
+   * the only server -> pod -> PROMPT channel: every adapter projects the wake
+   * payload and renders it, whereas `context.paperclipWorkspace` is enumerated
+   * field-by-field into pod env and `warnings` was never in that enumeration.
+   */
+  warnings: string[];
 };
 
 type PaperclipWakeRecovery = {
@@ -1243,6 +1251,11 @@ function normalizePaperclipWakeExecutionStage(value: unknown): PaperclipWakeExec
   };
 }
 
+/** Per-warning character cap in the wake payload's workspace warnings. */
+const PAPERCLIP_WAKE_WORKSPACE_WARNING_MAX_CHARS = 2000;
+/** How many workspace warnings ride the wake payload before truncation. */
+const PAPERCLIP_WAKE_WORKSPACE_WARNING_MAX_COUNT = 10;
+
 function normalizePaperclipWakeExecutionWorkspace(value: unknown): PaperclipWakeExecutionWorkspace | null {
   const workspace = parseObject(value);
   // Strip control characters (illegal in git refs, and the newline route into
@@ -1253,8 +1266,21 @@ function normalizePaperclipWakeExecutionWorkspace(value: unknown): PaperclipWake
       .replace(/[\u0000-\u001f\u007f]/g, "")
       .trim()
       .slice(0, 300) || null;
-  if (!branchName) return null;
-  return { branchName };
+  // Same control-character strip, same reason: a warning is server-composed
+  // prose that lands verbatim in the agent prompt, so a newline in it could
+  // forge a prompt bullet. Bounded in both length and count so a pathological
+  // warning set cannot crowd out the rest of the wake prompt.
+  const warnings = (Array.isArray(workspace.warnings) ? workspace.warnings : [])
+    .map((entry) =>
+      asString(entry, "")
+        .replace(/[\u0000-\u001f\u007f]/g, " ")
+        .trim()
+        .slice(0, PAPERCLIP_WAKE_WORKSPACE_WARNING_MAX_CHARS),
+    )
+    .filter(Boolean)
+    .slice(0, PAPERCLIP_WAKE_WORKSPACE_WARNING_MAX_COUNT);
+  if (!branchName && warnings.length === 0) return null;
+  return { branchName, warnings };
 }
 
 // Wrap a value in a Markdown inline-code span whose backtick fence is longer
@@ -1264,6 +1290,63 @@ function markdownInlineCode(value: string): string {
   if (longestBacktickRun === 0) return `\`${value}\``;
   const fence = "`".repeat(longestBacktickRun + 1);
   return `${fence} ${value} ${fence}`;
+}
+
+/** The fields that decide whether a wake payload says anything at all. */
+type PaperclipWakeContentParts = {
+  comments: unknown[];
+  commentIds: unknown[];
+  annotationDeltas: unknown[];
+  childIssueSummaries: unknown[];
+  unresolvedBlockerIssueIds: unknown[];
+  unresolvedBlockerSummaries: unknown[];
+  activeTreeHold: unknown;
+  executionStage: unknown;
+  continuationSummary: unknown;
+  planReviewContext: unknown;
+  livenessContinuation: unknown;
+  taskWatchdog: unknown;
+  checkboxSelection: unknown;
+  executionWorkspace: PaperclipWakeExecutionWorkspace | null;
+  recovery: unknown;
+  issue: unknown;
+};
+
+/**
+ * Does this payload say anything?
+ *
+ * One predicate, two callers, because they must not drift:
+ *
+ *   * `normalizePaperclipWakePayload` asks with `countWorkspaceWarnings: true`
+ *     -- a warnings-only payload is real and must survive to the pod.
+ *   * `paperclipWakeHasResumeDeltaContent` asks with it FALSE -- see that
+ *     function for why a warning is not a delta.
+ */
+function wakePayloadHasContent(
+  parts: PaperclipWakeContentParts,
+  options: { countWorkspaceWarnings: boolean },
+): boolean {
+  const workspaceCounts = options.countWorkspaceWarnings
+    ? Boolean(parts.executionWorkspace)
+    : Boolean(parts.executionWorkspace?.branchName);
+  return Boolean(
+    parts.comments.length > 0 ||
+      parts.commentIds.length > 0 ||
+      parts.annotationDeltas.length > 0 ||
+      parts.childIssueSummaries.length > 0 ||
+      parts.unresolvedBlockerIssueIds.length > 0 ||
+      parts.unresolvedBlockerSummaries.length > 0 ||
+      parts.activeTreeHold ||
+      parts.executionStage ||
+      parts.continuationSummary ||
+      parts.planReviewContext ||
+      parts.livenessContinuation ||
+      parts.taskWatchdog ||
+      parts.checkboxSelection ||
+      workspaceCounts ||
+      parts.recovery ||
+      parts.issue,
+  );
 }
 
 export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayload | null {
@@ -1309,7 +1392,25 @@ export function normalizePaperclipWakePayload(value: unknown): PaperclipWakePayl
   const activeTreeHold = normalizePaperclipWakeTreeHoldSummary(payload.activeTreeHold);
   const checkboxSelection = normalizePaperclipWakeCheckboxSelection(payload.checkboxSelection);
   const executionWorkspace = normalizePaperclipWakeExecutionWorkspace(payload.executionWorkspace);
-  if (comments.length === 0 && commentIds.length === 0 && annotationDeltas.length === 0 && childIssueSummaries.length === 0 && unresolvedBlockerIssueIds.length === 0 && unresolvedBlockerSummaries.length === 0 && !activeTreeHold && !executionStage && !continuationSummary && !planReviewContext && !livenessContinuation && !taskWatchdog && !checkboxSelection && !executionWorkspace && !recovery && !normalizePaperclipWakeIssue(payload.issue)) {
+  const contentParts = {
+    comments,
+    commentIds,
+    annotationDeltas,
+    childIssueSummaries,
+    unresolvedBlockerIssueIds,
+    unresolvedBlockerSummaries,
+    activeTreeHold,
+    executionStage,
+    continuationSummary,
+    planReviewContext,
+    livenessContinuation,
+    taskWatchdog,
+    checkboxSelection,
+    executionWorkspace,
+    recovery,
+    issue: normalizePaperclipWakeIssue(payload.issue),
+  };
+  if (!wakePayloadHasContent(contentParts, { countWorkspaceWarnings: true })) {
     return null;
   }
 
@@ -1350,6 +1451,29 @@ export function stringifyPaperclipWakePayload(value: unknown): string | null {
   const normalized = normalizePaperclipWakePayload(value);
   if (!normalized) return null;
   return JSON.stringify(normalized);
+}
+
+/**
+ * Does this wake payload carry content that justifies a RESUME DELTA -- that
+ * is, replacing the full heartbeat prompt with just the new material because
+ * the session is being resumed?
+ *
+ * ⚠️ Adapters used to spell this `renderPaperclipWakePrompt(...).length > 0`,
+ * and that spelling silently became wrong in PEN-5336, when execution-workspace
+ * WARNINGS started riding this payload. A warning is recomputed at every
+ * dispatch and is frequently the only thing in the payload, so the string test
+ * would have suppressed the entire heartbeat prompt on any resumed run whose
+ * only news was "you are sharing a checkout with another run". Warnings are
+ * extra context to render, not a reason to drop the prompt.
+ *
+ * Returns exactly what `renderPaperclipWakePrompt(...).length > 0` returned
+ * BEFORE warnings existed: an execution workspace counts only when it pins a
+ * branch. Use this for the gate; use the rendered string for the text.
+ */
+export function paperclipWakeHasResumeDeltaContent(value: unknown): boolean {
+  const normalized = normalizePaperclipWakePayload(value);
+  if (!normalized) return false;
+  return wakePayloadHasContent(normalized, { countWorkspaceWarnings: false });
 }
 
 export function isPaperclipRecoveryWakePayload(value: unknown): boolean {
@@ -1548,6 +1672,15 @@ export function renderPaperclipWakePrompt(
     lines.push(
       `- execution workspace branch: you are running in an execution workspace on branch ${markdownInlineCode(normalized.executionWorkspace.branchName)}. Do not switch, rename, or re-point this branch; keep all commits on it.`,
     );
+  }
+  // Deliberately NOT gated on `resumedSession`, unlike the branch pin above.
+  // The branch pin is a one-time fact about a workspace that does not change
+  // across wakes; a workspace warning is recomputed at every dispatch and
+  // describes the state of the tree for THIS run. Suppressing it on a resumed
+  // session would hide, for example, a sibling run that arrived since the last
+  // wake -- which is the case the warning exists for.
+  for (const warning of normalized.executionWorkspace?.warnings ?? []) {
+    lines.push(`- execution workspace warning: ${warning}`);
   }
   if (normalized.dependencyBlockedInteraction) {
     lines.push("- dependency-blocked interaction: yes");

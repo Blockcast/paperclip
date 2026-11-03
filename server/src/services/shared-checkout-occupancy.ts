@@ -181,11 +181,23 @@ function isRepoLessFallbackCwd(cwd: string, agentId: string | null): boolean {
 
 /**
  * The warning text. Its caller (heartbeat.ts) pushes it onto
- * `runtimeWorkspaceWarnings`, which is bound BY REFERENCE into
- * `context.paperclipWorkspace.warnings` and spread into the adapter context --
- * so it reaches the agent before the agent process starts, and therefore
- * before any filesystem write. The same array is also drained to the run log,
- * so a human triaging a mystery diff after the fact sees it too.
+ * `runtimeWorkspaceWarnings`, which reaches two destinations:
+ *
+ *   * the AGENT PROMPT, via the wake payload's
+ *     `executionWorkspace.warnings` -- rendered as an `execution workspace
+ *     warning:` bullet by `renderPaperclipWakePrompt`. The payload is built
+ *     before the agent process starts, so the agent reads this before any
+ *     filesystem write, which is the point.
+ *   * the RUN LOG, via the same array's drain, so a human triaging a mystery
+ *     diff after the fact sees it too.
+ *
+ * ⚠️ PEN-5336 corrected this comment. It used to claim delivery via
+ * `context.paperclipWorkspace.warnings` being "spread into the adapter
+ * context". It is not spread: K8s adapters enumerate that object into pod env
+ * by name, and `warnings` was never one of the enumerated fields, so from
+ * BLO-27858 until PEN-5336 this text reached no adapter, no pod and no prompt.
+ * If you move this warning to another array, check that the array you move it
+ * to is one an adapter actually projects.
  *
  * Both audiences matter and the text is written for the agent, which is the
  * one that can still act on it. Returns null when there is no contention.
