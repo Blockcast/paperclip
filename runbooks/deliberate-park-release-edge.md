@@ -285,6 +285,33 @@ second requires `issue.status === "todo"` — so it is **silent**, while
 `in_progress` is in `ISSUE_PARK_EXPIRY_WAKE_STATUSES`. One wake, at the
 deadline.
 
+**`in_progress` is not where the row comes to rest, and that is the good news.**
+The status-only PATCH holds only for the life of the run that issues it; once
+that run ends the row reverts to `todo`, with `parkedUntil`, `parkedAt` and
+`parkedWakeFiredAt` untouched. Measured 2026-11-03 on the rows moved at
+`12:23`–`12:25Z`: by `12:38Z` PEN-2208, PEN-5122 and PEN-5137 all read `todo`
+again. (PEN-2208's `blocked` → `in_progress` PATCH is the one verified directly,
+in its own activity log at `12:23:41.361Z`; the other two are as reported by the
+assignee. PEN-5141 is excluded — it was promoted into a fresh run at `12:38:58Z`
+and so is not a clean observation.)
+
+The reversion is **invisible on both audit surfaces**: no `issue.updated` records
+it — PEN-2208's activity log is complete back to its creation on 2026-08-09 and
+contains no such entry — and no wake request is spent on it, its
+`diagnostics/wakes` being untruncated with its most recent entry still
+`2026-10-24T14:38:40Z`. That silence is what the predicate predicts:
+`statusChangedFromBlockedToTodo` requires `existing.status === "blocked"`, and on
+the reversion `existing.status` is `in_progress`, so it cannot match. The row
+reaches `todo` for free.
+
+So this does not weaken the recommendation — it is why the recommendation works.
+`todo` is itself in `ISSUE_PARK_EXPIRY_WAKE_STATUSES`, and it is exactly where the
+stranded-blocked reconciler would have put the row, so the park still fires at the
+deadline from the state the system was converging on anyway. What
+`blocked` → `in_progress` buys is arriving there **without** the immediate wake
+that a direct PATCH to `todo` costs. The mechanism and precise timing of the
+reversion are uncharacterised; only the before/after states above were measured.
+
 ⚠️ **`blocked` → `todo` is the trap, and it is attractive rather than careless.**
 Both halves of the reasoning are true — `blocked` really has no automatic wake,
 and `todo` really has no hold — so a run reading the row fresh re-derives it.
@@ -304,6 +331,11 @@ restamps `parkedAt` and resets `parkedWakeFiredAt`, so the question this runbook
 exists to answer becomes unanswerable for that park
 ([Why the stamp is usually gone anyway](#why-the-stamp-is-usually-gone-anyway)).
 Prefer it only when the row must stay `blocked` for the hold to read correctly.
+
+⚠️ `parkedDisposition.reason` is capped at **500 characters**, and over-length is
+a `422` rather than a truncation (reported by the assignee on PEN-5291,
+2026-11-03). A note carrying both the hold *and* the at-wake instruction runs
+past it easily — budget for the cut rather than discovering it as a failed write.
 
 ⚠️ One side effect of `in_progress`, and a correction to an earlier revision
 of this section. `applyStatusSideEffects` writes `startedAt = new Date()` whenever
