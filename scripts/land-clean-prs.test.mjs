@@ -3262,8 +3262,19 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
     assert.deepEqual(capStarved([capPr(1, null)], [capRow(1)], { now: NOW }), [
       { number: 1, reason: `cap:${MAX_ENQUEUES_PER_FIRE}-per-fire`, ageHours: null },
     ]);
-    // A row with no PR at all is undatable the same way and is likewise kept.
+    // A row whose PR is MISSING entirely is dropped, which DIVERGES from both
+    // siblings — `stalledHolds` and `unlandedEligible` both keep it with a
+    // null age. The divergence is the unread-timeline rule above, not a
+    // different §4l posture: no PR means no timeline, and this cohort cannot
+    // assert "never offered a slot" about a PR it never saw. Unreachable in
+    // this script (rows and PRs come from one fetch), pinned so the contrast
+    // is deliberate rather than discovered.
     assert.deepEqual(capStarved([], [capRow(9)], { now: NOW }), []);
+    assert.deepEqual(
+      stalledHolds([], [row(9, "skip", "checks:none")], { now: NOW }),
+      [{ number: 9, reason: "checks:none", ageHours: null }],
+      "the sibling keeps it — this is a divergence, not a shared rule",
+    );
   });
 
   it("renders nothing when the cohort is empty, and names the remedy when it is not", () => {

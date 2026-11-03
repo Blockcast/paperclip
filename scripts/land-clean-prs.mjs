@@ -1573,6 +1573,12 @@ export function everOfferedQueueSlot(timeline) {
  * cohorts and for the same §4l reason: an instrument that cannot see something
  * must not report clean. A cap-deferred PR that has never been queued and
  * whose head carries no dated check is a true finding twice over.
+ *
+ * ⚠ A row whose PR is MISSING from `prs` is dropped, where both siblings keep
+ * it. That is the unread-timeline rule above rather than a different §4l
+ * posture — no PR means no timeline — but it IS a divergence, so it is named
+ * here and pinned by a test rather than left to be discovered. Unreachable in
+ * this script, where rows and PRs come from one fetch.
  */
 export function capStarved(prs, rows, { now = Date.now(), staleHours = CAP_STARVED_HOURS } = {}) {
   const byNumber = new Map((prs ?? []).map((pr) => [pr?.number, pr]));
