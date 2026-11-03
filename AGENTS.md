@@ -309,6 +309,7 @@ exits with a distinct code for each so a script can branch on it:
 | `AMBIENT_AUTH` | 3 | the wrapper supplied no token and none was named, so `gh` uses whatever auth you already had (your own `GH_TOKEN`/`GITHUB_TOKEN`, or `~/.config/gh/hosts.yml`) — **the self-test does not probe that**; with no ambient credential, `gh` is unauthenticated (60 req/hr) |
 | `GITHUB_UNREACHABLE` | 4 | the request never completed — a network fault, **not** a credential fault |
 | `UNEXPECTED` | 5 | the authenticated probe returned a status none of the above covers — report it with the generation line |
+| `RATE_LIMITED` | 6 | `403` with `x-ratelimit-remaining: 0` — the credential **authenticated** and the shared installation budget is exhausted. Not a credential fault. Wait for the `reset` on the `authenticated:` line; **GraphQL has a separate budget** and still works. Tracked: PEN-3776 / PEN-3852 |
 | _(no verdict)_ | 70 | the self-test could not run: it cannot create a temp file under `$TMPDIR`. A local fault in the diagnostic, which says nothing either way about the credential |
 
 It answers even when every other `gh` invocation is exiting 64, prints no

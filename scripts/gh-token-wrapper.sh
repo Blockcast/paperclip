@@ -420,11 +420,26 @@ token_file_on_shared_volume() {
 # without revealing it, which is what makes two reports comparable at all.
 GITHUB_API_BASE="${GH_TOKEN_WRAPPER_API_BASE:-https://api.github.com}"
 
-# Emits "<http_code> <x-ratelimit-limit>". http_code is 000 when the request
-# never completed (DNS, TLS, proxy, timeout) — curl's transport failure is a
-# different fact from any status GitHub returns, and collapsing the two is the
-# mistake this whole subcommand exists to stop. The token, when present, travels
-# in a 0600 config file rather than argv, so it is never visible in `ps`.
+# Emits "<http_code> <x-ratelimit-limit> <x-ratelimit-remaining> <x-ratelimit-reset>".
+# http_code is 000 when the request never completed (DNS, TLS, proxy, timeout) —
+# curl's transport failure is a different fact from any status GitHub returns,
+# and collapsing the two is the mistake this whole subcommand exists to stop.
+# The token, when present, travels in a 0600 config file rather than argv, so it
+# is never visible in `ps`.
+#
+# The three rate-limit fields are one emit rather than three because they are one
+# observation: `403` means opposite things at `remaining 0` and at `remaining
+# 4000`, and `limit 9500` beside either is what proves the credential
+# authenticated at all (the anonymous plane is 60). Splitting them across probes
+# would let a caller read one without the other — see the RATE_LIMITED arm in
+# paperclip_auth_check (PEN-5355).
+#
+# EVERY rate-limit field defaults to "-" when its header is absent, unreadable,
+# or awk is missing, so a caller never has to tell "no header" apart from "empty
+# value"; http_code keeps its own 000 sentinel for the transport failure, which
+# is a different fact.
+# The arity is asserted at BOTH call sites below; widening this printf without
+# widening both of them exits 70 on every invocation.
 #
 # `-q` is passed first on both calls, and must stay first: curl reads ~/.curlrc
 # unless -q is the *first* argument, and a .curlrc — in a HOME on a writable
@@ -466,11 +481,58 @@ auth_check_probe() {
       -w '%{http_code}' "${GITHUB_API_BASE}${probe_path}" 2>/dev/null)" || probe_code=000
   fi
   [ -n "${probe_code}" ] || probe_code=000
-  probe_limit="$(awk 'tolower($1) == "x-ratelimit-limit:" { v = $2 }
-    END { gsub(/\r/, "", v); print (v == "" ? "-" : v) }' "${probe_hdr}" 2>/dev/null)" || probe_limit="-"
-  [ -n "${probe_limit}" ] || probe_limit="-"
+  # ONE awk pass with ONE cleaner, deliberately, rather than three copies of
+  # the line that read x-ratelimit-limit before PEN-5355 widened this. The
+  # cleaner is small and entirely made of the parts that are easy to drop in a
+  # hand-copy — the CR strip (GitHub's headers are CRLF, so an un-stripped
+  # value compares unequal to every literal) and the "-" default — and PEN-5355
+  # was filed carrying a corrupted hand-copy of exactly that line, so copying
+  # it twice more by hand is the one thing this change must not do. Same
+  # reasoning as trim_seat_token below: the copies were the defect.
+  probe_rate="$(awk '
+    function clean(v) { gsub(/\r/, "", v); return (v == "" ? "-" : v) }
+    tolower($1) == "x-ratelimit-limit:"     { lim = $2 }
+    tolower($1) == "x-ratelimit-remaining:" { rem = $2 }
+    tolower($1) == "x-ratelimit-reset:"     { rst = $2 }
+    END { print clean(lim), clean(rem), clean(rst) }' "${probe_hdr}" 2>/dev/null)" || probe_rate="- - -"
+  [ -n "${probe_rate}" ] || probe_rate="- - -"
   rm -f "${probe_hdr}"
-  printf '%s %s\n' "${probe_code}" "${probe_limit}"
+  # Split here rather than emitting ${probe_rate} as one unquoted word, so the
+  # final printf states the field count literally. That is what lets the suite
+  # assert this emit against both of the caller's `[ $# -eq N ]` guards
+  # statically; a `'%s %s'` that happens to expand to four fields couples to
+  # nothing and the guards drift silently. `set -f` because the fields are
+  # expanded unquoted and a `*` from a malformed header would otherwise glob
+  # against cwd; `set --` is safe because $1/$2 were copied to probe_path and
+  # probe_cfg at entry.
+  set -f
+  # shellcheck disable=SC2086
+  set -- ${probe_rate}
+  set +f
+  # awk's END block always prints three fields, so anything else means awk
+  # itself failed or was replaced. Fail to the all-unknown row rather than
+  # emitting a short line the caller would reject as a temp-dir fault.
+  [ $# -eq 3 ] || set -- - - -
+  printf '%s %s %s %s\n' "${probe_code}" "$1" "$2" "$3"
+}
+
+# Renders an x-ratelimit-reset epoch as a UTC timestamp beside the raw value,
+# because "reset 1793681618" does not answer the only question an agent holding
+# an exhausted budget has, which is how long to wait. Best-effort and never
+# load-bearing: `date -u -d @N` is a GNU extension that BusyBox and BSD date do
+# not take, and this wrapper runs wherever an agent pod runs. Anything that is
+# not all-digits — including the "-" the probe emits for an absent header — is
+# passed straight through untouched rather than guessed at.
+auth_check_reset_label() {
+  case "$1" in
+    '' | *[!0-9]*) printf '%s\n' "$1" ; return 0 ;;
+  esac
+  reset_iso="$(date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null)" || reset_iso=""
+  if [ -n "${reset_iso}" ]; then
+    printf '%s (%s)\n' "${reset_iso}" "$1"
+  else
+    printf '%s\n' "$1"
+  fi
 }
 
 # Reports the kubelet atomic-writer generation backing a mounted Secret. kubelet
@@ -612,10 +674,16 @@ paperclip_auth_check() {
   # wrapper dies with rc 2 — which is the NO_CREDENTIAL verdict code, so a
   # read-only TMPDIR would read as a missing credential. Checking the arity also
   # fails closed on any other malformed probe output.
-  [ $# -eq 2 ] || exit 70
+  #
+  # FOUR, not two, since PEN-5355 widened the probe to carry the whole
+  # rate-limit triple. This number and the one on the authenticated probe below
+  # must move together with auth_check_probe's final printf; a mismatch exits 70
+  # on EVERY invocation, which is safe but is a total outage of the one
+  # diagnostic an agent reaches for mid-incident.
+  [ $# -eq 4 ] || exit 70
   anon_code="$1" anon_limit="$2"
 
-  auth_code="-" auth_limit="-"
+  auth_code="-" auth_limit="-" auth_remaining="-" auth_reset="-"
   if [ -n "${check_token}" ]; then
     # /installation/repositories, not /rate_limit: a healthy *App installation*
     # token authenticates there and is refused per-endpoint elsewhere (403 on
@@ -630,10 +698,10 @@ paperclip_auth_check() {
     set -f
     set -- $(auth_check_probe "/installation/repositories" "${check_cfg}")
     set +f
-    # Same arity guard as the unauthenticated probe above, for the same reason.
-    # The EXIT trap removes check_cfg on the way out.
-    [ $# -eq 2 ] || exit 70
-    auth_code="$1" auth_limit="$2"
+    # Same arity guard as the unauthenticated probe above, for the same reason,
+    # and the same four fields. The EXIT trap removes check_cfg on the way out.
+    [ $# -eq 4 ] || exit 70
+    auth_code="$1" auth_limit="$2" auth_remaining="$3" auth_reset="$4"
     rm -f "${check_cfg}"
     check_cfg=""
   fi
@@ -645,11 +713,12 @@ paperclip_auth_check() {
   fi
 
   # Verdicts are deliberately distinct states with distinct exit codes, because
-  # the whole defect is that GitHub collapses them into one string. Six of them:
-  # OK 0 - REJECTED 1 - NO_CREDENTIAL 2 - AMBIENT_AUTH 3 - GITHUB_UNREACHABLE 4
-  # - UNEXPECTED 5, beside the 70 a temp-dir fault exits with above. Keep this
-  # list in step with the arms below; a stale count here is the same class of
-  # confidently-wrong diagnostic the subcommand exists to end.
+  # the whole defect is that GitHub collapses them into one string. Seven of
+  # them: OK 0 - REJECTED 1 - NO_CREDENTIAL 2 - AMBIENT_AUTH 3 -
+  # GITHUB_UNREACHABLE 4 - UNEXPECTED 5 - RATE_LIMITED 6, beside the 70 a
+  # temp-dir fault exits with above. Keep this list in step with the arms below;
+  # a stale count here is the same class of confidently-wrong diagnostic the
+  # subcommand exists to end.
   #
   # Order matters: a transport failure is decided before anything is read as a
   # statement by GitHub.
@@ -679,6 +748,17 @@ paperclip_auth_check() {
       verdict="REJECTED — the token reached GitHub and GitHub refused it, while unauthenticated GitHub answered ${anon_code}; the credential itself is bad"
       verdict_code=1
     fi
+  elif [ "${auth_code}" = 403 ] && [ "${auth_remaining}" = 0 ]; then
+    # Gated on remaining == 0, NOT on bare 403. A 403 carrying headroom is a
+    # genuine authorization refusal and must keep falling through to UNEXPECTED;
+    # widening this to bare 403 would relabel a real permission loss as
+    # throttling, which is the fail-open direction. The pairing is what makes
+    # the state readable: `limit` is 9500 on the installation plane and 60
+    # anonymously, so a 403 quoting the installation limit is positive evidence
+    # the credential AUTHENTICATED and was then throttled — it is not a
+    # credential fault, and it is not PEN-5239.
+    verdict="RATE_LIMITED — the credential is VALID and authenticated (rate limit ${auth_limit}/hr, installation plane); the shared installation budget is exhausted. This is NOT a credential fault and NOT PEN-5239. Wait for the reset above; GraphQL has a separate budget. Tracked: PEN-3776/PEN-3852"
+    verdict_code=6
   else
     verdict="UNEXPECTED — authenticated /installation/repositories -> ${auth_code}; not a known state, report it with the generation above"
     verdict_code=5
@@ -692,7 +772,8 @@ paperclip_auth_check() {
   printf '  mount-written:      %s\n' "${check_written}"
   printf '  token-sha256:       %s\n' "${check_hash}"
   printf '  github-reachable:   %s\n' "${github_reachable}"
-  printf '  authenticated:      /installation/repositories -> %s, x-ratelimit-limit %s\n' "${auth_code}" "${auth_limit}"
+  printf '  authenticated:      /installation/repositories -> %s, x-ratelimit-limit %s, remaining %s, reset %s\n' \
+    "${auth_code}" "${auth_limit}" "${auth_remaining}" "$(auth_check_reset_label "${auth_reset}")"
   printf '  verdict:            %s\n' "${verdict}"
   exit "${verdict_code}"
 }
