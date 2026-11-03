@@ -39,6 +39,19 @@ export function parseCostDateRange(query: Record<string, unknown>) {
   return (from || to) ? { from, to } : undefined;
 }
 
+/**
+ * PEN-4902: `agentId` on the agent-keyed cost aggregates. Previously accepted
+ * and dropped — the route read `companyId` and the date range and nothing
+ * else — so a per-seat request answered with all nine seats and a caller
+ * taking `rows[0]` got the top spender under the requested seat's name.
+ */
+export function parseCostAgentId(query: Record<string, unknown>) {
+  const raw = Array.isArray(query.agentId) ? query.agentId[0] : query.agentId;
+  if (raw == null || raw === "") return undefined;
+  if (typeof raw !== "string") throw badRequest("invalid 'agentId' value");
+  return raw;
+}
+
 export function parseCostLimit(query: Record<string, unknown>) {
   const raw = Array.isArray(query.limit) ? query.limit[0] : query.limit;
   if (raw == null || raw === "") return 100;
@@ -198,7 +211,7 @@ export function costRoutes(
     assertCompanyAccess(req, companyId);
     if (!(await assertCompanyCostReadAllowed(req, res, companyId))) return;
     const range = parseCostDateRange(req.query);
-    const rows = await costs.byAgent(companyId, range);
+    const rows = await costs.byAgent(companyId, range, { agentId: parseCostAgentId(req.query) });
     res.json(rows);
   });
 
@@ -207,7 +220,7 @@ export function costRoutes(
     assertCompanyAccess(req, companyId);
     if (!(await assertCompanyCostReadAllowed(req, res, companyId))) return;
     const range = parseCostDateRange(req.query);
-    const rows = await costs.byAgentModel(companyId, range);
+    const rows = await costs.byAgentModel(companyId, range, { agentId: parseCostAgentId(req.query) });
     res.json(rows);
   });
 

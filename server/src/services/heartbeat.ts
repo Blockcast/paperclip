@@ -5271,6 +5271,34 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
 const heartbeatRunProcessGroupIdColumn =
   heartbeatRuns.processGroupId ?? sql<number | null>`NULL`.as("processGroupId");
 
+export type HeartbeatRunWindow = { from?: Date; to?: Date };
+
+/**
+ * PEN-4902: the company run list's `created_at` window, shared by the list and
+ * its count so the two can never disagree about what is in range.
+ *
+ * ⚠️ HALF-OPEN `[from, to)` — deliberately NOT the inclusive `to` that
+ * `parseCostDateRange` (`routes/costs.ts`) gives the `/costs/*` aggregates.
+ * Chaining day windows is the whole point of this filter, and with an
+ * inclusive bound `from=D1&to=D2` and `from=D2&to=D3` would both claim a run
+ * created exactly at `D2T00:00:00.000Z`. Half-open also matches
+ * `getMonthlySpendTotal`, which is the window budget enforcement actually
+ * uses. The divergence from `/costs/*` is real; it is documented here, on the
+ * route, and in the OpenAPI summary rather than left to be discovered.
+ */
+function heartbeatRunWindowPredicate(
+  companyId: string,
+  agentId?: string,
+  createdAtWindow: HeartbeatRunWindow = {},
+) {
+  return and(
+    eq(heartbeatRuns.companyId, companyId),
+    agentId ? eq(heartbeatRuns.agentId, agentId) : undefined,
+    createdAtWindow.from ? gte(heartbeatRuns.createdAt, createdAtWindow.from) : undefined,
+    createdAtWindow.to ? lt(heartbeatRuns.createdAt, createdAtWindow.to) : undefined,
+  );
+}
+
 const heartbeatRunListColumns = {
   id: heartbeatRuns.id,
   companyId: heartbeatRuns.companyId,
@@ -46325,11 +46353,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await new Promise((resolve) => setTimeout(resolve, intervalMs));
       }
     },
+    /**
+     * PEN-4902: how many runs a company (optionally one agent) has in a
+     * `created_at` window, without shipping the rows. The run list is the
+     * denominator for every per-run quantity in this tenant, and the only way
+     * to get one used to be to fetch every row and count them client-side —
+     * on a route whose `limit` is optional, so the honest call was an
+     * unbounded full-table read.
+     */
+    countRuns: async (
+      companyId: string,
+      agentId?: string,
+      createdAtWindow: HeartbeatRunWindow = {},
+    ) => {
+      const rows = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(heartbeatRuns)
+        .where(heartbeatRunWindowPredicate(companyId, agentId, createdAtWindow));
+      return rows[0]?.count ?? 0;
+    },
     list: async (
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: { summary?: boolean } & HeartbeatRunWindow = {},
     ) => {
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
@@ -46353,11 +46400,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               },
         )
         .from(heartbeatRuns)
-        .where(
-          agentId
-            ? and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId))
-            : eq(heartbeatRuns.companyId, companyId),
-        )
+        .where(heartbeatRunWindowPredicate(companyId, agentId, options))
         .orderBy(desc(heartbeatRuns.createdAt));
 
       const rows = limit ? await query.limit(limit) : await query;

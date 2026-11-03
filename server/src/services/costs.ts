@@ -12,6 +12,19 @@ export interface CostDateRange {
   to?: Date;
 }
 
+/**
+ * PEN-4902: narrow an agent-keyed cost aggregate to one seat.
+ *
+ * `GET /costs/by-agent?agentId=…` used to accept the parameter and ignore it,
+ * answering 200 with every seat in the company. The failure is not that the
+ * caller gets too much — it is that the natural read of a one-seat request,
+ * `rows[0]`, silently returns whichever seat sorts first by spend. A wrong
+ * seat's number is indistinguishable from the right one at the call site.
+ */
+export interface CostAgentFilter {
+  agentId?: string;
+}
+
 const METERED_BILLING_TYPE = "metered_api";
 const SUBSCRIPTION_BILLING_TYPES = ["subscription_included", "subscription_overage"] as const;
 
@@ -369,8 +382,9 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       };
     },
 
-    byAgent: async (companyId: string, range?: CostDateRange) => {
+    byAgent: async (companyId: string, range?: CostDateRange, options: CostAgentFilter = {}) => {
       const conditions: ReturnType<typeof eq>[] = [eq(costEvents.companyId, companyId)];
+      if (options.agentId) conditions.push(eq(costEvents.agentId, options.agentId));
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
       if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
 
@@ -548,8 +562,9 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       return results.flat();
     },
 
-    byAgentModel: async (companyId: string, range?: CostDateRange) => {
+    byAgentModel: async (companyId: string, range?: CostDateRange, options: CostAgentFilter = {}) => {
       const conditions: ReturnType<typeof eq>[] = [eq(costEvents.companyId, companyId)];
+      if (options.agentId) conditions.push(eq(costEvents.agentId, options.agentId));
       if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
       if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
 

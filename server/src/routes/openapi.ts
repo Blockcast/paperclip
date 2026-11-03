@@ -3144,14 +3144,26 @@ const costSummaryPaths = [
   "finance-by-kind", "finance-events", "window-spend", "quota-windows",
 ] as const;
 
+// PEN-4902: the agent-keyed aggregates take `agentId`; the others do not, and
+// a parameter this registry does not declare is one the route silently drops.
+const costAgentKeyedPaths = new Set<string>(["by-agent", "by-agent-model"]);
+
+const costAgentIdQuery = z.object({
+  agentId: z.string().min(1).optional()
+    .describe("Narrow the report to one agent. Omit for every agent in the company."),
+});
+
 for (const segment of costSummaryPaths) {
+  const params = z.object({ companyId: z.string() });
   registry.registerPath({
     method: "get",
     path: `/api/companies/{companyId}/costs/${segment}`,
     tags: ["costs"],
     summary: `Cost report: ${segment}`,
-    request: { params: z.object({ companyId: z.string() }) },
-    responses: { 200: r.ok(), 401: r.unauthorized },
+    request: costAgentKeyedPaths.has(segment)
+      ? { params, query: costAgentIdQuery }
+      : { params },
+    responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
   });
 }
 
@@ -3918,9 +3930,28 @@ registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/heartbeat-runs",
   tags: ["runs"],
-  summary: "List heartbeat runs for a company",
-  request: { params: z.object({ companyId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  // PEN-4902: `from` / `to` are HALF-OPEN on `created_at` — `to` is EXCLUSIVE
+  // here and INCLUSIVE on `/costs/*`. Stated in the summary because the split
+  // travels with the caller, not with the endpoint.
+  summary:
+    "List heartbeat runs for a company. `from`/`to` filter `created_at` as the half-open window [from, to) — note `to` is exclusive here and inclusive on the /costs/* reports.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: z.object({
+      agentId: z.string().min(1).optional(),
+      // Any string `new Date(...)` accepts, so a bare `2026-11-02` is legal and
+      // means that day's midnight UTC — not the end of it. Unparseable is a 400.
+      from: z.string().min(1).optional()
+        .describe("Inclusive lower bound on created_at (ISO-8601; a bare date is that day at 00:00:00Z)."),
+      to: z.string().min(1).optional()
+        .describe("EXCLUSIVE upper bound on created_at (ISO-8601; a bare date is that day at 00:00:00Z)."),
+      limit: z.coerce.number().int().min(1).max(1000).optional(),
+      summary: z.enum(["true", "1", "false", "0"]).optional(),
+      countOnly: z.enum(["true", "1", "false", "0"]).optional()
+        .describe("Return `{ count }` for the window instead of the rows."),
+    }),
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({
