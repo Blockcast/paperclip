@@ -86,6 +86,16 @@ describe("BLO-35668: terminal-failed wake error codes match their runbook rows",
     ).toEqual(emitted);
   });
 
+  // PEN-5424: `run_log_unwritable` REPLACED `adapter_failed` at the `executeRun`
+  // catch site, so these runs were already a member before the relabel. Omitting
+  // it would silently move them to `other` and change this gauge's meaning with
+  // nothing upstream having changed — the same reasoning that put
+  // `caveman_proxy_not_ready` and `skill_materialization_pending` here.
+  it("labels run_log_unwritable wherever it labels adapter_failed", () => {
+    const codes = new Set<string>(KNOWN_TERMINAL_FAILED_WAKE_ERROR_CODES);
+    expect(codes.has("run_log_unwritable")).toBe(codes.has("adapter_failed"));
+  });
+
   it("lists each code exactly once", () => {
     const duplicates = runbookCodes.filter((code, i) => runbookCodes.indexOf(code) !== i);
     expect(duplicates, `${RUNBOOK_PATH}: duplicate Step 2 rows`).toEqual([]);

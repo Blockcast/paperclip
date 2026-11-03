@@ -14854,6 +14854,28 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+/**
+ * Error codes that count toward the crashloop circuit breaker
+ * (`consecutiveAdapterFailedRuns`, read by the timer gate's
+ * `adapter_failed_circuit_breaker` arm).
+ *
+ * PEN-5424: `run_log_unwritable` rides this with `adapter_failed` because it
+ * REPLACED it at the `executeRun` catch site, and the breaker counter is
+ * reset-on-any-other-code — so a rename that stops here does not merely fail to
+ * enrol, it actively DISARMS the control. A run-log permission fault is the
+ * textbook case the breaker exists for: the retry re-attempts an identical
+ * mkdir against an identical root, so without this every timer tick spawns
+ * another doomed run and nothing ever bounds it. Leaving the code out of the
+ * two `adapter_failed` RETRY arms is deliberate (a retry buys nothing); leaving
+ * it out of the breaker was not, and is the opposite trade.
+ *
+ * Exported so the enrolment is assertable — BLO-35668's post-mortem notes that
+ * the sites a test cannot reach are exactly the ones a rename drifts at.
+ */
+export function countsTowardAdapterFailedCircuitBreaker(errorCode: string | null | undefined): boolean {
+  return errorCode === "adapter_failed" || errorCode === RUN_LOG_UNWRITABLE_ERROR_CODE;
+}
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   // PEN-3328. The queued-run dispatch critical section's database work is made
   // cancellable by wrapping the postgres.js client, but that wrap is applied at
@@ -32343,10 +32365,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           '0'::jsonb
         )`;
 
-    // Crashloop circuit breaker: track consecutive adapter_failed runs.
+    // Crashloop circuit breaker: track consecutive runs that died before doing
+    // useful work. Keyed on `countsTowardAdapterFailedCircuitBreaker` rather
+    // than the `adapter_failed` literal, because this counter is RESET by any
+    // code it does not count — so a code that belongs here and is omitted
+    // disarms the breaker rather than merely failing to arm it.
     // Nested inside idleCounterUpdate so both keys update atomically.
-    const isAdapterFailed = run.status === "failed" && result.errorCode === "adapter_failed";
-    const stateCounterUpdate = isAdapterFailed
+    const countsTowardCrashloopBreaker =
+      run.status === "failed" && countsTowardAdapterFailedCircuitBreaker(result.errorCode);
+    const stateCounterUpdate = countsTowardCrashloopBreaker
       ? sql`jsonb_set(
           ${idleCounterUpdate},
           '{consecutiveAdapterFailedRuns}',

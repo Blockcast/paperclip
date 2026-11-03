@@ -280,6 +280,13 @@ describe("createDurableRunLogStore permission diagnostics", () => {
       expect(message).toContain("RUN_LOG_BASE_PATH");
       // And the disambiguation that stops the next reader bisecting a diff.
       expect(message).toContain("not a run-scheduling fault");
+      // Ally suggestion 1: ownership is only one of the three ways to reach
+      // this message. EROFS says nothing about ownership, and an EACCES can
+      // land on a path the uid DOES own whose mode bits deny the write — so
+      // the message must not send the reader to `chown` for a fault `chown`
+      // cannot fix.
+      expect(message).toContain("cannot write to the path");
+      expect(message).not.toContain("does not own the path");
       // Callers that branch on the errno must still see it.
       expect(err?.code).toBe("EACCES");
       expect((err as { cause?: NodeJS.ErrnoException }).cause?.code).toBe("EACCES");
@@ -306,6 +313,59 @@ describe("createDurableRunLogStore permission diagnostics", () => {
     expect(err?.message).not.toContain("RUN_LOG_BASE_PATH");
     expect(["ENOTDIR", "EEXIST"]).toContain(err?.code);
     expect(isRunLogUnwritableError(err)).toBe(false);
+  });
+
+  // Ally suggestion 2: provenance is supplied by whoever CHOSE the base path,
+  // not read back out of the environment. A store constructed with an explicit
+  // `basePath` — every test, and any caller that is not `getRunLogStore` —
+  // would otherwise be labelled with whatever RUN_LOG_BASE_PATH happens to
+  // hold, naming a directory this store never used. This message exists to stop
+  // a misdiagnosis, so an unsupported claim is worse than no claim.
+  asNonRoot("claims no base-path provenance when the caller supplied one explicitly", async () => {
+    const readOnlyRoot = await fs.mkdtemp(path.join(os.tmpdir(), "run-log-store-noprov-"));
+    await fs.chmod(readOnlyRoot, 0o555);
+    const savedOverride = process.env.RUN_LOG_BASE_PATH;
+    // Deliberately set to a path this store does NOT use: the old message read
+    // the env var and would have labelled the root as coming from it.
+    process.env.RUN_LOG_BASE_PATH = path.join(os.tmpdir(), "some-other-root");
+    try {
+      const store = createDurableRunLogStore({ basePath: readOnlyRoot });
+      const err = await store.begin(begin).then(
+        () => null,
+        (caught: unknown) => caught as NodeJS.ErrnoException,
+      );
+      const message = String(err?.message);
+      expect(message).toContain(readOnlyRoot);
+      expect(message).not.toContain("(from RUN_LOG_BASE_PATH)");
+      expect(message).not.toContain("(derived from PAPERCLIP_HOME)");
+      // The remedy sentence still names the variable; it is advice, not a claim
+      // about where this store's root came from.
+      expect(message).toContain("Set RUN_LOG_BASE_PATH");
+    } finally {
+      if (savedOverride === undefined) delete process.env.RUN_LOG_BASE_PATH;
+      else process.env.RUN_LOG_BASE_PATH = savedOverride;
+      await fs.chmod(readOnlyRoot, 0o755);
+      await fs.rm(readOnlyRoot, { recursive: true, force: true });
+    }
+  });
+
+  asNonRoot("states the provenance it was given", async () => {
+    const readOnlyRoot = await fs.mkdtemp(path.join(os.tmpdir(), "run-log-store-prov-"));
+    await fs.chmod(readOnlyRoot, 0o555);
+    try {
+      const store = createDurableRunLogStore({
+        basePath: readOnlyRoot,
+        basePathOrigin: "derived from PAPERCLIP_HOME",
+      });
+      const err = await store.begin(begin).then(
+        () => null,
+        (caught: unknown) => caught as NodeJS.ErrnoException,
+      );
+      expect(String(err?.message)).toContain("(derived from PAPERCLIP_HOME)");
+    } finally {
+      await fs.chmod(readOnlyRoot, 0o755);
+      await fs.rm(readOnlyRoot, { recursive: true, force: true });
+    }
   });
 
   it("does not claim an unrelated EACCES as a run-log fault", () => {
