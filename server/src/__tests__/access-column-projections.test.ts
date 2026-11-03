@@ -76,6 +76,25 @@ describe("access service column projections", () => {
     const serverSrc = fileURLToPath(new URL("..", import.meta.url));
     const TABLES = ["companyMemberships", "principalPermissionGrants"] as const;
 
+    // The scan's two patterns and its `.returning()` probe are built HERE, so the
+    // positive control below can exercise the very construction the scan runs. A
+    // control that re-declares its own copy asserts a DIFFERENT regex than the one
+    // that ships, and drifts from it on the next edit — which is the same vacuity
+    // this control exists to catch, one level up. Refs PEN-5318.
+    //
+    // Fresh objects on every call, deliberately. `bareSelect` and `mutation` carry
+    // `g`: `matchAll` is safe to repeat on one instance (it clones internally),
+    // but `test`/`exec` advance `lastIndex` and would start returning false on a
+    // string that does match. Handing out a new object per call means a future
+    // edit that reaches for `test` here cannot acquire that false negative.
+    const patternsFor = (table: string) => ({
+      bareSelect: new RegExp(`\\.select\\(\\s*\\)\\s*\\.from\\(\\s*${table}\\s*\\)`, "g"),
+      mutation: new RegExp(`\\.(?:update|insert|delete)\\(\\s*${table}\\s*\\)`, "g"),
+      // A bare `.returning()` hands back the whole row just as a bare `.select()`
+      // does; `ensureMembership` was the live instance of this.
+      bareReturning: /\.returning\(\s*\)/,
+    });
+
     const sourceFiles = (dir: string): string[] =>
       readdirSync(dir).flatMap((entry) => {
         const full = join(dir, entry);
@@ -92,19 +111,17 @@ describe("access service column projections", () => {
       const hits: string[] = [];
 
       for (const table of TABLES) {
-        const bareSelect = new RegExp(`\\.select\\(\\s*\\)\\s*\\.from\\(\\s*${table}\\s*\\)`, "g");
+        const { bareSelect, mutation, bareReturning } = patternsFor(table);
+
         for (const match of text.matchAll(bareSelect)) {
           hits.push(`${where(match.index ?? 0)} bare .select() on ${table}`);
         }
 
-        // A bare `.returning()` hands back the whole row just as a bare
-        // `.select()` does; `ensureMembership` was the live instance of this.
-        const mutation = new RegExp(`\\.(?:update|insert|delete)\\(\\s*${table}\\s*\\)`, "g");
         for (const match of text.matchAll(mutation)) {
           const start = match.index ?? 0;
           const end = text.indexOf(";", start);
           const statement = text.slice(start, end === -1 ? text.length : end);
-          if (/\.returning\(\s*\)/.test(statement)) {
+          if (bareReturning.test(statement)) {
             hits.push(`${where(start)} bare .returning() on ${table}`);
           }
         }
@@ -114,6 +131,38 @@ describe("access service column projections", () => {
 
     it("finds no bare .select() or .returning()", () => {
       expect(findings).toEqual([]);
+    });
+
+    it("the scan's own patterns still match a known-bad query", () => {
+      // The vacuity guard below proves the walk REACHED the files. This proves
+      // the patterns can still FIRE on what they exist to find — the other half,
+      // and the one that is indistinguishable from success when it breaks: an
+      // escaping mistake or a changed query-builder idiom leaves `findings`
+      // permanently `[]`, and "finds no bare .select() or .returning()" goes on
+      // passing while guarding nothing.
+      //
+      // Driven off TABLES, so a table added to the scan is covered here too
+      // rather than silently acquiring an untested pattern. The known-bad
+      // literals are safe to keep in this file and nowhere else: `sourceFiles`
+      // skips `__tests__` and `.test.ts`, so the scan cannot read them back as
+      // real findings.
+      //
+      // Both this loop and the scan's iterate TABLES, so an empty TABLES would
+      // make BOTH vacuous at once — the exact shape this control exists to deny.
+      expect(TABLES.length).toBeGreaterThan(0);
+
+      for (const table of TABLES) {
+        const { bareSelect, mutation, bareReturning } = patternsFor(table);
+        const bareRead = `const rows = await db.select()\n      .from(${table});`;
+        const bareWrite = `await db.insert(${table}).values({}).returning();`;
+
+        expect({
+          table,
+          bareSelect: [...bareRead.matchAll(bareSelect)].length,
+          mutation: [...bareWrite.matchAll(mutation)].length,
+          bareReturning: bareReturning.test(bareWrite),
+        }).toEqual({ table, bareSelect: 1, mutation: 1, bareReturning: true });
+      }
     });
 
     it("actually scanned the files it claims to cover", () => {
