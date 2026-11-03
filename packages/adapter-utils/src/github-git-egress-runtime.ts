@@ -558,8 +558,14 @@ export function buildGitArgv(
   // do not). That cannot be made safe from inside the pod, so refuse it; a
   // dry run deletes nothing and stays allowed.
   if (classification.subcommand === "worktree" && argv[classification.subcommandIndex + 1] === "prune") {
-    const rest = argv.slice(classification.subcommandIndex + 2);
-    if (!rest.includes("-n") && !rest.includes("--dry-run")) {
+    // `--dry-run` is a negatable bool and the last value wins, so
+    // `-n --no-dry-run` really prunes; scan in order rather than test membership.
+    let dryRun = false;
+    for (const arg of argv.slice(classification.subcommandIndex + 2)) {
+      if (arg === "-n" || arg === "--dry-run") dryRun = true;
+      else if (arg === "--no-dry-run") dryRun = false;
+    }
+    if (!dryRun) {
       throw new GitEgressRuntimeError(
         "paperclip-github-egress: refusing to run `git worktree prune`. It deregisters every worktree whose directory this container cannot see, and an isolated run sees only its own -- so it removes other runs' live worktrees from the shared repository. Use `git worktree remove <path>` for a specific worktree you own; `git worktree prune --dry-run` is allowed.",
       );
