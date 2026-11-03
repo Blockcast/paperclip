@@ -45,6 +45,30 @@
  * Only the first is MEASURED (below). The other two are read from source — same call site,
  * same missing term — and carry no telemetry here; do not cite them as observed.
  *
+ * ### The two hand transitions out of `blocked` behave OPPOSITELY
+ *
+ * The list above is exhaustive, and that is the point: `blocked` -> `in_progress` matches
+ * NONE of the three flags (`statusChangedFromBlockedToTodo` requires `issue.status === "todo"`
+ * literally), and on a status-only PATCH no other branch covers it either — the sibling
+ * `issue_assigned` arm needs an assignee change, and `buildExecutionStageWakeup` keys on
+ * execution state rather than status. Both targets are wake statuses below, so:
+ *
+ *  - -> `todo`: woken at the transition (~1 s, measured above) AND again at the deadline,
+ *    because the PATCH leaves the park live. Two wakes from one intent.
+ *  - -> `in_progress`: silent at the transition, woken once at the deadline.
+ *
+ * Nothing in the API surfaces that difference, so prefer `in_progress` when one wake at the
+ * deadline is what you meant. One caveat, read from source and NOT measured: the
+ * `long_active_duration` trigger (`services/productivity-review.ts`) contains no reference to
+ * `parked_until` or `isDeliberateParkActive` at all — the "park" its code names is a
+ * run-liveness gap, a different thing — and its elapsed clock is gated on `in_progress`. It
+ * clamps the episode end to `nonLiveExecutionHoldSince`, which returns null when
+ * `issue.executionRunId` is null, so a previously-checked-out row (non-null `issues.started_at`,
+ * which is stamped at CHECKOUT and not by a status PATCH) left on `in_progress` with no holder
+ * accrues elapsed time across the park. A row never checked out reads null and cannot trip it,
+ * and a `todo` row is outside the trigger by construction. Nobody has observed this firing;
+ * check it before recommending `in_progress` as a general pattern.
+ *
  * The `blocked` arm is the one the exclusion below depends on, because that is not how a row
  * normally reaches `todo`, and conflating the two writers is the trap.
  * `stranded-blocked-issue-reconciler.ts` flips with a bare `UPDATE` and enqueues nothing, so
