@@ -107,6 +107,26 @@ describe("formatSharedCheckoutOccupancyWarning", () => {
     expect(warning).toContain("agent-scoped, not path-proven");
   });
 
+  /**
+   * PEN-5352 criterion 2. The incident's colliding run read `ListAgents ->
+   * none` as "no peer session is reachable from my pod" and designed around an
+   * unreachable peer, when the other writer was its own seat. The count alone
+   * did not prevent that -- the warning has to name the blind spot, or an empty
+   * ListAgents keeps reading as proof of absence.
+   */
+  it("names the ListAgents blind spot so an empty result stops reading as absence", () => {
+    const warning = formatSharedCheckoutOccupancyWarning({
+      cwd: CWD,
+      strategyType: "project_primary",
+      siblingRunIds: [SIBLING_RUN],
+    });
+    expect(warning).toContain("YOUR OWN SEAT");
+    expect(warning).toContain("ListAgents CANNOT SEE THEM");
+    expect(warning).toContain("separate pod");
+    expect(warning).toContain("never 'nobody else is");
+    expect(warning).toContain("issue thread");
+  });
+
   it("truncates the run list instead of pasting an unbounded fleet of ids", () => {
     const ids = Array.from(
       { length: SHARED_CHECKOUT_WARNING_RUN_SAMPLE + 3 },

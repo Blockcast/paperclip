@@ -86,3 +86,10 @@ vendor/*.tgz
 # Python bytecode (the .github/scripts/ sweep suite is run with unittest locally)
 __pycache__/
 *.pyc
+
+# Directory ownership claims taken by agent runs (PEN-5352). These live inside
+# the working tree they claim, so an agent that claims a checkout of this repo
+# would otherwise see its own claim as an untracked edit -- the exact kind of
+# ambiguous on-disk noise a run standing in a contended tree cannot interpret.
+.paperclip-dir-claim.json
+.dir-claim-released-*.json
