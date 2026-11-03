@@ -356,6 +356,10 @@ export const issueExecutionMonitorStateSchema = z.object({
   // spread; `null` means a clear genuinely found nothing owed. Old rows still
   // parse, because the key is optional rather than defaulted.
   clearedNextCheckAt: z.string().datetime().nullable().optional(),
+  // PEN-5346. `prefault(null)` so the rows written before this field existed —
+  // which is the whole backfill population — parse as "handoff still owed"
+  // rather than failing validation or reading as already discharged.
+  recoveryEmittedAt: z.string().datetime().nullable().prefault(null),
 });
 
 export const issueReviewRequestSchema = z.object({

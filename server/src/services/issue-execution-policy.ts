@@ -291,6 +291,7 @@ export function derivePersistedMonitorState(input: {
       clearedAt: null,
       clearReason: null,
       clearedNextCheckAt: null,
+      recoveryEmittedAt: null,
     };
   }
 
@@ -303,6 +304,14 @@ export function derivePersistedMonitorState(input: {
       lastTriggeredAt,
       ...metadata,
       ...convergence,
+      // PEN-5346: normalize absent to null so a state persisted before the
+      // field existed derives to the same shape as one written after it.
+      // `monitorStatesEqual` compares by JSON.stringify, where an absent key
+      // and a null one are different strings; without this every such row
+      // would compare unequal to itself and take a spurious executionState
+      // write on the next transition. The spread keeps the key in its
+      // persisted position when it is already there.
+      recoveryEmittedAt: fromState.recoveryEmittedAt ?? null,
     };
   }
 
@@ -319,6 +328,7 @@ export function derivePersistedMonitorState(input: {
       clearedAt: null,
       clearReason: null,
       clearedNextCheckAt: null,
+      recoveryEmittedAt: null,
     };
   }
 
@@ -347,6 +357,7 @@ function buildScheduledMonitorState(
     // PEN-5343: an arm and a fire both leave nothing owed, so neither carries
     // a lost due time forward. Only a clear sets this.
     clearedNextCheckAt: null,
+    recoveryEmittedAt: null,
   };
 }
 
@@ -368,6 +379,7 @@ function buildTriggeredMonitorState(input: {
     // PEN-5343: an arm and a fire both leave nothing owed, so neither carries
     // a lost due time forward. Only a clear sets this.
     clearedNextCheckAt: null,
+    recoveryEmittedAt: null,
   };
 }
 
@@ -398,6 +410,13 @@ function buildClearedMonitorState(input: {
     clearedAt: input.clearedAt.toISOString(),
     clearReason: input.clearReason,
     ...clearedNextCheckAtField(input.previous),
+    // PEN-5346: a clear owes a handoff; this clear has not made one yet.
+    // Deliberately NOT carried forward from `previous` — the audit copy is of
+    // the monitor being destroyed now, so inheriting an earlier clear's stamp
+    // would mark this obligation discharged by a recovery that was emitted for
+    // a different one. A re-clear can only reach here with a monitor armed in
+    // between, and an arm resets the stamp anyway.
+    recoveryEmittedAt: null,
   };
 }
 

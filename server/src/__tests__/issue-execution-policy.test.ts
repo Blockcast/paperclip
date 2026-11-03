@@ -386,6 +386,137 @@ function approvalOnlyPolicy() {
   ]);
 }
 
+/**
+ * PEN-5346: `recoveryEmittedAt` is the persisted answer to "has the obligation
+ * this clear destroyed been handed to a carrier that survives the clear?".
+ * `reconcileCancelledIssueMonitorRecoveries` selects on it, so these four
+ * assertions are what make that selection sound: a clear must owe a handoff, an
+ * arm must owe nothing, a later clear must not inherit an earlier discharge,
+ * and a row written before the field existed must read as owing one.
+ */
+describe("monitor recovery handoff bookkeeping (PEN-5346)", () => {
+  const armedPolicy = () =>
+    normalizeIssueExecutionPolicy({
+      stages: [],
+      monitor: { nextCheckAt: "2099-04-11T12:30:00.000Z", scheduledBy: "assignee", notes: "waiting on a merge" },
+    })!;
+
+  function monitorOf(state: unknown) {
+    return (state as { monitor?: Record<string, unknown> } | null)?.monitor ?? null;
+  }
+
+  it("leaves a fresh cancel owing a handoff", () => {
+    const policy = armedPolicy();
+    const patch = buildIssueMonitorClearedPatch({
+      issue: {
+        status: "cancelled",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+        monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
+      },
+      policy,
+      clearReason: "cancelled",
+    });
+
+    expect(monitorOf(patch.executionState)).toMatchObject({
+      status: "cleared",
+      clearReason: "cancelled",
+      recoveryEmittedAt: null,
+    });
+  });
+
+  it("does not let a later clear inherit an earlier clear's discharge", () => {
+    // The flapping shape: handed back once, re-armed, cancelled again. The
+    // second cancel destroys a DIFFERENT monitor and owes its own handoff —
+    // inheriting the stamp would silently drop it.
+    const policy = armedPolicy();
+    const patch = buildIssueMonitorClearedPatch({
+      issue: {
+        status: "cancelled",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: {
+          monitor: {
+            status: "cleared",
+            clearedAt: "2026-11-02T23:33:08.000Z",
+            clearReason: "cancelled",
+            recoveryEmittedAt: "2026-11-02T23:34:00.000Z",
+          },
+        } as unknown as IssueExecutionState,
+        monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
+      },
+      policy,
+      clearReason: "cancelled",
+    });
+
+    expect(monitorOf(patch.executionState)).toMatchObject({ recoveryEmittedAt: null });
+  });
+
+  it("owes nothing on an arm", () => {
+    const policy = armedPolicy();
+    const result = applyIssueMonitorPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: null,
+        executionState: {
+          monitor: {
+            status: "cleared",
+            clearedAt: "2026-11-03T01:11:39.000Z",
+            clearReason: "cancelled",
+            recoveryEmittedAt: "2026-11-03T01:12:00.000Z",
+          },
+        } as unknown as IssueExecutionState,
+      },
+      policy,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    expect(monitorOf(result.patch.executionState)).toMatchObject({
+      status: "scheduled",
+      recoveryEmittedAt: null,
+    });
+  });
+
+  it("reads a pre-existing cleared row as still owing a handoff", () => {
+    // The whole backfill population predates the field. Absent must derive to
+    // null — "owed" — not be left absent, which would compare unequal to an
+    // otherwise identical state under monitorStatesEqual and read as absent
+    // rather than owed to anything scanning it.
+    const derived = parseIssueExecutionState({
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor: {
+        status: "cleared",
+        nextCheckAt: null,
+        lastTriggeredAt: null,
+        attemptCount: 0,
+        notes: "waiting on a merge",
+        scheduledBy: "assignee",
+        clearedAt: "2026-11-03T01:11:39.000Z",
+        clearReason: "cancelled",
+      },
+    });
+
+    expect(derived?.monitor).toMatchObject({ clearReason: "cancelled", recoveryEmittedAt: null });
+  });
+});
+
 describe("normalizeIssueExecutionPolicy", () => {
   it("returns null for null/undefined input", () => {
     expect(normalizeIssueExecutionPolicy(null)).toBeNull();

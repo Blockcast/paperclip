@@ -841,6 +841,17 @@ export interface IssueExecutionMonitorState {
    * activity feed if you need to attribute the loss to a specific clear.
    */
   clearedNextCheckAt?: string | null;
+  /**
+   * PEN-5346: when the obligation this clear destroyed was handed to a carrier
+   * that survives the clear (a recovery issue), rather than dropped.
+   *
+   * Null on every armed and every freshly-cleared monitor — a clear owes a
+   * handoff until one is emitted, and `reconcileCancelledIssueMonitorRecoveries`
+   * selects on exactly that. Stamped only after the recovery has committed, so
+   * a crash between the two self-heals on the next sweep instead of marking an
+   * obligation discharged that nothing ever carried.
+   */
+  recoveryEmittedAt?: string | null;
 }
 
 export interface IssueReviewRequest {
