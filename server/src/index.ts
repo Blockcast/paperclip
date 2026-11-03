@@ -1409,8 +1409,8 @@ export async function startServer(): Promise<StartedServer> {
   if (config.paperclipNodeRole !== "api") {
     setInterval(() => {
       maybeTakeCpuProfile({ dir: config.heapSnapshotDir, durationMs: 60_000, keep: 3 })
-        .then((file) => {
-          if (file) logger.warn({ file }, "CPU profile written");
+        .then((res) => {
+          if (res) logger.warn({ file: res.file, ...res.summary }, "CPU profile written");
         })
         .catch((err) =>
           logger.error(
@@ -1425,8 +1425,8 @@ export async function startServer(): Promise<StartedServer> {
     // someone watching when a stall cluster happens, and nobody is (BLO-45336).
     setEventLoopStallListener((stallMs) => {
       maybeStartStallCpuProfile(stallMs, { dir: config.heapSnapshotDir, durationMs: 600_000, keep: 3 })
-        .then((file) => {
-          if (file) logger.warn({ file, triggerStallMs: stallMs }, "CPU profile written");
+        .then((res) => {
+          if (res) logger.warn({ file: res.file, triggerStallMs: stallMs, ...res.summary }, "CPU profile written");
         })
         .catch((err) =>
           logger.error({ err, dir: config.heapSnapshotDir }, "stall-triggered CPU profile capture failed"),
