@@ -919,7 +919,27 @@ export function classifyFromListing(pr, { now = Date.now() } = {}) {
     // directly-enqueued PR disarms nothing and would post a comment claiming a
     // disarm that never happened. `gh` exposes no dequeue flag (checked on
     // 2.102.0), so this one states the finding and leaves the queue alone.
-    if (ageHours > STALE_ENQUEUE_HOURS) {
+    //
+    // ⛔ AGE ALONE IS NOT STALENESS HERE, and this is the trap `stale-enqueue`
+    // does not have. `enqueuedAt` dates when the PR ENTERED the queue, not how
+    // long it has been stuck, so ordinary queue depth crosses the threshold on
+    // a PR that is progressing perfectly well — this repo's queue has run 40+
+    // entries against a measured 18-34 merges/day, which is comfortably over
+    // STALE_ENQUEUE_HOURS of legitimate waiting. Reporting that PR as stale
+    // would be wrong in the expensive direction: it is sitting in a position it
+    // has already waited for, and the obvious reading of a staleness report is
+    // to dequeue and re-enqueue, which forfeits exactly that position.
+    //
+    // So the verdict also requires the entry to be at the FRONT. Position 1 is
+    // the only shape this data can diagnose as not-progressing: a head-of-queue
+    // entry is the one GitHub is actively trying to land, so 13h there means
+    // something is wedged rather than something is busy. Anything behind it is
+    // waiting its turn by design and stays `already-enqueued`.
+    //
+    // `position` is 1-based (verified live 2026-11-02 on a 4-deep queue). An
+    // absent or non-numeric position is NOT treated as the front — unread must
+    // not manufacture a finding.
+    if (ageHours > STALE_ENQUEUE_HOURS && position === 1) {
       return row("stale-queued", `${where}, enqueued ${ageHours.toFixed(1)}h ago`);
     }
     return row("already-enqueued", `${where}, enqueued ${ageHours.toFixed(1)}h ago`);
@@ -2472,11 +2492,19 @@ export function applyRow(repo, row, run = gh) {
     // so `run` does not throw, the row stays `enqueue`, and `sweepRepos` spends
     // a MAX_ENQUEUES_PER_FIRE slot on a PR that needed nothing (PEN-5279).
     //
-    // Renaming the action is what actually fixes the accounting: `enqueue` is
-    // the cap's predicate (`sweepRepos`) AND `unlandedEligible`'s, so a row
-    // that leaves here as `already-enqueued` is correctly excluded from both.
-    // Detecting the no-op from the message instead would be guesswork about
-    // which stream `gh` writes it to; this asks GitHub directly.
+    // ⚠ What the rename does and does not recover. THIS repo's slot is already
+    // spent: `classifyAll` decrements the budget at CLASSIFICATION time, before
+    // `applyRow` runs, so a row that raced into the queue after the bulk read
+    // has already consumed one of this repo's MAX_ENQUEUES_PER_FIRE. The rename
+    // corrects the CROSS-repo carry in `sweepRepos` (which re-counts `enqueue`
+    // rows after apply to seed the next repo) and keeps the row out of
+    // `unlandedEligible`. The in-repo slot is not refunded, and that is
+    // accepted: the race is narrow, the bulk read handles the systematic case,
+    // and re-running the cap mid-fire would be a larger change than the defect
+    // justifies.
+    //
+    // Detecting the no-op from gh's message instead would be guesswork about
+    // which stream it writes to; this asks GitHub directly.
     const queued = liveMergeQueueEntry(repo, row.number, run);
     if (queued) {
       row.action = "already-enqueued";
@@ -2521,11 +2549,15 @@ export function applyRow(repo, row, run = gh) {
       repo,
       row.number,
       STALE_QUEUED_MARKER,
-      `This PR has been sitting in the merge queue for over ${STALE_ENQUEUE_HOURS}h without ` +
-        `landing (${row.detail}). The landing routine does not remove PRs from the queue, so it ` +
-        `is reporting this rather than acting on it: either the queue is wedged, or a required ` +
-        `check on the queue branch never reported. Dequeue and re-enqueue it, or say here why it ` +
-        `stands.\n\nPosted once, not once per fire — the routine will not repeat this.`,
+      `This PR has been at the FRONT of the merge queue for over ${STALE_ENQUEUE_HOURS}h without ` +
+        `landing (${row.detail}). Head-of-queue is the position GitHub is actively trying to ` +
+        `land from, so this is reported as wedged rather than waiting — likely a required check ` +
+        `on the queue branch that never reported.\n\n` +
+        `⚠ Deliberately NOT recommending a dequeue-and-re-enqueue: that forfeits this PR's place ` +
+        `at the front of the queue, and if the cause is a check that will eventually report, it ` +
+        `costs the whole wait again. Diagnose the queue branch first.\n\n` +
+        `The landing routine does not remove PRs from the queue and has taken no action here. ` +
+        `Posted once, not once per fire — the routine will not repeat this.`,
       run,
     );
   }
