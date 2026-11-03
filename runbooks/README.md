@@ -182,6 +182,16 @@ platform cannot resolve automatically. Each runbook should be:
   run): the supported one-call repair path, and why the `PATCH {status:
   "todo"}` bounce is superseded. Trigger: review evidence reads
   `monitor lapsed at …, never re-armed`.
+- [`alertmanager-alert-row-status-volatility.md`](alertmanager-alert-row-status-volatility.md)
+  — an alert-backed issue is a *recycled* row: `paperclip-plugin-alertmanager`
+  cancels it when the alert resolves and reopens it when the alert re-fires, so
+  its `status` is a sample rather than a fact (64 plugin-authored transitions on
+  one row in 14 days) and each cancel silently destroys the assignee's armed
+  monitor (13 of 13 clears paired with a plugin cancel, lag 3-26 s, none ever
+  fired). Covers how to read the row safely and how to tell a destroyed monitor
+  from one that was never armed. Trigger: two agents reporting contradictory
+  `status` for the same alert row, or an armed monitor that produced no wake
+  while `monitorAttemptCount` stayed put.
 - [`plugin-error.md`](plugin-error.md) — an installed plugin has sat at
   `plugins.status='error'` past the grace period, distinct from an
   operator-disabled plugin. Trigger: alert `PaperclipPluginCriticalErrored` or
