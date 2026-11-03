@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import {
+  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -10,6 +11,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it, expect, vi } from "vitest";
 import {
   buildJobManifest,
@@ -19,6 +21,7 @@ import {
   validatePonytailPluginPath,
   wakePayloadWithoutWorkspaceWarnings,
 } from "./job-manifest.js";
+import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { DEFAULT_OPENCODE_VERSION } from "./runtime-pin.js";
 import { ENV_GUARD_PLUGIN_SCRIPT } from "./env-guard-plugin.js";
 
@@ -2716,5 +2719,109 @@ describe("wakePayloadWithoutWorkspaceWarnings (PEN-5336)", () => {
     expect(wakePayloadWithoutWorkspaceWarnings({ executionWorkspace: null })).toEqual({
       executionWorkspace: null,
     });
+  });
+});
+
+// PEN-5336 review follow-up. `wakePayloadWithoutWorkspaceWarnings` has unit
+// tests above, but a correct helper does not prove the GATE uses it -- and
+// "the component is right, so delivery must be right" is precisely the
+// inference that let BLO-27858 ship a warning that reached nobody for four
+// months. These tests go through `buildJobManifest` and assert on
+// `promptMetrics`, so they fail if the gate stops calling the helper, if it
+// goes back to reading the rendered string, or if the strip is widened.
+//
+// This mirrors the claude_k8s suite's "warning-only resume keeps
+// heartbeatPromptChars > 0" case, which has no counterpart here.
+describe("the resume-delta gate is blind to warnings end to end (PEN-5336)", () => {
+  const CONTENTION =
+    "SHARED CHECKOUT CONTENTION: 1 other live run of this agent (5cc6d634) while this workspace has no per-run isolation";
+
+  const resumedCtx = (wake: Record<string, unknown>): JobBuildInput["ctx"] => ({
+    ...mockCtx,
+    runtime: {
+      sessionId: "ses_pen5336",
+      sessionParams: { sessionId: "ses_pen5336" },
+      sessionDisplayId: "ses_pen5336",
+      taskKey: null,
+    },
+    context: { ...mockCtx.context, paperclipWake: wake },
+  });
+
+  // ⚠️ NON-VACUITY PROBE, and the reason it is an assertion rather than a
+  // comment. Every case below is CORRECT under either adapter-utils build but
+  // only BITES under one: the published `^2026.428.0` this package declares
+  // drops a warnings-only payload at normalization, so the heartbeat prompt
+  // survives for a reason that has nothing to do with the gate, and an UNFIXED
+  // gate would pass all of them. vitest.config.ts aliases adapter-utils to the
+  // monorepo source when it is present -- which is how CI runs this suite, and
+  // which is also what the production image resolves (Dockerfile:490/756) --
+  // so in CI the probe is true and these tests are real.
+  const PROBE = "__pen5336_probe__";
+  const warningsAreRendered = renderPaperclipWakePrompt(
+    { executionWorkspace: { branchName: null, warnings: [PROBE] } },
+    { resumedSession: true },
+  ).includes(PROBE);
+
+  it("is not vacuous: this suite runs against the monorepo adapter-utils", () => {
+    const monorepoSrc = fileURLToPath(
+      new URL("../../../../packages/adapter-utils/src/index.ts", import.meta.url),
+    );
+    // Standalone checkout (no monorepo, published lib resolved): these tests
+    // legitimately cannot bite. Say so rather than pretend they did.
+    expect(warningsAreRendered).toBe(existsSync(monorepoSrc));
+  });
+
+  // THE REGRESSION. Verified to fail against the old `wakePrompt.length > 0`
+  // spelling and pass against the current gate.
+  it("keeps the heartbeat prompt on a resumed session whose only news is a warning", () => {
+    const result = buildJobManifest({
+      ctx: resumedCtx({ executionWorkspace: { branchName: null, warnings: [CONTENTION] } }),
+      selfPod: mockSelfPod,
+    });
+    expect(result.promptMetrics.heartbeatPromptChars).toBeGreaterThan(0);
+    if (warningsAreRendered) {
+      // Non-vacuous: the warning really did reach the prompt, and the heartbeat
+      // prompt survived anyway. On an unfixed gate these two are exclusive.
+      expect(result.prompt).toContain(CONTENTION);
+      expect(result.promptMetrics.wakePromptChars).toBeGreaterThan(0);
+    }
+  });
+
+  // The complement: a real delta still engages resume-delta, so the gate is
+  // unchanged for every pre-PEN-5336 payload shape.
+  it("still engages resume-delta when the payload carries a real comment", () => {
+    const result = buildJobManifest({
+      ctx: resumedCtx({
+        comments: [{ body: "a real new comment" }],
+        executionWorkspace: { branchName: null, warnings: [CONTENTION] },
+      }),
+      selfPod: mockSelfPod,
+    });
+    expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
+    // The warning rides along into the delta prompt rather than being lost.
+    if (warningsAreRendered) expect(result.prompt).toContain(CONTENTION);
+  });
+
+  // A branch pin IS a delta. The renderer suppresses the branch-pin LINE on
+  // resume but still emits the execution contract, so the render is non-empty
+  // and the gate fires -- the pre-PEN-5336 answer under either library. This is
+  // the arm that breaks if the strip is ever widened past `warnings`.
+  it("still engages resume-delta for a branch-pin-only payload", () => {
+    const result = buildJobManifest({
+      ctx: resumedCtx({ executionWorkspace: { branchName: "feat/x", warnings: [] } }),
+      selfPod: mockSelfPod,
+    });
+    expect(result.promptMetrics.heartbeatPromptChars).toBe(0);
+  });
+
+  // An always-attached, all-empty execution workspace is what the server now
+  // sends when there is nothing to say (see buildPaperclipWakeExecutionWorkspacePatch).
+  // It must not read as a delta and cost a resumed run its prompt.
+  it("does not treat an empty execution workspace as a delta", () => {
+    const result = buildJobManifest({
+      ctx: resumedCtx({ executionWorkspace: { branchName: null, warnings: [] } }),
+      selfPod: mockSelfPod,
+    });
+    expect(result.promptMetrics.heartbeatPromptChars).toBeGreaterThan(0);
   });
 });
