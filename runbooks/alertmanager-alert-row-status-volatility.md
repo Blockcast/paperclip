@@ -113,6 +113,18 @@ alert rows reads it:
 - `monitor: null` or absent — no monitor was ever armed.
 - `clearedNextCheckAt` absent on a `cleared` monitor — the row was cleared
   before PEN-5343 shipped. That means **not recorded**, not "no wake was owed".
+  The two are kept apart on purpose: the validator leaves the key optional
+  rather than defaulting it to `null`, so parsing and re-persisting an old row
+  cannot quietly turn "we never recorded this" into "nothing was owed".
+- `clearedNextCheckAt: null` on a `cleared` monitor — a clear ran and found no
+  due time. Distinct from absent, above.
+- On a row cleared more than once, `clearedNextCheckAt` belongs to the **first**
+  clear, not to the `clearReason`/`clearedAt` printed next to it: a re-clear
+  carries the original forward instead of overwriting it, so a wake destroyed
+  by a `cancelled` clear and later re-cleared as `done` still shows the
+  `cancelled` clear's due time. Read it as *the earliest wake this row is known
+  to have lost*; attributing a loss to a specific clear still needs the
+  activity feed.
 
 Re-arming after a destroyed wake is a normal recovery; note in the new
 monitor's `notes` that the previous one was lost, so the next reader does not

@@ -822,7 +822,23 @@ export interface IssueExecutionMonitorState {
    * took a 281-event feed pull per issue. With this field the row answers it
    * directly.
    *
-   * Null on an armed or triggered monitor — it is only ever set by a clear.
+   * Three states, and they are not interchangeable:
+   *
+   * - a timestamp — a clear destroyed a wake owed at that time;
+   * - `null` — a clear ran and found nothing owed (also the value on an armed
+   *   or triggered monitor: neither owes anything forward);
+   * - **absent** — not recorded, because the row was cleared before this field
+   *   existed. This is deliberately *not* `null`: the validator keeps the key
+   *   optional rather than defaulting it, precisely so an old destroyed
+   *   monitor cannot read as a clean one.
+   *
+   * Attribution: on a row that has been cleared more than once this value
+   * belongs to the **first** clear, not to the `clearReason`/`clearedAt`
+   * beside it. A re-clear carries the original forward rather than
+   * overwriting it, so a monitor destroyed by a `cancelled` clear and later
+   * re-cleared as `done` keeps the due time the `cancelled` clear took. Read
+   * it as "the earliest wake this row is known to have lost", and take the
+   * activity feed if you need to attribute the loss to a specific clear.
    */
   clearedNextCheckAt?: string | null;
 }

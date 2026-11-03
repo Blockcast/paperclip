@@ -339,10 +339,23 @@ export const issueExecutionMonitorStateSchema = z.object({
   clearedAt: z.string().datetime().nullable(),
   clearReason: z.enum(ISSUE_EXECUTION_MONITOR_CLEAR_REASONS).nullable(),
   // PEN-5343: the due time the monitor was holding when it was cleared.
-  // `prefault(null)` so every row written before this field existed keeps
-  // parsing — absent means "not recorded", which is NOT the same as "no wake
-  // was owed", and a sweep reading this must treat the two differently.
-  clearedNextCheckAt: z.string().datetime().nullable().prefault(null),
+  //
+  // `.optional()` rather than `.prefault(null)`, and the distinction is the
+  // whole point of the field. `prefault` fills the key in at parse time, and
+  // `parseIssueExecutionState` runs every stored blob through this schema — so
+  // a row cleared before this field existed would come back carrying
+  // `clearedNextCheckAt: null`, the `cleared` branch of
+  // `derivePersistedMonitorState` would spread that into the state it
+  // re-persists, and the next stage or monitor write would materialise it at
+  // rest. `null` on a `cleared` monitor asserts "the clear found no due time",
+  // i.e. no wake was owed — so prefaulting would make every pre-PEN-5343
+  // destroyed monitor read as a clean one. That is the exact false negative
+  // this field exists to remove.
+  //
+  // Absent therefore means "not recorded" and survives both the parse and the
+  // spread; `null` means a clear genuinely found nothing owed. Old rows still
+  // parse, because the key is optional rather than defaulted.
+  clearedNextCheckAt: z.string().datetime().nullable().optional(),
 });
 
 export const issueReviewRequestSchema = z.object({
