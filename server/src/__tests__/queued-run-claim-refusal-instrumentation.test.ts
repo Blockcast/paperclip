@@ -330,9 +330,16 @@ describe("dispatch candidate loop skips", () => {
     // inflate it with rows the gauge never reported on. They are split only to
     // say whether THIS pass cancelled the duplicate or lost the CAS to a
     // concurrent one — which measures replica contention, not the fork.
-    expect(loopSource).toContain("\"duplicate_dispatch_cancelled\"");
+    //
+    // The orientation is pinned, not just the pair: the CANCELLED branch must
+    // keep `duplicate_dispatch_suppressed`, because that is the name this path
+    // already writes on the cancelled row's error_code and on
+    // paperclip_heartbeat_duplicate_dispatch_suppressed_total. Inverting them
+    // makes the obvious join return disjoint sets, which is how a label stops
+    // meaning what a reader assumes it means.
+    expect(loopSource).toContain("\"duplicate_dispatch_cas_lost\"");
     expect(loopSource).toContain(
-      "cancelled ? \"duplicate_dispatch_cancelled\" : \"duplicate_dispatch_suppressed\"",
+      "cancelled ? \"duplicate_dispatch_suppressed\" : \"duplicate_dispatch_cas_lost\"",
     );
   });
 
