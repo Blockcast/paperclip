@@ -27,6 +27,7 @@ import {
   checkoutIssueSchema,
   linkIssueApprovalSchema,
   createIssueWorkProductSchema,
+  workProductExternalIdLookupQuerySchema,
   updateIssueWorkProductSchema,
   upsertIssueDocumentSchema,
   restoreIssueDocumentRevisionSchema,
@@ -2004,6 +2005,18 @@ registry.registerPath({
   summary: "List issue work products",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/companies/{companyId}/work-products/by-external-id",
+  tags: ["issues"],
+  summary: "Find the issues that own an external artifact (reverse of list issue work products)",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    query: workProductExternalIdLookupQuerySchema,
+  },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 registry.registerPath({

@@ -101,3 +101,45 @@ export type CreateIssueWorkProduct = z.infer<typeof createIssueWorkProductSchema
 export const updateIssueWorkProductSchema = createIssueWorkProductSchema.apply(partialNoDefaults);
 
 export type UpdateIssueWorkProduct = z.infer<typeof updateIssueWorkProductSchema>;
+
+/**
+ * A GitHub pull-request URL, in any of the forms a caller is likely to be
+ * holding, reduced to the canonical `owner/repo#123` work-product identity.
+ *
+ * PEN-5340. The reverse lookup is keyed on the exact stored `external_id`, and
+ * the value a run actually has to hand is almost always the PR URL it just
+ * printed. Normalising here rather than at the caller keeps the single most
+ * likely lookup miss -- a URL that matches no row and is indistinguishable from
+ * "no owner" -- from being the caller's problem to notice.
+ */
+const GITHUB_PULL_REQUEST_URL =
+  /^https?:\/\/(?:www\.)?github\.com\/([A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)\/pull\/(\d+)(?:[/?#].*)?$/;
+
+/** Canonical stored form: `owner/repo#123`. Must match `pullRequestExternalId`. */
+const CANONICAL_EXTERNAL_ID = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+#\d+$/;
+
+export function normalizeWorkProductExternalId(raw: string): string {
+  const trimmed = raw.trim();
+  const url = GITHUB_PULL_REQUEST_URL.exec(trimmed);
+  if (url) return `${url[1]}#${url[2]}`;
+  return trimmed;
+}
+
+export const workProductExternalIdLookupQuerySchema = z.object({
+  externalId: z
+    .string()
+    .min(1, "externalId is required")
+    .transform(normalizeWorkProductExternalId)
+    // Validated AFTER normalisation so a PR URL is accepted and a typo is not.
+    // A malformed id would otherwise return an empty set, which reads exactly
+    // like "this PR has no owning row" -- the false-absence this lookup exists
+    // to stop anyone concluding.
+    .refine(
+      (value) => CANONICAL_EXTERNAL_ID.test(value),
+      "externalId must be `owner/repo#123` or a GitHub pull-request URL",
+    ),
+  provider: z.string().min(1).prefault("github"),
+  type: issueWorkProductTypeSchema.prefault("pull_request"),
+});
+
+export type WorkProductExternalIdLookupQuery = z.infer<typeof workProductExternalIdLookupQuerySchema>;

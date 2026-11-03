@@ -1,0 +1,310 @@
+import { randomUUID } from "node:crypto";
+import express from "express";
+import request from "supertest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  agents,
+  companies,
+  createDb,
+  issues,
+  issueWorkProducts,
+} from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import {
+  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+  PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+} from "../services/pull-request-work-products.js";
+
+vi.hoisted(() => {
+  process.env.PAPERCLIP_HOME = "/tmp/paperclip-test-home";
+  process.env.PAPERCLIP_INSTANCE_ID = "vitest";
+  process.env.PAPERCLIP_LOG_DIR = "/tmp/paperclip-test-home/logs";
+  process.env.PAPERCLIP_IN_WORKTREE = "false";
+});
+
+vi.mock("../services/issue-assignment-wakeup.js", () => ({
+  queueIssueAssignmentWakeup: vi.fn(),
+}));
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+type Db = ReturnType<typeof createDb>;
+
+const PR = "Blockcast/paperclip#3205";
+
+function agentActor(companyId: string, agentId: string): Express.Request["actor"] {
+  return { type: "agent", agentId, companyId, runId: undefined, source: "agent_jwt" };
+}
+
+async function createApp(db: Db, actor: Express.Request["actor"]) {
+  process.env.PAPERCLIP_LOG_DIR = "/tmp/paperclip-test-home/logs";
+  process.env.PAPERCLIP_IN_WORKTREE = "false";
+  const { issueRoutes } = await import("../routes/issues.js");
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => {
+    req.actor = actor;
+    next();
+  });
+  app.use("/api", issueRoutes(db, {} as any));
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    res.status(err.status ?? 500).json({ error: err.message ?? "Internal server error" });
+  });
+  return app;
+}
+
+async function seedCompany(db: Db, label: string) {
+  return db
+    .insert(companies)
+    .values({
+      name: `Work Product Lookup ${label}`,
+      issuePrefix: `WP${randomUUID().replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    })
+    .returning()
+    .then((rows) => rows[0]!);
+}
+
+async function seedAgent(db: Db, companyId: string) {
+  return db
+    .insert(agents)
+    .values({
+      companyId,
+      name: `Agent ${randomUUID()}`,
+      role: "engineer",
+      status: "active",
+      adapterType: "process",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    })
+    .returning()
+    .then((rows) => rows[0]!);
+}
+
+async function seedIssue(db: Db, company: { id: string; issuePrefix: string }, n: number, title: string) {
+  return db
+    .insert(issues)
+    .values({
+      companyId: company.id,
+      identifier: `${company.issuePrefix}-${n}`,
+      title,
+      status: "in_progress",
+      priority: "medium",
+    })
+    .returning()
+    .then((rows) => rows[0]!);
+}
+
+/** A row shaped exactly as the GitHub webhook writes it. */
+async function seedWebhookPullRequest(
+  db: Db,
+  input: { companyId: string; issueId: string; externalId: string; owningIdentifiers: string[] },
+) {
+  await db.insert(issueWorkProducts).values({
+    companyId: input.companyId,
+    issueId: input.issueId,
+    type: "pull_request",
+    provider: "github",
+    externalId: input.externalId,
+    title: input.externalId,
+    url: `https://github.com/${input.externalId.replace("#", "/pull/")}`,
+    status: "ready_for_review",
+    sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+    metadata: {
+      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+      owningIdentifiers: input.owningIdentifiers,
+      branch: "devops/pen-5181-broker-soak-queries",
+      headSha: "eb2dc73765df23dd583890e7cf3ab7c6bfa4a733",
+    },
+  });
+}
+
+describeEmbeddedPostgres("GET /api/companies/:companyId/work-products/by-external-id", () => {
+  let db!: Db;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-work-product-lookup-");
+    db = createDb(tempDb.connectionString);
+    // Pay the route-module import cost here rather than inside whichever test
+    // happens to run first, which otherwise eats most of that test's budget.
+    await import("../routes/issues.js");
+  }, 180_000);
+
+  afterEach(async () => {
+    await db.delete(issueWorkProducts);
+    await db.delete(issues);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  // The whole point of the endpoint: a caller holding ONLY the artifact can
+  // name its owning row. Before PEN-5340 this required already knowing the row.
+  it("resolves an artifact to its owning row and that row's recorded owners", async () => {
+    const company = await seedCompany(db, "Forward");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Broker soak queries");
+    const unrelated = await seedIssue(db, company, 2, "Discusses the PR but owns nothing");
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: owner.id,
+      externalId: PR,
+      owningIdentifiers: [`${company.issuePrefix}-1`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.externalId).toBe(PR);
+    expect(res.body.owners).toHaveLength(1);
+    expect(res.body.owners[0].issueId).toBe(owner.id);
+    expect(res.body.owners[0].identifier).toBe(`${company.issuePrefix}-1`);
+    expect(res.body.owners[0].provenance).toBe("webhook");
+    expect(res.body.owners[0].owningIdentifiers).toEqual([`${company.issuePrefix}-1`]);
+    expect(res.body.withheldForAuthorizationCount).toBe(0);
+    // A row that merely discusses the PR is not an owner.
+    expect(res.body.owners.map((o: { issueId: string }) => o.issueId)).not.toContain(unrelated.id);
+  }, 120_000);
+
+  // Migration 0216 keys the unique index on (company, ISSUE, provider, type,
+  // external_id) precisely so one PR can own several rows. A single-row answer
+  // would report one arbitrary owner as "the" owner.
+  it("returns every owning row, not just one", async () => {
+    const company = await seedCompany(db, "Plural");
+    const agent = await seedAgent(db, company.id);
+    const first = await seedIssue(db, company, 1, "First owner");
+    const second = await seedIssue(db, company, 2, "Second owner");
+    const owningIdentifiers = [`${company.issuePrefix}-1`, `${company.issuePrefix}-2`];
+    await seedWebhookPullRequest(db, { companyId: company.id, issueId: first.id, externalId: PR, owningIdentifiers });
+    await seedWebhookPullRequest(db, { companyId: company.id, issueId: second.id, externalId: PR, owningIdentifiers });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(new Set(res.body.owners.map((o: { issueId: string }) => o.issueId))).toEqual(
+      new Set([first.id, second.id]),
+    );
+  }, 120_000);
+
+  // The value a run actually holds is the URL it just printed. A URL that
+  // silently matched nothing would be indistinguishable from "no owner".
+  it("accepts a GitHub pull-request URL and echoes the canonical key", async () => {
+    const company = await seedCompany(db, "Url");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Owner");
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: owner.id,
+      externalId: PR,
+      owningIdentifiers: [`${company.issuePrefix}-1`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: "https://github.com/Blockcast/paperclip/pull/3205" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.externalId).toBe(PR);
+    expect(res.body.owners).toHaveLength(1);
+    expect(res.body.owners[0].issueId).toBe(owner.id);
+  }, 120_000);
+
+  // An unparseable key must NOT come back as an empty owner set: empty reads as
+  // "this PR has no owning row", which is the false-absence this endpoint exists
+  // to remove.
+  it("rejects a malformed external id rather than answering with an empty set", async () => {
+    const company = await seedCompany(db, "Malformed");
+    const agent = await seedAgent(db, company.id);
+    const app = await createApp(db, agentActor(company.id, agent.id));
+
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: "3205" });
+
+    expect(res.status).toBe(400);
+    expect(res.body.owners).toBeUndefined();
+  }, 120_000);
+
+  // Labelled, not filtered. The webhook's own private query drops asserted rows;
+  // for a LOOKUP that would reintroduce a silent absence, so they are returned
+  // and marked, authoritative first.
+  it("labels provenance and sorts webhook-maintained rows ahead of asserted ones", async () => {
+    const company = await seedCompany(db, "Provenance");
+    const agent = await seedAgent(db, company.id);
+    const asserted = await seedIssue(db, company, 1, "Self-asserted link");
+    const webhook = await seedIssue(db, company, 2, "Webhook-maintained link");
+    await db.insert(issueWorkProducts).values({
+      companyId: company.id,
+      issueId: asserted.id,
+      type: "pull_request",
+      provider: "github",
+      externalId: PR,
+      title: PR,
+      status: "ready_for_review",
+      // No system sourceTrust, no webhook metadata source: an agent said so.
+      metadata: { owningIdentifiers: [`${company.issuePrefix}-1`] },
+    });
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: webhook.id,
+      externalId: PR,
+      owningIdentifiers: [`${company.issuePrefix}-2`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(2);
+    expect(res.body.owners[0].provenance).toBe("webhook");
+    expect(res.body.owners[0].issueId).toBe(webhook.id);
+    expect(res.body.owners[1].provenance).toBe("asserted");
+    expect(res.body.owners[1].issueId).toBe(asserted.id);
+  }, 120_000);
+
+  it("does not leak an owner from another company sharing the same external id", async () => {
+    const mine = await seedCompany(db, "Mine");
+    const theirs = await seedCompany(db, "Theirs");
+    const agent = await seedAgent(db, mine.id);
+    const myIssue = await seedIssue(db, mine, 1, "My owner");
+    const theirIssue = await seedIssue(db, theirs, 1, "Their owner");
+    await seedWebhookPullRequest(db, {
+      companyId: mine.id,
+      issueId: myIssue.id,
+      externalId: PR,
+      owningIdentifiers: [`${mine.issuePrefix}-1`],
+    });
+    await seedWebhookPullRequest(db, {
+      companyId: theirs.id,
+      issueId: theirIssue.id,
+      externalId: PR,
+      owningIdentifiers: [`${theirs.issuePrefix}-1`],
+    });
+
+    const app = await createApp(db, agentActor(mine.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${mine.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(1);
+    expect(res.body.owners[0].issueId).toBe(myIssue.id);
+  }, 120_000);
+});
