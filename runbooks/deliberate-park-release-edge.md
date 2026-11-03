@@ -366,10 +366,25 @@ restart the `long_active_duration` clock, whose bar is 6 h
 `deliberateParkWindow` covers `[parkedAt, min(parkedUntil, now)]`, that span is
 subtracted out of `unattendedMs`, and the `long_active_duration` suppression arm
 fires on `unattendedMs < longActiveMs`. A deliberate park is somebody accounting
-for the time, which is exactly what the trigger exists *not* to fire on. **Do not
-set `executionPolicy.productivityReviewDisabled` for this case** — it is
-unnecessary, and being durable it outlives the park and goes on suppressing
-genuine stalls afterwards.
+for the time, which is exactly what the trigger exists *not* to fire on.
+
+**Do not set `executionPolicy.productivityReviewDisabled` for this case**, and do
+not read the paragraph above as a reason to. It is unnecessary given the netting,
+and it is stronger than "suppresses this trigger": `isProductivityReviewOptedOut`
+(`packages/shared/src/types/issue.ts`) gates the candidate loop in
+`productivity-review.ts`, which counts the row `optedOut` and `continue`s **before
+evidence is collected**, and retires any in-flight review as `unreviewable_source`.
+It removes the row from productivity review entirely. In its top-level spelling it
+is also durable — it outlives the park it was set for, whereas the monitor-nested
+spelling dies with the monitor (`stripMonitorFromExecutionPolicy`). The park is
+bounded; the flag is not.
+
+⚠️ This is not hypothetical. The retracted advice was acted on: the flag was set on
+PEN-5141 at 2026-11-03T12:25:24Z and removed at 12:42:02Z, 17 minutes later, by the
+assignee re-checking the retraction against `master` before pulling the guard. The
+`issues.ts` projection you may find while chasing this (`productivityReviewDisabled`
+as a flat boolean on list rows, PEN-5295) is a **SQL mirror for list consumers**,
+not the gate — do not cite it as the enforcement site.
 
 The earlier claim ("holds **no** reference to `parked_until`") was read off this
 PR's own branch at `9488baa`, which was behind `main`; #3316 had merged to `main`
