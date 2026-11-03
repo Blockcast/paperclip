@@ -453,7 +453,7 @@ export function classifyAdmissionEvidence({
  *
  * @param {{
  *   merged: boolean,
- *   mergeGroupRuns: Array<{ conclusion: string | null }>,
+ *   mergeGroupRuns: Array<{ conclusion: string | null, hasFailedJob?: boolean }>,
  *   truncated?: boolean,
  *   dequeueActor?: string | null,
  *   admissionEvidence?: ReturnType<typeof classifyAdmissionEvidence>,
@@ -501,7 +501,11 @@ export function classifyMergeQueueEviction({
     if (admissionEvidence?.rejected === true) return "requirements_unmet";
     return "conflict_unstageable";
   }
-  if (mergeGroupRuns.some((run) => run?.conclusion === "failure")) return "check_failure";
+  // BLO-51600: the orphan sweeper cancels a run once a job has failed, so a
+  // `cancelled` run carrying a failed job is a check failure, not a dequeue.
+  if (mergeGroupRuns.some((run) => run?.conclusion === "failure" || run?.hasFailedJob === true)) {
+    return "check_failure";
+  }
   // A merge_group run exists and did not fail, yet the PR was evicted
   // unmerged: an administrative/manual dequeue (see
   // runbooks/merge-queue-stalled-head.md's stalled-head procedure) or a
@@ -669,6 +673,20 @@ function ghMergeGroupRuns(repo, createdRange) {
   ];
   const out = run(args);
   return JSON.parse(out);
+}
+
+// BLO-51600: one call per CANCELLED run only. A read failure returns false,
+// which keeps the pre-BLO-51600 verdict for that run.
+function ghRunHasFailedJob(repo, runId) {
+  try {
+    const out = run([
+      "gh", "api", `repos/${repo}/actions/runs/${runId}/jobs?per_page=100`,
+      "--jq", '[.jobs[]|select(.conclusion=="failure" or .conclusion=="timed_out")]|length',
+    ]);
+    return Number(out.trim()) > 0;
+  } catch {
+    return false;
+  }
 }
 
 function parseArgs(argv) {
@@ -891,7 +909,9 @@ async function main() {
   const allRuns = ghMergeGroupRuns(repo, buildRunSearchWindow(attemptWindow));
   const truncated = allRuns.length >= RUN_LIST_LIMIT;
 
-  const mergeGroupRuns = filterMergeGroupRunsForPr(allRuns, { base: pr.baseRefName, prNumber });
+  const mergeGroupRuns = filterMergeGroupRunsForPr(allRuns, { base: pr.baseRefName, prNumber }).map((r) =>
+    r.conclusion === "cancelled" ? { ...r, hasFailedJob: ghRunHasFailedJob(repo, r.databaseId) } : r,
+  );
   // PEN-4887: only gathered when there is a zero-run eviction to explain. The
   // other classifications are decided by run outcome and cannot be changed by
   // this evidence, so paying three API calls for them would be waste.

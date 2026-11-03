@@ -30,3 +30,23 @@ test("only an explicit 404 classifies a ref as gone", () => {
     assert.equal(classifyRefProbe(rc, stderr), expected, `${rc}: ${stderr}`);
   }
 });
+
+function decidedFailedJobs(stdin) {
+  const result = spawnSync(
+    "bash",
+    ["-c", 'source "$1"; decided_failed_jobs', "decided-test", script],
+    { encoding: "utf8", input: stdin },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+test("BLO-51600: only failure/timed_out jobs decide a run; in-flight and green never do", () => {
+  assert.equal(decidedFailedJobs("success\tbuild\n\tGeneral tests (server 3/6)\nskipped\tcanary\n"), "");
+  assert.equal(decidedFailedJobs("cancelled\tbuild\nneutral\tx\n"), "");
+  assert.equal(decidedFailedJobs(""), "");
+  assert.equal(
+    decidedFailedJobs("failure\te2e\n\tGeneral tests (server 3/6)\ntimed_out\tbuild\nsuccess\tpolicy\n"),
+    "e2e\nbuild",
+  );
+});

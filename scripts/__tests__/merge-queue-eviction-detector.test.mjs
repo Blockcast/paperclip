@@ -137,6 +137,17 @@ test("classifies a failing merge_group run as check_failure", () => {
   assert.equal(classification, "check_failure");
 });
 
+test("BLO-51600: a run the sweeper cancelled after a job failed is check_failure, not manual", () => {
+  assert.equal(
+    classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [{ conclusion: "cancelled", hasFailedJob: true }] }),
+    "check_failure",
+  );
+  assert.equal(
+    classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [{ conclusion: "cancelled", hasFailedJob: false }] }),
+    "manual",
+  );
+});
+
 test("classifies a non-failing merge_group run with no merge as manual", () => {
   const classification = classifyMergeQueueEviction({
     merged: false,
