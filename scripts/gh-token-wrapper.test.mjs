@@ -1367,6 +1367,15 @@ test("markPullRequestReadyForReview through gh api is refused (BLO-48359)", () =
 // same reason; keep new ones under that bound (PEN-3920).
 const AUTH_CHECK_VALID_TOKEN = "ghs_valid_app_tok";
 
+// PEN-5355. Two tokens the stub answers 403 to, differing ONLY in the
+// x-ratelimit-remaining they quote. They are the whole point of the arm under
+// test: `403` alone cannot tell an exhausted shared budget apart from a real
+// authorization refusal, and the fleet's installation (138085375) spends ~94
+// min/24h in the first state, so the catch-all used to send an agent to file a
+// credential incident against a credential that was working.
+const AUTH_CHECK_THROTTLED_TOKEN = "ghs_throttled_tok";
+const AUTH_CHECK_FORBIDDEN_TOKEN = "ghs_forbidden_tok";
+
 // A stand-in for api.github.com. The verdict logic keys on the exact signature
 // PEN-5239 established as the working oracle — an *unauthenticated* /rate_limit
 // beside an authenticated /installation/repositories — so the stub reproduces
@@ -1386,6 +1395,10 @@ const AUTH_CHECK_VALID_TOKEN = "ghs_valid_app_tok";
 const STUB_GITHUB_SOURCE = `import http from "node:http";
 
 const VALID = ${JSON.stringify(AUTH_CHECK_VALID_TOKEN)};
+const THROTTLED = ${JSON.stringify(AUTH_CHECK_THROTTLED_TOKEN)};
+const FORBIDDEN = ${JSON.stringify(AUTH_CHECK_FORBIDDEN_TOKEN)};
+// A fixed epoch so the reset the wrapper renders is assertable. 2026-11-03T04:53:38Z.
+const RESET = "1793681618";
 
 const server = http.createServer((req, res) => {
   const auth = req.headers.authorization ?? "";
@@ -1404,11 +1417,36 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.url.startsWith("/installation/repositories")) {
+    // Both 403s quote limit 9500 — the INSTALLATION plane — because that is
+    // what makes them indistinguishable by status alone, and it is also the
+    // evidence the credential authenticated: the anonymous plane is 60.
+    if (token === THROTTLED) {
+      res.writeHead(403, {
+        "x-ratelimit-limit": "9500",
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": RESET,
+        "content-type": "application/json",
+      });
+      return res.end(JSON.stringify({ message: "API rate limit exceeded for installation ID 138085375." }));
+    }
+    if (token === FORBIDDEN) {
+      res.writeHead(403, {
+        "x-ratelimit-limit": "9500",
+        "x-ratelimit-remaining": "4000",
+        "x-ratelimit-reset": RESET,
+        "content-type": "application/json",
+      });
+      return res.end(JSON.stringify({ message: "Resource not accessible by integration" }));
+    }
     if (!authenticated) {
       res.writeHead(401, { "content-type": "application/json" });
       return res.end(JSON.stringify({ message: "Bad credentials", status: "401" }));
     }
-    res.writeHead(200, { "x-ratelimit-limit": "9500" });
+    res.writeHead(200, {
+      "x-ratelimit-limit": "9500",
+      "x-ratelimit-remaining": "4730",
+      "x-ratelimit-reset": RESET,
+    });
     return res.end("{}");
   }
 
@@ -1551,6 +1589,96 @@ test("reports a healthy installation token as OK with its rate limit", async () 
       assert.match(proc.stdout, /verdict:\s+OK — valid GitHub App installation token/);
       assert.match(proc.stdout, /authenticated:\s+\/installation\/repositories -> 200, x-ratelimit-limit 9500/);
       assert.equal(proc.status, 0);
+    });
+  });
+});
+
+// --- PEN-5355: a throttled installation is not a dead credential -----------
+//
+// THE REQUIRED REGRESSION (PEN-5355 Done-when #1). These two run against the
+// same status code and differ only in one header, which is the entire claim:
+// before this arm existed, both landed in the UNEXPECTED catch-all and the
+// wrapper told the agent to "report it" — on the most common non-401 state
+// this installation reaches, one that is owned, measured (PEN-3776) and
+// self-heals at the reset. The cost of getting it wrong runs both ways, so
+// both directions are pinned here rather than just the new one.
+//
+// This also pins the CR strip without a separate test for it. Node writes
+// real CRLF response headers, so an x-ratelimit-remaining whose trailing \r
+// survived the probe's awk would compare unequal to `0` and this verdict would
+// silently never fire — the exact corruption PEN-5355's own filing suffered
+// when that escape did not survive JSON encoding.
+test("reports an exhausted shared installation budget as RATE_LIMITED, not a credential fault (PEN-5355)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_THROTTLED_TOKEN}\n`, apiBase });
+      assert.match(proc.stdout, /verdict:\s+RATE_LIMITED/);
+      assert.match(proc.stdout, /the credential is VALID and authenticated/);
+      // The two conclusions an agent must NOT draw from this state.
+      assert.match(proc.stdout, /NOT a credential fault and NOT PEN-5239/);
+      assert.doesNotMatch(proc.stdout, /UNEXPECTED/);
+      assert.doesNotMatch(proc.stdout, /REJECTED/);
+      // Wait-or-escalate is the decision, so the reset has to be on the page.
+      assert.match(
+        proc.stdout,
+        /authenticated:\s+\/installation\/repositories -> 403, x-ratelimit-limit 9500, remaining 0, reset /,
+      );
+      assert.equal(proc.status, 6);
+    });
+  });
+});
+
+// PEN-5355's named patch hazard, pinned statically because its dynamic
+// signature is a whole-subcommand outage rather than one wrong answer.
+// `paperclip_auth_check` destructures the probe's output positionally behind
+// `[ $# -eq N ] || exit 70`, once per probe. Widening the probe's emit without
+// widening BOTH guards exits 70 on every invocation — fail-closed, so not
+// silent, but it takes out the one diagnostic an agent reaches for when
+// nothing else works, and a happy-path test cannot tell that apart from a
+// temp-dir fault. Asserting the coupling directly is cheaper than trusting
+// every future widener to remember the second call site.
+test("the probe's field count and both arity guards move together (PEN-5355)", () => {
+  const source = readFileSync(WRAPPER, "utf8");
+
+  const emit = source.match(/^\s*printf '((?:%s )*%s)\\n' "\$\{probe_code\}".*$/m);
+  assert.ok(emit, "could not find auth_check_probe's final printf");
+  const emittedFields = emit[1].split(" ").length;
+
+  const guards = [...source.matchAll(/\[ \$# -eq (\d+) \] \|\| exit 70/g)].map((m) => Number(m[1]));
+  assert.equal(guards.length, 2, `expected one arity guard per probe call site, found ${guards.length}`);
+  for (const guard of guards) {
+    assert.equal(
+      guard,
+      emittedFields,
+      `an arity guard asserts ${guard} fields but auth_check_probe emits ${emittedFields}; ` +
+        "paperclip-auth-check would exit 70 on every invocation",
+    );
+  }
+
+  // The guards are useless if a call site reads a field it never checked for.
+  const reads = [...source.matchAll(/^\s*\w+_code="\$1".*$/gm)];
+  assert.equal(reads.length, 2, "expected one positional destructuring per probe call site");
+  for (const read of reads) {
+    const highest = [...read[0].matchAll(/"\$(\d+)"/g)].map((m) => Number(m[1]));
+    assert.ok(
+      Math.max(...highest) <= emittedFields,
+      `a call site reads $${Math.max(...highest)} but the probe emits ${emittedFields} fields: ${read[0].trim()}`,
+    );
+  }
+});
+
+// The fail-OPEN direction, and the reason the arm is gated on `remaining == 0`
+// rather than on a bare 403. A genuine authorization refusal carries headroom;
+// relabelling it as throttling would tell an agent to wait out a reset that
+// will change nothing, and would bury a real permission loss.
+test("a 403 with rate-limit headroom still falls through to UNEXPECTED (PEN-5355)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_FORBIDDEN_TOKEN}\n`, apiBase });
+      assert.match(proc.stdout, /verdict:\s+UNEXPECTED/);
+      assert.doesNotMatch(proc.stdout, /RATE_LIMITED/);
+      assert.match(proc.stdout, /remaining 4000/);
+      assert.equal(proc.status, 5);
     });
   });
 });
