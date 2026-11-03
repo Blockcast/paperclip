@@ -145,6 +145,16 @@ anchor, and the only one: it is a string literal in
 does not move. To find any row below, grep for it —
 `grep -n '"allow_self"' server/src/services/authorization.ts`.
 
+That grep returns **more than one hit**, and the extra hits are not near-misses.
+Every reason is also a member of the `reason` union in `AuthorizationDecision`
+near the top of the file, and most of these literals are reused by unrelated
+action branches — `allow_self` is also returned for inbox management, for
+`agent:wake`, and for `agent`-resource actions, and `deny_scope` from a
+dozen-odd places. The row you want is the hit inside `decideBase`'s branch
+**for that action on an `issue` resource**: for this grid, the `issue:comment` /
+`issue:mutate` arm or the `issue:coordination_metadata` arm. The deny-path list
+below names its enclosing branch for exactly this reason.
+
 This table deliberately carries **no line numbers**. It used to, and by `PEN-5401`
 every one of them was stale by a uniform +249 lines — a reader following the grid
 during an incident landed 249 lines from every allow-path they looked up. Do not
