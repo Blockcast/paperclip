@@ -1476,9 +1476,9 @@ async function holdsAnyExecutionLock(base, key, run) {
 //     reader told that name, unqualified, is cross-seat misattributed, which
 //     is exactly the bug.
 //
-// Hence: when the id is available it decides, and the name is corroboration.
-// When the name is the ONLY source it is reported as UNVERIFIED rather than
-// as attribution — a stale name presented confidently is worse than no name,
+// Hence: when the id is available it decides and is printed ALONE. When the
+// name is the ONLY source it is reported as UNVERIFIED rather than as
+// attribution — a stale name presented confidently is worse than no name,
 // because the reader cannot tell the two apart. And when nothing names the
 // holder, say THAT: an unqualified id is the input to the misread, so silence
 // must be spoken rather than left bare.
@@ -1499,9 +1499,20 @@ function describeHolderAgent(issue, holder, selfAgentId) {
     return 'the server did not name that run\'s agent directly; the issue\'s last recorded lock holder was agent "' +
       nameKey + '", which MAY BE STALE — do NOT assume it is another run of your own agent';
   }
-  // Id present, so it decides. The name is corroboration only, and is dropped
-  // rather than printed beside an id it might contradict.
-  const named = nameKey ? 'agent "' + nameKey + '" (' + agentId + ")" : "agent " + agentId;
+  // Id present, so it decides — and it is printed ALONE. The name is NOT
+  // appended beside it, because the two cannot be checked against each other:
+  // a name key ("engineer") and a run's agent id (a uuid) live in different
+  // namespaces, so a reader cannot tell a pair that AGREES from one that
+  // CONTRADICTS. On the adoption path above they genuinely contradict, and an
+  // earlier revision of this line printed
+  // 'agent "reviewer-seat" (<your own run's agent id>)' — naming a foreign
+  // seat as the owner of your own sibling run. Found in review on PR #3314;
+  // it is the same cross-seat misattribution this function exists to remove,
+  // reintroduced by the fix for it. Caveating the name instead of dropping it
+  // does not work either: the pair agrees in the common case, so a warning
+  // printed on every message is one readers learn to skip. Readers anchor on
+  // a readable name over a uuid, so the unverifiable name has to go.
+  const named = "agent " + agentId;
   if (!selfAgentId) return "that run belongs to " + named;
   return agentId === selfAgentId
     ? "that run belongs to " + named + ", which is YOUR OWN agent"
