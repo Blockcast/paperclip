@@ -129,6 +129,10 @@ export async function reconcileActiveAlerts(
   if (!Array.isArray(body)) throw new Error("Alertmanager returned a non-array body");
 
   const cutoff = now.getTime() - RECONCILE_GRACE_MS;
+  const scope = `${companyId}\n${base}`;
+  const prevNotifiable = notifiableSinceByScope.get(scope);
+  const notifiable = new Map<string, number>();
+  notifiableSinceByScope.set(scope, notifiable);
   let routed = 0;
   const missing: AlertmanagerAlert[] = [];
   const held = new Set<string>();
@@ -142,14 +146,24 @@ export async function reconcileActiveAlerts(
     if (!routedTo(entry, receivers)) continue;
     routed += 1;
     const alert = toWebhookAlert(entry);
-    if (!alert || !(Date.parse(alert.startsAt) <= cutoff) || !wouldFile(alert, config)) continue;
+    if (!alert) continue;
+    // BLO-51658: the grace runs from when the alert became notifiable, not from
+    // `startsAt`. An alert inhibited or silenced for longer than the grace is
+    // already "old" the moment it un-suppresses, while Alertmanager only sends
+    // it on the next group flush — so a `startsAt` test files it ahead of its
+    // own delivery. The first pass in a process has no history and trusts
+    // `startsAt`, which keeps outage recovery (BLO-44820) immediate.
+    const key = `${alert.fingerprint}\n${alert.startsAt}`;
+    const since = prevNotifiable ? (prevNotifiable.get(key) ?? now.getTime()) : Date.parse(alert.startsAt);
+    notifiable.set(key, since);
+    if (!(Date.parse(alert.startsAt) <= cutoff) || !(since <= cutoff) || !wouldFile(alert, config)) continue;
+    if (missing.length >= RECONCILE_MAX_PER_PASS) continue;
     const { record } = await readAlertState(ctx, companyId, alert.fingerprint);
     // Tracked and not resolved: nothing was lost. A record resolved BEFORE this
     // occurrence started is a re-fire whose delivery was lost; one resolved
     // after it is the push path being ahead of this read, so leave it.
     if (record && !(record.resolvedAt && Date.parse(record.resolvedAt) < Date.parse(alert.startsAt))) continue;
     missing.push(alert);
-    if (missing.length >= RECONCILE_MAX_PER_PASS) break;
   }
 
   if (missing.length > 0) {
@@ -192,9 +206,19 @@ export async function reconcileActiveAlerts(
  */
 const absentSinceByScope = new Map<string, Map<string, number>>();
 
-/** Test hook: forget absence observations between cases. */
+/**
+ * Same scope key -> `${fingerprint}\n${startsAt}` -> first pass (ms) that saw
+ * the alert notifiable (BLO-51658). Rebuilt every pass, so it holds only what
+ * is notifiable now. ponytail: in-memory like `absentSinceByScope`; a restart
+ * falls back to `startsAt` for one pass, re-opening the race only for an alert
+ * that un-suppresses in that same pass.
+ */
+const notifiableSinceByScope = new Map<string, Map<string, number>>();
+
+/** Test hook: forget absence and notifiable observations between cases. */
 export function __resetLostResolveObservationsForTests(): void {
   absentSinceByScope.clear();
+  notifiableSinceByScope.clear();
 }
 
 /**
