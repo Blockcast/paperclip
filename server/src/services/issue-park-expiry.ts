@@ -140,7 +140,12 @@
  *    erases it — and a park wake that WORKS dispatches a run which routinely re-parks the
  *    row, so the field systematically deletes its own positive cases;
  *  - the sweep rolls it back to `null` when `enqueueWakeup` throws, so even a stamp that
- *    survives re-parking is not a complete record of fires.
+ *    survives re-parking is not a complete record of fires;
+ *  - and the column errs in the OTHER direction too, which neither bullet above covers: a
+ *    `null` RETURN from `enqueueWakeup` is a suppression, not a throw, and the sweep
+ *    deliberately does not roll the claim back ("the edge fired; the platform declined it",
+ *    `tickExpiredIssueParks`). A stamp that IS present therefore means the sweep claimed the
+ *    park and attempted an enqueue — never that any run was woken.
  *
  * Measured 2026-10-28 on seven rows parked to one shared instant: 7 of 7 fired, between
  * +30.5 s and +75.4 s after the deadline (inside the historical park-fire band), and 7 of
@@ -151,6 +156,23 @@
  * ⚠️ The failure is in the REASSURING direction and gets worse as this module gets more
  * reliable, which is what made it expensive to find (three days and four monitor attempts
  * on PEN-4198 before a positive control caught it).
+ *
+ * The over-report has its own measurement, 2026-11-03 (PEN-5291), over the three rows the
+ * sweep stamped in one millisecond, `2026-11-02T09:00:23.252Z`. All three read as fired on
+ * this column and NONE of them is recorded as having woken a run:
+ *
+ *  - PEN-4793 — `issue_park_expired` at 09:00:57.960Z, `status: "skipped"`, `claimedAt: null`;
+ *  - PEN-3233 — stamped, and NO `issue_park_expired` request exists at all. What the enqueue
+ *    recorded is `issue_dependencies_blocked` at 09:01:32.665Z, `cancelled`, `claimedAt: null`;
+ *  - PEN-4828 — a `reason: "other"` request at 09:00:28.317Z, and a monitor was due at the
+ *    same instant, so it is unattributable in either direction.
+ *
+ * Both diagnostics reads were complete windows (`truncated: false`), so these are absences of
+ * the event and not of the evidence. PEN-3233 is the sharp one, and it is a trap on the
+ * REPLACEMENT surface rather than on this column: a claimed park can enqueue under a
+ * different reason, so "no `issue_park_expired` row" does not imply "the sweep never claimed
+ * this park". Pair the row with a control parked to the same millisecond before reading
+ * either surface's silence as a down sweep.
  *
  * ⇒ `null` means "no release wake is owed for this row's current park". To ask whether
  * park wakes FIRED, read the `agent_wakeup_requests` TABLE, which is the durable

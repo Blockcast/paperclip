@@ -17,9 +17,12 @@ Owner: Platform (PEN-4420 built the edge, PEN-4894 is why this file exists)
 
 **`parkedWakeFiredAt` is a per-PARK claim marker, not a per-ROW audit field.**
 It is specified and implemented correctly as the former. Asking it the latter
-question is the error, and it is wrong in the **reassuring** direction: it
-under-reports fires, and it under-reports more of them the better the release
-edge works.
+question is the error, and it is wrong in **both** directions. It under-reports
+fires, and it under-reports more of them the better the release edge works
+([Why the stamp is usually gone anyway](#why-the-stamp-is-usually-gone-anyway)).
+It also over-reports deliveries: a stamp that is present means the sweep claimed
+the park and attempted an enqueue, never that a run was woken
+([A present stamp is not a delivery](#a-present-stamp-is-not-a-delivery)).
 
 To ask whether park wakes fired, read `agent_wakeup_requests` — see
 [Answering the question](#answering-the-question) below, including its bounds.
@@ -78,8 +81,55 @@ coalesced ×3, skipped ×2, cancelled ×1) — which is exactly what step 3 abov
 predicts, since the claim is stamped before the enqueue and is not rolled back
 when the enqueue merely returns no run.
 
+That mixture is the over-report in miniature; it has its own section below,
+[A present stamp is not a delivery](#a-present-stamp-is-not-a-delivery).
+
 This cost one seat three days and four monitor attempts on PEN-4198 before a
 positive control caught it. That is the cost of the reassuring direction.
+
+## A present stamp is not a delivery
+
+Measured 2026-11-03 (PEN-5291). The converse of the section above, and the one
+the table there does not cover, because every row in it is about the stamp going
+**away**.
+
+The sweep stamps the claim **before** calling `enqueueWakeup`, and rolls it back
+only when that call **throws**. A `null` return is not a throw — it is
+`enqueueWakeup` deciding to suppress (budget, invokability, a dependency-blocked
+park), which it records in `agent_wakeup_requests` itself. The sweep leaves the
+claim standing on purpose: *"the edge fired; the platform declined it"*
+(`tickExpiredIssueParks`). Re-firing on the next tick would be polling a
+decision.
+
+So a `parkedWakeFiredAt` you can see answers *"did the sweep claim this park?"*
+and nothing more. On the three rows the sweep stamped in one millisecond,
+`2026-11-02T09:00:23.252Z`, the answer to *"did anyone wake?"* was no on all
+three:
+
+| row | status then | wake request at the slot | reason | status | claimed |
+|---|---|---|---|---|---|
+| PEN-4793 | `todo` | 09:00:57.960Z | `issue_park_expired` | `skipped` | `null` |
+| PEN-3233 | `todo` | 09:01:32.665Z | **`issue_dependencies_blocked`** | `cancelled` | `null` |
+| PEN-4828 | `in_progress` | 09:00:28.317Z | `other` | `completed` | 10:26:59Z (+86 min) |
+
+PEN-4828 is **not** a counter-example and must not be read as one: a monitor was
+due at the same instant (`nextCheckAt: 2026-11-02T09:00:00.000Z`), so nothing
+attributes that request to the park either way. It is in the table to show what
+an unattributable row looks like, which is why a control for this question needs
+`monitorNextCheckAt: null`.
+
+⚠️ **PEN-3233 is a trap on the replacement surface, not on this column.** The
+park was claimed and an enqueue was attempted, and yet **no**
+`reason: "issue_park_expired"` request exists on that row at all — the enqueue
+recorded a different reason. Its diagnostics window was complete
+(`truncated: false`, 6 events), so that is an absence of the event, not of the
+evidence.
+
+⇒ *"no `issue_park_expired` row"* does **not** imply *"the sweep never claimed
+this park"*, any more than *"stamp present"* implies *"a run woke"*. Neither
+surface answers the question alone. Pair the row under test with a control
+parked to the same millisecond, on a wake status, with no monitor due — and
+pre-register what "neither fired" will mean before the deadline passes.
 
 ## Answering the question
 
@@ -92,6 +142,10 @@ GET /api/issues/:id/diagnostics/wakes
 A park-expiry wake appears there as an event with
 `kind: "wake_request"`, `source: "automation"`, and
 `reason: "issue_park_expired"`.
+
+…when it appears at all. A claimed park can enqueue under a different reason —
+see [A present stamp is not a delivery](#a-present-stamp-is-not-a-delivery) —
+so read every event around the deadline, not only the ones matching that string.
 
 **Know its bounds before you read an absence as a negative.** The route calls
 `getWakeDiagnostics(issueId)` with no options, and both caps are hard ceilings a
