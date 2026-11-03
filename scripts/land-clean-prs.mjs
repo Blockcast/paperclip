@@ -1473,8 +1473,73 @@ export function stateHold(repo, { number, reason, ageHours, detail }, run = gh) 
 const PR_LIST_FIELDS =
   "number,headRefOid,author,labels,isDraft,autoMergeRequest,mergeStateStatus,reviewRequests";
 
-function gh(args) {
+function execGh(args) {
   return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+}
+
+/** Longest rate-limit reset one fire will wait out before aborting (BLO-51665). */
+export const RATE_LIMIT_MAX_WAIT_MS = 120_000;
+
+/**
+ * Milliseconds until the rate-limit bucket `args` draws from resets, read from
+ * a probe's own `X-Ratelimit-*` response headers; `0` when the bucket already
+ * has headroom again, `null` when the headers could not be read.
+ *
+ * ⛔ Not `/rate_limit`: on this installation its body AND its headers report a
+ * bucket ordinary calls do not draw from (BLO-37855), so it reads healthy
+ * during exactly the throttle this exists to wait out. `gh api -i` prints the
+ * headers on stdout even when the probe itself is refused, which is the case
+ * that matters. `gh pr …` and `gh api graphql` draw from the GraphQL bucket,
+ * every other `gh api` path from core, so the probe matches the failing call.
+ */
+export function rateLimitWaitMs(args, { exec = execGh, now = Date.now } = {}) {
+  const graphql = args[0] !== "api" || args[1] === "graphql";
+  const probe = graphql
+    ? ["api", "-i", "graphql", "-f", "query={viewer{login}}"]
+    : ["api", "-i", "meta"];
+  let out;
+  try {
+    out = exec(probe);
+  } catch (error) {
+    out = `${error?.stdout ?? ""}\n${error?.stderr ?? ""}`;
+  }
+  const header = (name) => {
+    const match = new RegExp(`^x-ratelimit-${name}:\\s*(\\d+)`, "im").exec(String(out));
+    return match ? Number(match[1]) : null;
+  };
+  const remaining = header("remaining");
+  if (remaining === null) return null;
+  if (remaining > 0) return 0;
+  const reset = header("reset");
+  return reset === null ? null : Math.max(0, reset * 1000 - now()) + 5_000;
+}
+
+/**
+ * Runs `gh`, waiting out ONE rate-limit refusal whose reset is near (BLO-51665).
+ *
+ * A 403 that clears in 22s used to abort the whole fire and cost six hours of
+ * landings. The deliberate abort for a real exhaustion is kept: a reset beyond
+ * RATE_LIMIT_MAX_WAIT_MS, unreadable headers, or a second refusal all rethrow
+ * the original error into `isFatalGhError`. Retrying a refused write is safe —
+ * a 403 applied nothing.
+ */
+export function ghWithRateLimitRetry(
+  args,
+  { exec = execGh, sleep = sleepSync, waitMs = rateLimitWaitMs } = {},
+) {
+  try {
+    return exec(args);
+  } catch (error) {
+    if (!/rate limit/i.test(String(error?.stderr ?? error?.message ?? ""))) throw error;
+    const wait = waitMs(args, { exec });
+    if (wait === null || wait > RATE_LIMIT_MAX_WAIT_MS) throw error;
+    sleep(wait);
+    return exec(args);
+  }
+}
+
+function gh(args) {
+  return ghWithRateLimitRetry(args);
 }
 
 /**
@@ -1888,7 +1953,17 @@ export function runRepo(
   stranded = [],
   { fetch = fetchOpenPrs, classify = classifyAll, applyOne = applyRow, state = stateHold } = {},
 ) {
-  const prs = fetch(repo);
+  let prs;
+  try {
+    prs = fetch(repo);
+  } catch (error) {
+    // BLO-51665: a throw here used to leave the receipt EMPTY, so nobody could
+    // tell which repo the fire died in or why. Say it on stdout, then rethrow:
+    // the caller's `finally` still prints the priority cohort.
+    const message = error?.stderr?.toString() || error?.message || String(error);
+    console.log(`## ${repo}\n\nAborted while collecting PRs: ${message.trim().split("\n")[0]}`);
+    throw error;
+  }
   const rows = classify(prs, { settleMinutes, spent });
 
   for (const row of rows) {

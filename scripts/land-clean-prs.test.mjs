@@ -25,6 +25,9 @@ import {
   headMovedAt,
   applyRow,
   isFatalGhError,
+  RATE_LIMIT_MAX_WAIT_MS,
+  ghWithRateLimitRetry,
+  rateLimitWaitMs,
   liveHeadSha,
   isMainModule,
   markFailure,
@@ -2182,5 +2185,90 @@ describe("runRepo apply wiring (PEN-5263)", () => {
     assert.deepEqual(stated, []);
     assert.deepEqual(stranded, ["a/one#3241"], "and the alarm can still see it");
     assert.equal(alarmExitCode(stranded), 1);
+  });
+});
+
+describe("rate-limit retry in gh() (BLO-51665)", () => {
+  const refused = () =>
+    Object.assign(new Error("gh failed"), {
+      stderr: "gh: API rate limit exceeded for installation ID 138085375. (HTTP 403)",
+    });
+
+  it("waits out one refusal whose reset is near, then succeeds", () => {
+    const calls = [];
+    const slept = [];
+    const out = ghWithRateLimitRetry(["api", "repos/o/r/issues/1/timeline", "--paginate"], {
+      exec: (args) => {
+        calls.push(args);
+        if (calls.length === 1) throw refused();
+        return "[]";
+      },
+      sleep: (ms) => slept.push(ms),
+      waitMs: () => 27_000,
+    });
+    assert.equal(out, "[]");
+    assert.equal(calls.length, 2);
+    assert.deepEqual(slept, [27_000]);
+  });
+
+  it("keeps the abort for a far reset, unreadable headers, a second refusal, or a non-rate-limit error", () => {
+    for (const waitMs of [() => RATE_LIMIT_MAX_WAIT_MS + 1, () => null]) {
+      // The retry would SUCCEED here, so throwing proves no retry was spent.
+      let calls = 0;
+      const exec = () => {
+        calls += 1;
+        if (calls === 1) throw refused();
+        return "[]";
+      };
+      assert.throws(() => ghWithRateLimitRetry(["api", "x"], { exec, sleep: () => {}, waitMs }), /gh failed/);
+      assert.equal(calls, 1);
+    }
+    let n = 0;
+    assert.throws(
+      () => ghWithRateLimitRetry(["api", "x"], { exec: () => { n += 1; throw refused(); }, sleep: () => {}, waitMs: () => 0 }),
+      (error) => isFatalGhError(error.stderr),
+    );
+    assert.equal(n, 2, "exactly one retry");
+    let waited = false;
+    assert.throws(() =>
+      ghWithRateLimitRetry(["api", "x"], {
+        exec: () => { throw Object.assign(new Error("boom"), { stderr: "HTTP 404" }); },
+        sleep: () => {},
+        waitMs: () => ((waited = true), 0),
+      }),
+    );
+    assert.equal(waited, false);
+  });
+
+  it("reads the reset from the failing probe's own headers, picking the bucket by call", () => {
+    const probes = [];
+    const exhausted = (args) => {
+      probes.push(args);
+      throw Object.assign(new Error("probe refused"), {
+        stdout: "HTTP/2.0 403 Forbidden\nX-Ratelimit-Remaining: 0\nX-Ratelimit-Reset: 1000\n",
+      });
+    };
+    assert.equal(rateLimitWaitMs(["api", "repos/o/r"], { exec: exhausted, now: () => 978_000 }), 27_000);
+    assert.deepEqual(probes[0], ["api", "-i", "meta"]);
+    rateLimitWaitMs(["pr", "list"], { exec: exhausted, now: () => 0 });
+    assert.equal(probes[1][2], "graphql");
+    assert.equal(rateLimitWaitMs(["api", "x"], { exec: () => "X-Ratelimit-Remaining: 12\n" }), 0);
+    assert.equal(rateLimitWaitMs(["api", "x"], { exec: () => "no headers" }), null);
+  });
+
+  it("a crash while collecting PRs still names the repo on stdout", () => {
+    const lines = [];
+    const log = console.log;
+    console.log = (line) => lines.push(String(line));
+    try {
+      assert.throws(() =>
+        runRepo("a/one", true, 0, 0, [], [], {
+          fetch: () => { throw refused(); },
+        }),
+      );
+    } finally {
+      console.log = log;
+    }
+    assert.match(lines.join("\n"), /## a\/one[\s\S]*Aborted while collecting PRs: .*rate limit/);
   });
 });
