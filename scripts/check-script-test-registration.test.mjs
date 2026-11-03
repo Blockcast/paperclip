@@ -219,10 +219,13 @@ test("arm 1: a `with:` carrying a trailing comment still anchors its inputs", ()
   // dropped from the `with:` detector. `with: # inputs` is an ordinary, common
   // shape; the trailing comment defeats that anchor, so `withIndent` was never
   // set and every nested input registered. What this pins is the ABSENCE of
-  // the right-hand anchor: re-add `\s*$` at `:308` and this goes green-to-red.
-  // It does NOT pin a comment strip -- the detector reads the raw line on
-  // purpose (see `:299-303`), so do not go looking for one. Found by Ally on
-  // #3281, and the stale wording here caught by Ally on the follow-up head.
+  // the right-hand anchor: re-add `\s*$` to the `withKey` pattern in
+  // `runCommands` and this goes green-to-red. It does NOT pin a comment strip
+  // -- that detector reads the raw line on purpose, for the reason given in
+  // the comment above it -- so do not go looking for one. Cited by SYMBOL and
+  // not by line: the first version of this comment carried line numbers that
+  // a later commit in this same PR had already invalidated. Found by Ally on
+  // #3281, and both the stale wording and the stale refs on later heads.
   const errors = errorsFor(
     world({
       workflows: [
@@ -270,13 +273,24 @@ test("arm 1: a `with:` nested INSIDE a `with:` block does not move the anchor", 
   assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
 });
 
-test("arm 1: the outer `with:` anchor still CLEARS on a real dedent", () => {
-  // Companion to the test above. `withIndent === null` must not turn the
-  // anchor into a latch that survives the block it was opened for: the next
-  // step's real `run:` sits at step depth, shallower than the `with:`, so the
-  // dedent clear has to fire and release it. Without this, variant 4 could be
-  // "closed" by never letting go -- trading a fail-open for a fail-closed that
-  // silently eats every command after the first `with:` in the file.
+test("arm 1: a following step's `run:` still registers after a nested `with:`", () => {
+  // Companion to the test above: `withIndent === null` must not turn the
+  // anchor into a latch that eats the next step's real command.
+  //
+  // ⚠ This pins NO MUTANT, and the honest name for it is a regression guard.
+  // An earlier version of this comment claimed it pinned the dedent clear; it
+  // does not, and Ally measured that. Deleting the clear fails only `a
+  // step-level run: still registers after a JOB-level with: closes`, which is
+  // the clear's real witness. The reason is structural rather than a weak
+  // fixture: the clear only bites when a LATER `run:` is DEEPER than the
+  // `with:` that anchored, and a step's own keys sit at or shallower than its
+  // own `with:` -- so no step-level shape can exercise it. Ally's suggested
+  // repair (a sibling `run:` at the `with:` column) was probed in both
+  // constructible forms, list item and mapping key, and both are vacuous for
+  // the same reason. Only a JOB-level `with:` above deeper step `run:`s works.
+  //
+  // Kept anyway: it is cheap and it is the shape a latching "fix" for variant
+  // 4 would break first. Do not read it as coverage of the clear.
   assert.deepEqual(
     errorsFor(
       world({
