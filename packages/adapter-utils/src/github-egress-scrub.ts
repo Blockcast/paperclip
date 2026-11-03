@@ -255,6 +255,17 @@ const CAMEL_CASE_VALUE_NAMES = new Set(["alertname", "kind"]);
  *  name-anchored trade is the same one. */
 const SNAKE_CASE_VALUE_NAMES = new Set(["job"]);
 
+/** BLO-51639: a blackbox-exporter module name in a `module="…"` matcher —
+ *  `dns_amtrelay_pool_answer_shred197_v6` — as onprem-k8s probe rule tests
+ *  write it. Same snake_case shape as JOB_NAME_RE, but the digit tail is up to
+ *  3: module names carry a 3-digit source suffix (`cast192`, `shred197`), which
+ *  `job`'s 2-digit tail refuses. Kept under its own name rather than widening
+ *  `job`. Measured through the entropy floor, 200k random [a-z0-9_] tokens per
+ *  length: 3.86e-4 / 3.00e-5 / 5.00e-6 at 24 / 32 / 40 chars, against `job`'s
+ *  3.46e-4 / 2.50e-5 / 0 — about 1.1x the residual already accepted there.
+ *  The digit-run cap still applies. */
+const BLACKBOX_MODULE_RE = /^[a-z]+\d{0,3}(?:_[a-z]+\d{0,3})+$/;
+
 /** BLO-50225: an orc8r network id — a canonical lowercase UUID — spelled out
  *  in a Prometheus label matcher (`networkID="…"`), which cannot derive it at
  *  runtime. A UUID is opaque by design and stays refused under every other
@@ -424,6 +435,7 @@ function isContentDigestAssignment(name: string, value: string): boolean {
   if (digitRunCount(value) <= ALERT_NAME_MAX_DIGIT_RUNS) {
     if (CAMEL_CASE_VALUE_NAMES.has(name) && ALERT_NAME_RE.test(value)) return true;
     if (SNAKE_CASE_VALUE_NAMES.has(name) && JOB_NAME_RE.test(value)) return true;
+    if (name === "module" && BLACKBOX_MODULE_RE.test(value)) return true;
   }
   if (K8S_OBJECT_NAME_VALUE_NAMES.has(name) && isKubernetesObjectName(value)) return true;
   if (name === "rev" && GIT_COMMIT_SHA_RE.test(value)) return true;
