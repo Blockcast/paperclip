@@ -34261,10 +34261,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // lost, so a concurrent pass or replica had already moved it. The
             // row is out of the queue either way, which is why neither arm is
             // fork (a) — see the allow-list.
+            //
+            // The cancelled case keeps the `duplicate_dispatch_suppressed`
+            // name because that is what this path already writes on the
+            // cancelled row's error_code and on
+            // HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC. Naming the other
+            // branch that would make those joins return disjoint sets.
             await notePreClaimSkip(
               queuedRun,
               queuedIssueId,
-              cancelled ? "duplicate_dispatch_cancelled" : "duplicate_dispatch_suppressed",
+              cancelled ? "duplicate_dispatch_suppressed" : "duplicate_dispatch_cas_lost",
             );
             continue;
           }

@@ -5241,22 +5241,33 @@ export const KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS = [
   "pr_review_task_in_flight",
   /**
    * The dispatch loop skipped this candidate BEFORE the claim because a running
-   * sibling already owns its issue, and the `status = 'queued'` CAS to cancel
-   * it LOST — a concurrent pass or replica had already moved the row.
+   * sibling already owns its issue, and THIS pass won the `status = 'queued'`
+   * CAS and cancelled the duplicate.
    *
    * NEITHER fork. The row is no longer `queued`, so the gauge is not aging it
    * and this is not the gauge over-reporting; and the pass did not pass over
-   * claimable work, because the work was a duplicate. What a rate here measures
-   * is overlapping dispatch passes racing on one agent — worth watching on a
-   * multi-replica control plane, but it must not be added to the fork (a) tally.
+   * claimable work, because the work was a duplicate.
+   *
+   * Named to match what this path ALREADY writes elsewhere — the cancelled
+   * row's `error_code` / `stopReason` and
+   * {@link HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC} all say
+   * `duplicate_dispatch_suppressed` for exactly this case. Giving the arm a
+   * different name would make the obvious join return disjoint sets.
    */
   "duplicate_dispatch_suppressed",
   /**
-   * Same screen, but THIS pass won the CAS and cancelled the duplicate.
-   * Also neither fork, and for the same reason: the row left the queue. Split
-   * from its sibling above only to say which pass moved it.
+   * Same screen, but the CAS LOST: a concurrent pass or replica had already
+   * moved the row, so this pass cancelled nothing.
+   *
+   * Also neither fork, and for the same reason — the row is not `queued`.
+   * Split from its sibling because the difference measures overlapping
+   * dispatch passes racing on one agent, which is worth watching on a
+   * multi-replica control plane; it is a contention signal, not a fork signal.
+   * `_cas_lost` rather than a `_suppressed` variant so it reads as a sibling of
+   * {@link KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS}'s `claim_cas_lost`, which is
+   * the same kind of event one layer down.
    */
-  "duplicate_dispatch_cancelled",
+  "duplicate_dispatch_cas_lost",
   /**
    * The external-lifecycle slot pool refused the claim and did not say why.
    * Residual only: the pool now names its cause, so a non-zero rate here means
