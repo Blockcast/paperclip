@@ -204,6 +204,14 @@ Measured 2026-11-03 (PEN-5291), three rows parked to `09:00:00.000Z`:
 | PEN-5291 | `in_progress` | 09:00:34.152Z | `issue_park_expired` 09:02:01.596Z | ✅ 09:06:47.010Z |
 | PEN-4554 | **`blocked`** | — | **none, any reason** | — |
 
+A second anchor at `12:00:00.000Z` the same day replicated the control half in a
+different wake status: PEN-5291, by then `in_review`, stamped `12:00:40.551Z` and
+delivered a claimed `issue_park_expired` wake at `12:01:12.192Z`. The `blocked`
+treatment row for that anchor was re-parked by its assignee 5 m 14 s early, which
+moved `parkedUntil` to the next day and voided it — the lapsed conjunct was false,
+so the status conjunct was never exercised. Noted because a voided treatment reads
+like a negative result and is not one.
+
 The compensating control for `blocked` is the **stranded-blocked reconciler**
 (`server/src/services/stranded-blocked-issue-reconciler.ts`, default-on,
 worker-tier, lease-held, 15-minute interval), which drains a `blocked` row with
@@ -249,6 +257,65 @@ interaction wakes the assignee only at `continuationPolicy` `wake_assignee` /
 `wake_assignee_on_accept`. `convergence_stalled` is the opposite case: the
 assignee is barred from re-arming its own monitor, so nothing it can do re-enters
 the row. Classify per reason before calling a dark row fine.
+
+### The row is legitimately `blocked` and still needs a timed re-check
+
+Diagnosing the silence is not the whole job. The next question — *"my row is
+held, but something does need re-reading at a deadline"* — has three answers,
+and the attractive one is wrong. All three verified at `9488baa`.
+
+**The park columns survive a status-only PATCH.** They are written only when
+`parkedDisposition !== undefined` (`services/issues.ts:11821`), so changing
+`status` alone moves the row between wake statuses without disturbing
+`parkedUntil`, `parkedReason` or `parkedAt`.
+
+| | immediate wake? | park preserved? | fires at the deadline? |
+|---|---|---|---|
+| stay `blocked` | no | yes | **no** |
+| → `todo` | **yes, at once** | yes | yes |
+| → `in_progress` | no | yes | yes |
+
+**`blocked` → `in_progress` is the one that does what you want.** The
+status-change wake fires on `statusChangedFromBacklog ‖
+statusChangedFromBlockedToTodo ‖ statusChangedFromClosedToTodo`
+(`routes/issues.ts:14380`, defined at `:14258`, `:13855`, `:14262`).
+`blocked` → `in_progress` matches none of the three — the first needs
+`existing.status === "backlog"`, the third a closed `existing.status`, and the
+second requires `issue.status === "todo"` — so it is **silent**, while
+`in_progress` is in `ISSUE_PARK_EXPIRY_WAKE_STATUSES`. One wake, at the
+deadline.
+
+⚠️ **`blocked` → `todo` is the trap, and it is attractive rather than careless.**
+Both halves of the reasoning are true — `blocked` really has no automatic wake,
+and `todo` really has no hold — so a run reading the row fresh re-derives it.
+But `statusChangedFromBlockedToTodo` matches, and the park is *not* cleared, so
+**the row is woken twice from one intent**: once immediately, with nothing to do,
+and again at the deadline. Measured: 614 ms on PEN-5217 and 0.9 s on PEN-5141.
+On PEN-5217 two separate runs made the same move 78 minutes apart, the second
+after the first had already been refuted and reverted on that row.
+
+**Re-parking by hand before the anchor also works, at a price.** Writing a fresh
+`parkedDisposition` is itself a wake-bearing act for the agent that does it, so
+an assignee that is awake anyway can re-park and treat that as the re-check —
+done on PEN-5141 at `11:54:46.746Z`, 5 m 14 s before its `12:00Z` anchor, with
+the substitution recorded in the park note. It costs an agent run to do what a
+timer would have done, and it **destroys the prior park's evidence**: the re-park
+restamps `parkedAt` and resets `parkedWakeFiredAt`, so the question this runbook
+exists to answer becomes unanswerable for that park
+([Why the stamp is usually gone anyway](#why-the-stamp-is-usually-gone-anyway)).
+Prefer it only when the row must stay `blocked` for the hold to read correctly.
+
+⚠️ One caveat on `in_progress`, because it is not free. `applyStatusSideEffects`
+writes `startedAt = new Date()` whenever a PATCH sets `in_progress` and carries
+no `startedAt` of its own (`services/issues.ts:432`), and a status-only PATCH
+never does. `productivity-review.ts` holds **no** reference to `parked_until`, so
+its `long_active_duration` check cannot see that the row is deliberately waiting;
+the bar is 6 h (`DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS`). Exposure needs
+all three of: hand-moved to `in_progress`, no execution holder, and a park longer
+than that bar. It has never been observed firing on a parked row — stated as the
+gap it is, not as an incident. On a park comfortably past 6 h, set
+`executionPolicy.productivityReviewDisabled` at the **top level**, where it is
+durable, rather than on the monitor, where it dies with the monitor.
 
 ## Design decisions, so they are not silently re-litigated
 
