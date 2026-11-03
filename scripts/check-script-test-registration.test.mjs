@@ -214,6 +214,94 @@ test("arm 1: a `run:` nested under `with:` is an action input, not a run step", 
   assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
 });
 
+test("arm 1: a `with:` carrying a trailing comment still anchors its inputs", () => {
+  // PEN-5282 shape 2, variant 1 -- fail-OPEN until the `with:` detector was
+  // matched on the STRIPPED line. `with: # inputs` is an ordinary, common
+  // shape; testing the raw line fails the `\s*$` anchor, so `withIndent` was
+  // never set and every nested input registered. Revert the strip in the
+  // `with:` detector and this test goes green-to-red. Found by Ally on #3281.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "jobs:\n  a:\n    steps:\n      - uses: some/action@v1\n        with: # inputs\n          run: node --test scripts/a.test.mjs\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: `with` as the FIRST key of a step list item anchors its inputs", () => {
+  // PEN-5282 shape 2, variant 2 -- fail-OPEN until `-?` was added. `- with:`
+  // is `with` as the opening key of a step list item; the bare `/^\s*with:/`
+  // form never matched it, so the nested input registered. Drop the `-?` and
+  // this test fails. Found by Ally on #3281.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "jobs:\n  a:\n    steps:\n      - with:\n          run: node --test scripts/a.test.mjs\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a multi-line flow `with: {` anchors the inputs below it", () => {
+  // PEN-5282 shape 2, variant 3 -- fail-OPEN while the `with:` detector was
+  // anchored with `\s*$`. A flow mapping opened on the `with:` line puts its
+  // inputs on the lines BELOW it, so the anchored form never fired and every
+  // one of them registered. Found by probing the mutant Ally's review on
+  // #3281 left surviving: re-add the `\s*$` anchor and only this test fails.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "jobs:\n  a:\n    steps:\n      - uses: some/action@v1\n        with: {\n          run: node --test scripts/a.test.mjs\n        }\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a flow `with: {a: 1}` closed on its own line releases the step run", () => {
+  // Companion to the test above: dropping the `\s*$` anchor must not LATCH on
+  // a flow mapping that closes on its own line. The step's real `run:` follows
+  // at a shallower indent, so the dedent clear ends the block and it still
+  // registers. Without this, variant 3 could be "closed" by a latch that
+  // silently eats real commands -- trading a fail-open for a fail-closed.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: [
+          "jobs:\n  a:\n    steps:\n      - uses: some/action@v1\n        with: {a: 1}\n      - run: node --test scripts/a.test.mjs\n",
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a sibling `run:` of a `- with:` step is a real command and registers", () => {
+  // Pins WHICH column `- with:` anchors on, which the two tests above do not:
+  // both pass whether the anchor is the `with` TOKEN column (8) or the DASH
+  // column (6), because the nested input at 10 is deeper than either. Here the
+  // step's own `run:` sits at the `with` column -- it is a SIBLING key of
+  // `with`, so it is a real step command. Anchor on the dash and 8 > 6 skips
+  // it, losing a genuine registration (fail-CLOSED). Mutate
+  // `withKey[1].length` to `indent` and only this test fails.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: [
+          "jobs:\n  a:\n    steps:\n      - with:\n          input-a: x\n        run: node --test scripts/a.test.mjs\n",
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
 test("arm 1: a step-level `run:` still registers after a JOB-level `with:` closes", () => {
   // The anchor is scoped to the enclosing `with:`, not latched for the rest of
   // the file. This is the shape that makes the dedent clear load-bearing, and
