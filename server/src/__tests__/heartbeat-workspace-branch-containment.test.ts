@@ -299,11 +299,37 @@ function readAdapterWorkspace(input: unknown) {
   if (!cwd || !branchName || !executionWorkspaceId) {
     throw new Error("Adapter input is missing execution workspace context");
   }
-  const wake = context.paperclipWake as { executionWorkspace?: { branchName?: string } } | undefined;
+  const wake = context.paperclipWake as
+    | { executionWorkspace?: { branchName?: string; warnings?: unknown } }
+    | undefined;
   if (wake?.executionWorkspace?.branchName !== branchName) {
     throw new Error("Adapter wake payload is missing the execution workspace branch pin");
   }
-  return { cwd, branchName, executionWorkspaceId };
+  // PEN-5336. This is the ONLY test that drives the real dispatch -> adapter
+  // -> input path; every other test covering workspace warnings either builds
+  // a `paperclipWake` by hand or exercises server-side composition. So if the
+  // heartbeat call site stopped attaching the patch, all of those would stay
+  // green and nothing would notice -- which is the shape of the original bug.
+  // Asserting only the branch pin left exactly that hole, and `warnings` rides
+  // the SAME patch object.
+  //
+  // The property asserted is IDENTITY with the server-side array, not mere
+  // presence: `context.paperclipWorkspace.warnings` is what the run-log drain
+  // reads, and the whole defect was these two silently disagreeing about what
+  // the agent had been told.
+  const serverWarnings = Array.isArray(workspace?.warnings) ? workspace.warnings : null;
+  const deliveredWarnings = Array.isArray(wake.executionWorkspace.warnings)
+    ? wake.executionWorkspace.warnings
+    : null;
+  if (!serverWarnings || !deliveredWarnings) {
+    throw new Error("Adapter wake payload is missing execution workspace warnings");
+  }
+  if (JSON.stringify(deliveredWarnings) !== JSON.stringify(serverWarnings)) {
+    throw new Error(
+      `Adapter wake payload warnings diverged from the server-side array: delivered ${JSON.stringify(deliveredWarnings)} vs ${JSON.stringify(serverWarnings)}`,
+    );
+  }
+  return { cwd, branchName, executionWorkspaceId, warnings: deliveredWarnings };
 }
 
 async function seedBranchContainmentRun(
