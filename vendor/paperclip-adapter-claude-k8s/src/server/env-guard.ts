@@ -1443,6 +1443,49 @@ async function holdsAnyExecutionLock(base, key, run) {
     return false;
   }
 }
+// PEN-5342. A bare run id is not readable. The reader has to supply the
+// missing half from somewhere, and the only sibling relationship the framing
+// suggests is "another run of mine" — which is wrong across seats. Measured
+// (PEN-5082 cmt e87c9e8b): a DevOps run read this very refusal, saw run
+// '389edf09' and reported "another DevOps run is on this row right now". That
+// run belonged to Engineer. The reader was not careless; the datum did not
+// carry what it takes to be read correctly.
+//
+// No new fetch, no new field: 'GET /api/issues/:task' already carries the
+// holding agent twice over, and both are co-written with the lock column
+// itself.
+//   - 'executionAgentNameKey' is set in the same UPDATE .set() as
+//     'executionRunId' (issues.ts runningCheckoutExecutionPatch, and the
+//     heartbeat claim path), so it describes THIS holder by construction.
+//     It is the better of the two: it survives the holder run going terminal
+//     while the lock column still points at it.
+//   - 'activeRun' is keyed off 'executionRunId', so 'activeRun.agentId' is the
+//     holder's agent — but only while a run row is live, and the id check
+//     below keeps a skewed payload from attributing the wrong seat.
+//
+// The agent ID is what answers the question the reader was actually guessing
+// at, so when both ids are known this says "yours" or "a DIFFERENT agent"
+// outright rather than leaving the inference to be made. When nothing names
+// the holder, say THAT — an unqualified id is the input to the misread, so
+// silence here must be explicit rather than bare.
+function describeHolderAgent(issue, holder, selfAgentId) {
+  const nameKey = issue && typeof issue.executionAgentNameKey === "string" && issue.executionAgentNameKey
+    ? issue.executionAgentNameKey
+    : null;
+  const activeRun = issue && issue.activeRun;
+  const agentId = activeRun && activeRun.id === holder && typeof activeRun.agentId === "string" && activeRun.agentId
+    ? activeRun.agentId
+    : null;
+  const named = nameKey ? 'agent "' + nameKey + '"' : agentId ? "agent " + agentId : null;
+  if (!named) {
+    return "the server named no holding agent for that run, so do NOT assume it is another run of your own agent";
+  }
+  const qualified = nameKey && agentId ? named + " (" + agentId + ")" : named;
+  if (!agentId || !selfAgentId) return "that run belongs to " + qualified;
+  return agentId === selfAgentId
+    ? "that run belongs to " + qualified + ", which is YOUR OWN agent"
+    : "that run belongs to " + qualified + ", which is a DIFFERENT agent from yours";
+}
 async function foreignLockHolder() {
   const env = process.env;
   const task = env.PAPERCLIP_TASK_ID, run = env.PAPERCLIP_RUN_ID;
@@ -1470,7 +1513,13 @@ async function foreignLockHolder() {
   // command pushes for. Entitlement is a property of the run, so ask that
   // before refusing — only a run holding no lock at all is unentitled.
   if (await holdsAnyExecutionLock(base, key, run)) return null;
-  return { holder, run, issue: issue.identifier || task, id: issue.id || task };
+  return {
+    holder,
+    holderAgent: describeHolderAgent(issue, holder, env.PAPERCLIP_AGENT_ID || null),
+    run,
+    issue: issue.identifier || task,
+    id: issue.id || task,
+  };
 }
 let raw = "";
 process.stdin.on("data", (d) => { raw += d; });
@@ -1519,6 +1568,7 @@ process.stdin.on("end", async () => {
           "FOR is not something this guard can see, and it is not claiming to know: " +
           "the unentitled run is the finding. (Detected via the issue that woke the " +
           "run, " + foreign.issue + ", whose lock is held by run " + foreign.holder +
+          " — " + foreign.holderAgent +
           ".) Check out the issue this change IS for — paperclipCheckoutIssue — then " +
           "run the command again. Do NOT check out " + foreign.issue + " to clear this " +
           "message unless that is the issue you are pushing for: taking an unrelated " +

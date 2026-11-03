@@ -800,7 +800,10 @@ describe("block message resolves to the installed helper (BLO-29526)", () => {
  */
 describe("embedded guard: lock re-assertion before outward side effects (BLO-29965)", () => {
   const ME = "run-mine";
-  const LOCK_VARS = ["PAPERCLIP_TASK_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_API_URL", "PAPERCLIP_API_KEY"];
+  // PEN-5342 adds PAPERCLIP_AGENT_ID: this suite can itself run inside an agent
+  // pod, where a real seat id would leak into the "unset" case and into the
+  // yours/theirs verdict.
+  const LOCK_VARS = ["PAPERCLIP_TASK_ID", "PAPERCLIP_RUN_ID", "PAPERCLIP_API_URL", "PAPERCLIP_API_KEY", "PAPERCLIP_AGENT_ID"];
 
   /**
    * PEN-4315: the guard now asks two questions, so the fake API serves two
@@ -983,6 +986,167 @@ describe("embedded guard: lock re-assertion before outward side effects (BLO-299
       expect(stderr).not.toMatch(/Re-assert the lock first/);
       expect(stderr).toContain("not something this guard can see");
       expect(stderr).toContain("Do NOT check out BLO-1");
+    });
+  });
+
+  /**
+   * PEN-5342. The refusal names the holder as a bare run id, and a reader has
+   * to supply the missing half from somewhere. The only sibling relationship
+   * the framing suggests is "another run of mine", which is wrong across
+   * seats — measured on PEN-5082 cmt `e87c9e8b`, where a DevOps run read this
+   * exact message, saw `389edf09` and reported "another DevOps run is on this
+   * row right now". That run was Engineer's.
+   *
+   * These assert the EMITTED STDERR, which is the surface an agent actually
+   * reads. Asserting that `executionAgentNameKey` survives onto some
+   * server-side object would not be a delivery test: BLO-27858 shipped a
+   * warning whose doc comments claimed it reached the agent while it only
+   * reached the run log, and nothing failed, because nothing asserted the
+   * text at the claimed destination.
+   */
+  describe("names the holding agent in the refusal (PEN-5342)", () => {
+    const SELF_AGENT = "agent-mine";
+    const OTHER_AGENT = "agent-theirs";
+
+    it("names a foreign agent by name AND says it is NOT your own seat", async () => {
+      await withApi(
+        {
+          status: 200,
+          body: {
+            id: "task-1",
+            identifier: "BLO-1",
+            executionRunId: "run-other",
+            executionAgentNameKey: "engineer",
+            activeRun: { id: "run-other", agentId: OTHER_AGENT },
+          },
+        },
+        async (vars) => {
+          const { status, stderr } = await run("git push", { ...vars, PAPERCLIP_AGENT_ID: SELF_AGENT });
+          expect(status).toBe(2);
+          expect(stderr).toContain("run-other");
+          // The id alone is what produced the misread; the agent must appear
+          // in the same breath as the id it qualifies.
+          expect(stderr).toContain('run run-other — that run belongs to agent "engineer"');
+          expect(stderr).toContain(OTHER_AGENT);
+          expect(stderr).toContain("a DIFFERENT agent from yours");
+          // ...and must not be left for the reader to guess at.
+          expect(stderr).not.toMatch(/held by run run-other\./);
+        },
+      );
+    });
+
+    it("says YOUR OWN agent when the holder is a sibling run of this seat", async () => {
+      await withApi(
+        {
+          status: 200,
+          body: {
+            id: "task-1",
+            identifier: "BLO-1",
+            executionRunId: "run-other",
+            executionAgentNameKey: "engineer",
+            activeRun: { id: "run-other", agentId: SELF_AGENT },
+          },
+        },
+        async (vars) => {
+          const { status, stderr } = await run("git push", { ...vars, PAPERCLIP_AGENT_ID: SELF_AGENT });
+          expect(status).toBe(2);
+          expect(stderr).toContain("which is YOUR OWN agent");
+          expect(stderr).not.toContain("a DIFFERENT agent from yours");
+        },
+      );
+    });
+
+    /**
+     * `executionAgentNameKey` is co-written with `executionRunId` in the same
+     * UPDATE, so it outlives the holder's run row going terminal while the
+     * lock column still points at it. That is the case `activeRun` cannot
+     * serve, and the one where a bare id would otherwise survive.
+     */
+    it("falls back to executionAgentNameKey when activeRun is gone", async () => {
+      await withApi(
+        {
+          status: 200,
+          body: {
+            id: "task-1",
+            identifier: "BLO-1",
+            executionRunId: "run-other",
+            executionAgentNameKey: "devops",
+            activeRun: null,
+          },
+        },
+        async (vars) => {
+          const { stderr } = await run("git push", { ...vars, PAPERCLIP_AGENT_ID: SELF_AGENT });
+          expect(stderr).toContain('that run belongs to agent "devops"');
+          // No agent id to compare against, so it must claim neither.
+          expect(stderr).not.toContain("a DIFFERENT agent from yours");
+          expect(stderr).not.toContain("YOUR OWN agent");
+        },
+      );
+    });
+
+    /**
+     * A skewed payload must not attribute the wrong seat: `activeRun` is keyed
+     * off `executionRunId`, so one naming a different run says nothing about
+     * this holder.
+     */
+    it("ignores an activeRun that is not the lock holder", async () => {
+      await withApi(
+        {
+          status: 200,
+          body: {
+            id: "task-1",
+            identifier: "BLO-1",
+            executionRunId: "run-other",
+            activeRun: { id: "run-unrelated", agentId: OTHER_AGENT },
+          },
+        },
+        async (vars) => {
+          const { stderr } = await run("git push", { ...vars, PAPERCLIP_AGENT_ID: SELF_AGENT });
+          expect(stderr).not.toContain(OTHER_AGENT);
+          expect(stderr).toContain("the server named no holding agent for that run");
+        },
+      );
+    });
+
+    /**
+     * The no-information case is the one that MADE the defect, so silence has
+     * to be spoken rather than left as a bare id. `foreign` carries no agent
+     * field at all — exactly the pre-PEN-5342 payload shape.
+     */
+    it("says so explicitly when nothing in the payload names the holder", async () => {
+      await withApi(foreign, async (vars) => {
+        const { status, stderr } = await run("git push", { ...vars, PAPERCLIP_AGENT_ID: SELF_AGENT });
+        expect(status).toBe(2);
+        expect(stderr).toContain("run-other");
+        expect(stderr).toContain("the server named no holding agent for that run");
+        expect(stderr).toContain("do NOT assume it is another run of your own agent");
+      });
+    });
+
+    /**
+     * PAPERCLIP_AGENT_ID is set by the job manifest, but the guard must not
+     * depend on it: without it the agent is still named, only the
+     * yours/theirs verdict is withheld.
+     */
+    it("still names the agent when PAPERCLIP_AGENT_ID is unset", async () => {
+      await withApi(
+        {
+          status: 200,
+          body: {
+            id: "task-1",
+            identifier: "BLO-1",
+            executionRunId: "run-other",
+            executionAgentNameKey: "engineer",
+            activeRun: { id: "run-other", agentId: OTHER_AGENT },
+          },
+        },
+        async (vars) => {
+          const { stderr } = await run("git push", vars);
+          expect(stderr).toContain('that run belongs to agent "engineer"');
+          expect(stderr).not.toContain("a DIFFERENT agent from yours");
+          expect(stderr).not.toContain("YOUR OWN agent");
+        },
+      );
     });
   });
 
