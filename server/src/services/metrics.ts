@@ -1757,6 +1757,36 @@ export const QUEUED_RUN_OLDEST_AGE_METRIC = "paperclip_queued_run_oldest_age_sec
 export const QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC =
   "paperclip_queued_run_oldest_claimable_age_seconds";
 export const QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC = "paperclip_queued_run_age_metrics_refresh_success";
+// PEN-5385 / BLO-51379: the `issues.last_activity_at` drift repair reports the
+// outcome of its pass exactly once, as a log line, at lease acquisition. On a
+// worker that has held the lease for a day that line sits at the HEAD of the
+// log, where `kubectl logs --tail` cannot reach it -- so "has the repair ever
+// run?" became unanswerable from every surface the fleet actually has, and
+// PEN-5385 was opened to answer it by hand (it took a Loki head query).
+//
+// These three make the same answer a scrape. REPAIRED is the load-bearing one:
+// the guard is idempotent and monotone, so a pass's repaired count IS the
+// number of rows that were drifted the moment it started. A later pass reading
+// 0 is the standing proof that `issues.last_activity_at` -- which PEN-5213 made
+// the issues-list ORDER BY definition -- is not silently mis-ordering the list.
+//
+// All three are LAST-PASS values, not counters, and they are written only when
+// a pass COMPLETES.
+//
+// ⚠️ THEY READ 0 UNTIL ONE DOES, which is the normal and PERMANENT state of a
+// non-lease-holding worker — the repair is a worker-tier singleton gated on the
+// scheduler lease, so only the holder ever runs it. A follower therefore
+// publishes `..._last_repaired_rows 0` forever, and that zero is byte-identical
+// to a real all-clear. NEVER bound `repaired` on its own: gate on
+// `..._last_completion_timestamp_seconds`, which is 0 (epoch) until a pass
+// finishes, so a staleness bound on it fails CLOSED. Scrape the lease holder,
+// or take `max` across the tier.
+export const ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_COMPLETION_METRIC =
+  "paperclip_issues_last_activity_drift_repair_last_completion_timestamp_seconds";
+export const ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_REPAIRED_METRIC =
+  "paperclip_issues_last_activity_drift_repair_last_repaired_rows";
+export const ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_FAILED_BATCHES_METRIC =
+  "paperclip_issues_last_activity_drift_repair_last_failed_batches";
 // BLO-32638: a routine's receipt that it took a measurement is a `done` issue
 // row, which Prometheus cannot see. So a routine silently disabled for
 // intervals is indistinguishable, on every existing metrics surface, from one
@@ -6155,6 +6185,9 @@ let githubRateLimitLimit: Gauge<"route"> | null = null;
 let githubRateLimitUsed: Gauge<"route"> | null = null;
 let githubRateLimitResetSeconds: Gauge<"route"> | null = null;
 let githubRateLimitSampleSuccess: Gauge<"route"> | null = null;
+let issuesLastActivityDriftRepairLastCompletion: Gauge | null = null;
+let issuesLastActivityDriftRepairLastRepaired: Gauge | null = null;
+let issuesLastActivityDriftRepairLastFailedBatches: Gauge | null = null;
 let deferredIssueExecutionWakeOldestAge: Gauge<"agent_id"> | null = null;
 let deferredIssueExecutionWakeAgeMetricsRefreshSuccess: Gauge | null = null;
 let coldInReviewIssueOldestAge: Gauge<"agent_id"> | null = null;
@@ -6429,6 +6462,9 @@ function ensureRegistry(): {
   githubRateLimitUsedGauge: Gauge<"route">;
   githubRateLimitResetSecondsGauge: Gauge<"route">;
   githubRateLimitSampleSuccessGauge: Gauge<"route">;
+  issuesLastActivityDriftRepairLastCompletionGauge: Gauge;
+  issuesLastActivityDriftRepairLastRepairedGauge: Gauge;
+  issuesLastActivityDriftRepairLastFailedBatchesGauge: Gauge;
   deferredIssueExecutionWakeOldestAgeGauge: Gauge<"agent_id">;
   deferredIssueExecutionWakeAgeMetricsRefreshSuccessGauge: Gauge;
   coldInReviewIssueOldestAgeGauge: Gauge<"agent_id">;
@@ -6582,6 +6618,9 @@ function ensureRegistry(): {
     || !githubRateLimitUsed
     || !githubRateLimitResetSeconds
     || !githubRateLimitSampleSuccess
+    || !issuesLastActivityDriftRepairLastCompletion
+    || !issuesLastActivityDriftRepairLastRepaired
+    || !issuesLastActivityDriftRepairLastFailedBatches
     || !externalRuntimeReservationsReleasePending
     || !externalRuntimeReservationReleasePendingOldestAge
     || !environmentLeasesOrphanedActive
@@ -7099,6 +7138,33 @@ function ensureRegistry(): {
       registers: [registry],
     });
     queuedRunAgeMetricsRefreshSuccess.set(0);
+    issuesLastActivityDriftRepairLastCompletion = new Gauge({
+      name: ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_COMPLETION_METRIC,
+      help:
+        "Unix time in seconds at which the last issues.last_activity_at drift repair pass COMPLETED "
+        + "on this process (PEN-5385). 0 until one finishes, which on a non-lease-holding worker is "
+        + "permanent and expected - the repair is a scheduler-lease singleton. Gate every other series "
+        + "in this family on this one; at 0 a `time() - <series>` bound fails closed.",
+      registers: [registry],
+    });
+    issuesLastActivityDriftRepairLastRepaired = new Gauge({
+      name: ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_REPAIRED_METRIC,
+      help:
+        "Rows advanced by the last completed issues.last_activity_at drift repair pass. The guard is "
+        + "idempotent and the column monotone, so this IS the number of rows that were drifted when the "
+        + "pass began: 0 on a later pass is the proof that the issues-list ORDER BY column (PEN-5213) is "
+        + "not mis-ordering. ALWAYS pair it with the completion timestamp - this reads 0 on a worker that "
+        + "has never run a pass, which is indistinguishable from an all-clear on its own.",
+      registers: [registry],
+    });
+    issuesLastActivityDriftRepairLastFailedBatches = new Gauge({
+      name: ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_FAILED_BATCHES_METRIC,
+      help:
+        "Batches the last completed issues.last_activity_at drift repair pass skipped after a "
+        + "statement/lock timeout. Non-zero means the pass completed but did NOT cover every issue, so "
+        + "its repaired count is a lower bound and the matching 0 cannot be read as 'no drift'.",
+      registers: [registry],
+    });
     scheduledRetryParkHorizon = new Gauge({
       name: SCHEDULED_RETRY_PARK_HORIZON_METRIC,
       help:
@@ -9826,6 +9892,9 @@ function ensureRegistry(): {
     githubRateLimitResetSecondsGauge: githubRateLimitResetSeconds,
     githubRateLimitSampleSuccessGauge: githubRateLimitSampleSuccess,
     queuedRunAgeMetricsRefreshSuccessGauge: queuedRunAgeMetricsRefreshSuccess,
+    issuesLastActivityDriftRepairLastCompletionGauge: issuesLastActivityDriftRepairLastCompletion,
+    issuesLastActivityDriftRepairLastRepairedGauge: issuesLastActivityDriftRepairLastRepaired,
+    issuesLastActivityDriftRepairLastFailedBatchesGauge: issuesLastActivityDriftRepairLastFailedBatches,
     externalRuntimeReservationsReleasePendingGauge: externalRuntimeReservationsReleasePending,
     externalRuntimeReservationReleasePendingOldestAgeGauge: externalRuntimeReservationReleasePendingOldestAge,
     environmentLeasesOrphanedActiveGauge: environmentLeasesOrphanedActive,
@@ -10788,6 +10857,28 @@ export function setGithubRateLimitSample(route: string, sample: GithubRateLimitS
 /** Mark whether the queued-run age gauge was refreshed from the database. */
 export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
+}
+
+/**
+ * Publish the outcome of a COMPLETED `issues.last_activity_at` drift repair
+ * pass (PEN-5385).
+ *
+ * Call this only on completion. A pass that threw leaves the previous values
+ * standing, which is correct: the gauges describe the last pass that actually
+ * finished, and the completion timestamp is what tells a reader how old that
+ * statement is. Writing partial values on failure would make a stale
+ * `repaired: 0` look like a fresh all-clear.
+ */
+export function recordIssuesLastActivityDriftRepairPass(result: {
+  repaired: number;
+  failedBatches: number;
+}): void {
+  const registry = ensureRegistry();
+  registry.issuesLastActivityDriftRepairLastRepairedGauge.set(result.repaired);
+  registry.issuesLastActivityDriftRepairLastFailedBatchesGauge.set(result.failedBatches);
+  // Set last, so a scrape that interleaves cannot pair a fresh timestamp with
+  // the previous pass's counts.
+  registry.issuesLastActivityDriftRepairLastCompletionGauge.set(Date.now() / 1000);
 }
 
 /**
@@ -13469,6 +13560,9 @@ export function __resetMetricsForTest(): void {
   githubRateLimitResetSeconds = null;
   githubRateLimitSampleSuccess = null;
   queuedRunAgeMetricsRefreshSuccess = null;
+  issuesLastActivityDriftRepairLastCompletion = null;
+  issuesLastActivityDriftRepairLastRepaired = null;
+  issuesLastActivityDriftRepairLastFailedBatches = null;
   externalRuntimeReservationsReleasePending = null;
   externalRuntimeReservationReleasePendingOldestAge = null;
   environmentLeasesOrphanedActive = null;
