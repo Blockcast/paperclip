@@ -5974,6 +5974,67 @@ describe("inspectManagedGitWorktreeBranch when `git worktree list` fails (BLO-42
   }, 30_000);
 });
 
+describe("inspectManagedGitWorktreeBranch when `git worktree list` outgrows the output capture (BLO-51647)", () => {
+  // onprem-k8s reached 525 registrations and `git worktree list --porcelain`
+  // printed 271,934 bytes. The default 256 KiB capture keeps only the TAIL, so
+  // the first registrations silently fell off the list and their live worktrees
+  // failed validation as `not_registered`. The shim runs the real list and then
+  // appends ~300 KiB of extra registrations, so the real one sits at the head.
+  it("still finds a registration printed before 256 KiB of later entries", async () => {
+    const repoRoot = await createTempRepo();
+    const branchName = "BLO-51647-head-of-list";
+    const worktreePath = path.join(repoRoot, ".paperclip", "worktrees", branchName);
+    await runGit(repoRoot, ["worktree", "add", "-b", branchName, worktreePath]);
+
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const fakeBin = await makeTempDir("paperclip-git-list-long-");
+    const padDir = `/nonexistent-blo-51647/${"p".repeat(380)}`;
+    await fs.writeFile(
+      path.join(fakeBin, "git"),
+      [
+        "#!/bin/sh",
+        `if [ "$1" = worktree ] && [ "$2" = list ]; then`,
+        `  "${realGit}" "$@" || exit $?`,
+        `  i=0; while [ $i -lt 800 ]; do printf 'worktree ${padDir}/%d\nHEAD 0000000000000000000000000000000000000000\ndetached\n\n' $i; i=$((i+1)); done`,
+        "  exit 0",
+        "fi",
+        `exec "${realGit}" "$@"`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const previousServerGit = process.env.PAPERCLIP_SERVER_GIT;
+    process.env.PAPERCLIP_SERVER_GIT = path.join(fakeBin, "git");
+    try {
+      const listed = (await execFileAsync(path.join(fakeBin, "git"), ["worktree", "list", "--porcelain"], {
+        cwd: repoRoot,
+        maxBuffer: 8 * 1024 * 1024,
+      })).stdout;
+      // Guard the fixture: the list must really exceed the old capture.
+      expect(Buffer.byteLength(listed)).toBeGreaterThan(256 * 1024);
+
+      const inspection = await inspectManagedGitWorktreeBranch({ worktreePath, expectedBranchName: branchName });
+
+      expect(inspection).toMatchObject({ valid: true, reasonCode: null, actualBranchName: branchName });
+    } finally {
+      if (previousServerGit === undefined) delete process.env.PAPERCLIP_SERVER_GIT;
+      else process.env.PAPERCLIP_SERVER_GIT = previousServerGit;
+      await fs.rm(fakeBin, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("refuses a truncated list instead of returning its tail as the whole answer", async () => {
+    const repoRoot = await createTempRepo();
+    await runGit(repoRoot, ["worktree", "add", "-b", "BLO-51647-a", path.join(repoRoot, ".paperclip", "worktrees", "a")]);
+    const args = ["worktree", "list", "--porcelain"];
+
+    // The control: without the flag the capture still silently keeps the tail.
+    expect(await runGitForTests(args, repoRoot, { maxStdoutBytes: 64 })).toContain("output truncated");
+    await expect(runGitForTests(args, repoRoot, { maxStdoutBytes: 64, rejectTruncatedStdout: true }))
+      .rejects.toMatchObject({ name: "GitCommandOutputTruncatedError" });
+  });
+});
+
 describe("ensureRuntimeServicesForRun", () => {
   it("leaves manual runtime services untouched during agent runs", async () => {
     const workspaceRoot = await makeTempDir("paperclip-runtime-manual-");

@@ -1314,6 +1314,17 @@ export class GitCommandFailedError extends Error {
 }
 
 /**
+ * git answered, but the capture kept only the tail of what it printed. Parsing
+ * that tail as the whole answer is wrong, so this is not a verdict (BLO-51647).
+ */
+export class GitCommandOutputTruncatedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "GitCommandOutputTruncatedError";
+  }
+}
+
+/**
  * `git submodule status` line shape: a status character, the full object id,
  * then the path. Anchored deliberately -- it is the guard that makes salvaging a
  * *partial* stream safe, because neither a head-chopped fragment (which has lost
@@ -1343,7 +1354,14 @@ function salvageGitSubmoduleFaults(error: GitCommandTimeoutError): GitSubmoduleR
 async function runGit(
   args: string[],
   cwd: string,
-  options: { env?: NodeJS.ProcessEnv; timeoutMs?: number; maxStdoutBytes?: number; maxStderrBytes?: number } = {},
+  options: {
+    env?: NodeJS.ProcessEnv;
+    timeoutMs?: number;
+    maxStdoutBytes?: number;
+    maxStderrBytes?: number;
+    /** Throw instead of returning a tail-truncated stdout (BLO-51647). */
+    rejectTruncatedStdout?: boolean;
+  } = {},
 ): Promise<string> {
   const proc = await executeProcess({
     ...resolveServerGitInvocation(args),
@@ -1377,6 +1395,11 @@ async function runGit(
     // `relinkHuskGitWorktree` would stop running its `fs.rm(dotGit)` cleanup,
     // and the only trace would be a `warn` (PEN-4900).
     throw new GitCommandFailedError(proc.stderr.trim() || proc.stdout.trim() || `git ${args.join(" ")} failed`);
+  }
+  if (proc.stdoutTruncated && options.rejectTruncatedStdout) {
+    throw new GitCommandOutputTruncatedError(
+      `git ${args.join(" ")} printed ${proc.stdoutBytes} bytes, more than the ${options.maxStdoutBytes ?? DEFAULT_EXECUTE_PROCESS_OUTPUT_BYTES}-byte capture`,
+    );
   }
   return proc.stdout.trim();
 }
@@ -3404,9 +3427,8 @@ async function resolveGitOwnerRepoRoot(cwd: string): Promise<string> {
 // the subprocess twice — once by path, once by branch — is pure overhead on the
 // common `sameHead` path that repairs without ever reading the branch lookup.
 async function listRegisteredGitWorktrees(repoRoot: string): Promise<GitWorktreeListEntry[] | null> {
-  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot, {
-    timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
-  }).catch(() => null);
+  const raw = await runGit(["worktree", "list", "--porcelain"], repoRoot, WORKTREE_LIST_GIT_OPTIONS)
+    .catch(() => null);
   if (!raw) return null;
   return parseGitWorktreeListPorcelain(raw);
 }
@@ -4085,9 +4107,7 @@ export async function resolvePathForWorktreeComparison(value: string): Promise<s
 }
 
 async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>> {
-  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot, {
-    timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
-  });
+  const output = await runGit(["worktree", "list", "--porcelain"], repoRoot, WORKTREE_LIST_GIT_OPTIONS);
   const paths = new Set<string>();
   for (const line of output.split("\n")) {
     if (!line.startsWith("worktree ")) continue;
@@ -4110,7 +4130,9 @@ async function listLinkedGitWorktreePaths(repoRoot: string): Promise<Set<string>
  */
 function gitWorktreeOwnershipContext(repoRoot: string) {
   return {
-    git: (args: string[], cwd: string) => runGit(args, cwd, { timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS }),
+    // List options for every call: a truncated registry must throw, so the
+    // ownership guards fail closed instead of reading "not registered".
+    git: (args: string[], cwd: string) => runGit(args, cwd, WORKTREE_LIST_GIT_OPTIONS),
     repoRoot,
     normalizePath: resolvePathForWorktreeComparison,
   };
@@ -5722,6 +5744,19 @@ export type WorktreeReclaimSafety = {
 };
 
 const WORKTREE_RECLAIM_GIT_TIMEOUT_MS = 30_000;
+
+/**
+ * BLO-51647: `git worktree list --porcelain` grows ~520 bytes per registration.
+ * At 525 registrations onprem-k8s printed 271,934 bytes, past the default
+ * 256 KiB capture, which keeps only the TAIL -- so the first ~20 registrations
+ * silently vanished and their live worktrees failed validation as
+ * `not_registered`. Every list read uses this cap and refuses a truncated answer.
+ */
+const WORKTREE_LIST_GIT_OPTIONS = {
+  timeoutMs: WORKTREE_RECLAIM_GIT_TIMEOUT_MS,
+  maxStdoutBytes: 64 * 1024 * 1024,
+  rejectTruncatedStdout: true,
+};
 
 const reclaimFsWedgedRoots = new Map<string, number>();
 
