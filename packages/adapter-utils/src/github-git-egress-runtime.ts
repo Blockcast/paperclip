@@ -551,6 +551,21 @@ export function buildGitArgv(
     throw publishVerbRefusal(classification.publishVerb);
   }
 
+  // BLO-51647: `git worktree prune` is repo-global and decides "stale" by
+  // whether each worktree directory exists. An isolation pod mounts only the
+  // shared `.git` and its own worktree, so every other run's live worktree reads
+  // as missing and the prune deregisters it (locked entries survive, the rest
+  // do not). That cannot be made safe from inside the pod, so refuse it; a
+  // dry run deletes nothing and stays allowed.
+  if (classification.subcommand === "worktree" && argv[classification.subcommandIndex + 1] === "prune") {
+    const rest = argv.slice(classification.subcommandIndex + 2);
+    if (!rest.includes("-n") && !rest.includes("--dry-run")) {
+      throw new GitEgressRuntimeError(
+        "paperclip-github-egress: refusing to run `git worktree prune`. It deregisters every worktree whose directory this container cannot see, and an isolated run sees only its own -- so it removes other runs' live worktrees from the shared repository. Use `git worktree remove <path>` for a specific worktree you own; `git worktree prune --dry-run` is allowed.",
+      );
+    }
+  }
+
   if (classification.subcommand === "commit") {
     return options.requiresSignoff?.() ? withSignoff(argv, classification) : [...argv];
   }
