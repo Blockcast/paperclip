@@ -174,11 +174,23 @@ describeEmbeddedPostgres("captureTimedOutIssueListPlan against real PostgreSQL (
 
   it("redacts a search pattern containing escapeLikePattern backslashes", async () => {
     // The production patterns are built by `escapeLikePattern`, which escapes
-    // %, _ and \\ — so a user searching `100%` binds `%100\\%%`. Whether a
-    // backslash changes how PostgreSQL renders the literal into the plan is a
-    // server behaviour, not a string-handling assumption, so it is asserted
-    // against a real server rather than reasoned about.
-    const pattern = "%100\\%%";
+    // %, _ and \\ — so a user searching `super-secret-100%` binds
+    // `%super-secret-100\\%%`. Whether a backslash changes how PostgreSQL renders
+    // the literal into the plan is a server behaviour, not a string-handling
+    // assumption, so it is asserted against a real server rather than reasoned
+    // about.
+    //
+    // PEN-5422 — the needle has to be DISTINCTIVE, not merely absent-looking.
+    // This pattern was `%100\\%%` and the assertion `.not.toContain("100")`
+    // against the whole serialised payload. That payload also carries a random
+    // `companyId` UUID, a raw `explainMs` duration and PostgreSQL's own cost and
+    // row estimates — and `100` is an ordinary hex sequence, so the needle
+    // collided with the NONCE rather than the secret and red-lit unrelated PRs
+    // at roughly 1 run in 205. The escaping behaviour under test is indifferent
+    // to which characters precede the escape, so the literal carries a
+    // distinctive prefix while keeping the trailing `100\\%` that provides the
+    // coverage.
+    const pattern = "%super-secret-100\\%%";
     const query = db
       .select({ id: issues.id })
       .from(issues)
@@ -190,7 +202,7 @@ describeEmbeddedPostgres("captureTimedOutIssueListPlan against real PostgreSQL (
       error: Object.assign(new Error("canceling statement"), { code: "57014" }),
       companyId,
       hasSearch: true,
-      searchTermLength: 4,
+      searchTermLength: 17,
       env: { [ISSUE_LIST_EXPLAIN_FLAG]: "1" },
     });
 
@@ -198,7 +210,15 @@ describeEmbeddedPostgres("captureTimedOutIssueListPlan against real PostgreSQL (
       .mocked(logger.warn)
       .mock.calls.find(([, message]) => String(message).includes("captured production query plan"));
     expect(call, "expected the plan to be logged, not withheld").toBeDefined();
-    expect(JSON.stringify(call![0])).not.toContain("100");
+    const [escapedPayload] = call!;
+    const escapedPlan = String((escapedPayload as any).plan);
+    expect(JSON.stringify(escapedPayload)).not.toContain("super-secret-100");
+    // ...and redaction must not have destroyed the artifact. A withheld or
+    // emptied payload satisfies the negative assertion on its own, so the plan
+    // SHAPE is asserted alongside it, exactly as the sibling test does.
+    expect((escapedPayload as any).statement).toContain("ILIKE $");
+    expect(escapedPlan).toMatch(/Scan/);
+    expect(escapedPlan).toMatch(/\$\d/);
   });
 
   it("the driver never names a prepared statement, so production plans custom", async () => {
