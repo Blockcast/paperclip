@@ -248,6 +248,15 @@ async function apiList(path) {
  * error rather than a silent partial scan. A page that is BOTH empty and
  * truncated is the same class of problem -- more rows exist and nothing can
  * advance past them -- so it throws rather than returning a short count.
+ *
+ * THAT THROW IS NOT A SERVER BUG, and it is reachable rather than theoretical.
+ * For an actor without company-scope read, a window in which every row is
+ * unreadable comes back empty while the header correctly reports readable rows
+ * further on; there is no cursor to carry, because the ids that would supply one
+ * are the rows this actor may not see. The walk refuses instead of undercounting,
+ * which is the safe direction, but it does mean this instrument is UNUSABLE for
+ * that actor class rather than merely imprecise. Run it with a company-scope key;
+ * nothing short of a raw-window cursor from the server fixes the restricted case.
  */
 export function nextCursor(rows, pageSize, afterId, truncated = false) {
   if (rows.length < pageSize && !truncated) return { done: true, afterId: null };
