@@ -35,7 +35,7 @@ import {
   createIssueAttachmentMetadataSchema,
   createIssueThreadInteractionSchema,
   unrecognizedInteractionPayloadKeys,
-  extractUnboundMentionTokens,
+  extractMentionBindingReport,
   createIssueWorkProductSchema,
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
@@ -16563,16 +16563,32 @@ export function issueRoutes(
     // be told apart from a server that predates this report, which is the
     // ambiguity the `unrecognizedPayloadKeys` note calls out. An empty array
     // means "every `@` token in this body reached somebody".
+    //
+    // PEN-5364: `unboundMentions` is deduped on the token text, so a body that
+    // writes `[@Cfo](agent://…)` once AND bare `@Cfo` in prose reports
+    // `["Cfo"]` — identical to a body that only wrote the bare form. The first
+    // raised the wake, the second dropped it, and the author could not tell
+    // which. `boundMentions` reports the names that DID bind, so the pair is
+    // readable: a name in both means the link bound and the prose tokens are
+    // noise; a name in `unboundMentions` alone means the wake was dropped.
+    // Additive on purpose — `unboundMentions` keeps its semantics, and
+    // `boundMentions` is likewise unconditional so an absent key cannot be
+    // confused with an older server.
     const commentResponseBody = async () => {
       let unboundMentions: string[] = [];
+      let boundMentions: string[] = [];
       try {
-        unboundMentions = extractUnboundMentionTokens(persistedComment.body, {
+        const mentionReport = extractMentionBindingReport(persistedComment.body, {
           boundAgentIds: await resolveMentionedAgentIds(),
         });
+        unboundMentions = mentionReport.unbound;
+        boundMentions = mentionReport.bound;
       } catch (err) {
+        // Fail toward "nothing bound": a false re-send costs one round trip, a
+        // false all-clear costs the wake.
         logger.warn({ err, issueId: id }, "failed to scan comment for unbound @-mentions");
       }
-      return { ...persistedComment, unboundMentions };
+      return { ...persistedComment, unboundMentions, boundMentions };
     };
 
     if ("deduplicated" in comment && comment.deduplicated) {

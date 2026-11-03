@@ -595,6 +595,93 @@ When creating a pull request (via `gh pr create` or any other method), you **mus
 
 The review gate also publishes a `ci/ally-head-attested` check-run on every PR. It is a schedule signal for heavy CI (`success` when an Ally comment attests this exact head and nothing blocks it, even where `gate/ally-comment-findings` is deliberately `neutral`), not review evidence and not a finding when `neutral`. Never add it to required contexts.
 
+### "It merged" is not review evidence on `master` (PEN-5362)
+
+Measured 2026-11-03 against the live API, read-only. `master` carries exactly two rulesets
+(`repos/Blockcast/paperclip/rules/branches/master`; the repo-wide `rulesets` list confirms there are
+no others, both `active`): a `merge_queue` rule and a `required_status_checks` rule naming **one**
+context, `gate/ally-comment-findings`. **There is no `pull_request` rule**, so no approving review is
+required to merge.
+
+Classic branch protection is a separate, additive mechanism and is `403` from an agent seat, so the
+ruleset read alone cannot prove a review requirement is absent. Three independent probes do:
+
+- 16 of 43 open PRs read `mergeStateStatus: CLEAN` while carrying zero approving reviews. `CLEAN`
+  means no blocking requirement remains.
+- `reviewDecision` never reads `REVIEW_REQUIRED` on any open PR. On a repo that does require a
+  review, an unapproved PR reads exactly that.
+- 739 of the 800 agent-authored merges in the last 1000 (92.4%) landed with no approving review of
+  any kind.
+
+The one required check is fail-open **by its own description**. At #3322's head `df4ab741`:
+
+```
+gate/ally-comment-findings :: success
+  "The only comment attesting this head is the PR author's own; nothing independent reviewed it."
+```
+
+That is not a bypass. It is the gate passing, as designed, on a head nothing read — absence of an
+independent review is one of its passing states.
+
+Five consequences, each easy to get backwards:
+
+- **"It merged" and "it was enqueued" are not review evidence.** Cite the approving reviewer's
+  login, the `Reviewed head:` SHA in the review body, and the review object id. Never cite the merge.
+  `reviewDecision` is a weak citation on its own: it *does* read `APPROVED` once anyone approves —
+  measured 2026-11-03 on merged #3245, #3220, #3181, #3116, #3114, #3107 and #3051 — but it names
+  neither the reviewer nor the head it read, and 78.6% of approvals here come from the authoring
+  identity family (below). It is the *absence* that proves nothing: it never reads `REVIEW_REQUIRED`.
+- **A red *non-required* check does not block enqueue or merge.** `ALLGREEN` grouping evaluates the
+  required checks on the merge-group ref (`gh-readonly-queue/master/pr-NNNN-…`), not every check
+  reported on the PR head. Measured: #3291 (red `e2e` **and** red `review`), #3299 and #3300 (red
+  `review`) all merged. Do not read a red non-required check as "the enqueue will no-op" — the merge
+  will happen.
+- **An approval from `allyblockcast` is not an independent read.** Of the 299 approving reviews in
+  that window, 181 are `allyblockcast` (Bot) and 54 `allyblockcast` (User) — 78.6% from the identity
+  family that authored 80% of the PRs. `githubSharesReviewerIdentity` collapses all three spellings
+  of that slug to one (see §"This PAT is a different token, not a different *reviewer-independent*
+  identity", PEN-4275). 416 of 800 agent-authored merges (52%) were authored by `allyblockcast`,
+  merged by `allyblockcast`, with no independent approval at all.
+- **Do not flip `gate/ally-comment-findings` fail-closed before a reviewer identity whose slug
+  differs from `allyblockcast` exists** (PEN-4275). Today nothing could clear it, so the flip would
+  block every agent PR rather than cause one to be reviewed. The ordering is load-bearing.
+- **The required set is at least TWO contexts, and the second is invisible to the ruleset read.**
+  `verify` (`pr.yml`'s CI aggregate) reads `isRequired: true` on every PR where it has reported —
+  measured 2026-11-03 on #3291, #3299, #3300, #3310 and #3305 — yet appears in **no** ruleset. It is
+  imposed by classic protection, which is `403` from an agent seat. That is the first *positive*
+  evidence that classic protection on `master` is non-empty, where before its contents were merely
+  unreadable. The inference is one-directional, and that is what makes it usable:
+  `statusCheckRollup.contexts` enumerates only contexts that have **reported**, so the query can omit
+  a required context but cannot invent one — `isRequired: true` is load-bearing where `false` or
+  absent proves nothing. `verify` is a build-and-test gate (`needs:` the typecheck, test, build and
+  vendor lanes); it cannot withhold a merge for want of an independent read, so it does not change
+  anything above. What it changes is enqueue: **"the required check is green" does not mean "enqueue
+  will merge".** A PR whose heavy lanes are still queued has not reported `verify`, reads
+  `mergeStateStatus: BLOCKED`, and an enqueue there is not a merge. Measured the same day: 5 of 47
+  open PRs sat `BLOCKED` on CI with `reviewDecision: null` and zero approvals. Re-read the live state
+  immediately before enqueuing; never act on a state you recorded earlier in your run.
+
+Two traps when you re-measure any of this:
+
+- `gate/ally-comment-findings` resolves to **two objects on the same head** — a status context and
+  a check-run of the same name, dual-emitted from one verdict by `publishCheckRunMirror` in
+  `server/src/services/pr-comment-review-gate.ts`. Both read `isRequired: true`, and **both can
+  block.** ⛔ Do not read a red `gate/ally-comment-findings` as non-blocking, and do not read
+  `neutral` as the check-run's only conclusion. `CommentReviewGateVerdict` has six outcomes across
+  two states: `success` for `clean`, `deferred_finding` and `not_evaluated`; `failure` for
+  `blocking_finding`, `unreadable_verdict` and `carried_finding`. The status context publishes that
+  state directly. The check-run maps it through `commentReviewGateCheckConclusion` — `failure` stays
+  `failure`, `clean` becomes `success`, and only the remaining two become `neutral`. So the gate is
+  fail-open on the **absence** of an independent review, because `not_evaluated` is one of its
+  passing states — that is the quote above, and it is the whole of the fail-open. It is **not**
+  fail-open on findings: an unresolved Ally Critical/Important finding publishes red on both
+  surfaces, and that red is what holds the PR. Reading only one surface will under- or over-state
+  the gate.
+- `commits/{sha}/status` reports **status contexts only** and cannot see check-runs at all, so its
+  `.state: success` is never a statement about the whole head — on a PR whose `verify` is red or
+  simply unreported it still reads `success`. Use `statusCheckRollup`, not the combined-status
+  endpoint.
+
 ### Never enqueue a PR whose head has just moved (PEN-4887)
 
 Landing a **stacked child** PR replaces its parent's head with the merge commit. Every check on the
