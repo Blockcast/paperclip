@@ -105,8 +105,24 @@ extract() { # stdin: check-runs API body (one object per page) -> stdout: rows
 }
 
 status_extract() { # stdin: commit-status API body (one object per page) -> rows
-  jq -r '.statuses[]|[.context,.state,.updated_at,"status",
-                        (.creator.login // ""),(.creator.id // ""),(.creator.type // "")]|@tsv'
+  # $1: optional {"<status id>": creator} map from acs_creators. The live path
+  # reads the COMBINED endpoint, whose statuses carry no `creator`; without the
+  # map every review/ally-complete success reads untrusted and STOPs.
+  local cr=${1:-}; [ -n "$cr" ] || cr='{}'
+  jq -r --argjson cr "$cr" '.statuses[]|(.creator // $cr[(.id|tostring)] // {}) as $w
+                        |[.context,.state,.updated_at,"status",
+                        ($w.login // ""),($w.id // ""),($w.type // "")]|@tsv'
+}
+
+acs_creators() { # stdin: status LIST pages, $1: combined body -> {"<status id>": creator}
+  # Only the review/ally-complete ids the combined body names (one per context),
+  # and only login/id/type: the map rides in argv to status_extract, and a head
+  # can carry hundreds of re-posted statuses (MAX_ARG_STRLEN is 128 KiB).
+  local ids
+  ids=$(printf '%s' "$1" | jq -cs '[.[]|.statuses[]?|select(.context=="review/ally-complete")|.id|tostring]') || ids='[]'
+  jq -cs --argjson ids "$ids" '[.[]|arrays|.[]|select(type=="object" and .context=="review/ally-complete")
+           |(.id|tostring) as $i|select(any($ids[]; . == $i))
+           |{key:$i,value:(.creator // {}|{login,id,type})}]|from_entries'
 }
 
 witness_extract() { # stdin: commit-status API body -> run-id <TAB> updated_at
@@ -876,7 +892,7 @@ if [ "${1:-}" = "--renamed" ]; then renamed_jobs "${2:-}"; exit 0; fi
 if [ "${1:-}" = "--dead" ]; then dead_runs "${2:-}" "${3:-}"; exit 0; fi
 if [ "${1:-}" = "--pending" ]; then pending_runs; exit 0; fi
 if [ "${1:-}" = "--extract" ]; then extract; exit 0; fi
-if [ "${1:-}" = "--status-extract" ]; then status_extract; exit 0; fi
+if [ "${1:-}" = "--status-extract" ]; then status_extract "${2:-}"; exit 0; fi
 if [ "${1:-}" = "--witness-extract" ]; then witness_extract; exit 0; fi
 if [ "${1:-}" = "--runs-extract" ]; then run_extract; exit 0; fi
 if [ "${1:-}" = "--gated" ]; then gated_lanes "${2:-}" "${3:-}" "${4:-}"; exit 0; fi
@@ -1003,7 +1019,21 @@ REQUIRED=$( { gh api "repos/$R/rules/branches/$BREF?per_page=100" --paginate \
                 --jq '.data.repository.ref.refUpdateRule.requiredStatusCheckContexts // [] | .[]'
             } | sort -u) || fetch_failed required-contexts $?
 
-{ printf '%s' "$STATUSES" | status_extract
+# The combined status carries no `creator`, and verdicts() trusts a
+# review/ally-complete success only by its creator. So read the status LIST
+# (which has it) when that context is present, and join it by status id. A
+# failed read fails closed; an id the list lacks leaves the creator empty: STOP.
+ALIST=
+if printf '%s' "$STATUSES" | grep -q '"review/ally-complete"'; then
+  ALIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
+fi
+ACS=$(printf '%s' "${ALIST:-[]}" | acs_creators "$STATUSES")
+# Checked, not piped: a jq failure here would drop every status row silently,
+# and only REQUIRED contexts would come back (as ABSENT); a non-required
+# failure would vanish.
+SROWS=$(printf '%s' "$STATUSES" | status_extract "$ACS") || fetch_failed status-extract $?
+
+{ [ -z "$SROWS" ] || printf '%s\n' "$SROWS"
   printf '%s' "$CHECKS" | extract
 } | verdicts "$DEAD" "$PENDING" "$WDEAD" "$RENAMED" "$REQUIRED"
 rc=$?
@@ -1013,7 +1043,9 @@ SLIST='[]'
 # BLO-49045: guarded, not argued. A partial list can hold a stale success
 # witness whose withdrawing re-judge sat on the page that failed.
 if [ -n "$GATED" ] && printf '%s' "$STATUSES" | grep -Eq '"ci/(dispatched|web)-lanes"'; then
-  SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
+  if [ -n "$ALIST" ]; then SLIST=$ALIST
+  else SLIST=$(gh api "repos/$R/commits/$H/statuses?per_page=100" --paginate) || fetch_failed statuses $?
+  fi
 fi
 EMPTY=$(printf '%s\n%s\n' "$SLIST" "$CHECKS" | empty_witness)
 printf '%s\n' "$RUNS" | gated_lanes "$H" "$GATED" "$EMPTY"

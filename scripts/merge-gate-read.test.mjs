@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
@@ -1939,7 +1939,8 @@ describe("merge-gate reader", () => {
       const fetches = SOURCE.split("\n").filter(
         (l) => l.includes('gh api "repos/') && !isSingle(l),
       );
-      assert.equal(fetches.length, 7, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
+      // 8: the review/ally-complete creator LIST read (paperclip#3355 follow-up).
+      assert.equal(fetches.length, 8, `unguarded fetch added? got ${JSON.stringify(fetches)}`);
       // The collector matches `gh api "repos/` on ONE line, so a fetch written
       // `gh api "$url"` or split across a continuation is collected by NEITHER
       // line: the count above stays 3 and this test passes while that fetch goes
@@ -2534,4 +2535,176 @@ esac
       assert.match(out, /^STOP\t<required-contexts fetch failed for a{40} \(rc 1\); refusing on a partial read>\tFETCH-FAILED\trun=-$/m);
     });
   }
+});
+
+// paperclip#3355 follow-up: the live path reads the COMBINED status endpoint,
+// whose statuses carry no `creator`, so the trusted-writer check read every
+// review/ally-complete success as untrusted and STOPped it (onprem-k8s#6853 @
+// 43439414 on 2026-11-03: combined has no creator; the LIST shows
+// github-actions[bot] 41898282 on the same status id). The fixtures below use
+// the live shapes: combined without `creator`, LIST with it.
+describe("live mode: review/ally-complete creator comes from the status LIST", () => {
+  const sha = "a".repeat(40);
+  const ok = `{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}`;
+  const combined = `{"state":"success","statuses":[{"id":77,"context":"review/ally-complete","state":"success","updated_at":"2026-11-03T16:57:59Z"}]}`;
+  const listed = (login, id, type) =>
+    `[{"id":77,"context":"review/ally-complete","state":"success","updated_at":"2026-11-03T16:57:59Z","creator":{"login":"${login}","id":${id},"type":"${type}"}}]`;
+  const run = (statusesArm) => {
+    const dir = mkdtempSync(join(tmpdir(), "mgr-gh-"));
+    writeFileSync(
+      join(dir, "gh"),
+      `#!/usr/bin/env bash
+case "$2" in
+  */rules/branches/*|graphql) ;;
+  repos/o/r) echo master ;;
+  */dispatch-approved-pr-ci.yml) echo "gh: Not Found (HTTP 404)" >&2; exit 1 ;;
+  */check-runs*) printf '%s' '{"total_count":1,"check_runs":[${ok}]}' ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */pulls*) ;;
+  ${statusesArm}
+  */status*) printf '%s' '${combined}' ;;
+  repos/o/r/commits/*) echo ${sha} ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    try {
+      const out = execFileSync("bash", [READER, "o/r", sha], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+      });
+      return { rc: 0, out };
+    } catch (e) {
+      return { rc: e.status, out: e.stdout };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("passes a success the LIST attributes to github-actions[bot]", () => {
+    const { rc, out } = run(`*/statuses*) printf '%s' '${listed("github-actions[bot]", 41898282, "Bot")}' ;;`);
+    assert.equal(rc, 0, out);
+    assert.doesNotMatch(out, /review\/ally-complete/);
+  });
+
+  it("still STOPs a success the LIST attributes to allyblockcast[bot]", () => {
+    const { out } = run(`*/statuses*) printf '%s' '${listed("allyblockcast[bot]", 290875700, "Bot")}' ;;`);
+    assert.match(out, /^STOP\treview\/ally-complete\tsuccess\trun=status$/m);
+  });
+
+  it("STOPs when the LIST does not carry the combined status id", () => {
+    const { out } = run(`*/statuses*) printf '%s' '[]' ;;`);
+    assert.match(out, /^STOP\treview\/ally-complete\tsuccess\trun=status$/m);
+  });
+
+  it("fails closed with rc > 1 when the LIST read fails", () => {
+    const { rc, out } = run(`*/statuses*) exit 1 ;;`);
+    assert.ok(rc > 1, `expected exit > 1, got ${rc}; out=${out}`);
+    assert.match(out, new RegExp(`^STOP\\t<statuses fetch failed for ${sha} \\(rc 1\\); refusing on a partial read>\\tFETCH-FAILED\\trun=-$`, "m"));
+  });
+});
+
+describe("--status-extract with a LIST creator map", () => {
+  const page = `{"statuses":[{"id":7,"context":"review/ally-complete","state":"success","updated_at":"t"}]}`;
+  it("fills creator fields from the map by status id", () => {
+    const out = execFileSync("bash", [READER, "--status-extract", `{"7":{"login":"github-actions[bot]","id":41898282,"type":"Bot"}}`], { input: page, encoding: "utf8" });
+    assert.equal(out, "review/ally-complete\tsuccess\tt\tstatus\tgithub-actions[bot]\t41898282\tBot\n");
+  });
+  it("leaves them empty without a map", () => {
+    const out = execFileSync("bash", [READER, "--status-extract"], { input: page, encoding: "utf8" });
+    assert.equal(out, "review/ally-complete\tsuccess\tt\tstatus\t\t\t\n");
+  });
+});
+
+describe("live mode: the creator join is by status id, bounded, and checked", () => {
+  const sha = "a".repeat(40);
+  const ok = `{"name":"ci","status":"completed","conclusion":"success","completed_at":"2026-10-24T00:00:00Z","details_url":"https://github.com/o/r/actions/runs/7/job/1"}`;
+  const BOT = `{"login":"github-actions[bot]","id":41898282,"type":"Bot"}`;
+  const ALLY = `{"login":"allyblockcast[bot]","id":290875700,"type":"Bot"}`;
+  const acs = (id, creator) =>
+    `{"id":${id},"context":"review/ally-complete","state":"success","updated_at":"2026-11-03T16:57:59Z"${creator ? `,"creator":${creator}` : ""}}`;
+  const lanes = (creator) =>
+    `{"id":5,"context":"ci/dispatched-lanes","state":"success","description":"(base master) no dispatched lane applies to this head"${creator ? `,"creator":${creator}` : ""}}`;
+  const run = ({ combined, list, gated = false }) => {
+    const dir = mkdtempSync(join(tmpdir(), "mgr-gh-"));
+    const listFile = join(dir, "list.json");
+    writeFileSync(listFile, list);
+    writeFileSync(
+      join(dir, "gh"),
+      `#!/usr/bin/env bash
+echo "$2" >> "${dir}/calls"
+case "$2" in
+  */rules/branches/*|graphql) ;;
+  repos/o/r) echo master ;;
+  */dispatch-approved-pr-ci.yml) ${gated ? "echo '{}'" : 'echo "gh: Not Found (HTTP 404)" >&2; exit 1'} ;;
+  */check-runs*) printf '%s' '{"total_count":1,"check_runs":[${ok}]}' ;;
+  */actions/runs*) printf '%s' '{"total_count":0,"workflow_runs":[]}' ;;
+  */pulls*) ;;
+  */statuses*) cat "${listFile}" ;;
+  */status*) printf '%s' '${combined}' ;;
+  repos/o/r/commits/*) echo ${sha} ;;
+  *) echo "unexpected: $*" >&2; exit 1 ;;
+esac
+`,
+      { mode: 0o755 },
+    );
+    try {
+      let rc = 0;
+      let out;
+      try {
+        out = execFileSync("bash", [READER, "o/r", sha], {
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+          env: { ...process.env, PATH: `${dir}:${process.env.PATH}` },
+        });
+      } catch (e) {
+        rc = e.status;
+        out = e.stdout;
+      }
+      const calls = readFileSync(join(dir, "calls"), "utf8").split("\n");
+      return { rc, out, listReads: calls.filter((c) => c.includes("/statuses?")).length };
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  };
+
+  it("another github-actions success does not vouch for the combined one", () => {
+    // The bot entry is FIRST and has the HIGHER id, so a join on list order or
+    // on the newest id would wrongly pass; only the id join reads allyblockcast.
+    const { out } = run({
+      combined: `{"state":"success","statuses":[${acs(77)}]}`,
+      list: `[${acs(78, BOT)},${acs(77, ALLY)}]`,
+    });
+    assert.match(out, /^STOP\treview\/ally-complete\tsuccess\trun=status$/m);
+  });
+
+  it("passes with hundreds of re-posted statuses on the head (argv stays small)", () => {
+    const pad = `"avatar_url":"${"x".repeat(2000)}"`;
+    const old = Array.from({ length: 300 }, (_, i) => `{"id":${1000 + i},"context":"review/ally-complete","state":"pending","creator":{${pad},"login":"github-actions[bot]","id":41898282,"type":"Bot"}}`);
+    const { rc, out } = run({
+      combined: `{"state":"success","statuses":[${acs(77)}]}`,
+      list: `[${acs(77, BOT)},${old.join(",")}]`,
+    });
+    assert.equal(rc, 0, out);
+    assert.doesNotMatch(out, /review\/ally-complete/);
+  });
+
+  it("a gated head reads the LIST once for both the verdict and the lanes witness", () => {
+    const { rc, out, listReads } = run({
+      combined: `{"state":"success","statuses":[${lanes()},${acs(77)}]}`,
+      list: `[${lanes(BOT)},${acs(77, BOT)}]`,
+      gated: true,
+    });
+    assert.equal(rc, 0, out);
+    assert.doesNotMatch(out, /^STOP/m);
+    assert.equal(listReads, 1);
+  });
+
+  it("fails closed with rc > 1 when status extraction fails", () => {
+    const { rc, out } = run({ combined: `{"state":"success","statuses":"oops"}`, list: "[]" });
+    assert.ok(rc > 1, `expected exit > 1, got ${rc}; out=${out}`);
+    assert.match(out, new RegExp(`^STOP\\t<status-extract fetch failed for ${sha} \\(rc \\d+\\); refusing on a partial read>\\tFETCH-FAILED\\trun=-$`, "m"));
+  });
 });
