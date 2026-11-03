@@ -641,6 +641,32 @@ Four consequences, each easy to get backwards:
 - **Do not flip `gate/ally-comment-findings` fail-closed before a reviewer identity whose slug
   differs from `allyblockcast` exists** (PEN-4275). Today nothing could clear it, so the flip would
   block every agent PR rather than cause one to be reviewed. The ordering is load-bearing.
+- **The required set is at least TWO contexts, and the second is invisible to the ruleset read.**
+  `verify` (`pr.yml`'s CI aggregate) reads `isRequired: true` on every PR where it has reported —
+  measured 2026-11-03 on #3291, #3299, #3300, #3310 and #3305 — yet appears in **no** ruleset. It is
+  imposed by classic protection, which is `403` from an agent seat. That is the first *positive*
+  evidence that classic protection on `master` is non-empty, where before its contents were merely
+  unreadable. The inference is one-directional, and that is what makes it usable:
+  `statusCheckRollup.contexts` enumerates only contexts that have **reported**, so the query can omit
+  a required context but cannot invent one — `isRequired: true` is load-bearing where `false` or
+  absent proves nothing. `verify` is a build-and-test gate (`needs:` the typecheck, test, build and
+  vendor lanes); it cannot withhold a merge for want of an independent read, so it does not change
+  anything above. What it changes is enqueue: **"the required check is green" does not mean "enqueue
+  will merge".** A PR whose heavy lanes are still queued has not reported `verify`, reads
+  `mergeStateStatus: BLOCKED`, and an enqueue there is not a merge. Measured the same day: 5 of 47
+  open PRs sat `BLOCKED` on CI with `reviewDecision: null` and zero approvals. Re-read the live state
+  immediately before enqueuing; never act on a state you recorded earlier in your run.
+
+Two traps when you re-measure any of this:
+
+- `gate/ally-comment-findings` resolves to **two objects on the same head** — a check-run that is
+  deliberately `neutral` (see the `ci/ally-head-attested` note above) and a status context that
+  carries the verdict and its description. Both read `isRequired: true`, and neither can block:
+  GitHub counts `neutral` as passing. Reading only one surface will under- or over-state the gate.
+- `commits/{sha}/status` reports **status contexts only** and cannot see check-runs at all, so its
+  `.state: success` is never a statement about the whole head — on a PR whose `verify` is red or
+  simply unreported it still reads `success`. Use `statusCheckRollup`, not the combined-status
+  endpoint.
 
 ### Never enqueue a PR whose head has just moved (PEN-4887)
 
