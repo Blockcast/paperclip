@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
+  CAP_STARVED_HOURS,
   CHECK_SETTLE_MINUTES,
   EJECTIONS_BEFORE_HOLD,
   MAX_ENQUEUES_PER_FIRE,
@@ -14,6 +16,9 @@ import {
   reviewGateRemedy,
   renderUnlandedEligible,
   unlandedEligible,
+  capStarved,
+  renderCapStarved,
+  everOfferedQueueSlot,
   allyVerdictAtHead,
   approvalLanes,
   checkSettlement,
@@ -426,23 +431,32 @@ describe("per-fire cap", () => {
     // `runRepo`: passing a literal 0 would make the cap per repo again.
     const rotted = [];
     const stranded = [];
+    const starved = [];
     const calls = [];
     const spy = (...args) => {
       calls.push(args);
       return classifyAll(clean(), { now: NOW, maxEnqueues: 4, spent: args[3] });
     };
-    sweepRepos(["a/one", "a/two"], repoRunner(true, 7, rotted, stranded, spy));
+    sweepRepos(
+      ["a/one", "a/two"],
+      repoRunner(true, 7, rotted, stranded, spy, new Set(), [], starved),
+    );
     assert.deepEqual(calls, [
-      ["a/one", true, 7, 0, rotted, stranded],
-      ["a/two", true, 7, 3, rotted, stranded],
+      ["a/one", true, 7, 0, rotted, stranded, starved],
+      ["a/two", true, 7, 3, rotted, stranded, starved],
     ]);
     // deepEqual is structural, so the empty `rotted`/`stranded` above match
     // any empty array. Identity is what main relies on: `rotted` for the
-    // `finally` cohort, `stranded` for the --alarm exit code, and a copy in
-    // either position would report an empty cohort and exit 0 forever.
+    // `finally` cohort, `stranded` and `starved` for the --alarm exit code,
+    // and a copy in any position would report an empty cohort and exit 0
+    // forever. `starved` is pinned for exactly the same reason as `stranded`
+    // and from the day it was added (PEN-5391): a cohort threaded by value
+    // is a detector that can never fire, which is indistinguishable from the
+    // blind spot it was written to close.
     for (const call of calls) {
       assert.equal(call[4], rotted);
       assert.equal(call[5], stranded);
+      assert.equal(call[6], starved);
     }
   });
 });
@@ -863,7 +877,7 @@ describe("notify-only repos (PEN-5430)", () => {
     // typo in the notify list arms an autolander in a human-gated repo — the
     // exact failure this row exists to make unreachable.
     const seen = [];
-    const spy = (repo, _apply, _settle, _spent, _rotted, _stranded, options) => {
+    const spy = (repo, _apply, _settle, _spent, _rotted, _stranded, _starved, options) => {
       seen.push([repo, options?.landable ?? true]);
       return [];
     };
@@ -885,10 +899,14 @@ describe("notify-only repos (PEN-5430)", () => {
     // a fire with no notify list is byte-identical to the pre-split one. Pinned
     // because the obvious implementation (always pass the bag) would make every
     // existing argument-vector assertion assert a new trailing slot instead.
+    //
+    // PEN-5391 added `starved` as the 7th positional, so the unchanged vector
+    // is now 7 long and the conditional slot is the 8th. The assertion is on
+    // the bag NOT being appended, not on the number 6.
     const calls = [];
     const spy = (...args) => (calls.push(args), []);
     quiet(() => sweepRepos(["a/one"], repoRunner(true, 7, [], [], spy)));
-    assert.equal(calls[0].length, 6, "no seventh argument when the notify list is empty");
+    assert.equal(calls[0].length, 7, "no eighth argument when the notify list is empty");
   });
 
   // ---- The acceptance criterion: zero enqueues, structurally. ----
@@ -901,7 +919,7 @@ describe("notify-only repos (PEN-5430)", () => {
     const run = (notifyOnly) =>
       quiet(() =>
         atNow(() =>
-          runRepo("a/repo", true, 0, 0, [], [], {
+          runRepo("a/repo", true, 0, 0, [], [], [], {
             fetch: landable,
             applyOne: () => null,
             state: () => {},
@@ -991,7 +1009,7 @@ describe("notify-only repos (PEN-5430)", () => {
     };
     quiet(() =>
       atNow(() =>
-        runRepo("b/notify", true, 0, 0, [], [], {
+        runRepo("b/notify", true, 0, 0, [], [], [], {
           landable: false,
           fetch: () => [pr({ number: 600 })],
           classify: () => [{ number: 600, action: "enqueue", reason: "mergestate:CLEAN", headSha: HEAD }],
@@ -1089,7 +1107,7 @@ describe("notify-only repos (PEN-5430)", () => {
     const actionsIn = (landableRepo) =>
       quiet(() =>
         atNow(() =>
-          runRepo("b/repo", true, 0, MAX_ENQUEUES_PER_FIRE, [], [], {
+          runRepo("b/repo", true, 0, MAX_ENQUEUES_PER_FIRE, [], [], [], {
             landable: landableRepo,
             fetch: many,
             applyOne: () => null,
@@ -1120,14 +1138,20 @@ describe("notify-only repos (PEN-5430)", () => {
       atNow(() =>
         sweepRepos(
           sweepOrder(["a/land"], [...notify]),
-          repoRunner(true, 0, [], [], (repo, apply, settle, carried, rotted, stranded, options) =>
-            runRepo(repo, apply, settle, carried, rotted, stranded, {
-              ...options,
-              fetch: landable,
-              applyOne: () => null,
-              state: () => {},
-            }),
-          notify),
+          repoRunner(
+            true,
+            0,
+            [],
+            [],
+            (repo, apply, settle, carried, rotted, stranded, starved, options) =>
+              runRepo(repo, apply, settle, carried, rotted, stranded, starved, {
+                ...options,
+                fetch: landable,
+                applyOne: () => null,
+                state: () => {},
+              }),
+            notify,
+          ),
         ),
       ),
     );
@@ -1156,7 +1180,7 @@ describe("notify-only repos (PEN-5430)", () => {
       const stated = [];
       quiet(() =>
         atNow(() =>
-          runRepo("b/repo", true, 0, 0, [], [], {
+          runRepo("b/repo", true, 0, 0, [], [], [], {
             landable: landableRepo,
             fetch: held,
             applyOne: () => null,
@@ -2275,13 +2299,16 @@ describe("unlanded-eligible PRs (PEN-5263)", () => {
     );
   });
 
-  it("does NOT claim the cap-deferred row — a stated residual, not an oversight", () => {
+  it("does NOT claim the cap-deferred row — neither of these two owns it", () => {
     // `classifyAll` rewrites an over-budget `enqueue` into `skip`/`cap:`, so
     // the row no longer reads `enqueue` and is excluded here by action.
     // `stalledHolds` excludes it by reason, deliberately: the deferred rows
     // are selected for old check stamps, so this clock is biased against them.
-    // That leaves cap-starvation uncovered BY DESIGN — see the comment on
-    // `unlandedEligible`. Pinned so widening the predicate has to be a choice.
+    //
+    // Both exclusions are UNCHANGED by PEN-5391 and this pin is why: the
+    // cap-starved case is owned by `capStarved`, which discriminates on the
+    // PR's timeline rather than on either of these clocks. Widening either
+    // predicate here still has to be a choice, and still should not be made.
     const prs = [pr(1, OLD)];
     const rows = [row(1, "skip", `cap:${MAX_ENQUEUES_PER_FIRE}-per-fire`)];
     assert.deepEqual(unlandedEligible(prs, rows, { now: NOW }), []);
@@ -2551,11 +2578,12 @@ describe("runRepo apply wiring (PEN-5263)", () => {
     const stated = [];
     const applied = [];
     const stranded = [];
+    const starved = [];
     const log = console.log;
     console.log = () => {};
     try {
       atNow(() =>
-        runRepo("a/one", apply, 0, 0, [], stranded, {
+        runRepo("a/one", apply, 0, 0, [], stranded, starved, {
           fetch: () => prs,
           classify: () => rows,
           applyOne: (_repo, row) => (applied.push(row.number), "merge requested"),
@@ -2565,7 +2593,7 @@ describe("runRepo apply wiring (PEN-5263)", () => {
     } finally {
       console.log = log;
     }
-    return { stated, applied, stranded, rows };
+    return { stated, applied, stranded, starved, rows };
   };
 
   it("never tells a PR it just enqueued that it is not being enqueued", () => {
@@ -2753,7 +2781,7 @@ describe("rate-limit retry in gh() (BLO-51665)", () => {
     console.log = (line) => lines.push(String(line));
     try {
       assert.throws(() =>
-        runRepo("a/one", true, 0, 0, [], [], {
+        runRepo("a/one", true, 0, 0, [], [], [], {
           fetch: () => { throw refused(); },
         }),
       );
@@ -3028,14 +3056,47 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
     assert.deepEqual(seen, [["a/first", 0], ["a/broken", 2], ["a/last", 2]]);
   });
 
-  it("leaves the per-repo argument vector alone", () => {
-    // `unreadable` is a seventh CONSTRUCTOR argument, not a seventh argument to
-    // `runRepo` — the same reason the notify bag is spread in conditionally.
+  it("keeps `unreadable` OUT of the per-repo argument vector, and `starved` IN", () => {
+    // PEN-5442 + PEN-5391. Both cohorts are collected by reference and both are
+    // `repoRunner` CONSTRUCTOR arguments, but they are not symmetric, and the
+    // asymmetry is the thing worth pinning:
+    //
+    //   `unreadable` is observed OUT HERE, in `repoRunner`'s catch, because the
+    //   condition it records is "`runRepo` threw before reporting anything".
+    //   It must therefore never enter the per-repo vector.
+    //
+    //   `starved` is observed INSIDE the sweep, per PR — `starved.push` sits
+    //   beside `stranded.push` in `runRepo` — so it must enter it.
+    //
+    // ⛔ This test was named "leaves the per-repo argument vector alone" and
+    // asserted `length === 6`. The name went FALSE the moment `starved` was
+    // threaded, while the assertion stayed true for an unrelated reason (the
+    // options bag is still not appended). A name that contradicts the code it
+    // guards is how the next reader derives the inverted principle — that
+    // `starved` should not be threaded at all — which compiles, passes, and
+    // leaves `main`'s array empty forever. So this asserts IDENTITIES now, not
+    // a length alone: a length can be satisfied by the wrong array.
+    const unreadable = [];
+    const starved = [];
     const calls = [];
     quietly(() =>
-      sweepRepos(["a/one"], repoRunner(true, 7, [], [], (...args) => (calls.push(args), []), new Set(), [])),
+      sweepRepos(
+        ["a/one"],
+        repoRunner(
+          true,
+          7,
+          [],
+          [],
+          (...args) => (calls.push(args), []),
+          new Set(),
+          unreadable,
+          starved,
+        ),
+      ),
     );
-    assert.equal(calls[0].length, 6, "no seventh argument when the notify list is empty");
+    assert.equal(calls[0].length, 7, "no options bag appended when the notify list is empty");
+    assert.equal(calls[0][6], starved, "`starved` is threaded through BY REFERENCE");
+    assert.ok(!calls[0].includes(unreadable), "`unreadable` never reaches `runRepo`");
   });
 
   it("⛔ an alarm run goes red for a repo it could not read", () => {
@@ -3050,5 +3111,425 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
     assert.equal(alarmExitCode(["a/one#1"], ["a/broken (HTTP 502)"]), 1);
     assert.equal(alarmExitCode(undefined, undefined), 0, "and both still default");
     assert.equal(alarmExitCode([]), 0, "including the one-argument call sites");
+  });
+});
+
+describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5391)`, () => {
+  const checkAt = (iso) => [
+    { __typename: "CheckRun", name: "verify", conclusion: "SUCCESS", completedAt: iso },
+  ];
+  // `timeline` defaults to `[]` — a READ timeline carrying no queue event,
+  // which is the shape of the PR this cohort exists to name.
+  //
+  // The UNREAD case cannot be spelled `capPr(n, iso, undefined)`: a default
+  // parameter substitutes on `undefined`, so that call produces `[]` and
+  // silently tests the opposite thing. (It did, on the first draft of this
+  // block, and the unread test below is what caught it.) `prUnread` omits the
+  // key entirely, which is the shape `fetchOpenPrs` actually produces when it
+  // does not hydrate a timeline.
+  const capPr = (number, iso, timeline = []) => ({
+    number,
+    statusCheckRollup: iso === null ? [] : checkAt(iso),
+    timeline,
+  });
+  const capPrUnread = (number, iso) => ({
+    number,
+    statusCheckRollup: iso === null ? [] : checkAt(iso),
+  });
+  const row = (number, action, reason) => ({ number, action, reason });
+  const capRow = (number) => row(number, "skip", `cap:${MAX_ENQUEUES_PER_FIRE}-per-fire`);
+  const event = (name, iso = "2026-09-12T10:00:00Z") => ({ event: name, created_at: iso });
+
+  const FRESH = "2026-09-13T08:00:00Z"; // 4h before NOW — inside the window
+  const OLD = "2026-09-12T20:00:00Z"; // 16h before NOW — past it
+
+  it("reports a cap-deferred PR that has never once been offered a queue slot", () => {
+    // #3306's shape, 2026-11-03: CLEAN and green for 12h, `enqueue` at 09:1xZ,
+    // `skip`/`cap:10-per-fire` by 11:28Z with nothing about the PR changed,
+    // and NO `added_to_merge_queue` or `auto_merge_enabled` anywhere on its
+    // timeline. The 11:28Z sweep went red naming six other PRs and was silent
+    // about this one, which is the miss this cohort closes.
+    assert.deepEqual(capStarved([capPr(3306, OLD)], [capRow(3306)], { now: NOW }), [
+      { number: 3306, reason: `cap:${MAX_ENQUEUES_PER_FIRE}-per-fire`, ageHours: 16 },
+    ]);
+  });
+
+  it("stays quiet when the cap is not saturated — the normal case", () => {
+    // THE negative case. `classifyAll` only writes a `cap:` reason once the
+    // budget is spent, so an unsaturated fire produces no row this cohort can
+    // match, however old and however never-queued the PRs are. A detector that
+    // fired here would fire on every fire, which is the failure mode the two
+    // sibling cohorts are each written to avoid.
+    //
+    // Driven through the REAL `classifyAll` rather than hand-written rows, so
+    // the test binds to the thing that actually mints the reason.
+    const eligible = [200, 201, 202].map((number) =>
+      pr({ number, statusCheckRollup: checkAt(OLD), timeline: [] }),
+    );
+    const unsaturated = classifyAll(eligible, { now: NOW, maxEnqueues: MAX_ENQUEUES_PER_FIRE });
+    assert.deepEqual(
+      unsaturated.map((r) => r.action),
+      ["enqueue", "enqueue", "enqueue"],
+      "precondition: the cap did not bite, so no row carries a cap: reason",
+    );
+    assert.deepEqual(capStarved(eligible, unsaturated, { now: NOW }), []);
+
+    // ...and the quiet is the CAP's doing, not the fixtures being inert. Same
+    // PRs, same ages, same empty timelines, budget lowered until it bites:
+    // the cohort fires. Without this control the assertion above would pass
+    // just as happily on a predicate that can never match anything.
+    const saturated = classifyAll(eligible, { now: NOW, maxEnqueues: 1 });
+    assert.deepEqual(
+      saturated.map((r) => r.action),
+      ["enqueue", "skip", "skip"],
+      "control: the cap bit on the last two",
+    );
+    assert.deepEqual(
+      capStarved(eligible, saturated, { now: NOW }).map((r) => r.number),
+      [201, 202],
+    );
+  });
+
+  it("does not report a cap-deferred PR the routine HAS reached before", () => {
+    // The discriminator, and the reason this cohort is safe where an age test
+    // over `cap:` rows is not. Deferral by a saturated fire is normal and is
+    // what a deep queue looks like; the finding is deferral by a routine that
+    // has never served this PR at all. One `added_to_merge_queue` anywhere on
+    // the timeline settles it permanently, whatever the check stamps say.
+    assert.deepEqual(
+      capStarved([capPr(1, OLD, [event("added_to_merge_queue")])], [capRow(1)], { now: NOW }),
+      [],
+    );
+  });
+
+  it("counts an armed auto-merge as an offer even with no queue entry yet", () => {
+    // `auto_merge_enabled` is the arming that precedes `added_to_merge_queue`
+    // on a queue-enabled base (both were present on #3322, 2026-11-03). A PR
+    // the routine armed and that has not reached the queue yet is waiting, not
+    // starved, so either event alone must disqualify it.
+    assert.deepEqual(
+      capStarved([capPr(1, OLD, [event("auto_merge_enabled")])], [capRow(1)], { now: NOW }),
+      [],
+    );
+  });
+
+  it("does not report an EJECTED PR — served and bounced is not starved", () => {
+    // An ejection is the routine reaching the PR and GitHub throwing it back.
+    // It has its own rule (`ejected-at-current-head`) with its own clock, and
+    // claiming it here would name one PR twice under two mechanisms that
+    // disagree about what is wrong with it.
+    const timeline = [event("added_to_merge_queue"), event("removed_from_merge_queue")];
+    assert.deepEqual(capStarved([capPr(1, OLD, timeline)], [capRow(1)], { now: NOW }), []);
+  });
+
+  it("does not report a PR deferred by one saturated fire", () => {
+    // Measured 2026-11-03 over the 30 most recent merges: every one reached
+    // the queue, worst first-slot wait 11.7h on a clock that over-states it
+    // (creation, not judgeable age). A 4h-old deferral is squarely inside
+    // normal operation and this cohort must not name it.
+    assert.deepEqual(capStarved([capPr(1, FRESH)], [capRow(1)], { now: NOW }), []);
+  });
+
+  it("claims only cap deferrals, not every skip", () => {
+    // `stalledHolds` owns the rows with a reason for inaction and ages them on
+    // a clock that is sound for them. Widening past `cap:` would take them
+    // over on a clock chosen for a different question.
+    const prs = [capPr(1, OLD), capPr(2, OLD), capPr(3, OLD)];
+    const rows = [
+      row(1, "skip", "label:do-not-merge"),
+      row(2, "skip", "checks:FAILURE"),
+      row(3, "skip", "human-author"),
+    ];
+    assert.deepEqual(capStarved(prs, rows, { now: NOW }), []);
+  });
+
+  it("is disjoint from both sibling cohorts — a PR is in exactly one", () => {
+    // All three blocks print together and two of them now set the exit code,
+    // so an overlap would name one PR twice and double-count the alarm.
+    // `stalledHolds` excludes the row by reason, `unlandedEligible` by action,
+    // and this one requires both — so the split is total by construction.
+    const prs = [capPr(1, OLD), capPr(2, OLD), capPr(3, OLD)];
+    const rows = [
+      capRow(1),
+      row(2, "enqueue", "mergestate:CLEAN"),
+      row(3, "codeowner-review-requested", "owner-approval-pending"),
+    ];
+    assert.deepEqual(
+      capStarved(prs, rows, { now: NOW }).map((r) => r.number),
+      [1],
+    );
+    assert.deepEqual(
+      unlandedEligible(prs, rows, { now: NOW }).map((r) => r.number),
+      [2],
+    );
+    assert.deepEqual(
+      stalledHolds(prs, rows, { now: NOW }).map((r) => r.number),
+      [3],
+    );
+  });
+
+  describe("everOfferedQueueSlot is three-valued", () => {
+    it("separates an unread timeline from a read one carrying no queue event", () => {
+      // The expensive conflation. `fetchOpenPrs` hydrates `timeline` only for
+      // PRs that survive `classifyFromListing` — today exactly the set that can
+      // reach `cap:` — so an absent timeline read as `false` would mark EVERY
+      // cap-deferred row starved at once and turn this detector into noise on
+      // its first fire.
+      assert.equal(everOfferedQueueSlot(undefined), null);
+      assert.equal(everOfferedQueueSlot(null), null);
+      assert.equal(everOfferedQueueSlot("not an array"), null);
+      assert.equal(everOfferedQueueSlot([]), false);
+      assert.equal(everOfferedQueueSlot([event("labeled")]), false);
+      assert.equal(everOfferedQueueSlot([event("added_to_merge_queue")]), true);
+    });
+
+    it("is live rather than vacuous — the event it looks for does occur", () => {
+      // Verified against GitHub 2026-11-03 before the cohort was written: 6 of
+      // 6 recently merged PRs carried `added_to_merge_queue`, and the two then
+      // sitting cap-deferred (#3306, #3215) carried no queue event at all. A
+      // predicate over an event that never appears reports clean forever, so
+      // the shape of a real merged timeline is pinned here.
+      const merged = [
+        event("committed"),
+        event("added_to_merge_queue", "2026-11-03T11:06:40Z"),
+        event("removed_from_merge_queue", "2026-11-03T11:21:00Z"),
+        event("merged"),
+      ];
+      assert.equal(everOfferedQueueSlot(merged), true);
+    });
+  });
+
+  it("does NOT claim a row whose timeline was not read", () => {
+    // The opposite call to the undatable-clock case below, and deliberately
+    // so: the clock REFINES a finding that stands without it, while the
+    // timeline IS the finding. Same posture `unlandedEligible` takes toward
+    // `mergestate:UNKNOWN` — an unread datum must not be asserted over.
+    assert.deepEqual(capStarved([capPrUnread(1, OLD)], [capRow(1)], { now: NOW }), []);
+    // And the row IS reported once the same timeline comes back read and
+    // empty — so the quiet above is the unread key, not the predicate.
+    assert.deepEqual(
+      capStarved([capPr(1, OLD, [])], [capRow(1)], { now: NOW }).map((r) => r.number),
+      [1],
+    );
+  });
+
+  it("REPORTS an undatable cap-deferred row rather than dropping it", () => {
+    // Same §4l posture as both siblings: an instrument that cannot see
+    // something must not report clean. A cap-deferred PR that has never been
+    // queued and whose head carries no dated check is a true finding twice
+    // over — nothing served it, and nothing dated it.
+    assert.deepEqual(capStarved([capPr(1, null)], [capRow(1)], { now: NOW }), [
+      { number: 1, reason: `cap:${MAX_ENQUEUES_PER_FIRE}-per-fire`, ageHours: null },
+    ]);
+    // A row with no PR at all is undatable the same way and is likewise kept.
+    assert.deepEqual(capStarved([], [capRow(9)], { now: NOW }), []);
+  });
+
+  it("renders nothing when the cohort is empty, and names the remedy when it is not", () => {
+    assert.equal(renderCapStarved("a/one", []), "");
+    assert.equal(renderCapStarved("a/one", undefined), "");
+    const block = renderCapStarved("a/one", [
+      { number: 3306, reason: "cap:10-per-fire", ageHours: 16 },
+      { number: 3215, reason: "cap:10-per-fire", ageHours: null },
+    ]);
+    assert.match(block, /^cap-starved \(judgeable >12h, never once queued\) — 2:/);
+    assert.match(block, /a\/one#3306 — `cap:10-per-fire`, 16\.0h/);
+    assert.match(block, /a\/one#3215 — `cap:10-per-fire`, age unknown/);
+    // The remedy is the point: re-running the routine cannot reach these.
+    assert.match(block, /Raising throughput is the fix; re-running the routine is not\./);
+  });
+
+  it("turns the alarm red, like the unlanded-eligible cohort and unlike stale-hold", () => {
+    // AC4: the condition must surface without a human noticing by hand. A
+    // print-only cohort inside a workflow whose only channel is its exit code
+    // would reproduce the silence-means-health failure landing-sweep.yml was
+    // written to remove.
+    //
+    // ⛔ `starved` is the THIRD argument. The second is `unreadable` (PEN-5442).
+    // Passing a starved cohort in the second slot returns 1 either way, so such
+    // a test passes while asserting nothing about this cohort — which is how
+    // the PEN-5442/PEN-5391 collision was going to bind silently. Every
+    // assertion below is positional ON PURPOSE.
+    assert.equal(alarmExitCode([], [], []), 0, "control: nothing wrong is green");
+    assert.equal(
+      alarmExitCode([], [], ["a/one#3306"]),
+      1,
+      "the starved term goes red ON ITS OWN, with both siblings empty",
+    );
+    assert.equal(alarmExitCode(["a/one#3241"], [], ["a/one#3306"]), 1);
+    assert.equal(alarmExitCode([], ["a/broken (HTTP 502)"], ["a/one#3306"]), 1);
+    // The two siblings still go red alone, so widening did not swallow either.
+    assert.equal(alarmExitCode(["a/one#3241"], [], []), 1, "stranded alone");
+    assert.equal(alarmExitCode([], ["a/broken (HTTP 502)"], []), 1, "unreadable alone");
+    // Optional and quiet by default, so no existing caller changes meaning.
+    assert.equal(alarmExitCode([]), 0);
+    assert.equal(alarmExitCode([], []), 0);
+    assert.equal(alarmExitCode(undefined, undefined, undefined), 0);
+  });
+
+  describe("runRepo wiring", () => {
+    const atNow = (fn) => {
+      const real = Date.now;
+      Date.now = () => Date.parse("2026-09-13T12:00:00Z");
+      try {
+        return fn();
+      } finally {
+        Date.now = real;
+      }
+    };
+
+    const sweep = (apply) => {
+      const stranded = [];
+      const starved = [];
+      const printed = [];
+      const log = console.log;
+      console.log = (line) => printed.push(String(line));
+      try {
+        atNow(() =>
+          runRepo("a/one", apply, 0, 0, [], stranded, starved, {
+            fetch: () => [capPr(3306, OLD)],
+            classify: () => [capRow(3306)],
+            applyOne: () => "merge requested",
+            state: () => {},
+          }),
+        );
+      } finally {
+        console.log = log;
+      }
+      return { stranded, starved, printed: printed.join("\n") };
+    };
+
+    it("collects the cohort on a dry run and prints its block", () => {
+      const { starved, printed } = sweep(false);
+      assert.deepEqual(starved, ["a/one#3306"]);
+      assert.match(printed, /cap-starved \(judgeable >12h, never once queued\) — 1:/);
+      assert.match(printed, /a\/one#3306/);
+      assert.equal(
+        alarmExitCode([], [], starved),
+        1,
+        "and that is what turns --alarm red — THIRD slot, not the unreadable one",
+      );
+    });
+
+    it("is silent on an applying fire, which has just spent the budget", () => {
+      // Same `apply ? [] :` cut as `unlandedEligible`, for an adjacent reason:
+      // an applying fire spends the very budget this cohort reasons about and
+      // `applyRow` re-reads no timeline, so a row deferred by that spend would
+      // be scored against a snapshot taken before it. The hourly `--alarm`
+      // fire owns this measurement, and it cannot apply by construction.
+      const { starved, printed } = sweep(true);
+      assert.deepEqual(starved, []);
+      assert.doesNotMatch(printed, /cap-starved/);
+    });
+
+    it("refuses an options bag passed in `starved`'s slot instead of binding it", () => {
+      // The regression this file has now suffered TWICE, in the same shape:
+      // a positional is inserted, an existing caller's options bag slides into
+      // it, and nothing complains. The damage is silent rather than red —
+      // `fetch` falls back to the real `fetchOpenPrs`, so the test makes a live
+      // GraphQL call and asserts against whatever GitHub answers. It passes.
+      //
+      // Asserted on the THROW, not on a comment asking the next person to be
+      // careful, because both prior instances were written by people being
+      // careful. `landing-sweep.yml` runs this suite ahead of the hourly sweep,
+      // so an arity that wedges here wedges the sweep too.
+      assert.throws(
+        () =>
+          runRepo("a/one", false, 0, 0, [], [], {
+            fetch: () => {
+              throw new Error("the real fetchOpenPrs must never be reached here");
+            },
+          }),
+        /`starved` \(7th positional\) must be an array/,
+      );
+    });
+
+    it("accepts the bag in slot 8, which is where it now belongs", () => {
+      // The positive control. Without it the test above would still pass if
+      // `runRepo` rejected every options bag outright.
+      const seen = [];
+      atNow(() =>
+        runRepo("a/one", false, 0, 0, [], [], [], {
+          fetch: () => (seen.push("injected"), []),
+          classify: () => [],
+          state: () => {},
+        }),
+      );
+      assert.deepEqual(seen, ["injected"], "the injected fetch ran, not the real one");
+    });
+  });
+});
+
+describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442)", () => {
+  // `alarmExitCode` is exported and heavily covered — but every one of those
+  // tests passes the cohorts in BY HAND. `main` is NOT exported, it
+  // self-invokes under `isMainModule`, and there is no seam to inject. So
+  // dropping a cohort from `main`'s own call site fails nothing above.
+  //
+  // That is not a hypothetical gap, it is the exact hazard this file was in:
+  // PEN-5442 added `alarmExitCode(stranded, unreadable)` and PEN-5391 added
+  // `alarmExitCode(stranded, starved)` concurrently. Because the function
+  // returns 1 when ANY term is non-empty, a merge resolution that keeps one
+  // name and drops the other COMPILES, passes every direct test, and silently
+  // retires an alarm arm. Git flags nothing — the two edits are textually
+  // identical in shape.
+  //
+  // ⚠ What this proves, and what it does not. It pins the TEXT of the call
+  // sites, not their behaviour: it cannot catch a cohort that is passed but
+  // never populated, and a rename of `main`'s local bindings will fail it for
+  // a cosmetic reason. It is deliberately the weakest check that still fails
+  // on the one regression it exists to catch. The mutation controls in the
+  // third test are what keep it from silently matching nothing.
+  const SOURCE = readFileSync(new URL("./land-clean-prs.mjs", import.meta.url), "utf8");
+
+  const EXIT_CALL = /process\.exit\(\s*alarmExitCode\(([^)]*)\)\s*\)/;
+  const RUNNER_CALL = /repoRunner\(([^)]*)\)/;
+  const argsOf = (re, src) => {
+    const match = src.match(re);
+    return match ? match[1].split(",").map((arg) => arg.trim()) : null;
+  };
+
+  it("hands `alarmExitCode` all THREE cohorts, in order", () => {
+    assert.deepEqual(
+      argsOf(EXIT_CALL, SOURCE),
+      ["stranded", "unreadable", "starved"],
+      "a cohort dropped here is an alarm arm that can never fire again",
+    );
+  });
+
+  it("hands `repoRunner` both collected-by-reference cohorts", () => {
+    // The other half: a cohort reaching `alarmExitCode` but never handed to
+    // the sweep is an array that stays `[]` forever, which reads as health.
+    const args = argsOf(RUNNER_CALL, SOURCE);
+    assert.ok(args, "main still builds its per-repo step through repoRunner");
+    assert.ok(args.includes("unreadable"), "`unreadable` is collected by the sweep");
+    assert.ok(args.includes("starved"), "`starved` is collected by the sweep");
+    assert.equal(args.indexOf("starved"), args.length - 1, "`starved` is the 8th and last");
+  });
+
+  it("⛔ the probes are LIVE — each one fails against a source missing its term", () => {
+    // Negative controls. Without these, a regex that had quietly stopped
+    // matching anything would leave both tests above passing forever — the
+    // same silence-means-health shape the whole row exists to remove.
+    const dropped = SOURCE.replace(
+      "alarmExitCode(stranded, unreadable, starved)",
+      "alarmExitCode(stranded, unreadable)",
+    );
+    assert.notEqual(dropped, SOURCE, "control: the mutation actually applied");
+    assert.deepEqual(
+      argsOf(EXIT_CALL, dropped),
+      ["stranded", "unreadable"],
+      "the probe SEES a dropped third term rather than matching nothing",
+    );
+
+    const unthreaded = SOURCE.replace(
+      "runRepo, notify, unreadable, starved)",
+      "runRepo, notify, unreadable)",
+    );
+    assert.notEqual(unthreaded, SOURCE, "control: the mutation actually applied");
+    assert.ok(
+      !argsOf(RUNNER_CALL, unthreaded).includes("starved"),
+      "the probe SEES an unthreaded cohort",
+    );
   });
 });
