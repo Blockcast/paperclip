@@ -150,10 +150,28 @@ Every reason is also a member of the `reason` union in `AuthorizationDecision`
 near the top of the file, and most of these literals are reused by unrelated
 action branches — `allow_self` is also returned for inbox management, for
 `agent:wake`, and for `agent`-resource actions, and `deny_scope` from a
-dozen-odd places. The row you want is the hit inside `decideBase`'s branch
-**for that action on an `issue` resource**: for this grid, the `issue:comment` /
-`issue:mutate` arm or the `issue:coordination_metadata` arm. The deny-path list
-below names its enclosing branch for exactly this reason.
+dozen-odd places. The hit you want is the one reached **for that action on an
+`issue` resource** — which is not always `decideBase`'s issue arm. The grid's
+rows return from three places:
+
+- **`decideBase`'s issue arm** — the `issue:comment` / `issue:mutate` block and
+  the separate `issue:coordination_metadata` block: `allow_self`,
+  `allow_company_agent`, `allow_issue_creator`, `allow_manager_chain`,
+  `allow_dependency_edge`.
+- **`decideBase`'s board branch**, evaluated before the issue arm and returning
+  without reaching it: `allow_local_board`, `allow_instance_admin`,
+  `allow_company_member`.
+- **a helper the issue arm delegates to**, outside `decideBase` entirely:
+  `allowIssueMentionGrant`, `allowRecoveryHandoffGrant` and
+  `allowProductivityReviewGrant`. Each is the only place its literal is
+  returned, so the grep finds it plus the union member and nothing else.
+  `allow_explicit_grant` is the exception — it is returned from four places,
+  and this grid's row is the one in `decidePrincipalGrant`, reached from the
+  `issue:coordination_metadata` block via `decideWithTaskAssignmentGrants`.
+
+A reader who assumes the issue arm will discard the only real return site for
+seven of the twelve rows. The deny-path list below names its enclosing branch
+for exactly this reason.
 
 This table deliberately carries **no line numbers**. It used to, and by `PEN-5401`
 every one of them was stale by a uniform +249 lines — a reader following the grid
