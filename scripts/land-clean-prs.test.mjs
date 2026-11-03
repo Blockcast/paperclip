@@ -321,6 +321,65 @@ describe("per-fire cap", () => {
     assert.equal(rows[0].reason, "cap:2-per-fire");
   });
 
+  // Listed NEWEST-FIRST on purpose: that is the order `gh pr list` returns, so
+  // an ascending fixture cannot tell age order apart from listing order and
+  // would pass against the pre-BLO-51664 allocation too.
+  const newestFirst = (...numbers) =>
+    [...numbers].sort((a, b) => b - a).map((number) => pr({ number }));
+
+  it("returns rows in listing order, so allocating by age does not scramble the receipt", () => {
+    // Allocation order and RECEIPT order are separate concerns. If sorting the
+    // candidates also reordered the output, every fire's receipt would stop
+    // being comparable with the last one and the diff would be unreadable.
+    const listed = newestFirst(290, 300, 310, 320);
+    const rows = classifyAll(listed, { now: NOW, maxEnqueues: 2 });
+    assert.deepEqual(
+      rows.map((r) => r.number),
+      listed.map((candidate) => candidate.number),
+      "receipt still reads newest-first even though the cap was spent oldest-first",
+    );
+  });
+
+  it("changes nothing when the cap does not bind", () => {
+    // Age order is an allocation rule for a SATURATED fire, not a filter: with
+    // budget to spare every eligible PR must still enqueue.
+    const rows = classifyAll(newestFirst(290, 300, 310), { now: NOW, maxEnqueues: 10 });
+    assert.deepEqual(rows.map((r) => r.action), ["enqueue", "enqueue", "enqueue"]);
+  });
+
+  it("lands the oldest PR even while new ones keep arriving at the cap rate", () => {
+    // The starvation is self-reinforcing, so it is only visible ACROSS fires:
+    // a deferred PR only gets older while the front of the line is defined by
+    // recency. With arrivals at the cap rate, listing-order allocation gives
+    // every slot to the new arrivals and #300 is deferred forever. A
+    // single-fire test cannot distinguish that from a one-off miss.
+    let nextNumber = 400;
+    let open = [pr({ number: 300 })];
+    const perFire = [];
+    for (let fire = 0; fire < 3; fire += 1) {
+      open = [...newestFirst(nextNumber, nextNumber + 1), ...open];
+      nextNumber += 2;
+      const rows = classifyAll(open, { now: NOW, maxEnqueues: 2 });
+      const won = new Set(rows.filter((r) => r.action === "enqueue").map((r) => r.number));
+      perFire.push(won);
+      open = open.filter((candidate) => !won.has(candidate.number));
+    }
+    assert.ok(perFire[0].has(300), "the oldest PR lands on the FIRST fire, not eventually");
+    assert.ok(perFire.every((won) => won.size === 2), "and each fire still spends its budget");
+  });
+
+  it("sorts a row with no usable number last, so a malformed row cannot take a slot", () => {
+    // The age key is read off the PR, so a row without one has no age. It must
+    // lose the tiebreak rather than win it: sorting it first would let a
+    // malformed row take a slot ahead of a real PR.
+    const rows = classifyAll([pr({ number: undefined }), pr({ number: 500 })], {
+      now: NOW,
+      maxEnqueues: 1,
+    });
+    assert.equal(rows[1].action, "enqueue", "the real PR takes the slot");
+    assert.equal(rows[0].reason, "cap:1-per-fire", "the numberless row is the one deferred");
+  });
+
   it("does not spend cap on PRs that were not enqueueable anyway", () => {
     const rows = classifyAll([pr({ number: 1, mergeStateStatus: "DIRTY" }), pr({ number: 2 })], {
       now: NOW,
