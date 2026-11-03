@@ -933,6 +933,11 @@ export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
  * raises no wake, while the write still returns 200. Measured on PEN-2918, the
  * plain form drew zero CEO actions in 24h and the `agent://` form was answered
  * in ~5 minutes.
+ *
+ * PEN-5364 adds the `boundMentions` half, because `unboundMentions` alone is
+ * unreadable on the body an author naturally writes: it dedupes on the token
+ * text, so one link plus loose prose for the same name is byte-identical to
+ * prose alone.
  */
 export const COMMENT_UNBOUND_MENTIONS_NOTE =
   "⚠ A plain `@Name` MENTIONS NOBODY. The extractor binds only a markdown link "
@@ -945,7 +950,15 @@ export const COMMENT_UNBOUND_MENTIONS_NOTE =
   + "`unboundMentions` — READ IT BACK. A non-empty list means those names reached "
   + "no one and you must re-send using the link form; an empty list means every "
   + "`@` token bound. The field being ABSENT from the response means the server "
-  + "predates this report and can tell you nothing either way. (PEN-5180)";
+  + "predates this report and can tell you nothing either way. (PEN-5180) "
+  + "⚠ `unboundMentions` DEDUPES BY NAME, so a name you wrote BOTH as a link and "
+  + "as bare prose appears there even though its wake was raised. Disambiguate "
+  + "with the sibling `boundMentions`, which lists the names that DID bind — do "
+  + "NOT disambiguate by re-sending. Same name in both lists = the link bound and "
+  + "the loose `@` tokens are noise, so do nothing. In `unboundMentions` only = "
+  + "nothing bound and the wake was dropped, so re-send in link form. "
+  + "`boundMentions` is likewise always present; absent means the server predates "
+  + "it. (PEN-5364)";
 
 export const addIssueCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)).describe(COMMENT_UNBOUND_MENTIONS_NOTE),

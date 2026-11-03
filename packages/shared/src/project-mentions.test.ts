@@ -6,6 +6,7 @@ import {
   buildSkillMentionHref,
   buildUserMentionHref,
   extractAgentMentionIds,
+  extractMentionBindingReport,
   extractProjectMentionIds,
   extractRoutineMentionIds,
   extractSkillMentionIds,
@@ -252,5 +253,107 @@ describe("extractUnboundMentionTokens", () => {
   it("returns nothing for an empty or mention-free body", () => {
     expect(extractUnboundMentionTokens("")).toEqual([]);
     expect(extractUnboundMentionTokens("a comment with no mentions at all")).toEqual([]);
+  });
+});
+
+// PEN-5364. `unbound` is deduped on the token text, not on the occurrence, so
+// the mixed-form body — one `agent://` link plus loose prose for the same name —
+// produces a receipt byte-identical to a body that only ever wrote the bare
+// form. One raised the wake; the other dropped it. These assert the `bound`
+// half tells them apart, and that the asymmetry runs the cheap way: an
+// unreadable label reports nothing and costs a re-send, never a false all-clear.
+describe("extractMentionBindingReport", () => {
+  const BOUND_AGENT_ID = "agent-cfo-1";
+  const boundHref = buildAgentMentionHref(BOUND_AGENT_ID, null);
+  const opts = { boundAgentIds: [BOUND_AGENT_ID] };
+
+  it("THE DEFECT: a mixed-form body is now readable", () => {
+    // Before `bound`, this body and the bare-only body below were the same
+    // receipt. The wake WAS raised here.
+    expect(
+      extractMentionBindingReport(
+        `[@Cfo](${boundHref}) please rule — @Cfo also owns the ledger question`,
+        opts,
+      ),
+    ).toEqual({ bound: ["Cfo"], unbound: ["Cfo"] });
+  });
+
+  it("CONTRAST: the bare-only body reports the same unbound list and NO bound one", () => {
+    expect(extractMentionBindingReport("@Cfo please rule on this", opts)).toEqual({
+      bound: [],
+      unbound: ["Cfo"],
+    });
+  });
+
+  it("link-only reports the bound name and nothing unbound", () => {
+    expect(extractMentionBindingReport(`[@Cfo](${boundHref}) please rule`, opts)).toEqual({
+      bound: ["Cfo"],
+      unbound: [],
+    });
+  });
+
+  it("does not report a link whose target resolved to nobody as bound", () => {
+    // The wake was dropped, so the name belongs in `unbound` and must not
+    // appear in `bound` — reporting it there would manufacture the exact false
+    // all-clear this field exists to prevent.
+    expect(
+      extractMentionBindingReport(`[@Ghost](${buildAgentMentionHref("agent-gone", null)})`, opts),
+    ).toEqual({ bound: [], unbound: ["Ghost"] });
+  });
+
+  it("does not report non-agent mention schemes as bound", () => {
+    const body = `[@Taylor](${buildUserMentionHref("user-1")})`;
+    expect(extractMentionBindingReport(body, opts)).toEqual({ bound: [], unbound: [] });
+  });
+
+  it("reads a bare label, the `[Cfo](agent://…)` form", () => {
+    expect(extractMentionBindingReport(`[Cfo](${boundHref}) please rule`, opts)).toEqual({
+      bound: ["Cfo"],
+      unbound: [],
+    });
+  });
+
+  it("reads the @-token out of a label carrying extra prose", () => {
+    expect(
+      extractMentionBindingReport(`[@Cfo — please rule](${boundHref}) and @Cfo again`, opts),
+    ).toEqual({ bound: ["Cfo"], unbound: ["Cfo"] });
+  });
+
+  it("RESIDUAL: a label with no name in it reports nothing bound", () => {
+    // Costs one redundant re-send, which is the cheap direction. Inventing a
+    // name by taking the first word would put prose in a list of names.
+    expect(extractMentionBindingReport(`[the CFO](${boundHref}) please rule`, opts)).toEqual({
+      bound: [],
+      unbound: [],
+    });
+  });
+
+  it("dedupes bound names case-insensitively, as `unbound` does", () => {
+    expect(
+      extractMentionBindingReport(`[@Cfo](${boundHref}) and [@cfo](${boundHref})`, opts),
+    ).toEqual({ bound: ["Cfo"], unbound: [] });
+  });
+
+  it("reports a bound link inside a code fence, because the wake really fires", () => {
+    // `findMentionedAgents` runs `extractAgentMentionIds` over the UNMASKED
+    // body, so a fenced `agent://` link does raise a wake. Masking it here
+    // would report a wake that happened as one that did not.
+    const body = ["```md", `[@Cfo](${boundHref})`, "```"].join("\n");
+    expect(extractMentionBindingReport(body, opts)).toEqual({ bound: ["Cfo"], unbound: [] });
+  });
+
+  it("returns both halves empty for a mention-free body", () => {
+    expect(extractMentionBindingReport("no mentions at all", opts)).toEqual({
+      bound: [],
+      unbound: [],
+    });
+    expect(extractMentionBindingReport("", opts)).toEqual({ bound: [], unbound: [] });
+  });
+
+  it("extractUnboundMentionTokens stays the unbound half, unchanged", () => {
+    const body = `[@Cfo](${boundHref}) and @Ceo`;
+    expect(extractUnboundMentionTokens(body, opts)).toEqual(
+      extractMentionBindingReport(body, opts).unbound,
+    );
   });
 });

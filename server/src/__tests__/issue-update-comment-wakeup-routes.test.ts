@@ -1356,6 +1356,149 @@ describe("issue update comment wakeups", () => {
       expect(res.body.unboundMentions).toEqual([]);
     });
 
+    // PEN-5364. `unboundMentions` dedupes on the token text, not the
+    // occurrence, so the mixed-form body — one `agent://` link plus loose prose
+    // for the same name — produced a receipt byte-identical to a body that only
+    // ever wrote the bare form. One raised the wake, the other dropped it, and
+    // the author could not tell which. Reading the first as the second costs a
+    // redundant re-send; reading the second as the first costs the whole wake,
+    // which is the 24h loss PEN-5180 was filed to end. `boundMentions` is the
+    // half that separates them.
+    describe("boundMentions disambiguates a mixed-form body (PEN-5364)", () => {
+      const MIXED_FORM_NAME = "QA";
+
+      it("mixed form: the same name in BOTH lists means the link bound", async () => {
+        const existing = makeIssue({ assigneeUserId: "active-user", status: "in_progress" });
+        const body = `[@${MIXED_FORM_NAME}](agent://${MENTIONED_AGENT_ID}) please inspect — `
+          + `@${MIXED_FORM_NAME} also owns the fixture question`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-mixed-form-same-name",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+        const res = await request(await createApp({
+          type: "board",
+          userId: "active-user",
+          companyIds: [existing.companyId],
+          source: "session",
+          isInstanceAdmin: false,
+        }))
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        expect(res.body.unboundMentions).toEqual([MIXED_FORM_NAME]);
+        expect(res.body.boundMentions).toEqual([MIXED_FORM_NAME]);
+        // The wake really was raised, which is what makes the bare token noise.
+        await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+          MENTIONED_AGENT_ID,
+          expect.objectContaining({ reason: "issue_comment_mentioned" }),
+        ));
+      });
+
+      it("bare only: the SAME unboundMentions, but boundMentions is empty", async () => {
+        // Byte-identical `unboundMentions` to the case above. Only
+        // `boundMentions` says the wake was dropped.
+        const existing = makeIssue({ status: "in_progress" });
+        const body = `@${MIXED_FORM_NAME} please inspect — @${MIXED_FORM_NAME} owns this`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-bare-only-same-name",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([]);
+
+        const res = await request(await createApp())
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        expect(res.body.unboundMentions).toEqual([MIXED_FORM_NAME]);
+        expect(res.body.boundMentions).toEqual([]);
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({ reason: "issue_comment_mentioned" }),
+        );
+      });
+
+      it("link only: boundMentions carries the name, unboundMentions is empty", async () => {
+        const existing = makeIssue({ assigneeUserId: "active-user", status: "in_progress" });
+        const body = `[@${MIXED_FORM_NAME}](agent://${MENTIONED_AGENT_ID}) please inspect this`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-link-only",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+        const res = await request(await createApp({
+          type: "board",
+          userId: "active-user",
+          companyIds: [existing.companyId],
+          source: "session",
+          isInstanceAdmin: false,
+        }))
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        expect(res.body.unboundMentions).toEqual([]);
+        expect(res.body.boundMentions).toEqual([MIXED_FORM_NAME]);
+      });
+
+      it("is unconditional, so an absent key cannot mean an older server", async () => {
+        const existing = makeIssue({ status: "in_progress" });
+        const body = "Recording the measurement here for the next reader.";
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-no-mentions-bound-half",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([]);
+
+        const res = await request(await createApp())
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        expect(res.body).toHaveProperty("boundMentions");
+        expect(res.body.boundMentions).toEqual([]);
+      });
+
+      it("fails toward 'nothing bound' when mention resolution throws", async () => {
+        // A false re-send costs one round trip; a false all-clear costs the
+        // wake. The resolver failing must never produce the latter.
+        const existing = makeIssue({ status: "in_progress" });
+        const body = `[@${MIXED_FORM_NAME}](agent://${MENTIONED_AGENT_ID}) and @${MIXED_FORM_NAME}`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-bound-half-resolution-failure",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockRejectedValue(new Error("resolution exploded"));
+
+        const res = await request(await createApp())
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        expect(res.body.boundMentions).toEqual([]);
+        expect(res.body.unboundMentions).toEqual([MIXED_FORM_NAME]);
+      });
+    });
+
     it("still reports the signal when mention resolution throws", async () => {
       // Fail toward reporting: a false "this may not have reached anyone" costs
       // a re-send, a false silence costs a day.
