@@ -423,27 +423,21 @@ export interface IssueBlockerAttention {
   sampleBlockerIdentifier: string | null;
   sampleStalledBlockerIdentifier: string | null;
   /**
-   * PEN-5105, OBSERVATION ONLY. How many of this row's top-level blockers reached
-   * `covered` through the human-assigned arm specifically -- `assigneeUserId` set and
-   * status not `cancelled`, which covers unconditionally with no staleness term.
+   * PEN-5105. How many of this row's top-level blockers reached `covered` through the
+   * human-assigned arm specifically -- `assigneeUserId` set, status not `cancelled`, and
+   * (since the conjunct landed) either idle under `HUMAN_ASSIGNED_BLOCKER_STALE_HOURS` or
+   * held by a live deliberate park.
    *
-   * This is NOT a subset you can derive from `coveredBlockerCount`: a blocker also
-   * reaches `covered` by being `done`, by carrying a pending interaction, by holding a
-   * live run/monitor/park, or by the downstream recursion. Only this arm is unbounded in
-   * time, so only this count sizes the population a staleness conjunct would touch.
+   * This is NOT a subset you can derive from `coveredBlockerCount`: a blocker also reaches
+   * `covered` by being `done`, by carrying a pending interaction, by holding a live
+   * run/monitor/park, or by the downstream recursion.
    *
-   * **It is an UPPER BOUND on what a staleness conjunct would un-cover, not an exact
-   * count.** This arm returns BEFORE the `in_review` arm, the downstream recursion and the
-   * leaf monitor/run/park checks. A blocker that failed a new staleness conjunct here would
-   * fall through to those arms, and any of them may still cover it. So the true delta is
-   * `<=` this number. That is the safe direction for sizing a blast radius -- it can only
-   * overstate the flood -- but read it as "depends on this arm", never as "would be
-   * un-covered". The exact figure needs a second classification pass with the arm disabled,
-   * which the PR that takes the conjunct has to compute anyway.
-   *
-   * It changes no `state`, no `reason` and no other count. It exists so the threshold in
-   * PEN-5105 can be chosen against a measured blast radius instead of a guess, and so the
-   * flood is measurable BEFORE it is taken.
+   * ⚠ A blocker that goes stale LEAVES this count, because it stops covering. So the count
+   * no longer sizes "what a conjunct would un-cover" -- that question is settled -- but
+   * remains an **UPPER BOUND on what a HIGHER threshold would un-cover**. This arm returns
+   * BEFORE the `in_review` arm, the downstream recursion and the leaf monitor/run/park
+   * checks, so a blocker that stopped covering here could still be covered by one of those.
+   * The true delta is `<=` this number: it can only overstate, which is the safe direction.
    */
   humanAssignedCoveredBlockerCount: number;
   /**
@@ -459,9 +453,9 @@ export interface IssueBlockerAttention {
    * That makes it useless for asserting attendance (`heartbeat.ts` rejects it for exactly
    * this reason: the run-finalization write would make every summary look fresh) but
    * correct for asserting its ABSENCE. Fresh does not prove a human attended; stale proves
-   * nothing touched the row at all, which is strictly stronger. A staleness conjunct only
+   * nothing touched the row at all, which is strictly stronger. The staleness conjunct only
    * ever acts on the stale side, so this clock can only UNDER-report staleness -- and
-   * under-reporting leaves a blocker `covered`, preserving today's behaviour. The error
+   * under-reporting leaves a blocker `covered`, preserving the prior behaviour. The error
    * direction is toward the status quo, never toward the flood.
    *
    * Consequence when reading the measurement: these spans are a LOWER BOUND on human

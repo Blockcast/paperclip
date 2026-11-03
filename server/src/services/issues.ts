@@ -2944,6 +2944,23 @@ const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
 const BLOCKER_ATTENTION_MAX_DEPTH = 8;
 const BLOCKER_ATTENTION_MAX_NODES = 2000;
 const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
+/**
+ * PEN-5105: after how long does a human-assigned blocker stop counting as attended?
+ *
+ * The arm below used to cover any human-assigned, non-cancelled blocker unconditionally and
+ * for ever. PEN-5021 named that the "quiet direction": a false `stalled` costs one
+ * adjudication and announces itself, while a false `covered` silently removes a row from
+ * every attention surface. Measured on the complete live population (todo + in_progress +
+ * blocked + in_review, n=394) at 2026-11-03T12:1xZ, 44 rows rested on this arm.
+ *
+ * 72h is chosen for INSENSITIVITY, not precision. The idle distribution is sharply bimodal
+ * — 8 rows at or under 10.4h, then a 106-hour gap, then 36 rows at or over 116.6h — so every
+ * threshold in (10.4h, 116.6h] selects the identical 36 rows. 24h, 48h and 72h are the same
+ * answer on this data; 72h simply sits mid-gap, so ordinary drift cannot move the outcome.
+ * Re-measure before re-tuning: the figures are a snapshot and live on PEN-5105, deliberately
+ * not inlined here beyond the reasoning they support.
+ */
+const HUMAN_ASSIGNED_BLOCKER_STALE_HOURS = 72;
 
 type IssueBlockerAttentionNode = {
   id: string;
@@ -4003,24 +4020,61 @@ async function listIssueBlockerAttentionMap(
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
     if (node.assigneeUserId && node.status !== "cancelled") {
-      // PEN-5105: THE arm. Any human assignee on any non-cancelled status covers
-      // immediately and unconditionally -- ahead of the `in_review` arm, the downstream
-      // recursion and the leaf invokability check -- with no staleness term and no upper
-      // bound on how long it holds. PEN-5021 and PEN-5105 carry the sweeps that attribute
-      // the false-`covered` population to this arm; the figures live there, deliberately
-      // not here, because a snapshot inlined in source goes stale silently.
+      // PEN-5105: THE arm. A human assignee on a non-cancelled status covers -- ahead of the
+      // `in_review` arm, the downstream recursion and the leaf invokability check -- but no
+      // longer unconditionally and no longer for ever. PEN-5021 and PEN-5105 carry the sweeps
+      // that attributed the false-`covered` population to this arm; the figures live there,
+      // deliberately not inlined, because a snapshot in source goes stale silently.
       //
-      // The verdict below is DELIBERATELY UNCHANGED. Adding the conjunct here un-covers
-      // every human-assigned blocker company-wide in one step, which is the flood shape the
-      // CEO flagged on PEN-5021 and the PEN-3345 shape. What is added is the measurement
-      // that lets the threshold be chosen against a real blast radius first.
+      // Two terms, and the second is the one that keeps this from being a false-positive
+      // machine:
+      //
+      //  - IDLE, from `lastActivityAt`. An UPPER bound on attendance: that column advances on
+      //    any write by anyone, so a row reading idle is idle at least that long and usually
+      //    longer. The error direction is therefore safe -- this under-reports staleness and
+      //    cannot invent it.
+      //  - NOT DELIBERATELY PARKED. `isDeliberateParkActive` is reused rather than restated;
+      //    `services/issue-park-expiry.ts` is the documented single owner of the live-park
+      //    reading (BLO-27912, BLO-22660) and this is a further caller, not a further copy.
+      //    ⚠ Deliberately NOT `hasLiveDeliberateParkWakePath`: that predicate additionally
+      //    requires an invokable AGENT assignee and returns false when `assigneeUserId` is
+      //    set, on the stated grounds that "human-assigned blockers already reach `covered`
+      //    by their own arm above" -- the very premise this change retires. A park on a
+      //    human-assigned row is a note to a person rather than a schedulable wake, and for
+      //    THIS arm that note is the attendance. Measured: 11 of the 36 otherwise-stale rows
+      //    are covered by two blockers parked to 2027-01-20; un-covering those would be a
+      //    false `stalled` of exactly the loud kind PEN-5021 shipped protections against.
+      //
+      // On staleness the verdict is `stalled`, NOT the `{covered:false, stalled:false}`
+      // fall-through. A blocker idle past the threshold with no live park IS what `stalled`
+      // denotes, and the recursion below tests `hardAttention` BEFORE `stalledEntry` -- so a
+      // non-stalled fall-through here would mask a genuinely stalled sibling out of the
+      // operator feed, making this change a net regression instead of a fix.
+      //
+      // `idleHours === null` reads as NOT stale. That guard is defensive only and has no
+      // test: migration 0076 sets `issues.last_activity_at` NOT NULL, so the null arm is
+      // unreachable through the database and `blockerIdleHours` can only return null for an
+      // unparseable value. It is kept because the node type admits null, and because the
+      // fail-safe direction for an unreadable span is "not proven stale", never "stale".
+      const idleHours = blockerIdleHours(node, blockerAttentionNowMs);
+      const stale = idleHours !== null
+        && idleHours >= HUMAN_ASSIGNED_BLOCKER_STALE_HOURS
+        && !isDeliberateParkActive(node.parkedUntil, blockerAttentionNowMs);
+      if (stale) {
+        return {
+          covered: false,
+          stalled: true,
+          sampleBlockerIdentifier: nodeSample,
+          sampleStalledBlockerIdentifier: nodeSample,
+        };
+      }
       return {
         covered: true,
         stalled: false,
         sampleBlockerIdentifier: nodeSample,
         sampleStalledBlockerIdentifier: null,
         humanAssignedCovered: true,
-        humanAssignedIdleHours: blockerIdleHours(node, blockerAttentionNowMs),
+        humanAssignedIdleHours: idleHours,
       };
     }
     if (node.status === "in_review") {
