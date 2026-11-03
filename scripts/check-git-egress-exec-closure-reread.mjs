@@ -76,10 +76,12 @@ export const TRAILER = "Residual-4-Reread";
  *
  * ⚠ Three constants is three things to get wrong, so note which way each fails.
  * Forgetting `REVIEW_NOTICE` strands it in the past, and the advisory warning
- * then fires on every run until the next window — loud, harmless, and obviously
- * wrong to anyone who reads it. Forgetting `REVIEW_LAST_COMPLETED` is the silent
- * one, which is why it is named first above. The remaining ordering mistake is
- * enforced rather than trusted: see `reviewNoticeDue`.
+ * then fires on every run from that edit to the new `REVIEW_DUE` — the stranded
+ * window swallows the next one rather than ending before it, so there is no
+ * quiet interval in between. Loud, harmless, and obviously wrong to anyone who
+ * reads it. Forgetting `REVIEW_LAST_COMPLETED` is the silent one, which is why
+ * it is named first above. The remaining ordering mistake is enforced rather
+ * than trusted: see `reviewNoticeDue`.
  */
 export const REVIEW_DUE = "2027-01-31";
 export const REVIEW_LAST_COMPLETED = null;
