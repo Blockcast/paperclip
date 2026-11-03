@@ -5140,22 +5140,34 @@ export function issueRoutes(
   // PEN-5334: this block used to say the wake path applied NO gate, and the
   // remediation below told a blocked agent that a non-assignee mention "wakes you
   // but does not authorize you". Both are wrong as shipped. Every mention-wake
-  // site (`:4645`, `:14468`, `:16816`) runs the SAME predicate and skips a
-  // mention that fails it, so a non-entitled author's mention raises no wake at
-  // all — and because it still BINDS, it is also absent from the create
-  // response's `unboundMentions`, which is PEN-5180's only signal. Its author
-  // therefore sees a 201 and an empty unbound list, the mentioned agent is never
-  // woken, and nothing anywhere names the reason: more silent than the failure
-  // the old text described, not less. Pinned by "does not wake a mentioned agent
-  // when an agent comment cannot grant reply access" and "does not enqueue a
-  // keyed mention wake when an agent cannot grant reply access" in
+  // site in this file runs the SAME predicate and skips a mention that fails it,
+  // so a non-entitled author's mention raises no wake at all — and because it
+  // still BINDS, it is also absent from the create response's `unboundMentions`,
+  // which is PEN-5180's only signal. Its author therefore sees a 201 and an empty
+  // unbound list, the mentioned agent is never woken, and nothing anywhere names
+  // the reason: more silent than the failure the old text described, not less.
+  //
+  // PEN-5353: the three sites are cited by symbol, not by line. They are the
+  // `continue`-on-failed-`commentAuthorCanGrantIssueMention` guards in
+  // `buildKeyedCommentEffectIntents`, in the `router.patch("/issues/:id", ...)`
+  // handler, and in the `router.post("/issues/:id/comments", ...)` handler.
+  // `grep -n commentAuthorCanGrantIssueMention server/src/routes/issues.ts` lists
+  // the import plus exactly those three. This comment previously carried raw line
+  // numbers; they went stale on the very PR that added this block, which is why
+  // they are gone.
+  //
+  // Pinned by "does not wake a mentioned agent when an agent comment cannot
+  // grant reply access" and "does not enqueue a keyed mention wake when an agent
+  // cannot grant reply access" in
   // __tests__/issue-update-comment-wakeup-routes.test.ts, each with a positive
   // control.
   //
   // The wake and the grant are co-extensive only AT CREATE TIME. The grant is
-  // re-derived per request against the issue's CURRENT assignee
-  // (`services/authorization.ts:2725`), so REASSIGNING the row revokes a mention
-  // the previous assignee wrote while its wake has already fired. That is the one
+  // re-derived per request against the issue's CURRENT assignee (`decideBase`
+  // passes `resource.assigneeAgentId` as `issueAssigneeAgentId` into
+  // `agentHasMentionGrantOnIssue`, in `services/authorization.ts`), so
+  // REASSIGNING the row revokes a mention the previous assignee wrote while its
+  // wake has already fired. That is the one
   // real "woken but not authorized" path, and it is staleness, not a hole in the
   // author gate. Model: docs/security/issue-authorization-model.md, "Who may
   // grant a mention".

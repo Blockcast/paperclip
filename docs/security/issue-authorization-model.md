@@ -238,8 +238,14 @@ places and only the first is ever reported back to the author. A well-formed
   contract is "every `@` token bound" (`PEN-5180`). That statement is true and says
   nothing whatever about entitlement;
 - raises **no** `issue_comment_mentioned` wake — the wake is gated on this same
-  predicate at all three comment-create paths (`server/src/routes/issues.ts:4645`,
-  `:14468`, `:16816`), each with a positive control in
+  predicate at all three comment-create paths in `server/src/routes/issues.ts`. Each
+  is a `continue` on a failed `commentAuthorCanGrantIssueMention({ ... })` guard
+  inside the `for (const mentionedId of mentionedIds)` loop, in:
+  `buildKeyedCommentEffectIntents`, the `router.patch("/issues/:id", ...)` handler,
+  and the `router.post("/issues/:id/comments", ...)` handler. To list them, grep the
+  predicate rather than trusting a line number:
+  `grep -n commentAuthorCanGrantIssueMention server/src/routes/issues.ts` returns the
+  import plus exactly those three call sites. Each has a positive control in
   `server/src/__tests__/issue-update-comment-wakeup-routes.test.ts`;
 - confers **no** grant.
 
@@ -270,8 +276,9 @@ peer, only by the assignee or a human.
 ### What revokes a mention grant
 
 The grant is **re-derived at decision time**, not stamped on the comment, and the
-assignee it compares against is the issue's **current** one
-(`resource.assigneeAgentId`, `:2725`). Three consequences:
+assignee it compares against is the issue's **current** one — `decideBase` passes
+`resource.assigneeAgentId` as the `issueAssigneeAgentId` argument to
+`agentHasMentionGrantOnIssue` on every request. Three consequences:
 
 - **Reassigning the issue revokes it.** A mention the previous assignee wrote stops
   granting the moment the row changes hands, because the author is no longer the
@@ -280,13 +287,21 @@ assignee it compares against is the issue's **current** one
   grant is evaluated fresh on every request. An agent in that state is not reading a
   stale denial — its access genuinely ended.
 - **Deleting the comment revokes it.** The lookup filters `deletedAt IS NULL`.
-- **For the user arm, revocation is by membership status, not by role.** The test is
-  `getActiveCompanyMembership` — `status = 'active'`, with **no role predicate**
-  (`:1570`). A seat must have been non-`viewer` to post the mention at all, since
-  `viewer` and `support` hold no `issue:comment` (`:1916`), but a later downgrade to
-  either does **not** revoke a grant the seat already issued. Deactivating the
-  membership does. A downgraded seat cannot issue new ones, so this is a
-  persistence property rather than a reachable escalation — but it is asymmetric
+- **For the user arm, revocation is by membership status, not by role.** The grant
+  path does **not** call `getActiveCompanyMembership`. It runs its own inline
+  `companyMemberships` query, in the `activeAuthorUserIds` set built inside
+  `agentHasMentionGrantOnIssue` (`server/src/services/authorization.ts`), which
+  filters `companyId`, `principalType = 'user'` and `status = 'active'` — with **no
+  role predicate**. (`getActiveCompanyMembership` is the **wake**-side helper, called
+  by the three `issues.ts` sites above to resolve the same fact for a live comment.
+  Grepping that symbol from here lands on the wake path, not the grant path, and
+  those two are exactly what this file exists to keep distinct.) A seat must have
+  been non-`viewer` to post the mention at all, since `viewer` holds no grants at all
+  and `support` normalizes to `viewer` — `grantsForHumanRole` and
+  `membershipRoleIsNonViewer` in `server/src/services/company-member-roles.ts` — but
+  a later downgrade to either does **not** revoke a grant the seat already issued.
+  Deactivating the membership does. A downgraded seat cannot issue new ones, so this
+  is a persistence property rather than a reachable escalation — but it is asymmetric
   with the agent arm above, where reassignment revokes.
 
 ## Why `comment` and `description` are deliberately asymmetric
