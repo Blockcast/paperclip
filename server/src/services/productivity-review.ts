@@ -1344,6 +1344,16 @@ function deliberatePendingMonitor(
  * to re-arm. A park whose deadline is still in the future covers up to `now` and
  * the trigger stays suppressed for exactly as long as the assignee declared.
  *
+ * Measures the CURRENT park only. `parkedDisposition` restamps `parkedAt` to now
+ * on every arm (`services/issues.ts`), so EXTENDING a park does not extend this
+ * window backwards — time the superseded park covered returns to `unattendedMs`
+ * and can re-trip the trigger. That is deliberate, not an oversight, and there is
+ * a test pinning it. It errs toward the review firing rather than toward silent
+ * suppression, which is the safe direction here; and the alternative — carrying
+ * the earliest `parkedAt` forward across re-parks — would let a row chain short
+ * parks into unbounded suppression, defeating the clamp above. Do not "fix" it by
+ * preserving the first `parkedAt`.
+ *
  * Requires BOTH columns and fails closed without them. `parkedDisposition` is
  * the only writer and sets the four park columns atomically on each arm
  * (`services/issues.ts`), so a deadline with no `parkedAt` is unreachable rather
@@ -1554,6 +1564,14 @@ function monitorGatingBreakdown(
   };
 }
 
+// Ally (#3316): neutralises the two characters that can restructure the inline
+// Markdown these evidence lines are rendered as. Only ever applied to
+// agent-authored free text (`parkedReason`), never to the server-owned fields
+// around it, which are timestamps and uuids.
+function escapeInlineMarkdown(text: string) {
+  return text.replace(/\\/g, "\\\\").replace(/`/g, "\\`");
+}
+
 /**
  * PEN-4522: the park clause, which goes FIRST inside the parenthetical.
  *
@@ -1573,7 +1591,14 @@ function formatDeliberatePark(park: DeliberateParkEvidence) {
   const by = park.parkedByAgentId
     ? ` by agent \`${park.parkedByAgentId}\`${park.parkedByAssignee ? " (the assignee)" : ""}`
     : "";
-  const reason = park.parkedReason ? `, reason: "${truncateInline(park.parkedReason, 300)}"` : "";
+  // Ally (#3316): `parkedReason` is agent-authored prose that routinely carries
+  // backticks, and an odd count opens an inline code span that swallows the rest of
+  // the parenthetical — including the monitor clause composed after it. Escaped
+  // rather than stripped: `ON WAKE:` is the part a manager acts on, so it has to
+  // survive intact. Backslashes go first, or the escape marks become escapable.
+  const reason = park.parkedReason
+    ? `, reason: "${escapeInlineMarkdown(truncateInline(park.parkedReason, 300))}"`
+    : "";
   return `deliberate park set${by} at ${park.parkedAt.toISOString()}, ${deadline}${reason}`;
 }
 

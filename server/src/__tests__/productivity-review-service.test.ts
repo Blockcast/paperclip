@@ -10070,6 +10070,89 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
   });
 
+  // Ally (#3316) — the re-park boundary, pinned on purpose rather than left to
+  // be rediscovered.
+  //
+  // `parkedDisposition` restamps `parkedAt` to now on EVERY arm
+  // (`services/issues.ts`), so extending a park does not extend the measured
+  // window backwards. A row parked at the start of a 14h episode and re-parked 4h
+  // ago measures a 4h bucket, and the 10h the superseded park genuinely covered
+  // returns to `unattendedMs` — over the 6h bar, so the review fires.
+  //
+  // That is the same false-positive SHAPE this issue fixes, and it is kept
+  // deliberately. It errs toward the review firing rather than toward silence,
+  // which is the safe direction for this trigger; and the obvious "fix" —
+  // carrying the earliest `parkedAt` forward across re-parks — would let a row
+  // chain short parks into unbounded suppression and defeat the clamp the
+  // boundedness pair above pins. This test exists so that changing either side is
+  // a decision somebody made rather than an accident.
+  it("measures only the current park after a re-park, returning the superseded park's time to unattended", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 14 * 60 * 60 * 1000);
+    // The re-park: the row has been parked since `startedAt`, but the most recent
+    // arm was 4h ago and that is the only start the row still records.
+    const reParkedAt = new Date(now.getTime() - 4 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      parkedAt: reParkedAt,
+      parkedUntil: new Date(now.getTime() + 20 * 60 * 60 * 1000),
+      parkedReason: "Extended the park. ON WAKE: re-check the gate.",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    // 4h measured, not 14h — and the park still renders as live, so the manager
+    // sees both the live park and the time it does not account for.
+    expect(review?.description).toContain("0m monitor-gated, 4h 0m park-gated, 10h 0m unattended");
+    expect(review?.description).toContain(`at ${reParkedAt.toISOString()}, live until`);
+  });
+
+  // Ally (#3316) — `parkedReason` is agent-authored prose and these parks are
+  // written with `ON WAKE:` instructions that routinely name commands, branches
+  // and SHAs in backticks. An odd backtick count opens an inline code span that
+  // runs past the closing quote and swallows the rest of the parenthetical — the
+  // monitor clause included — so the one line this issue exists to make readable
+  // is the line most exposed to it.
+  //
+  // Escaped rather than stripped: the instruction is what a manager acts on.
+  it("escapes backticks in a park reason so the rest of the evidence line survives", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 14 * 60 * 60 * 1000);
+    const parkedUntil = new Date(startedAt.getTime() + 2 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      parkedAt: startedAt,
+      parkedUntil,
+      // Three backticks: an odd count, so the unescaped form leaves a code span open.
+      parkedReason: "ON WAKE: run `pnpm build` on `main` then re-check the ` gate.",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      'reason: "ON WAKE: run \\`pnpm build\\` on \\`main\\` then re-check the \\` gate."',
+    );
+    // The clause composed after the reason is still outside the quoted text.
+    expect(review?.description).toContain('gate."; no monitor armed during this episode)');
+  });
+
   // The partition invariant, extended. B1 made the split a three-bucket partition
   // (`gatedMs + executingMs + unattendedMs === elapsedMs`); the park bucket makes
   // it four, and the two new buckets have to be DISJOINT or the sum breaks and
