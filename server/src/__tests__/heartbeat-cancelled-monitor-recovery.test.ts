@@ -24,7 +24,7 @@
  * is the point: a predicate with no instances is the cheapest one to pin.
  */
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { activityLog, agents, companies, createDb, issueComments, issues } from "@paperclipai/db";
 import {
@@ -122,6 +122,13 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
       recoveryPolicy?: string | null;
       recoveryEmittedAt?: string | null;
       monitorNextCheckAt?: Date | null;
+      /** Pins selection order: the pass reads `asc(updatedAt), asc(id)`. */
+      updatedAt?: Date;
+      /**
+       * Makes the row match the SQL predicate but fail `parseIssueExecutionState`
+       * — the one permanently-unhandable class that cannot be excluded in SQL.
+       */
+      malformed?: boolean;
     } = {},
   ) {
     const issueId = randomUUID();
@@ -167,8 +174,10 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
           clearedAt: CLEARED_AT,
           clearReason: overrides.clearReason ?? "cancelled",
           ...(overrides.recoveryEmittedAt === undefined ? {} : { recoveryEmittedAt: overrides.recoveryEmittedAt }),
+          ...(overrides.malformed ? { attemptCount: "not-a-number" } : {}),
         },
       },
+      ...(overrides.updatedAt ? { updatedAt: overrides.updatedAt } : {}),
       monitorNextCheckAt: overrides.monitorNextCheckAt ?? null,
       monitorNotes: null,
       monitorScheduledBy: "assignee",
@@ -441,5 +450,99 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
     const row = await readIssue(issueId);
     expect(row.monitorNextCheckAt?.toISOString()).toBe(rearmedAt.toISOString());
     expect(residueOf(row.executionState)).toMatchObject({ status: "scheduled", recoveryEmittedAt: null });
+  });
+
+  it("refuses to discharge an obligation it cannot hand to anyone (unassigned source)", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    // Reachable two ways: a flapping row reopened and then released, or a
+    // canceller that unassigned on its way out. `issueAllowsMonitor` requires
+    // an assignee, so the monitor WAS owned when it was armed.
+    const issueId = await seedCancelledResidue(companyId, null);
+
+    const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+    expect(result).toMatchObject({ scanned: 1, recovered: 0, unowned: 1, failed: 0 });
+
+    // No carrier: the recovery row inherits the source's assignee, so creating
+    // one here would mint an ownerless `todo` that no wake can ever reach —
+    // the same strand this pass exists to remove, one row further along.
+    expect(await readRecoveryIssues(issueId)).toHaveLength(0);
+
+    // And critically, the obligation is still OWED. Stamping would record it as
+    // discharged by a carrier that never existed.
+    const source = await readIssue(issueId);
+    expect(residueOf(source.executionState).recoveryEmittedAt ?? null).toBeNull();
+  });
+
+  it("hands back for real once an unassigned source gets an owner", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedCancelledResidue(companyId, null);
+
+    expect(await heartbeat.reconcileCancelledIssueMonitorRecoveries()).toMatchObject({ unowned: 1, recovered: 0 });
+    await db.update(issues).set({ assigneeAgentId: agentId }).where(eq(issues.id, issueId));
+
+    const second = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+    expect(second).toMatchObject({ scanned: 1, recovered: 1, unowned: 0, failed: 0 });
+    expect(await readRecoveryIssues(issueId)).toHaveLength(1);
+    expect(residueOf((await readIssue(issueId)).executionState).recoveryEmittedAt).toBeTruthy();
+  });
+
+  it("creates exactly one carrier when two passes run concurrently", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = await seedCancelledResidue(companyId, agentId);
+
+    // `setInterval` starts tick N+1 whether or not tick N settled, and the
+    // startup pass can overlap the first periodic one. `index.ts` single-flights
+    // this pass for cost; `issues_active_stranded_issue_recovery_uq` is what
+    // makes a duplicate carrier impossible even when the latch is bypassed, as
+    // it is here and as it would be across two replicas.
+    const [a, b] = await Promise.all([
+      heartbeat.reconcileCancelledIssueMonitorRecoveries(),
+      heartbeat.reconcileCancelledIssueMonitorRecoveries(),
+    ]);
+
+    expect(await readRecoveryIssues(issueId)).toHaveLength(1);
+    // One obligation, one carrier, and no pass invented a second one.
+    expect(a.recovered + b.recovered).toBeGreaterThanOrEqual(1);
+    expect(residueOf((await readIssue(issueId)).executionState).recoveryEmittedAt).toBeTruthy();
+  });
+
+  it("does not let rows it can never discharge starve the ones it can", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    // Selection is `asc(updatedAt)`, and neither of these two advances it: an
+    // unowned row and a malformed one both emit nothing. Without paging they
+    // would sit at the head of every page forever and the healthy row behind
+    // them would never be reached — with a `warn` line as the only symptom.
+    await seedCancelledResidue(companyId, null, { updatedAt: new Date("2026-11-01T00:00:00.000Z") });
+    await seedCancelledResidue(companyId, agentId, {
+      malformed: true,
+      updatedAt: new Date("2026-11-01T00:00:01.000Z"),
+    });
+    const healthy = await seedCancelledResidue(companyId, agentId, {
+      updatedAt: new Date("2026-11-01T00:00:02.000Z"),
+    });
+
+    // `limit: 1` makes each undischargeable row its own full page, so the pass
+    // only reaches the healthy row by walking past both.
+    const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries({ limit: 1 });
+
+    expect(result).toMatchObject({ recovered: 1, unowned: 1, skipped: 1, failed: 0 });
+    expect(await readRecoveryIssues(healthy)).toHaveLength(1);
+  });
+
+  it("will not synthesise a wake idempotency key for a clear with no clearedAt", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    // No in-tree construction site writes this, which is the point: keying the
+    // wake on `now` instead would change the key every pass and stop the
+    // re-offer deduping in precisely the state where nothing else does.
+    const issueId = await seedCancelledResidue(companyId, agentId);
+    await db
+      .update(issues)
+      .set({ executionState: sql`jsonb_set(${issues.executionState}::jsonb, '{monitor,clearedAt}', 'null'::jsonb)` })
+      .where(eq(issues.id, issueId));
+
+    const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+    expect(result).toMatchObject({ scanned: 0, recovered: 0, failed: 0 });
+    expect(await readRecoveryIssues(issueId)).toHaveLength(0);
+    expect(residueOf((await readIssue(issueId)).executionState).recoveryEmittedAt ?? null).toBeNull();
   });
 });
