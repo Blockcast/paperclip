@@ -338,6 +338,11 @@ export const issueExecutionMonitorStateSchema = z.object({
   recoveryPolicy: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES).nullable().prefault(null),
   clearedAt: z.string().datetime().nullable(),
   clearReason: z.enum(ISSUE_EXECUTION_MONITOR_CLEAR_REASONS).nullable(),
+  // PEN-5343: the due time the monitor was holding when it was cleared.
+  // `prefault(null)` so every row written before this field existed keeps
+  // parsing — absent means "not recorded", which is NOT the same as "no wake
+  // was owed", and a sweep reading this must treat the two differently.
+  clearedNextCheckAt: z.string().datetime().nullable().prefault(null),
 });
 
 export const issueReviewRequestSchema = z.object({

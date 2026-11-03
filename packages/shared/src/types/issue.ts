@@ -804,6 +804,27 @@ export interface IssueExecutionMonitorState {
   convergenceStalledAssigneeAgentId?: string | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
+  /**
+   * PEN-5343: the `nextCheckAt` the monitor was holding when it was cleared.
+   *
+   * Every other field of the armed monitor already survives a clear
+   * (`notes`, `attemptCount`, `maxAttempts`, `gateSignals`, plus
+   * `clearReason`/`clearedAt`), but the due time did not: the clear nulls
+   * `nextCheckAt` here and `monitorNextCheckAt` on the row, so the one fact
+   * that says *a wake was owed and when* was readable only by diffing the
+   * activity feed.
+   *
+   * That is the gap a cross-agent sweep falls into. `paperclip-plugin-
+   * alertmanager` cancels an alert row when its alert resolves and reopens it
+   * when the alert re-fires; each cancel clears the assignee's monitor
+   * (13 of 13 clears on PEN-4365 + PEN-4261 paired with a plugin cancel
+   * within 3-26 s, none of them ever fired). Reconstructing those nine rows
+   * took a 281-event feed pull per issue. With this field the row answers it
+   * directly.
+   *
+   * Null on an armed or triggered monitor — it is only ever set by a clear.
+   */
+  clearedNextCheckAt?: string | null;
 }
 
 export interface IssueReviewRequest {

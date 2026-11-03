@@ -290,6 +290,7 @@ export function derivePersistedMonitorState(input: {
       ...convergence,
       clearedAt: null,
       clearReason: null,
+      clearedNextCheckAt: null,
     };
   }
 
@@ -317,6 +318,7 @@ export function derivePersistedMonitorState(input: {
       ...convergence,
       clearedAt: null,
       clearReason: null,
+      clearedNextCheckAt: null,
     };
   }
 
@@ -342,6 +344,9 @@ function buildScheduledMonitorState(
     }),
     clearedAt: null,
     clearReason: null,
+    // PEN-5343: an arm and a fire both leave nothing owed, so neither carries
+    // a lost due time forward. Only a clear sets this.
+    clearedNextCheckAt: null,
   };
 }
 
@@ -360,6 +365,9 @@ function buildTriggeredMonitorState(input: {
     ...monitorConvergenceFields(input.previous),
     clearedAt: null,
     clearReason: null,
+    // PEN-5343: an arm and a fire both leave nothing owed, so neither carries
+    // a lost due time forward. Only a clear sets this.
+    clearedNextCheckAt: null,
   };
 }
 
@@ -389,6 +397,12 @@ function buildClearedMonitorState(input: {
         : input.previous?.convergenceStalledAssigneeAgentId ?? null,
     clearedAt: input.clearedAt.toISOString(),
     clearReason: input.clearReason,
+    // PEN-5343: record the wake this clear is destroying. Falls back to the
+    // previously-recorded value so re-clearing an already-cleared monitor
+    // (`previous.nextCheckAt` is null by then) does not erase the original
+    // due time — the clear has to be idempotent in what it remembers, not
+    // just in what it writes.
+    clearedNextCheckAt: input.previous?.nextCheckAt ?? input.previous?.clearedNextCheckAt ?? null,
   };
 }
 

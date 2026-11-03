@@ -99,6 +99,152 @@ describe("buildIssueMonitorEligibilityPatch", () => {
   });
 });
 
+// PEN-5343: `paperclip-plugin-alertmanager` cancels an alert row when its alert
+// resolves and reopens it when the alert re-fires, so an alert row is a
+// *recycled* row rather than a terminal one. Each cancel clears the assignee's
+// armed monitor: 13 of 13 `issue.monitor_cleared_undeliverable` events on
+// PEN-4365 and PEN-4261 paired with a plugin cancel within 3-26 s, and not one
+// of those monitors had fired — they were destroyed between 1h01m and 14h43m
+// early.
+//
+// Clearing is correct (a cancelled row genuinely cannot deliver a wake). What
+// was wrong is that the due time was the one piece of the armed monitor the
+// clear did not keep, so the row could not answer "was a wake owed here, and
+// when" without a per-issue activity-feed pull. These pin the due time onto the
+// row's own cleared state.
+describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343)", () => {
+  const armedAt = "2026-11-03T12:30:00.000Z";
+  const armed = {
+    status: "in_progress",
+    assigneeAgentId: coderAgentId,
+    assigneeUserId: null,
+    monitorNextCheckAt: new Date(armedAt),
+    monitorNotes: "re-check the PEN-5294 gate",
+    executionPolicy: {
+      monitor: { nextCheckAt: armedAt, scheduledBy: "assignee" as const, notes: "re-check the PEN-5294 gate" },
+    },
+  };
+
+  const monitorOf = (patch: Record<string, unknown>) =>
+    (patch.executionState as { monitor?: Record<string, unknown> }).monitor!;
+
+  // `issueExecutionStateSchema` requires the whole stage block; a partial
+  // object fails `safeParse` and `parseIssueExecutionState` hands back null,
+  // which would silently make these assertions vacuous.
+  const stateWithMonitor = (monitor: Record<string, unknown>) =>
+    ({
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor,
+    }) as unknown as IssueExecutionState;
+
+  it("keeps the due time the plugin's cancel destroyed", () => {
+    // The alert resolved while no run held the row: exactly the 11-02T21:46:42Z
+    // cancel that took a monitor due 14h43m later.
+    const monitor = monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" }));
+
+    expect(monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "cancelled",
+      // Still nulled — the monitor really is gone, and nothing should read
+      // this row as holding a live wake.
+      nextCheckAt: null,
+      clearedNextCheckAt: armedAt,
+    });
+  });
+
+  it("distinguishes a destroyed monitor from a row that never armed one", () => {
+    const destroyed = monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" }));
+    expect(destroyed.clearedNextCheckAt).toBe(armedAt);
+
+    // A row that never armed a monitor produces no patch at all, so there is
+    // no cleared state to confuse with the above. This is the discrimination
+    // the top-level columns cannot make: `monitorAttemptCount` reads 0 on both
+    // (8 of the 9 PEN-4365 casualties were destroyed at attempt 0).
+    expect(
+      buildIssueMonitorEligibilityPatch({
+        status: "cancelled",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        monitorNextCheckAt: null,
+      }),
+    ).toEqual({});
+  });
+
+  it("does not erase the original due time when an already-cleared monitor is re-cleared", () => {
+    // The plugin flaps: 64 status transitions on PEN-4365 in 14 days, all
+    // plugin-authored. A second clear arrives with `nextCheckAt` already null,
+    // so a naive assignment would overwrite the record with null and lose the
+    // only evidence that a wake was ever owed.
+    const first = monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" }));
+    expect(first.clearedNextCheckAt).toBe(armedAt);
+
+    const second = buildIssueMonitorClearedPatch({
+      issue: {
+        status: "cancelled",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        monitorNextCheckAt: null,
+        executionState: stateWithMonitor(first),
+      },
+      policy: null,
+      clearReason: "cancelled",
+    });
+
+    expect(monitorOf(second)).toMatchObject({
+      status: "cleared",
+      clearReason: "cancelled",
+      clearedNextCheckAt: armedAt,
+    });
+  });
+
+  it("leaves nothing owed on a fresh arm", () => {
+    // Re-arming after a destroyed wake must not keep advertising the dead one:
+    // PEN-4365 was re-armed for 12:30Z after the 21:47Z loss, and that new
+    // monitor owes nothing to the old.
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [],
+      monitor: { nextCheckAt: "2099-11-04T09:00:00.000Z", scheduledBy: "assignee" },
+    })!;
+
+    const rearmed = applyIssueMonitorPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: null,
+        executionState: stateWithMonitor(
+          monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" })),
+        ),
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: "assignee",
+      },
+      policy,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    expect(monitorOf(rearmed.patch)).toMatchObject({
+      status: "scheduled",
+      nextCheckAt: "2099-11-04T09:00:00.000Z",
+      clearedNextCheckAt: null,
+    });
+  });
+});
+
 function makePolicy(
   stages: Array<{ type: "review" | "approval"; participants: Array<{ type: "agent" | "user"; agentId?: string; userId?: string }> }>,
 ) {
