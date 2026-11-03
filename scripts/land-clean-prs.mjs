@@ -197,6 +197,30 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * leaves the next repo a full budget, up to `10 x repos` doomed calls. Those
  * are no-ops, so that is accepted rather than spending budget on them and
  * starving later repos in the sweep.
+ *
+ * The daily ceiling this implies, recorded 2026-11-03 (PEN-5397) because
+ * nothing else states it: the routine fires four times a day (a six-hourly
+ * cron at 45 past, America/LA), so the cap puts the ceiling at 40 NEW
+ * enqueues per day. `already-enqueued` rows do not spend a slot.
+ *
+ * That ceiling is now being reached, which it was not when the cap was
+ * chosen. Merged PRs per UTC day over 10-23..11-03 peaked at 52 (11-02),
+ * with 44 on 10-29 and 40 on 10-30. A single classifier sample at
+ * 2026-11-03T12:31Z produced 10 `enqueue` + 1 `already-enqueued` + 3
+ * `cap:10-per-fire` -- a 14-PR eligible pool against a 10-PR budget -- and
+ * the pool read at or above the cap on every hourly `landing-sweep` sample
+ * from 08:29Z to 12:31Z.
+ *
+ * If that has to be fixed, fix it with fire FREQUENCY, not by raising this
+ * number. Raising the cap buys throughput by spending the blast-radius
+ * guarantee in the first paragraph, and spends it silently -- nothing about
+ * a larger number announces that the safety margin moved. More fires at the
+ * same cap leave the per-fire radius at exactly 10 and raise the daily
+ * ceiling linearly, so the two concerns stay decoupled.
+ *
+ * The related REPORTING gap -- that a PR deferred by this cap is visible to
+ * neither alarm arm -- is a separate defect owned by PEN-5391, not this
+ * constant.
  */
 export const MAX_ENQUEUES_PER_FIRE = 10;
 
