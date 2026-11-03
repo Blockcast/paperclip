@@ -270,8 +270,19 @@ const BLACKBOX_MODULE_RE = /^[a-z]+\d{0,3}(?:_[a-z]+\d{0,3})+$/;
  *  in a Prometheus label matcher (`networkID="…"`), which cannot derive it at
  *  runtime. A UUID is opaque by design and stays refused under every other
  *  name; this exempts exactly the 8-4-4-4-12 hex layout under exactly this
- *  name, so a non-UUID token under `networkID` is still refused. */
-const UUID_VALUE_NAMES = new Set(["networkID"]);
+ *  name, so a non-UUID token under `networkID` is still refused.
+ *
+ *  PEN-5089 adds `companyId` on the same terms: a Paperclip company id is a
+ *  tenant identifier that appears in issue URLs and REST paths, and a doc
+ *  example that spells one out has no runtime to derive it from.
+ *
+ *  ⚠️ This set is an ALLOWLIST OF EXACT NAMES and must never become a pattern.
+ *  A `/Id$/` or `/_id$/` rule would read as the obvious generalisation and is
+ *  the one change to refuse: it would exonerate `sessionId`, `tokenId`,
+ *  `apiKeyId` and `secretId`, and a UUID genuinely IS the credential in every
+ *  system that issues session ids or API keys as UUIDs. Add a name here only
+ *  on a measured false positive, one name at a time. */
+const UUID_VALUE_NAMES = new Set(["networkID", "companyId"]);
 const CANONICAL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Digit runs in a value, for the bound above. */
@@ -286,6 +297,42 @@ function digitRunCount(value: string): number {
  *  value under any other name, or a non-hex value under `rev`, stays subject
  *  to the entropy test. */
 const GIT_COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
+
+/** PEN-5089: the same commit pin under the other names git and the GitHub API
+ *  bind it to. `rev` alone covered the flake-URL case; a REST example writes
+ *  `?ref=<sha>` or `?sha=<sha>`, a compare writes `?base=<sha>&head=<sha>`,
+ *  and GraphQL returns `headRefOid`/`oid` — each measured refusing while the
+ *  byte-identical value under `rev` passed.
+ *
+ *  ⚠️ The NAME is doing all of the work here, and must keep doing it. A
+ *  40-hex lowercase value is NOT self-exonerating on shape: a legacy GitHub
+ *  personal access token is exactly 40 lowercase hex with no prefix, so
+ *  `VENDOR_KEY_RE` — which keys on `ghp_`/`github_pat_`/`psk_`/`sk-` — does
+ *  not see one, and this entropy rule is its only net. The accepted residual
+ *  is therefore precise: a 40-hex SECRET bound to a git-object name sails
+ *  through. That is BLO-46892's bargain, unchanged in kind and widened only
+ *  across names that are git vocabulary, under none of which a credential is
+ *  plausibly pasted by accident.
+ *
+ *  Do NOT relax this to a shape-only test, and do NOT add a name here because
+ *  it "looks like" a ref — each entry below is a name measured refusing a real
+ *  commit SHA. Note a SHA in PROSE never needed this: `ASSIGNMENT_RE` requires
+ *  `name=value`, so "reviewed head: <sha>", a markdown link and YAML `sha: …`
+ *  all pass today and are not what this covers. */
+const GIT_COMMIT_SHA_VALUE_NAMES = new Set([
+  "rev",
+  "ref",
+  "sha",
+  "oid",
+  "commit",
+  "commit_sha",
+  "head",
+  "head_sha",
+  "headRefOid",
+  "base",
+  "base_sha",
+  "baseRefOid",
+]);
 
 /** PEN-4438 (D7): a Kubernetes object name, or an in-cluster DNS name, as a
  *  `PrometheusRule` label matcher writes it — `pod`, `name`, `instance`,
@@ -438,7 +485,7 @@ function isContentDigestAssignment(name: string, value: string): boolean {
     if (name === "module" && BLACKBOX_MODULE_RE.test(value)) return true;
   }
   if (K8S_OBJECT_NAME_VALUE_NAMES.has(name) && isKubernetesObjectName(value)) return true;
-  if (name === "rev" && GIT_COMMIT_SHA_RE.test(value)) return true;
+  if (GIT_COMMIT_SHA_VALUE_NAMES.has(name) && GIT_COMMIT_SHA_RE.test(value)) return true;
   if (UUID_VALUE_NAMES.has(name) && CANONICAL_UUID_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
 }

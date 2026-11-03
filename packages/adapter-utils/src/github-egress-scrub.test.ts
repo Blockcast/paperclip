@@ -1493,6 +1493,88 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-5089 regression: a commit SHA under the other git-object names", () => {
+    // Derived, not embedded: until this fix deploys, the pre-push guard refuses the literal.
+    const sha = ["2515e5ca485854475eb2739d", "73aef58d765564f2"].join("");
+    const pair = (name: string, value: string) => [name, value].join("=");
+    // Synthetic, per this file's standing rule: not the id of any real company.
+    const COMPANY_ID = ["7a4c2e18", "6b93", "4d05", "9f27", "c1e85b3a0d6f"].join("-");
+
+    it.each([
+      `GET /repos/Blockcast/onprem-k8s/contents/README.md?${pair("ref", sha)}`,
+      `gh api "/repos/Blockcast/onprem-k8s/commits?${pair("sha", sha)}&per_page=1"`,
+      `/compare?${pair("base", sha)}&${pair("head", sha)}`,
+      pair("commit", sha),
+      pair("commit_sha", sha),
+      pair("head_sha", sha),
+      pair("headRefOid", sha),
+      pair("baseRefOid", sha),
+      pair("oid", sha),
+      // BLO-46892's original name keeps passing.
+      pair("rev", sha),
+    ])("passes %s through byte-exact", (text) => {
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    it.each([
+      // Name half: the shape alone exonerates nothing. A legacy GitHub PAT is
+      // exactly 40 lowercase hex and carries no prefix for VENDOR_KEY_RE to
+      // catch, so this entropy rule is its only net -- these MUST stay refused.
+      ["password", sha],
+      ["token", sha],
+      ["api_key", sha],
+      ["secret", sha],
+      ["GITHUB_TOKEN", sha],
+    ])("still refuses a 40-hex value under %s", (name, value) => {
+      const result = scrubGitHubEgressText(pair(name, value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    it.each([
+      // Shape half: only exactly 40 lowercase hex is a commit pin.
+      ["ref", sha.toUpperCase()],
+      ["sha", `${sha}ab`],
+      ["commit", sha.slice(0, 39)],
+      ["head", SYNTHETIC_OPAQUE_VALUE],
+      ["headRefOid", SYNTHETIC_OPAQUE_VALUE],
+    ])("still refuses the non-SHA value bound to %s", (name, value) => {
+      expect(scrubGitHubEgressText(pair(name, value)).classes).toContain(
+        "high-entropy-assignment",
+      );
+    });
+
+    it("exempts a company id under companyId, and only the UUID layout", () => {
+      const text = `# ${pair("companyId", COMPANY_ID)}`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+
+      for (const [name, value] of [
+        // The allowlist is exact names, never a /Id$/ pattern: a UUID IS the
+        // credential wherever session ids or API keys are issued as UUIDs.
+        ["sessionId", COMPANY_ID],
+        ["tokenId", COMPANY_ID],
+        ["apiKeyId", COMPANY_ID],
+        ["companyId", SYNTHETIC_OPAQUE_VALUE],
+        ["companyId", COMPANY_ID.toUpperCase()],
+      ] as const) {
+        expect(scrubGitHubEgressText(pair(name, value)).classes).toContain(
+          "high-entropy-assignment",
+        );
+      }
+    });
+
+    it("still fires the true-positive controls", () => {
+      const ghp = ["ghp", "_", "Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj7Tg0PsQFaB"].join("");
+      expect(scrubGitHubEgressText(pair("ref", ghp)).classes).toContain("vendor-key");
+      expect(scrubGitHubEgressText(pair("password", SYNTHETIC_OPAQUE_VALUE)).classes).toContain(
+        "high-entropy-assignment",
+      );
+    });
+  });
+
   describe("BLO-41262: locateGitHubEgressMatches names the line", () => {
     const token = SYNTHETIC_OPAQUE_VALUE;
 
