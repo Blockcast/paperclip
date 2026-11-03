@@ -12,6 +12,7 @@ import {
   withholdAgentConfigKeys,
   withholdRunTranscriptStateContent,
 } from "../redaction.js";
+import { projectApprovalPayloadForRead } from "../agent-redaction.js";
 
 describe("redaction", () => {
   it("redacts sensitive keys and nested secret values", () => {
@@ -1147,3 +1148,276 @@ describe("withholdRunTranscriptStateContent resultJson depth bound (PEN-3142)", 
   });
 });
 
+
+// PEN-5225 (2026-11-01), round 2. `maskAgentWorkspaceStrategyCommands` closed the agent-config
+// admission gate, which shut `GET /api/agents/:id`. The `hire_agent` approval card carries the
+// SAME BYTES one route over — `routes/agents.ts` writes `adapterConfig` into the payload twice
+// (again under `requestedConfigurationSnapshot`) through `redactEventPayload` alone, which has
+// never known about `workspaceStrategy` — and three read paths serialize it. Those paths gate on
+// `agent_config:read`, which `agents:configure` / `agents:suggest-changes` CLEAR, so a peer
+// holding either read `provisionCommand` in the clear while every other route withheld it. That
+// is the two-exits-one-answer split (PEN-4775); `projectApprovalPayloadForRead` is the one
+// projection all three now share.
+describe("hire_agent approval payload workspace-command withholding (PEN-5225)", () => {
+  const PROVISION = "FOO_TOKEN=prov_secret_13579 ./provision.sh";
+  const TEARDOWN = "FOO_TOKEN=tear_secret_24680 ./teardown.sh";
+  const PARENT_DIR = "/srv/operator/worktrees";
+
+  const ENTITLED = { revealRuntimeConfig: true };
+  const WITHHELD = { revealRuntimeConfig: false };
+
+  function strategy() {
+    return {
+      type: "git_worktree",
+      runScope: "per_issue",
+      baseRef: "main",
+      branchTemplate: "agent/{issue}",
+      provisionCommand: PROVISION,
+      teardownCommand: TEARDOWN,
+      worktreeParentDir: PARENT_DIR,
+    };
+  }
+
+  function hirePayload() {
+    const adapterConfig = { image: "harbor.example.net/agent:sha-1234", workspaceStrategy: strategy() };
+    return {
+      name: "New Worker",
+      adapterType: "claude_k8s",
+      adapterConfig,
+      runtimeConfig: {
+        modelProfiles: { cheap: { adapterConfig: { workspaceStrategy: strategy() } } },
+      },
+      requestedConfigurationSnapshot: { adapterType: "claude_k8s", adapterConfig },
+    };
+  }
+
+  /** Every place a host-executed string could surface, flattened. */
+  function serialized(value: unknown) {
+    return JSON.stringify(value);
+  }
+
+  it("withholds the commands from a reader that holds agent_config:read but not workspace_runtime:read", () => {
+    // THE SHIPPED BUG. Both gates must be resolved independently: a fixture that answers one
+    // boolean for both cannot see this case, because the disclosing reader is precisely the one
+    // that passes gate 1 and fails gate 2.
+    const { payload, withheldFields } = projectApprovalPayloadForRead("hire_agent", hirePayload(), {
+      includeAgentConfig: true,
+      workspaceCommandViewer: WITHHELD,
+    });
+
+    expect(serialized(payload)).not.toContain("prov_secret_13579");
+    expect(serialized(payload)).not.toContain("tear_secret_24680");
+    expect(serialized(payload)).not.toContain(PARENT_DIR);
+
+    const adapter = payload.adapterConfig as any;
+    expect(adapter.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(adapter.workspaceStrategy.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(adapter.workspaceStrategy.worktreeParentDir).toBe(REDACTED_EVENT_VALUE);
+
+    // The SECOND copy, which is what makes this a payload-shaped problem rather than a key-shaped
+    // one: masking `adapterConfig` alone would leave the same bytes under the snapshot.
+    const snapshot = (payload.requestedConfigurationSnapshot as any).adapterConfig;
+    expect(snapshot.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+
+    // And the nested model-profile carrier the write guard already refuses by name.
+    const nested = (payload.runtimeConfig as any).modelProfiles.cheap.adapterConfig;
+    expect(nested.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+
+    // Gate 1 passed, so nothing is reported withheld by it — the two gates stay distinguishable.
+    expect(withheldFields).toEqual([]);
+    // Unrelated strategy keys ride through: this is a mask over an open column, not a projection
+    // of a closed type, so deleting an unclassified sibling would be data loss.
+    expect(adapter.workspaceStrategy.type).toBe("git_worktree");
+    expect(adapter.workspaceStrategy.baseRef).toBe("main");
+    expect(adapter.workspaceStrategy.branchTemplate).toBe("agent/{issue}");
+    expect(adapter.image).toBe("harbor.example.net/agent:sha-1234");
+    expect(payload.name).toBe("New Worker");
+  });
+
+  it("still discloses the commands to a reader that clears workspace_runtime:read", () => {
+    // The other direction, and the reason this is a viewer gate rather than an unconditional mask:
+    // an entitled human operator reads and edits these values unchanged.
+    const { payload } = projectApprovalPayloadForRead("hire_agent", hirePayload(), {
+      includeAgentConfig: true,
+      workspaceCommandViewer: ENTITLED,
+    });
+
+    expect((payload.adapterConfig as any).workspaceStrategy.provisionCommand).toBe(PROVISION);
+    expect((payload.adapterConfig as any).workspaceStrategy.teardownCommand).toBe(TEARDOWN);
+    expect((payload.adapterConfig as any).workspaceStrategy.worktreeParentDir).toBe(PARENT_DIR);
+  });
+
+  it("withholds by default when a caller resolves no viewer at all", () => {
+    // The polarity that makes a forgotten call site fail safe. `listApprovalsForIssue` has five
+    // callers and two of them pass no options, so this default is load-bearing, not decorative.
+    const { payload } = projectApprovalPayloadForRead("hire_agent", hirePayload(), {
+      includeAgentConfig: true,
+    });
+
+    expect(serialized(payload)).not.toContain("prov_secret_13579");
+    expect((payload.adapterConfig as any).workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("keeps both gates independent: failing agent_config:read still blanks the pair", () => {
+    // PEN-2777's answer must survive the new gate rather than be replaced by it.
+    const { payload, withheldFields } = projectApprovalPayloadForRead("hire_agent", hirePayload(), {
+      includeAgentConfig: false,
+      workspaceCommandViewer: WITHHELD,
+    });
+
+    expect(payload.adapterConfig).toEqual({});
+    expect(payload.runtimeConfig).toEqual({});
+    expect(withheldFields).toEqual([
+      "adapterConfig",
+      "runtimeConfig",
+      "requestedConfigurationSnapshot.adapterConfig",
+    ]);
+    expect(serialized(payload)).not.toContain("prov_secret_13579");
+  });
+
+  it("preserves withheld-is-not-absent for each of the three keys", () => {
+    const { payload } = projectApprovalPayloadForRead(
+      "hire_agent",
+      {
+        adapterConfig: {
+          workspaceStrategy: { type: "git_worktree", provisionCommand: null, teardownCommand: PROVISION },
+        },
+      },
+      { includeAgentConfig: true, workspaceCommandViewer: WITHHELD },
+    );
+
+    const s = (payload.adapterConfig as any).workspaceStrategy;
+    // null stays null ("not configured"), a value becomes the sentinel ("withheld"), and an
+    // absent key stays absent. A reader that cannot tell those apart is the PEN-4775 failure.
+    expect(s.provisionCommand).toBeNull();
+    expect(s.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(Object.prototype.hasOwnProperty.call(s, "worktreeParentDir")).toBe(false);
+  });
+
+  it("masks a non-object workspaceStrategy whole rather than spreading it", () => {
+    // The column has no shape guarantee at any layer, and `approvalPayloadSchema` is a
+    // `.catchall(z.unknown())`. Spreading a string would emit its characters.
+    const { payload } = projectApprovalPayloadForRead(
+      "hire_agent",
+      { adapterConfig: { workspaceStrategy: `provision: ${PROVISION}` } },
+      { includeAgentConfig: true, workspaceCommandViewer: WITHHELD },
+    );
+
+    expect((payload.adapterConfig as any).workspaceStrategy).toBe(REDACTED_EVENT_VALUE);
+    expect(serialized(payload)).not.toContain("prov_secret_13579");
+  });
+
+  it("leaves a non-hire card untouched, so the scoping does not become global", () => {
+    // Another type's payload is filer-authored prose, not an agent config. An agent filing a card
+    // ABOUT a provision command must not have its own text masked.
+    const { payload, withheldFields } = projectApprovalPayloadForRead(
+      "request_board_approval",
+      { title: "Ship it", workspaceStrategy: { provisionCommand: PROVISION } },
+      { includeAgentConfig: false, workspaceCommandViewer: WITHHELD },
+    );
+
+    expect(payload).toEqual({ title: "Ship it", workspaceStrategy: { provisionCommand: PROVISION } });
+    expect(withheldFields).toEqual([]);
+  });
+
+  /**
+   * Round 3 — the SHAPE half of gate 3, raised by Ally reviewing `68f772d`.
+   *
+   * The mask finds `workspaceStrategy` by descending plain objects and arrays. `POST
+   * /companies/:companyId/approvals` persists whatever the filer sent (`.catchall(z.unknown())`),
+   * so a JSON-ENCODED config carries the commands in bytes that walk cannot reach. The reader at
+   * risk is the same one the whole row is about: entitled to the config, not to the commands.
+   */
+  describe("a config shape the command mask cannot walk into", () => {
+    const encoded = () => JSON.stringify({ image: "harbor.example.net/agent:sha-1234", workspaceStrategy: strategy() });
+
+    it("blanks a string-encoded adapterConfig instead of returning it in the clear", () => {
+      const { payload } = projectApprovalPayloadForRead(
+        "hire_agent",
+        { name: "New Worker", adapterConfig: encoded() },
+        { includeAgentConfig: true, workspaceCommandViewer: WITHHELD },
+      );
+
+      expect(payload.adapterConfig).toBe(REDACTED_EVENT_VALUE);
+      expect(serialized(payload)).not.toContain("prov_secret_13579");
+      expect(serialized(payload)).not.toContain("tear_secret_24680");
+      expect(serialized(payload)).not.toContain(PARENT_DIR);
+      // Withheld, not absent, and the rest of the card still reads.
+      expect(payload.name).toBe("New Worker");
+    });
+
+    it("blanks an array-valued config too, which is the branch `!isPlainObject` is doing the work in", () => {
+      // Raised by Ally reviewing `7024740`: every other case here is a string or `null`, so
+      // narrowing the gate to `typeof entry === "string"` would leave this suite green while
+      // re-opening the shape it was written to close. The walk DOES descend arrays, so this case
+      // is not covered by the string reasoning — it is the deliberate fail-closed choice the
+      // docblock records, and an element that is itself encoded is exactly why.
+      const { payload } = projectApprovalPayloadForRead(
+        "hire_agent",
+        { name: "New Worker", adapterConfig: [encoded()] },
+        { includeAgentConfig: true, workspaceCommandViewer: WITHHELD },
+      );
+
+      expect(payload.adapterConfig).toBe(REDACTED_EVENT_VALUE);
+      expect(serialized(payload)).not.toContain("prov_secret_13579");
+      expect(serialized(payload)).not.toContain("tear_secret_24680");
+      expect(payload.name).toBe("New Worker");
+    });
+
+    it("reaches the snapshot depth and a string-encoded runtimeConfig too", () => {
+      // The card carries the pair twice. A gate that only knew the top level would leave the
+      // copy — which is how this class of hole has reopened before.
+      const { payload } = projectApprovalPayloadForRead(
+        "hire_agent",
+        {
+          runtimeConfig: encoded(),
+          requestedConfigurationSnapshot: { adapterType: "claude_k8s", adapterConfig: encoded() },
+        },
+        { includeAgentConfig: true, workspaceCommandViewer: WITHHELD },
+      );
+
+      expect(payload.runtimeConfig).toBe(REDACTED_EVENT_VALUE);
+      expect((payload.requestedConfigurationSnapshot as any).adapterConfig).toBe(REDACTED_EVENT_VALUE);
+      expect((payload.requestedConfigurationSnapshot as any).adapterType).toBe("claude_k8s");
+      expect(serialized(payload)).not.toContain("prov_secret_13579");
+    });
+
+    it("is a VIEWER gate, not an unconditional blank: an entitled reader still gets the string", () => {
+      // The other direction. The board decides the hire and must see what it is approving, in
+      // whatever shape the card was filed in.
+      const { payload } = projectApprovalPayloadForRead(
+        "hire_agent",
+        { adapterConfig: encoded() },
+        { includeAgentConfig: true, workspaceCommandViewer: ENTITLED },
+      );
+
+      expect(payload.adapterConfig).toBe(encoded());
+    });
+
+    it("keeps null and absent readable, which is the honest 'no config was requested'", () => {
+      // Matches `withholdAgentConfigKeys`: these carry no commands, and turning them into a
+      // sentinel would manufacture a withholding where the truth is that nothing was set.
+      const { payload } = projectApprovalPayloadForRead(
+        "hire_agent",
+        { name: "New Worker", adapterConfig: null },
+        { includeAgentConfig: true, workspaceCommandViewer: WITHHELD },
+      );
+
+      expect(payload.adapterConfig).toBeNull();
+      expect(Object.prototype.hasOwnProperty.call(payload, "runtimeConfig")).toBe(false);
+    });
+
+    it("changes nothing for a reader that cannot clear agent_config:read either", () => {
+      // Gate 2 has already blanked the pair to `{}` at ANY shape, so gate 3a must compose to a
+      // no-op rather than overwrite that with a different sentinel — two gates, one answer.
+      const { payload, withheldFields } = projectApprovalPayloadForRead(
+        "hire_agent",
+        { adapterConfig: encoded() },
+        { includeAgentConfig: false, workspaceCommandViewer: WITHHELD },
+      );
+
+      expect(payload.adapterConfig).toEqual({});
+      expect(withheldFields).toEqual(["adapterConfig"]);
+    });
+  });
+});

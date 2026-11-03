@@ -2012,6 +2012,392 @@ describe("restoreRedactedAgentMetadata — metadata round-trip guard", () => {
   });
 });
 
+// PEN-5225 (2026-11-01): `adapterConfig.workspaceStrategy.provisionCommand` /
+// `.teardownCommand` are host-executed strings — `bash -lc <string>`, via
+// `services/environment-run-orchestrator.ts` — and the WRITE side has always treated them as
+// privileged: `assertNoAgentHostWorkspaceCommandMutation` refuses the mutation for every agent
+// actor, on its own row included. The read side did not. `redactAgentSecrets` masked
+// `adapterConfig.env` and the MCP `Authorization` header and never touched `workspaceStrategy`,
+// so a peer holding `agents:configure` OR `agents:suggest-changes` — the two grants that clear
+// `agent_config:read` — received them in the clear, while every workspace / project / issue /
+// pipeline route withholds the same bytes behind `workspace_runtime:read`, which no agent can
+// hold at all (PEN-2852). The agents route was a strictly wider door onto a subset of what the
+// narrower one refuses.
+//
+// The entitlement is now `workspace_runtime:read` on every agent-serializing exit, with
+// `agent_config:read` still deciding whether the ROW is readable at all. Two gates, not one.
+describe("agent workspace command withholding (PEN-5225)", () => {
+  const peerAgentId = "66666666-6666-4666-8666-666666666666";
+  const PROVISION = "FOO_TOKEN=prov_secret_13579 ./provision.sh";
+  const TEARDOWN = "FOO_TOKEN=tear_secret_24680 ./teardown.sh";
+  const PARENT_DIR = "/srv/operator/worktrees";
+
+  const strategyAgent = {
+    ...baseAgent,
+    adapterConfig: {
+      cwd: "/workspace",
+      workspaceStrategy: {
+        type: "git_worktree",
+        runScope: "per_issue",
+        baseRef: "main",
+        branchTemplate: "agent/{issue}",
+        worktreeParentDir: PARENT_DIR,
+        provisionCommand: PROVISION,
+        teardownCommand: TEARDOWN,
+      },
+    },
+    runtimeConfig: {},
+  };
+
+  /**
+   * Resolve the two gates independently. The shipped bug is invisible to a mock that answers one
+   * boolean for every action: `agent_config:read` allowed is exactly the state a peer holding
+   * `agents:configure` is in, and that state used to disclose the commands.
+   */
+  function decideBy(allowed: Record<string, boolean>) {
+    return async (input: { action: string }) => ({
+      allowed: allowed[input.action] ?? false,
+      reason: "test",
+      explanation: `test decision for ${input.action}`,
+    });
+  }
+
+  const peerAgentActor = {
+    type: "agent",
+    agentId,
+    companyId,
+    companyIds: [companyId],
+    runId: "run-1",
+    source: "agent_key",
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockAgentService.getById.mockResolvedValue(strategyAgent);
+    mockAgentService.list.mockResolvedValue([strategyAgent]);
+    mockAgentService.getChainOfCommand.mockResolvedValue([]);
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: strategyAgent });
+    mockAccessService.getMembership.mockResolvedValue({
+      id: "membership-1",
+      companyId,
+      principalType: "agent",
+      principalId: agentId,
+      status: "active",
+      membershipRole: "member",
+      createdAt: new Date("2026-03-19T00:00:00.000Z"),
+      updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+    });
+    mockAccessService.listPrincipalGrants.mockResolvedValue([]);
+    mockAccessService.canUser.mockResolvedValue(true);
+    mockCompanySkillService.listRuntimeSkillEntries.mockResolvedValue([]);
+    mockSecretService.normalizeAdapterConfigForPersistence.mockImplementation(async (_companyId: string, config: unknown) => config);
+    mockLogActivity.mockResolvedValue(undefined);
+  });
+
+  it("GET /agents/:id withholds the commands from a peer that cleared agent_config:read", async () => {
+    // THE REGRESSION. `agents:configure` buys the row; it does not buy the commands.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": false,
+    }));
+    const peer = { ...strategyAgent, id: peerAgentId };
+    mockAgentService.getById.mockResolvedValue(peer);
+    mockAgentService.resolveByReference.mockResolvedValue({ ambiguous: false, agent: peer });
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(`/api/agents/${peerAgentId}`);
+
+    expect(res.status).toBe(200);
+    const strategy = res.body.adapterConfig.workspaceStrategy;
+    expect(strategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(strategy.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(strategy.worktreeParentDir).toBe(REDACTED_EVENT_VALUE);
+    // The restricted projection would have answered `{}`. This is a MASK, so everything the
+    // peer-read policy already allows still crosses — the two are different mechanisms and a
+    // fix to one is not a fix to the other (PEN-2839 / PEN-4775).
+    expect(strategy.type).toBe("git_worktree");
+    expect(strategy.runScope).toBe("per_issue");
+    expect(strategy.baseRef).toBe("main");
+    expect(strategy.branchTemplate).toBe("agent/{issue}");
+    expect(res.body.adapterConfig.cwd).toBe("/workspace");
+    expect(JSON.stringify(res.body)).not.toContain("prov_secret_13579");
+    expect(JSON.stringify(res.body)).not.toContain("tear_secret_24680");
+  });
+
+  it("GET /agents/:id withholds the commands on SELF-read too", async () => {
+    // The decision PEN-5225 left open, recorded here as a test rather than only in prose. Self
+    // is exempt from `agent_config:read` (`canReadSensitiveDetail = isSelf ? true : …`) and is
+    // NOT exempt from this one: the agent never executes these strings, cannot write them on its
+    // own row either, and could otherwise republish them into a company-readable issue thread.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": false,
+      "agent:read": true,
+      "workspace_runtime:read": false,
+    }));
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(`/api/agents/${agentId}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(res.body.adapterConfig.workspaceStrategy.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("GET /agents/:id discloses the commands to a reader that clears workspace_runtime:read", async () => {
+    // The other direction, and the reason this is a viewer gate rather than an unconditional
+    // mask: an active non-viewer company member configures these strings and has to read them
+    // back. Withholding from them would be a product regression, not a narrowing.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": true,
+    }));
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.workspaceStrategy.provisionCommand).toBe(PROVISION);
+    expect(res.body.adapterConfig.workspaceStrategy.teardownCommand).toBe(TEARDOWN);
+    expect(res.body.adapterConfig.workspaceStrategy.worktreeParentDir).toBe(PARENT_DIR);
+  });
+
+  it("GET /companies/:companyId/agents withholds the commands on the list route too", async () => {
+    // Gating the detail route and leaving the list open is the failure shape this whole series
+    // exists to close; the same (viewer, subject) pair must get one answer from both.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": false,
+    }));
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(`/api/companies/${companyId}/agents`);
+
+    expect(res.status).toBe(200);
+    expect(res.body[0].adapterConfig.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("GET /agents/:id/configuration withholds the commands", async () => {
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": false,
+    }));
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(`/api/agents/${agentId}/configuration`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+  });
+
+  it("withholds a command nested under runtimeConfig.modelProfiles.*.adapterConfig", async () => {
+    // `agentModelProfileConfigSchema.adapterConfig` is an open `z.record`, so the identical
+    // object is storable one key over through the ordinary API. A mask that read only
+    // `adapterConfig.workspaceStrategy` would have shipped with this sibling carrier open.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": false,
+    }));
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { cwd: "/workspace" },
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: { enabled: true, adapterConfig: { workspaceStrategy: { provisionCommand: PROVISION } } },
+        },
+      },
+    });
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(`/api/agents/${agentId}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.runtimeConfig.modelProfiles.cheap.adapterConfig.workspaceStrategy.provisionCommand)
+      .toBe(REDACTED_EVENT_VALUE);
+    expect(JSON.stringify(res.body)).not.toContain("prov_secret_13579");
+  });
+
+  it("keeps withheld distinguishable from not-configured and from absent", async () => {
+    // The PEN-4775 rule. `null` means "no command configured" and must stay `null`; an absent
+    // key must stay absent; only a real value becomes the sentinel. A reader that cannot tell
+    // the three apart cannot act on any of them.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": false,
+    }));
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: {
+        workspaceStrategy: { type: "git_worktree", provisionCommand: null, teardownCommand: TEARDOWN },
+      },
+      runtimeConfig: {},
+    });
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(`/api/agents/${agentId}`);
+
+    expect(res.status).toBe(200);
+    const strategy = res.body.adapterConfig.workspaceStrategy;
+    expect(strategy.provisionCommand).toBeNull();
+    expect(strategy.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(Object.hasOwn(strategy, "worktreeParentDir")).toBe(false);
+  });
+
+  it("masks a non-object workspaceStrategy whole rather than spreading it", async () => {
+    // `adapter_config` is raw `jsonb` with no shape guarantee at any layer, so the key can hold
+    // a string or an array. Spreading a string would emit its characters one index at a time.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": false,
+    }));
+    mockAgentService.getById.mockResolvedValue({
+      ...baseAgent,
+      adapterConfig: { workspaceStrategy: PROVISION },
+      runtimeConfig: {},
+    });
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(`/api/agents/${agentId}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body.adapterConfig.workspaceStrategy).toBe(REDACTED_EVENT_VALUE);
+    expect(JSON.stringify(res.body)).not.toContain("prov_secret_13579");
+  });
+
+  it("restores the stored command when a masked config is PATCHed back", async () => {
+    // The BLO-5xxx hazard: a sentinel written back into live config killed every run. No new
+    // guard was needed because this mask reuses `REDACTED_EVENT_VALUE`, which
+    // `stripRedactedEnvBindingsFromAdapterConfig` already substring-tests — but that is the
+    // claim, so it is pinned rather than assumed.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent_config:update": true,
+      "agent:read": true,
+      "agents:configure": true,
+      "workspace_runtime:read": false,
+    }));
+    mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...strategyAgent,
+      ...patch,
+    }));
+
+    const app = createApp(boardActor);
+    const res = await request(app)
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        adapterConfig: {
+          cwd: "/workspace",
+          workspaceStrategy: {
+            type: "git_worktree",
+            worktreeParentDir: REDACTED_EVENT_VALUE,
+            provisionCommand: REDACTED_EVENT_VALUE,
+            teardownCommand: REDACTED_EVENT_VALUE,
+          },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    const persisted = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, any>;
+    expect(persisted.adapterConfig.workspaceStrategy.provisionCommand).toBe(PROVISION);
+    expect(persisted.adapterConfig.workspaceStrategy.teardownCommand).toBe(TEARDOWN);
+    expect(persisted.adapterConfig.workspaceStrategy.worktreeParentDir).toBe(PARENT_DIR);
+  });
+
+  // The two OTHER paths that reach the same restore walk. The top-level case above pins
+  // `stripRedactedEnvBindingsFromAdapterConfig`; these reach `restoreRedactedRuntimeConfigValues`
+  // and the whole-value sentinel respectively. Each is a distinct function, so passing the first
+  // is not evidence for either — and a round-trip that failed here would persist the sentinel as
+  // the live command, which is the BLO-5xxx outage shape rather than a cosmetic bug.
+  it("restores a nested modelProfiles command when a masked runtimeConfig is PATCHed back", async () => {
+    const nestedAgent = {
+      ...strategyAgent,
+      runtimeConfig: {
+        modelProfiles: {
+          cheap: {
+            adapterConfig: {
+              cwd: "/workspace",
+              workspaceStrategy: { type: "git_worktree", provisionCommand: PROVISION, teardownCommand: TEARDOWN },
+            },
+          },
+        },
+      },
+    };
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent_config:update": true,
+      "agent:read": true,
+      "agents:configure": true,
+      "workspace_runtime:read": false,
+    }));
+    mockAgentService.getById.mockResolvedValue(nestedAgent);
+    mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...nestedAgent,
+      ...patch,
+    }));
+
+    const res = await request(createApp(boardActor))
+      .patch(`/api/agents/${agentId}`)
+      .send({
+        runtimeConfig: {
+          modelProfiles: {
+            cheap: {
+              adapterConfig: {
+                cwd: "/workspace",
+                workspaceStrategy: {
+                  type: "git_worktree",
+                  provisionCommand: REDACTED_EVENT_VALUE,
+                  teardownCommand: REDACTED_EVENT_VALUE,
+                },
+              },
+            },
+          },
+        },
+      });
+
+    expect(res.status).toBe(200);
+    const persisted = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, any>;
+    const nested = persisted.runtimeConfig.modelProfiles.cheap.adapterConfig.workspaceStrategy;
+    expect(nested.provisionCommand).toBe(PROVISION);
+    expect(nested.teardownCommand).toBe(TEARDOWN);
+  });
+
+  it("restores a non-object workspaceStrategy from the whole-value sentinel", async () => {
+    // Masked WHOLE on read (spreading a string would emit its characters), so the round-trip
+    // sends back a bare sentinel where an object normally sits. The restore has to put the stored
+    // string back rather than persist "***REDACTED***" as the strategy.
+    const scalarAgent = {
+      ...strategyAgent,
+      adapterConfig: { cwd: "/workspace", workspaceStrategy: PROVISION },
+    };
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent_config:update": true,
+      "agent:read": true,
+      "agents:configure": true,
+      "workspace_runtime:read": false,
+    }));
+    mockAgentService.getById.mockResolvedValue(scalarAgent);
+    mockAgentService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...scalarAgent,
+      ...patch,
+    }));
+
+    const res = await request(createApp(boardActor))
+      .patch(`/api/agents/${agentId}`)
+      .send({ adapterConfig: { cwd: "/workspace", workspaceStrategy: REDACTED_EVENT_VALUE } });
+
+    expect(res.status).toBe(200);
+    const persisted = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, any>;
+    expect(persisted.adapterConfig.workspaceStrategy).toBe(PROVISION);
+  });
+});
+
 // PEN-5253. The accepted residual, pinned on BOTH sides so it stops living only
 // in a docblock.
 //

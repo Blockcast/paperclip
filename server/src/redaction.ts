@@ -741,7 +741,12 @@ export function redactApprovalPayloadByType(type: unknown, payload: unknown): Re
   return redactEventPayload(payload) ?? {};
 }
 
-const WITHHELD_AGENT_CONFIG_KEYS = new Set(["adapterConfig", "runtimeConfig"]);
+/**
+ * The agent-config pair, as one list. Exported so `maskUnwalkableAgentConfigForRead`
+ * (`agent-redaction.ts`) classifies the SAME two keys this gate withholds rather than restating
+ * them — a second copy of the key list is how the two gates would drift apart.
+ */
+export const WITHHELD_AGENT_CONFIG_KEYS = new Set(["adapterConfig", "runtimeConfig"]);
 
 /**
  * Authorization filter for the approval read paths. Distinct in kind from the
@@ -1470,6 +1475,80 @@ export function maskWorkspaceRuntimeForRead(value: unknown): unknown {
  */
 export function maskWorkspaceRuntimeTextForRead(value: string | null): string | null {
   return value === null ? null : REDACTED_EVENT_VALUE;
+}
+
+/**
+ * PEN-5225. The ONE classifier of which keys on a workspace *strategy* reach a shell.
+ *
+ * `publicExecutionWorkspaceStrategy` (`routes/workspace-response.ts`) used to spell this list out
+ * inline, which was fine while the strategy object only ever reached a response through a workspace,
+ * project or issue row — all of which pass that module's boundary. It does not: the SAME object is a
+ * sub-key of an agent's `adapter_config`, a raw `jsonb` column that reaches
+ * `GET /api/agents/:id` through `agent-redaction.ts` and never touches the route layer at all. The
+ * write side already knew that (`collectAgentAdapterWorkspaceCommandPaths` addresses it by exactly
+ * that path and refuses every agent mutation of it); the read side did not, so a peer holding
+ * `agents:configure` or `agents:suggest-changes` received `provisionCommand` in the clear — the same
+ * bytes `workspace_runtime:read` withholds from every agent everywhere else.
+ *
+ * Both layers now share this function rather than each knowing the key list. That is the point:
+ * `agent-redaction.ts` is a deliberate leaf that imports only this module (PEN-3757), so it cannot
+ * reach `routes/workspace-response.ts`, and the alternative was a second copy of the classification —
+ * which is how a key ends up withheld on one exit and disclosed on another. Same placement reasoning
+ * as `restoreWithheldPipelineStageConfig` below: the shared rule lives here because the layer that
+ * must apply it cannot import from routes.
+ *
+ * Membership is the PEN-3073 rule — **a string this control plane hands to a shell is withheld,
+ * wherever it is stored and whatever it is named** — not a list of field names that happened to be
+ * found. `provisionCommand` / `teardownCommand` are executed as `bash -lc <string>`
+ * (`services/environment-run-orchestrator.ts`), which makes an inline `FOO_TOKEN=… ./deploy.sh` an
+ * ordinary idiom. `worktreeParentDir` joins them as an operator-authored host path that no caller
+ * needs to reach its own tree. `type` / `runScope` are closed enums and `baseRef` / `branchTemplate`
+ * are git refs the branch-naming UI renders; they are deliberately NOT here, and
+ * `publicExecutionWorkspaceStrategy`'s docblock is where that call is recorded.
+ *
+ * Behaviour is `maskWorkspaceRuntimeTextForRead`'s, unchanged, so withheld-is-not-absent survives at
+ * three levels: an absent key stays absent, a `null` stays `null` ("not configured"), and anything
+ * else becomes the sentinel ("withheld"). A reader that cannot tell those apart is the failure
+ * PEN-4775 spent an hour on.
+ *
+ * Non-string values are masked rather than passed through. On the typed call site they cannot occur;
+ * on the agent one the column has no shape guarantee at any layer, so this fails closed instead of
+ * trusting the declared type.
+ *
+ * Spread-based, and that is load-bearing for the agent caller: every key the caller stored survives,
+ * so masking cannot silently delete an unclassified sibling on a column whose key set is open.
+ * Spread also defines `__proto__` as an own data property rather than invoking the inherited setter,
+ * so a `JSON.parse`d strategy carrying that key keeps it (PEN-4240) — and the writes below route
+ * through `assignRecordKey` for the same reason.
+ */
+const WORKSPACE_STRATEGY_SHELL_TEXT_KEYS = [
+  "provisionCommand",
+  "teardownCommand",
+  "worktreeParentDir",
+] as const;
+
+export function maskWorkspaceStrategyShellTextForRead<T extends object>(strategy: T): T {
+  const masked = { ...strategy } as Record<string, unknown>;
+  for (const key of WORKSPACE_STRATEGY_SHELL_TEXT_KEYS) {
+    // OWN-property read, not `strategy[key]`. None of the three names exists on
+    // `Object.prototype` today, so the bare lookup happens to be equivalent — but this is the
+    // read half of the `__proto__` hazard `ownRecordValue` documents, and the failure direction
+    // is the bad one: an inherited hit would mask a key the row never carried, manufacturing a
+    // "withheld" where the honest answer is "absent".
+    if (!Object.prototype.hasOwnProperty.call(strategy, key)) continue;
+    const value = (strategy as Record<string, unknown>)[key];
+    // A present-but-`undefined` key is left exactly as the spread found it: inventing a sentinel
+    // for a key that was never set is the other half of withheld-is-not-absent, read in reverse.
+    if (value === undefined) continue;
+    assignRecordKey(
+      masked,
+      key,
+      typeof value === "string" || value === null
+        ? maskWorkspaceRuntimeTextForRead(value)
+        : REDACTED_EVENT_VALUE,
+    );
+  }
+  return masked as T;
 }
 
 /**

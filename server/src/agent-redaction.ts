@@ -1,4 +1,13 @@
-import { REDACTED_EVENT_VALUE, isPlainObject, redactAgentConfigPayload } from "./redaction.js";
+import {
+  REDACTED_EVENT_VALUE,
+  isPlainObject,
+  maskWorkspaceRuntimeForRead,
+  maskWorkspaceStrategyShellTextForRead,
+  redactAgentConfigPayload,
+  redactApprovalPayloadForDisplay,
+  WITHHELD_AGENT_CONFIG_KEYS,
+  withholdAgentConfigFromApprovalPayload,
+} from "./redaction.js";
 import { assignRecordKey, ownRecordValue } from "./record-keys.js";
 
 /**
@@ -49,10 +58,272 @@ function asRecord(value: unknown): Record<string, unknown> | null {
  *                 prototype). Withheld rather than emitted uncontained.
  *   otherwise   — the redacted record.
  */
-export function containAgentConfig(value: unknown): Record<string, unknown> | undefined {
+export function containAgentConfig(
+  value: unknown,
+  viewer: AgentWorkspaceCommandViewer = WITHHELD_AGENT_WORKSPACE_COMMAND_VIEWER,
+): Record<string, unknown> | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   if (!isPlainObject(value)) return {};
-  return redactAgentConfigPayload(value) ?? {};
+  const contained = redactAgentConfigPayload(value) ?? {};
+  return maskAgentWorkspaceStrategyCommands(contained, viewer) as Record<string, unknown>;
+}
+
+/**
+ * PEN-5225 — the entitlement for host-executed workspace command strings inside an agent config.
+ *
+ * Structurally `WorkspaceRuntimeViewer` (`routes/workspace-response.ts`), and callers pass that
+ * value straight through. It is restated rather than imported because this module is a deliberate
+ * leaf that imports only `./redaction.js` (PEN-3757): `services/agents.ts` depends on it, and a
+ * service importing from the route layer inverts the layering and closes an import cycle. A
+ * structural type costs nothing at the call site and keeps that property.
+ *
+ * `revealRuntimeConfig` is `workspace_runtime:read` and nothing else. Resolve it with
+ * `resolveWorkspaceRuntimeViewer`; never re-derive it from a role or a permission key, which is the
+ * substitution `routes/workspace-response.ts`'s header records as already falsified once.
+ */
+export interface AgentWorkspaceCommandViewer {
+  revealRuntimeConfig: boolean;
+}
+
+/** Withholds by default: a caller that proves nothing gets the masked projection. */
+export const WITHHELD_AGENT_WORKSPACE_COMMAND_VIEWER: AgentWorkspaceCommandViewer = {
+  revealRuntimeConfig: false,
+};
+
+/**
+ * PEN-5225. Withhold every host-executed workspace command string reachable inside an agent config
+ * from a reader that cannot clear `workspace_runtime:read`.
+ *
+ * ## The hole this closes
+ *
+ * `workspaceStrategy` is a key inside an agent's `adapter_config`. The WRITE side has always known
+ * that — `collectAgentAdapterWorkspaceCommandPaths` (`routes/workspace-command-authz.ts`) addresses
+ * it by exactly that path, and `assertNoAgentHostWorkspaceCommandMutation` refuses the mutation for
+ * every agent actor, on itself included. The READ side did not: `redactAgentSecrets` masks
+ * `adapterConfig.env` values and the MCP `Authorization` header and never touched
+ * `workspaceStrategy`, so `provisionCommand` left `GET /api/agents/:id` in the clear for any peer
+ * holding `agents:configure` or `agents:suggest-changes` (the two grants that clear
+ * `agent_config:read` — `docs/security/agent-config-read-model.md`). Those are the same bytes:
+ * `buildReusedExecutionWorkspaceConfigPatchFromIssueSettings` (`services/issues.ts`) copies
+ * `workspaceStrategy.provisionCommand` straight onto `config.provisionCommand`, which is executed as
+ * `bash -lc <string>`. Every other route carrying them withholds them, and no agent can hold
+ * `workspace_runtime:read` at all (PEN-2852), so the agents route was a strictly WIDER door onto a
+ * subset of what the narrower one refuses.
+ *
+ * ## Self-read is NOT exempt, and that is a decision, not an oversight
+ *
+ * PEN-5225 left open whether an agent reading its OWN `workspaceStrategy` commands should see them,
+ * noting `GET /api/agents/me` discloses other fields to self. It should not, and this masks on the
+ * entitlement alone with no self-ness branch. Three reasons, in order of weight:
+ *
+ *  1. The agent is not the executor. `provisionCommand` is run by the control plane
+ *     (`services/environment-run-orchestrator.ts`), never by the agent, so no agent consumer needs
+ *     the value — which is precisely the test that KEEPS `ExecutionWorkspace.cwd` disclosed in
+ *     `routes/workspace-response.ts`. These two fail it.
+ *  2. The read-to-edit round-trip that entitles human operators does not exist here. The write guard
+ *     keys on `req.actor.type === "agent"`, not on peer-ness, so an agent cannot write these fields
+ *     on its own row either; disclosing them to self would buy a read with no write it enables.
+ *  3. Self-read reopens the same bytes one hop later. An agent that can read its own
+ *     `provisionCommand` can post it into an issue thread, which is company-readable — the hazard
+ *     PEN-5225's interim handling exists to route around.
+ *
+ * One predicate, not two, also means there is no self-ness test to get wrong: PEN-4775 is the
+ * standing example of a self-exemption that was right on one route and wrong on its sibling.
+ *
+ * ## Keyed on reaching a shell, not on a field-name list
+ *
+ * The leaf classification is `maskWorkspaceStrategyShellTextForRead` (`./redaction.js`), shared with
+ * `publicExecutionWorkspaceStrategy` — one list, two layers. Enumerating the two command names here
+ * instead is what left `workspaceStrategy` out of `redactAgentSecrets` in the first place.
+ *
+ * The walk is recursive and keys on the `workspaceStrategy` key at ANY depth, rather than reading
+ * `adapterConfig.workspaceStrategy` and stopping. That is not speculative width — the write side
+ * already refuses the nested carrier by name: `assertNoAgentAdapterConfigMutation` is applied to
+ * each model profile's config too, and `agent-permissions-routes.test.ts` pins the 403 on
+ * `runtimeConfig.modelProfiles.cheap.adapterConfig.workspaceStrategy.provisionCommand`. So a
+ * top-level-only read mask would have shipped with a carrier the project demonstrably treats as
+ * privileged left open one key over, which is the one-of-twelve failure
+ * `routes/workspace-response.ts` records. The read walk is deliberately WIDER than the write
+ * enumeration (any depth, not `modelProfiles.cheap` specifically) because
+ * `agentModelProfileConfigSchema.adapterConfig` is an open `z.record(z.string(), z.unknown())`
+ * (`packages/shared/src/validators/agent.ts`) and a non-API writer — import, seed, direct SQL — is
+ * not gated by the route guard at all. Wider fails closed; narrower fails the way this row was
+ * filed about.
+ *
+ * A `workspaceStrategy` whose value is not a plain object — array, scalar, foreign prototype — is
+ * masked WHOLE via `maskWorkspaceRuntimeForRead` rather than spread, matching
+ * `publicIssueExecutionWorkspaceSettings`. Spreading a string would emit its characters.
+ *
+ * ## Withheld-is-not-absent
+ *
+ * Preserved at every level. Unrelated keys ride through untouched (this is a mask over an open
+ * column, not a projection of a closed type, so deleting an unclassified sibling would be a data
+ * loss, not a withholding); an absent command key stays absent; `null` stays `null`; anything else
+ * becomes `REDACTED_EVENT_VALUE`. Reusing that sentinel rather than inventing one is also what makes
+ * the write side already correct: `containsRedactedAdapterValue` / `restoreRedactedAdapterValue`
+ * below substring-test for exactly it, so a client that reads a masked config, edits an unrelated
+ * field and `PATCH`es the object back has the stored command restored instead of overwritten — the
+ * BLO-5xxx failure mode, which needed no new guard here only because the sentinel is shared.
+ *
+ * No depth cap, deliberately. `sanitizeValue` already recurses this same value unbounded, so a cap
+ * here would add a disclosure edge (a `workspaceStrategy` past the cap) without removing a stack
+ * risk that the composed call does not already carry.
+ */
+export function maskAgentWorkspaceStrategyCommands(
+  value: unknown,
+  viewer: AgentWorkspaceCommandViewer = WITHHELD_AGENT_WORKSPACE_COMMAND_VIEWER,
+): unknown {
+  if (viewer.revealRuntimeConfig) return value;
+  return maskAgentWorkspaceStrategyCommandsInner(value);
+}
+
+function maskAgentWorkspaceStrategyCommandsInner(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(maskAgentWorkspaceStrategyCommandsInner);
+  // A non-plain-object subtree (foreign prototype) is returned BY REFERENCE and therefore
+  // unmasked. That is unreachable from every caller today because each one composes this walk
+  // after `redactAgentConfigPayload` / `redactApprovalPayloadForDisplay`, and `sanitizeRecord`
+  // emits only plain objects and arrays. It is called out because the failure is silent: a future
+  // caller that hands a RAW column value straight in gets its `workspaceStrategy` back in the
+  // clear with no error. Compose this after the sanitizer, or admit through `containAgentConfig`,
+  // which withholds the unsanitizable shapes rather than passing them through.
+  if (!isPlainObject(value)) return value;
+  const projected: Record<string, unknown> = {};
+  for (const [key, child] of Object.entries(value)) {
+    // `assignRecordKey` for the same reason every other accumulator at this boundary uses it: a
+    // bare `projected[key] = …` DROPS a key named `__proto__`, and `JSON.parse` makes that a real
+    // own key on any jsonb column (PEN-4240). Dropping discloses less, but it breaks the
+    // withheld-is-not-absent rule this walk exists to hold.
+    assignRecordKey(
+      projected,
+      key,
+      key === "workspaceStrategy"
+        ? (isPlainObject(child)
+            ? maskWorkspaceStrategyShellTextForRead(child)
+            : maskWorkspaceRuntimeForRead(child))
+        : maskAgentWorkspaceStrategyCommandsInner(child),
+    );
+  }
+  return projected;
+}
+
+/**
+ * PEN-5225 round 3 — fail closed on an agent-config shape the command mask cannot walk into.
+ *
+ * {@link maskAgentWorkspaceStrategyCommands} finds `workspaceStrategy` by descending plain
+ * objects and arrays. `approvalPayloadSchema` is a `.catchall(z.unknown())`, so
+ * `POST /companies/:companyId/approvals` and the resubmit route persist whatever the filer sent:
+ * an `adapterConfig` that arrives as a JSON-ENCODED STRING carries `provisionCommand` in bytes
+ * that walk cannot reach, and hands them back unmasked.
+ *
+ * The reader this protects is the only one it can be: a caller that clears `agent_config:read`
+ * and not `workspace_runtime:read`. A caller that clears neither is already covered at any shape,
+ * because `withholdAgentConfigKeys` blanks the pair to `{}` by this same `.catchall` reasoning —
+ * entitlement must not depend on shape. This closes the matching hole one gate down, where
+ * entitlement is granted but the mask is shape-dependent.
+ *
+ * Blanked, never parsed. Reaching inside the string would make a filer-supplied encoding decide
+ * an authorization outcome, and a failed parse would have to land here regardless.
+ *
+ * `null`/`undefined` stay readable for the reason `withholdAgentConfigKeys` gives: they carry no
+ * commands and are the honest "no config was requested" the board queue renders. Arrays are
+ * blanked even though the mask does descend them, because an element can itself be a string and
+ * an array-valued config is a shape nothing writes server-side — fail closed rather than
+ * enumerate which element types happen to be safe.
+ */
+export function maskUnwalkableAgentConfigForRead(payload: Record<string, unknown>): Record<string, unknown> {
+  if (!isPlainObject(payload)) return payload;
+
+  function walk(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(walk);
+    if (!isPlainObject(value)) return value;
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value)) {
+      const unwalkable =
+        WITHHELD_AGENT_CONFIG_KEYS.has(key)
+        && entry !== null
+        && entry !== undefined
+        && !isPlainObject(entry);
+      // `assignRecordKey` for the reason every accumulator at this boundary uses it: a bare
+      // `out[key] = …` drops a key named `__proto__`, which `JSON.parse` makes a real own key on
+      // any jsonb column (PEN-4240), and dropping breaks withheld-is-not-absent.
+      assignRecordKey(out, key, unwalkable ? REDACTED_EVENT_VALUE : walk(entry));
+    }
+    return out;
+  }
+
+  // Recursing unconditionally is what covers BOTH depths the card carries the pair at —
+  // `payload.adapterConfig` and `payload.requestedConfigurationSnapshot.adapterConfig` — and any
+  // third copy a later writer adds.
+  return walk(payload) as Record<string, unknown>;
+}
+
+/**
+ * PEN-5225 — the ONE read projection for an approval card payload.
+ *
+ * ## Why this is shared rather than restated
+ *
+ * A `hire_agent` card embeds the hire's `adapterConfig` / `runtimeConfig` twice (again under
+ * `requestedConfigurationSnapshot`), and THREE read paths serialize it: `routes/approvals.ts`
+ * (detail, company list, create echo, and every resolution response) and
+ * `services/issue-approvals.ts#listApprovalsForIssue`. Both spelled the same three-step projection
+ * out inline, and the second copy is exactly how this hole stayed open: PEN-5225 masked the
+ * workspace commands at the agent-config admission gate, which closed `GET /api/agents/:id` and
+ * left the approval card — the same bytes, one route over — disclosing them. That is the
+ * two-exits-one-answer split PEN-4775 names. One function means the next finding against this
+ * projection lands on every exit at once.
+ *
+ * ## Two independent gates, and the order they compose in
+ *
+ *  1. `redactApprovalPayloadForDisplay` — what is SECRET (credential values, env bindings).
+ *     Unconditional; no entitlement turns it off.
+ *  2. `includeAgentConfig` — the caller's `agent_config:read` verdict. Blanks the config pair to
+ *     `{}` for a caller that cannot clear it (PEN-2777).
+ *  3. `workspaceCommandViewer` — the caller's `workspace_runtime:read` verdict, masking the
+ *     host-executed strings inside a config the caller IS entitled to read. Runs in two parts:
+ *     `maskUnwalkableAgentConfigForRead` blanks a config whose SHAPE the mask cannot descend
+ *     (a JSON-encoded string), then `maskAgentWorkspaceStrategyCommands` masks the commands
+ *     inside the shapes it can. Splitting shape from content is what keeps the second half from
+ *     having to parse filer-supplied bytes to reach an authorization outcome.
+ *
+ * Gates 2 and 3 are independent and a reader can clear either without the other: `agents:configure`
+ * and `agents:suggest-changes` clear `agent_config:read`, while NO agent can hold
+ * `workspace_runtime:read` at all (PEN-2852). A mock that answers one boolean for both cannot see
+ * the bug this closes, which is why the regression tests resolve them separately.
+ *
+ * The mask runs LAST, over the already-withheld payload, so it covers a `workspaceStrategy`
+ * carried anywhere in the card — not only inside the two keys gate 2 knows about. It is scoped to
+ * `hire_agent` for the same reason gate 2 is: that is the type whose payload is agent-config-shaped.
+ * Another type's payload is filer-authored prose and is left exactly as `redactEventPayload` made it.
+ *
+ * `workspaceCommandViewer` defaults to WITHHELD, matching every other viewer in this module: a read
+ * path added later that does not resolve the verdict masks rather than discloses.
+ */
+export function projectApprovalPayloadForRead(
+  type: unknown,
+  rawPayload: Record<string, unknown>,
+  options: {
+    includeAgentConfig: boolean;
+    workspaceCommandViewer?: AgentWorkspaceCommandViewer;
+  },
+): { payload: Record<string, unknown>; redactedFields: string[]; withheldFields: string[] } {
+  const { payload, redactedFields } = redactApprovalPayloadForDisplay(type, rawPayload);
+  const admitted = options.includeAgentConfig
+    ? { payload, withheldFields: [] as string[] }
+    : withholdAgentConfigFromApprovalPayload(type, payload);
+  if (type !== "hire_agent") {
+    return { payload: admitted.payload, redactedFields, withheldFields: admitted.withheldFields };
+  }
+  const viewer = options.workspaceCommandViewer ?? WITHHELD_AGENT_WORKSPACE_COMMAND_VIEWER;
+  // Gate 3a, ahead of the walk: blank a config the walk cannot descend. No-op for a revealing
+  // viewer, and a no-op after gate 2 as well, whose `{}` is a plain object.
+  const walkable = viewer.revealRuntimeConfig
+    ? admitted.payload
+    : maskUnwalkableAgentConfigForRead(admitted.payload);
+  return {
+    payload: maskAgentWorkspaceStrategyCommands(walkable, viewer) as Record<string, unknown>,
+    redactedFields,
+    withheldFields: admitted.withheldFields,
+  };
 }
 
 /**
@@ -206,10 +477,19 @@ export function containAgentMetadata(value: unknown): unknown {
  * Every response that serializes an agent MUST go through here,
  * `redactForRestrictedAgentView`, or `redactAgentConfiguration`. Adding an
  * agent-serializing route without one of them reopens this hole.
+ *
+ * PEN-5225 added the `viewer` parameter, which gates the host-executed
+ * workspace command strings described on
+ * {@link maskAgentWorkspaceStrategyCommands}. It DEFAULTS TO WITHHELD, and that
+ * polarity is the point: a new call site that forgets it masks those strings
+ * rather than disclosing them, so the omission is survivable in the direction
+ * this file's history keeps failing in. Pass a resolved
+ * `resolveWorkspaceRuntimeViewer` result only where an entitled human has to
+ * keep reading the value — the agent-config read and round-trip routes.
  */
 export function redactAgentSecrets<
   T extends { adapterConfig?: unknown; runtimeConfig?: unknown; metadata?: unknown },
->(agent: T): T {
+>(agent: T, viewer: AgentWorkspaceCommandViewer = WITHHELD_AGENT_WORKSPACE_COMMAND_VIEWER): T {
   const result = { ...agent };
   // `containAgentConfig`, not the local `asRecord`: `asRecord` admits any
   // non-array object, and for a foreign-prototype config the redactor handed
@@ -217,7 +497,7 @@ export function redactAgentSecrets<
   // raw record. See the helper for why swapping the predicate alone would
   // have moved the leak rather than closed it.
   const rawConfig = agent.adapterConfig;
-  const containedConfig = containAgentConfig(rawConfig);
+  const containedConfig = containAgentConfig(rawConfig, viewer);
   if (containedConfig) {
     const env = isPlainObject(rawConfig) ? asRecord(rawConfig.env) : null;
     if (env) {
@@ -238,7 +518,7 @@ export function redactAgentSecrets<
       result.adapterConfig = containedConfig as T["adapterConfig"];
     }
   }
-  const containedRuntime = containAgentConfig(agent.runtimeConfig);
+  const containedRuntime = containAgentConfig(agent.runtimeConfig, viewer);
   if (containedRuntime) {
     result.runtimeConfig = containedRuntime as T["runtimeConfig"];
   }

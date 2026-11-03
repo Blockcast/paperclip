@@ -11634,7 +11634,9 @@ export function issueRoutes(
     if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(id, {
+      // Two independent gates — see `projectApprovalPayloadForRead`. PEN-5225.
       includeAgentConfig: await actorCanReadAgentConfig(req, access, issue.companyId),
+      workspaceCommandViewer: await resolveWorkspaceRuntimeViewer(access, req, issue.companyId),
     });
     res.json(approvals);
   });
@@ -11690,7 +11692,9 @@ export function issueRoutes(
     });
 
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(id, {
+      // Two independent gates — see `projectApprovalPayloadForRead`. PEN-5225.
       includeAgentConfig: await actorCanReadAgentConfig(req, access, issue.companyId),
+      workspaceCommandViewer: await resolveWorkspaceRuntimeViewer(access, req, issue.companyId),
     });
     res.status(201).json(approvals);
   });

@@ -11,7 +11,7 @@ import type {
   WorkspaceOperation,
   WorkspaceRuntimeService,
 } from "@paperclipai/shared";
-import { isPlainObject, maskWorkspaceRuntimeForRead, maskWorkspaceRuntimeTextForRead, withholdWorkspaceOperationCapturedOutput } from "../redaction.js";
+import { isPlainObject, maskWorkspaceRuntimeForRead, maskWorkspaceRuntimeTextForRead, maskWorkspaceStrategyShellTextForRead, withholdWorkspaceOperationCapturedOutput } from "../redaction.js";
 import { parseIssueExecutionWorkspaceSettings } from "../services/execution-workspace-policy.js";
 import type { accessService } from "../services/index.js";
 import { maskProjectEnv } from "./project-env-response.js";
@@ -222,18 +222,13 @@ export function publicExecutionWorkspaceStrategy(
 ): ExecutionWorkspaceStrategy | null | undefined {
   if (strategy === null || strategy === undefined) return strategy;
   if (viewer.revealRuntimeConfig) return strategy;
-  return {
-    ...strategy,
-    ...(strategy.worktreeParentDir === undefined
-      ? {}
-      : { worktreeParentDir: maskWorkspaceRuntimeTextForRead(strategy.worktreeParentDir) }),
-    ...(strategy.provisionCommand === undefined
-      ? {}
-      : { provisionCommand: maskWorkspaceRuntimeTextForRead(strategy.provisionCommand) }),
-    ...(strategy.teardownCommand === undefined
-      ? {}
-      : { teardownCommand: maskWorkspaceRuntimeTextForRead(strategy.teardownCommand) }),
-  };
+  // PEN-5225: the key list moved to `maskWorkspaceStrategyShellTextForRead` (`../redaction.ts`) and
+  // is no longer spelled out here. Behaviour is unchanged; what changed is WHO can reach it. The
+  // same strategy object is also a sub-key of an agent's `adapter_config`, which is projected by
+  // `agent-redaction.ts` — a leaf module that imports only `../redaction.js` and so cannot import
+  // this one. Keeping the list inline meant the agent exit had to restate it, and a restated
+  // classification is how `workspaceStrategy` came to be masked here and disclosed there.
+  return maskWorkspaceStrategyShellTextForRead(strategy);
 }
 
 /**

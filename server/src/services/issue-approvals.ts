@@ -2,7 +2,7 @@ import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issues } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
-import { redactApprovalPayloadForDisplay, withholdAgentConfigFromApprovalPayload } from "../redaction.js";
+import { projectApprovalPayloadForRead, type AgentWorkspaceCommandViewer } from "../agent-redaction.js";
 
 interface LinkActor {
   agentId?: string | null;
@@ -42,14 +42,24 @@ export function issueApprovalService(db: Db) {
 
   return {
     /**
-     * `includeAgentConfig` carries the caller's `agent_config:read` verdict —
-     * the same second gate `routes/approvals.ts` applies, because this is the
-     * third path to the same `hire_agent` payload. Defaults to withholding so a
-     * caller that does not resolve the verdict discloses nothing (PEN-2777).
+     * This is the THIRD read path to the same `hire_agent` payload, so it applies the same two
+     * gates `routes/approvals.ts` does, through the same shared projection:
+     *
+     *  - `includeAgentConfig` is the caller's `agent_config:read` verdict (PEN-2777).
+     *  - `workspaceCommandViewer` is the caller's `workspace_runtime:read` verdict, which decides
+     *    the host-executed `workspaceStrategy` command strings inside a config the caller may
+     *    otherwise read (PEN-5225).
+     *
+     * Both default to WITHHOLDING, so a caller that does not resolve a verdict discloses nothing.
+     * That default is load-bearing here: two of this method's five callers read only `status` and
+     * pass no options at all.
      */
     listApprovalsForIssue: async (
       issueId: string,
-      options: { includeAgentConfig?: boolean } = {},
+      options: {
+        includeAgentConfig?: boolean;
+        workspaceCommandViewer?: AgentWorkspaceCommandViewer;
+      } = {},
     ) => {
       const issue = await getIssue(issueId);
       if (!issue) throw notFound("Issue not found");
@@ -74,17 +84,15 @@ export function issueApprovalService(db: Db) {
         .where(eq(issueApprovals.issueId, issueId))
         .orderBy(desc(issueApprovals.createdAt));
       return result.map((approval) => {
-        const { payload, redactedFields } = redactApprovalPayloadForDisplay(approval.type, approval.payload);
-        if (options.includeAgentConfig) {
-          return { ...approval, payload, redactedFields, withheldFields: [] as string[] };
-        }
-        const withheld = withholdAgentConfigFromApprovalPayload(approval.type, payload);
-        return {
-          ...approval,
-          payload: withheld.payload,
-          redactedFields,
-          withheldFields: withheld.withheldFields,
-        };
+        const { payload, redactedFields, withheldFields } = projectApprovalPayloadForRead(
+          approval.type,
+          approval.payload,
+          {
+            includeAgentConfig: options.includeAgentConfig ?? false,
+            workspaceCommandViewer: options.workspaceCommandViewer,
+          },
+        );
+        return { ...approval, payload, redactedFields, withheldFields };
       });
     },
 

@@ -337,6 +337,7 @@ Note also that the strip is **narrow**: `budgetMonthlyCents` and
 `spentMonthlyCents` pass through the restricted projection untouched. Whatever
 the peer rule is for, it is not a general "peer-sensitive data" rule.
 
+
 ### The withheld-is-not-absent signal (`PEN-5230`)
 
 `{}` is a legal **stored** value for both columns, so every `{}` in the table
@@ -441,6 +442,115 @@ the reason live in the module rather than only on the issue. `PEN-5258`
 (`#3267`) narrows `listPrincipalGrants` to an explicit column list, which bounds
 what a grant row *contains*; it does not decide who may read the list, and
 should not be cited as if it had.
+
+### One sub-key of `adapterConfig` has a second, tighter gate (`PEN-5225`)
+
+The table above treats `adapterConfig` as one object. It is not, for one key.
+`adapterConfig.workspaceStrategy.provisionCommand` / `.teardownCommand` /
+`.worktreeParentDir` are host-executed operator text — `provisionCommand` runs
+as `bash -lc <string>` via `services/environment-run-orchestrator.ts`, which
+makes an inline `FOO_TOKEN=… ./deploy.sh` an ordinary idiom — and they are
+**withheld from every actor that cannot clear `workspace_runtime:read`**, on
+top of whatever `agent_config:read` decided about the row.
+
+So the read takes **two** gates, and they are independent:
+
+| Gate | Decides | Reachable by an agent? |
+| --- | --- | --- |
+| `agent_config:read` | whether `adapterConfig` is returned at all, or `{}` | yes — `agents:configure` or `agents:suggest-changes` |
+| `workspace_runtime:read` | whether those three keys inside it are values or the sentinel | **no** — see below |
+
+`workspace_runtime:read` is unreachable by any agent *by construction*: it is
+absent from the blanket same-company agent allow-list in `decideBase`,
+`permissionForAction` returns `null` for it, and it is not a `PermissionKey`,
+so no grant row can confer it (`PEN-2852`). **No agent sees these three values,
+on any route, including on its own row.** Self is exempt from
+`agent_config:read` and is deliberately *not* exempt from this one: the agent
+never executes the string (the control plane does), the write guard
+`assertNoAgentHostWorkspaceCommandMutation` refuses the mutation on its own row
+too, so there is no read-to-edit round trip the disclosure would enable — and a
+self-read could be republished into a company-readable issue thread.
+
+This was a genuine inconsistency until `PEN-5225`, not a restatement of the
+peer question: the write side had always refused these fields to agents while
+`redactAgentSecrets` masked `env` and the MCP `Authorization` header and never
+touched `workspaceStrategy`. The agents route was therefore a strictly *wider*
+door onto a subset of the material every workspace, project, issue and pipeline
+route withholds.
+
+Withheld is distinguishable from not-configured, as everywhere else at this
+boundary: an absent key stays absent, `null` stays `null` ("no command
+configured"), and only a real value becomes `***REDACTED***`. Every other key
+on the strategy — `type`, `runScope`, `baseRef`, `branchTemplate` — crosses
+untouched; the classification is `maskWorkspaceStrategyShellTextForRead`
+(`server/src/redaction.ts`), shared with `publicExecutionWorkspaceStrategy` so
+the two layers cannot drift. The mask is applied at
+`containAgentConfig` / `redactAgentSecrets` (`agent-redaction.ts`), so it covers
+every agent-serializing exit at once, and it **defaults to withheld** — a route
+added without resolving a viewer masks rather than discloses.
+
+The same applies at any depth, not just the top level: the write guard already
+refuses `runtimeConfig.modelProfiles.cheap.adapterConfig.workspaceStrategy.provisionCommand`
+by name, so the read walk matches it (and is wider, since that config is an open
+`z.record` and non-API writers are not gated by the route guard).
+
+#### The gate follows the bytes, not the route (the `hire_agent` card)
+
+An agent config does not only leave through `routes/agents.ts`. A `hire_agent`
+approval card **embeds the hire's `adapterConfig` / `runtimeConfig`** — twice,
+again under `payload.requestedConfigurationSnapshot` — written by
+`POST /api/companies/:companyId/agent-hires` through `redactEventPayload`, which
+has never known about `workspaceStrategy`. Three read paths serialize that
+payload:
+
+| Route | Projection |
+| --- | --- |
+| `GET /api/approvals/:id` | `routes/approvals.ts` |
+| `GET /api/companies/:companyId/approvals` | `routes/approvals.ts` |
+| `GET /api/issues/:id/approvals` | `services/issue-approvals.ts` |
+
+All three take the **same two gates in the same order** as the agents route, via
+one shared projection — `projectApprovalPayloadForRead` (`agent-redaction.ts`):
+`agent_config:read` decides whether the config pair is returned at all or blanked
+to `{}` (`PEN-2777`), and `workspace_runtime:read` then decides whether the three
+`workspaceStrategy` keys inside a config the caller *may* read are values or the
+sentinel (`PEN-5225`).
+
+This mattered because the two gates point **opposite ways for the same reader**.
+A peer holding `agents:configure` clears the first and can never hold the second,
+so until `PEN-5225` it read `provisionCommand` in the clear off the approval card
+while every other route — including `GET /api/agents/:id`, one route over, on the
+same bytes — withheld it. Masking the agents route alone would have closed one
+exit of two and left the finding true (`PEN-4775`'s two-exits-one-answer shape).
+
+Two consequences worth stating, because both are easy to get wrong:
+
+- The mask runs **last**, over the already-withheld payload, so it covers a
+  `workspaceStrategy` carried anywhere in the card rather than only inside the
+  two keys the first gate knows about.
+- The second gate decides **shape before content**. The mask finds
+  `workspaceStrategy` by descending plain objects and arrays, but
+  `approvalPayloadSchema` is a `.catchall(z.unknown())`, so a card filed through
+  `POST /api/companies/:companyId/approvals` can carry `adapterConfig` as a
+  JSON-encoded **string** — commands in bytes that walk cannot reach. So
+  `maskUnwalkableAgentConfigForRead` blanks a config of an undescendable shape to
+  the sentinel first, and only then does the command mask run. Note the
+  *unentitled* reader was never exposed here: `withholdAgentConfigKeys` blanks the
+  pair at any shape, because entitlement must not depend on shape. This closes the
+  matching gap one gate down, where entitlement is granted but the mask was
+  shape-dependent. It is a blank, never a parse: reaching inside the string would
+  let a filer-supplied encoding decide an authorization outcome.
+- It is scoped to `type === "hire_agent"`, exactly as the first gate is. Another
+  approval type's payload is filer-authored prose, not an agent config; masking
+  it would redact an agent's own text about a command rather than withhold a
+  configured one.
+
+A fourth serialization — `approvalResolutionResponse`, the body returned by
+approve/reject/revise — shares the same projection rather than restating it.
+Both verdicts are **required arguments** at that seam and the viewer **defaults
+to withheld**, so a fifth approval-serializing route has to state which side of
+each gate it is on, and one that forgets masks rather than discloses.
+
 
 ### Archaeology
 
@@ -627,6 +737,12 @@ one `PEN-4775` §6 recorded: a seat holding `tools:manage_runtime` can **write**
 a peer's `runtimeConfig` and cannot read it back to verify the write, and that
 asymmetry then needs its own answer.
 
+Note that whichever way it lands, it does **not** reopen the three
+`workspaceStrategy` keys above: those hang off `workspace_runtime:read`, which
+no agent can hold, so "company-readable" would widen the row and not those
+values. `PEN-3206` ratified that posture and `PEN-5225` is the agents route
+catching up to it.
+
 ## Regression tests
 
 - `server/src/__tests__/agent-permissions-routes.test.ts` — `company agent list
@@ -656,6 +772,33 @@ asymmetry then needs its own answer.
 - `server/src/__tests__/agent-secret-redaction.test.ts` — `agent metadata
   containment on the spread-based redactors`: both projections, including that
   the restricted one is reached via a **peer** row.
+
+- `server/src/__tests__/agent-secret-redaction.test.ts` — `agent workspace
+  command withholding (PEN-5225)`: the peer case with `agent_config:read`
+  **allowed** and `workspace_runtime:read` denied (the shipped bug is invisible
+  to a mock that answers one boolean for both), self-read masked, an entitled
+  reader still disclosed, the list and `/configuration` routes, the
+  `modelProfiles` nesting, `null`-vs-sentinel-vs-absent, a non-object
+  `workspaceStrategy`, and the `PATCH` round-trip restoring the stored command
+  instead of persisting the sentinel.
+  Three round-trips are pinned, not one, because each reaches a different
+  restore function: the top-level config
+  (`stripRedactedEnvBindingsFromAdapterConfig`), the `modelProfiles.*`
+  nesting (`restoreRedactedRuntimeConfigValues`), and the whole-value sentinel
+  a non-object `workspaceStrategy` is masked to.
+- `server/src/__tests__/redaction.test.ts` — `hire_agent approval payload
+  workspace-command withholding (PEN-5225)`: the shared projection itself —
+  both copies of the config in the card, the `modelProfiles` nesting, the
+  withheld-by-default polarity, the two gates staying independent and
+  distinguishable, and a non-hire card left untouched.
+- `server/src/__tests__/approval-agent-config-authz-routes.test.ts` —
+  `hire_agent approval reads withhold host-executed workspace commands
+  (PEN-5225)`: the same question at the route layer, for the reader that
+  clears `agent_config:read` and not `workspace_runtime:read`, on
+  `GET /approvals/:id`, the company list, and a resolution response, with a
+  board reader still disclosed. The `workspaceStrategy` carrier sits on the
+  file's **shared** fixture, so every case in it would catch a re-disclosure.
+
 - `server/src/__tests__/agent-permissions-routes.test.ts` — ``the peer `{}`
   says it was withheld (PEN-5230)``, which pins the right-hand matrix column:
   the markers on both peer routes, **absent** on the viewer's own row and for a
@@ -664,3 +807,4 @@ asymmetry then needs its own answer.
   the disclosure-budget proof — whole-body equality between the two subjects,
   behind positive controls so it cannot pass against a build with the markers
   stripped. On `master` since 2026-11-02.
+
