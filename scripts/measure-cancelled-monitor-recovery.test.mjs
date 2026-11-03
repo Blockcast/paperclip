@@ -195,15 +195,27 @@ describe("destroyedDueTimes", () => {
 describe("nextCursor", () => {
   const page = (ids) => ids.map((id) => ({ id }));
 
-  it("stops on a short page, which is the only sound completeness rule", () => {
-    // NOT on the absence of a `truncated` flag: a server predating the envelope
-    // returns a bare array even when the cap bit.
+  it("stops on a short page only when the list did not report more rows", () => {
     assert.deepEqual(nextCursor(page(["a", "b"]), 3, undefined), { done: true, afterId: null });
     assert.deepEqual(nextCursor([], 3, "z"), { done: true, afterId: null });
+    assert.deepEqual(nextCursor(page(["a", "b"]), 3, undefined, false), { done: true, afterId: null });
+  });
+
+  it("keeps walking past a SHORT page that is flagged truncated", () => {
+    // The ACL filter runs after the raw window, so a restricted actor gets a
+    // short page with readable rows still beyond it. Stopping there undercounts
+    // and leaves no trace — the exact failure this file is written against.
+    assert.deepEqual(nextCursor(page(["a", "b"]), 3, undefined, true), { done: false, afterId: "b" });
+  });
+
+  it("throws when the list reports more rows beyond a page it cannot advance past", () => {
+    // Empty AND truncated: more rows exist and there is no cursor to take.
+    assert.throws(() => nextCursor([], 3, "z", true), /cannot advance/);
   });
 
   it("advances to the last id of a full page", () => {
     assert.deepEqual(nextCursor(page(["a", "b", "c"]), 3, undefined), { done: false, afterId: "c" });
+    assert.deepEqual(nextCursor(page(["a", "b", "c"]), 3, undefined, true), { done: false, afterId: "c" });
     assert.deepEqual(nextCursor(page(["d", "e", "f"]), 3, "c"), { done: false, afterId: "f" });
   });
 

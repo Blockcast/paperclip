@@ -207,26 +207,48 @@ export function destroyedDueTimes(activityEvents) {
     }));
 }
 
-async function api(path) {
+async function request(path) {
   const base = (process.env.PAPERCLIP_API_URL ?? "").replace(/\/$/, "");
   const key = process.env.PAPERCLIP_API_KEY;
   if (!base || !key) throw new Error("PAPERCLIP_API_URL and PAPERCLIP_API_KEY are required");
   const res = await fetch(`${base}${path}`, { headers: { Authorization: `Bearer ${key}` } });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText} for ${path}`);
-  return res.json();
+  return { body: await res.json(), truncated: res.headers.get("x-result-truncated") === "true" };
+}
+
+async function api(path) {
+  return (await request(path)).body;
+}
+
+async function apiList(path) {
+  const { body, truncated } = await request(path);
+  return { rows: Array.isArray(body) ? body : (body.issues ?? []), truncated };
 }
 
 /**
  * Keyset cursor step. Pure so the termination rule is testable without a server.
  *
- * Stops on a SHORT PAGE, never on the absence of a `truncated` flag: a bare array
- * exactly as long as the limit is not proof of completeness on a server predating
- * the truncation envelope. A full page whose last id equals the cursor we sent
- * means `afterId` never reached the query, so the walk would re-serve that page
- * forever; that is an error rather than a silent partial scan.
+ * A SHORT PAGE alone does not end the walk, and the version that thought it did
+ * was unsound for exactly the actor most likely to run this. The route applies
+ * its ACL filter AFTER taking the raw window, so for a key without company-scope
+ * read a page can come back short while readable rows remain beyond it -- the
+ * walk stops early and the undercount leaves no trace, which is the failure this
+ * whole file is written against. The route reports that case in
+ * `X-Result-Truncated`, so the stop condition is a short page AND no truncation
+ * flag. The flag's absence is still never treated as proof of completeness on
+ * its own, which is why the short-page test remains.
+ *
+ * A full page whose last id equals the cursor we sent means `afterId` never
+ * reached the query, so the walk would re-serve that page forever; that is an
+ * error rather than a silent partial scan. A page that is BOTH empty and
+ * truncated is the same class of problem -- more rows exist and nothing can
+ * advance past them -- so it throws rather than returning a short count.
  */
-export function nextCursor(rows, pageSize, afterId) {
-  if (rows.length < pageSize) return { done: true, afterId: null };
+export function nextCursor(rows, pageSize, afterId, truncated = false) {
+  if (rows.length < pageSize && !truncated) return { done: true, afterId: null };
+  if (rows.length === 0) {
+    throw new Error("list reported more rows beyond an empty page, so the walk cannot advance");
+  }
   const last = rows[rows.length - 1].id;
   if (last === afterId) {
     throw new Error("keyset cursor did not advance, so afterId is not reaching the list query");
@@ -242,12 +264,11 @@ async function walkList(companyId, extraQuery) {
       throw new Error(`exceeded ${WALK_MAX_PAGES} pages, so the walk is not terminating`);
     }
     const cursor = afterId ? `&afterId=${afterId}` : "";
-    const res = await api(
+    const { rows, truncated } = await apiList(
       `/api/companies/${companyId}/issues?sortField=id&limit=${LIST_PAGE_LIMIT}${extraQuery}${cursor}`,
     );
-    const rows = Array.isArray(res) ? res : (res.issues ?? []);
     out.push(...rows);
-    const step = nextCursor(rows, LIST_PAGE_LIMIT, afterId);
+    const step = nextCursor(rows, LIST_PAGE_LIMIT, afterId, truncated);
     if (step.done) return out;
     afterId = step.afterId;
   }
@@ -336,7 +357,30 @@ async function main() {
   // thing under test, and a stamp-without-carrier reads as a clean pass.
   const carriers = await walkList(companyId, `&originKind=${CARRIER_ORIGIN_KIND}`);
   const { lost, duplicated } = findHandoffFailures(issues, carriers);
-  for (const row of lost) console.error(`LOST: ${row.identifier} ${row.detail}`);
+
+  // `lost` is the decisive reading, so it is re-checked against a targeted query
+  // before it is allowed to exit non-zero. A walk artifact must not be reportable
+  // as a lost obligation: that is a false falsification of #3352, and it is the
+  // most expensive mistake this script can make.
+  //
+  // RESIDUAL, stated rather than silently carried: the list applies
+  // `visibleIssueCondition()`, so a carrier HIDDEN since it was emitted is
+  // invisible to both the walk and this re-check, and still reads as LOST. The
+  // re-check narrows the window to that one case. It is not closed here because
+  // nothing available to this script can see a hidden row -- confirm by hand
+  // before acting on a LOST line.
+  const confirmedLost = [];
+  for (const row of lost) {
+    const source = issues.find((issue) => issue.identifier === row.identifier);
+    const { rows: direct } = await apiList(
+      `/api/companies/${companyId}/issues?originKind=${CARRIER_ORIGIN_KIND}&originId=${source.id}` +
+        `&sortField=id&limit=${LIST_PAGE_LIMIT}`,
+    );
+    if (direct.length === 0) confirmedLost.push(row);
+    else console.error(`RECHECK: ${row.identifier} carrier found by targeted query, not by walk`);
+  }
+
+  for (const row of confirmedLost) console.error(`LOST: ${row.identifier} ${row.detail}`);
   for (const row of duplicated) console.error(`DUPLICATED: ${row.identifier} ${row.detail}`);
 
   console.log(
@@ -345,7 +389,7 @@ async function main() {
       `owed=${summary.owed} emitted=${summary.emitted} ownerless-owed=${summary.ownerlessOwed}`,
   );
   console.log(
-    `carriers=${carriers.length} lost=${lost.length} duplicated=${duplicated.length} ` +
+    `carriers=${carriers.length} lost=${confirmedLost.length} duplicated=${duplicated.length} ` +
       `cancelled-clear-events-on-owed=${clears} carrying-due-time=${withDueTime} ` +
       `unreadable-feeds=${feedFailures.length}`,
   );
@@ -364,7 +408,7 @@ async function main() {
     process.exit(1);
   }
   // A lost obligation is the one reading that falsifies #3352's design.
-  if (lost.length > 0) process.exit(1);
+  if (confirmedLost.length > 0) process.exit(1);
 }
 
 export function isMainModule(argvPath = process.argv[1], moduleUrl = import.meta.url) {
