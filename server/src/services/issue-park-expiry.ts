@@ -80,6 +80,20 @@
  * negative against the DEFAULT branch, never the branch under review: a "no hits" result is
  * only as current as the tree you ran it on, and it fails in the confident direction.
  *
+ * ⚠️ The stale tree is only ONE of the two axes, and the second one bites in this same file,
+ * on this same flag, at a perfectly current `master`. At `ab43454`,
+ * `grep -c productivityReviewDisabled server/src/services/productivity-review.ts` returns 0 —
+ * literally correct, and still the wrong conclusion. The key is never spelled in that file:
+ * it is read inside `isProductivityReviewOptedOut`
+ * (`packages/shared/src/types/issue.ts:781`, `record.productivityReviewDisabled === true`),
+ * which `productivity-review.ts` imports at `:6` under the alias
+ * `isPolicyProductivityReviewOptedOut`, wraps at `:5869-5870`, and applies at `:7118` and
+ * `:6675`. ⇒ a literal-identifier grep is only as good as THE NAME AT THE USE SITE. An
+ * encapsulating predicate and an aliased import of it each break the string while leaving the
+ * behaviour exactly where you were looking for it. Grep the exported predicate and follow its
+ * importers, or ask the type system; never conclude absence from the field name alone.
+ * (Second axis found by @Devops on PEN-5141, 2026-11-03; re-verified here against `ab43454`.)
+ *
  * What is actually true, and it removes the trade-off rather than resolving it:
  *
  *  - `deliberateParkWindow` covers `[parkedAt, min(parkedUntil, now)]`

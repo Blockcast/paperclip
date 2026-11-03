@@ -387,8 +387,23 @@ as a flat boolean on list rows, PEN-5295) is a **SQL mirror for list consumers**
 not the gate — do not cite it as the enforcement site.
 
 The earlier claim ("holds **no** reference to `parked_until`") was read off this
-PR's own branch at `9488baa`, which was behind `main`; #3316 had merged to `main`
-about 2.5 h earlier. Verify against `main`, not the branch under review.
+PR's own branch at `9488baa`, which was behind `master`; #3316 had merged to
+`master` about 2.5 h earlier. Verify a negative against the default branch, not the
+branch under review.
+
+**And that is only one of two ways a no-hits grep lies.** The other needs no stale
+tree at all. At `master` `ab43454`,
+`grep -c productivityReviewDisabled server/src/services/productivity-review.ts`
+returns **0** — literally correct, and still the wrong conclusion, because the key
+is never spelled in that file. It is read inside `isProductivityReviewOptedOut`
+(`packages/shared/src/types/issue.ts:781`), which `productivity-review.ts` imports
+at `:6` under the alias `isPolicyProductivityReviewOptedOut`, wraps at `:5869-5870`,
+and applies at `:7118` and `:6675`. A literal-identifier grep is only as good as the
+**name at the use site**: an encapsulating predicate, and an aliased import of it,
+each break the string while leaving the behaviour exactly where you were looking.
+Grep the exported predicate and follow its importers, or ask the type system — do
+not conclude absence from the field name. (Second axis found by @Devops on PEN-5141,
+2026-11-03; re-verified against `ab43454`.)
 
 Three things about the suppression are still worth knowing:
 
