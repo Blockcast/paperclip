@@ -8698,13 +8698,22 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
  *
  * `warnings` is bound BY REFERENCE for the same reason the context object
  * binds it that way: callers keep pushing onto `runtimeWorkspaceWarnings`
- * after this returns.
+ * after this returns, and the adapter does not serialise the payload until
+ * dispatch.
+ *
+ * ⚠️ Which is why this ALWAYS returns a patch and never null, even when there
+ * is nothing to say yet. An earlier revision returned null for "no branch and
+ * no warnings", and that silently dropped every warning appended after this
+ * point -- the session-reset notices a few hundred lines below, for one. The
+ * array is live; the object holding it has to exist for the late entries to
+ * have anywhere to arrive. An all-empty patch costs nothing: the wake
+ * normalizer discards an execution workspace with no branch and no warnings,
+ * so the payload still reads as absent downstream.
  */
 export function buildPaperclipWakeExecutionWorkspacePatch(input: {
   branchName: string | null;
   warnings: string[];
-}): { branchName: string | null; warnings: string[] } | null {
-  if (!input.branchName && input.warnings.length === 0) return null;
+}): { branchName: string | null; warnings: string[] } {
   return { branchName: input.branchName, warnings: input.warnings };
 }
 
@@ -35990,17 +35999,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // and delivered to nobody. The wake payload is different in kind: every
     // adapter projects it whole and renders it into the prompt, which is where
     // the warning text was always written to be read.
-    const wakeExecutionWorkspacePatch = buildPaperclipWakeExecutionWorkspacePatch({
-      branchName: executionWorkspace.branchName,
-      warnings: runtimeWorkspaceWarnings,
-    });
-    if (wakeExecutionWorkspacePatch) {
-      const wakePayloadForWorkspace = parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]);
-      context[PAPERCLIP_WAKE_PAYLOAD_KEY] = {
-        ...wakePayloadForWorkspace,
-        executionWorkspace: wakeExecutionWorkspacePatch,
-      };
-    }
+    //
+    // "Every adapter" is load-bearing and was checked per adapter, not assumed:
+    // the two vendored K8s adapters keep their own renderers and their own
+    // resume-delta gates, and `paperclip-adapter-opencode-k8s` typechecks
+    // against a PUBLISHED adapter-utils in CI while the production image builds
+    // it against this tree (Dockerfile:490). Both were handled in PEN-5336. A
+    // new adapter is not covered by this comment until someone checks it.
+    // Attached unconditionally: `warnings` is the live `runtimeWorkspaceWarnings`
+    // array, and entries are still appended to it below (session-reset notices).
+    // Skipping the attach when the array happens to be empty here would drop
+    // every one of those.
+    const wakePayloadForWorkspace = parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]);
+    context[PAPERCLIP_WAKE_PAYLOAD_KEY] = {
+      ...wakePayloadForWorkspace,
+      executionWorkspace: buildPaperclipWakeExecutionWorkspacePatch({
+        branchName: executionWorkspace.branchName,
+        warnings: runtimeWorkspaceWarnings,
+      }),
+    };
     const runtimeServiceIntents = (() => {
       const runtimeConfig = parseObject(hostExecutionWorkspaceConfig.workspaceRuntime);
       return Array.isArray(runtimeConfig.services)

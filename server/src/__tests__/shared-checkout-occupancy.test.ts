@@ -514,8 +514,7 @@ describe("wake-payload execution workspace patch (PEN-5336)", () => {
       branchName: null,
       warnings: [warning as string],
     });
-    expect(patch).not.toBeNull();
-    expect(patch?.warnings.join("\n")).toContain(SIBLING_RUN);
+    expect(patch.warnings.join("\n")).toContain(SIBLING_RUN);
   });
 
   it("still carries the branch pin when there are no warnings", () => {
@@ -524,14 +523,26 @@ describe("wake-payload execution workspace patch (PEN-5336)", () => {
     ).toEqual({ branchName: "PEN-5336-deliver", warnings: [] });
   });
 
-  it("returns null when there is nothing to say, so no empty payload is forced", () => {
-    expect(buildPaperclipWakeExecutionWorkspacePatch({ branchName: null, warnings: [] })).toBeNull();
+  // ⚠️ Deliberately NOT null. The patch is built before the last warnings are
+  // appended, and `warnings` is the live array -- so an "optimisation" that
+  // skipped the attach when the array was empty at this instant silently
+  // dropped every warning added afterwards. That was a real revision of this
+  // change, caught in review. An all-empty patch is discarded downstream by
+  // the wake normalizer, so it costs nothing.
+  it("still returns a patch when there is nothing to say yet", () => {
+    expect(buildPaperclipWakeExecutionWorkspacePatch({ branchName: null, warnings: [] })).toEqual({
+      branchName: null,
+      warnings: [],
+    });
   });
 
-  it("binds warnings by reference, like the context object does", () => {
-    const warnings: string[] = ["first"];
+  it("binds warnings by reference, so a warning appended LATER still arrives", () => {
+    // The case the null-return broke: nothing to say when the patch is built,
+    // a session-reset notice pushed onto the same array a few hundred lines
+    // later, and the adapter serialising only at dispatch.
+    const warnings: string[] = [];
     const patch = buildPaperclipWakeExecutionWorkspacePatch({ branchName: null, warnings });
-    warnings.push("appended after the patch was built");
-    expect(patch?.warnings).toEqual(["first", "appended after the patch was built"]);
+    warnings.push("Skipping saved session resume because the task key changed.");
+    expect(patch.warnings).toEqual(["Skipping saved session resume because the task key changed."]);
   });
 });

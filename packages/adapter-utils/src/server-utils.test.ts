@@ -13,6 +13,7 @@ import {
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   materializePaperclipSkillCopy,
   refreshPaperclipWorkspaceEnvForExecution,
+  paperclipWakeHasResumeDeltaContent,
   renderPaperclipWakePrompt,
   runningProcesses,
   runChildProcess,
@@ -1480,6 +1481,80 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt.match(/- execution workspace warning:/g)).toHaveLength(10);
     expect(prompt).toContain("warning 9");
     expect(prompt).not.toContain("warning 10");
+  });
+
+  // PEN-5336. The predicate the ten in-repo adapters' resume-delta gate calls.
+  // It must return EXACTLY what `renderPaperclipWakePrompt(...).length > 0`
+  // returned before workspace warnings existed, or a resumed run either loses
+  // its heartbeat prompt or stops getting its delta.
+  //
+  // ⚠️ These assert the SHARED predicate directly. The claude_k8s suite's
+  // equivalents exercise that adapter's own local `wakeHasResumeDeltaContent`,
+  // a separate implementation -- so flipping `countWorkspaceWarnings` here
+  // would not have turned them red.
+  describe("paperclipWakeHasResumeDeltaContent (PEN-5336)", () => {
+    const warning = "SHARED CHECKOUT CONTENTION: 1 other live run of this agent (5cc6d634)";
+
+    it("is FALSE for a warnings-only payload -- a warning is not a delta", () => {
+      const payload = { executionWorkspace: { warnings: [warning] } };
+      // The payload is alive (it must reach the pod) ...
+      expect(renderPaperclipWakePrompt(payload)).toContain("execution workspace warning:");
+      // ... but it is not a delta, so the heartbeat prompt must survive.
+      expect(paperclipWakeHasResumeDeltaContent(payload)).toBe(false);
+    });
+
+    it("is TRUE for a branch pin, matching the pre-PEN-5336 result", () => {
+      expect(paperclipWakeHasResumeDeltaContent({ executionWorkspace: { branchName: "b" } })).toBe(true);
+      // ...and a warning riding alongside a branch pin does not change that.
+      expect(
+        paperclipWakeHasResumeDeltaContent({
+          executionWorkspace: { branchName: "b", warnings: [warning] },
+        }),
+      ).toBe(true);
+    });
+
+    it("is TRUE for real wake content even when a warning rides along", () => {
+      expect(
+        paperclipWakeHasResumeDeltaContent({
+          comments: [{ id: "c1", body: "a real new comment" }],
+          executionWorkspace: { warnings: [warning] },
+        }),
+      ).toBe(true);
+      expect(
+        paperclipWakeHasResumeDeltaContent({
+          issue: { id: "i1", identifier: "PAP-1", title: "t" },
+          executionWorkspace: { warnings: [warning] },
+        }),
+      ).toBe(true);
+    });
+
+    it("is FALSE for an empty or absent payload", () => {
+      expect(paperclipWakeHasResumeDeltaContent(null)).toBe(false);
+      expect(paperclipWakeHasResumeDeltaContent({})).toBe(false);
+      // `reason` alone never kept the payload alive, and still does not.
+      expect(paperclipWakeHasResumeDeltaContent({ reason: "issue_assigned" })).toBe(false);
+    });
+
+    it("agrees with the rendered string on every payload that carries no warnings", () => {
+      // The equivalence that makes this a safe swap for the old gate: with
+      // warnings out of the picture, the predicate and the old string test
+      // must never disagree.
+      const payloads: unknown[] = [
+        null,
+        {},
+        { reason: "issue_assigned" },
+        { comments: [{ id: "c1", body: "hi" }] },
+        { issue: { id: "i1", identifier: "PAP-1", title: "t" } },
+        { executionWorkspace: { branchName: "b" } },
+        { unresolvedBlockerIssueIds: ["i2"] },
+        { checkboxSelection: { prompt: "p", selectedOptionIds: ["a"], selectedOptions: [] } },
+      ];
+      for (const payload of payloads) {
+        expect(paperclipWakeHasResumeDeltaContent(payload)).toBe(
+          renderPaperclipWakePrompt(payload).length > 0,
+        );
+      }
+    });
   });
 
   it("escapes backticks and strips control characters in the branch guard", () => {
