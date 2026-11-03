@@ -61,16 +61,26 @@
  *     than the nearest enclosing `with:` is an input and is skipped. Also found
  *     by Ally on PR #3275, fixed under PEN-5282.
  *
- *     RECOGNISING the `with:` is the whole of this narrowing, and three shapes
- *     of it were missed at first -- each one re-opening the hole completely,
- *     because an unrecognised `with:` anchors nothing: `with: # inputs` (a
- *     trailing comment), `- with:` (`with` as a step item's opening key), and
- *     `with: {` (a multi-line flow mapping). The first two were found by Ally
- *     on PR #3281; the third by probing the mutant that review left surviving.
- *     The pattern is therefore unanchored on the right and tolerant of a
- *     leading `- `, and it anchors on the column of the `with` TOKEN rather
- *     than of the dash -- a step's own keys sit at the token column, so the
- *     dash column would skip a REAL step `run:` written there.
+ *     RECOGNISING the `with:` is the whole of this narrowing, and FOUR shapes
+ *     of it were missed at first -- each one re-opening the hole completely:
+ *     `with: # inputs` (a trailing comment), `- with:` (`with` as a step
+ *     item's opening key), `with: {` (a multi-line flow mapping, inputs on
+ *     the lines below), and a `with:` nested INSIDE a `with:` block (an input
+ *     literally named `with`). Ally found the first two on PR #3281 and the
+ *     fourth on its follow-up head; the third came from probing the mutant
+ *     the first of those reviews left surviving.
+ *
+ *     So the pattern is unanchored on the right, tolerant of a leading `- `,
+ *     anchored on the column of the `with` TOKEN rather than of the dash --
+ *     a step's own keys sit at the token column, so the dash column would skip
+ *     a REAL step `run:` written there -- and it keeps the OUTERMOST anchor,
+ *     never moving it inward. The first three fail open by not recognising a
+ *     `with:` at all; the fourth is subtler, and worth keeping in mind before
+ *     touching this: the anchor IS set throughout, it just points at the inner
+ *     block, so the next line at outer input depth trips the dedent clear and
+ *     releases everything after it. Each shape has a named test, and so does
+ *     the opposite error in each case -- an anchor that latches and eats real
+ *     commands is the fail-CLOSED way to "pass" all four.
  *
  * KNOWN CEILING, stated rather than buried. The match is LITERAL, so a runner
  * that builds a path dynamically reads as unregistered here; the one
@@ -307,10 +317,19 @@ export function runCommands(workflowSource) {
       // the anchored version that did need it is what this replaces.
       const withKey = /^(\s*-?\s*)with:/.exec(lines[i]);
       if (withKey) {
+        // OUTERMOST `with:` only. An action input literally named `with` would
+        // otherwise overwrite the anchor with its own deeper column; the next
+        // line back at the outer input depth then trips the dedent clear, the
+        // anchor resets to null, and every later sibling input registers --
+        // fail-OPEN, and a more devious one than the shapes above, because the
+        // anchor is set the whole time and merely points at the wrong block.
+        // Found by Ally on #3281. Keeping the outer column makes the nested
+        // key just another input, which is what it is.
+        //
         // Column of the `with` TOKEN, not of a leading `- `. For `- with:` the
         // step's own sibling keys sit at the `with` column, so anchoring on the
         // dash column would skip a REAL step `run:` written at that depth.
-        withIndent = withKey[1].length;
+        if (withIndent === null) withIndent = withKey[1].length;
         continue;
       }
     }
