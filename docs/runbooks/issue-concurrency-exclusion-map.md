@@ -19,15 +19,28 @@ fix the anchor here.
 | L1 | issue | a `running` sibling of the **same agent** carrying this `issueId` in its `contextSnapshot` | cancels the queued run `duplicate_dispatch_suppressed` | `inFlightIssueIds` (`heartbeat.ts`) |
 | L2 | issue | **`issues.executionRunId`** | claim UPDATE matches zero rows → cancels `issue_execution_lock_not_acquired` | `executionRunClaimCondition` (`heartbeat.ts`) |
 | L3 | issue | `activeRun`, and a sibling's armed `scheduled_retry` | withholds the row from self-selection | `isIssueHeldByForeignRun`, `isIssueHeldByForeignScheduledRetry` (`issue-run-holding.ts`) |
-| L4 | worktree | the resolved execution-workspace **tree** | second run serialises on the reservation index | `withTreeScopedReservationKey` (BLO-31443) |
+| L4 | worktree | the resolved execution-workspace **tree** | second run serialises on the reservation index | `withTreeScopedReservationKey` (`heartbeat.ts`, BLO-31443) |
 | L5 | git branch | `(companyId, branchKey)` | `BranchClaimConflictError` | `branch-run-claims.ts` |
 
 L2 **is** PEN-5082 done-when 1, verbatim. It is built unconditionally and is always present in the
-claiming UPDATE's `.where(...)`:
+claiming UPDATE's `.where(...)`. In the non-retry case it is:
 
 ```ts
 or(isNull(issues.executionRunId), eq(issues.executionRunId, claimed.id))
 ```
+
+That is one of two branches. When `requiresIssueExecutionRetryLock(claimedRetryReason) &&
+claimed.retryOfRunId`, the condition carries a third arm —
+`eq(issues.executionRunId, claimed.retryOfRunId)` — so a qualifying retry **inherits its
+predecessor's lock** instead of being excluded by it. Unconditional presence is the invariant;
+the snippet above is not the whole condition.
+
+**A zero-row claim does not by itself prove another run held the column.** The same `.where(...)`
+also ANDs `issueStatusCondition` and `issueActorCondition`, so the UPDATE can match nothing
+because the issue left `in_progress`/`in_review`, or because the claimant is neither its assignee
+nor its execution-review participant. All three outcomes cancel with the same
+`issue_execution_lock_not_acquired`. Anyone who later builds the missing L2 counter (below) must
+not read it as "lock collisions" without separating those conditions first.
 
 L1 and L2 are distinct and both load-bearing. L1 runs *before* the claim and is scoped to one
 agent's dispatch pass, so it cannot see a holder whose `contextSnapshot` carries no `issueId` —
@@ -67,10 +80,23 @@ the design already answers it.
    `clearCheckoutRunIfTerminal` run at the top of `checkout()` and null the columns for terminal
    runs *before* the conflict is evaluated (`issues.ts`). So a 409 naming a run id means, by
    construction, that run is not terminal.
-3. **A time-bounded sweep catches the rest.** `sweepStaleIssueLocks` (`recovery/service.ts`)
-   clears a `running` holder's lock after `STALE_RUNNING_ISSUE_LOCK_MS` (2h, corroborated against
-   pod CPU since BLO-30087), and a never-started `queued`/`scheduled_retry` holder after
-   `STALE_PRE_CLAIM_ISSUE_LOCK_MS` (6h).
+3. **A time-bounded sweep catches most of the rest.** `sweepStaleIssueLocks` (grep finds two
+   definition sites — `heartbeat.ts` and `recovery/service.ts`; the 2h/6h logic is the
+   `recovery/service.ts` copy) clears a `running` holder's lock after
+   `STALE_RUNNING_ISSUE_LOCK_MS` (2h, corroborated against pod CPU since BLO-30087), and a
+   never-started `queued` holder after `STALE_PRE_CLAIM_ISSUE_LOCK_MS` (6h).
+
+   A `scheduled_retry` holder is swept on that same 6h bound **only when its
+   `scheduledRetryReason` is not in `SCHEDULED_RETRY_REASONS_REQUIRING_CONTINUOUS_ISSUE_LOCK`**
+   (`max_turns_continuation`, `capacity_blocked`, `job_failed`). For those three,
+   `isPreClaimLockExpired` returns false unconditionally (BLO-19848) and **the sweep never clears
+   the lock, at any age** — so do not expect a max-turns continuation's lock to time out. Clearing
+   it would destroy the continuation rather than delay it: the promotion path gates on the lock
+   under `FOR UPDATE`, and the pre-start staleness check cancels the run outright with
+   `issue_execution_lock_changed` if the column moved underneath it. That population's lock is
+   bounded by the promotion path (`requiresIssueExecutionRetryLock`), not by a clock — which is a
+   handoff, not a gap, but it is the one holder state where "6h and it releases" is the wrong
+   mental model.
 
 A related but separate defect is that `executionAgentNameKey` can go stale against a fresh
 `executionRunId` (PEN-5351). That misattributes the holder's **name**, which is a legibility
