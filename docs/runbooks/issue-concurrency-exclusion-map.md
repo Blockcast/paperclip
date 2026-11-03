@@ -37,8 +37,12 @@ the snippet above is not the whole condition.
 
 **A zero-row claim does not by itself prove another run held the column.** The same `.where(...)`
 also ANDs `issueStatusCondition` and `issueActorCondition`, so the UPDATE can match nothing
-because the issue left `in_progress`/`in_review`, or because the claimant is neither its assignee
-nor its execution-review participant. All three outcomes cancel with the same
+because the issue is not in a status this claim accepts, or because the claimant is neither its
+assignee nor its execution-review participant. "Not in a status this claim accepts" is wider than
+"left `in_progress`/`in_review`": `issueStatusCondition` has three branches
+(`heartbeat.ts`, search `const issueStatusCondition`) — a `requiresInProgressIssueRetry` retry
+narrows it to `in_progress` **alone**, and an auto-checkout wake on a dependency-ready issue
+*widens* it to also admit `todo`/`backlog`/`blocked`. All three outcomes cancel with the same
 `issue_execution_lock_not_acquired`. Anyone who later builds the missing L2 counter (below) must
 not read it as "lock collisions" without separating those conditions first.
 
@@ -96,25 +100,56 @@ the design already answers it.
    `issue_execution_lock_changed` if the column moved underneath it. That population's lock is
    bounded by the promotion path (`requiresIssueExecutionRetryLock`), not by a clock — a handoff,
    not a gap, but it is the one holder state where "6h and it releases" is the wrong mental model.
-   Mechanisms 4 and 5 are what make that handoff a bound rather than a promise.
+   Mechanism 5 is what makes that handoff a bound rather than a promise; mechanism 4 can end it
+   sooner, but is an event rather than a bound.
 4. **A never-started holder is reaped regardless of reason.**
    `ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES` (`issue-execution-lock.ts`) is
    `["queued", "scheduled_retry"]`, and `issues.checkout()` cancels and adopts such a row **while
    `startedAt` is null** — independent of the sweep and independent of `scheduledRetryReason`. So
-   a continuous-lock reason does not protect a holder that never ran; only a *started* one reaches
-   the handoff in 3.
-5. **A refused promotion releases the lock in the same transaction.** This is the bound on the
-   started holder, and it is the mechanism the "promotion owns the lifecycle" wording hides. When
-   the promotion gate declines — `issue_not_found`, assignee mismatch, `issue_cancelled`,
-   `issue_terminal_status`, `issue_not_in_progress`, or `issue_execution_lock_changed` — the
-   `gate_suppressed` branch sets the run `cancelled` **and** nulls `executionRunId`,
-   `executionAgentNameKey` and `executionLockedAt` in the same `db.transaction`, guarded by
-   `eq(issues.executionRunId, cancelled.id)` (`heartbeat.ts`, search `gate_suppressed`). A gate
-   refusal therefore cannot strand the column; the two outcomes are "promoted, lock legitimately
-   retained" and "cancelled, lock cleared".
+   a continuous-lock reason does not protect a holder that never ran.
 
-   **The residual that closes:** the only remaining unbounded shape would be a started
-   continuous-lock holder whose promotion sweep never selects it, since that sweep selects on
+   **Do not read that as "started holders take the handoff in 3 and never-started ones take this".
+   There is no started population here.** All four writers that park a run *insert* a fresh row and
+   none of them sets `startedAt` (verified at each of the four sites), so **every** continuous-lock
+   `scheduled_retry` holder is never-started and therefore reapable by `checkout()`. The real split
+   between 4 and 5 is not the holder's state but **which event arrives first**: a checkout adoption
+   (4) or the due time reaching the promotion gate (5).
+
+   Mechanism 4 is accordingly **event-driven, not a bound** — nothing schedules it. It fires only
+   when a live `running` actor checks the issue out (`actorLive`) and no active external runtime
+   reservation is held (`issues.ts`, search `hasActiveExternalRuntimeReservation`). If no such
+   checkout ever happens, 4 never fires and 5 is the only thing that ends the hold.
+
+   Note also what 4 *does* when it fires on this population: it **cancels a
+   `max_turns_continuation` park**. That is precisely the "clearing it would destroy the
+   continuation" outcome BLO-19848 kept out of the age sweep, reached here by a different door. It
+   is a deliberate trade-off in favour of the live claimant, not a protection — do not cite
+   mechanism 4 as evidence that continuations are safe.
+5. **A refused promotion releases the lock.** This is the actual bound, and it is the mechanism
+   the "promotion owns the lifecycle" wording hides. When the promotion gate declines —
+   `issue_not_found`, assignee mismatch, `issue_cancelled`, `issue_terminal_status`,
+   `issue_not_in_progress`, or `issue_execution_lock_changed` — the gate sets the run `cancelled`
+   **and** nulls `executionRunId`, `executionAgentNameKey` and `executionLockedAt`, guarded by
+   `eq(issues.executionRunId, cancelled.id)`. A gate refusal
+   therefore cannot strand the column; the two outcomes are "promoted, lock legitimately retained"
+   and "cancelled, lock cleared".
+
+   **"In the same transaction" is true of only one of the two paths — say which.**
+   `gate_suppressed` returns **nine** hits in `heartbeat.ts`, spanning two different release
+   mechanisms, so "the `gate_suppressed` branch" is not a single thing:
+   - The **in-transaction gate** inside the atomic promotion does cancel and clear in one
+     `db.transaction`.
+   - The **earlier** `gate_suppressed` returns — agent missing, an `evaluateScheduledRetryGate`
+     refusal such as `issue_execution_lock_changed`, and `timer_no_actionable_work` — route
+     through `cancelScheduledRetryForGate`, which issues the cancel and the lock clear as
+     **separate `db` statements with no enclosing transaction**.
+
+   A crash between those two statements therefore leaves a holder — but a **terminal** one
+   (`cancelled`), which mechanisms 1 and 2 release on their own schedule. So "cannot strand" holds
+   for both paths; "atomically" holds for only the first.
+
+   **The residual that closes:** the only remaining unbounded shape would be a continuous-lock
+   holder whose promotion sweep never selects it, since that sweep selects on
    `lte(heartbeatRuns.scheduledRetryAt, now)` — which a NULL never satisfies. It is not reachable.
    All four writers that park a run into `scheduled_retry` stamp a non-null `scheduledRetryAt` at
    insert, so every park carries a concrete due time and every holder eventually reaches the gate
