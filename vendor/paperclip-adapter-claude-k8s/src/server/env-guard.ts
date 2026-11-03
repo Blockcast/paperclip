@@ -1452,22 +1452,36 @@ async function holdsAnyExecutionLock(base, key, run) {
 // carry what it takes to be read correctly.
 //
 // No new fetch, no new field: 'GET /api/issues/:task' already carries the
-// holding agent twice over, and both are co-written with the lock column
-// itself.
-//   - 'executionAgentNameKey' is set in the same UPDATE .set() as
-//     'executionRunId' (issues.ts runningCheckoutExecutionPatch, and the
-//     heartbeat claim path), so it describes THIS holder by construction.
-//     It is the better of the two: it survives the holder run going terminal
-//     while the lock column still points at it.
-//   - 'activeRun' is keyed off 'executionRunId', so 'activeRun.agentId' is the
-//     holder's agent — but only while a run row is live, and the id check
-//     below keeps a skewed payload from attributing the wrong seat.
+// holding agent twice over. They are NOT equally trustworthy, and getting
+// that order wrong reintroduces the very defect this exists to remove.
 //
-// The agent ID is what answers the question the reader was actually guessing
-// at, so when both ids are known this says "yours" or "a DIFFERENT agent"
-// outright rather than leaving the inference to be made. When nothing names
-// the holder, say THAT — an unqualified id is the input to the misread, so
-// silence here must be explicit rather than bare.
+//   - 'activeRun.agentId' is AUTHORITATIVE and is preferred. 'activeRun' is
+//     hydrated by keying off 'executionRunId' (issues.ts:4366, :9274), so it
+//     is read from the holder's own run row. The 'activeRun.id === holder'
+//     check below additionally refuses a skewed payload.
+//   - 'executionAgentNameKey' is a FALLBACK and may be STALE. An earlier
+//     revision of this code claimed it is co-written with 'executionRunId'
+//     "by construction"; that was WRONG, found in review on PR #3314. Only
+//     'runningCheckoutExecutionPatch' (issues.ts:6496) and the heartbeat
+//     claim (heartbeat.ts:25439) write the pair together. Four adoption
+//     writers set 'executionRunId' alone and leave the old name in place:
+//     adoptActiveActorIssueRun (:7654), adoptStaleCheckoutRun (:7794),
+//     adoptUnownedCheckoutRun (:7894), adoptStaleExecutionLock (:8494).
+//
+//     Concretely: the heartbeat claim can hand the lock to an
+//     execution-review participant who is not the assignee and stamp THAT
+//     agent's name; when that run goes terminal the assignee's run adopts the
+//     lock through 'adoptStaleCheckoutRun', which carries no agent check — so
+//     the row keeps the reviewer's name against the assignee's run id. A
+//     reader told that name, unqualified, is cross-seat misattributed, which
+//     is exactly the bug.
+//
+// Hence: when the id is available it decides, and the name is corroboration.
+// When the name is the ONLY source it is reported as UNVERIFIED rather than
+// as attribution — a stale name presented confidently is worse than no name,
+// because the reader cannot tell the two apart. And when nothing names the
+// holder, say THAT: an unqualified id is the input to the misread, so silence
+// must be spoken rather than left bare.
 function describeHolderAgent(issue, holder, selfAgentId) {
   const nameKey = issue && typeof issue.executionAgentNameKey === "string" && issue.executionAgentNameKey
     ? issue.executionAgentNameKey
@@ -1476,15 +1490,22 @@ function describeHolderAgent(issue, holder, selfAgentId) {
   const agentId = activeRun && activeRun.id === holder && typeof activeRun.agentId === "string" && activeRun.agentId
     ? activeRun.agentId
     : null;
-  const named = nameKey ? 'agent "' + nameKey + '"' : agentId ? "agent " + agentId : null;
-  if (!named) {
-    return "the server named no holding agent for that run, so do NOT assume it is another run of your own agent";
+  // No id: the name key is all there is, and it may belong to a previous
+  // holder (see the adoption writers above). Report it as a lead, not a fact.
+  if (!agentId) {
+    if (!nameKey) {
+      return "the server named no holding agent for that run, so do NOT assume it is another run of your own agent";
+    }
+    return 'the server did not name that run\'s agent directly; the issue\'s last recorded lock holder was agent "' +
+      nameKey + '", which MAY BE STALE — do NOT assume it is another run of your own agent';
   }
-  const qualified = nameKey && agentId ? named + " (" + agentId + ")" : named;
-  if (!agentId || !selfAgentId) return "that run belongs to " + qualified;
+  // Id present, so it decides. The name is corroboration only, and is dropped
+  // rather than printed beside an id it might contradict.
+  const named = nameKey ? 'agent "' + nameKey + '" (' + agentId + ")" : "agent " + agentId;
+  if (!selfAgentId) return "that run belongs to " + named;
   return agentId === selfAgentId
-    ? "that run belongs to " + qualified + ", which is YOUR OWN agent"
-    : "that run belongs to " + qualified + ", which is a DIFFERENT agent from yours";
+    ? "that run belongs to " + named + ", which is YOUR OWN agent"
+    : "that run belongs to " + named + ", which is a DIFFERENT agent from yours";
 }
 async function foreignLockHolder() {
   const env = process.env;

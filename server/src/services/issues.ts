@@ -8208,7 +8208,10 @@ export function issueService(db: Db) {
   function holderAgentLabel(holder: { agentName: string | null; agentId: string | null }): string {
     if (holder.agentName) return `agent ${holder.agentName}`;
     if (holder.agentId) return `agent id ${holder.agentId}`;
-    return "holding agent unknown";
+    // Ally on #3314: the 409 remediation is the more widely read of the two
+    // surfaces, so it carries the explicit clause rather than the terser
+    // wording `formatContendingRunAgent` used to pair with.
+    return "holding agent unknown — do not assume it is another run of your own agent";
   }
 
   function holderLabel(holder: { runId: string; agentName: string | null; agentId: string | null }): string {
