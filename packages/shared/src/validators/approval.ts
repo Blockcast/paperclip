@@ -185,6 +185,10 @@ export type CreateApproval = z.infer<typeof createApprovalSchema>;
 /**
  * Query parameters for listing approvals. `view=summary` omits the `payload` body,
  * which is what makes a pre-file existence check cheap enough to be worth doing.
+ * It omits only the payload: every scalar column a caller might reason about —
+ * `decidedByUserId` above all — stays on the row, because a projection that drops
+ * a scalar does not save anything measurable and turns a missing key into a false
+ * claim about who decided the card (PEN-5432).
  */
 export const listApprovalsQuerySchema = z.object({
   status: z.enum(APPROVAL_STATUSES).optional(),
