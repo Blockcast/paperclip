@@ -18,7 +18,7 @@
  * This script measures the population before that pass runs and verifies the
  * post-condition after, from the same persisted state both times.
  *
- * WHY THIS READS EVERY STATUS, NOT JUST `cancelled`. The backfill population is
+ * WHY THIS READS EVERY STATUS IN ONE KEYSET WALK. The backfill population is
  * keyed on `executionState.monitor.clearReason`, which is a property of the
  * MONITOR, not of the row. A flapping alert row carries that state while sitting
  * in `todo` mid-cycle, so a scan restricted to `status=cancelled` undercounts by
@@ -26,6 +26,22 @@
  * cancelled-only population read 17 at 13:3xZ and 10 at ~18:00Z on the same
  * company with no mutation in between — the difference is rows that flapped back
  * out of `cancelled`, not rows that were handled.
+ *
+ * Reading every status is necessary but NOT sufficient, and the insufficient
+ * version of this scan shipped first. Walking one status at a time still loses a
+ * row that moves from a not-yet-walked status into an already-walked one while
+ * the walk is in flight — it is seen by neither pass — and the population
+ * this file exists to count is defined by rows that change status mid-cycle, so
+ * that is the common case here, not a corner. Offset paging compounds it: over
+ * the mutable default order a row touched mid-walk is re-ranked across the page
+ * boundary and skipped, and `done` alone exceeds one page. Both biases point the
+ * same way, toward UNDERCOUNT, and neither leaves a trace in the output.
+ *
+ * So this walks the immutable id order once, with no status filter, exactly as
+ * `walkIssueListPages` (`server/src/routes/issues.ts`) does for the same reason:
+ * "offset paging over the mutable activity order re-ranks rows touched mid-walk,
+ * which both double-counts and skips them". A status change mid-walk then cannot
+ * hide a row, because status is not what is being paged on.
  *
  * WHY THIS IS ONE GET PER ISSUE. The list projection DROPS
  * `executionState.monitor` entirely — a scan of it over list rows reads 0 for
@@ -37,9 +53,9 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const DEFAULT_COMPANY = "b1d3f3d3-adc9-48af-beb1-013a18368d84";
 const LIST_PAGE_LIMIT = 1000;
-const STATUSES = ["backlog", "todo", "in_progress", "in_review", "done", "blocked", "cancelled"];
+const WALK_MAX_PAGES = 1000;
+const CARRIER_ORIGIN_KIND = "stranded_issue_recovery";
 
 /**
  * Disjunct A — the destroyed-monitor shape this row exists to fix.
@@ -201,31 +217,61 @@ async function api(path) {
 }
 
 /**
- * Pages by the APPLIED limit and stops on a short page. A bare array exactly as
- * long as the limit is NOT proof of completeness on a server predating the
- * truncation envelope, so the stop condition is the short page, never the
- * absence of a `truncated` flag.
+ * Keyset cursor step. Pure so the termination rule is testable without a server.
+ *
+ * Stops on a SHORT PAGE, never on the absence of a `truncated` flag: a bare array
+ * exactly as long as the limit is not proof of completeness on a server predating
+ * the truncation envelope. A full page whose last id equals the cursor we sent
+ * means `afterId` never reached the query, so the walk would re-serve that page
+ * forever; that is an error rather than a silent partial scan.
  */
-async function listByStatus(companyId, status) {
+export function nextCursor(rows, pageSize, afterId) {
+  if (rows.length < pageSize) return { done: true, afterId: null };
+  const last = rows[rows.length - 1].id;
+  if (last === afterId) {
+    throw new Error("keyset cursor did not advance, so afterId is not reaching the list query");
+  }
+  return { done: false, afterId: last };
+}
+
+async function walkList(companyId, extraQuery) {
   const out = [];
-  for (let offset = 0; ; offset += LIST_PAGE_LIMIT) {
+  let afterId;
+  for (let page = 0; ; page += 1) {
+    if (page >= WALK_MAX_PAGES) {
+      throw new Error(`exceeded ${WALK_MAX_PAGES} pages, so the walk is not terminating`);
+    }
+    const cursor = afterId ? `&afterId=${afterId}` : "";
     const res = await api(
-      `/api/companies/${companyId}/issues?status=${status}&limit=${LIST_PAGE_LIMIT}&offset=${offset}`,
+      `/api/companies/${companyId}/issues?sortField=id&limit=${LIST_PAGE_LIMIT}${extraQuery}${cursor}`,
     );
-    const batch = Array.isArray(res) ? res : (res.issues ?? []);
-    out.push(...batch);
-    if (batch.length < LIST_PAGE_LIMIT) return out;
+    const rows = Array.isArray(res) ? res : (res.issues ?? []);
+    out.push(...rows);
+    const step = nextCursor(rows, LIST_PAGE_LIMIT, afterId);
+    if (step.done) return out;
+    afterId = step.afterId;
   }
 }
 
-async function mapWithConcurrency(items, limit, fn) {
+/**
+ * Resolves per item instead of rejecting the batch. One failed GET out of
+ * thousands must not discard a scan that takes tens of minutes, and -- more
+ * importantly -- a scan that lost rows must not be reportable as a clean one:
+ * failures are counted and the summary says INCOMPLETE, which is a different
+ * claim from "population=N".
+ */
+async function mapSettled(items, limit, fn) {
   const out = new Array(items.length);
   let cursor = 0;
   await Promise.all(
     Array.from({ length: Math.min(limit, items.length) }, async () => {
       while (cursor < items.length) {
         const index = cursor++;
-        out[index] = await fn(items[index]);
+        try {
+          out[index] = { ok: true, value: await fn(items[index]) };
+        } catch (error) {
+          out[index] = { ok: false, item: items[index], error: String(error) };
+        }
       }
     }),
   );
@@ -233,17 +279,20 @@ async function mapWithConcurrency(items, limit, fn) {
 }
 
 async function main() {
-  const companyId = process.env.MEASURE_COMPANY_ID || DEFAULT_COMPANY;
+  // Not defaulted. The before and after reads are only comparable if they cover
+  // the same company, and a default silently makes "I ran the same script" look
+  // like evidence of that when it is not.
+  const companyId = process.env.MEASURE_COMPANY_ID;
+  if (!companyId) throw new Error("MEASURE_COMPANY_ID is required");
   const concurrency = Number(process.env.MEASURE_CONCURRENCY || 16);
 
-  const seen = new Map();
-  for (const status of STATUSES) {
-    for (const row of await listByStatus(companyId, status)) seen.set(row.id, row);
-  }
-  const ids = [...seen.keys()];
-  console.error(`scanning ${ids.length} rows (one GET each; the list projection drops the monitor)`);
+  const listed = await walkList(companyId, "");
+  const ids = [...new Set(listed.map((row) => row.id))];
+  console.error(`walked ${ids.length} rows in id order (the list projection drops the monitor)`);
 
-  const issues = await mapWithConcurrency(ids, concurrency, (id) => api(`/api/issues/${id}`));
+  const settled = await mapSettled(ids, concurrency, (id) => api(`/api/issues/${id}`));
+  const issues = settled.filter((row) => row.ok).map((row) => row.value);
+  const failures = settled.filter((row) => !row.ok);
   const summary = summarize(issues);
 
   for (const row of summary.rows) {
@@ -254,13 +303,13 @@ async function main() {
   }
 
   // Second phase, owed rows only: recover each destroyed due time from the clear
-  // event itself. This is one activity GET per owed row, which is affordable
-  // only because the owed set is small (21 as of 2026-11-03) -- it is
-  // deliberately NOT run over the full scan.
+  // event itself. One activity GET per owed row, affordable only because the owed
+  // set is small -- deliberately NOT run over the full scan.
   const owedIssues = issues.filter(
-    (issue) => (isCancelledClear(issue) || isLiveMonitorOnCancelledRow(issue)) && !hasRecoveryEmitted(issue),
+    (issue) =>
+      (isCancelledClear(issue) || isLiveMonitorOnCancelledRow(issue)) && !hasRecoveryEmitted(issue),
   );
-  const feeds = await mapWithConcurrency(owedIssues, concurrency, async (issue) => ({
+  const feeds = await mapSettled(owedIssues, concurrency, async (issue) => ({
     identifier: issue.identifier,
     clears: destroyedDueTimes(await api(`/api/issues/${issue.id}/activity`)),
   }));
@@ -268,21 +317,41 @@ async function main() {
   let clears = 0;
   let withDueTime = 0;
   for (const feed of feeds) {
-    for (const clear of feed.clears) {
+    if (!feed.ok) continue;
+    for (const clear of feed.value.clears) {
       clears += 1;
       if (clear.dueAt) withDueTime += 1;
-      console.log(`DUE ${feed.identifier} cleared=${clear.clearedAt} due=${clear.dueAt ?? "MISSING"}`);
+      console.log(
+        `DUE ${feed.value.identifier} cleared=${clear.clearedAt} due=${clear.dueAt ?? "MISSING"}`,
+      );
     }
   }
 
+  // The post-condition check. Without this the "after" run reports `emitted=N`
+  // from the stamp alone, i.e. it trusts the very stamp whose correctness is the
+  // thing under test, and a stamp-without-carrier reads as a clean pass.
+  const carriers = await walkList(companyId, `&originKind=${CARRIER_ORIGIN_KIND}`);
+  const { lost, duplicated } = findHandoffFailures(issues, carriers);
+  for (const row of lost) console.error(`LOST: ${row.identifier} ${row.detail}`);
+  for (const row of duplicated) console.error(`DUPLICATED: ${row.identifier} ${row.detail}`);
+
   console.log(
-    `\nscanned=${summary.scanned} population=${summary.population} ` +
-      `(A=${summary.disjunctA} B=${summary.disjunctB}) owed=${summary.owed} ` +
-      `emitted=${summary.emitted} ownerless-owed=${summary.ownerlessOwed}`,
+    `\ncompany=${companyId} walked=${ids.length} read=${issues.length} ` +
+      `population=${summary.population} (A=${summary.disjunctA} B=${summary.disjunctB}) ` +
+      `owed=${summary.owed} emitted=${summary.emitted} ownerless-owed=${summary.ownerlessOwed}`,
   );
   console.log(
-    `cancelled-clear events on owed rows=${clears} carrying the destroyed due time=${withDueTime}`,
+    `carriers=${carriers.length} lost=${lost.length} duplicated=${duplicated.length} ` +
+      `cancelled-clear-events-on-owed=${clears} carrying-due-time=${withDueTime}`,
   );
+
+  if (failures.length > 0) {
+    console.error(`\nINCOMPLETE: ${failures.length} of ${ids.length} rows could not be read.`);
+    console.error(failures.slice(0, 5).map((row) => `  ${row.item}: ${row.error}`).join("\n"));
+    process.exit(1);
+  }
+  // A lost obligation is the one reading that falsifies #3352's design.
+  if (lost.length > 0) process.exit(1);
 }
 
 export function isMainModule(argvPath = process.argv[1], moduleUrl = import.meta.url) {
