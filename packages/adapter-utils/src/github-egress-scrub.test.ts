@@ -1188,6 +1188,36 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("BLO-51639 regression: a blackbox module name under module is not a credential", () => {
+    // Derived, not embedded, so this file stays pushable before the fix deploys.
+    const pair = (name: string, value: string) => [name, value].join("=");
+    const MODULE = ["dns", "amtrelay", "pool", "answer", "shred197", "v6"].join("_");
+
+    it("passes a module label matcher byte-exact", () => {
+      const text = `probe_success{${pair("job", '"dns_pool_probe"')}, ${pair("module", `"${MODULE}"`)}}`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    it.each([
+      ["module", SYNTHETIC_OPAQUE_VALUE],
+      // Interior digits: pins the tail-only digit placement.
+      ["module", "dns_a7mt3relay_po9ol_answer_s4hred"],
+      // 4-digit tail: pins the {0,3} bound.
+      ["module", "dns_amtrelay_pool_answer_shred1975"],
+      // Three digit runs: pins the digit-run cap.
+      ["module", "dns_amtrelay_pool1_answer_shred197_v6"],
+      // The 3-digit tail stays under module only.
+      ["job", MODULE],
+      ["token", MODULE],
+    ])("still refuses a credential-shaped value under %s", (name, value) => {
+      const result = scrubGitHubEgressText(pair(name, value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+  });
+
   describe("PEN-4637 regression: an absolute POSIX path is not a credential", () => {
     // Derived, not embedded, throughout. Every positive below is the exact
     // material the SHIPPED rule refuses, so a contiguous `name=value` literal
