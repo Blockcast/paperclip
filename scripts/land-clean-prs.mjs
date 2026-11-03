@@ -1216,6 +1216,12 @@ export function renderReceipt(rows) {
  * the ones with the oldest check stamps. Aging it would fire this report
  * hardest exactly when the queue is deepest and the routine is working
  * normally.
+ *
+ * Its exclusion here is unchanged, but it is no longer a blind spot: the
+ * persistent case — deferred for budget while NEVER having been offered a
+ * queue slot — is owned by `capStarved`, which discriminates on the PR's own
+ * timeline rather than on this clock. See its comment for why that is the
+ * only safe way to see a cap deferral (PEN-5391).
  */
 const DELIBERATE_HOLD_REASON_RE = /^(?:human-author|draft|label:|cap:)/;
 
@@ -1367,16 +1373,29 @@ export const UNLANDED_ELIGIBLE_HOURS = 6;
  * `enqueue-failed` — `markFailure` renames the action, which drops it out of
  * `NON_HOLD_ACTIONS`, so `stalledHolds` already ages it. Covered.
  *
- * `cap:N-per-fire` — a STATED residual, not an oversight. `stalledHolds`
- * excludes it because the deferred rows are selected for old check stamps
- * (the budget is spent on PRs that reported more recently), so this clock is
- * biased against them at any threshold; aging them would fire hardest exactly
- * when the queue is deepest and the routine is working. That reasoning holds
- * here unchanged, so a cap-STARVED PR is invisible to both detectors. It is
- * accepted because starvation is not reachable at today's figures — the cap
- * is MAX_ENQUEUES_PER_FIRE per fire against a measured 18-34 merges/day — and
- * it wants its own detector with its own clock if it ever becomes so. Do not
- * close that gap by widening this predicate.
+ * `cap:N-per-fire` — still excluded here, and `stalledHolds` still excludes it
+ * by reason, for an argument that is unchanged: the deferred rows are selected
+ * for old check stamps (the budget is spent on PRs that reported more
+ * recently), so this clock is biased against them at any threshold, and aging
+ * them would fire hardest exactly when the queue is deepest and the routine is
+ * working. Do not close the gap by widening this predicate.
+ *
+ * ⚠ What HAS changed is the premise that made the resulting blind spot
+ * acceptable. This paragraph used to read "accepted because starvation is not
+ * reachable at today's figures — the cap is MAX_ENQUEUES_PER_FIRE per fire
+ * against a measured 18-34 merges/day — and it wants its own detector with its
+ * own clock if it ever becomes so." That precondition FAILED, measured
+ * 2026-11-03 (PEN-5391): merges to `master` ran 27 on Nov 1, **51 on Nov 2**
+ * and ~45/day on Nov 3, above the band; and the cap was SATURATED on 4 of 4
+ * consecutive hourly samples (10 of 10 `enqueue` rows at 08:29Z, 09:27Z,
+ * 10:28Z, 11:28Z), deferring 4-6 PRs each time. It had already produced a
+ * silent miss: at 11:28Z the sweep went red naming 6 PRs and #3306 was not
+ * among them, after 12h CLEAN and never once queued.
+ *
+ * So the detector that paragraph asked for now exists — `capStarved`, with its
+ * own clock (CAP_STARVED_HOURS) and, crucially, its own DISCRIMINATOR, which
+ * is not an age test at all. See its comment. Both predicates here stayed
+ * exactly as they were.
  *
  * ## A sampling gap, measured rather than assumed
  *
@@ -1434,6 +1453,154 @@ export function renderUnlandedEligible(
     "that has not happened is the landing itself, not a decision about it. " +
     "Check that the routine is firing and that its enqueues are succeeding " +
     "before looking at the PRs."
+  );
+}
+
+/**
+ * How long a PR may sit cap-deferred, having never once been offered a queue
+ * slot, before it is reported as starved rather than as waiting its turn.
+ *
+ * ## Why a third cohort, and why the other two cannot have it
+ *
+ * `classifyAll` rewrites an over-budget `enqueue` into `skip`/`cap:`, which
+ * puts the row outside BOTH existing detectors — `stalledHolds` excludes
+ * `cap:` by reason (DELIBERATE_HOLD_REASON_RE), `unlandedEligible` excludes it
+ * by action. That residual is stated on `unlandedEligible` and it was correct
+ * while it held. It no longer holds; see the correction there.
+ *
+ * Neither predicate may simply be widened, and the reason is the same for
+ * both: the cap spends its budget on PRs that reported more recently, so the
+ * deferred set is SELECTED for old check stamps. An age test over `cap:` rows
+ * alone therefore fires hardest exactly when the queue is deepest and the
+ * routine is working hardest — an alarm on normal operation, which is the
+ * failure mode every cohort in this file is written to avoid.
+ *
+ * ## What makes this cohort safe where a widened predicate is not
+ *
+ * The age test is not the discriminator here; `everOfferedQueueSlot` is. A PR
+ * deferred by one saturated fire is normal and lands on a later one — and the
+ * moment it does, GitHub writes `added_to_merge_queue` to its timeline and the
+ * PR leaves this cohort permanently, whatever its check stamps say. What
+ * remains is only the PR that has gone its entire judgeable life without the
+ * routine ever offering it a slot, which is starvation and not depth.
+ *
+ * That also answers "where does the across-fire state live". It lives in the
+ * PR's own timeline, which is already fetched with `--paginate` for the
+ * ejection rule, so this cohort costs no API call and needs no durable store
+ * shared between fires.
+ *
+ * ## Why twelve hours
+ *
+ * Measured 2026-11-03 over the 30 most recent merges to `master`
+ * (#3274 - #3326, created 2026-11-02T10:49Z - 2026-11-03T06:18Z): every one
+ * of the 30 reached the queue, and the wait from CREATION to the first
+ * `added_to_merge_queue` ran min 3.9h, median 6.3h, p90 10.0h, max 11.7h.
+ *
+ * That is a strictly LOOSER clock than this one — a head's newest check stamp
+ * is never earlier than the PR's creation, so judgeable age at first enqueue
+ * is at most the figure above. Twelve hours is therefore past the worst
+ * observed first-slot wait measured on a clock that over-states it, which is
+ * the conservative direction: this cohort would have named none of those 30.
+ *
+ * Deliberately longer than UNLANDED_ELIGIBLE_HOURS (6). A row reading
+ * `enqueue` waits on nobody, so the routine's own cadence bounds it. A `cap:`
+ * row is waiting on a budget that genuinely refills, so it is owed the full
+ * span in which this repo demonstrably hands out first slots.
+ */
+export const CAP_STARVED_HOURS = 12;
+
+/** Rows `classifyAll` deferred for budget, as opposed to any other skip. */
+const CAP_DEFERRAL_REASON_RE = /^cap:/;
+
+/**
+ * Timeline events that mean the routine has, at some point, offered this PR a
+ * queue slot. `added_to_merge_queue` is the queue-enabled path and
+ * `auto_merge_enabled` the arming that precedes it; either one is proof.
+ *
+ * `removed_from_merge_queue` is deliberately NOT here. An ejected PR was
+ * served and bounced, which is the opposite of starved, and it is already
+ * carried by `added_to_merge_queue` on the same timeline (6 of 6 merged PRs
+ * sampled 2026-11-03 showed the pair). Reading the ejection as evidence in its
+ * own right would add nothing and would invite the inverse error.
+ */
+const QUEUE_OFFER_EVENTS = new Set(["added_to_merge_queue", "auto_merge_enabled"]);
+
+/**
+ * Whether this PR has ever been offered a queue slot: `true`, `false`, or
+ * `null` when the timeline was not read.
+ *
+ * ## `null` is not `false`, and conflating them is the expensive direction
+ *
+ * `fetchOpenPrs` hydrates `timeline` only for PRs that survive
+ * `classifyFromListing`, which is exactly the set that can reach `cap:` — so
+ * in this script the datum is always present for the rows `capStarved`
+ * examines. The three-valued return exists for the day that stops being true:
+ * an absent timeline read as `false` would make EVERY cap-deferred row look
+ * starved at once, turning this detector into noise on its first fire and
+ * costing the alarm its credibility across all three cohorts.
+ *
+ * Verified live 2026-11-03 before this cohort was written, because a predicate
+ * over an event that never appears is vacuous and reports clean forever: 6 of
+ * 6 recently merged PRs carried `added_to_merge_queue`, and the two PRs then
+ * sitting cap-deferred (#3306, #3215) carried no queue event at all.
+ */
+export function everOfferedQueueSlot(timeline) {
+  if (!Array.isArray(timeline)) return null;
+  return timeline.some((event) => QUEUE_OFFER_EVENTS.has(event?.event));
+}
+
+/**
+ * The PRs the classifier said yes to, that the per-fire cap deferred, and that
+ * the routine has never once offered a queue slot, as
+ * `{ number, reason, ageHours }`.
+ *
+ * ## What is deliberately NOT in this cohort
+ *
+ * A cap-deferred PR that HAS been queued before — however long ago, and
+ * whether it merged from there or was ejected. It is not starved: the routine
+ * reached it. An ejected head has its own rule (`ejected-at-current-head`) and
+ * its own clock, and claiming it here would name one PR twice under two
+ * mechanisms that disagree about what is wrong with it.
+ *
+ * A PR whose timeline was not read (`everOfferedQueueSlot === null`). This
+ * cohort's entire claim is "nothing has ever offered this a slot", and an
+ * unread timeline cannot support it — the same posture `unlandedEligible`
+ * takes toward `mergestate:UNKNOWN`. Note this is the OPPOSITE call to the
+ * undatable-clock case below, and deliberately so: the clock REFINES a finding
+ * that stands without it, while the timeline IS the finding.
+ *
+ * An undatable row (`ageHours === null`) is REPORTED, matching both sibling
+ * cohorts and for the same §4l reason: an instrument that cannot see something
+ * must not report clean. A cap-deferred PR that has never been queued and
+ * whose head carries no dated check is a true finding twice over.
+ */
+export function capStarved(prs, rows, { now = Date.now(), staleHours = CAP_STARVED_HOURS } = {}) {
+  const byNumber = new Map((prs ?? []).map((pr) => [pr?.number, pr]));
+  const starved = [];
+  for (const row of rows ?? []) {
+    if (row?.action !== "skip") continue;
+    if (!CAP_DEFERRAL_REASON_RE.test(String(row?.reason ?? ""))) continue;
+    if (everOfferedQueueSlot(byNumber.get(row?.number)?.timeline) !== false) continue;
+    const ageHours = judgeableAgeHours(byNumber.get(row?.number), { now });
+    if (ageHours !== null && ageHours < staleHours) continue;
+    starved.push({ number: row?.number, reason: row?.reason, ageHours });
+  }
+  return starved;
+}
+
+/** The cap-starved block for one repo's receipt, or "" when there is none. */
+export function renderCapStarved(repo, starved, { staleHours = CAP_STARVED_HOURS } = {}) {
+  if ((starved ?? []).length === 0) return "";
+  const line = ({ number, reason, ageHours }) =>
+    `  ${repo}#${number} — \`${reason}\`, ` +
+    (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`);
+  return (
+    `cap-starved (judgeable >${staleHours}h, never once queued) — ${starved.length}:\n` +
+    starved.map(line).join("\n") +
+    "\nThese are eligible and were deferred for budget, not for a reason — and " +
+    "unlike the usual cap deferral they have never been offered a slot at all. " +
+    "So demand is outrunning MAX_ENQUEUES_PER_FIRE rather than queueing behind " +
+    "it. Raising throughput is the fix; re-running the routine is not."
   );
 }
 
@@ -2343,6 +2510,7 @@ export function runRepo(
   spent,
   rotted,
   stranded = [],
+  starved = [],
   {
     fetch = fetchOpenPrs,
     classify = classifyAll,
@@ -2359,6 +2527,25 @@ export function runRepo(
     state = stateHold,
   } = {},
 ) {
+  // PEN-5391. This signature has now grown a positional twice, and BOTH times
+  // a caller's options bag silently bound to the NEW positional instead:
+  // BLO-51665's rate-limit test (slot 6 -> `stranded`) and PEN-5430's
+  // `repoRunner` spread (slot 7 -> `starved`). Neither threw. `fetch` simply
+  // fell back to the real `fetchOpenPrs`, so the test issued a LIVE GraphQL
+  // call and asserted against whatever GitHub returned — green, and testing
+  // nothing. The cost is not hypothetical: `landing-sweep.yml` runs this
+  // suite before the hourly sweep, so a wedged arity takes the sweep with it.
+  //
+  // So reject the shape rather than trusting the next inserter to notice. An
+  // options bag is a plain object and `starved` is an array; a mis-bound
+  // caller dies here, loudly, naming the slot, instead of quietly going live.
+  if (!Array.isArray(starved)) {
+    throw new TypeError(
+      "runRepo: `starved` (7th positional) must be an array — received " +
+        `${starved === null ? "null" : typeof starved}. A caller passing its ` +
+        "options bag in slot 7 is the usual cause; the bag is slot 8.",
+    );
+  }
   let prs;
   try {
     prs = fetch(repo);
@@ -2447,6 +2634,19 @@ export function runRepo(
   const eligible = apply ? [] : unlandedEligible(prs, rows);
   for (const row of eligible) stranded.push(`${repo}#${row.number}`);
 
+  // Same `apply ? [] :` cut as the cohort above, for a reason that is
+  // adjacent but not identical. There the post-apply flip makes the claim
+  // FALSE; here it makes it UNSOUND to measure. An applying fire has just
+  // spent the budget this cohort reasons about, and `applyRow` enqueues
+  // without re-reading any timeline, so a row deferred by that very spend
+  // would be scored against a snapshot taken before it. The hourly
+  // `--alarm` fire, which cannot apply by construction, is the one that
+  // owns this measurement — and it is also the one whose cap is a pure
+  // simulation, so its `cap:` rows mean "demand exceeds the budget right
+  // now" rather than "this fire ran out", which is exactly the question.
+  const capped = apply ? [] : capStarved(prs, rows);
+  for (const row of capped) starved.push(`${repo}#${row.number}`);
+
   // Stated on the PR, not just in this receipt — and only on `--apply`, since
   // it is a write. A failure here is recorded against the row and never
   // aborts: the report above is the load-bearing output, and losing it
@@ -2487,7 +2687,12 @@ export function runRepo(
       }
     }
   }
-  const blocks = [renderReceipt(rows), stalled, renderUnlandedEligible(repo, eligible)];
+  const blocks = [
+    renderReceipt(rows),
+    stalled,
+    renderUnlandedEligible(repo, eligible),
+    renderCapStarved(repo, capped),
+  ];
   console.log(`## ${repo}\n\n${blocks.filter(Boolean).join("\n\n")}`);
   return rows;
 }
@@ -2522,20 +2727,43 @@ export const repoRunner =
     notify = new Set(),
     // PEN-5442. Repos this fire could not read, by the same
     // collected-by-reference convention as `rotted`/`stranded`: `main` reports
-    // it after the sweep and `alarmExitCode` reads it. A seventh CONSTRUCTOR
-    // argument, deliberately — the per-repo call vector handed to `runRepo` is
-    // unchanged, which is what the "UNCHANGED argument vector" test pins.
+    // it after the sweep and `alarmExitCode` reads it. A CONSTRUCTOR argument
+    // ONLY: `unreadable` is never threaded into the per-repo vector, because
+    // the condition it records — the repo could not be listed — is observed
+    // out here, where the throw is caught, and is never visible inside
+    // `runRepo`.
     unreadable = [],
+    // PEN-5391. The cap-starved cohort, same collected-by-reference
+    // convention. APPENDED as the 8th rather than inserted, so PEN-5442's
+    // `unreadable` keeps the 7th and `run`/`notify` do not move: every
+    // existing positional call site stays correct by construction, which is
+    // what made the PEN-5442 shape safe and is worth preserving rather than
+    // re-earning. Unlike `unreadable` this one IS threaded through to
+    // `runRepo` — a cap deferral is observed per PR inside the sweep
+    // (`starved.push` sits beside `stranded.push`), not out here.
+    starved = [],
   ) =>
   (repo, spent) => {
-    // Spread rather than an unconditional 7th argument, so a fire with no
-    // notify list calls `runRepo` with exactly the arguments it always did.
-    // That keeps the carry test's deep-compare of the argument vector honest
-    // instead of making it assert `undefined` in a new slot.
+    // Spread rather than an unconditional trailing argument, so a fire with
+    // no notify list calls `runRepo` with exactly the positionals it needs and
+    // no `undefined` in the bag's slot.
+    //
+    // PEN-5391 moved `runRepo`'s options bag from slot 7 to slot 8, because
+    // `starved` is now `runRepo`'s 7th positional. Note this is `runRepo`'s
+    // numbering, NOT `repoRunner`'s — `starved` is `repoRunner`'s 8th
+    // constructor argument, and the two vectors are different lengths. Reading
+    // one function's slot number as the other's is exactly how this collision
+    // was first miscounted.
+    //
+    // Both of this file's last two parameter insertions bound a caller's
+    // options bag to the new positional in silence (BLO-51665's rate-limit
+    // test, then this spread), so `runRepo` opens with an
+    // `Array.isArray(starved)` throw naming the slot, which fails the suite
+    // rather than letting a third one through.
     const options = notify.has(repo) ? [{ landable: false }] : [];
     let rows;
     try {
-      rows = run(repo, apply, settleMinutes, spent, rotted, stranded, ...options);
+      rows = run(repo, apply, settleMinutes, spent, rotted, stranded, starved, ...options);
     } catch (error) {
       // PEN-5442: one unreadable repo used to end the WHOLE fire. `fetchOpenPrs`
       // is the first thing `runRepo` does and its throw escaped `runRepo`'s
@@ -2601,23 +2829,47 @@ function reportRotted(rotted) {
 
 /**
  * The exit code for an alarm run: 1 when any repo carried an unlanded-eligible
- * PR, 0 otherwise.
+ * or a cap-starved PR, 0 otherwise.
  *
  * Separated from `main` so the AC4 contract — go visibly red rather than
  * relying on someone noticing by hand — is pinned by a test rather than by
  * reading the shape of `main`.
  *
- * ⛔ `unreadable` is the second term for a reason, and it is the whole reason
- * skipping an unreadable repo is safe. Before PEN-5442 an unreadable repo
- * CRASHED the fire, which at least exited non-zero. Skipping it instead would,
- * on its own, convert that noisy failure into `0` — "no PR has been landable
- * and ignored for UNLANDED_ELIGIBLE_HOURS" asserted over a repo this fire
- * never read. That is the fail-OPEN direction and it is exactly the shape of
- * silent all-clear this detector exists to rule out, so the skip and this term
- * ship together: a repo that went unread makes the alarm red on its own.
+ * ⛔ EVERY term here must be able to go red ON ITS OWN, and each is a separate
+ * parameter rather than one widened array so that a caller cannot satisfy the
+ * contract by passing the wrong cohort in the right slot. The three are
+ * independent conditions with different remedies, and dropping any one of them
+ * during a future merge compiles, passes every test that calls this function
+ * directly, and silently retires an alarm arm — which is why
+ * `pins all three alarm terms at main's call site` reads the call site itself.
+ *
+ * ⛔ `unreadable` is a term for a reason, and it is the whole reason skipping
+ * an unreadable repo is safe. Before PEN-5442 an unreadable repo CRASHED the
+ * fire, which at least exited non-zero. Skipping it instead would, on its own,
+ * convert that noisy failure into `0` — "no PR has been landable and ignored
+ * for UNLANDED_ELIGIBLE_HOURS" asserted over a repo this fire never read. That
+ * is the fail-OPEN direction and it is exactly the shape of silent all-clear
+ * this detector exists to rule out, so the skip and this term ship together: a
+ * repo that went unread makes the alarm red on its own.
+ *
+ * `starved` (PEN-5391) is a THIRD argument rather than a widening of either
+ * existing one because the cohorts are reported separately and have different
+ * remedies, and because every existing caller then keeps its meaning
+ * unchanged. Both optional arguments default to the quiet value for the same
+ * reason: a caller that does not know about a cohort cannot be made red by it.
+ *
+ * ⚠ The stale-hold block is deliberately still NOT here. It is printed, not
+ * alarmed, and that asymmetry predates this cohort: a stale hold names a
+ * decision someone owes, which a red schedule cannot make them take. The
+ * alarming cohorts instead assert that NOTHING is owed and the landing has
+ * not happened anyway, which is a statement about the routine itself.
  */
-export function alarmExitCode(stranded, unreadable = []) {
-  return (stranded ?? []).length > 0 || (unreadable ?? []).length > 0 ? 1 : 0;
+export function alarmExitCode(stranded, unreadable = [], starved = []) {
+  return (stranded ?? []).length > 0 ||
+    (unreadable ?? []).length > 0 ||
+    (starved ?? []).length > 0
+    ? 1
+    : 0;
 }
 
 function main() {
@@ -2636,6 +2888,7 @@ function main() {
   const rotted = [];
   const stranded = [];
   const unreadable = [];
+  const starved = [];
 
   // `finally`, because the cohort is the expensive half of the output and the
   // likeliest thrower is `fetchOpenPrs` — outside `runRepo`'s try, one list
@@ -2649,7 +2902,7 @@ function main() {
   try {
     sweepRepos(
       sweepOrder(targetRepos(), [...notify]),
-      repoRunner(apply, settleMinutes, rotted, stranded, runRepo, notify, unreadable),
+      repoRunner(apply, settleMinutes, rotted, stranded, runRepo, notify, unreadable, starved),
     );
   } finally {
     reportRotted(rotted);
@@ -2673,7 +2926,17 @@ function main() {
         "See the unlanded-eligible block above.",
     );
   }
-  if (alarm) process.exit(alarmExitCode(stranded, unreadable));
+  if (alarm && starved.length > 0) {
+    console.error(
+      `\nALARM: ${starved.length} PR(s) have been eligible for over ` +
+        `${CAP_STARVED_HOURS}h and the per-fire cap has never once offered them ` +
+        `a queue slot — ${starved.join(", ")}.\n` +
+        "Nothing is holding them either; demand is simply outrunning " +
+        `MAX_ENQUEUES_PER_FIRE (${MAX_ENQUEUES_PER_FIRE}). Re-running the routine will not ` +
+        "reach them. See the cap-starved block above.",
+    );
+  }
+  if (alarm) process.exit(alarmExitCode(stranded, unreadable, starved));
 }
 
 export function isMainModule(argvPath = process.argv[1], moduleUrl = import.meta.url) {
