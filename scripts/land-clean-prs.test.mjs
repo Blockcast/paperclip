@@ -4111,12 +4111,42 @@ describe("merge-queue membership is read, not inferred from autoMergeRequest (PE
     assert.equal(row.action, "already-enqueued");
   });
 
-  it(`reports a queue entry older than ${STALE_ENQUEUE_HOURS}h as stale-queued, not stale-enqueue`, () => {
+  it(`reports a HEAD-OF-QUEUE entry older than ${STALE_ENQUEUE_HOURS}h as stale-queued, not stale-enqueue`, () => {
     // Its own action, because `stale-enqueue`'s remedy is `--disable-auto`,
     // which on a directly-enqueued PR disarms nothing and would post a comment
     // claiming a disarm that never happened.
-    const row = classify({ mergeQueueEntry: queued({ enqueuedAt: "2026-09-12T22:00:00Z" }) });
+    const row = classify({
+      mergeQueueEntry: queued({ position: 1, enqueuedAt: "2026-09-12T22:00:00Z" }),
+    });
     assert.equal(row.action, "stale-queued");
+  });
+
+  it("does NOT report a deep-position entry past the threshold — depth is not wedging", () => {
+    // `enqueuedAt` dates entry into the queue, not time stuck. A 40-deep queue
+    // against 18-34 merges/day puts a perfectly healthy PR past
+    // STALE_ENQUEUE_HOURS, and the obvious response to a staleness report —
+    // dequeue and re-enqueue — forfeits the position it has already waited for.
+    for (const position of [2, 7, 40]) {
+      const row = classify({
+        mergeQueueEntry: queued({ position, enqueuedAt: "2026-09-12T22:00:00Z" }),
+      });
+      assert.equal(row.action, "already-enqueued", `position ${position} should not read stale`);
+    }
+  });
+
+  it("does not treat an unreadable position as head-of-queue", () => {
+    // Unread must not manufacture a finding.
+    for (const position of [null, undefined, "1"]) {
+      const row = classify({
+        mergeQueueEntry: queued({ position, enqueuedAt: "2026-09-12T22:00:00Z" }),
+      });
+      assert.equal(row.action, "already-enqueued");
+    }
+  });
+
+  it("does not report a FRESH head-of-queue entry as stale", () => {
+    const row = classify({ mergeQueueEntry: queued({ position: 1 }) });
+    assert.equal(row.action, "already-enqueued");
   });
 
   it("reads an unparseable enqueuedAt as fresh, matching the auto-merge clock", () => {
@@ -4420,5 +4450,62 @@ describe("liveMergeQueueEntry fails toward enqueuing (PEN-5279)", () => {
       null,
     );
     assert.equal(liveMergeQueueEntry("nope", 1, () => assert.fail("queried")), null);
+  });
+});
+
+/**
+ * PEN-5279, Ally review on #3307. The `stale-queued` comment must not
+ * prescribe a remedy that costs the PR its queue position. A head-of-queue
+ * entry has the most to lose from a dequeue, and it is the only entry that can
+ * reach this action at all.
+ */
+describe("the stale-queued comment never prescribes forfeiting the queue position (PEN-5279)", () => {
+  function capture(calls) {
+    return (args) => {
+      calls.push(args);
+      // The `commentOnce` existence probe: no prior comment.
+      if (args[0] === "api") return "[]";
+      return "";
+    };
+  }
+
+  const posted = (calls) =>
+    String(calls.find((a) => a[0] === "pr" && a[1] === "comment")?.at(-1) ?? "");
+
+  it("states the finding without telling the reader to dequeue and re-enqueue", () => {
+    const calls = [];
+    applyRow(
+      "Blockcast/paperclip",
+      {
+        number: 1418,
+        headSha: HEAD,
+        action: "stale-queued",
+        reason: "queue position 1, enqueued 14.0h ago",
+        detail: "queue position 1, enqueued 14.0h ago",
+      },
+      capture(calls),
+    );
+
+    const body = posted(calls);
+    assert.ok(body.length > 0, "expected a comment to be posted");
+    // The exact phrasing Ally flagged, and the generic form of it.
+    assert.doesNotMatch(body, /dequeue and re-?enqueue it/i);
+    assert.match(body, /forfeits this PR's place/i);
+    // It must still say what it found, and that it did nothing.
+    assert.match(body, /FRONT of the merge queue/);
+    assert.match(body, /has taken no action/i);
+  });
+
+  it("does not act on the queue — comment only, no merge or dequeue call", () => {
+    const calls = [];
+    applyRow(
+      "Blockcast/paperclip",
+      { number: 1418, headSha: HEAD, action: "stale-queued", reason: "r", detail: "d" },
+      capture(calls),
+    );
+    assert.ok(
+      !calls.some((a) => a[0] === "pr" && a[1] === "merge"),
+      "stale-queued must never issue a merge/disable-auto call",
+    );
   });
 });
