@@ -72,7 +72,8 @@
     "src/__tests__/unclaimable-queued-run-reap.test.ts",
     "src/__tests__/ws-upgrade-url-log-guard.test.ts",
     "src/__tests__/zoned-cron-equivalence.test.ts",
-    "src/__tests__/zoned-cron-work-bound.test.ts"
+    "src/__tests__/zoned-cron-work-bound.test.ts",
+    "src/__tests__/queued-run-claim-refusal-instrumentation.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }
