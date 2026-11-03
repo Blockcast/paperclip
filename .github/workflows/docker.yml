@@ -1728,3 +1728,57 @@ jobs:
             exit 1
           fi
           # END RETIRE_IN_FLIGHT_LOCK_HANDBACK
+
+  # PEN-5369: a production deploy dispatch that delivered NOTHING must not
+  # report `conclusion: success`.
+  #
+  # On 2026-11-03T07:27Z run 41596391238 dispatched against master, built and
+  # pushed an image, deployed nothing, and concluded `success`. Production sat
+  # 105 commits behind master with every CI signal green —
+  # `paperclip_api_deploy_failed_since_success` at 0, all eleven drift rules
+  # `inactive`, and `scheduled-guard-liveness` green on every run. The cause was
+  # `vars.PAPERCLIP_CI_DEPLOY` no longer reading `true`, which skips all three
+  # jobs below by their shared `if:`, and a SKIPPED job does not fail a run.
+  # `skipped != failed`, and the one alert meant to say "the production deploy
+  # is not working" keys on failure.
+  #
+  # The condition deliberately lives in the shell script rather than in this
+  # `if:`, for the reason recorded on the retire-in-flight-lock step: a
+  # condition expressed as a GitHub expression cannot be executed by a test, and
+  # #1636's review showed two presence-only assertions passing against mutated
+  # code. scripts/check-dispatch-deploy-outcome.test.js runs the real matrix.
+  #
+  # `always()` is required: every case this job exists to catch is one where its
+  # `needs:` were SKIPPED, and the default `success()` would skip this job
+  # alongside them — reproducing the silence exactly.
+  #
+  # ⛔ The `github.event_name == 'workflow_dispatch'` term is the PEN-4841
+  # control, not a stylistic default. A `push` build of this workflow skips
+  # `deploy` BY DESIGN, and reporting that would make every push to master red.
+  # Pinning the event here keeps that whole population silent by construction.
+  deploy-dispatch-outcome:
+    needs: [build-and-push, guard-pending-deploy, guard-pending-deploy-final, deploy]
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master' }}
+    runs-on: arc-paperclip-light
+    timeout-minutes: 5
+    permissions:
+      # A job-level `permissions:` block REPLACES the workflow-level one rather
+      # than merging into it, so the `contents: read` at the top of this file
+      # does not reach here and `actions/checkout` below could not read the
+      # repo without it. Nothing else is needed: this job reads its own `needs`
+      # context and calls no API.
+      contents: read
+    steps:
+      - name: Checkout workflow scripts
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 1
+      - name: Assert this dispatch reached a deploy outcome
+        env:
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          GUARD_RESULT: ${{ needs.guard-pending-deploy.result }}
+          GUARD_BLOCKED: ${{ needs.guard-pending-deploy.outputs.blocked }}
+          FINAL_RESULT: ${{ needs.guard-pending-deploy-final.result }}
+          FINAL_BLOCKED: ${{ needs.guard-pending-deploy-final.outputs.blocked }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+        run: .github/scripts/assert-dispatch-deploy-outcome.sh

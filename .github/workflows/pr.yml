@@ -541,6 +541,27 @@ jobs:
         run: node --test ./scripts/check-stranded-approval-lock.test.js
         timeout-minutes: 1
 
+      # PEN-5369: the three above all concern a deploy that RAN. This one
+      # concerns a deploy that never ran and said nothing. On 2026-11-03 a
+      # dispatch to master built an image, deployed nothing, and concluded
+      # `success` because `vars.PAPERCLIP_CI_DEPLOY` stopped reading `true` and
+      # a SKIPPED job does not fail a run. Production sat 105 commits behind
+      # with every signal green, because the one alert meant to say "the
+      # production deploy is not working" keys on failure and `skipped !=
+      # failed`.
+      #
+      # Executable, and genuinely mutation-tested rather than presence-checked:
+      # the matrix defaults to the shape that broke production, so a case that
+      # forgets a field inherits the defect instead of a benign baseline, and
+      # three seams are mutated to prove the assertions are load-bearing — the
+      # fail() exit status, the deliberate-hold arm, and the
+      # `github.event_name == 'workflow_dispatch'` term that keeps PEN-4841's
+      # push-build population silent by construction.
+      - name: Validate a dispatch reaches a deploy outcome (PEN-5369)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-dispatch-deploy-outcome.test.js
+        timeout-minutes: 1
+
       # BLO-33027: pins the negative admission probe that ends the deploy job.
       # It is the only production-side evidence that
       # ValidatingAdmissionPolicy/paperclip-api-image-approval is EVALUATED
