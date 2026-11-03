@@ -17,6 +17,7 @@ import {
   sanitizeLabelValue,
   type JobBuildInput,
   validatePonytailPluginPath,
+  wakePayloadWithoutWorkspaceWarnings,
 } from "./job-manifest.js";
 import { DEFAULT_OPENCODE_VERSION } from "./runtime-pin.js";
 import { ENV_GUARD_PLUGIN_SCRIPT } from "./env-guard-plugin.js";
@@ -2650,5 +2651,70 @@ describe("buildJobManifest — GitHub egress wrapper PATH ordering (PEN-3732)", 
     const emitted = pathOf(buildJobManifest({ ctx: mockCtx, selfPod }));
     expect(emitted.split(":")[0]).toBe(WRAPPER_BIN);
     expect(resolveUnderDotfiles(emitted, "git")).toBe("image-wrapper");
+  });
+});
+
+
+// PEN-5336. Execution-workspace warnings now ride the wake payload so they
+// reach the agent's prompt, and the resume-delta gate must not see them: a
+// warning is recomputed every dispatch and is frequently the ONLY thing in the
+// payload, so a gate keyed on the rendered string would replace a resumed
+// run's entire heartbeat prompt with the warning.
+//
+// ⚠️ WHY THE GATE IS TESTED THROUGH THIS HELPER AND NOT THROUGH
+// `buildJobManifest`. This package's `package.json` pins a PUBLISHED
+// `@paperclipai/adapter-utils`, which does not render warnings at all -- so a
+// manifest-level "warning-only resume keeps the heartbeat prompt" assertion
+// would pass VACUOUSLY in CI, for the wrong reason, and would keep passing if
+// the strip were deleted. The production image does NOT use that published
+// version (`Dockerfile:490` installs a tarball packed from the in-repo
+// `packages/adapter-utils`), which is exactly why the gate needed fixing. The
+// helper is the part of the fix that can be tested identically under either
+// library, so it is what these assert on.
+describe("wakePayloadWithoutWorkspaceWarnings (PEN-5336)", () => {
+  it("strips executionWorkspace.warnings and nothing else", () => {
+    const stripped = wakePayloadWithoutWorkspaceWarnings({
+      reason: "issue_assigned",
+      comments: [{ body: "hi" }],
+      executionWorkspace: { branchName: "PEN-5336-x", warnings: ["SHARED CHECKOUT CONTENTION: ..."] },
+    }) as Record<string, unknown>;
+
+    expect(stripped.executionWorkspace).toEqual({ branchName: "PEN-5336-x" });
+    expect(stripped.executionWorkspace).not.toHaveProperty("warnings");
+    // Everything that legitimately makes a payload a delta survives.
+    expect(stripped.reason).toBe("issue_assigned");
+    expect(stripped.comments).toEqual([{ body: "hi" }]);
+  });
+
+  it("leaves a warnings-only payload with an empty execution workspace", () => {
+    // The shape a real contention warning arrives on: no reason, no comments,
+    // no branch. Stripped, there is nothing left for the renderer to emit, so
+    // the gate stays off and the heartbeat prompt survives.
+    const stripped = wakePayloadWithoutWorkspaceWarnings({
+      executionWorkspace: { warnings: ["SHARED CHECKOUT CONTENTION: ..."] },
+    }) as Record<string, unknown>;
+    expect(stripped.executionWorkspace).toEqual({});
+  });
+
+  it("keeps a branch pin, which IS a delta", () => {
+    const stripped = wakePayloadWithoutWorkspaceWarnings({
+      executionWorkspace: { branchName: "PEN-5336-x", warnings: ["w"] },
+    }) as Record<string, unknown>;
+    expect(stripped.executionWorkspace).toEqual({ branchName: "PEN-5336-x" });
+  });
+
+  it("does not mutate the caller's payload -- the prompt text still needs the warnings", () => {
+    const payload = { executionWorkspace: { warnings: ["w"] } };
+    wakePayloadWithoutWorkspaceWarnings(payload);
+    expect(payload.executionWorkspace.warnings).toEqual(["w"]);
+  });
+
+  it("passes through anything that is not a payload with a workspace", () => {
+    expect(wakePayloadWithoutWorkspaceWarnings(null)).toBeNull();
+    expect(wakePayloadWithoutWorkspaceWarnings("nope")).toBe("nope");
+    expect(wakePayloadWithoutWorkspaceWarnings({ reason: "r" })).toEqual({ reason: "r" });
+    expect(wakePayloadWithoutWorkspaceWarnings({ executionWorkspace: null })).toEqual({
+      executionWorkspace: null,
+    });
   });
 });

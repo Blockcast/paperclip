@@ -1076,6 +1076,31 @@ const DIND_WAIT_PREAMBLE =
   `i=0; while [ ! -S /var/run/docker.sock ] && [ $i -lt 60 ]; do sleep 0.5; i=$((i+1)); done; ` +
   `if [ ! -S /var/run/docker.sock ]; then echo "dind sidecar socket /var/run/docker.sock never appeared after 30s" >&2; exit 1; fi`;
 
+/**
+ * A shallow copy of a wake payload with `executionWorkspace.warnings` removed.
+ *
+ * PEN-5336: used ONLY for the resume-delta gate, never for the prompt text.
+ * Rendering the stripped payload reproduces, by construction, what
+ * `renderPaperclipWakePrompt(...).length > 0` returned before workspace
+ * warnings existed -- so a warning can be delivered to the prompt without
+ * costing a resumed run its heartbeat prompt.
+ *
+ * Written as a strip-and-render rather than a hand-rolled predicate on
+ * purpose: this package uses the SHARED renderer, whose non-emptiness depends
+ * on sixteen payload fields (issue, blockers, tree holds, checkbox selections,
+ * annotation deltas, ...). A local reason/comments predicate -- which is what
+ * the claude_k8s adapter can get away with, because it has its own minimal
+ * renderer -- would silently change this adapter's gate for all of them.
+ */
+export function wakePayloadWithoutWorkspaceWarnings(wake: unknown): unknown {
+  if (!wake || typeof wake !== "object" || Array.isArray(wake)) return wake;
+  const payload = wake as Record<string, unknown>;
+  const workspace = payload.executionWorkspace;
+  if (!workspace || typeof workspace !== "object" || Array.isArray(workspace)) return wake;
+  const { warnings: _strippedWarnings, ...workspaceWithoutWarnings } = workspace as Record<string, unknown>;
+  return { ...payload, executionWorkspace: workspaceWithoutWarnings };
+}
+
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const { ctx, selfPod } = input;
   const { runId, agent, runtime, config: rawConfig, context, onLog } = ctx;
@@ -1172,19 +1197,39 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // github_pr_* wake reaches the pod with NO PR number / repo in the
   // prompt and the reviewer agent has nothing to act on.
   const taskMarkdown = asString(context.paperclipTaskMarkdown, "").trim();
-  // PEN-5336 left this spelling in place DELIBERATELY, unlike the in-repo
-  // adapters. They resolve `@paperclipai/adapter-utils` by `workspace:*` and so
-  // picked up execution-workspace warnings in the wake prompt immediately; this
-  // package pins a PUBLISHED version (`^2026.428.0`), which neither renders
-  // warnings nor keeps a warnings-only payload alive, so there is nothing here
-  // for them to suppress yet.
+  // PEN-5336: the gate must NOT see execution-workspace warnings.
   //
-  // ⚠️ When this package's adapter-utils dependency is bumped past the release
-  // carrying PEN-5336, change this to
-  // `paperclipWakeHasResumeDeltaContent(context.paperclipWake)` as the in-repo
-  // adapters did. Left as-is, a resumed run whose only wake content is a
-  // workspace warning would drop its entire heartbeat prompt.
-  const shouldUseResumeDeltaPrompt = isResuming && wakePrompt.length > 0;
+  // Warnings now ride the wake payload so they reach the agent's prompt, and
+  // they are frequently the ONLY thing in it. Left keyed on the rendered
+  // string, a resumed run whose only news was "you are sharing a checkout"
+  // would have had its entire heartbeat prompt replaced by the warning --
+  // delivering a warning would cost the run its instructions.
+  //
+  // ⚠️ This package cannot use the shared `paperclipWakeHasResumeDeltaContent`
+  // the ten in-repo adapters switched to: `package.json` pins a PUBLISHED
+  // `@paperclipai/adapter-utils` (`^2026.428.0`) that has no such export, and
+  // importing it fails this package's own `tsc --noEmit` CI job.
+  //
+  // ⛔ That published pin is NOT, however, what the production image resolves,
+  // and assuming it was is the bug this comment replaces. `Dockerfile:490`
+  // runs `npm install --no-save /vendor/adapter-utils.tgz` right after
+  // `npm ci`, and that tarball is packed from the IN-REPO
+  // `packages/adapter-utils` (`Dockerfile:436-463`); `Dockerfile:756` installs
+  // the same tarball beside the adapter at runtime. So the shipped adapter
+  // runs the new renderer even though CI typechecks against the old one.
+  // "Our package.json pins the published version" says nothing about what
+  // ships.
+  //
+  // So the gate strips `executionWorkspace.warnings` and renders what is left.
+  // That is correct under BOTH libraries by construction -- under the
+  // published one the field is not read anyway, and under the in-repo one the
+  // stripped payload is exactly the pre-PEN-5336 input -- and it compiles
+  // against the published types because it uses only `renderPaperclipWakePrompt`.
+  const shouldUseResumeDeltaPrompt =
+    isResuming &&
+    renderPaperclipWakePrompt(wakePayloadWithoutWorkspaceWarnings(context.paperclipWake), {
+      resumedSession: isResuming,
+    }).length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const instructionsContent = input.instructionsContent?.trim() ?? "";
