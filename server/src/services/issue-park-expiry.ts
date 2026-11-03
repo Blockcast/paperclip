@@ -1,9 +1,9 @@
 /**
  * PEN-4420: the deliberate park's RELEASE edge.
  *
- * `parked_until` (BLO-27912 / migration 0222) is read on the wake path in three places,
- * and all of them read it to SUPPRESS. Each defers to `isDeliberateParkActive` below;
- * this list is the registry, so a fourth suppression site belongs here too:
+ * `parked_until` (BLO-27912 / migration 0222) is read in four places, and all of them read
+ * it to SUPPRESS. Each defers to `isDeliberateParkActive` below; this list is the registry,
+ * so a fifth suppression site belongs here too:
  *
  *  - `hasLiveDeliberatePark` (`routes/github-webhook.ts`) — a live park suppresses
  *    `github_check_*` wakes (PEN-4114).
@@ -15,6 +15,12 @@
  *    keeps the row out of the re-dispatch population (PEN-4871). This one was missing
  *    until PEN-4871: the row above stopped being FLAGGED as stranded and went on being
  *    WOKEN anyway, ~9 minutes after every park, at full agent-session cost.
+ *  - `hasLiveDeliberateParkWakePath` (`services/issues.ts`) — the blocker-attention walk's
+ *    `in_review` arm (PEN-5021). The odd one out: it suppresses a false `stalled`
+ *    CLASSIFICATION rather than a wake, so a blocker deliberately stood down stops minting
+ *    a `severity: "high"` attention item. Listed because this registry is of park READERS,
+ *    and that caller existed while the sentence above still read "three places" — the exact
+ *    drift this list exists to prevent, reproduced on the list itself.
  *
  * Nothing read it to RELEASE. `parked_until` passing produced no event on any status, so
  * a parked row whose only wake was the park itself sat inert indefinitely. The park had a
@@ -24,6 +30,33 @@
  * expiry before PEN-4114 either; what that change did was make the silence deliberate and
  * guaranteed rather than accidental and unreliable. Suppression while the park is LIVE is
  * unchanged by this module and must stay that way.
+ *
+ * ## The one place a live park is NOT read, and must not be assumed to be (PEN-5291)
+ *
+ * The `blocked` -> `todo` transition through `PATCH /api/issues/:id` wakes the assignee
+ * immediately and carries NO park term (`routes/issues.ts`: `statusChangedFromBlockedToTodo`
+ * -> `reason: "issue_status_changed"`). A hand-written transition on a parked row therefore
+ * KEEPS the park and gets dispatched about a second later.
+ *
+ * That is not how a row normally reaches `todo`, and conflating the two writers is the trap.
+ * `stranded-blocked-issue-reconciler.ts` flips with a bare `UPDATE` and enqueues nothing, so
+ * a reconciler-drained row lands on `todo` silently, is held there by the dispatch sweep's
+ * filter above, and fires once at its deadline — which is exactly the behaviour the `blocked`
+ * exclusion in `ISSUE_PARK_EXPIRY_WAKE_STATUSES` below assumes and depends on.
+ *
+ * Measured 2026-11-03 on PEN-5159 — one row, one live park (`2026-11-04T12:00Z`), both writers
+ * within six hours, read from a complete `agent_wakeup_requests` history (16 events, neither
+ * the 50-request cap nor the 14-day lookback binding):
+ *
+ *  - reconciler flip at 02:30:29.412Z → NO wake request of any kind;
+ *  - manual PATCH flip at 06:29:11.676Z → wake request 06:29:13.311Z, run claimed 06:29:18.
+ *
+ * Generalise neither half. "A live park suppresses dispatch" is false for the API transition;
+ * "a park is only a timer, never a suppressor" is false for the four readers above, and that
+ * reading is what turned the correct measurement into a proposal to stop draining rows at all.
+ * The unguarded site's cost is bounded — one run per transition, after which the dispatch
+ * filter resumes holding the row — so it is recorded here rather than closed by suppressing a
+ * wake that an operator moving a row to `todo` by hand may well have intended.
  *
  * ## Why this is not a monitor
  *
