@@ -191,7 +191,12 @@ import {
   readRunLogTerminalTail,
   type RunLogTailRead,
 } from "./run-log-terminal-result.js";
-import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
+import {
+  getRunLogStore,
+  isRunLogUnwritableError,
+  RUN_LOG_UNWRITABLE_ERROR_CODE,
+  type RunLogHandle,
+} from "./run-log-store.js";
 import {
   deleteAgentJobExact,
   deleteAgentJobsForRun,
@@ -38865,6 +38870,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         workspaceValidationFailure?.code
         ?? configurationIncompleteFailure?.code
         ?? recordedResponsibleUserDenialCode
+        // PEN-5424: the run log is opened BEFORE the adapter is spawned, so
+        // recording a storage-permission fault as `adapter_failed` names a
+        // component that never ran. That mislabel is most of why this failure
+        // reads as a code regression: what a developer sees is an adapter that
+        // did not start, and nothing says the cause was a directory. Same
+        // reasoning as separating `credential_quarantined` from `relay_failed`
+        // — one code over two causes makes the common one unreadable.
+        //
+        // It also leaves the `adapter_failed` retry arms deliberately: a retry
+        // re-attempts the identical mkdir against the identical root, so the
+        // attempts buy nothing and the run ends at the same place later.
+        ?? (isRunLogUnwritableError(err) ? RUN_LOG_UNWRITABLE_ERROR_CODE : null)
         ?? "adapter_failed";
       logger.error({ err, runId }, "heartbeat execution failed");
 
