@@ -145,6 +145,12 @@ describeEmbeddedPostgres("productivity review service", () => {
     parentId?: string | null;
     originKind?: string;
     executionPolicy?: Record<string, unknown> | null;
+    // PEN-4522: the deliberate-park columns. `parkedDisposition` is the only
+    // writer and sets all four atomically, so fixtures that set one set them all.
+    parkedUntil?: Date | null;
+    parkedAt?: Date | null;
+    parkedReason?: string | null;
+    parkedByAgentId?: string | null;
   }) {
     const companyId = randomUUID();
     const ownerUserId = randomUUID();
@@ -209,6 +215,10 @@ describeEmbeddedPostgres("productivity review service", () => {
       monitorLastTriggeredAt: opts?.monitorLastTriggeredAt ?? null,
       monitorWakeRequestedAt: opts?.monitorWakeRequestedAt ?? null,
       executionPolicy: opts?.executionPolicy ?? null,
+      parkedUntil: opts?.parkedUntil ?? null,
+      parkedAt: opts?.parkedAt ?? null,
+      parkedReason: opts?.parkedReason ?? null,
+      parkedByAgentId: opts?.parkedByAgentId ?? (opts?.parkedUntil ? coderId : null),
       createdAt,
       updatedAt: createdAt,
     });
@@ -9873,6 +9883,284 @@ describeEmbeddedPostgres("productivity review service", () => {
 
     expect(result.created).toBe(0);
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // ===========================================================================
+  // PEN-4522 — the deliberate-park bucket.
+  //
+  // The elapsed split had buckets for monitor-gated and executing time and swept
+  // everything else into `unattended`. A park set with `parkedDisposition` is
+  // neither, so every park longer than `longActiveMs` (6h by default — shorter
+  // than a routine overnight park) was a scheduled false positive. Three measured
+  // instances, each reporting a figure equal to park-to-scan to the minute:
+  // PEN-4441 at 23h, PEN-2343 at 6h24m, PEN-3551 at 6h03m.
+  //
+  // The fix is a fourth bucket, not a fourth gate: once park time has a bucket,
+  // B3's existing `unattendedMs < longActiveMs` arm means what it says and
+  // suppresses without a park term of its own.
+  // ===========================================================================
+
+  // AC2 — the headline case, PEN-2343's shape to the minute. 6h25m episode
+  // anchored at the park (the live instances had `parkedAt` and `startedAt` 3ms
+  // apart, because the assignee parks and the episode begins in the same breath),
+  // a previous monitor that lapsed before it began, `parkedUntil` still 17h out.
+  //
+  // Pre-fix this rendered `0m monitor-gated, 6h 24m unattended (no monitor armed
+  // during this episode; previous monitor lapsed …, before it began)` and filed.
+  it("does not fire long_active_duration while a live deliberate park covers the episode", async () => {
+    const now = new Date("2026-11-03T01:12:51.000Z");
+    const parkedAt = new Date("2026-11-02T18:47:55.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: parkedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(parkedAt.getTime() - 60 * 60 * 1000),
+      parkedAt,
+      parkedUntil: new Date("2026-11-03T18:00:00.000Z"),
+      parkedReason: "Waiting on the hosted-vault attestation rollout. ON WAKE: re-read the gate state.",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // AC3 positive control — the SAME fixture with the park removed, and nothing
+  // else changed. It must still fire, or the fix has suppressed the trigger
+  // rather than the parked case.
+  //
+  // AC4 mutation check: this is the assertion that fails if the park subtraction
+  // is ever applied unconditionally. `parkedUntil`/`parkedAt` are the only fields
+  // that differ from the test above, and the two expectations are opposite — so a
+  // `parkedMs` computed without consulting the row (or a gate that suppresses on
+  // the mere presence of the park columns' type rather than their values) turns
+  // this red. A test green both with and without a park is not testing this.
+  it("still fires long_active_duration on the same episode with no park", async () => {
+    const now = new Date("2026-11-03T01:12:51.000Z");
+    const episodeStartedAt = new Date("2026-11-02T18:47:55.000Z");
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt: episodeStartedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(episodeStartedAt.getTime() - 60 * 60 * 1000),
+      parkedAt: null,
+      parkedUntil: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("- Elapsed accounting: 0m monitor-gated, 6h 24m unattended");
+    // The park bucket is omitted entirely at zero, so an un-parked row renders
+    // byte-identically to the way it did before this bucket existed.
+    expect(review?.description).not.toContain("park-gated");
+    expect(review?.description).not.toContain("deliberate park");
+  });
+
+  // AC1 — the evidence block distinguishes parked from unattended time and names
+  // all four park columns. Asserted on a fixture that still FIRES, because that
+  // is the only shape a manager ever reads this line on: the park covers 2h of a
+  // 14h episode, so 12h of genuinely unattended time remains above the bar.
+  //
+  // This is also the shape the minimum fix in the issue description would have
+  // produced on its own, and the one that proves the two buckets are reported
+  // separately rather than the park merely swallowing the episode.
+  it("renders parked time as its own bucket and names the park fields", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 14 * 60 * 60 * 1000);
+    const parkedAt = startedAt;
+    const parkedUntil = new Date(startedAt.getTime() + 2 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      parkedAt,
+      parkedUntil,
+      parkedReason: "Blocked on the upstream release. ON WAKE: re-check the tag.",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain(
+      `- Elapsed accounting: 0m monitor-gated, 2h 0m park-gated, 12h 0m unattended (deliberate park set by agent \`${seeded.coderId}\` (the assignee) at ${parkedAt.toISOString()}, expired at ${parkedUntil.toISOString()}, reason: "Blocked on the upstream release. ON WAKE: re-check the tag."; no monitor armed during this episode)`,
+    );
+  });
+
+  // BLO-22331 AC2 boundedness — the guard that this suppression cannot become
+  // indefinite, and the reason `deliberateParkWindow` is an interval rather than
+  // `isDeliberateParkActive`'s boolean.
+  //
+  // Same 14h episode, but the park ran for the first 8h and expired 6h ago. The
+  // bucket keeps the 8h it actually covered and nothing after it, so the 6h
+  // residue reaches the bar and the review fires. Nothing has to expire the park,
+  // clear a flag, or emit a release edge: the clamp at `min(parkedUntil, now)` is
+  // the whole bound, and it tightens on every reconcile.
+  //
+  // A boolean `parkedUntil > now` gate would agree with this one case by accident
+  // — the park is expired, so it would also fire — but would diverge on the pair
+  // below, which is why the interval is the thing being tested.
+  it("fires again once an expired park's residue reaches the bar", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 14 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      parkedAt: startedAt,
+      parkedUntil: new Date(startedAt.getTime() + 8 * 60 * 60 * 1000),
+      parkedReason: "Waiting on review.",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `long_active_duration`");
+    expect(review?.description).toContain("0m monitor-gated, 8h 0m park-gated, 6h 0m unattended");
+  });
+
+  // The other half of the boundedness pair, and the case a boolean gate gets
+  // wrong in the opposite direction. The park expired only 1h ago after running
+  // 13h of a 14h episode, so only 1h is genuinely unattended and the row is NOT
+  // yet a long-active stall — a park that just lapsed must not instantly trip a
+  // 6h bar on the 13h it legitimately covered.
+  //
+  // Read with the test above, the pair pins the clamp: 8h park → fires, 13h park
+  // → does not, same episode length, same expired-park state. Only the interval
+  // distinguishes them.
+  it("does not fire on the residue of a park that has only just expired", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 14 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      parkedAt: startedAt,
+      parkedUntil: new Date(now.getTime() - 60 * 60 * 1000),
+      parkedReason: "Waiting on review.",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // The partition invariant, extended. B1 made the split a three-bucket partition
+  // (`gatedMs + executingMs + unattendedMs === elapsedMs`); the park bucket makes
+  // it four, and the two new buckets have to be DISJOINT or the sum breaks and
+  // `unattendedMs` can go negative.
+  //
+  // 20h episode: monitor lapsed 2h in, a run executed hours 0–6, and a park ran
+  // hours 0–10. Inside the unwatched suffix (hours 2–20) the run and the park
+  // overlap by 4h. Executing takes that 4h first and the park bucket keeps only
+  // the non-executing remainder of its own window in that suffix (hours 6–10), so
+  // the line reads 2h + 4h + 4h + 10h === 20h.
+  //
+  // Park time inside the monitor-gated prefix (hours 0–2) stays in `gatedMs` on
+  // purpose, for the same reason B1 gives for executing time: the monitor was
+  // already accounting for it, and moving it would shuffle time between two
+  // buckets that both mean "attended".
+  //
+  // The run starts exactly at `issue.startedAt`, which is load-bearing and not
+  // cosmetic: `activeStartedAt` is `mostRecentDispatchAt`, so a run seeded
+  // mid-episode silently re-anchors the episode to itself (same fixture note as
+  // the B1 test above). The 10h unattended residue keeps this above the bar, so
+  // the review fires and the rendered sum is actually observable — a fixture that
+  // suppressed would prove the arithmetic only by its absence.
+  it("keeps the four elapsed buckets disjoint when a park and a run overlap", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 20 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: new Date(startedAt.getTime() + 2 * 60 * 60 * 1000),
+      parkedAt: startedAt,
+      parkedUntil: new Date(startedAt.getTime() + 10 * 60 * 60 * 1000),
+      parkedReason: "Waiting on review.",
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      status: "succeeded",
+      invocationSource: "assignment",
+      triggerDetail: "system",
+      startedAt,
+      finishedAt: new Date(startedAt.getTime() + 6 * 60 * 60 * 1000),
+      contextSnapshot: { issueId: seeded.issueId, taskId: seeded.issueId },
+      livenessState: "advanced",
+      nextAction: null,
+      createdAt: startedAt,
+      updatedAt: startedAt,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain(
+      "- Elapsed accounting: 2h 0m monitor-gated, 4h 0m executing, 4h 0m park-gated, 10h 0m unattended",
+    );
+  });
+
+  // Fails closed on a half-written park. `parkedDisposition` is the only writer
+  // and sets all four columns atomically, so a deadline with no `parkedAt` is
+  // unreachable through the API — but the columns are independently nullable, and
+  // inventing a start for one would be suppression a row fell into rather than
+  // earned. That is the posture `isDeliberateParkActive` takes on this same column
+  // for the wake paths; the measurement path must not be laxer than the predicate
+  // it borrows its semantics from.
+  it("ignores a park deadline with no recorded park start", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const startedAt = new Date(now.getTime() - 7 * 60 * 60 * 1000);
+    const seeded = await seedAssignedIssue({
+      status: "in_progress",
+      startedAt,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: null,
+      parkedAt: null,
+      parkedUntil: new Date(now.getTime() + 24 * 60 * 60 * 1000),
+      parkedReason: "Deadline with no start.",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("- Elapsed accounting: 0m monitor-gated, 7h 0m unattended");
+    expect(review?.description).not.toContain("park-gated");
   });
 
   // BLO-27698 B3b — the case B3 drops, relocated rather than lost. Same 13h
