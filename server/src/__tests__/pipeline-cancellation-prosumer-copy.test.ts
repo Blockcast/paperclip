@@ -28,7 +28,7 @@ import { pipelineStageExitAutomationCancellationNotice } from "../services/pipel
 describe("pipeline stage-exit cancellation reason", () => {
   const reason = PIPELINE_STAGE_EXIT_CANCELLATION_REASON;
 
-  it("is the single source for every stage-exit cancellation message", () => {
+  it("is a non-empty string, so the rules below cannot pass vacuously", () => {
     expect(reason).toBeTypeOf("string");
     expect(reason.trim()).not.toHaveLength(0);
   });
