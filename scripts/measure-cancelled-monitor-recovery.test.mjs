@@ -126,6 +126,9 @@ describe("findHandoffFailures", () => {
     const { lost, duplicated } = findHandoffFailures([stamped], []);
     assert.equal(lost.length, 1);
     assert.equal(lost[0].identifier, "PEN-4835");
+    // The source id travels with the finding so the re-check never has to look
+    // the row back up by identifier, which can miss and throw.
+    assert.equal(lost[0].id, stamped.id);
     assert.equal(duplicated.length, 0);
   });
 

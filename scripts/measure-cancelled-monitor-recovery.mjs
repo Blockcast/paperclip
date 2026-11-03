@@ -163,9 +163,14 @@ export function findHandoffFailures(issues, recoveryRows) {
     if (!hasRecoveryEmitted(issue)) continue;
     const carriers = byOrigin.get(issue.id) ?? [];
     if (carriers.length === 0) {
-      lost.push({ identifier: issue.identifier, detail: "stamped recoveryEmittedAt, no carrier" });
+      lost.push({
+        id: issue.id,
+        identifier: issue.identifier,
+        detail: "stamped recoveryEmittedAt, no carrier",
+      });
     } else if (carriers.length > 1) {
       duplicated.push({
+        id: issue.id,
         identifier: issue.identifier,
         detail: `${carriers.length} carriers for one obligation`,
       });
@@ -371,9 +376,8 @@ async function main() {
   // before acting on a LOST line.
   const confirmedLost = [];
   for (const row of lost) {
-    const source = issues.find((issue) => issue.identifier === row.identifier);
     const { rows: direct } = await apiList(
-      `/api/companies/${companyId}/issues?originKind=${CARRIER_ORIGIN_KIND}&originId=${source.id}` +
+      `/api/companies/${companyId}/issues?originKind=${CARRIER_ORIGIN_KIND}&originId=${row.id}` +
         `&sortField=id&limit=${LIST_PAGE_LIMIT}`,
     );
     if (direct.length === 0) confirmedLost.push(row);
