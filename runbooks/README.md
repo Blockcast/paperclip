@@ -13,6 +13,12 @@ platform cannot resolve automatically. Each runbook should be:
 
 ## Index
 
+- [`stale-git-index-lock.md`](stale-git-index-lock.md) — a git write
+  in an agent working tree fails with `Unable to create '<path>/.git/index.lock':
+  File exists.` and the lock outlives the run. Covers why neither size nor mtime
+  is evidence of abandonment, the positive holder determination required before
+  removal, and why the removal is a rename. Trigger: that fatal, with no live
+  git process.
 - [`agent-wakeup-terminal-failed.md`](agent-wakeup-terminal-failed.md) — a
   PR-review wake left terminal at `agent_wakeup_requests.status='failed'`,
   which nothing re-drives: decide re-review vs accept without double-posting a
