@@ -142,6 +142,7 @@ import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
 import { publicWorkspaceOperations, resolveWorkspaceRuntimeViewer, withholdUnentitledWorkspaceOperationOutput } from "./workspace-response.js";
+import type { AgentWorkspaceCommandViewer } from "../agent-redaction.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
 import {
   AGENT_PROFILE_CHANGE_CONSENT_FIELDS,
@@ -1007,7 +1008,7 @@ export function agentRoutes(
 
   async function buildAgentDetail(
     agent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
-    options?: { restricted?: boolean },
+    options?: { restricted?: boolean; viewer?: AgentWorkspaceCommandViewer },
   ) {
     const [chainOfCommand, accessState] = await Promise.all([
       svc.getChainOfCommand(agent.id),
@@ -1020,7 +1021,12 @@ export function agentRoutes(
     ]);
 
     const detail = {
-      ...(options?.restricted ? redactForRestrictedAgentView(agent) : redactAgentSecrets(agent)),
+      // PEN-5225: `options.viewer` is OPTIONAL and omitting it withholds the host-executed
+      // workspace command strings — see `redactAgentSecrets`. The restricted branch needs none:
+      // it drops both config columns outright, so there is nothing left to mask.
+      ...(options?.restricted
+        ? redactForRestrictedAgentView(agent)
+        : redactAgentSecrets(agent, options?.viewer)),
       chainOfCommand,
       access: accessState,
     };
@@ -2555,7 +2561,10 @@ export function agentRoutes(
     };
   }
 
-  function redactAgentConfiguration(agent: Awaited<ReturnType<typeof svc.getById>>) {
+  function redactAgentConfiguration(
+    agent: Awaited<ReturnType<typeof svc.getById>>,
+    viewer?: AgentWorkspaceCommandViewer,
+  ) {
     if (!agent) return null;
     return {
       id: agent.id,
@@ -2566,8 +2575,8 @@ export function agentRoutes(
       status: agent.status,
       reportsTo: agent.reportsTo,
       adapterType: agent.adapterType,
-      adapterConfig: containAgentConfig(agent.adapterConfig) ?? null,
-      runtimeConfig: containAgentConfig(agent.runtimeConfig) ?? null,
+      adapterConfig: containAgentConfig(agent.adapterConfig, viewer) ?? null,
+      runtimeConfig: containAgentConfig(agent.runtimeConfig, viewer) ?? null,
       permissions: agent.permissions,
       updatedAt: agent.updatedAt,
     };
@@ -2602,7 +2611,10 @@ export function agentRoutes(
    * enumerates its output, so a new agent column cannot ship by accident. Same
    * material, same file — these two should share a default, and now do.
    */
-  function redactRevisionSnapshot(snapshot: unknown): Record<string, unknown> {
+  function redactRevisionSnapshot(
+    snapshot: unknown,
+    viewer?: AgentWorkspaceCommandViewer,
+  ): Record<string, unknown> {
     // Gate on `isPlainObject`, NOT the local `asRecord`. `asRecord` admits any
     // non-null non-array object, while `redactAgentConfigPayload` sanitizes only
     // plain objects and otherwise returns its argument *by reference*
@@ -2618,7 +2630,7 @@ export function agentRoutes(
     // `?? {}` is a type narrowing, not a live branch: `containAgentConfig`
     // returns `undefined` only for a non-object, which the gate above has
     // already excluded.
-    const contained = containAgentConfig(snapshot) ?? {};
+    const contained = containAgentConfig(snapshot, viewer) ?? {};
     const meta = contained.metadata;
     return {
       // Shape contract preserved exactly: absent or non-object config still
@@ -2660,11 +2672,12 @@ export function agentRoutes(
   // it to an enumerated one first.
   function redactConfigRevision(
     revision: Record<string, unknown> & { beforeConfig: unknown; afterConfig: unknown },
+    viewer?: AgentWorkspaceCommandViewer,
   ) {
     return {
       ...revision,
-      beforeConfig: redactRevisionSnapshot(revision.beforeConfig),
-      afterConfig: redactRevisionSnapshot(revision.afterConfig),
+      beforeConfig: redactRevisionSnapshot(revision.beforeConfig, viewer),
+      afterConfig: redactRevisionSnapshot(revision.afterConfig, viewer),
     };
   }
 
@@ -2982,8 +2995,12 @@ export function agentRoutes(
     }
     const result = await filterAgentsForActor(req, await svc.list(companyId));
     const canReadConfigs = await actorCanReadConfigurationsForCompany(req, companyId);
+    // PEN-5225: `agent_config:read` admits the row; `workspace_runtime:read` decides whether the
+    // host-executed workspace command strings INSIDE it are disclosed. Two gates, not one — the
+    // second is unreachable by any agent (PEN-2852), which is the whole point.
+    const workspaceCommandViewer = await resolveWorkspaceRuntimeViewer(access, req, companyId);
     if (canReadConfigs || req.actor.type === "board") {
-      res.json(result.map((agent) => redactAgentSecrets(agent)));
+      res.json(result.map((agent) => redactAgentSecrets(agent, workspaceCommandViewer)));
       return;
     }
     // `redactForRestrictedAgentView` answers the PEER question — "may this
@@ -3025,7 +3042,9 @@ export function agentRoutes(
     const selfTrustPreset = selfRow ? await resolveAgentSelfTrustPreset(req, selfRow) : null;
     const selfRowId = selfTrustPreset?.kind === "standard" ? selfAgentId : null;
     res.json(result.map((agent) => (
-      agent.id === selfRowId ? redactAgentSecrets(agent) : redactForRestrictedAgentView(agent)
+      agent.id === selfRowId
+        ? redactAgentSecrets(agent, workspaceCommandViewer)
+        : redactForRestrictedAgentView(agent)
     )));
   });
 
@@ -3132,8 +3151,9 @@ export function agentRoutes(
     // sharpest form of the exposure this row closes — a suggest-tier holder is
     // now refused here (`deny_scope`) and must read a named agent instead.
     await assertCanReadConfigurations(req, companyId);
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, companyId);
     const rows = await svc.list(companyId);
-    res.json(rows.map((row) => redactAgentConfiguration(row)));
+    res.json(rows.map((row) => redactAgentConfiguration(row, viewer)));
   });
 
   router.get("/agents/me", async (req, res) => {
@@ -3167,7 +3187,9 @@ export function agentRoutes(
       });
       return;
     }
-    res.json(await buildAgentDetail(agent));
+    res.json(await buildAgentDetail(agent, {
+      viewer: await resolveWorkspaceRuntimeViewer(access, req, agent.companyId),
+    }));
   });
 
   router.get("/agents/me/inbox-lite", async (req, res) => {
@@ -3363,7 +3385,9 @@ export function agentRoutes(
       res.json(await buildAgentDetail(agent, { restricted: true }));
       return;
     }
-    res.json(await buildAgentDetail(agent));
+    res.json(await buildAgentDetail(agent, {
+      viewer: await resolveWorkspaceRuntimeViewer(access, req, agent.companyId),
+    }));
   });
 
   router.get("/agents/:id/configuration", async (req, res) => {
@@ -3374,7 +3398,10 @@ export function agentRoutes(
       return;
     }
     await assertCanReadConfigurations(req, agent.companyId, agent.id);
-    res.json(redactAgentConfiguration(agent));
+    res.json(redactAgentConfiguration(
+      agent,
+      await resolveWorkspaceRuntimeViewer(access, req, agent.companyId),
+    ));
   });
 
   router.get("/agents/:id/config-revisions", async (req, res) => {
@@ -3405,7 +3432,8 @@ export function agentRoutes(
     // an enumerated one first.
     await assertCanReadConfigurations(req, agent.companyId);
     const revisions = await svc.listConfigRevisions(id);
-    res.json(revisions.map((revision) => redactConfigRevision(revision)));
+    const viewer = await resolveWorkspaceRuntimeViewer(access, req, agent.companyId);
+    res.json(revisions.map((revision) => redactConfigRevision(revision, viewer)));
   });
 
   router.get("/agents/:id/config-revisions/:revisionId", async (req, res) => {
@@ -3424,7 +3452,10 @@ export function agentRoutes(
       res.status(404).json({ error: "Revision not found" });
       return;
     }
-    res.json(redactConfigRevision(revision));
+    res.json(redactConfigRevision(
+      revision,
+      await resolveWorkspaceRuntimeViewer(access, req, agent.companyId),
+    ));
   });
 
   router.post("/agents/:id/config-revisions/:revisionId/rollback", async (req, res) => {
@@ -3457,7 +3488,10 @@ export function agentRoutes(
       details: { revisionId },
     });
 
-    res.json(redactAgentSecrets(updated));
+    res.json(redactAgentSecrets(
+      updated,
+      await resolveWorkspaceRuntimeViewer(access, req, updated.companyId),
+    ));
   });
 
   router.get("/agents/:id/runtime-state", async (req, res) => {
@@ -3728,10 +3762,11 @@ export function agentRoutes(
     // The hire approval payload embeds the requested adapterConfig (twice —
     // also under requestedConfigurationSnapshot), so redacting only `agent`
     // would leave the same credentials on the wire one key over. BLO-18969.
+    const hireViewer = await resolveWorkspaceRuntimeViewer(access, req, agent.companyId);
     res.status(201).json({
-      agent: redactAgentSecrets(agent),
+      agent: redactAgentSecrets(agent, hireViewer),
       approval: approval
-        ? { ...approval, payload: containAgentConfig(approval.payload) ?? null }
+        ? { ...approval, payload: containAgentConfig(approval.payload, hireViewer) ?? null }
         : approval,
     });
   });
@@ -3868,7 +3903,10 @@ export function agentRoutes(
       );
     }
 
-    res.status(201).json(redactAgentSecrets(agent));
+    res.status(201).json(redactAgentSecrets(
+      agent,
+      await resolveWorkspaceRuntimeViewer(access, req, agent.companyId),
+    ));
   });
 
   router.patch("/agents/:id/permissions", validate(updateAgentPermissionsSchema), async (req, res) => {
@@ -3927,7 +3965,9 @@ export function agentRoutes(
       },
     });
 
-    res.json(await buildAgentDetail(agent));
+    res.json(await buildAgentDetail(agent, {
+      viewer: await resolveWorkspaceRuntimeViewer(access, req, agent.companyId),
+    }));
   });
 
   router.patch("/agents/:id/instructions-path", validate(updateAgentInstructionsPathSchema), async (req, res) => {
@@ -4535,7 +4575,14 @@ export function agentRoutes(
       details: summarizeAgentUpdateDetails(patchData),
     });
 
-    res.json(redactAgentSecrets(agent));
+    // PEN-5225: the round-trip echo. An entitled editor must read back what it just saved —
+    // handing it the sentinel here is how a masked value gets `PATCH`ed into live config.
+    // (`stripRedactedEnvBindingsFromAdapterConfig` would restore it, but relying on the inverse
+    // to undo a mask the response had no reason to apply is the wrong order of defences.)
+    res.json(redactAgentSecrets(
+      agent,
+      await resolveWorkspaceRuntimeViewer(access, req, agent.companyId),
+    ));
   });
 
   router.post("/agents/:id/pause", async (req, res) => {
@@ -4561,7 +4608,7 @@ export function agentRoutes(
       entityId: agent.id,
     });
 
-    res.json(redactAgentSecrets(agent));
+    res.json(redactAgentSecrets(agent, await resolveWorkspaceRuntimeViewer(access, req, agent.companyId)));
   });
 
   router.post("/agents/:id/resume", async (req, res) => {
@@ -4592,7 +4639,7 @@ export function agentRoutes(
       entityId: agent.id,
     });
 
-    res.json(redactAgentSecrets(agent));
+    res.json(redactAgentSecrets(agent, await resolveWorkspaceRuntimeViewer(access, req, agent.companyId)));
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {
@@ -4624,7 +4671,7 @@ export function agentRoutes(
       entityId: agent.id,
     });
 
-    res.json(redactAgentSecrets(agent));
+    res.json(redactAgentSecrets(agent, await resolveWorkspaceRuntimeViewer(access, req, agent.companyId)));
   });
 
   router.post("/agents/:id/approve", async (req, res) => {
@@ -4678,7 +4725,7 @@ export function agentRoutes(
       details: { source: "agent_detail", approvalId: openApproval?.id ?? null },
     });
 
-    res.json(redactAgentSecrets(agent));
+    res.json(redactAgentSecrets(agent, await resolveWorkspaceRuntimeViewer(access, req, agent.companyId)));
   });
 
   router.post("/agents/:id/terminate", async (req, res) => {
@@ -4748,7 +4795,7 @@ export function agentRoutes(
       },
     });
 
-    res.json(redactAgentSecrets(agent));
+    res.json(redactAgentSecrets(agent, await resolveWorkspaceRuntimeViewer(access, req, agent.companyId)));
   });
 
   router.delete("/agents/:id", async (req, res) => {
