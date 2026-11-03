@@ -263,6 +263,37 @@ export const ISSUE_PARK_EXPIRED_WAKE_REASON = "issue_park_expired";
  *    the reconciler was demonstrably live — it flipped PEN-5217 at 13:15:27Z the same day.
  *    So do NOT infer from an undrained row that the reconciler is wedged; read
  *    `issue.stranded_blocked_reconciled` in `activity_log` before concluding that.
+ *
+ *    The exclusion itself was re-measured 2026-11-03 against a pre-registered prediction,
+ *    on three rows parked to the same millisecond, `09:00:00.000Z`: PEN-4828 and PEN-5291
+ *    (both `in_progress`) each stamped AND delivered an `issue_park_expired` wake that a run
+ *    claimed (09:03:33.037Z, 09:06:47.010Z), while PEN-4554 — `blocked`, zero unresolved
+ *    blockers, held by a pending interaction — stamped nothing and enqueued no wake request
+ *    of ANY reason. Its activity log carries no status change between 2026-10-25T13:06:35Z
+ *    and 09:04:19Z, so it was `blocked` at the anchor rather than drained before it. That
+ *    pairing is the same-millisecond control the down-sweep test above calls for.
+ *
+ *    ⇒ To classify a row you need the suppression REASON, and it is computed per sweep and
+ *    never stored, so no issue field carries it. `paperclipInboxLite` projects
+ *    `unresolvedBlockerCount` and nothing about the hold, which makes a correctly-held row
+ *    byte-identical to a dark one on the surface an agent reads every heartbeat — that
+ *    projection, not the drain, is how this behaviour came to be filed as a high-priority
+ *    defect. The surface that DOES name the hold is the blocked inbox:
+ *    `GET /api/companies/:id/issues?attention=blocked&includeBlockedInboxAttention=true`,
+ *    whose `blockedInboxAttention` carries a `reason`, an `owner`/`action` pair, and the
+ *    identifier of the thing being waited on (`approvalId`, `interactionId`,
+ *    `overdueInteractionId`). Measured 2026-11-03 across that inbox's 81 rows, it resolved
+ *    all five: PEN-5122/5137/5141 `pending_board_decision` each carrying its live
+ *    `approvalId`, PEN-2208 `blocked_chain_stalled` carrying `overdueInteractionId`
+ *    `e3934a88` (open since 2026-10-24), and PEN-4554 held by interaction `1c293b07` — which
+ *    was withdrawn at 09:04:15.554Z, four seconds before its assignee closed the row.
+ *
+ *    Two limits on that surface, both load-bearing. It pages by OFFSET with no truncation
+ *    flag, so a single page is not the population — PEN-5122 sat on page 2 and was absent
+ *    from the first 60 rows, which reads exactly like "not held". And its `reason` is its
+ *    own vocabulary, NOT `BlockedIssueAutoResumeSuppressionReason`: `blocked_chain_stalled`
+ *    is not a member of that union. Use it to find the hold and its id, then confirm the
+ *    suppression against the union; do not map the two by name.
  */
 export const ISSUE_PARK_EXPIRY_WAKE_STATUSES = [
   "backlog",
