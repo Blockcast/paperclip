@@ -269,9 +269,20 @@ const BLACKBOX_MODULE_RE = /^[a-z]+\d{0,3}(?:_[a-z]+\d{0,3})+$/;
 /** BLO-50225: an orc8r network id — a canonical lowercase UUID — spelled out
  *  in a Prometheus label matcher (`networkID="…"`), which cannot derive it at
  *  runtime. A UUID is opaque by design and stays refused under every other
- *  name; this exempts exactly the 8-4-4-4-12 hex layout under exactly this
- *  name, so a non-UUID token under `networkID` is still refused. */
-const UUID_VALUE_NAMES = new Set(["networkID"]);
+ *  name; this exempts exactly the 8-4-4-4-12 hex layout under exactly these
+ *  names, so a non-UUID token under one of them is still refused.
+ *
+ *  PEN-5406 added `companyId`: a Paperclip company id, written into a control
+ *  plane URL and into the issue prose that cites one. Same terms — an exact
+ *  name, on a measured false positive.
+ *
+ *  ⛔ Do NOT generalise this to a `/Id$/` pattern. It reads as the obvious
+ *  cleanup and is precisely the change to decline: it would exonerate
+ *  `sessionId`, `tokenId`, `apiKeyId` and `secretId`, and a UUID genuinely IS
+ *  the credential wherever session ids or API keys are issued as UUIDs. Exact
+ *  names, one at a time, each on a measured false positive. A test pins those
+ *  four as still refused so the generalisation cannot land silently. */
+const UUID_VALUE_NAMES = new Set(["companyId", "networkID"]);
 const CANONICAL_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** Digit runs in a value, for the bound above. */
@@ -282,10 +293,48 @@ function digitRunCount(value: string): number {
 /** BLO-46892: a git commit pin, `rev=<40 lowercase hex>`, as Nix flake inputs
  *  write it (`git+ssh://...?ref=main&rev=<sha>`). A flake input must be a
  *  literal URL, so there is no way to keep the SHA out of the pushed blob, and
- *  every pin bump was refused. Exact name AND exact shape, as above: a 40-hex
- *  value under any other name, or a non-hex value under `rev`, stays subject
- *  to the entropy test. */
+ *  every pin bump was refused. Exact name AND exact shape: a 40-hex value
+ *  under an unanchored name, or a non-hex value under an anchored one, stays
+ *  subject to the entropy test. */
 const GIT_COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
+
+/** PEN-5406: the names a git object id is actually bound to. BLO-46892
+ *  anchored the shape to the single literal `rev`, which is the Nix spelling
+ *  and almost nothing else's: a commit SHA refused under `ref=`, `sha=`,
+ *  `commit=`, `head=` and `headRefOid=` — the GitHub REST query parameter, the
+ *  GraphQL field, and the shell assignment that every workflow and review
+ *  attestation writes. `DIGEST_NAME_RE` does not reach them either; it
+ *  requires a bit-length suffix (`sha256`, `sha1`), so even `commit_sha`
+ *  refused.
+ *
+ *  Measured against the shipped detector, 20k uniform 40-hex values: 95.3%
+ *  refuse under an unanchored name. So this is a real and near-universal false
+ *  positive, not a tail case — but note it is the ENTROPY FLOOR doing that
+ *  work, not the shape, and the remaining 4.7% already passed under every
+ *  name. The name set is widened; `GIT_COMMIT_SHA_RE` and the floor are not.
+ *
+ *  The residual is stated precisely, and the shape argument for it is NOT
+ *  sound: a legacy GitHub personal access token is exactly 40 lowercase hex
+ *  with no prefix, and `VENDOR_KEY_RE` keys on `ghp_` / `github_pat_` / `sk-`
+ *  / `xox*` / `glpat-`, so it does not see one. For that token the entropy
+ *  rule is the only net, and under these names it is now off. What makes the
+ *  residual acceptable is the NAME half alone: no credential is plausibly
+ *  pasted under `ref=` or `headRefOid=`. It would not be acceptable as a
+ *  shape-only exemption, and must not be widened into one. */
+const GIT_OBJECT_NAME_VALUE_NAMES = new Set([
+  "base",
+  "baseRefOid",
+  "base_sha",
+  "commit",
+  "commit_sha",
+  "head",
+  "headRefOid",
+  "head_sha",
+  "oid",
+  "ref",
+  "rev",
+  "sha",
+]);
 
 /** PEN-4438 (D7): a Kubernetes object name, or an in-cluster DNS name, as a
  *  `PrometheusRule` label matcher writes it — `pod`, `name`, `instance`,
@@ -438,7 +487,7 @@ function isContentDigestAssignment(name: string, value: string): boolean {
     if (name === "module" && BLACKBOX_MODULE_RE.test(value)) return true;
   }
   if (K8S_OBJECT_NAME_VALUE_NAMES.has(name) && isKubernetesObjectName(value)) return true;
-  if (name === "rev" && GIT_COMMIT_SHA_RE.test(value)) return true;
+  if (GIT_OBJECT_NAME_VALUE_NAMES.has(name) && GIT_COMMIT_SHA_RE.test(value)) return true;
   if (UUID_VALUE_NAMES.has(name) && CANONICAL_UUID_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
 }
