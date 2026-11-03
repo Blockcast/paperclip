@@ -139,9 +139,15 @@ export interface CostByAgent {
    * `runCount`: {@link IssueCostSummary.runCount} carries that name for a different
    * population — runs counted `FROM heartbeat_runs`, with no `cost_events` join.
    * `heartbeat.ts` writes a cost event only when a run reports spend or token usage, so a
-   * run that produced neither is absent here and present there. For a true per-run
-   * denominator over a window, count `heartbeat_runs`
-   * (`GET /companies/:id/heartbeat-runs?from=…&to=…&countOnly=true`) rather than this.
+   * run that produced neither is absent here and present there. No window-scoped run
+   * count is served to get the true denominator from: `GET /companies/:id/heartbeat-runs`
+   * reads only `agentId`, `limit` and `summary` (`server/src/routes/agents.ts`), and
+   * `heartbeat.list` takes no time bounds — a `from`/`to` passed there is dropped in
+   * silence and you get the company's whole run list, capped at `limit`. Counting that is
+   * a quietly wrong denominator, not a windowed one. Until such a route exists the count
+   * has to come from the table: `count(*) from heartbeat_runs where company_id = … and
+   * created_at` in the window — noting that clock is the run's queue-entry time, while
+   * this aggregate windows on `cost_events.occurred_at`.
    */
   costEventRunCount: number;
   /**
@@ -183,9 +189,20 @@ export interface CostByProviderModel {
    * `runCount`: {@link IssueCostSummary.runCount} carries that name for a different
    * population — runs counted `FROM heartbeat_runs`, with no `cost_events` join.
    * `heartbeat.ts` writes a cost event only when a run reports spend or token usage, so a
-   * run that produced neither is absent here and present there. For a true per-run
-   * denominator over a window, count `heartbeat_runs`
-   * (`GET /companies/:id/heartbeat-runs?from=…&to=…&countOnly=true`) rather than this.
+   * run that produced neither is absent here and present there. No window-scoped run
+   * count is served to get the true denominator from: `GET /companies/:id/heartbeat-runs`
+   * reads only `agentId`, `limit` and `summary` (`server/src/routes/agents.ts`), and
+   * `heartbeat.list` takes no time bounds — a `from`/`to` passed there is dropped in
+   * silence and you get the company's whole run list, capped at `limit`. Counting that is
+   * a quietly wrong denominator, not a windowed one. Until such a route exists the count
+   * has to come from the table: `count(*) from heartbeat_runs where company_id = … and
+   * created_at` in the window — noting that clock is the run's queue-entry time, while
+   * this aggregate windows on `cost_events.occurred_at`.
+   *
+   * ⚠️ DISTINCT WITHIN THIS ROW — do not sum across rows. The group key here is
+   * (provider, biller, billingType, model), so a run that used two models is counted
+   * once in each of their rows and `sum(costEventRunCount)` over the list double-counts
+   * it. Only the ungrouped total is a run count for the window.
    */
   costEventRunCount: number;
   /**
@@ -224,9 +241,20 @@ export interface CostByBiller {
    * `runCount`: {@link IssueCostSummary.runCount} carries that name for a different
    * population — runs counted `FROM heartbeat_runs`, with no `cost_events` join.
    * `heartbeat.ts` writes a cost event only when a run reports spend or token usage, so a
-   * run that produced neither is absent here and present there. For a true per-run
-   * denominator over a window, count `heartbeat_runs`
-   * (`GET /companies/:id/heartbeat-runs?from=…&to=…&countOnly=true`) rather than this.
+   * run that produced neither is absent here and present there. No window-scoped run
+   * count is served to get the true denominator from: `GET /companies/:id/heartbeat-runs`
+   * reads only `agentId`, `limit` and `summary` (`server/src/routes/agents.ts`), and
+   * `heartbeat.list` takes no time bounds — a `from`/`to` passed there is dropped in
+   * silence and you get the company's whole run list, capped at `limit`. Counting that is
+   * a quietly wrong denominator, not a windowed one. Until such a route exists the count
+   * has to come from the table: `count(*) from heartbeat_runs where company_id = … and
+   * created_at` in the window — noting that clock is the run's queue-entry time, while
+   * this aggregate windows on `cost_events.occurred_at`.
+   *
+   * ⚠️ DISTINCT WITHIN THIS ROW — do not sum across rows. The group key here is the
+   * biller, so a run that billed through two of them is counted once in each row and
+   * `sum(costEventRunCount)` over the list double-counts it. Only the ungrouped total is
+   * a run count for the window.
    */
   costEventRunCount: number;
   /**

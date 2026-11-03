@@ -41,8 +41,14 @@ const SUBSCRIPTION_BILLING_TYPES = ["subscription_included", "subscription_overa
  * consumptionCents > 0 || hasTokenUsage)`, so a run that reported neither spend nor token
  * usage is absent here and present there. Raised by @Ceo on #3341: a remedy that moves an
  * error from ABSENT to quietly WRONG, under the name the correct answer would carry, is
- * worse than the absence. The true per-run denominator for a window is a count of
- * `heartbeat_runs` (`GET /companies/:id/heartbeat-runs?from=…&to=…&countOnly=true`).
+ * worse than the absence. There is no served window-scoped run count to get the true
+ * denominator from: `GET /companies/:id/heartbeat-runs` reads only `agentId`, `limit` and
+ * `summary` (`routes/agents.ts`), and `heartbeat.list` takes no time bounds, so a
+ * `from`/`to` passed there is dropped in silence and the response is the company's whole
+ * run list capped at `limit`. Until such a route exists the count has to come from the
+ * table: `count(*) from heartbeat_runs where company_id = … and created_at` in the
+ * window — noting that clock is the run's queue-entry time, while these aggregates
+ * window on `cost_events.occurred_at`.
  *
  * `runlessEventCount` is served beside it because `costEventRunCount` fails the OTHER way:
  * `cost_events.heartbeat_run_id` is nullable (`packages/db/src/schema/cost_events.ts`)
