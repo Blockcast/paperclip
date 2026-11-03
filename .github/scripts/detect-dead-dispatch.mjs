@@ -29,6 +29,25 @@
  * `waiting`; a run that reached a terminal `failure` in 84s is invisible to it.
  * Dying too fast was an unhandled shape, not a handled one that misfired.
  *
+ * THE SECOND SHAPE: A LANE THAT IS SWITCHED OFF (PEN-5261)
+ * --------------------------------------------------------
+ * The same false green has a second cause, and the original predicate absorbed
+ * it as `survived` by construction. Measured 2026-11-03: the 07:23Z slot
+ * dispatched correctly, run 41596391238 built and pushed an image, and
+ * `guard-pending-deploy`, `guard-pending-deploy-final` and `deploy` were ALL
+ * skipped. The run concluded `success`, so the `failure` conjunct above did not
+ * fire and the catch-all claimed a survival — while production sat 90 commits
+ * behind, 22h past its last rollout, with every signal green.
+ *
+ * The cause was `vars.PAPERCLIP_CI_DEPLOY` no longer being `'true'`. That
+ * variable gates the deploy lane's three jobs at the workflow level, so no
+ * dispatch can ship while it is off, and — unlike a death — a replacement
+ * dispatch does not recover it. Each one builds an image and skips identically.
+ * Reporting it as a death would therefore send a human to a lever that cannot
+ * work, which is why it classifies as its own fate and gets its own remedy.
+ *
+ * It is distinguishable, and distinguishable cheaply: see DEPLOY_GATE_JOB_NAME.
+ *
  * WHAT THIS DOES, AND DELIBERATELY DOES NOT DO
  * --------------------------------------------
  * It OBSERVES and REPORTS. It dispatches nothing, cancels nothing, and
@@ -109,6 +128,18 @@ export const DISPATCH_FATE = Object.freeze({
   SURVIVED: 'survived',
   /** Terminal `failure` with `deploy` never executed. The subject of PEN-4224. */
   DIED_BEFORE_DEPLOY: 'died-before-deploy',
+  /**
+   * Terminal `success` in which the deploy lane's ENTRY GUARD never executed,
+   * so `deploy` could not have run whatever the build did. The subject of
+   * PEN-5261: the lane is SWITCHED OFF, not broken.
+   *
+   * Kept distinct from DIED_BEFORE_DEPLOY because the two have opposite
+   * remedies, and reporting one as the other sends a human to the wrong lever.
+   * A death is transient and a later dispatch recovers it; a gated-off lane
+   * recovers from no number of dispatches at all, because every one of them
+   * skips the same way.
+   */
+  LANE_GATED_OFF: 'lane-gated-off',
   /** No completed dispatch run in the window, or the window is empty. */
   NONE: 'none',
   /** Anything unreadable. Reports nothing, reddens nothing. */
@@ -139,6 +170,41 @@ export const COMPLETED_SCAN_LIMIT = 20;
  * false alarm. Widen all three together.
  */
 export const DEPLOY_JOB_NAME = 'deploy';
+
+/**
+ * The deploy lane's ENTRY GUARD job in docker.yml, matched EXACTLY — same
+ * coupling, and the same widening hazard, as DEPLOY_JOB_NAME above.
+ *
+ * This job is the lane's gate made observable. It carries the SAME
+ * workflow-level condition `deploy` carries — the event, the
+ * `vars.PAPERCLIP_CI_DEPLOY` switch, and the ref — and, unlike `deploy`, it
+ * declares no `needs:`. So nothing upstream can cause it to skip: if it
+ * skipped, that shared condition was false, and `deploy` was unreachable from
+ * the moment the run started.
+ *
+ * That is what makes it the discriminator. Both the normal pending-guard skip
+ * and a gated-off lane end with `deploy: skipped` on a GREEN run and are
+ * indistinguishable by run conclusion; they differ here, and only here.
+ */
+export const DEPLOY_GATE_JOB_NAME = 'guard-pending-deploy';
+
+/**
+ * Was the whole deploy lane gated off before it could start?
+ *
+ * `skipped` on the entry guard means the shared condition was false. ABSENT is
+ * deliberately NOT folded in: an absent guard job is what a renamed job, a
+ * matrixed job, or an abbreviated fixture looks like, and claiming a switched-off
+ * lane from a job list that simply does not mention the gate would turn this
+ * module's one loud report into a guess. Absent stays quiet, which is this
+ * module's standing direction everywhere else.
+ *
+ * `cancelled` is likewise excluded by returning false: a cancelled guard is a
+ * supersede stopping the run, and the caller excludes that by run conclusion.
+ */
+export function deployLaneGatedOff(jobs) {
+  const gate = (jobs ?? []).find((job) => job?.name === DEPLOY_GATE_JOB_NAME);
+  return gate?.conclusion === 'skipped';
+}
 
 /**
  * The `deploy` job conclusions that prove the lane was actually REFILLED.
@@ -199,9 +265,22 @@ export function classifyDispatchRun(run, jobs) {
   // failed its migration pre-flight), and it is explicitly not this module's.
   if (deployJobExecuted(jobs)) return DISPATCH_FATE.SURVIVED;
   if (run.conclusion === 'failure') return DISPATCH_FATE.DIED_BEFORE_DEPLOY;
+  // PEN-5261. A GREEN run whose entry guard never executed is the lane being
+  // switched off, and it was previously absorbed by the catch-all below as
+  // "normal, owned behaviour" — which is true of the pending-guard skip the
+  // catch-all was written for, and false of this. Measured 2026-11-03: the
+  // 07:23Z slot dispatched, built an image, skipped all three deploy-lane jobs,
+  // concluded `success`, and classified `survived`, while production sat 90
+  // commits behind with nothing anywhere saying so.
+  //
+  // The `success` conjunct is what keeps the supersede path out: a cancelled
+  // run shows `cancelled` on the guard, not `skipped`, and must stay SURVIVED.
+  if (run.conclusion === 'success' && deployLaneGatedOff(jobs)) {
+    return DISPATCH_FATE.LANE_GATED_OFF;
+  }
   // `cancelled` with deploy never executed, or `success` with deploy skipped by
-  // the pending guard. Neither is a death this module may claim; both are
-  // normal, owned behaviour of the lane.
+  // the pending guard — the guard having RUN and reported blocked. Neither is a
+  // death this module may claim; both are normal, owned behaviour of the lane.
   return DISPATCH_FATE.SURVIVED;
 }
 
@@ -264,6 +343,17 @@ export async function findLastCompletedDispatch({
 }
 
 /**
+ * The fates in which the lane was handed a dispatch and delivered nothing.
+ *
+ * Both qualify for the gap check and the report; they differ only in the
+ * remedy the report names. Everything else — a survival, an empty window, an
+ * unreadable run — is silent.
+ */
+export const LANE_FAILED_TO_DELIVER_FATES = Object.freeze(
+  new Set([DISPATCH_FATE.DIED_BEFORE_DEPLOY, DISPATCH_FATE.LANE_GATED_OFF]),
+);
+
+/**
  * Should this report a dead lane?
  *
  * BOTH conjuncts are required. A dead dispatch with production already AT master
@@ -271,9 +361,14 @@ export async function findLastCompletedDispatch({
  * the dispatcher for a build failure on a commit nobody is waiting to ship.
  * `commitsBehind` must be affirmatively positive: `null` (gap unmeasurable)
  * stays silent, per this module's fail-quiet direction.
+ *
+ * The gap conjunct is why a gated-off lane can join this without making the
+ * dispatcher permanently red for a deliberate pause: a lane switched off while
+ * production is already AT master reports nothing, and only starts reporting
+ * once undelivered commits have actually accumulated behind the switch.
  */
 export function isDeadLane({ fate, commitsBehind }) {
-  if (fate !== DISPATCH_FATE.DIED_BEFORE_DEPLOY) return false;
+  if (!LANE_FAILED_TO_DELIVER_FATES.has(fate)) return false;
   return Number.isFinite(commitsBehind) && commitsBehind > 0;
 }
 
@@ -300,8 +395,9 @@ export async function detectDeadDispatch({
     };
   }
 
-  if (last.fate !== DISPATCH_FATE.DIED_BEFORE_DEPLOY) {
-    // Nothing else is worth an API call: the gap only ever qualifies a death.
+  if (!LANE_FAILED_TO_DELIVER_FATES.has(last.fate)) {
+    // Nothing else is worth an API call: the gap only ever qualifies a lane
+    // that was handed a dispatch and delivered nothing.
     return { fate: last.fate, run: last.run, gap: null, dead: false, reason: null };
   }
 
