@@ -675,15 +675,38 @@ function ghMergeGroupRuns(repo, createdRange) {
   return JSON.parse(out);
 }
 
+// BLO-51600: jobs whose failure reds pr.yml's `verify` -- its `lane_job_names`
+// plus `policy` and `ally-verdict`. `e2e` / `Canary Dry Run` are NOT here: they
+// sit outside `verify.needs`, so their failure cannot fail the queue. Must match
+// GATING_JOBS in .github/scripts/sweep-orphaned-merge-group-runs.sh; both are
+// pinned to pr.yml by tests.
+export const MERGE_GROUP_GATING_JOBS = [
+  "Helm chart",
+  "Typecheck + Release Registry",
+  "General tests",
+  "Worktree install (NODE_ENV=production)",
+  "OpenCode Responses replay",
+  "k8s-ro seed transport cold start",
+  "Build",
+  "Vendored claude_k8s adapter",
+  "Vendored opencode_k8s adapter",
+  "policy",
+  "ally-verdict",
+];
+
+export function isGatingJobName(name) {
+  return MERGE_GROUP_GATING_JOBS.some((g) => name === g || name.startsWith(`${g} (`));
+}
+
 // BLO-51600: one call per CANCELLED run only. A read failure returns false,
 // which keeps the pre-BLO-51600 verdict for that run.
 function ghRunHasFailedJob(repo, runId) {
   try {
     const out = run([
       "gh", "api", `repos/${repo}/actions/runs/${runId}/jobs?per_page=100`,
-      "--jq", '[.jobs[]|select(.conclusion=="failure" or .conclusion=="timed_out")]|length',
+      "--jq", '.jobs[]|select(.conclusion=="failure" or .conclusion=="timed_out")|.name',
     ]);
-    return Number(out.trim()) > 0;
+    return out.split("\n").some((name) => isGatingJobName(name.trim()));
   } catch {
     return false;
   }
