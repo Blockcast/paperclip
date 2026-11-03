@@ -41,6 +41,7 @@ import {
   resolvePaperclipDesiredSkillNames,
   removeMaintainerOnlySkillSymlinks,
   renderTemplate,
+  paperclipWakeHasResumeDeltaContent,
   renderPaperclipWakePrompt,
   isPaperclipRecoveryWakePayload,
   stringifyPaperclipWakePayload,
@@ -608,7 +609,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
         : "";
     const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: canResumeSession });
-    const shouldUseResumeDeltaPrompt = canResumeSession && wakePrompt.length > 0;
+    // PEN-5336: gated on the PAYLOAD, not on the rendered string. Execution
+    // workspace warnings now render into that string and can be the only thing
+    // in it, and a warning must not suppress the full heartbeat prompt.
+    const shouldUseResumeDeltaPrompt =
+      canResumeSession && paperclipWakeHasResumeDeltaContent(context.paperclipWake);
     const renderedHeartbeatPrompt = shouldUseResumeDeltaPrompt || isPaperclipRecoveryWakePayload(context.paperclipWake)
       ? ""
       : renderTemplate(promptTemplate, templateData);

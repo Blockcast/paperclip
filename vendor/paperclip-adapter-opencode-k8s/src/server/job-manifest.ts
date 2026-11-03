@@ -1172,6 +1172,18 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // github_pr_* wake reaches the pod with NO PR number / repo in the
   // prompt and the reviewer agent has nothing to act on.
   const taskMarkdown = asString(context.paperclipTaskMarkdown, "").trim();
+  // PEN-5336 left this spelling in place DELIBERATELY, unlike the in-repo
+  // adapters. They resolve `@paperclipai/adapter-utils` by `workspace:*` and so
+  // picked up execution-workspace warnings in the wake prompt immediately; this
+  // package pins a PUBLISHED version (`^2026.428.0`), which neither renders
+  // warnings nor keeps a warnings-only payload alive, so there is nothing here
+  // for them to suppress yet.
+  //
+  // ⚠️ When this package's adapter-utils dependency is bumped past the release
+  // carrying PEN-5336, change this to
+  // `paperclipWakeHasResumeDeltaContent(context.paperclipWake)` as the in-repo
+  // adapters did. Left as-is, a resumed run whose only wake content is a
+  // workspace warning would drop its entire heartbeat prompt.
   const shouldUseResumeDeltaPrompt = isResuming && wakePrompt.length > 0;
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();

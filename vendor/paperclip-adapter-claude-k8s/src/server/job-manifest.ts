@@ -1650,12 +1650,86 @@ function stringifyPaperclipWakePayload(wake: unknown): string | null {
   }
 }
 
+/** Per-warning character cap, mirroring the shared normalizer's bound. */
+const WAKE_WORKSPACE_WARNING_MAX_CHARS = 2000;
+/** How many workspace warnings are rendered before truncation. */
+const WAKE_WORKSPACE_WARNING_MAX_COUNT = 10;
+
+/**
+ * Pull the execution-workspace warnings off a raw wake payload.
+ *
+ * PEN-5336: this path reads `context.paperclipWake` RAW. This package keeps
+ * local copies of both the renderer and `stringifyPaperclipWakePayload`, so
+ * nothing here goes through adapter-utils' `normalizePaperclipWakePayload` and
+ * its control-character strip never runs. The strip therefore has to be
+ * repeated here: a warning lands verbatim in the prompt, and a newline inside
+ * one would forge a prompt line.
+ */
+function readWakeExecutionWorkspaceWarnings(wake: Record<string, unknown>): string[] {
+  const workspace = wake.executionWorkspace;
+  if (!workspace || typeof workspace !== "object" || Array.isArray(workspace)) return [];
+  const raw = (workspace as Record<string, unknown>).warnings;
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .map((entry) =>
+      typeof entry === "string"
+        ? entry.replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, WAKE_WORKSPACE_WARNING_MAX_CHARS)
+        : "",
+    )
+    .filter(Boolean)
+    .slice(0, WAKE_WORKSPACE_WARNING_MAX_COUNT);
+}
+
+/**
+ * Does this wake payload carry content that justifies a RESUME DELTA -- i.e.
+ * replacing the whole heartbeat prompt with just the new material because the
+ * session is being resumed?
+ *
+ * ⚠️ This used to be spelled `wakePrompt.length > 0`, and PEN-5336 made that
+ * spelling wrong: execution-workspace warnings now render into that string and
+ * are frequently the ONLY thing in it, so the string test would suppress the
+ * entire heartbeat prompt on any resumed run whose only news was "you are
+ * sharing a checkout". A warning is extra context to render, not a delta.
+ *
+ * Returns exactly what `renderPaperclipWakePrompt(...).length > 0` returned
+ * before warnings existed: reason, or at least one non-empty comment body.
+ */
+function wakeHasResumeDeltaContent(wake: unknown): boolean {
+  if (!wake || typeof wake !== "object") return false;
+  const w = wake as Record<string, unknown>;
+  if (typeof w.reason === "string" && w.reason.trim().length > 0) return true;
+  const comments = Array.isArray(w.comments) ? w.comments : [];
+  return comments.some(
+    (c) =>
+      typeof c === "object" &&
+      c !== null &&
+      typeof (c as Record<string, unknown>).body === "string" &&
+      ((c as Record<string, unknown>).body as string).trim().length > 0,
+  );
+}
+
+/**
+ * claude-k8s keeps a LOCAL, minimal wake renderer rather than calling
+ * `renderPaperclipWakePrompt` from adapter-utils. It covers the wake reason,
+ * the comment bodies, and (PEN-5336) execution-workspace warnings.
+ *
+ * ⚠️ It does NOT cover the rest of the shared renderer's output (issue status,
+ * blockers, the branch pin, the planning directive). That divergence predates
+ * PEN-5336 and is not fixed here -- closing it changes every claude_k8s prompt
+ * in the fleet and wants its own change. What is fixed here is the one field
+ * whose absence meant a warning written for the agent reached no prompt at all.
+ */
 function renderPaperclipWakePrompt(wake: unknown, _opts?: { resumedSession?: boolean }): string {
   if (!wake || typeof wake !== "object") return "";
   const w = wake as Record<string, unknown>;
   const reason = typeof w.reason === "string" ? w.reason.trim() : "";
   const comments = Array.isArray(w.comments) ? w.comments : [];
-  if (!reason && comments.length === 0) return "";
+  // PEN-5336: warnings alone must produce a prompt. An unscoped wake carries no
+  // reason and no comments, and that is exactly the shape a shared-checkout
+  // contention warning arrives on -- gating the whole render on reason/comments
+  // would drop it again.
+  const workspaceWarnings = readWakeExecutionWorkspaceWarnings(w);
+  if (!reason && comments.length === 0 && workspaceWarnings.length === 0) return "";
   const parts: string[] = [];
   if (reason) parts.push(`Wake reason: ${reason}`);
   for (const c of comments) {
@@ -1664,6 +1738,9 @@ function renderPaperclipWakePrompt(wake: unknown, _opts?: { resumedSession?: boo
       const body = typeof comment.body === "string" ? comment.body.trim() : "";
       if (body) parts.push(`Comment: ${body}`);
     }
+  }
+  for (const warning of workspaceWarnings) {
+    parts.push(`Execution workspace warning: ${warning}`);
   }
   return parts.join("\n\n");
 }
@@ -3664,7 +3741,11 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // github_pr_* wake reaches the pod with NO PR number / repo in the
   // prompt and the reviewer agent has nothing to act on.
   const taskMarkdown = asString(context.paperclipTaskMarkdown, "").trim();
-  const shouldUseResumeDeltaPrompt = Boolean(claudeResumeSessionId) && wakePrompt.length > 0;
+  // PEN-5336: gated on the PAYLOAD, not on the rendered string -- see
+  // `wakeHasResumeDeltaContent`. A workspace warning must reach the prompt
+  // without costing the run its heartbeat prompt.
+  const shouldUseResumeDeltaPrompt =
+    Boolean(claudeResumeSessionId) && wakeHasResumeDeltaContent(context.paperclipWake);
   const renderedPrompt = shouldUseResumeDeltaPrompt ? "" : renderTemplate(promptTemplate, templateData);
   const sessionHandoffNote = asString(context.paperclipSessionHandoffMarkdown, "").trim();
   const prompt = joinPromptSections([

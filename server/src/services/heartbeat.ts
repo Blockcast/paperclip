@@ -8814,17 +8814,56 @@ export function formatRuntimeWorkspaceWarningLog(warning: string) {
 }
 
 /**
- * Builds `context.paperclipWorkspace` -- the object the adapter context is
- * spread from, i.e. what the agent process actually receives.
+ * The `executionWorkspace` sub-object attached to the wake payload, or null
+ * when there is nothing to say.
  *
- * Extracted from the inline literal so the delivery contract is testable.
- * BLO-27858 shipped a warning that was only ever drained to the run log while
- * its own doc comments claimed it reached the agent; nothing failed, because
- * no test asserted the warning was observable at its claimed destination.
+ * Extracted from the inline literal for the same reason
+ * `buildPaperclipWorkspaceContext` was -- so the delivery contract is testable
+ * -- but note what that extraction did NOT buy last time: a unit test here
+ * proves the server composed the field, not that any adapter rendered it. The
+ * assertion that matters lives in the adapter, against a rendered prompt
+ * string (`job-manifest.test.ts`, "execution workspace warnings reach the pod
+ * prompt (PEN-5336)"). Keep both.
  *
- * Two properties are load-bearing and are pinned by tests:
+ * `warnings` is bound BY REFERENCE for the same reason the context object
+ * binds it that way: callers keep pushing onto `runtimeWorkspaceWarnings`
+ * after this returns.
+ */
+export function buildPaperclipWakeExecutionWorkspacePatch(input: {
+  branchName: string | null;
+  warnings: string[];
+}): { branchName: string | null; warnings: string[] } | null {
+  if (!input.branchName && input.warnings.length === 0) return null;
+  return { branchName: input.branchName, warnings: input.warnings };
+}
+
+/**
+ * Builds `context.paperclipWorkspace` -- a SERVER-SIDE object. Adapters read
+ * selected fields off it; the agent process does not receive it.
  *
- *   * `warnings` is present at all. Drop the key and the agent is told nothing.
+ * PEN-5336 corrected this comment. It used to say this was "the object the
+ * adapter context is spread from, i.e. what the agent process actually
+ * receives", and that was false for every K8s adapter: they enumerate this
+ * object into pod env EXPLICITLY AND BY NAME (nine `setIfPresent` calls in
+ * `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`), so a field
+ * that is not in that list reaches nothing. `warnings` was not in that list.
+ * `PAPERCLIP_WORKSPACES_JSON` does not rescue it either -- that serialises
+ * `context.paperclipWorkspaces` (plural, the workspace hints), a different
+ * object with no `warnings`.
+ *
+ * ⚠️ Do not add a delivery claim back to this comment, and do not satisfy one
+ * with a test that asserts a key exists here. BLO-27858 shipped exactly that
+ * test (`shared-checkout-occupancy.test.ts`) and the warning still reached
+ * nobody for four months, because key-presence on a server-side object is not
+ * delivery. Warnings now reach the agent via the WAKE PAYLOAD
+ * (`PAPERCLIP_WAKE_PAYLOAD_KEY`, attached next to the branch pin at the call
+ * site), which every adapter projects whole and renders into the prompt. That
+ * is the channel to extend, and its regression test must assert the text in a
+ * rendered prompt -- see `job-manifest.test.ts`.
+ *
+ * Two properties of this object remain load-bearing and are pinned by tests:
+ *
+ *   * `warnings` is present at all. It is what the run-log drain reads.
  *   * `warnings` is the CALLER'S ARRAY BY REFERENCE, not a copy. Callers keep
  *     pushing onto it after this returns (session-compaction warnings, for
  *     one), and the run-log drain reads the same array later still. Copying
@@ -36116,12 +36155,28 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     context.paperclipWorkspaces = resolvedWorkspace.workspaceHints;
     // The wake payload is built before the execution workspace is resolved, so
     // attach the branch pin here; the shared wake-prompt renderer surfaces it as
-    // a one-time "stay on this branch" hint on non-resumed sessions.
-    if (executionWorkspace.branchName) {
+    // a one-time "stay on this branch" hint on non-resumed sessions. (The
+    // claude_k8s adapter keeps its own minimal renderer and does NOT surface
+    // the branch pin -- a pre-existing divergence, out of scope for PEN-5336.)
+    //
+    // BLO-27858 / PEN-5336: `warnings` rides the SAME payload, and this is the
+    // only channel that actually reaches the agent. `context.paperclipWorkspace`
+    // (built just above) carries the identical array, but every adapter
+    // enumerates that object into pod env field-by-field by name -- nine fields
+    // in claude_k8s -- and `warnings` has never been one of them, so for four
+    // months the array was computed, bound by reference, drained to the run log,
+    // and delivered to nobody. The wake payload is different in kind: every
+    // adapter projects it whole and renders it into the prompt, which is where
+    // the warning text was always written to be read.
+    const wakeExecutionWorkspacePatch = buildPaperclipWakeExecutionWorkspacePatch({
+      branchName: executionWorkspace.branchName,
+      warnings: runtimeWorkspaceWarnings,
+    });
+    if (wakeExecutionWorkspacePatch) {
       const wakePayloadForWorkspace = parseObject(context[PAPERCLIP_WAKE_PAYLOAD_KEY]);
       context[PAPERCLIP_WAKE_PAYLOAD_KEY] = {
         ...wakePayloadForWorkspace,
-        executionWorkspace: { branchName: executionWorkspace.branchName },
+        executionWorkspace: wakeExecutionWorkspacePatch,
       };
     }
     const runtimeServiceIntents = (() => {
