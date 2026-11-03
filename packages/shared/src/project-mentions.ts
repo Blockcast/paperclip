@@ -392,6 +392,13 @@ const MAX_UNBOUND_MENTION_TOKEN_LENGTH = 64;
 const AT_TOKEN_RE = /@([A-Za-z][A-Za-z0-9._-]*)/g;
 
 /**
+ * A link label that is itself a bare name, with no `@` — the `[Cfo](agent://…)`
+ * form. Anchored on purpose: a label with any other text in it is prose, and is
+ * handled by the `@`-token branch of `boundLabelName` or not at all.
+ */
+const BARE_LABEL_NAME_RE = /^[A-Za-z][A-Za-z0-9._-]*$/;
+
+/**
  * The character class that can open the second half of a scoped package or org
  * path — `@types/node`, `@Blockcast/onprem-k8s-ally-reviewer`. Deliberately
  * excludes `@`, which is what keeps the mention-pair form `@Ceo/@Cto` reported.
@@ -463,31 +470,108 @@ export interface UnboundMentionScanOptions {
 }
 
 /**
- * Return the `@`-shaped tokens in `markdown` that bound to no agent.
+ * Both halves of the mention receipt for one body.
+ *
+ * PEN-5364: `unbound` alone cannot be read. It is deduped on the lowercased
+ * token text, not on the occurrence, so a body that writes `[@Cfo](agent://…)`
+ * once AND bare `@Cfo` in prose produces `["Cfo"]` — byte-identical to a body
+ * that only ever wrote the bare form. The first raised the wake; the second
+ * dropped it. Mixing the two forms is not an error mode, it is the normal way
+ * to write about an agent you are also addressing, so the instrument was
+ * blindest in exactly the case PEN-5180 built it for.
+ *
+ * Reading "link bound, prose is noise" as "nothing bound" costs one redundant
+ * re-send. Reading it the other way costs the whole wake, silently — the 24h
+ * loss PEN-5180 was filed to end. `bound` is what tells the two apart.
+ */
+export interface MentionBindingReport {
+  /**
+   * Names written as the label of an agent-mention link whose target resolved,
+   * i.e. names that DID raise a wake. Same shape, dedupe and caps as `unbound`,
+   * so the two lists are directly comparable: a name in both means the link
+   * bound and the loose prose tokens are noise.
+   */
+  bound: string[];
+  /**
+   * The `@`-shaped tokens that bound to no agent. Unchanged semantics — every
+   * existing reader of `unboundMentions` is unaffected by the addition of
+   * `bound`.
+   */
+  unbound: string[];
+}
+
+/**
+ * Reduce one written reference to the name it reports.
+ *
+ * Accepts the raw capture from `AT_TOKEN_RE` (already `@`-stripped) or a whole
+ * link label (`@Cfo`, `Cfo`, `@Cfo (CFO)`). Returns `null` when there is no
+ * name-shaped token to report.
+ */
+function normalizeMentionToken(raw: string): string | null {
+  // Trim trailing punctuation that markdown prose attaches to a name:
+  // "@Ceo." and "@Ceo-" both mean `Ceo`.
+  const trimmed = raw.replace(/[._-]+$/, "").trim();
+  if (!trimmed) return null;
+  return trimmed.slice(0, MAX_UNBOUND_MENTION_TOKEN_LENGTH);
+}
+
+/**
+ * The name a bound link reports, read off its label.
+ *
+ * Prefers an explicit `@`-token inside the label, so `[@Cfo](agent://…)` and
+ * `[@Cfo — please rule](agent://…)` both report `Cfo` and line up with a prose
+ * `@Cfo` in `unbound`. Falls back to the whole label only when it is itself
+ * name-shaped, which covers the `[Cfo](agent://…)` form.
+ *
+ * A label that is neither — `[the CFO](agent://…)` — reports nothing. There is
+ * no name there to compare against `unbound`, and inventing one by taking the
+ * first word would put prose in a list of names. The residual is that such a
+ * body reads as "nothing bound" and costs one redundant re-send, which is the
+ * cheap direction of the asymmetry above.
+ */
+function boundLabelName(label: string): string | null {
+  const at = new RegExp(AT_TOKEN_RE.source).exec(label);
+  if (at) return normalizeMentionToken(at[1] ?? "");
+  const bare = label.trim();
+  if (!BARE_LABEL_NAME_RE.test(bare)) return null;
+  return normalizeMentionToken(bare);
+}
+
+/**
+ * Return the `@`-shaped tokens in `markdown` that bound to no agent, alongside
+ * the names that did bind.
  *
  * A token is treated as BOUND only when it is the label of a mention link
  * whose target actually resolved:
  *
- *   - `[@Ceo](agent://<id>)` where `<id>` is in `boundAgentIds` — bound, silent.
+ *   - `[@Ceo](agent://<id>)` where `<id>` is in `boundAgentIds` — bound. Not
+ *     reported in `unbound`; reported in `bound`.
  *   - `[@Ceo](agent://<unknown>)` — well formed but resolved to nobody, so the
- *     wake is dropped just as silently as a plain name. Reported.
+ *     wake is dropped just as silently as a plain name. Reported in `unbound`.
  *   - `[@taylor](user://<id>)` and the other non-agent schemes — well-formed
- *     mention syntax for a different subject. Out of scope here, not reported.
- *   - plain `@Ceo` — reported. This is the defect of record.
+ *     mention syntax for a different subject. Out of scope here, reported in
+ *     neither.
+ *   - plain `@Ceo` — reported in `unbound`. This is the defect of record.
  *
  * Code spans, fenced blocks, blockquotes, URLs and email addresses are masked
  * first: a name inside a quoted prior comment or a `user@host` is not somebody
  * asking for a wake, and reporting it would train readers to ignore the field.
  * A token directly followed by `/<scope-char>` is skipped for the same reason —
  * `@types/node` is a package, not a person (PEN-5187).
+ *
+ * The masking applies to `unbound` only. `bound` is read off the raw link scan
+ * on purpose, because that is what the wake itself does: `findMentionedAgents`
+ * runs `extractAgentMentionIds` over the unmasked body, so an `agent://` link
+ * inside a fenced block really does raise a wake. Masking it here would report
+ * a wake that happened as one that did not.
  */
-export function extractUnboundMentionTokens(
+export function extractMentionBindingReport(
   markdown: string,
   options: UnboundMentionScanOptions = {},
-): string[] {
-  if (!markdown) return [];
+): MentionBindingReport {
+  if (!markdown) return { bound: [], unbound: [] };
 
-  const bound = new Set(options.boundAgentIds ?? []);
+  const boundIds = new Set(options.boundAgentIds ?? []);
   // Indexed by UTF-16 code unit, which is the offset space every `RegExp`
   // below reports in, so masking stays aligned with the original string.
   const units = markdown.split("");
@@ -502,6 +586,8 @@ export function extractUnboundMentionTokens(
   // Mask the labels of mention links that are NOT an unresolved agent link.
   // Scan the original text so a link is still located even if a later pass
   // blanked part of its href.
+  const boundSeen = new Set<string>();
+  const boundTokens: string[] = [];
   const linkScanner = new RegExp(ANY_MENTION_LINK_RE.source, ANY_MENTION_LINK_RE.flags);
   let link: RegExpExecArray | null;
   while ((link = linkScanner.exec(markdown)) !== null) {
@@ -512,7 +598,16 @@ export function extractUnboundMentionTokens(
       // An agent link that resolved is bound. One that did not is left visible
       // so its label is reported — a well-formed href pointing at nobody drops
       // the wake exactly as silently as a plain name does.
-      if (!parsed || !bound.has(parsed.agentId)) continue;
+      if (!parsed || !boundIds.has(parsed.agentId)) continue;
+      // PEN-5364: record what DID bind, so a mixed-form body is readable.
+      const name = boundLabelName(link[1] ?? "");
+      if (name) {
+        const key = name.toLowerCase();
+        if (!boundSeen.has(key) && boundTokens.length < MAX_UNBOUND_MENTION_TOKENS) {
+          boundSeen.add(key);
+          boundTokens.push(name);
+        }
+      }
     }
     maskRange(units, link.index, link.index + link[0].length);
   }
@@ -542,12 +637,9 @@ export function extractUnboundMentionTokens(
     const after = scanned.slice(match.index + match[0].length, match.index + match[0].length + 2);
     if (after[0] === "/" && after[1] !== undefined && SCOPE_PATH_CHAR_RE.test(after[1])) continue;
 
-    // Trim trailing punctuation that markdown prose attaches to a name:
-    // "@Ceo." and "@Ceo-" both mean `Ceo`.
-    const raw = (match[1] ?? "").replace(/[._-]+$/, "");
-    if (!raw) continue;
+    const token = normalizeMentionToken(match[1] ?? "");
+    if (!token) continue;
 
-    const token = raw.slice(0, MAX_UNBOUND_MENTION_TOKEN_LENGTH);
     const key = token.toLowerCase();
     if (seen.has(key)) continue;
     seen.add(key);
@@ -555,5 +647,16 @@ export function extractUnboundMentionTokens(
     if (tokens.length >= MAX_UNBOUND_MENTION_TOKENS) break;
   }
 
-  return tokens;
+  return { bound: boundTokens, unbound: tokens };
+}
+
+/**
+ * Back-compatible view of {@link extractMentionBindingReport}: the unbound half
+ * only, with its semantics unchanged.
+ */
+export function extractUnboundMentionTokens(
+  markdown: string,
+  options: UnboundMentionScanOptions = {},
+): string[] {
+  return extractMentionBindingReport(markdown, options).unbound;
 }
