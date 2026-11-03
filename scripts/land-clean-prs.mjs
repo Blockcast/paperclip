@@ -1070,16 +1070,25 @@ export function classifyAll(
     spent = 0,
   } = {},
 ) {
-  let enqueued = spent;
-  return (prs ?? []).map((pr) => {
-    const classified = classifyPr(pr, { now, settleMinutes });
-    if (classified.action !== "enqueue") return classified;
-    if (enqueued >= maxEnqueues) {
-      return { ...classified, action: "skip", reason: `cap:${maxEnqueues}-per-fire` };
-    }
-    enqueued += 1;
-    return classified;
-  });
+  const rows = (prs ?? []).map((pr) => classifyPr(pr, { now, settleMinutes }));
+  // The cap is spent OLDEST PR FIRST (BLO-51664). `gh pr list` returns newest
+  // first, so allocating in listing order handed every fire's budget to the
+  // newest arrivals while older landable PRs were deferred fire after fire —
+  // starvation, not a one-off miss. Ascending PR number is the age proxy;
+  // output order is unchanged.
+  const winners = new Set(
+    rows
+      .map((row, i) => ({ row, i, n: prs[i]?.number ?? Infinity }))
+      .filter(({ row }) => row.action === "enqueue")
+      .sort((a, b) => a.n - b.n)
+      .slice(0, Math.max(0, maxEnqueues - spent))
+      .map(({ i }) => i),
+  );
+  return rows.map((row, i) =>
+    row.action !== "enqueue" || winners.has(i)
+      ? row
+      : { ...row, action: "skip", reason: `cap:${maxEnqueues}-per-fire` },
+  );
 }
 
 /**
