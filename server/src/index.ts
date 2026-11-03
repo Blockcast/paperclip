@@ -1791,6 +1791,23 @@ export async function startServer(): Promise<StartedServer> {
             logger.error({ err }, "startup undeliverable-monitor reconciliation failed");
           }
 
+          // PEN-5346: hand back the obligation a `cancelled` clear destroyed.
+          // Ordered AFTER the clear above so a row demoted by a cancel is
+          // already carrying the residue this pass selects on, and the whole
+          // post-condition lands in one startup pass rather than two.
+          if (heartbeatSchedulerStopped) return;
+          try {
+            const handedBack = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+            if (handedBack.recovered > 0 || handedBack.cleared > 0 || handedBack.failed > 0) {
+              logger.warn(
+                { ...handedBack },
+                "startup cancelled-monitor recovery handed back wakes destroyed by a cancel (PEN-5346)",
+              );
+            }
+          } catch (err) {
+            logger.error({ err }, "startup cancelled-monitor recovery reconciliation failed");
+          }
+
           if (heartbeatSchedulerStopped) return;
           try {
             const failedWakeDispatches = await heartbeat.reconcileFailedWakeDispatches();
@@ -2426,6 +2443,31 @@ export async function startServer(): Promise<StartedServer> {
             })
             .catch((err) => {
               logger.error({ err }, "periodic undeliverable-monitor reconciliation failed");
+            }));
+
+          // PEN-5346: the handoff half of the same post-condition, and
+          // deliberately an INDEPENDENT pass rather than a `.then` off the
+          // clear above — for the same backstop reason that comment gives. A
+          // handoff that only runs when the clear succeeded is not a handoff:
+          // the conditions that make the clear throw are exactly the conditions
+          // that strand obligations. Running the two concurrently means a row
+          // cleared this tick is normally picked up on the next one, which is
+          // the cost of that independence and is paid in one tick interval.
+          // It needs no ordering for safety either: this pass reads the
+          // persisted residue and CASes on it, so a clear landing mid-pass is
+          // simply seen next time.
+          trackHeartbeatSchedulerWork(heartbeat
+            .reconcileCancelledIssueMonitorRecoveries()
+            .then((handedBack) => {
+              if (handedBack.recovered > 0 || handedBack.cleared > 0 || handedBack.failed > 0) {
+                logger.warn(
+                  { ...handedBack },
+                  "periodic cancelled-monitor recovery handed back wakes destroyed by a cancel",
+                );
+              }
+            })
+            .catch((err) => {
+              logger.error({ err }, "periodic cancelled-monitor recovery reconciliation failed");
             }));
 
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
