@@ -392,13 +392,20 @@ jobs:
               # backstop step at the bottom of this job, so `conclusion` carries
               # it too — the signal PEN-2848 made load-bearing.
               if [ "$DEAD_FATE" = "lane-gated-off" ]; then
-                # PEN-5261. Do NOT offer the manual dispatch here. It is the
-                # right lever for a death and the wrong one for this: the lane
-                # is gated off at the workflow level, so a manual dispatch
-                # builds another image and skips the same three jobs. Naming it
+                # PEN-5261. Do NOT offer the manual dispatch as THE fix here.
+                # It is the right lever for a death and the wrong one for this:
+                # while the variable is off, a manual dispatch builds another
+                # image and skips the same three jobs, so naming it up front
                 # would read as a fix and burn a human's attention proving it
                 # is not.
-                echo "::warning::The last production dispatch (run $DEAD_ID) concluded $DEAD_CONCLUSION but the deploy lane never STARTED — guard-pending-deploy was skipped, so docker.yml refused the lane before the build finished. master is $BEHIND commit(s) ahead. Dispatching again will NOT help; the deploy lane is switched off."
+                #
+                # It IS named at the end, strictly as the step AFTER the
+                # variable is restored. Ally caught the gap on review: this
+                # report does not stop when the variable comes back, because the
+                # last completed dispatch is still the gated-off run, so the
+                # hourly slots keep firing until a fresh dispatch exists. Left
+                # unsaid, that is up to a day of self-inflicted hourly red.
+                echo "::warning::The last production dispatch (run $DEAD_ID) concluded $DEAD_CONCLUSION but the deploy lane never STARTED — guard-pending-deploy was skipped, so docker.yml refused the lane before the build finished. master is $BEHIND commit(s) ahead. Dispatching again will NOT help until vars.PAPERCLIP_CI_DEPLOY is restored; the deploy lane is switched off."
                 {
                   echo "### ⚠️ The production deploy lane is switched OFF — dispatching is not the fix"
                   echo
@@ -414,14 +421,21 @@ jobs:
                   echo "github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master'"
                   echo "\`\`\`"
                   echo
-                  echo "The dispatch satisfies the first and third by construction, so **\`vars.PAPERCLIP_CI_DEPLOY\` is not \`true\`**."
+                  echo "This report is only made for a \`workflow_dispatch\` run whose head branch IS \`master\`, so the first and"
+                  echo "third conjuncts held and **\`vars.PAPERCLIP_CI_DEPLOY\` is not \`true\`**."
                   echo
-                  echo "⛔ **Re-dispatching cannot clear this.** Every dispatch builds an image and skips the same three jobs,"
-                  echo "which is why this is reported separately from a dispatch that died — that one a later dispatch recovers."
+                  echo "⛔ **Re-dispatching cannot clear this while the variable is off.** Every dispatch builds an image and"
+                  echo "skips the same three jobs, which is why this is reported separately from a dispatch that died — that"
+                  echo "one a later dispatch recovers."
                   echo
                   echo "**The lever is the repository variable**, in Settings → Secrets and variables → Actions. If the lane was"
                   echo "paused deliberately, nothing here is wrong except that nobody recorded it — this report is how it stops"
                   echo "being silent, and it clears itself once production is no longer behind."
+                  echo
+                  echo "↩️ **Once the variable is back to \`true\`, there is a second step.** This report does not stop on its own:"
+                  echo "the last completed dispatch is still the gated-off run, so the hourly slots keep reporting it until a"
+                  echo "FRESH dispatch exists. Run this workflow manually to ship immediately — otherwise the next daily slot"
+                  echo "clears it, and the report stands until then."
                 } >> "$GITHUB_STEP_SUMMARY"
               else
                 echo "::warning::The last production dispatch (run $DEAD_ID) concluded $DEAD_CONCLUSION WITHOUT reaching the deploy job, and master is $BEHIND commit(s) ahead. The day's dispatch was consumed and nothing shipped."
@@ -717,7 +731,7 @@ jobs:
           DEAD_FATE: ${{ steps.dispatch.outputs.dead_fate }}
         run: |
           if [ "$DEAD_FATE" = "lane-gated-off" ]; then
-            echo "::error::The production deploy lane is switched off: the last dispatch built an image and skipped guard-pending-deploy, guard-pending-deploy-final and deploy, so nothing shipped and master is still ahead. vars.PAPERCLIP_CI_DEPLOY is not 'true'. Dispatching again will NOT help — every dispatch skips the same way. See the step summary."
+            echo "::error::The production deploy lane is switched off: the last dispatch built an image and skipped guard-pending-deploy, guard-pending-deploy-final and deploy, so nothing shipped and master is still ahead. vars.PAPERCLIP_CI_DEPLOY is not 'true'. Dispatching again will NOT help until that variable is restored — every dispatch skips the same way; once it is back, run this workflow manually to ship without waiting for the daily slot. See the step summary."
           else
             echo "::error::The last production dispatch died before reaching the deploy job, so the dispatch it was given shipped nothing and master is still ahead. This slot cannot dispatch a replacement (it is not the daily slot); a manual run of this workflow dispatches at any hour. See the step summary."
           fi

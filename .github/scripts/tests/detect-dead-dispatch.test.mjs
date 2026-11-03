@@ -22,6 +22,7 @@ import {
   DEPLOY_JOB_NAME,
   DISPATCH_FATE,
   classifyDispatchRun,
+  DEPLOY_BRANCH,
   DEPLOY_GATE_JOB_NAME,
   LANE_FAILED_TO_DELIVER_FATES,
   deployJobCompleted,
@@ -181,13 +182,17 @@ test('the deploy job name is matched EXACTLY, and shares that coupling deliberat
 // ---------------------------------------------------------------------------
 
 const listPath = '/actions/workflows/docker.yml/runs';
-const run = (id, status, conclusion, createdAt) => ({
+const run = (id, status, conclusion, createdAt, headBranch = 'master') => ({
   id,
   status,
   conclusion,
   created_at: createdAt,
   updated_at: createdAt,
   head_sha: `sha-${id}`,
+  // The live API always carries this, and every real production dispatch is on
+  // master. The gated-off claim reads it, so omitting it here would make these
+  // fixtures quieter than the runs they stand for.
+  head_branch: headBranch,
   html_url: `https://github.com/Blockcast/paperclip/actions/runs/${id}`,
 });
 
@@ -460,16 +465,18 @@ const GATED_OFF_JOBS = jobs(
   ['deploy', 'skipped'],
 );
 
+const GATED_OFF_RUN = { status: 'completed', conclusion: 'success', head_branch: 'master' };
+
 test('replay 2026-11-03 run 41596391238: a GREEN run whose entry guard never ran is the lane switched off', () => {
   assert.equal(
-    classifyDispatchRun({ status: 'completed', conclusion: 'success' }, GATED_OFF_JOBS),
+    classifyDispatchRun(GATED_OFF_RUN, GATED_OFF_JOBS),
     DISPATCH_FATE.LANE_GATED_OFF,
   );
   // And it must NOT be reported as the death it superficially resembles: the
   // remedies are opposite. A death is recovered by a later dispatch; this is
   // recovered by no dispatch at all.
   assert.notEqual(
-    classifyDispatchRun({ status: 'completed', conclusion: 'success' }, GATED_OFF_JOBS),
+    classifyDispatchRun(GATED_OFF_RUN, GATED_OFF_JOBS),
     DISPATCH_FATE.DIED_BEFORE_DEPLOY,
   );
 });
@@ -477,7 +484,7 @@ test('replay 2026-11-03 run 41596391238: a GREEN run whose entry guard never ran
 test('the discriminator is the ENTRY GUARD, not the deploy job — both shapes end with deploy skipped', () => {
   // The pair that makes the predicate worth having. Identical run conclusion,
   // identical `deploy` conclusion; they differ only in whether the guard RAN.
-  const run = { status: 'completed', conclusion: 'success' };
+  const run = { status: 'completed', conclusion: 'success', head_branch: 'master' };
   const pendingGuardBlocked = jobs(
     ['build-and-push', 'success'],
     ['guard-pending-deploy', 'success'],
@@ -503,7 +510,7 @@ test('an ABSENT entry guard is never claimed as gated off — absent is unknown,
   assert.equal(deployLaneGatedOff([]), false);
   assert.equal(deployLaneGatedOff(undefined), false);
   assert.equal(
-    classifyDispatchRun({ status: 'completed', conclusion: 'success' }, jobs(['deploy', 'skipped'])),
+    classifyDispatchRun(GATED_OFF_RUN, jobs(['deploy', 'skipped'])),
     DISPATCH_FATE.SURVIVED,
   );
 });
@@ -529,9 +536,41 @@ test('a CANCELLED run whose entry guard was skipped is still a supersede, not a 
   // that as a switched-off lane would redden the dispatcher on every successful
   // supersede, which is exactly the over-claiming this module refuses.
   assert.equal(
-    classifyDispatchRun({ status: 'completed', conclusion: 'cancelled' }, GATED_OFF_JOBS),
+    classifyDispatchRun(
+      { status: 'completed', conclusion: 'cancelled', head_branch: 'master' },
+      GATED_OFF_JOBS,
+    ),
     DISPATCH_FATE.SURVIVED,
   );
+});
+
+test('a hand-dispatched FEATURE BRANCH is not a switched-off lane — same skip, other conjunct', () => {
+  // Ally caught this on review at c5e86458. `guard-pending-deploy`'s condition
+  // has three conjuncts and a skipped guard proves only that ONE was false.
+  // `findLastCompletedDispatch` never filters by branch, so a human dispatching
+  // `docker.yml` by hand off a feature branch produces this shape off the REF
+  // conjunct, becomes the lane's last completed dispatch, and would be reported
+  // as `lane-gated-off` — naming a variable that may be perfectly healthy.
+  //
+  // Harmless before this fate existed (it classified `survived`); loud now.
+  assert.equal(DEPLOY_BRANCH, 'master');
+  assert.equal(
+    classifyDispatchRun(
+      { status: 'completed', conclusion: 'success', head_branch: 'release/v9' },
+      GATED_OFF_JOBS,
+    ),
+    DISPATCH_FATE.SURVIVED,
+    'the ref conjunct explains this skip; the variable is not implicated',
+  );
+  // Absent is not master either — the fail-quiet direction this module takes
+  // everywhere, and the same one `deployLaneGatedOff` takes for an absent guard.
+  assert.equal(
+    classifyDispatchRun({ status: 'completed', conclusion: 'success' }, GATED_OFF_JOBS),
+    DISPATCH_FATE.SURVIVED,
+    'an unreadable ref is not evidence the switch is off',
+  );
+  // And the real shape still reports, so this conjunct cannot silence the lane.
+  assert.equal(classifyDispatchRun(GATED_OFF_RUN, GATED_OFF_JOBS), DISPATCH_FATE.LANE_GATED_OFF);
 });
 
 test('a switched-off lane with production AT master reports nothing', () => {
