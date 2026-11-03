@@ -3288,3 +3288,146 @@ describe("merge-queue eviction wake (BLO-23395)", () => {
     expect(merged.githubMergeQueueEvictionBody).toBeUndefined();
   });
 });
+
+describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliverable B)", () => {
+  const issue = {
+    id: "issue-1",
+    identifier: "PEN-5181",
+    title: "Stage 0 of the D1 broker enablement has no carrier row",
+    workMode: "standard",
+    description: null,
+  };
+
+  // THE measurement this deliverable exists for. PEN-5082 instance 3 is two runs of one
+  // agent: the run that pushed was woken `github_pr_merge_queue_evicted` and renders the
+  // eviction branch; the run holding the prohibition was woken `issue_comment_mentioned`
+  // with no PR context and renders none of it. A directive reachable only from the
+  // eviction wake reaches one of the two. This case is the wake shape of the run that
+  // could not see it, and it must now see it.
+  it("renders on a wake carrying NO prReview context at all", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      wakeComment: {
+        id: "comment-1",
+        body: "Do not push to this head until the board rules.",
+      },
+    });
+
+    expect(markdown).toContain("Pre-write re-read directive:");
+    expect(markdown).toContain("Recording a constraint:");
+    // The two live reads it mandates, named individually: a test that pinned only the
+    // heading would pass against a section that had quietly lost one of them.
+    expect(markdown).toContain("`activeRun` (`paperclipGetIssue`)");
+    expect(markdown).toContain("--json headRefOid,state,mergeStateStatus");
+  });
+
+  it("renders on an issue-only wake, with no wake comment and no PR", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("Pre-write re-read directive:");
+    expect(markdown).toContain("Recording a constraint:");
+  });
+
+  // The other half of instance 3. Both runs must carry it, which is the property that
+  // makes this a pre-write gate rather than one wake path's paragraph.
+  it("also renders on the merge-queue eviction wake, alongside that branch's own text", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      prReview: {
+        wakeReason: "github_pr_merge_queue_evicted",
+        prNumber: 3205,
+        repoFullName: "Blockcast/paperclip",
+        event: "issue_comment",
+        prRole: "author",
+        prAuthorLogin: "allyblockcast[bot]",
+      },
+    });
+
+    expect(markdown).toContain("GitHub merge-queue eviction directive:");
+    expect(markdown).toContain("Pre-write re-read directive:");
+  });
+
+  // The verb list is the whole reach of the rule. #3291 widened the eviction branch's own
+  // list from the single verb it suggested; this keeps the unconditional copy from being
+  // narrowed back to "push" by a later edit that reads the list as prose.
+  it("names every write verb, not only pushing", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    for (const verb of [
+      "push",
+      "force-push",
+      "rebase",
+      "enqueue",
+      "auto-merge",
+      "review-request removal",
+    ]) {
+      expect(markdown).toContain(verb);
+    }
+  });
+
+  // Constraint 1 on PEN-5350, and the reason a re-read that re-reads the prompt buys
+  // nothing: PEN-5082 measured the platform's own SHARED CHECKOUT CONTENTION warning
+  // computed once at dispatch, so the holding run's copy named two siblings and the run
+  // that went on to push was not among them -- it did not yet exist.
+  it("says plainly that the values in the prompt are a dispatch-time snapshot", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("computed when this run was DISPATCHED, not now");
+    expect(markdown).toContain("Re-reading this prompt is not re-reading state.");
+  });
+
+  // Deliberate absence with a named trigger, not an oversight. PEN-5340 hands over a
+  // lookup sentence citing `GET /api/companies/:companyId/work-products/by-external-id`,
+  // which Blockcast/paperclip#3310 ships and which 404s until it merges. A directive
+  // citing a 404 teaches a run the lookup is broken. When #3310 merges, add the sentence
+  // (it is recorded verbatim at the call site) and delete this case.
+  it("holds back the owning-row lookup URL until #3310 ships the endpoint", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    // Positive control first: a bare `not.toContain` also passes when the whole
+    // section is gone, which is the one way this case could go green while
+    // reporting nothing.
+    expect(markdown).toContain("Recording a constraint:");
+    expect(markdown).not.toContain("work-products/by-external-id");
+  });
+
+  // The containment-only path -- a notice with no issue, wake comment, prReview or
+  // ancestors -- renders the directive too. An earlier revision gated it out as a run
+  // "structurally unable to write", which was false: every refusal the containment
+  // enumerates is a Paperclip-API write (approvals, deliverables, annotations, documents,
+  // monitors) and NOT ONE is a GitHub write verb, so the run can still push or enqueue.
+  // "Carries no assignment" is about authority; this directive is about capability.
+  // Pinned so a future reader does not re-gate it on the premise that was already wrong.
+  it("renders on the containment-only path, which carries no assignment but can still push", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE,
+    });
+
+    // The wake this models genuinely has no assignment -- assert that, so the case
+    // cannot pass by accidentally exercising the issue-bearing path instead.
+    expect(markdown).toContain("This block carries no assignment");
+    expect(markdown).toContain("Run write-containment notice:");
+    expect(markdown).toContain("Pre-write re-read directive:");
+    expect(markdown).toContain("Recording a constraint:");
+  });
+
+  // The PEN-3275 block documents itself as the last block before the closing directive.
+  // This section is inserted ahead of it, so that invariant must still hold.
+  it("leaves the write-containment notice as the last block before the closing line", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE,
+    });
+
+    // `indexOf` returns -1 for an absent marker and -1 is less than everything,
+    // so assert presence before comparing or this orders two absences.
+    expect(markdown.indexOf("Pre-write re-read directive:")).toBeGreaterThan(-1);
+    expect(markdown.indexOf("Pre-write re-read directive:")).toBeLessThan(
+      markdown.indexOf("Run write-containment notice:"),
+    );
+    expect(markdown.indexOf("Run write-containment notice:")).toBeLessThan(
+      markdown.indexOf("Use this task context as the current assignment."),
+    );
+  });
+});
