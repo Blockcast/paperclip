@@ -44045,6 +44045,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // `heartbeatExpected` below rather than dropping the row.
         .leftJoin(companies, eq(companies.id, agents.companyId));
 
+      // BLO-47549: lastHeartbeatAt is stamped when a run FINISHES, so an agent
+      // mid-way through a long run read as dark and paged after 3x interval.
+      // Anchor on the newest output of a still-running run as well: a live run
+      // emitting output is the outcome this gauge measures, while a hung run
+      // that stops emitting still ages and pages.
+      const liveRunRows = await db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          lastOutputAt: max(heartbeatRuns.lastOutputAt),
+          startedAt: max(heartbeatRuns.startedAt),
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.status, "running"))
+        .groupBy(heartbeatRuns.agentId);
+      const liveRunActivityByAgent = new Map<string, Date>();
+      for (const r of liveRunRows) {
+        const times = [r.lastOutputAt, r.startedAt].filter((t) => t).map((t) => new Date(t!).getTime());
+        if (times.length) liveRunActivityByAgent.set(r.agentId, new Date(Math.max(...times)));
+      }
+
       // Complete per-company rosters (the select is unfiltered), so the
       // org-chain walk inside evaluateAgentInvokability sees every ancestor.
       const agentsByCompany = groupAgentOrgRowsByCompany(rows.map(toAgentOrgRow));
@@ -44055,7 +44075,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // its createdAt rather than treated as ageless -- a heartbeat-enabled
         // agent that has NEVER run is exactly the kind of dark agent this
         // metric exists to surface, not a reason to omit it.
-        const heartbeatAnchor = row.lastHeartbeatAt ?? row.createdAt;
+        const finishedAnchor = row.lastHeartbeatAt ?? row.createdAt;
+        const liveActivity = liveRunActivityByAgent.get(row.id);
+        const heartbeatAnchor = liveActivity && (!finishedAnchor || liveActivity > new Date(finishedAnchor))
+          ? liveActivity
+          : finishedAnchor;
         const heartbeatAgeSeconds = heartbeatAnchor
           ? Math.max(0, (now.getTime() - new Date(heartbeatAnchor).getTime()) / 1000)
           : null;
