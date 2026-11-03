@@ -1,9 +1,10 @@
 /**
  * PEN-4420: the deliberate park's RELEASE edge.
  *
- * `parked_until` (BLO-27912 / migration 0222) is read in four places, and all of them read
- * it to SUPPRESS. Each defers to `isDeliberateParkActive` below; this list is the registry,
- * so a fifth suppression site belongs here too:
+ * `parked_until` (BLO-27912 / migration 0222) is read in five places, and all of them read
+ * it to SUPPRESS. Four defer to `isDeliberateParkActive` below; the fifth reads the same two
+ * columns directly, as an interval. This list is the registry, so a sixth suppression site
+ * belongs here too:
  *
  *  - `hasLiveDeliberatePark` (`routes/github-webhook.ts`) — a live park suppresses
  *    `github_check_*` wakes (PEN-4114).
@@ -21,6 +22,14 @@
  *    a `severity: "high"` attention item. Listed because this registry is of park READERS,
  *    and that caller existed while the sentence above still read "three places" — the exact
  *    drift this list exists to prevent, reproduced on the list itself.
+ *  - `deliberateParkWindow` (`services/productivity-review.ts`) — the `long_active_duration`
+ *    trigger (PEN-4522, #3316, merged 2026-11-03T09:39Z). The second odd one out, and why the
+ *    sentence above no longer says every reader defers to the boolean: this one needs a START
+ *    as well as an end, so it reads `parkedAt`/`parkedUntil` itself and suppresses by
+ *    SUBTRACTING `[parkedAt, min(parkedUntil, now)]` out of `unattendedMs` rather than by
+ *    returning early. It calls `isDeliberateParkActive` too, but only to render the `live`
+ *    clause of its evidence. It landed the same morning this list was corrected from three to
+ *    four, and was missed — see the retraction below, which is that same error a second time.
  *
  * Nothing read it to RELEASE. `parked_until` passing produced no event on any status, so
  * a parked row whose only wake was the park itself sat inert indefinitely. The park had a
@@ -61,36 +70,53 @@
  * and the condition is the caveat below: `in_progress` buys one wake instead of two at the
  * cost of starting an un-suppressed `long_active_duration` clock.
  *
- * ⚠️ Read from source, NOT measured. That trigger (`services/productivity-review.ts`)
- * contains no reference to `parked_until` or `isDeliberateParkActive` at all — the "park"
- * its code names (`leadingParkMs`, `liveSegmentStartedAt`) is a run-liveness gap, a
- * different object — and its elapsed clock is gated on `in_progress`. Two conditions bound
- * the episode, and only the second is an exit:
+ * ⚠️ RETRACTED 2026-11-03, and the retraction is the part worth reading. An earlier revision
+ * of this block asserted that `services/productivity-review.ts` "contains no reference to
+ * `parked_until` or `isDeliberateParkActive` at all", and concluded from that a hand-parked
+ * `in_progress` row accrues the whole park as unattended. BOTH are false at `master`
+ * `ab43454`: that file imports `isDeliberateParkActive` from THIS module (:39) and reads both
+ * park columns in `deliberateParkWindow` (:1364). The grep was run against this PR's own
+ * branch at `9488baa`, which was behind `master` — #3316 had merged ~2.5 h earlier. Verify a
+ * negative against the DEFAULT branch, never the branch under review: a "no hits" result is
+ * only as current as the tree you ran it on, and it fails in the confident direction.
  *
- *  - the episode START is `issues.started_at`, which any status write of `in_progress`
- *    RE-STAMPS to now (`applyStatusSideEffects`, `services/issues.ts:427`). The patch
- *    spreads the request body, so a status-only PATCH leaves `patch.startedAt` unset and
- *    takes `new Date()`. That happens on EVERY row moved this way, previously checked out
- *    or not. There is no "never checked out, so it reads null" exemption — and null would
- *    not be one anyway, since `activeStartedAt` falls back to `executionLockedAt` and to
- *    the most recent dispatch.
- *  - the episode END is clamped to `nonLiveExecutionHoldSince`, which returns null ONLY
- *    when `issue.executionRunId` is null. A row still carrying a holder pointer is clamped
- *    at that holder's last attributable moment and accrues nothing across the park. This is
- *    the exit. A row with no holder accrues the whole park as "active".
+ * What is actually true, and it removes the trade-off rather than resolving it:
  *
- * ⇒ the exposed shape is: moved by hand to `in_progress`, no execution holder, park longer
- * than `longActiveMs` (`DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS` = 6 h, shorter than
- * most parks written here). The PATCH cannot land without an assignee (`in_progress issues
- * require an assignee`), so there is always someone for a resulting review to be filed
- * against. The module's one "deliberate wait" discount, `monitorGatingBreakdown`, keys on
- * the monitor columns and is reporting-only — it neither sees a park nor gates the fire.
+ *  - `deliberateParkWindow` covers `[parkedAt, min(parkedUntil, now)]`
+ *    (`productivity-review.ts:1364`); that span becomes its own `parkedMs` bucket; and
+ *    `unattendedMs` is computed net of it (:1466). The `long_active_duration` arm compares
+ *    exactly that — `monitorGating.unattendedMs < thresholds.longActiveMs` (:5696). The rule
+ *    the source states: the trigger fires on the time NOBODY was accounting for, and a
+ *    deliberate park is somebody accounting for it.
+ *  - `in_progress` does still RE-STAMP `issues.started_at` (`applyStatusSideEffects`,
+ *    `services/issues.ts`; a status-only PATCH leaves `patch.startedAt` unset and takes
+ *    `new Date()`). That half stands. It is simply no longer an exposure, because the park
+ *    is netted out of the comparison the restarted clock feeds.
  *
- * So prefer `in_progress` when one wake at the deadline is what you meant AND the row keeps
- * its holder, or the park is short; otherwise take the double wake on `todo`, which is
- * outside this trigger by construction. Nobody has observed the trigger firing on a parked
- * row and the suppression paths downstream of the bar are not traced: unmeasured, not
- * disproven.
+ * ⇒ prefer `in_progress` for this technique without condition: one wake at the deadline
+ * instead of two, and no productivity-review cost. The earlier "only if the row keeps its
+ * holder, or the park is short" proviso was an artefact of the false premise and is withdrawn
+ * with it.
+ *
+ * Three limits of the suppression, all deliberate, all pinned in `deliberateParkWindow`'s own
+ * docblock:
+ *
+ *  - It covers `parkedAt` FORWARD, and the CURRENT park only. `parkedDisposition` restamps
+ *    `parkedAt` on every arm, so EXTENDING a park returns the superseded span to
+ *    `unattendedMs`. Do not "fix" that by carrying the earliest `parkedAt` forward — it would
+ *    let a row chain short parks into unbounded suppression.
+ *  - It requires BOTH columns and fails closed without them.
+ *  - It is BOUNDED: the bucket stops growing at `min(parkedUntil, now)`, so a park whose wake
+ *    never arrives surfaces as a productivity review on its own roughly 6 h later. That is a
+ *    backstop for the technique above, not a defect — a dropped park wake is not silent.
+ *
+ * ⛔ Do NOT reach for `executionPolicy.productivityReviewDisabled` here, and do not read the
+ * line above as a reason to. It is unnecessary given the netting, and it is not a narrowing of
+ * one trigger: `isProductivityReviewOptedOut` (`packages/shared`) gates the candidate loop in
+ * `productivity-review.ts`, which counts the row `optedOut` and `continue`s before evidence is
+ * collected, and retires any in-flight review as `unreviewable_source`. It removes the row from
+ * productivity review ENTIRELY — and in its top-level spelling it is durable, so it outlives
+ * the park it was set for. The park is bounded; that flag is not.
  *
  * The `blocked` arm is the one the exclusion below depends on, because that is not how a row
  * normally reaches `todo`, and conflating the two writers is the trap.
