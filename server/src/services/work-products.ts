@@ -1,7 +1,12 @@
 import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueWorkProducts } from "@paperclipai/db";
+import { issueWorkProducts, issues } from "@paperclipai/db";
 import type { IssueWorkProduct } from "@paperclipai/shared";
+import {
+  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+  PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+  recordedPullRequestOwners,
+} from "./pull-request-work-products.js";
 
 type IssueWorkProductRow = typeof issueWorkProducts.$inferSelect;
 
@@ -283,6 +288,109 @@ export function workProductService(db: Db) {
           .then((rows) => rows[0] ?? null);
       });
       return row ? toIssueWorkProduct(row) : null;
+    },
+
+    /**
+     * The REVERSE of `upsertByExternalId`: given an artifact identity
+     * (`owner/repo#123`), which issues own it?
+     *
+     * PEN-5340. The forward direction (`GET /api/issues/:id/work-products`) has
+     * always worked, but it answers "what does this row own?" -- to ask "whose
+     * row owns this PR?" a caller had to already know the row, which is circular
+     * and useless to a run holding only the artifact. Nothing closed that loop:
+     * the only reverse query in the codebase is `selectIssuesLinkedToPullRequest`
+     * in `routes/github-webhook.ts`, which is module-private and has no HTTP or
+     * MCP surface. The supporting index
+     * (`issue_work_products_company_provider_external_id_idx`) has existed since
+     * migration 0035; this is the read that was missing, not the data.
+     *
+     * RETURNS A SET, DELIBERATELY. One PR legitimately maps to several issues
+     * when its branch/title/body reference more than one -- which is exactly why
+     * the unique index in migration 0216 is keyed
+     * `(company_id, issue_id, provider, type, external_id)` and NOT the narrower
+     * `(company_id, provider, external_id)`. Collapsing this to a single-row get
+     * would report one arbitrary owner as "the" owner.
+     *
+     * PROVENANCE IS LABELLED, NOT FILTERED, and that is a deliberate departure
+     * from the webhook's private query. That query pins hard to its own system
+     * writer so "an agent-promoted work product can never make an unrelated issue
+     * look like the PR's owner" -- correct for a writer deciding whom to wake.
+     * For a lookup it is the wrong trade: silently dropping a hand-recorded
+     * binding reproduces, one layer down, the exact failure this surface exists
+     * to remove -- an empty answer that reads as "no owner" when it means "no
+     * owner I chose to show you". So every matching row is returned with
+     * `provenance` set, and `webhook` rows sort first. Callers that need the
+     * authoritative binding filter on `provenance === "webhook"`; callers that
+     * need to know a link was asserted at all can still see it.
+     *
+     * Scoped to one company by the caller. Issue-level read authorization is NOT
+     * applied here -- the route applies it, because the actor lives on the
+     * request.
+     */
+    listOwnersByExternalId: async (
+      companyId: string,
+      key: { provider: string; type: string; externalId: string },
+    ) => {
+      const rows = await db
+        .select({
+          workProduct: issueWorkProducts,
+          issue: {
+            id: issues.id,
+            companyId: issues.companyId,
+            identifier: issues.identifier,
+            title: issues.title,
+            status: issues.status,
+            projectId: issues.projectId,
+            parentId: issues.parentId,
+            assigneeAgentId: issues.assigneeAgentId,
+            assigneeUserId: issues.assigneeUserId,
+            createdByAgentId: issues.createdByAgentId,
+            originKind: issues.originKind,
+            originId: issues.originId,
+          },
+        })
+        .from(issueWorkProducts)
+        .innerJoin(
+          issues,
+          and(
+            eq(issues.id, issueWorkProducts.issueId),
+            eq(issues.companyId, issueWorkProducts.companyId),
+          ),
+        )
+        .where(
+          and(
+            eq(issueWorkProducts.companyId, companyId),
+            eq(issueWorkProducts.provider, key.provider),
+            eq(issueWorkProducts.type, key.type),
+            eq(issueWorkProducts.externalId, key.externalId),
+          ),
+        )
+        .orderBy(desc(issueWorkProducts.isPrimary), desc(issueWorkProducts.updatedAt));
+
+      const owners = rows.map((row) => {
+        const workProduct = toIssueWorkProduct(row.workProduct);
+        const metadata = workProduct.metadata ?? {};
+        const trust = (row.workProduct.sourceTrust ?? null) as Record<string, unknown> | null;
+        const webhookMaintained =
+          metadata.source === PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE
+          && trust?.promotedByActorType === "system"
+          && trust?.promotedByActorId === PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID;
+        return {
+          provenance: (webhookMaintained ? "webhook" : "asserted") as "webhook" | "asserted",
+          issue: row.issue,
+          // `null` means "not recorded / unreadable", which is NOT the same as
+          // the empty set -- `recordedPullRequestOwners` keeps that distinction
+          // and every consumer takes its own safe direction from it.
+          owningIdentifiers: recordedPullRequestOwners(metadata.owningIdentifiers),
+          workProduct,
+        };
+      });
+
+      // Authoritative rows first; `orderBy` above is preserved within each group.
+      return [
+        ...owners.filter((owner) => owner.provenance === "webhook"),
+        ...owners.filter((owner) => owner.provenance !== "webhook"),
+      ];
     },
 
     remove: async (id: string) => {

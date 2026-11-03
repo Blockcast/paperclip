@@ -510,6 +510,8 @@ export {
   createIssueWorkProductSchema,
   issueWorkProductMetadataSchema,
   updateIssueWorkProductSchema,
+  workProductExternalIdLookupQuerySchema,
+  normalizeWorkProductExternalId,
   attachmentArtifactWorkProductMetadataSchema,
   issueWorkProductTypeSchema,
   issueWorkProductStatusSchema,
@@ -517,6 +519,7 @@ export {
   type CreateIssueWorkProduct,
   type IssueWorkProductMetadata,
   type UpdateIssueWorkProduct,
+  type WorkProductExternalIdLookupQuery,
 } from "./work-product.js";
 
 export {

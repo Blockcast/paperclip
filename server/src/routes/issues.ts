@@ -37,6 +37,7 @@ import {
   unrecognizedInteractionPayloadKeys,
   extractMentionBindingReport,
   createIssueWorkProductSchema,
+  workProductExternalIdLookupQuerySchema,
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
@@ -10440,6 +10441,69 @@ export function issueRoutes(
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const workProducts = await workProductsSvc.listForIssue(issue.id);
     res.json(workProducts);
+  });
+
+  /**
+   * ARTIFACT -> OWNING ROW. The reverse of `GET /issues/:id/work-products`
+   * (PEN-5340).
+   *
+   * The forward read answers "what does this row own?". Answering "whose row
+   * owns this PR?" required already knowing the row, which is circular and
+   * useless to a run holding only the artifact -- so a constraint recorded
+   * against a PR had no way to reach the run about to write it. The data, the
+   * index and the query have all existed for months; only this door was
+   * missing.
+   *
+   * Returns a SET. One PR legitimately maps to several issues (see migration
+   * 0216), so `owners` is plural by design, ordered authoritative-first.
+   */
+  router.get("/companies/:companyId/work-products/by-external-id", async (req, res) => {
+    const companyId = req.params.companyId as string;
+    assertCompanyAccess(req, companyId);
+    const parsed = workProductExternalIdLookupQuerySchema.safeParse(req.query);
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message ?? "Invalid work-product lookup query",
+        details: parsed.error.issues,
+      });
+      return;
+    }
+    const { externalId, provider, type } = parsed.data;
+    const matches = await workProductsSvc.listOwnersByExternalId(companyId, {
+      provider,
+      type,
+      externalId,
+    });
+    // Visibility is applied to the ISSUE, not to the work product: the answer
+    // names rows, so a seat that cannot read a row must not learn of it here.
+    const readableIssueIds = new Set(
+      (await filterIssuesForActor(req, matches.map((match) => match.issue))).map((issue) => issue.id),
+    );
+    const owners = matches.filter((match) => readableIssueIds.has(match.issue.id));
+    res.json({
+      // Echoed back normalised, so a caller that passed a PR URL can see the
+      // key the empty set would have been empty *for*.
+      externalId,
+      provider,
+      type,
+      owners: owners.map((owner) => ({
+        provenance: owner.provenance,
+        issueId: owner.issue.id,
+        identifier: owner.issue.identifier,
+        title: owner.issue.title,
+        status: owner.issue.status,
+        projectId: owner.issue.projectId,
+        assigneeAgentId: owner.issue.assigneeAgentId,
+        assigneeUserId: owner.issue.assigneeUserId,
+        owningIdentifiers: owner.owningIdentifiers,
+        workProduct: owner.workProduct,
+      })),
+      // An empty `owners` is ambiguous on its own -- no such PR, or none this
+      // seat may read. Reporting the withheld count keeps the caller from
+      // reading an authorization result as an absence of ownership, which is
+      // the precise misreading this endpoint exists to remove.
+      withheldForAuthorizationCount: matches.length - owners.length,
+    });
   });
 
   router.get("/issues/:id/external-objects", async (req, res) => {
