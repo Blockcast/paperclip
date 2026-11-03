@@ -622,10 +622,14 @@ gate/ally-comment-findings :: success
 That is not a bypass. It is the gate passing, as designed, on a head nothing read — absence of an
 independent review is one of its passing states.
 
-Four consequences, each easy to get backwards:
+Five consequences, each easy to get backwards:
 
-- **"It merged" and "it was enqueued" are not review evidence.** Cite `reviewDecision` and the login
-  of an approving reviewer. Never cite the merge.
+- **"It merged" and "it was enqueued" are not review evidence.** Cite the approving reviewer's
+  login, the `Reviewed head:` SHA in the review body, and the review object id. Never cite the merge.
+  `reviewDecision` is a weak citation on its own: it *does* read `APPROVED` once anyone approves —
+  measured 2026-11-03 on merged #3245, #3220, #3181, #3116, #3114, #3107 and #3051 — but it names
+  neither the reviewer nor the head it read, and 78.6% of approvals here come from the authoring
+  identity family (below). It is the *absence* that proves nothing: it never reads `REVIEW_REQUIRED`.
 - **A red *non-required* check does not block enqueue or merge.** `ALLGREEN` grouping evaluates the
   required checks on the merge-group ref (`gh-readonly-queue/master/pr-NNNN-…`), not every check
   reported on the PR head. Measured: #3291 (red `e2e` **and** red `review`), #3299 and #3300 (red
@@ -658,10 +662,20 @@ Four consequences, each easy to get backwards:
 
 Two traps when you re-measure any of this:
 
-- `gate/ally-comment-findings` resolves to **two objects on the same head** — a check-run that is
-  deliberately `neutral` (see the `ci/ally-head-attested` note above) and a status context that
-  carries the verdict and its description. Both read `isRequired: true`, and neither can block:
-  GitHub counts `neutral` as passing. Reading only one surface will under- or over-state the gate.
+- `gate/ally-comment-findings` resolves to **two objects on the same head** — a status context and
+  a check-run of the same name, dual-emitted from one verdict by `publishCheckRunMirror` in
+  `server/src/services/pr-comment-review-gate.ts`. Both read `isRequired: true`, and **both can
+  block.** ⛔ Do not read a red `gate/ally-comment-findings` as non-blocking, and do not read
+  `neutral` as the check-run's only conclusion. `CommentReviewGateVerdict` has six outcomes across
+  two states: `success` for `clean`, `deferred_finding` and `not_evaluated`; `failure` for
+  `blocking_finding`, `unreadable_verdict` and `carried_finding`. The status context publishes that
+  state directly. The check-run maps it through `commentReviewGateCheckConclusion` — `failure` stays
+  `failure`, `clean` becomes `success`, and only the remaining two become `neutral`. So the gate is
+  fail-open on the **absence** of an independent review, because `not_evaluated` is one of its
+  passing states — that is the quote above, and it is the whole of the fail-open. It is **not**
+  fail-open on findings: an unresolved Ally Critical/Important finding publishes red on both
+  surfaces, and that red is what holds the PR. Reading only one surface will under- or over-state
+  the gate.
 - `commits/{sha}/status` reports **status contexts only** and cannot see check-runs at all, so its
   `.state: success` is never a statement about the whole head — on a PR whose `verify` is red or
   simply unreported it still reads `success`. Use `statusCheckRollup`, not the combined-status
