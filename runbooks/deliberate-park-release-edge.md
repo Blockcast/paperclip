@@ -305,17 +305,41 @@ exists to answer becomes unanswerable for that park
 ([Why the stamp is usually gone anyway](#why-the-stamp-is-usually-gone-anyway)).
 Prefer it only when the row must stay `blocked` for the hold to read correctly.
 
-⚠️ One caveat on `in_progress`, because it is not free. `applyStatusSideEffects`
-writes `startedAt = new Date()` whenever a PATCH sets `in_progress` and carries
-no `startedAt` of its own (`services/issues.ts:432`), and a status-only PATCH
-never does. `productivity-review.ts` holds **no** reference to `parked_until`, so
-its `long_active_duration` check cannot see that the row is deliberately waiting;
-the bar is 6 h (`DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS`). Exposure needs
-all three of: hand-moved to `in_progress`, no execution holder, and a park longer
-than that bar. It has never been observed firing on a parked row — stated as the
-gap it is, not as an incident. On a park comfortably past 6 h, set
-`executionPolicy.productivityReviewDisabled` at the **top level**, where it is
-durable, rather than on the monitor, where it dies with the monitor.
+⚠️ One side effect of `in_progress`, and a correction to an earlier revision
+of this section. `applyStatusSideEffects` writes `startedAt = new Date()` whenever
+a PATCH sets `in_progress` and carries no `startedAt` of its own
+(`services/issues.ts:432`), and a status-only PATCH never does. So the move does
+restart the `long_active_duration` clock, whose bar is 6 h
+(`DEFAULT_PRODUCTIVITY_REVIEW_LONG_ACTIVE_HOURS`).
+
+**That is not an exposure, and an earlier revision of this file said it was.**
+`productivity-review.ts` *does* read the park. PEN-4522
+([#3316](https://github.com/Blockcast/paperclip/pull/3316), merged
+2026-11-03T09:39Z) gives deliberate park time its own bucket:
+`deliberateParkWindow` covers `[parkedAt, min(parkedUntil, now)]`, that span is
+subtracted out of `unattendedMs`, and the `long_active_duration` suppression arm
+fires on `unattendedMs < longActiveMs`. A deliberate park is somebody accounting
+for the time, which is exactly what the trigger exists *not* to fire on. **Do not
+set `executionPolicy.productivityReviewDisabled` for this case** — it is
+unnecessary, and being durable it outlives the park and goes on suppressing
+genuine stalls afterwards.
+
+The earlier claim ("holds **no** reference to `parked_until`") was read off this
+PR's own branch at `9488baa`, which was behind `main`; #3316 had merged to `main`
+about 2.5 h earlier. Verify against `main`, not the branch under review.
+
+Three things about the suppression are still worth knowing:
+
+- It covers only from `parkedAt` **forward**, and only the *current* park —
+  `parkedDisposition` restamps `parkedAt` on every re-park. Time the row spent
+  `in_progress` before it was parked stays unattended.
+- `deliberateParkWindow` requires **both** `parkedUntil` and `parkedAt` and fails
+  closed without them, so a deadline carrying no `parkedAt` is not covered.
+- It is **bounded, deliberately**: the bucket stops growing at
+  `min(parkedUntil, now)`, so once a park lapses its residue accrues to
+  `unattendedMs` and the arm stops suppressing roughly 6 h later. A park whose
+  wake never arrives therefore surfaces as a productivity review on its own.
+  That is a backstop for the technique above, not a defect.
 
 ## Design decisions, so they are not silently re-litigated
 
