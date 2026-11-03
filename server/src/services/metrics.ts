@@ -100,6 +100,25 @@ export const CONCURRENT_RUN_BLOCKED_METRIC = "claude_k8s_concurrent_run_blocked_
  * agent row is loaded (those are not per-agent facts and must not look like it).
  */
 export const AGENT_DISPATCH_DECLINED_METRIC = "paperclip_agent_dispatch_declined_total";
+/**
+ * PEN-5316. The per-CANDIDATE companion to
+ * {@link AGENT_DISPATCH_DECLINED_METRIC}, which is per-PASS.
+ *
+ * The decline counter says a pass claimed nothing and why the PASS bailed. It
+ * cannot say which rows the pass looked at or which screen rejected them, and
+ * that gap is what made `no_claimable_run` unfalsifiable: on the two busiest
+ * seats it co-fired with a `paperclip_queued_run_oldest_claimable_age_seconds`
+ * reading above 120 s on 27-31% of an 8 h window, and the two sides could not
+ * be joined to find out which of them was lying.
+ *
+ * Read the two together. `no_claimable_run` on the pass counter tells you a
+ * seat with a free slot started nothing; the `arm` here tells you whether the
+ * rows it passed over were genuinely unclaimable (the gauge over-reports) or
+ * genuinely claimable and refused by the slot allocator (the dispatcher
+ * under-claims). Those have opposite remedies.
+ */
+export const AGENT_DISPATCH_CANDIDATE_REFUSED_METRIC =
+  "paperclip_agent_dispatch_candidate_refused_total";
 // BLO-23379: routine dispatch bypassed a long-parked execution issue instead of
 // letting it gate the fire. Non-zero means a quota/capacity park was overridden;
 // zero while a routine is quiet means it is genuinely gated on in-flight work.
@@ -5052,6 +5071,102 @@ export const KNOWN_DISPATCH_DECLINE_REASONS = [
 
 export const UNKNOWN_DISPATCH_DECLINE_REASON = "other";
 
+/**
+ * Bounded `arm` allow-list for {@link AGENT_DISPATCH_CANDIDATE_REFUSED_METRIC}
+ * (PEN-5316): the named screens a ranked dispatch candidate can die on.
+ *
+ * Ordered as the dispatch loop applies them, and deliberately NOT collapsed
+ * into coarser buckets, because the fork this metric exists to settle runs
+ * straight down the middle of the list. Arms that leave the row `queued` and
+ * still COUNTED by the claimable gauge are the ones that make the gauge
+ * over-report; arms that cancel the row remove it from the gauge within a
+ * refresh and cannot sustain a 27-31% disagreement. Which group dominates is
+ * the answer.
+ *
+ * `agent_id` is bounded the same way the decline counter bounds it. The
+ * REJECTED RUN ID is deliberately not a label -- it is unbounded, and it goes
+ * on the structured decline log line beside the gauge's own subject id, which
+ * is what makes the join possible without a cardinality explosion.
+ */
+export const KNOWN_DISPATCH_CANDIDATE_REFUSAL_ARMS = [
+  /**
+   * Skipped before the claim: the issue already has a running sibling, so the
+   * row is cancelled as a duplicate dispatch. Leaves the gauge within a
+   * refresh.
+   */
+  "duplicate_dispatch_suppressed",
+  /**
+   * Skipped before the claim and deliberately LEFT QUEUED: an explicit review
+   * request queued behind the review that already owns this PR task key. The
+   * claimable gauge keeps counting and ageing it, so this arm over-reports by
+   * construction.
+   */
+  "pr_review_task_in_flight",
+  /** The agent row vanished between the queue read and the claim. */
+  "agent_missing",
+  /** Paused, terminated, pending approval, or an invalid reporting chain. */
+  "agent_not_invokable",
+  /**
+   * A k8s-isolation or branch-claim backoff stamp is still in the future.
+   * `isDispatchRankReady` screens this out too, so the gauge should already
+   * have excluded the row -- a non-trivial rate here against a >120 s gauge
+   * reading is evidence of clock/refresh skew between the two readers rather
+   * than of either being wrong.
+   */
+  "admission_deferred",
+  /** Company, project, or agent budget block. Cancels the row. */
+  "budget_blocked",
+  /** Heartbeat daily run/cost cap. Cancels the row. */
+  "daily_cap_blocked",
+  /** The context issue id is not a UUID. Cancels the row. */
+  "invalid_context_issue_id",
+  /** An active subtree pause hold owns the issue. Cancels the row. */
+  "tree_pause_hold",
+  /**
+   * Unresolved dependency blockers, with no interaction-wake exemption. Also
+   * screened by `isDispatchRankReady`, so see `admission_deferred`.
+   */
+  "dependency_blocked",
+  /** The issue reached a terminal status. Cancels the row. */
+  "stale_issue",
+  /**
+   * ⭐ The atomic claim found no free slot in the agent's reservation pool,
+   * on a pass that had computed `availableSlots > 0` and therefore never
+   * recorded `no_available_slots`.
+   *
+   * This is the arm that distinguishes a phantom slot from an unclaimable run,
+   * and the two accountings are permitted to disagree: `availableSlots` drops a
+   * `running` row silent longer than `RUN_STALE_SILENCE_MS` (BLO-12990) so a
+   * quiet Job cannot starve new work, while the reservation it holds is
+   * released only by the lifecycle finalizer. A sustained rate here means the
+   * gauge is RIGHT -- the run is claimable and the seat has nowhere to put it.
+   */
+  "slot_pool_exhausted",
+  /** The exclusive PR-review task key was held at claim time. */
+  "pr_review_task_blocked",
+  /** The row left `queued` between ranking and claiming (lost race). */
+  "run_not_queued",
+  /** A routine execution lock for the issue is already open. Cancels the row. */
+  "routine_execution_duplicate",
+  /** The issue execution lock could not be acquired. Cancels the row. */
+  "issue_lock_not_acquired",
+] as const;
+
+export const UNKNOWN_DISPATCH_CANDIDATE_REFUSAL_ARM = "other";
+
+const knownDispatchCandidateRefusalArmSet: ReadonlySet<string> = new Set(
+  KNOWN_DISPATCH_CANDIDATE_REFUSAL_ARMS,
+);
+
+export type DispatchCandidateRefusalArm =
+  (typeof KNOWN_DISPATCH_CANDIDATE_REFUSAL_ARMS)[number];
+
+export function normalizeDispatchCandidateRefusalArm(arm: string | null | undefined): string {
+  return typeof arm === "string" && knownDispatchCandidateRefusalArmSet.has(arm)
+    ? arm
+    : UNKNOWN_DISPATCH_CANDIDATE_REFUSAL_ARM;
+}
+
 const knownDispatchDeclineReasonSet: ReadonlySet<string> = new Set(
   KNOWN_DISPATCH_DECLINE_REASONS,
 );
@@ -5392,6 +5507,7 @@ export const AGENT_ERROR_REASON_OLDEST_AGE_METRIC =
 let registry: Registry | null = null;
 let concurrentRunBlocked: Counter<"agent_id" | "reason" | "isolation_mode"> | null = null;
 let agentDispatchDeclined: Counter<"agent_id" | "reason"> | null = null;
+let agentDispatchCandidateRefused: Counter<"agent_id" | "arm"> | null = null;
 let isolatedRunStarted: Counter<"agent_id" | "isolation_mode"> | null = null;
 type HeartbeatRunFailedLabel =
   | "agent_id"
@@ -5634,6 +5750,7 @@ function ensureRegistry(): {
   registry: Registry;
   counter: Counter<"agent_id" | "reason" | "isolation_mode">;
   dispatchDeclinedCounter: Counter<"agent_id" | "reason">;
+  dispatchCandidateRefusedCounter: Counter<"agent_id" | "arm">;
   isolatedStartedCounter: Counter<"agent_id" | "isolation_mode">;
   failedCounter: Counter<HeartbeatRunFailedLabel>;
   capacityDeferredCounter: Counter<"adapter" | "provider">;
@@ -5801,6 +5918,7 @@ function ensureRegistry(): {
     !registry
     || !concurrentRunBlocked
     || !agentDispatchDeclined
+    || !agentDispatchCandidateRefused
     || !isolatedRunStarted
     || !heartbeatRunFailed
     || !ccrotateCapacityDeferred
@@ -6012,6 +6130,35 @@ function ensureRegistry(): {
         + "dispatch kick lands here, leaving the run for the worker tick "
         + "(heartbeatSchedulerIntervalMs, default 30s) to claim.",
       labelNames: ["agent_id", "reason"],
+      registers: [registry],
+    });
+    agentDispatchCandidateRefused = new Counter({
+      name: AGENT_DISPATCH_CANDIDATE_REFUSED_METRIC,
+      help:
+        "Count of individual ranked dispatch candidates a pass refused, labeled by "
+        + "bounded agent_id and the named screen that refused them (PEN-5316). The "
+        + "per-candidate companion to " + AGENT_DISPATCH_DECLINED_METRIC + ", which is "
+        + "per-pass and carries a reason but no subject and no arm. Read them together: "
+        + "a pass that records reason='no_claimable_run' increments this once per row it "
+        + "passed over, and the arm says whether those rows were genuinely unclaimable "
+        + "or genuinely claimable and refused by the slot allocator. Those have OPPOSITE "
+        + "remedies, which is why the split exists — before it, `no_claimable_run` "
+        + "co-fired with a >120s "
+        + QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC + " reading on 27-31% of an 8h window "
+        + "on the two busiest seats and nothing could say which side was wrong. "
+        + "⭐ arm='slot_pool_exhausted' is the discriminator: it fires only on a pass "
+        + "that had already computed availableSlots > 0 (otherwise it would have "
+        + "recorded no_available_slots and never reached the claim), so a sustained rate "
+        + "means the seat's slot ACCOUNTING and its slot ALLOCATOR disagree — the "
+        + "accounting drops a running row silent beyond RUN_STALE_SILENCE_MS while its "
+        + "reservation is held until the lifecycle finalizer releases it. That is a "
+        + "phantom slot, and it means the claimable gauge is right. Arms that CANCEL the "
+        + "row (budget_blocked, stale_issue, dependency_blocked, ...) remove it from the "
+        + "gauge within one refresh and so cannot sustain the disagreement; arms that "
+        + "leave it queued (slot_pool_exhausted, pr_review_task_in_flight, "
+        + "admission_deferred) can. The rejected RUN ID is deliberately not a label "
+        + "(unbounded); it is on the decline log line beside the gauge's own subject id.",
+      labelNames: ["agent_id", "arm"],
       registers: [registry],
     });
     isolatedRunStarted = new Counter({
@@ -8757,6 +8904,7 @@ function ensureRegistry(): {
     registry,
     counter: concurrentRunBlocked,
     dispatchDeclinedCounter: agentDispatchDeclined,
+    dispatchCandidateRefusedCounter: agentDispatchCandidateRefused,
     isolatedStartedCounter: isolatedRunStarted,
     failedCounter: heartbeatRunFailed,
     capacityDeferredCounter: ccrotateCapacityDeferred,
@@ -8984,6 +9132,32 @@ export function recordAgentDispatchDeclined(
     reason: normalizeDispatchDeclineReason(input.reason),
   };
   ensureRegistry().dispatchDeclinedCounter.inc(labels);
+  return labels;
+}
+
+export interface RecordDispatchCandidateRefusedInput {
+  agentId: string | null | undefined;
+  arm: string | null | undefined;
+  /** Active company agent roster used to bound the `agent_id` label. */
+  knownAgentIds: ReadonlySet<string>;
+}
+
+/**
+ * Increment {@link AGENT_DISPATCH_CANDIDATE_REFUSED_METRIC}. Call once per
+ * ranked candidate a dispatch pass refused, at the site that made that
+ * decision. Unlike {@link recordAgentDispatchDeclined} this fires MORE than
+ * once per pass -- a pass that ranked five rows and claimed none increments it
+ * five times, which is what makes the arm distribution readable.
+ * Returns the normalized labels emitted (useful for logging/tests).
+ */
+export function recordDispatchCandidateRefused(
+  input: RecordDispatchCandidateRefusedInput,
+): { agent_id: string; arm: string } {
+  const labels = {
+    agent_id: normalizeAgentId(input.agentId, input.knownAgentIds),
+    arm: normalizeDispatchCandidateRefusalArm(input.arm),
+  };
+  ensureRegistry().dispatchCandidateRefusedCounter.inc(labels);
   return labels;
 }
 

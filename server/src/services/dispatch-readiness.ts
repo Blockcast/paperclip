@@ -198,8 +198,45 @@ export function isDispatchRankReady(
   readiness: { isDependencyReady: boolean } | null | undefined,
   now: Date,
 ): boolean {
-  if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) return false;
-  return isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness);
+  return describeDispatchRankReadiness(contextSnapshot, readiness, now).ready;
+}
+
+/**
+ * Which arm of {@link isDispatchRankReady} refused, rather than merely that it
+ * did (PEN-5316).
+ *
+ * The claimable gauge and the dispatcher's claim path both screen on
+ * `isDispatchRankReady`, and they disagree: on the two busiest seats the
+ * dispatcher recorded `no_claimable_run` while
+ * `paperclip_queued_run_oldest_claimable_age_seconds` read >120 s, on 27-31% of
+ * an 8 h window. Exactly one side is wrong, and the two could not be joined
+ * because the decline counter carried a reason but no SUBJECT and no ARM: it
+ * said "nothing was claimable" without saying which row it looked at or which
+ * screen rejected it.
+ *
+ * This is the boolean's own decision, named -- not a second copy of it.
+ * {@link isDispatchRankReady} delegates here, so the arm a caller reports can
+ * never describe a verdict different from the one the dispatcher acted on.
+ * Naming it in a parallel function that re-tested the same two conditions would
+ * be the fifth re-derivation this module exists to prevent, and the one hardest
+ * to catch -- a drifted *explanation* of a correct verdict reads as evidence.
+ */
+export type DispatchRankReadinessVerdict =
+  | { ready: true; arm: null }
+  | { ready: false; arm: "admission_deferred" | "dependency_blocked" };
+
+export function describeDispatchRankReadiness(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+  readiness: { isDependencyReady: boolean } | null | undefined,
+  now: Date,
+): DispatchRankReadinessVerdict {
+  if (isQueuedRunAdmissionDeferred(contextSnapshot, now)) {
+    return { ready: false, arm: "admission_deferred" };
+  }
+  if (!isEffectivelyDependencyReadyForDispatch(contextSnapshot, readiness)) {
+    return { ready: false, arm: "dependency_blocked" };
+  }
+  return { ready: true, arm: null };
 }
 
 /**

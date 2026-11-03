@@ -222,6 +222,7 @@ import {
 import {
   bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlotPool,
+  claimRunWithExternalRuntimeSlotPoolOutcome,
   ExternalRuntimeIsolationConflictError,
   ExternalRuntimeReservationReleasePendingError,
   externalRuntimeReservationCanRelease,
@@ -453,6 +454,7 @@ import {
   recordOrphanReapStage,
   recordConcurrentRunBlocked,
   recordAgentDispatchDeclined,
+  recordDispatchCandidateRefused,
   recordDuplicateDispatchSuppressed,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -480,7 +482,11 @@ import {
   CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
   recordTransientRetryFloorDisposition,
 } from "./metrics.js";
-import type { DispatchDeclineReason, TransientRetryFloorDisposition } from "./metrics.js";
+import type {
+  DispatchCandidateRefusalArm,
+  DispatchDeclineReason,
+  TransientRetryFloorDisposition,
+} from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
 import { mapAdapterToCcrotateTarget, mapPenstockProviderToCcrotateTarget } from "./ccrotate-target.js";
@@ -520,6 +526,7 @@ import {
   BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY,
   classifyQueuedRunForDependencyReap,
   deriveCommentId,
+  describeDispatchRankReadiness,
   isBranchClaimRetryDeferred,
   isDispatchRankReady,
   isEffectivelyDependencyReadyForDispatch,
@@ -25086,25 +25093,53 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return row !== null;
   }
 
-  async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
+  /**
+   * PEN-5316: every refusal below names the screen it died on.
+   *
+   * `claimQueuedRun` had thirteen `return null` sites and the caller could not
+   * tell them apart, so when a dispatch pass refused every candidate and
+   * recorded `no_claimable_run`, the record said a seat with a free slot
+   * started nothing and stopped there. Half those arms CANCEL the row (it
+   * leaves the claimable gauge within one refresh) and half LEAVE IT QUEUED
+   * (it keeps ageing in the gauge) -- opposite stories about the same counter,
+   * and the pair is what decides whether the gauge over-reports or the
+   * dispatcher under-claims.
+   *
+   * `onRefusal` rather than a changed return type: the second caller
+   * (`executeRun`) only asks "did I get a run", and widening the contract for
+   * both would have put a tuple between the dispatch loop and a path that has
+   * no use for one. The callback fires exactly once per refusal, immediately
+   * before the `null` that reports it, so a new arm added without one is
+   * visible as a bare `return null` -- which is what the source scanner in
+   * dispatch-decline-instrumentation.test.ts pins.
+   */
+  async function claimQueuedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    companyAgents?: AgentOrgRow[],
+    onRefusal?: (arm: DispatchCandidateRefusalArm) => void,
+  ) {
+    const refuse = (arm: DispatchCandidateRefusalArm) => {
+      onRefusal?.(arm);
+      return null;
+    };
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
-      return null;
+      return refuse("agent_missing");
     }
     const invokability = companyAgents
       ? evaluateAgentInvokability(toAgentOrgRow(agent), companyAgents)
       : await getAgentInvokability(agent);
     if (!invokability.invokable) {
       await cancelRunInternal(run.id, `Cancelled because the agent is not invokable: ${invokability.reason}`);
-      return null;
+      return refuse("agent_not_invokable");
     }
 
     const context = parseObject(run.contextSnapshot);
     let issueDependencyReadyForAutoCheckout = true;
     if (isQueuedRunAdmissionDeferred(context)) {
-      return null;
+      return refuse("admission_deferred");
     }
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
       issueId: readNonEmptyString(context.issueId),
@@ -25112,7 +25147,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     if (budgetBlock) {
       await cancelRunInternal(run.id, budgetBlock.reason);
-      return null;
+      return refuse("budget_blocked");
     }
 
     const dailyCapBlock = await getHeartbeatDailyCapBlock(agent, parseHeartbeatPolicy(agent), {
@@ -25122,7 +25157,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     if (dailyCapBlock) {
       await cancelQueuedRunForHeartbeatDailyCap(run, dailyCapBlock);
-      return null;
+      return refuse("daily_cap_blocked");
     }
 
     const issueId = readNonEmptyString(context.issueId);
@@ -25152,7 +25187,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "claimQueuedRun: cancelled queued run with an unparseable context issue id",
         );
       }
-      return null;
+      return refuse("invalid_context_issue_id");
     }
     if (issueId) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(run.companyId, issueId);
@@ -25184,7 +25219,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
           },
         });
-        return null;
+        return refuse("tree_pause_hold");
       }
 
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
@@ -25201,7 +25236,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { runId: run.id, issueId, unresolvedBlockerCount: readiness?.unresolvedBlockerCount ?? 0 },
           "claimQueuedRun: cancelled blocked queued run",
         );
-        return null;
+        return refuse("dependency_blocked");
       }
 
       const staleness = await evaluateQueuedRunStaleness(run, issueId, context);
@@ -25211,7 +25246,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
         );
-        return null;
+        return refuse("stale_issue");
       }
     }
 
@@ -25226,17 +25261,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const exclusivePrReviewTaskKey = prReviewTaskKey && isPrReviewRetryContext(context)
       ? prReviewTaskKey
       : null;
+    // PEN-5316: the arm the atomic claim died on, when it dies. Set beside each
+    // branch rather than inferred afterwards from a bare null -- the three
+    // allocators fail for three different reasons and the one that matters
+    // (`slot_pool_exhausted`) is reachable ONLY on a pass that already computed
+    // availableSlots > 0, because a pass without slots records
+    // `no_available_slots` and never reaches here. That makes a non-zero rate
+    // on it a direct measurement of the gap between the slot ACCOUNTING
+    // (`countRunsOccupyingSlots`, which drops a run silent beyond
+    // RUN_STALE_SILENCE_MS) and the slot ALLOCATOR (a reservation held until
+    // the lifecycle finalizer releases it) -- i.e. of a slot the pass believes
+    // in and the pool does not.
+    let claimRefusalArm: DispatchCandidateRefusalArm = "run_not_queued";
     const initiallyClaimed = hasExternalLifecycle(agent.adapterType)
-      ? (await claimRunWithExternalRuntimeSlotPool(
+      ? await (async () => {
+        const poolOutcome = await claimRunWithExternalRuntimeSlotPoolOutcome(
           db,
           run.id,
           claimedAt,
           resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
           exclusivePrReviewTaskKey ? { exclusivePrReviewTaskKey } : {},
-        ))?.run ?? null
+        );
+        if (poolOutcome.refusal) claimRefusalArm = poolOutcome.refusal;
+        return poolOutcome.claimed?.run ?? null;
+      })()
       : exclusivePrReviewTaskKey
       ? await db.transaction(async (tx) => {
-          if (!(await canClaimPrReviewTask(tx, exclusivePrReviewTaskKey))) return null;
+          if (!(await canClaimPrReviewTask(tx, exclusivePrReviewTaskKey))) {
+            claimRefusalArm = "pr_review_task_blocked";
+            return null;
+          }
           return tx
             .update(heartbeatRuns)
             .set({
@@ -25272,7 +25326,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .returning()
           .then((rows) => rows[0] ?? initiallyClaimed)
       : initiallyClaimed;
-    if (!claimed) return null;
+    if (!claimed) return refuse(claimRefusalArm);
 
     recordPrReviewQueueWait({
       taskKey: claimed.contextTaskKey,
@@ -25333,7 +25387,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "claimQueuedRun: cancelled duplicate routine execution run",
         );
-        return null;
+        return refuse("routine_execution_duplicate");
       }
 
       const claimedAgent = await getAgent(claimed.agentId);
@@ -25473,7 +25527,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "claimQueuedRun: cancelled duplicate routine execution run after lock race",
         );
-        return null;
+        return refuse("routine_execution_duplicate");
       }
 
       if (issueLockRequired && !claimedIssueLock) {
@@ -25486,7 +25540,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "claimQueuedRun: cancelled run because issue execution lock was not acquired",
         );
-        return null;
+        return refuse("issue_lock_not_acquired");
       }
     }
 
@@ -32339,6 +32393,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     { lastLoggedAt: number; suppressed: number }
   >();
 
+  /**
+   * Row cap on ONE decline record's candidate list (PEN-5316).
+   *
+   * Bounds the WIDTH of a single log line, not the rate — the throttle below
+   * does that, and the per-arm counter carries the complete distribution
+   * regardless. Ten is well above the handful a healthy pass ranks and far
+   * below the hundreds a wedged seat can hold; the exact total travels beside
+   * the list as `candidateCount` so a cap can never be misread as a short
+   * queue.
+   */
+  const DISPATCH_CANDIDATE_REFUSAL_LOG_LIMIT = 10;
+
   function takeDispatchDeclineLogSlot(
     agentId: string,
     reason: DispatchDeclineReason,
@@ -32379,6 +32445,33 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * to the bounded `unknown` — those refusals are facts about the process, and
    * labelling them per-agent would invite exactly the wrong query.
    */
+  /**
+   * PEN-5316: the per-CANDIDATE sibling of {@link noteDispatchDeclined}.
+   *
+   * Same failure discipline for the same reason -- instrumentation must never
+   * be able to fail dispatch, and the start-lock abort must still propagate.
+   * It fires more than once per pass by design: a pass that ranked five rows
+   * and claimed none records five arms, and that distribution is the datum.
+   */
+  async function noteDispatchCandidateRefused(
+    agentId: string,
+    arm: DispatchCandidateRefusalArm,
+    companyId: string | null,
+  ): Promise<void> {
+    try {
+      const knownAgentIds = companyId
+        ? await getActiveAgentIds(db, companyId)
+        : new Set<string>();
+      recordDispatchCandidateRefused({ agentId, arm, knownAgentIds });
+    } catch (error) {
+      rethrowIfAgentStartLockAborted(error);
+      logger.debug(
+        { agentId, arm, error },
+        "startNextQueuedRunForAgent: failed to record dispatch candidate refusal",
+      );
+    }
+  }
+
   async function noteDispatchDeclined(
     agentId: string,
     reason: DispatchDeclineReason,
@@ -33577,6 +33670,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // O(N log N) JSON parses. It is now O(N).
       const dispatchRankByRunId = new Map<string, number>();
       const dispatchSeniorityMsByRunId = new Map<string, number>();
+      const dispatchRankRefusalArmByRunId = new Map<string, DispatchCandidateRefusalArm>();
       for (const queuedRun of queuedRuns) {
         const snapshot = parseObject(queuedRun.contextSnapshot);
         const issueId = readNonEmptyString(snapshot.issueId);
@@ -33593,7 +33687,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // Deliberately `isDispatchRankReady`, not the lanes' `isRunClaimable`
         // — see that function's comment for why terminal-status must stay
         // out of this specific screen.
-        const ready = issueId ? isDispatchRankReady(snapshot, dependencyReadiness.get(issueId), dispatchNow) : true;
+        // PEN-5316: keep the ARM, not just the boolean. The claimable gauge
+        // screens on this same predicate, so when the gauge says a row has been
+        // ready and waiting while this pass claims nothing, the arm is what
+        // says whether the two readers even agreed about THIS row.
+        const rankReadiness = issueId
+          ? describeDispatchRankReadiness(snapshot, dependencyReadiness.get(issueId), dispatchNow)
+          : ({ ready: true, arm: null } as const);
+        if (!rankReadiness.ready) dispatchRankRefusalArmByRunId.set(queuedRun.id, rankReadiness.arm);
+        const ready = rankReadiness.ready;
         // Require both recoveryActionId AND source:"issue_recovery_action" (every
         // enqueueWakeup call in recovery/service.ts stamps both together) so this
         // stays an explicit, narrowly-scoped coupling rather than any future wake
@@ -33645,6 +33747,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      /**
+       * PEN-5316: the SUBJECT the decline counter has never carried.
+       *
+       * `no_claimable_run` said a seat with a free slot started nothing. It
+       * could not say which rows the pass held or which screen rejected them,
+       * so it could not be reconciled against
+       * `paperclip_queued_run_oldest_claimable_age_seconds` -- which, screening
+       * on the same `isDispatchRankReady`, simultaneously reported a ready run
+       * waiting more than 120 s, on 27-31% of an 8 h window on the two busiest
+       * seats. One of the two was wrong and nothing could say which.
+       *
+       * Capped at {@link DISPATCH_CANDIDATE_REFUSAL_LOG_LIMIT} entries. The
+       * bound is on the WIDTH of one record, not on the counter beside it: the
+       * arm distribution is complete in Prometheus, and this list exists to
+       * name enough run ids to join the two series by hand. `candidateCount`
+       * stays exact so a truncated list can never read as a short queue.
+       */
+      const candidateRefusals: Array<{ runId: string; arm: DispatchCandidateRefusalArm; rank: number | null; waitedSeconds: number | null }> = [];
+      // Counted separately from `candidateRefusals.length`, which saturates at
+      // the cap. Reporting the capped length as the count would say "5
+      // candidates" for a pass that refused 200 — the shown-equals-matched
+      // ambiguity, reintroduced inside the very record added to remove it.
+      let candidateRefusalCount = 0;
+      const noteCandidateRefusal = async (
+        candidate: typeof heartbeatRuns.$inferSelect,
+        arm: DispatchCandidateRefusalArm,
+      ) => {
+        candidateRefusalCount += 1;
+        if (candidateRefusals.length < DISPATCH_CANDIDATE_REFUSAL_LOG_LIMIT) {
+          const seniorityMs = dispatchSeniorityMsByRunId.get(candidate.id);
+          candidateRefusals.push({
+            runId: candidate.id,
+            arm,
+            rank: dispatchRankByRunId.get(candidate.id) ?? null,
+            waitedSeconds: seniorityMs === undefined
+              ? null
+              : Math.max(0, Math.round((dispatchNow.getTime() - seniorityMs) / 1000)),
+          });
+        }
+        await noteDispatchCandidateRefused(agentId, arm, agent.companyId);
+      };
       let scheduledEmergencyContinuationAfterRefusal = false;
       const scheduleEmergencyContinuationForStillQueuedRun = async (
         run: typeof heartbeatRuns.$inferSelect,
@@ -33744,6 +33887,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
               );
             }
+            await noteCandidateRefusal(queuedRun, "duplicate_dispatch_suppressed");
             continue;
           }
           const queuedTaskKey = readNonEmptyString(queuedSnapshot.taskKey);
@@ -33755,11 +33899,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // Explicit review requests intentionally queue a follow-up while a
             // review is running. Keep that row queued, but do not let it run
             // concurrently with the review that already owns this PR task.
+            //
+            // PEN-5316: this arm leaves the row QUEUED, so the claimable gauge
+            // keeps counting and ageing it while the dispatcher will not take
+            // it. That is a gauge over-report by construction, and it is one of
+            // the few arms that can sustain one -- the arms that CANCEL clear
+            // themselves from the gauge within a refresh.
+            await noteCandidateRefusal(queuedRun, "pr_review_task_in_flight");
             continue;
           }
           markAgentStartLockPhase(agentId, "claim");
-          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          let claimRefusalArm: DispatchCandidateRefusalArm | null = null;
+          const claimed = await claimQueuedRun(queuedRun, companyAgents, (arm) => {
+            claimRefusalArm = arm;
+          });
           if (!claimed) {
+            // `claimQueuedRun` returns the row unchanged (truthy) when it is no
+            // longer `queued`, so a falsy result always went through `refuse`.
+            // Fall back to the rank screen's own arm if one somehow did not,
+            // rather than inventing a verdict: an unnamed refusal is the defect
+            // this ticket exists to remove, and a wrong name is worse than
+            // `other`.
+            await noteCandidateRefusal(
+              queuedRun,
+              claimRefusalArm ?? dispatchRankRefusalArmByRunId.get(queuedRun.id) ?? "run_not_queued",
+            );
             if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
               scheduledEmergencyContinuationAfterRefusal = true;
               break;
@@ -33806,6 +33970,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               queuedRunCount: queuedRuns.length,
               availableSlots,
               suppressedSincePreviousLog: emergencyLogSlot.suppressedSincePreviousLog,
+              // PEN-5316: the same subjects as the `no_claimable_run` line
+              // below. This branch is the stronger distress signal of the pair
+              // (a candidate refused AND the pass escalated), so leaving it
+              // subject-less would have kept the worst case the darkest —
+              // which is exactly how it was found dark once before.
+              candidateCount: candidateRefusalCount,
+              candidateRefusalsShown: candidateRefusals.length,
+              candidateRefusals,
             },
             "startNextQueuedRunForAgent: declined — a candidate refused and an emergency continuation was scheduled",
           );
@@ -33833,6 +34005,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               queuedRunCount: queuedRuns.length,
               availableSlots,
               suppressedSincePreviousLog: noClaimLogSlot.suppressedSincePreviousLog,
+              // PEN-5316. `candidateCount` is exact; `candidateRefusals` is
+              // capped. Read the pair — a capped list beside a large count is
+              // a wide queue, not a short one, and conflating them is how the
+              // previous record managed to be both present and useless.
+              candidateCount: candidateRefusalCount,
+              candidateRefusalsShown: candidateRefusals.length,
+              candidateRefusals,
             },
             "startNextQueuedRunForAgent: declined — candidates were ranked but none could be claimed",
           );

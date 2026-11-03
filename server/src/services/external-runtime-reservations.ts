@@ -157,8 +157,8 @@ async function claimRunWithExternalRuntimeSlotOutcome(
   claimedAt: Date,
   slotId = DEFAULT_EXTERNAL_RUNTIME_SLOT_ID,
   options: { exclusivePrReviewTaskKey?: string } = {},
-): Promise<{ claimed: ExternalRuntimeClaim | null; taskBlocked: boolean }> {
-  let outcome: { claimed: ExternalRuntimeClaim | null; taskBlocked: boolean };
+): Promise<{ claimed: ExternalRuntimeClaim | null; taskBlocked: boolean; notQueued?: boolean }> {
+  let outcome: { claimed: ExternalRuntimeClaim | null; taskBlocked: boolean; notQueued?: boolean };
   try {
     outcome = await db.transaction(async (tx) => {
       if (
@@ -173,7 +173,16 @@ async function claimRunWithExternalRuntimeSlotOutcome(
         .where(eq(heartbeatRuns.id, runId))
         .for("update")
         .then((rows) => rows[0] ?? null);
-      if (!run || run.status !== "queued") return { claimed: null, taskBlocked: false };
+      // PEN-5316: distinguish "this row left `queued` under us" (another
+      // replica claimed it, or it was cancelled mid-pass) from "every slot in
+      // the pool is occupied". Both used to surface as a bare null, and the
+      // dispatcher then recorded `no_claimable_run` without being able to say
+      // which -- yet they are opposite faults. A lost race means the work IS
+      // being done by someone; an exhausted pool means the pass saw a free slot
+      // that the allocator does not agree exists.
+      if (!run || run.status !== "queued") {
+        return { claimed: null, taskBlocked: false, notQueued: true };
+      }
 
       let reservation = await tx
         .select()
@@ -286,14 +295,42 @@ export async function claimRunWithExternalRuntimeSlot(
   return outcome.claimed;
 }
 
-export async function claimRunWithExternalRuntimeSlotPool(
+/**
+ * Why a pool claim did not take a slot (PEN-5316).
+ *
+ * `paperclip_external_runtime_reservation_events_total{event="contended"}`
+ * already counts the refusals, but it is unlabelled by agent and collapses
+ * three unrelated causes into one event, so it cannot answer the question the
+ * dispatcher is actually asked: this seat had a free slot by its own
+ * accounting, so why did nothing start?
+ *
+ *  - `slot_pool_exhausted` -- every slot `0..maxSlots-1` already carries an
+ *    unreleased reservation. The pass computed `availableSlots` from
+ *    `countRunsOccupyingSlots`, which drops a `running` row silent for more
+ *    than `RUN_STALE_SILENCE_MS` (BLO-12990), while a reservation is held until
+ *    the lifecycle finalizer releases it. Those two populations are allowed to
+ *    differ, and when they do the pass believes in a slot the allocator does
+ *    not. That is a phantom slot, not an unclaimable run.
+ *  - `pr_review_task_blocked` -- the exclusive PR-review task key is held.
+ *  - `run_not_queued` -- the row left `queued` between ranking and claiming.
+ */
+export type ExternalRuntimeSlotPoolRefusal =
+  | "slot_pool_exhausted"
+  | "pr_review_task_blocked"
+  | "run_not_queued";
+
+export async function claimRunWithExternalRuntimeSlotPoolOutcome(
   db: Db,
   runId: string,
   claimedAt: Date,
   maxSlots: number,
   options: { exclusivePrReviewTaskKey?: string } = {},
-) {
+): Promise<{
+  claimed: ExternalRuntimeClaim | null;
+  refusal: ExternalRuntimeSlotPoolRefusal | null;
+}> {
   const slotCount = Math.max(1, Math.floor(maxSlots));
+  let sawNotQueued = false;
   for (let slotId = 0; slotId < slotCount; slotId += 1) {
     const outcome = await claimRunWithExternalRuntimeSlotOutcome(
       db,
@@ -304,15 +341,38 @@ export async function claimRunWithExternalRuntimeSlotPool(
     );
     if (outcome.claimed) {
       recordExternalRuntimeClaimAttempt(db, claimedAt, true);
-      return outcome.claimed;
+      return { claimed: outcome.claimed, refusal: null };
     }
     if (outcome.taskBlocked) {
       recordExternalRuntimeClaimAttempt(db, claimedAt, false);
-      return null;
+      return { claimed: null, refusal: "pr_review_task_blocked" };
     }
+    // Not an early exit: the row is re-read inside each probe's transaction, so
+    // a `notQueued` on slot 0 is the same verdict every later slot would reach.
+    // Recorded rather than returned only to keep the probe loop's shape -- and
+    // to keep `slot_pool_exhausted` honest, which is the whole point of the
+    // split: reporting an exhausted pool for a row that had already left the
+    // queue would manufacture evidence for the phantom-slot reading.
+    if (outcome.notQueued) sawNotQueued = true;
   }
   recordExternalRuntimeClaimAttempt(db, claimedAt, false);
-  return null;
+  return { claimed: null, refusal: sawNotQueued ? "run_not_queued" : "slot_pool_exhausted" };
+}
+
+export async function claimRunWithExternalRuntimeSlotPool(
+  db: Db,
+  runId: string,
+  claimedAt: Date,
+  maxSlots: number,
+  options: { exclusivePrReviewTaskKey?: string } = {},
+) {
+  return (await claimRunWithExternalRuntimeSlotPoolOutcome(
+    db,
+    runId,
+    claimedAt,
+    maxSlots,
+    options,
+  )).claimed;
 }
 
 export async function getActiveExternalRuntimeReservation(

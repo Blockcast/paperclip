@@ -172,7 +172,30 @@ const CLAIMABLE_QUEUED_RUN_WINDOW_PER_AGENT = 100;
  * Dropping it would be the fail-open direction of this change: it would hide a
  * genuinely stranded issueless run behind a filter that was never about it.
  */
+/**
+ * How old this gauge's subject must be before the refresh names it in the log
+ * (PEN-5316), and how often it may do so.
+ *
+ * The gauge can only ever say "agent X has a claimable run that has waited N
+ * seconds". The dispatcher's `no_claimable_run` decline simultaneously says
+ * agent X had a free slot and could claim nothing. Both were subject-less, so
+ * on the two busiest seats they co-fired across 27-31% of an 8 h window with no
+ * way to tell whether they were even talking about the same row -- and
+ * therefore no way to tell which of the two was wrong.
+ *
+ * `run_id` cannot be a metric label (unbounded). Logging the subject here is
+ * the join key: the dispatcher's decline line now carries the run ids it
+ * refused and the arm each died on, and this names the row this gauge is
+ * actually reporting. 120 s matches the threshold the disagreement was
+ * measured at, so the record exists for exactly the samples in question.
+ */
+const CLAIMABLE_SUBJECT_LOG_AGE_SECONDS = 120;
+const CLAIMABLE_SUBJECT_LOG_INTERVAL_MS = 5 * 60 * 1000;
+
+let lastClaimableSubjectLogMs: number | null = null;
+
 type ClaimableQueuedRunWindowRow = {
+  id: string;
   agent_id: string | null;
   company_id: string;
   context_issue_id: string | null;
@@ -186,9 +209,10 @@ async function refreshClaimableQueuedRunAgeMetrics(
   knownAgents: ReadonlyMap<string, QueuedRunAgentIdentity>,
 ): Promise<void> {
   const windowed = await db.execute<ClaimableQueuedRunWindowRow>(sql`
-    select agent_id, company_id, context_issue_id, context_snapshot, effective_queued_at
+    select id, agent_id, company_id, context_issue_id, context_snapshot, effective_queued_at
     from (
       select
+        ${heartbeatRuns.id} as id,
         ${heartbeatRuns.agentId} as agent_id,
         ${heartbeatRuns.companyId} as company_id,
         ${heartbeatRuns.contextIssueId} as context_issue_id,
@@ -230,6 +254,10 @@ async function refreshClaimableQueuedRunAgeMetrics(
   }
 
   const oldestClaimableByAgent = new Map<string | null, number>();
+  // PEN-5316: WHICH row each published age belongs to. The gauge's subject, so
+  // the dispatcher's decline record can be joined against it.
+  const oldestClaimableRunIdByAgent = new Map<string | null, string>();
+  const oldestClaimableIssueIdByAgent = new Map<string | null, string | null>();
   const windowSizeByAgent = new Map<string | null, number>();
   for (const row of windowRows) {
     windowSizeByAgent.set(row.agent_id, (windowSizeByAgent.get(row.agent_id) ?? 0) + 1);
@@ -244,7 +272,35 @@ async function refreshClaimableQueuedRunAgeMetrics(
     const current = oldestClaimableByAgent.get(row.agent_id);
     if (current === undefined || ageSeconds > current) {
       oldestClaimableByAgent.set(row.agent_id, ageSeconds);
+      oldestClaimableRunIdByAgent.set(row.agent_id, row.id);
+      oldestClaimableIssueIdByAgent.set(row.agent_id, issueId);
     }
+  }
+
+  // Name the subject of every reading above the threshold the PEN-5316
+  // disagreement was measured at. Throttled as a set rather than per agent so
+  // one line carries the whole fleet's subjects at an instant -- the question
+  // being answered ("was the dispatcher looking at THIS row?") is asked of a
+  // moment, and a per-agent trickle would scatter one answer across minutes.
+  const claimableSubjects = [...oldestClaimableByAgent]
+    .filter(([, ageSeconds]) => ageSeconds >= CLAIMABLE_SUBJECT_LOG_AGE_SECONDS)
+    .map(([agentId, ageSeconds]) => ({
+      agentId,
+      runId: oldestClaimableRunIdByAgent.get(agentId) ?? null,
+      issueId: oldestClaimableIssueIdByAgent.get(agentId) ?? null,
+      ageSeconds: Math.round(ageSeconds),
+    }));
+  const claimableSubjectLogDue = lastClaimableSubjectLogMs === null
+    || now.getTime() - lastClaimableSubjectLogMs >= CLAIMABLE_SUBJECT_LOG_INTERVAL_MS;
+  if (claimableSubjects.length > 0 && claimableSubjectLogDue) {
+    lastClaimableSubjectLogMs = now.getTime();
+    logger.info(
+      {
+        thresholdSeconds: CLAIMABLE_SUBJECT_LOG_AGE_SECONDS,
+        subjects: claimableSubjects,
+      },
+      "claimable queued-run age: subjects of the currently published gauge readings (PEN-5316 join key)",
+    );
   }
 
   // Saturation is the one way this gauge can under-report: if an agent's whole
