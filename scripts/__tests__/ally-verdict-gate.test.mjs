@@ -39,6 +39,7 @@ import {
   attestationLagFindings,
   chooseRun,
   liveHeadRefusal,
+  MAX_PR_PAGES,
   pullsForHead,
   rerunDecision,
   selectBackstopCandidates,
@@ -857,6 +858,34 @@ test("backstop dispatches the manual arm at the default branch, once per held he
   assert.match(stdout, /2 over the cap wait for the next sweep/);
 });
 
+// Ally review of d39c46d0, Suggestion 1: the paged walk stops at its cap, and
+// a reader cannot tell a quiet run from a truncated one. Both schedule-driven
+// readers share the walk, so both must disclose it.
+test("a paged walk that stopped at its cap says so, in both readers", async () => {
+  const page = (hasNextPage, nodes = []) => [
+    "POST",
+    /^\/graphql$/,
+    () => [200, { data: { repository: { defaultBranchRef: { name: BACKSTOP_BASE }, pullRequests: { pageInfo: { hasNextPage, endCursor: "c" }, nodes } } } }],
+  ];
+  for (const mode of ["backstop", "attestation-lag"]) {
+    const more = await scriptAgainst(mode, [page(true), ...backstopRoutes([]).slice(1)], {});
+    assert.equal(more.status, 0, more.stdout);
+    assert.equal(
+      more.calls.filter((c) => c.endsWith("/graphql")).length,
+      MAX_PR_PAGES,
+      `${mode}: the cap is still a cap -- disclosing it must not turn it into an unbounded walk`,
+    );
+    assert.match(more.stdout, /::warning title=[^:]*::Read only the \d+ most recently updated open PR/, mode);
+    assert.match(more.stdout, /covered a PREFIX of the open PRs, not all/, mode);
+
+    // The ordinary case stays silent: a complete walk must not cry truncation.
+    const all = await scriptAgainst(mode, [page(false), ...backstopRoutes([]).slice(1)], {});
+    assert.equal(all.status, 0, all.stdout);
+    assert.equal(all.calls.filter((c) => c.endsWith("/graphql")).length, 1, mode);
+    assert.doesNotMatch(all.stdout, /covered a PREFIX/, mode);
+  }
+});
+
 test("backstop under the kill switch releases a head held before it was thrown; unset, it does not", async () => {
   const prs = [heldPr(4, [B(1, "NEUTRAL")]), prNode({ number: 5, isDraft: true }, { base: BACKSTOP_BASE })];
   const off = await scriptAgainst("backstop", backstopRoutes(prs), { ALLY_GATED_CI_BYPASS: "" });
@@ -922,18 +951,39 @@ const attRun = (id, conclusion, completedAt, name = "ci/ally-head-attested") => 
   completedAt,
 });
 
+// `locks` is the `ally-verdict` lock check-run list of the newest pr.yml
+// pull_request run at the head -- the hold itself. `null` (the default) models
+// a head where no lock was visible at all, which is NOT the same as a released
+// one and must still be reported.
+const lockSuite = (locks, over = {}) => ({
+  workflowRun: { databaseId: 500, event: "pull_request", workflow: { name: "PR" }, ...(over.workflowRun ?? {}) },
+  checkRuns: { nodes: locks },
+});
+
 function lagNode(prs) {
   return {
     defaultBranchRef: { name: "master" },
     pullRequests: {
-      nodes: prs.map(({ number = 3307, head, reviews = [], runs = [], ...over }) => ({
+      nodes: prs.map(({ number = 3307, head, reviews = [], runs = [], locks = null, suites = null, ...over }) => ({
         number,
         isDraft: false,
         headRefOid: head,
         baseRefName: "master",
         headRepository: { nameWithOwner: LAG_REPO },
         reviews: { nodes: reviews },
-        commits: { nodes: [{ commit: { oid: head, ally: { nodes: [{ checkRuns: { nodes: runs } }] } } }] },
+        commits: {
+          nodes: [{
+            commit: {
+              oid: head,
+              ally: { nodes: [{ checkRuns: { nodes: runs } }] },
+              ...(suites !== null
+                ? { actions: { nodes: suites } }
+                : locks !== null
+                  ? { actions: { nodes: [lockSuite(locks)] } }
+                  : {}),
+            },
+          }],
+        },
         ...over,
       })),
     },
@@ -1120,6 +1170,95 @@ test("attestationLagFindings: worst stranded head sorts first", () => {
   );
 });
 
+// Ally review of d39c46d0, Important finding: the detector's own remedy must be
+// able to clear its own alarm. `/test` releases the hold through the commit
+// STATUS plane and the App's check-runs never move, so before this the head
+// stayed a finding -- an hourly exit 1 nobody could clear short of pushing or
+// closing the PR.
+test("attestationLagFindings: a stranded head whose hold has been RELEASED is not reported", () => {
+  // The stranded shape itself, unchanged: still a finding while the hold holds.
+  const stranded = {
+    head: lagHead.stranded,
+    reviews: [allyReview(lagHead.stranded, "2026-11-04T10:41:24Z")],
+    runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:23Z"), attRun(2, "NEUTRAL", "2026-11-04T10:37:30Z")],
+  };
+  const held = findLag([{ ...stranded, locks: [{ databaseId: 1, conclusion: "FAILURE" }] }]);
+  assert.equal(held.length, 1, "a hold that is still holding is still reported");
+  assert.equal(held[0].lock, "FAILURE");
+  assert.equal(held[0].strandedSeconds, 9996, "the severity is untouched by the new clause");
+
+  // The `/test` recovery: the manual arm re-runs the failed jobs at any
+  // attempt, so attempt 2's lock concludes SUCCESS while the attestation stays
+  // NEUTRAL for good. Newest lock wins -- attempt 1's FAILURE is still in the
+  // suite, which is exactly why this cannot be a `some(... === "FAILURE")`.
+  assert.deepEqual(
+    findLag([{
+      ...stranded,
+      locks: [{ databaseId: 1, conclusion: "FAILURE" }, { databaseId: 2, conclusion: "SUCCESS" }],
+    }]),
+    [],
+    "released by /test: nothing is held, so there is nothing to act on",
+  );
+  // Out-of-order ids must not change the verdict: newest is by id, not position.
+  assert.deepEqual(
+    findLag([{
+      ...stranded,
+      locks: [{ databaseId: 2, conclusion: "SUCCESS" }, { databaseId: 1, conclusion: "FAILURE" }],
+    }]),
+    [],
+  );
+  // Only the NEWEST pr.yml run counts. A stale green run from an earlier push
+  // of the same head must not mask the live hold.
+  const live = findLag([{
+    ...stranded,
+    suites: [
+      lockSuite([{ databaseId: 9, conclusion: "SUCCESS" }], { workflowRun: { databaseId: 100 } }),
+      lockSuite([{ databaseId: 1, conclusion: "FAILURE" }], { workflowRun: { databaseId: 900 } }),
+    ],
+  }]);
+  assert.equal(live.length, 1, "the newest run holds; an older green one is not a release");
+  assert.equal(live[0].lock, "FAILURE");
+});
+
+// Ally review of d39c46d0, Suggestion 2: pr.yml exempts a self-authored PR from
+// the hold unless ALLY_GATED_CI_HOLD_SELF_AUTHORED=true, and the detector used
+// to report such a head as "held" when it was not. Reading the lock covers it
+// without the detector having to mirror pr.yml's variables: on an exempt head
+// the lock job exits green at its mode step. Same for the fork exemption and
+// for ALLY_GATED_CI_BYPASS.
+test("attestationLagFindings: a head pr.yml never held is never called held", () => {
+  const exempt = {
+    head: lagHead.stranded,
+    reviews: [allyReview(lagHead.stranded, "2026-11-04T10:41:24Z")],
+    runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:30Z")],
+    // evaluate=false: every later step is skipped and the job concludes green.
+    locks: [{ databaseId: 1, conclusion: "SUCCESS" }],
+  };
+  assert.deepEqual(findLag([exempt]), []);
+});
+
+// The asymmetry is deliberate and is the one thing that must not regress: a
+// detector for a LOST signal may not go quiet on absent evidence.
+test("attestationLagFindings: a lock it could not read is reported, not assumed released", () => {
+  const base = {
+    head: lagHead.stranded,
+    reviews: [allyReview(lagHead.stranded, "2026-11-04T10:41:24Z")],
+    runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:30Z")],
+  };
+  for (const [why, over] of [
+    ["no Actions suite at all", {}],
+    ["a suite carrying no lock check-run", { locks: [] }],
+    ["a run of some other workflow", { suites: [{ workflowRun: { databaseId: 9, event: "pull_request", workflow: { name: "Nightly" } }, checkRuns: { nodes: [{ databaseId: 1, conclusion: "SUCCESS" }] } }] }],
+    ["a lock still running", { locks: [{ databaseId: 1, conclusion: null }] }],
+    ["a cancelled lock", { locks: [{ databaseId: 1, conclusion: "CANCELLED" }] }],
+  ]) {
+    const [finding, ...rest] = findLag([{ ...base, ...over }]);
+    assert.equal(rest.length, 0, why);
+    assert.ok(finding, `${why}: must still be reported`);
+    assert.equal(finding.lock, over.locks?.[0]?.conclusion ?? null, `${why}: the hold's state rides on the finding`);
+  }
+});
+
 test("attestation-lag: its own read-only job on the hourly sweep", () => {
   const block = jobBlocks(sweepYml).ally_attestation_lag;
   assert.ok(block, "the detector must be wired to a schedule, not left callable by hand");
@@ -1146,6 +1285,12 @@ test("the attestation-lag query reads the two planes the detector compares", () 
   assert.match(ATTESTATION_LAG_QUERY, /startedAt completedAt/);
   assert.match(ATTESTATION_LAG_QUERY, /filterBy: \{appId: 3966421\}/);
   assert.match(ATTESTATION_LAG_QUERY, /states: OPEN/);
+  // ...and the hold itself, on the Actions plane: without it the detector
+  // cannot tell a head still held from one `/test` already released, and its
+  // own remedy could never clear its own alarm.
+  assert.match(ATTESTATION_LAG_QUERY, /actions: checkSuites\(first: 50, filterBy: \{appId: 15368\}\)/);
+  assert.match(ATTESTATION_LAG_QUERY, /checkName: "ally-verdict"/);
+  assert.match(ATTESTATION_LAG_QUERY, /workflowRun \{ databaseId event workflow \{ name \} \}/);
   // Read-only by construction: a detector must never mutate what it watches.
   assert.doesNotMatch(ATTESTATION_LAG_QUERY, /mutation/);
   assert.ok(ATTESTATION_LAG_GRACE_SECONDS > 60, "grace must clear the ~12s healthy publication delay with room");
