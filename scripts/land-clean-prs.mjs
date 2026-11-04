@@ -2381,7 +2381,7 @@ export function fetchOpenPrs(repo, { run = gh, mergeStates = fetchMergeStates } 
   const mergeQueueEntryFor = (row) => {
     const base = row?.baseRefName;
     if (!base) return null;
-    if (!queueByBase.has(base)) queueByBase.set(base, fetchMergeQueueEntries(repo, base));
+    if (!queueByBase.has(base)) queueByBase.set(base, fetchMergeQueueEntries(repo, base, run));
     // `null` is an unread queue, and must not read as "this PR is not queued"
     // in a way that could ever be mistaken for a measurement — but the verdict
     // it produces is the same `null` entry the pre-PEN-5279 code implied, so
