@@ -33,6 +33,9 @@ export const PR_WORKFLOW_FILE = "pr.yml";
 export const PR_WORKFLOW_NAME = "PR";
 export const DISPATCHER_WORKFLOW_FILE = "dispatch-ally-verdict-ci.yml";
 export const MAX_BACKSTOP_DISPATCHES = 10;
+// Pages of 50 open PRs each schedule-driven reader walks before stopping. A
+// cost bound; walkOpenPullRequests discloses when it truncates.
+export const MAX_PR_PAGES = 4;
 // Attestation-lag detector (PEN-5538). App 3966421 publishes the attestation
 // pair twice per head: NEUTRAL at push time, then SUCCESS a few seconds after
 // Ally submits the review. Measured on #3307's four consecutive heads
@@ -181,6 +184,23 @@ export function bypassEnabled(value) {
   return typeof value === "string" && value.toLowerCase() === "true";
 }
 
+// The newest `pull_request` run of pr.yml at this commit, by run id. Shared by
+// the backstop's attempt-1 pre-filter and the attestation-lag detector's
+// released-hold exclusion so both read the same suite; they then read DIFFERENT
+// things from its lock check-runs (how many, versus what the newest concluded).
+function newestPrWorkflowSuite(commit) {
+  return (commit?.actions?.nodes ?? [])
+    .filter((suite) => suite?.workflowRun?.event === "pull_request" && suite?.workflowRun?.workflow?.name === PR_WORKFLOW_NAME)
+    .reduce(
+      (best, suite) =>
+        Number.isSafeInteger(suite?.workflowRun?.databaseId) &&
+        (best === null || suite.workflowRun.databaseId > best.workflowRun.databaseId)
+          ? suite
+          : best,
+      null,
+    );
+}
+
 // Backstop pre-filter. COST ONLY, never authority: each candidate re-enters
 // through the manual arm, which evaluates the shared predicate and the rerun
 // rule above. A false negative waits for the next event; a false positive is
@@ -206,18 +226,7 @@ export function selectBackstopCandidates(repositoryNode, repository, { bypass = 
       if (findings?.conclusion === "FAILURE") continue;
       if (findings?.conclusion !== "SUCCESS" && attested?.conclusion !== "SUCCESS") continue;
     }
-    const prSuites = (commit.actions?.nodes ?? []).filter(
-      (suite) => suite?.workflowRun?.event === "pull_request" && suite?.workflowRun?.workflow?.name === PR_WORKFLOW_NAME,
-    );
-    const newest = prSuites.reduce(
-      (best, suite) =>
-        Number.isSafeInteger(suite?.workflowRun?.databaseId) &&
-        (best === null || suite.workflowRun.databaseId > best.workflowRun.databaseId)
-          ? suite
-          : best,
-      null,
-    );
-    const locks = newest?.checkRuns?.nodes ?? [];
+    const locks = newestPrWorkflowSuite(commit)?.checkRuns?.nodes ?? [];
     // One lock check-run in the suite means attempt 1 (a re-run adds one).
     if (locks.length === 1 && locks[0]?.conclusion === "FAILURE") picked.push(pr.number);
   }
@@ -277,7 +286,9 @@ const newestEpoch = (nodes, pick) =>
 // PR's LIVE head, is the newest Ally review NEWER than the newest publication
 // of the attestation it is supposed to produce?
 //
-// A finding needs BOTH halves, and the second is what keeps this quiet:
+// A finding needs ALL THREE clauses below. The first is the signature; the
+// second and third are what keep this quiet, and the third is what lets the
+// operator turn it off by fixing the thing it reports:
 //
 //   lag     newest Ally review at the head post-dates the newest
 //           `ci/ally-head-attested` publication there by more than `grace`.
@@ -286,8 +297,41 @@ const newestEpoch = (nodes, pick) =>
 //   no      neither check-run base `decide()` admits is SUCCESS at that head.
 //   signal  Without this a head whose attestation DID land late, or landed
 //           FAILURE (a real blocking verdict, not a missing one), would be
-//           reported as stranded. It also makes the finding set a subset of
-//           the heads the hold is actually still holding.
+//           reported as stranded.
+//
+// and a head is dropped once the hold it is stranded behind has been RELEASED:
+//
+//   released  the newest `ally-verdict` lock check-run of the newest
+//             `pull_request` run of pr.yml at the head concluded SUCCESS.
+//
+// That third clause is what makes the alarm clearable, and it is not optional.
+// The `::warning` this detector prints tells the reader to comment `/test`, and
+// `/test` releases the hold through a plane this function does not otherwise
+// read: it posts the trusted `ci/manual-test-request` COMMIT STATUS
+// (pr-test-request.mjs), which pr.yml's lock honours BEFORE the predicate, and
+// the dispatcher's manual arm then re-runs the failed jobs at any attempt. The
+// App's check-runs never move, so without this clause a head that had been
+// released by the documented remedy stayed a finding for good -- an hourly
+// exit 1 the operator could not clear short of pushing or closing the PR, which
+// is precisely the un-actionable red the AC4 escalation exists to avoid.
+//
+// Reading the lock rather than the `ci/manual-test-request` status is the
+// choice recorded here: the lock IS the hold, so it answers the question
+// directly and covers every release path at once -- `/test`, a late verdict,
+// `ALLY_GATED_CI_BYPASS`, the fork exemption, and the self-authored exemption
+// (`ALLY_GATED_CI_HOLD_SELF_AUTHORED` unset, where pr.yml exits the lock job
+// green at its mode step, so an App-authored head is correctly never called
+// held). The status plane would additionally catch the minutes between a
+// `/test` comment and its re-run completing, but that window is two orders of
+// magnitude under ATTESTATION_LAG_ALARM_SECONDS (3600s), so no alarm can fire
+// inside it -- and reading it would duplicate manualTestAuthorized's creator
+// trust check on a second plane for no reachable gain.
+//
+// Deliberately ASYMMETRIC with the two clauses above: only a SUCCESS lock drops
+// a head. A missing lock -- no run yet, or a suite page that did not carry it --
+// leaves the head reported, because a detector whose whole purpose is to catch
+// a LOST signal must not go quiet on absent evidence. `lock` rides on the
+// finding so that state is legible rather than silent.
 //
 // Deliberately mirrors selectBackstopCandidates' predicate rather than
 // re-deriving one, so "positive signal" means the same thing in the detector
@@ -329,6 +373,13 @@ export function attestationLagFindings(
     if (attestations.some((run) => run?.conclusion === "SUCCESS")) continue;
     if (findingsRuns.some((run) => run?.conclusion === "SUCCESS")) continue;
 
+    // Released: whatever freed the lanes, they are not held at this head, so
+    // there is nothing here for the operator to act on. Newest lock by id, not
+    // `length === 1` as the backstop counts them -- a head released by `/test`
+    // is on attempt 2 by construction, and that is the shape to drop.
+    const lock = newestByDatabaseId(newestPrWorkflowSuite(commit)?.checkRuns?.nodes ?? [])?.conclusion ?? null;
+    if (lock === "SUCCESS") continue;
+
     const publishedAt = newestEpoch(attestations, (run) => run?.completedAt ?? run?.startedAt);
 
     // Two different quantities, and conflating them is the trap. `lag` is the
@@ -359,6 +410,10 @@ export function attestationLagFindings(
       // "stuck on the push-time NEUTRAL" shape apart from "nothing at all".
       conclusion: publishedAt === null ? null : (newestByDatabaseId(attestations)?.conclusion ?? null),
       publications: attestations.length,
+      // What the hold itself says. `null` means no lock check-run was visible
+      // at this head -- reported rather than dropped, so absent evidence reads
+      // as absent rather than as "released".
+      lock,
     });
   }
   return findings.sort((a, b) => b.strandedSeconds - a.strandedSeconds || a.number - b.number);
@@ -377,6 +432,12 @@ export const ATTESTATION_LAG_QUERY = `query($owner: String!, $name: String!, $cu
           oid
           ally: checkSuites(first: 5, filterBy: {appId: ${ALLY_APP_ID}}) {
             nodes { checkRuns(first: 20, filterBy: {checkType: ALL}) { nodes { databaseId name conclusion startedAt completedAt } } }
+          }
+          actions: checkSuites(first: 50, filterBy: {appId: ${ACTIONS_APP_ID}}) {
+            nodes {
+              workflowRun { databaseId event workflow { name } }
+              checkRuns(first: 20, filterBy: {checkName: "${LOCK_JOB_NAME}", checkType: ALL}) { nodes { databaseId conclusion } }
+            }
           }
         } } }
       }
@@ -521,21 +582,43 @@ async function unlock() {
   return summary(`${label} (${process.env.BASIS}): UNLOCKED, ${decision.reason}: ${run.html_url ?? run.id}`);
 }
 
-async function backstop() {
-  const { repository, api } = context();
+// Both schedule-driven readers walk the same page of open PRs, newest-updated
+// first, and both stop at MAX_PR_PAGES. One copy so the cap and its disclosure
+// cannot drift apart.
+//
+// The cap is a cost bound, not a correctness one -- but a reader cannot tell a
+// quiet run from a truncated one, and this repository has run near 200 open PRs.
+// Say so when the walk stops with more to read: a sweep that silently covered
+// only the newest 200 would under-report exactly the stale heads it is for.
+async function walkOpenPullRequests(api, repository, query, label) {
   const [owner, name] = repository.split("/");
   let repositoryNode = null;
   const nodes = [];
   let cursor = null;
-  for (let page = 0; page < 4; page += 1) {
-    const result = await api.post("/graphql", { query: BACKSTOP_QUERY, variables: { owner, name, cursor } });
+  let truncated = false;
+  for (let page = 0; page < MAX_PR_PAGES; page += 1) {
+    const result = await api.post("/graphql", { query, variables: { owner, name, cursor } });
     if (result?.errors?.length) throw new Error(`GraphQL: ${JSON.stringify(result.errors).slice(0, 500)}`);
     repositoryNode = result?.data?.repository ?? null;
     nodes.push(...(repositoryNode?.pullRequests?.nodes ?? []));
     const info = repositoryNode?.pullRequests?.pageInfo;
     if (!info?.hasNextPage) break;
     cursor = info.endCursor;
+    truncated = page === MAX_PR_PAGES - 1;
   }
+  if (truncated) {
+    console.log(
+      `::warning title=${label}::Read only the ${nodes.length} most recently updated open PR(s): the walk stopped at ` +
+        `its ${MAX_PR_PAGES}-page cap with more pages available, so this run covered a PREFIX of the open PRs, not all ` +
+        `of them. A head older than that prefix cannot be reported by this run.`,
+    );
+  }
+  return { repositoryNode, nodes };
+}
+
+async function backstop() {
+  const { repository, api } = context();
+  const { repositoryNode, nodes } = await walkOpenPullRequests(api, repository, BACKSTOP_QUERY, "Ally verdict backstop");
   const bypass = bypassEnabled(process.env.ALLY_GATED_CI_BYPASS ?? "");
   const candidates = selectBackstopCandidates({ ...repositoryNode, pullRequests: { nodes } }, repository, { bypass });
   const base = repositoryNode?.defaultBranchRef?.name;
@@ -563,19 +646,7 @@ async function backstop() {
 // depend on an event to notice. One batched GraphQL read, no writes at all.
 async function attestationLag() {
   const { repository, api } = context();
-  const [owner, name] = repository.split("/");
-  let repositoryNode = null;
-  const nodes = [];
-  let cursor = null;
-  for (let page = 0; page < 4; page += 1) {
-    const result = await api.post("/graphql", { query: ATTESTATION_LAG_QUERY, variables: { owner, name, cursor } });
-    if (result?.errors?.length) throw new Error(`GraphQL: ${JSON.stringify(result.errors).slice(0, 500)}`);
-    repositoryNode = result?.data?.repository ?? null;
-    nodes.push(...(repositoryNode?.pullRequests?.nodes ?? []));
-    const info = repositoryNode?.pullRequests?.pageInfo;
-    if (!info?.hasNextPage) break;
-    cursor = info.endCursor;
-  }
+  const { repositoryNode, nodes } = await walkOpenPullRequests(api, repository, ATTESTATION_LAG_QUERY, "ally attestation lag");
   if (!repositoryNode?.defaultBranchRef?.name) throw new Error("could not read the default branch");
 
   const grace = Number(process.env.ATTESTATION_LAG_GRACE_SECONDS ?? "") || ATTESTATION_LAG_GRACE_SECONDS;
@@ -595,10 +666,14 @@ async function attestationLag() {
     const published = f.publishedAt === null
       ? "never published (0 publications)"
       : `newest of ${f.publications} publication(s) is ${f.publishedAt} (${f.conclusion}), ${f.lagSeconds}s BEFORE the review`;
+    const hold = f.lock === null
+      ? `no '${LOCK_JOB_NAME}' lock was visible at this head`
+      : `'${LOCK_JOB_NAME}' concluded ${f.lock}`;
     console.log(
       `::warning title=ally attestation lag::PR #${f.number} head ${f.head.slice(0, 9)}: Ally reviewed at ` +
-        `${f.reviewedAt}, ${published}. Stranded ${f.strandedSeconds}s. The heavy lanes stay held at this head ` +
-        `and no verdict event is coming -- comment '/test' on the PR to release them.`,
+        `${f.reviewedAt}, ${published}. Stranded ${f.strandedSeconds}s; ${hold}. The heavy lanes stay held at this ` +
+        `head and no verdict event is coming -- comment '/test' on the PR to release them, which clears this ` +
+        `warning once the re-run lands.`,
     );
   }
   const worst = findings[0];
