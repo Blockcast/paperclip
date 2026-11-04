@@ -29,6 +29,7 @@ import {
   ejectionsAtHead,
   headMovedAt,
   applyRow,
+  applyOrder,
   isFatalGhError,
   RATE_LIMIT_MAX_WAIT_MS,
   ghWithRateLimitRetry,
@@ -458,6 +459,184 @@ describe("per-fire cap", () => {
       assert.equal(call[5], stranded);
       assert.equal(call[6], starved);
     }
+  });
+});
+
+describe("apply order (PEN-5503)", () => {
+  // One PR yields one row, and `classifyAll` has already rewritten every
+  // over-budget `enqueue` to `skip`/`cap:` — so the `enqueue` rows ARE the cap
+  // winners. Listed NEWEST-FIRST, because that is the order `gh pr list`
+  // returns and the order the apply loop used to walk; an ascending fixture
+  // could not tell the fix from the defect.
+  const enq = (number) => ({ number, action: "enqueue", reason: "mergestate:CLEAN", headSha: HEAD });
+  const cor = (number) => ({ number, action: "codeowner-review-requested", detail: "@team" });
+  const skip = (number) => ({ number, action: "skip", reason: "checks:settling" });
+
+  // The shape of the 2026-11-04 08:45Z fire, shortened: winners interleaved
+  // with notification rows by PR number, oldest winner last.
+  const saturated = () => [
+    enq(3368), cor(3358), enq(3356), cor(3335), skip(3330), enq(3307), cor(3290), enq(3215),
+  ];
+
+  it("hoists every enqueue to the front, oldest first, and leaves the rest alone", () => {
+    const rows = saturated();
+    assert.deepEqual(
+      applyOrder(rows).map((row) => `${row.number}:${row.action[0]}`),
+      ["3215:e", "3307:e", "3356:e", "3368:e", "3358:c", "3335:c", "3330:s", "3290:c"],
+      "enqueues ascend by number; the remainder keeps its listing order",
+    );
+  });
+
+  it("returns the SAME row objects, so the loop's in-place writes still reach the receipt", () => {
+    // The loop writes `row.detail` and `row.action` on whatever it iterates. If
+    // this returned copies, every outcome and every `enqueue-failed` rename
+    // would land on a throwaway and the receipt would report the
+    // classification instead of the result.
+    const rows = saturated();
+    const ordered = applyOrder(rows);
+    assert.equal(ordered.length, rows.length, "a permutation, not a filter");
+    for (const row of rows) assert.ok(ordered.includes(row), `#${row.number} is the same object`);
+  });
+
+  it("is an identity when nothing enqueues, which is every notify-only repo", () => {
+    // `demoteMergeActions` renames every merge-shaped row before the applier
+    // runs there, so this must not shuffle a notify-only fire's work.
+    const rows = [cor(600), skip(590), { number: 580, action: NOTIFY_ONLY_ACTION }];
+    assert.deepEqual(applyOrder(rows), rows);
+    assert.deepEqual(applyOrder([]), []);
+    assert.deepEqual(applyOrder(undefined), []);
+  });
+
+  it("sorts an enqueue with no usable number last among the enqueues", () => {
+    // Same rule as the cap allocation: a row without a number has no age, so
+    // it loses the tiebreak rather than jumping the oldest real PR.
+    const rows = [enq(undefined), enq(3368), enq(3215)];
+    assert.deepEqual(applyOrder(rows).map((row) => row.number), [3215, 3368, undefined]);
+  });
+
+  describe("through runRepo, where it decides what a dying fire has already done", () => {
+    const quiet = (fn) => {
+      const log = console.log;
+      const error = console.error;
+      console.log = () => {};
+      console.error = () => {};
+      try {
+        return fn();
+      } finally {
+        console.log = log;
+        console.error = error;
+      }
+    };
+
+    /**
+     * Runs a fire whose applier throws a fatal `gh` error on the row named by
+     * `failOn`, and reports what had been applied by then.
+     *
+     * `runRepo` answers a fatal throw with `process.exit(1)`, which would take
+     * the test runner with it, so it is swapped for a sentinel throw. That is
+     * the behaviour under test, not an inconvenience: the whole defect is that
+     * the fire STOPS there.
+     */
+    const fireUntilFatal = (rows, failOn) => {
+      const applied = [];
+      const realExit = process.exit;
+      const sentinel = new Error("process.exit(1)");
+      process.exit = () => {
+        throw sentinel;
+      };
+      try {
+        assert.throws(
+          () =>
+            quiet(() =>
+              runRepo("a/one", true, 0, 0, [], [], [], {
+                fetch: () => rows.map(({ number }) => ({ number })),
+                classify: () => rows,
+                applyOne: (_repo, row) => {
+                  if (row.number === failOn) {
+                    // `isFatalGhError` matches this; a non-fatal throw would be
+                    // recorded as `enqueue-failed` and the loop would carry on.
+                    throw Object.assign(new Error("gh failed"), {
+                      stderr: "API rate limit exceeded for installation",
+                    });
+                  }
+                  applied.push(row.number);
+                  return null;
+                },
+                state: () => {},
+              }),
+            ),
+          (error) => error === sentinel,
+          "a fatal gh error ends the fire",
+        );
+      } finally {
+        process.exit = realExit;
+      }
+      return applied;
+    };
+
+    it("has already enqueued every winner when a NOTIFICATION row kills the fire", () => {
+      // The amended acceptance case, and the one that separates this fix from
+      // the obvious one. `applyRow` mutates remote state for
+      // `codeowner-review-requested` as well as `enqueue`, and those rows sit
+      // interleaved among the winners by PR number — so merely permuting the
+      // winners into age order inside their existing slots leaves the newest
+      // winner behind every notification call. Injecting the abort at the
+      // FIRST notification is what makes that visible: under listing order it
+      // reaches one winner, under a winners-only permutation it still reaches
+      // one, and only hoisting the whole cohort reaches all four.
+      const rows = saturated();
+      assert.deepEqual(
+        fireUntilFatal(rows, 3358),
+        [3215, 3307, 3356, 3368],
+        "every cap winner is spent before any deferrable notification is attempted",
+      );
+    });
+
+    it("reaches the oldest winners first when an ENQUEUE kills the fire", () => {
+      // The budget cannot always be spent in full — this row's own abort is
+      // proof. When it cannot, the fairness fix decides WHICH winners a
+      // half-spent cap bought, and it must be the oldest. Under listing order
+      // the one winner this reaches is #3368, the NEWEST, which is precisely
+      // the cohort BLO-51664 deferred on purpose.
+      const rows = saturated();
+      assert.deepEqual(fireUntilFatal(rows, 3356), [3215, 3307], "oldest first, newest dropped");
+    });
+
+    it("leaves the receipt in listing order, with each outcome on its own row", () => {
+      // Done-when #2, and the constraint the whole implementation is shaped
+      // around: apply order and receipt order differ ON PURPOSE. `rows` is the
+      // receipt and must stay diffable against the last fire's, while the
+      // in-place writes the loop makes must still land on the right PR.
+      const rows = saturated();
+      const applied = [];
+      quiet(() =>
+        runRepo("a/one", true, 0, 0, [], [], [], {
+          fetch: () => rows.map(({ number }) => ({ number })),
+          classify: () => rows,
+          applyOne: (_repo, row) => {
+            applied.push(row.number);
+            return `touched ${row.number}`;
+          },
+          state: () => {},
+        }),
+      );
+      assert.deepEqual(
+        applied,
+        [3215, 3307, 3356, 3368, 3358, 3335, 3330, 3290],
+        "control: the loop really did run out of listing order",
+      );
+      assert.deepEqual(
+        rows.map((row) => row.number),
+        [3368, 3358, 3356, 3335, 3330, 3307, 3290, 3215],
+        "the receipt is still newest-first",
+      );
+      for (const row of rows) {
+        assert.ok(
+          String(row.detail).includes(`touched ${row.number}`),
+          `#${row.number} carries its OWN outcome, not a neighbour's`,
+        );
+      }
+    });
   });
 });
 
