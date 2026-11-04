@@ -4338,11 +4338,31 @@ const issueListSelect = {
   // leaves `monitorLastTriggeredAt` standing, and so does a fire — so `triggered` and
   // `cleared` are BYTE-IDENTICAL on this surface (`nextCheckAt` null, `lastTriggeredAt`
   // set), while their attendance verdicts are opposite:
-  //   - `triggered` — a sweep owns the row, bounded by min(its own `timeoutAt`,
-  //     `monitorLastTriggeredAt` + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS). Attended.
+  //   - `triggered` — a sweep owns the row, BUT ONLY IF the row also satisfies that
+  //     sweep's own outer-query preconditions; see below. Attended, conditionally.
   //   - `cleared`   — the sweep already fired and is gone. Nothing attends the row unless
   //     another path does. Dark.
   // Every list-based attendance sweep scores those the same today, which is the defect.
+  //
+  // ⚠ `triggered` IS NOT A SUFFICIENT CONDITION FOR ATTENDED, and the earlier revision of
+  // this comment said it was. Both nets that can clear a fired monitor —
+  // `tickExpiredIssueMonitors` (heartbeat.ts:18436) and the dispatch-lapse watchdog
+  // (:18074) — carry `inArray(issues.status, ["in_progress", "in_review"])` plus
+  // `assigneeUserId is null` and `assigneeAgentId is not null` on the OUTER query, where the
+  // monitor-state test sits on the inner condition. So a monitor that fires and then has its
+  // row moved to `todo`/`blocked`/`backlog`, reassigned to a user, or unassigned stays
+  // `triggered` FOREVER — no net owns it, and nothing will ever clear it. Measured live by
+  // @DevOps 2026-11-04 on PEN-5465 (fired 06:35:06Z, row then `todo`), third instance on that
+  // seat after PEN-1943 and PEN-5143. Benign there only because `todo` is covered by
+  // `paperclipInboxLite`; it is not benign for a consumer reading this field.
+  //   ⇒ the attendance read is `monitorStatus === "triggered" && status in
+  //     (in_progress, in_review) && assigneeAgentId != null`, never the first conjunct alone.
+  //
+  // Nor is the clear instant BOUNDED by min(`timeoutAt`, `monitorLastTriggeredAt` + grace),
+  // which is what this comment used to claim. That is the floor, not a ceiling: BLO-35155's
+  // live-consumer guard suppresses the stall arm for as long as a queued/running run exists
+  // for the issue, up to the ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS ceiling (24h). A row
+  // sitting `triggered` past the grace is therefore a normal state, not evidence of a strand.
   //
   // `timeoutAt` is deliberately NOT projected alongside it. Since PEN-5481 a `triggered`
   // monitor is owned whether or not it carries one, and `monitorLastTriggeredAt` above

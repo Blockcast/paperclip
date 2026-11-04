@@ -257,6 +257,25 @@ describe("paperclip MCP tools", () => {
     expect(description).toContain("`timeoutAt` is deliberately NOT projected");
   });
 
+  // PEN-5481 follow-up: `triggered` is NOT sufficient for attended, and the first
+  // revision of this description claimed it was. Both sweeps that can clear a fired
+  // monitor carry the status/assignee filter on their OUTER query, so a monitor that
+  // fires and then has its row moved to `todo` is never cleared by anything. A reader
+  // who takes `triggered` alone as attendance scores exactly those rows as covered,
+  // which is the fail-open direction and the same shape of mistake as the defect this
+  // field was added to expose. Pinned because it is one clause and trivially lost.
+  it("paperclipListIssues states the status/assignee precondition on a triggered monitor", () => {
+    const { description } = getTool("paperclipListIssues");
+    expect(description).toContain("`triggered` ALONE IS NOT ATTENDED");
+    expect(description).toContain("stays `triggered` FOREVER");
+    expect(description).toContain(
+      'monitorStatus === "triggered" && (status === "in_progress" || status === "in_review") && assigneeAgentId !== null',
+    );
+    // The 4h grace is a floor, not a ceiling — a reader who inverts that reports a
+    // normal live-consumer suppression as a strand.
+    expect(description).toContain("that is the FLOOR, NOT A CEILING");
+  });
+
   // The shared `offset` hint (paperclipListIssues, paperclip_search_issues) is
   // read in isolation by a caller paging; on an older server a truncated result
   // is never observable, and the window is raw (pre-ACL), so the increment is
