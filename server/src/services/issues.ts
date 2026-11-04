@@ -4421,13 +4421,26 @@ const issueListSelect = {
   // Every list-based attendance sweep scores those the same today, which is the defect.
   //
   // ⚠ `triggered` IS NOT A SUFFICIENT CONDITION FOR ATTENDED, and the earlier revision of
-  // this comment said it was. Both nets that can clear a fired monitor —
-  // `tickExpiredIssueMonitors` (heartbeat.ts:18436) and the dispatch-lapse watchdog
-  // (:18074) — carry `inArray(issues.status, ["in_progress", "in_review"])` plus
-  // `assigneeUserId is null` and `assigneeAgentId is not null` on the OUTER query, where the
-  // monitor-state test sits on the inner condition. So a monitor that fires and then has its
-  // row moved to `todo`/`blocked`/`backlog`, reassigned to a user, or unassigned stays
-  // `triggered` FOREVER — no net owns it, and nothing will ever clear it. Measured live by
+  // this comment said it was. ONLY ONE of the two nets clears a fired monitor, and the two
+  // do not carry the same filters — the previous revision of this block credited both with
+  // the same ones:
+  //   - `tickExpiredIssueMonitors` (heartbeat.ts:18426) CLEARS. Its outer `where` carries
+  //     `companies.status = 'active'`, `inArray(issues.status, ["in_progress",
+  //     "in_review"])`, `assigneeUserId is null` and `assigneeAgentId is not null`
+  //     (:18432-18436); the monitor-state test sits on the inner condition.
+  //   - the dispatch-lapse watchdog (`tickDueIssueMonitors`, :18064) RE-ARMS to `scheduled`
+  //     rather than clearing, and its outer `where` carries only `companies.status =
+  //     'active'`, the same status filter, and the queued-run conjuncts, over an INNER JOIN
+  //     on `issues.executionRunId` (:18068-18077). It does NOT carry the assignee filters.
+  //     It is also structurally narrower where it counts: no `executionRunId`, no join, no
+  //     row — so it cannot be the net that owns a fire which left `executionRunId` null.
+  // The predicate published below is `tickExpiredIssueMonitors`'s, i.e. the STRICTER of the
+  // two, so the misattribution leaned fail-closed. Keep it that way: nobody should derive a
+  // looser attendance predicate from the watchdog, which clears nothing.
+  //
+  // So a monitor that fires and then has its row moved to `todo`/`blocked`/`backlog`,
+  // reassigned to a user, or unassigned stays `triggered` FOREVER — the clearing net does
+  // not admit it, and nothing else will ever clear it. Measured live by
   // @DevOps 2026-11-04 on PEN-5465 (fired 06:35:06Z, row then `todo`), third instance on that
   // seat after PEN-1943 and PEN-5143. Benign there only because `todo` is covered by
   // `paperclipInboxLite`; it is not benign for a consumer reading this field.
@@ -4441,7 +4454,8 @@ const issueListSelect = {
   // sitting `triggered` past the grace is therefore a normal state, not evidence of a strand.
   //
   // `timeoutAt` is deliberately NOT projected alongside it. Since PEN-5481 a `triggered`
-  // monitor is owned whether or not it carries one, and `monitorLastTriggeredAt` above
+  // monitor ON AN ELIGIBLE ROW — the three-conjunct predicate above, never `triggered`
+  // alone — is attended whether or not it carries one, and `monitorLastTriggeredAt` above
   // already bounds the stall arm — `timeoutAt` can only pull that bound EARLIER, i.e. make
   // the row more attended, never less. A consumer asking "is this attended" is sound
   // without it. Projecting it would also re-offer the read-side version of the double duty

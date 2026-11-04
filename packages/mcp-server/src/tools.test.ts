@@ -258,12 +258,13 @@ describe("paperclip MCP tools", () => {
   });
 
   // PEN-5481 follow-up: `triggered` is NOT sufficient for attended, and the first
-  // revision of this description claimed it was. Both sweeps that can clear a fired
-  // monitor carry the status/assignee filter on their OUTER query, so a monitor that
-  // fires and then has its row moved to `todo` is never cleared by anything. A reader
-  // who takes `triggered` alone as attendance scores exactly those rows as covered,
-  // which is the fail-open direction and the same shape of mistake as the defect this
-  // field was added to expose. Pinned because it is one clause and trivially lost.
+  // revision of this description claimed it was. The ONE sweep that clears a fired
+  // monitor (`tickExpiredIssueMonitors`) carries the status/assignee filter on its OUTER
+  // query, so a monitor that fires and then has its row moved to `todo` is never cleared
+  // by anything. A reader who takes `triggered` alone as attendance scores exactly those
+  // rows as covered, which is the fail-open direction and the same shape of mistake as
+  // the defect this field was added to expose. Pinned because it is one clause and
+  // trivially lost.
   it("paperclipListIssues states the status/assignee precondition on a triggered monitor", () => {
     const { description } = getTool("paperclipListIssues");
     expect(description).toContain("`triggered` ALONE IS NOT ATTENDED");
@@ -274,6 +275,35 @@ describe("paperclip MCP tools", () => {
     // The 4h grace is a floor, not a ceiling — a reader who inverts that reports a
     // normal live-consumer suppression as a strand.
     expect(description).toContain("that is the FLOOR, NOT A CEILING");
+  });
+
+  // PEN-5481 follow-up 2: the first revision of the clause above credited BOTH nets with
+  // the assignee filters. Only `tickExpiredIssueMonitors` carries them, and it is also the
+  // only one that clears — the dispatch-lapse watchdog re-arms, and filters on an inner
+  // join over `executionRunId` instead. The published predicate is the clearing net's, so
+  // the error leaned fail-closed; the risk is the other direction, a reader deriving a
+  // LOOSER predicate from the watchdog and scoring unowned rows as attended. Pinned
+  // separately from the clause above because correcting one is what broke the other.
+  it("paperclipListIssues attributes the clearing filters to the one net that clears", () => {
+    const { description } = getTool("paperclipListIssues");
+    expect(description).toContain("Only ONE net clears a fired monitor");
+    expect(description).toContain("The dispatch-lapse watchdog RE-ARMS rather than clears");
+    expect(description).toContain("which it does not carry");
+    expect(description).not.toContain("Both nets that can clear a fired monitor carry");
+  });
+
+  // The `timeoutAt`-not-projected rationale sits several sentences after the precondition
+  // it depends on, so a reader who skims to it gets the retracted unconditional claim back
+  // unless the precondition travels with it. That is precisely the fail-open sentence this
+  // PR exists to remove, reappearing in the paragraph that justifies an omission.
+  it("paperclipListIssues keeps the eligibility precondition on the timeoutAt rationale", () => {
+    const { description } = getTool("paperclipListIssues");
+    expect(description).toContain(
+      "a `triggered` monitor ON AN ELIGIBLE ROW (the three-conjunct read above — never `triggered` alone) is attended whether or not it carries one",
+    );
+    expect(description).not.toContain(
+      "a `triggered` monitor is attended whether or not it carries one",
+    );
   });
 
   // The shared `offset` hint (paperclipListIssues, paperclip_search_issues) is
