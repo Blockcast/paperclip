@@ -130,13 +130,36 @@ async function patchAgentImage(
       .update(agents)
       .set({ adapterConfig: next, pendingImageBump: null, updatedAt: new Date() })
       .where(eq(agents.id, agentId));
+    // The snapshot key MUST be the camelCase column name (PEN-5321). It used
+    // to be `adapter_config`, which is the name of no column any reader of this
+    // table looks for: `buildConfigSnapshot` (`services/agents.ts`) emits
+    // camelCase, `configPatchFromSnapshot` reads camelCase, and `changedKeys`
+    // below already said `adapterConfig`. So every row this writer has produced
+    // — 1331 of 1341 on one measured seat — declared a change to a key its own
+    // snapshot did not contain, and the only correct way to chain a column
+    // through this log (filter to the revisions whose `changedKeys` names it,
+    // then read that key) found nothing on exactly the rows it had selected.
+    //
+    // This snapshot stays deliberately PARTIAL — it names the one column this
+    // writer touches rather than re-reading and storing the whole row, which
+    // would widen what sits at rest unredacted. `changedKeys` is the coverage
+    // declaration that makes a partial snapshot readable; see
+    // `docs/security/agent-config-read-model.md`
+    // § "`config-revisions` is not a complete audit".
+    //
+    // Being partial has one user-visible consequence, unchanged by this fix and
+    // recorded here so it is not rediscovered as a regression: "Restore" on one
+    // of these revisions answers 422. `configPatchFromSnapshot` requires `name`,
+    // `role`, `adapterType` and `budgetMonthlyCents` to be present, and a
+    // partial snapshot carries none of them. Renaming the key does not change
+    // that — it was 422 before and it is 422 now.
     await tx.insert(agentConfigRevisions).values({
       companyId: row.companyId,
       agentId,
       source,
       changedKeys: ["adapterConfig"],
-      beforeConfig: { adapter_config: existing },
-      afterConfig: { adapter_config: next },
+      beforeConfig: { adapterConfig: existing },
+      afterConfig: { adapterConfig: next },
     });
   });
 

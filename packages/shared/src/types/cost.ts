@@ -70,8 +70,25 @@ export interface CostEvent {
 export interface CostSummary {
   companyId: string;
   spendCents: number;
+  /**
+   * PEN-4902: list-price CONSUMPTION for the same rows. Served by every `/costs/*`
+   * aggregate since PEN-4466, but undeclared here until now — so a typed client was
+   * offered only the cash column and could not see the two diverge, which is the very
+   * thing `services/consumption-metric.ts` says reporting both exists to prevent.
+   *
+   * THIS, not `costCents`, is what enforcement reads: `getMonthlySpendTotal`
+   * (`services/costs.ts`) and `computeObservedAmount` (`services/budgets.ts`) both sum
+   * `consumptionCentsExpr`, so it is the number behind `spentMonthlyCents`, the 75% warn
+   * card, and any `hardStopEnabled` policy. `costCents` is CASH, and is zeroed for
+   * `subscription_included` by `normalizeBilledCostCents`. The two are equal for every
+   * row written to date only because no lane is classified as a subscription; they
+   * diverge — cash reading LOW — the first time any adapter reports one.
+   */
+  consumptionCents: number;
   budgetCents: number;
   utilizationPercent: number;
+  /** PEN-4902: `consumptionCents` against the same budget. Served since PEN-4466, undeclared until now. */
+  consumptionUtilizationPercent: number;
 }
 
 export interface IssueCostSummary {
@@ -79,6 +96,12 @@ export interface IssueCostSummary {
   issueCount: number;
   includeDescendants: boolean;
   costCents: number;
+  /**
+   * PEN-4902: list-price CONSUMPTION for the same rows — served since PEN-4466, declared
+   * here from now on. This is the quantity every spend gate reads; `costCents` is CASH and
+   * is zeroed for `subscription_included`. See `services/consumption-metric.ts`.
+   */
+  consumptionCents: number;
   inputTokens: number;
   cachedInputTokens: number;
   /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
@@ -96,6 +119,8 @@ export interface CostByAgent {
   agentName: string | null;
   agentStatus: string | null;
   costCents: number;
+  /** PEN-4902: list-price CONSUMPTION for the same rows — the quantity enforcement reads. See {@link CostSummary.consumptionCents}. */
+  consumptionCents: number;
   inputTokens: number;
   cachedInputTokens: number;
   /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
@@ -103,6 +128,34 @@ export interface CostByAgent {
   outputTokens: number;
   apiRunCount: number;
   subscriptionRunCount: number;
+  /**
+   * PEN-4902: distinct heartbeat runs IN THIS WINDOW THAT PRODUCED A COST EVENT, with no
+   * `billingType` branch. `apiRunCount` and `subscriptionRunCount` above cover only
+   * CLASSIFIED rows, and both read 0 while `unknown` is the fleet's normal value (it is
+   * the default in `createEvent` and what brokered lanes deliberately resolve to). A zero
+   * there reads as "this scope made no runs" and is not that.
+   *
+   * ⚠️ This is a LOWER BOUND on runs, not the run count, and it is deliberately NOT named
+   * `runCount`: {@link IssueCostSummary.runCount} carries that name for a different
+   * population — runs counted `FROM heartbeat_runs`, with no `cost_events` join.
+   * `heartbeat.ts` writes a cost event only when a run reports spend or token usage, so a
+   * run that produced neither is absent here and present there. No window-scoped run
+   * count is served to get the true denominator from: `GET /companies/:id/heartbeat-runs`
+   * reads only `agentId`, `limit` and `summary` (`server/src/routes/agents.ts`), and
+   * `heartbeat.list` takes no time bounds — a `from`/`to` passed there is dropped in
+   * silence and you get the company's whole run list, capped at `limit`. Counting that is
+   * a quietly wrong denominator, not a windowed one. Until such a route exists the count
+   * has to come from the table: `count(*) from heartbeat_runs where company_id = … and
+   * created_at` in the window — noting that clock is the run's queue-entry time, while
+   * this aggregate windows on `cost_events.occurred_at`.
+   */
+  costEventRunCount: number;
+  /**
+   * PEN-4902: rows in the window carrying no `heartbeatRunId`. The column is nullable and
+   * `count(distinct …)` skips NULL, so these are in the numerator of cost-per-run and not
+   * in its denominator: a non-zero value means that ratio reads HIGH.
+   */
+  runlessEventCount: number;
   subscriptionCachedInputTokens: number;
   /** BLO-29842: cache WRITE on subscription-billed runs. Not part of `subscriptionInputTokens`. */
   subscriptionCacheCreationInputTokens: number;
@@ -116,6 +169,8 @@ export interface CostByProviderModel {
   billingType: BillingType;
   model: string;
   costCents: number;
+  /** PEN-4902: list-price CONSUMPTION for the same rows — the quantity enforcement reads. See {@link CostSummary.consumptionCents}. */
+  consumptionCents: number;
   inputTokens: number;
   cachedInputTokens: number;
   /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
@@ -123,6 +178,39 @@ export interface CostByProviderModel {
   outputTokens: number;
   apiRunCount: number;
   subscriptionRunCount: number;
+  /**
+   * PEN-4902: distinct heartbeat runs IN THIS WINDOW THAT PRODUCED A COST EVENT, with no
+   * `billingType` branch. `apiRunCount` and `subscriptionRunCount` above cover only
+   * CLASSIFIED rows, and both read 0 while `unknown` is the fleet's normal value (it is
+   * the default in `createEvent` and what brokered lanes deliberately resolve to). A zero
+   * there reads as "this scope made no runs" and is not that.
+   *
+   * ⚠️ This is a LOWER BOUND on runs, not the run count, and it is deliberately NOT named
+   * `runCount`: {@link IssueCostSummary.runCount} carries that name for a different
+   * population — runs counted `FROM heartbeat_runs`, with no `cost_events` join.
+   * `heartbeat.ts` writes a cost event only when a run reports spend or token usage, so a
+   * run that produced neither is absent here and present there. No window-scoped run
+   * count is served to get the true denominator from: `GET /companies/:id/heartbeat-runs`
+   * reads only `agentId`, `limit` and `summary` (`server/src/routes/agents.ts`), and
+   * `heartbeat.list` takes no time bounds — a `from`/`to` passed there is dropped in
+   * silence and you get the company's whole run list, capped at `limit`. Counting that is
+   * a quietly wrong denominator, not a windowed one. Until such a route exists the count
+   * has to come from the table: `count(*) from heartbeat_runs where company_id = … and
+   * created_at` in the window — noting that clock is the run's queue-entry time, while
+   * this aggregate windows on `cost_events.occurred_at`.
+   *
+   * ⚠️ DISTINCT WITHIN THIS ROW — do not sum across rows. The group key here is
+   * (provider, biller, billingType, model), so a run that used two models is counted
+   * once in each of their rows and `sum(costEventRunCount)` over the list double-counts
+   * it. Only the ungrouped total is a run count for the window.
+   */
+  costEventRunCount: number;
+  /**
+   * PEN-4902: rows in the window carrying no `heartbeatRunId`. The column is nullable and
+   * `count(distinct …)` skips NULL, so these are in the numerator of cost-per-run and not
+   * in its denominator: a non-zero value means that ratio reads HIGH.
+   */
+  runlessEventCount: number;
   subscriptionCachedInputTokens: number;
   /** BLO-29842: cache WRITE on subscription-billed runs. Not part of `subscriptionInputTokens`. */
   subscriptionCacheCreationInputTokens: number;
@@ -133,6 +221,8 @@ export interface CostByProviderModel {
 export interface CostByBiller {
   biller: string;
   costCents: number;
+  /** PEN-4902: list-price CONSUMPTION for the same rows — the quantity enforcement reads. See {@link CostSummary.consumptionCents}. */
+  consumptionCents: number;
   inputTokens: number;
   cachedInputTokens: number;
   /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
@@ -140,6 +230,39 @@ export interface CostByBiller {
   outputTokens: number;
   apiRunCount: number;
   subscriptionRunCount: number;
+  /**
+   * PEN-4902: distinct heartbeat runs IN THIS WINDOW THAT PRODUCED A COST EVENT, with no
+   * `billingType` branch. `apiRunCount` and `subscriptionRunCount` above cover only
+   * CLASSIFIED rows, and both read 0 while `unknown` is the fleet's normal value (it is
+   * the default in `createEvent` and what brokered lanes deliberately resolve to). A zero
+   * there reads as "this scope made no runs" and is not that.
+   *
+   * ⚠️ This is a LOWER BOUND on runs, not the run count, and it is deliberately NOT named
+   * `runCount`: {@link IssueCostSummary.runCount} carries that name for a different
+   * population — runs counted `FROM heartbeat_runs`, with no `cost_events` join.
+   * `heartbeat.ts` writes a cost event only when a run reports spend or token usage, so a
+   * run that produced neither is absent here and present there. No window-scoped run
+   * count is served to get the true denominator from: `GET /companies/:id/heartbeat-runs`
+   * reads only `agentId`, `limit` and `summary` (`server/src/routes/agents.ts`), and
+   * `heartbeat.list` takes no time bounds — a `from`/`to` passed there is dropped in
+   * silence and you get the company's whole run list, capped at `limit`. Counting that is
+   * a quietly wrong denominator, not a windowed one. Until such a route exists the count
+   * has to come from the table: `count(*) from heartbeat_runs where company_id = … and
+   * created_at` in the window — noting that clock is the run's queue-entry time, while
+   * this aggregate windows on `cost_events.occurred_at`.
+   *
+   * ⚠️ DISTINCT WITHIN THIS ROW — do not sum across rows. The group key here is the
+   * biller, so a run that billed through two of them is counted once in each row and
+   * `sum(costEventRunCount)` over the list double-counts it. Only the ungrouped total is
+   * a run count for the window.
+   */
+  costEventRunCount: number;
+  /**
+   * PEN-4902: rows in the window carrying no `heartbeatRunId`. The column is nullable and
+   * `count(distinct …)` skips NULL, so these are in the numerator of cost-per-run and not
+   * in its denominator: a non-zero value means that ratio reads HIGH.
+   */
+  runlessEventCount: number;
   subscriptionCachedInputTokens: number;
   /** BLO-29842: cache WRITE on subscription-billed runs. Not part of `subscriptionInputTokens`. */
   subscriptionCacheCreationInputTokens: number;
@@ -158,6 +281,8 @@ export interface CostByAgentModel {
   billingType: BillingType;
   model: string;
   costCents: number;
+  /** PEN-4902: list-price CONSUMPTION for the same rows — the quantity enforcement reads. See {@link CostSummary.consumptionCents}. */
+  consumptionCents: number;
   inputTokens: number;
   cachedInputTokens: number;
   /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
@@ -174,6 +299,12 @@ export interface CostWindowSpendRow {
   /** rolling window duration in hours */
   windowHours: number;
   costCents: number;
+  /**
+   * PEN-4902: list-price CONSUMPTION for the same rows — served since PEN-4466, declared
+   * here from now on. This is the quantity every spend gate reads; `costCents` is CASH and
+   * is zeroed for `subscription_included`. See `services/consumption-metric.ts`.
+   */
+  consumptionCents: number;
   inputTokens: number;
   cachedInputTokens: number;
   /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */
@@ -186,6 +317,8 @@ export interface CostByProject {
   projectId: string | null;
   projectName: string | null;
   costCents: number;
+  /** PEN-4902: list-price CONSUMPTION for the same rows — the quantity enforcement reads. See {@link CostSummary.consumptionCents}. */
+  consumptionCents: number;
   inputTokens: number;
   cachedInputTokens: number;
   /** BLO-29842: cache WRITE (Anthropic `cache_creation_input_tokens`), billed 1.25x-2x input. Not part of `inputTokens`. */

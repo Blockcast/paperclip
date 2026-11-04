@@ -5140,22 +5140,34 @@ export function issueRoutes(
   // PEN-5334: this block used to say the wake path applied NO gate, and the
   // remediation below told a blocked agent that a non-assignee mention "wakes you
   // but does not authorize you". Both are wrong as shipped. Every mention-wake
-  // site (`:4645`, `:14468`, `:16816`) runs the SAME predicate and skips a
-  // mention that fails it, so a non-entitled author's mention raises no wake at
-  // all — and because it still BINDS, it is also absent from the create
-  // response's `unboundMentions`, which is PEN-5180's only signal. Its author
-  // therefore sees a 201 and an empty unbound list, the mentioned agent is never
-  // woken, and nothing anywhere names the reason: more silent than the failure
-  // the old text described, not less. Pinned by "does not wake a mentioned agent
-  // when an agent comment cannot grant reply access" and "does not enqueue a
-  // keyed mention wake when an agent cannot grant reply access" in
+  // site in this file runs the SAME predicate and skips a mention that fails it,
+  // so a non-entitled author's mention raises no wake at all — and because it
+  // still BINDS, it is also absent from the create response's `unboundMentions`,
+  // which is PEN-5180's only signal. Its author therefore sees a 201 and an empty
+  // unbound list, the mentioned agent is never woken, and nothing anywhere names
+  // the reason: more silent than the failure the old text described, not less.
+  //
+  // PEN-5353: the three sites are cited by symbol, not by line. They are the
+  // `continue`-on-failed-`commentAuthorCanGrantIssueMention` guards in
+  // `buildKeyedCommentEffectIntents`, in the `router.patch("/issues/:id", ...)`
+  // handler, and in the `router.post("/issues/:id/comments", ...)` handler.
+  // `grep -n commentAuthorCanGrantIssueMention server/src/routes/issues.ts` lists
+  // the import plus exactly those three. This comment previously carried raw line
+  // numbers; they went stale on the very PR that added this block, which is why
+  // they are gone.
+  //
+  // Pinned by "does not wake a mentioned agent when an agent comment cannot
+  // grant reply access" and "does not enqueue a keyed mention wake when an agent
+  // cannot grant reply access" in
   // __tests__/issue-update-comment-wakeup-routes.test.ts, each with a positive
   // control.
   //
   // The wake and the grant are co-extensive only AT CREATE TIME. The grant is
-  // re-derived per request against the issue's CURRENT assignee
-  // (`services/authorization.ts:2725`), so REASSIGNING the row revokes a mention
-  // the previous assignee wrote while its wake has already fired. That is the one
+  // re-derived per request against the issue's CURRENT assignee (`decideBase`
+  // passes `resource.assigneeAgentId` as `issueAssigneeAgentId` into
+  // `agentHasMentionGrantOnIssue`, in `services/authorization.ts`), so
+  // REASSIGNING the row revokes a mention the previous assignee wrote while its
+  // wake has already fired. That is the one
   // real "woken but not authorized" path, and it is staleness, not a hole in the
   // author gate. Model: docs/security/issue-authorization-model.md, "Who may
   // grant a mention".
@@ -11622,7 +11634,9 @@ export function issueRoutes(
     if (await assertLowTrustControlPlaneDenied(req, res, issue.companyId, issue)) return;
     if (!(await assertIssueReadAllowed(req, res, issue))) return;
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(id, {
+      // Two independent gates — see `projectApprovalPayloadForRead`. PEN-5225.
       includeAgentConfig: await actorCanReadAgentConfig(req, access, issue.companyId),
+      workspaceCommandViewer: await resolveWorkspaceRuntimeViewer(access, req, issue.companyId),
     });
     res.json(approvals);
   });
@@ -11678,7 +11692,9 @@ export function issueRoutes(
     });
 
     const approvals = await issueApprovalsSvc.listApprovalsForIssue(id, {
+      // Two independent gates — see `projectApprovalPayloadForRead`. PEN-5225.
       includeAgentConfig: await actorCanReadAgentConfig(req, access, issue.companyId),
+      workspaceCommandViewer: await resolveWorkspaceRuntimeViewer(access, req, issue.companyId),
     });
     res.status(201).json(approvals);
   });
@@ -12525,6 +12541,76 @@ export function issueRoutes(
    *
    * `PATCH /issues/:id` keeps its replace semantics for back-compat.
    */
+  /**
+   * The external-wait slot yield (#1195 / PEN-2074), extracted so both monitor write paths emit
+   * exactly the same terminal code, result payload and activity row.
+   *
+   * PEN-5372: it used to live inline in `PATCH /issues/:id` only, and `monitor.kind:
+   * "external_service"` was therefore inert on `PATCH /issues/:id/monitor` — the route the tool
+   * description tells callers to PREFER. Measured in the Penstock company over the 9.7 h to
+   * 2026-11-03T08:31Z: 177 of 200 monitor arms (88.5%) went through the monitor route, 23 through
+   * `PATCH /issues/:id`, and the yield fired 23/23 times on the latter and 0/67 times on the
+   * former for arms that carried `kind: "external_service"`.
+   *
+   * Post-commit by design: the issue row, including the armed `monitorNextCheckAt`, is already
+   * durable when this runs, so a rejection here must never reach the error middleware — the caller
+   * would read a 500 for a monitor that IS armed and re-arm into a live monitor.
+   */
+  async function yieldCurrentRunForExternalWait(input: {
+    actor: ReturnType<typeof getActorInfo>;
+    issue: { id: string; companyId: string };
+    monitor: { serviceName?: string | null } | null | undefined;
+    nextCheckAt: Date;
+  }) {
+    const { actor, issue, monitor, nextCheckAt } = input;
+    const runId = actor.runId;
+    if (!runId) return;
+    const serviceName = monitor?.serviceName ?? null;
+    const yielded = await heartbeat.cancelRun(
+      runId,
+      "Yielded after persisting an external-service wait",
+      {
+        errorCode: "external_wait_yield",
+        resultJson: {
+          yieldedExternalWait: true,
+          issueId: issue.id,
+          serviceName,
+        },
+        eventMessage: "run yielded after persisting an external-service wait",
+        eventPayload: {
+          issueId: issue.id,
+          serviceName,
+        },
+        persistBeforeTerminate: true,
+        repairTerminalRelease: true,
+      },
+    ).catch((err) => {
+      logger.warn(
+        { err, runId, issueId: issue.id },
+        "failed to yield run slot after persisting an external-service wait");
+      return null;
+    });
+    if (yielded?.status === "cancelled" && yielded.errorCode === "external_wait_yield") {
+      await logActivity(db, {
+        companyId: issue.companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "heartbeat.external_wait_yielded",
+        entityType: "heartbeat_run",
+        entityId: yielded.id,
+        issueId: issue.id,
+        details: {
+          issueId: issue.id,
+          serviceName,
+          monitorNextCheckAt: nextCheckAt.toISOString(),
+        },
+      });
+    }
+  }
+
   async function writeIssueMonitor(
     req: Request,
     res: Response,
@@ -12682,6 +12768,35 @@ export function issueRoutes(
             via: "issue_monitor_route",
           },
     });
+
+    // PEN-5372: the external-wait slot yield, on the route the tool description tells callers to
+    // PREFER. Same predicate as `PATCH /issues/:id` with one conjunct dropped: that handler also
+    // requires `req.body.executionPolicy !== undefined`, which separates a deliberate policy write
+    // from an unrelated field edit on an issue that merely carries a monitor. This route has no
+    // such ambiguity to resolve — every request to it IS a monitor write — and it has no
+    // `executionPolicy` body field at all, so replicating the conjunct would make `kind:
+    // "external_service"` permanently inert here, which is exactly the defect being fixed.
+    // PEN-3415's caution is preserved by `kind` staying the opt-in: a monitor armed mid-work with
+    // `kind` null (the default) still yields nothing.
+    const externalWaitMonitor = monitor ? nextExecutionPolicy?.monitor : null;
+    const externalWaitNextCheckAt = issue.monitorNextCheckAt;
+    if (
+      req.actor.type === "agent" &&
+      actor.runId !== null &&
+      isCurrentIssueExecutionRun(req, existing) &&
+      externalWaitMonitor?.kind === "external_service" &&
+      externalWaitNextCheckAt !== null &&
+      // A convergence-stalled refusal moves the issue to `blocked`, which fails this check — the
+      // run keeps its slot and reports the stall rather than parking on a monitor it did not get.
+      (issue.status === "in_progress" || issue.status === "in_review")
+    ) {
+      await yieldCurrentRunForExternalWait({
+        actor,
+        issue,
+        monitor: externalWaitMonitor,
+        nextCheckAt: externalWaitNextCheckAt,
+      });
+    }
 
     res.json(issue);
   }
@@ -13783,52 +13898,21 @@ export function issueRoutes(
       externalWaitMonitor?.kind === "external_service" &&
       externalWaitNextCheckAt !== null &&
       (issue.status === "in_progress" || issue.status === "in_review") &&
+      // PEN-3415 recorded why this last conjunct is load-bearing *on this route*: it is what
+      // separates "this PATCH is the deliberate park" from "this PATCH happens to touch an issue
+      // that already carries an external-wait monitor", and without it an ordinary field edit
+      // would cancel a run that still has work to do. It is deliberately NOT replicated on
+      // `PATCH /issues/:id/monitor` (PEN-5372): every request to that route is a monitor write by
+      // construction, so the route itself carries the signal this conjunct tests for here.
       (req.body.executionPolicy !== undefined || (existing.status !== "in_review" && issue.status === "in_review"));
 
     if (shouldYieldCurrentRunForExternalWait) {
-      const yielded = await heartbeat.cancelRun(
-        actor.runId as string,
-        "Yielded after persisting an external-service wait",
-        {
-          errorCode: "external_wait_yield",
-          resultJson: {
-            yieldedExternalWait: true,
-            issueId: issue.id,
-            serviceName: externalWaitMonitor.serviceName ?? null,
-          },
-          eventMessage: "run yielded after persisting an external-service wait",
-          eventPayload: {
-            issueId: issue.id,
-            serviceName: externalWaitMonitor.serviceName ?? null,
-          },
-          persistBeforeTerminate: true,
-          repairTerminalRelease: true,
-        },
-      ).catch((err) => {
-        logger.warn(
-          { err, runId: actor.runId, issueId: issue.id },
-          "failed to yield run slot after persisting an external-service wait");
-        return null;
+      await yieldCurrentRunForExternalWait({
+        actor,
+        issue,
+        monitor: externalWaitMonitor,
+        nextCheckAt: externalWaitNextCheckAt,
       });
-      if (yielded?.status === "cancelled" && yielded.errorCode === "external_wait_yield") {
-        await logActivity(db, {
-          companyId: issue.companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action: "heartbeat.external_wait_yielded",
-          entityType: "heartbeat_run",
-          entityId: yielded.id,
-          issueId: issue.id,
-          details: {
-            issueId: issue.id,
-            serviceName: externalWaitMonitor.serviceName ?? null,
-            monitorNextCheckAt: externalWaitNextCheckAt.toISOString(),
-          },
-        });
-      }
     }
 
     if (actor.runId) {

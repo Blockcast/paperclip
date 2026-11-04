@@ -29,3 +29,5 @@ No AI attribution trailers in commits. Never add a `Co-Authored-By:` or `Generat
 Keep changes company-scoped and preserve the control-plane invariants in `AGENTS.md`, especially single-assignee checkout, approval gates, budget hard stops, and activity logging. When changing a contract, update every affected layer rather than relying on an implicit compatibility path.
 
 Prefer the smallest relevant verification first. For broad or PR-ready changes, follow the full verification and pull-request checklist in `AGENTS.md`. Never expose credentials or weaken authorization checks to make a test or local workflow pass.
+
+Batch all edits before you request Ally review. After a clean Ally release at head, push only to fix a CI failure or a Critical/Important finding. Do not push wording, comment or test-pin nits: each push buys another ~244 runner-min heavy run on the 16-slot `arc-paperclip-general` pool, which was saturated at 15.3/16 busy runners on 2026-11-02 (BLO-51600). Leave them, or fold them into the next substantive change.

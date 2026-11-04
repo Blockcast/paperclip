@@ -493,6 +493,89 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(agent?.spentMonthlyCents).toBe(0);
   });
 
+  // PEN-4902: `apiRunCount` and `subscriptionRunCount` partition only the CLASSIFIED
+  // rows, and `unknown` is in neither set. On a fleet whose lanes are all brokered --
+  // the live state of this tenant -- both read 0 while runs are happening, and a reader
+  // who takes that as a run count concludes the seat is idle and divides by zero. This
+  // pins the unbranched `costEventRunCount` that answers the question those two cannot, and the
+  // `runlessEventCount` that keeps it from failing the opposite way.
+  it("reports an unbranched costEventRunCount when no row is classified and both billing-type counters read zero", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runOneId = randomUUID();
+    const runTwoId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Ceo",
+      role: "ceo",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: runOneId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "completed",
+        startedAt: new Date("2026-11-03T09:00:00.000Z"),
+        finishedAt: new Date("2026-11-03T09:11:00.000Z"),
+      },
+      {
+        id: runTwoId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        status: "completed",
+        startedAt: new Date("2026-11-03T09:15:00.000Z"),
+        finishedAt: new Date("2026-11-03T09:30:00.000Z"),
+      },
+    ]);
+
+    // billingType omitted on purpose: `createEvent` defaults it to "unknown", which is
+    // also what `resolveLedgerBillingType` resolves every Penstock-brokered lane to.
+    const base = {
+      agentId,
+      provider: "anthropic",
+      biller: "anthropic",
+      model: "claude-opus-5",
+      inputTokens: 1_000,
+      outputTokens: 500,
+      costCents: 100,
+      occurredAt: new Date("2026-11-03T09:05:00.000Z"),
+    } as const;
+
+    // two events on the same run, one on a second run: three events, two runs.
+    await costs.createEvent(companyId, { ...base, heartbeatRunId: runOneId });
+    await costs.createEvent(companyId, { ...base, heartbeatRunId: runOneId });
+    await costs.createEvent(companyId, { ...base, heartbeatRunId: runTwoId });
+    // and one row with no run attribution at all, which `POST /cost-events` permits.
+    await costs.createEvent(companyId, { ...base, heartbeatRunId: null });
+
+    const [row] = await costs.byAgent(companyId);
+
+    // the defect this field exists for: nothing is classified, so both read 0.
+    expect(row?.apiRunCount).toBe(0);
+    expect(row?.subscriptionRunCount).toBe(0);
+
+    expect(row?.costEventRunCount).toBe(2);
+    expect(row?.runlessEventCount).toBe(1);
+
+    // cash and consumption still agree, because no lane is classified as a subscription.
+    expect(row?.consumptionCents).toBe(row?.costCents);
+  });
+
   it("aggregates cost event sums above int32 without raising Postgres integer overflow", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

@@ -1641,6 +1641,161 @@ describe("issue execution policy routes", () => {
       });
     });
 
+    /**
+     * PEN-5372. The external-wait slot yield lived only in `PATCH /issues/:id`, where one conjunct
+     * of its predicate is `req.body.executionPolicy !== undefined`. This route has no
+     * `executionPolicy` body field at all, so `kind: "external_service"` was structurally inert
+     * here — on the route the tool description tells callers to PREFER. Every field a caller can
+     * read said the park worked: 200, `monitorNextCheckAt` armed, `executionState.monitor.status`
+     * "scheduled", and the run still holding its slot.
+     *
+     * The first case is the regression guard. The rest pin the boundaries, because a yield that
+     * fires too eagerly cancels a run that still has work to do — the failure PEN-3415 warned
+     * about when it kept that conjunct.
+     */
+    describe("external-wait slot yield on the monitor route (PEN-5372)", () => {
+      const seedIssue = (overrides: Record<string, unknown> = {}) => {
+        const issue = { ...wedgedIssue(), executionPolicy: null, executionState: null, ...overrides };
+        mockIssueService.getById.mockResolvedValue(issue);
+        mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+          ...issue,
+          ...patch,
+          updatedAt: new Date(),
+        }));
+        return issue;
+      };
+
+      const asRun = (runId: string) => createApp({
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId,
+      });
+
+      const armMonitor = (runId: string, monitor: Record<string, unknown>) =>
+        asRun(runId).then((app) => request(app)
+          .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/monitor")
+          .send(monitor));
+
+      const yieldActivityCalls = () => mockLogActivity.mock.calls.filter(
+        (call) => (call[1] as { action?: string })?.action === "heartbeat.external_wait_yielded",
+      );
+
+      it("yields the current run when the arm carries kind external_service", async () => {
+        const issue = seedIssue();
+        mockHeartbeatService.cancelRun.mockResolvedValueOnce({
+          id: "run-1",
+          status: "cancelled",
+          errorCode: "external_wait_yield",
+        } as never);
+
+        const res = await armMonitor("run-1", {
+          nextCheckAt: SCHEDULED_MONITOR_NEXT_CHECK_AT,
+          kind: "external_service",
+          serviceName: "github-actions",
+          notes: "signature=ci",
+        });
+
+        expect(res.status).toBe(200);
+        // The park is durable first: a yield that beat the write would free the slot for a monitor
+        // that is not armed, which is strictly worse than not yielding at all.
+        expect(mockIssueService.update).toHaveBeenCalledWith(
+          "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          expect.objectContaining({ monitorNextCheckAt: new Date(SCHEDULED_MONITOR_NEXT_CHECK_AT) }),
+        );
+        expect(mockHeartbeatService.cancelRun).toHaveBeenCalledWith(
+          "run-1",
+          "Yielded after persisting an external-service wait",
+          expect.objectContaining({
+            errorCode: "external_wait_yield",
+            persistBeforeTerminate: true,
+            repairTerminalRelease: true,
+            resultJson: expect.objectContaining({
+              yieldedExternalWait: true,
+              issueId: issue.id,
+              serviceName: "github-actions",
+            }),
+          }),
+        );
+        // The activity row is the caller's only positive evidence the slot was freed.
+        expect(yieldActivityCalls()).toHaveLength(1);
+        expect(yieldActivityCalls()[0]?.[1]).toMatchObject({
+          action: "heartbeat.external_wait_yielded",
+          entityType: "heartbeat_run",
+          issueId: issue.id,
+          details: expect.objectContaining({ serviceName: "github-actions" }),
+        });
+      });
+
+      it("does not yield when kind is left at its null default", async () => {
+        seedIssue();
+
+        const res = await armMonitor("run-1", {
+          nextCheckAt: SCHEDULED_MONITOR_NEXT_CHECK_AT,
+          serviceName: "github-actions",
+        });
+
+        expect(res.status).toBe(200);
+        expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+        expect(yieldActivityCalls()).toHaveLength(0);
+      });
+
+      it("does not yield a run that does not own the issue's execution lock", async () => {
+        seedIssue();
+
+        const res = await armMonitor("run-2", {
+          nextCheckAt: SCHEDULED_MONITOR_NEXT_CHECK_AT,
+          kind: "external_service",
+          serviceName: "github-actions",
+        });
+
+        // The arm itself is somebody else's business to authorize; the yield is not. Cancelling
+        // here would terminate a run on the strength of a monitor write it never made.
+        expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+        expect(yieldActivityCalls()).toHaveLength(0);
+        expect([200, 403]).toContain(res.status);
+      });
+
+      it("does not yield on a clear", async () => {
+        seedIssue({
+          executionPolicy: normalizeIssueExecutionPolicy({
+            monitor: {
+              nextCheckAt: "2099-11-01T13:00:00.000Z",
+              kind: "external_service",
+              serviceName: "github-actions",
+              scheduledBy: "assignee",
+            },
+          }),
+          monitorNextCheckAt: new Date("2099-11-01T13:00:00.000Z"),
+        });
+
+        const res = await request(await asRun("run-1"))
+          .delete("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/monitor");
+
+        expect(res.status).toBe(200);
+        // A clear is the opposite of a park: the run is resuming work, not waiting on anything.
+        expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+        expect(yieldActivityCalls()).toHaveLength(0);
+      });
+
+      it("still returns 200 when the post-commit yield rejects, and claims no release", async () => {
+        seedIssue();
+        mockHeartbeatService.cancelRun.mockRejectedValueOnce(new Error("db update unavailable"));
+
+        const res = await armMonitor("run-1", {
+          nextCheckAt: SCHEDULED_MONITOR_NEXT_CHECK_AT,
+          kind: "external_service",
+          serviceName: "github-actions",
+        });
+
+        // The monitor IS armed by this point. A 500 here would make the caller re-arm into a live
+        // monitor; the same absorption is pinned on the `PATCH /issues/:id` path above.
+        expect(res.status).toBe(200);
+        expect(mockHeartbeatService.cancelRun).toHaveBeenCalledTimes(1);
+        expect(yieldActivityCalls()).toHaveLength(0);
+      });
+    });
+
     // BLO-18816 review, Critical 1 + Important 2. The clause that lets
     // `PATCH {"executionPolicy": {}}` reach a *fired* monitor is route-level, and
     // every case above exercises the service layer or the new route — so the

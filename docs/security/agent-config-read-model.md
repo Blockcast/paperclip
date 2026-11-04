@@ -337,6 +337,7 @@ Note also that the strip is **narrow**: `budgetMonthlyCents` and
 `spentMonthlyCents` pass through the restricted projection untouched. Whatever
 the peer rule is for, it is not a general "peer-sensitive data" rule.
 
+
 ### The withheld-is-not-absent signal (`PEN-5230`)
 
 `{}` is a legal **stored** value for both columns, so every `{}` in the table
@@ -391,6 +392,35 @@ To tell which **tree** you are on, rather than what a response means, check for
 on `master`, so its absence now means a stale checkout rather than a tree
 predating the signal.
 
+> ⚠️ **Shipped is not deployed, and the matrix column above describes
+> `master`.** Measured 2026-11-02: the running API did not carry these
+> markers — `grep -c WITHHELD_AGENT_CONFIG_FIELDS` on
+> `server/src/routes/agents.ts` returned **4** at `master` and **0** at the
+> deployed commit, and a live peer list read returned `{}` rows with nothing
+> beside them. **Until you have confirmed the markers are live on the API you
+> are actually talking to, do not read marker-absence as "this `{}` is the
+> real stored value."** Run the own-id positive control **on the detail
+> route** (`GET /agents/:id`, `paperclipGetAgent`): if that call against your
+> own id comes back populated and a peer's does not, you are looking at a
+> projection. ⛔ **That control is only valid if your own read came back
+> populated at all.** Own-id is sufficient *on the standard trust preset
+> only*: the `isSelf` branch short-circuits before the gate, answering a
+> `low_trust_review` actor with `buildLowTrustSelfView` — a shape carrying no
+> config — and a `denied` actor with a **403**. So an empty own-id read means
+> the control did not run; it is **never** evidence that your own column is
+> empty. ⛔ Do **not** run it on the company roster — the self row there
+> is decided by which branch you landed on rather than by the column, so it
+> cannot tell redaction from absence
+> ([why](#check-whether-telemetry-answers-it-before-asking-for-the-read)).
+> Until the markers deploy, `{}` is uninformative in both directions — the state
+> that misled three principals in the issue record, most recently across four
+> runs on `PEN-4623`.
+>
+> If you are here because you hit a peer `{}` and you need the value, the
+> supported route is [the consultative one-hop peer-config
+> read](#the-consultative-one-hop-peer-config-read). You do not need a grant
+> and you should not ask for one.
+
 ### `access.grants` rides the same route and that projection never sees it (`PEN-5232`)
 
 The matrix above is about two columns on the `agents` row. The detail route
@@ -442,6 +472,115 @@ the reason live in the module rather than only on the issue. `PEN-5258`
 what a grant row *contains*; it does not decide who may read the list, and
 should not be cited as if it had.
 
+### One sub-key of `adapterConfig` has a second, tighter gate (`PEN-5225`)
+
+The table above treats `adapterConfig` as one object. It is not, for one key.
+`adapterConfig.workspaceStrategy.provisionCommand` / `.teardownCommand` /
+`.worktreeParentDir` are host-executed operator text — `provisionCommand` runs
+as `bash -lc <string>` via `services/environment-run-orchestrator.ts`, which
+makes an inline `FOO_TOKEN=… ./deploy.sh` an ordinary idiom — and they are
+**withheld from every actor that cannot clear `workspace_runtime:read`**, on
+top of whatever `agent_config:read` decided about the row.
+
+So the read takes **two** gates, and they are independent:
+
+| Gate | Decides | Reachable by an agent? |
+| --- | --- | --- |
+| `agent_config:read` | whether `adapterConfig` is returned at all, or `{}` | yes — `agents:configure` or `agents:suggest-changes` |
+| `workspace_runtime:read` | whether those three keys inside it are values or the sentinel | **no** — see below |
+
+`workspace_runtime:read` is unreachable by any agent *by construction*: it is
+absent from the blanket same-company agent allow-list in `decideBase`,
+`permissionForAction` returns `null` for it, and it is not a `PermissionKey`,
+so no grant row can confer it (`PEN-2852`). **No agent sees these three values,
+on any route, including on its own row.** Self is exempt from
+`agent_config:read` and is deliberately *not* exempt from this one: the agent
+never executes the string (the control plane does), the write guard
+`assertNoAgentHostWorkspaceCommandMutation` refuses the mutation on its own row
+too, so there is no read-to-edit round trip the disclosure would enable — and a
+self-read could be republished into a company-readable issue thread.
+
+This was a genuine inconsistency until `PEN-5225`, not a restatement of the
+peer question: the write side had always refused these fields to agents while
+`redactAgentSecrets` masked `env` and the MCP `Authorization` header and never
+touched `workspaceStrategy`. The agents route was therefore a strictly *wider*
+door onto a subset of the material every workspace, project, issue and pipeline
+route withholds.
+
+Withheld is distinguishable from not-configured, as everywhere else at this
+boundary: an absent key stays absent, `null` stays `null` ("no command
+configured"), and only a real value becomes `***REDACTED***`. Every other key
+on the strategy — `type`, `runScope`, `baseRef`, `branchTemplate` — crosses
+untouched; the classification is `maskWorkspaceStrategyShellTextForRead`
+(`server/src/redaction.ts`), shared with `publicExecutionWorkspaceStrategy` so
+the two layers cannot drift. The mask is applied at
+`containAgentConfig` / `redactAgentSecrets` (`agent-redaction.ts`), so it covers
+every agent-serializing exit at once, and it **defaults to withheld** — a route
+added without resolving a viewer masks rather than discloses.
+
+The same applies at any depth, not just the top level: the write guard already
+refuses `runtimeConfig.modelProfiles.cheap.adapterConfig.workspaceStrategy.provisionCommand`
+by name, so the read walk matches it (and is wider, since that config is an open
+`z.record` and non-API writers are not gated by the route guard).
+
+#### The gate follows the bytes, not the route (the `hire_agent` card)
+
+An agent config does not only leave through `routes/agents.ts`. A `hire_agent`
+approval card **embeds the hire's `adapterConfig` / `runtimeConfig`** — twice,
+again under `payload.requestedConfigurationSnapshot` — written by
+`POST /api/companies/:companyId/agent-hires` through `redactEventPayload`, which
+has never known about `workspaceStrategy`. Three read paths serialize that
+payload:
+
+| Route | Projection |
+| --- | --- |
+| `GET /api/approvals/:id` | `routes/approvals.ts` |
+| `GET /api/companies/:companyId/approvals` | `routes/approvals.ts` |
+| `GET /api/issues/:id/approvals` | `services/issue-approvals.ts` |
+
+All three take the **same two gates in the same order** as the agents route, via
+one shared projection — `projectApprovalPayloadForRead` (`agent-redaction.ts`):
+`agent_config:read` decides whether the config pair is returned at all or blanked
+to `{}` (`PEN-2777`), and `workspace_runtime:read` then decides whether the three
+`workspaceStrategy` keys inside a config the caller *may* read are values or the
+sentinel (`PEN-5225`).
+
+This mattered because the two gates point **opposite ways for the same reader**.
+A peer holding `agents:configure` clears the first and can never hold the second,
+so until `PEN-5225` it read `provisionCommand` in the clear off the approval card
+while every other route — including `GET /api/agents/:id`, one route over, on the
+same bytes — withheld it. Masking the agents route alone would have closed one
+exit of two and left the finding true (`PEN-4775`'s two-exits-one-answer shape).
+
+Two consequences worth stating, because both are easy to get wrong:
+
+- The mask runs **last**, over the already-withheld payload, so it covers a
+  `workspaceStrategy` carried anywhere in the card rather than only inside the
+  two keys the first gate knows about.
+- The second gate decides **shape before content**. The mask finds
+  `workspaceStrategy` by descending plain objects and arrays, but
+  `approvalPayloadSchema` is a `.catchall(z.unknown())`, so a card filed through
+  `POST /api/companies/:companyId/approvals` can carry `adapterConfig` as a
+  JSON-encoded **string** — commands in bytes that walk cannot reach. So
+  `maskUnwalkableAgentConfigForRead` blanks a config of an undescendable shape to
+  the sentinel first, and only then does the command mask run. Note the
+  *unentitled* reader was never exposed here: `withholdAgentConfigKeys` blanks the
+  pair at any shape, because entitlement must not depend on shape. This closes the
+  matching gap one gate down, where entitlement is granted but the mask was
+  shape-dependent. It is a blank, never a parse: reaching inside the string would
+  let a filer-supplied encoding decide an authorization outcome.
+- It is scoped to `type === "hire_agent"`, exactly as the first gate is. Another
+  approval type's payload is filer-authored prose, not an agent config; masking
+  it would redact an agent's own text about a command rather than withhold a
+  configured one.
+
+A fourth serialization — `approvalResolutionResponse`, the body returned by
+approve/reject/revise — shares the same projection rather than restating it.
+Both verdicts are **required arguments** at that seam and the viewer **defaults
+to withheld**, so a fifth approval-serializing route has to state which side of
+each gate it is on, and one that forgets masks rather than discloses.
+
+
 ### Archaeology
 
 The restricted projection and the company-wide gate that feeds it both arrived
@@ -479,11 +618,11 @@ unfalsifiable, and in this file that is a defect rather than a convenience.
 
 | Question | Standing answer | Ruled | Re-open only on |
 | --- | --- | --- | --- |
-| May a seat be granted `agents:configure` in order to obtain a peer config **read**? | **No.** | `Ceo`, 2026-11-01, `PEN-5218`; amended the same day | The successor row (below) defining a **read-only** action — not a fresh grant request |
-| May a seat be granted `agents:suggest-changes` in order to obtain a peer config **read**? | **No.** It is the lesser door, it reaches the same gate (`decideWithAgentConfigReadGrant`), and it fails on the same first reason and on a structural one. Since `#3244` merged (2026-11-02) it is narrowed to one named subject (row 3b′) and refused `deny_scope` against a company. ⚠️ **The refusal above is unchanged by that** — it never rested on the tier's reach, only on the first reason; the merge retired the second reason rather than the answer. | `Ceo`, 2026-11-01, `PEN-5218` | The successor row concluding that the suggest tier is the right interim mechanism — its call to make, not an ad-hoc grant |
+| May a seat be granted `agents:configure` in order to obtain a peer config **read**? | **No.** | `Ceo`, 2026-11-01, `PEN-5218`; amended the same day | A **read-only** action shipping — not a fresh grant request. ⚠️ The successor row (`PEN-5228`) has since ruled and **declined to define one**: it kept the withhold and made the consultative one-hop standing instead. This condition can no longer be met by that row, so it now points at an implementation row defining such an action — none filed as of 2026-11-02. |
+| May a seat be granted `agents:suggest-changes` in order to obtain a peer config **read**? | **No.** It is the lesser door, it reaches the same gate (`decideWithAgentConfigReadGrant`), and it fails on the same first reason and on a structural one. Since `#3244` merged (2026-11-02) it is narrowed to one named subject (row 3b′) and refused `deny_scope` against a company. ⚠️ **The refusal above is unchanged by that** — it never rested on the tier's reach, only on the first reason; the merge retired the second reason rather than the answer. | `Ceo`, 2026-11-01, `PEN-5218` | ⛔ **Answered, not open.** The successor row (`PEN-5228`, ruled 2026-11-02) concluded the suggest tier is **not** the right mechanism — the consultative one-hop is (row 5). `PEN-5231` / `#3244` narrowed the tier's reach in the same week but did not touch this answer. Re-open only on a *new* decision row carrying the question explicitly. |
 | Should `budgetMonthlyCents` / `spentMonthlyCents` get a control of their own, given they pass the restricted projection untouched? | **No.** No control is manufactured for them. | `Ceo` on `PEN-4775`; re-affirmed 2026-11-01 on `PEN-5218` | A measured harm, or a successor-row ruling that moves the projection these fields ride through |
 | Who decides whether peer config is company-readable? | The **successor row** to `PEN-3206` (below), owned by Security Engineer since 2026-11-01 — deliberately not the seat that wants the read, not an ad-hoc proposal on whichever operational row hit the `{}`, and deliberately not the `Ceo` either, who declined to take it as part of the same separation. | `Ceo`, 2026-11-01, `PEN-5218` | — |
-| How does a seat obtain a peer's `runtimeConfig` or `adapterConfig` value in the meantime? | **Ask the `Ceo`, naming the single field in advance; the `Ceo` reads that field and posts that field.** Not the object — see the exposure below. One hop, audited in the issue thread, no standing grant. This is the supported path, not a workaround. | `Ceo`, 2026-11-01, `PEN-5218`; narrowed the same day | A successor-row ruling |
+| How does a seat obtain a peer's `runtimeConfig` or `adapterConfig` value? | **Ask a principal who already holds `agents:configure` — in practice the `Ceo` — naming the single field in advance; they read that field and post that field, and nothing else.** Not the object — see the exposure below. One hop, per-question, dated in the issue thread, no standing capability left behind. This is the supported path, not a workaround, and it is **no longer interim**: the successor row ruled it standing. Four conditions bind it — see [the consultative one-hop peer-config read](#the-consultative-one-hop-peer-config-read). | `Ceo`, 2026-11-01, `PEN-5218`; narrowed the same day; **ratified standing by `PEN-5228` §5, `Ceo` 2026-11-02T21:22Z** | A caller with a **recurring** need that a single named-field ask cannot serve — **two instances in one week**, counted in the `PEN-5327` exercise log. One audit question is not. |
 
 The "Re-open only on" column is **derived from the rulings, not quoted from
 them**: the standing answers are the `Ceo`'s words, the conditions are this
@@ -540,10 +679,13 @@ merits.** A read obtained through a change permission is precisely the category
 error the open question exists to resolve. Making that workaround *standing*
 lowers the pressure to fix it properly, and the fix is a read-only action.
 
-Neither refusal is foreclosure. If the successor row concludes the suggest tier
-is the right interim mechanism, that is its call. What is declined here is
-deciding it ad hoc from an operational row. Anyone proposing either grant **as a
-route to a read** should expect this answer.
+Neither refusal was foreclosure — both were deferrals to the successor row, and
+**that row has since ruled** (`PEN-5228`, 2026-11-02): the suggest tier is not
+the right mechanism, the withhold stands, and the consultative one-hop is the
+supported path. What was declined here was deciding it ad hoc from an
+operational row; what is declined *now* is re-deciding it without a new
+decision row. Anyone proposing either grant **as a route to a read** should
+expect this answer.
 
 One claim that is *not* load-bearing here and used to be stated as though it
 were: the budget fields ride the same projection, but that is the
@@ -564,21 +706,103 @@ at 3 across nine consecutive samples spanning 85 minutes while `queued_count`
 never reached 0 and head-of-line age climbed monotonically to 3588 s. A
 demand-limited seat drains to 0 between arrivals; this one did not, so the
 flat line was a ceiling rather than a coincidence of arrivals. The configured
-value, supplied afterwards by the `Ceo` under the interim rule above — the
+value, supplied afterwards by the `Ceo` under the one-hop rule above — the
 single field `heartbeat.maxConcurrentRuns`, named in advance and posted on its
 own — was 3, since raised to 5 on that row. The inference was correct and the
 read would have added nothing to it.
 
 Two habits from that row are worth carrying:
 
-- **Run a positive control before claiming you cannot observe something.** The
-  same `paperclipGetAgent` call against the viewer's own id returns the full
-  `runtimeConfig.heartbeat`. That is what distinguishes redaction from absence,
-  and without it `{}` is equally consistent with "no such config".
+- **Run a positive control before claiming you cannot observe something — and
+  run it on the right route.** On the detail route (`GET /agents/:id`,
+  `paperclipGetAgent`) the same call against the viewer's own id returns the
+  full `runtimeConfig.heartbeat`. That is what distinguishes redaction from
+  absence, and without it `{}` is equally consistent with "no such config".
+  Three things bound that control, all read off `server/src/routes/agents.ts`:
+  - **Own-id is sufficient, not necessary.** The gate is
+    `isSelf ? true : actorCanReadConfigurationsForAgent(...)`, so a reader
+    entitled to the subject gets a populated **peer** read too. "It came back
+    populated, so that must have been my own row" does not follow — the axis
+    is the reader's entitlement, not self-vs-peer.
+  - ⛔ **But own-id is sufficient only on the standard trust preset.** The
+    `isSelf` branch short-circuits *before* that gate: a `low_trust_review`
+    actor is answered with `buildLowTrustSelfView`, a shape that carries no
+    config, and a `denied` actor gets a **403**. The detail route therefore
+    carries the same trust condition as the roster bullet below, and an empty
+    own-id read is evidence the control did not run — never evidence that
+    your own column is empty. Reading it the other way is the same inversion
+    the roster bullet warns about, on the route this section recommends.
+  - ⛔ **On the company agent list the control is vacuous.** That handler
+    gates on `actorCanReadConfigurationsForCompany`; once that fails it
+    renders the viewer's own row with `redactAgentSecrets` and every other row
+    restricted. A populated self row there is decided by that branch, and
+    would look identical if the peer's column really were empty — so it is not
+    evidence either way. The self exemption is itself **conditional**: it is
+    gated on the standard trust preset (`selfTrustPreset?.kind === "standard"`
+    → `selfRowId`), so a low-trust self keeps the *restricted* row and reads
+    `{}` for its own seat. A `{}` self row on the roster is therefore no more
+    informative than a populated one — it is the low-trust branch, not an
+    empty column, and reading it as absence inverts the control. (The route is
+    not grant-blind: a company-scoped holder gets *every* row populated. It is
+    the self row that carries no information, and only on the restricted
+    branch.)
+  - The two gates are scoped differently and can disagree for the same
+    reader: the detail route asks `agent_config:read` on the **agent**
+    resource, the list route asks it on the **company**. A holder of
+    `agents:suggest-changes` alone passes the first for a named subject and
+    fails the second (`PEN-5231`), so it reads a populated peer on
+    `/agents/:id` and `{}` for that same peer on the roster.
 - **Say which claims rest on telemetry.** `PEN-5218` stated that it was not
   quoting `runtimeConfig` as proof of the cap's value. That is what let the
   measurement stand on its own when the grant was refused, instead of the whole
   row blocking on a read it never actually needed.
+
+### The consultative one-hop peer-config read
+
+The route a grantless seat uses **instead of** asking for `agents:configure`.
+Ratified standing on `PEN-5228` §5 (`Ceo`, 2026-11-02T21:22Z) and carried,
+with its live exercise log, on
+[`PEN-5327`](https://paperclip.blockcast.net/PEN/issues/PEN-5327).
+
+**The rule.** When an agent needs a peer's `runtimeConfig` / `adapterConfig`
+value, it does not request a grant. It asks a principal who already holds
+`agents:configure` — in practice the `Ceo` — who reads the value and posts the
+single named field, and nothing else, on the issue thread.
+
+**Why this rather than a grant.** A grant is *per-seat and open-ended*; a
+consultative read is *per-question and closed*. For a need measured at one
+instance in the observed history, the per-question form is strictly the
+narrower instrument, and it leaves a dated artifact that a grant does not.
+
+Four conditions bind it. They are part of the rule, not commentary:
+
+1. **The field is named in advance, and the answer is only that field.** Not
+   politeness: until `PEN-5225` lands, posting the whole object publishes
+   host-executed command strings into an issue thread — a *wider* audience
+   than the grant would have been. See [Why both doors are
+   refused](#why-both-doors-are-refused), first reason, for why those strings
+   survive `redactAgentSecrets`. One scalar, named up front, is fine; an
+   object is not.
+2. ⛔ **A named field is not automatically answerable.** If the ask names
+   `adapterConfig.workspaceStrategy.provisionCommand` or `.teardownCommand`,
+   the reader **refuses and routes to `PEN-5225`**. No in-thread judgment
+   about how much of a host-executed string is safe to quote. This is the one
+   case where "one named field" and "discloses nothing" come apart.
+3. **Each exercise is logged as a one-line dated entry on `PEN-5327`.** The
+   re-open trigger below has no denominator otherwise: with nothing counting
+   instances it could only ever be *noticed*, not fired. A trigger with a
+   tally behind it can fire; one without is a hope.
+4. **Re-open on:** a caller with a *recurring* need for a specific peer's
+   config that neither the grant nor the one-hop ask serves. **Two instances
+   in a week is that; one audit question is not.** It then returns to the
+   read-model decision rather than being widened quietly.
+
+**The limitation, stated rather than papered over.** The route concentrates on
+a principal holding `agents:configure`, so its audit quality is exactly that
+principal's discipline in posting one named field and no more. That is a real
+dependency, it is visible, and it is cheaper than the alternative. Conditions
+2 and 3 exist to convert it from a disposition into something with a
+checkable edge.
 
 ## What this document does NOT decide
 
@@ -611,8 +835,14 @@ is the step at which a widening gets refused cheaply.
 > **Successor row: [`PEN-5228`](https://paperclip.blockcast.net/PEN/issues/PEN-5228)**,
 > filed 2026-11-01T21:50Z, owned by Security Engineer. Every "successor row"
 > reference in [Settled calls](#settled-calls) resolves here, and this is the
-> only place in this file the id appears — so if this question is ever
+> only *routing pointer* to that row in this file — so if this question is ever
 > re-routed again, one line changes and no reference goes stale behind it.
+> Elsewhere the id appears as a citation of what `PEN-5228` **ruled**. Those are
+> historical, they stay correct across a re-route, and they are not pointers —
+> which is why the one-line property holds despite them.
+>
+> (Do not restore a self-referential count here: it is the one claim a file
+> promising *descriptive* in its Status line cannot make and keep.)
 
 `PEN-4775` deliberately changed only the self row,
 because that row is wrong under *either* answer to the policy question — the
@@ -626,6 +856,318 @@ needs rewriting. If it lands on "not readable", the live gap it leaves is the
 one `PEN-4775` §6 recorded: a seat holding `tools:manage_runtime` can **write**
 a peer's `runtimeConfig` and cannot read it back to verify the write, and that
 asymmetry then needs its own answer.
+
+Note that whichever way it lands, it does **not** reopen the three
+`workspaceStrategy` keys above: those hang off `workspace_runtime:read`, which
+no agent can hold, so "company-readable" would widen the row and not those
+values. `PEN-3206` ratified that posture and `PEN-5225` is the agents route
+catching up to it.
+
+## `config-revisions` is not a complete audit
+
+Status: **descriptive**. Read out of `agentService.update`, `diffConfigSnapshot`
+and `activatePendingApproval` (`services/agents.ts`), `upsertPolicy` and
+`resolveIncident` (`services/budgets.ts`), `patchAgentImage`
+(`services/agent-image-bump.ts`), the agent import in
+`services/company-portability.ts`, and `redactRevisionSnapshot`
+(`routes/agents.ts`), at the commit that added this section. The two live gaps
+it cites were measured on the Penstock instance on 2026-11-02 and are recorded
+on `PEN-5321`; the bracket windows are the reporter's, not re-derived here.
+
+> `GET /api/agents/:id/config-revisions` may **NOT** be cited as a complete
+> record of agent configuration writes, and nothing on the endpoint says so.
+> Revision recording is **opt-in per call site**. Several live write paths do
+> not opt in, and two of the columns most often chained through this log —
+> `budgetMonthlyCents` and `runtimeConfig` — each have at least one writer that
+> records nothing. A column that moves with no revision row is the expected
+> behaviour of this table, not evidence of a lost row or of tampering.
+
+Two confirmed instances, both found while answering an ordinary provenance
+question:
+
+| Seat | Column | Change | Bracketed to | Row in the log |
+| --- | --- | --- | --- | --- |
+| `Ceo` | `budgetMonthlyCents` | 0 → 1,200,000 | (2026-10-28, 2026-10-31] | none |
+| `Cto` | `runtimeConfig.heartbeat.maxConcurrentRuns` | 1 → 3 | 2026-07-11 → 2026-08-17 | none |
+
+### It is (a) a bypassing write path — not dropped keys, not retention
+
+`PEN-5321` asked which of three causes this is. It is the first, and the other
+two are positively excluded rather than merely unobserved:
+
+- **Not (b), dropped `changedKeys`.** When a revision *is* recorded,
+  `diffConfigSnapshot` compares **every** entry of `CONFIG_REVISION_FIELDS`
+  between the before and after snapshots. There is no per-key filter it could
+  drop a column through. The one writer that does not diff —
+  `patchAgentImage`, which hardcodes `changedKeys: ["adapterConfig"]` — is
+  correct for the single column it writes.
+- **Not (c), retention or compaction.** Nothing anywhere deletes, prunes or
+  rewrites `agent_config_revisions`. The only `ON DELETE cascade` on the table
+  is from `agents`, i.e. the agent itself being deleted, and
+  `listConfigRevisions` applies no `LIMIT` — the endpoint returns the whole
+  array, which is why a non-round row count is not a truncated page.
+- **(a).** `agentService.update` records only when the caller passes
+  `recordRevision`, and the raw `db.update(agents)` writers never reach that
+  function at all.
+
+### The writers that record nothing
+
+Everything below changes a column in `CONFIG_REVISION_FIELDS` and leaves no
+revision row. Cited by symbol; grep for it.
+
+| Writer | Columns it can move | Reached by |
+| --- | --- | --- |
+| `upsertPolicy` agent mirror (`services/budgets.ts`) | `budgetMonthlyCents` | `POST /companies/:id/budgets/policies` — the budgets pane and `pc cost budget policy:upsert` |
+| `resolveIncident` agent mirror (same file) | `budgetMonthlyCents` | `POST /companies/:id/budget-incidents/:id/resolve` with `raise` |
+| the agent import in `services/company-portability.ts` | every config column, including `runtimeConfig` and `reportsTo` | company import / restore |
+| `activatePendingApproval` (`services/agents.ts`) | every config column the board edited on the hire card | board approval of a hire |
+| the instructions-bundle materializer (`routes/agents.ts`) | `adapterConfig` | `PATCH /agents/:id/instructions-bundle`, and the lazy migration off a legacy prompt template |
+| the join-request replay (`routes/access.ts`) | `adapterType`, `adapterConfig` | approving a company join request |
+| `agentService.create` | all of them — **there is no creation revision at all** | every hire |
+| `agentService.remove` (`services/agents.ts`) | `reportsTo`, on every *direct report* of the deleted agent — not on the agent being deleted | `DELETE /api/agents/:id` |
+
+**The two columns are affected differently, and the difference matters when you
+are deciding how much to trust a chain.**
+
+- `budgetMonthlyCents` has unrecorded writers on the **ordinary, routine path**.
+  Setting an agent cap through the budgets UI is the normal way to do it and it
+  is unrecorded; the two paths that *do* record (`PATCH /agents/:id/budgets`,
+  which gained it on 2026-08-26 for `BLO-20121`, and the approval executor) are
+  the exceptions. Expect gaps here as a matter of course.
+- `runtimeConfig` has unrecorded writers only on **exceptional** paths —
+  import, hire activation. The everyday editor, `PATCH /api/agents/:id`,
+  records. A `runtimeConfig` gap is therefore a much stronger signal that
+  something unusual wrote the column, and is worth chasing rather than shrugging
+  at.
+
+`agentService.remove` is the one that moves a column on a seat **other** than
+the one being written to. Deleting a manager runs
+`tx.update(agents).set({ reportsTo: null })` over all of its reports, so in a
+`reportsTo` chain the gap appears as an unexplained jump to `null` on agents
+nobody edited — and the agent whose deletion caused it is gone from the table by
+the time anyone reads the chain.
+
+`agentService.create` writing nothing is the quietest of these. It means every
+seat's chain begins unanchored: the earliest revision's `before` is the first
+state anyone recorded, never the state the agent was hired with, and the two are
+not the same object.
+
+### Where the actor IS still recoverable
+
+The endpoint cannot answer "who changed this", but for the budget column that is
+not the end of the inquiry — it is the wrong table. Both unrecorded budget
+writers log and stamp:
+
+- `activity_log` — `budget.policy_upserted` (`entity_type: budget_policy`,
+  scope in `details`) and `budget.incident_resolved`, each carrying the actor.
+- `budget_policies` — `updated_by_user_id`, plus `amount_updated_at`, which is
+  stamped only when the amount actually changed and so dates the cap move rather
+  than the row write.
+
+So "not recoverable from this surface" is accurate about `config-revisions` and
+should not be carried forward as "not recoverable". For `runtimeConfig` there is
+no equivalent: the import and activation paths log an activity row for the
+*operation*, not for the column, so an unrecorded `runtimeConfig` move genuinely
+has no attributed actor.
+
+### The seat whose history it is cannot read it
+
+Completeness is one axis; **reachability** is a second, independent one. This
+subsection would hold even if the log above were complete.
+
+`GET /api/agents/:id/config-revisions` has **no self door**. Both config-revision
+routes deliberately keep the *company* resource — see the blockquote in
+§ "The two allow-paths, in evaluation order": config history is reachable from no
+other self route, so naming the subject there would be a genuine widening. The
+consequence is that an agent holding neither `agents:configure` nor
+`agents:suggest-changes` is refused **its own** revision history exactly as it is
+refused a peer's. Measured 2026-11-04 from the `Cto` seat, which holds neither:
+
+| read | result |
+|---|---|
+| own seat | `403` `{"error":"Missing permission: agents:suggest-changes.","details":{"reason":"deny_missing_grant","boundary":"grant"}}` |
+| peer seat (`Ceo`) | byte-identical body |
+
+Independently reproduced on the `Devops` seat the same day — its own row and the
+`Cto` row, same two bodies.
+
+Two consequences for anyone citing this endpoint:
+
+- **The refusal does not distinguish the two questions.** "I may not read other
+  seats' history" and "I may not read my own" come back as the same body, so the
+  self case is not discoverable from the error. A reader who assumes the usual
+  self-exemption (the one `assertNoAgentHostWorkspaceCommandMutation` has, for
+  instance) will read this 403 as a scoping refusal it is not.
+- **The audit cannot be run by the party with the most at stake.** Both missing
+  writes recorded above were found from a seat holding `agents:configure`. The
+  two seats whose configuration actually moved could not have checked their own.
+
+This is **not** an argument for adding a self door. Widening that gate is a
+disclosure decision owned by `PEN-5231`, and the reasoning that put the company
+resource there is recorded above and is not overturned here. It is a reason the
+endpoint cannot be cited as *the* audit of record: a history only a third party
+can read may still be a record, but it is not a self-audit.
+
+### Reading this endpoint without being misled
+
+Three rules, each of which has already caught someone:
+
+1. **Chain one column at a time, filtered to the revisions whose `changedKeys`
+   contains it.** Snapshots are not all full rows (next rule), so chaining
+   across every revision compares a column against rows that never stored it and
+   manufactures roughly eleven spurious gaps per seat.
+2. **Snapshots come in two shapes, and the shape is not the `source` label.**
+   `patchAgentImage` (`services/agent-image-bump.ts`) writes a **partial**
+   snapshot naming only `adapterConfig`; every other writer of this table
+   snapshots the whole row. Identify the partial population by its **shape** —
+   `changedKeys` is the row's own coverage declaration — and never by `source`.
+   `source` is free-form caller text, so it cannot key a filter: the retry path
+   hardcodes `auto-retry-on-completion` (`agent-image-bump.ts:264`), but
+   `POST /admin/agents/bump-agent-image` takes the value from the request body
+   (`z.string().min(1).max(120).prefault("admin:manual")`) and *suffixes* it with
+   `@<buildSha>` when one is supplied, so even an exact match on a label you have
+   already seen misses the same writer's next row. Measured: the identical
+   partial shape arrives on the `Cto` seat under four labels —
+   `auto-retry-on-completion` 927, `ci:docker-agent.yml` 373, `manual:BLO-10409`
+   1, `manual:PEN-388` 1. Filtering on `auto-retry-on-completion` there misses
+   375 of 1302 partial rows (29%), and the missed ones are the CI rows — exactly
+   where a reader chasing an image bump would look.
+   **The mirror image is equally live, and it is the half this rule asserted
+   without exhibiting.** The *full* population is not `source == "patch"`
+   either. Measured on the `Ceo` seat 2026-11-04 — 1369 revisions, ten of them
+   full, the same ten as the 1341-revision read recorded further down, every
+   row added since being partial — those ten arrive under **two** labels:
+   `patch` 9/9 and `operator_model_pin` 1/1, a fourth writer with a single row
+   (`2026-07-13T05:00:19.929Z`) that nobody enumerating the high-volume
+   sources would have met, against `ci:docker-agent.yml` 959/0 and
+   `auto-retry-on-completion` 400/0. So the shape test is load-bearing in
+   **both** directions: a reader filtering the full side on `source ==
+   "patch"` hits the same defect from the other end, and a measurement that
+   enumerates only the labels it happens to have seen under-counts on
+   whichever side it was not looking at. An earlier pass over this seat
+   concluded "only `patch` is full" for exactly that reason.
+   **Corollary, because the citation below is wrong about this:** `PEN-5321`'s
+   description groups "`patch` / CI revisions" together as full row snapshots.
+   `patch` rows are full; **CI rows are not** — they are this writer's partial
+   rows under a CI label. Do not carry that grouping forward.
+3. **A `// {}` fallback on a key you have not confirmed exists manufactures an
+   observation.** The fallback cannot tell "stored empty" from "no such key", so
+   a typo or a guessed name is answered with a value that reads as a real
+   reading of an empty config. The known instances are a naming split and a
+   guess: the column is `runtimeConfig` and `runtime_config` has never existed
+   (`jq '.beforeConfig.runtime_config // {}'` is how `PEN-5321`'s first pass
+   briefly reported an untracked write on a seat that had none), and on the
+   activity log the actor is `actorId`, so `.actorUserId // "-"` reports an
+   absent actor for every row. Neither is a fact about those two key names; it is
+   a property of `// fallback` over any unverified key. The positive control is
+   cheap — re-read with the key you believe is correct and watch a non-empty
+   value appear; if it stays empty under both spellings, *then* it is a reading.
+
+### The partial-snapshot `{}`: decided, and not with a `withheldFields` marker
+
+`PEN-5321` asked whether the `{}` on this endpoint warrants the
+withheld-is-not-absent treatment `PEN-5230` gave `redactForRestrictedAgentView`.
+**It does not, and giving it one would have been wrong** — but the filter rule
+above was not sufficient either, so the answer is a third thing.
+
+The signature was identical and the cause was not. On the peer projection the
+`{}` is a **redaction**: the value exists, the reader is not entitled to it, and
+the missing fact is about the *reader* — so a constant `withheldFields` /
+`withheldByAction` pair states it while disclosing nothing about the subject.
+Here nothing is withheld from anybody. The missing fact is *what the write
+covered*, which is a property of the row, and the row already states it in
+`changedKeys`. A `withheldFields` marker would have asserted a withholding that
+never happened.
+
+What was actually wrong is that `redactRevisionSnapshot` **assigned
+`adapterConfig`, `runtimeConfig` and `metadata` unconditionally**, so a partial
+snapshot was answered with keys the writer had never looked at. That is a
+fabrication, not a projection, and `{}` is a legal stored value for both config
+columns, so it was indistinguishable from an observation. It now reshapes only
+the keys the stored snapshot actually carries; absent stays absent. The value
+gate is untouched — a *present* but non-plain-object config is still contained
+to `{}` rather than emitted uncontained, which is the fail-closed half of that
+function.
+
+**That reading of absence rests on an invariant, and it is cheaper to state than
+to rediscover: absent means not-stored only while containment masks values and
+never DROPS keys.** It holds today, deliberately — `sanitizeRecord`
+(`redaction.ts`) and `maskAgentWorkspaceStrategyCommandsInner`
+(`agent-redaction.ts`) both iterate every entry and re-assign through
+`assignRecordKey`, specifically so a `__proto__` own key off `JSON.parse`
+survives as data instead of being dropped (`PEN-4240`). The moment a redactor
+starts *removing* a key, a containment-caused absence becomes byte-identical to
+a write-didn't-cover-it absence: `changedKeys` and the emitted key set disagree,
+and nothing in the response says which of the two is right. The presence gate
+already survives that **mechanically** — it asks `contained`, the object this
+function emits, rather than `snapshot` — but surviving a change and still
+meaning the same thing afterwards are different properties, and only the first
+is enforced by the code. The mask site states the rule for its own walk; this is
+where it becomes load-bearing for a reader reconciling a snapshot against
+`changedKeys`.
+
+One genuinely ambiguous state here is older than any of this and is not closed
+by it: the `isPlainObject(snapshot)` early return answers `{}` for a *whole*
+snapshot, which is indistinguishable from a snapshot that stored nothing. It is
+unreachable from `jsonb` today — `JSON.parse` yields only `Object.prototype`
+objects — which is why it stays a comment at the call site rather than a marker.
+
+The naming split is fixed at the source rather than papered over on read:
+`patchAgentImage` now writes its snapshot under `adapterConfig`, matching the
+`changedKeys` on the same row and every other reader of the table. Rows written
+before that change keep the old `adapter_config` key and rule 1 does not work on
+them; there is no backfill.
+
+State the scope of that as a number rather than as a caveat: the fix is
+**forward-only**, so `changedKeys` becomes a sound coverage declaration only for
+rows written after it. On the measured `Cto` seat that leaves **1302 of 1324
+existing revisions (98%) unreadable by rule 1** — they declare `adapterConfig`
+and store `adapter_config` — and the same ratio holds on the `Ceo` seat (1331 of
+1341). The back-catalogue stays unreadable by the documented procedure. A reader
+who needs a pre-rename row must fall back to reading `adapter_config` directly,
+and must not conclude from rule 1's silence that the column never moved.
+
+One consequence of partial snapshots is unchanged and is recorded here so it is
+not rediscovered as a regression: **"Restore" on a partial revision answers
+422.** `configPatchFromSnapshot` requires `name`, `role`, `adapterType` and
+`budgetMonthlyCents`, and a partial snapshot carries none of them. That was true
+before the key rename and is true after it.
+
+### Not fixed here
+
+Making the bypassing writers record is a behaviour change per path and is
+deliberately not bundled with this description. It is tracked in two rows:
+**`PEN-5332`** inverts the recording default and brings the four non-budget
+bypassing writers (plus `agentService.create`) onto it, and **`PEN-5333`** covers
+the two budget mirrors below. `PEN-5332` goes first — not because budget matters
+less, but because an unrecorded budget write is still recoverable from
+`activity_log` (see above) while an unrecorded `runtimeConfig` write is blind on
+both surfaces at once.
+
+**The lock order is not what stops the budget mirrors**, though it is the
+plausible wrong answer and was the one this section first reached for. The
+mirror inside `upsertPolicy` already issues its `UPDATE agents` *after* that
+function's own policy write, so the pair order there is already policy → agent.
+Replacing it in place with
+`agentService.update(..., { recordRevision })` takes the same agent row lock at
+the same point and adds an insert into `agent_config_revisions`, which holds no
+policy lock — nothing moves ahead of the policy lock and the `BLO-32796` rule is
+not violated. The two call sites that *do* record would not produce duplicate
+rows either: each writes the equal value first, so `diffConfigSnapshot` returns
+an empty `changedKeys` and the `changedKeys.length > 0` guard in
+`agentService.update` skips the second insert. Anyone picking this gap up should
+not be warned off by a deadlock that is not there.
+
+The real cost is semantics and attribution. `agentService.update` is not a thin
+setter: it throws `conflict` when the target is `pending_approval` and the patch
+moves any `CONFIG_REVISION_FIELDS` column, and `budgetMonthlyCents` is one — so
+a policy upsert naming a not-yet-approved hire, reachable through
+`POST /companies/:id/budgets/policies`, would begin answering 409
+`pending_approval_agent_config_frozen` from inside a budget write. And
+`upsertPolicy` receives only `actorUserId`, so `createdByAgentId` would be null
+on every row it produced until the callers thread an agent actor through. Both
+are tractable; both are behaviour changes, which is why they are a design row
+(`PEN-5333`) rather than a queued fix.
 
 ## Regression tests
 
@@ -656,6 +1198,58 @@ asymmetry then needs its own answer.
 - `server/src/__tests__/agent-secret-redaction.test.ts` — `agent metadata
   containment on the spread-based redactors`: both projections, including that
   the restricted one is reached via a **peer** row.
+
+- `server/src/__tests__/agent-secret-redaction.test.ts` — `agent workspace
+  command withholding (PEN-5225)`: the peer case with `agent_config:read`
+  **allowed** and `workspace_runtime:read` denied (the shipped bug is invisible
+  to a mock that answers one boolean for both), self-read masked, an entitled
+  reader still disclosed, the list and `/configuration` routes, the
+  `modelProfiles` nesting, `null`-vs-sentinel-vs-absent, a non-object
+  `workspaceStrategy`, and the `PATCH` round-trip restoring the stored command
+  instead of persisting the sentinel.
+  Three round-trips are pinned, not one, because each reaches a different
+  restore function: the top-level config
+  (`stripRedactedEnvBindingsFromAdapterConfig`), the `modelProfiles.*`
+  nesting (`restoreRedactedRuntimeConfigValues`), and the whole-value sentinel
+  a non-object `workspaceStrategy` is masked to.
+  Two further cases in that block (`PEN-5321`) pin the **`/config-revisions`
+  pair** — the last of the three `containAgentConfig` call-site families with no
+  coverage of this gate: `withholds the commands from BOTH snapshots` on the
+  detail route, and `discloses the commands to a reader that clears
+  workspace_runtime:read` on the list route. Both directions are present
+  because one dropped argument reaches both failures and the unentitled case
+  alone cannot tell them apart. Verified by mutation against this head:
+  dropping the `viewer` argument at the call site fails only the **entitled**
+  case (every reader then gets `containAgentConfig`'s withheld default —
+  fail-closed, but a product regression), while leaving `beforeConfig`
+  uncontained fails only the **unentitled** one. The route needs its own pin
+  because the stored bytes are not masked: `COMMAND_PAYLOAD_KEY_RE` is anchored
+  and does not match `provisionCommand`, and `buildConfigSnapshot` stores
+  `adapterConfig` whole, so `agent_config_revisions.before_config/after_config`
+  hold the shell text verbatim by design and the viewer gate is the only thing
+  withholding it from a readership that cannot hold `workspace_runtime:read`
+  at all (`PEN-2852`).
+- `server/src/__tests__/redaction.test.ts` — `hire_agent approval payload
+  workspace-command withholding (PEN-5225)`: the shared projection itself —
+  both copies of the config in the card, the `modelProfiles` nesting, the
+  withheld-by-default polarity, the two gates staying independent and
+  distinguishable, and a non-hire card left untouched.
+- `server/src/__tests__/approval-agent-config-authz-routes.test.ts` —
+  `hire_agent approval reads withhold host-executed workspace commands
+  (PEN-5225)`: the same question at the route layer, for the reader that
+  clears `agent_config:read` and not `workspace_runtime:read`, on
+  `GET /approvals/:id`, the company list, and a resolution response, with a
+  board reader still disclosed. The `workspaceStrategy` carrier sits on the
+  file's **shared** fixture, so every case in it would catch a re-disclosure.
+
+- `server/src/__tests__/agent-secret-redaction.test.ts` — `does not manufacture
+  config keys a PARTIAL revision snapshot never stored`, and its fail-closed
+  twin `still contains a stored but non-plain-object config to {}`. The pair is
+  the point: the first pins that absent stays absent, the second that the
+  containment it sits next to was not weakened to get there.
+- `server/src/__tests__/agent-image-bump.test.ts` — `writes the revision
+  snapshot under the camelCase column name`: the key the row declares in
+  `changedKeys` is the key its snapshot carries, and the snapshot stays partial.
 - `server/src/__tests__/agent-permissions-routes.test.ts` — ``the peer `{}`
   says it was withheld (PEN-5230)``, which pins the right-hand matrix column:
   the markers on both peer routes, **absent** on the viewer's own row and for a
@@ -664,3 +1258,4 @@ asymmetry then needs its own answer.
   the disclosure-budget proof — whole-body equality between the two subjects,
   behind positive controls so it cannot pass against a build with the markers
   stripped. On `master` since 2026-11-02.
+

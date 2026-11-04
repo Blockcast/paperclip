@@ -14,7 +14,7 @@
 import { randomUUID } from "node:crypto";
 import { sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { agents, companies, createDb } from "@paperclipai/db";
+import { agents, companies, createDb, heartbeatRuns } from "@paperclipai/db";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
   AGENT_ERROR_DURATION_SECONDS_METRIC,
@@ -184,6 +184,32 @@ describeEmbeddedPostgres("agent-liveness gauges (BLO-23413)", () => {
 
     // Never-heartbeated agent anchors its age on createdAt, not omitted.
     expect(await gaugeValue(AGENT_HEARTBEAT_AGE_SECONDS_METRIC, neverHeartbeated)).toBe(500);
+  });
+
+  it("BLO-47549: an in-flight run emitting output keeps age fresh; a hung run still ages", async () => {
+    const now = new Date("2026-08-11T12:00:00Z");
+    const cfg = { heartbeat: { enabled: true, intervalSec: 600 } };
+    // lastHeartbeatAt is stamped at run FINISH, so both agents read 2400s
+    // (> 3x600) from the agents row alone.
+    const lastFinish = new Date(now.getTime() - 2400_000);
+    const liveAgent = await seedAgent({ runtimeConfig: cfg, lastHeartbeatAt: lastFinish, updatedAt: now });
+    const hungAgent = await seedAgent({ runtimeConfig: cfg, lastHeartbeatAt: lastFinish, updatedAt: now });
+    const runningSince = new Date(now.getTime() - 1900_000);
+    await db.insert(heartbeatRuns).values([
+      { companyId, agentId: liveAgent, invocationSource: "timer", status: "running",
+        startedAt: runningSince, lastOutputAt: new Date(now.getTime() - 30_000) },
+      { companyId, agentId: hungAgent, invocationSource: "timer", status: "running",
+        startedAt: new Date(now.getTime() - 2300_000), lastOutputAt: new Date(now.getTime() - 2000_000) },
+    ]);
+
+    await heartbeat.publishAgentLivenessGauges(now);
+
+    expect(await gaugeValue(AGENT_HEARTBEAT_AGE_SECONDS_METRIC, liveAgent)).toBe(30);
+    // Must-trip control: a running row whose output went quiet must not mask a
+    // dark agent -- its age tracks that last output and still clears 3x interval.
+    const hungAge = await gaugeValue(AGENT_HEARTBEAT_AGE_SECONDS_METRIC, hungAgent);
+    expect(hungAge).toBe(2000);
+    expect(hungAge!).toBeGreaterThan(3 * 600);
   });
 
   it("reset-then-sets: a deleted/disabled agent drops off the gauge on the next pass rather than freezing stale", async () => {

@@ -62,6 +62,13 @@ on:
     # expensive path, NOT with any threshold, so unlike review-gate-sweep.yml
     # there is no predicate-level cut to claim.
     #
+    # PEN-5442 adds one term to that floor: the merge states moved out of the
+    # listing into their own paginated GraphQL read, so the `1 pr list` above
+    # is now `1 pr list + ceil(open / MERGE_STATE_PAGE_SIZE)` — at 54 open PRs
+    # on this repo, 3 extra requests. It buys a read that works at all on a
+    # repo with >=100 open PRs, where the single combined call 502'd on 3 of 3
+    # attempts (measured against Blockcast/penstock-llm-proxy-core at 153).
+    #
     # ⚠ 97 is INVOCATIONS, which is a FLOOR on HTTP requests: 60 of them carry
     # `--paginate` and a long thread costs a request per page. The obvious
     # cross-check does not settle it either — the `rate_limit` delta over that
@@ -131,4 +138,15 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           LAND_CLEAN_PRS_REPO: ${{ github.repository }}
+          # PEN-5430 deliberately does NOT set LAND_CLEAN_PRS_NOTIFY_REPO here,
+          # and adding it would not work. The notify list exists so the
+          # `--apply` landing routine can post CODEOWNER_REQUEST_MARKER in a
+          # human-gated repo without acquiring the ability to land in it. This
+          # arm runs on `secrets.GITHUB_TOKEN`, which GitHub scopes to the
+          # workflow's own repository, so every sibling repo named in either
+          # list 403s regardless of which list it is in. Widening the sweep
+          # from Actions needs a cross-repo App credential first.
+          #
+          # It is also the wrong arm on purpose: this job is a DETECTOR and
+          # makes no writes (see the header), while a notification IS a write.
         run: node scripts/land-clean-prs.mjs --alarm

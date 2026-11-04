@@ -133,12 +133,250 @@ test("arm 1: a file named ONLY in a whole-line comment is still unregistered", (
   assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
 });
 
-test("arm 1: an inline `#` inside a run block is shell, not a comment", () => {
-  // Only WHOLE-LINE comments are stripped; stripping inline `#` would discard
-  // real shell and make a registered file read as unregistered.
+test("arm 1: a path BEFORE an inline `#` is real shell and still registers", () => {
+  // The half of an inline-comment line that precedes the `#` is a command, so
+  // stripping the comment must not cost this registration. This is the
+  // fail-CLOSED direction of the PEN-5282 fix and the reason it is anchored at
+  // the `#` rather than dropping the whole line.
   assert.deepEqual(
     errorsFor(
       world({ workflows: ["        run: node --test scripts/a.test.mjs # pinned\n"] }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a file named only AFTER an inline `#` is a comment, not a run", () => {
+  // PEN-5282 shape 1, fail-OPEN before the fix: the command is `echo hi`, which
+  // runs nothing, yet the trailing path read as a registration. Reverting
+  // `stripInlineComment` fails here.
+  const errors = errorsFor(
+    world({ workflows: ["        run: echo hi # scripts/a.test.mjs\n"] }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: an inline `#` in a `run: |` BODY line is a comment too", () => {
+  // Same shape one level in. The body of a block scalar is shell, where `#`
+  // starts a comment exactly as it does on the inline form.
+  const errors = errorsFor(
+    world({
+      workflows: ["        run: |\n          echo hi # node --test scripts/a.test.mjs\n"],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a block indicator followed by a comment still opens a block", () => {
+  // `run: | # why` is legal YAML: the comment follows the indicator rather
+  // than replacing it. The indicator is therefore tested AFTER the comment is
+  // stripped, so the body is still slurped and still registers what it names.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: ["        run: | # see PEN-5272\n          node --test scripts/a.test.mjs\n"],
+      }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a `#` INSIDE a token is not a comment and truncates nothing", () => {
+  // The strip is anchored to a `#` at a word boundary, so an action pin, a URL
+  // fragment or a `--grep '#tag'` does not eat the rest of the command. A
+  // naive split on the first `#` would lose this registration.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: [
+          "        run: curl -sf https://example.test/a#frag && node --test scripts/a.test.mjs\n",
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a `run:` nested under `with:` is an action input, not a run step", () => {
+  // PEN-5282 shape 2, fail-OPEN before the fix. `run` here is an INPUT to the
+  // action; the action decides whether it is ever executed, and most never
+  // execute it as a shell command. Reverting the `withIndent` anchor fails here.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "jobs:\n  a:\n    steps:\n      - uses: some/action@v1\n        with:\n          run: node --test scripts/a.test.mjs\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a `with:` carrying a trailing comment still anchors its inputs", () => {
+  // PEN-5282 shape 2, variant 1 -- fail-OPEN until the `\s*$` anchor was
+  // dropped from the `with:` detector. `with: # inputs` is an ordinary, common
+  // shape; the trailing comment defeats that anchor, so `withIndent` was never
+  // set and every nested input registered. What this pins is the ABSENCE of
+  // the right-hand anchor: re-add `\s*$` to the `withKey` pattern in
+  // `runCommands` and this goes green-to-red. It does NOT pin a comment strip
+  // -- that detector reads the raw line on purpose, for the reason given in
+  // the comment above it -- so do not go looking for one. Cited by SYMBOL and
+  // not by line: the first version of this comment carried line numbers that
+  // a later commit in this same PR had already invalidated. Found by Ally on
+  // #3281, and both the stale wording and the stale refs on later heads.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "jobs:\n  a:\n    steps:\n      - uses: some/action@v1\n        with: # inputs\n          run: node --test scripts/a.test.mjs\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: `with` as the FIRST key of a step list item anchors its inputs", () => {
+  // PEN-5282 shape 2, variant 2 -- fail-OPEN until `-?` was added. `- with:`
+  // is `with` as the opening key of a step list item; the bare `/^\s*with:/`
+  // form never matched it, so the nested input registered. Drop the `-?` and
+  // this test fails. Found by Ally on #3281.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "jobs:\n  a:\n    steps:\n      - with:\n          run: node --test scripts/a.test.mjs\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a `with:` nested INSIDE a `with:` block does not move the anchor", () => {
+  // PEN-5282 shape 2, variant 4 -- fail-OPEN, and subtler than the others:
+  // the anchor is set the whole time, it just points at the wrong block. An
+  // action input literally named `with` overwrote `withIndent` with its own
+  // deeper column; the next line back at the OUTER input depth then tripped
+  // the dedent clear, reset the anchor to null, and every later sibling input
+  // registered. Keeping the OUTERMOST anchor makes the nested key just another
+  // input. Drop the `withIndent === null` guard and this test fails.
+  // Found by Ally on #3281.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "jobs:\n  a:\n    steps:\n      - uses: a/b@v1\n        with:\n          with:\n            x: 1\n          run: node --test scripts/a.test.mjs\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a following step's `run:` still registers after a nested `with:`", () => {
+  // Companion to the test above: `withIndent === null` must not turn the
+  // anchor into a latch that eats the next step's real command.
+  //
+  // ⚠ This pins NO MUTANT, and the honest name for it is a regression guard.
+  // An earlier version of this comment claimed it pinned the dedent clear; it
+  // does not, and Ally measured that. Deleting the clear fails only `a
+  // step-level run: still registers after a JOB-level with: closes`, which is
+  // the clear's real witness. The reason is structural rather than a weak
+  // fixture: the clear only bites when a LATER `run:` is DEEPER than the
+  // `with:` that anchored, and a step's own keys sit at or shallower than its
+  // own `with:` -- so no step-level shape can exercise it. Ally's suggested
+  // repair (a sibling `run:` at the `with:` column) was probed in both
+  // constructible forms, list item and mapping key, and both are vacuous for
+  // the same reason. Only a JOB-level `with:` above deeper step `run:`s works.
+  //
+  // Kept anyway: it is cheap and it is the shape a latching "fix" for variant
+  // 4 would break first. Do not read it as coverage of the clear.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: [
+          "jobs:\n  a:\n    steps:\n      - uses: a/b@v1\n        with:\n          with:\n            x: 1\n      - run: node --test scripts/a.test.mjs\n",
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a multi-line flow `with: {` anchors the inputs below it", () => {
+  // PEN-5282 shape 2, variant 3 -- fail-OPEN while the `with:` detector was
+  // anchored with `\s*$`. A flow mapping opened on the `with:` line puts its
+  // inputs on the lines BELOW it, so the anchored form never fired and every
+  // one of them registered. Found by probing the mutant Ally's review on
+  // #3281 left surviving: re-add the `\s*$` anchor and only this test fails.
+  const errors = errorsFor(
+    world({
+      workflows: [
+        "jobs:\n  a:\n    steps:\n      - uses: some/action@v1\n        with: {\n          run: node --test scripts/a.test.mjs\n        }\n",
+      ],
+    }),
+  );
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /arm 1: scripts\/a\.test\.mjs/);
+});
+
+test("arm 1: a flow `with: {a: 1}` closed on its own line releases the step run", () => {
+  // Companion to the test above: dropping the `\s*$` anchor must not LATCH on
+  // a flow mapping that closes on its own line. The step's real `run:` follows
+  // at a shallower indent, so the dedent clear ends the block and it still
+  // registers. Without this, variant 3 could be "closed" by a latch that
+  // silently eats real commands -- trading a fail-open for a fail-closed.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: [
+          "jobs:\n  a:\n    steps:\n      - uses: some/action@v1\n        with: {a: 1}\n      - run: node --test scripts/a.test.mjs\n",
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a sibling `run:` of a `- with:` step is a real command and registers", () => {
+  // Pins WHICH column `- with:` anchors on, which the two tests above do not:
+  // both pass whether the anchor is the `with` TOKEN column (8) or the DASH
+  // column (6), because the nested input at 10 is deeper than either. Here the
+  // step's own `run:` sits at the `with` column -- it is a SIBLING key of
+  // `with`, so it is a real step command. Anchor on the dash and 8 > 6 skips
+  // it, losing a genuine registration (fail-CLOSED). Mutate
+  // `withKey[1].length` to `indent` and only this test fails.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: [
+          "jobs:\n  a:\n    steps:\n      - with:\n          input-a: x\n        run: node --test scripts/a.test.mjs\n",
+        ],
+      }),
+    ),
+    [],
+  );
+});
+
+test("arm 1: a step-level `run:` still registers after a JOB-level `with:` closes", () => {
+  // The anchor is scoped to the enclosing `with:`, not latched for the rest of
+  // the file. This is the shape that makes the dedent clear load-bearing, and
+  // it is a real one: a reusable-workflow call puts `with:` at JOB indent (4),
+  // shallower than any step `run:` (8) in every job after it --
+  // `.github/workflows/release.yml` does exactly this, twice. Drop the clear
+  // and every `run:` body below the first such call is silently discarded.
+  //
+  // Note the sibling-step form (`with:` and `run:` at the SAME indent) does NOT
+  // exercise this: there `indent > withIndent` is already false, so it passes
+  // with or without the clear. It has to be a DEEPER `run:` after a shallower
+  // `with:` or the fixture is vacuous.
+  assert.deepEqual(
+    errorsFor(
+      world({
+        workflows: [
+          "jobs:\n  verify:\n    uses: ./.github/workflows/release-verify.yml\n    with:\n      ref: main\n  unit:\n    steps:\n      - name: unit\n        run: node --test scripts/a.test.mjs\n",
+        ],
+      }),
     ),
     [],
   );

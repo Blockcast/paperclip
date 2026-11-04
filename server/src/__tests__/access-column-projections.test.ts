@@ -76,6 +76,51 @@ describe("access service column projections", () => {
     const serverSrc = fileURLToPath(new URL("..", import.meta.url));
     const TABLES = ["companyMemberships", "principalPermissionGrants"] as const;
 
+    // The scan's two patterns and its `.returning()` probe are built HERE, so the
+    // positive control below can exercise the very construction the scan runs. A
+    // control that re-declares its own copy asserts a DIFFERENT regex than the one
+    // that ships, and drifts from it on the next edit — which is the same vacuity
+    // this control exists to catch, one level up. Refs PEN-5318.
+    //
+    // Fresh objects on every call, deliberately. `bareSelect` and `mutation` carry
+    // `g`: `matchAll` is safe to repeat on one instance (it clones internally),
+    // but `test`/`exec` advance `lastIndex` and would start returning false on a
+    // string that does match. Handing out a new object per call means a future
+    // edit that reaches for `test` here cannot acquire that false negative.
+    const patternsFor = (table: string) => ({
+      bareSelect: new RegExp(`\\.select\\(\\s*\\)\\s*\\.from\\(\\s*${table}\\s*\\)`, "g"),
+      mutation: new RegExp(`\\.(?:update|insert|delete)\\(\\s*${table}\\s*\\)`, "g"),
+      // A bare `.returning()` hands back the whole row just as a bare `.select()`
+      // does; `ensureMembership` was the live instance of this.
+      bareReturning: /\.returning\(\s*\)/,
+    });
+
+    // EVERY step that decides whether a bare `.returning()` is reported lives in
+    // here, not just the regex: the mutation match, the `start` it yields, and the
+    // `start` -> `";"` slice that is all `bareReturning` ever sees. The scan below
+    // and the positive control both call THIS, so a regression in any of those
+    // steps fails the control instead of silently emptying `findings`.
+    //
+    // Mutating the slice terminator `";"` to `")"` is the worked case: the slice
+    // stops at `.insert(companyMemberships`, the probe goes false, and the scan
+    // can never report a bare `.returning()` again. Probing `bareReturning`
+    // straight at a whole literal does NOT catch that — it leaves the slicing
+    // step outside the control, which is the gap PEN-5361 closed. Refs PEN-5318
+    // (the regex half), PEN-5361 (this, the glue half).
+    const bareReturningHits = (text: string, table: string): number[] => {
+      const { mutation, bareReturning } = patternsFor(table);
+      const starts: number[] = [];
+      for (const match of text.matchAll(mutation)) {
+        const start = match.index ?? 0;
+        const end = text.indexOf(";", start);
+        const statement = text.slice(start, end === -1 ? text.length : end);
+        if (bareReturning.test(statement)) {
+          starts.push(start);
+        }
+      }
+      return starts;
+    };
+
     const sourceFiles = (dir: string): string[] =>
       readdirSync(dir).flatMap((entry) => {
         const full = join(dir, entry);
@@ -92,21 +137,14 @@ describe("access service column projections", () => {
       const hits: string[] = [];
 
       for (const table of TABLES) {
-        const bareSelect = new RegExp(`\\.select\\(\\s*\\)\\s*\\.from\\(\\s*${table}\\s*\\)`, "g");
+        const { bareSelect } = patternsFor(table);
+
         for (const match of text.matchAll(bareSelect)) {
           hits.push(`${where(match.index ?? 0)} bare .select() on ${table}`);
         }
 
-        // A bare `.returning()` hands back the whole row just as a bare
-        // `.select()` does; `ensureMembership` was the live instance of this.
-        const mutation = new RegExp(`\\.(?:update|insert|delete)\\(\\s*${table}\\s*\\)`, "g");
-        for (const match of text.matchAll(mutation)) {
-          const start = match.index ?? 0;
-          const end = text.indexOf(";", start);
-          const statement = text.slice(start, end === -1 ? text.length : end);
-          if (/\.returning\(\s*\)/.test(statement)) {
-            hits.push(`${where(start)} bare .returning() on ${table}`);
-          }
+        for (const start of bareReturningHits(text, table)) {
+          hits.push(`${where(start)} bare .returning() on ${table}`);
         }
       }
       return hits;
@@ -114,6 +152,58 @@ describe("access service column projections", () => {
 
     it("finds no bare .select() or .returning()", () => {
       expect(findings).toEqual([]);
+    });
+
+    it("the scan's own patterns and slicing still flag a known-bad query", () => {
+      // The vacuity guard below proves the walk REACHED the files. This proves
+      // the scan can still FIRE on what it exists to find — the other half, and
+      // the one that is indistinguishable from success when it breaks: an
+      // escaping mistake, a changed query-builder idiom, or a regressed
+      // statement slice leaves `findings` permanently `[]`, and "finds no bare
+      // .select() or .returning()" goes on passing while guarding nothing.
+      //
+      // Driven off TABLES, so a table added to the scan is covered here too
+      // rather than silently acquiring an untested pattern. The known-bad
+      // literals are safe to keep in this file and nowhere else: `sourceFiles`
+      // skips `__tests__` and `.test.ts`, so the scan cannot read them back as
+      // real findings.
+      //
+      // Both this loop and the scan's iterate TABLES, so an empty TABLES would
+      // make BOTH vacuous at once — the exact shape this control exists to deny.
+      expect(TABLES.length).toBeGreaterThan(0);
+
+      for (const table of TABLES) {
+        const { bareSelect, mutation } = patternsFor(table);
+        const bareRead = `const rows = await db.select()\n      .from(${table});`;
+        const bareWrite = `await db.insert(${table}).values({}).returning();`;
+        // A `.returning()` in a LATER statement must NOT be attributed to this
+        // mutation. That is what the slice is FOR, and it takes its own literal:
+        // `bareWrite` alone cannot see a slice that was dropped altogether,
+        // because it reads one hit with or without one.
+        const boundedWrite = `await db.insert(${table}).values({});\nawait tx.returning();`;
+
+        // Both `.returning()` figures go through `bareReturningHits`, NOT straight
+        // at a literal: the slice decides what the probe ever sees, so testing the
+        // regex alone leaves it unguarded. The two literals pin it from opposite
+        // sides — measured against the shipped construction, cutting the slice
+        // short (`";"` -> `")"`) takes `bareReturning` 1 -> 0, and removing the
+        // slice takes `bareReturningBounded` 0 -> 1. Neither mutant is visible to
+        // the other literal. Counting hits rather than asserting a boolean also
+        // pins double-reporting. Refs PEN-5361.
+        expect({
+          table,
+          bareSelect: [...bareRead.matchAll(bareSelect)].length,
+          mutation: [...bareWrite.matchAll(mutation)].length,
+          bareReturning: bareReturningHits(bareWrite, table).length,
+          bareReturningBounded: bareReturningHits(boundedWrite, table).length,
+        }).toEqual({
+          table,
+          bareSelect: 1,
+          mutation: 1,
+          bareReturning: 1,
+          bareReturningBounded: 0,
+        });
+      }
     });
 
     it("actually scanned the files it claims to cover", () => {

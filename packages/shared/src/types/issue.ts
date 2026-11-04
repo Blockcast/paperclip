@@ -423,27 +423,22 @@ export interface IssueBlockerAttention {
   sampleBlockerIdentifier: string | null;
   sampleStalledBlockerIdentifier: string | null;
   /**
-   * PEN-5105, OBSERVATION ONLY. How many of this row's top-level blockers reached
-   * `covered` through the human-assigned arm specifically -- `assigneeUserId` set and
-   * status not `cancelled`, which covers unconditionally with no staleness term.
+   * PEN-5105. How many of this row's top-level blockers reached `covered` through the
+   * human-assigned arm specifically -- `assigneeUserId` set, status not `cancelled`, and
+   * (since the conjunct landed) either idle under `HUMAN_ASSIGNED_BLOCKER_STALE_HOURS` or
+   * held by a live deliberate park.
    *
-   * This is NOT a subset you can derive from `coveredBlockerCount`: a blocker also
-   * reaches `covered` by being `done`, by carrying a pending interaction, by holding a
-   * live run/monitor/park, or by the downstream recursion. Only this arm is unbounded in
-   * time, so only this count sizes the population a staleness conjunct would touch.
+   * This is NOT a subset you can derive from `coveredBlockerCount`: a blocker also reaches
+   * `covered` by being `done`, by carrying a pending interaction, by holding a live
+   * run/monitor/park, or by the downstream recursion.
    *
-   * **It is an UPPER BOUND on what a staleness conjunct would un-cover, not an exact
-   * count.** This arm returns BEFORE the `in_review` arm, the downstream recursion and the
-   * leaf monitor/run/park checks. A blocker that failed a new staleness conjunct here would
-   * fall through to those arms, and any of them may still cover it. So the true delta is
-   * `<=` this number. That is the safe direction for sizing a blast radius -- it can only
-   * overstate the flood -- but read it as "depends on this arm", never as "would be
-   * un-covered". The exact figure needs a second classification pass with the arm disabled,
-   * which the PR that takes the conjunct has to compute anyway.
-   *
-   * It changes no `state`, no `reason` and no other count. It exists so the threshold in
-   * PEN-5105 can be chosen against a measured blast radius instead of a guess, and so the
-   * flood is measurable BEFORE it is taken.
+   * ⚠ A blocker that goes stale LEAVES this count, because it stops covering *here*. So the
+   * count no longer sizes "what a conjunct would un-cover" -- that question is settled --
+   * but remains an **UPPER BOUND on what a HIGHER threshold would un-cover**. A blocker that
+   * stops covering at this arm does not return: it falls through to the `in_review` monitor
+   * check, the `activeIssueIds` check and the downstream recursion, any of which may still
+   * cover it. The true delta is `<=` this number -- it can only overstate, which is the safe
+   * direction.
    */
   humanAssignedCoveredBlockerCount: number;
   /**
@@ -459,9 +454,9 @@ export interface IssueBlockerAttention {
    * That makes it useless for asserting attendance (`heartbeat.ts` rejects it for exactly
    * this reason: the run-finalization write would make every summary look fresh) but
    * correct for asserting its ABSENCE. Fresh does not prove a human attended; stale proves
-   * nothing touched the row at all, which is strictly stronger. A staleness conjunct only
+   * nothing touched the row at all, which is strictly stronger. The staleness conjunct only
    * ever acts on the stale side, so this clock can only UNDER-report staleness -- and
-   * under-reporting leaves a blocker `covered`, preserving today's behaviour. The error
+   * under-reporting leaves a blocker `covered`, preserving the prior behaviour. The error
    * direction is toward the status quo, never toward the flood.
    *
    * Consequence when reading the measurement: these spans are a LOWER BOUND on human
@@ -809,6 +804,43 @@ export interface IssueExecutionMonitorState {
   convergenceStalledAssigneeAgentId?: string | null;
   clearedAt: string | null;
   clearReason: IssueExecutionMonitorClearReason | null;
+  /**
+   * PEN-5343: the `nextCheckAt` the monitor was holding when it was cleared.
+   *
+   * Every other field of the armed monitor already survives a clear
+   * (`notes`, `attemptCount`, `maxAttempts`, `gateSignals`, plus
+   * `clearReason`/`clearedAt`), but the due time did not: the clear nulls
+   * `nextCheckAt` here and `monitorNextCheckAt` on the row, so the one fact
+   * that says *a wake was owed and when* was readable only by diffing the
+   * activity feed.
+   *
+   * That is the gap a cross-agent sweep falls into. `paperclip-plugin-
+   * alertmanager` cancels an alert row when its alert resolves and reopens it
+   * when the alert re-fires; each cancel clears the assignee's monitor
+   * (13 of 13 clears on PEN-4365 + PEN-4261 paired with a plugin cancel
+   * within 3-26 s, none of them ever fired). Reconstructing those nine rows
+   * took a 281-event feed pull per issue. With this field the row answers it
+   * directly.
+   *
+   * Three states, and they are not interchangeable:
+   *
+   * - a timestamp — a clear destroyed a wake owed at that time;
+   * - `null` — a clear ran and found nothing owed (also the value on an armed
+   *   or triggered monitor: neither owes anything forward);
+   * - **absent** — not recorded, because the row was cleared before this field
+   *   existed. This is deliberately *not* `null`: the validator keeps the key
+   *   optional rather than defaulting it, precisely so an old destroyed
+   *   monitor cannot read as a clean one.
+   *
+   * Attribution: on a row that has been cleared more than once this value
+   * belongs to the **first** clear, not to the `clearReason`/`clearedAt`
+   * beside it. A re-clear carries the original forward rather than
+   * overwriting it, so a monitor destroyed by a `cancelled` clear and later
+   * re-cleared as `done` keeps the due time the `cancelled` clear took. Read
+   * it as "the earliest wake this row is known to have lost", and take the
+   * activity feed if you need to attribute the loss to a specific clear.
+   */
+  clearedNextCheckAt?: string | null;
 }
 
 export interface IssueReviewRequest {

@@ -169,6 +169,20 @@ export const ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES = new Set([
   "caveman_proxy_not_ready",
   "k8s_pod_schedule_failed",
   "adapter_failed",
+  // PEN-5424: `run_log_unwritable` is the RENAME of the `adapter_failed` above
+  // at the `executeRun` catch site, for the case where the run log could not be
+  // opened. It inherits that membership for this set's own reason: the log is
+  // opened BEFORE the adapter is spawned, so the run never got to succeed or
+  // fail on its own merits and the assignee had no part in it. A literal like
+  // every other member — this module has no imports, and pulling in
+  // run-log-store.js would drag the storage provider graph in for one string.
+  //
+  // Deliberately NOT added to recovery/service.ts's
+  // TRANSIENT_INFRA_CONTINUATION_ERROR_CODES: that set schedules a RETRY, and a
+  // retry re-attempts an identical mkdir against an identical root. Infra-class
+  // routing and retryability are separate questions here, and this code answers
+  // them differently on purpose.
+  "run_log_unwritable",
   // BLO-35668: `skill_materialization_pending` (BLO-32055 / #1669) is not a new
   // fault — it is the RENAME of the `adapter_failed` directly above, at the one
   // claude-k8s emit site that names a skill-source fault

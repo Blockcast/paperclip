@@ -191,7 +191,12 @@ import {
   readRunLogTerminalTail,
   type RunLogTailRead,
 } from "./run-log-terminal-result.js";
-import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
+import {
+  getRunLogStore,
+  isRunLogUnwritableError,
+  RUN_LOG_UNWRITABLE_ERROR_CODE,
+  type RunLogHandle,
+} from "./run-log-store.js";
 import {
   deleteAgentJobExact,
   deleteAgentJobsForRun,
@@ -222,6 +227,7 @@ import {
 import {
   bindExternalRuntimeReservationIsolation,
   claimRunWithExternalRuntimeSlotPool,
+  type ExternalRuntimeClaimRefusal,
   ExternalRuntimeIsolationConflictError,
   ExternalRuntimeReservationReleasePendingError,
   externalRuntimeReservationCanRelease,
@@ -378,6 +384,7 @@ import {
   buildIssueMonitorTriggeredPatch,
   derivePersistedMonitorState,
   exhaustedMonitorClearReason,
+  issueAllowsMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
@@ -453,6 +460,7 @@ import {
   recordOrphanReapStage,
   recordConcurrentRunBlocked,
   recordAgentDispatchDeclined,
+  recordQueuedRunClaimRefused,
   recordDuplicateDispatchSuppressed,
   recordHeartbeatRunFailed,
   recordOrphanedManagedPodReaped,
@@ -481,7 +489,11 @@ import {
   recordTransientRetryFloorDisposition,
   recordDepBlockedRetryDispersion,
 } from "./metrics.js";
-import type { DispatchDeclineReason, TransientRetryFloorDisposition } from "./metrics.js";
+import type {
+  DispatchDeclineReason,
+  QueuedRunClaimRefusalArm,
+  TransientRetryFloorDisposition,
+} from "./metrics.js";
 import { runQuotaExhaustedHook } from "./quota-exhausted-hook.js";
 import { runLifecycleHook } from "./lifecycle-hook.js";
 import { mapAdapterToCcrotateTarget, mapPenstockProviderToCcrotateTarget } from "./ccrotate-target.js";
@@ -2630,6 +2642,45 @@ const SESSIONED_LOCAL_ADAPTERS = new Set([
   "pi_local",
 ]);
 const EXTERNAL_LIFECYCLE_ADAPTERS = new Set<string>(EXTERNAL_LIFECYCLE_ADAPTER_TYPES);
+
+/**
+ * A ranked candidate a dispatch pass could not take, and the screen that
+ * refused it (PEN-5316).
+ */
+export type QueuedRunClaimRefusalRecord = {
+  runId: string;
+  issueId: string | null;
+  arm: QueuedRunClaimRefusalArm;
+};
+
+/**
+ * Build the subject half of the `no_claimable_run` log line: the per-arm tally
+ * for the whole pass, plus the first `limit` refusals named individually.
+ *
+ * Module-level and pure so the join this PR exists to create — a refusal that
+ * carries its run id, against the claimable gauge's named subject — is
+ * testable without standing up a dispatch pass. The cap applies to the LOG
+ * only; `paperclip_queued_run_claim_refused_total` counted every refusal.
+ */
+export function summarizeQueuedRunClaimRefusals(
+  refusals: readonly QueuedRunClaimRefusalRecord[],
+  limit: number,
+) {
+  const safeLimit = Math.max(0, limit);
+  const refusalArmCounts: Record<string, number> = {};
+  for (const refusal of refusals) {
+    refusalArmCounts[refusal.arm] = (refusalArmCounts[refusal.arm] ?? 0) + 1;
+  }
+  return {
+    refusalArmCounts,
+    refusedRuns: refusals.slice(0, safeLimit).map((refusal) => ({
+      runId: refusal.runId,
+      issueId: refusal.issueId,
+      arm: refusal.arm,
+    })),
+    refusedRunsOmitted: Math.max(0, refusals.length - safeLimit),
+  };
+}
 // Fallback staleness window for external-lifecycle (k8s Job) runs when the
 // kube API is unavailable (local dev, RBAC misconfig, transient failure).
 // In-cluster the reaper uses listLiveAgentJobRunIds() to identify dead
@@ -14804,6 +14855,28 @@ export function resolveHeartbeatSchedulingSuppression(
   return { suppressed: false, reason: null };
 }
 
+/**
+ * Error codes that count toward the crashloop circuit breaker
+ * (`consecutiveAdapterFailedRuns`, read by the timer gate's
+ * `adapter_failed_circuit_breaker` arm).
+ *
+ * PEN-5424: `run_log_unwritable` rides this with `adapter_failed` because it
+ * REPLACED it at the `executeRun` catch site, and the breaker counter is
+ * reset-on-any-other-code — so a rename that stops here does not merely fail to
+ * enrol, it actively DISARMS the control. A run-log permission fault is the
+ * textbook case the breaker exists for: the retry re-attempts an identical
+ * mkdir against an identical root, so without this every timer tick spawns
+ * another doomed run and nothing ever bounds it. Leaving the code out of the
+ * two `adapter_failed` RETRY arms is deliberate (a retry buys nothing); leaving
+ * it out of the breaker was not, and is the opposite trade.
+ *
+ * Exported so the enrolment is assertable — BLO-35668's post-mortem notes that
+ * the sites a test cannot reach are exactly the ones a rename drifts at.
+ */
+export function countsTowardAdapterFailedCircuitBreaker(errorCode: string | null | undefined): boolean {
+  return errorCode === "adapter_failed" || errorCode === RUN_LOG_UNWRITABLE_ERROR_CODE;
+}
+
 export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) {
   // PEN-3328. The queued-run dispatch critical section's database work is made
   // cancellable by wrapping the postgres.js client, but that wrap is applied at
@@ -17016,6 +17089,162 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { outcome: "skipped" as const, reason: input.clearReason };
   }
 
+
+  /**
+   * PEN-3554 — every monitor re-arm on this path is a write to a row the
+   * dispatcher last saw several statements ago, so it has to re-check that the
+   * row can still be dispatched before it re-arms.
+   *
+   * `dispatchClaimedIssueMonitor` re-arms from three branches (a suppressed
+   * dispatch, a dependency-blocked park, and the watchdog's re-dispatch), and
+   * all three used to write `buildIssueMonitorDispatchRearmPatch` straight out
+   * on `where id = claimed.id`. `claimed` is a snapshot taken by the claim
+   * UPDATE, whose own filter admits only agent-assigned `in_progress`/
+   * `in_review` rows — so the branches were deciding deliverability off a value
+   * that was true at claim time and never re-read. A write committing between
+   * the claim and the re-arm (the cancel this row was filed for, a reassignment,
+   * a recovery park to `blocked`) is invisible to them, and the re-arm then
+   * persists a future `monitorNextCheckAt` onto a row no later tick can claim:
+   * the claim filter excludes it, so the column is undispatchable, while
+   * `hasActiveMonitorPath` reads it as a live wake path regardless. That is the
+   * casualty shape PEN-3326 removed from the budget-pause path, reintroduced
+   * one race over — a row reading attended on every field an observer checks
+   * while nothing will ever attend it.
+   *
+   * The cancel is the sharpest case because it is self-announcing: the gate
+   * that declines the wake does so BECAUSE the issue is cancelled
+   * (`pipeline_stage_exit_cancellation_pending`), so the branch re-arming
+   * afterwards is overwriting a verdict it was just handed. It is not the only
+   * case, which is why this is one helper rather than a `status === "cancelled"`
+   * special-case at one call site: the dependency-blocked branch is reachable on
+   * a cancelled row with FEWER preconditions than the suppressed one, since that
+   * gate additionally requires a running execution run carrying a
+   * pipeline-stage-exit marker.
+   *
+   * `SELECT … FOR UPDATE` rather than a CAS on the eligibility tuple. The
+   * backstop sweep uses a CAS because it reads and writes in separate
+   * statements and must tolerate losing the row; here the read exists only to
+   * decide this one write, so taking the row lock makes the decision and the
+   * write atomic instead of leaving a re-read window a CAS would still have.
+   *
+   * Three outcomes, and the third is the one PR #1910 declined to add inline:
+   *
+   *  - `landed` — still deliverable, re-armed. Unchanged behaviour.
+   *  - `cleared` — no longer deliverable AND still holding a `monitorNextCheckAt`,
+   *    i.e. some writer demoted the row without clearing its monitor. Cleared
+   *    with the reason the row's own status/assignee implies, through the same
+   *    primitive (`buildIssueMonitorEligibilityPatch`) and reported under the
+   *    same activity action (`issue.monitor_cleared_undeliverable`) as the
+   *    periodic backstop, so the two agree by construction rather than by
+   *    matching comments.
+   *  - `already_cleared` — no longer deliverable and `monitorNextCheckAt` is
+   *    ALREADY null. This is the ordinary shape of the cancel race, not an edge
+   *    case: a cancel routed through `issuesSvc.update` runs
+   *    `applyMonitorTransition`, which clears the monitor on the spot. The
+   *    correct repair is therefore to write nothing at all — the row is already
+   *    right, and the only defect was this path putting the column back.
+   *
+   * Deliberately NOT routed through `clearIssueMonitorAndRecover`. That helper
+   * also runs `performIssueMonitorRecovery`, which escalates to an owner wake or
+   * a recovery issue; a deliberately cancelled row is not a strand and must not
+   * summon anyone to it.
+   */
+  async function rearmClaimedIssueMonitorIfDeliverable(input: {
+    claimed: IssueMonitorDispatchRow;
+    rearmPatch: Record<string, unknown>;
+    /** The instant each call site already stamped; kept so this refactor is behaviour-preserving there. */
+    updatedAt?: Date;
+    actorType: "user" | "agent" | "system";
+    actorId: string;
+    agentId: string | null;
+    runId: string | null;
+    activitySource: "manual" | "scheduled";
+  }): Promise<
+    | { kind: "landed" }
+    // `clearReason` is present on both non-landed variants (null on
+    // `already_cleared`) so a caller can report the verdict without narrowing
+    // member by member.
+    | { kind: "cleared"; clearReason: string | null }
+    | { kind: "already_cleared"; clearReason: null }
+  > {
+    const outcome = await db.transaction(async (tx) => {
+      const [fresh] = await tx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.claimed.id))
+        .limit(1)
+        .for("update");
+      // The row was deleted under us. Nothing to re-arm and nothing to repair.
+      if (!fresh) return { kind: "already_cleared" as const, clearReason: null };
+
+      // Delegated, not restated. `issueAllowsMonitor` is the same predicate the
+      // claim filters and the backstop's SQL complement are written from, and
+      // `monitorClearReasonForIssue` returns non-null for every status it
+      // rejects — so "declines to re-arm" and "the backstop would have cleared
+      // this" cannot drift apart. Re-stating it here would make that agreement
+      // only as good as a test that notices it breaking (the BLO-24782 /
+      // PEN-2853 lesson, one predicate over).
+      if (issueAllowsMonitor(fresh.status, fresh.assigneeAgentId, fresh.assigneeUserId)) {
+        await tx
+          .update(issues)
+          .set({ ...input.rearmPatch, updatedAt: input.updatedAt ?? new Date() })
+          .where(eq(issues.id, fresh.id));
+        return { kind: "landed" as const };
+      }
+
+      const clearPatch = buildIssueMonitorEligibilityPatch(fresh);
+      // Empty patch means `monitorNextCheckAt` is already null — the cancel (or
+      // whatever else demoted the row) cleared the monitor itself. Writing here
+      // would only risk disturbing state that is already correct.
+      if (Object.keys(clearPatch).length === 0) return { kind: "already_cleared" as const, clearReason: null };
+
+      await tx
+        .update(issues)
+        .set({ ...clearPatch, updatedAt: new Date() })
+        .where(eq(issues.id, fresh.id));
+
+      return {
+        kind: "cleared" as const,
+        clearReason: (clearPatch.executionState as { monitor?: { clearReason?: string } } | null)
+          ?.monitor?.clearReason ?? null,
+        identifier: fresh.identifier,
+        companyId: fresh.companyId,
+        status: fresh.status,
+        nextCheckAt: fresh.monitorNextCheckAt?.toISOString() ?? null,
+        attemptCount: fresh.monitorAttemptCount ?? 0,
+        notes: fresh.monitorNotes,
+      };
+    });
+
+    // Logged outside the transaction, matching every other activity write in
+    // this service: `logActivity` publishes as well as inserting, and no caller
+    // in this file hands it a `tx`.
+    if (outcome.kind === "cleared") {
+      await logActivity(db, {
+        companyId: outcome.companyId,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        action: "issue.monitor_cleared_undeliverable",
+        entityType: "issue",
+        entityId: input.claimed.id,
+        details: {
+          identifier: outcome.identifier,
+          clearReason: outcome.clearReason,
+          status: outcome.status,
+          nextCheckAt: outcome.nextCheckAt,
+          attemptCount: outcome.attemptCount,
+          notes: outcome.notes,
+          source: input.activitySource,
+        },
+      });
+      return { kind: "cleared", clearReason: outcome.clearReason };
+    }
+    if (outcome.kind === "landed") return { kind: "landed" };
+    return { kind: "already_cleared", clearReason: null };
+  }
+
   async function dispatchClaimedIssueMonitor(
     claimed: IssueMonitorDispatchRow,
     input: {
@@ -17253,17 +17482,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           monitor: { ...monitor, nextCheckAt: retryCheckAt.toISOString() },
         });
         if (retryPolicy?.monitor) {
-          await db
-            .update(issues)
-            .set({
-              ...buildIssueMonitorDispatchRearmPatch({
-                issue: claimed,
-                policy: retryPolicy,
-                attemptCount: nextAttemptCount,
-              }),
-              updatedAt: input.now,
-            })
-            .where(eq(issues.id, claimed.id));
+          // PEN-3554: guarded. The watchdog re-arms after an explicit dispatch
+          // pass, which is a wider claim→write window than either deferral.
+          const rearm = await rearmClaimedIssueMonitorIfDeliverable({
+            claimed,
+            rearmPatch: buildIssueMonitorDispatchRearmPatch({
+              issue: claimed,
+              policy: retryPolicy,
+              attemptCount: nextAttemptCount,
+            }),
+            updatedAt: input.now,
+            actorType: input.actorType,
+            actorId: input.actorId,
+            agentId: input.agentId,
+            runId: input.runId,
+            activitySource: input.activitySource,
+          });
+          if (rearm.kind !== "landed") {
+            return { outcome: "skipped" as const, reason: rearm.clearReason ?? "monitor_undeliverable" };
+          }
           await logActivity(db, {
             companyId: claimed.companyId,
             actorType: input.actorType,
@@ -17329,16 +17566,36 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     //
     // One more return-null writer exists, and it is the only `durableSkipReason`
     // set outside the funnel at `enqueueWakeup`'s single skip helper:
-    // `pipeline_stage_exit_cancellation_pending`. It fires only on
-    // `issue.status === "cancelled"`, which the tick's own claim filter excludes
-    // (`in_progress`/`in_review`), so reaching it needs a cancellation to commit
-    // in the window between the claim and the gate. It is deliberately NOT
-    // special-cased here: the deferral is still the least-wrong answer, since the
-    // alternative on this path is the triggered patch that asserts a wake nobody
-    // queued. Known consequence, tracked separately — the re-arm leaves a future
-    // `monitorNextCheckAt` on a cancelled row, no later tick can claim it back
-    // (same status filter), and nothing else nulls that column on cancellation,
-    // so `hasActiveMonitorPath` reads a wake path that will never dispatch.
+    // `pipeline_stage_exit_cancellation_pending`. It needs three conjuncts, not
+    // one — `issue.status === "cancelled"`, a RUNNING active execution run, and
+    // a `pipelineStageExitCancellationRequestedAt` marker on that run's
+    // `resultJson` — and the tick's own claim filter excludes `cancelled`, so
+    // reaching it needs a cancellation to commit in the window between the claim
+    // and the gate.
+    //
+    // PEN-3554 closed what that used to cost. The deferral below is now guarded
+    // by `rearmClaimedIssueMonitorIfDeliverable`, which re-reads the row under a
+    // lock and declines to re-arm one that has left the deliverable set, so this
+    // gate no longer leaves a future `monitorNextCheckAt` that no later tick can
+    // claim and `hasActiveMonitorPath` reads as live.
+    //
+    // Two corrections to the premise this comment used to carry, both load-bearing
+    // for anyone auditing "is this row attended?":
+    //
+    //  - "nothing else nulls that column on cancellation" is false of the system.
+    //    A cancel routed through `issuesSvc.update` runs `applyMonitorTransition`,
+    //    which clears the monitor via `monitorClearReasonForIssue` returning
+    //    `"cancelled"`. That is precisely WHY the re-arm was a defect: it was not
+    //    leaving a stale column, it was putting a cleared one back.
+    //  - `reconcileUndeliverableIssueMonitors` (BLO-33539) is a producer-agnostic
+    //    backstop selecting the exact complement of the scheduler's eligibility
+    //    predicate, and it runs every scheduler tick. It would have swept this
+    //    residue within one tick regardless; the guard removes the window rather
+    //    than the invariant, which the backstop already held.
+    //
+    // The special-case this once declined to add is therefore no longer a design
+    // change: `skipped` already models "declined, nothing queued", so the third
+    // outcome needed no new disposition in the dispatch union.
     //
     // `company.inactive` is the last gate that reaches here, and it is bounded
     // the same way — by a filter upstream of this function, not by anything in
@@ -17368,6 +17625,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         kind: "rearmed";
         result: { outcome: "dispatch_suppressed_deferred"; nextCheckAt: string; suppressionReason: string };
       }
+      // PEN-3554: the third outcome. The row left the monitor-deliverable set
+      // between the claim and this write, so there is nothing to re-arm and
+      // nothing to trigger — only a suppression to report.
+      | { kind: "undeliverable"; clearReason: string | null }
       | { kind: "unpersistable" }
     > => {
       // No exhaustion check here. The top-level `clearReason` above already ran
@@ -17394,17 +17655,29 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // count, i.e. the unbounded loop this bound exists to prevent.
       if (!retryPolicy?.monitor) return { kind: "unpersistable" };
 
-      await db
-        .update(issues)
-        .set({
-          ...buildIssueMonitorDispatchRearmPatch({
-            issue: claimed,
-            policy: retryPolicy,
-            attemptCount: nextAttemptCount,
-          }),
-          updatedAt: new Date(),
-        })
-        .where(eq(issues.id, claimed.id));
+      // PEN-3554: guarded. A cancellation committing between the claim and here
+      // is exactly what this gate just told us about, and re-arming over it
+      // would leave an undispatchable `monitorNextCheckAt` on a cancelled row.
+      const rearm = await rearmClaimedIssueMonitorIfDeliverable({
+        claimed,
+        rearmPatch: buildIssueMonitorDispatchRearmPatch({
+          issue: claimed,
+          policy: retryPolicy,
+          attemptCount: nextAttemptCount,
+        }),
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        activitySource: input.activitySource,
+      });
+      if (rearm.kind !== "landed") {
+        // The row left the deliverable set. Report the suppression as a skip
+        // rather than a deferral: there is no live timer to defer to, and the
+        // `unpersistable` fallthrough would reach the triggered patch, which
+        // asserts a wake nobody queued — the very thing PEN-3326 removed.
+        return { kind: "undeliverable", clearReason: rearm.clearReason ?? null };
+      }
       await logActivity(db, {
         companyId: claimed.companyId,
         actorType: input.actorType,
@@ -17529,17 +17802,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
       if (deferredRetryAt && deferredPolicy?.monitor) {
         const retryAt = deferredRetryAt;
-        await db
-          .update(issues)
-          .set({
-            ...buildIssueMonitorDispatchRearmPatch({
-              issue: claimed,
-              policy: deferredPolicy,
-              attemptCount: nextAttemptCount,
-            }),
-            updatedAt: new Date(),
-          })
-          .where(eq(issues.id, claimed.id));
+        // PEN-3554: guarded for the same reason as the suppressed-dispatch
+        // deferral above, and this branch is the WIDER of the two on a cancelled
+        // row — the suppression gate additionally requires a running execution
+        // run carrying a pipeline-stage-exit marker, while this one needs only an
+        // unresolved blocker.
+        const rearm = await rearmClaimedIssueMonitorIfDeliverable({
+          claimed,
+          rearmPatch: buildIssueMonitorDispatchRearmPatch({
+            issue: claimed,
+            policy: deferredPolicy,
+            attemptCount: nextAttemptCount,
+          }),
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          activitySource: input.activitySource,
+        });
+        if (rearm.kind !== "landed") {
+          return { outcome: "skipped" as const, reason: rearm.clearReason ?? "monitor_undeliverable" };
+        }
         await logActivity(db, {
           companyId: claimed.companyId,
           actorType: input.actorType,
@@ -17576,6 +17859,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (monitorSuppression.durableSkipReason) {
         const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, null);
         if (deferral.kind === "rearmed") return deferral.result;
+        // PEN-3554: the row is no longer monitor-deliverable (a cancel landed in
+        // the claim→gate window, most often). The monitor is already cleared, or
+        // has just been cleared; either way falling through to the triggered
+        // patch would re-assert a wake nobody queued on a row nobody is waiting
+        // on. Report the suppression instead.
+        if (deferral.kind === "undeliverable") {
+          return { outcome: "skipped" as const, reason: deferral.clearReason ?? monitorSuppression.durableSkipReason };
+        }
         // `unpersistable` — fall through to the triggered patch, which at least
         // terminates the row rather than leaving it re-claiming forever. This is
         // the pre-existing behaviour for policy drift, unchanged.
@@ -17633,6 +17924,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         if (input.clearOnClientError && monitorSuppression.durableSkipReason) {
           const deferral = await deferSuppressedDispatch(monitorSuppression.durableSkipReason, err.message);
           if (deferral.kind === "rearmed") return deferral.result;
+          // PEN-3554: already cleared (or just cleared) because the row left the
+          // deliverable set. The clear below would re-clear it under the less
+          // accurate `dispatch_skipped` reason and log a second activity row for
+          // one event, so report the undeliverable verdict directly.
+          if (deferral.kind === "undeliverable") {
+            return { outcome: "skipped" as const, reason: deferral.clearReason ?? err.message };
+          }
           // `unpersistable` — fall through to the clear below, unchanged.
         }
         if (input.clearOnClientError) {
@@ -17770,7 +18068,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
-  async function tickDueIssueMonitors(now = new Date()) {
+  async function tickDueIssueMonitors(
+    now = new Date(),
+    opts?: {
+      /**
+       * PEN-3554 test seam: runs between the claim UPDATE and the dispatch,
+       * which is the exact window a cancellation has to land in to reach the
+       * `pipeline_stage_exit_cancellation_pending` gate. The race is otherwise
+       * unreachable from a test — the claim filter admits only
+       * `in_progress`/`in_review`, so an issue cancelled before the tick is
+       * never claimed at all, and one cancelled after it has already been
+       * dispatched.
+       */
+      beforeDispatch?: (issueId: string) => Promise<void>;
+    },
+  ) {
     const lapseThreshold = new Date(now.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS);
     const lapsed = await db
       .select({ issue: issueMonitorDispatchColumns, run: heartbeatRuns })
@@ -17918,6 +18230,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
 
       if (!claimed) continue;
+      if (opts?.beforeDispatch) await opts.beforeDispatch(claimed.id);
 
       try {
         const result = await dispatchClaimedIssueMonitor(claimed, {
@@ -25391,11 +25704,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return row !== null;
   }
 
-  async function claimQueuedRun(run: typeof heartbeatRuns.$inferSelect, companyAgents?: AgentOrgRow[]) {
+  /**
+   * Try to take a queued run. Returns the claimed row, or `null` if any screen
+   * refused it.
+   *
+   * `onRefusal` names the screen that refused (PEN-5316). Before it, the only
+   * record a refusal left was the pass-level
+   * `paperclip_agent_dispatch_declined_total{reason="no_claimable_run"}`, which
+   * carries a reason but no subject — so it could not be joined against
+   * `paperclip_queued_run_oldest_claimable_age_seconds`, the gauge that screens
+   * on `isDispatchRankReady` and asserts a ready run HAS been waiting. Both
+   * read positive at once on a third of the samples on the busiest seats, and
+   * with no shared subject there was no way to tell whether the gauge is aging
+   * rows the claim path will never take, or the pass is skipping work it could
+   * have had. The callback is that subject: every arm below reports itself, so
+   * the two sides describe the same runs.
+   *
+   * It is a callback rather than a richer return type because ~20 call sites
+   * read this function's result and only the dispatch pass needs the arm;
+   * widening the return would have made every other caller handle a shape it
+   * does not use. Refusals that CANCEL the run report too — a cancelled row
+   * stops being counted by the gauge, so the arm is what explains the gap
+   * between one sample and the next.
+   */
+  async function claimQueuedRun(
+    run: typeof heartbeatRuns.$inferSelect,
+    companyAgents?: AgentOrgRow[],
+    onRefusal?: (arm: QueuedRunClaimRefusalArm) => void,
+  ) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
     if (!agent) {
       await cancelRunInternal(run.id, "Cancelled because the agent no longer exists");
+      onRefusal?.("agent_missing");
       return null;
     }
     const invokability = companyAgents
@@ -25403,12 +25744,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       : await getAgentInvokability(agent);
     if (!invokability.invokable) {
       await cancelRunInternal(run.id, `Cancelled because the agent is not invokable: ${invokability.reason}`);
+      onRefusal?.("agent_not_invokable");
       return null;
     }
 
     const context = parseObject(run.contextSnapshot);
     let issueDependencyReadyForAutoCheckout = true;
     if (isQueuedRunAdmissionDeferred(context)) {
+      onRefusal?.("admission_deferred");
       return null;
     }
     const budgetBlock = await budgets.getInvocationBlock(run.companyId, run.agentId, {
@@ -25417,6 +25760,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     if (budgetBlock) {
       await cancelRunInternal(run.id, budgetBlock.reason);
+      onRefusal?.("budget_blocked");
       return null;
     }
 
@@ -25427,6 +25771,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
     if (dailyCapBlock) {
       await cancelQueuedRunForHeartbeatDailyCap(run, dailyCapBlock);
+      onRefusal?.("daily_cap");
       return null;
     }
 
@@ -25457,6 +25802,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "claimQueuedRun: cancelled queued run with an unparseable context issue id",
         );
       }
+      onRefusal?.("unparseable_issue_id");
       return null;
     }
     if (issueId) {
@@ -25489,6 +25835,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             securityPrinciples: ["Complete Mediation", "Fail Securely", "Secure Defaults"],
           },
         });
+        onRefusal?.("pause_hold");
         return null;
       }
 
@@ -25506,6 +25853,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { runId: run.id, issueId, unresolvedBlockerCount: readiness?.unresolvedBlockerCount ?? 0 },
           "claimQueuedRun: cancelled blocked queued run",
         );
+        onRefusal?.("dependency_blocked");
         return null;
       }
 
@@ -25516,6 +25864,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
         );
+        onRefusal?.("stale_issue");
         return null;
       }
     }
@@ -25531,17 +25880,41 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const exclusivePrReviewTaskKey = prReviewTaskKey && isPrReviewRetryContext(context)
       ? prReviewTaskKey
       : null;
+    // A holder rather than a bare `let`: the flag is set inside the
+    // transaction callback below, and TypeScript's flow analysis does not see
+    // assignments made in a nested function — a plain `let` would stay narrowed
+    // to `false` at the read site and silently collapse one arm into another.
+    const claimAttempt = { prReviewTaskHeld: false };
+    // PEN-5316 (review follow-up): the same hazard, one layer out. The external
+    // pool used to collapse three outcomes into one `null`, and the two busiest
+    // seats in the filing both run `claude_k8s` — so that single arm would have
+    // swallowed the whole population this PR exists to separate. A holder for
+    // the same flow-analysis reason as `claimAttempt`.
+    const externalRefusal: { cause: ExternalRuntimeClaimRefusal | null } = { cause: null };
     const initiallyClaimed = hasExternalLifecycle(agent.adapterType)
       ? (await claimRunWithExternalRuntimeSlotPool(
           db,
           run.id,
           claimedAt,
           resolveExternalLifecycleConcurrency(parseHeartbeatPolicy(agent)).effectiveMaxConcurrentRuns,
-          exclusivePrReviewTaskKey ? { exclusivePrReviewTaskKey } : {},
+          {
+            ...(exclusivePrReviewTaskKey ? { exclusivePrReviewTaskKey } : {}),
+            onRefusal: (cause) => {
+              externalRefusal.cause = cause;
+            },
+          },
         ))?.run ?? null
       : exclusivePrReviewTaskKey
       ? await db.transaction(async (tx) => {
-          if (!(await canClaimPrReviewTask(tx, exclusivePrReviewTaskKey))) return null;
+          if (!(await canClaimPrReviewTask(tx, exclusivePrReviewTaskKey))) {
+            // Recorded here rather than inferred at the `!claimed` site below:
+            // that site cannot tell this refusal apart from the CAS losing to a
+            // concurrent pass, and the two are opposite findings — one is a row
+            // the gauge should never have aged, the other is work this pass
+            // could have had.
+            claimAttempt.prReviewTaskHeld = true;
+            return null;
+          }
           return tx
             .update(heartbeatRuns)
             .set({
@@ -25577,7 +25950,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .returning()
           .then((rows) => rows[0] ?? initiallyClaimed)
       : initiallyClaimed;
-    if (!claimed) return null;
+    if (!claimed) {
+      // Several distinct causes reach this one `null`, and they are not the
+      // same finding — on an external-lifecycle seat they sit on opposite sides
+      // of the fork. Split them so the arm label can carry the difference.
+      //
+      // Assigned to a named const rather than inlined into the call: the arm
+      // choice is the interesting part and it is four cases deep, while the
+      // refusal-naming guard reads the report that sits next to `return null`.
+      const refusedArm: QueuedRunClaimRefusalArm = hasExternalLifecycle(agent.adapterType)
+        ? externalRefusal.cause === "task_held"
+          ? "external_lifecycle_pr_review_task_held"
+          : externalRefusal.cause === "run_not_queued"
+          // Same meaning as the non-external CAS loss, so it shares that arm
+          // and the two adapter families stay directly comparable.
+          ? "claim_cas_lost"
+          : externalRefusal.cause === "slots_exhausted"
+          ? "external_lifecycle_slots_exhausted"
+          // The pool refused without naming a cause. Should be unreachable;
+          // kept so an unreported path is visible rather than misfiled.
+          : "external_lifecycle_claim_refused"
+        : claimAttempt.prReviewTaskHeld
+        ? "pr_review_task_held"
+        : "claim_cas_lost";
+      onRefusal?.(refusedArm);
+      return null;
+    }
 
     recordPrReviewQueueWait({
       taskKey: claimed.contextTaskKey,
@@ -25638,6 +26036,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "claimQueuedRun: cancelled duplicate routine execution run",
         );
+        onRefusal?.("duplicate_routine_execution");
         return null;
       }
 
@@ -25778,6 +26177,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "claimQueuedRun: cancelled duplicate routine execution run after lock race",
         );
+        onRefusal?.("duplicate_routine_execution");
         return null;
       }
 
@@ -25791,6 +26191,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           },
           "claimQueuedRun: cancelled run because issue execution lock was not acquired",
         );
+        onRefusal?.("issue_execution_lock_unavailable");
         return null;
       }
     }
@@ -32205,10 +32606,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           '0'::jsonb
         )`;
 
-    // Crashloop circuit breaker: track consecutive adapter_failed runs.
+    // Crashloop circuit breaker: track consecutive runs that died before doing
+    // useful work. Keyed on `countsTowardAdapterFailedCircuitBreaker` rather
+    // than the `adapter_failed` literal, because this counter is RESET by any
+    // code it does not count — so a code that belongs here and is omitted
+    // disarms the breaker rather than merely failing to arm it.
     // Nested inside idleCounterUpdate so both keys update atomically.
-    const isAdapterFailed = run.status === "failed" && result.errorCode === "adapter_failed";
-    const stateCounterUpdate = isAdapterFailed
+    const countsTowardCrashloopBreaker =
+      run.status === "failed" && countsTowardAdapterFailedCircuitBreaker(result.errorCode);
+    const stateCounterUpdate = countsTowardCrashloopBreaker
       ? sql`jsonb_set(
           ${idleCounterUpdate},
           '{consecutiveAdapterFailedRuns}',
@@ -32639,6 +33045,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * bytes each against a set that is already bounded by the roster.
    */
   const DISPATCH_DECLINE_LOG_INTERVAL_MS = 10 * 60_000;
+
+  /**
+   * How many individual claim refusals the `no_claimable_run` line names
+   * (PEN-5316). The metric counts every refusal; this caps only the log. A
+   * wedged seat re-ranks the same bounded candidate window every tick, so the
+   * first few names identify the population — printing the whole window would
+   * scale the line with the incident it is reporting, which is the cost
+   * {@link DISPATCH_DECLINE_LOG_INTERVAL_MS} already exists to control.
+   */
+  const NO_CLAIMABLE_RUN_LOGGED_REFUSAL_LIMIT = 10;
   const dispatchDeclineLogState = new Map<
     string,
     { lastLoggedAt: number; suppressed: number }
@@ -32710,6 +33126,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       logger.debug(
         { agentId, reason, error },
         "startNextQueuedRunForAgent: failed to record dispatch decline",
+      );
+    }
+  }
+
+  /**
+   * Record one candidate's named claim refusal (PEN-5316). Same
+   * never-fail-dispatch contract as {@link noteDispatchDeclined}, and for the
+   * same reason: this runs inside the candidate loop, so a throwing roster read
+   * here would convert an ordinary refusal into a thrown pass.
+   */
+  async function noteQueuedRunClaimRefused(
+    agentId: string,
+    arm: QueuedRunClaimRefusalArm,
+    companyId: string | null,
+  ): Promise<void> {
+    try {
+      const knownAgentIds = companyId
+        ? await getActiveAgentIds(db, companyId)
+        : new Set<string>();
+      recordQueuedRunClaimRefused({ agentId, arm, knownAgentIds });
+    } catch (error) {
+      rethrowIfAgentStartLockAborted(error);
+      logger.debug(
+        { agentId, arm, error },
+        "startNextQueuedRunForAgent: failed to record queued-run claim refusal",
       );
     }
   }
@@ -33950,7 +34391,32 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      // PEN-5316: every candidate this pass tried and could not take, with the
+      // named arm that refused it. Read by the `no_claimable_run` branch below,
+      // which previously reported only that candidates existed and none could
+      // be claimed — true, and unjoinable against the claimable-age gauge.
+      const claimRefusals: QueuedRunClaimRefusalRecord[] = [];
       let scheduledEmergencyContinuationAfterRefusal = false;
+      // How far the candidate loop actually got. Read by the `no_claimable_run`
+      // line so an absent refusal can be told apart from a refusal that was
+      // never attempted (PEN-5316 review follow-up).
+      let candidatesConsidered = 0;
+      let passStoppedEarly: "slots_filled" | "dispatch_stopped" | null = null;
+      // PEN-5316 (review follow-up): the dispatch loop screens candidates
+      // BEFORE `claimQueuedRun` ever sees them, and those skips reported
+      // nothing. That silence was not neutral — the reading rule treated an
+      // absent refusal as "the dispatcher never reached it", i.e. fork (b),
+      // while `isDispatchRankReady` screens neither of these, so the gauge goes
+      // on aging the row and the honest reading is fork (a). Left unnamed, the
+      // pre-claim population would have pushed the verdict the wrong way.
+      const notePreClaimSkip = async (
+        run: typeof heartbeatRuns.$inferSelect,
+        skipIssueId: string | null,
+        arm: QueuedRunClaimRefusalArm,
+      ) => {
+        claimRefusals.push({ runId: run.id, issueId: skipIssueId, arm });
+        await noteQueuedRunClaimRefused(agentId, arm, agent.companyId);
+      };
       const scheduleEmergencyContinuationForStillQueuedRun = async (
         run: typeof heartbeatRuns.$inferSelect,
       ) => {
@@ -34028,8 +34494,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       };
       try {
         for (const queuedRun of prioritizedRuns) {
-          if (claimedRuns.length >= availableSlots) break;
-          if (dispatchStopped) break;
+          // PEN-5316 (review follow-up): a candidate the loop never reaches
+          // records no arm, so absence of a refusal must not be read as "the
+          // claim path declined it". The slot break cannot reach the
+          // `no_claimable_run` branch at all — `availableSlots <= 0` returns
+          // `no_available_slots` far above, so reaching this break means at
+          // least one claim succeeded — but the shutdown break can, and does so
+          // with an empty `claimedRuns`.
+          if (claimedRuns.length >= availableSlots) {
+            passStoppedEarly = "slots_filled";
+            break;
+          }
+          if (dispatchStopped) {
+            passStoppedEarly = "dispatch_stopped";
+            break;
+          }
+          candidatesConsidered += 1;
           const queuedSnapshot = parseObject(queuedRun.contextSnapshot);
           const queuedIssueId = readNonEmptyString(queuedSnapshot.issueId);
           if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
@@ -34049,6 +34529,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 "startNextQueuedRunForAgent: cancelled duplicate queued run for in-flight issue",
               );
             }
+            // Which pass moved the row, not whether it moved: `cancelled` means
+            // THIS pass cancelled it; null means the `status = 'queued'` CAS
+            // lost, so a concurrent pass or replica had already moved it. The
+            // row is out of the queue either way, which is why neither arm is
+            // fork (a) — see the allow-list.
+            //
+            // The cancelled case keeps the `duplicate_dispatch_suppressed`
+            // name because that is what this path already writes on the
+            // cancelled row's error_code and on
+            // HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC. Giving that name
+            // to the other branch would make those joins return disjoint sets.
+            await notePreClaimSkip(
+              queuedRun,
+              queuedIssueId,
+              cancelled ? "duplicate_dispatch_suppressed" : "duplicate_dispatch_cas_lost",
+            );
             continue;
           }
           const queuedTaskKey = readNonEmptyString(queuedSnapshot.taskKey);
@@ -34060,10 +34556,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             // Explicit review requests intentionally queue a follow-up while a
             // review is running. Keep that row queued, but do not let it run
             // concurrently with the review that already owns this PR task.
+            //
+            // The row stays `queued` and `isDispatchRankReady` does not screen
+            // this, so the claimable gauge keeps aging it: this arm is fork (a)
+            // evidence, and it was invisible before.
+            await notePreClaimSkip(queuedRun, queuedIssueId ?? null, "pr_review_task_in_flight");
             continue;
           }
           markAgentStartLockPhase(agentId, "claim");
-          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          // PEN-5316: capture WHICH screen refused, and for which run. The arm
+          // goes on a bounded metric label; the run id stays on the log line
+          // because it is unbounded. Appending straight into the shared
+          // accumulator (rather than through a local the callback assigns) keeps
+          // this correct without asserting how many times the callback fires.
+          const refusalsBeforeClaim = claimRefusals.length;
+          const claimed = await claimQueuedRun(queuedRun, companyAgents, (arm) => {
+            claimRefusals.push({ runId: queuedRun.id, issueId: queuedIssueId ?? null, arm });
+          });
+          for (const refusal of claimRefusals.slice(refusalsBeforeClaim)) {
+            await noteQueuedRunClaimRefused(agentId, refusal.arm, agent.companyId);
+          }
           if (!claimed) {
             if (await scheduleEmergencyContinuationForStillQueuedRun(queuedRun)) {
               scheduledEmergencyContinuationAfterRefusal = true;
@@ -34132,11 +34644,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // unthrottled line here scales with the incident it is reporting.
         const noClaimLogSlot = takeDispatchDeclineLogSlot(agentId, "no_claimable_run");
         if (noClaimLogSlot.log) {
+          // PEN-5316: the subject, not just the reason. `refusalArmCounts` is
+          // the whole pass; `refusedRuns` is capped because the candidate
+          // window is bounded but not small, and a wedged seat emits this line
+          // for as long as it stays wedged. The cap is on the LOG only — the
+          // metric counted every one.
           logger.warn(
             {
               agentId,
               queuedRunCount: queuedRuns.length,
               availableSlots,
+              // Absence of a refusal for a run id is only evidence about the
+              // dispatcher for candidates this pass actually offered to the
+              // claim path. These two say how many it did not.
+              candidatesConsidered,
+              candidatesNotAttempted: Math.max(0, prioritizedRuns.length - candidatesConsidered),
+              stoppedEarly: passStoppedEarly,
+              ...summarizeQueuedRunClaimRefusals(
+                claimRefusals,
+                NO_CLAIMABLE_RUN_LOGGED_REFUSAL_LIMIT,
+              ),
               suppressedSincePreviousLog: noClaimLogSlot.suppressedSincePreviousLog,
             },
             "startNextQueuedRunForAgent: declined — candidates were ranked but none could be claimed",
@@ -38611,6 +39138,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         workspaceValidationFailure?.code
         ?? configurationIncompleteFailure?.code
         ?? recordedResponsibleUserDenialCode
+        // PEN-5424: the run log is opened BEFORE the adapter is spawned, so
+        // recording a storage-permission fault as `adapter_failed` names a
+        // component that never ran. That mislabel is most of why this failure
+        // reads as a code regression: what a developer sees is an adapter that
+        // did not start, and nothing says the cause was a directory. Same
+        // reasoning as separating `credential_quarantined` from `relay_failed`
+        // — one code over two causes makes the common one unreadable.
+        //
+        // It also leaves the `adapter_failed` retry arms deliberately: a retry
+        // re-attempts the identical mkdir against the identical root, so the
+        // attempts buy nothing and the run ends at the same place later.
+        ?? (isRunLogUnwritableError(err) ? RUN_LOG_UNWRITABLE_ERROR_CODE : null)
         ?? "adapter_failed";
       logger.error({ err, runId }, "heartbeat execution failed");
 
@@ -43791,6 +44330,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // `heartbeatExpected` below rather than dropping the row.
         .leftJoin(companies, eq(companies.id, agents.companyId));
 
+      // BLO-47549: lastHeartbeatAt is stamped when a run FINISHES, so an agent
+      // mid-way through a long run read as dark and paged after 3x interval.
+      // Anchor on the newest output of a still-running run as well: a live run
+      // emitting output is the outcome this gauge measures, while a hung run
+      // that stops emitting still ages and pages.
+      const liveRunRows = await db
+        .select({
+          agentId: heartbeatRuns.agentId,
+          lastOutputAt: max(heartbeatRuns.lastOutputAt),
+          startedAt: max(heartbeatRuns.startedAt),
+        })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.status, "running"))
+        .groupBy(heartbeatRuns.agentId);
+      const liveRunActivityByAgent = new Map<string, Date>();
+      for (const r of liveRunRows) {
+        const times = [r.lastOutputAt, r.startedAt].filter((t) => t).map((t) => new Date(t!).getTime());
+        if (times.length) liveRunActivityByAgent.set(r.agentId, new Date(Math.max(...times)));
+      }
+
       // Complete per-company rosters (the select is unfiltered), so the
       // org-chain walk inside evaluateAgentInvokability sees every ancestor.
       const agentsByCompany = groupAgentOrgRowsByCompany(rows.map(toAgentOrgRow));
@@ -43801,7 +44360,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // its createdAt rather than treated as ageless -- a heartbeat-enabled
         // agent that has NEVER run is exactly the kind of dark agent this
         // metric exists to surface, not a reason to omit it.
-        const heartbeatAnchor = row.lastHeartbeatAt ?? row.createdAt;
+        const finishedAnchor = row.lastHeartbeatAt ?? row.createdAt;
+        const liveActivity = liveRunActivityByAgent.get(row.id);
+        const heartbeatAnchor = liveActivity && (!finishedAnchor || liveActivity > new Date(finishedAnchor))
+          ? liveActivity
+          : finishedAnchor;
         const heartbeatAgeSeconds = heartbeatAnchor
           ? Math.max(0, (now.getTime() - new Date(heartbeatAnchor).getTime()) / 1000)
           : null;
@@ -45675,7 +46238,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? { createdAt: cursor.createdAt, id: cursor.id, passes: cursor.passes }
         : null;
     },
-    __test_tickDueIssueMonitors: (now?: Date) => tickDueIssueMonitors(now),
+    __test_tickDueIssueMonitors: (
+      now?: Date,
+      opts?: { beforeDispatch?: (issueId: string) => Promise<void> },
+    ) => tickDueIssueMonitors(now, opts),
     __test_tickExpiredIssueParks: (now?: Date) => tickExpiredIssueParks(now),
     __test_tickExpiredIssueMonitors: (now?: Date) => tickExpiredIssueMonitors(now),
     // Override-aware scheduling-suppression check (honors the worktree

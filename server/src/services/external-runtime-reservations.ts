@@ -151,21 +151,51 @@ type ExternalRuntimeClaim = {
   reservation: ExternalRuntimeReservation;
 };
 
+/**
+ * Why an external-lifecycle claim did not take the run (PEN-5316).
+ *
+ * These three were a single `null` before, and they are not the same finding —
+ * they sit on opposite sides of the question PEN-5316 was filed to settle, and
+ * they merge on exactly the seats it was filed about (`claude_k8s` and
+ * `opencode_k8s` are the external-lifecycle adapters, and the two busiest seats
+ * run `claude_k8s`).
+ *
+ * - `task_held` — an exclusive PR-review task key is held by another run. The
+ *   row stays `queued` and `isDispatchRankReady` does not screen this, so the
+ *   claimable-age gauge keeps aging a row the claim path will never take.
+ * - `run_not_queued` — the row left `queued` under this pass. A lost race for
+ *   work that WAS claimable, same meaning as the non-external CAS loss.
+ * - `slots_exhausted` — every slot in the pool was already taken. The global
+ *   external pool, not the per-seat ceiling, is the binding constraint.
+ */
+export type ExternalRuntimeClaimRefusal = "task_held" | "run_not_queued" | "slots_exhausted";
+
+type ExternalRuntimeClaimOutcome = {
+  claimed: ExternalRuntimeClaim | null;
+  taskBlocked: boolean;
+  /**
+   * Null when `claimed` is set. `slots_exhausted` here means "this slot was
+   * taken" — only the pool caller, which knows whether any slot remained, can
+   * promote that to the pool-level verdict.
+   */
+  refusal: ExternalRuntimeClaimRefusal | null;
+};
+
 async function claimRunWithExternalRuntimeSlotOutcome(
   db: Db,
   runId: string,
   claimedAt: Date,
   slotId = DEFAULT_EXTERNAL_RUNTIME_SLOT_ID,
   options: { exclusivePrReviewTaskKey?: string } = {},
-): Promise<{ claimed: ExternalRuntimeClaim | null; taskBlocked: boolean }> {
-  let outcome: { claimed: ExternalRuntimeClaim | null; taskBlocked: boolean };
+): Promise<ExternalRuntimeClaimOutcome> {
+  let outcome: ExternalRuntimeClaimOutcome;
   try {
     outcome = await db.transaction(async (tx) => {
       if (
         options.exclusivePrReviewTaskKey &&
         !(await canClaimPrReviewTask(tx, options.exclusivePrReviewTaskKey))
       ) {
-        return { claimed: null, taskBlocked: true };
+        return { claimed: null, taskBlocked: true, refusal: "task_held" };
       }
       const run = await tx
         .select()
@@ -173,7 +203,12 @@ async function claimRunWithExternalRuntimeSlotOutcome(
         .where(eq(heartbeatRuns.id, runId))
         .for("update")
         .then((rows) => rows[0] ?? null);
-      if (!run || run.status !== "queued") return { claimed: null, taskBlocked: false };
+      if (!run || run.status !== "queued") {
+        // The row left `queued` under us. Not a capacity limit: a lost race
+        // for work that was claimable, so it reads the same as the
+        // non-external CAS loss and must not be filed under the pool.
+        return { claimed: null, taskBlocked: false, refusal: "run_not_queued" };
+      }
 
       let reservation = await tx
         .select()
@@ -228,7 +263,9 @@ async function claimRunWithExternalRuntimeSlotOutcome(
           .returning()
           .then((rows) => rows[0] ?? null);
       }
-      if (!reservation) return { claimed: null, taskBlocked: false };
+      // The slot row was taken by a concurrent claim (onConflictDoNothing, or
+      // the released-reservation update lost its race). This slot is busy.
+      if (!reservation) return { claimed: null, taskBlocked: false, refusal: "slots_exhausted" };
 
       const updatedRun = await tx
         .update(heartbeatRuns)
@@ -245,11 +282,12 @@ async function claimRunWithExternalRuntimeSlotOutcome(
       if (!updatedRun) {
         throw new Error(`External runtime reservation ${reservation.id} could not claim queued run ${run.id}`);
       }
-      return { claimed: { run: updatedRun, reservation }, taskBlocked: false };
+      return { claimed: { run: updatedRun, reservation }, taskBlocked: false, refusal: null };
     });
   } catch (error) {
     if (!isConstraintConflict(error, ACTIVE_RUNTIME_SLOT_CONSTRAINT)) throw error;
-    outcome = { claimed: null, taskBlocked: false };
+    // The active-slot uniqueness constraint fired: this slot is occupied.
+    outcome = { claimed: null, taskBlocked: false, refusal: "slots_exhausted" };
   }
 
   return outcome;
@@ -291,9 +329,22 @@ export async function claimRunWithExternalRuntimeSlotPool(
   runId: string,
   claimedAt: Date,
   maxSlots: number,
-  options: { exclusivePrReviewTaskKey?: string } = {},
+  options: {
+    exclusivePrReviewTaskKey?: string;
+    /**
+     * PEN-5316: name WHY the pool refused, so the caller's refusal arm can
+     * separate the three populations this `null` used to merge. Reporting
+     * only — the return value and the loop below are unchanged.
+     */
+    onRefusal?: (refusal: ExternalRuntimeClaimRefusal) => void;
+  } = {},
 ) {
   const slotCount = Math.max(1, Math.floor(maxSlots));
+  // Remembered rather than returned early: a `run_not_queued` outcome makes
+  // every remaining slot pointless, but bailing on it would change dispatch
+  // behavior. This change is observational, so the loop keeps its exact shape
+  // and the reason is promoted after it.
+  let sawRunNotQueued = false;
   for (let slotId = 0; slotId < slotCount; slotId += 1) {
     const outcome = await claimRunWithExternalRuntimeSlotOutcome(
       db,
@@ -306,12 +357,18 @@ export async function claimRunWithExternalRuntimeSlotPool(
       recordExternalRuntimeClaimAttempt(db, claimedAt, true);
       return outcome.claimed;
     }
+    if (outcome.refusal === "run_not_queued") sawRunNotQueued = true;
     if (outcome.taskBlocked) {
       recordExternalRuntimeClaimAttempt(db, claimedAt, false);
+      options.onRefusal?.("task_held");
       return null;
     }
   }
   recordExternalRuntimeClaimAttempt(db, claimedAt, false);
+  // A row that left the queue outranks "every slot busy": the pool never had a
+  // chance to be the constraint, so attributing it to pool capacity would
+  // manufacture evidence for the wrong fork.
+  options.onRefusal?.(sawRunNotQueued ? "run_not_queued" : "slots_exhausted");
   return null;
 }
 

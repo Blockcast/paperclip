@@ -632,7 +632,7 @@ export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Exp
       },
     })
     // Projected rather than bare: this row is a `company_memberships` whole-row
-    // read in all but name, and the two fields below are all the caller uses.
+    // read in all but name, and the fields below are all the caller uses.
     // See `services/access-columns.ts` (PEN-5273).
     .returning({
       companyId: companyMemberships.companyId,

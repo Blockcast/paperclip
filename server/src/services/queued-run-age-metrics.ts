@@ -173,6 +173,7 @@ const CLAIMABLE_QUEUED_RUN_WINDOW_PER_AGENT = 100;
  * genuinely stranded issueless run behind a filter that was never about it.
  */
 type ClaimableQueuedRunWindowRow = {
+  run_id: string;
   agent_id: string | null;
   company_id: string;
   context_issue_id: string | null;
@@ -180,15 +181,55 @@ type ClaimableQueuedRunWindowRow = {
   effective_queued_at: Date | string;
 };
 
+/**
+ * Below this, the gauge is not making a claim anyone disputes and naming the
+ * subject is noise. 120 s is the threshold PEN-5316's measurement used and the
+ * one `HeartbeatRunQueueAgentOldestQueuedHigh` reads, so the log population and
+ * the alert population are the same rows.
+ */
+const CLAIMABLE_SUBJECT_LOG_MIN_AGE_SECONDS = 120;
+
+/**
+ * Re-name an unchanged subject at most this often. A seat whose oldest
+ * claimable run does not move holds that state for as long as it is stuck, so
+ * an unthrottled line would scale with the incident. A CHANGE of subject always
+ * logs regardless: that is the transition the join actually needs, because it
+ * is the moment the gauge starts speaking about a different run.
+ */
+const CLAIMABLE_SUBJECT_LOG_INTERVAL_MS = 60_000;
+
+export type ClaimableSubjectLogState = Map<
+  string,
+  { runId: string; lastLoggedAt: number; suppressed: number }
+>;
+
+export type ClaimableQueuedRunSubject = {
+  runId: string;
+  issueId: string | null;
+  ageSeconds: number;
+};
+
+export type ClaimableSubjectLogLine = {
+  agentId: string | null;
+  runId: string;
+  issueId: string | null;
+  ageSeconds: number;
+  subjectChanged: boolean;
+  suppressedSincePreviousLog: number;
+};
+
+const claimableSubjectLogState: ClaimableSubjectLogState = new Map();
+
 async function refreshClaimableQueuedRunAgeMetrics(
   db: Db,
   now: Date,
   knownAgents: ReadonlyMap<string, QueuedRunAgentIdentity>,
 ): Promise<void> {
   const windowed = await db.execute<ClaimableQueuedRunWindowRow>(sql`
-    select agent_id, company_id, context_issue_id, context_snapshot, effective_queued_at
+    select run_id, agent_id, company_id, context_issue_id, context_snapshot, effective_queued_at
     from (
       select
+        ${heartbeatRuns.id} as run_id,
         ${heartbeatRuns.agentId} as agent_id,
         ${heartbeatRuns.companyId} as company_id,
         ${heartbeatRuns.contextIssueId} as context_issue_id,
@@ -229,7 +270,16 @@ async function refreshClaimableQueuedRunAgeMetrics(
     for (const [issueId, readiness] of batch) readinessByIssueId.set(issueId, readiness);
   }
 
-  const oldestClaimableByAgent = new Map<string | null, number>();
+  // PEN-5316: the SUBJECT is kept beside the age, not just the age. This gauge
+  // asserts "a run that is ready by the dispatcher's own definition has been
+  // waiting this long", and the dispatcher simultaneously records
+  // `no_claimable_run` on the same seat for 27-31% of samples. Exactly one of
+  // those is wrong, and neither side could be checked against the other
+  // because neither named a run: the gauge published an age with no subject
+  // and the decline counter a reason with no subject. Naming this one closes
+  // the gauge's half; `claimQueuedRun`'s `onRefusal` arms close the claim
+  // path's half. The run id is logged, never labelled -- it is unbounded.
+  const oldestClaimableByAgent = new Map<string | null, ClaimableQueuedRunSubject>();
   const windowSizeByAgent = new Map<string | null, number>();
   for (const row of windowRows) {
     windowSizeByAgent.set(row.agent_id, (windowSizeByAgent.get(row.agent_id) ?? 0) + 1);
@@ -242,8 +292,8 @@ async function refreshClaimableQueuedRunAgeMetrics(
       (now.getTime() - new Date(row.effective_queued_at).getTime()) / 1000,
     );
     const current = oldestClaimableByAgent.get(row.agent_id);
-    if (current === undefined || ageSeconds > current) {
-      oldestClaimableByAgent.set(row.agent_id, ageSeconds);
+    if (current === undefined || ageSeconds > current.ageSeconds) {
+      oldestClaimableByAgent.set(row.agent_id, { runId: row.run_id, issueId, ageSeconds });
     }
   }
 
@@ -265,10 +315,93 @@ async function refreshClaimableQueuedRunAgeMetrics(
     );
   }
 
+  for (const line of planClaimableSubjectLogs(oldestClaimableByAgent, now)) {
+    logger.info(line, "claimable queued-run age gauge subject");
+  }
+
   setQueuedRunOldestClaimableAgeMetrics(
-    [...oldestClaimableByAgent].map(([agentId, ageSeconds]) => ({ agentId, ageSeconds })),
+    [...oldestClaimableByAgent].map(([agentId, subject]) => ({
+      agentId,
+      ageSeconds: subject.ageSeconds,
+    })),
     knownAgents,
   );
+}
+
+/**
+ * Decide which agents' claimable-age subjects to name this refresh (PEN-5316),
+ * so the gauge's assertion can be joined against the arm `claimQueuedRun`
+ * reports when it refuses that same run.
+ *
+ * Returns the lines rather than writing them, and takes its throttle state as a
+ * parameter, so the change/throttle semantics below are testable without a
+ * logger spy or a module-global reset between cases.
+ *
+ * Reading the pair: a seat recording `no_claimable_run` while this names a run
+ * means one of two things, and the arm says which. If the refusal for THIS run
+ * id is on an arm `isDispatchRankReady` does not apply AND whose row stays
+ * `queued` (`pause_hold`, `stale_issue`, the PR-review arms, the budget and cap
+ * arms), the gauge is aging a row the claim path will never take — the gauge is
+ * wrong. The duplicate-dispatch arms look similar but are NOT that: the row
+ * leaves the queue there, so the gauge stops reporting on it and the refusal is
+ * evidence for neither fork.
+ *
+ * The converse does NOT hold symmetrically, and reading it as though it did
+ * would bias the verdict toward "the dispatcher is wrong". An absent refusal
+ * means the claim path never ruled on this run, which has two causes:
+ *
+ *   - The dispatch loop offered it and nothing refused it — the dispatcher
+ *     genuinely passed over claimable work. That is the fork (b) reading.
+ *   - The loop never offered it at all, because the pass stopped early. Check
+ *     `candidatesNotAttempted` and `stoppedEarly` on the `no_claimable_run`
+ *     line before concluding anything; a truncated pass is not evidence either
+ *     way.
+ *
+ * The loop's two pre-claim screens used to live in that silence as well, and
+ * the PR-review one is fork (a) rather than fork (b) — a running run holding
+ * the same task key, which `isDispatchRankReady` does not screen and which
+ * leaves the row `queued`. Both now report an arm, so they are counted on the
+ * correct side instead of inflating the absent-refusal bucket.
+ */
+export function planClaimableSubjectLogs(
+  oldestClaimableByAgent: ReadonlyMap<string | null, ClaimableQueuedRunSubject>,
+  now: Date,
+  state: ClaimableSubjectLogState = claimableSubjectLogState,
+): ClaimableSubjectLogLine[] {
+  const lines: ClaimableSubjectLogLine[] = [];
+  for (const [agentId, subject] of oldestClaimableByAgent) {
+    if (subject.ageSeconds < CLAIMABLE_SUBJECT_LOG_MIN_AGE_SECONDS) continue;
+    const key = agentId ?? UNKNOWN_AGENT_ID;
+    const previous = state.get(key);
+    const subjectChanged = previous?.runId !== subject.runId;
+    const throttled =
+      previous !== undefined
+      && !subjectChanged
+      && now.getTime() - previous.lastLoggedAt < CLAIMABLE_SUBJECT_LOG_INTERVAL_MS;
+    if (throttled) {
+      state.set(key, { ...previous, suppressed: previous.suppressed + 1 });
+      continue;
+    }
+    lines.push({
+      agentId,
+      runId: subject.runId,
+      issueId: subject.issueId,
+      ageSeconds: Math.round(subject.ageSeconds),
+      subjectChanged,
+      suppressedSincePreviousLog: subjectChanged ? 0 : previous?.suppressed ?? 0,
+    });
+    state.set(key, { runId: subject.runId, lastLoggedAt: now.getTime(), suppressed: 0 });
+  }
+
+  // Drop seats that no longer publish a claimable age, so a long-lived process
+  // does not accumulate one entry per agent that was ever briefly backed up.
+  const liveKeys = new Set(
+    [...oldestClaimableByAgent.keys()].map((agentId) => agentId ?? UNKNOWN_AGENT_ID),
+  );
+  for (const key of [...state.keys()]) {
+    if (!liveKeys.has(key)) state.delete(key);
+  }
+  return lines;
 }
 
 /**

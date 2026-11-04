@@ -2944,6 +2944,23 @@ const BLOCKER_ATTENTION_OPEN_RECOVERY_TERMINAL_STATUSES = ["done", "cancelled"];
 const BLOCKER_ATTENTION_MAX_DEPTH = 8;
 const BLOCKER_ATTENTION_MAX_NODES = 2000;
 const BLOCKER_ATTENTION_INVOKABLE_AGENT_STATUSES = new Set(["active", "idle", "running", "error"]);
+/**
+ * PEN-5105: after how long does a human-assigned blocker stop counting as attended?
+ *
+ * The arm below used to cover any human-assigned, non-cancelled blocker unconditionally and
+ * for ever. PEN-5021 named that the "quiet direction": a false `stalled` costs one
+ * adjudication and announces itself, while a false `covered` silently removes a row from
+ * every attention surface. Measured on the complete live population (todo + in_progress +
+ * blocked + in_review, n=394) at 2026-11-03T12:1xZ, 44 rows rested on this arm.
+ *
+ * 72h is chosen for INSENSITIVITY, not precision. The idle distribution is sharply bimodal
+ * — 8 rows at or under 10.4h, then a 106-hour gap, then 36 rows at or over 116.6h — so every
+ * threshold in (10.4h, 116.6h] selects the identical 36 rows. 24h, 48h and 72h are the same
+ * answer on this data; 72h simply sits mid-gap, so ordinary drift cannot move the outcome.
+ * Re-measure before re-tuning: the figures are a snapshot and live on PEN-5105, deliberately
+ * not inlined here beyond the reasoning they support.
+ */
+const HUMAN_ASSIGNED_BLOCKER_STALE_HOURS = 72;
 
 type IssueBlockerAttentionNode = {
   id: string;
@@ -3598,10 +3615,10 @@ function hasLiveDeliberateParkWakePath(
 }
 
 /**
- * PEN-5105, OBSERVATION ONLY -- this reads a clock, it does not gate anything.
+ * PEN-5105. Idle hours of a blocker against `issues.last_activity_at`.
  *
- * Idle hours of a blocker against `issues.last_activity_at`, used to size (not to take)
- * the staleness conjunct the `assigneeUserId` arm is missing. See
+ * This GATES the staleness conjunct on the `assigneeUserId` arm, and also feeds the
+ * `oldestHumanAssignedCoveredIdleHours` observation. See
  * `IssueBlockerAttention.oldestHumanAssignedCoveredIdleHours` for why this column is the
  * right clock despite being the wrong one for `heartbeat.ts`: migration 0076 maintains it
  * as a union over row writes and comments, so a FRESH value proves nothing about human
@@ -3960,9 +3977,9 @@ async function listIssueBlockerAttentionMap(
     sampleBlockerIdentifier: string | null;
     sampleStalledBlockerIdentifier: string | null;
     /**
-     * PEN-5105, OBSERVATION ONLY. Does this path's `covered` verdict DEPEND on the
-     * unconditional human-assigned arm below -- here, or anywhere in the covered subtree
-     * the recursion walked to reach it?
+     * PEN-5105, OBSERVATION ONLY -- this flag gates no verdict. Does this path's `covered`
+     * verdict DEPEND on the human-assigned arm below -- here, or anywhere in the covered
+     * subtree the recursion walked to reach it?
      *
      * Propagated rather than read off the top-level blocker, because PEN-5021's sweep
      * established the covering verdict can originate a level deeper and be carried up by
@@ -3974,7 +3991,7 @@ async function listIssueBlockerAttentionMap(
      */
     humanAssignedCovered?: boolean;
     /**
-     * PEN-5105, OBSERVATION ONLY. The STALEST idle span (hours) among the human-assigned
+     * PEN-5105, observation. The STALEST idle span (hours) among the human-assigned
      * covered nodes on this path -- `max`, not `min` or mean, because the path's covered
      * verdict collapses as soon as ANY node in it stops covering. The stalest node is
      * therefore the one that decides the lowest threshold at which this path would flip.
@@ -3996,6 +4013,18 @@ async function listIssueBlockerAttentionMap(
       return { covered: false, stalled: false, sampleBlockerIdentifier: nodeId, sampleStalledBlockerIdentifier: null };
     }
     const nodeSample = blockerSampleIdentifier(node);
+    /**
+     * PEN-5105. Set when this node is a human-assigned blocker that has gone stale, so the
+     * arms BELOW still get their chance to cover it. It changes exactly one thing: a
+     * terminal non-covered verdict becomes `stalled` instead of hard attention, because a
+     * stale human-assigned blocker IS what `stalled` denotes -- a wait a human must end.
+     */
+    let humanAssignedStale = false;
+    /** A terminal "nothing here covers it" verdict. Identical to the historical
+     * `{covered:false, stalled:false}` unless this node is a stale human-assigned blocker. */
+    const unattended = (): PathClassification => (humanAssignedStale
+      ? { covered: false, stalled: true, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: nodeSample }
+      : { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null });
     if (node.status === "done") {
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
@@ -4003,30 +4032,77 @@ async function listIssueBlockerAttentionMap(
       return { covered: true, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
     if (node.assigneeUserId && node.status !== "cancelled") {
-      // PEN-5105: THE arm. Any human assignee on any non-cancelled status covers
-      // immediately and unconditionally -- ahead of the `in_review` arm, the downstream
-      // recursion and the leaf invokability check -- with no staleness term and no upper
-      // bound on how long it holds. PEN-5021 and PEN-5105 carry the sweeps that attribute
-      // the false-`covered` population to this arm; the figures live there, deliberately
-      // not here, because a snapshot inlined in source goes stale silently.
+      // PEN-5105: THE arm. A human assignee on a non-cancelled status covers -- ahead of the
+      // `in_review` arm, the downstream recursion and the leaf invokability check -- but no
+      // longer unconditionally and no longer for ever. PEN-5021 and PEN-5105 carry the sweeps
+      // that attributed the false-`covered` population to this arm; the figures live there,
+      // deliberately not inlined, because a snapshot in source goes stale silently.
       //
-      // The verdict below is DELIBERATELY UNCHANGED. Adding the conjunct here un-covers
-      // every human-assigned blocker company-wide in one step, which is the flood shape the
-      // CEO flagged on PEN-5021 and the PEN-3345 shape. What is added is the measurement
-      // that lets the threshold be chosen against a real blast radius first.
-      return {
-        covered: true,
-        stalled: false,
-        sampleBlockerIdentifier: nodeSample,
-        sampleStalledBlockerIdentifier: null,
-        humanAssignedCovered: true,
-        humanAssignedIdleHours: blockerIdleHours(node, blockerAttentionNowMs),
-      };
+      // Two terms, and the second is the one that keeps this from being a false-positive
+      // machine:
+      //
+      //  - IDLE, from `lastActivityAt`. An UPPER bound on attendance: that column advances on
+      //    any write by anyone, so a row reading idle is idle at least that long and usually
+      //    longer. The error direction is therefore safe -- this under-reports staleness and
+      //    cannot invent it.
+      //  - NOT DELIBERATELY PARKED. `isDeliberateParkActive` is reused rather than restated;
+      //    `services/issue-park-expiry.ts` is the documented single owner of the live-park
+      //    reading (BLO-27912, BLO-22660) and this is a further caller, not a further copy.
+      //    ⚠ Deliberately NOT `hasLiveDeliberateParkWakePath`: that predicate additionally
+      //    requires an invokable AGENT assignee and returns false when `assigneeUserId` is
+      //    set, on the stated grounds that "human-assigned blockers already reach `covered`
+      //    by their own arm above" -- the very premise this change retires. A park on a
+      //    human-assigned row is a note to a person rather than a schedulable wake, and for
+      //    THIS arm that note is the attendance. Measured: 11 of the 36 otherwise-stale rows
+      //    are covered by two blockers parked to 2027-01-20; un-covering those would be a
+      //    false `stalled` of exactly the loud kind PEN-5021 shipped protections against.
+      //
+      // ⚠ STALENESS DOES NOT RETURN HERE -- it falls through, and that is load-bearing.
+      // This arm sits AHEAD of the `in_review` monitor check, the `activeIssueIds` check and
+      // the downstream recursion. While it always returned `covered` its position could not
+      // matter; the moment it can decline, an early `stalled` return would skip all three.
+      // A human-assigned row waiting on an agent's PR is the normal shape here: nobody
+      // writes the human row while the agent works, so it goes stale while being attended,
+      // and an early return would mint a false `stalled` against live work. Falling through
+      // is also what keeps the documented "could still be covered by one of those arms /
+      // true delta `<=`" claim true rather than false.
+      //
+      // When nothing further down covers it either, the terminal arms return `stalled`
+      // rather than the `{covered:false, stalled:false}` fall-through -- see `unattended`.
+      // That shape is itself load-bearing: the recursion tests `hardAttention` BEFORE
+      // `stalledEntry`, so a non-stalled terminal here would mask a genuinely stalled
+      // sibling out of the operator feed, a net regression instead of a fix.
+      //
+      // `idleHours === null` reads as NOT stale. That guard is defensive only and has no
+      // test: migration 0076 sets `issues.last_activity_at` NOT NULL, so the null arm is
+      // unreachable through the database and `blockerIdleHours` can only return null for an
+      // unparseable value. It is kept because the node type admits null, and because the
+      // fail-safe direction for an unreadable span is "not proven stale", never "stale".
+      const idleHours = blockerIdleHours(node, blockerAttentionNowMs);
+      const stale = idleHours !== null
+        && idleHours >= HUMAN_ASSIGNED_BLOCKER_STALE_HOURS
+        && !isDeliberateParkActive(node.parkedUntil, blockerAttentionNowMs);
+      if (!stale) {
+        return {
+          covered: true,
+          stalled: false,
+          sampleBlockerIdentifier: nodeSample,
+          sampleStalledBlockerIdentifier: null,
+          humanAssignedCovered: true,
+          humanAssignedIdleHours: idleHours,
+        };
+      }
+      humanAssignedStale = true;
     }
     if (node.status === "in_review") {
       // PEN-5021: a live deliberate park is a waiting path. See `hasLiveDeliberateParkWakePath`.
+      // PEN-5105: `Boolean(node.assigneeUserId)` is now reachable-as-true ONLY for a blocker
+      // that fell through the arm above because it went stale -- and a stale human assignee
+      // is precisely not a waiting path. The gate keeps the original term visible rather
+      // than silently deleting it. The other three terms still cover a stale human row: an
+      // active run, a valid monitor, or a live agent park.
       const hasWaitingPath = activeIssueIds.has(node.id)
-        || Boolean(node.assigneeUserId)
+        || (Boolean(node.assigneeUserId) && !humanAssignedStale)
         || hasValidBlockerMonitor(node)
         || hasLiveDeliberateParkWakePath(node, blockerAttentionNowMs, agentsById, companyId);
       if (hasWaitingPath) {
@@ -4041,7 +4117,7 @@ async function listIssueBlockerAttentionMap(
       return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
     }
     if (node.status === "backlog" && node.assigneeAgentId) {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+      return unattended();
     }
 
     const downstream = (edgesByIssueId.get(node.id) ?? []).filter((edge) => nodesById.get(edge.blockerIssueId)?.status !== "done");
@@ -4092,10 +4168,10 @@ async function listIssueBlockerAttentionMap(
     }
 
     if (node.assigneeAgentId && !hasInvokableBlockerAssignee(node.assigneeAgentId, agentsById, companyId)) {
-      return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+      return unattended();
     }
 
-    return { covered: false, stalled: false, sampleBlockerIdentifier: nodeSample, sampleStalledBlockerIdentifier: null };
+    return unattended();
   };
 
   for (const root of roots) {
@@ -4152,9 +4228,9 @@ async function listIssueBlockerAttentionMap(
     // PEN-5105, OBSERVATION ONLY -- nothing below this point reads these into `state`,
     // `reason` or any existing count.
     //
-    // Counted per TOP-LEVEL EDGE, not per node: the decision this sizes is "how many of
-    // this row's blockers would stop reading `covered` if the conjunct were added", and an
-    // edge whose chain holds three stale human-assigned nodes still flips exactly once.
+    // Counted per TOP-LEVEL EDGE, not per node: the question this sizes is "how many of
+    // this row's blockers would stop reading `covered` at a HIGHER threshold than the one
+    // now in force", and an edge whose chain holds three such nodes still flips exactly once.
     // Only edges that actually reached `covered` are counted -- a `needs_attention` or
     // `stalled` edge has nothing to un-cover.
     const humanAssignedCoveredEntries = classified.filter(

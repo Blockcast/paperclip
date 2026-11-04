@@ -16,7 +16,8 @@ vi.mock("../webhook-handler.js", async (importOriginal) => {
   };
 });
 
-const { reconcileActiveAlerts, RECONCILE_MAX_PER_PASS } = await import("../reconcile.js");
+const { reconcileActiveAlerts, RECONCILE_GRACE_MS, RECONCILE_MAX_PER_PASS, __resetLostResolveObservationsForTests } =
+  await import("../reconcile.js");
 const { isAlertmanagerPayload } = await import("../webhook-handler.js");
 
 const NOW = new Date("2026-10-12T12:00:00Z");
@@ -50,6 +51,7 @@ const ctx = {
 
 let served: unknown[] = [];
 beforeEach(() => {
+  __resetLostResolveObservationsForTests();
   handleWebhook.mockClear();
   states.clear();
   vi.stubGlobal(
@@ -115,6 +117,20 @@ describe("reconcileActiveAlerts (BLO-44820)", () => {
   it("does not backfill a silenced or inhibited alert, which Alertmanager never notifies", async () => {
     served = [amAlert("silenced", { status: { state: "suppressed", silencedBy: ["s1"], inhibitedBy: [] } })];
     expect((await reconcileActiveAlerts(ctx, config, NOW)).backfilled).toEqual([]);
+  });
+
+  it("runs the grace from un-suppression, not startsAt: an inhibition lifting is not a lost delivery (BLO-51658)", async () => {
+    // Firing for an hour, inhibited the whole time, so `startsAt` is long past the grace.
+    served = [amAlert("inhibited", { status: { state: "suppressed", silencedBy: [], inhibitedBy: ["p"] } })];
+    await reconcileActiveAlerts(ctx, config, NOW);
+    // Inhibition lifts. Alertmanager sends it on its next group flush, so this pass must leave it.
+    served = [amAlert("inhibited")];
+    const at = (ms: number) => new Date(NOW.getTime() + ms);
+    expect((await reconcileActiveAlerts(ctx, config, at(60_000))).backfilled).toEqual([]);
+    expect((await reconcileActiveAlerts(ctx, config, at(5 * 60_000))).backfilled).toEqual([]);
+    // Still untracked a full grace after it became notifiable: that delivery really was lost.
+    expect((await reconcileActiveAlerts(ctx, config, at(60_000 + RECONCILE_GRACE_MS))).backfilled).toEqual(["inhibited"]);
+    expect(ctx.metrics.write).toHaveBeenLastCalledWith("alertmanager.reconcile.backfilled", 1);
   });
 
   it("caps a backlog per pass so recovery is not a burst", async () => {

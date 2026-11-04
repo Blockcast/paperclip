@@ -15,6 +15,51 @@ export interface CostDateRange {
 const METERED_BILLING_TYPE = "metered_api";
 const SUBSCRIPTION_BILLING_TYPES = ["subscription_included", "subscription_overage"] as const;
 
+/**
+ * PEN-4902: the UNBRANCHED run count, and the gap it leaves visible.
+ *
+ * `apiRunCount` and `subscriptionRunCount` partition only the CLASSIFIED rows. `unknown`
+ * is in neither set, and `unknown` is the normal value, not an edge case: it is the
+ * default in `createEvent` and in `createCostEventSchema`, and it is what
+ * `resolveLedgerBillingType` deliberately resolves every Penstock-brokered lane to
+ * (`services/billing-classification.ts`). So on a fleet whose lanes are all brokered,
+ * BOTH counters read 0 for every row while runs are happening.
+ *
+ * Zero there means "nothing is classified", never "no runs" — it fails in the direction
+ * of ABSENCE, which is the reading a caller is least likely to question. A per-run
+ * quantity built on `apiRunCount` divides by zero, and the result looks like an answer.
+ * Nor can the true count be recovered from what used to be served: there was no total,
+ * so `apiRunCount + subscriptionRunCount` is a lower bound and nothing published said so.
+ *
+ * ⇒ Use `costEventRunCount` where you would have reached for the classified pair, and the
+ * classified pair only to ask what fraction of a window is classified.
+ *
+ * ⚠️ `costEventRunCount` is NOT the run count and is deliberately not named `runCount`:
+ * `IssueCostSummary.runCount` already carries that name for runs counted `FROM
+ * heartbeat_runs` with no `cost_events` join, and this one is a strict SUBSET of those —
+ * `heartbeat.ts` writes a cost event only `if (additionalCostCents > 0 ||
+ * consumptionCents > 0 || hasTokenUsage)`, so a run that reported neither spend nor token
+ * usage is absent here and present there. Raised by @Ceo on #3341: a remedy that moves an
+ * error from ABSENT to quietly WRONG, under the name the correct answer would carry, is
+ * worse than the absence. There is no served window-scoped run count to get the true
+ * denominator from: `GET /companies/:id/heartbeat-runs` reads only `agentId`, `limit` and
+ * `summary` (`routes/agents.ts`), and `heartbeat.list` takes no time bounds, so a
+ * `from`/`to` passed there is dropped in silence and the response is the company's whole
+ * run list capped at `limit`. Until such a route exists the count has to come from the
+ * table: `count(*) from heartbeat_runs where company_id = … and created_at` in the
+ * window — noting that clock is the run's queue-entry time, while these aggregates
+ * window on `cost_events.occurred_at`.
+ *
+ * `runlessEventCount` is served beside it because `costEventRunCount` fails the OTHER way:
+ * `cost_events.heartbeat_run_id` is nullable (`packages/db/src/schema/cost_events.ts`)
+ * and `count(distinct …)` skips NULL, so a row reported through `POST /cost-events`
+ * with no run id lands in the numerator of cost-per-run and not in its denominator. A
+ * non-zero `runlessEventCount` means cost-per-run reads HIGH by whatever those rows
+ * carry; it is served rather than inferred so the bias is visible without a second query.
+ */
+const costEventRunCountExpr = sql<number>`count(distinct ${costEvents.heartbeatRunId})::int`;
+const runlessEventCountExpr = sql<number>`count(*) filter (where ${costEvents.heartbeatRunId} is null)::int`;
+
 function sumAsNumber(
   column:
     | typeof costEvents.costCents
@@ -344,6 +389,10 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
           subscriptionRunCount:
             sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
+          // PEN-4902: the unbranched denominator. The two counters above cover only
+          // classified rows and both read 0 while `unknown` is the fleet's normal value.
+          costEventRunCount: costEventRunCountExpr,
+          runlessEventCount: runlessEventCountExpr,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
           // BLO-29842: cache writes used to be folded into inputTokens, so without this
@@ -383,6 +432,10 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
           subscriptionRunCount:
             sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
+          // PEN-4902: the unbranched denominator. The two counters above cover only
+          // classified rows and both read 0 while `unknown` is the fleet's normal value.
+          costEventRunCount: costEventRunCountExpr,
+          runlessEventCount: runlessEventCountExpr,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
           // BLO-29842: cache writes used to be folded into inputTokens, so without this
@@ -418,6 +471,10 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
           subscriptionRunCount:
             sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
+          // PEN-4902: the unbranched denominator. The two counters above cover only
+          // classified rows and both read 0 while `unknown` is the fleet's normal value.
+          costEventRunCount: costEventRunCountExpr,
+          runlessEventCount: runlessEventCountExpr,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
           // BLO-29842: cache writes used to be folded into inputTokens, so without this

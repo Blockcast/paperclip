@@ -1493,6 +1493,131 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-5406 regression: a git object id under any git-object name is not a credential", () => {
+    // Derived, not embedded, so this file stays pushable before the fix deploys.
+    // Same value BLO-46892 pins, deliberately: it is already known to clear the
+    // entropy floor, which is what keeps BOTH halves below deterministic. 95.3%
+    // of uniform 40-hex values refuse under an unanchored name, so a freshly
+    // generated fixture would be a ~1-in-21 flake.
+    const sha = ["2515e5ca485854475eb2739d", "73aef58d765564f2"].join("");
+    const pair = (name: string, value: string) => [name, value].join("=");
+
+    // Every name BLO-46892 left out. `rev` keeps its own suite above.
+    const GIT_OBJECT_NAMES = [
+      "base",
+      "baseRefOid",
+      "base_sha",
+      "commit",
+      "commit_sha",
+      "head",
+      "headRefOid",
+      "head_sha",
+      "oid",
+      "ref",
+      "sha",
+    ];
+
+    it.each(GIT_OBJECT_NAMES)("passes a commit SHA bound to %s byte-exact", (name) => {
+      const text = pair(name, sha);
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    it("passes the REST query and GraphQL forms these names actually appear in", () => {
+      for (const text of [
+        `https://api.github.com/repos/o/r/commits?${pair("sha", sha)}&per_page=1`,
+        `gh api graphql -F ${pair("headRefOid", sha)} -F ${pair("baseRefOid", sha)}`,
+        `git log --format=%H -1 > /tmp/x && ${pair("commit_sha", sha)}`,
+      ]) {
+        expect(scrubGitHubEgressText(text).text).toBe(text);
+        expect(locateGitHubEgressMatches(text)).toEqual([]);
+      }
+    });
+
+    // The set is EXACT and case-sensitive, by the same discipline that keeps
+    // the UUID names from becoming `/Id$/`. `GITHUB_SHA` — the environment
+    // variable every GitHub Actions workflow exports — is a measured remaining
+    // false positive that this decision did not cover, and it is pinned here
+    // as still refused rather than folded in silently. Widening to it is a
+    // separate decision on its own measured case.
+    it.each(["GITHUB_SHA", "SHA", "Ref", "REV", "Commit"])(
+      "still refuses a commit SHA under the un-decided name %s",
+      (name) => {
+        expect(scrubGitHubEgressText(pair(name, sha)).classes).toContain(
+          "high-entropy-assignment",
+        );
+      },
+    );
+
+    // Half 1 — the SHAPE alone exonerates nothing. Widening the name set must
+    // not become a blanket pass for 40 lowercase hex, which is exactly the
+    // layout of a legacy GitHub personal access token (no prefix, so
+    // VENDOR_KEY_RE cannot see one and the entropy rule is the only net).
+    it.each(["password", "token", "secret", "api_key", "GITHUB_TOKEN"])(
+      "still refuses the same 40-hex value under the unanchored name %s",
+      (name) => {
+        const result = scrubGitHubEgressText(pair(name, sha));
+        expect(result.classes).toContain("high-entropy-assignment");
+        expect(result.text).not.toContain(sha);
+      },
+    );
+
+    // Half 2 — the NAME alone exonerates nothing. GIT_COMMIT_SHA_RE is
+    // lowercase- and length-anchored and PEN-5406 did not touch it.
+    it.each(GIT_OBJECT_NAMES)("still refuses a non-SHA value bound to %s", (name) => {
+      for (const token of [sha.toUpperCase(), `${sha}ab`, sha.slice(0, 39), SYNTHETIC_OPAQUE_VALUE]) {
+        const result = scrubGitHubEgressText(pair(name, token));
+        expect(result.classes).toContain("high-entropy-assignment");
+        expect(result.text).not.toContain(token);
+      }
+    });
+  });
+
+  describe("PEN-5406 regression: companyId carries a UUID, and /Id$/ stays un-generalised", () => {
+    // Derived, not embedded, so this file stays pushable before the fix deploys.
+    const pair = (name: string, value: string) => [name, value].join("=");
+    const COMPANY_ID = ["b1d3f3d3", "adc9", "48af", "beb1", "013a18368d84"].join("-");
+
+    it("passes a companyId binding byte-exact", () => {
+      for (const text of [
+        pair("companyId", COMPANY_ID),
+        `https://paperclip.example.invalid/api/issues?${pair("companyId", COMPANY_ID)}`,
+      ]) {
+        expect(scrubGitHubEgressText(text).text).toBe(text);
+        expect(scrubGitHubEgressText(text).redacted).toBe(false);
+        expect(locateGitHubEgressMatches(text)).toEqual([]);
+      }
+    });
+
+    // ⛔ The guard rail on the refused generalisation. If anyone replaces the
+    // UUID_VALUE_NAMES set with a `/Id$/` test, these fail. A UUID genuinely
+    // IS the credential wherever session ids or API keys are issued as UUIDs,
+    // so each of these names must keep refusing until someone brings a
+    // measured false positive for it specifically.
+    it.each(["sessionId", "tokenId", "apiKeyId", "secretId", "credentialId", "keyId"])(
+      "still refuses a UUID bound to %s",
+      (name) => {
+        const result = scrubGitHubEgressText(pair(name, COMPANY_ID));
+        expect(result.classes).toContain("high-entropy-assignment");
+        expect(result.text).not.toContain(COMPANY_ID);
+      },
+    );
+
+    // Shape half, mirroring the BLO-50225 suite: the name alone exonerates
+    // nothing, so a non-UUID token under companyId is still refused.
+    it.each([
+      SYNTHETIC_OPAQUE_VALUE,
+      COMPANY_ID.toUpperCase(),
+      ["s7kq2vt9", "lm4x", "b8nd", "3wp6", "zc1yr5hj0tg9"].join("-"),
+      `${COMPANY_ID}-deadbeefcafe`,
+    ])("still refuses the non-UUID value %s bound to companyId", (token) => {
+      const result = scrubGitHubEgressText(pair("companyId", token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+  });
+
   describe("BLO-41262: locateGitHubEgressMatches names the line", () => {
     const token = SYNTHETIC_OPAQUE_VALUE;
 

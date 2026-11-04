@@ -25,6 +25,7 @@ import { assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo }
 import { fetchAllQuotaWindows } from "../services/quota-windows.js";
 import { badRequest } from "../errors.js";
 import { redactAgentSecrets } from "../agent-redaction.js";
+import { resolveWorkspaceRuntimeViewer } from "./workspace-response.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import type { BudgetEnforcementScope } from "../services/budgets.js";
 
@@ -450,7 +451,14 @@ export function costRoutes(
     // because the redactor was closure-private to the `agentRoutes` factory;
     // it is now a leaf import, so there is no reason not to contain it
     // (PEN-3707 §5 / PEN-3726).
-    res.json(redactAgentSecrets(updated));
+    // PEN-5225: this echo carries `adapterConfig`, so it carries the host-executed workspace
+    // command strings too. Board-gated is not the same entitlement — `workspace_runtime:read`
+    // is, and resolving it here keeps this route's answer identical to the one the agent detail
+    // route gives the same caller for the same row (the PEN-4775 consistency rule).
+    res.json(redactAgentSecrets(
+      updated,
+      await resolveWorkspaceRuntimeViewer(access, req, updated.companyId),
+    ));
   });
 
   return router;

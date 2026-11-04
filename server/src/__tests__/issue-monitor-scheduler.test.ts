@@ -1627,6 +1627,273 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(suppression).not.toContain("maximum attempt count");
   });
 
+  // PEN-3554: the residue PR #1910 (PEN-3326) shipped a comment about and did
+  // not special-case. The monitor claim filter admits only `in_progress` /
+  // `in_review`, so a cancellation has to land in the window BETWEEN the claim
+  // and `enqueueWakeup` to reach the `pipeline_stage_exit_cancellation_pending`
+  // gate at all — and the PEN-3326 deferral then re-armed a future
+  // `monitorNextCheckAt` onto a row no later tick can ever claim back, which
+  // `hasActiveMonitorPath` reads as a live wake path regardless.
+  //
+  // That is the same casualty shape PEN-3326 exists to remove, one race over: a
+  // row reading attended on every field an observer checks while nothing will
+  // ever attend it. `beforeDispatch` is the seam that reaches the window; the
+  // gate itself is driven for real, not stubbed.
+  async function seedPipelineStageExitCancellation(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: "running",
+      invocationSource: "scheduled",
+      startedAt: new Date("2026-04-11T12:00:00.000Z"),
+      createdAt: new Date("2026-04-11T12:00:00.000Z"),
+      contextSnapshot: { issueId: input.issueId, wakeReason: "issue_monitor_due" },
+      resultJson: { pipelineStageExitCancellationRequestedAt: "2026-04-11T12:30:30.000Z" },
+    });
+    await db
+      .update(issues)
+      .set({ executionRunId: runId, executionLockedAt: new Date("2026-04-11T12:00:00.000Z") })
+      .where(eq(issues.id, input.issueId));
+    return runId;
+  }
+
+  /**
+   * The gate needs the execution run to be `running` at `enqueueWakeup` time, but
+   * the suite's `afterEach` will not clean up while any heartbeat run is still
+   * `queued`/`running`/`scheduled_retry` — so a run left running here times out
+   * the teardown and leaks its rows into every later test in the file. Retire it
+   * once the assertions are done.
+   */
+  async function retireSeededExecutionRun(runId: string) {
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date("2026-04-11T12:32:00.000Z") })
+      .where(eq(heartbeatRuns.id, runId));
+  }
+
+  it("does not re-arm a monitor onto an issue cancelled between claim and dispatch (PEN-3554)", async () => {
+    const { companyId, agentId, issueId } = await seedFixture();
+    const runId = await seedPipelineStageExitCancellation({ companyId, agentId, issueId });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    // The real cancel path: `applyMonitorTransition` clears the monitor on the
+    // spot, so by the time the dispatch wants to re-arm, `monitorNextCheckAt` is
+    // already null. The defect was this path putting it BACK.
+    await heartbeat.__test_tickDueIssueMonitors(tickAt, {
+      beforeDispatch: async () => {
+        await db
+          .update(issues)
+          .set({ status: "cancelled", monitorNextCheckAt: null, monitorWakeRequestedAt: null })
+          .where(eq(issues.id, issueId));
+      },
+    });
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.status).toBe("cancelled");
+    // The invariant this row is about: a cancelled issue cannot hold a check
+    // time no tick can claim.
+    expect(issue.monitorNextCheckAt).toBeNull();
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    // Neither of the two wrong answers #1910 weighed: no deferral (which would
+    // have written the undispatchable column) and no triggered patch (which
+    // would assert a wake nobody queued).
+    expect(actions).not.toContain("issue.monitor_dispatch_suppressed_deferred");
+    expect(actions).not.toContain("issue.monitor_triggered");
+
+    await retireSeededExecutionRun(runId);
+  });
+
+  // Same race, but the cancelling write left `monitorNextCheckAt` populated —
+  // the shape a raw status write produces, and the one the periodic
+  // `reconcileUndeliverableIssueMonitors` backstop would otherwise have to sweep
+  // a tick later. The dispatcher now repairs it inline, under the same activity
+  // action the backstop uses so the two agree by construction.
+  it("clears a monitor left armed on an issue cancelled mid-dispatch (PEN-3554)", async () => {
+    const { companyId, agentId, issueId } = await seedFixture();
+    const runId = await seedPipelineStageExitCancellation({ companyId, agentId, issueId });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.__test_tickDueIssueMonitors(tickAt, {
+      beforeDispatch: async () => {
+        await db
+          .update(issues)
+          .set({ status: "cancelled" })
+          .where(eq(issues.id, issueId));
+      },
+    });
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.status).toBe("cancelled");
+    expect(issue.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "cancelled",
+    });
+
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows);
+    const actions = activity.map((row) => row.action);
+    expect(actions).toContain("issue.monitor_cleared_undeliverable");
+    expect(actions).not.toContain("issue.monitor_dispatch_suppressed_deferred");
+    expect(actions).not.toContain("issue.monitor_triggered");
+
+    const cleared = activity.find((row) => row.action === "issue.monitor_cleared_undeliverable");
+    expect(cleared?.details).toMatchObject({ clearReason: "cancelled", status: "cancelled" });
+
+    await retireSeededExecutionRun(runId);
+  });
+
+  // The guard must not become a new way to lose a live monitor: an issue still
+  // `in_progress` at dispatch time re-arms exactly as PEN-3326 specified. This
+  // is the control arm for the two above — without it they would also pass
+  // against a change that simply stopped re-arming altogether.
+  it("still re-arms a suppressed dispatch on an issue that stays deliverable (PEN-3554)", async () => {
+    const { issueId } = await seedFixture({ wakeOnDemand: false });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.__test_tickDueIssueMonitors(tickAt);
+
+    expect(result.dispatchSuppressedDeferred).toBe(1);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:36:00.000Z");
+    expect(issue.monitorAttemptCount).toBe(1);
+  });
+
+  // The suppressed-dispatch deferral above is only ONE of the three branches the
+  // PEN-3554 guard sits on. These two cover the other two, because each reaches
+  // the guard through a different gate and so could regress independently:
+  // the dependency-blocked park needs only an unresolved blocker, while the
+  // watchdog re-dispatch runs an explicit dispatch pass first and therefore
+  // holds the claim→write window open the longest of the three.
+  //
+  // Both cancel with a RAW status write that leaves `monitorNextCheckAt`
+  // populated. That is the shape a cancel not routed through `issuesSvc.update`
+  // produces, and it is the one that exercises the guard's `cleared` outcome —
+  // a cancel that already nulled the column would be satisfied by the guard
+  // merely declining, which is the weaker assertion the first test above makes.
+  it("does not re-arm a dependency-blocked deferral onto an issue cancelled mid-dispatch (PEN-3554)", async () => {
+    const { companyId, issueId } = await seedFixture();
+    await seedBlocker(companyId, issueId);
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.__test_tickDueIssueMonitors(tickAt, {
+      beforeDispatch: async () => {
+        await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+      },
+    });
+
+    // Read the park BEFORE releasing it. This is the positive marker that the
+    // dispatch really took the dependency-blocked branch: the park is what sets
+    // `dependencyBlockedRetryAt`, and without it this test would pass against the
+    // suppressed-dispatch branch the first test already covers — i.e. it would
+    // silently stop covering the branch it is named for.
+    const parked = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.scheduledRetryReason, "dependency_blocked"));
+
+    // Release the park before asserting: a `scheduled_retry` row counts as an
+    // active run and the shared teardown blocks until none remain, so a failing
+    // expectation below would otherwise cascade into a teardown timeout that
+    // buries the real diagnostic.
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.scheduledRetryReason, "dependency_blocked"));
+
+    expect(parked, "the wake must have parked on the blocker, or this is not the dep-blocked branch").toHaveLength(1);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.status).toBe("cancelled");
+    expect(issue.monitorNextCheckAt).toBeNull();
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(actions).toContain("issue.monitor_cleared_undeliverable");
+    expect(actions).not.toContain("issue.monitor_dependency_blocked_deferred");
+    expect(actions).not.toContain("issue.monitor_triggered");
+  });
+
+  it("does not re-arm a watchdog re-dispatch onto an issue cancelled mid-dispatch (PEN-3554)", async () => {
+    const { issueId } = await seedFixture();
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+    await db.update(issues).set({ executionRunId: queuedRun.id }).where(eq(issues.id, issueId));
+
+    // Pass 1 arms the watchdog against the stuck run, exactly as the
+    // re-dispatch test above does.
+    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await heartbeat.tickTimers(lapseDetectedAt);
+    const armed = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(armed.monitorNextCheckAt, "watchdog armed").not.toBeNull();
+    // Positive marker that pass 2 enters the WATCHDOG branch rather than an
+    // ordinary dispatch: the branch is selected by the armed monitor's
+    // serviceName, so asserting it here is what keeps this test pinned to the
+    // branch it is named for.
+    expect(parseIssueExecutionState(armed.executionState)?.monitor).toMatchObject({
+      serviceName: "paperclip_monitor_dispatch",
+    });
+    const watchdogDueAt = armed.monitorNextCheckAt!;
+
+    // Pass 2 fires the watchdog, and the cancel lands in the claim→write window.
+    await heartbeat.__test_tickDueIssueMonitors(new Date(watchdogDueAt.getTime() + 1000), {
+      beforeDispatch: async () => {
+        await db.update(issues).set({ status: "cancelled" }).where(eq(issues.id, issueId));
+      },
+    });
+
+    // Settle the deliberately-stuck run before asserting, for the same
+    // teardown-drain reason as above.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: watchdogDueAt })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.status).toBe("cancelled");
+    // The watchdog re-arm is the widest of the three windows, so this is the
+    // branch most likely to persist an undispatchable check time.
+    expect(issue.monitorNextCheckAt).toBeNull();
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(actions).toContain("issue.monitor_cleared_undeliverable");
+    expect(actions).not.toContain("issue.monitor_dispatch_watchdog_redispatched");
+  });
+
   // Policy drift — `monitorNextCheckAt` still set while the monitor policy is
   // gone — has nothing to rebuild, so the deferral cannot be persisted and the
   // pre-existing clear must still terminate the row. Deferring without a write

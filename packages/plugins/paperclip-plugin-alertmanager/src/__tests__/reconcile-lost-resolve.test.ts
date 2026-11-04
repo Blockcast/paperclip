@@ -223,6 +223,16 @@ describe("BLO-51097 — reconcile resolves alerts whose resolve delivery was los
     ]);
   });
 
+  it("does not backfill an alert that joined an aggregate row (BLO-51658)", async () => {
+    const { ctx, issues } = mkCtx();
+    await fire(ctx, [alertOf("fp-m1", "2026-10-31T14:50:00Z"), alertOf("fp-m2", "2026-10-31T14:51:00Z")]);
+    expect(issues.size).toBe(1); // fp-m2 owns no row of its own; it is a member of fp-m1's
+    held = [amEntry("fp-m1", "2026-10-31T14:50:00Z"), amEntry("fp-m2", "2026-10-31T14:51:00Z")];
+    expect((await reconcileActiveAlerts(ctx, config(), T0)).backfilled).toEqual([]);
+    expect((await reconcileActiveAlerts(ctx, config(), later(RECONCILE_GRACE_MS))).backfilled).toEqual([]);
+    expect(issues.size).toBe(1);
+  });
+
   it("treats a silenced alert as still held", async () => {
     const { ctx, issues } = mkCtx();
     await fire(ctx, [alertOf("fp-q", "2026-10-31T14:50:00Z")]);

@@ -11,7 +11,9 @@ import {
   classifyMergeQueueEviction,
   extractPaperclipIdentifiers,
   filterMergeGroupRunsForPr,
+  isGatingJobName,
   isQueueInitiatedRemoval,
+  MERGE_GROUP_GATING_JOBS,
   mergeQueueHeadBranchPrefix,
   selectLatestQueueAttemptWindow,
 } from "../merge-queue-eviction-detector.mjs";
@@ -135,6 +137,28 @@ test("classifies a failing merge_group run as check_failure", () => {
     mergeGroupRuns: [{ conclusion: "success" }, { conclusion: "failure" }],
   });
   assert.equal(classification, "check_failure");
+});
+
+test("BLO-51600: a run the sweeper cancelled after a job failed is check_failure, not manual", () => {
+  assert.equal(
+    classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [{ conclusion: "cancelled", hasFailedJob: true }] }),
+    "check_failure",
+  );
+  assert.equal(
+    classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [{ conclusion: "cancelled", hasFailedJob: false }] }),
+    "manual",
+  );
+});
+
+test("BLO-51600: only jobs verify aggregates are gating; list pinned to pr.yml", () => {
+  assert.equal(isGatingJobName("e2e"), false);
+  assert.equal(isGatingJobName("Canary Dry Run"), false);
+  assert.equal(isGatingJobName("verify"), false);
+  assert.equal(isGatingJobName("General tests (server 3/6)"), true);
+  assert.equal(isGatingJobName("policy"), true);
+  const prYml = readFileSync(new URL("../../.github/workflows/pr.yml", import.meta.url), "utf8");
+  const laneNames = [...prYml.match(/lane_job_names=\(\n([\s\S]*?)\n\s*\)/)[1].matchAll(/"([^"]+)"/g)].map((m) => m[1]);
+  assert.deepEqual(MERGE_GROUP_GATING_JOBS, [...laneNames, "policy", "ally-verdict"]);
 });
 
 test("classifies a non-failing merge_group run with no merge as manual", () => {

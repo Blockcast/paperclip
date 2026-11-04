@@ -24,7 +24,8 @@ import {
 } from "../services/index.js";
 import { evaluateAgentIssueApprovalLinkAuthorization } from "./issue-approval-link-authorization.js";
 import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
-import { redactApprovalPayloadForDisplay, withholdAgentConfigFromApprovalPayload } from "../redaction.js";
+import { projectApprovalPayloadForRead, type AgentWorkspaceCommandViewer } from "../agent-redaction.js";
+import { resolveWorkspaceRuntimeViewer } from "./workspace-response.js";
 import {
   BUDGET_POLICY_AMOUNT_ASSERTION,
   extractEnforcementAssertions,
@@ -54,32 +55,36 @@ import {
 } from "../services/recovery/origins.js";
 
 /**
- * `includeAgentConfig` is the caller's `agent_config:read` verdict, not a
- * formatting preference — see `withholdAgentConfigFromApprovalPayload`. It is a
- * required argument so a new approval-serializing route has to state which side
- * of that gate it is on rather than inheriting a permissive default.
+ * Both verdicts are REQUIRED arguments, not formatting preferences, so a new
+ * approval-serializing route has to state which side of each gate it is on
+ * rather than inheriting a permissive default:
+ *
+ *  - `includeAgentConfig` is `agent_config:read` — see
+ *    `withholdAgentConfigFromApprovalPayload` (PEN-2777).
+ *  - `workspaceCommandViewer` is `workspace_runtime:read` — see
+ *    `projectApprovalPayloadForRead` (PEN-5225). The two are independent: the
+ *    grants that clear the first (`agents:configure`, `agents:suggest-changes`)
+ *    say nothing about the second, which no agent can hold at all.
+ *
+ * The projection itself is shared with `services/issue-approvals.ts`, the third
+ * path to this same payload, so a correction lands on every exit at once.
  */
 function redactApprovalPayload<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
-  options: { includeAgentConfig: boolean },
+  options: { includeAgentConfig: boolean; workspaceCommandViewer: AgentWorkspaceCommandViewer },
 ): T & { redactedFields: string[]; withheldFields: string[] } {
-  const { payload, redactedFields } = redactApprovalPayloadForDisplay(approval.type, approval.payload);
-  if (options.includeAgentConfig) {
-    return { ...approval, payload, redactedFields, withheldFields: [] };
-  }
-  const withheld = withholdAgentConfigFromApprovalPayload(approval.type, payload);
-  return {
-    ...approval,
-    payload: withheld.payload,
-    redactedFields,
-    withheldFields: withheld.withheldFields,
-  };
+  const { payload, redactedFields, withheldFields } = projectApprovalPayloadForRead(
+    approval.type,
+    approval.payload,
+    options,
+  );
+  return { ...approval, payload, redactedFields, withheldFields };
 }
 
 function approvalResolutionResponse<T extends { type: string; payload: Record<string, unknown> }>(
   approval: T,
   applied: boolean,
-  options: { includeAgentConfig: boolean },
+  options: { includeAgentConfig: boolean; workspaceCommandViewer: AgentWorkspaceCommandViewer },
 ): T & { redactedFields: string[]; withheldFields: string[]; applied: boolean } {
   return {
     ...redactApprovalPayload(approval, options),
@@ -391,11 +396,20 @@ export function approvalRoutes(
 
   /**
    * `company_scope:read` gets you the card; it does not get you the hire's
-   * embedded agent configuration. Second, narrower verdict resolved per request
-   * and threaded into every approval serialization. PEN-2777.
+   * embedded agent configuration, and clearing THAT does not get you the
+   * host-executed command strings inside it. Two further verdicts, narrower in
+   * that order, resolved per request and threaded into every approval
+   * serialization. PEN-2777, PEN-5225.
    */
   async function approvalReadOptions(req: Request, companyId: string) {
-    return { includeAgentConfig: await actorCanReadAgentConfig(req, access, companyId) };
+    // Two decisions, resolved independently and threaded together. PEN-5225: a peer holding
+    // `agents:configure` clears the first and never the second, so collapsing them into one
+    // lookup would re-disclose the host-executed command strings this card carries.
+    const [includeAgentConfig, workspaceCommandViewer] = await Promise.all([
+      actorCanReadAgentConfig(req, access, companyId),
+      resolveWorkspaceRuntimeViewer(access, req, companyId),
+    ]);
+    return { includeAgentConfig, workspaceCommandViewer };
   }
 
   // PEN-3275: `recoveryRunWriteClassNotice` (`services/recovery/model-profile-hint.ts`) RESTATES

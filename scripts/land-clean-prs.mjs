@@ -197,6 +197,30 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * leaves the next repo a full budget, up to `10 x repos` doomed calls. Those
  * are no-ops, so that is accepted rather than spending budget on them and
  * starving later repos in the sweep.
+ *
+ * The daily ceiling this implies, recorded 2026-11-03 (PEN-5397) because
+ * nothing else states it: the routine fires four times a day (a six-hourly
+ * cron at 45 past, America/LA), so the cap puts the ceiling at 40 NEW
+ * enqueues per day. `already-enqueued` rows do not spend a slot.
+ *
+ * That ceiling is now being reached, which it was not when the cap was
+ * chosen. Merged PRs per UTC day over 10-23..11-03 peaked at 52 (11-02),
+ * with 44 on 10-29 and 40 on 10-30. A single classifier sample at
+ * 2026-11-03T12:31Z produced 10 `enqueue` + 1 `already-enqueued` + 3
+ * `cap:10-per-fire` -- a 14-PR eligible pool against a 10-PR budget -- and
+ * the pool read at or above the cap on every hourly `landing-sweep` sample
+ * from 08:29Z to 12:31Z.
+ *
+ * If that has to be fixed, fix it with fire FREQUENCY, not by raising this
+ * number. Raising the cap buys throughput by spending the blast-radius
+ * guarantee in the first paragraph, and spends it silently -- nothing about
+ * a larger number announces that the safety margin moved. More fires at the
+ * same cap leave the per-fire radius at exactly 10 and raise the daily
+ * ceiling linearly, so the two concerns stay decoupled.
+ *
+ * The related REPORTING gap -- that a PR deferred by this cap is visible to
+ * neither alarm arm -- is a separate defect owned by PEN-5391, not this
+ * constant.
  */
 export const MAX_ENQUEUES_PER_FIRE = 10;
 
@@ -269,6 +293,49 @@ const ALLY_VERDICT_STATUS_RE = /^(?:review|gate)\/ally-/i;
  * be TERMINAL — see `resolveMergeState`.
  */
 export const UNLANDABLE_MERGE_STATES = new Set(["DIRTY", "UNSTABLE", "UNKNOWN"]);
+
+/**
+ * Every value GitHub's `mergeStateStatus` enum can take.
+ *
+ * Exhaustive on purpose: `readMergeState` maps everything OUTSIDE this set to
+ * UNKNOWN, so the set is what makes "unrecognised" a decidable question rather
+ * than a guess. Adding a state GitHub later introduces is a deliberate act —
+ * until it is added, that state is held rather than merged.
+ */
+export const KNOWN_MERGE_STATES = new Set([
+  "BEHIND",
+  "BLOCKED",
+  "CLEAN",
+  "DIRTY",
+  "DRAFT",
+  "HAS_HOOKS",
+  "UNKNOWN",
+  "UNSTABLE",
+]);
+
+/**
+ * The PR's merge state, as a value `UNLANDABLE_MERGE_STATES` can decide.
+ *
+ * ⛔ The fail-closed direction is the whole point, and it is load-bearing in a
+ * way the obvious `String(x ?? "UNKNOWN").toUpperCase()` is NOT. That spelling
+ * defends only `undefined` and `null`, because `??` passes an empty string
+ * through — and `""` is not in `UNLANDABLE_MERGE_STATES`, so it falls past
+ * every hold and classifies `enqueue` with the reason `mergestate:`. Measured
+ * 2026-11-04 against the real classifier (PEN-5442): absent, `undefined` and
+ * `null` all held at `skip — mergestate:UNKNOWN`, while `""` ENQUEUED.
+ *
+ * That matters here because `fetchOpenPrs` now JOINS the merge state on from a
+ * second call, so for the first time a row can reach the classifier carrying a
+ * state nobody read. A join that defaults a miss to `""` — or to any value
+ * outside the enum — would merge it. Rather than rely on every present and
+ * future join spelling its default correctly, the classifier refuses to read
+ * anything it does not recognise as a state: unknown input is an UNREAD state,
+ * and an unread state is never a licence to merge.
+ */
+export function readMergeState(value) {
+  const raw = typeof value === "string" ? value.trim().toUpperCase() : "";
+  return KNOWN_MERGE_STATES.has(raw) ? raw : "UNKNOWN";
+}
 
 /**
  * How many extra reads to spend resolving an UNKNOWN `mergeStateStatus`, and
@@ -972,7 +1039,7 @@ export function classifyPr(pr, { now = Date.now(), settleMinutes = CHECK_SETTLE_
     detail,
   });
 
-  const mergeState = String(pr?.mergeStateStatus ?? "UNKNOWN").toUpperCase();
+  const mergeState = readMergeState(pr?.mergeStateStatus);
   if (mergeState === "DIRTY") {
     // An approval already paid for here is the BLO-33208 priority cohort: the
     // work is finished and reviewed, master moved underneath it, and no GitHub
@@ -1070,16 +1137,25 @@ export function classifyAll(
     spent = 0,
   } = {},
 ) {
-  let enqueued = spent;
-  return (prs ?? []).map((pr) => {
-    const classified = classifyPr(pr, { now, settleMinutes });
-    if (classified.action !== "enqueue") return classified;
-    if (enqueued >= maxEnqueues) {
-      return { ...classified, action: "skip", reason: `cap:${maxEnqueues}-per-fire` };
-    }
-    enqueued += 1;
-    return classified;
-  });
+  const rows = (prs ?? []).map((pr) => classifyPr(pr, { now, settleMinutes }));
+  // The cap is spent OLDEST PR FIRST (BLO-51664). `gh pr list` returns newest
+  // first, so allocating in listing order handed every fire's budget to the
+  // newest arrivals while older landable PRs were deferred fire after fire —
+  // starvation, not a one-off miss. Ascending PR number is the age proxy;
+  // output order is unchanged.
+  const winners = new Set(
+    rows
+      .map((row, i) => ({ row, i, n: prs[i]?.number ?? Infinity }))
+      .filter(({ row }) => row.action === "enqueue")
+      .sort((a, b) => a.n - b.n)
+      .slice(0, Math.max(0, maxEnqueues - spent))
+      .map(({ i }) => i),
+  );
+  return rows.map((row, i) =>
+    row.action !== "enqueue" || winners.has(i)
+      ? row
+      : { ...row, action: "skip", reason: `cap:${maxEnqueues}-per-fire` },
+  );
 }
 
 /**
@@ -1140,6 +1216,12 @@ export function renderReceipt(rows) {
  * the ones with the oldest check stamps. Aging it would fire this report
  * hardest exactly when the queue is deepest and the routine is working
  * normally.
+ *
+ * Its exclusion here is unchanged, but it is no longer a blind spot: the
+ * persistent case — deferred for budget while NEVER having been offered a
+ * queue slot — is owned by `capStarved`, which discriminates on the PR's own
+ * timeline rather than on this clock. See its comment for why that is the
+ * only safe way to see a cap deferral (PEN-5391).
  */
 const DELIBERATE_HOLD_REASON_RE = /^(?:human-author|draft|label:|cap:)/;
 
@@ -1154,6 +1236,12 @@ const NON_HOLD_ACTIONS = new Set([
   // `classifyFromListing`, which has a better clock for it than this one: the
   // request's own `enabledAt`.
   "stale-enqueue",
+  // PEN-5430. A notify-only repo's clean PR is held by POLICY — we do not land
+  // there — and that hold never clears. Aging it would park every clean PR in
+  // the repo in the stale-hold cohort permanently and, on `--apply`, comment
+  // on each one saying the routine is not enqueuing it. True, useless, and
+  // forever.
+  "notify-only",
 ]);
 
 /**
@@ -1285,16 +1373,29 @@ export const UNLANDED_ELIGIBLE_HOURS = 6;
  * `enqueue-failed` — `markFailure` renames the action, which drops it out of
  * `NON_HOLD_ACTIONS`, so `stalledHolds` already ages it. Covered.
  *
- * `cap:N-per-fire` — a STATED residual, not an oversight. `stalledHolds`
- * excludes it because the deferred rows are selected for old check stamps
- * (the budget is spent on PRs that reported more recently), so this clock is
- * biased against them at any threshold; aging them would fire hardest exactly
- * when the queue is deepest and the routine is working. That reasoning holds
- * here unchanged, so a cap-STARVED PR is invisible to both detectors. It is
- * accepted because starvation is not reachable at today's figures — the cap
- * is MAX_ENQUEUES_PER_FIRE per fire against a measured 18-34 merges/day — and
- * it wants its own detector with its own clock if it ever becomes so. Do not
- * close that gap by widening this predicate.
+ * `cap:N-per-fire` — still excluded here, and `stalledHolds` still excludes it
+ * by reason, for an argument that is unchanged: the deferred rows are selected
+ * for old check stamps (the budget is spent on PRs that reported more
+ * recently), so this clock is biased against them at any threshold, and aging
+ * them would fire hardest exactly when the queue is deepest and the routine is
+ * working. Do not close the gap by widening this predicate.
+ *
+ * ⚠ What HAS changed is the premise that made the resulting blind spot
+ * acceptable. This paragraph used to read "accepted because starvation is not
+ * reachable at today's figures — the cap is MAX_ENQUEUES_PER_FIRE per fire
+ * against a measured 18-34 merges/day — and it wants its own detector with its
+ * own clock if it ever becomes so." That precondition FAILED, measured
+ * 2026-11-03 (PEN-5391): merges to `master` ran 27 on Nov 1, **51 on Nov 2**
+ * and ~45/day on Nov 3, above the band; and the cap was SATURATED on 4 of 4
+ * consecutive hourly samples (10 of 10 `enqueue` rows at 08:29Z, 09:27Z,
+ * 10:28Z, 11:28Z), deferring 4-6 PRs each time. It had already produced a
+ * silent miss: at 11:28Z the sweep went red naming 6 PRs and #3306 was not
+ * among them, after 12h CLEAN and never once queued.
+ *
+ * So the detector that paragraph asked for now exists — `capStarved`, with its
+ * own clock (CAP_STARVED_HOURS) and, crucially, its own DISCRIMINATOR, which
+ * is not an age test at all. See its comment. Both predicates here stayed
+ * exactly as they were.
  *
  * ## A sampling gap, measured rather than assumed
  *
@@ -1352,6 +1453,160 @@ export function renderUnlandedEligible(
     "that has not happened is the landing itself, not a decision about it. " +
     "Check that the routine is firing and that its enqueues are succeeding " +
     "before looking at the PRs."
+  );
+}
+
+/**
+ * How long a PR may sit cap-deferred, having never once been offered a queue
+ * slot, before it is reported as starved rather than as waiting its turn.
+ *
+ * ## Why a third cohort, and why the other two cannot have it
+ *
+ * `classifyAll` rewrites an over-budget `enqueue` into `skip`/`cap:`, which
+ * puts the row outside BOTH existing detectors — `stalledHolds` excludes
+ * `cap:` by reason (DELIBERATE_HOLD_REASON_RE), `unlandedEligible` excludes it
+ * by action. That residual is stated on `unlandedEligible` and it was correct
+ * while it held. It no longer holds; see the correction there.
+ *
+ * Neither predicate may simply be widened, and the reason is the same for
+ * both: the cap spends its budget on PRs that reported more recently, so the
+ * deferred set is SELECTED for old check stamps. An age test over `cap:` rows
+ * alone therefore fires hardest exactly when the queue is deepest and the
+ * routine is working hardest — an alarm on normal operation, which is the
+ * failure mode every cohort in this file is written to avoid.
+ *
+ * ## What makes this cohort safe where a widened predicate is not
+ *
+ * The age test is not the discriminator here; `everOfferedQueueSlot` is. A PR
+ * deferred by one saturated fire is normal and lands on a later one — and the
+ * moment it does, GitHub writes `added_to_merge_queue` to its timeline and the
+ * PR leaves this cohort permanently, whatever its check stamps say. What
+ * remains is only the PR that has gone its entire judgeable life without the
+ * routine ever offering it a slot, which is starvation and not depth.
+ *
+ * That also answers "where does the across-fire state live". It lives in the
+ * PR's own timeline, which is already fetched with `--paginate` for the
+ * ejection rule, so this cohort costs no API call and needs no durable store
+ * shared between fires.
+ *
+ * ## Why twelve hours
+ *
+ * Measured 2026-11-03 over the 30 most recent merges to `master`
+ * (#3274 - #3326, created 2026-11-02T10:49Z - 2026-11-03T06:18Z): every one
+ * of the 30 reached the queue, and the wait from CREATION to the first
+ * `added_to_merge_queue` ran min 3.9h, median 6.3h, p90 10.0h, max 11.7h.
+ *
+ * That is a strictly LOOSER clock than this one — a head's newest check stamp
+ * is never earlier than the PR's creation, so judgeable age at first enqueue
+ * is at most the figure above. Twelve hours is therefore past the worst
+ * observed first-slot wait measured on a clock that over-states it, which is
+ * the conservative direction: this cohort would have named none of those 30.
+ *
+ * Deliberately longer than UNLANDED_ELIGIBLE_HOURS (6). A row reading
+ * `enqueue` waits on nobody, so the routine's own cadence bounds it. A `cap:`
+ * row is waiting on a budget that genuinely refills, so it is owed the full
+ * span in which this repo demonstrably hands out first slots.
+ */
+export const CAP_STARVED_HOURS = 12;
+
+/** Rows `classifyAll` deferred for budget, as opposed to any other skip. */
+const CAP_DEFERRAL_REASON_RE = /^cap:/;
+
+/**
+ * Timeline events that mean the routine has, at some point, offered this PR a
+ * queue slot. `added_to_merge_queue` is the queue-enabled path and
+ * `auto_merge_enabled` the arming that precedes it; either one is proof.
+ *
+ * `removed_from_merge_queue` is deliberately NOT here. An ejected PR was
+ * served and bounced, which is the opposite of starved, and it is already
+ * carried by `added_to_merge_queue` on the same timeline (6 of 6 merged PRs
+ * sampled 2026-11-03 showed the pair). Reading the ejection as evidence in its
+ * own right would add nothing and would invite the inverse error.
+ */
+const QUEUE_OFFER_EVENTS = new Set(["added_to_merge_queue", "auto_merge_enabled"]);
+
+/**
+ * Whether this PR has ever been offered a queue slot: `true`, `false`, or
+ * `null` when the timeline was not read.
+ *
+ * ## `null` is not `false`, and conflating them is the expensive direction
+ *
+ * `fetchOpenPrs` hydrates `timeline` only for PRs that survive
+ * `classifyFromListing`, which is exactly the set that can reach `cap:` — so
+ * in this script the datum is always present for the rows `capStarved`
+ * examines. The three-valued return exists for the day that stops being true:
+ * an absent timeline read as `false` would make EVERY cap-deferred row look
+ * starved at once, turning this detector into noise on its first fire and
+ * costing the alarm its credibility across all three cohorts.
+ *
+ * Verified live 2026-11-03 before this cohort was written, because a predicate
+ * over an event that never appears is vacuous and reports clean forever: 6 of
+ * 6 recently merged PRs carried `added_to_merge_queue`, and the two PRs then
+ * sitting cap-deferred (#3306, #3215) carried no queue event at all.
+ */
+export function everOfferedQueueSlot(timeline) {
+  if (!Array.isArray(timeline)) return null;
+  return timeline.some((event) => QUEUE_OFFER_EVENTS.has(event?.event));
+}
+
+/**
+ * The PRs the classifier said yes to, that the per-fire cap deferred, and that
+ * the routine has never once offered a queue slot, as
+ * `{ number, reason, ageHours }`.
+ *
+ * ## What is deliberately NOT in this cohort
+ *
+ * A cap-deferred PR that HAS been queued before — however long ago, and
+ * whether it merged from there or was ejected. It is not starved: the routine
+ * reached it. An ejected head has its own rule (`ejected-at-current-head`) and
+ * its own clock, and claiming it here would name one PR twice under two
+ * mechanisms that disagree about what is wrong with it.
+ *
+ * A PR whose timeline was not read (`everOfferedQueueSlot === null`). This
+ * cohort's entire claim is "nothing has ever offered this a slot", and an
+ * unread timeline cannot support it — the same posture `unlandedEligible`
+ * takes toward `mergestate:UNKNOWN`. Note this is the OPPOSITE call to the
+ * undatable-clock case below, and deliberately so: the clock REFINES a finding
+ * that stands without it, while the timeline IS the finding.
+ *
+ * An undatable row (`ageHours === null`) is REPORTED, matching both sibling
+ * cohorts and for the same §4l reason: an instrument that cannot see something
+ * must not report clean. A cap-deferred PR that has never been queued and
+ * whose head carries no dated check is a true finding twice over.
+ *
+ * ⚠ A row whose PR is MISSING from `prs` is dropped, where both siblings keep
+ * it. That is the unread-timeline rule above rather than a different §4l
+ * posture — no PR means no timeline — but it IS a divergence, so it is named
+ * here and pinned by a test rather than left to be discovered. Unreachable in
+ * this script, where rows and PRs come from one fetch.
+ */
+export function capStarved(prs, rows, { now = Date.now(), staleHours = CAP_STARVED_HOURS } = {}) {
+  const byNumber = new Map((prs ?? []).map((pr) => [pr?.number, pr]));
+  const starved = [];
+  for (const row of rows ?? []) {
+    if (row?.action !== "skip") continue;
+    if (!CAP_DEFERRAL_REASON_RE.test(String(row?.reason ?? ""))) continue;
+    if (everOfferedQueueSlot(byNumber.get(row?.number)?.timeline) !== false) continue;
+    const ageHours = judgeableAgeHours(byNumber.get(row?.number), { now });
+    if (ageHours !== null && ageHours < staleHours) continue;
+    starved.push({ number: row?.number, reason: row?.reason, ageHours });
+  }
+  return starved;
+}
+
+/** The cap-starved block for one repo's receipt, or "" when there is none. */
+export function renderCapStarved(repo, starved, { staleHours = CAP_STARVED_HOURS } = {}) {
+  if ((starved ?? []).length === 0) return "";
+  const line = ({ number, reason, ageHours }) =>
+    `  ${repo}#${number} — \`${reason}\`, ` +
+    (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`);
+  return (
+    `cap-starved (judgeable >${staleHours}h, never once queued) — ${starved.length}:\n` +
+    starved.map(line).join("\n") +
+    "\nThese are eligible and were deferred for budget, not for a reason — and " +
+    "unlike the usual cap deferral they have never been offered a slot at all. " +
+    "So demand is outrunning MAX_ENQUEUES_PER_FIRE rather than queueing behind " +
+    "it. Raising throughput is the fix; re-running the routine is not."
   );
 }
 
@@ -1471,10 +1726,153 @@ export function stateHold(repo, { number, reason, ageHours, detail }, run = gh) 
 }
 
 const PR_LIST_FIELDS =
-  "number,headRefOid,author,labels,isDraft,autoMergeRequest,mergeStateStatus,reviewRequests";
+  "number,headRefOid,author,labels,isDraft,autoMergeRequest,reviewRequests";
+
+/**
+ * Open PRs per page when reading merge states.
+ *
+ * ⛔ This is the fix, and it is a PAGE size, not a limit. `gh pr list` pages at
+ * 100 regardless of `--limit`, so on a repo with >=100 open PRs it issues a
+ * 100-item page — and a 100-item page carrying `mergeStateStatus` is what
+ * GitHub 502s on. Measured 2026-11-04 against Blockcast/penstock-llm-proxy-core
+ * at 153 open PRs (PEN-5442):
+ *
+ *   all 8 fields, one call (what this replaced)        0/3 OK
+ *   7 fields, no mergeStateStatus, `gh pr list`        5/5 OK
+ *   number+mergeStateStatus, `gh pr list` (100-page)  10/13 OK
+ *   all 8 fields, GraphQL, 50-item page                4/5 OK
+ *   number+mergeStateStatus, GraphQL, 25-item page     6/6 OK
+ *   number+mergeStateStatus, GraphQL, 10-item page     6/6 OK
+ *
+ * Note the third row: splitting the call is NOT sufficient on its own. The
+ * merge-state half still rides a 100-item page through `gh pr list` and still
+ * fails about a quarter of the time. Controlling the page size is the part
+ * that works, and `gh pr list` has no flag for it — hence the raw query.
+ *
+ * 25 over 10 only to spend 7 round trips instead of 16; both measured clean.
+ */
+export const MERGE_STATE_PAGE_SIZE = 25;
+
+/**
+ * Open PRs with their merge state, by number.
+ *
+ * ⛔ Hand-rolled GraphQL, which this file warns against elsewhere — that
+ * warning is about `statusCheckRollup`, whose `contexts(first: 100)` truncates
+ * SILENTLY and drops required checks. It does not transfer here: this query
+ * selects two scalars and reaches no nested connection, so there is no inner
+ * page to truncate. The outer connection is paginated by `--paginate` against
+ * `pageInfo`, and `fetchOpenPrs` cross-checks the result against the listing
+ * anyway. Everything with a shape worth getting wrong — `author.is_bot`,
+ * `labels`, `reviewRequests` — is deliberately left to `gh pr list`, which
+ * owns that mapping. Widening this query to those fields would put the
+ * fail-open direction (an unread `reviewRequests` reads as "no owner is
+ * waiting") behind a hand-written type mapping. Do not.
+ */
+export function fetchMergeStates(repo, { run = gh, pageSize = MERGE_STATE_PAGE_SIZE } = {}) {
+  const [owner, name] = String(repo).split("/");
+  const query = `query($owner:String!,$name:String!,$first:Int!,$endCursor:String){
+  repository(owner:$owner,name:$name){
+    pullRequests(states:OPEN,first:$first,after:$endCursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{ number mergeStateStatus }
+    }
+  }
+}`;
+  const out = run([
+    "api",
+    "graphql",
+    "--paginate",
+    "-F",
+    `owner=${owner}`,
+    "-F",
+    `name=${name}`,
+    "-F",
+    `first=${pageSize}`,
+    "--jq",
+    ".data.repository.pullRequests.nodes[] | {number, mergeStateStatus}",
+    "-f",
+    `query=${query}`,
+  ]);
+  const states = new Map();
+  for (const line of String(out).split("\n")) {
+    if (!line.trim()) continue;
+    const node = JSON.parse(line);
+    // `readMergeState` here as well as in the classifier: this map is the
+    // join's input, and normalising at the boundary means a malformed node
+    // enters as UNKNOWN rather than as a string the classifier has to defend
+    // against later.
+    states.set(node?.number, readMergeState(node?.mergeStateStatus));
+  }
+  return states;
+}
+
+function execGh(args) {
+  return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+}
+
+/** Longest rate-limit reset one fire will wait out before aborting (BLO-51665). */
+export const RATE_LIMIT_MAX_WAIT_MS = 120_000;
+
+/**
+ * Milliseconds until the rate-limit bucket `args` draws from resets, read from
+ * a probe's own `X-Ratelimit-*` response headers; `0` when the bucket already
+ * has headroom again, `null` when the headers could not be read.
+ *
+ * ⛔ Not `/rate_limit`: on this installation its body AND its headers report a
+ * bucket ordinary calls do not draw from (BLO-37855), so it reads healthy
+ * during exactly the throttle this exists to wait out. `gh api -i` prints the
+ * headers on stdout even when the probe itself is refused, which is the case
+ * that matters. `gh pr …` and `gh api graphql` draw from the GraphQL bucket,
+ * every other `gh api` path from core, so the probe matches the failing call.
+ */
+export function rateLimitWaitMs(args, { exec = execGh, now = Date.now } = {}) {
+  const graphql = args[0] !== "api" || args[1] === "graphql";
+  const probe = graphql
+    ? ["api", "-i", "graphql", "-f", "query={viewer{login}}"]
+    : ["api", "-i", "meta"];
+  let out;
+  try {
+    out = exec(probe);
+  } catch (error) {
+    out = `${error?.stdout ?? ""}\n${error?.stderr ?? ""}`;
+  }
+  const header = (name) => {
+    const match = new RegExp(`^x-ratelimit-${name}:\\s*(\\d+)`, "im").exec(String(out));
+    return match ? Number(match[1]) : null;
+  };
+  const remaining = header("remaining");
+  if (remaining === null) return null;
+  if (remaining > 0) return 0;
+  const reset = header("reset");
+  return reset === null ? null : Math.max(0, reset * 1000 - now()) + 5_000;
+}
+
+/**
+ * Runs `gh`, waiting out ONE rate-limit refusal whose reset is near (BLO-51665).
+ *
+ * A 403 that clears in 22s used to abort the whole fire and cost six hours of
+ * landings. The deliberate abort for a real exhaustion is kept: a reset beyond
+ * RATE_LIMIT_MAX_WAIT_MS, unreadable headers, or a second refusal all rethrow
+ * the original error into `isFatalGhError`. Retrying a refused write is safe —
+ * a 403 applied nothing.
+ */
+export function ghWithRateLimitRetry(
+  args,
+  { exec = execGh, sleep = sleepSync, waitMs = rateLimitWaitMs } = {},
+) {
+  try {
+    return exec(args);
+  } catch (error) {
+    if (!/rate limit/i.test(String(error?.stderr ?? error?.message ?? ""))) throw error;
+    const wait = waitMs(args, { exec });
+    if (wait === null || wait > RATE_LIMIT_MAX_WAIT_MS) throw error;
+    sleep(wait);
+    return exec(args);
+  }
+}
 
 function gh(args) {
-  return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+  return ghWithRateLimitRetry(args);
 }
 
 /**
@@ -1537,26 +1935,52 @@ export function fetchPrFiles(repo, number, run = gh) {
  * identity rules pin immutable REST account IDs, which the GraphQL shape does
  * not carry. A login string alone is not review evidence (I5).
  */
-function fetchOpenPrs(repo) {
+export function fetchOpenPrs(repo, { run = gh, mergeStates = fetchMergeStates } = {}) {
   const rows = JSON.parse(
-    gh(["pr", "list", "--repo", repo, "--state", "open", "--limit", "500", "--json", PR_LIST_FIELDS]),
+    run(["pr", "list", "--repo", repo, "--state", "open", "--limit", "500", "--json", PR_LIST_FIELDS]),
   );
   assertPrListComplete(rows, repo, 500);
+  // The second half of the split (PEN-5442, see MERGE_STATE_PAGE_SIZE). Read
+  // BEFORE the listing is joined so a failure here fails the whole read rather
+  // than yielding a listing with every merge state missing — which, absent
+  // `readMergeState`, is the shape that would enqueue.
+  const states = mergeStates(repo, { run });
   // One fetch per repo, not per PR: the rules are a property of the base branch.
-  const codeownerRules = fetchCodeownerRules(repo);
+  const codeownerRules = fetchCodeownerRules(repo, run);
   return rows.map((row) => {
     assertHeadSha(row, repo);
-    if (classifyFromListing(row)) return row;
+    // ⛔ The join, and the `??` is load-bearing in the fail-CLOSED direction.
+    //
+    // The two calls are not atomic: a PR open for the listing can merge, or be
+    // closed, before the merge-state read — so a number present in `rows` with
+    // no entry in `states` is the EXPECTED race, not a bug. It must resolve to
+    // a hold. `"UNKNOWN"` is the literal that does that (it is in
+    // `UNLANDABLE_MERGE_STATES`), and `readMergeState` is what makes any other
+    // spelling of "nothing here" — `undefined`, `null`, `""` — resolve the
+    // same way instead of falling through to `enqueue`.
+    //
+    // Do NOT "improve" this to a default that looks landable, and do not drop
+    // the row: dropping it would hide a PR from the receipt and from the
+    // unlanded-eligible detector, which is how a strand becomes invisible.
+    // The cost of the hold is one cycle; the next fire reads it again.
+    const joined = { ...row, mergeStateStatus: states.get(row?.number) ?? "UNKNOWN" };
+    if (classifyFromListing(joined)) return joined;
     return {
-      ...row,
+      ...joined,
       // Only PRs that survived `classifyFromListing` can still enqueue, so an
       // unresolved UNKNOWN can only change a verdict here — the same rule that
       // scopes `files`, `reviews` and `timeline` below.
-      mergeStateStatus: resolveMergeState(repo, row.number, row.mergeStateStatus),
+      // An UNKNOWN from the join is resolved by exactly the same per-PR
+      // re-read that has always resolved an UNKNOWN from GitHub, so a row
+      // that lost its state to the race above is repaired here rather than
+      // waiting a whole cycle — and when the re-read fails it stays UNKNOWN
+      // and stays held. Spent only on rows that survived `classifyFromListing`,
+      // i.e. the ones that could still enqueue.
+      mergeStateStatus: resolveMergeState(repo, joined.number, joined.mergeStateStatus, { run }),
       codeownerRules,
       // Only PRs that actually carry a request can be scoped by ownership, so
       // the extra call is spent only where it can change a verdict.
-      files: (row.reviewRequests ?? []).length > 0 ? fetchPrFiles(repo, row.number) : [],
+      files: (joined.reviewRequests ?? []).length > 0 ? fetchPrFiles(repo, joined.number, run) : [],
       // No `--paginate` here, and none is needed: `gh pr view` does not accept
       // the flag because it paginates the rollup's `contexts` connection
       // itself. Measured 2026-11-02 on gh 2.102.0 against
@@ -1576,9 +2000,9 @@ function fetchOpenPrs(repo) {
       // silently, and in a routine whose action is `enqueue` that direction
       // merges.
       statusCheckRollup: JSON.parse(
-        gh(["pr", "view", String(row.number), "--repo", repo, "--json", "statusCheckRollup"]),
+        run(["pr", "view", String(joined.number), "--repo", repo, "--json", "statusCheckRollup"]),
       ).statusCheckRollup,
-      reviews: JSON.parse(gh(["api", `repos/${repo}/pulls/${row.number}/reviews`, "--paginate"])),
+      reviews: JSON.parse(run(["api", `repos/${repo}/pulls/${joined.number}/reviews`, "--paginate"])),
       // The merge-queue ejection history, for the `ejected-at-current-head`
       // rule. Spent only on PRs that already survived `classifyFromListing`,
       // i.e. the ones that could still enqueue — on this repo a handful of the
@@ -1590,7 +2014,7 @@ function fetchOpenPrs(repo) {
       // and reports `count: 0` — a confident all-clear, in the fail-open
       // direction.
       timeline: JSON.parse(
-        gh(["api", `repos/${repo}/issues/${row.number}/timeline`, "--paginate"]),
+        run(["api", `repos/${repo}/issues/${joined.number}/timeline`, "--paginate"]),
       ),
     };
   });
@@ -1626,7 +2050,7 @@ export function resolveMergeState(repo, number, current, options = {}) {
   } = options;
   // Spend nothing on a PR whose state GitHub already computed. This is the
   // overwhelmingly common case and it must stay free.
-  if (String(current ?? "UNKNOWN").toUpperCase() !== "UNKNOWN") return current;
+  if (readMergeState(current) !== "UNKNOWN") return current;
 
   for (let attempt = 0; attempt < retries; attempt += 1) {
     // Sleep FIRST. The read that reported UNKNOWN is what scheduled the
@@ -1641,7 +2065,7 @@ export function resolveMergeState(repo, number, current, options = {}) {
     } catch {
       continue;
     }
-    if (String(next ?? "UNKNOWN").toUpperCase() !== "UNKNOWN") return next;
+    if (readMergeState(next) !== "UNKNOWN") return next;
   }
   return current;
 }
@@ -1791,17 +2215,160 @@ export function applyRow(repo, row, run = gh) {
     );
   }
   if (row.action === "codeowner-review-requested") {
-    return commentOnce(
-      repo,
-      row.number,
-      CODEOWNER_REQUEST_MARKER,
-      `This PR is clean at its current head but still has an outstanding code-owner review ` +
-        `request (${row.detail}). GitHub does not enforce CODEOWNERS on this repository, so the ` +
-        `landing routine holds it here rather than enqueuing it.`,
-      run,
-    );
+    return codeownerRequestComment(repo, row, run, LAND_REPO_HOLD_REASON);
   }
   return null;
+}
+
+/**
+ * Why a LAND repo's clean PR is being held rather than enqueued: the routine
+ * would land it, and is declining because CODEOWNERS is advisory here and
+ * enqueuing would merge past an owner who was asked to look.
+ */
+const LAND_REPO_HOLD_REASON =
+  "GitHub does not enforce CODEOWNERS on this repository, so the landing routine holds it here " +
+  "rather than enqueuing it.";
+
+/**
+ * Why a NOTIFY-ONLY repo's clean PR is being held: because this routine does
+ * not land anything here at all.
+ *
+ * The reason MUST be passed in rather than shared, and the land-repo sentence
+ * is actively false in the repo this notify list was built for. Measured on
+ * `Blockcast/penstock-llm-proxy-core`#2959 (2026-11-03): `mergeStateStatus:
+ * BLOCKED`, `reviewDecision: REVIEW_REQUIRED`, `.github/CODEOWNERS` reading
+ * `* @Blockcast/onprem-k8s-ally-reviewer @kkroo`. GitHub enforces the owner
+ * review there. Posting "GitHub does not enforce CODEOWNERS on this
+ * repository" would tell the one human the notification exists to reach that
+ * their review is unenforced — and `commentOnce` dedupes on the marker, so
+ * that sentence would be permanent per PR and unreplaceable without changing
+ * the marker. (Ally review, PR #3365.)
+ */
+const NOTIFY_ONLY_HOLD_REASON =
+  "This routine does not land pull requests in this repository — it only reports holds — so " +
+  "nothing here will merge it. It is waiting on the requested review.";
+
+/**
+ * The code-owner notification, lifted out of `applyRow` so that
+ * `applyRowNotifyOnly` can post it WITHOUT sharing a function body with
+ * `gh pr merge`. That separation is the whole structural claim of PEN-5430:
+ * the notify-only path is not a flag checked inside the lander, it is a
+ * different applier with no reachable merge call to get wrong.
+ *
+ * `holdReason` is a required argument rather than a default, so adding a third
+ * applier cannot inherit a sentence that is untrue in its repo by forgetting
+ * to override one.
+ */
+function codeownerRequestComment(repo, row, run, holdReason) {
+  return commentOnce(
+    repo,
+    row.number,
+    CODEOWNER_REQUEST_MARKER,
+    `This PR is clean at its current head but still has an outstanding code-owner review ` +
+      `request (${row.detail}). ${holdReason}`,
+    run,
+  );
+}
+
+/**
+ * The applier for a NOTIFY-ONLY repo: it posts the code-owner notification and
+ * can do nothing else.
+ *
+ * PEN-5430. `targetRepos()` used to answer two unrelated questions with one
+ * list — "where do we notify a human-gated hold" and "where do we arm
+ * `gh pr merge --auto`" — so adding a repo in order to get the first silently
+ * bought the second. `Blockcast/penstock-llm-proxy-core` wants the
+ * notification and must never get the arming: it is PR-gated and human-owned,
+ * and agent PRs there land only on a human's click.
+ *
+ * Note what this function does NOT contain: any call to `run(["pr", "merge",
+ * ...])`. A notify-only repo is incapable of enqueuing because the code that
+ * enqueues is not on its path, not because a classifier declined to ask for
+ * it. `runRepo` additionally demotes the merge-shaped actions before this is
+ * ever called (`demoteMergeActions`), so the guarantee is doubled: nothing
+ * reaches here reading `enqueue`, and nothing here could act on it if it did.
+ */
+export function applyRowNotifyOnly(repo, row, run = gh) {
+  if (row?.action === "codeowner-review-requested") {
+    return codeownerRequestComment(repo, row, run, NOTIFY_ONLY_HOLD_REASON);
+  }
+  return null;
+}
+
+/**
+ * Which applier a repo gets. A named function rather than a ternary buried in
+ * `runRepo`'s parameter defaults, so the choice is assertable on its own.
+ *
+ * That is not a style preference. The two guards protecting a notify-only repo
+ * — this selection and `demoteMergeActions` — are REDUNDANT by construction:
+ * the demotion renames every merge-shaped row before any applier sees it, so
+ * after it has run both appliers behave identically on every action that
+ * exists. No stub can therefore tell them apart through `runRepo`, and an edit
+ * reverting this selection to `applyRow` passed the entire suite when the
+ * choice lived in a default expression. Hoisting it here makes the edit
+ * visible to a test.
+ *
+ * The redundancy is deliberate and both halves are kept: the demotion is
+ * required for reasons that have nothing to do with safety (the enqueue cap,
+ * the `--alarm` cohort, the receipt tally — see its own comment), and this
+ * selection is what makes "a notify-only repo cannot merge" true even if the
+ * demotion is one day bypassed or a new merge-shaped action is added without
+ * being added to MERGE_MUTATING_ACTIONS.
+ */
+export function applierFor(landable) {
+  return landable ? applyRow : applyRowNotifyOnly;
+}
+
+/** The action a merge-shaped row becomes in a notify-only repo. */
+export const NOTIFY_ONLY_ACTION = "notify-only";
+
+/**
+ * The actions `applyRow` serves by MUTATING MERGE STATE — `enqueue` arms
+ * auto-merge, `stale-enqueue` disarms it. Both are refused in a notify-only
+ * repo: we are a guest there, and disarming a human's auto-merge is as much
+ * not-ours-to-do as arming one.
+ */
+const MERGE_MUTATING_ACTIONS = new Set(["enqueue", "stale-enqueue"]);
+
+/**
+ * Rewrites the merge-shaped rows of a notify-only repo to `notify-only`, in
+ * place, before anything reads them.
+ *
+ * This is not cosmetic, and it is not the structural guard either (that is
+ * `applyRowNotifyOnly`). It exists because three separate readers key on the
+ * literal action `enqueue` and all three would be WRONG about a notify-only
+ * repo if the row kept that name:
+ *
+ *   - `sweepRepos` tallies `enqueue` rows as spend against
+ *     MAX_ENQUEUES_PER_FIRE. A notify-only repo arms nothing, so counting its
+ *     clean PRs would let it starve the repos that actually land — a repo
+ *     added for NOTIFICATIONS silently throttling the lander is the same
+ *     class of coupling this whole row exists to remove.
+ *   - `unlandedEligible` reports a long-lived `enqueue` row as stranded and
+ *     `--alarm` exits non-zero on it. A clean PR in a notify-only repo is not
+ *     stranded; it is held by policy, and alarming on it would turn the
+ *     detector permanently red for working as designed.
+ *   - `renderReceipt` tallies by action, so the fire would print `enqueue: N`
+ *     for a repo in which it enqueued nothing — the #2020 shape, a receipt
+ *     naming an action nobody took.
+ *
+ * `notify-only` joins NON_HOLD_ACTIONS for a fourth reason: `stalledHolds`
+ * would otherwise age every clean PR in the repo into the stale-hold cohort
+ * forever, since the "hold" never clears by design.
+ */
+export function demoteMergeActions(rows) {
+  for (const row of rows ?? []) {
+    if (!MERGE_MUTATING_ACTIONS.has(row?.action)) continue;
+    const suppressed = row.action;
+    row.action = NOTIFY_ONLY_ACTION;
+    row.detail = [
+      row.detail,
+      `notify-only repo: would have \`${suppressed}\`, but this fire does not touch merge state here`,
+    ]
+      .filter(Boolean)
+      .join(" — ");
+  }
+  return rows;
 }
 
 /**
@@ -1810,13 +2377,76 @@ export function applyRow(repo, row, run = gh) {
  * times (BLO-29984 multicast, BLO-31321 trafficcontrol, BLO-32205 onprem-k8s,
  * BLO-33208) and regrown in the same repos every time. A single-repo sweep is
  * how the other two stay unobserved between cleanups.
+ *
+ * This list is the LAND list, and since PEN-5430 that is all it is. A repo
+ * named here has `gh pr merge --auto` armed on its clean PRs. To get a repo's
+ * code-owner holds NOTIFIED without that, name it in `notifyRepos()` below —
+ * the two questions used to share this one list, which made widening it for a
+ * notification a policy change wearing a config edit's clothes.
  */
 export function targetRepos(value = process.env.LAND_CLEAN_PRS_REPO) {
+  return parseRepoList(value, ["Blockcast/paperclip"]);
+}
+
+/**
+ * Repos this fire NOTIFIES but must never land in. Comma-separated, defaulting
+ * to EMPTY — the notify list is opt-in, and an unset variable must leave the
+ * routine behaving exactly as it did before PEN-5430.
+ *
+ * ## Why this is a second list and not another entry in the first one
+ *
+ * `targetRepos()` answers two unrelated questions at once: where do we post
+ * `CODEOWNER_REQUEST_MARKER` when a PR's only remaining gate is a human, and
+ * where do we arm `gh pr merge --auto` on a clean one. Adding a repo for the
+ * first silently buys the second, which is a policy change wearing a config
+ * edit's clothes.
+ *
+ * `Blockcast/penstock-llm-proxy-core` is the case that forced the split. It is
+ * PR-gated and human-owned: agent PRs there land on a human's click and on
+ * nothing else. It wants the notification badly — PEN-1942 ("DO NOT CLOSE:
+ * prod has NO backup") sat green on an unnotified single human reviewer from
+ * 2026-10-29 — and must not acquire an autolander as the price of getting it.
+ *
+ * ## A repo in BOTH lists is notify-only
+ *
+ * The restrictive reading wins, deliberately. A repo is in the notify list
+ * precisely to say "do not land here", so honouring that over an overlapping
+ * grant fails in the safe direction: the worst case is that nothing lands
+ * somewhere it could have, which the receipt shows plainly as `notify-only`
+ * rows. The opposite precedence makes a typo arm an autolander, which is the
+ * failure this row exists to make unreachable.
+ */
+export function notifyRepos(value = process.env.LAND_CLEAN_PRS_NOTIFY_REPO) {
+  return parseRepoList(value, []);
+}
+
+function parseRepoList(value, fallback) {
   const repos = String(value ?? "")
     .split(",")
     .map((repo) => repo.trim())
     .filter(Boolean);
-  return repos.length > 0 ? repos : ["Blockcast/paperclip"];
+  return repos.length > 0 ? repos : fallback;
+}
+
+/**
+ * The repos one fire visits, land-list first, deduplicated.
+ *
+ * Land-first is not arbitrary: `sweepRepos` carries the enqueue spend forward
+ * in list order, so visiting the repos that can actually spend it first keeps
+ * MAX_ENQUEUES_PER_FIRE meaning what it says. (Notify-only repos spend nothing
+ * — `demoteMergeActions` sees to that — so this is belt-and-braces rather than
+ * load-bearing today. It stops being free the moment anything else is counted
+ * per repo in list order.)
+ */
+export function sweepOrder(targets, notifies) {
+  const order = [];
+  const seen = new Set();
+  for (const repo of [...(targets ?? []), ...(notifies ?? [])]) {
+    if (seen.has(repo)) continue;
+    seen.add(repo);
+    order.push(repo);
+  }
+  return order;
 }
 
 /**
@@ -1886,10 +2516,71 @@ export function runRepo(
   spent,
   rotted,
   stranded = [],
-  { fetch = fetchOpenPrs, classify = classifyAll, applyOne = applyRow, state = stateHold } = {},
+  starved = [],
+  {
+    fetch = fetchOpenPrs,
+    classify = classifyAll,
+    // PEN-5430. `false` for a notify-only repo. Note the applier DEFAULT is
+    // derived from it rather than branched on inside the applier: in a
+    // notify-only repo `applyRow` is never referenced at all, so there is no
+    // in-function flag for a later edit to get wrong.
+    landable = true,
+    applyOne = applierFor(landable),
+    // The `gh` seam handed to whichever applier was selected above, so a test
+    // can assert over the invocations that applier makes without replacing it
+    // (which would stop testing the selection).
+    applyRun = gh,
+    state = stateHold,
+  } = {},
 ) {
-  const prs = fetch(repo);
-  const rows = classify(prs, { settleMinutes, spent });
+  // PEN-5391. This signature has now grown a positional twice, and BOTH times
+  // a caller's options bag silently bound to the NEW positional instead:
+  // BLO-51665's rate-limit test (slot 6 -> `stranded`) and PEN-5430's
+  // `repoRunner` spread (slot 7 -> `starved`). Neither threw. `fetch` simply
+  // fell back to the real `fetchOpenPrs`, so the test issued a LIVE GraphQL
+  // call and asserted against whatever GitHub returned — green, and testing
+  // nothing. The cost is not hypothetical: `landing-sweep.yml` runs this
+  // suite before the hourly sweep, so a wedged arity takes the sweep with it.
+  //
+  // So reject the shape rather than trusting the next inserter to notice. An
+  // options bag is a plain object and `starved` is an array; a mis-bound
+  // caller dies here, loudly, naming the slot, instead of quietly going live.
+  if (!Array.isArray(starved)) {
+    throw new TypeError(
+      "runRepo: `starved` (7th positional) must be an array — received " +
+        `${starved === null ? "null" : typeof starved}. A caller passing its ` +
+        "options bag in slot 7 is the usual cause; the bag is slot 8.",
+    );
+  }
+  let prs;
+  try {
+    prs = fetch(repo);
+  } catch (error) {
+    // BLO-51665: a throw here used to leave the receipt EMPTY, so nobody could
+    // tell which repo the fire died in or why. Say it on stdout, then rethrow.
+    //
+    // PEN-5442: the rethrow no longer necessarily ends the fire — `repoRunner`
+    // decides that, and skips this repo unless the error is one
+    // `isFatalGhError` calls untrustworthy. The message is worded for both
+    // outcomes, because this frame does not know which it will get.
+    const message = error?.stderr?.toString() || error?.message || String(error);
+    console.log(`## ${repo}\n\nCould not collect PRs: ${message.trim().split("\n")[0]}`);
+    throw error;
+  }
+  // The per-fire cap is applied INSIDE `classifyAll`, which rewrites an
+  // `enqueue` past the ceiling to `skip`/`cap:N-per-fire` before
+  // `demoteMergeActions` can see it. In a notify-only repo that prints a
+  // throttle which cannot apply there — the repo spends no budget and arms
+  // nothing — and it would do so routinely: once the land repos spend the cap,
+  // or once the notify repo holds more than MAX_ENQUEUES_PER_FIRE clean PRs.
+  // Opting out of the cap here is what makes `sweepOrder`'s "notify-only repos
+  // spend nothing" literally true rather than nearly true. (Ally review,
+  // PR #3365.)
+  const budget = landable ? { spent } : { spent: 0, maxEnqueues: Infinity };
+  const rows = classify(prs, { settleMinutes, ...budget });
+  // Before the apply loop, before the receipt, and before `sweepRepos` reads
+  // the returned rows — every consumer of `enqueue` must see the demoted name.
+  if (!landable) demoteMergeActions(rows);
 
   for (const row of rows) {
     if (row.action === "approval-rotted") rotted.push(`${repo}#${row.number} (${row.detail})`);
@@ -1898,7 +2589,7 @@ export function runRepo(
   for (const row of rows) {
     if (!apply) continue;
     try {
-      const outcome = applyOne(repo, row);
+      const outcome = applyOne(repo, row, applyRun);
       if (outcome) row.detail = [row.detail, outcome].filter(Boolean).join(" — ");
     } catch (error) {
       const message = error?.stderr?.toString() || error?.message || String(error);
@@ -1949,6 +2640,19 @@ export function runRepo(
   const eligible = apply ? [] : unlandedEligible(prs, rows);
   for (const row of eligible) stranded.push(`${repo}#${row.number}`);
 
+  // Same `apply ? [] :` cut as the cohort above, for a reason that is
+  // adjacent but not identical. There the post-apply flip makes the claim
+  // FALSE; here it makes it UNSOUND to measure. An applying fire has just
+  // spent the budget this cohort reasons about, and `applyRow` enqueues
+  // without re-reading any timeline, so a row deferred by that very spend
+  // would be scored against a snapshot taken before it. The hourly
+  // `--alarm` fire, which cannot apply by construction, is the one that
+  // owns this measurement — and it is also the one whose cap is a pure
+  // simulation, so its `cap:` rows mean "demand exceeds the budget right
+  // now" rather than "this fire ran out", which is exactly the question.
+  const capped = apply ? [] : capStarved(prs, rows);
+  for (const row of capped) starved.push(`${repo}#${row.number}`);
+
   // Stated on the PR, not just in this receipt — and only on `--apply`, since
   // it is a write. A failure here is recorded against the row and never
   // aborts: the report above is the load-bearing output, and losing it
@@ -1956,7 +2660,13 @@ export function runRepo(
   // for one PR's. `isFatalGhError` is deliberately NOT consulted — a rate
   // limit reached while commenting has already let the reads through, so the
   // receipt is trustworthy and worth printing.
-  if (apply) {
+  //
+  // `landable` gates this too (PEN-5430): in a notify-only repo the ONLY write
+  // this routine makes is the code-owner notification. A `stated-hold:*`
+  // comment there would be the routine explaining its own inaction in a repo
+  // where its inaction is the policy — and we are a guest in that repo, so the
+  // narrowest possible write surface is the one worth asking a human to grant.
+  if (apply && landable) {
     const byNumber = new Map(rows.map((row) => [row?.number, row]));
     for (const row of held) {
       const classified = byNumber.get(row?.number);
@@ -1983,7 +2693,12 @@ export function runRepo(
       }
     }
   }
-  const blocks = [renderReceipt(rows), stalled, renderUnlandedEligible(repo, eligible)];
+  const blocks = [
+    renderReceipt(rows),
+    stalled,
+    renderUnlandedEligible(repo, eligible),
+    renderCapStarved(repo, capped),
+  ];
   console.log(`## ${repo}\n\n${blocks.filter(Boolean).join("\n\n")}`);
   return rows;
 }
@@ -2009,12 +2724,100 @@ export function sweepRepos(repos, runOne) {
  * the cap per repo again) without running `main`. `run` is a test seam.
  */
 export const repoRunner =
-  (apply, settleMinutes, rotted, stranded = [], run = runRepo) =>
+  (
+    apply,
+    settleMinutes,
+    rotted,
+    stranded = [],
+    run = runRepo,
+    notify = new Set(),
+    // PEN-5442. Repos this fire could not read, by the same
+    // collected-by-reference convention as `rotted`/`stranded`: `main` reports
+    // it after the sweep and `alarmExitCode` reads it. A CONSTRUCTOR argument
+    // ONLY: `unreadable` is never threaded into the per-repo vector, because
+    // the condition it records — the repo could not be listed — is observed
+    // out here, where the throw is caught, and is never visible inside
+    // `runRepo`.
+    unreadable = [],
+    // PEN-5391. The cap-starved cohort, same collected-by-reference
+    // convention. APPENDED as the 8th rather than inserted, so PEN-5442's
+    // `unreadable` keeps the 7th and `run`/`notify` do not move: every
+    // existing positional call site stays correct by construction, which is
+    // what made the PEN-5442 shape safe and is worth preserving rather than
+    // re-earning. Unlike `unreadable` this one IS threaded through to
+    // `runRepo` — a cap deferral is observed per PR inside the sweep
+    // (`starved.push` sits beside `stranded.push`), not out here.
+    starved = [],
+  ) =>
   (repo, spent) => {
-    const rows = run(repo, apply, settleMinutes, spent, rotted, stranded);
+    // Spread rather than an unconditional trailing argument, so a fire with
+    // no notify list calls `runRepo` with exactly the positionals it needs and
+    // no `undefined` in the bag's slot.
+    //
+    // PEN-5391 moved `runRepo`'s options bag from slot 7 to slot 8, because
+    // `starved` is now `runRepo`'s 7th positional. Note this is `runRepo`'s
+    // numbering, NOT `repoRunner`'s — `starved` is `repoRunner`'s 8th
+    // constructor argument, and the two vectors are different lengths. Reading
+    // one function's slot number as the other's is exactly how this collision
+    // was first miscounted.
+    //
+    // Both of this file's last two parameter insertions bound a caller's
+    // options bag to the new positional in silence (BLO-51665's rate-limit
+    // test, then this spread), so `runRepo` opens with an
+    // `Array.isArray(starved)` throw naming the slot, which fails the suite
+    // rather than letting a third one through.
+    const options = notify.has(repo) ? [{ landable: false }] : [];
+    let rows;
+    try {
+      rows = run(repo, apply, settleMinutes, spent, rotted, stranded, starved, ...options);
+    } catch (error) {
+      // PEN-5442: one unreadable repo used to end the WHOLE fire. `fetchOpenPrs`
+      // is the first thing `runRepo` does and its throw escaped `runRepo`'s
+      // try, `sweepRepos` had no catch, and `main` wrapped the sweep in
+      // try/`finally` with no catch either — so a repo the routine merely
+      // could not list took every other repo down with it. That it did not
+      // cost anything yet was ordering luck: `sweepOrder` happens to sweep the
+      // land repos first, so their rows were already printed.
+      //
+      // Measured 2026-11-04, Blockcast/penstock-llm-proxy-core at 153 open
+      // PRs: the single list call 502'd on 3 of 3 attempts. A repo that cannot
+      // be read is a repo with no verdicts — which is a reason to say so and
+      // move on, not a reason to discard the verdicts of the repos that CAN be
+      // read.
+      const message = error?.stderr?.toString() || error?.message || String(error);
+      const first = message.trim().split("\n")[0];
+      // `isFatalGhError` keeps its meaning exactly: exhausted rate limits or
+      // bad credentials make the WHOLE fire untrustworthy, not just this repo,
+      // because every subsequent `skip:` row would be indistinguishable from a
+      // real verdict. Those still end the fire.
+      if (isFatalGhError(first)) throw error;
+      unreadable.push(`${repo} (${first})`);
+      console.log(`Skipped ${repo}: it could not be listed. The rest of the fire continues.\n`);
+      // No rows, so `sweepRepos` carries no spend for this repo — correct, it
+      // enqueued nothing.
+      return [];
+    }
     console.log("");
     return rows;
   };
+
+/**
+ * Names the repos this fire skipped, in every run mode.
+ *
+ * Printed from `main`'s `finally` beside `reportRotted` so it survives a later
+ * abort, and unconditionally rather than only under `--alarm`: a dry run that
+ * silently covered one repo fewer than the reader assumes is the same wrong
+ * conclusion, just without an exit code to carry it.
+ */
+function reportUnreadable(unreadable) {
+  if ((unreadable ?? []).length === 0) return;
+  console.log(
+    `\nunreadable repos (PEN-5442) — ${unreadable.length}:\n` +
+      unreadable.map((repo) => `  ${repo}`).join("\n") +
+      "\nThis fire asserts nothing about these: no receipt, no holds, no " +
+      "unlanded-eligible cohort. Everything above covers the other repos only.",
+  );
+}
 
 function reportRotted(rotted) {
   if (rotted.length === 0) return;
@@ -2032,14 +2835,47 @@ function reportRotted(rotted) {
 
 /**
  * The exit code for an alarm run: 1 when any repo carried an unlanded-eligible
- * PR, 0 otherwise.
+ * or a cap-starved PR, 0 otherwise.
  *
  * Separated from `main` so the AC4 contract — go visibly red rather than
  * relying on someone noticing by hand — is pinned by a test rather than by
  * reading the shape of `main`.
+ *
+ * ⛔ EVERY term here must be able to go red ON ITS OWN, and each is a separate
+ * parameter rather than one widened array so that a caller cannot satisfy the
+ * contract by passing the wrong cohort in the right slot. The three are
+ * independent conditions with different remedies, and dropping any one of them
+ * during a future merge compiles, passes every test that calls this function
+ * directly, and silently retires an alarm arm — which is why
+ * `pins all three alarm terms at main's call site` reads the call site itself.
+ *
+ * ⛔ `unreadable` is a term for a reason, and it is the whole reason skipping
+ * an unreadable repo is safe. Before PEN-5442 an unreadable repo CRASHED the
+ * fire, which at least exited non-zero. Skipping it instead would, on its own,
+ * convert that noisy failure into `0` — "no PR has been landable and ignored
+ * for UNLANDED_ELIGIBLE_HOURS" asserted over a repo this fire never read. That
+ * is the fail-OPEN direction and it is exactly the shape of silent all-clear
+ * this detector exists to rule out, so the skip and this term ship together: a
+ * repo that went unread makes the alarm red on its own.
+ *
+ * `starved` (PEN-5391) is a THIRD argument rather than a widening of either
+ * existing one because the cohorts are reported separately and have different
+ * remedies, and because every existing caller then keeps its meaning
+ * unchanged. Both optional arguments default to the quiet value for the same
+ * reason: a caller that does not know about a cohort cannot be made red by it.
+ *
+ * ⚠ The stale-hold block is deliberately still NOT here. It is printed, not
+ * alarmed, and that asymmetry predates this cohort: a stale hold names a
+ * decision someone owes, which a red schedule cannot make them take. The
+ * alarming cohorts instead assert that NOTHING is owed and the landing has
+ * not happened anyway, which is a statement about the routine itself.
  */
-export function alarmExitCode(stranded) {
-  return (stranded ?? []).length > 0 ? 1 : 0;
+export function alarmExitCode(stranded, unreadable = [], starved = []) {
+  return (stranded ?? []).length > 0 ||
+    (unreadable ?? []).length > 0 ||
+    (starved ?? []).length > 0
+    ? 1
+    : 0;
 }
 
 function main() {
@@ -2057,20 +2893,37 @@ function main() {
   const settleMinutes = settleMinutesFrom();
   const rotted = [];
   const stranded = [];
+  const unreadable = [];
+  const starved = [];
 
   // `finally`, because the cohort is the expensive half of the output and the
   // likeliest thrower is `fetchOpenPrs` — outside `runRepo`'s try, one list
   // call plus two per undecided PR, multiplied by the repo count, and in a dry
   // run the only `gh` traffic there is. The explicit call before `process.exit`
   // in `runRepo` stays: `exit` does not unwind, so this block never runs there.
+  // PEN-5430: two lists, one sweep. `notify` is the set the fire may comment
+  // in and must not land in; `targetRepos()` is unchanged, so an unset
+  // LAND_CLEAN_PRS_NOTIFY_REPO leaves behaviour exactly as it was.
+  const notify = new Set(notifyRepos());
   try {
-    sweepRepos(targetRepos(), repoRunner(apply, settleMinutes, rotted, stranded));
+    sweepRepos(
+      sweepOrder(targetRepos(), [...notify]),
+      repoRunner(apply, settleMinutes, rotted, stranded, runRepo, notify, unreadable, starved),
+    );
   } finally {
     reportRotted(rotted);
+    reportUnreadable(unreadable);
   }
 
   if (!apply) console.log("\n(dry run — pass --apply to act)");
 
+  if (alarm && unreadable.length > 0) {
+    console.error(
+      `\nALARM: ${unreadable.length} repo(s) could not be listed, so this run asserts ` +
+        `NOTHING about them — ${unreadable.join(", ")}.\n` +
+        "The sweep continued and the repos below were read normally; these were not.",
+    );
+  }
   if (alarm && stranded.length > 0) {
     console.error(
       `\nALARM: ${stranded.length} PR(s) have been landable for over ` +
@@ -2079,7 +2932,17 @@ function main() {
         "See the unlanded-eligible block above.",
     );
   }
-  if (alarm) process.exit(alarmExitCode(stranded));
+  if (alarm && starved.length > 0) {
+    console.error(
+      `\nALARM: ${starved.length} PR(s) have been eligible for over ` +
+        `${CAP_STARVED_HOURS}h and the per-fire cap has never once offered them ` +
+        `a queue slot — ${starved.join(", ")}.\n` +
+        "Nothing is holding them either; demand is simply outrunning " +
+        `MAX_ENQUEUES_PER_FIRE (${MAX_ENQUEUES_PER_FIRE}). Re-running the routine will not ` +
+        "reach them. See the cap-starved block above.",
+    );
+  }
+  if (alarm) process.exit(alarmExitCode(stranded, unreadable, starved));
 }
 
 export function isMainModule(argvPath = process.argv[1], moduleUrl = import.meta.url) {

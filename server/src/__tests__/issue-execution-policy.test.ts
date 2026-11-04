@@ -6,6 +6,7 @@ import {
   applyIssueMonitorPolicyTransition,
   buildIssueMonitorClearedPatch,
   buildIssueMonitorEligibilityPatch,
+  derivePersistedMonitorState,
   exhaustedMonitorClearReason,
   isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
@@ -96,6 +97,267 @@ describe("buildIssueMonitorEligibilityPatch", () => {
         },
       }),
     ).toEqual({});
+  });
+});
+
+// PEN-5343: `paperclip-plugin-alertmanager` cancels an alert row when its alert
+// resolves and reopens it when the alert re-fires, so an alert row is a
+// *recycled* row rather than a terminal one. Each cancel clears the assignee's
+// armed monitor: 13 of 13 `issue.monitor_cleared_undeliverable` events on
+// PEN-4365 and PEN-4261 paired with a plugin cancel within 3-26 s, and not one
+// of those monitors had fired — they were destroyed between 1h01m and 14h43m
+// early.
+//
+// Clearing is correct (a cancelled row genuinely cannot deliver a wake). What
+// was wrong is that the due time was the one piece of the armed monitor the
+// clear did not keep, so the row could not answer "was a wake owed here, and
+// when" without a per-issue activity-feed pull. These pin the due time onto the
+// row's own cleared state.
+describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343)", () => {
+  const armedAt = "2026-11-03T12:30:00.000Z";
+  const armed = {
+    status: "in_progress",
+    assigneeAgentId: coderAgentId,
+    assigneeUserId: null,
+    monitorNextCheckAt: new Date(armedAt),
+    monitorNotes: "re-check the PEN-5294 gate",
+    executionPolicy: {
+      monitor: { nextCheckAt: armedAt, scheduledBy: "assignee" as const, notes: "re-check the PEN-5294 gate" },
+    },
+  };
+
+  const monitorOf = (patch: Record<string, unknown>) =>
+    (patch.executionState as { monitor?: Record<string, unknown> }).monitor!;
+
+  // `issueExecutionStateSchema` requires the whole stage block; a partial
+  // object fails `safeParse` and `parseIssueExecutionState` hands back null,
+  // which would silently make these assertions vacuous.
+  const stateWithMonitor = (monitor: Record<string, unknown>) =>
+    ({
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor,
+    }) as unknown as IssueExecutionState;
+
+  it("keeps the due time the plugin's cancel destroyed", () => {
+    // The alert resolved while no run held the row: exactly the 11-02T21:46:42Z
+    // cancel that took a monitor due 14h43m later.
+    const monitor = monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" }));
+
+    expect(monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "cancelled",
+      // Still nulled — the monitor really is gone, and nothing should read
+      // this row as holding a live wake.
+      nextCheckAt: null,
+      clearedNextCheckAt: armedAt,
+    });
+  });
+
+  it("distinguishes a destroyed monitor from a row that never armed one", () => {
+    const destroyed = monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" }));
+    expect(destroyed.clearedNextCheckAt).toBe(armedAt);
+
+    // A row that never armed a monitor produces no patch at all, so there is
+    // no cleared state to confuse with the above. This is the discrimination
+    // the top-level columns cannot make: `monitorAttemptCount` reads 0 on both
+    // (8 of the 9 PEN-4365 casualties were destroyed at attempt 0).
+    expect(
+      buildIssueMonitorEligibilityPatch({
+        status: "cancelled",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        monitorNextCheckAt: null,
+      }),
+    ).toEqual({});
+  });
+
+  it("does not erase the original due time when an already-cleared monitor is re-cleared", () => {
+    // The plugin flaps: 64 status transitions on PEN-4365 in 14 days, all
+    // plugin-authored. A second clear arrives with `nextCheckAt` already null,
+    // so a naive assignment would overwrite the record with null and lose the
+    // only evidence that a wake was ever owed.
+    const first = monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" }));
+    expect(first.clearedNextCheckAt).toBe(armedAt);
+
+    const second = buildIssueMonitorClearedPatch({
+      issue: {
+        status: "cancelled",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        monitorNextCheckAt: null,
+        executionState: stateWithMonitor(first),
+      },
+      policy: null,
+      clearReason: "cancelled",
+    });
+
+    expect(monitorOf(second)).toMatchObject({
+      status: "cleared",
+      clearReason: "cancelled",
+      clearedNextCheckAt: armedAt,
+    });
+  });
+
+  it("leaves nothing owed on a fresh arm", () => {
+    // Re-arming after a destroyed wake must not keep advertising the dead one:
+    // PEN-4365 was re-armed for 12:30Z after the 21:47Z loss, and that new
+    // monitor owes nothing to the old.
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [],
+      monitor: { nextCheckAt: "2099-11-04T09:00:00.000Z", scheduledBy: "assignee" },
+    })!;
+
+    const rearmed = applyIssueMonitorPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: null,
+        executionState: stateWithMonitor(
+          monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" })),
+        ),
+        monitorAttemptCount: 0,
+        monitorNextCheckAt: null,
+        monitorLastTriggeredAt: null,
+        monitorNotes: null,
+        monitorScheduledBy: "assignee",
+      },
+      policy,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    expect(monitorOf(rearmed.patch)).toMatchObject({
+      status: "scheduled",
+      nextCheckAt: "2099-11-04T09:00:00.000Z",
+      clearedNextCheckAt: null,
+    });
+  });
+
+  // The field is only useful if "not recorded" and "nothing was owed" stay
+  // apart. They are one `prefault(null)` away from collapsing: the validator
+  // would fill the key in at parse time, `parseIssueExecutionState` runs every
+  // stored blob through it, and the `cleared` branch of
+  // `derivePersistedMonitorState` spreads the parsed state straight back out —
+  // so the next write would materialise `null` on a row cleared before this
+  // field existed, and a sweep would read a destroyed monitor as a clean one.
+  // That is the false negative the field exists to remove, so pin it.
+  describe("a row cleared before this field existed stays 'not recorded'", () => {
+    // Verbatim shape of a pre-PEN-5343 cleared monitor: no `clearedNextCheckAt`
+    // key at all.
+    const legacyCleared = {
+      status: "cleared",
+      nextCheckAt: null,
+      lastTriggeredAt: null,
+      attemptCount: 0,
+      notes: "re-check the PEN-5294 gate",
+      scheduledBy: "assignee",
+      clearedAt: "2026-11-02T21:47:03.771Z",
+      clearReason: "cancelled",
+    } as const;
+
+    it("survives parseIssueExecutionState without materialising null", () => {
+      const parsed = parseIssueExecutionState(stateWithMonitor({ ...legacyCleared }));
+
+      expect(parsed?.monitor?.status).toBe("cleared");
+      expect(parsed?.monitor && "clearedNextCheckAt" in parsed.monitor).toBe(false);
+    });
+
+    it("is not materialised by the re-persist path", () => {
+      // This is the mechanism itself: the `cleared` branch of
+      // `derivePersistedMonitorState` spreads the parsed state straight back
+      // out, and `executionStateWithMonitor` re-persists that on any later
+      // stage or monitor write. If the key were prefaulted in at parse time,
+      // this is where the `null` would get written at rest.
+      const parsed = parseIssueExecutionState(stateWithMonitor({ ...legacyCleared }));
+      expect(parsed?.monitor?.status).toBe("cleared");
+
+      const derived = derivePersistedMonitorState({
+        issue: {
+          status: "cancelled",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: null,
+          monitorAttemptCount: 0,
+          monitorNotes: null,
+          monitorScheduledBy: "assignee",
+        },
+        state: parsed,
+        policy: null,
+      });
+
+      expect(derived?.status).toBe("cleared");
+      expect(derived && "clearedNextCheckAt" in derived).toBe(false);
+
+      // And because `monitorStatesEqual` compares via `JSON.stringify`, which
+      // drops absent keys, the untouched row still compares equal to itself —
+      // so re-deriving it writes nothing rather than churning one row per clear.
+      expect(JSON.stringify(derived)).toBe(JSON.stringify(parsed?.monitor));
+    });
+
+    it("is not invented by a re-clear that has no due time to record", () => {
+      // The flap re-clears the row. `previous.nextCheckAt` is null and the
+      // original was never recorded, so there is nothing to carry forward —
+      // and writing `null` here would assert "no wake was owed" about a row
+      // whose wake we simply never captured.
+      const recleared = buildIssueMonitorClearedPatch({
+        issue: {
+          status: "cancelled",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          monitorNextCheckAt: null,
+          executionState: stateWithMonitor({ ...legacyCleared }),
+        },
+        policy: null,
+        clearReason: "done",
+      });
+
+      const monitor = monitorOf(recleared);
+      expect(monitor.status).toBe("cleared");
+      expect("clearedNextCheckAt" in monitor).toBe(false);
+    });
+
+    it("still records null when a clear genuinely finds nothing owed", () => {
+      // The contrast case: a monitor that really was holding no due time. This
+      // one must write `null`, not absence, or the two collapse the other way.
+      const triggered = {
+        ...legacyCleared,
+        status: "triggered",
+        clearedAt: null,
+        clearReason: null,
+        lastTriggeredAt: "2026-11-02T20:00:00.000Z",
+        attemptCount: 1,
+      } as const;
+
+      const monitor = monitorOf(
+        buildIssueMonitorClearedPatch({
+          issue: {
+            status: "cancelled",
+            assigneeAgentId: coderAgentId,
+            assigneeUserId: null,
+            monitorNextCheckAt: null,
+            executionState: stateWithMonitor({ ...triggered }),
+          },
+          policy: null,
+          clearReason: "cancelled",
+        }),
+      );
+
+      expect(monitor).toMatchObject({ status: "cleared", clearedNextCheckAt: null });
+      expect("clearedNextCheckAt" in monitor).toBe(true);
+    });
   });
 });
 

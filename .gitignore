@@ -86,3 +86,17 @@ vendor/*.tgz
 # Python bytecode (the .github/scripts/ sweep suite is run with unittest locally)
 __pycache__/
 *.pyc
+
+# Directory ownership claims taken by agent runs (PEN-5352).
+#
+# A claim on a git checkout lives in that checkout's GIT DIR, not in the
+# working tree, so the common case needs no ignore rule at all: `git add -A`
+# cannot sweep it into a commit and `git clean -fdx` cannot delete it. These
+# rules cover what is left -- a claim on a directory that is not itself a
+# checkout (a subdirectory of this repo taken as a workspace), and the scratch
+# and evidence files, which live in the claimed directory's parent and so can
+# land inside a tree when the workspace is nested in one.
+.paperclip-dir-claim.json
+.dir-claim-*.tmp
+.dir-claim-released-*.json
+.dir-claim-successor-*.json

@@ -290,6 +290,7 @@ export function derivePersistedMonitorState(input: {
       ...convergence,
       clearedAt: null,
       clearReason: null,
+      clearedNextCheckAt: null,
     };
   }
 
@@ -317,6 +318,7 @@ export function derivePersistedMonitorState(input: {
       ...convergence,
       clearedAt: null,
       clearReason: null,
+      clearedNextCheckAt: null,
     };
   }
 
@@ -342,6 +344,9 @@ function buildScheduledMonitorState(
     }),
     clearedAt: null,
     clearReason: null,
+    // PEN-5343: an arm and a fire both leave nothing owed, so neither carries
+    // a lost due time forward. Only a clear sets this.
+    clearedNextCheckAt: null,
   };
 }
 
@@ -360,6 +365,9 @@ function buildTriggeredMonitorState(input: {
     ...monitorConvergenceFields(input.previous),
     clearedAt: null,
     clearReason: null,
+    // PEN-5343: an arm and a fire both leave nothing owed, so neither carries
+    // a lost due time forward. Only a clear sets this.
+    clearedNextCheckAt: null,
   };
 }
 
@@ -389,7 +397,38 @@ function buildClearedMonitorState(input: {
         : input.previous?.convergenceStalledAssigneeAgentId ?? null,
     clearedAt: input.clearedAt.toISOString(),
     clearReason: input.clearReason,
+    ...clearedNextCheckAtField(input.previous),
   };
+}
+
+/**
+ * PEN-5343: the due time a clear is destroying, as a spreadable fragment so the
+ * three cases stay distinguishable at rest.
+ *
+ * - An armed monitor is being destroyed -> record what it was holding.
+ * - A re-clear of an already-cleared monitor -> carry the *first* clear's
+ *   record forward verbatim, **including its absence**. The plugin flaps (64
+ *   plugin-authored status transitions on PEN-4365 in 14 days), so a second
+ *   clear arrives with `previous.nextCheckAt` already null; assigning there
+ *   would erase the original due time, and collapsing an absent value to `null`
+ *   would assert "no wake was owed" about a row cleared before this field
+ *   existed. Both are the false-negative direction.
+ * - Any other clear -> `null`: a clear ran and genuinely found nothing owed.
+ *
+ * Returning a fragment rather than a value is what lets the second case emit no
+ * key at all; `monitorStatesEqual` compares via `JSON.stringify`, which drops
+ * absent keys, so an untouched old row still compares equal and writes nothing.
+ */
+function clearedNextCheckAtField(
+  previous: IssueExecutionMonitorState | null,
+): { clearedNextCheckAt?: string | null } {
+  if (previous?.nextCheckAt) return { clearedNextCheckAt: previous.nextCheckAt };
+  if (previous?.status === "cleared") {
+    return previous.clearedNextCheckAt === undefined
+      ? {}
+      : { clearedNextCheckAt: previous.clearedNextCheckAt };
+  }
+  return { clearedNextCheckAt: null };
 }
 
 export function issueAllowsMonitor(status: string, assigneeAgentId: string | null, assigneeUserId: string | null) {
