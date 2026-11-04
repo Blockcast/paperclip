@@ -403,8 +403,10 @@ type LiveClaimantRow = ClaimantRow & { runId: string; runStatus: string };
 interface ClaimantQueryChain {
   from: () => ClaimantQueryChain;
   // PEN-5493: the live-claimant query is the only one that joins, which is what
-  // lets one stub serve both lookups without the caller naming them.
-  innerJoin: () => ClaimantQueryChain;
+  // lets one stub serve both lookups without the caller naming them. The
+  // condition is captured so a test can assert on the predicate itself rather
+  // than only on the rows this stub was told to return.
+  innerJoin: (table: unknown, condition: unknown) => ClaimantQueryChain;
   where: () => ClaimantQueryChain;
   orderBy: () => ClaimantQueryChain;
   limit: (count: number) => Promise<ClaimantRow[] | LiveClaimantRow[]>;
@@ -413,6 +415,38 @@ interface ClaimantQueryChain {
     reject?: (error: unknown) => unknown,
   ) => Promise<unknown>;
 }
+
+/**
+ * Every column referenced anywhere inside a drizzle condition, by database
+ * column name.
+ *
+ * PEN-5493 review follow-up: the liveness fix is a change to the JOIN
+ * PREDICATE, and this stub resolves whatever rows it was handed regardless of
+ * what the query asked for — so a rows-only test passes just as happily against
+ * the lock-only predicate that the review showed to be incomplete. Walking the
+ * condition is what actually distinguishes them, and there is no Postgres in
+ * this suite to ask instead. Structural by necessity, so it asserts only that
+ * the needed columns are *referenced*, which is the part that would silently
+ * regress.
+ */
+function collectConditionColumnNames(node: unknown, acc: Set<string> = new Set()): Set<string> {
+  if (node === null || typeof node !== "object") return acc;
+  const candidate = node as { name?: unknown; columnType?: unknown; queryChunks?: unknown };
+  if (typeof candidate.name === "string" && typeof candidate.columnType === "string") {
+    acc.add(candidate.name);
+    return acc;
+  }
+  if (Array.isArray(node)) {
+    for (const child of node) collectConditionColumnNames(child, acc);
+    return acc;
+  }
+  if (Array.isArray(candidate.queryChunks)) {
+    for (const child of candidate.queryChunks) collectConditionColumnNames(child, acc);
+  }
+  return acc;
+}
+
+type LiveClaimantOutcome = { kind: "reject" } | { kind: "rows"; rows: LiveClaimantRow[] };
 
 // Drizzle-shaped stub for the claimant lookup in
 // `inspectGitWorktreeBranchIncoherence`. Only the database is faked; the git
@@ -436,39 +470,80 @@ interface ClaimantQueryChain {
 // it out would invite stubbing it as contended by habit.
 function createClaimantLookupDb(
   outcome: { kind: "reject" } | { kind: "rows"; rows: ClaimantRow[] },
-  live: { kind: "reject" } | { kind: "rows"; rows: LiveClaimantRow[] } = { kind: "rows", rows: [] },
+  /**
+   * One outcome, or a SEQUENCE consumed one per live query (the last entry
+   * repeats once exhausted).
+   *
+   * PEN-5493 review follow-up: the repair re-reads liveness immediately before
+   * `git checkout`, so "quiescent at eligibility time, a peer by mutation time"
+   * is a reachable state that a single fixed outcome cannot express — with one
+   * outcome the first lookup already refuses and the re-read is never reached.
+   */
+  live: LiveClaimantOutcome | LiveClaimantOutcome[] = { kind: "rows", rows: [] },
+  // Receives the live query's JOIN condition each time it is built, so a test
+  // can assert the predicate and not just the rows.
+  onLiveJoinCondition?: (condition: unknown) => void,
 ): Db {
-  const makeChain = (): ClaimantQueryChain => {
+  const liveSequence = Array.isArray(live) ? [...live] : null;
+  const nextLive = (): LiveClaimantOutcome => {
+    if (!liveSequence) return live as LiveClaimantOutcome;
+    return liveSequence.length > 1 ? liveSequence.shift()! : liveSequence[0]!;
+  };
+  const makeChain = (isLive: boolean): ClaimantQueryChain => {
     let joined = false;
     const chain: ClaimantQueryChain = {
       from: () => chain,
-      innerJoin: () => {
+      innerJoin: (_table: unknown, condition: unknown) => {
         joined = true;
+        onLiveJoinCondition?.(condition);
         return chain;
       },
       where: () => chain,
       orderBy: () => chain,
       limit: (count: number) => {
-        const selected = joined ? live : outcome;
+        // `isLive` keys on the entry point rather than on `joined`: PEN-5493's
+        // review follow-up moved the live query to `selectDistinctOn` (to dedupe
+        // a claimant named by more than one live run), so the two lookups are
+        // now distinguishable before any join is declared. `joined` is kept as a
+        // cross-check that only the live query joins.
+        const selected = isLive ? nextLive() : outcome;
+        if (isLive !== joined) {
+          return Promise.reject(new Error(
+            `claimant lookup stub: expected ${isLive ? "the live query to join" : "the plain query not to join"}`,
+          ));
+        }
         return selected.kind === "reject"
-          ? Promise.reject(new Error(joined ? "live claimant lookup unavailable" : "claimant lookup unavailable"))
+          ? Promise.reject(new Error(isLive ? "live claimant lookup unavailable" : "claimant lookup unavailable"))
           : Promise.resolve(selected.rows.slice(0, count) as ClaimantRow[] | LiveClaimantRow[]);
       },
       then: (resolve, reject) => Promise.resolve([]).then(resolve, reject),
     };
     return chain;
   };
-  // A fresh chain per `select()`, so the join flag set by the live query cannot
-  // leak into the plain claimant query that runs before it.
-  return { select: () => makeChain() } as unknown as Db;
+  // A fresh chain per entry point, so state from the live query cannot leak into
+  // the plain claimant query that runs before it.
+  return {
+    select: () => makeChain(false),
+    selectDistinctOn: () => makeChain(true),
+  } as unknown as Db;
 }
 
 function claimantRow(identifier: string): ClaimantRow {
   return { id: randomUUID(), identifier, status: "in_progress" };
 }
 
-function liveClaimantRow(identifier: string, runStatus = "running"): LiveClaimantRow {
-  return { ...claimantRow(identifier), runId: randomUUID(), runStatus };
+function liveClaimantRow(
+  identifier: string,
+  runStatus = "running",
+  issueStatus?: string,
+): LiveClaimantRow {
+  const base = claimantRow(identifier);
+  return {
+    ...base,
+    status: issueStatus ?? base.status,
+    runId: randomUUID(),
+    runStatus,
+  };
 }
 
 // Drives the real eligibility computation and returns the thrown validation
@@ -3571,6 +3646,165 @@ describe("realizeExecutionWorkspace", () => {
       .resolves.toBe(actualHeadBefore);
   }, 20_000);
 
+  // PEN-5493, raised in review on #3380. The first cut of this guard read
+  // liveness off the issue execution lock alone, and the lock does not answer
+  // the question the guard asks. `claimQueuedRun` requires it only when
+  // `!allowsIssueInteractionWake(ctx) && !isNonOwnershipRetryLineage(ctx)`, and
+  // writes it only for an `in_progress`/`in_review` row claimed by its assignee
+  // or current participant — so an interaction wake carrying a comment id runs
+  // on a `blocked` row with both lock columns null, and still realizes this
+  // worktree. Reading locks alone reports an idle worktree while that peer is
+  // committing in it, and `git checkout` would then move the branch underneath
+  // it. The master predicate this replaced (`claimants > 1`) happened to refuse
+  // this case, so losing it would have been a regression, not a known gap.
+  it("refuses a clean diverged worktree when a peer runs in it without holding the execution lock", async () => {
+    const expectedBranch = "PAP-5496-lockfree-recorded";
+    const actualBranch = "PAP-5496-lockfree-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+    // A `blocked` claimant with a `running` run: reachable only through the
+    // context-issue arm, because a blocked row cannot hold the lock at all.
+    const interactionWakePeer = liveClaimantRow("PAP-5497", "running", "blocked");
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb(
+        {
+          kind: "rows",
+          rows: Array.from({ length: 3 }, (_unused, index) => claimantRow(`PAP-56${index}`)),
+        },
+        { kind: "rows", rows: [interactionWakePeer] },
+      ),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          workspaceLiveClaimantLookup: "ok",
+          safeRepair: expect.objectContaining({ eligible: false, attempted: false, succeeded: false }),
+        }),
+      },
+    });
+    const validation = (error as {
+      resultJson: {
+        workspaceValidation: {
+          workspaceLiveClaimants: { issueIdentifier: string; status: string }[];
+          safeRepair: { reason: string };
+        };
+      };
+    }).resultJson.workspaceValidation;
+    expect(validation.workspaceLiveClaimants).toHaveLength(1);
+    expect(validation.workspaceLiveClaimants[0]).toMatchObject({ status: "blocked" });
+    expect(validation.safeRepair.reason).toContain("PAP-5497");
+    expect(validation.safeRepair.reason).toContain(interactionWakePeer.runId);
+    // Nothing moved: the peer's worktree is still on the peer's branch.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 20_000);
+
+  // The test above proves the REFUSAL fires for a lock-free peer, but it proves
+  // it against a stub that hands back whatever rows it was given — so it passes
+  // just as happily against the lock-only predicate the review rejected. This
+  // one asserts the predicate itself: a peer like that is only ever found if the
+  // join also matches runs that merely NAME the claimant as their context issue.
+  it("matches live runs by context issue as well as by execution lock", async () => {
+    const expectedBranch = "PAP-5503-predicate-recorded";
+    const actualBranch = "PAP-5503-predicate-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const joinConditions: unknown[] = [];
+
+    await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb(
+        { kind: "rows", rows: [claimantRow("PAP-5499"), claimantRow("PAP-5500")] },
+        { kind: "rows", rows: [liveClaimantRow("PAP-5499")] },
+        (condition) => joinConditions.push(condition),
+      ),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(joinConditions.length).toBeGreaterThan(0);
+    const columns = collectConditionColumnNames(joinConditions[0]);
+    // The lock arms — the predicate `POST /issues/:id/checkout` 409s on.
+    expect(columns).toContain("execution_run_id");
+    expect(columns).toContain("checkout_run_id");
+    // The arm the review added: the generated stored mirror of
+    // `context_snapshot ->> 'issueId'`, which is how the platform ties a run to
+    // an issue when no lock was ever taken.
+    expect(columns).toContain("context_issue_id");
+    // Still bounded to non-terminal runs, or every historical run would hold.
+    expect(columns).toContain("status");
+  }, 20_000);
+
+  // PEN-5493, raised in review on #3380 (Q5). Narrowing the test from a claimant
+  // COUNT to a liveness one makes the `git checkout` arm reachable for a shared
+  // worktree at all — on master `claimants > 1` refused before it, so a peer
+  // claiming between the sample and the mutation was unreachable. It is now
+  // reachable for every shared worktree quiescent at sample time, and `git
+  // checkout` is not a safe loser: it carries non-conflicting uncommitted edits
+  // across branches rather than refusing. So liveness is re-read immediately
+  // before the mutation. This drives exactly that interleaving — quiescent when
+  // eligibility was decided, a live peer by the time the branch would move.
+  it("refuses at the last moment when a peer claims the worktree between eligibility and checkout", async () => {
+    const expectedBranch = "PAP-5501-race-recorded";
+    const actualBranch = "PAP-5501-race-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+    const latecomer = liveClaimantRow("PAP-5502");
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb(
+        {
+          kind: "rows",
+          rows: Array.from({ length: 4 }, (_unused, index) => claimantRow(`PAP-57${index}`)),
+        },
+        // Quiescent when eligibility was computed; a live peer by the re-read.
+        [{ kind: "rows", rows: [] }, { kind: "rows", rows: [latecomer] }],
+      ),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    const validation = (error as {
+      resultJson: {
+        workspaceValidation: {
+          safeRepair: { eligible: boolean; attempted: boolean; succeeded: boolean; reason: string };
+        };
+      };
+    }).resultJson.workspaceValidation;
+    // Eligible AND attempted — this is not the eligibility refusal. Reading it
+    // as one would hide the race the re-read exists to catch.
+    expect(validation.safeRepair).toMatchObject({
+      eligible: true,
+      attempted: true,
+      succeeded: false,
+    });
+    expect(validation.safeRepair.reason).toContain("PAP-5502");
+    expect(validation.safeRepair.reason).toContain(latecomer.runId);
+    // The branch did not move, so the latecomer's worktree is untouched.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 20_000);
+
   // PEN-5493: the liveness lookup takes the same fail-closed posture as the
   // claimant lookup it narrows (BLO-32628) and for the same reason — database
   // stress co-occurs with the workspace thrash that produces contention, so a
@@ -3619,8 +3853,17 @@ describe("realizeExecutionWorkspace", () => {
   // PEN-5493: a null source issue means the liveness query cannot exclude THIS
   // run's own execution lock, and in this path our own lock is always held — so
   // "no other live claimant" is unprovable rather than true. Eligibility falls
-  // back to the pre-PEN-5493 claimant count there, which keeps the change
-  // strictly more permissive than what it replaced and never newly refuses.
+  // back to the pre-PEN-5493 claimant count there, so this case behaves exactly
+  // as master did.
+  //
+  // That fallback is per-case, and the change as a whole is NOT strictly more
+  // permissive — an earlier draft of this file claimed it was, and the review
+  // on #3380 showed otherwise. Two cases refuse where master allowed: a source
+  // issue not itself bound to the workspace gives `claimants = 1` (master
+  // eligible) against one live peer (refused now), and the pre-checkout
+  // re-read refuses a peer that arrives after eligibility was decided. Both
+  // move in the safe direction, which is the point — but "never newly refuses"
+  // was the wrong summary of it.
   it("falls back to the claimant count when there is no source issue to exclude", async () => {
     const expectedBranch = "PAP-5498-nosource-recorded";
     const actualBranch = "PAP-5498-nosource-sibling";
