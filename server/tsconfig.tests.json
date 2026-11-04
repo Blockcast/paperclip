@@ -49,6 +49,7 @@
     "src/__tests__/issue-list-analyze-probe-postgres.test.ts",
     "src/__tests__/issue-list-analyze-probe.test.ts",
     "src/__tests__/issue-list-description-truncation-flag.test.ts",
+    "src/__tests__/issue-list-monitor-status.test.ts",
     "src/__tests__/issue-list-productivity-review-disabled.test.ts",
     "src/__tests__/issue-list-timeout-explain-postgres.test.ts",
     "src/__tests__/issue-list-timeout-explain.test.ts",
