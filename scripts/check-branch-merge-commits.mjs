@@ -127,10 +127,10 @@ export function parseMergeCommitLog(rawOutput) {
  * `pull_request.base.sha`, which is the base branch tip as of PR creation and
  * LAGS as `master` moves -- #3358 read a base.sha 105 commits behind master.
  * That is normally harmless, because a branch point at or before base.sha means
- * every master commit in the head'"'"'s ancestry is already an ancestor of base.sha
+ * every master commit in the head's ancestry is already an ancestor of base.sha
  * and so falls out of the two-dot range. It stops being harmless if the branch
  * is REBASED onto a newer master than base.sha: master commits newer than
- * base.sha enter the head'"'"'s ancestry, and any MERGE commit among them would be
+ * base.sha enter the head's ancestry, and any MERGE commit among them would be
  * reported against an author who did not create it and cannot remove it.
  *
  * That is not hypothetical. `master` is not linear: 605 of its 9,303 commits
@@ -171,7 +171,7 @@ export function resolveBaseBranchTip({ repoRoot, baseRef, execFile = execFileSyn
  * Merge commits reachable from `head` but not from `base` (nor from any ref in
  * `excludeRefs`).
  *
- * Two-dot semantics, matching the runbook'"'"'s own probe, expressed in the
+ * Two-dot semantics, matching the runbook's own probe, expressed in the
  * explicit `<head> ^<base>` form so additional exclusions compose without the
  * argument-order surprises of `--not`.
  *
