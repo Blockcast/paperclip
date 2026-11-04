@@ -1674,7 +1674,36 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     sourceRunId: z.string().guid().nullable().optional(),
     title: z.string().trim().max(240).nullable().optional(),
     summary: z.string().trim().max(1000).nullable().optional(),
-    continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("none"),
+    // PEN-5505: `wake_assignee`, matching the four sibling kinds. This member
+    // defaulted to `none` — the only one of the five that did — which made a
+    // card filed with defaults emit nothing in any terminal state: not on
+    // accept, not on reject, and (for every policy) not on expiry. Since
+    // `supersedeOnUserComment` also defaults true, such a card had one path to
+    // being noticed and two to disappearing unannounced, and `request_confirmation`
+    // is the kind most used for human merge/approval gates.
+    //
+    // `wake_assignee` rather than `wake_assignee_on_accept`, because a rejection
+    // here is information the author must act on: the reject route records a
+    // decline reason and, for a tool action, composes explicit "do not retry the
+    // same call" instructions (`readToolActionContinuationContext`) that only
+    // reach the agent through this wake. `wake_assignee_on_accept` would build
+    // those and drop them. The platform's own most safety-critical producer of
+    // this kind — the tool-action approval gate in `tool-gateway.ts` — already
+    // hardcodes `wake_assignee`, so this aligns the default with it rather than
+    // merely with the siblings. `wake_assignee_on_accept` stays available and is
+    // still the right explicit choice where a rejection ends the work (see the
+    // reflection-coach gates), and explicit `none` is still honoured.
+    //
+    // Rows already persisted with `none` were deliberately NOT backfilled. A
+    // stored policy only matters at the instant the card resolves, so an
+    // un-backfilled card loses exactly the one wake it has lacked since it was
+    // filed, while the thread still records the resolution; an accepted one is
+    // already visible to the PEN-4409 sweep, since `request_confirmation` is in
+    // `ACCEPTED_OUTCOME_SWEEP_KINDS`. Against that bounded residual, a blind
+    // UPDATE across other agents' pending cards is the larger risk — and the
+    // population is unmeasurable from an agent seat, because the only
+    // company-scoped listing (`GET /companies/:id/attention`) is board-only.
+    continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
     payload: requestConfirmationPayloadSchema,
   }),
   z.object({

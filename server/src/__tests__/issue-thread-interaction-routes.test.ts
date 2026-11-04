@@ -1,9 +1,28 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createIssueThreadInteractionSchema } from "@paperclipai/shared";
 
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const CREATED_AGENT_ID = "22222222-2222-4222-8222-222222222222";
+
+/**
+ * The continuation policy a `request_confirmation` filed with NO explicit
+ * `continuationPolicy` actually gets (PEN-5505).
+ *
+ * Derived from the schema rather than written as a literal on purpose. The two
+ * halves of this defect live in different packages — `@paperclipai/shared`
+ * decides the default, `routes/issues.ts` decides what a policy emits — and
+ * nothing joined them, which is how a default of `none` survived: every
+ * wake test in this file pinned a policy it had hardcoded, so none of them was
+ * ever exercising the value a real caller would get. Reading the schema here
+ * means a regression of the default turns the two tests below red at the
+ * behaviour that matters, not at an assertion about a string.
+ */
+const DEFAULT_REQUEST_CONFIRMATION_POLICY = createIssueThreadInteractionSchema.parse({
+  kind: "request_confirmation",
+  payload: { version: 1, prompt: "Apply this plan?" },
+}).continuationPolicy;
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),
@@ -1589,6 +1608,60 @@ describe.sequential("issue thread interaction routes", () => {
     expect(res.status).toBe(200);
     expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
   });
+
+  // PEN-5505: the default must be reachable in BOTH terminal directions a human
+  // can put a card in. Accept alone would be satisfied by
+  // `wake_assignee_on_accept` too, and reject is the direction that carries the
+  // decline reason — the thing the author needs in order to do anything next.
+  for (const resolution of ["accept", "reject"] as const) {
+    it(`wakes the assignee when a default-policy request confirmation is ${resolution}ed`, async () => {
+      const interaction = {
+        id: "interaction-default-policy",
+        companyId: "company-1",
+        issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        kind: "request_confirmation",
+        status: resolution === "accept" ? "accepted" : "rejected",
+        continuationPolicy: DEFAULT_REQUEST_CONFIRMATION_POLICY,
+        idempotencyKey: null,
+        sourceCommentId: null,
+        sourceRunId: "run-3",
+        payload: {
+          version: 1,
+          prompt: "Apply this plan?",
+        },
+        result: resolution === "accept"
+          ? { version: 1, outcome: "accepted" }
+          : { version: 1, outcome: "rejected", reason: "Needs changes" },
+        createdAt: "2026-04-20T12:00:00.000Z",
+        updatedAt: "2026-04-20T12:05:00.000Z",
+        resolvedAt: "2026-04-20T12:05:00.000Z",
+      };
+      if (resolution === "accept") {
+        mockInteractionService.acceptInteraction.mockResolvedValueOnce({ interaction, createdIssues: [] });
+      } else {
+        mockInteractionService.rejectInteraction.mockResolvedValueOnce(interaction);
+      }
+      const app = await createApp();
+
+      const res = await request(app)
+        .post(`/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-default-policy/${resolution}`)
+        .send(resolution === "accept" ? {} : { reason: "Needs changes" });
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledTimes(1);
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        ASSIGNEE_AGENT_ID,
+        expect.objectContaining({
+          reason: "issue_commented",
+          payload: expect.objectContaining({
+            interactionId: "interaction-default-policy",
+            interactionKind: "request_confirmation",
+            interactionStatus: resolution === "accept" ? "accepted" : "rejected",
+          }),
+        }),
+      );
+    });
+  }
 
   it("wakes with decline instructions when a tool-action confirmation is rejected", async () => {
     mockInteractionService.rejectInteraction.mockResolvedValueOnce({

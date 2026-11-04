@@ -865,8 +865,9 @@ POST /api/issues/{issueId}/interactions
 
 Rules:
 
-- `continuationPolicy: "wake_assignee"` wakes the assignee only after a `request_confirmation` is accepted.
-- Rejection does not wake the assignee by default. The board/user can add a normal comment when revisions are needed.
+- `continuationPolicy` defaults to `"wake_assignee"`, which wakes the assignee on acceptance **and** on rejection. The rejection wake carries the recorded reason, so revisions do not depend on the board/user also leaving a comment (PEN-5505 — this field used to default to `"none"` for `request_confirmation` alone, which emitted nothing in any terminal state).
+- Pass `"wake_assignee_on_accept"` when a rejection ends the work and should not wake you; pass `"none"` only when you never need to resume.
+- No policy wakes on expiry. A `supersedeOnUserComment` expiry posts a system notice on the thread and the killing comment raises an ordinary comment wake with no interaction context, so a wake policy is not a substitute for `supersedeOnUserComment: false` on a gate that must survive unrelated thread traffic.
 - Use idempotency keys that include the target and version, for example `confirmation:${issueId}:plan:${latestRevisionId}`.
 - Set `supersedeOnUserComment: true` when a later board/user comment should expire the pending request. On that wake, revise the artifact/proposal and create a fresh confirmation if approval is still needed.
 - A pending interaction is an explicit waiting path. Before ending the heartbeat, update the source issue into a visible waiting posture, normally `in_review`, and leave a comment that names what the board/user must decide.
@@ -940,9 +941,9 @@ Payload field reference (`RequestCheckboxConfirmationPayload`):
 | `supersedeOnUserComment`    | boolean                                    | `true` (set server-side)         | When `true`, a board/user comment after the interaction supersedes it with `outcome: "superseded_by_comment"`.                              |
 | `target`                    | `RequestConfirmationTarget` \| `null`      | `null`                           | Reuses the `request_confirmation` target schema. Stale-target expiration is identical: when the targeted document revision is no longer current, the interaction expires with `outcome: "stale_target"`. |
 
-Envelope defaults that differ from other kinds:
+Envelope defaults:
 
-- `continuationPolicy` defaults to `"wake_assignee"` for `request_checkbox_confirmation` (same as `suggest_tasks` and `ask_user_questions`). Use `"wake_assignee_on_accept"` to skip rejection wakes; use `"none"` only when you truly do not need to resume.
+- `continuationPolicy` defaults to `"wake_assignee"` for `request_checkbox_confirmation`, which is the same as every other kind — `suggest_tasks`, `ask_user_questions`, `request_confirmation` and `request_item_verdicts` (PEN-5505 made `request_confirmation` match; it was the one exception). Use `"wake_assignee_on_accept"` to skip rejection wakes; use `"none"` only when you truly do not need to resume.
 
 Accept (board action, requires board/user role; agents creating the interaction cannot accept):
 

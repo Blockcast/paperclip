@@ -303,7 +303,12 @@ const createRequestConfirmationToolSchema = z.object({
   sourceRunId: z.string().guid().nullable().optional(),
   title: z.string().trim().max(240).nullable().optional(),
   summary: z.string().trim().max(1000).nullable().optional(),
-  continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("none"),
+  // PEN-5505: kept in step with the `request_confirmation` member of
+  // `createIssueThreadInteractionSchema`, which carries the reasoning. This
+  // schema is what the published tool advertises, so a skew between the two
+  // would show up as a tool whose documented default is not the one the API
+  // applies.
+  continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
   payload: requestConfirmationPayloadSchema,
 });
 
@@ -888,7 +893,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipRequestConfirmation",
-      "Create a request_confirmation interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response. ALSO set `payload.expectedOutcome` when accepting this ask authorises a concrete action (a PR merge, an issue reaching a status): it is the only thing that lets anything later tell an acceptance whose action happened from one whose action never did, it is never inferred from your prompt text, and without it the card is reported as `untracked`.",
+      "Create a request_confirmation interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response. ALSO set `payload.expectedOutcome` when accepting this ask authorises a concrete action (a PR merge, an issue reaching a status): it is the only thing that lets anything later tell an acceptance whose action happened from one whose action never did, it is never inferred from your prompt text, and without it the card is reported as `untracked`. NOTE `continuationPolicy` DEFAULTS TO `wake_assignee` when omitted (PEN-5505 — it used to default to `none`, uniquely among the ask-tools), so an accept OR a reject wakes the issue's assignee and the decline reason reaches you. Pass `wake_assignee_on_accept` when a rejection ends the work and you do not want waking for it, and `none` only when you genuinely never need to resume — on `none` NOTHING is emitted in any terminal state, so the card is yours to poll for. ⚠ NO policy wakes on EXPIRY, including `wake_assignee`. A card killed by `supersedeOnUserComment` posts a system notice on the thread and the killing comment raises an ORDINARY comment wake, which carries no interaction context at all — so nothing tells you your ask died, and on a closed issue not even that fires. A wake policy is therefore not a substitute for `supersedeOnUserComment: false` on a gate that must survive thread traffic.",
       createRequestConfirmationToolSchema,
       async ({ issueId, ...body }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/interactions`, {

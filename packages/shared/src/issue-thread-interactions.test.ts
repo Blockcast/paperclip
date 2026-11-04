@@ -17,7 +17,7 @@ import {
 } from "./validators/issue.js";
 
 describe("issue thread interaction schemas", () => {
-  it("parses request_confirmation payloads with default no-wake continuation", () => {
+  it("parses request_confirmation payloads and defaults the continuation to wake_assignee", () => {
     const parsed = createIssueThreadInteractionSchema.parse({
       kind: "request_confirmation",
       payload: {
@@ -35,7 +35,10 @@ describe("issue thread interaction schemas", () => {
 
     expect(parsed).toMatchObject({
       kind: "request_confirmation",
-      continuationPolicy: "none",
+      // PEN-5505. This assertion is the regression pin: the default was `none`,
+      // which emitted nothing on accept, on reject or on expiry, so a card filed
+      // with defaults could only ever fail silently.
+      continuationPolicy: "wake_assignee",
       payload: {
         prompt: "Apply this plan?",
         acceptLabel: "Apply",
@@ -47,6 +50,61 @@ describe("issue thread interaction schemas", () => {
         supersedeOnUserComment: true,
       },
     });
+  });
+
+  // PEN-5505: the point of the change is the DEFAULT, not the capability. An
+  // author who genuinely never needs to resume must still be able to ask for
+  // silence, and `wake_assignee_on_accept` must still be reachable for a gate
+  // whose rejection ends the work (the reflection-coach gates ask for exactly
+  // that). Asserted per value so a future "normalise the policy" change cannot
+  // quietly collapse the enum into the new default.
+  it.each(["none", "wake_assignee_on_accept", "wake_assignee"] as const)(
+    "honours an explicit request_confirmation continuationPolicy of %s",
+    (continuationPolicy) => {
+      const parsed = createIssueThreadInteractionSchema.parse({
+        kind: "request_confirmation",
+        continuationPolicy,
+        payload: { version: 1, prompt: "Apply this plan?" },
+      });
+
+      expect(parsed.continuationPolicy).toBe(continuationPolicy);
+    },
+  );
+
+  // PEN-5505: `request_confirmation` was the ONE kind of five that defaulted to
+  // `none`, and nothing asserted the set was uniform, so the odd one out went
+  // unnoticed. Pinning every kind together means the next one added has to make
+  // a deliberate choice rather than inherit an inconsistency.
+  it("defaults every interaction kind's continuation to wake_assignee", () => {
+    const minimalPayloads = {
+      suggest_tasks: { version: 1, tasks: [{ clientKey: "task-1", title: "One" }] },
+      ask_user_questions: {
+        version: 1,
+        questions: [{
+          id: "q1",
+          prompt: "Which one?",
+          selectionMode: "single",
+          options: [{ id: "a", label: "A" }],
+        }],
+      },
+      request_confirmation: { version: 1, prompt: "Apply this plan?" },
+      request_checkbox_confirmation: {
+        version: 1,
+        prompt: "Which files?",
+        options: [{ id: "file-a", label: "File A" }],
+      },
+      request_item_verdicts: {
+        version: 1,
+        prompt: "Review these",
+        items: [{ id: "item-1", label: "One" }],
+      },
+    } as const;
+
+    for (const [kind, payload] of Object.entries(minimalPayloads)) {
+      const parsed = createIssueThreadInteractionSchema.parse({ kind, payload });
+      expect({ kind, continuationPolicy: parsed.continuationPolicy })
+        .toEqual({ kind, continuationPolicy: "wake_assignee" });
+    }
   });
 
   it("round-trips versioned tool action payload and lifecycle metadata", () => {

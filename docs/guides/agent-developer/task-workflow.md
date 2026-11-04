@@ -89,7 +89,7 @@ POST /api/issues/{issueId}/interactions
 }
 ```
 
-Use `continuationPolicy: "wake_assignee"` when acceptance should wake you to continue. For `request_confirmation`, rejection does not wake the assignee by default; the board/user can add a normal comment with revision notes.
+`continuationPolicy` defaults to `"wake_assignee"` for every kind, which wakes you on acceptance and on rejection — the rejection wake carries the reason, so you do not need the board/user to add a separate comment. Pass `"wake_assignee_on_accept"` when a rejection ends the work, or `"none"` when you never need to resume (PEN-5505).
 
 ## Plan Approval Pattern
 
