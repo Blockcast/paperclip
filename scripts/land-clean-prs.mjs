@@ -271,6 +271,49 @@ const ALLY_VERDICT_STATUS_RE = /^(?:review|gate)\/ally-/i;
 export const UNLANDABLE_MERGE_STATES = new Set(["DIRTY", "UNSTABLE", "UNKNOWN"]);
 
 /**
+ * Every value GitHub's `mergeStateStatus` enum can take.
+ *
+ * Exhaustive on purpose: `readMergeState` maps everything OUTSIDE this set to
+ * UNKNOWN, so the set is what makes "unrecognised" a decidable question rather
+ * than a guess. Adding a state GitHub later introduces is a deliberate act —
+ * until it is added, that state is held rather than merged.
+ */
+export const KNOWN_MERGE_STATES = new Set([
+  "BEHIND",
+  "BLOCKED",
+  "CLEAN",
+  "DIRTY",
+  "DRAFT",
+  "HAS_HOOKS",
+  "UNKNOWN",
+  "UNSTABLE",
+]);
+
+/**
+ * The PR's merge state, as a value `UNLANDABLE_MERGE_STATES` can decide.
+ *
+ * ⛔ The fail-closed direction is the whole point, and it is load-bearing in a
+ * way the obvious `String(x ?? "UNKNOWN").toUpperCase()` is NOT. That spelling
+ * defends only `undefined` and `null`, because `??` passes an empty string
+ * through — and `""` is not in `UNLANDABLE_MERGE_STATES`, so it falls past
+ * every hold and classifies `enqueue` with the reason `mergestate:`. Measured
+ * 2026-11-04 against the real classifier (PEN-5442): absent, `undefined` and
+ * `null` all held at `skip — mergestate:UNKNOWN`, while `""` ENQUEUED.
+ *
+ * That matters here because `fetchOpenPrs` now JOINS the merge state on from a
+ * second call, so for the first time a row can reach the classifier carrying a
+ * state nobody read. A join that defaults a miss to `""` — or to any value
+ * outside the enum — would merge it. Rather than rely on every present and
+ * future join spelling its default correctly, the classifier refuses to read
+ * anything it does not recognise as a state: unknown input is an UNREAD state,
+ * and an unread state is never a licence to merge.
+ */
+export function readMergeState(value) {
+  const raw = typeof value === "string" ? value.trim().toUpperCase() : "";
+  return KNOWN_MERGE_STATES.has(raw) ? raw : "UNKNOWN";
+}
+
+/**
  * How many extra reads to spend resolving an UNKNOWN `mergeStateStatus`, and
  * how long to wait between them.
  *
@@ -972,7 +1015,7 @@ export function classifyPr(pr, { now = Date.now(), settleMinutes = CHECK_SETTLE_
     detail,
   });
 
-  const mergeState = String(pr?.mergeStateStatus ?? "UNKNOWN").toUpperCase();
+  const mergeState = readMergeState(pr?.mergeStateStatus);
   if (mergeState === "DIRTY") {
     // An approval already paid for here is the BLO-33208 priority cohort: the
     // work is finished and reviewed, master moved underneath it, and no GitHub
@@ -1477,7 +1520,85 @@ export function stateHold(repo, { number, reason, ageHours, detail }, run = gh) 
 }
 
 const PR_LIST_FIELDS =
-  "number,headRefOid,author,labels,isDraft,autoMergeRequest,mergeStateStatus,reviewRequests";
+  "number,headRefOid,author,labels,isDraft,autoMergeRequest,reviewRequests";
+
+/**
+ * Open PRs per page when reading merge states.
+ *
+ * ⛔ This is the fix, and it is a PAGE size, not a limit. `gh pr list` pages at
+ * 100 regardless of `--limit`, so on a repo with >=100 open PRs it issues a
+ * 100-item page — and a 100-item page carrying `mergeStateStatus` is what
+ * GitHub 502s on. Measured 2026-11-04 against Blockcast/penstock-llm-proxy-core
+ * at 153 open PRs (PEN-5442):
+ *
+ *   all 8 fields, one call (what this replaced)        0/3 OK
+ *   7 fields, no mergeStateStatus, `gh pr list`        5/5 OK
+ *   number+mergeStateStatus, `gh pr list` (100-page)  10/13 OK
+ *   all 8 fields, GraphQL, 50-item page                4/5 OK
+ *   number+mergeStateStatus, GraphQL, 25-item page     6/6 OK
+ *   number+mergeStateStatus, GraphQL, 10-item page     6/6 OK
+ *
+ * Note the third row: splitting the call is NOT sufficient on its own. The
+ * merge-state half still rides a 100-item page through `gh pr list` and still
+ * fails about a quarter of the time. Controlling the page size is the part
+ * that works, and `gh pr list` has no flag for it — hence the raw query.
+ *
+ * 25 over 10 only to spend 7 round trips instead of 16; both measured clean.
+ */
+export const MERGE_STATE_PAGE_SIZE = 25;
+
+/**
+ * Open PRs with their merge state, by number.
+ *
+ * ⛔ Hand-rolled GraphQL, which this file warns against elsewhere — that
+ * warning is about `statusCheckRollup`, whose `contexts(first: 100)` truncates
+ * SILENTLY and drops required checks. It does not transfer here: this query
+ * selects two scalars and reaches no nested connection, so there is no inner
+ * page to truncate. The outer connection is paginated by `--paginate` against
+ * `pageInfo`, and `fetchOpenPrs` cross-checks the result against the listing
+ * anyway. Everything with a shape worth getting wrong — `author.is_bot`,
+ * `labels`, `reviewRequests` — is deliberately left to `gh pr list`, which
+ * owns that mapping. Widening this query to those fields would put the
+ * fail-open direction (an unread `reviewRequests` reads as "no owner is
+ * waiting") behind a hand-written type mapping. Do not.
+ */
+export function fetchMergeStates(repo, { run = gh, pageSize = MERGE_STATE_PAGE_SIZE } = {}) {
+  const [owner, name] = String(repo).split("/");
+  const query = `query($owner:String!,$name:String!,$first:Int!,$endCursor:String){
+  repository(owner:$owner,name:$name){
+    pullRequests(states:OPEN,first:$first,after:$endCursor){
+      pageInfo{hasNextPage endCursor}
+      nodes{ number mergeStateStatus }
+    }
+  }
+}`;
+  const out = run([
+    "api",
+    "graphql",
+    "--paginate",
+    "-F",
+    `owner=${owner}`,
+    "-F",
+    `name=${name}`,
+    "-F",
+    `first=${pageSize}`,
+    "--jq",
+    ".data.repository.pullRequests.nodes[] | {number, mergeStateStatus}",
+    "-f",
+    `query=${query}`,
+  ]);
+  const states = new Map();
+  for (const line of String(out).split("\n")) {
+    if (!line.trim()) continue;
+    const node = JSON.parse(line);
+    // `readMergeState` here as well as in the classifier: this map is the
+    // join's input, and normalising at the boundary means a malformed node
+    // enters as UNKNOWN rather than as a string the classifier has to defend
+    // against later.
+    states.set(node?.number, readMergeState(node?.mergeStateStatus));
+  }
+  return states;
+}
 
 function execGh(args) {
   return execFileSync("gh", args, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
@@ -1608,26 +1729,52 @@ export function fetchPrFiles(repo, number, run = gh) {
  * identity rules pin immutable REST account IDs, which the GraphQL shape does
  * not carry. A login string alone is not review evidence (I5).
  */
-function fetchOpenPrs(repo) {
+export function fetchOpenPrs(repo, { run = gh, mergeStates = fetchMergeStates } = {}) {
   const rows = JSON.parse(
-    gh(["pr", "list", "--repo", repo, "--state", "open", "--limit", "500", "--json", PR_LIST_FIELDS]),
+    run(["pr", "list", "--repo", repo, "--state", "open", "--limit", "500", "--json", PR_LIST_FIELDS]),
   );
   assertPrListComplete(rows, repo, 500);
+  // The second half of the split (PEN-5442, see MERGE_STATE_PAGE_SIZE). Read
+  // BEFORE the listing is joined so a failure here fails the whole read rather
+  // than yielding a listing with every merge state missing — which, absent
+  // `readMergeState`, is the shape that would enqueue.
+  const states = mergeStates(repo, { run });
   // One fetch per repo, not per PR: the rules are a property of the base branch.
-  const codeownerRules = fetchCodeownerRules(repo);
+  const codeownerRules = fetchCodeownerRules(repo, run);
   return rows.map((row) => {
     assertHeadSha(row, repo);
-    if (classifyFromListing(row)) return row;
+    // ⛔ The join, and the `??` is load-bearing in the fail-CLOSED direction.
+    //
+    // The two calls are not atomic: a PR open for the listing can merge, or be
+    // closed, before the merge-state read — so a number present in `rows` with
+    // no entry in `states` is the EXPECTED race, not a bug. It must resolve to
+    // a hold. `"UNKNOWN"` is the literal that does that (it is in
+    // `UNLANDABLE_MERGE_STATES`), and `readMergeState` is what makes any other
+    // spelling of "nothing here" — `undefined`, `null`, `""` — resolve the
+    // same way instead of falling through to `enqueue`.
+    //
+    // Do NOT "improve" this to a default that looks landable, and do not drop
+    // the row: dropping it would hide a PR from the receipt and from the
+    // unlanded-eligible detector, which is how a strand becomes invisible.
+    // The cost of the hold is one cycle; the next fire reads it again.
+    const joined = { ...row, mergeStateStatus: states.get(row?.number) ?? "UNKNOWN" };
+    if (classifyFromListing(joined)) return joined;
     return {
-      ...row,
+      ...joined,
       // Only PRs that survived `classifyFromListing` can still enqueue, so an
       // unresolved UNKNOWN can only change a verdict here — the same rule that
       // scopes `files`, `reviews` and `timeline` below.
-      mergeStateStatus: resolveMergeState(repo, row.number, row.mergeStateStatus),
+      // An UNKNOWN from the join is resolved by exactly the same per-PR
+      // re-read that has always resolved an UNKNOWN from GitHub, so a row
+      // that lost its state to the race above is repaired here rather than
+      // waiting a whole cycle — and when the re-read fails it stays UNKNOWN
+      // and stays held. Spent only on rows that survived `classifyFromListing`,
+      // i.e. the ones that could still enqueue.
+      mergeStateStatus: resolveMergeState(repo, joined.number, joined.mergeStateStatus, { run }),
       codeownerRules,
       // Only PRs that actually carry a request can be scoped by ownership, so
       // the extra call is spent only where it can change a verdict.
-      files: (row.reviewRequests ?? []).length > 0 ? fetchPrFiles(repo, row.number) : [],
+      files: (joined.reviewRequests ?? []).length > 0 ? fetchPrFiles(repo, joined.number, run) : [],
       // No `--paginate` here, and none is needed: `gh pr view` does not accept
       // the flag because it paginates the rollup's `contexts` connection
       // itself. Measured 2026-11-02 on gh 2.102.0 against
@@ -1647,9 +1794,9 @@ function fetchOpenPrs(repo) {
       // silently, and in a routine whose action is `enqueue` that direction
       // merges.
       statusCheckRollup: JSON.parse(
-        gh(["pr", "view", String(row.number), "--repo", repo, "--json", "statusCheckRollup"]),
+        run(["pr", "view", String(joined.number), "--repo", repo, "--json", "statusCheckRollup"]),
       ).statusCheckRollup,
-      reviews: JSON.parse(gh(["api", `repos/${repo}/pulls/${row.number}/reviews`, "--paginate"])),
+      reviews: JSON.parse(run(["api", `repos/${repo}/pulls/${joined.number}/reviews`, "--paginate"])),
       // The merge-queue ejection history, for the `ejected-at-current-head`
       // rule. Spent only on PRs that already survived `classifyFromListing`,
       // i.e. the ones that could still enqueue — on this repo a handful of the
@@ -1661,7 +1808,7 @@ function fetchOpenPrs(repo) {
       // and reports `count: 0` — a confident all-clear, in the fail-open
       // direction.
       timeline: JSON.parse(
-        gh(["api", `repos/${repo}/issues/${row.number}/timeline`, "--paginate"]),
+        run(["api", `repos/${repo}/issues/${joined.number}/timeline`, "--paginate"]),
       ),
     };
   });
@@ -1697,7 +1844,7 @@ export function resolveMergeState(repo, number, current, options = {}) {
   } = options;
   // Spend nothing on a PR whose state GitHub already computed. This is the
   // overwhelmingly common case and it must stay free.
-  if (String(current ?? "UNKNOWN").toUpperCase() !== "UNKNOWN") return current;
+  if (readMergeState(current) !== "UNKNOWN") return current;
 
   for (let attempt = 0; attempt < retries; attempt += 1) {
     // Sleep FIRST. The read that reported UNKNOWN is what scheduled the
@@ -1712,7 +1859,7 @@ export function resolveMergeState(repo, number, current, options = {}) {
     } catch {
       continue;
     }
-    if (String(next ?? "UNKNOWN").toUpperCase() !== "UNKNOWN") return next;
+    if (readMergeState(next) !== "UNKNOWN") return next;
   }
   return current;
 }
@@ -2184,10 +2331,14 @@ export function runRepo(
     prs = fetch(repo);
   } catch (error) {
     // BLO-51665: a throw here used to leave the receipt EMPTY, so nobody could
-    // tell which repo the fire died in or why. Say it on stdout, then rethrow:
-    // the caller's `finally` still prints the priority cohort.
+    // tell which repo the fire died in or why. Say it on stdout, then rethrow.
+    //
+    // PEN-5442: the rethrow no longer necessarily ends the fire — `repoRunner`
+    // decides that, and skips this repo unless the error is one
+    // `isFatalGhError` calls untrustworthy. The message is worded for both
+    // outcomes, because this frame does not know which it will get.
     const message = error?.stderr?.toString() || error?.message || String(error);
-    console.log(`## ${repo}\n\nAborted while collecting PRs: ${message.trim().split("\n")[0]}`);
+    console.log(`## ${repo}\n\nCould not collect PRs: ${message.trim().split("\n")[0]}`);
     throw error;
   }
   // The per-fire cap is applied INSIDE `classifyAll`, which rewrites an
@@ -2329,17 +2480,77 @@ export function sweepRepos(repos, runOne) {
  * the cap per repo again) without running `main`. `run` is a test seam.
  */
 export const repoRunner =
-  (apply, settleMinutes, rotted, stranded = [], run = runRepo, notify = new Set()) =>
+  (
+    apply,
+    settleMinutes,
+    rotted,
+    stranded = [],
+    run = runRepo,
+    notify = new Set(),
+    // PEN-5442. Repos this fire could not read, by the same
+    // collected-by-reference convention as `rotted`/`stranded`: `main` reports
+    // it after the sweep and `alarmExitCode` reads it. A seventh CONSTRUCTOR
+    // argument, deliberately — the per-repo call vector handed to `runRepo` is
+    // unchanged, which is what the "UNCHANGED argument vector" test pins.
+    unreadable = [],
+  ) =>
   (repo, spent) => {
     // Spread rather than an unconditional 7th argument, so a fire with no
     // notify list calls `runRepo` with exactly the arguments it always did.
     // That keeps the carry test's deep-compare of the argument vector honest
     // instead of making it assert `undefined` in a new slot.
     const options = notify.has(repo) ? [{ landable: false }] : [];
-    const rows = run(repo, apply, settleMinutes, spent, rotted, stranded, ...options);
+    let rows;
+    try {
+      rows = run(repo, apply, settleMinutes, spent, rotted, stranded, ...options);
+    } catch (error) {
+      // PEN-5442: one unreadable repo used to end the WHOLE fire. `fetchOpenPrs`
+      // is the first thing `runRepo` does and its throw escaped `runRepo`'s
+      // try, `sweepRepos` had no catch, and `main` wrapped the sweep in
+      // try/`finally` with no catch either — so a repo the routine merely
+      // could not list took every other repo down with it. That it did not
+      // cost anything yet was ordering luck: `sweepOrder` happens to sweep the
+      // land repos first, so their rows were already printed.
+      //
+      // Measured 2026-11-04, Blockcast/penstock-llm-proxy-core at 153 open
+      // PRs: the single list call 502'd on 3 of 3 attempts. A repo that cannot
+      // be read is a repo with no verdicts — which is a reason to say so and
+      // move on, not a reason to discard the verdicts of the repos that CAN be
+      // read.
+      const message = error?.stderr?.toString() || error?.message || String(error);
+      const first = message.trim().split("\n")[0];
+      // `isFatalGhError` keeps its meaning exactly: exhausted rate limits or
+      // bad credentials make the WHOLE fire untrustworthy, not just this repo,
+      // because every subsequent `skip:` row would be indistinguishable from a
+      // real verdict. Those still end the fire.
+      if (isFatalGhError(first)) throw error;
+      unreadable.push(`${repo} (${first})`);
+      console.log(`Skipped ${repo}: it could not be listed. The rest of the fire continues.\n`);
+      // No rows, so `sweepRepos` carries no spend for this repo — correct, it
+      // enqueued nothing.
+      return [];
+    }
     console.log("");
     return rows;
   };
+
+/**
+ * Names the repos this fire skipped, in every run mode.
+ *
+ * Printed from `main`'s `finally` beside `reportRotted` so it survives a later
+ * abort, and unconditionally rather than only under `--alarm`: a dry run that
+ * silently covered one repo fewer than the reader assumes is the same wrong
+ * conclusion, just without an exit code to carry it.
+ */
+function reportUnreadable(unreadable) {
+  if ((unreadable ?? []).length === 0) return;
+  console.log(
+    `\nunreadable repos (PEN-5442) — ${unreadable.length}:\n` +
+      unreadable.map((repo) => `  ${repo}`).join("\n") +
+      "\nThis fire asserts nothing about these: no receipt, no holds, no " +
+      "unlanded-eligible cohort. Everything above covers the other repos only.",
+  );
+}
 
 function reportRotted(rotted) {
   if (rotted.length === 0) return;
@@ -2362,9 +2573,18 @@ function reportRotted(rotted) {
  * Separated from `main` so the AC4 contract — go visibly red rather than
  * relying on someone noticing by hand — is pinned by a test rather than by
  * reading the shape of `main`.
+ *
+ * ⛔ `unreadable` is the second term for a reason, and it is the whole reason
+ * skipping an unreadable repo is safe. Before PEN-5442 an unreadable repo
+ * CRASHED the fire, which at least exited non-zero. Skipping it instead would,
+ * on its own, convert that noisy failure into `0` — "no PR has been landable
+ * and ignored for UNLANDED_ELIGIBLE_HOURS" asserted over a repo this fire
+ * never read. That is the fail-OPEN direction and it is exactly the shape of
+ * silent all-clear this detector exists to rule out, so the skip and this term
+ * ship together: a repo that went unread makes the alarm red on its own.
  */
-export function alarmExitCode(stranded) {
-  return (stranded ?? []).length > 0 ? 1 : 0;
+export function alarmExitCode(stranded, unreadable = []) {
+  return (stranded ?? []).length > 0 || (unreadable ?? []).length > 0 ? 1 : 0;
 }
 
 function main() {
@@ -2382,6 +2602,7 @@ function main() {
   const settleMinutes = settleMinutesFrom();
   const rotted = [];
   const stranded = [];
+  const unreadable = [];
 
   // `finally`, because the cohort is the expensive half of the output and the
   // likeliest thrower is `fetchOpenPrs` — outside `runRepo`'s try, one list
@@ -2395,14 +2616,22 @@ function main() {
   try {
     sweepRepos(
       sweepOrder(targetRepos(), [...notify]),
-      repoRunner(apply, settleMinutes, rotted, stranded, runRepo, notify),
+      repoRunner(apply, settleMinutes, rotted, stranded, runRepo, notify, unreadable),
     );
   } finally {
     reportRotted(rotted);
+    reportUnreadable(unreadable);
   }
 
   if (!apply) console.log("\n(dry run — pass --apply to act)");
 
+  if (alarm && unreadable.length > 0) {
+    console.error(
+      `\nALARM: ${unreadable.length} repo(s) could not be listed, so this run asserts ` +
+        `NOTHING about them — ${unreadable.join(", ")}.\n` +
+        "The sweep continued and the repos below were read normally; these were not.",
+    );
+  }
   if (alarm && stranded.length > 0) {
     console.error(
       `\nALARM: ${stranded.length} PR(s) have been landable for over ` +
@@ -2411,7 +2640,7 @@ function main() {
         "See the unlanded-eligible block above.",
     );
   }
-  if (alarm) process.exit(alarmExitCode(stranded));
+  if (alarm) process.exit(alarmExitCode(stranded, unreadable));
 }
 
 export function isMainModule(argvPath = process.argv[1], moduleUrl = import.meta.url) {

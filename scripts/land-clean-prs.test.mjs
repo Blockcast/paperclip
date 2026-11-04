@@ -59,6 +59,11 @@ import {
   stripCodeownersComment,
   resolveMergeState,
   UNLANDABLE_MERGE_STATES,
+  KNOWN_MERGE_STATES,
+  readMergeState,
+  fetchMergeStates,
+  fetchOpenPrs,
+  MERGE_STATE_PAGE_SIZE,
 } from "./land-clean-prs.mjs";
 
 const HEAD = "958587ad1fe1eb52b06ca874c41734c9abdc2a10";
@@ -2685,6 +2690,295 @@ describe("rate-limit retry in gh() (BLO-51665)", () => {
     } finally {
       console.log = log;
     }
-    assert.match(lines.join("\n"), /## a\/one[\s\S]*Aborted while collecting PRs: .*rate limit/);
+    // PEN-5442 reworded this from "Aborted while collecting PRs" — `runRepo`
+    // still rethrows, but it is no longer the frame that decides whether the
+    // fire ends, so it no longer claims to. The behaviour this test exists for
+    // (BLO-51665: name the repo and the reason on stdout rather than dying
+    // with an empty receipt) is unchanged.
+    assert.match(lines.join("\n"), /## a\/one[\s\S]*Could not collect PRs: .*rate limit/);
+  });
+});
+
+describe("the merge-state read is total and fail-closed (PEN-5442)", () => {
+  // `fetchOpenPrs` now JOINS `mergeStateStatus` on from a second call, so for
+  // the first time a row can reach the classifier carrying a state nobody
+  // read. Every test here is about the SAME direction: an unread state must
+  // never be a licence to merge. The opposite direction — holding a PR that
+  // could have landed — costs one cycle and is not what these pin.
+
+  it("maps every unrecognised shape to UNKNOWN and passes real states through", () => {
+    for (const state of KNOWN_MERGE_STATES) {
+      assert.equal(readMergeState(state), state, `${state} is a state and survives`);
+      assert.equal(readMergeState(state.toLowerCase()), state, "case is normalised");
+      assert.equal(readMergeState(` ${state} `), state, "surrounding space is trimmed");
+    }
+    // The shapes a join can produce. `""` is the one that matters: `??` passes
+    // it through, so the obvious `String(x ?? "UNKNOWN").toUpperCase()` leaves
+    // it as `""`, which is NOT in UNLANDABLE_MERGE_STATES and therefore falls
+    // past every hold. Measured enqueuing before this existed.
+    for (const value of ["", "   ", undefined, null, 0, 1, NaN, false, true, {}, [], "MERGED", "garbage"]) {
+      assert.equal(readMergeState(value), "UNKNOWN", `${JSON.stringify(value) ?? String(value)} is not a state`);
+    }
+    assert.ok(UNLANDABLE_MERGE_STATES.has("UNKNOWN"), "and UNKNOWN is held");
+  });
+
+  it("⛔ a PR that would otherwise enqueue cannot enqueue once its merge state is lost", () => {
+    // The guard the whole row is about. `classify`'s default PR is BLOCKED and
+    // enqueues, so each case below differs from an enqueueing row by the merge
+    // state ALONE.
+    assert.equal(classify({ mergeStateStatus: "CLEAN" }).action, "enqueue", "control: this row does enqueue");
+
+    const lost = {
+      "deleted outright": (pr) => { delete pr.mergeStateStatus; },
+      "undefined": (pr) => { pr.mergeStateStatus = undefined; },
+      "null": (pr) => { pr.mergeStateStatus = null; },
+      "empty string": (pr) => { pr.mergeStateStatus = ""; },
+      "whitespace": (pr) => { pr.mergeStateStatus = " "; },
+      "a value outside the enum": (pr) => { pr.mergeStateStatus = "MERGED"; },
+    };
+    for (const [label, lose] of Object.entries(lost)) {
+      const subject = pr({ mergeStateStatus: "CLEAN" });
+      lose(subject);
+      const row = classifyPr(subject, { now: NOW });
+      assert.notEqual(row.action, "enqueue", `${label} must not enqueue`);
+      assert.equal(row.action, "skip", `${label} holds`);
+      assert.equal(row.reason, "mergestate:UNKNOWN", `${label} says why, in the resolvable form`);
+    }
+  });
+
+  it("holds a lost state as UNKNOWN specifically, so resolveMergeState can still repair it", () => {
+    // UNKNOWN rather than a new terminal reason: `resolveMergeState` re-reads
+    // exactly UNKNOWN, so a row that lost its state to the two-call race is
+    // repaired on the same fire instead of waiting a cycle. A bespoke
+    // `mergestate:MISSING` would have been a permanent hold.
+    const calls = [];
+    const run = (args) => (calls.push(args), JSON.stringify({ mergeStateStatus: "CLEAN" }));
+    assert.equal(
+      resolveMergeState("a/one", 1418, readMergeState(""), { run, sleep: () => {} }),
+      "CLEAN",
+    );
+    assert.equal(calls.length, 1, "one re-read repaired it");
+  });
+});
+
+describe("fetchOpenPrs splits the listing and joins on number (PEN-5442)", () => {
+  const HEAD_A = "1".repeat(40);
+  const HEAD_B = "2".repeat(40);
+  const listing = [
+    { number: 11, headRefOid: HEAD_A, author: { login: "kkroo", is_bot: false }, labels: [], isDraft: false, autoMergeRequest: null, reviewRequests: [] },
+    { number: 22, headRefOid: HEAD_B, author: { login: "kkroo", is_bot: false }, labels: [], isDraft: false, autoMergeRequest: null, reviewRequests: [] },
+  ];
+  // Every row here is human-authored, so `classifyFromListing` decides them all
+  // and `fetchOpenPrs` never hydrates — no checks, no reviews, no timeline. The
+  // join is the only thing under test.
+  const run = (args) => {
+    if (args[0] === "pr" && args[1] === "list") return JSON.stringify(listing);
+    throw new Error(`unexpected gh call: ${args.join(" ")}`);
+  };
+
+  it("asks for the merge state in a SEPARATE call, and not in the listing", () => {
+    // The defect: one call carrying all 8 fields 502'd on 3 of 3 attempts
+    // against a 153-open-PR repo. Splitting it is the fix, so the listing must
+    // not quietly regain the field.
+    const seen = [];
+    fetchOpenPrs("a/one", {
+      run: (args) => (seen.push(args), run(args)),
+      mergeStates: () => new Map([[11, "CLEAN"], [22, "CLEAN"]]),
+    });
+    const list = seen.find((args) => args[0] === "pr" && args[1] === "list");
+    assert.ok(list, "it still lists");
+    const fields = list[list.indexOf("--json") + 1];
+    assert.ok(!fields.includes("mergeStateStatus"), `the listing must not ask for it: ${fields}`);
+    for (const field of ["number", "headRefOid", "author", "labels", "isDraft", "autoMergeRequest", "reviewRequests"]) {
+      assert.ok(fields.includes(field), `${field} still comes from the listing`);
+    }
+  });
+
+  it("joins each row to ITS OWN number, not to the position in the other call", () => {
+    // The join risk that made this its own PR. The two calls are independent
+    // reads, so the merge-state call can come back in a different order, or
+    // short — and a positional join would hand #22's state to #11. Returned
+    // reversed on purpose.
+    const prs = fetchOpenPrs("a/one", {
+      run,
+      mergeStates: () => new Map([[22, "DIRTY"], [11, "CLEAN"]]),
+    });
+    assert.deepEqual(
+      prs.map((row) => [row.number, row.mergeStateStatus]),
+      [[11, "CLEAN"], [22, "DIRTY"]],
+    );
+  });
+
+  it("holds a row the merge-state call did not return, rather than inventing a state", () => {
+    // The expected race, not a bug: the two calls are not atomic, so a PR open
+    // for the listing can merge before the merge-state read. It must resolve
+    // to a hold — and to UNKNOWN specifically.
+    const prs = fetchOpenPrs("a/one", { run, mergeStates: () => new Map([[11, "CLEAN"]]) });
+    assert.equal(prs[0].mergeStateStatus, "CLEAN");
+    assert.equal(prs[1].mergeStateStatus, "UNKNOWN", "#22 was not in the second call");
+    assert.equal(classifyPr({ ...pr(), ...prs[1] }, { now: NOW }).action, "skip");
+  });
+
+  it("holds every row when the merge-state call comes back empty", () => {
+    // The whole-call failure mode, which is the one actually measured. If this
+    // ever enqueued, a single bad second call would merge the entire open set.
+    const prs = fetchOpenPrs("a/one", { run, mergeStates: () => new Map() });
+    for (const row of prs) assert.equal(row.mergeStateStatus, "UNKNOWN");
+  });
+
+  it("fails the whole read when the merge-state call throws, rather than returning stateless rows", () => {
+    // Read BEFORE the join for this reason: a caught-and-ignored failure would
+    // yield a full listing with every state missing, which is the previous
+    // test's shape arrived at by accident instead of on purpose.
+    assert.throws(
+      () => fetchOpenPrs("a/one", { run, mergeStates: () => { throw new Error("HTTP 502"); } }),
+      /502/,
+    );
+  });
+});
+
+describe("fetchMergeStates reads merge states at a controlled page size (PEN-5442)", () => {
+  const nd = (rows) => rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
+
+  it("pages at MERGE_STATE_PAGE_SIZE, which is the measured fix", () => {
+    // `gh pr list` pages at 100 whatever `--limit` says, and a 100-item page
+    // carrying mergeStateStatus is what GitHub 502s on. 25 measured 6/6 clean
+    // where the 100-item page measured 10/13.
+    let seen;
+    fetchMergeStates("a/one", { run: (args) => ((seen = args), nd([])) });
+    assert.equal(seen[0], "api");
+    assert.equal(seen[1], "graphql");
+    assert.ok(seen.includes("--paginate"), "and follows every page");
+    assert.ok(seen.includes(`first=${MERGE_STATE_PAGE_SIZE}`), seen.join(" "));
+    assert.ok(MERGE_STATE_PAGE_SIZE < 100, "below the page size that fails");
+    assert.ok(seen.includes("owner=a") && seen.includes("name=one"), "repo is split for GraphQL");
+    const query = seen[seen.indexOf("-f") + 1];
+    assert.ok(/states:OPEN/.test(query), query);
+    // Two scalars and no nested connection: this is why the file's "do not
+    // hand-roll GraphQL" warning (about `contexts(first: 100)` truncating
+    // silently) does not transfer to this query.
+    assert.ok(!/\(first:\s*100\)/.test(query), "no inner connection to truncate");
+  });
+
+  it("keys by number and normalises each state through readMergeState", () => {
+    const states = fetchMergeStates("a/one", {
+      run: () => nd([
+        { number: 11, mergeStateStatus: "CLEAN" },
+        { number: 22, mergeStateStatus: "dirty" },
+        { number: 33, mergeStateStatus: "" },
+        { number: 44, mergeStateStatus: null },
+      ]),
+    });
+    assert.equal(states.get(11), "CLEAN");
+    assert.equal(states.get(22), "DIRTY");
+    // Normalised at the boundary, so a malformed node enters the join as a
+    // hold rather than as a string the classifier has to defend against.
+    assert.equal(states.get(33), "UNKNOWN");
+    assert.equal(states.get(44), "UNKNOWN");
+    assert.equal(states.get(99), undefined, "an absent number stays absent for the join to default");
+  });
+
+  it("tolerates the blank lines --paginate leaves between pages", () => {
+    const states = fetchMergeStates("a/one", {
+      run: () => '\n{"number":11,"mergeStateStatus":"CLEAN"}\n\n{"number":22,"mergeStateStatus":"BEHIND"}\n\n',
+    });
+    assert.deepEqual([...states.entries()], [[11, "CLEAN"], [22, "BEHIND"]]);
+  });
+});
+
+describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () => {
+  const quietly = (fn) => {
+    const log = console.log;
+    const lines = [];
+    console.log = (line) => lines.push(String(line));
+    try {
+      return { value: fn(), lines: lines.join("\n") };
+    } finally {
+      console.log = log;
+    }
+  };
+  const boom = (message) => () => { throw Object.assign(new Error("gh failed"), { stderr: message }); };
+
+  it("⛔ one unreadable repo no longer ends the whole fire", () => {
+    // The defect: `fetchOpenPrs` is the first thing `runRepo` does, its throw
+    // escaped `runRepo`'s try, and neither `sweepRepos` nor `main` had a
+    // catch — so a repo the routine merely could not LIST discarded every
+    // other repo's verdicts. Measured 502 on 3 of 3 attempts against a
+    // 153-open-PR repo, so this is the ordinary case for that repo, not an
+    // exotic one.
+    const unreadable = [];
+    const swept = [];
+    const run = (repo) => {
+      if (repo === "a/broken") boom("HTTP 502: 502 Bad Gateway")();
+      swept.push(repo);
+      return [{ number: 1, action: "enqueue" }];
+    };
+    const { value, lines } = quietly(() =>
+      sweepRepos(
+        ["a/broken", "a/fine"],
+        repoRunner(true, 0, [], [], run, new Set(), unreadable),
+      ),
+    );
+    assert.deepEqual(swept, ["a/fine"], "the readable repo was still swept");
+    assert.equal(value, 1, "and its enqueue still counted toward the cap");
+    assert.deepEqual(unreadable, ["a/broken (HTTP 502: 502 Bad Gateway)"], "named, with the reason");
+    assert.match(lines, /Skipped a\/broken/);
+  });
+
+  it("still ends the fire for a failure that makes every later verdict untrustworthy", () => {
+    // `isFatalGhError` keeps its meaning. An exhausted rate limit or bad
+    // credentials would make every subsequent `skip:` row indistinguishable
+    // from a real verdict, which is a different thing from one repo being
+    // unlistable. Skipping those would be the fail-open direction.
+    for (const fatal of ["API rate limit exceeded (HTTP 403)", "Bad credentials", "HTTP 401"]) {
+      const unreadable = [];
+      assert.throws(
+        () => quietly(() => sweepRepos(["a/one"], repoRunner(true, 0, [], [], boom(fatal), new Set(), unreadable))),
+        /gh failed/,
+        `${fatal} must still abort`,
+      );
+      assert.deepEqual(unreadable, [], "and is not recorded as a mere skip");
+    }
+  });
+
+  it("does not spend the skipped repo's budget on anything", () => {
+    const unreadable = [];
+    const seen = [];
+    const run = (repo, _apply, _settle, spent) => {
+      seen.push([repo, spent]);
+      if (repo === "a/broken") boom("HTTP 502")();
+      return [{ number: 1, action: "enqueue" }, { number: 2, action: "enqueue" }];
+    };
+    quietly(() =>
+      sweepRepos(["a/first", "a/broken", "a/last"], repoRunner(true, 0, [], [], run, new Set(), unreadable)),
+    );
+    // The skipped repo contributes no rows, so the carry into `a/last` is the
+    // 2 that `a/first` actually spent — not 2 plus a guess for the repo nobody
+    // could read.
+    assert.deepEqual(seen, [["a/first", 0], ["a/broken", 2], ["a/last", 2]]);
+  });
+
+  it("leaves the per-repo argument vector alone", () => {
+    // `unreadable` is a seventh CONSTRUCTOR argument, not a seventh argument to
+    // `runRepo` — the same reason the notify bag is spread in conditionally.
+    const calls = [];
+    quietly(() =>
+      sweepRepos(["a/one"], repoRunner(true, 7, [], [], (...args) => (calls.push(args), []), new Set(), [])),
+    );
+    assert.equal(calls[0].length, 6, "no seventh argument when the notify list is empty");
+  });
+
+  it("⛔ an alarm run goes red for a repo it could not read", () => {
+    // Skipping is only safe BECAUSE of this. Before PEN-5442 an unreadable
+    // repo crashed the fire, which at least exited non-zero; skipping it
+    // without this term would turn that into a clean `0` — "nothing has been
+    // landable and ignored" asserted over a repo the fire never read, which is
+    // exactly the silent all-clear this detector exists to rule out.
+    assert.equal(alarmExitCode([], []), 0, "control: nothing wrong is still green");
+    assert.equal(alarmExitCode([], ["a/broken (HTTP 502)"]), 1);
+    assert.equal(alarmExitCode(["a/one#1"], []), 1, "the stranded term is unchanged");
+    assert.equal(alarmExitCode(["a/one#1"], ["a/broken (HTTP 502)"]), 1);
+    assert.equal(alarmExitCode(undefined, undefined), 0, "and both still default");
+    assert.equal(alarmExitCode([]), 0, "including the one-argument call sites");
   });
 });
