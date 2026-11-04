@@ -283,9 +283,13 @@ export const ISSUE_PARK_EXPIRED_WAKE_REASON = "issue_park_expired";
  *        approval wakes the requester (`requesterWakeActorType`, `approval-resolution.ts`).
  *        An interaction wakes the assignee ONLY at `continuationPolicy` `wake_assignee` /
  *        `wake_assignee_on_accept` (`queueResolvedInteractionContinuationWakeup`,
- *        `routes/issues.ts`) — and `request_confirmation` prefaults to `none`
- *        (`packages/mcp-server/src/tools.ts`), so even here the wake is not automatic.
- *        Where it holds, a timer wake adds nothing a human answer does not.
+ *        `routes/issues.ts`). Every kind prefaults to `wake_assignee` since PEN-5505
+ *        (`request_confirmation` alone used to prefault to `none`), so an ANSWERED card
+ *        now does wake the assignee, and there a timer wake adds nothing a human answer
+ *        does not. An EXPIRED one wakes nobody under ANY policy — that function bails on
+ *        `status === "expired"` whatever the policy said — so a card killed by
+ *        `supersedeOnUserComment`, which also prefaults true, leaves the row dark exactly
+ *        as this note warns. Check which of the two happened before concluding.
  *      - `convergence_stalled` — the opposite case, and the one to be most careful with.
  *        The assignee is barred from re-arming its own stalled monitor
  *        (`MONITOR_CONVERGENCE_RESET_REQUIRES_NON_ASSIGNEE_MESSAGE`,

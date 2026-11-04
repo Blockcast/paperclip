@@ -267,7 +267,12 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
       resolved_by_kind: "agent",
       resolution_reason: "rejected",
       created_by_kind: "user",
-      continuation_policy: "none",
+      // PEN-5505: this card is filed with NO `continuationPolicy`, so this
+      // asserts the new default end-to-end — through create, resolve and
+      // telemetry -- rather than only at the schema. Deliberately a literal and
+      // not derived from the schema: deriving it would make a regression of the
+      // default agree with itself and pass here silently.
+      continuation_policy: "wake_assignee",
       target_type: "none",
     });
     expect(dimensions).not.toHaveProperty("creator_agent_role");
@@ -453,7 +458,10 @@ describeEmbeddedPostgres("issueThreadInteractionService telemetry", () => {
       resolved_by_kind: "system",
       resolution_reason: "stale_target",
       created_by_kind: "user",
-      continuation_policy: "none",
+      // PEN-5505: also filed with NO `continuationPolicy`; see the rejected
+      // case above. This pins the dimension that gets REPORTED, not a wake —
+      // no policy, `wake_assignee` included, wakes anyone on an expiry.
+      continuation_policy: "wake_assignee",
       target_type: "issue_document",
     });
     expect(dimensions).not.toHaveProperty("staleTarget");
