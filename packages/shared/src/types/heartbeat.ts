@@ -70,10 +70,17 @@ export interface GitWorktreeBranchIncoherenceEvidence {
     status: string;
   }[] | null;
   /**
-   * Claimants other than the issue being repaired that currently hold an issue
-   * execution lock on this workspace — i.e. whose `checkoutRunId` or
-   * `executionRunId` names a non-terminal run, the same predicate
-   * `POST /issues/:id/checkout` 409s on.
+   * Claimants other than the issue being repaired that are being worked in this
+   * workspace right now — i.e. that a non-terminal run either holds the issue
+   * execution lock for (`checkoutRunId`/`executionRunId`, the same predicate
+   * `POST /issues/:id/checkout` 409s on) or merely names as its context issue.
+   *
+   * Both arms are needed, and the second is not redundant: a run only takes the
+   * lock when `claimQueuedRun` requires it, which excludes interaction wakes
+   * carrying a comment id, non-assignee mention runs and non-ownership retry
+   * lineages. Those execute and realize this worktree while holding no lock at
+   * all, so a lock-only reading would report an idle worktree while a peer was
+   * committing in it.
    *
    * PEN-5493. Eligibility used to refuse on `workspaceClaimants.length > 1`,
    * which is a count of references rather than a test of use: a `backlog` row
