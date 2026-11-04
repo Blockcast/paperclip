@@ -421,6 +421,25 @@ export type AllyVerdictBlockParse =
   | { kind: "unreadable"; reason: string };
 
 /**
+ * The JSON shape a value arrived as, or `null` when it has no name worth
+ * publishing.
+ *
+ * Names the SHAPE, never the payload. A malformed `findings` is model-authored
+ * and its reason reaches the same unscrubbed publication boundary as the
+ * severity key (PEN-3157), so the value itself is never quoted; the words below
+ * come from this closed set rather than from the input, which is what makes
+ * them safe to publish without asPublishableToken.
+ */
+function describeJsonShape(raw: unknown): string | null {
+  if (raw === null) return "null";
+  if (Array.isArray(raw)) return "an array";
+  if (typeof raw === "string") return "a string";
+  if (typeof raw === "number") return "a number";
+  if (typeof raw === "boolean") return "a boolean";
+  return null;
+}
+
+/**
  * Note there is deliberately no `undefined` branch here, unlike
  * `asDispositions`. A missing `findings` is rejected by the caller rather than
  * defaulted to an empty map: defaulting is a fail-open path, because zero
@@ -434,17 +453,41 @@ export type AllyVerdictBlockParse =
  * that string into `unreadable`. A reason rather than a bare `null` because an
  * unsupported severity key is worth naming: it is almost always a typo, and
  * the gate description is the only place Ally will see which key we rejected.
+ *
+ * That applies to EVERY branch here, not only the unsupported-key one. Two
+ * paths used to answer the bare "findings are not severity counts": a
+ * non-object `findings`, and a non-integer or negative count. Neither named
+ * what it saw, and the second actively misdirected — `findings` is
+ * severity-counts-shaped in that branch and only one entry's value is wrong, so
+ * the reader was sent back to re-read a structurally fine block (PEN-5565). The
+ * one branch that still declines to name its key is the duplicate-severity
+ * check, and it says why: there the defect is the repetition, not the key.
  */
 function asSeverityCounts(raw: unknown): Map<string, number> | string {
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
-    return "ally-verdict findings are not severity counts";
+    // Name what arrived. `findings` is the one mandatory field, so this branch
+    // is the first thing a malformed block hits, and "are not severity counts"
+    // alone leaves Ally re-reading a block whose defect is visible in one word.
+    const shape = describeJsonShape(raw);
+    return shape === null
+      ? "ally-verdict findings are not severity counts"
+      : `ally-verdict findings are ${shape}, not severity counts`;
   }
   const counts = new Map<string, number>();
   for (const [severity, value] of Object.entries(raw as Record<string, unknown>)) {
-    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
-      return "ally-verdict findings are not severity counts";
-    }
     const key = severity.trim().toLowerCase();
+    if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+      // `findings` IS a severity-counts-shaped object here — one entry's value
+      // is wrong — so the whole-object wording above named the wrong defect and
+      // sent the reader back to re-read a block that is structurally fine.
+      //
+      // Scrubbed, unlike the `exceeds` message below: that one is reached only
+      // after VERDICT_SEVERITIES.has(key), so its key is from a closed set,
+      // while this branch runs BEFORE that check and `key` is still arbitrary
+      // model-authored text (PEN-3157). The value is named by category and
+      // never quoted, for the same reason.
+      return `ally-verdict findings count \`${asPublishableToken(key)}\` is not a non-negative integer`;
+    }
     // An unrecognized key must make the whole block unreadable, not be dropped.
     // Dropping it is a fail-open: no blocking check ever consults a severity
     // outside BLOCKING_SEVERITIES, so `{"critcal": 1}` parses as a readable
