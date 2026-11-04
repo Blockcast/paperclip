@@ -912,6 +912,20 @@ Three rules, each of which has already caught someone:
    1, `manual:PEN-388` 1. Filtering on `auto-retry-on-completion` there misses
    375 of 1302 partial rows (29%), and the missed ones are the CI rows — exactly
    where a reader chasing an image bump would look.
+   **The mirror image is equally live, and it is the half this rule asserted
+   without exhibiting.** The *full* population is not `source == "patch"`
+   either. Measured on the `Ceo` seat 2026-11-04 — 1369 revisions, ten of them
+   full, the same ten as the 1341-revision read recorded further down, every
+   row added since being partial — those ten arrive under **two** labels:
+   `patch` 9/9 and `operator_model_pin` 1/1, a fourth writer with a single row
+   (`2026-07-13T05:00:19.929Z`) that nobody enumerating the high-volume
+   sources would have met, against `ci:docker-agent.yml` 959/0 and
+   `auto-retry-on-completion` 400/0. So the shape test is load-bearing in
+   **both** directions: a reader filtering the full side on `source ==
+   "patch"` hits the same defect from the other end, and a measurement that
+   enumerates only the labels it happens to have seen under-counts on
+   whichever side it was not looking at. An earlier pass over this seat
+   concluded "only `patch` is full" for exactly that reason.
    **Corollary, because the citation below is wrong about this:** `PEN-5321`'s
    description groups "`patch` / CI revisions" together as full row snapshots.
    `patch` rows are full; **CI rows are not** — they are this writer's partial
@@ -954,6 +968,29 @@ the keys the stored snapshot actually carries; absent stays absent. The value
 gate is untouched — a *present* but non-plain-object config is still contained
 to `{}` rather than emitted uncontained, which is the fail-closed half of that
 function.
+
+**That reading of absence rests on an invariant, and it is cheaper to state than
+to rediscover: absent means not-stored only while containment masks values and
+never DROPS keys.** It holds today, deliberately — `sanitizeRecord`
+(`redaction.ts`) and `maskAgentWorkspaceStrategyCommandsInner`
+(`agent-redaction.ts`) both iterate every entry and re-assign through
+`assignRecordKey`, specifically so a `__proto__` own key off `JSON.parse`
+survives as data instead of being dropped (`PEN-4240`). The moment a redactor
+starts *removing* a key, a containment-caused absence becomes byte-identical to
+a write-didn't-cover-it absence: `changedKeys` and the emitted key set disagree,
+and nothing in the response says which of the two is right. The presence gate
+already survives that **mechanically** — it asks `contained`, the object this
+function emits, rather than `snapshot` — but surviving a change and still
+meaning the same thing afterwards are different properties, and only the first
+is enforced by the code. The mask site states the rule for its own walk; this is
+where it becomes load-bearing for a reader reconciling a snapshot against
+`changedKeys`.
+
+One genuinely ambiguous state here is older than any of this and is not closed
+by it: the `isPlainObject(snapshot)` early return answers `{}` for a *whole*
+snapshot, which is indistinguishable from a snapshot that stored nothing. It is
+unreachable from `jsonb` today — `JSON.parse` yields only `Object.prototype`
+objects — which is why it stays a comment at the call site rather than a marker.
 
 The naming split is fixed at the source rather than papered over on read:
 `patchAgentImage` now writes its snapshot under `adapterConfig`, matching the
@@ -1055,6 +1092,23 @@ are tractable; both are behaviour changes, which is why they are a design row
   (`stripRedactedEnvBindingsFromAdapterConfig`), the `modelProfiles.*`
   nesting (`restoreRedactedRuntimeConfigValues`), and the whole-value sentinel
   a non-object `workspaceStrategy` is masked to.
+  Two further cases in that block (`PEN-5321`) pin the **`/config-revisions`
+  pair** — the last of the three `containAgentConfig` call-site families with no
+  coverage of this gate: `withholds the commands from BOTH snapshots` on the
+  detail route, and `discloses the commands to a reader that clears
+  workspace_runtime:read` on the list route. Both directions are present
+  because one dropped argument reaches both failures and the unentitled case
+  alone cannot tell them apart. Verified by mutation against this head:
+  dropping the `viewer` argument at the call site fails only the **entitled**
+  case (every reader then gets `containAgentConfig`'s withheld default —
+  fail-closed, but a product regression), while leaving `beforeConfig`
+  uncontained fails only the **unentitled** one. The route needs its own pin
+  because the stored bytes are not masked: `COMMAND_PAYLOAD_KEY_RE` is anchored
+  and does not match `provisionCommand`, and `buildConfigSnapshot` stores
+  `adapterConfig` whole, so `agent_config_revisions.before_config/after_config`
+  hold the shell text verbatim by design and the viewer gate is the only thing
+  withholding it from a readership that cannot hold `workspace_runtime:read`
+  at all (`PEN-2852`).
 - `server/src/__tests__/redaction.test.ts` — `hire_agent approval payload
   workspace-command withholding (PEN-5225)`: the shared projection itself —
   both copies of the config in the card, the `modelProfiles` nesting, the

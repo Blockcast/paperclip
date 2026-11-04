@@ -2251,6 +2251,92 @@ describe("agent workspace command withholding (PEN-5225)", () => {
     expect(res.body.adapterConfig.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
   });
 
+  // `/config-revisions` is the third `containAgentConfig` call site and was the last one of
+  // the three with no pin on this gate (PEN-5321). It is not a restatement of the cases
+  // above, because the stored bytes differ: write-time sanitation does not touch
+  // workspace-strategy shell text — `COMMAND_PAYLOAD_KEY_RE` is anchored (`^command$`,
+  // `^cmd$`, `command[-_]?line`) and does not match `provisionCommand` — while
+  // `buildConfigSnapshot` stores `adapterConfig` whole. So
+  // `agent_config_revisions.before_config/after_config` hold the command verbatim by
+  // design, and the viewer argument threaded through `redactConfigRevision` is the only
+  // thing withholding it from the readership this route admits: `agents:configure` and
+  // `agents:suggest-changes` both clear `agent_config:read`, and no agent can hold
+  // `workspace_runtime:read` at all (PEN-2852).
+  //
+  // BOTH directions are pinned, because one dropped argument reaches both failures: lose
+  // the `viewer` and `containAgentConfig` falls back to its withheld default, masking
+  // entitled readers too (fail-closed, but a product regression); mask unconditionally and
+  // the history route discloses what the detail route withholds. The first case alone
+  // cannot tell those apart.
+  const strategyRevisionId = "77777777-7777-4777-8777-777777777777";
+
+  function strategyRevisionRow() {
+    return {
+      id: strategyRevisionId,
+      agentId,
+      companyId,
+      source: "patch",
+      changedKeys: ["adapterConfig"],
+      beforeConfig: { adapterConfig: strategyAgent.adapterConfig },
+      afterConfig: { adapterConfig: strategyAgent.adapterConfig },
+    };
+  }
+
+  it("GET /agents/:id/config-revisions/:revisionId withholds the commands from BOTH snapshots", async () => {
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": false,
+    }));
+    mockAgentService.getConfigRevision.mockResolvedValue(strategyRevisionRow());
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(
+      `/api/agents/${agentId}/config-revisions/${strategyRevisionId}`,
+    );
+
+    expect(res.status).toBe(200);
+    // `afterConfig` alone would pass with `beforeConfig` uncontained: `redactConfigRevision`
+    // threads the viewer into the two snapshots in separate calls, so each is its own
+    // failure and a one-sided fix is a live disclosure.
+    expect(res.body.afterConfig.adapterConfig.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(res.body.beforeConfig.adapterConfig.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(res.body.beforeConfig.adapterConfig.workspaceStrategy.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+    expect(JSON.stringify(res.body)).not.toContain("prov_secret_13579");
+    expect(JSON.stringify(res.body)).not.toContain("tear_secret_24680");
+  });
+
+  it("GET /agents/:id/config-revisions discloses the commands to a reader that clears workspace_runtime:read", async () => {
+    // The command here deliberately carries NO embedded secret. The revision path composes
+    // `redactAgentConfigPayload`, not `redactAgentSecrets`, so asserting the exact bytes of
+    // `PROVISION` would couple this case to the inner-secret rules instead of to the viewer
+    // gate it exists to pin.
+    const plainProvision = "./provision.sh --no-secrets";
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": true,
+    }));
+    mockAgentService.listConfigRevisions.mockResolvedValue([{
+      ...strategyRevisionRow(),
+      afterConfig: {
+        adapterConfig: {
+          ...strategyAgent.adapterConfig,
+          workspaceStrategy: {
+            ...strategyAgent.adapterConfig.workspaceStrategy,
+            provisionCommand: plainProvision,
+          },
+        },
+      },
+    }]);
+
+    const app = createApp(boardActor);
+    const res = await request(app).get(`/api/agents/${agentId}/config-revisions`);
+
+    expect(res.status).toBe(200);
+    expect(res.body[0].afterConfig.adapterConfig.workspaceStrategy.provisionCommand).toBe(plainProvision);
+  });
+
   it("withholds a command nested under runtimeConfig.modelProfiles.*.adapterConfig", async () => {
     // `agentModelProfileConfigSchema.adapterConfig` is an open `z.record`, so the identical
     // object is storable one key over through the ordinary API. A mask that read only
