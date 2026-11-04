@@ -209,22 +209,43 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * 2026-11-03T12:31Z produced 10 `enqueue` + 1 `already-enqueued` + 3
  * `cap:10-per-fire` -- a 14-PR eligible pool against a 10-PR budget -- and
  * the pool read at or above the cap on every hourly `landing-sweep` sample
- * from 08:29Z to 12:31Z.
+ * from 08:29Z to 12:31Z. Read that sample as a classification, not a fire:
+ * the 14:45Z fire that followed it enqueued 6. A sweep samples an eligible
+ * pool that other enqueue paths drain before the fire reaches it.
  *
  * CAUTION on that merge-count table: it is repo demand, not ROUTINE demand.
  * This routine is one enqueue path among several. Measured 2026-11-04 over
- * the 22 most recently merged PRs, only 5 were enqueued within 15 min of a
- * scheduled fire; of the other 17, eight were enqueued by a human account.
- * So 4 x 10 bounds the PRs that DEPEND on this routine, not the repo's
- * throughput, and a merge count overstates what the ceiling governs.
+ * the two complete UTC days 11-02 and 11-03 -- 96 PRs merged, 91 of them
+ * carrying an `added_to_merge_queue` event -- 28 were enqueued within 15
+ * min of a scheduled fire, and 25 of those sat in a batch tight enough to
+ * be one. So 4 x 10 bounds the PRs that DEPEND on this routine, not the
+ * repo's throughput, and a merge count overstates what the ceiling governs.
  *
- * Measure the enqueue, then, not the merge. A merged PR's
- * `added_to_merge_queue` timeline event carries both the instant and the
- * actor -- and the merge commit's committer DATE and IDENTITY are those
- * same two values (exact on 6 of 6 PRs sampled 2026-11-04), so `git log`
- * over the default branch yields the whole series with no API calls. A
- * fire reads as a tight cluster a few minutes past the hour: on 2026-11-04
- * the 02:45Z fire shows as 02:50:19Z..02:50:50Z, +5.3 to +5.6 min.
+ * Measure the enqueue, then, not the merge -- and make the unit a PULL
+ * REQUEST. That is the part that is easy to get wrong, and it was gotten
+ * wrong in two directions at once in the version of this paragraph that
+ * stood until 2026-11-04:
+ *
+ *   - `git log` over the default branch counts COMMITS. Squash merge is
+ *     disabled on this repo, so an N-commit PR lands N commits carrying
+ *     the SAME committer second -- 185 commits for those 96 PRs (1.93x),
+ *     46 of them multi-commit, #3238 alone landing 12. A 12-commit PR
+ *     therefore fabricates exactly the tight cluster a fire looks like.
+ *     The committer date does equal `added_to_merge_queue` to the second,
+ *     so `git log` finds candidate instants; it cannot count them.
+ *   - `gh pr list --state merged` returns rows newest-CREATED first, so a
+ *     `mergedAt` window over a fixed `--limit` truncates silently and
+ *     still reads as complete: that window returned 100 / 125 / 125 rows
+ *     at limits 100 / 200 / 400. Page until two limits agree.
+ *
+ * A fire reads as a tight cluster of bot enqueues a few minutes past the
+ * hour, in DESCENDING PR number: 11-02T14:48:38Z n=8, 11-02T20:47:46Z n=5,
+ * 11-03T02:50:46Z n=6, 11-03T14:56:06Z n=6, each 16-40s wide at +2.8 to
+ * +11.8 min. Identity does NOT discriminate -- 77 of the 91 enqueues are
+ * `allyblockcast[bot]`, far more than any fire batch, so cluster shape is
+ * the only signal. The cap IS reached in practice, just not on either day
+ * above: the 2026-11-04T08:45Z fire enqueued exactly 10 in 32s
+ * (#3368 down to #3215), against 8 in 31s at 02:45Z the same morning.
  *
  * If that has to be fixed, fix it with fire FREQUENCY, not by raising this
  * number. Raising the cap buys throughput by spending the blast-radius
