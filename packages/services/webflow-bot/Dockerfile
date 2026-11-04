@@ -39,6 +39,16 @@ RUN apt-get update -qq \
 # baked into the base image (mismatch = "browser version not found"
 # at runtime). PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 prevents the postinstall
 # hook from re-downloading what's already at /ms-playwright.
+# The playwright base image ships npm 10.x, whose bundled `tar` 6.2.1 carries
+# CVE-2026-59873 (Critical; fixed in tar 7.5.19) — BLO-51968. Every image
+# built FROM this one (figma-bot) inherits it. npm@11.21.1 bundles tar 7.5.22
+# and supports the base image's Node 22 (npm 12 needs Node >=22.22.2).
+# The second line fails the build if the bundled tar is ever back below 7.
+RUN npm install -g --no-audit --no-fund npm@11.21.1 \
+ && TAR_V=$(node -p "require('$(npm root -g)/npm/node_modules/tar/package.json').version") \
+ && echo "npm-bundled tar $TAR_V" \
+ && [ "${TAR_V%%.*}" -ge 7 ]
+
 WORKDIR /app
 RUN npm init -y >/dev/null \
  && PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1 \
