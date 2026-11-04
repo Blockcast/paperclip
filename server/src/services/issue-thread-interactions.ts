@@ -251,9 +251,16 @@ function isEquivalentCreateRequest(
   // that card's real `continuationPolicy`, so a policy that differs from the
   // one just requested is visible rather than merely assumed.
   //
-  // Dropping the term also keeps the next default change from re-breaking
-  // replay the same way; every remaining field is caller-supplied, so none of
-  // them can be skewed by a server-side default.
+  // Dropping the term narrows this hazard; it does not close it. `payload` is
+  // still compared by value after parsing, and the payload schemas carry their
+  // own server defaults — `supersedeOnUserComment` and `allowDeclineReason`
+  // both prefault in `packages/shared/src/validators/issue.ts`. Changing either
+  // reproduces this exact 409 through the `isDeepStrictEqual` term below, for
+  // every card already persisted under the previous default. That is live, not
+  // theoretical: flipping the `supersedeOnUserComment` default is a direct
+  // follow-up to the issue this change came from. Any such change needs the
+  // same treatment — a replay test against a row stored under the old default,
+  // red before the fix and green after.
   return (
     row.kind === input.kind
     && (row.idempotencyKey ?? null) === (input.idempotencyKey ?? null)
