@@ -11,7 +11,7 @@ import {
   isKnownPublishingGitVerb,
 } from "@paperclipai/adapter-utils/github-git-egress-shim";
 import type { Db } from "@paperclipai/db";
-import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
+import { executionWorkspaces, heartbeatRuns, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
   collectBranchTemplateProblems,
   listWorkspaceServiceCommandDefinitions,
@@ -23,7 +23,7 @@ import {
   type WorkspaceRuntimeDesiredState,
   type WorkspaceRuntimeServiceStateMap,
 } from "@paperclipai/shared";
-import { and, desc, eq, inArray, isNull, ne, notInArray } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, notInArray, or } from "drizzle-orm";
 import { asNumber, asString, parseObject, renderTemplate } from "../adapters/utils.js";
 import { resolveHomeAwarePath, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 import { logger } from "../middleware/logger.js";
@@ -49,6 +49,7 @@ import {
   pruneOwnStaleGitWorktree,
 } from "./git-worktree-ownership.js";
 import { executionWorkspaceService, readExecutionWorkspaceConfig } from "./execution-workspaces.js";
+import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "./issue-execution-lock.js";
 import {
   buildAgentGitIdentityEnv,
   ensureCheckoutGitIdentity,
@@ -1674,11 +1675,10 @@ type ExecutionWorkspaceClaimantLookup =
   | { status: "not-computable" }
   | { status: "failed" };
 
-// Non-terminal issues pointing at one execution workspace. A worktree holds a
-// single branch, so two or more claimants make it a shared resource and the
-// recorded branch is shared with them. Restoring it would move the worktree off
-// whichever claimant's branch is currently checked out, so safe repair refuses
-// and leaves the existing workspace-binding recovery path to route it (BLO-32628).
+// Non-terminal issues pointing at one execution workspace. Collected for the
+// evidence payload only. This list is NOT the eligibility test: it counts rows
+// that *reference* the workspace, and a reference is not use (PEN-5493 — see
+// `findExecutionWorkspaceLiveClaimants`). Originally BLO-32628.
 async function findExecutionWorkspaceIssueClaimants(input: {
   db: Db | null | undefined;
   executionWorkspaceId: string | null;
@@ -1726,6 +1726,110 @@ function formatWorkspaceClaimantRefusal(
   const count = truncated ? `at least ${claimants.length}` : `${claimants.length}`;
   const sample = truncated ? `${names}, …` : names;
   return `execution workspace is claimed by ${count} non-terminal issues (${sample}); restoring the recorded branch would move the worktree off another issue's branch`;
+}
+
+type ExecutionWorkspaceLiveClaimantLookup =
+  | {
+      status: "ok";
+      liveClaimants: NonNullable<GitWorktreeBranchIncoherenceEvidence["workspaceLiveClaimants"]>;
+      truncated: boolean;
+    }
+  | { status: "not-computable" }
+  | { status: "failed" };
+
+// Claimants OTHER than the issue being repaired that are using this worktree
+// right now (PEN-5493).
+//
+// The hazard a shared worktree creates is not that several rows name it — it is
+// that restoring the recorded branch could move the worktree out from under a
+// peer that is mid-run in it. That is a liveness question, and the platform
+// already has exactly one answer to it: an issue is locked by whichever run is
+// named in `checkoutRunId` or `executionRunId` until that run reaches a terminal
+// status (`issue-execution-lock.ts`). The same predicate is what
+// `POST /issues/:id/checkout` 409s on and what `activeRun` reports, so a holder
+// found here is a holder by the whole system's definition rather than by a
+// second, weaker one invented at this call site.
+//
+// Expressed as the complement of terminal, not as an enumeration of live
+// statuses, for the reason `activeRunMapForIssues` gives: `heartbeat_runs.status`
+// is a plain text column with no enum constraint, `error` and `adapter_failed`
+// already occur in it outside the canonical union, and a future non-terminal
+// status added to the column must read as HOLDING here rather than silently
+// dropping out of the guard.
+//
+// Deliberately NOT bounded by the claimant sample limit. The sample above stops
+// at 11 rows for display; a workspace in this estate carries up to 33 claimants,
+// so a live one can sit well past that cut. Capping the liveness query the same
+// way would let a sampling cap decide a safety question. The cap here applies
+// only to how many holders are NAMED back.
+async function findExecutionWorkspaceLiveClaimants(input: {
+  db: Db | null | undefined;
+  executionWorkspaceId: string | null;
+  excludingIssueId: string | null;
+}): Promise<ExecutionWorkspaceLiveClaimantLookup> {
+  // No source issue means we cannot tell our own lock from a peer's, and our own
+  // is always held in this path. Report that rather than guessing; the caller
+  // falls back to the claimant count.
+  if (!input.db || !input.executionWorkspaceId || !input.excludingIssueId) {
+    return { status: "not-computable" };
+  }
+  let rows: { id: string; identifier: string | null; status: string; runId: string; runStatus: string }[];
+  try {
+    rows = await input.db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        runId: heartbeatRuns.id,
+        runStatus: heartbeatRuns.status,
+      })
+      .from(issues)
+      .innerJoin(
+        heartbeatRuns,
+        and(
+          or(
+            eq(heartbeatRuns.id, issues.executionRunId),
+            eq(heartbeatRuns.id, issues.checkoutRunId),
+          ),
+          notInArray(heartbeatRuns.status, TERMINAL_HEARTBEAT_RUN_STATUS_VALUES),
+        ),
+      )
+      .where(and(
+        eq(issues.executionWorkspaceId, input.executionWorkspaceId),
+        ne(issues.id, input.excludingIssueId),
+        notInArray(issues.status, ["done", "cancelled"]),
+        isNull(issues.hiddenAt),
+      ))
+      .orderBy(issues.issueNumber)
+      .limit(EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT + 1);
+  } catch {
+    return { status: "failed" };
+  }
+  return {
+    status: "ok",
+    truncated: rows.length > EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT,
+    liveClaimants: rows.slice(0, EXECUTION_WORKSPACE_CLAIMANT_SAMPLE_LIMIT).map((row) => ({
+      issueId: row.id,
+      issueIdentifier: row.identifier ?? null,
+      status: row.status,
+      runId: row.runId,
+      runStatus: row.runStatus,
+    })),
+  };
+}
+
+function formatWorkspaceLiveClaimantRefusal(
+  liveClaimants: NonNullable<GitWorktreeBranchIncoherenceEvidence["workspaceLiveClaimants"]>,
+  truncated: boolean,
+) {
+  const names = liveClaimants
+    .map((claimant) => `${claimant.issueIdentifier ?? claimant.issueId} (run ${claimant.runId}, ${claimant.runStatus})`)
+    .join(", ");
+  const count = truncated ? `at least ${liveClaimants.length}` : `${liveClaimants.length}`;
+  const sample = truncated ? `${names}, …` : names;
+  const singular = liveClaimants.length === 1 && !truncated;
+  const subject = singular ? "issue holding a live execution lock" : "issues holding live execution locks";
+  return `execution workspace is in use by ${count} other non-terminal ${subject} (${sample}); restoring the recorded branch would move the worktree off a branch another run is working on`;
 }
 
 function executionWorkspaceUsesInheritedProjectRuntimeServices(
@@ -2189,14 +2293,40 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   });
   const workspaceClaimants =
     workspaceClaimantLookup.status === "ok" ? workspaceClaimantLookup.claimants : null;
-  // A failed lookup fails closed. `cleanliness` above resolves to "unknown" when
-  // `git status` fails and then refuses; this has to take the same posture,
-  // because database stress and workspace thrash share causes — a refusal that
-  // evaporates under exactly the load that produces contention is not a refusal.
-  // Only "not-computable" reads as uncontended: there was nothing to query, which
-  // is the fresh-worktree reuse path with no execution workspace id yet.
+  const workspaceLiveClaimantLookup = await findExecutionWorkspaceLiveClaimants({
+    db: input.db ?? null,
+    executionWorkspaceId: input.executionWorkspaceId ?? null,
+    excludingIssueId: input.sourceIssue?.id ?? null,
+  });
+  const workspaceLiveClaimants =
+    workspaceLiveClaimantLookup.status === "ok" ? workspaceLiveClaimantLookup.liveClaimants : null;
+  // PEN-5493. The question is whether another run is working in this worktree
+  // now, not how many rows point at it. The old test — `claimants > 1` — answered
+  // the second, and because a claimant count never falls on its own, a worktree
+  // that reached two claimants was ineligible permanently: no quiescence, and no
+  // passage of time, could make it repairable again. Measured on this company,
+  // 353 of 581 non-terminal rows sat on such a worktree across 74 shared
+  // worktrees — and exactly 1 of those 74 carried two or more live claimants at
+  // the same instant, which is the only shape that still refuses here (the row
+  // being repaired always holds a lock itself, so a refusal needs a second one).
+  //
+  // Both lookups fail closed, and for the same reason `cleanliness` does when
+  // `git status` fails: database stress and workspace thrash share causes, so a
+  // refusal that evaporates under the load that produces contention is not a
+  // refusal.
+  //
+  // `not-computable` on the liveness lookup is not a pass. It means we could not
+  // tell our own execution lock from a peer's — no database handle, no workspace
+  // id, or no source issue to exclude — so eligibility falls back to the
+  // pre-PEN-5493 claimant count rather than reading "nothing live" out of "could
+  // not look". On the claimant lookup it stays a pass, which is the
+  // fresh-worktree reuse path with no execution workspace id yet.
   const workspaceIsContended =
-    workspaceClaimantLookup.status === "failed" || (workspaceClaimants?.length ?? 0) > 1;
+    workspaceClaimantLookup.status === "failed" ||
+    workspaceLiveClaimantLookup.status === "failed" ||
+    (workspaceLiveClaimantLookup.status === "ok"
+      ? (workspaceLiveClaimants?.length ?? 0) > 0
+      : (workspaceClaimants?.length ?? 0) > 1);
   // `git checkout` refuses a branch that is already checked out in another
   // linked worktree, so eligibility has to know about that before it promises a
   // repair. Without this the run would report `eligible: true`, attempt the
@@ -2216,7 +2346,8 @@ async function inspectGitWorktreeBranchIncoherence(input: {
   // load-bearing for the two branches above — the detached-HEAD case, where no
   // ref preserves those commits, and the forward-adopt case, which rewrites the
   // recorded branch rather than restoring it. A contended workspace is excluded:
-  // there the checked-out branch belongs to another claimant, so the mismatch is
+  // there the checked-out branch belongs to a peer that is running in this
+  // worktree now (PEN-5493 — not merely one that names it), so the mismatch is
   // a workspace-binding defect for the recovery path, not a branch to restore.
   const canCheckoutRecordedBranchOverDivergedBranch =
     cleanliness === "clean" &&
@@ -2270,6 +2401,13 @@ async function inspectGitWorktreeBranchIncoherence(input: {
             ? `a git ${GIT_IN_PROGRESS_OPERATION_LABELS[inProgressOperation]} is in progress in this worktree`
           : workspaceClaimantLookup.status === "failed"
             ? "execution workspace claimant lookup failed, so contention could not be ruled out"
+          : workspaceLiveClaimantLookup.status === "failed"
+            ? "execution workspace live-claimant lookup failed, so contention could not be ruled out"
+          : workspaceIsContended && workspaceLiveClaimants?.length
+            ? formatWorkspaceLiveClaimantRefusal(
+              workspaceLiveClaimants,
+              workspaceLiveClaimantLookup.status === "ok" && workspaceLiveClaimantLookup.truncated,
+            )
           : workspaceIsContended && workspaceClaimants
             ? formatWorkspaceClaimantRefusal(
               workspaceClaimants,
@@ -2319,6 +2457,8 @@ async function inspectGitWorktreeBranchIncoherence(input: {
     contention,
     workspaceClaimants,
     workspaceClaimantLookup: workspaceClaimantLookup.status,
+    workspaceLiveClaimants,
+    workspaceLiveClaimantLookup: workspaceLiveClaimantLookup.status,
     expectedBranchWorktreePath,
     provenance: {
       expectedBranchRef: `refs/heads/${input.expectedBranchName}`,
