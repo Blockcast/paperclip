@@ -293,6 +293,51 @@ describe("withRetry", () => {
     );
     assert.equal(calls, 3);
   });
+
+  // PEN-5314 added `shouldRetry` for `land-clean-prs.mjs`, which is NOT
+  // all-reads. This module's own callers pass nothing, so the default has to
+  // keep retrying everything or their behaviour changes silently.
+  it("retries every failure class when no predicate is given", () => {
+    let calls = 0;
+    const value = withRetry("read", () => {
+      calls += 1;
+      if (calls < 3) throw new Error("HTTP 404");
+      return "ok";
+    }, opts);
+    assert.equal(value, "ok");
+    assert.equal(calls, 3);
+  });
+
+  it("rethrows immediately when the predicate declines the error", () => {
+    let calls = 0;
+    assert.throws(
+      () => withRetry("write", () => {
+        calls += 1;
+        // Would succeed on a retry, so one call proves none was spent.
+        if (calls > 1) return "ok";
+        throw new Error("HTTP 502");
+      }, { ...opts, shouldRetry: () => false }),
+      /HTTP 502/,
+    );
+    assert.equal(calls, 1);
+  });
+
+  it("passes the error to the predicate so it can classify", () => {
+    const seen = [];
+    assert.throws(
+      () => withRetry("read", () => {
+        throw new Error("HTTP 502");
+      }, {
+        ...opts,
+        shouldRetry: (error) => {
+          seen.push(error.message);
+          return false;
+        },
+      }),
+      /HTTP 502/,
+    );
+    assert.deepEqual(seen, ["HTTP 502"]);
+  });
 });
 
 describe("buildStatusArgs", () => {

@@ -308,12 +308,23 @@ function sleepSync(ms) {
  * exhausted retries is still the terminal behaviour, because the alternative on
  * a queue ref is an ejection that cannot be re-run.
  */
-export function withRetry(label, fn, { attempts = 3, delayMs = 2000 } = {}) {
+export function withRetry(label, fn, { attempts = 3, delayMs = 2000, shouldRetry = () => true } = {}) {
   for (let attempt = 1; ; attempt += 1) {
     try {
       return fn();
     } catch (error) {
-      if (attempt >= attempts) throw error;
+      // `shouldRetry` DEFAULTS TO RETRY-EVERYTHING, which is what this
+      // module's own callers want: every one of them is an idempotent read or
+      // the single status write, so any failure class is worth another go.
+      //
+      // It exists for callers that are NOT all-reads. `land-clean-prs.mjs`
+      // shares this helper (PEN-5314) and issues `pr merge` / `pr comment`
+      // writes, where a 5xx can be returned AFTER the mutation applied, and
+      // also probes paths it EXPECTS to 404 (`fetchCodeownerRules`). Retrying
+      // blindly there would risk double-applying a write and would pay the
+      // full backoff on every expected miss. The predicate is the seam that
+      // lets such a caller opt a failure class out without forking the helper.
+      if (attempt >= attempts || !shouldRetry(error)) throw error;
       console.log(`::warning::${label} failed (attempt ${attempt}/${attempts}); retrying.`);
       if (delayMs > 0) sleepSync(delayMs * attempt);
     }

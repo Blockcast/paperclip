@@ -31,6 +31,12 @@ import {
   applyRow,
   isFatalGhError,
   RATE_LIMIT_MAX_WAIT_MS,
+  EXIT_UNMEASURED,
+  ghErrorMessage,
+  ghWithTransientRetry,
+  isIdempotentGhRead,
+  isTransientGhError,
+  reportUnmeasured,
   ghWithRateLimitRetry,
   rateLimitWaitMs,
   liveHeadSha,
@@ -2704,6 +2710,230 @@ describe("runRepo apply wiring (PEN-5263)", () => {
     assert.deepEqual(stated, []);
     assert.deepEqual(stranded, ["a/one#3241"], "and the alarm can still see it");
     assert.equal(alarmExitCode(stranded), 1);
+  });
+});
+
+describe("transient 5xx retry in gh() (PEN-5314)", () => {
+  // `withRetry` announces each attempt with `::warning::`, and this suite runs
+  // inside landing-sweep.yml — unsilenced it would hang a workflow annotation
+  // off every green run.
+  const quiet = (fn) => {
+    const real = console.log;
+    console.log = () => {};
+    try {
+      return fn();
+    } finally {
+      console.log = real;
+    }
+  };
+  const fails = (stderr) => () => {
+    throw Object.assign(new Error("gh failed"), { stderr });
+  };
+  const READ = ["pr", "list", "--repo", "o/r", "--state", "open"];
+  const WRITE = ["pr", "merge", "3241", "--repo", "o/r", "--auto", "--rebase"];
+
+  describe("isTransientGhError", () => {
+    it("accepts the measured 5xx shapes, by status or by prose", () => {
+      for (const text of [
+        "HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
+        "HTTP 503",
+        "HTTP 504",
+        "Bad Gateway",
+        "Service Unavailable",
+        "Gateway Timeout",
+        "Gateway Time-out",
+      ]) {
+        assert.equal(isTransientGhError(text), true, text);
+      }
+    });
+
+    it("refuses 500, which retrying cannot fix, and every non-5xx class", () => {
+      for (const text of ["HTTP 500", "HTTP 404", "HTTP 422", "", null, undefined]) {
+        assert.equal(isTransientGhError(text), false, String(text));
+      }
+    });
+
+    // The deliberate abort must survive: a fire that continued past an
+    // exhausted rate limit would print `skip:` rows indistinguishable from
+    // real verdicts, which is what `isFatalGhError` exists to prevent.
+    it("never claims a fatal error is transient, so the abort cannot be retried away", () => {
+      for (const text of [
+        "API rate limit exceeded for installation ID 138085375. (HTTP 403)",
+        "HTTP 401: Bad credentials",
+        "could not read Username for 'https://github.com'",
+      ]) {
+        assert.equal(isFatalGhError(text), true, `${text} is fatal`);
+        assert.equal(isTransientGhError(text), false, `${text} is not transient`);
+      }
+    });
+  });
+
+  describe("isIdempotentGhRead", () => {
+    it("admits the reads this script actually makes", () => {
+      for (const args of [
+        READ,
+        ["pr", "view", "3241", "--repo", "o/r", "--json", "statusCheckRollup"],
+        ["api", "repos/o/r/issues/1/timeline", "--paginate"],
+        ["api", "repos/o/r/contents/CODEOWNERS"],
+        ["api", "repos/o/r/pulls/1/files", "--paginate"],
+        ["api", "-X", "GET", "repos/o/r"],
+        // PEN-5442 splits the listing onto a paginated GraphQL query; it is a
+        // POST on the wire and a read in meaning, so the query text decides.
+        ["api", "graphql", "--paginate", "-F", "owner=o", "-F", "name=r"],
+        ["api", "-i", "graphql", "-f", "query={viewer{login}}"],
+      ]) {
+        assert.equal(isIdempotentGhRead(args), true, args.join(" "));
+      }
+    });
+
+    // ⛔ The safety property. A 5xx can be returned AFTER the mutation landed,
+    // so a retried write can arm auto-merge twice or double-post a comment.
+    it("refuses every write, and anything it cannot positively identify", () => {
+      for (const args of [
+        WRITE,
+        ["pr", "merge", "3241", "--repo", "o/r", "--disable-auto"],
+        ["pr", "comment", "3241", "--repo", "o/r", "--body", "hi"],
+        ["api", "-X", "POST", "repos/o/r/statuses/abc", "-f", "state=success"],
+        ["api", "--method", "DELETE", "repos/o/r/issues/1"],
+        ["api", "repos/o/r/issues/1/comments", "-f", "body=hi"],
+        ["api", "graphql", "-f", "query=mutation{enablePullRequestAutoMerge}"],
+        ["pr", "edit", "1"],
+        ["repo", "clone", "o/r"],
+        [],
+        undefined,
+      ]) {
+        assert.equal(isIdempotentGhRead(args), false, JSON.stringify(args ?? null));
+      }
+    });
+  });
+
+  it("retries a transient 5xx on a read and returns the eventual value", () => {
+    let calls = 0;
+    const out = quiet(() =>
+      ghWithTransientRetry(READ, {
+        delayMs: 0,
+        exec: () => {
+          calls += 1;
+          if (calls < 3) fails("HTTP 502: 502 Bad Gateway")();
+          return "[]";
+        },
+      }),
+    );
+    assert.equal(out, "[]");
+    assert.equal(calls, 3, "two retries were spent");
+  });
+
+  // The defect in the row: one 502 on `fetchOpenPrs` took the whole fire down.
+  it("rethrows once the attempts are exhausted, so the fire still fails closed", () => {
+    let calls = 0;
+    assert.throws(
+      () =>
+        quiet(() =>
+          ghWithTransientRetry(READ, {
+            delayMs: 0,
+            exec: () => {
+              calls += 1;
+              fails(`HTTP 502 #${calls}`)();
+            },
+          }),
+        ),
+      /gh failed/,
+    );
+    assert.equal(calls, 3, "bounded — it does not retry forever");
+  });
+
+  it("spends exactly one attempt on a WRITE, however transient the failure looks", () => {
+    for (const args of [WRITE, ["pr", "comment", "1", "--repo", "o/r", "--body", "x"]]) {
+      let calls = 0;
+      assert.throws(
+        () =>
+          quiet(() =>
+            ghWithTransientRetry(args, {
+              delayMs: 0,
+              exec: () => {
+                calls += 1;
+                // Would SUCCEED on a retry, so one call proves none was spent.
+                if (calls > 1) return "ok";
+                fails("HTTP 502: 502 Bad Gateway")();
+              },
+            }),
+          ),
+        /gh failed/,
+      );
+      assert.equal(calls, 1, `${args[1]} must not be repeated`);
+    }
+  });
+
+  it("does not retry a read whose failure is a 404 or an exhausted rate limit", () => {
+    for (const stderr of [
+      "HTTP 404: Not Found",
+      "API rate limit exceeded for installation ID 1. (HTTP 403)",
+    ]) {
+      let calls = 0;
+      assert.throws(
+        () =>
+          quiet(() =>
+            ghWithTransientRetry(["api", "repos/o/r/contents/CODEOWNERS"], {
+              delayMs: 0,
+              exec: () => {
+                calls += 1;
+                if (calls > 1) return "{}";
+                fails(stderr)();
+              },
+            }),
+          ),
+        /gh failed/,
+      );
+      assert.equal(calls, 1, stderr);
+    }
+  });
+
+  it("reads the failure text from stderr, message, or the error itself", () => {
+    assert.equal(ghErrorMessage({ stderr: Buffer.from("HTTP 502") }), "HTTP 502");
+    assert.equal(ghErrorMessage(new Error("HTTP 504")), "HTTP 504");
+    assert.equal(ghErrorMessage("plain"), "plain");
+  });
+});
+
+describe("the unmeasured exit code (PEN-5314)", () => {
+  // ⛔ The whole row: red must stop meaning two different things.
+  it("is distinct from every other code this script can spend", () => {
+    assert.equal(EXIT_UNMEASURED, 3);
+    assert.notEqual(EXIT_UNMEASURED, alarmExitCode([]), "not the all-clear");
+    assert.notEqual(EXIT_UNMEASURED, alarmExitCode(["a/one#1"]), "not the alarm");
+    assert.notEqual(EXIT_UNMEASURED, 2, "2 is --alarm + --apply misuse");
+  });
+
+  const capture = (error, stranded, options) => {
+    const lines = [];
+    reportUnmeasured(error, stranded, { ...options, log: (line) => lines.push(line) });
+    return lines.join("\n");
+  };
+
+  it("names the failure and refuses to claim a verdict", () => {
+    const out = capture(Object.assign(new Error("x"), { stderr: "HTTP 502: Bad Gateway\nmore" }), []);
+    assert.match(out, /DID NOT MEASURE/);
+    assert.match(out, /HTTP 502: Bad Gateway/);
+    assert.doesNotMatch(out, /more/, "only the first line of the failure");
+    assert.match(out, /makes no claim/);
+  });
+
+  // The wake-comment finding: `stranded` was populated and then discarded
+  // unread, so the run went red as a stack trace naming no PRs.
+  it("reports the partial cohort it had computed before stopping", () => {
+    const out = capture(new Error("HTTP 504"), ["a/one#3241", "a/two#17"], { alarm: true });
+    assert.match(out, /a\/one#3241, a\/two#17/);
+    assert.match(out, /possibly incomplete/);
+  });
+
+  it("calls an empty partial cohort a prefix, never an all-clear", () => {
+    const out = capture(new Error("HTTP 504"), [], { alarm: true });
+    assert.match(out, /PREFIX, not an all-clear/);
+  });
+
+  it("says nothing about a cohort when the run was not an alarm run", () => {
+    const out = capture(new Error("HTTP 504"), ["a/one#1"], { alarm: false });
+    assert.doesNotMatch(out, /a\/one#1/);
   });
 });
 

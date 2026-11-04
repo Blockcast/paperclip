@@ -85,6 +85,13 @@ import {
   hasStillPresentDisposition,
   isAllyAppLogin,
 } from "./check-ally-review-consistency.mjs";
+// The SAME helper the Ally review-consistency guard adopted for this exact
+// failure class (BLO-48423). Shared rather than re-implemented: PEN-5314 asked
+// whether the sibling guards duplicate the bare-`gh` pattern, and the answer
+// is that one shared retry already exists, so this file joins it instead of
+// becoming the third spelling. Importing is safe — that module runs nothing on
+// import (`if (isMainModule()) main()`).
+import { withRetry } from "./mirror-comment-review-gate-to-merge-group.mjs";
 
 /**
  * An auto-merge request older than this is treated as wedged rather than
@@ -1871,8 +1878,132 @@ export function ghWithRateLimitRetry(
   }
 }
 
+/**
+ * How many times a transient read is attempted, and the backoff step between
+ * attempts (PEN-5314).
+ *
+ * `withRetry` waits `delayMs * attempt`, so 3 attempts spend 2s then 4s — a
+ * bounded, growing backoff with a 6s ceiling per call. Deliberately NOT the
+ * rate-limit path's wait: that one reads a RESET TIMESTAMP off a probe
+ * (`rateLimitWaitMs`), and a 5xx has no reset timestamp to read, so routing a
+ * 502 through it yields either `sleep(0)` — an instant retry into an API that
+ * is mid-5xx — or `null`, which rethrows. The two waits answer different
+ * questions and cannot share an implementation.
+ *
+ * 3/2s matches the Ally guard's config, which is the one measured to work on
+ * this failure class, rather than a second set of numbers to reason about.
+ *
+ * ⚠ It NESTS. `resolveMergeState` already spends up to MERGE_STATE_RETRIES
+ * reads of its own and swallows a throw as "still unknown", so a sustained
+ * 5xx costs it 3 x 6s per undecided PR rather than 6s. That is bounded and
+ * acceptable: the storm that would make it expensive fails `fetchOpenPrs`
+ * first and aborts the fire in ~6s, while the intermittent case this exists
+ * for usually succeeds on attempt 2. The job's `timeout-minutes: 15` is the
+ * backstop — and note a timeout kills the process, so it reports neither this
+ * module's exit codes nor a verdict; that state is only readable at the
+ * workflow level.
+ */
+export const TRANSIENT_RETRY_ATTEMPTS = 3;
+export const TRANSIENT_RETRY_DELAY_MS = 2_000;
+
+/** The `gh` failure text, from whichever field carries it. */
+export function ghErrorMessage(error) {
+  return error?.stderr?.toString() || error?.message || String(error);
+}
+
+/**
+ * A `gh` failure that is GitHub being briefly unavailable rather than an
+ * answer (PEN-5314).
+ *
+ * Narrow on purpose. `500` is excluded: GitHub returns it for a malformed or
+ * too-expensive GraphQL query, which retrying cannot fix and which would spend
+ * the whole backoff on every fire. `502/503/504` are the shapes measured on
+ * this call — `fetchOpenPrs` 502'd on 3 of 3 attempts against a 153-PR repo
+ * (PEN-5442) and the hourly Ally guard saw 502/504 on 10 of 40 runs
+ * (BLO-48423).
+ *
+ * `isFatalGhError` is subtracted so the DELIBERATE abort can never be retried
+ * away: an exhausted rate limit or bad credentials must still end the fire.
+ * The two classes do not overlap today (`HTTP 40[13]` vs `HTTP 50[234]`); the
+ * subtraction keeps that true if either predicate is ever widened.
+ */
+export function isTransientGhError(message) {
+  const text = String(message ?? "");
+  if (isFatalGhError(text)) return false;
+  return (
+    /HTTP 50[234]\b/i.test(text) ||
+    /\b(?:Bad Gateway|Service Unavailable|Gateway Time-?out)\b/i.test(text)
+  );
+}
+
+/** `gh api` flags that turn a default GET into a POST. */
+const GH_API_BODY_FLAGS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
+/** `gh pr` subcommands that only read. */
+const GH_PR_READ_SUBCOMMANDS = new Set(["list", "view", "diff", "checks", "status"]);
+
+/**
+ * Whether this invocation is a read that is safe to repeat (PEN-5314).
+ *
+ * ⛔ This gate is the reason the retry is not simply `withRetry(gh)`. The Ally
+ * guard CAN wrap every call blindly because every call it makes is a read.
+ * This file is not that: it runs `pr merge --auto` and `pr comment`, and a 5xx
+ * can be returned AFTER the mutation was applied — so a blind retry risks
+ * arming auto-merge twice or double-posting a comment. The existing rate-limit
+ * retry is safe for writes for a reason that does NOT transfer here: a 403
+ * applied nothing, a 502 may have applied everything.
+ *
+ * A POSITIVE allowlist, so anything it cannot identify is left unretried and
+ * behaves exactly as it does today. That direction also keeps
+ * `fetchCodeownerRules` cheap: it walks CODEOWNERS_PATHS EXPECTING 404s, and a
+ * blind retry would pay 6s of backoff on every expected miss.
+ */
+export function isIdempotentGhRead(args) {
+  const argv = (Array.isArray(args) ? args : []).map((arg) => String(arg));
+  if (argv.length === 0) return false;
+  if (argv[0] === "pr") return GH_PR_READ_SUBCOMMANDS.has(argv[1]);
+  if (argv[0] !== "api") return false;
+
+  // An explicit method is the whole answer, whatever else is on the line.
+  const method = argv.findIndex((arg) => arg === "-X" || arg === "--method");
+  if (method !== -1) return ["GET", "HEAD"].includes((argv[method + 1] ?? "").toUpperCase());
+
+  // GraphQL is POSTed even to read, so the body flags below cannot classify
+  // it; the query text can. A `mutation` keyword anywhere in the invocation
+  // disqualifies it. Bounded to the endpoint slot so a REST path that merely
+  // contains the word cannot reach this branch.
+  if (argv.indexOf("graphql") === 1 || argv.indexOf("graphql") === 2) {
+    return !argv.some((arg) => /\bmutation\b/i.test(arg));
+  }
+
+  // Plain `gh api <path>` is a GET until a body flag makes it a POST.
+  return !argv.some((arg) => GH_API_BODY_FLAGS.has(arg));
+}
+
+/**
+ * Runs `gh`, waiting out a near-reset rate limit (BLO-51665) and retrying a
+ * transient 5xx on an idempotent read (PEN-5314).
+ *
+ * A write gets `attempts: 1`, so it takes the inner rate-limit behaviour and
+ * nothing else — no added latency, no repeated mutation.
+ */
+export function ghWithTransientRetry(
+  args,
+  {
+    exec = ghWithRateLimitRetry,
+    retry = withRetry,
+    attempts = TRANSIENT_RETRY_ATTEMPTS,
+    delayMs = TRANSIENT_RETRY_DELAY_MS,
+  } = {},
+) {
+  return retry(`gh ${args.slice(0, 2).join(" ")}`, () => exec(args), {
+    attempts: isIdempotentGhRead(args) ? attempts : 1,
+    delayMs,
+    shouldRetry: (error) => isTransientGhError(ghErrorMessage(error)),
+  });
+}
+
 function gh(args) {
-  return ghWithRateLimitRetry(args);
+  return ghWithTransientRetry(args);
 }
 
 /**
@@ -2601,7 +2732,12 @@ export function runRepo(
         // the output, and the repos that already completed earned it.
         reportRotted(rotted);
         console.error(`\nAborted the fire: ${row.detail}`);
-        process.exit(1);
+        // PEN-5314: this abort is a TRANSPORT failure (exhausted rate limit,
+        // bad credentials), not a verdict, so it spends the unmeasured code
+        // rather than the alarm's `1`. `stranded` is not passed: this path is
+        // reachable only under `--apply`, which `main` refuses to combine with
+        // `--alarm`, so there is no alarm cohort in flight to report.
+        process.exit(EXIT_UNMEASURED);
       }
       markFailure(row, message);
     }
@@ -2834,8 +2970,64 @@ function reportRotted(rotted) {
 }
 
 /**
- * The exit code for an alarm run: 1 when any repo carried an unlanded-eligible
- * or a cap-starved PR, 0 otherwise.
+ * The exit code for a fire that could not finish measuring (PEN-5314).
+ *
+ * ⛔ THE POINT IS THAT IT IS NOT 1. Every other outcome this script can reach
+ * already spends 0, 1 or 2:
+ *
+ *   0  measured, nothing stranded          `alarmExitCode`
+ *   1  measured, cohort non-empty          `alarmExitCode`
+ *   2  `--alarm` + `--apply` misuse        `main`
+ *   3  COULD NOT MEASURE                   this
+ *
+ * Before this existed, an abort exited 1 — the node default for an uncaught
+ * throw, and the same integer `alarmExitCode` spends to report a real stranded
+ * cohort. So a red landing-sweep meant either "PRs have been landable for
+ * {UNLANDED_ELIGIBLE_HOURS}h and nothing took them" or "GitHub 502'd and this
+ * run never classified a single PR", with nothing in the exit code to tell
+ * them apart. That is the same unmeasured-state-encoded-as-a-measured-state
+ * defect as PEN-5158 and PEN-4458.
+ *
+ * 3 rather than 2 because 2 is taken, and the collision would only be found
+ * after a workflow `if:` had been written against it.
+ */
+export const EXIT_UNMEASURED = 3;
+
+/**
+ * Says, on stderr, that the fire stopped before it finished — and reports
+ * whatever cohort it HAD computed (PEN-5314).
+ *
+ * Reporting the partial cohort is deliberate: "I could not finish, and here is
+ * what I found before I stopped" is strictly more useful than either half. It
+ * is explicitly NOT a verdict, and the text says so, because the rows below it
+ * are a prefix of the real answer and a reader must not treat a short list as
+ * a complete one.
+ */
+export function reportUnmeasured(error, stranded = [], { alarm = false, log = console.error } = {}) {
+  const message = ghErrorMessage(error).trim().split("\n")[0];
+  log(
+    `\nDID NOT MEASURE: the sweep stopped before every repo was classified — ${message}\n` +
+      `Exiting ${EXIT_UNMEASURED}, which is NOT the alarm code. This run makes no claim ` +
+      "about whether any PR is stranded; it never finished looking.",
+  );
+  if (!alarm) return;
+  if (stranded.length === 0) {
+    log(
+      "No unlanded-eligible PR had been found when the sweep stopped — but the repos " +
+        "after the failure were never read, so this is an empty PREFIX, not an all-clear.",
+    );
+    return;
+  }
+  log(
+    `Partial unlanded-eligible cohort found before stopping (${stranded.length}, ` +
+      `possibly incomplete) — ${stranded.join(", ")}.`,
+  );
+}
+
+/**
+ * The exit code for an alarm run that COMPLETED: 1 when any repo carried an
+ * unlanded-eligible or a cap-starved PR, 0 otherwise. A run that could not
+ * finish does not reach this — it spends `EXIT_UNMEASURED` instead.
  *
  * Separated from `main` so the AC4 contract — go visibly red rather than
  * relying on someone noticing by hand — is pinned by a test rather than by
@@ -2905,14 +3097,32 @@ function main() {
   // in and must not land in; `targetRepos()` is unchanged, so an unset
   // LAND_CLEAN_PRS_NOTIFY_REPO leaves behaviour exactly as it was.
   const notify = new Set(notifyRepos());
+  // PEN-5314. Captured rather than exited on, because `process.exit` does NOT
+  // unwind: exiting from the catch would skip the `finally` and lose the
+  // priority cohort that the repos already swept had earned. So the `finally`
+  // runs first, then the unmeasured report, then the exit.
+  let sweepError = null;
   try {
     sweepRepos(
       sweepOrder(targetRepos(), [...notify]),
       repoRunner(apply, settleMinutes, rotted, stranded, runRepo, notify, unreadable, starved),
     );
+  } catch (error) {
+    sweepError = error;
   } finally {
     reportRotted(rotted);
     reportUnreadable(unreadable);
+  }
+
+  if (sweepError) {
+    // ⛔ Fails CLOSED, and this is the direction that matters: the run exits
+    // non-zero and says it measured nothing. It must never fall through to the
+    // `alarm` block below, because reaching `alarmExitCode` with an empty
+    // `stranded` would spend 0 — a confident all-clear printed over repos that
+    // were never read. That is precisely the fail-open shape
+    // `assertPrListComplete` exists to prevent one layer down.
+    reportUnmeasured(sweepError, stranded, { alarm });
+    process.exit(EXIT_UNMEASURED);
   }
 
   if (!apply) console.log("\n(dry run — pass --apply to act)");
