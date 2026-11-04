@@ -85,6 +85,13 @@ If the follow-up outlives the alert, give it its own issue and arm the monitor
 there; link the alert row to it. The alert row can then be cancelled and
 recycled without taking your wake with it.
 
+PEN-5346 puts a net under this, but it is a net and not a licence: a destroyed
+wake now reappears as a `stranded_issue_recovery` row assigned to you (see the
+last section). That costs you a round trip and the recovery row carries the
+monitor's `notes` rather than its schedule, so the wake arrives when the sweep
+runs — not at the due time you armed. Arming on a row of your own is still
+strictly better; the carrier exists for the case where you did not.
+
 ## Rule 3 — to tell "monitor destroyed" from "never armed", read the nested state
 
 The top-level columns cannot distinguish them. After a clear,
@@ -101,6 +108,7 @@ alert rows reads it:
     "clearReason": "cancelled",      // the plugin's cancel destroyed it
     "clearedAt": "2026-11-02T21:47:03.771Z",
     "clearedNextCheckAt": "2026-11-03T12:30:00Z",  // the wake that was owed (PEN-5343)
+    "recoveryEmittedAt": null,       // the handoff is still owed (PEN-5346)
     "notes": "...",                  // the armed monitor's notes survive here
     "attemptCount": 1
   }
@@ -118,6 +126,12 @@ alert rows reads it:
   cannot quietly turn "we never recorded this" into "nothing was owed".
 - `clearedNextCheckAt: null` on a `cleared` monitor — a clear ran and found no
   due time. Distinct from absent, above.
+- `recoveryEmittedAt` on a `cancelled` clear — `null` means the handoff has not
+  been emitted yet and the sweep will retry it; a timestamp means a recovery
+  issue exists and carries this row's obligation. Find it with
+  `originId == <this row>` and `originFingerprint == "issue_monitor:cancelled"`.
+  It is never carried forward from an earlier clear, so it always refers to the
+  clear printed beside it.
 - On a row cleared more than once, `clearedNextCheckAt` belongs to the **first**
   clear, not to the `clearReason`/`clearedAt` printed next to it: a re-clear
   carries the original forward instead of overwriting it, so a wake destroyed
@@ -132,10 +146,50 @@ count the gap as idleness.
 
 ## What this runbook deliberately does not do
 
-It does not stop the monitor being destroyed. Damping the flap was evaluated
-against the measured intervals and **rejected as the primary fix**: a 60-minute
-hold-down would have suppressed 21 of 32 cancels on PEN-4365 but only 5 of the
-13 monitor destructions across both rows (4/9 and 1/4), because most losses
-follow a genuine multi-hour resolve rather than a short flap. Preserving the
-monitor across the plugin's cancel/reopen recycle is tracked separately; this
-runbook is what protects a reader until that lands.
+**It does not stop the monitor being destroyed, and neither does PEN-5346.**
+The cancel is still a plain `status: "cancelled"` write, the eligibility
+reconciler still clears the monitor, and the wake is still gone. What PEN-5346
+added is a *carrier*: the obligation that monitor represented is handed to a
+row that survives the cancel, instead of being dropped.
+
+`reconcileCancelledIssueMonitorRecoveries` sweeps for cleared monitors whose
+`clearReason` is `"cancelled"` and whose `recoveryEmittedAt` is still null, and
+for each one opens a recovery issue:
+
+- title `Carry forward the wake cancelled on <source title>`;
+- `originKind: "stranded_issue_recovery"`, `originId` the cancelled row,
+  `originFingerprint: "issue_monitor:cancelled"`;
+- `status: "todo"`, `priority: "high"`, assigned to the **source row's
+  assignee**;
+- body carrying the dead monitor's `notes`, its `gateSignals`, its
+  `attemptCount`, and an explicit instruction to check whether the cancelled
+  row solely owns an open work product.
+
+Three things follow that a reader should not have to rediscover:
+
+- **The recovery policy is forced, not honoured.** Across the 21 rows carrying
+  this residue in PEN, `recoveryPolicy` was `null` on 12, `wake_owner` on 5 and
+  `create_recovery_issue` on **none** — so honouring the configured policy
+  emits nothing on 12 and posts a comment to the cancelled row itself on the
+  other 5. Forcing `create_recovery_issue` is the only setting that emits
+  anything, and a row is the only carrier that outlives its source.
+- **It covers the terminal branch too.** The sweep keys on the *cancel*, which
+  always happens, not on the *reopen*, which may not. A row cancelled because
+  the alert genuinely cleared — the case that orphaned
+  [onprem-k8s#7360](https://github.com/Blockcast/onprem-k8s/pull/7360) off
+  PEN-4835 — gets a carrier even though it is never reopened.
+- **An unassigned source gets no carrier.** There is nobody to hand the
+  obligation to, so the sweep logs
+  `cancelled-monitor recoveries left owed: the source has no agent to hand the
+  obligation to (PEN-5346)` with the issue ids and leaves `recoveryEmittedAt`
+  null, so the row is retried rather than silently marked discharged. If you
+  are chasing a wake that never arrived on an unassigned alert row, that log
+  line is where it went.
+
+**Damping the flap is still not done, and is still not this fix.** It was
+evaluated against the measured intervals and **rejected as the primary fix**: a
+60-minute hold-down would have suppressed 21 of 32 cancels on PEN-4365 but only
+5 of the 13 monitor destructions across both rows (4/9 and 1/4), because most
+losses follow a genuine multi-hour resolve rather than a short flap. The
+status-volatility harm that Rule 1 exists for is therefore unchanged, and
+damping remains open on PEN-5343. Rules 1 and 2 above stand as written.
