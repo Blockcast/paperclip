@@ -76,6 +76,7 @@ import {
   SYSTEM_ISSUE_DOCUMENT_KEYS,
   ISSUE_STATUS_ADJUDICATION_DOCUMENT_KEY,
   type ExecutionWorkspaceConfig,
+  type IssueExecutionMonitorStateStatus,
   type IssueExecutionState,
 } from "@paperclipai/shared";
 import { badRequest, conflict, HttpError, notFound, unprocessable } from "../errors.js";
@@ -1114,16 +1115,32 @@ type IssueProductivityReviewProjection = {
   productivityReviewDisabled: boolean;
 };
 /**
+ * PEN-5481: the monitor's lifecycle state, flattened onto every list row.
+ *
+ * Declared here for the same reason as the projection above: `issueListSelect` computes
+ * it in SQL, so it is not on `IssueRow` (the table type), and without this declaration the
+ * key exists at runtime and is invisible to every TypeScript consumer of a list row.
+ *
+ * NULLABLE, unlike its sibling — and the null is meaningful rather than a defaulting
+ * oversight. "No monitor has ever been armed on this row" is a real, common state with no
+ * honest member of the status union to stand for it, so inventing one would be the forged
+ * null `issueListSelect` warns about. A consumer must branch on null explicitly.
+ */
+type IssueMonitorStatusProjection = {
+  monitorStatus: IssueExecutionMonitorStateStatus | null;
+};
+/**
  * A row as `issueListSelect` actually returns it: every table column, plus the columns that
  * projection computes in SQL. `dbOrTx` is untyped, so the select's shape cannot be inferred
  * at the call sites and has to be stated — state it as this, never as the bare `IssueRow`,
  * which silently drops the computed keys and is what hid PEN-5295's projection from `tsc`.
  */
-type IssueListSelectRow = IssueRow & IssueProductivityReviewProjection;
+type IssueListSelectRow = IssueRow & IssueProductivityReviewProjection & IssueMonitorStatusProjection;
 type IssueWithLabelsAndRun = IssueWithLabels
   & { activeRun: IssueActiveRunRow | null }
   & IssueScheduledRetryProjection
-  & IssueProductivityReviewProjection;
+  & IssueProductivityReviewProjection
+  & IssueMonitorStatusProjection;
 type IssueUserCommentStats = {
   issueId: string;
   myLastCommentAt: Date | null;
@@ -4311,6 +4328,36 @@ const issueListSelect = {
   monitorNextCheckAt: issues.monitorNextCheckAt,
   monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
   monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+  // PEN-5481: the one key of `executionState.monitor` a list consumer cannot do without,
+  // projected as a flat scalar rather than by relaxing the deliberate omission above —
+  // the PEN-5295 `productivityReviewDisabled` pattern.
+  //
+  // The monitor_* columns next to this one do NOT mirror the lifecycle state, and the
+  // comment above saying `monitor` is "mirrored by the monitor_* columns" is true only of
+  // its scheduling fields. `buildIssueMonitorClearedPatch` nulls `monitorNextCheckAt` and
+  // leaves `monitorLastTriggeredAt` standing, and so does a fire — so `triggered` and
+  // `cleared` are BYTE-IDENTICAL on this surface (`nextCheckAt` null, `lastTriggeredAt`
+  // set), while their attendance verdicts are opposite:
+  //   - `triggered` — a sweep owns the row, bounded by min(its own `timeoutAt`,
+  //     `monitorLastTriggeredAt` + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS). Attended.
+  //   - `cleared`   — the sweep already fired and is gone. Nothing attends the row unless
+  //     another path does. Dark.
+  // Every list-based attendance sweep scores those the same today, which is the defect.
+  //
+  // `timeoutAt` is deliberately NOT projected alongside it. Since PEN-5481 a `triggered`
+  // monitor is owned whether or not it carries one, and `monitorLastTriggeredAt` above
+  // already bounds the stall arm — `timeoutAt` can only pull that bound EARLIER, i.e. make
+  // the row more attended, never less. A consumer asking "is this attended" is sound
+  // without it. Projecting it would also re-offer the read-side version of the double duty
+  // that caused PEN-5481 on the write side: `timeoutAt` is a budget bound, not a liveness
+  // one, and a detector that keys attendance off it would be re-deriving the same mistake.
+  //
+  // NULL when the row has no `executionState`, no `monitor` inside it, or a non-object
+  // `monitor` — `->` yields SQL NULL through all three, and `->>` on a JSON null yields
+  // NULL too, so absent and never-armed both read null, which is the honest answer. Cost is
+  // two `->`/`->>` lookups on a column this row already carries, strictly less than the
+  // `jsonb_each` + `jsonb_object_agg` the `executionState` projection above already pays.
+  monitorStatus: sql<IssueExecutionMonitorStateStatus | null>`${issues.executionState} -> 'monitor' ->> 'status'`,
   monitorAttemptCount: issues.monitorAttemptCount,
   monitorNotes: issues.monitorNotes,
   monitorScheduledBy: issues.monitorScheduledBy,
@@ -4356,9 +4403,15 @@ const issueListSelect = {
  * was a projection that silently omitted a key, so the failure mode has to be a
  * compile error at any new call site, not a row that quietly ships without the
  * field.
+ *
+ * The input type names every SQL-computed projection the rows must already
+ * carry, for the same reason: a caller that assembled its rows from anything but
+ * `issueListSelect` fails here rather than shipping a row missing a key. That is
+ * what caught `monitorStatus` (PEN-5481) — add new projections to both this
+ * signature and `IssueListSelectRow`, never to only one.
  */
 function withActiveRuns(
-  issueRows: (IssueWithLabels & IssueProductivityReviewProjection)[],
+  issueRows: (IssueWithLabels & IssueProductivityReviewProjection & IssueMonitorStatusProjection)[],
   runMap: Map<string, IssueActiveRunRow>,
   retryMap: Map<string, IssueScheduledRetryProjection>,
 ): IssueWithLabelsAndRun[] {

@@ -930,9 +930,13 @@ const MANUAL_CAPACITY_REPROBE_CANCEL_REASON =
   "Cancelled because an explicit manual wake requested a fresh provider-capacity probe";
 export const ISSUE_MONITOR_DISPATCH_LAPSE_MS = 15 * 60 * 1000;
 /**
- * BLO-29606: how long a `triggered` monitor carrying no `timeoutAt` may sit with
- * a null `nextCheckAt` before `tickExpiredIssueMonitors` treats its woken run as
- * never coming back.
+ * BLO-29606: how long a `triggered` monitor may sit with a null `nextCheckAt`
+ * before `tickExpiredIssueMonitors` treats its woken run as never coming back.
+ *
+ * PEN-5481: this used to read "carrying no `timeoutAt`" — the grace was gated on
+ * `timeoutAt is null`, so an explicit future deadline opted the row out of stall
+ * recovery entirely. It now applies to every `triggered` monitor; an explicit
+ * `timeoutAt` is an additional, independent expiry rather than a suppressor.
  *
  * `timeoutAt` is optional and defaults to null, and the re-arm shape the fleet is
  * actually instructed to use — `{ nextCheckAt, notes, scheduledBy }` — omits it.
@@ -18269,22 +18273,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * `triggered` forever — the dominant source of `in_review_without_action_path`
    * liveness escalations. A monitor with no `timeoutAt` now expires against
    * ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS measured from `monitorLastTriggeredAt`
-   * and clears as `trigger_stalled`. A monitor that *does* carry a `timeoutAt`
-   * still expires only at that instant: an operator-supplied deadline is
-   * authoritative, so a long explicit timeout is honoured rather than pre-empted
-   * by the grace window.
+   * and clears as `trigger_stalled`.
    *
    * BLO-35155: that grace window is a proxy for "the woken run never called
    * back", and the proxy sits below the dispatch-latency p50 of the lanes whose
-   * monitors matter most. The no-`timeoutAt` branch now additionally requires
-   * that no queued/running run exists for this issue, so `trigger_stalled`
-   * means what it says. See the predicate for the numbers.
+   * monitors matter most. The stall branch additionally requires that no
+   * queued/running run exists for this issue, so `trigger_stalled` means what it
+   * says. See the predicate for the numbers.
+   *
+   * PEN-5481: the stall branch used to be gated on `timeoutAt is null`, making
+   * the two branches mutually exclusive — so a monitor carrying an explicit
+   * FUTURE deadline matched neither and had no stall coverage at all until that
+   * deadline. `timeoutAt` is a BUDGET bound ("stop re-arming after this
+   * instant"); the exclusion silently also made it a LIVENESS bound ("do not ask
+   * whether the trigger stalled until this instant"), so the more responsibly an
+   * operator bounded a monitor, the longer a stranded row could sit — measured
+   * on PEN-5386, a 48h deadline bought a ~51h blind spot. Both branches now
+   * apply: the deadline still expires the monitor at its instant (the BLO-25865
+   * intent is intact, and a deadline shorter than the grace still wins), and the
+   * stall branch independently catches a trigger nothing came back for.
    */
   async function tickExpiredIssueMonitors(now = new Date()) {
     const staleClaimThreshold = new Date(now.getTime() - 5 * 60 * 1000);
     const triggeredStallThreshold = new Date(now.getTime() - ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS);
     const liveConsumerFloor = new Date(now.getTime() - ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS);
     const worktreeExecutionCutoff = await getWorktreeExecutionCutoff();
+    /**
+     * PEN-5481: "did the stall arm admit this row?" — i.e. the arm that consults
+     * the live-consumer ceiling, as opposed to the row's own deadline passing.
+     * Mirrors the SQL arms below: a `timeoutAt` already past admits via the
+     * timeout arm, which never consults the ceiling.
+     *
+     * Before PEN-5481 the two arms were mutually exclusive on `timeoutAt`, so
+     * `timeoutAt == null` answered this question exactly. It no longer does —
+     * the stall arm now also covers rows carrying a future deadline.
+     *
+     * An unparseable `timeoutAt` is treated as the stall arm's: the timeout arm
+     * compares it as a `timestamptz` and would not have admitted a value we
+     * cannot date here.
+     */
+    const admittedByTriggeredStallArm = (timeoutAt: unknown) => {
+      if (typeof timeoutAt !== "string") return true;
+      const parsed = new Date(timeoutAt);
+      return Number.isNaN(parsed.getTime()) || parsed.getTime() > now.getTime();
+    };
     const expiredMonitorTimeoutCondition = and(
       sql`${issues.executionState} -> 'monitor' ->> 'status' = 'triggered'`,
       or(
@@ -18293,14 +18325,39 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt') is not null`,
           sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt')::timestamptz <= ${now.toISOString()}`,
         ),
-        // BLO-29606: no deadline supplied — fall back to how long the trigger has
-        // been outstanding. `monitorLastTriggeredAt` is written atomically with the
-        // triggered state by buildIssueMonitorTriggeredPatch, so it is the same
-        // instant the JSON records; using the column keeps this off a JSON cast.
-        // A null there means we cannot date the trigger, so we leave the row alone
-        // rather than guess — stranding is preferable to a wrong sweep.
+        // BLO-29606: the deadline did not expire the monitor — fall back to how
+        // long the trigger has been outstanding. `monitorLastTriggeredAt` is
+        // written atomically with the triggered state by
+        // buildIssueMonitorTriggeredPatch, so it is the same instant the JSON
+        // records; using the column keeps this off a JSON cast. A null there
+        // means we cannot date the trigger, so we leave the row alone rather
+        // than guess — stranding is preferable to a wrong sweep.
+        //
+        // PEN-5481: this arm used to additionally require `timeoutAt is null`,
+        // which made the two arms MUTUALLY EXCLUSIVE and left a monitor carrying
+        // an explicit FUTURE deadline matching neither — not covered by the
+        // grace at all, eligible only at its own `timeoutAt`. The dispatch-lapse
+        // sweep does not cover it either (it joins on `executionRunId`, and a
+        // fire that left none is invisible to the join), so no net owned the
+        // row. Measured on PEN-5386: a 48h `timeoutAt` bought a ~51h blind spot.
+        //
+        // `timeoutAt` was doing double duty. It is a BUDGET bound — "stop
+        // re-arming after this instant" — and the exclusion silently also read
+        // it as a LIVENESS bound — "do not ask whether the trigger stalled until
+        // this instant". Those are different questions, and conflating them
+        // meant the more responsibly an operator bounded their monitor, the
+        // longer a stranded row could sit. The budget meaning is preserved
+        // exactly: the arm above still expires the monitor at the deadline, and
+        // this arm cannot fire before the grace, so an explicit `timeoutAt`
+        // shorter than the grace still expires first.
+        //
+        // The exclusion was itself a workaround for a defect BLO-35155 has since
+        // fixed properly. Pre-BLO-35155 the grace reaped monitors whose own woken
+        // run was merely still queued, and setting a `timeoutAt` was how the
+        // fleet opted out of that false positive; the live-consumer guard below
+        // now tests the real question directly, so the opt-out has nothing left
+        // to protect against and only suppresses recovery.
         and(
-          sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt') is null`,
           sql`${issues.monitorLastTriggeredAt} is not null`,
           lte(issues.monitorLastTriggeredAt, triggeredStallThreshold),
           // BLO-35155: the grace window is a PROXY for "the run that consumed
@@ -18431,12 +18488,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // over-age queued run is at the HEAD of the oldest-first dispatch queue,
         // and it is a coalescing accumulator carrying every wake merged into it.
         // Cancelling it would discard that context for a status-only recovery
-        // run, so it is left alone and the recovery wake rides on it. An
-        // explicit timeoutAt never consulted the ceiling, so it is left alone.
+        // run, so it is left alone and the recovery wake rides on it. A row
+        // admitted by the timeout arm — its own deadline passed — never
+        // consulted the ceiling, so it is left alone (PEN-5481: that used to be
+        // spelled `timeoutAt == null`, which stopped being the same test once
+        // the stall arm started covering future deadlines too).
         if (
           worktreeExecutionCutoff &&
           updated?.assigneeAgentId &&
-          parseObject(parseObject(updated.executionState).monitor).timeoutAt == null
+          admittedByTriggeredStallArm(parseObject(parseObject(updated.executionState).monitor).timeoutAt)
         ) {
           const reason = "Cancelled because it was queued before the worktree execution cutoff, so it can never dispatch, and past the issue monitor live-consumer ceiling; the monitor recovery wake replaces it";
           const expiredConsumers = await tx
@@ -18498,17 +18558,50 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           maxAttempts: currentMonitorState.maxAttempts ?? null,
           recoveryPolicy: currentMonitorState.recoveryPolicy ?? null,
         };
+        // The predicate admits a row for exactly two reasons, and
+        // `exhaustedMonitorClearReason` is the single source of truth for the
+        // first (deadline passed, or attempts exhausted). Anything it declines
+        // was admitted by the stall arm, so the remaining reason is the stall.
+        //
+        // PEN-5481: this used to fall back to `monitor.timeoutAt ?
+        // "timeout_exceeded" : "trigger_stalled"`, which was equivalent only
+        // while the stall arm was gated on `timeoutAt is null` — a
+        // timeoutAt-carrying row could then only have been admitted by its
+        // deadline. Now that the stall arm covers those rows too, that form
+        // would tell the owner "its timeout was reached" (monitorRecoveryComment)
+        // about a deadline still days away, mislabelling the one fact the
+        // recovery comment exists to carry.
         const clearReason = exhaustedMonitorClearReason({
           monitor,
           attemptCount: currentMonitorState.attemptCount,
           now,
-        }) ?? (monitor.timeoutAt ? "timeout_exceeded" : "trigger_stalled");
+        }) ?? "trigger_stalled";
         const recoveryPolicy = monitorRecoveryPolicy(monitor);
 
         await clearIssueMonitorAndRecover({
           claimed,
           policy,
-          scheduledAtIso: currentMonitorState.timeoutAt ?? now.toISOString(),
+          // The instant this monitor's road actually ran out. It reaches two
+          // places: `nextCheckAt` on the `issue.monitor_exhausted` activity
+          // details, and the recovery wake's `idempotencyKey`. Only a deadline
+          // expiry ran out AT the deadline; a stall and an attempt exhaustion
+          // both ran out now, whatever deadline the monitor also carried.
+          //
+          // PEN-5481: this was `timeoutAt ?? now`, equivalent only while a
+          // timeoutAt-carrying row could reach here solely by its deadline
+          // passing. With the stall arm covering future deadlines too, that form
+          // was wrong on both surfaces. It would log an instant DAYS IN THE
+          // FUTURE as the cleared monitor's `nextCheckAt` — a wake path that does
+          // not exist, recorded by the very recovery that exists because the row
+          // had none. Worse, it would pin the idempotency key to a CONSTANT, so a
+          // monitor re-armed and stalled a second time before its deadline would
+          // mint the same key and have its second owner wake suppressed as a
+          // duplicate. Keyed on the reason rather than on `timeoutAt`'s presence
+          // so `max_attempts_exhausted` on a future-deadline monitor cannot
+          // reintroduce either.
+          scheduledAtIso: clearReason === "timeout_exceeded"
+            ? currentMonitorState.timeoutAt ?? now.toISOString()
+            : now.toISOString(),
           nextAttemptCount: currentMonitorState.attemptCount,
           clearReason,
           recoveryPolicy,
