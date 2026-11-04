@@ -181,7 +181,15 @@ export interface ApprovalGateReconcileResult {
 }
 
 export type ApprovalGateReconcilerScheduler = {
-  setInterval: (callback: () => void, intervalMs: number) => ReturnType<typeof setInterval>;
+  /**
+   * The callback returns the sweep it started so a test can await a pass settling
+   * rather than guessing from its side effects; the real `setInterval` ignores it.
+   * See `startApprovalGateReconciler`'s `runTick` for why that matters (PEN-5468).
+   */
+  setInterval: (
+    callback: () => void | Promise<void>,
+    intervalMs: number,
+  ) => ReturnType<typeof setInterval>;
   clearInterval: (timer: ReturnType<typeof setInterval>) => void;
 };
 
@@ -885,9 +893,23 @@ export function startApprovalGateReconciler(
   // Seeded from the caller so a resume point can be injected; thereafter this is
   // the rotation's only state.
   let resumeFrom: CandidateCursor | null = options.resumeFrom ?? null;
-  const runTick = () => {
-    if (inFlight) return;
-    inFlight = reconcileApprovalGates(db, { ...options, resumeFrom })
+  /**
+   * Returns the sweep this call started, or — when the in-flight guard drops the
+   * call — the sweep already running. The drop semantics are unchanged and nothing
+   * in production reads the value: the real `setInterval` discards it.
+   *
+   * It exists so a caller can await a pass *settling* instead of inferring that
+   * from a side effect, which is the PEN-5468 flake. `fetchRun` is called partway
+   * through a pass, while `inFlight` is still set, so a `vi.waitFor` on its call
+   * count resolves mid-pass; the next `tick()` then lands inside the in-flight
+   * window and is swallowed whole — 0 further calls, never 1 — and with a fake
+   * scheduler nothing ever fires again to retry it. Awaiting the returned promise
+   * closes that window: by the time it resolves the `finally` below has already
+   * cleared `inFlight`, so the next call is guaranteed to start a pass.
+   */
+  const runTick = (): Promise<void> => {
+    if (inFlight) return inFlight;
+    const pass = reconcileApprovalGates(db, { ...options, resumeFrom })
       // Advancing on success only. A sweep that threw returned no cursor, and
       // inventing one would skip the region it failed on; holding the previous
       // value re-walks exactly what was not finished.
@@ -900,9 +922,14 @@ export function startApprovalGateReconciler(
       .finally(() => {
         inFlight = null;
       });
+    inFlight = pass;
+    return pass;
   };
 
-  runTick();
+  // Deliberately floating: the immediate pass is fire-and-forget here exactly as it
+  // was before `runTick` started returning its promise. Errors are already handled
+  // inside the chain, so there is nothing for a caller to await or catch.
+  void runTick();
   const timer = scheduler.setInterval(runTick, intervalMs);
   return () => scheduler.clearInterval(timer);
 }
