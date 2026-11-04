@@ -2485,22 +2485,38 @@ export async function startServer(): Promise<StartedServer> {
           // that reads like a defect.
           if (!cancelledMonitorRecoveryInFlight) {
             cancelledMonitorRecoveryInFlight = true;
-            trackHeartbeatSchedulerWork(heartbeat
-              .reconcileCancelledIssueMonitorRecoveries()
-              .then((handedBack) => {
-                if (handedBack.recovered > 0 || handedBack.cleared > 0 || handedBack.unowned > 0 || handedBack.failed > 0) {
-                  logger.warn(
-                    { ...handedBack },
-                    "periodic cancelled-monitor recovery handed back wakes destroyed by a cancel",
-                  );
+            // The latch is released in a `finally` INSIDE the async body, not
+            // in a `.finally()` chained off the call expression. Chaining only
+            // releases the latch if the chain gets built, and a synchronous
+            // throw from the call itself means it never is — the latch would
+            // then stay `true` for the life of the process and every later tick
+            // would skip this pass at the `if` above. The one reachable
+            // synchronous throw is the method being absent, which is exactly
+            // the shape CI hit on this branch, so the failure mode is not
+            // hypothetical. This also makes the periodic site read like the
+            // startup one, which has always been `try/catch/finally`.
+            trackHeartbeatSchedulerWork(
+              (async () => {
+                try {
+                  const handedBack = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+                  if (
+                    handedBack.recovered > 0 ||
+                    handedBack.cleared > 0 ||
+                    handedBack.unowned > 0 ||
+                    handedBack.failed > 0
+                  ) {
+                    logger.warn(
+                      { ...handedBack },
+                      "periodic cancelled-monitor recovery handed back wakes destroyed by a cancel",
+                    );
+                  }
+                } catch (err) {
+                  logger.error({ err }, "periodic cancelled-monitor recovery reconciliation failed");
+                } finally {
+                  cancelledMonitorRecoveryInFlight = false;
                 }
-              })
-              .catch((err) => {
-                logger.error({ err }, "periodic cancelled-monitor recovery reconciliation failed");
-              })
-              .finally(() => {
-                cancelledMonitorRecoveryInFlight = false;
-              }));
+              })(),
+            );
           }
 
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
