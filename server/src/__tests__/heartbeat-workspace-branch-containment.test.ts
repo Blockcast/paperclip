@@ -655,12 +655,18 @@ async function expectContainedWorkspaceBranchFailure(input: {
       // self-heals, so containment here rests on two other refusals — both
       // real, and which one fires depends on what the call site knows.
       // Persisted restore passes the execution workspace id, so claimant
-      // contention is visible (source + same-workspace sibling). Fresh-worktree
-      // reuse passes `executionWorkspaceId: null`, so contention cannot be
-      // computed and the refusal falls to the git-level fact that the fixture's
-      // main checkout still holds the recorded branch.
+      // contention is visible. Fresh-worktree reuse passes
+      // `executionWorkspaceId: null`, so contention cannot be computed and the
+      // refusal falls to the git-level fact that the fixture's main checkout
+      // still holds the recorded branch.
+      //
+      // PEN-5493: contention is now a liveness test rather than a claimant
+      // count, and this fixture's same-workspace sibling holds a running
+      // heartbeat run — so it still contends, and the refusal now names the
+      // holder. The fixture would need its sibling run to reach a terminal
+      // status for this arm to stop firing, which is the point: the exit exists.
       reason: input.sourceExecutionWorkspaceId
-        ? expect.stringContaining("execution workspace is claimed by 2 non-terminal issues")
+        ? expect.stringContaining("execution workspace is in use by 1 other non-terminal issue holding a live execution lock")
         : expect.stringContaining("recorded branch is already checked out in another worktree"),
     }),
   });
