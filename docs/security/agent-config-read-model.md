@@ -718,7 +718,7 @@ Two habits from that row are worth carrying:
   `paperclipGetAgent`) the same call against the viewer's own id returns the
   full `runtimeConfig.heartbeat`. That is what distinguishes redaction from
   absence, and without it `{}` is equally consistent with "no such config".
-  Three things bound that control, all read off `server/src/routes/agents.ts`:
+  Four things bound that control, all read off `server/src/routes/agents.ts`:
   - **Own-id is sufficient, not necessary.** The gate is
     `isSelf ? true : actorCanReadConfigurationsForAgent(...)`, so a reader
     entitled to the subject gets a populated **peer** read too. "It came back
