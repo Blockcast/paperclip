@@ -79,6 +79,7 @@
     "src/__tests__/unclaimable-queued-run-reap-postgres.test.ts",
     "src/__tests__/unclaimable-queued-run-reap.test.ts",
     "src/__tests__/workspace-dir-claim.test.ts",
+    "src/__tests__/workspace-dir-claims-route.test.ts",
     "src/__tests__/ws-upgrade-url-log-guard.test.ts",
     "src/__tests__/zoned-cron-equivalence.test.ts",
     "src/__tests__/zoned-cron-work-bound.test.ts",

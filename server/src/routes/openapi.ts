@@ -5894,6 +5894,11 @@ for (const route of [
   ["post", "/api/metrics/claude-k8s/isolated-run-started", "Record a Claude Kubernetes isolated-run start metric"],
   ["post", "/api/workspace/scan", "Scan a local workspace"],
   ["post", "/api/workspace/browse", "Browse local workspace directories"],
+  // PEN-5352. Keyed on the directory an agent CHOSE, which is why the path
+  // arrives in the body rather than being derived from anything the control
+  // plane provisioned.
+  ["post", "/api/workspace-dir-claims", "Claim a working directory for this run"],
+  ["post", "/api/workspace-dir-claims/release", "Release this run's working-directory claim"],
 ] as const) {
   registerCurrentRoute({
     method: route[0],

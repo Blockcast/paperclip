@@ -63,6 +63,7 @@ import { githubWebhookRoutes } from "./routes/github-webhook.js";
 import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { workspaceScanRoutes } from "./routes/workspace-scan.js";
+import { workspaceDirClaimRoutes } from "./routes/workspace-dir-claims.js";
 import { loadConfig } from "./config.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "./routes/tool-gateway.js";
@@ -863,6 +864,9 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // guardrail and increments the counter exposed on /metrics.
   api.use(metricsIngestRoutes(db));
   api.use(workspaceScanRoutes());
+  // PEN-5352: the call site for the directory claim. Agent-supplied path, so it
+  // has to be a route; see the module header for how the path is bounded.
+  api.use(workspaceDirClaimRoutes(db));
   api.use(agentImageBumpRoutes(db));
   api.use(
     accessRoutes(db, {

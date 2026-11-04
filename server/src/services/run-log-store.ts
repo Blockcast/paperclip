@@ -2,7 +2,7 @@ import { createReadStream, promises as fs } from "node:fs";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { notFound } from "../errors.js";
-import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { resolveRunLogBasePath, resolveRunLogBasePathOverride } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
 
@@ -385,11 +385,19 @@ let cachedStore: RunLogStore | null = null;
 
 export function getRunLogStore() {
   if (cachedStore) return cachedStore;
-  const overridden = process.env.RUN_LOG_BASE_PATH;
-  const basePath = overridden ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
+  const basePath = resolveRunLogBasePath();
   // This is the one caller that KNOWS which branch the path came from, so it is
   // the one that gets to say so.
-  const basePathOrigin = overridden ? "from RUN_LOG_BASE_PATH" : "derived from PAPERCLIP_HOME";
+  //
+  // PEN-5466: keyed on the SAME predicate the resolver branches on, never on the
+  // raw env value's truthiness. The two disagreed at `RUN_LOG_BASE_PATH=""` —
+  // not nullish, so `??` took it and rooted the store at the process cwd; falsy,
+  // so the label read "derived from PAPERCLIP_HOME" and named a root that was not
+  // in use. The blank value is now absent for both halves, so there is one branch
+  // to get wrong instead of two. An unsupported claim is worse than no claim here:
+  // this is the sentence a reader trusts when a run-log fault surfaces.
+  const basePathOrigin =
+    resolveRunLogBasePathOverride() === undefined ? "derived from PAPERCLIP_HOME" : "from RUN_LOG_BASE_PATH";
   cachedStore = createDurableRunLogStore({ basePath, basePathOrigin, s3: resolveRunLogS3() });
   return cachedStore;
 }

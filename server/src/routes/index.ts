@@ -31,4 +31,5 @@ export { accessRoutes } from "./access.js";
 export { instanceSettingsRoutes } from "./instance-settings.js";
 export { instanceDatabaseBackupRoutes } from "./instance-database-backups.js";
 export { workspaceScanRoutes } from "./workspace-scan.js";
+export { workspaceDirClaimRoutes } from "./workspace-dir-claims.js";
 export { cloudUpstreamRoutes } from "./cloud-upstreams.js";

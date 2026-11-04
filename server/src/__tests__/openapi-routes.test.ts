@@ -60,6 +60,7 @@ const apiPrefixes: Record<string, string> = {
   "tool-access.ts": "/api",
   "tool-gateway.ts": "/api",
   "user-profiles.ts": "/api",
+  "workspace-dir-claims.ts": "/api",
   "workspace-scan.ts": "/api",
 };
 
