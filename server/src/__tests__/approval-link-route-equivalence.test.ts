@@ -53,6 +53,10 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   link: vi.fn(),
   unlink: vi.fn(),
   listApprovalsForIssue: vi.fn(),
+  // PEN-5511: the link route reads the card's requester to decide the
+  // `requested_by_self` relation. `null` is the no-subject case, i.e. exactly
+  // the pre-PEN-5511 verdict, so existing cases are unaffected.
+  getApprovalLinkSubject: vi.fn(async () => null),
   listIssuesForApproval: vi.fn(),
   linkManyForApproval: vi.fn(),
 }));
@@ -252,6 +256,10 @@ beforeEach(() => {
   );
   mockApprovalService.getById.mockResolvedValue({ id: APPROVAL_ID, companyId: COMPANY_ID });
   mockIssueApprovalService.listApprovalsForIssue.mockResolvedValue([]);
+  // `vi.clearAllMocks()` clears calls but NOT implementations, so a
+  // `mockResolvedValue` set by one case would leak into every later one. Reset to
+  // the no-subject default, which is the pre-PEN-5511 verdict.
+  mockIssueApprovalService.getApprovalLinkSubject.mockResolvedValue(null);
   mockIssueApprovalService.link.mockResolvedValue(undefined);
   mockLogActivity.mockResolvedValue(() => {});
   mockIssueService.getById.mockResolvedValue(null);
@@ -306,8 +314,13 @@ describe("approval-link authorization is the same at both doors (BLO-24699)", ()
   it("reports a peer's in_progress checkout as the same retryable 409 at both doors", async () => {
     // A plain grant clears the boundary so the evaluator reaches the assignee
     // mismatch rather than short-circuiting on a permanent refusal.
+    //
+    // PEN-5511: `issue:comment` is denied deliberately. It is the participation half
+    // of the `requested_by_self` relation, which overrides this very 409 by design
+    // — so an actor holding it would be allowed here for a reason this case is not
+    // about. The relation gets its own equivalence case below.
     mockAccessService.decide.mockImplementation(async (input: any) => {
-      if (input.action === "tasks:manage_active_checkouts") {
+      if (input.action === "tasks:manage_active_checkouts" || input.action === "issue:comment") {
         return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "" };
       }
       return { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "" };

@@ -106,7 +106,109 @@ import {
  *
  * Outside the deliberate differences listed above, every branch is now a faithful
  * mirror, and each denial is at least as strict as the link route's.
+ *
+ * ## The `requested_by_self` relation (PEN-5511)
+ *
+ * Every relation above answers "what is this actor to the *issue*". None answers
+ * "this actor filed the card". So on any row worked by agent A, a card filed by
+ * agent B was permanently unlinkable **by B** — who is the only party that knows
+ * the card exists at filing time. The live refusal read `deny_missing_grant` /
+ * `boundary: grant`, naming
+ * `evaluatedRelations: [assignee, unassigned_issue, productivity_review]`.
+ *
+ * That is not merely inconvenient. `paperclipListApprovals(issueId=…)` returns only
+ * *linked* cards, so the rows where it matters most — multi-agent incidents, where
+ * two or more seats are each asking the board for something — under-report, and
+ * they under-report in the direction that understates board exposure. The response
+ * is a clean array with no marker, so a short list is indistinguishable at the call
+ * site from a row with fewer asks. Measured on PEN-5379: three linked cards
+ * returned against four standing asks.
+ *
+ * `requestedBySelfOverride` admits a relation the list above has no name for:
+ * **the actor filed this card, and the actor is a participant in this row.**
+ *
+ * Both halves are load-bearing, and the second is what keeps this least-privilege.
+ * "I filed it" alone cannot be the whole test, because at the two *create* doors
+ * every actor is the filer of the card it is creating — so a filer-only rule
+ * authorizes every (actor, issue) pair there and reopens the BLO-23763 hole it took
+ * three PRs to close. The participation half is supplied by `issue:comment`, and it
+ * is the right half for three reasons:
+ *
+ * - It is the **system's own model of "who belongs in this row's conversation"**.
+ *   `ISSUE_COMMENT_EVALUATED_RELATIONS` is eight relations where
+ *   `ISSUE_MUTATE_EVALUATED_RELATIONS` is three: it adds `creator`,
+ *   `manager_of_assignee`, `agent_mention`, `recovery_handoff` and
+ *   `dependency_edge`. Those are exactly the cross-seat escalation shapes PEN-5511
+ *   names — a CTO filing on an engineer's row, a seat mentioned into an incident, a
+ *   row reached through a blocker edge — and precisely not "any company member".
+ * - **Attaching is weaker than commenting.** A comment wakes an agent; an approval
+ *   card is inert until a human decides it. An actor already trusted with the
+ *   stronger act on this row is not newly dangerous doing the weaker one.
+ * - It is **one rule at all three doors**, so the BLO-24699 equivalence invariant
+ *   survives: an actor with no relation at all to the row is refused at the link
+ *   door and at both create doors, exactly as before.
+ *
+ * This mirrors BLO-18996 in `evaluateAgentIssueCommentAuthorization`, which
+ * overrides the same `deny_missing_grant` fall-through with one extra relation
+ * probe and leaves hard denials terminal. Beyond that:
+ *
+ * - It is an **override of specific refusals**, evaluated only once a refusal has
+ *   been reached, rather than a bypass placed ahead of `access.decide`. Placing it
+ *   earlier would have skipped the trust-boundary, company, membership and scope
+ *   checks too. The overridable set is enumerated in
+ *   `REQUESTED_BY_SELF_OVERRIDABLE_DECISION_REASONS` plus the two assignee branches
+ *   below; **every other denial stays terminal**, including both watchdog refusals,
+ *   which is why the watchdog gate still runs first and unconditionally.
+ * - An actor may attach a card **it filed**; an arbitrary pre-existing card id is
+ *   refused exactly as before.
+ * - It discloses nothing. `requestedByAgentId` is server-derived from the
+ *   authenticated actor at every create door (`routes/approvals.ts`,
+ *   `routes/agents.ts`), so a caller cannot nominate someone else as requester; and
+ *   the link route's `assertApprovalReadAllowed` gate is unchanged, so the
+ *   scoped-key classes (task-bridge keys, skill-test tokens, low-trust presets) are
+ *   excluded from this route exactly as before.
+ * - The association it permits is **additive and non-destructive**. `DELETE
+ *   /issues/:id/approvals/:approvalId` keeps its privileged gate untouched:
+ *   curation stays privileged, attaching does not.
+ *
+ * It overrides the checkout 409 as well as the assignee 403, because those are the
+ * same refusal — "you are not the assignee" — in its retryable and permanent forms,
+ * and an `in_progress` row under another agent's checkout is precisely the
+ * multi-agent incident this exists for. That is consistent with the no-checkout-lock
+ * reasoning above: the lock is bookkeeping about who is *executing* the issue, not
+ * about who may annotate it.
  */
+
+/**
+ * PEN-5511: the card side of the decision — who filed the approval being attached.
+ *
+ * `approvalId` is `null` at the create doors, where the card does not exist yet and
+ * the actor is its requester by construction. Callers must take
+ * `requestedByAgentId` from the server-derived requester column (or, on create,
+ * from the authenticated actor), never from a request body.
+ */
+export type IssueApprovalLinkSubject = {
+  approvalId: string | null;
+  companyId: string;
+  requestedByAgentId: string | null;
+};
+
+/**
+ * The denial reasons `requested_by_self` may override, enumerated rather than
+ * inverted so that a new `deny_*` reason added to `AuthorizationDecision` is
+ * terminal here by default. Both carry `authorizationBoundaryLabel` "grant", i.e.
+ * "this actor holds no relation to this issue" — the refusal the filer relation is
+ * meant to answer.
+ *
+ * `deny_missing_consent` shares that label and is deliberately NOT here: consent is
+ * a separate question from relation, and filing a card does not supply it.
+ */
+const REQUESTED_BY_SELF_OVERRIDABLE_DECISION_REASONS: ReadonlySet<string> = new Set([
+  "deny_missing_grant",
+  "deny_no_grant",
+]);
+
+export const REQUESTED_BY_SELF_REASON = "allow_approval_requested_by_self";
 
 export type IssueApprovalLinkAuthorizationIssue = {
   id: string;
@@ -239,10 +341,73 @@ async function evaluateTaskWatchdogSubtreeScope(
   };
 }
 
+/**
+ * The two halves of the `requested_by_self` relation (PEN-5511). Returns the allow
+ * verdict or `null`, so a caller cannot accidentally use a half-satisfied result.
+ *
+ * The company equality is defence in depth rather than the primary gate — the
+ * routes apply `assertCompanyAccess`/`getAccessibleResource` first, and
+ * `issueApprovalService.link` refuses a cross-company pair at write time — but this
+ * is the predicate that *relaxes* a refusal, so it re-establishes the invariant
+ * locally instead of inheriting it.
+ *
+ * The `issue:comment` probe is made only after a refusal has already been reached
+ * AND the filer half holds, so it adds no decide call to any path that was going to
+ * allow anyway, and none at all for a third-party card or a non-agent actor.
+ */
+async function requestedBySelfOverride(
+  deps: { access: AccessDecider },
+  actorAgentId: string,
+  issue: IssueApprovalLinkAuthorizationIssue,
+  subject: IssueApprovalLinkSubject | null | undefined,
+): Promise<{ allowed: true; reason: string } | null> {
+  if (!subject) return null;
+  if (subject.companyId !== issue.companyId) return null;
+  if (subject.requestedByAgentId === null || subject.requestedByAgentId !== actorAgentId) {
+    return null;
+  }
+
+  const participation = await deps.access.decide({
+    actor: { type: "agent", agentId: actorAgentId, companyId: issue.companyId },
+    action: "issue:comment",
+    resource: {
+      type: "issue",
+      companyId: issue.companyId,
+      issueId: issue.id,
+      projectId: issue.projectId,
+      parentIssueId: issue.parentId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+      createdByAgentId: issue.createdByAgentId ?? null,
+      status: issue.status,
+      // Same undefined-vs-null contract as the `issue:mutate` call below.
+      originKind: issue.originKind,
+      originId: issue.originId ?? null,
+    },
+    scope: {
+      issueId: issue.id,
+      projectId: issue.projectId,
+      parentIssueId: issue.parentId,
+      assigneeAgentId: issue.assigneeAgentId,
+      assigneeUserId: issue.assigneeUserId,
+      originKind: issue.originKind ?? null,
+      originId: issue.originId ?? null,
+    },
+  });
+  if (!participation.allowed) return null;
+  return { allowed: true, reason: REQUESTED_BY_SELF_REASON };
+}
+
 export async function evaluateAgentIssueApprovalLinkAuthorization(
   deps: { access: AccessDecider; db: Db },
   req: Request,
   issue: IssueApprovalLinkAuthorizationIssue,
+  /**
+   * PEN-5511. Optional so a caller that cannot identify the card keeps exactly the
+   * pre-PEN-5511 verdict: omitting it can only ever make this evaluator stricter,
+   * never looser, which is what let the three doors adopt it independently.
+   */
+  subject?: IssueApprovalLinkSubject | null,
 ): Promise<IssueApprovalLinkVerdict> {
   if (req.actor.type !== "agent") return { allowed: true, reason: "allow_non_agent" };
 
@@ -299,6 +464,15 @@ export async function evaluateAgentIssueApprovalLinkAuthorization(
   });
 
   if (!decision.allowed) {
+    // PEN-5511: the filer-of-the-card relation, applied only to the "no relation to
+    // this issue" refusals. Evaluated here — after the watchdog gate and after
+    // `access.decide` has run — so a trust-boundary, company, membership, scope or
+    // consent denial stays terminal for a filer. This is the branch the live
+    // PEN-5379 refusal fell at.
+    if (REQUESTED_BY_SELF_OVERRIDABLE_DECISION_REASONS.has(decision.reason)) {
+      const self = await requestedBySelfOverride(deps, actorAgentId, issue, subject);
+      if (self) return self;
+    }
     return {
       allowed: false,
       status: 403,
@@ -313,6 +487,13 @@ export async function evaluateAgentIssueApprovalLinkAuthorization(
   // (BLO-18113 / BLO-18797). The one mutation they carry is a shaped delegate
   // recovery PATCH, which this is not.
   if (isCreatorOrManagerChainDecision(decision)) {
+    // PEN-5511: an actor holding only a comment-only grant is refused here, but the
+    // filer relation is an independent and stronger basis than the grant being
+    // narrowed, so it is honoured rather than shadowed by it. Without this an agent
+    // would be refused *because* it also happens to be the issue's creator, which
+    // inverts the intent of the narrowing.
+    const self = await requestedBySelfOverride(deps, actorAgentId, issue, subject);
+    if (self) return self;
     return {
       allowed: false,
       status: 403,
@@ -346,6 +527,15 @@ export async function evaluateAgentIssueApprovalLinkAuthorization(
     if (decision.reason === "allow_productivity_review_grant") {
       return { allowed: true, reason: decision.reason };
     }
+
+    // PEN-5511: placed to cover BOTH refusals below, because they are one refusal —
+    // "you are not the assignee" — in its retryable (409, row checked out) and
+    // permanent (403) forms. Admitting only the 403 would leave the filer unable to
+    // link on exactly the `in_progress` multi-agent incident this exists for, and
+    // would make the relation's availability depend on the row's status, which the
+    // filer neither controls nor can wait out.
+    const requestedBySelf = await requestedBySelfOverride(deps, actorAgentId, issue, subject);
+    if (requestedBySelf) return requestedBySelf;
 
     if (issue.status === "in_progress") {
       return {

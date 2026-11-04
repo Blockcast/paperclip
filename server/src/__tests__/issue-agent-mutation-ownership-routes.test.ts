@@ -99,6 +99,10 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   link: vi.fn(),
   unlink: vi.fn(),
   listApprovalsForIssue: vi.fn(async () => []),
+  // PEN-5511: the link route reads the card's requester to decide the
+  // `requested_by_self` relation. `null` is the no-subject case, i.e. exactly
+  // the pre-PEN-5511 verdict, so existing cases are unaffected.
+  getApprovalLinkSubject: vi.fn(async () => null),
 }));
 const mockIssueRecoveryActionService = vi.hoisted(() => ({
   getActiveForIssue: vi.fn(async () => null),

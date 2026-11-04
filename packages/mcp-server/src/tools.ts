@@ -587,9 +587,17 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListIssueApprovals",
-      "List approvals linked to an issue",
+      "List the board approvals LINKED to an issue, with a completeness report. Returns `{approvals, linkCoverage}` — `approvals` is the linked set, and `linkCoverage` says how partial that set may be, because the only cards this surface can see are the ones somebody linked. ⚠ `linkCoverage.potentiallyUnlinkedCards: true` means undecided cards in this company name this issue's identifier but are NOT linked to it, so the board is being asked for more on this row than `approvals` shows — read `unlinkedMentionCandidateCount` and go look at them. FALSE IS NOT PROOF OF COMPLETENESS: it is a lower bound, and a card about this row that never spells the identifier is invisible to it (`basis` names what was actually measured, and is `identifier_unavailable` with null counts when the row has no identifier to match on). Before PEN-5511 a card filed by a non-assignee could not be linked to the row it was about at all, so cards filed then are the likeliest to be missing here. (PEN-5511)",
       z.object({ issueId: issueIdSchema }),
-      async ({ issueId }) => client.requestJson("GET", `/issues/${encodeURIComponent(issueId)}/approvals`),
+      async ({ issueId }) =>
+        // PEN-5511: always on for agent readers. The envelope is opt-in at the API
+        // so the CLI/web/plugin-host array consumers keep working unchanged; this
+        // tool is the surface where the silent undercount was actually read, so it
+        // takes the reporting form by default rather than on request.
+        client.requestJson(
+          "GET",
+          `/issues/${encodeURIComponent(issueId)}/approvals?includeLinkCoverage=true`,
+        ),
     ),
     // PEN-4484: this list omits system documents by default, and nothing in the
     // response says so. `[]` is byte-identical to "this issue has no
@@ -721,7 +729,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListApprovals",
-      "List approvals in a company. Default view=full returns whole payload bodies and is expensive (hundreds of KB on a busy queue). Before filing a new approval, check for an existing one with view=count or view=summary — summary omits payload and returns a derived, always-populated `label` per row, so a duplicate check costs a fraction of a re-file. Filter by type, issueId, requestedByAgentId, or idempotencyKey to narrow further.",
+      "List approvals in a company. Default view=full returns whole payload bodies and is expensive (hundreds of KB on a busy queue). Before filing a new approval, check for an existing one with view=count or view=summary — summary omits payload and returns a derived, always-populated `label` per row, so a duplicate check costs a fraction of a re-file. Filter by type, issueId, requestedByAgentId, or idempotencyKey to narrow further. ⚠ `issueId` FILTERS THROUGH THE LINK TABLE, so it returns only cards somebody LINKED to that row — never \"every card about this row\". The array views (`full`, `summary`) report nothing about that gap: a short list is indistinguishable at the call site from a row with fewer asks, and the error understates board exposure on exactly the multi-agent incidents where it matters most (measured on PEN-5379: 3 returned, 4 standing). THE TELL: pass `view=count` with `issueId`, which answers `{count, linkCoverage}`; `linkCoverage.potentiallyUnlinkedCards: true` means undecided cards name that issue's identifier without being linked to it. It is a lower bound, so `false` is not proof of completeness. Before PEN-5511 a card filed by a non-assignee could not be linked to its own subject row at all, so cards filed then are the likeliest to be missing. (PEN-5511)",
       z.object({
         companyId: companyIdOptional,
         status: z.string().optional(),

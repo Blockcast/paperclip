@@ -282,6 +282,7 @@ import {
 import {
   evaluateAgentIssueApprovalLinkAuthorization,
   type IssueApprovalLinkAuthorizationIssue,
+  type IssueApprovalLinkSubject,
 } from "./issue-approval-link-authorization.js";
 
 export const ISSUE_CREATE_DUPLICATE_CANDIDATE_WINDOW_DAYS = 30;
@@ -4916,6 +4917,8 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: IssueApprovalLinkAuthorizationIssue,
+    /** PEN-5511: who filed the card being attached. See the evaluator header. */
+    subject?: IssueApprovalLinkSubject | null,
   ) {
     // BLO-23763: this helper receives an already-looked-up issue, so answering a
     // cross-tenant `issue.companyId` with `assertCompanyAccess`'s 403 would say
@@ -4956,7 +4959,12 @@ export function issueRoutes(
       deniedWriteAction: "issue:mutate",
     });
     if (watchdogDecision === false) return false;
-    const verdict = await evaluateAgentIssueApprovalLinkAuthorization({ access, db }, req, issue);
+    const verdict = await evaluateAgentIssueApprovalLinkAuthorization(
+      { access, db },
+      req,
+      issue,
+      subject,
+    );
     if (verdict.allowed) return true;
     res.status(verdict.status).json({
       error: verdict.error,
@@ -11627,6 +11635,19 @@ export function issueRoutes(
     res.json(removed ?? { ok: true, userId: target.userId });
   });
 
+  /**
+   * PEN-5511: this route answers through the `issue_approvals` join, so it returns
+   * LINKED cards and nothing else. A card that was never linked to the row it is
+   * about is absent, and the bare array carries no marker saying so — a short list
+   * is indistinguishable at the call site from a row that genuinely has fewer asks,
+   * and the error runs in the direction that UNDERSTATES board exposure.
+   *
+   * `includeLinkCoverage=true` switches the body to an envelope that reports its own
+   * completeness. It is opt-in precisely so it is additive: the CLI, the plugin host
+   * and the web client all index the array, and enveloping unconditionally would
+   * break them. The MCP tool `paperclipListIssueApprovals` passes it on every call,
+   * so the agent readers this defect was found by get the flag by default.
+   */
   router.get("/issues/:id/approvals", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
@@ -11638,6 +11659,16 @@ export function issueRoutes(
       includeAgentConfig: await actorCanReadAgentConfig(req, access, issue.companyId),
       workspaceCommandViewer: await resolveWorkspaceRuntimeViewer(access, req, issue.companyId),
     });
+    if (req.query.includeLinkCoverage === "true") {
+      res.json({
+        approvals,
+        linkCoverage: await issueApprovalsSvc.linkCoverageForIssue(issue.companyId, {
+          id: issue.id,
+          identifier: issue.identifier ?? null,
+        }),
+      });
+      return;
+    }
     res.json(approvals);
   });
 
@@ -11661,6 +11692,14 @@ export function issueRoutes(
     // path an agent needs, and BLO-23036 AC #2 requires that constraint stay visible
     // rather than being masked by a generic boundary message.
     if (!(await assertApprovalReadAllowed(req, res, issue.companyId))) return;
+    // PEN-5511: the card side of the decision, read AFTER `assertApprovalReadAllowed`
+    // so this lookup is never reachable by an actor that may not read approvals in
+    // this company — it must not become an existence oracle for approval ids. It is
+    // used only to decide, never reflected in a response, and an unknown id yields
+    // `null`, which is the pre-PEN-5511 verdict (and still 404s at `link` below).
+    const approvalLinkSubject = await issueApprovalsSvc.getApprovalLinkSubject(
+      req.body.approvalId,
+    );
     // BLO-24699: the shared evaluator replaces the former
     // `assertAgentIssueMutationAllowed` + `assertCanManageIssueApprovalLinks` pair,
     // so this route and `POST /companies/:companyId/approvals` reach the same
@@ -11670,7 +11709,7 @@ export function issueRoutes(
     // assignee's other runs off a locked pending review (see the evaluator header).
     // The 409 conflict contract for another agent's active checkout is preserved by
     // the evaluator.
-    if (!(await assertIssueApprovalLinkAllowed(req, res, issue))) return;
+    if (!(await assertIssueApprovalLinkAllowed(req, res, issue, approvalLinkSubject))) return;
 
     const actor = getActorInfo(req);
     await issueApprovalsSvc.link(id, req.body.approvalId, {

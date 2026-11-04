@@ -137,7 +137,10 @@ import {
 } from "../services/default-agent-instructions.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
-import { evaluateAgentIssueApprovalLinkAuthorization } from "./issue-approval-link-authorization.js";
+import {
+  evaluateAgentIssueApprovalLinkAuthorization,
+  type IssueApprovalLinkSubject,
+} from "./issue-approval-link-authorization.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { resolveCoreTrustPreset } from "../services/trust-preset-resolver.js";
 import { readObject } from "../lib/objects.js";
@@ -1510,11 +1513,26 @@ export function agentRoutes(
   ) {
     if (req.actor.type !== "agent" || sourceIssueIds.length === 0) return;
     const issuesSvc = issueService(db);
+    // PEN-5511: as at the other create door — the hire approval does not exist yet
+    // and this route derives `requestedByAgentId` from the authenticated actor, so
+    // the filer-of-the-card relation holds by construction. Passed here so the three
+    // doors keep reaching the same verdict for the same (actor, issue) pair, which
+    // is the invariant `approval-link-route-equivalence.test.ts` pins.
+    const subject: IssueApprovalLinkSubject = {
+      approvalId: null,
+      companyId,
+      requestedByAgentId: req.actor.agentId ?? null,
+    };
     const refusals: Array<{ issueId: string; status: 403 | 409 } & Record<string, unknown>> = [];
     for (const issueId of sourceIssueIds) {
       const issue = await issuesSvc.getById(issueId);
       if (!issue || issue.companyId !== companyId) continue;
-      const verdict = await evaluateAgentIssueApprovalLinkAuthorization({ access, db }, req, issue);
+      const verdict = await evaluateAgentIssueApprovalLinkAuthorization(
+        { access, db },
+        req,
+        issue,
+        subject,
+      );
       if (verdict.allowed) continue;
       refusals.push({
         issueId,
