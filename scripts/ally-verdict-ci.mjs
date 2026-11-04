@@ -33,6 +33,30 @@ export const PR_WORKFLOW_FILE = "pr.yml";
 export const PR_WORKFLOW_NAME = "PR";
 export const DISPATCHER_WORKFLOW_FILE = "dispatch-ally-verdict-ci.yml";
 export const MAX_BACKSTOP_DISPATCHES = 10;
+// Attestation-lag detector (PEN-5538). App 3966421 publishes the attestation
+// pair twice per head: NEUTRAL at push time, then SUCCESS a few seconds after
+// Ally submits the review. Measured on #3307's four consecutive heads
+// (2026-11-04), the post-review pair landed 12s, 12s and 12s after the review
+// on three of them -- and never on the fourth, which then sat unmergeable for
+// 2h47m with nothing comparing the two timestamps.
+//
+// The missed publication itself is app 3966421's bug and is NOT fixable here:
+// PEN-5545 carries it upstream. This detector is the compensating control
+// named there, and it only reports -- releasing the hold is still '/test'.
+//
+// GRACE is the margin above that observed 12s before a head is called stranded:
+// 50x the healthy figure, and two orders of magnitude under the strand. ALARM
+// is when the job stops merely reporting and turns this repo's Actions tab red,
+// on the same "surface it without a human noticing by hand" principle as the
+// sweep's AC4 above it in review-gate-sweep.yml.
+export const ATTESTATION_LAG_GRACE_SECONDS = 600;
+export const ATTESTATION_LAG_ALARM_SECONDS = 3600;
+export const MAX_ATTESTATION_LAG_REPORTED = 20;
+// GraphQL `author { login }` returns a Bot node's login WITHOUT the `[bot]`
+// suffix REST uses, so both spellings are accepted. The bare `allyblockcast`
+// USER seat is a different principal that publishes no attestation, so the
+// typename check below -- not this list -- is what excludes it.
+export const ALLY_REVIEWER_LOGINS = ["allyblockcast", "allyblockcast[bot]", "app/allyblockcast"];
 const FULL_SHA = /^[0-9a-f]{40}$/;
 const PR_NUMBER = /^[1-9][0-9]{0,9}$/;
 const sameRepo = (a, b) => typeof a === "string" && a.toLowerCase() === String(b).toLowerCase();
@@ -102,12 +126,38 @@ export function rerunDecision(run, lockJobs, manual = false) {
   if (manual && ['failure', 'cancelled', 'timed_out'].includes(run.conclusion)) {
     return { rerun: true, reason: `trusted /test retries the failed jobs of run ${run.id}` };
   }
+  // PEN-5538 Defect B, and the decision recorded rather than the alternative.
+  //
+  // The test is on the attempt NUMBER alone: it does not ask whether a positive
+  // signal existed when that earlier attempt ran. So an attempt 2 spent while
+  // the head was still ineligible -- which could not have released anything, by
+  // construction -- permanently moves the head from auto-releasing to hand-only.
+  //
+  // ⛔ NOT TAKEN: making the disqualification conditional (PEN-5538 §5.2), i.e.
+  // declining to count an attempt whose own hold failed because no signal was
+  // visible to it. The inference is sound -- a lock that concluded `failure` at
+  // attempt N proves attempt N saw no positive signal -- but acting on it is
+  // unbounded in exactly the case it is meant to fix. On #3307's `ea8ec0476`
+  // the signal was never going to be published at all, so attempt 3 would have
+  // failed the hold identically, and so would every attempt after it: one
+  // dispatcher event per re-run, with no terminating condition short of a new
+  // push. That is a CPU-waste loop, against the owner directive this file opens
+  // with, and it would retire invariant I6 ("never a second automatic re-run",
+  // ally-verdict-gate.test.mjs) which the exactly-once design rests on.
+  //
+  // ✅ TAKEN: §5.3 instead -- report the spend at the point of loss (see the
+  // `::warning` in unlock() below) and name the recovery that still works, so
+  // the cost is visible to whoever pays it. `spent` is reported, not acted on:
+  // `rerun` stays false here in every branch.
   if (run.run_attempt !== 1) {
     return {
       rerun: false,
+      spent: true,
       reason:
-        `run ${run.id} is already at attempt ${run.run_attempt}; the automatic unlock fires only on attempt 1. ` +
-        `After Ally's verdict at this head, re-run its failed jobs by hand`,
+        `run ${run.id} is already at attempt ${run.run_attempt}; the automatic unlock fires only on attempt 1 ` +
+        `and was spent there. This head is hand-only from here: comment '/test' on the PR (the trusted manual arm ` +
+        `re-runs failed jobs at any attempt), or re-run its failed jobs by hand once Ally's verdict lands. ` +
+        `If no verdict is coming, the attestation never published -- see the attestation-lag detector`,
     };
   }
   const locks = lockJobs.filter((job) => job?.name === LOCK_JOB_NAME);
@@ -192,6 +242,141 @@ export const BACKSTOP_QUERY = `query($owner: String!, $name: String!, $cursor: S
               workflowRun { databaseId event workflow { name } }
               checkRuns(first: 5, filterBy: {checkName: "${LOCK_JOB_NAME}", checkType: ALL}) { nodes { databaseId conclusion } }
             }
+          }
+        } } }
+      }
+    }
+  }
+}`;
+
+// --- attestation-lag detector (PEN-5538) -------------------------------------
+
+const epochMs = (value) => {
+  const ms = Date.parse(String(value ?? ""));
+  return Number.isFinite(ms) ? ms : null;
+};
+
+// Is this review the one app 3966421 reacts to? The App publishes the
+// attestation for its OWN review. The same-named USER seat is a separate
+// principal whose reviews produce no attestation, so counting it would invent
+// a strand on every head a human-equivalent commented on (the mirror of the
+// `claude[bot]` false negative recorded in review-gate-sweep.yml).
+function isAllyAppReview(review, logins) {
+  const login = String(review?.author?.login ?? "").toLowerCase();
+  if (!logins.some((candidate) => candidate.toLowerCase() === login)) return false;
+  return review?.author?.__typename === "Bot";
+}
+
+const newestEpoch = (nodes, pick) =>
+  nodes.reduce((best, node) => {
+    const ms = epochMs(pick(node));
+    return ms !== null && (best === null || ms > best) ? ms : best;
+  }, null);
+
+// The one comparison §4 of PEN-5538 found nothing anywhere was making: at a
+// PR's LIVE head, is the newest Ally review NEWER than the newest publication
+// of the attestation it is supposed to produce?
+//
+// A finding needs BOTH halves, and the second is what keeps this quiet:
+//
+//   lag     newest Ally review at the head post-dates the newest
+//           `ci/ally-head-attested` publication there by more than `grace`.
+//           When nothing was ever published, the lag is measured from the
+//           review to `now` instead -- "never" is the worst case, not a skip.
+//   no      neither check-run base `decide()` admits is SUCCESS at that head.
+//   signal  Without this a head whose attestation DID land late, or landed
+//           FAILURE (a real blocking verdict, not a missing one), would be
+//           reported as stranded. It also makes the finding set a subset of
+//           the heads the hold is actually still holding.
+//
+// Deliberately mirrors selectBackstopCandidates' predicate rather than
+// re-deriving one, so "positive signal" means the same thing in the detector
+// and in the thing it detects the absence of. Like that predicate it reads the
+// CHECK-RUN plane only and does not consult the `review/ally-complete` commit
+// status: review-gate-sweep.yml records that this repo has no producer for it
+// (0 of 100 open PRs carried it, measured 2026-08-20), so consulting it here
+// would add a request per PR to read a column that is empty by construction.
+//
+// Pure: every bound arrives as an argument so the thresholds and `now` are
+// fixed by the caller and testable without a clock.
+export function attestationLagFindings(
+  repositoryNode,
+  repository,
+  { nowMs, graceSeconds = ATTESTATION_LAG_GRACE_SECONDS, reviewerLogins = ALLY_REVIEWER_LOGINS } = {},
+) {
+  const base = repositoryNode?.defaultBranchRef?.name;
+  const graceMs = graceSeconds * 1000;
+  const findings = [];
+  for (const pr of repositoryNode?.pullRequests?.nodes ?? []) {
+    if (pr?.isDraft !== false || pr?.baseRefName !== base) continue;
+    if (!sameRepo(pr?.headRepository?.nameWithOwner, repository)) continue;
+    const commit = pr?.commits?.nodes?.[0]?.commit;
+    // Stale read: the PR pushed while this page was being fetched. The next
+    // sweep sees the new head; reporting the old one would name a dead SHA.
+    if (!commit || commit.oid !== pr.headRefOid) continue;
+
+    const reviewedAt = newestEpoch(
+      (pr?.reviews?.nodes ?? []).filter(
+        (review) => review?.commit?.oid === pr.headRefOid && isAllyAppReview(review, reviewerLogins),
+      ),
+      (review) => review?.submittedAt,
+    );
+    if (reviewedAt === null) continue;
+
+    const allyRuns = (commit.ally?.nodes ?? []).flatMap((suite) => suite?.checkRuns?.nodes ?? []);
+    const attestations = allyRuns.filter((run) => run?.name === HEAD_ATTESTED_CHECK);
+    const findingsRuns = allyRuns.filter((run) => run?.name === COMMENT_FINDINGS_CHECK);
+    if (attestations.some((run) => run?.conclusion === "SUCCESS")) continue;
+    if (findingsRuns.some((run) => run?.conclusion === "SUCCESS")) continue;
+
+    const publishedAt = newestEpoch(attestations, (run) => run?.completedAt ?? run?.startedAt);
+
+    // Two different quantities, and conflating them is the trap. `lag` is the
+    // SIGNATURE: review minus newest publication. On a healthy head it is about
+    // -12s (the publication follows the review); in this failure it is positive
+    // because the newest publication is the push-time NEUTRAL that PRECEDES the
+    // review. Note it is a CONSTANT once both timestamps are fixed -- on
+    // #3307's `ea8ec0476` it was +234s at minute one and still +234s at minute
+    // 167. Thresholding on it would mean picking a number under 234s and
+    // racing the healthy 12s path, so it is not what the thresholds read.
+    //
+    // `stranded` is the SEVERITY: review to now. That is what actually climbs,
+    // and it is what both thresholds read. `grace` is therefore doing exactly
+    // one job -- absorbing the seconds between a review landing and its
+    // attestation landing -- rather than trying to encode how bad a lag is.
+    if (publishedAt !== null && publishedAt >= reviewedAt) continue;
+    const strandedMs = nowMs - reviewedAt;
+    if (strandedMs <= graceMs) continue;
+
+    findings.push({
+      number: pr.number,
+      head: pr.headRefOid,
+      reviewedAt: new Date(reviewedAt).toISOString(),
+      publishedAt: publishedAt === null ? null : new Date(publishedAt).toISOString(),
+      lagSeconds: publishedAt === null ? null : Math.round((reviewedAt - publishedAt) / 1000),
+      strandedSeconds: Math.round(strandedMs / 1000),
+      // What the newest publication actually said, so a reader can tell the
+      // "stuck on the push-time NEUTRAL" shape apart from "nothing at all".
+      conclusion: publishedAt === null ? null : (newestByDatabaseId(attestations)?.conclusion ?? null),
+      publications: attestations.length,
+    });
+  }
+  return findings.sort((a, b) => b.strandedSeconds - a.strandedSeconds || a.number - b.number);
+}
+
+export const ATTESTATION_LAG_QUERY = `query($owner: String!, $name: String!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef { name }
+    pullRequests(states: OPEN, first: 50, after: $cursor, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        number isDraft headRefOid baseRefName
+        headRepository { nameWithOwner }
+        reviews(last: 20) { nodes { submittedAt author { login __typename } commit { oid } } }
+        commits(last: 1) { nodes { commit {
+          oid
+          ally: checkSuites(first: 5, filterBy: {appId: ${ALLY_APP_ID}}) {
+            nodes { checkRuns(first: 20, filterBy: {checkType: ALL}) { nodes { databaseId name conclusion startedAt completedAt } } }
           }
         } } }
       }
@@ -320,6 +505,19 @@ async function unlock() {
   const movedNow = liveHeadRefusal(pull, { headSha, repository });
   if (movedNow) return summary(`${label}: STOP before re-run, ${movedNow}`);
   await api.post(`/repos/${repository}/actions/runs/${run.id}/rerun-failed-jobs`);
+  // PEN-5538 §5.3: this re-run moves the run to attempt 2, and rerunDecision
+  // refuses every later automatic unlock at this head on the attempt number
+  // alone. Said out loud at the moment it is spent, because the cost used to be
+  // invisible until someone read the check-run timestamps by hand 2h47m later.
+  // Not a failure: the spend is correct here -- a positive signal is present, so
+  // this re-run can actually release the hold.
+  if (!manual) {
+    console.log(
+      `::warning title=ally-verdict unlock::${label}: this re-run spends the ONLY automatic unlock for this head ` +
+        `(attempt 1 -> 2). If '${LOCK_JOB_NAME}' fails again, no later verdict event can release it: ` +
+        `comment '/test' on the PR, or re-run the failed jobs by hand.`,
+    );
+  }
   return summary(`${label} (${process.env.BASIS}): UNLOCKED, ${decision.reason}: ${run.html_url ?? run.id}`);
 }
 
@@ -360,6 +558,70 @@ async function backstop() {
   );
 }
 
+// PEN-5538 Done-when 1. Schedule-driven, like backstop() above and for the
+// same reason: the condition it looks for IS a lost event, so it must not
+// depend on an event to notice. One batched GraphQL read, no writes at all.
+async function attestationLag() {
+  const { repository, api } = context();
+  const [owner, name] = repository.split("/");
+  let repositoryNode = null;
+  const nodes = [];
+  let cursor = null;
+  for (let page = 0; page < 4; page += 1) {
+    const result = await api.post("/graphql", { query: ATTESTATION_LAG_QUERY, variables: { owner, name, cursor } });
+    if (result?.errors?.length) throw new Error(`GraphQL: ${JSON.stringify(result.errors).slice(0, 500)}`);
+    repositoryNode = result?.data?.repository ?? null;
+    nodes.push(...(repositoryNode?.pullRequests?.nodes ?? []));
+    const info = repositoryNode?.pullRequests?.pageInfo;
+    if (!info?.hasNextPage) break;
+    cursor = info.endCursor;
+  }
+  if (!repositoryNode?.defaultBranchRef?.name) throw new Error("could not read the default branch");
+
+  const grace = Number(process.env.ATTESTATION_LAG_GRACE_SECONDS ?? "") || ATTESTATION_LAG_GRACE_SECONDS;
+  const alarm = Number(process.env.ATTESTATION_LAG_ALARM_SECONDS ?? "") || ATTESTATION_LAG_ALARM_SECONDS;
+  const findings = attestationLagFindings({ ...repositoryNode, pullRequests: { nodes } }, repository, {
+    nowMs: Date.now(),
+    graceSeconds: grace,
+  });
+
+  if (findings.length === 0) {
+    return summary(
+      `Ally attestation-lag: ${nodes.length} open PR(s) read; no head carries an Ally review older than ${grace}s ` +
+        `with no \`${HEAD_ATTESTED_CHECK}\` publication behind it.`,
+    );
+  }
+  for (const f of findings.slice(0, MAX_ATTESTATION_LAG_REPORTED)) {
+    const published = f.publishedAt === null
+      ? "never published (0 publications)"
+      : `newest of ${f.publications} publication(s) is ${f.publishedAt} (${f.conclusion}), ${f.lagSeconds}s BEFORE the review`;
+    console.log(
+      `::warning title=ally attestation lag::PR #${f.number} head ${f.head.slice(0, 9)}: Ally reviewed at ` +
+        `${f.reviewedAt}, ${published}. Stranded ${f.strandedSeconds}s. The heavy lanes stay held at this head ` +
+        `and no verdict event is coming -- comment '/test' on the PR to release them.`,
+    );
+  }
+  const worst = findings[0];
+  const over = findings.filter((f) => f.strandedSeconds >= alarm);
+  await summary(
+    `Ally attestation-lag: ${nodes.length} open PR(s) read; **${findings.length}** head(s) carry an Ally review ` +
+      `with no attestation behind it. Worst: #${worst.number} at ${worst.head.slice(0, 9)}, stranded ` +
+      `${worst.strandedSeconds}s. ${over.length} at or past the ${alarm}s alarm.`,
+  );
+  // AC4, the same escalation review-gate-sweep.yml's sweep job uses: a stranded
+  // head must become visible without a human reading timestamps by hand, and a
+  // scheduled job's step summary is not read. Past `alarm` this turns the
+  // Actions tab red. Below it the warnings above are the whole report, so a
+  // transient few-second race never reddens the tab.
+  if (over.length > 0) {
+    process.exitCode = 1;
+    console.log(
+      `::error title=ally attestation lag::${over.length} head(s) past the ${alarm}s alarm: ` +
+        `${over.map((f) => `#${f.number}@${f.head.slice(0, 9)} (${f.strandedSeconds}s)`).join(", ")}`,
+    );
+  }
+}
+
 function resolvedPathOrNull(candidate) {
   try {
     return realpathSync(candidate);
@@ -370,7 +632,7 @@ function resolvedPathOrNull(candidate) {
 
 const entrypoint = typeof process.argv[1] === "string" ? resolvedPathOrNull(process.argv[1]) : null;
 if (entrypoint !== null && entrypoint === resolvedPathOrNull(fileURLToPath(import.meta.url))) {
-  const modes = { resolve, unlock, backstop };
+  const modes = { resolve, unlock, backstop, "attestation-lag": attestationLag };
   const mode = modes[process.argv[2]];
   if (!mode) {
     console.error(`usage: ally-verdict-ci.mjs ${Object.keys(modes).join("|")}`);

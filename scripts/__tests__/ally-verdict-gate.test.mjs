@@ -34,6 +34,9 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  ATTESTATION_LAG_GRACE_SECONDS,
+  ATTESTATION_LAG_QUERY,
+  attestationLagFindings,
   chooseRun,
   liveHeadRefusal,
   pullsForHead,
@@ -892,4 +895,293 @@ test('manual unlock validates the status-list producer rather than the combined 
     assert.equal(result.status,0,result.stdout);
     assert.equal(result.calls.filter(call=>call.startsWith('POST')).length,status===permission?1:0,result.stdout);
   }
+});
+
+// --- PEN-5538: the attestation-lag detector and the budget it reports --------
+//
+// Fixtures are the REAL timestamps from Blockcast/paperclip#3307's four
+// consecutive heads on 2026-11-04 (the row's own measurement, re-read from the
+// GraphQL API while building this). Three healthy, one stranded for 2h47m. A
+// synthetic fixture would prove the function self-consistent; these prove it
+// separates the population it was written for.
+const LAG_REPO = "Blockcast/paperclip";
+const lagHead = {
+  healthy1: "d3db82258acb1ffc68757bc1f48b996052f9018b",
+  healthy2: "5817adb4bfd03ad6543fdeac3bb71074ef3563bb",
+  healthy3: "da511942694210e71e135877297a8f31ca8b7a63",
+  stranded: "ea8ec047633906404fcf75e94a21b3670d872fd9",
+};
+// 2026-11-04T13:28:00Z: 2h46m36s after the stranded head's review, which is the
+// moment the row was filed and the head abandoned.
+const LAG_NOW = Date.parse("2026-11-04T13:28:00Z");
+
+const attRun = (id, conclusion, completedAt, name = "ci/ally-head-attested") => ({
+  databaseId: id,
+  name,
+  conclusion,
+  completedAt,
+});
+
+function lagNode(prs) {
+  return {
+    defaultBranchRef: { name: "master" },
+    pullRequests: {
+      nodes: prs.map(({ number = 3307, head, reviews = [], runs = [], ...over }) => ({
+        number,
+        isDraft: false,
+        headRefOid: head,
+        baseRefName: "master",
+        headRepository: { nameWithOwner: LAG_REPO },
+        reviews: { nodes: reviews },
+        commits: { nodes: [{ commit: { oid: head, ally: { nodes: [{ checkRuns: { nodes: runs } }] } } }] },
+        ...over,
+      })),
+    },
+  };
+}
+const allyReview = (head, submittedAt, over = {}) => ({
+  submittedAt,
+  commit: { oid: head },
+  author: { login: "allyblockcast", __typename: "Bot", ...(over.author ?? {}) },
+});
+const findLag = (prs, over = {}) =>
+  attestationLagFindings(lagNode(prs), LAG_REPO, { nowMs: LAG_NOW, ...over });
+
+test("attestationLagFindings: the three healthy #3307 heads are silent, the stranded one is reported", () => {
+  // Healthy: the post-review SUCCESS pair lands ~12s after the review.
+  for (const [head, review, published] of [
+    [lagHead.healthy1, "2026-11-04T00:54:51Z", "2026-11-04T00:55:03Z"],
+    [lagHead.healthy2, "2026-11-04T02:28:23Z", "2026-11-04T02:28:35Z"],
+    [lagHead.healthy3, "2026-11-04T05:43:42Z", "2026-11-04T05:43:54Z"],
+  ]) {
+    assert.deepEqual(
+      findLag([
+        {
+          head,
+          reviews: [allyReview(head, review)],
+          runs: [attRun(1, "NEUTRAL", "2026-11-04T00:50:07Z"), attRun(2, "SUCCESS", published)],
+        },
+      ]),
+      [],
+      `${head.slice(0, 9)} published after its review and must not be reported`,
+    );
+  }
+
+  // Stranded: only the push-time NEUTRAL pair, 3m54s BEFORE the review.
+  const [finding, ...rest] = findLag([
+    {
+      head: lagHead.stranded,
+      reviews: [allyReview(lagHead.stranded, "2026-11-04T10:41:24Z")],
+      runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:23Z"), attRun(2, "NEUTRAL", "2026-11-04T10:37:30Z")],
+    },
+  ]);
+  assert.equal(rest.length, 0);
+  assert.equal(finding.number, 3307);
+  assert.equal(finding.head, lagHead.stranded);
+  assert.equal(finding.conclusion, "NEUTRAL");
+  assert.equal(finding.publications, 2);
+  // The row's own two figures, which are different quantities: the signature is
+  // a constant, the severity is what climbs.
+  assert.equal(finding.lagSeconds, 234, "+3m54s, the signature PEN-5538 measured");
+  assert.equal(finding.strandedSeconds, 9996, "2h46m36s, the age that crosses the alarm");
+});
+
+test("attestationLagFindings: the signature is a constant, so only the severity may be thresholded", () => {
+  const stranded = [
+    {
+      head: lagHead.stranded,
+      reviews: [allyReview(lagHead.stranded, "2026-11-04T10:41:24Z")],
+      runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:30Z")],
+    },
+  ];
+  // One minute after the review the lag already reads its final 234s -- which
+  // is why a threshold on it would have to sit under the healthy path's own
+  // publication delay. `grace` reads the age instead and holds this quiet.
+  assert.deepEqual(findLag(stranded, { nowMs: Date.parse("2026-11-04T10:42:24Z") }), []);
+  const later = findLag(stranded, { nowMs: Date.parse("2026-11-04T11:41:24Z") });
+  assert.equal(later[0].lagSeconds, 234, "unchanged an hour on");
+  assert.equal(later[0].strandedSeconds, 3600, "the severity is what grew");
+});
+
+test("attestationLagFindings: a publication that concluded FAILURE is a verdict, not a strand", () => {
+  // Live shape of #3383 on 2026-11-04: the pair DID land, 13s after the
+  // review, and concluded blocking. Reporting this would make the detector
+  // fire on every genuinely-rejected head -- and 2 of the 3 open PRs without a
+  // SUCCESS attestation at the time of writing are this shape, not a strand.
+  //
+  // `nowMs` is hours past that review ON PURPOSE. An earlier revision of this
+  // test reused the shared clock, which sits BEFORE 15:02Z, so the age test
+  // excluded the fixture and the assertion passed without ever reaching the
+  // ordering guard -- a surviving mutant. Keep `now` well past the review so
+  // the ONLY thing that can exclude this head is publication-after-review.
+  const after = Date.parse("2026-11-04T18:00:00Z");
+  const pr = {
+    number: 3383,
+    head: lagHead.healthy1,
+    reviews: [allyReview(lagHead.healthy1, "2026-11-04T15:02:47Z")],
+    runs: [
+      attRun(1, "NEUTRAL", "2026-11-04T15:03:00Z"),
+      attRun(2, "FAILURE", "2026-11-04T15:03:00Z", "gate/ally-comment-findings"),
+    ],
+  };
+  assert.deepEqual(findLag([pr], { nowMs: after }), []);
+  // The age test genuinely does not exclude it: move the publication to BEFORE
+  // the review and the same fixture at the same clock is reported.
+  const reported = findLag(
+    [{ ...pr, runs: [attRun(1, "NEUTRAL", "2026-11-04T15:02:34Z"), attRun(2, "FAILURE", "2026-11-04T15:02:34Z", "gate/ally-comment-findings")] }],
+    { nowMs: after },
+  );
+  assert.equal(reported.length, 1, "control: only the ordering guard excluded the case above");
+  assert.equal(reported[0].lagSeconds, 13);
+});
+
+test("attestationLagFindings: a positive signal on either check-run base clears the head", () => {
+  const base = {
+    head: lagHead.stranded,
+    reviews: [allyReview(lagHead.stranded, "2026-11-04T10:41:24Z")],
+  };
+  const stale = attRun(1, "NEUTRAL", "2026-11-04T10:37:30Z");
+  assert.equal(findLag([{ ...base, runs: [stale] }]).length, 1, "control: reported without a positive signal");
+  for (const positive of [
+    attRun(2, "SUCCESS", "2026-11-04T10:37:30Z"),
+    attRun(2, "SUCCESS", "2026-11-04T10:37:30Z", "gate/ally-comment-findings"),
+  ]) {
+    assert.deepEqual(findLag([{ ...base, runs: [stale, positive] }]), [], `${positive.name} SUCCESS releases the hold`);
+  }
+});
+
+test("attestationLagFindings: never published at all is the worst case, not a skip", () => {
+  const [finding] = findLag([
+    { head: lagHead.stranded, reviews: [allyReview(lagHead.stranded, "2026-11-04T10:41:24Z")], runs: [] },
+  ]);
+  assert.equal(finding.publishedAt, null);
+  assert.equal(finding.lagSeconds, null, "no publication means no signature to measure");
+  assert.equal(finding.conclusion, null);
+  assert.equal(finding.publications, 0);
+  assert.equal(finding.strandedSeconds, 9996, "severity still reads review -> now");
+});
+
+test("attestationLagFindings: only the Ally APP's review at the LIVE head counts", () => {
+  const review = (over) => ({
+    head: lagHead.stranded,
+    reviews: [over],
+    runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:30Z")],
+  });
+  const good = allyReview(lagHead.stranded, "2026-11-04T10:41:24Z");
+  assert.equal(findLag([review(good)]).length, 1, "control");
+  for (const [why, bad] of [
+    // The same-named USER seat is a different principal and publishes no
+    // attestation, so counting it would invent a strand on every head a
+    // human-equivalent commented on.
+    ["the User seat, not the App", { ...good, author: { login: "allyblockcast", __typename: "User" } }],
+    ["an unrelated reviewer", { ...good, author: { login: "claude", __typename: "Bot" } }],
+    // A review at a superseded head says nothing about this one.
+    ["a review at an older head", { ...good, commit: { oid: lagHead.healthy1 } }],
+  ]) {
+    assert.deepEqual(findLag([review(bad)]), [], why);
+  }
+});
+
+test("attestationLagFindings: drafts, forks, other bases and stale head reads are out of scope", () => {
+  const live = {
+    head: lagHead.stranded,
+    reviews: [allyReview(lagHead.stranded, "2026-11-04T10:41:24Z")],
+    runs: [attRun(1, "NEUTRAL", "2026-11-04T10:37:30Z")],
+  };
+  assert.equal(findLag([live]).length, 1, "control");
+  for (const [why, over] of [
+    ["a draft is not held", { isDraft: true }],
+    ["another base branch", { baseRefName: "release" }],
+    ["a fork head", { headRepository: { nameWithOwner: "fork/paperclip" } }],
+  ]) {
+    assert.deepEqual(findLag([{ ...live, ...over }]), [], why);
+  }
+  // The PR pushed while the page was being read: the commit node is the OLD
+  // head. Reporting it would name a SHA that is no longer anyone's head.
+  const stale = lagNode([live]);
+  stale.pullRequests.nodes[0].headRefOid = lagHead.healthy2;
+  assert.deepEqual(attestationLagFindings(stale, LAG_REPO, { nowMs: LAG_NOW }), [], "stale head read");
+});
+
+test("attestationLagFindings: worst stranded head sorts first", () => {
+  const mk = (number, head, submittedAt) => ({
+    number,
+    head,
+    reviews: [allyReview(head, submittedAt)],
+    runs: [attRun(1, "NEUTRAL", "2026-11-04T00:00:00Z")],
+  });
+  assert.deepEqual(
+    findLag([
+      mk(3307, lagHead.stranded, "2026-11-04T10:41:24Z"),
+      mk(3344, lagHead.healthy1, "2026-11-04T05:00:00Z"),
+      mk(3383, lagHead.healthy2, "2026-11-04T12:00:00Z"),
+    ]).map((f) => f.number),
+    [3344, 3307, 3383],
+  );
+});
+
+test("attestation-lag: its own read-only job on the hourly sweep", () => {
+  const block = jobBlocks(sweepYml).ally_attestation_lag;
+  assert.ok(block, "the detector must be wired to a schedule, not left callable by hand");
+  assert.equal(runsOn(block), "arc-paperclip-light");
+  assert.match(block, /run: node scripts\/ally-verdict-ci\.mjs attestation-lag/);
+  assert.match(block, /ref: \$\{\{ github\.event\.repository\.default_branch \}\}/, "trusted code only");
+  // The whole point of a separate job: a detector that cannot write cannot
+  // make the condition it watches worse. The backstop beside it holds
+  // `actions: write`; this must not inherit it.
+  for (const scope of ["actions: write", "pull-requests: write", "statuses: write", "checks: write"]) {
+    assert.ok(!block.includes(scope), `the detector must not hold ${scope}`);
+  }
+  assert.match(block, /permissions:\n(?: {6}.*\n)*? {6}pull-requests: read\n/);
+  // It rides the existing hourly cron rather than adding one.
+  assert.match(sweepYml, /- cron: '9 \* \* \* \*'/);
+});
+
+test("the attestation-lag query reads the two planes the detector compares", () => {
+  // It must read reviews WITH their head, and the Ally check-runs WITH
+  // timestamps -- `conclusion` alone cannot answer "which came first".
+  assert.match(ATTESTATION_LAG_QUERY, /reviews\(last: 20\)/);
+  assert.match(ATTESTATION_LAG_QUERY, /author \{ login __typename \}/, "the User seat must be distinguishable");
+  assert.match(ATTESTATION_LAG_QUERY, /submittedAt/);
+  assert.match(ATTESTATION_LAG_QUERY, /startedAt completedAt/);
+  assert.match(ATTESTATION_LAG_QUERY, /filterBy: \{appId: 3966421\}/);
+  assert.match(ATTESTATION_LAG_QUERY, /states: OPEN/);
+  // Read-only by construction: a detector must never mutate what it watches.
+  assert.doesNotMatch(ATTESTATION_LAG_QUERY, /mutation/);
+  assert.ok(ATTESTATION_LAG_GRACE_SECONDS > 60, "grace must clear the ~12s healthy publication delay with room");
+});
+
+// PEN-5538 Done-when 3. The chosen fix is §5.3 (report the spend), NOT §5.2
+// (stop counting a no-signal attempt) -- so the disqualification itself must be
+// UNCHANGED, and this is the negative case that proves it.
+test("rerunDecision: a legitimate attempt 2 still disqualifies, and the refusal now names the way out", () => {
+  const spent = run({ run_attempt: 2 });
+  for (const [why, jobs] of [
+    ["the hold failed again", lock("failure")],
+    ["no jobs read at attempt 2", []],
+    ["the hold passed", lock("success")],
+  ]) {
+    const decision = rerunDecision(spent, jobs);
+    assert.equal(decision.rerun, false, `I6 holds: ${why}`);
+    assert.equal(decision.spent, true, "the budget is reported as spent");
+    assert.match(decision.reason, /attempt 1 and was spent there/);
+    assert.match(decision.reason, /'\/test'/, "the recovery that still works is named");
+  }
+  // Attempt 1 is untouched by any of this: it neither reports a spend nor
+  // refuses. Without this the test above would pass on a function that always
+  // returned {rerun:false, spent:true}.
+  const fresh = rerunDecision(run(), lock("failure"));
+  assert.equal(fresh.rerun, true);
+  assert.equal(fresh.spent, undefined);
+  // And the trusted manual arm is still exempt at any attempt (it is checked
+  // before the attempt test), which is what makes '/test' a real recovery.
+  assert.equal(rerunDecision({ ...spent, conclusion: "failure" }, [], true).rerun, true);
+});
+
+test("the automatic unlock warns that it is spending the only one, and /test does not", async () => {
+  const warned = await unlockAgainst(baseRoutes([livePull(), livePull()]), { ELIGIBLE: "true" });
+  assert.equal(warned.status, 0, warned.stdout);
+  assert.match(warned.stdout, /::warning title=ally-verdict unlock::/);
+  assert.match(warned.stdout, /spends the ONLY automatic unlock/);
+  assert.match(warned.stdout, /UNLOCKED/);
 });
