@@ -822,6 +822,34 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         client.requestJson("DELETE", `/issues/${encodeURIComponent(issueId)}/monitor`),
     ),
     makeTool(
+      "paperclipClaimWorkspaceDir",
+      "Claim a working DIRECTORY before you edit anything in it, and act on the refusal if you get one. This is the guard that the issue checkout lock cannot provide: the lock is keyed on the ISSUE, while the per-issue worktree path is keyed on the issue too \u2014 so two runs OF YOUR OWN SEAT on one issue resolve to ONE directory, and a run that starts editing before checking out is never refused, only wrong. It finds out by reading its own diff back changed. Call this once the directory's final shape exists (AFTER the clone or worktree is materialised, not before: a directory claimed while plain and then turned into a git checkout moves its own claim into .git/, leaving the first claim unreadable by the next run and unreleasable by you). Pass issueId whenever the directory is an issue's tree \u2014 that additionally refuses a run that does not hold that issue's checkout lock, which is the STRICTLY EARLIER failure and the one that actually happened in PEN-5352, where no claim existed at all and `available` was the honest verdict about the wrong run being there. \u26a0 `acquired: false` is a REFUSAL, not advice: `refusal` says who holds the directory and what to do. Do NOT work in the directory anyway, and do NOT delete the claim by hand. \u26a0 READ THIS BEFORE CONCLUDING YOU ARE ALONE: `ListAgents` CANNOT see sibling runs of your own seat \u2014 they are separate pods, and subagents/teammates/local sessions are all it returns \u2014 so `ListAgents \u2192 none` means \"this tool cannot answer that question\", NEVER \"nobody else is here\". A `sibling_run` verdict here is your own seat, not an unreachable peer: the issue thread is where concurrent runs of one seat actually meet, so read it before designing around a rival. Mistaking the first for the second is the expensive half of PEN-5352 \u2014 the colliding run spent its remaining budget carefully preserving a branch the thread had already declared empty 19 minutes earlier. The claim is NOT a lease and never expires: a takeover needs the owning run to be positively determined finished, so `unknown` liveness, an unreadable claim, or a failed lookup all refuse.",
+      z.object({
+        dirPath: z
+          .string()
+          .trim()
+          .min(1)
+          .describe(
+            "Absolute path of the directory you are about to work in. Must already exist, must be a directory, and must be on a filesystem the server shares with the agent pods \u2014 a path local to one pod cannot exclude a run in another, and is refused with the allowed roots named.",
+          ),
+        issueId: z
+          .string()
+          .trim()
+          .min(1)
+          .optional()
+          .describe(
+            "The issue whose tree this is. Supplying it gates the claim on your holding that issue's checkout lock as well, so pass it whenever one applies.",
+          ),
+      }),
+      async (body) => client.requestJson("POST", "/workspace-dir-claims", { body }),
+    ),
+    makeTool(
+      "paperclipReleaseWorkspaceDir",
+      "Release your own claim on a working directory when you are done with it. Only ever removes a claim whose runId is yours: a release that could delete a foreign claim would reintroduce the overwrite the claim exists to prevent, and a run exiting is the moment it is least able to judge whose claim it is looking at. So `released: false` with a reason naming another run is the correct, safe answer \u2014 not an error to route around. Leaving a claim behind is recoverable without this call: the next run positively determines your run terminal from its status and takes the directory over.",
+      z.object({ dirPath: z.string().trim().min(1) }),
+      async (body) => client.requestJson("POST", "/workspace-dir-claims/release", { body }),
+    ),
+    makeTool(
       "paperclipReleaseIssue",
       "Release your checkout on an issue: unassigns it and resets it to todo (regardless of what status it was in before checkout — this is not a revert). Inverse of paperclipCheckoutIssue — use when you can no longer make progress and want another agent to be able to pick it up.",
       z.object({ issueId: issueIdSchema }),
