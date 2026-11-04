@@ -17,6 +17,13 @@ const ID_PATTERN = /^\d+$/;
 const POLL_INTERVAL_MS = 5_000;
 const CLAIM_BATCH = 4;
 const STALE_PROCESSING_MS = 60_000;
+// A `capturing` row older than this was never activated: it was captured while
+// dispatch was off (capture-only) or while no worker ran, since a live worker
+// requeues an unactivated row after STALE_PROCESSING_MS. Replaying it would post
+// `pending` and send a dispatch per row (11,161 rows had built up by 2026-11-04),
+// while the consumer's heartbeat full sweep already reconciles every head such a
+// row names. So it is expired instead of requeued.
+const CAPTURE_REPLAY_WINDOW_MS = 10 * 60_000;
 const RETRY_DELAYS_MS = [5_000, 30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000, 2 * 60 * 60_000];
 const PR_ACTIONS = new Set([
   "opened",
@@ -673,6 +680,22 @@ export async function activateGithubReviewGateDelivery(
 }
 
 export async function resetStaleGithubReviewGateDeliveries(db: Db, now = new Date()): Promise<number> {
+  const expired = await db
+    .update(githubReviewGateDeliveries)
+    .set({ status: "expired", lastError: "review_gate_capture_expired", updatedAt: now })
+    .where(
+      and(
+        eq(githubReviewGateDeliveries.status, "capturing"),
+        lt(githubReviewGateDeliveries.createdAt, new Date(now.getTime() - CAPTURE_REPLAY_WINDOW_MS)),
+      ),
+    )
+    .returning({ id: githubReviewGateDeliveries.id });
+  if (expired.length > 0) {
+    logger.info(
+      { count: expired.length },
+      "github-review-gate-authority: expired captured deliveries too old to replay",
+    );
+  }
   const staleBefore = new Date(now.getTime() - STALE_PROCESSING_MS);
   const rows = await db
     .update(githubReviewGateDeliveries)

@@ -898,8 +898,20 @@ githubApp:
   # It fails loud — GitHub retries a 503 — but while it fails, other
   # webhook-driven behaviour for that repo stops too, including agent PR wakes.
   # Step 5 is not pre-authorized; it needs the soak numbers first.
+  #
+  # Step 5 taken 2026-11-04 on Omar's go, with two preconditions:
+  #   * Penstock's consumer runs a targeted dispatch `targeted-only` (one PR, no
+  #     all-heads sweep; review-gate-action#73). Without it every dispatch here
+  #     costs a full sweep (~1,700 REST calls) and ~650 deliveries a day would
+  #     exhaust both of the consumer's rate budgets. Deploy this only after that.
+  #   * The 11,161-row capture-only backlog is expired, not replayed
+  #     (CAPTURE_REPLAY_WINDOW_MS in github-review-gate-authority.ts); the
+  #     consumer's heartbeat sweep covers every head those rows named.
+  # Step 6's "authored by App 3966421" is superseded: penstock#3111 moved the
+  # success writer to github-actions[bot]. This server still posts `pending` as
+  # the App, which no reader takes for a success.
   reviewGateCaptureEnabled: true
-  reviewGateEnabled: false
+  reviewGateEnabled: true
   reviewGateRepositories:
     - Blockcast/penstock-llm-proxy-core
   reviewGateExpectedAppId: "3966421"

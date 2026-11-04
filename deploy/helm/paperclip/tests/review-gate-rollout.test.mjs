@@ -28,11 +28,11 @@ function render(template, extraArgs = []) {
   );
 }
 
-// PEN-2073 step 3 taken 2026-10-04 (BLO-38934): capture is ON in
-// values.blockcast.yaml, the authority is still OFF. Capture-only performs a
-// database insert and makes no GitHub call, so this asserts the live rollout
-// state rather than the pre-step-3 "both off".
-test("Blockcast rollout captures deliveries with the authority still disabled", () => {
+// PEN-2073 step 3 taken 2026-10-04 (BLO-38934), step 5 on 2026-11-04 (Omar's
+// go, once penstock's consumer runs a targeted dispatch `targeted-only`): capture
+// and the authority are both ON in values.blockcast.yaml. This asserts the live
+// rollout state.
+test("Blockcast rollout runs the authority on top of capture", () => {
   for (const template of ["templates/statefulset.yaml", "templates/deployment-api.yaml"]) {
     const extraArgs = template.endsWith("deployment-api.yaml")
       ? ["--set", "api.enabled=true"]
@@ -42,8 +42,8 @@ test("Blockcast rollout captures deliveries with the authority still disabled", 
       rendered,
       /- name: PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED\n\s+value: "true"/,
     );
-    // The step-5 flag. Nothing in this repo writes a GitHub status until it is set.
-    assert.doesNotMatch(rendered, /- name: PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED/);
+    // The step-5 flag: with it, this server posts `pending` and dispatches.
+    assert.match(rendered, /- name: PAPERCLIP_GITHUB_REVIEW_GATE_ENABLED\n\s+value: "true"/);
     assert.match(
       rendered,
       /- name: PAPERCLIP_GITHUB_REVIEW_GATE_REPOSITORIES\n\s+value: "Blockcast\/penstock-llm-proxy-core"/,
@@ -68,6 +68,8 @@ test("capture disabled renders no review-gate configuration", () => {
   const rendered = render("templates/statefulset.yaml", [
     "--set",
     "githubApp.reviewGateCaptureEnabled=false",
+    "--set",
+    "githubApp.reviewGateEnabled=false",
   ]);
 
   for (const name of [
@@ -87,6 +89,8 @@ test("capture rollout renders durable inbox configuration without authority", ()
     "api.enabled=true",
     "--set",
     "githubApp.reviewGateCaptureEnabled=true",
+    "--set",
+    "githubApp.reviewGateEnabled=false",
   ]);
 
   assert.match(rendered, /- name: PAPERCLIP_GITHUB_REVIEW_GATE_CAPTURE_ENABLED\n\s+value: "true"/);
