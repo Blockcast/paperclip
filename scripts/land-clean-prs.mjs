@@ -2975,10 +2975,24 @@ function reportRotted(rotted) {
  * ⛔ THE POINT IS THAT IT IS NOT 1. Every other outcome this script can reach
  * already spends 0, 1 or 2:
  *
- *   0  measured, nothing stranded          `alarmExitCode`
- *   1  measured, cohort non-empty          `alarmExitCode`
- *   2  `--alarm` + `--apply` misuse        `main`
- *   3  COULD NOT MEASURE                   this
+ *   0  measured, nothing wrong                    `alarmExitCode`
+ *   1  measured, a PR is stranded or starved      `alarmExitCode`
+ *   2  `--alarm` + `--apply` misuse               `main`
+ *   3  COULD NOT MEASURE                          `main` AND `alarmExitCode`
+ *
+ * ⚠ `3` is spent from TWO places, and they are the same claim at two scales:
+ * `main` when the sweep itself threw, and `alarmExitCode` when the sweep
+ * finished but PEN-5442's `unreadable` cohort is the only non-empty one. Both
+ * mean "this run did not look at everything, so do not read it as health".
+ *
+ * That second site exists because the per-repo catch landed AFTER the first
+ * draft of this constant and quietly took the headline case back: a transient
+ * 5xx exhausting `fetchOpenPrs`'s retries is not fatal, so `repoRunner` catches
+ * it, pushes the repo onto `unreadable` and returns `[]` — and `alarmExitCode`
+ * then spent `1` for it. The dominant "GitHub 502'd" case was spelled as a
+ * stranded cohort again, which is the exact defect this constant was added to
+ * remove. A table that disagrees with the code is worse than no table, because
+ * a workflow `if:` gets written against the table.
  *
  * Before this existed, an abort exited 1 — the node default for an uncaught
  * throw, and the same integer `alarmExitCode` spends to report a real stranded
@@ -2995,33 +3009,68 @@ export const EXIT_UNMEASURED = 3;
 
 /**
  * Says, on stderr, that the fire stopped before it finished — and reports
- * whatever cohort it HAD computed (PEN-5314).
+ * whatever alarming cohorts it HAD computed (PEN-5314).
  *
- * Reporting the partial cohort is deliberate: "I could not finish, and here is
+ * Reporting the partial cohorts is deliberate: "I could not finish, and here is
  * what I found before I stopped" is strictly more useful than either half. It
  * is explicitly NOT a verdict, and the text says so, because the rows below it
  * are a prefix of the real answer and a reader must not treat a short list as
  * a complete one.
+ *
+ * ⛔ EVERY alarming cohort, not just the first. `stranded` and `starved` are
+ * both collected by reference as the sweep runs, so each is a genuine prefix
+ * of its own answer; reporting one and not the other makes the summary quietly
+ * untrue for the arm it omits, in a run whose whole claim is "here is what I
+ * had". `unreadable` is deliberately NOT here — it is printed unconditionally
+ * by `reportUnreadable` from `main`'s `finally`, which runs before this.
  */
-export function reportUnmeasured(error, stranded = [], { alarm = false, log = console.error } = {}) {
+export function reportUnmeasured(
+  error,
+  stranded = [],
+  // ⛔ `starved` rides in the OPTIONS BAG, not in a third positional slot.
+  // Both of this file's last two parameter insertions bound an existing
+  // caller's options bag to the new positional in silence (BLO-51665's
+  // rate-limit test, then PEN-5391's spread), which is why `runRepo` now opens
+  // with an `Array.isArray` throw. A key cannot collide with a bag, so this
+  // insertion cannot repeat that — every existing two- and three-argument
+  // caller keeps its exact meaning.
+  { alarm = false, starved = [], log = console.error } = {},
+) {
   const message = ghErrorMessage(error).trim().split("\n")[0];
   log(
     `\nDID NOT MEASURE: the sweep stopped before every repo was classified — ${message}\n` +
       `Exiting ${EXIT_UNMEASURED}, which is NOT the alarm code. This run makes no claim ` +
       "about whether any PR is stranded; it never finished looking.",
   );
+  // One line is the right amount of a `gh` failure and the wrong amount of a
+  // programming error: for the latter the first line is the least useful part
+  // of what Node would otherwise have printed, and the frames are the whole
+  // diagnosis. `ghErrorMessage` prefers `stderr`, so its ABSENCE is the tell
+  // that this throw did not come from a subprocess.
+  if (!error?.stderr && error?.stack) log(error.stack);
   if (!alarm) return;
-  if (stranded.length === 0) {
+  // Every alarming cohort collected so far, not just the first one. These are
+  // gathered by reference as the sweep runs, so each is a genuine prefix of
+  // its real answer; omitting one makes "here is what I found before I
+  // stopped" quietly untrue for that cohort.
+  const partial = [
+    ["unlanded-eligible", stranded ?? []],
+    ["cap-starved", starved ?? []],
+  ].filter(([, cohort]) => cohort.length > 0);
+  if (partial.length === 0) {
     log(
-      "No unlanded-eligible PR had been found when the sweep stopped — but the repos " +
-        "after the failure were never read, so this is an empty PREFIX, not an all-clear.",
+      "No unlanded-eligible or cap-starved PR had been found when the sweep stopped — but " +
+        "the repos after the failure were never read, so this is an empty PREFIX, not an " +
+        "all-clear.",
     );
     return;
   }
-  log(
-    `Partial unlanded-eligible cohort found before stopping (${stranded.length}, ` +
-      `possibly incomplete) — ${stranded.join(", ")}.`,
-  );
+  for (const [label, cohort] of partial) {
+    log(
+      `Partial ${label} cohort found before stopping (${cohort.length}, ` +
+        `possibly incomplete) — ${cohort.join(", ")}.`,
+    );
+  }
 }
 
 /**
@@ -3048,7 +3097,29 @@ export function reportUnmeasured(error, stranded = [], { alarm = false, log = co
  * for UNLANDED_ELIGIBLE_HOURS" asserted over a repo this fire never read. That
  * is the fail-OPEN direction and it is exactly the shape of silent all-clear
  * this detector exists to rule out, so the skip and this term ship together: a
- * repo that went unread makes the alarm red on its own.
+ * repo that went unread goes NON-ZERO on its own.
+ *
+ * ⚠ It goes non-zero as `EXIT_UNMEASURED`, not as `1`, and the distinction is
+ * the entire point of PEN-5314 rather than a tidier spelling of it. `1` is a
+ * MEASURED claim — "this fire looked, and found a PR nobody landed". An
+ * unreadable repo is the opposite claim: this fire did not look. Spending `1`
+ * for it rebuilt the exact ambiguity `EXIT_UNMEASURED` was added to remove,
+ * and it did so for the DOMINANT case, since a transient 5xx that outlives its
+ * retries arrives here rather than at `main`'s `sweepError` branch.
+ *
+ * The fail-open guard above is untouched by that change and does not depend on
+ * which integer is spent: `EXIT_UNMEASURED` is non-zero, so the step still
+ * fails and the schedule still goes red. `landing-sweep.yml` reads zero vs
+ * non-zero and nothing finer.
+ *
+ * ⛔ PRECEDENCE, when more than one cohort is non-empty: a measured alarm wins.
+ * `stranded`/`starved` are complete verdicts over the repos that WERE read —
+ * the per-repo catch is per-repo, so the others ran in full — and a real PR to
+ * act on outranks a report about transport. `1` surfaces that; the `unreadable`
+ * ALARM block still names the skipped repos, so nothing is lost by it. This is
+ * the one asymmetry with `main`'s `sweepError` path, which spends
+ * `EXIT_UNMEASURED` even with a non-empty `stranded` — correctly, because there
+ * the sweep ABORTED, so that cohort is a prefix rather than a verdict.
  *
  * `starved` (PEN-5391) is a THIRD argument rather than a widening of either
  * existing one because the cohorts are reported separately and have different
@@ -3063,11 +3134,17 @@ export function reportUnmeasured(error, stranded = [], { alarm = false, log = co
  * not happened anyway, which is a statement about the routine itself.
  */
 export function alarmExitCode(stranded, unreadable = [], starved = []) {
-  return (stranded ?? []).length > 0 ||
-    (unreadable ?? []).length > 0 ||
-    (starved ?? []).length > 0
-    ? 1
-    : 0;
+  // MEASURED alarms first. A stranded or cap-starved PR is a thing to act on,
+  // and `1` is the code that says so. An unreadable repo standing beside one
+  // does not soften that verdict and must not mask it — the `ALARM:` block
+  // still names the skipped repos either way.
+  if ((stranded ?? []).length > 0 || (starved ?? []).length > 0) return 1;
+  // Nothing measured went wrong AND a repo went unread. That is definitionally
+  // "could not measure" by this file's own words — `reportUnreadable` prints
+  // "This fire asserts nothing about these" — so it spends EXIT_UNMEASURED
+  // rather than borrowing the stranded cohort's integer.
+  if ((unreadable ?? []).length > 0) return EXIT_UNMEASURED;
+  return 0;
 }
 
 function main() {
@@ -3121,7 +3198,7 @@ function main() {
     // `stranded` would spend 0 — a confident all-clear printed over repos that
     // were never read. That is precisely the fail-open shape
     // `assertPrListComplete` exists to prevent one layer down.
-    reportUnmeasured(sweepError, stranded, { alarm });
+    reportUnmeasured(sweepError, stranded, { alarm, starved });
     process.exit(EXIT_UNMEASURED);
   }
 
