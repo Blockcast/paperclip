@@ -2940,6 +2940,50 @@ describe("fetchOpenPrs splits the listing and joins on number (PEN-5442)", () =>
       /502/,
     );
   });
+
+  it("threads the injected `run` into the merge-queue read, instead of falling back to the real gh", () => {
+    // The defect this pins. `fetchOpenPrs` takes an injected `run` and threads
+    // it into every read it makes except one: `fetchMergeQueueEntries` was
+    // called as `(repo, base)`, so its third parameter fell back to the
+    // module-level `gh`. None of the tests above caught it because none of
+    // their listing rows carry `baseRefName`, and `mergeQueueEntryFor` returns
+    // before the call is made when the base is absent.
+    //
+    // Assert on what the stub SAW rather than on the verdict, because the
+    // verdict cannot distinguish the two: `fetchMergeQueueEntries` catches its
+    // own throws and returns `null`, so the fallback degraded to "queue
+    // unread" in silence. Keyed this way the test fails deterministically if
+    // the argument is dropped again, with or without a network.
+    const seen = [];
+    const based = [{ ...listing[0], baseRefName: "master" }];
+    const prs = fetchOpenPrs("a/one", {
+      run: (args) => {
+        seen.push(args);
+        if (args[0] === "pr" && args[1] === "list") return JSON.stringify(based);
+        if (args[0] === "api" && args[1] === "graphql") {
+          return JSON.stringify({
+            data: {
+              repository: {
+                mergeQueue: {
+                  entries: {
+                    pageInfo: { hasNextPage: false },
+                    nodes: [{ position: 1, state: "QUEUED", enqueuedAt: "2026-11-04T08:50:28Z", pullRequest: { number: 11 } }],
+                  },
+                },
+              },
+            },
+          });
+        }
+        throw new Error(`unexpected gh call: ${args.join(" ")}`);
+      },
+      mergeStates: () => new Map([[11, "UNKNOWN"]]),
+    });
+    assert.ok(
+      seen.some((args) => args[0] === "api" && args[1] === "graphql" && args.includes("branch=master")),
+      "the merge-queue read must arrive at the injected run, not at the real gh",
+    );
+    assert.equal(prs[0].mergeQueueEntry?.position, 1, "and the stub's answer must reach the row");
+  });
 });
 
 describe("fetchMergeStates reads merge states at a controlled page size (PEN-5442)", () => {
