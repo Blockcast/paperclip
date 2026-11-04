@@ -884,7 +884,7 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     const { companyId, agentId } = await createCompany();
     await insertApproval({ companyId, agentId, gate: gateFor(13) });
     const fetchRun = vi.fn(async () => found("waiting", null));
-    let tick: (() => void) | null = null;
+    let tick: (() => void | Promise<void>) | null = null;
     const scheduler: ApprovalGateReconcilerScheduler = {
       setInterval: (cb) => {
         tick = cb;
@@ -894,11 +894,55 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     };
 
     const stop = startApprovalGateReconciler(db, 60_000, { fetchRun, logger: silentLogger }, scheduler);
+    // `startApprovalGateReconciler` starts the immediate pass synchronously, so the
+    // in-flight guard is already armed on this line: the call is deterministically
+    // dropped and hands back that running pass, which awaiting settles. Waiting on
+    // the call count instead resolves mid-pass and the next tick is swallowed whole
+    // (PEN-5468).
+    await tick?.();
     // The immediate pass is what drains pre-existing debris without a full interval wait.
-    await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(1));
+    expect(fetchRun).toHaveBeenCalledTimes(1);
 
-    tick?.();
-    await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(2));
+    await tick?.();
+    expect(fetchRun).toHaveBeenCalledTimes(2);
+    stop();
+  });
+
+  // PEN-5468. The ticker drops a tick that lands while a pass is still in flight,
+  // silently and with no retry. That is intended for the real `setInterval`, but it
+  // made every scheduler-driven test here timing-dependent: they waited on
+  // `fetchRun`'s call count, which is reached *during* a pass, then fired the next
+  // tick into the in-flight window and saw it swallowed whole — 0 further calls,
+  // never 1, and with a fake scheduler nothing ever fires again. Four CI failures
+  // across two unrelated PRs. Pinning the return value is what makes sequencing
+  // ticks independent of how long a sweep takes to settle.
+  it("hands back the running sweep when a tick lands mid-pass instead of dropping it silently", async () => {
+    const { companyId, agentId } = await createCompany();
+    await insertApproval({ companyId, agentId, gate: gateFor(21) });
+    const fetchRun = vi.fn(async () => found("waiting", null));
+    let tick: (() => void | Promise<void>) | null = null;
+    const scheduler: ApprovalGateReconcilerScheduler = {
+      setInterval: (cb) => {
+        tick = cb;
+        return 0 as unknown as ReturnType<typeof setInterval>;
+      },
+      clearInterval: () => {},
+    };
+
+    const stop = startApprovalGateReconciler(db, 60_000, { fetchRun, logger: silentLogger }, scheduler);
+    // `startApprovalGateReconciler` launches the start-up pass synchronously, so this
+    // call is guaranteed to land inside the in-flight window. It must hand that pass
+    // back rather than return nothing, and it must not start a second one.
+    const handedBack = tick?.();
+    expect(handedBack).toBeInstanceOf(Promise);
+    await handedBack;
+    expect(fetchRun).toHaveBeenCalledTimes(1);
+
+    // Awaiting the handed-back sweep must leave the guard disarmed, so the next tick
+    // is guaranteed to start a pass rather than being dropped in turn. This is the
+    // property the three tests around this one rely on to sequence their ticks.
+    await tick?.();
+    expect(fetchRun).toHaveBeenCalledTimes(2);
     stop();
   });
 
@@ -1020,7 +1064,7 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     // that restarts at the oldest card can never reach the third.
     it("reaches a card behind the budget on a later tick instead of never", async () => {
       const { deadId, deadRunId, fetchRun } = await starvedQueue("AGRG", 2);
-      let tick: (() => void) | null = null;
+      let tick: (() => void | Promise<void>) | null = null;
       const scheduler: ApprovalGateReconcilerScheduler = {
         setInterval: (cb) => {
           tick = cb;
@@ -1036,22 +1080,21 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
         scheduler,
       );
       // Tick 1 spends the whole budget on the live head and never sees the dead card.
-      await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(2));
+      // The guard is armed here, so this awaits that pass rather than starting one.
+      await tick?.();
+      expect(fetchRun).toHaveBeenCalledTimes(2);
       expect(fetchRun.mock.calls.map(([input]) => input.runId)).not.toContain(deadRunId);
       expect((await approvalRow(deadId))?.status).toBe("pending");
 
-      tick?.();
-
       // Tick 2 resumes behind the head and retires it.
-      await vi.waitFor(async () =>
-        expect((await approvalRow(deadId))?.status).toBe("cancelled"),
-      );
+      await tick?.();
+      expect((await approvalRow(deadId))?.status).toBe("cancelled");
       stop();
     });
 
     it("returns to the oldest card after the rotation completes", async () => {
       const { deadRunId, liveRunIds, fetchRun } = await starvedQueue("AGRH", 2);
-      let tick: (() => void) | null = null;
+      let tick: (() => void | Promise<void>) | null = null;
       const scheduler: ApprovalGateReconcilerScheduler = {
         setInterval: (cb) => {
           tick = cb;
@@ -1066,15 +1109,18 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
         { fetchRun, maxLookups: 2, batchSize: 2, logger: silentLogger },
         scheduler,
       );
-      await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(2));
+      // Tick 1 is already in flight when this line runs, so the guard drops this call
+      // and returns that pass; awaiting it settles the sweep instead of merely
+      // observing its second lookup (PEN-5468).
+      await tick?.();
+      expect(fetchRun).toHaveBeenCalledTimes(2);
 
       // Tick 2 finishes the pass (one card left), so tick 3 wraps to the head again.
-      tick?.();
-      await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(3));
+      await tick?.();
+      expect(fetchRun).toHaveBeenCalledTimes(3);
       fetchRun.mockClear();
 
-      tick?.();
-      await vi.waitFor(() => expect(fetchRun).toHaveBeenCalledTimes(2));
+      await tick?.();
       // Back at the oldest two cards — the head is re-checked, not abandoned. A card
       // whose gate dies while it sits in the head must still be retired eventually,
       // which is what rotating rather than advancing-forever buys.
