@@ -258,6 +258,14 @@ const CONTENTION_SENSITIVE_STEPS = [
   // the two uncensored runs (a contended agent pod) took 162s and 192s. The
   // floor is what this list enforces; sizing above it is the step's own call.
   "Test vendored-provenance union-merge invariants (BLO-34872)",
+  // PEN-5561. Not fork-heavy -- it is I/O- and registry-bound, which reaches
+  // the same place by a different road: its wall time tracked runner disk
+  // contention rather than its own work. At the 1m bound it killed 6 of 285
+  // executed runs over 2026-11-02..04, 5 of them on arc-merge-queue where each
+  // one evicted a PR from the queue. Its p100 is censored AT that bound, so
+  // the sample cannot bound it from above; the worst healthy run was 58s, i.e.
+  // 97% of the budget it was given. Sized to 4m at the step, above this floor.
+  "Test brace-expansion security override",
 ];
 
 function assertContentionFloor(steps) {

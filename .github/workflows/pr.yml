@@ -1328,11 +1328,44 @@ jobs:
       - name: Test brace-expansion security override
         if: ${{ !cancelled() }}
         run: pnpm run test:brace-expansion-security-override
-        timeout-minutes: 1
+        # PEN-5561. At 1m this killed 6 of 285 executed runs over 2026-11-02..04
+        # -- 5 of 105 on arc-merge-queue, every one of those a queue eviction
+        # (#3341 and #3377 among them) -- while the worst HEALTHY run cleared
+        # the same wall by 2s.
+        #
+        # Both BLO-35615 forms floor at 1 here, and neither can see why:
+        #   primary: ceil( W95 / (F * 60) ) = ceil( 10.0 / 12.6 ) = 1
+        #            W95 = 10.0 CPU-seconds, the max of n=7 invocations of the
+        #                  npm script (user+sys, post-fix).
+        #            F   = 0.21 cores, the arc-light supply floor this job's own
+        #                  cap is derived from -- the worse of its two pools.
+        #   floor:   ceil( 6 * T_best / 60 ) = ceil( 6 * 7 / 60 ) = 1
+        #            T_best = 7s, fastest healthy CI run of this step, n=285.
+        #
+        # Both forms weigh CPU work against CPU supply, and this step never
+        # overran on CPU -- it overran on WAIT: disk I/O for the fixture copy,
+        # then a cold npm-registry resolve. CPU-seconds is invariant to supply
+        # by construction, which is precisely what makes it blind here. Both
+        # forms are LOWER bounds on a hang detector (see the job cap above), so
+        # 4m sits above the floor on the wait term they do not count:
+        #   - 17x the post-fix p100 measured off-runner (13.5s), so it reads as
+        #     a hang detector rather than a performance budget;
+        #   - 4.1x the worst healthy PRE-fix run (58s), so it still absorbs the
+        #     entire observed distribution if the fixture change in
+        #     scripts/brace-expansion-security-override.test.js turns out to buy
+        #     less on a runner than it does off one.
+        # Held at or above the floor by CONTENTION_SENSITIVE_STEPS in
+        # policy-node-test-timeouts.test.mjs.
+        timeout-minutes: 4
 
       - name: Test postcss security override
         if: ${{ !cancelled() }}
         run: pnpm run test:postcss-security-override
+        # PEN-5561 measured this the same way, on the suspicion it shared the
+        # shape of the step above. It does not: it reads package.json and
+        # pnpm-lock.yaml in place and regexes them -- no fixture copy, no
+        # registry. n=284 executed runs over the same window: p50 1s, p95 3s,
+        # p100 4s, zero overruns on either pool. 1m is 15x its p100; left as is.
         timeout-minutes: 1
 
       # Named "smoke" but it reaches no network: it extracts shell functions
