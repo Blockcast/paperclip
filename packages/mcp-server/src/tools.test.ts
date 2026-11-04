@@ -237,6 +237,26 @@ describe("paperclip MCP tools", () => {
     );
   });
 
+  // PEN-5481: `monitorStatus` is the only list field that separates a FIRED
+  // monitor a sweep still owns from a CLEARED one nothing owns — every other
+  // list column reads identically on both. The description is the only place a
+  // detector author learns the field exists at all, so it has to carry the
+  // deploy-skew gate and the null meaning, not merely name the field: absent
+  // read as null scores every row as having no monitor, which is the fail-open
+  // direction, and null read as "not triggered" conflates "never armed" with
+  // "armed and cleared".
+  it("paperclipListIssues documents monitorStatus with its null meaning and skew gate", () => {
+    const { description } = getTool("paperclipListIssues");
+    expect(description).toContain("`monitorStatus` (PEN-5481)");
+    expect(description).toContain('"scheduled" | "triggered" | "cleared" | null');
+    expect(description).toContain("`null` means NO MONITOR WAS EVER ARMED on this row");
+    expect(description).toContain('has("monitorStatus")');
+    expect(description).toContain("ABSENT IS NOT `null`");
+    // The decision not to project `timeoutAt` has to travel with the field, or
+    // the next detector re-derives the very read it was excluded to prevent.
+    expect(description).toContain("`timeoutAt` is deliberately NOT projected");
+  });
+
   // The shared `offset` hint (paperclipListIssues, paperclip_search_issues) is
   // read in isolation by a caller paging; on an older server a truncated result
   // is never observable, and the window is raw (pre-ACL), so the increment is

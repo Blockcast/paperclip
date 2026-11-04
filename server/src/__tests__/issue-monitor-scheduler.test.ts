@@ -2390,12 +2390,20 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     });
   });
 
-  // Control: a triggered monitor whose timeoutAt has not yet passed is not a
-  // BLO-25865 instance — it is simply mid-flight, waiting on its woken run.
-  it("leaves a triggered monitor alone until its timeout actually passes", async () => {
-    const { issueId, timeoutAt } = await seedExpiredTriggeredFixture();
+  // Control: a triggered monitor inside the stall grace is not a BLO-25865
+  // instance — it is simply mid-flight, waiting on its woken run.
+  //
+  // PEN-5481: this control used to tick at `timeoutAt - 1h` and read "until its
+  // timeout actually passes", which only held while the stall arm was gated on
+  // `timeoutAt is null`. The fixture's default deadline is 24h out and the grace
+  // is 4h, so that tick now lands well past the grace and the row is correctly
+  // reaped as `trigger_stalled`. The honest control is the grace window, so the
+  // tick moves inside it; "a future deadline does not suppress the grace" is
+  // asserted positively below.
+  it("leaves a triggered monitor alone inside the stall grace", async () => {
+    const { issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture();
     const heartbeat = createHeartbeat();
-    const tickAt = new Date(timeoutAt!.getTime() - 60 * 60 * 1000);
+    const tickAt = new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS - 60 * 1000);
 
     await heartbeat.tickTimers(tickAt);
 
@@ -2526,10 +2534,13 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(recoveryWakeups).toHaveLength(1);
   });
 
-  // AC3 / BLO-35155: the live-run guard is scoped to the no-`timeoutAt` fallback
-  // only. An explicit operator deadline is authoritative and still expires at its
-  // instant even with a queued run outstanding. This is what fails if the guard
-  // is attached to the wrong branch of the OR.
+  // AC3 / BLO-35155: the live-run guard is scoped to the stall fallback only. An
+  // explicit operator deadline is authoritative and still expires at its instant
+  // even with a queued run outstanding. This is what fails if the guard is
+  // attached to the wrong branch of the OR. (PEN-5481: the fallback is no longer
+  // the "no-`timeoutAt`" branch — it covers future deadlines too — but it is
+  // still the only branch the live-run guard hangs off, which is what keeps a
+  // PAST deadline expiring here.)
   it("still expires a past explicit timeoutAt while a run for the issue is queued", async () => {
     const { companyId, agentId, issueId, timeoutAt, lastTriggeredAt } = await seedExpiredTriggeredFixture();
     await db.insert(heartbeatRuns).values({
@@ -2717,22 +2728,134 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, runId));
   });
 
-  // Regression guard: an operator-supplied deadline stays authoritative. A monitor
-  // whose timeoutAt is still in the future is NOT pre-empted by the grace window,
-  // even once the trigger is older than the grace.
-  it("does not let the stall grace pre-empt a future explicit timeoutAt", async () => {
-    const { issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({
-      timeoutAt: new Date(new Date("2026-04-10T00:00:00.000Z").getTime() + 30 * 24 * 60 * 60 * 1000),
-    });
+  // PEN-5481 AC(a): a triggered monitor carrying an explicit FUTURE `timeoutAt`
+  // is covered by the stall grace like any other. This test asserted the exact
+  // opposite ("does not let the stall grace pre-empt a future explicit
+  // timeoutAt") and that was the defect: the two arms of the OR were mutually
+  // exclusive on `timeoutAt`, so such a monitor matched neither and no net owned
+  // the row until its own deadline. The dispatch-lapse sweep does not cover it
+  // either — it joins on `executionRunId`, and a fire that leaves none is
+  // invisible to the join. Measured on PEN-5386: a 48h deadline bought a ~51h
+  // blind spot.
+  //
+  // Assert the ARM, not just the outcome: `clearReason` has to be
+  // `trigger_stalled`, because the deadline is 30 days out and has NOT been
+  // reached. `timeout_exceeded` here would mean the recovery comment tells the
+  // owner "its timeout was reached" about a deadline a month away.
+  it("recovers a triggered monitor with a future explicit timeoutAt once the stall grace passes", async () => {
+    const futureTimeoutAt = new Date(new Date("2026-04-10T00:00:00.000Z").getTime() + 30 * 24 * 60 * 60 * 1000);
+    const { issueId, agentId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: futureTimeoutAt });
     const heartbeat = createHeartbeat();
     const tickAt = new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000);
+    expect(tickAt.getTime()).toBeLessThan(futureTimeoutAt.getTime());
 
     await heartbeat.tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt).toBeNull();
+    const monitorState = parseIssueExecutionState(issue.executionState)?.monitor;
+    expect(monitorState).toMatchObject({
+      status: "cleared",
+      clearReason: "trigger_stalled",
+    });
+    expect(monitorState?.clearedAt).not.toBeNull();
+
+    // The recovery policy still fires, which is the whole point — the row
+    // regains a wake source instead of sitting dark until the deadline.
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(1);
+    expect(recoveryWakeups[0]?.payload).toMatchObject({
+      issueId,
+      clearReason: "trigger_stalled",
+    });
+
+    // `scheduledAtIso` — "when did the road run out" — is logged as
+    // `nextCheckAt` on the exhaustion activity. For a stall that is the sweep
+    // instant, not the deadline: recording the 30-day `timeoutAt` here would
+    // write down a wake path that does not exist, from the very recovery that
+    // fired BECAUSE the row had none. It also feeds the wake's idempotency key,
+    // so a constant there would suppress the second wake of a monitor that
+    // stalls twice before its deadline.
+    const exhausted = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.find((row) => row.action === "issue.monitor_exhausted"));
+    expect(exhausted?.details).toMatchObject({
+      clearReason: "trigger_stalled",
+      nextCheckAt: tickAt.toISOString(),
+      // The monitor's own deadline is still reported, unchanged and separately —
+      // the budget bound is not erased, it just stops standing in for liveness.
+      timeoutAt: futureTimeoutAt.toISOString(),
+    });
+  });
+
+  // PEN-5481 AC(b): the live-consumer guard is what now distinguishes "stalled"
+  // from "mid-flight", and it must apply to a future-`timeoutAt` monitor exactly
+  // as it does to a null-`timeoutAt` one. Without this, dropping the mutual
+  // exclusion would reap monitors whose own woken run is merely still queued —
+  // the BLO-35155 false positive that the `timeoutAt` workaround was invented
+  // for in the first place.
+  it("leaves a future explicit timeoutAt alone past the grace while a run for the issue is queued", async () => {
+    const futureTimeoutAt = new Date(new Date("2026-04-10T00:00:00.000Z").getTime() + 30 * 24 * 60 * 60 * 1000);
+    const { companyId, agentId, issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({
+      timeoutAt: futureTimeoutAt,
+    });
+    const queuedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: queuedRunId,
+      companyId,
+      agentId,
+      status: "queued",
+      invocationSource: "scheduled",
+      createdAt: new Date(lastTriggeredAt.getTime() + 1000),
+      contextSnapshot: { issueId, wakeReason: "issue_monitor_due" },
+    });
+
+    const heartbeat = createHeartbeat();
+    await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
     expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
       status: "triggered",
       clearReason: null,
+    });
+    expect(issue.monitorWakeRequestedAt).toBeNull();
+
+    const recoveryWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId))
+      .then((rows) => rows.filter((row) => row.reason === "issue_monitor_recovery"));
+    expect(recoveryWakeups).toHaveLength(0);
+
+    // The queued run is never dispatched (the agent has no work left), so retire
+    // it explicitly rather than let afterEach's settle-wait block on it.
+    await db.update(heartbeatRuns).set({ status: "failed" }).where(eq(heartbeatRuns.id, queuedRunId));
+  });
+
+  // PEN-5481: the BLO-25865 budget meaning of `timeoutAt` is preserved — a
+  // deadline SHORTER than the grace still expires the monitor at its own
+  // instant, before the stall arm could ever fire. Dropping the mutual exclusion
+  // must not delay an explicit deadline to the grace.
+  it("still expires an explicit timeoutAt shorter than the stall grace at its own instant", async () => {
+    const lastTriggered = new Date("2026-04-10T00:00:00.000Z");
+    const shortTimeoutAt = new Date(lastTriggered.getTime() + 30 * 60 * 1000);
+    const { issueId } = await seedExpiredTriggeredFixture({ timeoutAt: shortTimeoutAt });
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date(shortTimeoutAt.getTime() + 60 * 1000);
+    expect(tickAt.getTime()).toBeLessThan(lastTriggered.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS);
+
+    await heartbeat.tickTimers(tickAt);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "timeout_exceeded",
     });
   });
 
