@@ -2378,6 +2378,27 @@ export function demoteMergeActions(rows) {
  * BLO-33208) and regrown in the same repos every time. A single-repo sweep is
  * how the other two stay unobserved between cleanups.
  *
+ * ## That paragraph is the intent, and no caller delivers it today
+ *
+ * It has been read as a description of what runs. It is not. Every fire
+ * covers exactly one repo, for two unrelated reasons:
+ *
+ * - `--alarm` (`.github/workflows/landing-sweep.yml`, step "Alarm on PRs that
+ *   have been landable for hours and are still open") pins
+ *   `LAND_CLEAN_PRS_REPO` to the workflow's own repository, which can never be
+ *   a comma-separated list. Un-pinning it alone would not widen the sweep
+ *   either; that step's env block records why.
+ * - `--apply` (the landing routine, which runs outside Actions) covers
+ *   `Blockcast/paperclip` only. Established by its own output rather than by
+ *   its configuration, which is not readable from this repository: sampled
+ *   `Blockcast/paperclip` PRs held on a code-owner review each carry exactly
+ *   one `CODEOWNER_REQUEST_MARKER` comment, while the
+ *   `Blockcast/penstock-llm-proxy-core` PRs under the identical hold carry
+ *   none. PEN-5423 holds the dated per-PR counts.
+ *
+ * So the comma-separation is reachable, but only by whoever configures the
+ * `--apply` routine — not by anything in this repository.
+ *
  * This list is the LAND list, and since PEN-5430 that is all it is. A repo
  * named here has `gh pr merge --auto` armed on its clean PRs. To get a repo's
  * code-owner holds NOTIFIED without that, name it in `notifyRepos()` below —
