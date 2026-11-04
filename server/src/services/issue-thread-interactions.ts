@@ -226,9 +226,36 @@ function isEquivalentCreateRequest(
   input: CreateIssueThreadInteraction,
   actor: InteractionActor,
 ) {
+  // PEN-5505: `continuationPolicy` is deliberately NOT compared.
+  //
+  // This predicate exists to catch an idempotency key reused for a different
+  // *ask* — a different prompt, a different target, a different author. The
+  // continuation policy is not part of the ask: it says what happens to the
+  // author after a human answers, and the human sees the same card either way.
+  //
+  // Comparing it made the 409 reachable by a caller who changed nothing. The
+  // default for `request_confirmation` moved from `none` to `wake_assignee`,
+  // and `input` arrives already defaulted — `validate()` parses the body at the
+  // route boundary, and the MCP tool schema prefaults client-side, so the field
+  // is populated on every real request and "the caller omitted it" is not
+  // observable here. Every `request_confirmation` persisted under the old
+  // default therefore stopped replaying and started returning
+  // `409 ... already exists for a different request` on retry.
+  //
+  // That failure points the wrong way. The keys the docs recommend
+  // (`confirmation:${issueId}:plan:${revisionId}`) are deterministic precisely
+  // so retries reuse them, and a 409 naming "a different request" invites the
+  // caller to mint a fresh key — putting a duplicate card in front of the human
+  // for exactly the pending gates agents retry most. Replaying is the lesser
+  // residual: the caller gets its existing card back, and the response carries
+  // that card's real `continuationPolicy`, so a policy that differs from the
+  // one just requested is visible rather than merely assumed.
+  //
+  // Dropping the term also keeps the next default change from re-breaking
+  // replay the same way; every remaining field is caller-supplied, so none of
+  // them can be skewed by a server-side default.
   return (
     row.kind === input.kind
-    && row.continuationPolicy === input.continuationPolicy
     && (row.idempotencyKey ?? null) === (input.idempotencyKey ?? null)
     && (row.sourceCommentId ?? null) === (input.sourceCommentId ?? null)
     && (row.sourceRunId ?? null) === (input.sourceRunId ?? null)

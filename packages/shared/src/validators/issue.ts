@@ -1694,15 +1694,25 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     // still the right explicit choice where a rejection ends the work (see the
     // reflection-coach gates), and explicit `none` is still honoured.
     //
-    // Rows already persisted with `none` were deliberately NOT backfilled. A
-    // stored policy only matters at the instant the card resolves, so an
-    // un-backfilled card loses exactly the one wake it has lacked since it was
-    // filed, while the thread still records the resolution; an accepted one is
-    // already visible to the PEN-4409 sweep, since `request_confirmation` is in
+    // Rows already persisted with `none` were deliberately NOT backfilled. Such
+    // a card loses exactly the one wake it has lacked since it was filed, while
+    // the thread still records the resolution; an accepted one is already
+    // visible to the PEN-4409 sweep, since `request_confirmation` is in
     // `ACCEPTED_OUTCOME_SWEEP_KINDS`. Against that bounded residual, a blind
     // UPDATE across other agents' pending cards is the larger risk — and the
     // population is unmeasurable from an agent seat, because the only
     // company-scoped listing (`GET /companies/:id/attention`) is board-only.
+    // A backfill would also have to guess intent: `none` was what the MCP tool
+    // sent for an omitted policy AND for an explicitly requested silence, so
+    // the stored value cannot distinguish the two and flipping all of them
+    // would override authors who asked for quiet.
+    //
+    // Do not restate this as "a stored policy only matters at the instant the
+    // card resolves". It does not: the stored value was also a term in
+    // `isEquivalentCreateRequest`, so changing this default made every
+    // already-stored card with an idempotency key start returning 409 on an
+    // unchanged retry. That is handled in the service, by no longer comparing
+    // the policy at all (PEN-5505) — in code, not by migrating data.
     continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
     payload: requestConfirmationPayloadSchema,
   }),
