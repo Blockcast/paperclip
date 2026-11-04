@@ -254,6 +254,13 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * above: the 2026-11-04T08:45Z fire enqueued exactly 10 in 32s
  * (#3368 down to #3215), against 8 in 31s at 02:45Z the same morning.
  *
+ * One thing that per-fire count does NOT tell you: a slot is spent at
+ * ENQUEUE, not at merge. Of the 10 that saturated 08:45Z, six merged,
+ * three were ejected by the merge queue inside 40 min (#3307, #3352,
+ * #3356) and one was still queued an hour later. An ejected PR burns a
+ * slot and lands nothing, so the daily ceiling bounds ATTEMPTS, and the
+ * yield under it is a second quantity to measure before buying more fires.
+ *
  * If that has to be fixed, fix it with fire FREQUENCY, not by raising this
  * number. Raising the cap buys throughput by spending the blast-radius
  * guarantee in the first paragraph, and spends it silently -- nothing about
