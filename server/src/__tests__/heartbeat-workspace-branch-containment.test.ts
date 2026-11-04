@@ -652,22 +652,26 @@ async function expectContainedWorkspaceBranchFailure(input: {
       attempted: false,
       succeeded: false,
       // BLO-32628: a single-claimant worktree in this same git state now
-      // self-heals, so containment here rests on two other refusals — both
-      // real, and which one fires depends on what the call site knows.
-      // Persisted restore passes the execution workspace id, so claimant
-      // contention is visible. Fresh-worktree reuse passes
-      // `executionWorkspaceId: null`, so contention cannot be computed and the
-      // refusal falls to the git-level fact that the fixture's main checkout
-      // still holds the recorded branch.
+      // self-heals, so containment here rests on another refusal that is real
+      // at both call sites — the git-level fact that the fixture's main
+      // checkout still holds the recorded branch.
       //
-      // PEN-5493: contention is now a liveness test rather than a claimant
-      // count, and this fixture's same-workspace sibling holds a running
-      // heartbeat run — so it still contends, and the refusal now names the
-      // holder. The fixture would need its sibling run to reach a terminal
-      // status for this arm to stop firing, which is the point: the exit exists.
-      reason: input.sourceExecutionWorkspaceId
-        ? expect.stringContaining("execution workspace is in use by 1 other non-terminal issue holding a live execution lock")
-        : expect.stringContaining("recorded branch is already checked out in another worktree"),
+      // PEN-5493: contention used to be the refusal at the persisted-restore
+      // call site, because that site passes the execution workspace id and the
+      // old predicate counted claimants (`claimed by 2 non-terminal issues`).
+      // It no longer fires here, and that is correct rather than a regression:
+      // contention is now "does ANOTHER claimant hold a LIVE run", and this
+      // fixture's same-workspace sibling is locked by `runId` — the very run
+      // performing the repair — which `findExecutionWorkspaceLiveClaimants`
+      // excludes by id. A sibling whose only holder is the repairing run is not
+      // a peer, so there is no live holder and the refusal falls through to the
+      // same git-level guard the fresh-worktree site already relied on.
+      //
+      // ⇒ Containment is still proven at both call sites; it just rests on one
+      // refusal instead of two. The contention arm itself is covered directly
+      // in `workspace-runtime.test.ts`, including the real-Postgres pair that
+      // flips a sibling run's status and the lock-free context-issue wake.
+      reason: expect.stringContaining("recorded branch is already checked out in another worktree"),
     }),
   });
   if (input.sourceExecutionWorkspaceId !== undefined) {
