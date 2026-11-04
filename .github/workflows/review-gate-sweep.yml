@@ -337,3 +337,57 @@ jobs:
           # The kill switch: under it every held head qualifies (see above).
           ALLY_GATED_CI_BYPASS: ${{ vars.ALLY_GATED_CI_BYPASS }}
         run: node scripts/ally-verdict-ci.mjs backstop
+
+  # Attestation-lag detector (PEN-5538). The other two jobs here backstop a
+  # LOST event; this one detects a signal that was never PRODUCED, which no
+  # amount of re-firing can recover.
+  #
+  # App 3966421 publishes `ci/ally-head-attested` twice per head: NEUTRAL at
+  # push time, then SUCCESS a few seconds after Ally submits the review.
+  # Measured on #3307's four consecutive heads (2026-11-04), the post-review
+  # pair landed 12s after the review on three of them -- and never at all on
+  # the fourth, whose heavy lanes then stayed held for 2h47m. Nothing anywhere
+  # compared "newest review at this head" against "newest attestation at this
+  # head", so it took a human-equivalent reading check-run timestamps by hand
+  # to find it. That comparison is this job.
+  #
+  # Why it cannot be a step in ally_verdict_backstop above, which already reads
+  # every open PR: that job holds `actions: write` so it can dispatch. This one
+  # only ever reads, and a detector that cannot write is a detector that cannot
+  # make the condition worse. The duplicated GraphQL page walk is ~25 points
+  # against the 1,000/hour GraphQL budget -- cheap beside the separation.
+  #
+  # Thresholds live in the script (ATTESTATION_LAG_{GRACE,ALARM}_SECONDS) and
+  # are deliberately NOT restated here: every figure in this file that was
+  # copied next to its constant has gone stale against it at least once.
+  ally_attestation_lag:
+    name: Ally attestation lag (reviewed heads with no verdict)
+    runs-on: arc-paperclip-light
+    # A hang detector: up to 4 GraphQL pages and no writes at all.
+    timeout-minutes: 10
+    permissions:
+      checks: read
+      contents: read
+      pull-requests: read
+    steps:
+      # Same reasoning as the backstop above: on `schedule` the empty `ref`
+      # falls back to the default branch, and trusted default-branch code is
+      # the only thing this runs.
+      - name: Check out the default branch (trusted code only)
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+
+      # Exits non-zero past the alarm threshold, turning this repo's Actions
+      # tab red -- the same AC4 escalation the sweep job uses, and for the same
+      # reason: a scheduled job's step summary is not read by anyone.
+      - name: Report heads whose Ally review has no attestation behind it
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/ally-verdict-ci.mjs attestation-lag
