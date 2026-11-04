@@ -14,6 +14,7 @@ import {
   formatReport,
   parseArgs,
   parseMergeCommitLog,
+  resolveBaseBranchTip,
 } from "./check-branch-merge-commits.mjs";
 
 const SCRIPT = fileURLToPath(new URL("./check-branch-merge-commits.mjs", import.meta.url));
@@ -249,6 +250,113 @@ test("CLI: a bad range is exit 2 (infrastructure), never a silent pass", () => {
       code = error.status;
     }
     assert.equal(code, 2, "an unreadable range must not be reported as clean");
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+// --- base.sha staleness hardening (PEN-5431) --------------------------------
+//
+// `pull_request.base.sha` lags as the base branch moves (#3358 measured 105
+// commits behind). If the branch is rebased onto a newer master than base.sha,
+// master commits -- including master's own merge commits -- enter the two-dot
+// range and would be reported against an author who did not create them.
+// `master` really does carry merge commits (605/9,303; 1 in the last 500), so
+// this class is small and live, not historical.
+
+/**
+ * master: C1 -> MC (merge of sidecar) -> C2 ; feature branches off C2.
+ * A stale base of C1 puts master's own MC inside `C1..feature`.
+ */
+function makeStaleBaseRepo() {
+  const repoRoot = mkdtempSync(path.join(os.tmpdir(), "merge-commit-stale-"));
+  git(repoRoot, ["init", "--quiet", "--initial-branch", "master"]);
+  git(repoRoot, ["config", "user.email", "test@example.com"]);
+  git(repoRoot, ["config", "user.name", "Test"]);
+  git(repoRoot, ["config", "commit.gpgsign", "false"]);
+  const staleBase = commit(repoRoot, "README.md", "base\n", "C1");
+  git(repoRoot, ["checkout", "--quiet", "-b", "sidecar"]);
+  commit(repoRoot, "sidecar.txt", "side\n", "sidecar work");
+  git(repoRoot, ["checkout", "--quiet", "master"]);
+  git(repoRoot, ["merge", "--no-ff", "--no-gpg-sign", "-m", "Merge sidecar into master", "sidecar"]);
+  commit(repoRoot, "c2.txt", "c2\n", "C2");
+  const masterTip = git(repoRoot, ["rev-parse", "HEAD"]).trim();
+  git(repoRoot, ["checkout", "--quiet", "-b", "feature"]);
+  commit(repoRoot, "feature.txt", "work\n", "feature work");
+  const head = git(repoRoot, ["rev-parse", "HEAD"]).trim();
+  return { repoRoot, staleBase, masterTip, head };
+}
+
+test("resolveBaseBranchTip resolves a local branch and returns null when unresolvable", () => {
+  const { repoRoot, masterTip } = makeStaleBaseRepo();
+  try {
+    assert.equal(resolveBaseBranchTip({ repoRoot, baseRef: "master" }), masterTip);
+    assert.equal(resolveBaseBranchTip({ repoRoot, baseRef: "no-such-branch" }), null);
+    assert.equal(resolveBaseBranchTip({ repoRoot, baseRef: null }), null);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("a stale base.sha would report master's OWN merge commit; excluding the base branch tip removes it", () => {
+  const { repoRoot, staleBase, masterTip, head } = makeStaleBaseRepo();
+  try {
+    // Without the hardening: master's merge commit is attributed to the branch.
+    const naive = findBranchMergeCommits({ repoRoot, base: staleBase, head });
+    assert.equal(naive.length, 1, "precondition: the stale range really does contain master's merge");
+    assert.match(naive[0].subject, /Merge sidecar into master/);
+
+    // With it: gone, because it is reachable from the base branch tip.
+    const hardened = findBranchMergeCommits({ repoRoot, base: staleBase, head, excludeRefs: [masterTip] });
+    assert.deepEqual(hardened, [], "a merge commit the branch did not create must not be reported");
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("the exclusion introduces NO false negative: a branch-authored merge is still caught", () => {
+  const { repoRoot, staleBase } = makeStaleBaseRepo();
+  try {
+    // master must move PAST the branch point first: `git merge --no-ff` is a
+    // no-op ("Already up to date") when the named ref is already an ancestor,
+    // so without this there is no merge commit to catch and the test would
+    // pass vacuously.
+    git(repoRoot, ["checkout", "--quiet", "master"]);
+    commit(repoRoot, "c3.txt", "c3\n", "C3");
+    const newMasterTip = git(repoRoot, ["rev-parse", "HEAD"]).trim();
+
+    // The prohibited remedy, on top of the stale-base shape.
+    git(repoRoot, ["checkout", "--quiet", "feature"]);
+    git(repoRoot, ["merge", "--no-ff", "--no-gpg-sign", "-m", "Merge branch 'master' into feature", "master"]);
+    const head = git(repoRoot, ["rev-parse", "HEAD"]).trim();
+    assert.notEqual(head, newMasterTip, "precondition: a real merge commit was created");
+
+    const hardened = findBranchMergeCommits({ repoRoot, base: staleBase, head, excludeRefs: [newMasterTip] });
+    assert.equal(hardened.length, 1, "the branch's own merge commit is never reachable from the base branch");
+    assert.match(hardened[0].subject, /Merge branch 'master' into feature/);
+    assert.equal(evaluateBranch({ baseRef: "master", mergeCommits: hardened }).ok, false);
+  } finally {
+    rmSync(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test("CLI end-to-end: a stale base does not false-fail once the base branch resolves", () => {
+  const { repoRoot, staleBase, head } = makeStaleBaseRepo();
+  try {
+    let code = 0;
+    let output = "";
+    try {
+      output = execFileSync(process.execPath, [SCRIPT, "--base", staleBase, "--head", head, "--base-ref", "master"], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (error) {
+      code = error.status;
+      output = `${error.stdout ?? ""}${error.stderr ?? ""}`;
+    }
+    assert.equal(code, 0, `expected PASS, got exit ${code}:\n${output}`);
+    assert.match(output, /PASS/);
   } finally {
     rmSync(repoRoot, { recursive: true, force: true });
   }
