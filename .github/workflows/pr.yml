@@ -889,6 +889,49 @@ jobs:
         run: node --test ./scripts/check-commit-author-attribution.test.mjs
         timeout-minutes: 1
 
+      # PEN-5431: the REBASE merge queue replays every commit on a branch, so a
+      # merge commit absorbed INTO the branch is itself replayed -- and its diff
+      # against its own first parent routinely touches files (lockfiles,
+      # generated journals, migration manifests) that a later `master` has
+      # changed again. The result is a SILENT eviction: zero `merge_group` runs,
+      # no check-run, no comment, only a timeline event.
+      #
+      # Documentation was NOT the gap. The rule was already in
+      # `runbooks/merge-queue-stalled-head.md` (0b1ce770, 2026-09-29) and
+      # `runbooks/pr-update-branch-destroys-required-checks.md` (df73fefc,
+      # 2026-08-16), and #3352 violated it anyway on 2026-11-04 -- merge commit
+      # e47e65dea, authored by the SAME identity as the runbook that prohibits
+      # it. Two evictions 3h20m apart, neither explained by any check failure.
+      # A rule its own author does not apply at the moment of action has no
+      # enforcement surface; this is that surface.
+      #
+      # `pull_request` ONLY, and that is LOAD-BEARING -- do not "simplify" it to
+      # run everywhere. In `merge_group`, `merge_group.head_sha` is the queue's
+      # own staging commit, which legitimately joins the queued PRs onto the
+      # base and so IS a merge commit; asserting there would false-fail every
+      # queue entry and wedge the queue. The remedy (`git rebase origin/master`)
+      # is meaningless at that point anyway -- the author is no longer in the
+      # loop.
+      #
+      # `base.ref` goes through `env:` rather than inline `${{ }}` so no ref
+      # name is ever interpolated into the shell command.
+      #
+      # Needs full history for `base..head`; this job has `fetch-depth: 0`.
+      - name: Check branch carries no merge commits (REBASE queue)
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: >-
+          node ./scripts/check-branch-merge-commits.mjs
+          --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
+          --base-ref "$PR_BASE_REF"
+        timeout-minutes: 1
+
+      - name: Test branch-merge-commits check
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-branch-merge-commits.test.mjs
+        timeout-minutes: 2
+
       - name: Test gh token wrapper
         if: ${{ !cancelled() }}
         run: node --test ./scripts/gh-token-wrapper.test.mjs
