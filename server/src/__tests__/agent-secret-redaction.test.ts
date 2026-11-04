@@ -2572,7 +2572,7 @@ describe("agent workspace command withholding (PEN-5225)", () => {
   // they are about.
   const PLAIN_PROVISION = "./provision.sh --no-secrets";
 
-  function strategyRevisionRow(adapterConfig: unknown) {
+  function peerStrategyRevisionRow(adapterConfig: unknown) {
     // Its own row rather than the `revisionRow()` above, which is scoped to the
     // other describe. `agentId` is the PEER subject, matching the agent the four
     // cases below resolve and request — see the readership note on the first.
@@ -2604,7 +2604,7 @@ describe("agent workspace command withholding (PEN-5225)", () => {
     // they are named for. Matches the `/api/agents/:id` sibling above.
     mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
     mockAgentService.getConfigRevision.mockResolvedValue(
-      strategyRevisionRow(strategyAgent.adapterConfig),
+      peerStrategyRevisionRow(strategyAgent.adapterConfig),
     );
 
     const app = createApp(peerAgentActor);
@@ -2641,7 +2641,7 @@ describe("agent workspace command withholding (PEN-5225)", () => {
     }));
     mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
     mockAgentService.listConfigRevisions.mockResolvedValue([
-      strategyRevisionRow(strategyAgent.adapterConfig),
+      peerStrategyRevisionRow(strategyAgent.adapterConfig),
     ]);
 
     const app = createApp(peerAgentActor);
@@ -2683,7 +2683,7 @@ describe("agent workspace command withholding (PEN-5225)", () => {
     }));
     mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
     mockAgentService.getConfigRevision.mockResolvedValue(
-      strategyRevisionRow({
+      peerStrategyRevisionRow({
         workspaceStrategy: { type: "git_worktree", provisionCommand: PLAIN_PROVISION },
       }),
     );
@@ -2712,7 +2712,7 @@ describe("agent workspace command withholding (PEN-5225)", () => {
     }));
     mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
     mockAgentService.listConfigRevisions.mockResolvedValue([
-      strategyRevisionRow({
+      peerStrategyRevisionRow({
         workspaceStrategy: { type: "git_worktree", provisionCommand: PLAIN_PROVISION },
       }),
     ]);
