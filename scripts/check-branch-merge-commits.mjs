@@ -121,20 +121,69 @@ export function parseMergeCommitLog(rawOutput) {
 }
 
 /**
- * Merge commits reachable from `head` but not from `base`.
+ * Resolve the CURRENT tip of the base branch, for use as an extra exclusion.
  *
- * Two-dot range, matching the runbook's own probe. Three-dot would add the
- * base side's merge commits, which this branch is not responsible for and
- * cannot remove.
+ * WHY THIS EXISTS (measured 2026-11-04, master @ ab4a80c82). `PR_BASE_SHA` is
+ * `pull_request.base.sha`, which is the base branch tip as of PR creation and
+ * LAGS as `master` moves -- #3358 read a base.sha 105 commits behind master.
+ * That is normally harmless, because a branch point at or before base.sha means
+ * every master commit in the head'"'"'s ancestry is already an ancestor of base.sha
+ * and so falls out of the two-dot range. It stops being harmless if the branch
+ * is REBASED onto a newer master than base.sha: master commits newer than
+ * base.sha enter the head'"'"'s ancestry, and any MERGE commit among them would be
+ * reported against an author who did not create it and cannot remove it.
+ *
+ * That is not hypothetical. `master` is not linear: 605 of its 9,303 commits
+ * are merges. The REBASE queue has made it nearly so recently -- 1 in the last
+ * 500, 18 in the last 1,500 -- but the most recent (`9112ad1af`, 2026-11-01)
+ * postdates the runbook this gate enforces, so the population is small and
+ * live rather than purely historical.
+ *
+ * A gate that cries wolf gets switched off, so excluding anything already
+ * reachable from the base branch removes the class. It CANNOT cause a false
+ * negative: a merge commit the author created by merging master into their own
+ * branch exists only on that branch, so it is never reachable from the base
+ * branch tip and is still reported.
+ *
+ * Returns null when the ref cannot be resolved (shallow clone, no remote), in
+ * which case the caller proceeds without the extra exclusion -- the strict
+ * direction, identical to the pre-hardening behaviour.
+ */
+export function resolveBaseBranchTip({ repoRoot, baseRef, execFile = execFileSync } = {}) {
+  if (!baseRef) return null;
+  for (const candidate of [`refs/remotes/origin/${baseRef}`, `refs/heads/${baseRef}`]) {
+    try {
+      const sha = execFile("git", ["rev-parse", "--verify", "--quiet", `${candidate}^{commit}`], {
+        cwd: repoRoot,
+        encoding: "utf8",
+        maxBuffer: GIT_MAX_BUFFER,
+      });
+      const trimmed = String(sha).trim();
+      if (trimmed) return trimmed;
+    } catch {
+      // Unresolvable candidate; try the next, then fall through to null.
+    }
+  }
+  return null;
+}
+
+/**
+ * Merge commits reachable from `head` but not from `base` (nor from any ref in
+ * `excludeRefs`).
+ *
+ * Two-dot semantics, matching the runbook'"'"'s own probe, expressed in the
+ * explicit `<head> ^<base>` form so additional exclusions compose without the
+ * argument-order surprises of `--not`.
  *
  * `execFile` is injected for tests; argv array, never a shell.
  */
-export function findBranchMergeCommits({ repoRoot, base, head, execFile = execFileSync } = {}) {
+export function findBranchMergeCommits({ repoRoot, base, head, excludeRefs = [], execFile = execFileSync } = {}) {
   if (!base || !head) throw new Error("findBranchMergeCommits requires both base and head");
   const format = `%H${UNIT_SEPARATOR}%P${UNIT_SEPARATOR}%s${RECORD_SEPARATOR}`;
+  const exclusions = [base, ...excludeRefs].filter(Boolean).map((ref) => `^${ref}`);
   const rawOutput = execFile(
     "git",
-    ["log", "--min-parents=2", `--format=${format}`, `${base}..${head}`],
+    ["log", "--min-parents=2", `--format=${format}`, head, ...exclusions],
     { cwd: repoRoot, encoding: "utf8", maxBuffer: GIT_MAX_BUFFER },
   );
   return parseMergeCommitLog(rawOutput);
@@ -248,7 +297,11 @@ function main() {
   // green.
   let mergeCommits;
   try {
-    mergeCommits = findBranchMergeCommits({ repoRoot: process.cwd(), base: args.base, head: args.head });
+    const repoRoot = process.cwd();
+    // Drop anything already on the base branch; see resolveBaseBranchTip.
+    const baseBranchTip = resolveBaseBranchTip({ repoRoot, baseRef: args.baseRef });
+    const excludeRefs = baseBranchTip && baseBranchTip !== args.base ? [baseBranchTip] : [];
+    mergeCommits = findBranchMergeCommits({ repoRoot, base: args.base, head: args.head, excludeRefs });
   } catch (error) {
     console.error(`check-branch-merge-commits: could not read ${args.base}..${args.head}.`);
     console.error("This needs full history — the calling job must use `fetch-depth: 0`.");
