@@ -300,7 +300,7 @@ Supported `kind` values:
 - `ask_user_questions`: ask structured questions and store selected answers
 - `request_confirmation`: ask the board/user to accept or reject a proposal
 
-For `request_confirmation`, `continuationPolicy: "wake_assignee"` wakes the assignee only after acceptance. Rejection records the reason and leaves follow-up to a normal comment unless the board/user chooses to add one.
+For every kind, `continuationPolicy` defaults to `"wake_assignee"`, which wakes the assignee on acceptance **and** on rejection, carrying the recorded reason. Use `"wake_assignee_on_accept"` when a rejection ends the work and should not wake you, and `"none"` only when you never need to resume. No policy wakes on expiry: a `supersedeOnUserComment` expiry posts a system notice on the thread, and the killing comment raises an ordinary comment wake that carries no interaction context, so set `supersedeOnUserComment: false` on any gate that must survive unrelated thread traffic (PEN-5505).
 
 ### Resolve Interaction
 
