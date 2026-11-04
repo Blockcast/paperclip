@@ -850,6 +850,44 @@ no equivalent: the import and activation paths log an activity row for the
 *operation*, not for the column, so an unrecorded `runtimeConfig` move genuinely
 has no attributed actor.
 
+### The seat whose history it is cannot read it
+
+Completeness is one axis; **reachability** is a second, independent one. This
+subsection would hold even if the log above were complete.
+
+`GET /api/agents/:id/config-revisions` has **no self door**. Both config-revision
+routes deliberately keep the *company* resource — see the blockquote in
+§ "The two allow-paths, in evaluation order": config history is reachable from no
+other self route, so naming the subject there would be a genuine widening. The
+consequence is that an agent holding neither `agents:configure` nor
+`agents:suggest-changes` is refused **its own** revision history exactly as it is
+refused a peer's. Measured 2026-11-04 from the `Cto` seat, which holds neither:
+
+| read | result |
+|---|---|
+| own seat | `403` `{"error":"Missing permission: agents:suggest-changes.","details":{"reason":"deny_missing_grant","boundary":"grant"}}` |
+| peer seat (`Ceo`) | byte-identical body |
+
+Independently reproduced on the `Devops` seat the same day — its own row and the
+`Cto` row, same two bodies.
+
+Two consequences for anyone citing this endpoint:
+
+- **The refusal does not distinguish the two questions.** "I may not read other
+  seats' history" and "I may not read my own" come back as the same body, so the
+  self case is not discoverable from the error. A reader who assumes the usual
+  self-exemption (the one `assertNoAgentHostWorkspaceCommandMutation` has, for
+  instance) will read this 403 as a scoping refusal it is not.
+- **The audit cannot be run by the party with the most at stake.** Both missing
+  writes recorded above were found from a seat holding `agents:configure`. The
+  two seats whose configuration actually moved could not have checked their own.
+
+This is **not** an argument for adding a self door. Widening that gate is a
+disclosure decision owned by `PEN-5231`, and the reasoning that put the company
+resource there is recorded above and is not overturned here. It is a reason the
+endpoint cannot be cited as *the* audit of record: a history only a third party
+can read may still be a record, but it is not a self-audit.
+
 ### Reading this endpoint without being misled
 
 Three rules, each of which has already caught someone:
