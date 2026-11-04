@@ -24,6 +24,41 @@ export {
   resolvePaperclipInstanceRoot,
 };
 
+/**
+ * The `RUN_LOG_BASE_PATH` override, or `undefined` when it is unset OR blank.
+ *
+ * PEN-5466. Blank is treated as ABSENT rather than honoured, matching the
+ * `?.trim() || undefined` reads the run-log store already uses for its S3
+ * settings. `RUN_LOG_BASE_PATH=""` is exactly what a k8s env entry with
+ * `value: ""` produces, and a `??` read honours it: the root becomes `""`,
+ * which is cwd-RELATIVE, so every run log lands wherever the process happened
+ * to be started. A whitespace-only value cannot be a usable root either, so it
+ * takes the same branch.
+ */
+export function resolveRunLogBasePathOverride(): string | undefined {
+  return process.env.RUN_LOG_BASE_PATH?.trim() || undefined;
+}
+
+/**
+ * The run-log root: the override above when one is set, else the instance-root
+ * default.
+ *
+ * It lives HERE, beside the other instance-root path producers, rather than in
+ * `run-log-store.ts`, because it has two independent consumers that must agree:
+ * the store that WRITES run logs, and `orphaned-run-terminal-result.ts`, which
+ * READS the pod's sibling `.pod.ndjson` artifact out of the same tree.
+ * `orphan-artifact-path-agreement.test.ts` exists to pin that agreement, and it
+ * held across two separate copies of this expression only because both copies
+ * happened to say the same thing. One producer makes it structural.
+ *
+ * Importing the store into the reader is not the alternative: that read runs
+ * under the orphan reap's start lock (BLO-51107) and would drag the S3 provider
+ * in behind it.
+ */
+export function resolveRunLogBasePath(): string {
+  return resolveRunLogBasePathOverride() ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
+}
+
 export function resolveDefaultConfigPath(): string {
   return resolvePaperclipConfigPathForInstance();
 }

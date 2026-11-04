@@ -150,6 +150,19 @@ describe("orphan artifact path agreement (adapter ↔ server)", () => {
     expect(runLogBasePath()).toBe(adapterServerViewBase());
   });
 
+  // PEN-5466. A k8s env entry with `value: ""` sets the variable to the empty
+  // string, which is not what `delete` above produces. The reader used to take
+  // that `""` through a `??`, making its root cwd-relative while the deployment
+  // mounts the volume at an absolute path -- so the agreement this file exists
+  // to pin held for the unset case and silently broke for the blank one.
+  it("still agrees when RUN_LOG_BASE_PATH is set to the empty string", () => {
+    process.env.RUN_LOG_BASE_PATH = "";
+    process.env.PAPERCLIP_HOME = deploymentMountPath();
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+
+    expect(runLogBasePath()).toBe(adapterServerViewBase());
+  });
+
   /**
    * Write an artifact exactly where `buildPodLogPath` would put it under a temp
    * root, and hand the reader the matching base. Real I/O rather than a string
