@@ -11662,10 +11662,28 @@ export function issueRoutes(
     if (req.query.includeLinkCoverage === "true") {
       res.json({
         approvals,
-        linkCoverage: await issueApprovalsSvc.linkCoverageForIssue(issue.companyId, {
-          id: issue.id,
-          identifier: issue.identifier ?? null,
-        }),
+        linkCoverage: await issueApprovalsSvc.linkCoverageForIssue(
+          issue.companyId,
+          { id: issue.id, identifier: issue.identifier ?? null },
+          {
+            // This route is gated on reading the ISSUE; the linked list is in scope
+            // for that because those cards hang off a row the caller can read. The
+            // candidate count is not: it scans undecided cards company-wide that are
+            // NOT linked to this row, which is the approval-read boundary that the
+            // `POST` handler below enforces with `assertApprovalReadAllowed` — the
+            // same `company_scope:read` verdict this reads. Without this an actor
+            // that may read an issue but not approvals (task-bridge keys, skill-test
+            // tokens, low-trust presets) would learn how many pending cards elsewhere
+            // in the company name it.
+            //
+            // It degrades rather than 403s because `paperclipListIssueApprovals`
+            // passes the flag on every call: refusing would turn a read those actors
+            // are entitled to into an error. They get the linked set and a
+            // `basis: "approval_read_unavailable"` coverage report, which is the
+            // honest answer — null, never `false`.
+            approvalReadAllowed: await actorCanReadCompanyScope(req, issue.companyId),
+          },
+        ),
       });
       return;
     }

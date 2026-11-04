@@ -354,9 +354,22 @@ async function evaluateTaskWatchdogSubtreeScope(
  * The `issue:comment` probe is made only after a refusal has already been reached
  * AND the filer half holds, so it adds no decide call to any path that was going to
  * allow anyway, and none at all for a third-party card or a non-agent actor.
+ *
+ * It probes with `req.actor` — the same actor value the `issue:mutate` half above
+ * was decided with — rather than rebuilding a bare `{ type, agentId, companyId }`.
+ * A rebuilt actor silently drops `keyScope`, `keyId`, `runId` and `source`, so the
+ * participation half would be judged against a LOOSER actor than the mutate half
+ * (a run-scoped low-trust preset, for instance, resolves as standard trust). No
+ * exploitable path followed from that today, because scoped-key and low-trust
+ * denials are terminal before any override point and every override point sits on
+ * a row the first decision already admitted — but that is a property of the current
+ * ordering, and reusing the actor makes the two halves consistent by construction
+ * instead. The actor is known to be an agent with a non-null `agentId` here; both
+ * are narrowed by the caller before this runs.
  */
 async function requestedBySelfOverride(
   deps: { access: AccessDecider },
+  actor: Request["actor"],
   actorAgentId: string,
   issue: IssueApprovalLinkAuthorizationIssue,
   subject: IssueApprovalLinkSubject | null | undefined,
@@ -368,7 +381,7 @@ async function requestedBySelfOverride(
   }
 
   const participation = await deps.access.decide({
-    actor: { type: "agent", agentId: actorAgentId, companyId: issue.companyId },
+    actor,
     action: "issue:comment",
     resource: {
       type: "issue",
@@ -470,7 +483,7 @@ export async function evaluateAgentIssueApprovalLinkAuthorization(
     // consent denial stays terminal for a filer. This is the branch the live
     // PEN-5379 refusal fell at.
     if (REQUESTED_BY_SELF_OVERRIDABLE_DECISION_REASONS.has(decision.reason)) {
-      const self = await requestedBySelfOverride(deps, actorAgentId, issue, subject);
+      const self = await requestedBySelfOverride(deps, req.actor, actorAgentId, issue, subject);
       if (self) return self;
     }
     return {
@@ -492,7 +505,7 @@ export async function evaluateAgentIssueApprovalLinkAuthorization(
     // narrowed, so it is honoured rather than shadowed by it. Without this an agent
     // would be refused *because* it also happens to be the issue's creator, which
     // inverts the intent of the narrowing.
-    const self = await requestedBySelfOverride(deps, actorAgentId, issue, subject);
+    const self = await requestedBySelfOverride(deps, req.actor, actorAgentId, issue, subject);
     if (self) return self;
     return {
       allowed: false,
@@ -534,7 +547,13 @@ export async function evaluateAgentIssueApprovalLinkAuthorization(
     // link on exactly the `in_progress` multi-agent incident this exists for, and
     // would make the relation's availability depend on the row's status, which the
     // filer neither controls nor can wait out.
-    const requestedBySelf = await requestedBySelfOverride(deps, actorAgentId, issue, subject);
+    const requestedBySelf = await requestedBySelfOverride(
+      deps,
+      req.actor,
+      actorAgentId,
+      issue,
+      subject,
+    );
     if (requestedBySelf) return requestedBySelf;
 
     if (issue.status === "in_progress") {

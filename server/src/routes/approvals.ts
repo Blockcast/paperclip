@@ -750,10 +750,17 @@ export function approvalRoutes(
         if (issue && issue.companyId === companyId) {
           res.json({
             count,
-            linkCoverage: await issueApprovalsSvc.linkCoverageForIssue(companyId, {
-              id: issue.id,
-              identifier: issue.identifier ?? null,
-            }),
+            linkCoverage: await issueApprovalsSvc.linkCoverageForIssue(
+              companyId,
+              { id: issue.id, identifier: issue.identifier ?? null },
+              {
+                // Unconditionally true here, and only here: this whole route is
+                // already behind `assertApprovalAccessAllowed`, which is the same
+                // `company_scope:read` decision the coverage probe needs. An actor
+                // that could not read approvals never reached this line.
+                approvalReadAllowed: true,
+              },
+            ),
           });
           return;
         }
