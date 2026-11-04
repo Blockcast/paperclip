@@ -37,7 +37,13 @@ ENV NODE_ENV=production \
 WORKDIR /app
 COPY packages/mcp-external/package.json ./package.json
 COPY --from=build /build/packages/mcp-external/dist ./dist
-RUN npm install --omit=dev --no-audit --no-fund && npm cache clean --force
+# Upgrade Debian packages at build time: the harbor `node:lts-trixie-slim`
+# mirror lags security point releases (BLO-51885: perl-base 5.40.1-6 shipped
+# with three Criticals fixed in 5.40.1-6+deb13u1). Then delete npm/npx — the
+# entrypoint is plain `node`, and npm's bundled `tar` was a Critical of its own.
+RUN apt-get update && apt-get -y upgrade && rm -rf /var/lib/apt/lists/* \
+ && npm install --omit=dev --no-audit --no-fund && npm cache clean --force \
+ && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 USER 1000
 EXPOSE 9011
 ENTRYPOINT ["node", "dist/http.js"]
