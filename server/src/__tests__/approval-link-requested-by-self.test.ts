@@ -1,6 +1,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { IssueApprovalLinkSubject } from "../routes/issue-approval-link-authorization.js";
 
 /**
  * PEN-5511: a board card filed by a non-assignee could never be linked to the row
@@ -67,7 +68,9 @@ const mockIssueApprovalService = vi.hoisted(() => ({
   // PEN-5511: the link route reads the card's requester to decide the
   // `requested_by_self` relation. `null` is the no-subject case, i.e. exactly
   // the pre-PEN-5511 verdict, so existing cases are unaffected.
-  getApprovalLinkSubject: vi.fn(async () => null),
+  getApprovalLinkSubject: vi.fn(
+    async (_approvalId: string): Promise<IssueApprovalLinkSubject | null> => null,
+  ),
   listIssuesForApproval: vi.fn(),
   linkManyForApproval: vi.fn(),
 }));
