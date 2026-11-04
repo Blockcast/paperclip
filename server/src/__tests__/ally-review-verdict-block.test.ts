@@ -676,6 +676,75 @@ describe("BLO-32695 — an unknown severity key fails closed, not open", () => {
 });
 
 /**
+ * PEN-5565 — the two reason paths that named nothing.
+ *
+ * `asSeverityCounts` documents why it answers a reason rather than a bare
+ * `null`: "the gate description is the only place Ally will see which key we
+ * rejected." Two of its four failure paths did not honour that — a non-object
+ * `findings` and a non-integer or negative count both answered the same bare
+ * "ally-verdict findings are not severity counts".
+ *
+ * The second was the actively misleading one: `findings` IS a
+ * severity-counts-shaped object there and exactly one entry's value is wrong,
+ * so the whole-object wording sent Ally back to re-read a block whose structure
+ * was fine. The key was in scope the whole time, and the very next branch in
+ * the same loop body already names it.
+ *
+ * These cases assert the WORDING, because the compiler cannot tell an
+ * actionable reason from a bare one. The verdicts themselves are asserted
+ * unchanged alongside: this is a diagnostics change and must not move a single
+ * head between readable and unreadable.
+ */
+describe("PEN-5565 — an unreadable findings object names its own defect", () => {
+  const body = (findings: unknown) =>
+    `${verdictBlock({ head: PR1675_HEAD, findings })}\n## Ally — Consolidated PR Review\n` +
+    `Reviewed head: ${PR1675_HEAD}\n\n### Critical Issues (0)\n### Important Issues (0)`;
+
+  it.each([
+    ["a string", "7"],
+    ["an array", [1, 2]],
+    ["a number", 3],
+    ["a boolean", true],
+    ["null", null],
+  ])("names a findings value that arrived as %s", (shape, findings) => {
+    expect(parseAllyVerdictBlock(body(findings))).toMatchObject({
+      kind: "unreadable",
+      reason: `ally-verdict findings are ${shape}, not severity counts`,
+    });
+  });
+
+  it.each([
+    ["a non-integer", { critical: 1.5, important: 0 }],
+    ["a non-number", { critical: "1", important: 0 }],
+    ["a negative", { critical: -1, important: 0 }],
+  ])("names the key whose count is %s, not the whole object", (_label, findings) => {
+    expect(parseAllyVerdictBlock(body(findings))).toMatchObject({
+      kind: "unreadable",
+      reason: "ally-verdict findings count `critical` is not a non-negative integer",
+    });
+  });
+
+  it("scrubs a non-conforming key before publishing it (PEN-3157)", () => {
+    // This branch runs BEFORE the VERDICT_SEVERITIES check, so unlike the
+    // sibling `exceeds` message its key is still arbitrary model-authored
+    // text and reaches githubPostCommitStatusDetailed unscrubbed.
+    const parsed = parseAllyVerdictBlock(body({ "crit!cal": "x" }));
+    expect(parsed).toMatchObject({ kind: "unreadable" });
+    expect((parsed as { reason: string }).reason).toBe(
+      "ally-verdict findings count `<non-conforming>` is not a non-negative integer",
+    );
+    expect((parsed as { reason: string }).reason).not.toContain("crit!cal");
+  });
+
+  it("still fails closed on every one of them — wording moved, verdicts did not", () => {
+    for (const findings of ["7", [1], 3, true, null, { critical: -1 }, { critical: "1" }]) {
+      expect(parseAllyVerdictBlock(body(findings))).toMatchObject({ kind: "unreadable" });
+    }
+  });
+});
+
+
+/**
  * The opener is line-anchored, so only a *real* block counts.
  *
  * Fencing is not the only way to quote, and withoutFencedCodeBlocks strips only
@@ -755,7 +824,10 @@ describe("BLO-32695 — fail-closed on an unreadable block", () => {
     {
       name: "non-integer finding counts",
       body: `${verdictBlock({ head: PR1675_HEAD, findings: { important: "two" } })}\n## Ally — Consolidated PR Review`,
-      reason: /not severity counts/,
+      // Names the offending key since PEN-5565. It used to answer the
+      // whole-object "not severity counts", which misdescribed this case:
+      // `findings` is severity-counts-shaped and one value is wrong.
+      reason: /findings count `important` is not a non-negative integer/,
     },
     {
       // The dangerous shape, and the reason it needs its own case: every other
