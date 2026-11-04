@@ -377,3 +377,115 @@ describe("createDurableRunLogStore permission diagnostics", () => {
     expect(isRunLogUnwritableError("EACCES")).toBe(false);
   });
 });
+
+// PEN-5466. `getRunLogStore()` makes ONE decision -- override or instance-root
+// default -- and reports it twice: as the store's `basePath` and as the
+// provenance label the permission message prints. Those two reads used to key
+// on different predicates (`??` vs truthiness), so they disagreed on exactly
+// one value: `RUN_LOG_BASE_PATH=""`, which is what a k8s env entry with
+// `value: ""` produces. The root became `""` -- cwd-RELATIVE, so run logs
+// landed wherever the process was started -- while the label named
+// PAPERCLIP_HOME, a root that was not in use. A label that contradicts the root
+// it describes is worse than no label, because it is the sentence a reader
+// trusts when a run-log fault surfaces.
+describe("getRunLogStore base-path provenance", () => {
+  const asNonRoot = typeof process.getuid === "function" && process.getuid() !== 0 ? it : it.skip;
+
+  const saved = {
+    base: process.env.RUN_LOG_BASE_PATH,
+    home: process.env.PAPERCLIP_HOME,
+    instance: process.env.PAPERCLIP_INSTANCE_ID,
+    bucket: process.env.RUN_LOG_S3_BUCKET,
+  };
+  let home: string;
+
+  beforeEach(async () => {
+    home = await fs.mkdtemp(path.join(os.tmpdir(), "pen5466-home-"));
+    process.env.PAPERCLIP_HOME = home;
+    process.env.PAPERCLIP_INSTANCE_ID = "default";
+    // Keep the store local-only: the S3 mirror is irrelevant here and would
+    // need credentials.
+    delete process.env.RUN_LOG_S3_BUCKET;
+    // `getRunLogStore` memoizes, so every case needs a fresh module instance.
+    vi.resetModules();
+  });
+
+  afterEach(async () => {
+    for (const [key, value] of [
+      ["RUN_LOG_BASE_PATH", saved.base],
+      ["PAPERCLIP_HOME", saved.home],
+      ["PAPERCLIP_INSTANCE_ID", saved.instance],
+      ["RUN_LOG_S3_BUCKET", saved.bucket],
+    ] as const) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    await fs.rm(home, { recursive: true, force: true });
+    vi.resetModules();
+  });
+
+  const instanceRunLogRoot = () => path.join(home, "instances", "default", "data", "run-logs");
+
+  it("roots a blank override under PAPERCLIP_HOME instead of the process cwd", async () => {
+    process.env.RUN_LOG_BASE_PATH = "";
+    const { getRunLogStore } = await import("./run-log-store.js");
+
+    const handle = await getRunLogStore().begin(begin);
+
+    // Written where PAPERCLIP_HOME says, which is what the label claims.
+    const written = path.join(instanceRunLogRoot(), handle.logRef);
+    await expect(fs.stat(written).then((s) => s.isFile())).resolves.toBe(true);
+    // And NOT under the cwd, which is where the `""` root used to put it.
+    await expect(fs.stat(path.resolve(begin.companyId))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  // Both halves of the decision in one assertion: the message names the root
+  // the store actually used AND the branch it came from, so they cannot be
+  // asserted apart from each other.
+  asNonRoot("labels the blank-override root as derived from PAPERCLIP_HOME, which is the root it used", async () => {
+    const root = instanceRunLogRoot();
+    await fs.mkdir(root, { recursive: true });
+    await fs.chmod(root, 0o555);
+    process.env.RUN_LOG_BASE_PATH = "";
+    try {
+      const { getRunLogStore, isRunLogUnwritableError: isUnwritable } = await import("./run-log-store.js");
+      const err = await getRunLogStore()
+        .begin(begin)
+        .then(
+          () => null,
+          (caught: unknown) => caught as NodeJS.ErrnoException,
+        );
+      expect(err).not.toBeNull();
+      expect(isUnwritable(err)).toBe(true);
+      const message = String(err?.message);
+      expect(message).toContain(root);
+      expect(message).toContain("(derived from PAPERCLIP_HOME)");
+      expect(message).not.toContain("(from RUN_LOG_BASE_PATH)");
+    } finally {
+      await fs.chmod(root, 0o755);
+    }
+  });
+
+  asNonRoot("labels a real override as coming from RUN_LOG_BASE_PATH", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "pen5466-override-"));
+    await fs.chmod(root, 0o555);
+    // Padded on purpose: the resolver trims, so the label must describe the
+    // trimmed root the store opened rather than the raw environment value.
+    process.env.RUN_LOG_BASE_PATH = `  ${root}  `;
+    try {
+      const { getRunLogStore } = await import("./run-log-store.js");
+      const err = await getRunLogStore()
+        .begin(begin)
+        .then(
+          () => null,
+          (caught: unknown) => caught as NodeJS.ErrnoException,
+        );
+      const message = String(err?.message);
+      expect(message).toContain(`The run-log root is ${root} (from RUN_LOG_BASE_PATH)`);
+      expect(message).not.toContain("(derived from PAPERCLIP_HOME)");
+    } finally {
+      await fs.chmod(root, 0o755);
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
