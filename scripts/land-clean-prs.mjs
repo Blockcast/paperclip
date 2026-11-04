@@ -2661,6 +2661,74 @@ export function markFailure(row, message) {
  */
 const BESPOKE_COMMENT_ACTIONS = new Set(["codeowner-review-requested", "stale-enqueue"]);
 
+/**
+ * The order the apply loop walks `rows` in: every `enqueue` row first, oldest
+ * PR first, then every other row in its `rows` position.
+ *
+ * ## This is DELIBERATELY not the order of `rows`, and the difference must survive
+ *
+ * `rows` is the RECEIPT. It comes back in `gh pr list` order (newest first) and
+ * `classifyAll` keeps it that way on purpose, so one fire's receipt diffs
+ * against the last one's. That stability is pinned by its own test and is not
+ * negotiable. This function therefore reorders the ITERATION and leaves the
+ * array alone — it returns the same row OBJECTS, so the in-place `row.action`
+ * and `row.detail` writes the loop makes still land in the receipt, in receipt
+ * order. An edit that "fixes the inconsistency" by sorting `rows` instead
+ * breaks the receipt; an edit that drops this call restores the defect below.
+ *
+ * ## Why the apply order has to differ at all (PEN-5503)
+ *
+ * The loop can DIE PARTWAY. Every `applyRow` call can throw something
+ * `isFatalGhError` calls untrustworthy, and that exits the process, so a row's
+ * position in the apply order decides whether a fire that dies reaches it.
+ *
+ * Before BLO-51664 the cap was spent newest-first, so the winners were a
+ * contiguous PREFIX of the newest-first listing and were applied FIRST; a
+ * truncation killed rows already headed for `cap:N-per-fire`, which cost
+ * nothing. Spending the cap oldest-first moved the winner block to a contiguous
+ * SUFFIX — so an abort began dropping exactly the oldest PRs that fix exists
+ * to protect. Measured on the 2026-11-04 08:45Z fire: the ten winners were
+ * applied in one descending burst ending at the oldest, #3215, 32s in.
+ *
+ * ## Why ALL enqueues, and not merely the winners among themselves
+ *
+ * Permuting the winners into age order inside their existing slots satisfies
+ * the letter of that and leaves most of the exposure standing: `applyRow`
+ * mutates remote state for `codeowner-review-requested` too, and those rows are
+ * interleaved among the winners by PR number. Same fire, in apply order: 18
+ * abort-capable calls to reach the last winner, 8 of them notifications. So the
+ * hoist is over the whole `enqueue` cohort, for three reasons:
+ *
+ *   - The two actions are not equally expensive to lose. A deferred
+ *     notification is `commentOnce`-deduped: it arrives 6h late and still posts
+ *     exactly once. A deferred `enqueue` costs 6h AND re-presents as fresh
+ *     demand against a cap that is spent at enqueue rather than at merge.
+ *   - The deferrable work is itself an abort CAUSE. `commentOnce` reads the
+ *     PR's whole comment list with `--paginate` before deciding whether to
+ *     post, so those rows burn paginated rate limit ahead of the scarce action
+ *     — and an exhausted rate limit is one of the things `isFatalGhError`
+ *     fires on.
+ *   - It shortens the classification-to-enqueue window, which can only reduce
+ *     the `head moved since classification` refusals of PEN-4887.
+ *
+ * Nothing orders against the hoist: one PR yields one row, so a `stale-enqueue`
+ * disarm and an `enqueue` are never the same PR, and `stalledHolds` reads
+ * `rows` after the loop. In a notify-only repo `demoteMergeActions` has already
+ * renamed every `enqueue`, so this is an identity there.
+ *
+ * Ascending PR number is the age proxy, the same key `classifyAll` allocates
+ * on; a row with no usable number sorts last, and ties keep `rows` order.
+ */
+export function applyOrder(rows) {
+  const indexed = (rows ?? []).map((row, i) => ({ row, i }));
+  const age = ({ row }) => row?.number ?? Infinity;
+  const enqueues = indexed
+    .filter(({ row }) => row?.action === "enqueue")
+    .sort((a, b) => age(a) - age(b) || a.i - b.i);
+  const rest = indexed.filter(({ row }) => row?.action !== "enqueue");
+  return [...enqueues, ...rest].map(({ row }) => row);
+}
+
 export function runRepo(
   repo,
   apply,
@@ -2738,7 +2806,12 @@ export function runRepo(
     if (row.action === "approval-rotted") rotted.push(`${repo}#${row.number} (${row.detail})`);
   }
 
-  for (const row of rows) {
+  // ⚠ APPLY ORDER IS NOT RECEIPT ORDER, ON PURPOSE. `rows` stays in listing
+  // order for the receipt; `applyOrder` hoists the scarce `enqueue` work to the
+  // front, oldest first, so a fire that dies partway has already spent the cap
+  // on the oldest PRs rather than on whatever the listing happened to put
+  // first. Read its doc comment before collapsing the two orders back together.
+  for (const row of applyOrder(rows)) {
     if (!apply) continue;
     try {
       const outcome = applyOne(repo, row, applyRun);
