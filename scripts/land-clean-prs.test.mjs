@@ -2935,6 +2935,58 @@ describe("the unmeasured exit code (PEN-5314)", () => {
     const out = capture(new Error("HTTP 504"), ["a/one#1"], { alarm: false });
     assert.doesNotMatch(out, /a\/one#1/);
   });
+
+  it("⛔ an unreadable repo ALONE is unmeasured; a real cohort beside it still alarms", () => {
+    const blocked = ["a/broken (HTTP 502)"];
+    assert.equal(alarmExitCode([], blocked, []), EXIT_UNMEASURED, "nothing measured, a repo unread");
+    // PRECEDENCE. A measured verdict outranks a transport report: there IS a
+    // PR to act on, and 1 is the code that says so. The `unreadable` ALARM
+    // block still names the skipped repo, so spending 3 here would cost the
+    // actionable signal and buy nothing.
+    assert.equal(alarmExitCode(["a/one#1"], blocked, []), 1, "a stranded PR outranks it");
+    assert.equal(alarmExitCode([], blocked, ["a/one#2"]), 1, "so does a cap-starved one");
+    assert.equal(alarmExitCode([], [], []), 0, "control: a clean measured run is still green");
+    // PEN-5442's fail-open guard is indifferent to the renumbering, and is
+    // asserted separately so it keeps holding if the integer ever moves again.
+    for (const code of [alarmExitCode([], blocked, []), alarmExitCode(["a/one#1"], blocked, [])]) {
+      assert.notEqual(code, 0, "an unread repo can never produce a green run");
+    }
+  });
+
+  it("reports the partial cap-starved cohort too, not only the stranded one", () => {
+    const out = capture(new Error("HTTP 504"), ["a/one#3241"], {
+      alarm: true,
+      starved: ["a/two#3306"],
+    });
+    assert.match(out, /Partial unlanded-eligible cohort .*a\/one#3241/);
+    assert.match(out, /Partial cap-starved cohort .*a\/two#3306/);
+  });
+
+  it("reports a cap-starved prefix even when the stranded cohort is empty", () => {
+    const out = capture(new Error("HTTP 504"), [], { alarm: true, starved: ["a/two#3306"] });
+    assert.match(out, /Partial cap-starved cohort .*a\/two#3306/);
+    assert.doesNotMatch(out, /PREFIX, not an all-clear/, "something WAS found before stopping");
+  });
+
+  it("calls BOTH cohorts empty a prefix, never an all-clear", () => {
+    const out = capture(new Error("HTTP 504"), [], { alarm: true, starved: [] });
+    assert.match(out, /PREFIX, not an all-clear/);
+  });
+
+  it("keeps the frames for a throw that did not come from gh", () => {
+    // A `gh` failure carries stderr, and one line is the right amount of it.
+    // A programming error carries none — there the frames ARE the diagnosis,
+    // and the first line is the least useful part of them.
+    const bug = new Error("rows.map is not a function");
+    const out = capture(bug, [], {});
+    assert.match(out, /rows\.map is not a function/);
+    assert.ok(out.includes(bug.stack), "the frames Node would have printed are kept");
+
+    const gh = Object.assign(new Error("gh failed"), { stderr: "HTTP 502: Bad Gateway\nnoise" });
+    const ghOut = capture(gh, [], {});
+    assert.doesNotMatch(ghOut, /noise/, "a gh failure is still trimmed to one line");
+    assert.ok(!ghOut.includes(gh.stack), "and still carries no frames");
+  });
 });
 
 describe("rate-limit retry in gh() (BLO-51665)", () => {
@@ -3341,11 +3393,53 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
     // landable and ignored" asserted over a repo the fire never read, which is
     // exactly the silent all-clear this detector exists to rule out.
     assert.equal(alarmExitCode([], []), 0, "control: nothing wrong is still green");
-    assert.equal(alarmExitCode([], ["a/broken (HTTP 502)"]), 1);
+    // ⛔ The property this test exists for is NON-ZERO, asserted separately
+    // from which non-zero. PEN-5314 moved the integer from 1 to
+    // EXIT_UNMEASURED; the fail-open guard is indifferent to that and must
+    // keep holding if it ever moves again.
+    assert.notEqual(alarmExitCode([], ["a/broken (HTTP 502)"]), 0, "an unread repo is never green");
     assert.equal(alarmExitCode(["a/one#1"], []), 1, "the stranded term is unchanged");
     assert.equal(alarmExitCode(["a/one#1"], ["a/broken (HTTP 502)"]), 1);
     assert.equal(alarmExitCode(undefined, undefined), 0, "and both still default");
     assert.equal(alarmExitCode([]), 0, "including the one-argument call sites");
+  });
+
+  it("⛔ a transient 5xx spends EXIT_UNMEASURED, not the stranded cohort's 1 (PEN-5314)", () => {
+    // The composition, run through the REAL path rather than a hand-built
+    // cohort — because the regression was in the composition and every
+    // by-hand `alarmExitCode` test above kept passing while it was live.
+    //
+    // PEN-5314 added EXIT_UNMEASURED for exactly this input. This catch then
+    // took it back: a 502 that outlives `fetchOpenPrs`'s retries is NOT fatal,
+    // so it arrives here as an unreadable skip rather than at `main`'s
+    // `sweepError` branch — and the dominant "GitHub 502'd" case went back to
+    // spelling "could not measure" with the same integer as "a PR has been
+    // landable for hours and nothing took it".
+    const unreadable = [];
+    const stranded = [];
+    const starved = [];
+    quietly(() =>
+      sweepRepos(
+        ["a/broken"],
+        repoRunner(
+          false,
+          0,
+          [],
+          stranded,
+          boom("HTTP 502: 502 Bad Gateway"),
+          new Set(),
+          unreadable,
+          starved,
+        ),
+      ),
+    );
+    assert.deepEqual(unreadable, ["a/broken (HTTP 502: 502 Bad Gateway)"], "the 5xx became a skip");
+    assert.deepEqual(stranded, [], "having measured nothing");
+    assert.equal(
+      alarmExitCode(stranded, unreadable, starved),
+      EXIT_UNMEASURED,
+      "so the run says it could not measure — NOT that a PR is stranded",
+    );
   });
 });
 
@@ -3606,7 +3700,11 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
     assert.equal(alarmExitCode([], ["a/broken (HTTP 502)"], ["a/one#3306"]), 1);
     // The two siblings still go red alone, so widening did not swallow either.
     assert.equal(alarmExitCode(["a/one#3241"], [], []), 1, "stranded alone");
-    assert.equal(alarmExitCode([], ["a/broken (HTTP 502)"], []), 1, "unreadable alone");
+    assert.notEqual(
+      alarmExitCode([], ["a/broken (HTTP 502)"], []),
+      0,
+      "unreadable alone — still red, though PEN-5314 changed WHICH non-zero",
+    );
     // Optional and quiet by default, so no existing caller changes meaning.
     assert.equal(alarmExitCode([]), 0);
     assert.equal(alarmExitCode([], []), 0);
@@ -3706,7 +3804,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
   });
 });
 
-describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442)", () => {
+describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442 + PEN-5314)", () => {
   // `alarmExitCode` is exported and heavily covered — but every one of those
   // tests passes the cohorts in BY HAND. `main` is NOT exported, it
   // self-invokes under `isMainModule`, and there is no seam to inject. So
@@ -3730,6 +3828,7 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442)",
 
   const EXIT_CALL = /process\.exit\(\s*alarmExitCode\(([^)]*)\)\s*\)/;
   const RUNNER_CALL = /repoRunner\(([^)]*)\)/;
+  const UNMEASURED_CALL = /reportUnmeasured\(\s*sweepError,\s*stranded,\s*\{([^}]*)\}\s*\)/;
   const argsOf = (re, src) => {
     const match = src.match(re);
     return match ? match[1].split(",").map((arg) => arg.trim()) : null;
@@ -3751,6 +3850,16 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442)",
     assert.ok(args.includes("unreadable"), "`unreadable` is collected by the sweep");
     assert.ok(args.includes("starved"), "`starved` is collected by the sweep");
     assert.equal(args.indexOf("starved"), args.length - 1, "`starved` is the 8th and last");
+  });
+
+  it("hands `reportUnmeasured` the cap-starved cohort as well (PEN-5314)", () => {
+    // Same hazard, third cohort: `starved` is collected by reference exactly
+    // like `stranded`, so leaving it out of the partial report makes "here is
+    // what I found before I stopped" quietly untrue for that arm.
+    const keys = argsOf(UNMEASURED_CALL, SOURCE);
+    assert.ok(keys, "main still reports the unmeasured run");
+    assert.ok(keys.includes("alarm"), "`alarm` still gates the cohort report");
+    assert.ok(keys.includes("starved"), "`starved` is reported, not silently dropped");
   });
 
   it("⛔ the probes are LIVE — each one fails against a source missing its term", () => {
@@ -3776,6 +3885,16 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442)",
     assert.ok(
       !argsOf(RUNNER_CALL, unthreaded).includes("starved"),
       "the probe SEES an unthreaded cohort",
+    );
+
+    const unreported = SOURCE.replace(
+      "reportUnmeasured(sweepError, stranded, { alarm, starved });",
+      "reportUnmeasured(sweepError, stranded, { alarm });",
+    );
+    assert.notEqual(unreported, SOURCE, "control: the mutation actually applied");
+    assert.ok(
+      !argsOf(UNMEASURED_CALL, unreported).includes("starved"),
+      "the probe SEES an unreported cohort",
     );
   });
 });
