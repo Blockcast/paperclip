@@ -2431,10 +2431,11 @@ describe("agent workspace command withholding (PEN-5225)", () => {
 
   function strategyRevisionRow(adapterConfig: unknown) {
     // Its own row rather than the `revisionRow()` above, which is scoped to the
-    // other describe.
+    // other describe. `agentId` is the PEER subject, matching the agent the four
+    // cases below resolve and request — see the readership note on the first.
     return {
       id: strategyRevisionId,
-      agentId,
+      agentId: peerAgentId,
       companyId,
       source: "patch",
       changedKeys: ["adapterConfig"],
@@ -2451,13 +2452,21 @@ describe("agent workspace command withholding (PEN-5225)", () => {
       "agent:read": true,
       "workspace_runtime:read": false,
     }));
+    // Resolve the PEER row, not this actor's own. `peerAgentActor.agentId` IS
+    // `agentId`, so requesting `/api/agents/${agentId}` here would be a SELF
+    // read wearing a peer's name. Inert today — both routes are deliberately
+    // company-scoped and never pass a `subjectAgentId`, so `allow_self` is not
+    // reachable (PEN-5231) — but if that scoping were ever widened these cases
+    // would silently start exercising the self path instead of the readership
+    // they are named for. Matches the `/api/agents/:id` sibling above.
+    mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
     mockAgentService.getConfigRevision.mockResolvedValue(
       strategyRevisionRow(strategyAgent.adapterConfig),
     );
 
     const app = createApp(peerAgentActor);
     const res = await request(app).get(
-      `/api/agents/${agentId}/config-revisions/${strategyRevisionId}`,
+      `/api/agents/${peerAgentId}/config-revisions/${strategyRevisionId}`,
     );
 
     // Assert the success path explicitly — a 403/404 passes every negative
@@ -2487,20 +2496,35 @@ describe("agent workspace command withholding (PEN-5225)", () => {
       "agent:read": true,
       "workspace_runtime:read": false,
     }));
+    mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
     mockAgentService.listConfigRevisions.mockResolvedValue([
       strategyRevisionRow(strategyAgent.adapterConfig),
     ]);
 
     const app = createApp(peerAgentActor);
-    const res = await request(app).get(`/api/agents/${agentId}/config-revisions`);
+    const res = await request(app).get(`/api/agents/${peerAgentId}/config-revisions`);
 
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
-    expect(res.body[0].afterConfig.adapterConfig.workspaceStrategy.provisionCommand)
-      .toBe(REDACTED_EVENT_VALUE);
-    expect(res.body[0].beforeConfig.adapterConfig.workspaceStrategy.teardownCommand)
-      .toBe(REDACTED_EVENT_VALUE);
+    // The SAME (key x side) matrix as the detail case, for the same reason:
+    // `redactConfigRevision` masks `beforeConfig` and `afterConfig` through two
+    // independent `redactRevisionSnapshot` calls, so masking one is not evidence
+    // for the other. Asserting a subset left three of the six cells unpinned,
+    // and one of those — `teardownCommand` on `afterConfig` — was covered by
+    // NOTHING: no mask assertion, and the `tear_secret_24680` substring check
+    // that would have caught it was absent too. That is a LEAK-direction hole,
+    // not the fail-closed one the positive controls cover. `worktreeParentDir`
+    // carries no secret at all, so only a direct assertion can reach it.
+    for (const side of [res.body[0].beforeConfig, res.body[0].afterConfig]) {
+      expect(side.adapterConfig.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(side.adapterConfig.workspaceStrategy.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(side.adapterConfig.workspaceStrategy.worktreeParentDir).toBe(REDACTED_EVENT_VALUE);
+    }
+    // A mask, not a drop — pinned on this route too, not only on the detail one.
+    expect(res.body[0].afterConfig.adapterConfig.workspaceStrategy.type).toBe("git_worktree");
+    expect(res.body[0].afterConfig.adapterConfig.cwd).toBe("/workspace");
     expect(JSON.stringify(res.body)).not.toContain("prov_secret_13579");
+    expect(JSON.stringify(res.body)).not.toContain("tear_secret_24680");
   });
 
   it("returns a revision's commands to a reader holding workspace_runtime:read", async () => {
@@ -2514,6 +2538,7 @@ describe("agent workspace command withholding (PEN-5225)", () => {
       "agent:read": true,
       "workspace_runtime:read": true,
     }));
+    mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
     mockAgentService.getConfigRevision.mockResolvedValue(
       strategyRevisionRow({
         workspaceStrategy: { type: "git_worktree", provisionCommand: PLAIN_PROVISION },
@@ -2522,7 +2547,7 @@ describe("agent workspace command withholding (PEN-5225)", () => {
 
     const app = createApp(peerAgentActor);
     const res = await request(app).get(
-      `/api/agents/${agentId}/config-revisions/${strategyRevisionId}`,
+      `/api/agents/${peerAgentId}/config-revisions/${strategyRevisionId}`,
     );
 
     expect(res.status).toBe(200);
@@ -2542,6 +2567,7 @@ describe("agent workspace command withholding (PEN-5225)", () => {
       "agent:read": true,
       "workspace_runtime:read": true,
     }));
+    mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
     mockAgentService.listConfigRevisions.mockResolvedValue([
       strategyRevisionRow({
         workspaceStrategy: { type: "git_worktree", provisionCommand: PLAIN_PROVISION },
@@ -2549,7 +2575,7 @@ describe("agent workspace command withholding (PEN-5225)", () => {
     ]);
 
     const app = createApp(peerAgentActor);
-    const res = await request(app).get(`/api/agents/${agentId}/config-revisions`);
+    const res = await request(app).get(`/api/agents/${peerAgentId}/config-revisions`);
 
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
