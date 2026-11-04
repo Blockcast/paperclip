@@ -218,12 +218,45 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * the pool read at or above the cap on every hourly `landing-sweep` sample
  * from 08:29Z to 12:31Z.
  *
+ * CAUTION on that merge-count table: it is repo demand, not ROUTINE demand.
+ * This routine is one enqueue path among several. Measured 2026-11-04 over
+ * the 22 most recently merged PRs, only 5 were enqueued within 15 min of a
+ * scheduled fire; of the other 17, eight were enqueued by a human account.
+ * So 4 x 10 bounds the PRs that DEPEND on this routine, not the repo's
+ * throughput, and a merge count overstates what the ceiling governs.
+ *
+ * Measure the enqueue, then, not the merge. A merged PR's
+ * `added_to_merge_queue` timeline event carries both the instant and the
+ * actor -- and the merge commit's committer DATE and IDENTITY are those
+ * same two values (exact on 6 of 6 PRs sampled 2026-11-04), so `git log`
+ * over the default branch yields the whole series with no API calls. A
+ * fire reads as a tight cluster a few minutes past the hour: on 2026-11-04
+ * the 02:45Z fire shows as 02:50:19Z..02:50:50Z, +5.3 to +5.6 min.
+ *
  * If that has to be fixed, fix it with fire FREQUENCY, not by raising this
  * number. Raising the cap buys throughput by spending the blast-radius
  * guarantee in the first paragraph, and spends it silently -- nothing about
  * a larger number announces that the safety margin moved. More fires at the
- * same cap leave the per-fire radius at exactly 10 and raise the daily
- * ceiling linearly, so the two concerns stay decoupled.
+ * same cap leave the PER-FIRE radius at exactly 10 and raise the daily
+ * ceiling linearly.
+ *
+ * They do not leave the per-DAY exposure alone, and the paragraph above
+ * claimed they did ("the two concerns stay decoupled") until this
+ * correction. The 40 is a second bound in its own right: it caps how many
+ * PRs a wrong verdict of ANY kind can land in a day -- a classifier bug, or
+ * a head verdict this routine trusted and should not have. Six fires at a
+ * cap of 10 is 60, so frequency buys latency by spending THAT bound. It is
+ * still the better lever than raising the cap, which spends both bounds at
+ * once; it is just not a free one. Price the per-day axis before proposing
+ * it, rather than stopping at "per-fire radius unchanged".
+ *
+ * Proposed and DEFERRED, 2026-11-03 (PEN-5397): the six-hourly cron stays
+ * and this constant stays 10. The deferral turned on the per-day axis
+ * above, against a condition that is dated and expected to clear, recorded
+ * on PEN-5397 rather than here so this comment does not outlive it -- read
+ * that row before citing this paragraph as a standing refusal. Re-measure
+ * pool-against-budget once PEN-5279 lands; re-propose only if the
+ * deferral is still biting.
  *
  * The related REPORTING gap -- that a PR deferred by this cap is visible to
  * neither alarm arm -- is a separate defect owned by PEN-5391, not this
