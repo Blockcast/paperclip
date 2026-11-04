@@ -240,6 +240,7 @@ describe("the issue-lock gate runs before anything is written", () => {
     const dir = await makeDir("wt/pen-4522");
     mockIssueService.getById.mockResolvedValue({
       id: "issue-1",
+      companyId: "company-1",
       checkoutRunId: RUN_SIBLING,
       executionRunId: RUN_SIBLING,
     });
@@ -260,6 +261,7 @@ describe("the issue-lock gate runs before anything is written", () => {
     const dir = await makeDir("wt/pen-5352");
     mockIssueService.getById.mockResolvedValue({
       id: "issue-1",
+      companyId: "company-1",
       checkoutRunId: RUN_SELF,
       executionRunId: RUN_SELF,
     });
@@ -280,14 +282,34 @@ describe("the issue-lock gate runs before anything is written", () => {
     expect(res.body.refusal).toContain("ISSUE LOCK UNVERIFIED");
   });
 
-  it("treats a missing issue as a determination, not as an unverifiable lookup", async () => {
+  it("reports an unresolvable issue reference as such, not as a lock verdict", async () => {
+    // Reporting a typo as NOT HELD sent an agent to paperclipCheckoutIssue for
+    // a row that does not exist (Ally, #3370).
     const dir = await makeDir("wt/no-such-issue");
     mockIssueService.getById.mockResolvedValue(null);
     const res = await request(await createApp())
       .post("/api/workspace-dir-claims")
       .send({ dirPath: dir, issueId: "PEN-404" });
-    expect(res.status).toBe(409);
-    expect(res.body.refusal).toContain("ISSUE LOCK NOT HELD");
+    expect(res.status).toBe(400);
+    expect(res.body.refusal).toContain("ISSUE REFUSED");
+    expect(res.body.refusal).not.toContain("ISSUE LOCK NOT HELD");
+  });
+
+  it("refuses another company's issue without echoing its lock holder", async () => {
+    const dir = await makeDir("wt/cross-tenant");
+    mockIssueService.getById.mockResolvedValue({
+      id: "issue-9",
+      companyId: "company-2",
+      checkoutRunId: RUN_SIBLING,
+      executionRunId: RUN_SIBLING,
+    });
+    const res = await request(await createApp())
+      .post("/api/workspace-dir-claims")
+      .send({ dirPath: dir, issueId: "OTHER-1" });
+    expect(res.status).toBe(403);
+    // The holder is the leak: a cross-tenant id must not be distinguishable
+    // from a missing one by what comes back.
+    expect(JSON.stringify(res.body)).not.toContain(RUN_SIBLING);
   });
 });
 
@@ -345,6 +367,82 @@ describe("path bounding", () => {
   });
 });
 
+describe("the WRITE LOCATION is confined, not just the directory named", () => {
+  /**
+   * Ally, #3370. `resolveWorkspaceClaimLocation` decides where the claim,
+   * staging, successor-token and evidence files actually go by reading
+   * `<dirPath>/.git` -- content the AGENT controls. Confining `dirPath` alone
+   * left that location free to point anywhere the SERVER's uid can write,
+   * which is a wider view of the volume than any agent pod has.
+   */
+  it("refuses a `.git` pointer file aiming the claim outside every root", async () => {
+    const outside = await realpath(await mkdtemp(path.join(os.tmpdir(), "pen5352-gitdir-")));
+    try {
+      const dir = await makeDir("wt/pointer");
+      await writeFile(path.join(dir, ".git"), `gitdir: ${outside}\n`);
+      const res = await request(await createApp()).post("/api/workspace-dir-claims").send({ dirPath: dir });
+      expect(res.status).toBe(400);
+      expect(res.body.refusal).toContain("PATH REFUSED");
+      expect(res.body.refusal).toContain("claim location");
+      // Nothing may have been written through the pointer.
+      await expect(readFile(path.join(outside, "paperclip-dir-claim.json"), "utf8")).rejects.toThrow();
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses a `.git` SYMLINK to a directory outside every root", async () => {
+    const outside = await realpath(await mkdtemp(path.join(os.tmpdir(), "pen5352-gitlink-")));
+    try {
+      const dir = await makeDir("wt/gitlink");
+      await symlink(outside, path.join(dir, ".git"));
+      const res = await request(await createApp()).post("/api/workspace-dir-claims").send({ dirPath: dir });
+      expect(res.status).toBe(400);
+      expect(res.body.refusal).toContain("PATH REFUSED");
+      await expect(readFile(path.join(outside, "paperclip-dir-claim.json"), "utf8")).rejects.toThrow();
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  it("release is confined the same way, so it cannot become an unbounded rm", async () => {
+    const outside = await realpath(await mkdtemp(path.join(os.tmpdir(), "pen5352-relgit-")));
+    try {
+      const dir = await makeDir("wt/release-pointer");
+      await writeFile(path.join(dir, ".git"), `gitdir: ${outside}\n`);
+      const res = await request(await createApp())
+        .post("/api/workspace-dir-claims/release")
+        .send({ dirPath: dir });
+      expect(res.status).toBe(400);
+      expect(res.body.released).toBe(false);
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  });
+
+  // Positive control for the new check: the ordinary checkout must still work,
+  // and its claim must land in the git dir rather than the working tree.
+  it("positive control: a real git checkout inside a root still acquires, into its git dir", async () => {
+    const dir = await makeDir("wt/real-checkout");
+    await mkdir(path.join(dir, ".git"), { recursive: true });
+    const res = await request(await createApp()).post("/api/workspace-dir-claims").send({ dirPath: dir });
+    expect(res.status).toBe(200);
+    expect(res.body.acquired).toBe(true);
+    const claim = JSON.parse(await readFile(path.join(dir, ".git", "paperclip-dir-claim.json"), "utf8"));
+    expect(claim.runId).toBe(RUN_SELF);
+  });
+
+  // The asymmetry that makes the check usable: dirPath strict, write location
+  // inclusive. A directory exactly one segment below a root stages into the
+  // root itself, which must be allowed.
+  it("allows a directory one segment below the root, whose scratch dir IS the root", async () => {
+    const dir = await makeDir("one-deep");
+    const res = await request(await createApp()).post("/api/workspace-dir-claims").send({ dirPath: dir });
+    expect(res.status).toBe(200);
+    expect(res.body.acquired).toBe(true);
+  });
+});
+
 describe("actor requirements", () => {
   it("refuses a board user: a claim with no run behind it could never be shown finished", async () => {
     const app = await createApp({ actor: { type: "board", userId: "u1", source: "session" } });
@@ -398,6 +496,31 @@ describe("resolveWorkspaceClaimRoots", () => {
         PAPERCLIP_WORKSPACE_CLAIM_ROOTS: "/mnt/a:/mnt/a/:/mnt/a",
       } as NodeJS.ProcessEnv),
     ).toEqual(["/mnt/a"]);
+  });
+
+  it("expands {companyId}, and drops such a root entirely for a run with no company", async () => {
+    const { resolveWorkspaceClaimRoots } = await load();
+    expect(
+      resolveWorkspaceClaimRoots(
+        { PAPERCLIP_WORKSPACE_CLAIM_ROOTS: "/paperclip/companies/{companyId}" } as NodeJS.ProcessEnv,
+        "company-1",
+      ),
+    ).toEqual(["/paperclip/companies/company-1"]);
+    // Fails closed: no company means no root, rather than a literal path.
+    expect(
+      resolveWorkspaceClaimRoots(
+        { PAPERCLIP_WORKSPACE_CLAIM_ROOTS: "/paperclip/companies/{companyId}" } as NodeJS.ProcessEnv,
+        null,
+      ),
+    ).toEqual([]);
+  });
+
+  it("inclusive containment permits the root itself; strict does not", async () => {
+    const { isInsideRootInclusive, isStrictlyInsideRoot } = await load();
+    expect(isInsideRootInclusive("/paperclip", "/paperclip")).toBe(true);
+    expect(isStrictlyInsideRoot("/paperclip", "/paperclip")).toBe(false);
+    expect(isInsideRootInclusive("/paperclip", "/paperclip-other")).toBe(false);
+    expect(isInsideRootInclusive("/paperclip", "/")).toBe(false);
   });
 
   it("is a path test, not a prefix test: a sibling name is not inside", async () => {
