@@ -1588,6 +1588,30 @@ export function renderUnlandedEligible(
  * ejection rule, so this cohort costs no API call and needs no durable store
  * shared between fires.
  *
+ * ## What BLO-51664 changed, and what it did not (measured 2026-11-04)
+ *
+ * `classifyAll` now spends the cap OLDEST PR FIRST. That narrows WHICH PRs
+ * this cohort can name; it does not make it vacuous, and the difference is a
+ * reachability question that one healthy sample cannot settle. Oldest-first
+ * bounds how long a PR stays deferred only if the PRs that WIN the slots then
+ * leave. When they do not, the budget is pinned and everything newer starves
+ * structurally rather than transiently.
+ *
+ * Worked member, same day: #3215 spent 21.2h judgeable with zero
+ * `added_to_merge_queue` and zero `auto_merge_enabled` events in its entire
+ * timeline, deferred `cap:10-per-fire` at every saturated sweep. That is
+ * `everOfferedQueueSlot === false` past CAP_STARVED_HOURS exactly — reached
+ * under oldest-first allocation, not before it. (It was enqueued on the
+ * 08:45Z fire of 2026-11-04 and left the cohort; the point is the day it
+ * spent inside it with no detector able to name it.)
+ *
+ * So do not read a quiet queue as evidence this cohort is now unreachable,
+ * and do not replace `everOfferedQueueSlot` with an age test on the grounds
+ * that the starved set is now always young. On 2026-11-04T07:28Z it was
+ * (#3376 #3375 #3374 #3372, the newest band); at 11:28Z the day before it was
+ * not. The discriminator is the absence of an offered slot, which is true of
+ * both.
+ *
  * ## Why twelve hours
  *
  * Measured 2026-11-03 over the 30 most recent merges to `master`
@@ -3113,6 +3137,16 @@ export const repoRunner =
     // test, then this spread), so `runRepo` opens with an
     // `Array.isArray(starved)` throw naming the slot, which fails the suite
     // rather than letting a third one through.
+    //
+    // STANDING INSTRUCTION (CTO, 2026-11-04, PEN-5391 / PEN-5386). Before a
+    // FIFTH cohort is added here, convert `repoRunner` and `runRepo` from
+    // positional vectors to named options objects, in its own commit, ahead
+    // of the cohort. Recorded in the file rather than in a closed issue
+    // thread because the next author to need it will be reading this line and
+    // not that thread. The append-plus-throw discipline above is what the
+    // fourth cohort did instead, and it held — but both defences still depend
+    // on the next author remembering to extend them, which is the property
+    // the conversion removes.
     const options = notify.has(repo) ? [{ landable: false }] : [];
     let rows;
     try {
