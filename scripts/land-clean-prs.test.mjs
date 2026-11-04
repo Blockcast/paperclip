@@ -2722,6 +2722,11 @@ describe("rate-limit retry in gh() (BLO-51665)", () => {
     console.log = (line) => lines.push(String(line));
     try {
       assert.throws(() =>
+        // `starved` (PEN-5391) sits between `stranded` and the options bag.
+        // Omitting it silently bound this stub to `starved`, leaving `fetch`
+        // defaulted to the real network call -- which is how this read green
+        // against a live GraphQL error instead of the injected refusal. It is
+        // no longer silent: `runRepo` now rejects a non-array in slot 7.
         runRepo("a/one", true, 0, 0, [], [], [], {
           fetch: () => { throw refused(); },
         }),
