@@ -277,9 +277,11 @@ function spawnScrubbedServer(
       process.off("SIGTERM", forwardSignal);
       process.stdin.removeListener("data", onData);
       process.stdin.removeListener("end", onEnd);
-      // Only an owned proxy is closed. A reused one belongs to another MCP
-      // server still running in this pod, and closing it would wedge that one.
-      if (proxy?.owned) void proxy.close();
+      // The proxy is always this process's own — adoption was removed in
+      // PEN-5641 because a listener this process does not own can vanish
+      // underneath it, leaving GITHUB_HOST pointing at a dead or, worse, a
+      // squatted port. So closing it unconditionally is correct.
+      if (proxy) void proxy.close();
     };
 
     const fail = (error: Error) => {

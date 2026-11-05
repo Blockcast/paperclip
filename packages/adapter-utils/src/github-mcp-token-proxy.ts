@@ -47,6 +47,35 @@
 // checked rather than assumed: a bind failure disables the proxy and leaves the
 // previous behaviour exactly as it was.
 //
+// ## No adoption: one proxy per server, owned for that server's whole life
+//
+// An earlier revision adopted an already-bound :80 when a health probe showed
+// the listener was one of ours, reasoning that the proxy holds no per-session
+// state. The flaw is not state, it is LIFETIME. The listener lives inside its
+// owner's runtime process and is unref'd, so when the owning MCP server exits
+// the port goes away — while every adopting server still has
+// `GITHUB_HOST=http://127.0.0.1` baked into the environment it was spawned
+// with. From that moment its every call fails ECONNREFUSED for the rest of the
+// session, which is WORSE than the defect this module fixes (that at least
+// works until the first rotation), and fail-open cannot rescue it because
+// GITHUB_HOST was exported at spawn and is never re-read.
+//
+// The second-order consequence is the one that settles it: once the port is
+// free, ANY local process may bind `127.0.0.1:80` and will then receive the
+// adopters' requests — carrying their boot-time GITHUB_PERSONAL_ACCESS_TOKEN
+// in cleartext, because the inert credential is only inert while OUR listener
+// is the one overwriting it. A credential-disclosure path is not a trade worth
+// making for a second server's rotation coverage.
+//
+// So a bound port is never adopted. The cost is explicit and accepted: when a
+// pod runs more than one GitHub MCP server, the first gets rotation coverage
+// and the others keep the credential they booted with, exactly as they did
+// before this module existed. Giving every server its own proxy means giving
+// each a distinct loopback address (all of 127/8 is on `lo`, and upstream
+// `parseAPIHost` treats any such host as GHES) — tracked as follow-up work,
+// because it also requires `gh paperclip-auth-check` to report per-server
+// coverage rather than a single URL.
+//
 // ## Fail-open, loudly
 //
 // If the proxy cannot start, the caller leaves GITHUB_HOST unset and the server
@@ -127,8 +156,6 @@ export interface GitHubMcpTokenProxyHandle {
   /** Value to export as GITHUB_HOST for the MCP server child. */
   ghHost: string;
   port: number;
-  /** False when an already-running proxy was reused; see start(). */
-  owned: boolean;
   close(): Promise<void>;
 }
 
@@ -344,31 +371,15 @@ export function createProxyHandler(options: GitHubMcpTokenProxyOptions = {}) {
   };
 }
 
-/** Probe whether an already-bound :80 is one of our proxies rather than an
- *  unrelated listener. Reuse is safe and intended: the proxy holds no
- *  per-session state, so several MCP servers in one pod can share one. */
-function probeExistingProxy(bindAddress: string, port: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const req = httpRequest(
-      { host: bindAddress, port, path: PROXY_HEALTH_PATH, method: "GET", timeout: 2000 },
-      (res) => {
-        let text = "";
-        res.setEncoding("utf8");
-        res.on("data", (c: string) => { text += c; });
-        res.on("end", () => resolve(res.statusCode === 200 && text.trim() === PROXY_HEALTH_MARKER));
-      },
-    );
-    req.on("error", () => resolve(false));
-    req.on("timeout", () => { req.destroy(); resolve(false); });
-    req.end();
-  });
-}
-
 /**
- * Start the proxy, or adopt one already running in this pod.
+ * Start a proxy this process owns for its whole life.
  *
  * Returns null when the proxy is not applicable or cannot start — the caller
  * then leaves GITHUB_HOST alone. See the fail-open note in the module header.
+ *
+ * A bound port is NEVER adopted, even when the health marker says it is one of
+ * ours. See the "no adoption" note in the module header: a listener this
+ * process does not own can disappear underneath it.
  */
 export async function startGitHubMcpTokenProxy(
   options: GitHubMcpTokenProxyOptions = {},
@@ -436,22 +447,24 @@ export async function startGitHubMcpTokenProxy(
     // lifetime is the child server's, and an unref'd listener lets the process
     // exit when that child does.
     server.unref();
+    // Report the port actually bound, not the one requested: with port 0 the
+    // kernel assigns an ephemeral one, and a handle that echoed the request
+    // back would name a port nothing is listening on. Production always asks
+    // for :80, where the two coincide, so only tests exercise the difference.
+    const address = server.address();
+    const boundPort = typeof address === "object" && address ? address.port : port;
     return {
       ghHost: `http://${bindAddress}`,
-      port,
-      owned: true,
+      port: boundPort,
       close: () => new Promise<void>((resolve) => server.close(() => resolve())),
     };
   }
 
-  if (listened === "in-use" && (await probeExistingProxy(bindAddress, port))) {
-    notify(`reusing the proxy already listening on ${bindAddress}:${port}`);
-    return { ghHost: `http://${bindAddress}`, port, owned: false, close: async () => {} };
-  }
-
   if (listened === "in-use") {
+    // Deliberately not adopted, not even when the health marker says the
+    // listener is one of ours. See "no adoption" in the module header.
     notify(
-      `${bindAddress}:${port} is held by something that is not this proxy; the MCP GitHub tools will keep the credential they start with and will NOT survive a token rotation (PEN-5641)`,
+      `${bindAddress}:${port} is already bound, so this server gets no proxy; it will keep the credential it starts with and will NOT survive a token rotation (PEN-5641)`,
     );
   }
   return null;
