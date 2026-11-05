@@ -242,8 +242,7 @@ refuse_api_ready() {
 #   - An exact-head `APPROVED` review turns `review/ally-complete` green. That
 #     gate's `isSelfReview` check keys on who authored the PR and its commits,
 #     never on who wrote the review, so it does not fire on a PR the App did not
-#     author — and the agent seat passes authorization on the endpoint that
-#     submits it (measured 422, i.e. authz accepted, body rejected).
+#     author.
 #   - A consolidated-review body carrying a `Reviewed head: <sha>` attestation is
 #     credited on *either* surface. On #676 every consolidated body arrived as a
 #     review object's body, and a count taken only over `issues/{n}/comments`
@@ -257,9 +256,35 @@ refuse_api_ready() {
 # boundary is a credential that is not the reviewer's (PEN-3193 Remediation #1);
 # this exists only until that lands, and should be deleted when it does.
 #
-# The escape hatch is a fixed string rather than a boolean so it cannot be set
-# by accident and is greppable in a transcript: the reviewer's own harness is
-# the one caller that legitimately publishes this evidence.
+# ── Why this is DISARMED by default ──────────────────────────────────────────
+# `/usr/bin/gh` in the agent image *is* this wrapper, and the reviewer agent runs
+# in that same image. The reviewer's own publisher
+# (`.planning/ally-agent/AGENTS.md`) is `gh pr review --comment --body-file
+# <consolidated body>`, escalating to `--approve` when the Critical section is
+# empty — i.e. exactly the two shapes below. The reviewer is therefore caught by
+# its own guard unless it is exempted, and an armed-by-default rollout would
+# refuse every Ally review fleet-wide: `review/ally-complete` and
+# `gate/ally-comment-findings` could never go green and agent merges would stall
+# everywhere. Measured on this branch before this change: all three of the
+# reviewer's publishing shapes were refused.
+#
+# The exemption lives in the reviewer agent's runtime env, which is agent-record
+# configuration and not a file in this repo — so the guard cannot ship armed
+# atomically with it. Arming is therefore a deliberate, ordered rollout:
+#
+#   1. set GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE=i-am-the-reviewer on the reviewer
+#      agent (its adapter config env, or the PR-review wake), and confirm a real
+#      Ally review still publishes;
+#   2. THEN set GH_WRAPPER_REFUSE_REVIEWER_EVIDENCE=refuse-reviewer-evidence on
+#      the agent seats to be guarded.
+#
+# Until step 2 the wrapper behaves exactly as it did before this change, so
+# merging cannot break the fleet; the guard is fully exercised by the tests, and
+# arming it is a config change that can be reverted without a release.
+#
+# Both switches are fixed strings rather than booleans so neither can be set by
+# accident and both are greppable in a transcript.
+REVIEWER_EVIDENCE_ARM='refuse-reviewer-evidence'
 REVIEWER_EVIDENCE_ESCAPE='i-am-the-reviewer'
 
 # The canonical consolidated-review heading, matched with the slack the gate's
@@ -270,9 +295,31 @@ REVIEWER_EVIDENCE_ESCAPE='i-am-the-reviewer'
 # what a machine reads.
 REVIEWER_EVIDENCE_RE='^[[:blank:]]{0,3}[#*]*[[:blank:]]*ally[[:blank:]]*(—|--|-)[[:blank:]]*consolidated[[:blank:]]+pr[[:blank:]]+review|^[[:blank:]]{0,3}reviewed[[:blank:]]+head:'
 
+# `APPROVE` is the value GitHub actually accepts: the REST reviews endpoint takes
+# `event=APPROVE` and the GraphQL `PullRequestReviewEvent` enum is `APPROVE`.
+# `APPROVED` is the resulting review *state*, never an input — matching only it
+# left the `gh api` path wide open while the tests pinned a value GitHub rejects.
+# The optional `d` keeps both, so a caller that sends the state name by mistake
+# is still caught.
+REVIEWER_EVIDENCE_APPROVAL_RE='^--approve$|event"?[[:blank:]]*[=:][[:blank:]]*"?approved?([^a-z]|$)'
+
 reviewer_evidence_refusal() {
   echo "gh-token-wrapper: refusing to ${1} as \`allyblockcast[bot]\`: this run's GH_TOKEN is the Ally App installation token, so the write would publish under the identity the review gates credit as reviewer evidence (PEN-3193). You are the PR author here, not the reviewer. If you are the reviewer's own harness, set GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE=${REVIEWER_EVIDENCE_ESCAPE}." >&2
   exit 1
+}
+
+# Armed only when the seat opts in, and never for a caller carrying the
+# reviewer's exemption. Checked before any body is read so an unarmed seat pays
+# nothing for this guard.
+reviewer_evidence_armed() {
+  case "${GH_WRAPPER_REFUSE_REVIEWER_EVIDENCE:-}" in
+    "${REVIEWER_EVIDENCE_ARM}") ;;
+    *) return 1 ;;
+  esac
+  case "${GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE:-}" in
+    "${REVIEWER_EVIDENCE_ESCAPE}") return 1 ;;
+  esac
+  return 0
 }
 
 # Emits every candidate body this invocation would send. `mode` splits the two
@@ -309,6 +356,45 @@ reviewer_evidence_bodies() {
   done
 }
 
+# Emits only the places an approval *event* can legitimately travel: the
+# `--approve` flag, and — on `gh api` — the values of field flags and the body of
+# `--input`, which is where `event=APPROVE` and the GraphQL mutation text arrive.
+#
+# Deliberately NOT every argv element. The previous version scanned all of argv,
+# so an author comment that merely quoted `event=approved` — while discussing
+# this very guard, say — was refused as an approval. `body=` is skipped for the
+# same reason: an approval event never travels in a comment body, but prose
+# about one does.
+reviewer_evidence_approval_tokens() {
+  mode="$1"
+  shift
+  while [ "$#" -gt 0 ]; do
+    a="$1"
+    shift
+    case "${a}" in
+      --approve)
+        printf '%s\n' --approve
+        continue
+        ;;
+    esac
+    [ "${mode}" = api ] || continue
+    v=""
+    case "${a}" in
+      --field=* | --raw-field=* | --input=*) v="${a#*=}" a="${a%%=*}" ;;
+      -f?* | -F?*) v="${a#-?}" a="${a%"${v}"}" ;;
+      -f | -F | --field | --raw-field | --input)
+        v="${1:-}"
+        shift
+        ;;
+      *) continue ;;
+    esac
+    case "${a}" in
+      --input) reviewer_evidence_cat "${v}" ;;
+      *) case "${v}" in body=*) ;; *) printf '%s\n' "${v}" ;; esac ;;
+    esac
+  done
+}
+
 # `-` means stdin, which by this point lives in REVIEWER_EVIDENCE_STDIN. An
 # unreadable path emits nothing rather than failing: this function only decides
 # whether to refuse, and the real gh is the right place for that error.
@@ -322,26 +408,23 @@ reviewer_evidence_cat() {
 }
 
 refuse_reviewer_evidence() {
-  case "${GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE:-}" in
-    "${REVIEWER_EVIDENCE_ESCAPE}") return 0 ;;
-  esac
+  reviewer_evidence_armed || return 0
 
-  # 1. Approval events — the strongest surface, and argv alone decides it.
-  # GitHub already bars the App approving a PR it authored (PEN-2015); what this
-  # closes is the case that bar does not reach, a PR the App did not author.
-  # `COMMENTED` and `REQUEST_CHANGES` are deliberately untouched: COMMENTED is
-  # the state the reviewer's own reviews take on agent-authored PRs, so refusing
-  # it would break the reviewer rather than the forger.
-  for a in "$@"; do
-    case "$(printf '%s' "${a}" | tr '[:upper:]' '[:lower:]')" in
-      --approve | *event=approved* | *'"event":"approved"'* | *event:approved* | *'event: approved'*)
-        reviewer_evidence_refusal "submit an APPROVED pull-request review" ;;
-    esac
-  done
-
-  # 2. Reviewer-shaped bodies, on either credited surface.
   mode=api
   case "${1:-} ${2:-}" in "pr review" | "pr comment") mode=pr ;; esac
+
+  # 1. Approval events — the strongest surface. GitHub already bars the App
+  # approving a PR it authored (PEN-2015); what this closes is the case that bar
+  # does not reach, a PR the App did not author. `COMMENTED` and
+  # `REQUEST_CHANGES` are deliberately untouched: COMMENTED is the state the
+  # reviewer's own reviews take on agent-authored PRs, so refusing it would break
+  # the reviewer rather than the forger.
+  if reviewer_evidence_approval_tokens "${mode}" "$@" |
+    tr '[:upper:]' '[:lower:]' | grep -qE "${REVIEWER_EVIDENCE_APPROVAL_RE}"; then
+    reviewer_evidence_refusal "submit an APPROVED pull-request review"
+  fi
+
+  # 2. Reviewer-shaped bodies, on either credited surface.
   if reviewer_evidence_bodies "${mode}" "$@" | sed 's/\\n/\
 /g' | grep -qiE "${REVIEWER_EVIDENCE_RE}"; then
     reviewer_evidence_refusal "publish a consolidated-review heading or a \`Reviewed head:\` attestation"
@@ -360,9 +443,24 @@ buffer_stdin_for_reviewer_evidence() {
       - | @- | body=@- | query=@- | --body-file=- | --input=- | -F- | -f-) ;;
       *) continue ;;
     esac
-    REVIEWER_EVIDENCE_STDIN="$(mktemp "${TMPDIR:-/tmp}/gh-stdin.XXXXXX")"
-    cat > "${REVIEWER_EVIDENCE_STDIN}"
-    exec < "${REVIEWER_EVIDENCE_STDIN}"
+    reviewer_evidence_buf="$(mktemp "${TMPDIR:-/tmp}/gh-stdin.XXXXXX")"
+    cat > "${reviewer_evidence_buf}"
+    # Hold the buffer open twice — fd 0 so the real gh reads the body verbatim
+    # after `exec`, fd 9 so the guard can read it — then unlink it. Both
+    # descriptions survive the unlink, so a body full of PR text stops existing in
+    # $TMPDIR the moment it is buffered instead of outliving the process. Nothing
+    # could clean it up later: this wrapper `exec`s the real gh, so an EXIT trap
+    # would never run. Re-opening /proc/self/fd/9 yields a fresh description at
+    # offset 0, so the guard can still read the body more than once.
+    exec 9<"${reviewer_evidence_buf}"
+    exec <"${reviewer_evidence_buf}"
+    if [ -r /proc/self/fd/9 ]; then
+      rm -f -- "${reviewer_evidence_buf}"
+      REVIEWER_EVIDENCE_STDIN=/proc/self/fd/9
+    else
+      # No /proc to re-open through, so the path has to stay for the guard to read.
+      REVIEWER_EVIDENCE_STDIN="${reviewer_evidence_buf}"
+    fi
     return 0
   done
 }
