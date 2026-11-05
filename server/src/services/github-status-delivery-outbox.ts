@@ -401,30 +401,35 @@ async function failPermanentDelivery(
  * after this row was queued" proves the live evaluation landed.
  */
 async function processGateReevaluation(db: Db, row: DeliveryRow): Promise<void> {
-  const latestStatus = await githubGetLatestCommitStatusForContext({
-    repoFullName: row.repoFullName,
-    sha: row.sha,
-    context: row.context,
-  });
-  if (!latestStatus.ok) {
-    if (latestStatus.retryable) {
-      await retryOrFailDelivery(db, row, latestStatus.reason, { latestStatus });
-    } else {
-      await failPermanentDelivery(db, row, latestStatus.reason, { latestStatus });
+  // A coalesced row (forceWrite) was queued while another evaluation held this
+  // head. That holder's status lands after `createdAt` from reads that may
+  // predate the trigger, so here a fresh status proves nothing (BLO-52499).
+  if (!row.forceWrite) {
+    const latestStatus = await githubGetLatestCommitStatusForContext({
+      repoFullName: row.repoFullName,
+      sha: row.sha,
+      context: row.context,
+    });
+    if (!latestStatus.ok) {
+      if (latestStatus.retryable) {
+        await retryOrFailDelivery(db, row, latestStatus.reason, { latestStatus });
+      } else {
+        await failPermanentDelivery(db, row, latestStatus.reason, { latestStatus });
+      }
+      return;
     }
-    return;
-  }
-  const latestCreatedAt = latestStatus.status?.createdAt ? Date.parse(latestStatus.status.createdAt) : NaN;
-  if (statusCreatedAtOrAfterQueueSecond(latestCreatedAt, row.createdAt)) {
-    await markTerminal(
-      db,
-      row,
-      "skipped",
-      "info",
-      `Skipped comment-review gate re-evaluation for ${row.context} on ${row.repoFullName}@${row.sha.slice(0, 7)} because the live evaluation already published`,
-      { reason: "live_evaluation_published", latestStatus: latestStatus.status },
-    );
-    return;
+    const latestCreatedAt = latestStatus.status?.createdAt ? Date.parse(latestStatus.status.createdAt) : NaN;
+    if (statusCreatedAtOrAfterQueueSecond(latestCreatedAt, row.createdAt)) {
+      await markTerminal(
+        db,
+        row,
+        "skipped",
+        "info",
+        `Skipped comment-review gate re-evaluation for ${row.context} on ${row.repoFullName}@${row.sha.slice(0, 7)} because the live evaluation already published`,
+        { reason: "live_evaluation_published", latestStatus: latestStatus.status },
+      );
+      return;
+    }
   }
 
   const fencedRow = await refreshDeliveryClaimBeforeExternalWrite(db, row);
@@ -641,6 +646,13 @@ export async function enqueueGithubCommitStatusDelivery(
   } in ('delivered', 'skipped') and ${
     githubCommitStatusDeliveries.sourceRunId
   } = ${sourceRunId})`;
+  // A coalesced re-evaluation (reevaluate + forceWrite, BLO-52499) stays forced,
+  // and keeps its earlier due time, when the webhook's backstop for a later
+  // trigger lands on it: the status that backstop's freshness check would accept
+  // may come from a holder whose reads predate the coalesced trigger.
+  const keepCoalescedReevaluation = input.reevaluate
+    ? sql`${githubCommitStatusDeliveries.status} = 'queued' and ${githubCommitStatusDeliveries.reevaluate} and ${githubCommitStatusDeliveries.forceWrite}`
+    : sql`false`;
   // Scrub BEFORE this 140-char cap, not only at the send. The replay path
   // hands `row.description` to githubPostCommitStatusDetailed, which scrubs
   // it — but by then the value has already been truncated here, and a
@@ -699,13 +711,13 @@ export async function enqueueGithubCommitStatusDelivery(
         prNumber: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prNumber} else ${input.prNumber} end`,
         prUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.prUrl} else ${input.prUrl ?? null} end`,
         state: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.state} else ${input.state} end`,
-        forceWrite: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.forceWrite} else ${input.forceWrite ?? false} end`,
+        forceWrite: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.forceWrite} when ${keepCoalescedReevaluation} then true else ${input.forceWrite ?? false} end`,
         reevaluate: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.reevaluate} else ${input.reevaluate ?? false} end`,
         description: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.description} else ${scrubbedDescription} end`,
         targetUrl: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.targetUrl} else ${input.targetUrl ?? null} end`,
         status: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.status} else 'queued' end`,
         attempts: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.attempts} else 0 end`,
-        nextAttemptAt: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.nextAttemptAt} else ${dueAtSql} end`,
+        nextAttemptAt: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.nextAttemptAt} when ${keepCoalescedReevaluation} then least(${githubCommitStatusDeliveries.nextAttemptAt}, ${dueAtSql}) else ${dueAtSql} end`,
         lastError: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.lastError} else null end`,
         lastErrorKind: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.lastErrorKind} else null end`,
         lastResult: sql`case when ${preserveExistingDelivery} then ${githubCommitStatusDeliveries.lastResult} else null end`,

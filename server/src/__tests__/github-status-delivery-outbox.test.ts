@@ -1251,6 +1251,82 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       });
     });
 
+    // The holder's reads may predate the coalesced trigger, and its status
+    // lands after the row was queued, so "a status was written after this row"
+    // must not skip a coalesced row the way it skips the webhook backstop.
+    it("re-evaluates a coalesced row even when a status was written after it was queued (BLO-52499)", async () => {
+      setCreds();
+      h.cfg.prCommentReviewGateStatusContext = GATE_CONTEXT;
+      const delivery = await enqueueGithubCommitStatusDelivery(db, {
+        companyId: null,
+        sourceRunId: null,
+        repoFullName: "Blockcast/frr",
+        sha: HEAD_SHA,
+        context: GATE_CONTEXT,
+        state: "pending",
+        description: "Comment-review gate re-evaluation queued.",
+        reevaluate: true,
+        forceWrite: true,
+        prNumber: 105,
+        prUrl: "https://github.com/Blockcast/frr/pull/105",
+      });
+      const fetchMock = stubGithub({
+        // The holder's stale green, published after the row was queued.
+        latestStatuses: [{ context: GATE_CONTEXT, state: "success", created_at: new Date(Date.now() + 2_000).toISOString() }],
+        reviews: [
+          {
+            user: { login: "allyblockcast[bot]" },
+            state: "COMMENTED",
+            submitted_at: "2026-09-26T16:45:29Z",
+            body: `## Ally — Consolidated PR Review\nReviewed head: ${HEAD_SHA}\n### Important Issues (1)\nFix before merge.`,
+          },
+        ],
+        comments: [],
+      });
+
+      await pollGitHubCommitStatusDeliveriesOnce(db);
+
+      expect(await readDelivery(delivery.id)).toMatchObject({ status: "delivered", lastResult: { reason: "reevaluated" } });
+      expect(postedGateStates(fetchMock)).toEqual(["failure"]);
+    });
+
+    it("keeps a coalesced re-evaluation forced and due when a later webhook backstop lands on it (BLO-52499)", async () => {
+      h.cfg.prCommentReviewGateStatusContext = GATE_CONTEXT;
+      const before = Date.now();
+      // The shape the gate queues when it coalesces behind a holder.
+      await enqueueGithubCommitStatusDelivery(db, {
+        companyId: null,
+        sourceRunId: null,
+        repoFullName: "Blockcast/frr",
+        sha: HEAD_SHA,
+        context: GATE_CONTEXT,
+        state: "pending",
+        description: "Comment-review gate re-evaluation queued.",
+        reevaluate: true,
+        forceWrite: true,
+        delayMs: 15_000,
+        prNumber: 105,
+        prUrl: "https://github.com/Blockcast/frr/pull/105",
+      });
+      // The webhook's pre-ack backstop for the next trigger: unforced, 15 min out.
+      const row = await enqueueGithubCommitStatusDelivery(db, {
+        companyId: null,
+        sourceRunId: null,
+        repoFullName: "Blockcast/frr",
+        sha: HEAD_SHA,
+        context: GATE_CONTEXT,
+        state: "pending",
+        description: "Comment-review gate re-evaluation queued.",
+        reevaluate: true,
+        delayMs: 15 * 60_000,
+        prNumber: 106,
+        prUrl: "https://github.com/Blockcast/frr/pull/106",
+      });
+
+      expect(row).toMatchObject({ status: "queued", reevaluate: true, forceWrite: true, prNumber: 106 });
+      expect(row.nextAttemptAt.getTime()).toBeLessThan(before + 60_000);
+    });
+
     it("holds the first attempt back by the requested delay", async () => {
       const before = Date.now();
       h.cfg.prCommentReviewGateStatusContext = GATE_CONTEXT;
