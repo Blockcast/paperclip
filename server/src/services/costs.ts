@@ -665,7 +665,20 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             inArray(activityLog.runId, windowedRunIds),
           ),
         )
-        .orderBy(activityLog.runId, desc(activityLog.createdAt))
+        // PEN-5624: `activity_log.created_at` is `defaultNow()`, which renders as `now()`
+        // -- TRANSACTION start time, constant within a transaction. Two issue activity
+        // rows written by one run in one transaction therefore tie by CONSTRUCTION, and
+        // `DISTINCT ON` would otherwise keep whichever row the executor presented first,
+        // letting attribution flip between requests over identical data.
+        //
+        // `activityLog.id` is `defaultRandom()` -- a v4 UUID with NO time component. So
+        // this tiebreaker makes the pick STABLE, not recency-correct: at a true
+        // `created_at` tie there is no recency answer to be faithful to, and this picks
+        // arbitrarily but deterministically. Stable beats flapping; a genuinely
+        // recency-correct tiebreaker would need a per-statement monotonic column that
+        // does not exist today (e.g. `clock_timestamp()`), which is a schema change.
+        // Totals are unaffected either way -- run-dedup already yields one row per run.
+        .orderBy(activityLog.runId, desc(activityLog.createdAt), desc(activityLog.id))
         .as("run_project_links");
 
       const effectiveProjectId = sql<string | null>`coalesce(${costEvents.projectId}, ${runProjectLinks.projectId})`;
