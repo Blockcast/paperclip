@@ -15271,6 +15271,56 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.status).toBe("in_progress");
   });
 
+  it("BLO-53492: a reconciler unblock does not re-escalate a recovery issue off the same failed run", async () => {
+    // The 4-step cycle: (1) a recovery issue's run fails; (2) the sweep escalates it
+    // in place to `blocked` with no blocker edge and no recovery action; (3) the
+    // BLO-21523 reconciler flips it back to `todo`, logging
+    // `issue.stranded_blocked_reconciled`; (4) the next sweep re-reads the SAME
+    // failed run. Before the fix step 4 re-blocked it, forever.
+    const sourceIssueId = randomUUID();
+    const { companyId, issueId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "failed",
+    });
+    await db
+      .update(issues)
+      .set({ title: "Recover stalled issue PAP-1", originKind: "stranded_issue_recovery", originId: sourceIssueId })
+      .where(eq(issues.id, issueId));
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values({
+      id: sourceIssueId,
+      companyId,
+      title: "Original stranded source",
+      status: "done",
+      priority: "medium",
+      issueNumber: 2,
+      identifier: `${issuePrefix}-2`,
+    });
+
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.escalated).toBe(1);
+    const blocked = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(blocked?.status).toBe("blocked");
+
+    // What `stranded-blocked-issue-reconciler.ts` writes.
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+    await db.insert(activityLog).values({
+      id: randomUUID(),
+      companyId,
+      actorType: "system",
+      actorId: "stranded-blocked-issue-reconciler",
+      action: "issue.stranded_blocked_reconciled",
+      entityType: "issue",
+      entityId: issueId,
+      details: { statusBefore: "blocked", statusAfter: "todo" },
+    });
+
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.escalated).toBe(0);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("todo");
+  });
+
   // BLO-8050: generalize the BLO-7521 "operator-just-unblocked" gate across
   // the escalation callsites. Without these gates, an issue with a stale
   // failing run gets re-flipped to `blocked` on the next sweep even though
