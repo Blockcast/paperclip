@@ -317,6 +317,54 @@ never toward a false clear. A false alarm costs a look; a false clear is
 strictly worse than the silence this replaced, because silence at least does not
 claim to have checked.
 
+### `observed` proves the state was reached, not that your reason is why
+
+The table above is about absence. This is its converse, and it is the one false
+clear the agent-declared design does **not** remove: the sweep observes a
+**state**, never a mechanism. `observed` says the declared row reached the
+declared status, or the declared PR merged. It says nothing about *why* — and
+the card's `note`, printed beside that verdict, is free text nothing verified.
+
+Worked instance, 2026-11-05 ([PEN-2965](https://paperclip.blockcast.net/PEN/issues/PEN-2965),
+card `c7cba391`). It declared `issue_status` → PEN-4392 `done`, with the note:
+
+> PEN-4392 reaching `done` means the probe was RUN and its answer recorded. All
+> three documented outcomes land there […] `cancelled` would mean it was never
+> run, which is the one result that does not discharge.
+
+PEN-4392 reached `done` at 2026-11-05T04:16Z, and the probe was never run.
+[penstock-vault-node#1150](https://github.com/Blockcast/penstock-vault-node/pull/1150)
+(merged 03:54Z, `4066f29d`) designed the question out of existence — every
+member is now read under its own banked key, so the cross-member probe the card
+asked about stopped being needed. **Both halves of that note inverted in the
+event:** the row reached `done` without the probe, and the card ended
+`cancelled` while the dependency it gated *was* discharged. A note that
+enumerates outcomes is not thereby exhaustive — it is a guess about mechanism
+wearing the shape of a case analysis.
+
+⚠ **This card never entered the sweep, and that is the point, not an excuse.**
+It went `pending` → `cancelled` and never reached `accepted`, so
+`WHERE ti.status = 'accepted'` excluded it throughout. It is a *replayable*
+false clear rather than one this sweep served: an accepted card carrying that
+same declaration would have resolved PEN-4392 to `done` through the
+`issue_status` observer above and bucketed `observed`, with the false note
+printed beside the green as corroboration.
+
+Note what was *not* wrong: the declaration was well-formed and the sweep would
+have resolved exactly the row it named. AMENDMENT 1 removed the **wrong object**
+failure; this is the **right object, wrong meaning** failure, and no observer
+can close it, because the cause is not in the database at all. So it is closed
+at the ask instead — a `note` must state what the status change is **evidence
+of**, never what **caused** it. *"Done means this row is no longer a gate on
+T9"* would have been true in every branch; *"done means the probe was run"* was
+not. The rule is carried to filing agents by the `note` field's own
+`.describe()` text in `packages/shared/src/validators/issue.ts`, which is the
+only channel that reaches them.
+
+⚠ So when you action or acknowledge an `observed` card, check the object rather
+than the bucket — the same discipline the `unobserved` path already demands, for
+the opposite reason.
+
 ## `PaperclipAcceptedInteractionUntracked`
 
 `info`. Acceptances are sitting with **no** `expectedOutcome` at all, so nothing
