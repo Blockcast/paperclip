@@ -4857,7 +4857,14 @@ export function issueRoutes(
    * owes have committed together, so the work is already guaranteed to happen:
    * `processCommentEffects` writes a failed effect back as `queued`/`failed`
    * with a backoff (`releaseEffect`) BEFORE it rethrows, and
-   * `startIssueCommentEffectReconciler` polls for due work every second. The
+   * `startIssueCommentEffectReconciler` polls for due work every second.
+   *
+   * That release is itself a write and can fail too — the same deadlock, or a
+   * second blip. Do NOT tighten this catch on the assumption that the row is
+   * always back to `queued`: an un-released row stays `processing` with its
+   * lease, and `listCommentsWithResumableEffects` reclaims it once the lease
+   * expires. Recovery then waits out the lease rather than the backoff, which
+   * is slower but equally certain. The
    * rethrow's only remaining effect was to tell the caller its write had failed
    * about work the system was about to complete regardless — a 503 whose own
    * advice ("replay the request") is at best a no-op. The one traced victim was
@@ -16817,7 +16824,29 @@ export function issueRoutes(
               comment: accepted,
               actor,
               referenceSummaryBefore: commentReferenceSummaryBefore,
-              mentions: mentionContext,
+              // `mentionContext` was resolved from `req.body.body`, but the
+              // intents are built against `accepted`, and those are not always
+              // the same text. The builder has always asked about the PERSISTED
+              // body, so reuse the hoisted answer only when it describes it:
+              //
+              //  - Two concurrent same-key requests can both miss the
+              //    out-of-transaction pre-check and both enter this branch. The
+              //    loser's `svc.addComment` hits `onConflictDoNothing` and
+              //    returns the WINNER's row with `deduplicated: true`. Building
+              //    from the loser's body would enqueue `wake:<agent>:<issue>`
+              //    keys for agents the stored comment never mentions — and
+              //    those keys do not conflict with the winner's, so the
+              //    `(comment_id, effect_key)` dedup cannot catch them. The
+              //    result is a wake for a mention nobody can read.
+              //  - With `censorUsernameInLogs` on, the stored body is
+              //    `redactCurrentUserText(body)`, so a mention token matching
+              //    the OS username survives in the request body and not in the
+              //    persisted one.
+              //
+              // Falling back costs the in-transaction lookup this hoist exists
+              // to remove, but only on those paths: correctness there is worth
+              // more than the lock time, and the common case is unaffected.
+              mentions: accepted.body === req.body.body ? mentionContext : undefined,
             });
             await enqueueCommentEffects(tx as unknown as Db, {
               companyId: currentIssue.companyId,
@@ -16857,11 +16886,14 @@ export function issueRoutes(
     // here via `commentResponseBody()`, so a keyed first write makes two
     // queries. (A keyed replay whose effects already exist makes one.) The two sites are
     // deliberately NOT merged: the pre-insert resolution asks about
-    // `req.body.body`, while this one asks about `persistedComment.body` — the
-    // SAME string on a first write, but on a same-key replay the persisted body
-    // is whatever the original request sent, which a replay carrying a
-    // different body must still be told about. Sharing one memo would silently
-    // answer the response question with the request's body.
+    // `req.body.body`, while this one asks about `persistedComment.body`. Those
+    // usually coincide on a first write, but not always — `censorUsernameInLogs`
+    // stores `redactCurrentUserText(body)`, and a same-key replay (or a loser of
+    // the concurrent-insert race) carries the ORIGINAL request's body, which a
+    // replay sending different text must still be told about. Sharing one memo
+    // would silently answer the response question with the request's body; the
+    // insert transaction guards the same divergence by reusing its hoisted
+    // context only when `accepted.body` matches what it resolved from.
     const persistedComment = comment;
     let resolvedMentionAgentIds: string[] | null = null;
     const resolveMentionedAgentIds = async (): Promise<string[]> => {
