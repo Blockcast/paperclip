@@ -2926,6 +2926,28 @@ export function recoveryService(
   // does not filter on the resulting status. External callers of
   // `.escalateStrandedAssignedIssue(` in `services/heartbeat.ts` are
   // event-driven (not sweep evidence) and out of this gate's scope.
+  async function hasInPlaceRecoveryEscalationForRun(
+    companyId: string,
+    issueId: string,
+    runId: string,
+  ): Promise<boolean> {
+    const [row] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          eq(activityLog.action, "issue.updated"),
+          sql`${activityLog.details} ->> 'source' = 'recovery.reconcile_stranded_recovery_issue'`,
+          sql`${activityLog.details} ->> 'latestRunId' = ${runId}`,
+        ),
+      )
+      .limit(1);
+    return Boolean(row);
+  }
+
   async function latestRunPredatesLatestUnblock(
     companyId: string,
     issueId: string,
@@ -10345,6 +10367,19 @@ export function recoveryService(
         // `latestRunPredatesLatestUnblock` for the full rationale.
         if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
           await requeueAfterStaleUnblock(latestRun);
+          return;
+        }
+        // BLO-53492: the in-place escalation attaches no blocker edge and no
+        // recovery action (nested recovery issues are suppressed), so the
+        // BLO-21523 stranded-blocked reconciler flips the row back to `todo` --
+        // and it logs `issue.stranded_blocked_reconciled`, which the unblock gate
+        // above does not read. Without this check the next sweep re-blocks off the
+        // SAME failed run, forever (measured: >=13 cycles/day per row). One
+        // escalation per failed run; a deliberate skip, not a requeue: requeueing
+        // would trade a free loop for one that burns a run per cycle. The row
+        // stays a visible, assigned `todo`.
+        if (await hasInPlaceRecoveryEscalationForRun(issue.companyId, issue.id, latestRun.id)) {
+          result.skipped += 1;
           return;
         }
         const updated = await escalateStrandedRecoveryIssueInPlace({
