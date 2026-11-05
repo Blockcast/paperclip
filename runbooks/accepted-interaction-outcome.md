@@ -139,8 +139,10 @@ reads, no log access, no database access:
    two fields you want. ⚠ Keep `limit` at or below ~30 — this filter is not
    indexed, and larger pages reliably hit the statement timeout and return
    `503 statement_timeout` / sqlstate `57014`. (PEN-3596 split that code out
-   of `transient_db_conflict`: `57014` is a cancelled statement, not lock
-   contention, and used to be reported as "Database contention".)
+   of `transient_db_conflict`: `57014` is a cancelled statement, not one of
+   the contention states Postgres names, and used to be reported as "Database
+   contention". ⚠ PEN-5244: `57014` says the time bound was exceeded, not what
+   the time went on — it is not evidence that no lock was involved.)
 
 3. **Read the card** with `GET /api/issues/:issueId/interactions` and confirm
    it: `status: "accepted"`, a `resolvedAt` inside the step 1 window, and a

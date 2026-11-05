@@ -29,11 +29,16 @@
 
 /**
  * `query_canceled`. PEN-3596: this is the one member of
- * {@link TRANSIENT_DB_SQLSTATES} that is NOT contention — the statement
- * outran the role's `statement_timeout` and nothing was waiting on a lock.
- * It stays in the retry set (a cancellation under a transient load spike can
- * succeed on replay), but the API boundary reports it separately so a reader
- * is not sent looking for a lock that does not exist.
+ * {@link TRANSIENT_DB_SQLSTATES} that Postgres did not raise by naming a
+ * contention state — the statement outran the role's `statement_timeout` and
+ * was cancelled. It stays in the retry set (a cancellation under a transient
+ * load spike can succeed on replay), but the API boundary reports it
+ * separately so a 57014 is not read as a deadlock or a lock timeout.
+ *
+ * PEN-5244: "and nothing was waiting on a lock" used to close that first
+ * sentence. It does not follow and is removed — this SQLSTATE reports that the
+ * time bound was exceeded, not what the time was spent on, and a statement can
+ * burn its whole budget blocked on a lock and then be cancelled here.
  */
 export const STATEMENT_TIMEOUT_SQLSTATE = "57014";
 
