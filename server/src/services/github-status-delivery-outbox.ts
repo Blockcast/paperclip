@@ -20,7 +20,9 @@ import {
 import { GITHUB_FETCH_DEADLINE_MS } from "./github-fetch.js";
 
 type DeliveryRow = typeof githubCommitStatusDeliveries.$inferSelect;
-// Either handle works for the delivery bookkeeping below.
+// Either handle works for the delivery bookkeeping below. Code reached from
+// inside withGithubStatusDeliveryLock must use the transaction handle so the
+// critical section does not take a second pool connection.
 type DbHandle = Db | DbTransaction;
 type DeliveryTerminalStatus = "delivered" | "skipped" | "failed" | "failed_permanent";
 
@@ -36,32 +38,27 @@ const RETRY_DELAYS_MS = [
   2 * 60 * 60_000,
 ];
 
+// How long a holder may sit idle-in-transaction (i.e. inside its external
+// GitHub calls) before Postgres terminates it and releases the lock. Far above
+// the normal critical-section cost: it exists to make a wedged holder
+// recoverable, not to bound healthy work. It is also the last moment, counted
+// from taking the key, at which a holder may START a GitHub write.
+const DELIVERY_LOCK_HOLD_TIMEOUT_MS = 120_000;
+
 // How long a coalesced re-evaluation, or a forced replay that found the key
 // held, waits for the holder to finish. Holds are typically seconds; a key
 // still held when the row comes due just pushes it back again.
 export const COALESCED_REEVALUATION_DELAY_MS = 15_000;
 
-/**
- * Lease timing. Every fence renews the lease, so a write admitted by a fence
- * has a full TTL in which to finish; the TTL therefore exceeds the longest one
- * GitHub write attempt can take on the client (an installation token mint and
- * the POST, each bounded by ghFetch's deadline) plus a margin. The heartbeat
- * keeps a holder's lease alive through a long read phase, and stops once the
- * holder passes maxHoldMs, so a hung evaluation cannot keep a head forever.
- */
-const LEASE_TIMING = {
-  ttlMs: 90_000,
-  heartbeatMs: 30_000,
-  writeBudgetMs: 2 * GITHUB_FETCH_DEADLINE_MS + 10_000,
-  maxHoldMs: 10 * 60_000,
-  fenceTimeoutMs: 10_000,
-};
-const leaseTiming = { ...LEASE_TIMING };
-
-/** Test-only: shrink the lease timing so expiry and renewal run in milliseconds. */
-export function _setGithubStatusKeyLeaseTimingForTest(timing: Partial<typeof leaseTiming> = {}) {
-  Object.assign(leaseTiming, LEASE_TIMING, timing);
-}
+// The longest one GitHub write attempt can take on the client: an installation
+// token mint and the POST, each bounded by ghFetch's deadline.
+const WRITE_ATTEMPT_MAX_MS = 2 * GITHUB_FETCH_DEADLINE_MS;
+const FENCE_MARGIN_MS = 10_000;
+const FENCE_QUERY_TIMEOUT_MS = 10_000;
+// Long enough that a write admitted at the last permitted moment still ends on
+// the client before anyone else can take the key. ponytail: no heartbeat, so a
+// dead holder blocks its head for up to this long; release N+1 renews instead.
+const GITHUB_STATUS_KEY_LEASE_TTL_MS = DELIVERY_LOCK_HOLD_TIMEOUT_MS + WRITE_ATTEMPT_MAX_MS + FENCE_MARGIN_MS;
 
 /** The holder no longer owns its status key, so it must not write to GitHub. */
 export class GithubStatusKeyLost extends Error {}
@@ -73,26 +70,13 @@ function firstRow(rows: unknown): Record<string, unknown> | undefined {
   return Array.isArray(rows) ? (rows[0] as Record<string, unknown> | undefined) : undefined;
 }
 
-function leaseTtl() {
-  return sql.raw(`interval '${leaseTiming.ttlMs} milliseconds'`);
-}
-
 async function acquireGithubStatusKeyLease(db: Db, leaseKey: string, token: string): Promise<boolean> {
+  const ttl = sql.raw(`interval '${GITHUB_STATUS_KEY_LEASE_TTL_MS} milliseconds'`);
   const rows = await db.execute(sql`
     insert into github_status_key_leases (key, token, expires_at)
-    values (${leaseKey}, ${token}, clock_timestamp() + ${leaseTtl()})
+    values (${leaseKey}, ${token}, clock_timestamp() + ${ttl})
     on conflict (key) do update set token = excluded.token, expires_at = excluded.expires_at
       where github_status_key_leases.expires_at <= clock_timestamp()
-    returning token
-  `);
-  return firstRow(rows) !== undefined;
-}
-
-/** Extend a lease this token still holds; false once it has expired or been taken. */
-async function renewGithubStatusKeyLease(db: Db, leaseKey: string, token: string): Promise<boolean> {
-  const rows = await db.execute(sql`
-    update github_status_key_leases set expires_at = clock_timestamp() + ${leaseTtl()}
-    where key = ${leaseKey} and token = ${token} and expires_at > clock_timestamp()
     returning token
   `);
   return firstRow(rows) !== undefined;
@@ -101,8 +85,9 @@ async function renewGithubStatusKeyLease(db: Db, leaseKey: string, token: string
 async function releaseGithubStatusKeyLease(db: Db, leaseKey: string, token: string): Promise<void> {
   const release = () => db.execute(sql`delete from github_status_key_leases where key = ${leaseKey} and token = ${token}`);
   try {
-    // Once more on failure, so a transient error does not leave a row that
-    // blocks this head until it expires.
+    // Once more on failure: after the holder's backend dies, the first query
+    // can land on the dead connection, and the retry reopens it. A row left
+    // behind would block this head until it expires.
     await release().catch(release);
   } catch (err) {
     // The row frees itself at expiry; the next sweep deletes it.
@@ -118,64 +103,95 @@ async function releaseGithubStatusKeyLease(db: Db, leaseKey: string, token: stri
  * follow-up work instead (BLO-52499). `operation` must call `fence()` before
  * every GitHub write and let a GithubStatusKeyLost propagate.
  *
- * Exclusivity is a lease row (migration 0273), held without a transaction, so
- * a holder keeps no pooled connection across its GitHub calls: it takes one
- * only for the acquire, each fence, each heartbeat and the release. Each fence
- * renews the lease and refuses unless the renewal leaves a full write attempt's
- * time, so a write it admits finishes before anyone else can take the key.
+ * Exclusivity is a lease row (migration 0273), taken before any transaction,
+ * so a contended trigger costs one statement. Release N keeps #3411's
+ * transaction-scoped advisory lock as well, because pods still running #3411
+ * see only that lock during a rolling deploy; the next release drops it, and
+ * with it the pooled connection a holder pins across its GitHub calls.
  */
 export async function withGithubStatusDeliveryLock<T>(
   db: Db,
   key: string,
-  operation: (fence: GithubStatusFence, db: Db) => Promise<T>,
+  operation: (fence: GithubStatusFence, tx: DbTransaction) => Promise<T>,
 ): Promise<T | null> {
   const leaseKey = key.toLowerCase();
   const token = `${hostname()}:${randomUUID()}`;
   if (!(await acquireGithubStatusKeyLease(db, leaseKey, token))) return null;
-  const acquiredAt = performance.now();
-  const pastMaxHold = () => performance.now() - acquiredAt > leaseTiming.maxHoldMs;
 
-  // A renewal never revives a lease that expired or was taken, so the
-  // heartbeat needs no notion of loss: it keeps renewing until the maximum
-  // hold, and the next fence finds out.
-  const heartbeat = setInterval(() => {
-    if (pastMaxHold()) return clearInterval(heartbeat);
-    void renewGithubStatusKeyLease(db, leaseKey, token).catch(() => {});
-  }, leaseTiming.heartbeatMs);
-  heartbeat.unref();
-
-  const fence: GithubStatusFence = async () => {
-    if (pastMaxHold()) throw new GithubStatusKeyLost("max_hold_exceeded");
-    // Charge the renewal's own latency against the holder: the write must still
-    // fit inside the TTL the renewal started.
-    const sentAt = performance.now();
-    let timer: NodeJS.Timeout | undefined;
-    const held = await Promise.race([
-      renewGithubStatusKeyLease(db, leaseKey, token),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new GithubStatusKeyLost("fence_timeout")), leaseTiming.fenceTimeoutMs);
-      }),
-    ]).catch((err) => {
-      throw err instanceof GithubStatusKeyLost ? err : new GithubStatusKeyLost("fence_failed", { cause: err });
-    }).finally(() => clearTimeout(timer));
-    if (!held) throw new GithubStatusKeyLost("lease_not_held");
-    // A backstop while fenceTimeoutMs < ttlMs - writeBudgetMs, as it is by
-    // default; it holds the invariant if that timing ever changes.
-    if (performance.now() - sentAt > leaseTiming.ttlMs - leaseTiming.writeBudgetMs) {
-      throw new GithubStatusKeyLost("lease_expiring");
-    }
-  };
-
+  let running: Promise<T> | undefined;
+  let transactionEnded = false;
   try {
-    return await operation(fence, db);
+    return await db.transaction(async (tx) => {
+      // The critical section performs external GitHub I/O (paginated list
+      // calls and status POSTs with retries), so the holder sits
+      // idle-in-transaction pinning a pool connection. Bound it, or a hung
+      // GitHub call holds the key forever.
+      //
+      // set_config(..., true) is transaction-local; SET LOCAL cannot be
+      // parameterized, so it is spelled this way deliberately.
+      await tx.execute(
+        sql`select set_config('idle_in_transaction_session_timeout', ${`${DELIVERY_LOCK_HOLD_TIMEOUT_MS}ms`}, true)`,
+      );
+      // BRIDGE (release N): the raw, case-preserving key, byte-identical to
+      // #3411's, so a #3411 pod and this one exclude each other.
+      const row = firstRow(
+        await tx.execute(sql`
+          select pg_try_advisory_xact_lock(hashtextextended(${key}, 0)) as acquired,
+                 pg_backend_pid() as pid,
+                 transaction_timestamp()::text as started
+        `),
+      );
+      if (row?.acquired !== true) return null;
+      const pid = Number(row.pid);
+      const started = String(row.started);
+      const fence: GithubStatusFence = async () => {
+        if (transactionEnded) throw new GithubStatusKeyLost("transaction_ended");
+        // On `tx`, not `db`: a second pool connection taken inside the critical
+        // section can wedge the holder on a saturated pool. Bound to this
+        // backend and this transaction, because after the backend dies the
+        // driver can route a later query to a reconnected session that holds
+        // no advisory lock. clock_timestamp(), because now() is frozen at the
+        // transaction's start.
+        const sentAt = performance.now();
+        let timer: NodeJS.Timeout | undefined;
+        const rows = await Promise.race([
+          tx.execute(sql`
+            select (extract(epoch from expires_at - clock_timestamp()) * 1000)::float8 as remaining_ms
+            from github_status_key_leases
+            where key = ${leaseKey} and token = ${token}
+              and pg_backend_pid() = ${pid} and transaction_timestamp()::text = ${started}
+          `),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new GithubStatusKeyLost("fence_timeout")), FENCE_QUERY_TIMEOUT_MS);
+          }),
+        ]).catch((err) => {
+          throw err instanceof GithubStatusKeyLost ? err : new GithubStatusKeyLost("fence_failed", { cause: err });
+        }).finally(() => clearTimeout(timer));
+        const remaining = firstRow(rows)?.remaining_ms;
+        if (remaining === undefined) throw new GithubStatusKeyLost("lease_not_held");
+        // Charge the query's own latency against the holder.
+        if (Number(remaining) - (performance.now() - sentAt) < WRITE_ATTEMPT_MAX_MS + FENCE_MARGIN_MS) {
+          throw new GithubStatusKeyLost("lease_expiring");
+        }
+      };
+      return (running = operation(fence, tx));
+    });
   } catch (err) {
-    if (err instanceof GithubStatusKeyLost) {
-      logger.warn({ key, reason: err.message }, "github-status-delivery-outbox: status key lost before a GitHub write; caller re-queues");
+    // Postgres can end the transaction (idle timeout, terminated backend) while
+    // the operation is still running, so settle on the operation itself.
+    transactionEnded = true;
+    const outcome = running
+      ? await running.then((value) => ({ value }), (error: unknown) => ({ error }))
+      : { error: err };
+    if ("value" in outcome) return outcome.value;
+    if (outcome.error instanceof GithubStatusKeyLost) {
+      logger.warn({ key, reason: outcome.error.message }, "github-status-delivery-outbox: status key lost before a GitHub write; caller re-queues");
       return null;
     }
-    throw err;
+    throw outcome.error;
   } finally {
-    clearInterval(heartbeat);
+    // Never free the key while a write that passed its fence is in flight.
+    await running?.catch(() => {});
     await releaseGithubStatusKeyLease(db, leaseKey, token);
   }
 }
@@ -427,8 +443,8 @@ async function markTerminal(
 /**
  * A forced replay found this head's status key held by a live evaluation.
  * Requeue without spending an attempt: contention says nothing about whether
- * delivery can succeed, and the holder is bounded by the lease's maximum
- * hold. The in-lock freshness re-check runs again
+ * delivery can succeed, and the holder is bounded by
+ * DELIVERY_LOCK_HOLD_TIMEOUT_MS. The in-lock freshness re-check runs again
  * once the key is free.
  */
 async function deferBehindLiveEvaluation(db: DbHandle, row: DeliveryRow): Promise<void> {
@@ -573,8 +589,8 @@ async function processGateReevaluation(db: Db, row: DeliveryRow): Promise<void> 
   // Imported lazily: pr-comment-review-gate imports withGithubStatusDeliveryLock
   // from this module, and a static edge back would be a module-init cycle.
   const { runPrCommentReviewGateCheck } = await import("./pr-comment-review-gate.js");
-  // Not inside withGithubStatusDeliveryLock: the check takes that same status
-  // key itself, and would always find it held.
+  // Not inside withGithubStatusDeliveryLock: the check takes that same advisory
+  // lock itself, on a second pool connection, and would always find it held.
   const result = await runPrCommentReviewGateCheck({
     repoFullName: fencedRow.repoFullName,
     prNumber: fencedRow.prNumber,
@@ -711,10 +727,12 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     ? await withGithubStatusDeliveryLock(
         db,
         `${fencedRow.repoFullName}#${fencedRow.sha}`,
-        async (fence) => {
+        async (fence, tx) => {
           // The lock is shared with the live gate evaluation. Re-check inside
           // it so a clean evaluation that won the lock cannot be overwritten.
-          if (await handleFreshSuccessForForcedDelivery(db, fencedRow)) {
+          // Use `tx`, not `db`: a second pool connection taken here is what
+          // lets a saturated pool wedge the lock holder.
+          if (await handleFreshSuccessForForcedDelivery(tx, fencedRow)) {
             return { ok: true as const, skipped: true as const };
           }
           await fence();
