@@ -274,6 +274,21 @@ describe("watch-event queue integrity (BLO-23143 finding 2)", () => {
       companies: [{ id: companyId }],
       companyConfigs: { [companyId]: { slackTokenRef: "tok" } },
       secrets: { tok: "xoxb-token" },
+      // Events are only queued for a company that has a watch.
+      state: {
+        "instance:global:global-watches-list": [
+          {
+            id: "watch-1",
+            companyId,
+            eventPattern: "issue.created",
+            prompt: "look at {{id}}",
+            agentId: "agent-1",
+            channelId: "C-WATCH",
+            createdAt: new Date().toISOString(),
+            triggerCount: 0,
+          },
+        ],
+      },
     });
 
     await plugin.definition.setup(ctx);
