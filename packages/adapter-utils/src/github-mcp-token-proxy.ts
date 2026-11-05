@@ -281,6 +281,26 @@ function refuse(res: ServerResponse, status: number, message: string): void {
  * Build the request handler. Exported so tests can exercise the forwarding
  * rules against a stub origin without binding the privileged port.
  */
+/**
+ * A browser cannot be prevented from reaching a loopback listener, so the
+ * listener decides what it answers. Only the Go MCP client is served: it sends
+ * `Host: 127.0.0.1` (the address it was handed in GITHUB_HOST, port discarded)
+ * and no browser-origin headers. Anything presenting a different Host has been
+ * rebound onto us, and anything carrying Origin / Sec-Fetch-Site is a browser
+ * request regardless of what it claims.
+ */
+export function isTrustedLoopbackClient(req: IncomingMessage): boolean {
+  const host = req.headers.host;
+  if (typeof host !== "string") return false;
+  const hostname = host.split(":")[0];
+  if (hostname !== PROXY_BIND_ADDRESS) return false;
+  // Present on every browser-issued request, including cross-origin "simple"
+  // ones that carry no preflight. The Go client sends neither.
+  if (req.headers.origin !== undefined) return false;
+  if (req.headers["sec-fetch-site"] !== undefined) return false;
+  return true;
+}
+
 export function createProxyHandler(options: GitHubMcpTokenProxyOptions = {}) {
   const tokenFile =
     options.tokenFile || process.env.PAPERCLIP_GITHUB_TOKEN_FILE || DEFAULT_TOKEN_FILE;
@@ -293,6 +313,23 @@ export function createProxyHandler(options: GitHubMcpTokenProxyOptions = {}) {
 
   return async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const requestPath = req.url ?? "/";
+
+    // This listener attaches a live write-scoped installation token to
+    // anything that reaches loopback :80, and agent pods run a headless
+    // browser in the same network namespace. A DNS-rebound page
+    // (Host: attacker.example resolving to 127.0.0.1) or a cross-origin
+    // "simple" request would otherwise be relayed with the Bearer attached —
+    // a confused deputy holding the fleet credential. Current Chrome's
+    // local-network-access checks probably block both, but "probably" and
+    // "this browser version" are not the footing a credential belongs on.
+    //
+    // The Go client sends neither header, so refusing both costs nothing:
+    // a request is forwarded only when its Host is the loopback address we
+    // bound and it carries no browser-origin marking at all.
+    if (!isTrustedLoopbackClient(req)) {
+      refuse(res, 403, "refusing a request that did not come from the local MCP server");
+      return;
+    }
 
     if (requestPath === PROXY_HEALTH_PATH) {
       res.writeHead(200, { "content-type": "text/plain" });

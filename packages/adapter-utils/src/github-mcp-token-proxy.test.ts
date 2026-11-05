@@ -391,6 +391,54 @@ describe("github MCP token proxy", () => {
       await handle?.close();
     });
 
+    it("refuses a rebound Host and any browser-origin request (PEN-5641)", async () => {
+      // Confused-deputy guard. The listener holds a live write-scoped token,
+      // and agent pods run a headless browser in the same netns, so a
+      // DNS-rebound page or a cross-origin "simple" request must not be
+      // relayed with the Bearer attached. The Go client sends neither header.
+      const upstream = await startStubUpstream();
+      const root = temporaryDirectory();
+      const file = writeMountGeneration(root, "gen1", GENERATION_ONE);
+      const origin = await startProxyUnderTest({
+        tokenFile: file,
+        apiOrigin: upstream.origin,
+        uploadsOrigin: upstream.origin,
+      });
+      const url = new URL(origin);
+
+      const send = (headers: Record<string, string>): Promise<number> =>
+        new Promise((resolve, reject) => {
+          const req = httpRequest(
+            {
+              host: url.hostname,
+              port: url.port,
+              path: "/api/v3/repos/o/r",
+              method: "GET",
+              headers,
+            },
+            (res) => {
+              res.resume();
+              resolve(res.statusCode ?? 0);
+            },
+          );
+          req.on("error", reject);
+          req.end();
+        });
+
+      // Rebound onto us under an attacker-controlled name.
+      expect(await send({ host: "attacker.example" })).toBe(403);
+      // Browser-issued, even when the Host looks right.
+      expect(await send({ origin: "https://attacker.example" })).toBe(403);
+      expect(await send({ "sec-fetch-site": "cross-site" })).toBe(403);
+
+      // None of those reached GitHub at all, so no token was ever attached.
+      expect(upstream.seen).toHaveLength(0);
+
+      // The Go client's own shape still works.
+      expect(await send({})).toBe(200);
+      expect(upstream.seen).toHaveLength(1);
+    });
+
     it("never adopts a port it does not own, even one answering the health marker (PEN-5641)", async () => {
       // The important finding on PR #3410. Adoption was justified by the proxy
       // holding no per-session state, but the hazard is LIFETIME, not state:
