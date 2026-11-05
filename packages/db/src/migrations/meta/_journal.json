@@ -1849,6 +1849,13 @@
       "when": 1792004001477,
       "tag": "0273_github_status_key_leases",
       "breakpoints": true
+    },
+    {
+      "idx": 274,
+      "version": "7",
+      "when": 1792004101477,
+      "tag": "0274_issues_drop_unscoped_description_trigram_index",
+      "breakpoints": true
     }
   ]
 }
