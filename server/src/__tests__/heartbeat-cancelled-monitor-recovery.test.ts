@@ -25,13 +25,14 @@
  */
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, companies, createDb, issueComments, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
+import { logger } from "../middleware/logger.js";
 import { heartbeatService } from "../services/heartbeat.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -544,5 +545,96 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
     expect(result).toMatchObject({ scanned: 0, recovered: 0, failed: 0 });
     expect(await readRecoveryIssues(issueId)).toHaveLength(0);
     expect(residueOf((await readIssue(issueId)).executionState).recoveryEmittedAt ?? null).toBeNull();
+  });
+
+  /**
+   * PEN-5346 §4. The three tests below pin the one thing the shipped pass could
+   * not say: that it had selected work and discharged none of it.
+   *
+   * `scanned` and `skipped` are computed and returned, and then discarded at
+   * both call sites in `index.ts`, whose log condition reads only
+   * `recovered`/`cleared`/`unowned`/`failed`. So an inert pass was byte-identical
+   * in the logs to a pass that selected nothing, which is byte-identical to the
+   * healthy drained steady state. Measured in production on 2026-11-04 with
+   * >= 21 rows carrying the residue: zero log lines on either worker.
+   */
+  type InertLine = [Record<string, unknown>, string];
+
+  function inertLines(warn: { mock: { calls: unknown[][] } }): InertLine[] {
+    return warn.mock.calls.filter(
+      (call): call is InertLine => typeof call[1] === "string" && call[1].includes("discharged none of them"),
+    );
+  }
+
+  it("says so when every candidate it selected was skipped (PEN-5346 §4)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    // Malformed rows match the SQL predicate and fail `parseIssueExecutionState`
+    // — the permanently-unhandable class, and the exact shape that produced
+    // total silence in production.
+    await seedCancelledResidue(companyId, agentId, { malformed: true });
+    await seedCancelledResidue(companyId, agentId, { malformed: true });
+
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    try {
+      const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(result).toMatchObject({ scanned: 2, recovered: 0, cleared: 0, skipped: 2, unowned: 0, failed: 0 });
+
+      const lines = inertLines(warn);
+      expect(lines).toHaveLength(1);
+      expect(lines[0]![0]).toMatchObject({ scanned: 2, skipped: 2, recovered: 0, cleared: 0 });
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("stays silent when there was nothing to discharge (PEN-5346 §4)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    // Already stamped: selects nothing. Silence here is the one reading that
+    // means what an operator takes it to mean, so it must stay silent.
+    await seedCancelledResidue(companyId, agentId, { recoveryEmittedAt: "2026-11-03T02:00:00.000Z" });
+
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    try {
+      const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(result).toMatchObject({ scanned: 0, skipped: 0 });
+      expect(inertLines(warn)).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("throttles an unchanged inert shape but reports a changed one immediately (PEN-5346 §4)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    // FOUR rows, not two: the slot is keyed on the pass's shape and lives for
+    // the life of the service, so seeding the same count as the test above
+    // would make this test's first call a THROTTLED one and the assertion
+    // below order-dependent. A shape no other test in this file produces makes
+    // the establishing call establish something whatever ran before it.
+    for (let i = 0; i < 4; i += 1) {
+      await seedCancelledResidue(companyId, agentId, { malformed: true });
+    }
+
+    // Establishes the slot for this shape, whatever the previous test left.
+    await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+
+    const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+    try {
+      // Same shape inside the interval: the condition persists on every 30 s
+      // tick, so re-emitting it would be ~2 880 lines a day.
+      await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(inertLines(warn)).toHaveLength(0);
+
+      // A population that is actually draining changes shape, and that is the
+      // movement an operator needs to see without waiting out the interval.
+      await seedCancelledResidue(companyId, agentId, { malformed: true });
+      await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+
+      const lines = inertLines(warn);
+      expect(lines).toHaveLength(1);
+      // Honest about how many passes the emitted line stands for.
+      expect(lines[0]![0]).toMatchObject({ scanned: 5, skipped: 5, suppressedSincePreviousLog: 1 });
+    } finally {
+      warn.mockRestore();
+    }
   });
 });
