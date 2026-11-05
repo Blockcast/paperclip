@@ -264,9 +264,11 @@ async function countGithubRefusal(url: string, response: Response): Promise<void
  * each caller takes the rate-limit path it already has — no caller can re-fire
  * inside the exhausted window, whatever its own retry loop does.
  *
- * Keyed on a hash of the Authorization header (never the token itself) plus the
- * budget, so one installation's exhaustion never blocks another credential, and
- * `search` never blocks `core`. The request-side budget is inferred from the
+ * Keyed on the host, a hash of the Authorization header (never the token
+ * itself) and the budget, so one installation's exhaustion never blocks another
+ * credential, `search` never blocks `core`, and an exhausted `api.github.com`
+ * never blocks `raw.githubusercontent.com` or a GHES host — which matters most
+ * for unauthenticated callers, who all share the empty-header hash. The request-side budget is inferred from the
  * URL; a wrong inference only means no hold, which is today's behaviour.
  * Secondary limits (`retry-after`) are not held here.
  */
@@ -287,14 +289,14 @@ function inferRateLimitResource(url: string): string {
   return "core";
 }
 
-function rateLimitHoldKey(init: RequestInit | undefined, resource: string): string {
+function rateLimitHoldKey(url: string, init: RequestInit | undefined, resource: string): string {
   let auth = "";
   try {
     auth = new Headers(init?.headers).get("authorization") ?? "";
   } catch {
     // Unreadable headers: hold under the anonymous key, as an unauthenticated call would be.
   }
-  return `${createHash("sha256").update(auth).digest("hex").slice(0, 16)}:${resource}`;
+  return `${new URL(url).host}:${createHash("sha256").update(auth).digest("hex").slice(0, 16)}:${resource}`;
 }
 
 function heldResponse(resetMs: number, resource: string): Response {
@@ -314,7 +316,7 @@ function heldResponse(resetMs: number, resource: string): Response {
   );
 }
 
-function rememberRateLimitHold(init: RequestInit | undefined, response: Response): void {
+function rememberRateLimitHold(url: string, init: RequestInit | undefined, response: Response): void {
   if (response?.status !== 403 && response?.status !== 429) return;
   if (refusalHeader(response, "x-ratelimit-remaining")?.trim() !== "0") return;
   const resetSec = Number(refusalHeader(response, "x-ratelimit-reset"));
@@ -323,7 +325,9 @@ function rememberRateLimitHold(init: RequestInit | undefined, response: Response
   const resetMs = Math.min(resetSec * 1000, now + RATE_LIMIT_HOLD_MAX_MS);
   if (resetMs <= now) return;
   const resource = refusalHeader(response, "x-ratelimit-resource") ?? "core";
-  rateLimitHolds.set(rateLimitHoldKey(init, resource), { resetMs, resource });
+  // Rotated tokens never look their old key up again; sweep so the map stays bounded.
+  for (const [key, hold] of rateLimitHolds) if (hold.resetMs <= now) rateLimitHolds.delete(key);
+  rateLimitHolds.set(rateLimitHoldKey(url, init, resource), { resetMs, resource });
 }
 
 export async function ghFetch(url: string, init?: RequestInit): Promise<Response> {
@@ -331,19 +335,20 @@ export async function ghFetch(url: string, init?: RequestInit): Promise<Response
   // than the default, and the default must still bound a caller that passes none.
   const deadline = AbortSignal.timeout(deadlineMs);
   const signal = init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
-  // Before the request leaves, so the denominator counts attempts and keeps
-  // advancing when GitHub is unreachable rather than merely unhappy (PEN-3852).
-  const holdKey = rateLimitHoldKey(init, inferRateLimitResource(url));
+  // Held calls never reach GitHub, so they deliberately skip both counters.
+  const holdKey = rateLimitHoldKey(url, init, inferRateLimitResource(url));
   const hold = rateLimitHolds.get(holdKey);
   if (hold) {
     if (hold.resetMs > Date.now()) return heldResponse(hold.resetMs, hold.resource);
     rateLimitHolds.delete(holdKey);
   }
+  // Before the request leaves, so the denominator counts attempts and keeps
+  // advancing when GitHub is unreachable rather than merely unhappy (PEN-3852).
   countGithubApiAttempt();
   try {
     const response = await fetch(url, { ...init, signal });
     await countGithubRefusal(url, response);
-    rememberRateLimitHold(init, response);
+    rememberRateLimitHold(url, init, response);
     return response;
   } catch (err) {
     const aborted = abortFailure(url, err, init?.signal);
