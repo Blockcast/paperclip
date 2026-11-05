@@ -435,12 +435,17 @@ export async function hasUnsettledEffects(db: Db, commentId: string): Promise<bo
  * Comments whose effects all completed but whose `idempotency_processed_at`
  * was never stamped.
  *
- * This is a real reachable state, not defensive padding: whenever a worker loses
- * its lease mid-pipeline, the worker that finishes the last effect may not be the
- * one that runs settlement, and the resumable-work query above cannot see the
- * comment any more because no row is left `queued` or lease-expired. Without this
- * sweep such a comment stays unprocessed forever and every later replay redoes
- * the whole pipeline.
+ * Reachable whenever the final `completeEffect` commits but the separate stamp
+ * UPDATE does not: the process dies between the two, the stamp throws, the
+ * commit reply is lost, or the driver misreads a response (BLO-46428). No row is
+ * left `queued` or lease-expired, so the resumable-work query above cannot see
+ * the comment. Nothing is owed meanwhile -- every sink has run, and a same-key
+ * replay finds no unfinished effects and stamps the comment itself -- but a
+ * comment nobody replays would stay unstamped forever without this sweep.
+ *
+ * The plan reads every effect row and probes `issue_comments` once per
+ * effect-bearing comment, so it costs O(ledger) however empty the result is;
+ * the reconciler runs it on its own slow cadence (BLO-52498).
  */
 export async function listSettledUnprocessedComments(
   db: Db,
@@ -520,10 +525,15 @@ export function startIssueCommentEffectReconciler(
   db: Db,
   process: (commentId: string) => Promise<unknown>,
   intervalMs: number = 1_000,
+  // The settlement sweep only writes bookkeeping, so a minute of latency costs
+  // nothing; run every pass, it was the largest consumer of DB time (BLO-52498).
+  sweepIntervalMs: number = 60_000,
 ): () => Promise<void> {
   let pass: Promise<void> = Promise.resolve();
   let polling = false;
   let stopped = false;
+  // The first pass sweeps, so a restart still settles whatever stranded while it was down.
+  let lastSweepAt = Number.NEGATIVE_INFINITY;
   void resetLeaselessProcessing(db).catch((err) =>
     logger.warn({ err }, "issue-comment-effects: stale-processing reset failed"));
   const timer = setInterval(() => {
@@ -537,7 +547,10 @@ export function startIssueCommentEffectReconciler(
           logger.warn({ err, commentId }, "issue-comment-effects: reconciliation failed"));
       }
       // Comments whose effects all settled but that nobody stamped processed.
-      // Settlement only, no sink re-execution.
+      // Settlement only, no sink re-execution. Timed before the query, so a
+      // failing sweep retries an interval later rather than on every pass.
+      if (stopped || performance.now() - lastSweepAt < sweepIntervalMs) return;
+      lastSweepAt = performance.now();
       const stranded = await listSettledUnprocessedComments(db, 50);
       for (const commentId of stranded) {
         if (stopped) break;
