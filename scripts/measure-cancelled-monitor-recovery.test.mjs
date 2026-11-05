@@ -9,6 +9,7 @@ import {
   destroyedDueTimes,
   findHandoffFailures,
   hasRecoveryEmitted,
+  isAutoDischarged,
   isCancelledClear,
   isLiveMonitorOnCancelledRow,
   isMainModule,
@@ -276,10 +277,53 @@ describe("findHandoffFailures", () => {
 
   it("is silent on a correctly handed-back row and on an unstamped one", () => {
     const ok = findHandoffFailures([stamped], [carrier()]);
-    assert.deepEqual(ok, { lost: [], duplicated: [], unresolved: [] });
+    assert.deepEqual(ok, { lost: [], duplicated: [], unresolved: [], autoDischarged: [] });
     // Unstamped rows are still owed, not failures — they are the `owed` count.
     const unstamped = findHandoffFailures([issue()], []);
-    assert.deepEqual(unstamped, { lost: [], duplicated: [], unresolved: [] });
+    assert.deepEqual(unstamped, { lost: [], duplicated: [], unresolved: [], autoDischarged: [] });
+  });
+
+  it("does NOT report a horizon-discharged row as lost — it is stamped with no carrier on purpose", () => {
+    // The whole backfill reaches this shape once the horizon works, so scoring
+    // it as `lost` would exit 1 on success and read as a falsification of
+    // #3352. Same stamp as `stamped`, one extra field.
+    const discharged = issue({
+      monitor: {
+        recoveryEmittedAt: "2026-11-03T18:00:00.000Z",
+        recoveryDisposition: "auto_discharged_past_horizon",
+      },
+    });
+    const { lost, duplicated, autoDischarged } = findHandoffFailures([discharged], []);
+    assert.equal(lost.length, 0);
+    assert.equal(duplicated.length, 0);
+    assert.equal(autoDischarged.length, 1);
+    assert.equal(autoDischarged[0].identifier, "PEN-4835");
+    assert.equal(autoDischarged[0].carriers, 0);
+
+    // A carrier on a discharged row is an anomaly, reported rather than
+    // silently dropped — and still never `lost`.
+    const withCarrier = findHandoffFailures([discharged], [{ originId: discharged.id }]);
+    assert.equal(withCarrier.lost.length, 0);
+    assert.equal(withCarrier.autoDischarged[0].carriers, 1);
+    assert.match(withCarrier.autoDischarged[0].detail, /1 carrier/);
+  });
+});
+
+describe("isAutoDischarged", () => {
+  it("reads the disposition, and nothing adjacent to it", () => {
+    assert.equal(
+      isAutoDischarged(issue({ monitor: { recoveryDisposition: "auto_discharged_past_horizon" } })),
+      true,
+    );
+    // `recovery_issue` is the sibling disposition — a carrier WAS built, so the
+    // stamp looks the same and only this field separates them.
+    assert.equal(
+      isAutoDischarged(issue({ monitor: { recoveryDisposition: "recovery_issue" } })),
+      false,
+    );
+    assert.equal(isAutoDischarged(issue()), false);
+    assert.equal(isAutoDischarged(issue({ executionState: null })), false);
+    assert.equal(isAutoDischarged(undefined), false);
   });
 });
 
