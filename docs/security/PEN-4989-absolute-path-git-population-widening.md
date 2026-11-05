@@ -109,6 +109,7 @@ right axis, and it took the sixth window to show it.
 | **PEN-4994** | **UX Designer** | `sha-1e99f06` | 4.8 min | 132,456 | 64 | **0** | `0.793` ⛔ `git-calib` — **error path** |
 | **PEN-4993** A | **Engineer** (git-dense) | `sha-e74d17b` | ≈ 3 min | — | — | **0** | — |
 | **⛔ PEN-4993** B | **Engineer** (build/test) | `sha-e74d17b` | 17.0 min | 435,047 | 2,447 | **⛔ 28** | `0.837` copy named `git` · **`0.810` real `/usr/bin/git`** |
+| **PEN-5663** (§1.3) | **Security Engineer** (root `pnpm test`) | `sha-71d2d07` | 28.0 min | 395,355 | 2,192 | **26** | `0.867` copy named `git` · **`0.770` real `/usr/bin/git`** |
 
 ⛔ **The last column is NOT comparable down its own length, and the first four values should not be
 quoted as catch rates at all.** See §2.1: a copy named `git-calib` does not run — it exits `128`
@@ -117,12 +118,19 @@ before doing any work. Only PEN-4993 B calibrated against something that actuall
 ⚠ **The `Obs.` column is not one quantity across rows and must not be summed.** PEN-4986's `54` is its
 *organic* count; this record's `233` is the *total*, of which 210 were self-inflicted controls and only
 ≈ 21 organic (§1). The comparable organic figures are PEN-4986 `54`, this record ≈ `21`, PEN-4992 `24`,
-PEN-4994 `64`, PEN-4993 B `2,447`. The column that **is** uniform, and the one this record turns on,
-is *unexplained unwrapped*: **zero in the first five, ⛔ 28 in the sixth.**
+PEN-4994 `64`, PEN-4993 B `2,447`, PEN-5663 `2,192`. The column that **is** uniform, and the one this
+record turns on, is *unexplained unwrapped*: **zero in the first five, ⛔ 28 in the sixth, 26 in the
+seventh.**
 
-**Six windows, four agents, five pods, four image tags (three of them fingerprinted) — and ≈ 61
+**Seven windows, four agents, six pods, five image tags (four of them fingerprinted) — and ≈ 89
 minutes of observation in total.**
-⛔ **Trigger 4 fired in the last one (§1.2). The first five were zero.**
+⛔ **Trigger 4 fired in the sixth (§1.2). The first five were zero.**
+
+⚠ **The seventh (§1.3) is a re-measurement on a *changed surface*, not a seventh sample of the same
+one, and it must not be added to the other six as though it were.** ⛔ It is also **not** a second
+firing of trigger 4: the instrument cannot observe an invocation, and the acceptance a firing would
+end has already ended (§1.2, D-3). It re-found the **same** mechanism on a new surface — evidence
+about the class, nothing more.
 
 The three new agents are what makes this a workload axis rather than a repeat:
 
@@ -229,6 +237,81 @@ An unwrapped `git` reaching github.com **is** authenticated by the system creden
 intent and no credential handling by the caller. These 26 ran with a live, publish-capable credential
 path available and unscanned. It was **not** exercised — identifying a bypass is in scope, using one
 is not.
+
+### 1.3 Re-measurement on a changed surface — 2026-11-05, root `pnpm test`, 26 unwrapped
+
+§4's staleness rule fired and **PEN-5663** discharged it. Everything here is a statement about **one
+pod, one image, one workload, one 28-minute window.** Do not generalise from it.
+
+**Which branch of §4 this is.** The fingerprint differed and `wrapperAhead` was `true`, so this is the
+*staleness* branch — **not** the control-failure branch. A bare `git` still reached the wrapper
+(`command -v git` → `/usr/local/libexec/paperclip/bin/git`).
+
+| | |
+|---|---|
+| **Window** | `2026-11-05T10:02:02.251Z` → `10:30:01.374Z` UTC (**28.0** min, `395,355` sweeps, `2,708` distinct processes) |
+| **Population** | one agent pod: `ac-7500672d-efe6-40-3020bfa4-06f5-47-db822a-l9jlk`, ns `paperclip`, agent **Security Engineer** (`7500672d-efe6-4037-a05f-61204a670894`), run `3020bfa4-…`, task PEN-5663 |
+| **Image** | `…/paperclip-agent:sha-71d2d07-k8s-vendored` — the **fifth** distinct image tag this record names |
+| **⭐ Workload** | **root-package `pnpm test`** in `Blockcast/penstock-llm-proxy-core` @ `origin/main` `5383a9403`, run in a dedicated locked worktree |
+| **Surface fingerprint** | `83aef063afaaf81aaeeb24f7cb74362dc0e7c911e97eb57c5955dc234c4d5a3e` (rule **v2**, §4) |
+| Class-A observations (incl. controls) | `2,429` |
+| — organic | `2,192` |
+| — organic wrapped | `2,166` |
+| **— ⛔ organic UNWRAPPED** | **`26`** |
+| Class-B (`git-core`) | `0` |
+| Indeterminate | `19` — see the bound below |
+
+**The fingerprint was taken before the window and again after it, and was identical both times**
+(`09:58:03Z`, `10:31:19Z`), so the number above is a coherent statement about one surface rather than
+an average over two. It was still identical when this record was edited (`14:51:17Z`).
+
+**This satisfies the §4 population spec.** It is a root-package `pnpm test` window, so it *reaches*
+`test/secret-scan-budget.test.ts` — the file carrying 26 of PEN-4993 B's 28, and the file a
+`--filter @penstock/portal` window is structurally unable to reach. It is not a reassurance.
+
+#### What the 26 are — the known mechanism, unchanged
+
+All 26 are `/usr/bin/git`; all 26 are `rev-parse --verify --quiet <rev>^{commit}`; all 26 carry the
+same ancestry — `bash -e -c args=(detect --source . --config .gitleaks.toml …)` under `vitest run`.
+23 of 26 also show a `…/secret-scan-step-*/work` cwd; the other 3 read `cwd: null` because the
+scratch directory was already unlinked when the sweep read it — same harness, same mechanism.
+
+That is `test/secret-scan-budget.test.ts:611` in **`Blockcast/penstock-llm-proxy-core`**, which
+narrows `PATH` to `${bin}:/usr/bin:/bin` so the wrapper directory is absent by construction. **No new
+mechanism appeared**, so there is nothing here to raise beyond this record. The sweep for the class is
+**PEN-5012**.
+
+⚠ **26 here vs 28 there is NOT a two-instance improvement.** Different surface, different workload,
+different window length — §4 is explicit that a prior result says nothing about a changed fingerprint,
+and that runs in **both** directions. Two numbers taken on two surfaces are not a trend. **Do not
+quote this as the class shrinking.**
+
+#### ⚠ Two bounds on the number, stated rather than buried
+
+- **`19` indeterminate samples.** The instrument scores a sample `indeterminate` when argv was
+  unreadable *and* no other wrapped-arm fired — precisely the samples it would otherwise have called
+  unwrapped, which it refuses to score so it cannot manufacture findings. So **26 is the confirmed
+  floor; the ceiling consistent with this data is 45.** **6 of those 19 were `/usr/lib/git-core/git`**
+  — the **PEN-4998** class, not this one; the other 13 were `/usr/bin/git`.
+- **Calibration, both spellings (§2.1's correction applied).** Controls behaved: positive **6/6
+  classified wrapped**, negative **231/231 classified unwrapped**.
+
+| calibrated against | caught | issued | rate |
+|---|---|---|---|
+| real `/usr/bin/git` | 231 | 300 | **`0.770`** |
+| copy named `git` | 260 | 300 | **`0.867`** |
+
+  At a `0.770` catch rate against the real binary, **26 observed is consistent with ≈ 34 actually
+  occurring.** The headline errs low, by design.
+
+#### Test-suite outcome, reported rather than omitted
+
+`651 passed / 2 failed / 35 skipped` files; `12,739 passed / 53 failed / 1,116 skipped` tests;
+`1668.61s`; `pnpm test` exited `1`. Both failing files are **sandbox-environmental, not defects** —
+`database-deployment-migration` wants a cluster API at `localhost:8080`, and
+`managed-commercial-acceptance-validation` wants a Docker daemon the sandbox does not have. Neither
+touches the measurement, and `test/secret-scan-budget.test.ts` is not among the failures — its
+gitleaks children were directly observed, which is positive proof the site executed.
 
 ### ⚠ The predicate matters, and this result is the first to make it load-bearing
 
@@ -537,6 +620,54 @@ Rules:
   which is **indistinguishable from "trigger 4 never fired"** unless the run says so. This record
   carries the firing, so the evidence is safe here — but any later §7.1 text written off such a run
   must say the zero is *remediated*, not *never observed* (hazard raised by Engineer, 2026-10-29).
+
+### 4.1 This section's *staleness* trigger has fired twice; observed turnover is 2–5 days
+
+⛔ **"Fired" here means §4's re-measurement trigger — the surface changed, so a prior count no
+longer applies. It does *not* mean §7.2 trigger 4.** Those are different triggers with different
+consequences, and conflating them would read a routine rebuild as a control event.
+
+§4 was written as a rule. It is now also a measured cadence — which is the strongest argument that
+this duty cannot be discharged by a document:
+
+| evaluated | fingerprint (rule v2) | vs §1 | → |
+|---|---|---|---|
+| 2026-10-29 (§1) | `d81423fe…` | — | baseline |
+| 2026-11-03 | `50aab1b9…` | **differs** | staleness; `wrapperAhead: true`. `/usr/bin/git` **unchanged** — the whole delta was the three paperclip-authored files |
+| 2026-11-05 (§1.3) | `83aef063…` | **differs** | staleness; `wrapperAhead: true`; re-measured → **26** |
+
+— i.e. the egress surface turned over twice in seven days, on a roughly **2-to-5-day** cadence. A
+measurement is stale about that fast. ⚠ The 2026-11-03 evaluation was a *fingerprint* reading only:
+no count was taken against it, so no result is cited for that row.
+
+⭐ **§1's fingerprint is no longer the only citable one.** §4's first rule — "a later run whose
+fingerprint **equals** the one in §1 may cite this measurement" — now reads: a run may cite the
+window whose fingerprint it matches, `d81423fe…` for §1 and `83aef063…` for §1.3. A run matching
+neither must re-take it.
+
+**Per-file hashes, published so the next firing is diagnosable in one comparison.** §1 published only
+the composite digest, which is why attributing the 2026-11-03 mismatch took a 650-permutation sweep
+rather than a table lookup. The instrument's `--json` already emits the components; the gap was this
+record's presentation. For `83aef063…`:
+
+| sha256 (first 16) | path |
+|---|---|
+| `deee13f66acd1792` | `/usr/local/libexec/paperclip/bin/git` (wrapper) |
+| `a7de00b0effc92c4` | `…/@paperclipai/adapter-utils/dist/github-git-egress-runtime.js` |
+| `aed180246980bb08` | `/usr/local/libexec/paperclip/bin/github-token-credential-helper` |
+| `356db14e102d68a1` | `/usr/bin/git` |
+| `356db14e102d68a1` | `/bin/git` |
+
+Layout `[wrapper, wrapper, /usr/bin/git, /bin/git]`; `wrapperAhead: true`.
+⭐ **`/usr/bin/git` is `356db14e…` — the same value PEN-4986 recorded for both class-A inodes on two
+images, and the same one §1.1's pooling check reports.** The real binary is untouched across every
+firing so far, and the entire delta each time has been the three paperclip-authored files.
+
+⚠ **That comparison is against §1.1 and PEN-4986, not against §1's digest — because §1 never
+published its components.** `d81423fe…` is a composite and cannot be decomposed, so no per-file
+claim about it is checkable from this record. That is exactly the gap this table closes going
+forward, and it is why the 2026-11-03 attribution needed a sweep. Anyone re-taking this should
+publish the same table.
 
 ⛔ **The population spec is part of the trigger, and omitting it is fatal.** A re-measurement
 **must include at least one build/test workload window** — a `pnpm test`-class run — and must say
