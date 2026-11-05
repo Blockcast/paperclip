@@ -58,9 +58,34 @@
  * it with backoff carrying `conflictingRunId` -- it does not fail it. That is
  * the deliberately cheap arm of the fix. Handing each run its own tree instead
  * costs a worktree plus a full dependency install per concurrent run (measured
- * on this repo: ~105 MB of tree and ~2.2 GB of node_modules), which is not
- * affordable on a volume already at 88%. Serializing runs that genuinely share
- * one mutable directory is the correct outcome, not a degradation.
+ * on this repo: ~105 MB of tree and ~2.2 GB of node_modules).
+ *
+ * WHY SHARING STAYS (PEN-5684, decided by Ceo 2026-11-05) -- and note the
+ * reason is NOT the one this comment used to give. It read "not affordable on a
+ * volume already at 88%", and that number went stale: `paperclip-data` (the PVC
+ * backing /paperclip, where the project trees live) measured 68.8% of 3 TiB,
+ * ~960 GiB free, on 2026-11-05 -- roughly 400 concurrent worktrees of headroom
+ * at the per-run cost above. The disk argument no longer carries the decision.
+ *
+ * It stays because contention is a SMALL term, not because a worktree per run
+ * is unaffordable: PEN-5684 measured the isolation backoff ladder at ~7% of a
+ * contended run's total queue wait (~28 min of thrash inside a ~7 h wait), the
+ * other ~93% being pre-conflict queue time that this key does not influence at
+ * all (PEN-4362 / PEN-4363). Changing the storage model aims a large change at
+ * the 7%. Serializing runs that genuinely share one mutable directory is the
+ * correct outcome, not a degradation.
+ *
+ * REVISIT IT IF: `paperclip_k8s_isolation_conflict_deferrals_total{cause}`
+ * shows `active_writer` (the tree is genuinely busy) dominating `elder_waiter`
+ * (a seniority yield on a tree that is frequently free). That would mean real
+ * serialization rather than admission ordering, which is the case the shared
+ * tree actually costs. Re-measure the PVC at the same time rather than trusting
+ * the figure above -- it was climbing ~0.37 points/day over the week to
+ * 2026-11-05, which is how the last number in this comment went stale.
+ *
+ * Any revisit must also cover the `workspace:<uuid>` key shape, not just
+ * `project_primary`: 44% of contending rows in PEN-5684's census were on that
+ * second shape, which no change to the branch below would touch.
  *
  * Two exclusions, and note the asymmetry between them:
  * - a stateless PR review is run-unique by construction (and is filtered in
