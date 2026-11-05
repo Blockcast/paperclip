@@ -650,13 +650,23 @@ structural — plain bindings, `env` maps at any depth, Tier-1 key names,
 URI-embedded credentials, JWT-shaped strings. A bare command string under an
 innocuous key matches none of those rules and survives; that module's own
 header says so. So `adapterConfig.workspaceStrategy.provisionCommand` and
-`.teardownCommand` reach an entitled reader **unmasked** (`PEN-5225`,
-2026-11-01). Those strings are handed to a shell, and `FOO_TOKEN=… ./deploy.sh`
-is an ordinary idiom. Granting *any* peer-config read capability today
-therefore also hands over host-executed command strings that may carry inline
-credentials. That is a confidentiality exposure rather than a proportionality
-question, which is why it refuses both doors with one argument. `PEN-5225`
-masks it at source; until that ships, this reason stands on its own.
+`.teardownCommand` reached an entitled reader **unmasked**, and because those
+strings are handed to a shell — `FOO_TOKEN=… ./deploy.sh` is an ordinary idiom
+— granting *any* peer-config read capability also handed over host-executed
+command strings that may carry inline credentials. That was a confidentiality
+exposure rather than a proportionality question, which is why this reason
+refused both doors with one argument.
+
+**`PEN-5225` closed that instance at source**, and the paragraph above is kept
+in the past tense rather than deleted because the **shape** is the reusable
+part, not the one key it was found on. The mask lives in `containAgentConfig` /
+`redactAgentSecrets` and defaults to withheld, so those three keys no longer
+reach any reader who cannot clear `workspace_runtime:read`. What is *not*
+closed is the property that produced it: the redactor's coverage is structural,
+so a credential under an innocuous key still survives it at any depth — the
+module header says so in those terms. This reason therefore no longer rests on
+that one named instance, and the refusal of each door is carried by the reason
+below that names it.
 
 **Second reason — proportionality, and it is specific to `agents:configure`.**
 Per [the implication rule](#why-never-a-stored-grant-is-the-load-bearing-part),
@@ -777,17 +787,28 @@ narrower instrument, and it leaves a dated artifact that a grant does not.
 Four conditions bind it. They are part of the rule, not commentary:
 
 1. **The field is named in advance, and the answer is only that field.** Not
-   politeness: until `PEN-5225` lands, posting the whole object publishes
-   host-executed command strings into an issue thread — a *wider* audience
-   than the grant would have been. See [Why both doors are
-   refused](#why-both-doors-are-refused), first reason, for why those strings
-   survive `redactAgentSecrets`. One scalar, named up front, is fine; an
-   object is not.
+   politeness. Before the `PEN-5225` mask landed, posting the whole object
+   published host-executed command strings into an issue thread — a *wider*
+   audience than the grant would have been. That specific leak is closed: the
+   mask sits inside `redactAgentSecrets` and defaults to withheld, so the
+   reader cannot quote those strings even by accident. See [Why both doors are
+   refused](#why-both-doors-are-refused), first reason, for the shape and for
+   what about it is *not* closed. **The condition still binds, and does not
+   depend on that leak**: an object answers every field the asker did not ask
+   about, and answering per-question rather than per-seat is the whole reason
+   this route is the narrower instrument. One scalar, named up front, is fine;
+   an object is not.
 2. ⛔ **A named field is not automatically answerable.** If the ask names
    `adapterConfig.workspaceStrategy.provisionCommand` or `.teardownCommand`,
-   the reader **refuses and routes to `PEN-5225`**. No in-thread judgment
-   about how much of a host-executed string is safe to quote. This is the one
-   case where "one named field" and "discloses nothing" come apart.
+   the reader **refuses, and has no onward route to offer**. `PEN-5225` is no
+   longer a routing target: it has landed, and what it landed withholds those
+   three keys from **every** agent on every route — including the consulted
+   reader's own, and including that reader's own row. So the ask does not
+   become answerable by finding a better-entitled agent; it needs
+   `workspace_runtime:read`, which no agent can hold by construction. Route it
+   to a human who clears that gate, or not at all. No in-thread judgment about
+   how much of a host-executed string is safe to quote. This is the one case
+   where "one named field" and "discloses nothing" come apart.
 3. **Each exercise is logged as a one-line dated entry on `PEN-5327`.** The
    re-open trigger below has no denominator otherwise: with nothing counting
    instances it could only ever be *noticed*, not fired. A trigger with a
