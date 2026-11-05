@@ -2148,3 +2148,183 @@ if (!process.env.GH_TOKEN_WRAPPER_TEST_NESTED) {
     );
   });
 }
+
+// --- PEN-3193: the agent seat holds the reviewer's credential --------------
+//
+// An agent run's GH_TOKEN *is* the Ally App installation token, so every write
+// publishes as `allyblockcast[bot]` — the identity the review gates credit as
+// reviewer evidence. Measured on penstock-vault-node #666 and recorded in that
+// repo's docs/security/PEN-3193-agent-seat-holds-reviewer-credential.md.
+//
+// These pin the two credited shapes, and — just as importantly — the shapes
+// that must keep working. A guard that also refused `COMMENTED` reviews, or any
+// body mentioning a SHA, would break the reviewer instead of the forger, and
+// the reviewer is the party with no alternative path.
+
+const STUB_GH_ECHO_STDIN = `#!/bin/sh
+echo "ARGS=$*"
+echo "STDIN<<$(cat)>>"
+`;
+
+// spawnSync closes the child's stdin when `input` is given, so the `cat` above
+// reaches EOF rather than blocking — which a stdin-reading stub would otherwise
+// do on every test that sends no body.
+function runGuard(dir, args, { extraEnv = {}, input = "" } = {}) {
+  const stubGhPath = path.join(dir, "gh.real");
+  writeFileSync(stubGhPath, STUB_GH_ECHO_STDIN);
+  chmodSync(stubGhPath, 0o755);
+  const tokenFilePath = path.join(dir, "token");
+  writeFileSync(tokenFilePath, "ghs_stub_token\n");
+
+  const env = sanitizedEnv({
+    GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
+    PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
+    ...extraEnv,
+  });
+  // The escape hatch is not a credential, so WRAPPER_CREDENTIAL_ENV_VARS does
+  // not strip it — and an ambient value would silently disable the guard every
+  // test below asserts on, turning the whole section vacuous.
+  if (!("GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE" in extraEnv)) {
+    delete env.GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE;
+  }
+  return spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8", input });
+}
+
+function assertRefused(proc, pattern) {
+  assert.equal(proc.status, 1);
+  assert.doesNotMatch(proc.stdout, /ARGS=/, "the real gh must not run");
+  assert.match(proc.stderr, pattern);
+}
+
+const APPROVED = /refusing to submit an APPROVED pull-request review/;
+const EVIDENCE = /refusing to publish a consolidated-review heading or a `Reviewed head:` attestation/;
+
+for (const [label, args] of [
+  ["gh pr review --approve", ["pr", "review", "5", "--approve"]],
+  ["gh api -f event=APPROVED", ["api", "-X", "POST", "repos/o/r/pulls/5/reviews", "-f", "event=APPROVED"]],
+  ["gh api --field event=approved", ["api", "repos/o/r/pulls/5/reviews", "--field", "event=approved"]],
+  [
+    "graphql addPullRequestReview",
+    ["api", "graphql", "-f", 'query=mutation{addPullRequestReview(input:{pullRequestId:"x",event:APPROVED}){clientMutationId}}'],
+  ],
+]) {
+  test(`${label} is refused (PEN-3193)`, () => {
+    withTempDir((dir) => assertRefused(runGuard(dir, args), APPROVED));
+  });
+}
+
+// The heading is matched with the slack the gate's own matcher allows, so an
+// indented or bolded copy does not slip past. Indenting is not an escape: the
+// gate reads those as the heading too.
+for (const [label, body] of [
+  ["canonical heading", "## Ally — Consolidated PR Review\n\n0 Critical, 0 Important"],
+  ["indented heading", "  ## Ally — Consolidated PR Review\n"],
+  ["bolded, unprefixed heading", "**Ally — Consolidated PR Review**\n"],
+  ["ASCII-dash heading", "## Ally -- Consolidated PR Review\n"],
+  ["bare attestation", "Reviewed head: 2ee3d4561f0e4a1b9c8d7e6f5a4b3c2d1e0f9a8b\n"],
+  ["attestation below prose", "Looks good to me.\n\nReviewed head: 2ee3d456\n"],
+]) {
+  test(`a comment carrying a ${label} is refused (PEN-3193)`, () => {
+    withTempDir((dir) => assertRefused(runGuard(dir, ["pr", "comment", "5", "--body", body]), EVIDENCE));
+  });
+}
+
+test("reviewer-shaped evidence is refused on the review surface too (PEN-3193)", () => {
+  // On #676 every consolidated body arrived as a review object's body, not as
+  // an issue comment — a check that watched only the comment surface read zero.
+  withTempDir((dir) =>
+    assertRefused(
+      runGuard(dir, ["pr", "review", "5", "--comment", "--body", "## Ally — Consolidated PR Review\n"]),
+      EVIDENCE,
+    ),
+  );
+});
+
+test("reviewer-shaped evidence is refused when it arrives via --body-file (PEN-3193)", () => {
+  withTempDir((dir) => {
+    const bodyPath = path.join(dir, "body.md");
+    writeFileSync(bodyPath, "## Ally — Consolidated PR Review\n");
+    assertRefused(runGuard(dir, ["pr", "comment", "5", "--body-file", bodyPath]), EVIDENCE);
+  });
+});
+
+test("reviewer-shaped evidence is refused when it arrives on stdin (PEN-3193)", () => {
+  withTempDir((dir) =>
+    assertRefused(runGuard(dir, ["pr", "comment", "5", "--body-file", "-"], { input: "Reviewed head: abc123\n" }), EVIDENCE),
+  );
+});
+
+test("reviewer-shaped evidence is refused inside a JSON --input payload (PEN-3193)", () => {
+  // `gh api --input` sends one line with \n escapes, so a line-anchored match
+  // over the raw bytes would see a single line that starts with `{` and pass it.
+  withTempDir((dir) => {
+    const payload = path.join(dir, "payload.json");
+    writeFileSync(payload, JSON.stringify({ body: "intro\n## Ally — Consolidated PR Review\n0 Critical" }));
+    assertRefused(runGuard(dir, ["api", "-X", "POST", "repos/o/r/issues/5/comments", "--input", payload]), EVIDENCE);
+  });
+});
+
+// Everything below must keep working. These are the regression guards on blast
+// radius, and they matter more than the refusals: the cost of a false refusal
+// lands on the reviewer, which has no other way to publish a verdict.
+test("an ordinary author comment passes through (PEN-3193)", () => {
+  withTempDir((dir) => {
+    const proc = runGuard(dir, ["pr", "comment", "5", "--body", "I am the author; CI is green at this head."]);
+    assert.equal(proc.status, 0);
+    assert.match(proc.stdout, /ARGS=pr comment 5 --body I am the author/);
+  });
+});
+
+test("a COMMENTED review passes through (PEN-3193)", () => {
+  // COMMENTED is the state the reviewer's own reviews take on agent-authored
+  // PRs — GitHub bars the App approving a PR it authored (PEN-2015) — so
+  // refusing it would break the reviewer and leave the forger the APPROVED path.
+  withTempDir((dir) => {
+    const proc = runGuard(dir, ["pr", "review", "5", "--comment", "--body", "nit: stray import"]);
+    assert.equal(proc.status, 0);
+    assert.match(proc.stdout, /ARGS=pr review 5 --comment/);
+  });
+});
+
+test("a body read from stdin still reaches the real gh verbatim (PEN-3193)", () => {
+  // The guard has to consume stdin to inspect it. If it did not hand the bytes
+  // back, every `--body-file -` caller would post an empty comment instead.
+  withTempDir((dir) => {
+    const proc = runGuard(dir, ["pr", "comment", "5", "--body-file", "-"], { input: "hello from stdin\n" });
+    assert.equal(proc.status, 0);
+    assert.match(proc.stdout, /STDIN<<hello from stdin>>/);
+  });
+});
+
+test("read-only api calls on the review endpoint pass through (PEN-3193)", () => {
+  withTempDir((dir) => {
+    const proc = runGuard(dir, ["api", "repos/o/r/pulls/5/reviews"]);
+    assert.equal(proc.status, 0);
+    assert.match(proc.stdout, /ARGS=api repos\/o\/r\/pulls\/5\/reviews/);
+  });
+});
+
+test("the reviewer's own harness can publish evidence through the escape hatch (PEN-3193)", () => {
+  // The guard stops accidental authorship-as-reviewer; it is not a boundary
+  // against a process that holds the reviewer's key, and nothing parsing argv
+  // could be. That boundary is Remediation #1 — a credential that is not the
+  // reviewer's — and this hatch is why this change cannot substitute for it.
+  withTempDir((dir) => {
+    const proc = runGuard(dir, ["pr", "comment", "5", "--body", "## Ally — Consolidated PR Review\n"], {
+      extraEnv: { GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE: "i-am-the-reviewer" },
+    });
+    assert.equal(proc.status, 0);
+    assert.match(proc.stdout, /ARGS=pr comment 5/);
+  });
+});
+
+test("a near-miss escape-hatch value does not disable the guard (PEN-3193)", () => {
+  withTempDir((dir) =>
+    assertRefused(
+      runGuard(dir, ["pr", "comment", "5", "--body", "Reviewed head: abc\n"], {
+        extraEnv: { GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE: "1" },
+      }),
+      EVIDENCE,
+    ),
+  );
+});
