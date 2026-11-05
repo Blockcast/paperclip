@@ -78,7 +78,7 @@ async function until(cond: () => boolean | Promise<boolean>, what: string) {
 
 /** The pool's queue lengths, exported by patches/postgres@3.4.9.patch (BLO-33243). */
 const poolStats = (client: postgres.Sql) =>
-  (client as unknown as { poolStats(): { active: number; waiting: number } }).poolStats();
+  (client as unknown as { poolStats(): { idle: number; active: number; connecting: number; waiting: number } }).poolStats();
 
 /**
  * Settles with the value, the error's code, or `hung`, so a hang fails an
@@ -641,6 +641,61 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
       await proxied.end({ timeout: 1 });
       for (const socket of sockets) socket.destroy();
       proxy.close();
+    }
+  });
+
+  it("returns the losing connection to the pool when two are offered to one reserve() waiter", async () => {
+    // A cold reserve() waiter is its own connect's trigger and stays queued, so if
+    // another connection closes while that connect is still in its handshake,
+    // onclose() hands it the same waiter. Both connections then offer
+    // themselves; the one that loses must go back to the pool, not sit in
+    // `connecting` forever.
+    const target = new URL(dbh.connectionString);
+    const sockets = new Set<net.Socket>();
+    const gate = deferred();
+    let accepted = 0;
+    const proxy = net.createServer((client) => {
+      const n = ++accepted;
+      const upstream = net.connect(Number(target.port), target.hostname);
+      for (const socket of [client, upstream]) {
+        sockets.add(socket);
+        socket.on("error", () => {});
+        socket.on("close", () => sockets.delete(socket));
+      }
+      // The second connection is the cold reserve()'s: hold it in its handshake.
+      void (n === 2 ? gate.promise : Promise.resolve()).then(() => {
+        client.pipe(upstream);
+        upstream.pipe(client);
+      });
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const viaProxy = new URL(dbh.connectionString);
+    viaProxy.hostname = "127.0.0.1";
+    viaProxy.port = String((proxy.address() as net.AddressInfo).port);
+    const proxied = postgres(viaProxy.toString(), { max: 2, onnotice: () => {} });
+    try {
+      const [{ pid }] = await proxied<{ pid: number }[]>`select pg_backend_pid() as pid`;
+      const busy = within(proxied`select pg_sleep(${5})`, 10_000);
+      await waitForPgSleep(pid);
+      const reserving = within(proxied.reserve(), 10_000);
+      await until(() => poolStats(proxied).connecting === 1, "the cold connect to start");
+      // The busy connection closes; onclose() hands its reconnect the same waiter.
+      await admin`select pg_terminate_backend(${pid})`;
+      const outcome = await reserving;
+      expect(outcome).toHaveProperty("value");
+      // Now let the cold connect finish its handshake and offer itself too.
+      gate.resolve();
+      await until(() => {
+        const stats = poolStats(proxied);
+        return stats.connecting === 0 && stats.idle + stats.active === 2;
+      }, "both connections to leave `connecting`");
+      (outcome as { value: postgres.ReservedSql }).value.release();
+      expect(await busy).toEqual({ error: "CONNECTION_CLOSED" });
+    } finally {
+      gate.resolve();
+      await proxied.end({ timeout: 1 });
+      for (const socket of sockets) socket.destroy();
+      proxy.listening && proxy.close();
     }
   });
 
