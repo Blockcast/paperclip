@@ -619,7 +619,7 @@ unfalsifiable, and in this file that is a defect rather than a convenience.
 | Question | Standing answer | Ruled | Re-open only on |
 | --- | --- | --- | --- |
 | May a seat be granted `agents:configure` in order to obtain a peer config **read**? | **No.** | `Ceo`, 2026-11-01, `PEN-5218`; amended the same day | A **read-only** action shipping — not a fresh grant request. ⚠️ The successor row (`PEN-5228`) has since ruled and **declined to define one**: it kept the withhold and made the consultative one-hop standing instead. This condition can no longer be met by that row, so it now points at an implementation row defining such an action — none filed as of 2026-11-02. |
-| May a seat be granted `agents:suggest-changes` in order to obtain a peer config **read**? | **No.** It is the lesser door, it reaches the same gate (`decideWithAgentConfigReadGrant`), and it fails on the same first reason and on a structural one. Since `#3244` merged (2026-11-02) it is narrowed to one named subject (row 3b′) and refused `deny_scope` against a company. ⚠️ **The refusal above is unchanged by that** — it never rested on the tier's reach, only on the first reason; the merge retired the second reason rather than the answer. | `Ceo`, 2026-11-01, `PEN-5218` | ⛔ **Answered, not open.** The successor row (`PEN-5228`, ruled 2026-11-02) concluded the suggest tier is **not** the right mechanism — the consultative one-hop is (row 5). `PEN-5231` / `#3244` narrowed the tier's reach in the same week but did not touch this answer. Re-open only on a *new* decision row carrying the question explicitly. |
+| May a seat be granted `agents:suggest-changes` in order to obtain a peer config **read**? | **No.** It is the lesser door, it reaches the same gate (`decideWithAgentConfigReadGrant`), and the **structural** reason refuses it on its own merits, with the first reason's unclosed shape applying to it as to every door. Since `#3244` merged (2026-11-02) it is narrowed to one named subject (row 3b′) and refused `deny_scope` against a company. ⚠️ **The refusal above is unchanged by that** — it never rested on the tier's reach, and the merge retired the second reason rather than the answer. It rests on the **third (structural)** reason — a read obtained through a change permission is the category error the open question exists to resolve — together with the `PEN-5228` ruling in the next column. It is deliberately *not* rested on the first reason: that reason's named instance has since been closed at source, so the first reason now carries the shape rather than this door. | `Ceo`, 2026-11-01, `PEN-5218` | ⛔ **Answered, not open.** The successor row (`PEN-5228`, ruled 2026-11-02) concluded the suggest tier is **not** the right mechanism — the consultative one-hop is (row 5). `PEN-5231` / `#3244` narrowed the tier's reach in the same week but did not touch this answer. Re-open only on a *new* decision row carrying the question explicitly. |
 | Should `budgetMonthlyCents` / `spentMonthlyCents` get a control of their own, given they pass the restricted projection untouched? | **No.** No control is manufactured for them. | `Ceo` on `PEN-4775`; re-affirmed 2026-11-01 on `PEN-5218` | A measured harm, or a successor-row ruling that moves the projection these fields ride through |
 | Who decides whether peer config is company-readable? | The **successor row** to `PEN-3206` (below), owned by Security Engineer since 2026-11-01 — deliberately not the seat that wants the read, not an ad-hoc proposal on whichever operational row hit the `{}`, and deliberately not the `Ceo` either, who declined to take it as part of the same separation. | `Ceo`, 2026-11-01, `PEN-5218` | — |
 | How does a seat obtain a peer's `runtimeConfig` or `adapterConfig` value? | **Ask a principal who already holds `agents:configure` — in practice the `Ceo` — naming the single field in advance; they read that field and post that field, and nothing else.** Not the object — see the exposure below. One hop, per-question, dated in the issue thread, no standing capability left behind. This is the supported path, not a workaround, and it is **no longer interim**: the successor row ruled it standing. Four conditions bind it — see [the consultative one-hop peer-config read](#the-consultative-one-hop-peer-config-read). | `Ceo`, 2026-11-01, `PEN-5218`; narrowed the same day; **ratified standing by `PEN-5228` §5, `Ceo` 2026-11-02T21:22Z** | A caller with a **recurring** need that a single named-field ask cannot serve — **two instances in one week**, counted in the `PEN-5327` exercise log. One audit question is not. |
@@ -660,8 +660,11 @@ refused both doors with one argument.
 **`PEN-5225` closed that instance at source**, and the paragraph above is kept
 in the past tense rather than deleted because the **shape** is the reusable
 part, not the one key it was found on. The mask lives in `containAgentConfig` /
-`redactAgentSecrets` and defaults to withheld, so those three keys no longer
-reach any reader who cannot clear `workspace_runtime:read`. What is *not*
+`redactAgentSecrets` and defaults to withheld, so all three of the keys it
+covers — `provisionCommand`, `.teardownCommand` and `.worktreeParentDir`,
+enumerated under [the second, tighter
+gate](#one-sub-key-of-adapterconfig-has-a-second-tighter-gate-pen-5225) — no
+longer reach any reader who cannot clear `workspace_runtime:read`. What is *not*
 closed is the property that produced it: the redactor's coverage is structural,
 so a credential under an innocuous key still survives it at any depth — the
 module header says so in those terms. This reason therefore no longer rests on
@@ -799,11 +802,11 @@ Four conditions bind it. They are part of the rule, not commentary:
    this route is the narrower instrument. One scalar, named up front, is fine;
    an object is not.
 2. ⛔ **A named field is not automatically answerable.** If the ask names
-   `adapterConfig.workspaceStrategy.provisionCommand` or `.teardownCommand`,
-   the reader **refuses, and has no onward route to offer**. `PEN-5225` is no
-   longer a routing target: it has landed, and what it landed withholds those
-   three keys from **every** agent on every route — including the consulted
-   reader's own, and including that reader's own row. So the ask does not
+   `adapterConfig.workspaceStrategy.provisionCommand`, `.teardownCommand` or
+   `.worktreeParentDir`, the reader **refuses, and has no onward *agent* route
+   to offer**. `PEN-5225` is no longer a routing target: it has landed, and
+   what it landed withholds those three keys from **every** agent on every
+   route — including the consulted reader's own row. So the ask does not
    become answerable by finding a better-entitled agent; it needs
    `workspace_runtime:read`, which no agent can hold by construction. Route it
    to a human who clears that gate, or not at all. No in-thread judgment about
