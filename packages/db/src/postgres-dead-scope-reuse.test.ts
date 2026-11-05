@@ -642,6 +642,59 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
     }
   });
 
+  it("settles queries queued behind reserve() waiters promptly when the database goes away", async () => {
+    // Each closing connection takes its own queued item, as upstream does, so an
+    // outage settles one item per failed connect attempt. Leaving a waiter queued
+    // as every reconnect's trigger instead settled one waiter per round while the
+    // pool's shared backoff grew, and rejected the plain queries seconds late.
+    const target = new URL(dbh.connectionString);
+    const sockets = new Set<net.Socket>();
+    const proxy = net.createServer((client) => {
+      const upstream = net.connect(Number(target.port), target.hostname);
+      for (const socket of [client, upstream]) {
+        sockets.add(socket);
+        socket.on("error", () => {});
+        socket.on("close", () => sockets.delete(socket));
+      }
+      client.pipe(upstream);
+      upstream.pipe(client);
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const viaProxy = new URL(dbh.connectionString);
+    viaProxy.hostname = "127.0.0.1";
+    viaProxy.port = String((proxy.address() as net.AddressInfo).port);
+    const proxied = postgres(viaProxy.toString(), { max: 2, onnotice: () => {} });
+    try {
+      // Hold both connections, then queue three waiters ahead of two queries.
+      await proxied.reserve();
+      await proxied.reserve();
+      let down = 0;
+      const settled = (p: PromiseLike<unknown>) =>
+        Promise.resolve(p)
+          .then(() => "ok", (error: { code?: string }) => error?.code ?? String(error))
+          .then((outcome) => ({ outcome, ms: performance.now() - down }));
+      const waiters = [0, 1, 2].map(() => settled(proxied.reserve()));
+      const queued = [1, 2].map((n) => settled(proxied`select ${n} as x`.execute()));
+      await until(() => poolStats(proxied).waiting === 5, "the queue to fill");
+      down = performance.now();
+      proxy.close();
+      for (const socket of sockets) socket.destroy();
+
+      for (const { outcome, ms } of await Promise.all(queued)) {
+        expect(outcome).toBe("ECONNREFUSED");
+        expect(ms).toBeLessThan(1_500);
+      }
+      expect((await Promise.all(waiters)).map((w) => w.outcome)).toEqual([
+        "ECONNREFUSED",
+        "ECONNREFUSED",
+        "ECONNREFUSED",
+      ]);
+    } finally {
+      await proxied.end({ timeout: 1 });
+      proxy.listening && proxy.close();
+    }
+  });
+
   async function waitForBackendGone(pid: number) {
     for (let i = 0; i < 100; i++) {
       const [{ alive }] = await admin<{ alive: boolean }[]>`
