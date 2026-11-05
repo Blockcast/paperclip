@@ -455,7 +455,11 @@ describe("the broker's own stderr records how every connection ended", () => {
     // legitimately contain a newline. Once outcome lines became the durable
     // record of publish outcomes, an injected line was a forged OUTCOME --
     // from exactly the principal this boundary exists to constrain.
-    const forged = "paperclip-github-broker: exit git code=0";
+    // ⚠ `code=99`, not `code=0`. The fake `git` below really does exit 0, so a
+    // forged payload of `exit git code=0` would be byte-identical to the
+    // genuine outcome line and the assertion would catch the broker telling
+    // the truth. 99 is a code nothing in this test can legitimately produce.
+    const forged = "paperclip-github-broker: exit git code=99";
 
     it("collapses CR, LF and the unicode line separators", () => {
       expect(toSingleLogLine(`a\nb`)).toBe("a b");
@@ -497,13 +501,16 @@ describe("the broker's own stderr records how every connection ended", () => {
         expect(line.includes("\n")).toBe(false);
         expect(line.includes("\r")).toBe(false);
       }
-      // Without the guard the accept line would have split, and the second
-      // half would be an outcome line nobody wrote. Count what a matcher
-      // anchored at `^` would count: exactly one outcome, the real one.
+      // Without the guard the accept line would have split in two and the
+      // second half would be an outcome line nobody wrote. Count the way a
+      // Loki matcher does -- ANCHORED at the start of a physical line.
       const asLoki = logged.flatMap((line) => line.split(/\r?\n/));
-      const forgedOutcomes = asLoki.filter((line) => line === forged);
-      expect(forgedOutcomes).toHaveLength(0);
-      expect(outcomes()).toHaveLength(1);
+      expect(asLoki).toHaveLength(logged.length); // nothing split
+      expect(asLoki.filter((line) => line.startsWith(forged))).toHaveLength(0);
+      // Exactly one real outcome, and it is the genuine exit 0.
+      const realOutcomes = asLoki.filter((line) => /^paperclip-github-broker: (exit|spawn-failed|refused) /.test(line));
+      expect(realOutcomes).toHaveLength(1);
+      expect(realOutcomes[0]).toBe("paperclip-github-broker: exit git code=0");
     });
 
     it("applies the guard to a caller-supplied log, not only the default", async () => {
