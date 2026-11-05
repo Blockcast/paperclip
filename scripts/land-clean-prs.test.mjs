@@ -11,6 +11,7 @@ import {
   STALE_HOLD_HOURS,
   UNLANDED_ELIGIBLE_HOURS,
   alarmExitCode,
+  WiringError,
   stateHold,
   statedHoldMarker,
   reviewGateRemedy,
@@ -448,12 +449,24 @@ describe("per-fire cap", () => {
     };
     sweepRepos(
       ["a/one", "a/two"],
-      repoRunner(true, 7, rotted, stranded, spy, new Set(), [], starved),
+      repoRunner({
+        apply: true,
+        settleMinutes: 7,
+        rotted,
+        stranded,
+        run: spy,
+        notify: new Set(),
+        unreadable: [],
+        starved,
+      }),
     );
-    assert.deepEqual(calls, [
-      ["a/one", true, 7, 0, rotted, stranded, starved],
-      ["a/two", true, 7, 3, rotted, stranded, starved],
-    ]);
+    assert.deepEqual(
+      calls.map(([bag]) => [bag.repo, bag.apply, bag.settleMinutes, bag.spent]),
+      [
+        ["a/one", true, 7, 0],
+        ["a/two", true, 7, 3],
+      ],
+    );
     // deepEqual is structural, so the empty `rotted`/`stranded` above match
     // any empty array. Identity is what main relies on: `rotted` for the
     // `finally` cohort, `stranded` and `starved` for the --alarm exit code,
@@ -462,10 +475,10 @@ describe("per-fire cap", () => {
     // and from the day it was added (PEN-5391): a cohort threaded by value
     // is a detector that can never fire, which is indistinguishable from the
     // blind spot it was written to close.
-    for (const call of calls) {
-      assert.equal(call[4], rotted);
-      assert.equal(call[5], stranded);
-      assert.equal(call[6], starved);
+    for (const [bag] of calls) {
+      assert.equal(bag.rotted, rotted);
+      assert.equal(bag.stranded, stranded);
+      assert.equal(bag.starved, starved);
     }
   });
 });
@@ -556,7 +569,14 @@ describe("apply order (PEN-5503)", () => {
         assert.throws(
           () =>
             quiet(() =>
-              runRepo("a/one", true, 0, 0, [], [], [], {
+              runRepo({
+                repo: "a/one",
+                apply: true,
+                settleMinutes: 0,
+                spent: 0,
+                rotted: [],
+                stranded: [],
+                starved: [],
                 fetch: () => rows.map(({ number }) => ({ number })),
                 classify: () => rows,
                 applyOne: (_repo, row) => {
@@ -618,7 +638,14 @@ describe("apply order (PEN-5503)", () => {
       const rows = saturated();
       const applied = [];
       quiet(() =>
-        runRepo("a/one", true, 0, 0, [], [], [], {
+        runRepo({
+          repo: "a/one",
+          apply: true,
+          settleMinutes: 0,
+          spent: 0,
+          rotted: [],
+          stranded: [],
+          starved: [],
           fetch: () => rows.map(({ number }) => ({ number })),
           classify: () => rows,
           applyOne: (_repo, row) => {
@@ -1064,15 +1091,24 @@ describe("notify-only repos (PEN-5430)", () => {
     // typo in the notify list arms an autolander in a human-gated repo — the
     // exact failure this row exists to make unreachable.
     const seen = [];
-    const spy = (repo, _apply, _settle, _spent, _rotted, _stranded, _starved, options) => {
-      seen.push([repo, options?.landable ?? true]);
+    const spy = ({ repo, landable = true }) => {
+      seen.push([repo, landable]);
       return [];
     };
     const notify = new Set(["a/both"]);
     quiet(() =>
       sweepRepos(
         sweepOrder(["a/both", "a/land"], [...notify]),
-        repoRunner(true, 0, [], [], spy, notify),
+        repoRunner({
+          apply: true,
+          settleMinutes: 0,
+          rotted: [],
+          stranded: [],
+          run: spy,
+          notify,
+          unreadable: [],
+          starved: [],
+        }),
       ),
     );
     assert.deepEqual(seen, [
@@ -1087,13 +1123,32 @@ describe("notify-only repos (PEN-5430)", () => {
     // because the obvious implementation (always pass the bag) would make every
     // existing argument-vector assertion assert a new trailing slot instead.
     //
-    // PEN-5391 added `starved` as the 7th positional, so the unchanged vector
-    // is now 7 long and the conditional slot is the 8th. The assertion is on
+    // PEN-5536 converted both signatures to named bags, so there is no slot to
+    // count any more and the invariant is stated directly: `landable` is
+    // ABSENT from the bag in a land repo, which is what lets `runRepo`'s own
+    // default supply it. The assertion is on
     // the bag NOT being appended, not on the number 6.
     const calls = [];
     const spy = (...args) => (calls.push(args), []);
-    quiet(() => sweepRepos(["a/one"], repoRunner(true, 7, [], [], spy)));
-    assert.equal(calls[0].length, 7, "no eighth argument when the notify list is empty");
+    quiet(() =>
+      sweepRepos(
+        ["a/one"],
+        repoRunner({
+          apply: true,
+          settleMinutes: 7,
+          rotted: [],
+          stranded: [],
+          run: spy,
+          unreadable: [],
+          starved: [],
+        }),
+      ),
+    );
+    assert.equal(calls[0].length, 1, "one named bag, never a positional vector");
+    assert.ok(
+      !("landable" in calls[0][0]),
+      "no `landable` key when the notify list is empty, so runRepo's own default applies",
+    );
   });
 
   // ---- The acceptance criterion: zero enqueues, structurally. ----
@@ -1106,7 +1161,14 @@ describe("notify-only repos (PEN-5430)", () => {
     const run = (notifyOnly) =>
       quiet(() =>
         atNow(() =>
-          runRepo("a/repo", true, 0, 0, [], [], [], {
+          runRepo({
+            repo: "a/repo",
+            apply: true,
+            settleMinutes: 0,
+            spent: 0,
+            rotted: [],
+            stranded: [],
+            starved: [],
             fetch: landable,
             applyOne: () => null,
             state: () => {},
@@ -1196,7 +1258,14 @@ describe("notify-only repos (PEN-5430)", () => {
     };
     quiet(() =>
       atNow(() =>
-        runRepo("b/notify", true, 0, 0, [], [], [], {
+        runRepo({
+          repo: "b/notify",
+          apply: true,
+          settleMinutes: 0,
+          spent: 0,
+          rotted: [],
+          stranded: [],
+          starved: [],
           landable: false,
           fetch: () => [pr({ number: 600 })],
           classify: () => [{ number: 600, action: "enqueue", reason: "mergestate:CLEAN", headSha: HEAD }],
@@ -1294,7 +1363,14 @@ describe("notify-only repos (PEN-5430)", () => {
     const actionsIn = (landableRepo) =>
       quiet(() =>
         atNow(() =>
-          runRepo("b/repo", true, 0, MAX_ENQUEUES_PER_FIRE, [], [], [], {
+          runRepo({
+            repo: "b/repo",
+            apply: true,
+            settleMinutes: 0,
+            spent: MAX_ENQUEUES_PER_FIRE,
+            rotted: [],
+            stranded: [],
+            starved: [],
             landable: landableRepo,
             fetch: many,
             applyOne: () => null,
@@ -1325,20 +1401,22 @@ describe("notify-only repos (PEN-5430)", () => {
       atNow(() =>
         sweepRepos(
           sweepOrder(["a/land"], [...notify]),
-          repoRunner(
-            true,
-            0,
-            [],
-            [],
-            (repo, apply, settle, carried, rotted, stranded, starved, options) =>
-              runRepo(repo, apply, settle, carried, rotted, stranded, starved, {
-                ...options,
+          repoRunner({
+            apply: true,
+            settleMinutes: 0,
+            rotted: [],
+            stranded: [],
+            unreadable: [],
+            starved: [],
+            run: (bag) =>
+              runRepo({
+                ...bag,
                 fetch: landable,
                 applyOne: () => null,
                 state: () => {},
               }),
             notify,
-          ),
+          }),
         ),
       ),
     );
@@ -1367,7 +1445,14 @@ describe("notify-only repos (PEN-5430)", () => {
       const stated = [];
       quiet(() =>
         atNow(() =>
-          runRepo("b/repo", true, 0, 0, [], [], [], {
+          runRepo({
+            repo: "b/repo",
+            apply: true,
+            settleMinutes: 0,
+            spent: 0,
+            rotted: [],
+            stranded: [],
+            starved: [],
             landable: landableRepo,
             fetch: held,
             applyOne: () => null,
@@ -2770,7 +2855,14 @@ describe("runRepo apply wiring (PEN-5263)", () => {
     console.log = () => {};
     try {
       atNow(() =>
-        runRepo("a/one", apply, 0, 0, [], stranded, starved, {
+        runRepo({
+          repo: "a/one",
+          apply,
+          settleMinutes: 0,
+          spent: 0,
+          rotted: [],
+          stranded,
+          starved,
           fetch: () => prs,
           classify: () => rows,
           applyOne: (_repo, row) => (applied.push(row.number), "merge requested"),
@@ -3249,7 +3341,14 @@ describe("rate-limit retry in gh() (BLO-51665)", () => {
         // defaulted to the real network call -- which is how this read green
         // against a live GraphQL error instead of the injected refusal. It is
         // no longer silent: `runRepo` now rejects a non-array in slot 7.
-        runRepo("a/one", true, 0, 0, [], [], [], {
+        runRepo({
+          repo: "a/one",
+          apply: true,
+          settleMinutes: 0,
+          spent: 0,
+          rotted: [],
+          stranded: [],
+          starved: [],
           fetch: () => { throw refused(); },
         }),
       );
@@ -3518,7 +3617,7 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
     // exotic one.
     const unreadable = [];
     const swept = [];
-    const run = (repo) => {
+    const run = ({ repo }) => {
       if (repo === "a/broken") boom("HTTP 502: 502 Bad Gateway")();
       swept.push(repo);
       return [{ number: 1, action: "enqueue" }];
@@ -3526,7 +3625,16 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
     const { value, lines } = quietly(() =>
       sweepRepos(
         ["a/broken", "a/fine"],
-        repoRunner(true, 0, [], [], run, new Set(), unreadable),
+        repoRunner({
+          apply: true,
+          settleMinutes: 0,
+          rotted: [],
+          stranded: [],
+          run,
+          notify: new Set(),
+          unreadable,
+          starved: [],
+        }),
       ),
     );
     assert.deepEqual(swept, ["a/fine"], "the readable repo was still swept");
@@ -3543,7 +3651,22 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
     for (const fatal of ["API rate limit exceeded (HTTP 403)", "Bad credentials", "HTTP 401"]) {
       const unreadable = [];
       assert.throws(
-        () => quietly(() => sweepRepos(["a/one"], repoRunner(true, 0, [], [], boom(fatal), new Set(), unreadable))),
+        () =>
+          quietly(() =>
+            sweepRepos(
+              ["a/one"],
+              repoRunner({
+                apply: true,
+                settleMinutes: 0,
+                rotted: [],
+                stranded: [],
+                run: boom(fatal),
+                notify: new Set(),
+                unreadable,
+                starved: [],
+              }),
+            ),
+          ),
         /gh failed/,
         `${fatal} must still abort`,
       );
@@ -3554,13 +3677,25 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
   it("does not spend the skipped repo's budget on anything", () => {
     const unreadable = [];
     const seen = [];
-    const run = (repo, _apply, _settle, spent) => {
+    const run = ({ repo, spent }) => {
       seen.push([repo, spent]);
       if (repo === "a/broken") boom("HTTP 502")();
       return [{ number: 1, action: "enqueue" }, { number: 2, action: "enqueue" }];
     };
     quietly(() =>
-      sweepRepos(["a/first", "a/broken", "a/last"], repoRunner(true, 0, [], [], run, new Set(), unreadable)),
+      sweepRepos(
+        ["a/first", "a/broken", "a/last"],
+        repoRunner({
+          apply: true,
+          settleMinutes: 0,
+          rotted: [],
+          stranded: [],
+          run,
+          notify: new Set(),
+          unreadable,
+          starved: [],
+        }),
+      ),
     );
     // The skipped repo contributes no rows, so the carry into `a/last` is the
     // 2 that `a/first` actually spent — not 2 plus a guess for the repo nobody
@@ -3594,21 +3729,26 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
     quietly(() =>
       sweepRepos(
         ["a/one"],
-        repoRunner(
-          true,
-          7,
-          [],
-          [],
-          (...args) => (calls.push(args), []),
-          new Set(),
+        repoRunner({
+          apply: true,
+          settleMinutes: 7,
+          rotted: [],
+          stranded: [],
+          run: (...args) => (calls.push(args), []),
+          notify: new Set(),
           unreadable,
           starved,
-        ),
+        }),
       ),
     );
-    assert.equal(calls[0].length, 7, "no options bag appended when the notify list is empty");
-    assert.equal(calls[0][6], starved, "`starved` is threaded through BY REFERENCE");
-    assert.ok(!calls[0].includes(unreadable), "`unreadable` never reaches `runRepo`");
+    assert.equal(calls[0].length, 1, "one named bag, never a positional vector");
+    const [bag] = calls[0];
+    assert.equal(bag.starved, starved, "`starved` is threaded through BY REFERENCE");
+    assert.ok(
+      !Object.values(bag).includes(unreadable),
+      "`unreadable` never reaches `runRepo`, under ANY key",
+    );
+    assert.ok(!("unreadable" in bag), "and not under its own name either");
   });
 
   it("⛔ an alarm run goes red for a repo it could not read", () => {
@@ -3646,16 +3786,16 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
     quietly(() =>
       sweepRepos(
         ["a/broken"],
-        repoRunner(
-          false,
-          0,
-          [],
+        repoRunner({
+          apply: false,
+          settleMinutes: 0,
+          rotted: [],
           stranded,
-          boom("HTTP 502: 502 Bad Gateway"),
-          new Set(),
+          run: boom("HTTP 502: 502 Bad Gateway"),
+          notify: new Set(),
           unreadable,
           starved,
-        ),
+        }),
       ),
     );
     assert.deepEqual(unreadable, ["a/broken (HTTP 502: 502 Bad Gateway)"], "the 5xx became a skip");
@@ -3955,7 +4095,14 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
       console.log = (line) => printed.push(String(line));
       try {
         atNow(() =>
-          runRepo("a/one", apply, 0, 0, [], stranded, starved, {
+          runRepo({
+            repo: "a/one",
+            apply,
+            settleMinutes: 0,
+            spent: 0,
+            rotted: [],
+            stranded,
+            starved,
             fetch: () => [capPr(3306, OLD)],
             classify: () => [capRow(3306)],
             applyOne: () => "merge requested",
@@ -3991,40 +4138,196 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
       assert.doesNotMatch(printed, /cap-starved/);
     });
 
-    it("refuses an options bag passed in `starved`'s slot instead of binding it", () => {
-      // The regression this file has now suffered TWICE, in the same shape:
-      // a positional is inserted, an existing caller's options bag slides into
-      // it, and nothing complains. The damage is silent rather than red —
-      // `fetch` falls back to the real `fetchOpenPrs`, so the test makes a live
-      // GraphQL call and asserts against whatever GitHub answers. It passes.
-      //
-      // Asserted on the THROW, not on a comment asking the next person to be
-      // careful, because both prior instances were written by people being
-      // careful. `landing-sweep.yml` runs this suite ahead of the hourly sweep,
-      // so an arity that wedges here wedges the sweep too.
+    it("⛔ rejects an UNKNOWN option, naming the key (PEN-5536)", () => {
+      // Supersedes the deleted `Array.isArray(starved)` slot guard, and is
+      // strictly stronger on the axis that guard was written for: it caught
+      // ONE slot, this catches every key — including `fetch`, the misspelling
+      // that started all of this by silently falling back to the real
+      // `fetchOpenPrs` and issuing a LIVE GraphQL call from a green test.
       assert.throws(
         () =>
-          runRepo("a/one", false, 0, 0, [], [], {
-            fetch: () => {
+          runRepo({
+            repo: "a/one",
+            apply: false,
+            settleMinutes: 0,
+            spent: 0,
+            rotted: [],
+            stranded: [],
+            starved: [],
+            fecth: () => {
               throw new Error("the real fetchOpenPrs must never be reached here");
             },
           }),
-        /`starved` \(7th positional\) must be an array/,
+        (error) =>
+          error instanceof WiringError && /unknown option `fecth`/.test(error.message),
+        "a mistyped key must name ITSELF, not merely fail",
       );
     });
 
-    it("accepts the bag in slot 8, which is where it now belongs", () => {
-      // The positive control. Without it the test above would still pass if
-      // `runRepo` rejected every options bag outright.
+    it("⛔ rejects an OMITTED cohort, naming the key (PEN-5536)", () => {
+      // The other half, and it is invisible to the check above: a typo has two
+      // halves and an omission has one. Without this, a dropped `starved:`
+      // would let the callee collect into an array the caller never reads —
+      // the alarm sums zero and the suite stays green.
+      assert.throws(
+        () =>
+          runRepo({
+            repo: "a/one",
+            apply: false,
+            settleMinutes: 0,
+            spent: 0,
+            rotted: [],
+            stranded: [],
+            classify: () => [],
+          }),
+        (error) =>
+          error instanceof WiringError && /missing required option `starved`/.test(error.message),
+        "an omitted cohort must name ITSELF",
+      );
+    });
+
+    it("rejects a positional call outright rather than binding it as a bag", () => {
+      // The conversion's own boundary: the old vector must not half-work.
+      assert.throws(
+        () => runRepo("a/one", false, 0, 0, [], [], []),
+        (error) =>
+          error instanceof WiringError && /expected a named options object/.test(error.message),
+      );
+    });
+
+    it("accepts a complete, correctly-spelled bag", () => {
+      // The positive control for all three throws above. Without it they would
+      // all still pass if `runRepo` rejected every bag outright — which is the
+      // job the deleted slot-8 positive control was doing, re-anchored.
       const seen = [];
       atNow(() =>
-        runRepo("a/one", false, 0, 0, [], [], [], {
+        runRepo({
+          repo: "a/one",
+          apply: false,
+          settleMinutes: 0,
+          spent: 0,
+          rotted: [],
+          stranded: [],
+          starved: [],
           fetch: () => (seen.push("injected"), []),
           classify: () => [],
           state: () => {},
         }),
       );
       assert.deepEqual(seen, ["injected"], "the injected fetch ran, not the real one");
+    });
+
+    it("applies both guards to `repoRunner`'s bag as well, not just `runRepo`'s", () => {
+      // Both signatures grew cohorts and both are called from `main`; a guard
+      // on one of them is a guard on half the surface.
+      assert.throws(
+        () =>
+          repoRunner({ apply: true, settleMinutes: 0, rotted: [], stranded: [], unreadable: [] }),
+        (error) =>
+          error instanceof WiringError && /missing required option `starved`/.test(error.message),
+      );
+      assert.throws(
+        () =>
+          repoRunner({
+            apply: true,
+            settleMinutes: 0,
+            rotted: [],
+            stranded: [],
+            unreadable: [],
+            starved: [],
+            notifiy: new Set(),
+          }),
+        (error) => error instanceof WiringError && /unknown option `notifiy`/.test(error.message),
+      );
+      assert.doesNotThrow(() =>
+        repoRunner({
+          apply: true,
+          settleMinutes: 0,
+          rotted: [],
+          stranded: [],
+          unreadable: [],
+          starved: [],
+        }),
+      );
+    });
+  });
+
+  describe("⛔ a wiring fault is never recorded as a repo-readability fact (PEN-5536)", () => {
+    const hushed = (fn) => {
+      const log = console.log;
+      console.log = () => {};
+      try {
+        return fn();
+      } finally {
+        console.log = log;
+      }
+    };
+    it("lets a WiringError ESCAPE `repoRunner`'s catch", () => {
+      // Without the rethrow, `assertBag`'s throw is matched against
+      // `isFatalGhError` — a regex over rate-limit / bad-credential / HTTP 401
+      // / HTTP 403 messages that a shape fault matches none of — so it lands in
+      // `unreadable` and is printed as "it could not be listed". A wiring fault
+      // is repo-INDEPENDENT, so EVERY repo takes the same throw and the hourly
+      // detector reports an apparent GitHub outage.
+      const unreadable = [];
+      assert.throws(
+        () =>
+          hushed(() =>
+            sweepRepos(
+              ["a/one"],
+              repoRunner({
+                apply: true,
+                settleMinutes: 0,
+                rotted: [],
+                stranded: [],
+                unreadable,
+                starved: [],
+                // A seam standing in for `runRepo` that fails the way a
+                // mis-wired `runRepo` fails.
+                run: () => {
+                  throw new WiringError("runRepo: missing required option `starved`.");
+                },
+              }),
+            ),
+          ),
+        (error) => error instanceof WiringError,
+      );
+      assert.deepEqual(unreadable, [], "and is NOT filed as an unreadable repo");
+    });
+
+    it("⛔ CONTROL: a plain TypeError from the read path STILL lands in `unreadable`", () => {
+      // This is the assertion that keeps the rethrow narrow, and it is the one
+      // that fails if someone later widens the predicate back to bare
+      // `TypeError`. `fetchOpenPrs` JSON.parses `gh pr list` output and calls
+      // `.map` on it, so a well-formed non-array payload raises exactly this —
+      // a genuine per-repo read failure, PEN-5442's subject, where the repo is
+      // skipped and every other repo keeps its verdicts. A blanket `TypeError`
+      // rethrow would end the whole fire instead: `sweepRepos` has no catch and
+      // `main`'s try/`finally` has none either.
+      //
+      // The test above alone stays green under that widening. This one does not.
+      const unreadable = [];
+      const swept = [];
+      hushed(() =>
+        sweepRepos(
+          ["a/broken", "a/fine"],
+          repoRunner({
+            apply: true,
+            settleMinutes: 0,
+            rotted: [],
+            stranded: [],
+            unreadable,
+            starved: [],
+            run: ({ repo }) => {
+              if (repo === "a/broken") throw new TypeError("rows.map is not a function");
+              swept.push(repo);
+              return [];
+            },
+          }),
+        ),
+      );
+      assert.deepEqual(unreadable, ["a/broken (rows.map is not a function)"]);
+      assert.deepEqual(swept, ["a/fine"], "and the fire CONTINUED to the next repo");
     });
   });
 });
@@ -4052,7 +4355,25 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442 + 
   const SOURCE = readFileSync(new URL("./land-clean-prs.mjs", import.meta.url), "utf8");
 
   const EXIT_CALL = /process\.exit\(\s*alarmExitCode\(([^)]*)\)\s*\)/;
-  const RUNNER_CALL = /repoRunner\(([^)]*)\)/;
+  // ⛔ ANCHORED AT THE CALL SITE, and the anchor is load-bearing (PEN-5536).
+  // `repoRunner` is now declared `export const repoRunner = (options) => {`,
+  // so a bare /repoRunner\(/ matches the DECLARATION — which is ~400 lines
+  // EARLIER in the file, and a non-global match returns the first occurrence.
+  // The probe would then pin the parameter list of the thing it is supposed to
+  // be checking the call to, and pass forever.
+  //
+  // The anchor is `sweepOrder\(targetRepos\(\)`, not a bare `sweepRepos\(`:
+  // `sweepRepos` has a DECLARATION too, so that weaker prefix let the lazy
+  // span run from the declaration all the way down to the call and matched
+  // anyway — measured while writing this. `sweepOrder(targetRepos())` appears
+  // exactly once in the file and only ever as an argument, which is what makes
+  // it a call-site anchor rather than a name. Same job `process.exit\(` does
+  // for EXIT_CALL. The retarget control below is what proves it.
+  const RUNNER_CALL = /sweepOrder\(targetRepos\(\)[\s\S]*?repoRunner\(\{([^}]*)\}\s*\)/;
+  // The cohorts collected BY REFERENCE, which are the keys whose absence is
+  // silent. `run` and `notify` are seams and `apply`/`settleMinutes` are
+  // ordinary inputs; none of them read as health when dropped.
+  const COHORT_KEYS = ["rotted", "stranded", "unreadable", "starved"];
   const UNMEASURED_CALL = /reportUnmeasured\(\s*sweepError,\s*stranded,\s*\{([^}]*)\}\s*\)/;
   const argsOf = (re, src) => {
     const match = src.match(re);
@@ -4067,14 +4388,22 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442 + 
     );
   });
 
-  it("hands `repoRunner` both collected-by-reference cohorts", () => {
+  it("hands `repoRunner` EVERY collected-by-reference cohort", () => {
     // The other half: a cohort reaching `alarmExitCode` but never handed to
     // the sweep is an array that stays `[]` forever, which reads as health.
+    //
+    // Asserted as the exact SET rather than as membership plus an index.
+    // PEN-5536 replaced the positional vector with a named bag, so "is the 8th
+    // and last" no longer means anything — and a set equality is strictly
+    // stronger than the two `includes` it replaces, because it also fails on a
+    // cohort that was added to the bag and never collected anywhere.
     const args = argsOf(RUNNER_CALL, SOURCE);
     assert.ok(args, "main still builds its per-repo step through repoRunner");
-    assert.ok(args.includes("unreadable"), "`unreadable` is collected by the sweep");
-    assert.ok(args.includes("starved"), "`starved` is collected by the sweep");
-    assert.equal(args.indexOf("starved"), args.length - 1, "`starved` is the 8th and last");
+    assert.deepEqual(
+      args.filter((key) => COHORT_KEYS.includes(key)),
+      COHORT_KEYS,
+      "a cohort dropped here is an array that stays empty forever, which reads as health",
+    );
   });
 
   it("hands `reportUnmeasured` the cap-starved cohort as well (PEN-5314)", () => {
@@ -4103,13 +4432,27 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442 + 
     );
 
     const unthreaded = SOURCE.replace(
-      "runRepo, notify, unreadable, starved)",
-      "runRepo, notify, unreadable)",
+      "        unreadable,\n        starved,\n      }),",
+      "        unreadable,\n      }),",
     );
     assert.notEqual(unthreaded, SOURCE, "control: the mutation actually applied");
     assert.ok(
       !argsOf(RUNNER_CALL, unthreaded).includes("starved"),
       "the probe SEES an unthreaded cohort",
+    );
+
+    // ⛔ THE RETARGET CONTROL (PEN-5536), and it is the one the other controls
+    // cannot stand in for. Every assertion above is satisfied by a probe that
+    // matched `repoRunner`'s own PARAMETER LIST instead of `main`'s call —
+    // the declaration comes first in the file, so a probe that lost its
+    // call-site anchor silently pins the wrong occurrence and stays green.
+    // Delete the call and the probe must find NOTHING, never fall back.
+    const uncalled = SOURCE.replace("sweepOrder(targetRepos()", "sweepOrder(noSuchRepos()");
+    assert.notEqual(uncalled, SOURCE, "control: the mutation actually applied");
+    assert.equal(
+      argsOf(RUNNER_CALL, uncalled),
+      null,
+      "the probe is anchored at the CALL SITE and cannot retarget to the declaration",
     );
 
     const unreported = SOURCE.replace(
