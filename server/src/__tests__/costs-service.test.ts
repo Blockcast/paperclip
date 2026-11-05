@@ -870,6 +870,156 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     }
   });
 
+  // PEN-5604: `byProject` attributes run-level cost through `run_project_links`, which
+  // deduplicated (run_id, project_id) PAIRS rather than runs. A run that touched issues
+  // in N projects produced N link rows, the `leftJoin` matched on `run_id` alone, and
+  // every cost event of that run was therefore counted N times -- including the rows
+  // that already carried a direct `project_id`, which `coalesce` kept mapping back to
+  // the same project on each copy. The visible consequence is arithmetic that does not
+  // add up: `sum(byProject[].costCents)` exceeded actual spend in the same window.
+  //
+  // The invariant pinned here is that total, not the split. The per-project assertions
+  // below additionally pin the attribution the CTO ruled on: a multi-project run's
+  // run-level cost lands on the project it most recently touched, which is what the
+  // pre-existing `ORDER BY ... created_at DESC` was written for and what pair-dedup
+  // made inert.
+  it("does not double-count a multi-project run's cost events across projects", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const earlierProjectId = randomUUID();
+    const laterProjectId = randomUUID();
+    const earlierIssueId = randomUUID();
+    const laterIssueId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Cost Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: earlierProjectId, companyId, name: "Earlier Project", status: "active" },
+      { id: laterProjectId, companyId, name: "Later Project", status: "active" },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: earlierIssueId,
+        companyId,
+        projectId: earlierProjectId,
+        title: "Touched first",
+        status: "done",
+        priority: "medium",
+        issueNumber: 1,
+        identifier: "TST-1",
+      },
+      {
+        id: laterIssueId,
+        companyId,
+        projectId: laterProjectId,
+        title: "Touched last",
+        status: "done",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: "TST-2",
+      },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "completed",
+      startedAt: new Date("2026-11-04T09:00:00.000Z"),
+      finishedAt: new Date("2026-11-04T09:30:00.000Z"),
+    });
+
+    // One run, two projects: this is the fan-out source. `created_at` is set explicitly
+    // so "most recently touched" is deterministic rather than insertion-order luck.
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        runId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.checked_out",
+        entityType: "issue",
+        entityId: earlierIssueId,
+        details: {},
+        createdAt: new Date("2026-11-04T09:05:00.000Z"),
+      },
+      {
+        companyId,
+        runId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.checked_out",
+        entityType: "issue",
+        entityId: laterIssueId,
+        details: {},
+        createdAt: new Date("2026-11-04T09:20:00.000Z"),
+      },
+    ]);
+
+    // Both populations, so the fix is shown to cover each: one row that needs run
+    // attribution (no direct project), one that does not (direct project already set).
+    await db.insert(costEvents).values([
+      {
+        companyId,
+        agentId,
+        heartbeatRunId: runId,
+        projectId: null,
+        provider: "anthropic",
+        biller: "anthropic",
+        billingType: "metered_api",
+        model: "claude-opus-5",
+        inputTokens: 1_000,
+        outputTokens: 500,
+        costCents: 100,
+        occurredAt: new Date("2026-11-04T09:10:00.000Z"),
+      },
+      {
+        companyId,
+        agentId,
+        heartbeatRunId: runId,
+        projectId: earlierProjectId,
+        provider: "anthropic",
+        biller: "anthropic",
+        billingType: "metered_api",
+        model: "claude-opus-5",
+        inputTokens: 2_000,
+        outputTokens: 800,
+        costCents: 250,
+        occurredAt: new Date("2026-11-04T09:25:00.000Z"),
+      },
+    ]);
+
+    const rows = await costs.byProject(companyId);
+    const totalReported = rows.reduce((sum, row) => sum + (row.costCents ?? 0), 0);
+
+    // The invariant: by-project totals must equal actual spend over the same window.
+    expect(totalReported).toBe(350);
+
+    const byProjectId = new Map(rows.map((row) => [row.projectId, row.costCents]));
+    // Direct attribution, counted exactly once despite the run touching two projects.
+    expect(byProjectId.get(earlierProjectId)).toBe(250);
+    // Run attribution resolves to the project the run most recently touched.
+    expect(byProjectId.get(laterProjectId)).toBe(100);
+  });
+
   it("aggregates issue costs across recursive descendants only", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
