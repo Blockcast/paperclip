@@ -32904,15 +32904,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const unownedIssueIds: string[] = [];
 
     /**
-     * PEN-5346: does this source still solely own a work product nobody else
-     * is chasing? The terminal-branch exemption to the handoff horizon.
+     * PEN-5346: does this source still own an OPEN work product? The
+     * terminal-branch exemption to the handoff horizon.
      *
-     * A cancelled row keeps owning its work products and nothing else will
-     * chase them (PEN-4835: a remediation PR left open for months with the
-     * cancelled row as its only owner). A remediation PR normally OUTLIVES the
-     * alert that prompted it — it is usually why the alert resolved — so the
-     * age of the clear is exactly the wrong signal for this class, and the
-     * horizon must not apply to it however old the clear is.
+     * Checks only that the row has a non-terminal work product — NOT that it
+     * is the sole owner. That is deliberately the looser test: sole ownership
+     * is the motivating case (PEN-4835: a remediation PR left open for months
+     * with the cancelled row as its only owner), but a shared owner is no
+     * reason to discharge, so this fails toward emitting a carrier.
+     *
+     * A remediation PR normally OUTLIVES the alert that prompted it — it is
+     * usually why the alert resolved — so the age of the clear is exactly the
+     * wrong signal for this class, and the horizon must not apply to it
+     * however old the clear is.
      *
      * Open is defined as "not terminal" rather than enumerated positively, so
      * a work-product status added later fails toward emitting a carrier.
@@ -33098,8 +33102,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       //    field shipped, i.e. exactly the historical backfill — and when
       //    `null`, which asserts the clear found no wake owed at all.
       //
-      //  - A source that still solely owns an OPEN work product is emitted
-      //    regardless. That is the terminal branch this row was widened for
+      //  - A source that still owns an OPEN work product is emitted
+      //    regardless. The check is the looser "has any non-terminal work
+      //    product", not "is the sole owner" — a shared owner is no reason to
+      //    discharge. That is the terminal branch this row was widened for
       //    (PEN-4835: a cancelled row whose remediation PR outlived it by
       //    months and had nothing else pointing at it). Age is precisely the
       //    wrong signal there, because a remediation PR normally outlives the
