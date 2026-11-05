@@ -436,6 +436,20 @@ the cluster**, so nothing would currently report trigger 4 firing in another pod
 on the §7.2 triggers is already permitted by §8 without further security review, and is the cheapest
 remaining improvement here.
 
+⚠ **That re-take has since been owed twice, and taken once — so the "six windows" above is now seven
+(PEN-5663, 2026-11-05).** The egress-relevant surface changed on 2026-11-03 (`50aab1b9…`) and again on
+2026-11-05 (`83aef063…`), against the `d81423fe…` the six windows were taken on — a roughly
+**2-to-5-day** turnover, so a measurement here is stale about that fast. The seventh window re-took it
+on `83aef063…` under a **root-package `pnpm test`** workload — 28.0 min, 2,192 organic observations —
+and found **26 unwrapped**, all of them the same `test/secret-scan-budget.test.ts:611` mechanism the 28
+came from, with **no new mechanism**. Window, population, bounds and the per-file surface hashes are in
+`PEN-4989-absolute-path-git-population-widening.md` §1.3 and §4.1. Three things that are easy to get
+backwards: `wrapperAhead` was **`true`**, so this is §4's *staleness* branch and **not** a control
+failure; ⛔ it is **not** a second firing of §7.2 trigger 4, because the instrument cannot observe an
+invocation and the acceptance a firing would end has **already ended** (above); and 26-against-28 is
+**not** a shrinking class — the two numbers were taken on different surfaces under different workloads,
+which §4 says makes them incomparable in **both** directions.
+
 ⚠ **Status, 2026-10-29 (PEN-4933):** D1 is **built** and merged behind a default-off rollout gate;
 see §7.3. The residual statement above still describes the deployed fleet — but it is **no longer
 accepted on the grounds listed**, because trigger 4 has fired (above). ⛔ The firing is deliberately
