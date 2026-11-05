@@ -5,6 +5,7 @@ import type {
   IssueCommentPresentationTone,
   IssueExecutionMonitorClearReason,
   IssueExecutionMonitorKind,
+  IssueExecutionMonitorRecoveryDisposition,
   IssueExecutionMonitorRecoveryPolicy,
   IssueExecutionMonitorStateStatus,
   IssueExecutionDecisionOutcome,
@@ -871,6 +872,12 @@ export interface IssueExecutionMonitorState {
    * obligation discharged that nothing ever carried.
    */
   recoveryEmittedAt?: string | null;
+  /**
+   * PEN-5346: why this handoff was stamped. Absent on every row stamped before
+   * the field existed, which is not the same claim as `"recovery_issue"` — see
+   * {@link IssueExecutionMonitorRecoveryDisposition}.
+   */
+  recoveryDisposition?: IssueExecutionMonitorRecoveryDisposition;
 }
 
 export interface IssueReviewRequest {
