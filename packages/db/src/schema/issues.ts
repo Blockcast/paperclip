@@ -202,14 +202,14 @@ export const issues = pgTable(
     identifierIdx: uniqueIndex("issues_identifier_idx").on(table.identifier),
     titleSearchIdx: index("issues_title_search_idx").using("gin", table.title.op("gin_trgm_ops")),
     identifierSearchIdx: index("issues_identifier_search_idx").using("gin", table.identifier.op("gin_trgm_ops")),
-    descriptionSearchIdx: index("issues_description_search_idx").using("gin", table.description.op("gin_trgm_ops")),
-    // PEN-3596: company-scoped twins of the three single-column trigram indexes
+    // PEN-3596: company-scoped twins of the single-column trigram indexes
     // above. The issues-list search path always filters by company, and the
     // un-scoped indexes make it pay for every other company's matches on the
     // heap (2,700 index hits to keep 245 rows on a production-shaped seed).
     // btree_gin lets company_id lead the GIN index so the index cond answers
-    // both halves. The single-column indexes stay: company-search also searches
-    // these columns with `ILIKE ANY(array)` forms these do not serve.
+    // both halves. The un-scoped description index was dropped in 0274: it
+    // doubled the GIN write cost of every non-HOT issues update (24-35% of all
+    // WAL) and the description twin below serves every shape it did.
     companyTitleSearchIdx: index("issues_company_title_search_idx")
       .using("gin", table.companyId, table.title.op("gin_trgm_ops")),
     companyIdentifierSearchIdx: index("issues_company_identifier_search_idx")
