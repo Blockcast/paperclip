@@ -475,6 +475,7 @@ describe("the broker's own stderr records how every connection ended", () => {
       const socketPath = await start(undefined, () => {
         throw new TypeError("ERR_INVALID_ARG_TYPE: synthetic synchronous spawn failure");
       });
+      // paperclip:allow-git-push: brokered push under test; the child is a fake tool, not git.
       await call(socketPath, "git", ["push"]).catch(() => undefined);
 
       expect(accepts()).toHaveLength(0);
@@ -490,6 +491,7 @@ describe("the broker's own stderr records how every connection ended", () => {
       writeFakeTool("git", "exit 0");
       const socketPath = await start();
       rmSync(path.join(wrapperDir, "git"), { force: true });
+      // paperclip:allow-git-push: brokered push under test; the child is a fake tool, not git.
       await call(socketPath, "git", ["push"]).catch(() => undefined);
 
       expect(accepts()).toHaveLength(1);
@@ -501,6 +503,7 @@ describe("the broker's own stderr records how every connection ended", () => {
     it("logs one accept and one exit for an ordinary publish", async () => {
       writeFakeTool("git", "exit 0");
       const socketPath = await start();
+      // paperclip:allow-git-push: brokered push under test; the child is a fake tool, not git.
       await call(socketPath, "git", ["push"]);
       expect(accepts()).toHaveLength(1);
       expect(outcomes()).toEqual(["paperclip-github-broker: exit git code=0"]);
