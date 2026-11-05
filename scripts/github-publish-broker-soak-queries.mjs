@@ -203,6 +203,22 @@ const ATTRIBUTED_REFUSAL_ALT = [...POLICY_REFUSAL_OPENINGS, ...PROTOCOL_REFUSAL_
   .join("|");
 
 /**
+ * An anchored `refused` head, up to and including `detail=<self prefix>`.
+ *
+ * ⚠ ANCHORING IS LOAD-BEARING, not tidiness. The refusal reason echoes caller
+ * text — `unknown tool ${JSON.stringify(candidate.tool)}` reflects whatever
+ * JSON arrived — so a caller can put the literal
+ * `detail=paperclip-github-broker: refusing ` INSIDE its own tool name. With
+ * an unanchored `|~ detail=…` that line matches `policy_refusal`, while the
+ * `request_error_other` exclusion (anchored) does not exclude it, so Loki
+ * counts it TWICE while `classifyBrokerLine` counts it once. The partition
+ * then over-totals and the report blames a broken matcher for a line that is
+ * merely adversarial. Found by review on #3409; the fixture that pins it is
+ * `refusalEchoingDetail`.
+ */
+const REFUSED_HEAD = `${escapeForLogqlRegex(SELF_PREFIX)}refused (${OUTCOME_TOOL_ALT}) code=[0-9]+ detail=${escapeForLogqlRegex(SELF_PREFIX)}`;
+
+/**
  * A complete outcome head, used as an EXCLUSION so that prefixed prose merely
  * beginning with a verb (`exit the building`) is not mistaken for one — which
  * is exactly how `parseBrokerOutcomeLine` decides.
@@ -255,8 +271,7 @@ export const BROKER_QUERIES = [
     // discriminator, and it is DOUBLY prefixed: the outcome line carries the
     // self prefix, and PublishBrokerRefusal already prefixed the message.
     logql:
-      `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}refused \`` +
-      ` |~ \`detail=${escapeForLogqlRegex(SELF_PREFIX)}(${POLICY_REFUSAL_OPENINGS.map(escapeForLogqlRegex).join("|")})\``,
+      `${BROKER_STREAM} |~ \`^${REFUSED_HEAD}(${POLICY_REFUSAL_OPENINGS.map(escapeForLogqlRegex).join("|")})\``,
     note:
       "A PublishBrokerRefusal from github-publish-broker-policy.ts. ⚠ The security-relevant " +
       "category: this is the boundary refusing an attempt to reach the credential. Investigate " +
@@ -269,8 +284,7 @@ export const BROKER_QUERIES = [
     observable: true,
     // The four non-policy `refuse()` sites. Invisible before PEN-5185.
     logql:
-      `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}refused \`` +
-      ` |~ \`detail=${escapeForLogqlRegex(SELF_PREFIX)}(${PROTOCOL_REFUSAL_OPENINGS.map(escapeForLogqlRegex).join("|")})\``,
+      `${BROKER_STREAM} |~ \`^${REFUSED_HEAD}(${PROTOCOL_REFUSAL_OPENINGS.map(escapeForLogqlRegex).join("|")})\``,
     note:
       "A malformed or out-of-sequence frame. Ordinarily a client bug, not an attack — but it " +
       "exits 64 exactly like a policy refusal, which is why the verb and reason, not the code, " +
@@ -294,7 +308,7 @@ export const BROKER_QUERIES = [
       `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}\`` +
       ` !~ \`^${escapeForLogqlRegex(SELF_PREFIX)}(${KNOWN_SELF_SHAPES.join("|")})\`` +
       ` !~ \`^${escapeForLogqlRegex(SELF_PREFIX)}(${escapeForLogqlRegex("exit")}|${escapeForLogqlRegex("spawn-failed")}) (${OUTCOME_TOOL_ALT}) code=[0-9]+\`` +
-      ` !~ \`^${escapeForLogqlRegex(SELF_PREFIX)}refused (${OUTCOME_TOOL_ALT}) code=[0-9]+ detail=${escapeForLogqlRegex(SELF_PREFIX)}(${ATTRIBUTED_REFUSAL_ALT})\``,
+      ` !~ \`^${REFUSED_HEAD}(${ATTRIBUTED_REFUSAL_ALT})\``,
     note:
       "⚠ This is ALSO where a newly added refusal reason would land, so this count is the " +
       "novelty signal. If it moves and no publish was rejected, re-read the refusal sites. " +

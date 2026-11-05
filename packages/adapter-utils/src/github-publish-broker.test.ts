@@ -15,6 +15,7 @@ import {
   OUTCOME_DETAIL_TRUNCATION_MARKER,
   prepareBrokeredInvocation,
   type PublishBrokerServer,
+  type PublishBrokerServerOptions,
 } from "./github-publish-broker.js";
 import { redactionMarker } from "./github-egress-scrub.js";
 import { runPublishBrokerClient } from "./github-publish-broker-client.js";
@@ -77,7 +78,16 @@ afterEach(async () => {
   rmSync(workdir, { recursive: true, force: true });
 });
 
-async function start(log?: (message: string) => void): Promise<string> {
+async function start(
+  log?: (message: string) => void,
+  /**
+   * Override the spawn. Only needed to reach a SYNCHRONOUS spawn throw, which
+   * a real `spawn` produces for ERR_INVALID_ARG_* and which no fixture binary
+   * can trigger — the ENOENT path is asynchronous and is covered by deleting
+   * the wrapper instead.
+   */
+  spawnChild?: PublishBrokerServerOptions["spawnChild"],
+): Promise<string> {
   const socketPath = path.join(workdir, "broker.sock");
   server = await createPublishBrokerServer({
     socketPath,
@@ -88,6 +98,7 @@ async function start(log?: (message: string) => void): Promise<string> {
     privateDir: path.join(workdir, "private"),
     env: { PATH: process.env.PATH, HOME: workdir, GH_TOKEN: TOKEN, GITHUB_TOKEN: TOKEN },
     log: log ?? ((message: string) => logged.push(message)),
+    ...(spawnChild ? { spawnChild } : {}),
   });
   return socketPath;
 }
@@ -448,6 +459,52 @@ describe("the broker's own stderr records how every connection ended", () => {
     ]);
     // Two accepts, two outcomes: the partition balances.
     expect(logged.filter((l) => /: gh in \//.test(l))).toHaveLength(2);
+  });
+
+  describe("the accept line and the outcome line balance", () => {
+    /** Accept lines only — the denominator §5.3 tells a reader to compare. */
+    const accepts = () => logged.filter((line) => /: (git|gh|github-mcp-server) in \//.test(line));
+
+    it("logs no accept when spawn throws SYNCHRONOUSLY, because a refusal answers it", async () => {
+      // Node throws ERR_INVALID_ARG_* synchronously from `spawn`, which unwinds
+      // into the handler's catch -> refuse -> a `refused` outcome. Refusals are
+      // excluded from the outcome sum, so an accept logged BEFORE the spawn
+      // would leave an accept with no countable outcome and the report would
+      // say "the broker died mid-publish" about a malformed request.
+      writeFakeTool("git", "exit 0");
+      const socketPath = await start(undefined, () => {
+        throw new TypeError("ERR_INVALID_ARG_TYPE: synthetic synchronous spawn failure");
+      });
+      await call(socketPath, "git", ["push"]).catch(() => undefined);
+
+      expect(accepts()).toHaveLength(0);
+      const outs = outcomes();
+      expect(outs).toHaveLength(1);
+      expect(outs[0]).toMatch(/: refused /);
+      // 0 accepts, 0 countable outcomes (a refusal is not one) -> balanced.
+    });
+
+    it("logs an accept when spawn fails ASYNCHRONOUSLY, because spawn-failed answers it", async () => {
+      // ENOENT arrives on child.on("error") AFTER spawn returns, so the accept
+      // is real and `spawn-failed` is its countable outcome.
+      writeFakeTool("git", "exit 0");
+      const socketPath = await start();
+      rmSync(path.join(wrapperDir, "git"), { force: true });
+      await call(socketPath, "git", ["push"]).catch(() => undefined);
+
+      expect(accepts()).toHaveLength(1);
+      const outs = outcomes();
+      expect(outs).toHaveLength(1);
+      expect(outs[0]).toMatch(/: spawn-failed /);
+    });
+
+    it("logs one accept and one exit for an ordinary publish", async () => {
+      writeFakeTool("git", "exit 0");
+      const socketPath = await start();
+      await call(socketPath, "git", ["push"]);
+      expect(accepts()).toHaveLength(1);
+      expect(outcomes()).toEqual(["paperclip-github-broker: exit git code=0"]);
+    });
   });
 
   describe("an agent cannot forge a second log line", () => {
