@@ -101,7 +101,10 @@ which one you get tells you what happened: `transient_db_conflict` is lock
 contention (sqlstates `40001`/`40P01`/`55P03`), while a query cancelled by the
 statement timeout now arrives as `503 statement_timeout` / sqlstate `57014`.
 (PEN-3596 split `57014` out of `transient_db_conflict`: a cancelled statement is
-not lock contention, and used to be reported as "Database contention".)
+not one of the contention states Postgres names, and used to be reported as
+"Database contention". ⚠ PEN-5244: that is a statement about the SQLSTATE, not
+about what the statement was doing — `57014` says the time bound was exceeded
+and does not establish that no lock was involved.)
 
 Reading the result:
 

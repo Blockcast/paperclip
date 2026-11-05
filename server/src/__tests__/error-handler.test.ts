@@ -127,10 +127,20 @@ describe("errorHandler", () => {
   // advisory lock; under contention that wait is cancelled with 55P03 and used
   // to surface as a bare 500, indistinguishable from a permanent fault.
   describe("transient database conflicts", () => {
+    // PEN-5244: the lead sentence speaks for the STATEMENT only, and the tail
+    // is the request-level advice both branches share. The replaced wording
+    // ("the failing statement was rolled back", with no read-back step and no
+    // mention of `idempotencyKey`) was read as "my write did not land" and was
+    // wrong in that direction 4/4 times.
+    const REQUEST_ADVICE =
+      "This response does NOT establish that your write did not land: it reports one failed " +
+      "statement, not the request, and earlier statements in this request may already have " +
+      "COMMITTED. Read the resource back before replaying, and replay only with an " +
+      "`idempotencyKey` or an otherwise idempotent request.";
     const TRANSIENT_BODY = {
       error:
-        "Database contention: the failing statement was rolled back. " +
-        "Earlier statements in this request may have applied — replay only if it is idempotent.",
+        "Database contention: the failing statement was cancelled and applied nothing. " +
+        REQUEST_ADVICE,
       code: "transient_db_conflict",
     };
 
@@ -174,14 +184,71 @@ describe("errorHandler", () => {
       const body = res.json.mock.calls[0][0];
       expect(body.code).toBe("statement_timeout");
       expect(body.details).toEqual({ sqlstate: "57014" });
-      // Asserts the replacement claim, not merely the absence of a keyword:
-      // the new wording still contains the word "contention" (in "not lock
-      // contention"), so a bare keyword ban would both pass vacuously here and
-      // fail on the disclaimer.
+      // Asserts the replacement claim, not merely the absence of a keyword.
       expect(body.error).toContain("statement timeout");
-      expect(body.error).toContain("not lock contention");
-      expect(body.error).toContain("replay only if it is idempotent");
+      expect(body.error).toContain("exceeded");
       expect(body.error).not.toContain("Database contention");
+      // PEN-5244: and the retracted over-claim is gone. Pinned as the exact
+      // retracted sentence, not as a "lock" keyword ban — the honest
+      // replacement below says "no lock was involved", so a keyword ban would
+      // fail on the correction it exists to protect.
+      expect(body.error).not.toContain("nothing was waiting on a lock");
+      expect(body.error).toContain("not evidence that no lock was involved");
+    });
+
+    // PEN-5244: measured 4/4 — a 503 from this boundary arrived after the write
+    // had COMMITTED, including on the create that filed PEN-5244 itself. The
+    // mechanism is in-repo: `svc.addComment` opens no transaction of its own,
+    // so on `POST /issues/:id/comments` the INSERT autocommits and
+    // `markCommentIdempotencyProcessed` / `syncComment` / `logActivity` run as
+    // separate statements after it. A transient failure in any of those lands
+    // here with the comment already durable. Both branches must therefore
+    // decline to speak for the request, and must name `idempotencyKey` before
+    // inviting a replay, because neither `paperclipAddComment` nor
+    // `paperclipCreateIssue` is idempotent without one.
+    it("never claims the request rolled back, and names idempotencyKey before advising replay", () => {
+      for (const code of TRANSIENT_DB_SQLSTATES) {
+        const res = makeRes() as any;
+        errorHandler(
+          Object.assign(new Error(`pg error ${code}`), { code }),
+          { ...makeReq(), method: "POST", originalUrl: "/api/issues/123/comments" } as any,
+          res,
+          vi.fn() as unknown as NextFunction,
+        );
+
+        const body = res.json.mock.calls[0][0];
+        expect(body.error).toContain("does NOT establish that your write did not land");
+        expect(body.error).toContain("may already have");
+        expect(body.error).toContain("Read the resource back before replaying");
+        expect(body.error).toContain("idempotencyKey");
+        // The retracted reassurance, in both of the forms it shipped in.
+        expect(body.error).not.toContain("the failing statement was rolled back");
+        expect(body.error).not.toContain("was rolled back");
+        // Unqualified replay advice is what produced the duplicate posts.
+        expect(body.error).not.toContain("replay only if it is idempotent");
+      }
+    });
+
+    // The machine-readable half of the contract is deliberately untouched by
+    // the PEN-5244 rewording: callers and `noteTransientDbResponse` key on
+    // these, and a wording fix must not move a dimension anything aggregates.
+    it("leaves `code` and `details.sqlstate` unchanged by the rewording", () => {
+      for (const code of TRANSIENT_DB_SQLSTATES) {
+        const res = makeRes() as any;
+        errorHandler(
+          Object.assign(new Error(`pg error ${code}`), { code }),
+          makeReq(),
+          res,
+          vi.fn() as unknown as NextFunction,
+        );
+
+        const body = res.json.mock.calls[0][0];
+        expect(res.status).toHaveBeenCalledWith(503);
+        expect(body.details).toEqual({ sqlstate: code });
+        expect(body.code).toBe(
+          code === STATEMENT_TIMEOUT_SQLSTATE ? "statement_timeout" : "transient_db_conflict",
+        );
+      }
     });
 
     it("keeps 57014 retryable — this split changes the report, not the retry set", () => {
