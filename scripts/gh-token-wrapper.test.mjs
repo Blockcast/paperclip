@@ -2227,10 +2227,10 @@ test("does not mistake an unrelated listener for the token proxy (PEN-5641)", as
   });
 });
 
-// PEN-5641 Finding 2. A single REJECTED reading is also exactly what a
-// mid-rotation mount window looks like, and one was measured closing by itself
-// in 93 seconds. The distinguishing test has to be in this output, beside the
-// two fields it consumes, or it is not where a waking agent reads.
+// PEN-5641 Finding 2, as corrected 2026-11-05. A single REJECTED reading is
+// also what a transient window looks like, so it must not stand a run down.
+// The distinguishing test has to be in this output, beside the two fields it
+// consumes, or it is not where a waking agent reads.
 test("a REJECTED verdict prints the rotation-window vs real-outage test (PEN-5641)", async () => {
   await withStubGitHub(async (apiBase) => {
     withTempDir((dir) => {
@@ -2238,13 +2238,39 @@ test("a REJECTED verdict prints the rotation-window vs real-outage test (PEN-564
       assert.match(proc.stdout, /verdict:\s+REJECTED/);
       assert.match(proc.stdout, /rotation-vs-outage:/);
       assert.match(proc.stdout, /does NOT establish an outage/);
-      // The procedure must name both discriminating outcomes, not just one:
-      // "advanced and now OK" is what stops a needless escalation, "unchanged"
-      // is what PEN-5239's evidence actually turned on.
+      // The procedure must name both generations, because each labels a
+      // different fault to report.
       assert.match(proc.stdout, /generation ADVANCED/);
       assert.match(proc.stdout, /generation UNCHANGED/);
       // And it must consume the fields this output already prints.
       assert.match(proc.stdout, /note mount-generation and token-sha256/);
+      assert.equal(proc.status, 1);
+    });
+  });
+});
+
+// The load-bearing half of the correction. An earlier draft of this block made
+// "generation UNCHANGED" a necessary condition for escalating, which fails open
+// in the quadrant it does not name: generation ADVANCED while still REJECTED
+// matched no case and so read as "do not escalate". Escalation is gated on the
+// second REJECTED; the generation only labels which fault to report. Asserted
+// rather than left to prose because prose is what drifted the first time.
+test("escalation is gated on the second REJECTED, not on the generation (PEN-5641)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: "ghs_revoked_token\n", apiBase });
+      // Step 4 must key on the verdict alone.
+      assert.match(proc.stdout, /still REJECTED -> ESCALATE/);
+      // The generation must be explicitly demoted to a label, not a gate.
+      assert.match(proc.stdout, /says WHICH fault, never WHETHER/);
+      assert.match(proc.stdout, /Do NOT wait for the generation to settle before escalating/);
+      // A moved generation is not proof the rotator ran: this pod stamps one at
+      // mount time too, measured on PEN-5641.
+      assert.match(proc.stdout, /this pod stamps one at mount time too/);
+      // And the retracted framing must not come back: the window is not
+      // self-healing, and 93s was a sampling interval, never a duration.
+      assert.doesNotMatch(proc.stdout, /closed itself/);
+      assert.doesNotMatch(proc.stdout, /93 seconds/);
       assert.equal(proc.status, 1);
     });
   });
