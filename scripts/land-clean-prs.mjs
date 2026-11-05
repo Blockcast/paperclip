@@ -211,15 +211,53 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * cron at 45 past, America/LA), so the cap puts the ceiling at 40 NEW
  * enqueues per day. `already-enqueued` rows do not spend a slot.
  *
- * That ceiling is now being reached, which it was not when the cap was
- * chosen. Merged PRs per UTC day over 10-23..11-03 peaked at 52 (11-02),
- * with 44 on 10-29 and 40 on 10-30. A single classifier sample at
- * 2026-11-03T12:31Z produced 10 `enqueue` + 1 `already-enqueued` + 3
- * `cap:10-per-fire` -- a 14-PR eligible pool against a 10-PR budget -- and
- * the pool read at or above the cap on every hourly `landing-sweep` sample
- * from 08:29Z to 12:31Z. Read that sample as a classification, not a fire:
- * the 14:45Z fire that followed it enqueued 6. A sweep samples an eligible
- * pool that other enqueue paths drain before the fire reaches it.
+ * That ceiling has NOT been reached on any day yet measured. This
+ * paragraph claimed it had, from 2026-11-03 until this correction on
+ * 2026-11-05 (PEN-5397). The mistake was the UNIT -- and it is exactly
+ * the one the CAUTION paragraph further down already warns about, so the
+ * wrong number sat above its own warning for two days.
+ *
+ * The figures behind it are not wrong, they are about something else:
+ * merged PRs per UTC day over 10-23..11-03 peaked at 52 (11-02), with 44
+ * on 10-29 and 40 on 10-30. That is REPO demand. This ceiling governs
+ * only the PRs this routine itself enqueues.
+ *
+ * In the right unit -- fire-aligned enqueues under the routine's own
+ * identity, counted once per PR -- the three complete UTC days available:
+ *
+ *     11-02  17-19 / 40      11-03  14-15 / 40      11-04  26 / 40
+ *
+ * Peak 26, or 65% of the ceiling. The spread is the two defensible
+ * clusterings (a 180s-gap burst, or every bot enqueue inside +0..+20 min
+ * of a fire instant); they agree to within 2 and neither approaches 40.
+ * Of the EIGHT fires that produced output in that window, exactly ONE
+ * reached the cap -- 2026-11-04T08:45Z, 10 PRs in 32s. So the cap does
+ * bind, but rarely. Measured 2026-11-05 over the timeline of all 222 PRs
+ * touched since 11-01: a different method and a wider population than the
+ * 11-04 reading it reproduces.
+ *
+ * The sweep-sample evidence does not survive either. A classifier sample
+ * at 2026-11-03T12:31Z produced 10 `enqueue` + 1 `already-enqueued` + 3
+ * `cap:10-per-fire` -- a 14-PR eligible pool against a 10-PR budget --
+ * and the pool read at or above the cap on every hourly `landing-sweep`
+ * sample from 08:29Z to 12:31Z. Read that as a classification, not a
+ * fire: the 14:45Z fire that followed it enqueued 6. A sweep samples an
+ * eligible pool that other enqueue paths drain before the fire reaches
+ * it. The converse reading is just as necessary and is why a quiet fire
+ * is not an incident: at 2026-11-05T02:29Z, 16 min before that morning's
+ * fire, the sweep emitted no `enqueue` row at all, and the fire duly
+ * enqueued nothing. An empty pool and a failed fire look identical from
+ * the enqueue side alone; only a pool reading taken BEFORE the fire tells
+ * them apart, so bracket the fire if the answer matters.
+ *
+ * Where the constraint actually sits today is DOWNSTREAM of this cap, in
+ * the merge queue. Measured 2026-11-04T22:49Z: depth 12, the 20:45Z
+ * fire's entire 8-PR output still in it two hours later, the head
+ * AWAITING_CHECKS for 5h41m, and a trailing-24h drain of 47 merges =
+ * 1.96/hr -- against the 1.67/hr a fully-spent 40/day ceiling would
+ * require. A budget running at 35-65% is not the binding constraint, and
+ * more fires would add entries to the one that is. Price that before
+ * buying frequency.
  *
  * CAUTION on that merge-count table: it is repo demand, not ROUTINE demand.
  * This routine is one enqueue path among several. Measured 2026-11-04 over
@@ -245,11 +283,34 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  *     `mergedAt` window over a fixed `--limit` truncates silently and
  *     still reads as complete: that window returned 100 / 125 / 125 rows
  *     at limits 100 / 200 / 400. Page until two limits agree.
+ *   - `auto_merge_enabled` is the WRONG event, even though `--auto` is
+ *     literally what this routine calls. On a queue-enabled base GitHub
+ *     enqueues immediately whenever it believes the gates are met, and
+ *     `classifyPr` only ever arms `mergestate:CLEAN` rows -- so there is
+ *     nothing left to wait for and no auto-merge record is written.
+ *     Measured 2026-11-04: 25 such events across 200 PRs and 1 that day,
+ *     against 34 bot queue-adds the same day. Censusing it reads a
+ *     working routine as a dead one.
+ *   - Anchoring the census on MERGED PRs undercounts a fire, because a
+ *     fire enqueues PRs that have not merged yet and some never will.
+ *     Each burst count below read one lower before 2026-11-05, and this
+ *     accounts for two of the four: #3151 was in the 11-02T20:47Z burst
+ *     and is still open, and #3242 was in the 14:48Z burst but merged on
+ *     11-04, outside the two days that census sampled. The other two
+ *     off-by-ones were not traced to a cause -- recorded as unexplained
+ *     rather than assumed to share this one. Enumerate by UPDATE, not by
+ *     merge.
+ *   - A fixed minute-window manufactures cap-bound fires that burst
+ *     analysis then falsifies. At +0..+20 min the 11-02T14:45Z fire reads
+ *     n=10 and looks capped; its actual burst is 9 enqueues inside 30s,
+ *     with the tenth arriving 831s later as a delayed arm. Cluster by
+ *     gap first, then check the window -- not the other way round.
  *
  * A fire reads as a tight cluster of bot enqueues a few minutes past the
- * hour, in DESCENDING PR number: 11-02T14:48:38Z n=8, 11-02T20:47:46Z n=5,
- * 11-03T02:50:46Z n=6, 11-03T14:56:06Z n=6, each 16-40s wide at +2.8 to
- * +11.8 min. Identity does NOT discriminate -- 77 of the 91 enqueues are
+ * hour, in DESCENDING PR number: 11-02T14:48:38Z n=9, 11-02T20:47:46Z n=6,
+ * 11-03T02:50:46Z n=7, 11-03T14:56:06Z n=7, each 22-40s wide at +2.8 to
+ * +11.1 min (counts re-measured 2026-11-05; see the merged-anchor bullet
+ * above for why each read one lower before). Identity does NOT discriminate -- 77 of the 91 enqueues are
  * `allyblockcast[bot]`, far more than any fire batch, so cluster shape is
  * the only signal. The cap IS reached in practice, just not on either day
  * above: the 2026-11-04T08:45Z fire enqueued exactly 10 in 32s
