@@ -483,6 +483,25 @@ describe("reconciler work lists reject rows without a comment id (BLO-46428)", (
     return { selectDistinct: () => chain } as unknown as Parameters<typeof listCommentsWithResumableEffects>[0];
   }
 
+  it("runs the settlement sweep on its own slower cadence, not every pass (BLO-52498)", async () => {
+    let passes = 0;
+    let sweeps = 0;
+    const chain: Record<string, unknown> = {};
+    chain.from = () => chain;
+    chain.where = () => chain;
+    chain.limit = () => chain;
+    chain.innerJoin = () => { sweeps++; return chain; };
+    chain.then = (resolve: (value: unknown) => void) => resolve([]);
+    const db = { selectDistinct: () => { passes++; return chain; } } as never;
+    const stop = startIssueCommentEffectReconciler(db, async () => undefined, 1, 60_000);
+    try {
+      await vi.waitFor(() => expect(passes).toBeGreaterThanOrEqual(6), { interval: 5, timeout: 5_000 });
+    } finally {
+      await stop();
+    }
+    expect(sweeps).toBe(1);
+  });
+
   it("never hands an undefined/null commentId to the reconciler, and logs it once", async () => {
     const { logger } = await import("../middleware/logger.js");
     const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => undefined as never);

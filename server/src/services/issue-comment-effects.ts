@@ -520,8 +520,14 @@ export function startIssueCommentEffectReconciler(
   db: Db,
   process: (commentId: string) => Promise<unknown>,
   intervalMs: number = 1_000,
+  // The settlement sweep scans every effect row joined to its comment (~34 ms
+  // in prod) for a state only a lost lease produces. Every 1 s pass made it the
+  // largest consumer of DB time (BLO-52498: 703k calls in 4 days), so it runs
+  // on its own slower cadence.
+  strandedSweepIntervalMs: number = 60_000,
 ): () => Promise<void> {
   let pass: Promise<void> = Promise.resolve();
+  let lastStrandedSweepAt = -Infinity;
   let polling = false;
   let stopped = false;
   void resetLeaselessProcessing(db).catch((err) =>
@@ -538,6 +544,8 @@ export function startIssueCommentEffectReconciler(
       }
       // Comments whose effects all settled but that nobody stamped processed.
       // Settlement only, no sink re-execution.
+      if (Date.now() - lastStrandedSweepAt < strandedSweepIntervalMs) return;
+      lastStrandedSweepAt = Date.now();
       const stranded = await listSettledUnprocessedComments(db, 50);
       for (const commentId of stranded) {
         if (stopped) break;
