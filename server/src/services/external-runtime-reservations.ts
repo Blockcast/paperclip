@@ -388,6 +388,31 @@ export async function getActiveExternalRuntimeReservation(
     .then((rows) => rows[0] ?? null);
 }
 
+/**
+ * Serializes a non-`run` isolation bind against the two things it races, and
+ * nothing else.
+ *
+ * - Other binds of the same key: an exclusive lock on the key keeps the
+ *   check-then-act below (writer drift, the elder-waiter rule of BLO-48769)
+ *   atomic per key, as the unique writer index alone cannot.
+ * - Rolling-upgrade legacy inserts: the 0131 trigger takes 748293011
+ *   exclusively, so binders hold it shared. Binders never exclude each other
+ *   on it.
+ *
+ * This used to be one exclusive 748293011 for every bind, which queued every
+ * shared/workspace bind in the fleet behind whichever holder was slowest --
+ * each waiter pinning a pooled connection (BLO-52499).
+ */
+export async function lockExternalRuntimeIsolationBinding(
+  tx: Pick<Db, "execute">,
+  isolationKey: string,
+): Promise<void> {
+  await tx.execute(sql`select pg_advisory_xact_lock_shared(748293011)`);
+  await tx.execute(
+    sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:external-runtime-isolation:${isolationKey}`}, 0))`,
+  );
+}
+
 export async function bindExternalRuntimeReservationIsolation(
   db: Db,
   input: {
@@ -402,7 +427,7 @@ export async function bindExternalRuntimeReservationIsolation(
   try {
     return await db.transaction(async (tx) => {
       if (input.isolationMode !== "run") {
-        await tx.execute(sql`select pg_advisory_xact_lock(748293011)`);
+        await lockExternalRuntimeIsolationBinding(tx, input.isolationKey);
       }
       const existing = await tx
         .select()

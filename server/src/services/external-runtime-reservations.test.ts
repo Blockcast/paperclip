@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { eq, inArray, isNull } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { eq, inArray, isNull, sql } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   companies,
@@ -20,6 +20,7 @@ import {
   externalRuntimeReservationCanRelease,
   markExternalRuntimeReservationLaunching,
   getActiveExternalRuntimeReservation,
+  lockExternalRuntimeIsolationBinding,
   rearmExternalRuntimeReservationForRetry,
   recordExpectedExternalRuntimeJobName,
   recordExternalRuntimeJobIdentity,
@@ -665,6 +666,59 @@ describeEmbeddedPostgres("external runtime reservations", () => {
 
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
     expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+  });
+
+  it("does not queue binds of other isolation keys behind a held key (BLO-52499)", async () => {
+    const [otherRunId, sameRunId] = await seedQueuedRuns(2);
+    const otherClaim = await claimRunWithExternalRuntimeSlot(db, otherRunId, new Date(), 0);
+    const sameClaim = await claimRunWithExternalRuntimeSlot(db, sameRunId, new Date(), 1);
+    const settledWithin = (promise: Promise<unknown>, ms: number) => Promise.race([
+      promise.then(() => "settled", () => "settled"),
+      new Promise((resolve) => setTimeout(() => resolve("pending"), ms)),
+    ]);
+
+    // A binder of "workspace:held" stalled mid-transaction: the shape that
+    // queued every bind in the fleet while the lock was global.
+    let releaseHolder!: () => void;
+    const released = new Promise<void>((resolve) => { releaseHolder = resolve; });
+    let holderLocked!: () => void;
+    const locked = new Promise<void>((resolve) => { holderLocked = resolve; });
+    const holder = db.transaction(async (tx) => {
+      await lockExternalRuntimeIsolationBinding(tx, "workspace:held");
+      holderLocked();
+      await released;
+    });
+    try {
+      // Racing the holder: a setup failure fails the test instead of hanging it.
+      await Promise.race([locked, holder]);
+      const otherKeyBind = bindExternalRuntimeReservationIsolation(db, {
+        runId: otherRunId,
+        reservationId: otherClaim!.reservation.id,
+        isolationMode: "workspace",
+        isolationKey: "workspace:other",
+      });
+      expect(await settledWithin(otherKeyBind, 5_000)).toBe("settled");
+      await expect(otherKeyBind).resolves.toMatchObject({ isolationKey: "workspace:other" });
+
+      const sameKeyBind = bindExternalRuntimeReservationIsolation(db, {
+        runId: sameRunId,
+        reservationId: sameClaim!.reservation.id,
+        isolationMode: "workspace",
+        isolationKey: "workspace:held",
+      });
+      // Proof by lock state, not elapsed time: the bind is queued on an advisory lock.
+      await vi.waitFor(async () => {
+        const [row] = await db.execute<{ waiting: number }>(
+          sql`select count(*)::int as waiting from pg_locks where locktype = 'advisory' and not granted`,
+        );
+        expect(row?.waiting).toBe(1);
+      }, { interval: 20, timeout: 5_000 });
+      releaseHolder();
+      await expect(sameKeyBind).resolves.toMatchObject({ isolationKey: "workspace:held" });
+    } finally {
+      releaseHolder();
+      await holder;
+    }
   });
 
   it("rejects a second active writer for the same workspace key with a typed conflict", async () => {
