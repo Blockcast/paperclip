@@ -78,7 +78,17 @@ function runRuntime(input: string): { record: string; status: number | null; std
   const result = spawnSync(
     process.execPath,
     ["--import", "tsx", runtimeEntryPoint, process.execPath, server, record],
-    { input, encoding: "utf8" },
+    {
+      input,
+      encoding: "utf8",
+      // PEN-5641: these cases are about the scrubbing leg, and the runtime now
+      // also starts the rotating-credential proxy. Inside an agent pod that
+      // mount exists and :80 is bindable, so without the kill switch each case
+      // here would stand up a real listener holding the live credential and
+      // contend for the port with every other one. Off is also the behaviour
+      // these assertions were written against.
+      env: { ...process.env, PAPERCLIP_GITHUB_MCP_TOKEN_PROXY: "0" },
+    },
   );
 
   return {

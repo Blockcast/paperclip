@@ -38,6 +38,8 @@ import {
   GitHubMcpEgressFrameError,
   scrubGitHubMcpClientFrame,
 } from "./github-mcp-egress-shim.js";
+import type { GitHubMcpTokenProxyHandle } from "./github-mcp-token-proxy.js";
+import { startGitHubMcpTokenProxy } from "./github-mcp-token-proxy.js";
 import { brokerSocketPath, runPublishBrokerClient } from "./github-publish-broker-client.js";
 
 /**
@@ -228,10 +230,35 @@ export function runGitHubMcpEgressRuntime(
     });
   }
 
+  // PEN-5641: start the rotating-credential proxy BEFORE the child, and point
+  // the child at it with GITHUB_HOST. The server reads its token once at
+  // startup and is long-lived, so without this it wedges on whichever mount
+  // generation it happened to boot with — 401 Bad credentials from every
+  // `mcp__github__*` tool while `gh`/`curl`/`git` stay green, for the rest of
+  // the session.
+  //
+  // This is placed after the broker branch on purpose: in a brokered
+  // deployment the server is spawned by this same runtime re-entered on the
+  // broker side, which is where the proxy belongs.
+  //
+  // Fail-open: a null handle leaves GITHUB_HOST untouched and the child runs
+  // exactly as it did before. See github-mcp-token-proxy.ts.
+  return startGitHubMcpTokenProxy().then((proxy) =>
+    spawnScrubbedServer(target, argv, io, proxy),
+  );
+}
+
+function spawnScrubbedServer(
+  target: string,
+  argv: string[],
+  io: GitHubMcpEgressRuntimeIo,
+  proxy: GitHubMcpTokenProxyHandle | null,
+): Promise<number> {
   return new Promise((resolve, reject) => {
     // stdin piped so frames can be rewritten; stdout/stderr inherited so the
     // response leg never enters this process. See the header note.
-    const child = spawn(target, argv, { stdio: ["pipe", "inherit", "inherit"] });
+    const childEnv = proxy ? { ...process.env, GITHUB_HOST: proxy.ghHost } : process.env;
+    const child = spawn(target, argv, { stdio: ["pipe", "inherit", "inherit"], env: childEnv });
 
     let settled = false;
     let forwardedSignal = false;
@@ -250,6 +277,9 @@ export function runGitHubMcpEgressRuntime(
       process.off("SIGTERM", forwardSignal);
       process.stdin.removeListener("data", onData);
       process.stdin.removeListener("end", onEnd);
+      // Only an owned proxy is closed. A reused one belongs to another MCP
+      // server still running in this pod, and closing it would wedge that one.
+      if (proxy?.owned) void proxy.close();
     };
 
     const fail = (error: Error) => {

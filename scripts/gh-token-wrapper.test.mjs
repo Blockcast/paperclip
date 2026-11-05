@@ -1500,10 +1500,17 @@ async function withStubGitHub(fn) {
 // pod is the live fleet credential — and this subcommand would then probe real
 // GitHub with it. tokenFilePath lets a caller supply a path it built itself
 // (the mount-generation test needs a kubelet-shaped directory).
-function runAuthCheck(dir, { tokenFileContent, tokenValue, tokenFilePath, apiBase, mode } = {}) {
+function runAuthCheck(dir, { tokenFileContent, tokenValue, tokenFilePath, apiBase, mode, mcpProxyUrl } = {}) {
   const env = sanitizedEnv({});
   if (apiBase !== undefined) env.GH_TOKEN_WRAPPER_API_BASE = apiBase;
   if (tokenValue !== undefined) env.GH_SEAT_TOKEN_VALUE = tokenValue;
+  // PEN-5641: always pinned, never left to the compiled-in loopback default.
+  // The default probes :80 of this host, so an unrelated listener there — or
+  // a real token proxy, inside an agent pod — would decide the mcp-channel
+  // line for us and the assertions below would be measuring the host. Port 1
+  // is reserved and unroutable, so the un-pinned case fails fast and locally.
+  env.GH_TOKEN_WRAPPER_MCP_PROXY_URL =
+    mcpProxyUrl ?? "http://127.0.0.1:1/__paperclip/github-mcp-token-proxy";
 
   let filePath = tokenFilePath;
   if (filePath === undefined) {
@@ -2119,6 +2126,146 @@ test("the self-test's verdict and the real path's exit code agree on every seat-
 // A plain assertion inside a single test cannot catch that class of bug — the
 // leak is in how each test builds its environment, so the check has to be a
 // second run of every test under a dirty one.
+
+// ───────────────────────────────────────────────────────────────────────────
+// PEN-5641: the verdict has two channels, and it used to answer for only one.
+// ───────────────────────────────────────────────────────────────────────────
+
+const MCP_PROXY_MARKER = "paperclip-github-mcp-token-proxy";
+
+const STUB_MCP_PROXY_SOURCE = `import http from "node:http";
+const server = http.createServer((req, res) => {
+  if (req.url === "/__paperclip/github-mcp-token-proxy") {
+    res.writeHead(200, { "content-type": "text/plain" });
+    return res.end(${JSON.stringify(MCP_PROXY_MARKER)});
+  }
+  res.writeHead(404);
+  res.end();
+});
+server.listen(0, "127.0.0.1", () => console.log("PORT=" + server.address().port));
+`;
+
+/** Runs `fn` with a loopback listener that answers the proxy's health marker. */
+async function withStubMcpProxy(fn) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "gh-stub-mcp-proxy-"));
+  const scriptPath = path.join(dir, "stub-mcp-proxy.mjs");
+  writeFileSync(scriptPath, STUB_MCP_PROXY_SOURCE);
+
+  const child = spawn(process.execPath, [scriptPath], { stdio: ["ignore", "pipe", "inherit"] });
+  try {
+    const port = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("stub MCP proxy did not report a port within 10s")), 10_000);
+      let buffered = "";
+      child.stdout.on("data", (chunk) => {
+        buffered += chunk;
+        const match = buffered.match(/PORT=(\d+)/);
+        if (match) {
+          clearTimeout(timer);
+          resolve(Number(match[1]));
+        }
+      });
+      child.once("error", (err) => { clearTimeout(timer); reject(err); });
+      child.once("exit", (code) => { clearTimeout(timer); reject(new Error(`stub MCP proxy exited early with code ${code}`)); });
+    });
+    return await fn(`http://127.0.0.1:${port}/__paperclip/github-mcp-token-proxy`);
+  } finally {
+    child.kill("SIGKILL");
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+// THE REGRESSION THIS TICKET WAS FILED FOR. On 2026-11-05T04:49Z this
+// subcommand printed `OK` while every `mcp__github__*` tool returned `401 Bad
+// credentials`, because the MCP server had cached a since-rotated generation
+// and nothing in this output said the verdict did not cover it. A healthy
+// verdict must therefore never be silent about the other channel.
+test("an OK verdict says plainly that it does not cover mcp__github__* when no proxy is live (PEN-5641)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
+      assert.match(proc.stdout, /verdict:\s+OK/);
+      assert.match(proc.stdout, /mcp-channel:\s+NOT COVERED/);
+      assert.match(proc.stdout, /file-reading path ONLY/);
+      // The interim guidance an agent needs in the same breath: gh green while
+      // the MCP tools 401 is expected after a rotation, not a credential fault.
+      assert.match(proc.stdout, /is NOT a credential fault/);
+      assert.equal(proc.status, 0);
+    });
+  });
+});
+
+// And the other direction: once the proxy is in front of the MCP server, the
+// two channels read the same mount and the verdict genuinely does cover both.
+// Claiming coverage when it is absent and denying it when it is present are
+// both wrong; this pins the second.
+test("reports the MCP channel as covered when the token proxy answers (PEN-5641)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    await withStubMcpProxy(async (mcpProxyUrl) => {
+      withTempDir((dir) => {
+        const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase, mcpProxyUrl });
+        assert.match(proc.stdout, /mcp-channel:\s+covered/);
+        assert.doesNotMatch(proc.stdout, /NOT COVERED/);
+        assert.equal(proc.status, 0);
+      });
+    });
+  });
+});
+
+// Something else holding the port is not this proxy, and reporting it as one
+// would re-create the false all-clear in a new place.
+test("does not mistake an unrelated listener for the token proxy (PEN-5641)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    // The stub GitHub answers on loopback but serves no marker at that path.
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, {
+        tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`,
+        apiBase,
+        mcpProxyUrl: `${apiBase}/__paperclip/github-mcp-token-proxy`,
+      });
+      assert.match(proc.stdout, /mcp-channel:\s+NOT COVERED/);
+    });
+  });
+});
+
+// PEN-5641 Finding 2. A single REJECTED reading is also exactly what a
+// mid-rotation mount window looks like, and one was measured closing by itself
+// in 93 seconds. The distinguishing test has to be in this output, beside the
+// two fields it consumes, or it is not where a waking agent reads.
+test("a REJECTED verdict prints the rotation-window vs real-outage test (PEN-5641)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: "ghs_revoked_token\n", apiBase });
+      assert.match(proc.stdout, /verdict:\s+REJECTED/);
+      assert.match(proc.stdout, /rotation-vs-outage:/);
+      assert.match(proc.stdout, /does NOT establish an outage/);
+      // The procedure must name both discriminating outcomes, not just one:
+      // "advanced and now OK" is what stops a needless escalation, "unchanged"
+      // is what PEN-5239's evidence actually turned on.
+      assert.match(proc.stdout, /generation ADVANCED/);
+      assert.match(proc.stdout, /generation UNCHANGED/);
+      // And it must consume the fields this output already prints.
+      assert.match(proc.stdout, /note mount-generation and token-sha256/);
+      assert.equal(proc.status, 1);
+    });
+  });
+});
+
+// The guidance is scoped to the verdict that needs it. Printing an escalation
+// procedure under a healthy credential is noise an agent learns to skip, and
+// the next REJECTED is then skipped with it.
+test("the rotation-vs-outage block appears only on REJECTED (PEN-5641)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const ok = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
+      assert.doesNotMatch(ok.stdout, /rotation-vs-outage:/);
+
+      const empty = runAuthCheck(dir, { tokenFileContent: "", apiBase });
+      assert.match(empty.stdout, /verdict:\s+NO_CREDENTIAL/);
+      assert.doesNotMatch(empty.stdout, /rotation-vs-outage:/);
+    });
+  });
+});
+
 if (!process.env.GH_TOKEN_WRAPPER_TEST_NESTED) {
   test("the suite is hermetic against inherited credential env vars", () => {
     const nestedEnv = {

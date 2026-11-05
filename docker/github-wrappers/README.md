@@ -73,6 +73,52 @@ belongs in the same follow-up that deletes the seed install: that is already
 gated on the whole fleet carrying this directory, which is exactly the condition
 that makes the absolute path safe.
 
+## The MCP server's credential rotates; its environment does not (PEN-5641)
+
+`paperclip-github-token-env` reads the token file once and `exec`s, so whatever
+it exported is frozen into the child's environment for that child's whole life.
+For `gh` and `git` that is harmless — those are one invocation each, and the
+next one re-reads the file. For `github-mcp-server` it is the defect: that
+process is long-lived, spanning a whole agent session and therefore several
+rotations (the rotator re-mints every 20 minutes), and it reads
+`GITHUB_PERSONAL_ACCESS_TOKEN` exactly once at startup.
+
+Measured on 2026-11-05T04:49Z: `curl` on a URL returned `200` while
+`mcp__github__*` on the identical URL returned `401 Bad credentials`, and
+`gh paperclip-auth-check` reported `OK` throughout — the fleet's designated
+credential oracle contradicting the agent's own tooling, with no self-heal
+short of restarting the server.
+
+The server is an upstream Go binary, so it cannot be taught to re-read. Instead
+`github-mcp-egress-runtime.ts` starts a loopback proxy
+(`packages/adapter-utils/src/github-mcp-token-proxy.ts`) and points the child at
+it with `GITHUB_HOST`. The server then emits GitHub Enterprise-shaped requests
+to `/api/v3/...`, and the proxy rewrites the `Authorization` header from the
+live mount on **every** request, mapping back onto `api.github.com`. The
+server's own `GITHUB_PERSONAL_ACCESS_TOKEN` becomes inert.
+
+Three things about it are worth knowing before changing it:
+
+- **The port is not a choice.** The upstream server discards the port from
+  `GITHUB_HOST` — `http://127.0.0.1:41487` produces requests to
+  `http://127.0.0.1/api/v3/...` (measured on v1.0.3). The listener therefore has
+  to take `:80` on loopback, which works because the pod has
+  `net.ipv4.ip_unprivileged_port_start=0`. That is checked, never assumed.
+- **It fails open.** If the proxy cannot bind, or there is no token to serve,
+  `GITHUB_HOST` is left unset and the server behaves exactly as it did before.
+  Failing closed would turn a stale-credential bug into a total outage of every
+  `mcp__github__*` tool, which this defect does not justify.
+- **It does not touch the stdio leg.** The scrubbing topology is unchanged: the
+  child is still spawned with stdout and stderr inherited, so responses still
+  never pass through a parser in this process. The credential is refreshed one
+  layer lower, on the HTTP leg.
+
+`gh paperclip-auth-check` probes the proxy's health marker and prints an
+`mcp-channel:` line saying whether its verdict governs `mcp__github__*` or only
+the file-reading path. `PAPERCLIP_GITHUB_MCP_TOKEN_PROXY=0` disables the proxy
+without an image rollback; the `mcp-channel:` line then truthfully reports
+`NOT COVERED`.
+
 ## The publish broker (PEN-4933)
 
 When `enableGitHubPublishBroker` is set on the agent adapter, the GitHub

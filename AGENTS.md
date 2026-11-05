@@ -330,6 +330,31 @@ name its generation cannot be compared across pods or across time — two pods
 disagreeing is indistinguishable from one pod changing while you watched. That
 ambiguity is what produced the false all-clear in PEN-5241's own filing.
 
+**One `REJECTED` is not an outage — re-run and see whether the generation
+moved.** `REJECTED` is the correct *instantaneous* verdict and is also exactly
+what a mid-rotation mount window looks like; one was measured closing by itself
+in **93 seconds** with no intervention (PEN-5641). Standing a run down on the
+single sample spends a wake and escalates a condition that cleared before the
+escalation could be read. The check prints the discriminator under
+`rotation-vs-outage:` whenever it returns `REJECTED`: note `mount-generation`
+and `token-sha256`, do other work for a few minutes, re-run — a generation that
+**advanced** and now reads `OK` was a rotation window and needs no escalation,
+while a generation **unchanged** across several minutes and still `REJECTED` is
+a real outage. The `unchanged` is the whole of PEN-5239's evidence.
+
+**The verdict does not automatically govern `mcp__github__*` — read the
+`mcp-channel:` line.** `gh`, `curl` and `git` re-read the token file on every
+invocation; `github-mcp-server` is a long-lived upstream binary that reads its
+credential once at startup. When the two are not sharing a credential, this
+check reports `OK` while every `mcp__github__*` tool returns `401 Bad
+credentials` — measured at 2026-11-05T04:49Z on URLs `curl` answered `200`
+(PEN-5641). `mcp-channel: covered` means the MCP server is behind the loopback
+token proxy and the verdict governs it too. `mcp-channel: NOT COVERED` means
+the verdict governs the file-reading path **only**: `gh` working while
+`mcp__github__*` 401s is then *expected* after a rotation and is **not**
+evidence of a credential problem — use `gh`/`curl`/`git`, and treat the MCP
+GitHub tools as unavailable until their server restarts.
+
 **Never treat `permissions.push: false` as proof you lack write access.** Every
 GitHub repository payload — `GET /repos/{owner}/{repo}`, `search_repositories`,
 even `/installation/repositories` — carries a `permissions` object describing a

@@ -9,4 +9,12 @@
 # the server still inherits GITHUB_PERSONAL_ACCESS_TOKEN, exactly as
 # before; the only change to its environment is that its stdin now
 # arrives scrubbed. Do not "simplify" this back to a direct exec.
+#
+# PEN-5641: that inherited token is now inert. The server is
+# long-lived and reads it once at startup, so it wedges on a dead
+# generation the moment the mount rotates. The egress runtime
+# therefore also starts a loopback proxy and sets GITHUB_HOST for the
+# child, rewriting the Authorization header from the live mount on
+# every request. The token wrapper stays in the chain regardless: it
+# is what refuses loudly when there is no credential to serve at all.
 exec /usr/local/libexec/paperclip/bin/paperclip-github-token-env /usr/local/bin/node /opt/paperclip-bundled-adapters/node_modules/@paperclipai/adapter-utils/dist/github-mcp-egress-runtime.js /usr/local/bin/github-mcp-server "$@"
