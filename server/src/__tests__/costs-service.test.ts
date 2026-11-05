@@ -423,6 +423,57 @@ describe("cost routes", () => {
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
+/**
+ * PEN-5585: record the SQL of every drizzle query this db actually executes.
+ *
+ * A result-preserving change cannot be regression-guarded by its results. Wrapping the
+ * handle lets a test assert on the statement the service built rather than on a copy
+ * rebuilt in the test, which would only prove the test agrees with itself.
+ *
+ * The proxy re-wraps anything a builder method returns that still carries `toSQL`, and
+ * reads the statement at `then` — the moment the chain is finalised and awaited.
+ */
+function withSqlCapture<T extends object>(db: T, sink: string[]): T {
+  const wrapValue = (value: unknown): unknown => {
+    // Builders must be wrapped from the FIRST link in the chain. `db.select({...})` returns
+    // a builder that has no `toSQL` until `.from()` is called, so gating the wrap on `toSQL`
+    // unwraps the chain at step one and captures nothing. Arrays are the resolved rows.
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return value;
+    const candidate = value as { toSQL?: () => { sql: string } };
+    return new Proxy(candidate, {
+      get(target, prop, receiver) {
+        const got = Reflect.get(target, prop, receiver);
+        if (prop === "then" && typeof got === "function") {
+          if (typeof target.toSQL === "function") {
+            try {
+              sink.push(target.toSQL().sql);
+            } catch {
+              // Not every thenable is a finalised statement; a capture miss must not fail the query.
+            }
+          }
+          return (got as (...a: unknown[]) => unknown).bind(target);
+        }
+        if (typeof got === "function") {
+          return (...args: unknown[]) =>
+            wrapValue((got as (...a: unknown[]) => unknown).apply(target, args));
+        }
+        return got;
+      },
+    }) as unknown;
+  };
+
+  return new Proxy(db, {
+    get(target, prop, receiver) {
+      const got = Reflect.get(target, prop, receiver);
+      if (typeof got === "function") {
+        return (...args: unknown[]) =>
+          wrapValue((got as (...a: unknown[]) => unknown).apply(target, args));
+      }
+      return got;
+    },
+  }) as T;
+}
+
 describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
   let db!: ReturnType<typeof createDb>;
   let costs!: ReturnType<typeof costService>;
@@ -786,7 +837,10 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       },
     ]);
 
-    const rows = await costs.byProject(companyId, {
+    const capturedSql: string[] = [];
+    const costsWithCapture = costService(withSqlCapture(db, capturedSql));
+
+    const rows = await costsWithCapture.byProject(companyId, {
       from: new Date("2026-04-01T00:00:00.000Z"),
       to: new Date("2026-04-15T23:59:59.999Z"),
     });
@@ -796,13 +850,24 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(rows[0]?.costCents).toBe(700);
 
     // The pruned run is not lost data — ask for its window and it attributes normally.
-    const earlierRows = await costs.byProject(companyId, {
+    const earlierRows = await costsWithCapture.byProject(companyId, {
       from: new Date("2026-01-01T00:00:00.000Z"),
       to: new Date("2026-01-31T23:59:59.999Z"),
     });
     expect(earlierRows).toHaveLength(1);
     expect(earlierRows[0]?.projectId).toBe(outOfWindowProjectId);
     expect(earlierRows[0]?.costCents).toBe(999);
+
+    // PEN-5585: the assertions above guard ATTRIBUTION, not the pruning — the bound is
+    // result-preserving by construction, so they pass identically whether the restriction
+    // is emitted or silently dropped by a drizzle API mistake. Only the compiled SQL
+    // distinguishes those two, so read it off the query the service actually built.
+    const emitted = capturedSql.filter((text) => text.includes("run_project_links"));
+    expect(emitted.length).toBeGreaterThan(0);
+    for (const text of emitted) {
+      expect(text).toContain('"activity_log"."run_id" in (');
+      expect(text).toContain('select distinct "heartbeat_run_id" from "cost_events"');
+    }
   });
 
   it("aggregates issue costs across recursive descendants only", async () => {
