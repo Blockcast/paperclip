@@ -1587,16 +1587,33 @@ export const UNLANDED_ELIGIBLE_HOURS = 6;
  * ⚠ That second clock is why this carve-out is sound, and it did not exist
  * before PEN-5279. Until then `already-enqueued` was reachable ONLY through
  * `autoMergeRequest`, so a DIRECTLY-enqueued PR — the normal product of a
- * queue-enabled base — never classified `already-enqueued` at all. It
- * classified `enqueue`, which is exactly this cohort's predicate, so a PR
- * sitting healthily in the queue was INSIDE this detector rather than carved
- * out of it, and `--alarm` exits non-zero on a non-empty cohort. It needed
- * `judgeableAgeHours > UNLANDED_ELIGIBLE_HOURS` on top, which is the only
- * reason it was not observed firing: measured 2026-11-02, #3241 reached ~4.3h
- * of judgeable age while queued, ~1.7h under the bar, and what held it under
- * was an unrelated re-run on its head. Luck, not design. Reading queue
- * membership closes that; do not reintroduce it by making `already-enqueued`
- * depend on `autoMergeRequest` again.
+ * queue-enabled base — never classified `already-enqueued` at all. Reading
+ * queue membership closes that; do not reintroduce it by making
+ * `already-enqueued` depend on `autoMergeRequest` again.
+ *
+ * ⛔ CORRECTED 2026-11-05 (PEN-5536). This paragraph used to say that such a
+ * PR "classified `enqueue`, which is exactly this cohort's predicate, so a PR
+ * sitting healthily in the queue was INSIDE this detector", held under the bar
+ * on #3241 by "Luck, not design." THAT READING IS WRONG, and it matters
+ * because it invites the next reader to derive a coverage claim from it — to
+ * conclude that PEN-5279 REMOVED an accidental alarm that something now has to
+ * restore. Nothing was removed.
+ *
+ * The mechanism, not luck: `UNKNOWN` is a member of UNLANDABLE_MERGE_STATES,
+ * so a PR reading UNKNOWN returns `skip`/`mergestate:UNKNOWN` and never
+ * reaches the `enqueue` arm at all. Measured 2026-11-04, a PR in the merge
+ * queue reads UNKNOWN for its ENTIRE time queued (3 of 3 queued vs 0 of 3 not
+ * queued, across the 08:29Z/09:28Z/10:28Z sweeps), and all six sampled PRs
+ * read CLEAN only BEFORE being queued. So the window in which a queued PR can
+ * classify `enqueue` is the brief one at the head of its queue time, and by
+ * the time it could age past UNLANDED_ELIGIBLE_HOURS it is reading UNKNOWN and
+ * classifying `skip`. The two clocks point in opposite directions, and the
+ * accidental alarm was never reachable for a genuinely wedged head.
+ *
+ * The consequence is the load-bearing one: a wedged front-of-queue entry was
+ * red to NOBODY before PEN-5279 and still red to nobody after it. PEN-5536's
+ * `queued` cohort is therefore a hole being closed for the first time — a
+ * strictly additive change to the alarm, not a restoration.
  *
  * `enqueue-failed` — `markFailure` renames the action, which drops it out of
  * `NON_HOLD_ACTIONS`, so `stalledHolds` already ages it. Covered.
@@ -1631,16 +1648,28 @@ export const UNLANDED_ELIGIBLE_HOURS = 6;
  * computes mergeability lazily and a CLEAN row flaps to UNKNOWN under load:
  * measured 2026-11-02, #3241 and #3255 classified `enqueue`/`mergestate:CLEAN`
  * at 09:0xZ and `skip`/`mergestate:UNKNOWN` at 09:2xZ, with `resolveMergeState`
- * having already spent its retries. While a row reads UNKNOWN its state is
- * UNREAD, so claiming "nothing is holding this" about it would be a statement
- * the data does not support — and this cohort's whole content is that claim.
+ * having already spent its retries — and, measured 2026-11-04, a PR IN THE
+ * MERGE QUEUE reads UNKNOWN for its entire time queued (3 of 3 queued vs 0 of
+ * 3 not queued, across the 08:29Z/09:28Z/10:28Z sweeps). That one is not a
+ * flap and does not settle, so `resolveMergeState` exhausts its retries on it
+ * every fire. While a row reads UNKNOWN its state is UNREAD, so claiming
+ * "nothing is holding this" about it would be a statement the data does not
+ * support — and this cohort's whole content is that claim.
  *
  * The cost is one missed sample, not a blind spot: the condition persists for
- * hours, the sweep is hourly, and `stalledHolds` owns `mergestate:UNKNOWN`
- * outright from STALE_HOLD_HOURS. What is genuinely uncovered is a PR that
+ * hours, the sweep is hourly, and PEN-5279 classifies a queued PR
+ * `already-enqueued` before the merge state is read, so the queue-induced case
+ * no longer reaches either detector. What is genuinely uncovered is a PR that
  * reads UNKNOWN on every sample between the two thresholds. Stated here
  * rather than papered over, because the fix for it is a better merge-state
  * read, not a looser predicate.
+ *
+ * ⛔ Note what the superseded reading of that paragraph got wrong, because it
+ * is the kind of error that reads as reassurance: it said "`stalledHolds` owns
+ * `mergestate:UNKNOWN` outright from STALE_HOLD_HOURS". `stalledHolds` does
+ * not feed `alarmExitCode`, so it never owned anything in the ALARM sense —
+ * it prints. It printed "act on it" about #3281 fifteen minutes before that PR
+ * merged.
  *
  * An undatable row (`ageHours === null`) is REPORTED, matching `stalledHolds`
  * and for the same §4l reason: an instrument that cannot see something must
@@ -3254,6 +3283,7 @@ const RUN_REPO_KEYS = new Set([
   "rotted",
   "stranded",
   "starved",
+  "queued",
   "fetch",
   "classify",
   "landable",
@@ -3272,6 +3302,7 @@ const REPO_RUNNER_KEYS = new Set([
   "notify",
   "unreadable",
   "starved",
+  "queued",
 ]);
 
 /**
@@ -3283,8 +3314,8 @@ const REPO_RUNNER_KEYS = new Set([
  * is this file's original practice, abandoned once per cohort without anyone
  * deciding to.
  */
-const RUN_REPO_REQUIRED_KEYS = ["rotted", "stranded", "starved"];
-const REPO_RUNNER_REQUIRED_KEYS = ["rotted", "stranded", "unreadable", "starved"];
+const RUN_REPO_REQUIRED_KEYS = ["rotted", "stranded", "starved", "queued"];
+const REPO_RUNNER_REQUIRED_KEYS = ["rotted", "stranded", "unreadable", "starved", "queued"];
 
 /**
  * ⛔ TWO throws, not one, because a typo and an omission are different faults
@@ -3361,6 +3392,7 @@ export function runRepo(options) {
     rotted,
     stranded,
     starved,
+    queued,
     // Defaults are retained on the injectable SEAMS below, because supplying a
     // real implementation when a test did not ask for one is exactly what a
     // seam default is for.
@@ -3489,6 +3521,73 @@ export function runRepo(options) {
   const capped = apply ? [] : capStarved(prs, rows);
   for (const row of capped) starved.push(`${repo}#${row.number}`);
 
+  // PEN-5536. The wedged-front-of-queue cohort. No `capStarved`-style helper
+  // and no clock of its own: `classifyPr` has already applied BOTH halves of
+  // the predicate (`position === 1` strictly, and `enqueuedAt` older than
+  // STALE_ENQUEUE_HOURS), so the finding IS the row and this only collects it.
+  // Nothing here may re-derive or relax it.
+  //
+  // ⚠ NO `apply ? [] :` CUT, unlike both cohorts above, and the asymmetry is
+  // deliberate. Theirs exists because applying FLIPS the meaning of the row
+  // they read: an `enqueue` row after the apply loop means "this fire just
+  // took it", and a `cap:` row is scored against a budget the same fire just
+  // spent. `stale-queued` has no such flip — `applyRow` only comments on it,
+  // because `gh` exposes no dequeue flag — so the row reads identically before
+  // and after, and the finding is equally true in both modes. (`main` refuses
+  // `--alarm` with `--apply` anyway, so an applying fire never reads this.)
+  //
+  // ⛔ SCOPED TO LAND REPOS, answering PEN-5536 §6 deliberately rather than by
+  // default. In a notify-only repo this routine enqueues nothing, so a wedged
+  // queue there was queued by somebody else: still a true finding, but not a
+  // statement about THIS routine, and the blast-radius argument that justifies
+  // alarming evaporates with it — none of the PRs stuck behind that head were
+  // ones this fire would have landed. What would remain is a shared hourly
+  // schedule turned red at an on-call who cannot clear it, which is the
+  // specific way alarms stop being read. `demoteMergeActions` already makes
+  // exactly this argument for `stranded`: "a clean PR in a notify-only repo is
+  // not stranded; it is held by policy, and alarming on it would turn the
+  // detector permanently red for working as designed." Cited rather than
+  // restated, because two statements of one dividing line are how they drift.
+  //
+  // Gated HERE, on `landable`, rather than by adding `stale-queued` to
+  // MERGE_MUTATING_ACTIONS. That set files an action as something this routine
+  // MUTATES, and `stale-queued` mutates nothing — `gh` exposes no dequeue
+  // flag, so the row only ever states a finding. It would also be the wrong
+  // instrument: `demoteMergeActions` RENAMES the row to `notify-only` before
+  // every consumer reads it, which would erase the finding from that repo's
+  // RECEIPT as well. Not alarming on a guest repo's wedged queue is the
+  // decision; refusing to print it is not. `landable` is the same key one hop
+  // down from `notifyRepos()`, and already gates the `stated-hold:*` writes
+  // below.
+  //
+  // ⚠ Correcting the premise this scoping was ruled on, because the ruling's
+  // wording invites a widening that would be wrong. PEN-5536 §4 said to "keep
+  // the comment unscoped" since "commenting is the one thing a notify-only
+  // repo exists to permit". The PR comment is indeed untouched by this change
+  // — but in a notify-only repo it never happened in the first place:
+  // `applierFor(false)` selects `applyRowNotifyOnly`, which returns `null` for
+  // every action except `codeowner-review-requested`. The code-owner
+  // notification is the ONLY write this routine makes in a guest repo, by
+  // design and for a stated reason (narrowest write surface worth asking a
+  // human to grant). So the instruction is satisfied vacuously, and nobody
+  // should "restore" a `stale-queued` comment there: that would WIDEN the
+  // write surface in a repo we are a guest in, which is the opposite of what
+  // §4 was protecting.
+  //
+  // ⚠ This is the file's FIRST cohort scoping that is a visible check rather
+  // than a consequence of `demoteMergeActions`' rename, so nothing else
+  // enforces it: the mutation-detecting test PAIR in the suite (alarms in a
+  // land repo, silent in a notify-only one) is what makes deleting this `if`
+  // red rather than free. `unreadable` is deliberately NOT scoped, for the
+  // record — "I could not read this repo" is a statement about the routine
+  // whether or not it lands there — so "scope every cohort" would be wrong
+  // and this needed an argument rather than a convention.
+  if (landable) {
+    for (const row of rows) {
+      if (row.action === "stale-queued") queued.push(`${repo}#${row.number}`);
+    }
+  }
+
   // Stated on the PR, not just in this receipt — and only on `--apply`, since
   // it is a write. A failure here is recorded against the row and never
   // aborts: the report above is the load-bearing output, and losing it
@@ -3589,6 +3688,7 @@ export const repoRunner = (options) => {
     stranded,
     unreadable,
     starved,
+    queued,
     // Seams keep their defaults.
     run = runRepo,
     notify = new Set(),
@@ -3601,7 +3701,17 @@ export const repoRunner = (options) => {
     const scope = notify.has(repo) ? { landable: false } : {};
     let rows;
     try {
-      rows = run({ repo, apply, settleMinutes, spent, rotted, stranded, starved, ...scope });
+      rows = run({
+        repo,
+        apply,
+        settleMinutes,
+        spent,
+        rotted,
+        stranded,
+        starved,
+        queued,
+        ...scope,
+      });
     } catch (error) {
       // ⛔ PEN-5536, and it is FIRST on purpose: a wiring fault is never
       // recorded as a repo-readability fact. `assertBag`'s throws travel
@@ -3746,7 +3856,7 @@ export function reportUnmeasured(
   // with an `Array.isArray` throw. A key cannot collide with a bag, so this
   // insertion cannot repeat that — every existing two- and three-argument
   // caller keeps its exact meaning.
-  { alarm = false, starved = [], log = console.error } = {},
+  { alarm = false, starved = [], queued = [], log = console.error } = {},
 ) {
   const message = ghErrorMessage(error).trim().split("\n")[0];
   log(
@@ -3768,10 +3878,12 @@ export function reportUnmeasured(
   const partial = [
     ["unlanded-eligible", stranded ?? []],
     ["cap-starved", starved ?? []],
+    ["stale-queued", queued ?? []],
   ].filter(([, cohort]) => cohort.length > 0);
   if (partial.length === 0) {
     log(
-      "No unlanded-eligible or cap-starved PR had been found when the sweep stopped — but " +
+      "No unlanded-eligible, cap-starved or stale-queued PR had been found when the sweep " +
+        "stopped — but " +
         "the repos after the failure were never read, so this is an empty PREFIX, not an " +
         "all-clear.",
     );
@@ -3844,13 +3956,70 @@ export function reportUnmeasured(
  * decision someone owes, which a red schedule cannot make them take. The
  * alarming cohorts instead assert that NOTHING is owed and the landing has
  * not happened anyway, which is a statement about the routine itself.
+ *
+ * ## Why `queued` alarms where the stale-hold block still does not (PEN-5536)
+ *
+ * `queued` is a FOURTH argument for the same reasons `starved` was a third —
+ * separate report, separate remedy, every existing caller unchanged — but it
+ * is the first cohort to be promoted INTO this function rather than written
+ * alarming, so the test above is the thing it had to pass.
+ *
+ * It passes the first half outright. A PR at the front of the merge queue for
+ * over STALE_ENQUEUE_HOURS is green, approved, and GitHub has accepted it:
+ * NOBODY has been asked for anything, so there is no decision a red could fail
+ * to compel. The comment this routine posts names the likely cause itself — a
+ * required check on the queue branch that never reported — which is an
+ * infrastructure fault, not an owed judgement.
+ *
+ * It passes the second half through the queue's SERIALIZATION, which is the
+ * mechanism and is measured rather than asserted. On 2026-11-05 the `master`
+ * queue held eight entries behind a slow front entry for 3h42m with ZERO
+ * queue merges in that window, and position 2 read MERGEABLE throughout — a
+ * ready entry that is not merging is the discriminator, because it is the head
+ * holding it rather than its own checks. So a wedged head blocks an unbounded
+ * set of PRs, each of which `unlandedEligible` carves out as
+ * `already-enqueued` BY DESIGN. One wedged head silences the alarm for all of
+ * them, which makes this the most expensive thing the sweep can miss.
+ *
+ * Two honest limits on that measurement, carried rather than hidden:
+ *
+ *   - The front entry was slow, NOT proven wedged — its merge-group jobs were
+ *     still starting. What is measured is the serialization, which is the
+ *     mechanism by which a wedged head would stall everything behind it. That
+ *     licenses the reasoning; it is not an instance of the fault.
+ *   - The observed relief valve was humans admin-merging AROUND the queue (2
+ *     of the 2 merges to `master` in that window had no queue events at all).
+ *     That makes the stall invisible to `master` throughput, so anything
+ *     reasoning from "commits are still landing" concludes the queue is
+ *     healthy. The fault is actively masked, which strengthens the case for
+ *     alarming rather than weakening it.
+ *
+ * False-positive risk is what makes the promotion safe: `classifyPr` already
+ * requires `position === 1` strictly, explicitly refuses to read an absent or
+ * non-numeric position as the front, and puts STALE_ENQUEUE_HOURS on top.
+ * GitHub ejects queue entries whose checks time out, so a 13h front-of-queue
+ * entry means the queue is not even ejecting — pathological by construction
+ * rather than merely slow.
+ *
+ * ⚠ CALIBRATION, recorded here so it has a durable home rather than dying in
+ * a ticket: the 2026-11-05 front-stall above ran 3h42m against a threshold of
+ * 13h, so this cohort would not have fired once on it — the second live
+ * instance in two days to sit under the bar. The threshold is deliberately
+ * UNCHANGED by the commit that added this cohort. If the distance turns out
+ * to matter it is a separate question against a separate measurement, and it
+ * should be answered by one.
  */
-export function alarmExitCode(stranded, unreadable = [], starved = []) {
+export function alarmExitCode(stranded, unreadable = [], starved = [], queued = []) {
   // MEASURED alarms first. A stranded or cap-starved PR is a thing to act on,
-  // and `1` is the code that says so. An unreadable repo standing beside one
-  // does not soften that verdict and must not mask it — the `ALARM:` block
-  // still names the skipped repos either way.
-  if ((stranded ?? []).length > 0 || (starved ?? []).length > 0) return 1;
+  // and `1` is the code that says so. A wedged front-of-queue entry joins them
+  // (PEN-5536): it is measured, it is a statement about the routine, and it is
+  // the one finding whose blast radius is other PRs rather than itself. An
+  // unreadable repo standing beside any of them does not soften that verdict
+  // and must not mask it — the `ALARM:` block still names the skipped repos
+  // either way.
+  if ((stranded ?? []).length > 0 || (starved ?? []).length > 0 || (queued ?? []).length > 0) {
+    return 1;
+  }
   // Nothing measured went wrong AND a repo went unread. That is definitionally
   // "could not measure" by this file's own words — `reportUnreadable` prints
   // "This fire asserts nothing about these" — so it spends EXIT_UNMEASURED
@@ -3876,6 +4045,7 @@ function main() {
   const stranded = [];
   const unreadable = [];
   const starved = [];
+  const queued = [];
 
   // `finally`, because the cohort is the expensive half of the output and the
   // likeliest thrower is `fetchOpenPrs` — outside `runRepo`'s try, one list
@@ -3903,6 +4073,7 @@ function main() {
         notify,
         unreadable,
         starved,
+        queued,
       }),
     );
   } catch (error) {
@@ -3919,7 +4090,7 @@ function main() {
     // `stranded` would spend 0 — a confident all-clear printed over repos that
     // were never read. That is precisely the fail-open shape
     // `assertPrListComplete` exists to prevent one layer down.
-    reportUnmeasured(sweepError, stranded, { alarm, starved });
+    reportUnmeasured(sweepError, stranded, { alarm, starved, queued });
     process.exit(EXIT_UNMEASURED);
   }
 
@@ -3950,7 +4121,18 @@ function main() {
         "reach them. See the cap-starved block above.",
     );
   }
-  if (alarm) process.exit(alarmExitCode(stranded, unreadable, starved));
+  if (alarm && queued.length > 0) {
+    console.error(
+      `\nALARM: ${queued.length} PR(s) have been at the FRONT of a merge queue for over ` +
+        `${STALE_ENQUEUE_HOURS}h — ${queued.join(", ")}.\n` +
+        "Nothing is being asked of anyone: they are green, approved and already accepted by " +
+        "GitHub. The queue is head-serialized, so EVERY entry behind one of these is blocked " +
+        "and is reported nowhere — the landing routine carves a queued PR out of its own " +
+        "unlanded-eligible cohort by design. The usual cause is a required check on the queue " +
+        "branch that never reported. Land repos only; see the cohort's comment in `runRepo`.",
+    );
+  }
+  if (alarm) process.exit(alarmExitCode(stranded, unreadable, starved, queued));
 }
 
 export function isMainModule(argvPath = process.argv[1], moduleUrl = import.meta.url) {
