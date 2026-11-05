@@ -307,6 +307,32 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
       expect(residue.recoveryDisposition).toBe("recovery_issue");
     });
 
+    it("discharges a RECENT clear whose destroyed due time is long past (PEN-5346)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      // The mirror of the case above, and the one that states the choice: the
+      // deadline is the OBLIGATION's age, not the CLEAR's. This clear landed
+      // minutes ago, but the wake it destroyed came due 45 days ago — an
+      // overdue monitor on a status where it could never have fired. Nothing
+      // is owed to a wake that has been moot that long, so no carrier.
+      //
+      // This is not a corner case on a flapping row: `clearedNextCheckAt`
+      // carries the FIRST clear's due time forward across plugin flaps
+      // (`issue-execution-policy.ts`), so a row the alertmanager has been
+      // recycling for weeks reaches exactly this shape — recent clear,
+      // ancient due time — on every flap after the first.
+      const issueId = await seedCancelledResidue(companyId, agentId, {
+        clearedAt: new Date(Date.now() - 5 * 60 * 1000).toISOString(),
+        clearedNextCheckAt: LONG_PAST_CLEARED_AT,
+      });
+
+      const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(result).toMatchObject({ scanned: 1, recovered: 0, autoDischarged: 1 });
+      await expect(readRecoveryIssues(issueId)).resolves.toHaveLength(0);
+
+      const residue = residueOf((await readIssue(issueId)).executionState);
+      expect(residue.recoveryDisposition).toBe("auto_discharged_past_horizon");
+    });
+
     it("still carries an old clear whose source solely owns an OPEN work product (PEN-5346)", async () => {
       const { companyId, agentId } = await seedCompanyAndAgent();
       const issueId = await seedCancelledResidue(companyId, agentId, {
