@@ -32666,6 +32666,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * `monitorNextCheckAt` null, AND the obligation it carried is on a row that
    * survives the cancel.
    */
+  /**
+   * PEN-5346 §4 — rate-limit the "selected work, discharged nothing" line to at
+   * most one per {@link CANCELLED_MONITOR_INERT_LOG_INTERVAL_MS} per shape.
+   *
+   * The state this line reports is, by its nature, a state that PERSISTS: the
+   * rows it names keep their residue and are selected again on the very next
+   * tick. The scheduler tick is 30 s, so an unthrottled line would be ~2 880
+   * entries a day for as long as the condition holds — the same flood
+   * {@link DISPATCH_DECLINE_LOG_INTERVAL_MS} exists to bound, and the same one
+   * PEN-5457 already raises against the `unowned` warn below.
+   *
+   * Keyed on the SHAPE of the pass rather than on a fixed slot, so a population
+   * that is actually draining — 21 skipped, then 19, then 17 — says so on every
+   * change instead of once per interval. A shape that does not move is the
+   * stuck case, and that is the one worth throttling.
+   * `suppressedSincePreviousLog` keeps the emitted line honest about how many
+   * passes it stands for, so a throttled line is never read as an isolated one.
+   *
+   * Bounded by construction: a single slot, replaced rather than accumulated.
+   */
+  const CANCELLED_MONITOR_INERT_LOG_INTERVAL_MS = 10 * 60_000;
+  let cancelledMonitorInertLogState:
+    | { signature: string; lastLoggedAt: number; suppressed: number }
+    | null = null;
+
+  function takeCancelledMonitorInertLogSlot(
+    signature: string,
+  ): { log: false } | { log: true; suppressedSincePreviousLog: number } {
+    const now = Date.now();
+    const previous = cancelledMonitorInertLogState;
+    if (
+      previous &&
+      previous.signature === signature &&
+      now - previous.lastLoggedAt < CANCELLED_MONITOR_INERT_LOG_INTERVAL_MS
+    ) {
+      previous.suppressed += 1;
+      return { log: false };
+    }
+    cancelledMonitorInertLogState = { signature, lastLoggedAt: now, suppressed: 0 };
+    return { log: true, suppressedSincePreviousLog: previous?.suppressed ?? 0 };
+  }
+
   async function reconcileCancelledIssueMonitorRecoveries(opts?: {
     companyId?: string;
     limit?: number;
@@ -33008,6 +33050,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         { unowned: unownedIssueIds.length, issues: unownedIssueIds.slice(0, 20) },
         "cancelled-monitor recoveries left owed: the source has no agent to hand the obligation to (PEN-5346)",
       );
+    }
+
+    // PEN-5346 §4 — an INERT pass must not read as a drained one.
+    //
+    // Both call sites log only when `recovered`/`cleared`/`unowned`/`failed` is
+    // non-zero. `scanned` and `skipped` are computed, returned, and then
+    // discarded at every call site, so a pass that selected 21 candidates and
+    // skipped all 21 was BYTE-IDENTICAL in the logs to a pass that selected
+    // nothing — which is itself byte-identical to the healthy, fully-drained
+    // steady state this pass exists to reach. Measured 2026-11-04: with the
+    // backfill deployed and >= 21 rows carrying the residue, neither worker
+    // emitted a single line of any kind, and the non-drain was found only by
+    // reading a row by hand.
+    //
+    // That is this row's own defect reintroduced one layer up, on the
+    // instrument rather than on the obligation, and done-when item 5 named it
+    // in advance ("keyed so a partial failure self-heals rather than
+    // reintroducing this bug one layer up").
+    //
+    // The condition below is exactly the call sites' SILENT branch: every
+    // candidate skipped (`skipped === scanned`) with nothing cleared. Stated
+    // intrinsically rather than as a copy of their `if`, but chosen to tile
+    // with it, so the union of the three sites leaves silence meaning one
+    // thing only — `scanned === 0`, nothing was owed.
+    if (scanned > 0 && skipped === scanned && cleared === 0) {
+      const slot = takeCancelledMonitorInertLogSlot(`${scanned}:${skipped}:${pages}:${oldestClearedAt ?? ""}`);
+      if (slot.log) {
+        logger.warn(
+          {
+            scanned,
+            recovered,
+            cleared,
+            skipped,
+            unowned,
+            failed,
+            pages,
+            oldestClearedAt,
+            suppressedSincePreviousLog: slot.suppressedSincePreviousLog,
+          },
+          "cancelled-monitor recovery selected candidates and discharged none of them (PEN-5346)",
+        );
+      }
     }
 
     return { scanned, recovered, cleared, skipped, unowned, failed, pages, oldestClearedAt };
