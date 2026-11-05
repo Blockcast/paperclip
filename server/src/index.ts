@@ -1817,7 +1817,14 @@ export async function startServer(): Promise<StartedServer> {
             cancelledMonitorRecoveryInFlight = true;
             try {
               const handedBack = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
-              if (handedBack.recovered > 0 || handedBack.cleared > 0 || handedBack.unowned > 0 || handedBack.failed > 0) {
+              // `autoDischarged` is in the gate (PEN-5346): draining the
+              // historical backfill is the one outcome a pass can produce
+              // entirely on its own, so leaving it out would make the drain
+              // the only thing this line cannot report.
+              if (
+                handedBack.recovered > 0 || handedBack.cleared > 0 || handedBack.unowned > 0
+                || handedBack.autoDischarged > 0 || handedBack.failed > 0
+              ) {
                 logger.warn(
                   { ...handedBack },
                   "startup cancelled-monitor recovery handed back wakes destroyed by a cancel (PEN-5346)",
@@ -2503,6 +2510,9 @@ export async function startServer(): Promise<StartedServer> {
                     handedBack.recovered > 0 ||
                     handedBack.cleared > 0 ||
                     handedBack.unowned > 0 ||
+                    // See the startup pass: a tick that only drains the
+                    // backfill is still the tick worth reading.
+                    handedBack.autoDischarged > 0 ||
                     handedBack.failed > 0
                   ) {
                     logger.warn(

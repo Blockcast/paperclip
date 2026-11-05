@@ -4,6 +4,7 @@ import {
   ISSUE_EXECUTION_DECISION_OUTCOMES,
   ISSUE_EXECUTION_MONITOR_CLEAR_REASONS,
   ISSUE_EXECUTION_MONITOR_KINDS,
+  ISSUE_EXECUTION_MONITOR_RECOVERY_DISPOSITIONS,
   ISSUE_EXECUTION_MONITOR_RECOVERY_POLICIES,
   ISSUE_EXECUTION_MONITOR_STATE_STATUSES,
   ISSUE_EXECUTION_POLICY_MODES,
@@ -360,6 +361,20 @@ export const issueExecutionMonitorStateSchema = z.object({
   // which is the whole backfill population — parse as "handoff still owed"
   // rather than failing validation or reading as already discharged.
   recoveryEmittedAt: z.string().datetime().nullable().prefault(null),
+  // PEN-5346: WHY the handoff was stamped, when the answer is not "a carrier
+  // row was created".
+  //
+  // `recoveryEmittedAt` alone cannot carry this. It is the `owed` predicate —
+  // null means the obligation is still owed, non-null means it is not — and
+  // the measurement instrument counts on exactly that. Overloading it to also
+  // mean "discharged without a carrier" would make a horizon-discharged row
+  // indistinguishable from one a carrier actually picked up, which is the one
+  // distinction anybody auditing this backfill needs.
+  //
+  // `.optional()` for the same reason `clearedNextCheckAt` is: absent means
+  // "stamped before this field existed", which is every row the first passes
+  // emitted, and that is NOT the same claim as `"recovery_issue"`.
+  recoveryDisposition: z.enum(ISSUE_EXECUTION_MONITOR_RECOVERY_DISPOSITIONS).optional(),
 });
 
 export const issueReviewRequestSchema = z.object({
