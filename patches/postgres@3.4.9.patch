@@ -1,5 +1,5 @@
 diff --git a/cf/src/connection.js b/cf/src/connection.js
-index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..cd5eb46bb3dd8040f242f6a06afe537e33c652ca 100644
+index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..b3ca1cd159d12fba1f17ad1636be803f46d4301e 100644
 --- a/cf/src/connection.js
 +++ b/cf/src/connection.js
 @@ -77,6 +77,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -157,7 +157,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..cd5eb46bb3dd8040f242f6a06afe537e
      idleTimer.cancel()
      lifeTimer.cancel()
      connectTimer.cancel()
-@@ -452,7 +536,22 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -452,7 +536,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      if (initial)
        return reconnect()
  
@@ -165,7 +165,9 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..cd5eb46bb3dd8040f242f6a06afe537e
 +    // BLO-52499: settle and forget everything the dead session held; the next
 +    // session's startup ReadyForQuery would otherwise consume it. A stashed
 +    // FATAL (57P01) rejected the next caller's first query, a leftover `query`
-+    // was resolved with the startup's empty result, a mid-DataRow `rows` offset
++    // made ErrorResponse stash a FATAL from the next session's startup instead of
++    // rejecting `initial` with it, so closed() looped on reconnect and the caller
++    // hung, a mid-DataRow `rows` offset
 +    // the next result, and an ended COPY's `final` fired on the next session's
 +    // first CommandComplete. Not gated on !hadError: on ECONNRESET, Node runs
 +    // microtasks between 'error' and 'close', so a statement written in that gap
@@ -181,8 +183,15 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..cd5eb46bb3dd8040f242f6a06afe537e
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -566,10 +665,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
-         return fetchArrayTypes()
+@@ -563,13 +664,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+ 
+       if (needsTypes) {
+         initial.reserve && (initial = null)
+-        return fetchArrayTypes()
++        // BLO-52499: closed() rejects the type query when the session dies under
++        // it, and nothing awaits this promise, so that rejection was unhandled.
++        // The next session fetches the types again (connected() resets needsTypes).
++        return fetchArrayTypes().catch(noop)
        }
  
 -      initial && !initial.reserve && execute(initial)
@@ -199,7 +208,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..cd5eb46bb3dd8040f242f6a06afe537e
      }
  
      while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-@@ -839,13 +943,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -839,13 +948,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    async function PortalSuspended() {
@@ -222,7 +231,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..cd5eb46bb3dd8040f242f6a06afe537e
        query.reject(err)
      }
 diff --git a/cf/src/index.js b/cf/src/index.js
-index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..8ccccb8f0361fb6a9c0b61acf7d318535ac83dea 100644
+index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..4c3e8bc31743f0070b3fb49fb25db71424940f5a 100644
 --- a/cf/src/index.js
 +++ b/cf/src/index.js
 @@ -75,6 +75,18 @@ function Postgres(a, b) {
@@ -349,7 +358,7 @@ index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..8ccccb8f0361fb6a9c0b61acf7d31853
    function move(c, queue) {
      c.queue.remove(c)
      queue.push(c)
-@@ -421,10 +472,17 @@ function Postgres(a, b) {
+@@ -421,10 +472,18 @@ function Postgres(a, b) {
  
    function onclose(c, e) {
      move(c, closed)
@@ -361,14 +370,15 @@ index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..8ccccb8f0361fb6a9c0b61acf7d31853
 +    // BLO-52499: a queued reserve() waiter is only the reconnect's trigger, as in
 +    // reserve()'s own cold path: it stays in `queries` for onopen() to serve.
 +    // Shifting it out made it the reconnect's `initial`, which the handshake
-+    // drops for a reserve() waiter, so the waiter was in neither place and never
-+    // settled. Upstream only settled it by accident, by rejecting it with the
-+    // dead session's stashed FATAL, which closed() no longer carries over.
++    // drops for a reserve() waiter, so the waiter was in neither place. Upstream
++    // settled it only by accident, when the dead session had stashed a FATAL to
++    // reject it with, and otherwise hung it. closed() no longer carries that
++    // FATAL over.
 +    queries.length && connect(c, queries.peek().reserve ? queries.peek() : queries.shift())
    }
  }
  
-@@ -445,13 +503,18 @@ function parseOptions(a, b) {
+@@ -445,13 +504,18 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -389,7 +399,7 @@ index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..8ccccb8f0361fb6a9c0b61acf7d31853
      max_pipeline    : 100,
      backoff         : backoff,
 diff --git a/cf/src/query.js b/cf/src/query.js
-index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..74e2d05eeabcd700df1e7ef7c56d992b05b167b5 100644
+index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..c6327a8d7ac56ced88511b62c79ce8fe24273c77 100644
 --- a/cf/src/query.js
 +++ b/cf/src/query.js
 @@ -50,7 +50,25 @@ export class Query extends Promise {
@@ -419,6 +429,33 @@ index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..74e2d05eeabcd700df1e7ef7c56d992b
    }
  
    simple() {
+@@ -84,9 +102,17 @@ export class Query extends Promise {
+       return (this.cursorFn = fn, this)
+ 
+     let prev
++      , error
+     return {
+       [Symbol.asyncIterator]: () => ({
+         next: () => {
++          // BLO-52499: a rejection that lands while the caller holds a batch hits
++          // a promise already resolved, and it also clears `active`, so the next
++          // next() reported a clean end and the rows so far passed for the whole
++          // result. Keep it and throw it here instead.
++          if (error)
++            return Promise.reject(error)
++
+           if (this.executed && !this.active)
+             return { done: true }
+ 
+@@ -97,7 +123,7 @@ export class Query extends Promise {
+               return new Promise(r => prev = r)
+             }
+             this.resolve = () => (this.active = false, resolve({ done: true }))
+-            this.reject = x => (this.active = false, reject(x))
++            this.reject = x => (this.active = false, error = x, reject(x))
+           })
+           this.execute()
+           return promise
 diff --git a/cf/src/queue.js b/cf/src/queue.js
 index c4ef97164f057db99dce1b9af3401dbb1af37e31..a741ae31caca18139befcb74634b9b80bb397dee 100644
 --- a/cf/src/queue.js
@@ -433,7 +470,7 @@ index c4ef97164f057db99dce1b9af3401dbb1af37e31..a741ae31caca18139befcb74634b9b80
        const out = xs[index++]
  
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
-index 07f6716702ac888215c86ad6e0071aaf55ae519c..590732568d9c73c64af6bf954a0bd9949a7deef1 100644
+index 07f6716702ac888215c86ad6e0071aaf55ae519c..d5ca5f8c20d1ad8f7be06b07aad57162d2e0d0bc 100644
 --- a/cjs/src/connection.js
 +++ b/cjs/src/connection.js
 @@ -75,6 +75,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -591,7 +628,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..590732568d9c73c64af6bf954a0bd994
      idleTimer.cancel()
      lifeTimer.cancel()
      connectTimer.cancel()
-@@ -450,7 +534,22 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -450,7 +534,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      if (initial)
        return reconnect()
  
@@ -599,7 +636,9 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..590732568d9c73c64af6bf954a0bd994
 +    // BLO-52499: settle and forget everything the dead session held; the next
 +    // session's startup ReadyForQuery would otherwise consume it. A stashed
 +    // FATAL (57P01) rejected the next caller's first query, a leftover `query`
-+    // was resolved with the startup's empty result, a mid-DataRow `rows` offset
++    // made ErrorResponse stash a FATAL from the next session's startup instead of
++    // rejecting `initial` with it, so closed() looped on reconnect and the caller
++    // hung, a mid-DataRow `rows` offset
 +    // the next result, and an ended COPY's `final` fired on the next session's
 +    // first CommandComplete. Not gated on !hadError: on ECONNRESET, Node runs
 +    // microtasks between 'error' and 'close', so a statement written in that gap
@@ -615,8 +654,15 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..590732568d9c73c64af6bf954a0bd994
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -564,10 +663,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
-         return fetchArrayTypes()
+@@ -561,13 +662,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+ 
+       if (needsTypes) {
+         initial.reserve && (initial = null)
+-        return fetchArrayTypes()
++        // BLO-52499: closed() rejects the type query when the session dies under
++        // it, and nothing awaits this promise, so that rejection was unhandled.
++        // The next session fetches the types again (connected() resets needsTypes).
++        return fetchArrayTypes().catch(noop)
        }
  
 -      initial && !initial.reserve && execute(initial)
@@ -633,7 +679,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..590732568d9c73c64af6bf954a0bd994
      }
  
      while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-@@ -837,13 +941,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -837,13 +946,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    async function PortalSuspended() {
@@ -656,7 +702,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..590732568d9c73c64af6bf954a0bd994
        query.reject(err)
      }
 diff --git a/cjs/src/index.js b/cjs/src/index.js
-index f09c61c7e998f411560b95c9a8e1ed6a97972c11..33368049f1d777b901d2590770c0c8ecada2341e 100644
+index f09c61c7e998f411560b95c9a8e1ed6a97972c11..9b5aeeb78fb74f1c81825e588023e620c095d46b 100644
 --- a/cjs/src/index.js
 +++ b/cjs/src/index.js
 @@ -74,6 +74,18 @@ function Postgres(a, b) {
@@ -783,7 +829,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..33368049f1d777b901d2590770c0c8ec
    function move(c, queue) {
      c.queue.remove(c)
      queue.push(c)
-@@ -420,10 +471,17 @@ function Postgres(a, b) {
+@@ -420,10 +471,18 @@ function Postgres(a, b) {
  
    function onclose(c, e) {
      move(c, closed)
@@ -795,14 +841,15 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..33368049f1d777b901d2590770c0c8ec
 +    // BLO-52499: a queued reserve() waiter is only the reconnect's trigger, as in
 +    // reserve()'s own cold path: it stays in `queries` for onopen() to serve.
 +    // Shifting it out made it the reconnect's `initial`, which the handshake
-+    // drops for a reserve() waiter, so the waiter was in neither place and never
-+    // settled. Upstream only settled it by accident, by rejecting it with the
-+    // dead session's stashed FATAL, which closed() no longer carries over.
++    // drops for a reserve() waiter, so the waiter was in neither place. Upstream
++    // settled it only by accident, when the dead session had stashed a FATAL to
++    // reject it with, and otherwise hung it. closed() no longer carries that
++    // FATAL over.
 +    queries.length && connect(c, queries.peek().reserve ? queries.peek() : queries.shift())
    }
  }
  
-@@ -444,13 +502,18 @@ function parseOptions(a, b) {
+@@ -444,13 +503,18 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -823,7 +870,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..33368049f1d777b901d2590770c0c8ec
      max_pipeline    : 100,
      backoff         : backoff,
 diff --git a/cjs/src/query.js b/cjs/src/query.js
-index 45327f2fabcdbf8f8ec5020675012c310c04fee6..5ebfa4c654d624333aafaf6738fb32974a009807 100644
+index 45327f2fabcdbf8f8ec5020675012c310c04fee6..1bfabb8da05f7cbb9023c75375a484a04130cc29 100644
 --- a/cjs/src/query.js
 +++ b/cjs/src/query.js
 @@ -50,7 +50,25 @@ const Query = module.exports.Query = class Query extends Promise {
@@ -853,6 +900,33 @@ index 45327f2fabcdbf8f8ec5020675012c310c04fee6..5ebfa4c654d624333aafaf6738fb3297
    }
  
    simple() {
+@@ -84,9 +102,17 @@ const Query = module.exports.Query = class Query extends Promise {
+       return (this.cursorFn = fn, this)
+ 
+     let prev
++      , error
+     return {
+       [Symbol.asyncIterator]: () => ({
+         next: () => {
++          // BLO-52499: a rejection that lands while the caller holds a batch hits
++          // a promise already resolved, and it also clears `active`, so the next
++          // next() reported a clean end and the rows so far passed for the whole
++          // result. Keep it and throw it here instead.
++          if (error)
++            return Promise.reject(error)
++
+           if (this.executed && !this.active)
+             return { done: true }
+ 
+@@ -97,7 +123,7 @@ const Query = module.exports.Query = class Query extends Promise {
+               return new Promise(r => prev = r)
+             }
+             this.resolve = () => (this.active = false, resolve({ done: true }))
+-            this.reject = x => (this.active = false, reject(x))
++            this.reject = x => (this.active = false, error = x, reject(x))
+           })
+           this.execute()
+           return promise
 diff --git a/cjs/src/queue.js b/cjs/src/queue.js
 index 8438f5da92cf7637d98a33491d75c75b1c817c25..a4b264104a5de904d8f91c8b3dca42cb8857dc99 100644
 --- a/cjs/src/queue.js
@@ -867,7 +941,7 @@ index 8438f5da92cf7637d98a33491d75c75b1c817c25..a4b264104a5de904d8f91c8b3dca42cb
        const out = xs[index++]
  
 diff --git a/src/connection.js b/src/connection.js
-index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..701acb4708289d6a80e5a1113465e2dea23a8306 100644
+index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..0432baf9502d09a43157e8e1dfb023b1b7e1dcdb 100644
 --- a/src/connection.js
 +++ b/src/connection.js
 @@ -75,6 +75,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -1025,7 +1099,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..701acb4708289d6a80e5a1113465e2de
      idleTimer.cancel()
      lifeTimer.cancel()
      connectTimer.cancel()
-@@ -450,7 +534,22 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -450,7 +534,24 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      if (initial)
        return reconnect()
  
@@ -1033,7 +1107,9 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..701acb4708289d6a80e5a1113465e2de
 +    // BLO-52499: settle and forget everything the dead session held; the next
 +    // session's startup ReadyForQuery would otherwise consume it. A stashed
 +    // FATAL (57P01) rejected the next caller's first query, a leftover `query`
-+    // was resolved with the startup's empty result, a mid-DataRow `rows` offset
++    // made ErrorResponse stash a FATAL from the next session's startup instead of
++    // rejecting `initial` with it, so closed() looped on reconnect and the caller
++    // hung, a mid-DataRow `rows` offset
 +    // the next result, and an ended COPY's `final` fired on the next session's
 +    // first CommandComplete. Not gated on !hadError: on ECONNRESET, Node runs
 +    // microtasks between 'error' and 'close', so a statement written in that gap
@@ -1049,8 +1125,15 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..701acb4708289d6a80e5a1113465e2de
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -564,10 +663,15 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
-         return fetchArrayTypes()
+@@ -561,13 +662,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+ 
+       if (needsTypes) {
+         initial.reserve && (initial = null)
+-        return fetchArrayTypes()
++        // BLO-52499: closed() rejects the type query when the session dies under
++        // it, and nothing awaits this promise, so that rejection was unhandled.
++        // The next session fetches the types again (connected() resets needsTypes).
++        return fetchArrayTypes().catch(noop)
        }
  
 -      initial && !initial.reserve && execute(initial)
@@ -1067,7 +1150,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..701acb4708289d6a80e5a1113465e2de
      }
  
      while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-@@ -837,13 +941,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -837,13 +946,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    async function PortalSuspended() {
@@ -1090,7 +1173,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..701acb4708289d6a80e5a1113465e2de
        query.reject(err)
      }
 diff --git a/src/index.js b/src/index.js
-index c7fba3dace20173f4cb13f3f138bb6d213b43683..01d1da6be88d816eff4be3f3049c55d82d354471 100644
+index c7fba3dace20173f4cb13f3f138bb6d213b43683..6ce8f04813b5e98feaf0e4818b8466d3c2ab1e8a 100644
 --- a/src/index.js
 +++ b/src/index.js
 @@ -74,6 +74,18 @@ function Postgres(a, b) {
@@ -1217,7 +1300,7 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..01d1da6be88d816eff4be3f3049c55d8
    function move(c, queue) {
      c.queue.remove(c)
      queue.push(c)
-@@ -420,10 +471,17 @@ function Postgres(a, b) {
+@@ -420,10 +471,18 @@ function Postgres(a, b) {
  
    function onclose(c, e) {
      move(c, closed)
@@ -1229,14 +1312,15 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..01d1da6be88d816eff4be3f3049c55d8
 +    // BLO-52499: a queued reserve() waiter is only the reconnect's trigger, as in
 +    // reserve()'s own cold path: it stays in `queries` for onopen() to serve.
 +    // Shifting it out made it the reconnect's `initial`, which the handshake
-+    // drops for a reserve() waiter, so the waiter was in neither place and never
-+    // settled. Upstream only settled it by accident, by rejecting it with the
-+    // dead session's stashed FATAL, which closed() no longer carries over.
++    // drops for a reserve() waiter, so the waiter was in neither place. Upstream
++    // settled it only by accident, when the dead session had stashed a FATAL to
++    // reject it with, and otherwise hung it. closed() no longer carries that
++    // FATAL over.
 +    queries.length && connect(c, queries.peek().reserve ? queries.peek() : queries.shift())
    }
  }
  
-@@ -444,13 +502,18 @@ function parseOptions(a, b) {
+@@ -444,13 +503,18 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -1257,7 +1341,7 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..01d1da6be88d816eff4be3f3049c55d8
      max_pipeline    : 100,
      backoff         : backoff,
 diff --git a/src/query.js b/src/query.js
-index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..74e2d05eeabcd700df1e7ef7c56d992b05b167b5 100644
+index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..c6327a8d7ac56ced88511b62c79ce8fe24273c77 100644
 --- a/src/query.js
 +++ b/src/query.js
 @@ -50,7 +50,25 @@ export class Query extends Promise {
@@ -1287,6 +1371,33 @@ index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..74e2d05eeabcd700df1e7ef7c56d992b
    }
  
    simple() {
+@@ -84,9 +102,17 @@ export class Query extends Promise {
+       return (this.cursorFn = fn, this)
+ 
+     let prev
++      , error
+     return {
+       [Symbol.asyncIterator]: () => ({
+         next: () => {
++          // BLO-52499: a rejection that lands while the caller holds a batch hits
++          // a promise already resolved, and it also clears `active`, so the next
++          // next() reported a clean end and the rows so far passed for the whole
++          // result. Keep it and throw it here instead.
++          if (error)
++            return Promise.reject(error)
++
+           if (this.executed && !this.active)
+             return { done: true }
+ 
+@@ -97,7 +123,7 @@ export class Query extends Promise {
+               return new Promise(r => prev = r)
+             }
+             this.resolve = () => (this.active = false, resolve({ done: true }))
+-            this.reject = x => (this.active = false, reject(x))
++            this.reject = x => (this.active = false, error = x, reject(x))
+           })
+           this.execute()
+           return promise
 diff --git a/src/queue.js b/src/queue.js
 index c4ef97164f057db99dce1b9af3401dbb1af37e31..a741ae31caca18139befcb74634b9b80bb397dee 100644
 --- a/src/queue.js
