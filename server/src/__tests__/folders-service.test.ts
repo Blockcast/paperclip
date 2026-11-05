@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { eq, sql } from "drizzle-orm";
 import {
   folderSlugSchema,
@@ -443,5 +443,59 @@ describeEmbeddedPostgres("folder service", () => {
       message: "Move or delete nested folders first",
     });
     await expect(svc.getFolder(companyId, parent.id)).resolves.toMatchObject({ id: parent.id });
+  });
+
+  it("reconciles settled bundled categories without the company folder lock (BLO-52499)", async () => {
+    const companyId = await seedCompany();
+    const svc = folderService(db);
+    const category = await svc.ensureBundledCategory(companyId, "Software Development");
+    const empty = await svc.ensureBundledCategory(companyId, "Initial");
+    const within = <T>(promise: Promise<T>, ms: number) => Promise.race([
+      promise,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`still blocked after ${ms} ms`)), ms)),
+    ]);
+
+    // Another folder mutation holds the company lock for the whole test.
+    let releaseLock!: () => void;
+    const holdLock = new Promise<void>((resolve) => { releaseLock = resolve; });
+    let markLockAcquired!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => { markLockAcquired = resolve; });
+    const blocker = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:folders:${companyId}`}, 0))`);
+      markLockAcquired();
+      await holdLock;
+    });
+    try {
+      await Promise.race([lockAcquired, blocker]);
+
+      // Nothing to write: the read-path check and a no-op prune return without
+      // queueing on the lock; a pending rename reads as "not current".
+      await expect(within(svc.currentBundledCategory(companyId, "Software Development"), 5_000))
+        .resolves.toMatchObject({ id: category.id, path: "bundled/software-development" });
+      await expect(within(svc.currentBundledCategory(companyId, "software-development"), 5_000))
+        .resolves.toBeNull();
+      await expect(within(svc.pruneEmptyBundledCategories(companyId, ["Software Development", "Initial"]), 5_000))
+        .resolves.toBeUndefined();
+
+      // Something to write -- and every ensure, since installs file new skills
+      // into the folder -- still waits for the lock.
+      const rename = svc.ensureBundledCategory(companyId, "software-development");
+      const prune = svc.pruneEmptyBundledCategories(companyId, ["Software Development"]);
+      const settledEnsure = svc.ensureBundledCategory(companyId, "Initial");
+      await vi.waitFor(async () => {
+        const [row] = await db.execute<{ waiting: number }>(
+          sql`select count(*)::int as waiting from pg_locks where locktype = 'advisory' and not granted`,
+        );
+        expect(row?.waiting).toBe(3);
+      }, { interval: 20, timeout: 5_000 });
+      releaseLock();
+      await expect(rename).resolves.toMatchObject({ id: category.id, name: "software-development" });
+      await prune;
+      await settledEnsure;
+      expect(await svc.getFolder(companyId, empty.id)).toBeNull();
+    } finally {
+      releaseLock();
+      await blocker;
+    }
   });
 });
