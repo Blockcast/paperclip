@@ -169,6 +169,17 @@ A contended lease raises `ExternalRuntimeIsolationConflictError`
 (`external_runtime_isolation_conflict`) and the run defers rather than
 proceeding — fail-closed.
 
+That defer is **not free**, and the cost was unmeasurable until PEN-5684. The
+conflict is raised inside `bindExternalRuntimeReservationIsolation`, which runs
+*after* `claimQueuedRun` has stamped `startedAt` and moved the row to `running`
+— so the loser rolls back a complete dispatch cycle, and
+`deferRunForK8sIsolationConflict` then nulls `startedAt` and re-stamps
+`queuedAt`. The row afterwards reads as "never ran", and the ≤300 s re-stamp
+cadence is also what stops `coalesce(queued_at, created_at)` age gauges from
+ever satisfying a 1-hour predicate on a multi-hour wait (PEN-5310). Read
+`paperclip_k8s_isolation_conflict_deferrals_total` for that cost; see
+[Reading the two deferral labels](#reading-the-two-deferral-labels).
+
 ## Observability
 
 Exposed on `/metrics` (`server/src/services/metrics.ts`):
@@ -178,7 +189,9 @@ Exposed on `/metrics` (`server/src/services/metrics.ts`):
 | `claude_k8s_concurrent_run_blocked_total{agent_id,reason,isolation_mode}` | slot-ceiling refusals. Labels are allow-listed, so cardinality is bounded by roster size |
 | `paperclip_k8s_isolated_run_started_total` | the paired positive control — isolated starts that were *not* blocked. Read the two together; a blocked counter that merely stopped is ambiguous alone |
 | `paperclip_agent_dispatch_declined_total{agent_id,reason}` | every other reason dispatch declined a queued run (PEN-3607). `agent_id="unknown"` here means attribution was collapsed **by design**, not that it was lost — the opposite of the same label value on `paperclip_heartbeat_run_failed_total` — but only on the four reasons listed next. The contrast is per-reason, not per-metric: on this metric's other, attributed reasons an `unknown` means a genuine roster miss, same as on `paperclip_heartbeat_run_failed_total`. Four reasons always collapse: `dispatch_stopped`, `api_tier_fence` and `scheduling_suppressed` (process-wide guards that fire before the agent row loads, so they pass no company to scope the roster against) and `agent_missing` (the row does not exist, so no roster can contain it — read that one from the logs). A collapsed reason is therefore a **fleet-wide total**; aggregate the other side before comparing it to a single seat (PEN-4532) |
-| `paperclip_external_runtime_reservation_events_total` | lease transitions: `reserved`, `contended`, `launching`, `launched`, `released`, `name_mismatch` |
+| `paperclip_external_runtime_reservation_events_total` | lease transitions: `reserved`, `contended`, `launching`, `launched`, `released`, `name_mismatch`. ⚠️ `contended` is the **slot-pool** refusal on `external_runtime_reservations_active_slot_idx` — a cheap pre-claim refusal. It is *not* the isolation-writer conflict; for that read the next two rows, and never sum the two |
+| `paperclip_k8s_isolation_conflict_deferrals_total{key_shape,cause}` | dispatch cycles **burned on rollback** by an isolation-writer conflict (PEN-5684). Each increment is a completed `queued → claim → running → conflict → queued` cycle, so it is capacity spent, not a refusal avoided. Invisible everywhere else: the defer resets `startedAt` to null and re-stamps `queuedAt` |
+| `paperclip_k8s_isolation_conflict_deferral_attempt{key_shape}` | how DEEP the thrash goes. The counter cannot tell 40 runs deferred once from one run deferred 40 times, and the two are different problems |
 | `paperclip_external_runtime_reservations_active` | live leases |
 | `paperclip_external_runtime_reservation_oldest_age_seconds` | oldest live lease — a lease that never releases shows up here first |
 | `paperclip_external_runtime_reservation_stranded_oldest_age_seconds` | stranded leases specifically (labelled; prefer this for alerting over the unlabelled gauge above) |
@@ -200,6 +213,45 @@ teardown, and a stuck `reserved` row is a leaked slot, not a missing Job:
 SELECT state, count(*) FROM external_runtime_reservations
 WHERE released_at IS NULL GROUP BY state;
 ```
+
+### Reading the two deferral labels
+
+Both labels on `paperclip_k8s_isolation_conflict_deferrals_total` are bounded
+allow-lists (`normalizeK8sIsolationKeyShape` / `normalizeK8sIsolationConflictCause`
+in `metrics.ts`); isolation keys carry UUIDs and are never used as label values.
+
+**`cause` separates the cost of fairness from the cost of contention.** They are
+indistinguishable from `conflictingRunId` alone, because all three refusals
+populate it:
+
+- `active_writer` — another live run owns the single-writer index. The tree
+  really is busy; serializing is doing its job.
+- `elder_waiter` — nobody owns the key, but an **older live waiter** is queued
+  on it, so this run yields on seniority (BLO-48769). The tree is frequently
+  free. This is fairness working as designed, and it is paid for in exactly
+  these rolled-back cycles: a young run can burn many of them losing the same
+  race while the elder's backoff runs down. A high `elder_waiter` rate is not a
+  bug report — it is the bill for oldest-first admission, and it is the number
+  to weigh against reverting to first-to-bind.
+- `legacy_writer` — an unreleased pre-migration `legacy` reservation is blocking
+  every keyed bind. Rare, and a different operator response (find and release it).
+
+**`key_shape` keeps remedies from being scored against the wrong population.**
+`resolveWorkspaceWriterTreeKey` emits two tree shapes under one prefix:
+
+- `workspace-tree:project-primary` — the ONE shared `project_primary` checkout
+  of a project. Every run of every seat that resolves to it contends here.
+- `workspace-tree:per-issue` — an own tree (worktree / isolated), keyed per issue.
+
+plus the non-tree keys `workspace` (an explicitly reused persisted workspace,
+which several issues may share), `agent-shared`, and `run`.
+
+A live census on 2026-11-05 found the shared `project_primary` key was only
+**5 of 9** contending rows (56%); the other 44% were on `workspace:<uuid>` across
+three distinct workspaces. A fallback-to-worktree remedy scoped to
+`project_primary` would have moved just over half the population and measured as
+"no improvement" against an undifferentiated total. Split by `key_shape` before
+claiming a change worked.
 
 ### Failure signatures
 

@@ -488,6 +488,7 @@ import {
   CAVEMAN_PROXY_NOT_READY_ERROR_CODE,
   recordTransientRetryFloorDisposition,
   recordDepBlockedRetryDispersion,
+  recordK8sIsolationConflictDeferral,
 } from "./metrics.js";
 import type {
   DispatchDeclineReason,
@@ -35395,6 +35396,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   //
   // Revisit if that log ever shows attempts climbing without a distinct
   // conflictingRunId, which would mean the scope is never actually released.
+  //
+  // PEN-5684 AMENDS THE LAST BULLET. "Already observable" was true per RUN and
+  // false per FLEET, and the gap was not academic: a live census on 2026-11-05
+  // found 4 seats holding 52 rolled-back cycles across four keys in two shapes,
+  // a figure that had to be assembled by fetching nine runs individually
+  // because no aggregate existed. The run event and the log line answer "what
+  // happened to THIS run"; neither answers "how much dispatch capacity is this
+  // burning", which is the question that decides whether the contention is
+  // worth removing. `recordK8sIsolationConflictDeferral` below closes that, and
+  // deliberately labels by key SHAPE and CAUSE: the census found the shared
+  // `project_primary` checkout was only 56% of the contending population, so a
+  // single undifferentiated total would have scored a `project_primary`-only
+  // remedy as "no improvement".
+  //
+  // It does NOT make the attempt count bounded, and is not an argument that it
+  // should be — the reasoning above still stands. It makes the unbounded choice
+  // measurable, so the next revisit has a number instead of a sample.
   async function deferRunForK8sIsolationConflict(
     run: typeof heartbeatRuns.$inferSelect,
     conflict: ExternalRuntimeIsolationConflictError,
@@ -35461,6 +35479,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       message: "Deferred run because another active run owns its mutable K8s isolation scope",
       payload: {
         isolationKey: conflict.isolationKey,
+        conflictCause: conflict.conflictCause,
         conflictingRunId: conflict.conflictingRunId,
         retryAttempt,
         retryAt: retryAt.toISOString(),
@@ -35482,11 +35501,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
     publishRunLifecyclePluginEvent(deferredRun);
+    // PEN-5684: emitted only after the re-queue UPDATE has actually landed, so
+    // the counter measures rolled-back cycles and not conflict throws. The two
+    // differ: the UPDATE is guarded on `status = running`, so a run finalized
+    // underneath this path returns null above without ever being re-queued, and
+    // counting that as a burned cycle would overstate the cost.
+    const deferralLabels = recordK8sIsolationConflictDeferral({
+      isolationKey: conflict.isolationKey,
+      cause: conflict.conflictCause,
+      retryAttempt,
+    });
     logger.info(
       {
         runId: deferredRun.id,
         agentId: deferredRun.agentId,
         isolationKey: conflict.isolationKey,
+        // The same bounded values the metric is labeled with, so a series on
+        // the dashboard can be turned into a log query without re-deriving them.
+        isolationKeyShape: deferralLabels.keyShape,
+        conflictCause: deferralLabels.cause,
         conflictingRunId: conflict.conflictingRunId,
         retryAttempt,
         retryAt: retryAt.toISOString(),

@@ -1500,6 +1500,130 @@ export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_complete
 export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_runtime_reservation_events_total";
 export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
 export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_oldest_age_seconds";
+/**
+ * PEN-5684: the K8s isolation-WRITER conflict is the one dispatch rollback that
+ * leaves no measurand behind.
+ *
+ * `deferRunForK8sIsolationConflict` pushes an already-claimed `running` row
+ * back to `queued` with `startedAt: null` and re-stamps `queuedAt`, so the
+ * burned cycle is invisible twice over: `startedAt` reads as "never ran", and
+ * the re-stamp resets `coalesce(queued_at, created_at)` at most 300 s apart,
+ * which is precisely what makes the PEN-5310 age gauges structurally unable to
+ * satisfy a 1-hour predicate on a multi-hour wait. Before this counter the only
+ * record of a rolled-back cycle was a per-run log line and a run event -- both
+ * per-run, neither a fleet measurand, so "how much dispatch capacity is this
+ * burning" could not be asked at all.
+ *
+ * `paperclip_external_runtime_reservation_events_total{event="contended"}` does
+ * NOT already cover this, and the names are close enough that it is worth
+ * saying why. That label is incremented by the slot-POOL claim path
+ * (`claimRunWithExternalRuntimeSlotOutcome`), a cheap PRE-claim refusal on
+ * `external_runtime_reservations_active_slot_idx`. The isolation-writer
+ * conflict is raised later, inside `bindExternalRuntimeReservationIsolation`,
+ * after `claimQueuedRun` has already stamped `startedAt` and moved the row to
+ * `running` -- a completed `queued -> claim -> running -> conflict -> queued`
+ * cycle that was rolled back. The two are different costs on different indexes
+ * and must not be summed.
+ *
+ * Cardinality: both labels are coerced to fixed allow-lists before they reach
+ * the registry (`normalizeK8sIsolationKeyShape` /
+ * `normalizeK8sIsolationConflictCause`). Isolation keys carry UUIDs and are
+ * therefore never used as label values directly.
+ */
+export const K8S_ISOLATION_CONFLICT_DEFERRALS_METRIC =
+  "paperclip_k8s_isolation_conflict_deferrals_total";
+/**
+ * PEN-5684: the DEPTH of the thrash, which the counter alone cannot show. A
+ * saturated backoff ladder (`min(300 s, 15 s * 2^(n-1))`, saturating at attempt
+ * 6) means one contended run can reach attempt 48 while another passes on its
+ * first try, and a rate() over the counter renders both as the same flat line.
+ * Buckets run to 55 so the measured tail (attempt 48 on 2026-11-02) lands below
+ * the +Inf bucket and stays readable as a quantile.
+ */
+export const K8S_ISOLATION_CONFLICT_DEFERRAL_ATTEMPT_METRIC =
+  "paperclip_k8s_isolation_conflict_deferral_attempt";
+
+const K8S_ISOLATION_CONFLICT_DEFERRAL_ATTEMPT_BUCKETS = [1, 2, 3, 5, 8, 13, 21, 34, 55] as const;
+
+const UNKNOWN_K8S_ISOLATION_KEY_SHAPE = "other";
+
+/**
+ * Isolation-key heads that are a complete shape on their own -- everything
+ * after the first `:` is an id and is discarded. `workspace-tree` is absent
+ * deliberately: it needs a second segment to be meaningful, and is handled
+ * explicitly in {@link normalizeK8sIsolationKeyShape}.
+ */
+const KNOWN_K8S_ISOLATION_KEY_HEADS: ReadonlySet<string> = new Set([
+  // An explicitly reused persisted workspace. Already names a tree, so
+  // `resolveK8sRunIsolationIdentity` leaves it run-unique rather than widening.
+  "workspace",
+  // The agent home, for a run that resolves to no project checkout.
+  "agent-shared",
+  // Run-unique: stateless PR review, and concurrency-forced ephemeral runs.
+  "run",
+  // Pre-bind placeholders. Neither should reach a conflict; counted rather than
+  // folded into "other" so that if one ever does, it is named.
+  "legacy",
+  "pending",
+]);
+
+/**
+ * Bounded label for the equivalence class of tree a contended run was waiting
+ * on, derived from the reservation key without echoing its UUIDs.
+ *
+ * The `workspace-tree` split is the point of this function, not an incidental
+ * detail. `resolveWorkspaceWriterTreeKey` emits exactly two tree shapes --
+ * `project-primary:<projectWorkspaceId>`, the ONE shared project checkout every
+ * seat serializes on, and `<projectWorkspaceId|no-project-workspace>:<issueId>`,
+ * a per-issue own tree -- and they have different remedies. PEN-5684's live
+ * census found the shared-checkout key was only 5 of 9 contending rows (56%);
+ * the other 44% were contending on `workspace:<uuid>` across three distinct
+ * workspaces. A remedy scoped to `project_primary` alone would have measured as
+ * "no improvement" against an undifferentiated total. Keeping the shapes apart
+ * is what makes that mistake impossible to repeat from the dashboard.
+ */
+export function normalizeK8sIsolationKeyShape(isolationKey: string | null | undefined): string {
+  const key = typeof isolationKey === "string" ? isolationKey.trim() : "";
+  if (!key) return UNKNOWN_K8S_ISOLATION_KEY_SHAPE;
+  const segments = key.split(":");
+  const head = segments[0] ?? "";
+  if (head === "workspace-tree") {
+    return segments[1] === "project-primary"
+      ? "workspace-tree:project-primary"
+      : "workspace-tree:per-issue";
+  }
+  return KNOWN_K8S_ISOLATION_KEY_HEADS.has(head) ? head : UNKNOWN_K8S_ISOLATION_KEY_SHAPE;
+}
+
+const UNKNOWN_K8S_ISOLATION_CONFLICT_CAUSE = "other";
+
+/**
+ * Which of `bindExternalRuntimeReservationIsolation`'s three refusals rolled
+ * this cycle back. Separating them is what lets the cost of FAIRNESS be told
+ * apart from the cost of CONTENTION, which is otherwise unanswerable:
+ *
+ * - `active_writer` -- another live run holds
+ *   `external_runtime_reservations_active_isolation_writer_idx` for this key.
+ *   Genuine contention; the tree really is busy.
+ * - `elder_waiter` -- nobody holds the key, but an OLDER live waiter is queued
+ *   on it, so this run yields on seniority (BLO-48769). The tree may well be
+ *   free. This is fairness working as designed, and it is paid for in exactly
+ *   these rolled-back cycles -- a young run can burn many of them losing the
+ *   same race repeatedly while the elder's backoff runs down.
+ * - `legacy_writer` -- an unreleased pre-migration `legacy` reservation is
+ *   blocking every keyed bind. Rare, and a different operator response.
+ */
+const KNOWN_K8S_ISOLATION_CONFLICT_CAUSES: ReadonlySet<string> = new Set([
+  "active_writer",
+  "elder_waiter",
+  "legacy_writer",
+]);
+
+export function normalizeK8sIsolationConflictCause(cause: string | null | undefined): string {
+  return typeof cause === "string" && KNOWN_K8S_ISOLATION_CONFLICT_CAUSES.has(cause)
+    ? cause
+    : UNKNOWN_K8S_ISOLATION_CONFLICT_CAUSE;
+}
 // BLO-21116: age of the oldest `queued` heartbeatRuns row per agent. A
 // dispatchable run sitting in `queued` for a long time is exactly the
 // "invisible strand" this issue reports -- it looks like an active issue with
@@ -5685,6 +5809,8 @@ let heartbeatTimerChecked: Counter | null = null;
 let heartbeatTimerEnqueued: Counter | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
+let k8sIsolationConflictDeferrals: Counter<"key_shape" | "cause"> | null = null;
+let k8sIsolationConflictDeferralAttempt: Histogram<"key_shape"> | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
 let queuedRunAgeMetricsRefreshSuccess: Gauge | null = null;
@@ -5915,6 +6041,8 @@ function ensureRegistry(): {
   heartbeatTimerEnqueuedCounter: Counter;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
   externalRuntimeReservationEventsCounter: Counter<"event">;
+  k8sIsolationConflictDeferralsCounter: Counter<"key_shape" | "cause">;
+  k8sIsolationConflictDeferralAttemptHistogram: Histogram<"key_shape">;
   externalRuntimeReservationsActiveGauge: Gauge;
   externalRuntimeReservationOldestAgeGauge: Gauge;
   externalRuntimeReservationsReleasePendingGauge: Gauge;
@@ -6084,6 +6212,8 @@ function ensureRegistry(): {
     || !heartbeatTimerEnqueued
     || !agentZeroTokenCompletedRunStreak
     || !externalRuntimeReservationEvents
+    || !k8sIsolationConflictDeferrals
+    || !k8sIsolationConflictDeferralAttempt
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
     || !queuedRunAgeMetricsRefreshSuccess
@@ -6484,6 +6614,30 @@ function ensureRegistry(): {
       name: EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC,
       help: "Count of durable external-runtime reservation lifecycle transitions.",
       labelNames: ["event"],
+      registers: [registry],
+    });
+    k8sIsolationConflictDeferrals = new Counter({
+      name: K8S_ISOLATION_CONFLICT_DEFERRALS_METRIC,
+      help:
+        "Count of K8s dispatch cycles rolled back by an isolation-writer conflict (PEN-5684). "
+        + "Each increment is a completed queued -> claim -> running -> conflict -> queued cycle, "
+        + "not a pre-claim refusal: the run reached `running` and was pushed back with "
+        + "startedAt reset to null, so it is invisible in startedAt and in every queued-age gauge. "
+        + "cause splits fairness (elder_waiter) from genuine contention (active_writer). "
+        + "Distinct from reservation_events_total{event=\"contended\"}, which counts the cheap "
+        + "slot-pool refusal on a different index.",
+      labelNames: ["key_shape", "cause"],
+      registers: [registry],
+    });
+    k8sIsolationConflictDeferralAttempt = new Histogram({
+      name: K8S_ISOLATION_CONFLICT_DEFERRAL_ATTEMPT_METRIC,
+      help:
+        "Retry attempt number at the moment a run was deferred behind an isolation writer "
+        + "(PEN-5684). The counter alone cannot distinguish 40 runs deferred once from one run "
+        + "deferred 40 times, and the backoff saturates at 300 s by attempt 6, so a deep tail is "
+        + "a run re-stamping queuedAt every 5 min indefinitely.",
+      labelNames: ["key_shape"],
+      buckets: [...K8S_ISOLATION_CONFLICT_DEFERRAL_ATTEMPT_BUCKETS],
       registers: [registry],
     });
     externalRuntimeReservationsActive = new Gauge({
@@ -9101,6 +9255,8 @@ function ensureRegistry(): {
     heartbeatTimerEnqueuedCounter: heartbeatTimerEnqueued,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
+    k8sIsolationConflictDeferralsCounter: k8sIsolationConflictDeferrals,
+    k8sIsolationConflictDeferralAttemptHistogram: k8sIsolationConflictDeferralAttempt,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
     queuedRunAgeMetricsRefreshSuccessGauge: queuedRunAgeMetricsRefreshSuccess,
@@ -9884,6 +10040,31 @@ export function recordExternalRuntimeReservationEvent(event: string): string {
   const normalized = EXTERNAL_RUNTIME_RESERVATION_EVENTS.has(event) ? event : "other";
   ensureRegistry().externalRuntimeReservationEventsCounter.inc({ event: normalized });
   return normalized;
+}
+
+/**
+ * PEN-5684: record one rolled-back dispatch cycle.
+ *
+ * Returns the normalized labels so the caller can put the SAME bounded values
+ * on its log line and run event. That is deliberate: when the dashboard shows a
+ * climbing `workspace-tree:project-primary` / `elder_waiter` series, the next
+ * question is always "which runs", and the answer has to be greppable with the
+ * exact string the graph is drawn from rather than a near-miss of it.
+ */
+export function recordK8sIsolationConflictDeferral(input: {
+  isolationKey: string | null | undefined;
+  cause: string | null | undefined;
+  retryAttempt: number;
+}): { keyShape: string; cause: string } {
+  const keyShape = normalizeK8sIsolationKeyShape(input.isolationKey);
+  const cause = normalizeK8sIsolationConflictCause(input.cause);
+  const metrics = ensureRegistry();
+  metrics.k8sIsolationConflictDeferralsCounter.inc({ key_shape: keyShape, cause });
+  metrics.k8sIsolationConflictDeferralAttemptHistogram.observe(
+    { key_shape: keyShape },
+    Math.max(1, Math.floor(Number.isFinite(input.retryAttempt) ? input.retryAttempt : 1)),
+  );
+  return { keyShape, cause };
 }
 
 export function setExternalRuntimeReservationMetrics(input: {
@@ -12591,6 +12772,8 @@ export function __resetMetricsForTest(): void {
   agentZeroTokenCompletedRunStreak = null;
   zeroTokenStreakAdapterByAgentId.clear();
   externalRuntimeReservationEvents = null;
+  k8sIsolationConflictDeferrals = null;
+  k8sIsolationConflictDeferralAttempt = null;
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
   queuedRunAgeMetricsRefreshSuccess = null;
