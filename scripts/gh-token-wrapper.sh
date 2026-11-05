@@ -551,6 +551,39 @@ auth_check_mount_generation() {
   fi
 }
 
+# PEN-5641: does this verdict govern `mcp__github__*` as well?
+#
+# It did not, and nothing said so. `gh`, `curl` and `git` all re-read the token
+# file per invocation; `github-mcp-server` reads GITHUB_PERSONAL_ACCESS_TOKEN
+# once at startup and is long-lived, so after a rotation it keeps presenting a
+# dead generation while every path this check measures is green. On
+# 2026-11-05T04:49Z that produced the worst possible pairing: this subcommand
+# printing `OK` while every `mcp__github__*` tool returned `401 Bad
+# credentials` — the fleet's designated credential oracle contradicting the
+# agent's own tooling, which is PEN-5241's non-diagnostic 401 reappearing
+# through a channel this check never covered.
+#
+# The fix for that is the loopback token proxy the MCP server is pointed at,
+# which re-reads the same mount per request. Its presence is therefore exactly
+# the question "is the MCP channel covered by the verdict below", and it is
+# answerable from inside the pod with one unauthenticated loopback GET.
+#
+# Probes the marker rather than merely a 200: something else holding :80 would
+# answer, and reporting an unrelated listener as the credential proxy is the
+# same class of confidently-wrong diagnosis this subcommand exists to end.
+GITHUB_MCP_PROXY_URL="${GH_TOKEN_WRAPPER_MCP_PROXY_URL:-http://127.0.0.1/__paperclip/github-mcp-token-proxy}"
+GITHUB_MCP_PROXY_MARKER="paperclip-github-mcp-token-proxy"
+
+auth_check_mcp_channel() {
+  # Short timeout: this is loopback, and a diagnostic must not hang on it.
+  mcp_body="$(curl -q -sS --max-time 3 "${GITHUB_MCP_PROXY_URL}" 2>/dev/null)" || mcp_body=""
+  if [ "${mcp_body}" = "${GITHUB_MCP_PROXY_MARKER}" ]; then
+    printf 'covered\n'
+  else
+    printf 'not-covered\n'
+  fi
+}
+
 # The ONE implementation of the GH_SEAT_TOKEN_VALUE trim, shared by the real
 # credential branch below and by `paperclip_auth_check`'s report of what that
 # branch would do. It is a function rather than two matching copies because the
@@ -706,6 +739,13 @@ paperclip_auth_check() {
     check_cfg=""
   fi
 
+  mcp_channel_state="$(auth_check_mcp_channel)"
+  if [ "${mcp_channel_state}" = covered ]; then
+    mcp_channel="covered — the MCP server reaches GitHub through the loopback token proxy, which re-reads this same mount on every request, so the verdict below governs \`mcp__github__*\` too (PEN-5641)"
+  else
+    mcp_channel="NOT COVERED — no token proxy is listening, so \`github-mcp-server\` is pinned to whichever generation it started with. The verdict below is measured on the file-reading path ONLY. After a rotation, \`mcp__github__*\` returns \`401 Bad credentials\` while gh/curl/git stay green: that is EXPECTED and is NOT a credential fault. Use gh/curl/git; the MCP GitHub tools recover only when their server restarts (PEN-5641)"
+  fi
+
   if [ "${anon_code}" = 000 ]; then
     github_reachable="NO (unauthenticated ${GITHUB_API_BASE}/rate_limit did not complete)"
   else
@@ -774,7 +814,26 @@ paperclip_auth_check() {
   printf '  github-reachable:   %s\n' "${github_reachable}"
   printf '  authenticated:      /installation/repositories -> %s, x-ratelimit-limit %s, remaining %s, reset %s\n' \
     "${auth_code}" "${auth_limit}" "${auth_remaining}" "$(auth_check_reset_label "${auth_reset}")"
+  printf '  credential-channel: gh / curl / git (all re-read the mount per invocation)\n'
+  printf '  mcp-channel:        %s\n' "${mcp_channel}"
   printf '  verdict:            %s\n' "${verdict}"
+  # PEN-5641 Finding 2. REJECTED is the correct INSTANTANEOUS verdict and is
+  # also exactly what a mid-rotation mount window looks like from inside the
+  # pod — one was measured closing by itself in 93 seconds with no
+  # intervention. Standing a run down on the instantaneous reading spends a
+  # wake and escalates a condition that cleared before the escalation can be
+  # read, so the distinguishing test is printed here, beside the two fields it
+  # needs, rather than left for an agent to reconstruct mid-incident. Only
+  # case 4 is PEN-5239's shape: that row's whole evidence was a generation
+  # "written by the kubelet at 01:52:54Z and still being refused at 02:01:21Z,
+  # unchanged".
+  if [ "${verdict_code}" = 1 ]; then
+    printf '  rotation-vs-outage: a REJECTED reading alone does NOT establish an outage. Do not escalate on this one sample:\n'
+    printf '                        1. note mount-generation and token-sha256 above\n'
+    printf '                        2. do other work for a few minutes, then re-run this check\n'
+    printf '                        3. generation ADVANCED and now OK -> it was a rotation window, it closed itself; proceed, escalate nothing\n'
+    printf '                        4. generation UNCHANGED across several minutes, still REJECTED -> a real outage (PEN-5239); escalate\n'
+  fi
   exit "${verdict_code}"
 }
 

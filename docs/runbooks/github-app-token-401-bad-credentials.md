@@ -31,6 +31,8 @@ authenticated verdict. It reads no credential value into your output.
   token-sha256:       bf65aa6d
   github-reachable:   yes (unauthenticated /rate_limit -> 200, x-ratelimit-limit 60)
   authenticated:      /installation/repositories -> 200, x-ratelimit-limit 9500, remaining 4730, reset 2026-11-03T04:53:38Z (1793681618)
+  credential-channel: gh / curl / git (all re-read the mount per invocation)
+  mcp-channel:        covered — the MCP server reaches GitHub through the loopback token proxy, which re-reads this same mount on every request, so the verdict below governs `mcp__github__*` too (PEN-5641)
   verdict:            OK — valid GitHub App installation token (rate limit 9500/hr)
 ```
 
@@ -72,6 +74,58 @@ remaining**. Anything expressible as a GraphQL query still works for the whole
 exhaustion window — worth saying out loud, because the reflex on a 403 storm
 is to conclude the API is gone and park the run. `gh api graphql` and
 `gh pr view`-style reads that go through GraphQL are the way through.
+
+### 1b. `REJECTED` once is not an outage — check whether the generation moved (PEN-5641)
+
+`REJECTED` is the correct **instantaneous** verdict, and it is also exactly
+what a **mid-rotation mount window** looks like from inside the pod. One was
+measured on 2026-11-05 closing by itself in **93 seconds**, no intervention:
+
+| mount generation | `gh paperclip-auth-check` |
+|---|---|
+| `..2026_11_05_04_30_17` | `REJECTED` — `/installation/repositories` → 401 |
+| `..2026_11_05_04_31_50` | `OK` — valid installation token, 9550/hr |
+
+Standing a run down on the single sample spends a wake and escalates a
+condition that cleared before the escalation can be read. The check now prints
+the discriminator itself under a `rotation-vs-outage:` heading whenever it
+returns `REJECTED`:
+
+1. `OK` → proceed.
+2. `REJECTED` → note `mount-generation` and `token-sha256`, do other work for a
+   few minutes, re-run.
+3. Generation **advanced** and now `OK` → it was a rotation window; proceed,
+   escalate nothing.
+4. Generation **unchanged** across several minutes, still `REJECTED` → a real
+   outage; escalate.
+
+Only (4) is PEN-5239's shape. That row's evidence turned on precisely this —
+a generation *"written by the kubelet at 01:52:54Z and still being refused at
+02:01:21Z, **unchanged**"*. The `unchanged` is the whole finding.
+
+### 1c. Which channels the verdict governs (PEN-5641)
+
+`gh`, `curl` and `git` re-read the token file on **every** invocation, so they
+pick up each rotation. `github-mcp-server` does not: it is an upstream Go
+binary that reads `GITHUB_PERSONAL_ACCESS_TOKEN` once at startup and then runs
+for the whole session. Before PEN-5641 that produced the worst possible
+pairing — this oracle printing `OK` while every `mcp__github__*` tool returned
+`401 Bad credentials`, measured at 2026-11-05T04:49Z on URLs `curl` was
+answering `200`.
+
+The fix points the MCP server at a loopback proxy that re-reads the same mount
+per request, so both channels now share one credential. **Read the
+`mcp-channel:` line to know which situation you are in:**
+
+- `covered` → the verdict governs `mcp__github__*` as well.
+- `NOT COVERED` → the verdict governs the file-reading path **only**. After a
+  rotation, `mcp__github__*` returning `401 Bad credentials` while `gh`/`curl`
+  are green is **expected and is not a credential fault**. Use `gh`/`curl`/`git`;
+  the MCP GitHub tools recover when their server restarts.
+
+The proxy can be turned off without an image rollback by setting
+`PAPERCLIP_GITHUB_MCP_TOKEN_PROXY=0`, which restores the pre-PEN-5641
+behaviour; `mcp-channel:` then reports `NOT COVERED`, truthfully.
 
 ## 2. Healthy vs dead — read the right endpoint
 
