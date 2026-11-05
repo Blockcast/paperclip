@@ -3369,11 +3369,19 @@ function assertBag(fn, bag, known, required) {
     );
   }
   for (const key of required) {
-    if (key in bag) continue;
+    // `Array.isArray`, NOT `key in bag`: an explicit `undefined` satisfies `in`,
+    // and its later `.push` throws a BARE TypeError, which `repoRunner`'s catch
+    // reads as a listing failure and files under `unreadable` — the exact
+    // misfiling this conversion exists to remove. A cohort is only usable if it
+    // is an array, so that is what the boundary checks. (Ally review, PR#3415.)
+    if (Array.isArray(bag[key])) continue;
+    const got =
+      key in bag ? `is ${bag[key] === null ? "null" : typeof bag[key]}` : "was not supplied";
     throw new WiringError(
-      `${fn}: missing required option \`${key}\`. The by-reference cohorts carry no ` +
-        "default on purpose: a dropped key collects into an array the caller never reads, " +
-        "which reads downstream as an empty cohort and therefore as health.",
+      `${fn}: missing required option \`${key}\` — a by-reference cohort must be an array ` +
+        `and this one ${got}. The cohorts carry no default on purpose: a dropped key ` +
+        "collects into an array the caller never reads, which reads downstream as an empty " +
+        "cohort and therefore as health.",
     );
   }
 }
@@ -3682,8 +3690,13 @@ export const repoRunner = (options) => {
   // CALL SITE's syntax must re-anchor that probe in the same commit and keep
   // its mutation control live — the control is the only thing that identifies
   // WHICH occurrence the probe matched, and a probe that has quietly
-  // retargeted to a declaration still passes. See the call-site probes in
-  // `land-clean-prs.test.mjs`.
+  // retargeted to a declaration still passes. See the call-site probes in this
+  // module's sibling test file — referred to by description and NOT by its
+  // filename on purpose. `siblingScriptRefs` in the CI suite selector scans raw
+  // text INCLUDING comments, so spelling that name in any comment here adds the
+  // test file to every group's scan closure; the real-repo closure guard then
+  // reports that file's own fixture strings as uncovered reads of inert `doc/`
+  // and `scripts/` paths, and reds `policy` on a change that touched neither.
   assertBag("repoRunner", options, REPO_RUNNER_KEYS, REPO_RUNNER_REQUIRED_KEYS);
   const {
     apply,
