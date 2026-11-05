@@ -5982,7 +5982,9 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
               );
             });
           }
-          logger[result.posted ? "info" : "warn"](
+          // `coalesced` is healthy: another evaluation held this head and a
+          // re-evaluation is durably queued behind it.
+          logger[result.posted || result.reason === "coalesced" ? "info" : "warn"](
             { deliveryId, event: eventName, ...commentReviewGateTrigger, result },
             "github webhook comment-review gate check completed",
           );

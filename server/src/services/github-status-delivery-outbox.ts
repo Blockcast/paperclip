@@ -1,4 +1,4 @@
-import { and, eq, inArray, lt, sql } from "drizzle-orm";
+import { and, eq, inArray, lt, ne, sql } from "drizzle-orm";
 import {
   githubCommitStatusDeliveries,
   heartbeatRunEvents,
@@ -35,39 +35,52 @@ const RETRY_DELAYS_MS = [
   2 * 60 * 60_000,
 ];
 
-// How long a waiter may queue for the delivery advisory lock before giving up,
-// and how long a holder may sit idle-in-transaction (i.e. inside its external
-// GitHub calls) before Postgres terminates it and releases the lock. Both are
-// far above the normal critical-section cost — they exist to make pool
-// exhaustion recoverable, not to bound healthy work.
-const DELIVERY_LOCK_WAIT_TIMEOUT_MS = 30_000;
+// How long a holder may sit idle-in-transaction (i.e. inside its external
+// GitHub calls) before Postgres terminates it and releases the lock. Far above
+// the normal critical-section cost: it exists to make a wedged holder
+// recoverable, not to bound healthy work.
 const DELIVERY_LOCK_HOLD_TIMEOUT_MS = 120_000;
 
-/** Serialize the final read and external write for one GitHub status key. */
+// How long a coalesced re-evaluation, or a forced replay that found the key
+// held, waits for the holder to finish. Holds are typically seconds; a key
+// still held when the row comes due just pushes it back again.
+export const COALESCED_REEVALUATION_DELAY_MS = 15_000;
+
+/**
+ * Serialize the final read and external write for one GitHub status key.
+ *
+ * Returns `null`, without waiting, when another evaluation holds the key; the
+ * caller must leave durable follow-up work instead (BLO-52499). A blocking lock
+ * made every waiter pin a pooled connection for up to its 30 s lock_timeout
+ * while the holder made GitHub calls, and a waiter that timed out dropped its
+ * verdict.
+ */
 export async function withGithubStatusDeliveryLock<T>(
   db: Db,
   key: string,
   operation: (tx: DbTransaction) => Promise<T>,
-): Promise<T> {
+): Promise<T | null> {
   return db.transaction(async (tx) => {
-    // Bound both sides of the lock. The critical section performs external
-    // GitHub I/O (paginated list calls and status POSTs with retries), so the
-    // holder sits idle-in-transaction pinning a pool connection, and every
-    // waiter queued on an untimed pg_advisory_xact_lock pins one too. Without
-    // these bounds a hung GitHub call can exhaust the pool, and once exhausted
-    // the holder cannot finish, so the lock is never released.
+    // The critical section performs external GitHub I/O (paginated list calls
+    // and status POSTs with retries), so the holder sits idle-in-transaction
+    // pinning a pool connection. Bound it, or a hung GitHub call holds the key
+    // forever. ponytail: the holder still pins one connection per head in
+    // flight; a lease row held outside a transaction removes that if holders
+    // alone ever saturate the pool.
     //
     // set_config(..., true) is transaction-local; SET LOCAL cannot be
     // parameterized, so it is spelled this way deliberately.
     await tx.execute(
-      sql`select set_config('lock_timeout', ${`${DELIVERY_LOCK_WAIT_TIMEOUT_MS}ms`}, true)`,
-    );
-    await tx.execute(
       sql`select set_config('idle_in_transaction_session_timeout', ${`${DELIVERY_LOCK_HOLD_TIMEOUT_MS}ms`}, true)`,
     );
-    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${key}, 0))`);
+    const rows = await tx.execute(
+      sql`select pg_try_advisory_xact_lock(hashtextextended(${key}, 0)) as acquired`,
+    );
+    const row = Array.isArray(rows) ? (rows[0] as { acquired?: unknown } | undefined) : undefined;
+    if (row?.acquired !== true) return null;
     // Hand the transaction handle to the caller: taking a second pool
-    // connection here is what makes the exhaustion above reachable.
+    // connection inside the critical section can wedge the holder on a
+    // saturated pool.
     return operation(tx);
   });
 }
@@ -316,6 +329,27 @@ async function markTerminal(
   });
 }
 
+/**
+ * A forced replay found this head's status key held by a live evaluation.
+ * Requeue without spending an attempt: contention says nothing about whether
+ * delivery can succeed, and the holder is bounded by
+ * DELIVERY_LOCK_HOLD_TIMEOUT_MS. The in-lock freshness re-check runs again
+ * once the key is free.
+ */
+async function deferBehindLiveEvaluation(db: DbHandle, row: DeliveryRow): Promise<void> {
+  const now = new Date();
+  await db
+    .update(githubCommitStatusDeliveries)
+    .set({
+      status: "queued",
+      nextAttemptAt: new Date(now.getTime() + COALESCED_REEVALUATION_DELAY_MS),
+      lastError: "github_status_key_busy",
+      lastErrorKind: "transient",
+      updatedAt: now,
+    })
+    .where(deliveryClaimWhere(row));
+}
+
 async function retryOrFailDelivery(
   db: DbHandle,
   row: DeliveryRow,
@@ -445,7 +479,7 @@ async function processGateReevaluation(db: Db, row: DeliveryRow): Promise<void> 
   // from this module, and a static edge back would be a module-init cycle.
   const { runPrCommentReviewGateCheck } = await import("./pr-comment-review-gate.js");
   // Not inside withGithubStatusDeliveryLock: the check takes that same advisory
-  // lock itself, on a second pool connection, which would self-deadlock.
+  // lock itself, on a second pool connection, and would always find it held.
   const result = await runPrCommentReviewGateCheck({
     repoFullName: fencedRow.repoFullName,
     prNumber: fencedRow.prNumber,
@@ -467,6 +501,9 @@ async function processGateReevaluation(db: Db, row: DeliveryRow): Promise<void> 
     );
     return;
   }
+  // The gate found the head held and already re-armed this row behind the
+  // holder (enqueueCoalescedGateReevaluation), so this claim is gone.
+  if (result.reason === "coalesced") return;
   if (result.reason === "not_configured") {
     await failPermanentDelivery(db, fencedRow, "comment_review_gate_not_configured", { result });
     return;
@@ -591,6 +628,10 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
         },
       )
     : { ...(await post()), skipped: false as const };
+  if (posted === null) {
+    await deferBehindLiveEvaluation(db, fencedRow);
+    return;
+  }
   if (posted.skipped) return;
   if (posted.ok) {
     await markTerminal(
@@ -608,6 +649,47 @@ async function processDelivery(db: Db, row: DeliveryRow): Promise<void> {
     return;
   }
   await failPermanentDelivery(db, fencedRow, posted.reason, { posted });
+}
+
+/**
+ * Queue a re-evaluation of a head whose status key another evaluation holds
+ * (BLO-52499). Forced, so the holder's status, which may come from reads that
+ * predate this trigger, cannot satisfy its freshness check.
+ *
+ * It also re-arms a row that is mid-evaluation. The plain enqueue preserves a
+ * `processing` row, and that row is often the holder itself, which would then
+ * close `delivered` on its pre-trigger reads. Moving it back to `queued` makes
+ * the holder's own bookkeeping miss its claim, so the row runs again after it.
+ */
+export async function enqueueCoalescedGateReevaluation(
+  db: Db,
+  input: { repoFullName: string; sha: string; context: string; prNumber: number; prUrl?: string | null },
+): Promise<void> {
+  const row = await enqueueGithubCommitStatusDelivery(db, {
+    ...input,
+    companyId: null,
+    sourceRunId: null,
+    // Placeholder, as for the webhook's backstop row: a reevaluate row computes
+    // its own verdict and never publishes this state.
+    state: "pending",
+    description: "Comment-review gate re-evaluation queued.",
+    reevaluate: true,
+    forceWrite: true,
+    delayMs: COALESCED_REEVALUATION_DELAY_MS,
+  });
+  if (row.status === "queued") return;
+  const now = new Date();
+  await db
+    .update(githubCommitStatusDeliveries)
+    .set({
+      status: "queued",
+      reevaluate: true,
+      forceWrite: true,
+      nextAttemptAt: new Date(now.getTime() + COALESCED_REEVALUATION_DELAY_MS),
+      updatedAt: now,
+    })
+    // Not only `processing`: the holder may have closed the row since the upsert.
+    .where(and(eq(githubCommitStatusDeliveries.id, row.id), ne(githubCommitStatusDeliveries.status, "queued")));
 }
 
 export async function enqueueGithubCommitStatusDelivery(

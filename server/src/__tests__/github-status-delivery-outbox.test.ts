@@ -8,7 +8,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
 } from "@paperclipai/db";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -37,6 +37,7 @@ const h = vi.hoisted(() => ({
 vi.mock("../config.js", () => ({ loadConfig: () => h.cfg }));
 
 import { _resetInstallationTokenCache, githubPostCommitStatusDetailed } from "../services/github-app-auth.js";
+import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.js";
 import {
   _classifyReviewerEvidenceError,
   enqueueGithubCommitStatusDelivery,
@@ -1251,6 +1252,66 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       });
     });
 
+    // Hold this head's status key on another connection, as a live evaluation
+    // on another pod would (BLO-52499).
+    async function holdStatusKey() {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let markHeld!: () => void;
+      const held = new Promise<void>((resolve) => { markHeld = resolve; });
+      const holder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`Blockcast/frr#${HEAD_SHA}`}, 0))`);
+        markHeld();
+        await released;
+      });
+      await held;
+      return async () => {
+        release();
+        await holder;
+      };
+    }
+
+    function settlesWithin<T>(promise: Promise<T>, ms: number): Promise<T> {
+      return Promise.race([
+        promise,
+        new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`still waiting after ${ms}ms`)), ms)),
+      ]);
+    }
+
+    async function gateRow() {
+      const [row] = await db
+        .select()
+        .from(githubCommitStatusDeliveries)
+        .where(eq(githubCommitStatusDeliveries.context, GATE_CONTEXT));
+      return row ?? null;
+    }
+
+    it("coalesces an evaluation of a held head into a forced re-evaluation without waiting (BLO-52499)", async () => {
+      setCreds();
+      h.cfg.prCommentReviewGateStatusContext = GATE_CONTEXT;
+      const fetchMock = stubGithub({ reviews: [cleanAllyReview(HEAD_SHA)], comments: [] });
+      const release = await holdStatusKey();
+      try {
+        const before = Date.now();
+        const result = await settlesWithin(runPrCommentReviewGateCheck({
+          repoFullName: "Blockcast/frr",
+          prNumber: 105,
+          headSha: HEAD_SHA,
+          prUrl: "https://github.com/Blockcast/frr/pull/105",
+          db,
+        }), 5_000);
+
+        expect(result).toEqual({ posted: false, reason: "coalesced" });
+        // Nothing read or written while another evaluation owns the head.
+        expect(fetchMock).not.toHaveBeenCalled();
+        const row = await gateRow();
+        expect(row).toMatchObject({ status: "queued", reevaluate: true, forceWrite: true, sha: HEAD_SHA, prNumber: 105 });
+        expect(row!.nextAttemptAt.getTime()).toBeGreaterThanOrEqual(before + 10_000);
+      } finally {
+        await release();
+      }
+    });
+
     // The holder's reads may predate the coalesced trigger, and its status
     // lands after the row was queued, so "a status was written after this row"
     // must not skip a coalesced row the way it skips the webhook backstop.
@@ -1290,6 +1351,84 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       expect(postedGateStates(fetchMock)).toEqual(["failure"]);
     });
 
+    it("re-arms a re-evaluation of a held head behind the holder without spending an attempt (BLO-52499)", async () => {
+      setCreds();
+      const delivery = await seedReevaluation();
+      const fetchMock = stubGithub({
+        latestStatuses: [{ context: GATE_CONTEXT, state: "failure", created_at: "2026-09-26T16:32:20Z" }],
+        reviews: [cleanAllyReview(HEAD_SHA)],
+        comments: [],
+      });
+      const release = await holdStatusKey();
+      try {
+        const before = Date.now();
+        await settlesWithin(pollGitHubCommitStatusDeliveriesOnce(db), 5_000);
+
+        const row = await readDelivery(delivery.id);
+        expect(row).toMatchObject({
+          status: "queued",
+          attempts: 0,
+          // From here on the holder's status cannot skip it.
+          forceWrite: true,
+        });
+        expect(row!.nextAttemptAt.getTime()).toBeGreaterThanOrEqual(before + 10_000);
+        expect(postedGateStates(fetchMock)).toEqual([]);
+      } finally {
+        await release();
+      }
+    });
+
+    // The live-context row is often the holder itself: the worker's own
+    // re-evaluation of this head. A trigger that coalesces behind it must not be
+    // swallowed by the upsert preserving that `processing` row, which would let
+    // the holder close it `delivered` on reads that predate the trigger.
+    it("keeps a trigger that coalesces behind the head's own in-flight re-evaluation (BLO-52499)", async () => {
+      setCreds();
+      const delivery = await seedReevaluation();
+      const inner = stubGithub({
+        latestStatuses: [{ context: GATE_CONTEXT, state: "failure", created_at: "2026-09-26T16:32:20Z" }],
+        reviews: [cleanAllyReview(HEAD_SHA)],
+        comments: [],
+        openPullRequestsAtHead: selfOnlyPullsPage(),
+      });
+      let markReading!: () => void;
+      const reading = new Promise<void>((resolve) => { markReading = resolve; });
+      let releaseRead!: () => void;
+      const readReleased = new Promise<void>((resolve) => { releaseRead = resolve; });
+      let paused = false;
+      vi.stubGlobal("fetch", async (url: string | URL, init?: RequestInit) => {
+        if (!paused && String(url).includes("/reviews")) {
+          paused = true;
+          markReading();
+          await readReleased;
+        }
+        return inner(url, init);
+      });
+
+      const holder = pollGitHubCommitStatusDeliveriesOnce(db);
+      await reading;
+      // The holder has read its reviews; a trigger arrives for another PR at the
+      // same head. (The same PR would queue behind the holder in-process instead.)
+      let result: Awaited<ReturnType<typeof runPrCommentReviewGateCheck>>;
+      try {
+        result = await settlesWithin(runPrCommentReviewGateCheck({
+          repoFullName: "Blockcast/frr",
+          prNumber: 106,
+          headSha: HEAD_SHA,
+          prUrl: "https://github.com/Blockcast/frr/pull/106",
+          db,
+        }), 5_000);
+      } finally {
+        releaseRead();
+        await holder;
+      }
+
+      expect(result).toEqual({ posted: false, reason: "coalesced" });
+      // The holder published from its reads, but the row survives for a rerun.
+      expect(postedGateStates(inner)).toEqual(["success"]);
+      expect(await readDelivery(delivery.id)).toMatchObject({ status: "queued", reevaluate: true, forceWrite: true });
+    });
+
     it("keeps a coalesced re-evaluation forced and due when a later webhook backstop lands on it (BLO-52499)", async () => {
       h.cfg.prCommentReviewGateStatusContext = GATE_CONTEXT;
       const before = Date.now();
@@ -1325,6 +1464,36 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
 
       expect(row).toMatchObject({ status: "queued", reevaluate: true, forceWrite: true, prNumber: 106 });
       expect(row.nextAttemptAt.getTime()).toBeLessThan(before + 60_000);
+    });
+
+    it("defers a forced retirement replay while the head is held, without writing (BLO-52499)", async () => {
+      setCreds();
+      const delivery = await enqueueGithubCommitStatusDelivery(db, {
+        companyId: null,
+        sourceRunId: null,
+        repoFullName: "Blockcast/frr",
+        sha: HEAD_SHA,
+        context: "review/ally-comment",
+        state: "failure",
+        description: "retired context mirrors the live verdict",
+        forceWrite: true,
+        prNumber: 105,
+        prUrl: "https://github.com/Blockcast/frr/pull/105",
+      });
+      const fetchMock = stubGithub({ latestStatuses: [] });
+      const release = await holdStatusKey();
+      try {
+        await settlesWithin(pollGitHubCommitStatusDeliveriesOnce(db), 5_000);
+
+        expect(await readDelivery(delivery.id)).toMatchObject({
+          status: "queued",
+          attempts: 0,
+          lastError: "github_status_key_busy",
+        });
+        expect(fetchMock.mock.calls.some(([url]) => /\/statuses\/[0-9a-f]{40}$/i.test(String(url)))).toBe(false);
+      } finally {
+        await release();
+      }
     });
 
     it("holds the first attempt back by the requested delay", async () => {
