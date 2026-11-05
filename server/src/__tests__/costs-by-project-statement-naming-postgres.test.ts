@@ -134,6 +134,15 @@ describeEmbeddedPostgres("byProject never names a server-side prepared statement
      * absorb a real regression too; this does not, because `byProject`'s
      * statement is prepared after this line, not before it. It is cached in
      * client state for the life of the connection, so it is not re-prepared.
+     *
+     * That last clause is scoped to the connection on purpose. `createDb` sets
+     * `max_lifetime` (`packages/db/src/client.ts`), so a reconnect WOULD re-run
+     * `fetch_types` and leave it in the count again — a red that the driver
+     * produced, not `byProject`. It cannot happen here (this test runs in
+     * milliseconds, `max_lifetime` is minutes), but if you are ever reading a
+     * red whose only entry is `fetch_types`-shaped — a parameterless
+     * `pg_catalog` join on `typcategory = 'A'` — check for a reconnect before
+     * re-opening anything below.
      */
     await db.execute(sql.raw("DEALLOCATE ALL"));
 
