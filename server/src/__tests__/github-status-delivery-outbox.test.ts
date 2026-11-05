@@ -5,6 +5,7 @@ import {
   companies,
   createDb,
   githubCommitStatusDeliveries,
+  githubStatusKeyLeases,
   heartbeatRunEvents,
   heartbeatRuns,
 } from "@paperclipai/db";
@@ -140,6 +141,7 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     clearCreds();
     vi.unstubAllGlobals();
     await db.delete(githubCommitStatusDeliveries);
+    await db.delete(githubStatusKeyLeases);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agents);
@@ -1516,6 +1518,193 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       expect(delivery.nextAttemptAt.getTime()).toBeGreaterThan(before + 10 * 60_000);
       // Not due yet, so the poller must not claim it.
       await expect(pollGitHubCommitStatusDeliveriesOnce(db)).resolves.toBe(0);
+    });
+  });
+
+  describe("status key lease (BLO-52499)", () => {
+    const KEY = `Blockcast/FRR#${HEAD_SHA}`;
+    const LEASE_KEY = KEY.toLowerCase();
+
+    async function leaseRows() {
+      return db.select().from(githubStatusKeyLeases);
+    }
+
+    async function insertLease(token: string, expiresIn: string) {
+      await db.execute(sql`
+        insert into github_status_key_leases (key, token, expires_at)
+        values (${LEASE_KEY}, ${token}, clock_timestamp() + ${sql.raw(`interval '${expiresIn}'`)})
+      `);
+    }
+
+    it("holds a lease row on the lower-cased key while it runs, and removes it after", async () => {
+      const seen = await withGithubStatusDeliveryLock(db, KEY, async () => leaseRows());
+
+      expect(seen).toHaveLength(1);
+      expect(seen![0]!.key).toBe(LEASE_KEY);
+      expect(await leaseRows()).toEqual([]);
+    });
+
+    it("returns null without opening a transaction while another evaluation's lease is live", async () => {
+      await insertLease("another-evaluation", "1 hour");
+      const transaction = vi.spyOn(db, "transaction");
+      const operation = vi.fn(async () => "ran");
+
+      // Differently cased: the lease key is case-insensitive, like GitHub's repo names.
+      await expect(withGithubStatusDeliveryLock(db, `blockcast/frr#${HEAD_SHA}`, operation)).resolves.toBeNull();
+
+      expect(operation).not.toHaveBeenCalled();
+      expect(transaction).not.toHaveBeenCalled();
+      expect(await leaseRows()).toMatchObject([{ token: "another-evaluation" }]);
+    });
+
+    it("takes over an expired lease", async () => {
+      await insertLease("crashed-evaluation", "-1 second");
+
+      await expect(withGithubStatusDeliveryLock(db, KEY, async () => "ran")).resolves.toBe("ran");
+      expect(await leaseRows()).toEqual([]);
+    });
+
+    it("refuses a write once another evaluation has taken the key", async () => {
+      const wrote = vi.fn();
+      const result = await withGithubStatusDeliveryLock(db, KEY, async (fence) => {
+        await fence();
+        await db.update(githubStatusKeyLeases).set({ token: "taker" });
+        await fence();
+        wrote();
+        return "wrote";
+      });
+
+      expect(result).toBeNull();
+      expect(wrote).not.toHaveBeenCalled();
+      // Release deletes only its own token's row.
+      expect(await leaseRows()).toMatchObject([{ token: "taker" }]);
+    });
+
+    it("refuses a write that could outlive the lease", async () => {
+      const wrote = vi.fn();
+      const result = await withGithubStatusDeliveryLock(db, KEY, async (fence) => {
+        await db.execute(sql`update github_status_key_leases set expires_at = clock_timestamp() + interval '30 seconds'`);
+        await fence();
+        wrote();
+      });
+
+      expect(result).toBeNull();
+      expect(wrote).not.toHaveBeenCalled();
+    });
+
+    // now() is frozen at the transaction's start, so a fence measured with it
+    // would credit the holder with the time it has already spent.
+    it("measures the lease on the wall clock, not the transaction's frozen now()", async () => {
+      const wrote = vi.fn();
+      const result = await withGithubStatusDeliveryLock(db, KEY, async (fence, tx) => {
+        await tx.execute(sql`select pg_sleep(2)`);
+        // Just under the 70 s a write needs; frozen now() would read about 71 s.
+        await db.execute(sql`update github_status_key_leases set expires_at = clock_timestamp() + interval '69 seconds'`);
+        await fence();
+        wrote();
+      });
+
+      expect(result).toBeNull();
+      expect(wrote).not.toHaveBeenCalled();
+    });
+
+    // After its backend dies, the driver reopens the same pooled connection for
+    // queued work and runs the dead transaction's later queries there, on a
+    // backend that holds no advisory lock (verified against postgres.js). One
+    // connection plus queued work forces exactly that. Two guards refuse it:
+    // the helper's transactionEnded latch and the fence's backend/transaction
+    // binding; each covers the other.
+    it("fails closed when the holder's transaction backend dies and its connection is reopened", async () => {
+      const holderDb = createDb(tempDb!.connectionString, 1);
+      const wrote = vi.fn();
+      let queued: Promise<unknown> | undefined;
+      const result = await withGithubStatusDeliveryLock(holderDb, KEY, async (fence, tx) => {
+        const [row] = (await tx.execute(sql`select pg_backend_pid() as pid`)) as unknown as Array<{ pid: number }>;
+        queued = holderDb.execute(sql`select pg_sleep(0.2)`);
+        await db.execute(sql`select pg_terminate_backend(${row!.pid})`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await fence();
+        wrote();
+      });
+      await queued;
+
+      expect(result).toBeNull();
+      expect(wrote).not.toHaveBeenCalled();
+      expect(await leaseRows()).toEqual([]);
+    }, 30_000);
+
+    // Pods still running #3411 see only the transaction-scoped advisory lock on
+    // the raw key, so release N must keep taking it.
+    it("excludes, and is excluded by, a #3411 pod's advisory lock on the raw key", async () => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let markHeld!: () => void;
+      const held = new Promise<void>((resolve) => { markHeld = resolve; });
+      const legacyHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${KEY}, 0))`);
+        markHeld();
+        await released;
+      });
+      await held;
+      try {
+        await expect(withGithubStatusDeliveryLock(db, KEY, async () => "ran")).resolves.toBeNull();
+        expect(await leaseRows()).toEqual([]);
+      } finally {
+        release();
+        await legacyHolder;
+      }
+
+      const legacyTryLock = await withGithubStatusDeliveryLock(db, KEY, async () => {
+        const [row] = (await db.execute(
+          sql`select pg_try_advisory_xact_lock(hashtextextended(${KEY}, 0)) as acquired`,
+        )) as unknown as Array<{ acquired: boolean }>;
+        return row!.acquired;
+      });
+      expect(legacyTryLock).toBe(false);
+    });
+
+    it("sweeps only expired leases", async () => {
+      await insertLease("crashed-evaluation", "-1 second");
+      await db.execute(sql`
+        insert into github_status_key_leases (key, token, expires_at)
+        values ('blockcast/other#sha', 'live-evaluation', clock_timestamp() + interval '1 hour')
+      `);
+
+      await pollGitHubCommitStatusDeliveriesOnce(db);
+
+      expect(await leaseRows()).toMatchObject([{ key: "blockcast/other#sha", token: "live-evaluation" }]);
+    });
+
+    it("defers a forced replay that loses the key before its write", async () => {
+      setCreds();
+      const delivery = await enqueueGithubCommitStatusDelivery(db, {
+        companyId: null,
+        sourceRunId: null,
+        repoFullName: "Blockcast/FRR",
+        sha: HEAD_SHA,
+        context: "review/ally-comment",
+        state: "failure",
+        description: "retired context mirrors the live verdict",
+        forceWrite: true,
+        prNumber: 105,
+        prUrl: "https://github.com/Blockcast/frr/pull/105",
+      });
+      const inner = stubGithub({ latestStatuses: [] });
+      // The in-lock freshness read is the last thing before the fence: lose the
+      // key there, as an expiry or a takeover would.
+      vi.stubGlobal("fetch", async (url: string | URL, init?: RequestInit) => {
+        if (/\/commits\/[^/]+\/statuses(?:\?|$)/.test(String(url))) await db.delete(githubStatusKeyLeases);
+        return inner(url, init);
+      });
+
+      await pollGitHubCommitStatusDeliveriesOnce(db);
+
+      expect(await readDelivery(delivery.id)).toMatchObject({
+        status: "queued",
+        attempts: 0,
+        lastError: "github_status_key_busy",
+      });
+      expect(inner.mock.calls.some(([url]) => /\/statuses\/[0-9a-f]{40}$/i.test(String(url)))).toBe(false);
     });
   });
 });
