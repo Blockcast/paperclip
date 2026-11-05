@@ -25,6 +25,7 @@ const mockPostStatus = vi.hoisted(() => vi.fn());
 const mockPostCheckRun = vi.hoisted(() => vi.fn());
 const mockListOpenPrsAtHead = vi.hoisted(() => vi.fn());
 const mockStatusDeliveryLock = vi.hoisted(() => vi.fn());
+const mockEnqueueStatusDelivery = vi.hoisted(() => vi.fn());
 
 // Only the network calls are mocked. The identity predicates are imported for
 // real via `importOriginal`: they are pure, and the hand-rolled copy this mock
@@ -43,6 +44,7 @@ vi.mock("../services/github-app-auth.js", async (importOriginal) => ({
 }));
 
 vi.mock("../services/github-status-delivery-outbox.js", () => ({
+  enqueueCoalescedGateReevaluation: mockEnqueueStatusDelivery,
   withGithubStatusDeliveryLock: mockStatusDeliveryLock,
 }));
 
@@ -102,6 +104,7 @@ beforeEach(() => {
   mockListOpenPrsAtHead.mockReset();
   mockStatusDeliveryLock.mockReset();
   mockStatusDeliveryLock.mockImplementation(async (_db, _key, operation) => operation());
+  mockEnqueueStatusDelivery.mockReset();
   // Default both surfaces to empty; each test overrides the one it exercises.
   mockListComments.mockResolvedValue([]);
   mockListReviews.mockResolvedValue([]);
@@ -202,6 +205,24 @@ describe("runPrCommentReviewGateCheck", () => {
     await runPrCommentReviewGateCheck({ ...TARGET, db: {} as never });
 
     expect(events).toEqual(["lock", "fetch-comments", "post"]);
+  });
+
+  it("queues a forced re-evaluation instead of waiting when another evaluation holds the head (BLO-52499)", async () => {
+    mockStatusDeliveryLock.mockResolvedValue(null);
+    mockListComments.mockResolvedValue([]);
+    const db = {} as never;
+
+    await expect(runPrCommentReviewGateCheck({ ...TARGET, db })).resolves.toEqual({ posted: false, reason: "coalesced" });
+
+    expect(mockEnqueueStatusDelivery).toHaveBeenCalledWith(db, {
+      repoFullName: TARGET.repoFullName,
+      sha: TARGET.headSha,
+      context: "review/ally-comment-gate",
+      prNumber: TARGET.prNumber,
+      prUrl: TARGET.prUrl,
+    });
+    expect(mockListComments).not.toHaveBeenCalled();
+    expect(mockPostStatus).not.toHaveBeenCalled();
   });
 
   it("refuses to publish unsynchronized when db is missing", async () => {

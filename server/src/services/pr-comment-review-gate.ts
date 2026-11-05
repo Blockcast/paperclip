@@ -13,7 +13,10 @@
  */
 import { loadConfig } from "../config.js";
 import type { Db } from "@paperclipai/db";
-import { withGithubStatusDeliveryLock } from "./github-status-delivery-outbox.js";
+import {
+  enqueueCoalescedGateReevaluation,
+  withGithubStatusDeliveryLock,
+} from "./github-status-delivery-outbox.js";
 import {
   countAllyDeferredPriorFindings,
   extractAllyPriorFindingDispositions,
@@ -1931,7 +1934,7 @@ export type PrCommentReviewGateCheckResult =
   | { posted: true; verdict: CommentReviewGateVerdict }
   | {
       posted: false;
-      reason: "not_configured" | "fetch_failed" | "post_failed" | "retirement_failed";
+      reason: "not_configured" | "fetch_failed" | "post_failed" | "retirement_failed" | "coalesced";
       postFailure?: string;
       retirementDeliveries?: Array<{
         sha: string;
@@ -2494,7 +2497,20 @@ async function executeCommentReviewGateCheck(
   // forced retries. The transaction-scoped lock is the cross-process boundary,
   // and it is unconditional: `db` is required precisely so there is no
   // unsynchronized fall-through for a caller to reach by omission.
-  return withGithubStatusDeliveryLock(input.db, `${input.repoFullName}#${headSha}`, publish);
+  const published = await withGithubStatusDeliveryLock(input.db, `${input.repoFullName}#${headSha}`, publish);
+  if (published) return published;
+  // Another evaluation of this head holds the key, and its reads may predate
+  // this trigger. Queue a re-evaluation behind it rather than wait for it on a
+  // pooled connection (BLO-52499). Triggers that arrive during one hold
+  // collapse into this single row.
+  await enqueueCoalescedGateReevaluation(input.db, {
+    repoFullName: input.repoFullName,
+    sha: headSha,
+    context,
+    prNumber: input.prNumber,
+    prUrl: input.prUrl,
+  });
+  return { posted: false, reason: "coalesced" };
 }
 
 /**

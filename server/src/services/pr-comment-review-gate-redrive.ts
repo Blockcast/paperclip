@@ -470,6 +470,9 @@ export async function redriveStaleCommentReviewGates(input: {
           { repoFullName: input.repoFullName, prNumber: candidate.prNumber, reason: check.reason },
           "comment-review gate re-driven, but retiring the superseded contexts failed",
         );
+      } else if (check.reason === "coalesced") {
+        // Not a failure: another evaluation held this head, and a re-evaluation
+        // is durably queued behind it in the status outbox.
       } else {
         result.failed += 1;
         log.warn(
