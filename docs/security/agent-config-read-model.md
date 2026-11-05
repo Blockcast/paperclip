@@ -345,8 +345,9 @@ above used to be ambiguous: a reader could not tell *"this agent has no runtime
 config"* from *"you are not entitled to see it"*, and nothing on the response
 said a projection had run at all. That was misread at least twice, once by the
 `Ceo` seat, which is why `PEN-5228` had to tell its readers to run an own-id
-read as a positive control. A withhold that costs every reader a control
-experiment has a recurring bill.
+read as a positive control. In the issue record the same state misled three
+principals, most recently across four runs on `PEN-4623`. A withhold that
+costs every reader a control experiment has a recurring bill.
 
 Shipped in `Blockcast/paperclip#3241`, merged `2026-11-02T09:28:08Z`. Every
 response that reaches `redactForRestrictedAgentView` — i.e. every `{}` in the
@@ -392,30 +393,6 @@ To tell which **tree** you are on, rather than what a response means, check for
 on `master`, so its absence now means a stale checkout rather than a tree
 predating the signal.
 
-> ⚠️ **Shipped is not deployed, and the matrix column above describes
-> `master`.** Measured 2026-11-02: the running API did not carry these
-> markers — `grep -c WITHHELD_AGENT_CONFIG_FIELDS` on
-> `server/src/routes/agents.ts` returned **4** at `master` and **0** at the
-> deployed commit, and a live peer list read returned `{}` rows with nothing
-> beside them. **Until you have confirmed the markers are live on the API you
-> are actually talking to, do not read marker-absence as "this `{}` is the
-> real stored value."** Run the own-id positive control **on the detail
-> route** (`GET /agents/:id`, `paperclipGetAgent`): if that call against your
-> own id comes back populated and a peer's does not, you are looking at a
-> projection. ⛔ **That control is only valid if your own read came back
-> populated at all.** Own-id is sufficient *on the standard trust preset
-> only*: the `isSelf` branch short-circuits before the gate, answering a
-> `low_trust_review` actor with `buildLowTrustSelfView` — a shape carrying no
-> config — and a `denied` actor with a **403**. So an empty own-id read means
-> the control did not run; it is **never** evidence that your own column is
-> empty. ⛔ Do **not** run it on the company roster — the self row there
-> is decided by which branch you landed on rather than by the column, so it
-> cannot tell redaction from absence
-> ([why](#check-whether-telemetry-answers-it-before-asking-for-the-read)).
-> Until the markers deploy, `{}` is uninformative in both directions — the state
-> that misled three principals in the issue record, most recently across four
-> runs on `PEN-4623`.
->
 > If you are here because you hit a peer `{}` and you need the value, the
 > supported route is [the consultative one-hop peer-config
 > read](#the-consultative-one-hop-peer-config-read). You do not need a grant
