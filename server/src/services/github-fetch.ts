@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { unprocessable } from "../errors.js";
 import {
   recordGithubApiRefusal,
@@ -251,6 +252,80 @@ async function countGithubRefusal(url: string, response: Response): Promise<void
   }
 }
 
+/**
+ * Primary-budget exhaustion, remembered until GitHub's own reset (BLO-53662).
+ *
+ * Once GitHub answers `x-ratelimit-remaining: 0` for a credential and budget,
+ * every further call on that pair is refused until `x-ratelimit-reset`. Sending
+ * them anyway buys nothing and is not free: measured 2026-11-05, this process
+ * sent ~8.1k such calls in 24h while the shared installation sat at zero, every
+ * one of them landing in the same minutes every other consumer was dark. So the
+ * hold answers them locally with the same 403 shape GitHub would have sent, and
+ * each caller takes the rate-limit path it already has — no caller can re-fire
+ * inside the exhausted window, whatever its own retry loop does.
+ *
+ * Keyed on a hash of the Authorization header (never the token itself) plus the
+ * budget, so one installation's exhaustion never blocks another credential, and
+ * `search` never blocks `core`. The request-side budget is inferred from the
+ * URL; a wrong inference only means no hold, which is today's behaviour.
+ * Secondary limits (`retry-after`) are not held here.
+ */
+const rateLimitHolds = new Map<string, { resetMs: number; resource: string }>();
+
+/** Never trust a reset further out than one primary window. */
+const RATE_LIMIT_HOLD_MAX_MS = 60 * 60 * 1000;
+
+export function _resetGhFetchRateLimitHoldsForTest() {
+  rateLimitHolds.clear();
+}
+
+function inferRateLimitResource(url: string): string {
+  const path = new URL(url).pathname;
+  if (path.endsWith("/graphql")) return "graphql";
+  if (path.includes("/search/code")) return "code_search";
+  if (path.includes("/search/")) return "search";
+  return "core";
+}
+
+function rateLimitHoldKey(init: RequestInit | undefined, resource: string): string {
+  let auth = "";
+  try {
+    auth = new Headers(init?.headers).get("authorization") ?? "";
+  } catch {
+    // Unreadable headers: hold under the anonymous key, as an unauthenticated call would be.
+  }
+  return `${createHash("sha256").update(auth).digest("hex").slice(0, 16)}:${resource}`;
+}
+
+function heldResponse(resetMs: number, resource: string): Response {
+  return new Response(
+    JSON.stringify({
+      message: "API rate limit exceeded (held locally until x-ratelimit-reset; BLO-53662)",
+    }),
+    {
+      status: 403,
+      headers: {
+        "content-type": "application/json",
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": String(Math.ceil(resetMs / 1000)),
+        "x-ratelimit-resource": resource,
+      },
+    },
+  );
+}
+
+function rememberRateLimitHold(init: RequestInit | undefined, response: Response): void {
+  if (response?.status !== 403 && response?.status !== 429) return;
+  if (refusalHeader(response, "x-ratelimit-remaining")?.trim() !== "0") return;
+  const resetSec = Number(refusalHeader(response, "x-ratelimit-reset"));
+  if (!Number.isFinite(resetSec) || resetSec <= 0) return;
+  const now = Date.now();
+  const resetMs = Math.min(resetSec * 1000, now + RATE_LIMIT_HOLD_MAX_MS);
+  if (resetMs <= now) return;
+  const resource = refusalHeader(response, "x-ratelimit-resource") ?? "core";
+  rateLimitHolds.set(rateLimitHoldKey(init, resource), { resetMs, resource });
+}
+
 export async function ghFetch(url: string, init?: RequestInit): Promise<Response> {
   // Compose, never replace: a caller-supplied signal must still abort earlier
   // than the default, and the default must still bound a caller that passes none.
@@ -258,10 +333,17 @@ export async function ghFetch(url: string, init?: RequestInit): Promise<Response
   const signal = init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
   // Before the request leaves, so the denominator counts attempts and keeps
   // advancing when GitHub is unreachable rather than merely unhappy (PEN-3852).
+  const holdKey = rateLimitHoldKey(init, inferRateLimitResource(url));
+  const hold = rateLimitHolds.get(holdKey);
+  if (hold) {
+    if (hold.resetMs > Date.now()) return heldResponse(hold.resetMs, hold.resource);
+    rateLimitHolds.delete(holdKey);
+  }
   countGithubApiAttempt();
   try {
     const response = await fetch(url, { ...init, signal });
     await countGithubRefusal(url, response);
+    rememberRateLimitHold(init, response);
     return response;
   } catch (err) {
     const aborted = abortFailure(url, err, init?.signal);
