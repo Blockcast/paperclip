@@ -651,6 +651,160 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(byAgentModelRow?.costCents).toBe(4_000_000_000);
   });
 
+  // PEN-5585: `byProject` resolves a project for run-attributed cost events through
+  // `run_project_links`, and that subquery is now restricted to the runs appearing in the
+  // windowed `cost_events`. The restriction has to prune WITHOUT dropping a real
+  // attribution — the failure mode would be silent, because a dropped link does not error,
+  // it just moves money out of the project that earned it.
+  it("attributes run-linked cost events to their project while ignoring links for runs outside the window", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const inWindowProjectId = randomUUID();
+    const outOfWindowProjectId = randomUUID();
+    const inWindowIssueId = randomUUID();
+    const outOfWindowIssueId = randomUUID();
+    const inWindowRunId = randomUUID();
+    const outOfWindowRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Link Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: inWindowProjectId, companyId, name: "In Window Project", status: "active" },
+      { id: outOfWindowProjectId, companyId, name: "Out Of Window Project", status: "active" },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: inWindowIssueId,
+        companyId,
+        projectId: inWindowProjectId,
+        title: "In window",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 1,
+        identifier: "LNK-1",
+      },
+      {
+        id: outOfWindowIssueId,
+        companyId,
+        projectId: outOfWindowProjectId,
+        title: "Out of window",
+        status: "done",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: "LNK-2",
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: inWindowRunId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "completed",
+        startedAt: new Date("2026-04-10T00:00:00.000Z"),
+        finishedAt: new Date("2026-04-10T00:01:00.000Z"),
+      },
+      {
+        id: outOfWindowRunId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "completed",
+        startedAt: new Date("2026-01-02T00:00:00.000Z"),
+        finishedAt: new Date("2026-01-02T00:01:00.000Z"),
+      },
+    ]);
+
+    // Both runs have a link row. `created_at` defaults to now() for both, i.e. far outside
+    // the requested window for EITHER run — which is why the restriction is keyed on the
+    // windowed run ids and not on `activity_log.created_at`.
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        runId: inWindowRunId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.checked_out",
+        entityType: "issue",
+        entityId: inWindowIssueId,
+        details: {},
+      },
+      {
+        companyId,
+        runId: outOfWindowRunId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.checked_out",
+        entityType: "issue",
+        entityId: outOfWindowIssueId,
+        details: {},
+      },
+    ]);
+
+    const base = {
+      companyId,
+      agentId,
+      provider: "anthropic",
+      biller: "anthropic",
+      billingType: "metered_api",
+      model: "claude-opus-5",
+      inputTokens: 1_000,
+      cachedInputTokens: 0,
+      outputTokens: 500,
+    } as const;
+
+    await db.insert(costEvents).values([
+      // no projectId: attribution has to come through run_project_links.
+      {
+        ...base,
+        heartbeatRunId: inWindowRunId,
+        costCents: 700,
+        occurredAt: new Date("2026-04-10T00:00:30.000Z"),
+      },
+      {
+        ...base,
+        heartbeatRunId: outOfWindowRunId,
+        costCents: 999,
+        occurredAt: new Date("2026-01-02T00:00:30.000Z"),
+      },
+    ]);
+
+    const rows = await costs.byProject(companyId, {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    });
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.projectId).toBe(inWindowProjectId);
+    expect(rows[0]?.costCents).toBe(700);
+
+    // The pruned run is not lost data — ask for its window and it attributes normally.
+    const earlierRows = await costs.byProject(companyId, {
+      from: new Date("2026-01-01T00:00:00.000Z"),
+      to: new Date("2026-01-31T23:59:59.999Z"),
+    });
+    expect(earlierRows).toHaveLength(1);
+    expect(earlierRows[0]?.projectId).toBe(outOfWindowProjectId);
+    expect(earlierRows[0]?.costCents).toBe(999);
+  });
+
   it("aggregates issue costs across recursive descendants only", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
@@ -587,6 +587,40 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
     },
 
     byProject: async (companyId: string, range?: CostDateRange) => {
+      const conditions: ReturnType<typeof eq>[] = [eq(costEvents.companyId, companyId)];
+      if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
+      if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
+
+      /**
+       * PEN-5585: the window has to reach `run_project_links`, not just `cost_events`.
+       *
+       * `run_project_links` exists only to supply a project for cost events that carry a
+       * `heartbeat_run_id` but no `project_id`. It used to be built from the company's
+       * ENTIRE `activity_log` history whatever window the caller asked for, so its cost
+       * grew monotonically with fleet activity and never came back down — and the join it
+       * feeds is `activity_log.entity_id = issues.id::text`, where the cast defeats any
+       * ordinary index on `issues.id`, so that full join fed a `DISTINCT ON` sort.
+       *
+       * On 2026-11-04 that stopped fitting inside the 30s `statement_timeout`: a client
+       * polling a pinned 30-day window every 60s got 503 on 191/191 attempts, and the
+       * always-in-flight 30s query pushed ten other routes over their own timeouts
+       * (peak 103 `57014`/hour against a 0-1/hour baseline).
+       *
+       * Restricting to the runs that actually appear in the windowed `cost_events` is
+       * EXACTLY result-preserving, not an approximation: the outer `leftJoin` is on
+       * `cost_events.heartbeat_run_id = run_project_links.run_id`, so a link row whose
+       * `run_id` is absent from that set can never match and contributes nothing. It is
+       * deliberately not a `created_at` bound — a run may log activity long before or
+       * after the cost event it bills, and no run-duration slack is provably safe.
+       *
+       * The inner select is served by `cost_events_company_occurred_idx`, and the
+       * resulting `run_id` restriction by `activity_log_run_id_idx`.
+       */
+      const windowedRunIds = db
+        .selectDistinct({ runId: costEvents.heartbeatRunId })
+        .from(costEvents)
+        .where(and(...conditions, isNotNull(costEvents.heartbeatRunId)));
+
       const issueIdAsText = sql<string>`${issues.id}::text`;
       const runProjectLinks = db
         .selectDistinctOn([activityLog.runId, issues.projectId], {
@@ -607,15 +641,13 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             eq(issues.companyId, companyId),
             isNotNull(activityLog.runId),
             isNotNull(issues.projectId),
+            inArray(activityLog.runId, windowedRunIds),
           ),
         )
         .orderBy(activityLog.runId, issues.projectId, desc(activityLog.createdAt))
         .as("run_project_links");
 
       const effectiveProjectId = sql<string | null>`coalesce(${costEvents.projectId}, ${runProjectLinks.projectId})`;
-      const conditions: ReturnType<typeof eq>[] = [eq(costEvents.companyId, companyId)];
-      if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
-      if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
 
       const costCentsExpr = sumAsNumber(costEvents.costCents);
 
