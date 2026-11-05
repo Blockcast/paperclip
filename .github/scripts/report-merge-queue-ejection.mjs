@@ -8,6 +8,22 @@
  * the synthetic branch is therefore the durable correlation key.
  */
 
+// PEN-5592: the queue-removal attribution is IMPORTED from the sibling
+// detector, not re-derived here. The two used to answer "why did this PR leave
+// the queue" independently and contradict each other on the same event --
+// measured on #3371 (2026-11-04), where this reporter posted "a job timeout
+// surfaces this way ... re-enqueue the PR" at 13:15:17Z and
+// merge-queue-eviction-detector posted "deliberate dequeue ... do not rebase"
+// 14s later. Sharing the predicate is what makes that class of disagreement
+// unrepresentable rather than merely unlikely.
+//
+// The workflow sparse-checkout MUST include scripts/merge-queue-eviction-detector.mjs
+// for this import to resolve -- see report-merge-queue-ejection.yml.
+import {
+  isQueueInitiatedRemoval,
+  selectLatestQueueAttemptWindow,
+} from "../../scripts/merge-queue-eviction-detector.mjs";
+
 export function mergeQueuePullRequestNumber(headBranch) {
   if (typeof headBranch !== "string") return null;
   const match = headBranch.match(/(?:^|\/)pr-(\d+)(?:-|$)/i);
@@ -42,6 +58,86 @@ export function shouldReportCancelledRun({ merged, isInMergeQueue }) {
   // that loses data, and is accepted -- whoever re-added it already knows.
   // Against the measured 22: 14-15 true reports, 0 false alarms.
   return !merged && !isInMergeQueue;
+}
+
+/**
+ * PEN-5592: how far AFTER the run's own end a `removed_from_merge_queue` may
+ * still be read as the cause of that run's teardown.
+ *
+ * The causal ordering is dequeue -> GitHub tears the merge group down -> the
+ * run concludes `cancelled`, so the removal normally PRECEDES the run's
+ * `updated_at` (57s before it on the measured #3371). The tolerance exists
+ * only for the reverse ordering of the two RECORDS, not of the two events:
+ * the run's conclusion and the timeline event are written by different
+ * subsystems and neither is ordered against the other.
+ *
+ * Deliberately small. Widening it suppresses more notices, and a dequeue a
+ * clear minute after the run already died is a different act from the one
+ * that killed it.
+ */
+export const MANUAL_DEQUEUE_SKEW_MS = 60 * 1000;
+
+/**
+ * The `removed_from_merge_queue` that explains THIS run's `cancelled`, when
+ * one exists and was performed by someone other than the queue itself.
+ *
+ * This is the whole of PEN-5592. `conclusion === "cancelled"` holds over two
+ * populations that nothing else here can separate:
+ *
+ *   1. the merge-group run genuinely died (a `timeout-minutes` kill surfaces
+ *      as `cancelled`) and the queue then ejected the PR -- "rerun the checks
+ *      and re-enqueue" is the right advice; and
+ *   2. somebody dequeued the PR and GitHub tore the run down as a consequence
+ *      -- nothing failed, nothing timed out, and "re-enqueue" is the single
+ *      action a deliberate hold forbids.
+ *
+ * Measured cost of conflating them (#3371, 2026-11-04): the `kkroo` seat
+ * dequeued at 13:13:57Z, run 41835906627 ended `cancelled` at 13:14:54Z, and
+ * the notice told its reader to re-enqueue. `allyblockcast[bot]` did exactly
+ * that at 20:59:58Z against an unchanged head, and the hold had to be
+ * reimposed with a second dequeue at 21:31:38Z. The sibling runs at the same
+ * two merge-group `created_at` both finished `success` in 41s and 59s --
+ * nothing timed out.
+ *
+ * Fails toward REPORTING, in three independent ways, because a silent skip on
+ * a genuinely stuck PR is the failure nobody notices:
+ *   - an unparseable/absent run end -> null (callers treat that as fatal, see
+ *     reportMergeQueueFailure -- a guard that can be silently switched off by
+ *     dropping an env var is worse than no guard);
+ *   - no enqueue or no removal on the timeline -> `selectLatestQueueAttemptWindow`
+ *     returns null/`dequeuedAt: null` -> null;
+ *   - no attributable actor -> `isQueueInitiatedRemoval` returns true -> null.
+ * Only a POSITIVELY identified non-queue actor suppresses anything.
+ *
+ * Suppressing costs the PR no notice at all: the removal this function keys on
+ * is itself a `pull_request_target: dequeued` event, so
+ * merge-queue-eviction-detector has already fired for the very event being
+ * read here, and it names the remover (`buildEvictionCommentBody`'s
+ * `namedManualActor` branch). That is why this reporter yields rather than
+ * growing a second manual-dequeue text: whichever notice survives must be the
+ * one whose attribution comes from the timeline, and only the sibling's does.
+ *
+ * @param {Array<{ event: string, created_at: string, actor?: string | null }>} timelineEvents
+ * @param {{ runUpdatedAt: string, skewMs?: number }} opts
+ * @returns {{ dequeuedAt: string, dequeuedBy: string } | null}
+ */
+export function manualDequeueExplainingRun(timelineEvents, { runUpdatedAt, skewMs = MANUAL_DEQUEUE_SKEW_MS }) {
+  const endedAt = Date.parse(runUpdatedAt ?? "");
+  if (!Number.isFinite(endedAt)) return null;
+  // `now: endedAt` is what scopes the window to THIS run: the enqueue is the
+  // last one at or before the run ended, so a later attempt's enqueue (#3371
+  // was re-enqueued at 20:59:58Z) cannot anchor the window of a run that
+  // concluded hours earlier.
+  const window = selectLatestQueueAttemptWindow(timelineEvents, { now: endedAt });
+  if (!window?.dequeuedAt) return null;
+  const dequeuedAt = Date.parse(window.dequeuedAt);
+  // The removal must plausibly have CAUSED this teardown. `selectLatestQueueAttemptWindow`
+  // takes the first removal after the anchoring enqueue with no upper bound,
+  // so without this a run that genuinely timed out at 13:20 and a hold placed
+  // at 14:00 would read as cause and effect.
+  if (!Number.isFinite(dequeuedAt) || dequeuedAt > endedAt + skewMs) return null;
+  if (isQueueInitiatedRemoval(window.dequeuedBy)) return null;
+  return { dequeuedAt: window.dequeuedAt, dequeuedBy: window.dequeuedBy };
 }
 
 // BLO-28886 asks the ejection signal to NAME the failing shard. Without it the
@@ -145,12 +241,20 @@ export function failingJobSummary(jobs) {
   // death and is always named -- keyed on the complement so a new enum value
   // (`timed_out`, `stale`, ...) is reported rather than silently dropped.
   const anyRealDeath = list.some((job) => job?.conclusion !== "cancelled");
-  const failed = list
+  const named = list
     .filter((job) => job?.conclusion !== "cancelled" || !anyRealDeath)
-    .map((job) => job.name)
-    .filter((name) => typeof name === "string" && name.length > 0);
-  if (failed.length === 0) return "";
-  return ` Failing ${failed.length === 1 ? "job" : "jobs"}: ${failed.map((name) => `\`${name}\``).join(", ")}.`;
+    .filter((job) => typeof job?.name === "string" && job.name.length > 0);
+  if (named.length === 0) return "";
+  // PEN-5592: a cancelled job is not a failed job, and the label is the only
+  // thing a reader has to tell them apart. On #3371 all 12 named jobs were
+  // killed mid-flight when the PR was dequeued -- none had failed, none had
+  // timed out -- and they were printed as "Failing jobs", which is HEARTBEAT
+  // S4.2's "a cancelled check is not a failed check" trap running the other
+  // way. Derived from what is actually being PRINTED (the post-filter set)
+  // rather than from `anyRealDeath`, so the label cannot drift away from the
+  // list it labels if that filter changes.
+  const label = named.every((job) => job.conclusion === "cancelled") ? "Cancelled" : "Failing";
+  return ` ${label} ${named.length === 1 ? "job" : "jobs"}: ${named.map((job) => `\`${job.name}\``).join(", ")}.`;
 }
 
 // A run whose conclusion is `cancelled` is NOT necessarily a timeout. GitHub
@@ -211,8 +315,8 @@ async function githubRequest(path, options = {}) {
 // `isInMergeQueue` is GraphQL-only -- REST /pulls/{n} has no queue-membership
 // field, and its `mergeable_state` reads `unknown` for a queued PR (lazy
 // compute), so it cannot answer this.
-async function pullRequestQueueState(owner, repo, number) {
-  const payload = await githubRequest("/graphql", {
+async function pullRequestQueueState(owner, repo, number, request = githubRequest) {
+  const payload = await request("/graphql", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
@@ -229,7 +333,18 @@ async function pullRequestQueueState(owner, repo, number) {
   return pullRequest;
 }
 
-export async function reportMergeQueueFailure({ repository, headBranch, conclusion, runUrl, runId }) {
+export async function reportMergeQueueFailure({
+  repository,
+  headBranch,
+  conclusion,
+  runUrl,
+  runId,
+  runUpdatedAt,
+  // Seam, not configuration: the whole point of PEN-5592 is a decision taken
+  // before any comment is composed, and that decision is only pinned by a test
+  // that can observe the POST not happening.
+  request = githubRequest,
+}) {
   // Gate here as well as in the CLI, so the safe path is the only path.
   if (!shouldReportMergeQueueFailure({ headBranch, conclusion })) {
     return { reported: false, reason: "not-reportable" };
@@ -243,9 +358,34 @@ export async function reportMergeQueueFailure({ repository, headBranch, conclusi
     // Deliberate: a GraphQL blip here reddens the reporter job rather than
     // silently skipping. A silent skip loses an ejection report on a PR that is
     // already stuck, which is the failure nobody notices.
-    const state = await pullRequestQueueState(owner, repo, number);
+    const state = await pullRequestQueueState(owner, repo, number, request);
     if (!shouldReportCancelledRun(state)) {
       return { reported: false, reason: state.merged ? "merged" : "still-queued", number };
+    }
+
+    // PEN-5592: fail LOUD rather than fail open. `runUpdatedAt` comes from the
+    // same `workflow_run` payload as `conclusion`, so it is never legitimately
+    // absent on this path -- but a guard that silently disables itself when an
+    // env var is dropped from the workflow is the vacuous-green trap at
+    // deployment scale, and the bug it would restore is one an automated
+    // enqueuer already acted on once.
+    if (!Number.isFinite(Date.parse(runUpdatedAt ?? ""))) {
+      throw new Error(
+        `reportMergeQueueFailure needs a parseable runUpdatedAt to attribute a cancelled run; got ${JSON.stringify(runUpdatedAt)}`,
+      );
+    }
+    // Same policy as the GraphQL read above: a timeline blip reddens the job.
+    // Posting a wrong CAUSE is not the cheap direction here -- it is read by
+    // bots, and on #3371 one acted on it.
+    const timeline = await request(
+      `/repos/${owner}/${repo}/issues/${number}/timeline?per_page=100`,
+    );
+    const manual = manualDequeueExplainingRun(timeline, { runUpdatedAt });
+    if (manual) {
+      // merge-queue-eviction-detector has already fired on this very removal
+      // and names the remover. Yielding is what makes the two detectors
+      // incapable of posting contradictory causes for one event.
+      return { reported: false, reason: "manual-dequeue", number, dequeuedBy: manual.dequeuedBy };
     }
   }
 
@@ -257,7 +397,7 @@ export async function reportMergeQueueFailure({ repository, headBranch, conclusi
   // re-post on every redelivery. Ceiling accepted: the busiest thread here is 12,
   // and the blast radius is one duplicate comment. Paginate to the end if a PR
   // thread ever approaches 100.
-  const comments = await githubRequest(
+  const comments = await request(
     `/repos/${owner}/${repo}/issues/${number}/comments?per_page=100`,
   );
   const marker = `<!-- paperclip:merge-queue-ejection:${runId} -->`;
@@ -272,7 +412,7 @@ export async function reportMergeQueueFailure({ repository, headBranch, conclusi
   // are excluded). Ceiling: a workflow past 100 jobs truncates -- 17 today.
   let jobs;
   try {
-    ({ jobs } = await githubRequest(
+    ({ jobs } = await request(
       `/repos/${owner}/${repo}/actions/runs/${runId}/jobs?per_page=100`,
     ));
   } catch (error) {
@@ -280,7 +420,7 @@ export async function reportMergeQueueFailure({ repository, headBranch, conclusi
   }
   const summary = failingJobSummary(jobs);
   const body = `${marker}\nMerge-queue ejection detected for PR #${number}. The merge-group run ${runOutcomeText(conclusion, jobs)} and GitHub may have removed the PR from the queue and dropped auto-merge.${summary} Inspect the merge-group jobs, fix or rerun the failing checks, then re-enqueue the PR.\n\nRun: ${runUrl}`;
-  await githubRequest(`/repos/${owner}/${repo}/issues/${number}/comments`, {
+  await request(`/repos/${owner}/${repo}/issues/${number}/comments`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ body }),
@@ -289,13 +429,22 @@ export async function reportMergeQueueFailure({ repository, headBranch, conclusi
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { GITHUB_REPOSITORY, GITHUB_WORKFLOW_RUN_HEAD_BRANCH, GITHUB_WORKFLOW_RUN_CONCLUSION, GITHUB_SERVER_URL, GITHUB_WORKFLOW_RUN_ID } = process.env;
+  const { GITHUB_REPOSITORY, GITHUB_WORKFLOW_RUN_HEAD_BRANCH, GITHUB_WORKFLOW_RUN_CONCLUSION, GITHUB_SERVER_URL, GITHUB_WORKFLOW_RUN_ID, GITHUB_WORKFLOW_RUN_UPDATED_AT } = process.env;
   const result = await reportMergeQueueFailure({
     repository: GITHUB_REPOSITORY,
     headBranch: GITHUB_WORKFLOW_RUN_HEAD_BRANCH,
     conclusion: GITHUB_WORKFLOW_RUN_CONCLUSION,
     runUrl: `${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_WORKFLOW_RUN_ID}`,
     runId: GITHUB_WORKFLOW_RUN_ID,
+    // PEN-5592: when the run ENDED, which is what a `removed_from_merge_queue`
+    // has to precede to be read as the cause of its teardown.
+    runUpdatedAt: GITHUB_WORKFLOW_RUN_UPDATED_AT,
   });
-  console.log(result.reported ? `Reported merge-queue ejection for PR #${result.number}` : `Skipped: ${result.reason}`);
+  console.log(
+    result.reported
+      ? `Reported merge-queue ejection for PR #${result.number}`
+      : result.reason === "manual-dequeue"
+        ? `Skipped: manual-dequeue by ${result.dequeuedBy} (merge-queue-eviction-detector reports this one)`
+        : `Skipped: ${result.reason}`,
+  );
 }

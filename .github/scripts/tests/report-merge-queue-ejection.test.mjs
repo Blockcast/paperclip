@@ -7,6 +7,8 @@ import {
   failingJobSummary,
   runOutcomeText,
   causalJobs,
+  manualDequeueExplainingRun,
+  reportMergeQueueFailure,
 } from "../report-merge-queue-ejection.mjs";
 
 test("extracts PR numbers from merge-group synthetic refs", () => {
@@ -57,9 +59,11 @@ test("the ejection comment names the failing shards", () => {
   );
   // A job killed by `timeout-minutes` surfaces as cancelled, and that is the
   // class pr.yml deliberately trades a fast red for -- so it must be named too.
+  // PEN-5592: named, but as CANCELLED. GitHub's own conclusion for this job is
+  // `cancelled`; calling it a failure asserts a state the API does not report.
   assert.equal(
     failingJobSummary([{ name: "General tests (server 4/4)", conclusion: "cancelled" }]),
-    " Failing job: `General tests (server 4/4)`.",
+    " Cancelled job: `General tests (server 4/4)`.",
   );
   // Empty, not a dangling "Failing jobs:", when the jobs read gave nothing
   // usable -- the comment must still read as a sentence. Covers the
@@ -128,9 +132,13 @@ test("a `policy` timeout is named as the cause, not the `verify` lane that merel
     { name: "policy", conclusion: "cancelled", started_at: "2026-09-24T02:57:04Z", completed_at: "2026-09-24T03:08:22Z" },
     { name: "verify", conclusion: "failure", started_at: "2026-09-24T03:08:36Z", completed_at: "2026-09-24T03:08:47Z" },
   ];
+  // PEN-5592: `Cancelled job`, not `Failing job` -- `policy` concluded
+  // `cancelled` at its 600s cap, and the run sentence already says a timeout
+  // surfaces this way. The two halves now agree instead of the list asserting
+  // a failure the run text does not claim.
   assert.equal(
     `The merge-group run ${runOutcomeText("cancelled", jobs)}.${failingJobSummary(jobs)}`,
-    "The merge-group run was cancelled (a job timeout surfaces this way). Failing job: `policy`.",
+    "The merge-group run was cancelled (a job timeout surfaces this way). Cancelled job: `policy`.",
   );
   // Same shape, `timed_out` instead of `cancelled`. That value is in GitHub's
   // documented conclusion enum; under a denylist of bad states it was invisible
@@ -187,7 +195,7 @@ test("a lone failing job is never dropped for being vacuously last", () => {
   const jobs = [{ name: "e2e", conclusion: "failure", started_at: "2026-09-24T11:45:42Z", completed_at: "2026-09-24T12:05:41Z" }];
   assert.equal(failingJobSummary(jobs), " Failing job: `e2e`.");
   // Jobs with no timestamps at all (never dispatched) must not vanish either.
-  assert.equal(failingJobSummary([{ name: "policy", conclusion: "cancelled" }]), " Failing job: `policy`.");
+  assert.equal(failingJobSummary([{ name: "policy", conclusion: "cancelled" }]), " Cancelled job: `policy`.");
 });
 
 test("an in-flight job is not a cause: a null conclusion is excluded, not read as non-success", () => {
@@ -260,5 +268,202 @@ test("jobs cancelled at the same instant are all reported, not all dropped", () 
     { name: "Build", conclusion: "cancelled", started_at: "2026-09-24T10:00:00Z", completed_at: "2026-09-24T10:00:00Z" },
     { name: "e2e", conclusion: "cancelled", started_at: "2026-09-24T10:00:00Z", completed_at: "2026-09-24T10:00:00Z" },
   ];
-  assert.equal(failingJobSummary(jobs), " Failing jobs: `Build`, `e2e`.");
+  // PEN-5592: plural form of the cancelled label.
+  assert.equal(failingJobSummary(jobs), " Cancelled jobs: `Build`, `e2e`.");
+});
+
+
+// ---------------------------------------------------------------------------
+// PEN-5592: a deliberate dequeue is not a CI job timeout.
+//
+// The #3371 timeline, verbatim and all UTC on 2026-11-04. This is the measured
+// shape the whole guard exists for, and every case below is a perturbation of
+// exactly one field of it.
+// ---------------------------------------------------------------------------
+const PR_3371_TIMELINE = [
+  { event: "added_to_merge_queue", created_at: "2026-11-04T13:11:37Z", actor: "kkroo" },
+  { event: "removed_from_merge_queue", created_at: "2026-11-04T13:13:57Z", actor: "kkroo" },
+];
+// Run 41835906627 ended `cancelled` 57s AFTER the dequeue -- the dequeue is the
+// cause of the teardown, not a consequence of it.
+const PR_3371_RUN_ENDED = "2026-11-04T13:14:54Z";
+
+test("PEN-5592: a dequeue by a non-queue actor before the run ended is attributed to that actor", () => {
+  assert.deepEqual(
+    manualDequeueExplainingRun(PR_3371_TIMELINE, { runUpdatedAt: PR_3371_RUN_ENDED }),
+    { dequeuedAt: "2026-11-04T13:13:57.000Z", dequeuedBy: "kkroo" },
+  );
+});
+
+test("PEN-5592: a queue-initiated removal is NOT a manual dequeue", () => {
+  // The discriminator is the actor and nothing else. Same timeline, same
+  // ordering, same everything -- only the login differs, and this is the
+  // population whose notice ("rerun the checks, then re-enqueue") is correct.
+  const queueRemoved = [
+    PR_3371_TIMELINE[0],
+    { ...PR_3371_TIMELINE[1], actor: "github-merge-queue[bot]" },
+  ];
+  assert.equal(manualDequeueExplainingRun(queueRemoved, { runUpdatedAt: PR_3371_RUN_ENDED }), null);
+  // Case-insensitively, via the sibling's own predicate.
+  const shouty = [PR_3371_TIMELINE[0], { ...PR_3371_TIMELINE[1], actor: "GitHub-Merge-Queue[BOT]" }];
+  assert.equal(manualDequeueExplainingRun(shouty, { runUpdatedAt: PR_3371_RUN_ENDED }), null);
+});
+
+test("PEN-5592: the guard fails TOWARD reporting on every missing input", () => {
+  // No attribution available -> report, exactly as before PEN-5592. A timeline
+  // that stops carrying `actor` must never make a genuine ejection quieter.
+  const noActor = [PR_3371_TIMELINE[0], { ...PR_3371_TIMELINE[1], actor: null }];
+  assert.equal(manualDequeueExplainingRun(noActor, { runUpdatedAt: PR_3371_RUN_ENDED }), null);
+  assert.equal(
+    manualDequeueExplainingRun([PR_3371_TIMELINE[0], { ...PR_3371_TIMELINE[1], actor: "   " }], { runUpdatedAt: PR_3371_RUN_ENDED }),
+    null,
+  );
+  // Enqueued, never removed: the run died on its own.
+  assert.equal(manualDequeueExplainingRun([PR_3371_TIMELINE[0]], { runUpdatedAt: PR_3371_RUN_ENDED }), null);
+  // No timeline at all / unreadable run end.
+  assert.equal(manualDequeueExplainingRun([], { runUpdatedAt: PR_3371_RUN_ENDED }), null);
+  assert.equal(manualDequeueExplainingRun(PR_3371_TIMELINE, { runUpdatedAt: undefined }), null);
+  assert.equal(manualDequeueExplainingRun(PR_3371_TIMELINE, { runUpdatedAt: "not a date" }), null);
+});
+
+test("PEN-5592: a dequeue well AFTER the run already died is not its cause", () => {
+  // The direction that would over-suppress. A run that genuinely timed out at
+  // 13:14:54 and a hold placed at 14:00 are two unrelated acts;
+  // selectLatestQueueAttemptWindow applies no upper bound of its own, so
+  // without the skew test the later hold would be read as the cause of the
+  // earlier teardown and the real timeout would go unreported.
+  const lateHold = [
+    PR_3371_TIMELINE[0],
+    { event: "removed_from_merge_queue", created_at: "2026-11-04T14:00:00Z", actor: "kkroo" },
+  ];
+  assert.equal(manualDequeueExplainingRun(lateHold, { runUpdatedAt: PR_3371_RUN_ENDED }), null);
+  // Inside the record-ordering tolerance, it still counts: the run conclusion
+  // and the timeline event are written by different subsystems.
+  const justAfter = [
+    PR_3371_TIMELINE[0],
+    { event: "removed_from_merge_queue", created_at: "2026-11-04T13:15:30Z", actor: "kkroo" },
+  ];
+  assert.equal(manualDequeueExplainingRun(justAfter, { runUpdatedAt: PR_3371_RUN_ENDED })?.dequeuedBy, "kkroo");
+});
+
+test("PEN-5592: a LATER attempt's dequeue cannot be read as this run's cause", () => {
+  // #3371 really was re-enqueued at 20:59:58Z and dequeued again at 21:31:38Z.
+  // The 13:14:54 run must still anchor to the 13:13:57 removal -- pins the
+  // `now: endedAt` argument, without which the window walks forward to the
+  // most recent attempt and attributes an evening hold to a lunchtime run.
+  const full = [
+    ...PR_3371_TIMELINE,
+    { event: "added_to_merge_queue", created_at: "2026-11-04T20:59:58Z", actor: "allyblockcast[bot]" },
+    { event: "removed_from_merge_queue", created_at: "2026-11-04T21:31:38Z", actor: "kkroo" },
+  ];
+  assert.equal(
+    manualDequeueExplainingRun(full, { runUpdatedAt: PR_3371_RUN_ENDED }).dequeuedAt,
+    "2026-11-04T13:13:57.000Z",
+  );
+});
+
+/** Drives reportMergeQueueFailure with a scripted transport, recording every POST. */
+function fakeGitHub({ timeline, jobs, merged = false, isInMergeQueue = false }) {
+  const posts = [];
+  const request = async (path, options = {}) => {
+    if (path === "/graphql") return { data: { repository: { pullRequest: { merged, isInMergeQueue } } } };
+    if (path.includes("/timeline")) return timeline;
+    if (path.includes("/jobs")) return { jobs };
+    if (path.includes("/comments") && options.method === "POST") {
+      posts.push(JSON.parse(options.body).body);
+      return {};
+    }
+    if (path.includes("/comments")) return [];
+    throw new Error(`unexpected request: ${path}`);
+  };
+  return { request, posts };
+}
+
+const EJECTED_3371 = {
+  repository: "Blockcast/paperclip",
+  headBranch: "gh-readonly-queue/master/pr-3371-0e757f41",
+  conclusion: "cancelled",
+  runUrl: "https://github.com/Blockcast/paperclip/actions/runs/41835906627",
+  runId: "41835906627",
+  runUpdatedAt: PR_3371_RUN_ENDED,
+};
+// The 12 jobs the real notice listed as "Failing jobs" were killed mid-flight
+// by the dequeue. None failed; none timed out.
+const KILLED_MID_FLIGHT = [
+  { name: "Build", conclusion: "cancelled", started_at: "2026-11-04T13:12:10Z", completed_at: "2026-11-04T13:14:54Z" },
+  { name: "policy", conclusion: "cancelled", started_at: "2026-11-04T13:12:10Z", completed_at: "2026-11-04T13:14:54Z" },
+];
+
+test("PEN-5592: a deliberate dequeue produces NO notice, and never the re-enqueue instruction", () => {
+  // THE REGRESSION. Before this guard, this exact input posted "The merge-group
+  // run was cancelled (a job timeout surfaces this way). Failing jobs: ...
+  // fix or rerun the failing checks, then re-enqueue the PR." --
+  // `allyblockcast[bot]` then re-enqueued #3371 at an unchanged head at
+  // 20:59:58Z and the hold had to be reimposed at 21:31:38Z.
+  const { request, posts } = fakeGitHub({ timeline: PR_3371_TIMELINE, jobs: KILLED_MID_FLIGHT });
+  return reportMergeQueueFailure({ ...EJECTED_3371, request }).then((result) => {
+    assert.deepEqual(result, {
+      reported: false,
+      reason: "manual-dequeue",
+      number: 3371,
+      dequeuedBy: "kkroo",
+    });
+    // Not "no comment containing the bad advice" -- NO COMMENT. Asserted on the
+    // transport, so it holds however the body is later reworded.
+    assert.deepEqual(posts, []);
+  });
+});
+
+test("PEN-5592: positive control -- a queue-initiated cancel still gets its notice", () => {
+  // Mutation-proof pair for the test above: identical input but for the removal
+  // actor. If this one stopped posting, the suppression test would pass
+  // vacuously and prove nothing. Also pins that the string the regression
+  // forbids is genuinely reachable on this path.
+  const queueRemoved = [
+    PR_3371_TIMELINE[0],
+    { ...PR_3371_TIMELINE[1], actor: "github-merge-queue[bot]" },
+  ];
+  const { request, posts } = fakeGitHub({ timeline: queueRemoved, jobs: KILLED_MID_FLIGHT });
+  return reportMergeQueueFailure({ ...EJECTED_3371, request }).then((result) => {
+    assert.deepEqual(result, { reported: true, number: 3371 });
+    assert.equal(posts.length, 1);
+    assert.match(posts[0], /then re-enqueue the PR/);
+    // And the jobs it names are labelled as what GitHub says they are.
+    assert.match(posts[0], /Cancelled jobs: `Build`, `policy`\./);
+    assert.doesNotMatch(posts[0], /Failing job/);
+  });
+});
+
+test("PEN-5592: a cancelled run with no parseable run end fails loud, not open", () => {
+  // The guard must not be switchable off by dropping an env var from the
+  // workflow: that is the vacuous-green trap one layer up, and it would
+  // silently restore the #3371 behaviour on every future cancelled run.
+  const { request, posts } = fakeGitHub({ timeline: PR_3371_TIMELINE, jobs: KILLED_MID_FLIGHT });
+  return assert
+    .rejects(
+      () => reportMergeQueueFailure({ ...EJECTED_3371, runUpdatedAt: undefined, request }),
+      /parseable runUpdatedAt/,
+    )
+    .then(() => assert.deepEqual(posts, []));
+});
+
+test("PEN-5592: the timeline is not consulted for a `failure` run", () => {
+  // Scope discipline. A run GitHub marks `failure` DID fail, so its cause
+  // attribution was never in doubt and this guard must not touch it -- the
+  // fake transport throws on an unexpected path, so a stray timeline read here
+  // fails the test rather than passing silently.
+  const { request, posts } = fakeGitHub({
+    timeline: PR_3371_TIMELINE,
+    jobs: [{ name: "policy", conclusion: "failure", started_at: "2026-11-04T13:12:10Z", completed_at: "2026-11-04T13:14:00Z" }],
+  });
+  return reportMergeQueueFailure({
+    ...EJECTED_3371,
+    conclusion: "failure",
+    runUpdatedAt: undefined,
+    request,
+  }).then((result) => {
+    assert.deepEqual(result, { reported: true, number: 3371 });
+    assert.match(posts[0], /The merge-group run failed and GitHub may have removed/);
+    assert.match(posts[0], /Failing job: `policy`\./);
+  });
 });

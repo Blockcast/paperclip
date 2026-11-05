@@ -50,7 +50,14 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: master
-          sparse-checkout: .github/scripts/report-merge-queue-ejection.mjs
+          # PEN-5592: the second path is LOAD-BEARING, not tidying. The script
+          # imports the queue-removal attribution from the eviction detector
+          # rather than re-deriving it (that duplication is what let the two
+          # post contradictory causes for #3371), so dropping this line makes
+          # the reporter fail at `import`, not fall back to the old behaviour.
+          sparse-checkout: |
+            .github/scripts/report-merge-queue-ejection.mjs
+            scripts/merge-queue-eviction-detector.mjs
       - name: Report ejection to PR
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -59,4 +66,9 @@ jobs:
           GITHUB_WORKFLOW_RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           GITHUB_SERVER_URL: ${{ github.server_url }}
           GITHUB_WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+          # PEN-5592: a `removed_from_merge_queue` has to PRECEDE this to be
+          # read as the cause of the run's teardown. Dropping this line does
+          # not quietly restore the old guess -- the script throws on a
+          # cancelled run without it, by design.
+          GITHUB_WORKFLOW_RUN_UPDATED_AT: ${{ github.event.workflow_run.updated_at }}
         run: node .github/scripts/report-merge-queue-ejection.mjs
