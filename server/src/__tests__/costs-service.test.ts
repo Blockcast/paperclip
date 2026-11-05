@@ -1020,6 +1020,159 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(byProjectId.get(laterProjectId)).toBe(100);
   });
 
+  // PEN-5624: `activity_log.created_at` is `defaultNow()` = `now()` = TRANSACTION start
+  // time, so a run's multiple issue touches written in one transaction tie by
+  // CONSTRUCTION. With the sort keys equal, `DISTINCT ON (run_id)` keeps whichever row
+  // the executor presents first, and attribution can flip between requests over
+  // identical data. The `desc(activityLog.id)` tiebreaker makes the pick STABLE -- not
+  // recency-correct, since `activity_log.id` is a random v4 UUID with no time component.
+  //
+  // ON WHAT THIS TEST ACTUALLY PINS -- measured, not assumed. The fixture is built so
+  // the tiebreaker's winner (HIGH id) is the row inserted SECOND, in the hope that an
+  // untiebroken query would keep heap order and pick the other project. IT DOES NOT:
+  // reverting ONLY the tiebreaker leaves both behavioural assertions GREEN, because the
+  // executor happens to present the same row first anyway on this fixture. So the
+  // behavioural half does NOT falsify, and claiming it does would be false.
+  //
+  // What falsifies is the ORDER BY assertion below, which fails the moment the
+  // tiebreaker is dropped. PEN-5624 anticipated exactly this ("if it cannot be made to
+  // fail reliably ... say so"), and a tie that does not flap on a single-threaded
+  // embedded Postgres cannot be made to flap by trying harder -- the flap needs a plan
+  // or parallelism change this harness will not produce. The behavioural assertions are
+  // kept as a cheap invariant guard (total unmoved, two calls agree), not as the pin.
+  it("breaks a created_at tie in run attribution deterministically", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const losingProjectId = randomUUID();
+    const winningProjectId = randomUUID();
+    const losingIssueId = randomUUID();
+    const winningIssueId = randomUUID();
+
+    // Fixed ids, not random: the tiebreaker is `desc(id)`, so the winner must be known
+    // up front. The LOW id is inserted first, the HIGH id second.
+    const losingActivityId = "00000000-0000-4000-8000-000000000001";
+    const winningActivityId = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Tie Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: losingProjectId, companyId, name: "Lower Activity Id", status: "active" },
+      { id: winningProjectId, companyId, name: "Higher Activity Id", status: "active" },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: losingIssueId,
+        companyId,
+        projectId: losingProjectId,
+        title: "Tied touch A",
+        status: "done",
+        priority: "medium",
+        issueNumber: 1,
+        identifier: "TIE-1",
+      },
+      {
+        id: winningIssueId,
+        companyId,
+        projectId: winningProjectId,
+        title: "Tied touch B",
+        status: "done",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: "TIE-2",
+      },
+    ]);
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      status: "completed",
+      startedAt: new Date("2026-11-04T09:00:00.000Z"),
+      finishedAt: new Date("2026-11-04T09:30:00.000Z"),
+    });
+
+    // IDENTICAL `created_at` -- this is what one transaction's `now()` produces, written
+    // explicitly so the tie is a property of the fixture rather than of timing luck.
+    const tiedAt = new Date("2026-11-04T09:05:00.000Z");
+    await db.insert(activityLog).values([
+      {
+        id: losingActivityId,
+        companyId,
+        runId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.checked_out",
+        entityType: "issue",
+        entityId: losingIssueId,
+        details: {},
+        createdAt: tiedAt,
+      },
+      {
+        id: winningActivityId,
+        companyId,
+        runId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.checked_out",
+        entityType: "issue",
+        entityId: winningIssueId,
+        details: {},
+        createdAt: tiedAt,
+      },
+    ]);
+
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      heartbeatRunId: runId,
+      projectId: null,
+      provider: "anthropic",
+      biller: "anthropic",
+      billingType: "metered_api",
+      model: "claude-opus-5",
+      inputTokens: 1_000,
+      outputTokens: 500,
+      costCents: 100,
+      occurredAt: new Date("2026-11-04T09:10:00.000Z"),
+    });
+
+    const capturedSql: string[] = [];
+    const costsWithCapture = costService(withSqlCapture(db, capturedSql));
+
+    const first = await costsWithCapture.byProject(companyId);
+    const second = await costsWithCapture.byProject(companyId);
+
+    // Totals are untouched by the tiebreaker -- only WHICH project a tie lands on moves.
+    expect(first.reduce((sum, row) => sum + (row.costCents ?? 0), 0)).toBe(100);
+    expect(first).toHaveLength(1);
+    expect(first[0]?.projectId).toBe(winningProjectId);
+    expect(second[0]?.projectId).toBe(first[0]?.projectId);
+
+    const emitted = capturedSql.filter((text) => text.includes("run_project_links"));
+    expect(emitted.length).toBeGreaterThan(0);
+    for (const text of emitted) {
+      expect(text).toContain('order by "activity_log"."run_id", "activity_log"."created_at" desc, "activity_log"."id" desc');
+    }
+  });
+
   it("aggregates issue costs across recursive descendants only", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
