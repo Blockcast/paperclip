@@ -277,7 +277,7 @@ ambiguity, and it survives in row titles, doc headings and `scripts/measure-abso
 The concept is renamed to **unwrapped `git`**. This record keeps its filename for link stability — it
 is referenced by PEN-3183 — but uses the new term in prose. ✅ §7.1 and §7.2 adopted it: the
 predicate block at the head of §7.1 defines the counted thing as an **unwrapped `git`** (landed
-2026-10-30 in [#3098](https://github.com/Blockcast/paperclip/pull/3098)). ⚠ The **script filename**
+2026-10-31 in [#3146](https://github.com/Blockcast/paperclip/pull/3146)). ⚠ The **script filename**
 `scripts/measure-absolute-path-git.mjs` is **unchanged**, for the same link-stability reason this
 record keeps its own. **A control whose own name scores its correct operation as a violation will
 be misread again.**
