@@ -2488,3 +2488,31 @@ test("a refused invocation leaves no stdin buffer behind either (PEN-3193)", () 
     );
   });
 });
+
+// --- `--input` carries JSON, so the approval there is a JSON member ---------
+//
+// Matched with a stricter pattern than argv field values: a payload's `body` is
+// prose, and prose about an approval is not an approval. Scanning an `--input`
+// document with the argv pattern refused `{"body":"... event=APPROVE ..."}`,
+// which is the Suggestion-1 false positive wearing a different hat.
+for (const [label, payload, expected] of [
+  ["a real JSON approval", { event: "APPROVE", body: "lgtm" }, "refused"],
+  ["a JSON COMMENT review", { event: "COMMENT", body: "nit: stray import" }, "allowed"],
+  ["prose naming the wire value", { body: "ordinary author comment about event=APPROVE" }, "allowed"],
+  ["prose quoting the JSON form", { body: 'I quote "event":"APPROVE" while discussing the guard' }, "allowed"],
+]) {
+  test(`gh api --input with ${label} is ${expected} (PEN-3193)`, () => {
+    withTempDir((dir) => {
+      const file = path.join(dir, "payload.json");
+      writeFileSync(file, JSON.stringify(payload));
+      const args = ["api", "-X", "POST", "repos/o/r/pulls/5/reviews", "--input", file];
+      if (expected === "refused") {
+        assertRefused(runGuard(dir, args), APPROVED);
+        return;
+      }
+      const proc = runGuard(dir, args);
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.doesNotMatch(proc.stderr, /refusing to/);
+    });
+  });
+}

@@ -303,6 +303,14 @@ REVIEWER_EVIDENCE_RE='^[[:blank:]]{0,3}[#*]*[[:blank:]]*ally[[:blank:]]*(—|--|
 # is still caught.
 REVIEWER_EVIDENCE_APPROVAL_RE='^--approve$|event"?[[:blank:]]*[=:][[:blank:]]*"?approved?([^a-z]|$)'
 
+# `--input` carries a JSON document, so the approval there can only be the
+# member `"event": "APPROVE"`. Matched with its own, stricter pattern rather
+# than the one above: a payload's `body` string is prose, and prose about an
+# approval is not an approval (`{"body":"... event=APPROVE ..."}` must pass).
+# A quoted JSON fragment inside a body string arrives backslash-escaped
+# (`\"event\":\"APPROVE\"`), which this does not match either.
+REVIEWER_EVIDENCE_APPROVAL_JSON_RE='"event"[[:blank:]]*:[[:blank:]]*"approved?"'
+
 reviewer_evidence_refusal() {
   echo "gh-token-wrapper: refusing to ${1} as \`allyblockcast[bot]\`: this run's GH_TOKEN is the Ally App installation token, so the write would publish under the identity the review gates credit as reviewer evidence (PEN-3193). You are the PR author here, not the reviewer. If you are the reviewer's own harness, set GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE=${REVIEWER_EVIDENCE_ESCAPE}." >&2
   exit 1
@@ -380,17 +388,31 @@ reviewer_evidence_approval_tokens() {
     [ "${mode}" = api ] || continue
     v=""
     case "${a}" in
-      --field=* | --raw-field=* | --input=*) v="${a#*=}" a="${a%%=*}" ;;
-      -f?* | -F?*) v="${a#-?}" a="${a%"${v}"}" ;;
-      -f | -F | --field | --raw-field | --input)
+      --field=* | --raw-field=*) v="${a#*=}" ;;
+      -f?* | -F?*) v="${a#-?}" ;;
+      -f | -F | --field | --raw-field)
         v="${1:-}"
         shift
         ;;
       *) continue ;;
     esac
+    case "${v}" in body=*) continue ;; esac
+    printf '%s\n' "${v}"
+  done
+}
+
+# The `--input` payloads, emitted separately because they are matched with the
+# stricter JSON pattern above.
+reviewer_evidence_approval_json() {
+  while [ "$#" -gt 0 ]; do
+    a="$1"
+    shift
     case "${a}" in
-      --input) reviewer_evidence_cat "${v}" ;;
-      *) case "${v}" in body=*) ;; *) printf '%s\n' "${v}" ;; esac ;;
+      --input=*) reviewer_evidence_cat "${a#*=}" ;;
+      --input)
+        reviewer_evidence_cat "${1:-}"
+        shift
+        ;;
     esac
   done
 }
@@ -421,6 +443,10 @@ refuse_reviewer_evidence() {
   # the reviewer rather than the forger.
   if reviewer_evidence_approval_tokens "${mode}" "$@" |
     tr '[:upper:]' '[:lower:]' | grep -qE "${REVIEWER_EVIDENCE_APPROVAL_RE}"; then
+    reviewer_evidence_refusal "submit an APPROVED pull-request review"
+  fi
+  if [ "${mode}" = api ] && reviewer_evidence_approval_json "$@" |
+    tr '[:upper:]' '[:lower:]' | grep -qE "${REVIEWER_EVIDENCE_APPROVAL_JSON_RE}"; then
     reviewer_evidence_refusal "submit an APPROVED pull-request review"
   fi
 
