@@ -297,6 +297,17 @@ export function approvalService(db: Db) {
      * than re-filing it. `label` is derived server-side so the caller still gets
      * something triageable without shipping the payload body.
      *
+     * `decidedByUserId` is in this set deliberately, and removing it is a governance
+     * regression rather than a saving. It is a plain scalar column, so it costs
+     * nothing against the cheapness rationale above — and the row already carries
+     * `decidedAt`, which announces THAT a decision happened and when. Reporting the
+     * decision while withholding the decider is what makes the omission dangerous:
+     * a caller reading `row.decidedByUserId` off a projection that never had the key
+     * gets `undefined`/`null` and reads it as "no human decided this", which is the
+     * opposite of the truth and licenses resubmitting, withdrawing or overriding a
+     * deliberate human decision. That misread reached live reasoning twice before
+     * PEN-5432, including one card resubmitted past a human's return.
+     *
      * `issueId` filters through the issue_approvals join table.
      */
     listSummary: async (
@@ -315,6 +326,7 @@ export function approvalService(db: Db) {
           idempotencyKey: approvals.idempotencyKey,
           createdAt: approvals.createdAt,
           decidedAt: approvals.decidedAt,
+          decidedByUserId: approvals.decidedByUserId,
           title: sql<string | null>`${approvals.payload} ->> 'title'`,
           summary: sql<string | null>`${approvals.payload} ->> 'summary'`,
           description: sql<string | null>`${approvals.payload} ->> 'description'`,

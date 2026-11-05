@@ -22,8 +22,12 @@ import {
   DEPLOY_JOB_NAME,
   DISPATCH_FATE,
   classifyDispatchRun,
+  DEPLOY_BRANCH,
+  DEPLOY_GATE_JOB_NAME,
+  LANE_FAILED_TO_DELIVER_FATES,
   deployJobCompleted,
   deployJobExecuted,
+  deployLaneGatedOff,
   detectDeadDispatch,
   findLastCompletedDispatch,
   isDeadLane,
@@ -178,13 +182,17 @@ test('the deploy job name is matched EXACTLY, and shares that coupling deliberat
 // ---------------------------------------------------------------------------
 
 const listPath = '/actions/workflows/docker.yml/runs';
-const run = (id, status, conclusion, createdAt) => ({
+const run = (id, status, conclusion, createdAt, headBranch = 'master') => ({
   id,
   status,
   conclusion,
   created_at: createdAt,
   updated_at: createdAt,
   head_sha: `sha-${id}`,
+  // The live API always carries this, and every real production dispatch is on
+  // master. The gated-off claim reads it, so omitting it here would make these
+  // fixtures quieter than the runs they stand for.
+  head_branch: headBranch,
   html_url: `https://github.com/Blockcast/paperclip/actions/runs/${id}`,
 });
 
@@ -433,4 +441,168 @@ test('the detector publishes the run TIME and the STRICT refill signal (PEN-4224
     source,
     /setOutput\('last_dispatch_deploy_executed', result\.run\?\.deployExecuted === true \? 'true' : 'false'\)/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// PEN-5261: the lane that is SWITCHED OFF.
+//
+// The second cause of the same false green, and the one the original predicate
+// absorbed by construction: a GREEN run with `deploy` skipped was the shape
+// written for docker.yml's own pending guard, and a lane gated off at the
+// workflow level is byte-identical to it in run conclusion. The discriminator
+// is `guard-pending-deploy` — it declares no `needs:`, so nothing upstream can
+// make it skip, and it carries the same condition `deploy` carries.
+//
+// Replayed from the live run rather than invented: 41596391238, dispatched by
+// slot 41596273435 at 2026-11-03T07:27:01Z, concluded `success` with
+// production 90 commits behind.
+// ---------------------------------------------------------------------------
+
+const GATED_OFF_JOBS = jobs(
+  ['build-and-push', 'success'],
+  ['guard-pending-deploy', 'skipped'],
+  ['guard-pending-deploy-final', 'skipped'],
+  ['deploy', 'skipped'],
+);
+
+const GATED_OFF_RUN = { status: 'completed', conclusion: 'success', head_branch: 'master' };
+
+test('replay 2026-11-03 run 41596391238: a GREEN run whose entry guard never ran is the lane switched off', () => {
+  assert.equal(
+    classifyDispatchRun(GATED_OFF_RUN, GATED_OFF_JOBS),
+    DISPATCH_FATE.LANE_GATED_OFF,
+  );
+  // And it must NOT be reported as the death it superficially resembles: the
+  // remedies are opposite. A death is recovered by a later dispatch; this is
+  // recovered by no dispatch at all.
+  assert.notEqual(
+    classifyDispatchRun(GATED_OFF_RUN, GATED_OFF_JOBS),
+    DISPATCH_FATE.DIED_BEFORE_DEPLOY,
+  );
+});
+
+test('the discriminator is the ENTRY GUARD, not the deploy job — both shapes end with deploy skipped', () => {
+  // The pair that makes the predicate worth having. Identical run conclusion,
+  // identical `deploy` conclusion; they differ only in whether the guard RAN.
+  const run = { status: 'completed', conclusion: 'success', head_branch: 'master' };
+  const pendingGuardBlocked = jobs(
+    ['build-and-push', 'success'],
+    ['guard-pending-deploy', 'success'],
+    ['guard-pending-deploy-final', 'skipped'],
+    ['deploy', 'skipped'],
+  );
+  assert.equal(
+    classifyDispatchRun(run, pendingGuardBlocked),
+    DISPATCH_FATE.SURVIVED,
+    'a guard that RAN and reported blocked is normal, owned behaviour',
+  );
+  assert.equal(classifyDispatchRun(run, GATED_OFF_JOBS), DISPATCH_FATE.LANE_GATED_OFF);
+});
+
+test('an ABSENT entry guard is never claimed as gated off — absent is unknown, not off', () => {
+  // The fail-quiet direction, and the reason this predicate reads `skipped`
+  // rather than "not success". A renamed or matrixed guard job, and every
+  // abbreviated fixture in this file, present as ABSENT; claiming a switched-off
+  // lane from a job list that does not mention the gate would make this
+  // module's one loud report a guess. Also what keeps the LIVE_RUNS replay and
+  // the pre-existing green-skip test above honest.
+  assert.equal(deployLaneGatedOff(jobs(['deploy', 'skipped'])), false);
+  assert.equal(deployLaneGatedOff([]), false);
+  assert.equal(deployLaneGatedOff(undefined), false);
+  assert.equal(
+    classifyDispatchRun(GATED_OFF_RUN, jobs(['deploy', 'skipped'])),
+    DISPATCH_FATE.SURVIVED,
+  );
+});
+
+test('deployLaneGatedOff: only `skipped` counts, and the job name is matched EXACTLY', () => {
+  assert.equal(DEPLOY_GATE_JOB_NAME, 'guard-pending-deploy');
+  assert.equal(deployLaneGatedOff(jobs([DEPLOY_GATE_JOB_NAME, 'skipped'])), true);
+  for (const conclusion of ['success', 'failure', 'cancelled', null]) {
+    assert.equal(
+      deployLaneGatedOff(jobs([DEPLOY_GATE_JOB_NAME, conclusion])),
+      false,
+      `a ${conclusion} guard is not a switched-off lane`,
+    );
+  }
+  // Same matrix hazard pinned for DEPLOY_JOB_NAME, same safe direction.
+  assert.equal(deployLaneGatedOff(jobs(['guard-pending-deploy-final', 'skipped'])), false);
+  assert.equal(deployLaneGatedOff(jobs(['guard-pending-deploy (amd64)', 'skipped'])), false);
+});
+
+test('a CANCELLED run whose entry guard was skipped is still a supersede, not a switched-off lane', () => {
+  // The `success` conjunct earns its place here. A supersede stops the run, and
+  // the guard can show `skipped` when it is stopped before starting; treating
+  // that as a switched-off lane would redden the dispatcher on every successful
+  // supersede, which is exactly the over-claiming this module refuses.
+  assert.equal(
+    classifyDispatchRun(
+      { status: 'completed', conclusion: 'cancelled', head_branch: 'master' },
+      GATED_OFF_JOBS,
+    ),
+    DISPATCH_FATE.SURVIVED,
+  );
+});
+
+test('a hand-dispatched FEATURE BRANCH is not a switched-off lane — same skip, other conjunct', () => {
+  // Ally caught this on review at c5e86458. `guard-pending-deploy`'s condition
+  // has three conjuncts and a skipped guard proves only that ONE was false.
+  // `findLastCompletedDispatch` never filters by branch, so a human dispatching
+  // `docker.yml` by hand off a feature branch produces this shape off the REF
+  // conjunct, becomes the lane's last completed dispatch, and would be reported
+  // as `lane-gated-off` — naming a variable that may be perfectly healthy.
+  //
+  // Harmless before this fate existed (it classified `survived`); loud now.
+  assert.equal(DEPLOY_BRANCH, 'master');
+  assert.equal(
+    classifyDispatchRun(
+      { status: 'completed', conclusion: 'success', head_branch: 'release/v9' },
+      GATED_OFF_JOBS,
+    ),
+    DISPATCH_FATE.SURVIVED,
+    'the ref conjunct explains this skip; the variable is not implicated',
+  );
+  // Absent is not master either — the fail-quiet direction this module takes
+  // everywhere, and the same one `deployLaneGatedOff` takes for an absent guard.
+  assert.equal(
+    classifyDispatchRun({ status: 'completed', conclusion: 'success' }, GATED_OFF_JOBS),
+    DISPATCH_FATE.SURVIVED,
+    'an unreadable ref is not evidence the switch is off',
+  );
+  // And the real shape still reports, so this conjunct cannot silence the lane.
+  assert.equal(classifyDispatchRun(GATED_OFF_RUN, GATED_OFF_JOBS), DISPATCH_FATE.LANE_GATED_OFF);
+});
+
+test('a switched-off lane with production AT master reports nothing', () => {
+  // The gap conjunct is what lets a DELIBERATE pause be silent. The report is
+  // not "the switch is off" — it is "the switch is off AND commits are piling
+  // up behind it", which is the only version a human owes anything about.
+  const fate = DISPATCH_FATE.LANE_GATED_OFF;
+  assert.equal(isDeadLane({ fate, commitsBehind: 90 }), true);
+  assert.equal(isDeadLane({ fate, commitsBehind: 0 }), false, 'a paused lane with nothing to ship');
+  assert.equal(isDeadLane({ fate, commitsBehind: null }), false, 'unmeasurable gap stays quiet');
+  assert.ok(LANE_FAILED_TO_DELIVER_FATES.has(fate));
+  assert.ok(LANE_FAILED_TO_DELIVER_FATES.has(DISPATCH_FATE.DIED_BEFORE_DEPLOY));
+  for (const other of [DISPATCH_FATE.SURVIVED, DISPATCH_FATE.NONE, DISPATCH_FATE.UNKNOWN]) {
+    assert.equal(LANE_FAILED_TO_DELIVER_FATES.has(other), false, `${other} delivered or is unknown`);
+  }
+});
+
+test('detectDeadDispatch: a switched-off lane plus a positive gap is reportable end to end', async () => {
+  const client = stubClient({
+    [listPath]: (p) =>
+      p.includes('status=success')
+        ? { workflow_runs: [run(1, 'completed', 'success', '2026-11-02T09:09:42Z')] }
+        : { workflow_runs: [run(2, 'completed', 'success', '2026-11-03T07:27:01Z')] },
+    '/actions/runs/2/jobs': { jobs: GATED_OFF_JOBS },
+    '/actions/runs/1/jobs': { jobs: jobs(['deploy', 'success']) },
+    '/compare/': { ahead_by: 90, status: 'ahead' },
+  });
+  const result = await detectDeadDispatch({ client });
+  assert.equal(result.fate, DISPATCH_FATE.LANE_GATED_OFF);
+  assert.equal(result.dead, true);
+  assert.equal(result.gap.commitsBehind, 90);
+  // The strict refill signal must still say the lane was NOT refilled, so the
+  // durable stall record cannot be closed by a dispatch that shipped nothing.
+  assert.equal(result.run.deployExecuted, false);
 });

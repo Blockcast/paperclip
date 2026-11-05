@@ -85,6 +85,13 @@ import {
   hasStillPresentDisposition,
   isAllyAppLogin,
 } from "./check-ally-review-consistency.mjs";
+// The SAME helper the Ally review-consistency guard adopted for this exact
+// failure class (BLO-48423). Shared rather than re-implemented: PEN-5314 asked
+// whether the sibling guards duplicate the bare-`gh` pattern, and the answer
+// is that one shared retry already exists, so this file joins it instead of
+// becoming the third spelling. Importing is safe — that module runs nothing on
+// import (`if (isMainModule()) main()`).
+import { withRetry } from "./mirror-comment-review-gate-to-merge-group.mjs";
 
 /**
  * An auto-merge request older than this is treated as wedged rather than
@@ -209,14 +216,75 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * 2026-11-03T12:31Z produced 10 `enqueue` + 1 `already-enqueued` + 3
  * `cap:10-per-fire` -- a 14-PR eligible pool against a 10-PR budget -- and
  * the pool read at or above the cap on every hourly `landing-sweep` sample
- * from 08:29Z to 12:31Z.
+ * from 08:29Z to 12:31Z. Read that sample as a classification, not a fire:
+ * the 14:45Z fire that followed it enqueued 6. A sweep samples an eligible
+ * pool that other enqueue paths drain before the fire reaches it.
+ *
+ * CAUTION on that merge-count table: it is repo demand, not ROUTINE demand.
+ * This routine is one enqueue path among several. Measured 2026-11-04 over
+ * the two complete UTC days 11-02 and 11-03 -- 96 PRs merged, 91 of them
+ * carrying an `added_to_merge_queue` event -- 28 were enqueued within 15
+ * min of a scheduled fire, and 25 of those sat in a batch tight enough to
+ * be one. So 4 x 10 bounds the PRs that DEPEND on this routine, not the
+ * repo's throughput, and a merge count overstates what the ceiling governs.
+ *
+ * Measure the enqueue, then, not the merge -- and make the unit a PULL
+ * REQUEST. That is the part that is easy to get wrong, and it was gotten
+ * wrong in two directions at once in the version of this paragraph that
+ * stood until 2026-11-04:
+ *
+ *   - `git log` over the default branch counts COMMITS. Squash merge is
+ *     disabled on this repo, so an N-commit PR lands N commits carrying
+ *     the SAME committer second -- 185 commits for those 96 PRs (1.93x),
+ *     46 of them multi-commit, #3238 alone landing 12. A 12-commit PR
+ *     therefore fabricates exactly the tight cluster a fire looks like.
+ *     The committer date does equal `added_to_merge_queue` to the second,
+ *     so `git log` finds candidate instants; it cannot count them.
+ *   - `gh pr list --state merged` returns rows newest-CREATED first, so a
+ *     `mergedAt` window over a fixed `--limit` truncates silently and
+ *     still reads as complete: that window returned 100 / 125 / 125 rows
+ *     at limits 100 / 200 / 400. Page until two limits agree.
+ *
+ * A fire reads as a tight cluster of bot enqueues a few minutes past the
+ * hour, in DESCENDING PR number: 11-02T14:48:38Z n=8, 11-02T20:47:46Z n=5,
+ * 11-03T02:50:46Z n=6, 11-03T14:56:06Z n=6, each 16-40s wide at +2.8 to
+ * +11.8 min. Identity does NOT discriminate -- 77 of the 91 enqueues are
+ * `allyblockcast[bot]`, far more than any fire batch, so cluster shape is
+ * the only signal. The cap IS reached in practice, just not on either day
+ * above: the 2026-11-04T08:45Z fire enqueued exactly 10 in 32s
+ * (#3368 down to #3215), against 8 in 31s at 02:45Z the same morning.
+ *
+ * One thing that per-fire count does NOT tell you: a slot is spent at
+ * ENQUEUE, not at merge. Of the 10 that saturated 08:45Z, six merged,
+ * three were ejected by the merge queue inside 40 min (#3307, #3352,
+ * #3356) and one was still queued an hour later. An ejected PR burns a
+ * slot and lands nothing, so the daily ceiling bounds ATTEMPTS, and the
+ * yield under it is a second quantity to measure before buying more fires.
  *
  * If that has to be fixed, fix it with fire FREQUENCY, not by raising this
  * number. Raising the cap buys throughput by spending the blast-radius
  * guarantee in the first paragraph, and spends it silently -- nothing about
  * a larger number announces that the safety margin moved. More fires at the
- * same cap leave the per-fire radius at exactly 10 and raise the daily
- * ceiling linearly, so the two concerns stay decoupled.
+ * same cap leave the PER-FIRE radius at exactly 10 and raise the daily
+ * ceiling linearly.
+ *
+ * They do not leave the per-DAY exposure alone, and the paragraph above
+ * claimed they did ("the two concerns stay decoupled") until this
+ * correction. The 40 is a second bound in its own right: it caps how many
+ * PRs a wrong verdict of ANY kind can land in a day -- a classifier bug, or
+ * a head verdict this routine trusted and should not have. Six fires at a
+ * cap of 10 is 60, so frequency buys latency by spending THAT bound. It is
+ * still the better lever than raising the cap, which spends both bounds at
+ * once; it is just not a free one. Price the per-day axis before proposing
+ * it, rather than stopping at "per-fire radius unchanged".
+ *
+ * Proposed and DEFERRED, 2026-11-03 (PEN-5397): the six-hourly cron stays
+ * and this constant stays 10. The deferral turned on the per-day axis
+ * above, against a condition that is dated and expected to clear, recorded
+ * on PEN-5397 rather than here so this comment does not outlive it -- read
+ * that row before citing this paragraph as a standing refusal. Re-measure
+ * pool-against-budget once PEN-5279 lands; re-propose only if the
+ * deferral is still biting.
  *
  * The related REPORTING gap -- that a PR deferred by this cap is visible to
  * neither alarm arm -- is a separate defect owned by PEN-5391, not this
@@ -1871,8 +1939,132 @@ export function ghWithRateLimitRetry(
   }
 }
 
+/**
+ * How many times a transient read is attempted, and the backoff step between
+ * attempts (PEN-5314).
+ *
+ * `withRetry` waits `delayMs * attempt`, so 3 attempts spend 2s then 4s — a
+ * bounded, growing backoff with a 6s ceiling per call. Deliberately NOT the
+ * rate-limit path's wait: that one reads a RESET TIMESTAMP off a probe
+ * (`rateLimitWaitMs`), and a 5xx has no reset timestamp to read, so routing a
+ * 502 through it yields either `sleep(0)` — an instant retry into an API that
+ * is mid-5xx — or `null`, which rethrows. The two waits answer different
+ * questions and cannot share an implementation.
+ *
+ * 3/2s matches the Ally guard's config, which is the one measured to work on
+ * this failure class, rather than a second set of numbers to reason about.
+ *
+ * ⚠ It NESTS. `resolveMergeState` already spends up to MERGE_STATE_RETRIES
+ * reads of its own and swallows a throw as "still unknown", so a sustained
+ * 5xx costs it 3 x 6s per undecided PR rather than 6s. That is bounded and
+ * acceptable: the storm that would make it expensive fails `fetchOpenPrs`
+ * first and aborts the fire in ~6s, while the intermittent case this exists
+ * for usually succeeds on attempt 2. The job's `timeout-minutes: 15` is the
+ * backstop — and note a timeout kills the process, so it reports neither this
+ * module's exit codes nor a verdict; that state is only readable at the
+ * workflow level.
+ */
+export const TRANSIENT_RETRY_ATTEMPTS = 3;
+export const TRANSIENT_RETRY_DELAY_MS = 2_000;
+
+/** The `gh` failure text, from whichever field carries it. */
+export function ghErrorMessage(error) {
+  return error?.stderr?.toString() || error?.message || String(error);
+}
+
+/**
+ * A `gh` failure that is GitHub being briefly unavailable rather than an
+ * answer (PEN-5314).
+ *
+ * Narrow on purpose. `500` is excluded: GitHub returns it for a malformed or
+ * too-expensive GraphQL query, which retrying cannot fix and which would spend
+ * the whole backoff on every fire. `502/503/504` are the shapes measured on
+ * this call — `fetchOpenPrs` 502'd on 3 of 3 attempts against a 153-PR repo
+ * (PEN-5442) and the hourly Ally guard saw 502/504 on 10 of 40 runs
+ * (BLO-48423).
+ *
+ * `isFatalGhError` is subtracted so the DELIBERATE abort can never be retried
+ * away: an exhausted rate limit or bad credentials must still end the fire.
+ * The two classes do not overlap today (`HTTP 40[13]` vs `HTTP 50[234]`); the
+ * subtraction keeps that true if either predicate is ever widened.
+ */
+export function isTransientGhError(message) {
+  const text = String(message ?? "");
+  if (isFatalGhError(text)) return false;
+  return (
+    /HTTP 50[234]\b/i.test(text) ||
+    /\b(?:Bad Gateway|Service Unavailable|Gateway Time-?out)\b/i.test(text)
+  );
+}
+
+/** `gh api` flags that turn a default GET into a POST. */
+const GH_API_BODY_FLAGS = new Set(["-f", "-F", "--field", "--raw-field", "--input"]);
+/** `gh pr` subcommands that only read. */
+const GH_PR_READ_SUBCOMMANDS = new Set(["list", "view", "diff", "checks", "status"]);
+
+/**
+ * Whether this invocation is a read that is safe to repeat (PEN-5314).
+ *
+ * ⛔ This gate is the reason the retry is not simply `withRetry(gh)`. The Ally
+ * guard CAN wrap every call blindly because every call it makes is a read.
+ * This file is not that: it runs `pr merge --auto` and `pr comment`, and a 5xx
+ * can be returned AFTER the mutation was applied — so a blind retry risks
+ * arming auto-merge twice or double-posting a comment. The existing rate-limit
+ * retry is safe for writes for a reason that does NOT transfer here: a 403
+ * applied nothing, a 502 may have applied everything.
+ *
+ * A POSITIVE allowlist, so anything it cannot identify is left unretried and
+ * behaves exactly as it does today. That direction also keeps
+ * `fetchCodeownerRules` cheap: it walks CODEOWNERS_PATHS EXPECTING 404s, and a
+ * blind retry would pay 6s of backoff on every expected miss.
+ */
+export function isIdempotentGhRead(args) {
+  const argv = (Array.isArray(args) ? args : []).map((arg) => String(arg));
+  if (argv.length === 0) return false;
+  if (argv[0] === "pr") return GH_PR_READ_SUBCOMMANDS.has(argv[1]);
+  if (argv[0] !== "api") return false;
+
+  // An explicit method is the whole answer, whatever else is on the line.
+  const method = argv.findIndex((arg) => arg === "-X" || arg === "--method");
+  if (method !== -1) return ["GET", "HEAD"].includes((argv[method + 1] ?? "").toUpperCase());
+
+  // GraphQL is POSTed even to read, so the body flags below cannot classify
+  // it; the query text can. A `mutation` keyword anywhere in the invocation
+  // disqualifies it. Bounded to the endpoint slot so a REST path that merely
+  // contains the word cannot reach this branch.
+  if (argv.indexOf("graphql") === 1 || argv.indexOf("graphql") === 2) {
+    return !argv.some((arg) => /\bmutation\b/i.test(arg));
+  }
+
+  // Plain `gh api <path>` is a GET until a body flag makes it a POST.
+  return !argv.some((arg) => GH_API_BODY_FLAGS.has(arg));
+}
+
+/**
+ * Runs `gh`, waiting out a near-reset rate limit (BLO-51665) and retrying a
+ * transient 5xx on an idempotent read (PEN-5314).
+ *
+ * A write gets `attempts: 1`, so it takes the inner rate-limit behaviour and
+ * nothing else — no added latency, no repeated mutation.
+ */
+export function ghWithTransientRetry(
+  args,
+  {
+    exec = ghWithRateLimitRetry,
+    retry = withRetry,
+    attempts = TRANSIENT_RETRY_ATTEMPTS,
+    delayMs = TRANSIENT_RETRY_DELAY_MS,
+  } = {},
+) {
+  return retry(`gh ${args.slice(0, 2).join(" ")}`, () => exec(args), {
+    attempts: isIdempotentGhRead(args) ? attempts : 1,
+    delayMs,
+    shouldRetry: (error) => isTransientGhError(ghErrorMessage(error)),
+  });
+}
+
 function gh(args) {
-  return ghWithRateLimitRetry(args);
+  return ghWithTransientRetry(args);
 }
 
 /**
@@ -2378,6 +2570,27 @@ export function demoteMergeActions(rows) {
  * BLO-33208) and regrown in the same repos every time. A single-repo sweep is
  * how the other two stay unobserved between cleanups.
  *
+ * ## That paragraph is the intent, and no caller delivers it today
+ *
+ * It has been read as a description of what runs. It is not. Every fire
+ * covers exactly one repo, for two unrelated reasons:
+ *
+ * - `--alarm` (`.github/workflows/landing-sweep.yml`, step "Alarm on PRs that
+ *   have been landable for hours and are still open") pins
+ *   `LAND_CLEAN_PRS_REPO` to the workflow's own repository, which can never be
+ *   a comma-separated list. Un-pinning it alone would not widen the sweep
+ *   either; that step's env block records why.
+ * - `--apply` (the landing routine, which runs outside Actions) covers
+ *   `Blockcast/paperclip` only. Established by its own output rather than by
+ *   its configuration, which is not readable from this repository: sampled
+ *   `Blockcast/paperclip` PRs held on a code-owner review each carry exactly
+ *   one `CODEOWNER_REQUEST_MARKER` comment, while the
+ *   `Blockcast/penstock-llm-proxy-core` PRs under the identical hold carry
+ *   none. PEN-5423 holds the dated per-PR counts.
+ *
+ * So the comma-separation is reachable, but only by whoever configures the
+ * `--apply` routine — not by anything in this repository.
+ *
  * This list is the LAND list, and since PEN-5430 that is all it is. A repo
  * named here has `gh pr merge --auto` armed on its clean PRs. To get a repo's
  * code-owner holds NOTIFIED without that, name it in `notifyRepos()` below —
@@ -2509,6 +2722,74 @@ export function markFailure(row, message) {
  */
 const BESPOKE_COMMENT_ACTIONS = new Set(["codeowner-review-requested", "stale-enqueue"]);
 
+/**
+ * The order the apply loop walks `rows` in: every `enqueue` row first, oldest
+ * PR first, then every other row in its `rows` position.
+ *
+ * ## This is DELIBERATELY not the order of `rows`, and the difference must survive
+ *
+ * `rows` is the RECEIPT. It comes back in `gh pr list` order (newest first) and
+ * `classifyAll` keeps it that way on purpose, so one fire's receipt diffs
+ * against the last one's. That stability is pinned by its own test and is not
+ * negotiable. This function therefore reorders the ITERATION and leaves the
+ * array alone — it returns the same row OBJECTS, so the in-place `row.action`
+ * and `row.detail` writes the loop makes still land in the receipt, in receipt
+ * order. An edit that "fixes the inconsistency" by sorting `rows` instead
+ * breaks the receipt; an edit that drops this call restores the defect below.
+ *
+ * ## Why the apply order has to differ at all (PEN-5503)
+ *
+ * The loop can DIE PARTWAY. Every `applyRow` call can throw something
+ * `isFatalGhError` calls untrustworthy, and that exits the process, so a row's
+ * position in the apply order decides whether a fire that dies reaches it.
+ *
+ * Before BLO-51664 the cap was spent newest-first, so the winners were a
+ * contiguous PREFIX of the newest-first listing and were applied FIRST; a
+ * truncation killed rows already headed for `cap:N-per-fire`, which cost
+ * nothing. Spending the cap oldest-first moved the winner block to a contiguous
+ * SUFFIX — so an abort began dropping exactly the oldest PRs that fix exists
+ * to protect. Measured on the 2026-11-04 08:45Z fire: the ten winners were
+ * applied in one descending burst ending at the oldest, #3215, 32s in.
+ *
+ * ## Why ALL enqueues, and not merely the winners among themselves
+ *
+ * Permuting the winners into age order inside their existing slots satisfies
+ * the letter of that and leaves most of the exposure standing: `applyRow`
+ * mutates remote state for `codeowner-review-requested` too, and those rows are
+ * interleaved among the winners by PR number. Same fire, in apply order: 18
+ * abort-capable calls to reach the last winner, 8 of them notifications. So the
+ * hoist is over the whole `enqueue` cohort, for three reasons:
+ *
+ *   - The two actions are not equally expensive to lose. A deferred
+ *     notification is `commentOnce`-deduped: it arrives 6h late and still posts
+ *     exactly once. A deferred `enqueue` costs 6h AND re-presents as fresh
+ *     demand against a cap that is spent at enqueue rather than at merge.
+ *   - The deferrable work is itself an abort CAUSE. `commentOnce` reads the
+ *     PR's whole comment list with `--paginate` before deciding whether to
+ *     post, so those rows burn paginated rate limit ahead of the scarce action
+ *     — and an exhausted rate limit is one of the things `isFatalGhError`
+ *     fires on.
+ *   - It shortens the classification-to-enqueue window, which can only reduce
+ *     the `head moved since classification` refusals of PEN-4887.
+ *
+ * Nothing orders against the hoist: one PR yields one row, so a `stale-enqueue`
+ * disarm and an `enqueue` are never the same PR, and `stalledHolds` reads
+ * `rows` after the loop. In a notify-only repo `demoteMergeActions` has already
+ * renamed every `enqueue`, so this is an identity there.
+ *
+ * Ascending PR number is the age proxy, the same key `classifyAll` allocates
+ * on; a row with no usable number sorts last, and ties keep `rows` order.
+ */
+export function applyOrder(rows) {
+  const indexed = (rows ?? []).map((row, i) => ({ row, i }));
+  const age = ({ row }) => row?.number ?? Infinity;
+  const enqueues = indexed
+    .filter(({ row }) => row?.action === "enqueue")
+    .sort((a, b) => age(a) - age(b) || a.i - b.i);
+  const rest = indexed.filter(({ row }) => row?.action !== "enqueue");
+  return [...enqueues, ...rest].map(({ row }) => row);
+}
+
 export function runRepo(
   repo,
   apply,
@@ -2586,7 +2867,12 @@ export function runRepo(
     if (row.action === "approval-rotted") rotted.push(`${repo}#${row.number} (${row.detail})`);
   }
 
-  for (const row of rows) {
+  // ⚠ APPLY ORDER IS NOT RECEIPT ORDER, ON PURPOSE. `rows` stays in listing
+  // order for the receipt; `applyOrder` hoists the scarce `enqueue` work to the
+  // front, oldest first, so a fire that dies partway has already spent the cap
+  // on the oldest PRs rather than on whatever the listing happened to put
+  // first. Read its doc comment before collapsing the two orders back together.
+  for (const row of applyOrder(rows)) {
     if (!apply) continue;
     try {
       const outcome = applyOne(repo, row, applyRun);
@@ -2601,7 +2887,12 @@ export function runRepo(
         // the output, and the repos that already completed earned it.
         reportRotted(rotted);
         console.error(`\nAborted the fire: ${row.detail}`);
-        process.exit(1);
+        // PEN-5314: this abort is a TRANSPORT failure (exhausted rate limit,
+        // bad credentials), not a verdict, so it spends the unmeasured code
+        // rather than the alarm's `1`. `stranded` is not passed: this path is
+        // reachable only under `--apply`, which `main` refuses to combine with
+        // `--alarm`, so there is no alarm cohort in flight to report.
+        process.exit(EXIT_UNMEASURED);
       }
       markFailure(row, message);
     }
@@ -2834,8 +3125,113 @@ function reportRotted(rotted) {
 }
 
 /**
- * The exit code for an alarm run: 1 when any repo carried an unlanded-eligible
- * or a cap-starved PR, 0 otherwise.
+ * The exit code for a fire that could not finish measuring (PEN-5314).
+ *
+ * ⛔ THE POINT IS THAT IT IS NOT 1. Every other outcome this script can reach
+ * already spends 0, 1 or 2:
+ *
+ *   0  measured, nothing wrong                    `alarmExitCode`
+ *   1  measured, a PR is stranded or starved      `alarmExitCode`
+ *   2  `--alarm` + `--apply` misuse               `main`
+ *   3  COULD NOT MEASURE                          `main` AND `alarmExitCode`
+ *
+ * ⚠ `3` is spent from TWO places, and they are the same claim at two scales:
+ * `main` when the sweep itself threw, and `alarmExitCode` when the sweep
+ * finished but PEN-5442's `unreadable` cohort is the only non-empty one. Both
+ * mean "this run did not look at everything, so do not read it as health".
+ *
+ * That second site exists because the per-repo catch landed AFTER the first
+ * draft of this constant and quietly took the headline case back: a transient
+ * 5xx exhausting `fetchOpenPrs`'s retries is not fatal, so `repoRunner` catches
+ * it, pushes the repo onto `unreadable` and returns `[]` — and `alarmExitCode`
+ * then spent `1` for it. The dominant "GitHub 502'd" case was spelled as a
+ * stranded cohort again, which is the exact defect this constant was added to
+ * remove. A table that disagrees with the code is worse than no table, because
+ * a workflow `if:` gets written against the table.
+ *
+ * Before this existed, an abort exited 1 — the node default for an uncaught
+ * throw, and the same integer `alarmExitCode` spends to report a real stranded
+ * cohort. So a red landing-sweep meant either "PRs have been landable for
+ * {UNLANDED_ELIGIBLE_HOURS}h and nothing took them" or "GitHub 502'd and this
+ * run never classified a single PR", with nothing in the exit code to tell
+ * them apart. That is the same unmeasured-state-encoded-as-a-measured-state
+ * defect as PEN-5158 and PEN-4458.
+ *
+ * 3 rather than 2 because 2 is taken, and the collision would only be found
+ * after a workflow `if:` had been written against it.
+ */
+export const EXIT_UNMEASURED = 3;
+
+/**
+ * Says, on stderr, that the fire stopped before it finished — and reports
+ * whatever alarming cohorts it HAD computed (PEN-5314).
+ *
+ * Reporting the partial cohorts is deliberate: "I could not finish, and here is
+ * what I found before I stopped" is strictly more useful than either half. It
+ * is explicitly NOT a verdict, and the text says so, because the rows below it
+ * are a prefix of the real answer and a reader must not treat a short list as
+ * a complete one.
+ *
+ * ⛔ EVERY alarming cohort, not just the first. `stranded` and `starved` are
+ * both collected by reference as the sweep runs, so each is a genuine prefix
+ * of its own answer; reporting one and not the other makes the summary quietly
+ * untrue for the arm it omits, in a run whose whole claim is "here is what I
+ * had". `unreadable` is deliberately NOT here — it is printed unconditionally
+ * by `reportUnreadable` from `main`'s `finally`, which runs before this.
+ */
+export function reportUnmeasured(
+  error,
+  stranded = [],
+  // ⛔ `starved` rides in the OPTIONS BAG, not in a third positional slot.
+  // Both of this file's last two parameter insertions bound an existing
+  // caller's options bag to the new positional in silence (BLO-51665's
+  // rate-limit test, then PEN-5391's spread), which is why `runRepo` now opens
+  // with an `Array.isArray` throw. A key cannot collide with a bag, so this
+  // insertion cannot repeat that — every existing two- and three-argument
+  // caller keeps its exact meaning.
+  { alarm = false, starved = [], log = console.error } = {},
+) {
+  const message = ghErrorMessage(error).trim().split("\n")[0];
+  log(
+    `\nDID NOT MEASURE: the sweep stopped before every repo was classified — ${message}\n` +
+      `Exiting ${EXIT_UNMEASURED}, which is NOT the alarm code. This run makes no claim ` +
+      "about whether any PR is stranded; it never finished looking.",
+  );
+  // One line is the right amount of a `gh` failure and the wrong amount of a
+  // programming error: for the latter the first line is the least useful part
+  // of what Node would otherwise have printed, and the frames are the whole
+  // diagnosis. `ghErrorMessage` prefers `stderr`, so its ABSENCE is the tell
+  // that this throw did not come from a subprocess.
+  if (!error?.stderr && error?.stack) log(error.stack);
+  if (!alarm) return;
+  // Every alarming cohort collected so far, not just the first one. These are
+  // gathered by reference as the sweep runs, so each is a genuine prefix of
+  // its real answer; omitting one makes "here is what I found before I
+  // stopped" quietly untrue for that cohort.
+  const partial = [
+    ["unlanded-eligible", stranded ?? []],
+    ["cap-starved", starved ?? []],
+  ].filter(([, cohort]) => cohort.length > 0);
+  if (partial.length === 0) {
+    log(
+      "No unlanded-eligible or cap-starved PR had been found when the sweep stopped — but " +
+        "the repos after the failure were never read, so this is an empty PREFIX, not an " +
+        "all-clear.",
+    );
+    return;
+  }
+  for (const [label, cohort] of partial) {
+    log(
+      `Partial ${label} cohort found before stopping (${cohort.length}, ` +
+        `possibly incomplete) — ${cohort.join(", ")}.`,
+    );
+  }
+}
+
+/**
+ * The exit code for an alarm run that COMPLETED: 1 when any repo carried an
+ * unlanded-eligible or a cap-starved PR, 0 otherwise. A run that could not
+ * finish does not reach this — it spends `EXIT_UNMEASURED` instead.
  *
  * Separated from `main` so the AC4 contract — go visibly red rather than
  * relying on someone noticing by hand — is pinned by a test rather than by
@@ -2856,7 +3252,29 @@ function reportRotted(rotted) {
  * for UNLANDED_ELIGIBLE_HOURS" asserted over a repo this fire never read. That
  * is the fail-OPEN direction and it is exactly the shape of silent all-clear
  * this detector exists to rule out, so the skip and this term ship together: a
- * repo that went unread makes the alarm red on its own.
+ * repo that went unread goes NON-ZERO on its own.
+ *
+ * ⚠ It goes non-zero as `EXIT_UNMEASURED`, not as `1`, and the distinction is
+ * the entire point of PEN-5314 rather than a tidier spelling of it. `1` is a
+ * MEASURED claim — "this fire looked, and found a PR nobody landed". An
+ * unreadable repo is the opposite claim: this fire did not look. Spending `1`
+ * for it rebuilt the exact ambiguity `EXIT_UNMEASURED` was added to remove,
+ * and it did so for the DOMINANT case, since a transient 5xx that outlives its
+ * retries arrives here rather than at `main`'s `sweepError` branch.
+ *
+ * The fail-open guard above is untouched by that change and does not depend on
+ * which integer is spent: `EXIT_UNMEASURED` is non-zero, so the step still
+ * fails and the schedule still goes red. `landing-sweep.yml` reads zero vs
+ * non-zero and nothing finer.
+ *
+ * ⛔ PRECEDENCE, when more than one cohort is non-empty: a measured alarm wins.
+ * `stranded`/`starved` are complete verdicts over the repos that WERE read —
+ * the per-repo catch is per-repo, so the others ran in full — and a real PR to
+ * act on outranks a report about transport. `1` surfaces that; the `unreadable`
+ * ALARM block still names the skipped repos, so nothing is lost by it. This is
+ * the one asymmetry with `main`'s `sweepError` path, which spends
+ * `EXIT_UNMEASURED` even with a non-empty `stranded` — correctly, because there
+ * the sweep ABORTED, so that cohort is a prefix rather than a verdict.
  *
  * `starved` (PEN-5391) is a THIRD argument rather than a widening of either
  * existing one because the cohorts are reported separately and have different
@@ -2871,11 +3289,17 @@ function reportRotted(rotted) {
  * not happened anyway, which is a statement about the routine itself.
  */
 export function alarmExitCode(stranded, unreadable = [], starved = []) {
-  return (stranded ?? []).length > 0 ||
-    (unreadable ?? []).length > 0 ||
-    (starved ?? []).length > 0
-    ? 1
-    : 0;
+  // MEASURED alarms first. A stranded or cap-starved PR is a thing to act on,
+  // and `1` is the code that says so. An unreadable repo standing beside one
+  // does not soften that verdict and must not mask it — the `ALARM:` block
+  // still names the skipped repos either way.
+  if ((stranded ?? []).length > 0 || (starved ?? []).length > 0) return 1;
+  // Nothing measured went wrong AND a repo went unread. That is definitionally
+  // "could not measure" by this file's own words — `reportUnreadable` prints
+  // "This fire asserts nothing about these" — so it spends EXIT_UNMEASURED
+  // rather than borrowing the stranded cohort's integer.
+  if ((unreadable ?? []).length > 0) return EXIT_UNMEASURED;
+  return 0;
 }
 
 function main() {
@@ -2905,14 +3329,32 @@ function main() {
   // in and must not land in; `targetRepos()` is unchanged, so an unset
   // LAND_CLEAN_PRS_NOTIFY_REPO leaves behaviour exactly as it was.
   const notify = new Set(notifyRepos());
+  // PEN-5314. Captured rather than exited on, because `process.exit` does NOT
+  // unwind: exiting from the catch would skip the `finally` and lose the
+  // priority cohort that the repos already swept had earned. So the `finally`
+  // runs first, then the unmeasured report, then the exit.
+  let sweepError = null;
   try {
     sweepRepos(
       sweepOrder(targetRepos(), [...notify]),
       repoRunner(apply, settleMinutes, rotted, stranded, runRepo, notify, unreadable, starved),
     );
+  } catch (error) {
+    sweepError = error;
   } finally {
     reportRotted(rotted);
     reportUnreadable(unreadable);
+  }
+
+  if (sweepError) {
+    // ⛔ Fails CLOSED, and this is the direction that matters: the run exits
+    // non-zero and says it measured nothing. It must never fall through to the
+    // `alarm` block below, because reaching `alarmExitCode` with an empty
+    // `stranded` would spend 0 — a confident all-clear printed over repos that
+    // were never read. That is precisely the fail-open shape
+    // `assertPrListComplete` exists to prevent one layer down.
+    reportUnmeasured(sweepError, stranded, { alarm, starved });
+    process.exit(EXIT_UNMEASURED);
   }
 
   if (!apply) console.log("\n(dry run — pass --apply to act)");

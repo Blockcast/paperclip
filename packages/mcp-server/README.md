@@ -64,6 +64,8 @@ Write tools:
 - `paperclipUpdateIssue`
 - `paperclipCheckoutIssue`
 - `paperclipReleaseIssue`
+- `paperclipClaimWorkspaceDir`
+- `paperclipReleaseWorkspaceDir`
 - `paperclipAddComment`
 - `paperclipSuggestTasks`
 - `paperclipAskUserQuestions`

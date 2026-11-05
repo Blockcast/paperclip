@@ -36,6 +36,6 @@ const manifest = JSON.parse(
 );
 assert.equal(
   manifest.overrides?.["fast-uri"],
-  "^3.1.6",
+  ">=3.1.9 <4",
   "designer package.json must pin the fast-uri override that keeps npm off the vulnerable range",
 );

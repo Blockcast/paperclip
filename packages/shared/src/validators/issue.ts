@@ -356,6 +356,10 @@ export const issueExecutionMonitorStateSchema = z.object({
   // spread; `null` means a clear genuinely found nothing owed. Old rows still
   // parse, because the key is optional rather than defaulted.
   clearedNextCheckAt: z.string().datetime().nullable().optional(),
+  // PEN-5346. `prefault(null)` so the rows written before this field existed —
+  // which is the whole backfill population — parse as "handoff still owed"
+  // rather than failing validation or reading as already discharged.
+  recoveryEmittedAt: z.string().datetime().nullable().prefault(null),
 });
 
 export const issueReviewRequestSchema = z.object({
@@ -1670,7 +1674,46 @@ export const createIssueThreadInteractionSchema = z.discriminatedUnion("kind", [
     sourceRunId: z.string().guid().nullable().optional(),
     title: z.string().trim().max(240).nullable().optional(),
     summary: z.string().trim().max(1000).nullable().optional(),
-    continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("none"),
+    // PEN-5505: `wake_assignee`, matching the four sibling kinds. This member
+    // defaulted to `none` — the only one of the five that did — which made a
+    // card filed with defaults emit nothing in any terminal state: not on
+    // accept, not on reject, and (for every policy) not on expiry. Since
+    // `supersedeOnUserComment` also defaults true, such a card had one path to
+    // being noticed and two to disappearing unannounced, and `request_confirmation`
+    // is the kind most used for human merge/approval gates.
+    //
+    // `wake_assignee` rather than `wake_assignee_on_accept`, because a rejection
+    // here is information the author must act on: the reject route records a
+    // decline reason and, for a tool action, composes explicit "do not retry the
+    // same call" instructions (`readToolActionContinuationContext`) that only
+    // reach the agent through this wake. `wake_assignee_on_accept` would build
+    // those and drop them. The platform's own most safety-critical producer of
+    // this kind — the tool-action approval gate in `tool-gateway.ts` — already
+    // hardcodes `wake_assignee`, so this aligns the default with it rather than
+    // merely with the siblings. `wake_assignee_on_accept` stays available and is
+    // still the right explicit choice where a rejection ends the work (see the
+    // reflection-coach gates), and explicit `none` is still honoured.
+    //
+    // Rows already persisted with `none` were deliberately NOT backfilled. Such
+    // a card loses exactly the one wake it has lacked since it was filed, while
+    // the thread still records the resolution; an accepted one is already
+    // visible to the PEN-4409 sweep, since `request_confirmation` is in
+    // `ACCEPTED_OUTCOME_SWEEP_KINDS`. Against that bounded residual, a blind
+    // UPDATE across other agents' pending cards is the larger risk — and the
+    // population is unmeasurable from an agent seat, because the only
+    // company-scoped listing (`GET /companies/:id/attention`) is board-only.
+    // A backfill would also have to guess intent: `none` was what the MCP tool
+    // sent for an omitted policy AND for an explicitly requested silence, so
+    // the stored value cannot distinguish the two and flipping all of them
+    // would override authors who asked for quiet.
+    //
+    // Do not restate this as "a stored policy only matters at the instant the
+    // card resolves". It does not: the stored value was also a term in
+    // `isEquivalentCreateRequest`, so changing this default made every
+    // already-stored card with an idempotency key start returning 409 on an
+    // unchanged retry. That is handled in the service, by no longer comparing
+    // the policy at all (PEN-5505) — in code, not by migrating data.
+    continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
     payload: requestConfirmationPayloadSchema,
   }),
   z.object({

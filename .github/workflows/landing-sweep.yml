@@ -13,12 +13,24 @@ name: landing-sweep
 # report anywhere.
 #
 # Measured 2026-11-02 on this repo: #3241 and #3255 both classified `enqueue`,
-# and the routine's stale-hold block printed 8 rows — neither of them. #3241's
-# head landed 2026-11-01T23:51:30Z and Ally returned a clean verdict against
-# it at 00:05:01Z; 21 PRs merged to `master` past it while it sat eligible.
-# The damage is not only latency: PEN-5232 was parked 48h on a diagnosis built
-# around a human approver who was not in the path, because the stall had no
-# stated reason to read.
+# and the routine's stale-hold block printed 8 rows — neither of them. That
+# invisibility is the defect this workflow closes.
+#
+# ⚠ CORRECTION (2026-11-03, PEN-5344). The version of this paragraph added in
+# #3270 went further and said #3241's head "sat eligible" from Ally's clean
+# verdict at 2026-11-02T00:05:01Z. That is wrong, and the mistake matters
+# because it reads as landing latency when it is not. CI at that head
+# (da94f2885) stayed RED until `General tests (workspaces-b)` went green at
+# 04:45:06Z, `verify` following at 04:45:26Z — so the PR became LANDABLE
+# there, not at the verdict. The next scheduled landing fire was at 08:45Z,
+# it enqueued the PR at 08:48:41Z, and it merged at 09:28:08Z — 4h42m42s in
+# total, decomposing as 3h59m34s of ordinary schedule wait, 3m41s of
+# within-fire processing, and 39m27s in the merge queue. The ~9h23m from
+# verdict to merge is NOT landing latency and must never be cited as such.
+#
+# The cost that remains real here is diagnostic rather than duration: PEN-5232
+# was parked 48h on a diagnosis built around a human approver who was not in
+# the path, because the stall had no stated reason to read.
 #
 # THIS IS A DETECTOR, NEVER A LANDER. It runs `--alarm`, which the script
 # refuses to combine with `--apply`. Two reasons, and the second is the
@@ -40,6 +52,96 @@ name: landing-sweep
 #
 # Registered in WATCHED_GUARDS (scripts/check-scheduled-guard-liveness.mjs) at
 # the hourly 2.75h bar, so this detector is itself watched for going dark.
+#
+# WHY A SCHEDULE AND NOT THE EVENT — a PERMANENT, accepted limitation
+# (PEN-5341). The mechanism gap below was put to the owning side as a product
+# decision on 2026-11-03 (PEN-5344, board card ee9063ab) and DECLINED that
+# day. So this sweep is the permanent compensating control, not an interim
+# measure, and the wait described below is the steady state rather than a gap
+# awaiting a fix. PERMANENT here has a definition: the question is not
+# reopened without new evidence, which would be repeated alarms from this
+# sweep that a late or skipped landing-routine fire does not explain, or
+# upstream shipping a trigger event filter.
+#
+# This sweep covers the CONSEQUENCE of a missed landing evaluation. It does
+# not close the MECHANISM gap, and that gap is worth stating because the
+# review side does not have it:
+#
+#   review:  a `synchronize` push is delivered to server/src/routes/
+#            github-webhook.ts:1020 and re-evaluates the gate through the
+#            first-party authority service (github-review-gate-authority.ts:21,
+#            whose PR_ACTIONS set contains "synchronize"). Event-driven.
+#   landing: fires only from the landing routine (BLO-32511). Nothing connects
+#            a GitHub event to it — github-webhook.ts fires no routines at all.
+#
+# WHAT THAT COSTS, stated precisely, because the loose version of this
+# paragraph is what produced the error corrected at the top of this file:
+#
+#   - Landing is evaluated on the landing routine's OWN schedule:
+#     `45 */6 * * *`, America/Los_Angeles. FOUR FIRES A DAY, not hourly. The
+#     schedule is recorded in the routine's `trigger` row in
+#     docs/superpowers/plans/2026-09-05-track-a-landing-log.md, and matches
+#     allyblockcast's observed 2026-11-02 enqueue batches at 08:48Z, 14:48Z
+#     and 20:47Z.
+#   - A newly landable PR therefore waits up to ONE 6-HOUR INTERVAL plus
+#     dispatch lag, and longer still if a fire's MAX_ENQUEUES_PER_FIRE cap
+#     defers it. Never state this as "an hour", and never as "≤1h end to
+#     end": the hourly figure elsewhere in this file is THIS SWEEP's own
+#     cadence, which is a different clock from the one a PR waits on.
+#   - The wait starts when a PR becomes LANDABLE — CI completion or the Ally
+#     verdict, whichever lands last — NOT at `synchronize`. At a head move
+#     there is nothing for a landing evaluation to decide: the new head's
+#     checks are queued and no verdict sits at it yet, so the classifier can
+#     only skip (scripts/land-clean-prs.mjs:998-1019). That is why an
+#     event-driven landing evaluation would not have landed #3241 any sooner,
+#     and it is the substance of the 2026-11-03 decline.
+#   - This sweep flags a PR still landable 6 hours after its newest check, at
+#     its next hourly run. By design it does not see cap-deferred or
+#     `mergestate:UNKNOWN` rows.
+#
+# THE OBVIOUS FIX DOES NOT EXIST, and this is the part that is easy to get
+# wrong. "Add a `synchronize` trigger to the landing routine" is not a
+# configuration anyone can apply, at any privilege level:
+#
+#   - The trigger kinds are ["schedule", "webhook", "api"]
+#     (packages/shared/src/constants.ts:917), so a webhook trigger IS
+#     available, and `github_hmac` signing alongside it. That much reads as
+#     though the wiring is a config change away.
+#   - But a trigger carries NO event filter. The `webhook` variant of
+#     createRoutineTriggerSchema accepts `signingMode` and `replayWindowSec`
+#     and nothing else (packages/shared/src/validators/routine.ts:132-146);
+#     routine_triggers has no event, action, repo or payload-predicate column
+#     (packages/db/src/schema/routines.ts:107-131); and firePublicTrigger
+#     (server/src/services/routines.ts:3911) verifies the signature and fires.
+#     That is the whole admission.
+#   - GitHub delivers every subscribed event to one URL. So pointing a PR
+#     webhook at a routine trigger fires the landing routine on EVERY PR
+#     event on this repo, not on `synchronize` — many times the four-a-day
+#     rate it would replace, spending MAX_ENQUEUES_PER_FIRE on each fire and
+#     competing with Ally's reviews for the same capacity.
+#
+# Access is a real constraint too, but it is the SECOND one, and it is
+# narrower than "board access required" (which is the company-LIST route,
+# /companies — per-company routine reads succeed from an ordinary agent seat).
+# The actual rule is assertCanManageCompanyRoutine / assertCanManageExisting-
+# Routine (server/src/routes/routines.ts:106,115): an agent may manage a
+# routine only where routine.assigneeAgentId is its own id; board actors are
+# exempt. BLO-32511 additionally sits in a company this repo's agents are not
+# members of. Neither of those would matter if the trigger were expressible.
+#
+# ACCEPTED, AND PERMANENTLY SO: the schedule wait set out above, with this
+# sweep as the compensating control. Closing the mechanism would need a
+# product change — either an event/action predicate on webhook triggers, or a
+# first-party landing hook beside the review hook in github-webhook.ts. Both
+# were named to the owning side on 2026-11-03 and DECLINED, so neither is
+# pending and nobody is waiting on one. If that decision is ever revisited on
+# new evidence, the second option must not become a second enqueuer, for the
+# reason given under "DETECTOR, NEVER A LANDER" above. Do NOT close this by
+# widening the detector's predicate or halving its cadence; neither touches
+# the trigger, and the cadence arithmetic below does not admit the latter. If
+# landing latency itself ever needs to shrink, the lever is the landing
+# routine's own schedule — which needs no product change, and which is NOT
+# ordered here.
 
 on:
   schedule:

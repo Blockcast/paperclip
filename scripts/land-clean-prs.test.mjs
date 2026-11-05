@@ -29,8 +29,15 @@ import {
   ejectionsAtHead,
   headMovedAt,
   applyRow,
+  applyOrder,
   isFatalGhError,
   RATE_LIMIT_MAX_WAIT_MS,
+  EXIT_UNMEASURED,
+  ghErrorMessage,
+  ghWithTransientRetry,
+  isIdempotentGhRead,
+  isTransientGhError,
+  reportUnmeasured,
   ghWithRateLimitRetry,
   rateLimitWaitMs,
   liveHeadSha,
@@ -458,6 +465,184 @@ describe("per-fire cap", () => {
       assert.equal(call[5], stranded);
       assert.equal(call[6], starved);
     }
+  });
+});
+
+describe("apply order (PEN-5503)", () => {
+  // One PR yields one row, and `classifyAll` has already rewritten every
+  // over-budget `enqueue` to `skip`/`cap:` — so the `enqueue` rows ARE the cap
+  // winners. Listed NEWEST-FIRST, because that is the order `gh pr list`
+  // returns and the order the apply loop used to walk; an ascending fixture
+  // could not tell the fix from the defect.
+  const enq = (number) => ({ number, action: "enqueue", reason: "mergestate:CLEAN", headSha: HEAD });
+  const cor = (number) => ({ number, action: "codeowner-review-requested", detail: "@team" });
+  const skip = (number) => ({ number, action: "skip", reason: "checks:settling" });
+
+  // The shape of the 2026-11-04 08:45Z fire, shortened: winners interleaved
+  // with notification rows by PR number, oldest winner last.
+  const saturated = () => [
+    enq(3368), cor(3358), enq(3356), cor(3335), skip(3330), enq(3307), cor(3290), enq(3215),
+  ];
+
+  it("hoists every enqueue to the front, oldest first, and leaves the rest alone", () => {
+    const rows = saturated();
+    assert.deepEqual(
+      applyOrder(rows).map((row) => `${row.number}:${row.action[0]}`),
+      ["3215:e", "3307:e", "3356:e", "3368:e", "3358:c", "3335:c", "3330:s", "3290:c"],
+      "enqueues ascend by number; the remainder keeps its listing order",
+    );
+  });
+
+  it("returns the SAME row objects, so the loop's in-place writes still reach the receipt", () => {
+    // The loop writes `row.detail` and `row.action` on whatever it iterates. If
+    // this returned copies, every outcome and every `enqueue-failed` rename
+    // would land on a throwaway and the receipt would report the
+    // classification instead of the result.
+    const rows = saturated();
+    const ordered = applyOrder(rows);
+    assert.equal(ordered.length, rows.length, "a permutation, not a filter");
+    for (const row of rows) assert.ok(ordered.includes(row), `#${row.number} is the same object`);
+  });
+
+  it("is an identity when nothing enqueues, which is every notify-only repo", () => {
+    // `demoteMergeActions` renames every merge-shaped row before the applier
+    // runs there, so this must not shuffle a notify-only fire's work.
+    const rows = [cor(600), skip(590), { number: 580, action: NOTIFY_ONLY_ACTION }];
+    assert.deepEqual(applyOrder(rows), rows);
+    assert.deepEqual(applyOrder([]), []);
+    assert.deepEqual(applyOrder(undefined), []);
+  });
+
+  it("sorts an enqueue with no usable number last among the enqueues", () => {
+    // Same rule as the cap allocation: a row without a number has no age, so
+    // it loses the tiebreak rather than jumping the oldest real PR.
+    const rows = [enq(undefined), enq(3368), enq(3215)];
+    assert.deepEqual(applyOrder(rows).map((row) => row.number), [3215, 3368, undefined]);
+  });
+
+  describe("through runRepo, where it decides what a dying fire has already done", () => {
+    const quiet = (fn) => {
+      const log = console.log;
+      const error = console.error;
+      console.log = () => {};
+      console.error = () => {};
+      try {
+        return fn();
+      } finally {
+        console.log = log;
+        console.error = error;
+      }
+    };
+
+    /**
+     * Runs a fire whose applier throws a fatal `gh` error on the row named by
+     * `failOn`, and reports what had been applied by then.
+     *
+     * `runRepo` answers a fatal throw with `process.exit(1)`, which would take
+     * the test runner with it, so it is swapped for a sentinel throw. That is
+     * the behaviour under test, not an inconvenience: the whole defect is that
+     * the fire STOPS there.
+     */
+    const fireUntilFatal = (rows, failOn) => {
+      const applied = [];
+      const realExit = process.exit;
+      const sentinel = new Error("process.exit(1)");
+      process.exit = () => {
+        throw sentinel;
+      };
+      try {
+        assert.throws(
+          () =>
+            quiet(() =>
+              runRepo("a/one", true, 0, 0, [], [], [], {
+                fetch: () => rows.map(({ number }) => ({ number })),
+                classify: () => rows,
+                applyOne: (_repo, row) => {
+                  if (row.number === failOn) {
+                    // `isFatalGhError` matches this; a non-fatal throw would be
+                    // recorded as `enqueue-failed` and the loop would carry on.
+                    throw Object.assign(new Error("gh failed"), {
+                      stderr: "API rate limit exceeded for installation",
+                    });
+                  }
+                  applied.push(row.number);
+                  return null;
+                },
+                state: () => {},
+              }),
+            ),
+          (error) => error === sentinel,
+          "a fatal gh error ends the fire",
+        );
+      } finally {
+        process.exit = realExit;
+      }
+      return applied;
+    };
+
+    it("has already enqueued every winner when a NOTIFICATION row kills the fire", () => {
+      // The amended acceptance case, and the one that separates this fix from
+      // the obvious one. `applyRow` mutates remote state for
+      // `codeowner-review-requested` as well as `enqueue`, and those rows sit
+      // interleaved among the winners by PR number — so merely permuting the
+      // winners into age order inside their existing slots leaves the newest
+      // winner behind every notification call. Injecting the abort at the
+      // FIRST notification is what makes that visible: under listing order it
+      // reaches one winner, under a winners-only permutation it still reaches
+      // one, and only hoisting the whole cohort reaches all four.
+      const rows = saturated();
+      assert.deepEqual(
+        fireUntilFatal(rows, 3358),
+        [3215, 3307, 3356, 3368],
+        "every cap winner is spent before any deferrable notification is attempted",
+      );
+    });
+
+    it("reaches the oldest winners first when an ENQUEUE kills the fire", () => {
+      // The budget cannot always be spent in full — this row's own abort is
+      // proof. When it cannot, the fairness fix decides WHICH winners a
+      // half-spent cap bought, and it must be the oldest. Under listing order
+      // the one winner this reaches is #3368, the NEWEST, which is precisely
+      // the cohort BLO-51664 deferred on purpose.
+      const rows = saturated();
+      assert.deepEqual(fireUntilFatal(rows, 3356), [3215, 3307], "oldest first, newest dropped");
+    });
+
+    it("leaves the receipt in listing order, with each outcome on its own row", () => {
+      // Done-when #2, and the constraint the whole implementation is shaped
+      // around: apply order and receipt order differ ON PURPOSE. `rows` is the
+      // receipt and must stay diffable against the last fire's, while the
+      // in-place writes the loop makes must still land on the right PR.
+      const rows = saturated();
+      const applied = [];
+      quiet(() =>
+        runRepo("a/one", true, 0, 0, [], [], [], {
+          fetch: () => rows.map(({ number }) => ({ number })),
+          classify: () => rows,
+          applyOne: (_repo, row) => {
+            applied.push(row.number);
+            return `touched ${row.number}`;
+          },
+          state: () => {},
+        }),
+      );
+      assert.deepEqual(
+        applied,
+        [3215, 3307, 3356, 3368, 3358, 3335, 3330, 3290],
+        "control: the loop really did run out of listing order",
+      );
+      assert.deepEqual(
+        rows.map((row) => row.number),
+        [3368, 3358, 3356, 3335, 3330, 3307, 3290, 3215],
+        "the receipt is still newest-first",
+      );
+      for (const row of rows) {
+        assert.ok(
+          String(row.detail).includes(`touched ${row.number}`),
+          `#${row.number} carries its OWN outcome, not a neighbour's`,
+        );
+      }
+    });
   });
 });
 
@@ -2707,6 +2892,282 @@ describe("runRepo apply wiring (PEN-5263)", () => {
   });
 });
 
+describe("transient 5xx retry in gh() (PEN-5314)", () => {
+  // `withRetry` announces each attempt with `::warning::`, and this suite runs
+  // inside landing-sweep.yml — unsilenced it would hang a workflow annotation
+  // off every green run.
+  const quiet = (fn) => {
+    const real = console.log;
+    console.log = () => {};
+    try {
+      return fn();
+    } finally {
+      console.log = real;
+    }
+  };
+  const fails = (stderr) => () => {
+    throw Object.assign(new Error("gh failed"), { stderr });
+  };
+  const READ = ["pr", "list", "--repo", "o/r", "--state", "open"];
+  const WRITE = ["pr", "merge", "3241", "--repo", "o/r", "--auto", "--rebase"];
+
+  describe("isTransientGhError", () => {
+    it("accepts the measured 5xx shapes, by status or by prose", () => {
+      for (const text of [
+        "HTTP 502: 502 Bad Gateway (https://api.github.com/graphql)",
+        "HTTP 503",
+        "HTTP 504",
+        "Bad Gateway",
+        "Service Unavailable",
+        "Gateway Timeout",
+        "Gateway Time-out",
+      ]) {
+        assert.equal(isTransientGhError(text), true, text);
+      }
+    });
+
+    it("refuses 500, which retrying cannot fix, and every non-5xx class", () => {
+      for (const text of ["HTTP 500", "HTTP 404", "HTTP 422", "", null, undefined]) {
+        assert.equal(isTransientGhError(text), false, String(text));
+      }
+    });
+
+    // The deliberate abort must survive: a fire that continued past an
+    // exhausted rate limit would print `skip:` rows indistinguishable from
+    // real verdicts, which is what `isFatalGhError` exists to prevent.
+    it("never claims a fatal error is transient, so the abort cannot be retried away", () => {
+      for (const text of [
+        "API rate limit exceeded for installation ID 138085375. (HTTP 403)",
+        "HTTP 401: Bad credentials",
+        "could not read Username for 'https://github.com'",
+      ]) {
+        assert.equal(isFatalGhError(text), true, `${text} is fatal`);
+        assert.equal(isTransientGhError(text), false, `${text} is not transient`);
+      }
+    });
+  });
+
+  describe("isIdempotentGhRead", () => {
+    it("admits the reads this script actually makes", () => {
+      for (const args of [
+        READ,
+        ["pr", "view", "3241", "--repo", "o/r", "--json", "statusCheckRollup"],
+        ["api", "repos/o/r/issues/1/timeline", "--paginate"],
+        ["api", "repos/o/r/contents/CODEOWNERS"],
+        ["api", "repos/o/r/pulls/1/files", "--paginate"],
+        ["api", "-X", "GET", "repos/o/r"],
+        // PEN-5442 splits the listing onto a paginated GraphQL query; it is a
+        // POST on the wire and a read in meaning, so the query text decides.
+        ["api", "graphql", "--paginate", "-F", "owner=o", "-F", "name=r"],
+        ["api", "-i", "graphql", "-f", "query={viewer{login}}"],
+      ]) {
+        assert.equal(isIdempotentGhRead(args), true, args.join(" "));
+      }
+    });
+
+    // ⛔ The safety property. A 5xx can be returned AFTER the mutation landed,
+    // so a retried write can arm auto-merge twice or double-post a comment.
+    it("refuses every write, and anything it cannot positively identify", () => {
+      for (const args of [
+        WRITE,
+        ["pr", "merge", "3241", "--repo", "o/r", "--disable-auto"],
+        ["pr", "comment", "3241", "--repo", "o/r", "--body", "hi"],
+        ["api", "-X", "POST", "repos/o/r/statuses/abc", "-f", "state=success"],
+        ["api", "--method", "DELETE", "repos/o/r/issues/1"],
+        ["api", "repos/o/r/issues/1/comments", "-f", "body=hi"],
+        ["api", "graphql", "-f", "query=mutation{enablePullRequestAutoMerge}"],
+        ["pr", "edit", "1"],
+        ["repo", "clone", "o/r"],
+        [],
+        undefined,
+      ]) {
+        assert.equal(isIdempotentGhRead(args), false, JSON.stringify(args ?? null));
+      }
+    });
+  });
+
+  it("retries a transient 5xx on a read and returns the eventual value", () => {
+    let calls = 0;
+    const out = quiet(() =>
+      ghWithTransientRetry(READ, {
+        delayMs: 0,
+        exec: () => {
+          calls += 1;
+          if (calls < 3) fails("HTTP 502: 502 Bad Gateway")();
+          return "[]";
+        },
+      }),
+    );
+    assert.equal(out, "[]");
+    assert.equal(calls, 3, "two retries were spent");
+  });
+
+  // The defect in the row: one 502 on `fetchOpenPrs` took the whole fire down.
+  it("rethrows once the attempts are exhausted, so the fire still fails closed", () => {
+    let calls = 0;
+    assert.throws(
+      () =>
+        quiet(() =>
+          ghWithTransientRetry(READ, {
+            delayMs: 0,
+            exec: () => {
+              calls += 1;
+              fails(`HTTP 502 #${calls}`)();
+            },
+          }),
+        ),
+      /gh failed/,
+    );
+    assert.equal(calls, 3, "bounded — it does not retry forever");
+  });
+
+  it("spends exactly one attempt on a WRITE, however transient the failure looks", () => {
+    for (const args of [WRITE, ["pr", "comment", "1", "--repo", "o/r", "--body", "x"]]) {
+      let calls = 0;
+      assert.throws(
+        () =>
+          quiet(() =>
+            ghWithTransientRetry(args, {
+              delayMs: 0,
+              exec: () => {
+                calls += 1;
+                // Would SUCCEED on a retry, so one call proves none was spent.
+                if (calls > 1) return "ok";
+                fails("HTTP 502: 502 Bad Gateway")();
+              },
+            }),
+          ),
+        /gh failed/,
+      );
+      assert.equal(calls, 1, `${args[1]} must not be repeated`);
+    }
+  });
+
+  it("does not retry a read whose failure is a 404 or an exhausted rate limit", () => {
+    for (const stderr of [
+      "HTTP 404: Not Found",
+      "API rate limit exceeded for installation ID 1. (HTTP 403)",
+    ]) {
+      let calls = 0;
+      assert.throws(
+        () =>
+          quiet(() =>
+            ghWithTransientRetry(["api", "repos/o/r/contents/CODEOWNERS"], {
+              delayMs: 0,
+              exec: () => {
+                calls += 1;
+                if (calls > 1) return "{}";
+                fails(stderr)();
+              },
+            }),
+          ),
+        /gh failed/,
+      );
+      assert.equal(calls, 1, stderr);
+    }
+  });
+
+  it("reads the failure text from stderr, message, or the error itself", () => {
+    assert.equal(ghErrorMessage({ stderr: Buffer.from("HTTP 502") }), "HTTP 502");
+    assert.equal(ghErrorMessage(new Error("HTTP 504")), "HTTP 504");
+    assert.equal(ghErrorMessage("plain"), "plain");
+  });
+});
+
+describe("the unmeasured exit code (PEN-5314)", () => {
+  // ⛔ The whole row: red must stop meaning two different things.
+  it("is distinct from every other code this script can spend", () => {
+    assert.equal(EXIT_UNMEASURED, 3);
+    assert.notEqual(EXIT_UNMEASURED, alarmExitCode([]), "not the all-clear");
+    assert.notEqual(EXIT_UNMEASURED, alarmExitCode(["a/one#1"]), "not the alarm");
+    assert.notEqual(EXIT_UNMEASURED, 2, "2 is --alarm + --apply misuse");
+  });
+
+  const capture = (error, stranded, options) => {
+    const lines = [];
+    reportUnmeasured(error, stranded, { ...options, log: (line) => lines.push(line) });
+    return lines.join("\n");
+  };
+
+  it("names the failure and refuses to claim a verdict", () => {
+    const out = capture(Object.assign(new Error("x"), { stderr: "HTTP 502: Bad Gateway\nmore" }), []);
+    assert.match(out, /DID NOT MEASURE/);
+    assert.match(out, /HTTP 502: Bad Gateway/);
+    assert.doesNotMatch(out, /more/, "only the first line of the failure");
+    assert.match(out, /makes no claim/);
+  });
+
+  // The wake-comment finding: `stranded` was populated and then discarded
+  // unread, so the run went red as a stack trace naming no PRs.
+  it("reports the partial cohort it had computed before stopping", () => {
+    const out = capture(new Error("HTTP 504"), ["a/one#3241", "a/two#17"], { alarm: true });
+    assert.match(out, /a\/one#3241, a\/two#17/);
+    assert.match(out, /possibly incomplete/);
+  });
+
+  it("calls an empty partial cohort a prefix, never an all-clear", () => {
+    const out = capture(new Error("HTTP 504"), [], { alarm: true });
+    assert.match(out, /PREFIX, not an all-clear/);
+  });
+
+  it("says nothing about a cohort when the run was not an alarm run", () => {
+    const out = capture(new Error("HTTP 504"), ["a/one#1"], { alarm: false });
+    assert.doesNotMatch(out, /a\/one#1/);
+  });
+
+  it("⛔ an unreadable repo ALONE is unmeasured; a real cohort beside it still alarms", () => {
+    const blocked = ["a/broken (HTTP 502)"];
+    assert.equal(alarmExitCode([], blocked, []), EXIT_UNMEASURED, "nothing measured, a repo unread");
+    // PRECEDENCE. A measured verdict outranks a transport report: there IS a
+    // PR to act on, and 1 is the code that says so. The `unreadable` ALARM
+    // block still names the skipped repo, so spending 3 here would cost the
+    // actionable signal and buy nothing.
+    assert.equal(alarmExitCode(["a/one#1"], blocked, []), 1, "a stranded PR outranks it");
+    assert.equal(alarmExitCode([], blocked, ["a/one#2"]), 1, "so does a cap-starved one");
+    assert.equal(alarmExitCode([], [], []), 0, "control: a clean measured run is still green");
+    // PEN-5442's fail-open guard is indifferent to the renumbering, and is
+    // asserted separately so it keeps holding if the integer ever moves again.
+    for (const code of [alarmExitCode([], blocked, []), alarmExitCode(["a/one#1"], blocked, [])]) {
+      assert.notEqual(code, 0, "an unread repo can never produce a green run");
+    }
+  });
+
+  it("reports the partial cap-starved cohort too, not only the stranded one", () => {
+    const out = capture(new Error("HTTP 504"), ["a/one#3241"], {
+      alarm: true,
+      starved: ["a/two#3306"],
+    });
+    assert.match(out, /Partial unlanded-eligible cohort .*a\/one#3241/);
+    assert.match(out, /Partial cap-starved cohort .*a\/two#3306/);
+  });
+
+  it("reports a cap-starved prefix even when the stranded cohort is empty", () => {
+    const out = capture(new Error("HTTP 504"), [], { alarm: true, starved: ["a/two#3306"] });
+    assert.match(out, /Partial cap-starved cohort .*a\/two#3306/);
+    assert.doesNotMatch(out, /PREFIX, not an all-clear/, "something WAS found before stopping");
+  });
+
+  it("calls BOTH cohorts empty a prefix, never an all-clear", () => {
+    const out = capture(new Error("HTTP 504"), [], { alarm: true, starved: [] });
+    assert.match(out, /PREFIX, not an all-clear/);
+  });
+
+  it("keeps the frames for a throw that did not come from gh", () => {
+    // A `gh` failure carries stderr, and one line is the right amount of it.
+    // A programming error carries none — there the frames ARE the diagnosis,
+    // and the first line is the least useful part of them.
+    const bug = new Error("rows.map is not a function");
+    const out = capture(bug, [], {});
+    assert.match(out, /rows\.map is not a function/);
+    assert.ok(out.includes(bug.stack), "the frames Node would have printed are kept");
+
+    const gh = Object.assign(new Error("gh failed"), { stderr: "HTTP 502: Bad Gateway\nnoise" });
+    const ghOut = capture(gh, [], {});
+    assert.doesNotMatch(ghOut, /noise/, "a gh failure is still trimmed to one line");
+    assert.ok(!ghOut.includes(gh.stack), "and still carries no frames");
+  });
+});
+
 describe("rate-limit retry in gh() (BLO-51665)", () => {
   const refused = () =>
     Object.assign(new Error("gh failed"), {
@@ -3111,11 +3572,53 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
     // landable and ignored" asserted over a repo the fire never read, which is
     // exactly the silent all-clear this detector exists to rule out.
     assert.equal(alarmExitCode([], []), 0, "control: nothing wrong is still green");
-    assert.equal(alarmExitCode([], ["a/broken (HTTP 502)"]), 1);
+    // ⛔ The property this test exists for is NON-ZERO, asserted separately
+    // from which non-zero. PEN-5314 moved the integer from 1 to
+    // EXIT_UNMEASURED; the fail-open guard is indifferent to that and must
+    // keep holding if it ever moves again.
+    assert.notEqual(alarmExitCode([], ["a/broken (HTTP 502)"]), 0, "an unread repo is never green");
     assert.equal(alarmExitCode(["a/one#1"], []), 1, "the stranded term is unchanged");
     assert.equal(alarmExitCode(["a/one#1"], ["a/broken (HTTP 502)"]), 1);
     assert.equal(alarmExitCode(undefined, undefined), 0, "and both still default");
     assert.equal(alarmExitCode([]), 0, "including the one-argument call sites");
+  });
+
+  it("⛔ a transient 5xx spends EXIT_UNMEASURED, not the stranded cohort's 1 (PEN-5314)", () => {
+    // The composition, run through the REAL path rather than a hand-built
+    // cohort — because the regression was in the composition and every
+    // by-hand `alarmExitCode` test above kept passing while it was live.
+    //
+    // PEN-5314 added EXIT_UNMEASURED for exactly this input. This catch then
+    // took it back: a 502 that outlives `fetchOpenPrs`'s retries is NOT fatal,
+    // so it arrives here as an unreadable skip rather than at `main`'s
+    // `sweepError` branch — and the dominant "GitHub 502'd" case went back to
+    // spelling "could not measure" with the same integer as "a PR has been
+    // landable for hours and nothing took it".
+    const unreadable = [];
+    const stranded = [];
+    const starved = [];
+    quietly(() =>
+      sweepRepos(
+        ["a/broken"],
+        repoRunner(
+          false,
+          0,
+          [],
+          stranded,
+          boom("HTTP 502: 502 Bad Gateway"),
+          new Set(),
+          unreadable,
+          starved,
+        ),
+      ),
+    );
+    assert.deepEqual(unreadable, ["a/broken (HTTP 502: 502 Bad Gateway)"], "the 5xx became a skip");
+    assert.deepEqual(stranded, [], "having measured nothing");
+    assert.equal(
+      alarmExitCode(stranded, unreadable, starved),
+      EXIT_UNMEASURED,
+      "so the run says it could not measure — NOT that a PR is stranded",
+    );
   });
 });
 
@@ -3376,7 +3879,11 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
     assert.equal(alarmExitCode([], ["a/broken (HTTP 502)"], ["a/one#3306"]), 1);
     // The two siblings still go red alone, so widening did not swallow either.
     assert.equal(alarmExitCode(["a/one#3241"], [], []), 1, "stranded alone");
-    assert.equal(alarmExitCode([], ["a/broken (HTTP 502)"], []), 1, "unreadable alone");
+    assert.notEqual(
+      alarmExitCode([], ["a/broken (HTTP 502)"], []),
+      0,
+      "unreadable alone — still red, though PEN-5314 changed WHICH non-zero",
+    );
     // Optional and quiet by default, so no existing caller changes meaning.
     assert.equal(alarmExitCode([]), 0);
     assert.equal(alarmExitCode([], []), 0);
@@ -3476,7 +3983,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
   });
 });
 
-describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442)", () => {
+describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442 + PEN-5314)", () => {
   // `alarmExitCode` is exported and heavily covered — but every one of those
   // tests passes the cohorts in BY HAND. `main` is NOT exported, it
   // self-invokes under `isMainModule`, and there is no seam to inject. So
@@ -3500,6 +4007,7 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442)",
 
   const EXIT_CALL = /process\.exit\(\s*alarmExitCode\(([^)]*)\)\s*\)/;
   const RUNNER_CALL = /repoRunner\(([^)]*)\)/;
+  const UNMEASURED_CALL = /reportUnmeasured\(\s*sweepError,\s*stranded,\s*\{([^}]*)\}\s*\)/;
   const argsOf = (re, src) => {
     const match = src.match(re);
     return match ? match[1].split(",").map((arg) => arg.trim()) : null;
@@ -3521,6 +4029,16 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442)",
     assert.ok(args.includes("unreadable"), "`unreadable` is collected by the sweep");
     assert.ok(args.includes("starved"), "`starved` is collected by the sweep");
     assert.equal(args.indexOf("starved"), args.length - 1, "`starved` is the 8th and last");
+  });
+
+  it("hands `reportUnmeasured` the cap-starved cohort as well (PEN-5314)", () => {
+    // Same hazard, third cohort: `starved` is collected by reference exactly
+    // like `stranded`, so leaving it out of the partial report makes "here is
+    // what I found before I stopped" quietly untrue for that arm.
+    const keys = argsOf(UNMEASURED_CALL, SOURCE);
+    assert.ok(keys, "main still reports the unmeasured run");
+    assert.ok(keys.includes("alarm"), "`alarm` still gates the cohort report");
+    assert.ok(keys.includes("starved"), "`starved` is reported, not silently dropped");
   });
 
   it("⛔ the probes are LIVE — each one fails against a source missing its term", () => {
@@ -3546,6 +4064,16 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442)",
     assert.ok(
       !argsOf(RUNNER_CALL, unthreaded).includes("starved"),
       "the probe SEES an unthreaded cohort",
+    );
+
+    const unreported = SOURCE.replace(
+      "reportUnmeasured(sweepError, stranded, { alarm, starved });",
+      "reportUnmeasured(sweepError, stranded, { alarm });",
+    );
+    assert.notEqual(unreported, SOURCE, "control: the mutation actually applied");
+    assert.ok(
+      !argsOf(UNMEASURED_CALL, unreported).includes("starved"),
+      "the probe SEES an unreported cohort",
     );
   });
 });

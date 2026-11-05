@@ -1358,6 +1358,23 @@ export async function startServer(): Promise<StartedServer> {
   // the chain's stamp it reports and does not act.
   let executionWorkspaceCollectorInFlight = false;
   let executionWorkspaceCollectorStartedAt = 0;
+  // PEN-5346: the same latch, for the cancelled-monitor handoff pass. Unlike
+  // its sibling `reconcileUndeliverableIssueMonitors` — which only CASes
+  // columns and is safe to overlap — this pass CREATES ROWS and ENQUEUES
+  // WAKES, and `setInterval` starts tick N+1 whether or not tick N settled.
+  //
+  // It is not the duplicate-carrier guard: `issues_active_stranded_issue_recovery_uq`
+  // (packages/db/src/schema/issues.ts) is a partial unique index on
+  // (companyId, originKind, originId) for exactly this origin kind, so two
+  // overlapping passes cannot both commit a carrier for one source — the
+  // loser takes a 23505. The latch is here because the loser takes that 23505
+  // as a `failed`, having already done the selection and the emit work twice,
+  // and a backfill tick running 25 candidates serially is the one that can
+  // outlive the 30 s interval. Overlap is wasted work and a misleading
+  // counter, not corruption. Every pass is idempotent and re-drivable from
+  // persisted state, so a tick that finds one running skips it with no loss.
+  // The startup pass holds it too, so the first periodic tick cannot double it.
+  let cancelledMonitorRecoveryInFlight = false;
   // 10 scheduler intervals. Above the normal case (a sweep routinely outlives
   // one interval — that is what the latch is for) and far below the hours a
   // wedged chain would otherwise sit silent. Deliberately scaled to the
@@ -1789,6 +1806,28 @@ export async function startServer(): Promise<StartedServer> {
             }
           } catch (err) {
             logger.error({ err }, "startup undeliverable-monitor reconciliation failed");
+          }
+
+          // PEN-5346: hand back the obligation a `cancelled` clear destroyed.
+          // Ordered AFTER the clear above so a row demoted by a cancel is
+          // already carrying the residue this pass selects on, and the whole
+          // post-condition lands in one startup pass rather than two.
+          if (heartbeatSchedulerStopped) return;
+          if (!cancelledMonitorRecoveryInFlight) {
+            cancelledMonitorRecoveryInFlight = true;
+            try {
+              const handedBack = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+              if (handedBack.recovered > 0 || handedBack.cleared > 0 || handedBack.unowned > 0 || handedBack.failed > 0) {
+                logger.warn(
+                  { ...handedBack },
+                  "startup cancelled-monitor recovery handed back wakes destroyed by a cancel (PEN-5346)",
+                );
+              }
+            } catch (err) {
+              logger.error({ err }, "startup cancelled-monitor recovery reconciliation failed");
+            } finally {
+              cancelledMonitorRecoveryInFlight = false;
+            }
           }
 
           if (heartbeatSchedulerStopped) return;
@@ -2427,6 +2466,58 @@ export async function startServer(): Promise<StartedServer> {
             .catch((err) => {
               logger.error({ err }, "periodic undeliverable-monitor reconciliation failed");
             }));
+
+          // PEN-5346: the handoff half of the same post-condition, and
+          // deliberately an INDEPENDENT pass rather than a `.then` off the
+          // clear above — for the same backstop reason that comment gives. A
+          // handoff that only runs when the clear succeeded is not a handoff:
+          // the conditions that make the clear throw are exactly the conditions
+          // that strand obligations. Running the two concurrently means a row
+          // cleared this tick is normally picked up on the next one, which is
+          // the cost of that independence and is paid in one tick interval.
+          // It needs no ordering for safety either: this pass reads the
+          // persisted residue and CASes on it, so a clear landing mid-pass is
+          // simply seen next time.
+          //
+          // Single-flighted by `cancelledMonitorRecoveryInFlight` (declared
+          // above with the reason): this pass creates rows and enqueues wakes,
+          // so an overlapping tick is duplicated work and a `failed` counter
+          // that reads like a defect.
+          if (!cancelledMonitorRecoveryInFlight) {
+            cancelledMonitorRecoveryInFlight = true;
+            // The latch is released in a `finally` INSIDE the async body, not
+            // in a `.finally()` chained off the call expression. Chaining only
+            // releases the latch if the chain gets built, and a synchronous
+            // throw from the call itself means it never is — the latch would
+            // then stay `true` for the life of the process and every later tick
+            // would skip this pass at the `if` above. The one reachable
+            // synchronous throw is the method being absent, which is exactly
+            // the shape CI hit on this branch, so the failure mode is not
+            // hypothetical. This also makes the periodic site read like the
+            // startup one, which has always been `try/catch/finally`.
+            trackHeartbeatSchedulerWork(
+              (async () => {
+                try {
+                  const handedBack = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+                  if (
+                    handedBack.recovered > 0 ||
+                    handedBack.cleared > 0 ||
+                    handedBack.unowned > 0 ||
+                    handedBack.failed > 0
+                  ) {
+                    logger.warn(
+                      { ...handedBack },
+                      "periodic cancelled-monitor recovery handed back wakes destroyed by a cancel",
+                    );
+                  }
+                } catch (err) {
+                  logger.error({ err }, "periodic cancelled-monitor recovery reconciliation failed");
+                } finally {
+                  cancelledMonitorRecoveryInFlight = false;
+                }
+              })(),
+            );
+          }
 
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.

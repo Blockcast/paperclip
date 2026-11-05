@@ -398,17 +398,55 @@ async function createCleanDivergedSiblingRepo(input: {
 }
 
 type ClaimantRow = { id: string; identifier: string | null; status: string };
+type LiveClaimantRow = ClaimantRow & { runId: string; runStatus: string };
 
 interface ClaimantQueryChain {
   from: () => ClaimantQueryChain;
+  // PEN-5493: the live-claimant query is the only one that joins, which is what
+  // lets one stub serve both lookups without the caller naming them. The
+  // condition is captured so a test can assert on the predicate itself rather
+  // than only on the rows this stub was told to return.
+  innerJoin: (table: unknown, condition: unknown) => ClaimantQueryChain;
   where: () => ClaimantQueryChain;
   orderBy: () => ClaimantQueryChain;
-  limit: (count: number) => Promise<ClaimantRow[]>;
+  limit: (count: number) => Promise<ClaimantRow[] | LiveClaimantRow[]>;
   then: (
     resolve: (rows: { companyId: string | null }[]) => unknown,
     reject?: (error: unknown) => unknown,
   ) => Promise<unknown>;
 }
+
+/**
+ * Every column referenced anywhere inside a drizzle condition, by database
+ * column name.
+ *
+ * PEN-5493 review follow-up: the liveness fix is a change to the JOIN
+ * PREDICATE, and this stub resolves whatever rows it was handed regardless of
+ * what the query asked for — so a rows-only test passes just as happily against
+ * the lock-only predicate that the review showed to be incomplete. Walking the
+ * condition is what actually distinguishes them, and there is no Postgres in
+ * this suite to ask instead. Structural by necessity, so it asserts only that
+ * the needed columns are *referenced*, which is the part that would silently
+ * regress.
+ */
+function collectConditionColumnNames(node: unknown, acc: Set<string> = new Set()): Set<string> {
+  if (node === null || typeof node !== "object") return acc;
+  const candidate = node as { name?: unknown; columnType?: unknown; queryChunks?: unknown };
+  if (typeof candidate.name === "string" && typeof candidate.columnType === "string") {
+    acc.add(candidate.name);
+    return acc;
+  }
+  if (Array.isArray(node)) {
+    for (const child of node) collectConditionColumnNames(child, acc);
+    return acc;
+  }
+  if (Array.isArray(candidate.queryChunks)) {
+    for (const child of candidate.queryChunks) collectConditionColumnNames(child, acc);
+  }
+  return acc;
+}
+
+type LiveClaimantOutcome = { kind: "reject" } | { kind: "rows"; rows: LiveClaimantRow[] };
 
 // Drizzle-shaped stub for the claimant lookup in
 // `inspectGitWorktreeBranchIncoherence`. Only the database is faked; the git
@@ -416,32 +454,96 @@ interface ClaimantQueryChain {
 // against a live Postgres without breaking every other query in the path, and
 // the fail-closed posture is precisely what needs proving.
 //
-// The claimant query is the only one that calls `.limit()`; `readIssueCompanyId`
-// awaits the builder directly, so `then` resolves empty and branch contention
-// short-circuits to null. That keeps the claimant lookup the only database fact
-// these tests depend on.
+// Both claimant queries are the only ones that call `.limit()`;
+// `readIssueCompanyId` awaits the builder directly, so `then` resolves empty and
+// branch contention short-circuits to null. That keeps the two claimant lookups
+// the only database facts these tests depend on.
 //
 // `limit` honours its argument rather than returning the whole fixture. Postgres
 // would, and a stub that ignores it makes the production limit unobservable:
-// the saturation assertion below then passes whether or not the query reads the
+// the saturation assertions below then pass whether or not the query reads the
 // extra row it needs to tell "exactly N" from "at least N".
+//
+// PEN-5493: `live` defaults to an empty answer rather than being required,
+// because "no peer is executing in this worktree" is the overwhelmingly common
+// real state (73 of 74 shared worktrees measured) and making every caller spell
+// it out would invite stubbing it as contended by habit.
 function createClaimantLookupDb(
   outcome: { kind: "reject" } | { kind: "rows"; rows: ClaimantRow[] },
+  /**
+   * One outcome, or a SEQUENCE consumed one per live query (the last entry
+   * repeats once exhausted).
+   *
+   * PEN-5493 review follow-up: the repair re-reads liveness immediately before
+   * `git checkout`, so "quiescent at eligibility time, a peer by mutation time"
+   * is a reachable state that a single fixed outcome cannot express — with one
+   * outcome the first lookup already refuses and the re-read is never reached.
+   */
+  live: LiveClaimantOutcome | LiveClaimantOutcome[] = { kind: "rows", rows: [] },
+  // Receives the live query's JOIN condition each time it is built, so a test
+  // can assert the predicate and not just the rows.
+  onLiveJoinCondition?: (condition: unknown) => void,
 ): Db {
-  const chain: ClaimantQueryChain = {
-    from: () => chain,
-    where: () => chain,
-    orderBy: () => chain,
-    limit: (count: number) => (outcome.kind === "reject"
-      ? Promise.reject(new Error("claimant lookup unavailable"))
-      : Promise.resolve(outcome.rows.slice(0, count))),
-    then: (resolve, reject) => Promise.resolve([]).then(resolve, reject),
+  const liveSequence = Array.isArray(live) ? [...live] : null;
+  const nextLive = (): LiveClaimantOutcome => {
+    if (!liveSequence) return live as LiveClaimantOutcome;
+    return liveSequence.length > 1 ? liveSequence.shift()! : liveSequence[0]!;
   };
-  return { select: () => chain } as unknown as Db;
+  const makeChain = (isLive: boolean): ClaimantQueryChain => {
+    let joined = false;
+    const chain: ClaimantQueryChain = {
+      from: () => chain,
+      innerJoin: (_table: unknown, condition: unknown) => {
+        joined = true;
+        onLiveJoinCondition?.(condition);
+        return chain;
+      },
+      where: () => chain,
+      orderBy: () => chain,
+      limit: (count: number) => {
+        // `isLive` keys on the entry point rather than on `joined`: PEN-5493's
+        // review follow-up moved the live query to `selectDistinctOn` (to dedupe
+        // a claimant named by more than one live run), so the two lookups are
+        // now distinguishable before any join is declared. `joined` is kept as a
+        // cross-check that only the live query joins.
+        const selected = isLive ? nextLive() : outcome;
+        if (isLive !== joined) {
+          return Promise.reject(new Error(
+            `claimant lookup stub: expected ${isLive ? "the live query to join" : "the plain query not to join"}`,
+          ));
+        }
+        return selected.kind === "reject"
+          ? Promise.reject(new Error(isLive ? "live claimant lookup unavailable" : "claimant lookup unavailable"))
+          : Promise.resolve(selected.rows.slice(0, count) as ClaimantRow[] | LiveClaimantRow[]);
+      },
+      then: (resolve, reject) => Promise.resolve([]).then(resolve, reject),
+    };
+    return chain;
+  };
+  // A fresh chain per entry point, so state from the live query cannot leak into
+  // the plain claimant query that runs before it.
+  return {
+    select: () => makeChain(false),
+    selectDistinctOn: () => makeChain(true),
+  } as unknown as Db;
 }
 
 function claimantRow(identifier: string): ClaimantRow {
   return { id: randomUUID(), identifier, status: "in_progress" };
+}
+
+function liveClaimantRow(
+  identifier: string,
+  runStatus = "running",
+  issueStatus?: string,
+): LiveClaimantRow {
+  const base = claimantRow(identifier);
+  return {
+    ...base,
+    status: issueStatus ?? base.status,
+    runId: randomUUID(),
+    runStatus,
+  };
 }
 
 // Drives the real eligibility computation and returns the thrown validation
@@ -452,6 +554,12 @@ async function captureBranchCoherenceRefusal(input: {
   repoRoot: string;
   worktreePath: string;
   expectedBranch: string;
+  /**
+   * PEN-5493: without a source issue the liveness lookup cannot tell this run's
+   * own execution lock from a peer's, so eligibility falls back to the
+   * claimant count. Set this to exercise that fallback.
+   */
+  withoutSourceIssue?: boolean;
 }) {
   let error: unknown = null;
   try {
@@ -460,7 +568,7 @@ async function captureBranchCoherenceRefusal(input: {
       repoRoot: input.repoRoot,
       worktreePath: input.worktreePath,
       expectedBranchName: input.expectedBranch,
-      sourceIssue: {
+      sourceIssue: input.withoutSourceIssue ? null : {
         id: "issue-branch-coherence",
         identifier: "PAP-462",
         title: "Refuse an unprovable safe repair",
@@ -3434,25 +3542,289 @@ describe("realizeExecutionWorkspace", () => {
       .resolves.toBe(actualHeadBefore);
   }, 20_000);
 
-  // BLO-32628: the claimant query takes one row past its sample limit so a
-  // saturated result reads as "at least N" rather than rendering the cap as an
-  // exact count. A refusal message that looks precise and is wrong at scale is
-  // the same diagnosability defect as omitting the fact altogether.
-  it("reports a saturated claimant sample as a lower bound rather than an exact count", async () => {
-    const expectedBranch = "PAP-465-saturated-recorded";
-    const actualBranch = "PAP-465-saturated-sibling";
+  // PEN-5493. The defect this closes: eligibility refused on a COUNT of rows
+  // referencing the workspace, never on whether any of them was using it. A
+  // count of non-terminal claimants only grows, so a worktree that reached two
+  // claimants was ineligible for auto-repair PERMANENTLY — no quiescence and no
+  // passage of time could make it repairable, which is what converted a routine
+  // recoverable divergence into a human escalation. Measured on this company at
+  // filing: 353 of 581 non-terminal rows (60.8%) sat on such a worktree across
+  // 74 shared worktrees, and exactly ONE of those worktrees had a peer holding a
+  // live execution lock.
+  //
+  // The git state here is byte-identical to the refusing case below; only the
+  // liveness answer differs. That is the whole claim.
+  it("repairs a clean diverged worktree with many claimants when none is live", async () => {
+    const expectedBranch = "PAP-5493-idle-recorded";
+    const actualBranch = "PAP-5493-idle-sibling";
     const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
       expectedBranch,
       actualBranch,
     });
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
 
-    const error = await captureBranchCoherenceRefusal({
+    await expect(captureBranchCoherenceRefusal({
       db: createClaimantLookupDb({
         kind: "rows",
-        // One more than the sample limit, which is what the extra selected row
-        // detects. Twelve would read identically, and that is the point.
-        rows: Array.from({ length: 11 }, (_unused, index) => claimantRow(`PAP-5${index}`)),
+        // Eight claimants — the shape that bit PEN-5478, and only the 7th worst
+        // worktree in the measured census. Under the old predicate this was an
+        // unconditional refusal.
+        rows: Array.from({ length: 8 }, (_unused, index) => claimantRow(`PAP-55${index}`)),
       }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    })).resolves.toBeNull();
+
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(expectedBranch);
+    // The sibling branch still names its commits, which is why restoring the
+    // recorded branch cannot orphan the work that was checked out.
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 20_000);
+
+  // PEN-5493: the other half of the pair. Same claimant count, same git state —
+  // one peer holding a live execution lock — and the repair must refuse, naming
+  // the holder and its run so the refusal is actionable rather than a count.
+  it("refuses a clean diverged worktree when another claimant holds a live execution lock", async () => {
+    const expectedBranch = "PAP-5494-live-recorded";
+    const actualBranch = "PAP-5494-live-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+    const holder = liveClaimantRow("PAP-5495");
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb(
+        {
+          kind: "rows",
+          rows: Array.from({ length: 8 }, (_unused, index) => claimantRow(`PAP-55${index}`)),
+        },
+        { kind: "rows", rows: [holder] },
+      ),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          workspaceLiveClaimantLookup: "ok",
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            attempted: false,
+            succeeded: false,
+          }),
+        }),
+      },
+    });
+    const validation = (error as {
+      resultJson: {
+        workspaceValidation: {
+          workspaceLiveClaimants: { issueIdentifier: string; runId: string }[];
+          safeRepair: { reason: string };
+        };
+      };
+    }).resultJson.workspaceValidation;
+    expect(validation.workspaceLiveClaimants).toHaveLength(1);
+    // The holder is nameable from the message alone — a bare count is what
+    // PEN-5493 replaced, and a bare issue id would leave a reader unable to tell
+    // which run to wait on.
+    expect(validation.safeRepair.reason).toContain("PAP-5495");
+    expect(validation.safeRepair.reason).toContain(holder.runId);
+    expect(validation.safeRepair.reason).toContain("running");
+    // Nothing moved, so the refusal is a refusal and not a failed attempt.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 20_000);
+
+  // PEN-5493, raised in review on #3380. The first cut of this guard read
+  // liveness off the issue execution lock alone, and the lock does not answer
+  // the question the guard asks. `claimQueuedRun` requires it only when
+  // `!allowsIssueInteractionWake(ctx) && !isNonOwnershipRetryLineage(ctx)`, and
+  // writes it only for an `in_progress`/`in_review` row claimed by its assignee
+  // or current participant — so an interaction wake carrying a comment id runs
+  // on a `blocked` row with both lock columns null, and still realizes this
+  // worktree. Reading locks alone reports an idle worktree while that peer is
+  // committing in it, and `git checkout` would then move the branch underneath
+  // it. The master predicate this replaced (`claimants > 1`) happened to refuse
+  // this case, so losing it would have been a regression, not a known gap.
+  it("refuses a clean diverged worktree when a peer runs in it without holding the execution lock", async () => {
+    const expectedBranch = "PAP-5496-lockfree-recorded";
+    const actualBranch = "PAP-5496-lockfree-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+    // A `blocked` claimant with a `running` run: reachable only through the
+    // context-issue arm, because a blocked row cannot hold the lock at all.
+    const interactionWakePeer = liveClaimantRow("PAP-5497", "running", "blocked");
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb(
+        {
+          kind: "rows",
+          rows: Array.from({ length: 3 }, (_unused, index) => claimantRow(`PAP-56${index}`)),
+        },
+        { kind: "rows", rows: [interactionWakePeer] },
+      ),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          cleanliness: "clean",
+          workspaceLiveClaimantLookup: "ok",
+          safeRepair: expect.objectContaining({ eligible: false, attempted: false, succeeded: false }),
+        }),
+      },
+    });
+    const validation = (error as {
+      resultJson: {
+        workspaceValidation: {
+          workspaceLiveClaimants: { issueIdentifier: string; status: string }[];
+          safeRepair: { reason: string };
+        };
+      };
+    }).resultJson.workspaceValidation;
+    expect(validation.workspaceLiveClaimants).toHaveLength(1);
+    expect(validation.workspaceLiveClaimants[0]).toMatchObject({ status: "blocked" });
+    expect(validation.safeRepair.reason).toContain("PAP-5497");
+    expect(validation.safeRepair.reason).toContain(interactionWakePeer.runId);
+    // Nothing moved: the peer's worktree is still on the peer's branch.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 20_000);
+
+  // The test above proves the REFUSAL fires for a lock-free peer, but it proves
+  // it against a stub that hands back whatever rows it was given — so it passes
+  // just as happily against the lock-only predicate the review rejected. This
+  // one asserts the predicate itself: a peer like that is only ever found if the
+  // join also matches runs that merely NAME the claimant as their context issue.
+  it("matches live runs by context issue as well as by execution lock", async () => {
+    const expectedBranch = "PAP-5503-predicate-recorded";
+    const actualBranch = "PAP-5503-predicate-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const joinConditions: unknown[] = [];
+
+    await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb(
+        { kind: "rows", rows: [claimantRow("PAP-5499"), claimantRow("PAP-5500")] },
+        { kind: "rows", rows: [liveClaimantRow("PAP-5499")] },
+        (condition) => joinConditions.push(condition),
+      ),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(joinConditions.length).toBeGreaterThan(0);
+    const columns = collectConditionColumnNames(joinConditions[0]);
+    // The lock arms — the predicate `POST /issues/:id/checkout` 409s on.
+    expect(columns).toContain("execution_run_id");
+    expect(columns).toContain("checkout_run_id");
+    // The arm the review added: the generated stored mirror of
+    // `context_snapshot ->> 'issueId'`, which is how the platform ties a run to
+    // an issue when no lock was ever taken.
+    expect(columns).toContain("context_issue_id");
+    // Still bounded to non-terminal runs, or every historical run would hold.
+    expect(columns).toContain("status");
+  }, 20_000);
+
+  // PEN-5493, raised in review on #3380 (Q5). Narrowing the test from a claimant
+  // COUNT to a liveness one makes the `git checkout` arm reachable for a shared
+  // worktree at all — on master `claimants > 1` refused before it, so a peer
+  // claiming between the sample and the mutation was unreachable. It is now
+  // reachable for every shared worktree quiescent at sample time, and `git
+  // checkout` is not a safe loser: it carries non-conflicting uncommitted edits
+  // across branches rather than refusing. So liveness is re-read immediately
+  // before the mutation. This drives exactly that interleaving — quiescent when
+  // eligibility was decided, a live peer by the time the branch would move.
+  it("refuses at the last moment when a peer claims the worktree between eligibility and checkout", async () => {
+    const expectedBranch = "PAP-5501-race-recorded";
+    const actualBranch = "PAP-5501-race-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+    const latecomer = liveClaimantRow("PAP-5502");
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb(
+        {
+          kind: "rows",
+          rows: Array.from({ length: 4 }, (_unused, index) => claimantRow(`PAP-57${index}`)),
+        },
+        // Quiescent when eligibility was computed; a live peer by the re-read.
+        [{ kind: "rows", rows: [] }, { kind: "rows", rows: [latecomer] }],
+      ),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    const validation = (error as {
+      resultJson: {
+        workspaceValidation: {
+          safeRepair: { eligible: boolean; attempted: boolean; succeeded: boolean; reason: string };
+        };
+      };
+    }).resultJson.workspaceValidation;
+    // Eligible AND attempted — this is not the eligibility refusal. Reading it
+    // as one would hide the race the re-read exists to catch.
+    expect(validation.safeRepair).toMatchObject({
+      eligible: true,
+      attempted: true,
+      succeeded: false,
+    });
+    expect(validation.safeRepair.reason).toContain("PAP-5502");
+    expect(validation.safeRepair.reason).toContain(latecomer.runId);
+    // The branch did not move, so the latecomer's worktree is untouched.
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 20_000);
+
+  // PEN-5493: the liveness lookup takes the same fail-closed posture as the
+  // claimant lookup it narrows (BLO-32628) and for the same reason — database
+  // stress co-occurs with the workspace thrash that produces contention, so a
+  // liveness test that evaporates under load is not a liveness test. Without
+  // this, a query error would read as "nobody is live" and ENABLE the repair the
+  // guard exists to withhold, which is strictly worse than the count it replaced.
+  it("refuses safe repair when the live-claimant lookup fails", async () => {
+    const expectedBranch = "PAP-5496-livefail-recorded";
+    const actualBranch = "PAP-5496-livefail-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    const actualHeadBefore = await readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]);
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb(
+        { kind: "rows", rows: [claimantRow("PAP-5497")] },
+        { kind: "reject" },
+      ),
       repoRoot,
       worktreePath,
       expectedBranch,
@@ -3463,17 +3835,122 @@ describe("realizeExecutionWorkspace", () => {
       resultJson: {
         workspaceValidation: expect.objectContaining({
           workspaceClaimantLookup: "ok",
+          workspaceLiveClaimantLookup: "failed",
+          workspaceLiveClaimants: null,
           safeRepair: expect.objectContaining({
             eligible: false,
-            reason: expect.stringContaining("claimed by at least 10 non-terminal issues"),
+            reason: "execution workspace live-claimant lookup failed, so contention could not be ruled out",
           }),
         }),
       },
     });
-    // The sample is capped even though the query read one row past the cap.
-    const validation = (error as { resultJson: { workspaceValidation: { workspaceClaimants: unknown[] } } })
-      .resultJson.workspaceValidation;
+    await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
+      .resolves.toBe(actualBranch);
+    await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
+      .resolves.toBe(actualHeadBefore);
+  }, 20_000);
+
+  // PEN-5493: a null source issue means the liveness query cannot exclude THIS
+  // run's own execution lock, and in this path our own lock is always held — so
+  // "no other live claimant" is unprovable rather than true. Eligibility falls
+  // back to the pre-PEN-5493 claimant count there, so this case behaves exactly
+  // as master did.
+  //
+  // That fallback is per-case, and the change as a whole is NOT strictly more
+  // permissive — an earlier draft of this file claimed it was, and the review
+  // on #3380 showed otherwise. Two cases refuse where master allowed: a source
+  // issue not itself bound to the workspace gives `claimants = 1` (master
+  // eligible) against one live peer (refused now), and the pre-checkout
+  // re-read refuses a peer that arrives after eligibility was decided. Both
+  // move in the safe direction, which is the point — but "never newly refuses"
+  // was the wrong summary of it.
+  it("falls back to the claimant count when there is no source issue to exclude", async () => {
+    const expectedBranch = "PAP-5498-nosource-recorded";
+    const actualBranch = "PAP-5498-nosource-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb({
+        kind: "rows",
+        rows: [claimantRow("PAP-5499"), claimantRow("PAP-5500")],
+      }),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      withoutSourceIssue: true,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          workspaceLiveClaimantLookup: "not-computable",
+          workspaceLiveClaimants: null,
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: expect.stringContaining("claimed by 2 non-terminal issues"),
+          }),
+        }),
+      },
+    });
+  }, 20_000);
+
+  // BLO-32628, retargeted by PEN-5493: both claimant queries take one row past
+  // their sample limit so a saturated result reads as "at least N" rather than
+  // rendering the cap as an exact count. A refusal message that looks precise
+  // and is wrong at scale is the same diagnosability defect as omitting the
+  // fact altogether. The refusing list is now the live one, so the lower-bound
+  // assertion follows it there; the diagnostic claimant list is capped too.
+  it("reports a saturated claimant sample as a lower bound rather than an exact count", async () => {
+    const expectedBranch = "PAP-465-saturated-recorded";
+    const actualBranch = "PAP-465-saturated-sibling";
+    const { repoRoot, worktreePath } = await createCleanDivergedSiblingRepo({
+      expectedBranch,
+      actualBranch,
+    });
+
+    const error = await captureBranchCoherenceRefusal({
+      db: createClaimantLookupDb(
+        {
+          kind: "rows",
+          // One more than the sample limit, which is what the extra selected row
+          // detects. Twelve would read identically, and that is the point.
+          rows: Array.from({ length: 11 }, (_unused, index) => claimantRow(`PAP-5${index}`)),
+        },
+        {
+          kind: "rows",
+          rows: Array.from({ length: 11 }, (_unused, index) => liveClaimantRow(`PAP-5${index}`)),
+        },
+      ),
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+    });
+
+    expect(error).toMatchObject({
+      code: "workspace_validation_failed",
+      resultJson: {
+        workspaceValidation: expect.objectContaining({
+          workspaceClaimantLookup: "ok",
+          workspaceLiveClaimantLookup: "ok",
+          safeRepair: expect.objectContaining({
+            eligible: false,
+            reason: expect.stringContaining("in use by at least 10 other non-terminal issues"),
+          }),
+        }),
+      },
+    });
+    // Both samples are capped even though each query read one row past the cap.
+    const validation = (error as {
+      resultJson: {
+        workspaceValidation: { workspaceClaimants: unknown[]; workspaceLiveClaimants: unknown[] };
+      };
+    }).resultJson.workspaceValidation;
     expect(validation.workspaceClaimants).toHaveLength(10);
+    expect(validation.workspaceLiveClaimants).toHaveLength(10);
   }, 20_000);
 
   // BLO-32628 / AC 4: eligibility checks several independent facts but only the
@@ -3492,10 +3969,13 @@ describe("realizeExecutionWorkspace", () => {
     });
 
     const error = await captureBranchCoherenceRefusal({
-      db: createClaimantLookupDb({
-        kind: "rows",
-        rows: [claimantRow("PAP-466"), claimantRow("PAP-467")],
-      }),
+      db: createClaimantLookupDb(
+        {
+          kind: "rows",
+          rows: [claimantRow("PAP-466"), claimantRow("PAP-467")],
+        },
+        { kind: "rows", rows: [liveClaimantRow("PAP-467")] },
+      ),
       repoRoot,
       worktreePath,
       expectedBranch,
@@ -3508,7 +3988,7 @@ describe("realizeExecutionWorkspace", () => {
           // Contention wins the ordering...
           safeRepair: expect.objectContaining({
             eligible: false,
-            reason: expect.stringContaining("claimed by 2 non-terminal issues"),
+            reason: expect.stringContaining("in use by 1 other non-terminal issue"),
           }),
           // ...and the losing precondition is still on the payload.
           expectedBranchWorktreePath: expect.any(String),
@@ -9179,7 +9659,16 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
   // prove this guard bites. Here the recorded branch is free and the tree is
   // clean, so contention is the only thing left that can refuse; dropping the
   // second claimant must flip the very same git state to a successful repair.
-  it("refuses safe repair on a clean diverged worktree that two non-terminal issues claim", async () => {
+  // PEN-5493. Retargeted from a claimant COUNT to a claimant LIVENESS test, and
+  // deliberately kept on a real database rather than the drizzle stub upstairs,
+  // because the join to `heartbeat_runs` is the part a stub cannot vouch for.
+  //
+  // The two attempts below differ in exactly one column — the sibling's run
+  // status — while the claimant count, the git state and every other fact stay
+  // byte-identical. That is the control: under the old predicate both attempts
+  // refused and no sequence of events could ever reach the second, which is why
+  // 353 of 581 non-terminal rows in this company were permanently unrepairable.
+  it("refuses safe repair only while another claimant's run is live", async () => {
     const expectedBranch = "PAP-460-contended-recorded";
     const actualBranch = "PAP-460-contended-sibling";
     const repoRoot = await createTempRepo();
@@ -9213,6 +9702,16 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     });
 
     const siblingIssueId = randomUUID();
+    const siblingRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: siblingRunId,
+      companyId: ids.companyId,
+      agentId: ids.agentId,
+      invocationSource: "manual",
+      status: "running",
+      startedAt: new Date(),
+      updatedAt: new Date(),
+    });
     await db.insert(issues).values({
       id: siblingIssueId,
       companyId: ids.companyId,
@@ -9224,6 +9723,9 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       assigneeAgentId: ids.agentId,
       identifier: "PAP-461",
       executionWorkspaceId: ids.sourceWorkspaceId,
+      // The sibling is not merely non-terminal — it holds the execution lock,
+      // which is what makes restoring the recorded branch unsafe here.
+      executionRunId: siblingRunId,
     });
 
     await expect(restoreDirtyQuarantine({
@@ -9245,11 +9747,21 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
             expect.objectContaining({ issueIdentifier: "PAP-460", status: "in_progress" }),
             expect.objectContaining({ issueIdentifier: "PAP-461", status: "in_progress" }),
           ]),
+          // Only the sibling is reported live: the validating issue's own lock is
+          // excluded, because it is held on every pass through this path and
+          // counting it would make the test unsatisfiable by construction.
+          workspaceLiveClaimants: [
+            expect.objectContaining({
+              issueIdentifier: "PAP-461",
+              runId: siblingRunId,
+              runStatus: "running",
+            }),
+          ],
           safeRepair: expect.objectContaining({
             eligible: false,
             attempted: false,
             succeeded: false,
-            reason: expect.stringContaining("execution workspace is claimed by 2 non-terminal issues"),
+            reason: expect.stringContaining("execution workspace is in use by 1 other non-terminal issue"),
           }),
         }),
       },
@@ -9257,8 +9769,12 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(worktreePath, ["symbolic-ref", "--quiet", "--short", "HEAD"]))
       .resolves.toBe(actualBranch);
 
-    // Same git state, one claimant: the repair runs and restores the branch.
-    await db.delete(issues).where(eq(issues.id, siblingIssueId));
+    // Same git state, same TWO claimants — only the sibling's run reaches a
+    // terminal status, which is exactly what releases its execution lock
+    // (`issue-execution-lock.ts`). The repair now runs and restores the branch.
+    await db.update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(eq(heartbeatRuns.id, siblingRunId));
     const realized = await restoreDirtyQuarantine({
       repoRoot,
       worktreePath,
@@ -9272,6 +9788,10 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     // The sibling ref still resolves to the commit captured before the repair.
     await expect(readGit(repoRoot, ["rev-parse", `refs/heads/${actualBranch}`]))
       .resolves.toBe(actualHeadBefore);
+    // The sibling row is still there and still non-terminal, so what changed is
+    // the liveness answer and not the claimant count.
+    await expect(db.select({ status: issues.status }).from(issues).where(eq(issues.id, siblingIssueId)))
+      .resolves.toEqual([{ status: "in_progress" }]);
   }, 30_000);
 });
 

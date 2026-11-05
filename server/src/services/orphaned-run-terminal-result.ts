@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
-import { resolvePaperclipInstanceRoot } from "../home-paths.js";
+import { resolveRunLogBasePath } from "../home-paths.js";
 
 /**
  * Recovers an orphaned run's own terminal verdict from the artifact its pod
@@ -57,8 +57,13 @@ export type OrphanedRunTerminalResult =
     }
   | { outcome: "found"; succeeded: boolean; subtype: string | null; artifactPath: string };
 
+/**
+ * The run-log root this reader scans, which must be the one the run-log STORE
+ * writes to. Delegated to the single producer rather than re-derived here
+ * (PEN-5466); `orphan-artifact-path-agreement.test.ts` pins the agreement.
+ */
 export function runLogBasePath() {
-  return process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
+  return resolveRunLogBasePath();
 }
 
 /**

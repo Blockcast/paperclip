@@ -94,6 +94,21 @@ const {
     reconcileProductivityReviews: vi.fn(async () => ({ created: 0, updated: 0, failed: 0 })),
     reconcileResolvedBlockerDependents: vi.fn(async () => ({ woken: 0, failed: 0 })),
     reconcileUndeliverableIssueMonitors: vi.fn(async () => ({ scanned: 0, cleared: 0, skipped: 0, failed: 0 })),
+    // PEN-5346: the handoff half of the same post-condition. This mock is a
+    // LITERAL, not a Proxy, so a method the startup path calls but the literal
+    // omits is `undefined` and throws `is not a function` — which is how the
+    // two new call sites in `index.ts` took all 11 tests in this file red
+    // without touching it. All-zero so the `logger.warn` guard stays quiet.
+    reconcileCancelledIssueMonitorRecoveries: vi.fn(async () => ({
+      scanned: 0,
+      recovered: 0,
+      cleared: 0,
+      skipped: 0,
+      unowned: 0,
+      failed: 0,
+      pages: 0,
+      oldestClearedAt: null,
+    })),
     reconcileFailedWakeDispatches: vi.fn(async () => ({ recovered: 0, exhausted: 0 })),
     sweepExpiredRuntimeStatuses: vi.fn(() => 0),
     publishAgentLivenessGauges: vi.fn(async () => {}),

@@ -409,11 +409,11 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     expect(comment.idempotencyProcessedAt).toBeNull();
   }, 60_000);
 
-  it("settles a comment whose effects all finished under different owners", async () => {
+  it("settles a comment whose final completion committed without its stamp", async () => {
     await seed();
     await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
-    // Hand-off case: whoever completed the last effect was not the worker that
-    // would have run settlement, so idempotency_processed_at is still null while
+    // The final completion committed but its stamp never did (crash, stamp
+    // error, lost commit reply), so idempotency_processed_at is still null while
     // no row is left queued or lease-expired — invisible to the resumable query.
     for (const effect of await listUnfinishedEffects(db as never, commentId)) {
       const claimed = await claimEffect(db as never, effect.id);
@@ -471,6 +471,44 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
       await stop();
     }
     expect(executed).toEqual([effect.id]);
+  }, 60_000);
+
+  it("sweeps stranded comments on the first reconciler pass, then once per sweep interval", async () => {
+    const strand = async () => {
+      await seed();
+      await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+      for (const effect of await listUnfinishedEffects(db as never, commentId)) {
+        await completeEffect(db as never, (await claimEffect(db as never, effect.id))!);
+      }
+      return commentId;
+    };
+    const stampOf = async (id: string) =>
+      (await db.select().from(issueComments).where(eq(issueComments.id, id)))[0].idempotencyProcessedAt;
+    const process = vi.fn(async () => {});
+
+    const first = await strand();
+    let stop = startIssueCommentEffectReconciler(db as never, process, 1, 60_000);
+    try {
+      await vi.waitFor(async () => expect(await stampOf(first)).not.toBeNull(), { interval: 10, timeout: 5_000 });
+
+      // Hundreds of 1 ms passes later, the throttled sweep has not looked again.
+      const second = await strand();
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      expect(await stampOf(second)).toBeNull();
+
+      // A restarted reconciler sweeps on its first pass, then again once the
+      // interval elapses -- without another restart.
+      await stop();
+      stop = startIssueCommentEffectReconciler(db as never, process, 1, 200);
+      await vi.waitFor(async () => expect(await stampOf(second)).not.toBeNull(), { interval: 10, timeout: 5_000 });
+      const third = await strand();
+      await vi.waitFor(async () => expect(await stampOf(third)).not.toBeNull(), { interval: 10, timeout: 5_000 });
+    } finally {
+      await stop();
+    }
+    // Settlement only: the sweep never re-runs a sink. (The second comment's
+    // freshly enqueued effects were briefly resumable while strand() ran.)
+    expect(process).not.toHaveBeenCalledWith(first);
   }, 60_000);
 });
 

@@ -358,8 +358,14 @@ jobs:
           # call would not fix that — the run would merely be `queued`.
           node .github/scripts/detect-dead-dispatch.mjs || true
           DEAD_DISPATCH=false
+          DEAD_FATE=unknown
           if [ -f "$DEAD_DISPATCH_JSON_PATH" ]; then
             DEAD_DISPATCH="$(jq -r '.dead // false' "$DEAD_DISPATCH_JSON_PATH" 2>/dev/null || echo false)"
+            # PEN-5261. `dead` says the lane delivered nothing; the FATE says
+            # which of the two ways, and the two have opposite remedies. A
+            # `lane-gated-off` reported with the death's prose sends a human to
+            # a lever that provably cannot work.
+            DEAD_FATE="$(jq -r '.fate // "unknown"' "$DEAD_DISPATCH_JSON_PATH" 2>/dev/null || echo unknown)"
           fi
 
           # (1b) Sampling slots stop here. They exist ONLY to age a pending approval,
@@ -385,24 +391,73 @@ jobs:
               # that PEN-4224 measured. The run is additionally FAILED by the
               # backstop step at the bottom of this job, so `conclusion` carries
               # it too — the signal PEN-2848 made load-bearing.
-              echo "::warning::The last production dispatch (run $DEAD_ID) concluded $DEAD_CONCLUSION WITHOUT reaching the deploy job, and master is $BEHIND commit(s) ahead. The day's dispatch was consumed and nothing shipped."
-              {
-                echo "### ⚠️ The last production dispatch died before it could deploy"
-                echo
-                echo "\`docker.yml\` run [\`$DEAD_ID\`]($DEAD_URL) concluded \`$DEAD_CONCLUSION\` **without the \`deploy\` job ever executing**,"
-                echo "so the dispatch it was given was consumed and nothing shipped."
-                echo
-                echo "Production is **$BEHIND commit(s) behind \`master\`**."
-                echo
-                echo "This is NOT a failed deploy. A \`deploy\` job that runs and fails is a different, separately owned"
-                echo "condition; this run never reached one, which usually means the builder or the runner died in front of it."
-                echo
-                echo "**To recover now, without waiting for the next daily slot:** run the"
-                echo "[\`Scheduled production deploy dispatch\`](${GITHUB_SERVER_URL:-https://github.com}/${REPO}/actions/workflows/scheduled-production-deploy.yml)"
-                echo "workflow manually. A \`workflow_dispatch\` of this workflow dispatches regardless of the hour — it does"
-                echo "not wait for the daily cron — and it still approves nothing."
-              } >> "$GITHUB_STEP_SUMMARY"
+              if [ "$DEAD_FATE" = "lane-gated-off" ]; then
+                # PEN-5261. Do NOT offer the manual dispatch as THE fix here.
+                # It is the right lever for a death and the wrong one for this:
+                # while the variable is off, a manual dispatch builds another
+                # image and skips the same three jobs, so naming it up front
+                # would read as a fix and burn a human's attention proving it
+                # is not.
+                #
+                # It IS named at the end, strictly as the step AFTER the
+                # variable is restored. Ally caught the gap on review: this
+                # report does not stop when the variable comes back, because the
+                # last completed dispatch is still the gated-off run, so the
+                # hourly slots keep firing until a fresh dispatch exists. Left
+                # unsaid, that is up to a day of self-inflicted hourly red.
+                echo "::warning::The last production dispatch (run $DEAD_ID) concluded $DEAD_CONCLUSION but the deploy lane never STARTED — guard-pending-deploy was skipped, so docker.yml refused the lane before the build finished. master is $BEHIND commit(s) ahead. Dispatching again will NOT help until vars.PAPERCLIP_CI_DEPLOY is restored; the deploy lane is switched off."
+                {
+                  echo "### ⚠️ The production deploy lane is switched OFF — dispatching is not the fix"
+                  echo
+                  echo "\`docker.yml\` run [\`$DEAD_ID\`]($DEAD_URL) concluded \`$DEAD_CONCLUSION\`, built and pushed an image, and"
+                  echo "skipped **\`guard-pending-deploy\`, \`guard-pending-deploy-final\` and \`deploy\`**. Nothing was rolled out."
+                  echo
+                  echo "Production is **$BEHIND commit(s) behind \`master\`**."
+                  echo
+                  echo "\`guard-pending-deploy\` declares no \`needs:\`, so nothing upstream can make it skip. It skipped because the"
+                  echo "condition it shares with \`deploy\` was false. That condition is:"
+                  echo
+                  echo "\`\`\`"
+                  echo "github.event_name == 'workflow_dispatch' && vars.PAPERCLIP_CI_DEPLOY == 'true' && github.ref == 'refs/heads/master'"
+                  echo "\`\`\`"
+                  echo
+                  echo "This report is only made for a \`workflow_dispatch\` run whose head branch IS \`master\`, so the first and"
+                  echo "third conjuncts held and **\`vars.PAPERCLIP_CI_DEPLOY\` is not \`true\`**."
+                  echo
+                  echo "⛔ **Re-dispatching cannot clear this while the variable is off.** Every dispatch builds an image and"
+                  echo "skips the same three jobs, which is why this is reported separately from a dispatch that died — that"
+                  echo "one a later dispatch recovers."
+                  echo
+                  echo "**The lever is the repository variable**, in Settings → Secrets and variables → Actions. If the lane was"
+                  echo "paused deliberately, nothing here is wrong except that nobody recorded it — this report is how it stops"
+                  echo "being silent, and it clears itself once production is no longer behind."
+                  echo
+                  echo "↩️ **Once the variable is back to \`true\`, there is a second step.** This report does not stop on its own:"
+                  echo "the last completed dispatch is still the gated-off run, so the hourly slots keep reporting it until a"
+                  echo "FRESH dispatch exists. Run this workflow manually to ship immediately — otherwise the next daily slot"
+                  echo "clears it, and the report stands until then."
+                } >> "$GITHUB_STEP_SUMMARY"
+              else
+                echo "::warning::The last production dispatch (run $DEAD_ID) concluded $DEAD_CONCLUSION WITHOUT reaching the deploy job, and master is $BEHIND commit(s) ahead. The day's dispatch was consumed and nothing shipped."
+                {
+                  echo "### ⚠️ The last production dispatch died before it could deploy"
+                  echo
+                  echo "\`docker.yml\` run [\`$DEAD_ID\`]($DEAD_URL) concluded \`$DEAD_CONCLUSION\` **without the \`deploy\` job ever executing**,"
+                  echo "so the dispatch it was given was consumed and nothing shipped."
+                  echo
+                  echo "Production is **$BEHIND commit(s) behind \`master\`**."
+                  echo
+                  echo "This is NOT a failed deploy. A \`deploy\` job that runs and fails is a different, separately owned"
+                  echo "condition; this run never reached one, which usually means the builder or the runner died in front of it."
+                  echo
+                  echo "**To recover now, without waiting for the next daily slot:** run the"
+                  echo "[\`Scheduled production deploy dispatch\`](${GITHUB_SERVER_URL:-https://github.com}/${REPO}/actions/workflows/scheduled-production-deploy.yml)"
+                  echo "workflow manually. A \`workflow_dispatch\` of this workflow dispatches regardless of the hour — it does"
+                  echo "not wait for the daily cron — and it still approves nothing."
+                } >> "$GITHUB_STEP_SUMMARY"
+              fi
               echo "dead_dispatch=true" >> "$GITHUB_OUTPUT"
+              echo "dead_fate=$DEAD_FATE" >> "$GITHUB_OUTPUT"
               echo "outcome=dispatch-died" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -668,6 +723,16 @@ jobs:
       # reddening the run that recovered would be the wrong signal entirely.
       - name: Fail the run when the last dispatch died before it could deploy
         if: steps.dispatch.outputs.dead_dispatch == 'true'
+        env:
+          # PEN-5261. The gate stays `dead_dispatch` — one flag, one red run,
+          # and the `outcome ==` step-gate set stays exactly {skipped-pending}.
+          # Only the WORDING varies, because the two shapes send a human to
+          # different levers and a wrong lever costs more than no message.
+          DEAD_FATE: ${{ steps.dispatch.outputs.dead_fate }}
         run: |
-          echo "::error::The last production dispatch died before reaching the deploy job, so the dispatch it was given shipped nothing and master is still ahead. This slot cannot dispatch a replacement (it is not the daily slot); a manual run of this workflow dispatches at any hour. See the step summary."
+          if [ "$DEAD_FATE" = "lane-gated-off" ]; then
+            echo "::error::The production deploy lane is switched off: the last dispatch built an image and skipped guard-pending-deploy, guard-pending-deploy-final and deploy, so nothing shipped and master is still ahead. vars.PAPERCLIP_CI_DEPLOY is not 'true'. Dispatching again will NOT help until that variable is restored — every dispatch skips the same way; once it is back, run this workflow manually to ship without waiting for the daily slot. See the step summary."
+          else
+            echo "::error::The last production dispatch died before reaching the deploy job, so the dispatch it was given shipped nothing and master is still ahead. This slot cannot dispatch a replacement (it is not the daily slot); a manual run of this workflow dispatches at any hour. See the step summary."
+          fi
           exit 1

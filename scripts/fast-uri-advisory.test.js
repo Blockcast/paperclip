@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -22,15 +23,18 @@ function justBelow([major, minor, patch]) {
   return [major - 1, 999, 999];
 }
 
-// The union the nine encoded advisories must derive to. Transcribed here ONCE,
-// on purpose: this is the assertion that fails if an advisory entry is dropped
-// or a bound is mistyped, which is the defect this module has shipped three
-// times. It is not a second source of truth -- the module derives, this pins.
+// The union the seventeen encoded advisories must derive to. Transcribed here
+// ONCE, on purpose: this is the assertion that fails if an advisory entry is
+// dropped or a bound is mistyped, which is the defect this module has shipped
+// three times. It is not a second source of truth -- the module derives, this
+// pins. PEN-5284 moved all three fixed bounds: 2.4.5 -> 2.4.8, 3.1.6 -> 3.1.9
+// and 4.1.3 -> 4.2.3, because the eight advisories published after the
+// 2026-09-13 read patch above every bound the snapshot knew about.
 test("derived union matches the union of all published fast-uri advisories", () => {
   assert.deepEqual(FAST_URI_VULNERABLE_RANGES, [
-    { introduced: [0, 0, 0], fixed: [2, 4, 5] },
-    { introduced: [3, 0, 0], fixed: [3, 1, 6] },
-    { introduced: [4, 0, 0], fixed: [4, 1, 3] },
+    { introduced: [0, 0, 0], fixed: [2, 4, 8] },
+    { introduced: [3, 0, 0], fixed: [3, 1, 9] },
+    { introduced: [4, 0, 0], fixed: [4, 2, 3] },
   ]);
 });
 
@@ -88,15 +92,12 @@ test("versions the single-advisory table wrongly accepted are rejected", () => {
   }
 });
 
+// 2.4.5, 3.1.6, 3.1.7 and 4.1.3 all used to sit in this list. Every one of
+// them is now declared vulnerable by an advisory published after the snapshot,
+// so each moved up to the real patch point for its line. 3.1.7 is the one
+// PEN-5284 was opened on: both lockfiles resolved it and both gates were green.
 test("patched and out-of-range versions are accepted", () => {
-  for (const version of [
-    "2.4.5",
-    "2.9.9",
-    "3.1.6",
-    "3.1.7",
-    "4.1.3",
-    "5.0.0",
-  ]) {
+  for (const version of ["2.4.8", "2.9.9", "3.1.9", "4.2.3", "5.0.0"]) {
     assert.equal(
       isVulnerableFastUri(version),
       false,
@@ -112,15 +113,109 @@ test("a guard failure cites every advisory that matched, not one", () => {
   assert.ok(matched.length > 1, "3.1.2 matches more than one advisory");
   assert.ok(!matched.includes("GHSA-5jgf-p345-68v8"), "5jgf floor is 3.1.3");
   assert.ok(matched.includes("GHSA-fph4-wmhf-6fwf"), "fph4 floor is 3.1.2");
-  assert.deepEqual(fastUriAdvisoriesFor("3.1.7"), []);
+  // The PEN-5284 regression. This read `[]` against the 2026-09-13 snapshot
+  // while five live advisories covered 3.1.7, which is precisely why both
+  // gates passed over it. Compared sorted: which advisories match is the
+  // property worth pinning, their order in the table is not.
+  assert.deepEqual(fastUriAdvisoriesFor("3.1.7").slice().sort(), [
+    "GHSA-333x-w4r6-6crp",
+    "GHSA-hrr3-gc8f-f4qj",
+    "GHSA-w74x-v6f9-j3xg",
+    "GHSA-wjr9-j795-jxcr",
+    "GHSA-xhq7-xmqj-769h",
+  ]);
+  // 3.1.8 patches GHSA-hrr3 alone, so it is still covered by the other four --
+  // the floor has to clear the HIGHEST patch point, not the first one.
+  assert.equal(isVulnerableFastUri("3.1.8"), true);
+  assert.equal(isVulnerableFastUri("3.1.9"), false);
+
+  // GHSA-58mr-gqgx-xq4g is encoded as three `= X` exact pins. Assert it from
+  // the derived verdict rather than from parseRange alone: a pin that parses
+  // but never reaches the table protects nothing, and 3.1.6 is a version the
+  // previous table declared PATCHED, so this is a real reversal.
+  assert.ok(fastUriAdvisoriesFor("3.1.6").includes("GHSA-58mr-gqgx-xq4g"));
+  assert.ok(!fastUriAdvisoriesFor("3.1.7").includes("GHSA-58mr-gqgx-xq4g"));
 });
 
 test("every encoded advisory contributes at least one live range", () => {
-  assert.equal(FAST_URI_ADVISORIES.length, 9);
+  assert.equal(FAST_URI_ADVISORIES.length, 17);
   for (const { id, ranges } of FAST_URI_ADVISORIES) {
     assert.ok(ranges.length > 0, `${id} has no ranges`);
     for (const range of ranges) parseRange(range);
   }
+});
+
+// package.json's securityAuditRemediations entry is a CLAIM about this table:
+// that its `patchedRange` clears every advisory encoded above, and that its
+// `advisories` names the ones that forced that floor. Nothing else in the repo
+// checks either half, so without this the entry could record any floor and any
+// IDs and still be "guarded" on paper.
+//
+// It also arms the NEXT rotation. The floor assertions below are written
+// against the derived table rather than against a literal, so when a newly
+// published advisory raises the 3.x bound past the recorded floor this fails
+// in a pr.yml-registered gate -- which is exactly what did not happen when the
+// 2026-09-13 snapshot aged out from under 3.1.7 and both gates stayed green.
+// The resolution this floor supersedes: what both lockfiles carried when the
+// 2026-09-13 snapshot went stale under them.
+const SUPERSEDED_RESOLUTION = "3.1.7";
+
+test("the securityAuditRemediations floor clears this table exactly", () => {
+  const rootPackageJson = JSON.parse(
+    readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+  );
+  const entry =
+    rootPackageJson.securityAuditRemediations["PEN-5284"]["fast-uri"];
+
+  // The ledger records the floor the override actually enforces, not a
+  // parallel one that can drift away from it.
+  assert.equal(entry.patchedRange, rootPackageJson.pnpm.overrides["fast-uri"]);
+
+  const floor = /^>=(\d+\.\d+\.\d+) </.exec(entry.patchedRange)?.[1];
+  assert.ok(floor, `unreadable patchedRange ${entry.patchedRange}`);
+  assert.equal(isVulnerableFastUri(floor), false, `${floor} must be accepted`);
+
+  // The floor must be the LOWEST clean version at or above the resolution it
+  // supersedes -- derived by walking the union up from 3.1.7, never compared
+  // against a literal, so a newly published advisory that extends that range
+  // moves the expectation and fails here.
+  //
+  // "clean, and one patch below it is vulnerable" is NOT enough and this was
+  // measured, not assumed: a floor of `>=4.2.3 <5` satisfies both (4.2.2 is
+  // vulnerable, 4.2.3 is not) and survived that weaker pair, while being a
+  // major-version jump away from the line this override actually pins.
+  const cmp = (a, b) => {
+    for (let i = 0; i < 3; i += 1) if (a[i] !== b[i]) return a[i] < b[i] ? -1 : 1;
+    return 0;
+  };
+  let lowestClean = parseVersion(SUPERSEDED_RESOLUTION);
+  for (const range of FAST_URI_VULNERABLE_RANGES) {
+    if (
+      cmp(lowestClean, range.introduced) >= 0 &&
+      cmp(lowestClean, range.fixed) < 0
+    ) {
+      lowestClean = [...range.fixed];
+    }
+  }
+  assert.equal(
+    floor,
+    v(lowestClean),
+    `floor must be the fix for the range covering ${SUPERSEDED_RESOLUTION}`,
+  );
+
+  // Every recorded ID is a real entry above -- a typo'd or retired GHSA ID
+  // reads as documentation and asserts nothing.
+  const known = new Set(FAST_URI_ADVISORIES.map((advisory) => advisory.id));
+  for (const id of entry.advisories) {
+    assert.ok(known.has(id), `ledger names unknown advisory ${id}`);
+  }
+  // And they are EXACTLY the advisories that covered 3.1.7, the resolution
+  // this floor supersedes. Containment is what let the snapshot rot: a table
+  // that merely contains the advisory you came for is the failure mode.
+  assert.deepEqual(
+    entry.advisories.slice().sort(),
+    fastUriAdvisoriesFor(SUPERSEDED_RESOLUTION).slice().sort(),
+  );
 });
 
 test("parseVersion fails closed rather than coercing", () => {
@@ -164,7 +259,30 @@ test("parseRange normalises GitHub bounds and fails closed", () => {
     introduced: [0, 0, 0],
     fixed: [2, 4, 1],
   });
-  for (const bad of ["3.1.6", ">= 3.1.6", "^3.1.6", "", "> 3.1.6, < 3.1.6"]) {
+  // `= X` pins a single affected release. GHSA-58mr-gqgx-xq4g writes all three
+  // of its arms that way, and before PEN-5284 this threw -- at module load,
+  // not at gate time, so transcribing that advisory verbatim would have taken
+  // down every importer rather than failing a check.
+  assert.deepEqual(parseRange("= 3.1.6"), {
+    introduced: [3, 1, 6],
+    fixed: [3, 1, 7],
+  });
+  assert.deepEqual(parseRange("=2.4.5"), {
+    introduced: [2, 4, 5],
+    fixed: [2, 4, 6],
+  });
+  for (const bad of [
+    "3.1.6",
+    ">= 3.1.6",
+    "^3.1.6",
+    "",
+    "> 3.1.6, < 3.1.6",
+    // Still a bad range, not an exact pin: the version must be complete.
+    "= 3.1",
+    "= 3.1.x",
+    "== 3.1.6",
+    ">= 3.0.0, = 3.1.6",
+  ]) {
     assert.throws(
       () => parseRange(bad),
       /fast-uri range|unparseable fast-uri version/,
@@ -177,13 +295,17 @@ test("the lockfile scan reads every pnpm key shape, and fails closed", () => {
   // Both `packages:` (`key:`) and `snapshots:` (`key: {}`) forms, bare and
   // quoted. The quoted forms are the ones worth pinning: the closing `'` must
   // not reach parseVersion as part of the version.
+  // Fixtures carry 3.1.9, not 3.1.7: the last assertion in this loop is that
+  // the scanned version is ACCEPTED, so a fixture pinned to a version that
+  // later goes vulnerable turns a key-shape test into a floor test and fails
+  // for the wrong reason. Use the current floor.
   for (const [line, want] of [
-    ["  fast-uri@3.1.7:", "3.1.7"],
-    ["  fast-uri@3.1.7: {}", "3.1.7"],
-    ["  'fast-uri@3.1.7':", "3.1.7"],
-    ["  'fast-uri@3.1.7': {}", "3.1.7"],
-    ["  fast-uri@3.1.7(patch_hash=abc):", "3.1.7"],
-    ["  'fast-uri@3.1.7(patch_hash=abc)': {}", "3.1.7"],
+    ["  fast-uri@3.1.9:", "3.1.9"],
+    ["  fast-uri@3.1.9: {}", "3.1.9"],
+    ["  'fast-uri@3.1.9':", "3.1.9"],
+    ["  'fast-uri@3.1.9': {}", "3.1.9"],
+    ["  fast-uri@3.1.9(patch_hash=abc):", "3.1.9"],
+    ["  'fast-uri@3.1.9(patch_hash=abc)': {}", "3.1.9"],
   ]) {
     assert.deepEqual(
       fastUriLockfileVersions(line),

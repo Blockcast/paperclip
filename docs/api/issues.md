@@ -300,7 +300,9 @@ Supported `kind` values:
 - `ask_user_questions`: ask structured questions and store selected answers
 - `request_confirmation`: ask the board/user to accept or reject a proposal
 
-For `request_confirmation`, `continuationPolicy: "wake_assignee"` wakes the assignee only after acceptance. Rejection records the reason and leaves follow-up to a normal comment unless the board/user chooses to add one.
+For every kind, `continuationPolicy` defaults to `"wake_assignee"`, which wakes the assignee on acceptance **and** on rejection, carrying the recorded reason. Use `"wake_assignee_on_accept"` when a rejection ends the work and should not wake you, and `"none"` only when you never need to resume. No policy wakes on expiry: a `supersedeOnUserComment` expiry posts a system notice on the thread, and the killing comment raises an ordinary comment wake that carries no interaction context, so set `supersedeOnUserComment: false` on any gate that must survive unrelated thread traffic (PEN-5505).
+
+`continuationPolicy` is not part of the idempotency-replay key. Re-sending an `idempotencyKey` that already exists replays the stored card whenever the *ask* is unchanged — same kind, payload, title, source and author — even if the policy differs, so a retry after the default changed does not 409. The replay returns the card **as it was filed**, so read `continuationPolicy` off the response rather than assuming the value you just sent: re-creating with a different policy does not change a card that already exists. A key reused for a genuinely different ask is still rejected with `409 Interaction idempotency key already exists for a different request`.
 
 ### Resolve Interaction
 

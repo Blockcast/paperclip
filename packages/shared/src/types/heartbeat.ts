@@ -58,16 +58,53 @@ export interface GitWorktreeBranchIncoherenceEvidence {
     } | null;
   } | null;
   /**
-   * Non-terminal issues that reference this execution workspace. More than one
-   * claimant means the worktree is a shared resource, so restoring the recorded
-   * branch would move it off another issue's branch. Safe repair refuses in that
-   * case and routes to the workspace-binding recovery path instead. Optional so
+   * Non-terminal issues that reference this execution workspace. Recorded for
+   * diagnosis only: a claimant that merely *references* the workspace is not
+   * evidence that anything is using the worktree right now, so this list does
+   * not decide eligibility. {@link workspaceLiveClaimants} does. Optional so
    * previously persisted evidence payloads stay valid.
    */
   workspaceClaimants?: {
     issueId: string;
     issueIdentifier: string | null;
     status: string;
+  }[] | null;
+  /**
+   * Claimants other than the issue being repaired that are being worked in this
+   * workspace right now — i.e. that a non-terminal run either holds the issue
+   * execution lock for (`checkoutRunId`/`executionRunId`, the same predicate
+   * `POST /issues/:id/checkout` 409s on) or merely names as its context issue.
+   *
+   * Both arms are needed, and the second is not redundant: a run only takes the
+   * lock when `claimQueuedRun` requires it, which excludes interaction wakes
+   * carrying a comment id, non-assignee mention runs and non-ownership retry
+   * lineages. Those execute and realize this worktree while holding no lock at
+   * all, so a lock-only reading would report an idle worktree while a peer was
+   * committing in it.
+   *
+   * PEN-5493. Eligibility used to refuse on `workspaceClaimants.length > 1`,
+   * which is a count of references rather than a test of use: a `backlog` row
+   * that will never run again weighed exactly as much as a peer mid-checkout.
+   * Because the count can only grow, a worktree with two claimants was
+   * permanently ineligible — no quiescence made it repairable. Measured across
+   * the three projects in this company that have non-terminal work, 353 of 581
+   * non-terminal rows (60.8%) sat on such a worktree. This list asks the
+   * question the refusal was reaching for: across the 74 shared worktrees in
+   * that census, exactly one carried a second live claimant, so this list is
+   * empty — and the repair therefore eligible — on the other 73.
+   *
+   * Empty means no other claimant is executing and the restore cannot pull the
+   * worktree out from under a live peer. Optional so previously persisted
+   * evidence payloads stay valid; absent is not the same as empty, and a reader
+   * must not treat a pre-PEN-5493 payload as proof that nothing was live.
+   */
+  workspaceLiveClaimants?: {
+    issueId: string;
+    issueIdentifier: string | null;
+    status: string;
+    /** The non-terminal run holding the lock, so the holder is nameable. */
+    runId: string;
+    runStatus: string;
   }[] | null;
   /**
    * Outcome of the claimant lookup, so a `null` `workspaceClaimants` stays
@@ -78,6 +115,18 @@ export interface GitWorktreeBranchIncoherenceEvidence {
    * payloads stay valid.
    */
   workspaceClaimantLookup?: "ok" | "failed" | "not-computable";
+  /**
+   * Outcome of the live-claimant lookup, separate from
+   * {@link workspaceClaimantLookup} because the two queries fail
+   * independently. `failed` refuses — a liveness test that evaporates under
+   * database stress is not a liveness test, and database stress co-occurs with
+   * the workspace thrash that produces contention. `not-computable` means
+   * there was nothing to query (no database handle, no execution workspace id,
+   * or no source issue to exclude), and falls back to the pre-PEN-5493
+   * claimant-count refusal rather than passing. Optional so previously
+   * persisted evidence payloads stay valid.
+   */
+  workspaceLiveClaimantLookup?: "ok" | "failed" | "not-computable";
   /**
    * Worktree that currently holds the recorded branch, when some worktree does.
    * Recorded unconditionally rather than only when it is the refusing

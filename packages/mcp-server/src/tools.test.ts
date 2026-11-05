@@ -798,7 +798,10 @@ describe("paperclip MCP tools", () => {
     expect(init.method).toBe("POST");
     expect(JSON.parse(String(init.body))).toEqual({
       kind: "request_confirmation",
-      continuationPolicy: "none",
+      // PEN-5505: was `none`, the only ask-tool that defaulted to the enum member
+      // emitting nothing. The published tool schema is what agents read, so this
+      // asserts the advertised default and the applied one cannot drift apart.
+      continuationPolicy: "wake_assignee",
       idempotencyKey: "confirmation:PAP-1135:plan:33333333-3333-4333-8333-333333333333",
       title: "Plan approval",
       payload: {

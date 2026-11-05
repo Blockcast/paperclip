@@ -877,6 +877,51 @@ describe("approval routes idempotent retries", () => {
     expect(mockApprovalService.list).not.toHaveBeenCalled();
   });
 
+  it("surfaces the decider on summary rows instead of leaving a hole (PEN-5432)", async () => {
+    // The route is a pass-through, so this pins that it stays one for this field. A caller
+    // reading `decidedByUserId` off a summary row is asking "did a human decide this card";
+    // if the route ever drops the key, that caller silently gets `undefined`, reads it as
+    // "no human decided", and may resubmit or override a deliberate human decision.
+    mockApprovalService.listSummary.mockResolvedValue([
+      {
+        id: "approval-decided",
+        type: "request_board_approval",
+        status: "rejected",
+        requestedByAgentId: "agent-1",
+        requestedByUserId: null,
+        idempotencyKey: null,
+        createdAt: new Date("2026-08-02T00:00:00.000Z"),
+        decidedAt: new Date("2026-08-03T00:00:00.000Z"),
+        decidedByUserId: "human-board-user",
+        label: "Rotate credentials",
+      },
+      {
+        id: "approval-pending",
+        type: "request_board_approval",
+        status: "pending",
+        requestedByAgentId: "agent-1",
+        requestedByUserId: null,
+        idempotencyKey: null,
+        createdAt: new Date("2026-08-02T00:00:00.000Z"),
+        decidedAt: null,
+        decidedByUserId: null,
+        label: "Still open",
+      },
+    ]);
+
+    const res = await request(await createApp()).get(
+      "/api/companies/company-1/approvals?view=summary",
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body[0].decidedByUserId).toBe("human-board-user");
+    // Present-and-null on the undecided row, never absent: `has(key)` must answer truthfully
+    // on every row so that absence is not something a caller has to interpret.
+    expect(res.body[1]).toHaveProperty("decidedByUserId");
+    expect(res.body[1].decidedByUserId).toBeNull();
+    expect(res.body[0]).not.toHaveProperty("payload");
+  });
+
   it("rejects an unknown view rather than silently falling back to the expensive listing", async () => {
     const res = await request(await createApp())
       .get("/api/companies/company-1/approvals?view=everything");

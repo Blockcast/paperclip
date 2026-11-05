@@ -303,7 +303,12 @@ const createRequestConfirmationToolSchema = z.object({
   sourceRunId: z.string().guid().nullable().optional(),
   title: z.string().trim().max(240).nullable().optional(),
   summary: z.string().trim().max(1000).nullable().optional(),
-  continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("none"),
+  // PEN-5505: kept in step with the `request_confirmation` member of
+  // `createIssueThreadInteractionSchema`, which carries the reasoning. This
+  // schema is what the published tool advertises, so a skew between the two
+  // would show up as a tool whose documented default is not the one the API
+  // applies.
+  continuationPolicy: issueThreadInteractionContinuationPolicySchema.prefault("wake_assignee"),
   payload: requestConfirmationPayloadSchema,
 });
 
@@ -729,7 +734,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipListApprovals",
-      "List approvals in a company. Default view=full returns whole payload bodies and is expensive (hundreds of KB on a busy queue). Before filing a new approval, check for an existing one with view=count or view=summary — summary omits payload and returns a derived, always-populated `label` per row, so a duplicate check costs a fraction of a re-file. Filter by type, issueId, requestedByAgentId, or idempotencyKey to narrow further. ⚠ `issueId` FILTERS THROUGH THE LINK TABLE, so it returns only cards somebody LINKED to that row — never \"every card about this row\". The array views (`full`, `summary`) report nothing about that gap: a short list is indistinguishable at the call site from a row with fewer asks, and the error understates board exposure on exactly the multi-agent incidents where it matters most (measured on PEN-5379: 3 returned, 4 standing). THE TELL: pass `view=count` with `issueId`, which answers `{count, linkCoverage}`; `linkCoverage.potentiallyUnlinkedCards: true` means undecided cards name that issue's identifier without being linked to it. It is a lower bound, so `false` is not proof of completeness, and null counts with `basis: \"approval_read_unavailable\"` mean the probe was not permitted for your seat rather than that it found nothing. Before PEN-5511 a card filed by a non-assignee could not be linked to its own subject row at all, so cards filed then are the likeliest to be missing. (PEN-5511)",
+      "List approvals in a company. Default view=full returns whole payload bodies and is expensive (hundreds of KB on a busy queue). Before filing a new approval, check for an existing one with view=count or view=summary — summary omits payload and returns a derived, always-populated `label` per row, so a duplicate check costs a fraction of a re-file. Filter by type, issueId, requestedByAgentId, or idempotencyKey to narrow further. ⚠ `issueId` FILTERS THROUGH THE LINK TABLE, so it returns only cards somebody LINKED to that row — never \"every card about this row\". The array views (`full`, `summary`) report nothing about that gap: a short list is indistinguishable at the call site from a row with fewer asks, and the error understates board exposure on exactly the multi-agent incidents where it matters most (measured on PEN-5379: 3 returned, 4 standing). THE TELL: pass `view=count` with `issueId`, which answers `{count, linkCoverage}`; `linkCoverage.potentiallyUnlinkedCards: true` means undecided cards name that issue's identifier without being linked to it. It is a lower bound, so `false` is not proof of completeness, and null counts with `basis: \"approval_read_unavailable\"` mean the probe was not permitted for your seat rather than that it found nothing. Before PEN-5511 a card filed by a non-assignee could not be linked to its own subject row at all, so cards filed then are the likeliest to be missing. (PEN-5511)\n\n⚠ `decidedByUserId` tells you WHETHER A HUMAN DECIDED THIS CARD, and reading it wrong is a governance error, not a cosmetic one. Both `full` and `summary` now carry it, populated, on every decided row (PEN-5432); `count` returns a bare count and carries no rows at all. A non-null value is WHO LAST WROTE A DECISION on the card, and it is NOT always a resolvable user: the approve/reject/requestRevision routes write `req.actor.userId ?? \"board\"`, so a board actor carrying no user id lands the literal sentinel `board`. Treat an unresolvable value as that sentinel rather than a missing user. ⚠ `null` means NO HUMAN USER wrote that decision — a system or agent action — and it is ALSO what an undecided (`pending`) card carries, so pair it with `status`/`decidedAt` before concluding anything: `null` on a decided row is a real signal, `null` on a pending row is just \"not yet\". ⚠ `withdrawn` is the one status where a NON-NULL value does not mean \"a human decided this\". A withdrawal preserves an existing board note byte-identical ALONG WITH its `decidedByUserId`, but on a card the board never wrote on it OVERWRITES the field with the WITHDRAWER (their user id, or `null` when an agent retired its own card). So on a withdrawn row the field names either the board that returned it or the party that retired it, and only `decisionNote` plus the approval comments distinguish them — do not read it as a board decision. `resubmit` clears the field back to `null`. ⚠ DEPLOY SKEW, and it fails in the DANGEROUS direction: this description and the paperclip-api deploy reach you on different cadences, and a server predating PEN-5432 OMITS the key entirely from `summary` rows. ABSENT IS NOT `null` — but `jq .decidedByUserId` and JS property access both render an absent key exactly like a populated `null`, so on an older server every decided card reads as \"no human decided this\". That is the misread itself: it licenses resubmitting, withdrawing or overriding a decision a human deliberately made, and it reached live agent reasoning twice before this fix. Gate on key presence (`has(\"decidedByUserId\")`), and when the key is ABSENT the decider is NOT KNOWABLE from this surface — re-read the card with `paperclipGetApproval`, which has always populated it correctly, rather than inferring from the hole.",
       z.object({
         companyId: companyIdOptional,
         status: z.string().optional(),
@@ -830,6 +835,34 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
         client.requestJson("DELETE", `/issues/${encodeURIComponent(issueId)}/monitor`),
     ),
     makeTool(
+      "paperclipClaimWorkspaceDir",
+      "Claim a working DIRECTORY before you edit anything in it, and act on the refusal if you get one. This is the guard that the issue checkout lock cannot provide: the lock is keyed on the ISSUE, while the per-issue worktree path is keyed on the issue too \u2014 so two runs OF YOUR OWN SEAT on one issue resolve to ONE directory, and a run that starts editing before checking out is never refused, only wrong. It finds out by reading its own diff back changed. Call this once the directory's final shape exists (AFTER the clone or worktree is materialised, not before: a directory claimed while plain and then turned into a git checkout moves its own claim into .git/, leaving the first claim unreadable by the next run and unreleasable by you). Pass issueId whenever the directory is an issue's tree \u2014 that additionally refuses a run that does not hold that issue's checkout lock, which is the STRICTLY EARLIER failure and the one that actually happened in PEN-5352, where no claim existed at all and `available` was the honest verdict about the wrong run being there. \u26a0 `acquired: false` is a REFUSAL, not advice: `refusal` says who holds the directory and what to do. Do NOT work in the directory anyway, and do NOT delete the claim by hand. \u26a0 READ THIS BEFORE CONCLUDING YOU ARE ALONE: `ListAgents` CANNOT see sibling runs of your own seat \u2014 they are separate pods, and subagents/teammates/local sessions are all it returns \u2014 so `ListAgents \u2192 none` means \"this tool cannot answer that question\", NEVER \"nobody else is here\". A `sibling_run` verdict here is your own seat, not an unreachable peer: the issue thread is where concurrent runs of one seat actually meet, so read it before designing around a rival. Mistaking the first for the second is the expensive half of PEN-5352 \u2014 the colliding run spent its remaining budget carefully preserving a branch the thread had already declared empty 19 minutes earlier. The claim is NOT a lease and never expires: a takeover needs the owning run to be positively determined finished, so `unknown` liveness, an unreadable claim, or a failed lookup all refuse.",
+      z.object({
+        dirPath: z
+          .string()
+          .trim()
+          .min(1)
+          .describe(
+            "Absolute path of the directory you are about to work in. Must already exist, must be a directory, and must be on a filesystem the server shares with the agent pods \u2014 a path local to one pod cannot exclude a run in another, and is refused with the allowed roots named.",
+          ),
+        issueId: z
+          .string()
+          .trim()
+          .min(1)
+          .optional()
+          .describe(
+            "The issue whose tree this is. Supplying it gates the claim on your holding that issue's checkout lock as well, so pass it whenever one applies.",
+          ),
+      }),
+      async (body) => client.requestJson("POST", "/workspace-dir-claims", { body }),
+    ),
+    makeTool(
+      "paperclipReleaseWorkspaceDir",
+      "Release your own claim on a working directory when you are done with it. Only ever removes a claim whose runId is yours: a release that could delete a foreign claim would reintroduce the overwrite the claim exists to prevent, and a run exiting is the moment it is least able to judge whose claim it is looking at. So `released: false` with a reason naming another run is the correct, safe answer \u2014 not an error to route around. Leaving a claim behind is recoverable without this call: the next run positively determines your run terminal from its status and takes the directory over.",
+      z.object({ dirPath: z.string().trim().min(1) }),
+      async (body) => client.requestJson("POST", "/workspace-dir-claims/release", { body }),
+    ),
+    makeTool(
       "paperclipReleaseIssue",
       "Release your checkout on an issue: unassigns it and resets it to todo (regardless of what status it was in before checkout — this is not a revert). Inverse of paperclipCheckoutIssue — use when you can no longer make progress and want another agent to be able to pick it up.",
       z.object({ issueId: issueIdSchema }),
@@ -868,7 +901,7 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
     ),
     makeTool(
       "paperclipRequestConfirmation",
-      "Create a request_confirmation interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response. ALSO set `payload.expectedOutcome` when accepting this ask authorises a concrete action (a PR merge, an issue reaching a status): it is the only thing that lets anything later tell an acceptance whose action happened from one whose action never did, it is never inferred from your prompt text, and without it the card is reported as `untracked`.",
+      "Create a request_confirmation interaction on an issue. NOTE: `payload.supersedeOnUserComment` DEFAULTS TO TRUE when omitted — while true, any user comment on the issue expires this ask unanswered, including an unrelated one. Pass `false` explicitly for a gate that must survive routine thread traffic, and confirm it in the response. ALSO set `payload.expectedOutcome` when accepting this ask authorises a concrete action (a PR merge, an issue reaching a status): it is the only thing that lets anything later tell an acceptance whose action happened from one whose action never did, it is never inferred from your prompt text, and without it the card is reported as `untracked`. NOTE `continuationPolicy` DEFAULTS TO `wake_assignee` when omitted (PEN-5505 — it used to default to `none`, uniquely among the ask-tools), so an accept OR a reject wakes the issue's assignee and the decline reason reaches you. Pass `wake_assignee_on_accept` when a rejection ends the work and you do not want waking for it, and `none` only when you genuinely never need to resume — on `none` NOTHING is emitted in any terminal state, so the card is yours to poll for. ⚠ NO policy wakes on EXPIRY, including `wake_assignee`. A card killed by `supersedeOnUserComment` posts a system notice on the thread and the killing comment raises an ORDINARY comment wake, which carries no interaction context at all — so nothing tells you your ask died, and on a closed issue not even that fires. A wake policy is therefore not a substitute for `supersedeOnUserComment: false` on a gate that must survive thread traffic.",
       createRequestConfirmationToolSchema,
       async ({ issueId, ...body }) =>
         client.requestJson("POST", `/issues/${encodeURIComponent(issueId)}/interactions`, {

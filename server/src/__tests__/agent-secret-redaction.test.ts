@@ -2540,6 +2540,191 @@ describe("agent workspace command withholding (PEN-5225)", () => {
     const persisted = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, any>;
     expect(persisted.adapterConfig.workspaceStrategy).toBe(PROVISION);
   });
+
+  // PEN-5327 (deferred item 4). `/config-revisions` is the third
+  // `containAgentConfig` call-site family and was the only one no test reached:
+  // the agent detail / company list / `/configuration` surfaces are pinned
+  // above, the approval payload by `approval-agent-config-authz-routes.test.ts`,
+  // revision snapshots by nothing. The existing revision tests in `agent secret
+  // redaction on mutating responses` read as a board actor and pin the SECRET
+  // containment, not this viewer gate.
+  //
+  // The commands are genuinely AT REST in `agent_config_revisions`.
+  // `buildConfigSnapshot` stores `adapterConfig` through `sanitizeRecord`, which
+  // decides from the KEY name, and neither `COMMAND_PAYLOAD_KEY_RE` nor
+  // `COMMAND_ARGS_PAYLOAD_KEY_RE` matches `provisionCommand` /
+  // `teardownCommand` / `worktreeParentDir` — so the strings reach the column
+  // intact and `containAgentConfig` inside `redactRevisionSnapshot` is the SOLE
+  // control withholding them on this surface. The readership is the one PEN-5225
+  // withholds from: these two routes are deliberately COMPANY-scoped, so
+  // `agents:configure` admits (the suggest tier is refused `deny_scope` here —
+  // PEN-5231), and no agent can hold `workspace_runtime:read` (PEN-2852).
+  //
+  // Severity is Low and there is no live exposure: the control is correct today.
+  // It is pinned because it is reachable BY ACCIDENT — `containAgentConfig(value,
+  // viewer = WITHHELD_AGENT_WORKSPACE_COMMAND_VIEWER)` defaults to the withheld
+  // viewer, so dropping the argument at either call site fails CLOSED, and a
+  // fail-closed regression is one only a test tells you about.
+  // Deliberately a command with NO embedded secret, for the two positive
+  // controls. `containAgentConfig` runs the name-and-shape sanitizer over the
+  // snapshot before the viewer gate, so asserting the exact bytes of `PROVISION`
+  // there would couple them to the inner-secret rules as well as to the gate
+  // they are about.
+  const PLAIN_PROVISION = "./provision.sh --no-secrets";
+
+  function peerStrategyRevisionRow(adapterConfig: unknown) {
+    // Its own row rather than the `revisionRow()` above, which is scoped to the
+    // other describe. `agentId` is the PEER subject, matching the agent the four
+    // cases below resolve and request — see the readership note on the first.
+    return {
+      id: strategyRevisionId,
+      agentId: peerAgentId,
+      companyId,
+      source: "patch",
+      changedKeys: ["adapterConfig"],
+      beforeConfig: { adapterConfig },
+      afterConfig: { adapterConfig },
+    };
+  }
+
+  it("GET /agents/:id/config-revisions/:revisionId withholds the commands from a peer", async () => {
+    // THE LOAD-BEARING DIRECTION, and the same two-gate state as the detail
+    // route: `agent_config:read` buys the revision; it does not buy the commands.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": false,
+    }));
+    // Resolve the PEER row, not this actor's own. `peerAgentActor.agentId` IS
+    // `agentId`, so requesting `/api/agents/${agentId}` here would be a SELF
+    // read wearing a peer's name. Inert today — both routes are deliberately
+    // company-scoped and never pass a `subjectAgentId`, so `allow_self` is not
+    // reachable (PEN-5231) — but if that scoping were ever widened these cases
+    // would silently start exercising the self path instead of the readership
+    // they are named for. Matches the `/api/agents/:id` sibling above.
+    mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
+    mockAgentService.getConfigRevision.mockResolvedValue(
+      peerStrategyRevisionRow(strategyAgent.adapterConfig),
+    );
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(
+      `/api/agents/${peerAgentId}/config-revisions/${strategyRevisionId}`,
+    );
+
+    // Assert the success path explicitly — a 403/404 passes every negative
+    // assertion below vacuously.
+    expect(res.status).toBe(200);
+    // BOTH snapshots: `redactConfigRevision` makes two independent
+    // `redactRevisionSnapshot` calls, so masking one is not evidence for the other.
+    for (const side of [res.body.beforeConfig, res.body.afterConfig]) {
+      expect(side.adapterConfig.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(side.adapterConfig.workspaceStrategy.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(side.adapterConfig.workspaceStrategy.worktreeParentDir).toBe(REDACTED_EVENT_VALUE);
+    }
+    // A mask, not a drop: everything the revision reader is already allowed to
+    // see still crosses.
+    expect(res.body.afterConfig.adapterConfig.workspaceStrategy.type).toBe("git_worktree");
+    expect(res.body.afterConfig.adapterConfig.cwd).toBe("/workspace");
+    expect(JSON.stringify(res.body)).not.toContain("prov_secret_13579");
+    expect(JSON.stringify(res.body)).not.toContain("tear_secret_24680");
+  });
+
+  it("GET /agents/:id/config-revisions withholds them from the LIST route too", async () => {
+    // `redactConfigRevision` has TWO call sites and each resolves its own viewer
+    // through `resolveWorkspaceRuntimeViewer`. Pinning only the single-revision
+    // route leaves the list free to drop its argument.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": false,
+    }));
+    mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
+    mockAgentService.listConfigRevisions.mockResolvedValue([
+      peerStrategyRevisionRow(strategyAgent.adapterConfig),
+    ]);
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(`/api/agents/${peerAgentId}/config-revisions`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(1);
+    // The SAME (key x side) matrix as the detail case, for the same reason:
+    // `redactConfigRevision` masks `beforeConfig` and `afterConfig` through two
+    // independent `redactRevisionSnapshot` calls, so masking one is not evidence
+    // for the other. Asserting a subset left three of the six cells unpinned,
+    // and one of those — `teardownCommand` on `afterConfig` — was covered by
+    // NOTHING: no mask assertion, and the `tear_secret_24680` substring check
+    // that would have caught it was absent too. That is a LEAK-direction hole,
+    // not the fail-closed one the positive controls cover. `worktreeParentDir`
+    // carries no secret at all, so only a direct assertion can reach it.
+    for (const side of [res.body[0].beforeConfig, res.body[0].afterConfig]) {
+      expect(side.adapterConfig.workspaceStrategy.provisionCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(side.adapterConfig.workspaceStrategy.teardownCommand).toBe(REDACTED_EVENT_VALUE);
+      expect(side.adapterConfig.workspaceStrategy.worktreeParentDir).toBe(REDACTED_EVENT_VALUE);
+    }
+    // A mask, not a drop — pinned on this route too, not only on the detail one.
+    expect(res.body[0].afterConfig.adapterConfig.workspaceStrategy.type).toBe("git_worktree");
+    expect(res.body[0].afterConfig.adapterConfig.cwd).toBe("/workspace");
+    expect(JSON.stringify(res.body)).not.toContain("prov_secret_13579");
+    expect(JSON.stringify(res.body)).not.toContain("tear_secret_24680");
+  });
+
+  it("returns a revision's commands to a reader holding workspace_runtime:read", async () => {
+    // THE POSITIVE CONTROL for the single-revision route. Without it a redactor
+    // that masked unconditionally — or a route that 403'd — would satisfy every
+    // negative assertion above. It is also the only case that catches this call
+    // site DROPPING its viewer argument: that defaults to the withheld viewer,
+    // so it fails closed and every negative assertion still passes.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": true,
+    }));
+    mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
+    mockAgentService.getConfigRevision.mockResolvedValue(
+      peerStrategyRevisionRow({
+        workspaceStrategy: { type: "git_worktree", provisionCommand: PLAIN_PROVISION },
+      }),
+    );
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(
+      `/api/agents/${peerAgentId}/config-revisions/${strategyRevisionId}`,
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body.afterConfig.adapterConfig.workspaceStrategy.provisionCommand)
+      .toBe(PLAIN_PROVISION);
+  });
+
+  it("returns a revision's commands on the LIST route to the same entitled reader", async () => {
+    // The list route needs its OWN positive control, and this is the case the
+    // negative list test above cannot cover. `redactConfigRevision` has two call
+    // sites; each resolves its own viewer. Dropping the argument at THIS one
+    // fails closed, so the negative test keeps passing and only an entitled read
+    // notices. Pinning one route's viewer and not the other's leaves exactly the
+    // silent half unpinned.
+    mockAccessService.decide.mockImplementation(decideBy({
+      "agent_config:read": true,
+      "agent:read": true,
+      "workspace_runtime:read": true,
+    }));
+    mockAgentService.getById.mockResolvedValue({ ...strategyAgent, id: peerAgentId });
+    mockAgentService.listConfigRevisions.mockResolvedValue([
+      peerStrategyRevisionRow({
+        workspaceStrategy: { type: "git_worktree", provisionCommand: PLAIN_PROVISION },
+      }),
+    ]);
+
+    const app = createApp(peerAgentActor);
+    const res = await request(app).get(`/api/agents/${peerAgentId}/config-revisions`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveLength(1);
+    expect(res.body[0].afterConfig.adapterConfig.workspaceStrategy.provisionCommand)
+      .toBe(PLAIN_PROVISION);
+  });
 });
 
 // PEN-5253. The accepted residual, pinned on BOTH sides so it stops living only

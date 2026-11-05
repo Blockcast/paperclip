@@ -973,3 +973,84 @@ test('the dispatch output names the reviewer set but never states its value (PEN
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// PEN-5261: a lane that is SWITCHED OFF reports a different lever.
+//
+// `dead_dispatch` stays one flag with one red run — what varies is the prose,
+// because the two shapes send a human to opposite levers. For a death the
+// manual dispatch IS the fix; for a gated-off lane it provably is not, and
+// offering it would burn a human's attention proving that.
+// ---------------------------------------------------------------------------
+
+const deadBranch = () => {
+  const branch = code.match(/if \[ "\$DEAD_DISPATCH" = "true" \][\s\S]*?\n            fi\n/);
+  assert.ok(branch, 'the sampling slot must branch on a dead lane');
+  return branch[0];
+};
+
+test('the dead-lane branch tells a switched-off lane apart from a dispatch that died', () => {
+  const branch = deadBranch();
+  assert.match(branch, /DEAD_FATE/, 'the branch must read the fate, not just `dead`');
+  assert.match(
+    branch,
+    /if \[ "\$DEAD_FATE" = "lane-gated-off" \]/,
+    'and must take a different arm for it',
+  );
+  // Both arms still warn. A switched-off lane is not a notice either.
+  assert.ok(!/::notice::/.test(branch), 'neither arm may downgrade to a notice');
+});
+
+test('the switched-off arm names the REAL lever, and the dispatch only as the SECOND step', () => {
+  // The whole point of splitting the report. The gated-off arm is the text
+  // between the fate test and the `else`; the other arm's UNCONDITIONAL
+  // manual-dispatch lever must not leak into this one, because while the
+  // variable is off a dispatch provably ships nothing.
+  //
+  // It must still name the dispatch as the step AFTER the variable is restored
+  // (Ally, review of c5e86458): this report reads the LAST COMPLETED dispatch,
+  // which is still the gated-off run once the variable comes back, so the
+  // hourly slots keep firing until a fresh dispatch exists. Saying only "the
+  // lever is the variable" leaves up to a day of self-inflicted hourly red.
+  const branch = deadBranch();
+  const gatedArm = branch.slice(
+    branch.indexOf('if [ "$DEAD_FATE" = "lane-gated-off" ]'),
+    branch.indexOf('\n              else\n'),
+  );
+  assert.ok(gatedArm.length > 0, 'the gated-off arm must be non-empty');
+  assert.match(gatedArm, /PAPERCLIP_CI_DEPLOY/, 'name the variable that actually gates the lane');
+  assert.match(gatedArm, /guard-pending-deploy/, 'and the job whose skip proves it');
+  assert.ok(
+    /will NOT help|cannot clear this/.test(gatedArm),
+    'and say plainly that re-dispatching does not recover it',
+  );
+  assert.ok(
+    !/regardless of the hour/.test(gatedArm),
+    'the OTHER arm offers the dispatch unconditionally — that framing must not leak here',
+  );
+  // The qualifier is load-bearing: unqualified, the claim goes false the moment
+  // the variable is restored.
+  assert.ok(
+    /while the variable is off|until vars\.PAPERCLIP_CI_DEPLOY is restored/.test(gatedArm),
+    'the "re-dispatching does not help" claim must be scoped to the switch being off',
+  );
+  assert.ok(
+    /back to .true.|restored/.test(gatedArm) && /manually/.test(gatedArm),
+    'and the arm must name the restore-then-dispatch step that actually clears the hourly red',
+  );
+});
+
+test('the fate reaches the backstop, so the red run names the right lever too', () => {
+  // The gate stays `dead_dispatch` (pinned above, with the `outcome ==` step-gate
+  // set). Only the wording varies.
+  const writes = [...code.matchAll(/dead_fate=\$DEAD_FATE/g)];
+  assert.equal(writes.length, 1, 'exactly one writer, in the same branch as dead_dispatch');
+  assert.match(deadBranch(), /echo "dead_fate=\$DEAD_FATE" >> "\$GITHUB_OUTPUT"/);
+
+  const backstop = code.match(/- name: Fail the run when the last dispatch died[\s\S]*?exit 1/);
+  assert.ok(backstop, 'the backstop must still exist');
+  assert.match(backstop[0], /if:\s*steps\.dispatch\.outputs\.dead_dispatch == 'true'/);
+  assert.match(backstop[0], /DEAD_FATE: \$\{\{ steps\.dispatch\.outputs\.dead_fate \}\}/);
+  assert.match(backstop[0], /PAPERCLIP_CI_DEPLOY/, 'the error must name the lever for a gated lane');
+  assert.match(backstop[0], /exit 1/, 'and must still make the conclusion carry it');
+});

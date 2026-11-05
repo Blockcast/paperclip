@@ -1270,6 +1270,119 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     expect(rows[0]?.idempotencyKey).toBe("run-1:questionnaire");
   });
 
+  // PEN-5505: the default moved from `none` to `wake_assignee`, so every
+  // `request_confirmation` already persisted with a key carries a policy the
+  // new default no longer matches. `isEquivalentCreateRequest` used to compare
+  // the policy, which turned an unchanged retry into
+  // `409 ... already exists for a different request` and invited the caller to
+  // mint a new key — a duplicate card in front of a human, on exactly the
+  // pending gates agents retry.
+  //
+  // The stored row is seeded through `create` with an EXPLICIT `none`, which
+  // produces exactly the row the old default produced: the column records the
+  // value, not how it was chosen. Seeding it with a raw insert instead would
+  // skip the payload normalization `create` applies, and the replay would then
+  // fail on the payload term rather than exercising the policy one.
+  it("replays a pre-existing request_confirmation whose stored continuation policy predates the new default", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Pre-default idempotent replay");
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const idempotencyKey = `confirmation:${issueId}:plan:${randomUUID()}`;
+    const payload = { version: 1 as const, prompt: "Apply this plan?" };
+
+    const stored = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      idempotencyKey,
+      // What the old default persisted. Also what the MCP tool sent for an
+      // omitted policy, which is why a stored `none` cannot be read as "the
+      // author asked for silence" and why these rows were not backfilled.
+      continuationPolicy: "none",
+      payload,
+    }, {
+      agentId,
+    });
+    expect(stored.continuationPolicy).toBe("none");
+
+    // Exactly what a retry now sends: the route's `validate()` and the MCP tool
+    // schema both populate the policy before the service sees it, so the new
+    // default arrives explicitly and "the caller omitted it" is not observable
+    // at this boundary.
+    const replayed = await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      idempotencyKey,
+      continuationPolicy: "wake_assignee",
+      payload,
+    }, {
+      agentId,
+    });
+
+    expect(replayed.id).toBe(stored.id);
+    // Replayed as filed, not silently upgraded: the caller can read the real
+    // policy off the response rather than assume the one it asked for.
+    expect(replayed.continuationPolicy).toBe("none");
+
+    const rows = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, issueId));
+    expect(rows).toHaveLength(1);
+  });
+
+  // The conflict this predicate exists for must still fire: a key reused for a
+  // genuinely different ask is a caller bug, and dropping the policy term above
+  // must not have widened the replay into one that hides it.
+  it("still rejects an idempotency key reused for a different request_confirmation prompt", async () => {
+    const { companyId, issueId } = await seedConfirmationIssue("Key reuse still conflicts");
+    const agentId = randomUUID();
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const idempotencyKey = `confirmation:${issueId}:plan:${randomUUID()}`;
+
+    await interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      idempotencyKey,
+      payload: { version: 1, prompt: "Apply this plan?" },
+    }, {
+      agentId,
+    });
+
+    await expect(interactionsSvc.create({
+      id: issueId,
+      companyId,
+    }, {
+      kind: "request_confirmation",
+      idempotencyKey,
+      payload: { version: 1, prompt: "Delete the production database?" },
+    }, {
+      agentId,
+    })).rejects.toThrow("Interaction idempotency key already exists for a different request");
+  });
+
   it("accepts request_confirmation interactions without creating child issues", async () => {
     const companyId = randomUUID();
     const goalId = randomUUID();

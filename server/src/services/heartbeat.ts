@@ -16651,6 +16651,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     clearReason: IssueExecutionMonitorClearReason;
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
     nextAttemptCount: number;
+    /**
+     * PEN-5346: the destroyed monitor's own record of what it was waiting for.
+     * Only the `cancelled` body uses it, because that is the only reason whose
+     * recovery is a HANDOFF rather than a report — the source row may be gone
+     * for good, so whatever the monitor knew has to travel with the recovery.
+     */
+    clearedMonitor?: {
+      notes: string | null;
+      gateSignals: string[] | null;
+      serviceName: string | null;
+      timeoutAt: string | null;
+      clearedAt: string | null;
+    } | null;
   }) {
     const label = formatIssueIdentifierLink(input.issue.identifier, input.issue.id);
     // Keep this exhaustive over the reasons the recovery path can actually mint.
@@ -16661,7 +16674,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         ? "its timeout was reached"
         : input.clearReason === "trigger_stalled"
           ? "it fired but the woken run never re-armed or cleared it"
-          : "its maximum attempt count was reached";
+          : input.clearReason === "cancelled"
+            ? `${formatIssueIdentifierLink(input.issue.identifier, "the issue")} was cancelled while a wake was still owed`
+            : "its maximum attempt count was reached";
+
+    // PEN-5346: the `cancelled` branch is a different artifact from the others.
+    // Every other reason is a report about a row that is still there to be
+    // read; a cancel may be TERMINAL, in which case this recovery row is the
+    // only surviving carrier of the obligation and the source thread is a
+    // thread nobody will open again. So state the obligation here rather than
+    // pointing at the row that holds it, and name the work-product check
+    // explicitly — a remediation PR normally outlives the alert that prompted
+    // it, which is exactly when a sole-owning row gets cancelled.
+    if (input.clearReason === "cancelled") {
+      const monitor = input.clearedMonitor ?? null;
+      const gates = monitor?.gateSignals?.length ? monitor.gateSignals : null;
+      return [
+        `Paperclip cleared the scheduled monitor for ${label} because ${reason}.`,
+        "",
+        "The wake that monitor represented is gone. This issue is its replacement carrier:",
+        "the cancelled row may be reopened later (an alert row is recycled, not terminal)",
+        "or may never be touched again, and neither case restores the wake.",
+        "",
+        `- Source issue: ${label} (cancelled)`,
+        `- Cleared at: ${monitor?.clearedAt ?? "unknown"}`,
+        `- Attempt count: ${input.nextAttemptCount}`,
+        `- Recovery policy: ${input.recoveryPolicy} (forced for this clear reason)`,
+        ...(monitor?.serviceName ? [`- Waiting on service: ${monitor.serviceName}`] : []),
+        ...(monitor?.timeoutAt ? [`- Declared timeout: ${monitor.timeoutAt}`] : []),
+        ...(gates ? ["- Declared gate signals:", ...gates.map((gate) => `  - \`${gate}\``)] : []),
+        "",
+        ...(monitor?.notes
+          ? ["What the monitor recorded it was waiting for:", "", "> " + monitor.notes.split("\n").join("\n> "), ""]
+          : ["The monitor recorded no notes, so the gates above are the whole record.", ""]),
+        "Next action:",
+        `1. Re-check the gates above and decide whether the obligation is still live.`,
+        `2. Check whether ${label} solely owns an open work product (a PR, a deploy, a credential grant).`,
+        "   A cancelled row keeps owning it and nothing else will chase it.",
+        "3. Either carry the remaining work here, or close this issue stating the obligation is discharged.",
+      ].join("\n");
+    }
+
     return [
       `Paperclip cleared the scheduled external-service monitor for ${label} because ${reason}.`,
       "",
@@ -16702,6 +16755,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
+    /** PEN-5346: see `monitorRecoveryComment`. Only the `cancelled` body reads it. */
+    clearedMonitor?: Parameters<typeof monitorRecoveryComment>[0]["clearedMonitor"];
   }) {
     const details = monitorRecoveryDetails({
       claimed: input.claimed,
@@ -16747,6 +16802,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 clearReason: input.clearReason,
                 recoveryPolicy: input.recoveryPolicy,
                 nextAttemptCount: input.nextAttemptCount,
+                clearedMonitor: input.clearedMonitor,
               }),
               "",
               suppressionNote,
@@ -16795,12 +16851,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(input.claimed);
       if (!recoveryIssue) {
         recoveryIssue = await issuesSvc.create(input.claimed.companyId, {
-          title: `Recover external-service monitor for ${input.claimed.identifier ?? input.claimed.title}`,
+          title:
+            input.clearReason === "cancelled"
+              // PEN-5346: name the act, not the subsystem. This row is the
+              // carrier for an obligation whose source was cancelled, and it is
+              // frequently the only thing left pointing at it.
+              ? `Carry forward the wake cancelled on ${input.claimed.identifier ?? input.claimed.title}`
+              : `Recover external-service monitor for ${input.claimed.identifier ?? input.claimed.title}`,
           description: monitorRecoveryComment({
             issue: input.claimed,
             clearReason: input.clearReason,
             recoveryPolicy: input.recoveryPolicy,
             nextAttemptCount: input.nextAttemptCount,
+            clearedMonitor: input.clearedMonitor,
           }),
           status: "todo",
           priority: "high",
@@ -16924,6 +16987,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           clearReason: input.clearReason,
           recoveryPolicy: input.recoveryPolicy,
           nextAttemptCount: input.nextAttemptCount,
+          clearedMonitor: input.clearedMonitor,
         }),
       });
 
@@ -16963,6 +17027,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           clearReason: input.clearReason,
           recoveryPolicy: input.recoveryPolicy,
           nextAttemptCount: input.nextAttemptCount,
+          clearedMonitor: input.clearedMonitor,
         }),
       });
     } catch (err) {
@@ -32498,6 +32563,428 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { scanned: candidates.length, cleared, skipped, failed };
   }
 
+  /**
+   * PEN-5346 — hand back the obligation a `cancelled` monitor clear destroys.
+   *
+   * `reconcileUndeliverableIssueMonitors` above clears a monitor that a status
+   * write made undeliverable, which is correct: a cancelled row genuinely
+   * cannot fire. What it does not do is tell anyone. The clear is an activity
+   * row, and the wake it destroyed was frequently the ONLY observer the issue
+   * had between runs — so the destruction removes the very thing that would
+   * have noticed it.
+   *
+   * Measured on two live alertmanager rows over 14 days: 14 of 14
+   * `clearReason: "cancelled"` clears paired with a plugin cancel 3-28 s
+   * earlier, every one destroyed before its due time (1 h 01 m to 14 h 43 m
+   * early), and 8 of 10 at `attemptCount: 0` — so the loss consumes no attempt
+   * and raises no budget signal either. Only 10 of 34 cancels destroyed
+   * anything, and those 10 are exactly the cancels that landed on
+   * `in_progress`: the population is precisely the rows an agent was actively
+   * holding.
+   *
+   * Two branches, both keyed on the cancel because the cancel always happens:
+   *
+   *  - FLAPPING — `paperclip-plugin-alertmanager` cancels a row when its alert
+   *    resolves and reopens it when the alert re-fires, so an alert row is a
+   *    RECYCLED row. The reopen restores it to `todo` with no monitor. A manual
+   *    re-arm does not survive: one measured re-arm was destroyed again by the
+   *    next cancel 3 h 10 m later, 9 h 46 m before its due time.
+   *  - TERMINAL — an alert that resolves because the condition genuinely
+   *    cleared produces a cancel with NO reopen. There is no row to restore a
+   *    monitor onto, and the row's other obligations die with it. PEN-4835 was
+   *    cancelled while solely owning an open remediation PR. This is not a
+   *    corner case: a remediation PR normally OUTLIVES the alert that prompted
+   *    it, because the PR is usually why the alert resolved — so the terminal
+   *    branch fires on exactly the rows that did their job.
+   *
+   * ### Why the recovery policy is FORCED rather than honoured
+   *
+   * Across the 21 rows carrying this residue in PEN, `recoveryPolicy` is `null`
+   * on 12, `wake_owner` on 5, and `create_recovery_issue` on NONE. Honouring
+   * the configured policy would be a no-op on 12 and, on the other 5, a comment
+   * posted to the cancelled row itself — a thread whose whole problem is that
+   * nobody will open it again. Forcing is not a preference here; it is the only
+   * setting that emits anything at all. `create_recovery_issue` is also the
+   * only policy whose artifact is a ROW, and a row is the one carrier that
+   * survives its source being cancelled.
+   *
+   * ### Why a sweep and not an after-commit hook at the clear site
+   *
+   * The obligation must not be lost if the process dies between clearing the
+   * monitor and handing it back — that would reintroduce this exact bug one
+   * layer up. So the "handoff still owed" state is PERSISTED (a cleared monitor
+   * with `clearReason: "cancelled"` and a null `recoveryEmittedAt`) and this
+   * pass is re-drivable from it. Emit first, stamp second: a crash in between
+   * re-emits next tick, where `findOpenIssueMonitorRecoveryIssue` reuses the
+   * row and the wake idempotency key dedupes. The reverse order would mark an
+   * obligation discharged that nothing ever carried.
+   *
+   * A sweep also covers every cancel source rather than one. Two of the 17
+   * cancelled rows carrying this residue were cancelled by
+   * `stale_active_run_evaluation`, not by the plugin — independent evidence
+   * that the defect lives at the clear path and not in any one canceller.
+   *
+   * ### The second disjunct (PEN-3554)
+   *
+   * `status: "cancelled"` with a non-null `monitorNextCheckAt` is an invariant
+   * violation in its own right — a terminal row advertising a live wake. It
+   * selects 0 of 294 cancelled rows in PEN today, because the eligibility
+   * reconciler above already heals it on the next tick. It is carried here
+   * anyway so the post-condition holds in ONE pass regardless of which sweep
+   * runs first, and because a predicate with no live instances is the cheapest
+   * possible moment to pin with a regression test.
+   *
+   * Post-condition, on both shapes: a cancel leaves the monitor cleared with
+   * `monitorNextCheckAt` null, AND the obligation it carried is on a row that
+   * survives the cancel.
+   */
+  async function reconcileCancelledIssueMonitorRecoveries(opts?: {
+    companyId?: string;
+    limit?: number;
+    maxPages?: number;
+    now?: Date;
+    /** Test seam: runs between candidate selection and the recovery emit. */
+    beforeRecover?: () => Promise<void>;
+  }) {
+    // Deliberately lower than the eligibility sweep's 200. That pass only
+    // writes columns; this one CREATES ROWS and ENQUEUES WAKES, and its first
+    // run against a deployed fleet is the backfill — a population measured at
+    // >= 21 in PEN and unmeasured elsewhere. 25 per tick drains PEN in a single
+    // pass while spreading a larger fleet backlog over minutes rather than
+    // landing it as one burst of recovery issues and wakes. The pass is
+    // re-drivable from persisted state, so a smaller window costs latency and
+    // nothing else.
+    //
+    // It is an EMISSION budget, not a scan budget — see the paging loop below.
+    const limit = opts?.limit ?? 25;
+    // Bounds the walk PAST candidates that emit nothing. A row this pass cannot
+    // discharge keeps its `updatedAt`, and selection is `asc(updatedAt)`, so it
+    // sits at the head of every page forever: `limit` of them would starve
+    // every healthy row behind them with a `warn` line as the only symptom.
+    // Three classes reach that state — a source with no owner, a malformed
+    // state the SQL predicate matches but zod rejects, and a create that keeps
+    // throwing — and none of them can be excluded in SQL without also making
+    // them invisible. Walking past them costs one query per page and bounds the
+    // damage at a tick rather than forever.
+    const maxPages = opts?.maxPages ?? 8;
+    const now = opts?.now ?? new Date();
+
+    // Disjunct A: a cancelled clear whose obligation has not been handed back.
+    // Deliberately NOT restricted to `issues.status = 'cancelled'` — a flapping
+    // row is reopened to `todo` carrying the same unhanded residue, and that is
+    // the branch where a wake was owed to somebody who is still working.
+    //
+    // It IS restricted on one condition, and deliberately NOT on the other:
+    //
+    //  - `clearedAt is not null`. That timestamp keys the recovery wake's
+    //    idempotency; synthesising `now` instead would change the key on every
+    //    pass and stop the re-offer deduping in precisely the state where
+    //    nothing else does. No in-tree site writes a `cleared` state without it
+    //    (`issue-execution-policy.ts`), so this excludes nothing today and
+    //    exists so that it cannot one day include the wrong thing.
+    //
+    // A source with NO assignee is deliberately still selected, even though the
+    // handoff cannot complete for it. The carrier inherits the source's
+    // assignee, so an unassigned source would yield an ownerless `high` `todo`
+    // that no inbox returns and no wake reaches — the same strand this pass
+    // exists to remove. `issueAllowsMonitor` requires an assignee, so a row
+    // only arrives here unowned if the assignee was removed between the arm and
+    // this pass (a release, or a canceller that unassigned). Selecting it is
+    // what makes it COUNTABLE: the pass refuses to stamp it, reports it in
+    // `unowned`, and it is handed back for real the moment it has an owner.
+    // Excluding it in SQL would leave the obligation owed and invisible, which
+    // is the quieter half of the same bug.
+    const handoffOwed = sql`(
+      ${issues.executionState}->'monitor'->>'status' = 'cleared'
+      and ${issues.executionState}->'monitor'->>'clearReason' = 'cancelled'
+      and ${issues.executionState}->'monitor'->>'recoveryEmittedAt' is null
+      and ${issues.executionState}->'monitor'->>'clearedAt' is not null
+    )`;
+    // Disjunct B (PEN-3554): a cancelled row still advertising a live wake.
+    // Not narrowed at all — nulling that column is an invariant repair owed
+    // whether or not anybody can carry the obligation afterwards.
+    const liveWakeOnCancelled = sql`(
+      ${issues.status} = 'cancelled' and ${issues.monitorNextCheckAt} is not null
+    )`;
+
+    // Sources selected with an obligation still owed and nobody to hand it to.
+    // Collected rather than logged per row: see the `unowned` branch below.
+    const unownedIssueIds: string[] = [];
+
+    /**
+     * One candidate, start to finish. Extracted from the paging loop so that
+     * every exit is a NAMED OUTCOME rather than a `continue` into a shared
+     * counter — `unowned` in particular has to stay distinguishable from
+     * `skipped`, because it is the only outcome that leaves an obligation owed
+     * with nobody named to carry it.
+     */
+    async function handBackOneCandidate(candidate: IssueMonitorDispatchRow): Promise<{
+      clearedColumn: boolean;
+      outcome: "recovered" | "skipped" | "unowned";
+      clearedAt: string | null;
+    }> {
+      let row = candidate;
+      let clearedColumn = false;
+
+      // Disjunct B first: null the column before handing anything back, so a
+      // single pass leaves the monitor in exactly one well-defined state.
+      // CAS on (status, monitorNextCheckAt) for the same reason the
+      // eligibility sweep does — selection and write are separate statements,
+      // and a concurrent reopen can arm a fresh monitor in between.
+      if (row.monitorNextCheckAt && row.status === "cancelled") {
+        const clearPatch = buildIssueMonitorClearedPatch({
+          issue: row,
+          policy: normalizeIssueExecutionPolicy(row.executionPolicy ?? null),
+          clearReason: "cancelled",
+          clearedAt: now,
+        });
+        const updated = await db
+          .update(issues)
+          .set({ ...clearPatch, updatedAt: now })
+          .where(
+            and(
+              eq(issues.id, row.id),
+              eq(issues.status, "cancelled"),
+              eq(issues.monitorNextCheckAt, row.monitorNextCheckAt),
+            ),
+          )
+          .returning({ id: issues.id })
+          .then((rows) => rows[0] ?? null);
+        if (!updated) return { clearedColumn: false, outcome: "skipped", clearedAt: null };
+        clearedColumn = true;
+        await logActivity(db, {
+          companyId: row.companyId,
+          actorType: "system",
+          actorId: "heartbeat_scheduler",
+          agentId: null,
+          runId: null,
+          action: "issue.monitor_cleared_undeliverable",
+          entityType: "issue",
+          entityId: row.id,
+          details: {
+            identifier: row.identifier,
+            clearReason: "cancelled",
+            status: row.status,
+            nextCheckAt: row.monitorNextCheckAt.toISOString(),
+            attemptCount: row.monitorAttemptCount ?? 0,
+            notes: row.monitorNotes,
+            invariant: "cancelled_row_with_live_monitor",
+          },
+        });
+        row = {
+          ...row,
+          executionPolicy: clearPatch.executionPolicy as Record<string, unknown> | null,
+          executionState: clearPatch.executionState as Record<string, unknown> | null,
+          monitorNextCheckAt: null,
+          monitorWakeRequestedAt: null,
+          monitorNotes: null,
+        };
+      }
+
+      const monitorState = parseIssueExecutionState(row.executionState)?.monitor ?? null;
+      if (
+        !monitorState ||
+        monitorState.status !== "cleared" ||
+        monitorState.clearReason !== "cancelled" ||
+        monitorState.recoveryEmittedAt
+      ) {
+        return { clearedColumn, outcome: "skipped", clearedAt: null };
+      }
+
+      // The same two conditions `handoffOwed` excludes in SQL, re-asserted here
+      // because disjunct B reaches this point without them and because the row
+      // can change between selection and now. NEITHER STAMPS: an obligation
+      // nobody can carry stays visibly owed rather than being marked discharged
+      // by a carrier that no wake will ever reach.
+      if (!row.assigneeAgentId) {
+        // Reported once per pass, in aggregate, below — a `warn` per unowned
+        // row per tick is noise, and the population is the actionable number.
+        unownedIssueIds.push(row.identifier ?? row.id);
+        return { clearedColumn, outcome: "unowned", clearedAt: monitorState.clearedAt ?? null };
+      }
+      if (!monitorState.clearedAt) {
+        logger.warn(
+          { issueId: row.id, identifier: row.identifier, outcome: "skipped" },
+          "cancelled-monitor recovery has no clearedAt to key its wake idempotency on; leaving it owed",
+        );
+        return { clearedColumn, outcome: "skipped", clearedAt: null };
+      }
+
+      if (opts?.beforeRecover) await opts.beforeRecover();
+
+      // `buildIssueMonitorClearedPatch` nulls `monitorNotes` (PEN-1995) and
+      // keeps the audit copy on the state, so the column is empty by the time
+      // this pass runs. Re-hydrate from the audit copy: the notes are the
+      // whole record of what the run was waiting for, and they feed the
+      // recovery body, the activity details and the wake payload alike.
+      const claimed: IssueMonitorDispatchRow = { ...row, monitorNotes: monitorState.notes ?? null };
+      const clearedAtIso = monitorState.clearedAt;
+
+      await performIssueMonitorRecovery({
+        claimed,
+        // Keys the recovery wake's idempotency, so one clear yields one wake
+        // however many times this pass re-drives, while a later clear on a
+        // flapping row gets its own.
+        scheduledAtIso: clearedAtIso,
+        nextAttemptCount: monitorState.attemptCount ?? 0,
+        clearReason: "cancelled",
+        recoveryPolicy: "create_recovery_issue",
+        monitor: {
+          serviceName: monitorState.serviceName ?? null,
+          timeoutAt: monitorState.timeoutAt ?? null,
+          maxAttempts: monitorState.maxAttempts ?? null,
+          recoveryPolicy: monitorState.recoveryPolicy ?? null,
+        },
+        actorType: "system",
+        actorId: "heartbeat_scheduler",
+        agentId: null,
+        runId: null,
+        activitySource: "scheduled",
+        clearedMonitor: {
+          notes: monitorState.notes ?? null,
+          gateSignals: monitorState.gateSignals ?? null,
+          serviceName: monitorState.serviceName ?? null,
+          timeoutAt: monitorState.timeoutAt ?? null,
+          clearedAt: monitorState.clearedAt ?? null,
+        },
+      });
+
+      // Stamp AFTER the recovery has committed. Surgical `jsonb_set` rather
+      // than a rebuilt `executionState` so this cannot clobber a concurrent
+      // writer's state, guarded on the exact clear it discharges: if the row
+      // was re-armed or re-cleared in between, the guard fails, the stamp is
+      // skipped, and the next pass handles the new clear on its own terms.
+      const stamped = await db
+        .update(issues)
+        .set({
+          executionState: sql`jsonb_set(${issues.executionState}::jsonb, '{monitor,recoveryEmittedAt}', to_jsonb(${now.toISOString()}::text))`,
+        })
+        .where(
+          and(
+            eq(issues.id, row.id),
+            sql`${issues.executionState}->'monitor'->>'status' = 'cleared'`,
+            sql`${issues.executionState}->'monitor'->>'clearReason' = 'cancelled'`,
+            sql`${issues.executionState}->'monitor'->>'recoveryEmittedAt' is null`,
+            sql`${issues.executionState}->'monitor'->>'clearedAt' = ${clearedAtIso}`,
+          ),
+        )
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+
+      if (!stamped) {
+        // The recovery landed; only the bookkeeping lost a race. Harmless and
+        // self-correcting, but worth a line — a stamp that never lands would
+        // make this pass re-emit on every tick.
+        logger.info(
+          { issueId: row.id, identifier: row.identifier },
+          "cancelled-monitor recovery emitted but the handoff stamp lost a CAS (will re-evaluate next pass)",
+        );
+      }
+
+      return { clearedColumn, outcome: "recovered", clearedAt: clearedAtIso };
+    }
+
+    let scanned = 0;
+    let recovered = 0;
+    let cleared = 0;
+    let skipped = 0;
+    // Split out of `skipped` because the cause is different and actionable:
+    // these rows keep their residue, so the obligation is still owed and will
+    // be selected again as soon as somebody owns it. Folding it into `skipped`
+    // would hide the one outcome with nobody named.
+    let unowned = 0;
+    let failed = 0;
+    let pages = 0;
+    // Spend against `limit`: candidates that WROTE something. Counted apart
+    // from `recovered`/`cleared` because a disjunct-B row increments both and
+    // would otherwise consume two units of a budget it used once.
+    let emitted = 0;
+    // The oldest clear this pass touched. The first deployed run IS the
+    // backfill, and its blast radius is as much a question about AGE as about
+    // volume — this answers it from the pass's own log line rather than from a
+    // query nobody runs.
+    let oldestClearedAt: string | null = null;
+    let cursor: { updatedAt: Date; id: string } | null = null;
+    // Paging walks a table this pass MUTATES, and a write can move a row
+    // forward past the cursor into a later page: a disjunct-B row that is
+    // cleared but has no owner lands on `updatedAt = now` still matching
+    // disjunct A, so it would be seen, counted and reported twice. Rows are
+    // handled once per pass; anything genuinely still owed is picked up by the
+    // next one.
+    const seen = new Set<string>();
+
+    while (pages < maxPages && emitted < limit) {
+      pages += 1;
+      // Annotated rather than inferred: the keyset condition below reads
+      // `cursor`, and `cursor` is assigned from this page, which is a circular
+      // inference TypeScript refuses (TS7022).
+      const candidates: Array<IssueMonitorDispatchRow & { updatedAt: Date }> = await db
+        .select({ ...issueMonitorDispatchColumns, updatedAt: issues.updatedAt })
+        .from(issues)
+        .innerJoin(companies, eq(companies.id, issues.companyId))
+        .where(
+          and(
+            eq(companies.status, "active"),
+            opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
+            visibleIssueCondition(),
+            sql`(${handoffOwed} or ${liveWakeOnCancelled})`,
+            // Keyset, not OFFSET: this pass MUTATES the column it orders by, so
+            // an offset would skip rows as the ones ahead of it move.
+            // `toISOString()` rather than the Date: a raw `sql` template binds
+            // through postgres.js's serializer, which rejects a Date outright.
+            cursor
+              ? sql`(${issues.updatedAt}, ${issues.id}) > (${cursor.updatedAt.toISOString()}::timestamptz, ${cursor.id}::uuid)`
+              : undefined,
+          ),
+        )
+        .orderBy(asc(issues.updatedAt), asc(issues.id))
+        .limit(limit);
+
+      if (candidates.length === 0) break;
+      const lastOfPage = candidates[candidates.length - 1]!;
+      cursor = { updatedAt: lastOfPage.updatedAt, id: lastOfPage.id };
+
+      for (const candidate of candidates) {
+        if (emitted >= limit) break;
+        if (seen.has(candidate.id)) continue;
+        seen.add(candidate.id);
+        scanned += 1;
+        try {
+          const result = await handBackOneCandidate(candidate);
+          if (result.clearedColumn) cleared += 1;
+          if (result.outcome === "recovered") recovered += 1;
+          else if (result.outcome === "unowned") unowned += 1;
+          else skipped += 1;
+          if (result.clearedColumn || result.outcome === "recovered") emitted += 1;
+          if (result.clearedAt && (!oldestClearedAt || result.clearedAt < oldestClearedAt)) {
+            oldestClearedAt = result.clearedAt;
+          }
+        } catch (err) {
+          failed += 1;
+          logger.warn(
+            { err, issueId: candidate.id, outcome: "failed" },
+            "reconcileCancelledIssueMonitorRecoveries recovery failed",
+          );
+        }
+      }
+
+      // A short page is the last page.
+      if (candidates.length < limit) break;
+    }
+
+    if (unownedIssueIds.length > 0) {
+      // Not an error and not silence either: the obligation is intact and still
+      // selectable, it just has nobody named to carry it. Assigning the source
+      // is the whole remedy, which is why the identifiers are the payload.
+      logger.warn(
+        { unowned: unownedIssueIds.length, issues: unownedIssueIds.slice(0, 20) },
+        "cancelled-monitor recoveries left owed: the source has no agent to hand the obligation to (PEN-5346)",
+      );
+    }
+
+    return { scanned, recovered, cleared, skipped, unowned, failed, pages, oldestClearedAt };
+  }
+
   async function reconcileTaskWatchdogs(opts?: { companyId?: string | null; runId?: string | null }) {
     return taskWatchdogs.reconcileTaskWatchdogs({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }
@@ -46314,6 +46801,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileResolvedBlockerDependents,
     reapUnclaimableQueuedRuns,
     reconcileUndeliverableIssueMonitors,
+    reconcileCancelledIssueMonitorRecoveries,
     reconcileTaskWatchdogs,
 
     buildRunOutputSilence,

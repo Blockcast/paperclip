@@ -468,6 +468,31 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
     expect(await readDelivery()).toMatchObject({ status: "queued" });
   });
 
+  it("expires a captured delivery too old to replay, but requeues a recent one", async () => {
+    await enqueue();
+    const capturedAt = new Date(Date.now() - 11 * 60_000);
+    await db
+      .update(githubReviewGateDeliveries)
+      .set({ status: "capturing", createdAt: capturedAt, updatedAt: capturedAt })
+      .where(eq(githubReviewGateDeliveries.deliveryId, "delivery-1"));
+
+    // Nothing requeued: the only stale row was too old to replay.
+    await expect(resetStaleGithubReviewGateDeliveries(db)).resolves.toBe(0);
+    expect(await readDelivery()).toMatchObject({
+      status: "expired",
+      lastError: "review_gate_capture_expired",
+    });
+    await expect(pollGithubReviewGateDeliveriesOnce(db)).resolves.toBe(0);
+
+    const recentAt = new Date(Date.now() - 2 * 60_000);
+    await db
+      .update(githubReviewGateDeliveries)
+      .set({ status: "capturing", createdAt: recentAt, updatedAt: recentAt, lastError: null })
+      .where(eq(githubReviewGateDeliveries.deliveryId, "delivery-1"));
+    await expect(resetStaleGithubReviewGateDeliveries(db)).resolves.toBe(1);
+    expect(await readDelivery()).toMatchObject({ status: "queued" });
+  });
+
   it("fences an old claimant after stale reset and a successful reclaim", async () => {
     await enqueue();
     let releaseFirstPull!: () => void;

@@ -792,6 +792,7 @@ describe("approvalService listSummary", () => {
       idempotencyKey: "rotate-creds",
       createdAt: new Date("2026-08-02T00:00:00.000Z"),
       decidedAt: null,
+      decidedByUserId: null,
       title: "aaa.bbb.ccc",
       summary: "Rotate credentials",
       description: "fallback",
@@ -817,6 +818,7 @@ describe("approvalService listSummary", () => {
         idempotencyKey: "rotate-creds",
         createdAt: new Date("2026-08-02T00:00:00.000Z"),
         decidedAt: null,
+        decidedByUserId: null,
         label: "Rotate credentials",
       },
     ]);
@@ -1006,5 +1008,76 @@ describeEmbeddedPostgres("approvalService refuses to strand an open budget incid
 
     expect(result.applied).toBe(true);
     expect(await readStatus(approvalId)).toBe("rejected");
+  });
+});
+
+describeEmbeddedPostgres("listSummary reports who decided a card (PEN-5432)", () => {
+  // The projection regression this pins is not cosmetic. `listSummary` used to select an
+  // explicit column set that reported `decidedAt` — THAT a decision happened, and when —
+  // while silently dropping `decidedByUserId`. Every caller that read the decider off a
+  // summary row therefore got `undefined`, which `jq` and JS property access both render
+  // indistinguishably from a populated `null`, i.e. "no human decided this". The real
+  // answer was frequently the exact opposite, and the misread licensed resubmitting a card
+  // a human had deliberately returned. A stub-shaped test cannot catch a dropped column, so
+  // this one round-trips a real row.
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-approval-summary-decider-");
+    db = createDb(tempDb.connectionString);
+  }, 120_000);
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("carries decidedByUserId on every row, populated on the decided ones", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Summary decider company",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+    });
+
+    const decidedId = randomUUID();
+    const pendingId = randomUUID();
+    await db.insert(approvals).values([
+      {
+        id: decidedId,
+        companyId,
+        type: "request_board_approval",
+        status: "approved",
+        payload: { title: "Decided by a human" },
+        decidedAt: new Date("2026-11-03T00:00:00.000Z"),
+        decidedByUserId: "human-board-user",
+      },
+      {
+        id: pendingId,
+        companyId,
+        type: "request_board_approval",
+        status: "pending",
+        payload: { title: "Nobody has decided this yet" },
+      },
+    ]);
+
+    const rows = await approvalService(db).listSummary(companyId, {});
+    const decided = rows.find((row) => row.id === decidedId);
+    const pending = rows.find((row) => row.id === pendingId);
+
+    // The decided row must name its human decider. Dropping the column from the
+    // projection is what turned this into `undefined` for every caller.
+    expect(decided?.decidedByUserId).toBe("human-board-user");
+
+    // The key must be PRESENT on the undecided row too, carrying a real `null`. That is
+    // what makes `null` mean "no human user decided this" rather than "this surface does
+    // not report deciders" — a caller gating on `has(key)` gets a true answer on every row
+    // instead of a hole it has to guess about.
+    expect(pending).toHaveProperty("decidedByUserId");
+    expect(pending?.decidedByUserId).toBeNull();
+
+    // `summary` stays cheap: the payload body is still withheld, so restoring the decider
+    // is not a licence to widen the projection back into the expensive column.
+    expect(decided).not.toHaveProperty("payload");
   });
 });
