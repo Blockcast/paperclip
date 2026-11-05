@@ -36,10 +36,12 @@
  * - a type fetch that dies during startup no longer leaves an unhandled
  *   rejection.
  *
- * Every test here fails on the pre-patch driver, with one exception: the
- * failed-connect reserve() test guards a failure mode that the hand-off fix
- * would otherwise introduce. Each part of the patch is pinned by a test that
- * fails without that part.
+ * Every test here fails on the pre-patch driver except two, which upstream
+ * already passes. They guard failure modes the reserve() hand-off could
+ * otherwise introduce:
+ * - the failed-connect waiter test;
+ * - the outage test.
+ * Each part of the patch is pinned by a test that fails without that part.
  *
  * Most tests kill a backend on a pool of ONE connection, so the next caller is
  * guaranteed to reuse the dead scope's `Connection` object.
