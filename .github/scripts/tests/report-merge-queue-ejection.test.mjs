@@ -10,6 +10,7 @@ import {
   manualDequeueExplainingRun,
   reportMergeQueueFailure,
 } from "../report-merge-queue-ejection.mjs";
+import { timelineActorLogin } from "../../../scripts/merge-queue-eviction-detector.mjs";
 
 test("extracts PR numbers from merge-group synthetic refs", () => {
   assert.equal(mergeQueuePullRequestNumber("gh-readonly-queue/master/pr-1306-abc123"), 1306);
@@ -280,10 +281,30 @@ test("jobs cancelled at the same instant are all reported, not all dropped", () 
 // shape the whole guard exists for, and every case below is a perturbation of
 // exactly one field of it.
 // ---------------------------------------------------------------------------
+// `actor` is an OBJECT, because that is what the REST endpoint returns. An
+// earlier revision of this fixture was labelled verbatim while carrying a
+// FLATTENED `actor: "kkroo"`, which no caller of this script ever produces --
+// the reporter passes the REST response through untouched. That one field is
+// why every test below passed while the guard could not fire in production
+// (Ally review, PR #3399): re-verified live on #3371, where all four
+// merge-queue events carry `actor` of type object.
 const PR_3371_TIMELINE = [
-  { event: "added_to_merge_queue", created_at: "2026-11-04T13:11:37Z", actor: "kkroo" },
-  { event: "removed_from_merge_queue", created_at: "2026-11-04T13:13:57Z", actor: "kkroo" },
+  {
+    event: "added_to_merge_queue",
+    created_at: "2026-11-04T13:11:37Z",
+    actor: { login: "kkroo", id: 1234567, type: "User" },
+  },
+  {
+    event: "removed_from_merge_queue",
+    created_at: "2026-11-04T13:13:57Z",
+    actor: { login: "kkroo", id: 1234567, type: "User" },
+  },
 ];
+// The same two events as `scripts/merge-queue-eviction-detector.mjs` hands
+// them over: its `ghTimeline` flattens with `--jq '{..., actor: .actor.login}'`
+// before calling the shared window selector. Both shapes reach the same
+// predicate, so both are pinned here -- that interchangeability IS the fix.
+const PR_3371_TIMELINE_FLATTENED = PR_3371_TIMELINE.map((e) => ({ ...e, actor: e.actor.login }));
 // Run 41835906627 ended `cancelled` 57s AFTER the dequeue -- the dequeue is the
 // cause of the teardown, not a consequence of it.
 const PR_3371_RUN_ENDED = "2026-11-04T13:14:54Z";
@@ -301,12 +322,23 @@ test("PEN-5592: a queue-initiated removal is NOT a manual dequeue", () => {
   // population whose notice ("rerun the checks, then re-enqueue") is correct.
   const queueRemoved = [
     PR_3371_TIMELINE[0],
-    { ...PR_3371_TIMELINE[1], actor: "github-merge-queue[bot]" },
+    { ...PR_3371_TIMELINE[1], actor: { login: "github-merge-queue[bot]", type: "Bot" } },
   ];
   assert.equal(manualDequeueExplainingRun(queueRemoved, { runUpdatedAt: PR_3371_RUN_ENDED }), null);
   // Case-insensitively, via the sibling's own predicate.
-  const shouty = [PR_3371_TIMELINE[0], { ...PR_3371_TIMELINE[1], actor: "GitHub-Merge-Queue[BOT]" }];
+  const shouty = [
+    PR_3371_TIMELINE[0],
+    { ...PR_3371_TIMELINE[1], actor: { login: "GitHub-Merge-Queue[BOT]", type: "Bot" } },
+  ];
   assert.equal(manualDequeueExplainingRun(shouty, { runUpdatedAt: PR_3371_RUN_ENDED }), null);
+  // And identically on the flattened shape the sibling detector passes in.
+  assert.equal(
+    manualDequeueExplainingRun(
+      [PR_3371_TIMELINE_FLATTENED[0], { ...PR_3371_TIMELINE_FLATTENED[1], actor: "github-merge-queue[bot]" }],
+      { runUpdatedAt: PR_3371_RUN_ENDED },
+    ),
+    null,
+  );
 });
 
 test("PEN-5592: the guard fails TOWARD reporting on every missing input", () => {
@@ -314,10 +346,19 @@ test("PEN-5592: the guard fails TOWARD reporting on every missing input", () => 
   // that stops carrying `actor` must never make a genuine ejection quieter.
   const noActor = [PR_3371_TIMELINE[0], { ...PR_3371_TIMELINE[1], actor: null }];
   assert.equal(manualDequeueExplainingRun(noActor, { runUpdatedAt: PR_3371_RUN_ENDED }), null);
-  assert.equal(
-    manualDequeueExplainingRun([PR_3371_TIMELINE[0], { ...PR_3371_TIMELINE[1], actor: "   " }], { runUpdatedAt: PR_3371_RUN_ENDED }),
-    null,
-  );
+  // Every unattributable shape, flattened and raw. `{}` and `{login: null}` are
+  // the ones the object unwrap introduced: a ghost actor must read as "no
+  // attribution", never as a named remover, or the unwrap would start
+  // SUPPRESSING genuine ejections instead of reporting them.
+  for (const actor of [null, undefined, "   ", "", {}, { login: null }, { login: "   " }, { login: 42 }]) {
+    assert.equal(
+      manualDequeueExplainingRun([PR_3371_TIMELINE[0], { ...PR_3371_TIMELINE[1], actor }], {
+        runUpdatedAt: PR_3371_RUN_ENDED,
+      }),
+      null,
+      `actor ${JSON.stringify(actor)} must fail toward reporting`,
+    );
+  }
   // Enqueued, never removed: the run died on its own.
   assert.equal(manualDequeueExplainingRun([PR_3371_TIMELINE[0]], { runUpdatedAt: PR_3371_RUN_ENDED }), null);
   // No timeline at all / unreadable run end.
@@ -334,14 +375,14 @@ test("PEN-5592: a dequeue well AFTER the run already died is not its cause", () 
   // earlier teardown and the real timeout would go unreported.
   const lateHold = [
     PR_3371_TIMELINE[0],
-    { event: "removed_from_merge_queue", created_at: "2026-11-04T14:00:00Z", actor: "kkroo" },
+    { event: "removed_from_merge_queue", created_at: "2026-11-04T14:00:00Z", actor: { login: "kkroo", type: "User" } },
   ];
   assert.equal(manualDequeueExplainingRun(lateHold, { runUpdatedAt: PR_3371_RUN_ENDED }), null);
   // Inside the record-ordering tolerance, it still counts: the run conclusion
   // and the timeline event are written by different subsystems.
   const justAfter = [
     PR_3371_TIMELINE[0],
-    { event: "removed_from_merge_queue", created_at: "2026-11-04T13:15:30Z", actor: "kkroo" },
+    { event: "removed_from_merge_queue", created_at: "2026-11-04T13:15:30Z", actor: { login: "kkroo", type: "User" } },
   ];
   assert.equal(manualDequeueExplainingRun(justAfter, { runUpdatedAt: PR_3371_RUN_ENDED })?.dequeuedBy, "kkroo");
 });
@@ -353,8 +394,8 @@ test("PEN-5592: a LATER attempt's dequeue cannot be read as this run's cause", (
   // most recent attempt and attributes an evening hold to a lunchtime run.
   const full = [
     ...PR_3371_TIMELINE,
-    { event: "added_to_merge_queue", created_at: "2026-11-04T20:59:58Z", actor: "allyblockcast[bot]" },
-    { event: "removed_from_merge_queue", created_at: "2026-11-04T21:31:38Z", actor: "kkroo" },
+    { event: "added_to_merge_queue", created_at: "2026-11-04T20:59:58Z", actor: { login: "allyblockcast[bot]", type: "Bot" } },
+    { event: "removed_from_merge_queue", created_at: "2026-11-04T21:31:38Z", actor: { login: "kkroo", type: "User" } },
   ];
   assert.equal(
     manualDequeueExplainingRun(full, { runUpdatedAt: PR_3371_RUN_ENDED }).dequeuedAt,
@@ -362,12 +403,26 @@ test("PEN-5592: a LATER attempt's dequeue cannot be read as this run's cause", (
   );
 });
 
-/** Drives reportMergeQueueFailure with a scripted transport, recording every POST. */
+/**
+ * Drives reportMergeQueueFailure with a scripted transport, recording every POST.
+ *
+ * The timeline arm PAGES, the way the real endpoint does: it honours `page` and
+ * `per_page` and slices `timeline` accordingly. A fake that returned the whole
+ * array for any `/timeline` path would make the pagination below untestable --
+ * and an unpaginated read is what sent a held, long-lived PR back to the
+ * "re-enqueue" notice (Ally review, PR #3399).
+ */
 function fakeGitHub({ timeline, jobs, merged = false, isInMergeQueue = false }) {
   const posts = [];
+  const timelinePaths = [];
   const request = async (path, options = {}) => {
     if (path === "/graphql") return { data: { repository: { pullRequest: { merged, isInMergeQueue } } } };
-    if (path.includes("/timeline")) return timeline;
+    if (path.includes("/timeline")) {
+      timelinePaths.push(path);
+      const perPage = Number(new URLSearchParams(path.split("?")[1] ?? "").get("per_page") ?? 100);
+      const page = Number(new URLSearchParams(path.split("?")[1] ?? "").get("page") ?? 1);
+      return timeline.slice((page - 1) * perPage, page * perPage);
+    }
     if (path.includes("/jobs")) return { jobs };
     if (path.includes("/comments") && options.method === "POST") {
       posts.push(JSON.parse(options.body).body);
@@ -376,7 +431,7 @@ function fakeGitHub({ timeline, jobs, merged = false, isInMergeQueue = false }) 
     if (path.includes("/comments")) return [];
     throw new Error(`unexpected request: ${path}`);
   };
-  return { request, posts };
+  return { request, posts, timelinePaths };
 }
 
 const EJECTED_3371 = {
@@ -421,7 +476,7 @@ test("PEN-5592: positive control -- a queue-initiated cancel still gets its noti
   // forbids is genuinely reachable on this path.
   const queueRemoved = [
     PR_3371_TIMELINE[0],
-    { ...PR_3371_TIMELINE[1], actor: "github-merge-queue[bot]" },
+    { ...PR_3371_TIMELINE[1], actor: { login: "github-merge-queue[bot]", type: "Bot" } },
   ];
   const { request, posts } = fakeGitHub({ timeline: queueRemoved, jobs: KILLED_MID_FLIGHT });
   return reportMergeQueueFailure({ ...EJECTED_3371, request }).then((result) => {
@@ -466,4 +521,67 @@ test("PEN-5592: the timeline is not consulted for a `failure` run", () => {
     assert.match(posts[0], /The merge-group run failed and GitHub may have removed/);
     assert.match(posts[0], /Failing job: `policy`\./);
   });
+});
+
+test("PEN-5592: the timeline is paginated, so a removal past page 1 still suppresses", async () => {
+  // Ally review (PR #3399). The timeline is OLDEST-first and
+  // `removed_from_merge_queue` lands late, so on a long-lived PR the removal
+  // sits on page 2+. With a single unpaginated read the reporter saw no
+  // removal, fell through, and told the reader to re-enqueue -- failing
+  // precisely on the repeatedly-held PRs a hold exists to protect.
+  const filler = Array.from({ length: 120 }, (_, i) => ({
+    event: "commented",
+    created_at: `2026-11-04T12:${String(i % 60).padStart(2, "0")}:00Z`,
+    actor: { login: "someone", type: "User" },
+  }));
+  const { request, posts, timelinePaths } = fakeGitHub({
+    timeline: [...filler, ...PR_3371_TIMELINE],
+    jobs: KILLED_MID_FLIGHT,
+  });
+  const result = await reportMergeQueueFailure({ ...EJECTED_3371, request });
+  assert.deepEqual(result, { reported: false, reason: "manual-dequeue", number: 3371, dequeuedBy: "kkroo" });
+  assert.deepEqual(posts, []);
+  // It genuinely walked: page 1 was full, so page 2 had to be fetched.
+  assert.equal(timelinePaths.length, 2);
+  assert.match(timelinePaths[0], /per_page=100&page=1$/);
+  assert.match(timelinePaths[1], /per_page=100&page=2$/);
+});
+
+test("PEN-5592: a short first page ends the walk without a second request", () => {
+  // The common case, and the cost control: 39 events on #3371. A walk that
+  // always probed the next page would double this script's timeline reads on
+  // every cancelled run for nothing.
+  const { request, timelinePaths } = fakeGitHub({ timeline: PR_3371_TIMELINE, jobs: KILLED_MID_FLIGHT });
+  return reportMergeQueueFailure({ ...EJECTED_3371, request }).then(() => {
+    assert.deepEqual(timelinePaths.length, 1);
+  });
+});
+
+test("PEN-5592: both actor shapes reach the same verdict", () => {
+  // The interchangeability the shared normalizer buys. The reporter passes the
+  // raw REST response through; the sibling detector flattens with `--jq` first.
+  // If these two ever diverge again, the detectors can contradict each other on
+  // one event -- the whole defect this row was filed for.
+  assert.deepEqual(
+    manualDequeueExplainingRun(PR_3371_TIMELINE, { runUpdatedAt: PR_3371_RUN_ENDED }),
+    manualDequeueExplainingRun(PR_3371_TIMELINE_FLATTENED, { runUpdatedAt: PR_3371_RUN_ENDED }),
+  );
+  assert.deepEqual(
+    manualDequeueExplainingRun(PR_3371_TIMELINE_FLATTENED, { runUpdatedAt: PR_3371_RUN_ENDED }),
+    { dequeuedAt: "2026-11-04T13:13:57.000Z", dequeuedBy: "kkroo" },
+  );
+});
+
+test("PEN-5592: timelineActorLogin normalizes both shapes and nothing else", () => {
+  // Unit-level pin on the shared helper itself, so a regression names the
+  // helper rather than surfacing three layers up as a mysterious missing
+  // suppression.
+  assert.equal(timelineActorLogin({ login: "kkroo", type: "User" }), "kkroo");
+  assert.equal(timelineActorLogin("kkroo"), "kkroo");
+  // Idempotent: normalizing an already-normalized value is a no-op, which is
+  // what lets both call sites pass through one chokepoint.
+  assert.equal(timelineActorLogin(timelineActorLogin({ login: "kkroo" })), "kkroo");
+  for (const bad of [null, undefined, "", "   ", {}, { login: null }, { login: "" }, { login: 42 }, 42]) {
+    assert.equal(timelineActorLogin(bad), null, `${JSON.stringify(bad)} must not attribute`);
+  }
 });
