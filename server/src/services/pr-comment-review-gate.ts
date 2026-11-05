@@ -15,7 +15,9 @@ import { loadConfig } from "../config.js";
 import type { Db } from "@paperclipai/db";
 import {
   enqueueCoalescedGateReevaluation,
+  GithubStatusKeyLost,
   withGithubStatusDeliveryLock,
+  type GithubStatusFence,
 } from "./github-status-delivery-outbox.js";
 import {
   countAllyDeferredPriorFindings,
@@ -2153,7 +2155,10 @@ async function executeCommentReviewGateCheck(
     return authorLaneValue;
   };
 
-  const publish = async (): Promise<PrCommentReviewGateCheckResult> => {
+  // `fence` must run before every GitHub write: it throws once this evaluation
+  // no longer owns the head, and the lock helper turns that into a coalesced
+  // re-evaluation rather than a write without exclusivity.
+  const publish = async (fence: GithubStatusFence): Promise<PrCommentReviewGateCheckResult> => {
     const comments = await loadComments(input.prNumber);
     if (comments == null) return { posted: false, reason: "fetch_failed" };
 
@@ -2427,20 +2432,22 @@ async function executeCommentReviewGateCheck(
     // overwhelmingly common case.
     const publishInput = targetUrl === (input.prUrl ?? null) ? input : { ...input, prUrl: targetUrl };
     const posted = await withBoundedRetry<GitHubCommitStatusPostResult>(
-      () =>
-        githubPostCommitStatusDetailed({
+      async () => {
+        await fence();
+        return githubPostCommitStatusDetailed({
           repoFullName: input.repoFullName,
           sha: headSha,
           context,
           state: verdict.state,
           description: verdict.reason,
           targetUrl,
-        }),
+        });
+      },
       (result) => !result.ok && result.retryable,
     );
     if (!posted.ok) return { posted: false, reason: "post_failed", postFailure: posted.reason };
 
-    await publishCheckRunMirror(publishInput, headSha, context, verdict);
+    await publishCheckRunMirror(publishInput, headSha, context, verdict, fence);
 
     // The retirement write is merge-facing and the signal is not, so retirement
     // goes first and the signal is written LAST, after every write that decides
@@ -2459,15 +2466,16 @@ async function executeCommentReviewGateCheck(
     // its verdict arm wakes only on a `success` conclusion (ally-gated CI design
     // 3.4) and a `neutral` mirror, the self-attested population's, is not one.
     //
-    // `finally`, so the signal is unconditional: a retirement that throws
-    // rejects the publish, and the signal has still been written. It cannot
-    // throw itself (it contains its own failures), so it never masks the
-    // retirement's. Pinned by test.
+    // `finally`, so the signal is written even when a retirement throws: that
+    // rejects the publish, and the signal has still been written. It contains
+    // its own failures, so it never masks the retirement's. Pinned by test.
+    // The one exception is a lost status key, which skips it: the coalesced
+    // re-evaluation that loss queues republishes it.
     let retirementFailures: Awaited<ReturnType<typeof supersedeRetiredContexts>>;
     try {
-      retirementFailures = await supersedeRetiredContexts(publishInput, headSha, context, config, verdict);
+      retirementFailures = await supersedeRetiredContexts(publishInput, headSha, context, config, verdict, fence);
     } finally {
-      await publishAllyHeadAttestedCheckRun(publishInput, headSha, context, verdict);
+      await publishAllyHeadAttestedCheckRun(publishInput, headSha, context, verdict, fence);
     }
     if (retirementFailures.length > 0) {
       // NOT "post_failed": the live status published successfully at line 643
@@ -2537,12 +2545,14 @@ async function publishCheckRunMirror(
   headSha: string,
   context: string,
   verdict: CommentReviewGateVerdict,
+  fence: GithubStatusFence,
 ): Promise<void> {
   let reason: string;
   try {
     const result = await withBoundedRetry<GitHubCommitStatusPostResult>(
-      () =>
-        githubPostCheckRun({
+      async () => {
+        await fence();
+        return githubPostCheckRun({
           repoFullName: input.repoFullName,
           sha: headSha,
           name: context,
@@ -2550,12 +2560,16 @@ async function publishCheckRunMirror(
           title: commentReviewGateCheckTitle(verdict),
           summary: verdict.reason,
           detailsUrl: input.prUrl ?? null,
-        }),
+        });
+      },
       (attempt) => !attempt.ok && attempt.retryable,
     );
     if (result.ok) return;
     reason = result.reason;
   } catch (error) {
+    // Not a write failure: the evaluation lost the head, and the caller
+    // re-queues it. Swallowing it here would let the publish write on.
+    if (error instanceof GithubStatusKeyLost) throw error;
     // "Best-effort" has to mean it too. `githubPostCheckRun` returns a
     // classified result rather than throwing, but it can still throw for
     // reasons outside its own error handling — an unmocked export under test,
@@ -2619,9 +2633,11 @@ async function publishAllyHeadAttestedCheckRun(
   headSha: string,
   gateContext: string,
   verdict: CommentReviewGateVerdict,
+  fence: GithubStatusFence,
 ): Promise<void> {
   let reason: string;
   try {
+    await fence();
     const conclusion = allyHeadAttestedCheckConclusion(verdict);
     const result = await githubPostCheckRun({
       repoFullName: input.repoFullName,
@@ -2635,6 +2651,7 @@ async function publishAllyHeadAttestedCheckRun(
     if (result.ok) return;
     reason = result.reason;
   } catch (error) {
+    if (error instanceof GithubStatusKeyLost) throw error;
     // Same reasoning as the mirror's catch: a classified failure comes back as a
     // result, but an unmocked export or a module that failed to load throws, and
     // letting that escape would reject the publish and lose the commit status
@@ -2687,6 +2704,7 @@ async function supersedeRetiredContexts(
   liveContext: string,
   config: ReturnType<typeof loadConfig>,
   verdict: CommentReviewGateVerdict,
+  fence: GithubStatusFence,
 ): Promise<Array<{ context: string; reason: string; state: CommentReviewGateVerdict["state"]; description: string }>> {
   const retiredContexts = retiredCommentReviewGateContexts(
     config.prCommentReviewGateRetiredStatusContexts,
@@ -2695,19 +2713,23 @@ async function supersedeRetiredContexts(
   if (retiredContexts.length === 0) return [];
 
   const retirement = commentReviewGateRetirementStatus(liveContext, verdict);
-  const failures = await Promise.all(
+  // allSettled, not all: the publish must not settle while a sibling POST is
+  // still in flight, or the caller would free the status key under it.
+  const settled = await Promise.allSettled(
     retiredContexts.map(async (retiredContext) => {
       const post = () =>
         withBoundedRetry<GitHubCommitStatusPostResult>(
-          () =>
-            githubPostCommitStatusDetailed({
+          async () => {
+            await fence();
+            return githubPostCommitStatusDetailed({
               repoFullName: input.repoFullName,
               sha: headSha,
               context: retiredContext,
               state: retirement.state,
               description: retirement.description,
               targetUrl: input.prUrl ?? null,
-            }),
+            });
+          },
           (attempt) => !attempt.ok && attempt.retryable,
         );
       const result = await post();
@@ -2726,5 +2748,11 @@ async function supersedeRetiredContexts(
       return null;
     }),
   );
-  return failures.filter((failure): failure is NonNullable<typeof failure> => failure !== null);
+  const rejected = settled.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (rejected.length > 0) {
+    // A lost key outranks any other throw: it must reach the caller as a lost
+    // key, never as a retirement failure queued for a forced replay.
+    throw (rejected.find((result) => result.reason instanceof GithubStatusKeyLost) ?? rejected[0]!).reason;
+  }
+  return settled.flatMap((result) => (result.status === "fulfilled" && result.value ? [result.value] : []));
 }

@@ -26,6 +26,9 @@ const mockPostCheckRun = vi.hoisted(() => vi.fn());
 const mockListOpenPrsAtHead = vi.hoisted(() => vi.fn());
 const mockStatusDeliveryLock = vi.hoisted(() => vi.fn());
 const mockEnqueueStatusDelivery = vi.hoisted(() => vi.fn());
+// The real class lives in the mocked module, so the gate's `instanceof` and
+// these tests must share one definition.
+const MockGithubStatusKeyLost = vi.hoisted(() => class GithubStatusKeyLost extends Error {});
 
 // Only the network calls are mocked. The identity predicates are imported for
 // real via `importOriginal`: they are pure, and the hand-rolled copy this mock
@@ -45,6 +48,7 @@ vi.mock("../services/github-app-auth.js", async (importOriginal) => ({
 
 vi.mock("../services/github-status-delivery-outbox.js", () => ({
   enqueueCoalescedGateReevaluation: mockEnqueueStatusDelivery,
+  GithubStatusKeyLost: MockGithubStatusKeyLost,
   withGithubStatusDeliveryLock: mockStatusDeliveryLock,
 }));
 
@@ -103,7 +107,7 @@ beforeEach(() => {
   mockPostCheckRun.mockReset();
   mockListOpenPrsAtHead.mockReset();
   mockStatusDeliveryLock.mockReset();
-  mockStatusDeliveryLock.mockImplementation(async (_db, _key, operation) => operation());
+  mockStatusDeliveryLock.mockImplementation(async (_db, _key, operation) => operation(async () => {}, {}));
   mockEnqueueStatusDelivery.mockReset();
   // Default both surfaces to empty; each test overrides the one it exercises.
   mockListComments.mockResolvedValue([]);
@@ -191,7 +195,7 @@ describe("runPrCommentReviewGateCheck", () => {
     const events: string[] = [];
     mockStatusDeliveryLock.mockImplementation(async (_db, _key, operation) => {
       events.push("lock");
-      return operation();
+      return operation(async () => {}, {});
     });
     mockListComments.mockImplementation(async () => {
       events.push("fetch-comments");
@@ -1897,5 +1901,147 @@ describe("author-lane fetch (BLO-43550)", () => {
     });
     expect(mockFetchCommitAuthorEmail).toHaveBeenCalled();
     expect(mockPostStatus.mock.calls[0][0]).toMatchObject({ state: "failure" });
+  });
+});
+
+describe("status key fence (BLO-52499)", () => {
+  // Mirrors the lock helper's contract: a fence that throws GithubStatusKeyLost
+  // makes the helper return null, which the gate turns into a coalesced
+  // re-evaluation. `fails(n)` decides whether the nth fence call throws.
+  function lockWithFence(fails: (call: number) => boolean) {
+    let calls = 0;
+    mockStatusDeliveryLock.mockImplementation(async (_db, _key, operation) => {
+      const fence = async () => {
+        calls += 1;
+        if (fails(calls)) throw new MockGithubStatusKeyLost("lease_not_held");
+      };
+      try {
+        return await operation(fence, {});
+      } catch (error) {
+        if (error instanceof MockGithubStatusKeyLost) return null;
+        throw error;
+      }
+    });
+  }
+
+  // A fresh repo per case, so a swallowed loss would show up as a warn-once
+  // that an earlier case could not already have spent.
+  let repoSeq = 0;
+  function target() {
+    repoSeq += 1;
+    return { ...TARGET, repoFullName: `Blockcast/fence-${repoSeq}` };
+  }
+
+  function checkRunNames(): string[] {
+    return mockPostCheckRun.mock.calls.map(([arg]) => arg.name);
+  }
+
+  function statusContexts(): string[] {
+    return mockPostStatus.mock.calls.map(([arg]) => arg.context);
+  }
+
+  let warn: ReturnType<typeof vi.spyOn>;
+  beforeEach(() => {
+    mockListComments.mockResolvedValue([blockingCommentFor(TARGET.headSha)]);
+    mockPostStatus.mockResolvedValue({ ok: true, statusCode: 201 });
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    warn.mockRestore();
+    h.cfg.prCommentReviewGateRetiredStatusContexts = [];
+  });
+
+  it("writes nothing when the key is lost before the live status", async () => {
+    lockWithFence(() => true);
+    const input = target();
+
+    await expect(runPrCommentReviewGateCheck(input)).resolves.toEqual({ posted: false, reason: "coalesced" });
+
+    expect(mockPostStatus).not.toHaveBeenCalled();
+    expect(mockPostCheckRun).not.toHaveBeenCalled();
+    expect(mockEnqueueStatusDelivery).toHaveBeenCalledWith(input.db, expect.objectContaining({
+      repoFullName: input.repoFullName,
+      sha: input.headSha,
+    }));
+  });
+
+  it("fences every retry of the live status, not just the first attempt", async () => {
+    lockWithFence((call) => call === 2);
+    mockPostStatus.mockResolvedValueOnce({ ok: false, retryable: true, reason: "commit_status_write_http_500" });
+
+    await expect(runPrCommentReviewGateCheck(target())).resolves.toEqual({ posted: false, reason: "coalesced" });
+
+    expect(statusContexts()).toEqual(["review/ally-comment-gate"]);
+    expect(mockPostCheckRun).not.toHaveBeenCalled();
+  });
+
+  it("stops at the mirror without spending its warning when the key is lost there", async () => {
+    lockWithFence((call) => call >= 2);
+
+    await expect(runPrCommentReviewGateCheck(target())).resolves.toEqual({ posted: false, reason: "coalesced" });
+
+    expect(statusContexts()).toEqual(["review/ally-comment-gate"]);
+    expect(mockPostCheckRun).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("never turns a key lost during retirement into a retirement failure", async () => {
+    h.cfg.prCommentReviewGateRetiredStatusContexts = ["review/ally-comment"];
+    lockWithFence((call) => call >= 3);
+
+    const result = await runPrCommentReviewGateCheck(target());
+
+    expect(result).toEqual({ posted: false, reason: "coalesced" });
+    expect(statusContexts()).toEqual(["review/ally-comment-gate"]);
+    expect(checkRunNames()).toEqual(["review/ally-comment-gate"]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("skips the schedule signal when the key is lost just before it", async () => {
+    lockWithFence((call) => call >= 3);
+
+    await expect(runPrCommentReviewGateCheck(target())).resolves.toEqual({ posted: false, reason: "coalesced" });
+
+    expect(checkRunNames()).toEqual(["review/ally-comment-gate"]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it("reports a lost key ahead of another retirement's throw", async () => {
+    h.cfg.prCommentReviewGateRetiredStatusContexts = ["review/ally-comment", "review/ally-legacy"];
+    // Fence calls: 1 live status, 2 mirror, 3 and 4 the two retirements; only
+    // the second retirement's fence is lost, and the first retirement throws.
+    lockWithFence((call) => call === 4);
+    mockPostStatus.mockImplementation(async (arg: { context: string }) => {
+      if (arg.context === "review/ally-comment") throw new Error("socket hang up");
+      return { ok: true, statusCode: 201 };
+    });
+
+    await expect(runPrCommentReviewGateCheck(target())).resolves.toEqual({ posted: false, reason: "coalesced" });
+  });
+
+  it("does not settle while a sibling retirement POST is still in flight", async () => {
+    h.cfg.prCommentReviewGateRetiredStatusContexts = ["review/ally-comment", "review/ally-legacy"];
+    // Fence calls: 1 live status, 2 mirror, 3 and 4 the two retirements.
+    lockWithFence((call) => call === 3);
+    let releaseSibling!: () => void;
+    const siblingReleased = new Promise<void>((resolve) => { releaseSibling = resolve; });
+    let siblingPosting!: () => void;
+    const siblingStarted = new Promise<void>((resolve) => { siblingPosting = resolve; });
+    mockPostStatus.mockImplementation(async (arg: { context: string }) => {
+      if (arg.context === "review/ally-legacy") {
+        siblingPosting();
+        await siblingReleased;
+      }
+      return { ok: true, statusCode: 201 };
+    });
+
+    let settled = false;
+    const result = runPrCommentReviewGateCheck(target()).finally(() => { settled = true; });
+    await siblingStarted;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(settled).toBe(false);
+
+    releaseSibling();
+    await expect(result).resolves.toEqual({ posted: false, reason: "coalesced" });
   });
 });

@@ -100,6 +100,7 @@ export { externalRuntimeReservations } from "./external_runtime_reservations.js"
 export { branchRunClaims } from "./branch_run_claims.js";
 export { backstopSweepCursors } from "./backstop_sweep_cursors.js";
 export { schedulerLeases } from "./scheduler_leases.js";
+export { githubStatusKeyLeases } from "./github_status_key_leases.js";
 export { heartbeatRunEvents } from "./heartbeat_run_events.js";
 export { heartbeatRunWatchdogDecisions } from "./heartbeat_run_watchdog_decisions.js";
 export { smokeRuns, smokeRunSteps } from "./smoke_lab.js";
