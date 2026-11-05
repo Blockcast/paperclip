@@ -388,8 +388,59 @@ describe("github MCP token proxy", () => {
       const handle = await startGitHubMcpTokenProxy({ tokenFile: file, port: 0, notify: () => {} });
       expect(handle).not.toBeNull();
       expect(handle?.ghHost).toBe("http://127.0.0.1");
-      expect(handle?.owned).toBe(true);
       await handle?.close();
+    });
+
+    it("never adopts a port it does not own, even one answering the health marker (PEN-5641)", async () => {
+      // The important finding on PR #3410. Adoption was justified by the proxy
+      // holding no per-session state, but the hazard is LIFETIME, not state:
+      // the listener is unref'd inside its owner's process, so when the owning
+      // MCP server exits the port vanishes while every adopter still has
+      // GITHUB_HOST baked into its spawn environment — ECONNREFUSED for the
+      // rest of its session, and then any local process that binds the freed
+      // port receives those requests with the adopter's boot-time
+      // GITHUB_PERSONAL_ACCESS_TOKEN in cleartext. Failing open costs the
+      // second server its rotation coverage; adopting costs a credential.
+      const root = temporaryDirectory();
+      const file = writeMountGeneration(root, "gen1", GENERATION_ONE);
+
+      // A first proxy, holding the port and answering the marker exactly as a
+      // genuine sibling would — this is the case adoption used to accept.
+      const first = await startGitHubMcpTokenProxy({ tokenFile: file, port: 0, notify: () => {} });
+      expect(first).not.toBeNull();
+      const heldPort = first?.port ?? 0;
+
+      // Confirm the fixture really is one of ours, so the test is exercising
+      // the adoption branch and not merely an unrelated-listener refusal.
+      const probe = await new Promise<string>((resolve) => {
+        const req = httpRequest(
+          { host: "127.0.0.1", port: heldPort, path: PROXY_HEALTH_PATH, method: "GET" },
+          (res) => {
+            let text = "";
+            res.setEncoding("utf8");
+            res.on("data", (c: string) => { text += c; });
+            res.on("end", () => resolve(text.trim()));
+          },
+        );
+        req.on("error", () => resolve(""));
+        req.end();
+      });
+      expect(probe).toBe(PROXY_HEALTH_MARKER);
+
+      const messages: string[] = [];
+      const second = await startGitHubMcpTokenProxy({
+        tokenFile: file,
+        port: heldPort,
+        notify: (message) => messages.push(message),
+      });
+
+      // Fail open: no handle, so the caller leaves GITHUB_HOST unset and the
+      // child keeps working against its boot credential.
+      expect(second).toBeNull();
+      expect(messages.join(" ")).toContain("already bound");
+      expect(messages.join(" ")).not.toContain("reusing");
+
+      await first?.close();
     });
   });
 });
