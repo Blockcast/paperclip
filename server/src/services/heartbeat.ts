@@ -32870,6 +32870,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     now?: Date;
     /** Test seam: runs between candidate selection and the recovery emit. */
     beforeRecover?: () => Promise<void>;
+    /** Test seam: the same, for the horizon's discharge stamp. */
+    beforeDischarge?: () => Promise<void>;
   }) {
     // Deliberately lower than the eligibility sweep's 200. That pass only
     // writes columns; this one CREATES ROWS and ENQUEUES WAKES, and its first
@@ -33091,25 +33093,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { clearedColumn, outcome: "skipped", clearedAt: null };
       }
 
-      // The same two conditions `handoffOwed` excludes in SQL, re-asserted here
-      // because disjunct B reaches this point without them and because the row
-      // can change between selection and now. NEITHER STAMPS: an obligation
-      // nobody can carry stays visibly owed rather than being marked discharged
-      // by a carrier that no wake will ever reach.
-      if (!row.assigneeAgentId) {
-        // Reported once per pass, in aggregate, below — a `warn` per unowned
-        // row per tick is noise, and the population is the actionable number.
-        unownedIssueIds.push(row.identifier ?? row.id);
-        return { clearedColumn, outcome: "unowned", clearedAt: monitorState.clearedAt ?? null };
-      }
-      if (!monitorState.clearedAt) {
-        logger.warn(
-          { issueId: row.id, identifier: row.identifier, outcome: "skipped" },
-          "cancelled-monitor recovery has no clearedAt to key its wake idempotency on; leaving it owed",
-        );
-        return { clearedColumn, outcome: "skipped", clearedAt: null };
-      }
-
+      // ORDERING (Ally, #3405): the horizon is evaluated BEFORE the `unowned`
+      // and missing-`clearedAt` guards below, because an UNOWNED row past the
+      // horizon is the one class that could never leave this pass. It cannot be
+      // handed to anybody, so it was returned `unowned` on every tick forever —
+      // inert backfill accumulating in the one aggregate the comment below calls
+      // the actionable number. Discharging it is what the horizon is for; having
+      // no assignee is not a reason to keep a moot obligation owed.
+      //
+      // Nothing else changes order. `clearedAtIso` is required below rather than
+      // assumed, so a row with no `clearedAt` still falls through to the same two
+      // guards and reports exactly what it reported before — this reorder adds a
+      // discharge for unowned past-horizon rows and reclassifies nothing.
+      //
+      // The open-work-product carve-out applies to unowned rows too, and that is
+      // load-bearing: an unowned source that still owns an open work product is
+      // the PEN-4835 terminal branch, and it must stay visibly owed.
+      //
+      // Cost: past-horizon unowned rows now pay the `sourceOwnsOpenWorkProduct`
+      // query they previously skipped. Bounded by the horizon, and paid once —
+      // after the stamp the row is no longer selected.
+      //
       // PEN-5346: THE HORIZON. Discharge an obligation that has been moot for
       // longer than `CANCELLED_MONITOR_HANDOFF_HORIZON_MS` without building a
       // carrier for it.
@@ -33150,11 +33154,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // separate "a carrier owns this" from "nothing ever will".
       const clearedAtIso = monitorState.clearedAt;
       const obligationDeadlineIso = monitorState.clearedNextCheckAt ?? clearedAtIso;
-      const obligationDeadlineMs = Date.parse(obligationDeadlineIso);
+      // `clearedAtIso` is nullable at this point (the guard that excludes it now
+      // sits BELOW this block), so the deadline can be absent entirely. NaN is
+      // the right value: `Number.isFinite` rejects it and the row falls through
+      // to the guards below, exactly as it did before the reorder.
+      const obligationDeadlineMs = obligationDeadlineIso
+        ? Date.parse(obligationDeadlineIso)
+        : Number.NaN;
       const pastHorizon = Number.isFinite(obligationDeadlineMs)
         && now.getTime() - obligationDeadlineMs > CANCELLED_MONITOR_HANDOFF_HORIZON_MS;
 
-      if (pastHorizon && !(await sourceOwnsOpenWorkProduct(row))) {
+      if (clearedAtIso && pastHorizon && !(await sourceOwnsOpenWorkProduct(row))) {
+        if (opts?.beforeDischarge) await opts.beforeDischarge();
         const dischargeStamped = await stampHandoffDisposition({
           row,
           clearedAtIso,
@@ -33181,6 +33192,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           "cancelled-monitor handoff discharged past its horizon without a carrier (PEN-5346)",
         );
         return { clearedColumn, outcome: "auto_discharged", clearedAt: clearedAtIso };
+      }
+
+      // The same two conditions `handoffOwed` excludes in SQL, re-asserted here
+      // because disjunct B reaches this point without them and because the row
+      // can change between selection and now. NEITHER STAMPS: an obligation
+      // nobody can carry stays visibly owed rather than being marked discharged
+      // by a carrier that no wake will ever reach.
+      if (!row.assigneeAgentId) {
+        // Reported once per pass, in aggregate, below — a `warn` per unowned
+        // row per tick is noise, and the population is the actionable number.
+        unownedIssueIds.push(row.identifier ?? row.id);
+        return { clearedColumn, outcome: "unowned", clearedAt: monitorState.clearedAt ?? null };
+      }
+      // Reads `clearedAtIso` rather than `monitorState.clearedAt` so the carrier
+      // path below narrows to `string`: the binding now predates this guard.
+      if (!clearedAtIso) {
+        logger.warn(
+          { issueId: row.id, identifier: row.identifier, outcome: "skipped" },
+          "cancelled-monitor recovery has no clearedAt to key its wake idempotency on; leaving it owed",
+        );
+        return { clearedColumn, outcome: "skipped", clearedAt: null };
       }
 
       if (opts?.beforeRecover) await opts.beforeRecover();

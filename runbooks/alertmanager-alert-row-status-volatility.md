@@ -157,7 +157,8 @@ row that survives the cancel, instead of being dropped.
 each one whose obligation can still be live — see the horizon below — it opens a
 recovery issue:
 
-- title `Carry forward the wake cancelled on <source title>`;
+- title `Carry forward the wake cancelled on <source identifier>`, falling back
+  to the source's title when it has no identifier;
 - `originKind: "stranded_issue_recovery"`, `originId` the cancelled row,
   `originFingerprint: "issue_monitor:cancelled"`;
 - `status: "todo"`, `priority: "high"`, assigned to the **source row's
@@ -201,13 +202,24 @@ Four things follow that a reader should not have to rediscover:
   the alert genuinely cleared — the case that orphaned
   [onprem-k8s#7360](https://github.com/Blockcast/onprem-k8s/pull/7360) off
   PEN-4835 — gets a carrier even though it is never reopened.
-- **An unassigned source gets no carrier.** There is nobody to hand the
-  obligation to, so the sweep logs
+- **An unassigned source gets no carrier — but it is not owed forever.** A
+  carrier inherits its source's assignee, so an unassigned source would mint an
+  ownerless `todo` that no wake can reach. Within the horizon the sweep
+  therefore logs
   `cancelled-monitor recoveries left owed: the source has no agent to hand the
   obligation to (PEN-5346)` with the issue ids and leaves `recoveryEmittedAt`
   null, so the row is retried rather than silently marked discharged. If you
   are chasing a wake that never arrived on an unassigned alert row, that log
   line is where it went.
+
+  **Past** the horizon it is discharged like any other moot obligation. The
+  horizon is evaluated *before* the unassigned check for exactly this reason:
+  nothing assigns a cancelled row, so an unowned past-horizon row would
+  otherwise be re-reported `unowned` on every tick for the life of the
+  deployment, and that inert backfill would dominate the one aggregate this
+  log line exists to make actionable. The open-work-product carve-out still
+  applies first, so an unassigned source that still owns a live PR stays
+  visibly owed rather than being written off for want of an assignee.
 
 **Damping the flap is still not done, and is still not this fix.** It was
 evaluated against the measured intervals and **rejected as the primary fix**: a

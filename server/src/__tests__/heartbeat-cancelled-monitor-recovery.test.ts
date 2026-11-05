@@ -211,6 +211,15 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
     return issueId;
   }
 
+  /** The two columns the carrier title interpolates (PEN-5457). */
+  function readIssueNaming(issueId: string) {
+    return db
+      .select({ identifier: issues.identifier, title: issues.title })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!);
+  }
+
   function readIssue(issueId: string) {
     return db
       .select({
@@ -380,6 +389,85 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
       expect(result).toMatchObject({ scanned: 1, recovered: 0, autoDischarged: 1 });
       await expect(readRecoveryIssues(issueId)).resolves.toHaveLength(0);
     });
+
+    it("discharges an UNOWNED row past the horizon instead of reporting it owed forever", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      // Ally on #3405: the `unowned` guard used to run BEFORE the horizon, so
+      // this row — which can never be handed to anybody — was returned `unowned`
+      // on every tick for the life of the deployment. It is inert backfill
+      // accumulating in the one aggregate the pass calls the actionable number,
+      // and no amount of waiting changes it: nothing assigns a cancelled row.
+      const issueId = await seedCancelledResidue(companyId, null, {
+        clearedAt: LONG_PAST_CLEARED_AT,
+      });
+
+      const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(result).toMatchObject({ scanned: 1, recovered: 0, unowned: 0, autoDischarged: 1, failed: 0 });
+
+      // Still no carrier — an ownerless `todo` is exactly what the `unowned`
+      // guard exists to prevent, and the horizon does not reach for one either.
+      await expect(readRecoveryIssues(issueId)).resolves.toHaveLength(0);
+      const residue = residueOf((await readIssue(issueId)).executionState);
+      expect(residue.recoveryDisposition).toBe("auto_discharged_past_horizon");
+    });
+
+    it("keeps an UNOWNED row owed when its source still owns an open work product", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      // The carve-out has to survive the reorder, and this is the pairing that
+      // proves it: unowned AND past the horizon, so both of the previous case's
+      // conditions hold, but the source still owns a live PR. That is the
+      // PEN-4835 terminal branch, and it must stay visibly owed rather than be
+      // written off for the incidental reason that nobody is assigned.
+      const issueId = await seedCancelledResidue(companyId, null, {
+        clearedAt: LONG_PAST_CLEARED_AT,
+      });
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/onprem-k8s#7360",
+        title: "fix(prod-07): restart node-exporter under the new unit",
+        status: "ready_for_review",
+      });
+
+      const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(result).toMatchObject({ scanned: 1, recovered: 0, unowned: 1, autoDischarged: 0, failed: 0 });
+      await expect(readRecoveryIssues(issueId)).resolves.toHaveLength(0);
+      // Not stamped: the obligation is still live and still selectable.
+      const residue = residueOf((await readIssue(issueId)).executionState);
+      expect(residue.recoveryEmittedAt ?? null).toBeNull();
+    });
+
+    it("leaves a past-horizon row owed when the discharge stamp loses its CAS", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = await seedCancelledResidue(companyId, agentId, {
+        clearedAt: LONG_PAST_CLEARED_AT,
+      });
+
+      // The carrier path's equivalent is pinned via `beforeRecover`; the
+      // discharge path had no case. Move the clear out from under the CAS
+      // between selection and the stamp — the predicate keys on `clearedAt`, so
+      // this is the same race a concurrent re-arm produces.
+      const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries({
+        beforeDischarge: async () => {
+          await db
+            .update(issues)
+            .set({
+              executionState: sql`jsonb_set(${issues.executionState}, '{monitor,clearedAt}', ${JSON.stringify(
+                new Date(Date.now() - 44 * DAY_MS).toISOString(),
+              )}::jsonb)`,
+            })
+            .where(eq(issues.id, issueId));
+        },
+      });
+
+      // Skipped, NOT discharged: a lost CAS means the row changed under us, so
+      // it is re-evaluated next pass on whatever state it now holds.
+      expect(result).toMatchObject({ scanned: 1, autoDischarged: 0, skipped: 1, failed: 0 });
+      const residue = residueOf((await readIssue(issueId)).executionState);
+      expect(residue.recoveryEmittedAt ?? null).toBeNull();
+    });
   });
 
   it("hands a terminally-cancelled row's obligation to a surviving carrier (PEN-5346)", async () => {
@@ -400,7 +488,14 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
       assigneeAgentId: agentId,
       originFingerprint: "issue_monitor:cancelled",
     });
-    expect(recoveries[0]!.title).toContain("Carry forward the wake cancelled on");
+    // Pins the INTERPOLATED half too (PEN-5457): the title names the source's
+    // identifier, falling back to its title. A `toContain` on the fixed prefix
+    // alone passes just as happily when the interpolation is empty or names the
+    // wrong row, which is the whole of what makes this title useful.
+    const naming = await readIssueNaming(issueId);
+    expect(recoveries[0]!.title).toBe(
+      `Carry forward the wake cancelled on ${naming.identifier ?? naming.title}`,
+    );
 
     // It carries the whole record of what was owed. The notes came off the
     // audit copy: the live column was nulled by the clear.
