@@ -31,9 +31,8 @@ is written as a **count test, not a harm test**, and the mechanism is the findin
 [`PEN-3183-git-egress-enforcement-boundary-decision.md`](./PEN-3183-git-egress-enforcement-boundary-decision.md)
 carries the same summary and is **in this tree**. The fuller record of the widening — all six
 windows, the severity argument and the predicate discussion — is
-`PEN-4989-absolute-path-git-population-widening.md` *(lands in #3102; not present in this tree, so
-do not follow it from here until that merges)*. This document is the method and the first data
-point. §4 below is right that this result does not generalise — what it could not know is that the
+`PEN-4989-absolute-path-git-population-widening.md` — **in this tree** since #3102 merged
+2026-11-05. This document is the method and the first data point. §4 below is right that this result does not generalise — what it could not know is that the
 first counter-example was already one window away. Read §2.2 before quoting a confidence
 with the zero: the sampler's measured catch rate on the shortest invocation class is **0.710**, so
 the zero supports *k = 0* at only ~71 % for that class, not the ~93 % earlier drafts claimed.
@@ -312,8 +311,8 @@ from splitting the sources of a git invocation in an agent pod into two:
   The fleet claim rests on the **fingerprint comparison in §5**, not on this count: a pod whose
   egress-surface fingerprint matches may cite this census, and one whose fingerprint differs must
   re-take it. See
-  `PEN-4989-absolute-path-git-population-widening.md` §3 *(lands in #3102; not present in this
-  tree)*.
+  `PEN-4989-absolute-path-git-population-widening.md` §3 (in this tree since #3102 merged
+  2026-11-05).
 - **Agent-composed shell — per-pod, and measured in one pod only.** An agent can compose an
   absolute path to either binary into a shell snippet at runtime. That is the half this measurement
   covers for one pod and cannot cover for the others.
@@ -377,8 +376,8 @@ cannot scope.
 
 This section first said "whenever the agent image or the PATH layout changes". At ≈15 image changes
 a day (PEN-4989 §3) that trigger is always firing and so gets ignored, which is the failure PEN-4988
-exists to prevent. `scripts/absolute-path-git-fingerprint.mjs` *(lands in #3102)* hashes the narrower
-surface, so staleness is a comparison: a run whose fingerprint matches may cite this measurement,
+exists to prevent. `scripts/absolute-path-git-fingerprint.mjs` (in this tree since #3102 merged
+2026-11-05) hashes the narrower surface, so staleness is a comparison: a run whose fingerprint matches may cite this measurement,
 one whose fingerprint differs must re-take it. **This is also what the census count in §4 rests
 on**, since three images off one egress surface are a reproducibility check, not a sample of the
 fleet.

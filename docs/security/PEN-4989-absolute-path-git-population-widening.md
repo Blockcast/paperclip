@@ -49,13 +49,14 @@ census generalises fleet-wide "because the image is identical across the fleet".
 run one image. That does not change either measurement's number; it changes what may be inferred
 from them, and it changes the shape of the re-measurement trigger.
 
-> ⚠ **Merge order: PR [#3098](https://github.com/Blockcast/paperclip/pull/3098) lands first.**
-> Two things this document relies on exist only there and 404 on `master` until it lands:
+> ✅ **Merge order: satisfied.** PR [#3098](https://github.com/Blockcast/paperclip/pull/3098) merged
+> **2026-10-30**; this record merged in [#3102](https://github.com/Blockcast/paperclip/pull/3102) on
+> **2026-11-05**. The two things this document relies on —
 > `PEN-4986-absolute-path-git-runtime-measurement.md` (linked above — this record's primary
 > reference) and `scripts/measure-absolute-path-git.mjs` (the measurement itself, invoked by the
-> §6 re-run procedure). Landing this record first would publish a security record whose primary
-> link is dead and whose re-measurement procedure cannot be executed — which is the specific
-> failure §4 is about: a staleness rule nobody can run is a rule nobody acts on.
+> §6 re-run procedure) — are both on `master`, so the primary link resolves and the §6 procedure can
+> be executed. The constraint is kept rather than deleted because it records the specific failure
+> §4 is about: a staleness rule nobody can run is a rule nobody acts on.
 
 ## 1. Window, population, result
 
@@ -274,10 +275,12 @@ inverts all four.
 ⚠ **Consequently the name is retired.** "Absolute-path `git`" is a misnomer that invited exactly this
 ambiguity, and it survives in row titles, doc headings and `scripts/measure-absolute-path-git.mjs`.
 The concept is renamed to **unwrapped `git`**. This record keeps its filename for link stability — it
-is referenced by open PRs and by PEN-3183 — but uses the new term in prose; the rename lands in
-§7.1/§7.2 and in the script name when those are edited after PR
-[#3098](https://github.com/Blockcast/paperclip/pull/3098). **A control whose own name scores its
-correct operation as a violation will be misread again.**
+is referenced by PEN-3183 — but uses the new term in prose. ✅ §7.1 and §7.2 adopted it: the
+predicate block at the head of §7.1 defines the counted thing as an **unwrapped `git`** (landed
+2026-10-30 in [#3098](https://github.com/Blockcast/paperclip/pull/3098)). ⚠ The **script filename**
+`scripts/measure-absolute-path-git.mjs` is **unchanged**, for the same link-stability reason this
+record keeps its own. **A control whose own name scores its correct operation as a violation will
+be misread again.**
 
 ### Severity — argued both ways here; **decided by the CTO** (D-2)
 
@@ -637,7 +640,7 @@ mkdir -p /tmp/calib && cp /usr/bin/git /tmp/calib/git   # copy, and NAME IT `git
                                                         # on argv[0], so a differently-named copy
                                                         # takes a shorter startup path and
                                                         # calibrates against the wrong thing
-node scripts/measure-absolute-path-git.mjs /tmp/obs.ndjson 2 /tmp/calib/git &  # lands in #3098
+node scripts/measure-absolute-path-git.mjs /tmp/obs.ndjson 2 /tmp/calib/git &  # on master
 # positive, negative and calibration controls, then work normally across the window
 kill -TERM %1                                      # emits the {"kind":"stop"} summary
 grep -c '"wrapped":false' /tmp/obs.ndjson          # minus any deliberate negative control
