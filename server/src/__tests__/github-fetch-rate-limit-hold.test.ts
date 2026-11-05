@@ -53,6 +53,18 @@ describe("ghFetch rate-limit hold (BLO-53662)", () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
+  it("never lets an exhausted api.github.com hold another host", async () => {
+    const reset = Math.ceil(Date.now() / 1000) + 600;
+    const fetchMock = vi.fn(async () => exhausted(reset));
+    vi.stubGlobal("fetch", fetchMock);
+    await ghFetch(CORE);
+
+    fetchMock.mockImplementation(async () => new Response("x", { status: 200 }));
+    expect((await ghFetch("https://raw.githubusercontent.com/o/r/main/SKILL.md")).status).toBe(200);
+    expect((await ghFetch("https://ghes.example.com/api/v3/repos/o/r")).status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
   it("sends again once the reset has passed", async () => {
     const fetchMock = vi.fn(async () => exhausted(Math.floor(Date.now() / 1000) - 1));
     vi.stubGlobal("fetch", fetchMock);
