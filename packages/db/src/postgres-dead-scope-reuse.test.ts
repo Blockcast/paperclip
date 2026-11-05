@@ -25,7 +25,21 @@
  * it started on (`Connection.session`, bumped on close), refuses every later
  * statement with CONNECTION_CLOSED before it can reach the connection, settles
  * the scope's local queue on close, makes a stale `release()` a no-op, and resets
- * the per-session state in `closed()`. Reverting it makes every test here fail.
+ * the per-session state in `closed()`.
+ *
+ * Clearing that state removed the dead session's FATAL, which upstream had
+ * relied on by accident in three places. The patch fixes each one properly:
+ * - a reserve() queued behind the dead connection is handed the reconnected
+ *   one;
+ * - a cursor loop whose session dies mid-iteration throws instead of ending
+ *   early;
+ * - a type fetch that dies during startup no longer leaves an unhandled
+ *   rejection.
+ *
+ * Every test here fails on the pre-patch driver, with one exception: the
+ * failed-connect reserve() test guards a failure mode that the hand-off fix
+ * would otherwise introduce. Each part of the patch is pinned by a test that
+ * fails without that part.
  *
  * Most tests kill a backend on a pool of ONE connection, so the next caller is
  * guaranteed to reuse the dead scope's `Connection` object.
@@ -51,9 +65,18 @@ function deferred() {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Polls until `cond` holds; a bounded stand-in for an event the driver does not expose. */
+async function until(cond: () => boolean | Promise<boolean>, what: string) {
+  for (let i = 0; i < 200; i++) {
+    if (await cond()) return;
+    await sleep(25);
+  }
+  throw new Error(`timed out waiting for ${what}`);
+}
+
 /** The pool's queue lengths, exported by patches/postgres@3.4.9.patch (BLO-33243). */
 const poolStats = (client: postgres.Sql) =>
-  (client as unknown as { poolStats(): { active: number } }).poolStats();
+  (client as unknown as { poolStats(): { active: number; waiting: number } }).poolStats();
 
 /**
  * Settles with the value, the error's code, or `hung`, so a hang fails an
@@ -96,6 +119,15 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
     };
   });
 
+  /** Waits until `pid` is inside pg_sleep(), i.e. its statement is running server-side. */
+  const waitForPgSleep = (pid: number) =>
+    until(async () => {
+      const [{ sleeping }] = await admin<{ sleeping: boolean }[]>`
+        select exists (select 1 from pg_stat_activity where pid = ${pid} and wait_event = 'PgSleep') as sleeping
+      `;
+      return sleeping;
+    }, `backend ${pid} to sleep`);
+
   const rows = async () =>
     (await admin<{ n: number }[]>`select n from dead_scope_rows order by n`).map((row) => row.n);
 
@@ -125,8 +157,7 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
     // The server dropping the backend is not enough: until the driver has run
     // its own close, release() still sees a live reservation. Wait until the
     // pool no longer counts the reserved slot as active.
-    for (let i = 0; i < 100 && poolStats(sql).active > 0; i++) await sleep(50);
-    expect(poolStats(sql).active).toBe(0);
+    await until(() => poolStats(sql).active === 0, "the driver to see the close");
     return reserved;
   }
 
@@ -204,7 +235,7 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
         // waits in begin()'s own queue, whose only drain died with the session.
         void tx`select pg_sleep(${3})`.catch(() => {});
         const parked = within(tx`select 2 as x`, 3_000);
-        await sleep(100);
+        await waitForPgSleep(pid);
         await admin`select pg_terminate_backend(${pid})`;
         behind = await parked;
         settled.resolve();
@@ -220,7 +251,7 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
     const [{ pid }] = await reserved<{ pid: number }[]>`select pg_backend_pid() as pid`;
     void reserved`select pg_sleep(${3})`.catch(() => {});
     const parked = within(reserved`select 2 as x`, 3_000);
-    await sleep(100);
+    await waitForPgSleep(pid);
     await admin`select pg_terminate_backend(${pid})`;
 
     expect(await parked).toEqual({ error: "CONNECTION_CLOSED" });
@@ -277,7 +308,8 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
     // Parameterized, so the connection goes `full` and `next` waits in the pool backlog.
     const killed = within(sql`select pg_sleep(${5})`, 5_000);
     const next = within(sql`select 42 as x`, 5_000);
-    await sleep(100);
+    await waitForPgSleep(pid);
+    await until(() => poolStats(sql).waiting === 1, "the next query to queue");
     await admin`select pg_terminate_backend(${pid})`;
 
     expect(await killed).toEqual({ error: "CONNECTION_CLOSED" });
@@ -298,7 +330,9 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
         5_000,
       );
       const next = within(raw`select 42 as x`, 5_000);
-      await sleep(300);
+      // Row 3 is the first to sleep, so rows 1 and 2 are already on the wire.
+      await waitForPgSleep(pid);
+      await until(() => poolStats(raw).waiting === 1, "the next query to queue");
       await admin`select pg_terminate_backend(${pid})`;
 
       expect(await killed).toEqual({ error: "CONNECTION_CLOSED" });
@@ -324,7 +358,8 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
     );
     await started.promise;
     const queued = within(sql`select 42 as x`, 5_000);
-    await sleep(100);
+    await waitForPgSleep(pid);
+    await until(() => poolStats(sql).waiting === 1, "the next query to queue");
     await admin`select pg_terminate_backend(${pid})`;
 
     expect(await begun).toEqual({ error: "CONNECTION_CLOSED" });
@@ -355,13 +390,13 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
     viaProxy.port = String((proxy.address() as net.AddressInfo).port);
     const proxied = postgres(viaProxy.toString(), { max: 1, onnotice: () => {} });
     try {
-      await proxied`select 1`;
+      const [{ pid }] = await proxied<{ pid: number }[]>`select pg_backend_pid() as pid`;
       const begun = proxied.begin(async (tx) => {
         await tx`select pg_sleep(2)`;
       });
-      await sleep(50);
+      await waitForPgSleep(pid);
       const queued = within(proxied`select 42 as x`, 3_000);
-      await sleep(200);
+      await until(() => poolStats(proxied).waiting === 1, "the next query to queue");
       for (const client of clients) client.resetAndDestroy();
 
       await expect(begun).rejects.toMatchObject({ code: "CONNECTION_CLOSED" });
@@ -402,6 +437,7 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
       create trigger dead_scope_slow before insert on dead_scope_rows
         for each row execute function dead_scope_slow()
     `);
+    const [{ pid }] = await sql<{ pid: number }[]>`select pg_backend_pid() as pid`;
     const writable = await sql`copy dead_scope_rows from stdin`.writable();
     const outcome = new Promise((resolve) => {
       writable.on("finish", () => resolve("finish"));
@@ -409,16 +445,115 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
     });
     writable.write("1\n");
     writable.end();
-    await sleep(300);
-    await admin`
-      select pg_terminate_backend(pid) from pg_stat_activity
-      where query like 'copy dead_scope_rows%' and pid <> pg_backend_pid()
-    `;
-    await sleep(300);
+    // The trigger's pg_sleep runs, so the COPY has ended client-side and is in flight.
+    await waitForPgSleep(pid);
+    expect(await admin`select pg_terminate_backend(${pid}) as t`).toEqual([{ t: true }]);
+    await until(() => poolStats(sql).active === 0, "the driver to see the close");
     // Upstream left its `final` for the next session's first CommandComplete to fire as success.
     await within(sql`select 1`, 3_000);
 
     expect(await within(outcome, 3_000)).toEqual({ value: "CONNECTION_CLOSED" });
+  });
+
+  it("throws from a cursor loop whose backend dies while it holds a batch, instead of ending early", async () => {
+    // The rejection used to land on next()'s already-resolved promise and clear
+    // `active`, so the loop ended cleanly and the rows so far passed for all of
+    // them. Upstream only failed loudly by accident, on the dead session's
+    // stashed FATAL at the caller's next statement.
+    const [{ pid }] = await sql<{ pid: number }[]>`select pg_backend_pid() as pid`;
+    let seen = 0;
+    const outcome = await (async () => {
+      try {
+        for await (const batch of sql`select generate_series(1, 100) as n`.cursor(10)) {
+          seen += batch.length;
+          if (seen === 10) {
+            await admin`select pg_terminate_backend(${pid})`;
+            await until(() => poolStats(sql).active === 0, "the driver to see the close");
+          }
+        }
+        return "ended";
+      } catch (error) {
+        return (error as { code?: string }).code;
+      }
+    })();
+
+    expect(outcome).toBe("CONNECTION_CLOSED");
+    expect(seen).toBe(10);
+  });
+
+  it("rejects a queued caller with the next session's startup error instead of reconnecting forever", async () => {
+    // A leftover `query` made ErrorResponse stash the startup FATAL instead of
+    // rejecting `initial` with it, so closed() looped on reconnect.
+    const [{ pid }] = await sql<{ pid: number }[]>`select pg_backend_pid() as pid`;
+    const killed = within(sql`select pg_sleep(${5})`, 5_000);
+    const next = within(sql`select 42 as x`, 5_000);
+    await waitForPgSleep(pid);
+    await until(() => poolStats(sql).waiting === 1, "the next query to queue");
+    const database = new URL(dbh.connectionString).pathname.slice(1);
+    // Postgres refuses to disallow connections to the database a session is in.
+    const maintenanceUrl = new URL(dbh.connectionString);
+    maintenanceUrl.pathname = "/postgres";
+    const maintenance = postgres(maintenanceUrl.toString(), { max: 1, onnotice: () => {} });
+    try {
+      await maintenance.unsafe(`alter database "${database}" allow_connections false`);
+      await admin`select pg_terminate_backend(${pid})`;
+
+      expect(await killed).toEqual({ error: "CONNECTION_CLOSED" });
+      expect(await next).toEqual({ error: "55000" });
+    } finally {
+      await maintenance.unsafe(`alter database "${database}" allow_connections true`);
+      await maintenance.end({ timeout: 5 });
+    }
+  });
+
+  it("does not raise an unhandled rejection when a new connection dies during its type fetch", async () => {
+    // The startup's array-type query is fire-and-forget, so its rejection had no
+    // handler; paperclip's crash guard exits the worker on one.
+    const target = new URL(dbh.connectionString);
+    const sockets = new Set<net.Socket>();
+    let killedTypeFetch = false;
+    const proxy = net.createServer((client) => {
+      sockets.add(client);
+      client.on("error", () => {});
+      client.on("close", () => sockets.delete(client));
+      const upstream = net.connect(Number(target.port), target.hostname);
+      upstream.on("error", () => {});
+      client.on("data", (chunk: Buffer) => {
+        if (!killedTypeFetch && chunk.includes("typarray")) {
+          killedTypeFetch = true;
+          client.destroy();
+          upstream.destroy();
+          return;
+        }
+        upstream.write(chunk);
+      });
+      upstream.pipe(client);
+      client.on("close", () => upstream.destroy());
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const viaProxy = new URL(dbh.connectionString);
+    viaProxy.hostname = "127.0.0.1";
+    viaProxy.port = String((proxy.address() as net.AddressInfo).port);
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => void unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    // reserve() first, so the type fetch runs with no user query behind it.
+    const proxied = postgres(viaProxy.toString(), { max: 1, onnotice: () => {} });
+    try {
+      const outcome = await within(proxied.reserve(), 5_000);
+      expect(killedTypeFetch).toBe(true);
+      expect(outcome).toHaveProperty("value");
+      (outcome as { value: postgres.ReservedSql }).value.release();
+      expect(await within(proxied`select 1 as x`, 3_000)).toEqual({ value: [{ x: 1 }] });
+      await sleep(STALE_WRITE_SETTLE_MS);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await proxied.end({ timeout: 1 });
+      for (const socket of sockets) socket.destroy();
+      proxy.close();
+    }
+
+    expect(unhandled).toEqual([]);
   });
 
   /**
@@ -428,9 +563,9 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
   async function reserveQueuedBehindTerminatedConnection(client: Sql) {
     const [{ pid }] = await client<{ pid: number }[]>`select pg_backend_pid() as pid`;
     const busy = within(client`select pg_sleep(${5})`, 5_000);
-    await sleep(50);
+    await waitForPgSleep(pid);
     const reserving = within(client.reserve(), 5_000);
-    await sleep(50);
+    await until(() => poolStats(client).waiting === 1, "the reserve() to queue");
     await admin`select pg_terminate_backend(${pid})`;
 
     expect(await busy).toEqual({ error: "CONNECTION_CLOSED" });
