@@ -139,7 +139,7 @@ anchor whose construct it can place unambiguously, and reports the rest rather t
 
 <!-- anchor-file: vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts -->
 
-Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3504`**
+Read at `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` **`:3633`**
 (`asBoolean(config.enableGitHubPublishBroker, false)`). Every anchor below is a line in that
 same vendored file — not the `opencode-k8s` adapter's same-named `job-manifest.ts` — and each
 is re-resolved against the tree by `scripts/check-doc-line-anchors.mjs` on every PR, so these
@@ -147,9 +147,9 @@ numbers are checked continuously rather than as of any one reading:
 
 | | Gate off (today) | Gate on |
 |---|---|---|
-| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:4342`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
+| GitHub Secret | mounted into the agent container | mounted into the `github-publish-broker` sidecar only (**`:4475`** (`isGitHubCredentialSecretVolume(sv.mountPath)`), drops it from the agent) |
 | Agent publish path | `git`/`gh`/MCP authenticate locally | agent asks the broker over a unix socket; `PAPERCLIP_GITHUB_BROKER_SOCKET` is set |
-| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:4959`** (`!narrowWritableSurface`)) — fail closed, not degrade |
+| Broad data mount | renders, annotated `broad:<reason>` | **`buildJobManifest` throws** (**`:5092`** (`!narrowWritableSurface`)) — fail closed, not degrade |
 | Pod shape | one container | `+1` native sidecar (initContainer, `restartPolicy: Always`), uid 1001, gid 1000, same image |
 
 Two properties make staging possible, and both were verified in the source rather than assumed:
@@ -214,28 +214,28 @@ The chain, read at `47d01a4bf`:
 
 <!-- anchor-file: server/src/services/heartbeat.ts -->
 
-1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8446`
+1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8654`
    (`function parseIssueAssigneeAdapterOverrides(`), parses
    `issue.assigneeAdapterOverrides.adapterConfig` with `parseObject` and **no key allowlist** —
    arbitrary keys pass.
-2. `mergeModelProfileAdapterConfig`, defined at `:7210`
+2. `mergeModelProfileAdapterConfig`, defined at `:7418`
    (`export function mergeModelProfileAdapterConfig(input: {`), is a **shallow spread** with `issueAdapterConfig`
    **last**, so an issue override beats agent config for any top-level key.
-3. The merged object becomes `executionRunConfig` at `:34894`
+3. The merged object becomes `executionRunConfig` at `:36335`
    (`stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig)`) and reaches the adapter as `ctx.config`
    — the same object `buildJobManifest` reads the gate from.
-4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:2922`
+4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3102`
    (`function withAgentScopedEnvProvenance(`), re-asserts agent values for
    `AGENT_SCOPE_ONLY_ENV_KEYS` — three keys, **inside `env`**. It does nothing for top-level
    `adapterConfig` keys.
 
 So `assigneeAdapterOverrides.adapterConfig.enableGitHubPublishBroker = false` on an issue assigned to
 the agent yields a pod with the credential back in the agent container. The overlay applies only when
-`issueContext.assigneeAgentId === agent.id` (`:34330`) — which is not a mitigation, since an agent can
+`issueContext.assigneeAgentId === agent.id` (`:35771`) — which is not a mitigation, since an agent can
 file an issue assigned to itself, and `paperclipCreateIssue` exposes `assigneeAdapterOverrides`
 directly.
 
-The code already knows this class of problem. The comment at `:2905`
+The code already knows this class of problem. The comment at `:3085`
 (`is issue.assigneeAdapterOverrides.adapterConfig.`) says it in as many words:
 
 > `issueAdapterConfig` is `issue.assigneeAdapterOverrides.adapterConfig`.
@@ -464,7 +464,7 @@ runtime descriptor agent-scoped persistent roots so that `narrowWritableSurface`
 `mode === "shared"` branch and its rationale comment in
 `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts` at **`:1309-1322`**
 (`if (mode === "shared") {`), with
-`narrowWritableSurface` itself defined at **`:3923`**
+`narrowWritableSurface` itself defined at **`:4056`**
 (`const narrowWritableSurface = isolation.enabled && dataClaimName !== "";`); before it, a shared run returned
 `enabled:false` and kept the whole PVC mounted rw. `isolation_disabled` being the *only* leg that
 ever fired, and its stopping dead at that change, is consistent with that and with nothing else.
@@ -475,7 +475,7 @@ and `config.isolationMode` is not `isolated`/`isolate` — in
 `vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`, the constant declared at **`:1264`**
 (`const SHARED_JOB_ISOLATION: JobIsolation = {`)
 and returned at **`:1389`** (`return SHARED_JOB_ISOLATION`). The comment at
-**`:3901`** (`only a config-only run`) names it: *"only a config-only run
+**`:4034`** (`only a config-only run`) names it: *"only a config-only run
 with no descriptor and no `isolationMode` still reaches this fallback."* The measured zero is
 therefore a property of **the server supplying a descriptor on every render**, not of configuration.
 A run path that stops supplying one renders broad — and once the gate is on, that stops being a
@@ -827,8 +827,8 @@ on PEN-5016 at 2026-10-29T20:23Z). It is written here so that it survives the th
 <!-- anchor-file: scripts/gh-token-wrapper.sh -->
 
 **Independently verified against `master` for this revision**, rather than carried on the CTO's word:
-`scripts/gh-token-wrapper.sh:806` guards the token-file path on `${PAPERCLIP_GITHUB_TOKEN_FILE+x}`
-being set, and `:919` is an unconditional `exec_real_gh "$@"` fallthrough. With the variable unset
+`scripts/gh-token-wrapper.sh:887` guards the token-file path on `${PAPERCLIP_GITHUB_TOKEN_FILE+x}`
+being set, and `:1000` is an unconditional `exec_real_gh "$@"` fallthrough. With the variable unset
 the wrapper execs the real `gh` under whatever ambient auth exists, and both fallbacks §5 names are
 live again.
 
@@ -983,12 +983,12 @@ precondition as outstanding, which is the *conservative* direction but still wro
 distinction matters: #3112's content reached `master` through #3123 and #3133 while #3112 itself was
 closed unmerged. A ledger that reads `merged` as the discharge condition would call this row
 outstanding forever. Re-verified at source on `47d01a4bf` — `AGENT_SCOPE_ONLY_CONFIG_KEYS`
-(`server/src/services/heartbeat.ts:2971`
+(`server/src/services/heartbeat.ts:3151`
 (`const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([`)), `withAgentScopedConfigProvenance`
-(defined `server/src/services/heartbeat.ts:3136`
-(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7220`
+(defined `server/src/services/heartbeat.ts:3316`
+(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7428`
 (`return withAgentScopedConfigProvenance(`)), `BROKERED_POD_COMPOSITION_CONFIG_KEYS`
-(`server/src/services/heartbeat.ts:3074`
+(`server/src/services/heartbeat.ts:3254`
 (`const BROKERED_POD_COMPOSITION_CONFIG_KEYS = new Set([`), three keys),
 `vendor/paperclip-adapter-claude-k8s/src/server/config-schema.ts:216`
 (`key: "enableGitHubPublishBroker"`) — **not** from the closing
