@@ -3222,15 +3222,148 @@ export function applyOrder(rows) {
   return [...enqueues, ...rest].map(({ row }) => row);
 }
 
-export function runRepo(
-  repo,
-  apply,
-  settleMinutes,
-  spent,
-  rotted,
-  stranded = [],
-  starved = [],
-  {
+/**
+ * A fault in how this file's own functions were CALLED, as opposed to a fault
+ * in what they were called about. Extends `TypeError`, so anything catching
+ * broadly keeps the familial meaning, but carries its own IDENTITY — because
+ * the frame that has to tell a wiring fault from a read failure can then ask
+ * what this file declared about itself rather than guess from an error's
+ * species.
+ *
+ * Why identity and not `instanceof TypeError`, measured 2026-11-04.
+ * `fetchOpenPrs` runs inside `runRepo` and `JSON.parse`s `gh pr list` output
+ * before calling `.map` on it, so with the `run` seam returning a well-formed
+ * NON-array payload it raises a bare `TypeError` that `isFatalGhError` does
+ * not match: `rows.map is not a function` for an object or a string,
+ * `Cannot read properties of null (reading 'map')` for null. That is a genuine
+ * per-repo read failure and PEN-5442's exact subject — the repo is skipped and
+ * every other repo keeps its verdicts. A blanket `TypeError` rethrow would
+ * turn it into an unhandled throw that ends the whole fire, since `sweepRepos`
+ * has no catch and `main`'s try/`finally` has none either. That is PEN-5442's
+ * closing sentence reinstated as a regression, inside a commit whose purpose
+ * is adding a control.
+ */
+export class WiringError extends TypeError {}
+
+/** Every option `runRepo` knows. */
+const RUN_REPO_KEYS = new Set([
+  "repo",
+  "apply",
+  "settleMinutes",
+  "spent",
+  "rotted",
+  "stranded",
+  "starved",
+  "fetch",
+  "classify",
+  "landable",
+  "applyOne",
+  "applyRun",
+  "state",
+]);
+
+/** Every option `repoRunner` knows. */
+const REPO_RUNNER_KEYS = new Set([
+  "apply",
+  "settleMinutes",
+  "rotted",
+  "stranded",
+  "run",
+  "notify",
+  "unreadable",
+  "starved",
+]);
+
+/**
+ * The by-reference cohorts, which carry NO default on either bag.
+ *
+ * `rotted` is cited rather than introduced: it is the first by-reference
+ * out-param in both signatures and it has never carried a default in either,
+ * while all three later cohorts acquired one. So this is not a new rule — it
+ * is this file's original practice, abandoned once per cohort without anyone
+ * deciding to.
+ */
+const RUN_REPO_REQUIRED_KEYS = ["rotted", "stranded", "starved"];
+const REPO_RUNNER_REQUIRED_KEYS = ["rotted", "stranded", "unreadable", "starved"];
+
+/**
+ * ⛔ TWO throws, not one, because a typo and an omission are different faults
+ * and NEITHER check can see the other's.
+ *
+ * Unknown-key rejection catches a typo, which has two halves — a key that
+ * should not be there and a key that should. Required-key rejection catches an
+ * omission, which has only one. A dropped `starved:` — or a future call site
+ * that never learns a cohort exists — binds nothing, the callee's own default
+ * would supply a fresh array, the callee pushes into THAT, the caller's
+ * collector stays empty, the alarm sums zero and the suite is green. Byte
+ * identical silence to the typo case, and completely invisible to the
+ * unknown-key check.
+ *
+ * ⚠ THIS HAZARD IS PRE-EXISTING, not introduced by the bag. An omitted
+ * trailing positional took `[]` just as silently before this conversion. What
+ * the bag changes is the hazard's REACH — an interior key can be dropped where
+ * an interior positional cannot — and its frequency. It does not create it.
+ *
+ * ⚠ What these guards do NOT cover, stated because the guard they replace had
+ * a comment that overstated its own reach. They check the SHAPE of the call,
+ * never its meaning: passing `stranded` where `starved` belongs is two known,
+ * present keys and sails through, as does passing an array that some other
+ * frame is not reading. They also say nothing about `repo`, `apply`,
+ * `settleMinutes` or `spent`, which are ordinary inputs rather than
+ * by-reference out-params — an omission there is loud on its own, which is why
+ * the required set is the cohorts and not every key without a default.
+ */
+function assertBag(fn, bag, known, required) {
+  if (bag === null || typeof bag !== "object" || Array.isArray(bag)) {
+    const got = bag === null ? "null" : Array.isArray(bag) ? "an array" : typeof bag;
+    throw new WiringError(
+      `${fn}: expected a named options object — received ${got}. This signature ` +
+        "takes ONE bag and has no positional form; see the conversion note on `repoRunner`.",
+    );
+  }
+  for (const key of Object.keys(bag)) {
+    if (known.has(key)) continue;
+    throw new WiringError(
+      `${fn}: unknown option \`${key}\`. Known options: ${[...known].join(", ")}.`,
+    );
+  }
+  for (const key of required) {
+    if (key in bag) continue;
+    throw new WiringError(
+      `${fn}: missing required option \`${key}\`. The by-reference cohorts carry no ` +
+        "default on purpose: a dropped key collects into an array the caller never reads, " +
+        "which reads downstream as an empty cohort and therefore as health.",
+    );
+  }
+}
+
+export function runRepo(options) {
+  // PEN-5536. ONE named bag, no positional form. This signature grew a
+  // positional twice and BOTH times a caller's options bag bound silently to
+  // the NEW positional instead — BLO-51665's rate-limit test (slot 6 ->
+  // `stranded`) and PEN-5430's `repoRunner` spread (slot 7 -> `starved`).
+  // Neither threw: `fetch` simply fell back to the real `fetchOpenPrs`, so the
+  // test issued a LIVE GraphQL call and asserted against whatever GitHub
+  // returned — green, and testing nothing. The cost was never hypothetical,
+  // because `landing-sweep.yml` runs this suite before the hourly sweep, so a
+  // wedged arity takes the sweep with it.
+  //
+  // A bag removes the failure mode rather than detecting it a third time:
+  // there is no slot for a value to land in by accident, so there is nothing
+  // for the next inserter to have to notice.
+  assertBag("runRepo", options, RUN_REPO_KEYS, RUN_REPO_REQUIRED_KEYS);
+  const {
+    repo,
+    apply,
+    settleMinutes,
+    spent,
+    // No defaults, and `assertBag` requires them. See RUN_REPO_REQUIRED_KEYS.
+    rotted,
+    stranded,
+    starved,
+    // Defaults are retained on the injectable SEAMS below, because supplying a
+    // real implementation when a test did not ask for one is exactly what a
+    // seam default is for.
     fetch = fetchOpenPrs,
     classify = classifyAll,
     // PEN-5430. `false` for a notify-only repo. Note the applier DEFAULT is
@@ -3244,27 +3377,7 @@ export function runRepo(
     // (which would stop testing the selection).
     applyRun = gh,
     state = stateHold,
-  } = {},
-) {
-  // PEN-5391. This signature has now grown a positional twice, and BOTH times
-  // a caller's options bag silently bound to the NEW positional instead:
-  // BLO-51665's rate-limit test (slot 6 -> `stranded`) and PEN-5430's
-  // `repoRunner` spread (slot 7 -> `starved`). Neither threw. `fetch` simply
-  // fell back to the real `fetchOpenPrs`, so the test issued a LIVE GraphQL
-  // call and asserted against whatever GitHub returned — green, and testing
-  // nothing. The cost is not hypothetical: `landing-sweep.yml` runs this
-  // suite before the hourly sweep, so a wedged arity takes the sweep with it.
-  //
-  // So reject the shape rather than trusting the next inserter to notice. An
-  // options bag is a plain object and `starved` is an array; a mis-bound
-  // caller dies here, loudly, naming the slot, instead of quietly going live.
-  if (!Array.isArray(starved)) {
-    throw new TypeError(
-      "runRepo: `starved` (7th positional) must be an array — received " +
-        `${starved === null ? "null" : typeof starved}. A caller passing its ` +
-        "options bag in slot 7 is the usual cause; the bag is slot 8.",
-    );
-  }
+  } = options;
   let prs;
   try {
     prs = fetch(repo);
@@ -3446,64 +3559,65 @@ export function sweepRepos(repos, runOne) {
  * `runRepo`. Hoisted so a test can pin that carry (a literal `0` here makes
  * the cap per repo again) without running `main`. `run` is a test seam.
  */
-export const repoRunner =
-  (
+export const repoRunner = (options) => {
+  // PEN-5536. ONE named bag, same conversion and same reason as `runRepo`
+  // above — see its note for the two silent mis-bindings that motivated it.
+  //
+  // ⚠ FORWARD OBLIGATION, replacing the standing instruction this commit
+  // spends (CTO, 2026-11-04, PEN-5391 / PEN-5386: *"Before a FIFTH cohort is
+  // added here, convert `repoRunner` and `runRepo` from positional vectors to
+  // named options objects"*). That conversion has now happened, and leaving
+  // the instruction in place would send the next author to perform it again.
+  //
+  // What replaces it: the bag is now the shape. Any edit that moves a PINNED
+  // CALL SITE's syntax must re-anchor that probe in the same commit and keep
+  // its mutation control live — the control is the only thing that identifies
+  // WHICH occurrence the probe matched, and a probe that has quietly
+  // retargeted to a declaration still passes. See the call-site probes in
+  // `land-clean-prs.test.mjs`.
+  assertBag("repoRunner", options, REPO_RUNNER_KEYS, REPO_RUNNER_REQUIRED_KEYS);
+  const {
     apply,
     settleMinutes,
-    rotted,
-    stranded = [],
-    run = runRepo,
-    notify = new Set(),
-    // PEN-5442. Repos this fire could not read, by the same
-    // collected-by-reference convention as `rotted`/`stranded`: `main` reports
-    // it after the sweep and `alarmExitCode` reads it. A CONSTRUCTOR argument
-    // ONLY: `unreadable` is never threaded into the per-repo vector, because
+    // No defaults, and `assertBag` requires them. `unreadable` (PEN-5442) is a
+    // CONSTRUCTOR-only cohort: it is never threaded into `runRepo`, because
     // the condition it records — the repo could not be listed — is observed
     // out here, where the throw is caught, and is never visible inside
-    // `runRepo`.
-    unreadable = [],
-    // PEN-5391. The cap-starved cohort, same collected-by-reference
-    // convention. APPENDED as the 8th rather than inserted, so PEN-5442's
-    // `unreadable` keeps the 7th and `run`/`notify` do not move: every
-    // existing positional call site stays correct by construction, which is
-    // what made the PEN-5442 shape safe and is worth preserving rather than
-    // re-earning. Unlike `unreadable` this one IS threaded through to
-    // `runRepo` — a cap deferral is observed per PR inside the sweep
-    // (`starved.push` sits beside `stranded.push`), not out here.
-    starved = [],
-  ) =>
-  (repo, spent) => {
-    // Spread rather than an unconditional trailing argument, so a fire with
-    // no notify list calls `runRepo` with exactly the positionals it needs and
-    // no `undefined` in the bag's slot.
-    //
-    // PEN-5391 moved `runRepo`'s options bag from slot 7 to slot 8, because
-    // `starved` is now `runRepo`'s 7th positional. Note this is `runRepo`'s
-    // numbering, NOT `repoRunner`'s — `starved` is `repoRunner`'s 8th
-    // constructor argument, and the two vectors are different lengths. Reading
-    // one function's slot number as the other's is exactly how this collision
-    // was first miscounted.
-    //
-    // Both of this file's last two parameter insertions bound a caller's
-    // options bag to the new positional in silence (BLO-51665's rate-limit
-    // test, then this spread), so `runRepo` opens with an
-    // `Array.isArray(starved)` throw naming the slot, which fails the suite
-    // rather than letting a third one through.
-    //
-    // STANDING INSTRUCTION (CTO, 2026-11-04, PEN-5391 / PEN-5386). Before a
-    // FIFTH cohort is added here, convert `repoRunner` and `runRepo` from
-    // positional vectors to named options objects, in its own commit, ahead
-    // of the cohort. Recorded in the file rather than in a closed issue
-    // thread because the next author to need it will be reading this line and
-    // not that thread. The append-plus-throw discipline above is what the
-    // fourth cohort did instead, and it held — but both defences still depend
-    // on the next author remembering to extend them, which is the property
-    // the conversion removes.
-    const options = notify.has(repo) ? [{ landable: false }] : [];
+    // `runRepo`. `starved` (PEN-5391) IS threaded through, because a cap
+    // deferral is observed per PR inside the sweep.
+    rotted,
+    stranded,
+    unreadable,
+    starved,
+    // Seams keep their defaults.
+    run = runRepo,
+    notify = new Set(),
+  } = options;
+  return (repo, spent) => {
+    // Spread rather than an unconditional key, so a fire with no notify list
+    // hands `runRepo` exactly the options it needs and lets `landable` take
+    // its own default, instead of passing an explicit `undefined` that the
+    // destructuring default would have to absorb.
+    const scope = notify.has(repo) ? { landable: false } : {};
     let rows;
     try {
-      rows = run(repo, apply, settleMinutes, spent, rotted, stranded, starved, ...options);
+      rows = run({ repo, apply, settleMinutes, spent, rotted, stranded, starved, ...scope });
     } catch (error) {
+      // ⛔ PEN-5536, and it is FIRST on purpose: a wiring fault is never
+      // recorded as a repo-readability fact. `assertBag`'s throws travel
+      // through this very catch, and `isFatalGhError` is a regex over
+      // rate-limit / bad-credential / HTTP 401 / HTTP 403 / credential-prompt
+      // messages that a shape fault matches none of — so without this line a
+      // mis-wired call is pushed to `unreadable` and printed as "it could not
+      // be listed". That is wrong twice: a wiring fault is repo-INDEPENDENT,
+      // so every repo in the sweep takes the same throw and the hourly
+      // `--alarm` detector goes red naming an apparent GitHub outage, while
+      // the `45 */6` applying routine prints the same list and exits 0 —
+      // green rather than silent, and a green routine's log reaches nobody.
+      //
+      // A guard is only as loud as the catch above it. Neither half of this
+      // control is complete alone.
+      if (error instanceof WiringError) throw error;
       // PEN-5442: one unreadable repo used to end the WHOLE fire. `fetchOpenPrs`
       // is the first thing `runRepo` does and its throw escaped `runRepo`'s
       // try, `sweepRepos` had no catch, and `main` wrapped the sweep in
@@ -3533,6 +3647,7 @@ export const repoRunner =
     console.log("");
     return rows;
   };
+};
 
 /**
  * Names the repos this fire skipped, in every run mode.
@@ -3779,7 +3894,16 @@ function main() {
   try {
     sweepRepos(
       sweepOrder(targetRepos(), [...notify]),
-      repoRunner(apply, settleMinutes, rotted, stranded, runRepo, notify, unreadable, starved),
+      repoRunner({
+        apply,
+        settleMinutes,
+        rotted,
+        stranded,
+        run: runRepo,
+        notify,
+        unreadable,
+        starved,
+      }),
     );
   } catch (error) {
     sweepError = error;
