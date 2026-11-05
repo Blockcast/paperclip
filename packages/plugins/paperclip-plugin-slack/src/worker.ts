@@ -1561,6 +1561,12 @@ const plugin = definePlugin({
     ] as const;
     for (const eventType of watchableEvents) {
       ctx.events.on(eventType, async (event) => {
+        // No watch for this company means nothing can ever match: skip the
+        // queue entirely. Otherwise every event re-reads and rewrites the whole
+        // up-to-100-event array, and a company that never drains (no Slack
+        // config) pins it at the cap -- ~1.1 MB rewritten per event, which was
+        // ~27% of paperclip-pg's WAL and a 12 GB plugin_state TOAST (2026-11-05).
+        if ((await listWatches(ctx, event.companyId)).length === 0) return;
         // Append under the company's queue lock. Without it two events
         // arriving together both read the same array and the second `set`
         // drops the first (BLO-23143, Ally finding 2 on #996). The drain in

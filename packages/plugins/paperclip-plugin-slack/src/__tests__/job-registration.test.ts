@@ -235,6 +235,39 @@ describe("worker setup() job registration (BLO-20959)", () => {
     ).toEqual([]);
   });
 
+  it("does not queue watchable events for a company with no registered watches", async () => {
+    const { ctx, eventHandlers, storedState } = mkCtx({
+      bootstrapConfig: {},
+      companies: [{ id: "company-1" }, { id: "company-2" }],
+      state: {
+        "instance:global:global-watches-list": [
+          {
+            id: "watch-1",
+            companyId: "company-2",
+            eventPattern: "issue.created",
+            prompt: "Investigate ${event.payload.title}",
+            agentId: "agent-1",
+            channelId: "C123",
+            createdAt: "2026-08-04T00:00:00.000Z",
+            triggerCount: 0,
+          },
+        ],
+      },
+    });
+
+    await plugin.definition.setup(ctx);
+    await eventHandlers.get("issue.updated")!({
+      eventType: "issue.updated",
+      companyId: "company-1",
+      entityId: "issue-1",
+      payload: { title: "no watch here" },
+    });
+
+    // Nothing could ever match, so the queue is neither read nor rewritten.
+    expect(ctx.state.set).not.toHaveBeenCalled();
+    expect(storedState.has("company:company-1:recent-watch-events")).toBe(false);
+  });
+
   it("skips only the unconfigured company and still serves a configured one", async () => {
     const { ctx, registeredJobs } = mkCtx({
       companyConfigs: {
