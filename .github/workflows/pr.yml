@@ -952,7 +952,50 @@ jobs:
       - name: Test gh token wrapper
         if: ${{ !cancelled() }}
         run: node --test ./scripts/gh-token-wrapper.test.mjs
-        timeout-minutes: 1
+        # PEN-5640. At 1m this killed 6 of 276 executed runs over
+        # 2026-11-03..05 -- all 6 on arc-merge-queue, and every one of those
+        # evicted a PR from the merge queue (#3317, #3333, #3387 twice, #3390,
+        # and #3389 itself, the PR landing the sibling fix for PEN-5561) --
+        # while the worst HEALTHY run cleared the same wall by 1 second.
+        #
+        # THE CAP NEVER CHANGED; THE WORK DID. scripts/gh-token-wrapper.test.mjs
+        # went 87 tests -> 114 inside the sample window (PEN-5241, BLO-51471,
+        # PEN-5255, and last PEN-5355 at 5d5932ec, 2026-11-03T11:01:36Z). Read
+        # off the CI job logs, the suite's own duration_ms went 3.8s -> 57-59s
+        # and the merge-queue p95 went 29s -> 59s, i.e. 98% of its budget. 1m
+        # was correctly sized for the step that existed when it was written.
+        # Sampling across that boundary measures two different steps, so the
+        # figures below are the CURRENT suite only (head > 5d5932ec), n=276:
+        #   arc-merge-queue  n=122  p50 19s  p95 59s  p100 73s*  6 over (4.9%)
+        #   arc-light        n=154  p50 22s  p95 49s  p100 58s   0 over (0.0%)
+        #   * censored AT the bound -- the kill plus teardown. This sample
+        #     cannot bound p100 from above.
+        #
+        # Sized by the BLO-35615 rule. Unlike the brace-expansion step below,
+        # the primary branch is live here rather than floored, because this
+        # step really does overrun on CPU:
+        #   primary: ceil( W95 / (F * 60) ) = ceil( 95.3 / 12.6 ) = 8
+        #            W95 = 95.3 CPU-seconds, the max of n=8 off-runner
+        #                  invocations (user+sys), measured as #3389 measured
+        #                  its own.
+        #            F   = 0.21 cores, the arc-light supply floor this job's own
+        #                  cap is derived from -- the worse of its two pools.
+        #   floor:   ceil( 6 * T_best / 60 ) = ceil( 6 * 11 / 60 ) = 2
+        #            T_best = 11s, fastest run of the current suite, n=276.
+        #
+        # It is fork-bound, not compute-bound: 114 tests over 55 wrapper
+        # invocations, each forking a shell and a stub gh, and the user/sys
+        # split is sys-dominant (39.0s user / 56.4s sys) -- the fork/exec
+        # signature. One test re-runs the WHOLE suite as a nested `node --test`
+        # to prove hermeticity against inherited credential env vars, so every
+        # test added to that file is paid for twice here.
+        #
+        # Cross-check: 95.3 CPU-s is 26% of this job's own W95 of 364 CPU-s
+        # (see the job cap above), and 26% of the 29m job cap is 7.6m. The
+        # step-level and job-level derivations agree.
+        # Held at or above the floor by CONTENTION_SENSITIVE_STEPS in
+        # policy-node-test-timeouts.test.mjs.
+        timeout-minutes: 8
 
       - name: Test PR test-coverage gate
         if: ${{ !cancelled() }}
