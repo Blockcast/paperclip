@@ -333,6 +333,45 @@ async function pullRequestQueueState(owner, repo, number, request = githubReques
   return pullRequest;
 }
 
+const TIMELINE_PAGE_SIZE = 100;
+// Ceiling accepted: 10 pages = 1000 events. The timeline is OLDEST-first, so a
+// PR past this truncates the NEWEST events -- which is where the removal being
+// attributed lives. That direction is deliberate and matches the two ceilings
+// below: a missing removal reads as "no manual dequeue observed" and the notice
+// is POSTED, so this can only ever cost a false notice on an absurdly long
+// thread, never a suppressed genuine ejection. #3371 carries 39 events. Raise
+// it, or switch to Link-header walking (which needs `githubRequest` to surface
+// headers), if a PR thread ever approaches 1000.
+const TIMELINE_PAGE_CEILING = 10;
+
+/**
+ * The issue timeline, walked past the first page.
+ *
+ * PEN-5592 (Ally review, PR #3399): the single unpaginated read this replaces
+ * failed exactly where it mattered most. `removed_from_merge_queue` lands late
+ * on a long timeline, so on a repeatedly-held, long-lived PR -- the population
+ * a hold EXISTS for -- the removal fell on page 2, `dequeuedAt` read `null`,
+ * and the reporter went back to telling its reader to re-enqueue a held PR.
+ *
+ * Paged through the injected `request` seam rather than with `--paginate`-style
+ * Link walking, so the page boundary is observable from the tests without
+ * teaching the fake transport about response headers.
+ */
+async function readTimeline(owner, repo, number, request) {
+  const events = [];
+  for (let page = 1; page <= TIMELINE_PAGE_CEILING; page += 1) {
+    const batch = await request(
+      `/repos/${owner}/${repo}/issues/${number}/timeline?per_page=${TIMELINE_PAGE_SIZE}&page=${page}`,
+    );
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    events.push(...batch);
+    // A short page is the last page. Saves a request on the common single-page
+    // case and terminates without needing a total count.
+    if (batch.length < TIMELINE_PAGE_SIZE) break;
+  }
+  return events;
+}
+
 export async function reportMergeQueueFailure({
   repository,
   headBranch,
@@ -377,9 +416,7 @@ export async function reportMergeQueueFailure({
     // Same policy as the GraphQL read above: a timeline blip reddens the job.
     // Posting a wrong CAUSE is not the cheap direction here -- it is read by
     // bots, and on #3371 one acted on it.
-    const timeline = await request(
-      `/repos/${owner}/${repo}/issues/${number}/timeline?per_page=100`,
-    );
+    const timeline = await readTimeline(owner, repo, number, request);
     const manual = manualDequeueExplainingRun(timeline, { runUpdatedAt });
     if (manual) {
       // merge-queue-eviction-detector has already fired on this very removal

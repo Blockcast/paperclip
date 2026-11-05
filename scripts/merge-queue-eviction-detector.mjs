@@ -85,6 +85,42 @@ export function filterMergeGroupRunsForPr(runs, { base, prNumber }) {
 }
 
 /**
+ * The login of a timeline event's actor, in whichever of the two shapes the
+ * caller happens to hold, or `null` when no usable attribution is present.
+ *
+ * PEN-5592 (Ally review, PR #3399): this exists because the two callers of
+ * `selectLatestQueueAttemptWindow` did NOT hold the same shape, and the
+ * mismatch was silent and total.
+ *   - `ghTimeline` below flattens first, via `--jq '{..., actor: .actor.login}'`,
+ *     so it passes a STRING.
+ *   - `report-merge-queue-ejection.mjs` reads `GET /issues/{n}/timeline`
+ *     through `fetch` and passes the response through untouched. That endpoint
+ *     returns `actor` as an OBJECT (`{login, type, ...}`) -- verified live on
+ *     #3371, where all four merge-queue events carry `actor` of type object.
+ * The old inline `typeof e.actor === "string" ? e.actor : null` therefore read
+ * every REST-shaped actor as `null`, `isQueueInitiatedRemoval(null)` answered
+ * `true`, and the reporter posted the "job timeout ... re-enqueue the PR"
+ * notice exactly as it did before the guard existed.
+ *
+ * Normalizing HERE rather than at each call site is the structural half of the
+ * fix: this is the one chokepoint both callers already pass through, so a third
+ * caller cannot reintroduce the drift by forgetting to map. It is idempotent by
+ * construction -- a string passes through, an object is unwrapped -- so the
+ * flattened and raw shapes are interchangeable at every entry point.
+ *
+ * Blank and non-string logins collapse to `null`, which is the fail-TOWARD-
+ * reporting direction: no attribution means the caller falls back to its
+ * pre-attribution verdict rather than suppressing a genuine eviction.
+ *
+ * @param {string | { login?: unknown } | null | undefined} actor
+ * @returns {string | null}
+ */
+export function timelineActorLogin(actor) {
+  const login = typeof actor === "string" ? actor : actor?.login;
+  return typeof login === "string" && login.trim().length > 0 ? login : null;
+}
+
+/**
  * A PR can enter the merge queue more than once (e.g. a failed attempt gets
  * fixed and manually re-added). Ally review #1220: matching every historical
  * `merge_group` run for this PR number on this base -- rather than just the
@@ -113,7 +149,9 @@ export function filterMergeGroupRunsForPr(runs, { base, prNumber }) {
  * signals "enqueue found, no removal observed yet" so the caller can retry
  * instead of guessing.
  *
- * @param {Array<{ event: string, created_at: string, actor?: string | null }>} timelineEvents
+ * @param {Array<{ event: string, created_at: string, actor?: string | { login?: unknown } | null }>} timelineEvents
+ *   `actor` may arrive flattened (a string) or raw from the REST timeline
+ *   (an object); `timelineActorLogin` normalizes both. See PEN-5592.
  * @param {{ now: number }} opts
  * @returns {{ enqueuedAt: string, dequeuedAt: string | null, dequeuedBy: string | null } | null}
  *   `dequeuedBy` is the actor of the removal this window anchored to, and is
@@ -128,10 +166,12 @@ export function selectLatestQueueAttemptWindow(timelineEvents, { now }) {
     .map((e) => ({
       event: e.event,
       at: new Date(e.created_at).getTime(),
-      // PEN-3926: absent/non-string actor stays `null` so the classifier can
+      // PEN-3926: an unattributable actor stays `null` so the classifier can
       // tell "no attribution available" apart from a named actor and fall
-      // back to the pre-PEN-3926 verdict.
-      actor: typeof e.actor === "string" && e.actor.trim().length > 0 ? e.actor : null,
+      // back to the pre-PEN-3926 verdict. PEN-5592: the shape normalization
+      // lives in the shared helper so the flattened (`--jq`) and raw REST
+      // callers cannot drift apart again.
+      actor: timelineActorLogin(e.actor),
     }))
     .filter((e) => Number.isFinite(e.at))
     .sort((a, b) => a.at - b.at);
