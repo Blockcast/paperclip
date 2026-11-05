@@ -18,7 +18,8 @@ import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const ghFetchMock = vi.fn();
-vi.mock("../services/github-fetch.js", () => ({
+vi.mock("../services/github-fetch.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/github-fetch.js")>()),
   ghFetch: (...args: unknown[]) => ghFetchMock(...args),
   gitHubApiBase: () => "https://api.github.com",
 }));
