@@ -421,6 +421,92 @@ describe.skipIf(!support.supported)("postgres.js scope that outlives its connect
     expect(await within(outcome, 3_000)).toEqual({ value: "CONNECTION_CLOSED" });
   });
 
+  /**
+   * Queues a reserve() behind a busy connection, terminates that connection's
+   * backend, and checks the waiter is handed the reconnected connection.
+   */
+  async function reserveQueuedBehindTerminatedConnection(client: Sql) {
+    const [{ pid }] = await client<{ pid: number }[]>`select pg_backend_pid() as pid`;
+    const busy = within(client`select pg_sleep(${5})`, 5_000);
+    await sleep(50);
+    const reserving = within(client.reserve(), 5_000);
+    await sleep(50);
+    await admin`select pg_terminate_backend(${pid})`;
+
+    expect(await busy).toEqual({ error: "CONNECTION_CLOSED" });
+    const outcome = await reserving;
+    // Upstream rejected it only by accident, with the dead session's stashed 57P01.
+    expect(outcome).toHaveProperty("value");
+    const reserved = (outcome as { value: postgres.ReservedSql }).value;
+    expect(await within(reserved`select 7 as x`, 3_000)).toEqual({ value: [{ x: 7 }] });
+    reserved.release();
+    expect(await within(client`select 1 as x`, 3_000)).toEqual({ value: [{ x: 1 }] });
+  }
+
+  it("hands a reserve() queued behind a terminated connection the reconnected one", async () => {
+    await reserveQueuedBehindTerminatedConnection(sql);
+  });
+
+  it("hands a queued reserve() the reconnected connection without fetch_types too", async () => {
+    const raw = postgres(dbh.connectionString, { max: 1, fetch_types: false, onnotice: () => {} });
+    try {
+      await reserveQueuedBehindTerminatedConnection(raw);
+    } finally {
+      await raw.end({ timeout: 5 });
+    }
+  });
+
+  it("serves a cold reserve() without fetch_types", async () => {
+    // The handshake returned without calling onopen() for a reserve() trigger, so
+    // with no type fetch to finish the startup the connection sat in `connecting`.
+    const raw = postgres(dbh.connectionString, { max: 1, fetch_types: false, onnotice: () => {} });
+    try {
+      const outcome = await within(raw.reserve(), 3_000);
+      expect(outcome).toHaveProperty("value");
+      (outcome as { value: postgres.ReservedSql }).value.release();
+      expect(await within(raw`select 1 as x`, 3_000)).toEqual({ value: [{ x: 1 }] });
+    } finally {
+      await raw.end({ timeout: 5 });
+    }
+  });
+
+  it("does not hand a later connection to a reserve() that already failed to connect", async () => {
+    // A queued reserve() waiter now stays in the pool's queue until served, so
+    // one rejected meanwhile must leave it; otherwise the next reconnect is
+    // handed to the dead waiter and the slot is stranded.
+    const target = new URL(dbh.connectionString);
+    const sockets = new Set<net.Socket>();
+    let swallow = true;
+    const proxy = net.createServer((client) => {
+      sockets.add(client);
+      client.on("error", () => {});
+      client.on("close", () => sockets.delete(client));
+      if (swallow) {
+        // Accept the first connection and never answer, so the driver's connect times out.
+        swallow = false;
+        return;
+      }
+      const upstream = net.connect(Number(target.port), target.hostname);
+      upstream.on("error", () => {});
+      client.pipe(upstream);
+      upstream.pipe(client);
+      client.on("close", () => upstream.destroy());
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const viaProxy = new URL(dbh.connectionString);
+    viaProxy.hostname = "127.0.0.1";
+    viaProxy.port = String((proxy.address() as net.AddressInfo).port);
+    const proxied = postgres(viaProxy.toString(), { max: 1, connect_timeout: 1, onnotice: () => {} });
+    try {
+      expect(await within(proxied.reserve(), 5_000)).toEqual({ error: "CONNECT_TIMEOUT" });
+      expect(await within(proxied`select 1 as x`, 5_000)).toEqual({ value: [{ x: 1 }] });
+    } finally {
+      await proxied.end({ timeout: 1 });
+      for (const socket of sockets) socket.destroy();
+      proxy.close();
+    }
+  });
+
   async function waitForBackendGone(pid: number) {
     for (let i = 0; i < 100; i++) {
       const [{ alive }] = await admin<{ alive: boolean }[]>`
