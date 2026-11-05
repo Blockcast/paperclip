@@ -6,8 +6,9 @@ took the measurement that §7.1 of
 makes its residual acceptance conditional on, and got **zero** — in **one pod**, on one image, for
 one agent's workload. This document widens that population to **six windows across four agents and
 five pods** (§1 is this record's own; §1.1 carries the Devops, UX Designer and Engineer rows; §1.2 is
-the one that fired), and it exists because §7.2 trigger 4 has no detector and cannot have one: it has
-only this measurement, and a measurement observes nothing between runs.
+the one that fired), plus a seventh in **§1.3** — a re-measurement on a *changed* surface, which
+§1.1 records must not be pooled with the other six. It exists because §7.2 trigger 4 has no detector
+and cannot have one: it has only this measurement, and a measurement observes nothing between runs.
 
 # ⛔⛔ RESULT: §7.2 TRIGGER 4 HAS FIRED. THE §7.1 RESIDUAL ACCEPTANCE ENDS HERE.
 
@@ -289,9 +290,12 @@ quote this as the class shrinking.**
 
 - **`19` indeterminate samples.** The instrument scores a sample `indeterminate` when argv was
   unreadable *and* no other wrapped-arm fired — precisely the samples it would otherwise have called
-  unwrapped, which it refuses to score so it cannot manufacture findings. So **26 is the confirmed
-  floor; the ceiling consistent with this data is 45.** **6 of those 19 were `/usr/lib/git-core/git`**
-  — the **PEN-4998** class, not this one; the other 13 were `/usr/bin/git`.
+  unwrapped, which it refuses to score so it cannot manufacture findings. **6 of those 19 were
+  `/usr/lib/git-core/git`** — the **PEN-4998** class, not this one; the other **13** were
+  `/usr/bin/git`. So **26 is the confirmed floor, and the ceiling for *this* class is `26 + 13` =
+  39.** The all-class ceiling is `26 + 19` = **45**, and it must not be quoted as this class's — the
+  two differ by exactly the PEN-4998 samples. ⚠ This record's governing rule is that a number never
+  travels without its population **and its class**; an unlabelled `45` is that rule breached here.
 - **Calibration, both spellings (§2.1's correction applied).** Controls behaved: positive **6/6
   classified wrapped**, negative **231/231 classified unwrapped**.
 
@@ -571,7 +575,8 @@ So the honest form of the argument is **empirical, not structural**:
 > several at once.
 
 Anyone citing either document fleet-wide must cite that sample size. The agent-composed half remains
-per-pod and is now measured in **six** windows across **four agents** (§1.1).
+per-pod and is now measured in **six windows on prior surfaces** across **four agents** (§1.1), plus
+**one changed-surface re-measurement** (§1.3) that is not pooled with them.
 
 ⛔ **This paragraph predicted the finding, and the prediction held.** When this record was first
 drafted it said the uncovered axis was **workload** — "the one most likely to vary, since what
@@ -735,9 +740,10 @@ and obtaining it from inside an agent pod needs the hardening §8 forbids relaxi
   reported bare or as a class closure. A behavioural control was considered and **refused**.)*
 - **Workload, not pod count, was the axis that mattered — and it is still barely sampled.** Five pods
   and four agents found nothing until the one window that ran `pnpm test`. **≈ 61 minutes of
-  observation in total**, and a single 24-second burst carried 26 of the 28. Widening needs no new
-  platform capability, no `kubectl exec` and no tracer — only more agents running the script over
-  **more kinds of work**. Sampling more pods doing the same work would have found nothing, forever.
+  observation across the six comparable windows** (≈ 89 minutes including §1.3's changed-surface
+  re-measurement, which §1.1 records must not be pooled with them), and a single 24-second burst
+  carried 26 of the 28. Widening needs no new platform capability, no `kubectl exec` and no tracer —
+  only more agents running the script over **more kinds of work**. Sampling more pods doing the same work would have found nothing, forever.
 - **⛔ The instrument's calibration is unresolved, and it is the most load-bearing open item here.**
   §2.1 measures the calibration copy as overstating catch against `/usr/bin/git` itself. Resolving it
   means re-basing every row together against a directly calibrated rate; nobody has. Until then the
