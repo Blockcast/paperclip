@@ -458,6 +458,7 @@ describe("per-fire cap", () => {
         notify: new Set(),
         unreadable: [],
         starved,
+        queued: [],
       }),
     );
     assert.deepEqual(
@@ -577,6 +578,7 @@ describe("apply order (PEN-5503)", () => {
                 rotted: [],
                 stranded: [],
                 starved: [],
+                queued: [],
                 fetch: () => rows.map(({ number }) => ({ number })),
                 classify: () => rows,
                 applyOne: (_repo, row) => {
@@ -646,6 +648,7 @@ describe("apply order (PEN-5503)", () => {
           rotted: [],
           stranded: [],
           starved: [],
+          queued: [],
           fetch: () => rows.map(({ number }) => ({ number })),
           classify: () => rows,
           applyOne: (_repo, row) => {
@@ -1108,6 +1111,7 @@ describe("notify-only repos (PEN-5430)", () => {
           notify,
           unreadable: [],
           starved: [],
+          queued: [],
         }),
       ),
     );
@@ -1141,6 +1145,7 @@ describe("notify-only repos (PEN-5430)", () => {
           run: spy,
           unreadable: [],
           starved: [],
+          queued: [],
         }),
       ),
     );
@@ -1169,6 +1174,7 @@ describe("notify-only repos (PEN-5430)", () => {
             rotted: [],
             stranded: [],
             starved: [],
+            queued: [],
             fetch: landable,
             applyOne: () => null,
             state: () => {},
@@ -1266,6 +1272,7 @@ describe("notify-only repos (PEN-5430)", () => {
           rotted: [],
           stranded: [],
           starved: [],
+          queued: [],
           landable: false,
           fetch: () => [pr({ number: 600 })],
           classify: () => [{ number: 600, action: "enqueue", reason: "mergestate:CLEAN", headSha: HEAD }],
@@ -1371,6 +1378,7 @@ describe("notify-only repos (PEN-5430)", () => {
             rotted: [],
             stranded: [],
             starved: [],
+            queued: [],
             landable: landableRepo,
             fetch: many,
             applyOne: () => null,
@@ -1408,6 +1416,7 @@ describe("notify-only repos (PEN-5430)", () => {
             stranded: [],
             unreadable: [],
             starved: [],
+            queued: [],
             run: (bag) =>
               runRepo({
                 ...bag,
@@ -1453,6 +1462,7 @@ describe("notify-only repos (PEN-5430)", () => {
             rotted: [],
             stranded: [],
             starved: [],
+            queued: [],
             landable: landableRepo,
             fetch: held,
             applyOne: () => null,
@@ -2863,6 +2873,7 @@ describe("runRepo apply wiring (PEN-5263)", () => {
           rotted: [],
           stranded,
           starved,
+          queued: [],
           fetch: () => prs,
           classify: () => rows,
           applyOne: (_repo, row) => (applied.push(row.number), "merge requested"),
@@ -3349,6 +3360,7 @@ describe("rate-limit retry in gh() (BLO-51665)", () => {
           rotted: [],
           stranded: [],
           starved: [],
+          queued: [],
           fetch: () => { throw refused(); },
         }),
       );
@@ -3634,6 +3646,7 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
           notify: new Set(),
           unreadable,
           starved: [],
+          queued: [],
         }),
       ),
     );
@@ -3664,6 +3677,7 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
                 notify: new Set(),
                 unreadable,
                 starved: [],
+                queued: [],
               }),
             ),
           ),
@@ -3694,6 +3708,7 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
           notify: new Set(),
           unreadable,
           starved: [],
+          queued: [],
         }),
       ),
     );
@@ -3738,6 +3753,7 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
           notify: new Set(),
           unreadable,
           starved,
+          queued: [],
         }),
       ),
     );
@@ -3795,6 +3811,7 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
           notify: new Set(),
           unreadable,
           starved,
+          queued: [],
         }),
       ),
     );
@@ -4103,6 +4120,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
             rotted: [],
             stranded,
             starved,
+            queued: [],
             fetch: () => [capPr(3306, OLD)],
             classify: () => [capRow(3306)],
             applyOne: () => "merge requested",
@@ -4154,6 +4172,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
             rotted: [],
             stranded: [],
             starved: [],
+            queued: [],
             fecth: () => {
               throw new Error("the real fetchOpenPrs must never be reached here");
             },
@@ -4209,6 +4228,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
           rotted: [],
           stranded: [],
           starved: [],
+          queued: [],
           fetch: () => (seen.push("injected"), []),
           classify: () => [],
           state: () => {},
@@ -4235,6 +4255,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
             stranded: [],
             unreadable: [],
             starved: [],
+            queued: [],
             notifiy: new Set(),
           }),
         (error) => error instanceof WiringError && /unknown option `notifiy`/.test(error.message),
@@ -4247,6 +4268,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
           stranded: [],
           unreadable: [],
           starved: [],
+          queued: [],
         }),
       );
     });
@@ -4282,6 +4304,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
                 stranded: [],
                 unreadable,
                 starved: [],
+                queued: [],
                 // A seam standing in for `runRepo` that fails the way a
                 // mis-wired `runRepo` fails.
                 run: () => {
@@ -4318,6 +4341,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
             stranded: [],
             unreadable,
             starved: [],
+            queued: [],
             run: ({ repo }) => {
               if (repo === "a/broken") throw new TypeError("rows.map is not a function");
               swept.push(repo);
@@ -4373,17 +4397,17 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442 + 
   // The cohorts collected BY REFERENCE, which are the keys whose absence is
   // silent. `run` and `notify` are seams and `apply`/`settleMinutes` are
   // ordinary inputs; none of them read as health when dropped.
-  const COHORT_KEYS = ["rotted", "stranded", "unreadable", "starved"];
+  const COHORT_KEYS = ["rotted", "stranded", "unreadable", "starved", "queued"];
   const UNMEASURED_CALL = /reportUnmeasured\(\s*sweepError,\s*stranded,\s*\{([^}]*)\}\s*\)/;
   const argsOf = (re, src) => {
     const match = src.match(re);
     return match ? match[1].split(",").map((arg) => arg.trim()) : null;
   };
 
-  it("hands `alarmExitCode` all THREE cohorts, in order", () => {
+  it("hands `alarmExitCode` all FOUR cohorts, in order", () => {
     assert.deepEqual(
       argsOf(EXIT_CALL, SOURCE),
-      ["stranded", "unreadable", "starved"],
+      ["stranded", "unreadable", "starved", "queued"],
       "a cohort dropped here is an alarm arm that can never fire again",
     );
   });
@@ -4414,6 +4438,7 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442 + 
     assert.ok(keys, "main still reports the unmeasured run");
     assert.ok(keys.includes("alarm"), "`alarm` still gates the cohort report");
     assert.ok(keys.includes("starved"), "`starved` is reported, not silently dropped");
+    assert.ok(keys.includes("queued"), "`queued` is reported, not silently dropped");
   });
 
   it("⛔ the probes are LIVE — each one fails against a source missing its term", () => {
@@ -4421,19 +4446,19 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442 + 
     // matching anything would leave both tests above passing forever — the
     // same silence-means-health shape the whole row exists to remove.
     const dropped = SOURCE.replace(
-      "alarmExitCode(stranded, unreadable, starved)",
+      "alarmExitCode(stranded, unreadable, starved, queued)",
       "alarmExitCode(stranded, unreadable)",
     );
     assert.notEqual(dropped, SOURCE, "control: the mutation actually applied");
     assert.deepEqual(
       argsOf(EXIT_CALL, dropped),
       ["stranded", "unreadable"],
-      "the probe SEES a dropped third term rather than matching nothing",
+      "the probe SEES dropped terms rather than matching nothing",
     );
 
     const unthreaded = SOURCE.replace(
-      "        unreadable,\n        starved,\n      }),",
-      "        unreadable,\n      }),",
+      "        unreadable,\n        starved,\n        queued,\n      }),",
+      "        unreadable,\n        queued,\n      }),",
     );
     assert.notEqual(unthreaded, SOURCE, "control: the mutation actually applied");
     assert.ok(
@@ -4456,7 +4481,7 @@ describe("main's alarm wiring is pinned at the CALL SITE (PEN-5391 + PEN-5442 + 
     );
 
     const unreported = SOURCE.replace(
-      "reportUnmeasured(sweepError, stranded, { alarm, starved });",
+      "reportUnmeasured(sweepError, stranded, { alarm, starved, queued });",
       "reportUnmeasured(sweepError, stranded, { alarm });",
     );
     assert.notEqual(unreported, SOURCE, "control: the mutation actually applied");
@@ -4894,5 +4919,174 @@ describe("the stale-queued comment never prescribes forfeiting the queue positio
       !calls.some((a) => a[0] === "pr" && a[1] === "merge"),
       "stale-queued must never issue a merge/disable-auto call",
     );
+  });
+});
+
+/**
+ * PEN-5536. `stale-queued` promoted from "detected, commented once, alarmed on
+ * by nobody" to its own alarm cohort.
+ *
+ * The predicate itself is NOT re-tested here — it belongs to PEN-5279 and is
+ * covered above (position 1 strictly, a non-numeric position refused, the
+ * 13h clock). What is new is the COLLECTION and the ALARM, so that is what
+ * these pin, plus the two negatives proving the cohort inherits the
+ * predicate's conservatism instead of re-deriving a looser one.
+ */
+describe("a wedged front-of-queue entry is its own alarm cohort (PEN-5536)", () => {
+  const NOW_ISO = "2026-09-13T12:00:00Z";
+  const atNow = (fn) => {
+    const real = Date.now;
+    Date.now = () => Date.parse(NOW_ISO);
+    try {
+      return fn();
+    } finally {
+      Date.now = real;
+    }
+  };
+  const hush = (fn) => {
+    const log = console.log;
+    const err = console.error;
+    const lines = [];
+    console.log = (line) => lines.push(String(line));
+    console.error = (line) => lines.push(String(line));
+    try {
+      return { value: fn(), printed: lines.join("\n") };
+    } finally {
+      console.log = log;
+      console.error = err;
+    }
+  };
+
+  // Drives the REAL classifier, through the shared `pr()` fixture so the early
+  // rules (author, labels, draft, reviews) are satisfied the same way every
+  // other suite satisfies them. A stubbed `classify` would let this whole
+  // suite pass over a predicate that had stopped producing `stale-queued`.
+  const queuedPr = (number, { position, enqueuedAt }) =>
+    pr({
+      number,
+      autoMergeRequest: null,
+      mergeQueueEntry: { position, state: "AWAITING_CHECKS", enqueuedAt },
+    });
+  const WEDGED = { position: 1, enqueuedAt: "2026-09-12T22:00:00Z" };
+
+  const sweep = (prs, { landable = true } = {}) => {
+    const queued = [];
+    hush(() =>
+      atNow(() =>
+        runRepo({
+          repo: "a/one",
+          apply: false,
+          settleMinutes: 0,
+          spent: 0,
+          rotted: [],
+          stranded: [],
+          starved: [],
+          queued,
+          fetch: () => prs,
+          landable,
+          state: () => {},
+        }),
+      ),
+    );
+    return queued;
+  };
+
+  it("collects a head-of-queue entry past the threshold", () => {
+    assert.deepEqual(sweep([queuedPr(3389, WEDGED)]), ["a/one#3389"]);
+  });
+
+  it("⛔ spends the alarm code, which is the whole point of the promotion", () => {
+    // Before this cohort the same finding produced one comment, once, from an
+    // applying fire on the `45 */6` cadence — up to ~6h after the hourly
+    // detector had already seen it — and `alarmExitCode` never heard about it.
+    assert.equal(alarmExitCode([], [], [], ["a/one#3389"]), 1);
+    assert.equal(alarmExitCode([], [], []), 0, "control: the term still defaults quiet");
+    assert.equal(
+      alarmExitCode([], ["a/broken (HTTP 502)"], [], ["a/one#3389"]),
+      1,
+      "a measured alarm outranks an unreadable repo, as for the sibling cohorts",
+    );
+    assert.equal(alarmExitCode([], [], [], []), 0, "and an empty cohort is not an alarm");
+  });
+
+  it("names the cohort in its own ALARM block, not inside another one", () => {
+    const SOURCE = readFileSync(new URL("./land-clean-prs.mjs", import.meta.url), "utf8");
+    assert.match(SOURCE, /ALARM: \$\{queued\.length\} PR\(s\) have been at the FRONT/);
+    assert.match(SOURCE, /if \(alarm && queued\.length > 0\) \{/);
+  });
+
+  it("stays quiet for a healthy queued PR that is NOT at the front", () => {
+    // Depth is not wedging. `enqueuedAt` dates entry into the queue, not time
+    // stuck, so a deep entry crosses 13h while progressing perfectly well —
+    // and the obvious response to a staleness report, dequeue and re-enqueue,
+    // forfeits the position it has already waited for.
+    for (const position of [2, 7, 40]) {
+      assert.deepEqual(
+        sweep([queuedPr(3389, { position, enqueuedAt: WEDGED.enqueuedAt })]),
+        [],
+        `position ${position} must not read as the front`,
+      );
+    }
+  });
+
+  it("does not manufacture a finding from an absent or non-numeric position", () => {
+    // Unread must not become a finding. `"1"` is the one that matters: it is
+    // the shape a JSON field drifts into, and it LOOKS like the front.
+    for (const position of [null, undefined, "1"]) {
+      assert.deepEqual(
+        sweep([queuedPr(3389, { position, enqueuedAt: WEDGED.enqueuedAt })]),
+        [],
+        `position ${JSON.stringify(position)} must not read as the front`,
+      );
+    }
+  });
+
+  it("stays quiet for a FRESH head-of-queue entry", () => {
+    assert.deepEqual(sweep([queuedPr(3389, { position: 1, enqueuedAt: NOW_ISO })]), []);
+  });
+
+  it("⛔ MUTATION PAIR: alarms in a land repo, silent in a notify-only one", () => {
+    // This is the pair, and neither half means anything alone. The first
+    // assertion alone stays green if the `landable` gate is deleted; the
+    // second alone stays green if the cohort stops collecting entirely. Only
+    // together do they pin that the gate exists AND that it is the gate doing
+    // the work rather than an absent detector.
+    //
+    // It matters more here than for the sibling cohorts because this is the
+    // file's FIRST land-scoping that is a visible check. `stranded` and
+    // `starved` are scoped as CONSEQUENCES — the first by
+    // `demoteMergeActions`' rename defeating its `enqueue` predicate, the
+    // second by `maxEnqueues: Infinity` making a `cap:` row unreachable — so
+    // deleting their scoping means deleting load-bearing machinery and
+    // everything goes red. Deleting one `if (landable)` costs nothing without
+    // this test.
+    const prs = [queuedPr(3389, WEDGED)];
+    assert.deepEqual(sweep(prs, { landable: true }), ["a/one#3389"], "land repo: alarms");
+    assert.deepEqual(sweep(prs, { landable: false }), [], "notify-only repo: silent");
+  });
+
+  it("the notify-only repo still PRINTS the finding it does not alarm on", () => {
+    // Not alarming on a guest repo's wedged queue is the decision; refusing to
+    // report it is not. This is why the gate is an `if` at the collection site
+    // rather than an entry in MERGE_MUTATING_ACTIONS, which would rename the
+    // row to `notify-only` and erase it from the receipt too.
+    const { printed } = hush(() =>
+      atNow(() =>
+        runRepo({
+          repo: "a/one",
+          apply: false,
+          settleMinutes: 0,
+          spent: 0,
+          rotted: [],
+          stranded: [],
+          starved: [],
+          queued: [],
+          fetch: () => [queuedPr(3389, WEDGED)],
+          landable: false,
+          state: () => {},
+        }),
+      ),
+    );
+    assert.match(printed, /stale-queued/, "the receipt still names it");
   });
 });
