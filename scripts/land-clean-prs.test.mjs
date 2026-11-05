@@ -4272,6 +4272,35 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
         }),
       );
     });
+
+    it("refuses a present-but-unusable cohort at the bag boundary, not at its first `.push`", () => {
+      // `key in bag` ADMITS `{ queued: undefined }`. The fault then surfaces at
+      // the first `queued.push`, as a BARE TypeError — and `repoRunner`'s catch
+      // reads a bare TypeError as "this repo could not be listed" and files it
+      // under `unreadable`. That is precisely the misfiling this conversion
+      // exists to remove, so the cohort's SHAPE is checked at the boundary,
+      // where the fault can still be named. Reverting the check to `key in bag`
+      // fails every row below. (Ally review, PR#3415.)
+      for (const bad of [undefined, null, {}, 0, "[]"]) {
+        assert.throws(
+          () =>
+            repoRunner({
+              apply: true,
+              settleMinutes: 0,
+              rotted: [],
+              stranded: [],
+              unreadable: [],
+              starved: [],
+              queued: bad,
+            }),
+          (error) =>
+            error instanceof WiringError &&
+            /missing required option `queued`/.test(error.message) &&
+            /must be an array/.test(error.message),
+          `a \`queued\` of ${JSON.stringify(bad) ?? "undefined"} must be refused by name`,
+        );
+      }
+    });
   });
 
   describe("⛔ a wiring fault is never recorded as a repo-readability fact (PEN-5536)", () => {
