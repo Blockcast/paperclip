@@ -10,6 +10,7 @@ import {
   brokerChildEnv,
   createPublishBrokerServer,
   formatBrokerOutcomeLine,
+  toSingleLogLine,
   MAX_OUTCOME_DETAIL_CHARS,
   OUTCOME_DETAIL_TRUNCATION_MARKER,
   prepareBrokeredInvocation,
@@ -447,6 +448,86 @@ describe("the broker's own stderr records how every connection ended", () => {
     ]);
     // Two accepts, two outcomes: the partition balances.
     expect(logged.filter((l) => /: gh in \//.test(l))).toHaveLength(2);
+  });
+
+  describe("an agent cannot forge a second log line", () => {
+    // The accept line interpolates `cwd`, which the agent chose and which may
+    // legitimately contain a newline. Once outcome lines became the durable
+    // record of publish outcomes, an injected line was a forged OUTCOME --
+    // from exactly the principal this boundary exists to constrain.
+    const forged = "paperclip-github-broker: exit git code=0";
+
+    it("collapses CR, LF and the unicode line separators", () => {
+      expect(toSingleLogLine(`a\nb`)).toBe("a b");
+      expect(toSingleLogLine(`a\r\nb`)).toBe("a b");
+      expect(toSingleLogLine(`a\rb`)).toBe("a b");
+      expect(toSingleLogLine(`a\u2028b`)).toBe("a b");
+      expect(toSingleLogLine(`a\u2029b`)).toBe("a b");
+      // A run collapses to ONE space, so a flood cannot pad a line either.
+      expect(toSingleLogLine(`a\n\n\r\nb`)).toBe("a b");
+    });
+
+    it("leaves a line with no terminator untouched", () => {
+      const clean = "paperclip-github-broker: git in /paperclip/work/repo";
+      expect(toSingleLogLine(clean)).toBe(clean);
+    });
+
+    it("emits ONE physical line per log call when cwd carries a forged outcome", async () => {
+      // A real directory, really named with a newline. The policy layer
+      // resolves and confines it; it is INSIDE the workspace, so it is
+      // accepted -- which is the point. The guard is not the confinement.
+      const evil = path.join(workspaceRoot, `repo\n${forged}`);
+      mkdirSync(evil, { recursive: true });
+      writeFakeTool("git", "exit 0");
+      const socketPath = await start();
+      const stdin = new PassThrough();
+      stdin.end();
+      await runPublishBrokerClient({
+        socketPath,
+        tool: "git",
+        argv: ["push"],
+        cwd: evil,
+        stdin,
+        stdout: collect([]),
+        stderr: collect([]),
+      }).catch(() => undefined);
+
+      expect(logged.length).toBeGreaterThan(0);
+      for (const line of logged) {
+        expect(line.includes("\n")).toBe(false);
+        expect(line.includes("\r")).toBe(false);
+      }
+      // Without the guard the accept line would have split, and the second
+      // half would be an outcome line nobody wrote. Count what a matcher
+      // anchored at `^` would count: exactly one outcome, the real one.
+      const asLoki = logged.flatMap((line) => line.split(/\r?\n/));
+      const forgedOutcomes = asLoki.filter((line) => line === forged);
+      expect(forgedOutcomes).toHaveLength(0);
+      expect(outcomes()).toHaveLength(1);
+    });
+
+    it("applies the guard to a caller-supplied log, not only the default", async () => {
+      // The guard sits where `log` is built, so a caller's own function is
+      // wrapped too. If it ever moved to the call sites, this fails.
+      const seen: string[] = [];
+      const evil = path.join(workspaceRoot, `other\n${forged}`);
+      mkdirSync(evil, { recursive: true });
+      writeFakeTool("git", "exit 0");
+      const socketPath = await start((message) => void seen.push(message));
+      const stdin = new PassThrough();
+      stdin.end();
+      await runPublishBrokerClient({
+        socketPath,
+        tool: "git",
+        argv: ["push"],
+        cwd: evil,
+        stdin,
+        stdout: collect([]),
+        stderr: collect([]),
+      }).catch(() => undefined);
+      expect(seen.length).toBeGreaterThan(0);
+      for (const line of seen) expect(line.includes("\n")).toBe(false);
+    });
   });
 
   describe("a log that throws costs the connection nothing and the sidecar nothing", () => {

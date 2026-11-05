@@ -537,30 +537,44 @@ window, not reconstructed from the cluster afterwards.
 `{namespace="paperclip",container="github-publish-broker"}` separating (a) startup failures,
 (b) policy refusals, (c) child non-zero exits. Without it stage 1 is unfalsifiable — a silent broker
 and a broker nobody asked to publish look identical. Shipped by PEN-5181 as
-`scripts/github-publish-broker-soak-queries.mjs` and `runbooks/github-publish-broker-soak-queries.md`;
-that tool prints `NOT OBSERVABLE` rather than `0` for any category the broker cannot yet emit, which
-is the right stopgap and is why a stage-1 reading of it is honest even where this section was not.
+`scripts/github-publish-broker-soak-queries.mjs` and `runbooks/github-publish-broker-soak-queries.md`.
+Every one of those categories is a real count as of PEN-5185 item 6; the tool's `NOT OBSERVABLE`
+machinery is retained for whatever goes dark next, so no category can ever report a `0` it has not
+measured.
 
-⛔ **Stage 1 still confirms its own observations agent-side.** PEN-5185 lands *between stage 1 and
-stage 2*, deliberately: changing the logging of the component under test days before its first
-real-traffic soak would mean the thing soaked is not the thing reviewed, and §7 is explicit that
-stage 0 carries no PR merges. So §7's observations (b) a real `git push`, (c) a real non-push `gh`
-and (d) an MCP tool call are confirmed from the run log and from the PR existing — not from the
-broker container. §5.2 already predicts that asymmetry for `gh` and MCP. From stage 2 on, where the
-population is a whole company and confirming every publish outcome agent-side stops being
-affordable, the broker's own logs carry it.
+⛔ **Stage 1 still confirms its own observations agent-side.** §7's observations (b) a real
+`git push`, (c) a real non-push `gh` and (d) an MCP tool call are confirmed from the run log and
+from the PR existing — not from the broker container. §5.2 already predicts that asymmetry for `gh`
+and MCP. This remains the instruction for stage 1 regardless of the sequencing outcome recorded
+below: it is cheap, it is independent of the broker's own telemetry, and a soak that relies on the
+component under test to report on itself is weaker evidence than one that does not.
 
-**The window is a predicate, not a date** (Security, under §11.3): *after stage-1 exit is declared,
-before stage-2 start*. It moves when stage 1 moves — §11.3 re-set stages 2 and 3 as `stage-1
-exit + 1 working day` for exactly this reason, and a fixed date here would repeat the mistake one
-level down. In the earliest case that window is a **single working day**, so the review is done
-*during* stage 1 and only the merge is held.
+### ⚠ The PEN-5185 sequencing hold did not hold. Recorded because the plan asserted otherwise
 
-⛔ **Decided fallback, recorded now rather than settled under time pressure:** if this change is not
-ready to land when stage 2 would otherwise start, **stage 2 starts on time** and the change slides
-to the stage-2 → stage-3 boundary. It is not landed mid-stage, and no stage is delayed to fit it.
-The soak is the only part of this plan that produces evidence (§11.3); an observability improvement
-must not compress it.
+This section previously read *"PEN-5185 lands between stage 1 and stage 2, deliberately"*, as a
+statement of fact. **It did not.** [#3209](https://github.com/Blockcast/paperclip/pull/3209) was
+merged to `master` on **2026-11-05 08:32:48Z**, by a human maintainer, before stage 1 had started
+(earliest start 2026-11-06). The `do-not-merge` label that held it was removed in the same action.
+
+The window was Security's call under §11.3 — *after stage-1 exit is declared, before stage-2
+start*, a predicate rather than a date — and the recorded fallback was that if the change were not
+ready when stage 2 would otherwise start, **stage 2 starts on time** and the change slides to the
+stage-2 → stage-3 boundary, rather than being landed mid-stage or delaying a stage. That reasoning
+is preserved here because it was sound and because it is the standard the next such hold should be
+judged against; it is **not** restated as a prediction, because the event it predicted has already
+gone the other way.
+
+**What a reader must take from this, which is the operative part:**
+
+- **Stage 1 soaks the post-PEN-5185 broker.** The thing soaked and the thing reviewed are the same
+  build — that much is now true by accident rather than by design, and it is the benign direction.
+  What is lost is the clean stage-1 baseline the hold was meant to buy: there is no run of the
+  pre-change broker under real traffic to measure the change against.
+- ⛔ **A merge hold expressed as a label or a PR title is advisory against a human.** Both were in
+  place on #3209 and neither held. Anything that must not land is held by something that fails
+  closed, or it is not held. See [PEN-5192](https://paperclip.blockcast.net/PEN/issues/PEN-5192).
+- **The §11.3 sequencing authority is unchanged.** This paragraph records an outcome; it does not
+  re-decide the rule, and nobody should read "a hold was overridden once" as "holds are optional".
 
 ## 6. Rollback — who decides, and on what evidence
 

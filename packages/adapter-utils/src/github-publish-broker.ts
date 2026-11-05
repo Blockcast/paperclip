@@ -290,6 +290,35 @@ export type PublishBrokerOutcome =
   | "refused";
 
 /**
+ * Force one logical broker log line to occupy exactly one PHYSICAL line.
+ *
+ * ⛔ This is a log-forgery guard, not formatting. Several lines the broker
+ * writes interpolate agent-supplied text — most importantly the accept line's
+ * `cwd`, which is a real path the agent chose and which may legitimately
+ * contain a newline, because a directory name may. Nothing between there and
+ * `process.stderr.write` strips CR/LF, so an agent that creates
+ * `…/work/x\npaperclip-github-broker: exit git code=0` and publishes from it
+ * emits a SECOND line into `container="github-publish-broker"` that is
+ * byte-identical to one the broker wrote.
+ *
+ * That was a bounded nuisance while these lines were a dashboard. It stopped
+ * being bounded when PEN-5185 made them the durable record of publish
+ * OUTCOMES: the principal who can forge them is exactly the one this boundary
+ * exists to constrain, and Loki outlives the pod's `ttlSecondsAfterFinished:
+ * 300`, so a forged "exit 0" is what a later reader finds instead of the real
+ * outcome. `runbooks/github-publish-broker-soak-queries.md` names this and
+ * requires the guard to land WITH the outcome logging rather than after it.
+ *
+ * Applied once, where `log` is built, rather than at each call site: a guard
+ * every caller has to remember is one a new call site will omit. U+2028 and
+ * U+2029 are included because they terminate lines for some readers and not
+ * others, and a disagreement about where a line ends is the whole primitive.
+ */
+export function toSingleLogLine(message: string): string {
+  return String(message).replace(/[\r\n\u2028\u2029]+/g, " ");
+}
+
+/**
  * The one line the broker writes about how a connection ended.
  *
  * ⛔ **It carries the exit code and the tool name. It never carries the child's
@@ -385,7 +414,11 @@ export function createPublishBrokerServer(options: PublishBrokerServerOptions): 
   const env = options.env ?? process.env;
   const wrapperDir = options.wrapperDir ?? IMAGE_WRAPPER_DIR;
   const spawnChild = options.spawnChild ?? spawn;
-  const log = options.log ?? ((message: string) => process.stderr.write(`${message}\n`));
+  const rawLog = options.log ?? ((message: string) => process.stderr.write(`${message}\n`));
+  // Every line the broker writes passes through here, including a
+  // caller-supplied `log`, so the one-physical-line property holds by
+  // construction rather than by each call site remembering it.
+  const log = (message: string) => rawLog(toSingleLogLine(message));
 
   const privateDir = options.privateDir ?? BROKER_PRIVATE_DIR;
   const server = net.createServer((socket) => {
