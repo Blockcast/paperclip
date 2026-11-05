@@ -269,7 +269,8 @@ where it is now.
 
 **Predicate — what is being counted (settled 2026-10-29 by the CTO; D-1 on
 [PEN-4989](https://paperclip.blockcast.net/PEN/issues/PEN-4989), recorded in
-`PEN-4989-absolute-path-git-population-widening.md`, *lands in #3102*).** Throughout §7.1, §7.2
+`PEN-4989-absolute-path-git-population-widening.md`, now on `master`: #3102 merged
+2026-11-05).** Throughout §7.1, §7.2
 trigger 4 and §8 the thing counted is an **unwrapped `git`**: an invocation that **reached a real
 `git` binary without transiting the wrapper**. That is §7.2 trigger 4's own inline wording — *"any
 invocation **reaching** `/usr/bin/git` that did not come through the wrapper"* — and **it governs**.
@@ -428,8 +429,9 @@ So the assumption is tested in six windows across four agents, five pods and fou
 is not a fleet census — and it **failed** in the one window that ran a build/test workload. Re-take it when
 the **egress-relevant surface** changes — the wrapper, the runtime it `exec`s, the credential helper,
 **the set of real git binaries**, and the PATH ordering. "Whenever the agent image changes" is not an operable
-trigger at ≈15 changes a day; `scripts/absolute-path-git-fingerprint.mjs` *(lands in #3102)* computes the narrower
-surface hash so staleness is a comparison rather than a judgement.
+trigger at ≈15 changes a day; `scripts/absolute-path-git-fingerprint.mjs` — on `master` since
+#3102 merged 2026-11-05 — computes the narrower surface hash so staleness is a comparison rather
+than a judgement.
 
 One finding is worth more than the count itself: **no exec-level telemetry is deployed anywhere in
 the cluster**, so nothing would currently report trigger 4 firing in another pod. Standing alerting
@@ -569,10 +571,13 @@ this paragraph is what a future reader should point at when asking for it to be 
 
 So trigger 4 fires **silently**: if an absolute-path `git` ran in another agent pod tomorrow,
 nothing would report it. What stands in its place is a *measurement*, not a detector —
-`scripts/measure-absolute-path-git.mjs`, re-runnable, from PEN-4986. ⚠ That script is **not on
-master** at this writing — it is #3098 (PEN-4986), open — and neither is the §7.1 text this
-paragraph cites. Both land in that PR or not at all; until they do, this paragraph states an
-intent, not a control that exists. Read the difference plainly: a measurement observes the pods
+`scripts/measure-absolute-path-git.mjs`, re-runnable, from PEN-4986. ✅ That script **is on
+master** — #3098 (PEN-4986) merged 2026-10-30 — as is the §7.1 text this paragraph cites, and as is
+`scripts/absolute-path-git-fingerprint.mjs`, the staleness instrument (#3102, merged 2026-11-05).
+⚠ An earlier revision of this paragraph said the opposite and was correct when written; it is kept
+visible here because the distinction it drew still binds. What changed is only that the artifacts
+exist: this paragraph now describes **a control that exists**, and it is still **a measurement,
+not a detector**. Read the difference plainly: a measurement observes the pods
 it is run in, over the window it is run for, and says nothing about the rest of the fleet or
 about the time between runs. PEN-4986 measured **three** pods on three images that share one
 egress surface, and §7.1 records it as such — explicitly *not* as a fleet census. Widening that
