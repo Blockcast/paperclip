@@ -153,8 +153,9 @@ added is a *carrier*: the obligation that monitor represented is handed to a
 row that survives the cancel, instead of being dropped.
 
 `reconcileCancelledIssueMonitorRecoveries` sweeps for cleared monitors whose
-`clearReason` is `"cancelled"` and whose `recoveryEmittedAt` is still null, and
-for each one opens a recovery issue:
+`clearReason` is `"cancelled"` and whose `recoveryEmittedAt` is still null. For
+each one whose obligation can still be live — see the horizon below — it opens a
+recovery issue:
 
 - title `Carry forward the wake cancelled on <source title>`;
 - `originKind: "stranded_issue_recovery"`, `originId` the cancelled row,
@@ -165,8 +166,30 @@ for each one opens a recovery issue:
   `attemptCount`, and an explicit instruction to check whether the cancelled
   row solely owns an open work product.
 
-Three things follow that a reader should not have to rediscover:
+Four things follow that a reader should not have to rediscover:
 
+- **A long-dead obligation is discharged without a carrier.** The carrier is
+  not free: it is a `high`-priority row with an assignee, so it becomes a full
+  agent run that queues *ahead of* real remediation. Measured in BLO on
+  2026-11-05, the first deployed passes created 291 carriers in six hours; of 24
+  closed ones sampled evenly across the 221 then done, **24/24 closed as
+  "obligation discharged" carrying no live work**, their gates naming runner
+  pods, alerts and PRs from August to October that no longer exist. At the same
+  time PlatformSRE held 92 queued runs, 46 of them carriers, with 89 blocked
+  rows waiting behind them.
+
+  So when the obligation has been moot for longer than
+  `CANCELLED_MONITOR_HANDOFF_HORIZON_MS` (7 days), the sweep stamps
+  `recoveryEmittedAt` with
+  `recoveryDisposition: "auto_discharged_past_horizon"` and builds nothing. The
+  deadline is the destroyed monitor's **own due time** (`clearedNextCheckAt`)
+  when one was recorded, falling back to `clearedAt` — so an ancient clear whose
+  destroyed wake is *still ahead of us* is carried normally, and so is one whose
+  source still owns an open work product. A carrier that was built stamps
+  `recoveryDisposition: "recovery_issue"`; the field is absent on rows stamped
+  before it existed, which is not the same claim as either. If you are auditing
+  the backfill, that field — not `recoveryEmittedAt` — is what separates "a
+  carrier owns this" from "nothing ever will".
 - **The recovery policy is forced, not honoured.** Across the 21 rows carrying
   this residue in PEN, `recoveryPolicy` was `null` on 12, `wake_owner` on 5 and
   `create_recovery_issue` on **none** — so honouring the configured policy

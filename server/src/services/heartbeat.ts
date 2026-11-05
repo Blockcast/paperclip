@@ -115,7 +115,9 @@ import {
   type HeartbeatRunRetrySuccessor,
   type IssueExecutionMonitorClearReason,
   type IssueExecutionMonitorPolicy,
+  type IssueExecutionMonitorRecoveryDisposition,
   type IssueExecutionMonitorRecoveryPolicy,
+  CANCELLED_MONITOR_HANDOFF_HORIZON_MS,
   type ModelProfileKey,
   type RequestConfirmationResult,
   type RoutineRevisionSnapshotV1,
@@ -32902,6 +32904,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const unownedIssueIds: string[] = [];
 
     /**
+     * PEN-5346: does this source still solely own a work product nobody else
+     * is chasing? The terminal-branch exemption to the handoff horizon.
+     *
+     * A cancelled row keeps owning its work products and nothing else will
+     * chase them (PEN-4835: a remediation PR left open for months with the
+     * cancelled row as its only owner). A remediation PR normally OUTLIVES the
+     * alert that prompted it — it is usually why the alert resolved — so the
+     * age of the clear is exactly the wrong signal for this class, and the
+     * horizon must not apply to it however old the clear is.
+     *
+     * Open is defined as "not terminal" rather than enumerated positively, so
+     * a work-product status added later fails toward emitting a carrier.
+     */
+    async function sourceOwnsOpenWorkProduct(row: IssueMonitorDispatchRow): Promise<boolean> {
+      const open = await db
+        .select({ id: issueWorkProducts.id })
+        .from(issueWorkProducts)
+        .where(
+          and(
+            eq(issueWorkProducts.issueId, row.id),
+            notInArray(issueWorkProducts.status, ["merged", "closed", "failed", "archived"]),
+          ),
+        )
+        .limit(1);
+      return open.length > 0;
+    }
+
+    /**
+     * PEN-5346: mark this clear's handoff obligation discharged, and say how.
+     *
+     * Surgical `jsonb_set` rather than a rebuilt `executionState` so this
+     * cannot clobber a concurrent writer's state, guarded on the exact clear it
+     * discharges: if the row was re-armed or re-cleared in between, the guard
+     * fails, the stamp is skipped, and the next pass handles the new clear on
+     * its own terms.
+     *
+     * Both fields move together and `recoveryEmittedAt` keeps its meaning
+     * unchanged — null is "still owed", which is the predicate the sweep
+     * selects on and the measurement instrument counts. `recoveryDisposition`
+     * is additive: it answers WHICH discharge this was without redefining the
+     * `owed` predicate underneath anything already reading it.
+     */
+    async function stampHandoffDisposition(input: {
+      row: IssueMonitorDispatchRow;
+      clearedAtIso: string;
+      disposition: IssueExecutionMonitorRecoveryDisposition;
+    }): Promise<boolean> {
+      const updated = await db
+        .update(issues)
+        .set({
+          executionState: sql`jsonb_set(
+            jsonb_set(${issues.executionState}::jsonb, '{monitor,recoveryEmittedAt}', to_jsonb(${now.toISOString()}::text)),
+            '{monitor,recoveryDisposition}',
+            to_jsonb(${input.disposition}::text)
+          )`,
+        })
+        .where(
+          and(
+            eq(issues.id, input.row.id),
+            sql`${issues.executionState}->'monitor'->>'status' = 'cleared'`,
+            sql`${issues.executionState}->'monitor'->>'clearReason' = 'cancelled'`,
+            sql`${issues.executionState}->'monitor'->>'recoveryEmittedAt' is null`,
+            sql`${issues.executionState}->'monitor'->>'clearedAt' = ${input.clearedAtIso}`,
+          ),
+        )
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+      return Boolean(updated);
+    }
+
+    /**
      * One candidate, start to finish. Extracted from the paging loop so that
      * every exit is a NAMED OUTCOME rather than a `continue` into a shared
      * counter — `unowned` in particular has to stay distinguishable from
@@ -32910,7 +32983,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      */
     async function handBackOneCandidate(candidate: IssueMonitorDispatchRow): Promise<{
       clearedColumn: boolean;
-      outcome: "recovered" | "skipped" | "unowned";
+      outcome: "recovered" | "skipped" | "unowned" | "auto_discharged";
       clearedAt: string | null;
     }> {
       let row = candidate;
@@ -33000,6 +33073,77 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { clearedColumn, outcome: "skipped", clearedAt: null };
       }
 
+      // PEN-5346: THE HORIZON. Discharge an obligation that has been moot for
+      // longer than `CANCELLED_MONITOR_HANDOFF_HORIZON_MS` without building a
+      // carrier for it.
+      //
+      // The handoff's whole purpose is to put a destroyed obligation in front
+      // of somebody who can act. Past the horizon there is nothing to act on:
+      // measured on BLO 2026-11-05, 24 of 24 closed carriers sampled evenly
+      // across 221 closed as "obligation discharged" carrying no live work,
+      // their gates naming pods, alerts and PRs from August to October that no
+      // longer exist. The carrier is not free — it is a `high`-priority row
+      // with an assignee, so it becomes a full agent run that queues AHEAD of
+      // real remediation. In the same window PlatformSRE held 92 queued runs,
+      // 46 of them carriers, with 89 blocked rows waiting behind them.
+      //
+      // Two guards keep this from discharging anything live:
+      //
+      //  - The deadline is the destroyed monitor's OWN due time when one was
+      //    recorded (`clearedNextCheckAt`, PEN-5343), not the clear's age. A
+      //    monitor destroyed 14 h before a due time that is still ahead of us
+      //    is an obligation nobody has yet had the chance to meet, and it is
+      //    emitted however old the clear is. `clearedNextCheckAt` falls back
+      //    to `clearedAt` when ABSENT — which is every row cleared before that
+      //    field shipped, i.e. exactly the historical backfill — and when
+      //    `null`, which asserts the clear found no wake owed at all.
+      //
+      //  - A source that still solely owns an OPEN work product is emitted
+      //    regardless. That is the terminal branch this row was widened for
+      //    (PEN-4835: a cancelled row whose remediation PR outlived it by
+      //    months and had nothing else pointing at it). Age is precisely the
+      //    wrong signal there, because a remediation PR normally outlives the
+      //    alert that prompted it.
+      //
+      // Stamped, not skipped: the obligation leaves this pass in exactly one
+      // well-defined state, the same post-condition the carrier path holds to.
+      // `recoveryDisposition` records WHICH state, so an auditor can still
+      // separate "a carrier owns this" from "nothing ever will".
+      const clearedAtIso = monitorState.clearedAt;
+      const obligationDeadlineIso = monitorState.clearedNextCheckAt ?? clearedAtIso;
+      const obligationDeadlineMs = Date.parse(obligationDeadlineIso);
+      const pastHorizon = Number.isFinite(obligationDeadlineMs)
+        && now.getTime() - obligationDeadlineMs > CANCELLED_MONITOR_HANDOFF_HORIZON_MS;
+
+      if (pastHorizon && !(await sourceOwnsOpenWorkProduct(row))) {
+        const dischargeStamped = await stampHandoffDisposition({
+          row,
+          clearedAtIso,
+          disposition: "auto_discharged_past_horizon",
+        });
+        if (!dischargeStamped) {
+          // Same shape as the carrier path's lost CAS, and the same remedy:
+          // the row is re-evaluated next pass on whatever state it now holds.
+          logger.info(
+            { issueId: row.id, identifier: row.identifier },
+            "cancelled-monitor handoff auto-discharge lost a CAS (will re-evaluate next pass)",
+          );
+          return { clearedColumn, outcome: "skipped", clearedAt: null };
+        }
+        logger.info(
+          {
+            issueId: row.id,
+            identifier: row.identifier,
+            clearedAt: clearedAtIso,
+            obligationDeadline: obligationDeadlineIso,
+            deadlineSource: monitorState.clearedNextCheckAt ? "cleared_next_check_at" : "cleared_at",
+            outcome: "auto_discharged",
+          },
+          "cancelled-monitor handoff discharged past its horizon without a carrier (PEN-5346)",
+        );
+        return { clearedColumn, outcome: "auto_discharged", clearedAt: clearedAtIso };
+      }
+
       if (opts?.beforeRecover) await opts.beforeRecover();
 
       // `buildIssueMonitorClearedPatch` nulls `monitorNotes` (PEN-1995) and
@@ -33008,7 +33152,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // whole record of what the run was waiting for, and they feed the
       // recovery body, the activity details and the wake payload alike.
       const claimed: IssueMonitorDispatchRow = { ...row, monitorNotes: monitorState.notes ?? null };
-      const clearedAtIso = monitorState.clearedAt;
 
       await performIssueMonitorRecovery({
         claimed,
@@ -33044,22 +33187,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // writer's state, guarded on the exact clear it discharges: if the row
       // was re-armed or re-cleared in between, the guard fails, the stamp is
       // skipped, and the next pass handles the new clear on its own terms.
-      const stamped = await db
-        .update(issues)
-        .set({
-          executionState: sql`jsonb_set(${issues.executionState}::jsonb, '{monitor,recoveryEmittedAt}', to_jsonb(${now.toISOString()}::text))`,
-        })
-        .where(
-          and(
-            eq(issues.id, row.id),
-            sql`${issues.executionState}->'monitor'->>'status' = 'cleared'`,
-            sql`${issues.executionState}->'monitor'->>'clearReason' = 'cancelled'`,
-            sql`${issues.executionState}->'monitor'->>'recoveryEmittedAt' is null`,
-            sql`${issues.executionState}->'monitor'->>'clearedAt' = ${clearedAtIso}`,
-          ),
-        )
-        .returning({ id: issues.id })
-        .then((rows) => rows[0] ?? null);
+      const stamped = await stampHandoffDisposition({ row, clearedAtIso, disposition: "recovery_issue" });
 
       if (!stamped) {
         // The recovery landed; only the bookkeeping lost a race. Harmless and
@@ -33083,6 +33211,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // be selected again as soon as somebody owns it. Folding it into `skipped`
     // would hide the one outcome with nobody named.
     let unowned = 0;
+    // PEN-5346: handoffs stamped past the horizon with no carrier built. Named
+    // apart from both `recovered` and `skipped` because it is neither: the
+    // obligation IS discharged (unlike `skipped`, which leaves it owed) but
+    // nothing was handed to anybody (unlike `recovered`). It is also the number
+    // that says whether the horizon is doing what it was added for, so folding
+    // it into either neighbour would make the backfill's cost unreadable.
+    let autoDischarged = 0;
     let failed = 0;
     let pages = 0;
     // Spend against `limit`: candidates that WROTE something. Counted apart
@@ -33144,8 +33279,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           if (result.clearedColumn) cleared += 1;
           if (result.outcome === "recovered") recovered += 1;
           else if (result.outcome === "unowned") unowned += 1;
+          else if (result.outcome === "auto_discharged") autoDischarged += 1;
           else skipped += 1;
-          if (result.clearedColumn || result.outcome === "recovered") emitted += 1;
+          // An auto-discharge WROTE (it stamped the disposition), so it spends
+          // against the emission budget exactly as a carrier does. Letting it
+          // run free would turn a tick that discharges a long historical run of
+          // them into an unbounded write burst — the opposite of the budget's
+          // purpose, and on the one population large enough to notice.
+          if (
+            result.clearedColumn
+            || result.outcome === "recovered"
+            || result.outcome === "auto_discharged"
+          ) emitted += 1;
           if (result.clearedAt && (!oldestClearedAt || result.clearedAt < oldestClearedAt)) {
             oldestClearedAt = result.clearedAt;
           }
@@ -33174,8 +33319,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     // PEN-5346 §4 — an INERT pass must not read as a drained one.
     //
-    // Both call sites log only when `recovered`/`cleared`/`unowned`/`failed` is
-    // non-zero. `scanned` and `skipped` are computed, returned, and then
+    // Both call sites log only when `recovered`/`cleared`/`unowned`/
+    // `autoDischarged`/`failed` is non-zero. `scanned` and `skipped` are
+    // computed, returned, and then
     // discarded at every call site, so a pass that selected 21 candidates and
     // skipped all 21 was BYTE-IDENTICAL in the logs to a pass that selected
     // nothing — which is itself byte-identical to the healthy, fully-drained
@@ -33194,6 +33340,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // intrinsically rather than as a copy of their `if`, but chosen to tile
     // with it, so the union of the three sites leaves silence meaning one
     // thing only — `scanned === 0`, nothing was owed.
+    //
+    // The outcomes are mutually exclusive — every scanned candidate increments
+    // exactly one of `recovered`/`unowned`/`autoDischarged`/`skipped`/`failed`
+    // — so `skipped === scanned` already implies all four others are zero,
+    // including the `autoDischarged` the horizon added. The conjunct is left
+    // out rather than forgotten: adding it would assert something the
+    // accounting already guarantees. If a future outcome stops being exclusive,
+    // this is the line that breaks.
     if (scanned > 0 && skipped === scanned && cleared === 0) {
       const slot = takeCancelledMonitorInertLogSlot(`${scanned}:${skipped}:${pages}:${oldestClearedAt ?? ""}`);
       if (slot.log) {
@@ -33214,7 +33368,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
     }
 
-    return { scanned, recovered, cleared, skipped, unowned, failed, pages, oldestClearedAt };
+    return { scanned, recovered, cleared, skipped, unowned, autoDischarged, failed, pages, oldestClearedAt };
   }
 
   async function reconcileTaskWatchdogs(opts?: { companyId?: string | null; runId?: string | null }) {

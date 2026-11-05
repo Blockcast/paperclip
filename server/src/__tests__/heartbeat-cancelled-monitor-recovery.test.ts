@@ -26,7 +26,7 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agents, companies, createDb, issueComments, issues } from "@paperclipai/db";
+import { activityLog, agents, companies, createDb, issueComments, issueWorkProducts, issues } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -48,13 +48,27 @@ if (!embeddedPostgresSupport.supported) {
 
 const MONITOR_NOTES = "Waiting on a human merge of onprem-k8s#7360; the alert cleared because that PR exists.";
 const GATE_SIGNALS = ["pr:blockcast/onprem-k8s#7360:merged"];
-const CLEARED_AT = "2026-11-03T01:11:39.000Z";
+const DAY_MS = 24 * 60 * 60 * 1000;
+/**
+ * Two days ago, and RELATIVE on purpose.
+ *
+ * PEN-5346's handoff horizon is measured against a real `now`, so the fixed
+ * literal this used to be would have silently flipped every case in this file
+ * from "carrier emitted" to "auto-discharged" the moment the wall clock passed
+ * it — a suite that rots into asserting the opposite of what it was written
+ * for. Two days keeps every default-seeded clear well inside the horizon;
+ * `clearedAt` is overridable per case for the ones that test the far side.
+ */
+const CLEARED_AT = new Date(Date.now() - 2 * DAY_MS).toISOString();
+/** Comfortably past the 7-day horizon, in the band the BLO backfill occupies. */
+const LONG_PAST_CLEARED_AT = new Date(Date.now() - 45 * DAY_MS).toISOString();
 
 type MonitorResidue = {
   status?: string;
   clearReason?: string;
   clearedAt?: string | null;
   recoveryEmittedAt?: string | null;
+  recoveryDisposition?: string;
   notes?: string | null;
 };
 
@@ -122,6 +136,10 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
       clearReason?: string;
       recoveryPolicy?: string | null;
       recoveryEmittedAt?: string | null;
+      /** PEN-5346: moves the clear across the handoff horizon. */
+      clearedAt?: string;
+      /** PEN-5346: the due time the clear destroyed (PEN-5343's audit copy). */
+      clearedNextCheckAt?: string | null;
       monitorNextCheckAt?: Date | null;
       /** Pins selection order: the pass reads `asc(updatedAt), asc(id)`. */
       updatedAt?: Date;
@@ -172,8 +190,11 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
           timeoutAt: null,
           maxAttempts: null,
           recoveryPolicy: overrides.recoveryPolicy === undefined ? "wake_owner" : overrides.recoveryPolicy,
-          clearedAt: CLEARED_AT,
+          clearedAt: overrides.clearedAt ?? CLEARED_AT,
           clearReason: overrides.clearReason ?? "cancelled",
+          ...(overrides.clearedNextCheckAt === undefined
+            ? {}
+            : { clearedNextCheckAt: overrides.clearedNextCheckAt }),
           ...(overrides.recoveryEmittedAt === undefined ? {} : { recoveryEmittedAt: overrides.recoveryEmittedAt }),
           ...(overrides.malformed ? { attemptCount: "not-a-number" } : {}),
         },
@@ -183,7 +204,9 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
       monitorNotes: null,
       monitorScheduledBy: "assignee",
       monitorAttemptCount: 0,
-      cancelledAt: (overrides.status ?? "cancelled") === "cancelled" ? new Date(CLEARED_AT) : null,
+      cancelledAt: (overrides.status ?? "cancelled") === "cancelled"
+        ? new Date(overrides.clearedAt ?? CLEARED_AT)
+        : null,
     });
     return issueId;
   }
@@ -220,6 +243,118 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
       .from(issues)
       .where(and(eq(issues.originId, issueId), eq(issues.originKind, "stranded_issue_recovery")));
   }
+
+  /**
+   * PEN-5346: the handoff horizon.
+   *
+   * The carrier is not free. It is a `high`-priority row with an assignee, so
+   * it becomes a full agent run that queues AHEAD of real remediation. Measured
+   * on BLO 2026-11-05: 291 carriers in six hours, and of 24 closed ones sampled
+   * evenly across the 221 then done, 24/24 closed as "obligation discharged"
+   * carrying no live work — their gates named pods, alerts and PRs from August
+   * to October that no longer exist. Meanwhile PlatformSRE held 92 queued runs,
+   * 46 of them carriers, with 89 blocked rows waiting behind them.
+   *
+   * So past the horizon the handoff is stamped without a carrier. These cases
+   * pin that, and — more importantly — pin the two things that must still get
+   * one however old the clear is.
+   */
+  describe("handoff horizon", () => {
+    it("discharges a long-past obligation without building a carrier (PEN-5346)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = await seedCancelledResidue(companyId, agentId, {
+        clearedAt: LONG_PAST_CLEARED_AT,
+      });
+
+      const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(result).toMatchObject({ scanned: 1, recovered: 0, autoDischarged: 1, skipped: 0, failed: 0 });
+
+      // No carrier, and so no run: that is the entire point of the horizon.
+      await expect(readRecoveryIssues(issueId)).resolves.toHaveLength(0);
+
+      // Discharged, not left owed. The post-condition is the same one the
+      // carrier path holds to — exactly one well-defined state — and
+      // `recoveryDisposition` is what keeps the two states distinguishable.
+      const residue = residueOf((await readIssue(issueId)).executionState);
+      expect(residue.recoveryEmittedAt).toBeTruthy();
+      expect(residue.recoveryDisposition).toBe("auto_discharged_past_horizon");
+    });
+
+    it("re-selects nothing once discharged, so the pass does not re-emit (PEN-5346)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      await seedCancelledResidue(companyId, agentId, { clearedAt: LONG_PAST_CLEARED_AT });
+
+      await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      const second = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(second).toMatchObject({ scanned: 0, recovered: 0, autoDischarged: 0 });
+    });
+
+    it("still carries an old clear whose destroyed due time is STILL AHEAD (PEN-5346)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      // The clear itself is ancient, but the wake it destroyed has not yet come
+      // due — nobody has had the chance to meet that obligation, so age is the
+      // wrong question and the carrier is owed.
+      const issueId = await seedCancelledResidue(companyId, agentId, {
+        clearedAt: LONG_PAST_CLEARED_AT,
+        clearedNextCheckAt: new Date(Date.now() + 3 * DAY_MS).toISOString(),
+      });
+
+      const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(result).toMatchObject({ scanned: 1, recovered: 1, autoDischarged: 0 });
+      await expect(readRecoveryIssues(issueId)).resolves.toHaveLength(1);
+
+      const residue = residueOf((await readIssue(issueId)).executionState);
+      expect(residue.recoveryDisposition).toBe("recovery_issue");
+    });
+
+    it("still carries an old clear whose source solely owns an OPEN work product (PEN-5346)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = await seedCancelledResidue(companyId, agentId, {
+        clearedAt: LONG_PAST_CLEARED_AT,
+      });
+      // The terminal branch this row was widened for (PEN-4835): a cancelled
+      // row whose remediation PR outlived it and has nothing else pointing at
+      // it. A remediation PR normally OUTLIVES the alert that prompted it — it
+      // is usually why the alert resolved — so this is precisely the class for
+      // which the age of the clear means nothing.
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/onprem-k8s#7360",
+        title: "fix(prod-07): restart node-exporter under the new unit",
+        status: "ready_for_review",
+      });
+
+      const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(result).toMatchObject({ scanned: 1, recovered: 1, autoDischarged: 0 });
+      await expect(readRecoveryIssues(issueId)).resolves.toHaveLength(1);
+    });
+
+    it("discharges when the only work product the source owns is already terminal (PEN-5346)", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = await seedCancelledResidue(companyId, agentId, {
+        clearedAt: LONG_PAST_CLEARED_AT,
+      });
+      // Merged is the common case behind a genuinely-resolved alert, and it is
+      // the one the BLO sample kept finding: the PR landed months ago and the
+      // carrier existed only to re-discover that.
+      await db.insert(issueWorkProducts).values({
+        companyId,
+        issueId,
+        type: "pull_request",
+        provider: "github",
+        externalId: "Blockcast/onprem-k8s#7301",
+        title: "fix(prod-07): the merge that resolved this alert",
+        status: "merged",
+      });
+
+      const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+      expect(result).toMatchObject({ scanned: 1, recovered: 0, autoDischarged: 1 });
+      await expect(readRecoveryIssues(issueId)).resolves.toHaveLength(0);
+    });
+  });
 
   it("hands a terminally-cancelled row's obligation to a surviving carrier (PEN-5346)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
