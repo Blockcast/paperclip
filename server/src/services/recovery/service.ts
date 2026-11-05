@@ -10378,7 +10378,7 @@ export function recoveryService(
         // escalation per failed run; a deliberate skip, not a requeue: requeueing
         // would trade a free loop for one that burns a run per cycle. The row
         // stays a visible, assigned `todo`.
-        if (await hasInPlaceRecoveryEscalationForRun(issue.companyId, issue.id, latestRun.id)) {
+        if (latestRun && await hasInPlaceRecoveryEscalationForRun(issue.companyId, issue.id, latestRun.id)) {
           result.skipped += 1;
           return;
         }
