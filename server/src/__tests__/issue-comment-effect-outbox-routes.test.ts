@@ -235,7 +235,13 @@ describe("issue comment effect outbox routes", () => {
     mockIssueService.listWakeableBlockedDependents.mockResolvedValue([]);
     mockIssueService.getWakeableParentAfterChildCompletion.mockResolvedValue(null);
     mockIssueService.getCurrentScheduledRetry.mockResolvedValue(null);
-    mockIssueService.addComment.mockResolvedValue(makeComment());
+    // Echo the request body, as a real first-write insert does. The route now
+    // reuses its pre-resolved mention context only when `accepted.body` matches
+    // what it resolved from, so a fixture that returns a FIXED body would quietly
+    // exercise the dedup fallback on every test.
+    mockIssueService.addComment.mockImplementation(async (_issueId: string, body: string) =>
+      makeComment({ body }),
+    );
     mockGetActiveCompanyMembership.mockResolvedValue({ id: "membership-1" });
     mockIssueReferenceService.diffIssueReferenceSummary.mockReturnValue({
       addedReferencedIssues: [],
@@ -379,6 +385,44 @@ describe("issue comment effect outbox routes", () => {
     //    finishes the pipeline afterwards.
     await reconcile(COMMENT_ID);
     expect(ledgerRows(COMMENT_ID).every((row) => row.status === "processed")).toBe(true);
+  });
+
+  it("ignores the hoisted mention context when the insert deduplicated onto another request's comment", async () => {
+    // Two concurrent same-key requests can both miss the out-of-transaction
+    // pre-check and both enter the transaction branch. The loser's
+    // `svc.addComment` hits `onConflictDoNothing` and returns the WINNER's
+    // persisted row with `deduplicated: true` — so the hoisted context, which
+    // was resolved from THIS request's body, describes text that was never
+    // stored. Its wake keys would not collide with the winner's, so the
+    // `(comment_id, effect_key)` dedup cannot catch them, and the result would
+    // be a wake for a mention nobody can read.
+    mockIssueService.getById.mockResolvedValue(makeIssue());
+    mockIssueService.findMentionedAgents.mockImplementation(async (_companyId: string, body: string) =>
+      body.includes(MENTIONED_AGENT_ID) ? [MENTIONED_AGENT_ID] : [],
+    );
+    // What the race persisted: the winner's comment, which mentions nobody.
+    mockIssueService.addComment.mockResolvedValue({
+      ...makeComment({ body: "the winner's text" }),
+      deduplicated: true,
+    });
+    const { app } = await createApp();
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/comments`)
+      .send({ body: `loser [@Peer](agent://${MENTIONED_AGENT_ID})`, idempotencyKey: "raced" });
+
+    // 200, not 201: `deduplicated` on the insert marks this request a replay.
+    expect(res.status).toBe(200);
+    expect(res.body.deduplicated).toBe(true);
+    // The builder fell back to resolving from the PERSISTED body, so the
+    // request-only mention produces no intent.
+    expect(ledgerRows(COMMENT_ID).map((row) => row.effectKey)).not.toContain(
+      `wake:${MENTIONED_AGENT_ID}:${ISSUE_ID}`,
+    );
+    // The assignee wake, which does not depend on the body, is still there.
+    expect(ledgerRows(COMMENT_ID).map((row) => row.effectKey)).toContain(
+      `wake:${ASSIGNEE_AGENT_ID}:${ISSUE_ID}`,
+    );
   });
 
   it("answers a same-key replay 200 while its effects are still queued, without inserting a second comment", async () => {
