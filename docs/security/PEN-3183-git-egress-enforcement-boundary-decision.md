@@ -582,9 +582,16 @@ it is run in, over the window it is run for, and says nothing about the rest of 
 about the time between runs. PEN-4986 measured **three** pods on three images that share one
 egress surface, and §7.1 records it as such — explicitly *not* as a fleet census. Widening that
 population is per-pod work — the script runs unprivileged inside an agent's own run, so it needs
-no new platform capability, only more agents running it — and re-taking it is required whenever the agent image or the PATH layout changes.
-That re-measurement is tracked as **PEN-4989** rather than as a sentence here, for the reason
-PEN-4988 exists at all: a condition recorded only in a document has no owner.
+no new platform capability, only more agents running it — and re-taking it is required whenever
+the agent image or the PATH layout changes. That re-measurement is tracked as a **row** rather
+than as a sentence here, for the reason PEN-4988 exists at all: a condition recorded only in a
+document has no owner. **PEN-4989** discharged the *one-time* widening — the sixth window, and the
+firing recorded above — and does **not** carry the recurring duty. That duty is owned by
+**[PEN-5663](https://paperclip.blockcast.net/PEN/issues/PEN-5663)**, which is **open**, and is
+keyed to the egress-relevant surface fingerprint (§7.1) rather than to the image tag — at ≈15
+image changes a day the latter is not an operable trigger. ⚠ **Whoever closes PEN-5663 must name
+its successor here, in the same change.** Otherwise this paragraph names a closed row and the duty
+loses its owner in precisely the way the sentence above forbids.
 
 #### Trigger 3's mount half — what asserts it (PEN-4990, 2026-10-29)
 
