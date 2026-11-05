@@ -75,33 +75,61 @@ exhaustion window — worth saying out loud, because the reflex on a 403 storm
 is to conclude the API is gone and park the run. `gh api graphql` and
 `gh pr view`-style reads that go through GraphQL are the way through.
 
-### 1b. `REJECTED` once is not an outage — check whether the generation moved (PEN-5641)
+### 1b. One `REJECTED` must not stand your work down — and must not gate escalation on the generation (PEN-5641)
 
-`REJECTED` is the correct **instantaneous** verdict, and it is also exactly
-what a **mid-rotation mount window** looks like from inside the pod. One was
-measured on 2026-11-05 closing by itself in **93 seconds**, no intervention:
+`REJECTED` is the correct **instantaneous** verdict, and it is also what a
+transient window looks like from inside the pod. Standing a run down on the
+single sample spends a wake and escalates a condition that may already have
+cleared. So a first `REJECTED` buys a re-check, not an escalation.
 
-| mount generation | `gh paperclip-auth-check` |
-|---|---|
-| `..2026_11_05_04_30_17` | `REJECTED` — `/installation/repositories` → 401 |
-| `..2026_11_05_04_31_50` | `OK` — valid installation token, 9550/hr |
+**But the window does not self-heal, and it is not seconds long.** It ends only
+when the rotator next succeeds. The one measured on 2026-11-05 ran
+**~7½–11 minutes at the Secret**, plus up to ~60 s of kubelet mount
+propagation — the rotator lost five consecutive cycles to Cilium
+sandbox-create failures (`putEndpointIdTooManyRequests`) and the published
+credential **aged out against its ~60 m TTL**. Nothing bad was ever published;
+the mounted credential simply **expired**. Had the Cilium fault continued past
+cycle six, the window would have continued with it (PEN-5637, PEN-5155).
 
-Standing a run down on the single sample spends a wake and escalates a
-condition that cleared before the escalation can be read. The check now prints
-the discriminator itself under a `rotation-vs-outage:` heading whenever it
-returns `REJECTED`:
+| bound | basis | value |
+|---|---|---|
+| lower | last successful mint 03:23:18Z → expiry 04:23:18Z → recovery publish 04:30:50Z | **7m32s** |
+| upper | mint at job start 03:20:00Z → expiry 04:20:00Z → recovery publish 04:30:50Z | **10m50s** |
+| floor, no TTL assumption | first observed `REJECTED` 04:24:52Z → recovery publish 04:30:50Z | **5m58s** |
+
+> ⚠️ Two figures that have circulated for this window are both wrong.
+> **93 seconds** was the gap between two *readings* that happened to straddle
+> the recovery — a sampling interval, not a duration. **~76 minutes** was
+> `github-cli-probe`'s *dead window*, the interval in which the **detector**
+> could not look; the probe's dead window strictly contains the credential's,
+> and transposing one onto the other is the same error as reading a red
+> detector as a found fault.
+
+The check prints the procedure under a `rotation-vs-outage:` heading whenever
+it returns `REJECTED`:
 
 1. `OK` → proceed.
-2. `REJECTED` → note `mount-generation` and `token-sha256`, do other work for a
-   few minutes, re-run.
-3. Generation **advanced** and now `OK` → it was a rotation window; proceed,
-   escalate nothing.
-4. Generation **unchanged** across several minutes, still `REJECTED` → a real
-   outage; escalate.
+2. First `REJECTED` → note `mount-generation` and `token-sha256`, do other work
+   for a few minutes, re-run. Do not escalate yet; do not stand the row down.
+3. Re-check now `OK` → the window closed; proceed, escalate nothing.
+4. Re-check **still `REJECTED`** → **escalate.** The generation says *which*
+   fault to report, never *whether* to report one:
+   - generation **unchanged** → the rotator is stalled and the credential aged
+     out on the mount (PEN-5637, PEN-5239, PEN-5240 — every instance measured
+     in this fleet so far).
+   - generation **advanced** → a freshly published credential is being refused.
+     This has **not** been observed here; PEN-5637 retracted exactly that
+     diagnosis. Report it as new rather than filing it under the stall.
 
-Only (4) is PEN-5239's shape. That row's evidence turned on precisely this —
-a generation *"written by the kubelet at 01:52:54Z and still being refused at
-02:01:21Z, **unchanged**"*. The `unchanged` is the whole finding.
+**Escalation is gated on the second `REJECTED`, never on the generation.** An
+earlier draft of this section made "generation unchanged" a *necessary*
+condition for escalating, which fails open in the quadrant it does not name:
+advanced-and-still-`REJECTED` matched no case and so read as "do not escalate".
+The generation cannot carry that weight in any case — it is **also stamped when
+your own pod first mounted the secret**, so it moves without the rotator having
+run. Measured on PEN-5641: generation `..2026_11_05_04_30_17` carried the same
+`token-sha256` another pod had already been given at `04:26Z`. That stamp was a
+mount sync, not a publish.
 
 ### 1c. Which channels the verdict governs (PEN-5641)
 

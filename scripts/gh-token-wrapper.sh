@@ -817,22 +817,35 @@ paperclip_auth_check() {
   printf '  credential-channel: gh / curl / git (all re-read the mount per invocation)\n'
   printf '  mcp-channel:        %s\n' "${mcp_channel}"
   printf '  verdict:            %s\n' "${verdict}"
-  # PEN-5641 Finding 2. REJECTED is the correct INSTANTANEOUS verdict and is
-  # also exactly what a mid-rotation mount window looks like from inside the
-  # pod — one was measured closing by itself in 93 seconds with no
-  # intervention. Standing a run down on the instantaneous reading spends a
-  # wake and escalates a condition that cleared before the escalation can be
-  # read, so the distinguishing test is printed here, beside the two fields it
-  # needs, rather than left for an agent to reconstruct mid-incident. Only
-  # case 4 is PEN-5239's shape: that row's whole evidence was a generation
-  # "written by the kubelet at 01:52:54Z and still being refused at 02:01:21Z,
-  # unchanged".
+  # PEN-5641 Finding 2, as corrected 2026-11-05. REJECTED is the correct
+  # INSTANTANEOUS verdict and is also what a transient window looks like from
+  # inside the pod, so a single reading must not stand a run down. But the
+  # window is NOT self-healing and must not be described as such: it ends only
+  # when the rotator next succeeds. The one measured on 2026-11-05 ran ~7.5-11
+  # minutes at the Secret (rotator lost five consecutive cycles to Cilium
+  # sandbox-create failures and the published credential aged out against its
+  # ~60m TTL), plus up to ~60s of kubelet mount propagation — had the Cilium
+  # fault continued, the window would have continued with it.
+  #
+  # ESCALATION IS GATED ON THE SECOND REJECTED, NEVER ON THE GENERATION. An
+  # earlier draft made "generation UNCHANGED" a necessary condition for
+  # escalating, which fails open in the quadrant it does not name: a generation
+  # that ADVANCED while the verdict stayed REJECTED matched no case and so read
+  # as "do not escalate". The generation cannot carry that weight anyway — it is
+  # also stamped when THIS pod first mounted the secret, so it moves without the
+  # rotator having run. Measured on PEN-5641: generation ..2026_11_05_04_30_17
+  # carried the same sha another pod had already seen at 04:26Z.
   if [ "${verdict_code}" = 1 ]; then
-    printf '  rotation-vs-outage: a REJECTED reading alone does NOT establish an outage. Do not escalate on this one sample:\n'
+    printf '  rotation-vs-outage: a REJECTED reading alone does NOT establish an outage, and does NOT stand your work down:\n'
     printf '                        1. note mount-generation and token-sha256 above\n'
     printf '                        2. do other work for a few minutes, then re-run this check\n'
-    printf '                        3. generation ADVANCED and now OK -> it was a rotation window, it closed itself; proceed, escalate nothing\n'
-    printf '                        4. generation UNCHANGED across several minutes, still REJECTED -> a real outage (PEN-5239); escalate\n'
+    printf '                        3. now OK -> the window closed; proceed, escalate nothing\n'
+    printf '                        4. still REJECTED -> ESCALATE. The generation says WHICH fault, never WHETHER:\n'
+    printf '                             generation UNCHANGED -> rotator stalled, credential aged out on the mount (PEN-5637)\n'
+    printf '                             generation ADVANCED  -> a freshly published credential is being refused; not yet\n'
+    printf '                                                     observed in this fleet, so report it as new\n'
+    printf '                        Do NOT wait for the generation to settle before escalating, and do not read a\n'
+    printf '                        moved generation as proof the rotator ran: this pod stamps one at mount time too.\n'
   fi
   exit "${verdict_code}"
 }
