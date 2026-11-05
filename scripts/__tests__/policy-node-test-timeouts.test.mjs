@@ -266,6 +266,23 @@ const CONTENTION_SENSITIVE_STEPS = [
   // the sample cannot bound it from above; the worst healthy run was 58s, i.e.
   // 97% of the budget it was given. Sized to 4m at the step, above this floor.
   "Test brace-expansion security override",
+  // PEN-5640. Fork-heavy in the original sense of this list -- 114 tests over
+  // 55 wrapper invocations, each forking a shell and a stub gh, and one that
+  // re-runs the whole suite as a nested `node --test` to prove hermeticity, so
+  // every test in that file is paid for twice. Its user/sys split is
+  // sys-dominant (39.0s/56.4s off-runner), which is fork/exec, not compute.
+  // At the 1m bound it killed 6 of 276 executed runs over 2026-11-03..05, all
+  // 6 on arc-merge-queue and every one of those a queue eviction -- #3389
+  // among them, the PR that sized the step above. Its p100 is censored AT that
+  // bound; the worst healthy run was 59s, i.e. 98% of the budget it was given.
+  //
+  // Unlike its neighbours this one was not mis-sized when written: the suite
+  // grew 87 -> 114 tests under it (PEN-5241, BLO-51471, PEN-5255, PEN-5355)
+  // and its merge-queue p95 went 29s -> 59s against an unchanged 60s wall.
+  // That is the failure this list exists to make loud -- a bound that silently
+  // stops fitting is indistinguishable from one that always fit until it
+  // starts killing verdicts. Sized to 8m at the step, above this floor.
+  "Test gh token wrapper",
 ];
 
 function assertContentionFloor(steps) {
