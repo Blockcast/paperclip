@@ -1,7 +1,17 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -2342,7 +2352,11 @@ echo "STDIN<<$(cat)>>"
 // spawnSync closes the child's stdin when `input` is given, so the `cat` above
 // reaches EOF rather than blocking — which a stdin-reading stub would otherwise
 // do on every test that sends no body.
-function runGuard(dir, args, { extraEnv = {}, input = "" } = {}) {
+// `armed` defaults to true because almost every test here asserts on the
+// guard's behaviour, but the SHIPPED default is disarmed — see the
+// `armed: false` block at the end of this section, which is the one that pins
+// what merging this actually does to the fleet.
+function runGuard(dir, args, { extraEnv = {}, input = "", armed = true } = {}) {
   const stubGhPath = path.join(dir, "gh.real");
   writeFileSync(stubGhPath, STUB_GH_ECHO_STDIN);
   chmodSync(stubGhPath, 0o755);
@@ -2352,14 +2366,14 @@ function runGuard(dir, args, { extraEnv = {}, input = "" } = {}) {
   const env = sanitizedEnv({
     GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
     PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
-    ...extraEnv,
   });
-  // The escape hatch is not a credential, so WRAPPER_CREDENTIAL_ENV_VARS does
-  // not strip it — and an ambient value would silently disable the guard every
-  // test below asserts on, turning the whole section vacuous.
-  if (!("GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE" in extraEnv)) {
-    delete env.GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE;
-  }
+  // Neither switch is a credential, so WRAPPER_CREDENTIAL_ENV_VARS does not
+  // strip them — and an ambient value would silently arm or disarm the guard
+  // every test below asserts on, turning the whole section vacuous.
+  delete env.GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE;
+  delete env.GH_WRAPPER_REFUSE_REVIEWER_EVIDENCE;
+  if (armed) env.GH_WRAPPER_REFUSE_REVIEWER_EVIDENCE = "refuse-reviewer-evidence";
+  Object.assign(env, extraEnv);
   return spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8", input });
 }
 
@@ -2372,12 +2386,26 @@ function assertRefused(proc, pattern) {
 const APPROVED = /refusing to submit an APPROVED pull-request review/;
 const EVIDENCE = /refusing to publish a consolidated-review heading or a `Reviewed head:` attestation/;
 
+// `APPROVE` is the value GitHub actually accepts — the REST reviews endpoint
+// takes `event=APPROVE` and the GraphQL `PullRequestReviewEvent` enum is
+// `APPROVE`. `APPROVED` is the resulting review *state*, never an input, so an
+// earlier revision that pinned only `APPROVED` was asserting on a value GitHub
+// rejects while the real one passed straight through the `gh api` path. Both
+// are pinned now: the wire value because it is the one that can actually
+// submit an approval, the state name because a caller that confuses the two
+// should still be caught rather than silently allowed.
 for (const [label, args] of [
   ["gh pr review --approve", ["pr", "review", "5", "--approve"]],
-  ["gh api -f event=APPROVED", ["api", "-X", "POST", "repos/o/r/pulls/5/reviews", "-f", "event=APPROVED"]],
+  ["gh api -f event=APPROVE (the REST wire value)", ["api", "-X", "POST", "repos/o/r/pulls/5/reviews", "-f", "event=APPROVE"]],
+  ["gh api -f event=APPROVED (the state name)", ["api", "-X", "POST", "repos/o/r/pulls/5/reviews", "-f", "event=APPROVED"]],
+  ["gh api --field event=approve", ["api", "repos/o/r/pulls/5/reviews", "--field", "event=approve"]],
   ["gh api --field event=approved", ["api", "repos/o/r/pulls/5/reviews", "--field", "event=approved"]],
   [
-    "graphql addPullRequestReview",
+    "graphql addPullRequestReview event:APPROVE (the GraphQL enum)",
+    ["api", "graphql", "-f", 'query=mutation{addPullRequestReview(input:{pullRequestId:"x",event:APPROVE}){clientMutationId}}'],
+  ],
+  [
+    "graphql addPullRequestReview event:APPROVED",
     ["api", "graphql", "-f", 'query=mutation{addPullRequestReview(input:{pullRequestId:"x",event:APPROVED}){clientMutationId}}'],
   ],
 ]) {
@@ -2500,4 +2528,136 @@ test("a near-miss escape-hatch value does not disable the guard (PEN-3193)", () 
       EVIDENCE,
     ),
   );
+});
+
+// --- The reviewer's own publishing shapes ----------------------------------
+//
+// `/usr/bin/gh` in the agent image IS this wrapper, and the reviewer agent runs
+// in that same image, so the reviewer is subject to its own guard. Its
+// publisher (`.planning/ally-agent/AGENTS.md`) is `gh pr review --comment
+// --body-file <consolidated body>`, escalating to `--approve` when the Critical
+// section is empty — both of which the guard refuses once armed. An
+// armed-by-default rollout would therefore refuse every Ally review fleet-wide:
+// `review/ally-complete` and `gate/ally-comment-findings` could never go green
+// and agent merges would stall everywhere.
+//
+// These pin the two halves of the rollout contract: disarmed is the shipped
+// default and changes nothing for anyone, and the exemption lets the reviewer
+// publish once it is armed.
+
+const REVIEWER_BODY = [
+  "## Ally — Consolidated PR Review",
+  "",
+  "Reviewed head: 2a6bb6c0480daaf5d692d7a19ae1bd80b3e0dfe9",
+  "",
+  "### Critical Issues (0)",
+  "",
+].join("\n");
+
+function withReviewerBody(dir) {
+  const bodyPath = path.join(dir, "ally-review.md");
+  writeFileSync(bodyPath, REVIEWER_BODY);
+  return bodyPath;
+}
+
+for (const [label, argsFor] of [
+  ["pr review --comment --body-file", (f) => ["pr", "review", "5", "--comment", "--body-file", f]],
+  ["pr review --approve --body-file", (f) => ["pr", "review", "5", "--approve", "--body-file", f]],
+  ["pr comment --body-file", (f) => ["pr", "comment", "5", "--body-file", f]],
+]) {
+  test(`the shipped default is disarmed, so the reviewer's \`${label}\` still publishes (PEN-3193)`, () => {
+    withTempDir((dir) => {
+      const proc = runGuard(dir, argsFor(withReviewerBody(dir)), { armed: false });
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.match(proc.stdout, /ARGS=pr /);
+    });
+  });
+
+  test(`armed, the reviewer's \`${label}\` publishes through the exemption (PEN-3193)`, () => {
+    withTempDir((dir) => {
+      const proc = runGuard(dir, argsFor(withReviewerBody(dir)), {
+        extraEnv: { GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE: "i-am-the-reviewer" },
+      });
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.match(proc.stdout, /ARGS=pr /);
+    });
+  });
+
+  test(`armed and unexempted, \`${label}\` is refused — this is what arming costs (PEN-3193)`, () => {
+    withTempDir((dir) => assertRefused(runGuard(dir, argsFor(withReviewerBody(dir))), /refusing to/));
+  });
+}
+
+test("the shipped default is disarmed for approvals too (PEN-3193)", () => {
+  withTempDir((dir) => {
+    const proc = runGuard(dir, ["api", "-X", "POST", "repos/o/r/pulls/5/reviews", "-f", "event=APPROVE"], {
+      armed: false,
+    });
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.match(proc.stdout, /ARGS=api -X POST/);
+  });
+});
+
+// --- Prose about an approval is not an approval ----------------------------
+//
+// The approval scan reads the `--approve` flag and, on `gh api`, the *values*
+// of field flags — not every argv element. An earlier revision scanned all of
+// argv, so an author comment that merely quoted `event=approved` was refused as
+// an approval. Review comments on this very guard quote those strings, so this
+// is a live shape, not a hypothetical one.
+for (const [label, args] of [
+  ["a --body quoting the guard's own pattern", ["pr", "comment", "5", "--body", "the guard matches event=approved today"]],
+  ["a --body quoting the wire value", ["pr", "comment", "5", "--body", "GitHub takes event=APPROVE, not APPROVED"]],
+  [
+    "an api body= field quoting the wire value",
+    ["api", "repos/o/r/issues/5/comments", "-f", "body=discussing event=APPROVE here"],
+  ],
+]) {
+  test(`${label} is not an approval (PEN-3193)`, () => {
+    withTempDir((dir) => {
+      const proc = runGuard(dir, args);
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.doesNotMatch(proc.stderr, /refusing to submit an APPROVED/);
+    });
+  });
+}
+
+test("the stdin buffer does not outlive the invocation (PEN-3193)", () => {
+  // The buffer holds a full PR body. The wrapper `exec`s the real gh, so an
+  // EXIT trap would never run and nothing else would ever clean it up; it is
+  // unlinked while still held open on two descriptors instead.
+  withTempDir((dir) => {
+    const tmp = path.join(dir, "tmp");
+    mkdirSync(tmp);
+    const proc = runGuard(dir, ["pr", "comment", "5", "--body-file", "-"], {
+      extraEnv: { TMPDIR: tmp },
+      input: "ordinary author comment\n",
+    });
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.match(proc.stdout, /STDIN<<ordinary author comment>>/);
+    assert.deepEqual(
+      readdirSync(tmp).filter((name) => name.startsWith("gh-stdin.")),
+      [],
+      "the buffered body must not be left behind in TMPDIR",
+    );
+  });
+});
+
+test("a refused invocation leaves no stdin buffer behind either (PEN-3193)", () => {
+  withTempDir((dir) => {
+    const tmp = path.join(dir, "tmp");
+    mkdirSync(tmp);
+    assertRefused(
+      runGuard(dir, ["pr", "comment", "5", "--body-file", "-"], {
+        extraEnv: { TMPDIR: tmp },
+        input: REVIEWER_BODY,
+      }),
+      EVIDENCE,
+    );
+    assert.deepEqual(
+      readdirSync(tmp).filter((name) => name.startsWith("gh-stdin.")),
+      [],
+      "the buffered body must not be left behind in TMPDIR",
+    );
+  });
 });
