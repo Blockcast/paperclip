@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   agents,
   authUsers,
@@ -333,6 +333,40 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const refreshedSkill = refreshedList.find((skill) => skill.id === bundledSkill.id);
 
     expect(refreshedSkill?.updatedAt.toISOString()).toBe(preservedUpdatedAt.toISOString());
+  });
+
+  it("refreshes a settled bundled inventory without the company folder lock (BLO-52499)", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await svc.list(companyId, { sort: "recent" });
+
+    // Another folder mutation holds the company lock; a settled refresh has
+    // nothing to write and must not queue behind it.
+    let releaseLock!: () => void;
+    const holdLock = new Promise<void>((resolve) => { releaseLock = resolve; });
+    let markLockAcquired!: () => void;
+    const lockAcquired = new Promise<void>((resolve) => { markLockAcquired = resolve; });
+    const blocker = db.transaction(async (tx) => {
+      await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`paperclip:folders:${companyId}`}, 0))`);
+      markLockAcquired();
+      await holdLock;
+    });
+    try {
+      await Promise.race([lockAcquired, blocker]);
+      const refreshed = await Promise.race([
+        svc.list(companyId, { sort: "recent" }),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error("list queued on the folder lock")), 10_000)),
+      ]);
+      expect(refreshed.some((skill) => skill.key.startsWith("paperclipai/paperclip/"))).toBe(true);
+    } finally {
+      releaseLock();
+      await blocker;
+    }
   });
 
   it("repairs a squatted bundled root during bundled-skill list refresh", async () => {

@@ -544,6 +544,24 @@ export function folderService(db: Db, mutationLockHeld = false) {
     throw conflict("Could not create project skill folder");
   }
 
+  /**
+   * The category folder as the locked path below would return it when it has
+   * nothing to write, read without the lock; null when it would write.
+   * Committed state only: a prune holding the lock may be deleting it, so a
+   * caller about to file a new skill into the folder must use
+   * ensureBundledCategory. The read-path reconcile, which only files skills
+   * that already exist (prune spares their folders), uses this first: taking
+   * the company lock on every skills read just to find nothing to do held a
+   * pooled connection idle in a transaction per category (BLO-52499).
+   */
+  async function currentBundledCategory(companyId: string, category: string) {
+    const views = Array.from(buildFolderViews(await getRows(companyId, "skill")).values());
+    const systemKey = `bundled:${normalizeFolderSlug(category)}`;
+    const existing = views.find((view) => view.systemKey === systemKey);
+    if (!existing || existing.name !== normalizeName(category)) return null;
+    return views.some((view) => view.systemKey === "bundled") ? existing : null;
+  }
+
   async function ensureBundledCategory(companyId: string, category: string): Promise<Folder> {
     if (!mutationLockHeld) {
       return withCompanyFolderLock(companyId, (lockedDb) => folderService(lockedDb, true).ensureBundledCategory(companyId, category));
@@ -576,13 +594,10 @@ export function folderService(db: Db, mutationLockHeld = false) {
     throw conflict("Could not create bundled skill folder");
   }
 
-  async function pruneEmptyBundledCategories(companyId: string, retainedCategories: string[]): Promise<void> {
-    if (!mutationLockHeld) {
-      return withCompanyFolderLock(companyId, (lockedDb) => folderService(lockedDb, true).pruneEmptyBundledCategories(companyId, retainedCategories));
-    }
-    const root = await findSystemFolder(companyId, "bundled");
-    if (!root) return;
+  async function prunableBundledCategoryIds(companyId: string, retainedCategories: string[]) {
     const rows = await getRows(companyId, "skill");
+    const root = rows.find((row) => row.systemKey === "bundled");
+    if (!root) return [];
     const retainedSystemKeys = new Set(
       retainedCategories.map((category) => `bundled:${normalizeFolderSlug(category)}`),
     );
@@ -594,10 +609,21 @@ export function folderService(db: Db, mutationLockHeld = false) {
         .then((skills) => skills.flatMap((skill) => skill.folderId ? [skill.folderId] : [])),
     );
     const parentIds = new Set(rows.flatMap((row) => row.parentId ? [row.parentId] : []));
-    for (const row of rows) {
-      if (row.parentId !== root.id || !row.systemKey?.startsWith("bundled:")) continue;
-      if (retainedSystemKeys.has(row.systemKey) || usedFolderIds.has(row.id) || parentIds.has(row.id)) continue;
-      await db.delete(folders).where(and(eq(folders.companyId, companyId), eq(folders.id, row.id)));
+    return rows.flatMap((row) => {
+      if (row.parentId !== root.id || !row.systemKey?.startsWith("bundled:")) return [];
+      if (retainedSystemKeys.has(row.systemKey) || usedFolderIds.has(row.id) || parentIds.has(row.id)) return [];
+      return [row.id];
+    });
+  }
+
+  async function pruneEmptyBundledCategories(companyId: string, retainedCategories: string[]): Promise<void> {
+    if (!mutationLockHeld) {
+      // Usually nothing to prune: check without the lock (see currentBundledCategory).
+      if ((await prunableBundledCategoryIds(companyId, retainedCategories)).length === 0) return;
+      return withCompanyFolderLock(companyId, (lockedDb) => folderService(lockedDb, true).pruneEmptyBundledCategories(companyId, retainedCategories));
+    }
+    for (const id of await prunableBundledCategoryIds(companyId, retainedCategories)) {
+      await db.delete(folders).where(and(eq(folders.companyId, companyId), eq(folders.id, id)));
     }
   }
 
@@ -613,6 +639,7 @@ export function folderService(db: Db, mutationLockHeld = false) {
     validateSkillFolder,
     ensureMyFolder,
     ensureProjectFolder,
+    currentBundledCategory,
     ensureBundledCategory,
     pruneEmptyBundledCategories,
   };

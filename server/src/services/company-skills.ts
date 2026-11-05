@@ -2870,7 +2870,10 @@ export function companySkillService(db: Db) {
     for (const skill of shippedSkills) {
       let folder = foldersByCategory.get(skill.category);
       if (!folder) {
-        folder = await folderSvc.ensureBundledCategory(companyId, bundledFolderLabel(skill.category));
+        const label = bundledFolderLabel(skill.category);
+        // Unlocked check first: in steady state there is nothing to write (BLO-52499).
+        folder = await folderSvc.currentBundledCategory(companyId, label)
+          ?? await folderSvc.ensureBundledCategory(companyId, label);
         foldersByCategory.set(skill.category, folder);
       }
       if (skill.folderId === folder.id) continue;
@@ -5703,6 +5706,7 @@ export function companySkillService(db: Db) {
 
   async function upsertImportedSkills(companyId: string, imported: ImportedSkill[]): Promise<CompanySkill[]> {
     const out: CompanySkill[] = [];
+    const currentBundledFolders = new Map<string, Awaited<ReturnType<typeof folderSvc.currentBundledCategory>>>();
     for (const skill of imported) {
       assertImportedSkillKeyAllowed(skill);
       assertImportedSkillSourceAllowed(skill);
@@ -5730,8 +5734,22 @@ export function companySkillService(db: Db) {
       const parsed = parseFrontmatterMarkdown(skill.markdown);
       const storeMetadata = readSkillStoreMetadata(parsed.frontmatter, metadata);
       const bundledCategory = paperclipBundledFolderCategory(skill.key, incomingMeta);
-      const bundledFolder = bundledCategory
-        ? await folderSvc.ensureBundledCategory(companyId, bundledFolderLabel(bundledCategory))
+      const bundledLabel = bundledCategory ? bundledFolderLabel(bundledCategory) : null;
+      // Every refresh re-upserts every bundled skill. One already filed in its
+      // settled category keeps that folder alive (prune spares used folders), so
+      // the unlocked check is safe for it; a new or moving skill takes the
+      // locked ensure (BLO-52499).
+      let current: Awaited<ReturnType<typeof folderSvc.currentBundledCategory>> = null;
+      if (bundledLabel && existing?.folderId) {
+        if (!currentBundledFolders.has(bundledLabel)) {
+          currentBundledFolders.set(bundledLabel, await folderSvc.currentBundledCategory(companyId, bundledLabel));
+        }
+        current = currentBundledFolders.get(bundledLabel) ?? null;
+      }
+      const bundledFolder = bundledLabel
+        ? (current && current.id === existing?.folderId
+          ? current
+          : await folderSvc.ensureBundledCategory(companyId, bundledLabel))
         : null;
       const projectId = asString(incomingMeta.projectId);
       const projectName = asString(incomingMeta.projectName);
