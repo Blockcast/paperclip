@@ -3376,19 +3376,40 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("Re-reading this prompt is not re-reading state.");
   });
 
-  // Deliberate absence with a named trigger, not an oversight. PEN-5340 hands over a
-  // lookup sentence citing `GET /api/companies/:companyId/work-products/by-external-id`,
-  // which Blockcast/paperclip#3310 ships and which 404s until it merges. A directive
-  // citing a 404 teaches a run the lookup is broken. When #3310 merges, add the sentence
-  // (it is recorded verbatim at the call site) and delete this case.
-  it("holds back the owning-row lookup URL until #3310 ships the endpoint", () => {
+  // The inverse of the case this replaces. Blockcast/paperclip#3310 shipped the endpoint
+  // (merged 2026-11-05T03:48:06Z), so the sentence held back behind that trigger is now
+  // present and pinned. The positive control is kept for the same reason the absence
+  // case carried one: an assertion about this sentence must not be satisfiable by the
+  // surrounding section having vanished.
+  it("names the owning-row lookup endpoint, now that #3310 has shipped it", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
-    // Positive control first: a bare `not.toContain` also passes when the whole
-    // section is gone, which is the one way this case could go green while
-    // reporting nothing.
     expect(markdown).toContain("Recording a constraint:");
-    expect(markdown).not.toContain("work-products/by-external-id");
+    expect(markdown).toContain("work-products/by-external-id");
+    // Pinned individually because each clause closes a specific misreading, and a
+    // test matching only the path would pass against a sentence that had lost them.
+    // `YOU MAY READ` + the withheld count are what stop an authorization-filtered
+    // result being read as "this artifact has no owner".
+    expect(markdown).toContain("every owning row YOU MAY READ");
+    expect(markdown).toContain("`withheldForAuthorizationCount > 0`");
+    // The URL form is the one a run has to hand; teaching `%23` first taught it to
+    // re-encode a value the endpoint normalises itself.
+    expect(markdown).toContain("externalId=<the PR's URL>");
+  });
+
+  // Placement, asserted rather than left to reading order. The sentence is author-side
+  // -- it belongs to the rule that says record a constraint on the artifact's owning
+  // row, which cannot be followed without enumerating the owners. In the pre-write list
+  // it would read as a reader-side check that, on the instance that motivated it, would
+  // not have fired: the lookup returns the row the writing run already held.
+  it("places the lookup inside the constraint-recording rule, not the pre-write list", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    const constraintHeading = markdown.indexOf("Recording a constraint:");
+    const lookup = markdown.indexOf("work-products/by-external-id");
+
+    expect(constraintHeading).toBeGreaterThan(-1);
+    expect(lookup).toBeGreaterThan(constraintHeading);
   });
 
   // The containment-only path -- a notice with no issue, wake comment, prReview or

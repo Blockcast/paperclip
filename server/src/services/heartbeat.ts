@@ -13993,18 +13993,28 @@ export function buildPaperclipTaskMarkdown(input: {
     "- Your row's `activeRun` (`paperclipGetIssue`). If a run that is not yours holds it, a sibling of yours is already working this row; do not write over it.",
     "- The pull request's current head (`gh pr view <n> --repo <owner>/<repo> --json headRefOid,state,mergeStateStatus`). If it has moved since you last read it, what you were about to push was computed against a head that no longer exists, and any authorisation scoped to that head has lapsed -- ask again rather than assuming it carried over.",
     "Every value in this block was computed when this run was DISPATCHED, not now. That includes any head SHA, sibling-run id or checkout-contention notice printed above: a sibling run that started after your dispatch appears in none of it. Re-reading this prompt is not re-reading state.",
-    // PEN-5340 hands over one further sentence for this rule -- the reverse lookup that
-    // tells an author WHICH row owns the artifact:
-    //   "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id
-    //    ?externalId=owner/repo%23123` (companyId from `paperclipMe`). It returns EVERY
-    //    owning row, with `provenance: \"webhook\"` marking the authoritative binding."
-    // It is HELD BACK until Blockcast/paperclip#3310 ships that endpoint. A directive
-    // citing a 404 is worse than no directive: it teaches a run the lookup is broken.
-    // Add it here, unchanged, once #3310 merges.
     "",
     "Recording a constraint:",
     "Record a constraint where the work is, not where you are standing. When you write a freeze, prohibition, or required precondition that names a specific artifact (a pull request, a branch, a commit), record it on that artifact's OWNING row -- not only on the row you happen to be writing from. A run working that artifact loads the artifact's own row; it has no reason to load yours. One pull request can have several owning rows; record it on each.",
     "A prohibition issued at 10:15Z was acted against at 13:58Z by a run that had correctly read everything it owned. The constraint was on a third row it had no reason to load.",
+    // PEN-5340: the lookup that makes the rule above followable. It was held back while
+    // `work-products/by-external-id` 404ed -- a directive citing a 404 teaches a run the
+    // lookup is broken -- and Blockcast/paperclip#3310 merged 2026-11-05T03:48:06Z.
+    //
+    // Placed HERE, author-side, rather than in the pre-write list above, and the
+    // distinction is load-bearing. Read before a push it is a reader-side check, and on
+    // the instance that motivated it that check provably would not have fired: #3205's
+    // owning row is PEN-5181, which the writing run already held. Read here it reaches
+    // the actor the rule needs -- the line directly above ends "record it on each",
+    // which is unfollowable without enumerating the owners, and this endpoint is the
+    // only thing that enumerates them.
+    //
+    // "every owning row YOU MAY READ" is exact, not hedging: the service returns every
+    // row, then the route filters through `filterIssuesForActor` and reports the
+    // remainder as `withheldForAuthorizationCount`. Promising "EVERY owning row" would
+    // teach a run that a short list means no owner -- the false absence this endpoint
+    // exists to remove.
+    "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, with `provenance: \"webhook\"` marking the authoritative binding. `withheldForAuthorizationCount > 0` means owners exist that it did not show you -- an empty `owners` list is NOT proof the artifact is unowned.",
   );
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
