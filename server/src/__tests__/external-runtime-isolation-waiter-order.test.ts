@@ -107,6 +107,11 @@ describeEmbeddedPostgres("isolation writer admits waiters oldest-first (BLO-4876
     const err = await bind(young, youngRes.id, key).catch((e) => e);
     expect(err).toBeInstanceOf(ExternalRuntimeIsolationConflictError);
     expect((err as ExternalRuntimeIsolationConflictError).conflictingRunId).toBe(elder);
+    // PEN-5684: the cycle this rolls back is charged to FAIRNESS, not to a busy
+    // tree -- nothing holds the key here, the elder is merely older. The two
+    // are indistinguishable from `conflictingRunId` alone, which is why the
+    // cause is carried as its own field and labels the deferral counter.
+    expect((err as ExternalRuntimeIsolationConflictError).conflictCause).toBe("elder_waiter");
 
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, elder));
     const elderRes = await reserve(elder);

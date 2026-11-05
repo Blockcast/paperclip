@@ -36,6 +36,25 @@ function liveIsolationWaiters(isolationKey: string, now: Date) {
   );
 }
 
+/**
+ * PEN-5684: which of this module's three refusals raised the conflict.
+ *
+ * Carried as a field rather than inferred downstream from `conflictingRunId`,
+ * because that id cannot distinguish them -- all three populate it, and
+ * `elder_waiter` names a run that holds NOTHING (it is merely older and still
+ * contending). Reading "there is a conflicting run id" as "the tree is busy"
+ * is the specific inversion this field exists to prevent: under `elder_waiter`
+ * the tree is frequently free and the cycle was spent on seniority, not on
+ * contention.
+ */
+export type ExternalRuntimeIsolationConflictCause =
+  /** Another live run owns the single-writer index for this key. */
+  | "active_writer"
+  /** An OLDER live waiter is queued on this key, so this run yields (BLO-48769). */
+  | "elder_waiter"
+  /** An unreleased pre-migration `legacy` reservation blocks every keyed bind. */
+  | "legacy_writer";
+
 export class ExternalRuntimeIsolationConflictError extends Error {
   readonly code = "external_runtime_isolation_conflict";
 
@@ -43,10 +62,12 @@ export class ExternalRuntimeIsolationConflictError extends Error {
     readonly runId: string,
     readonly isolationKey: string,
     readonly conflictingRunId: string | null,
+    readonly conflictCause: ExternalRuntimeIsolationConflictCause = "active_writer",
   ) {
     super(
       `External runtime run ${runId} cannot acquire writer ownership for ${isolationKey}`
-      + (conflictingRunId ? `; active run ${conflictingRunId} already owns it` : ""),
+      + (conflictingRunId ? `; active run ${conflictingRunId} already owns it` : "")
+      + ` (cause: ${conflictCause})`,
     );
     this.name = "ExternalRuntimeIsolationConflictError";
   }
@@ -492,6 +513,7 @@ export async function bindExternalRuntimeReservationIsolation(
             input.runId,
             input.isolationKey,
             legacyWriter.runId,
+            "legacy_writer",
           );
         }
         // BLO-48769: the writer goes to the oldest live waiter on this key, not
@@ -518,7 +540,12 @@ export async function bindExternalRuntimeReservationIsolation(
             .limit(1)
             .then((rows) => rows[0] ?? null);
           if (elder) {
-            throw new ExternalRuntimeIsolationConflictError(input.runId, input.isolationKey, elder.id);
+            throw new ExternalRuntimeIsolationConflictError(
+              input.runId,
+              input.isolationKey,
+              elder.id,
+              "elder_waiter",
+            );
           }
         }
       }
@@ -574,6 +601,7 @@ export async function bindExternalRuntimeReservationIsolation(
       input.runId,
       input.isolationKey,
       conflicting?.runId ?? null,
+      "active_writer",
     );
   }
 }
