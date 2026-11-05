@@ -251,13 +251,20 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * them apart, so bracket the fire if the answer matters.
  *
  * Where the constraint actually sits today is DOWNSTREAM of this cap, in
- * the merge queue. Measured 2026-11-04T22:49Z: depth 12, the 20:45Z
- * fire's entire 8-PR output still in it two hours later, the head
- * AWAITING_CHECKS for 5h41m, and a trailing-24h drain of 47 merges =
- * 1.96/hr -- against the 1.67/hr a fully-spent 40/day ceiling would
- * require. A budget running at 35-65% is not the binding constraint, and
- * more fires would add entries to the one that is. Price that before
- * buying frequency.
+ * the merge queue. That conclusion rests on the DEPTH reading alone:
+ * measured 2026-11-04T22:49Z, depth 12, with the 20:45Z fire's entire
+ * 8-PR output still in it two hours later and the head AWAITING_CHECKS
+ * for 5h41m.
+ *
+ * The trailing-24h drain RATE is a separate measurement and does not
+ * support that conclusion -- read on its own it points the other way.
+ * 47 merges = 1.96/hr, against the 1.67/hr a fully-spent 40/day ceiling
+ * would require, means the queue drains FASTER than a saturated ceiling
+ * could feed it, which argues the queue is NOT the limit. What that
+ * figure actually sizes is BUDGET UTILISATION: 35-65%. Both readings
+ * hold at once -- the budget is underspent AND the queue head is slow --
+ * so do not chain them into one sentence. Only the depth reading is
+ * evidence of a constraint. Price that before buying frequency.
  *
  * CAUTION on that merge-count table: it is repo demand, not ROUTINE demand.
  * This routine is one enqueue path among several. Measured 2026-11-04 over
@@ -310,9 +317,10 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * hour, in DESCENDING PR number: 11-02T14:48:38Z n=9, 11-02T20:47:46Z n=6,
  * 11-03T02:50:46Z n=7, 11-03T14:56:06Z n=7, each 22-40s wide at +2.8 to
  * +11.1 min (counts re-measured 2026-11-05; see the merged-anchor bullet
- * above for why each read one lower before). Identity does NOT discriminate -- 77 of the 91 enqueues are
- * `allyblockcast[bot]`, far more than any fire batch, so cluster shape is
- * the only signal. The cap IS reached in practice, just not on either day
+ * above for why each read one lower before). Identity does NOT
+ * discriminate -- 77 of the 91 enqueues are `allyblockcast[bot]`, far
+ * more than any fire batch, so cluster shape is the only signal. The cap
+ * IS reached in practice, just not on either day
  * above: the 2026-11-04T08:45Z fire enqueued exactly 10 in 32s
  * (#3368 down to #3215), against 8 in 31s at 02:45Z the same morning.
  *
