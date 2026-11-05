@@ -1064,32 +1064,50 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
   // identical data. The `desc(activityLog.id)` tiebreaker makes the pick STABLE -- not
   // recency-correct, since `activity_log.id` is a random v4 UUID with no time component.
   //
-  // ON WHAT THIS TEST ACTUALLY PINS -- measured, not assumed. The fixture is built so
-  // the tiebreaker's winner (HIGH id) is the row inserted SECOND, in the hope that an
-  // untiebroken query would keep heap order and pick the other project. IT DOES NOT:
-  // reverting ONLY the tiebreaker leaves both behavioural assertions GREEN, because the
-  // executor happens to present the same row first anyway on this fixture. So the
-  // behavioural half does NOT falsify, and claiming it does would be false.
+  // WHY THIS FIXTURE IS A MIRRORED PAIR. A single tied run cannot falsify the
+  // tiebreaker behaviourally: whichever row the untiebroken executor happens to present
+  // first, a one-run fixture can be read as agreeing with it, and the earlier version of
+  // this test did exactly that -- reverting only the tiebreaker left its behavioural
+  // assertions green, so the `order by` string was the lone pin.
   //
-  // What falsifies is the ORDER BY assertion below, which fails the moment the
-  // tiebreaker is dropped. PEN-5624 anticipated exactly this ("if it cannot be made to
-  // fail reliably ... say so"), and a tie that does not flap on a single-threaded
-  // embedded Postgres cannot be made to flap by trying harder -- the flap needs a plan
-  // or parallelism change this harness will not produce. The behavioural assertions are
-  // kept as a cheap invariant guard (total unmoved, two calls agree), not as the pin.
+  // So the fixture runs the SAME two issues twice, as two runs, swapping only which of
+  // the two tied `activity_log` rows carries the HIGH id. Both runs insert alpha's row
+  // first and beta's second, so every order-determining input the untiebroken query can
+  // see -- heap order, join shape, issue and project ids -- is IDENTICAL across the two
+  // groups. The only difference is the id values, which the untiebroken query ignores.
+  //
+  // That makes the falsification structural rather than lucky. Untiebroken, the executor
+  // must present the same POSITION first in both groups, so both runs attribute to the
+  // SAME project and the two per-project expectations below cannot both hold. Tiebroken,
+  // the HIGH id wins in both, and the runs land on different projects.
+  //
+  // MEASURED, not assumed. Reverting only `desc(activityLog.id)` on `costs.ts` reds this
+  // test 3/3 runs with an identical behavioural failure -- `expected 107 to be 100` on
+  // the alpha assertion, i.e. both runs collapsed onto alpha, the first-inserted row of
+  // each pair. Restoring the tiebreaker returns the 100/7 split. So unlike the single-run
+  // fixture this replaces, the behavioural half IS the pin here; the `order by` assertion
+  // below is kept as a cheap guard on the mechanism, not as the only thing that falsifies.
   it("breaks a created_at tie in run attribution deterministically", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
-    const runId = randomUUID();
-    const losingProjectId = randomUUID();
-    const winningProjectId = randomUUID();
-    const losingIssueId = randomUUID();
-    const winningIssueId = randomUUID();
 
-    // Fixed ids, not random: the tiebreaker is `desc(id)`, so the winner must be known
-    // up front. The LOW id is inserted first, the HIGH id second.
-    const losingActivityId = "00000000-0000-4000-8000-000000000001";
-    const winningActivityId = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+    // Every id below is fixed, not random. The tiebreaker is `desc(id)`, so the intended
+    // winner has to be known up front; and random issue/project ids let the join's row
+    // order vary between runs of the test, which would make the falsification flaky
+    // rather than structural.
+    const alphaProjectId = "a0000000-0000-4000-8000-00000000a1a1";
+    const betaProjectId = "b0000000-0000-4000-8000-00000000b1b1";
+    const alphaIssueId = "a0000000-0000-4000-8000-00000000a2a2";
+    const betaIssueId = "b0000000-0000-4000-8000-00000000b2b2";
+    const highIdRunId = "70000000-0000-4000-8000-000000000001";
+    const lowIdRunId = "70000000-0000-4000-8000-000000000002";
+
+    // Run 1: alpha's touch carries the HIGH activity id, beta's the LOW one.
+    const run1AlphaActivityId = "ffffffff-ffff-4fff-bfff-ffffffffff11";
+    const run1BetaActivityId = "00000000-0000-4000-8000-000000000011";
+    // Run 2: mirrored -- beta's touch carries the HIGH id, alpha's the LOW one.
+    const run2AlphaActivityId = "00000000-0000-4000-8000-000000000022";
+    const run2BetaActivityId = "ffffffff-ffff-4fff-bfff-ffffffffff22";
 
     await db.insert(companies).values({
       id: companyId,
@@ -1109,87 +1127,114 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       permissions: {},
     });
     await db.insert(projects).values([
-      { id: losingProjectId, companyId, name: "Lower Activity Id", status: "active" },
-      { id: winningProjectId, companyId, name: "Higher Activity Id", status: "active" },
+      { id: alphaProjectId, companyId, name: "Alpha", status: "active" },
+      { id: betaProjectId, companyId, name: "Beta", status: "active" },
     ]);
     await db.insert(issues).values([
       {
-        id: losingIssueId,
+        id: alphaIssueId,
         companyId,
-        projectId: losingProjectId,
-        title: "Tied touch A",
+        projectId: alphaProjectId,
+        title: "Tied touch alpha",
         status: "done",
         priority: "medium",
         issueNumber: 1,
         identifier: "TIE-1",
       },
       {
-        id: winningIssueId,
+        id: betaIssueId,
         companyId,
-        projectId: winningProjectId,
-        title: "Tied touch B",
+        projectId: betaProjectId,
+        title: "Tied touch beta",
         status: "done",
         priority: "medium",
         issueNumber: 2,
         identifier: "TIE-2",
       },
     ]);
-    await db.insert(heartbeatRuns).values({
-      id: runId,
-      companyId,
-      agentId,
-      invocationSource: "automation",
-      status: "completed",
-      startedAt: new Date("2026-11-04T09:00:00.000Z"),
-      finishedAt: new Date("2026-11-04T09:30:00.000Z"),
-    });
-
-    // IDENTICAL `created_at` -- this is what one transaction's `now()` produces, written
-    // explicitly so the tie is a property of the fixture rather than of timing luck.
-    const tiedAt = new Date("2026-11-04T09:05:00.000Z");
-    await db.insert(activityLog).values([
+    await db.insert(heartbeatRuns).values([
       {
-        id: losingActivityId,
+        id: highIdRunId,
         companyId,
-        runId,
-        actorType: "agent",
-        actorId: agentId,
         agentId,
-        action: "issue.checked_out",
-        entityType: "issue",
-        entityId: losingIssueId,
-        details: {},
-        createdAt: tiedAt,
+        invocationSource: "automation",
+        status: "completed",
+        startedAt: new Date("2026-11-04T09:00:00.000Z"),
+        finishedAt: new Date("2026-11-04T09:30:00.000Z"),
       },
       {
-        id: winningActivityId,
+        id: lowIdRunId,
         companyId,
-        runId,
-        actorType: "agent",
-        actorId: agentId,
         agentId,
-        action: "issue.checked_out",
-        entityType: "issue",
-        entityId: winningIssueId,
-        details: {},
-        createdAt: tiedAt,
+        invocationSource: "automation",
+        status: "completed",
+        startedAt: new Date("2026-11-04T10:00:00.000Z"),
+        finishedAt: new Date("2026-11-04T10:30:00.000Z"),
       },
     ]);
 
-    await db.insert(costEvents).values({
+    // IDENTICAL `created_at` within each run -- this is what one transaction's `now()`
+    // produces, written explicitly so the tie is a property of the fixture rather than
+    // of timing luck. Alpha's row is inserted first in BOTH runs; only the ids mirror.
+    const run1TiedAt = new Date("2026-11-04T09:05:00.000Z");
+    const run2TiedAt = new Date("2026-11-04T10:05:00.000Z");
+    const touch = (
+      id: string,
+      runId: string,
+      entityId: string,
+      createdAt: Date,
+    ) => ({
+      id,
       companyId,
+      runId,
+      actorType: "agent" as const,
+      actorId: agentId,
       agentId,
-      heartbeatRunId: runId,
-      projectId: null,
-      provider: "anthropic",
-      biller: "anthropic",
-      billingType: "metered_api",
-      model: "claude-opus-5",
-      inputTokens: 1_000,
-      outputTokens: 500,
-      costCents: 100,
-      occurredAt: new Date("2026-11-04T09:10:00.000Z"),
+      action: "issue.checked_out",
+      entityType: "issue",
+      entityId,
+      details: {},
+      createdAt,
     });
+    await db.insert(activityLog).values([
+      touch(run1AlphaActivityId, highIdRunId, alphaIssueId, run1TiedAt),
+      touch(run1BetaActivityId, highIdRunId, betaIssueId, run1TiedAt),
+      touch(run2AlphaActivityId, lowIdRunId, alphaIssueId, run2TiedAt),
+      touch(run2BetaActivityId, lowIdRunId, betaIssueId, run2TiedAt),
+    ]);
+
+    // Distinct amounts so the assertions below name WHICH run landed where, rather than
+    // only how much landed in total.
+    await db.insert(costEvents).values([
+      {
+        companyId,
+        agentId,
+        heartbeatRunId: highIdRunId,
+        projectId: null,
+        provider: "anthropic",
+        biller: "anthropic",
+        billingType: "metered_api",
+        model: "claude-opus-5",
+        inputTokens: 1_000,
+        outputTokens: 500,
+        costCents: 100,
+        occurredAt: new Date("2026-11-04T09:10:00.000Z"),
+      },
+      {
+        companyId,
+        agentId,
+        heartbeatRunId: lowIdRunId,
+        projectId: null,
+        provider: "anthropic",
+        biller: "anthropic",
+        billingType: "metered_api",
+        model: "claude-opus-5",
+        inputTokens: 1_000,
+        outputTokens: 500,
+        costCents: 7,
+        occurredAt: new Date("2026-11-04T10:10:00.000Z"),
+      },
+    ]);
 
     const capturedSql: string[] = [];
     const costsWithCapture = costService(withSqlCapture(db, capturedSql));
@@ -1198,10 +1243,17 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     const second = await costsWithCapture.byProject(companyId);
 
     // Totals are untouched by the tiebreaker -- only WHICH project a tie lands on moves.
-    expect(first.reduce((sum, row) => sum + (row.costCents ?? 0), 0)).toBe(100);
-    expect(first).toHaveLength(1);
-    expect(first[0]?.projectId).toBe(winningProjectId);
-    expect(second[0]?.projectId).toBe(first[0]?.projectId);
+    expect(first.reduce((sum, row) => sum + (row.costCents ?? 0), 0)).toBe(107);
+
+    // The mirrored pair. Run 1's HIGH id is alpha's, run 2's is beta's, so the two runs
+    // must separate. An untiebroken query presents the same position first in both
+    // groups and collapses both runs onto one project -- measured, alpha at 107.
+    const firstByProject = new Map(first.map((row) => [row.projectId, row.costCents]));
+    expect(firstByProject.get(alphaProjectId)).toBe(100);
+    expect(firstByProject.get(betaProjectId)).toBe(7);
+
+    // Stability across repeated calls over identical data -- the flap PEN-5624 names.
+    expect(second).toEqual(first);
 
     const emitted = capturedSql.filter((text) => text.includes("run_project_links"));
     expect(emitted.length).toBeGreaterThan(0);
