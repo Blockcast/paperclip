@@ -502,13 +502,35 @@ env:
     #
     # ⭐ THE VALUE IS THE SEARCH TERM TO PROBE, NOT A BOOLEAN. Setting it to
     # "true" would probe the literal term `true` and measure nothing. Empty or
-    # unset is OFF. `the` is chosen because it is the most expensive term
-    # measured on this workload (24.2s on Penstock, against 0.34s for a
-    # non-matching term) AND because it reliably COMPLETES at offset 0 --
-    # re-verified 2026-11-02T15:3xZ. That second property is load-bearing: the
-    # probe only fires on the success path, so a term that tips over 30s
-    # measures nothing. ⚠️ It selects the EXPENSIVE (`Hash Join`) shape. The
-    # cheap-shape timeouts are a second population and need their own term.
+    # unset is OFF.
+    #
+    # `timeout` (PEN-5296, re-aimed 2026-11-05) replaces the original `the`.
+    # ⛔ The property being preserved is NOT the character count -- it is
+    # TRIGRAM SELECTIVITY, which is what the GIN `gin_trgm_ops` search arms
+    # actually plan on. A 3-char term contributes ~1 trigram, common enough
+    # that the planner estimates the `Append` at 17,500-21,585 and takes the
+    # `Hash Join` shape; a 6-8 char term contributes 4-6 trigrams that must
+    # co-occur, the estimate collapses to ~73, and the planner takes the
+    # `Nested Loop` over `issues_pkey`. Five production captures read
+    # 2026-11-02 bracket the flip at exactly that boundary (cost ~38,500
+    # against 1,554-1,798).
+    #
+    # The hypothesis under test is stated about the `Nested Loop`/`Append`-73
+    # shape, so `the` was aimed at the wrong one: on the `Hash Join` shape the
+    # estimate may simply be RIGHT -- ~20k candidates out of ~6k company
+    # issues plus ~15k company comments is honest work, not a misestimate.
+    # `timeout` is chosen to sit inside the measured 6-8 band AND to be common
+    # in this corpus, because the signature the row needs is a LOW estimate
+    # against a HIGH actual, which is the blowup itself.
+    #
+    # ⚠️ RESIDUAL RISK, stated here rather than discovered later: the probe
+    # fires only on the SUCCESS path, and the cheap shape is the one observed
+    # timing out -- PEN-5223's capture at `searchTermLength` 6 is a TIMED-OUT
+    # statement. So a cheap-shape term can itself exceed 30s and never fire.
+    # That is bounded and self-revealing rather than silent: the probe is
+    # company-agnostic so it fires on whichever company completes first, and a
+    # mis-aimed term is visible in the first capture's own `Append` estimate
+    # and join type.
     #
     # Bounded: at most 3 probes per process, only on an exact term match, and
     # read-only. ⚠️ Each probe re-executes the statement, so a matching request
@@ -524,7 +546,7 @@ env:
     # ⏳ PEN-5296 box 4 turns this back to "" once a probe has landed. Leaving
     # it on is a decision that has to be recorded there, not a default.
     - name: PAPERCLIP_EXPLAIN_ANALYZE_ISSUE_LIST_TERM
-      value: "the"
+      value: "timeout"
 
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
