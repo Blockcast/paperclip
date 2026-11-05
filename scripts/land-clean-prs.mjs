@@ -256,15 +256,17 @@ export const SKIP_LABELS = ["do-not-merge", "review-gate-override"];
  * 8-PR output still in it two hours later and the head AWAITING_CHECKS
  * for 5h41m.
  *
- * The trailing-24h drain RATE is a separate measurement and does not
- * support that conclusion -- read on its own it points the other way.
- * 47 merges = 1.96/hr, against the 1.67/hr a fully-spent 40/day ceiling
- * would require, means the queue drains FASTER than a saturated ceiling
- * could feed it, which argues the queue is NOT the limit. What that
- * figure actually sizes is BUDGET UTILISATION: 35-65%. Both readings
- * hold at once -- the budget is underspent AND the queue head is slow --
- * so do not chain them into one sentence. Only the depth reading is
- * evidence of a constraint. Price that before buying frequency.
+ * The trailing-24h drain RATE is a different measurement in a different
+ * UNIT, and it supports neither conclusion about this cap. 47 merges =
+ * 1.96/hr is whole-repo throughput across every enqueue path, while this
+ * cap governs only this routine's own fire-aligned enqueues -- so
+ * setting it against the 1.67/hr a fully-spent 40/day ceiling would feed
+ * is precisely the cross-unit comparison the CAUTION paragraph below
+ * warns about. Taken as a ratio it would read 47/40 = 118%, which is not
+ * a utilisation of this budget at all. Budget utilisation is 35-65%, and
+ * it comes from the fire-aligned enqueue table above, not from this
+ * rate. Only the depth reading is evidence of a constraint. Price that
+ * before buying frequency.
  *
  * CAUTION on that merge-count table: it is repo demand, not ROUTINE demand.
  * This routine is one enqueue path among several. Measured 2026-11-04 over
