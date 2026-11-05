@@ -122,6 +122,23 @@ const LINES = {
   exitFailSignal: outcomeLine({ outcome: "exit", tool: "git", code: 143 }),
   spawnFailed: outcomeLine({ outcome: "spawn-failed", tool: "gh", code: 1, detail: "ENOENT" }),
 
+  // ⚠ Adversarial: the refusal reason ECHOES CALLER TEXT. `unknown tool
+  // ${JSON.stringify(candidate.tool)}` reflects whatever JSON arrived, so a
+  // caller can embed the literal `detail=<prefix>refusing ` inside its own
+  // tool name. With an UNANCHORED `|~ detail=…` this matched policy_refusal
+  // AND request_error_other in Loki while the classifier counted it once, so
+  // the partition over-totalled and the report blamed a broken matcher.
+  // Found by review on #3409.
+  refusalEchoingDetail: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason(`unknown tool "detail=${SELF_PREFIX}refusing a thing"; expected one of git, gh, github-mcp-server`),
+  }),
+  // The protocol-opening spelling of the same trick.
+  refusalEchoingProtocolDetail: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason(`unknown tool "detail=${SELF_PREFIX}stdin arrived before a request"; expected one of git, gh, github-mcp-server`),
+  }),
+
   // Adversarial: a refusal whose agent-supplied value quotes a prefixed shape.
   // classifyBrokerLine anchors, so these stay refusals; an UNANCHORED
   // contains-matcher would miscount them as startup or accept lines.
@@ -225,6 +242,16 @@ describe("classifyBrokerLine", () => {
 
   it("counts the non-refusal request error under (b), as the residual", () => {
     for (const k of ["requestErrorParse", "requestErrorUnknownTool", "requestErrorSpawn"]) {
+      assert.equal(classifyBrokerLine(LINES[k]), "request_error_other", k);
+    }
+  });
+
+  it("does not let an echoed `detail=` in the reason forge an attributed refusal", () => {
+    // The reason is caller-echoed text. Anchoring is what stops the echo from
+    // being read as the real `detail=` field — in the classifier AND in the
+    // shipped LogQL, which must agree. The agreement test below is what
+    // actually catches the Loki side; this pins the classifier's half.
+    for (const k of ["refusalEchoingDetail", "refusalEchoingProtocolDetail"]) {
       assert.equal(classifyBrokerLine(LINES[k]), "request_error_other", k);
     }
   });

@@ -145,10 +145,10 @@ Copy-pasteable equivalents:
 {namespace="paperclip",container="github-publish-broker"} !~ `^paperclip-github-broker: ` !~ `^(refusing |the broker performs pushes, and this is )`
 
 # [b] policy refusal (attempted egress-policy bypass)
-{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: refused ` |~ `detail=paperclip-github-broker: (refusing |the broker performs pushes, and this is )`
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: refused (git|gh|github-mcp-server|-) code=[0-9]+ detail=paperclip-github-broker: (refusing |the broker performs pushes, and this is )`
 
 # [b] protocol refusal (malformed frame / bad sequence)
-{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: refused ` |~ `detail=paperclip-github-broker: (frame declares |a second request on one connection|stdin arrived before a request|unknown frame kind 0x)`
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: refused (git|gh|github-mcp-server|-) code=[0-9]+ detail=paperclip-github-broker: (frame declares |a second request on one connection|stdin arrived before a request|unknown frame kind 0x)`
 
 # [b] request rejected (unexpected error — neither policy nor protocol)
 {namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: ` !~ `^paperclip-github-broker: (listening on|PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset|(git|gh|github-mcp-server) in /)` !~ `^paperclip-github-broker: (exit|spawn-failed) (git|gh|github-mcp-server|-) code=[0-9]+` !~ `^paperclip-github-broker: refused (git|gh|github-mcp-server|-) code=[0-9]+ detail=paperclip-github-broker: (refusing |the broker performs pushes, and this is |frame declares |a second request on one connection|stdin arrived before a request|unknown frame kind 0x)`

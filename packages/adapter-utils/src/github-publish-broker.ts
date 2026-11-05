@@ -596,13 +596,33 @@ function startChild(
     privateDir: ctx.privateDir,
     env: ctx.env,
   });
-  ctx.log(`paperclip-github-broker: ${request.tool} in ${prepared.cwd}`);
-
   const child = ctx.spawnChild(prepared.command, prepared.argv, {
     cwd: prepared.cwd,
     env: prepared.env,
     stdio: ["pipe", "pipe", "pipe"],
   });
+  // ⚠ AFTER the spawn returns, not before, and the ordering is the §5.3
+  // accept-vs-outcome invariant rather than taste.
+  //
+  // This line is the DENOMINATOR: every accept must be answered by exactly one
+  // outcome of an accepted publish (`exit` 0, `exit` non-zero, `spawn-failed`).
+  // Refusals are deliberately not in that sum, because a refused request never
+  // reached this function.
+  //
+  // `spawn` fails in two different ways. ENOENT and friends arrive
+  // ASYNCHRONOUSLY on `child.on("error")` — the accept belongs there, and
+  // `spawn-failed` answers it. But Node throws `ERR_INVALID_ARG_*`
+  // SYNCHRONOUSLY from the call above, and that throw unwinds into the
+  // handler's `catch`, which calls `refuse` — a `refused` outcome, which the
+  // sum excludes. Logging the accept first would therefore leave an accept
+  // with no countable outcome, and the report would say "an accepted publish
+  // reported no outcome … the broker died mid-publish" about a request that
+  // was merely malformed. Wrong diagnosis, and the §6 rollback standard names
+  // that exact shape as the one most likely to force an unnecessary rollback.
+  //
+  // Logging after the spawn returns makes both paths balance. Found by review
+  // on #3409.
+  ctx.log(`paperclip-github-broker: ${request.tool} in ${prepared.cwd}`);
 
   child.stdout?.on("data", (data: Buffer) => socket.write(encodeFrame(ServerFrameKind.STDOUT, data)));
   child.stderr?.on("data", (data: Buffer) => socket.write(encodeFrame(ServerFrameKind.STDERR, data)));
