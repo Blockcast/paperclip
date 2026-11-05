@@ -35,48 +35,75 @@
 // A dashboard is still worth having on top. It is not what makes stage 1
 // falsifiable by 2026-11-06.
 //
-// ## ⛔ Category (c) IS NOT OBSERVABLE, and this script refuses to print 0 for it
+// ## What the broker emits, and the one thing it deliberately does not
 //
-// Read before trusting any output. §5.3 states the broker "writes refusals and
-// child stderr to its own container's stderr". Verified against `master` at
-// 8be492039 on 2026-11-01, that is **wrong for child stderr entirely and
-// partially wrong for refusals**. There are exactly three stderr sites in
-// packages/adapter-utils/src/github-publish-broker.ts (the `log` definition at
-// :278 and its two call sites, :366 and :417) plus two in
-// github-publish-broker-runtime.ts (:39, :55). Everything else goes to the
-// SOCKET, i.e. back to the agent, and never reaches the container's stderr:
+// Read before trusting any output. This section was rewritten by PEN-5185
+// item 6; the state it describes is `master` at the PEN-5185 merge
+// (71d2d07e3). ⚠ Anchors are SYMBOLS, not line numbers — this comment cited
+// `:271,329,419`, which rotted to `:278,366,417` and then moved again when
+// PEN-5185 landed. Grep the symbol (PEN-5091).
 //
-//   - `sendExit(code)` (:439) frames the child's exit code to the socket. The
-//     child's non-zero exit is therefore NEVER written to the broker's stderr.
-//   - `child.stderr` (:426) is relayed to the socket, not logged.
-//   - `child.on("error")` (:431), i.e. "unable to start the tool", likewise.
-//   - The four protocol-level `refuse()` calls (:349 malformed frame, :355
-//     second request on one connection, :373 stdin before request, :384 unknown
-//     frame kind) are socket-only.
+// Until PEN-5185 the broker reported every publish OUTCOME to the socket — back
+// to the agent — and wrote only its INPUTS to its own stderr. Three classes
+// were therefore structurally unobservable rather than merely quiet, and this
+// script printed NOT OBSERVABLE for them rather than `0`, because `0` and "no
+// child ever failed" are byte-identical and that is the exact confusion §5.3
+// exists to prevent. `sendExit` and `refuse` now log through ONE chokepoint,
+// so those categories are real counts and the NOT OBSERVABLE stopgap is
+// retired for them.
 //
-// So printing `child_nonzero_exit: 0` would be a lie of exactly the shape §5.3
-// warns about -- indistinguishable from "no child ever failed". This script
-// reports that category as NOT OBSERVABLE and carries the query that would work
-// if the broker logged it, so the gap is recorded in code rather than in prose
-// somebody has to remember. See the runbook for the one-line fix.
+// Two line families reach the container stderr, and the split is load-bearing:
 //
-// ## What IS observable, and why these matchers are what they are
+//   - INPUT lines, one per accepted invocation — `${tool} in ${cwd}` from
+//     `startChild`. This is the denominator.
+//   - OUTCOME lines, exactly one per connection, from `formatBrokerOutcomeLine`
+//     via `sendExit`:
 //
-// Message shapes were read from source, not guessed. Two prefix families:
+//         paperclip-github-broker: <verb> <tool|-> code=<n> [detail=<reason>]
 //
-//   - Lines the broker writes about ITSELF are prefixed `paperclip-github-broker: `
-//     -- the listen line (runtime.ts:39), the known startup throw (runtime.ts:33),
-//     the per-invocation accept line (broker.ts:417), and the non-refusal parse
-//     failure (broker.ts:366). That last one is counted as (b): it ends in
-//     refuse(), so it is a rejected request, and it is the only prefixed shape
-//     with no fixed text -- hence it is matched as the COMPLEMENT of the other
-//     three rather than by a pattern of its own.
-//   - `PublishBrokerRefusal` messages pass through UNPREFIXED (broker.ts:363
-//     takes `error.message` verbatim). Every one of them in
-//     github-publish-broker-policy.ts begins either "refusing " or "the broker
-//     performs pushes, and this is ".
+//     with `<verb>` drawn from the closed set OUTCOME_VERBS. ⛔ The VERB, not
+//     the code, separates a refusal from a child exit: `refuse` defaults to 64
+//     and a child can genuinely return 64.
 //
-// That asymmetry is load-bearing and is why the refusal matcher is anchored.
+// Plus the two startup lines from `main()` in github-publish-broker-runtime.ts.
+//
+// ## ⛔ The child's bytes are NOT here, and must never be
+//
+// `child.stderr` is relayed to the SOCKET and nowhere else. It is `git`/`gh`
+// output and can carry a URL with an embedded token; the broker's stderr
+// reaches Loki, which outlives the pod's `ttlSecondsAfterFinished: 300`. So
+// teeing it into the container log would convert this observability surface
+// into a durable credential-disclosure path. The outcome line carries the exit
+// code and the tool name. A refusal also carries its own prose reason —
+// the broker's words, not the child's — scrubbed through
+// `scrubGitHubEgressText` and capped at 1024 chars.
+//
+// That is the one category still dark, and it is dark ON PURPOSE: there is no
+// `child_stderr` query here and there must not be one.
+//
+// ## How a refusal is attributed, and why it is the detail and not the code
+//
+// All five `refuse()` call sites now log. Four never touched the policy module
+// and were invisible before PEN-5185. They are told apart by the REASON, which
+// is the only thing that differs — every one of them exits 64:
+//
+//   - a reason opening with a POLICY_REFUSAL_OPENING is a policy refusal, i.e.
+//     an attempted egress-policy bypass. This is the single most
+//     security-relevant thing the broker can report.
+//   - a reason opening with a PROTOCOL_REFUSAL_OPENING is a malformed or
+//     out-of-sequence frame — a client stutter, not a bypass attempt.
+//   - anything else is a rejected request whose cause is an arbitrary Node
+//     error (a bad JSON body, a workspace-prep failure in `startChild`), and
+//     is the residual bucket AND the novelty signal.
+//
+// ⚠ `PublishBrokerRefusal`'s constructor prefixes EVERY message with
+// `paperclip-github-broker: `, and has since the broker's first commit
+// (ff160679d). So the openings below are the prose AFTER that prefix, and a
+// matcher anchored on the bare prose matches nothing. That mistake shipped
+// once: the pre-PEN-5185 `policy_refusal` query was anchored unprefixed and
+// returned 0 for every window, which then surfaced through the partition check
+// as "a new log line has been added". The test derives these openings from
+// github-publish-broker-policy.ts rather than restating them.
 //
 // Usage:
 //   node scripts/github-publish-broker-soak-queries.mjs [--window 24h] [--json]
@@ -95,16 +122,60 @@ export const BROKERED_TOOLS = ["git", "gh", "github-mcp-server"];
 export const SELF_PREFIX = "paperclip-github-broker: ";
 
 /**
- * Openings of every PublishBrokerRefusal message in
- * github-publish-broker-policy.ts. These reach stderr UNPREFIXED.
+ * Openings of every `PublishBrokerRefusal` message in
+ * github-publish-broker-policy.ts, as the prose AFTER the self prefix.
+ *
+ * ⚠ These do NOT appear at the start of a log line. `PublishBrokerRefusal`
+ * prefixes every message, and `refuse` now routes the message into the outcome
+ * line's `detail=`, so a policy refusal reaches Loki as:
+ *
+ *   paperclip-github-broker: refused - code=64 detail=paperclip-github-broker: refusing ...
+ *
+ * A matcher anchored on the bare prose matches nothing — see the header.
  */
-export const REFUSAL_OPENINGS = ["refusing ", "the broker performs pushes, and this is "];
+export const POLICY_REFUSAL_OPENINGS = ["refusing ", "the broker performs pushes, and this is "];
 
 /**
- * The two fixed prefixed shapes, named once so the LogQL matchers and
- * `classifyBrokerLine` cannot drift apart. The third prefixed shape is the
- * per-tool accept line, built from BROKERED_TOOLS.
+ * Back-compat alias. The pre-PEN-5185 name, kept because it is accurate and
+ * because #3205 is still open against the old spelling; prefer the explicit
+ * POLICY_REFUSAL_OPENINGS in new code, which does not read as "all refusals".
  */
+export const REFUSAL_OPENINGS = POLICY_REFUSAL_OPENINGS;
+
+/**
+ * Openings of the four protocol-level `refuse()` messages in
+ * github-publish-broker.ts — the sites that never touch the policy module and
+ * were entirely invisible before PEN-5185. Also prose after the self prefix.
+ *
+ * `frame declares ` is the `createFrameReader` throw caught by the
+ * `socket.on("data")` handler; the other three are literal.
+ *
+ * ⛔ Keeping these separate from the policy openings is the point of the
+ * category, not decoration: "stdin arrived before a request" is a client
+ * stutter and "refusing `gh auth`" is an attempted credential exfiltration.
+ * A single `refused` count cannot tell an operator which one happened, and
+ * they exit with the same code.
+ */
+export const PROTOCOL_REFUSAL_OPENINGS = [
+  "frame declares ",
+  "a second request on one connection",
+  "stdin arrived before a request",
+  "unknown frame kind 0x",
+];
+
+/**
+ * The closed set of outcome verbs, mirroring `PublishBrokerOutcome` in
+ * packages/adapter-utils/src/github-publish-broker.ts.
+ */
+export const OUTCOME_VERBS = ["exit", "spawn-failed", "refused"];
+
+/**
+ * `formatBrokerOutcomeLine` writes `-` for the tool when the connection was
+ * refused before a request was parsed — there is no tool, and naming one would
+ * invent a door that was never asked for.
+ */
+export const OUTCOME_NO_TOOL = "-";
+
 export const SELF_LISTEN = "listening on";
 export const SELF_WORKSPACE_UNSET = "PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset";
 
@@ -118,6 +189,25 @@ const KNOWN_SELF_SHAPES = [
   escapeForLogqlRegex(SELF_WORKSPACE_UNSET),
   `(${BROKERED_TOOLS.map(escapeForLogqlRegex).join("|")}) in /`,
 ];
+
+/** `git|gh|github-mcp-server|-` — the tool field of an outcome line. */
+const OUTCOME_TOOL_ALT = [...BROKERED_TOOLS, OUTCOME_NO_TOOL].map(escapeForLogqlRegex).join("|");
+
+/**
+ * The refusal reasons that ARE attributed to a named family. `request_error_other`
+ * is the complement of this within `refused`, so this is the single place the
+ * two must agree.
+ */
+const ATTRIBUTED_REFUSAL_ALT = [...POLICY_REFUSAL_OPENINGS, ...PROTOCOL_REFUSAL_OPENINGS]
+  .map(escapeForLogqlRegex)
+  .join("|");
+
+/**
+ * A complete outcome head, used as an EXCLUSION so that prefixed prose merely
+ * beginning with a verb (`exit the building`) is not mistaken for one — which
+ * is exactly how `parseBrokerOutcomeLine` decides.
+ */
+const OUTCOME_HEAD = `(${OUTCOME_VERBS.map(escapeForLogqlRegex).join("|")}) (${OUTCOME_TOOL_ALT}) code=[0-9]+`;
 
 /**
  * The saved query set. `observable: false` entries are the §5.3 categories the
@@ -159,42 +249,57 @@ export const BROKER_QUERIES = [
   {
     id: "policy_refusal",
     category: "b",
-    label: "policy refusal (PublishBrokerRefusal)",
+    label: "policy refusal (attempted egress-policy bypass)",
     observable: true,
-    logql: `${BROKER_STREAM} |~ \`^(${REFUSAL_OPENINGS.map(escapeForLogqlRegex).join("|")})\``,
-    note: "broker.ts:366 logging a policy.ts refusal. Anchored because the messages are unprefixed.",
-  },
-  {
-    id: "request_error_other",
-    category: "b",
-    label: "request rejected (unexpected error — not a policy refusal)",
-    observable: true,
-    // broker.ts:366, the NON-refusal branch. Anything parsePublishBrokerRequest
-    // or startChild throws that is NOT a PublishBrokerRefusal is logged with the
-    // self prefix and then refused, so it is a request rejection and belongs to
-    // (b). Before this row existed those rejections were uncounted AND tripped
-    // the partition check's "a new log line has been added" warning, which was
-    // wrong: nothing had been added. Defined as the complement of the known
-    // prefixed shapes, because the message is an arbitrary Node error string
-    // with no distinguishing text of its own.
+    // `refuse` -> `sendExit(code, "refused", message)`. The reason is the
+    // discriminator, and it is DOUBLY prefixed: the outcome line carries the
+    // self prefix, and PublishBrokerRefusal already prefixed the message.
     logql:
-      `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}\`` +
-      ` !~ \`^${escapeForLogqlRegex(SELF_PREFIX)}(${KNOWN_SELF_SHAPES.join("|")})\``,
+      `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}refused \`` +
+      ` |~ \`detail=${escapeForLogqlRegex(SELF_PREFIX)}(${POLICY_REFUSAL_OPENINGS.map(escapeForLogqlRegex).join("|")})\``,
     note:
-      "broker.ts:366 non-refusal branch — a malformed request, or a workspace-prep failure in " +
-      "startChild. ⚠ This is ALSO where a NEWLY ADDED prefixed line would land: the two are " +
-      "textually indistinguishable, so this count is the novelty signal. If it moves and no " +
-      "publish was rejected, re-read the broker's stderr sites.",
+      "A PublishBrokerRefusal from github-publish-broker-policy.ts. ⚠ The security-relevant " +
+      "category: this is the boundary refusing an attempt to reach the credential. Investigate " +
+      "every one — unlike a protocol refusal, it is never a client bug.",
   },
   {
     id: "protocol_refusal",
     category: "b",
     label: "protocol refusal (malformed frame / bad sequence)",
-    observable: false,
-    logql: `${BROKER_STREAM} |= \`${SELF_PREFIX}\` |~ \`(a second request on one connection|stdin arrived before a request|unknown frame kind)\``,
+    observable: true,
+    // The four non-policy `refuse()` sites. Invisible before PEN-5185.
+    logql:
+      `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}refused \`` +
+      ` |~ \`detail=${escapeForLogqlRegex(SELF_PREFIX)}(${PROTOCOL_REFUSAL_OPENINGS.map(escapeForLogqlRegex).join("|")})\``,
     note:
-      "SOCKET-ONLY. broker.ts refuse() at :349/:355/:373/:384 writes to the socket, not stderr. " +
-      "The query is kept for the day those are logged.",
+      "A malformed or out-of-sequence frame. Ordinarily a client bug, not an attack — but it " +
+      "exits 64 exactly like a policy refusal, which is why the verb and reason, not the code, " +
+      "carry the distinction.",
+  },
+  {
+    id: "request_error_other",
+    category: "b",
+    label: "request rejected (unexpected error — neither policy nor protocol)",
+    observable: true,
+    // The non-refusal branch: whatever `parsePublishBrokerRequest` or
+    // `startChild` threw that was not a PublishBrokerRefusal — a bad JSON
+    // body, an unknown tool, a workspace-prep failure. Arbitrary Node strings
+    // with no fixed shape, so this is the COMPLEMENT of the two named refusal
+    // families within `refused`.
+    // ⚠ A COMPLEMENT, not a pattern. It must absorb BOTH an unattributed
+    // refusal reason AND a prefixed line nobody has written yet, or the
+    // partition stops being total and the report's shortfall check — which
+    // reads a gap as a broken matcher — starts lying about which it is.
+    logql:
+      `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}\`` +
+      ` !~ \`^${escapeForLogqlRegex(SELF_PREFIX)}(${KNOWN_SELF_SHAPES.join("|")})\`` +
+      ` !~ \`^${escapeForLogqlRegex(SELF_PREFIX)}(${escapeForLogqlRegex("exit")}|${escapeForLogqlRegex("spawn-failed")}) (${OUTCOME_TOOL_ALT}) code=[0-9]+\`` +
+      ` !~ \`^${escapeForLogqlRegex(SELF_PREFIX)}refused (${OUTCOME_TOOL_ALT}) code=[0-9]+ detail=${escapeForLogqlRegex(SELF_PREFIX)}(${ATTRIBUTED_REFUSAL_ALT})\``,
+    note:
+      "⚠ This is ALSO where a newly added refusal reason would land, so this count is the " +
+      "novelty signal. If it moves and no publish was rejected, re-read the refusal sites. " +
+      "Before PEN-5185 item 6 this bucket silently absorbed EVERY outcome line, including " +
+      "successful publishes — a clean soak read as all-rejections and the partition still balanced.",
   },
   {
     id: "invocation_accepted",
@@ -202,18 +307,45 @@ export const BROKER_QUERIES = [
     label: "invocations accepted (publish attempts)",
     observable: true,
     logql: `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}(${BROKERED_TOOLS.map(escapeForLogqlRegex).join("|")}) in /\``,
-    note: "broker.ts:417. Per-door publish attempts — the denominator stage 1's observations (b)/(c)/(d) need.",
+    note:
+      "`ctx.log` in `startChild`. Per-door publish attempts. Compare against the outcome total: " +
+      "the two must agree, and §5.3 says so — a dropped outcome line shows up as an IMBALANCE " +
+      "here rather than as a miscount inside a category.",
+  },
+  {
+    id: "child_exit_ok",
+    category: "denominator",
+    label: "child exited 0 (publish succeeded)",
+    observable: true,
+    logql: `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}exit (${[...BROKERED_TOOLS, OUTCOME_NO_TOOL].map(escapeForLogqlRegex).join("|")}) code=0($| )\``,
+    note:
+      "The success case, counted so the outcome families sum to the accept count. Anchored on " +
+      "`code=0$` because an `exit` line carries no detail — `child.on(\"close\")` passes none.",
   },
   {
     id: "child_nonzero_exit",
     category: "c",
     label: "child non-zero exits",
-    observable: false,
-    logql: `${BROKER_STREAM} |~ \`exited with code [1-9]\``,
+    observable: true,
+    // §5.3's category (c). Observable since PEN-5185; this printed NOT
+    // OBSERVABLE before, because `sendExit` framed the code to the socket only.
+    logql: `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}exit (${[...BROKERED_TOOLS, OUTCOME_NO_TOOL].map(escapeForLogqlRegex).join("|")}) code=[1-9][0-9]*($| )\``,
     note:
-      "⛔ NOT OBSERVABLE. sendExit() (broker.ts:439) frames the exit code to the socket and nothing " +
-      "writes it to stderr. This query matches nothing TODAY and would match nothing even if every " +
-      "publish failed. Do not read its 0 as evidence.",
+      "The tool RAN and failed. `code` is the child's own status (or 128+n for a signal). " +
+      "⛔ The child's stderr explaining WHY is socket-only and must stay that way — it can carry " +
+      "a push URL with an embedded token. Read the agent's run log for the reason.",
+  },
+  {
+    id: "spawn_failed",
+    category: "c",
+    label: "spawn failures (the tool never started)",
+    observable: true,
+    // `child.on("error")`. §5.3 did not name this class at all before PEN-5185.
+    logql: `${BROKER_STREAM} |~ \`^${escapeForLogqlRegex(SELF_PREFIX)}spawn-failed \``,
+    note:
+      "exec failed — the tool did NO work. Its own verb rather than an `exit` of 1, because " +
+      "counting it under (c) would overstate child failures and hide a class with a different " +
+      "cause (a missing binary, a broken image) and a different fix.",
   },
 ];
 
@@ -236,9 +368,35 @@ export function assertWindow(window) {
 }
 
 /**
+ * Split an outcome line's body (everything after SELF_PREFIX) into its fields,
+ * or return `null` if it is not an outcome line at all.
+ *
+ * `formatBrokerOutcomeLine` writes exactly:
+ *
+ *   <verb> <tool|-> code=<n>[ detail=<reason>]
+ *
+ * The tool is checked against BROKERED_TOOLS rather than matched as `\S+`, so
+ * a future prefixed line that merely begins with one of the verbs cannot be
+ * mistaken for an outcome. `detail` is already collapsed to one physical line
+ * by the broker, so there is nothing multi-line to handle here.
+ */
+export function parseBrokerOutcomeLine(body) {
+  const m = /^(\S+) (\S+) code=(\d+)(?: detail=(.*))?$/.exec(String(body ?? ""));
+  if (!m) return null;
+  const [, outcome, tool, code, detail] = m;
+  if (!OUTCOME_VERBS.includes(outcome)) return null;
+  if (tool !== OUTCOME_NO_TOOL && !BROKERED_TOOLS.includes(tool)) return null;
+  return { outcome, tool: tool === OUTCOME_NO_TOOL ? null : tool, code: Number(code), detail: detail ?? null };
+}
+
+/**
  * Partition one broker stderr line. Pure, and the reason the query set can be
  * trusted: the queries above and this function must agree, which the tests
  * assert line-by-line against strings taken from the broker source.
+ *
+ * Every branch returns a category, so this is a TOTAL partition: a line that
+ * matches nothing is impossible by construction, which is what lets the report
+ * read a shortfall as a broken matcher rather than as a new log shape.
  */
 export function classifyBrokerLine(line) {
   const text = String(line ?? "");
@@ -249,11 +407,29 @@ export function classifyBrokerLine(line) {
     for (const tool of BROKERED_TOOLS) {
       if (rest.startsWith(`${tool} in /`)) return "invocation_accepted";
     }
-    // broker.ts:366's non-refusal branch. NOT a residual "we do not know what
-    // this is" bucket -- it is a known, counted site. See request_error_other.
+    const outcome = parseBrokerOutcomeLine(rest);
+    if (outcome) {
+      if (outcome.outcome === "spawn-failed") return "spawn_failed";
+      if (outcome.outcome === "exit") return outcome.code === 0 ? "child_exit_ok" : "child_nonzero_exit";
+      // `refused`. The reason tells a bypass attempt from a client stutter;
+      // the code cannot, because both are 64.
+      const reason = (outcome.detail ?? "").startsWith(SELF_PREFIX)
+        ? outcome.detail.slice(SELF_PREFIX.length)
+        : (outcome.detail ?? "");
+      if (POLICY_REFUSAL_OPENINGS.some((o) => reason.startsWith(o))) return "policy_refusal";
+      if (PROTOCOL_REFUSAL_OPENINGS.some((o) => reason.startsWith(o))) return "protocol_refusal";
+      return "request_error_other";
+    }
+    // A prefixed line that is neither a known input shape nor a parseable
+    // outcome. Genuinely novel, and counted rather than dropped.
     return "request_error_other";
   }
-  for (const opening of REFUSAL_OPENINGS) {
+  // Unprefixed. Refusals are NOT unprefixed — PublishBrokerRefusal prefixes
+  // them and they now travel inside `detail=` — so this is a raw Node error
+  // from the runtime's startup catch. The exclusion below is vestigial and
+  // kept deliberately: it costs one comparison and it fails safe if a refusal
+  // ever reaches stderr unwrapped.
+  for (const opening of POLICY_REFUSAL_OPENINGS) {
     if (text.startsWith(opening)) return "policy_refusal";
   }
   return "startup_failure_other";
@@ -294,6 +470,34 @@ export function formatReport(rows, { window, streamTotal, newest }) {
     out.push("  ⚠ The broker stream is EMPTY for this window. Every zero above is");
     out.push("    'no broker pod has run', NOT 'the broker ran cleanly'. Expected");
     out.push("    while enableGitHubPublishBroker is off.");
+  }
+  // §5.3's accept-vs-outcome comparison. The outcome log is BEST-EFFORT: a
+  // throw from `ctx.log` is swallowed so it cannot kill the sidecar, which
+  // means a line can go missing. §5.3 tells the reader what that looks like —
+  // "an imbalance between the accept count and the outcome count, not a
+  // miscount inside a category" — so the tool has to compute it rather than
+  // leave it to whoever remembers the sentence.
+  //
+  // Every accepted invocation ends in exactly one of: exit 0, exit non-zero,
+  // spawn-failed. A refusal is NOT in that sum: a request refused by policy
+  // never reached `startChild` and so was never accepted.
+  const countOf = (id) => rows.find((r) => r.id === id)?.count ?? 0;
+  const accepted = countOf("invocation_accepted");
+  const outcomes = countOf("child_exit_ok") + countOf("child_nonzero_exit") + countOf("spawn_failed");
+  if (accepted !== outcomes) {
+    const missing = accepted - outcomes;
+    out.push("");
+    out.push(`  \u26a0 accept/outcome imbalance: ${accepted} accepted, ${outcomes} outcome line(s).`);
+    if (missing > 0) {
+      out.push(`    ${missing} accepted publish(es) reported no outcome. Either the outcome log`);
+      out.push("    call threw (it is deliberately best-effort, §5.3), or the broker process died");
+      out.push("    mid-publish — which is the §6 'a Job that never renders' shape. Check for a");
+      out.push("    listen line with no matching shutdown before reading any count below as whole.");
+    } else {
+      out.push(`    ${-missing} more outcome(s) than accepts. An outcome without an accept is a`);
+      out.push("    refusal miscounted as a child exit, or a window boundary cutting a publish in");
+      out.push("    half. Re-run with a wider --window before investigating.");
+    }
   }
   const classified = rows.filter((r) => r.observable).reduce((n, r) => n + r.count, 0);
   if (streamTotal > 0 && classified !== streamTotal) {

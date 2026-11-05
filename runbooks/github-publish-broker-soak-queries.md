@@ -32,9 +32,11 @@ Three ways this surface reports "nothing wrong" when it has measured nothing.
 The script handles all three, which is the main reason to use it rather than
 pasting LogQL into Grafana.
 
-1. **Category (c) — child non-zero exits — is NOT OBSERVABLE.** Not "currently
-   quiet". Structurally absent. The script prints `NOT OBSERVABLE`, never `0`.
-   See the next section.
+1. **Every §5.3 category is now a real count** — category (c) included, since
+   PEN-5185. The `NOT OBSERVABLE` machinery is retained for whatever goes dark
+   next: the script prints that, never `0`, for any category the broker cannot
+   emit. ⛔ One class is dark **on purpose** and must stay so — see the next
+   section.
 2. **An empty stream is not a clean stream.** While the gate is off no broker
    pod exists, so every count is 0 and the stream has no lines at all. The
    script detects `streamTotal === 0` and says so explicitly.
@@ -59,39 +61,72 @@ those two counts moving, not as a partition gap.**
 
 ## What reaches the broker container's stderr, and what does not
 
-Read from source at `master` `8be492039` on 2026-11-01. **Grep the symbol, not
-the line number** — these anchors move; §5.3's own citations (`:271,329,419`)
-had already rotted to `:278,366,417` by the time this was written.
+Read from source at `master` `71d2d07e3` (the PEN-5185 merge). **Grep the
+symbol, not the line number** — these anchors move; §5.3's own citations
+(`:271,329,419`) had already rotted to `:278,366,417` before PEN-5185 moved them
+again (PEN-5091).
 
-| §5.3 category | Observable in Loki? | Where |
+Two families reach it, and the split is what makes the counts readable:
+
+- **INPUT**, one line per accepted invocation — `${tool} in ${cwd}` from
+  `startChild`. The denominator.
+- **OUTCOME**, exactly one line per connection, from `formatBrokerOutcomeLine`
+  via `sendExit`:
+
+  ```
+  paperclip-github-broker: <verb> <tool|-> code=<n> [detail=<reason>]
+  ```
+
+| §5.3 category | Observable? | Where |
 |---|---|---|
-| (a) startup failures | ✅ yes | `github-publish-broker-runtime.ts` — the listen line, and `process.stderr.write` on the catch |
-| (b) policy refusals | ⚠️ **partly** | Two observable sites, both through `ctx.log` in `github-publish-broker.ts`: a `PublishBrokerRefusal` from `github-publish-broker-policy.ts` (unprefixed), and the **non-refusal** branch of the same `catch` — anything `parsePublishBrokerRequest` or `startChild` throws, prefixed. The four protocol-level `refuse()` calls are **socket-only** |
-| (c) child non-zero exits | ⛔ **no** | `sendExit()` frames the exit code to the **socket**. Nothing writes it to stderr |
+| (a) startup failures | ✅ | `main()` in `github-publish-broker-runtime.ts` — the listen line and the catch |
+| (b) policy refusals | ✅ | `refused` with a reason opening `refusing ` / `the broker performs pushes, and this is ` |
+| (b) protocol refusals | ✅ | `refused` with one of the four protocol reasons. Dark before PEN-5185 |
+| (b) other rejections | ✅ | `refused` with any other reason — a bad JSON body, a workspace-prep failure |
+| (c) child non-zero exits | ✅ | `exit <tool> code=<n≠0>`. **The category PEN-5185 exists to create** |
+| spawn failures | ✅ | `spawn-failed`. §5.3 did not name this class at all |
+| the child's own stderr | ⛔ **never** | Relayed to the **socket**, back to the agent. See below |
 
-⚠️ **§5.3 states the broker "writes refusals and child stderr to its own
-container's stderr". That is wrong for child stderr entirely** — `child.stderr`
-is relayed to the socket, i.e. back to the agent — **and partly wrong for
-refusals.** There are exactly three stderr sites in `github-publish-broker.ts`
-(the `log` default and its two call sites) plus two in the runtime module.
-Everything else is socket-bound.
+⛔ **The child's bytes are not here and must never be.** `child.stderr` is
+`git`/`gh` output and can carry a push URL with an embedded token; the broker's
+stderr reaches Loki, which outlives the pod's `ttlSecondsAfterFinished: 300`.
+Teeing it into the container log would convert this observability surface into a
+durable credential-disclosure path. **This is the one way to get the change
+wrong, and it is the obvious way.** The test suite pins it: there is no
+`child_stderr` query, and a `ctx.log` near `child.stderr` fails the suite.
+To find out *why* a child exited non-zero, read the **agent's** run log.
 
-**Consequence for the soak.** You can measure *how many publishes were
-attempted* (the per-invocation accept line) and *how many were refused by
-policy*. You **cannot** measure *whether the tool the broker ran succeeded*.
-Stage 1's observations (b) `git push` reaching GitHub, (c) a real `gh` call and
-(d) an MCP tool call must therefore be confirmed **agent-side** — from the run
-log, and from the PR existing — not from the broker container. §5.2 already
-predicts this asymmetry for `gh` and MCP ("the quiet one"); what is new here is
-that the broker's own logs do not close it.
+### Telling a bypass attempt from a client stutter
 
-**The fix, if someone wants category (c) for real,** is one line beside
-`sendExit` in `github-publish-broker.ts`: log the tool and a non-zero code to
-stderr before framing it. It is deliberately **not** bundled into stage 0 —
-§7 is explicit that stage 0 carries no PR merges and changes nothing about the
-broker, and a logging change to the component under test, made days before its
-first soak, is the wrong moment. The query is already in `BROKER_QUERIES` with
-`observable: false`, so it starts working the moment that line lands.
+Every `refuse()` exits **64**, so the exit code cannot separate them — the
+**verb** and the **reason** carry it. That distinction is the most
+security-relevant thing the broker reports:
+
+- **`policy_refusal`** — the boundary refused an attempt to reach the
+  credential (`gh auth`, a push that sets `credential.helper`, a path outside
+  the workspace). **Investigate every one.** It is never a client bug.
+- **`protocol_refusal`** — a malformed or out-of-sequence frame. Ordinarily a
+  client bug.
+- **`request_error_other`** — the residual, and the novelty signal.
+
+⚠️ `PublishBrokerRefusal` prefixes **every** message with
+`paperclip-github-broker: `, and has since the broker's first commit. The
+reason therefore appears inside `detail=` as `detail=paperclip-github-broker: …`
+and a matcher anchored on the bare prose matches **nothing**. That shipped once:
+the pre-PEN-5185 `policy_refusal` query returned 0 for every window.
+
+### Comparing accepts against outcomes
+
+Every accepted invocation ends in exactly one of `exit` 0, `exit` non-zero, or
+`spawn-failed`. A refusal is **not** in that sum — a refused request never
+reached `startChild`, so it has no accept line.
+
+The script computes this and flags a mismatch. It matters because the outcome
+log is deliberately **best-effort**: a throw from `ctx.log` is swallowed so it
+cannot kill the sidecar (an uncaught throw in an EventEmitter callback would end
+the broker process and every publish for the rest of the Job's life). §5.3 tells
+the reader what a dropped line looks like — **an imbalance between the accept
+count and the outcome count, not a miscount inside a category.**
 
 ## The saved queries
 
@@ -100,23 +135,36 @@ first soak, is the wrong moment. The query is already in `BROKER_QUERIES` with
 Copy-pasteable equivalents:
 
 ```logql
-# (a) startup OK — the denominator. A brokered pod with no listen line did not start.
+# [a] startup OK (broker reached listen)
 {namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: listening on`
 
-# (a) startup FAILURE, named
+# [a] startup FAILURE (workspace root unset)
 {namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset`
 
-# (a) startup FAILURE, unexpected — unprefixed, and not a refusal
+# [a] startup FAILURE (unexpected — unprefixed error)
 {namespace="paperclip",container="github-publish-broker"} !~ `^paperclip-github-broker: ` !~ `^(refusing |the broker performs pushes, and this is )`
 
-# (b) policy refusal
-{namespace="paperclip",container="github-publish-broker"} |~ `^(refusing |the broker performs pushes, and this is )`
+# [b] policy refusal (attempted egress-policy bypass)
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: refused ` |~ `detail=paperclip-github-broker: (refusing |the broker performs pushes, and this is )`
 
-# (b) request rejected by a NON-refusal error (malformed request, workspace-prep failure)
-{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: ` !~ `^paperclip-github-broker: (listening on|PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset|(git|gh|github-mcp-server) in /)`
+# [b] protocol refusal (malformed frame / bad sequence)
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: refused ` |~ `detail=paperclip-github-broker: (frame declares |a second request on one connection|stdin arrived before a request|unknown frame kind 0x)`
 
-# denominator: publish attempts, per door
+# [b] request rejected (unexpected error — neither policy nor protocol)
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: ` !~ `^paperclip-github-broker: (listening on|PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset|(git|gh|github-mcp-server) in /)` !~ `^paperclip-github-broker: (exit|spawn-failed) (git|gh|github-mcp-server|-) code=[0-9]+` !~ `^paperclip-github-broker: refused (git|gh|github-mcp-server|-) code=[0-9]+ detail=paperclip-github-broker: (refusing |the broker performs pushes, and this is |frame declares |a second request on one connection|stdin arrived before a request|unknown frame kind 0x)`
+
+# [denominator] invocations accepted (publish attempts)
 {namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: (git|gh|github-mcp-server) in /`
+
+# [denominator] child exited 0 (publish succeeded)
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: exit (git|gh|github-mcp-server|-) code=0($| )`
+
+# [c] child non-zero exits
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: exit (git|gh|github-mcp-server|-) code=[1-9][0-9]*($| )`
+
+# [c] spawn failures (the tool never started)
+{namespace="paperclip",container="github-publish-broker"} |~ `^paperclip-github-broker: spawn-failed `
+```
 ```
 
 Every matcher above is **anchored** at `^` and **case-sensitive**, because
@@ -124,33 +172,38 @@ Every matcher above is **anchored** at `^` and **case-sensitive**, because
 two agree line-for-line. An unanchored `|=` or `!=` matches the prefix anywhere
 in the line, which a refusal quoting an agent-supplied path can satisfy.
 
-**Why the refusal matcher is anchored and unprefixed.** Lines the broker writes
-about *itself* carry `paperclip-github-broker: `. `PublishBrokerRefusal`
-messages do **not** — the handler passes `error.message` through verbatim, and
-every refusal in the policy module opens with `refusing ` or `the broker
-performs pushes, and this is `. Anchoring stops a refusal that *quotes* a
-command from being counted as an invocation.
+**Why the refusal matchers look doubly prefixed.** They are. The outcome line
+carries `paperclip-github-broker: `, and the reason inside `detail=` carries it
+again because `PublishBrokerRefusal` added it. Anchoring stops a refusal that
+*quotes* a command from being counted as an invocation, and the test suite
+derives the openings from `github-publish-broker-policy.ts` rather than
+restating them — a hand-copied opening is how the unprefixed matcher shipped.
 
-## ⚠️ These counters are agent-forgeable today
+## Log forgery: closed by PEN-5185, and why it had to be
 
-Refusal messages interpolate agent-supplied values verbatim — the working
-directory and argument tokens in `github-publish-broker-policy.ts` — and
-nothing on the path to `ctx.log` strips CR/LF. An agent that sends a `cwd`
-containing a newline plus a line of its own choosing gets that line into
-`container="github-publish-broker"`, indistinguishable from one the broker
-wrote. It can inflate any counter here, including a forged accept line.
+Refusal messages and the accept line interpolate agent-supplied values — the
+working directory and argument tokens. A directory name may legitimately contain
+a newline, so an agent that publishes from
+`…/work/x\npaperclip-github-broker: exit git code=0` could emit a **second**
+line into `container="github-publish-broker"`, byte-identical to one the broker
+wrote, forging any counter here including a publish outcome.
 
-**Read a mid-soak spike with that in mind.** The impact today is bounded to
-these counters, which are a dashboard — this is **not** a merge or soak
-blocker, and the same primitive was rated non-blocking on review of
-[#3205](https://github.com/Blockcast/paperclip/pull/3205) at that scope.
+That was a bounded nuisance while these lines were a dashboard, and was rated
+non-blocking at that scope on review of
+[#3205](https://github.com/Blockcast/paperclip/pull/3205). It stopped being
+bounded the moment PEN-5185 made them the **durable record of publish
+outcomes** — the principal who can forge them is exactly the one the broker
+exists to constrain, and a forged `exit 0` is what a later reader finds instead
+of the real outcome, five minutes after the pod is gone.
 
-⛔ **It stops being bounded the moment category (c) lands.** That change makes
-these lines the durable record of publish *outcomes*, and the principal who can
-forge them is the one the broker exists to constrain. **PEN-5185 owns the
-sanitiser and must land it in the same change as the (c) logging**, not as a
-follow-up: a sanitiser that arrives afterwards leaves a window in which the
-lines are trusted and still forgeable.
+`toSingleLogLine` now collapses CR/LF (and U+2028/U+2029) where `log` is built,
+so the one-physical-line property holds **by construction** for every call site
+including a caller-supplied `log`. ⛔ Do not move this guard to the call sites:
+a guard each caller must remember is one the next call site will omit.
+
+⚠️ This bounds forgery to *content within a line*. An agent can still choose a
+`cwd` that makes an accept line read oddly; it can no longer manufacture an
+extra line, which is what made counters forgeable.
 
 ## Verifying the tooling itself
 

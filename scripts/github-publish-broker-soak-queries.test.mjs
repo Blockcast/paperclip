@@ -8,6 +8,10 @@ import {
   BROKERED_TOOLS,
   BROKER_QUERIES,
   BROKER_STREAM,
+  OUTCOME_NO_TOOL,
+  OUTCOME_VERBS,
+  POLICY_REFUSAL_OPENINGS,
+  PROTOCOL_REFUSAL_OPENINGS,
   REFUSAL_OPENINGS,
   SELF_LISTEN,
   SELF_PREFIX,
@@ -18,11 +22,32 @@ import {
   escapeForLogqlRegex,
   formatReport,
   parseArgs,
+  parseBrokerOutcomeLine,
   windowNanos,
 } from "./github-publish-broker-soak-queries.mjs";
 
-// Verbatim from the broker on `master` 8be492039. If a message is reworded
-// these fixtures must be re-copied from source -- that is the point of them.
+const SRC = join(dirname(fileURLToPath(import.meta.url)), "..", "packages", "adapter-utils", "src");
+
+/**
+ * Build an outcome line the way `formatBrokerOutcomeLine` does, from its
+ * literal template. Every outcome fixture below goes through this, so a change
+ * to that template breaks these tests rather than silently making them
+ * fictional — which is exactly what went wrong with the refusal fixtures: they
+ * were hand-copied UNPREFIXED while `PublishBrokerRefusal` prefixes every
+ * message, so the suite was green against strings the broker never emits.
+ */
+function outcomeLine({ outcome, tool, code, detail }) {
+  const parts = [`${SELF_PREFIX}${outcome} ${tool ?? OUTCOME_NO_TOOL} code=${code}`];
+  if (detail !== undefined) parts.push(`detail=${detail}`);
+  return parts.join(" ");
+}
+
+/** A refusal reason as `refuse` receives it — ALWAYS self-prefixed. */
+const refusalReason = (prose) => `${SELF_PREFIX}${prose}`;
+
+// Verbatim from the broker on `master` at the PEN-5185 merge (71d2d07e3). If a
+// message is reworded these fixtures must be re-copied from source -- that is
+// the point of them.
 const LINES = {
   listening: `${SELF_PREFIX}listening on /run/paperclip/github-broker.sock, publishing from under /paperclip/work`,
   startupUnset: `${SELF_PREFIX}PAPERCLIP_GITHUB_BROKER_WORKSPACE_ROOT is unset; refusing to start without a workspace root to confine requests to`,
@@ -30,21 +55,84 @@ const LINES = {
   acceptGit: `${SELF_PREFIX}git in /paperclip/work/repo`,
   acceptGh: `${SELF_PREFIX}gh in /paperclip/work/repo`,
   acceptMcp: `${SELF_PREFIX}github-mcp-server in /paperclip/work/repo`,
-  refusalNotPush: "the broker performs pushes, and this is `git status`. Everything git does that is not a publish runs locally in your own container — call it there.",
-  refusalConfig: "refusing a push that sets git config itself (`-c`). `credential.helper` is multi-valued",
-  refusalGhVerb: 'refusing `gh auth`: it is a route from "the broker runs gh for me" back to holding the token itself',
-  refusalRelCwd: "refusing a relative working directory `../elsewhere`",
-  refusalOutside: "refusing a working directory outside the shared workspace: `/etc` resolves to `/etc`, which is not under `/paperclip/work`.",
-  refusalArgPath: "refusing an argument that names a file outside the shared workspace: `/etc/shadow` resolves to `/etc/shadow`.",
-  // broker.ts:366 NON-refusal branch: whatever parsePublishBrokerRequest or
-  // startChild threw, stringified. Arbitrary Node messages -- no fixed shape.
-  requestErrorParse: `${SELF_PREFIX}Unexpected end of JSON input`,
-  requestErrorSpawn: `${SELF_PREFIX}EACCES: permission denied, mkdir '/paperclip/work/repo/.git'`,
+
+  // (b) POLICY refusals -- a PublishBrokerRefusal, prefixed by its own
+  // constructor and then carried inside the outcome line's `detail=`.
+  refusalNotPush: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason("the broker performs pushes, and this is `git status`. Everything git does that is not a publish runs locally in your own container — call it there."),
+  }),
+  refusalConfig: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason("refusing a push that sets git config itself (`-c`). `credential.helper` is multi-valued"),
+  }),
+  refusalGhVerb: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason('refusing `gh auth`: it is a route from "the broker runs gh for me" back to holding the token itself'),
+  }),
+  refusalRelCwd: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason("refusing a relative working directory `../elsewhere`"),
+  }),
+  refusalOutside: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason("refusing a working directory outside the shared workspace: `/etc` resolves to `/etc`, which is not under `/paperclip/work`."),
+  }),
+  refusalArgPath: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason("refusing an argument that names a file outside the shared workspace: `/etc/shadow` resolves to `/etc/shadow`."),
+  }),
+
+  // (b) PROTOCOL refusals -- the four sites that never touch the policy module
+  // and were entirely dark before PEN-5185.
+  protoFrameDeclares: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason("frame declares 9999999 bytes, over the 1048576-byte cap"),
+  }),
+  protoSecondRequest: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason("a second request on one connection; one publish per connection"),
+  }),
+  protoStdinEarly: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason("stdin arrived before a request"),
+  }),
+  protoUnknownKind: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason("unknown frame kind 0x7f"),
+  }),
+
+  // (b) the NON-refusal branch: an arbitrary Node/protocol error, refused.
+  requestErrorParse: outcomeLine({
+    outcome: "refused", tool: null, code: 64, detail: refusalReason("request is not valid JSON"),
+  }),
+  requestErrorUnknownTool: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason('unknown tool "curl"; expected one of git, gh, github-mcp-server'),
+  }),
+  requestErrorSpawn: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason("EACCES: permission denied, mkdir '/paperclip/work/repo/.git'"),
+  }),
+
+  // (c) and the denominator.
+  exitOkGit: outcomeLine({ outcome: "exit", tool: "git", code: 0 }),
+  exitOkGh: outcomeLine({ outcome: "exit", tool: "gh", code: 0 }),
+  exitFailGh: outcomeLine({ outcome: "exit", tool: "gh", code: 7 }),
+  exitFailSignal: outcomeLine({ outcome: "exit", tool: "git", code: 143 }),
+  spawnFailed: outcomeLine({ outcome: "spawn-failed", tool: "gh", code: 1, detail: "ENOENT" }),
+
   // Adversarial: a refusal whose agent-supplied value quotes a prefixed shape.
-  // classifyBrokerLine uses startsWith, so these are refusals; an UNANCHORED
+  // classifyBrokerLine anchors, so these stay refusals; an UNANCHORED
   // contains-matcher would miscount them as startup or accept lines.
-  refusalQuotingListen: `refusing a relative working directory \`${SELF_PREFIX}${SELF_LISTEN} /x\``,
-  refusalQuotingUnset: `refusing a relative working directory \`${SELF_PREFIX}${SELF_WORKSPACE_UNSET}\``,
+  refusalQuotingListen: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason(`refusing a relative working directory \`${SELF_PREFIX}${SELF_LISTEN} /x\``),
+  }),
+  refusalQuotingUnset: outcomeLine({
+    outcome: "refused", tool: null, code: 64,
+    detail: refusalReason(`refusing a relative working directory \`${SELF_PREFIX}${SELF_WORKSPACE_UNSET}\``),
+  }),
 };
 
 /** Compile the `|~ \`...\`` matcher out of a query so the test checks the SHIPPED regex. */
@@ -94,49 +182,135 @@ describe("classifyBrokerLine", () => {
     }
   });
 
-  it("covers every brokered tool, so a fourth door cannot be added silently", () => {
-    assert.deepEqual(BROKERED_TOOLS, ["git", "gh", "github-mcp-server"]);
-    for (const tool of BROKERED_TOOLS) {
-      assert.equal(classifyBrokerLine(`${SELF_PREFIX}${tool} in /paperclip/work/x`), "invocation_accepted");
+  it("counts category (c) — the whole point of PEN-5185", () => {
+    // Before PEN-5185 `sendExit` framed the exit code to the SOCKET and nothing
+    // wrote it to stderr, so this category printed NOT OBSERVABLE. Before item
+    // 6 the lines existed but landed in `request_error_other`.
+    assert.equal(classifyBrokerLine(LINES.exitFailGh), "child_nonzero_exit");
+    assert.equal(classifyBrokerLine(LINES.exitFailSignal), "child_nonzero_exit");
+  });
+
+  it("does NOT count a successful publish as a failure or a rejection", () => {
+    // The regression item 6 exists to fix: every outcome line, including
+    // `exit git code=0`, fell through to `request_error_other`, whose label
+    // reads "request rejected". A clean soak reported as all-rejections AND
+    // the partition still balanced, so nothing warned.
+    for (const k of ["exitOkGit", "exitOkGh"]) {
+      assert.equal(classifyBrokerLine(LINES[k]), "child_exit_ok", k);
     }
   });
 
-  it("counts the broker.ts:366 non-refusal request error, which is a KNOWN site", () => {
-    // Regression for the finding on #3205: this site is logged to stderr with
-    // the self prefix and matched no query, so (b) undercounted it AND the
-    // partition check cried "a new log line has been added" when none had been.
-    for (const k of ["requestErrorParse", "requestErrorSpawn"]) {
+  it("gives a spawn failure its own class, not `exit 1`", () => {
+    // The tool never ran. Folding it into (c) would overstate child failures
+    // and hide a class §5.3 did not name at all.
+    assert.equal(classifyBrokerLine(LINES.spawnFailed), "spawn_failed");
+  });
+
+  it("separates a POLICY refusal from a PROTOCOL refusal, which the code cannot", () => {
+    // Both exit 64. The reason is the only discriminator, and the distinction
+    // is security-relevant: an attempted egress bypass vs a client stutter.
+    for (const k of ["protoFrameDeclares", "protoSecondRequest", "protoStdinEarly", "protoUnknownKind"]) {
+      assert.equal(classifyBrokerLine(LINES[k]), "protocol_refusal", k);
+    }
+    for (const k of ["refusalNotPush", "refusalConfig", "refusalGhVerb", "refusalRelCwd", "refusalOutside", "refusalArgPath"]) {
+      assert.equal(classifyBrokerLine(LINES[k]), "policy_refusal", k);
+    }
+    // Same verb, same code, different category — stated outright.
+    for (const k of [...["refusalNotPush", "refusalConfig", "refusalGhVerb", "refusalRelCwd", "refusalOutside", "refusalArgPath"], ...["protoFrameDeclares", "protoSecondRequest", "protoStdinEarly", "protoUnknownKind"]]) {
+      const parsed = parseBrokerOutcomeLine(LINES[k].slice(SELF_PREFIX.length));
+      assert.equal(parsed.outcome, "refused", k);
+      assert.equal(parsed.code, 64, k);
+    }
+  });
+
+  it("counts the non-refusal request error under (b), as the residual", () => {
+    for (const k of ["requestErrorParse", "requestErrorUnknownTool", "requestErrorSpawn"]) {
       assert.equal(classifyBrokerLine(LINES[k]), "request_error_other", k);
     }
   });
 
+  it("derives the policy openings from policy.ts, so they cannot be hand-copied wrong", () => {
+    // The #3205 finding generalised. The shipped fixtures used to be
+    // UNPREFIXED refusals, which PublishBrokerRefusal never produces, so the
+    // suite was green against strings the broker cannot emit and the shipped
+    // query matched nothing in production.
+    const src = readFileSync(join(SRC, "github-publish-broker-policy.ts"), "utf8");
+    const ctor = /super\(message\.startsWith\("paperclip-github-broker"\) \? message : `paperclip-github-broker: \$\{message\}`\)/;
+    assert.match(src, ctor, "PublishBrokerRefusal no longer prefixes — every refusal matcher must be re-derived");
+
+    // Every refusal message in policy.ts must open with a known opening.
+    const messages = [...src.matchAll(/new PublishBrokerRefusal\(\s*(`|")([\s\S]{0,80})/g)].map((m) => m[2]);
+    assert.ok(messages.length >= 9, `expected policy.ts refusals, found ${messages.length}`);
+    for (const msg of messages) {
+      assert.ok(
+        POLICY_REFUSAL_OPENINGS.some((o) => msg.startsWith(o)),
+        `policy.ts refusal opens with an unknown phrase, so policy_refusal would miss it:\n  ${msg}`,
+      );
+    }
+  });
+
+  it("derives the protocol openings from broker.ts, so a fifth site cannot go dark", () => {
+    const src = readFileSync(join(SRC, "github-publish-broker.ts"), "utf8");
+    // The literal protocol refusals. The variable one (`frame declares`) comes
+    // from createFrameReader and is asserted against protocol.ts below.
+    for (const opening of ["a second request on one connection", "stdin arrived before a request", "unknown frame kind 0x"]) {
+      assert.ok(src.includes(opening), `broker.ts no longer writes ${JSON.stringify(opening)}`);
+      assert.ok(PROTOCOL_REFUSAL_OPENINGS.includes(opening), `${opening} missing from PROTOCOL_REFUSAL_OPENINGS`);
+    }
+    const proto = readFileSync(join(SRC, "github-publish-broker-protocol.ts"), "utf8");
+    assert.ok(proto.includes("frame declares "), "createFrameReader no longer says `frame declares`");
+  });
+
+  it("mirrors the broker's outcome verbs exactly", () => {
+    const src = readFileSync(join(SRC, "github-publish-broker.ts"), "utf8");
+    for (const verb of OUTCOME_VERBS) {
+      assert.ok(src.includes(`| "${verb}"`) || src.includes(`"${verb}"`), `broker.ts no longer knows verb ${verb}`);
+    }
+    assert.deepEqual(OUTCOME_VERBS, ["exit", "spawn-failed", "refused"]);
+  });
+
+  it("covers every brokered tool, so a fourth door cannot be added silently", () => {
+    assert.deepEqual(BROKERED_TOOLS, ["git", "gh", "github-mcp-server"]);
+    for (const tool of BROKERED_TOOLS) {
+      assert.equal(classifyBrokerLine(`${SELF_PREFIX}${tool} in /paperclip/work/x`), "invocation_accepted");
+      assert.equal(classifyBrokerLine(`${SELF_PREFIX}exit ${tool} code=0`), "child_exit_ok");
+      assert.equal(classifyBrokerLine(`${SELF_PREFIX}exit ${tool} code=3`), "child_nonzero_exit");
+    }
+  });
+
   it("does not mistake a self-prefixed novelty for a startup failure", () => {
-    // A genuinely new prefixed line is textually indistinguishable from the
-    // :366 error, so it lands in the same counted bucket by design -- never in
-    // 'unexpected startup error', which is the unprefixed residual.
     assert.equal(classifyBrokerLine(`${SELF_PREFIX}something nobody has written yet`), "request_error_other");
   });
 
+  it("does not mistake a prefixed line that merely starts with a verb for an outcome", () => {
+    // `parseBrokerOutcomeLine` checks the TOOL against BROKERED_TOOLS, so prose
+    // beginning "exit ..." cannot score as a child exit.
+    assert.equal(classifyBrokerLine(`${SELF_PREFIX}exit the building code=0`), "request_error_other");
+    assert.equal(classifyBrokerLine(`${SELF_PREFIX}refused to elaborate`), "request_error_other");
+    assert.equal(parseBrokerOutcomeLine("exit curl code=0"), null);
+    assert.equal(parseBrokerOutcomeLine("sauntered-off gh code=0"), null);
+  });
+
   it("reads an adversarial refusal that quotes a prefixed shape as a refusal", () => {
-    // classifyBrokerLine anchors with startsWith; the shipped matchers must too.
     for (const k of ["refusalQuotingListen", "refusalQuotingUnset"]) {
       assert.equal(classifyBrokerLine(LINES[k]), "policy_refusal", k);
     }
   });
 
-  it("treats a refusal as a refusal even though it is unprefixed", () => {
-    // broker.ts:363 passes PublishBrokerRefusal.message through verbatim. If
-    // that ever gains the self prefix this assertion fails, which is correct:
-    // the anchored refusal query would stop matching.
-    for (const opening of REFUSAL_OPENINGS) {
-      assert.ok(!opening.startsWith(SELF_PREFIX));
+  it("keeps the vestigial unprefixed-refusal branch, which fails safe", () => {
+    // Refusals are no longer unprefixed — they travel inside `detail=`. The
+    // branch is kept so a refusal reaching stderr unwrapped is still counted
+    // as a refusal rather than as an unexpected startup error.
+    for (const opening of POLICY_REFUSAL_OPENINGS) {
       assert.equal(classifyBrokerLine(`${opening}whatever`), "policy_refusal");
     }
+    assert.equal(REFUSAL_OPENINGS, POLICY_REFUSAL_OPENINGS, "back-compat alias must not drift");
   });
 
   it("handles empty and nullish input without throwing", () => {
     assert.equal(classifyBrokerLine(""), "startup_failure_other");
     assert.equal(classifyBrokerLine(undefined), "startup_failure_other");
+    assert.equal(parseBrokerOutcomeLine(undefined), null);
   });
 });
 
@@ -194,21 +368,53 @@ describe("shipped LogQL matchers agree with classifyBrokerLine", () => {
   });
 });
 
-describe("the §5.3 gap is encoded, not merely documented", () => {
-  it("marks child non-zero exits NOT observable", () => {
+describe("the §5.3 categories are counted, and the one dark class stays dark", () => {
+  it("counts child non-zero exits — category (c), the row's reason for existing", () => {
     const q = BROKER_QUERIES.find((x) => x.id === "child_nonzero_exit");
     assert.equal(q.category, "c");
-    assert.equal(q.observable, false, "sendExit() is socket-only; a 0 here would be a false all-clear");
+    assert.equal(q.observable, true, "sendExit logs through ctx.log since PEN-5185");
   });
 
-  it("marks protocol refusals NOT observable", () => {
-    assert.equal(BROKER_QUERIES.find((x) => x.id === "protocol_refusal").observable, false);
+  it("counts protocol refusals and spawn failures, which were entirely dark", () => {
+    assert.equal(BROKER_QUERIES.find((x) => x.id === "protocol_refusal").observable, true);
+    const spawn = BROKER_QUERIES.find((x) => x.id === "spawn_failed");
+    assert.ok(spawn, "spawn failure has no query — §5.3 did not name the class, so it must be named here");
+    assert.equal(spawn.observable, true);
+  });
+
+  it("keeps NOT OBSERVABLE available, so a future dark category cannot print 0", () => {
+    // Every category is observable TODAY. The mechanism is the thing being
+    // retained, per done-when 6: the next class the broker cannot emit must
+    // still be able to say so rather than report a false all-clear.
+    const out = formatReport(
+      [{ id: "z", category: "c", label: "something dark", observable: false, count: null }],
+      { window: "24h", streamTotal: 1, newest: "2026-11-05T09:00:00.000Z" },
+    );
+    assert.match(out, /something dark\s+NOT OBSERVABLE/);
+    assert.doesNotMatch(out, /something dark\s+0/);
+  });
+
+  it("⛔ ships NO query for the child's own stderr, and must never", () => {
+    // The one way to get PEN-5185 wrong. child.stderr is git/gh output and can
+    // carry a push URL with an embedded token; the broker's stderr reaches
+    // Loki, which outlives ttlSecondsAfterFinished: 300. A query here would
+    // mean someone had teed it into the container log.
+    for (const q of BROKER_QUERIES) {
+      assert.ok(!/child[_ ]?stderr/i.test(q.id + q.label + q.note), `${q.id} looks like a child-stderr query`);
+    }
+    const src = readFileSync(join(SRC, "github-publish-broker.ts"), "utf8");
+    const relay = /child\.stderr\?\.on\("data", \(data: Buffer\) => socket\.write\(/;
+    assert.match(src, relay, "child.stderr must be relayed to the SOCKET only");
+    assert.ok(
+      !/child\.stderr[\s\S]{0,200}ctx\.log/.test(src),
+      "child.stderr is being written to the container log — this is the credential-disclosure path §5.3 forbids",
+    );
   });
 
   it("counts the non-refusal request error under (b), observably", () => {
     const q = BROKER_QUERIES.find((x) => x.id === "request_error_other");
     assert.equal(q.category, "b", "a rejected request is a (b) event, not a startup failure");
-    assert.equal(q.observable, true, "broker.ts:366 reaches stderr via ctx.log — it IS observable");
+    assert.equal(q.observable, true);
   });
 
   it("covers all three §5.3 categories plus a denominator", () => {
@@ -221,6 +427,42 @@ describe("the §5.3 gap is encoded, not merely documented", () => {
       assert.ok(q.logql.startsWith(BROKER_STREAM), `${q.id} is not scoped to the broker stream`);
     }
     assert.match(BROKER_STREAM, /container="github-publish-broker"/);
+  });
+});
+
+describe("accept and outcome counts are compared, as §5.3 promises a reader", () => {
+  const row = (id, count) => ({ id, category: "x", label: id, observable: true, count });
+  const base = (accepted, ok, bad, spawn) => [
+    row("invocation_accepted", accepted),
+    row("child_exit_ok", ok),
+    row("child_nonzero_exit", bad),
+    row("spawn_failed", spawn),
+  ];
+
+  it("stays quiet when every accepted publish reported an outcome", () => {
+    const out = formatReport(base(5, 3, 1, 1), { window: "24h", streamTotal: 10, newest: "x" });
+    assert.doesNotMatch(out, /imbalance/);
+  });
+
+  it("reports a dropped outcome line as an imbalance, not as a miscount", () => {
+    // §5.3: the outcome log is best-effort (a throw must not kill the sidecar),
+    // so this is the reader's signal that a line went missing.
+    const out = formatReport(base(5, 2, 1, 0), { window: "24h", streamTotal: 10, newest: "x" });
+    assert.match(out, /accept\/outcome imbalance: 5 accepted, 3 outcome line\(s\)/);
+    assert.match(out, /2 accepted publish\(es\) reported no outcome/);
+  });
+
+  it("reports a surplus of outcomes differently from a shortfall", () => {
+    const out = formatReport(base(1, 2, 1, 0), { window: "24h", streamTotal: 10, newest: "x" });
+    assert.match(out, /2 more outcome\(s\) than accepts/);
+  });
+
+  it("does not count a refusal as an outcome of an accepted publish", () => {
+    // A refused request never reached startChild, so it has no accept line.
+    // Counting it here would mask a genuinely dropped outcome.
+    const rows = [...base(2, 2, 0, 0), row("policy_refusal", 7), row("protocol_refusal", 3)];
+    const out = formatReport(rows, { window: "24h", streamTotal: 14, newest: "x" });
+    assert.doesNotMatch(out, /imbalance/);
   });
 });
 
