@@ -322,8 +322,12 @@ claim to have checked.
 The table above is about absence. This is its converse, and it is the one false
 clear the agent-declared design does **not** remove: the sweep observes a
 **state**, never a mechanism. `observed` says the declared row reached the
-declared status, or the declared PR merged. It says nothing about *why* — and
-the card's `note`, printed beside that verdict, is free text nothing verified.
+declared status *or any later one on the ladder*, or that the declared PR merged.
+It says nothing about *why*. The card's `note` is the one part of a declaration
+nothing can check: the sweep never reads it — `ClassifiedRow` carries no note
+field, and `observed` leaves the sweep as a bare count with no per-card sample —
+so it reaches a reader only on the card, where whoever actions or acknowledges
+that card reads it alongside the verdict.
 
 Worked instance, 2026-11-05 ([PEN-2965](https://paperclip.blockcast.net/PEN/issues/PEN-2965),
 card `c7cba391`). It declared `issue_status` → PEN-4392 `done`, with the note:
@@ -347,12 +351,14 @@ It went `pending` → `cancelled` and never reached `accepted`, so
 `WHERE ti.status = 'accepted'` excluded it throughout. It is a *replayable*
 false clear rather than one this sweep served: an accepted card carrying that
 same declaration would have resolved PEN-4392 to `done` through the
-`issue_status` observer above and bucketed `observed`, with the false note
-printed beside the green as corroboration.
+`issue_status` observer above and bucketed `observed` — leaving that false note
+standing unchallenged on the card for whoever actioned it next.
 
 Note what was *not* wrong: the declaration was well-formed and the sweep would
-have resolved exactly the row it named. AMENDMENT 1 removed the **wrong object**
-failure; this is the **right object, wrong meaning** failure, and no observer
+have resolved exactly the row it named. The PEN-4409 decision to have the filing
+agent **declare** the outcome rather than have it extracted from the card's prose
+(see *"Why this is declared and never extracted from the card's prose"* below)
+removed the **wrong object** failure; this is the **right object, wrong meaning** failure, and no observer
 can close it, because the cause is not in the database at all. So it is closed
 at the ask instead — a `note` must state what the status change is **evidence
 of**, never what **caused** it. *"Done means this row is no longer a gate on

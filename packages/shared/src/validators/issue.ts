@@ -1246,12 +1246,13 @@ export const requestConfirmationTargetSchema = z.discriminatedUnion("type", [
  */
 const expectedOutcomeNoteSchema = z.string().trim().min(1).max(500).nullable().optional()
   .describe(
-    "Free-text for a human reading the sweep output. Never parsed, never matched — which is "
-    + "exactly what makes it dangerous: it is printed beside a verdict that LOOKS checked, so a "
-    + "note claiming more than the sweep can see lends that verdict corroboration nothing "
-    + "verified. ⚠ Write what the declared outcome is EVIDENCE OF, never what CAUSED it. The "
-    + "sweep observes a STATE, never a mechanism: `observed` proves the row reached the declared "
-    + "status (or the PR merged), and never proves your reason is why. Measured instance "
+    "Free-text shown on the card itself. The sweep NEVER reads it — no observer, no bucket, no "
+    + "output line — so it is the one part of a declaration nothing can check, and it reaches a "
+    + "reader only through whoever actions or acknowledges the card. ⚠ Write what the declared "
+    + "outcome is EVIDENCE OF, never what CAUSED it. The sweep observes a STATE, never a "
+    + "mechanism: `observed` proves the row reached the declared status OR ANY LATER ONE on the "
+    + "`backlog < todo < in_progress < in_review < done` ladder (or that the PR merged), and never "
+    + "proves your reason is why. Measured instance "
     + "(PEN-2965, card `c7cba391`) — declared `issue_status` -> PEN-4392 `done`, note read "
     + "\"done means the probe was RUN and its answer recorded\". PEN-4392 reached `done` because a "
     + "later PR removed the need for the probe; nobody ever ran it. The binding fired and the note "
@@ -1284,8 +1285,10 @@ export const interactionExpectedOutcomeIssueStatusSchema = z.object({
     status: z.enum(ISSUE_STATUSES)
       .describe(
         "The status that means the authorised action happened. Pick one the action is REQUIRED "
-        + "to produce, not merely one you expect to follow it: the sweep compares status and "
-        + "never cause, so a row reaching this status by any other route still reads `observed`.",
+        + "to produce, not merely one you expect to follow it: the sweep compares status and never "
+        + "cause, and it counts AT-OR-PAST this status along the "
+        + "`backlog < todo < in_progress < in_review < done` ladder. So a declared `in_review` is "
+        + "satisfied by a row that ran straight to `done` for an unrelated reason.",
       ),
   }),
   note: expectedOutcomeNoteSchema,
