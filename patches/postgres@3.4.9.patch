@@ -1,5 +1,5 @@
 diff --git a/cf/src/connection.js b/cf/src/connection.js
-index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..b3ca1cd159d12fba1f17ad1636be803f46d4301e 100644
+index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..339974592883cdde244b7538db865eb949f80509 100644
 --- a/cf/src/connection.js
 +++ b/cf/src/connection.js
 @@ -77,6 +77,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -183,11 +183,13 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..b3ca1cd159d12fba1f17ad1636be803f
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -563,13 +664,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -562,14 +663,26 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       }
  
        if (needsTypes) {
-         initial.reserve && (initial = null)
+-        initial.reserve && (initial = null)
 -        return fetchArrayTypes()
++        initial.reserve && !initial.handoff && (initial = null)
 +        // BLO-52499: closed() rejects the type query when the session dies under
 +        // it, and nothing awaits this promise, so that rejection was unhandled.
 +        // The next session fetches the types again (connected() resets needsTypes).
@@ -195,20 +197,24 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..b3ca1cd159d12fba1f17ad1636be803f
        }
  
 -      initial && !initial.reserve && execute(initial)
-+      // BLO-52499: a reserve() waiter is a trigger, not a query to run: it stays
-+      // in the pool's queue, so fall through to onopen() to serve it. Returning
-+      // here left the connection in `connecting` forever with fetch_types:false.
++      // BLO-52499: a reserve() waiter that onclose() handed this connection gets
++      // it directly. A cold reserve() waiter is only a trigger and stays in the
++      // pool's queue, so fall through to onopen() to serve it: returning here
++      // left the connection in `connecting` forever with fetch_types:false.
 +      const owned = !initial.reserve
++      const handoff = initial.handoff && initial
 +      owned && execute(initial)
        options.shared.retries = retries = 0
        initial = null
 -      return
 +      if (owned)
 +        return
++      if (handoff)
++        return handoff.reserve(connection)
      }
  
      while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-@@ -839,13 +948,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -839,13 +952,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    async function PortalSuspended() {
@@ -231,7 +237,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..b3ca1cd159d12fba1f17ad1636be803f
        query.reject(err)
      }
 diff --git a/cf/src/index.js b/cf/src/index.js
-index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..4c3e8bc31743f0070b3fb49fb25db71424940f5a 100644
+index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..1af83ae975d8ef69bbd1f507ccdb7033bddc74d7 100644
 --- a/cf/src/index.js
 +++ b/cf/src/index.js
 @@ -75,6 +75,18 @@ function Postgres(a, b) {
@@ -358,7 +364,7 @@ index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..4c3e8bc31743f0070b3fb49fb25db714
    function move(c, queue) {
      c.queue.remove(c)
      queue.push(c)
-@@ -421,10 +472,18 @@ function Postgres(a, b) {
+@@ -421,10 +472,23 @@ function Postgres(a, b) {
  
    function onclose(c, e) {
      move(c, closed)
@@ -367,18 +373,23 @@ index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..4c3e8bc31743f0070b3fb49fb25db714
      c.onclose && (c.onclose(e), c.onclose = null)
      options.onclose && options.onclose(c.id)
 -    queries.length && connect(c, queries.shift())
-+    // BLO-52499: a queued reserve() waiter is only the reconnect's trigger, as in
-+    // reserve()'s own cold path: it stays in `queries` for onopen() to serve.
-+    // Shifting it out made it the reconnect's `initial`, which the handshake
-+    // drops for a reserve() waiter, so the waiter was in neither place. Upstream
-+    // settled it only by accident, when the dead session had stashed a FATAL to
-+    // reject it with, and otherwise hung it. closed() no longer carries that
-+    // FATAL over.
-+    queries.length && connect(c, queries.peek().reserve ? queries.peek() : queries.shift())
++    // BLO-52499: a reserve() waiter shifted out here becomes this reconnect's own
++    // `initial`, so mark it: the handshake hands the connection straight to it.
++    // Unmarked, the handshake dropped it (in reserve()'s cold path the waiter is
++    // only a trigger and stays queued for onopen()), so it was in neither place.
++    // Upstream settled it only by accident, when the dead session had stashed a
++    // FATAL to reject it with, and otherwise hung it; closed() no longer carries
++    // that FATAL over. Each closing connection still takes its own queued item,
++    // so an outage settles one item per failed attempt, as upstream does.
++    if (queries.length) {
++      const query = queries.shift()
++      query.reserve && (query.handoff = true)
++      connect(c, query)
++    }
    }
  }
  
-@@ -445,13 +504,18 @@ function parseOptions(a, b) {
+@@ -445,13 +509,18 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -456,21 +467,8 @@ index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..c6327a8d7ac56ced88511b62c79ce8fe
            })
            this.execute()
            return promise
-diff --git a/cf/src/queue.js b/cf/src/queue.js
-index c4ef97164f057db99dce1b9af3401dbb1af37e31..a741ae31caca18139befcb74634b9b80bb397dee 100644
---- a/cf/src/queue.js
-+++ b/cf/src/queue.js
-@@ -15,6 +15,8 @@ function Queue(initial = []) {
-         : (xs.splice(index, 1), x)
-     },
-     push: (x) => (xs.push(x), x),
-+    // BLO-52499: lets onclose() hand a reserve() waiter on without dequeuing it.
-+    peek: () => xs[index],
-     shift: () => {
-       const out = xs[index++]
- 
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
-index 07f6716702ac888215c86ad6e0071aaf55ae519c..d5ca5f8c20d1ad8f7be06b07aad57162d2e0d0bc 100644
+index 07f6716702ac888215c86ad6e0071aaf55ae519c..c72aaffd222cc09efdf24bb3445cecab38fe0577 100644
 --- a/cjs/src/connection.js
 +++ b/cjs/src/connection.js
 @@ -75,6 +75,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -654,11 +652,13 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..d5ca5f8c20d1ad8f7be06b07aad57162
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -561,13 +662,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -560,14 +661,26 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       }
  
        if (needsTypes) {
-         initial.reserve && (initial = null)
+-        initial.reserve && (initial = null)
 -        return fetchArrayTypes()
++        initial.reserve && !initial.handoff && (initial = null)
 +        // BLO-52499: closed() rejects the type query when the session dies under
 +        // it, and nothing awaits this promise, so that rejection was unhandled.
 +        // The next session fetches the types again (connected() resets needsTypes).
@@ -666,20 +666,24 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..d5ca5f8c20d1ad8f7be06b07aad57162
        }
  
 -      initial && !initial.reserve && execute(initial)
-+      // BLO-52499: a reserve() waiter is a trigger, not a query to run: it stays
-+      // in the pool's queue, so fall through to onopen() to serve it. Returning
-+      // here left the connection in `connecting` forever with fetch_types:false.
++      // BLO-52499: a reserve() waiter that onclose() handed this connection gets
++      // it directly. A cold reserve() waiter is only a trigger and stays in the
++      // pool's queue, so fall through to onopen() to serve it: returning here
++      // left the connection in `connecting` forever with fetch_types:false.
 +      const owned = !initial.reserve
++      const handoff = initial.handoff && initial
 +      owned && execute(initial)
        options.shared.retries = retries = 0
        initial = null
 -      return
 +      if (owned)
 +        return
++      if (handoff)
++        return handoff.reserve(connection)
      }
  
      while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-@@ -837,13 +946,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -837,13 +950,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    async function PortalSuspended() {
@@ -702,7 +706,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..d5ca5f8c20d1ad8f7be06b07aad57162
        query.reject(err)
      }
 diff --git a/cjs/src/index.js b/cjs/src/index.js
-index f09c61c7e998f411560b95c9a8e1ed6a97972c11..9b5aeeb78fb74f1c81825e588023e620c095d46b 100644
+index f09c61c7e998f411560b95c9a8e1ed6a97972c11..1c0f77845df6a37f469cb288513948b704e8eabd 100644
 --- a/cjs/src/index.js
 +++ b/cjs/src/index.js
 @@ -74,6 +74,18 @@ function Postgres(a, b) {
@@ -829,7 +833,7 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..9b5aeeb78fb74f1c81825e588023e620
    function move(c, queue) {
      c.queue.remove(c)
      queue.push(c)
-@@ -420,10 +471,18 @@ function Postgres(a, b) {
+@@ -420,10 +471,23 @@ function Postgres(a, b) {
  
    function onclose(c, e) {
      move(c, closed)
@@ -838,18 +842,23 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..9b5aeeb78fb74f1c81825e588023e620
      c.onclose && (c.onclose(e), c.onclose = null)
      options.onclose && options.onclose(c.id)
 -    queries.length && connect(c, queries.shift())
-+    // BLO-52499: a queued reserve() waiter is only the reconnect's trigger, as in
-+    // reserve()'s own cold path: it stays in `queries` for onopen() to serve.
-+    // Shifting it out made it the reconnect's `initial`, which the handshake
-+    // drops for a reserve() waiter, so the waiter was in neither place. Upstream
-+    // settled it only by accident, when the dead session had stashed a FATAL to
-+    // reject it with, and otherwise hung it. closed() no longer carries that
-+    // FATAL over.
-+    queries.length && connect(c, queries.peek().reserve ? queries.peek() : queries.shift())
++    // BLO-52499: a reserve() waiter shifted out here becomes this reconnect's own
++    // `initial`, so mark it: the handshake hands the connection straight to it.
++    // Unmarked, the handshake dropped it (in reserve()'s cold path the waiter is
++    // only a trigger and stays queued for onopen()), so it was in neither place.
++    // Upstream settled it only by accident, when the dead session had stashed a
++    // FATAL to reject it with, and otherwise hung it; closed() no longer carries
++    // that FATAL over. Each closing connection still takes its own queued item,
++    // so an outage settles one item per failed attempt, as upstream does.
++    if (queries.length) {
++      const query = queries.shift()
++      query.reserve && (query.handoff = true)
++      connect(c, query)
++    }
    }
  }
  
-@@ -444,13 +503,18 @@ function parseOptions(a, b) {
+@@ -444,13 +508,18 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -927,21 +936,8 @@ index 45327f2fabcdbf8f8ec5020675012c310c04fee6..1bfabb8da05f7cbb9023c75375a484a0
            })
            this.execute()
            return promise
-diff --git a/cjs/src/queue.js b/cjs/src/queue.js
-index 8438f5da92cf7637d98a33491d75c75b1c817c25..a4b264104a5de904d8f91c8b3dca42cb8857dc99 100644
---- a/cjs/src/queue.js
-+++ b/cjs/src/queue.js
-@@ -15,6 +15,8 @@ function Queue(initial = []) {
-         : (xs.splice(index, 1), x)
-     },
-     push: (x) => (xs.push(x), x),
-+    // BLO-52499: lets onclose() hand a reserve() waiter on without dequeuing it.
-+    peek: () => xs[index],
-     shift: () => {
-       const out = xs[index++]
- 
 diff --git a/src/connection.js b/src/connection.js
-index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..0432baf9502d09a43157e8e1dfb023b1b7e1dcdb 100644
+index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..6a67862c104949f1daacfd510a917c51feeb7f83 100644
 --- a/src/connection.js
 +++ b/src/connection.js
 @@ -75,6 +75,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -1125,11 +1121,13 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..0432baf9502d09a43157e8e1dfb023b1
      closedTime = performance.now()
      hadError && options.shared.retries++
      delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
-@@ -561,13 +662,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -560,14 +661,26 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+       }
  
        if (needsTypes) {
-         initial.reserve && (initial = null)
+-        initial.reserve && (initial = null)
 -        return fetchArrayTypes()
++        initial.reserve && !initial.handoff && (initial = null)
 +        // BLO-52499: closed() rejects the type query when the session dies under
 +        // it, and nothing awaits this promise, so that rejection was unhandled.
 +        // The next session fetches the types again (connected() resets needsTypes).
@@ -1137,20 +1135,24 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..0432baf9502d09a43157e8e1dfb023b1
        }
  
 -      initial && !initial.reserve && execute(initial)
-+      // BLO-52499: a reserve() waiter is a trigger, not a query to run: it stays
-+      // in the pool's queue, so fall through to onopen() to serve it. Returning
-+      // here left the connection in `connecting` forever with fetch_types:false.
++      // BLO-52499: a reserve() waiter that onclose() handed this connection gets
++      // it directly. A cold reserve() waiter is only a trigger and stays in the
++      // pool's queue, so fall through to onopen() to serve it: returning here
++      // left the connection in `connecting` forever with fetch_types:false.
 +      const owned = !initial.reserve
++      const handoff = initial.handoff && initial
 +      owned && execute(initial)
        options.shared.retries = retries = 0
        initial = null
 -      return
 +      if (owned)
 +        return
++      if (handoff)
++        return handoff.reserve(connection)
      }
  
      while (sent.length && (query = sent.shift()) && (query.active = true, query.cancelled))
-@@ -837,13 +946,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -837,13 +950,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    async function PortalSuspended() {
@@ -1173,7 +1175,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..0432baf9502d09a43157e8e1dfb023b1
        query.reject(err)
      }
 diff --git a/src/index.js b/src/index.js
-index c7fba3dace20173f4cb13f3f138bb6d213b43683..6ce8f04813b5e98feaf0e4818b8466d3c2ab1e8a 100644
+index c7fba3dace20173f4cb13f3f138bb6d213b43683..795f50761d0b11374c4abe6287604b48bdb19f81 100644
 --- a/src/index.js
 +++ b/src/index.js
 @@ -74,6 +74,18 @@ function Postgres(a, b) {
@@ -1300,7 +1302,7 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..6ce8f04813b5e98feaf0e4818b8466d3
    function move(c, queue) {
      c.queue.remove(c)
      queue.push(c)
-@@ -420,10 +471,18 @@ function Postgres(a, b) {
+@@ -420,10 +471,23 @@ function Postgres(a, b) {
  
    function onclose(c, e) {
      move(c, closed)
@@ -1309,18 +1311,23 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..6ce8f04813b5e98feaf0e4818b8466d3
      c.onclose && (c.onclose(e), c.onclose = null)
      options.onclose && options.onclose(c.id)
 -    queries.length && connect(c, queries.shift())
-+    // BLO-52499: a queued reserve() waiter is only the reconnect's trigger, as in
-+    // reserve()'s own cold path: it stays in `queries` for onopen() to serve.
-+    // Shifting it out made it the reconnect's `initial`, which the handshake
-+    // drops for a reserve() waiter, so the waiter was in neither place. Upstream
-+    // settled it only by accident, when the dead session had stashed a FATAL to
-+    // reject it with, and otherwise hung it. closed() no longer carries that
-+    // FATAL over.
-+    queries.length && connect(c, queries.peek().reserve ? queries.peek() : queries.shift())
++    // BLO-52499: a reserve() waiter shifted out here becomes this reconnect's own
++    // `initial`, so mark it: the handshake hands the connection straight to it.
++    // Unmarked, the handshake dropped it (in reserve()'s cold path the waiter is
++    // only a trigger and stays queued for onopen()), so it was in neither place.
++    // Upstream settled it only by accident, when the dead session had stashed a
++    // FATAL to reject it with, and otherwise hung it; closed() no longer carries
++    // that FATAL over. Each closing connection still takes its own queued item,
++    // so an outage settles one item per failed attempt, as upstream does.
++    if (queries.length) {
++      const query = queries.shift()
++      query.reserve && (query.handoff = true)
++      connect(c, query)
++    }
    }
  }
  
-@@ -444,13 +503,18 @@ function parseOptions(a, b) {
+@@ -444,13 +508,18 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -1398,16 +1405,3 @@ index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..c6327a8d7ac56ced88511b62c79ce8fe
            })
            this.execute()
            return promise
-diff --git a/src/queue.js b/src/queue.js
-index c4ef97164f057db99dce1b9af3401dbb1af37e31..a741ae31caca18139befcb74634b9b80bb397dee 100644
---- a/src/queue.js
-+++ b/src/queue.js
-@@ -15,6 +15,8 @@ function Queue(initial = []) {
-         : (xs.splice(index, 1), x)
-     },
-     push: (x) => (xs.push(x), x),
-+    // BLO-52499: lets onclose() hand a reserve() waiter on without dequeuing it.
-+    peek: () => xs[index],
-     shift: () => {
-       const out = xs[index++]
- 
