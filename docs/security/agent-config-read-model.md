@@ -296,10 +296,10 @@ are not causal; the `agents:configure` row is.
 `PEN-5232`.** The reading seat was answered `{}` for peer config and, in the
 same response body, the peer's whole `access.grants` array — which is where the
 grant and its 2026-07-19 date came from. The grant counts in column 1 have the
-same provenance. So this evidence does not survive the narrowing below: once
-`#3274` lands, a seat in the `Cto`'s position can no longer reproduce this
-table, and a re-derivation needs either a seat holding `agents:configure` or a
-direct database read.
+same provenance. So this evidence does not survive the narrowing below:
+`#3274` has landed, so a seat in the `Cto`'s position can no longer reproduce
+this table, and a re-derivation needs either a seat holding `agents:configure`
+or a direct database read.
 
 ## The route matrix
 
@@ -364,6 +364,24 @@ stored value, and both are declared optional on the shared `Agent` interface
 **only**, so their absence beside a `{}` is itself the signal that the `{}` is
 the real stored value.
 
+> ⚠️ **That inference runs through the *arm*, not through the markers — which
+> is what keeps it usable against a build that does not emit them.** Which arm
+> answered you is settled before anything is serialised, and it is settled by
+> your own entitlement, not by the subject's row: the detail route asks
+> whether you clear `agent_config:read` for that subject
+> (`canReadSensitiveDetail`), the company roster asks the same question
+> company-wide, and each then exempts your own row on the standard trust
+> preset. Clear the gate and you are never on the restricted arm; fail it and,
+> your own row aside, you always are — for **every** peer, including one whose
+> stored config really is empty, because the `{}` and the markers are assigned
+> flat on that arm and neither is computed from what was stored.
+>
+> So the markers *confirm* an arm you could already name; they are not the
+> only evidence for one. If you fail the gate, a peer `{}` is the projection's
+> synthetic value whether or not the markers are beside it — an API that
+> answered you without them is an API that does not emit them, which is a fact
+> about that build and never about the subject's stored config.
+
 **No config byte widened.** `withheldFields` names both columns
 unconditionally rather than only the populated ones, and `withheldByAction`
 names a gate the reader lacks, so the pair discloses **zero bits** about the
@@ -421,24 +439,34 @@ predating the signal.
 > read](#the-consultative-one-hop-peer-config-read). You do not need a grant
 > and you should not ask for one.
 
-### `access.grants` rides the same route and that projection never sees it (`PEN-5232`)
+### `access.grants` rode the same route and that projection did not see it (`PEN-5232`, closed)
 
 The matrix above is about two columns on the `agents` row. The detail route
-returns a second object beside them which the restricted projection does not
-reach: `buildAgentDetail` composes the projection and then attaches `access`
-**outside** the spread, and `buildAgentAccessState` returns the subject's grant
-list on every one of its arms. `options.restricted` is consulted by the spread
-only. So the peer read answered `adapterConfig: {}` is answered in the same body
-with the subject's complete grant inventory — and `listPrincipalGrants` is a
-bare `db.select()`, so each entry is the whole 9-column row, `permissionKey`,
-`scope`, `grantedByUserId` and `createdAt` among them.
+returns a second object beside them, and the restricted projection did not
+reach it: `buildAgentDetail` composed the projection and then attached `access`
+**outside** the spread, and `buildAgentAccessState` returned the subject's
+grant list on every one of its arms. `options.restricted` was consulted by the
+spread only. So the peer read answered `adapterConfig: {}` was answered in the
+same body with the subject's complete grant inventory — each entry the whole
+row, `permissionKey`, `scope`, `grantedByUserId` and `createdAt` among them.
+
+**`#3274` closed that.** `buildAgentDetail` now passes `restricted` into
+`buildAgentAccessState`, whose restricted arm is built as an explicit literal —
+`canAssignTasks`, `taskAssignSource`, `membership.status`, and `grants`
+**absent** rather than `[]` — with a `grants?: never` clause on a `satisfies`
+check so re-adding the key in any form fails the build. The withhold is
+declared on the response through `WITHHELD_AGENT_ACCESS_FIELDS`, appended to
+`withheldFields` beside the two config columns. The paragraph above is kept in
+the past tense rather than deleted because the **shape** of the defect — a flag
+that reaches the spread and nothing else — is the reusable lesson, and
+`buildAgentDetail` still composes fields outside that spread.
 
 | Route | Subject | config columns | `access.grants` | On `master`? |
 | --- | --- | --- | --- | --- |
 | `GET /api/agents/me` | self | populated, secrets masked | full inventory | in effect |
 | `GET /api/agents/:id` | self | populated, secrets masked | full inventory | in effect |
-| `GET /api/agents/:id` | peer | `{}` + both markers | **full inventory** | in effect — the finding |
-| `GET /api/agents/:id` | peer | `{}` + both markers | key absent; `canAssignTasks` / `taskAssignSource` / `membership.status` only | **pending — `#3274`** |
+| `GET /api/agents/:id` | peer | `{}` + both markers | **full inventory** | superseded by `#3274` — the finding as filed |
+| `GET /api/agents/:id` | peer | `{}` + both markers | key absent; `canAssignTasks` / `taskAssignSource` / `membership.status` only | **in effect** |
 | `GET /api/companies/:id/agents` | peer | `{}` + both markers | **no `access` key at all** | in effect |
 | `GET /api/agents/:id/configuration` | peer | enumerated `redactAgentConfiguration` shape | **no `access` key at all** | in effect |
 | `PATCH /api/agents/:id/permissions` | peer | populated, secrets masked | full inventory | in effect — write-gated |
@@ -458,19 +486,22 @@ from the row count:
   projection enforces.
 
 To settle which **tree** you are on, grep `server/src/routes/agents.ts` for
-`WITHHELD_AGENT_ACCESS_FIELDS`: absent on `master` at `7fafb2ed2`
-(2026-11-02), present once `#3274` lands. The sibling
-`WITHHELD_AGENT_CONFIG_FIELDS` is already there, so finding one without the
-other is the in-between state, not a stale checkout.
+`WITHHELD_AGENT_ACCESS_FIELDS`; it is present on `master`, so its absence now
+means a stale checkout rather than a tree predating the narrowing. The sibling
+`WITHHELD_AGENT_CONFIG_FIELDS` is present too — finding that one alone no
+longer means you have caught the tree mid-narrowing, it means the checkout
+predates `#3274`.
 
 **`PEN-5228` does not cover this field in either direction.** That ruling is
 about the two config columns and it said keep the withhold; this object was
 outside it, and the decision on it is `PEN-5232`'s — recorded beside
-`buildAgentAccessState` once `#3274` lands, per that row's own requirement that
-the reason live in the module rather than only on the issue. `PEN-5258`
+`buildAgentDetail` and `buildAgentAccessState`, per that row's own requirement
+that the reason live in the module rather than only on the issue. `PEN-5258`
 (`#3267`) narrows `listPrincipalGrants` to an explicit column list, which bounds
 what a grant row *contains*; it does not decide who may read the list, and
-should not be cited as if it had.
+should not be cited as if it had. That is also why the inventory above is
+described by its columns rather than as a bare `db.select()`: the column list
+is explicit now, and it is currently the table's full column set.
 
 ### One sub-key of `adapterConfig` has a second, tighter gate (`PEN-5225`)
 
