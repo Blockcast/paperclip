@@ -1,0 +1,436 @@
+/**
+ * Regression coverage for a postgres.js scope that outlives its connection
+ * (BLO-52499 follow-up).
+ *
+ * When a `sql.begin()` transaction's backend dies (idle-in-transaction timeout,
+ * pg_terminate_backend), the driver's pool `onclose` rejects `begin()` and
+ * immediately reconnects the SAME `Connection` object for the next caller. The
+ * transaction's scope keeps running its callback, and its handler still
+ * dispatches to that object. So upstream sends the dead transaction's later
+ * queries, and its final ROLLBACK or COMMIT, into whatever session now owns the
+ * connection. A ROLLBACK silently discards another caller's writes; a COMMIT
+ * commits them early. `sql.reserve()` has the same shape, and its `release()`
+ * hands the next owner's connection back to the pool. When nothing has reused
+ * the object yet, a parameterized late statement strands the pool slot, and
+ * statements parked in the scope's own queue never settle.
+ *
+ * The connection-level state of the dead session leaked the same way: the next
+ * session's startup consumed its stashed FATAL (rejecting an innocent queued
+ * query with 57P01), and a statement written between a socket's 'error' and
+ * 'close' events stayed in flight forever and wedged the next session. A
+ * cursor's continuation wrote into the next session and threw an unhandled
+ * rejection.
+ *
+ * `patches/postgres@3.4.9.patch` binds every begin/reserve scope to the session
+ * it started on (`Connection.session`, bumped on close), refuses every later
+ * statement with CONNECTION_CLOSED before it can reach the connection, settles
+ * the scope's local queue on close, makes a stale `release()` a no-op, and resets
+ * the per-session state in `closed()`. Reverting it makes every test here fail.
+ *
+ * Most tests kill a backend on a pool of ONE connection, so the next caller is
+ * guaranteed to reuse the dead scope's `Connection` object.
+ */
+import net from "node:net";
+import postgres from "postgres";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+  type EmbeddedPostgresTestDatabase,
+} from "./test-embedded-postgres.js";
+
+const support = await getEmbeddedPostgresTestSupport();
+
+type Sql = postgres.Sql;
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>((r) => (resolve = r));
+  return { promise, resolve };
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** The pool's queue lengths, exported by patches/postgres@3.4.9.patch (BLO-33243). */
+const poolStats = (client: postgres.Sql) =>
+  (client as unknown as { poolStats(): { active: number } }).poolStats();
+
+/**
+ * Settles with the value, the error's code, or `hung`, so a hang fails an
+ * assertion instead of the test timeout. Subscribing dispatches a lazy query
+ * and attaches its rejection handler at once.
+ */
+const within = (p: PromiseLike<unknown>, ms: number) =>
+  Promise.race([
+    Promise.resolve(p).then(
+      (value) => ({ value }),
+      (error: { code?: string }) => ({ error: error?.code ?? String(error) }),
+    ),
+    sleep(ms).then(() => ({ hung: true })),
+  ]);
+
+// Long enough for a stale statement, which upstream writes within a few
+// microtasks, to reach the socket ahead of the next caller's statement.
+const STALE_WRITE_SETTLE_MS = 250;
+
+describe.skipIf(!support.supported)("postgres.js scope that outlives its connection", () => {
+  let dbh: EmbeddedPostgresTestDatabase;
+  let admin: Sql;
+  let sql: Sql;
+
+  beforeAll(async () => {
+    dbh = await startEmbeddedPostgresTestDatabase("pg-dead-scope");
+    admin = postgres(dbh.connectionString, { max: 1, onnotice: () => {} });
+  }, 180_000);
+
+  afterAll(async () => {
+    await admin?.end();
+    await dbh?.cleanup();
+  });
+
+  beforeEach(async () => {
+    await admin.unsafe("drop table if exists dead_scope_rows; create table dead_scope_rows (n int)");
+    sql = postgres(dbh.connectionString, { max: 1, onnotice: () => {} });
+    return async () => {
+      await sql.end({ timeout: 5 });
+    };
+  });
+
+  const rows = async () =>
+    (await admin<{ n: number }[]>`select n from dead_scope_rows order by n`).map((row) => row.n);
+
+  /**
+   * Opens a transaction, lets Postgres kill its backend while it waits on
+   * `gate`, and resolves once `begin()` has rejected. The callback then runs
+   * `afterGate` on the dead scope when the test resolves `gate`.
+   */
+  async function killedTransaction(afterGate: (tx: postgres.TransactionSql) => Promise<unknown>) {
+    const gate = deferred();
+    const begun = sql.begin(async (tx) => {
+      await tx`select set_config('idle_in_transaction_session_timeout', '300', true)`;
+      await gate.promise;
+      return afterGate(tx);
+    });
+    await expect(begun).rejects.toThrow();
+    return gate;
+  }
+
+  /** A reserved connection with an open transaction whose backend has been idle-killed. */
+  async function killedReservation() {
+    const reserved = await sql.reserve();
+    await reserved`select set_config('idle_in_transaction_session_timeout', '300', false)`;
+    const [{ pid }] = await reserved<{ pid: number }[]>`select pg_backend_pid() as pid`;
+    await reserved.unsafe("begin");
+    await waitForBackendGone(pid);
+    // The server dropping the backend is not enough: until the driver has run
+    // its own close, release() still sees a live reservation. Wait until the
+    // pool no longer counts the reserved slot as active.
+    for (let i = 0; i < 100 && poolStats(sql).active > 0; i++) await sleep(50);
+    expect(poolStats(sql).active).toBe(0);
+    return reserved;
+  }
+
+  it("never sends a dead transaction's ROLLBACK into the next transaction on its reused connection", async () => {
+    const gate = await killedTransaction(async () => {
+      throw new Error("the dead transaction's callback fails");
+    });
+
+    await sql.begin(async (tx) => {
+      await tx`insert into dead_scope_rows values (1)`;
+      gate.resolve();
+      await sleep(STALE_WRITE_SETTLE_MS);
+      await tx`insert into dead_scope_rows values (2)`;
+    });
+
+    expect(await rows()).toEqual([1, 2]);
+  });
+
+  it("never sends a dead transaction's COMMIT into the next transaction on its reused connection", async () => {
+    const gate = await killedTransaction(async () => "the dead transaction's callback succeeds");
+
+    await expect(
+      sql.begin(async (tx) => {
+        await tx`insert into dead_scope_rows values (1)`;
+        gate.resolve();
+        await sleep(STALE_WRITE_SETTLE_MS);
+        await tx`insert into dead_scope_rows values (2)`;
+        throw new Error("the next transaction rolls back");
+      }),
+    ).rejects.toThrow("the next transaction rolls back");
+
+    expect(await rows()).toEqual([]);
+  });
+
+  it("refuses a dead transaction's own late query instead of running it on the reused connection", async () => {
+    let late: unknown;
+    const gate = await killedTransaction(async (tx) => {
+      late = await within(tx`insert into dead_scope_rows values (99)`, 2_000);
+    });
+
+    await sql.begin(async (tx) => {
+      await tx`insert into dead_scope_rows values (1)`;
+      gate.resolve();
+      await sleep(STALE_WRITE_SETTLE_MS);
+      await tx`insert into dead_scope_rows values (2)`;
+    });
+
+    expect(late).toEqual({ error: "CONNECTION_CLOSED" });
+    expect(await rows()).toEqual([1, 2]);
+  });
+
+  it("does not strand the pool slot when a dead transaction issues a parameterized statement", async () => {
+    // Parameterized and not yet prepared, so upstream's `c.execute(q) || move(c, full)`
+    // parked the socket-less connection in `full`, where nothing ever retrieves it.
+    let late: unknown;
+    const settled = deferred();
+    const gate = await killedTransaction(async (tx) => {
+      late = await within(tx`select ${1}::int as x`, 2_000);
+      settled.resolve();
+    });
+    gate.resolve();
+    await settled.promise;
+
+    expect(late).toEqual({ error: "CONNECTION_CLOSED" });
+    expect(await within(sql`select 1 as x`, 3_000)).toEqual({ value: [{ x: 1 }] });
+  });
+
+  it("settles a statement parked in a transaction's local queue when its backend dies", async () => {
+    let behind: unknown;
+    const settled = deferred();
+    void sql
+      .begin(async (tx) => {
+        const [{ pid }] = await tx<{ pid: number }[]>`select pg_backend_pid() as pid`;
+        // Parameterized, so the connection goes `full` and the next statement
+        // waits in begin()'s own queue, whose only drain died with the session.
+        void tx`select pg_sleep(${3})`.catch(() => {});
+        const parked = within(tx`select 2 as x`, 3_000);
+        await sleep(100);
+        await admin`select pg_terminate_backend(${pid})`;
+        behind = await parked;
+        settled.resolve();
+      })
+      .catch(() => {});
+    await settled.promise;
+
+    expect(behind).toEqual({ error: "CONNECTION_CLOSED" });
+  });
+
+  it("settles a statement parked in a reserved connection's local queue when its backend dies", async () => {
+    const reserved = await sql.reserve();
+    const [{ pid }] = await reserved<{ pid: number }[]>`select pg_backend_pid() as pid`;
+    void reserved`select pg_sleep(${3})`.catch(() => {});
+    const parked = within(reserved`select 2 as x`, 3_000);
+    await sleep(100);
+    await admin`select pg_terminate_backend(${pid})`;
+
+    expect(await parked).toEqual({ error: "CONNECTION_CLOSED" });
+    reserved.release();
+    expect(await within(sql`select 1 as x`, 3_000)).toEqual({ value: [{ x: 1 }] });
+  });
+
+  it("never sends a dead reserved connection's ROLLBACK into the next owner's transaction", async () => {
+    const reserved = await killedReservation();
+
+    await sql.begin(async (tx) => {
+      await tx`insert into dead_scope_rows values (1)`;
+      expect(await within(reserved.unsafe("rollback"), 2_000)).toEqual({ error: "CONNECTION_CLOSED" });
+      await sleep(STALE_WRITE_SETTLE_MS);
+      await tx`insert into dead_scope_rows values (2)`;
+    });
+
+    expect(await rows()).toEqual([1, 2]);
+  });
+
+  it("does not hand the next owner's connection back to the pool on a stale release()", async () => {
+    const reserved = await killedReservation();
+
+    let unrelated: Promise<unknown> | undefined;
+    await expect(
+      sql.begin(async (tx) => {
+        await tx`insert into dead_scope_rows values (1)`;
+        reserved.release();
+        // An unrelated pool query. It must wait for this transaction, not run
+        // inside it on a connection the stale release() put back in the pool.
+        unrelated = sql`insert into dead_scope_rows values (3)`.execute();
+        await sleep(STALE_WRITE_SETTLE_MS);
+        throw new Error("the owner rolls back");
+      }),
+    ).rejects.toThrow("the owner rolls back");
+    await unrelated;
+
+    expect(await rows()).toEqual([3]);
+  });
+
+  it("keeps the pool usable after release() of a reserved connection that died while idle", async () => {
+    const reserved = await killedReservation();
+
+    // Nothing has reused the object: upstream pulled it, socket-less, from
+    // `closed` into `open`, and every later query failed CONNECTION_CLOSED.
+    reserved.release();
+
+    expect(await within(sql`select 1 as x`, 3_000)).toEqual({ value: [{ x: 1 }] });
+    expect(await within(sql`select 2 as x`, 3_000)).toEqual({ value: [{ x: 2 }] });
+  });
+
+  it("does not reject the next pooled query with the terminated session's error", async () => {
+    const [{ pid }] = await sql<{ pid: number }[]>`select pg_backend_pid() as pid`;
+    // Parameterized, so the connection goes `full` and `next` waits in the pool backlog.
+    const killed = within(sql`select pg_sleep(${5})`, 5_000);
+    const next = within(sql`select 42 as x`, 5_000);
+    await sleep(100);
+    await admin`select pg_terminate_backend(${pid})`;
+
+    expect(await killed).toEqual({ error: "CONNECTION_CLOSED" });
+    expect(await next).toEqual({ value: [{ x: 42 }] });
+  });
+
+  it("does not offset the next session's first result by rows the dead session had streamed", async () => {
+    // Without fetch_types there is no handshake query whose CommandComplete
+    // resets the DataRow index, so the user's first query is the first consumer.
+    const raw = postgres(dbh.connectionString, { max: 1, fetch_types: false, onnotice: () => {} });
+    try {
+      const [{ pid }] = await raw<{ pid: number }[]>`select pg_backend_pid() as pid`;
+      // Rows wide enough to be flushed one by one; the third one blocks.
+      // Parameterized, so the connection goes `full` and `next` waits in the pool backlog.
+      const killed = within(
+        raw`select n, repeat('x', ${20_000}) as pad, pg_sleep(case when n = 3 then 10 else 0 end)
+            from generate_series(1, 4) n`,
+        5_000,
+      );
+      const next = within(raw`select 42 as x`, 5_000);
+      await sleep(300);
+      await admin`select pg_terminate_backend(${pid})`;
+
+      expect(await killed).toEqual({ error: "CONNECTION_CLOSED" });
+      const outcome = await next;
+      expect(outcome).toEqual({ value: [{ x: 42 }] });
+      expect((outcome as { value: unknown[] }).value).toHaveLength(1);
+    } finally {
+      await raw.end({ timeout: 5 });
+    }
+  });
+
+  it("does not fail the queued next caller when a transaction's backend is terminated mid-statement", async () => {
+    const started = deferred();
+    let pid = 0;
+    const begun = within(
+      sql.begin(async (tx) => {
+        [{ pid }] = await tx<{ pid: number }[]>`select pg_backend_pid() as pid`;
+        const sleeping = tx`select pg_sleep(5)`;
+        started.resolve();
+        await sleeping;
+      }),
+      5_000,
+    );
+    await started.promise;
+    const queued = within(sql`select 42 as x`, 5_000);
+    await sleep(100);
+    await admin`select pg_terminate_backend(${pid})`;
+
+    expect(await begun).toEqual({ error: "CONNECTION_CLOSED" });
+    expect(await queued).toEqual({ value: [{ x: 42 }] });
+  });
+
+  it("does not carry a ROLLBACK written between a socket's 'error' and 'close' into the next session", async () => {
+    // On ECONNRESET Node runs microtasks between 'error' and 'close', so the
+    // scope's ROLLBACK is written before closed() runs. A proxy that answers
+    // with RST produces exactly that.
+    const target = new URL(dbh.connectionString);
+    const clients = new Set<net.Socket>();
+    const proxy = net.createServer((client) => {
+      const upstream = net.connect(Number(target.port), target.hostname);
+      clients.add(client);
+      client.on("error", () => {});
+      upstream.on("error", () => {});
+      client.pipe(upstream);
+      upstream.pipe(client);
+      client.on("close", () => {
+        clients.delete(client);
+        upstream.destroy();
+      });
+    });
+    await new Promise<void>((resolve) => proxy.listen(0, "127.0.0.1", resolve));
+    const viaProxy = new URL(dbh.connectionString);
+    viaProxy.hostname = "127.0.0.1";
+    viaProxy.port = String((proxy.address() as net.AddressInfo).port);
+    const proxied = postgres(viaProxy.toString(), { max: 1, onnotice: () => {} });
+    try {
+      await proxied`select 1`;
+      const begun = proxied.begin(async (tx) => {
+        await tx`select pg_sleep(2)`;
+      });
+      await sleep(50);
+      const queued = within(proxied`select 42 as x`, 3_000);
+      await sleep(200);
+      for (const client of clients) client.resetAndDestroy();
+
+      await expect(begun).rejects.toMatchObject({ code: "CONNECTION_CLOSED" });
+      expect(await queued).toEqual({ value: [{ x: 42 }] });
+      expect(await within(proxied`select 1 as x`, 3_000)).toEqual({ value: [{ x: 1 }] });
+    } finally {
+      await proxied.end({ timeout: 1 });
+      proxy.close();
+    }
+  });
+
+  it("does not raise an unhandled rejection when a cursor loop exits after its backend died", async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => void unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const [{ pid }] = await sql<{ pid: number }[]>`select pg_backend_pid() as pid`;
+      for await (const batch of sql`select generate_series(1, 100) as n`.cursor(10)) {
+        expect(batch).toHaveLength(10);
+        await admin`select pg_terminate_backend(${pid})`;
+        await waitForBackendGone(pid);
+        // Reconnect the slot, so the cursor's continuation resumes against a new session.
+        await sql`select 1`.catch(() => {});
+        break;
+      }
+      await sleep(STALE_WRITE_SETTLE_MS);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    expect(unhandled).toEqual([]);
+  });
+
+  it("errors an ended COPY stream whose backend died instead of leaving it for the next session", async () => {
+    await admin.unsafe(`
+      create or replace function dead_scope_slow() returns trigger language plpgsql
+        as $$ begin perform pg_sleep(3); return new; end $$;
+      create trigger dead_scope_slow before insert on dead_scope_rows
+        for each row execute function dead_scope_slow()
+    `);
+    const writable = await sql`copy dead_scope_rows from stdin`.writable();
+    const outcome = new Promise((resolve) => {
+      writable.on("finish", () => resolve("finish"));
+      writable.on("error", (error: { code?: string }) => resolve(error.code));
+    });
+    writable.write("1\n");
+    writable.end();
+    await sleep(300);
+    await admin`
+      select pg_terminate_backend(pid) from pg_stat_activity
+      where query like 'copy dead_scope_rows%' and pid <> pg_backend_pid()
+    `;
+    await sleep(300);
+    // Upstream left its `final` for the next session's first CommandComplete to fire as success.
+    await within(sql`select 1`, 3_000);
+
+    expect(await within(outcome, 3_000)).toEqual({ value: "CONNECTION_CLOSED" });
+  });
+
+  async function waitForBackendGone(pid: number) {
+    for (let i = 0; i < 100; i++) {
+      const [{ alive }] = await admin<{ alive: boolean }[]>`
+        select exists (select 1 from pg_stat_activity where pid = ${pid}) as alive
+      `;
+      // The driver hears the close asynchronously; give it a beat once the
+      // server side is gone.
+      if (!alive) return sleep(100);
+      await sleep(50);
+    }
+    throw new Error(`backend ${pid} was never terminated`);
+  }
+});

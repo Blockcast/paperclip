@@ -1,5 +1,5 @@
 diff --git a/cf/src/connection.js b/cf/src/connection.js
-index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..035d7c66c31ba46538df773cf9729621068638a0 100644
+index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..713af12a5aa9f0754907b65048551533c5c6761a 100644
 --- a/cf/src/connection.js
 +++ b/cf/src/connection.js
 @@ -77,6 +77,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -10,7 +10,16 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..035d7c66c31ba46538df773cf9729621
  
    let socket = null
      , cancelMessage
-@@ -165,14 +166,32 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -121,6 +122,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     cancel,
+     end,
+     count: 0,
++    // BLO-52499: bumped by closed(); identifies the session this object carries.
++    session: 0,
+     id
+   }
+ 
+@@ -165,14 +168,32 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      if (q.cancelled)
        return
  
@@ -45,7 +54,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..035d7c66c31ba46538df773cf9729621
          && !q.describeFirst
          && !q.cursorFn
          && sent.length < max_pipeline
-@@ -254,6 +273,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -254,6 +275,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -63,7 +72,7 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..035d7c66c31ba46538df773cf9729621
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
-@@ -417,16 +447,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -417,16 +449,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !connection.reserved && onend(connection),
        !connection.reserved && !initial && !query && sent.length === 0
          ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
@@ -125,7 +134,11 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..035d7c66c31ba46538df773cf9729621
      if (socket) {
        socket.removeListener('data', data)
        socket.removeListener('connect', connected)
-@@ -439,9 +512,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -436,12 +511,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   async function closed(hadError) {
++    connection.session++
      incoming = Buffer.alloc(0)
      remaining = 0
      incomings = null
@@ -144,8 +157,54 @@ index 8e79170aeb13efe8c3c77ccede0cd3a115b5e1b5..035d7c66c31ba46538df773cf9729621
      idleTimer.cancel()
      lifeTimer.cancel()
      connectTimer.cancel()
+@@ -452,7 +536,22 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     if (initial)
+       return reconnect()
+ 
+-    !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
++    // BLO-52499: settle and forget everything the dead session held; the next
++    // session's startup ReadyForQuery would otherwise consume it. A stashed
++    // FATAL (57P01) rejected the next caller's first query, a leftover `query`
++    // was resolved with the startup's empty result, a mid-DataRow `rows` offset
++    // the next result, and an ended COPY's `final` fired on the next session's
++    // first CommandComplete. Not gated on !hadError: on ECONNRESET, Node runs
++    // microtasks between 'error' and 'close', so a statement written in that gap
++    // (a begin() scope's own ROLLBACK) sat in `sent` and wedged the next
++    // session. Not via error(): its multi-host early return skips `query`.
++    const err = Errors.connection('CONNECTION_CLOSED', options, socket)
++    errored(err)
++    while (sent.length)
++      queryError(sent.shift(), err)
++    final && (final(err), final = null)
++    query = errorResponse = null
++    rows = 0
+     closedTime = performance.now()
+     hadError && options.shared.retries++
+     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
+@@ -839,13 +938,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   async function PortalSuspended() {
++    // BLO-52499: cursorFn is user code. If the session died while it ran,
++    // closed() already rejected this cursor and `query`/`socket` now belong to
++    // the next session (or are null): write nothing there.
++    const session = connection.session
+     try {
+       const x = await Promise.resolve(query.cursorFn(result))
++      if (connection.session !== session)
++        return
+       rows = 0
+       x === CLOSE
+         ? write(Close(query.portal))
+         : (result = new Result(), write(Execute('', query.cursorRows)))
+     } catch (err) {
++      if (connection.session !== session)
++        return
+       write(Sync)
+       query.reject(err)
+     }
 diff --git a/cf/src/index.js b/cf/src/index.js
-index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..2560ab4662167edcea7fe001d06fbdf75ee8ec72 100644
+index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..f6c8e61c753a713088bb7f735068a44cc2fbc6de 100644
 --- a/cf/src/index.js
 +++ b/cf/src/index.js
 @@ -75,6 +75,18 @@ function Postgres(a, b) {
@@ -167,7 +226,110 @@ index ffbe7aef075d6037c540cbd5e8f7e298d4345cc3..2560ab4662167edcea7fe001d06fbdf7
      reserve,
      listen,
      begin,
-@@ -445,13 +457,18 @@ function parseOptions(a, b) {
+@@ -212,13 +224,21 @@ function Postgres(a, b) {
+       })
+ 
+     move(c, reserved)
++    // BLO-52499: this reservation owns `c` only for the session it was handed.
++    const session = c.session
+     c.reserved = () => queue.length
+       ? c.execute(queue.shift())
+       : move(c, reserved)
+     c.reserved.release = true
++    c.reserved.drop = () => drop(queue)
+ 
+     const sql = Sql(handler)
+     sql.release = () => {
++      // BLO-52499: once that session is gone, onclose() has already returned
++      // `c` to the pool. Releasing again would strip the next owner's
++      // reservation, or pull a socket-less `c` out of `closed` into `open`.
++      if (c.session !== session)
++        return
+       c.reserved = null
+       onopen(c)
+     }
+@@ -226,9 +246,11 @@ function Postgres(a, b) {
+     return sql
+ 
+     function handler(q) {
+-      c.queue === full
+-        ? queue.push(q)
+-        : c.execute(q) || move(c, full)
++      c.session !== session
++        ? refuse(q)
++        : c.queue === full
++          ? queue.push(q)
++          : c.execute(q) || move(c, full)
+     }
+   }
+ 
+@@ -237,6 +259,7 @@ function Postgres(a, b) {
+     const queries = Queue()
+     let savepoints = 0
+       , connection
++      , session
+       , prepare = null
+ 
+     try {
+@@ -291,21 +314,46 @@ function Postgres(a, b) {
+ 
+       function handler(q) {
+         q.catch(e => uncaughtError || (uncaughtError = e))
+-        c.queue === full
+-          ? queries.push(q)
+-          : c.execute(q) || move(c, full)
++        c.session !== session
++          ? refuse(q)
++          : c.queue === full
++            ? queries.push(q)
++            : c.execute(q) || move(c, full)
+       }
+     }
+ 
+     function onexecute(c) {
+       connection = c
++      session = c.session
+       move(c, reserved)
+       c.reserved = () => queries.length
+         ? c.execute(queries.shift())
+         : move(c, reserved)
++      c.reserved.drop = () => drop(queries)
+     }
+   }
+ 
++  // BLO-52499: a begin()/reserve() scope binds to the Connection OBJECT, but
++  // onclose() hands that object to the next caller (or leaves it socket-less in
++  // `closed`) while the scope keeps running: begin()'s callback outlives its
++  // rejected race, and a reserve() holder is never told at all. Its later
++  // statements -- ROLLBACK [TO], COMMIT and PREPARE included -- would then run
++  // in whatever session owns `c` now. So a scope records `c.session` (bumped by
++  // Connection closed()) when it takes `c`, and once that moved it refuses every
++  // statement. The refusal must come before c.execute(): a not-ready execute()
++  // on a socket-less `c` moves it into `full`, where nothing ever retrieves it.
++  // These live at Postgres() scope because begin()'s `options` is its mode string.
++  function refuse(q) {
++    q.reject(Errors.connection('CONNECTION_CLOSED', options))
++  }
++
++  // Statements a scope parked in its local queue behind a busy `c`. Their only
++  // drain is the c.reserved closure that onclose() discards.
++  function drop(queue) {
++    while (queue.length)
++      refuse(queue.shift())
++  }
++
+   function move(c, queue) {
+     c.queue.remove(c)
+     queue.push(c)
+@@ -421,6 +469,7 @@ function Postgres(a, b) {
+ 
+   function onclose(c, e) {
+     move(c, closed)
++    c.reserved && c.reserved.drop && c.reserved.drop() // BLO-52499: see drop()
+     c.reserved = null
+     c.onclose && (c.onclose(e), c.onclose = null)
+     options.onclose && options.onclose(c.id)
+@@ -445,13 +494,18 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -219,7 +381,7 @@ index 0d44a15cd9e42beaf11d4be6ccde60223e09508a..74e2d05eeabcd700df1e7ef7c56d992b
  
    simple() {
 diff --git a/cjs/src/connection.js b/cjs/src/connection.js
-index 07f6716702ac888215c86ad6e0071aaf55ae519c..9e3d0fb7d7e69671f65323e91ea355c58e548950 100644
+index 07f6716702ac888215c86ad6e0071aaf55ae519c..199ebe50671a61026a65dd3b02df279bb2748556 100644
 --- a/cjs/src/connection.js
 +++ b/cjs/src/connection.js
 @@ -75,6 +75,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -230,7 +392,16 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..9e3d0fb7d7e69671f65323e91ea355c5
  
    let socket = null
      , cancelMessage
-@@ -163,14 +164,32 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -119,6 +120,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     cancel,
+     end,
+     count: 0,
++    // BLO-52499: bumped by closed(); identifies the session this object carries.
++    session: 0,
+     id
+   }
+ 
+@@ -163,14 +166,32 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      if (q.cancelled)
        return
  
@@ -265,7 +436,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..9e3d0fb7d7e69671f65323e91ea355c5
          && !q.describeFirst
          && !q.cursorFn
          && sent.length < max_pipeline
-@@ -252,6 +271,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -252,6 +273,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -283,7 +454,7 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..9e3d0fb7d7e69671f65323e91ea355c5
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
-@@ -415,16 +445,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -415,16 +447,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !connection.reserved && onend(connection),
        !connection.reserved && !initial && !query && sent.length === 0
          ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
@@ -345,7 +516,11 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..9e3d0fb7d7e69671f65323e91ea355c5
      if (socket) {
        socket.removeListener('data', data)
        socket.removeListener('connect', connected)
-@@ -437,9 +510,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -434,12 +509,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   async function closed(hadError) {
++    connection.session++
      incoming = Buffer.alloc(0)
      remaining = 0
      incomings = null
@@ -364,8 +539,54 @@ index 07f6716702ac888215c86ad6e0071aaf55ae519c..9e3d0fb7d7e69671f65323e91ea355c5
      idleTimer.cancel()
      lifeTimer.cancel()
      connectTimer.cancel()
+@@ -450,7 +534,22 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     if (initial)
+       return reconnect()
+ 
+-    !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
++    // BLO-52499: settle and forget everything the dead session held; the next
++    // session's startup ReadyForQuery would otherwise consume it. A stashed
++    // FATAL (57P01) rejected the next caller's first query, a leftover `query`
++    // was resolved with the startup's empty result, a mid-DataRow `rows` offset
++    // the next result, and an ended COPY's `final` fired on the next session's
++    // first CommandComplete. Not gated on !hadError: on ECONNRESET, Node runs
++    // microtasks between 'error' and 'close', so a statement written in that gap
++    // (a begin() scope's own ROLLBACK) sat in `sent` and wedged the next
++    // session. Not via error(): its multi-host early return skips `query`.
++    const err = Errors.connection('CONNECTION_CLOSED', options, socket)
++    errored(err)
++    while (sent.length)
++      queryError(sent.shift(), err)
++    final && (final(err), final = null)
++    query = errorResponse = null
++    rows = 0
+     closedTime = performance.now()
+     hadError && options.shared.retries++
+     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
+@@ -837,13 +936,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   async function PortalSuspended() {
++    // BLO-52499: cursorFn is user code. If the session died while it ran,
++    // closed() already rejected this cursor and `query`/`socket` now belong to
++    // the next session (or are null): write nothing there.
++    const session = connection.session
+     try {
+       const x = await Promise.resolve(query.cursorFn(result))
++      if (connection.session !== session)
++        return
+       rows = 0
+       x === CLOSE
+         ? write(Close(query.portal))
+         : (result = new Result(), write(Execute('', query.cursorRows)))
+     } catch (err) {
++      if (connection.session !== session)
++        return
+       write(Sync)
+       query.reject(err)
+     }
 diff --git a/cjs/src/index.js b/cjs/src/index.js
-index f09c61c7e998f411560b95c9a8e1ed6a97972c11..6d92cce05dee675855eba5b48f206d9f8c387b67 100644
+index f09c61c7e998f411560b95c9a8e1ed6a97972c11..93d97c8280cc3858024a811847bde3676be69e6e 100644
 --- a/cjs/src/index.js
 +++ b/cjs/src/index.js
 @@ -74,6 +74,18 @@ function Postgres(a, b) {
@@ -387,7 +608,110 @@ index f09c61c7e998f411560b95c9a8e1ed6a97972c11..6d92cce05dee675855eba5b48f206d9f
      reserve,
      listen,
      begin,
-@@ -444,13 +456,18 @@ function parseOptions(a, b) {
+@@ -211,13 +223,21 @@ function Postgres(a, b) {
+       })
+ 
+     move(c, reserved)
++    // BLO-52499: this reservation owns `c` only for the session it was handed.
++    const session = c.session
+     c.reserved = () => queue.length
+       ? c.execute(queue.shift())
+       : move(c, reserved)
+     c.reserved.release = true
++    c.reserved.drop = () => drop(queue)
+ 
+     const sql = Sql(handler)
+     sql.release = () => {
++      // BLO-52499: once that session is gone, onclose() has already returned
++      // `c` to the pool. Releasing again would strip the next owner's
++      // reservation, or pull a socket-less `c` out of `closed` into `open`.
++      if (c.session !== session)
++        return
+       c.reserved = null
+       onopen(c)
+     }
+@@ -225,9 +245,11 @@ function Postgres(a, b) {
+     return sql
+ 
+     function handler(q) {
+-      c.queue === full
+-        ? queue.push(q)
+-        : c.execute(q) || move(c, full)
++      c.session !== session
++        ? refuse(q)
++        : c.queue === full
++          ? queue.push(q)
++          : c.execute(q) || move(c, full)
+     }
+   }
+ 
+@@ -236,6 +258,7 @@ function Postgres(a, b) {
+     const queries = Queue()
+     let savepoints = 0
+       , connection
++      , session
+       , prepare = null
+ 
+     try {
+@@ -290,21 +313,46 @@ function Postgres(a, b) {
+ 
+       function handler(q) {
+         q.catch(e => uncaughtError || (uncaughtError = e))
+-        c.queue === full
+-          ? queries.push(q)
+-          : c.execute(q) || move(c, full)
++        c.session !== session
++          ? refuse(q)
++          : c.queue === full
++            ? queries.push(q)
++            : c.execute(q) || move(c, full)
+       }
+     }
+ 
+     function onexecute(c) {
+       connection = c
++      session = c.session
+       move(c, reserved)
+       c.reserved = () => queries.length
+         ? c.execute(queries.shift())
+         : move(c, reserved)
++      c.reserved.drop = () => drop(queries)
+     }
+   }
+ 
++  // BLO-52499: a begin()/reserve() scope binds to the Connection OBJECT, but
++  // onclose() hands that object to the next caller (or leaves it socket-less in
++  // `closed`) while the scope keeps running: begin()'s callback outlives its
++  // rejected race, and a reserve() holder is never told at all. Its later
++  // statements -- ROLLBACK [TO], COMMIT and PREPARE included -- would then run
++  // in whatever session owns `c` now. So a scope records `c.session` (bumped by
++  // Connection closed()) when it takes `c`, and once that moved it refuses every
++  // statement. The refusal must come before c.execute(): a not-ready execute()
++  // on a socket-less `c` moves it into `full`, where nothing ever retrieves it.
++  // These live at Postgres() scope because begin()'s `options` is its mode string.
++  function refuse(q) {
++    q.reject(Errors.connection('CONNECTION_CLOSED', options))
++  }
++
++  // Statements a scope parked in its local queue behind a busy `c`. Their only
++  // drain is the c.reserved closure that onclose() discards.
++  function drop(queue) {
++    while (queue.length)
++      refuse(queue.shift())
++  }
++
+   function move(c, queue) {
+     c.queue.remove(c)
+     queue.push(c)
+@@ -420,6 +468,7 @@ function Postgres(a, b) {
+ 
+   function onclose(c, e) {
+     move(c, closed)
++    c.reserved && c.reserved.drop && c.reserved.drop() // BLO-52499: see drop()
+     c.reserved = null
+     c.onclose && (c.onclose(e), c.onclose = null)
+     options.onclose && options.onclose(c.id)
+@@ -444,13 +493,18 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
@@ -439,7 +763,7 @@ index 45327f2fabcdbf8f8ec5020675012c310c04fee6..5ebfa4c654d624333aafaf6738fb3297
  
    simple() {
 diff --git a/src/connection.js b/src/connection.js
-index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..e8fb54df842588b9cd4c73aacf4b28cea099ea17 100644
+index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..982c6b0a1d270779293a9789648adc7d97211aab 100644
 --- a/src/connection.js
 +++ b/src/connection.js
 @@ -75,6 +75,7 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
@@ -450,7 +774,16 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..e8fb54df842588b9cd4c73aacf4b28ce
  
    let socket = null
      , cancelMessage
-@@ -163,14 +164,32 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -119,6 +120,8 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     cancel,
+     end,
+     count: 0,
++    // BLO-52499: bumped by closed(); identifies the session this object carries.
++    session: 0,
+     id
+   }
+ 
+@@ -163,14 +166,32 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
      if (q.cancelled)
        return
  
@@ -485,7 +818,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..e8fb54df842588b9cd4c73aacf4b28ce
          && !q.describeFirst
          && !q.cursorFn
          && sent.length < max_pipeline
-@@ -252,6 +271,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -252,6 +273,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
    }
  
    function nextWrite(fn) {
@@ -503,7 +836,7 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..e8fb54df842588b9cd4c73aacf4b28ce
      const x = socket.write(chunk, fn)
      nextWriteTimer !== null && clearImmediate(nextWriteTimer)
      chunk = nextWriteTimer = null
-@@ -415,16 +445,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -415,16 +447,59 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
        !connection.reserved && onend(connection),
        !connection.reserved && !initial && !query && sent.length === 0
          ? (terminate(), new Promise(r => socket && socket.readyState !== 'closed' ? socket.once('close', r) : r()))
@@ -565,7 +898,11 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..e8fb54df842588b9cd4c73aacf4b28ce
      if (socket) {
        socket.removeListener('data', data)
        socket.removeListener('connect', connected)
-@@ -437,9 +510,17 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+@@ -434,12 +509,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   async function closed(hadError) {
++    connection.session++
      incoming = Buffer.alloc(0)
      remaining = 0
      incomings = null
@@ -584,8 +921,54 @@ index 1b1cccde43b4570d5d071d6ffaab2669b3c2065a..e8fb54df842588b9cd4c73aacf4b28ce
      idleTimer.cancel()
      lifeTimer.cancel()
      connectTimer.cancel()
+@@ -450,7 +534,22 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+     if (initial)
+       return reconnect()
+ 
+-    !hadError && (query || sent.length) && error(Errors.connection('CONNECTION_CLOSED', options, socket))
++    // BLO-52499: settle and forget everything the dead session held; the next
++    // session's startup ReadyForQuery would otherwise consume it. A stashed
++    // FATAL (57P01) rejected the next caller's first query, a leftover `query`
++    // was resolved with the startup's empty result, a mid-DataRow `rows` offset
++    // the next result, and an ended COPY's `final` fired on the next session's
++    // first CommandComplete. Not gated on !hadError: on ECONNRESET, Node runs
++    // microtasks between 'error' and 'close', so a statement written in that gap
++    // (a begin() scope's own ROLLBACK) sat in `sent` and wedged the next
++    // session. Not via error(): its multi-host early return skips `query`.
++    const err = Errors.connection('CONNECTION_CLOSED', options, socket)
++    errored(err)
++    while (sent.length)
++      queryError(sent.shift(), err)
++    final && (final(err), final = null)
++    query = errorResponse = null
++    rows = 0
+     closedTime = performance.now()
+     hadError && options.shared.retries++
+     delay = (typeof backoff === 'function' ? backoff(options.shared.retries) : backoff) * 1000
+@@ -837,13 +936,21 @@ function Connection(options, queues = {}, { onopen = noop, onend = noop, onclose
+   }
+ 
+   async function PortalSuspended() {
++    // BLO-52499: cursorFn is user code. If the session died while it ran,
++    // closed() already rejected this cursor and `query`/`socket` now belong to
++    // the next session (or are null): write nothing there.
++    const session = connection.session
+     try {
+       const x = await Promise.resolve(query.cursorFn(result))
++      if (connection.session !== session)
++        return
+       rows = 0
+       x === CLOSE
+         ? write(Close(query.portal))
+         : (result = new Result(), write(Execute('', query.cursorRows)))
+     } catch (err) {
++      if (connection.session !== session)
++        return
+       write(Sync)
+       query.reject(err)
+     }
 diff --git a/src/index.js b/src/index.js
-index c7fba3dace20173f4cb13f3f138bb6d213b43683..29b30c82994173104576aec430c4e95ba3de6537 100644
+index c7fba3dace20173f4cb13f3f138bb6d213b43683..750d4236e7eaafa9e9f5508668570d07a2ff7bf9 100644
 --- a/src/index.js
 +++ b/src/index.js
 @@ -74,6 +74,18 @@ function Postgres(a, b) {
@@ -607,7 +990,110 @@ index c7fba3dace20173f4cb13f3f138bb6d213b43683..29b30c82994173104576aec430c4e95b
      reserve,
      listen,
      begin,
-@@ -444,13 +456,18 @@ function parseOptions(a, b) {
+@@ -211,13 +223,21 @@ function Postgres(a, b) {
+       })
+ 
+     move(c, reserved)
++    // BLO-52499: this reservation owns `c` only for the session it was handed.
++    const session = c.session
+     c.reserved = () => queue.length
+       ? c.execute(queue.shift())
+       : move(c, reserved)
+     c.reserved.release = true
++    c.reserved.drop = () => drop(queue)
+ 
+     const sql = Sql(handler)
+     sql.release = () => {
++      // BLO-52499: once that session is gone, onclose() has already returned
++      // `c` to the pool. Releasing again would strip the next owner's
++      // reservation, or pull a socket-less `c` out of `closed` into `open`.
++      if (c.session !== session)
++        return
+       c.reserved = null
+       onopen(c)
+     }
+@@ -225,9 +245,11 @@ function Postgres(a, b) {
+     return sql
+ 
+     function handler(q) {
+-      c.queue === full
+-        ? queue.push(q)
+-        : c.execute(q) || move(c, full)
++      c.session !== session
++        ? refuse(q)
++        : c.queue === full
++          ? queue.push(q)
++          : c.execute(q) || move(c, full)
+     }
+   }
+ 
+@@ -236,6 +258,7 @@ function Postgres(a, b) {
+     const queries = Queue()
+     let savepoints = 0
+       , connection
++      , session
+       , prepare = null
+ 
+     try {
+@@ -290,21 +313,46 @@ function Postgres(a, b) {
+ 
+       function handler(q) {
+         q.catch(e => uncaughtError || (uncaughtError = e))
+-        c.queue === full
+-          ? queries.push(q)
+-          : c.execute(q) || move(c, full)
++        c.session !== session
++          ? refuse(q)
++          : c.queue === full
++            ? queries.push(q)
++            : c.execute(q) || move(c, full)
+       }
+     }
+ 
+     function onexecute(c) {
+       connection = c
++      session = c.session
+       move(c, reserved)
+       c.reserved = () => queries.length
+         ? c.execute(queries.shift())
+         : move(c, reserved)
++      c.reserved.drop = () => drop(queries)
+     }
+   }
+ 
++  // BLO-52499: a begin()/reserve() scope binds to the Connection OBJECT, but
++  // onclose() hands that object to the next caller (or leaves it socket-less in
++  // `closed`) while the scope keeps running: begin()'s callback outlives its
++  // rejected race, and a reserve() holder is never told at all. Its later
++  // statements -- ROLLBACK [TO], COMMIT and PREPARE included -- would then run
++  // in whatever session owns `c` now. So a scope records `c.session` (bumped by
++  // Connection closed()) when it takes `c`, and once that moved it refuses every
++  // statement. The refusal must come before c.execute(): a not-ready execute()
++  // on a socket-less `c` moves it into `full`, where nothing ever retrieves it.
++  // These live at Postgres() scope because begin()'s `options` is its mode string.
++  function refuse(q) {
++    q.reject(Errors.connection('CONNECTION_CLOSED', options))
++  }
++
++  // Statements a scope parked in its local queue behind a busy `c`. Their only
++  // drain is the c.reserved closure that onclose() discards.
++  function drop(queue) {
++    while (queue.length)
++      refuse(queue.shift())
++  }
++
+   function move(c, queue) {
+     c.queue.remove(c)
+     queue.push(c)
+@@ -420,6 +468,7 @@ function Postgres(a, b) {
+ 
+   function onclose(c, e) {
+     move(c, closed)
++    c.reserved && c.reserved.drop && c.reserved.drop() // BLO-52499: see drop()
+     c.reserved = null
+     c.onclose && (c.onclose(e), c.onclose = null)
+     options.onclose && options.onclose(c.id)
+@@ -444,13 +493,18 @@ function parseOptions(a, b) {
    'timeout' in o && (console.log('The timeout option is deprecated, use idle_timeout instead'), o.idle_timeout = o.timeout) // eslint-disable-line
    query.sslrootcert === 'system' && (query.ssl = 'verify-full')
  
