@@ -42,7 +42,6 @@ import { runPrCommentReviewGateCheck } from "../services/pr-comment-review-gate.
 import {
   _classifyReviewerEvidenceError,
   enqueueGithubCommitStatusDelivery,
-  _setGithubStatusKeyLeaseTimingForTest,
   pollGitHubCommitStatusDeliveriesOnce,
   resetStaleGitHubCommitStatusDeliveries,
   withGithubStatusDeliveryLock,
@@ -1255,15 +1254,22 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       });
     });
 
-    // Hold this head's status key, as a live evaluation on another pod would:
-    // a live lease row under another token (BLO-52499).
+    // Hold this head's status key on another connection, as a live evaluation
+    // on another pod would (BLO-52499).
     async function holdStatusKey() {
-      await db.execute(sql`
-        insert into github_status_key_leases (key, token, expires_at)
-        values (${`blockcast/frr#${HEAD_SHA}`}, 'another-pod', clock_timestamp() + interval '1 hour')
-      `);
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let markHeld!: () => void;
+      const held = new Promise<void>((resolve) => { markHeld = resolve; });
+      const holder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`Blockcast/frr#${HEAD_SHA}`}, 0))`);
+        markHeld();
+        await released;
+      });
+      await held;
       return async () => {
-        await db.execute(sql`delete from github_status_key_leases where token = 'another-pod'`);
+        release();
+        await holder;
       };
     }
 
@@ -1519,10 +1525,6 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
     const KEY = `Blockcast/FRR#${HEAD_SHA}`;
     const LEASE_KEY = KEY.toLowerCase();
 
-    afterEach(() => {
-      _setGithubStatusKeyLeaseTimingForTest();
-    });
-
     async function leaseRows() {
       return db.select().from(githubStatusKeyLeases);
     }
@@ -1578,95 +1580,87 @@ describeEmbeddedPostgres("GitHub commit-status delivery outbox", () => {
       expect(await leaseRows()).toMatchObject([{ token: "taker" }]);
     });
 
-    it("renews the lease at every fence", async () => {
-      const remaining = await withGithubStatusDeliveryLock(db, KEY, async (fence) => {
-        await db.execute(sql`update github_status_key_leases set expires_at = clock_timestamp() + interval '5 seconds'`);
+    it("refuses a write that could outlive the lease", async () => {
+      const wrote = vi.fn();
+      const result = await withGithubStatusDeliveryLock(db, KEY, async (fence) => {
+        await db.execute(sql`update github_status_key_leases set expires_at = clock_timestamp() + interval '30 seconds'`);
         await fence();
+        wrote();
+      });
+
+      expect(result).toBeNull();
+      expect(wrote).not.toHaveBeenCalled();
+    });
+
+    // now() is frozen at the transaction's start, so a fence measured with it
+    // would credit the holder with the time it has already spent.
+    it("measures the lease on the wall clock, not the transaction's frozen now()", async () => {
+      const wrote = vi.fn();
+      const result = await withGithubStatusDeliveryLock(db, KEY, async (fence, tx) => {
+        await tx.execute(sql`select pg_sleep(2)`);
+        // Just under the 70 s a write needs; frozen now() would read about 71 s.
+        await db.execute(sql`update github_status_key_leases set expires_at = clock_timestamp() + interval '69 seconds'`);
+        await fence();
+        wrote();
+      });
+
+      expect(result).toBeNull();
+      expect(wrote).not.toHaveBeenCalled();
+    });
+
+    // After its backend dies, the driver reopens the same pooled connection for
+    // queued work and runs the dead transaction's later queries there, on a
+    // backend that holds no advisory lock (verified against postgres.js). One
+    // connection plus queued work forces exactly that. Two guards refuse it:
+    // the helper's transactionEnded latch and the fence's backend/transaction
+    // binding; each covers the other.
+    it("fails closed when the holder's transaction backend dies and its connection is reopened", async () => {
+      const holderDb = createDb(tempDb!.connectionString, 1);
+      const wrote = vi.fn();
+      let queued: Promise<unknown> | undefined;
+      const result = await withGithubStatusDeliveryLock(holderDb, KEY, async (fence, tx) => {
+        const [row] = (await tx.execute(sql`select pg_backend_pid() as pid`)) as unknown as Array<{ pid: number }>;
+        queued = holderDb.execute(sql`select pg_sleep(0.2)`);
+        await db.execute(sql`select pg_terminate_backend(${row!.pid})`);
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        await fence();
+        wrote();
+      });
+      await queued;
+
+      expect(result).toBeNull();
+      expect(wrote).not.toHaveBeenCalled();
+      expect(await leaseRows()).toEqual([]);
+    }, 30_000);
+
+    // Pods still running #3411 see only the transaction-scoped advisory lock on
+    // the raw key, so release N must keep taking it.
+    it("excludes, and is excluded by, a #3411 pod's advisory lock on the raw key", async () => {
+      let release!: () => void;
+      const released = new Promise<void>((resolve) => { release = resolve; });
+      let markHeld!: () => void;
+      const held = new Promise<void>((resolve) => { markHeld = resolve; });
+      const legacyHolder = db.transaction(async (tx) => {
+        await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${KEY}, 0))`);
+        markHeld();
+        await released;
+      });
+      await held;
+      try {
+        await expect(withGithubStatusDeliveryLock(db, KEY, async () => "ran")).resolves.toBeNull();
+        expect(await leaseRows()).toEqual([]);
+      } finally {
+        release();
+        await legacyHolder;
+      }
+
+      const legacyTryLock = await withGithubStatusDeliveryLock(db, KEY, async () => {
         const [row] = (await db.execute(
-          sql`select extract(epoch from expires_at - clock_timestamp()) as s from github_status_key_leases`,
-        )) as unknown as Array<{ s: number }>;
-        return Number(row!.s);
+          sql`select pg_try_advisory_xact_lock(hashtextextended(${KEY}, 0)) as acquired`,
+        )) as unknown as Array<{ acquired: boolean }>;
+        return row!.acquired;
       });
-      expect(remaining).toBeGreaterThan(80);
-    });
-
-    it("refuses a write once its lease has expired", async () => {
-      const wrote = vi.fn();
-      const result = await withGithubStatusDeliveryLock(db, KEY, async (fence) => {
-        await db.execute(sql`update github_status_key_leases set expires_at = clock_timestamp() - interval '1 second'`);
-        await fence();
-        wrote();
-      });
-
-      expect(result).toBeNull();
-      expect(wrote).not.toHaveBeenCalled();
-    });
-
-    it("refuses a write when the renewal leaves less than a write attempt's time", async () => {
-      // No time left over: any renewal latency at all eats into the write.
-      _setGithubStatusKeyLeaseTimingForTest({ ttlMs: 1_000, writeBudgetMs: 1_000 });
-      const wrote = vi.fn();
-      let reason: string | undefined;
-      const result = await withGithubStatusDeliveryLock(db, KEY, async (fence) => {
-        await fence().catch((err: Error) => {
-          reason = err.message;
-          throw err;
-        });
-        wrote();
-      });
-
-      expect(result).toBeNull();
-      expect(reason).toBe("lease_expiring");
-      expect(wrote).not.toHaveBeenCalled();
-    });
-
-    it("keeps a long evaluation's lease alive with the heartbeat", async () => {
-      _setGithubStatusKeyLeaseTimingForTest({ ttlMs: 1_500, heartbeatMs: 200, writeBudgetMs: 500 });
-      const result = await withGithubStatusDeliveryLock(db, KEY, async (fence) => {
-        // Twice the TTL, as a slow read phase would take.
-        await new Promise((resolve) => setTimeout(resolve, 3_000));
-        await fence();
-        return "wrote";
-      });
-
-      expect(result).toBe("wrote");
-    });
-
-    it("stops holding a head once an evaluation passes its maximum hold", async () => {
-      _setGithubStatusKeyLeaseTimingForTest({ ttlMs: 1_000, heartbeatMs: 100, writeBudgetMs: 500, maxHoldMs: 300 });
-      const wrote = vi.fn();
-      let expired: boolean | undefined;
-      const result = await withGithubStatusDeliveryLock(db, KEY, async (fence) => {
-        // Past the hold and a full TTL: the heartbeat must have stopped renewing.
-        await new Promise((resolve) => setTimeout(resolve, 1_800));
-        const [row] = (await db.execute(sql`
-          select expires_at <= clock_timestamp() as expired from github_status_key_leases
-        `)) as unknown as Array<{ expired: boolean }>;
-        expired = row?.expired;
-        await fence();
-        wrote();
-      });
-
-      expect(result).toBeNull();
-      expect(expired).toBe(true);
-      expect(wrote).not.toHaveBeenCalled();
-    });
-
-    // The point of the lease: a holder keeps no pooled connection, and no
-    // transaction, across its GitHub calls.
-    it("holds the key without a transaction or an idle-in-transaction backend", async () => {
-      const transaction = vi.spyOn(db, "transaction");
-      const idleInTransaction = await withGithubStatusDeliveryLock(db, KEY, async (fence) => {
-        await fence();
-        const [row] = (await db.execute(sql`
-          select count(*)::int as n from pg_stat_activity
-          where datname = current_database() and state like 'idle in transaction%'
-        `)) as unknown as Array<{ n: number }>;
-        return row!.n;
-      });
-
-      expect(idleInTransaction).toBe(0);
-      expect(transaction).not.toHaveBeenCalled();
+      expect(legacyTryLock).toBe(false);
     });
 
     it("sweeps only expired leases", async () => {
