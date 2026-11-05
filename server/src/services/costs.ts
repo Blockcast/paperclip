@@ -637,8 +637,14 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         .where(and(...conditions, isNotNull(costEvents.heartbeatRunId)));
 
       const issueIdAsText = sql<string>`${issues.id}::text`;
+      // PEN-5604: dedup by RUN, not by (run, project) pair. Pair-dedup emitted one link
+      // row per project a run touched, and since the join below matches on `run_id`
+      // alone, every cost event of a multi-project run was counted once per project --
+      // so `sum(byProject[].costCents)` exceeded actual spend. Run-dedup also makes the
+      // `ORDER BY ... created_at DESC` below mean what it was written to mean: of the
+      // projects this run touched, attribute its run-level cost to the most recent one.
       const runProjectLinks = db
-        .selectDistinctOn([activityLog.runId, issues.projectId], {
+        .selectDistinctOn([activityLog.runId], {
           runId: activityLog.runId,
           projectId: issues.projectId,
         })
@@ -659,7 +665,7 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             inArray(activityLog.runId, windowedRunIds),
           ),
         )
-        .orderBy(activityLog.runId, issues.projectId, desc(activityLog.createdAt))
+        .orderBy(activityLog.runId, desc(activityLog.createdAt))
         .as("run_project_links");
 
       const effectiveProjectId = sql<string | null>`coalesce(${costEvents.projectId}, ${runProjectLinks.projectId})`;
@@ -678,7 +684,16 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           outputTokens: sumAsNumber(costEvents.outputTokens),
         })
         .from(costEvents)
-        .leftJoin(runProjectLinks, eq(costEvents.heartbeatRunId, runProjectLinks.runId))
+        // Only rows WITHOUT a direct project need run attribution. Narrowing the join
+        // here is safe under LEFT JOIN -- a row that already carries a project simply
+        // does not match, and `coalesce(direct, null)` returns that project unchanged.
+        .leftJoin(
+          runProjectLinks,
+          and(
+            eq(costEvents.heartbeatRunId, runProjectLinks.runId),
+            isNull(costEvents.projectId),
+          ),
+        )
         .innerJoin(projects, sql`${projects.id} = ${effectiveProjectId}`)
         .where(and(...conditions, sql`${effectiveProjectId} is not null`))
         .groupBy(effectiveProjectId, projects.name)
