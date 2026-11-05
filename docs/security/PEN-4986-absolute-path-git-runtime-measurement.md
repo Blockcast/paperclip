@@ -32,8 +32,9 @@ is written as a **count test, not a harm test**, and the mechanism is the findin
 carries the same summary and is **in this tree**. The fuller record of the widening — all six
 windows, the severity argument and the predicate discussion — is
 `PEN-4989-absolute-path-git-population-widening.md` — **in this tree** since #3102 merged
-2026-11-05. This document is the method and the first data point. §4 below is right that this result does not generalise — what it could not know is that the
-first counter-example was already one window away. Read §2.2 before quoting a confidence
+2026-11-05. This document is the method and the first data point. §4 below is right that this
+result does not generalise — what it could not know is that the first counter-example was already
+one window away. Read §2.2 before quoting a confidence
 with the zero: the sampler's measured catch rate on the shortest invocation class is **0.710**, so
 the zero supports *k = 0* at only ~71 % for that class, not the ~93 % earlier drafts claimed.
 
