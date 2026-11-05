@@ -890,13 +890,32 @@ PVC's **0.39.0** to the image's **0.41.1**. That belongs on stage 3's verificati
      not silence it; opting an agent in is accepted only together with an owner
      for that claim's capacity.
 
-     ⚠️ **On Blockcast that enforcement is not live yet.**
-     `deploy/helm/paperclip/values.blockcast.yaml` sets `prometheusRule.enabled:
-     false`, and the mirror that actually deploys this rule,
-     Blockcast/onprem-k8s#7210, is still open. Until it lands, the ceiling is
-     accepted against an alarm that cannot sound — so verify the rule is loaded
-     at `/api/v1/rules` before treating the ceiling as enforced, and do not opt
-     an agent in on the strength of this paragraph alone.
+     ✅ **On Blockcast that enforcement is now live** — verified, not assumed.
+     Blockcast/onprem-k8s#7210 merged 2026-11-05T01:21:58Z (`cef3f659`), and
+     `PaperclipIsolationWorkspaceReaperCoverageGap` reads back from the running
+     Prometheus at `/api/v1/rules`: group
+     `paperclip-isolation-workspace-reaper`, file
+     `/etc/prometheus/rules/paperclip-runtime-alerts.rules.yml`, `health: ok`.
+     The qualifier this paragraph used to carry — *the ceiling is accepted
+     against an alarm that cannot sound* — is **retired**.
+
+     ⚠️ **Keep checking `/api/v1/rules` anyway: merged still does not mean
+     deployed.** `deploy/helm/paperclip/values.blockcast.yaml` still sets
+     `prometheusRule.enabled: false`, and that is deliberate, not an oversight
+     to fix (BLO-14032: the `paperclip-ci-deploy` ServiceAccount holds no grant
+     on `prometheusrules.monitoring.coreos.com`, so enabling it fails the whole
+     `helm upgrade` rather than skipping the resource). **This chart therefore
+     never ships this rule — the onprem-k8s apply pipeline does.** A green diff
+     in *this* repository is not evidence about what Prometheus loaded — it is
+     the distinction the retired qualifier above existed to hold open, and the
+     rule did sit undeployed from 2026-10-31 until the merge above.
+
+     When you check, confirm two things, not one: that the rule is loaded, and
+     that its query selects a **live series** (`max by (dry_run)
+     (paperclip_isolation_workspace_reaper_unreachable_agents{job="paperclip-control-plane"})`).
+     An alert whose selector matches nothing also sits `inactive`, and is
+     indistinguishable at a glance from one that is genuinely clear. On
+     2026-11-05 that series was present and `0` — clear, not vacuous.
 
      **Operator remedy while it is open**: opt the agent back out, or expand the
      claim. `runbooks/isolation-workspace-reaper.md` § "What you can actually do
