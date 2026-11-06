@@ -88,6 +88,7 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     status: string;
     type?: string;
     createdAt: Date;
+    updatedAt?: Date;
     decidedAt?: Date | null;
     requestedByAgentId?: string;
   }) {
@@ -98,7 +99,7 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
       status: input.status,
       payload: {},
       createdAt: input.createdAt,
-      updatedAt: input.createdAt,
+      updatedAt: input.updatedAt ?? input.createdAt,
       decidedAt: input.decidedAt ?? null,
     });
   }
@@ -132,6 +133,59 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     // Oldest of the two, not the newest and not their sum.
     expect(series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { ...board, type: "request_board_approval" })).toBe(600);
     expect(body).toContain(`${APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC} 1`);
+  });
+
+  // THE LOAD-BEARING CASE FOR PEN-5719. `resubmit` returns a row to `pending`
+  // and KEEPS its original `created_at`, so dating the age from that column
+  // bills the board both for the stretch the card sat in `revision_requested`
+  // -- the requester's court, which the pending COUNT already excludes -- and
+  // for the pre-revision stretch the board discharged by ruling on it. The live
+  // instance: a card filed 10-30, sent back 11-03, resubmitted 11-04 read 7.2d
+  // against a 7d threshold while its true pending age was 1.8d, and paged a
+  // board that had answered. Reverting the query to `min(created_at)` must turn
+  // this test red.
+  it("ages a resubmitted card from its resubmission, not its original filing", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId);
+    // Filed 8 days ago, sent back, resubmitted 90 minutes ago.
+    await insertApproval({
+      companyId,
+      status: "pending",
+      requestedByAgentId: agentId,
+      createdAt: new Date(NOW.getTime() - 8 * 86_400_000),
+      updatedAt: new Date(NOW.getTime() - 5_400_000),
+    });
+
+    await refreshApprovalQueueMetrics(db, NOW);
+    const { body } = await renderMetrics();
+
+    const age = series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, {
+      ...agent,
+      type: "request_board_approval",
+    });
+    // 90 minutes of board-owned wait, not 8 days -- and specifically BELOW the
+    // 7d (604800s) PaperclipApprovalStarved threshold this card used to trip.
+    expect(age).toBe(5_400);
+    expect(age!).toBeLessThan(604_800);
+    expect(series(body, APPROVALS_PENDING_METRIC, { ...agent, type: "request_board_approval" })).toBe(1);
+  });
+
+  // The guard on the fix itself: GREATEST must not let a backdated `updated_at`
+  // report a NEGATIVE age, and must leave the ordinary never-resubmitted card
+  // dated from its filing.
+  it("falls back to createdAt when updatedAt is older, and never reports a negative age", async () => {
+    const companyId = await insertCompany();
+    await insertApproval({
+      companyId,
+      status: "pending",
+      createdAt: new Date(NOW.getTime() - 3_600_000),
+      updatedAt: new Date(NOW.getTime() - 9_000_000),
+    });
+
+    await refreshApprovalQueueMetrics(db, NOW);
+    const { body } = await renderMetrics();
+
+    expect(series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { ...board, type: "request_board_approval" })).toBe(3_600);
   });
 
   // THE LOAD-BEARING CASE. This is the defect the issue was filed on: the 8 most
