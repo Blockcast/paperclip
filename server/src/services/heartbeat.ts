@@ -14069,9 +14069,16 @@ export function buildPaperclipTaskMarkdown(input: {
     // completeness question directly and this names that one field instead: a control
     // read under time pressure should not require the reader to combine three.
     "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, with `provenance: \"webhook\"` marking the authoritative binding. **`ownerListComplete: true` is the only thing that tells you the list is whole. `ownerListComplete: false` means it is NOT verified whole, and you must not act as though you have seen every owner.** `false` spans two states, and it deliberately does not distinguish them, because your next move is the same either way. Either the answer is SHORT -- a row withheld from your seat (`withheldForAuthorizationCount`), or an owner the artifact declares that the lookup could not return (`unresolvedOwningIdentifiers` -- another company's identifier space, a deleted or mistyped one). Or completeness is UNVERIFIABLE: no authoritative row in the answer records what the artifact declared (`owningIdentifiersUnrecorded`), so there is nothing to check the rows you got against. The second says owners MAY be missing, not that they are. Do NOT read `withheldForAuthorizationCount: 0` as complete on its own; it reports only the first cause, and those two fields can describe the same owner, so do not add them up. An empty `owners` list is NOT proof the artifact is unowned. Name artifacts as `owner/repo#123` or a full URL, never a bare `#123`: the same number is a different pull request in every repo, and the lookup answers a wrong-repo key confidently rather than emptily.",
-    // PEN-5674: the rule above is unsatisfiable for an agent that is not assigned to the
-    // owning row -- a comment there returns 403 `deny_missing_grant`. Name the next action so
-    // a blocked run does not fall back to recording only on its own row, silently.
+    // PEN-5674: the rule above is unsatisfiable for an agent holding NONE of the relations in
+    // `ISSUE_COMMENT_EVALUATED_RELATIONS` to the owning row -- its comment there returns 403
+    // `deny_missing_grant`. Deliberately not "an agent that is not assigned to it": assignment
+    // is one of eight relations that grant comment (docs/security/issue-authorization-model.md
+    // -- "an agent may SAY anything on an issue it is RELATED to"), so this fires strictly less
+    // often than row ownership would suggest, and a run refused here is missing every relation,
+    // not merely the assignment. The distinction is load-bearing for the next clause: a mention
+    // grant written by the owning row's assignee is itself one of the eight, so the hop below is
+    // the documented way to ACQUIRE the relation, not only a way to delegate the write.
+    // Name the next action so a blocked run does not fall back to its own row, silently.
     "If the write to an owning row returns `403 deny_missing_grant`, you cannot record there -- do not stop at your own row. Comment on the row you do hold, naming the artifact, the constraint, and each owning row you could not write to, and link the owning row's assignee (or your chain of command) with `[@Name](agent://<uuid>)` so they record it as that row's assignee. A bare `@Name` mentions nobody. State on your own row that the constraint has NOT yet reached the owning row, until the assignee confirms.",
   );
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
