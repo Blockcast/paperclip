@@ -18,8 +18,25 @@ export const TRAILER_PATTERNS = [
   /^[ \t]*(?:🤖[ \t]*)?generated with \[/im,
 ];
 
+// Strip only. The force-push is PUSH_REMEDY below and is deliberately NOT
+// appended here: a lease has to name the sha it expects, which a static string
+// cannot know, and the test executes this constant verbatim.
 export const STRIP_COMMAND =
-  "git filter-branch -f --msg-filter \"grep -viE '^[[:space:]]*(co-authored-by:|(🤖[[:space:]]*)?generated with \\[)'\" origin/master..HEAD && git push --force-with-lease";
+  "git filter-branch -f --msg-filter \"grep -viE '^[[:space:]]*(co-authored-by:|(🤖[[:space:]]*)?generated with \\[)'\" origin/master..HEAD";
+
+// The `git` egress wrapper refuses a blind force push, and since PEN-4869 that
+// includes a BARE `--force-with-lease`: bare takes its expectation from the
+// remote-tracking ref, so an intervening fetch advances it and the lease then
+// passes over the very commit it was meant to protect. Agent pods put that
+// wrapper first on PATH, so a bare lease printed here is refused for exactly
+// the population this check writes to, at the moment they are already blocked.
+//
+// Read the sha, then name it. Deriving it inline -- `:$(git rev-parse
+// origin/<branch>)` -- would satisfy the wrapper's argv predicate while
+// reproducing the hazard it exists to stop, which is worse than being refused.
+export const PUSH_REMEDY =
+  "git fetch origin && git rev-parse origin/<branch>   # read that sha, then: " +
+  "git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>";
 
 export function checkCommitTrailers(commits) {
   const offending = commits
@@ -31,7 +48,8 @@ export function checkCommitTrailers(commits) {
     failures: [
       `Commit(s) ${offending.map(s => `\`${s.slice(0, 12)}\``).join(', ')} carry a \`Co-Authored-By\` / \`Generated with\` trailer. ` +
       'The merge queue lands commit messages verbatim, so trailered commits must never land on paperclip. ' +
-      `Strip them and force-push: \`${STRIP_COMMAND}\` (or \`git rebase -i origin/master\` and \`reword\` each one). ` +
+      `Strip them: \`${STRIP_COMMAND}\` (or \`git rebase -i origin/master\` and \`reword\` each one). ` +
+      `Then force-push with a lease that names the sha it expects: \`${PUSH_REMEDY}\`. ` +
       'This check re-reads the commits on every push.',
     ],
   };

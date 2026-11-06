@@ -248,7 +248,13 @@ export function formatReport(verdict, { base, head } = {}) {
   lines.push("");
   lines.push("    git fetch origin master");
   lines.push("    git rebase origin/master      # NOT `git merge origin/master`");
-  lines.push("    git push --force-with-lease");
+  // `ls-remote`, not `rev-parse origin/<branch>`: only master was fetched above,
+  // so the tracking ref is stale or (in a fresh clone) absent. And the lease is
+  // PINNED, not bare -- since PEN-4869 the git egress wrapper refuses a bare
+  // `--force-with-lease`, because bare takes its expectation from that same
+  // tracking ref and so passes over the very commit it was meant to protect.
+  lines.push("    git ls-remote origin refs/heads/<branch>   # the sha you are replacing: <expected-sha>");
+  lines.push("    git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>");
   lines.push("");
   lines.push("`git merge origin/master` and the GitHub \"Update branch\" button both make");
   lines.push("`mergeable` true while leaving `rebaseable` false, which is the failure this");
