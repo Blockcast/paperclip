@@ -6972,18 +6972,34 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         },
       })
       .where(eq(heartbeatRuns.id, runId));
-    // Operator unblock recorded strictly AFTER the handoff run.
-    await db.insert(activityLog).values({
-      id: randomUUID(),
-      companyId,
-      actorType: "user",
-      actorId: "operator",
-      action: "issue.updated",
-      entityType: "issue",
-      entityId: issueId,
-      details: { previousStatus: "blocked", status: "todo" },
-      createdAt: new Date("2026-03-19T01:00:00.000Z"),
-    });
+    // Operator unblock recorded strictly AFTER the handoff run. The PATCH route
+    // writes `successful_run_handoff_resolved` alongside the `issue.updated` for a
+    // user status change, so seed both: BLO-53712's resolved-since guard must not
+    // swallow this requeue (deleting the ordering makes continuationRequeued 0).
+    await db.insert(activityLog).values([
+      {
+        id: randomUUID(),
+        companyId,
+        actorType: "user",
+        actorId: "operator",
+        action: "issue.updated",
+        entityType: "issue",
+        entityId: issueId,
+        details: { previousStatus: "blocked", status: "todo" },
+        createdAt: new Date("2026-03-19T01:00:00.000Z"),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        actorType: "user",
+        actorId: "operator",
+        action: "issue.successful_run_handoff_resolved",
+        entityType: "issue",
+        entityId: issueId,
+        details: { sourceRunId, correctiveRunId: runId, resolvedByStatus: "todo" },
+        createdAt: new Date("2026-03-19T01:00:00.000Z"),
+      },
+    ]);
     heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
 
     const result = await heartbeat.reconcileStrandedAssignedIssues();
@@ -7008,8 +7024,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   // route recorded `issue.successful_run_handoff_resolved` -- but that run's
   // contextSnapshot still carries `handoffAttempt: 1 / max 1`, so the arm above
   // read it as exhausted and escalated a disposition that already existed
-  // (BLO-53258/53260/53261/53270/53399). Order reproduced: required, run,
-  // resolved, then the reconcile tick. Deleting the
+  // (BLO-53258/53260/53261/53270/53399). Order reproduced: run, required
+  // (heartbeat logs it after enqueueing the run), resolved, then the reconcile tick. Deleting the
   // `successfulRunHandoffResolvedSince` guard makes this escalate (1, `blocked`).
   it("BLO-53712: does not escalate a todo handoff the corrective run already resolved", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
@@ -7046,7 +7062,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         entityType: "issue",
         entityId: issueId,
         details: { sourceRunId, correctiveRunId: runId },
-        createdAt: new Date("2026-11-06T00:49:00.000Z"),
+        createdAt: new Date("2026-11-06T00:50:01.000Z"),
       },
       {
         id: randomUUID(),
