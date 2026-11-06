@@ -25,11 +25,22 @@ const COMPANY_NAME = `E2E-Test-${Date.now()}`;
 const MISSION = "Build affordable home robots that handle household chores.";
 
 test.describe("Onboarding wizard", () => {
-  // The single test below declares 15s + 10s + 30s = 55s of assertion budget
-  // against the suite's 60s default cap, leaving 5s for a goto, two clicks,
-  // two fills and four API round-trips. Statically that budget is unreachable,
-  // which is the same defect that made applications-crud and
-  // application-delete-screenshot flake (BLO-33320).
+  // The single test below declares 15s + 10s + 90s = 115s of assertion budget
+  // against the 180s cap set below, leaving 65s for a goto, two clicks, two
+  // fills and four API round-trips.
+  //
+  // The 90s belongs to the "Confirm mission" wait. That one is server-bound —
+  // it covers two creates, not a render — and it degrades with suite progress,
+  // because specs create companies and never tear them down, so the periodic
+  // sweeps iterate an ever-larger set. Measured on run 42205645363: 9s at ~7
+  // live companies, 8s at ~13, then 32s and 38s by test #30 of 50, against the
+  // 30s this used to budget. Both the attempt and its retry timed out (PEN-5805).
+  //
+  // The 15s and 10s cover client-side renders and are deliberately unchanged;
+  // both passed in that run. Sizing an inner wait to the retired 60s default is
+  // the same defect that made applications-crud and application-delete-screenshot
+  // flake (BLO-33320) — raising only the outer cap does not fix it, since the
+  // inner wait still fails first.
   test.setTimeout(180_000);
 
   test("create-company path: name + mission creates company and goal", async ({
@@ -79,7 +90,7 @@ test.describe("Onboarding wizard", () => {
     // advances to the team-lead naming step of the capsule wizard.
     await page.getByRole("button", { name: /Confirm mission/ }).click();
     await page.waitForSelector('input[placeholder="Chief of staff"]', {
-      timeout: 30_000,
+      timeout: 90_000,
     });
 
     // Verify the company + company-level goal were persisted.
