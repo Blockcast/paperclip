@@ -721,6 +721,218 @@ function isPosixPathValue(value: string): boolean {
   return true;
 }
 
+/** PEN-5734: `--force-with-lease=<ref>:<expected-oid>`, the ONLY force-push
+ *  form the PEN-4869 git-egress guard accepts. A bare `--force-with-lease`
+ *  reads its expected OID from `refs/remotes/origin/<branch>`, so any
+ *  intervening `git fetch` makes the lease pass vacuously; that guard refuses
+ *  the bare form and demands this one.
+ *
+ *  Which made the mandated form unpublishable. `ASSIGNMENT_RE` captures a name
+ *  from `[A-Za-z0-9_]`, so the `-` in `--force-with-lease=` terminates it and
+ *  the captured name is `lease`; `:` is outside the value alphabet, so the
+ *  captured value is the REF half alone. A branch name long enough to clear
+ *  the entropy floor was therefore redacted out of the middle of the command,
+ *  leaving a marker where the ref had been and `:<oid>` still trailing it — a
+ *  non-command — in a PR body whose write reported success. The fleet's own
+ *  guard mandates the form, so "derive it at runtime" is unavailable: the
+ *  point of a pinned lease is that the expected OID is a literal written down
+ *  ahead of time.
+ *
+ *  TWO HALVES, TWO INDEPENDENT BOUNDS — never the composite as a whole. The
+ *  value is a git ref and a git object name joined by `:`, and each half is
+ *  exonerated on its own shape under this one binding name. Nothing here
+ *  admits an opaque `<ref>:<token>` as a unit: an opaque left half is still
+ *  refused by the entropy test it falls through to, and an opaque right half
+ *  is now refused by a rule that did not previously exist. That is the
+ *  BLO-45350 / BLO-45605 lesson recorded in
+ *  `docs/security/PEN-3920-egress-entropy-identifier-decision.md` §10 applied
+ *  before the fact: there, two runs of a composite were bounded and the third
+ *  exonerated an arbitrary token in the gap.
+ *
+ *  THE RIGHT HALF IS A TIGHTENING, NOT AN EXEMPTION. Because `:` ends
+ *  `ASSIGNMENT_RE`'s capture, everything after it was never offered to any
+ *  detector. Measured on the shipped scrubber, a lease naming a 32-character
+ *  base64url token as its expectation published that token BYTE-EXACT while
+ *  redacting the harmless branch name beside it — this binding scrubbed the
+ *  public half and passed the opaque one. `FORCE_WITH_LEASE_EXPECTATION_RE`
+ *  and its pass in `scrubGitHubEgressText` close that.
+ *
+ *  THE ANCHOR IS THE LITERAL FLAG, not the captured name. Exonerating the name
+ *  `lease` would also reach `lease=`, `--lease=` and `my_lease=`, none of
+ *  which any control mandates. `isForceWithLeaseBinding` therefore re-reads
+ *  the bytes immediately before the match and requires `--force-with-` there,
+ *  so the anchor is exactly `--force-with-lease`. Same doctrine as every other
+ *  name anchor in this file (PEN-3920 §4): detection stays structural and an
+ *  unrecognised name still fires; the name only narrows an exemption, so a
+ *  name nobody anticipated costs a false positive, never a leak. */
+const FORCE_WITH_LEASE_NAME = "lease";
+const FORCE_WITH_LEASE_NAME_PREFIX = "--force-with-";
+
+/** True when an `ASSIGNMENT_RE` match is the `--force-with-lease=` binding
+ *  rather than some other name ending in `lease`. `offset` points at the NAME,
+ *  because that pattern opens with `\b(`, so the rest of the flag is exactly
+ *  the bytes immediately before it. */
+function isForceWithLeaseBinding(name: string, whole: string, offset: number): boolean {
+  if (name !== FORCE_WITH_LEASE_NAME) return false;
+  const start = offset - FORCE_WITH_LEASE_NAME_PREFIX.length;
+  if (start < 0) return false;
+  return whole.slice(start, offset) === FORCE_WITH_LEASE_NAME_PREFIX;
+}
+
+/** Longest ref admitted. git imposes no limit of its own; the longest branch
+ *  name in the three repositories' histories is 68 characters. */
+const GIT_REF_MAX_LENGTH = 128;
+/** Slash-separated components. `refs/remotes/origin/<branch>` is four, which
+ *  is also the corpus maximum: over 1192 branch names in Blockcast/paperclip's
+ *  history the distribution is 263 at one component, 914 at two, 3 at three
+ *  and 12 at four. So this sits exactly on the maximum with nothing to spare,
+ *  and it is a real bound rather than headroom — `/` is the separator the
+ *  chopped-token families use to reach a word-only rule, and capping it is
+ *  what takes `lower-alnum chopped by '/'` out of the top of the residual
+ *  table below. */
+const GIT_REF_MAX_COMPONENTS = 4;
+/** Summed length of the letters-only runs. THIS IS THE CONJUNCT THAT HOLDS THE
+ *  RULE, exactly as `K8S_NAME_MIN_WORD_MASS` holds the Kubernetes one, and the
+ *  numbers are in `isGitRefName`'s residual table: without it the chopped-token
+ *  families reach 8.5e-3, with it 1.5e-4.
+ *
+ *  It is also what keeps real credential FORMATS out, which no other conjunct
+ *  here does — none musters ten characters of letter runs: `sk-ant-api03-…`
+ *  has 5, `xoxb-…` 4, `sk_live_…` 6, a Kubernetes bootstrap token's
+ *  `<6>.<16>` has 0 unless both halves draw no digit.
+ *
+ *  Set one below the corpus minimum, the convention this file uses for a knee.
+ *  Over 1192 distinct branch names in Blockcast/paperclip's history, 847 are
+ *  refused inside a lease by the shipped detector and this rule publishes 518
+ *  of them; the lowest word mass among those 518 is 11, so a floor of 10 costs
+ *  nothing and 12 would drop two real branches. */
+const GIT_REF_MIN_WORD_MASS = 14;
+
+/**
+ * True when a value is a git ref name built entirely of words.
+ *
+ * ZERO OPAQUE MASS, deliberately, and that is what carries the rule. Every run
+ * between `/`, `-`, `_` and `.` must satisfy `isPosixPathRun` — a word, a
+ * number, or a tightly bounded word-with-digits — so there is no budget here
+ * for a generated segment at all, unlike `isKubernetesObjectName`, which
+ * spends sixteen characters of one. Same trade `isPosixPathValue` takes, for
+ * the same reason: a credential is one opaque run, and one opaque run reaches
+ * neither shape.
+ *
+ * The git-specific refusals (`..`, a leading `.` on a component, a `.lock`
+ * tail, an empty component) are `git check-ref-format`'s rules rather than
+ * security bounds — a value git would reject is not a ref, and saying so keeps
+ * the predicate honest about what it claims to recognise. What holds the rule
+ * is the per-run shape above plus the run and content caps borrowed from the
+ * POSIX path rule.
+ *
+ * The rest of what `check-ref-format` forbids — `~`, `^`, `?`, `*`, `[`,
+ * backslash, whitespace — needs no test here: none is in the alphabet that
+ * reaches this predicate, because `ASSIGNMENT_RE`'s capture and
+ * `FORCE_WITH_LEASE_EXPECTATION_RE` both stop at the first character outside
+ * the token alphabet. A ref carrying one arrives TRUNCATED, which can only
+ * narrow what is exonerated.
+ *
+ * THE RESIDUAL, measured as this file's family requires — 200,000 random
+ * values per family, fraction NEWLY exonerated under the `--force-with-lease`
+ * anchor, i.e. values the shipped detector refuses that this rule admits.
+ * Reproduce with `scripts/measure-force-with-lease-residual.mjs`; the full
+ * table and the knee analysis are in PEN-3920 §11.3.
+ *
+ *   base64url, base62, base36, base32, hex upper and lower, mixed-case
+ *   letters, alphanumeric, at 24 / 32 / 43 / 64 characters .......... 0 each
+ *   UUID v4 layout .................................................. 0
+ *   24 real credential formats (GitHub PAT classic, fine-grained and
+ *   OAuth, Slack, Stripe live and restricted, AWS key id and secret,
+ *   Google, Anthropic, OpenAI key and project key, Vault, GitLab,
+ *   npm, Grafana, base32 TOTP seed, DigitalOcean, Paperclip service
+ *   key, raw hex and base64 blobs), bare and `release/`-prefixed .... 0 each
+ *   Kubernetes bootstrap token (`<6>.<16>`), `release/`-prefixed .... 2.30e-3
+ *   Synthetic "chopped token" families — a random token sliced into
+ *   equal runs by `/` or `-`, the only construction that reaches a
+ *   word-only rule: base36 and lowercase-alnum at 4 / 6 / 8-char
+ *   runs, mixed-case letters at 4 / 6 / 8 ................ 0 to 1.15e-3
+ *
+ * Worst family 2.30e-3. It is NOT zero, and the flat-token zeros are the
+ * uninteresting half of that: a flat token is one opaque run and cannot reach
+ * a word-only rule at all. The number to watch is the chopped-token column,
+ * and the two conjuncts holding it are GIT_REF_MIN_WORD_MASS and
+ * GIT_REF_MAX_COMPONENTS — without them the same families measure 8.50e-3.
+ *
+ * For scale, `isLexicalIdentifier` carries 2.96e-3 to 3.57e-3 NAME-FREE today,
+ * and the name-anchored Kubernetes rule up to 9.85e-3 under an anchor of eight
+ * common label names. This sits below both, under an anchor of one literal
+ * flag.
+ *
+ * WHAT IT ADMITS, stated plainly. A deliberately constructed value — a secret
+ * chopped into short case-homogeneous word-shaped runs and spelled as a branch
+ * name — is admitted, up to the word mass `POSIX_PATH_MAX_CONTENT_LENGTH`
+ * allows. No encoder emits that; producing it means setting out to, which
+ * PEN-3920 §4 and PEN-3183 put outside this control's threat model. The one
+ * non-zero credential row above is the honest edge of that: a Kubernetes
+ * bootstrap token whose two halves both happen to draw no digit is word-shaped
+ * by accident rather than by construction.
+ */
+function isGitRefName(value: string): boolean {
+  if (value.length === 0 || value.length > GIT_REF_MAX_LENGTH) return false;
+  if (value.startsWith("/") || value.endsWith("/")) return false;
+  if (value.includes("..") || value.endsWith(".lock")) return false;
+  const components = value.split("/");
+  if (components.length > GIT_REF_MAX_COMPONENTS) return false;
+  let runCount = 0;
+  let contentLength = 0;
+  let mixedRuns = 0;
+  let wordMass = 0;
+  for (const component of components) {
+    if (component === "" || component.startsWith(".")) return false;
+    for (const run of component.split(/[-._]/)) {
+      if (!isPosixPathRun(run)) return false;
+      runCount += 1;
+      contentLength += run.length;
+      if (runCount > POSIX_PATH_MAX_RUNS) return false;
+      if (contentLength > POSIX_PATH_MAX_CONTENT_LENGTH) return false;
+      if (/^[A-Za-z]+$/.test(run)) wordMass += run.length;
+      else if (/[0-9]/.test(run) && /[A-Za-z]/.test(run)) {
+        mixedRuns += 1;
+        if (mixedRuns > POSIX_PATH_MAX_MIXED_RUNS) return false;
+      }
+    }
+  }
+  return wordMass >= GIT_REF_MIN_WORD_MASS;
+}
+
+/** The expected-OID half of a pinned lease: a git object name, full or
+ *  abbreviated. 7 is git's own minimum unambiguous abbreviation and 64 covers
+ *  a sha256 OID, so this spans every form `--force-with-lease` takes as a
+ *  literal. Lowercase only, like `GIT_COMMIT_SHA_RE` and `HEX_DIGEST_RE`: an
+ *  uppercase OID is not a form git plumbing emits, so it stays subject to the
+ *  entropy test.
+ *
+ *  The residual is the one `GIT_OBJECT_NAME_VALUE_NAMES` already states and
+ *  accepts, reached under one more binding name: a legacy GitHub personal
+ *  access token is exactly 40 lowercase hex with no prefix, and
+ *  `VENDOR_KEY_RE` does not see one. What makes it acceptable is the NAME half
+ *  alone — nothing but a git object name is plausibly written after
+ *  `--force-with-lease=<ref>:` — and it must never be widened into a
+ *  shape-only rule. Note too that the direction of travel on this half is
+ *  TIGHTENING: before PEN-5734 nothing tested it at all. */
+const LEASE_EXPECTED_OID_RE = /^[0-9a-f]{7,64}$/;
+
+/** The `--force-with-lease=` binding together with its expectation half.
+ *
+ *  Group 1 is everything through the `:` — flag, optional opening quote, ref —
+ *  and is replayed verbatim, so this pass can only ever rewrite what follows
+ *  the colon. The ref half is left for `ASSIGNMENT_RE` to adjudicate exactly
+ *  as it does today, which is what keeps the two bounds independent.
+ *
+ *  Group 2 is the expectation. `.` is admitted only BETWEEN token runs, never
+ *  as a tail: `ASSIGNMENT_RE`'s alphabet includes `.`, and borrowing it whole
+ *  would swallow the full stop ending a sentence, turn a clean 40-hex OID into
+ *  a 41-character non-OID, and redact the very value this rule exists to let
+ *  through. */
+const FORCE_WITH_LEASE_EXPECTATION_RE =
+  /(--force-with-lease=["']?[^\s"'`:]*:)([A-Za-z0-9+/=_-]+(?:\.[A-Za-z0-9+/=_-]+)*)/g;
+
 /** A segment is "lexical" when it is a plain word or a plain number — the
  *  shape hyphenated identifiers are built from, and the shape a random token's
  *  segments essentially never take, because a token mixes letters with digits
@@ -1034,14 +1246,45 @@ export function scrubGitHubEgressText(input: string): GitHubEgressScrubResult {
 
   apply(VENDOR_KEY_RE, "vendor-key");
 
+  // PEN-5734: the expectation half of `--force-with-lease=<ref>:<oid>`, which
+  // no other detector can reach. `:` is outside ASSIGNMENT_RE's value
+  // alphabet, so the capture stops at it and everything after the colon was
+  // never offered to any rule — this binding redacted the public branch name
+  // and published whatever sat in the expectation slot byte-exact.
+  //
+  // Runs BEFORE ASSIGNMENT_RE so the two halves are adjudicated in a fixed
+  // order and the ref half below sees the text this pass leaves. It must run
+  // after the vendor-key and JWT passes for the opposite reason: a marker they
+  // emitted contains spaces, which this pattern stops at, so a half already
+  // redacted by a more specific class is not re-examined and its marker is
+  // carried through untouched — the file's invariant that every class in
+  // `classes` keeps a visible marker in `text`.
+  text = text.replace(
+    FORCE_WITH_LEASE_EXPECTATION_RE,
+    (match, binding: string, expectation: string) => {
+      if (LEASE_EXPECTED_OID_RE.test(expectation)) return match;
+      if (!isOpaqueSecretValue(expectation)) return match;
+      fired.add("high-entropy-assignment");
+      return `${binding}${redactionMarker("high-entropy-assignment")}`;
+    },
+  );
+
   // Redact only the value; the name is often the point of the sentence and is
   // not itself sensitive.
-  text = text.replace(ASSIGNMENT_RE, (match, name: string, quote: string, value: string) => {
-    if (isContentDigestAssignment(name, value)) return match;
-    if (!isOpaqueSecretValue(value)) return match;
-    fired.add("high-entropy-assignment");
-    return `${name}=${quote}${redactionMarker("high-entropy-assignment")}`;
-  });
+  text = text.replace(
+    ASSIGNMENT_RE,
+    (match, name: string, quote: string, value: string, offset: number, whole: string) => {
+      // PEN-5734: the ref half of a pinned lease. Checked before
+      // isContentDigestAssignment rather than inside it because the anchor is
+      // the literal flag `--force-with-lease`, which only the surrounding
+      // bytes can establish — the name this pattern captures is bare `lease`.
+      if (isForceWithLeaseBinding(name, whole, offset) && isGitRefName(value)) return match;
+      if (isContentDigestAssignment(name, value)) return match;
+      if (!isOpaqueSecretValue(value)) return match;
+      fired.add("high-entropy-assignment");
+      return `${name}=${quote}${redactionMarker("high-entropy-assignment")}`;
+    },
+  );
 
   const order: GitHubEgressScrubClass[] = [
     "private-key-block",
