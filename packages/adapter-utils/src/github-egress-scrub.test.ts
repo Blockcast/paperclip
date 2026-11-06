@@ -1558,6 +1558,26 @@ describe("scrubGitHubEgressText", () => {
       expect(result.text).toContain(EXPECTED_OID);
     });
 
+    it("treats `:` as a SEPARATOR, so a dangling colon does not eat the pinned OID", () => {
+      // Ally, review 5798756712, measured at 19c9b48: with `:` a plain member
+      // of the expectation alphabet, prose that punctuates the command with a
+      // trailing colon captured `<oid>:`, which LEASE_EXPECTED_OID_RE rejects
+      // — so a VALID pinned OID was redacted. That is PEN-5734's own defect
+      // (the mandated form is unpublishable) reintroduced by PEN-5734's fix,
+      // in a narrower case. Failing closed is not good enough here: this
+      // binding exists precisely so the mandated form survives prose.
+      // A FULL 40-hex OID, deliberately: the 8-hex `EXPECTED_OID` the row
+      // measured is too short to read as opaque once a colon is appended, so
+      // it survives under BOTH forms and cannot discriminate. The mandated
+      // pinned lease normally carries the full object name, which is exactly
+      // the value the looser form ate.
+      const fullOid = "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8";
+      const result = scrubGitHubEgressText(`${lease(BRANCH, fullOid)}: then push`);
+
+      expect(result.redacted).toBe(false);
+      expect(result.text).toContain(fullOid);
+    });
+
     it("refuses an opaque REF even beside a well-formed OID", () => {
       const opaque = ["Qz7Z4mWvT2pK", "9dLxR6bN3sYcH1gF"].join("");
       const result = scrubGitHubEgressText(lease(opaque, EXPECTED_OID));

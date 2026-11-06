@@ -1572,12 +1572,21 @@ const LEASE_EXPECTED_OID_RE = /^[0-9a-f]{7,64}$/;
  *  containing a colon. So this strictly ENLARGES what is offered to
  *  `isOpaqueSecretValue` and can never let a value through that the narrower
  *  alphabet refused — the expectation-slot residual stays 0 by construction
- *  rather than by measurement. The one behaviour change in the other
- *  direction is a malformed trailing form (`<ref>:<oid>:`), which now reaches
- *  the detector instead of being exonerated; that is fail-closed, and it is
- *  not the shape PEN-4869 mandates. */
+ *  rather than by measurement.
+ *
+ *  `:` IS A SEPARATOR, NOT A MEMBER: it must be FOLLOWED by at least one
+ *  alphabet character, exactly as `.` already is. A dangling colon is
+ *  therefore not swallowed. Ally caught the cost of the looser form (review
+ *  5798756712): with `:` a plain member, prose such as
+ *  `--force-with-lease=<ref>:<oid>: then …` captured `<oid>:`, which
+ *  `LEASE_EXPECTED_OID_RE` rejects, so a VALID pinned OID was redacted —
+ *  PEN-5734's own defect in miniature, reintroduced by its own fix. That
+ *  failed closed, but failing closed on the mandated form is the thing this
+ *  binding exists to prevent. The separator form still captures
+ *  `sha256:<token>` and `<oid>:<token>` whole, so the second-colon escape
+ *  stays shut. */
 const FORCE_WITH_LEASE_EXPECTATION_RE =
-  /(--force-with-lease=["']?[^\s"'`:]*:)([A-Za-z0-9+/=_:-]+(?:\.[A-Za-z0-9+/=_:-]+)*)/g;
+  /(--force-with-lease=["']?[^\s"'`:]*:)([A-Za-z0-9+/=_-]+(?:[.:][A-Za-z0-9+/=_-]+)*)/g;
 
 /** A segment is "lexical" when it is a plain word or a plain number — the
  *  shape hyphenated identifiers are built from, and the shape a random token's
