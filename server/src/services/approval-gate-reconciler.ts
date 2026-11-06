@@ -108,6 +108,25 @@ const TERMINAL_RUN_STATES = new Set([
 const SUCCESS_CONCLUSION = "success";
 
 /**
+ * How long a pull request must have been closed before closed-unmerged retires its
+ * card (PEN-5662). Applies to the UNMERGED branch only; `merged` is monotonic and is
+ * never age-gated.
+ *
+ * Sized against a measured transient, not a guess. `allyblockcast[bot]` runs a sweep
+ * that closes a pull request unmerged and reopens it 5-6 seconds later; inside that
+ * window the pull request is genuinely `state=closed, merged=false`, and a sweep tick
+ * landing there would retire a card whose pull request is about to reopen and still
+ * needs merging. 120s is 20x the longest observed window, so the whole of that
+ * transient is covered with room for a slower reopen.
+ *
+ * The ceiling is the sweep interval (default 10 minutes): a threshold below it costs a
+ * genuinely-abandoned pull request's card at most ONE extra tick of delay before it
+ * retires, because by the next tick `closed_at` is older than any value here. That is
+ * the entire cost of this guard on the legitimate path.
+ */
+const CLOSED_UNMERGED_SETTLE_MS = 120_000;
+
+/**
  * Approval types this sweep is allowed to close.
  *
  * An allow-list rather than a deny-list: a newly added approval type is excluded
@@ -337,6 +356,15 @@ export function classifyGateLookup(lookup: WorkflowRunLookup): GateDisposition {
  *     is cheap and re-filable and the announcement says so; this reconciler does
  *     not watch for a reopen, so if #N comes back, file a new card naming it.
  *
+ *     ⏱ Because that retirement is one-way, the unmerged branch is age-gated: a
+ *     close must be at least `CLOSED_UNMERGED_SETTLE_MS` old before it retires
+ *     anything. A measured bot sweep closes pull requests unmerged and reopens
+ *     them 5-6 seconds later (PEN-5662), and a tick landing inside that window
+ *     would retire a card whose pull request is about to come back and still needs
+ *     merging — the exact inversion of the failure this rule was written to stop.
+ *     Inside the settle window the lookup is `deferred`, not `terminal`, so the
+ *     card simply survives to the next tick. `merged` is NOT age-gated.
+ *
  * So both terminal states retire the card, and they are kept apart by `satisfied`:
  * merged is satisfied, closed-unmerged is not. `satisfied` carries the same narrow
  * meaning it does for runs — "the PR this card NAMED reached this state" — never
@@ -344,7 +372,10 @@ export function classifyGateLookup(lookup: WorkflowRunLookup): GateDisposition {
  * run-shaped (`status=`/`conclusion=`) so a reader of either announcement can tell
  * which rule produced it.
  */
-export function classifyPullRequestGateLookup(lookup: PullRequestGateResult): GateDisposition {
+export function classifyPullRequestGateLookup(
+  lookup: PullRequestGateResult,
+  options: { now?: Date } = {},
+): GateDisposition {
   // Checked before the general error branch: `notFound` is a refinement OF `{error}`,
   // not an alternative to it, so order is load-bearing here.
   if ("error" in lookup && lookup.notFound === true) {
@@ -354,6 +385,32 @@ export function classifyPullRequestGateLookup(lookup: PullRequestGateResult): Ga
   // An open pull request is a live gate: it can still merge, so the ask can still
   // be granted. Same unknown-means-live direction the run classifier takes.
   if (lookup.state !== "closed") return { kind: "live" };
+
+  // PEN-5662: the settle guard, on the UNMERGED branch only.
+  //
+  // `merged` is monotonic — a merged pull request never un-merges — so a merge is
+  // terminal the instant it is observed and is deliberately not age-gated here. A
+  // CLOSE is not monotonic: it can be, and measurably is, undone seconds later, and
+  // retiring on one is irreversible for the card. So the unmerged branch must see a
+  // close that has had time to prove durable before it acts on it.
+  if (!lookup.merged) {
+    const closedAtMs = Date.parse(lookup.closedAt ?? "");
+    // Absent or unparseable `closed_at` falls through to today's behaviour rather
+    // than deferring. Deferring would be the safer direction for ONE card, but if the
+    // field ever stopped arriving it would silently switch the whole closed-unmerged
+    // branch off and leave cards standing for ever against dead pull requests —
+    // BLO-29359's failure mode, reintroduced with no signal. Preserve the shipped rule
+    // on the unexpected path; the one consumer is the sweep, and the sweep logs it.
+    if (Number.isFinite(closedAtMs)) {
+      const age = (options.now?.getTime() ?? Date.now()) - closedAtMs;
+      // Negative age = GitHub's clock is ahead of ours, which is the harmless
+      // direction: treat it as "not settled yet" and look again next tick.
+      if (age < CLOSED_UNMERGED_SETTLE_MS) {
+        return { kind: "deferred", reason: "pull_request_closed_recently" };
+      }
+    }
+  }
+
   return {
     kind: "terminal",
     summary: `state=\`closed\`, merged=\`${lookup.merged ? "true" : "false"}\``,
@@ -740,6 +797,9 @@ export async function reconcileApprovalGates(
                   repoFullName: gate.repoFullName,
                   prNumber: gate.prNumber,
                 }),
+                // Same clock the sweep stamps its writes with, so an injected `now`
+                // in tests moves the settle guard with everything else.
+                { now: now() },
               );
       } catch (err) {
         result.deferred += 1;
@@ -761,6 +821,11 @@ export async function reconcileApprovalGates(
       // still not grounds to cancel somebody's escalation (PEN-5254).
       if (disposition.kind === "deferred" || disposition.kind === "unreadable") {
         result.deferred += 1;
+        // The settle guard shares the `deferred` disposition but NOT its cause: GitHub
+        // answered perfectly well here, and the card is being held back on purpose.
+        // Logging it as unreadable would send anyone chasing a read failure that did
+        // not happen, so it gets its own line (PEN-5662).
+        const settling = disposition.reason === "pull_request_closed_recently";
         log.warn(
           {
             approvalId: candidate.id,
@@ -768,7 +833,9 @@ export async function reconcileApprovalGates(
             reason: disposition.reason,
             unresolvable: disposition.kind === "unreadable",
           },
-          "approval-gate reconciler deferred a card because GitHub was unreadable (BLO-29359)",
+          settling
+            ? "approval-gate reconciler held a card whose pull request closed within the settle window; re-checking next tick (PEN-5662)"
+            : "approval-gate reconciler deferred a card because GitHub was unreadable (BLO-29359)",
         );
         continue;
       }

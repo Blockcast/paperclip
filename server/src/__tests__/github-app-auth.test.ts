@@ -175,9 +175,9 @@ describe("getInstallationToken", () => {
 
 describe("githubGetPullRequestGate", () => {
   it.each([
-    { state: "open", merged: false },
-    { state: "closed", merged: false },
-    { state: "closed", merged: true },
+    { state: "open", merged: false, closed_at: null },
+    { state: "closed", merged: false, closed_at: "2026-11-05T08:37:27Z" },
+    { state: "closed", merged: true, closed_at: "2026-10-30T11:02:04Z" },
   ] as const)("returns the authoritative PR gate state: $state merged=$merged", async (gate) => {
     setCreds();
     const fetchMock = vi.fn(async (url: string | URL) => {
@@ -189,10 +189,34 @@ describe("githubGetPullRequestGate", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
+    // `closedAt` is surfaced alongside `{ state, merged }` so the closed-unmerged
+    // retirement can tell a durable close from a close/reopen transient (PEN-5662).
+    // Carried through verbatim: this reader does not parse it, and the one consumer
+    // that does treats anything unparseable as "fall back to the shipped rule".
     await expect(githubGetPullRequestGate({
       repoFullName: "Blockcast/paperclip",
       prNumber: 847,
-    })).resolves.toEqual(gate);
+    })).resolves.toEqual({
+      state: gate.state,
+      merged: gate.merged,
+      closedAt: gate.closed_at,
+    });
+  });
+
+  it("normalises a missing closed_at to null rather than undefined", async () => {
+    // GitHub always sends the field, but a proxy or a future payload change could
+    // drop it. `null` keeps the success arm one shape, so a consumer destructuring
+    // it cannot tell "absent" from "present and empty" by accident.
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) =>
+      String(url).includes("/access_tokens")
+        ? jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO })
+        : jsonResponse({ state: "closed", merged: false })));
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+    })).resolves.toEqual({ state: "closed", merged: false, closedAt: null });
   });
 
   it("threads the caller's signal into the installation-token mint, not just the resource fetch (BLO-38257)", async () => {

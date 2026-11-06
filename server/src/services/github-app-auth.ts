@@ -289,90 +289,94 @@ export type ReviewerEvidenceResult =
  * exactly one call site — the one that asked for it — and `reason` still carries
  * `pull_request_http_404` for their logs.
  *
- * ## Why `closed_at` is NOT surfaced here (DECISION, PEN-5265, 2026-11-03)
+ * ## Why `closed_at` IS surfaced here (DECISION REVERSED, PEN-5662, 2026-11-06)
  *
- * Ally and @Cto both proposed hardening the closed-unmerged retirement in
- * `classifyPullRequestGateLookup` by requiring the PR to have been closed for longer
- * than one sweep interval, so a PR closed and reopened inside one tick could not
- * retire a card in the gap. GitHub sends `closed_at` in this payload; adding it is one
- * line here. It is declined anyway. Reason 1 below has EXPIRED since this decision was
- * first written, and is recorded as expired rather than quietly dropped, because what
- * retired it is also the re-open trigger: reasons 2 and 3 carry the decline on their own.
+ * This field was DECLINED on 2026-11-03 under PEN-5265 and that decline is now
+ * OVERTURNED by @Cto, who co-proposed the original guard and signed the original
+ * decline. The history is kept rather than deleted, because the reversal only makes
+ * sense against it, and because a reader who finds the guard should be able to see
+ * what it cost to argue for.
  *
- *   1. ⛔ EXPIRED — was: "nothing would read it". When this was first written the
- *      closed-unmerged retirement lived in an unmerged PR, so the field would have
- *      shipped with no consumer and had its semantics fixed before the code depending
- *      on it existed. PEN-5254 has since landed that retirement on master
- *      (`classifyPullRequestGateLookup`), so a consumer now exists. This reason no
- *      longer supports the decline.
- *   2. It narrows a window; it does not close the hole. A PR closed for longer than one
- *      interval and then reopened still retires its card, and nothing reopens a card
- *      when its PR reopens — `classifyPullRequestGateLookup`'s own docblock says so and
- *      tells the reader to file a new card naming the reopened PR. The guard converts a
- *      certainty into a probability while leaving the failure mode intact, so the
- *      residual stays where it is already handled: in prose, at the point a reader
- *      learns the card retired.
- *   3. Cost lands on a shared reader. SEVEN call sites today — the approvals sweep,
- *      `routes/approvals.ts` (the file-time gate check PEN-5254 added),
- *      `terminal-gate-reconciler.ts`, `issues.ts`, and three in `heartbeat.ts`. Six of
- *      the seven want `{ state, merged }` and nothing more, and every test double of
- *      this reader inherits whatever is added here. (The count was five when this
- *      decision was first written; it has grown once already, which is the argument.)
+ * ### What was declined, and on what three legs
  *
- * Re-open the decision on EVIDENCE, not on a schedule: a card observed retired by a
- * close/reopen race. That was originally the second half of a two-part trigger whose
- * first half was "a closed-unmerged retirement has landed on master"; that half is now
- * satisfied, so the evidence half is the whole trigger.
+ * Ally and @Cto proposed hardening the closed-unmerged retirement in
+ * `classifyPullRequestGateLookup` by requiring the pull request to have been closed
+ * for longer than some threshold, so a PR closed and reopened inside one sweep tick
+ * could not retire a card in the gap. The decline rested on three reasons:
  *
- * ### Evidence log — hazard CONFIRMED, trigger NOT met (PEN-5662, 2026-11-06)
+ *   1. ⛔ EXPIRED 2026-11-05 — was: "nothing would read it". The closed-unmerged
+ *      retirement then lived in an unmerged PR, so the field would have shipped with
+ *      no consumer. PEN-5254 landed that retirement on master, so a consumer exists.
+ *   2. ⛔ EXPIRED 2026-11-06 — was: "it narrows a window, it does not close the hole",
+ *      on the reading that a reopen is arbitrarily timed. Correct against a hand-driven
+ *      reopen. NOT correct against the sweep since measured, which sits ENTIRELY inside
+ *      the window a guard closes: see the evidence log below.
+ *   3. ⚠ STANDS, and was the load-bearing leg at reversal time — cost lands on a shared
+ *      reader with seven call sites, six of which want `{ state, merged }` and nothing
+ *      more. This is ANSWERED rather than overruled, by making the field OPTIONAL:
+ *      `closedAt?: string | null` leaves every existing producer, consumer and test
+ *      double compiling untouched, and the one consumer that reads it treats absence as
+ *      "fall back to the shipped rule". The accretion cost reason 3 named is real; the
+ *      compile-and-maintenance cost it predicted is not incurred in this shape.
  *
- * A close/reopen sweep is now measured, and it is systematic rather than incidental.
+ * ### The evidence (PEN-5662, Security Engineer, verified by @Cto 2026-11-06)
+ *
  * In `Blockcast/penstock-llm-proxy-core`, `allyblockcast[bot]` closed three pull
  * requests UNMERGED and reopened each within seconds on 2026-11-05: #3144 (08:37:27Z →
  * 08:37:33Z, 6s), #3145 (08:38:53Z → 08:38:58Z, 5s), #3147 (08:39:06Z → 08:39:11Z, 5s).
- * Controls #3136 and #3149 carry no such events, so it is a selected set and not a pass
- * over every open pull request. ⚠ Note the REPO. The sweep has NOT been observed in
- * `Blockcast/paperclip`, whose #3144/#3145/#3147 merged on 2026-10-30 and were never
- * reopened — the same numbers with an innocent explanation. Check the right timeline
- * before concluding anything; this misattribution costs a whole read to undo.
+ * Controls #3136 and #3149 carry no such events, so it is a selected set rather than a
+ * pass over every open pull request. All five re-verified open and unmerged 2026-11-06.
+ * ⚠ Note the REPO. The sweep has NOT been observed in `Blockcast/paperclip`, whose
+ * #3144/#3145/#3147 merged on 2026-10-30 and were never reopened — the same numbers
+ * with an innocent explanation. Check the right timeline before concluding anything.
  *
- * The race is REACHABLE, not excluded by construction. The sweep is poll-driven
- * (`startApprovalGateReconciler` → `scheduler.setInterval(runTick, intervalMs)`, plus
- * one immediate pass at start); nothing subscribes to `pull_request.closed`.
- * `classifyPullRequestGateLookup` returns `terminal` on `state === "closed"` with no
- * time component, this reader hands it no `closed_at` to use, and `closeAndAnnounce`
- * guards only on `status IN undecided` — which protects against a concurrent human
- * decision, not against a pull request that has since reopened. At the default
- * 10-minute interval (`approvalGateReconcilerIntervalMinutes.fallback = 10`), a ~6s
- * window is roughly 1% per sweep event on a gated pull request.
+ * The race is REACHABLE. The sweep is poll-driven (`startApprovalGateReconciler` →
+ * `scheduler.setInterval(runTick, intervalMs)`); nothing subscribes to
+ * `pull_request.closed`. At the default 10-minute interval
+ * (`approvalGateReconcilerIntervalMinutes.fallback = 10`), a ~6s window is roughly 1%
+ * per sweep event on a gated pull request. Exposure is concentrated exactly where it
+ * would hurt: 9 of 15 live gated cards name `penstock-llm-proxy-core` pull requests.
  *
- * ⚠ The trigger above is STILL NOT MET, and that is why this decline STANDS. It asks
- * for "a card observed retired by a close/reopen race" — an actual retirement, not a
- * demonstrated hazard. Measured 2026-11-06: the closed-unmerged branch has never fired
- * in production at all. Every `github_pr_merged` card ever retired company-wide went
- * out on `merged = true`; no card has been cancelled for a closed-unmerged pull
- * request. Of 15 live gated cards, 9 name `penstock-llm-proxy-core` pull requests, so
- * exposure IS concentrated in the swept repo — but exactly one of those 9 (#3144) has
- * ever been swept, and its card `b2fb91a9` survived it. One near-miss, zero losses.
+ * ### Why this reversed on a hazard, when the trigger asked for a loss
  *
- * What this evidence DOES change is the weight of reason 2, which reads the reopen as
- * arbitrarily timed. Against an arbitrary reopen reason 2 is correct and the guard only
- * narrows a window. But the sweep actually observed sits ENTIRELY inside the window a
- * guard would close: any threshold above ~6s covers it completely, so against this
- * pattern the guard closes the hole rather than narrowing it. Reason 2 still carries
- * against hand-driven reopens; it no longer carries against the sweep. Reason 3 (the
- * shared reader, seven call sites) is untouched, and is now the load-bearing half.
+ * The trigger read: "re-open the decision on EVIDENCE — a card observed retired by a
+ * close/reopen race." That asks for an actual retirement, and no retirement has
+ * occurred: measured 2026-11-06, the closed-unmerged branch has NEVER fired in
+ * production. Every `github_pr_merged` card ever retired company-wide went out on
+ * `merged = true`. One near-miss (#3144's card `b2fb91a9` survived its sweep), zero
+ * losses. On its literal terms the trigger is NOT met. It is overridden anyway, for
+ * three reasons that are about the trigger rather than about the guard:
  *
- * So if a retirement is ever observed, this entry is the other half of the case, and
- * the guard goes on the `closed-unmerged` branch ONLY — `merged` is monotonic and its
- * fail-closed posture must not be touched.
+ *   - THE TRIGGER IS MISCALIBRATED FOR A SILENT FAILURE. "Wait for an observed loss" is
+ *     a sound rule when the loss announces itself. This one does not: a wrongly-retired
+ *     card presents, much later, as "the board never answered my card" — indistinguishable
+ *     from an ordinary slow queue. Nothing alerts on it; establishing even the NEGATIVE
+ *     took a deliberate audit of every cancelled card company-wide. A trigger that waits
+ *     for an observation nobody is positioned to make is a trigger that can accumulate
+ *     losses while reading as unfired.
+ *   - "NEVER FIRED" CUTS TOWARD THE GUARD, NOT AWAY FROM IT. The legitimate
+ *     closed-unmerged retirement rate is measurably zero over the feature's whole life.
+ *     A branch whose only demonstrated trigger in production is a 6-second transient is
+ *     a branch whose first firing is likelier to be spurious than genuine. The guard's
+ *     false-positive-prevention value is therefore high relative to the only cost it
+ *     imposes on the legitimate path: one extra sweep tick of delay.
+ *   - THE DECLINE HAD LOST TWO OF ITS THREE LEGS. A decision standing on one cost
+ *     argument is not the decision that was made, and re-examining it on its merits is
+ *     what the evidence clause existed to invite.
  *
- * (A fourth consideration, noted and NOT relied on: the guard compares GitHub's clock
- * against the server's. At the 10-minute sweep interval, ordinary NTP skew is far
- * inside the margin, so this is a design note rather than an objection.)
+ * The guard is on the `closed-unmerged` branch ONLY. `merged` is monotonic and its
+ * fail-closed posture is untouched — see `classifyPullRequestGateLookup`.
+ *
+ * ### Clock skew, considered and accepted
+ *
+ * The guard compares GitHub's `closed_at` against the server's clock. The dangerous
+ * direction is a server clock running AHEAD, which makes a close look older than it is
+ * and retires early; a server clock behind merely defers to the next tick. Ordinary NTP
+ * skew is seconds against a threshold two orders of magnitude larger, so this is
+ * recorded as a design note rather than an objection.
  */
 export type PullRequestGateResult =
-  | { state: "open" | "closed"; merged: boolean }
+  | { state: "open" | "closed"; merged: boolean; closedAt?: string | null }
   | { error: string; notFound?: true };
 
 export type GitHubCommitEvidenceResult =
@@ -465,11 +469,19 @@ export async function githubGetPullRequestGate(input: {
   const body = (await res.json().catch(() => null)) as {
     state?: string;
     merged?: boolean;
+    closed_at?: string | null;
   } | null;
   if (body?.state !== "open" && body?.state !== "closed") {
     return { error: "pull_request_state_missing" };
   }
-  return { state: body.state, merged: body.merged === true };
+  // `closed_at` is surfaced ONLY so the closed-unmerged retirement can tell a durable
+  // close from a close/reopen transient (PEN-5662). It is optional on the type for the
+  // reason in the docblock above: every other caller ignores it and no test double has
+  // to grow a field to keep compiling. Pass it through verbatim rather than parsing —
+  // the one consumer parses it, and a value this reader cannot parse is not this
+  // reader's to discard.
+  const closedAt = typeof body.closed_at === "string" ? body.closed_at : null;
+  return { state: body.state, merged: body.merged === true, closedAt };
 }
 
 export type OpenPullRequestOnBase = {

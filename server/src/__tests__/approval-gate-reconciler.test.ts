@@ -783,6 +783,58 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     );
   });
 
+  // PEN-5662 — the sweep race, end to end.
+  //
+  // `allyblockcast[bot]` closes pull requests UNMERGED and reopens them 5-6 seconds
+  // later (measured on Blockcast/penstock-llm-proxy-core #3144/#3145/#3147 on
+  // 2026-11-05, controls #3136/#3149 clean). Before the settle guard, a tick landing
+  // inside that window cancelled a card whose pull request was about to reopen and
+  // still needed merging — the exact inversion of the standing-forever failure the
+  // closed-unmerged rule exists to prevent, and silent: the requesting agent goes on
+  // waiting on a card that no longer exists.
+  it("survives a sweep tick that lands inside a close/reopen window, and retires once the close proves durable", async () => {
+    const { companyId, agentId } = await createCompany("AGRP");
+    const issueId = await insertIssue(companyId, "AGRP-9");
+    const approvalId = await insertApproval({
+      companyId,
+      agentId,
+      gate: prGateFor(3144),
+      issueId,
+      title: "Merge the swept PR",
+    });
+
+    const closedAt = "2026-11-05T08:37:27.000Z";
+
+    // Tick 1 lands 6s into the close — the window the bot reopens in.
+    const duringWindow = await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => ({ state: "closed", merged: false, closedAt }),
+      now: () => new Date("2026-11-05T08:37:33.000Z"),
+      logger: silentLogger,
+    });
+    expect(duringWindow).toMatchObject({ examined: 1, closed: 0, announced: 0, deferred: 1 });
+    expect((await approvalRow(approvalId))?.status).toBe("pending");
+
+    // The pull request reopens, as it actually did. The card is still there to be
+    // satisfied, which is the whole point.
+    const afterReopen = await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => ({ state: "open", merged: false, closedAt: null }),
+      now: () => new Date("2026-11-05T08:47:00.000Z"),
+      logger: silentLogger,
+    });
+    expect(afterReopen).toMatchObject({ examined: 1, closed: 0, live: 1 });
+    expect((await approvalRow(approvalId))?.status).toBe("pending");
+
+    // And the guard does not strand a card against a pull request that stays closed:
+    // one tick later the close has outlived the settle window and retires normally.
+    const durable = await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => ({ state: "closed", merged: false, closedAt }),
+      now: () => new Date("2026-11-05T08:57:00.000Z"),
+      logger: silentLogger,
+    });
+    expect(durable).toMatchObject({ examined: 1, closed: 1, announced: 1 });
+    expect((await approvalRow(approvalId))?.status).toBe("cancelled");
+  });
+
   // ⭐ PEN-5254 "Done when" #2, asserted rather than inferred from source reading.
   //
   // `githubGetPullRequestGate` maps every non-ok response to `{ error }`, so no read
@@ -1223,6 +1275,71 @@ describe("classifyPullRequestGateLookup", () => {
     expect(classifyPullRequestGateLookup({ state: "closed", merged: false })).toMatchObject({
       kind: "terminal",
       satisfied: false,
+    });
+  });
+
+  // PEN-5662 — the settle guard. A measured bot sweep closes a pull request unmerged
+  // and reopens it 5-6s later; a tick landing in that window used to retire a card
+  // whose pull request was about to come back and still needed merging.
+  describe("closed-unmerged settle window", () => {
+    const now = new Date("2026-11-05T08:40:00.000Z");
+    const ago = (ms: number) => new Date(now.getTime() - ms).toISOString();
+
+    it("defers a pull request closed inside the settle window instead of retiring its card", () => {
+      // The exact shape measured on penstock-llm-proxy-core#3144: closed 6s ago,
+      // reopened moments later.
+      expect(
+        classifyPullRequestGateLookup(
+          { state: "closed", merged: false, closedAt: ago(6_000) },
+          { now },
+        ),
+      ).toMatchObject({ kind: "deferred", reason: "pull_request_closed_recently" });
+    });
+
+    it("retires the card once the close has outlived the settle window", () => {
+      // The legitimate PEN-2043 supersession shape still retires — one tick later at
+      // worst, which is the entire cost of this guard on the honest path.
+      expect(
+        classifyPullRequestGateLookup(
+          { state: "closed", merged: false, closedAt: ago(10 * 60_000) },
+          { now },
+        ),
+      ).toMatchObject({ kind: "terminal", satisfied: false });
+    });
+
+    it("does NOT age-gate a merge, however recent", () => {
+      // Load-bearing. `merged` is monotonic, so a merge is terminal the instant it is
+      // seen; age-gating it would delay the satisfying branch and weaken a fail-closed
+      // posture the guard is explicitly not allowed to touch.
+      expect(
+        classifyPullRequestGateLookup(
+          { state: "closed", merged: true, closedAt: ago(1_000) },
+          { now },
+        ),
+      ).toMatchObject({ kind: "terminal", satisfied: true });
+    });
+
+    it("falls back to the shipped rule when closed_at is absent or unparseable", () => {
+      // Back-compat with every existing caller and test double, and a deliberate
+      // choice of direction: if the field ever stopped arriving, deferring would
+      // silently switch the whole closed-unmerged branch off and strand cards against
+      // dead pull requests for ever.
+      for (const closedAt of [undefined, null, "not-a-date"]) {
+        expect(
+          classifyPullRequestGateLookup({ state: "closed", merged: false, closedAt }, { now }),
+        ).toMatchObject({ kind: "terminal", satisfied: false });
+      }
+    });
+
+    it("treats a close timestamped in the future as not yet settled", () => {
+      // GitHub's clock ahead of ours. Negative age must read as "too recent", never
+      // wrap around into "old enough to retire".
+      expect(
+        classifyPullRequestGateLookup(
+          { state: "closed", merged: false, closedAt: ago(-30_000) },
+          { now },
+        ),
+      ).toMatchObject({ kind: "deferred", reason: "pull_request_closed_recently" });
     });
   });
 

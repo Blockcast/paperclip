@@ -346,6 +346,66 @@ describe("a card may not be filed against an already-finished gate (PEN-5103)", 
     expect(mockGetWorkflowRun).not.toHaveBeenCalled();
   });
 
+  it("files a card whose pull request closed moments ago, because the close may not be durable", async () => {
+    // PEN-5662. The reader now carries `closedAt`, and the settle guard reads a close
+    // younger than CLOSED_UNMERGED_SETTLE_MS as `deferred` rather than `terminal`.
+    // That reaches this door too, and the direction is deliberate: a measured bot
+    // sweep closes pull requests unmerged and reopens them 5-6s later, so refusing
+    // here would reject a card for a pull request that is about to be live again and
+    // still needs merging. If the close turns out to be durable the card is filed and
+    // then retired by the next sweep, which is the strictly recoverable direction.
+    mockGetPullRequestGate.mockResolvedValue({
+      state: "closed",
+      merged: false,
+      closedAt: new Date(Date.now() - 6_000).toISOString(),
+    });
+
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: PR_ASK_PAYLOAD,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockApprovalService.create).toHaveBeenCalledOnce();
+  });
+
+  it("still refuses a pull request whose close has outlived the settle window", async () => {
+    // The guard delays the refusal; it must not remove it. A durable close is still
+    // a dead-on-arrival card (PEN-5103).
+    mockGetPullRequestGate.mockResolvedValue({
+      state: "closed",
+      merged: false,
+      closedAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    });
+
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: PR_ASK_PAYLOAD,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details.code).toBe("approval_gate_already_terminal");
+    expect(mockApprovalService.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses a merge the instant it is observed, however recent", async () => {
+    // `merged` is monotonic and is NOT age-gated: a card asking for a merge that has
+    // already happened is dead on arrival no matter how fresh the merge is.
+    mockGetPullRequestGate.mockResolvedValue({
+      state: "closed",
+      merged: true,
+      closedAt: new Date(Date.now() - 1_000).toISOString(),
+    });
+
+    const res = await postApproval(await createAgentApp(), {
+      type: "request_board_approval",
+      payload: PR_ASK_PAYLOAD,
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(res.body.details.code).toBe("approval_gate_already_terminal");
+  });
+
   it("files a card whose gated pull request is still open", async () => {
     // The legitimate case the kind exists for: an open PR a human must merge.
     mockGetPullRequestGate.mockResolvedValue({ state: "open", merged: false });
