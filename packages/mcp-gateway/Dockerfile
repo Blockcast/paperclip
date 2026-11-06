@@ -17,15 +17,17 @@ RUN cd packages/mcp-gateway && pnpm build
 FROM node:22-alpine
 # The runtime only runs `node dist/server.js`; the base image's bundled
 # npm/corepack/yarn are dead weight that carry their own CVEs (BLO-51891:
-# npm <= 10.9.8 bundles tar 7.5.11, which CVE-2026-59873 hits). Drop them.
+# npm <= 10.9.8 bundles a tar that CVE-2026-59873 hits). Drop them.
 #
 # Do NOT reuse "npm 10.9.x ⇒ CVE-2026-59873" as a triage rule — it false-
-# positives on 10.9.9+ (PEN-5690). The advisory range is tar <= 7.5.18, first
-# patched 7.5.19 (GHSA-23hp-3jrh-7fpw); npm 10.9.9 — first shipped in Node
-# v22.23.3, 2026-09-23 — bundles tar 7.5.22 and is unaffected. `node:22-alpine`
-# is a floating tag, so which npm lands here is decided by build date, not by
-# this repo. That is why the removal below is unconditional rather than a
-# version check: it is correct whichever npm the base image happens to carry.
+# positives on 10.9.9+ (PEN-5690), and the bundled tar is not even constant
+# within 10.9.x (10.9.5 → 6.2.1, 10.9.8 → 7.5.11; both inside the range).
+# The advisory is tar <= 7.5.18, first patched 7.5.19 (GHSA-23hp-3jrh-7fpw);
+# npm 10.9.9 — first shipped in Node v22.23.3, 2026-09-23 — bundles 7.5.22
+# and is unaffected. `node:22-alpine` is a floating tag, so which npm lands
+# here is decided by build date, not by this repo. That is why the removal
+# below is unconditional rather than a version check: it is correct whichever
+# npm the base image happens to carry.
 RUN rm -rf /usr/local/lib/node_modules /usr/local/bin/npm /usr/local/bin/npx \
       /usr/local/bin/corepack /usr/local/bin/yarn /usr/local/bin/yarnpkg /opt/yarn-*
 WORKDIR /app
