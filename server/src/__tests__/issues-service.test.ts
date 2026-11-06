@@ -3703,6 +3703,76 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
     expect(ids(listById.get(doubleBlockedId)?.blockedBy)).toEqual([doubleBlockerAId, doubleBlockerBId].sort());
   });
 
+  it("reports parkedUntil on blocker summaries so a parked blocker is not read as actionable", async () => {
+    // PEN-5782. A deliberate park does not change `status` — a parked row keeps the
+    // `todo` it had — so a consumer that follows a dependency edge and reads only
+    // `status` scores a blocker that cannot move for days as pickable right now.
+    // Before this field existed the key was ABSENT on every entry, parked or not, so
+    // even the usual `has(key)` guard could not tell the two apart: there was no read
+    // of this surface that answered the question.
+    const companyId = randomUUID();
+    const parkedBlockerId = randomUUID();
+    const liveBlockerId = randomUUID();
+    const blockedId = randomUUID();
+    const parkedUntil = new Date("2099-01-01T09:00:00.000Z");
+
+    await db.insert(companies).values({
+      id: companyId,
+      defaultResponsibleUserId: "responsible-user",
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(issues).values([
+      // The shape the defect made invisible: parked, but still `todo`.
+      {
+        id: parkedBlockerId,
+        companyId,
+        title: "Parked blocker",
+        status: "todo",
+        priority: "high",
+        parkedUntil,
+        parkedReason: "human gate",
+      },
+      { id: liveBlockerId, companyId, title: "Live blocker", status: "todo", priority: "high" },
+      { id: blockedId, companyId, title: "Blocked issue", status: "blocked", priority: "high" },
+    ]);
+
+    await db.insert(issueRelations).values([
+      { companyId, issueId: parkedBlockerId, relatedIssueId: blockedId, type: "blocks" },
+      { companyId, issueId: liveBlockerId, relatedIssueId: blockedId, type: "blocks" },
+    ]);
+
+    const single = await svc.getRelationSummaries(blockedId);
+    const singleById = new Map(single.blockedBy.map((row) => [row.id, row]));
+
+    // Both blockers read `todo`; only `parkedUntil` separates them.
+    expect(singleById.get(parkedBlockerId)?.status).toBe("todo");
+    expect(singleById.get(liveBlockerId)?.status).toBe("todo");
+    expect(singleById.get(parkedBlockerId)?.parkedUntil).toEqual(parkedUntil);
+
+    // The unparked blocker must carry the key with an explicit `null`, not omit it —
+    // an absent key is how the original defect presented, and a consumer cannot tell
+    // an omission from a negative answer.
+    expect(singleById.get(liveBlockerId)).toHaveProperty("parkedUntil", null);
+
+    // And the reverse edge, which answers "who is waiting on me".
+    const fromBlocker = await svc.getRelationSummaries(parkedBlockerId);
+    expect(fromBlocker.blocks.map((row) => row.id)).toEqual([blockedId]);
+    expect(fromBlocker.blocks[0]).toHaveProperty("parkedUntil", null);
+
+    // The list route is the surface sweeps read; it must agree with the single read
+    // rather than quietly dropping the field.
+    type WithBlockedBy = { id: string; blockedBy?: Array<{ id: string; parkedUntil?: unknown }> };
+    const hydrated = (await svc.list(companyId, { includeBlockedBy: true })) as WithBlockedBy[];
+    const listRow = hydrated.find((row) => row.id === blockedId);
+    const listById = new Map((listRow?.blockedBy ?? []).map((row) => [row.id, row]));
+
+    expect(listById.get(parkedBlockerId)?.parkedUntil).toEqual(parkedUntil);
+    expect(listById.get(liveBlockerId)).toHaveProperty("parkedUntil", null);
+  });
+
   it("computes blockerAttention on non-terminal rows with explicit blockers", async () => {
     // BLO-19046/BLO-19261: `blockedBy` remains the source of truth for the
     // blocker set, and blockerAttention is now computed for non-terminal rows

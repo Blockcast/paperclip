@@ -3355,6 +3355,7 @@ type IssueRelationSummaryRow = {
   priority: string;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  parkedUntil: Date | null;
 };
 
 function summarizeIssueRelationRow(row: IssueRelationSummaryRow): IssueRelationIssueSummary {
@@ -3366,6 +3367,10 @@ function summarizeIssueRelationRow(row: IssueRelationSummaryRow): IssueRelationI
     priority: row.priority as IssueRelationIssueSummary["priority"],
     assigneeAgentId: row.assigneeAgentId,
     assigneeUserId: row.assigneeUserId,
+    // PEN-5782: always emitted by this summarizer, `null` when unparked. Every query
+    // feeding it selects the column, so the key is never absent here — which is what
+    // lets a caller treat absence as "this surface did not ask" rather than "not parked".
+    parkedUntil: row.parkedUntil ?? null,
   };
 }
 
@@ -3396,6 +3401,7 @@ async function terminalExplicitBlockersByRoot(
           priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          parkedUntil: issues.parkedUntil,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -4681,6 +4687,7 @@ async function blockedByMapForIssues(
         priority: issues.priority,
         assigneeAgentId: issues.assigneeAgentId,
         assigneeUserId: issues.assigneeUserId,
+        parkedUntil: issues.parkedUntil,
       })
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -4703,6 +4710,10 @@ async function blockedByMapForIssues(
         priority: row.priority as IssueRelationIssueSummary["priority"],
         assigneeAgentId: row.assigneeAgentId,
         assigneeUserId: row.assigneeUserId,
+        // PEN-5782: keep this literal in step with `summarizeIssueRelationRow`. The list
+        // route is the surface sweeps read, so a blocker that is parked has to say so
+        // here too, or the two surfaces disagree about the same edge.
+        parkedUntil: row.parkedUntil ?? null,
       });
     }
   }
@@ -7377,6 +7388,7 @@ export function issueService(db: Db) {
           priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          parkedUntil: issues.parkedUntil,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -7397,6 +7409,7 @@ export function issueService(db: Db) {
           priority: issues.priority,
           assigneeAgentId: issues.assigneeAgentId,
           assigneeUserId: issues.assigneeUserId,
+          parkedUntil: issues.parkedUntil,
         })
         .from(issueRelations)
         .innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id))
