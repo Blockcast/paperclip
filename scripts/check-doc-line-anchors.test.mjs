@@ -5,6 +5,7 @@ import {
   applyFixes,
   applyUnverified,
   attributeInherited,
+  changedSince,
   checkDocument,
   locateConstruct,
   parseAnchorSpan,
@@ -361,6 +362,40 @@ test("an anchor that held against the base is inherited even when this PR edits 
   const base = [{ docPath: "d.md", start: 10, status: "ok", file: "src/a.ts" }];
   const [out] = attributeInherited(head, base, new Set(["d.md"]));
   assert.equal(out.inherited, true);
+});
+
+test("renaming a cited file owns the citation: the old path counts as changed", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const root = mkdtempSync(join(tmpdir(), "anchor-rename-"));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  try {
+    git("init", "-q");
+    git("config", "user.email", "t@t");
+    git("config", "user.name", "t");
+    mkdirSync(join(root, "src"));
+    writeFileSync(join(root, "src/a.ts"), SOURCE);
+    git("add", "-A");
+    git("commit", "-qm", "base");
+    const base = git("rev-parse", "HEAD");
+    git("mv", "src/a.ts", "src/b.ts");
+    git("commit", "-qm", "rename");
+
+    const changed = changedSince(base, root);
+    assert.ok(changed.has("src/a.ts"), "a rename must report the path it removed");
+
+    // End to end: the document is untouched, the cited file moved. Fatal, not inherited.
+    const doc = "`parseThing` (`src/a.ts:2`)";
+    const head = checkDocument({ docPath: "d.md", docText: doc, readSource: () => null });
+    const atBase = checkDocument({ docPath: "d.md", docText: doc, readSource: () => SOURCE });
+    const [f] = attributeInherited(head, atBase, changed);
+    assert.equal(f.status, "missing-file");
+    assert.ok(!f.inherited, "a file this PR moved away cannot be inherited drift");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("attribution leaves passing anchors alone", () => {

@@ -476,8 +476,13 @@ function collectAgainstBaseSource(ref, docs, root) {
 
 // The paths this PR changes, as `base...HEAD` -- three-dot, so a `merge_group` head
 // carrying master's own commits still reports only the PR's own files.
-function changedSince(ref, root) {
-  const r = spawnSync("git", ["diff", "--name-only", `${ref}...HEAD`], {
+//
+// --no-renames is load-bearing. With rename detection on, `git mv a.ts b.ts` lists only
+// `b.ts`, so an anchor still citing `a.ts` matches neither attribution arm and falls
+// through to INHERITED -- a PR that moves a cited file without opening the document,
+// which is the exact case this check exists for, passes with a MISSING FILE it caused.
+export function changedSince(ref, root) {
+  const r = spawnSync("git", ["diff", "--no-renames", "--name-only", `${ref}...HEAD`], {
     cwd: root,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
