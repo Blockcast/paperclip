@@ -354,6 +354,11 @@ describe("paperclip MCP tools", () => {
     expect(description).toContain("THE ATTENDANCE TRIPLE SPLITS");
     expect(description).toContain("fails OPEN");
     expect(description).toContain("BLO-34421");
+    // The survivor is the trap, not the absences: `executionState` comes back
+    // FULLY POPULATED in the same payload its two neighbours vanish from, and a
+    // detailed nested object reads as a complete response (CTO, run `fef2198c`).
+    expect(description).toContain("the split is three-way");
+    expect(description).toContain("Detail is read as completeness");
 
     // POST hydrates the relation pair, PATCH does not — which is what trains
     // the habit on create and breaks it on update.
