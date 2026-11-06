@@ -10971,10 +10971,6 @@ export function recoveryService(
             result.skipped += 1;
             return;
           }
-          if (await successfulRunHandoffResolvedSince(issue.companyId, issue.id, latestRun)) {
-            result.skipped += 1;
-            return;
-          }
 
           if (await latestRunPredatesLatestUnblock(issue.companyId, issue.id, latestRun)) {
             // BLO-8050: operator just unblocked; skip re-escalation on stale evidence.
@@ -10983,6 +10979,14 @@ export function recoveryService(
             // never expires, so without this an operator moving the row back to `todo`
             // is met with an immediate re-flip to `blocked` on the same pre-unblock run.
             await requeueAfterStaleUnblock(latestRun);
+            return;
+          }
+          // BLO-53712: after the unblock gate, not before. An operator's
+          // `blocked -> todo` also writes `successful_run_handoff_resolved`, so
+          // checking this first would bare-skip the requeue that gate owes the
+          // row (BLO-48133) and leave it `todo` with no wake path.
+          if (await successfulRunHandoffResolvedSince(issue.companyId, issue.id, latestRun)) {
+            result.skipped += 1;
             return;
           }
 
