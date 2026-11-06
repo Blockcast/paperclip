@@ -98,8 +98,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           UNREPORTED_JOB_REPO: ${{ github.repository }}
+          # Dispatch inputs reach the script through the environment, never
+          # through `${{ }}` interpolation into the shell body. Only a
+          # dispatcher with write access can set them, so this is defence in
+          # depth rather than a live hole — but interpolating an input into a
+          # `run:` block is a shell-injection SHAPE, and the cost of not having
+          # it is one line. (Ally review, PEN-5738.)
+          REPO: ${{ github.repository }}
+          LOOKBACK_MINUTES: ${{ inputs.lookback_minutes || '60' }}
+          POST_COMMENT: ${{ inputs.comment || 'true' }}
         run: |
           node scripts/unreported-job-failure-detector.mjs \
-            --repo "${{ github.repository }}" \
-            --lookback-minutes "${{ inputs.lookback_minutes || '60' }}" \
-            --comment "${{ inputs.comment || 'true' }}"
+            --repo "$REPO" \
+            --lookback-minutes "$LOOKBACK_MINUTES" \
+            --comment "$POST_COMMENT"

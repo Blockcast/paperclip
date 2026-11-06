@@ -59,6 +59,40 @@ const GENUINE_FAILURE = {
   ],
 };
 
+// Ally review, PEN-5738: a runner killed MID-TEST produces the SAME API shape
+// as the DNS victim — `failure` plus an `in_progress`/`null` test step — and
+// the cause there can be the suite itself (an OOM blow-up in a shard, a test
+// that wedges the runner). The detector must not tell that author their tests
+// were fine. This fixture exists to hold the weaker wording honest.
+const KILLED_MID_TEST = {
+  id: 2,
+  name: "General tests (server 4/6)",
+  conclusion: "failure",
+  completed_at: "2026-11-06T06:21:00Z",
+  steps: [
+    { name: "Set up job", status: "completed", conclusion: "success" },
+    { name: "Build workspace", status: "completed", conclusion: "success" },
+    { name: "Run grouped general test suites", status: "in_progress", conclusion: null },
+    { name: "Post Checkout repository", status: "pending", conclusion: null },
+  ],
+};
+
+// The runner went silent BETWEEN steps: everything that started also closed,
+// and nothing closed `failure`. Weaker claim available here, but still not
+// "the job would have passed".
+const SILENT_BETWEEN_STEPS = {
+  id: 3,
+  name: "General tests (server 5/6)",
+  conclusion: "failure",
+  completed_at: "2026-11-06T06:21:10Z",
+  steps: [
+    { name: "Set up job", status: "completed", conclusion: "success" },
+    { name: "Run grouped general test suites", status: "completed", conclusion: "success" },
+    { name: "Upload vitest JSON reports (flake ledger)", status: "pending", conclusion: null },
+    { name: "Post Checkout repository", status: "pending", conclusion: null },
+  ],
+};
+
 const RUN_3444 = {
   id: 42147146391,
   name: "PR",
@@ -191,4 +225,87 @@ test("parseArgs defaults pad the fetch far enough to reach a long-queued run", (
   assert.ok(a.fetchPadMinutes > 3 * 60 + 38);
   assert.equal(parseArgs(["--comment", "true"]).comment, true);
   assert.equal(parseArgs(["--comment", "false"]).comment, false);
+});
+
+// --- Ally review findings, PEN-5738 ---------------------------------------
+
+test("a runner killed mid-test is distinguished from one silent between steps", () => {
+  assert.equal(classifyJob(KILLED_MID_TEST).shape, "mid_step");
+  assert.equal(classifyJob(SILENT_BETWEEN_STEPS).shape, "between_steps");
+  // The real victim is mid_step — which is the point. Its tests were known to
+  // have passed from the RUNNER LOG, which this detector never reads, so the
+  // API data alone cannot earn the stronger claim even on the motivating case.
+  assert.equal(classifyJob(VICTIM_3_6).shape, "mid_step");
+});
+
+test("the comment never claims the tests passed, on either shape", () => {
+  for (const job of [KILLED_MID_TEST, SILENT_BETWEEN_STEPS, VICTIM_3_6]) {
+    const c = classifyJob(job);
+    const body = renderComment({
+      headSha: RUN_3444.head_sha,
+      findings: [{ ...c, jobName: job.name, completedAt: job.completed_at, runId: 1 }],
+    });
+    // The exact phrases Ally flagged must be gone, in both branches.
+    assert.doesNotMatch(body, /No test failed/i, `${job.name}: must not claim no test failed`);
+    assert.doesNotMatch(body, /do not debug these tests/i, `${job.name}: must not tell the author to ignore it`);
+    assert.doesNotMatch(body, /after the work finished/i, `${job.name}: must not assert the work finished`);
+    assert.match(body, /UNKNOWN/, `${job.name}: must say the result is unknown`);
+    assert.match(body, /[Rr]erun/, `${job.name}: must name the remedy`);
+  }
+});
+
+test("a mid-test kill is called out as possibly caused by the tests themselves", () => {
+  const mid = renderComment({
+    headSha: RUN_3444.head_sha,
+    findings: [{ ...classifyJob(KILLED_MID_TEST), jobName: "x", completedAt: "t", runId: 1 }],
+  });
+  assert.match(mid, /mid-test/i);
+  assert.match(mid, /OOM|eviction/i);
+
+  const between = renderComment({
+    headSha: RUN_3444.head_sha,
+    findings: [{ ...classifyJob(SILENT_BETWEEN_STEPS), jobName: "x", completedAt: "t", runId: 1 }],
+  });
+  assert.match(between, /between\*{0,2} steps/i);
+  assert.doesNotMatch(between, /mid-test/i);
+});
+
+test("one rerun line per distinct run, not just the first", () => {
+  const body = renderComment({
+    headSha: RUN_3444.head_sha,
+    findings: [
+      { ...classifyJob(VICTIM_3_6), jobName: "a", completedAt: "t", runId: 111 },
+      { ...classifyJob(KILLED_MID_TEST), jobName: "b", completedAt: "t", runId: 222 },
+      { ...classifyJob(SILENT_BETWEEN_STEPS), jobName: "c", completedAt: "t", runId: 222 },
+    ],
+  });
+  // Findings group by head SHA, so one SHA can span several workflow runs. A
+  // single rerun line would leave the other run red forever.
+  assert.match(body, /gh run rerun 111 --failed/);
+  assert.match(body, /gh run rerun 222 --failed/);
+  assert.equal((body.match(/gh run rerun /g) ?? []).length, 2, "deduplicated per runId");
+});
+
+test("parseArgs exposes the page cap and a candidate cap big enough for this repo", () => {
+  const a = parseArgs([]);
+  // Hitting the candidate cap means exit 2 and a red scheduled run, so the cap
+  // must sit clear of the real candidate set. Measured on this repo
+  // 2026-11-06: 19 live runs + 55 `conclusion: failure` in 13h = ~74 before the
+  // in-window filter trims further. A live dry-run at maxRuns 200 over the
+  // UNFILTERED listing still truncated, which is what forced the server-side
+  // arms; with those arms ~120 is headroom rather than a bound that bites.
+  assert.ok(a.maxRuns >= 100, "candidate cap must clear this repo's measured candidate set");
+  assert.ok(a.maxPages >= 20, "listing must be able to walk past one page");
+  assert.equal(parseArgs(["--max-pages", "3"]).maxPages, 3);
+  assert.equal(parseArgs(["--max-runs", "7"]).maxRuns, 7);
+});
+
+test("a truncated fetch is reported, so a clean verdict cannot read as a census", () => {
+  // The defect Ally found: one page of 100 covers ~1h on this repo, so the 12h
+  // pad was inert and the 3h38m motivating case was dropped with
+  // fetchTruncated still false — a clean census over a window never looked at.
+  const v = detect({ runs: [], ...WINDOW, fetchTruncated: true });
+  assert.equal(v.firing, false);
+  assert.equal(v.fetchTruncated, true, "truncation must survive into the verdict");
+  assert.equal(v.failedJobsScanned, 0);
 });

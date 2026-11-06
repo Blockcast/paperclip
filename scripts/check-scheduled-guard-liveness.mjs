@@ -487,6 +487,22 @@ export const EXEMPT_SCHEDULED_WORKFLOWS = [
       "that no sound bar exists for a once-daily guard. Owned by PEN-5304.",
   },
   {
+    workflow: "unreported-job-failure-detector.yml",
+    reason:
+      "A REAL COVERAGE GAP, not a category exclusion -- the same shape as dependency-audit.yml " +
+      "above. PEN-5738 added it as a 15-minute detector for check runs GitHub concluded `failure` " +
+      "whose runner never reported, so it IS a guard and its silent stop genuinely goes " +
+      "unreported. It is exempt only because WATCHED_GUARDS requires a threshold derived from the " +
+      "guard's OWN measured completion-gap distribution, and a workflow added today has no legs to " +
+      "measure. Inventing one is exactly the PEN-3379 defect this file is built around, and " +
+      "watching it from merge -- when a schedule has fired zero times, because schedules only run " +
+      "from the default branch -- is the born-red defect argued against everywhere else here. " +
+      "Promote it once ~3-4 weeks of completions exist. Its 15-MINUTE cadence should make that " +
+      "easier than for the daily guards, not harder: ~2700 legs in 4 weeks, and the G-B > 60 " +
+      "sampling arithmetic is comfortable when the subject fires 4x per hour against an hourly " +
+      "detector. Owned by PEN-5738.",
+  },
+  {
     workflow: "scheduled-guard-liveness.yml",
     reason:
       "This job itself. Surfaced by the BLO-42887 widening of the coverage invariant beyond the " +
