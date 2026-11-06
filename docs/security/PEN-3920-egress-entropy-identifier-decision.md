@@ -977,8 +977,9 @@ Measured on the shipped scrubber: a lease naming a 32-character base64url token 
 expectation published that token **byte-exact**, while redacting the harmless public branch
 name beside it. This binding scrubbed the public half and passed the opaque one.
 
-D10 closes that. Across the residual harness's families the change **newly refuses** several
-hundred thousand values in the expectation slot and newly admits none there.
+D10 closes that. Across the residual harness's 164 families at 200,000 trials each the change
+**newly refuses** 7,073,445 values — essentially all of them in the expectation slot — and
+newly admits **none** there: every expectation-slot family measures 0 newly admitted.
 
 ### 12.3 Residual, measured
 
@@ -1005,17 +1006,25 @@ each measured bare and under a branch-like `release/` prefix, with one exception
 The families that are not zero are the only construction that can reach a word-only rule — a
 random token chopped into short runs:
 
+The knee analysis below was taken at 20,000 trials per family (enough to rank the
+configurations); the shipped row was then re-measured at the full 200,000.
+
 | conjunct state | worst newly-admitted family | rate | real branches published |
 |---|---|---|---|
 | no word-mass floor, 6 components | `lower-alnum` chopped by `/` into ~4-char runs | 8.50e-3 | 518 of 847 |
 | floor 10, 4 components | `base36` chopped by `-` into ~6-char runs | 7.25e-3 | 518 of 847 |
-| **floor 14, 4 components (shipped)** | k8s bootstrap token under a `release/` prefix | **2.30e-3** | **511 of 847** |
+| **floor 14, 4 components (shipped)** | `letters-mixed` chopped by `/` into ~6-char runs | **2.33e-3** | **511 of 847** |
 | floor 16, 4 components | `letters-mixed` chopped by `/` into ~6-char runs | 2.30e-3 | 502 of 847 |
 
 The knee is at 14: a 3x reduction for seven real branches out of 518, and 16 buys nothing
-further on residual while costing nine more. For scale, `isLexicalIdentifier` carries 2.96e-3
+further on residual while costing nine more.
+
+At the full 200,000 trials the shipped configuration measures **2.33e-3** worst, over 164
+families. The chopped-token families span 7.5e-5 to 2.33e-3; a `release/`-prefixed Kubernetes
+bootstrap token sits at 1.80e-3; every flat token family, every other real credential format,
+and every expectation-slot family measure 0. For scale, `isLexicalIdentifier` carries 2.96e-3
 to 3.57e-3 **name-free** today and §9's Kubernetes rule up to 9.85e-3 under an anchor of eight
-common label names; D10's 2.30e-3 sits below both, under an anchor of one literal flag.
+common label names; D10's 2.33e-3 sits below both, under an anchor of one literal flag.
 
 **The corpus.** 1192 distinct branch names from `Blockcast/paperclip`'s history. **847 of them
 are refused inside a lease by the shipped detector** — 71% — which is the scale of the false
@@ -1028,7 +1037,7 @@ is what takes `lower-alnum chopped by '/'` out of the top of the table.
 `K8S_NAME_MIN_WORD_MASS` holds §9's. It is also the only conjunct here that keeps real
 credential **formats** out, because none musters fourteen characters of letter runs:
 `sk-ant-api03-…` has 5, `xoxb-…` 4, `sk_live_…` 6, and a Kubernetes bootstrap token's
-`<6>.<16>` has none unless both halves happen to draw no digit — which is exactly the 2.30e-3
+`<6>.<16>` has none unless both halves happen to draw no digit — which is exactly the 1.80e-3
 row above, and the honest reading of it is that a bootstrap token whose two halves are
 *all letters*, written with a branch-like prefix, is admitted at that rate.
 
