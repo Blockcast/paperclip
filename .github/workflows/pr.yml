@@ -191,8 +191,25 @@ jobs:
           # do not masquerade as changes made by the PR itself.
           changed="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"
           if printf '%s\n' "$changed" | grep -qx 'pnpm-lock.yaml'; then
-            echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
-            exit 1
+            # A patch-file edit must change the lockfile's patch hashes, and
+            # regen_lockfile only fires on manifest changes, so such a PR has
+            # to commit them. Allow a lockfile that differs from the merge base
+            # ONLY in patch hashes: the overrides-consistency check below
+            # proves each one matches its committed patch file.
+            hashless() {
+              git show "$1:pnpm-lock.yaml" |
+                sed -E 's/patch_hash=[a-z0-9]+/patch_hash=/g; s/^(    hash: )[a-z0-9]+$/\1/'
+            }
+            set -o pipefail
+            base="$(git merge-base "$PR_BASE_SHA" "$PR_HEAD_SHA")"
+            before="$(hashless "$base")"
+            after="$(hashless "$PR_HEAD_SHA")"
+            if [ "$before" = "$after" ]; then
+              echo "pnpm-lock.yaml differs from the merge base only in patch hashes; allowed."
+            else
+              echo "Do not commit pnpm-lock.yaml in pull requests. CI owns lockfile updates."
+              exit 1
+            fi
           fi
 
       - name: Setup pnpm
