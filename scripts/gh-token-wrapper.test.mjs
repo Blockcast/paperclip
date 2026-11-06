@@ -2448,6 +2448,17 @@ test("the mount-generation line carries its own not-evidence-of-publication cave
 
 // ...and only where there is a generation to qualify. "-" means this token is
 // not a Secret mount at all, so a caveat about the mount stamp is noise.
+test("a token that is not a Secret mount gets no generation caveat (PEN-5730)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const plain = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
+      assert.match(plain.stdout, /mount-generation:\s+-$/m);
+      assert.doesNotMatch(plain.stdout, /NOT evidence of publication/);
+      assert.equal(plain.status, 0);
+    });
+  });
+});
+
 // PEN-5775. PEN-5730 took `mount-generation` out of the decision because it is
 // a property of the OBSERVER. That fixes the wrong verdicts, but the sha alone
 // can only ever report "unchanged" -- it cannot report that a publication
@@ -2478,7 +2489,12 @@ test("token-dated separates an initial mount from an in-life rewrite (PEN-5775)"
       // 19:41:34. This is the reading that dates the Secret's content.
       const initial = runAuthCheck(dir, { tokenFilePath, apiBase, containerStart: mountedAt + 16 });
       assert.match(initial.stdout, /token-dated:\s+INITIAL MOUNT/);
-      assert.match(initial.stdout, /genuine publication probe/);
+      // The probe claim is deliberately CONDITIONAL: an in-place container
+      // restart gets a new PID 1 but reuses the existing volume, so a mount
+      // written long before the restart also lands here. The dating is still
+      // correct; "this is the pod's first mount" is what cannot be concluded.
+      assert.match(initial.stdout, /On a pod FIRST container start that also makes this a publication probe/);
+      assert.match(initial.stdout, /confirm restartCount before relying on it as one/);
 
       // The other case: kubelet rewrites a projection only when the content it
       // projects changed (PEN-5730's within-pod control measured the stamp
@@ -2502,6 +2518,35 @@ test("token-dated separates an initial mount from an in-life rewrite (PEN-5775)"
 // kubelet projection, so reporting its mtime as though it dated a publication
 // would reintroduce the whole defect on the one path that has no generation to
 // warn anybody off.
+// The fail-closed path, which is the one that must never quietly become a
+// claim. `stat -c %Y /proc/1` was rejected as the start-time source precisely
+// because its error direction ran INTO the overclaim branch; this pins that an
+// unusable start time lands here instead of being guessed at.
+test("token-dated degrades when the container start time is unreadable (PEN-5775)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const generation = `..2026_11_06_19_41_18.${Date.now()}`;
+      mkdirSync(path.join(dir, generation));
+      writeFileSync(path.join(dir, generation, "token"), `${AUTH_CHECK_VALID_TOKEN}\n`);
+      symlinkSync(generation, path.join(dir, "..data"));
+      symlinkSync(path.join("..data", "token"), path.join(dir, "token"));
+
+      const proc = runAuthCheck(dir, {
+        tokenFilePath: path.join(dir, "token"),
+        apiBase,
+        containerStart: "not-a-number",
+      });
+      assert.match(proc.stdout, /start time is unreadable, so an initial mount and an in-life rewrite cannot be told apart/);
+      // It must claim NEITHER classification rather than pick one.
+      assert.doesNotMatch(proc.stdout, /INITIAL MOUNT/);
+      assert.doesNotMatch(proc.stdout, /IN-LIFE REWRITE/);
+      // ...while still dating the sha to mount-written, which it can prove.
+      assert.match(proc.stdout, /the sha above was the Secret's content as of mount-written/);
+      assert.equal(proc.status, 0);
+    });
+  });
+});
+
 test("token-dated refuses to date a token file that is not a Secret mount (PEN-5775)", async () => {
   await withStubGitHub(async (apiBase) => {
     withTempDir((dir) => {
@@ -2509,17 +2554,6 @@ test("token-dated refuses to date a token file that is not a Secret mount (PEN-5
       assert.match(proc.stdout, /token-dated:\s+NOT A KUBELET PROJECTION/);
       assert.match(proc.stdout, /says nothing about a Secret publication/);
       assert.match(proc.stdout, /mount-generation:\s+-$/m);
-    });
-  });
-});
-
-test("a token that is not a Secret mount gets no generation caveat (PEN-5730)", async () => {
-  await withStubGitHub(async (apiBase) => {
-    withTempDir((dir) => {
-      const plain = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
-      assert.match(plain.stdout, /mount-generation:\s+-$/m);
-      assert.doesNotMatch(plain.stdout, /NOT evidence of publication/);
-      assert.equal(plain.status, 0);
     });
   });
 });
