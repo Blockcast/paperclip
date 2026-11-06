@@ -976,6 +976,13 @@ export function checkSettlement(
  * that survive them cost two API calls each, and on a repo where most open PRs
  * are already enqueued or human-authored that is most of them avoided.
  */
+/**
+ * The action for a PR whose base is not its repo's default branch — a PR
+ * stacked on another PR's feature branch. See `classifyFromListing`, which is
+ * the only producer, for why this is a skip rather than a cap exclusion.
+ */
+export const NON_DEFAULT_BASE_ACTION = "non-default-base";
+
 export function classifyFromListing(pr, { now = Date.now() } = {}) {
   const row = (action, reason, detail = null) => ({
     number: pr?.number,
@@ -987,6 +994,77 @@ export function classifyFromListing(pr, { now = Date.now() } = {}) {
 
   if (!isAllyAppLogin(pr?.author?.login) || pr?.author?.is_bot !== true) {
     return row("skip", "human-author", pr?.author?.login ?? "<unknown>");
+  }
+
+  // ## SCOPE, not a hold: a PR stacked on another PR's branch is not ours
+  //
+  // This lander lands PRs onto a repo's DEFAULT branch. A PR whose base is
+  // another PR's feature branch is a different object: it is part of someone's
+  // stack, and the thing that decides when it merges is the parent landing,
+  // not this routine.
+  //
+  // ### The decision this branch encodes: SKIP OUTRIGHT, not merely
+  // ### "exclude from the cap" (PEN-5469 done-when 3)
+  //
+  // Both were on the table, because the row that filed this named two separate
+  // harms, and only one of them is about budget:
+  //
+  //   1. BUDGET. `MAX_ENQUEUES_PER_FIRE` is a ceiling on the DEFAULT-branch
+  //      landing backlog. A stacked PR contributes nothing to that backlog and
+  //      still consumed a slot at classification time (#3366 took slot 1 in
+  //      the 22:32Z and 23:33Z fires on 2026-11-03 while ten `master` PRs read
+  //      `cap:10-per-fire` beneath it).
+  //   2. SAFETY. `applyRow` runs `gh pr merge --auto --rebase`, which queues,
+  //      arms, or MERGES OUTRIGHT depending on the base. A feature branch has
+  //      no merge queue and no rulesets, so the child can merge straight into
+  //      its parent's branch — moving the parent's head with no push by any
+  //      agent, and voiding any Ally verdict pinned to that head.
+  //
+  // Excluding from the cap fixes (1) and makes (2) STRICTLY WORSE: the PR
+  // would still be enqueued, and would now do so without even spending a
+  // budget slot, so nothing bounds how many parent heads one fire can move.
+  // Skipping is the only option that answers both, and it is also what the
+  // existing manual control already does — `do-not-merge` is in `SKIP_LABELS`
+  // and was applied to #3366 by hand. This branch automates that label; it
+  // does not introduce a new policy.
+  //
+  // ### Its own action, for the same four reasons `notify-only` has one
+  //
+  // `non-default-base` is a POLICY hold that never clears by design (only the
+  // author retargeting the PR clears it), which is the `notify-only` shape
+  // exactly. Reporting it as a bare `skip` would: spend nothing but read as a
+  // deferral in the receipt; and — via `stalledHolds` — age every stacked PR
+  // in the repo into the stale-hold cohort forever and, under `--apply`,
+  // comment on each one every fire. So it joins `NON_HOLD_ACTIONS`. It is
+  // excluded from `unlandedEligible` and `capStarved` for free: those key on
+  // `enqueue` and on `skip` + a cap reason respectively.
+  //
+  // ### ⛔ Fail direction: UNPROVEN must not skip
+  //
+  // The dangerous error here is skipping a PR that actually targets the
+  // default branch — that strands it on every fire, forever, with no detector
+  // aging it (it is in `NON_HOLD_ACTIONS`). The harmless error is not skipping
+  // one that should have been: that degrades to the pre-PEN-5469 behaviour,
+  // which is wasteful but cannot stall anything, and `do-not-merge` still
+  // covers it by hand. So this fires only on two POSITIVELY READ, non-empty
+  // strings that differ. An unread default branch (`fetchDefaultBranch`
+  // returns `null`) or a listing with no `baseRefName` falls through. Same
+  // posture, and the same reasoning, as `fetchMergeQueueEntries`.
+  const base = pr?.baseRefName;
+  const defaultBranch = pr?.repoDefaultBranch;
+  if (
+    typeof base === "string" &&
+    base !== "" &&
+    typeof defaultBranch === "string" &&
+    defaultBranch !== "" &&
+    base !== defaultBranch
+  ) {
+    return row(
+      NON_DEFAULT_BASE_ACTION,
+      `base:${base}`,
+      `stacked on \`${base}\`, not \`${defaultBranch}\` — ` +
+        "landing it would move that branch's head",
+    );
   }
 
   const labels = (pr?.labels ?? []).map((label) => lower(label?.name));
@@ -1464,6 +1542,13 @@ const NON_HOLD_ACTIONS = new Set([
   // Same argument, different clock: a PR wedged in the merge queue is reported
   // by `classifyFromListing` off the queue entry's own `enqueuedAt`.
   "stale-queued",
+  // PEN-5469, and the `notify-only` argument one word different: a PR stacked
+  // on another PR's branch is held by POLICY — we land onto the default branch
+  // only — and that hold clears when the AUTHOR retargets, never because this
+  // routine waited. Aging it would park every stacked PR in the stale-hold
+  // cohort permanently and, on `--apply`, comment on each one every fire
+  // saying the routine is not enqueuing it. True, useless, and forever.
+  "non-default-base",
 ]);
 
 /**
@@ -2334,6 +2419,38 @@ export function fetchCodeownerRules(repo, run = gh) {
   return null;
 }
 
+/**
+ * A repo's default branch name, or `null` when it could not be read.
+ *
+ * One call per repo, not per PR — the default branch is a property of the
+ * repository, the same reasoning that makes `fetchCodeownerRules` a per-repo
+ * read.
+ *
+ * ⛔ `null` means UNREAD and must stay distinguishable from a branch name,
+ * because the two fail in opposite directions and only one of them is
+ * recoverable. `classifyFromListing` skips a PR when its base DIFFERS from
+ * this value, and that skip is in `NON_HOLD_ACTIONS` — so no detector in this
+ * script ages it. A wrong name (or an empty string compared against a real
+ * base) would therefore strand every PR in the repo silently and permanently.
+ * An unread default branch merely falls through to the pre-PEN-5469
+ * behaviour: a stacked PR can still spend a cap slot, which is wasteful and is
+ * exactly what this read exists to stop, but cannot stall a PR — and the
+ * manual `do-not-merge` control still covers it.
+ *
+ * So every failure returns `null`, and nothing here throws: an unreadable
+ * default branch is not grounds to abort a fire that can still land the PRs it
+ * can positively classify.
+ */
+export function fetchDefaultBranch(repo, run = gh) {
+  try {
+    const name = JSON.parse(run(["repo", "view", repo, "--json", "defaultBranchRef"]))
+      ?.defaultBranchRef?.name;
+    return typeof name === "string" && name !== "" ? name : null;
+  } catch {
+    return null;
+  }
+}
+
 /** How many queue entries one page asks for. GitHub caps `first` at 100. */
 const MERGE_QUEUE_PAGE = 100;
 
@@ -2455,7 +2572,10 @@ export function fetchPrFiles(repo, number, run = gh) {
  * identity rules pin immutable REST account IDs, which the GraphQL shape does
  * not carry. A login string alone is not review evidence (I5).
  */
-export function fetchOpenPrs(repo, { run = gh, mergeStates = fetchMergeStates } = {}) {
+export function fetchOpenPrs(
+  repo,
+  { run = gh, mergeStates = fetchMergeStates, defaultBranch = fetchDefaultBranch } = {},
+) {
   const rows = JSON.parse(
     run(["pr", "list", "--repo", repo, "--state", "open", "--limit", "500", "--json", PR_LIST_FIELDS]),
   );
@@ -2467,6 +2587,12 @@ export function fetchOpenPrs(repo, { run = gh, mergeStates = fetchMergeStates } 
   const states = mergeStates(repo, { run });
   // One fetch per repo, not per PR: the rules are a property of the base branch.
   const codeownerRules = fetchCodeownerRules(repo, run);
+
+  // Likewise one per repo. Read BEFORE `classifyFromListing` is consulted,
+  // because the base rule is one of the cheap rules that DECIDES whether a PR
+  // needs the expensive hydration below at all — the same placement argument
+  // as the merge-queue read above.
+  const repoDefaultBranch = defaultBranch(repo, run);
 
   // One merge-queue read per DISTINCT BASE, not per PR: a queue belongs to a
   // branch, so every PR targeting that branch is answered by the same read.
@@ -2513,6 +2639,9 @@ export function fetchOpenPrs(repo, { run = gh, mergeStates = fetchMergeStates } 
       ...listed,
       mergeStateStatus: states.get(listed?.number) ?? "UNKNOWN",
       mergeQueueEntry: mergeQueueEntryFor(listed),
+      // `null` when unread, and `classifyFromListing` treats that as "cannot
+      // prove this PR is stacked" rather than as a licence to skip it.
+      repoDefaultBranch,
     };
     if (classifyFromListing(joined)) return joined;
     return {
