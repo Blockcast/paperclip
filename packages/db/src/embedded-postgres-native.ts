@@ -32,7 +32,7 @@ async function pathExists(value: string): Promise<boolean> {
   }
 }
 
-function resolveEmbeddedPostgresPackageRoot(): string | null {
+export function resolveEmbeddedPostgresPackageRoot(): string | null {
   try {
     const entry = require.resolve("embedded-postgres");
     return path.dirname(path.dirname(entry));

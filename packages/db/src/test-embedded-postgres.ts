@@ -1,9 +1,14 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { applyPendingMigrations, ensurePostgresDatabase } from "./client.js";
-import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
+import {
+  prepareEmbeddedPostgresNativeRuntime,
+  resolveEmbeddedPostgresPackageRoot,
+} from "./embedded-postgres-native.js";
 import { endTrackedClients, trackTestDatabase } from "./embedded-test-client-registry.js";
 
 type EmbeddedPostgresInstance = {
@@ -34,8 +39,10 @@ export type EmbeddedPostgresTestDatabase = {
 };
 
 let embeddedPostgresSupportPromise: Promise<EmbeddedPostgresTestSupport> | null = null;
+let templateKey: string | undefined;
 
 const DEFAULT_PAPERCLIP_EMBEDDED_POSTGRES_PORT = 54329;
+const MIGRATIONS_DIR = fileURLToPath(new URL("./migrations", import.meta.url));
 
 function getReservedTestPorts(): Set<number> {
   const configuredPorts = [
@@ -144,9 +151,145 @@ async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSuppo
   }
 }
 
+/**
+ * Names the template after what decides its contents: the embedded-postgres
+ * version and every file the migrator reads, i.e. the .sql files and the
+ * journal (the meta/ snapshots only feed `drizzle-kit generate`).
+ */
+export function embeddedPostgresTemplateKey(
+  migrationsDir = MIGRATIONS_DIR,
+  embeddedPostgresVersion = readEmbeddedPostgresVersion(),
+): string {
+  const hash = createHash("sha256").update(`embedded-postgres ${embeddedPostgresVersion}\n`);
+  const sqlFiles = fs.readdirSync(migrationsDir).filter((name) => name.endsWith(".sql")).sort();
+  for (const file of [...sqlFiles, "meta/_journal.json"]) {
+    const content = fs.readFileSync(path.join(migrationsDir, file));
+    hash.update(`${file} ${content.length}\n`).update(content);
+  }
+  return hash.digest("hex").slice(0, 16);
+}
+
+function readEmbeddedPostgresVersion(): string {
+  const packageRoot = resolveEmbeddedPostgresPackageRoot();
+  if (!packageRoot) throw new Error("embedded-postgres is not installed");
+  const manifest = JSON.parse(fs.readFileSync(path.join(packageRoot, "package.json"), "utf8"));
+  return String(manifest.version);
+}
+
+// initdb, the paperclip database and every migration, as each suite used to
+// do it, into a stopped cluster under EMBEDDED_POSTGRES_DATA_ROOT.
+async function buildMigratedTemplateCluster(): Promise<string> {
+  const { dataDir, port, instance } = await createEmbeddedPostgresTestInstance(
+    "paperclip-pg-template-build-",
+  );
+  try {
+    await instance.initialise();
+    await instance.start();
+    await ensurePostgresDatabase(`postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`, "paperclip");
+    await applyPendingMigrations(`postgres://paperclip:paperclip@127.0.0.1:${port}/paperclip`);
+    await instance.stop();
+    // stop() resolves when the postmaster exits, however it exits. A clean
+    // shutdown removes postmaster.pid; a copy of a crashed cluster is not used.
+    if (fs.existsSync(path.join(dataDir, "postmaster.pid"))) {
+      throw new Error("template cluster did not shut down cleanly");
+    }
+    return dataDir;
+  } catch (error) {
+    await instance.stop().catch(() => {});
+    cleanupEmbeddedPostgresTestDirs(dataDir);
+    throw error;
+  }
+}
+
+// The build runs while Vitest collects a suite, which has no timeout, so a
+// hung migration would otherwise stall the job until its step timeout. Past
+// the deadline the suites take the per-suite path, where hookTimeout applies,
+// and a build that finishes late is removed rather than published.
+const TEMPLATE_BUILD_TIMEOUT_MS = 5 * 60_000;
+
+async function withBuildDeadline(build: Promise<string>, timeoutMs: number): Promise<string> {
+  let timer: NodeJS.Timeout | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      void build.then(cleanupEmbeddedPostgresTestDirs, () => {});
+      reject(new Error(`template build did not finish within ${timeoutMs} ms`));
+    }, timeoutMs);
+  });
+  try {
+    return await Promise.race([build, deadline]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * One migrated template cluster per CI job, copied for each suite.
+ *
+ * Every DB suite used to run initdb and all migrations in its own cluster,
+ * after a throwaway probe cluster: a 7.7-10.9 s floor even for a one-test file,
+ * paid per file because the server suites fork per file. A suite now copies a
+ * stopped, migrated cluster and starts it; applyPendingMigrations still runs
+ * and returns at its up-to-date check.
+ *
+ * Only under EMBEDDED_POSTGRES_DATA_ROOT, the ARC runner's per-pod tmpfs, which
+ * goes away with the job. Not under os.tmpdir(): run-vitest-stable.mjs points
+ * TMPDIR at a new /tmp/pcvt-* directory for every Vitest invocation and never
+ * removes it, so a template there would be rebuilt per invocation and left
+ * behind. PAPERCLIP_TEST_PG_TEMPLATE=0 restores a fresh cluster per suite.
+ */
+export async function ensureEmbeddedPostgresTemplate(
+  buildCluster: () => Promise<string> = buildMigratedTemplateCluster,
+  buildTimeoutMs = TEMPLATE_BUILD_TIMEOUT_MS,
+): Promise<string | null> {
+  const dataRoot = process.env.EMBEDDED_POSTGRES_DATA_ROOT;
+  if (!dataRoot || process.env.PAPERCLIP_TEST_PG_TEMPLATE === "0") return null;
+  let builtDir: string | null = null;
+  try {
+    templateKey ??= embeddedPostgresTemplateKey();
+    const templateDir = path.join(dataRoot, `paperclip-pg-template-${templateKey}`);
+    if (fs.existsSync(templateDir)) return templateDir;
+    // mkdir is the atomic claim: one process per job builds the template. It is
+    // never released, so after a failed or killed build every suite keeps the
+    // per-suite path: nobody waits on it, and a broken migration is not built
+    // twice per suite.
+    try {
+      fs.mkdirSync(`${templateDir}.lock`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return null;
+      throw error;
+    }
+    const startedAt = Date.now();
+    builtDir = await withBuildDeadline(buildCluster(), buildTimeoutMs);
+    // rename is atomic, so a reader sees the whole template or none of it.
+    fs.renameSync(builtDir, templateDir);
+    console.log(
+      `[test-embedded-postgres] built migrated template ${templateDir} in ${Date.now() - startedAt} ms`,
+    );
+    return templateDir;
+  } catch (error) {
+    if (builtDir) cleanupEmbeddedPostgresTestDirs(builtDir);
+    console.warn(
+      `[test-embedded-postgres] no migrated template, each suite builds its own cluster: ${formatEmbeddedPostgresError(error)}`,
+    );
+    return null;
+  }
+}
+
+export function copyEmbeddedPostgresTemplate(templateDir: string, dataDir: string): void {
+  // dataDir already exists (mkdtemp, 0700), so cpSync copies the template's
+  // contents into it and leaves its mode alone. Postgres refuses a data
+  // directory that is not 0700 or 0750; the chmod only makes that explicit.
+  fs.cpSync(templateDir, dataDir, { recursive: true });
+  fs.chmodSync(dataDir, 0o700);
+}
+
 export async function getEmbeddedPostgresTestSupport(): Promise<EmbeddedPostgresTestSupport> {
   if (!embeddedPostgresSupportPromise) {
-    embeddedPostgresSupportPromise = probeEmbeddedPostgresSupport();
+    // A template on disk means initdb and start already work on this host, so
+    // the throwaway probe cluster is skipped.
+    embeddedPostgresSupportPromise = ensureEmbeddedPostgresTemplate().then((templateDir) =>
+      templateDir ? { supported: true } : probeEmbeddedPostgresSupport(),
+    );
   }
   return await embeddedPostgresSupportPromise;
 }
@@ -158,11 +301,16 @@ export async function startEmbeddedPostgresTestDatabase(
   let instance: EmbeddedPostgresInstance | null = null;
 
   try {
+    const templateDir = await ensureEmbeddedPostgresTemplate();
     const created = await createEmbeddedPostgresTestInstance(tempDirPrefix);
     dataDir = created.dataDir;
     instance = created.instance;
     const { port } = created;
-    await instance.initialise();
+    if (templateDir) {
+      copyEmbeddedPostgresTemplate(templateDir, dataDir);
+    } else {
+      await instance.initialise();
+    }
     await instance.start();
 
     const adminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
