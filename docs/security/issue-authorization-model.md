@@ -213,6 +213,35 @@ Terminal denials:
   the 403 rather than from this file. A relation not in that list is excluded
   on purpose if it appears in the negative controls below, and unmodelled
   otherwise — adding one means adding it there, here, and in the matrix.
+  Several of those relations are **conjunctions**, so the list alone cannot say
+  *which* part failed. Where the actor came within one conjunct of holding a
+  relation, the denial also carries `details.nearMissRelations` — a subset of
+  `evaluatedRelations` — and an explanation naming the failed conjunct and the
+  remedy that actually reaches it. Today exactly one relation reports this:
+  `dependency_edge`, when a live edge joins T to a non-terminal issue the actor
+  is assigned but no creator of such an edge had standing on T. Without it the
+  two states below are byte-identical, and the stock "no relation holds" text is
+  false for the second — the actor *does* hold the edge:
+
+  | state | `nearMissRelations` | remedy |
+  |---|---|---|
+  | no `blocks` edge reaches T | absent | nothing here reaches T; escalate to an ancestor |
+  | edge live, creator lacked standing on T | `["dependency_edge"]` | ask T's assignee/creator (or a manager of T's assignee, or a board user) to declare the edge **from their side** |
+
+  `PEN-5780` is why: the collapsed answer misdiagnosed two experienced readers
+  in one morning and produced a proposed one-line "fix" — drop the creator
+  conjunct — whose only satisfiable implementation is a self-grant
+  vulnerability, since that conjunct *is* the anti-self-grant guard. The field
+  is **advisory and additive**: it never changes an allow/deny outcome. A near
+  miss also emits a server-side log line (`grant: "dependency_edge_comment"`,
+  `failedConjunct: "edge_creator_standing"`), as the recovery-handoff TTL lapse
+  already did, so the distinction survives into an operator's logs too.
+  Disclosure was argued per relation, not assumed: naming this conjunct leaks
+  nothing, because the actor is assigned the issue carrying the edge and can
+  already read that the edge exists. `agent_mention` has the same conjunctive
+  shape but a different disclosure question — its grant turns on *who authored*
+  a comment on T, which an actor with no relation to T cannot otherwise read —
+  so it is deliberately **not** reported here and needs its own argument first.
 - `deny_missing_grant` for `issue:mutate` — returned at the end of the same block
   with `details.evaluatedRelations` (`ISSUE_MUTATE_EVALUATED_RELATIONS`): three
   entries where comment has eight, and the explanation states that no grant and no
