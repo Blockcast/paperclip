@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import path from "node:path";
 import test from "node:test";
 import { createContext, Script } from "node:vm";
 
@@ -8,6 +9,10 @@ const dockerWorkflowPath = ".github/workflows/docker.yml";
 const dockerAgentWorkflowPath = ".github/workflows/docker-agent.yml";
 const refreshLockfileWorkflowPath = ".github/workflows/refresh-lockfile.yml";
 const playwrightCachePrimeWorkflowPath = ".github/workflows/playwright-cache-prime.yml";
+const masterHealthWorkflowPath = ".github/workflows/master-health.yml";
+const restorePnpmStoreActionPath = ".github/actions/restore-pnpm-store/action.yml";
+const pluginBuildDepsActionPath = ".github/actions/plugin-build-deps/action.yml";
+const ensurePluginBuildDepsPath = "scripts/ensure-plugin-build-deps.mjs";
 
 test("PR jobs do not install an ineffective compiler cache", async () => {
   const workflow = await readFile(prWorkflowPath, "utf8");
@@ -114,6 +119,129 @@ test("Refresh Lockfile populates the setup-node-compatible pnpm cache before sav
     [...orderedSteps].sort((left, right) => left - right),
     orderedSteps,
     "the refreshed lockfile must be restored, fetched, and saved in order",
+  );
+});
+
+// setup-node's `cache: pnpm` and the combined actions/cache save in a post-step
+// on every event. From a pull_request or merge_group run that save lands in a
+// refs/pull/N/merge or single-use gh-readonly-queue/* scope no later run reads,
+// and on a failed restore it re-uploaded the ~0.8 GB store after the job's work
+// (3 of 14 sampled heavy jobs were cancelled inside it). Refresh Lockfile and
+// Playwright cache prime seed `master`, which every scope reads.
+test("PR and master-health jobs only restore caches; every pnpm install restores the store first", async () => {
+  for (const [workflowPath, minimumInstalls] of [[prWorkflowPath, 6], [masterHealthWorkflowPath, 2]]) {
+    const workflow = await readFile(workflowPath, "utf8");
+    // Input lines only: comments in pr.yml still name `cache: pnpm`.
+    assert.doesNotMatch(workflow, /^\s*cache: pnpm\s*$/m, `${workflowPath} must not use setup-node's saving pnpm cache`);
+    assert.doesNotMatch(workflow, /uses: actions\/cache\/save@/, `${workflowPath} must not save a cache directly`);
+    assert.doesNotMatch(workflow, /uses: actions\/cache@/, `${workflowPath} must use actions/cache/restore, which has no post-step save`);
+
+    const steps = workflow.split("\n      - name: ");
+    let installs = 0;
+    for (let index = 1; index < steps.length; index += 1) {
+      if (!steps[index].startsWith("Install dependencies\n")) continue;
+      installs += 1;
+      assert.match(
+        steps[index - 1],
+        /^Restore pnpm store\n(?: {8}if: [^\n]*\n)? {8}uses: \.\/\.github\/actions\/restore-pnpm-store\n/,
+        `${workflowPath}: every \`Install dependencies\` must follow the restore-only pnpm store step`,
+      );
+      assert.match(steps[index - 2], /^Setup Node\.js\n/, `${workflowPath}: the store restore needs node, so it follows Setup Node.js`);
+    }
+    assert.ok(installs >= minimumInstalls, `${workflowPath}: found ${installs} pnpm installs; slicing broke?`);
+  }
+});
+
+test("the restore-only pnpm action reads exactly the entry Refresh Lockfile saves", async () => {
+  const action = await readFile(restorePnpmStoreActionPath, "utf8");
+  const refresh = await readFile(refreshLockfileWorkflowPath, "utf8");
+
+  assert.doesNotMatch(action, /actions\/cache\/save|uses: actions\/cache@/, "the action must never save");
+  // actions/cache versions an entry by its path string and compression, so the
+  // path, the arch and the key must resolve exactly as Refresh Lockfile's do.
+  const resolve = (text) =>
+    text
+      .match(/echo "path=\$\(pnpm store path --silent\)" >> "\$GITHUB_OUTPUT"\n\s*echo "arch=\$\(node -p 'process\.arch'\)" >> "\$GITHUB_OUTPUT"/)?.[0]
+      .replace(/\n\s*/, "\n");
+  assert.ok(resolve(action), "the action must resolve the store path like Refresh Lockfile");
+  assert.equal(resolve(action), resolve(refresh));
+  const values = (text, name) => [...text.matchAll(new RegExp(`^\\s*${name}: (.+)$`, "gm"))].map((match) => match[1]);
+  const [refreshPath] = values(refresh, "path");
+  const [refreshKey] = values(refresh, "key");
+  assert.deepEqual(values(action, "path"), [refreshPath, refreshPath]);
+  assert.deepEqual(values(action, "key"), [refreshKey, refreshKey]);
+  assert.match(
+    action,
+    /- name: Retry pnpm store restore\n\s+if: steps\.pnpm-cache-restore\.outputs\.cache-matched-key == ''\n\s+uses: actions\/cache\/restore@v4\n/,
+    "the retry must fire only when nothing was restored",
+  );
+  // A prefix match in the job's own scope beats master's exact entry, so only
+  // the retry may fall back to an older store.
+  assert.equal([...action.matchAll(/^\s*restore-keys:/gm)].length, 1, "restore-keys belongs on the retry only");
+  assert.match(action, /- name: Retry pnpm store restore\n[\s\S]*restore-keys:/);
+  // `pnpm store path` differs across pnpm majors (v3 store in pnpm 9, v10 in
+  // pnpm 10). Lanes run package.json's packageManager through setup-pnpm, and
+  // Refresh Lockfile pins its own copy, so a bump must move both.
+  const packageManager = JSON.parse(await readFile("package.json", "utf8")).packageManager;
+  const refreshPnpm = refresh.match(/uses: pnpm\/action-setup@[^\n]+\n\s+with:\n\s+version: ([^\s]+)\n/)?.[1];
+  assert.equal(`pnpm@${refreshPnpm}`, packageManager, "Refresh Lockfile must seed the store with the pnpm the lanes run");
+});
+
+// The restored dist is touched to look fresh, so ensure-plugin-build-deps.mjs
+// skips its compile. That is safe only while the key hashes every compile input.
+test("plugin build deps: the key hashes every build target, and only a master push saves", async () => {
+  const action = await readFile(pluginBuildDepsActionPath, "utf8");
+  const script = await readFile(ensurePluginBuildDepsPath, "utf8");
+  const masterHealth = await readFile(masterHealthWorkflowPath, "utf8");
+
+  const key = action.match(/\n {8}key: plugin-build-deps-\$\{\{ runner\.os \}\}-\$\{\{ hashFiles\((.+)\) \}\}\n/)?.[1];
+  assert.ok(key, "plugin build deps restore key is missing");
+  const inputs = [...key.matchAll(/'([^']+)'/g)].map((match) => match[1]);
+  const targets = [...script.matchAll(/(sourceDir|tsconfig): path\.join\(rootDir, "([^"]+)"\)/g)];
+  assert.ok(targets.length >= 4, "buildTargets moved; re-point this test at them");
+  for (const [, field, file] of targets) {
+    const wanted = field === "sourceDir" ? [`${file}/**`] : [file, `${path.posix.dirname(file)}/package.json`];
+    for (const input of wanted) assert.ok(inputs.includes(input), `plugin build deps key must hash ${input}`);
+  }
+  for (const input of ["tsconfig.base.json", "tsconfig.json", "pnpm-lock.yaml", ensurePluginBuildDepsPath]) {
+    assert.ok(inputs.includes(input), `plugin build deps key must hash ${input}`);
+  }
+  assert.doesNotMatch(action, /^\s*restore-keys:/m, "a near match would be touched into looking fresh");
+  assert.match(action, /- name: Mark restored plugin build deps fresh\n\s+if: steps\.restore\.outputs\.cache-hit == 'true'\n/);
+
+  const gate = action.match(/- name: Save plugin build deps\n\s+if: ([^\n]+)\n\s+uses: actions\/cache\/save@v4\n/)?.[1];
+  assert.ok(gate, "plugin build deps save step is missing");
+  // GitHub's `a.b-c` property syntax is not JavaScript; everything else here is.
+  const expression = gate.replace(/\.([A-Za-z_]\w*-[\w-]*)/g, '["$1"]');
+  const cases = [
+    ["push", "refs/heads/master", "true", "", true],
+    ["push", "refs/heads/master", "true", "true", false],
+    ["push", "refs/heads/master", "false", "", false],
+    ["push", "refs/heads/feature/test", "true", "", false],
+    ["pull_request", "refs/pull/123/merge", "true", "", false],
+    ["merge_group", "refs/heads/gh-readonly-queue/master/pr-1-abc", "true", "", false],
+    ["schedule", "refs/heads/master", "true", "", false],
+    ["workflow_dispatch", "refs/heads/master", "true", "", false],
+  ];
+  // One reused context and a compile-once Script, as the shared-image-cache test
+  // below does (PEN-5667): the timeout is a hang guard, not a performance bound.
+  const sandbox = {};
+  const context = createContext(sandbox);
+  const gateScript = new Script(expression);
+  for (const [event_name, ref, save, hit, allowed] of cases) {
+    Object.assign(sandbox, {
+      github: { event_name, ref },
+      inputs: { save },
+      steps: { restore: { outputs: { "cache-hit": hit } } },
+    });
+    const result = gateScript.runInContext(context, { timeout: 5_000 });
+    assert.equal(Boolean(result), allowed, `${event_name} ${ref} save=${save} cache-hit=${hit}`);
+  }
+  // Nothing else seeds this key, so losing this input would turn every restore
+  // into a miss without failing anything.
+  assert.match(
+    masterHealth,
+    /- name: Restore or seed plugin build deps\n {8}uses: \.\/\.github\/actions\/plugin-build-deps\n {8}with:\n {10}save: \$\{\{ matrix\.shard_index == 0 \}\}\n/,
   );
 });
 

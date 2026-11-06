@@ -6,8 +6,8 @@ name: Playwright cache prime
 # single-use `gh-readonly-queue/*` ref, and one saved by a `pull_request` run
 # on `refs/pull/<n>/merge`; neither is readable from the next queue entry or a
 # sibling PR. Nothing ever saved this key on `master`, which every ref CAN read.
-# The pnpm store in the same job hits on every run for exactly that reason:
-# `master-health.yml` saves it on `master`.
+# The pnpm store in the same job is restored from `master` for exactly that
+# reason: Refresh Lockfile saves it there.
 #
 # Measured over 28 recent `pr.yml` runs (14 `merge_group`, 14 `pull_request`,
 # jobs API, 2026-10-06/07): the e2e `Install Playwright browser` step ran in
@@ -94,9 +94,12 @@ jobs:
       - name: Setup pnpm
         uses: ./.github/actions/setup-pnpm
 
-      # Same Node major and `cache: pnpm` as the e2e job. On a lockfile push the
-      # store restore misses (see `runs-on` above); on a push of this file or a
-      # dispatch it hits the entry `master-health.yml` and Refresh Lockfile save.
+      # Same Node major as the e2e job. `cache: pnpm` stays here: this job runs
+      # on pushes to `master` (and by dispatch), so its post-step save seeds
+      # `master` alongside Refresh Lockfile; pr.yml and master-health.yml only
+      # restore. On a lockfile push the store restore misses (see `runs-on`
+      # above); on a push of this file or a dispatch it hits the entry Refresh
+      # Lockfile saves.
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:

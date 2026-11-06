@@ -3,7 +3,8 @@
 //
 // pr.yml's `policy` job runs this once and publishes one boolean per suite
 // group; the heavy steps of `general_tests`, `e2e` and `canary_dry_run` read
-// them. The only question answered here is "can the diff possibly change the
+// them, and on pull_request so do those of `typecheck_release_registry` and
+// `build`. The only question answered here is "can the diff possibly change the
 // outcome of this suite?". The answer FAILS OPEN: a suite is skipped only when
 // EVERY changed path is positively classified as unable to reach it. Anything
 // unclassified, any failure of this script, and an empty diff all mean "run".
@@ -69,9 +70,14 @@ export function groupDefinitions(workspaces, vitestProjectDirs) {
       rootScripts: [...unitScripts, "test:e2e", "paperclipai", "build"],
     },
     // release.sh builds and packs every workspace package and writes release notes.
+    // pr.yml's Typecheck + Release Registry and Build lanes also skip on this
+    // group, so it carries the root scripts those lanes run.
     release_dry_run_needed: { roots: all, sourceDirs: [], notInert: ["releases"],
       scriptsAlwaysRelevant: true,
-      rootScripts: ["release", "release:canary", "build", "build:npm", "typecheck"],
+      rootScripts: [
+        "release", "release:canary", "build", "build:npm", "typecheck",
+        "typecheck:build-gaps", "check:test-undefined-symbols", "test:release-registry",
+      ],
     },
   };
 }

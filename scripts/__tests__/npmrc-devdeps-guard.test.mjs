@@ -228,8 +228,10 @@ test("pr.yml guards the install against an ambient NODE_ENV=production", () => {
 // the install is complete` step fails if that ever stops holding. There is no
 // shared-cache-key hazard here.
 //
-// Asserting on the job body rather than the whole file is deliberate: every
-// other `cache: pnpm` in pr.yml is correct and must stay.
+// Asserting on the job body rather than the whole file is deliberate: the
+// other lanes restore the store through .github/actions/restore-pnpm-store,
+// which has no save step, and must keep doing so. (No lane sets `cache: pnpm`
+// any more; scripts/__tests__/ci-cache-routing.test.mjs holds that.)
 test("worktree_install does not enable setup-node's pnpm cache", () => {
   const prWorkflow = readRepoFile(".github/workflows/pr.yml");
   const jobBody = workflowJobBody(prWorkflow, "worktree_install");
@@ -254,15 +256,16 @@ test("worktree_install does not enable setup-node's pnpm cache", () => {
   );
 
   // Positive control for the slicing AND for the scope of this rule: the other
-  // lanes still cache, so a change that stripped `cache: pnpm` repo-wide fails
-  // here rather than passing quietly. Count YAML input lines with the same
-  // anchoring the `doesNotMatch` above uses — a bare substring count also
-  // matches the prose mentions in pr.yml's PEN-5032 comment, which inflates
-  // the total enough to hide the loss of a real lane.
-  const cachingLanes = (prWorkflow.match(/^\s*cache: pnpm\s*$/gm) ?? []).length;
+  // lanes still restore the store, so a change that dropped the restore
+  // repo-wide fails here rather than passing quietly. Count `uses:` lines with
+  // the same line anchoring as above, so prose mentions of the action in
+  // pr.yml's comments cannot inflate the total and hide the loss of a lane.
+  const restoringLanes = (
+    prWorkflow.match(/^\s*uses: \.\/\.github\/actions\/restore-pnpm-store\s*$/gm) ?? []
+  ).length;
   assert.ok(
-    cachingLanes >= 6,
-    `pr.yml should still enable the pnpm cache on the other lanes; found ${cachingLanes} ` +
-      "input lines, expected at least the 6 that exist alongside worktree_install.",
+    restoringLanes >= 6,
+    `pr.yml should still restore the pnpm store on the other lanes; found ${restoringLanes} ` +
+      "restore steps, expected at least the 6 that exist alongside worktree_install.",
   );
 });

@@ -13,7 +13,11 @@ concurrency:
 jobs:
   refresh:
     runs-on: arc-paperclip-general
-    timeout-minutes: 10
+    # 20, not 10: this job is the pnpm store's master seeder (pr.yml and
+    # master-health.yml only restore it). Over the 24 h to 2026-11-06, 4 of 32
+    # runs were cancelled at the 10-minute cap (10m06s-10m21s); the slowest
+    # success took 9m03s.
+    timeout-minutes: 20
     permissions:
       contents: write
       pull-requests: write
