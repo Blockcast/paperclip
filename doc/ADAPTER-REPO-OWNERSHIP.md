@@ -73,10 +73,18 @@ Then this repo gets a one-line follow-up repointing the references in
 
 Create `Blockcast/paperclip-adapter-claude-k8s` empty, then:
 
+> **Attended operator step — not agent work.** Since PEN-4869 the `git` egress
+> wrapper refuses `--mirror` outright: it force-updates *every* ref and deletes
+> any the local repository does not have, and there is no lease form of it to
+> narrow. Agent pods put that wrapper first on `PATH`, so an agent running this
+> is refused. Seeding a new remote from an old one is a deliberate human step —
+> run it with `/usr/bin/git` directly, outside the wrapper, the way an
+> uninitialised submodule is repaired.
+
 ```sh
-git clone --mirror https://github.com/kkroo/paperclip-adapter-claude-k8s.git
+/usr/bin/git clone --mirror https://github.com/kkroo/paperclip-adapter-claude-k8s.git
 cd paperclip-adapter-claude-k8s.git
-git push --mirror https://github.com/Blockcast/paperclip-adapter-claude-k8s.git
+/usr/bin/git push --mirror https://github.com/Blockcast/paperclip-adapter-claude-k8s.git
 ```
 
 Measured 2026-08-01, so the trade is concrete rather than hypothetical:

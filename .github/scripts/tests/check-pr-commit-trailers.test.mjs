@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   checkCommitTrailers,
   fetchAllPullRequestCommits,
+  PUSH_REMEDY,
   STRIP_COMMAND,
 } from '../check-pr-commit-trailers.mjs';
 
@@ -70,13 +71,31 @@ test('orchestrator reads commits live through the shared budget and gates on the
   assert.match(main, /\.\.\.trailerResult\.failures/);
 });
 
+test('no remedy text offers a shape the PEN-4869 egress wrapper refuses', () => {
+  // Agent pods put that wrapper first on PATH, so a refused shape here misfires
+  // for exactly the population this check writes to. Refused: `--force`/`-f`,
+  // `+<refspec>`, `--mirror`, and a BARE `--force-with-lease`. Accepted:
+  // `--force-with-lease=<ref>:<expected-sha>` with both halves non-empty.
+  const texts = [STRIP_COMMAND, PUSH_REMEDY, checkCommitTrailers([TRAILERED]).failures[0]];
+  for (const text of texts) {
+    assert.doesNotMatch(text, /--force-with-lease(?!=)/, 'bare lease is refused');
+    assert.doesNotMatch(text, /git push[^&;|]*--force(?![-\w])/, 'blind --force is refused');
+    assert.doesNotMatch(text, /--mirror\b/, '--mirror is refused');
+  }
+  // ...and the replacement is the pinned form, not merely the absence of a bare one.
+  assert.match(PUSH_REMEDY, /--force-with-lease=refs\/heads\/<branch>:<expected-sha>/);
+  // STRIP_COMMAND is executed verbatim by the test below: it must carry no push
+  // at all, so no network reaches the sandbox.
+  assert.doesNotMatch(STRIP_COMMAND, /git push/);
+});
+
 test('the remedy command in the failure message actually strips the trailers', () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'trailers-'));
   const sh = cmd => execSync(cmd, { cwd: dir, encoding: 'utf8', env: { ...process.env, FILTER_BRANCH_SQUELCH_WARNING: '1', GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
   sh('git init -q -b master && git commit -q --allow-empty -m base && git update-ref refs/remotes/origin/master HEAD');
   sh(`git commit -q --allow-empty -F - <<'M'\n${TRAILERED.commit.message}\nM`);
   sh(`git commit -q --allow-empty -F - <<'M'\n${FOOTER.commit.message}\nM`);
-  sh(STRIP_COMMAND.replace(/ && git push.*$/, ''));
+  sh(STRIP_COMMAND);
   const msgs = sh('git log --format=%B%x00 origin/master..HEAD').split('\0').filter(m => m.trim());
   assert.equal(msgs.length, 2);
   assert.equal(checkCommitTrailers(msgs.map((m, i) => commit(String(i), m))).passed, true);
