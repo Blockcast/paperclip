@@ -65,11 +65,14 @@
 //
 // ATTRIBUTION
 //
-// A failure that is already present at the BASE is INHERITED: reported in full, never
-// fatal. One that is absent at the base was INTRODUCED here and fails the PR. Pass
-// --base <ref> to enable that comparison; without it every failure is fatal, which is
-// the right shape for a local run against one tree but not for a gate. See
-// attributeInherited below for why the distinction is load-bearing.
+// A failure this PR did not cause is INHERITED: reported in full, never fatal. One this
+// PR did cause is INTRODUCED and fails it. Pass --base <ref> to enable that comparison;
+// without it every failure is fatal, which is the right shape for a local run against
+// one tree but not for a gate. See attributeInherited below for the two introduced
+// cases, and for why INHERITED is wider than "already failing on the base": an anchor
+// that RESOLVED at the base and drifted because master moved mid-run is inherited too,
+// and is reported under its own label so the output does not claim the run checked
+// something it did not.
 //
 // Usage:
 //   check-doc-line-anchors.mjs [--root <dir>] [--glob <pattern>] [--base <ref>]
@@ -332,7 +335,11 @@ export function attributeInherited(headFindings, baseSourceFindings, changed) {
     if (!FAILING.has(f.status)) return f;
     if (f.file && changed.has(f.file)) return f;
     if (changed.has(f.docPath) && !resolvedAtBase.has(key(f))) return f;
-    return { ...f, inherited: true };
+    // Both are inherited and neither is fatal, but they are not the same fact and the
+    // report must not state the stronger one. `driftedSinceBase` RESOLVED against the
+    // base source and fails only at HEAD -- master moved under a run in flight -- so
+    // "already failing on the base" would describe a check that was never made.
+    return { ...f, inherited: true, driftedSinceBase: resolvedAtBase.has(key(f)) };
   });
 }
 
@@ -374,7 +381,8 @@ function report(findings, { quiet, stale = [], inheritedStale = [] }) {
   const count = (s) => findings.filter((f) => f.status === s).length;
   const failing = findings.filter((f) => FAILING.has(f.status));
   const failures = failing.filter((f) => !f.inherited);
-  const inherited = failing.filter((f) => f.inherited);
+  const inherited = failing.filter((f) => f.inherited && !f.driftedSinceBase);
+  const driftedSinceBase = failing.filter((f) => f.inherited && f.driftedSinceBase);
 
   for (const key of stale) {
     const [doc, anchor, construct] = key.split("\t");
@@ -410,13 +418,25 @@ function report(findings, { quiet, stale = [], inheritedStale = [] }) {
 
   for (const f of failures) explain(f, "");
 
-  // Printed in full and deliberately not fatal. These were already failing on the base,
-  // so this PR is not what broke them and is usually not the change that can judge them
-  // -- but leaving them silent is how the corpus rotted in the first place.
+  // Printed in full and deliberately not fatal. This PR is not what broke them and is
+  // usually not the change that can judge them -- but leaving them silent is how the
+  // corpus rotted in the first place.
+  //
+  // Two labels, because they are two different facts and only one of them was checked
+  // against the base. Claiming the stronger one for both is what made a reader trust a
+  // statement the run never established.
+  const FIX_HINT = `\`node scripts/check-doc-line-anchors.mjs --fix\` corrects the renumberable ones`;
+  if (driftedSinceBase.length > 0) {
+    console.error(
+      `DRIFTED ON MASTER SINCE THE BASE (resolved at the base, not caused by this PR's ` +
+        `changes -- reported, not fatal; ${FIX_HINT}):`,
+    );
+    for (const f of driftedSinceBase) explain(f, "  ");
+  }
   if (inherited.length > 0 || inheritedStale.length > 0) {
     console.error(
-      `INHERITED (already failing on the base -- reported, not fatal; ` +
-        `\`node scripts/check-doc-line-anchors.mjs --fix\` corrects the renumberable ones):`,
+      `INHERITED (already failing on the base, not caused by this PR's changes -- ` +
+        `reported, not fatal; ${FIX_HINT}):`,
     );
     for (const f of inherited) explain(f, "  ");
     for (const key of inheritedStale) {
@@ -439,6 +459,9 @@ function report(findings, { quiet, stale = [], inheritedStale = [] }) {
         (loose > 0 ? ` (${loose} on a construct with several sites)` : "") +
         `, ${failures.length} need attention` +
         (inherited.length > 0 ? `, ${inherited.length} inherited from the base` : "") +
+        (driftedSinceBase.length > 0
+          ? `, ${driftedSinceBase.length} drifted on master since the base`
+          : "") +
         `, ${count("unverified")} unverified, ${externals.length} external`,
     );
   }

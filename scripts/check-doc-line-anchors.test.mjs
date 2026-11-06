@@ -362,6 +362,19 @@ test("an anchor that held against the base is inherited even when this PR edits 
   const base = [{ docPath: "d.md", start: 10, status: "ok", file: "src/a.ts" }];
   const [out] = attributeInherited(head, base, new Set(["d.md"]));
   assert.equal(out.inherited, true);
+  // ...and it is tagged as the base-OK case, so the report does not file it under
+  // "already failing on the base" -- a claim about the base that this run refutes.
+  assert.equal(out.driftedSinceBase, true);
+});
+
+test("an inherited anchor that also failed at the base is not tagged drifted-since-base", () => {
+  // The other inherited case: broken at the base too, so "already failing on the base"
+  // is the accurate label for it and the two must not share one.
+  const head = [{ docPath: "d.md", start: 10, status: "drifted", file: "src/a.ts" }];
+  const base = [{ docPath: "d.md", start: 10, status: "drifted", file: "src/a.ts" }];
+  const [out] = attributeInherited(head, base, new Set());
+  assert.equal(out.inherited, true);
+  assert.equal(out.driftedSinceBase, false);
 });
 
 test("renaming a cited file owns the citation: the old path counts as changed", async () => {

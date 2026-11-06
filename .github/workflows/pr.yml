@@ -821,6 +821,17 @@ jobs:
       # it, one merged commit moving a cited file reds `policy` on every open PR until
       # someone lands a correction -- measured on this PR's own merge-queue ejection,
       # run 42209953505. This job checks out at fetch-depth: 0, so the base resolves.
+      #
+      # On `merge_group`, PR_BASE_SHA is the merge-group base, so `base...HEAD` spans
+      # every entry queued ahead of this one -- same reason the `Select suites reachable
+      # from this diff` step gives for its own cumulative diff: PR_BASE_SHA/PR_HEAD_SHA
+      # come from the merge_group event. (No line number here on purpose; that is the
+      # failure mode this whole step exists to catch.)
+      # Drift that an earlier entry caused is therefore attributed to -- and can eject
+      # -- a later one that touched neither the source nor the document. That direction
+      # is deliberate: it fails closed, never open. Read such an ejection as the queue
+      # reporting a real anchor the combined tree broke, not as a regression of this
+      # attribution fix; re-enqueue once the earlier entry's drift is corrected.
       - name: Re-resolve docs/security source anchors (PEN-5091)
         if: ${{ !cancelled() }}
         run: node ./scripts/check-doc-line-anchors.mjs --base "$PR_BASE_SHA"
