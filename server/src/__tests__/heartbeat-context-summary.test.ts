@@ -3512,6 +3512,49 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(lookup).toBeGreaterThan(constraintHeading);
   });
 
+  // PEN-5674. The lookup sentence above tells a run WHICH row owns the artifact; it does
+  // not tell a run what to do when the write to that row is refused, and a non-assignee's
+  // write is refused (`403 deny_missing_grant`). Without the escalation hop the rule is
+  // unsatisfiable in exactly its general case, and the fallback a blocked run reaches for
+  // -- recording only on its own row -- is the one the rule opens by calling insufficient.
+  // Pinned clause by clause: each closes a distinct way the hop fails silently.
+  it("names the escalation hop for a run that cannot write to the owning row", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    // Positive control first: every assertion below is satisfiable by the surrounding
+    // section having vanished, which is the one way this case could go green reporting
+    // nothing.
+    expect(markdown).toContain("Recording a constraint:");
+    // The refusal is named by its code so a blocked run recognises what it is holding
+    // rather than reading the 403 as a bug in its own call.
+    expect(markdown).toContain("`403 deny_missing_grant`");
+    // The own-row fallback is what a blocked run does by default; the directive has to
+    // say it is not the end of the hop, not merely that it is insufficient.
+    expect(markdown).toContain("do not stop at your own row");
+    // The hop has a named recipient. Without this it degrades to "write it somewhere".
+    expect(markdown).toContain("link the owning row's assignee (or your chain of command)");
+    // The mention form is load-bearing: a bare `@Name` binds nobody and raises no wake,
+    // so a hop written that way reaches the recipient's thread and not the recipient.
+    expect(markdown).toContain("[@Name](agent://<uuid>)");
+    expect(markdown).toContain("A bare `@Name` mentions nobody.");
+    // The unreached state is the audit trail. A constraint parked on its author's row
+    // with nothing saying it never arrived is indistinguishable from one that did.
+    expect(markdown).toContain("has NOT yet reached the owning row");
+  });
+
+  // Placement, asserted rather than left to reading order. The hop is the failure branch
+  // of the lookup sentence, so it has to read after it: a run reaches the hop by having
+  // tried the write the lookup pointed it at.
+  it("places the escalation hop after the owning-row lookup it fails over from", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    const lookup = markdown.indexOf("work-products/by-external-id");
+    const hop = markdown.indexOf("`403 deny_missing_grant`");
+
+    expect(lookup).toBeGreaterThan(-1);
+    expect(hop).toBeGreaterThan(lookup);
+  });
+
   // The containment-only path -- a notice with no issue, wake comment, prReview or
   // ancestors -- renders the directive too. An earlier revision gated it out as a run
   // "structurally unable to write", which was false: every refusal the containment
