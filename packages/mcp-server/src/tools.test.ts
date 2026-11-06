@@ -361,7 +361,7 @@ describe("paperclip MCP tools", () => {
     // warns about, committed inside the warning (third instance; Ally flagged
     // the downstream echo at `c10a6df5`, CTO the rule it echoes).
     expect(description).toContain("ON UPDATE ONLY; create is NOT conditional");
-    expect(description).toContain("Create returns BOTH pairs ALWAYS");
+    expect(description).toContain("`paperclipCreateIssue` returns BOTH pairs ALWAYS");
     expect(description).toContain("does NOT transfer to create");
 
     // The split is why a careful reader is fooled: one third of the attendance
@@ -409,6 +409,47 @@ describe("paperclip MCP tools", () => {
     // And the prescribed verification must route to the surface that actually
     // hydrates, rather than to another write.
     expect(description).toContain("re-read with `paperclipGetIssue`");
+  });
+
+  // PEN-5860: PEN-5760 put the never-verify-on-a-write warning on
+  // `paperclipUpdateIssue` only. But its own central mechanism is "`POST`
+  // TRAINS THE HABIT `PATCH` BREAKS" — create is where the habit is FORMED,
+  // and create's response is the RICHER of the two: not conditional on what
+  // was written, and emitting both relation pairs unconditionally. Warning the
+  // surface where the habit fails and not the one where it forms left the
+  // formation step unannotated, and a run that only ever calls create saw no
+  // warning at all — the sole pointer was a clause inside the update tool's
+  // description. Pin the create-side text here, including the one value whose
+  // meaning INVERTS between the two surfaces.
+  it("warns on paperclipCreateIssue that its response is unhydrated and the richer of the two", () => {
+    const { description } = getTool("paperclipCreateIssue");
+
+    // Same rule, stated at the tool a create-only run actually stands at.
+    expect(description).toContain("NEVER VERIFY A WRITE BY READING ITS OWN RESPONSE");
+    expect(description).toContain("ABSENT \u2014 not `[]`, not `null`, not present-and-empty");
+
+    // The load-bearing hydrations, and the check that cannot be satisfied here.
+    expect(description).toContain("`activeRun`");
+    expect(description).toContain("`scheduledRetry`");
+    expect(description).toContain("`workProducts`");
+    expect(description).toContain("cannot be satisfied from this response at all");
+
+    // Richness is the trap: a MORE complete shape is the one that gets carried
+    // to a surface that does not return it.
+    expect(description).toContain("THIS IS THE RICHER WRITE RESPONSE, AND THAT IS THE TRAP");
+    expect(description).toContain("Create is NOT conditional on what you wrote");
+    expect(description).toContain("`POST` trains the habit `PATCH` breaks");
+
+    // `blockedBy: []` means opposite things on the two write surfaces. Create's
+    // is the API's own and truthful; `PATCH`'s is a receipt of a destructive
+    // write. Carrying either reading across is a live misread, so pin both
+    // directions rather than only the local one.
+    expect(description).toContain("ONE VALUE INVERTS BETWEEN THE TWO SURFACES");
+    expect(description).toContain("never evidence that anything went wrong");
+    expect(description).toContain("an unintended `[]` is a true receipt of a destructive write");
+
+    // Verification must route to the surface that hydrates.
+    expect(description).toContain("re-read it with `paperclipGetIssue`");
   });
 
   it("adds auth headers and run id to mutating requests", async () => {
