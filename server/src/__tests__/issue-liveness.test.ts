@@ -505,6 +505,152 @@ describe("issue graph liveness classifier", () => {
     expect(findings[0]?.state).toBe("blocked_by_cancelled_issue");
   });
 
+  describe("PEN-5851: cancelled-blocker ownership follows the row the repair writes", () => {
+    // The repair for `blocked_by_cancelled_issue` is a `blockedByIssueIds` write on the row
+    // holding the dead edge. `issue:mutate` is relationship-gated, so only that row's
+    // assignee can perform it — routing anywhere else buys a wake-and-wait round trip.
+    const cancelledBlocker = (overrides: Record<string, unknown> = {}) => issue({
+      id: blockerId,
+      identifier: "PAP-1704",
+      title: "Cancelled unblock work",
+      status: "cancelled",
+      assigneeAgentId: "blocker-agent",
+      ...overrides,
+    });
+    const blockerAgent = agent({ id: "blocker-agent", name: "Cancelled owner" });
+
+    it("routes to the edge holder's assignee rather than the cancelled blocker's chain", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [issue(), cancelledBlocker()],
+        relations: blocks,
+        agents: [agent(), manager, blockerAgent],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.state).toBe("blocked_by_cancelled_issue");
+      // Pre-fix this was `managerId` — the cancelled blocker's reporting chain, reached
+      // because `includeStalledAssignee` correctly declines to wake a cancelled row's
+      // owner and nothing then preferred the row that actually gets written.
+      expect(findings[0]?.recommendedOwnerAgentId).toBe(coderId);
+      expect(findings[0]?.recommendedOwnerCandidates[0]).toMatchObject({
+        agentId: coderId,
+        reason: "repair_target_assignee",
+        sourceIssueId: blockedId,
+      });
+      // The chain is still present behind it, so budget-blocked selection still has
+      // somewhere to fall through to.
+      expect(findings[0]?.recommendedOwnerCandidateAgentIds).toContain(managerId);
+    });
+
+    it("keeps today's fallback when the edge holder has no assignee (PEN-1746)", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          issue({ assigneeAgentId: null, createdByAgentId: null }),
+          cancelledBlocker(),
+        ],
+        relations: blocks,
+        agents: [agent(), manager, blockerAgent],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.state).toBe("blocked_by_cancelled_issue");
+      expect(findings[0]?.recommendedOwnerAgentId).toBe(managerId);
+      expect(
+        findings[0]?.recommendedOwnerCandidates.map((candidate) => candidate.reason),
+      ).not.toContain("repair_target_assignee");
+    });
+
+    it("keeps today's fallback when the edge holder's assignee is not invokable", () => {
+      const findings = classifyIssueGraphLiveness({
+        issues: [issue(), cancelledBlocker()],
+        relations: blocks,
+        agents: [agent({ status: "paused" }), manager, blockerAgent],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]?.state).toBe("blocked_by_cancelled_issue");
+      expect(findings[0]?.recommendedOwnerAgentId).toBe(managerId);
+      expect(findings[0]?.recommendedOwnerCandidateAgentIds).not.toContain(coderId);
+    });
+
+    it("names the descendant that holds the edge, not the reported source, deeper in a chain", () => {
+      // source -> middle -> cancelled. The dead edge is on `middle`, so `middle`'s
+      // assignee is the only agent who can remove it, and the action text has to say
+      // `middle` too — naming the source told the owner to edit a row whose blocker set
+      // does not contain the cancelled issue.
+      const middleId = "middle-1";
+      const middleAgentId = "middle-agent";
+
+      const findings = classifyIssueGraphLiveness({
+        issues: [
+          issue(),
+          issue({
+            id: middleId,
+            identifier: "PAP-1705",
+            title: "Middle of the chain",
+            status: "blocked",
+            assigneeAgentId: middleAgentId,
+          }),
+          cancelledBlocker(),
+        ],
+        relations: [
+          { companyId, blockerIssueId: middleId, blockedIssueId: blockedId },
+          { companyId, blockerIssueId: blockerId, blockedIssueId: middleId },
+        ],
+        agents: [agent(), manager, blockerAgent, agent({ id: middleAgentId, name: "Middle owner" })],
+      });
+
+      expect(findings).toHaveLength(1);
+      expect(findings[0]).toMatchObject({
+        issueId: blockedId,
+        state: "blocked_by_cancelled_issue",
+        recoveryIssueId: blockerId,
+        recommendedOwnerAgentId: middleAgentId,
+      });
+      expect(findings[0]?.recommendedOwnerCandidates[0]).toMatchObject({
+        agentId: middleAgentId,
+        reason: "repair_target_assignee",
+        sourceIssueId: middleId,
+      });
+      expect(findings[0]?.recommendedAction).toContain("PAP-1705's blockers");
+      expect(findings[0]?.recommendedAction).not.toContain("PAP-1703's blockers");
+    });
+
+    it("leaves the other blocker invariants' ownership untouched", () => {
+      // `blocked_by_assigned_backlog_issue` and `blocked_by_unassigned_issue` both
+      // prescribe a write on the BLOCKER, so their ownership must not move.
+      const backlog = classifyIssueGraphLiveness({
+        issues: [
+          issue(),
+          cancelledBlocker({ status: "backlog", assigneeAgentId: "blocker-agent" }),
+        ],
+        relations: blocks,
+        agents: [agent(), manager, blockerAgent],
+      });
+      expect(backlog[0]?.state).toBe("blocked_by_assigned_backlog_issue");
+      expect(backlog[0]?.recommendedOwnerAgentId).toBe("blocker-agent");
+
+      const unassigned = classifyIssueGraphLiveness({
+        issues: [
+          issue(),
+          cancelledBlocker({ status: "todo", assigneeAgentId: null }),
+        ],
+        relations: blocks,
+        agents: [agent(), manager, blockerAgent],
+      });
+      expect(unassigned[0]?.state).toBe("blocked_by_unassigned_issue");
+      expect(unassigned[0]?.recommendedOwnerAgentId).toBe(managerId);
+
+      const uninvokable = classifyIssueGraphLiveness({
+        issues: [issue(), cancelledBlocker({ status: "todo" })],
+        relations: blocks,
+        agents: [agent(), manager, agent({ id: "blocker-agent", name: "Paused", status: "paused" })],
+      });
+      expect(uninvokable[0]?.state).toBe("blocked_by_uninvokable_assignee");
+      expect(uninvokable[0]?.recommendedOwnerAgentId).toBe(managerId);
+    });
+  });
+
   it("detects blocker assignees under terminated org ancestors as uninvokable", () => {
     const findings = classifyIssueGraphLiveness({
       issues: [
