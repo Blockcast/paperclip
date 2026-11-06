@@ -540,6 +540,41 @@ function hasMergeQueueEvictionMarker(body: string | null | undefined): boolean {
   return typeof body === "string" && body.startsWith(MERGE_QUEUE_EVICTION_MARKER);
 }
 
+// PEN-5747: the label names whose placement/removal on a PR is allowed to WAKE
+// the owning issue's assignee. Everything else about a label event is still
+// recorded (see the `labeled`/`unlabeled` arm of the pull_request filter) --
+// this set gates the interrupt only, which is the whole point of the split.
+//
+// This is an ALLOWLIST, and it is the containment for the one real design risk
+// in admitting these actions: `labeled` fires for EVERY label in the repo --
+// size labels, `stale-base`, every bot label. Admitting all of them for a wake
+// would be an unbounded agent-wake amplifier, which is the same failure class
+// `isReviewGateEscalationProducer` above exists to prevent, and it is contained
+// the same way: by naming the members rather than describing them.
+//
+// It degrades safely in the direction that costs nothing. An empty set means
+// every label event still produces its work product and no run at all -- i.e.
+// exactly the `enqueued`/`dequeued` idiom, which is the behaviour this would
+// have shipped with anyway. A membership mistake cannot manufacture a wake for
+// a label nobody listed; it can only withhold one.
+//
+// One entry at ship, matching REVIEW_GATE_ESCALATION_PRODUCER_LOGIN being one
+// login. `landing-hold` is a hold placed by a human on a PR that must not
+// merge yet (PEN-4874): the placement was previously observable ONLY at its
+// lift, so merge-readiness reads and board cards were being filed on void
+// premises for a measured 2.7h-75.5h.
+const WAKE_DRIVING_PULL_REQUEST_LABELS: ReadonlySet<string> = new Set(["landing-hold"]);
+
+// GitHub label names are case-preserving but compared case-insensitively, and
+// cannot be created with leading/trailing whitespace -- normalize both anyway
+// so the allowlist is matched on the same footing as the login allowlists.
+function isWakeDrivingPullRequestLabel(name: string | null | undefined): boolean {
+  if (typeof name !== "string") return false;
+  const normalized = name.trim().toLowerCase();
+  if (normalized.length === 0) return false;
+  return WAKE_DRIVING_PULL_REQUEST_LABELS.has(normalized);
+}
+
 // BLO-23059: Claude Code Review posts its "this integration is paused/disabled"
 // org-settings notice as a FORMAL pull_request_review (state COMMENTED, commit_id
 // = current head), not as a plain comment. Measured 2026-08-07:
@@ -1294,6 +1329,26 @@ interface ResolvedEventContext {
   // work-product upsert (BLO-19566) can describe the PR's state without
   // reverse-mapping it out of wakeReason.
   prAction?: string | null;
+  // pull_request.labeled/.unlabeled only (PEN-5747). The name of the label that
+  // was placed or removed -- the single field the wake allowlist reads, and the
+  // only thing that distinguishes a `landing-hold` placement from a size label.
+  prLabelName?: string | null;
+  // pull_request events. `payload.sender.login` -- WHO performed the action, as
+  // opposed to prAuthorLogin (who opened the PR).
+  //
+  // Carried for label events specifically because it is the non-attestation
+  // detector: a hold is a claim about a PR made BY somebody, and a placement
+  // whose actor is not recorded cannot later be told apart from one that was
+  // never placed. That is precisely the defect class PEN-4874 was about, and it
+  // is the reason this belongs in the control plane rather than remaining a
+  // property only GitHub can see.
+  prSenderLogin?: string | null;
+  // pull_request events. The PR's own `state` ("open"/"closed"), distinct from
+  // the action that delivered the event. Read by the work-product status
+  // mapping, which could previously only learn about closure from
+  // `action === "closed"` -- unsound once an action a CLOSED PR can emit is
+  // admitted. See the `prState` docblock in pull-request-work-products.ts.
+  prState?: string | null;
 }
 
 // Cap review body in contextSnapshot so the heartbeat-run row stays small.
@@ -2033,6 +2088,28 @@ function resolveEventContextRaw(
       // pushing ejects it). Neither reason appears in shouldFirePrReviewerWake's
       // set, and both are added to suppressAuthorWake below, so admitting them
       // adds rows and no runs.
+      //
+      // labeled/unlabeled (PEN-5747) are admitted on the SAME idiom, with one
+      // addition. A label placement previously could not reach Paperclip by any
+      // route at all: it died here at `return null`, and the generic carriers
+      // that might have substituted (`workflow_run`, `check_run`) bind their
+      // identifiers from the branch with the uppercase-only
+      // `extractPaperclipIdentifiers`, which this fleet's lowercase branches
+      // (`pen-4874-landing-hold-marker`) never match — so they resolve to
+      // `no_paperclip_identifier` instead. `pull_request` is the one event
+      // without that defect: `collectFromPullRequest` also calls
+      // `resolveOwningPaperclipIdentifiers`, whose branch-aware tier is
+      // case-insensitive, and the previously-linked-PR fallback is gated on
+      // `eventName === "pull_request"` exactly.
+      //
+      // The addition is that these two are NOT uniformly wake-suppressed. They
+      // are suppressed BY DEFAULT and re-admitted for a wake only when the
+      // label is in WAKE_DRIVING_PULL_REQUEST_LABELS — see suppressAuthorWake
+      // below. That split is the point: RECORDING a placement is always worth
+      // it and is most of what is wanted here, while INTERRUPTING on one is
+      // narrow and must stay allowlisted. Neither reason is in
+      // shouldFirePrReviewerWake's set, so no label can ever spend a review
+      // pass regardless of the allowlist.
       if (
         action !== "opened" &&
         action !== "reopened" &&
@@ -2041,6 +2118,8 @@ function resolveEventContextRaw(
         action !== "synchronize" &&
         action !== "enqueued" &&
         action !== "dequeued" &&
+        action !== "labeled" &&
+        action !== "unlabeled" &&
         action !== "closed"
       ) return null;
       const pr = payload.pull_request as Record<string, unknown> | undefined;
@@ -2053,6 +2132,8 @@ function resolveEventContextRaw(
         synchronize: "github_pr_synchronized",
         enqueued: "github_pr_enqueued",
         dequeued: "github_pr_dequeued",
+        labeled: "github_pr_labeled",
+        unlabeled: "github_pr_unlabeled",
         closed: "github_pr_closed",
       };
       const head = pr?.head as Record<string, unknown> | undefined;
@@ -2084,6 +2165,11 @@ function resolveEventContextRaw(
         // commentBody. It bypasses clampReviewBody, so it needs the scrub here.
         prBody: redactExternalBody(pr?.body as string | undefined),
         prAction: action,
+        prState: readStringField(pr, "state"),
+        // PEN-5747. `label` is present only on labeled/unlabeled; reading it
+        // unconditionally is harmless and keeps the shape uniform.
+        prLabelName: readStringField(readNestedRecord(payload, ["label"]), "name"),
+        prSenderLogin: readStringField(readNestedRecord(payload, ["sender"]), "login"),
       };
     }
     default:
@@ -5223,6 +5309,11 @@ function githubContextMetadata(context: ResolvedEventContext) {
     // right ISSUE, but that issue's assignee is not necessarily the PR's
     // author (a `kkroo/blo-*` branch resolves to an agent's issue).
     ...(context.prAuthorLogin ? { githubPrAuthorLogin: context.prAuthorLogin } : {}),
+    // PEN-5747: a label wake that did not say WHICH label moved would be
+    // unactionable, and one that did not say WHO moved it would reproduce the
+    // non-attestation defect the placement signal exists to close.
+    ...(context.prLabelName ? { githubPrLabelName: context.prLabelName } : {}),
+    ...(context.prSenderLogin ? { githubPrSenderLogin: context.prSenderLogin } : {}),
     ...(context.identifiers.length > 0 ? { githubPaperclipIdentifiers: context.identifiers } : {}),
   };
 }
@@ -6984,6 +7075,11 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
         prMergedAt: context.prMergedAt ?? null,
         prUpdatedAt: context.prUpdatedAt ?? null,
         action: context.prAction ?? "",
+        // PEN-5747: the action alone can no longer witness closure now that a
+        // CLOSED PR can emit an admitted action (`labeled`). Without this the
+        // label event's later `updated_at` wins acceptIncoming outright and
+        // demotes a `closed` row to `ready_for_review`, permanently.
+        prState: context.prState ?? null,
         // The row is written for every issue the PR references (see the
         // targets list above), so the row alone cannot say which issue the PR
         // is actually FOR. Carry the resolved owning set onto it so consumers
@@ -7539,7 +7635,26 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       // Waking on them would add one run per PR per queue cycle (91 cycles
       // across 52 PRs in the week measured) to buy nothing.
       context.wakeReason === "github_pr_enqueued" ||
-      context.wakeReason === "github_pr_dequeued";
+      context.wakeReason === "github_pr_dequeued" ||
+      // PEN-5747: label events are evidence by default and an interrupt only by
+      // exception. Every label event has already produced its work product by
+      // the time this is read -- that upsert is unconditional on
+      // `eventName === "pull_request"` and does not consult this flag -- so
+      // suppressing here withholds the RUN and keeps the ROW, which is the
+      // whole split.
+      //
+      // The allowlist is read off the label the event itself carries, never off
+      // the labels currently on the PR: `unlabeled` must wake on the REMOVAL of
+      // `landing-hold`, at which point the PR no longer carries it. A lift is
+      // as load-bearing as a placement here -- the hold being over is exactly
+      // what a blocked row is waiting to learn.
+      //
+      // Fails CLOSED in the only direction it can: a label event whose name is
+      // unreadable (absent/empty `label.name`) is not in the allowlist, so it
+      // records and does not wake.
+      ((context.wakeReason === "github_pr_labeled" ||
+        context.wakeReason === "github_pr_unlabeled") &&
+        !isWakeDrivingPullRequestLabel(context.prLabelName));
     if (
       eventName === "pull_request" &&
       synchronizeReviewerOnly &&
@@ -8133,6 +8248,7 @@ export const __test_hasAllyConsolidatedReviewHeading = hasAllyConsolidatedReview
 export const __test_verifyGithubSignature = verifyGithubSignature;
 export const __test_resolveEventContext = resolveEventContext;
 export const __test_shouldFirePrReviewerWake = shouldFirePrReviewerWake;
+export const __test_isWakeDrivingPullRequestLabel = isWakeDrivingPullRequestLabel;
 export const __test_isReviewerSelfEchoReview = isReviewerSelfEchoReview;
 export const __test_resolvePostedReviewObservation = resolvePostedReviewObservation;
 export const __test_buildPrReviewerWakeIdempotencyKey = buildPrReviewerWakeIdempotencyKey;
