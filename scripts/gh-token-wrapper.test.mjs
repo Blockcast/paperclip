@@ -2542,10 +2542,6 @@ test("token-dated separates an initial mount from an in-life rewrite (PEN-5775)"
   });
 });
 
-// Degrading honestly matters more than degrading quietly. A plain file is not a
-// kubelet projection, so reporting its mtime as though it dated a publication
-// would reintroduce the whole defect on the one path that has no generation to
-// warn anybody off.
 // The fail-closed path, which is the one that must never quietly become a
 // claim. `stat -c %Y /proc/1` was rejected as the start-time source precisely
 // because its error direction ran INTO the overclaim branch; this pins that an
@@ -2575,6 +2571,10 @@ test("token-dated degrades when the container start time is unreadable (PEN-5775
   });
 });
 
+// Degrading honestly matters more than degrading quietly. A plain file is not a
+// kubelet projection, so reporting its mtime as though it dated a publication
+// would reintroduce the whole defect on the one path that has no generation to
+// warn anybody off.
 test("token-dated refuses to date a token file that is not a Secret mount (PEN-5775)", async () => {
   await withStubGitHub(async (apiBase) => {
     withTempDir((dir) => {
