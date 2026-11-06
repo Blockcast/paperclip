@@ -7,6 +7,7 @@ import {
   attributeInherited,
   changedSince,
   checkDocument,
+  isMainModule,
   locateConstruct,
   parseAnchorSpan,
   parseDirective,
@@ -488,4 +489,94 @@ test("the real corpus still has anchors to check, and most of them are enforced"
     findings.filter(failing).length < findings.length / 2,
     "most of the corpus is failing; the checker is probably misreading it",
   );
+});
+
+// The main-module guard decides whether this check RUNS AT ALL, so its failure mode is
+// a silent exit 0 -- a gate reporting clean without having looked. The naive
+// `file://${process.argv[1]}` comparison fails open two ways, both reproduced below.
+
+test("isMainModule: matches the direct path, rejects a different one", async () => {
+  const { fileURLToPath } = await import("node:url");
+  const self = fileURLToPath(import.meta.url);
+  assert.equal(isMainModule(self, import.meta.url), true);
+  assert.equal(isMainModule("/tmp/some-other-script.mjs", import.meta.url), false);
+});
+
+test("isMainModule: a missing argv[1] is not a match", () => {
+  // `undefined` would re-trigger the default parameter and silently test the real
+  // argv instead, so drive the falsy branch with values that do not default.
+  assert.equal(isMainModule(null, import.meta.url), false);
+  assert.equal(isMainModule("", import.meta.url), false);
+});
+
+test("isMainModule: a path needing percent-encoding still matches", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { pathToFileURL } = await import("node:url");
+  const { join } = await import("node:path");
+
+  const base = mkdtempSync(join(tmpdir(), "anchor-main-guard-"));
+  try {
+    // A space is the cheap reproducer; `pathToFileURL` encodes it as %20, so the naive
+    // string comparison against `file://${argv}` can never be true.
+    const dir = join(base, "dir with space");
+    mkdirSync(dir);
+    const script = join(dir, "s.mjs");
+    writeFileSync(script, "");
+    assert.ok(pathToFileURL(script).href.includes("%20"), "fixture did not encode");
+    assert.equal(isMainModule(script, pathToFileURL(script).href), true);
+    assert.notEqual(pathToFileURL(script).href, `file://${script}`);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("isMainModule: a symlinked argv[1] matches the real module url", async () => {
+  const { mkdtempSync, writeFileSync, symlinkSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { pathToFileURL } = await import("node:url");
+  const { join } = await import("node:path");
+
+  const base = mkdtempSync(join(tmpdir(), "anchor-main-guard-link-"));
+  try {
+    const real = join(base, "real.mjs");
+    writeFileSync(real, "");
+    const link = join(base, "link.mjs");
+    symlinkSync(real, link);
+    // Node resolves symlinks for `import.meta.url` but leaves argv[1] as typed, so the
+    // two differ as strings and only a realpath on both sides makes them agree.
+    assert.equal(isMainModule(link, pathToFileURL(real).href), true);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("the real script still runs when invoked through a symlink in an encoded path", async () => {
+  const { mkdtempSync, mkdirSync, symlinkSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const { dirname, join } = await import("node:path");
+
+  const self = fileURLToPath(import.meta.url);
+  const script = join(dirname(self), "check-doc-line-anchors.mjs");
+
+  const base = mkdtempSync(join(tmpdir(), "anchor-main-guard-e2e-"));
+  try {
+    const dir = join(base, "dir with space");
+    mkdirSync(dir);
+    const link = join(dir, "link.mjs");
+    symlinkSync(script, link);
+
+    // `--root` at a path with no documents is the cheapest deterministic non-zero: the
+    // checker refuses to judge rather than reporting clean. If the guard regresses, this
+    // comes back exit 0 with empty output -- which is the whole defect.
+    const run = spawnSync(process.execPath, [link, "--root", "/nonexistent-anchor-root"], {
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 2, `expected a refusal to judge, got ${run.status}`);
+    assert.match(`${run.stdout}${run.stderr}`, /cannot judge/);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

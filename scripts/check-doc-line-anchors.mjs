@@ -84,8 +84,9 @@
 //
 // Exit 0 clean, 1 anchors need attention, 2 cannot judge.
 
-import { readFileSync, writeFileSync, existsSync, globSync } from "node:fs";
-import { join } from "node:path";
+import { readFileSync, writeFileSync, existsSync, globSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
 const CODE_SPAN = /`([^`\n]+)`/g;
@@ -612,6 +613,28 @@ function main(argv) {
   return report(findings, { quiet, stale: introducedStale, inheritedStale }) === 0 ? 0 : 1;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Whether this module was invoked as a program, rather than imported by the tests.
+//
+// The naive `import.meta.url === \`file://${process.argv[1]}\`` FAILS OPEN, which on a
+// gate is the worst direction: the comparison is false, `main()` never runs, and the
+// process exits 0 having checked nothing. Two ways to get there, both reproduced --
+// a path needing percent-encoding (a space) never equals the encoded `import.meta.url`,
+// and under a symlink `argv[1]` is the link while `import.meta.url` is already the real
+// path. So canonicalize BOTH sides: decode the URL to a path, then resolve symlinks on
+// each. `realpathSync` throws on a path that does not exist, which is the ordinary case
+// for the unit tests, so fall back to a lexical resolve there.
+export function isMainModule(argvPath = process.argv[1], moduleUrl = import.meta.url) {
+  if (!argvPath) return false;
+  const canonical = (p) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return resolve(p);
+    }
+  };
+  return canonical(argvPath) === canonical(fileURLToPath(moduleUrl));
+}
+
+if (isMainModule()) {
   process.exit(main(process.argv.slice(2)));
 }
