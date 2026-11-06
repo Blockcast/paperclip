@@ -12,6 +12,12 @@ const lockDir = path.join(rootDir, "node_modules", ".cache", "paperclip-plugin-b
 const lockTimeoutMs = 60_000;
 const lockPollMs = 100;
 
+// CI restores these outputs from a master-seeded cache and touches them fresh
+// on an exact key hit (.github/actions/plugin-build-deps/action.yml). That key
+// hashes each target's src/, package.json and tsconfig, the tsconfig chain,
+// the install layout and this file. A target or compile input added here must
+// be added to that key too, or a stale dist passes the freshness check below;
+// scripts/__tests__/ci-cache-routing.test.mjs checks the targets.
 const buildTargets = [
   {
     name: "@paperclipai/shared",

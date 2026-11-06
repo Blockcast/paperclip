@@ -1,0 +1,74 @@
+# Master-seeded tsc output of @paperclipai/shared and @paperclipai/plugin-sdk.
+#
+# `pnpm test:run:general` and `test:run:serialized` start with
+# `pnpm --filter @paperclipai/plugin-sdk ensure-build-deps`, which compiled
+# both packages in every leg of every run: 57 s and 41 s in the two
+# server-shard logs sampled on 2026-11-05 (jobs 127055728487, 127148937846),
+# 0.5 s when its outputs were already fresh. This restores those outputs.
+#
+# EXACT KEY ONLY, AND WHY THE TOUCH IS SAFE
+#
+# The key hashes every input of both compiles: their sources, package.json and
+# tsconfig files, the tsconfig chain they extend, the install layout
+# (pnpm-lock.yaml for TypeScript, @types and zod; .npmrc; pnpm-workspace.yaml)
+# and scripts/ensure-plugin-build-deps.mjs itself. A hit means byte-identical
+# inputs, so the restored dist is what tsc would emit now. tar restores the
+# archived mtimes, which are older than this checkout's sources, and
+# ensure-plugin-build-deps.mjs accepts outputs only when they are newer than
+# src/ and the tsconfig, so a hit is touched to now. A miss rebuilds exactly as
+# before. No restore-keys: a near match would be touched into looking fresh.
+# The tsbuildinfo files are left out on purpose: ensure-plugin-build-deps.mjs
+# deletes them before every rebuild, and a tsc run that finds none compiles in
+# full.
+#
+# If either compile gains an input outside the key (another referenced
+# workspace, a new tsconfig in the chain), add it, or a stale dist passes as
+# fresh. scripts/__tests__/ci-cache-routing.test.mjs checks that the key names
+# every buildTarget of scripts/ensure-plugin-build-deps.mjs.
+#
+# WRITER
+#
+# Only a push to master, from the one leg that passes `save: true`
+# (master-health.yml, server 1/4). pull_request and merge_group runs restore
+# master's entry and never write: the save step's own condition holds whatever
+# a caller passes.
+
+name: Plugin build deps
+description: Restore the master-seeded shared and plugin-sdk tsc output. A master push seeds it.
+
+inputs:
+  save:
+    description: "'true' builds and saves the entry on a miss. It saves only on a push to master."
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Restore plugin build deps
+      id: restore
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          packages/shared/dist
+          packages/plugins/sdk/dist
+        key: plugin-build-deps-${{ runner.os }}-${{ hashFiles('packages/shared/src/**', 'packages/shared/package.json', 'packages/shared/tsconfig.json', 'packages/plugins/sdk/src/**', 'packages/plugins/sdk/package.json', 'packages/plugins/sdk/tsconfig.json', 'tsconfig.base.json', 'tsconfig.json', 'pnpm-lock.yaml', '.npmrc', 'pnpm-workspace.yaml', 'scripts/ensure-plugin-build-deps.mjs') }}
+
+    - name: Mark restored plugin build deps fresh
+      if: steps.restore.outputs.cache-hit == 'true'
+      shell: bash
+      run: find packages/shared/dist packages/plugins/sdk/dist -type f -exec touch {} +
+
+    - name: Build plugin build deps
+      if: inputs.save == 'true' && steps.restore.outputs.cache-hit != 'true'
+      shell: bash
+      run: pnpm --filter @paperclipai/plugin-sdk ensure-build-deps
+
+    - name: Save plugin build deps
+      if: inputs.save == 'true' && steps.restore.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          packages/shared/dist
+          packages/plugins/sdk/dist
+        key: ${{ steps.restore.outputs.cache-primary-key }}

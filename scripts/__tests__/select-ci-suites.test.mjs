@@ -519,6 +519,63 @@ test("the selection shell step skips on the literal 'false' only, per group", ()
   assert.equal(run("some-future-group", all("false")), "run=true", "an unknown group always runs");
 });
 
+// typecheck_release_registry and build feed `verify`, so they skip by step, never
+// by job, and only on pull_request: merge_group always runs them on the merged
+// tree. They read the release dry run's output, which already gates Canary.
+test("typecheck and build skip their steps only on a pull_request the release build cannot reach", () => {
+  for (const name of ["typecheck_release_registry", "build"]) {
+    const block = jobBlock(name);
+    assert.doesNotMatch(block, /\n    if:/, `${name}: a job-level if reads as a skipped lane and fails verify`);
+    const steps = block.split("\n      - name: ").slice(1);
+    assert.ok(steps.length >= 6, `${name}: job slice looks truncated`);
+    assert.match(steps[0], /^Resolve whether this diff can reach this lane\n        id: select\n/, `${name}: selection must come first`);
+    for (const step of steps.slice(1)) {
+      assert.match(
+        step,
+        /\n        if: steps\.select\.outputs\.run == 'true'/,
+        `${name}: step '${step.split("\n")[0]}' must be gated on the selection`,
+      );
+    }
+    const script = steps[0].match(/run: \|\n((?:          [^\n]*\n|\n)+)/)[1].replace(/^ {10}/gm, "");
+    const run = (env) => {
+      const dir = mkdtempSync(path.join(tmpdir(), "select-lane-step-"));
+      const out = path.join(dir, "out");
+      writeFileSync(out, "");
+      const result = spawnSync("bash", ["-c", script], {
+        env: { PATH: process.env.PATH, GITHUB_OUTPUT: out, ...env },
+        encoding: "utf8",
+      });
+      const output = readFileSync(out, "utf8").trim();
+      rmSync(dir, { recursive: true, force: true });
+      assert.equal(result.status, 0, result.stderr);
+      return output;
+    };
+    assert.equal(run({ EVENT_NAME: "pull_request", RELEASE_DRY_RUN_NEEDED: "false" }), "run=false");
+    for (const value of ["true", "", "TRUE", "0", "null"]) {
+      assert.equal(run({ EVENT_NAME: "pull_request", RELEASE_DRY_RUN_NEEDED: value }), "run=true", `'${value}' must run ${name}`);
+    }
+    for (const event of ["merge_group", "push", ""]) {
+      assert.equal(run({ EVENT_NAME: event, RELEASE_DRY_RUN_NEEDED: "false" }), "run=true", `${event || "no event"} must run ${name}`);
+    }
+  }
+});
+
+// The group must trace what these lanes run, not only what release.sh runs:
+// otherwise a file only a lane's own tests read stays relevant by accident.
+test("the release group traces every root script the typecheck and build lanes run", () => {
+  const ctx = realContext();
+  const group = groupDefinitions(ctx.workspaces, vitestProjectDirs(repoRoot)).release_dry_run_needed;
+  const laneScripts = ["typecheck_release_registry", "build"].flatMap((name) =>
+    [...jobBlock(name).matchAll(/\n        run: pnpm (?:run )?(\w[\w:-]*)/g)].map((m) => m[1]).filter((s) => s !== "install"),
+  );
+  assert.ok(laneScripts.includes("test:release-registry") && laneScripts.includes("build"), "lane slicing broke");
+  for (const script of laneScripts) assert.ok(group.rootScripts.includes(script), `release_dry_run_needed must trace \`${script}\``);
+  // Read by scripts/publish-penstock-scope.test.js (test:release-registry); before
+  // that script was traced, only an unrelated `.github/workflows` directory
+  // reference kept the file relevant.
+  assert.ok(computeReach(ctx, group).refs.has(".github/workflows/release-penstock-scope.yml"));
+});
+
 test("e2e and canary are skipped at job level, and verify neither needs nor reclassifies them", () => {
   // The selector's literal-'false' clause opens each job-level `if:`. The
   // merge-group heavy-lane trim ANDs a merge_group-only conjunct after it;

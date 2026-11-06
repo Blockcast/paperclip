@@ -345,10 +345,23 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: pnpm
+
+      # Restore-only, as in pr.yml: refresh-lockfile.yml and
+      # playwright-cache-prime.yml are the pnpm store's only writers
+      # (.github/actions/restore-pnpm-store/action.yml).
+      - name: Restore pnpm store
+        uses: ./.github/actions/restore-pnpm-store
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      # The one writer of the plugin build deps cache that pr.yml's General
+      # tests restore: on a push to master, server 1/4 builds and saves it when
+      # its restore missed (.github/actions/plugin-build-deps/action.yml).
+      - name: Restore or seed plugin build deps
+        uses: ./.github/actions/plugin-build-deps
+        with:
+          save: ${{ matrix.shard_index == 0 }}
 
       - name: Run grouped general test suites
         run: |
@@ -398,10 +411,15 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: pnpm
+
+      - name: Restore pnpm store
+        uses: ./.github/actions/restore-pnpm-store
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: Restore plugin build deps
+        uses: ./.github/actions/plugin-build-deps
 
       - name: Run grouped general test suites
         run: pnpm test:run:general -- --group '${{ matrix.group }}'

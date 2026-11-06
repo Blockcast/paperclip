@@ -1,0 +1,68 @@
+# Restore-only pnpm store for pr.yml and master-health.yml.
+#
+# WHY NOT setup-node's `cache: pnpm`
+#
+# That input restores AND saves: setup-node's post-step re-uploads the whole
+# ~0.8 GB store whenever its restore did not return the exact key, on every
+# event, with no timeout. Over the 24 h to 2026-11-06 the org's cache server
+# logged ~900 restores and 167 saves of the master lockfile key
+# (node-cache-Linux-x64-pnpm-8c3995550fa4...). In the sampled logs a restore
+# dies mid-download with "Failed to restore: Premature close", the install runs
+# cold (4-7 min), and the post-step then uploads the store into a
+# `refs/pull/N/merge` or single-use `gh-readonly-queue/*` scope that no later
+# run reads. 3 of 14 sampled heavy jobs were cancelled inside that upload after
+# every work step had passed (Typecheck run 41949882952, merge-queue Build job
+# 127359994567, Canary run 42097179337), and `verify` fails on a cancelled
+# lane. PEN-5032 removed the input from worktree_install for the same reason.
+#
+# WHO WRITES THE STORE
+#
+# Not pr.yml or master-health.yml. On master, refresh-lockfile.yml (every
+# push: restore, `pnpm fetch`, save when absent) and playwright-cache-prime.yml
+# (lockfile pushes) seed it. Workflows that keep setup-node's `cache: pnpm`
+# save the same key too: release.yml and sdk-publish-drift.yml on master,
+# stack-package-tests.yml, sandbox-provider-tests.yml and storybook-visual.yml
+# into their pull_request scope. Every scope reads master's entries.
+# actions/cache versions an entry by its path string and compression, so the
+# path and key below must stay byte-identical to refresh-lockfile.yml's, and
+# both must run the same pnpm, or every lane misses master's entry and installs
+# cold. scripts/__tests__/ci-cache-routing.test.mjs compares the two.
+#
+# Callers check out the repo and run setup-pnpm and setup-node first:
+# `pnpm store path` and `node` resolve the store path and the arch.
+
+name: Restore pnpm store
+description: Restore the master-seeded pnpm store, retrying once. Never saves.
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve pnpm store cache
+      id: pnpm-cache
+      shell: bash
+      run: |
+        echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+        echo "arch=$(node -p 'process.arch')" >> "$GITHUB_OUTPUT"
+
+    # Exact key only. The cache server searches the job's own scope, prefix
+    # matches included, before master, so a restore-keys prefix here would pick
+    # a store an older pull_request run left in this PR's scope over master's
+    # entry for this lockfile.
+    - name: Restore pnpm store
+      id: pnpm-cache-restore
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.pnpm-cache.outputs.path }}
+        key: node-cache-${{ runner.os }}-${{ steps.pnpm-cache.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+
+    # Nothing restored: no entry for this lockfile (`policy` regenerated it),
+    # or a download that stalled. The retry also accepts an older store, so
+    # `pnpm install` fetches only the delta; after a second failure it fetches
+    # from the registry as before.
+    - name: Retry pnpm store restore
+      if: steps.pnpm-cache-restore.outputs.cache-matched-key == ''
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.pnpm-cache.outputs.path }}
+        key: node-cache-${{ runner.os }}-${{ steps.pnpm-cache.outputs.arch }}-pnpm-${{ hashFiles('pnpm-lock.yaml') }}
+        restore-keys: node-cache-${{ runner.os }}-${{ steps.pnpm-cache.outputs.arch }}-pnpm-

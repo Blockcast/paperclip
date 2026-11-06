@@ -1812,14 +1812,40 @@ jobs:
     timeout-minutes: 50
 
     steps:
+      # Path-scoped on pull_request only. The job always runs and reports, so
+      # `verify` sees this lane succeed; when policy's selector
+      # (scripts/select-ci-suites.mjs) finds no changed path that can reach the
+      # workspace build, every step below is skipped. That is its
+      # `release_dry_run_needed` output, the one Canary Dry Run already skips
+      # on: every workspace, every script, every root file that is not prose,
+      # pr.yml, .github/actions, patches/, and every file a closure source
+      # names. Over the 24 h to 2026-11-06, 7 of 45 pull_request runs ran this
+      # lane and Build in full on such a diff (23,339 CPU-seconds). Only the
+      # literal 'false' skips, so a selector fault or an empty output runs the
+      # lane, and merge_group always runs it on the merged tree.
+      - name: Resolve whether this diff can reach this lane
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_DRY_RUN_NEEDED: ${{ needs.policy.outputs.release_dry_run_needed }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$RELEASE_DRY_RUN_NEEDED" = "false" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Typecheck + Release Registry skipped::policy's path selector found no changed path that can reach the workspace build (release_dry_run_needed; see its 'Select suites reachable from this diff' step). The merge group runs this lane in full."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.select.outputs.run == 'true'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Setup pnpm
+        if: steps.select.outputs.run == 'true'
         uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
-        if: needs.policy.outputs.lockfile_regenerated == '1'
+        if: steps.select.outputs.run == 'true' && needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -1827,21 +1853,32 @@ jobs:
           path: .
 
       - name: Setup Node.js
+        if: steps.select.outputs.run == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: pnpm
+
+      # Restore-only: no job in this workflow writes the pnpm store. See
+      # .github/actions/restore-pnpm-store/action.yml for why setup-node's
+      # `cache: pnpm` is gone.
+      - name: Restore pnpm store
+        if: steps.select.outputs.run == 'true'
+        uses: ./.github/actions/restore-pnpm-store
 
       - name: Install dependencies
+        if: steps.select.outputs.run == 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Typecheck workspaces whose build scripts skip TypeScript
+        if: steps.select.outputs.run == 'true'
         run: pnpm run typecheck:build-gaps
 
       - name: Check server tests for undefined identifiers
+        if: steps.select.outputs.run == 'true'
         run: pnpm run check:test-undefined-symbols
 
       - name: Test undefined-identifier guard failure modes
+        if: steps.select.outputs.run == 'true'
         run: node --test scripts/check-test-undefined-symbols.test.mjs
 
       # PEN-5272. This one is registered HERE, not in `policy`, because it
@@ -1849,6 +1886,7 @@ jobs:
       # -- registering it there would fail on ERR_MODULE_NOT_FOUND rather than
       # on anything about the extractor.
       - name: Test proposed-telemetry extractor (PEN-5272)
+        if: steps.select.outputs.run == 'true'
         run: node --test scripts/extract-proposed-events.test.mjs
 
       # BLO-38582: server's `typecheck` script runs this config, but NOTHING on
@@ -1866,9 +1904,11 @@ jobs:
       # `typecheck:tests` rather than inlined here, so the invocation has ONE
       # definition that this step and server's own `typecheck` both reach.
       - name: Typecheck allowlisted server tests
+        if: steps.select.outputs.run == 'true'
         run: pnpm --filter @paperclipai/server run typecheck:tests
 
       - name: Verify release registry test coverage
+        if: steps.select.outputs.run == 'true'
         run: pnpm run test:release-registry
 
   worktree_install:
@@ -1928,10 +1968,11 @@ jobs:
           name: pr-lockfile
           path: .
 
-      # PEN-5032: deliberately NO `cache: pnpm` on this lane, unlike every other
-      # `Setup Node.js` in this workflow. The cache POST-step is what kills this
-      # job. `actions/setup-node` saves the pnpm store in a post-step and
-      # exposes no timeout on it, so there is nothing to bound in place.
+      # PEN-5032: deliberately NO `cache: pnpm` on this lane, and unlike the
+      # other lanes no restore-only `Restore pnpm store` step either (see
+      # below). The cache POST-step is what kills this job. `actions/setup-node`
+      # saves the pnpm store in a post-step and exposes no timeout on it, so
+      # there is nothing to bound in place.
       #
       # Measured on merge-queue head c9021a88 (PR #3105, run 40897060922, job
       # 123533129683): every substantive step passed -- including `Assert the
@@ -2146,7 +2187,10 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: pnpm
+
+      - name: Restore pnpm store
+        if: steps.trim.outputs.run == 'true'
+        uses: ./.github/actions/restore-pnpm-store
 
       - name: Install dependencies
         if: steps.trim.outputs.run == 'true'
@@ -2366,11 +2410,21 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: pnpm
+
+      - name: Restore pnpm store
+        if: steps.select.outputs.run == 'true'
+        uses: ./.github/actions/restore-pnpm-store
 
       - name: Install dependencies
         if: steps.select.outputs.run == 'true'
         run: pnpm install --frozen-lockfile
+
+      # The suite scripts compile @paperclipai/shared and plugin-sdk first
+      # (ensure-build-deps, 41-57 s per leg). master-health.yml seeds that
+      # output on master; a hit makes the compile a 0.5 s freshness check.
+      - name: Restore plugin build deps
+        if: steps.select.outputs.run == 'true'
+        uses: ./.github/actions/plugin-build-deps
 
       - name: Run grouped general test suites
         if: steps.select.outputs.run == 'true'
@@ -3144,14 +3198,31 @@ jobs:
     timeout-minutes: 25
 
     steps:
+      # The same pull_request-only path-scoped skip as
+      # typecheck_release_registry above; merge_group always builds.
+      - name: Resolve whether this diff can reach this lane
+        id: select
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_DRY_RUN_NEEDED: ${{ needs.policy.outputs.release_dry_run_needed }}
+        run: |
+          if [ "$EVENT_NAME" = "pull_request" ] && [ "$RELEASE_DRY_RUN_NEEDED" = "false" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Build skipped::policy's path selector found no changed path that can reach the workspace build (release_dry_run_needed; see its 'Select suites reachable from this diff' step). The merge group runs this lane in full."
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout repository
+        if: steps.select.outputs.run == 'true'
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       - name: Setup pnpm
+        if: steps.select.outputs.run == 'true'
         uses: ./.github/actions/setup-pnpm
 
       - name: Restore regenerated PR lockfile (if policy uploaded one)
-        if: needs.policy.outputs.lockfile_regenerated == '1'
+        if: steps.select.outputs.run == 'true' && needs.policy.outputs.lockfile_regenerated == '1'
         uses: actions/download-artifact@v4
         continue-on-error: true
         with:
@@ -3159,15 +3230,21 @@ jobs:
           path: .
 
       - name: Setup Node.js
+        if: steps.select.outputs.run == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: pnpm
+
+      - name: Restore pnpm store
+        if: steps.select.outputs.run == 'true'
+        uses: ./.github/actions/restore-pnpm-store
 
       - name: Install dependencies
+        if: steps.select.outputs.run == 'true'
         run: pnpm install --frozen-lockfile
 
       - name: Build
+        if: steps.select.outputs.run == 'true'
         run: pnpm build
 
   canary_dry_run:
@@ -3218,7 +3295,9 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 24
-          cache: pnpm
+
+      - name: Restore pnpm store
+        uses: ./.github/actions/restore-pnpm-store
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -3414,7 +3493,9 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: 22
-          cache: pnpm
+
+      - name: Restore pnpm store
+        uses: ./.github/actions/restore-pnpm-store
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
@@ -3425,9 +3506,12 @@ jobs:
           version="$(node -p "require('@playwright/test/package.json').version")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
+      # Restore-only. playwright-cache-prime.yml saves this key on master, which
+      # every scope reads; a save from here would land in a refs/pull/N/merge
+      # or single-use gh-readonly-queue/* scope that no later run reads.
       - name: Cache Playwright browser
         id: playwright_cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ steps.playwright_version.outputs.version }}
