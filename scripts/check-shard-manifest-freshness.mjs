@@ -20,10 +20,18 @@
  *     90%) so ordinary one-or-two-suite drift can no longer cascade. It
  *     always prints formatMissingSuitesDiagnostic() as a warning even when
  *     it doesn't fail.
- *   - scripts/check-shard-manifest-freshness.test.mjs asserts
- *     strict 100% coverage and is wired into .github/workflows/pr.yml with
- *     continue-on-error, so it stays visible (a real red X on its own step,
- *     naming every missing suite and the fix) without failing `policy`.
+ *   - scripts/report-shard-manifest-freshness.mjs reports strict 100%
+ *     coverage as a `::warning::` and always exits 0, so drift stays visible
+ *     -- every missing suite named, with the fix -- without failing `policy`.
+ *
+ * PEN-5700: that reporter replaced a `node --test` step run under
+ * `continue-on-error: true`, which this header used to describe as leaving "a
+ * real red X on its own step". It does not. `continue-on-error` sets the step's
+ * CONCLUSION to `success` and does not suppress the `##[error]` the runner
+ * mints for a non-zero exit, so the step was green while writing a full
+ * ERR_ASSERTION diff into the `policy` log. Four readers in two days took that
+ * for their job's real failure. A non-blocking step has to actually SUCCEED to
+ * stop spelling itself like a failure, which is why the reporter exits 0.
  */
 
 export const HARD_FAIL_COVERAGE_FLOOR = 0.75;

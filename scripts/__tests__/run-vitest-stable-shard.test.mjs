@@ -168,9 +168,11 @@ test("a missing or malformed manifest degrades to uniform weights", () => {
 // typecheck, e2e and every test lane over a single missing JSON entry. The
 // floor here is now HARD_FAIL_COVERAGE_FLOOR (well below 90%), so a suite or
 // two of ordinary drift can no longer cascade. Whether coverage is complete
-// is separately, precisely asserted (with the missing suites named) in
-// check-shard-manifest-freshness.test.mjs, wired into pr.yml with
-// continue-on-error so that assertion stays visible without blocking.
+// is separately, precisely reported (with the missing suites named) by
+// scripts/report-shard-manifest-freshness.mjs, which pr.yml runs as a
+// `::warning::` reporter that always exits 0 -- visible without blocking, and
+// without the `##[error]` that a continue-on-error test step used to mint from
+// a green step (PEN-5700).
 test("the checked-in manifest loads and covers most of the current suite set", () => {
   const durations = loadShardDurations(durationsManifest);
   assert.ok(Object.keys(durations).length > 0, "manifest must parse to a non-empty duration map");
