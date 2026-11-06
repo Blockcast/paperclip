@@ -1,6 +1,6 @@
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, approvalComments, approvals, budgetIncidents, budgetPolicies, issueApprovals } from "@paperclipai/db";
+import { agents, approvalComments, approvalPayloadRevisions, approvals, budgetIncidents, budgetPolicies, issueApprovals } from "@paperclipai/db";
 import { APPROVAL_UNDECIDED_STATUSES } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
@@ -286,9 +286,24 @@ export function approvalService(db: Db) {
   }
 
   return {
+    /**
+     * ⚠️ `ORDER BY created_at` is load-bearing, not tidiness (PEN-5766).
+     *
+     * This view carried no ORDER BY at all, so Postgres was free to return rows in
+     * heap order — and an UPDATE writes a NEW tuple version, which relocates the row
+     * within the heap. That made a card's position in this response a function of
+     * when it was last written, which is exactly the property an in-place payload
+     * edit must not disturb. Preserving `created_at` across an edit (which the edit
+     * does) would have preserved nothing a reader of THIS view could see.
+     *
+     * So the ordering is now explicit and matches `listSummary`, and the queue is
+     * FIFO by filing time on both views. Removing it does not merely change
+     * presentation: it re-opens the way an edit can move a card past cards that have
+     * waited longer, which is the defect the edit route exists to close.
+     */
     list: (companyId: string, filters?: string | ApprovalListFilters) => {
       const conditions = approvalListConditions(companyId, normalizeListFilters(filters));
-      return db.select().from(approvals).where(and(...conditions));
+      return db.select().from(approvals).where(and(...conditions)).orderBy(asc(approvals.createdAt));
     },
 
     /**
@@ -732,6 +747,106 @@ export function approvalService(db: Db) {
         return updated;
       });
     },
+
+    /**
+     * Correct a PENDING card's payload in place, preserving its queue position.
+     *
+     * The caller-facing rules (requester-only, pending-only, gate-immutable,
+     * create-equivalent revalidation) are enforced in `routes/approvals.ts`, which
+     * is where the HTTP refusal shapes live. What is enforced HERE is the part that
+     * must be transactional:
+     *
+     *   - the prior payload is archived BEFORE it is overwritten, so no edit can
+     *     lose the text a decider may already have read;
+     *   - the UPDATE is guarded on BOTH `status = 'pending'` and the
+     *     `payload_revision` the caller read, so a board decision or a second
+     *     concurrent edit landing in between loses the race as a refusal rather
+     *     than silently overwriting (the same lost-update discipline `resubmit` and
+     *     `withdraw` use above);
+     *   - `createdAt` is never in the SET clause. That is the whole point of the
+     *     route: the withdraw-and-refile it replaces minted a fresh `created_at`,
+     *     and service is measurably recency-skewed, so re-filing for accuracy took
+     *     position from older cards (PEN-3918 cmt `d00b4081` §4, PEN-5766).
+     */
+    updatePayload: async (
+      id: string,
+      payload: Record<string, unknown>,
+      actor: { agentId?: string | null; userId?: string | null },
+    ) => {
+      return db.transaction(async (tx) => {
+        const txDb = tx as unknown as Db;
+        const existing = await getExistingApproval(id, txDb);
+        if (existing.status !== "pending") {
+          throw conflict("Only pending approvals can have their payload edited", {
+            approvalId: id,
+            status: existing.status,
+            allowedStatuses: ["pending"],
+          });
+        }
+
+        const priorRevision = existing.payloadRevision ?? 0;
+        const now = new Date();
+
+        // Archive first. If the guarded UPDATE below loses its race the whole
+        // transaction rolls back, so this never leaves an archived revision
+        // describing an edit that did not happen.
+        await txDb.insert(approvalPayloadRevisions).values({
+          companyId: existing.companyId,
+          approvalId: existing.id,
+          revision: priorRevision,
+          payload: existing.payload,
+          editedByAgentId: actor.agentId ?? null,
+          editedByUserId: actor.userId ?? null,
+        });
+
+        const updated = await txDb
+          .update(approvals)
+          .set({
+            payload,
+            payloadRevision: priorRevision + 1,
+            payloadEditedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(approvals.id, id),
+              eq(approvals.status, "pending"),
+              eq(approvals.payloadRevision, priorRevision),
+            ),
+          )
+          .returning()
+          .then((rows) => rows[0] ?? null);
+
+        if (!updated) {
+          const latest = await getExistingApproval(id, txDb);
+          throw conflict(
+            latest.status === "pending"
+              ? "Approval payload changed while this edit was in flight; re-read the card and retry"
+              : "Only pending approvals can have their payload edited",
+            {
+              approvalId: id,
+              status: latest.status,
+              expectedPayloadRevision: priorRevision,
+              currentPayloadRevision: latest.payloadRevision ?? 0,
+              allowedStatuses: ["pending"],
+            },
+          );
+        }
+
+        return updated;
+      });
+    },
+
+    /**
+     * Superseded payloads, oldest first. `payload` on each row is the value as it
+     * stood BEFORE the edit that archived it; the live one is on the approval.
+     */
+    listPayloadRevisions: (approvalId: string) =>
+      db
+        .select()
+        .from(approvalPayloadRevisions)
+        .where(eq(approvalPayloadRevisions.approvalId, approvalId))
+        .orderBy(asc(approvalPayloadRevisions.revision)),
 
     withdraw: async (
       id: string,
