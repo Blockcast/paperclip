@@ -9,6 +9,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -1510,10 +1511,17 @@ async function withStubGitHub(fn) {
 // pod is the live fleet credential — and this subcommand would then probe real
 // GitHub with it. tokenFilePath lets a caller supply a path it built itself
 // (the mount-generation test needs a kubelet-shaped directory).
-function runAuthCheck(dir, { tokenFileContent, tokenValue, tokenFilePath, apiBase, mode, mcpProxyUrl } = {}) {
+function runAuthCheck(
+  dir,
+  { tokenFileContent, tokenValue, tokenFilePath, apiBase, mode, mcpProxyUrl, containerStart } = {},
+) {
   const env = sanitizedEnv({});
   if (apiBase !== undefined) env.GH_TOKEN_WRAPPER_API_BASE = apiBase;
   if (tokenValue !== undefined) env.GH_SEAT_TOKEN_VALUE = tokenValue;
+  // PEN-5775: pins this container's PID 1 start time, which the subcommand
+  // otherwise reads off /proc/1. Both branches of `token-dated` are then
+  // reachable deterministically, and on a host without /proc as well.
+  if (containerStart !== undefined) env.GH_TOKEN_WRAPPER_CONTAINER_START = String(containerStart);
   // PEN-5641: always pinned, never left to the compiled-in loopback default.
   // The default probes :80 of this host, so an unrelated listener there — or
   // a real token proxy, inside an agent pod — would decide the mcp-channel
@@ -2440,6 +2448,71 @@ test("the mount-generation line carries its own not-evidence-of-publication cave
 
 // ...and only where there is a generation to qualify. "-" means this token is
 // not a Secret mount at all, so a caveat about the mount stamp is noise.
+// PEN-5775. PEN-5730 took `mount-generation` out of the decision because it is
+// a property of the OBSERVER. That fixes the wrong verdicts, but the sha alone
+// can only ever report "unchanged" -- it cannot report that a publication
+// HAPPENED. The constructive form can: a pod's FIRST mount is a direct read of
+// the Secret at that instant, so (container start, sha) dates the content. A
+// later re-read of an unchanged mount does not, because kubelet's sync period
+// cannot tell "nothing was published" from "I cannot see it yet". That
+// asymmetry is what let the Engineer prove, on PEN-5726, that an 11:10:09Z mint
+// was never published -- banking an 11:13:32Z initial mount and explicitly
+// refusing their own 11:21:05Z re-read -- settling a dilemma two other agents
+// could not close. Pinned here because it is the branch that triggers
+// escalations, and prose is what drifted the last two times.
+test("token-dated separates an initial mount from an in-life rewrite (PEN-5775)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const generation = `..2026_11_06_19_41_18.${Date.now()}`;
+      mkdirSync(path.join(dir, generation));
+      const payload = path.join(dir, generation, "token");
+      writeFileSync(payload, `${AUTH_CHECK_VALID_TOKEN}\n`);
+      symlinkSync(generation, path.join(dir, "..data"));
+      symlinkSync(path.join("..data", "token"), path.join(dir, "token"));
+      const tokenFilePath = path.join(dir, "token");
+      const mountedAt = Math.floor(statSync(payload).mtimeMs / 1000);
+
+      // kubelet materialises the volume BEFORE the container starts, so an
+      // initial mount always predates PID 1 -- measured at 16s on the agent
+      // image, where the generation dir was stamped 19:41:18 and /proc/1 at
+      // 19:41:34. This is the reading that dates the Secret's content.
+      const initial = runAuthCheck(dir, { tokenFilePath, apiBase, containerStart: mountedAt + 16 });
+      assert.match(initial.stdout, /token-dated:\s+INITIAL MOUNT/);
+      assert.match(initial.stdout, /genuine publication probe/);
+
+      // The other case: kubelet rewrites a projection only when the content it
+      // projects changed (PEN-5730's within-pod control measured the stamp
+      // holding still for 17m43s), so a rewrite during the pod's life dates the
+      // content too -- to mount-written, not to now.
+      const rewritten = runAuthCheck(dir, { tokenFilePath, apiBase, containerStart: mountedAt - 525 });
+      assert.match(rewritten.stdout, /token-dated:\s+IN-LIFE REWRITE/);
+      assert.doesNotMatch(rewritten.stdout, /INITIAL MOUNT/);
+
+      // The load-bearing half, and it must hold in BOTH branches: neither
+      // reading dates the credential to the moment the check was run.
+      for (const proc of [initial, rewritten]) {
+        assert.match(proc.stdout, /dated to mount-written, NEVER to the moment you ran/);
+        assert.equal(proc.status, 0);
+      }
+    });
+  });
+});
+
+// Degrading honestly matters more than degrading quietly. A plain file is not a
+// kubelet projection, so reporting its mtime as though it dated a publication
+// would reintroduce the whole defect on the one path that has no generation to
+// warn anybody off.
+test("token-dated refuses to date a token file that is not a Secret mount (PEN-5775)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
+      assert.match(proc.stdout, /token-dated:\s+NOT A KUBELET PROJECTION/);
+      assert.match(proc.stdout, /says nothing about a Secret publication/);
+      assert.match(proc.stdout, /mount-generation:\s+-$/m);
+    });
+  });
+});
+
 test("a token that is not a Secret mount gets no generation caveat (PEN-5730)", async () => {
   await withStubGitHub(async (apiBase) => {
     withTempDir((dir) => {
