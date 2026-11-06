@@ -5238,9 +5238,10 @@ export function issueRoutes(
         `Ask agent://${input.assigneeAgentId} to @-mention you here: that grants comment access on its own, ` +
         `in one act, and is derived live, so it takes effect immediately. Re-declaring the dependency is NOT ` +
         `a substitute — an unchanged edge keeps its original creator stamp, so re-sending the same blocker ` +
-        `set changes nothing, and the opposite edge is refused as a blocking cycle. Re-stamping is possible ` +
-        `but takes two writes, by a principal with standing on this issue who can also write the blocker set ` +
-        `that holds the edge; for an edge on your own issue's blocker set that is a board user.`
+        `set changes nothing. Inverting the edge is not a remedy either: it records a dependency that ` +
+        `does not hold. Re-stamping is possible but takes two writes, by a principal with standing on ` +
+        `this issue who can also write the blocker set that holds the edge; for an edge on your own ` +
+        `issue's blocker set that is a board user.`
       );
     }
     return (

@@ -2997,7 +2997,10 @@ describe("agent issue mutation checkout ownership", () => {
       expect(remediation).toMatch(/mention/i);
       expect(remediation).toContain(`agent://${ownerAgentId}`);
       // The false promise must stay gone: re-declaring the edge is a no-op on
-      // one shape and a cycle 422 on the other, so it is not the remedy.
+      // one shape, and on the other it inverts the edge — recording a
+      // dependency that does not hold. Neither is the remedy. (The inverse
+      // also trips the cycle guard while the actor's edge stands, but that is
+      // incidental and lapses with the edge, so it is not the reason given.)
       expect(remediation).not.toMatch(/declare the same dependency from their side/i);
       // Says why the guard exists, so the next reader does not "fix" it by
       // deleting the creator conjunct — which is the self-grant hole.
