@@ -321,6 +321,56 @@ describe("paperclip MCP tools", () => {
     },
   );
 
+  // PEN-5760: the write response is not a stable projection. It is the bare DB
+  // row plus whatever subsystems the request engaged, so its top-level key set
+  // varies BY REQUEST — and the fleet's standing habit is "read the response
+  // back to confirm the write landed". Applied to a hydrated field that habit
+  // reads a key this surface was never going to carry, and scores it null.
+  // Measured 2026-11-06 on one row: read route 85 top-level keys, a
+  // `priority`-only PATCH 66; a `description` PATCH on the SAME row carried
+  // `relatedWork` the `priority` one omitted. The conditionality is the point —
+  // "remember which fields are missing" is unsound because there is no fixed
+  // shape to remember — so assert the rule, not an omission list.
+  it("warns that the write response is a conditional, unhydrated projection", () => {
+    const { description } = getTool("paperclipUpdateIssue");
+
+    // The rule is never-verify-on-a-write, not remember-the-omissions.
+    expect(description).toContain("NEVER VERIFY A WRITE BY READING ITS OWN RESPONSE");
+    expect(description).toContain("KEY SET VARIES FROM CALL TO CALL");
+    expect(description).toContain("Learning the response shape once, from any single write, is UNSOUND");
+
+    // Absence must not be readable as emptiness.
+    expect(description).toContain("ABSENT \u2014 not `[]`, not `null`, not present-and-empty");
+
+    // The load-bearing fields, each named with what breaks when it is read off
+    // a write. These are the ones a run acts on, not the full omission list.
+    expect(description).toContain("`activeRun`");
+    expect(description).toContain("`scheduledRetry`");
+    expect(description).toContain("`workProducts`");
+    expect(description).toMatch(/`blockedBy`\/`blocks` come back ONLY when the request body carried `blockedByIssueIds`/);
+
+    // The split is why a careful reader is fooled: one third of the attendance
+    // triple survives and looks authoritative while the other two vanish.
+    expect(description).toContain("THE ATTENDANCE TRIPLE SPLITS");
+    expect(description).toContain("fails OPEN");
+    expect(description).toContain("BLO-34421");
+
+    // POST hydrates the relation pair, PATCH does not — which is what trains
+    // the habit on create and breaks it on update.
+    expect(description).toContain("`POST` TRAINS THE HABIT `PATCH` BREAKS");
+
+    // `[]` is NOT the undetectable case here: it is unreachable by accident, so
+    // an unintended `[]` is a receipt for a destructive write. A reader who
+    // "repairs" it writes blockers back onto a row whose edges they just
+    // cleared, or misses that they cleared them.
+    expect(description).toContain("TRUE RECEIPT OF A DESTRUCTIVE WRITE");
+    expect(description).toContain("investigate is the write, not the field");
+
+    // And the prescribed verification must route to the surface that actually
+    // hydrates, rather than to another write.
+    expect(description).toContain("re-read with `paperclipGetIssue`");
+  });
+
   it("adds auth headers and run id to mutating requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ ok: true }),
