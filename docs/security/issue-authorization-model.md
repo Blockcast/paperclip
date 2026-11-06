@@ -277,6 +277,20 @@ places and only the first is ever reported back to the author. A well-formed
 - **binds** — so it is **absent from the create response's `unboundMentions`**, whose
   contract is "every `@` token bound" (`PEN-5180`). That statement is true and says
   nothing whatever about entitlement;
+- is **named in the create response's `boundMentions`** (`PEN-5364`), which is worse
+  than the silence this section was first written to describe: the author is not
+  merely told nothing, they are shown the ungrantable mention in a list whose own
+  doc comment used to say those names "DID raise a wake". Measured 2026-11-06
+  (`PEN-5367`): one body mentioning a grantable and an ungrantable agent returned
+  `boundMentions: ["Cto", "Security"]` and `unboundMentions: []` — input varied
+  across the only axis that matters, output identical — and its author told the
+  ungrantable agent, in good faith, that they had been granted. The three code
+  surfaces that describe the field — `packages/shared/src/project-mentions.ts`,
+  `packages/shared/src/validators/issue.ts`, `packages/mcp-server/src/tools.ts` —
+  now say "resolved", not "woken", and say explicitly that the field reports
+  nothing about entitlement. The field itself is unchanged, so this paragraph is
+  still the only place the entitlement half is stated. Making it machine-readable
+  is `PEN-5812`;
 - raises **no** `issue_comment_mentioned` wake — the wake is gated on this same
   predicate at all three comment-create paths in `server/src/routes/issues.ts`. Each
   is a `continue` on a failed `commentAuthorCanGrantIssueMention({ ... })` guard
@@ -433,9 +447,10 @@ without re-deciding the model itself:
   active-membership user** — a manager, the creator, the CEO, a peer, or itself:
   denied `issue:comment`. Otherwise mention grants would chain agent-to-agent and
   every control in this list would be reachable by two agents mentioning each
-  other. This control is **silent on both halves** — the mention still binds, so it
-  is absent from `unboundMentions`, and no wake is raised either, so neither party
-  learns anything; see "Who may grant a mention".
+  other. This control is **worse than silent** — the mention still binds, so it is
+  absent from `unboundMentions` and PRESENT in `boundMentions`, and no wake is
+  raised either, so the author is shown a success the mention did not earn and
+  neither party learns anything; see "Who may grant a mention".
 - An agent assigned a parent or sibling issue: denied on the target issue.
   Ancestry is not a declared dependency; only a `blocks` edge is.
 - An agent across a `blocks` edge: denied `issue:mutate` — the edge grants a
