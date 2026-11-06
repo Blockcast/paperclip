@@ -1459,9 +1459,37 @@ export async function githubFetchCommitAuthorEmail(input: {
  * could be credited by the merge gate while reading as "no review at head"
  * here — the #1675 false red, reproduced in a second parser. The shared heading
  * pattern is the wider of the two (it admits the bold and alternate-dash forms
- * Ally actually emits); forgery is not the risk it guards, because
- * `githubHasReviewerEvidenceForPr` credits a body only after matching the
- * reviewer App identity.
+ * Ally actually emits). That width is licensed by what Ally actually emits, NOT
+ * by an identity check upstream of it. An earlier revision of this comment said
+ * forgery "is not the risk it guards, because `githubHasReviewerEvidenceForPr`
+ * credits a body only after matching the reviewer App identity" — that is false
+ * on this fleet and is corrected here (PEN-3193). That predicate's identity
+ * conjunct is `githubReviewerIdentityMatches(login, cfg.prReviewerBotLogin)`,
+ * which defaults to `allyblockcast[bot]` — the same App identity every agent PR
+ * author writes under, for the reason recorded on `githubFetchCommitAuthorEmail`
+ * above. It is a tautology here rather than a filter, and the predicate takes
+ * `{repoFullName, prNumber, headSha}`: it has no author input to check with. On
+ * the comment surface this heading is therefore the ONLY conjunct separating a
+ * reviewer-write from an author-write.
+ *
+ * Two things follow, and neither of them is "narrow the heading":
+ *
+ *  - The reachable failure is ACCIDENTAL, not forged: an author quoting a prior
+ *    review verbatim. Indenting is no defence, because the shared pattern
+ *    allows 0-3 leading spaces (BLO-21618) — quote inside a fence or behind
+ *    `>`. Deliberate forgery is not a grammar problem at all: a process holding
+ *    the reviewer's key can emit any body it likes, which is why PEN-3193's
+ *    remedy is a credential that is not the reviewer's, not a tighter regex.
+ *  - Do NOT close the gap by adding an author check inside that predicate. Its
+ *    callers fail closed on `{error}`, and widening a doc-string fix into the
+ *    server predicate is how BLO-28920 happened (the same warning is recorded
+ *    in `packages/shared/src/validators/issue.ts`). Authorship is already
+ *    checked where it authorizes a merge: `evaluateCommentReviewGate` withholds
+ *    its positive claim both on `authorUnknown` and on
+ *    `githubSharesReviewerIdentity(prAuthorLogin, reviewerBotLogin)`. What a
+ *    miscredit costs HERE is a suppressed signal, not a merge — the callers use
+ *    `found` to skip a gate-status failure delivery and to keep a reviewer run
+ *    terminal.
  *
  * An unreadable verdict block yields false here, exactly as it yields a
  * non-`success` verdict in the gate: no evidence re-runs the reviewer, whereas
