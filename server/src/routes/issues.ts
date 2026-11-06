@@ -14581,10 +14581,35 @@ export function issueRoutes(
         });
       }
 
+      // PEN-5776 box 3 — the DECISION, recorded where the code is.
+      //
+      // This arm deliberately carries NO author predicate, and that is a decision rather
+      // than a remaining gap. A seat is not a run: the run that writes `done` -> `todo` is
+      // normally on its way out, and the new run is the mechanism by which the seat acts
+      // on the transition it just wrote. Suppressing on `actor.actorId === assigneeAgentId`
+      // would leave a self-reopened row with no wake until the next scheduled heartbeat.
+      // The codebase already holds that position on the sibling comment arm below, which
+      // bypasses its own `selfComment` guard when `reopened` is true (`reopened ||
+      // !skipAssigneeCommentWake`) — a self-authored reopen is MEANT to wake its author.
+      //
+      // The signal that distinguishes "re-enter this row" from "leave it alone" is the
+      // PARK, not the identity of the writer, and that is the term added above.
+      //
+      // What the arm genuinely lacked beside it is the term its sibling DOES carry: the
+      // POST-update closed-status check (BLO-29821). `statusChangedFromBacklog` fires on
+      // `backlog` -> ANY other status, so a single PATCH that retired a row
+      // (`{status: "cancelled"}`) woke its assignee onto work that was terminal by the time
+      // the wake was claimed — measured on PEN-5763, Δ = 0.319 s, and the run it dispatched
+      // ended `cancelled` having had nothing to do. That is the BLO-23206 shape: a wake
+      // that revives work somebody finished. Reading the post-update status is the point;
+      // `existing.status` is one write behind and would miss exactly this case.
+      const statusChangeWakeOntoClosedRow = isClosedIssueStatus(issue.status);
+
       if (
         !assigneeChanged &&
         (statusChangedFromBacklog || statusChangedFromBlockedToTodo || statusChangedFromClosedToTodo) &&
         !statusChangeWakeDeferredToParkExpiry &&
+        !statusChangeWakeOntoClosedRow &&
         issue.assigneeAgentId
       ) {
         addWakeup(issue.assigneeAgentId, {
