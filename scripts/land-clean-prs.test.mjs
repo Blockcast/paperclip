@@ -5171,6 +5171,43 @@ describe("a PR stacked on a feature branch is out of scope (PEN-5469)", () => {
     assert.match(row.detail, /move that branch's head/);
   });
 
+  describe("an ARMED stacked PR is named in the receipt, because nothing else can reach it", () => {
+    // This rule returns ahead of the `autoMergeRequest` branch, so a stacked
+    // PR armed by an earlier fire can never reach `stale-enqueue` and its
+    // `--disable-auto` remedy. Returning first is correct; leaving the arming
+    // unsaid is not, and is the same blind spot PEN-5469 is about. The
+    // receipt names it so a human can disarm by hand — this routine issues no
+    // write against a non-default base.
+    it("says so when auto-merge is still armed", () => {
+      const armedPr = stacked({ autoMergeRequest: { enabledAt: "2026-09-13T10:00:00Z" } });
+      const row = classifyFromListing(armedPr, { now: NOW });
+      assert.equal(row.action, NON_DEFAULT_BASE_ACTION, "still out of scope, armed or not");
+      assert.match(row.detail, /auto-merge still ARMED/);
+      assert.match(row.detail, /disarm by hand/);
+    });
+
+    it("stays silent about arming when the PR is not armed", () => {
+      // Without this the note would read as boilerplate and carry no signal.
+      const row = classifyFromListing(stacked({ autoMergeRequest: null }), { now: NOW });
+      assert.equal(row.action, NON_DEFAULT_BASE_ACTION);
+      assert.doesNotMatch(row.detail, /ARMED/);
+    });
+
+    it("still does not spend a cap slot, armed or not", () => {
+      const rows = classifyAll(
+        [
+          stacked({ number: 3100, autoMergeRequest: { enabledAt: "2026-09-13T10:00:00Z" } }),
+          landable({ number: 3200 }),
+        ],
+        { now: NOW, maxEnqueues: 1 },
+      );
+      assert.deepEqual(
+        rows.map((row) => [row.number, row.action]),
+        [[3100, NON_DEFAULT_BASE_ACTION], [3200, "enqueue"]],
+      );
+    });
+  });
+
   it("is SCOPE, so it is decided ahead of every readiness rule", () => {
     // Deliberately pinned: a stacked PR is not ours whatever else is true of
     // it, and the verdict must not be reachable-around by removing a label or
