@@ -907,6 +907,180 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     }
   });
 
+  // PEN-5591: the window bound above left `run_project_links` fed by EVERY run in the
+  // window, including the runs that can never consume a link because their cost events
+  // already carry a direct `project_id`. The outer join is
+  // `... = run_project_links.run_id AND cost_events.project_id IS NULL`, so those link
+  // rows are computed and then matched against nothing.
+  //
+  // Both halves are asserted here, and they fail in different directions. The attribution
+  // half would pass even if the predicate were silently dropped (the narrowing is
+  // result-preserving, which is the whole point), so only the compiled SQL proves the
+  // pruning happens. The SQL half would pass on a narrowing that ALSO broke the
+  // attribution the join exists to provide, so only `nullProjectRunId` proves it did not.
+  it("prunes link rows for runs whose cost events already carry a project, without dropping a real attribution", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const directProjectId = randomUUID();
+    const linkProjectId = randomUUID();
+    const directIssueId = randomUUID();
+    const linkIssueId = randomUUID();
+    const directRunId = randomUUID();
+    const nullProjectRunId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Prune Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values([
+      { id: directProjectId, companyId, name: "Direct Project", status: "active" },
+      { id: linkProjectId, companyId, name: "Link Project", status: "active" },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: directIssueId,
+        companyId,
+        projectId: linkProjectId,
+        title: "Touched by the directly-attributed run",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 1,
+        identifier: "PRN-1",
+      },
+      {
+        id: linkIssueId,
+        companyId,
+        projectId: linkProjectId,
+        title: "Touched by the null-project run",
+        status: "in_progress",
+        priority: "medium",
+        issueNumber: 2,
+        identifier: "PRN-2",
+      },
+    ]);
+    await db.insert(heartbeatRuns).values([
+      {
+        id: directRunId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "completed",
+        startedAt: new Date("2026-04-10T00:00:00.000Z"),
+        finishedAt: new Date("2026-04-10T00:01:00.000Z"),
+      },
+      {
+        id: nullProjectRunId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "completed",
+        startedAt: new Date("2026-04-11T00:00:00.000Z"),
+        finishedAt: new Date("2026-04-11T00:01:00.000Z"),
+      },
+    ]);
+
+    // BOTH runs have a link row pointing at `linkProjectId`. `directRunId`'s link is the
+    // one that must be pruned: its cost event names `directProjectId` directly, so the
+    // outer join's `project_id IS NULL` arm can never match it. Pointing the two links at
+    // the same project is deliberate -- if the pruning were wrong in the other direction
+    // and `directRunId` were attributed through its link, its 700 would land on
+    // `linkProjectId` and the per-project totals below would move.
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        runId: directRunId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.checked_out",
+        entityType: "issue",
+        entityId: directIssueId,
+        details: {},
+      },
+      {
+        companyId,
+        runId: nullProjectRunId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        action: "issue.checked_out",
+        entityType: "issue",
+        entityId: linkIssueId,
+        details: {},
+      },
+    ]);
+
+    const base = {
+      companyId,
+      agentId,
+      provider: "anthropic",
+      biller: "anthropic",
+      billingType: "metered_api",
+      model: "claude-opus-5",
+      inputTokens: 1_000,
+      cachedInputTokens: 0,
+      outputTokens: 500,
+    } as const;
+
+    await db.insert(costEvents).values([
+      {
+        ...base,
+        heartbeatRunId: directRunId,
+        projectId: directProjectId,
+        costCents: 700,
+        occurredAt: new Date("2026-04-10T00:00:30.000Z"),
+      },
+      {
+        ...base,
+        heartbeatRunId: nullProjectRunId,
+        costCents: 250,
+        occurredAt: new Date("2026-04-11T00:00:30.000Z"),
+      },
+    ]);
+
+    const capturedSql: string[] = [];
+    const costsWithCapture = costService(withSqlCapture(db, capturedSql));
+
+    const rows = await costsWithCapture.byProject(companyId, {
+      from: new Date("2026-04-01T00:00:00.000Z"),
+      to: new Date("2026-04-15T23:59:59.999Z"),
+    });
+
+    const byProjectId = new Map(rows.map((row) => [row.projectId, row.costCents]));
+    expect(rows).toHaveLength(2);
+    // Direct attribution survives the narrowing untouched...
+    expect(byProjectId.get(directProjectId)).toBe(700);
+    // ...and the run that NEEDS the link still gets it. A narrowing that pruned this one
+    // would read as a pass on the SQL assertion below while silently losing attribution.
+    expect(byProjectId.get(linkProjectId)).toBe(250);
+
+    const emitted = capturedSql.filter((text) => text.includes("run_project_links"));
+    expect(emitted.length).toBeGreaterThan(0);
+    for (const text of emitted) {
+      // The PEN-5585 window bound, still present...
+      expect(text).toContain('select distinct "heartbeat_run_id" from "cost_events"');
+      // ...now also carrying the PEN-5591 narrowing. Asserted on the subquery text rather
+      // than on the whole statement, because `project_id is null` also appears in the
+      // outer join predicate -- a whole-statement match would pass with the narrowing
+      // absent.
+      const subquery = text.slice(text.indexOf('select distinct "heartbeat_run_id" from "cost_events"'));
+      expect(subquery.slice(0, subquery.indexOf(")"))).toContain('"cost_events"."project_id" is null');
+    }
+  });
+
   // PEN-5604: `byProject` attributes run-level cost through `run_project_links`, which
   // deduplicated (run_id, project_id) PAIRS rather than runs. A run that touched issues
   // in N projects produced N link rows, the `leftJoin` matched on `run_id` alone, and

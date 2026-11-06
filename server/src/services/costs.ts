@@ -631,10 +631,41 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
        * The inner select is served by `cost_events_company_occurred_idx`, and the
        * resulting `run_id` restriction by `activity_log_run_id_idx`.
        */
+      /**
+       * PEN-5591: narrow the SAME restriction one step further, to the runs whose cost
+       * events can actually consume a link.
+       *
+       * The outer `leftJoin` below matches on
+       * `cost_events.heartbeat_run_id = run_project_links.run_id AND cost_events.project_id IS NULL`.
+       * A link row whose `run_id` has no NULL-project cost event in the window therefore
+       * cannot satisfy that predicate under any row ordering, and contributes nothing to
+       * the aggregate. Dropping it here is EXACTLY result-preserving -- the same argument
+       * the window bound above rests on, with a strictly stronger predicate on the same
+       * `cost_events_company_occurred_idx` scan. It is not an approximation and it is not
+       * a sampling bound.
+       *
+       * Why it was still needed after the window bound: measured in production on
+       * 2026-11-06 against the deployed bound, `by-project` answers 1/7/10-day windows
+       * (~2s/~12s/~22s) and is cancelled by `statement_timeout` at 14 and 30 days. The
+       * same company, same window and same outer `cost_events` scan via `by-agent` --
+       * which carries no `run_project_links` join -- answers 30 days in ~0.1s. The scan
+       * is ~0.3% of the budget; the join is the rest of it, so narrowing what feeds the
+       * join is the lever that remains.
+       *
+       * `project_id` is resolved ONCE per run (`resolveLedgerScopeForRun`) and reused for
+       * every cost event that run writes, so this predicate partitions runs cleanly rather
+       * than splitting a run's events. The runs it drops are the issue-scoped ones -- which
+       * are also the runs that write the most `activity_log` rows -- so it prunes the join
+       * input by more than its share of runs.
+       */
       const windowedRunIds = db
         .selectDistinct({ runId: costEvents.heartbeatRunId })
         .from(costEvents)
-        .where(and(...conditions, isNotNull(costEvents.heartbeatRunId)));
+        .where(and(
+          ...conditions,
+          isNotNull(costEvents.heartbeatRunId),
+          isNull(costEvents.projectId),
+        ));
 
       const issueIdAsText = sql<string>`${issues.id}::text`;
       // PEN-5604: dedup by RUN, not by (run, project) pair. Pair-dedup emitted one link
