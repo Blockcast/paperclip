@@ -14090,7 +14090,30 @@ export function buildPaperclipTaskMarkdown(input: {
     "Wake steps that name a live GitHub read:",
     "A wake step of the form \"ON WAKE read `mergedAt` on #NNNN FIRST\" names a LIVE GitHub read, and the fleet credential is NOT guaranteed at wake time -- it has been globally REJECTED for hours at a stretch, so the step 401s and the note that gave it offers no substitute. `gh paperclip-auth-check` tells a dead credential apart from a dead step; do that before concluding anything about the artifact.",
     "The credential-free substitute is the lookup named above -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>`. It is webhook-fed and needs no GitHub credential, and each owner's `workProduct.metadata` carries `merged`, `mergedAt`, `headSha`, `branch`, `draft` and `lastEventAction`, which answers the \"has this merged\" question most such wake steps are really asking.",
-    "Read it for what it is. It reports the last DELIVERED webhook event for a narrow set of `pull_request` actions -- not current state, and not reviews or checks, which arrive as `pull_request_review`/`check_run` events and are never written here. It carries no \"as of\" stamp, so an unchanged entry, an undelivered event, and a mirror that has gone deaf are indistinguishable from inside it. It is therefore sufficient to conclude \"no merge event has been delivered\" -- which is safe, because that conclusion keeps the row parked -- and NEVER \"this has not merged\". Do not use it to establish that something HAS happened, and do not release a park on it.",
+    "Read it for what it is. It reports the last DELIVERED webhook event for a narrow set of `pull_request` actions -- not current state, and not reviews or checks, which arrive as `pull_request_review`/`check_run` events and are never written here. Its `sourceEventTimestamp` dates the last event it RECEIVED, not the last time it looked, so it cannot tell \"nothing has happened since\" from \"nothing has ARRIVED since\": an unchanged entry, an undelivered event, and a mirror that has gone deaf are indistinguishable from inside it. A `merged` that is `false` or absent is therefore sufficient only for \"no merge event has been delivered\" -- which is safe, because that conclusion keeps the row parked -- and NEVER \"this has not merged\".",
+    // PEN-5778 review (#3476, native-codex): the asymmetry above used to run in BOTH
+    // directions, which left the mirror unable to answer the one question it was offered
+    // for. A run told that the mirror "answers the has-this-merged question", and then told
+    // to conclude nothing positive from it, hits a contradiction -- and a contradiction is
+    // what invites the improvisation this whole block exists to prevent.
+    //
+    // Merge is the one MONOTONE fact here, so staleness cannot falsify it. The "not current
+    // state" objection applies only to fields that can go BACKWARDS. `merged` is written by
+    // `pullRequestHasMerged` (services/pull-request-work-products.ts), whose docblock states
+    // the invariant this clause rests on: GitHub sets `merged_at` on a real merge, never
+    // clears it, and a merged PR cannot be reopened.
+    //
+    // Scoped to `webhook` provenance deliberately. `listOwnersByExternalId` stamps that only
+    // when the metadata carries the system writer's source AND the row's `sourceTrust` names
+    // the system actor; an `asserted` row carries hand-written metadata, so its `merged` is
+    // whatever someone typed. The line above tells the run to read metadata off EACH owner,
+    // which reaches those rows too, so the qualifier is load-bearing rather than decorative.
+    //
+    // The confinement in the last sentence is load-bearing too. The danger in granting a
+    // positive direction at all is that it reads as a general licence, and
+    // `headSha`/`draft`/`mergeQueueState` are exactly the snapshot fields a run reaches for
+    // next. Those CAN go backwards. Name them rather than leaving the boundary implied.
+    "One fact escapes that, and only one. A `provenance: \"webhook\"` owner whose `metadata.merged` is `true` AND whose `mergedAt` is populated IS sufficient to conclude the pull request merged, and you may release a park on it. A merge is MONOTONE -- GitHub sets `merged_at` once on a real merge, never clears it, and a merged PR cannot be reopened -- so a stale reading of it is still a true one. Nothing else in the metadata is monotone: `headSha`, `draft`, `mergeQueueState` and `lastEventAction` are point-in-time snapshots that a later event can supersede, so do NOT use them to establish that something HAS happened. `asserted` owners carry hand-written metadata and settle nothing in either direction.",
     "If the mirror cannot answer, re-park and record why in the note. Do NOT improvise an instrument: a wake step you cannot execute is a reason to wait, not a licence to invent a substitute under time pressure.",
     "When you WRITE a wake step, name the FACT to read (\"read `mergedAt` on #3110\"), not the command to run (\"`gh pr view` ...\"). Naming the instrument is this surface's job, not the note's -- a note in fact form survives the instrument changing, while one in command form has to be rewritten, and a parked row is exactly what nobody goes back to rewrite.",
   );

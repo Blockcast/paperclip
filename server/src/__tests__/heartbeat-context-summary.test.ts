@@ -3452,15 +3452,57 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
   });
 
   // The semantics, not just the route. Pinned individually because each clause closes a
-  // specific misreading, and the asymmetry is the whole point: the mirror is sufficient
-  // for the conclusion that keeps a row parked and never for the one that releases it.
+  // specific misreading. The asymmetry is the whole point, and it runs ONE way: an absent
+  // merge event keeps a row parked, and never licenses "this has not merged".
   it("states the mirror's safe direction and forbids the unsafe one", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
     expect(markdown).toContain("last DELIVERED webhook event");
     expect(markdown).toContain('"no merge event has been delivered"');
     expect(markdown).toContain('NEVER "this has not merged"');
-    expect(markdown).toContain("do not release a park on it");
+  });
+
+  // PEN-5778 review (#3476). The negative half above used to be the WHOLE rule, which left
+  // the mirror unable to answer the question it is offered for and contradicted the line
+  // that offers it. A merge is monotone, so a stale reading of it is still a true one --
+  // this pins the positive direction, and the `mergedAt` + `webhook` conjunction that makes
+  // it sound. Without the conjunction the clause would credit an `asserted` row's
+  // hand-written metadata.
+  it("lets a webhook-provenance merged row release a park, and says why that is sound", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain('A `provenance: "webhook"` owner');
+    expect(markdown).toContain("`metadata.merged` is `true` AND whose `mergedAt` is populated");
+    expect(markdown).toContain("you may release a park on it");
+    expect(markdown).toContain("MONOTONE");
+    expect(markdown).toContain("never clears it");
+    expect(markdown).toContain("`asserted` owners");
+  });
+
+  // The confinement, pinned separately because it is the failure mode of the clause above
+  // rather than of the block: a positive direction granted for merge reads as a general
+  // licence unless the non-monotone fields are named, and those are exactly the ones a run
+  // reaches for next.
+  it("confines the positive direction to merge and names the snapshot fields it excludes", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("Nothing else in the metadata is monotone");
+    expect(markdown).toContain("`headSha`, `draft`, `mergeQueueState` and `lastEventAction`");
+    expect(markdown).toContain("do NOT use them to establish that something HAS happened");
+  });
+
+  // PEN-5778 review (#3476, pr-review-toolkit:comments). The clause used to claim the mirror
+  // "carries no 'as of' stamp", which is false -- `sourceEventTimestamp` is written on every
+  // row. A reader who finds that field discards the whole clause as wrong, so the clause has
+  // to make the accurate point instead: a last-EVENT time cannot witness that nothing
+  // arrived since.
+  it("describes the timestamp it actually carries rather than denying one exists", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("`sourceEventTimestamp`");
+    expect(markdown).toContain("not the last time it looked");
+    expect(markdown).toContain('"nothing has ARRIVED since"');
+    expect(markdown).not.toContain('carries no "as of" stamp');
   });
 
   // The failure this row is really about is a run INVENTING an instrument under time
