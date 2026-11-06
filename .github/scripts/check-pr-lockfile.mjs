@@ -3,12 +3,47 @@
  * check-pr-lockfile.mjs
  * Checks that pnpm-lock.yaml was not manually edited.
  * Export: checkLockfile(files, prAuthor, prBranch) → { passed, failures }
+ *         onlyPatchHashesChanged(patch) → boolean
  */
 import { fileURLToPath } from 'node:url';
 
+const hashless = line => line
+  .replace(/patch_hash=[a-z0-9]+/g, 'patch_hash=')
+  .replace(/^( {4}hash: )[a-z0-9]+$/, '$1');
+
+// True when a GitHub file `patch` changes nothing but pnpm patch hashes: every
+// run of removed lines is replaced in place by the same lines with only their
+// hashes differing. A missing (too large) patch is not hash-only.
+export function onlyPatchHashesChanged(patch) {
+  if (!patch) return false;
+  let removed = [];
+  let added = [];
+  const flush = () => {
+    const same = removed.join('\n') === added.join('\n');
+    removed = [];
+    added = [];
+    return same;
+  };
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('-')) {
+      if (added.length && !flush()) return false;
+      removed.push(hashless(line.slice(1)));
+    } else if (line.startsWith('+')) {
+      added.push(hashless(line.slice(1)));
+    } else if (!flush()) {
+      return false;
+    }
+  }
+  return flush();
+}
+
 export function checkLockfile(files, prAuthor, prBranch) {
-  const lockfileChanged = files.some(f => f.filename === 'pnpm-lock.yaml');
-  if (!lockfileChanged) return { passed: true, failures: [] };
+  const lockfile = files.find(f => f.filename === 'pnpm-lock.yaml');
+  if (!lockfile) return { passed: true, failures: [] };
+  // pr.yml allows a lockfile that differs from base only in patch hashes: a
+  // patch-file edit must change them, and the overrides-consistency check
+  // proves each matches its committed patch file.
+  if (onlyPatchHashesChanged(lockfile.patch)) return { passed: true, failures: [] };
 
   // Exemptions MUST mirror the `Block manual lockfile edits` step in pr.yml —
   // that is the policy which actually hard-fails the PR. pr.yml allows the
