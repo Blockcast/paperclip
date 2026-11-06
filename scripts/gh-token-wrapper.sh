@@ -946,6 +946,15 @@ auth_check_container_start() {
     return 0
   fi
 
+  # With shareProcessNamespace: true the pod's PID 1 is the `pause` process, not
+  # this container's entrypoint. pause starts before the volumes are mounted, so
+  # its start time would classify a genuine initial mount as an in-life rewrite.
+  # That direction is conservative -- the dating to mount-written still holds,
+  # and it moves AWAY from the INITIAL MOUNT overclaim -- but a reading that is
+  # knowably about the wrong process should not be presented as either
+  # classification, so fall to the undated branch instead.
+  case "$(cat /proc/1/comm 2>/dev/null)" in pause) return 0 ;; esac
+
   acs_btime="$(awk '$1 == "btime" { print $2; exit }' /proc/stat 2>/dev/null)" || acs_btime=""
   acs_hz="$(getconf CLK_TCK 2>/dev/null)" || acs_hz=""
   # Field 22 is counted from AFTER the last ")": field 2 (comm) is parenthesised
