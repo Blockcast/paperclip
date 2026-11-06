@@ -84,6 +84,19 @@ test('no remedy text offers a shape the PEN-4869 egress wrapper refuses', () => 
   }
   // ...and the replacement is the pinned form, not merely the absence of a bare one.
   assert.match(PUSH_REMEDY, /--force-with-lease=refs\/heads\/<branch>:<expected-sha>/);
+  // PEN-5807: pinned is necessary but not sufficient. The expectation must be
+  // the newest `update by push` in `git reflog show origin/<branch>` -- the
+  // tracking ref's REFLOG, which records what THIS clone published -- never the
+  // ref's CURRENT value. `:$(git rev-parse origin/<branch>)`, a `rev-parse`
+  // after a fetch, `ls-remote`, and `@{u}` are all that current value: each
+  // wears the accepted shape while leasing against the thing it is checked
+  // against, so it can never fail. `ls-remote` is the comparison, not the
+  // source.
+  assert.doesNotMatch(PUSH_REMEDY, /--force-with-lease=\S*:\$\(/, 'the expectation must not be derived inline');
+  assert.match(PUSH_REMEDY, /git reflog show origin\/<branch>/);
+  assert.doesNotMatch(PUSH_REMEDY, /rev-parse @\{u\}/, '`@{u}` is the tracking ref, not the sha you last pushed');
+  assert.doesNotMatch(PUSH_REMEDY, /git fetch/, 'the remedy must not fetch the expectation into existence');
+  assert.match(PUSH_REMEDY, /never pushed from this clone/, 'the no-reflog fallback must be rendered, not only commented');
   // STRIP_COMMAND is executed verbatim by the test below: it must carry no push
   // at all, so no network reaches the sandbox.
   assert.doesNotMatch(STRIP_COMMAND, /git push/);

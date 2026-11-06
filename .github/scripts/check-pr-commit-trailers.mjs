@@ -31,11 +31,33 @@ export const STRIP_COMMAND =
 // wrapper first on PATH, so a bare lease printed here is refused for exactly
 // the population this check writes to, at the moment they are already blocked.
 //
-// Read the sha, then name it. Deriving it inline -- `:$(git rev-parse
-// origin/<branch>)` -- would satisfy the wrapper's argv predicate while
-// reproducing the hazard it exists to stop, which is worse than being refused.
+// The sha to name is the one YOU last pushed, and the only source that means
+// exactly that is the remote-tracking ref's REFLOG: a push writes an `update by
+// push` entry, a fetch writes a different one, so the newest `update by push`
+// is your own publication and nothing else.
+//
+// Every other candidate is the tracking ref's CURRENT value, which is the thing
+// the lease is checked against -- `:$(git rev-parse origin/<branch>)` inline, a
+// `rev-parse` after a fetch, or `ls-remote`. Those make the lease equal what it
+// is compared to, so it can never fail: the wrapper's argv predicate is
+// satisfied and the hazard it exists to stop is reproduced, which is worse than
+// being refused because it looks protected.
+//
+// `@{u}` is NOT a way out -- it resolves to `origin/<branch>`, the same ref.
+// Reading it before this remedy fetches only narrows the window; an earlier
+// `git pull` or an IDE autofetch has already moved it onto a co-author's commit.
+// Measured: co-author pushes, we fetch, `rev-parse origin/<branch>` returns
+// THEIR commit while the newest `update by push` still returns ours. `@{u}` also
+// dies with `fatal: no upstream configured` on a worktree that pushed via
+// `git push origin HEAD:<branch>`, which is the common agent shape; the reflog
+// needs no upstream. Hence the rendered fallback for a clone that never pushed.
+//
+// `ls-remote` stays on the far side of the comparison: disagreeing with the
+// reflog means a co-author pushed, which is the one case worth stopping for.
 export const PUSH_REMEDY =
-  "git fetch origin && git rev-parse origin/<branch>   # read that sha, then: " +
+  "git reflog show origin/<branch>   # newest \"update by push\" = the sha YOU last pushed " +
+  "(never pushed from this clone? the sha your last push printed); confirm " +
+  "git ls-remote origin <branch> still shows it, then: " +
   "git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>";
 
 export function checkCommitTrailers(commits) {
