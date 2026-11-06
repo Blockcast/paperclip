@@ -215,6 +215,45 @@ export function classifyGithubRefusalResource(response: Response): string | null
   return refusalHeader(response, "x-ratelimit-resource");
 }
 
+const REPO_ROUTE_SEGMENTS = new Set([
+  "actions", "branches", "check-runs", "check-suites", "collaborators", "commits", "compare",
+  "contents", "deployments", "environments", "git", "hooks", "issues", "labels", "merges",
+  "pulls", "releases", "rules", "rulesets", "statuses", "tags",
+]);
+// Third-level resources under repos/:o/:r/<seg>/:id/<sub>, and actions/<sub>.
+const REPO_ROUTE_SUBRESOURCES = new Set([
+  "approve", "attempts", "check-runs", "check-suites", "comments", "commits", "events", "files",
+  "jobs", "logs", "merge", "pending_deployments", "pulls", "requested_reviewers", "rerun",
+  "reviews", "runs", "status", "statuses", "timeline", "workflows",
+]);
+const TOP_ROUTE_SEGMENTS = new Set(["app", "graphql", "installation", "orgs", "rate_limit", "search", "user", "users"]);
+
+/**
+ * Closed route template for `paperclip_github_api_requests_by_route_total`
+ * (BLO-53662). Every value is built only from the sets above, so owner, repo,
+ * numbers and SHAs can never become label values. Exported for its test.
+ */
+export function classifyGithubApiRoute(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return "other";
+  }
+  if (parsed.hostname === "raw.githubusercontent.com") return "raw";
+  const segs = parsed.pathname.split("/").filter(Boolean);
+  if (segs[0] === "api" && segs[1] === "graphql") return "graphql"; // GHES graphql
+  if (segs[0] === "api" && segs[1] === "v3") segs.splice(0, 2); // GHES REST prefix
+  const top = segs[0];
+  if (!top) return "other";
+  if (top !== "repos") return TOP_ROUTE_SEGMENTS.has(top) ? top : "other";
+  const seg = segs[3];
+  if (!seg) return "repos";
+  if (!REPO_ROUTE_SEGMENTS.has(seg)) return "repos/other";
+  const sub = seg === "actions" ? segs[4] : segs[5];
+  return sub && REPO_ROUTE_SUBRESOURCES.has(sub) ? `repos/${seg}/${sub}` : `repos/${seg}`;
+}
+
 /**
  * Count one attempt. Never throws.
  *
@@ -227,9 +266,9 @@ export function classifyGithubRefusalResource(response: Response): string | null
  * asymmetry of protecting only the half that already had a try/catch is not
  * worth the two lines it saves.
  */
-function countGithubApiAttempt(): void {
+function countGithubApiAttempt(url: string): void {
   try {
-    recordGithubApiRequest();
+    recordGithubApiRequest(classifyGithubApiRoute(url));
   } catch {
     // Observation is best-effort; the caller's request is not.
   }
@@ -344,7 +383,7 @@ export async function ghFetch(url: string, init?: RequestInit): Promise<Response
   }
   // Before the request leaves, so the denominator counts attempts and keeps
   // advancing when GitHub is unreachable rather than merely unhappy (PEN-3852).
-  countGithubApiAttempt();
+  countGithubApiAttempt(url);
   try {
     const response = await fetch(url, { ...init, signal });
     await countGithubRefusal(url, response);
