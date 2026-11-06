@@ -1529,6 +1529,35 @@ describe("scrubGitHubEgressText", () => {
       expect(result.text).toContain("main:");
     });
 
+    it("refuses an opaque expectation that hides behind a SECOND colon", () => {
+      // Ally, review 5797006954, measured at e765389: the expectation pass
+      // originally stopped at the NEXT colon, so `<ref>:sha256:<token>`
+      // captured only `sha256` — not an OID, not opaque, match returned
+      // untouched — and the token published BYTE-EXACT. Group 1 still stops at
+      // the first colon, so this is the expectation half, not the ref half.
+      //
+      // This is the done-when's "must not admit an opaque `<ref>:<opaque>`
+      // whole" in its least obvious form: the opaque part is not the whole
+      // expectation, it is a suffix of it behind a plausible algorithm label.
+      const opaque = ["Xq7rLm2PvYw9TbNc", "4HsKdFgJ8ZaQe3Ui"].join("");
+      const result = scrubGitHubEgressText(lease("feature/pen-5734-x", `sha256:${opaque}`));
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(opaque);
+    });
+
+    it("still admits the mandated pinned form, which carries exactly one colon", () => {
+      // The negative half of the test above: widening the expectation alphabet
+      // to include `:` must not cost the form PEN-4869 REQUIRES. Exoneration
+      // is `LEASE_EXPECTED_OID_RE` alone, which rejects anything with a colon,
+      // so admitting `:` can only ever offer MORE to the detector.
+      const result = scrubGitHubEgressText(lease(BRANCH, EXPECTED_OID));
+
+      expect(result.redacted).toBe(false);
+      expect(result.text).toContain(BRANCH);
+      expect(result.text).toContain(EXPECTED_OID);
+    });
+
     it("refuses an opaque REF even beside a well-formed OID", () => {
       const opaque = ["Qz7Z4mWvT2pK", "9dLxR6bN3sYcH1gF"].join("");
       const result = scrubGitHubEgressText(lease(opaque, EXPECTED_OID));
