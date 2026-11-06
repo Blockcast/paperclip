@@ -27,6 +27,7 @@ const refreshScheduledRetryParkHorizonMetrics = vi.fn(async () => {});
 const refreshDeferredIssueExecutionWakeAgeMetrics = vi.fn(async () => {});
 const refreshExternalRuntimeReservationStrandMetrics = vi.fn(async () => {});
 const refreshAcceptedInteractionOutcomeMetrics = vi.fn(async () => {});
+const refreshApprovalQueueMetrics = vi.fn(async () => {});
 
 vi.mock("../services/external-runtime-reservations.js", () => ({
   refreshExternalRuntimeReservationMetrics: (db: unknown) =>
@@ -35,6 +36,9 @@ vi.mock("../services/external-runtime-reservations.js", () => ({
 vi.mock("../services/accepted-interaction-outcome-sweep.js", () => ({
   refreshAcceptedInteractionOutcomeMetrics: (db: unknown) =>
     refreshAcceptedInteractionOutcomeMetrics(db as never),
+}));
+vi.mock("../services/approval-queue-metrics.js", () => ({
+  refreshApprovalQueueMetrics: (db: unknown) => refreshApprovalQueueMetrics(db as never),
 }));
 vi.mock("../services/external-runtime-reservation-strand-metrics.js", () => ({
   refreshExternalRuntimeReservationStrandMetrics: (db: unknown) =>
@@ -83,6 +87,7 @@ beforeEach(() => {
     refreshDeferredIssueExecutionWakeAgeMetrics,
     refreshExternalRuntimeReservationStrandMetrics,
     refreshAcceptedInteractionOutcomeMetrics,
+    refreshApprovalQueueMetrics,
   ]) {
     fn.mockReset();
     fn.mockResolvedValue(undefined);
@@ -191,8 +196,8 @@ describe("expireStaleRefreshFreshness (BLO-28865 contract)", () => {
 });
 
 /**
- * PEN-4409. The accepted-interaction sweep is the only refresh in the list on a
- * cadence of its own: its CTE scans every accepted confirmation ever filed with
+ * PEN-4409. The accepted-interaction sweep runs on a cadence of its own (as does
+ * approval-queue since BLO-52494, for its per-approval activity_log probe): its CTE scans every accepted confirmation ever filed with
  * two correlated EXISTS per row, a cost that grows with history and never
  * shrinks, while what it measures (has a person acted on a decision?) moves on
  * human timescales against a 24 h alerting threshold. Four scans a minute to
@@ -227,6 +232,7 @@ describe("per-refresh cadence", () => {
     await settle();
 
     expect(refreshAcceptedInteractionOutcomeMetrics).toHaveBeenCalledTimes(1);
+    expect(refreshApprovalQueueMetrics).toHaveBeenCalledTimes(1);
     // The siblings are unaffected: three ticks, three runs.
     expect(refreshQueuedRunAgeMetrics).toHaveBeenCalledTimes(3);
   });
@@ -242,6 +248,7 @@ describe("per-refresh cadence", () => {
     await settle();
 
     expect(refreshAcceptedInteractionOutcomeMetrics).toHaveBeenCalledTimes(2);
+    expect(refreshApprovalQueueMetrics).toHaveBeenCalledTimes(2);
   });
 
   /**
