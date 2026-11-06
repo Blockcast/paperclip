@@ -3321,6 +3321,37 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("--json headRefOid,state,mergeStateStatus");
   });
 
+  // PEN-5802. The head check above is push-scoped, and the directive's own verb list
+  // includes verbs that never move the head. Two sibling runs of one seat each spent one
+  // body-edit grant 38 s apart with both prescribed gates correctly passing, so the
+  // directive has to say that an unmoved head is not evidence a grant is unspent, and name
+  // the one surface that is. Pinned on the SAME no-PR-context wake as the measurement
+  // above: the run that double-spends is not necessarily the one woken about the PR.
+  it("states that the head check is push-scoped and names the redemption receipt", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      wakeComment: {
+        id: "comment-1",
+        body: "Do not push to this head until the board rules.",
+      },
+    });
+
+    // The non-gate claim itself, and the verbs it is about. A test pinning only the
+    // remedy would pass against a bullet that had lost the reason anyone needs it.
+    expect(markdown).toContain("That head check is PUSH-scoped");
+    expect(markdown).toContain("it is a NON-gate");
+    expect(markdown).toContain("auto-merge toggle");
+    // The remedy, and the abort condition that makes it fail closed rather than merely
+    // leave a trace. `deduplicated: true` is the readable signal; without it the bullet
+    // tells a run to write a receipt and not what to do when the write is refused.
+    expect(markdown).toContain("redeem its receipt key BEFORE writing");
+    expect(markdown).toContain("`deduplicated: true`");
+    expect(markdown).toContain("abort, do not write");
+    // The unkeyed-grant refusal. This is the clause that closes the loop when the GRANTOR
+    // forgets the key, so it is the one most likely to be trimmed as belt-and-braces.
+    expect(markdown).toContain("A grant that names no receipt key cannot be checked");
+  });
+
   it("renders on an issue-only wake, with no wake comment and no PR", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 

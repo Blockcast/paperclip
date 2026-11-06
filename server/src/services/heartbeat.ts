@@ -13997,6 +13997,32 @@ export function buildPaperclipTaskMarkdown(input: {
     "Before ANY write verb against a pull request -- push, force-push, rebase, enqueue, auto-merge, review-request removal -- re-read LIVE state and act on what that read says, not on what this block says:",
     "- Your row's `activeRun` (`paperclipGetIssue`). If a run that is not yours holds it, a sibling of yours is already working this row; do not write over it.",
     "- The pull request's current head (`gh pr view <n> --repo <owner>/<repo> --json headRefOid,state,mergeStateStatus`). If it has moved since you last read it, what you were about to push was computed against a head that no longer exists, and any authorisation scoped to that head has lapsed -- ask again rather than assuming it carried over.",
+    // PEN-5802: the two bullets above are both blind to a metadata write, and this bullet
+    // says so rather than leaving a run to infer it. The head bullet is push-scoped by
+    // construction -- it reasons about "what you were about to push" -- but the verb list
+    // this directive opens with enumerates `enqueue`, `auto-merge` and `review-request
+    // removal`, none of which move the head. A run that reads the verb list as the scope
+    // and the head check as the gate concludes that an unmoved head clears a body edit.
+    //
+    // Measured, not predicted: two sibling runs of ONE seat each spent ONE body-edit grant
+    // 38 s apart on Blockcast/penstock-llm-proxy-core#3108, both bullets above correctly
+    // passing -- `activeRun` because the lock is per-ROW while the grant was per-ARTIFACT,
+    // the head because a body edit leaves it byte-identical. The outcome was benign only
+    // because both runs happened to write the same prescribed text; a title edit, a review
+    // or an enqueue would have had the second silently overwrite the first.
+    //
+    // The receipt-key remedy is named HERE, in the generated directive, rather than left to
+    // the per-seat instruction roots. Those roots are per-seat mounts with no privileged
+    // writer -- a cross-seat change is one issue per seat, hand-applied, which is one drift
+    // opportunity per seat (four adopted it; three converged on one hash, one did not).
+    // This directive is the single surface every write-capable run reads.
+    //
+    // What this does NOT close, stated so it is not recorded as closing it: the CAS makes
+    // the SECOND redeemer fail closed. It gives no run a way to ENUMERATE what its siblings
+    // already hold, and it is scoped `(issue, agent, key)`, so it does not span seats. Both
+    // remain open on PEN-5802. This is a detector one run can read, not a lock that
+    // serialises two.
+    "- That head check is PUSH-scoped. For a metadata write it is not a weak gate, it is a NON-gate: a body or title edit, a review submission, an enqueue, an auto-merge toggle and a review-request change all leave `headRefOid` byte-identical, so an unmoved head shows only that no PUSH landed -- never that an authorisation you were handed is still unspent. `git push` has a server-side compare-and-swap; `PATCH /pulls/:n` has none, and `updatedAt` is measured to bump with no mutation on any readable surface, so it cannot separate them either. If what authorises this write is SINGLE-USE, redeem its receipt key BEFORE writing -- `paperclipAddComment` with the key the grant names -- and treat `deduplicated: true` as \"a sibling run already spent this; abort, do not write\". That key is scoped `(issue, agent, key)`, so it fails closed against sibling runs of your own seat: the collision the bullet above cannot see, because `activeRun` is per-ROW while a single-use grant is per-ARTIFACT. A grant that names no receipt key cannot be checked at all -- ask for a keyed one rather than writing.",
     "Every value in this block was computed when this run was DISPATCHED, not now. That includes any head SHA, sibling-run id or checkout-contention notice printed above: a sibling run that started after your dispatch appears in none of it. Re-reading this prompt is not re-reading state.",
     "",
     "Recording a constraint:",
