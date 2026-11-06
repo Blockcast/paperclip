@@ -2122,6 +2122,93 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  // PEN-5776 (Ally review on #3462): one PATCH can carry a status change, a comment AND a
+  // park — the ordinary reopen shape, and the one measured on PEN-4363. Both wake arms
+  // evaluate on such a write and `addWakeup` collects per agent, so the status arm's
+  // deferral buys nothing unless the comment arm's `reopened` branch defers too.
+  it("defers the reopen-via-comment wake when the same write parks the row", async () => {
+    const parkedUntil = new Date(Date.now() + 60 * 60 * 1000);
+    const issue = { ...makeIssue("done"), parkedUntil };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "picking this up after the deadline",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "todo", comment: "picking this up after the deadline" });
+
+    expect(res.status).toBe(200);
+    // Allow any deferred wakeup task to flush before asserting it never fired.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_status_changed" }),
+    );
+  });
+
+  // The park gate is on the `reopened` branch only. A plain comment on a parked row is a
+  // human joining the thread, not a resume, and must still wake.
+  it("still wakes on a plain comment to a parked open row", async () => {
+    const issue = { ...makeIssue("todo"), parkedUntil: new Date(Date.now() + 60 * 60 * 1000) };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "one question while you are parked",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "one question while you are parked" });
+
+    expect(res.status).toBe(201);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_commented" }),
+    ));
+  });
+
+  // A reopen-with-comment on a row whose park has lapsed must still wake.
+  it("still wakes on a reopen-via-comment when the park has lapsed", async () => {
+    const issue = { ...makeIssue("done"), parkedUntil: new Date(Date.now() - 60 * 1000) };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+    mockIssueService.addComment.mockResolvedValue({
+      id: "comment-1",
+      issueId: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      body: "deadline passed, back to it",
+    });
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "todo", comment: "deadline passed, back to it" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+    ));
+  });
+
   // PEN-5776 box 3: what the arm genuinely lacked is the term its sibling comment arm
   // carries (BLO-29821) — the POST-update closed-status check. Measured on PEN-5763:
   // a `backlog` -> `cancelled` write woke the assignee 0.319 s later onto a row the same
