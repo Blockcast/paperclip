@@ -1752,23 +1752,40 @@ test("prints a truncated hash and never the credential itself on the seat-value 
 // all-clear into the bug report. The rotator re-mints every 20 minutes and
 // kubelet propagates into a running pod within seconds, so a result that does
 // not name its generation cannot be compared across pods OR across time.
+// kubelet's atomic writer: a `..<timestamp>.<nonce>` directory holding the
+// payload, with `..data` flipped at it and the key symlinked through.
+//
+// Calling this a SECOND time against the same directory is precisely what a
+// kubelet resync does — a brand-new generation directory, with `..data`
+// re-pointed at it, carrying content that may be byte-identical. PEN-5730 turns
+// on that being indistinguishable from a real publication by the generation
+// alone, so the resync case gets a first-class helper rather than being
+// open-coded at the one call site that needs it.
+//
+// The nonce is derived rather than written out. A real one is a ~10-digit run,
+// which is credential-shaped to the publish guard and refuses the push
+// (PEN-3920) — and no assertion cares what it is, only that whatever kubelet
+// chose comes back verbatim.
+function writeKubeletMount(dir, generation, tokenContent) {
+  mkdirSync(path.join(dir, generation));
+  writeFileSync(path.join(dir, generation, "token"), tokenContent);
+  // force: the links exist already on every call after the first.
+  const dataLink = path.join(dir, "..data");
+  rmSync(dataLink, { force: true });
+  symlinkSync(generation, dataLink);
+  const tokenLink = path.join(dir, "token");
+  rmSync(tokenLink, { force: true });
+  symlinkSync(path.join("..data", "token"), tokenLink);
+  return tokenLink;
+}
+
 test("reports the kubelet mount generation backing a Secret-mounted token", async () => {
   await withStubGitHub(async (apiBase) => {
     withTempDir((dir) => {
-      // kubelet's atomic writer: a `..<timestamp>.<nonce>` directory holding the
-      // payload, with `..data` flipped at it and the key symlinked through.
-      //
-      // The nonce is derived rather than written out. A real one is a ~10-digit
-      // run, which is credential-shaped to the publish guard and refuses the
-      // push (PEN-3920) — and the assertion does not care what it is, only that
-      // whatever kubelet chose comes back verbatim.
       const generation = `..2026_11_02_03_40_22.${Date.now()}`;
-      mkdirSync(path.join(dir, generation));
-      writeFileSync(path.join(dir, generation, "token"), `${AUTH_CHECK_VALID_TOKEN}\n`);
-      symlinkSync(generation, path.join(dir, "..data"));
-      symlinkSync(path.join("..data", "token"), path.join(dir, "token"));
+      const tokenFilePath = writeKubeletMount(dir, generation, `${AUTH_CHECK_VALID_TOKEN}\n`);
 
-      const proc = runAuthCheck(dir, { tokenFilePath: path.join(dir, "token"), apiBase });
+      const proc = runAuthCheck(dir, { tokenFilePath, apiBase });
       assert.match(proc.stdout, new RegExp(`mount-generation:\\s+${generation.replace(/\./g, "\\.")}`));
       assert.equal(proc.status, 0);
     });
@@ -2238,12 +2255,14 @@ test("a REJECTED verdict prints the rotation-window vs real-outage test (PEN-564
       assert.match(proc.stdout, /verdict:\s+REJECTED/);
       assert.match(proc.stdout, /rotation-vs-outage:/);
       assert.match(proc.stdout, /does NOT establish an outage/);
-      // The procedure must name both generations, because each labels a
-      // different fault to report.
-      assert.match(proc.stdout, /generation ADVANCED/);
-      assert.match(proc.stdout, /generation UNCHANGED/);
-      // And it must consume the fields this output already prints.
-      assert.match(proc.stdout, /note mount-generation and token-sha256/);
+      // The procedure must name both sha states, because each labels a
+      // different fault to report. PEN-5730: these were keyed on the
+      // generation, which discriminates nothing — see the regression test
+      // below for the shape that broke.
+      assert.match(proc.stdout, /token-sha256 CHANGED/);
+      assert.match(proc.stdout, /token-sha256 UNCHANGED/);
+      // And it must consume the field this output already prints.
+      assert.match(proc.stdout, /note token-sha256 above/);
       assert.equal(proc.status, 1);
     });
   });
@@ -2261,11 +2280,12 @@ test("escalation is gated on the second REJECTED, not on the generation (PEN-564
       const proc = runAuthCheck(dir, { tokenFileContent: "ghs_revoked_token\n", apiBase });
       // Step 4 must key on the verdict alone.
       assert.match(proc.stdout, /still REJECTED -> ESCALATE/);
-      // The generation must be explicitly demoted to a label, not a gate.
+      // The discriminating field must be explicitly demoted to a label, not a
+      // gate — it says which fault, never whether to escalate.
       assert.match(proc.stdout, /says WHICH fault, never WHETHER/);
-      assert.match(proc.stdout, /Do NOT wait for the generation to settle before escalating/);
+      assert.match(proc.stdout, /Do NOT wait for the sha to settle before escalating/);
       // A moved generation is not proof the rotator ran: this pod stamps one at
-      // mount time too, measured on PEN-5641.
+      // mount time too, measured on PEN-5641 and again on PEN-5730.
       assert.match(proc.stdout, /this pod stamps one at mount time too/);
       // And the retracted framing must not come back: the window is not
       // self-healing, and 93s was a sampling interval, never a duration.
@@ -2288,6 +2308,119 @@ test("the rotation-vs-outage block appears only on REJECTED (PEN-5641)", async (
       const empty = runAuthCheck(dir, { tokenFileContent: "", apiBase });
       assert.match(empty.stdout, /verdict:\s+NO_CREDENTIAL/);
       assert.doesNotMatch(empty.stdout, /rotation-vs-outage:/);
+    });
+  });
+});
+
+// PEN-5730, the live PEN-5726 shape, reproduced rather than asserted as prose.
+//
+// The rotator had published nothing for ~90 minutes and the credential on the
+// mount had aged out: a textbook stall, the exact fault step 4 exists to route
+// to PEN-5637. But the kubelet kept resyncing the projected volume, rewriting
+// the directory under a fresh generation each time with BYTE-IDENTICAL content
+// — so every re-check read `generation ADVANCED` and the old guidance sent the
+// agent down the `report it as new` arm. That arm is not an edge case under a
+// generation key: the resync period is short, so any two readings far enough
+// apart to be worth taking advance it, and the `UNCHANGED` arm that points at
+// PEN-5637 is close to unreachable. Four readings across three seats on
+// 2026-11-06 all showed the generation equal to the READING pod's own mount
+// second and never to the last publish time.
+//
+// This test drives the two readings for real — same content, new generation —
+// so the regression cannot be re-introduced by anyone who keeps the strings and
+// re-keys the branch.
+test("the PEN-5726 shape (generation ADVANCED, sha UNCHANGED, REJECTED) routes to the rotator stall, not to \"report it as new\" (PEN-5730)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      // One credential, never republished, and refused by GitHub: the rotator
+      // is stalled and what is on the mount has aged out.
+      //
+      // Derived rather than embedded. A `ghs_`-prefixed literal of this length
+      // is credential-shaped to the publish guard and refuses the push
+      // (PEN-3920) — which is why every fixture in this file is either short
+      // or built at runtime. The stub answers 401 to anything that is not the
+      // valid fixture, and being refused is the whole of what this needs.
+      const agedOut = `${AUTH_CHECK_VALID_TOKEN}_aged\n`;
+      const nonce = Date.now();
+
+      // Reading 1 — 05:29Z in the live incident.
+      const first = runAuthCheck(dir, {
+        tokenFilePath: writeKubeletMount(dir, `..2026_11_06_05_29_02.${nonce}`, agedOut),
+        apiBase,
+      });
+      // Reading 2 — 05:51Z. The kubelet resynced and rewrote the directory
+      // under a NEW generation. Nothing was published in between.
+      const second = runAuthCheck(dir, {
+        tokenFilePath: writeKubeletMount(dir, `..2026_11_06_05_51_12.${nonce + 1}`, agedOut),
+        apiBase,
+      });
+
+      const genOf = (out) => out.match(/mount-generation:\s+(\S+)/)[1];
+      const shaOf = (out) => out.match(/token-sha256:\s+(\S+)/)[1];
+
+      // The measured shape: both REJECTED, generation ADVANCED, sha UNCHANGED.
+      assert.match(first.stdout, /verdict:\s+REJECTED/);
+      assert.match(second.stdout, /verdict:\s+REJECTED/);
+      assert.notEqual(genOf(second.stdout), genOf(first.stdout));
+      assert.equal(shaOf(second.stdout), shaOf(first.stdout));
+
+      // The classification an agent lands on is chosen by the sha, which has
+      // not moved — so the destination is the rotator stall.
+      assert.match(second.stdout, /token-sha256 UNCHANGED -> rotator stalled[\s\S]*?PEN-5637/);
+
+      // The defect itself. No arm may be keyed on the generation in either
+      // direction: that is what made "report it as new" the default outcome of
+      // a re-check during a stall.
+      assert.doesNotMatch(second.stdout, /generation ADVANCED\s+->/);
+      assert.doesNotMatch(second.stdout, /generation UNCHANGED\s+->/);
+      assert.doesNotMatch(second.stdout, /generation says WHICH fault/);
+
+      // And the genuinely-unobserved state keeps its arm — re-keyed to the
+      // field that can actually detect it, and told to check for an existing
+      // row first, because filing a duplicate into a live incident is the harm
+      // this whole branch produced.
+      assert.match(second.stdout, /token-sha256 CHANGED\s+-> a freshly published credential is being refused/);
+      assert.match(second.stdout, /check for an\s+existing row before filing/);
+
+      assert.equal(first.status, 1);
+      assert.equal(second.status, 1);
+    });
+  });
+});
+
+// The caveat has to ride on the FIELD, not only on the rotation-vs-outage
+// block: that block prints on REJECTED alone, while this line prints under
+// every verdict — and "the generation moved, so the rotator published" is a
+// misreading available to anyone who reads the line in any verdict.
+test("the mount-generation line carries its own not-evidence-of-publication caveat (PEN-5730)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const tokenFilePath = writeKubeletMount(
+        dir,
+        `..2026_11_06_06_56_28.${Date.now()}`,
+        `${AUTH_CHECK_VALID_TOKEN}\n`,
+      );
+      const ok = runAuthCheck(dir, { tokenFilePath, apiBase });
+
+      assert.match(ok.stdout, /verdict:\s+OK/);
+      assert.doesNotMatch(ok.stdout, /rotation-vs-outage:/);
+      assert.match(ok.stdout, /mount-generation:\s+\S+ \(kubelet resync stamp/);
+      assert.match(ok.stdout, /NOT evidence of publication: bumped/);
+      assert.match(ok.stdout, /with identical content, and stamped at this pod's own mount\. PEN-5730\)/);
+      assert.equal(ok.status, 0);
+    });
+  });
+});
+
+// ...and only where there is a generation to qualify. "-" means this token is
+// not a Secret mount at all, so a caveat about kubelet resync is noise.
+test("a token that is not a Secret mount gets no generation caveat (PEN-5730)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const plain = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
+      assert.match(plain.stdout, /mount-generation:\s+-$/m);
+      assert.doesNotMatch(plain.stdout, /NOT evidence of publication/);
+      assert.equal(plain.status, 0);
     });
   });
 });

@@ -109,27 +109,68 @@ The check prints the procedure under a `rotation-vs-outage:` heading whenever
 it returns `REJECTED`:
 
 1. `OK` → proceed.
-2. First `REJECTED` → note `mount-generation` and `token-sha256`, do other work
-   for a few minutes, re-run. Do not escalate yet; do not stand the row down.
+2. First `REJECTED` → note `token-sha256`, do other work for a few minutes,
+   re-run. Do not escalate yet; do not stand the row down.
 3. Re-check now `OK` → the window closed; proceed, escalate nothing.
-4. Re-check **still `REJECTED`** → **escalate.** The generation says *which*
-   fault to report, never *whether* to report one:
-   - generation **unchanged** → the rotator is stalled and the credential aged
-     out on the mount (PEN-5637, PEN-5239, PEN-5240 — every instance measured
-     in this fleet so far).
-   - generation **advanced** → a freshly published credential is being refused.
-     This has **not** been observed here; PEN-5637 retracted exactly that
-     diagnosis. Report it as new rather than filing it under the stall.
+4. Re-check **still `REJECTED`** → **escalate.** The **sha** says *which* fault
+   to report, never *whether* to report one:
+   - `token-sha256` **unchanged** → the rotator is stalled and the credential
+     aged out on the mount (PEN-5637, PEN-5239, PEN-5240, PEN-5726 — every
+     instance measured in this fleet so far). **This is the common case.**
+   - `token-sha256` **changed** → a freshly published credential is being
+     refused. This has **not** been observed here; PEN-5637 retracted exactly
+     that diagnosis. Check for an existing row before filing — confirm, do not
+     assume.
 
-**Escalation is gated on the second `REJECTED`, never on the generation.** An
+**Escalation is gated on the second `REJECTED`, never on a mount field.** An
 earlier draft of this section made "generation unchanged" a *necessary*
 condition for escalating, which fails open in the quadrant it does not name:
 advanced-and-still-`REJECTED` matched no case and so read as "do not escalate".
-The generation cannot carry that weight in any case — it is **also stamped when
-your own pod first mounted the secret**, so it moves without the rotator having
-run. Measured on PEN-5641: generation `..2026_11_05_04_30_17` carried the same
-`token-sha256` another pod had already been given at `04:26Z`. That stamp was a
-mount sync, not a publish.
+
+### ⛔ `mount-generation` is not the discriminator either (PEN-5730)
+
+PEN-5641 corrected the *gate* but left the generation labelling *which* fault,
+and that half was wrong too. `mount-generation` is the kubelet's atomic-writer
+stamp. The kubelet rewrites a projected-secret directory and bumps that stamp
+**on every resync, even when the content is byte-identical**, and your own pod
+also stamps one when it first mounted the secret. So it does not track "a new
+credential was published" — it tracks "the kubelet looked at this volume".
+
+Because the resync period is short, **any two readings far enough apart to be
+worth taking will show the generation advanced.** That made
+`generation advanced → report it as new` the *default* outcome of step 4 rather
+than an edge case: during the live PEN-5726 outage it routed a textbook rotator
+stall to "novel fault, file a new row", silently and confidently, because every
+instruction had been obeyed. One seat avoided filing a duplicate
+high-priority row into a critical incident only by checking the sha itself.
+
+Four readings across three seats on 2026-11-06, every one with the generation
+equal to the **reading pod's own mount second** and never to the last publish:
+
+| when | seat | `mount-generation` | `token-sha256` | verdict |
+|---|---|---|---|---|
+| 05:29:02Z | UXDesigner | `..05_29_02` advanced | `fd932f45` unchanged | `REJECTED` |
+| 05:51:12Z | Cto | `..05_51_12` advanced | `fd932f45` unchanged | `REJECTED` |
+| 06:52:12Z | Cto | `..06_52_12` advanced | `eba251a0` **changed** | `OK` |
+| 06:56:28Z | Engineer | `..06_56_28` advanced | `561d2c1b` **changed** | `OK` |
+
+`token-sha256` discriminates in all four; `mount-generation` in none. The sha
+*is* the content, so a changed sha **is** a publication and an unchanged sha
+**is** the rotator not having published — whatever the generation says.
+
+Keep reporting the generation as context — it still separates a kubelet-sync
+problem from a rotator problem, and the PEN-5641 measurement stands alongside
+these: generation `..2026_11_05_04_30_17` carried the same `token-sha256`
+another pod had already been given at `04:26Z`. Never branch on it.
+
+> **This rule was already in this document.** §5 has said *"key the park on
+> `token-sha256`, never on `mount-generation` … generation is per-pod forensics
+> only"* since PEN-5239, and even records that the generation-keyed rule it
+> replaced *"would have escalated on the second run every time"*. §2 says the
+> sha *"is the only field that identifies the credential — `mount-generation`
+> does not"*. The defect PEN-5730 fixes is that the **escalation** procedure
+> above, and the tool that prints it, never had that rule applied to them. When
+> you change one of these surfaces, change the others.
 
 ### 1c. Which channels the verdict governs (PEN-5641)
 
