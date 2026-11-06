@@ -14440,15 +14440,27 @@ export function issueRoutes(
      * PEN-5776: the sixth park READER, and the first on this route. Registered in
      * `services/issue-park-expiry.ts`'s header list — add any seventh there too.
      *
-     * The three flags above share one `issue_status_changed` wake and carried NO park
-     * term at any layer: not here, not in `dispatchIssueWakeups`, not in
+     * Governs BOTH wake arms below, and it has to. A single PATCH can carry a status
+     * change, a comment and a park (`{status:"todo", comment:"…", parkedDisposition:{…}}`
+     * — the ordinary reopen shape, and the one measured on PEN-4363), in which case the
+     * `issue_status_changed` arm and the `reopened` branch of the comment arm BOTH
+     * evaluate against the same row. `addWakeup` collects per agent, so a term on one arm
+     * alone suppresses nothing on that write: the other arm still dispatches. Applied to
+     * the `reopened` branch only — a plain `issue_commented` wake on a parked row is a
+     * human joining the thread, not a resume, and keeps waking.
+     *
+     * The three status flags above share one `issue_status_changed` wake and carried NO
+     * park term at any layer: not here, not in `dispatchIssueWakeups`, not in
      * `services/heartbeat.ts` (whose only `parkedUntil` reads are the expiry-RELEASE
      * select). A park can be set on any status, so a PATCH that reopened a row and
      * parked it IN THE SAME WRITE dispatched a run onto that row about a second later
      * and the park was defeated by the write that created it — measured on PEN-4363 at
      * Δ = 1.099 s against a park with 5 h 43 m left to run. This brings the arm into
-     * line with the four paths that already defer to `isDeliberateParkActive`
-     * (PEN-4114, PEN-4871, PEN-5021, BLO-27912).
+     * line with the four readers that already defer to `isDeliberateParkActive`:
+     * `hasLiveDeliberatePark` (PEN-4114), `hasActiveParkedDisposition`
+     * (`recovery/issue-graph-liveness.ts`), the stranded dispatch sweep (PEN-4871) and
+     * `hasLiveDeliberateParkWakePath` (PEN-5021). BLO-27912 is the column's origin, not
+     * a reader.
      *
      * ⚠️ DEFERRAL, NOT SUPPRESSION — and the second conjunct is what makes that true.
      * The park's own release wake only fires on `ISSUE_PARK_EXPIRY_WAKE_STATUSES`, so
@@ -14466,7 +14478,7 @@ export function issueRoutes(
      *
      * Deliberately NOT an author term. See the `issue_status_changed` guard below.
      */
-    const statusChangeWakeDeferredToParkExpiry =
+    const wakeDeferredToParkExpiry =
       isDeliberateParkActive(issue.parkedUntil, Date.now()) &&
       isIssueParkExpiryWakeStatus(issue.status);
     const previousExecutionState = parseIssueExecutionState(existing.executionState);
@@ -14608,7 +14620,7 @@ export function issueRoutes(
       if (
         !assigneeChanged &&
         (statusChangedFromBacklog || statusChangedFromBlockedToTodo || statusChangedFromClosedToTodo) &&
-        !statusChangeWakeDeferredToParkExpiry &&
+        !wakeDeferredToParkExpiry &&
         !statusChangeWakeOntoClosedRow &&
         issue.assigneeAgentId
       ) {
@@ -14648,7 +14660,17 @@ export function issueRoutes(
         // peers. Only an explicit reopen makes the thread actionable again.
         const skipAssigneeCommentWake = selfComment || isClosedIssueStatus(issue.status);
 
-        if (assigneeId && !assigneeChanged && (reopened || !skipAssigneeCommentWake)) {
+        // PEN-5776: `reopened` deliberately bypasses `skipAssigneeCommentWake` (a
+        // self-authored reopen is meant to wake its author — see the status arm above),
+        // but it must not also bypass a live park. A reopen-with-comment that sets a park
+        // in the same write is the exact shape measured on PEN-4363, and without this the
+        // status arm's deferral buys nothing on that write: both arms evaluate, and this
+        // one would still dispatch. The plain `issue_commented` wake is left alone.
+        const reopenWakeSuppressed = reopened
+          ? wakeDeferredToParkExpiry
+          : skipAssigneeCommentWake;
+
+        if (assigneeId && !assigneeChanged && !reopenWakeSuppressed) {
           addWakeup(assigneeId, {
             source: "automation",
             triggerDetail: "system",

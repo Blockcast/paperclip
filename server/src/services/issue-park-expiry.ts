@@ -1,10 +1,12 @@
 /**
  * PEN-4420: the deliberate park's RELEASE edge.
  *
- * `parked_until` (BLO-27912 / migration 0222) is read in six places, and all of them read
- * it to SUPPRESS. Five defer to `isDeliberateParkActive` below; the sixth reads the same two
- * columns directly, as an interval. This list is the registry, so a seventh suppression site
- * belongs here too:
+ * `parked_until` (BLO-27912 / migration 0222) is read in six places, and every one of them
+ * reads it to WITHHOLD something while the park is live — five by suppressing outright, the
+ * sixth (PEN-5776) by deferring to the deadline instead, which is a weaker claim and is
+ * called out on its own entry. Five defer to `isDeliberateParkActive` below; the sixth reads
+ * the same two columns directly, as an interval. This list is the registry, so a seventh
+ * site belongs here too:
  *
  *  - `hasLiveDeliberatePark` (`routes/github-webhook.ts`) — a live park suppresses
  *    `github_check_*` wakes (PEN-4114).
@@ -31,15 +33,19 @@
  *    clause of its evidence. It landed the same morning this list was corrected from three to
  *    four, and was missed — see the retraction below, which is that same error a second time.
  *
- *  - `statusChangeWakeDeferredToParkExpiry` (`routes/issues.ts`) — the
- *    `issue_status_changed` wake on `PATCH /api/issues/:id` (PEN-5776). The gap the
- *    section below used to describe as open; it is now closed, and that section is kept
- *    as the account of what the gap was. The odd one out in the other direction: it is
- *    the only reader that is a DEFERRAL rather than a suppression, because it conjoins
- *    `isIssueParkExpiryWakeStatus(issue.status)` so the wake it drops is always one this
- *    module will fire at the deadline instead. Without that conjunct it would strand a
- *    `backlog` -> `blocked` park, which is the failure mode the `recovery/service.ts`
- *    entry above warns about on the lapsed-park axis.
+ *  - `wakeDeferredToParkExpiry` (`routes/issues.ts`) — the assignee wakes on
+ *    `PATCH /api/issues/:id` (PEN-5776): the `issue_status_changed` arm AND the `reopened`
+ *    branch of the comment arm. It governs both because one PATCH can carry a status
+ *    change, a comment and a park together, both arms then evaluate, and `addWakeup`
+ *    collects per agent — so a term on one arm alone suppresses nothing on that write.
+ *    The plain `issue_commented` wake is deliberately left un-gated.
+ *
+ *    The gap the section below used to describe as open. The odd one out in the other
+ *    direction: it is the only reader that is a DEFERRAL rather than a suppression,
+ *    because it conjoins `isIssueParkExpiryWakeStatus(issue.status)` so the wake it drops
+ *    is always one this module will fire at the deadline instead. Without that conjunct
+ *    it would strand a `backlog` -> `blocked` park, which is the failure mode the
+ *    `recovery/service.ts` entry above warns about on the lapsed-park axis.
  *
  * Nothing read it to RELEASE. `parked_until` passing produced no event on any status, so
  * a parked row whose only wake was the park itself sat inert indefinitely. The park had a
@@ -52,10 +58,18 @@
  *
  * ## The API transitions where a live park WAS not read (PEN-5291, closed by PEN-5776)
  *
- * ✅ CLOSED 2026-11-06. Kept because the shape still governs: the flags below are still the
- * trigger set, and the deferral added to that call site is conditional on the post-update
- * status, so WHICH transition you are on still decides whether the wake survives. Read it as
- * the account of a gap, not as a live gap.
+ * ✅ CLOSED 2026-11-06 for the `PATCH /api/issues/:id` assignee wakes — BOTH the
+ * `issue_status_changed` arm and the `reopened` branch of the comment arm, which had to move
+ * together: one PATCH can carry a status change, a comment and a park at once, both arms
+ * then evaluate, and `addWakeup` collects per agent, so a term on one arm alone would have
+ * suppressed nothing on exactly the write shape PEN-4363 measured.
+ *
+ * ⚠️ Scope of that CLOSED, stated so it is not read wider than it is. The plain
+ * `issue_commented` wake (no reopen) is deliberately NOT park-gated: a human joining the
+ * thread of a parked row is a conversation, not a resume. And the deferral is conditional on
+ * the POST-UPDATE status, so WHICH transition you are on still decides whether the wake
+ * survives — see below. Every other wake producer in this codebase is its own question; this
+ * section closes one route, not the family.
  *
  * Three status-change flags in `PATCH /api/issues/:id` share ONE
  * `addWakeup(... reason: "issue_status_changed")` call (`routes/issues.ts`), and that call
