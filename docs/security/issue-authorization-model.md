@@ -236,8 +236,9 @@ Terminal denials:
   they hold `issue:mutate` on. If the edge sits on the **actor's** blocker set —
   the self-declared shape, and the common one — T's assignee cannot touch that
   row at all, and declaring the dependency "from their side" means
-  `T.blockedBy ∋ S`, the opposite edge, which `assertNoBlockingCycles` refuses
-  with a 422. If it sits on **T's** blocker set, T's assignee can re-send it,
+  `T.blockedBy ∋ S`, the opposite edge — which is not a remedy, because it
+  records a dependency that does not hold: the truth is *S blocked by T*, not
+  the reverse. If it sits on **T's** blocker set, T's assignee can re-send it,
   but `syncBlockedByIssueIds` diffs rather than re-inserting, so an unchanged
   edge keeps its original stamp and nothing moves. Re-stamping is therefore two
   writes — remove, then re-add by a principal with standing — and for the

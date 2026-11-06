@@ -2870,8 +2870,9 @@ export function authorizationService(db: Db) {
               "creator of such an edge had standing on this issue, so it confers no reach — otherwise any agent " +
               "could mint comment access by pointing its own blockedBy at this issue. Re-sending the same " +
               "dependency will not change that: an unchanged edge keeps its original creator stamp, so " +
-              "re-declaring it is a no-op, and declaring the opposite edge is refused as a blocking cycle. The " +
-              "remedy that works in one act is a mention: ask this issue's assignee to @-mention you here, which " +
+              "re-declaring it is a no-op. Inverting the edge is not a remedy either: it records a " +
+              "dependency that does not hold. The remedy that works in one act is a mention: ask this " +
+              "issue's assignee to @-mention you here, which " +
               "grants comment access by itself. Re-stamping the edge also works, but it is two writes — the edge " +
               "must be removed and re-added by a principal with standing on this issue who can also write the " +
               "blocker set that holds it, which for an edge on your own issue's blocker set means a board user.",

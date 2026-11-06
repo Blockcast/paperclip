@@ -5468,19 +5468,70 @@ describeEmbeddedPostgres("authorization service", () => {
       expect(nearMiss.explanation).toMatch(/mention/i);
 
       // Why the text must NOT promise a one-step re-stamp, pinned instead of
-      // argued: T's assignee declaring the dependency "from their side" is the
-      // opposite edge, and the cycle guard refuses it. This is the 422 the old
-      // wording walked the reader into.
+      // argued: T's assignee declaring the dependency "from their side" writes
+      // the OPPOSITE edge, and that is not a remedy — it records a dependency
+      // that does not hold. `syncBlockedByIssueIds` inserts
+      // `{issueId: blocker, relatedIssueId: issue}`, so this call means
+      // "consumer blocks producer" when the truth is the reverse. While the
+      // actor's edge stands the cycle guard also refuses it, which is the 422
+      // pinned below; that refusal is incidental and lapses the moment the
+      // actor withdraws their edge, so nothing downstream of it is a remedy.
       await expect(
         svc.update(producer.id, { blockedByIssueIds: [consumer.id], actorAgentId: owner.id }),
       ).rejects.toMatchObject({ status: 422, message: "Blocking relations cannot contain cycles" });
 
-      // The remedy that does work, end to end through the real path: remove the
-      // self-declared edge, then re-add it from a principal with standing on the
-      // target. Two writes — which is what the denial text now says it takes.
+      // The remedy that does work, end to end through the real path — and it
+      // keeps the edge pointing the way the dependency actually runs. Remove
+      // the self-declared edge, then re-add THE SAME edge stamped by a user
+      // rather than by the actor. Two writes — which is what the denial text
+      // says it takes. The operative reason for the allow is narrow and worth
+      // stating exactly: `createdByUserId` short-circuits the creator conjunct
+      // outright, because a user-stamped edge cannot be an agent self-grant.
+      // It is NOT a standing check on the target — no such check runs on this
+      // path — so do not read this assertion as pinning one.
+      const boardUserId = await createUser(db);
       await svc.update(consumer.id, { blockedByIssueIds: [], actorAgentId: actor.id });
-      await svc.update(producer.id, { blockedByIssueIds: [consumer.id], actorAgentId: owner.id });
+      await svc.update(consumer.id, { blockedByIssueIds: [producer.id], actorUserId: boardUserId });
       expect((await decideComment()).reason).toBe("allow_dependency_edge");
+    });
+
+    it("counts an edge with no recorded creator as a near miss, not as absent (PEN-5780)", async () => {
+      // `created_by_agent_id` is ON DELETE SET NULL, so an edge whose creator
+      // agent was since deleted carries NEITHER creator column. Nobody
+      // self-declared anything here, yet no standing can be shown either — so
+      // the outcome is the near miss, and the denial's "no RECORDED creator
+      // with standing" wording has to be true of this case too. Pinned rather
+      // than argued, because that one word is what makes the sentence honest.
+      const company = await createCompany(db, "Matrix-dependency-edge-null-creator");
+      const owner = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+      const producer = await createIssue(db, company.id, { title: "Producer", assigneeAgentId: owner.id });
+      const consumer = await createIssue(db, company.id, { title: "Consumer", assigneeAgentId: actor.id });
+      await db.insert(issueRelations).values({
+        companyId: company.id,
+        issueId: producer.id,
+        relatedIssueId: consumer.id,
+        type: "blocks",
+        createdByAgentId: null, // creator agent deleted (ON DELETE SET NULL)
+        createdByUserId: null,
+      });
+      const authorization = authorizationService(db);
+      const decided = await authorization.decide({
+        actor: { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_jwt" },
+        action: "issue:comment",
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: producer.id,
+          assigneeAgentId: owner.id,
+          createdByAgentId: null,
+          status: producer.status,
+        },
+      });
+
+      expect(decided.allowed).toBe(false);
+      expect(decided.reason).toBe("deny_missing_grant");
+      expect(authorizationDeniedDetails(decided).nearMissRelations).toEqual(["dependency_edge"]);
     });
 
     it("rewriting a blocker set keeps the original creator stamp on unchanged edges (BLO-30968)", async () => {
