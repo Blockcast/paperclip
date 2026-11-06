@@ -153,6 +153,16 @@ export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOption
   //
   // Format mirrors the refusal above, field by field, because the fleet
   // already parses that shape and because the two differ only in disposition.
+  //
+  // IT GOES TO STDERR, AND THAT IS VISIBLE TO STREAM-MERGING CALLERS. A caller
+  // that merges the two streams — `gh api … 2>&1 | jq` is a common agent idiom
+  // — gets this notice as a non-JSON leader in front of the payload, and its
+  // parse fails (Ally, review 5797006954). That is deliberate and it is the
+  // right trade: a loud parse failure on a call whose payload WAS rewritten is
+  // strictly better than the silent corruption this notice replaces, and it is
+  // recognisable by `REWRITE_NOTICE_PREFIX` rather than needing prose parsing.
+  // A caller that wants the clean payload should read stderr separately rather
+  // than suppress it — `2>/dev/null` here restores the exact PEN-5734 defect.
   if (result.rewrites.length > 0) {
     const io = options.io ?? defaultIo;
     io.notify(

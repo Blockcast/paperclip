@@ -1413,18 +1413,25 @@ const GIT_REF_MAX_COMPONENTS = 4;
 /** Summed length of the letters-only runs. THIS IS THE CONJUNCT THAT HOLDS THE
  *  RULE, exactly as `K8S_NAME_MIN_WORD_MASS` holds the Kubernetes one, and the
  *  numbers are in `isGitRefName`'s residual table: without it the chopped-token
- *  families reach 8.5e-3, with it 1.5e-4.
+ *  families reach 8.5e-3, with it 2.33e-3.
  *
  *  It is also what keeps real credential FORMATS out, which no other conjunct
- *  here does — none musters ten characters of letter runs: `sk-ant-api03-…`
+ *  here does — none musters fourteen characters of letter runs: `sk-ant-api03-…`
  *  has 5, `xoxb-…` 4, `sk_live_…` 6, a Kubernetes bootstrap token's
  *  `<6>.<16>` has 0 unless both halves draw no digit.
  *
- *  Set one below the corpus minimum, the convention this file uses for a knee.
- *  Over 1192 distinct branch names in Blockcast/paperclip's history, 847 are
- *  refused inside a lease by the shipped detector and this rule publishes 518
- *  of them; the lowest word mass among those 518 is 11, so a floor of 10 costs
- *  nothing and 12 would drop two real branches. */
+ *  Set at the KNEE ON RESIDUAL — NOT one below the corpus minimum, which is
+ *  the convention this file uses elsewhere and which would put it at 10. Ten
+ *  is not free. Over 1192 distinct branch names in Blockcast/paperclip's
+ *  history, 847 are refused inside a lease by the shipped detector; a floor of
+ *  10 publishes 518 of those 847 and carries 7.25e-3, 14 publishes 511 and
+ *  carries 2.33e-3, 16 publishes 502 and carries 2.30e-3. So 14 buys a 3x
+ *  reduction in residual for seven real branches out of 518, and 16 buys
+ *  nothing further while costing nine more. Full table: PEN-3920 11.3.
+ *
+ *  DO NOT LOWER THIS TO 10 on the strength of the corpus minimum alone — that
+ *  is the 7.25e-3 row above, about 3x the shipped residual. A failing mutation
+ *  pins 14. */
 const GIT_REF_MIN_WORD_MASS = 14;
 
 /**
@@ -1549,9 +1556,28 @@ const LEASE_EXPECTED_OID_RE = /^[0-9a-f]{7,64}$/;
  *  as a tail: `ASSIGNMENT_RE`'s alphabet includes `.`, and borrowing it whole
  *  would swallow the full stop ending a sentence, turn a clean 40-hex OID into
  *  a 41-character non-OID, and redact the very value this rule exists to let
- *  through. */
+ *  through.
+ *
+ *  `:` IS IN GROUP 2'S ALPHABET, so the expectation runs to the end of the
+ *  token and not merely to the next colon. Ally caught the narrower form
+ *  (review 5797006954): with `:` excluded, `--force-with-lease=<ref>:sha256:<32-char
+ *  token>` captured only `sha256`, which is not an OID and not opaque, so the
+ *  pass returned the match untouched and the token published BYTE-EXACT —
+ *  measured, not reasoned. Group 1 still stops at the FIRST colon, so the ref
+ *  half is unaffected and the two bounds stay independent.
+ *
+ *  Admitting `:` here cannot widen exoneration, which is the only property
+ *  that matters for the residual: the sole exonerating predicate is
+ *  `LEASE_EXPECTED_OID_RE`, and `^[0-9a-f]{7,64}$` rejects every string
+ *  containing a colon. So this strictly ENLARGES what is offered to
+ *  `isOpaqueSecretValue` and can never let a value through that the narrower
+ *  alphabet refused — the expectation-slot residual stays 0 by construction
+ *  rather than by measurement. The one behaviour change in the other
+ *  direction is a malformed trailing form (`<ref>:<oid>:`), which now reaches
+ *  the detector instead of being exonerated; that is fail-closed, and it is
+ *  not the shape PEN-4869 mandates. */
 const FORCE_WITH_LEASE_EXPECTATION_RE =
-  /(--force-with-lease=["']?[^\s"'`:]*:)([A-Za-z0-9+/=_-]+(?:\.[A-Za-z0-9+/=_-]+)*)/g;
+  /(--force-with-lease=["']?[^\s"'`:]*:)([A-Za-z0-9+/=_:-]+(?:\.[A-Za-z0-9+/=_:-]+)*)/g;
 
 /** A segment is "lexical" when it is a plain word or a plain number — the
  *  shape hyphenated identifiers are built from, and the shape a random token's
