@@ -1320,17 +1320,44 @@ jobs:
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
         timeout-minutes: 1
 
-      # BLO-24241: unlike the step above (a hard-required, generous-floor
-      # sanity check), this one asserts strict 100% manifest coverage and is
-      # allowed to fail. A missing suite shows up as a real red X on this
-      # step, naming the exact suites and the one-line fix, without failing
-      # `policy` and skipping build/typecheck/e2e for the whole PR the way
-      # the old bare >=90% assertion did.
-      - name: Check shard duration manifest freshness (non-blocking)
+      # BLO-24241, re-tiered by PEN-5700. This was ONE step carrying two
+      # different kinds of check, run under `continue-on-error: true` in the
+      # belief -- written here -- that a stale manifest would then show as "a
+      # real red X on this step". It does not. `continue-on-error` sets the
+      # step's CONCLUSION to `success`; it does not suppress the `##[error]`
+      # annotation the runner mints for the non-zero exit. So a green step
+      # wrote a full ERR_ASSERTION diff and `##[error]Process completed with
+      # exit code 1.` into this job's log, indistinguishable from a real
+      # failure and sitting LATER in the log than the genuine one.
+      #
+      # Four readers in two days followed it instead of the real failure, each
+      # from a different PR. The trap has a sharp edge worth naming: the
+      # assertion is TRUE -- it reproduces on a clean master -- so a reader who
+      # verifies the hypothesis gets a true result that confirms a false
+      # conclusion. Only `continue-on-error`, which is not in the log, or other
+      # PRs being green falsifies it.
+      #
+      # So the two halves are now tiered separately and neither is
+      # continue-on-error. The helper tests are pure and REQUIRED. Tree state
+      # is reported by a reporter that exits 0 and speaks in the runner's
+      # warning channel, which is what a non-blocking step has to do to stop
+      # spelling itself like a failure. What drift actually COSTS stays gated
+      # by the required HARD_FAIL_COVERAGE_FLOOR assertion in the "Test
+      # general-server shard partition" step above.
+      - name: Test shard manifest freshness helpers
         if: ${{ !cancelled() }}
-        continue-on-error: true
         run: node --test ./scripts/check-shard-manifest-freshness.test.mjs
         timeout-minutes: 1
+
+      - name: Test shard manifest freshness reporter
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/report-shard-manifest-freshness.test.mjs
+        timeout-minutes: 3
+
+      - name: Report shard duration manifest freshness (non-blocking)
+        if: ${{ !cancelled() }}
+        run: node ./scripts/report-shard-manifest-freshness.mjs
+        timeout-minutes: 3
 
       # BLO-24241: the weekly refresh path. These are required (not
       # continue-on-error) because a break here only surfaces on a Monday
