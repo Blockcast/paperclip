@@ -84,9 +84,18 @@ const PENDING_STATUS = "pending";
  * `updated_at`. So on a pending row the column carries exactly one signal:
  * when this card most recently became the board's problem.
  *
- * GREATEST, not a bare `updated_at`, because a never-resubmitted row is only
- * guaranteed `updated_at >= created_at` by convention, and the gauge must not
- * be able to report a NEGATIVE age if some future writer backdates it.
+ * GREATEST, not a bare `updated_at`, because `updated_at >= created_at` is a
+ * convention and rows that violate it already exist: pending approval
+ * `e1b6747a` carries an `updated_at` 1 ms BEFORE its `created_at`. On a bare
+ * `updated_at` such a row anchors EARLIER than it was filed and so reports an
+ * age LARGER than its true one -- reintroducing, by a different route, the
+ * very overstatement this constant exists to remove. GREATEST clamps the
+ * anchor so it can never precede the filing.
+ *
+ * Note it is `Math.max(0, ...)` at the call site, NOT this GREATEST, that
+ * keeps the age non-negative: a negative age needs an anchor in the FUTURE,
+ * and against that GREATEST is actively unhelpful, since it would prefer the
+ * future timestamp. The two guards cover opposite ends and are both load-bearing.
  */
 const PENDING_SINCE = sql`greatest(${approvals.createdAt}, ${approvals.updatedAt})`;
 
