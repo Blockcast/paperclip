@@ -1747,13 +1747,8 @@ test("prints a truncated hash and never the credential itself on the seat-value 
   });
 });
 
-// The field whose absence produced PEN-5241's own false clear: the CTO measured
-// a 200 on a *later* generation than the one being reported on, and wrote the
-// all-clear into the bug report. The rotator re-mints every 20 minutes and
-// kubelet propagates into a running pod within seconds, so a result that does
-// not name its generation cannot be compared across pods OR across time.
-// kubelet's atomic writer: a `..<timestamp>.<nonce>` directory holding the
-// payload, with `..data` flipped at it and the key symlinked through.
+// Models kubelet's atomic writer: a `..<timestamp>.<nonce>` directory holding
+// the payload, with `..data` flipped at it and the key symlinked through.
 //
 // Calling this a SECOND time against the same directory models what the agent
 // fleet actually sees between two readings: a NEW generation directory holding
@@ -2323,15 +2318,14 @@ test("the rotation-vs-outage block appears only on REJECTED (PEN-5641)", async (
 //
 // The rotator had published nothing for ~90 minutes and the credential on the
 // mount had aged out: a textbook stall, the exact fault step 4 exists to route
-// to PEN-5637. But the kubelet kept resyncing the projected volume, rewriting
-// the directory under a fresh generation each time with BYTE-IDENTICAL content
-// — so every re-check read `generation ADVANCED` and the old guidance sent the
-// agent down the `report it as new` arm. That arm is not an edge case under a
-// generation key: the resync period is short, so any two readings far enough
-// apart to be worth taking advance it, and the `UNCHANGED` arm that points at
-// PEN-5637 is close to unreachable. Four readings across three seats on
-// 2026-11-06 all showed the generation equal to the READING pod's own mount
-// second and never to the last publish time.
+// to PEN-5637. But every re-check read `generation ADVANCED`, so the old
+// guidance sent the agent down the `report it as new` arm. That arm is not an
+// edge case under a generation key: the stamp records when THIS pod mounted
+// the secret and every agent run is a fresh Job pod, so `ADVANCED` is the
+// default outcome of any re-check that spans a park and re-wake, and the
+// `UNCHANGED` arm that points at PEN-5637 is close to unreachable. Four
+// readings across three seats on 2026-11-06 all showed the generation equal to
+// the READING pod's own mount second and never to the last publish time.
 //
 // This test drives the two readings for real — same content, new generation —
 // so the regression cannot be re-introduced by anyone who keeps the strings and
@@ -2360,8 +2354,9 @@ test("the PEN-5726 shape (generation ADVANCED, sha UNCHANGED, REJECTED) routes t
         tokenFilePath: writeKubeletMount(dir, `..2026_11_06_05_29_02.${nonce}`, agedOut),
         apiBase,
       });
-      // Reading 2 — 05:51Z. The kubelet resynced and rewrote the directory
-      // under a NEW generation. Nothing was published in between.
+      // Reading 2 — 05:51Z. A new run, so a new pod: it mounts the same
+      // unchanged Secret and stamps its own generation. Nothing was published
+      // in between.
       const second = runAuthCheck(dir, {
         tokenFilePath: writeKubeletMount(dir, `..2026_11_06_05_51_12.${nonce + 1}`, agedOut),
         apiBase,
@@ -2434,7 +2429,7 @@ test("the mount-generation line carries its own not-evidence-of-publication cave
 });
 
 // ...and only where there is a generation to qualify. "-" means this token is
-// not a Secret mount at all, so a caveat about kubelet resync is noise.
+// not a Secret mount at all, so a caveat about the mount stamp is noise.
 test("a token that is not a Secret mount gets no generation caveat (PEN-5730)", async () => {
   await withStubGitHub(async (apiBase) => {
     withTempDir((dir) => {
