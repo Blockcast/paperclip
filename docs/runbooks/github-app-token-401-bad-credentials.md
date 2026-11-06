@@ -29,6 +29,12 @@ authenticated verdict. It reads no credential value into your output.
   mount-generation:   ..2026_11_02_21_37_06.2080447267
   mount-written:      2026-11-02 21:37:06
   token-sha256:       bf65aa6d
+  token-dated:        INITIAL MOUNT — kubelet populated this volume 16s before this container started, by reading the Secret from the API server, so the sha above WAS the Secret's content as of 2026-11-02 21:37:06. This reading is a genuine publication probe
+                      token-sha256 is dated to mount-written, NEVER to the moment you ran
+                      this check: an unchanged mount cannot tell "nothing was published"
+                      apart from "not yet propagated to this pod" (kubelet sync period).
+                      A pod FIRST mount is a direct read of the Secret and so dates its
+                      content; a later re-read of an unchanged mount does not. PEN-5775.
   github-reachable:   yes (unauthenticated /rate_limit -> 200, x-ratelimit-limit 60)
   authenticated:      /installation/repositories -> 200, x-ratelimit-limit 9500, remaining 4730, reset 2026-11-03T04:53:38Z (1793681618)
   credential-channel: gh / curl / git (all re-read the mount per invocation)
@@ -194,6 +200,36 @@ been given at `04:26Z`. Never branch on it.
 > does not"*. The defect PEN-5730 fixes is that the **escalation** procedure
 > above, and the tool that prints it, never had that rule applied to them. When
 > you change one of these surfaces, change the others.
+
+#### Dating the sha — what your own reading does and does not prove (PEN-5775)
+
+Keying on `token-sha256` fixes the wrong verdicts, but on its own the sha can
+only ever report *"unchanged"* — it cannot report that a publication
+**happened**. The constructive form can, and it is strictly stronger than the
+`resourceVersion` read nobody in this fleet has RBAC for:
+
+> **Any pod that starts at time *T* and reports `token-sha256` *X* proves the
+> Secret held *X* at *T*.**
+
+The pairing is what makes it sound, and the caveat is load-bearing. A pod's
+**first** secret mount is a direct read of the Secret at that instant — kubelet
+materialises the volume from the API server before the container starts — so
+*(pod start, sha)* is a genuine publication probe. A **later re-read** of an
+unchanged mount is not: kubelet's sync period means an unchanged sha there
+cannot distinguish *"nothing was published"* from *"I cannot see it yet."*
+
+So `token-sha256` is dated to `mount-written`, **never** to the moment you ran
+the check. The tool now computes which case your reading is and prints it on the
+`token-dated:` line — `INITIAL MOUNT`, `IN-LIFE REWRITE`, or `NOT A KUBELET
+PROJECTION`. Quote that line when you report a reading; it is what tells the
+next reader whether your sha dates anything.
+
+This bound is what let the Engineer prove, on PEN-5726, that an 11:10:09Z mint
+was never published — banking an 11:13:32Z initial mount and explicitly refusing
+their own 11:21:05Z re-read — settling an (a)/(b) dilemma two other agents could
+not close. It is the same per-pod-vs-per-Secret confusion as the generation
+defect above, one level down: a reader who dates the sha to the moment they ran
+the check has made that mistake about their own mount.
 
 ### 1c. Which channels the verdict governs (PEN-5641)
 

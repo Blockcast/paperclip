@@ -903,6 +903,41 @@ auth_check_mount_generation() {
   fi
 }
 
+# PEN-5775: when was `token-sha256` actually true of the Secret?
+#
+# PEN-5730 removed `mount-generation` from the decision because it is a
+# property of the OBSERVER. That fixes the wrong verdicts, but on its own the
+# sha only ever reports "unchanged" -- it cannot report that a publication
+# HAPPENED. The constructive form can, and it is strictly stronger than the
+# `resourceVersion` read nobody in this fleet has RBAC for:
+#
+#   Any pod that starts at time T and reports token-sha256 X proves the Secret
+#   held X at T.
+#
+# The pairing is what makes it sound, and the caveat is load-bearing. kubelet
+# populates a projection by reading the Secret from the API server, and (per
+# PEN-5730's measurement, and AtomicWriter's early return) rewrites it only
+# when the projected content changed. So the sha is the Secret's content as of
+# `mount-written` -- and in NEITHER case as of now. A later reading of an
+# unchanged mount cannot distinguish "nothing was published" from "not yet
+# propagated to this pod", because kubelet's sync period bounds how stale a
+# projection may be. A pod's FIRST mount is therefore a genuine publication
+# probe; any later re-read of an unchanged mount is not.
+#
+# Returns this container's PID 1 start time as an epoch, or empty when it
+# cannot be read. Callers must degrade to the undated statement rather than
+# guess. The env override exists so both branches are testable off a real
+# /proc, following GH_TOKEN_WRAPPER_API_BASE / _MCP_PROXY_URL.
+auth_check_container_start() {
+  if [ -n "${GH_TOKEN_WRAPPER_CONTAINER_START:-}" ]; then
+    printf '%s\n' "${GH_TOKEN_WRAPPER_CONTAINER_START}"
+    return 0
+  fi
+  # The /proc/<pid> directory's mtime is the process start time; cross-checked
+  # against /proc/1/stat field 22 + /proc/uptime on the agent image.
+  stat -c %Y /proc/1 2>/dev/null || true
+}
+
 # PEN-5641: does this verdict govern `mcp__github__*` as well?
 #
 # It did not, and nothing said so. `gh`, `curl` and `git` all re-read the token
@@ -993,6 +1028,7 @@ auth_check_cleanup() {
 paperclip_auth_check() {
   check_source="none" check_state="absent" check_gen="-" check_written="-"
   check_hash="-" check_bytes="-" check_token="" would_refuse=no check_cfg=""
+  check_written_epoch="" check_dated="-"
   trap 'auth_check_cleanup' EXIT
   trap 'auth_check_cleanup; exit 130' INT
   trap 'auth_check_cleanup; exit 143' TERM
@@ -1040,6 +1076,7 @@ paperclip_auth_check() {
       esac
       check_gen="$(auth_check_mount_generation "${TOKEN_FILE}")"
       check_written="$(stat -L -c %y -- "${TOKEN_FILE}" 2>/dev/null | cut -d. -f1)" || check_written="-"
+      check_written_epoch="$(stat -L -c %Y -- "${TOKEN_FILE}" 2>/dev/null)" || check_written_epoch=""
       check_bytes="$(printf '%s' "${check_token}" | wc -c | tr -d ' ')"
     elif [ -e "${TOKEN_FILE}" ]; then
       check_state="exists-but-unreadable"
@@ -1168,6 +1205,29 @@ paperclip_auth_check() {
     verdict_code=5
   fi
 
+  # PEN-5775: classify this reading rather than leaving it to the reader. The
+  # per-pod-vs-per-Secret confusion PEN-5730 removed from the decision table
+  # repeats one level down here: a reader who dates the sha to the moment they
+  # ran the check has made the same mistake about their own mount.
+  check_dated="no mount timestamp — nothing in this output dates the credential"
+  if [ "${check_written}" != "-" ] && [ -n "${check_written_epoch}" ]; then
+    if [ "${check_gen}" = "-" ]; then
+      check_dated="NOT A KUBELET PROJECTION — mount-written ${check_written} is this file's own mtime, so it dates the file and says nothing about a Secret publication"
+    else
+      check_started="$(auth_check_container_start)"
+      case "${check_started}" in
+        '' | *[!0-9]*) check_started="" ;;
+      esac
+      if [ -z "${check_started}" ]; then
+        check_dated="the sha above was the Secret's content as of mount-written ${check_written} (this container's start time is unreadable, so an initial mount and an in-life rewrite cannot be told apart here)"
+      elif [ "${check_written_epoch}" -le "${check_started}" ]; then
+        check_dated="INITIAL MOUNT — kubelet populated this volume $((check_started - check_written_epoch))s before this container started, by reading the Secret from the API server, so the sha above WAS the Secret's content as of ${check_written}. This reading is a genuine publication probe"
+      else
+        check_dated="IN-LIFE REWRITE — kubelet rewrote this volume $((check_written_epoch - check_started))s after this container started, and it rewrites only when the projected content changed, so the sha above was the Secret's content as of ${check_written}"
+      fi
+    fi
+  fi
+
   printf 'gh paperclip-auth-check (PEN-5241)\n'
   printf '  source:             %s\n' "${check_source}"
   printf '  credential:         %s%s\n' "${check_state}" \
@@ -1188,6 +1248,12 @@ paperclip_auth_check() {
   fi
   printf '  mount-written:      %s\n' "${check_written}"
   printf '  token-sha256:       %s\n' "${check_hash}"
+  printf '  token-dated:        %s\n' "${check_dated}"
+  printf '                      token-sha256 is dated to mount-written, NEVER to the moment you ran\n'
+  printf '                      this check: an unchanged mount cannot tell "nothing was published"\n'
+  printf '                      apart from "not yet propagated to this pod" (kubelet sync period).\n'
+  printf '                      A pod FIRST mount is a direct read of the Secret and so dates its\n'
+  printf '                      content; a later re-read of an unchanged mount does not. PEN-5775.\n'
   printf '  github-reachable:   %s\n' "${github_reachable}"
   printf '  authenticated:      /installation/repositories -> %s, x-ratelimit-limit %s, remaining %s, reset %s\n' \
     "${auth_code}" "${auth_limit}" "${auth_remaining}" "$(auth_check_reset_label "${auth_reset}")"
