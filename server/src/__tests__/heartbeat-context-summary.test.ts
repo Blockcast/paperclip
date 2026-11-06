@@ -3388,13 +3388,41 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("work-products/by-external-id");
     // Pinned individually because each clause closes a specific misreading, and a
     // test matching only the path would pass against a sentence that had lost them.
-    // `YOU MAY READ` + the withheld count are what stop an authorization-filtered
-    // result being read as "this artifact has no owner".
+    // `YOU MAY READ` is what stops an authorization-filtered result being read as
+    // "this artifact has no owner".
     expect(markdown).toContain("every owning row YOU MAY READ");
-    expect(markdown).toContain("`withheldForAuthorizationCount > 0`");
+    // PEN-5340 item 5. The signal named here must be the one that covers EVERY
+    // incompleteness cause. The sentence previously named
+    // `withheldForAuthorizationCount > 0`, which covers only the authorization
+    // cause and read `0` on a measured four-of-five answer.
+    expect(markdown).toContain("`ownerListComplete: false`");
+    expect(markdown).toContain("`unresolvedOwningIdentifiers`");
     // The URL form is the one a run has to hand; teaching `%23` first taught it to
     // re-encode a value the endpoint normalises itself.
     expect(markdown).toContain("externalId=<the PR's URL>");
+  });
+
+  // PEN-5340 item 5, asserted as a prohibition rather than only as a presence.
+  // The failure being closed is a run reading a complete-looking answer off the
+  // one counter this sentence used to advertise, so it is not enough that the
+  // better signal is present -- the superseded instruction must be gone, and the
+  // reader must be told explicitly that the counter alone does not mean complete.
+  it("does not offer the authorization counter as the completeness signal", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("work-products/by-external-id");
+    expect(markdown).not.toContain("`withheldForAuthorizationCount > 0` means owners exist");
+    expect(markdown).toContain("Do NOT read `withheldForAuthorizationCount: 0` as complete");
+  });
+
+  // Security's §4 on PEN-5340: the endpoint refuses a bare `#123` (400), so this
+  // cannot be hit through the API -- it is hit by a reader re-deriving owner/repo
+  // from an abbreviated reference and guessing wrong, which returns a confident
+  // DISJOINT owner set rather than an empty one. Costs one clause to prevent.
+  it("requires artifacts to be named with their repo, not a bare number", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("never a bare `#123`");
   });
 
   // Placement, asserted rather than left to reading order. The sentence is author-side

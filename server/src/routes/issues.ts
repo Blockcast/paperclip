@@ -10509,6 +10509,39 @@ export function issueRoutes(
       (await filterIssuesForActor(req, matches.map((match) => match.issue))).map((issue) => issue.id),
     );
     const owners = matches.filter((match) => readableIssueIds.has(match.issue.id));
+    // PEN-5340 item 5. `withheldForAuthorizationCount` reports ONE incompleteness
+    // cause -- a matched row this seat may not read. It is silent about the other:
+    // an identifier the artifact itself declares that never becomes an `owners`
+    // entry at all. Measured on Blockcast/penstock-llm-proxy-core#3114, which
+    // declares five owners and returns four; the fifth (`BLO-21096`) belongs to
+    // another company's identifier space, matches no row here, and so increments
+    // no counter. A caller following the directive exactly was handed 4 / 0 / 5 and
+    // nothing in the response said the list was short. Reproduced from both an
+    // admin and a non-admin seat, so it is not the authorization filter.
+    //
+    // Note `owners` is NOT a join on `owningIdentifiers` and never was: owners are
+    // the `issue_work_products` rows carrying this key, each already bound to its
+    // own issue, while `owningIdentifiers` is provenance copied off the PR. Neither
+    // set contains the other -- #3114 above declares more than it returns, and
+    // Blockcast/paperclip#3114 returns three owners while all three rows declare
+    // only one. That is why completeness cannot be derived from either field alone.
+    const returnedIdentifiers = new Set(owners.map((owner) => owner.issue.identifier));
+    // Computed as a set difference over values ALREADY in this response: every
+    // string here is one the caller can read off `owners[].owningIdentifiers`
+    // today. So it discloses nothing new and costs no extra query -- and it is
+    // deliberately derived from the READABLE rows only, because a withheld row's
+    // metadata would otherwise leak the identifier the filter above exists to
+    // withhold.
+    const unresolvedOwningIdentifiers = [
+      ...new Set(owners.flatMap((owner) => owner.owningIdentifiers ?? [])),
+    ]
+      .filter((identifier) => !returnedIdentifiers.has(identifier))
+      .sort();
+    // `owningIdentifiers: null` is "not recorded / unreadable", NOT the empty set.
+    // Read as "declares nothing" it would make an unreadable recording answer
+    // `complete`, which is the one direction this field must never fail in.
+    const owningIdentifiersUnrecorded = owners.some((owner) => owner.owningIdentifiers === null);
+    const withheldForAuthorizationCount = matches.length - owners.length;
     res.json({
       // Echoed back normalised, so a caller that passed a PR URL can see the
       // key the empty set would have been empty *for*.
@@ -10531,7 +10564,22 @@ export function issueRoutes(
       // seat may read. Reporting the withheld count keeps the caller from
       // reading an authorization result as an absence of ownership, which is
       // the precise misreading this endpoint exists to remove.
-      withheldForAuthorizationCount: matches.length - owners.length,
+      withheldForAuthorizationCount,
+      // The declared owners this answer does not contain, whatever the cause:
+      // another company's identifier space, a deleted or mistyped identifier, or
+      // a row that exists here but carries no binding for this artifact. One
+      // field rather than one per cause, because the caller's next action is the
+      // same in every case -- go and look, do not assume you have seen them all.
+      unresolvedOwningIdentifiers,
+      owningIdentifiersUnrecorded,
+      // The question a caller actually has, answered here instead of left to be
+      // re-derived from three fields. A pre-write safety control is read under
+      // time pressure, so the directive names THIS and nothing else; every
+      // incompleteness cause above folds into it, and it fails toward `false`.
+      ownerListComplete:
+        withheldForAuthorizationCount === 0
+        && unresolvedOwningIdentifiers.length === 0
+        && !owningIdentifiersUnrecorded,
     });
   });
 

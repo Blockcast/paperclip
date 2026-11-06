@@ -173,6 +173,10 @@ describeEmbeddedPostgres("GET /api/companies/:companyId/work-products/by-externa
     expect(res.body.owners[0].provenance).toBe("webhook");
     expect(res.body.owners[0].owningIdentifiers).toEqual([`${company.issuePrefix}-1`]);
     expect(res.body.withheldForAuthorizationCount).toBe(0);
+    // Every declared owner was returned, so the caller may act on the list.
+    expect(res.body.unresolvedOwningIdentifiers).toEqual([]);
+    expect(res.body.owningIdentifiersUnrecorded).toBe(false);
+    expect(res.body.ownerListComplete).toBe(true);
     // A row that merely discusses the PR is not an owner.
     expect(res.body.owners.map((o: { issueId: string }) => o.issueId)).not.toContain(unrelated.id);
   }, 120_000);
@@ -306,5 +310,104 @@ describeEmbeddedPostgres("GET /api/companies/:companyId/work-products/by-externa
     expect(res.status).toBe(200);
     expect(res.body.owners).toHaveLength(1);
     expect(res.body.owners[0].issueId).toBe(myIssue.id);
+    // The other company's declared identifier must not reach this response by the
+    // back door either: the unresolved set is derived from the READABLE rows, so a
+    // row this seat may not see cannot leak its identifier through the new field.
+    expect(res.body.unresolvedOwningIdentifiers).toEqual([]);
+  }, 120_000);
+
+  // PEN-5340 item 5, the measured regression. Blockcast/penstock-llm-proxy-core#3114
+  // declares five owners, returns four, and reported `withheldForAuthorizationCount: 0`
+  // -- identical on an admin and a non-admin seat, so nothing was withheld. The fifth
+  // (`BLO-21096`) is another company's identifier: it matches no row here, so it is
+  // filtered by nothing and counted by nothing. The response was indistinguishable from
+  // a complete one, inside the control whose whole job is to stop a run concluding it
+  // has seen every owner.
+  it("reports a declared owner it could not return, which no authorization counter sees", async () => {
+    const company = await seedCompany(db, "Unresolved");
+    const agent = await seedAgent(db, company.id);
+    const first = await seedIssue(db, company, 1, "First owner");
+    const second = await seedIssue(db, company, 2, "Second owner");
+    // Exactly the live shape: the webhook copies every declared owner off the PR,
+    // including one belonging to an identifier space this company cannot resolve.
+    const owningIdentifiers = [`${company.issuePrefix}-1`, `${company.issuePrefix}-2`, "BLO-21096"];
+    await seedWebhookPullRequest(db, { companyId: company.id, issueId: first.id, externalId: PR, owningIdentifiers });
+    await seedWebhookPullRequest(db, { companyId: company.id, issueId: second.id, externalId: PR, owningIdentifiers });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(2);
+    // The counter is right and is not the point: nothing here is withheld.
+    expect(res.body.withheldForAuthorizationCount).toBe(0);
+    expect(res.body.unresolvedOwningIdentifiers).toEqual(["BLO-21096"]);
+    // The single signal the directive names. Without it, 2 / 0 / 3 reads as complete.
+    expect(res.body.ownerListComplete).toBe(false);
+  }, 120_000);
+
+  // The other direction of the same non-containment, and the reason completeness
+  // cannot be derived from comparing the two fields' sizes. Measured on
+  // Blockcast/paperclip#3114: three owning rows, each bound to its own issue, all
+  // three declaring only ONE identifier between them. `owners` is not a join on
+  // `owningIdentifiers` -- it is the set of rows carrying this external id -- so a
+  // returned owner that is declared nowhere is ordinary and must not read as short.
+  it("does not report an owner it DID return merely because the metadata omits it", async () => {
+    const company = await seedCompany(db, "Undeclared");
+    const agent = await seedAgent(db, company.id);
+    const declared = await seedIssue(db, company, 1, "The declared owner");
+    const undeclaredA = await seedIssue(db, company, 2, "Bound but undeclared");
+    const undeclaredB = await seedIssue(db, company, 3, "Also bound but undeclared");
+    const owningIdentifiers = [`${company.issuePrefix}-1`];
+    for (const issue of [declared, undeclaredA, undeclaredB]) {
+      await seedWebhookPullRequest(db, { companyId: company.id, issueId: issue.id, externalId: PR, owningIdentifiers });
+    }
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(3);
+    expect(res.body.unresolvedOwningIdentifiers).toEqual([]);
+    expect(res.body.ownerListComplete).toBe(true);
+  }, 120_000);
+
+  // `recordedPullRequestOwners` returns `null` for a recording it could not parse,
+  // and that is deliberately NOT the empty set. Read as "declares nothing" it would
+  // let an unreadable recording answer `complete`, which is the one direction this
+  // field must never fail in -- so it fails the other way.
+  it("refuses to call the list complete when a recording could not be read", async () => {
+    const company = await seedCompany(db, "Unrecorded");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Owner with an unparseable recording");
+    await db.insert(issueWorkProducts).values({
+      companyId: company.id,
+      issueId: owner.id,
+      type: "pull_request",
+      provider: "github",
+      externalId: PR,
+      title: PR,
+      url: `https://github.com/${PR.replace("#", "/pull/")}`,
+      status: "ready_for_review",
+      sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
+      // Non-string entries: a recording that exists and cannot be read.
+      metadata: { source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE, owningIdentifiers: [42] },
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(1);
+    expect(res.body.owners[0].owningIdentifiers).toBeNull();
+    expect(res.body.unresolvedOwningIdentifiers).toEqual([]);
+    expect(res.body.owningIdentifiersUnrecorded).toBe(true);
+    expect(res.body.ownerListComplete).toBe(false);
   }, 120_000);
 });

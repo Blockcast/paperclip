@@ -2012,6 +2012,19 @@ registry.registerPath({
   path: "/api/companies/{companyId}/work-products/by-external-id",
   tags: ["issues"],
   summary: "Find the issues that own an external artifact (reverse of list issue work products)",
+  // PEN-5340: the completeness limit belongs in the contract, because a caller that
+  // cannot see it reads every answer as complete.
+  description:
+    "Returns `owners`, every owning row the caller may read, authoritative (`provenance: " +
+    "\"webhook\"`) first. **Read `ownerListComplete` before treating the list as the whole " +
+    "owner set.** It is `false` whenever the answer is short, for any cause: a matched row " +
+    "withheld from this seat (`withheldForAuthorizationCount`), an owner the artifact declares " +
+    "that this lookup could not return (`unresolvedOwningIdentifiers`, e.g. another company's " +
+    "identifier space), or a recording that could not be parsed (`owningIdentifiersUnrecorded`). " +
+    "`withheldForAuthorizationCount: 0` does NOT mean complete -- it reports one cause only. " +
+    "`owners` is not a join on `owningIdentifiers`: owners are the work-product rows carrying " +
+    "this external id, while `owningIdentifiers` is provenance copied off the pull request, and " +
+    "neither set contains the other. An empty `owners` is not proof the artifact is unowned.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: workProductExternalIdLookupQuerySchema,

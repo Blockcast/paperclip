@@ -14020,7 +14020,17 @@ export function buildPaperclipTaskMarkdown(input: {
     // remainder as `withheldForAuthorizationCount`. Promising "EVERY owning row" would
     // teach a run that a short list means no owner -- the false absence this endpoint
     // exists to remove.
-    "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, with `provenance: \"webhook\"` marking the authoritative binding. `withheldForAuthorizationCount > 0` means owners exist that it did not show you -- an empty `owners` list is NOT proof the artifact is unowned.",
+    //
+    // PEN-5340 item 5: this used to name `withheldForAuthorizationCount > 0` as THE
+    // signal that the list was short, and that was measurably false. It reports only
+    // the authorization cause. #3114 declares five owners, returns four, and reports
+    // `0` -- the fifth is another company's identifier, which matches no row here and
+    // so is withheld by nothing. A run following this directive exactly was handed a
+    // short list that presented itself as complete, which is the failure mode the
+    // directive exists to prevent, inside the remedy for it. The route now answers the
+    // completeness question directly and this names that one field instead: a control
+    // read under time pressure should not require the reader to combine three.
+    "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, with `provenance: \"webhook\"` marking the authoritative binding. **`ownerListComplete: false` means the answer is SHORT -- owners exist that it did not show you, and you must not act as though you have seen them all.** It covers every cause: a row withheld from your seat (`withheldForAuthorizationCount`) AND an owner the artifact itself declares that the lookup could not return (`unresolvedOwningIdentifiers` -- another company's identifier space, a deleted or mistyped one). Do NOT read `withheldForAuthorizationCount: 0` as complete on its own; it reports only the first cause. An empty `owners` list is NOT proof the artifact is unowned. Name artifacts as `owner/repo#123` or a full URL, never a bare `#123`: the same number is a different pull request in every repo, and the lookup answers a wrong-repo key confidently rather than emptily.",
   );
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
