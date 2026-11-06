@@ -20,6 +20,27 @@ export interface PullRequestWorkProductInput {
   prMerged?: boolean;
   prMergedAt?: string | null;
   prUpdatedAt?: string | null;
+  /**
+   * The PR's own `state` (`"open"` / `"closed"`) as reported by the event
+   * payload, independent of the action that delivered it (PEN-5747).
+   *
+   * Load-bearing once an action can arrive while the PR is already closed.
+   * `pullRequestWorkProductStatus` used `action === "closed"` as its sole
+   * witness for closure, which held only while every admitted action was one a
+   * closed PR cannot emit. `labeled`/`unlabeled` break that: GitHub lets a
+   * closed PR be labelled, and the resulting event carries a strictly later
+   * `updated_at`, so `acceptIncoming` takes it on the timestamp comparison
+   * before rank is ever consulted -- overwriting a correct `closed` row with
+   * `ready_for_review`. That is the PERMANENT failure direction named in
+   * `work-products.ts`: a closed PR emits nothing further, so nothing corrects
+   * it, and PEN-2791's stranded-assigned sweep then reads the row as a live
+   * event-wake path forever.
+   *
+   * `undefined`/`null` means "this caller did not report state" and is NOT
+   * read as open -- the `action === "closed"` witness is kept alongside it, so
+   * every pre-existing caller keeps its exact prior behaviour.
+   */
+  prState?: string | null;
   /** GitHub `action` from the pull_request event. */
   action: string;
   /**
@@ -195,10 +216,20 @@ export function pullRequestHasMerged(
  * states and the row should describe the PR, not the event that last touched it.
  */
 export function pullRequestWorkProductStatus(
-  input: Pick<PullRequestWorkProductInput, "action" | "prDraft" | "prMerged" | "prMergedAt">,
+  input: Pick<
+    PullRequestWorkProductInput,
+    "action" | "prDraft" | "prMerged" | "prMergedAt" | "prState"
+  >,
 ): PullRequestWorkProductStatus {
   if (pullRequestHasMerged(input)) return "merged";
-  if (input.action === "closed") return "closed";
+  // Two independent witnesses for closure, deliberately. The action is the
+  // historical one and is kept so no existing caller changes behaviour; the
+  // PR's own state is what makes this correct for an action that a CLOSED PR
+  // can still emit (`labeled`/`unlabeled`, PEN-5747). Without the second
+  // witness, labelling a closed PR demotes its row to `ready_for_review`
+  // permanently -- see the `prState` field docblock for why nothing later
+  // repairs that.
+  if (input.action === "closed" || input.prState === "closed") return "closed";
   if (input.prDraft === true) return "draft";
   return "ready_for_review";
 }
