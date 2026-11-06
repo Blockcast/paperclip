@@ -2017,10 +2017,16 @@ registry.registerPath({
   description:
     "Returns `owners`, every owning row the caller may read, authoritative (`provenance: " +
     "\"webhook\"`) first. **Read `ownerListComplete` before treating the list as the whole " +
-    "owner set.** It is `false` whenever the answer is short, for any cause: a matched row " +
-    "withheld from this seat (`withheldForAuthorizationCount`), an owner the artifact declares " +
+    "owner set.** `true` means the owner set is verified whole; `false` means it is not, which " +
+    "spans two states the caller must treat identically. The answer may be SHORT: a matched row " +
+    "withheld from this seat (`withheldForAuthorizationCount`), or an owner the artifact declares " +
     "that this lookup could not return (`unresolvedOwningIdentifiers`, e.g. another company's " +
-    "identifier space), or a recording that could not be parsed (`owningIdentifiersUnrecorded`). " +
+    "identifier space). Or completeness may be UNVERIFIABLE: no `provenance: \"webhook\"` row in " +
+    "this answer carries a readable recording of what the artifact declared " +
+    "(`owningIdentifiersUnrecorded`) -- because none is present, or because the only recording " +
+    "could not be parsed -- so there is nothing to check the returned rows against. That is not a " +
+    "claim that owners are missing. `unresolvedOwningIdentifiers` and " +
+    "`withheldForAuthorizationCount` can describe the SAME owner and must not be summed. " +
     "`withheldForAuthorizationCount: 0` does NOT mean complete -- it reports one cause only. " +
     "`owners` is not a join on `owningIdentifiers`: owners are the work-product rows carrying " +
     "this external id, while `owningIdentifiers` is provenance copied off the pull request, and " +
