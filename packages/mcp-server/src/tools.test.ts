@@ -349,6 +349,21 @@ describe("paperclip MCP tools", () => {
     expect(description).toContain("`workProducts`");
     expect(description).toMatch(/`blockedBy`\/`blocks` come back ONLY when the request body carried `blockedByIssueIds`/);
 
+    // ...and that rule is `PATCH`-ONLY. It sat unscoped between two buckets that
+    // DID name their scope ("create and update alike" above, "`POST` ..." below),
+    // which reads as a deliberate omission rather than a missing qualifier. It is
+    // false for create twice over: `withIssueRelationSummaries` runs
+    // unconditionally in the create service and DEFAULTS the pair to `[]`
+    // (`server/src/services/issues.ts:7452`, called at `:11650`), and the create
+    // route appends `relatedWork`/`referencedIssueIdentifiers` ungated
+    // (`server/src/routes/issues.ts:12136`). Pin the scope, not just the rule —
+    // an unscoped rule here is the same over-generalisation this whole block
+    // warns about, committed inside the warning (third instance; Ally flagged
+    // the downstream echo at `c10a6df5`, CTO the rule it echoes).
+    expect(description).toContain("ON UPDATE ONLY; create is NOT conditional");
+    expect(description).toContain("Create returns BOTH pairs ALWAYS");
+    expect(description).toContain("does NOT transfer to create");
+
     // The split is why a careful reader is fooled: one third of the attendance
     // triple survives and looks authoritative while the other two vanish.
     expect(description).toContain("THE ATTENDANCE TRIPLE SPLITS");
@@ -387,7 +402,8 @@ describe("paperclip MCP tools", () => {
     // 2026-11-06, 11 of 12 rows from the company list route came back `[]`,
     // every one correct. Left unscoped, the text impeaches a correct read and
     // sends someone hunting a destructive write that never happened.
-    expect(description).toContain("it holds for THIS surface, and only for a write that actually PASSED");
+    expect(description).toContain("it holds for THIS surface (`PATCH`), and only for an update that actually PASSED");
+    expect(description).toContain("It does NOT hold for `paperclipCreateIssue`");
     expect(description).toContain("on a READ, `[]` is a receipt of nothing");
 
     // And the prescribed verification must route to the surface that actually
