@@ -410,8 +410,35 @@ export async function getActiveExternalRuntimeReservation(
 }
 
 /**
- * Serializes a non-`run` isolation bind against the two things it races, and
- * nothing else.
+ * PEN-5684: does this key name a resource only THIS run can ever bind?
+ *
+ * The single axis every shared-key rule in this module must test. Each of the
+ * three -- the per-key advisory lock, the BLO-48769 elder-waiter yield, and the
+ * release-side wake -- used to ask `isolationMode !== "run"` instead, which was
+ * a sound proxy only until BLO-31443 split `reservationKey` (the SHARED tree a
+ * run writes, and what is bound here) from `isolationKey` (the run's private
+ * filesystem identity, which still names the mode). After that split a mode-
+ * `run` bind can carry a shared `workspace-tree:` key, and all three rules
+ * silently stopped applying to it.
+ *
+ * Stated once, on purpose: the first fix moved only the yield, which left the
+ * release-side wake mode-gated and so made the elder yield without anything
+ * waking it -- the same axis error, one call site over.
+ *
+ * The three per-run shapes are enumerated rather than prefix-matched because a
+ * prefix test would also swallow a hypothetical shared key that happened to
+ * start with one of these words.
+ */
+function isRunUniqueIsolationKey(isolationKey: string, runId: string): boolean {
+  return isolationKey === `run:${runId}`
+    || isolationKey === `pending:${runId}`
+    || isolationKey === `legacy:${runId}`;
+}
+
+/**
+ * Serializes a SHARED-KEY isolation bind against the two things it races, and
+ * nothing else. "Shared-key" rather than "non-`run`": see
+ * `isRunUniqueIsolationKey`.
  *
  * - Other binds of the same key: an exclusive lock on the key keeps the
  *   check-then-act below (writer drift, the elder-waiter rule of BLO-48769)
@@ -447,7 +474,12 @@ export async function bindExternalRuntimeReservationIsolation(
   const now = input.now ?? new Date();
   try {
     return await db.transaction(async (tx) => {
-      if (input.isolationMode !== "run") {
+      // PEN-5684: keyed on the KEY, not the mode. A mode-`run` tree-scoped bind
+      // races other binds of that tree exactly as a mode-`workspace` one does,
+      // and the docblock above promises this lock makes the elder-waiter rule
+      // below atomic per key -- a promise that was false for this population
+      // while the gate tested the mode.
+      if (!isRunUniqueIsolationKey(input.isolationKey, input.runId)) {
         await lockExternalRuntimeIsolationBinding(tx, input.isolationKey);
       }
       const existing = await tx
@@ -524,7 +556,7 @@ export async function bindExternalRuntimeReservationIsolation(
       // This is BLO-19422's defect shape repeated: `agent-shared` was likewise
       // judged "already stricter" on the AGENT axis while carrying no tree
       // scope at all. Test the key, not the mode.
-      const bindsRunUniqueKey = input.isolationKey === `run:${input.runId}`;
+      const bindsRunUniqueKey = isRunUniqueIsolationKey(input.isolationKey, input.runId);
       // The `legacy_writer` screen is deliberately LEFT on the mode test. It is
       // an unconditional block on every keyed bind rather than a per-key
       // comparison, so widening it would newly refuse the whole mode-`run`
@@ -777,9 +809,19 @@ export async function releaseExternalRuntimeReservation(
   if (reservation) {
     recordExternalRuntimeReservationEvent("released");
     refreshExternalRuntimeReservationMetricsBestEffort(db, now, "release");
+    // PEN-5684: the acquire side and the release side MUST test the same axis.
+    // While this was mode-gated and the yield was not, a released mode-`run`
+    // tree writer woke nobody: every younger contender yielded to the elder,
+    // and the elder then waited out its own backoff (up to ~5 min) on a tree
+    // that was already free. That is precisely the dead time BLO-48769's wake
+    // exists to remove, re-introduced on the hottest key shape.
+    //
+    // `pending:`/`legacy:` keys are per-run by construction, so they stay
+    // excluded here exactly as they were under the old mode test -- no waiter
+    // can be stamped with one, and the predicate saves the pointless lookup.
     if (
       reservation.isolationKey
-      && (reservation.isolationMode === "workspace" || reservation.isolationMode === "shared")
+      && !isRunUniqueIsolationKey(reservation.isolationKey, reservation.runId)
     ) {
       await wakeOldestIsolationWaiter(db, reservation.isolationKey, now).catch((error) => {
         logger.warn({ error, isolationKey: reservation.isolationKey }, "failed to wake oldest isolation waiter");
