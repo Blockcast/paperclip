@@ -16,6 +16,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  type GitHubCliContentRefusal,
+  type GitHubCliRewrite,
   hasGitHubCliStdinTextFile,
   scrubGitHubCliInvocation,
 } from "./github-cli-egress-shim.js";
@@ -27,12 +29,28 @@ import {
   type ReviewAttestationGuardIo,
 } from "./github-review-attestation.js";
 
+/** Where a rewrite notice goes. Split out so tests can capture it, exactly as
+ *  {@link GitHubMcpEgressRuntimeIo} does at the MCP door. */
+export interface GitHubCliEgressRuntimeIo {
+  /** One already-formatted notice. Receives CLASSES and SCRUBBED excerpts
+   *  only, never the material that fired. */
+  notify(message: string): void;
+}
+
+const defaultIo: GitHubCliEgressRuntimeIo = {
+  notify: (message) => {
+    console.error(message);
+  },
+};
+
 export interface GitHubCliEgressRuntimeOptions {
   target: string;
   argv: string[];
   /** Override the review-attestation guard's I/O. Tests inject a resolver so
    *  the guard can be exercised without a network or a real repository. */
   guardIo?: ReviewAttestationGuardIo;
+  /** Override where the PEN-5734 rewrite notice is written. */
+  io?: GitHubCliEgressRuntimeIo;
 }
 
 export class GitHubCliEgressRuntimeError extends Error {
@@ -48,6 +66,11 @@ export class GitHubCliEgressRuntimeError extends Error {
 export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOptions): {
   argv: string[];
   temporaryDirectory: string | null;
+  /** PEN-5734: every value that was rewritten in place and is still being
+   *  sent. Already announced via `io.notify` by the time this returns; it is
+   *  returned as well so an embedding caller can act on the rewrite
+   *  programmatically rather than by parsing stderr. Empty on a clean call. */
+  rewrites: GitHubCliRewrite[];
 } {
   const { target, argv } = options;
   if (!target) throw new GitHubCliEgressRuntimeError("missing GitHub CLI target");
@@ -86,32 +109,7 @@ export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOption
   // stdin rejection above: refuse, and say exactly what to fix.
   if (result.refusals.length > 0) {
     if (temporaryDirectory) rmSync(temporaryDirectory, { recursive: true, force: true });
-    const detail = result.refusals
-      .map((refusal) => {
-        const where = refusal.path ? ` (${refusal.path})` : "";
-        // BLO-41262: name the lines. Without them, finding the match in a
-        // 3000-line draft took ~12 bisecting API calls. The excerpt is the
-        // SCRUBBED line, so the refusal cannot carry the material it refused.
-        const lines = refusal.locations
-          .map((location) => {
-            const key = location.key ? `${location.key}:` : "";
-            return `\n    ${key}${location.line}: ${location.excerpt}`;
-          })
-          .join("");
-        // A region class never has line attribution (see
-        // locateGitHubEgressMatches), so say so rather than print nothing.
-        // Keyed on the class, not on `locations.length === 0`: in an --input
-        // body one key can trip a region class while another prints a line,
-        // and the region key still needs explaining. The lines that do print
-        // come from other keys, so say that too rather than read as a
-        // contradiction.
-        const unlocated = refusal.classes.some((cls) => GITHUB_EGRESS_REGION_CLASSES.includes(cls))
-          ? " (spans lines; no per-line location is reported for environment-dump or private-key-block;" +
-            " any lines listed are other, single-line matches)"
-          : "";
-        return `\`${refusal.field}\`${where} matched ${refusal.classes.join(", ")}${unlocated}${lines}`;
-      })
-      .join("; ");
+    const detail = result.refusals.map(describeSpan).join("; ");
     throw new GitHubCliEgressRuntimeError(
       `refusing to rewrite GitHub repository content: ${detail}\n` +
         "Content fields are never scrubbed in place — a silent rewrite would corrupt the committed bytes. " +
@@ -120,7 +118,89 @@ export function prepareGitHubCliInvocation(options: GitHubCliEgressRuntimeOption
     );
   }
 
-  return { argv: result.argv, temporaryDirectory };
+  // PEN-5734: say what was rewritten. Everything above this point either
+  // passed through byte-exact or was refused; everything that reaches here has
+  // had agent-authored text REPLACED IN PLACE and is about to be published
+  // anyway, which is the one outcome the caller could not previously detect.
+  //
+  // Measured first-hand on 2026-11-06: `gh pr edit --body-file` carrying a
+  // `--force-with-lease=<ref>:<oid>` recipe ran, exited 0, printed nothing on
+  // either stream, and served back a body with a redaction marker where the
+  // branch name had been. Nothing in the tool result, the exit code or the
+  // output distinguished that from a clean write, so an agent that trusts its
+  // own success publishes a corrupted instruction and reports the step done.
+  //
+  // WHY THIS IS A NOTICE AND NOT A REFUSAL, since the two other doors choose
+  // differently and the asymmetry has to be deliberate:
+  //
+  //  - The `git` push door (PEN-3156) refuses, and the content-field branch
+  //    above refuses, because both carry BYTES THAT GET COMMITTED. A rewrite
+  //    there survives into the repository and reads on review as an
+  //    intentional change (#1542).
+  //  - This branch carries PROSE — a review body, a PR description, a comment.
+  //    Removing the material and publishing the rest IS the containment
+  //    PEN-2527 was built to perform. Refusing instead would mean an agent
+  //    that accidentally pastes a token cannot post its review at all, and the
+  //    whole body is then retyped by hand around a control nobody can see.
+  //
+  // So the defect was never the rewrite. It was the silence.
+  //
+  // THE EXIT CODE STAYS THE CHILD'S, deliberately. This notice is emitted
+  // BEFORE `gh` is spawned, so the author sees it whether the call then
+  // succeeds or fails; but failing the invocation after a successful publish
+  // would be a lie in the other direction — the artifact exists, and a caller
+  // that retries on non-zero would post it twice.
+  //
+  // Format mirrors the refusal above, field by field, because the fleet
+  // already parses that shape and because the two differ only in disposition.
+  if (result.rewrites.length > 0) {
+    const io = options.io ?? defaultIo;
+    io.notify(
+      `${REWRITE_NOTICE_PREFIX} ${result.rewrites.map(describeSpan).join("; ")}\n` +
+        "The text above is what GitHub will receive — it is NOT what you wrote. " +
+        "Re-read the artifact after this call, and rewrite the marked span if the published form matters " +
+        "(a literal a control requires can usually be assigned to a shell variable and interpolated).",
+    );
+  }
+
+  return { argv: result.argv, temporaryDirectory, rewrites: result.rewrites };
+}
+
+/** Stable leader on the PEN-5734 rewrite notice, so a caller can recognise one
+ *  without parsing prose. Distinct from the `paperclip-github-egress:` error
+ *  leader `reportRuntimeError` uses, because this call is NOT failing. */
+export const REWRITE_NOTICE_PREFIX = "paperclip-github-egress: REWROTE outbound text:";
+
+/**
+ * Describe one scrubbed span — the field, where its bytes came from, which
+ * classes fired, and on which lines.
+ *
+ * Shared by the refusal and the rewrite notice so the two cannot drift: they
+ * report the same evidence and differ only in what the runtime does next.
+ *
+ * BLO-41262: name the lines. Without them, finding the match in a 3000-line
+ * draft took ~12 bisecting API calls. The excerpt is the SCRUBBED line, so
+ * neither message can carry the material it removed.
+ */
+function describeSpan(span: GitHubCliContentRefusal | GitHubCliRewrite): string {
+  const where = span.path ? ` (${span.path})` : "";
+  const lines = span.locations
+    .map((location) => {
+      const key = location.key ? `${location.key}:` : "";
+      return `\n    ${key}${location.line}: ${location.excerpt}`;
+    })
+    .join("");
+  // A region class never has line attribution (see locateGitHubEgressMatches),
+  // so say so rather than print nothing. Keyed on the class, not on
+  // `locations.length === 0`: in an --input body one key can trip a region
+  // class while another prints a line, and the region key still needs
+  // explaining. The lines that do print come from other keys, so say that too
+  // rather than read as a contradiction.
+  const unlocated = span.classes.some((cls) => GITHUB_EGRESS_REGION_CLASSES.includes(cls))
+    ? " (spans lines; no per-line location is reported for environment-dump or private-key-block;" +
+      " any lines listed are other, single-line matches)"
+    : "";
+  return `\`${span.field}\`${where} matched ${span.classes.join(", ")}${unlocated}${lines}`;
 }
 
 /**

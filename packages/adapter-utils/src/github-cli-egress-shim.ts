@@ -125,12 +125,47 @@ export interface GitHubCliContentRefusal {
   locations: GitHubCliContentLocation[];
 }
 
+/**
+ * A text value this shim REWROTE on its way to GitHub.
+ *
+ * PEN-5734: the result used to carry `redacted` and `classes` and nothing
+ * else, and the runtime discarded both — so a `gh pr edit --body-file` whose
+ * body had been rewritten in place ran, exited 0, and printed nothing. The
+ * author's only way to learn that the published artifact was not what they
+ * wrote was to read it back, and the measured instance published a force-push
+ * recipe with a redaction marker where the branch name belonged.
+ *
+ * Deliberately the same shape as {@link GitHubCliContentRefusal}, because the
+ * two carry the same evidence and differ only in what the runtime does with
+ * it. Refusals stop the call; rewrites announce it.
+ */
+export interface GitHubCliRewrite {
+  /** The flag or request field whose value was rewritten. */
+  field: string;
+  /** Path, when the bytes came from a file rather than inline argv. */
+  path: string | null;
+  classes: GitHubEgressScrubClass[];
+  /**
+   * Lines that fired, so the author does not have to bisect the artifact.
+   *
+   * May be empty even though `classes` is not: a class that only fires across
+   * lines has no single line. Report `classes` regardless.
+   */
+  locations: GitHubCliContentLocation[];
+}
+
 export interface GitHubCliScrubResult {
   argv: string[];
   redacted: boolean;
   classes: GitHubEgressScrubClass[];
   /** Non-empty when the invocation must be refused rather than run. */
   refusals: GitHubCliContentRefusal[];
+  /**
+   * Every value that WAS rewritten and will still be sent. The caller must
+   * surface these; a rewrite the author never hears about is the PEN-5734
+   * defect.
+   */
+  rewrites: GitHubCliRewrite[];
 }
 
 /**
@@ -179,9 +214,11 @@ export function scrubGitHubCliInvocation(
   const out = [...argv];
   const fired = new Set<GitHubEgressScrubClass>();
   const refusals: GitHubCliContentRefusal[] = [];
+  const rewrites: GitHubCliRewrite[] = [];
 
-  const record = (classes: readonly GitHubEgressScrubClass[]) => {
-    for (const cls of classes) fired.add(cls);
+  const record: RecordRewrite = (rewrite) => {
+    for (const cls of rewrite.classes) fired.add(cls);
+    rewrites.push(rewrite);
   };
   const refuse = (refusal: GitHubCliContentRefusal) => {
     refusals.push(refusal);
@@ -199,7 +236,12 @@ export function scrubGitHubCliInvocation(
         const scrubbed = scrubGitHubEgressText(value);
         if (scrubbed.redacted) {
           out[i] = `${flag}=${scrubbed.text}`;
-          record(scrubbed.classes);
+          record({
+            field: flag,
+            path: null,
+            classes: scrubbed.classes,
+            locations: locateContent(null, value),
+          });
         }
         continue;
       }
@@ -234,7 +276,12 @@ export function scrubGitHubCliInvocation(
       const scrubbed = scrubGitHubEgressText(next);
       if (scrubbed.redacted) {
         out[i + 1] = scrubbed.text;
-        record(scrubbed.classes);
+        record({
+          field: arg,
+          path: null,
+          classes: scrubbed.classes,
+          locations: locateContent(null, next),
+        });
       }
       i += 1;
       continue;
@@ -259,8 +306,12 @@ export function scrubGitHubCliInvocation(
     redacted: fired.size > 0,
     classes: orderedClasses(fired),
     refusals,
+    rewrites,
   };
 }
+
+/** How a nested helper reports a value it rewrote. */
+type RecordRewrite = (rewrite: GitHubCliRewrite) => void;
 
 /**
  * Scrub a text file, returning a replacement path, or null to leave argv alone.
@@ -277,7 +328,7 @@ function scrubTextFile(
   path: string,
   field: string,
   io: GitHubCliScrubIo,
-  record: (classes: readonly GitHubEgressScrubClass[]) => void,
+  record: RecordRewrite,
   refuse: (refusal: GitHubCliContentRefusal) => void,
 ): string | null {
   if (path === "-") return null;
@@ -297,7 +348,12 @@ function scrubTextFile(
         return null;
       }
       if (split.proseClasses.length === 0) return null;
-      record(split.proseClasses);
+      record({
+        field,
+        path,
+        classes: split.proseClasses,
+        locations: split.proseLocations,
+      });
       return io.writeTempText(split.body);
     }
   }
@@ -305,7 +361,12 @@ function scrubTextFile(
   const scrubbed = scrubGitHubEgressText(contents);
   if (!scrubbed.redacted) return null;
 
-  record(scrubbed.classes);
+  record({
+    field,
+    path,
+    classes: scrubbed.classes,
+    locations: locateContent(null, contents),
+  });
   return io.writeTempText(scrubbed.text);
 }
 
@@ -331,6 +392,7 @@ function splitRequestBody(body: string): {
   contentClasses: GitHubEgressScrubClass[];
   contentLocations: GitHubCliContentLocation[];
   proseClasses: GitHubEgressScrubClass[];
+  proseLocations: GitHubCliContentLocation[];
 } | null {
   let parsed: unknown;
   try {
@@ -343,6 +405,10 @@ function splitRequestBody(body: string): {
   const contentFired = new Set<GitHubEgressScrubClass>();
   const contentLocations: GitHubCliContentLocation[] = [];
   const proseFired = new Set<GitHubEgressScrubClass>();
+  // PEN-5734: prose values are REWRITTEN rather than refused, so their
+  // locations are what the rewrite notice reports. Same attribution the
+  // refusal path already does for content values.
+  const proseLocations: GitHubCliContentLocation[] = [];
 
   const walk = (node: unknown): unknown => {
     // A string reaching walk() came from an ARRAY element (object properties
@@ -352,6 +418,7 @@ function splitRequestBody(body: string): {
     if (typeof node === "string") {
       const scrubbed = scrubGitHubEgressText(node);
       for (const cls of scrubbed.classes) proseFired.add(cls);
+      if (scrubbed.redacted) proseLocations.push(...locateContent(null, node));
       return scrubbed.text;
     }
     if (Array.isArray(node)) return node.map(walk);
@@ -372,6 +439,7 @@ function splitRequestBody(body: string): {
         continue;
       }
       for (const cls of scrubbed.classes) proseFired.add(cls);
+      if (scrubbed.redacted) proseLocations.push(...locateContent(key, value));
       out[key] = scrubbed.text;
     }
     return out;
@@ -385,6 +453,7 @@ function splitRequestBody(body: string): {
     contentClasses: orderedClasses(contentFired),
     contentLocations,
     proseClasses: orderedClasses(proseFired),
+    proseLocations,
   };
 }
 
@@ -425,7 +494,7 @@ function scrubField(
   expression: string,
   typed: boolean,
   io: GitHubCliScrubIo,
-  record: (classes: readonly GitHubEgressScrubClass[]) => void,
+  record: RecordRewrite,
   refuse: (refusal: GitHubCliContentRefusal) => void,
 ): string {
   const equals = expression.indexOf("=");
@@ -467,6 +536,11 @@ function scrubField(
     });
     return expression;
   }
-  record(scrubbed.classes);
+  record({
+    field: key,
+    path: null,
+    classes: scrubbed.classes,
+    locations: locateContent(null, value),
+  });
   return `${key}=${scrubbed.text}`;
 }
