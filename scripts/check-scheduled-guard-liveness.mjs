@@ -1280,7 +1280,8 @@ function queuedJobLabels(repo, runId) {
   try {
     const raw = gh(["api", `repos/${repo}/actions/runs/${runId}/jobs?per_page=100`]);
     const jobs = JSON.parse(raw).jobs ?? [];
-    const job = jobs.find((j) => j.status === "queued") ?? jobs[0];
+    // No queued job → null ("could not be read"); jobs[0] may be a finished job on another lane.
+    const job = jobs.find((j) => j.status === "queued");
     return job?.labels?.length ? job.labels : null;
   } catch {
     return null;
