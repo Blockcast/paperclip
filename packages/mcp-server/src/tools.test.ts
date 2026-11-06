@@ -356,9 +356,16 @@ describe("paperclip MCP tools", () => {
     expect(description).toContain("BLO-34421");
     // The survivor is the trap, not the absences: `executionState` comes back
     // FULLY POPULATED in the same payload its two neighbours vanish from, and a
-    // detailed nested object reads as a complete response (CTO, run `fef2198c`).
+    // detailed nested object reads as a complete response (CTO, run `9ccaa4ea`).
+    // It survives because it is a COLUMN, not a hydration — which is the rule
+    // that PREDICTS the 85/66 partition instead of enumerating it, and is also
+    // why `null` here means "this row has no monitor state", never "the write
+    // dropped it". Pin both the generator and the null case: the populated
+    // reading was measured on a row that HAD a monitor and generalised past it.
     expect(description).toContain("the split is three-way");
     expect(description).toContain("Detail is read as completeness");
+    expect(description).toContain("COLUMNS SURVIVE A WRITE, HYDRATIONS VANISH");
+    expect(description).toContain("is NOT evidence the write dropped it");
 
     // POST hydrates the relation pair, PATCH does not — which is what trains
     // the habit on create and breaks it on update.
@@ -370,6 +377,18 @@ describe("paperclip MCP tools", () => {
     // cleared, or misses that they cleared them.
     expect(description).toContain("TRUE RECEIPT OF A DESTRUCTIVE WRITE");
     expect(description).toContain("investigate is the write, not the field");
+
+    // ...but that inversion is narrower than it reads. It holds on THIS surface
+    // AND only for a write that passed `blockedByIssueIds`; absent that, the API
+    // omits the key, so an `[]` there is the reader's. The first draft scoped it
+    // to neither and generalised to every surface — the document committing its
+    // own error inside the warning against it. The READ
+    // routes return `[]` truthfully and it is their MODAL value: measured
+    // 2026-11-06, 11 of 12 rows from the company list route came back `[]`,
+    // every one correct. Left unscoped, the text impeaches a correct read and
+    // sends someone hunting a destructive write that never happened.
+    expect(description).toContain("it holds for THIS surface, and only for a write that actually PASSED");
+    expect(description).toContain("on a READ, `[]` is a receipt of nothing");
 
     // And the prescribed verification must route to the surface that actually
     // hydrates, rather than to another write.
