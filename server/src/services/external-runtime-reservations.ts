@@ -497,6 +497,42 @@ export async function bindExternalRuntimeReservationIsolation(
           + `received ${input.isolationMode}/${input.isolationKey}`,
         );
       }
+      // PEN-5684: `isolationMode` is the WRONG AXIS to ask "can another run bind
+      // this key too?", and reading it as that proxy silently disabled the
+      // fairness yield below for the entire shared-checkout population.
+      //
+      // BLO-31443 split the two keys apart: `isolationMode`/`isolationKey` name
+      // the run's PRIVATE filesystem identity, while the key actually bound here
+      // is `reservationKey` (see the call site in heartbeat.ts, which passes
+      // `k8sIsolationIdentity.reservationKey` as `input.isolationKey`), and
+      // `withTreeScopedReservationKey` substitutes a SHARED
+      // `workspace-tree:<treeKey>` into it while leaving the mode untouched. So
+      // mode `run` no longer implies a run-unique key: an agent at effective
+      // concurrency > 1 running `project_primary` takes the `run` branch of
+      // `resolveK8sRunIsolationIdentity` and binds
+      // `workspace-tree:project-primary:<pwid>` -- the one shared checkout every
+      // seat contends for. Gating on the mode skipped the elder check for
+      // exactly those runs.
+      //
+      // Measured: `paperclip_k8s_isolation_conflict_deferrals_total` carried
+      // `elder_waiter` on 143 of 238 `workspace`-shape cycles and 0 of 539
+      // `workspace-tree:project-primary` cycles (2026-11-06) -- not rare, an
+      // absent series. That is the shape whose attempt tail runs to ~55 while
+      // the shape with the yield stops dead at 21, and it is where attempt 48
+      // on Cto (11-02) and 28 on Devops (11-05) came from.
+      //
+      // This is BLO-19422's defect shape repeated: `agent-shared` was likewise
+      // judged "already stricter" on the AGENT axis while carrying no tree
+      // scope at all. Test the key, not the mode.
+      const bindsRunUniqueKey = input.isolationKey === `run:${input.runId}`;
+      // The `legacy_writer` screen is deliberately LEFT on the mode test. It is
+      // an unconditional block on every keyed bind rather than a per-key
+      // comparison, so widening it would newly refuse the whole mode-`run`
+      // population the moment one unreleased pre-migration reservation existed
+      // -- a much larger blast radius than the defect being fixed here, and a
+      // separate decision. `legacy` rows are pre-migration and expected to be
+      // absent; if that ever stops being true this asymmetry is the thing to
+      // revisit.
       if (input.isolationMode !== "run") {
         const legacyWriter = await tx
           .select({ runId: externalRuntimeReservations.runId })
@@ -516,10 +552,17 @@ export async function bindExternalRuntimeReservationIsolation(
             "legacy_writer",
           );
         }
-        // BLO-48769: the writer goes to the oldest live waiter on this key, not
-        // to whichever run reaches bind first after a release (usually the
-        // releasing agent's own next run, or a waiter on a shorter backoff).
-        // A younger run yields by taking the normal conflict/defer path.
+      }
+      // BLO-48769: the writer goes to the oldest live waiter on this key, not
+      // to whichever run reaches bind first after a release (usually the
+      // releasing agent's own next run, or a waiter on a shorter backoff).
+      // A younger run yields by taking the normal conflict/defer path.
+      //
+      // PEN-5684: keyed on `bindsRunUniqueKey`, not on the mode -- see above.
+      // A genuinely run-unique key can have no other waiter by construction, so
+      // skipping it there is an optimisation; skipping it for a tree-scoped
+      // mode-`run` bind was the defect.
+      if (!bindsRunUniqueKey) {
         const self = await tx
           .select({ createdAt: heartbeatRuns.createdAt })
           .from(heartbeatRuns)

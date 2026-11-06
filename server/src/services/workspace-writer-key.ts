@@ -83,6 +83,22 @@
  * the figure above -- it was climbing ~0.37 points/day over the week to
  * 2026-11-05, which is how the last number in this comment went stale.
  *
+ * ⚠️ THAT TRIGGER WAS NOT DIAGNOSTIC WHEN IT WAS WRITTEN, and the failure was
+ * in the expensive direction -- it would have fired a storage re-architecture
+ * off a number that could not have read any other way. `elder_waiter` was
+ * STRUCTURALLY UNREACHABLE on the `workspace-tree:project-primary` shape:
+ * `bindExternalRuntimeReservationIsolation` gated the yield on
+ * `isolationMode !== "run"`, while every contending seat binds that shape in
+ * mode `run` (effective concurrency > 1). So the ratio was pinned at 100%
+ * `active_writer` by construction -- measured 0 of 539 cycles on 2026-11-06,
+ * against 143 of 238 on the `workspace` shape, which does reach the check.
+ * PEN-5684 re-gated it on whether the BOUND KEY is run-unique.
+ *
+ * ⇒ the trigger only became readable once that landed. Before trusting a
+ * dominance ratio on any key shape, confirm the `elder_waiter` series EXISTS
+ * for that shape; an absent series is evidence about the admission path, not
+ * about the tree. A zero that cannot move is not a measurement.
+ *
  * Any revisit must also cover the `workspace:<uuid>` key shape, not just
  * `project_primary`: 44% of contending rows in PEN-5684's census were on that
  * second shape, which no change to the branch below would touch.

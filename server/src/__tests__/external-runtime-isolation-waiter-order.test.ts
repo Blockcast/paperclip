@@ -92,6 +92,16 @@ describeEmbeddedPostgres("isolation writer admits waiters oldest-first (BLO-4876
   }
   const bind = (runId: string, reservationId: string, key: string) =>
     bindExternalRuntimeReservationIsolation(db, { runId, reservationId, isolationMode: "workspace", isolationKey: key });
+  // PEN-5684: the production shape for a SHARED `project_primary` checkout.
+  // `resolveK8sRunIsolationIdentity` returns mode `run` for any agent at
+  // effective concurrency > 1, and `withTreeScopedReservationKey` then
+  // substitutes the shared `workspace-tree:project-primary:<pwid>` into the
+  // RESERVATION key only -- so the bind that every contending seat actually
+  // performs is mode `run` on a shared key. Every case above binds mode
+  // `workspace`, so the suite passed in full while the yield was dead for the
+  // entire shared-checkout population.
+  const bindAsSharedTreeRunMode = (runId: string, reservationId: string, key: string) =>
+    bindExternalRuntimeReservationIsolation(db, { runId, reservationId, isolationMode: "run", isolationKey: key });
 
   it("makes a younger contender yield to an older live waiter, then lets the elder in", async () => {
     const key = `workspace-tree:project-primary:${randomUUID()}`;
@@ -177,6 +187,38 @@ describeEmbeddedPostgres("isolation writer admits waiters oldest-first (BLO-4876
     const run = await insertRun({ createdAt: new Date(), status: "running" });
     const res = await reserve(run);
     expect((await bind(run, res.id, key)).isolationKey).toBe(key);
+  });
+
+  it("yields to an older waiter when a shared tree key is bound in `run` isolation mode (PEN-5684)", async () => {
+    const key = `workspace-tree:project-primary:${randomUUID()}`;
+    const now = Date.now();
+    const elder = await insertRun({
+      createdAt: new Date(now - 6 * 3600_000),
+      status: "queued",
+      context: waiting(key, new Date(now + 4 * 60_000)),
+    });
+    const young = await insertRun({ createdAt: new Date(now - 60_000), status: "running" });
+
+    const youngRes = await reserve(young);
+    const err = await bindAsSharedTreeRunMode(young, youngRes.id, key).catch((e) => e);
+    expect(err).toBeInstanceOf(ExternalRuntimeIsolationConflictError);
+    expect((err as ExternalRuntimeIsolationConflictError).conflictCause).toBe("elder_waiter");
+    expect((err as ExternalRuntimeIsolationConflictError).conflictingRunId).toBe(elder);
+  });
+
+  it("still skips the elder check for a genuinely run-unique key (PEN-5684)", async () => {
+    // The narrowing must not cost the optimisation: `run:<runId>` cannot be
+    // bound by anyone else, so an unrelated older waiter must not block it.
+    const now = Date.now();
+    const young = await insertRun({ createdAt: new Date(now - 60_000), status: "running" });
+    const ownKey = `run:${young}`;
+    await insertRun({
+      createdAt: new Date(now - 6 * 3600_000),
+      status: "queued",
+      context: waiting(ownKey, new Date(now + 4 * 60_000)),
+    });
+    const youngRes = await reserve(young);
+    expect((await bindAsSharedTreeRunMode(young, youngRes.id, ownKey)).isolationKey).toBe(ownKey);
   });
 
   it("releasing a yielded run's still-pending reservation does not refresh the elder's stamp", async () => {
