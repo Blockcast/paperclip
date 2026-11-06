@@ -9,6 +9,10 @@ import { buildOpenApiSpec, openApiRoutes } from "../routes/openapi.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const ROUTES_DIR = path.resolve(__dirname, "../routes");
+// Route-path constants that the clients also need live here, not in the routes
+// directory, because `packages/shared` cannot import from `server`. See
+// `loadExportedPathConstants`.
+const SHARED_VALIDATORS_DIR = path.resolve(__dirname, "../../../packages/shared/src/validators");
 
 const apiPrefixes: Record<string, string> = {
   "access.ts": "/api",
@@ -119,15 +123,35 @@ function routeSourceFiles() {
   return fs.readdirSync(ROUTES_DIR).filter((entry) => entry.endsWith(".ts"));
 }
 
+function sharedValidatorSourceFiles() {
+  return fs
+    .readdirSync(SHARED_VALIDATORS_DIR)
+    .filter((entry) => entry.endsWith(".ts") && !entry.endsWith(".test.ts"));
+}
+
 // `IDENT -> "/literal"` for every statically-valued path constant exported from the
 // routes directory, so `router.post(COMPANY_IMPORT_ROUTE_PATH, ...)` resolves without
 // a hand-maintained special case. Excluded files are still scanned for constants —
 // a constant may live in a file whose own routes are out of OpenAPI scope.
+//
+// The shared validators are scanned too (PEN-5707). A mounted path that also has to
+// appear in prose the clients render — `ISSUE_RECOVERY_ACTION_RESOLVE_ROUTE`, whose
+// guidance string names the route an agent must POST to — has to live in a package
+// both sides can import, and `packages/shared` cannot import from `server`. Without
+// this the registration resolves to nothing, which does not fail quietly: the route
+// drops out of the scanned set and then reads as `extraInSpec`, i.e. a route the
+// OpenAPI document invents. Routes-dir constants are loaded last so that on a name
+// collision the directory that actually owns mounted paths wins.
 function loadExportedPathConstants() {
   const constants = new Map<string, string>();
 
-  for (const file of routeSourceFiles()) {
-    const source = fs.readFileSync(path.join(ROUTES_DIR, file), "utf8");
+  const sources: string[] = [
+    ...sharedValidatorSourceFiles().map((file) => path.join(SHARED_VALIDATORS_DIR, file)),
+    ...routeSourceFiles().map((file) => path.join(ROUTES_DIR, file)),
+  ];
+
+  for (const sourcePath of sources) {
+    const source = fs.readFileSync(sourcePath, "utf8");
     for (const match of source.matchAll(EXPORTED_PATH_CONSTANT_PATTERN)) {
       constants.set(match[1], match[2]);
     }
