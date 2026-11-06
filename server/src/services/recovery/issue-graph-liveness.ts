@@ -107,6 +107,7 @@ export interface IssueLivenessDependencyPathEntry {
 
 export type IssueLivenessOwnerCandidateReason =
   | "stalled_blocker_assignee"
+  | "repair_target_assignee"
   | "assignee_reporting_chain"
   | "creator_reporting_chain"
   | "root_agent"
@@ -408,16 +409,75 @@ function orderedInvokableAgents(
     .sort((left, right) => left.id.localeCompare(right.id));
 }
 
+/**
+ * PEN-5851: when the prescribed repair is a write on a row OTHER than the recovery issue,
+ * that row's assignee has to come first, because it is the only agent who can perform it.
+ *
+ * `issue:mutate` is relationship-gated: a non-assignee `PATCH /api/issues/:id` returns
+ * `403 deny_missing_grant`. So an escalation whose Next Action is "edit row X" is
+ * unactionable by anyone but X's assignee — the selected owner's only remaining move is to
+ * comment on X and wait for its assignee to wake, which costs one extra run, minimum,
+ * every time.
+ *
+ * This only bites where the repair target and the recovery issue differ. For the
+ * assignee-shaped rules (`blocked_without_blockers`, `in_review_without_action_path`,
+ * `blocked_by_assigned_backlog_issue`, …) they are the same row, and
+ * `includeStalledAssignee` already puts that assignee first. The one rule where they
+ * diverge is `blocked_by_cancelled_issue`: the recovery issue is the *cancelled blocker*,
+ * whose assignee is deliberately skipped below — you do not wake the owner of a cancelled
+ * row — while the repair (`blockedByIssueIds`) is a write on the row that HOLDS the dead
+ * edge. Candidate selection then fell through to that blocker's reporting chain, which is
+ * how all 6 `blocked_by_cancelled_issue` escalations with an assigned repair target
+ * (2026-06-17 → 2026-11-06) went to an agent who structurally could not perform the write.
+ *
+ * Measured instance, PEN-5787: repair target PEN-5449 was assigned to Devops (`11b9c48f`),
+ * who was in the candidate set and invokable; selection picked Cto (`29033747`), whose run
+ * hit `403`, commented, and left the incident open. A second Cto run re-reached the same
+ * wall. Devops made the one-line change and the sweep auto-resolved six minutes later —
+ * three runs for one field write.
+ *
+ * Fallback is unchanged in both directions this must not regress: an absent or uninvokable
+ * repair-target assignee adds nothing (`addOwnerCandidate` filters both), so the ordering
+ * below applies exactly as before. That keeps PEN-1746 — a cancelled blocker whose repair
+ * target had no assignee at all, the one correct non-assignee routing in the population —
+ * and `blocked_by_uninvokable_assignee` on today's behaviour.
+ */
 function ownerCandidatesForRecoveryIssue(
   issue: IssueLivenessIssueInput,
   agents: IssueLivenessAgentInput[],
   agentsById: Map<string, IssueLivenessAgentInput>,
   options: {
     includeStalledAssignee?: boolean;
+    /**
+     * The row the recommended action tells the owner to WRITE, when that is not `issue`.
+     * Its assignee is preferred over every other candidate. Pass only for rules whose
+     * repair is a subject-row write; rules that legitimately escalate ABOVE a stuck
+     * assignee must keep selecting from the chain.
+     */
+    repairTarget?: IssueLivenessIssueInput | null;
   } = {},
 ) {
   const candidates: IssueLivenessOwnerCandidate[] = [];
   const seen = new Set<string>();
+
+  const repairTarget = options.repairTarget;
+  if (
+    repairTarget &&
+    repairTarget.id !== issue.id &&
+    repairTarget.companyId === issue.companyId &&
+    repairTarget.status !== "cancelled" &&
+    repairTarget.status !== "done"
+  ) {
+    addOwnerCandidate(
+      candidates,
+      seen,
+      agentsById,
+      issue.companyId,
+      repairTarget.assigneeAgentId,
+      "repair_target_assignee",
+      repairTarget.id,
+    );
+  }
 
   if (options.includeStalledAssignee && issue.status !== "cancelled" && issue.status !== "done") {
     addOwnerCandidate(
@@ -862,29 +922,47 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     });
   }
 
+  /**
+   * `edgeHolder` is the row that actually carries the `blockedBy` edge to `blocker` —
+   * `source` at depth 1, and a descendant of it further down the chain walk. `source` is
+   * the row the finding is REPORTED against; they are the same row only at depth 1.
+   *
+   * The distinction matters for `blocked_by_cancelled_issue`, whose repair is a write on
+   * whichever row holds the dead edge. Naming `source` there was wrong at depth > 1 in
+   * both halves at once: it told the owner to edit a row whose blocker set does not
+   * contain the cancelled issue, and (PEN-5851) it is the input to owner selection.
+   */
   function blockedFindingForLeaf(
     source: IssueLivenessIssueInput,
+    edgeHolder: IssueLivenessIssueInput,
     blocker: IssueLivenessIssueInput,
     dependencyPath: IssueLivenessIssueInput[],
   ): IssueLivenessFinding | null {
-    const ownerCandidates = ownerCandidatesForRecoveryIssue(blocker, input.agents, agentsById, {
-      includeStalledAssignee: true,
-    });
-
     if (blocker.status === "cancelled") {
+      // PEN-5851: the recovery issue is the cancelled blocker, but every write this
+      // action prescribes lands on `edgeHolder` — so its assignee leads the candidates.
+      const cancelledOwnerCandidates = ownerCandidatesForRecoveryIssue(blocker, input.agents, agentsById, {
+        includeStalledAssignee: true,
+        repairTarget: edgeHolder,
+      });
+
       return finding({
         issue: source,
         state: "blocked_by_cancelled_issue",
         reason: `${issueLabel(source)} is still blocked by cancelled issue ${issueLabel(blocker)}.`,
         dependencyPath,
         recoveryIssue: blocker,
-        recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
-        recommendedOwnerCandidates: ownerCandidates,
+        recommendedOwnerCandidateAgentIds: cancelledOwnerCandidates.map((candidate) => candidate.agentId),
+        recommendedOwnerCandidates: cancelledOwnerCandidates,
         recommendedAction:
-          `Inspect ${issueLabel(blocker)} and either remove it from ${issueLabel(source)}'s blockers or replace it with an actionable unblock issue.`,
+          `Inspect ${issueLabel(blocker)} and either remove it from ${issueLabel(edgeHolder)}'s blockers or replace it with an actionable unblock issue.`,
         blockerIssueId: blocker.id,
       });
     }
+
+    const ownerCandidates = ownerCandidatesForRecoveryIssue(blocker, input.agents, agentsById, {
+      includeStalledAssignee: true,
+    });
 
     if (hasExplicitWaitingPath(blocker)) return null;
 
@@ -1016,7 +1094,7 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
         if (hasExplicitWaitingPath(blocker)) continue;
       }
 
-      const leafFinding = blockedFindingForLeaf(source, blocker, path);
+      const leafFinding = blockedFindingForLeaf(source, current, blocker, path);
       if (leafFinding) return leafFinding;
     }
 
