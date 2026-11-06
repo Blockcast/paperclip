@@ -171,9 +171,11 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
   });
 
   // The guard on the fix itself: GREATEST must not let a backdated `updated_at`
-  // report a NEGATIVE age, and must leave the ordinary never-resubmitted card
-  // dated from its filing.
-  it("falls back to createdAt when updatedAt is older, and never reports a negative age", async () => {
+  // anchor the gauge EARLIER than the filing (which would INFLATE the age), and
+  // must leave the ordinary never-resubmitted card dated from its filing. Not a
+  // hypothetical row shape -- pending approval `e1b6747a` carries an
+  // `updated_at` 1 ms before its `created_at`.
+  it("falls back to createdAt when updatedAt is older, so a backdated row cannot inflate the age", async () => {
     const companyId = await insertCompany();
     await insertApproval({
       companyId,
