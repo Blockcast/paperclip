@@ -1578,6 +1578,40 @@ describe("scrubGitHubEgressText", () => {
       expect(result.text).toContain(fullOid);
     });
 
+    it("refuses an opaque expectation hidden behind a DOUBLED colon", () => {
+      // Ally, review 5798876353, measured at 3ee44ad, and reproduced here
+      // before the fix. The single-separator form `[.:]` admits exactly ONE
+      // colon before each alphabet run, so `::` ENDS the capture and the tail
+      // is never offered to the detector at all — the regex did not match,
+      // and the token published BYTE-EXACT.
+      //
+      // Note this is the escape the SECOND-colon test above was meant to
+      // close, returning in a form that test could not see. The lesson is in
+      // the block comment: "cannot widen exoneration" says nothing about
+      // material that never enters the match. Monotonic exoneration and total
+      // capture are different properties; only the second closes an escape.
+      const opaque = ["Xq7rLm2PvYw9TbNc", "4HsKdFgJ8ZaQe3Ui"].join("");
+      const result = scrubGitHubEgressText(lease("feature/pen-5734-x", `:${opaque}`));
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(opaque);
+    });
+
+    it("refuses a DOUBLED-colon tail even when a valid OID precedes it", () => {
+      // The nastier half: `<ref>:<oid>::<token>` captured only `<oid>`, which
+      // LEASE_EXPECTED_OID_RE EXONERATES — so the match was returned untouched
+      // and the token after `::` published byte-exact. A well-formed pinned
+      // OID was acting as cover for the opaque tail behind it.
+      const fullOid = "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8";
+      const opaque = ["Xq7rLm2PvYw9TbNc", "4HsKdFgJ8ZaQe3Ui"].join("");
+      const result = scrubGitHubEgressText(
+        lease("feature/pen-5734-x", `${fullOid}::${opaque}`),
+      );
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(opaque);
+    });
+
     it("refuses an opaque REF even beside a well-formed OID", () => {
       const opaque = ["Qz7Z4mWvT2pK", "9dLxR6bN3sYcH1gF"].join("");
       const result = scrubGitHubEgressText(lease(opaque, EXPECTED_OID));

@@ -1576,17 +1576,35 @@ const LEASE_EXPECTED_OID_RE = /^[0-9a-f]{7,64}$/;
  *
  *  `:` IS A SEPARATOR, NOT A MEMBER: it must be FOLLOWED by at least one
  *  alphabet character, exactly as `.` already is. A dangling colon is
- *  therefore not swallowed. Ally caught the cost of the looser form (review
+ *  therefore not swallowed. Ally caught the cost of the member form (review
  *  5798756712): with `:` a plain member, prose such as
  *  `--force-with-lease=<ref>:<oid>: then …` captured `<oid>:`, which
  *  `LEASE_EXPECTED_OID_RE` rejects, so a VALID pinned OID was redacted —
  *  PEN-5734's own defect in miniature, reintroduced by its own fix. That
  *  failed closed, but failing closed on the mandated form is the thing this
- *  binding exists to prevent. The separator form still captures
- *  `sha256:<token>` and `<oid>:<token>` whole, so the second-colon escape
- *  stays shut. */
+ *  binding exists to prevent.
+ *
+ *  THE SEPARATOR MUST BE `:*` / `[.:]+`, NOT `[.:]`, AND THAT IS A LEAK BOUND
+ *  RATHER THAN A STYLE CHOICE. A single-separator form (`[.:]`) admits exactly
+ *  one colon before each alphabet run, so a DOUBLED colon ends the capture and
+ *  the tail is never offered to the detector: `<ref>::<token>` did not match at
+ *  all, and `<ref>:<oid>::<token>` captured only `<oid>` — which this predicate
+ *  EXONERATES — publishing the token BYTE-EXACT in both cases. Ally measured it
+ *  (review 5798876353) and I reproduced all three variants before changing
+ *  anything. The leading `:*` lets the capture start on a run of colons, and
+ *  `[.:]+` lets any run of separators sit between two alphabet runs, so no
+ *  amount of colon-stuffing can push material past the end of the match.
+ *
+ *  SO THE CORRECT STATEMENT OF THE PROPERTY IS NARROWER THAN THE PARAGRAPH
+ *  ABOVE CLAIMS, and the earlier wording is what hid this: "cannot widen
+ *  exoneration" is true and remains true — exoneration is `^[0-9a-f]{7,64}$`,
+ *  which no colon-bearing string can satisfy — but it says nothing about
+ *  material that never enters the MATCH in the first place. A value the regex
+ *  does not reach is not exonerated; it is simply never examined, and it
+ *  publishes. Monotonic exoneration is NOT the same property as total capture,
+ *  and only the second one closes an escape. Judge a change here on BOTH. */
 const FORCE_WITH_LEASE_EXPECTATION_RE =
-  /(--force-with-lease=["']?[^\s"'`:]*:)([A-Za-z0-9+/=_-]+(?:[.:][A-Za-z0-9+/=_-]+)*)/g;
+  /(--force-with-lease=["']?[^\s"'`:]*:)(:*[A-Za-z0-9+/=_-]+(?:[.:]+[A-Za-z0-9+/=_-]+)*)/g;
 
 /** A segment is "lexical" when it is a plain word or a plain number — the
  *  shape hyphenated identifiers are built from, and the shape a random token's
