@@ -2122,6 +2122,54 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  // PEN-5776 box 3: what the arm genuinely lacked is the term its sibling comment arm
+  // carries (BLO-29821) — the POST-update closed-status check. Measured on PEN-5763:
+  // a `backlog` -> `cancelled` write woke the assignee 0.319 s later onto a row the same
+  // write had retired, and the dispatched run ended `cancelled` with nothing to do.
+  it("does not wake the assignee onto a row the same write closed", async () => {
+    const issue = makeIssue("backlog");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "cancelled" });
+
+    expect(res.status).toBe(200);
+    // Allow any deferred wakeup task to flush before asserting it never fired.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_status_changed" }),
+    );
+  });
+
+  // The closed-status term must not swallow the reopen it sits next to: the post-update
+  // status there is `todo`, not the `done` the row came from.
+  it("still wakes on a reopen out of a closed status", async () => {
+    const issue = makeIssue("cancelled");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_status_changed" }),
+    ));
+  });
+
   // PEN-5776 box 3: the absence of an AUTHOR term on this arm is deliberate, and this
   // test pins it. A seat is not a run — the run that writes the transition is normally
   // exiting, and the new run is how the seat acts on it. The comment arm takes the same
