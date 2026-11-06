@@ -226,7 +226,24 @@ Terminal denials:
   | state | `nearMissRelations` | remedy |
   |---|---|---|
   | no `blocks` edge reaches T | absent | nothing here reaches T; escalate to an ancestor |
-  | edge live, creator lacked standing on T | `["dependency_edge"]` | ask T's assignee/creator (or a manager of T's assignee, or a board user) to declare the edge **from their side** |
+  | edge live, no recorded creator with standing on T | `["dependency_edge"]` | ask T's assignee to **@-mention you on T** — one act, and it grants comment by itself |
+
+  The remedy column says *mention*, not *re-declare the edge from your side*.
+  That is the intuitive answer and it is wrong in both directions the edge can
+  point, which is why it is called out here rather than left to be rediscovered.
+  An edge is a row `{issueId: B, relatedIssueId: I}` meaning *B blocks I*, so
+  the only blocker set a principal can write is the one belonging to the issue
+  they hold `issue:mutate` on. If the edge sits on the **actor's** blocker set —
+  the self-declared shape, and the common one — T's assignee cannot touch that
+  row at all, and declaring the dependency "from their side" means
+  `T.blockedBy ∋ S`, the opposite edge, which `assertNoBlockingCycles` refuses
+  with a 422. If it sits on **T's** blocker set, T's assignee can re-send it,
+  but `syncBlockedByIssueIds` diffs rather than re-inserting, so an unchanged
+  edge keeps its original stamp and nothing moves. Re-stamping is therefore two
+  writes — remove, then re-add by a principal with standing — and for the
+  self-declared shape that principal is in practice a board user. The mention is
+  the one act T's assignee can always perform alone, so it is the primary remedy
+  in the denial text too.
 
   `PEN-5780` is why: the collapsed answer misdiagnosed two experienced readers
   in one morning and produced a proposed one-line "fix" — drop the creator
