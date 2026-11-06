@@ -2238,6 +2238,34 @@ test("reports the MCP channel as covered when the token proxy answers (PEN-5641)
   });
 });
 
+// PEN-5702. The probe answers "is A proxy listening on this pod"; the text
+// above it used to assert "the MCP server reaches GitHub through the loopback
+// token proxy", which is strictly stronger and is false for every server after
+// the first. The port is bound once per pod: later `github-mcp-server` spawns
+// take a null handle, are started with no GITHUB_HOST, and stay pinned to
+// their boot generation while this probe still sees the winner's listener.
+//
+// An oracle answering confidently for a channel it does not govern is the
+// defect PEN-5641 was filed for, so this pins the qualification rather than
+// leaving it to prose that can be tidied away. Asserted on the stable nouns an
+// operator would act on -- the scope disclaimer and the `already bound` stderr
+// line that identifies an uncovered server -- not on the whole sentence.
+test("the covered verdict scopes its claim to servers actually behind the proxy (PEN-5702)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    await withStubMcpProxy(async (mcpProxyUrl) => {
+      withTempDir((dir) => {
+        const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase, mcpProxyUrl });
+        assert.match(proc.stdout, /mcp-channel:\s+covered/);
+        assert.match(proc.stdout, /not that YOUR server is behind it/);
+        assert.match(proc.stdout, /already bound/);
+        // The overstatement itself must not come back.
+        assert.doesNotMatch(proc.stdout, /the MCP server reaches GitHub through the loopback token proxy/);
+        assert.equal(proc.status, 0);
+      });
+    });
+  });
+});
+
 // Something else holding the port is not this proxy, and reporting it as one
 // would re-create the false all-clear in a new place.
 test("does not mistake an unrelated listener for the token proxy (PEN-5641)", async () => {
