@@ -11,6 +11,7 @@ import {
   requestApprovalRevisionSchema,
   resolveApprovalSchema,
   resubmitApprovalSchema,
+  updateApprovalPayloadSchema,
   withdrawApprovalSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
@@ -1122,6 +1123,209 @@ export function approvalRoutes(
       details: { type: approval.type },
     });
     res.json(redactApprovalPayload(approval, await approvalReadOptions(req, approval.companyId)));
+  });
+
+  /**
+   * Correct a PENDING card's payload in place (PEN-5766).
+   *
+   * ## What this closes
+   *
+   * A pending card's payload was immutable to the agent that filed it: `resubmit`
+   * is gated on `revision_requested`, and nothing else writes `payload`. A filer
+   * whose evidence had gone stale could therefore only leave false evidence in
+   * front of a human decider, or `withdraw` and re-file — and a re-file mints a new
+   * row with a new `createdAt`. Board service is measurably recency-skewed
+   * (PEN-3918 cmt `d00b4081` §4: the 11-03 burst decided 17 cards, 16 of them newer
+   * than the oldest card it left pending), so re-filing for accuracy took queue
+   * position from specific, older cards. **Correcting your evidence and jumping the
+   * queue were the same keystroke.**
+   *
+   * This route separates them. `createdAt` and row identity are untouched, and the
+   * default list view now has an explicit `ORDER BY created_at` (see
+   * `services/approvals.ts`) so that preservation is something a reader can
+   * actually observe — without it, the UPDATE would relocate the row in heap order
+   * and the guarantee would be vacuous.
+   *
+   * ## Refusals, narrowest first
+   *
+   * 1. not the requesting agent → 403
+   * 2. card not `pending`        → 409 (naming `allowedStatuses`)
+   * 3. `gate` changed or dropped → 422 `approval_payload_gate_immutable`
+   * 4. payload a create would refuse → 422, the create's own refusal verbatim
+   *
+   * ## ⚠️ The trade this makes, named rather than buried
+   *
+   * An editable payload means a decider can approve a card whose text changed after
+   * they read it. That is a real regression against the immutability it replaces,
+   * which was doing that safety work for free. The mitigation here is DISCLOSURE,
+   * not prevention: `payloadRevision` / `payloadEditedAt` on the card and the full
+   * prior text behind `GET /approvals/:id/payload-revisions`. It is worth making
+   * only because the failure it replaces — false evidence that CANNOT be corrected
+   * — is silent, while this one is visible. Prevention (an `expectedPayloadRevision`
+   * interlock on the decision routes) is deliberately NOT in this change; see the
+   * pull request for why it was priced and deferred rather than skipped.
+   */
+  router.patch("/approvals/:id", validate(updateApprovalPayloadSchema), async (req, res) => {
+    const id = req.params.id as string;
+    const existing = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    if (!existing) return;
+    if (!(await assertApprovalMutationAllowedByRunContext(req, res, existing.companyId)).allowed) return;
+
+    // Scoped tighter than `withdraw`/`resubmit`, which also admit board actors. The
+    // board already has a payload-editing path of its own — `requestRevision` then
+    // the requester's `resubmit` — and that one is visible to the filer, who is the
+    // party answerable for the card's evidence. A board actor silently rewriting a
+    // filer's ask is a different power than the one this row asked for, so it is not
+    // granted here.
+    if (req.actor.type !== "agent" || req.actor.agentId !== existing.requestedByAgentId) {
+      res.status(403).json({
+        error: "Only the requesting agent can edit this approval's payload",
+        details: {
+          code: "approval_payload_edit_forbidden",
+          remediation:
+            "A board actor changes a card by requesting revision (`POST /approvals/:id/request-revision`), " +
+            "which returns it to its filer to resubmit. That keeps the filer answerable for the card's evidence.",
+        },
+      });
+      return;
+    }
+
+    if (existing.status !== "pending") {
+      res.status(409).json({
+        error: "Only pending approvals can have their payload edited",
+        details: {
+          code: "approval_payload_edit_status",
+          approvalId: id,
+          status: existing.status,
+          allowedStatuses: ["pending"],
+          remediation:
+            existing.status === "revision_requested"
+              ? "This card was sent back for revision: use `POST /approvals/:id/resubmit`, which takes a replacement payload."
+              : "This card is already decided. Editing it would change an ask a human has answered; file a new one if the situation changed.",
+        },
+      });
+      return;
+    }
+
+    // The gate is the card's retirement contract, so it is not editable: a card that
+    // retires on a different event than the one it was filed against is PEN-5103 by
+    // construction. Omission is refused rather than treated as "keep the stored
+    // gate" — a caller that believes it just removed a gate must not receive a 200
+    // for an operation that did not happen, which is the same class of
+    // correct-looking-but-wrong artifact this route exists to remove.
+    const submittedGate = (req.body.payload as Record<string, unknown>).gate ?? null;
+    const storedGate = (existing.payload as Record<string, unknown>).gate ?? null;
+    if (JSON.stringify(submittedGate ?? null) !== JSON.stringify(storedGate ?? null)) {
+      res.status(422).json({
+        error:
+          "`payload.gate` cannot be changed by an edit: it is the card's retirement contract, and a card " +
+          "that retires on a different event than the one it was filed against can be closed for a reason " +
+          "that has nothing to do with its ask",
+        details: {
+          code: "approval_payload_gate_immutable",
+          storedGate,
+          submittedGate,
+          remediation:
+            storedGate === null
+              ? "This card was filed without a gate. Retrofitting one changes what the ask IS, so it stays a " +
+                "withdraw-and-refile. Send the payload without `gate` to edit the rest of the text."
+              : "Resend `payload.gate` exactly as stored (shown above) alongside your edits. To change or remove " +
+                "the gate, withdraw this card and file a new one — that is the correct cost for changing the ask.",
+        },
+      });
+      return;
+    }
+
+    // Revalidate exactly as a create would. An edit must not be able to land a
+    // payload `POST /companies/:id/approvals` would have refused — in particular a
+    // `budget_override_required` card must not shed its `enforcement_assertions` by
+    // editing them away (BLO-34008), and a gate must not go terminal between filing
+    // and edit.
+    const normalizedPayload =
+      existing.type === "hire_agent"
+        ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
+            existing.companyId,
+            req.body.payload,
+            { strictMode: strictSecretsMode },
+          )
+        : req.body.payload;
+
+    // Mirrors the resubmit guard: a hire card's agent binding is not re-pointable,
+    // and an edit is no more entitled to move it than a resubmit is.
+    if (existing.type === "hire_agent") {
+      const submittedAgentId = (normalizedPayload as Record<string, unknown>).agentId;
+      if (
+        (existing.linkedAgentId && submittedAgentId !== undefined && submittedAgentId !== existing.linkedAgentId) ||
+        (!existing.linkedAgentId && Object.prototype.hasOwnProperty.call(normalizedPayload, "agentId"))
+      ) {
+        res.status(422).json({ error: "Hire approval agent binding cannot be changed" });
+        return;
+      }
+    }
+
+    const budgetRefusal = budgetAssertionRefusal(existing.type, normalizedPayload);
+    if (budgetRefusal) {
+      res.status(422).json(budgetRefusal);
+      return;
+    }
+
+    const gateRefusal = await gateAlreadyTerminalRefusal(normalizedPayload);
+    if (gateRefusal) {
+      res.status(422).json(gateRefusal);
+      return;
+    }
+
+    const stamped = await stampPriors(existing.companyId, existing.type, normalizedPayload);
+    const actor = getActorInfo(req);
+    const approval = await svc.updatePayload(id, stamped as Record<string, unknown>, {
+      agentId: actor.agentId,
+      userId: actor.actorType === "user" ? actor.actorId : null,
+    });
+
+    await logActivity(db, {
+      companyId: approval.companyId,
+      actorType: actor.actorType,
+      actorId: actor.actorId,
+      agentId: actor.agentId,
+      action: "approval.payload_edited",
+      entityType: "approval",
+      entityId: approval.id,
+      details: {
+        type: approval.type,
+        approvalId: approval.id,
+        payloadRevision: approval.payloadRevision,
+      },
+    });
+
+    res.json(redactApprovalPayload(approval, await approvalReadOptions(req, approval.companyId)));
+  });
+
+  /**
+   * Superseded payloads for a card, oldest first — the readable half of the
+   * disclosure this route's edit marker advertises. An edit marker that a reader
+   * cannot expand is a claim, not evidence.
+   */
+  router.get("/approvals/:id/payload-revisions", async (req, res) => {
+    const id = req.params.id as string;
+    const approval = await getAccessibleResource(req, res, svc.getById(id), "Approval not found");
+    if (!approval) return;
+    if (!(await assertApprovalAccessAllowed(req, res, approval.companyId))) return;
+
+    const readOptions = await approvalReadOptions(req, approval.companyId);
+    const revisions = await svc.listPayloadRevisions(id);
+    // Archived payloads run through the SAME projection as the live one. A prior
+    // revision is not less sensitive than the current text, and a history endpoint
+    // that skipped redaction would be a way to read withheld fields by editing the
+    // card once.
+    res.json(
+      revisions.map((revision) => ({
+        ...revision,
+        ...redactApprovalPayload(
+          { type: approval.type, payload: revision.payload },
+          readOptions,
+        ),
+      })),
+    );
   });
 
   router.post("/approvals/:id/withdraw", validate(withdrawApprovalSchema), async (req, res) => {

@@ -1856,6 +1856,13 @@
       "when": 1792004101477,
       "tag": "0274_issues_drop_unscoped_description_trigram_index",
       "breakpoints": true
+    },
+    {
+      "idx": 275,
+      "version": "7",
+      "when": 1792004201477,
+      "tag": "0275_approval_payload_revisions",
+      "breakpoints": true
     }
   ]
 }

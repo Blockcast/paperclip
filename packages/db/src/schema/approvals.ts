@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, jsonb, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, integer, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
@@ -20,6 +20,19 @@ export const approvals = pgTable(
     decisionNote: text("decision_note"),
     decidedByUserId: text("decided_by_user_id"),
     decidedAt: timestamp("decided_at", { withTimezone: true }),
+    // How many times the payload has been edited in place by its requester, and
+    // when it last was. Both are the EDIT MARKER a decider reads: `payloadRevision
+    // > 0` means the text now on the card is not the text it was filed with, and
+    // the superseded versions are in `approval_payload_revisions` (PEN-5766).
+    //
+    // `createdAt` is deliberately untouched by an edit. That is the entire point of
+    // having an edit route at all: the alternative a filer had — withdraw and
+    // re-file — mints a fresh `created_at`, and service is measurably recency-
+    // skewed, so correcting stale evidence promoted the card over cards that had
+    // waited longer (PEN-3918 cmt `d00b4081` §4). Preserving it is a correctness
+    // requirement, not ergonomics.
+    payloadRevision: integer("payload_revision").notNull().default(0),
+    payloadEditedAt: timestamp("payload_edited_at", { withTimezone: true }),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
