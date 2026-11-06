@@ -3431,6 +3431,48 @@ export function applyOrder(rows) {
  */
 export class WiringError extends TypeError {}
 
+/**
+ * The "this repo could not be LISTED" tag, which is the only failure
+ * `repoRunner`'s skip is allowed to swallow (PEN-5482).
+ *
+ * Why a tag rather than `repoRunner` deciding from the error alone: the skip
+ * is written for one specific failure, but it sits around the WHOLE of
+ * `runRepo` — the classify pass, the apply loop, the hold comments and the
+ * receipt all throw through it too. Nothing in an error's shape distinguishes
+ * "the list call 502'd" from "the apply loop has a new bug", so only the frame
+ * that knows which call failed can say so.
+ *
+ * A module-private `Symbol` rather than a string key (Ally review, PR #3376):
+ * a string key is reachable by any other throw site, and an error object from
+ * a library that happened to carry that name would opt ITSELF into the skip —
+ * a collision that fails OPEN, in the one direction this whole change exists
+ * to close. A symbol nobody else holds cannot be collided with. It stays a
+ * property rather than a `WeakSet` so the tag travels with the error and shows
+ * up when one is inspected, which is worth keeping on an operator-facing path.
+ */
+const COLLECT_FAILED = Symbol("land-clean-prs.collectFailed");
+
+/**
+ * Tags a listing failure. Non-extensible and non-object throws are left
+ * UNTAGGED on purpose rather than being coerced: assigning to a frozen object
+ * throws in a module's strict mode, which would replace the real error with a
+ * `TypeError` raised from inside the catch. Untagged fails in the safe
+ * direction — the fire ends loudly, exactly as it did before PEN-5442 — where
+ * a wrong tag would fail silently.
+ *
+ * Exported so a test seam standing in for `runRepo` can fail the way `runRepo`
+ * fails, rather than hand-rolling a tag shape that could drift from this one.
+ */
+export const markCollectFailure = (error) => {
+  if (error && typeof error === "object" && Object.isExtensible(error)) {
+    error[COLLECT_FAILED] = true;
+  }
+  return error;
+};
+
+/** True only for an error `markCollectFailure` tagged. */
+export const isCollectFailure = (error) => error?.[COLLECT_FAILED] === true;
+
 /** Every option `runRepo` knows. */
 const RUN_REPO_KEYS = new Set([
   "repo",
@@ -3588,7 +3630,9 @@ export function runRepo(options) {
     // outcomes, because this frame does not know which it will get.
     const message = error?.stderr?.toString() || error?.message || String(error);
     console.log(`## ${repo}\n\nCould not collect PRs: ${message.trim().split("\n")[0]}`);
-    throw error;
+    // PEN-5482: tag it, so `repoRunner` can tell the listing failure its skip
+    // was written for apart from every other throw that passes through it.
+    throw markCollectFailure(error);
   }
   // The per-fire cap is applied INSIDE `classifyAll`, which rewrites an
   // `enqueue` past the ceiling to `skip`/`cap:N-per-fire` before
@@ -3897,6 +3941,15 @@ export const repoRunner = (options) => {
       //
       // A guard is only as loud as the catch above it. Neither half of this
       // control is complete alone.
+      //
+      // PEN-5482 keeps this FIRST rather than folding it into the tag
+      // allowlist below, because the two are not redundant.
+      // `markCollectFailure` tags whatever the fetch seam threw, without
+      // asking what it was — so a wiring fault raised INSIDE that seam would
+      // arrive here already tagged and sail through the allowlist. Asking
+      // about identity first keeps "a wiring fault is never recorded as a
+      // repo-readability fact" true unconditionally, rather than true only for
+      // as long as nothing bagged is reachable from `fetch`.
       if (error instanceof WiringError) throw error;
       // PEN-5442: one unreadable repo used to end the WHOLE fire. `fetchOpenPrs`
       // is the first thing `runRepo` does and its throw escaped `runRepo`'s
@@ -3911,6 +3964,17 @@ export const repoRunner = (options) => {
       // be read is a repo with no verdicts — which is a reason to say so and
       // move on, not a reason to discard the verdicts of the repos that CAN be
       // read.
+      //
+      // PEN-5482: this catch is for ONE failure — the list call. `runRepo`
+      // throws through it from the classify pass, the apply loop, the hold
+      // comments and the receipt as well, and swallowing one of those would be
+      // wrong twice over: the operator would be told the repo "could not be
+      // listed", which is false and points at GitHub availability instead of
+      // at the real bug; and the `return []` below would under-report spend the
+      // apply loop had ALREADY committed, letting later repos in the same fire
+      // run past `MAX_ENQUEUES_PER_FIRE`. Only `runRepo`'s own fetch catch can
+      // tell the difference, so only what it tagged is skippable here.
+      if (!isCollectFailure(error)) throw error;
       const message = error?.stderr?.toString() || error?.message || String(error);
       const first = message.trim().split("\n")[0];
       // `isFatalGhError` keeps its meaning exactly: exhausted rate limits or
@@ -3920,8 +3984,10 @@ export const repoRunner = (options) => {
       if (isFatalGhError(first)) throw error;
       unreadable.push(`${repo} (${first})`);
       console.log(`Skipped ${repo}: it could not be listed. The rest of the fire continues.\n`);
-      // No rows, so `sweepRepos` carries no spend for this repo — correct, it
-      // enqueued nothing.
+      // No rows, and none were possible: the tag above restricts this path to a
+      // failure of the FIRST thing `runRepo` does, so nothing downstream of the
+      // listing ran and nothing was enqueued. `sweepRepos` carrying no spend for
+      // this repo is therefore the truth, not an assumption about the catch.
       return [];
     }
     console.log("");
