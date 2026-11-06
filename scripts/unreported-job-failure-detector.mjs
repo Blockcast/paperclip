@@ -88,7 +88,17 @@ export function parseArgs(argv) {
     // further back than the window we actually report on, or the fetch drops
     // exactly the runs we are looking for.
     fetchPadMinutes: 720,
-    maxRuns: 60,
+    // One jobs request per candidate, so this is the real cost knob. The
+    // server-side arms in `loadLive` keep the live candidate set near ~75 at
+    // this repo's volume (measured 2026-11-06), so 120 is headroom rather than
+    // a bound that bites — which matters because hitting it means exit 2 and a
+    // red scheduled run. Budget: ~4 listing pages + ~30 jobs calls per scan,
+    // 4 scans/hour, against a GITHUB_TOKEN ceiling of 1000/hour per repo that
+    // is SHARED with every other workflow here.
+    maxRuns: 120,
+    // Page cap for the run listing. 20 pages = 2000 runs; beyond that the scan
+    // says it truncated rather than pretending to a census.
+    maxPages: 20,
     comment: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
@@ -97,6 +107,7 @@ export function parseArgs(argv) {
     else if (arg === "--lookback-minutes") args.lookbackMinutes = Number(argv[++i]);
     else if (arg === "--fetch-pad-minutes") args.fetchPadMinutes = Number(argv[++i]);
     else if (arg === "--max-runs") args.maxRuns = Number(argv[++i]);
+    else if (arg === "--max-pages") args.maxPages = Number(argv[++i]);
     else if (arg === "--json-file") args.jsonFile = argv[++i];
     else if (arg === "--comment") args.comment = String(argv[++i]).toLowerCase() === "true";
   }
@@ -130,8 +141,32 @@ export function classifyJob(job) {
   if (unreported.length === 0) {
     return { verdict: "genuine_failure", unreportedSteps: [], stepCount: steps.length };
   }
+  // WHAT A NULL CONCLUSION DOES AND DOES NOT PROVE (Ally review, PEN-5738).
+  //
+  // It proves the runner STOPPED REPORTING. It does NOT prove the work
+  // finished. A runner that dies MID-TEST — OOM-killed, evicted, its node
+  // removed, or wedged by the suite itself — produces exactly this shape, and
+  // some of those causes ARE the tests. Telling that author "no test failed"
+  // would be the one error this detector must never make.
+  //
+  // So distinguish the two, step-name-agnostically, on `status`:
+  //
+  //   any unreported step `in_progress` => a step was MID-FLIGHT when the
+  //                                        runner went silent. Result UNKNOWN.
+  //   every unreported step `pending`   => every step that STARTED also
+  //                                        closed, and closed non-`failure`.
+  //                                        The runner went silent BETWEEN
+  //                                        steps. Still not "the job would
+  //                                        have passed" — later steps never
+  //                                        ran — but no step failed first.
+  //
+  // Neither branch licenses "no test failed". The victim fixture is
+  // `mid_step`, which is the point: the incident knew its tests passed from
+  // the RUNNER LOG, which this detector never reads.
+  const midStep = unreported.some((s) => s.status === "in_progress");
   return {
     verdict: "runner_never_reported",
+    shape: midStep ? "mid_step" : "between_steps",
     reason: `${unreported.length} of ${steps.length} steps were never closed by the runner`,
     unreportedSteps: unreported,
     stepCount: steps.length,
@@ -177,6 +212,7 @@ export function detect({ runs, windowStartMs, windowEndMs, repo, fetchTruncated 
         workflowName: run.name ?? null,
         pullRequests: (run.pull_requests ?? []).map((p) => p.number),
         reason: c.reason,
+        shape: c.shape,
         stepCount: c.stepCount,
         unreportedSteps: c.unreportedSteps,
       });
@@ -206,13 +242,15 @@ export function commentMarkerFor(headSha) {
 }
 
 export function renderComment({ headSha, findings }) {
+  const anyMidStep = findings.some((f) => f.shape === "mid_step");
   const lines = [];
   lines.push(commentMarkerFor(headSha));
-  lines.push("## ⚠️ Infrastructure fault, not a test failure — do not debug these tests");
+  lines.push("## ⚠️ The runner stopped reporting — this result is UNKNOWN, not a test failure");
   lines.push("");
   lines.push(
     `${findings.length === 1 ? "A red check" : `${findings.length} red checks`} at \`${String(headSha).slice(0, 7)}\` ` +
-      "came back `failure` **without the runner ever reporting a result**. No test failed.",
+      "came back `failure` **without the runner ever reporting a result**. " +
+      "**Rerun before debugging anything.**",
   );
   lines.push("");
   lines.push("| Check | Concluded | Steps never closed by the runner |");
@@ -223,21 +261,47 @@ export function renderComment({ headSha, findings }) {
     lines.push(`| ${name} | ${f.completedAt} | ${f.unreportedSteps.length}/${f.stepCount} — ${steps} |`);
   }
   lines.push("");
-  lines.push("### How this is known");
+  lines.push("### What this does and does not tell you");
   lines.push("");
   lines.push(
     "Only a runner can close a step. The Actions service sets the **job** conclusion when a runner " +
       "goes silent, but it cannot retro-fill steps it never heard about — so an abandoned job keeps " +
-      "its unreported steps at `conclusion: null`. A genuine failure always carries " +
-      "`conclusion: failure` **on the failing step itself**.",
+      "its unreported steps at `conclusion: null`. A genuine test failure always carries " +
+      "`conclusion: failure` **on the failing step itself**, and none of these do.",
   );
   lines.push("");
-  lines.push("The usual cause is the runner losing external DNS at `CompleteJobAsync` (`EAI_AGAIN`) after the work finished.");
+  lines.push(
+    "**So the tests here did not report a failure — but they are not known to have passed either.** " +
+      "That evidence lives in the runner log, which this check does not read.",
+  );
+  lines.push("");
+  if (anyMidStep) {
+    lines.push(
+      "⚠️ At least one step above was still `in_progress` when the runner went silent, so its work " +
+        "may not have finished. A runner killed **mid-test** — OOM, eviction, a lost node, or a suite " +
+        "that wedges the runner — produces exactly this shape, and some of those causes are the tests " +
+        "themselves. **Treat the result as unknown and rerun;** if the rerun reproduces, it is real.",
+    );
+  } else {
+    lines.push(
+      "Every unreported step above is `pending` — it never started. So every step that *did* start " +
+        "also closed, and none closed `failure`; the runner went silent **between** steps. That is " +
+        "consistent with the usual cause below, but it still does not prove the remaining steps would " +
+        "have passed.",
+    );
+  }
+  lines.push("");
+  lines.push(
+    "The usual cause is the runner losing external DNS at `CompleteJobAsync` (`EAI_AGAIN`), which " +
+      "strands the pod holding a concurrency slot. See PEN-5738.",
+  );
   lines.push("");
   lines.push("### What to do");
   lines.push("");
   lines.push("```");
-  lines.push(`gh run rerun ${findings[0].runId} --failed`);
+  for (const runId of [...new Set(findings.map((f) => f.runId))]) {
+    lines.push(`gh run rerun ${runId} --failed`);
+  }
   lines.push("```");
   lines.push("");
   lines.push(
@@ -267,14 +331,125 @@ function ghApi(path, extra = []) {
   return JSON.parse(execFileSync("gh", ["api", path, ...extra], { encoding: "utf8", maxBuffer: 1 << 28 }));
 }
 
+// Page one `actions/runs` query. Returns what it got plus whether the server
+// said there was more than it returned.
+//
+// WHY THIS IS PAGINATED, AND WHY IT IS NOT ENOUGH ON ITS OWN (Ally, PEN-5738).
+// The first version read ONE page of 100. Measured on this repo: ~1388 runs
+// created in 13h, so `per_page=100` covers roughly the last HOUR — which made
+// the 12h `fetchPadMinutes` completely inert and DROPPED THE MOTIVATING CASE.
+// A run created 3h38m ago (the PR #3444 shape the padding exists for) was never
+// listed, never became a candidate, and `fetchTruncated` stayed `false`, so the
+// scan reported a clean census. That is precisely the "quiet is the dangerous
+// reading" failure this file warns about, built into the fetch.
+function listRunsPage(repo, query, maxPages) {
+  const runs = [];
+  let totalCount = null;
+  let pagesExhausted = false;
+  for (let page = 1; page <= maxPages; page += 1) {
+    const res = ghApi(`/repos/${repo}/actions/runs?per_page=100&page=${page}&${query}`);
+    if (totalCount === null && Number.isFinite(res.total_count)) totalCount = res.total_count;
+    const batch = res.workflow_runs ?? [];
+    runs.push(...batch);
+    // A short page is the end of the result set. This is OUR criterion and it
+    // is sound; see below for why the server's own count is not.
+    if (batch.length < 100) break;
+    if (page === maxPages) pagesExhausted = true;
+  }
+
+  // TRUNCATION IS `pagesExhausted` ALONE — DELIBERATELY NOT `runs.length <
+  // total_count`.
+  //
+  // That comparison looks like the obvious check and it is WRONG on this
+  // endpoint: GitHub's run index is not self-consistent across filters, so
+  // `total_count` can exceed the rows the same query actually returns on a
+  // single, complete, non-truncated page. Measured here 2026-11-06:
+  //
+  //     status=in_progress   returned 8    total_count 9     <-- skew
+  //     status=queued        returned 12   total_count 12
+  //     status=failure       returned 78   total_count 78
+  //
+  // Using it as the truncation signal pinned `fetchTruncated` true on every
+  // scan, which means exit 2 and a RED SCHEDULED RUN every cycle — an alarm
+  // that is red by design is one everybody learns to ignore, which would
+  // destroy this detector's only job. This repo already has prior art for the
+  // same inconsistency: see the `total_count` cross-check and the "run index is
+  // not self-consistent across filters (BLO-38286)" case in
+  // scripts/check-scheduled-guard-liveness.mjs.
+  //
+  // The skew is still REPORTED rather than swallowed: it is real information
+  // about the index, and a large gap would mean something different from a
+  // one-row wobble. It just is not allowed to claim truncation on its own.
+  const indexSkew = totalCount !== null && runs.length < totalCount ? totalCount - runs.length : 0;
+  if (indexSkew > 0) {
+    console.error(
+      `unreported-job-failure-detector: index skew on \`${query}\` — server reported ` +
+        `total_count=${totalCount}, the walk returned ${runs.length}. Not treated as truncation ` +
+        `(BLO-38286 shape); see listRunsPage.`,
+    );
+  }
+  return { runs, totalCount, indexSkew, truncated: pagesExhausted };
+}
+
 function loadLive(args, windowStartMs, nowMs) {
   const padMs = args.fetchPadMinutes * 60 * 1000;
   const created = `${new Date(windowStartMs - padMs).toISOString()}..${new Date(nowMs + 60_000).toISOString()}`;
-  const listed = ghApi(
-    `/repos/${args.repo}/actions/runs?per_page=100&created=${encodeURIComponent(created)}`,
-  ).workflow_runs ?? [];
-  const candidates = listed.filter((r) => runMayContainWindowFailure(r, windowStartMs));
-  const fetchTruncated = candidates.length > args.maxRuns;
+  const createdQuery = `created=${encodeURIComponent(created)}`;
+
+  // EVERY ARM IS SERVER-SIDE FILTERED. The first version listed the whole
+  // `created` window and filtered client-side, which does not work at this
+  // repo's volume and failed in the worst direction. Measured 2026-11-06:
+  //
+  //     runs created in the last 13h ............. 1375
+  //     ...of those `conclusion: success` .........  467   cannot hold a failure
+  //     ...of those `conclusion: failure` ..........  55
+  //     live now (`in_progress` + `queued`) ........  19
+  //
+  // So the interesting set is ~74 and the listing walked 1375 to find it. One
+  // page of 100 covered only the newest hour, which made the 12h
+  // `fetchPadMinutes` inert and silently dropped the 3h38m case the padding
+  // exists for; paginating the whole window instead blew the candidate cap and
+  // exited 2 (red run) on a live dry-run even at `maxRuns: 200`.
+  //
+  // `status=` on this endpoint accepts a CONCLUSION as well as a status, which
+  // is what makes the narrow query possible:
+  //
+  //   ARM 1  in_progress / queued  — live runs, UNBOUNDED by `created`. The
+  //          correctness arm: a run still running can already contain a job
+  //          GitHub concluded `failure`, which IS the PEN-5738 shape (7 jobs
+  //          queued 3h38m behind two already-red ones). Unbounded because the
+  //          whole point is a run that has been alive far longer than the
+  //          report window, and it is cheap precisely because it is bounded by
+  //          what is actually running rather than by time.
+  //
+  //   ARM 2  failure / timed_out, within `created` — completed runs that can
+  //          still hold a false red. A run GitHub concluded `success` contains
+  //          no job concluded `failure`, so fetching its jobs is pure cost.
+  //
+  // KNOWN SENSITIVITY LIMIT, stated rather than hidden: a job marked
+  // `continue-on-error` can conclude `failure` inside a run that concludes
+  // `success`, and arm 2 will not look there. That is a deliberate trade — such
+  // a job does not render as a blocking red, so it cannot cause the
+  // debug-the-wrong-thing harm this detector exists to prevent — but it IS a
+  // coverage gap, not a proof of absence.
+  const arms = [
+    { query: "status=in_progress", dated: false },
+    { query: "status=queued", dated: false },
+    { query: "status=failure", dated: true },
+    { query: "status=timed_out", dated: true },
+  ];
+
+  const byId = new Map();
+  let fetchTruncated = false;
+  for (const arm of arms) {
+    const got = listRunsPage(args.repo, arm.dated ? `${arm.query}&${createdQuery}` : arm.query, args.maxPages);
+    fetchTruncated = fetchTruncated || got.truncated;
+    for (const run of got.runs) byId.set(run.id, run);
+  }
+
+  const candidates = [...byId.values()].filter((r) => runMayContainWindowFailure(r, windowStartMs));
+  if (candidates.length > args.maxRuns) fetchTruncated = true;
+
   const runs = [];
   for (const run of candidates.slice(0, args.maxRuns)) {
     let jobs = [];
@@ -310,6 +485,36 @@ function listIssueComments(repo, prNumber) {
   return all;
 }
 
+// There is a read-then-write race here and it is REACHABLE, not theoretical
+// (Ally, PEN-5738): the workflow deliberately carries no `concurrency` group —
+// see the header, cancelling a queued scan loses the verdict exactly when a
+// backlog makes it most valuable — so when an `arc-paperclip-light` backlog
+// drains, several queued scans start together, all see no marker, and all POST.
+//
+// It is resolved AFTER the fact rather than prevented, because the lock that
+// would prevent it is the `concurrency` group we are deliberately not taking.
+// Post first (never lose the verdict), then converge: if more than one comment
+// now carries this marker, the lowest id is canonical and the rest are the
+// race's debris. Deleting them is best-effort — a permission failure degrades
+// to a duplicated comment, which is the pre-existing behaviour and strictly
+// better than throwing away a finding.
+function reconcileDuplicates({ repo, prNumber, marker }) {
+  const mine = listIssueComments(repo, prNumber)
+    .filter((c) => (c.body ?? "").includes(marker))
+    .sort((a, b) => a.id - b.id);
+  for (const dup of mine.slice(1)) {
+    try {
+      ghApi(`/repos/${repo}/issues/comments/${dup.id}`, ["-X", "DELETE"]);
+      console.log(`unreported-job-failure-detector: removed duplicate comment ${dup.id} on #${prNumber}`);
+    } catch (err) {
+      console.error(
+        `unreported-job-failure-detector: could not remove duplicate comment ${dup.id}: ${err.message}`,
+      );
+    }
+  }
+  return mine.length;
+}
+
 function upsertComment({ repo, prNumber, headSha, body }) {
   const marker = commentMarkerFor(headSha);
   const existing = listIssueComments(repo, prNumber).find((c) => (c.body ?? "").includes(marker));
@@ -318,6 +523,10 @@ function upsertComment({ repo, prNumber, headSha, body }) {
     ? `/repos/${repo}/issues/comments/${existing.id}`
     : `/repos/${repo}/issues/${prNumber}/comments`;
   ghApi(path, args);
+  if (!existing) {
+    const seen = reconcileDuplicates({ repo, prNumber, marker });
+    if (seen > 1) return "created (raced; duplicates reconciled)";
+  }
   return existing ? "updated" : "created";
 }
 
