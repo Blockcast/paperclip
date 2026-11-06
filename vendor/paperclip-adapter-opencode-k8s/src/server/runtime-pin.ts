@@ -30,7 +30,7 @@ export const OPENCODE_PACKAGE = "opencode-ai";
  * job-manifest.ts resets a persistent opencode.db whenever the binary version
  * changes, so every bump costs each agent its local session DB once.
  */
-export const DEFAULT_OPENCODE_VERSION = "1.18.35";
+export const DEFAULT_OPENCODE_VERSION = "1.19.5";
 
 /** Config sentinel: run the binary bundled in the container image, no bootstrap. */
 export const OPENCODE_RUNTIME_FROM_IMAGE = "image";
