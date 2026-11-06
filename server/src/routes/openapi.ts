@@ -3379,8 +3379,15 @@ registry.registerPath({
   summary: "List issue recovery actions",
   request: {
     params: z.object({ companyId: z.string() }),
+    // `.strict()` is load-bearing documentation, not decoration: PEN-5708 made the
+    // handler REJECT unknown query keys with a 400 rather than drop them, because a
+    // dropped filter returns a full unfiltered page that reads exactly like a
+    // filtered one. The same applies to a repeated key.
     query: z.object({
       ownerAgentId: z.string().guid().optional(),
+      // PEN-5708. The only read that shows a `resolved` action; the issue-scoped
+      // read goes blind the moment one retires, so this is the audit filter.
+      sourceIssueId: z.string().guid().optional(),
       kind: z.string().optional(),
       status: z.string().optional(),
       limit: z.string().optional(),
@@ -3389,9 +3396,9 @@ registry.registerPath({
       // reachable at all past the 500-row limit; the route has accepted both
       // since BLO-19124 but neither appeared here.
       order: z.enum(["asc", "desc"]).optional(),
-    }),
+    }).strict(),
   },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
 });
 
 // ─── Sidebar ─────────────────────────────────────────────────────────────────

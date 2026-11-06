@@ -803,4 +803,110 @@ describeEmbeddedPostgres("recovery observability report", () => {
       "SRC-3",
     ]);
   });
+
+  // PEN-5708. `?sourceIssueId=` was accepted by the route and dropped, and the
+  // failure mode is the dangerous one: a dropped filter returns a FULL UNFILTERED
+  // PAGE, which is the one response shape a caller reads as "these are the matching
+  // rows". Measured live before the fix: 100 actions across 94 distinct source
+  // issues came back for a single-issue query, none of them the issue requested.
+  //
+  // The fixture is three rows on three different issues on purpose. A one-row
+  // fixture passes whether or not the filter is wired, because the unfiltered page
+  // and the filtered page are the same page.
+  it("narrows to one source issue, and does not return a full page when it cannot", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+    for (let i = 1; i <= 3; i += 1) {
+      await seedRecoveryAction({
+        companyId,
+        n: i,
+        createdAt: regressionWeek,
+        cause: "stranded_assigned_issue",
+        errorCode: "process_lost",
+        status: i === 1 ? "resolved" : "escalated",
+        outcome: i === 1 ? "restored" : null,
+        ownerAgentId: managerId,
+        returnOwnerAgentId: coderId,
+        finalAssigneeAgentId: coderId,
+        finalIssueStatus: "in_progress",
+      });
+    }
+
+    const service = recoveryObservabilityService(db);
+    const all = await service.listActions(companyId, {});
+    expect(all).toHaveLength(3);
+    expect(new Set(all.map((a) => a.sourceIssueId)).size).toBe(3);
+
+    const target = all.find((a) => a.sourceIssueIdentifier === "SRC-2")!;
+    const narrowed = await service.listActions(companyId, { sourceIssueId: target.sourceIssueId });
+    expect(narrowed).toHaveLength(1);
+    expect(narrowed[0]).toMatchObject({
+      sourceIssueId: target.sourceIssueId,
+      sourceIssueIdentifier: "SRC-2",
+    });
+
+    // Composes with the other filters rather than overriding them, and a
+    // no-match combination returns EMPTY — not the unfiltered page the bug served.
+    expect(
+      await service.listActions(companyId, {
+        sourceIssueId: target.sourceIssueId,
+        status: "resolved",
+      }),
+    ).toHaveLength(0);
+    expect(
+      await service.listActions(companyId, { sourceIssueId: randomUUID() }),
+    ).toHaveLength(0);
+  });
+
+  // PEN-5708. The projection omitted `resolvedAt`, so it deserialised as `null` on
+  // every row — and a reader taking that at face value concludes "nobody discharged
+  // this" for rows where somebody did. PEN-5445's 23:49Z analysis did exactly that:
+  // the conclusion happened to be right, the evidence could not have shown it.
+  it("projects resolvedAt and resolutionNote on a retired row", async () => {
+    const { companyId, managerId, coderId } = await seedBaseline();
+    await seedRecoveryAction({
+      companyId,
+      n: 1,
+      createdAt: regressionWeek,
+      cause: "stranded_assigned_issue",
+      errorCode: "process_lost",
+      status: "escalated",
+      outcome: null,
+      ownerAgentId: managerId,
+      returnOwnerAgentId: coderId,
+      finalAssigneeAgentId: coderId,
+      finalIssueStatus: "in_progress",
+    });
+    const service = recoveryObservabilityService(db);
+
+    // Active rows carry neither, and `escalated` is one of them: it retires the
+    // WAKE, not the action, and stays inside `ACTIVE_RECOVERY_ACTION_STATUSES`.
+    const [active] = await service.listActions(companyId, {});
+    expect(active).toMatchObject({ status: "escalated", resolvedAt: null, resolutionNote: null });
+
+    const [row] = await db.select().from(issueRecoveryActions);
+    await issueRecoveryActionService(db).resolveActiveForIssue({
+      companyId,
+      sourceIssueId: row!.sourceIssueId,
+      status: "resolved",
+      outcome: "restored",
+      resolutionNote: "Operator confirmed the agent is dispatchable again.",
+    });
+
+    const [resolved] = await service.listActions(companyId, { sourceIssueId: row!.sourceIssueId });
+    expect(resolved!.resolvedAt).toBeInstanceOf(Date);
+    expect(resolved!.resolutionNote).toBe("Operator confirmed the agent is dispatchable again.");
+
+    // The discharge rewrote `updatedAt`, which is exactly why `resolvedAt` had to be
+    // projected separately: `updatedAt` cannot say when the row was RETIRED, only
+    // when it was last touched.
+    expect(resolved!.updatedAt.getTime()).toBeGreaterThan(regressionWeek.getTime());
+
+    // ⚠ And the half that is easy to get wrong: a non-null `resolvedAt` is NOT
+    // evidence a human did this. Both retiring writers stamp it, so the field
+    // separates retired from live and nothing else — `outcome` here is the same
+    // `restored` the automatic sweep writes. The note is the discriminator, and
+    // the cross-path version of this is pinned in `issue-recovery-actions.test.ts`.
+    expect(resolved!.status).toBe("resolved");
+    expect(resolved!.outcome).toBe("restored");
+  });
 });

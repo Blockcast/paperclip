@@ -5683,8 +5683,10 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // `recoveryObservabilityService.listActions` — the same projection the company-scoped
     // `/companies/:id/recovery-actions` route serves — rather than against the table, so
     // dropping `retiringBound` from that projection fails here too. That projection is the
-    // ONLY live-API route to this fact: it carries no `resolvedAt` and no `resolutionNote`,
-    // and `updatedAt` is overwritten by the discharge.
+    // only live-API route to this fact: `updatedAt` is overwritten by the discharge, and
+    // until PEN-5708 it carried neither `resolvedAt` nor `resolutionNote` either. Both are
+    // projected now (asserted separately below), but `retiringBound` remains the field this
+    // case is about, because a manual discharge may leave `resolutionNote` null.
     const { companyId, sourceIssueId, actionId } = await seedRetiredActionForDischarge("timeout_horizon");
     const svc = issueRecoveryActionService(db);
 
@@ -7993,6 +7995,65 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(await svc.dischargeActionsWithRestoredExecution({ companyId })).toHaveLength(1);
       expect(await svc.dischargeActionsWithRestoredExecution({ companyId })).toHaveLength(0);
       expect((await readAction(actionId)).status).toBe("resolved");
+    });
+
+    it("lets the company-scoped list tell a sweep discharge from a resolver discharge (PEN-5708)", async () => {
+      // The question this surface exists to answer, asserted through the surface
+      // rather than against the table — because the table always could answer it and
+      // the API could not. `GET /issues/:id/recovery-actions` collapses to
+      // `{active: null, actions: []}` the moment an action retires, so the
+      // company-scoped list is the ONLY read that shows a retired action at all.
+      //
+      // ⚠ The trap this pins: `resolvedAt` does NOT discriminate. Both retiring
+      // writers stamp it — `dischargeActionsWithRestoredExecution` and
+      // `resolveActiveForIssue`, the latter being what the resolve ROUTE and half a
+      // dozen automatic callers in `recovery/service.ts` go through. Nor does
+      // `outcome`: the sweep writes `restored` and so does a plain manual discharge.
+      // Both halves are asserted equal below ON PURPOSE, so that a future change
+      // which makes `resolvedAt` look like a discriminator fails here.
+      const swept = await seedActionWithRun();
+      const byHand = await seedActionWithRun();
+      const svc = issueRecoveryActionService(db);
+
+      // Only the first company's row is swept; the second is left for a hand discharge.
+      expect(
+        await svc.dischargeActionsWithRestoredExecution({ companyId: swept.companyId }),
+      ).toHaveLength(1);
+      await svc.resolveActiveForIssue({
+        companyId: byHand.companyId,
+        sourceIssueId: byHand.sourceIssueId,
+        status: "resolved",
+        outcome: "restored",
+        resolutionNote: "Owner confirmed the adapter was repaired; closing by hand.",
+      });
+
+      const observability = recoveryObservabilityService(db);
+      const [sweptRow] = await observability.listActions(swept.companyId, {
+        sourceIssueId: swept.sourceIssueId,
+      });
+      const [handRow] = await observability.listActions(byHand.companyId, {
+        sourceIssueId: byHand.sourceIssueId,
+      });
+
+      // The fields that are IDENTICAL across the two paths, i.e. the ones that cannot
+      // answer the question.
+      expect(sweptRow!.status).toBe("resolved");
+      expect(handRow!.status).toBe("resolved");
+      expect(sweptRow!.outcome).toBe("restored");
+      expect(handRow!.outcome).toBe("restored");
+      expect(sweptRow!.resolvedAt).toBeInstanceOf(Date);
+      expect(handRow!.resolvedAt).toBeInstanceOf(Date);
+
+      // The fields that are NOT. `resolutionNote` is the discriminator the projection
+      // was missing; `retiringBound` gets most of the way but not all of it — these
+      // rows were seeded `escalated` with a spent `timeout_horizon`, and PEN-4013's
+      // `coalesce` deliberately preserves it through a hand discharge, so on that
+      // field alone the hand discharge is indistinguishable from an expiry.
+      expect(sweptRow!.resolutionNote).toContain(RESTORED_EXECUTION_DISCHARGE_NOTE_PREFIX);
+      expect(sweptRow!.retiringBound).toBe("execution_restored");
+      expect(handRow!.resolutionNote).toBe("Owner confirmed the adapter was repaired; closing by hand.");
+      expect(handRow!.retiringBound).toBe("timeout_horizon");
+      expect(handRow!.resolutionNote).not.toContain(RESTORED_EXECUTION_DISCHARGE_NOTE_PREFIX);
     });
 
     it("`timeoutAt` passing is NOT a discharge, and that is deliberate", async () => {
