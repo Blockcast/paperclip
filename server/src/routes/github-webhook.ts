@@ -5537,8 +5537,18 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     const deliveryId = req.header("x-github-delivery") ?? null;
     const payload = (req.body ?? {}) as Record<string, unknown>;
     let reviewGateReceipt: Record<string, unknown> | null = null;
+    // BLO-53674: a failed synchronous revocation still answers 503, but only
+    // after the reviewer wake below has run. Returning early dropped the Ally
+    // wake for the pushed head; the gate row itself stays `capturing` and the
+    // poller re-drives it (resetStaleGithubReviewGateDeliveries).
+    let reviewGateFailure: Record<string, unknown> | null = null;
     const respond = (status: number, body: Record<string, unknown>) => {
-      if (!res.headersSent) res.status(reviewGateReceipt ? 202 : status).json(reviewGateReceipt ?? body);
+      if (res.headersSent) return;
+      if (reviewGateFailure) {
+        res.status(503).json(reviewGateFailure);
+        return;
+      }
+      res.status(reviewGateReceipt ? 202 : status).json(reviewGateReceipt ?? body);
     };
 
     if (config.reviewGateAuthority?.repositories.length) {
@@ -5578,13 +5588,13 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
                 deliveryDbId: gateDelivery.deliveryDbId,
                 reason: revocation.reason,
               },
-              "github review-gate delivery persisted but pending revocation failed",
+              "github review-gate delivery persisted but pending revocation failed; " +
+                "continuing to the reviewer wake before answering 503 (BLO-53674)",
             );
-            res.status(503).json({
+            reviewGateFailure = {
               error: "github review-gate pending revocation failed",
               reason: revocation.reason,
-            });
-            return;
+            };
           }
         }
         logger.info(
