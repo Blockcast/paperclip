@@ -36,14 +36,29 @@ RUN apt-get update -qq \
  && rm -rf /var/lib/apt/lists/*
 
 # The playwright base image ships npm 10.x, whose bundled `tar` 6.2.1 carries
-# CVE-2026-59873 (Critical; fixed in tar 7.5.19) — BLO-51968. Every image
-# built FROM this one (figma-bot) inherits it. npm@11.21.1 bundles tar 7.5.22
-# and supports the base image's Node 22 (npm 12 needs Node >=22.22.2).
-# The tar check fails the build if the bundled tar is ever back below 7.
+# CVE-2026-59873 (Critical; node-tar decompression DoS — GHSA-23hp-3jrh-7fpw,
+# vulnerable range `tar <= 7.5.18`, first patched 7.5.19) — BLO-51968. Every
+# image built FROM this one (figma-bot) inherits it. npm@11.21.1 bundles tar
+# 7.5.22 and supports the base image's Node 22 (npm 12 needs Node >=22.22.2).
+#
+# The tar check below fails the build if the bundled tar is below 7.5.19 —
+# the advisory's fix version, NOT a major-version floor. PEN-5800: the
+# original `[ "${TAR_V%%.*}" -ge 7 ]` compared only the major, so it passed
+# on tar 7.5.11 — exactly what npm 10.9.x bundles. That left the single most
+# likely regression (lowering this npm pin back to a 10.9.x) landing on a
+# vulnerable tar and still going green. A version string that is not a plain
+# X.Y.Z release also fails, so an unrecognised version can never be read as
+# "new enough".
 RUN npm install -g --no-audit --no-fund npm@11.21.1 \
- && TAR_V=$(node -p "require('$(npm root -g)/npm/node_modules/tar/package.json').version") \
- && echo "npm-bundled tar $TAR_V" \
- && [ "${TAR_V%%.*}" -ge 7 ]
+ && TAR_PKG="$(npm root -g)/npm/node_modules/tar/package.json" \
+ && node -e 'const MIN = "7.5.19"; \
+const parse = s => { const m = /^(\d+)\.(\d+)\.(\d+)$/.exec(String(s)); return m ? m.slice(1).map(Number) : null; }; \
+const v = require(process.argv[1]).version; \
+const got = parse(v), min = parse(MIN); \
+if (!got) { console.error(`FATAL: npm-bundled tar version ${JSON.stringify(v)} is not a plain X.Y.Z release; refusing to assume it is >= ${MIN} (CVE-2026-59873).`); process.exit(1); } \
+const below = got[0] !== min[0] ? got[0] < min[0] : got[1] !== min[1] ? got[1] < min[1] : got[2] < min[2]; \
+if (below) { console.error(`FATAL: npm-bundled tar ${v} is vulnerable to CVE-2026-59873 (GHSA-23hp-3jrh-7fpw: tar <= 7.5.18). Need >= ${MIN}; raise the npm pin above.`); process.exit(1); } \
+console.log(`npm-bundled tar ${v} (>= ${MIN}, clear of CVE-2026-59873)`);' "$TAR_PKG"
 
 # Playwright NPM module pinned at v1.49.1 — matches the browser binaries
 # baked into the base image (mismatch = "browser version not found"
