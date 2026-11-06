@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { runInNewContext } from "node:vm";
+import { createContext, Script } from "node:vm";
 
 const prWorkflowPath = ".github/workflows/pr.yml";
 const dockerWorkflowPath = ".github/workflows/docker.yml";
@@ -136,6 +136,20 @@ test("Playwright cache prime runs its cold-store install on a 16 GiB pool, not a
 test("shared image cache exports accept only default-branch sources", async () => {
   const names = ["docker-agent", "docker-designer", "docker-mcp-external",
     "docker-mcp-gateway", "docker-figma-bot", "docker-webflow-bot"];
+  // PEN-5667: the per-script timeout below is a hang guard, not a performance
+  // assertion. It was 100 ms around a `runInNewContext` call that built a fresh
+  // V8 context per evaluation -- 6 workflows x 8 events x N expressions = 96
+  // contexts -- so the bound covered context construction and the GC pressure
+  // those contexts created rather than the microsecond boolean comparison it
+  // was meant to bound. Measured on a 4-CPU runner: p100 70.94 ms while idle
+  // (71% of the old budget) and ERR_SCRIPT_EXECUTION_TIMEOUT under load, which
+  // took the required `policy` context down with it and ejected #3376 from the
+  // merge queue. One reused context plus a compile-once Script keeps the timed
+  // region to the expression itself; 5 s still catches a genuine infinite loop
+  // well inside this step's `timeout-minutes: 1`, which is the real hang guard.
+  const scriptTimeoutMs = 5_000;
+  const sandbox = { github: undefined };
+  const context = createContext(sandbox);
   for (const name of names) {
     const workflow = await readFile(`.github/workflows/${name}.yml`, "utf8");
     const blocks = [...workflow.matchAll(/cache-to: (\$\{\{.+?\}\}|\|\n(?: {12}.+\n)+)/g)];
@@ -153,12 +167,13 @@ test("shared image cache exports accept only default-branch sources", async () =
       ["workflow_run", "refs/heads/master", "master", name === "docker-agent"],
       ["workflow_run", "refs/heads/master", "feature/test", false],
     ];
+    const compiled = expressions.map((expression) => [expression, new Script(expression)]);
     for (const [event_name, ref, head_branch, allowed] of events) {
-      for (const expression of expressions) {
-        const result = runInNewContext(expression, {
-          github: { event_name, ref, event: { workflow_run: { head_branch } } },
-        }, { timeout: 100 });
-        assert.equal(Boolean(result), allowed, `${name}: ${event_name} ${ref} ${head_branch}`);
+      sandbox.github = { event_name, ref, event: { workflow_run: { head_branch } } };
+      for (const [expression, script] of compiled) {
+        const result = script.runInContext(context, { timeout: scriptTimeoutMs });
+        assert.equal(Boolean(result), allowed,
+          `${name}: ${event_name} ${ref} ${head_branch} :: ${expression}`);
       }
     }
     if (name === "docker-figma-bot" || name === "docker-webflow-bot") {
