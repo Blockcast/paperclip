@@ -2689,3 +2689,122 @@ for (const [label, payload, expected] of [
     });
   });
 }
+
+// --- Every spelling of an approval -----------------------------------------
+//
+// Approval is the strongest surface the guard covers, and an earlier revision
+// matched only the literal `--approve` and only a quoted JSON `"event"` member.
+// Four ordinary spellings went straight through to the real gh — each probed
+// armed against a stub, each rc=0. One of them, the `--input` GraphQL case, was
+// a regression: narrowing the `--input` matcher to stop a prose false positive
+// also stopped it matching the mutation shape `--input` exists to carry. These
+// pin all four, so neither the gap nor the trade that opened it can come back.
+
+const GQL_APPROVE = 'mutation{addPullRequestReview(input:{pullRequestId:"x",event:APPROVE}){clientMutationId}}';
+const GQL_COMMENT = 'mutation{addPullRequestReview(input:{pullRequestId:"x",event:COMMENT}){clientMutationId}}';
+
+for (const [label, argsFor] of [
+  // `-a` is gh's documented short form of `--approve`.
+  ["gh pr review -a", () => ["pr", "review", "5", "-a"]],
+  // pflag bundles boolean shorthands, so `-ab <body>` is `-a -b <body>`.
+  ["gh pr review -ab <body> (bundled shorthand)", () => ["pr", "review", "5", "-ab", "LGTM"]],
+  // Cobra accepts the `--flag=value` form for booleans.
+  ["gh pr review --approve=true", () => ["pr", "review", "5", "--approve=true"]],
+  ["gh pr review --approve=1", () => ["pr", "review", "5", "--approve=1"]],
+  // `reviewer_evidence_bodies` dereferenced `query=@file`; the approval scan
+  // emitted the literal path, so the mutation text was never inspected.
+  [
+    "gh api graphql -f query=@file",
+    (dir) => {
+      const q = path.join(dir, "q.gql");
+      writeFileSync(q, GQL_APPROVE);
+      return ["api", "graphql", "-f", `query=@${q}`];
+    },
+  ],
+  [
+    "gh api graphql -F query=@file",
+    (dir) => {
+      const q = path.join(dir, "q.gql");
+      writeFileSync(q, GQL_APPROVE);
+      return ["api", "graphql", "-F", `query=@${q}`];
+    },
+  ],
+  // The regression: a GraphQL mutation spells the event unquoted, so the JSON
+  // member matcher cannot see it.
+  [
+    "gh api graphql --input <GraphQL approval>",
+    (dir) => {
+      const f = path.join(dir, "gq.json");
+      writeFileSync(f, JSON.stringify({ query: GQL_APPROVE }));
+      return ["api", "graphql", "--input", f];
+    },
+  ],
+]) {
+  test(`${label} is refused (PEN-3193)`, () => {
+    withTempDir((dir) => assertRefused(runGuard(dir, argsFor(dir)), APPROVED));
+  });
+}
+
+// The other half of widening the approval match: none of it may cost a false
+// refusal. A cluster is scanned only until the first shorthand that takes a
+// value, because everything after it is that value and not a flag, and the
+// shorthand scan runs only for `gh pr review` — `gh api` has no `-a` and its
+// own shorthands carry arbitrary text.
+for (const [label, argsFor] of [
+  // strconv.ParseBool reads this as false, so it is explicitly NOT an approval.
+  ["gh pr review --approve=false", () => ["pr", "review", "5", "--approve=false"]],
+  ["gh pr review -cb <body> (comment, bundled)", () => ["pr", "review", "5", "-cb", "nit: stray import"]],
+  [
+    "gh pr review -rb <body naming approval>",
+    () => ["pr", "review", "5", "-rb", "approve this differently"],
+  ],
+  [
+    "gh api with a lowercase-a header cluster",
+    () => ["api", "repos/o/r/issues/5/comments", "-f", "body=hi", "-Hauthorization-note:a"],
+  ],
+  [
+    "gh api graphql --input <GraphQL COMMENT review>",
+    (dir) => {
+      const f = path.join(dir, "gq.json");
+      writeFileSync(f, JSON.stringify({ query: GQL_COMMENT }));
+      return ["api", "graphql", "--input", f];
+    },
+  ],
+  // The prose exemption the `--input` narrowing bought has to survive widening
+  // it again: a sibling `body` member is prose, and prose is not an approval.
+  [
+    "gh api --input with a GraphQL query beside prose about approving",
+    (dir) => {
+      const f = path.join(dir, "gq.json");
+      writeFileSync(f, JSON.stringify({ body: "I discuss event=APPROVE and addPullRequestReview here" }));
+      return ["api", "-X", "POST", "repos/o/r/issues/5/comments", "--input", f];
+    },
+  ],
+]) {
+  test(`${label} is not an approval (PEN-3193)`, () => {
+    withTempDir((dir) => {
+      const proc = runGuard(dir, argsFor(dir));
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.doesNotMatch(proc.stderr, /refusing to/);
+    });
+  });
+}
+
+test("a disarmed seat does not buffer stdin, and still delivers it verbatim (PEN-3193)", () => {
+  // The guard's own comments promise an unarmed seat "pays nothing" and
+  // "behaves exactly as it did before". Buffering ran ahead of the armed check,
+  // so a disarmed seat still slurped `-` stdin into a tempfile. The content
+  // always passed through intact; this pins that it now does so untouched.
+  withTempDir((dir) => {
+    const tmp = path.join(dir, "tmp");
+    mkdirSync(tmp);
+    const proc = runGuard(dir, ["pr", "comment", "5", "--body-file", "-"], {
+      armed: false,
+      extraEnv: { TMPDIR: tmp },
+      input: "ordinary author comment\n",
+    });
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.match(proc.stdout, /STDIN<<ordinary author comment>>/);
+    assert.deepEqual(readdirSync(tmp), [], "a disarmed seat must not create a buffer at all");
+  });
+});
