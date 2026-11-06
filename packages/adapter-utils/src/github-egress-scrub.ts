@@ -1466,17 +1466,18 @@ const GIT_REF_MIN_WORD_MASS = 14;
  *   Google, Anthropic, OpenAI key and project key, Vault, GitLab,
  *   npm, Grafana, base32 TOTP seed, DigitalOcean, Paperclip service
  *   key, raw hex and base64 blobs), bare and `release/`-prefixed .... 0 each
- *   Kubernetes bootstrap token (`<6>.<16>`), `release/`-prefixed .... 2.30e-3
+ *   Kubernetes bootstrap token (`<6>.<16>`), `release/`-prefixed .... 1.80e-3
  *   Synthetic "chopped token" families — a random token sliced into
  *   equal runs by `/` or `-`, the only construction that reaches a
  *   word-only rule: base36 and lowercase-alnum at 4 / 6 / 8-char
- *   runs, mixed-case letters at 4 / 6 / 8 ................ 0 to 1.15e-3
+ *   runs, mixed-case letters at 4 / 6 / 8 ............ 7.5e-5 to 2.33e-3
  *
- * Worst family 2.30e-3. It is NOT zero, and the flat-token zeros are the
- * uninteresting half of that: a flat token is one opaque run and cannot reach
- * a word-only rule at all. The number to watch is the chopped-token column,
- * and the two conjuncts holding it are GIT_REF_MIN_WORD_MASS and
- * GIT_REF_MAX_COMPONENTS — without them the same families measure 8.50e-3.
+ * Worst family 2.33e-3 (mixed-case letters chopped by `/` into ~6-character
+ * runs). It is NOT zero, and the flat-token zeros are the uninteresting half
+ * of that: a flat token is one opaque run and cannot reach a word-only rule at
+ * all. The number to watch is the chopped-token column, and the two conjuncts
+ * holding it are GIT_REF_MIN_WORD_MASS and GIT_REF_MAX_COMPONENTS — without
+ * them the same families measure 8.5e-3.
  *
  * For scale, `isLexicalIdentifier` carries 2.96e-3 to 3.57e-3 NAME-FREE today,
  * and the name-anchored Kubernetes rule up to 9.85e-3 under an anchor of eight
