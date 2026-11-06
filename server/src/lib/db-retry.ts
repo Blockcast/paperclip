@@ -182,7 +182,15 @@ export function findPgError(error: unknown): PgErrorFields | null {
       return {
         code: code.toUpperCase(),
         detail: readString(record, "detail"),
-        constraint: readString(record, "constraint"),
+        // `constraint` OR `constraint_name`: node-postgres spells it the first
+        // way, the `postgres` (porsager) driver this server actually runs spells
+        // it the second. Reading only `constraint` left this field permanently
+        // empty in production — `describeDbError` below has therefore never once
+        // printed a constraint name, and a caller keying on it (as the approval
+        // payload-edit conflict translation does) silently never matched. Same
+        // `constraint ?? constraint_name` fallback `issue-thread-interactions.ts`
+        // already applies at its own call site.
+        constraint: readString(record, "constraint") ?? readString(record, "constraint_name"),
         table: readString(record, "table"),
         column: readString(record, "column"),
         message: readString(record, "message"),

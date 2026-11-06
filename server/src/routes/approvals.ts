@@ -36,6 +36,7 @@ import {
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { resolveApprovalWithSideEffects } from "../services/approval-resolution.js";
 import {
+  approvalGatesEquivalent,
   classifyGateLookup,
   classifyPullRequestGateLookup,
 } from "../services/approval-gate-reconciler.js";
@@ -1213,9 +1214,15 @@ export function approvalRoutes(
     // gate" — a caller that believes it just removed a gate must not receive a 200
     // for an operation that did not happen, which is the same class of
     // correct-looking-but-wrong artifact this route exists to remove.
+    //
+    // Compared STRUCTURALLY, not textually. `payload` is jsonb and Postgres sorts
+    // jsonb keys shortest-first, so the stored gate reads back in a different key
+    // order than the zod-parsed submitted one — a `JSON.stringify` comparison finds
+    // two renderings of identical data unequal and refuses every edit to a gated
+    // card, which is this route's main use case. See `approvalGatesEquivalent`.
     const submittedGate = (req.body.payload as Record<string, unknown>).gate ?? null;
     const storedGate = (existing.payload as Record<string, unknown>).gate ?? null;
-    if (JSON.stringify(submittedGate ?? null) !== JSON.stringify(storedGate ?? null)) {
+    if (!approvalGatesEquivalent(submittedGate, storedGate)) {
       res.status(422).json({
         error:
           "`payload.gate` cannot be changed by an edit: it is the card's retirement contract, and a card " +
@@ -1241,7 +1248,7 @@ export function approvalRoutes(
     // `budget_override_required` card must not shed its `enforcement_assertions` by
     // editing them away (BLO-34008), and a gate must not go terminal between filing
     // and edit.
-    const normalizedPayload =
+    let normalizedPayload =
       existing.type === "hire_agent"
         ? await secretsSvc.normalizeHireApprovalPayloadForPersistence(
             existing.companyId,
@@ -1260,6 +1267,16 @@ export function approvalRoutes(
       ) {
         res.status(422).json({ error: "Hire approval agent binding cannot be changed" });
         return;
+      }
+      // And mirrors resubmit's RE-STAMP, not only its refusal (`resubmit` above).
+      // The guard rejects a payload that moves the binding, but an edit REPLACES
+      // the stored payload wholesale, so one that merely OMITS `agentId` passes the
+      // guard and then drops the binding out of the persisted payload.
+      // `agentService` falls back to `payload.agentId` when the linked column is
+      // not consulted, so the omission is not guaranteed to be harmless — and
+      // keeping it costs one line.
+      if (existing.linkedAgentId) {
+        normalizedPayload = { ...normalizedPayload, agentId: existing.linkedAgentId };
       }
     }
 
