@@ -335,12 +335,37 @@ export const HTTP_REQUEST_DURATION_METRIC = "paperclip_http_request_duration_sec
  *   "inside the bound" into a directly queryable quantity.
  * - `60` -- over-bound completions, so a request that outruns the statement
  *   bound is still separable from the unbounded `+Inf` tail.
+ * - `120` -- the API tier's `PROXY_REQUEST_TIMEOUT_MS`, i.e. the deadline that
+ *   actually destroys a delivery. Same edge and same reason as
+ *   {@link PLUGIN_METRIC_DURATION_BUCKETS_SECONDS}'s final finite bucket.
  *
- * Nine edges means 12 series per (route, method) -- 10 `_bucket` including
+ * ⚠️ PEN-5783 -- why the ladder could not end at `60`. Every edge above was
+ * chosen to straddle the inherited 30s `statement_timeout`, and that is the
+ * one bound which does NOT operate in this family's worst case. When
+ * `paperclip-pg-0` was unreachable for ~16 minutes on 2026-11-06, `57014` read
+ * **zero** on every route across 04:15-04:55Z: a statement that never acquires
+ * a pooled connection never starts, so it cannot be cancelled by a per-statement
+ * timeout. The pool queues such callers without any bound of its own
+ * (`createDb` sets no queue bound, and postgres.js attaches no timer to a
+ * queued query -- its 30s `connect_timeout` default bounds a connection
+ * ATTEMPT, not the wait for one). So the requests that ran longest were
+ * precisely the ones the 30s edge was blind to.
+ *
+ * Measured on the two API pods over the 55 minutes to 05:10Z: 414 completed
+ * responses above `le="30"`, of which **361 (87%) were also above `le="60"`**
+ * and therefore indistinguishable inside `+Inf`. That is the gap this edge
+ * closes -- without it we cannot ask how much traffic crosses the tier's own
+ * delivery deadline, which is the quantity any acquire-bound decision needs.
+ * It is a lower bound on the waste either way: a response the client abandoned
+ * is never observed here at all (see the `"0"` status on
+ * {@link HTTP_REQUESTS_METRIC}), and 3,711 requests were abandoned in that same
+ * window against an ordinary-hour baseline of 0-27.
+ *
+ * Ten edges means 13 series per (route, method) -- 11 `_bucket` including
  * `+Inf`, plus `_sum` and `_count`.
  */
 const HTTP_REQUEST_DURATION_BUCKETS_SECONDS = [
-  0.1, 0.5, 1, 2.5, 5, 10, 20, 30, 60,
+  0.1, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120,
 ] as const;
 /**
  * Project primary-workspace fallback counter (BLO-26184). Incremented once
@@ -8671,8 +8696,13 @@ function ensureRegistry(): {
         + "than the server's work, so including them would bias every percentile downward. "
         + "That makes this family's _count LOWER than the request counter by the abort "
         + "rate, by design. Buckets straddle the inherited 30s statement_timeout, so "
-        + "le=\"30\" versus +Inf separates requests served inside the bound from those that "
-        + "outran it. Nothing is zero-initialized -- an absent series means no completed "
+        + "le=\"30\" separates requests served inside the bound from those that outran it, "
+        + "and le=\"120\" is the API tier's PROXY_REQUEST_TIMEOUT_MS -- the deadline past "
+        + "which a delivery is destroyed, so le=\"120\" versus +Inf is the deadline-crossing "
+        + "population (PEN-5783). Note a pool-starvation stall raises NO 57014 at all, since "
+        + "a statement that never acquires a connection never starts, so the 30s edge is "
+        + "blind to exactly this family's worst case. Nothing is zero-initialized -- an "
+        + "absent series means no completed "
         + "response was ever observed for that route, not that it was observed as zero. No "
         + "user, company, agent, query string, or status is exposed.",
       labelNames: ["route", "method"],
