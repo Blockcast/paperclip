@@ -106,6 +106,7 @@ export interface IssueLivenessDependencyPathEntry {
 }
 
 export type IssueLivenessOwnerCandidateReason =
+  | "subject_write_assignee"
   | "stalled_blocker_assignee"
   | "assignee_reporting_chain"
   | "creator_reporting_chain"
@@ -414,10 +415,51 @@ function ownerCandidatesForRecoveryIssue(
   agentsById: Map<string, IssueLivenessAgentInput>,
   options: {
     includeStalledAssignee?: boolean;
+    subjectWriteIssue?: IssueLivenessIssueInput | null;
   } = {},
 ) {
   const candidates: IssueLivenessOwnerCandidate[] = [];
   const seen = new Set<string>();
+
+  /**
+   * PEN-5851: when the prescribed repair is a write on a DIFFERENT issue than the one
+   * being recovered, the only agent who can perform it goes first.
+   *
+   * `issue:mutate` is relationship-gated, so a `blockedByIssueIds` or status write on the
+   * subject row returns `403` for everyone except its assignee. Owner selection is purely
+   * positional — `resolveEscalationOwnerAgentId` takes the first candidate that is not
+   * budget-blocked — so an owner picked from the chain-of-command arms below can only
+   * comment asking the assignee to do it, and wait. Measured over every
+   * `blocked_by_cancelled_issue` escalation to date: 5 of the 6 determinable cases routed
+   * to an agent who structurally could not perform the repair, each costing at least one
+   * extra run (PEN-5787 took three runs for one field write).
+   *
+   * Deliberately NOT a blanket "always prefer the subject's assignee". It applies only
+   * where the caller states that the repair lands on the subject, which today is
+   * `blocked_by_cancelled_issue` alone — the one rule whose recovery issue is terminal, so
+   * `includeStalledAssignee` is inert by its own `cancelled` guard and the whole remedy
+   * ("remove it from the source's blockers, or replace it") is a source-row write.
+   * Everywhere else the primary repair is a write on the recovery issue itself, whose
+   * assignee is already first via `includeStalledAssignee`; escalating ABOVE a stuck
+   * assignee is a legitimate pattern and must keep working.
+   *
+   * Falls through to the existing arms unchanged when the subject has no assignee, or its
+   * assignee is not an invokable same-company agent — `addOwnerCandidate` enforces both,
+   * so `blocked_by_uninvokable_assignee` and the unassigned-subject case (PEN-1746) keep
+   * today's behaviour rather than losing an owner.
+   */
+  const subject = options.subjectWriteIssue;
+  if (subject && subject.id !== issue.id && subject.companyId === issue.companyId) {
+    addOwnerCandidate(
+      candidates,
+      seen,
+      agentsById,
+      issue.companyId,
+      subject.assigneeAgentId,
+      "subject_write_assignee",
+      subject.id,
+    );
+  }
 
   if (options.includeStalledAssignee && issue.status !== "cancelled" && issue.status !== "done") {
     addOwnerCandidate(
@@ -867,24 +909,31 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
     blocker: IssueLivenessIssueInput,
     dependencyPath: IssueLivenessIssueInput[],
   ): IssueLivenessFinding | null {
-    const ownerCandidates = ownerCandidatesForRecoveryIssue(blocker, input.agents, agentsById, {
-      includeStalledAssignee: true,
-    });
-
     if (blocker.status === "cancelled") {
+      // The remedy below writes to `source`, not to the cancelled blocker, so ownership is
+      // resolved against `source`'s assignee first — see `subjectWriteIssue` (PEN-5851).
+      const cancelledOwnerCandidates = ownerCandidatesForRecoveryIssue(blocker, input.agents, agentsById, {
+        includeStalledAssignee: true,
+        subjectWriteIssue: source,
+      });
+
       return finding({
         issue: source,
         state: "blocked_by_cancelled_issue",
         reason: `${issueLabel(source)} is still blocked by cancelled issue ${issueLabel(blocker)}.`,
         dependencyPath,
         recoveryIssue: blocker,
-        recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
-        recommendedOwnerCandidates: ownerCandidates,
+        recommendedOwnerCandidateAgentIds: cancelledOwnerCandidates.map((candidate) => candidate.agentId),
+        recommendedOwnerCandidates: cancelledOwnerCandidates,
         recommendedAction:
           `Inspect ${issueLabel(blocker)} and either remove it from ${issueLabel(source)}'s blockers or replace it with an actionable unblock issue.`,
         blockerIssueId: blocker.id,
       });
     }
+
+    const ownerCandidates = ownerCandidatesForRecoveryIssue(blocker, input.agents, agentsById, {
+      includeStalledAssignee: true,
+    });
 
     if (hasExplicitWaitingPath(blocker)) return null;
 

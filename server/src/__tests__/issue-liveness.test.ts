@@ -485,6 +485,131 @@ describe("issue graph liveness classifier", () => {
     });
   });
 
+  // PEN-5851: the `blocked_by_cancelled_issue` remedy — "remove it from the source's
+  // blockers, or replace it" — is a write on the SOURCE, and `issue:mutate` is
+  // relationship-gated. Owner selection is positional, so the source's assignee has to be
+  // candidate #1 or the selected owner can only comment and wait.
+  it("routes a cancelled blocker to the source's assignee, who is the only agent who can write the fix", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue(),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1704",
+          title: "Cancelled unblock work",
+          status: "cancelled",
+          assigneeAgentId: "blocker-agent",
+        }),
+      ],
+      relations: blocks,
+      agents: [agent(), manager, agent({ id: "blocker-agent", name: "Cancelled owner" })],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.state).toBe("blocked_by_cancelled_issue");
+    expect(findings[0]?.recommendedOwnerAgentId).toBe(coderId);
+    expect(findings[0]?.recommendedOwnerCandidates[0]).toMatchObject({
+      agentId: coderId,
+      reason: "subject_write_assignee",
+      sourceIssueId: blockedId,
+    });
+    // The pre-existing chain-of-command arms stay behind it rather than being replaced,
+    // so a budget-blocked assignee still falls through to an owner who can escalate.
+    expect(findings[0]?.recommendedOwnerCandidateAgentIds).toContain(managerId);
+  });
+
+  // PEN-1746's shape: nothing to prefer, so the chain-of-command fallback must be intact.
+  it("keeps the chain-of-command fallback when a cancelled blocker's source is unassigned", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({ assigneeAgentId: null, createdByAgentId: coderId }),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1704",
+          title: "Cancelled unblock work",
+          status: "cancelled",
+          assigneeAgentId: "blocker-agent",
+        }),
+      ],
+      relations: blocks,
+      agents: [agent(), manager, agent({ id: "blocker-agent", name: "Cancelled owner" })],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.state).toBe("blocked_by_cancelled_issue");
+    expect(findings[0]?.recommendedOwnerAgentId).toBe(managerId);
+    expect(
+      findings[0]?.recommendedOwnerCandidates.map((candidate) => candidate.reason),
+    ).not.toContain("subject_write_assignee");
+  });
+
+  it("keeps the chain-of-command fallback when a cancelled blocker's source assignee is uninvokable", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({ assigneeAgentId: "paused-coder" }),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1704",
+          title: "Cancelled unblock work",
+          status: "cancelled",
+          assigneeAgentId: "blocker-agent",
+        }),
+      ],
+      relations: blocks,
+      agents: [
+        agent({ id: "paused-coder", name: "Paused coder", status: "paused" }),
+        manager,
+        agent({ id: "blocker-agent", name: "Cancelled owner" }),
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.state).toBe("blocked_by_cancelled_issue");
+    expect(findings[0]?.recommendedOwnerAgentId).toBe(managerId);
+    expect(findings[0]?.recommendedOwnerCandidateAgentIds).not.toContain("paused-coder");
+  });
+
+  // Scope guard: states whose remedy is a write on the RECOVERY issue keep routing to the
+  // recovery issue's own owner. Escalating above a stuck assignee is a legitimate pattern.
+  it("leaves owner routing untouched for findings whose remedy is not a source-row write", () => {
+    const backlog = classifyIssueGraphLiveness({
+      issues: [
+        issue(),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1704",
+          title: "Backlog unblock work",
+          status: "backlog",
+          assigneeAgentId: "blocker-agent",
+        }),
+      ],
+      relations: blocks,
+      agents: [agent(), manager, agent({ id: "blocker-agent", name: "Backlog owner" })],
+    });
+
+    expect(backlog[0]?.state).toBe("blocked_by_assigned_backlog_issue");
+    expect(backlog[0]?.recommendedOwnerAgentId).toBe("blocker-agent");
+    expect(backlog[0]?.recommendedOwnerCandidates[0]?.reason).toBe("stalled_blocker_assignee");
+
+    const unassigned = classifyIssueGraphLiveness({
+      issues: [
+        issue(),
+        issue({
+          id: blockerId,
+          identifier: "PAP-1704",
+          title: "Missing unblock work",
+          status: "todo",
+          assigneeAgentId: null,
+        }),
+      ],
+      relations: blocks,
+      agents: [agent(), manager],
+    });
+
+    expect(unassigned[0]?.state).toBe("blocked_by_unassigned_issue");
+    expect(unassigned[0]?.recommendedOwnerAgentId).toBe(managerId);
+  });
+
   it("prefers the blocker finding for an in-review source with a cancelled blocker", () => {
     const findings = classifyIssueGraphLiveness({
       issues: [
