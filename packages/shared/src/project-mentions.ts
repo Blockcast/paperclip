@@ -486,10 +486,35 @@ export interface UnboundMentionScanOptions {
  */
 export interface MentionBindingReport {
   /**
-   * Names written as the label of an agent-mention link whose target resolved,
-   * i.e. names that DID raise a wake. Same shape, dedupe and caps as `unbound`,
-   * so the two lists are directly comparable: a name in both means the link
-   * bound and the loose prose tokens are noise.
+   * Names written as the label of an agent-mention link whose target RESOLVED
+   * to an agent in this company. Same shape, dedupe and caps as `unbound`, so
+   * the two lists are directly comparable: a name in both means the link bound
+   * and the loose prose tokens are noise.
+   *
+   * PEN-5367. Three things this list does NOT say. The first is the one that
+   * has already cost a false claim in a live thread:
+   *
+   * - NOT "a wake was raised". Resolution is where this scan stops. Every
+   *   comment-create path then gates the `issue_comment_mentioned` wake on
+   *   `commentAuthorCanGrantIssueMention`, so a mention written by anyone other
+   *   than the issue's assignee — a manager, the CEO, a peer — resolves, is
+   *   reported here, wakes nobody, and confers no grant. Measured 2026-11-06:
+   *   one body mentioning a grantable and an ungrantable agent reported both,
+   *   identically, and the author read that as delivery. Entitlement is a
+   *   separate mechanism and no field reports it; see
+   *   `docs/security/issue-authorization-model.md`, "Who may grant a mention".
+   * - NOT the resolved agent's name. The reported name is the link LABEL, so
+   *   `[@Cfo](agent://<ceo-id>)` reports `Cfo` while the CEO is the seat that
+   *   resolved. Reporting the resolved name needs the id-to-name query this
+   *   field was built to avoid, and `unbound` reports what the author wrote, so
+   *   `bound` must too or the two stop being comparable.
+   * - NOT necessarily a name any agent has. See `boundLabelName`: a multi-word
+   *   name is truncated at its first space.
+   *
+   * Compare the two lists CASE-INSENSITIVELY. Both dedupe on the lowercased
+   * token but report first-seen casing, so `[@Cfo](agent://…)` plus a prose
+   * `@cfo` yields `bound: ["Cfo"]`, `unbound: ["cfo"]`, and a strict string
+   * intersection reads that as "nothing bound".
    */
   bound: string[];
   /**
@@ -528,6 +553,16 @@ function normalizeMentionToken(raw: string): string | null {
  * first word would put prose in a list of names. The residual is that such a
  * body reads as "nothing bound" and costs one redundant re-send, which is the
  * cheap direction of the asymmetry above.
+ *
+ * PEN-5367: the `@`-token branch stops at the first character outside
+ * `[A-Za-z0-9._-]`, so a multi-word name is TRUNCATED at its first space —
+ * `[@Security Engineer](agent://…)` reports `Security`. Prose truncates
+ * identically, because `AT_TOKEN_RE` is the same pattern, so the two lists stay
+ * comparable WITH EACH OTHER; what fails is an equality check against the
+ * agent's actual name, which reads as a dropped wake and buys a redundant
+ * re-send. The bare-label branch is anchored, so the same name written
+ * `[Security Engineer](agent://…)` is name-shaped in neither branch and is
+ * reported in neither list.
  */
 function boundLabelName(label: string): string | null {
   const at = new RegExp(AT_TOKEN_RE.source).exec(label);

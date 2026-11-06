@@ -969,6 +969,10 @@ export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
  * unreadable on the body an author naturally writes: it dedupes on the token
  * text, so one link plus loose prose for the same name is byte-identical to
  * prose alone.
+ *
+ * PEN-5367 corrects what that half claims. It knows the `agent://` id resolved
+ * and nothing beyond that: not that a wake was raised, not that the mention
+ * authorized anyone, and not that the echoed name matches the agent's.
  */
 export const COMMENT_UNBOUND_MENTIONS_NOTE =
   "⚠ A plain `@Name` MENTIONS NOBODY. The extractor binds only a markdown link "
@@ -983,13 +987,25 @@ export const COMMENT_UNBOUND_MENTIONS_NOTE =
   + "`@` token bound. The field being ABSENT from the response means the server "
   + "predates this report and can tell you nothing either way. (PEN-5180) "
   + "⚠ `unboundMentions` DEDUPES BY NAME, so a name you wrote BOTH as a link and "
-  + "as bare prose appears there even though its wake was raised. Disambiguate "
+  + "as bare prose appears there even though its link RESOLVED. Disambiguate "
   + "with the sibling `boundMentions`, which lists the names that DID bind — do "
   + "NOT disambiguate by re-sending. Same name in both lists = the link bound and "
   + "the loose `@` tokens are noise, so do nothing. In `unboundMentions` only = "
   + "nothing bound and the wake was dropped, so re-send in link form. "
   + "`boundMentions` is likewise always present; absent means the server predates "
-  + "it. (PEN-5364)";
+  + "it. (PEN-5364) "
+  + "⚠ `boundMentions` means the `agent://` id RESOLVED to an agent. It does NOT "
+  + "mean a wake was raised, and NEVER means the mention authorized anything. The "
+  + "wake is separately gated on the comment author: only the issue's ASSIGNEE, or "
+  + "an active-membership user, can grant a mention. So a mention you write on "
+  + "someone ELSE's row resolves, is listed in `boundMentions`, wakes nobody and "
+  + "grants nothing — and no field reports that, so do not tell the mentioned "
+  + "agent they have access. Compare the two lists CASE-INSENSITIVELY: both dedupe "
+  + "on the lowercased token but report first-seen casing. Compare against the "
+  + "name YOU WROTE, never the agent's: the reported name is the link label "
+  + "reduced to its first `@`-token, so `[@Security Engineer](…)` reports "
+  + "`Security`, and an equality check against the real name is a false negative. "
+  + "(PEN-5367)";
 
 export const addIssueCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)).describe(COMMENT_UNBOUND_MENTIONS_NOTE),

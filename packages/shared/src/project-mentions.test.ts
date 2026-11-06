@@ -269,7 +269,8 @@ describe("extractMentionBindingReport", () => {
 
   it("THE DEFECT: a mixed-form body is now readable", () => {
     // Before `bound`, this body and the bare-only body below were the same
-    // receipt. The wake WAS raised here.
+    // receipt. The link RESOLVED here — whether a wake followed is gated
+    // elsewhere, on the comment author (PEN-5367).
     expect(
       extractMentionBindingReport(
         `[@Cfo](${boundHref}) please rule — @Cfo also owns the ledger question`,
