@@ -180,6 +180,24 @@ ever satisfying a 1-hour predicate on a multi-hour wait (PEN-5310). Read
 `paperclip_k8s_isolation_conflict_deferrals_total` for that cost; see
 [Reading the two deferral labels](#reading-the-two-deferral-labels).
 
+⚠️ **There are two defer paths, not one, and they are easy to mistake for one.**
+`deferRunForBranchClaimConflict` (BLO-25024) does the same thing after a branch
+claim race, under the same `status = running` guard, and writes the same field
+set — but it keys its backoff on `paperclipBranchClaimRetryAttempt` /
+`paperclipBranchClaimRetryAt`, **not** the `paperclipK8sIsolation*` pair. A
+census probing only the isolation keys reads zero on every row and wrongly
+concludes the defer paths are not re-stamping `queued_at`; that exact inference
+was drawn on live data more than once during PEN-4363 / PEN-5310. Read
+`paperclip_branch_claim_conflict_deferrals_total` alongside the isolation
+counter, and treat neither as the whole measurand.
+
+Note also that `heartbeat_runs.queued_at` has exactly **three** writers:
+`promoteScheduledRetryRun` and these two defers. The first legitimately restarts
+the dispatch-wait clock (a parked run was not competing for a slot); the two
+defers do not, because the run *was* competing and returns at its original rank
+— `dispatchRank` ages from `created_at`/`retry_chain_created_at` and never reads
+`queued_at`. That asymmetry is the whole of PEN-5310's measurement defect.
+
 ## Observability
 
 Exposed on `/metrics` (`server/src/services/metrics.ts`):
@@ -192,6 +210,8 @@ Exposed on `/metrics` (`server/src/services/metrics.ts`):
 | `paperclip_external_runtime_reservation_events_total` | lease transitions: `reserved`, `contended`, `launching`, `launched`, `released`, `name_mismatch`. ⚠️ `contended` is the **slot-pool** refusal on `external_runtime_reservations_active_slot_idx` — a cheap pre-claim refusal. It is *not* the isolation-writer conflict; for that read the next two rows, and never sum the two |
 | `paperclip_k8s_isolation_conflict_deferrals_total{key_shape,cause}` | dispatch cycles **burned on rollback** by an isolation-writer conflict (PEN-5684). Each increment is a completed `queued → claim → running → conflict → queued` cycle, so it is capacity spent, not a refusal avoided. Invisible everywhere else: the defer resets `startedAt` to null and re-stamps `queuedAt` |
 | `paperclip_k8s_isolation_conflict_deferral_attempt{key_shape}` | how DEEP the thrash goes. The counter cannot tell 40 runs deferred once from one run deferred 40 times, and the two are different problems |
+| `paperclip_branch_claim_conflict_deferrals_total` | the same rollback cost on the **branch-claim** path (PEN-5310). `deferRunForBranchClaimConflict` is a structural twin of the isolation defer — same `status = running` guard, same re-queue nulling `startedAt`, same `queuedAt` re-stamp — so it burns cycles identically and was unmetered until PEN-5310. **Sum the two counters** for all rolled-back cycles; reading either alone understates the thrash by an unknown amount. Unlabelled: the conflict carries only a branch name and two UUIDs, none admissible as a label value |
+| `paperclip_branch_claim_conflict_deferral_attempt` | depth of the branch-claim thrash, for the same reason as its isolation counterpart. `deferRunForBranchClaimConflict` calls `computeK8sIsolationRetryDelayMs` — literally the same ladder — so the buckets match and the two histograms are directly comparable |
 | `paperclip_external_runtime_reservations_active` | live leases |
 | `paperclip_external_runtime_reservation_oldest_age_seconds` | oldest live lease — a lease that never releases shows up here first |
 | `paperclip_external_runtime_reservation_stranded_oldest_age_seconds` | stranded leases specifically (labelled; prefer this for alerting over the unlabelled gauge above) |
