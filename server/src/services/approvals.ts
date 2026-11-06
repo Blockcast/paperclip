@@ -862,7 +862,6 @@ export function approvalService(db: Db) {
           }
 
           return updated;
-          return updated;
         });
 
       try {
