@@ -70,8 +70,8 @@ The current packaging pins are intentionally inspectable in `Dockerfile`:
 
 ```text
 PENSTOCK_RUNTIME_REF=9878ca2499ea8a8e24ec7d8bcf3222db65ac014a
-CAVEMAN_RELEASE=bin-v1.1.6
-PONYTAIL_REF=0a4dd63ad4541f4f655c4108a295916f3c1d8fda
+CAVEMAN_RELEASE=bin-v4.0.2
+PONYTAIL_REF=7801d061243d7b753bad0e0b3c057cd250b11755
 ```
 
 The launcher path is:

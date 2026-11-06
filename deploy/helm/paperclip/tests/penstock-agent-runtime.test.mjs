@@ -80,14 +80,14 @@ test("production image packages the pinned launcher and Caveman proxy", () => {
     dockerfile,
     /COPY --from=penstock-agent-runtime \/opt\/penstock\/bin\/penstock-agent-runtime\.mjs/,
   );
-  assert.match(dockerfile, /ARG CAVEMAN_RELEASE=bin-v1\.1\.6/);
+  assert.match(dockerfile, /ARG CAVEMAN_RELEASE=bin-v4\.0\.2/);
   assert.match(
     dockerfile,
-    /5085c65788a569bf978868084bc849261a2acef8c334124d6fc7240a3f83a35c/,
+    /a70f393806ef8ef1a4b29353f158769eab6b797b3b860fc85c81528f2bfc4f04/,
   );
   assert.match(
     dockerfile,
-    /6781f31728c403805e2a93af5be9e9535e4b8b1607650d8e0fbbb4b5a9b8ae52/,
+    /bd6f6ae5de6fdfdd4cc067dc4ec1641f9f839b35f4b8c8ba3571b06255e75ebd/,
   );
   assert.match(dockerfile, /SHA256 mismatch[\s\S]*expected[\s\S]*received/);
   assert.doesNotMatch(dockerfile, /sha256sum --check --status/);
@@ -171,11 +171,11 @@ test("the agent overlay carries every packaged Penstock runtime asset", () => {
 test("production image carries a pinned Ponytail tree without shared activation", () => {
   assert.match(
     dockerfile,
-    /ARG PONYTAIL_REF=0a4dd63ad4541f4f655c4108a295916f3c1d8fda/,
+    /ARG PONYTAIL_REF=7801d061243d7b753bad0e0b3c057cd250b11755/,
   );
   assert.match(
     dockerfile,
-    /ARG PONYTAIL_HOOKS_SHA256=dd0837e870a8b81eb45ef4adebfc413a48c6daf84329befd897640f731aa0e39/,
+    /ARG PONYTAIL_HOOKS_SHA256=3320ac7fae9bdded7fab83b62017db55c01b25af3f5896a518a5cf911072f54a/,
   );
   // BLO-43044: blobless clone. `--filter=blob:none` is asserted here so the
   // /tmp byte reduction cannot be silently dropped on a later Dockerfile edit.

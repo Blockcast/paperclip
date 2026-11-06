@@ -191,7 +191,7 @@ describe("production Dockerfile k8s adapter runtime pins", () => {
     expect(runtimeDockerfile).toContain("ca-certificates gosu curl git wget ripgrep python3 \\\n");
   });
   it("pins opencode-ai and asserts the installed version", () => {
-    expect(runtimeDockerfile).toContain("ARG OPENCODE_AI_VERSION=1.18.11");
+    expect(runtimeDockerfile).toContain("ARG OPENCODE_AI_VERSION=1.19.5");
     expect(runtimeDockerfile).toContain("response.in_progress");
     expect(runtimeDockerfile).toContain("opencode-responses-replay.mjs");
     expect(runtimeDockerfile).toContain('"opencode-ai@${OPENCODE_AI_VERSION}"');
