@@ -23,6 +23,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   GITHUB_API_REFUSALS_METRIC,
+  GITHUB_API_REQUESTS_BY_ROUTE_METRIC,
   GITHUB_API_REQUESTS_METRIC,
   KNOWN_GITHUB_API_REFUSAL_REASONS,
   KNOWN_GITHUB_API_REFUSAL_RESOURCES,
@@ -33,6 +34,7 @@ import {
   renderMetrics,
 } from "../services/metrics.js";
 import {
+  classifyGithubApiRoute,
   classifyGithubRefusal,
   classifyGithubRefusalResource,
   ghFetch,
@@ -442,5 +444,39 @@ describe("normalizeGithubApiRefusalResource — the label is closed, the header 
     expect([...KNOWN_GITHUB_API_REFUSAL_RESOURCES]).toContain(
       ZERO_INIT_GITHUB_API_REFUSAL_RESOURCE,
     );
+  });
+});
+
+describe("per-route request split (BLO-53662)", () => {
+  it("maps URLs to a closed template that never carries owner, repo, number or SHA", () => {
+    const cases: Array<[string, string]> = [
+      ["https://api.github.com/repos/o/r", "repos"],
+      ["https://api.github.com/repos/o/r/pulls/12/reviews?per_page=100", "repos/pulls/reviews"],
+      ["https://api.github.com/repos/o/r/pulls/12", "repos/pulls"],
+      ["https://api.github.com/repos/o/r/commits/abc123/check-runs", "repos/commits/check-runs"],
+      ["https://api.github.com/repos/o/r/actions/runs?head_sha=abc", "repos/actions/runs"],
+      ["https://api.github.com/repos/o/r/issues/5/comments", "repos/issues/comments"],
+      ["https://api.github.com/repos/o/r/somethingnew/5", "repos/other"],
+      ["https://api.github.com/repos/o/r/pulls/12/secret-owner-name", "repos/pulls"],
+      ["https://api.github.com/graphql", "graphql"],
+      ["https://api.github.com/app/installations/1/access_tokens", "app"],
+      ["https://api.github.com/search/issues?q=x", "search"],
+      ["https://api.github.com/zzz", "other"],
+      ["https://raw.githubusercontent.com/o/r/main/x.md", "raw"],
+      ["https://ghes.example/api/v3/repos/o/r/pulls/1/files", "repos/pulls/files"],
+      ["https://ghes.example/api/graphql", "graphql"],
+      ["not a url", "other"],
+    ];
+    for (const [url, route] of cases) expect([url, classifyGithubApiRoute(url)]).toEqual([url, route]);
+  });
+
+  it("ghFetch counts each attempt under its route as well as in the unlabelled total", async () => {
+    const url = "https://api.github.com/repos/o/r/pulls/7/reviews";
+    const labels = { route: "repos/pulls/reviews" };
+    const before = counterValue((await renderMetrics()).body, GITHUB_API_REQUESTS_BY_ROUTE_METRIC, labels) ?? 0;
+    vi.stubGlobal("fetch", async () => githubResponse(200, {}, "{}"));
+    await ghFetch(url);
+    const after = counterValue((await renderMetrics()).body, GITHUB_API_REQUESTS_BY_ROUTE_METRIC, labels) ?? 0;
+    expect(after).toBe(before + 1);
   });
 });
