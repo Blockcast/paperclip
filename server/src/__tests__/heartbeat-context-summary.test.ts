@@ -3415,6 +3415,26 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("Do NOT read `withheldForAuthorizationCount: 0` as complete");
   });
 
+  // PEN-5340, review follow-up. `ownerListComplete: false` has two causes and only
+  // one of them means owners are missing; the other (`owningIdentifiersUnrecorded`)
+  // means completeness could not be CHECKED, and it is the common shape, because
+  // agent-registered rows carry no ownership metadata at all. The directive
+  // previously asserted the strong reading for every `false`, which would be wrong
+  // on most real answers -- and a control that over-claims on the common case is one
+  // readers learn to skip, which is the same fail-open it exists to remove.
+  it("does not claim a false completeness signal proves owners are missing", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("`ownerListComplete: true` is the only thing");
+    expect(markdown).toContain("`ownerListComplete: false`");
+    expect(markdown).not.toContain("means the answer is SHORT -- owners exist that it did not show you");
+    // The unverifiable cause is named, and named as weaker than the short one.
+    expect(markdown).toContain("`owningIdentifiersUnrecorded`");
+    expect(markdown).toContain("owners MAY be missing, not that they are");
+    // Suggestion from the same review: the two fields can describe one owner.
+    expect(markdown).toContain("do not add them up");
+  });
+
   // Security's §4 on PEN-5340: the endpoint refuses a bare `#123` (400), so this
   // cannot be hit through the API -- it is hit by a reader re-deriving owner/repo
   // from an abbreviated reference and guessing wrong, which returns a confident

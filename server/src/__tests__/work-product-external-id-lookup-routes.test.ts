@@ -376,6 +376,126 @@ describeEmbeddedPostgres("GET /api/companies/:companyId/work-products/by-externa
     expect(res.body.ownerListComplete).toBe(true);
   }, 120_000);
 
+  // THE COMMON SHAPE, and the reason `owningIdentifiersUnrecorded` cannot be keyed
+  // per row. `metadata.owningIdentifiers` has one writer -- the GitHub webhook --
+  // so a row an agent registered carries none, and `recordedPullRequestOwners`
+  // maps that absence onto the same `null` as an unparseable value. The field's
+  // own docblock calls agent-registered rows "the common case ... load-bearing
+  // indefinitely". Keyed per row, `ownerListComplete` would read `false` on most
+  // real lookups -- including this one, where a sibling webhook row states the
+  // declaration in full -- and a signal that is false on the common shape is a
+  // signal readers learn to skip. That is the same fail-open this endpoint exists
+  // to remove, reached by over-alerting rather than under-alerting.
+  it("stays complete when an agent-registered row carries no ownership metadata", async () => {
+    const company = await seedCompany(db, "Mixed");
+    const agent = await seedAgent(db, company.id);
+    const asserted = await seedIssue(db, company, 1, "Registered by an agent");
+    const webhook = await seedIssue(db, company, 2, "Webhook-maintained");
+    await db.insert(issueWorkProducts).values({
+      companyId: company.id,
+      issueId: asserted.id,
+      type: "pull_request",
+      provider: "github",
+      externalId: PR,
+      title: PR,
+      status: "ready_for_review",
+      // Exactly what the Paperclip skill's create call writes: no ownership at all.
+      metadata: {},
+    });
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: webhook.id,
+      externalId: PR,
+      owningIdentifiers: [`${company.issuePrefix}-1`, `${company.issuePrefix}-2`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(2);
+    // The asserted row really does carry no recording -- the point is that one
+    // readable authoritative recording is enough to answer the question.
+    expect(res.body.owners.find((owner: { provenance: string }) => owner.provenance === "asserted").owningIdentifiers)
+      .toBeNull();
+    expect(res.body.owningIdentifiersUnrecorded).toBe(false);
+    expect(res.body.unresolvedOwningIdentifiers).toEqual([]);
+    expect(res.body.ownerListComplete).toBe(true);
+  }, 120_000);
+
+  // The declared set is read off `provenance: "webhook"` rows only. An asserted
+  // row's metadata is whatever an agent chose to write, so taking the declaration
+  // from it would let one stray agent write turn a safety signal `false` for every
+  // caller of this artifact.
+  it("does not let an agent-asserted row's stray metadata decide completeness", async () => {
+    const company = await seedCompany(db, "Stray");
+    const agent = await seedAgent(db, company.id);
+    const asserted = await seedIssue(db, company, 1, "Asserted, with invented ownership");
+    const webhook = await seedIssue(db, company, 2, "Webhook-maintained");
+    await db.insert(issueWorkProducts).values({
+      companyId: company.id,
+      issueId: asserted.id,
+      type: "pull_request",
+      provider: "github",
+      externalId: PR,
+      title: PR,
+      status: "ready_for_review",
+      // No system sourceTrust: an agent said so, and named a row that owns nothing.
+      metadata: { owningIdentifiers: ["BLO-99999"] },
+    });
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: webhook.id,
+      externalId: PR,
+      owningIdentifiers: [`${company.issuePrefix}-2`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    // Still returned and still labelled -- it is dropped from the DECLARATION, not
+    // from the answer.
+    expect(res.body.owners).toHaveLength(2);
+    expect(res.body.unresolvedOwningIdentifiers).toEqual([]);
+    expect(res.body.ownerListComplete).toBe(true);
+  }, 120_000);
+
+  // The authoritative recording is what the artifact declared; with no webhook row
+  // carrying one there is nothing to check the returned rows against. `false` here
+  // is "unverifiable", which is why the directive stopped saying `false` means
+  // owners are definitely missing.
+  it("reports an answer with no authoritative recording as unverifiable", async () => {
+    const company = await seedCompany(db, "NoWebhook");
+    const agent = await seedAgent(db, company.id);
+    const asserted = await seedIssue(db, company, 1, "Only an agent-registered row");
+    await db.insert(issueWorkProducts).values({
+      companyId: company.id,
+      issueId: asserted.id,
+      type: "pull_request",
+      provider: "github",
+      externalId: PR,
+      title: PR,
+      status: "ready_for_review",
+      metadata: {},
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(1);
+    expect(res.body.withheldForAuthorizationCount).toBe(0);
+    expect(res.body.owningIdentifiersUnrecorded).toBe(true);
+    expect(res.body.ownerListComplete).toBe(false);
+  }, 120_000);
+
   // `recordedPullRequestOwners` returns `null` for a recording it could not parse,
   // and that is deliberately NOT the empty set. Read as "declares nothing" it would
   // let an unreadable recording answer `complete`, which is the one direction this

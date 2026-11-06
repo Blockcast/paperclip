@@ -10497,21 +10497,49 @@ export function issueRoutes(
     // Blockcast/paperclip#3114 returns three owners while all three rows declare
     // only one. That is why completeness cannot be derived from either field alone.
     const returnedIdentifiers = new Set(owners.map((owner) => owner.issue.identifier));
+    // The declaration is read off WEBHOOK rows only, and that is a correctness
+    // bound rather than a preference. `metadata.owningIdentifiers` has exactly one
+    // writer in this codebase -- `routes/github-webhook.ts`, which copies the set
+    // off the pull request itself. An `asserted` row's metadata is whatever an
+    // agent chose to put there, so reading it here would let a stray agent write
+    // decide a safety signal for every caller, and `provenance: "webhook"` is
+    // already what the directive calls authoritative.
+    const declaringOwners = owners.filter((owner) => owner.provenance === "webhook");
     // Computed as a set difference over values ALREADY in this response: every
     // string here is one the caller can read off `owners[].owningIdentifiers`
     // today. So it discloses nothing new and costs no extra query -- and it is
     // deliberately derived from the READABLE rows only, because a withheld row's
     // metadata would otherwise leak the identifier the filter above exists to
     // withhold.
+    //
+    // It therefore OVERLAPS `withheldForAuthorizationCount` rather than
+    // partitioning with it: an identifier whose row exists here but is withheld
+    // from this seat is declared by the readable rows and absent from `owners`, so
+    // it appears in both. Do not sum the two -- each is a reason the answer may be
+    // short, not a disjoint count of missing owners.
     const unresolvedOwningIdentifiers = [
-      ...new Set(owners.flatMap((owner) => owner.owningIdentifiers ?? [])),
+      ...new Set(declaringOwners.flatMap((owner) => owner.owningIdentifiers ?? [])),
     ]
       .filter((identifier) => !returnedIdentifiers.has(identifier))
       .sort();
-    // `owningIdentifiers: null` is "not recorded / unreadable", NOT the empty set.
-    // Read as "declares nothing" it would make an unreadable recording answer
-    // `complete`, which is the one direction this field must never fail in.
-    const owningIdentifiersUnrecorded = owners.some((owner) => owner.owningIdentifiers === null);
+    // `owningIdentifiers: null` is "not recorded / unreadable", NOT the empty set,
+    // so a response carrying no readable recording cannot state what the artifact
+    // declared and the set difference above is computed over nothing.
+    //
+    // The test is "NO authoritative row states the declaration", not "SOME row does
+    // not". Per-row absence is the common and permanent shape, not an anomaly: the
+    // field's own docblock in `pull-request-work-products.ts` records that rows
+    // whose writer never resolved ownership are "the common case ... load-bearing
+    // indefinitely", and `recordedPullRequestOwners` maps an absent field and an
+    // unparseable one onto the same `null`. Keyed per row this would fire on most
+    // real lookups -- including one where a sibling webhook row carries the PR's
+    // full declaration -- and a signal that is false on the common shape is ignored,
+    // which is the same fail-open this endpoint exists to remove, reached by
+    // over-alerting instead of under-alerting. The declaration is copied off the PR,
+    // so ONE readable recording states it in full and any further row is a copy.
+    const owningIdentifiersUnrecorded = !declaringOwners.some(
+      (owner) => owner.owningIdentifiers !== null,
+    );
     const withheldForAuthorizationCount = matches.length - owners.length;
     res.json({
       // Echoed back normalised, so a caller that passed a PR URL can see the
@@ -10542,11 +10570,19 @@ export function issueRoutes(
       // field rather than one per cause, because the caller's next action is the
       // same in every case -- go and look, do not assume you have seen them all.
       unresolvedOwningIdentifiers,
+      // `true` means this answer carries no authoritative recording of what the
+      // artifact declared, so its completeness is UNVERIFIABLE -- which is not the
+      // same claim as "owners are missing". An artifact with no webhook row at all
+      // lands here, and so does one whose only recording could not be parsed.
       owningIdentifiersUnrecorded,
       // The question a caller actually has, answered here instead of left to be
       // re-derived from three fields. A pre-write safety control is read under
       // time pressure, so the directive names THIS and nothing else; every
       // incompleteness cause above folds into it, and it fails toward `false`.
+      //
+      // `true` is "verified complete", so `false` spans both "owners are missing"
+      // and "this cannot be confirmed". The directive is worded for that, because
+      // the caller's next action is identical either way.
       ownerListComplete:
         withheldForAuthorizationCount === 0
         && unresolvedOwningIdentifiers.length === 0
