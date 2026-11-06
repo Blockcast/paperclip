@@ -1400,6 +1400,7 @@ describe("scrubGitHubEgressText", () => {
     // so a contiguous `--force-with-lease=<ref>:<oid>` anywhere in this file
     // would make the file itself unpushable through the very door it tests.
     const lease = (ref: string, expected?: string) =>
+      // paperclip:allow-git-push: fixture text only — `lease()` BUILDS the recipe string this suite feeds to the scrubber. It is input to a detector, never a command; no child process and no remote.
       `git push ${["--force-with-lease", expected === undefined ? ref : `${ref}:${expected}`].join("=")}`;
     const pair = (name: string, value: string) => [name, value].join("=");
 
@@ -1421,6 +1422,7 @@ describe("scrubGitHubEgressText", () => {
       ["attempt 1: pinned lease, full 40-hex OID", lease(BRANCH, `${EXPECTED_OID}${"a".repeat(32)}`)],
       ["attempt 2: pinned lease, abbreviated OID", lease(BRANCH, EXPECTED_OID)],
       ["bare lease, no expectation", lease(BRANCH)],
+      // paperclip:allow-git-push: fixture text only — the quoted recipe form, fed to the scrubber as input. Never executed.
       ["quoted, as a shell recipe writes it", `git push ${["--force-with-lease", `"${BRANCH}:${EXPECTED_OID}"`].join("=")}`],
       ["fully-qualified ref", lease(`refs/heads/${BRANCH}`, EXPECTED_OID)],
     ])("publishes %s byte-exact", (_label, text) => {
@@ -1434,6 +1436,7 @@ describe("scrubGitHubEgressText", () => {
       const text = [
         pair("BR", BRANCH),
         pair("EXPECT", EXPECTED_OID),
+        // paperclip:allow-git-push: fixture text only — attempt 3 from the row, fed to the scrubber as input. Never executed.
         `git push ${["--force-with-lease", '"$BR:$EXPECT"'].join("=")}`,
       ].join("\n");
 
@@ -1458,6 +1461,7 @@ describe("scrubGitHubEgressText", () => {
         const text = [
           pair(name, BRANCH),
           pair("EXPECT", EXPECTED_OID),
+          // paperclip:allow-git-push: fixture text only — the shell-variable workaround from the row, fed to the scrubber as input. Never executed.
           `git push ${["--force-with-lease", `"$${name}:$EXPECT"`].join("=")}`,
         ].join("\n");
 
@@ -1504,6 +1508,7 @@ describe("scrubGitHubEgressText", () => {
       // `-` is outside the name alphabet. Exonerating that captured name would
       // reach every one of these, none of which any control mandates.
       for (const nearMiss of ["--lease", "--force-lease", "--with-lease", "-force-with-lease"]) {
+        // paperclip:allow-git-push: fixture text only — near-miss flag strings fed to the scrubber to assert they are still REFUSED. Never executed.
         const text = `git push ${[nearMiss, `${BRANCH}:${EXPECTED_OID}`].join("=")}`;
         const result = scrubGitHubEgressText(text);
         expect(result.classes).toContain("high-entropy-assignment");
