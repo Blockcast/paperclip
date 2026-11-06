@@ -308,7 +308,7 @@ exits with a distinct code for each so a script can branch on it:
 | `NO_CREDENTIAL` | 2 | no usable token on this pod (absent / empty / unreadable / malformed binding); `gh` will refuse with exit 64 |
 | `AMBIENT_AUTH` | 3 | the wrapper supplied no token and none was named, so `gh` uses whatever auth you already had (your own `GH_TOKEN`/`GITHUB_TOKEN`, or `~/.config/gh/hosts.yml`) — **the self-test does not probe that**; with no ambient credential, `gh` is unauthenticated (60 req/hr) |
 | `GITHUB_UNREACHABLE` | 4 | the request never completed — a network fault, **not** a credential fault |
-| `UNEXPECTED` | 5 | the authenticated probe returned a status none of the above covers — report it with the generation line |
+| `UNEXPECTED` | 5 | the authenticated probe returned a status none of the above covers — report it with the `token-sha256` and generation lines |
 | `RATE_LIMITED` | 6 | `403` with `x-ratelimit-remaining: 0` — the credential **authenticated** and the shared installation budget is exhausted. Not a credential fault. Wait for the `reset` on the `authenticated:` line; **GraphQL has a separate budget** and still works. Tracked: PEN-3776 / PEN-3852 |
 | _(no verdict)_ | 70 | the self-test could not run: it cannot create a temp file under `$TMPDIR`. A local fault in the diagnostic, which says nothing either way about the credential |
 
@@ -322,29 +322,44 @@ false positive, reachable in one command, that reads as confirmation. It cost a
 senior agent an entire wake and produced a fleet-scope alarm on 2026-11-02
 (PEN-5226, PEN-5241).
 
-**Always quote the `mount-generation` and `token-sha256` when you report a
-credential result.** The rotator re-mints every 20 minutes and kubelet
-propagates the new Secret into a *running* pod within seconds, so the live
-token turns over several times inside one agent wake. A result that does not
-name its generation cannot be compared across pods or across time — two pods
-disagreeing is indistinguishable from one pod changing while you watched. That
-ambiguity is what produced the false all-clear in PEN-5241's own filing.
+**Always quote the `token-sha256` when you report a credential result, and the
+`mount-generation` beside it as context.** The sha identifies the credential;
+the generation does not. A result that does not name its sha cannot be compared
+across pods or across time — that ambiguity is what produced the false
+all-clear in PEN-5241's own filing.
 
 **One `REJECTED` does not stand your work down — but a second one escalates
-regardless of the generation.** `REJECTED` is the correct *instantaneous*
+regardless of either field.** `REJECTED` is the correct *instantaneous*
 verdict and is also what a transient window looks like, so the first reading
-buys a re-check rather than an escalation: note `mount-generation` and
-`token-sha256`, do other work for a few minutes, re-run. If it now reads `OK`
-the window closed, and nothing needs escalating. **If it still reads `REJECTED`,
-escalate — the generation tells you *which* fault, never *whether* to report
-one.** Unchanged ⇒ the rotator is stalled and the credential aged out on the
-mount (PEN-5637); advanced ⇒ a freshly published credential is being refused,
-which has not been observed here and should be reported as new. Do not gate
-escalation on the generation: it is also stamped when your own pod first
-mounted the secret, so it moves without the rotator having run (PEN-5641).
-The window itself is **not** self-healing and is not seconds long — it ends
-only when the rotator next succeeds, and the one measured on 2026-11-05 ran
-~7½–11 minutes because the published credential expired on the mount.
+buys a re-check rather than an escalation: note `token-sha256`, do other work
+for a few minutes, re-run. If it now reads `OK` the window closed, and nothing
+needs escalating. **If it still reads `REJECTED`, escalate — the *sha* tells
+you *which* fault, never *whether* to report one.** Unchanged ⇒ the rotator is
+stalled, or has published without this mount receiving it, and the credential
+aged out on the mount (PEN-5637) — this is the common case. Changed ⇒ a freshly
+published credential is being refused, which has **not** been observed here, so
+check for an existing row before filing. The window itself is **not**
+self-healing and is not seconds long — it ends only when the rotator next
+succeeds, and the one measured on 2026-11-05 ran ~7½–11 minutes because the
+published credential expired on the mount.
+
+⛔ **Never branch on `mount-generation` (PEN-5730).** It is the kubelet's
+atomic-writer stamp, recorded when **your own pod mounted the secret** and
+moved only when the projected content actually changes. So it is useless as a
+publication signal in both directions:
+
+- **Across pods** — and a park-and-re-wake re-check *is* across pods, since
+  every agent run is a fresh Job pod — it always differs, because it names when
+  *that* pod mounted. It therefore reads "advanced" whether or not anything was
+  published. Four readings on 2026-11-06 across three seats each carried the
+  reading pod's own mount second, never the last publish time.
+- **Within one pod** it only moves when the content moved, so it tells you
+  nothing the sha has not already told you. Measured: one pod, 06:56:28Z →
+  07:14:11Z, generation and sha both unchanged across 17m43s.
+
+Branching on it routed a textbook rotator stall to "novel fault, report it as
+new" during the live PEN-5726 outage. Report it — it separates a
+kubelet-propagation problem from a rotator problem — but decide on the sha.
 
 **The verdict does not automatically govern `mcp__github__*` — read the
 `mcp-channel:` line.** `gh`, `curl` and `git` re-read the token file on every
