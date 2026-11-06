@@ -219,3 +219,75 @@ describe("GitHub egress doors agree", () => {
     expect([...covered].sort()).toEqual([...allClasses].sort());
   });
 });
+
+/**
+ * PEN-5734: the doors must also agree on whether they TELL you.
+ *
+ * The parity above compares verdicts and classes. It passed throughout the
+ * period in which the `gh` door could rewrite an outbound payload and say
+ * nothing at all — both doors agreed perfectly on what to redact, and one of
+ * them published the result in silence while the other announced it. A
+ * differential test on the verdict cannot see a divergence in the DISPOSITION,
+ * and disposition is what the author acts on.
+ *
+ * So this block asserts the second half of parity: when either door rewrites
+ * agent-authored text, the agent is told. It is deliberately a test about the
+ * existence and provenance of a notice rather than its wording, so it does not
+ * ossify the message format.
+ */
+describe("GitHub egress doors both announce a rewrite", () => {
+  const rewritten = `SOME_UNENUMERATED_NAME=${SYNTHETIC_OPAQUE}`;
+
+  it("the CLI door reports every value it rewrote", () => {
+    const result = scrubGitHubCliInvocation(["issue", "comment", "1435", "--body", rewritten], {
+      readText: () => {
+        throw new Error("no file-backed text in this fixture");
+      },
+      writeTempText: () => {
+        throw new Error("no file-backed text in this fixture");
+      },
+    });
+
+    expect(result.redacted).toBe(true);
+    // The field, so the caller knows WHICH value moved, and a location so it
+    // knows WHERE. Both were computable before PEN-5734 and neither was kept.
+    expect(result.rewrites).toHaveLength(1);
+    expect(result.rewrites[0]?.field).toBe("--body");
+    expect(result.rewrites[0]?.classes).toEqual(result.classes);
+    expect(result.rewrites[0]?.locations.length).toBeGreaterThan(0);
+  });
+
+  it("the MCP door reports the same rewrite", () => {
+    const result = scrubGitHubMcpClientFrame(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/call",
+        params: { name: "add_issue_comment", arguments: { body: rewritten } },
+      }),
+    );
+
+    // The MCP runtime notifies on `result.redacted`; the parity that matters
+    // is that the signal EXISTS on both doors for the same input.
+    expect(result.redacted).toBe(true);
+    expect(result.classes).toEqual(["high-entropy-assignment"]);
+  });
+
+  it("neither door reports a rewrite on clean prose", () => {
+    const clean = "## Review\n\nOne finding in `server/src/routes/issues.ts`. LGTM otherwise.";
+
+    const cli = scrubGitHubCliInvocation(["issue", "comment", "1435", "--body", clean], {
+      readText: () => {
+        throw new Error("no file-backed text in this fixture");
+      },
+      writeTempText: () => {
+        throw new Error("no file-backed text in this fixture");
+      },
+    });
+    const mcp = throughMcpDoor(clean);
+
+    expect(cli.rewrites).toEqual([]);
+    expect(cli.redacted).toBe(false);
+    expect(mcp.redacted).toBe(false);
+  });
+});

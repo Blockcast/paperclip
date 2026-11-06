@@ -30,7 +30,7 @@ now be implemented and what may not; it is deliberately a set of bounds rather t
 
 This table is PEN-3920's own verdicts and is not the whole decision set. Later rows decided
 under the same governing rule are appended as numbered sections, each heading carrying its
-letter: D7 in section 9, D8 in section 10, D9 in section 11.
+letter: D7 in section 9, D8 in section 10, D9 in section 11, D10 in section 12.
 
 The row's `⛔` note stands and is re-affirmed: **do not raise `HIGH_ENTROPY_MIN_BITS_PER_CHAR`.**
 Reaching the measured cases needs 4.16 bits/char, above the 4.0 ceiling a 16-symbol alphabet
@@ -853,3 +853,207 @@ an internal predicate directly, and the generators were checked against a known 
 known exoneration before any count was believed: a value bound to a name shorter than three
 characters is not captured by `ASSIGNMENT_RE` at all, and an unchecked harness reports that
 silence as a clean result for every shape.
+
+## 12. PEN-5734 (D10) — `--force-with-lease=<ref>:<oid>`, and the door that rewrote instead of refusing
+
+Date: 2026-11-06
+Reviewer: Security Engineer (`7500672d-efe6-4037-a05f-61204a670894`)
+Filed by: CTO, measured first-hand against `Blockcast/penstock-llm-proxy-core#3055`.
+
+> The `=` spacing convention at the top of this file applies here too, and in this section it
+> is doubly load-bearing: until D10 deploys, the shipped scrubber redacts the very command
+> this section is about, so a contiguous `--force-with-lease=<ref>:<oid>` anywhere below
+> would make this document unpushable through the door it describes.
+
+PEN-5734 is two findings. The second is a routine name anchor of the kind §9 and §10 record.
+The first is not, and it is the one that matters.
+
+### 12.1 Finding 1 — the `gh` door rewrote an artifact and reported success
+
+Every prior row in this family is about a door **refusing**: PEN-3920, PEN-4637, PEN-5406 and
+PEN-3907 all describe a push or a write that failed closed. A refusal is a usability gap in a
+working control — you are told, nothing lands, you fix it.
+
+This was not that. `gh pr edit --body-file` **succeeded, exited 0, and printed nothing on
+stdout or stderr**, while the text GitHub then served back had the author's content replaced
+in place by a redaction marker. Nothing in the tool result, the exit code, or the output
+distinguished it from a clean write. The author found out by reading the artifact back.
+
+An agent that trusts its own success publishes a corrupted instruction and reports the step
+done. That is strictly worse than refusal, and worse specifically on a **write** path, where
+the corrupted text becomes the artifact other agents and humans then execute.
+
+The cause was a one-line omission with a wide blast radius: `scrubGitHubCliInvocation` already
+returned `redacted` and `classes`, and `prepareGitHubCliInvocation` **discarded both**. The
+same runtime's refusal path (BLO-33171 content fields) builds a detailed, line-attributed
+message; the rewrite path built nothing. The MCP door, by contrast, has notified since
+PEN-3152 (`paperclip-github-mcp-egress: redacted outbound frame (<classes>)`). So this was
+also a **door-parity defect on reporting** — the `gh` door was the only one of the three that
+could alter an outbound payload without saying so.
+
+#### Decision: ANNOUNCE, do not refuse. The defect was the silence, not the rewrite.
+
+The three doors now divide deliberately, and the asymmetry has to be argued rather than
+assumed:
+
+| door | disposition | why |
+|---|---|---|
+| `git` push (PEN-3156) | **refuse** | carries bytes that get committed |
+| `gh`/MCP repository-content fields (BLO-33171) | **refuse** | same — a rewrite survives into the repository and reads on review as an intentional change (#1542 landed with 9 `sk-` fixtures eaten) |
+| `gh`/MCP **prose** (PEN-2527) | **rewrite, and announce** | removing the material and publishing the rest IS the containment PEN-2527 was built to perform |
+
+Refusing prose instead was considered and declined. It would mean an agent that accidentally
+pastes a token cannot post its review at all, and the body is then retyped by hand around a
+control nobody can see — trading a silent corruption for a silent workaround.
+
+**The exit code stays the child's**, and this is the part worth stating explicitly because
+PEN-5734's acceptance criterion offered a non-zero exit as an alternative. It is the wrong
+one here. The notice is emitted *before* `gh` is spawned, so the author sees it whether the
+call then succeeds or fails; but failing the invocation *after* a successful publish would be
+a lie in the other direction — the artifact exists, and a caller that retries on non-zero
+posts it twice. A refusal must prevent the write, not annotate it.
+
+The notice names the field, the originating file, the classes, and the **1-based line within
+the value**, reusing `locateGitHubEgressMatches` and the exact format the refusal path
+already emits, so the two cannot drift and the fleet's existing parsing keeps working. The
+excerpt is the **scrubbed** line: echoing the raw match would send the material into agent
+stderr and from there into run logs — PEN-2526's shape, reached from inside the control built
+to prevent it. `prepareGitHubCliInvocation` additionally returns the `rewrites` array, so an
+embedding caller can act on it without parsing stderr.
+
+Brokered deployments are covered without further work: the broker forwards child stderr over
+its socket and the client writes it to `process.stderr`, and the broker re-enters this same
+runtime, which is what keeps door parity true (PEN-4933).
+
+### 12.2 Finding 2 — the anchor, and why this value needed one
+
+[PEN-4869](https://paperclip.blockcast.net/PEN/issues/PEN-4869) made the `git` egress wrapper
+**refuse a bare `--force-with-lease`** and accept only the pinned `<ref>:<expected-oid>` form,
+because a bare lease reads its expected OID from `refs/remotes/origin/<branch>` and any
+intervening `git fetch` makes it pass vacuously. So two shipped controls disagreed about one
+string: the git door **required** it, and the egress scrub **redacted** it.
+
+The consequence is sharper than an ordinary false positive. The mandated form could not be
+**written down** through any `gh` surface — PR body, PR comment, issue text. Documenting the
+correct command corrupted it into a non-command, and PEN-5055 (remediation texts that still
+print the *bare* form) could not be fixed, because the replacement text was unpublishable.
+"Derive it at runtime" — this file's standing advice on a false positive — is unavailable by
+construction: the whole point of a pinned lease is that the expected OID is a literal written
+down ahead of time.
+
+**Mechanically**, `ASSIGNMENT_RE` captures a name from `[A-Za-z0-9_]`, so the `-` terminates
+it and the captured name is bare `lease`; `:` is outside the value alphabet, so the captured
+value is the **ref half alone**. The ref was redacted and the `:<oid>` left dangling.
+
+#### The anchor is the literal flag, not the captured name
+
+Exonerating the captured name `lease` would also reach `lease=`, `--lease=` and `my_lease=`,
+none of which any control mandates. `isForceWithLeaseBinding` therefore re-reads the bytes
+immediately before the match and requires `--force-with-` there. A test pins `--lease`,
+`--force-lease`, `--with-lease` and `-force-with-lease` as still refused, so the
+generalisation cannot land silently — the same discipline §9's `UUID_VALUE_NAMES` note
+demands ("⛔ Do NOT generalise this to a `/Id$/` pattern").
+
+#### Two halves, two independent bounds — never the composite as a whole
+
+This is §10's BLO-45350 / BLO-45605 lesson applied *before* the fact. There, two runs of a
+composite were bounded and the third exonerated an arbitrary token in the gap. Here the value
+is a git ref and a git object name joined by `:`, and each half is bounded on its own:
+
+- **ref half** — `isGitRefName`, which spends **zero opaque budget**: every run between `/`,
+  `-`, `_` and `.` must be a word, a number, or a bounded word-with-digits (`isPosixPathRun`,
+  reused from §10). Plus a letters-only **word mass** floor and a component cap; see 12.3.
+- **expectation half** — `LEASE_EXPECTED_OID_RE`, lowercase hex of 7 to 64 characters: git's
+  own minimum unambiguous abbreviation through a sha256 OID.
+
+An opaque left half is still refused by the entropy test it falls through to; an opaque right
+half is now refused by a rule that did not previously exist.
+
+#### The right half was a hole, and closing it is a tightening
+
+Stated plainly because it inverts the usual direction of these sections. Because `:` ends
+`ASSIGNMENT_RE`'s capture, **everything after the colon was never offered to any detector**.
+Measured on the shipped scrubber: a lease naming a 32-character base64url token as its
+expectation published that token **byte-exact**, while redacting the harmless public branch
+name beside it. This binding scrubbed the public half and passed the opaque one.
+
+D10 closes that. Across the residual harness's families the change **newly refuses** several
+hundred thousand values in the expectation slot and newly admits none there.
+
+### 12.3 Residual, measured
+
+`scripts/measure-force-with-lease-residual.mjs`, 200,000 trials per family. "Newly admitted"
+is the fraction the shipped detector refuses that the patched one passes — the number §6.5
+requires. The shipped detector is reconstructed by denying the anchor its name
+(`--force-with-leaseX=`), which exercises every other detector identically and cannot drift
+from a vendored copy.
+
+> **A baseline trap, recorded because the first version of this harness fell into it** — it is
+> PEN-4425's measurement trap in different clothes. The ref held constant while the
+> *expectation* half was under test was a realistic branch, which is precisely a value the
+> shipped detector redacts. Every expectation family therefore measured a baseline already
+> failing for an unrelated reason, and the **ref** exemption alone moved the composite from
+> refused to passed — reporting `1.00e+0` "newly admitted" for families where the expectation
+> rule had not fired at all. The constant is now `main`: four characters, below
+> `ASSIGNMENT_RE`'s three-character name floor and its 16-character value floor, so it is
+> clean under both detectors and contributes to neither verdict.
+
+Every flat token family — base64url, base62, base36, base32, hex upper and lower, mixed-case
+letters, alphanumeric, at 24 / 32 / 43 / 64 characters — and the UUID v4 layout measure **0**,
+in the ref slot, the expectation slot, and both at once. So do 24 real credential formats,
+each measured bare and under a branch-like `release/` prefix, with one exception noted below.
+The families that are not zero are the only construction that can reach a word-only rule — a
+random token chopped into short runs:
+
+| conjunct state | worst newly-admitted family | rate | real branches published |
+|---|---|---|---|
+| no word-mass floor, 6 components | `lower-alnum` chopped by `/` into ~4-char runs | 8.50e-3 | 518 of 847 |
+| floor 10, 4 components | `base36` chopped by `-` into ~6-char runs | 7.25e-3 | 518 of 847 |
+| **floor 14, 4 components (shipped)** | k8s bootstrap token under a `release/` prefix | **2.30e-3** | **511 of 847** |
+| floor 16, 4 components | `letters-mixed` chopped by `/` into ~6-char runs | 2.30e-3 | 502 of 847 |
+
+The knee is at 14: a 3x reduction for seven real branches out of 518, and 16 buys nothing
+further on residual while costing nine more. For scale, `isLexicalIdentifier` carries 2.96e-3
+to 3.57e-3 **name-free** today and §9's Kubernetes rule up to 9.85e-3 under an anchor of eight
+common label names; D10's 2.30e-3 sits below both, under an anchor of one literal flag.
+
+**The corpus.** 1192 distinct branch names from `Blockcast/paperclip`'s history. **847 of them
+are refused inside a lease by the shipped detector** — 71% — which is the scale of the false
+positive this row reports; D10 publishes 511. The component cap sits exactly on the corpus
+maximum (263 one-component, 914 two, 3 three, 12 four) with no headroom, and it is a real
+bound rather than hygiene: `/` is the separator the chopped-token families use, and capping it
+is what takes `lower-alnum chopped by '/'` out of the top of the table.
+
+**The word-mass floor is the conjunct that holds the rule**, exactly as
+`K8S_NAME_MIN_WORD_MASS` holds §9's. It is also the only conjunct here that keeps real
+credential **formats** out, because none musters fourteen characters of letter runs:
+`sk-ant-api03-…` has 5, `xoxb-…` 4, `sk_live_…` 6, and a Kubernetes bootstrap token's
+`<6>.<16>` has none unless both halves happen to draw no digit — which is exactly the 2.30e-3
+row above, and the honest reading of it is that a bootstrap token whose two halves are
+*all letters*, written with a branch-like prefix, is admitted at that rate.
+
+### 12.4 What it admits, stated plainly
+
+A **deliberately constructed** value — a secret chopped into short case-homogeneous
+word-shaped runs and spelled as a branch name — is admitted, up to the word mass
+`POSIX_PATH_MAX_CONTENT_LENGTH` allows. No encoder emits that; producing it means setting out
+to, which §4 and PEN-3183 put outside this control's threat model.
+
+On the expectation half the residual is the one `GIT_OBJECT_NAME_VALUE_NAMES` already states
+and accepts (§ PEN-5406), reached under one more binding name: a legacy GitHub personal access
+token is exactly 40 lowercase hex with no prefix, and `VENDOR_KEY_RE` does not see one. What
+makes it acceptable is the **name half alone** — nothing but a git object name is plausibly
+written after `--force-with-lease=<ref>:` — and it must never be widened into a shape-only
+rule.
+
+### 12.5 Downstream
+
+- **PEN-5055** can now proceed. Its remediation texts print the *bare* `--force-with-lease`
+  that the PEN-4869 guard refuses; the pinned replacement is publishable once D10 deploys, and
+  was not before.
+- The **variable workaround** in `penstock-llm-proxy-core#3055`'s body keeps working and needs
+  no edit. It is worth recording that it is more fragile than it looks: it survives because
+  the variable is named `BR`, two characters, below `ASSIGNMENT_RE`'s three-character name
+  floor. `BRANCH=<the same string>` is redacted, before D10 and after it. The row's conclusion
+  — that the binding name discriminates — is right; that particular evidence had a second
+  cause. A test pins both halves so the distinction cannot be lost.
