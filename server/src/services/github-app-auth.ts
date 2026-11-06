@@ -324,6 +324,49 @@ export type ReviewerEvidenceResult =
  * first half was "a closed-unmerged retirement has landed on master"; that half is now
  * satisfied, so the evidence half is the whole trigger.
  *
+ * ### Evidence log — hazard CONFIRMED, trigger NOT met (PEN-5662, 2026-11-06)
+ *
+ * A close/reopen sweep is now measured, and it is systematic rather than incidental.
+ * In `Blockcast/penstock-llm-proxy-core`, `allyblockcast[bot]` closed three pull
+ * requests UNMERGED and reopened each within seconds on 2026-11-05: #3144 (08:37:27Z →
+ * 08:37:33Z, 6s), #3145 (08:38:53Z → 08:38:58Z, 5s), #3147 (08:39:06Z → 08:39:11Z, 5s).
+ * Controls #3136 and #3149 carry no such events, so it is a selected set and not a pass
+ * over every open pull request. ⚠ Note the REPO. The sweep has NOT been observed in
+ * `Blockcast/paperclip`, whose #3144/#3145/#3147 merged on 2026-10-30 and were never
+ * reopened — the same numbers with an innocent explanation. Check the right timeline
+ * before concluding anything; this misattribution costs a whole read to undo.
+ *
+ * The race is REACHABLE, not excluded by construction. The sweep is poll-driven
+ * (`startApprovalGateReconciler` → `scheduler.setInterval(runTick, intervalMs)`, plus
+ * one immediate pass at start); nothing subscribes to `pull_request.closed`.
+ * `classifyPullRequestGateLookup` returns `terminal` on `state === "closed"` with no
+ * time component, this reader hands it no `closed_at` to use, and `closeAndAnnounce`
+ * guards only on `status IN undecided` — which protects against a concurrent human
+ * decision, not against a pull request that has since reopened. At the default
+ * 10-minute interval (`approvalGateReconcilerIntervalMinutes.fallback = 10`), a ~6s
+ * window is roughly 1% per sweep event on a gated pull request.
+ *
+ * ⚠ The trigger above is STILL NOT MET, and that is why this decline STANDS. It asks
+ * for "a card observed retired by a close/reopen race" — an actual retirement, not a
+ * demonstrated hazard. Measured 2026-11-06: the closed-unmerged branch has never fired
+ * in production at all. Every `github_pr_merged` card ever retired company-wide went
+ * out on `merged = true`; no card has been cancelled for a closed-unmerged pull
+ * request. Of 15 live gated cards, 9 name `penstock-llm-proxy-core` pull requests, so
+ * exposure IS concentrated in the swept repo — but exactly one of those 9 (#3144) has
+ * ever been swept, and its card `b2fb91a9` survived it. One near-miss, zero losses.
+ *
+ * What this evidence DOES change is the weight of reason 2, which reads the reopen as
+ * arbitrarily timed. Against an arbitrary reopen reason 2 is correct and the guard only
+ * narrows a window. But the sweep actually observed sits ENTIRELY inside the window a
+ * guard would close: any threshold above ~6s covers it completely, so against this
+ * pattern the guard closes the hole rather than narrowing it. Reason 2 still carries
+ * against hand-driven reopens; it no longer carries against the sweep. Reason 3 (the
+ * shared reader, seven call sites) is untouched, and is now the load-bearing half.
+ *
+ * So if a retirement is ever observed, this entry is the other half of the case, and
+ * the guard goes on the `closed-unmerged` branch ONLY — `merged` is monotonic and its
+ * fail-closed posture must not be touched.
+ *
  * (A fourth consideration, noted and NOT relied on: the guard compares GitHub's clock
  * against the server's. At the 10-minute sweep interval, ordinary NTP skew is far
  * inside the margin, so this is a design note rather than an objection.)
