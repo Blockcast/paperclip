@@ -5540,7 +5540,8 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
     // BLO-53674: a failed synchronous revocation still answers 503, but only
     // after the reviewer wake below has run. Returning early dropped the Ally
     // wake for the pushed head; the gate row itself stays `capturing` and the
-    // poller re-drives it (resetStaleGithubReviewGateDeliveries).
+    // poller re-drives it (resetStaleGithubReviewGateDeliveries) within the
+    // 10-minute capture window; past that the row is expired, not retried.
     let reviewGateFailure: Record<string, unknown> | null = null;
     const respond = (status: number, body: Record<string, unknown>) => {
       if (res.headersSent) return;
