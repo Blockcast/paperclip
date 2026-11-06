@@ -1755,12 +1755,13 @@ test("prints a truncated hash and never the credential itself on the seat-value 
 // kubelet's atomic writer: a `..<timestamp>.<nonce>` directory holding the
 // payload, with `..data` flipped at it and the key symlinked through.
 //
-// Calling this a SECOND time against the same directory is precisely what a
-// kubelet resync does — a brand-new generation directory, with `..data`
-// re-pointed at it, carrying content that may be byte-identical. PEN-5730 turns
-// on that being indistinguishable from a real publication by the generation
-// alone, so the resync case gets a first-class helper rather than being
-// open-coded at the one call site that needs it.
+// Calling this a SECOND time against the same directory models what the agent
+// fleet actually sees between two readings: a NEW generation directory holding
+// the SAME credential. In production that pairing comes from a new Job pod
+// mounting the unchanged Secret, not from a resync in place — kubelet's
+// AtomicWriter returns early when the content has not changed. The fixture
+// reproduces the pairing, which is what PEN-5730 turns on; it does not claim
+// to reproduce the mechanism that produces it.
 //
 // The nonce is derived rather than written out. A real one is a ~10-digit run,
 // which is credential-shaped to the publish guard and refuses the push
@@ -1779,6 +1780,10 @@ function writeKubeletMount(dir, generation, tokenContent) {
   return tokenLink;
 }
 
+// The field whose absence produced PEN-5241's own false clear: the CTO measured
+// a 200 on a *later* generation than the one being reported on, and wrote the
+// all-clear into the bug report. A result that does not name its generation
+// cannot be compared across pods OR across time.
 test("reports the kubelet mount generation backing a Secret-mounted token", async () => {
   await withStubGitHub(async (apiBase) => {
     withTempDir((dir) => {
@@ -2284,9 +2289,11 @@ test("escalation is gated on the second REJECTED, not on the generation (PEN-564
       // gate — it says which fault, never whether to escalate.
       assert.match(proc.stdout, /says WHICH fault, never WHETHER/);
       assert.match(proc.stdout, /Do NOT wait for the sha to settle before escalating/);
-      // A moved generation is not proof the rotator ran: this pod stamps one at
-      // mount time too, measured on PEN-5641 and again on PEN-5730.
-      assert.match(proc.stdout, /this pod stamps one at mount time too/);
+      // A moved generation is not proof the rotator ran: the stamp records when
+      // this pod mounted the secret, measured on PEN-5641 and again on
+      // PEN-5730. (Phrasing changed in PEN-5730 when the mechanism was
+      // corrected; the claim it pins is the same one.)
+      assert.match(proc.stdout, /stamped when this pod mounted the secret/);
       // And the retracted framing must not come back: the window is not
       // self-healing, and 93s was a sampling interval, never a duration.
       assert.doesNotMatch(proc.stdout, /closed itself/);
@@ -2344,6 +2351,11 @@ test("the PEN-5726 shape (generation ADVANCED, sha UNCHANGED, REJECTED) routes t
       const nonce = Date.now();
 
       // Reading 1 — 05:29Z in the live incident.
+      //
+      // The two readings below are two agent RUNS, which in production means
+      // two pods: each mounts the unchanged Secret and stamps its own
+      // generation. Same credential, different generation — the pairing that
+      // the generation-keyed rule read as "something was published".
       const first = runAuthCheck(dir, {
         tokenFilePath: writeKubeletMount(dir, `..2026_11_06_05_29_02.${nonce}`, agedOut),
         apiBase,
@@ -2366,7 +2378,11 @@ test("the PEN-5726 shape (generation ADVANCED, sha UNCHANGED, REJECTED) routes t
 
       // The classification an agent lands on is chosen by the sha, which has
       // not moved — so the destination is the rotator stall.
-      assert.match(second.stdout, /token-sha256 UNCHANGED -> rotator stalled[\s\S]*?PEN-5637/);
+      assert.match(second.stdout, /token-sha256 UNCHANGED -> no new credential reached this mount[\s\S]*?PEN-5637/);
+      // "sha unchanged" bounds what reached THIS MOUNT, not what the rotator
+      // did — a published-but-unpropagated Secret reads identically. Same
+      // remedy, but the label must not overclaim.
+      assert.match(second.stdout, /published without propagating here/);
 
       // The defect itself. No arm may be keyed on the generation in either
       // direction: that is what made "report it as new" the default outcome of
@@ -2404,9 +2420,14 @@ test("the mount-generation line carries its own not-evidence-of-publication cave
 
       assert.match(ok.stdout, /verdict:\s+OK/);
       assert.doesNotMatch(ok.stdout, /rotation-vs-outage:/);
-      assert.match(ok.stdout, /mount-generation:\s+\S+ \(kubelet resync stamp/);
-      assert.match(ok.stdout, /NOT evidence of publication: bumped/);
-      assert.match(ok.stdout, /with identical content, and stamped at this pod's own mount\. PEN-5730\)/);
+      assert.match(ok.stdout, /mount-generation:\s+\S+ \(stamped when THIS pod mounted the secret/);
+      assert.match(ok.stdout, /NOT\s+evidence of publication/);
+      assert.match(ok.stdout, /readings from different pods always\s+differ\. Decide on token-sha256\. PEN-5730\)/);
+      // The mechanism claim this replaced was false and must not come back:
+      // kubelet's AtomicWriter returns early when the content is unchanged, so
+      // the stamp does NOT move on a same-content resync. Measured on one pod,
+      // 06:56:28Z -> 07:14:11Z: generation and sha both unchanged (PEN-5730).
+      assert.doesNotMatch(ok.stdout, /bumped\s+with identical content/);
       assert.equal(ok.status, 0);
     });
   });

@@ -814,12 +814,13 @@ paperclip_auth_check() {
   # guards against ("the generation moved, so the rotator published") is
   # available to anyone who reads this line in any verdict. Suppressed when
   # there is no generation to qualify: "-" means this token is not a Secret
-  # mount at all, and a caveat about kubelet resync would be noise there.
+  # mount at all, and the caveat would be noise there.
   if [ "${check_gen}" = "-" ]; then
     printf '  mount-generation:   %s\n' "${check_gen}"
   else
-    printf '  mount-generation:   %s (kubelet resync stamp — NOT evidence of publication: bumped\n' "${check_gen}"
-    printf '                      with identical content, and stamped at this pod'"'"'s own mount. PEN-5730)\n'
+    printf '  mount-generation:   %s (stamped when THIS pod mounted the secret — NOT\n' "${check_gen}"
+    printf '                      evidence of publication; readings from different pods always\n'
+    printf '                      differ. Decide on token-sha256. PEN-5730)\n'
   fi
   printf '  mount-written:      %s\n' "${check_written}"
   printf '  token-sha256:       %s\n' "${check_hash}"
@@ -847,44 +848,53 @@ paperclip_auth_check() {
   #
   # PEN-5730: the generation cannot label WHICH fault either, and that half was
   # still wrong after PEN-5641 corrected the gate. `mount-generation` is the
-  # kubelet's atomic-writer stamp, which it rewrites on every resync of the
-  # projected volume EVEN WHEN THE CONTENT IS BYTE-IDENTICAL, and which this pod
-  # also stamps when it first mounted the secret. So it does not track "a new
-  # credential was published", it tracks "the kubelet looked at this volume" —
-  # and because the resync period is short, it ADVANCES on essentially every
-  # re-check this procedure asks for. That made `generation ADVANCED -> report it
-  # as new` the DEFAULT outcome of step 4 rather than an edge case, routing a
-  # textbook rotator stall to "novel fault, file a new row" during the live
-  # PEN-5726 outage — silently and confidently, because every instruction had
-  # been obeyed.
+  # kubelet's atomic-writer stamp: recorded when THIS pod mounted the secret,
+  # and moved only when the projected content actually changes (AtomicWriter
+  # compares the payload against what is on disk and returns early when nothing
+  # changed). It is useless as a publication signal in BOTH directions:
   #
-  # Four readings across three seats on 2026-11-06, every one of them with the
-  # generation equal to the READING pod's own mount second and never to the last
-  # publish time:
+  #   - ACROSS PODS it always differs, because it names when THAT pod mounted.
+  #     And a park-and-re-wake re-check IS across pods: every agent run is a
+  #     fresh Job pod. So step 4's re-check reads "advanced" whether or not
+  #     anything was published — which made `generation ADVANCED -> report it as
+  #     new` the DEFAULT outcome rather than an edge case, routing a textbook
+  #     rotator stall to "novel fault, file a new row" during the live PEN-5726
+  #     outage, silently and confidently, with every instruction obeyed.
   #
-  #   05:29:02Z  UXDesigner  gen ..05_29_02 ADVANCED  sha fd932f45 unchanged  REJECTED
-  #   05:51:12Z  Cto         gen ..05_51_12 ADVANCED  sha fd932f45 unchanged  REJECTED
-  #   06:52:12Z  Cto         gen ..06_52_12 ADVANCED  sha eba251a0 CHANGED    OK
-  #   06:56:28Z  Engineer    gen ..06_56_28 ADVANCED  sha 561d2c1b CHANGED    OK
+  #   - WITHIN ONE POD it moves only when the content moved, so it says nothing
+  #     the sha has not already said.
   #
-  # `token-sha256` discriminates in all four; `mount-generation` in none. The
-  # sha is the content, so a changed sha IS a publication and an unchanged sha
-  # IS the rotator not having published — whatever the generation says.
+  # Four readings across three seats on 2026-11-06, each carrying the READING
+  # pod's own mount second and never the last publish time — note rows 2 and 3
+  # are the same SEAT but different runs, hence different pods:
+  #
+  #   05:29:02Z  UXDesigner  gen ..05_29_02  sha fd932f45 unchanged  REJECTED
+  #   05:51:12Z  Cto         gen ..05_51_12  sha fd932f45 unchanged  REJECTED
+  #   06:52:12Z  Cto         gen ..06_52_12  sha eba251a0 CHANGED    OK
+  #   06:56:28Z  Engineer    gen ..06_56_28  sha 561d2c1b CHANGED    OK
+  #
+  # And a fifth, the within-one-pod control: that same Engineer pod re-read at
+  # 07:14:11Z — 17m43s later, generation AND sha both unchanged. The stamp does
+  # not drift on its own.
+  #
+  # `token-sha256` discriminates in all five; `mount-generation` in none.
   if [ "${verdict_code}" = 1 ]; then
     printf '  rotation-vs-outage: a REJECTED reading alone does NOT establish an outage, and does NOT stand your work down:\n'
     printf '                        1. note token-sha256 above (mount-generation is context, never the discriminator)\n'
     printf '                        2. do other work for a few minutes, then re-run this check\n'
     printf '                        3. now OK -> the window closed; proceed, escalate nothing\n'
     printf '                        4. still REJECTED -> ESCALATE. The sha says WHICH fault, never WHETHER:\n'
-    printf '                             token-sha256 UNCHANGED -> rotator stalled, credential aged out on the mount\n'
-    printf '                                                       (PEN-5637). This is the common case.\n'
+    printf '                             token-sha256 UNCHANGED -> no new credential reached this mount: the rotator\n'
+    printf '                                                       stalled, or published without propagating here, and\n'
+    printf '                                                       what is mounted aged out (PEN-5637). Common case.\n'
     printf '                             token-sha256 CHANGED   -> a freshly published credential is being refused; this\n'
     printf '                                                       has NOT been observed in this fleet, so check for an\n'
     printf '                                                       existing row before filing — confirm, do not assume\n'
     printf '                        Do NOT wait for the sha to settle before escalating. And do NOT branch on\n'
-    printf '                        mount-generation: the kubelet bumps it on every resync with identical content, and\n'
-    printf '                        this pod stamps one at mount time too, so it ADVANCES on essentially every re-check\n'
-    printf '                        and discriminates nothing. Context, never a discriminator (PEN-5730).\n'
+    printf '                        mount-generation: it is stamped when this pod mounted the secret, so two readings\n'
+    printf '                        from two runs (two pods) always differ whether or not anything was published, and\n'
+    printf '                        within one pod it moves only when the sha does. Context, never a discriminator\n'
+    printf '                        (PEN-5730).\n'
   fi
   exit "${verdict_code}"
 }
