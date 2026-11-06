@@ -1545,6 +1545,39 @@ export const K8S_ISOLATION_CONFLICT_DEFERRAL_ATTEMPT_METRIC =
 
 const K8S_ISOLATION_CONFLICT_DEFERRAL_ATTEMPT_BUCKETS = [1, 2, 3, 5, 8, 13, 21, 34, 55] as const;
 
+/**
+ * PEN-5310: the third of the three writers of `heartbeat_runs.queued_at`, the
+ * second of its two defer paths, and until now the only one with no measurand.
+ *
+ * `deferRunForBranchClaimConflict` is a structural twin of
+ * `deferRunForK8sIsolationConflict` -- same `status = running` guard, same
+ * re-queue that nulls `startedAt`/`errorCode`, same `queuedAt: now` re-stamp,
+ * same `computeK8sIsolationRetryDelayMs` ladder -- but it keys its backoff on
+ * `paperclipBranchClaimRetry*` instead of `paperclipK8sIsolationRetryAttempt`,
+ * and it emitted no metric at all. That asymmetry made it invisible twice
+ * over: a census probing the isolation keys reads 0 and concludes the defer
+ * paths are not the writer, and the PEN-5684 counter added for the isolation
+ * twin cannot see these cycles either. Both readings were reached on live data
+ * (PEN-4363, PEN-5310) and both were wrong in the same direction.
+ *
+ * Unlabeled deliberately. The conflict carries `branchKey`, `holderRunId` and
+ * `holderIssueId`; the first is an unbounded branch name and the other two are
+ * UUIDs, so none can be a label value. The run event and the log line stay the
+ * per-run answer -- this is the fleet aggregate those cannot provide.
+ */
+export const BRANCH_CLAIM_CONFLICT_DEFERRALS_METRIC =
+  "paperclip_branch_claim_conflict_deferrals_total";
+/**
+ * PEN-5310: depth of the branch-claim thrash, for the same reason PEN-5684
+ * needed one for isolation conflicts -- a counter renders 40 runs deferred
+ * once and one run deferred 40 times as the same line. The ladder is literally
+ * the same function (`computeK8sIsolationRetryDelayMs`, saturating at 300 s by
+ * attempt 6), so the isolation buckets apply unchanged and the two histograms
+ * stay directly comparable.
+ */
+export const BRANCH_CLAIM_CONFLICT_DEFERRAL_ATTEMPT_METRIC =
+  "paperclip_branch_claim_conflict_deferral_attempt";
+
 const UNKNOWN_K8S_ISOLATION_KEY_SHAPE = "other";
 
 /**
@@ -5814,6 +5847,8 @@ let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = nul
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let k8sIsolationConflictDeferrals: Counter<"key_shape" | "cause"> | null = null;
 let k8sIsolationConflictDeferralAttempt: Histogram<"key_shape"> | null = null;
+let branchClaimConflictDeferrals: Counter | null = null;
+let branchClaimConflictDeferralAttempt: Histogram | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
 let queuedRunAgeMetricsRefreshSuccess: Gauge | null = null;
@@ -6047,6 +6082,8 @@ function ensureRegistry(): {
   externalRuntimeReservationEventsCounter: Counter<"event">;
   k8sIsolationConflictDeferralsCounter: Counter<"key_shape" | "cause">;
   k8sIsolationConflictDeferralAttemptHistogram: Histogram<"key_shape">;
+  branchClaimConflictDeferralsCounter: Counter;
+  branchClaimConflictDeferralAttemptHistogram: Histogram;
   externalRuntimeReservationsActiveGauge: Gauge;
   externalRuntimeReservationOldestAgeGauge: Gauge;
   externalRuntimeReservationsReleasePendingGauge: Gauge;
@@ -6219,6 +6256,8 @@ function ensureRegistry(): {
     || !externalRuntimeReservationEvents
     || !k8sIsolationConflictDeferrals
     || !k8sIsolationConflictDeferralAttempt
+    || !branchClaimConflictDeferrals
+    || !branchClaimConflictDeferralAttempt
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
     || !queuedRunAgeMetricsRefreshSuccess
@@ -6643,6 +6682,27 @@ function ensureRegistry(): {
         + "deferred 40 times, and the backoff saturates at 300 s by attempt 6, so a deep tail is "
         + "a run re-stamping queuedAt every 5 min indefinitely.",
       labelNames: ["key_shape"],
+      buckets: [...K8S_ISOLATION_CONFLICT_DEFERRAL_ATTEMPT_BUCKETS],
+      registers: [registry],
+    });
+    branchClaimConflictDeferrals = new Counter({
+      name: BRANCH_CLAIM_CONFLICT_DEFERRALS_METRIC,
+      help:
+        "Count of dispatch cycles rolled back by a branch-claim conflict (PEN-5310). "
+        + "The branch-claim twin of k8s_isolation_conflict_deferrals_total: each increment is a "
+        + "completed queued -> claim -> running -> conflict -> queued cycle, re-stamping queued_at "
+        + "and resetting startedAt to null, so it is invisible in startedAt and in every "
+        + "coalesce(queued_at, created_at) age gauge. Sum the two to get all rolled-back cycles; "
+        + "reading either alone understates the thrash.",
+      registers: [registry],
+    });
+    branchClaimConflictDeferralAttempt = new Histogram({
+      name: BRANCH_CLAIM_CONFLICT_DEFERRAL_ATTEMPT_METRIC,
+      help:
+        "Retry attempt number at the moment a run was deferred behind an active branch claim "
+        + "(PEN-5310). Same ladder as the isolation twin (computeK8sIsolationRetryDelayMs, "
+        + "saturating at 300 s by attempt 6), so the buckets match and the two are comparable. "
+        + "A deep tail is one run re-stamping queuedAt every 5 min indefinitely.",
       buckets: [...K8S_ISOLATION_CONFLICT_DEFERRAL_ATTEMPT_BUCKETS],
       registers: [registry],
     });
@@ -9274,6 +9334,8 @@ function ensureRegistry(): {
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     k8sIsolationConflictDeferralsCounter: k8sIsolationConflictDeferrals,
     k8sIsolationConflictDeferralAttemptHistogram: k8sIsolationConflictDeferralAttempt,
+    branchClaimConflictDeferralsCounter: branchClaimConflictDeferrals,
+    branchClaimConflictDeferralAttemptHistogram: branchClaimConflictDeferralAttempt,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
     queuedRunAgeMetricsRefreshSuccessGauge: queuedRunAgeMetricsRefreshSuccess,
@@ -10083,6 +10145,20 @@ export function recordK8sIsolationConflictDeferral(input: {
     Math.max(1, Math.floor(Number.isFinite(input.retryAttempt) ? input.retryAttempt : 1)),
   );
   return { keyShape, cause };
+}
+
+/**
+ * PEN-5310: record one dispatch cycle rolled back by a branch-claim conflict.
+ *
+ * Returns nothing, unlike the isolation recorder, because there are no bounded
+ * labels for the caller to echo onto its log line -- see the metric's docblock.
+ */
+export function recordBranchClaimConflictDeferral(input: { retryAttempt: number }): void {
+  const metrics = ensureRegistry();
+  metrics.branchClaimConflictDeferralsCounter.inc();
+  metrics.branchClaimConflictDeferralAttemptHistogram.observe(
+    Math.max(1, Math.floor(Number.isFinite(input.retryAttempt) ? input.retryAttempt : 1)),
+  );
 }
 
 export function setExternalRuntimeReservationMetrics(input: {
@@ -12794,6 +12870,8 @@ export function __resetMetricsForTest(): void {
   externalRuntimeReservationEvents = null;
   k8sIsolationConflictDeferrals = null;
   k8sIsolationConflictDeferralAttempt = null;
+  branchClaimConflictDeferrals = null;
+  branchClaimConflictDeferralAttempt = null;
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
   queuedRunAgeMetricsRefreshSuccess = null;

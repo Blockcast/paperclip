@@ -489,6 +489,7 @@ import {
   recordTransientRetryFloorDisposition,
   recordDepBlockedRetryDispersion,
   recordK8sIsolationConflictDeferral,
+  recordBranchClaimConflictDeferral,
 } from "./metrics.js";
 import type {
   DispatchDeclineReason,
@@ -35701,6 +35702,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       },
     });
     publishRunLifecyclePluginEvent(deferredRun);
+    // PEN-5310: emitted only after the re-queue UPDATE has landed, for the same
+    // reason as the isolation twin -- the UPDATE is guarded on `status =
+    // running`, so a run finalized underneath this path returns null above
+    // without ever being re-queued, and counting that would overstate the cost.
+    recordBranchClaimConflictDeferral({ retryAttempt });
     logger.info(
       {
         runId: deferredRun.id,
