@@ -2961,6 +2961,54 @@ describe("agent issue mutation checkout ownership", () => {
       expect(mockIssueService.addComment).not.toHaveBeenCalled();
     });
 
+    // PEN-5780: the near-miss remediation. The generic text above is wrong for
+    // an actor who already HOLDS a dependency edge — "respond on an issue you
+    // are assigned to and reference this one" is what they just did, and the
+    // reportsTo escalation aims at a chain that is not the obstacle. One
+    // missing creator stamp is. Pins that the swap happens and that the old
+    // misdirection is gone.
+    it("swaps in the dependency-edge remediation on a near miss, dropping the generic escalation", async () => {
+      mockAccessService.decide.mockImplementation(async (input: { action: string }) => (
+        input.action === "issue:read"
+          ? { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "read ok" }
+          : {
+            allowed: false,
+            action: input.action,
+            reason: "deny_missing_grant",
+            explanation: "No issue:comment relation holds between the actor and this issue.",
+            evaluatedRelations: ["dependency_edge"],
+            nearMissRelations: ["dependency_edge"],
+          }
+      ));
+      mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+
+      const res = await request(await createApp(peerActor()))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "I am blocked by you; here is what I need." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      const remediation = res.body.details?.remediation;
+      expect(remediation, JSON.stringify(res.body)).toBeTruthy();
+      // Says the edge is already there — the opposite of "no relation at all".
+      expect(remediation).toMatch(/already joins this issue/i);
+      // Names the one act that clears it, aimed at the assignee.
+      expect(remediation).toMatch(/declare the same dependency from their side/i);
+      expect(remediation).toContain(`agent://${ownerAgentId}`);
+      // Says why the guard exists, so the next reader does not "fix" it by
+      // deleting the creator conjunct — which is the self-grant hole.
+      expect(remediation).toMatch(/confers no reach/i);
+      // The two remedies that do not apply here must be gone, or the agent is
+      // still being pointed at the wrong doors.
+      expect(remediation).not.toMatch(/respond on an issue you are assigned to/i);
+      expect(remediation).not.toMatch(/reportsTo chain/i);
+      // Same invariant the mention remediation holds: nothing in the text may
+      // parse as a live mention, or quoting the error would grant access.
+      expect(extractAgentMentionIds(remediation)).toEqual([]);
+      // Still a denial — the diagnosis changed, the outcome did not.
+      expect(res.body.details).toMatchObject({ reason: "deny_missing_grant" });
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+
     // The manager-chain case, from the route's side. `decide` is stubbed to deny
     // here, so this pins the *route* contract — a denial still arrives with
     // guidance rather than silently — and deliberately says nothing about how

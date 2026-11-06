@@ -5222,10 +5222,30 @@ export function issueRoutes(
     actorAgentId: string;
     assigneeAgentId: string | null;
     reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
+    nearMissRelations?: string[];
   }): string | null {
     if (input.reason !== "deny_missing_grant") return null;
     if (!input.assigneeAgentId) return null;
     if (input.assigneeAgentId === input.actorAgentId) return null;
+    // PEN-5780: a `dependency_edge` near miss is not the state the text below
+    // describes. The actor already holds a live edge, so "respond on an issue
+    // you are assigned to and reference this one" is what they just tried, and
+    // the batch-escalation advice aims at a chain that is not the obstacle —
+    // the obstacle is one missing stamp. Name the stamp instead. Mentioning
+    // still works, so it stays on offer; it is simply no longer the only door.
+    if (input.nearMissRelations?.includes("dependency_edge")) {
+      return (
+        `A blocks edge already joins this issue to a non-terminal issue you are assigned, so the dependency ` +
+        `itself is not missing and nothing needs re-declaring on your side. What is missing is the edge's ` +
+        `creator standing: an edge counts only when it was declared by this issue's assignee ` +
+        `(agent://${input.assigneeAgentId}) or creator, by a manager of its assignee, or by a board user. ` +
+        `An edge you declared yourself confers no reach, by design — otherwise any agent could mint comment ` +
+        `access to any issue by pointing its own blockedBy at it. Ask agent://${input.assigneeAgentId} to ` +
+        `declare the same dependency from their side; that stamp alone turns the existing edge into a grant, ` +
+        `and it is derived live, so it takes effect immediately. Being @-mentioned by that same assignee ` +
+        `also grants comment access if they would rather do that.`
+      );
+    }
     return (
       `Being @-mentioned here does not grant you comment access. Only this issue's assignee ` +
       `(agent://${input.assigneeAgentId}) or a board user can grant it, by posting a comment on ` +
@@ -5435,6 +5455,7 @@ export function issueRoutes(
         actorAgentId,
         assigneeAgentId: issue.assigneeAgentId,
         reason: boundaryDecision.reason,
+        nearMissRelations: boundaryDecision.nearMissRelations,
       });
       return {
         allowed: false,

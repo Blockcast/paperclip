@@ -157,6 +157,16 @@ export type AuthorizationDecision = {
     | "deny_unsupported_action";
   /** issue:comment and issue:mutate denials: the relations that were checked (BLO-30968). */
   evaluatedRelations?: string[];
+  /**
+   * Denials only: the subset of `evaluatedRelations` the actor came within one
+   * conjunct of satisfying, rather than holding no part of (PEN-5780). Several
+   * of the evaluated relations are conjunctions, and `evaluatedRelations`
+   * alone cannot tell "nothing here reaches this issue" apart from "something
+   * does, but one qualifier failed" — two states with opposite remedies.
+   * Always a subset of `evaluatedRelations`; absent when there was no near
+   * miss. Advisory: it never widens or narrows the allow/deny outcome.
+   */
+  nearMissRelations?: string[];
   grant?: {
     principalType: PrincipalType;
     principalId: string;
@@ -168,6 +178,15 @@ export type AuthorizationDecision = {
 type PrincipalGrantDecision = AuthorizationDecision & {
   grant?: NonNullable<AuthorizationDecision["grant"]>;
 };
+
+/**
+ * Outcome of the `dependency_edge` check (PEN-5780). `held` is the
+ * authorization answer and is exactly the boolean this check used to return.
+ * `nearMiss` is diagnostic only: true when a live `blocks` edge does join the
+ * target to a non-terminal issue the actor is assigned, but no creator of such
+ * an edge had standing on the target. Never read by any allow/deny branch.
+ */
+type DependencyEdgeProbe = { held: boolean; nearMiss: boolean };
 
 function companyIdForResource(resource: AuthorizationResource) {
   return resource.companyId;
@@ -691,6 +710,7 @@ export function authorizationDeniedDetails(decision: AuthorizationDecision) {
     reason: decision.reason,
     boundary: authorizationBoundaryLabel(decision.reason),
     ...(decision.evaluatedRelations ? { evaluatedRelations: decision.evaluatedRelations } : {}),
+    ...(decision.nearMissRelations?.length ? { nearMissRelations: decision.nearMissRelations } : {}),
     ...(decision.policyResolution ? { resolution: decision.policyResolution } : {}),
   };
 }
@@ -1754,13 +1774,24 @@ export function authorizationService(db: Db) {
   // read on T. So the row alone never proves T's side consented; the stamp
   // does. An agent that declares a dependency on an issue it has no relation
   // to gets no reach from that; this fails closed by design.
+  //
+  // PEN-5780: returns which conjunct failed, not a bare `false`. The two
+  // failures below have opposite remedies — "no live edge reaches this issue,
+  // escalate to an ancestor" versus "an edge does, get the target's side to
+  // declare it" — and collapsing them into one boolean made the resulting 403
+  // actively misleading: it reported no relation at all to an actor who held
+  // the edge. Two experienced readers diagnosed the same denial backwards from
+  // it in one morning, and the fix they proposed — drop the creator conjunct —
+  // is precisely the self-grant hole that conjunct exists to close. The
+  // allow/deny outcome is unchanged; `held` is exactly the old boolean.
   async function agentHoldsIssueAcrossDependencyEdge(input: {
     companyId: string;
     issueId: string;
     issueAssigneeAgentId: string | null;
     issueCreatedByAgentId: string | null;
     actorAgentId: string;
-  }) {
+    action: AuthorizationAction;
+  }): Promise<DependencyEdgeProbe> {
     const rows = await db
       .select({
         createdByAgentId: issueRelations.createdByAgentId,
@@ -1782,15 +1813,33 @@ export function authorizationService(db: Db) {
         notInArray(issues.status, ["done", "cancelled"]),
       ));
     for (const row of rows) {
-      if (row.createdByUserId) return true;
+      if (row.createdByUserId) return { held: true, nearMiss: false };
       const creator = row.createdByAgentId;
       if (!creator) continue;
-      if (creator === input.issueAssigneeAgentId || creator === input.issueCreatedByAgentId) return true;
+      if (creator === input.issueAssigneeAgentId || creator === input.issueCreatedByAgentId) {
+        return { held: true, nearMiss: false };
+      }
       if (input.issueAssigneeAgentId && await isManagerOf(input.companyId, creator, input.issueAssigneeAgentId)) {
-        return true;
+        return { held: true, nearMiss: false };
       }
     }
-    return false;
+    // Rows exist but none was declared by a principal with standing on the
+    // target: the actor holds the edge and missed only the creator conjunct.
+    // Logged for the same reason the recovery-handoff TTL lapse above is —
+    // so an operator reading logs after the fact can tell the two apart too.
+    if (rows.length > 0) {
+      logger.info({
+        actorAgentId: input.actorAgentId,
+        issueId: input.issueId,
+        companyId: input.companyId,
+        requestedAction: input.action,
+        grant: "dependency_edge_comment",
+        candidateEdges: rows.length,
+        failedConjunct: "edge_creator_standing",
+      }, "dependency edge comment grant near miss: edge creator lacked standing on the target");
+      return { held: false, nearMiss: true };
+    }
+    return { held: false, nearMiss: false };
   }
 
   function allowRecoveryHandoffGrant(action: AuthorizationAction): AuthorizationDecision {
@@ -2741,22 +2790,26 @@ export function authorizationService(db: Db) {
       ) {
         return allowRecoveryHandoffGrant(input.action);
       }
-      if (
-        input.action === "issue:comment" &&
-        resource?.issueId &&
-        await agentHoldsIssueAcrossDependencyEdge({
+      // Held in a local so the denial below can report a near miss. Same
+      // predicate, same order, same outcome as the inline `await` it replaces
+      // (PEN-5780) — only the discarded half of the result is now kept.
+      let dependencyEdge: DependencyEdgeProbe = { held: false, nearMiss: false };
+      if (input.action === "issue:comment" && resource?.issueId) {
+        dependencyEdge = await agentHoldsIssueAcrossDependencyEdge({
           companyId,
           issueId: resource.issueId,
           issueAssigneeAgentId: resource.assigneeAgentId ?? null,
           issueCreatedByAgentId: resource.createdByAgentId ?? null,
           actorAgentId,
-        })
-      ) {
-        return allow({
           action: input.action,
-          reason: "allow_dependency_edge",
-          explanation: "Allowed because the actor is assigned an issue joined to this one by a blocks edge.",
         });
+        if (dependencyEdge.held) {
+          return allow({
+            action: input.action,
+            reason: "allow_dependency_edge",
+            explanation: "Allowed because the actor is assigned an issue joined to this one by a blocks edge.",
+          });
+        }
       }
       // Unlike the two grants above this covers `issue:mutate` as well as
       // `issue:comment`: a productivity review's entire remedy set (block,
@@ -2795,6 +2848,29 @@ export function authorizationService(db: Db) {
       // relations NOT listed — parent/sibling, project lead, same-company peer —
       // are excluded on purpose; see docs/security/issue-authorization-model.md.
       if (input.action === "issue:comment") {
+        // PEN-5780: several evaluated relations are conjunctions, so the stock
+        // "no relation holds" line is factually false for an actor who holds
+        // the edge and missed only its creator conjunct — and it points them
+        // at the one remedy that cannot work. Name the failed conjunct and the
+        // reachable action instead. Nothing is suppressed: the actor is
+        // assigned the issue carrying the edge, so the edge's existence is
+        // already theirs to read, and the message adds no state they lack.
+        // Argued for `dependency_edge` only — `agent_mention` has the same
+        // shape but a different disclosure question, and gets its own row.
+        if (dependencyEdge.nearMiss) {
+          return deny({
+            action: input.action,
+            reason: "deny_missing_grant",
+            explanation:
+              "A blocks edge does join this issue to a non-terminal issue you are assigned, but no such edge was " +
+              "declared by a principal with standing on this issue, so it confers no reach: a self-declared " +
+              "dependency grants nothing, by design. The edge itself is live and nothing needs re-declaring on " +
+              "your side. Ask this issue's assignee or creator (or a manager of its assignee, or a board user) to " +
+              "declare the dependency from their side; that stamp is what turns the existing edge into a grant.",
+            evaluatedRelations: [...ISSUE_COMMENT_EVALUATED_RELATIONS],
+            nearMissRelations: ["dependency_edge"],
+          });
+        }
         return deny({
           action: input.action,
           reason: "deny_missing_grant",

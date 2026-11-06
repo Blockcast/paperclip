@@ -5409,6 +5409,73 @@ describeEmbeddedPostgres("authorization service", () => {
       expect(authorizationDeniedDetails(commentDenied).evaluatedRelations).toContain("agent_mention");
     });
 
+    it("tells a dependency-edge near miss apart from no edge at all (PEN-5780)", async () => {
+      // Two states, opposite remedies, one byte-identical 403 before this:
+      //   no edge      -> nothing here reaches T; escalate to an ancestor.
+      //   creator miss -> you HOLD the edge; get T's side to stamp it.
+      // The stock "no relation holds" line is factually false in the second,
+      // and the fix it invited (drop the creator conjunct) is the self-grant
+      // hole that conjunct closes. Both denials stay denials; only the
+      // diagnosis differs.
+      const company = await createCompany(db, "Matrix-dependency-edge-nearmiss");
+      const owner = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+      const producer = await createIssue(db, company.id, { title: "Producer", assigneeAgentId: owner.id });
+      const consumer = await createIssue(db, company.id, { title: "Consumer", assigneeAgentId: actor.id });
+      const authorization = authorizationService(db);
+      const decideComment = () => authorization.decide({
+        actor: { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_jwt" },
+        action: "issue:comment",
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: producer.id,
+          assigneeAgentId: owner.id,
+          createdByAgentId: null,
+          status: producer.status,
+        },
+      });
+
+      // State 1: no edge at all.
+      const absent = await decideComment();
+      expect(absent.allowed).toBe(false);
+      const absentDetails = authorizationDeniedDetails(absent);
+      expect(absentDetails.evaluatedRelations).toContain("dependency_edge");
+      expect(absentDetails).not.toHaveProperty("nearMissRelations");
+
+      // State 2: live edge, self-declared by the actor — the exact shape that
+      // misdiagnosed PEN-5726/PEN-5734. Still denied, and still for the right
+      // reason; the guard is correct and unchanged.
+      await db.insert(issueRelations).values({
+        companyId: company.id,
+        issueId: producer.id,
+        relatedIssueId: consumer.id,
+        type: "blocks",
+        createdByAgentId: actor.id,
+      });
+      const nearMiss = await decideComment();
+      expect(nearMiss.allowed).toBe(false);
+      expect(nearMiss.reason).toBe("deny_missing_grant");
+      const nearMissDetails = authorizationDeniedDetails(nearMiss);
+      expect(nearMissDetails.nearMissRelations).toEqual(["dependency_edge"]);
+      expect(nearMissDetails.evaluatedRelations).toContain("dependency_edge");
+
+      // The point of the row: the two 403 bodies must not be byte-identical.
+      expect(JSON.stringify(nearMissDetails)).not.toBe(JSON.stringify(absentDetails));
+      expect(nearMiss.explanation).not.toBe(absent.explanation);
+
+      // And the remediation must name the reachable action, not the generic
+      // ancestor escalation that cannot resolve this state.
+      expect(nearMiss.explanation).toMatch(/declare the dependency from their side/);
+
+      // Stamping the same edge by T's owner flips it to an allow: the near
+      // miss really was one conjunct away, which is what the text claims.
+      await db.update(issueRelations)
+        .set({ createdByAgentId: owner.id })
+        .where(eq(issueRelations.relatedIssueId, consumer.id));
+      expect((await decideComment()).reason).toBe("allow_dependency_edge");
+    });
+
     it("rewriting a blocker set keeps the original creator stamp on unchanged edges (BLO-30968)", async () => {
       const company = await createCompany(db, "Matrix-dependency-edge-stamp");
       const owner = await createAgent(db, company.id, { role: "engineer" });
