@@ -3433,6 +3433,100 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("Recording a constraint:");
   });
 
+  // PEN-5778. The CEO measured 21 of 47 parked rows naming a GitHub read or `gh` write as
+  // their FIRST wake step, 9 of them waking the same day into a fleet-wide credential
+  // outage (PEN-5726) that made every one of those first steps 401. The remedy is one line
+  // on this always-loaded surface rather than 21 park-note rewrites, so what has to be
+  // pinned is that the line is HERE -- reachable from the wake classes that read a park
+  // note and nothing else.
+  it("names the credential-free fallback for a wake step that depends on a live GitHub read", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("Wake steps that name a live GitHub read:");
+    // The substitute has to be executable without a second lookup -- a rule that says
+    // "use the mirror" and makes the run go find it is the improvisation branch again.
+    expect(markdown).toContain("work-products/by-external-id");
+    expect(markdown).toContain("`gh paperclip-auth-check`");
+    // The fields that answer the question these notes actually ask.
+    expect(markdown).toContain("`merged`, `mergedAt`, `headSha`");
+  });
+
+  // The semantics, not just the route. Pinned individually because each clause closes a
+  // specific misreading, and the asymmetry is the whole point: the mirror is sufficient
+  // for the conclusion that keeps a row parked and never for the one that releases it.
+  it("states the mirror's safe direction and forbids the unsafe one", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("last DELIVERED webhook event");
+    expect(markdown).toContain('"no merge event has been delivered"');
+    expect(markdown).toContain('NEVER "this has not merged"');
+    expect(markdown).toContain("do not release a park on it");
+  });
+
+  // The failure this row is really about is a run INVENTING an instrument under time
+  // pressure, not a run being briefly blind. Without this branch the rule reads as
+  // permission to find some other way.
+  it("makes the re-park branch explicit rather than leaving improvisation open", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("re-park");
+    expect(markdown).toContain("Do NOT improvise an instrument");
+  });
+
+  // The author-side half, and the reason the rule is a good trade rather than a
+  // convenience: notes carry FACTS and this surface carries INSTRUMENTS, so a note never
+  // needs rewriting when the instrument changes. PEN-4656's note survived the outage on
+  // exactly this split.
+  it("tells a note author to name the fact, not the command", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("name the FACT to read");
+    expect(markdown).toContain("not the command to run");
+  });
+
+  // Reachability is the entire deliverable: a scoped wake that renders a park note and no
+  // PR context is exactly the run this rule has to reach, and it is the one a per-agent
+  // file or a `prReview` branch would miss.
+  it("renders the fallback rule on a bare wake with no PR context, and on the containment-only path", () => {
+    const scoped = buildPaperclipTaskMarkdown({
+      issue,
+      wakeComment: { id: "comment-1", body: "ON WAKE read `mergedAt` on #3110 FIRST." },
+    });
+    expect(scoped).toContain("Wake steps that name a live GitHub read:");
+
+    const containmentOnly = buildPaperclipTaskMarkdown({
+      issue: null,
+      recoveryRunWriteClassNotice: STATUS_ONLY_NOTICE,
+    });
+    expect(containmentOnly).toContain("This block carries no assignment");
+    expect(containmentOnly).toContain("Wake steps that name a live GitHub read:");
+  });
+
+  // PEN-5778, the mirror's ambiguous empty answer. The existing sentence gives the
+  // AUTHORIZATION reason an empty list is not proof of unownedness; these pin the second,
+  // unrelated reason with the same shape -- a shape-valid identifier that names nothing --
+  // and the positive check that discriminates it.
+  it("says an empty owner list can mean a wrong identifier, and names the positive check", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("identifier PARSED, never that it was understood");
+    expect(markdown).toContain("`metadata.repoFullName` and `metadata.prNumber`");
+    expect(markdown).toContain("re-check the identifier before concluding anything in EITHER direction");
+  });
+
+  // The opposite failure on the same instrument: the list over-returns too. Measured on
+  // #3110 -- 5 owners, all `webhook`, all declaring `owningIdentifiers: ["PEN-5455"]`, so
+  // provenance cannot be the discriminator and `owningIdentifiers` has to be.
+  it("says the owner list is a candidate set and gives the per-row ownership test", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("CANDIDATE SET");
+    expect(markdown).toContain("does not contain its OWN `identifier` is referenced, not owning");
+    // The null arm must not be collapsed into "owns nothing" by a later edit -- that is
+    // the reasoning-from-absence error the recovery sweep documents at length.
+    expect(markdown).toContain("`owningIdentifiers: null` means NOT RECORDED");
+  });
+
   // The PEN-3275 block documents itself as the last block before the closing directive.
   // This section is inserted ahead of it, so that invariant must still hold.
   it("leaves the write-containment notice as the last block before the closing line", () => {
