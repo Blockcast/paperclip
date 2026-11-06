@@ -905,13 +905,22 @@ export function classifyGuard(
  * behind a dead lane is an ARC/infra fault, whereas nothing queued at all
  * points at the schedule itself.
  *
+ * The lane is named from the queued job's own `runs-on` labels, never a
+ * constant: a hard-coded 'default' hint sent BLO-53898's triage to a healthy
+ * scale set while the starved one was `arc-paperclip-light` (BLO-53908).
+ *
  * @param {number|null} queuedCount null when the count could not be read
+ * @param {string[]|null} [queuedLabels] `runs-on` labels of a queued job; null when unread
  */
-export function describeStopMode(queuedCount) {
+export function describeStopMode(queuedCount, queuedLabels = null) {
+  const lane = queuedLabels?.length
+    ? `the runs-on label(s) ${queuedLabels.map((l) => `'${l}'`).join(", ")}`
+    : `the queued job's runs-on label(s) (could not be read)`;
+
   if (queuedCount === null || queuedCount === undefined) {
     return (
       `Could not read the queued-run count, so the stop-mode is undetermined — check both the ARC ` +
-      `listener for the 'default' label and the workflow's own schedule.`
+      `listener serving this workflow's runs-on label(s) and the workflow's own schedule.`
     );
   }
 
@@ -919,7 +928,7 @@ export function describeStopMode(queuedCount) {
     return (
       `${queuedCount} run(s) are sitting in 'queued' and have never started — the schedule is ` +
       `firing but nothing is dispatching them. That is a runner-lane fault: check the ARC listener ` +
-      `for the 'default' label (cf. PEN-3272).`
+      `for ${lane} (cf. PEN-3272).`
     );
   }
 
@@ -1260,7 +1269,19 @@ function countQueued(repo, workflow) {
       "api",
       `repos/${repo}/actions/workflows/${workflow}/runs?status=queued&per_page=100`,
     ]);
-    return JSON.parse(raw).workflow_runs?.length ?? 0;
+    const runs = JSON.parse(raw).workflow_runs ?? [];
+    return { count: runs.length, labels: runs.length ? queuedJobLabels(repo, runs[0].id) : null };
+  } catch {
+    return { count: null, labels: null };
+  }
+}
+
+function queuedJobLabels(repo, runId) {
+  try {
+    const raw = gh(["api", `repos/${repo}/actions/runs/${runId}/jobs?per_page=100`]);
+    const jobs = JSON.parse(raw).jobs ?? [];
+    const job = jobs.find((j) => j.status === "queued") ?? jobs[0];
+    return job?.labels?.length ? job.labels : null;
   } catch {
     return null;
   }
@@ -1584,10 +1605,9 @@ function main() {
     // handed to a pure renderer. Everything about WHAT an operator sees is then
     // decided in `annotationFor`, where a test can reach it without a network
     // (PEN-3462).
-    const stopModeDetail =
-      result.status === "stale" && result.reason === "stopped"
-        ? describeStopMode(countQueued(repo, result.workflow))
-        : null;
+    const queued =
+      result.status === "stale" && result.reason === "stopped" ? countQueued(repo, result.workflow) : null;
+    const stopModeDetail = queued ? describeStopMode(queued.count, queued.labels) : null;
     console.log(annotationFor(result, stopModeDetail));
   }
 
