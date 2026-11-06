@@ -1034,6 +1034,17 @@ describe("describeStopMode", () => {
     assert.match(describeStopMode(38), /PEN-3272/);
   });
 
+  it("names the queued job's real runs-on label, not a hard-coded 'default' (BLO-53908)", () => {
+    const detail = describeStopMode(3, ["arc-paperclip-light"]);
+    assert.match(detail, /arc-paperclip-light/);
+    assert.doesNotMatch(detail, /'default'/);
+  });
+
+  it("never falls back to a 'default' hint when the labels could not be read", () => {
+    assert.doesNotMatch(describeStopMode(3, null), /'default'/);
+    assert.doesNotMatch(describeStopMode(null), /'default'/);
+  });
+
   it("points at the schedule when nothing is queued either", () => {
     assert.match(describeStopMode(0), /the schedule itself is not producing runs/);
   });
