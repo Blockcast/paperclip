@@ -170,6 +170,11 @@ const REFRESHES: readonly ScrapeRefresh[] = [
     name: "approval-queue",
     run: (db) => refreshApprovalQueueMetrics(db),
     setFresh: setApprovalQueueMetricsRefreshSuccess,
+    // BLO-52494. Its revision probe joins each approval against activity_log
+    // (one index probe per approval), and at the default cadence that was
+    // ~568 index scans/s. The queue moves on human timescales, so 5 min costs
+    // nothing against its multi-day staleness alert.
+    minIntervalMs: 5 * 60_000,
   },
   {
     // PEN-4409. Every refresh above measures whether the platform is serving
@@ -181,7 +186,7 @@ const REFRESHES: readonly ScrapeRefresh[] = [
     name: "accepted-interaction-outcome",
     run: (db) => refreshAcceptedInteractionOutcomeMetrics(db),
     setFresh: setAcceptedInteractionOutcomeMetricsRefreshSuccess,
-    // The only refresh in this list on a cadence of its own. Its CTE scans every
+    // On its own cadence for the same reason as approval-queue. Its CTE scans every
     // accepted confirmation ever filed with two correlated EXISTS per row, and
     // that cost grows with history and never shrinks -- while what it measures
     // (has a person acted on a decision?) moves on a scale of hours against a
