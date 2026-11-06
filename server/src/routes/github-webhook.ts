@@ -60,6 +60,7 @@ import { HttpError } from "../errors.js";
 import { redactSensitiveText } from "../redaction.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import {
+  extractBranchIdentifiers,
   extractPaperclipIdentifiers,
   resolveOwningPaperclipIdentifiers,
   type OwningIdentifierResolution,
@@ -1385,6 +1386,40 @@ function resolveEventContext(
   return { ...context, identifiers: Array.from(identifiers) };
 }
 
+/**
+ * Bind a CI event's Paperclip identifiers from a BRANCH ref (PEN-5834).
+ *
+ * `check_run`, `check_suite` and `workflow_run` carry no PR title or body, so
+ * the branch is the only identifier source they have. Each of them used to read
+ * it with `extractPaperclipIdentifiers` alone -- and that pattern is
+ * UPPERCASE-only, while every branch this fleet produces is lowercase
+ * (`platform/pen-5681-...`, `devops/pen-5747-...`). The three events therefore
+ * resolved to zero identifiers on every real PR, so the red-CI author wake
+ * (BLO-46732) never fired -- for any seat, on any branch.
+ *
+ * Measured 2026-11-06 on the four PRs then red on `review`: #3251
+ * `platform/blo-46894-...`, #3451 `platform/pen-5681-...`, #3459
+ * `devops/pen-5747-...`, #3461 `pen-5684/...` -- 0/4 bound under the general
+ * pattern, 4/4 under the branch tier. The existing suite missed it because its
+ * fixtures use `fix/BLO-3182-webflow`, an uppercase ref no branchTemplate emits.
+ *
+ * `extractBranchIdentifiers` is the case-insensitive, segment-anchored tier
+ * BLO-20886 made mandatory for branch refs, precisely so that uppercasing a
+ * whole branch cannot manufacture owners out of version numbers (`UNDICI-7`
+ * from `blo-21612-undici-7.29.0`). It is ADDED to the general extractor rather
+ * than replacing it, so a mid-segment uppercase ref that resolved before still
+ * resolves: this widens the binding and narrows nothing.
+ *
+ * This does not multiply wakes. All three events share one head-scoped
+ * idempotency key, so the result is still ONE wake per (issue, head) -- red
+ * immediately, green only once the head settles -- and the park/terminal
+ * suppressions are untouched.
+ */
+function collectCiBranchIdentifiers(into: Set<string>, branch: string | null | undefined): void {
+  for (const id of extractPaperclipIdentifiers(branch)) into.add(id);
+  for (const id of extractBranchIdentifiers(branch)) into.add(id);
+}
+
 function resolveEventContextRaw(
   eventName: string,
   payload: Record<string, unknown>,
@@ -1509,13 +1544,13 @@ function resolveEventContextRaw(
       for (const pr of pullRequests) {
         const head = pr.head as Record<string, unknown> | undefined;
         const branch = head?.ref as string | undefined;
-        for (const id of extractPaperclipIdentifiers(branch)) allIds.add(id);
+        collectCiBranchIdentifiers(allIds, branch);
         const num = pr.number as number | undefined;
         if (firstNumber === null && typeof num === "number") firstNumber = num;
         if (!firstPrUrl) firstPrUrl = githubPrUrl(repoFullName, firstNumber, readStringField(pr, "html_url"));
       }
       const headBranch = checkRun.head_branch as string | undefined;
-      for (const id of extractPaperclipIdentifiers(headBranch)) allIds.add(id);
+      collectCiBranchIdentifiers(allIds, headBranch);
       return {
         identifiers: Array.from(allIds),
         wakeReason: "github_check_completed",
@@ -1538,13 +1573,13 @@ function resolveEventContextRaw(
       for (const pr of pullRequests) {
         const head = pr.head as Record<string, unknown> | undefined;
         const branch = head?.ref as string | undefined;
-        for (const id of extractPaperclipIdentifiers(branch)) allIds.add(id);
+        collectCiBranchIdentifiers(allIds, branch);
         const num = pr.number as number | undefined;
         if (firstNumber === null && typeof num === "number") firstNumber = num;
         if (!firstPrUrl) firstPrUrl = githubPrUrl(repoFullName, firstNumber, readStringField(pr, "html_url"));
       }
       const headBranch = checkSuite.head_branch as string | undefined;
-      for (const id of extractPaperclipIdentifiers(headBranch)) allIds.add(id);
+      collectCiBranchIdentifiers(allIds, headBranch);
       return {
         identifiers: Array.from(allIds),
         wakeReason: "github_check_suite_completed",
@@ -1567,13 +1602,13 @@ function resolveEventContextRaw(
       for (const pr of pullRequests) {
         const head = pr.head as Record<string, unknown> | undefined;
         const branch = head?.ref as string | undefined;
-        for (const id of extractPaperclipIdentifiers(branch)) allIds.add(id);
+        collectCiBranchIdentifiers(allIds, branch);
         const num = pr.number as number | undefined;
         if (firstNumber === null && typeof num === "number") firstNumber = num;
         if (!firstPrUrl) firstPrUrl = githubPrUrl(repoFullName, firstNumber, readStringField(pr, "html_url"));
       }
       const headBranch = workflowRun.head_branch as string | undefined;
-      for (const id of extractPaperclipIdentifiers(headBranch)) allIds.add(id);
+      collectCiBranchIdentifiers(allIds, headBranch);
       return {
         identifiers: Array.from(allIds),
         wakeReason: "github_workflow_completed",
