@@ -7004,6 +7004,76 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .toHaveLength(0);
   });
 
+  // BLO-53712: the corrective run itself parked the row (`todo`) and the PATCH
+  // route recorded `issue.successful_run_handoff_resolved` -- but that run's
+  // contextSnapshot still carries `handoffAttempt: 1 / max 1`, so the arm above
+  // read it as exhausted and escalated a disposition that already existed
+  // (BLO-53258/53260/53261/53270/53399). Order reproduced: required, run,
+  // resolved, then the reconcile tick. Deleting the
+  // `successfulRunHandoffResolvedSince` guard makes this escalate (1, `blocked`).
+  it("BLO-53712: does not escalate a todo handoff the corrective run already resolved", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "todo",
+      runStatus: "succeeded",
+    });
+    const sourceRunId = randomUUID();
+    const runCreatedAt = new Date("2026-11-06T00:50:00.000Z");
+    await db
+      .update(heartbeatRuns)
+      .set({
+        createdAt: runCreatedAt,
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "finish_successful_run_handoff",
+          sourceRunId,
+          resumeFromRunId: sourceRunId,
+          handoffRequired: true,
+          handoffReason: "successful_run_missing_state",
+          missingDisposition: "clear_next_step",
+          handoffAttempt: 1,
+          maxHandoffAttempts: 1,
+        },
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.insert(activityLog).values([
+      {
+        id: randomUUID(),
+        companyId,
+        actorType: "system",
+        actorId: "heartbeat",
+        action: "issue.successful_run_handoff_required",
+        entityType: "issue",
+        entityId: issueId,
+        details: { sourceRunId, correctiveRunId: runId },
+        createdAt: new Date("2026-11-06T00:49:00.000Z"),
+      },
+      {
+        id: randomUUID(),
+        companyId,
+        actorType: "agent",
+        actorId: agentId,
+        agentId,
+        runId,
+        action: "issue.successful_run_handoff_resolved",
+        entityType: "issue",
+        entityId: issueId,
+        details: { sourceRunId, correctiveRunId: runId, resolvedByStatus: "todo" },
+        createdAt: new Date("2026-11-06T00:53:52.000Z"),
+      },
+    ]);
+    heartbeat = createHeartbeat({ penstockAvailabilityGate: allowPenstockGate });
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.successfulRunHandoffEscalated).toBe(0);
+    expect(result.escalated).toBe(0);
+    const sourceIssue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(sourceIssue?.status).toBe("todo");
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
+      .toHaveLength(0);
+  });
+
   // BLO-31913 regression guard, and the more important half of the pair: a
   // succeeded run on a `todo` issue is normally a DELIBERATE park -- the run
   // chose `todo` and recorded why, which is the disposition this fleet's own

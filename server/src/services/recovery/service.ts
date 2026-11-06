@@ -2958,6 +2958,42 @@ export function recoveryService(
     return Boolean(unblockedAt && latestRunCreatedAt && latestRunCreatedAt <= unblockedAt);
   }
 
+  // BLO-53712: `isExhaustedSuccessfulRunHandoff` reads only the corrective run's
+  // contextSnapshot, which still says "exhausted handoff" after that same run
+  // recorded its disposition (the PATCH route writes
+  // `issue.successful_run_handoff_resolved`). With the default max of 1, every
+  // corrective run reads as exhausted, so the reconciler escalated rows the
+  // agent had already parked. The durable handoff activity row is the
+  // authority: if the latest one is `resolved` and postdates the run, the
+  // disposition the escalation would ask for already exists. Used on the `todo`
+  // arm only: a row still `in_progress` when the run ends really has no
+  // disposition, even if that run resolved earlier and then checked out again.
+  async function successfulRunHandoffResolvedSince(
+    companyId: string,
+    issueId: string,
+    latestRun: LatestIssueRun,
+  ): Promise<boolean> {
+    if (!latestRun?.createdAt) return false;
+    const latest = await db
+      .select({ action: activityLog.action, createdAt: activityLog.createdAt })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issueId),
+        inArray(activityLog.action, [
+          "issue.successful_run_handoff_required",
+          "issue.successful_run_handoff_resolved",
+          "issue.successful_run_handoff_escalated",
+        ]),
+      ))
+      .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    return latest?.action === "issue.successful_run_handoff_resolved"
+      && latest.createdAt >= latestRun.createdAt;
+  }
+
   async function countConsecutiveNonProductiveSuccessfulRuns(
     companyId: string,
     issueId: string,
@@ -10932,6 +10968,10 @@ export function recoveryService(
           // status filter outright — that is the shape the tests pin.
           const todoHandoffEvidence = isExhaustedSuccessfulRunHandoff(latestRun);
           if (!todoHandoffEvidence || !todoHandoffEvidence.exhausted) {
+            result.skipped += 1;
+            return;
+          }
+          if (await successfulRunHandoffResolvedSince(issue.companyId, issue.id, latestRun)) {
             result.skipped += 1;
             return;
           }
