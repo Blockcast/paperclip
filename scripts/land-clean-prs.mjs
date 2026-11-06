@@ -967,6 +967,13 @@ export function checkSettlement(
 }
 
 /**
+ * The action for a PR whose base is not its repo's default branch — a PR
+ * stacked on another PR's feature branch. See `classifyFromListing`, which is
+ * the only producer, for why this is a skip rather than a cap exclusion.
+ */
+export const NON_DEFAULT_BASE_ACTION = "non-default-base";
+
+/**
  * The rules decidable from `gh pr list` alone, or null when this PR needs its
  * checks and reviews fetched.
  *
@@ -976,13 +983,6 @@ export function checkSettlement(
  * that survive them cost two API calls each, and on a repo where most open PRs
  * are already enqueued or human-authored that is most of them avoided.
  */
-/**
- * The action for a PR whose base is not its repo's default branch — a PR
- * stacked on another PR's feature branch. See `classifyFromListing`, which is
- * the only producer, for why this is a skip rather than a cap exclusion.
- */
-export const NON_DEFAULT_BASE_ACTION = "non-default-base";
-
 export function classifyFromListing(pr, { now = Date.now() } = {}) {
   const row = (action, reason, detail = null) => ({
     number: pr?.number,
@@ -1059,11 +1059,29 @@ export function classifyFromListing(pr, { now = Date.now() } = {}) {
     defaultBranch !== "" &&
     base !== defaultBranch
   ) {
+    // ### Receipt visibility: say so when the PR is STILL ARMED
+    //
+    // This rule returns AHEAD of the `autoMergeRequest` branch below, so a
+    // stacked PR that an earlier fire already armed can never reach
+    // `stale-enqueue` and its `--disable-auto` remedy. Returning first is the
+    // right order — re-reading or re-arming a stacked PR is the whole thing
+    // this rule exists to stop — but it leaves the arming INVISIBLE, which is
+    // the same class of blind spot PEN-5469 is about.
+    //
+    // So this REPORTS rather than acts. Disarming would mean issuing a write
+    // against a non-default base from the routine that just decided it has no
+    // business touching one, and the case is rare anyway: an unprotected
+    // feature branch normally merges the moment auto-merge is armed rather
+    // than staying armed. Naming it in the receipt is enough for a human to
+    // disarm it by hand, and costs no write.
+    const armed = pr?.autoMergeRequest
+      ? "; auto-merge still ARMED — `stale-enqueue` cannot reach it, disarm by hand"
+      : "";
     return row(
       NON_DEFAULT_BASE_ACTION,
       `base:${base}`,
       `stacked on \`${base}\`, not \`${defaultBranch}\` — ` +
-        "landing it would move that branch's head",
+        `landing it would move that branch's head${armed}`,
     );
   }
 
