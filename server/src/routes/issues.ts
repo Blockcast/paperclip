@@ -186,6 +186,10 @@ import {
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
+import {
+  isDeliberateParkActive,
+  isIssueParkExpiryWakeStatus,
+} from "../services/issue-park-expiry.js";
 import { incrementBlockerResolvedWakeMetric } from "../services/blocker-resolved-wake-metrics.js";
 import {
   ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
@@ -14432,6 +14436,39 @@ export function issueRoutes(
       isClosedIssueStatus(existing.status) &&
       issue.status === "todo" &&
       req.body.status !== undefined;
+    /**
+     * PEN-5776: the sixth park READER, and the first on this route. Registered in
+     * `services/issue-park-expiry.ts`'s header list — add any seventh there too.
+     *
+     * The three flags above share one `issue_status_changed` wake and carried NO park
+     * term at any layer: not here, not in `dispatchIssueWakeups`, not in
+     * `services/heartbeat.ts` (whose only `parkedUntil` reads are the expiry-RELEASE
+     * select). A park can be set on any status, so a PATCH that reopened a row and
+     * parked it IN THE SAME WRITE dispatched a run onto that row about a second later
+     * and the park was defeated by the write that created it — measured on PEN-4363 at
+     * Δ = 1.099 s against a park with 5 h 43 m left to run. This brings the arm into
+     * line with the four paths that already defer to `isDeliberateParkActive`
+     * (PEN-4114, PEN-4871, PEN-5021, BLO-27912).
+     *
+     * ⚠️ DEFERRAL, NOT SUPPRESSION — and the second conjunct is what makes that true.
+     * The park's own release wake only fires on `ISSUE_PARK_EXPIRY_WAKE_STATUSES`, so
+     * dropping this wake on any OTHER post-update status would leave the row with no
+     * wake at all: the exact "second, silent strand" `recovery/service.ts:9770` warns
+     * about for lapsed parks, reproduced on the status axis. `statusChangedFromBacklog`
+     * is the flag that can land there — it fires on `backlog` -> ANY status, including
+     * `blocked` (excluded from park expiry by design, PEN-5291) and the two closed
+     * statuses. So the rule is: defer only when the deadline will pick the row back up.
+     *
+     * Reads the POST-update row on purpose, like the comment arm's own closed-status
+     * guard (BLO-29821). That is what lets one PATCH override the deferral: clearing the
+     * park in the same write (`parkedDisposition: null`) leaves `issue.parkedUntil` null
+     * here and the wake fires normally.
+     *
+     * Deliberately NOT an author term. See the `issue_status_changed` guard below.
+     */
+    const statusChangeWakeDeferredToParkExpiry =
+      isDeliberateParkActive(issue.parkedUntil, Date.now()) &&
+      isIssueParkExpiryWakeStatus(issue.status);
     const previousExecutionState = parseIssueExecutionState(existing.executionState);
     const nextExecutionState = parseIssueExecutionState(issue.executionState);
     const executionStageWakeup = buildExecutionStageWakeup({
@@ -14547,6 +14584,7 @@ export function issueRoutes(
       if (
         !assigneeChanged &&
         (statusChangedFromBacklog || statusChangedFromBlockedToTodo || statusChangedFromClosedToTodo) &&
+        !statusChangeWakeDeferredToParkExpiry &&
         issue.assigneeAgentId
       ) {
         addWakeup(issue.assigneeAgentId, {
