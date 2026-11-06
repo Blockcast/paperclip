@@ -37,7 +37,7 @@ Core fields:
 Kubernetes fields:
 - namespace (string, optional): namespace for Jobs; defaults to the Deployment namespace
 - image (string, optional): override container image; defaults to the running Deployment image
-- opencodeVersion (string, optional): exact opencode-ai version installed once onto the data PVC and used by Job pods; default 1.18.35; "image" runs the binary bundled in the container image
+- opencodeVersion (string, optional): exact opencode-ai version installed once onto the data PVC and used by Job pods; default 1.19.5; "image" runs the binary bundled in the container image
 - imagePullPolicy (string, optional): image pull policy; default "IfNotPresent"
 - kubeconfig (string, optional): absolute path to a kubeconfig file on disk; defaults to in-cluster service account auth
 - resources (object, optional): { requests: { cpu, memory }, limits: { cpu, memory } }

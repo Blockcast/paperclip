@@ -4825,7 +4825,7 @@ describe("scoped writable mounts (BLO-32734)", () => {
       "/paperclip/.mcp.json",
       // The managed Claude Code runtime every pod puts first on PATH: neither the
       // broad-mount shared copy nor another company's copy may be writable here.
-      "/paperclip/.local/lib/paperclip-k8s-runtimes/claude-code/2.1.292",
+      `/paperclip/.local/lib/paperclip-k8s-runtimes/claude-code/${DEFAULT_CLAUDE_CODE_VERSION}`,
       "/paperclip/.local/lib/paperclip-k8s-runtimes/companies/co2/claude-code",
     ];
     for (const container of [main, init]) {
