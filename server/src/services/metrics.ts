@@ -3671,6 +3671,9 @@ export const GITHUB_API_REFUSALS_METRIC = "paperclip_github_api_refusals_total";
  */
 export const GITHUB_API_REQUESTS_METRIC = "paperclip_github_api_requests_total";
 
+/** Per-route split of {@link GITHUB_API_REQUESTS_METRIC} (BLO-53662). Label values come from `classifyGithubApiRoute`. */
+export const GITHUB_API_REQUESTS_BY_ROUTE_METRIC = "paperclip_github_api_requests_by_route_total";
+
 /**
  * Why GitHub refused. Closed set — see {@link GITHUB_API_REFUSALS_METRIC}.
  *
@@ -5733,6 +5736,7 @@ let githubReviewPosted: Counter<"repo" | "surface"> | null = null;
 let githubReviewCompletion: Counter<"status"> | null = null;
 let githubApiRefusals: Counter<"reason" | "resource"> | null = null;
 let githubApiRequests: Counter | null = null;
+let githubApiRequestsByRoute: Counter<"route"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
@@ -5935,6 +5939,7 @@ function ensureRegistry(): {
   githubReviewCompletionCounter: Counter<"status">;
   githubApiRefusalsCounter: Counter<"reason" | "resource">;
   githubApiRequestsCounter: Counter;
+  githubApiRequestsByRouteCounter: Counter<"route">;
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
@@ -6126,6 +6131,7 @@ function ensureRegistry(): {
     || !githubReviewCompletion
     || !githubApiRefusals
     || !githubApiRequests
+    || !githubApiRequestsByRoute
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
@@ -7857,6 +7863,17 @@ function ensureRegistry(): {
     // asserted at the source rather than inherited from library behaviour that
     // a future version is free to change. 1 constant-zero series.
     githubApiRequests.inc(0);
+    githubApiRequestsByRoute = new Counter({
+      name: GITHUB_API_REQUESTS_BY_ROUTE_METRIC,
+      help:
+        "Same attempts as " + GITHUB_API_REQUESTS_METRIC + ", split by a CLOSED route template "
+        + "derived from the URL path (BLO-53662), e.g. 'repos/pulls/reviews', 'repos/commits/check-runs', "
+        + "'graphql', 'raw'. Exists to attribute an egress step to an endpoint family; it carries no "
+        + "owner, repo, number or SHA. 'repos/other' and 'other' are the residual for paths this build "
+        + "does not enumerate. Not zero-initialised: sum it for totals, use the unlabelled counter for liveness.",
+      labelNames: ["route"],
+      registers: [registry],
+    });
     agentWakeupTerminalFailedUnresolved = new Gauge({
       name: AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC,
       help:
@@ -9145,6 +9162,7 @@ function ensureRegistry(): {
     githubReviewCompletionCounter: githubReviewCompletion,
     githubApiRefusalsCounter: githubApiRefusals,
     githubApiRequestsCounter: githubApiRequests,
+    githubApiRequestsByRouteCounter: githubApiRequestsByRoute,
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
@@ -11249,8 +11267,10 @@ export function recordGithubReviewCompletion(status: string | null | undefined):
  * {@link GITHUB_API_REQUESTS_METRIC} for why that distinction is what keeps the
  * signal readable during a network-level outage.
  */
-export function recordGithubApiRequest(): void {
-  ensureRegistry().githubApiRequestsCounter.inc();
+export function recordGithubApiRequest(route?: string): void {
+  const reg = ensureRegistry();
+  reg.githubApiRequestsCounter.inc();
+  if (route) reg.githubApiRequestsByRouteCounter.inc({ route });
 }
 
 /**
