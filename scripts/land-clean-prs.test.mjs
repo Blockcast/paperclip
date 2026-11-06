@@ -52,6 +52,7 @@ import {
   stalledHolds,
   repoRunner,
   runRepo,
+  markCollectFailure,
   settleMinutesFrom,
   sweepRepos,
   targetRepos,
@@ -3620,7 +3621,13 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
       console.log = log;
     }
   };
-  const boom = (message) => () => { throw Object.assign(new Error("gh failed"), { stderr: message }); };
+  // PEN-5482: `run` here stands in for `runRepo`, so it has to fail the way
+  // `runRepo` does — a LISTING failure is tagged `collectFailed` by `runRepo`'s
+  // own fetch catch, and that tag is what makes it skippable. An untagged throw
+  // is a different failure and gets its own test below.
+  const boom = (message) => () => {
+    throw markCollectFailure(Object.assign(new Error("gh failed"), { stderr: message }));
+  };
 
   it("⛔ one unreadable repo no longer ends the whole fire", () => {
     // The defect: `fetchOpenPrs` is the first thing `runRepo` does, its throw
@@ -3695,7 +3702,7 @@ describe("an unreadable repo is skipped, not fatal to the fire (PEN-5442)", () =
     const seen = [];
     const run = ({ repo, spent }) => {
       seen.push([repo, spent]);
-      if (repo === "a/broken") boom("HTTP 502")();
+      if (repo === "a/broken") boom("HTTP 502")();  // tagged: a listing failure
       return [{ number: 1, action: "enqueue" }, { number: 2, action: "enqueue" }];
     };
     quietly(() =>
@@ -4360,6 +4367,16 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
       // `main`'s try/`finally` has none either.
       //
       // The test above alone stays green under that widening. This one does not.
+      //
+      // PEN-5482 made the seam TAG its throw. The real `fetchOpenPrs`
+      // `TypeError` is raised inside `runRepo`'s fetch try and leaves it
+      // tagged, so a seam standing in for `runRepo` has to fail the way
+      // `runRepo` fails or it is modelling a contract the module no longer
+      // has — which is why `markCollectFailure` is exported. The assertion is
+      // unchanged and so is its reach: widen the rethrow above to bare
+      // `TypeError` and this still goes red, because identity is consulted
+      // before the tag. The case where that tag is ABSENT is the subject of
+      // "only a LISTING failure is skippable (PEN-5482)" below.
       const unreadable = [];
       const swept = [];
       hushed(() =>
@@ -4374,7 +4391,9 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
             starved: [],
             queued: [],
             run: ({ repo }) => {
-              if (repo === "a/broken") throw new TypeError("rows.map is not a function");
+              if (repo === "a/broken") {
+                throw markCollectFailure(new TypeError("rows.map is not a function"));
+              }
               swept.push(repo);
               return [];
             },
@@ -5327,5 +5346,231 @@ describe("fetchDefaultBranch reads one branch per repo and fails to UNREAD (PEN-
     });
     const list = seen.find((args) => args[0] === "pr" && args[1] === "list");
     assert.ok(list[list.indexOf("--json") + 1].includes("baseRefName"));
+  });
+});
+
+describe("only a LISTING failure is skippable (PEN-5482)", () => {
+  const quietly = (fn) => {
+    const log = console.log;
+    const lines = [];
+    console.log = (line) => lines.push(String(line));
+    try {
+      return { value: fn(), lines: lines.join("\n") };
+    } finally {
+      console.log = log;
+    }
+  };
+
+  it("⛔ an untagged throw propagates instead of being reported as unlistable", () => {
+    // The defect this pins: PEN-5442's catch sits around the WHOLE of
+    // `runRepo`, not around the list call it was written for. `classifyAll`,
+    // the apply loop, the hold comments and the receipt all throw through it,
+    // and a throw from any of them used to be swallowed into the `unreadable`
+    // cohort. Two separate wrongs from that one catch:
+    //
+    //  - the operator is told the repo "could not be listed", which is false,
+    //    and sends them to GitHub availability instead of to the real bug;
+    //  - `return []` reports zero spend for a repo whose apply loop may have
+    //    ALREADY enqueued, so later repos in the same fire run past
+    //    `MAX_ENQUEUES_PER_FIRE`.
+    //
+    // Latent when written — everything downstream of the apply loop is
+    // in-memory rendering and the one real write already catches its own
+    // failure — which is the point: a too-wide catch hides the NEXT bug, and
+    // the next bug is the one nobody is looking for.
+    const unreadable = [];
+    const swept = [];
+    const run = ({ repo }) => {
+      if (repo === "a/broken") throw new Error("applyOne blew up after enqueuing #1");
+      swept.push(repo);
+      return [{ number: 1, action: "enqueue" }];
+    };
+    const { lines } = quietly(() =>
+      assert.throws(
+        () =>
+          sweepRepos(
+            ["a/broken", "a/fine"],
+            repoRunner({
+              apply: true,
+              settleMinutes: 0,
+              rotted: [],
+              stranded: [],
+              run,
+              notify: new Set(),
+              unreadable,
+              starved: [],
+              queued: [],
+            }),
+          ),
+        /applyOne blew up after enqueuing #1/,
+        "an apply-loop failure must reach the operator as itself",
+      ),
+    );
+    assert.deepEqual(unreadable, [], "and must never be filed as a repo that could not be listed");
+    assert.deepEqual(swept, [], "the fire ends there rather than carrying a spend it cannot vouch for");
+    assert.doesNotMatch(lines, /could not be listed/, "nor claim so on stdout");
+  });
+
+  it("⛔ the real runRepo tags its listing failure, so the real pair still skips", () => {
+    // The seam tests above assert `repoRunner`'s half. This one composes the
+    // REAL `runRepo` with the REAL `repoRunner`, so deleting the tag from
+    // `runRepo`'s fetch catch fails a test rather than quietly turning every
+    // 502 back into a fire-ending throw.
+    const unreadable = [];
+    const swept = [];
+    const run = (bag) =>
+      runRepo({
+        ...bag,
+        fetch: () => {
+          if (bag.repo === "a/broken") {
+            throw Object.assign(new Error("gh failed"), { stderr: "HTTP 502: 502 Bad Gateway" });
+          }
+          swept.push(bag.repo);
+          return [];
+        },
+      });
+    const { lines } = quietly(() =>
+      sweepRepos(
+        ["a/broken", "a/fine"],
+        repoRunner({
+          apply: false,
+          settleMinutes: 0,
+          rotted: [],
+          stranded: [],
+          run,
+          notify: new Set(),
+          unreadable,
+          starved: [],
+          queued: [],
+        }),
+      ),
+    );
+    assert.deepEqual(unreadable, ["a/broken (HTTP 502: 502 Bad Gateway)"], "listed as unreadable, with its reason");
+    assert.deepEqual(swept, ["a/fine"], "and the readable repo was still read");
+    assert.match(lines, /Skipped a\/broken/);
+  });
+
+  it("⛔ a wiring fault raised under the fetch seam is not laundered into a skip", () => {
+    // The composition of the two guards in `repoRunner`'s catch, and the
+    // reason identity is consulted FIRST rather than folded into the tag
+    // allowlist. `runRepo`'s fetch catch tags whatever it caught WITHOUT
+    // asking what it was, so a `WiringError` raised from under `fetch` — a
+    // bagged helper called by a future read path, say — reaches `repoRunner`
+    // already carrying the listing tag and would otherwise buy the skip it is
+    // least entitled to. PEN-5536's rule holds unconditionally: a wiring fault
+    // is never recorded as a repo-readability fact, whatever tagged it.
+    const unreadable = [];
+    const run = (bag) =>
+      runRepo({
+        ...bag,
+        fetch: () => {
+          throw new WiringError("someReadHelper: unknown option `rotted`.");
+        },
+      });
+    quietly(() =>
+      assert.throws(
+        () =>
+          sweepRepos(
+            ["a/one"],
+            repoRunner({
+              apply: false,
+              settleMinutes: 0,
+              rotted: [],
+              stranded: [],
+              run,
+              notify: new Set(),
+              unreadable,
+              starved: [],
+              queued: [],
+            }),
+          ),
+        (error) => error instanceof WiringError,
+        "a wiring fault stays a wiring fault even once the fetch catch has tagged it",
+      ),
+    );
+    assert.deepEqual(unreadable, [], "and is never filed as a repo that could not be listed");
+  });
+
+  it("⛔ a foreign `collectFailed` property does not buy the skip", () => {
+    // Ally review, PR #3376. The tag is a module-private `Symbol`, not a string
+    // key, so no other throw site — and no error object from a library that
+    // happens to carry that name — can opt itself into the skip. A string key
+    // would collide in the fail-OPEN direction, which is the one direction this
+    // whole change exists to close.
+    const unreadable = [];
+    const run = () => {
+      throw Object.assign(new Error("not a listing failure"), {
+        stderr: "HTTP 502: 502 Bad Gateway",
+        collectFailed: true,
+      });
+    };
+    quietly(() =>
+      assert.throws(
+        () =>
+          sweepRepos(
+            ["a/one"],
+            repoRunner({
+              apply: true,
+              settleMinutes: 0,
+              rotted: [],
+              stranded: [],
+              run,
+              notify: new Set(),
+              unreadable,
+              starved: [],
+              queued: [],
+            }),
+          ),
+        /not a listing failure/,
+        "only this module's symbol tags a listing failure",
+      ),
+    );
+    assert.deepEqual(unreadable, [], "and it is not filed as a repo that could not be listed");
+  });
+
+  it("leaves an untaggable error alone rather than failing in the catch", () => {
+    // `markCollectFailure` declines to tag a non-extensible error instead of
+    // assigning to it: this file is a module, so a frozen-object assignment
+    // throws, and a `TypeError` raised INSIDE the catch would replace the real
+    // error with one naming the wrong line entirely. Untagged then means the
+    // fire ends loudly — the pre-PEN-5442 behaviour, and the safe direction.
+    const unreadable = [];
+    const frozen = Object.freeze(
+      Object.assign(new Error("gh failed"), { stderr: "HTTP 502: 502 Bad Gateway" }),
+    );
+    const run = (bag) =>
+      runRepo({
+        ...bag,
+        fetch: () => {
+          throw frozen;
+        },
+      });
+    let thrown;
+    const { lines } = quietly(() => {
+      try {
+        sweepRepos(
+          ["a/broken"],
+          repoRunner({
+            apply: false,
+            settleMinutes: 0,
+            rotted: [],
+            stranded: [],
+            run,
+            notify: new Set(),
+            unreadable,
+            starved: [],
+            queued: [],
+          }),
+        );
+      } catch (error) {
+        thrown = error;
+      }
+    });
+    // Identity, not just the message: a `TypeError` raised by the tagging would
+    // also have escaped the sweep, and would also have been "an error".
+    assert.equal(thrown, frozen, "the original error object, not a TypeError from the tagging");
+    assert.doesNotMatch(lines, /could not be listed/, "and not reported as unlistable");
+    assert.deepEqual(Object.getOwnPropertySymbols(frozen), [], "never tagged");
+    assert.deepEqual(unreadable, [], "so it is not filed as a mere skip");
   });
 });
