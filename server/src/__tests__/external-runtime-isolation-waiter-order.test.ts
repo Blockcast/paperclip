@@ -221,6 +221,29 @@ describeEmbeddedPostgres("isolation writer admits waiters oldest-first (BLO-4876
     expect((await bindAsSharedTreeRunMode(young, youngRes.id, ownKey)).isolationKey).toBe(ownKey);
   });
 
+  it("wakes the oldest waiter when a `run`-mode writer on a shared tree key releases (PEN-5684)", async () => {
+    // The acquire side and the release side must test the same axis. While the
+    // wake stayed mode-gated and the yield did not, every younger contender
+    // yielded to the elder and nothing woke the elder -- so the tree sat idle
+    // for a full backoff interval after each release, on the hottest shape.
+    const key = `workspace-tree:project-primary:${randomUUID()}`;
+    const now = Date.now();
+    const later = new Date(now + 4 * 60_000);
+    const elder = await insertRun({ createdAt: new Date(now - 3 * 3600_000), status: "queued", context: waiting(key, later) });
+    const writer = await insertRun({ createdAt: new Date(now - 2 * 3600_000), status: "running" });
+    const writerRes = await reserve(writer);
+    await db.update(externalRuntimeReservations)
+      .set({ isolationMode: "run", isolationKey: key })
+      .where(eq(externalRuntimeReservations.id, writerRes.id));
+
+    await releaseExternalRuntimeReservation(db, { runId: writer, reason: "test" });
+
+    const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, elder));
+    const stamp = new Date(String(row!.contextSnapshot!.paperclipK8sIsolationRetryAt)).getTime();
+    expect(stamp).toBeLessThanOrEqual(Date.now());
+    expect(stamp).toBeLessThan(later.getTime());
+  });
+
   it("releasing a yielded run's still-pending reservation does not refresh the elder's stamp", async () => {
     const key = `workspace-tree:project-primary:${randomUUID()}`;
     const now = Date.now();
