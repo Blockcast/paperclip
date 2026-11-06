@@ -5139,20 +5139,28 @@ describe("a PR stacked on a feature branch is out of scope (PEN-5469)", () => {
     // 23:33Z fires on 2026-11-03 while ten `master` PRs read `cap:10-per-fire`
     // beneath it. Against the pre-PEN-5469 code this asserts the opposite of
     // what the code does, in both columns.
-    const rows = classifyAll([landable({ number: 3400 }), stacked({ number: 3100 })], {
-      now: NOW,
-      maxEnqueues: 1,
-    });
+    // Three candidates for ONE slot, listed newest-first as `gh pr list`
+    // returns them, so the fixture can tell "oldest default-base PR" apart
+    // from "first listed" as well as from "oldest overall".
+    const rows = classifyAll(
+      [landable({ number: 3400 }), stacked({ number: 3100 }), landable({ number: 3200 })],
+      { now: NOW, maxEnqueues: 1 },
+    );
     assert.deepEqual(
       rows.map((row) => [row.number, row.action]),
       [
-        [3400, "enqueue"],
+        [3400, "skip"],
         [3100, NON_DEFAULT_BASE_ACTION],
+        // The OLDEST default-base PR takes the slot — not #3100, which is
+        // older still but stacked, and not #3400, which is listed first.
+        [3200, "enqueue"],
       ],
     );
-    // The slot was not merely reassigned — it was never contested, so nothing
-    // in this fire reads as a cap deferral.
-    assert.equal(rows.filter((row) => /^cap:/.test(String(row.reason ?? ""))).length, 0);
+    assert.equal(rows[0].reason, "cap:1-per-fire", "the deferred one is deferred BY THE CAP");
+    // The stacked PR is not merely ranked last — it is not a cap participant
+    // at all, so it never reads as a deferral the next fire might honour.
+    assert.equal(rows[1].reason, `base:${STACK_BASE}`);
+    assert.equal(rows.filter((row) => /^cap:/.test(String(row.reason ?? ""))).length, 1);
   });
 
   it("names the branch it is stacked on, in the reason and in the detail", () => {
