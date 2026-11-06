@@ -2991,9 +2991,14 @@ describe("agent issue mutation checkout ownership", () => {
       expect(remediation, JSON.stringify(res.body)).toBeTruthy();
       // Says the edge is already there — the opposite of "no relation at all".
       expect(remediation).toMatch(/already joins this issue/i);
-      // Names the one act that clears it, aimed at the assignee.
-      expect(remediation).toMatch(/declare the same dependency from their side/i);
+      // Names an act the reader can actually perform — a mention from this
+      // issue's assignee. Asserted by role, not by sentence, so the wording can
+      // be improved without breaking this test.
+      expect(remediation).toMatch(/mention/i);
       expect(remediation).toContain(`agent://${ownerAgentId}`);
+      // The false promise must stay gone: re-declaring the edge is a no-op on
+      // one shape and a cycle 422 on the other, so it is not the remedy.
+      expect(remediation).not.toMatch(/declare the same dependency from their side/i);
       // Says why the guard exists, so the next reader does not "fix" it by
       // deleting the creator conjunct — which is the self-grant hole.
       expect(remediation).toMatch(/confers no reach/i);

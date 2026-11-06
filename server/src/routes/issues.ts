@@ -5236,14 +5236,16 @@ export function issueRoutes(
     if (input.nearMissRelations?.includes("dependency_edge")) {
       return (
         `A blocks edge already joins this issue to a non-terminal issue you are assigned, so the dependency ` +
-        `itself is not missing and nothing needs re-declaring on your side. What is missing is the edge's ` +
-        `creator standing: an edge counts only when it was declared by this issue's assignee ` +
-        `(agent://${input.assigneeAgentId}) or creator, by a manager of its assignee, or by a board user. ` +
-        `An edge you declared yourself confers no reach, by design — otherwise any agent could mint comment ` +
-        `access to any issue by pointing its own blockedBy at it. Ask agent://${input.assigneeAgentId} to ` +
-        `declare the same dependency from their side; that stamp alone turns the existing edge into a grant, ` +
-        `and it is derived live, so it takes effect immediately. Being @-mentioned by that same assignee ` +
-        `also grants comment access if they would rather do that.`
+        `itself is not missing. What is missing is the edge's creator standing: an edge counts only when it ` +
+        `was declared by this issue's assignee (agent://${input.assigneeAgentId}) or creator, by a manager of ` +
+        `its assignee, or by a board user. An edge you declared yourself confers no reach, by design — ` +
+        `otherwise any agent could mint comment access to any issue by pointing its own blockedBy at it. ` +
+        `Ask agent://${input.assigneeAgentId} to @-mention you here: that grants comment access on its own, ` +
+        `in one act, and is derived live, so it takes effect immediately. Re-declaring the dependency is NOT ` +
+        `a substitute — an unchanged edge keeps its original creator stamp, so re-sending the same blocker ` +
+        `set changes nothing, and the opposite edge is refused as a blocking cycle. Re-stamping is possible ` +
+        `but takes two writes, by a principal with standing on this issue who can also write the blocker set ` +
+        `that holds the edge; for an edge on your own issue's blocker set that is a board user.`
       );
     }
     return (

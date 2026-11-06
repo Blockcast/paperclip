@@ -5444,15 +5444,13 @@ describeEmbeddedPostgres("authorization service", () => {
       expect(absentDetails).not.toHaveProperty("nearMissRelations");
 
       // State 2: live edge, self-declared by the actor — the exact shape that
-      // misdiagnosed PEN-5726/PEN-5734. Still denied, and still for the right
-      // reason; the guard is correct and unchanged.
-      await db.insert(issueRelations).values({
-        companyId: company.id,
-        issueId: producer.id,
-        relatedIssueId: consumer.id,
-        type: "blocks",
-        createdByAgentId: actor.id,
-      });
+      // misdiagnosed PEN-5726/PEN-5734. Written through `syncBlockedByIssueIds`
+      // rather than a raw insert, so the state under test is one an actor can
+      // actually reach: they hold `issue:mutate` on their own issue, and this
+      // is the only blocker set they can write. Still denied, and still for the
+      // right reason; the guard is correct and unchanged.
+      const svc = issueService(db);
+      await svc.update(consumer.id, { blockedByIssueIds: [producer.id], actorAgentId: actor.id });
       const nearMiss = await decideComment();
       expect(nearMiss.allowed).toBe(false);
       expect(nearMiss.reason).toBe("deny_missing_grant");
@@ -5464,15 +5462,24 @@ describeEmbeddedPostgres("authorization service", () => {
       expect(JSON.stringify(nearMissDetails)).not.toBe(JSON.stringify(absentDetails));
       expect(nearMiss.explanation).not.toBe(absent.explanation);
 
-      // And the remediation must name the reachable action, not the generic
-      // ancestor escalation that cannot resolve this state.
-      expect(nearMiss.explanation).toMatch(/declare the dependency from their side/);
+      // The remediation must name an act the reader can actually perform.
+      // Asserted by role (a mention from T's assignee) rather than by sentence,
+      // so correcting the prose does not red this test.
+      expect(nearMiss.explanation).toMatch(/mention/i);
 
-      // Stamping the same edge by T's owner flips it to an allow: the near
-      // miss really was one conjunct away, which is what the text claims.
-      await db.update(issueRelations)
-        .set({ createdByAgentId: owner.id })
-        .where(eq(issueRelations.relatedIssueId, consumer.id));
+      // Why the text must NOT promise a one-step re-stamp, pinned instead of
+      // argued: T's assignee declaring the dependency "from their side" is the
+      // opposite edge, and the cycle guard refuses it. This is the 422 the old
+      // wording walked the reader into.
+      await expect(
+        svc.update(producer.id, { blockedByIssueIds: [consumer.id], actorAgentId: owner.id }),
+      ).rejects.toMatchObject({ status: 422, message: "Blocking relations cannot contain cycles" });
+
+      // The remedy that does work, end to end through the real path: remove the
+      // self-declared edge, then re-add it from a principal with standing on the
+      // target. Two writes — which is what the denial text now says it takes.
+      await svc.update(consumer.id, { blockedByIssueIds: [], actorAgentId: actor.id });
+      await svc.update(producer.id, { blockedByIssueIds: [consumer.id], actorAgentId: owner.id });
       expect((await decideComment()).reason).toBe("allow_dependency_edge");
     });
 

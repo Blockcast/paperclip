@@ -1823,8 +1823,12 @@ export function authorizationService(db: Db) {
         return { held: true, nearMiss: false };
       }
     }
-    // Rows exist but none was declared by a principal with standing on the
-    // target: the actor holds the edge and missed only the creator conjunct.
+    // Rows exist but none has a RECORDED creator with standing on the target:
+    // the actor holds the edge and missed only the creator conjunct. "Recorded"
+    // is load-bearing — `created_by_agent_id` is ON DELETE SET NULL, so an edge
+    // whose creator agent was since deleted lands here too, with nobody having
+    // self-declared anything. The outcome is identical (no standing can be
+    // shown), and the explanation is worded to be true of that case as well.
     // Logged for the same reason the recovery-handoff TTL lapse above is —
     // so an operator reading logs after the fact can tell the two apart too.
     if (rows.length > 0) {
@@ -2862,11 +2866,15 @@ export function authorizationService(db: Db) {
             action: input.action,
             reason: "deny_missing_grant",
             explanation:
-              "A blocks edge does join this issue to a non-terminal issue you are assigned, but no such edge was " +
-              "declared by a principal with standing on this issue, so it confers no reach: a self-declared " +
-              "dependency grants nothing, by design. The edge itself is live and nothing needs re-declaring on " +
-              "your side. Ask this issue's assignee or creator (or a manager of its assignee, or a board user) to " +
-              "declare the dependency from their side; that stamp is what turns the existing edge into a grant.",
+              "A blocks edge does join this issue to a non-terminal issue you are assigned, but no recorded " +
+              "creator of such an edge had standing on this issue, so it confers no reach — otherwise any agent " +
+              "could mint comment access by pointing its own blockedBy at this issue. Re-sending the same " +
+              "dependency will not change that: an unchanged edge keeps its original creator stamp, so " +
+              "re-declaring it is a no-op, and declaring the opposite edge is refused as a blocking cycle. The " +
+              "remedy that works in one act is a mention: ask this issue's assignee to @-mention you here, which " +
+              "grants comment access by itself. Re-stamping the edge also works, but it is two writes — the edge " +
+              "must be removed and re-added by a principal with standing on this issue who can also write the " +
+              "blocker set that holds it, which for an edge on your own issue's blocker set means a board user.",
             evaluatedRelations: [...ISSUE_COMMENT_EVALUATED_RELATIONS],
             nearMissRelations: ["dependency_edge"],
           });
