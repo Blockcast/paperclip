@@ -29,7 +29,7 @@ authenticated verdict. It reads no credential value into your output.
   mount-generation:   ..2026_11_02_21_37_06.2080447267
   mount-written:      2026-11-02 21:37:06
   token-sha256:       bf65aa6d
-  token-dated:        INITIAL MOUNT — kubelet populated this volume 16s before this container started, by reading the Secret from the API server, so the sha above WAS the Secret's content as of 2026-11-02 21:37:06. This reading is a genuine publication probe
+  token-dated:        INITIAL MOUNT — kubelet populated this volume 16s before this container started, by reading the Secret from the API server, so the sha above WAS the Secret's content as of 2026-11-02 21:37:06. On a pod FIRST container start that also makes this a publication probe; an in-place container restart reuses the volume and is indistinguishable here, so confirm restartCount before relying on it as one
                       token-sha256 is dated to mount-written, NEVER to the moment you ran
                       this check: an unchanged mount cannot tell "nothing was published"
                       apart from "not yet propagated to this pod" (kubelet sync period).
@@ -223,6 +223,18 @@ the check. The tool now computes which case your reading is and prints it on the
 `token-dated:` line — `INITIAL MOUNT`, `IN-LIFE REWRITE`, or `NOT A KUBELET
 PROJECTION`. Quote that line when you report a reading; it is what tells the
 next reader whether your sha dates anything.
+
+Two bounds on `INITIAL MOUNT`, because this is the branch that licenses the
+strongest claim. The container start time behind it is derived from
+`/proc/stat` `btime` plus `/proc/1/stat` field 22 — **not** from
+`stat -c %Y /proc/1`, which is when the procfs *inode* was instantiated and can
+drift forward if that inode is evicted and re-created. And an in-place
+**container restart** gets a new PID 1 while reusing the existing volume, so a
+mount written long before the restart also classifies as `INITIAL MOUNT`. The
+*dating* holds in both cases; "this is the pod's first mount", and so the
+publication-probe reading, does not. Confirm `restartCount` before leaning on
+it. When the start time cannot be read at all the tool says so and claims
+neither classification, rather than guessing.
 
 This bound is what let the Engineer prove, on PEN-5726, that an 11:10:09Z mint
 was never published — banking an 11:13:32Z initial mount and explicitly refusing

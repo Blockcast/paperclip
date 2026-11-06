@@ -928,14 +928,44 @@ auth_check_mount_generation() {
 # cannot be read. Callers must degrade to the undated statement rather than
 # guess. The env override exists so both branches are testable off a real
 # /proc, following GH_TOKEN_WRAPPER_API_BASE / _MCP_PROXY_URL.
+#
+# Derived from /proc/stat `btime` plus /proc/1/stat field 22 (starttime, in
+# clock ticks since boot). NOT from `stat -c %Y /proc/1`: that is when the
+# procfs INODE was instantiated, not when the process started.
+# proc_pid_make_inode() stamps the inode with the current time on creation, and
+# the inode can be evicted from the cache and re-created later, so that mtime
+# can drift FORWARD to any point in the container's life. The error is
+# one-directional and lands in the overclaim branch -- a late start time makes
+# `written <= started` true for a genuine in-life rewrite, which would then be
+# announced as an INITIAL MOUNT, the reading that licenses "the Secret held X
+# at T". Measured agreement between the two sources on this image (16s) shows
+# they usually agree, not that they must.
 auth_check_container_start() {
   if [ -n "${GH_TOKEN_WRAPPER_CONTAINER_START:-}" ]; then
     printf '%s\n' "${GH_TOKEN_WRAPPER_CONTAINER_START}"
     return 0
   fi
-  # The /proc/<pid> directory's mtime is the process start time; cross-checked
-  # against /proc/1/stat field 22 + /proc/uptime on the agent image.
-  stat -c %Y /proc/1 2>/dev/null || true
+
+  acs_btime="$(awk '$1 == "btime" { print $2; exit }' /proc/stat 2>/dev/null)" || acs_btime=""
+  acs_hz="$(getconf CLK_TCK 2>/dev/null)" || acs_hz=""
+  # Field 22 is counted from AFTER the last ")": field 2 (comm) is parenthesised
+  # and may itself contain spaces and parentheses, which would shift every
+  # positional field. The tokens after that ")" begin at field 3, so starttime
+  # (field 22) is the 20th of them.
+  acs_ticks="$(awk '{
+      n = 0
+      for (i = length($0); i > 0; i--) { if (substr($0, i, 1) == ")") { n = i; break } }
+      if (n == 0) { exit }
+      split(substr($0, n + 1), f, " ")
+      print f[20]
+    }' /proc/1/stat 2>/dev/null)" || acs_ticks=""
+
+  case "${acs_btime}" in '' | *[!0-9]*) return 0 ;; esac
+  case "${acs_hz}" in '' | *[!0-9]*) return 0 ;; esac
+  case "${acs_ticks}" in '' | *[!0-9]*) return 0 ;; esac
+  [ "${acs_hz}" -gt 0 ] || return 0
+
+  printf '%s\n' "$((acs_btime + acs_ticks / acs_hz))"
 }
 
 # PEN-5641: does this verdict govern `mcp__github__*` as well?
@@ -1221,7 +1251,7 @@ paperclip_auth_check() {
       if [ -z "${check_started}" ]; then
         check_dated="the sha above was the Secret's content as of mount-written ${check_written} (this container's start time is unreadable, so an initial mount and an in-life rewrite cannot be told apart here)"
       elif [ "${check_written_epoch}" -le "${check_started}" ]; then
-        check_dated="INITIAL MOUNT — kubelet populated this volume $((check_started - check_written_epoch))s before this container started, by reading the Secret from the API server, so the sha above WAS the Secret's content as of ${check_written}. This reading is a genuine publication probe"
+        check_dated="INITIAL MOUNT — kubelet populated this volume $((check_started - check_written_epoch))s before this container started, by reading the Secret from the API server, so the sha above WAS the Secret's content as of ${check_written}. On a pod FIRST container start that also makes this a publication probe; an in-place container restart reuses the volume and is indistinguishable here, so confirm restartCount before relying on it as one"
       else
         check_dated="IN-LIFE REWRITE — kubelet rewrote this volume $((check_written_epoch - check_started))s after this container started, and it rewrites only when the projected content changed, so the sha above was the Secret's content as of ${check_written}"
       fi
