@@ -9,6 +9,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -1510,10 +1511,17 @@ async function withStubGitHub(fn) {
 // pod is the live fleet credential — and this subcommand would then probe real
 // GitHub with it. tokenFilePath lets a caller supply a path it built itself
 // (the mount-generation test needs a kubelet-shaped directory).
-function runAuthCheck(dir, { tokenFileContent, tokenValue, tokenFilePath, apiBase, mode, mcpProxyUrl } = {}) {
+function runAuthCheck(
+  dir,
+  { tokenFileContent, tokenValue, tokenFilePath, apiBase, mode, mcpProxyUrl, containerStart } = {},
+) {
   const env = sanitizedEnv({});
   if (apiBase !== undefined) env.GH_TOKEN_WRAPPER_API_BASE = apiBase;
   if (tokenValue !== undefined) env.GH_SEAT_TOKEN_VALUE = tokenValue;
+  // PEN-5775: pins this container's PID 1 start time, which the subcommand
+  // otherwise reads off /proc/1. Both branches of `token-dated` are then
+  // reachable deterministically, and on a host without /proc as well.
+  if (containerStart !== undefined) env.GH_TOKEN_WRAPPER_CONTAINER_START = String(containerStart);
   // PEN-5641: always pinned, never left to the compiled-in loopback default.
   // The default probes :80 of this host, so an unrelated listener there — or
   // a real token proxy, inside an agent pod — would decide the mcp-channel
@@ -2248,12 +2256,13 @@ test("a REJECTED verdict prints the rotation-window vs real-outage test (PEN-564
       assert.match(proc.stdout, /verdict:\s+REJECTED/);
       assert.match(proc.stdout, /rotation-vs-outage:/);
       assert.match(proc.stdout, /does NOT establish an outage/);
-      // The procedure must name both generations, because each labels a
-      // different fault to report.
-      assert.match(proc.stdout, /generation ADVANCED/);
-      assert.match(proc.stdout, /generation UNCHANGED/);
-      // And it must consume the fields this output already prints.
-      assert.match(proc.stdout, /note mount-generation and token-sha256/);
+      // The procedure must name both branches, because each labels a different
+      // fault to report. PEN-5775 re-keyed them off the generation and onto the
+      // sha: the generation is per-pod, so it labelled the two faults wrong.
+      assert.match(proc.stdout, /sha CHANGED/);
+      assert.match(proc.stdout, /sha UNCHANGED/);
+      // And it must consume the field this output already prints.
+      assert.match(proc.stdout, /note token-sha256 above/);
       assert.equal(proc.status, 1);
     });
   });
@@ -2273,10 +2282,10 @@ test("escalation is gated on the second REJECTED, not on the generation (PEN-564
       assert.match(proc.stdout, /still REJECTED -> ESCALATE/);
       // The generation must be explicitly demoted to a label, not a gate.
       assert.match(proc.stdout, /says WHICH fault, never WHETHER/);
-      assert.match(proc.stdout, /Do NOT wait for the generation to settle before escalating/);
+      assert.match(proc.stdout, /Do NOT wait for the sha or the generation to settle before escalating/);
       // A moved generation is not proof the rotator ran: this pod stamps one at
-      // mount time too, measured on PEN-5641.
-      assert.match(proc.stdout, /this pod stamps one at mount time too/);
+      // mount time too, measured on PEN-5641 and again on PEN-5775.
+      assert.match(proc.stdout, /moves when THIS pod mounts/);
       // And the retracted framing must not come back: the window is not
       // self-healing, and 93s was a sampling interval, never a duration.
       assert.doesNotMatch(proc.stdout, /closed itself/);
@@ -2298,6 +2307,159 @@ test("the rotation-vs-outage block appears only on REJECTED (PEN-5641)", async (
       const empty = runAuthCheck(dir, { tokenFileContent: "", apiBase });
       assert.match(empty.stdout, /verdict:\s+NO_CREDENTIAL/);
       assert.doesNotMatch(empty.stdout, /rotation-vs-outage:/);
+    });
+  });
+});
+
+// THE REQUIRED REGRESSION (PEN-5775 Done-when #3). `mount-generation` is a
+// property of the OBSERVER: kubelet stamps it when THIS pod materialises the
+// volume, so one credential sitting on two pods carries two generations. A
+// decision table keyed on it therefore returns a different verdict per pod for
+// one credential -- measured 2026-11-06, when one sha on five mounts spanning
+// 63 minutes produced "rotator stalled" and "report it as new" ~60 seconds
+// apart, the second of which would have been a spurious critical escalation.
+//
+// No single-pod test can catch that, which is why the broken table passed every
+// test it had. The fixture is therefore necessarily two mounts differing ONLY
+// in the generation directory, asserting that every pod-invariant conclusion is
+// equal across them.
+test("same sha on two different generations yields the same verdict (PEN-5775)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      // kubelet's atomic writer shape, as in the mount-generation test above.
+      const mountWithGeneration = (name, generation) => {
+        const mount = path.join(dir, name);
+        mkdirSync(path.join(mount, generation), { recursive: true });
+        // Byte-identical payload on both: ONE credential, two pods.
+        writeFileSync(path.join(mount, generation, "token"), "ghs_revoked_token\n");
+        symlinkSync(generation, path.join(mount, "..data"));
+        symlinkSync(path.join("..data", "token"), path.join(mount, "token"));
+        return runAuthCheck(dir, { tokenFilePath: path.join(mount, "token"), apiBase });
+      };
+
+      // The two ends of the 63-minute span measured across five real pods.
+      const early = mountWithGeneration("pod-a", `..2026_11_06_09_58_11.${Date.now()}`);
+      const late = mountWithGeneration("pod-b", `..2026_11_06_11_01_06.${Date.now() + 1}`);
+
+      const field = (out, name) =>
+        out.split("\n").find((line) => line.trim().startsWith(`${name}:`));
+
+      // The premise: the generations really do differ...
+      assert.notEqual(
+        field(early.stdout, "mount-generation"),
+        field(late.stdout, "mount-generation"),
+      );
+      // ...while the content-derived field does not.
+      assert.equal(field(early.stdout, "token-sha256"), field(late.stdout, "token-sha256"));
+
+      // The conclusion, which must not depend on which pod is asking.
+      assert.equal(field(early.stdout, "verdict"), field(late.stdout, "verdict"));
+      assert.equal(early.status, late.status);
+      assert.match(early.stdout, /verdict:\s+REJECTED/);
+      assert.equal(early.status, 1);
+
+      // And the escalation guidance itself, since that is the part an agent
+      // acts on.
+      const guidance = (out) => out.slice(out.indexOf("rotation-vs-outage:"));
+      assert.equal(guidance(early.stdout), guidance(late.stdout));
+
+      // THE ASSERTION THAT ACTUALLY BITES, and it is worth being exact about
+      // why, because the row this fixture serves is about diagnostics that
+      // mislead. Every equality above ALSO held before the fix: the verdict is
+      // derived from the HTTP status, and the guidance is static prose, so
+      // neither ever varied with the generation. What varied was the BRANCH the
+      // prose told the reader to take -- the script never evaluates it, the
+      // agent does, against a field that differs per pod. So the defect is only
+      // observable as the guidance naming a per-pod field as the key, and that
+      // is what is pinned here. Mutating the table back to `generation
+      // UNCHANGED`/`ADVANCED` fails exactly this pair, verified by hand.
+      for (const proc of [early, late]) {
+        assert.doesNotMatch(proc.stdout, /generation UNCHANGED/);
+        assert.doesNotMatch(proc.stdout, /generation ADVANCED/);
+      }
+    });
+  });
+});
+
+// PEN-5775 Done-when #2. The generation keeps its line -- it is still the right
+// thing to quote when reporting THIS pod's mount -- so the caveat has to travel
+// with it, or a reader rebuilds the defect from the raw field.
+test("mount-generation and mount-written are labelled per-pod (PEN-5775)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
+      assert.match(proc.stdout, /mount-scope:\s+PER-POD/);
+      assert.match(proc.stdout, /Neither is a publish time, and neither is the token age/);
+      assert.match(proc.stdout, /either across pods/);
+      assert.equal(proc.status, 0);
+    });
+  });
+});
+
+// PEN-5775, the Engineer's publication probe, carried onto this row by the CEO.
+// Keying the table on the sha fixes the wrong verdicts but on its own only ever
+// reports "unchanged"; the constructive form is what lets a pod prove a
+// publication happened. A pod's FIRST mount is a direct read of the Secret at
+// that instant, so (container start, sha) dates the content. Any later reading
+// of an unchanged mount does not -- kubelet's sync period means it cannot tell
+// "nothing was published" from "I cannot see it yet". That asymmetry settled an
+// (a)/(b) dilemma two agents could not close on PEN-5726, so it is pinned here.
+test("token-dated separates an initial mount from an in-life rewrite (PEN-5775)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const generation = `..2026_11_06_19_41_18.${Date.now()}`;
+      mkdirSync(path.join(dir, generation));
+      const payload = path.join(dir, generation, "token");
+      writeFileSync(payload, `${AUTH_CHECK_VALID_TOKEN}\n`);
+      symlinkSync(generation, path.join(dir, "..data"));
+      symlinkSync(path.join("..data", "token"), path.join(dir, "token"));
+      const tokenFilePath = path.join(dir, "token");
+      const mountedAt = Math.floor(statSync(payload).mtimeMs / 1000);
+
+      // kubelet materialises the volume BEFORE the container starts, so an
+      // initial mount always predates PID 1 -- measured at 16s on the agent
+      // image, where the generation dir is stamped 19:41:18 and /proc/1 at
+      // 19:41:34. This is the reading that dates the Secret's content.
+      const initial = runAuthCheck(dir, {
+        tokenFilePath,
+        apiBase,
+        containerStart: mountedAt + 16,
+      });
+      assert.match(initial.stdout, /token-dated:\s+INITIAL MOUNT/);
+      assert.match(initial.stdout, /genuine publication probe/);
+
+      // The other case: kubelet rewrites a projection only when the content it
+      // projects changed, so a rewrite during the pod's life dates the content
+      // too -- to mount-written, not to now.
+      const rewritten = runAuthCheck(dir, {
+        tokenFilePath,
+        apiBase,
+        containerStart: mountedAt - 525,
+      });
+      assert.match(rewritten.stdout, /token-dated:\s+IN-LIFE REWRITE/);
+      assert.doesNotMatch(rewritten.stdout, /INITIAL MOUNT/);
+
+      // The load-bearing half, and it has to hold in BOTH branches: neither
+      // reading dates the credential to the moment the check was run. This is
+      // the same per-pod-vs-per-Secret confusion as the generation defect, one
+      // level down, and it is the branch that triggers escalations.
+      for (const proc of [initial, rewritten]) {
+        assert.match(proc.stdout, /dated to mount-written, NEVER to the moment you ran this/);
+      }
+    });
+  });
+});
+
+// Degrading honestly matters more than degrading quietly: a plain file is not a
+// kubelet projection, and reporting its mtime as though it dated a publication
+// would reintroduce the defect on exactly the path that has no generation.
+test("token-dated refuses to date a token file that is not a Secret mount (PEN-5775)", async () => {
+  await withStubGitHub(async (apiBase) => {
+    withTempDir((dir) => {
+      const proc = runAuthCheck(dir, { tokenFileContent: `${AUTH_CHECK_VALID_TOKEN}\n`, apiBase });
+      assert.match(proc.stdout, /token-dated:\s+NOT A KUBELET PROJECTION/);
+      assert.match(proc.stdout, /says nothing about a Secret publication/);
+      assert.match(proc.stdout, /mount-generation:\s+-$/m);
     });
   });
 });

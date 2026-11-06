@@ -903,6 +903,37 @@ auth_check_mount_generation() {
   fi
 }
 
+# PEN-5775: when was `token-sha256` actually true of the Secret?
+#
+# `mount-generation` and `mount-written` are properties of THIS POD's volume,
+# never of the Secret. kubelet materialises a projected volume before the
+# container starts, so on a fresh pod `mount-written` is ~pod creation and says
+# nothing about when the credential was published. Measured 2026-11-06: one
+# credential sat on five pods at five different generations spanning 63 minutes,
+# and two agents read OPPOSITE verdicts off it ~60 seconds apart.
+#
+# What a pod CAN prove is the constructive form. kubelet populates a projection
+# by reading the Secret from the API server, and rewrites it only when the
+# content it projects has changed. So in both cases the sha is the Secret's
+# content as of `mount-written` — and in NEITHER case as of now. An unchanged
+# mount cannot distinguish "nothing was published" from "not yet propagated to
+# this pod", because kubelet's sync period bounds how stale a projection may be.
+# A pod's FIRST mount is therefore a genuine publication probe (it dates the
+# content to container start); any later reading of an unchanged mount is not.
+#
+# Returns this container's PID 1 start time as an epoch, or empty when it cannot
+# be read. Callers must degrade to the undated statement rather than guess. The
+# env override exists so both branches are testable off a real /proc.
+auth_check_container_start() {
+  if [ -n "${GH_TOKEN_WRAPPER_CONTAINER_START:-}" ]; then
+    printf '%s\n' "${GH_TOKEN_WRAPPER_CONTAINER_START}"
+    return 0
+  fi
+  # The /proc/<pid> directory's mtime is the process start time; cross-checked
+  # against /proc/1/stat field 22 + /proc/uptime on the agent image.
+  stat -c %Y /proc/1 2>/dev/null || true
+}
+
 # PEN-5641: does this verdict govern `mcp__github__*` as well?
 #
 # It did not, and nothing said so. `gh`, `curl` and `git` all re-read the token
@@ -981,6 +1012,7 @@ auth_check_cleanup() {
 paperclip_auth_check() {
   check_source="none" check_state="absent" check_gen="-" check_written="-"
   check_hash="-" check_bytes="-" check_token="" would_refuse=no check_cfg=""
+  check_written_epoch="" check_dated="-"
   trap 'auth_check_cleanup' EXIT
   trap 'auth_check_cleanup; exit 130' INT
   trap 'auth_check_cleanup; exit 143' TERM
@@ -1028,6 +1060,7 @@ paperclip_auth_check() {
       esac
       check_gen="$(auth_check_mount_generation "${TOKEN_FILE}")"
       check_written="$(stat -L -c %y -- "${TOKEN_FILE}" 2>/dev/null | cut -d. -f1)" || check_written="-"
+      check_written_epoch="$(stat -L -c %Y -- "${TOKEN_FILE}" 2>/dev/null)" || check_written_epoch=""
       check_bytes="$(printf '%s' "${check_token}" | wc -c | tr -d ' ')"
     elif [ -e "${TOKEN_FILE}" ]; then
       check_state="exists-but-unreadable"
@@ -1156,13 +1189,45 @@ paperclip_auth_check() {
     verdict_code=5
   fi
 
+  # PEN-5775: classify this reading instead of leaving it to the reader. The
+  # per-pod-vs-per-Secret confusion that made `mount-generation` unusable repeats
+  # one level down here: a reader who dates the sha to the moment they ran the
+  # check has made the same mistake about their own mount.
+  check_dated="no mount timestamp — nothing in this output dates the credential"
+  if [ "${check_written}" != "-" ] && [ -n "${check_written_epoch}" ]; then
+    if [ "${check_gen}" = "-" ]; then
+      check_dated="NOT A KUBELET PROJECTION — mount-written ${check_written} is this file's own mtime, so it dates the file and says nothing about a Secret publication"
+    else
+      check_started="$(auth_check_container_start)"
+      case "${check_started}" in
+        '' | *[!0-9]*) check_started="" ;;
+      esac
+      if [ -z "${check_started}" ]; then
+        check_dated="the sha above was the Secret's content as of mount-written ${check_written} (this container's start time is unreadable, so an initial mount and an in-life rewrite cannot be told apart here)"
+      elif [ "${check_written_epoch}" -le "${check_started}" ]; then
+        check_dated="INITIAL MOUNT — kubelet populated this volume $((check_started - check_written_epoch))s before this container started, by reading the Secret from the API server, so the sha above WAS the Secret's content as of ${check_written}. This reading is a genuine publication probe"
+      else
+        check_dated="IN-LIFE REWRITE — kubelet rewrote this volume $((check_written_epoch - check_started))s after this container started, and it rewrites only when the projected content changed, so the sha above was the Secret's content as of ${check_written}"
+      fi
+    fi
+  fi
+
   printf 'gh paperclip-auth-check (PEN-5241)\n'
   printf '  source:             %s\n' "${check_source}"
   printf '  credential:         %s%s\n' "${check_state}" \
     "$([ "${check_bytes}" = "-" ] && printf '' || printf ' (%s bytes)' "${check_bytes}")"
   printf '  mount-generation:   %s\n' "${check_gen}"
   printf '  mount-written:      %s\n' "${check_written}"
+  printf '  mount-scope:        PER-POD — both fields above are when kubelet materialised the volume on THIS\n'
+  printf '                      pod. Neither is a publish time, and neither is the token age. Never compare\n'
+  printf '                      either across pods, or against a generation another agent quoted: on\n'
+  printf '                      2026-11-06 five pods held ONE credential at five different generations\n'
+  printf '                      spanning 63 minutes (PEN-5775).\n'
   printf '  token-sha256:       %s\n' "${check_hash}"
+  printf '  token-dated:        %s\n' "${check_dated}"
+  printf '                      token-sha256 is dated to mount-written, NEVER to the moment you ran this\n'
+  printf '                      check: an unchanged mount cannot tell "nothing was published" apart from\n'
+  printf '                      "not yet propagated to this pod" (kubelet sync period). PEN-5775.\n'
   printf '  github-reachable:   %s\n' "${github_reachable}"
   printf '  authenticated:      /installation/repositories -> %s, x-ratelimit-limit %s, remaining %s, reset %s\n' \
     "${auth_code}" "${auth_limit}" "${auth_remaining}" "$(auth_check_reset_label "${auth_reset}")"
@@ -1187,17 +1252,38 @@ paperclip_auth_check() {
   # also stamped when THIS pod first mounted the secret, so it moves without the
   # rotator having run. Measured on PEN-5641: generation ..2026_11_05_04_30_17
   # carried the same sha another pod had already seen at 04:26Z.
+  #
+  # PEN-5775 finishes that correction. Demoting the generation from a GATE to a
+  # LABEL was not enough, because the label was still wrong: `mount-generation`
+  # is a property of the OBSERVER, so the two branches it labelled returned
+  # different answers per pod for one credential. Measured 2026-11-06, one sha
+  # on five mounts over 63 minutes produced three wrong readings in an hour —
+  # including a near-miss where one agent was routed to "report it as new" ~60
+  # seconds after a sibling pod had correctly read "rotator stalled" off the
+  # same credential. A discriminator that disagrees with itself across observers
+  # is not a weak signal; it is not a signal.
+  #
+  # The table therefore keys on `token-sha256`, which is content-derived and so
+  # pod-invariant — the only field in this output that may be compared against
+  # another pod's reading, or against this pod's own earlier run. The generation
+  # keeps its line (it is still the right thing to quote when reporting THIS
+  # pod's mount) but is removed from the decision and carries `mount-scope`
+  # saying so.
   if [ "${verdict_code}" = 1 ]; then
     printf '  rotation-vs-outage: a REJECTED reading alone does NOT establish an outage, and does NOT stand your work down:\n'
-    printf '                        1. note mount-generation and token-sha256 above\n'
+    printf '                        1. note token-sha256 above — NOT the generation; see mount-scope\n'
     printf '                        2. do other work for a few minutes, then re-run this check\n'
     printf '                        3. now OK -> the window closed; proceed, escalate nothing\n'
-    printf '                        4. still REJECTED -> ESCALATE. The generation says WHICH fault, never WHETHER:\n'
-    printf '                             generation UNCHANGED -> rotator stalled, credential aged out on the mount (PEN-5637)\n'
-    printf '                             generation ADVANCED  -> a freshly published credential is being refused; not yet\n'
-    printf '                                                     observed in this fleet, so report it as new\n'
-    printf '                        Do NOT wait for the generation to settle before escalating, and do not read a\n'
-    printf '                        moved generation as proof the rotator ran: this pod stamps one at mount time too.\n'
+    printf '                        4. still REJECTED -> ESCALATE. The sha says WHICH fault, never WHETHER:\n'
+    printf '                             sha UNCHANGED -> rotator stalled, credential aged out on the mount (PEN-5637)\n'
+    printf '                             sha CHANGED   -> a freshly published credential is being refused; not yet\n'
+    printf '                                              observed in this fleet, so report it as new\n'
+    printf '                        token-sha256 is content-derived and therefore pod-invariant: it is the ONLY\n'
+    printf '                        field here you may compare against a reading another agent quoted, or\n'
+    printf '                        against your own earlier run. Do NOT key this on mount-generation — it also\n'
+    printf '                        moves when THIS pod mounts, so two pods holding one credential read OPPOSITE\n'
+    printf '                        verdicts in the same minute (measured 2026-11-06, PEN-5775).\n'
+    printf '                        Do NOT wait for the sha or the generation to settle before escalating.\n'
   fi
   exit "${verdict_code}"
 }

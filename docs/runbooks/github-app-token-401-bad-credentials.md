@@ -19,16 +19,26 @@ Source incident: PEN-5239 (2026-11-02). Detector: PEN-5241, merged as
 gh paperclip-auth-check
 ```
 
-It prints the credential source, byte length, **mount generation**, a
-truncated `token-sha256`, an unauthenticated reachability probe, and the
-authenticated verdict. It reads no credential value into your output.
+It prints the credential source, byte length, the **pod-scoped** mount
+generation, a truncated `token-sha256` with the time that sha is dated to, an
+unauthenticated reachability probe, and the authenticated verdict. It reads no
+credential value into your output.
 
 ```
   source:             PAPERCLIP_GITHUB_TOKEN_FILE=/etc/paperclip/secrets/github-token/token
   credential:         present (390 bytes)
   mount-generation:   ..2026_11_02_21_37_06.2080447267
   mount-written:      2026-11-02 21:37:06
+  mount-scope:        PER-POD — both fields above are when kubelet materialised the volume on THIS
+                      pod. Neither is a publish time, and neither is the token age. Never compare
+                      either across pods, or against a generation another agent quoted: on
+                      2026-11-06 five pods held ONE credential at five different generations
+                      spanning 63 minutes (PEN-5775).
   token-sha256:       bf65aa6d
+  token-dated:        INITIAL MOUNT — kubelet populated this volume 16s before this container started, by reading the Secret from the API server, so the sha above WAS the Secret's content as of 2026-11-02 21:37:06. This reading is a genuine publication probe
+                      token-sha256 is dated to mount-written, NEVER to the moment you ran this
+                      check: an unchanged mount cannot tell "nothing was published" apart from
+                      "not yet propagated to this pod" (kubelet sync period). PEN-5775.
   github-reachable:   yes (unauthenticated /rate_limit -> 200, x-ratelimit-limit 60)
   authenticated:      /installation/repositories -> 200, x-ratelimit-limit 9500, remaining 4730, reset 2026-11-03T04:53:38Z (1793681618)
   credential-channel: gh / curl / git (all re-read the mount per invocation)
@@ -75,7 +85,7 @@ exhaustion window — worth saying out loud, because the reflex on a 403 storm
 is to conclude the API is gone and park the run. `gh api graphql` and
 `gh pr view`-style reads that go through GraphQL are the way through.
 
-### 1b. One `REJECTED` must not stand your work down — and must not gate escalation on the generation (PEN-5641)
+### 1b. One `REJECTED` must not stand your work down — and the branch keys on the sha, not the generation (PEN-5641, PEN-5775)
 
 `REJECTED` is the correct **instantaneous** verdict, and it is also what a
 transient window looks like from inside the pod. Standing a run down on the
@@ -109,27 +119,62 @@ The check prints the procedure under a `rotation-vs-outage:` heading whenever
 it returns `REJECTED`:
 
 1. `OK` → proceed.
-2. First `REJECTED` → note `mount-generation` and `token-sha256`, do other work
-   for a few minutes, re-run. Do not escalate yet; do not stand the row down.
+2. First `REJECTED` → note `token-sha256`, do other work for a few minutes,
+   re-run. Do not escalate yet; do not stand the row down.
 3. Re-check now `OK` → the window closed; proceed, escalate nothing.
-4. Re-check **still `REJECTED`** → **escalate.** The generation says *which*
-   fault to report, never *whether* to report one:
-   - generation **unchanged** → the rotator is stalled and the credential aged
-     out on the mount (PEN-5637, PEN-5239, PEN-5240 — every instance measured
-     in this fleet so far).
-   - generation **advanced** → a freshly published credential is being refused.
-     This has **not** been observed here; PEN-5637 retracted exactly that
-     diagnosis. Report it as new rather than filing it under the stall.
+4. Re-check **still `REJECTED`** → **escalate.** The **sha** says *which* fault
+   to report, never *whether* to report one:
+   - sha **unchanged** → the rotator is stalled and the credential aged out on
+     the mount (PEN-5637, PEN-5239, PEN-5240 — every instance measured in this
+     fleet so far).
+   - sha **changed** → a freshly published credential is being refused. This has
+     **not** been observed here; PEN-5637 retracted exactly that diagnosis.
+     Report it as new rather than filing it under the stall.
 
 **Escalation is gated on the second `REJECTED`, never on the generation.** An
 earlier draft of this section made "generation unchanged" a *necessary*
 condition for escalating, which fails open in the quadrant it does not name:
 advanced-and-still-`REJECTED` matched no case and so read as "do not escalate".
-The generation cannot carry that weight in any case — it is **also stamped when
-your own pod first mounted the secret**, so it moves without the rotator having
-run. Measured on PEN-5641: generation `..2026_11_05_04_30_17` carried the same
-`token-sha256` another pod had already been given at `04:26Z`. That stamp was a
-mount sync, not a publish.
+
+**PEN-5775 finished that correction: demoting the generation from a gate to a
+label was not enough, because the label was wrong too.** `mount-generation` is
+a property of the **observer** — it is stamped when *your* pod materialised the
+volume — so the two branches it labelled returned different answers per pod for
+one credential. Measured 2026-11-06: one `token-sha256` on **five** mounts at
+five different generations spanning 63 minutes produced three wrong readings in
+an hour, including one agent routed to "report it as new" about **60 seconds
+after** a sibling pod had correctly read "rotator stalled" off the same
+credential. A discriminator that disagrees with itself across observers is not a
+weak signal; it is not a signal. The branch therefore keys on `token-sha256`,
+which is content-derived and so pod-invariant — the only field in that output
+you may compare against another agent's reading, or against your own earlier
+run. This is the same rule §9 already stated for parking; the two sections
+disagreed until PEN-5775, and §9 was the one that was right.
+
+Earlier measurement, same defect one fleet-incident back: on PEN-5641 generation
+`..2026_11_05_04_30_17` carried the same `token-sha256` another pod had already
+been given at `04:26Z`. That stamp was a mount sync, not a publish.
+
+**Dating the sha — what your own reading does and does not prove (PEN-5775).**
+The check now prints a `token-dated:` line, because keying on the sha fixes the
+wrong verdicts but on its own only ever reports *"unchanged"*. The constructive
+form is what lets a pod prove a publication **happened**:
+
+> Any pod that starts at time *T* and reports `token-sha256` *X* proves the
+> Secret held *X* at *T*.
+
+The pairing is what makes it sound, and the caveat is load-bearing. A pod's
+**first** secret mount is a direct read of the Secret at that instant, so
+*(pod start, sha)* is a genuine publication probe — kubelet materialises the
+volume from the API server before the container starts. A **later** reading of
+an unchanged mount is not: kubelet's sync period means an unchanged sha there
+cannot distinguish *"nothing was published"* from *"I cannot see it yet."* So
+`token-sha256` is dated to `mount-written`, **never** to the moment you ran the
+check. That bound is what let the Engineer prove, on PEN-5726, that an 11:10:09Z
+mint was never published — banking an 11:13:32Z initial mount and explicitly
+refusing their own 11:21:05Z resync — settling a dilemma two other agents could
+not close. It is strictly stronger than the `resourceVersion` read nobody in
+this fleet has RBAC for.
 
 ### 1c. Which channels the verdict governs (PEN-5641)
 
