@@ -117,6 +117,45 @@ export type RecoveryActionListItem = {
   retiringBound: string | null;
   lastAttemptAt: Date | null;
   outcome: string | null;
+  /**
+   * PEN-5708: when the action was RETIRED, as distinct from `updatedAt`, which the
+   * discharge overwrites on its way past and which any later write moves again.
+   * Null on every row that is still `active`/`escalated` — including a row already
+   * carrying a spent `retiringBound`, because `escalated` is a retirement of the
+   * WAKE, not of the action (see `escalateExpiredWakeHorizons`).
+   *
+   * ⚠ This does NOT answer "did a human discharge this". Every writer that moves a
+   * row to `resolved`/`cancelled` goes through `resolveActiveForIssue` or
+   * `dischargeActionsWithRestoredExecution`, and BOTH stamp `resolvedAt: now` — as
+   * do the half-dozen automatic callers of the former in `recovery/service.ts`
+   * (watchdog fold, continuation-retry cancel, hand-back drain, backlog-parked
+   * cancel, PR-merge discharge). So `resolvedAt` is non-null on every retired row
+   * regardless of who retired it, and reading a non-null value as evidence of a
+   * manual resolution is the same category of error as reading the old absent key
+   * as evidence of none. The discriminator is `resolutionNote` plus
+   * `retiringBound`; see `resolutionNote` below.
+   */
+  resolvedAt: Date | null;
+  /**
+   * PEN-5708: the only field on this row that actually separates a resolver
+   * discharge from a sweep discharge, which is why it is projected alongside
+   * `resolvedAt` rather than instead of it.
+   *
+   * `outcome` cannot do it — the automatic sweep writes `restored` and the resolve
+   * route rewrites a caller's `restored` to `handed_back`/`owner_completed`/
+   * `restored_unverified` by its own rules, so the verb is shared by design.
+   * `retiringBound` gets most of the way there (`execution_restored` is written by
+   * the restored-execution sweep and by nothing else) but not all of it: PEN-4013
+   * made a manual discharge `coalesce` onto an existing bound, so a hand discharge
+   * of an already-escalated row reads `timeout_horizon` — indistinguishable from an
+   * expiry on that field alone.
+   *
+   * Every automatic path writes a fixed, self-describing note; a manual discharge
+   * writes the caller's text, or null when the caller supplied none. The machine
+   * notes are the ones that can be matched on — a null or free-form note is the
+   * absence of a machine discharge, not proof of a human one.
+   */
+  resolutionNote: string | null;
   createdAt: Date;
   updatedAt: Date;
   /**
@@ -140,6 +179,13 @@ export type RecoveryActionListItem = {
 
 export type RecoveryActionListOptions = {
   ownerAgentId?: string;
+  /**
+   * PEN-5708: narrow to one source issue. The company-scoped list is the only read
+   * that shows a `resolved` action at all — `GET /issues/:id/recovery-actions`
+   * returns `{active: null, actions: []}` once the action retires — so without this
+   * the sole audit surface could not be pointed at the row being audited.
+   */
+  sourceIssueId?: string;
   kind?: string;
   status?: string;
   limit?: number;
@@ -245,6 +291,22 @@ function toResolutionSnapshot(row: ResolutionSnapshotRow): RecoveryResolutionSna
  * `resolveActiveForIssue`. Rows resolved before that capture shipped have no
  * snapshot and are `unknown`; they are NOT re-derived from live state, which
  * would launder a drifted read as a measurement.
+ *
+ * PEN-5708 asked whether this classifier should also consume `resolvedAt`, now that
+ * the list projects it. It should not, on both counts:
+ *
+ *   - It carries no signal here. Both writers that move a row to `resolved`/
+ *     `cancelled` stamp it, and nothing else in the service writes a terminal status,
+ *     so on every row this code retires it tracks `status` exactly — as an input it
+ *     would restate the `ACTIVE_STATUSES` test on line one. (A legacy row terminal
+ *     with a null `resolvedAt` would make it WEAKER than `status`, never stronger.)
+ *   - It answers a different question. This classifies WHO ENDED UP OWNING THE
+ *     DELIVERABLE WORK — a property of the source issue at resolution. "Who
+ *     discharged the action" is a property of the discharge, the two are
+ *     independent (a sweep discharge can land on a self-recovery and a manual one on
+ *     a hand-back), and folding the second into the first would make a class that
+ *     measures neither. A consumer that wants the discharge path reads
+ *     `resolutionNote` and `retiringBound`, which are both projected.
  */
 export function classifyRecoveryHandoff(facts: RecoveryActionFacts): HandoffClass {
   if (ACTIVE_STATUSES.has(facts.status)) return "active";
@@ -302,6 +364,9 @@ export function recoveryObservabilityService(db: Db) {
   ): Promise<RecoveryActionListItem[]> {
     const filters = [eq(issueRecoveryActions.companyId, companyId)];
     if (opts.ownerAgentId) filters.push(eq(issueRecoveryActions.ownerAgentId, opts.ownerAgentId));
+    if (opts.sourceIssueId) {
+      filters.push(eq(issueRecoveryActions.sourceIssueId, opts.sourceIssueId));
+    }
     if (opts.kind) filters.push(eq(issueRecoveryActions.kind, opts.kind));
     if (opts.status) {
       const statuses = opts.status
@@ -335,6 +400,13 @@ export function recoveryObservabilityService(db: Db) {
         retiringBound: issueRecoveryActions.retiringBound,
         lastAttemptAt: issueRecoveryActions.lastAttemptAt,
         outcome: issueRecoveryActions.outcome,
+        // PEN-5708. Deliberately a PAIR: `resolvedAt` is when the row was retired
+        // (`updatedAt` cannot say, because the discharge overwrites it), and
+        // `resolutionNote` is the only field that says BY WHAT. Projecting the
+        // timestamp alone would have swapped one unanswerable question for a
+        // plausible-looking wrong answer, since every retiring writer stamps it.
+        resolvedAt: issueRecoveryActions.resolvedAt,
+        resolutionNote: issueRecoveryActions.resolutionNote,
         createdAt: issueRecoveryActions.createdAt,
         updatedAt: issueRecoveryActions.updatedAt,
         ...resolutionSnapshotColumns,

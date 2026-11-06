@@ -1691,13 +1691,18 @@ export function issueRecoveryActionService(db: DbOrTransaction) {
         // unconditional write erased the bound that recorded the retirement —
         // `timeout_horizon` and `attempt_budget` both became `discharged`.
         //
-        // That erasure is unrecoverable and silent. `retiringBound` is the only field
-        // distinguishing HOW an action ended that the company-scoped recovery-actions
-        // route projects at all: `resolvedAt` and `resolutionNote` are not in that
-        // projection, and the discharge overwrites `updatedAt` on its way past. So every
-        // retrospective census of horizon expiries — the query PEN-3000 and PEN-3322 rest
-        // on — under-counted by exactly the rows someone had since discharged, with no
-        // indication that it had.
+        // That erasure is unrecoverable and silent. When PEN-4013 was written `retiringBound`
+        // was the ONLY field distinguishing HOW an action ended that the company-scoped
+        // recovery-actions route projected at all — `resolvedAt` and `resolutionNote` were
+        // absent from that projection, and the discharge overwrites `updatedAt` on its way
+        // past. So every retrospective census of horizon expiries — the query PEN-3000 and
+        // PEN-3322 rest on — under-counted by exactly the rows someone had since discharged,
+        // with no indication that it had.
+        //
+        // PEN-5708 added that pair to the projection, so the census now has a second,
+        // independent witness. This `coalesce` is NOT thereby redundant: `resolutionNote` is
+        // caller-supplied on this path and may be null, so it can corroborate a preserved
+        // bound but cannot reconstruct an erased one.
         //
         // The decision this encodes (PEN-4013): `retiringBound` means "how the action was
         // RETIRED", not "how it ended". Preserving the prior bound costs the disposal

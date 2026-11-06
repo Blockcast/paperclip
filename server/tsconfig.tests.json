@@ -85,7 +85,8 @@
     "src/__tests__/zoned-cron-equivalence.test.ts",
     "src/__tests__/work-product-external-id-lookup-routes.test.ts",
     "src/__tests__/zoned-cron-work-bound.test.ts",
-    "src/__tests__/queued-run-claim-refusal-instrumentation.test.ts"
+    "src/__tests__/queued-run-claim-refusal-instrumentation.test.ts",
+    "src/__tests__/recovery-actions-route-query-params.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }

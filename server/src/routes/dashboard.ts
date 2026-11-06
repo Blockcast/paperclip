@@ -22,6 +22,59 @@ function parsePositiveNumber(
   return max != null ? Math.min(parsed, max) : parsed;
 }
 
+/**
+ * Every query key `/companies/:companyId/recovery-actions` understands. PEN-5708:
+ * anything outside this set is a 400, not a silent drop.
+ *
+ * The argument is the one already written below about `order`, applied to the key
+ * rather than the value. A silently-ignored filter does not return an error page
+ * or an empty page — it returns a FULL UNFILTERED PAGE, which is the one response
+ * shape a caller reads as "these are the matching rows". Measured on this exact
+ * handler: `?sourceIssueId=<uuid>` returned 100 actions across 94 distinct source
+ * issues, none of them the one requested, and nothing in the response said so.
+ *
+ * The breaking-change risk is bounded and was checked before shipping: the repo's
+ * only callers are this route's own tests and the probe documented in
+ * `services/recovery/workspace-validation-probe.ts`, both of which send supported
+ * keys only. A caller that was relying on a dropped key was already getting the
+ * wrong rows, so failing it loudly is a strict improvement over failing it silently.
+ */
+const RECOVERY_ACTION_QUERY_KEYS = new Set([
+  "ownerAgentId",
+  "sourceIssueId",
+  "kind",
+  "status",
+  "limit",
+  "offset",
+  "order",
+]);
+
+/**
+ * Read a query param that must appear at most once.
+ *
+ * Express parses a repeated key (`?kind=a&kind=b`) into an ARRAY, and the previous
+ * `typeof value === "string" ? value : undefined` read turned that into `undefined`
+ * — i.e. into no filter at all, which is the same full-unfiltered-page failure as
+ * an unknown key, reached by a different route. Rejecting is the only answer that
+ * cannot be mistaken for a result.
+ */
+function readSingleStringParam(value: unknown, name: string): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") {
+    throw badRequest(`Query parameter ${name} must be given at most once`);
+  }
+  return value;
+}
+
+function readUuidParam(value: unknown, name: string): string | undefined {
+  const raw = readSingleStringParam(value, name);
+  if (raw === undefined) return undefined;
+  if (!UUID_REGEX.test(raw)) {
+    throw badRequest(`Query parameter ${name} must be a valid UUID`);
+  }
+  return raw;
+}
+
 export function dashboardRoutes(db: Db) {
   const router = Router();
   const svc = dashboardService(db);
@@ -65,30 +118,64 @@ export function dashboardRoutes(db: Db) {
   router.get("/companies/:companyId/recovery-actions", async (req, res) => {
     const companyId = req.params.companyId as string;
     assertCompanyAccess(req, companyId);
-    const ownerAgentId = typeof req.query.ownerAgentId === "string" ? req.query.ownerAgentId : undefined;
-    if (ownerAgentId !== undefined && !UUID_REGEX.test(ownerAgentId)) {
-      throw badRequest("Query parameter ownerAgentId must be a valid UUID");
+    // Unknown keys first, so a typo is reported as a typo rather than as whichever
+    // supported key happened to be missing. See RECOVERY_ACTION_QUERY_KEYS.
+    const unknownKeys = Object.keys(req.query).filter((key) => !RECOVERY_ACTION_QUERY_KEYS.has(key));
+    if (unknownKeys.length > 0) {
+      throw badRequest(
+        `Unsupported query parameter(s): ${unknownKeys.sort().join(", ")}. `
+        + `Supported: ${[...RECOVERY_ACTION_QUERY_KEYS].sort().join(", ")}`,
+      );
     }
-    const kind = typeof req.query.kind === "string" ? req.query.kind : undefined;
-    const status = typeof req.query.status === "string" ? req.query.status : undefined;
-    const limit = parsePositiveNumber(req.query.limit, 100, 500);
-    const offset = Math.max(0, Math.floor(parsePositiveNumber(req.query.offset, 0)));
+    const ownerAgentId = readUuidParam(req.query.ownerAgentId, "ownerAgentId");
+    // PEN-5708: this is the audit filter, and the reason it matters more than a
+    // missing filter usually would is that this route is the ONLY read that shows a
+    // `resolved` action at all — the issue-scoped read collapses to
+    // `{active: null, actions: []}` the moment an action retires, i.e. it goes blind
+    // at exactly the moment you want to know how the action ended. Without this key
+    // the sole audit surface could not be narrowed to the row being audited.
+    const sourceIssueId = readUuidParam(req.query.sourceIssueId, "sourceIssueId");
+    const kind = readSingleStringParam(req.query.kind, "kind");
+    const status = readSingleStringParam(req.query.status, "status");
+    // Routed through the same single-value read as the filters. A repeated `limit`
+    // is an array, and `parsePositiveNumber` would quietly fall back to 100 — which
+    // is a smaller lie than a dropped filter but still a page the caller did not ask
+    // for, and this handler now has no silently-coerced inputs left.
+    const limit = parsePositiveNumber(readSingleStringParam(req.query.limit, "limit"), 100, 500);
+    const offset = Math.max(
+      0,
+      Math.floor(parsePositiveNumber(readSingleStringParam(req.query.offset, "offset"), 0)),
+    );
     // Rejected rather than coerced: a silently-ignored `order=ascending` returns a
     // newest-first page that the caller reads as a census of the oldest rows.
-    const orderParam = req.query.order;
+    const orderParam = readSingleStringParam(req.query.order, "order");
     if (orderParam !== undefined && orderParam !== "asc" && orderParam !== "desc") {
       throw badRequest('Query parameter order must be "asc" or "desc"');
     }
     const order = orderParam === "asc" ? "asc" : "desc";
     const actions = await recoveryObservability.listActions(companyId, {
       ownerAgentId,
+      sourceIssueId,
       kind,
       status,
       limit,
       offset,
       order,
     });
-    res.json({ companyId, ownerAgentId: ownerAgentId ?? null, kind: kind ?? null, status: status ?? null, limit, offset, order, actions });
+    // Echoed back for the same reason the other filters are: a caller comparing the
+    // echo against what it sent can tell a filtered page from an unfiltered one
+    // without counting rows.
+    res.json({
+      companyId,
+      ownerAgentId: ownerAgentId ?? null,
+      sourceIssueId: sourceIssueId ?? null,
+      kind: kind ?? null,
+      status: status ?? null,
+      limit,
+      offset,
+      order,
+      actions,
+    });
   });
 
   return router;
