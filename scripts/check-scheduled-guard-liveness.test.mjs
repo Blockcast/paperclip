@@ -1663,6 +1663,14 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
       [
         "ally-review-consistency.yml",
         "codeowners-guard.yml",
+        // PEN-5781. The BLO-29711 comment-review-gate census, which shipped
+        // with ZERO live invocations and went unnoticed because PEN-3281's
+        // detector watches guards that STOP and this one never started.
+        // Watched rather than exempt for the same reason as
+        // stranded-approval-lock-check.yml above: an unrun detector is the
+        // exact failure it exists to catch, so scheduling it without watching
+        // it would leave it one silent deschedule away from where it began.
+        "comment-review-gate-census.yml",
         "commit-attribution-audit.yml",
         // PEN-4988. Watches §7.2 trigger 2 of the PEN-3183 git-egress boundary
         // decision — an agent Job rendering a broad read-write data mount, which
@@ -1751,6 +1759,21 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     assert.ok(dailyClockRot > 24, "a daily cron must clear one full cycle plus GitHub's delay");
     assert.ok(dailyClockRot <= 48, "looser than two missed cycles stops being a backstop at all");
 
+    // PEN-5781: the second daily guard. Its 48h bar is INHERITED from
+    // master-health.yml rather than measured — it has no gap distribution of
+    // its own yet — so it is asserted against the same daily band, which is
+    // what makes the two move together if that band is ever re-derived.
+    // Asserted rather than skipped so a drift onto the hourly bar, which would
+    // red it every single day, fails here instead of at 06:37.
+    const dailyCensus = byWorkflow.get("comment-review-gate-census.yml");
+    assert.ok(dailyCensus > 24, "a daily cron must clear one full cycle plus GitHub's delay");
+    assert.ok(dailyCensus <= 48, "looser than two missed cycles stops being a backstop at all");
+    assert.equal(
+      dailyCensus,
+      dailyClockRot,
+      "the daily guards must share one bar until each has gaps of its own",
+    );
+
     // BLO-42887: hourly CADENCE but on its own measured bar, so it is excluded
     // from the shared-hourly assertion and given its own band here. Its jitter
     // ceiling is 173 min, not the six's 118 — measured but unexplained, and not
@@ -1773,7 +1796,12 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
     // (PEN-3379 moved it 4h -> 2.75h).
     // Derived from TWICE_DAILY rather than re-listed, so adding a twice-daily
     // guard above cannot leave it wrongly asserted against the hourly bar here.
-    const notHourly = new Set([...TWICE_DAILY, "master-health.yml", "scheduled-production-deploy.yml"]);
+    const notHourly = new Set([
+      ...TWICE_DAILY,
+      "master-health.yml",
+      "comment-review-gate-census.yml",
+      "scheduled-production-deploy.yml",
+    ]);
     for (const workflow of WATCHED_WORKFLOWS) {
       if (notHourly.has(workflow)) continue;
       assert.equal(
