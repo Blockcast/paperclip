@@ -9144,6 +9144,79 @@ describeEmbeddedPostgres("github-webhook route", () => {
     });
   });
 
+  // PEN-5834: `check_run`, `check_suite` and `workflow_run` carry no PR title
+  // or body, so the branch ref is their only identifier source. They bound it
+  // with the UPPERCASE-only `extractPaperclipIdentifiers`, while every branch
+  // branchTemplate emits is lowercase -- so all three resolved to zero
+  // identifiers on every real PR and the red-CI author wake (BLO-46732) was
+  // dark fleet-wide. The whole existing suite above missed it because its
+  // fixtures use `fix/BLO-3182-webflow`, an uppercase ref no real branch has.
+  describe("PEN-5834: CI-completion wakes bind lowercase branch refs", () => {
+    const ciDelivery = (event: string, branch: string, headSha: string, conclusion: string) => {
+      const obj = {
+        head_branch: branch,
+        head_sha: headSha,
+        conclusion,
+        pull_requests: [{ number: 3451, head: { ref: branch } }],
+      };
+      const key = event === "check_run" ? "check_run" : event === "check_suite" ? "check_suite" : "workflow_run";
+      return {
+        event,
+        delivery: `pen5834-${headSha}-${event}`,
+        payload: { action: "completed", [key]: obj, repository: { full_name: "Blockcast/paperclip" } },
+      };
+    };
+    const send = async (app: express.Express, d: ReturnType<typeof ciDelivery>) => {
+      const { body, signature } = signedRequest(d.payload);
+      const res = await request(app)
+        .post("/api/webhooks/github")
+        .set("x-github-event", d.event)
+        .set("x-hub-signature-256", signature)
+        .set("x-github-delivery", d.delivery)
+        .set("content-type", "application/json")
+        .send(body);
+      expect(res.status).toBe(200);
+      return (res.body.wakes as unknown[]).length;
+    };
+
+    // The four branches measured red on `review` 2026-11-06, verbatim. Each is
+    // the real ref of the PR named beside it.
+    const realBranches: Array<[string, string]> = [
+      ["PEN-5681", "platform/pen-5681-comment-effect-retention"], // #3451
+      ["PEN-5747", "devops/pen-5747-pr-label-placement-wake"], // #3459
+      ["PEN-5684", "pen-5684/fairness-yield-reaches-shared-tree"], // #3461, ref in segment 0
+      ["BLO-46894", "platform/blo-46894-submillisecond-precondition-flake"], // #3251
+    ];
+
+    for (const [identifier, branch] of realBranches) {
+      it(`wakes the owner of ${identifier} when its lowercase branch goes red (${branch})`, async () => {
+        await seedIssueWithIdentifier(identifier);
+        const app = buildApp({ resolveCiHeadSettlement: async () => "settled" });
+        expect(await send(app, ciDelivery("workflow_run", branch, `head-${identifier}`, "failure"))).toBe(1);
+      });
+    }
+
+    it("still collapses to one wake per (issue, head) across all three CI events", async () => {
+      await seedIssueWithIdentifier("PEN-5681");
+      const app = buildApp({ resolveCiHeadSettlement: async () => "settled" });
+      const branch = "platform/pen-5681-comment-effect-retention";
+      // Red wakes immediately; the other two events dedup onto that same wake.
+      expect(await send(app, ciDelivery("workflow_run", branch, "head-dedup", "failure"))).toBe(1);
+      expect(await send(app, ciDelivery("check_run", branch, "head-dedup", "failure"))).toBe(0);
+      expect(await send(app, ciDelivery("check_suite", branch, "head-dedup", "failure"))).toBe(0);
+    });
+
+    it("does not manufacture an owner from a dependency bump's version number", async () => {
+      // `extractBranchIdentifiers` is segment-anchored and skips dependency-bot
+      // branches precisely so `undici-7.29.0` cannot resolve to `UNDICI-7`.
+      await seedIssueWithIdentifier("UNDICI-7");
+      const app = buildApp({ resolveCiHeadSettlement: async () => "settled" });
+      expect(
+        await send(app, ciDelivery("workflow_run", "blo-21612-undici-7.29.0", "head-dep", "failure")),
+      ).toBe(0);
+    });
+  });
+
   it("reopens an in_review issue when Ally posts actionable PR feedback and ignores done siblings on the same PR", async () => {
     const { companyId, agentId, issueId } = await seedIssueWithIdentifier("PEN-1126", { status: "in_review" });
     await db.insert(issues).values({
