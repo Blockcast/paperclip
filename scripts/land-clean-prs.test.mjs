@@ -78,6 +78,8 @@ import {
   readMergeState,
   fetchMergeStates,
   fetchOpenPrs,
+  fetchDefaultBranch,
+  NON_DEFAULT_BASE_ACTION,
   MERGE_STATE_PAGE_SIZE,
 } from "./land-clean-prs.mjs";
 
@@ -5117,5 +5119,168 @@ describe("a wedged front-of-queue entry is its own alarm cohort (PEN-5536)", () 
       ),
     );
     assert.match(printed, /stale-queued/, "the receipt still names it");
+  });
+});
+
+
+describe("a PR stacked on a feature branch is out of scope (PEN-5469)", () => {
+  const MASTER = "master";
+  // The measured instance: #3366, stacked on #3353's branch.
+  const STACK_BASE = "fix/land-clean-prs-oldest-first-blo-51664";
+
+  const landable = (overrides = {}) => pr({ baseRefName: MASTER, repoDefaultBranch: MASTER, ...overrides });
+  const stacked = (overrides = {}) => landable({ baseRefName: STACK_BASE, ...overrides });
+
+  it("⛔ does not spend a cap slot on a stacked PR; the slot goes to the oldest DEFAULT-base PR", () => {
+    // Done-when 2, and the fixture is built to discriminate rather than to
+    // pass. The stacked PR is the OLDER of the two, so under the BLO-51664
+    // ascending-number allocation it wins the single slot outright if it is
+    // eligible at all — which is exactly what #3366 did in the 22:32Z and
+    // 23:33Z fires on 2026-11-03 while ten `master` PRs read `cap:10-per-fire`
+    // beneath it. Against the pre-PEN-5469 code this asserts the opposite of
+    // what the code does, in both columns.
+    const rows = classifyAll([landable({ number: 3400 }), stacked({ number: 3100 })], {
+      now: NOW,
+      maxEnqueues: 1,
+    });
+    assert.deepEqual(
+      rows.map((row) => [row.number, row.action]),
+      [
+        [3400, "enqueue"],
+        [3100, NON_DEFAULT_BASE_ACTION],
+      ],
+    );
+    // The slot was not merely reassigned — it was never contested, so nothing
+    // in this fire reads as a cap deferral.
+    assert.equal(rows.filter((row) => /^cap:/.test(String(row.reason ?? ""))).length, 0);
+  });
+
+  it("names the branch it is stacked on, in the reason and in the detail", () => {
+    const row = classifyFromListing(stacked(), { now: NOW });
+    assert.equal(row.action, NON_DEFAULT_BASE_ACTION);
+    assert.equal(row.reason, `base:${STACK_BASE}`);
+    assert.match(row.detail, new RegExp(STACK_BASE.replace(/[/-]/g, "\\$&")));
+    assert.match(row.detail, /move that branch's head/);
+  });
+
+  it("is SCOPE, so it is decided ahead of every readiness rule", () => {
+    // Deliberately pinned: a stacked PR is not ours whatever else is true of
+    // it, and the verdict must not be reachable-around by removing a label or
+    // marking the PR ready. `do-not-merge` is today's manual control for
+    // exactly this case, so the two necessarily overlap.
+    const row = classifyFromListing(
+      stacked({ labels: [{ name: "do-not-merge" }], isDraft: true, autoMergeRequest: {} }),
+      { now: NOW },
+    );
+    assert.equal(row.action, NON_DEFAULT_BASE_ACTION);
+  });
+
+  it("leaves a PR that targets the default branch completely alone", () => {
+    assert.equal(classifyFromListing(landable(), { now: NOW }), null, "falls through to classifyPr");
+    assert.equal(classifyPr(landable(), { now: NOW }).action, "enqueue");
+  });
+
+  describe("⛔ an UNPROVEN base must not skip — the skip is the unrecoverable direction", () => {
+    // A wrongly-skipped PR is stranded on every fire forever and no detector
+    // ages it (the action is in NON_HOLD_ACTIONS). Not skipping degrades to
+    // the pre-PEN-5469 behaviour, which is wasteful but cannot stall anything.
+    for (const [why, overrides] of [
+      ["the default branch could not be read", { repoDefaultBranch: null }],
+      ["the default branch is absent from the row", { repoDefaultBranch: undefined }],
+      ["the default branch came back empty", { repoDefaultBranch: "" }],
+      ["the listing carried no base", { baseRefName: undefined }],
+      ["the base came back empty", { baseRefName: "" }],
+    ]) {
+      it(`still enqueues when ${why}`, () => {
+        const row = classifyPr(stacked(overrides), { now: NOW });
+        assert.equal(row.action, "enqueue", `${why}: must not skip on an unproven base`);
+      });
+    }
+  });
+
+  describe("it is a POLICY hold, so no staleness cohort may age it", () => {
+    // The `notify-only` argument: the hold clears when the AUTHOR retargets,
+    // never because this routine waited. Aging it would comment on every
+    // stacked PR every fire, forever.
+    const rows = [
+      { number: 3100, action: NON_DEFAULT_BASE_ACTION, reason: `base:${STACK_BASE}` },
+      { number: 3400, action: "skip", reason: "checks:FAILURE" },
+    ];
+    const prs = [stacked({ number: 3100 }), landable({ number: 3400 })];
+
+    it("stalledHolds skips it while still aging an ordinary hold", () => {
+      const held = stalledHolds(prs, rows, { now: NOW, staleHours: 0 });
+      assert.deepEqual(held.map((h) => h.number), [3400], "only the ordinary skip is aged");
+    });
+
+    it("unlandedEligible and capStarved do not see it either", () => {
+      assert.deepEqual(unlandedEligible(prs, rows, { now: NOW, staleHours: 0 }), []);
+      assert.deepEqual(capStarved(prs, rows, { now: NOW, staleHours: 0 }), []);
+    });
+  });
+
+  it("does not change the per-fire cap (done-when 4)", () => {
+    assert.equal(MAX_ENQUEUES_PER_FIRE, 10);
+  });
+});
+
+describe("fetchDefaultBranch reads one branch per repo and fails to UNREAD (PEN-5469)", () => {
+  it("returns the default branch name", () => {
+    const seen = [];
+    const name = fetchDefaultBranch("a/one", (args) => {
+      seen.push(args);
+      return JSON.stringify({ defaultBranchRef: { name: "master" } });
+    });
+    assert.equal(name, "master");
+    assert.deepEqual(seen, [["repo", "view", "a/one", "--json", "defaultBranchRef"]]);
+  });
+
+  for (const [why, run] of [
+    ["gh throws", () => { throw new Error("HTTP 502"); }],
+    ["the body is not JSON", () => "not json"],
+    ["the ref is absent", () => JSON.stringify({ defaultBranchRef: null })],
+    ["the name is empty", () => JSON.stringify({ defaultBranchRef: { name: "" } })],
+    ["the name is not a string", () => JSON.stringify({ defaultBranchRef: { name: 7 } })],
+  ]) {
+    it(`returns null — never a value to compare bases against — when ${why}`, () => {
+      assert.equal(fetchDefaultBranch("a/one", run), null);
+    });
+  }
+
+  it("never throws, so an unreadable default branch cannot abort a whole fire", () => {
+    assert.doesNotThrow(() => fetchDefaultBranch("a/one", () => { throw new Error("boom"); }));
+  });
+
+  it("fetchOpenPrs hydrates it onto every row, reading it ONCE for the repo", () => {
+    const listing = [
+      { number: 11, headRefOid: "1".repeat(40), author: { login: "kkroo", is_bot: false }, labels: [], isDraft: false, autoMergeRequest: null, reviewRequests: [], baseRefName: "master" },
+      { number: 22, headRefOid: "2".repeat(40), author: { login: "kkroo", is_bot: false }, labels: [], isDraft: false, autoMergeRequest: null, reviewRequests: [], baseRefName: "feature/x" },
+    ];
+    let reads = 0;
+    const prs = fetchOpenPrs("a/one", {
+      run: (args) => {
+        if (args[0] === "pr" && args[1] === "list") return JSON.stringify(listing);
+        throw new Error(`unexpected gh call: ${args.join(" ")}`);
+      },
+      mergeStates: () => new Map([[11, "CLEAN"], [22, "CLEAN"]]),
+      defaultBranch: () => (reads += 1, "master"),
+    });
+    assert.equal(reads, 1, "one read per repo, not one per PR");
+    assert.deepEqual(prs.map((row) => row.repoDefaultBranch), ["master", "master"]);
+  });
+
+  it("asks the listing for baseRefName, which the whole rule depends on", () => {
+    const seen = [];
+    fetchOpenPrs("a/one", {
+      run: (args) => {
+        seen.push(args);
+        if (args[0] === "pr" && args[1] === "list") return JSON.stringify([]);
+        throw new Error(`unexpected gh call: ${args.join(" ")}`);
+      },
+      mergeStates: () => new Map(),
+      defaultBranch: () => "master",
+    });
+    const list = seen.find((args) => args[0] === "pr" && args[1] === "list");
+    assert.ok(list[list.indexOf("--json") + 1].includes("baseRefName"));
   });
 });
