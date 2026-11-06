@@ -413,12 +413,75 @@ export const issueRecoveryActionReadModelSchema = z.object({
 
 export type IssueRecoveryActionReadModel = z.infer<typeof issueRecoveryActionReadModelSchema>;
 
-const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
+export const RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES = [
   "restored",
   "false_positive",
   "blocked",
   "cancelled",
 ] as const;
+
+/**
+ * The mounted path of the manual-resolution endpoint, as one string.
+ *
+ * PEN-5707: the `nextAction` text this subsystem writes told recovery owners to
+ * "record an intentional manual resolution" and named no route for it. The route
+ * differs from every natural guess by one segment — `resolve` is a literal with no
+ * `:actionId` before it, because the action id is a BODY field — so a seat that
+ * probed for it got four 404s and recorded, in writing, that the disposition
+ * "cannot be recorded in the field built for it". That conclusion then propagated
+ * to three other seats holding the same action kind.
+ *
+ * The route registration and the prose both read this constant so they cannot
+ * drift: a rename moves both, and `recovery-action-resolve-guidance.test.ts` fails
+ * if the prose ever stops naming the path it is registered at.
+ */
+export const ISSUE_RECOVERY_ACTION_RESOLVE_ROUTE = "/issues/:id/recovery-actions/resolve";
+
+/** The resolve route for one concrete issue, for prose that can name the id. */
+export function issueRecoveryActionResolvePath(issueId: string): string {
+  return ISSUE_RECOVERY_ACTION_RESOLVE_ROUTE.replace(":id", issueId);
+}
+
+/**
+ * The "record an intentional manual resolution" clause, with the route in it.
+ *
+ * Modelled on the self-review `nextAction` in `recovery/service.ts`, which already
+ * said all of this; the `stranded_assigned_issue` strings simply never got the same
+ * treatment. Every clause below exists because its absence cost someone a wrong
+ * conclusion:
+ *
+ *   - the path, because four path-shaped guesses all 404 (PEN-5707);
+ *   - `actionId` optional and in the body, because that is the one-segment trap;
+ *   - OMITTING `sourceIssueStatus`, because the enum has no `in_progress` member and
+ *     a reader who only sees the enum concludes that recording a disposition on a
+ *     live row requires falsifying its status. It does not: PEN-2756 made the field
+ *     optional precisely so a mid-flight row can be discharged while asserting
+ *     nothing about its status;
+ *   - the outcome vocabulary, because today you discover it by sending a
+ *     deliberately-invalid body and reading the 400 (PEN-3991: an agent that cannot
+ *     see the enum reaches for the verb in the prose, which is "restore").
+ *
+ * The outcome list is derived from `RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES` rather
+ * than retyped, so a new outcome cannot land without this text moving with it.
+ */
+export function buildManualResolutionGuidance(issueId: string): string {
+  const outcomes = RESOLVE_ISSUE_RECOVERY_ACTION_OUTCOMES.join(" | ");
+  return (
+    "record an intentional manual resolution: " +
+    `POST ${issueRecoveryActionResolvePath(issueId)} ` +
+    'with body {"outcome":"restored","resolutionNote":"<why>"} ' +
+    `(outcomes: ${outcomes}. ` +
+    '"actionId" is OPTIONAL and belongs in the BODY, never in the path — omitted, ' +
+    "it resolves this issue's active action. " +
+    'OMIT "sourceIssueStatus" to leave this issue\'s status untouched: a live ' +
+    "`in_progress` run or a board-approved `backlog` park stays exactly as it is. " +
+    '"blocked" requires "sourceIssueStatus":"blocked" and is refused without an ' +
+    'unresolved first-class blocker; "false_positive" and "cancelled" are board-only ' +
+    'and require "sourceIssueStatus" of done or in_review. On an issue left blocked ' +
+    'or cancelled, "restored" is still accepted but is recorded as ' +
+    '"restored_unverified".)'
+  );
+}
 
 /**
  * `sourceIssueStatus` is the status the resolver ASSERTS about the source issue.

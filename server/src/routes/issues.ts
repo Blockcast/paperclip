@@ -47,6 +47,7 @@ import {
   createIssueSchema,
   resolveCreateIssueStatusDefault,
   resolveIssueRecoveryActionSchema,
+  ISSUE_RECOVERY_ACTION_RESOLVE_ROUTE,
   isContradictedRestoredClaim,
   feedbackTargetTypeSchema,
   feedbackTraceStatusSchema,
@@ -10171,7 +10172,7 @@ export function issueRoutes(
     res.json(rollup);
   });
 
-  router.post("/issues/:id/recovery-actions/resolve", validate(resolveIssueRecoveryActionSchema), async (req, res) => {
+  router.post(ISSUE_RECOVERY_ACTION_RESOLVE_ROUTE, validate(resolveIssueRecoveryActionSchema), async (req, res) => {
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;

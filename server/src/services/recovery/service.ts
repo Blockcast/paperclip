@@ -8,6 +8,7 @@ import {
   PROVIDER_QUOTA_MONITOR_SERVICE_NAME,
   getAgentWorkEligibility,
   renewedIssueMonitorMaxAttempts,
+  buildManualResolutionGuidance,
   type IssueGraphLivenessAutoRecoveryPreview,
   type IssueGraphLivenessAutoRecoveryPreviewItem,
   type IssueRecoveryAction,
@@ -6742,8 +6743,10 @@ export function recoveryService(
         : recoveryCause === "configuration_incomplete"
           ? "Bind the missing secret(s) named in the run failure to the agent/project/routine env before resuming adapter execution."
         : recoveryCause === "execution_review_participant_recovery"
-          ? "Repair the failed review participant path, restore the source issue to in_review with a live reviewer, or record an intentional manual resolution."
-        : "Restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
+          ? "Repair the failed review participant path, restore the source issue to in_review with a live reviewer, or "
+            + buildManualResolutionGuidance(input.issue.id)
+        : "Restore a live execution path, fix the runtime/adapter failure, or "
+          + buildManualResolutionGuidance(input.issue.id),
       wakePolicy: recoveryCause === "provider_quota" && !ownerAgentId
         ? {
           type: "monitor_only",
@@ -8908,7 +8911,8 @@ export function recoveryService(
             : []),
           workspacePreflightHandoffCause
             ? `- Next action: ${workspacePreflightHandoffCause}`
-            : "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or record an intentional manual resolution.",
+            : "- Next action: the recovery owner should restore a live execution path, fix the runtime/adapter failure, or "
+              + buildManualResolutionGuidance(input.issue.id),
         ].join("\n")
         : [
           "",
@@ -8922,7 +8926,8 @@ export function recoveryService(
               `- Issue status: left \`${escalatedStatus}\` rather than \`blocked\`, because no owner and no blocker edge means a \`blocked\` park here would never be re-swept or drained. It will dispatch again on its own once an invokable owner with budget exists.`,
             ]
             : []),
-          "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or record an intentional manual resolution.",
+          "- Next action: a board operator should assign an invokable recovery owner, fix the agent/runtime state, or "
+            + buildManualResolutionGuidance(input.issue.id),
         ].join("\n");
 
       // A later attempt normally stays silent (one comment per action), but a
