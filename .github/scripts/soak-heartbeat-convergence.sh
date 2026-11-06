@@ -29,6 +29,7 @@
 #   LOAD_SETTLE_S seconds to settle before sampling the load baseline (default 90)
 #   LOAD_WARMUP_S seconds to let the load average converge (default 240)
 #   OUT_DIR       output directory (default ./soak-out)
+#   PAPERCLIP_TEST_PG_TEMPLATE  default 0 here, see below
 #
 # Exit: 0 only if every iteration returned rc=0.
 
@@ -38,6 +39,11 @@ TEST_FILE="src/__tests__/heartbeat-queued-backlog-convergence.test.ts"
 ITERATIONS="${ITERATIONS:-20}"
 LOAD_WORKERS="${LOAD_WORKERS:-auto}"
 OUT_DIR="${OUT_DIR:-${PWD}/soak-out}"
+# Every iteration boots a cold cluster (initdb and every migration). On a CI pod
+# EMBEDDED_POSTGRES_DATA_ROOT is set, and test-embedded-postgres.ts would
+# otherwise build one migrated template in iteration 1 and copy it from then
+# on, skipping the lifecycle this soak is meant to exercise.
+export PAPERCLIP_TEST_PG_TEMPLATE="${PAPERCLIP_TEST_PG_TEMPLATE:-0}"
 
 # Series-1 iter-14 failure regime: load average 11 on a 48-core host. This is
 # the bar the VERDICT tests against; it is deliberately not the bar the burners
