@@ -551,7 +551,7 @@ RUN --mount=type=secret,id=penstock_runtime_token \
 # upstream checksum before it is copied into the production image.
 FROM base AS caveman-proxy
 USER root
-ARG CAVEMAN_RELEASE=bin-v1.1.6
+ARG CAVEMAN_RELEASE=bin-v4.0.2
 RUN set -eu; \
     verify_sha256() { \
       expected="$1"; \
@@ -563,8 +563,8 @@ RUN set -eu; \
       fi; \
     }; \
     case "$(dpkg --print-architecture)" in \
-      amd64) asset=caveman-proxy_linux_amd64; expected_sha256=5085c65788a569bf978868084bc849261a2acef8c334124d6fc7240a3f83a35c ;; \
-      arm64) asset=caveman-proxy_linux_arm64; expected_sha256=6781f31728c403805e2a93af5be9e9535e4b8b1607650d8e0fbbb4b5a9b8ae52 ;; \
+      amd64) asset=caveman-proxy_linux_amd64; expected_sha256=a70f393806ef8ef1a4b29353f158769eab6b797b3b860fc85c81528f2bfc4f04 ;; \
+      arm64) asset=caveman-proxy_linux_arm64; expected_sha256=bd6f6ae5de6fdfdd4cc067dc4ec1641f9f839b35f4b8c8ba3571b06255e75ebd ;; \
       *) echo "unsupported Caveman architecture: $(dpkg --print-architecture)" >&2; exit 1 ;; \
     esac; \
     curl --fail --location --retry 5 \
@@ -577,8 +577,8 @@ RUN set -eu; \
 # reviewed commit rather than registering a moving GitHub branch at pod boot.
 FROM base AS ponytail-marketplace
 USER root
-ARG PONYTAIL_REF=0a4dd63ad4541f4f655c4108a295916f3c1d8fda
-ARG PONYTAIL_HOOKS_SHA256=dd0837e870a8b81eb45ef4adebfc413a48c6daf84329befd897640f731aa0e39
+ARG PONYTAIL_REF=7801d061243d7b753bad0e0b3c057cd250b11755
+ARG PONYTAIL_HOOKS_SHA256=3320ac7fae9bdded7fab83b62017db55c01b25af3f5896a518a5cf911072f54a
 RUN set -eu; \
     verify_sha256() { \
       expected="$1"; \
@@ -598,7 +598,7 @@ RUN set -eu; \
     verify_sha256 "${PONYTAIL_HOOKS_SHA256}" /opt/penstock/ponytail/hooks/claude-codex-hooks.json; \
     test -f /opt/penstock/ponytail/.claude-plugin/plugin.json; \
     test -f /opt/penstock/ponytail/.opencode/plugins/ponytail.mjs; \
-    node -e "const fs=require('node:fs');const p=JSON.parse(fs.readFileSync('/opt/penstock/ponytail/.claude-plugin/plugin.json','utf8'));if(p.name!=='ponytail'||p.version!=='4.9.0'){console.error('unexpected Ponytail plugin identity');process.exit(1)}"; \
+    node -e "const fs=require('node:fs');const p=JSON.parse(fs.readFileSync('/opt/penstock/ponytail/.claude-plugin/plugin.json','utf8'));if(p.name!=='ponytail'||p.version!=='5.3.3'){console.error('unexpected Ponytail plugin identity');process.exit(1)}"; \
     chmod -R a+rX,go-w /opt/penstock/ponytail; \
     rm -rf /tmp/ponytail
 
