@@ -180,10 +180,11 @@ unchanged sha **is** no new content — whatever the generation says.
 > (escalate), but say "no new credential reached this mount" rather than
 > "the rotator is stalled" if you have not separately confirmed the rotator.
 
-Keep reporting the generation as context — it still separates a kubelet-sync
-problem from a rotator problem, and the PEN-5641 measurement stands alongside
-these: generation `..2026_11_05_04_30_17` carried the same `token-sha256`
-another pod had already been given at `04:26Z`. Never branch on it.
+Keep reporting the generation as context, but as **per-pod forensics only**:
+it tells the next reader which pods your readings came from, not which fault
+you hit. The PEN-5641 measurement stands alongside these: generation
+`..2026_11_05_04_30_17` carried the same `token-sha256` another pod had already
+been given at `04:26Z`. Never branch on it.
 
 > **This rule was already in this document.** §5 has said *"key the park on
 > `token-sha256`, never on `mount-generation` … generation is per-pod forensics
