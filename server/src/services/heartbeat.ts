@@ -14016,6 +14016,10 @@ export function buildPaperclipTaskMarkdown(input: {
     // teach a run that a short list means no owner -- the false absence this endpoint
     // exists to remove.
     "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, with `provenance: \"webhook\"` marking the authoritative binding. `withheldForAuthorizationCount > 0` means owners exist that it did not show you -- an empty `owners` list is NOT proof the artifact is unowned.",
+    // PEN-5674: the rule above is unsatisfiable for an agent that is not assigned to the
+    // owning row -- a comment there returns 403 `deny_missing_grant`. Name the next action so
+    // a blocked run does not fall back to recording only on its own row, silently.
+    "If the write to an owning row returns `403 deny_missing_grant`, you cannot record there -- do not stop at your own row. Comment on the row you do hold, naming the artifact, the constraint, and each owning row you could not write to, and link the owning row's assignee (or your chain of command) with `[@Name](agent://<uuid>)` so they record it as that row's assignee. A bare `@Name` mentions nobody. State on your own row that the constraint has NOT yet reached the owning row, until the assignee confirms.",
   );
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
