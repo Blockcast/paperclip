@@ -8,10 +8,8 @@ const PR_ISSUE_BACKLINK_LOCK_PREFIX = "github:pr-issue-backlink:";
 // how long the holder may sit idle-in-transaction — i.e. inside its GitHub calls
 // — before Postgres terminates it and releases the lock. Both sit far above the
 // healthy critical-section cost; they exist to make pool exhaustion recoverable,
-// not to bound normal work. The hold bound mirrors `withGithubStatusDeliveryLock`'s
-// (which no longer waits at all, BLO-52499), smaller because this critical
-// section is one unpaginated list plus at most one post rather than a paginated
-// list plus retrying status writes.
+// not to bound normal work. (`withGithubStatusDeliveryLock` once bounded the
+// same shape; it now holds a lease outside any transaction, BLO-52499.)
 const BACKLINK_LOCK_WAIT_TIMEOUT_MS = 10_000;
 const BACKLINK_LOCK_HOLD_TIMEOUT_MS = 30_000;
 

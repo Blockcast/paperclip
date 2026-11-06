@@ -2453,10 +2453,10 @@ async function executeCommentReviewGateCheck(
     // goes first and the signal is written LAST, after every write that decides
     // anything. A retired context mirrors a blocking verdict onto a legacy
     // context that may still be a required check (BLO-26602), and all of this
-    // runs under the delivery lock's 120s hold cap, which a degraded Checks API
-    // can spend: three 30s hangs and their backoff cost the mirror 91s, and a
+    // runs under the status key's bounded hold, which a degraded Checks API can
+    // spend: three 30s hangs and their backoff cost the mirror 91s, and a
     // signal written ahead of retirement cost it another 91s, so the retirement
-    // landed at 182s, after Postgres had already ended the lock's holder.
+    // landed at 182s, past the 120s cap the hold had when this was measured.
     //
     // The signal also stays AFTER the mirror. Its `success` is an event a
     // dispatcher wakes on, and the dispatcher then reads the gate's own
@@ -2502,7 +2502,7 @@ async function executeCommentReviewGateCheck(
   };
 
   // Serialize evidence reads, verdict computation, and all status writes with
-  // forced retries. The transaction-scoped lock is the cross-process boundary,
+  // forced retries. The status key lease is the cross-process boundary,
   // and it is unconditional: `db` is required precisely so there is no
   // unsynchronized fall-through for a caller to reach by omission.
   const published = await withGithubStatusDeliveryLock(input.db, `${input.repoFullName}#${headSha}`, publish);
@@ -2606,7 +2606,7 @@ async function publishCheckRunMirror(
  * commit status that does gate.
  *
  * ONE attempt, unlike the status and the mirror, which are retried. It runs
- * inside the delivery lock, whose 120s hold cap a degraded Checks API can spend
+ * inside the status key's bounded hold, which a degraded Checks API can spend
  * (a retried hung write costs 91s of it), it is written after every write that
  * decides anything, and it is rewritten by the next evaluation of the head.
  *
