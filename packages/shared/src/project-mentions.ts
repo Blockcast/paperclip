@@ -496,13 +496,17 @@ export interface MentionBindingReport {
    *
    * - NOT "a wake was raised". Resolution is where this scan stops. Every
    *   comment-create path then gates the `issue_comment_mentioned` wake on
-   *   `commentAuthorCanGrantIssueMention`, so a mention written by anyone other
-   *   than the issue's assignee — a manager, the CEO, a peer — resolves, is
-   *   reported here, wakes nobody, and confers no grant. Measured 2026-11-06:
-   *   one body mentioning a grantable and an ungrantable agent reported both,
-   *   identically, and the author read that as delivery. Entitlement is a
-   *   separate mechanism and no field reports it; see
-   *   `docs/security/issue-authorization-model.md`, "Who may grant a mention".
+   *   `commentAuthorCanGrantIssueMention`, so a mention written by any AGENT
+   *   other than the issue's assignee — a manager, the CEO, a peer — resolves,
+   *   is reported here, wakes nobody, and confers no grant. (A USER author of
+   *   active membership does pass that predicate, so this is an agent-author
+   *   rule, not a general one.) This field is computed with no reference to
+   *   that predicate, so no input makes the grantable and ungrantable cases
+   *   differ. Measured 2026-11-06: one body naming two agents, NEITHER
+   *   grantable by that author on that row, reported both identically and the
+   *   author read it as delivery. Entitlement is a separate mechanism and no
+   *   field reports it; see `docs/security/issue-authorization-model.md`, "Who
+   *   may grant a mention".
    * - NOT the resolved agent's name. The reported name is the link LABEL, so
    *   `[@Cfo](agent://<ceo-id>)` reports `Cfo` while the CEO is the seat that
    *   resolved. Reporting the resolved name needs the id-to-name query this

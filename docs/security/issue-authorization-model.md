@@ -280,11 +280,14 @@ places and only the first is ever reported back to the author. A well-formed
 - is **named in the create response's `boundMentions`** (`PEN-5364`), which is worse
   than the silence this section was first written to describe: the author is not
   merely told nothing, they are shown the ungrantable mention in a list whose own
-  doc comment used to say those names "DID raise a wake". Measured 2026-11-06
-  (`PEN-5367`): one body mentioning a grantable and an ungrantable agent returned
-  `boundMentions: ["Cto", "Security"]` and `unboundMentions: []` — input varied
-  across the only axis that matters, output identical — and its author told the
-  ungrantable agent, in good faith, that they had been granted. The three code
+  doc comment used to say those names "DID raise a wake". The field is computed
+  off `findMentionedAgents` with no reference to the predicate below, so no input
+  can make it distinguish a grantable mention from an ungrantable one — that is a
+  property of the source, not an inference from a sample. Measured 2026-11-06
+  (`PEN-5367`), as an illustration of the cost rather than as a control: one body
+  naming two agents, NEITHER grantable by that author on that row, returned
+  `boundMentions: ["Cto", "Security"]` and `unboundMentions: []`, and its author
+  told one of them, in good faith, that they had been granted. The three code
   surfaces that describe the field — `packages/shared/src/project-mentions.ts`,
   `packages/shared/src/validators/issue.ts`, `packages/mcp-server/src/tools.ts` —
   now say "resolved", not "woken", and say explicitly that the field reports
