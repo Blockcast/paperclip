@@ -256,6 +256,16 @@ refuse_api_ready() {
 # boundary is a credential that is not the reviewer's (PEN-3193 Remediation #1);
 # this exists only until that lands, and should be deleted when it does.
 #
+# ── A known ceiling: GraphQL variables ───────────────────────────────────────
+# An approval whose event travels in a *variable* rather than in the mutation
+# text — `-f 'query=mutation($e:PullRequestReviewEvent!){… event:$e …}' -f
+# e=APPROVE`, or an `--input` payload with `"variables":{"e":"APPROVE"}` — is not
+# refused, because the value then sits under a caller-chosen name with nothing
+# tying it to an approval. Closing it means either parsing GraphQL or refusing
+# any field whose value is the bare word APPROVE, and the second is the false
+# positive this guard can least afford. Accepted: nobody reaches for a variable
+# by accident, and accidents are the whole threat model here.
+#
 # ── Why this is DISARMED by default ──────────────────────────────────────────
 # `/usr/bin/gh` in the agent image *is* this wrapper, and the reviewer agent runs
 # in that same image. The reviewer's own publisher
@@ -311,6 +321,15 @@ REVIEWER_EVIDENCE_APPROVAL_RE='^--approve$|event"?[[:blank:]]*[=:][[:blank:]]*"?
 # (`\"event\":\"APPROVE\"`), which this does not match either.
 REVIEWER_EVIDENCE_APPROVAL_JSON_RE='"event"[[:blank:]]*:[[:blank:]]*"approved?"'
 
+# A GraphQL mutation spells the event *unquoted* (`event:APPROVE`), so when one
+# travels in an `--input` payload's `query` member the JSON matcher above cannot
+# see it — and the generic matcher cannot simply be turned loose on the whole
+# payload, because that is what re-refuses prose in a sibling `body` member.
+# Anchoring on the mutation name separates them: every GraphQL approval names
+# `addPullRequestReview` or `submitPullRequestReview` ahead of its event, and a
+# REST comment payload has no `query` member at all for this to read.
+REVIEWER_EVIDENCE_APPROVAL_GQL_RE='pullrequestreview.*event"?[[:blank:]]*[=:][[:blank:]]*"?approved?([^a-z]|$)'
+
 reviewer_evidence_refusal() {
   echo "gh-token-wrapper: refusing to ${1} as \`allyblockcast[bot]\`: this run's GH_TOKEN is the Ally App installation token, so the write would publish under the identity the review gates credit as reviewer evidence (PEN-3193). You are the PR author here, not the reviewer. If you are the reviewer's own harness, set GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE=${REVIEWER_EVIDENCE_ESCAPE}." >&2
   exit 1
@@ -364,6 +383,50 @@ reviewer_evidence_bodies() {
   done
 }
 
+# True when one argv token is `gh pr review`'s approve flag in any spelling the
+# CLI accepts. Matching only the literal `--approve` left three ordinary ways to
+# approve by accident wide open, and approval is the strongest surface here.
+reviewer_evidence_is_approve_flag() {
+  ev_mode="$1"
+  case "${2}" in
+    --approve) return 0 ;;
+    # Cobra parses `--approve=<bool>` with strconv.ParseBool, so the value has to
+    # be read: `--approve=false` is explicitly NOT an approval, and refusing it
+    # would be a false positive of exactly the kind this guard pays most for.
+    --approve=*)
+      case "$(printf '%s' "${2#*=}" | tr '[:upper:]' '[:lower:]')" in
+        1 | t | true) return 0 ;;
+      esac
+      return 1
+      ;;
+    --*) return 1 ;;
+  esac
+  # The shorthands below are `gh pr review`'s. They are read ONLY in `pr` mode:
+  # `gh api` has no `-a`, and its own shorthands carry values that must never be
+  # read as a flag cluster — `-Hauthorization: …` would otherwise look like one.
+  [ "${ev_mode}" = pr ] || return 1
+  case "${2}" in
+    -[A-Za-z]*) ;;
+    *) return 1 ;;
+  esac
+  # `-a` is the documented short form, and pflag bundles boolean shorthands, so
+  # `-ab <body>` is `-a -b <body>`. Scan the cluster left to right and stop at
+  # the first shorthand that takes a value, because everything after it is that
+  # value rather than a flag — `-rb approve` is a request-changes review whose
+  # body happens to read "approve", not an approval.
+  ev_cluster="${2#-}"
+  while [ -n "${ev_cluster}" ]; do
+    ev_char="${ev_cluster%"${ev_cluster#?}"}"
+    ev_cluster="${ev_cluster#?}"
+    case "${ev_char}" in
+      a) return 0 ;;
+      # -b body, -F body-file, -R repo.
+      b | F | R) return 1 ;;
+    esac
+  done
+  return 1
+}
+
 # Emits only the places an approval *event* can legitimately travel: the
 # `--approve` flag, and — on `gh api` — the values of field flags and the body of
 # `--input`, which is where `event=APPROVE` and the GraphQL mutation text arrive.
@@ -379,12 +442,10 @@ reviewer_evidence_approval_tokens() {
   while [ "$#" -gt 0 ]; do
     a="$1"
     shift
-    case "${a}" in
-      --approve)
-        printf '%s\n' --approve
-        continue
-        ;;
-    esac
+    if reviewer_evidence_is_approve_flag "${mode}" "${a}"; then
+      printf '%s\n' --approve
+      continue
+    fi
     [ "${mode}" = api ] || continue
     v=""
     case "${a}" in
@@ -396,14 +457,19 @@ reviewer_evidence_approval_tokens() {
         ;;
       *) continue ;;
     esac
-    case "${v}" in body=*) continue ;; esac
-    printf '%s\n' "${v}"
+    case "${v}" in
+      body=*) continue ;;
+      # `reviewer_evidence_bodies` already dereferences `query=@file`; emitting
+      # the literal path here instead meant the mutation text was never read.
+      query=@*) reviewer_evidence_cat "${v#*=@}" ;;
+      *) printf '%s\n' "${v}" ;;
+    esac
   done
 }
 
 # The `--input` payloads, emitted separately because they are matched with the
 # stricter JSON pattern above.
-reviewer_evidence_approval_json() {
+reviewer_evidence_input_payloads() {
   while [ "$#" -gt 0 ]; do
     a="$1"
     shift
@@ -415,6 +481,15 @@ reviewer_evidence_approval_json() {
         ;;
     esac
   done
+}
+
+# The GraphQL document an `--input` payload carries in its `query` member, so
+# the mutation can be matched on its own rather than against the whole payload.
+# A JSON string cannot contain a literal newline, so a `query` value always
+# lands on one line and a line-wise extract is sufficient.
+reviewer_evidence_input_graphql() {
+  reviewer_evidence_input_payloads "$@" |
+    sed -n 's/.*"query"[[:blank:]]*:[[:blank:]]*"//p'
 }
 
 # `-` means stdin, which by this point lives in REVIEWER_EVIDENCE_STDIN. An
@@ -445,8 +520,12 @@ refuse_reviewer_evidence() {
     tr '[:upper:]' '[:lower:]' | grep -qE "${REVIEWER_EVIDENCE_APPROVAL_RE}"; then
     reviewer_evidence_refusal "submit an APPROVED pull-request review"
   fi
-  if [ "${mode}" = api ] && reviewer_evidence_approval_json "$@" |
+  if [ "${mode}" = api ] && reviewer_evidence_input_payloads "$@" |
     tr '[:upper:]' '[:lower:]' | grep -qE "${REVIEWER_EVIDENCE_APPROVAL_JSON_RE}"; then
+    reviewer_evidence_refusal "submit an APPROVED pull-request review"
+  fi
+  if [ "${mode}" = api ] && reviewer_evidence_input_graphql "$@" |
+    tr '[:upper:]' '[:lower:]' | grep -qE "${REVIEWER_EVIDENCE_APPROVAL_GQL_RE}"; then
     reviewer_evidence_refusal "submit an APPROVED pull-request review"
   fi
 
@@ -464,6 +543,10 @@ refuse_reviewer_evidence() {
 # its terminal stdin for prompts.
 REVIEWER_EVIDENCE_STDIN=''
 buffer_stdin_for_reviewer_evidence() {
+  # Nothing downstream reads the buffer unless the guard is armed, and the
+  # comments above `reviewer_evidence_armed` promise an unarmed seat pays
+  # nothing — so make that true here rather than only for the matching.
+  reviewer_evidence_armed || return 0
   for a in "$@"; do
     case "${a}" in
       - | @- | body=@- | query=@- | --body-file=- | --input=- | -F- | -f-) ;;
