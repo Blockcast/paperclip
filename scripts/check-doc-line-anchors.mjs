@@ -39,6 +39,12 @@
 //
 //   <!-- anchor-external: penstock-vault-node -->
 //
+// A region ends where the next directive begins, so a cross-repo aside in the middle
+// of a document needs a way to hand the rest of the file back. `<!-- anchor-local -->`
+// clears the context: qualified anchors below it resolve against this tree again, and
+// a bare one reports as having no file context rather than silently inheriting the
+// aside's repository.
+//
 // THE CONSTRUCT
 //
 // The construct is the code span the anchor points at: the nearest one on the same
@@ -57,8 +63,17 @@
 // within the cited lines. Matching is on the collapsed text rather than the raw
 // line so that a reformat which only rewraps a call does not report as drift.
 //
+// ATTRIBUTION
+//
+// A failure that is already present at the BASE is INHERITED: reported in full, never
+// fatal. One that is absent at the base was INTRODUCED here and fails the PR. Pass
+// --base <ref> to enable that comparison; without it every failure is fatal, which is
+// the right shape for a local run against one tree but not for a gate. See
+// attributeInherited below for why the distinction is load-bearing.
+//
 // Usage:
-//   check-doc-line-anchors.mjs [--root <dir>] [--glob <pattern>] [--fix] [--quiet]
+//   check-doc-line-anchors.mjs [--root <dir>] [--glob <pattern>] [--base <ref>]
+//                              [--fix] [--quiet]
 //
 // --fix rewrites a drifted line number in place when the construct occurs EXACTLY
 // ONCE in the file. An ambiguous construct is left alone and reported: picking one
@@ -68,11 +83,13 @@
 
 import { readFileSync, writeFileSync, existsSync, globSync } from "node:fs";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 
 const CODE_SPAN = /`([^`\n]+)`/g;
 const ANCHOR = /^([\w./-]*):(\d+)(?:-(\d+))?$/;
 const DIRECTIVE_FILE = /^\s*<!--\s*anchor-file:\s*(\S+?)\s*-->\s*$/;
 const DIRECTIVE_EXTERNAL = /^\s*<!--\s*anchor-external:\s*(.+?)\s*-->\s*$/;
+const DIRECTIVE_LOCAL = /^\s*<!--\s*anchor-local\s*-->\s*$/;
 const PATH_LIKE = /^(?:[\w./-]*\/)?[\w.-]+\.(?:ts|tsx|mjs|cjs|js|jsx|rs|go|py|sql|ya?ml|json|md|sh)$|^Dockerfile[\w.-]*$/;
 
 const collapse = (s) => s.replace(/\s+/g, " ").trim();
@@ -130,6 +147,7 @@ export function resolveConstruct(text, spans, index) {
 }
 
 export function parseDirective(line) {
+  if (DIRECTIVE_LOCAL.test(line)) return { path: null, external: null };
   const file = DIRECTIVE_FILE.exec(line);
   if (file) return { path: file[1], external: null };
   // `anchor-external` names the repository and NOT a path, deliberately. A section
@@ -272,6 +290,52 @@ const FAILING = new Set(["drifted", "ambiguous", "no-construct", "no-file-contex
 // entry drops it out of the manifest on its own.
 export const unverifiedKey = (f) => `${f.docPath}\t${f.anchor}\t${f.construct ?? ""}`;
 
+// ATTRIBUTION: an anchor fails the PR only when THIS PR is what stopped it resolving.
+//
+// Without that distinction the check is a repo-wide tripwire with a manual reset. Any
+// merged change that moves a cited file drifts an anchor on master, and from that
+// moment every open PR goes red in `policy` -- including PRs that touch neither the
+// document nor the source -- until someone lands a correction. This PR measured that
+// on itself before it was ever merged: four separate "heal N anchors master drifted
+// under this PR" commits, and then a merge-queue ejection (run 42209953505,
+// 2026-11-06) at a head whose anchors were correct when they were written and whose
+// code-owner sign-off had already been spent on that head. A gate that no PR can hold
+// green for the length of its own CI run is not a gate.
+//
+// A failing anchor is INTRODUCED -- and fatal -- in exactly two cases:
+//
+//   1. THIS PR TOUCHES THE CITED FILE. You moved the code, so you own the citation.
+//      This is the PEN-4932 case the check exists for: the PR moves `job-manifest.ts`
+//      and never opens the document.
+//   2. THIS PR TOUCHES THE DOCUMENT, and the anchor does not resolve against the
+//      BASE's copy of the source either -- so it is a number that was never right,
+//      not one the base moved out from under you.
+//
+// Everything else is INHERITED: the drift reached master by some other route. It is
+// printed in full on every run and `--fix` corrects the renumberable ones, but it does
+// not fail a PR that did not cause it and often cannot judge it.
+//
+// Case 2 is what makes the document's own PR survive its CI run. Its anchors are
+// checked against the base source, which does not move while the run is in flight;
+// a master commit landing mid-run moves the HEAD source only, and that is inherited.
+//
+// Head and base findings are matched by the anchor's byte offset in the document.
+// Both runs read the same document text -- only the source tree differs -- so the
+// offsets are identical by construction, and nothing has to be inferred from an
+// anchor's line number, which is the one part of it that drifts.
+export function attributeInherited(headFindings, baseSourceFindings, changed) {
+  const key = (f) => `${f.docPath}\t${f.start}`;
+  const resolvedAtBase = new Set(
+    baseSourceFindings.filter((f) => !FAILING.has(f.status)).map(key),
+  );
+  return headFindings.map((f) => {
+    if (!FAILING.has(f.status)) return f;
+    if (f.file && changed.has(f.file)) return f;
+    if (changed.has(f.docPath) && !resolvedAtBase.has(key(f))) return f;
+    return { ...f, inherited: true };
+  });
+}
+
 // `docs/security/**` predates this check by a year and carries anchors whose construct
 // cannot be inferred and has never been established -- PEN-1650 cites bare `Location:`
 // ranges, and issue-authorization-model.md's reason strings each occur at several sites
@@ -306,9 +370,11 @@ export function applyUnverified(findings, manifest, scannedDocs) {
   return { findings: out, stale };
 }
 
-function report(findings, { quiet, stale = [] }) {
+function report(findings, { quiet, stale = [], inheritedStale = [] }) {
   const count = (s) => findings.filter((f) => f.status === s).length;
-  const failures = findings.filter((f) => FAILING.has(f.status));
+  const failing = findings.filter((f) => FAILING.has(f.status));
+  const failures = failing.filter((f) => !f.inherited);
+  const inherited = failing.filter((f) => f.inherited);
 
   for (const key of stale) {
     const [doc, anchor, construct] = key.split("\t");
@@ -316,29 +382,46 @@ function report(findings, { quiet, stale = [] }) {
     console.error(`         this anchor now resolves, or no longer exists. Remove the entry.`);
   }
 
-  for (const f of failures) {
+  const explain = (f, prefix) => {
     const where = `${f.docPath}:${f.docLine}`;
     if (f.status === "drifted") {
       const actual = f.actual.length === 0
         ? "the construct is no longer in the file at all"
         : `now at ${f.actual.map((n) => `:${n}`).join(", ")}`;
-      console.error(`DRIFTED  ${where}  \`${f.anchor}\` -> ${f.file}`);
+      console.error(`${prefix}DRIFTED  ${where}  \`${f.anchor}\` -> ${f.file}`);
       console.error(`         construct \`${f.construct}\` is not in lines ${f.lo}-${f.hi}; ${actual}`);
     } else if (f.status === "ambiguous") {
-      console.error(`AMBIGUOUS  ${where}  \`${f.anchor}\` -> ${f.file}`);
+      console.error(`${prefix}AMBIGUOUS  ${where}  \`${f.anchor}\` -> ${f.file}`);
       console.error(
         `         construct \`${f.construct}\` is in lines ${f.lo}-${f.hi}, but occurs at ` +
           `${f.sites.length} sites (${f.sites.map((n) => `:${n}`).join(", ")}); a range must ` +
           `name a construct unique to the file. Pin it: \`${f.anchor}\` (\`<unique construct>\`)`,
       );
     } else if (f.status === "no-construct") {
-      console.error(`NO CONSTRUCT  ${where}  \`${f.anchor}\``);
+      console.error(`${prefix}NO CONSTRUCT  ${where}  \`${f.anchor}\``);
       console.error(`         nothing to assert. Annotate it: \`${f.anchor}\` (\`<symbol>\`)`);
     } else if (f.status === "no-file-context") {
-      console.error(`NO FILE  ${where}  \`${f.anchor}\``);
+      console.error(`${prefix}NO FILE  ${where}  \`${f.anchor}\``);
       console.error(`         a bare anchor needs <!-- anchor-file: <path> --> above it`);
     } else {
-      console.error(`MISSING FILE  ${where}  \`${f.anchor}\` -> ${f.file} does not exist`);
+      console.error(`${prefix}MISSING FILE  ${where}  \`${f.anchor}\` -> ${f.file} does not exist`);
+    }
+  };
+
+  for (const f of failures) explain(f, "");
+
+  // Printed in full and deliberately not fatal. These were already failing on the base,
+  // so this PR is not what broke them and is usually not the change that can judge them
+  // -- but leaving them silent is how the corpus rotted in the first place.
+  if (inherited.length > 0 || inheritedStale.length > 0) {
+    console.error(
+      `INHERITED (already failing on the base -- reported, not fatal; ` +
+        `\`node scripts/check-doc-line-anchors.mjs --fix\` corrects the renumberable ones):`,
+    );
+    for (const f of inherited) explain(f, "  ");
+    for (const key of inheritedStale) {
+      const [doc, anchor, construct] = key.split("\t");
+      console.error(`  STALE MANIFEST ENTRY  ${doc}  \`${anchor}\` (\`${construct}\`)`);
     }
   }
 
@@ -354,11 +437,52 @@ function report(findings, { quiet, stale = [] }) {
     console.log(
       `anchors: ${findings.length} total, ${count("ok")} resolved` +
         (loose > 0 ? ` (${loose} on a construct with several sites)` : "") +
-        `, ${failures.length} need attention, ${count("unverified")} unverified, ` +
-        `${externals.length} external`,
+        `, ${failures.length} need attention` +
+        (inherited.length > 0 ? `, ${inherited.length} inherited from the base` : "") +
+        `, ${count("unverified")} unverified, ${externals.length} external`,
     );
   }
   return failures.length + stale.length;
+}
+
+// Read one path as it stands at `ref`. Null when the path does not exist there, which
+// is how a document or a source file added by this PR reports: nothing to inherit.
+function readAtRef(ref, path, root) {
+  const r = spawnSync("git", ["show", `${ref}:${path}`], {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 256 * 1024 * 1024,
+  });
+  return r.status === 0 ? r.stdout : null;
+}
+
+// The same documents as the working tree, resolved against the source tree at `ref`.
+// The document text is deliberately the HEAD copy: the question this answers is "would
+// the anchors this PR is proposing have held against the tree it started from", which
+// is only meaningful about the anchors it is actually proposing.
+function collectAgainstBaseSource(ref, docs, root) {
+  const cache = new Map();
+  const readSource = (file) => {
+    if (!cache.has(file)) cache.set(file, readAtRef(ref, file, root));
+    return cache.get(file);
+  };
+  let out = [];
+  for (const rel of docs) {
+    const docText = readFileSync(join(root, rel), "utf8");
+    out = out.concat(checkDocument({ docPath: rel, docText, readSource }));
+  }
+  return out;
+}
+
+// The paths this PR changes, as `base...HEAD` -- three-dot, so a `merge_group` head
+// carrying master's own commits still reports only the PR's own files.
+function changedSince(ref, root) {
+  const r = spawnSync("git", ["diff", "--name-only", `${ref}...HEAD`], {
+    cwd: root,
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  return r.status === 0 ? new Set(r.stdout.split("\n").filter(Boolean)) : null;
 }
 
 function main(argv) {
@@ -372,6 +496,10 @@ function main(argv) {
   const fix = argv.includes("--fix");
   const quiet = argv.includes("--quiet");
   const writeManifest = argv.includes("--update-unverified");
+  // Empty is "no base": CI passes $PR_BASE_SHA straight through, and it is unset on
+  // event types that have no base. Absent a base every failure is fatal, which is the
+  // right shape for a local run against one tree.
+  const baseRef = arg("--base", "") || "";
 
   const docs = globSync(pattern, { cwd: root }).sort();
   if (docs.length === 0) {
@@ -424,8 +552,36 @@ function main(argv) {
   const manifest = existsSync(manifestPath)
     ? JSON.parse(readFileSync(manifestPath, "utf8"))
     : [];
-  const { findings, stale } = applyUnverified(all, manifest, docs);
-  return report(findings, { quiet, stale }) === 0 ? 0 : 1;
+
+  let attributed = all;
+  let inheritedStale = [];
+  if (baseRef) {
+    // A base that cannot be read would mark every inherited failure as introduced and
+    // fail the PR for drift it did not cause. Say so instead of judging on it.
+    const resolved = spawnSync("git", ["rev-parse", "--verify", `${baseRef}^{commit}`], {
+      cwd: root,
+      encoding: "utf8",
+    });
+    if (resolved.status !== 0) {
+      console.error(`cannot judge: --base ${baseRef} does not resolve in ${root}`);
+      console.error(`         the job needs the base commit on disk (fetch-depth: 0)`);
+      return 2;
+    }
+    const changed = changedSince(baseRef, root);
+    if (changed === null) {
+      console.error(`cannot judge: cannot diff ${baseRef}...HEAD in ${root}`);
+      return 2;
+    }
+    const baseSource = collectAgainstBaseSource(baseRef, docs, root);
+    attributed = attributeInherited(all, baseSource, changed);
+    inheritedStale = applyUnverified(baseSource, manifest, docs).stale.filter(
+      (k) => !changed.has(k.split("\t")[0]),
+    );
+  }
+
+  const { findings, stale } = applyUnverified(attributed, manifest, docs);
+  const introducedStale = stale.filter((k) => !inheritedStale.includes(k));
+  return report(findings, { quiet, stale: introducedStale, inheritedStale }) === 0 ? 0 : 1;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

@@ -440,6 +440,8 @@ the cluster**, so nothing would currently report trigger 4 firing in another pod
 on the §7.2 triggers is already permitted by §8 without further security review, and is the cheapest
 remaining improvement here.
 
+<!-- anchor-external: penstock-llm-proxy-core -->
+
 ⚠ **That re-take has since been owed twice, and taken once — so the "six windows" above is now seven
 (PEN-5663, 2026-11-05).** The egress-relevant surface changed on 2026-11-03 (`50aab1b9…`) and again on
 2026-11-05 (`83aef063…`), against the `d81423fe…` the six windows were taken on — a roughly
@@ -453,6 +455,8 @@ failure; ⛔ it is **not** a second firing of §7.2 trigger 4, because the instr
 invocation and the acceptance a firing would end has **already ended** (above); and 26-against-28 is
 **not** a shrinking class — the two numbers were taken on different surfaces under different workloads,
 which §4 says makes them incomparable in **both** directions.
+
+<!-- anchor-local -->
 
 ⚠ **Status, 2026-10-29 (PEN-4933):** D1 is **built** and merged behind a default-off rollout gate;
 see §7.3. The residual statement above still describes the deployed fleet — but it is **no longer
@@ -952,14 +956,14 @@ Four things a reader should not infer from that paragraph:
    a symlink to `scripts/gh-token-wrapper.sh` (`Dockerfile.runtime:53-55`
    (`ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh`)), and
    the decisive conjunct is its `TOKEN_FILE_REQUIRED`, set to `yes` **iff
-   `PAPERCLIP_GITHUB_TOKEN_FILE` is present in the environment** (`:887-888`
+   `PAPERCLIP_GITHUB_TOKEN_FILE` is present in the environment** (`:959-960`
    (`TOKEN_FILE_REQUIRED=yes`), tested with
    `${VAR+x}`, so set-empty counts). `auth git-credential` is not
-   in the exempt list that follows (`:894`
+   in the exempt list that follows (`:966`
    (`"auth setup-git" | "auth login") TOKEN_FILE_REQUIRED=no ;;`)), so with the variable set and the
-   file absent the wrapper reaches `reject_token_file "is absent"` (`:997`) and
+   file absent the wrapper reaches `reject_token_file "is absent"` (`:1069`) and
    exits non-zero. With the variable **unset** it falls through to
-   the unconditional `exec_real_gh "$@"` (`:1000`) that ends the wrapper, under
+   the unconditional `exec_real_gh "$@"` (`:1072`) that ends the wrapper, under
    whatever ambient auth exists.
    ⚠ That mechanism is now **asserted**, not merely probable — which was the
    whole of §5's objection to the paragraph above.

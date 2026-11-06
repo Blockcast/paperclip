@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   applyFixes,
   applyUnverified,
+  attributeInherited,
   checkDocument,
   locateConstruct,
   parseAnchorSpan,
@@ -325,10 +326,85 @@ test("resolveConstruct skips path-shaped spans when inferring", () => {
   assert.equal(resolveConstruct(text, spans, anchorIndex), "parseThing");
 });
 
-test("the real corpus is clean under the committed manifest", async () => {
-  // The detector is only worth running if it is green on master: a check that
-  // ships red is a check that gets ignored. This fails on a PR that drifts an
-  // enforced anchor -- including a PR that never opens the document.
+const failing = (f) => ["drifted", "ambiguous", "no-construct", "no-file-context", "missing-file"]
+  .includes(f.status);
+
+test("a failure the base already had is inherited, not this PR's", () => {
+  const head = [{ docPath: "d.md", start: 10, status: "drifted", file: "src/a.ts" }];
+  const base = [{ docPath: "d.md", start: 10, status: "drifted", file: "src/a.ts" }];
+  const [out] = attributeInherited(head, base, new Set(["unrelated.ts"]));
+  assert.equal(out.inherited, true);
+});
+
+test("touching the cited file owns the citation, even without opening the document", () => {
+  // The PEN-4932 case this check exists for: the PR moves the source and never
+  // opens the record that cites it.
+  const head = [{ docPath: "d.md", start: 10, status: "drifted", file: "src/a.ts" }];
+  const base = [{ docPath: "d.md", start: 10, status: "drifted", file: "src/a.ts" }];
+  const [out] = attributeInherited(head, base, new Set(["src/a.ts"]));
+  assert.equal(out.inherited, undefined);
+});
+
+test("an anchor this PR writes that never resolved is introduced", () => {
+  const head = [{ docPath: "d.md", start: 10, status: "drifted", file: "src/a.ts" }];
+  const base = [{ docPath: "d.md", start: 10, status: "drifted", file: "src/a.ts" }];
+  const [out] = attributeInherited(head, base, new Set(["d.md"]));
+  assert.equal(out.inherited, undefined);
+});
+
+test("an anchor that held against the base is inherited even when this PR edits the document", () => {
+  // The race that ejected this PR from the merge queue at a head whose anchors were
+  // correct when written: a master commit lands mid-run and moves the HEAD source
+  // only. The base source does not move, so the document's own PR stays green for
+  // the length of its CI run.
+  const head = [{ docPath: "d.md", start: 10, status: "drifted", file: "src/a.ts" }];
+  const base = [{ docPath: "d.md", start: 10, status: "ok", file: "src/a.ts" }];
+  const [out] = attributeInherited(head, base, new Set(["d.md"]));
+  assert.equal(out.inherited, true);
+});
+
+test("attribution leaves passing anchors alone", () => {
+  // The changed set is empty on purpose: every later branch would fall through to
+  // `inherited` here, so this pins the status guard itself rather than riding on one
+  // of the attribution branches returning first.
+  const head = [{ docPath: "d.md", start: 10, status: "ok", file: "src/a.ts" }];
+  const [out] = attributeInherited(head, [], new Set());
+  assert.equal(out.inherited, undefined);
+});
+
+test("anchor-local hands the document back to this tree", () => {
+  assert.deepEqual(parseDirective("<!-- anchor-local -->"), { path: null, external: null });
+
+  const doc = [
+    "<!-- anchor-external: other-repo -->",
+    "an aside citing `other/thing.rs:3`",
+    "<!-- anchor-local -->",
+    "back home: `parseThing` (`src/a.ts:2`)",
+  ].join("\n");
+  const f = check(doc);
+  assert.equal(f[0].status, "external");
+  assert.equal(f[1].status, "ok");
+});
+
+test("a bare anchor below anchor-local has no file context, rather than the aside's repo", () => {
+  const doc = [
+    "<!-- anchor-external: other-repo -->",
+    "<!-- anchor-local -->",
+    "`parseThing` (`:2`)",
+  ].join("\n");
+  assert.equal(only(doc).status, "no-file-context");
+});
+
+test("the real corpus still has anchors to check, and most of them are enforced", async () => {
+  // Deliberately NOT an assertion that the corpus is clean. That assertion is what
+  // the CI step makes, with `--base $PR_BASE_SHA`, so it can tell drift this PR
+  // caused from drift it inherited from master. Repeating it here without a base
+  // re-creates the tripwire: this suite runs in the same `policy` job, so a master
+  // commit moving a cited file would turn it red on every open PR -- which is the
+  // failure this PR was ejected from the merge queue by (run 42209953505).
+  //
+  // What is worth asserting here is the one thing a green run cannot distinguish
+  // itself from: a detector that has quietly stopped finding anything.
   const { readFileSync, existsSync, globSync } = await import("node:fs");
   const { fileURLToPath } = await import("node:url");
   const { dirname, join } = await import("node:path");
@@ -353,19 +429,15 @@ test("the real corpus is clean under the committed manifest", async () => {
   const manifest = JSON.parse(
     readFileSync(join(root, "scripts/doc-line-anchors.unverified.json"), "utf8"),
   );
-  const { findings, stale } = applyUnverified(all, manifest, docs);
-  const failing = findings.filter((f) =>
-    ["drifted", "no-construct", "no-file-context", "missing-file"].includes(f.status),
-  );
-  assert.deepEqual(
-    failing.map((f) => `${f.docPath}:${f.docLine} \`${f.anchor}\``),
-    [],
-  );
-  assert.deepEqual(stale, []);
-  // Guard the enforced population directly: were every anchor to land in the
-  // manifest the two assertions above would still pass, saying nothing.
+  const { findings } = applyUnverified(all, manifest, docs);
+  // Were every anchor to land in the manifest, or to be declared external, the
+  // checker would report clean while asserting nothing at all.
   assert.ok(
     findings.filter((f) => f.status === "ok").length >= 25,
     "too few anchors are actually enforced",
+  );
+  assert.ok(
+    findings.filter(failing).length < findings.length / 2,
+    "most of the corpus is failing; the checker is probably misreading it",
   );
 });

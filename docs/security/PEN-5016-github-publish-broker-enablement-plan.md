@@ -118,7 +118,8 @@ Write an anchor so the checker can assert it:
 - A bare `` `:NNN` `` needs a declared file, set by a comment that is invisible when rendered
   and holds until the next one: `<!-- anchor-file: server/src/services/heartbeat.ts -->`.
 - Anchors into another repository: `<!-- anchor-external: penstock-vault-node -->`. They are
-  reported and skipped, never silently passed.
+  reported and skipped, never silently passed. `<!-- anchor-local -->` ends that region and
+  hands the rest of the document back to this tree.
 
 Prefer a construct that occurs **once** in its file. A distinctive one makes the assertion
 sharp and lets `--fix` relocate the number for you; `null` is technically present at the
@@ -134,6 +135,16 @@ will catch the next drift.
 
 When a number drifts, run `node scripts/check-doc-line-anchors.mjs --fix` — it rewrites any
 anchor whose construct it can place unambiguously, and reports the rest rather than guessing.
+
+**A drift already on `master` does not fail your pull request.** CI passes `--base $PR_BASE_SHA`,
+and an anchor that was already failing against the base is reported as `INHERITED` rather than
+enforced; only an anchor this PR broke fails it — either because the PR touches the cited file,
+or because the PR writes an anchor that does not resolve against the base either. That is not a
+softening of the check: without it, one merged commit moving a cited file turns `policy` red on
+every open pull request, including the ones that touch neither the document nor the source, and
+the document's own correction cannot stay green for the length of its own CI run. This PR was
+ejected from the merge queue that way (run `42209953505`) at a head whose anchors were correct
+when they were written.
 
 ## 2. What the gate actually does
 
@@ -214,28 +225,28 @@ The chain, read at `47d01a4bf`:
 
 <!-- anchor-file: server/src/services/heartbeat.ts -->
 
-1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8654`
+1. `parseIssueAssigneeAdapterOverrides`, defined at `server/src/services/heartbeat.ts:8659`
    (`function parseIssueAssigneeAdapterOverrides(`), parses
    `issue.assigneeAdapterOverrides.adapterConfig` with `parseObject` and **no key allowlist** —
    arbitrary keys pass.
-2. `mergeModelProfileAdapterConfig`, defined at `:7418`
+2. `mergeModelProfileAdapterConfig`, defined at `:7423`
    (`export function mergeModelProfileAdapterConfig(input: {`), is a **shallow spread** with `issueAdapterConfig`
    **last**, so an issue override beats agent config for any top-level key.
-3. The merged object becomes `executionRunConfig` at `:36335`
+3. The merged object becomes `executionRunConfig` at `:36461`
    (`stripWorkspaceRuntimeFromExecutionRunConfig(mergedConfig)`) and reaches the adapter as `ctx.config`
    — the same object `buildJobManifest` reads the gate from.
-4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3102`
+4. The only provenance guard, `withAgentScopedEnvProvenance`, defined at `:3107`
    (`function withAgentScopedEnvProvenance(`), re-asserts agent values for
    `AGENT_SCOPE_ONLY_ENV_KEYS` — three keys, **inside `env`**. It does nothing for top-level
    `adapterConfig` keys.
 
 So `assigneeAdapterOverrides.adapterConfig.enableGitHubPublishBroker = false` on an issue assigned to
 the agent yields a pod with the credential back in the agent container. The overlay applies only when
-`issueContext.assigneeAgentId === agent.id` (`:35771`) — which is not a mitigation, since an agent can
+`issueContext.assigneeAgentId === agent.id` (`:35897`) — which is not a mitigation, since an agent can
 file an issue assigned to itself, and `paperclipCreateIssue` exposes `assigneeAdapterOverrides`
 directly.
 
-The code already knows this class of problem. The comment at `:3085`
+The code already knows this class of problem. The comment at `:3090`
 (`is issue.assigneeAdapterOverrides.adapterConfig.`) says it in as many words:
 
 > `issueAdapterConfig` is `issue.assigneeAdapterOverrides.adapterConfig`.
@@ -827,8 +838,8 @@ on PEN-5016 at 2026-10-29T20:23Z). It is written here so that it survives the th
 <!-- anchor-file: scripts/gh-token-wrapper.sh -->
 
 **Independently verified against `master` for this revision**, rather than carried on the CTO's word:
-`scripts/gh-token-wrapper.sh:887` guards the token-file path on `${PAPERCLIP_GITHUB_TOKEN_FILE+x}`
-being set, and `:1000` is an unconditional `exec_real_gh "$@"` fallthrough. With the variable unset
+`scripts/gh-token-wrapper.sh:959` guards the token-file path on `${PAPERCLIP_GITHUB_TOKEN_FILE+x}`
+being set, and `:1072` is an unconditional `exec_real_gh "$@"` fallthrough. With the variable unset
 the wrapper execs the real `gh` under whatever ambient auth exists, and both fallbacks §5 names are
 live again.
 
@@ -983,12 +994,12 @@ precondition as outstanding, which is the *conservative* direction but still wro
 distinction matters: #3112's content reached `master` through #3123 and #3133 while #3112 itself was
 closed unmerged. A ledger that reads `merged` as the discharge condition would call this row
 outstanding forever. Re-verified at source on `47d01a4bf` — `AGENT_SCOPE_ONLY_CONFIG_KEYS`
-(`server/src/services/heartbeat.ts:3151`
+(`server/src/services/heartbeat.ts:3156`
 (`const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([`)), `withAgentScopedConfigProvenance`
-(defined `server/src/services/heartbeat.ts:3316`
-(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7428`
+(defined `server/src/services/heartbeat.ts:3321`
+(`function withAgentScopedConfigProvenance(`), applied `server/src/services/heartbeat.ts:7433`
 (`return withAgentScopedConfigProvenance(`)), `BROKERED_POD_COMPOSITION_CONFIG_KEYS`
-(`server/src/services/heartbeat.ts:3254`
+(`server/src/services/heartbeat.ts:3259`
 (`const BROKERED_POD_COMPOSITION_CONFIG_KEYS = new Set([`), three keys),
 `vendor/paperclip-adapter-claude-k8s/src/server/config-schema.ts:216`
 (`key: "enableGitHubPublishBroker"`) — **not** from the closing
