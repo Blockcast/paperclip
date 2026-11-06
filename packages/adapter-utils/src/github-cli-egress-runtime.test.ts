@@ -402,6 +402,7 @@ describe("PEN-5734: a rewrite is announced, never silent", () => {
     // Both halves of the fix in one assertion: the mandated form is no longer
     // rewritten, so there is nothing to announce.
     const branch = ["chore", "/", "PEN-5215-lock-holder-notes-and-render-guards"].join("");
+    // paperclip:allow-git-push: fixture text only — a recipe STRING handed to the egress runtime as input to assert it is NOT rewritten. Never executed; no remote is contacted.
     const recipe = `git push ${["--force-with-lease", `${branch}:ff113077`].join("=")}`;
 
     const { notices, result } = captureNotices(["pr", "edit", "3055", "--body", recipe]);
