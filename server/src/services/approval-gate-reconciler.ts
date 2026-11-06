@@ -35,6 +35,7 @@
  *     `payload.title` are invisible to it by construction; that is why
  *     `payload.gate` exists.
  */
+import { isDeepStrictEqual } from "node:util";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvals, issueApprovals, issueComments } from "@paperclipai/db";
@@ -286,6 +287,48 @@ export function classifyGateLookup(lookup: WorkflowRunLookup): GateDisposition {
     satisfied,
     url: lookup.htmlUrl,
   };
+}
+
+/**
+ * Is the gate a caller resent the SAME gate the card already carries?
+ *
+ * Structural, never textual, and that distinction is the whole reason this
+ * function exists rather than a `JSON.stringify` comparison at the call site.
+ *
+ * `approvals.payload` is a **jsonb** column, and Postgres does not preserve object
+ * key order in jsonb: it stores keys sorted shortest-first, then bytewise. A
+ * `github_pr_merged` gate written as `{kind, repoFullName, prNumber, url}`
+ * therefore reads back as `{url, kind, prNumber, repoFullName}`. The submitted side
+ * has been through `approvalGateSchema` (zod emits keys in shape order), so the two
+ * renderings of identical data never match as strings. Compared textually, EVERY
+ * edit to a gated card is refused with `approval_payload_gate_immutable` — and the
+ * refusal body prints a `storedGate` and a `submittedGate` with identical contents,
+ * so the caller is told to resend what it just sent. Gated cards are exactly the
+ * merge and deploy asks `PATCH /approvals/:id` exists to serve, so that failure
+ * takes out the route's main use case while every mocked route test passes, because
+ * a mock returns a JS literal in shape order and never goes through jsonb.
+ *
+ * `isDeepStrictEqual` ignores key order, which is the fix. The JSON round-trip in
+ * front of it drops `undefined`-valued keys — a zod-parsed optional can carry one
+ * and a jsonb read never can, and `isDeepStrictEqual` would call those unequal too.
+ * It is deliberately total over malformed gates: rows written before `gate` was
+ * validated on create may hold an arbitrary value under that key, and the edit
+ * route must be able to say "unchanged" about one of those rather than throw.
+ */
+export function approvalGatesEquivalent(a: unknown, b: unknown): boolean {
+  return isDeepStrictEqual(normalizeGateForComparison(a), normalizeGateForComparison(b));
+}
+
+function normalizeGateForComparison(gate: unknown): unknown {
+  if (gate === undefined || gate === null) return null;
+  try {
+    return JSON.parse(JSON.stringify(gate)) as unknown;
+  } catch {
+    // Unserializable (a cycle, a BigInt). Compare the value itself rather than
+    // failing the request: worst case this reports "changed" for a gate no create
+    // could have persisted anyway, which refuses rather than waves through.
+    return gate;
+  }
 }
 
 /**

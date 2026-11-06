@@ -31,6 +31,7 @@
 import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { asStoredGate, LIVE_GATE } from "./helpers/approval-gate-fixtures.js";
 
 const mockApprovalService = vi.hoisted(() => ({
   list: vi.fn(),
@@ -135,11 +136,6 @@ async function createAppWithActor(actor: Record<string, unknown>) {
   return app;
 }
 
-const LIVE_GATE = {
-  kind: "github_pr_merged" as const,
-  repoFullName: "Blockcast/paperclip",
-  prNumber: 2958,
-};
 
 function pendingApproval(overrides: Record<string, unknown> = {}) {
   return {
@@ -248,7 +244,7 @@ describe("PATCH /approvals/:id", () => {
 
   it("refuses an edit that CHANGES the gate, because the gate is the retirement contract", async () => {
     mockApprovalService.getById.mockResolvedValue(
-      pendingApproval({ payload: { title: "merge #2958", gate: LIVE_GATE } }),
+      pendingApproval({ payload: { title: "merge #2958", gate: asStoredGate(LIVE_GATE) } }),
     );
 
     const res = await patchPayload(await createAppWithActor(agentActor(REQUESTER_AGENT_ID)), {
@@ -266,7 +262,7 @@ describe("PATCH /approvals/:id", () => {
     // not get a 200 for an operation that did not happen. That is the same class of
     // correct-looking-but-wrong artifact this whole row exists to remove.
     mockApprovalService.getById.mockResolvedValue(
-      pendingApproval({ payload: { title: "merge #2958", gate: LIVE_GATE } }),
+      pendingApproval({ payload: { title: "merge #2958", gate: asStoredGate(LIVE_GATE) } }),
     );
 
     const res = await patchPayload(await createAppWithActor(agentActor(REQUESTER_AGENT_ID)), {
@@ -279,8 +275,15 @@ describe("PATCH /approvals/:id", () => {
     expect(mockApprovalService.updatePayload).not.toHaveBeenCalled();
   }, 15000);
 
-  it("accepts an edit that resends the stored gate byte-identically", async () => {
-    const stored = { title: "merge #2958", gate: LIVE_GATE };
+  it("⭐ accepts an edit that resends the stored gate, which jsonb hands back REORDERED", async () => {
+    // Not "byte-identically", which is what this case used to claim and why it
+    // passed against a guard that refused every real edit to a gated card. The
+    // stored side goes through `asStoredGate` because `payload` is jsonb and
+    // Postgres sorts jsonb keys shortest-first, so no stored gate is ever in the
+    // shape order zod emits. The guard must compare STRUCTURE (Ally, PR 3456);
+    // `approval-payload-edit-service.test.ts` pins that key order against a real
+    // database, so this fixture cannot drift away from what a card actually holds.
+    const stored = { title: "merge #2958", gate: asStoredGate(LIVE_GATE) };
     mockApprovalService.getById.mockResolvedValue(pendingApproval({ payload: stored }));
     mockApprovalService.updatePayload.mockResolvedValue(
       pendingApproval({ payload: { ...stored, title: "merge #2958 (rebased)" }, payloadRevision: 1 }),
@@ -329,7 +332,7 @@ describe("PATCH /approvals/:id", () => {
     // keep pointing at it: an edit must not be able to land a payload a create
     // would have turned away.
     mockApprovalService.getById.mockResolvedValue(
-      pendingApproval({ payload: { title: "merge #2958", gate: LIVE_GATE } }),
+      pendingApproval({ payload: { title: "merge #2958", gate: asStoredGate(LIVE_GATE) } }),
     );
     mockGetPullRequestGate.mockResolvedValue({ state: "closed", merged: true });
 
@@ -340,6 +343,63 @@ describe("PATCH /approvals/:id", () => {
 
     expect(res.status).toBe(422);
     expect(res.body.details.code).toBe("approval_gate_already_terminal");
+    expect(mockApprovalService.updatePayload).not.toHaveBeenCalled();
+  }, 15000);
+
+  it("re-stamps a hire card's agent binding onto an edit that omits it", async () => {
+    // `payload` REPLACES the stored payload wholesale, so an edit that merely omits
+    // `agentId` passes the binding guard (which only refuses a MOVED binding) and
+    // then drops the binding out of the persisted payload — `agentService` reads
+    // `payload.agentId` as a fallback. `resubmit` already re-stamps it; an edit is
+    // no different (Ally, PR 3456).
+    const LINKED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+    mockApprovalService.getById.mockResolvedValue(
+      pendingApproval({
+        type: "hire_agent",
+        linkedAgentId: LINKED_AGENT_ID,
+        payload: { title: "hire a platform engineer", agentId: LINKED_AGENT_ID },
+      }),
+    );
+    // The secrets normalizer is a pass-through here: what is under test is the
+    // re-stamp that runs after it, not the normalization itself.
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockImplementation(
+      async (_companyId: string, payload: Record<string, unknown>) => payload,
+    );
+    mockApprovalService.updatePayload.mockResolvedValue(
+      pendingApproval({ type: "hire_agent", payloadRevision: 1 }),
+    );
+
+    const res = await patchPayload(await createAppWithActor(agentActor(REQUESTER_AGENT_ID)), {
+      title: "hire a platform engineer — scope narrowed to the approvals surface",
+    });
+
+    expect(res.status).toBe(200);
+    expect(mockApprovalService.updatePayload).toHaveBeenCalledWith(
+      "approval-1",
+      expect.objectContaining({ agentId: LINKED_AGENT_ID }),
+      { agentId: REQUESTER_AGENT_ID, userId: null },
+    );
+  }, 15000);
+
+  it("still refuses a hire edit that re-points the agent binding", async () => {
+    const LINKED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
+    mockApprovalService.getById.mockResolvedValue(
+      pendingApproval({
+        type: "hire_agent",
+        linkedAgentId: LINKED_AGENT_ID,
+        payload: { title: "hire a platform engineer", agentId: LINKED_AGENT_ID },
+      }),
+    );
+    mockSecretService.normalizeHireApprovalPayloadForPersistence.mockImplementation(
+      async (_companyId: string, payload: Record<string, unknown>) => payload,
+    );
+
+    const res = await patchPayload(await createAppWithActor(agentActor(REQUESTER_AGENT_ID)), {
+      title: "hire a platform engineer",
+      agentId: "44444444-4444-4444-8444-444444444444",
+    });
+
+    expect(res.status).toBe(422);
     expect(mockApprovalService.updatePayload).not.toHaveBeenCalled();
   }, 15000);
 

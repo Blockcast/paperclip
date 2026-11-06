@@ -26,6 +26,12 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vites
 import { eq } from "drizzle-orm";
 import { approvalPayloadRevisions, approvals, companies, createDb } from "@paperclipai/db";
 import { approvalService } from "../services/approvals.js";
+import { approvalGatesEquivalent } from "../services/approval-gate-reconciler.js";
+import {
+  asStoredGate,
+  JSONB_GATE_KEY_ORDER,
+  LIVE_GATE,
+} from "./helpers/approval-gate-fixtures.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -192,5 +198,124 @@ describeEmbeddedPostgres("approvalService.updatePayload", () => {
     expect(updated.decidedAt).toBeNull();
     expect(updated.decidedByUserId).toBeNull();
     expect(updated.decisionNote).toBeNull();
+  }, 60_000);
+  /**
+   * ⭐ The review finding this suite existed to be unable to catch (Ally, PR 3456).
+   *
+   * The gate-immutability guard in `routes/approvals.ts` used to compare the stored
+   * gate with the submitted one using `JSON.stringify`, which is key-order
+   * sensitive. `payload` is jsonb and Postgres does not keep key order in jsonb, so
+   * the two sides come back in DIFFERENT orders and the strings never match: every
+   * edit to a gated card was refused `approval_payload_gate_immutable`, and the
+   * refusal printed a `storedGate` and a `submittedGate` with identical contents.
+   * Gated cards are the merge and deploy asks the route exists to serve.
+   *
+   * The route suite could not see it — its service is mocked, so its stored gate
+   * was a JS literal in shape order, which no stored card can ever be in. This is
+   * the test that goes through the column.
+   */
+  it("⭐ a gate survives a jsonb round-trip REORDERED, and the guard still calls it unchanged", async () => {
+    const companyId = await seedCompany();
+    const id = randomUUID();
+    await db.insert(approvals).values({
+      id,
+      companyId,
+      type: "request_board_approval",
+      status: "pending",
+      payload: { title: "merge #2958", gate: LIVE_GATE },
+      createdAt: new Date("2026-11-04T09:36:00.000Z"),
+      updatedAt: new Date("2026-11-04T09:36:00.000Z"),
+    });
+
+    const stored = await approvalService(db).getById(id);
+    const storedGate = (stored!.payload as Record<string, unknown>).gate as Record<string, unknown>;
+
+    // 1. The mechanism, measured rather than assumed. If Postgres ever stops doing
+    //    this, THIS is the assertion that should fail — and `JSONB_GATE_KEY_ORDER`
+    //    is what the route suite's fixture is built from, so the two stay in step.
+    expect(Object.keys(storedGate)).toEqual(JSONB_GATE_KEY_ORDER);
+    expect(Object.keys(storedGate)).not.toEqual(Object.keys(LIVE_GATE));
+    expect(asStoredGate(LIVE_GATE)).toEqual(storedGate);
+
+    // 2. The defect, pinned exactly: the old textual comparison called a resent
+    //    identical gate "changed".
+    expect(JSON.stringify(storedGate)).not.toBe(JSON.stringify(LIVE_GATE));
+
+    // 3. The fix: same data, so the guard must let it through — while still
+    //    refusing a gate that genuinely names a different pull request.
+    expect(approvalGatesEquivalent(LIVE_GATE, storedGate)).toBe(true);
+    expect(approvalGatesEquivalent({ ...LIVE_GATE, prNumber: 9999 }, storedGate)).toBe(false);
+    expect(approvalGatesEquivalent(null, storedGate)).toBe(false);
+
+    // 4. And end to end: the edit the route would now forward actually lands,
+    //    carrying the gate unchanged.
+    const updated = await approvalService(db).updatePayload(
+      id,
+      { title: "merge #2958 — 5 red checks are the refused legacy arm", gate: LIVE_GATE },
+      editor,
+    );
+    expect(updated.payloadRevision).toBe(1);
+    expect((updated.payload as Record<string, unknown>).gate).toEqual(LIVE_GATE);
+  }, 60_000);
+
+  /**
+   * The archive INSERT runs before the guarded UPDATE, so the LOSER of two
+   * concurrent edits at the same revision never reaches that guard: it blocks on
+   * `approval_payload_revisions_approval_revision_unique_idx` and fails `23505`.
+   * `23505` is not a transient SQLSTATE, so unhandled it reached the caller as a
+   * bare 500 — "the server is broken" instead of "re-read the card and retry"
+   * (Ally, PR 3456).
+   *
+   * Simulated deterministically by pre-claiming the revision-0 archive row, which
+   * is exactly the state the loser's stale read leaves it in. A timing-dependent
+   * version of this cannot be made to fail reliably.
+   */
+  it("reports a lost archive race as a 409, not as a 500", async () => {
+    const companyId = await seedCompany();
+    const id = await seedApproval(companyId, new Date("2026-11-04T09:36:00.000Z"), "Fully green");
+
+    await db.insert(approvalPayloadRevisions).values({
+      companyId,
+      approvalId: id,
+      revision: 0,
+      payload: { title: "claimed by the edit that won the race" },
+      editedByAgentId: null,
+      editedByUserId: null,
+    });
+
+    await expect(
+      approvalService(db).updatePayload(id, { title: "corrected" }, editor),
+    ).rejects.toMatchObject({ status: 409 });
+
+    // The refusal rolled back: no second archive row, and the card is untouched.
+    const revisions = await db
+      .select()
+      .from(approvalPayloadRevisions)
+      .where(eq(approvalPayloadRevisions.approvalId, id));
+    expect(revisions).toHaveLength(1);
+    const [row] = await db.select().from(approvals).where(eq(approvals.id, id));
+    expect(row.payloadRevision).toBe(0);
+    expect(row.payload).toEqual({ title: "Fully green" });
+  }, 60_000);
+
+  it("never surfaces a raw unique-violation from two genuinely concurrent edits", async () => {
+    // Both orderings are legitimate — if the second transaction reads after the
+    // first commits it simply edits revision 1 — so this asserts the only thing
+    // that is true either way: nothing escapes as an unmapped 5xx.
+    const companyId = await seedCompany();
+    const id = await seedApproval(companyId, new Date("2026-11-04T09:36:00.000Z"), "Fully green");
+
+    const svc = approvalService(db);
+    const results = await Promise.allSettled([
+      svc.updatePayload(id, { title: "corrected by A" }, editor),
+      svc.updatePayload(id, { title: "corrected by B" }, editor),
+    ]);
+
+    expect(results.some((r) => r.status === "fulfilled")).toBe(true);
+    for (const result of results) {
+      if (result.status === "rejected") {
+        expect(result.reason).toMatchObject({ status: 409 });
+      }
+    }
   }, 60_000);
 });
