@@ -4,12 +4,16 @@ import { fileURLToPath } from "node:url";
 
 import {
   admitsNothingEvaluated,
+  classifyAuditedContext,
   findPrViolations,
   findViolations,
   isMainModule,
   isReviewNamespacedContext,
+  parseGateContexts,
   statusesAsOfMerge,
+  summarizeViolations,
   violatingPrCount,
+  violationsBySurface,
 } from "./check-comment-review-gate-census.mjs";
 
 const HEAD = "a".repeat(40);
@@ -149,11 +153,44 @@ describe("findPrViolations", () => {
 
     assert.equal(violations.length, 1);
     assert.equal(violations[0].context, "review/ally-comment");
+    assert.equal(violations[0].surface, "review-namespace");
     assert.match(violations[0].detail, /green at merge while admitting/);
   });
 
-  it("does not flag the same verdict outside the review/ namespace", () => {
-    assert.deepEqual(findPrViolations(pr([status({ context: "gate/ally-comment-findings" })])), []);
+  // PEN-5781. THIS ASSERTION USED TO READ THE OTHER WAY — "does not flag the
+  // same verdict outside the review/ namespace" — and that is how the blindness
+  // survived review: the census's scope was pinned to the namespace the gate had
+  // already been moved OUT of (BLO-33657), so the one context that actually gates
+  // merge was asserted to be invisible.
+  //
+  // Measured 2026-11-06 over the 12 most recently merged PRs on Blockcast/paperclip:
+  // the old predicate found 10 violations, every one of them the retired mirror,
+  // and none on `gate/ally-comment-findings` — then the SOLE ruleset-required
+  // status context on master (ruleset 25827389).
+  it("flags the same verdict on the required gate context, outside review/", () => {
+    const violations = findPrViolations(pr([status({ context: "gate/ally-comment-findings" })]));
+
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].context, "gate/ally-comment-findings");
+    assert.equal(violations[0].surface, "required-gate");
+  });
+
+  // The rename tripwire. A context in neither audited set still counts, so the
+  // next rename cannot make this census silent again — only mislabel the bucket.
+  it("flags a renamed context it has never heard of, as unclassified", () => {
+    const violations = findPrViolations(pr([status({ context: "verify/ally-findings-v2" })]));
+
+    assert.equal(violations.length, 1);
+    assert.equal(violations[0].surface, "unclassified");
+  });
+
+  it("still requires this gate's own wording, whatever the context is called", () => {
+    assert.deepEqual(
+      findPrViolations(
+        pr([status({ context: "ci/some-other-system", description: "Build succeeded." })]),
+      ),
+      [],
+    );
   });
 
   it("does not flag a non-green state, nor a reviewed-and-clean green", () => {
@@ -200,6 +237,12 @@ describe("findPrViolations", () => {
 
     assert.equal(violations.length, 1);
     assert.equal(violations[0].context, "review/ally-comment");
+    // PEN-5781 done-when #2, decided: the retirement row STAYS a violation.
+    // BLO-34742 worded it to trip this pattern on purpose ("the retired mirror
+    // of a not-evaluated verdict always was one"), so it is not reclassified as
+    // benign here. It is bucketed apart from the required gate instead, because
+    // it MIRRORS that verdict rather than being an independent instance.
+    assert.equal(violations[0].surface, "review-namespace");
   });
 
   it("does not flag the retired mirror of a clean verdict", () => {
@@ -243,6 +286,96 @@ describe("violatingPrCount", () => {
   it("is zero for an empty or missing list", () => {
     assert.equal(violatingPrCount([]), 0);
     assert.equal(violatingPrCount(undefined), 0);
+  });
+});
+
+describe("classifyAuditedContext", () => {
+  it("separates the required gate from the review/ namespace", () => {
+    assert.equal(classifyAuditedContext("gate/ally-comment-findings"), "required-gate");
+    assert.equal(classifyAuditedContext("  Gate/Ally-Comment-Findings "), "required-gate");
+    assert.equal(classifyAuditedContext("review/ally-comment"), "review-namespace");
+    assert.equal(classifyAuditedContext("review/ally-complete"), "review-namespace");
+  });
+
+  it("falls back to unclassified rather than to silence", () => {
+    assert.equal(classifyAuditedContext("verify"), "unclassified");
+    assert.equal(classifyAuditedContext("reviewer/ally"), "unclassified");
+    assert.equal(classifyAuditedContext(undefined), "unclassified");
+  });
+
+  it("honours an operator-supplied gate context set", () => {
+    const contexts = parseGateContexts("gate/renamed-findings");
+    assert.equal(classifyAuditedContext("gate/renamed-findings", contexts), "required-gate");
+    // The old name is not silently retained; it degrades to the tripwire bucket.
+    assert.equal(classifyAuditedContext("gate/ally-comment-findings", contexts), "unclassified");
+  });
+});
+
+describe("parseGateContexts", () => {
+  it("defaults to the pinned live context when unset or blank", () => {
+    for (const raw of [undefined, null, "", "   ", ",, ,"]) {
+      assert.deepEqual([...parseGateContexts(raw)], ["gate/ally-comment-findings"]);
+    }
+  });
+
+  it("parses, trims and lowercases a comma-separated override", () => {
+    assert.deepEqual(
+      [...parseGateContexts(" Gate/One , gate/two ")],
+      ["gate/one", "gate/two"],
+    );
+  });
+});
+
+describe("violationsBySurface", () => {
+  // The reason this exists rather than a single total: on today's deployment
+  // every not-evaluated PR emits BOTH rows, so summing the buckets reports
+  // twice as many PRs in trouble as there are.
+  it("counts PRs per surface without summing the mirror into the gate", () => {
+    const rows = findViolations([
+      pr([status(), status({ context: "gate/ally-comment-findings" })]),
+      pr([status(), status({ context: "gate/ally-comment-findings" })], { number: 1390 }),
+    ]);
+
+    const bySurface = violationsBySurface(rows);
+    assert.equal(rows.length, 4);
+    assert.equal(violatingPrCount(rows), 2);
+    assert.equal(bySurface.get("required-gate").prs.size, 2);
+    assert.equal(bySurface.get("review-namespace").prs.size, 2);
+  });
+
+  it("is empty for an empty or missing list", () => {
+    assert.equal(violationsBySurface([]).size, 0);
+    assert.equal(violationsBySurface(undefined).size, 0);
+  });
+});
+
+describe("summarizeViolations", () => {
+  // The property the scheduled job depends on: the rename tripwire is readable
+  // on its own, so the job can red on it WITHOUT redding on the known-open
+  // PEN-5565 population and becoming a permanently-red auditor (PEN-2847).
+  it("reports the rename bucket separately from the known-open populations", () => {
+    const rows = findViolations([
+      pr([status(), status({ context: "gate/ally-comment-findings" })]),
+      pr([status({ context: "verify/ally-findings-v2" })], { number: 1390 }),
+    ]);
+
+    const summary = summarizeViolations(rows, 12);
+    assert.equal(summary.prsExamined, 12);
+    assert.equal(summary.violatingPrs, 2);
+    assert.equal(summary.surfaces["required-gate"].prs, 1);
+    assert.equal(summary.surfaces["review-namespace"].prs, 1);
+    assert.equal(summary.unclassifiedPrs, 1);
+  });
+
+  it("reports zero rename instances when every context is recognized", () => {
+    const rows = findViolations([pr([status(), status({ context: "gate/ally-comment-findings" })])]);
+
+    assert.equal(summarizeViolations(rows, 12).unclassifiedPrs, 0);
+  });
+
+  it("is well-formed for a clean census", () => {
+    const summary = summarizeViolations([], 60);
+    assert.deepEqual(summary, { prsExamined: 60, violatingPrs: 0, surfaces: {}, unclassifiedPrs: 0 });
   });
 });
 

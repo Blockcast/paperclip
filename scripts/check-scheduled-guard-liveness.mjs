@@ -200,6 +200,38 @@ export const WATCHED_GUARDS = [
     graceUntil: "2026-10-03T00:00:00.000Z",
   },
 
+  // PEN-5781. Daily (cron "37 6 * * *") on `arc-paperclip-light`. Runs the
+  // BLO-29711 comment-review-gate census against Blockcast/paperclip — the
+  // check that no merged PR carries a green status admitting nothing reviewed
+  // the head.
+  //
+  // WATCHING IT IS THE SECOND HALF OF ITS OWN FIX. The census shipped with zero
+  // live invocations and nobody noticed, because PEN-3281's detector watches
+  // guards that STOP and this one never started. A guard that is scheduled but
+  // unwatched can regress to exactly that state silently, so the schedule and
+  // this entry are deliberately one change.
+  //
+  // The 48h bar is INHERITED from master-health.yml, not re-derived: it is the
+  // only other daily guard on this repo, and 48h is 2x the period, which
+  // tolerates one dropped dispatch and reds on two. Re-derive by this file's
+  // normal method once ~30 real gaps exist. If this census's distribution turns
+  // out wider than master-health's it will false-red first and loudly, which is
+  // the right direction to be wrong in.
+  //
+  // graceUntil, same fail-closed reasoning as master-health above: a schedule
+  // fires only from the default branch, so this guard has zero completed runs
+  // at merge BY CONSTRUCTION and would otherwise be red-by-design on day one —
+  // noise sitting on top of a shared alarm. The date is the first cron after an
+  // expected merge (2026-11-07T06:37Z) plus two full cycles of slack. If the
+  // merge slips past it the grace is already expired and this reds honestly
+  // rather than silently.
+  {
+    workflow: "comment-review-gate-census.yml",
+    staleHours: 48,
+    event: "schedule",
+    graceUntil: "2026-11-10T00:00:00.000Z",
+  },
+
   // BLO-26736. Twice daily (cron "29 7,19"), so it takes the same 16h bar as
   // the other twice-daily guard above rather than the hourly 2.75h one. The bar
   // is INHERITED, not re-derived: this workflow has no gap history of its own
