@@ -230,7 +230,7 @@ async function normalizePolicy(input: {
   return normalizeIssueExecutionPolicy(input);
 }
 
-function makeIssue(status: "todo" | "done" | "blocked" | "cancelled" | "in_progress") {
+function makeIssue(status: "todo" | "done" | "blocked" | "cancelled" | "in_progress" | "backlog") {
   return {
     id: "11111111-1111-4111-8111-111111111111",
     companyId: "company-1",
@@ -2049,6 +2049,100 @@ describe.sequential("issue comment reopen routes", () => {
           mutation: "update",
         }),
       }),
+    ));
+  });
+
+  // PEN-5776: the `issue_status_changed` arm carried no park term, so a PATCH that
+  // reopened a row and parked it in the same write dispatched a run onto that row ~1 s
+  // later and the park was defeated by the write that created it.
+  it("defers the status-change wake to the park deadline when the row is parked", async () => {
+    const parkedUntil = new Date(Date.now() + 60 * 60 * 1000);
+    const issue = { ...makeIssue("blocked"), parkedUntil };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(200);
+    // Allow any deferred wakeup task to flush before asserting it never fired.
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_status_changed" }),
+    );
+  });
+
+  // The suppression must not outlive the park, or the deferral becomes a drop.
+  it("wakes the assignee when the park has already lapsed", async () => {
+    const issue = { ...makeIssue("blocked"), parkedUntil: new Date(Date.now() - 60 * 1000) };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_status_changed" }),
+    ));
+  });
+
+  // The deferral is only sound where the deadline will pick the row back up.
+  // `blocked` is excluded from ISSUE_PARK_EXPIRY_WAKE_STATUSES (PEN-5291), so deferring
+  // here would strand the row rather than defer it.
+  it("wakes a parked row whose new status is outside the park-expiry sweep", async () => {
+    const issue = { ...makeIssue("backlog"), parkedUntil: new Date(Date.now() + 60 * 60 * 1000) };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "blocked" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_status_changed" }),
+    ));
+  });
+
+  // PEN-5776 box 3: the absence of an AUTHOR term on this arm is deliberate, and this
+  // test pins it. A seat is not a run — the run that writes the transition is normally
+  // exiting, and the new run is how the seat acts on it. The comment arm takes the same
+  // position by bypassing its own `selfComment` guard when `reopened` is true.
+  it("wakes the assignee on a self-authored reopen (no author predicate, by design)", async () => {
+    const issue = makeIssue("done");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await installActor(createApp(), agentActor()))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ status: "todo" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_status_changed" }),
     ));
   });
 

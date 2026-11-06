@@ -1,9 +1,9 @@
 /**
  * PEN-4420: the deliberate park's RELEASE edge.
  *
- * `parked_until` (BLO-27912 / migration 0222) is read in five places, and all of them read
- * it to SUPPRESS. Four defer to `isDeliberateParkActive` below; the fifth reads the same two
- * columns directly, as an interval. This list is the registry, so a sixth suppression site
+ * `parked_until` (BLO-27912 / migration 0222) is read in six places, and all of them read
+ * it to SUPPRESS. Five defer to `isDeliberateParkActive` below; the sixth reads the same two
+ * columns directly, as an interval. This list is the registry, so a seventh suppression site
  * belongs here too:
  *
  *  - `hasLiveDeliberatePark` (`routes/github-webhook.ts`) — a live park suppresses
@@ -31,6 +31,16 @@
  *    clause of its evidence. It landed the same morning this list was corrected from three to
  *    four, and was missed — see the retraction below, which is that same error a second time.
  *
+ *  - `statusChangeWakeDeferredToParkExpiry` (`routes/issues.ts`) — the
+ *    `issue_status_changed` wake on `PATCH /api/issues/:id` (PEN-5776). The gap the
+ *    section below used to describe as open; it is now closed, and that section is kept
+ *    as the account of what the gap was. The odd one out in the other direction: it is
+ *    the only reader that is a DEFERRAL rather than a suppression, because it conjoins
+ *    `isIssueParkExpiryWakeStatus(issue.status)` so the wake it drops is always one this
+ *    module will fire at the deadline instead. Without that conjunct it would strand a
+ *    `backlog` -> `blocked` park, which is the failure mode the `recovery/service.ts`
+ *    entry above warns about on the lapsed-park axis.
+ *
  * Nothing read it to RELEASE. `parked_until` passing produced no event on any status, so
  * a parked row whose only wake was the park itself sat inert indefinitely. The park had a
  * brake and no accelerator.
@@ -40,12 +50,18 @@
  * guaranteed rather than accidental and unreliable. Suppression while the park is LIVE is
  * unchanged by this module and must stay that way.
  *
- * ## The API transitions where a live park is NOT read (PEN-5291)
+ * ## The API transitions where a live park WAS not read (PEN-5291, closed by PEN-5776)
+ *
+ * ✅ CLOSED 2026-11-06. Kept because the shape still governs: the flags below are still the
+ * trigger set, and the deferral added to that call site is conditional on the post-update
+ * status, so WHICH transition you are on still decides whether the wake survives. Read it as
+ * the account of a gap, not as a live gap.
  *
  * Three status-change flags in `PATCH /api/issues/:id` share ONE
  * `addWakeup(... reason: "issue_status_changed")` call (`routes/issues.ts`), and that call
- * carries NO park term. A park can be set on any status, so on all three a parked row KEEPS
- * its park and is dispatched about a second later:
+ * carried NO park term — not at the guard, not in `dispatchIssueWakeups`, not in
+ * `services/heartbeat.ts`. A park can be set on any status, so on all three a parked row KEPT
+ * its park and was dispatched about a second later:
  *
  *  - `statusChangedFromBlockedToTodo` — `blocked` -> `todo`, by explicit status or `reopened`.
  *  - `statusChangedFromBacklog` — `backlog` -> ANY other status, not only `todo`.
@@ -53,6 +69,18 @@
  *
  * Only the first is MEASURED (below). The other two are read from source — same call site,
  * same missing term — and carry no telemetry here; do not cite them as observed.
+ *
+ * PEN-5776 measured the third on PEN-4363: a reopen that set `parkedUntil` 5 h 43 m out in
+ * the SAME write was followed by a dispatch of the same seat Δ = 1.099 s later, which took
+ * the row to `in_progress` and so retired the disposition the park expressed. The fix defers
+ * that wake to the deadline — but ONLY where the deadline fires, i.e. where the post-update
+ * status is in `ISSUE_PARK_EXPIRY_WAKE_STATUSES`. `statusChangedFromBacklog` is the flag that
+ * can leave that set (`backlog` -> `blocked`, `done`, `cancelled`), and on those targets the
+ * wake still fires, because deferring to a deadline that is excluded from this sweep would be
+ * a strand rather than a deferral. The asymmetry between the two hand transitions out of
+ * `blocked`, described below, is therefore UNCHANGED by PEN-5776 on the `-> in_progress` side
+ * and changed on the `-> todo` side only when a park is live: the double wake that section
+ * describes ("two wakes, one intent") is now a single wake at the deadline.
  *
  * ### The two hand transitions out of `blocked` behave OPPOSITELY
  *
