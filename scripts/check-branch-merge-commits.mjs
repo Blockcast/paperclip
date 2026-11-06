@@ -246,14 +246,30 @@ export function formatReport(verdict, { base, head } = {}) {
   lines.push("");
   lines.push("REMEDY — rebase, do not merge:");
   lines.push("");
+  // The lease has to name the sha the author last PUBLISHED, and the reflog of
+  // the remote-tracking ref is the only source that means exactly that: a push
+  // writes an `update by push` entry, a fetch writes a different one, so the
+  // newest `update by push` is this clone's own publication.
+  //
+  // Since PEN-4869 the wrapper refuses a bare `--force-with-lease`, because bare
+  // takes its expectation from the tracking ref and so passes over the very
+  // commit it was meant to protect. A PINNED lease read from `ls-remote`, from a
+  // freshly fetched `origin/<branch>`, or from `@{u}` has that same defect in the
+  // accepted shape -- all three are the tracking ref's current value, i.e. the
+  // thing the lease is compared against, so it can never fail. `@{u}` in
+  // particular is just `origin/<branch>`: measured, after a co-author pushes and
+  // we fetch, it returns THEIR commit while the newest `update by push` still
+  // returns ours. It also fails `fatal: no upstream configured` on a worktree
+  // that pushed via `git push origin HEAD:<branch>` -- the common agent shape --
+  // whereas the reflog needs no upstream. Hence the rendered fallback below.
+  //
+  // `ls-remote` belongs on the far side of the comparison, which is what the
+  // fourth line does.
+  lines.push("    git reflog show origin/<branch>   # newest `update by push` = <expected-sha>, the sha YOU last pushed");
+  lines.push("                                      #   (never pushed from this clone? use the sha your last push printed)");
   lines.push("    git fetch origin master");
   lines.push("    git rebase origin/master      # NOT `git merge origin/master`");
-  // `ls-remote`, not `rev-parse origin/<branch>`: only master was fetched above,
-  // so the tracking ref is stale or (in a fresh clone) absent. And the lease is
-  // PINNED, not bare -- since PEN-4869 the git egress wrapper refuses a bare
-  // `--force-with-lease`, because bare takes its expectation from that same
-  // tracking ref and so passes over the very commit it was meant to protect.
-  lines.push("    git ls-remote origin refs/heads/<branch>   # the sha you are replacing: <expected-sha>");
+  lines.push("    git ls-remote origin refs/heads/<branch>   # still <expected-sha>? if not, a co-author pushed -- STOP");
   lines.push("    git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>");
   lines.push("");
   lines.push("`git merge origin/master` and the GitHub \"Update branch\" button both make");

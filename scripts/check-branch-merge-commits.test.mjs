@@ -174,6 +174,26 @@ test("formatReport: the failure names the rebase remedy and never recommends mer
     !/^\s*git merge origin\/master\s*$/m.test(report),
     "the report must never present `git merge origin/master` as a remedy",
   );
+  // PEN-4869: agent pods put the git egress wrapper first on PATH and it refuses
+  // a BARE `--force-with-lease`, so a remedy printed here would misfire for
+  // exactly the population already blocked by this check. The trailers module
+  // carries the same guard; this one is its counterpart, so the third remedy
+  // cannot regress to a bare lease silently (PEN-5807).
+  assert.doesNotMatch(report, /--force-with-lease(?!=)/, "bare lease is refused by the PEN-4869 wrapper");
+  assert.match(report, /--force-with-lease=refs\/heads\/<branch>:<expected-sha>/);
+  // ...and the expectation must be a sha the author READ, never one substituted
+  // from the remote at push time: `:$(git rev-parse ...)` wears the accepted
+  // shape while leasing against the value it is checked against (PEN-5807).
+  assert.doesNotMatch(report, /--force-with-lease=\S*:\$\(/, "the expectation must not be derived inline");
+  // The expectation is sourced from the tracking ref's REFLOG (`update by push`
+  // = this clone's own publication), never from the ref's CURRENT value --
+  // `ls-remote`, a fetched `origin/<branch>`, or `@{u}`, which is that same ref
+  // and returns a co-author's commit once anything has fetched (PEN-5807).
+  assert.match(report, /git reflog show origin\/<branch>/);
+  assert.doesNotMatch(report, /rev-parse @\{u\}/, "`@{u}` is the tracking ref, not the sha you last pushed");
+  // The no-upstream / never-pushed case must be in the RENDERED text, not only
+  // in a source comment the report's reader never sees.
+  assert.match(report, /never pushed from this clone/);
 });
 
 test("formatReport: a PASS states its own one-sidedness", () => {
