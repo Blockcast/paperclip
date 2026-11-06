@@ -822,11 +822,20 @@ jobs:
       # someone lands a correction -- measured on this PR's own merge-queue ejection,
       # run 42209953505. This job checks out at fetch-depth: 0, so the base resolves.
       #
-      # On `merge_group`, PR_BASE_SHA is the merge-group base, so `base...HEAD` spans
-      # every entry queued ahead of this one -- same reason the `Select suites reachable
-      # from this diff` step gives for its own cumulative diff: PR_BASE_SHA/PR_HEAD_SHA
-      # come from the merge_group event. (No line number here on purpose; that is the
-      # failure mode this whole step exists to catch.)
+      # --head is the other half of that, and it is not optional. On `pull_request` this
+      # job's worktree is `refs/pull/N/merge`, a merge of the PR head into current
+      # master, and PR_BASE_SHA is an ancestor of it -- so a `base...HEAD` diff reports
+      # every file MASTER moved since the base as one this PR touched, and the tripwire
+      # is back by another door. Measured at head d9871cea3: master's edit to
+      # scripts/gh-token-wrapper.sh made six anchors fatal on a PR that never opened
+      # that file. Passing the PR's own head sha confines attribution to the PR.
+      #
+      # On `merge_group`, PR_BASE_SHA is the merge-group base and PR_HEAD_SHA is the
+      # queue head this job already checks out, so `--head` is a no-op there and the
+      # diff still spans every entry queued ahead of this one -- same reason the
+      # `Select suites reachable from this diff` step gives for its own cumulative diff:
+      # both come from the merge_group event. (No line number here on purpose; that is
+      # the failure mode this whole step exists to catch.)
       # Drift that an earlier entry caused is therefore attributed to -- and can eject
       # -- a later one that touched neither the source nor the document. That direction
       # is deliberate: it fails closed, never open. Read such an ejection as the queue
@@ -834,7 +843,7 @@ jobs:
       # attribution fix; re-enqueue once the earlier entry's drift is corrected.
       - name: Re-resolve docs/security source anchors (PEN-5091)
         if: ${{ !cancelled() }}
-        run: node ./scripts/check-doc-line-anchors.mjs --base "$PR_BASE_SHA"
+        run: node ./scripts/check-doc-line-anchors.mjs --base "$PR_BASE_SHA" --head "$PR_HEAD_SHA"
         timeout-minutes: 1
 
       - name: Test doc line-anchor checker

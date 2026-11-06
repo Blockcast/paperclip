@@ -76,7 +76,11 @@
 //
 // Usage:
 //   check-doc-line-anchors.mjs [--root <dir>] [--glob <pattern>] [--base <ref>]
-//                              [--fix] [--quiet]
+//                              [--head <ref>] [--fix] [--quiet]
+//
+// --head names the commit whose diff against --base is "what this PR changed". It
+// defaults to the worktree HEAD, which is right locally and WRONG under a
+// `pull_request` checkout of `refs/pull/N/merge`; see changedSince.
 //
 // --fix rewrites a drifted line number in place when the construct occurs EXACTLY
 // ONCE in the file. An ambiguous construct is left alone and reported: picking one
@@ -498,15 +502,30 @@ function collectAgainstBaseSource(ref, docs, root) {
   return out;
 }
 
-// The paths this PR changes, as `base...HEAD` -- three-dot, so a `merge_group` head
-// carrying master's own commits still reports only the PR's own files.
+// The paths THIS PR changes: `base...head`, where `head` is the PR's own head commit
+// and NOT the checked-out worktree.
+//
+// On `pull_request`, actions/checkout checks out `refs/pull/N/merge` -- a merge of the
+// PR head into current master -- so the worktree HEAD carries master's commits as well
+// as the PR's. `PR_BASE_SHA` is an ancestor of that merge, which makes the three-dot
+// `base...HEAD` identical to two-dot: it lists everything master landed since the base
+// alongside the PR's own files. Reading that as "this PR touches the cited file" hands
+// case 1 below every file master moved, and the gate is a repo-wide tripwire again --
+// measured on this PR at `d9871cea3`, where master's 353-line edit to
+// `scripts/gh-token-wrapper.sh` made six anchors fatal on a PR that never opened it.
+// (An earlier revision of this comment claimed three-dot already excluded master's
+// commits. It does not, and cannot, when the base is an ancestor of the head.)
+//
+// Defaults to `HEAD` for a local run, where the worktree is the thing being judged.
+// On `merge_group` the checkout IS the head sha, so passing it changes nothing and the
+// documented queue behaviour -- a diff spanning every entry ahead -- is preserved.
 //
 // --no-renames is load-bearing. With rename detection on, `git mv a.ts b.ts` lists only
 // `b.ts`, so an anchor still citing `a.ts` matches neither attribution arm and falls
 // through to INHERITED -- a PR that moves a cited file without opening the document,
 // which is the exact case this check exists for, passes with a MISSING FILE it caused.
-export function changedSince(ref, root) {
-  const r = spawnSync("git", ["diff", "--no-renames", "--name-only", `${ref}...HEAD`], {
+export function changedSince(ref, root, head = "HEAD") {
+  const r = spawnSync("git", ["diff", "--no-renames", "--name-only", `${ref}...${head}`], {
     cwd: root,
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
@@ -529,6 +548,10 @@ function main(argv) {
   // event types that have no base. Absent a base every failure is fatal, which is the
   // right shape for a local run against one tree.
   const baseRef = arg("--base", "") || "";
+  // The worktree is what gets judged; this is only the right-hand end of the
+  // "what did this PR change" diff. CI passes $PR_HEAD_SHA because its worktree is a
+  // merge commit that also carries master's changes.
+  const headRef = arg("--head", "HEAD") || "HEAD";
 
   const docs = globSync(pattern, { cwd: root }).sort();
   if (docs.length === 0) {
@@ -596,9 +619,13 @@ function main(argv) {
       console.error(`         the job needs the base commit on disk (fetch-depth: 0)`);
       return 2;
     }
-    const changed = changedSince(baseRef, root);
+    // A head that is not on disk needs no guard of its own: the diff below fails, and
+    // `changed === null` already refuses to judge rather than attributing everything
+    // to this PR. --base has an explicit pre-check only because it is ALSO read by
+    // collectAgainstBaseSource, where a silent miss would read as "clean at the base".
+    const changed = changedSince(baseRef, root, headRef);
     if (changed === null) {
-      console.error(`cannot judge: cannot diff ${baseRef}...HEAD in ${root}`);
+      console.error(`cannot judge: cannot diff ${baseRef}...${headRef} in ${root}`);
       return 2;
     }
     const baseSource = collectAgainstBaseSource(baseRef, docs, root);

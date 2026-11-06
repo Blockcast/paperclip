@@ -412,6 +412,181 @@ test("renaming a cited file owns the citation: the old path counts as changed", 
   }
 });
 
+// A `pull_request` checkout is `refs/pull/N/merge`, not the PR head. The fixture below
+// builds that exact shape -- base, a master commit, a PR commit, and a merge of the two
+// -- because the defect is invisible against a linear history: the three-dot diff only
+// over-reports once the base is an ancestor of the thing being diffed.
+const mergeRefFixture = async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const root = mkdtempSync(join(tmpdir(), "anchor-mergeref-"));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  git("init", "-q", "-b", "master");
+  git("config", "user.email", "t@t");
+  git("config", "user.name", "t");
+  mkdirSync(join(root, "src"));
+  mkdirSync(join(root, "docs"));
+  writeFileSync(join(root, "src/a.ts"), SOURCE);
+  writeFileSync(join(root, "docs/d.md"), "x\n");
+  git("add", "-A");
+  git("commit", "-qm", "base");
+  const base = git("rev-parse", "HEAD");
+
+  // The PR: it edits the document only. It never opens src/a.ts.
+  git("checkout", "-q", "-b", "pr");
+  writeFileSync(join(root, "docs/d.md"), "`parseThing` (`src/a.ts:2`)\n");
+  git("add", "-A");
+  git("commit", "-qm", "pr edits the doc");
+  const head = git("rev-parse", "HEAD");
+
+  // Master, independently: it moves src/a.ts's contents down. Nothing to do with the PR.
+  git("checkout", "-q", "master");
+  writeFileSync(join(root, "src/a.ts"), `// pushed down\n${SOURCE}`);
+  git("add", "-A");
+  git("commit", "-qm", "master moves the cited file");
+
+  // What actions/checkout gives the job on a pull_request event.
+  git("checkout", "-q", "-b", "mergeref");
+  git("merge", "-q", "--no-ff", "-m", "Merge pr into master", "pr");
+  return { root, base, head, rm: () => rmSync(root, { recursive: true, force: true }) };
+};
+
+test("changedSince reports only the PR's files when the worktree is a merge ref", async () => {
+  const { root, base, head, rm } = await mergeRefFixture();
+  try {
+    const viaWorktree = changedSince(base, root);
+    assert.ok(
+      viaWorktree.has("src/a.ts"),
+      "the merge ref carries master's commits, so the worktree diff over-reports",
+    );
+
+    const viaHead = changedSince(base, root, head);
+    assert.ok(viaHead.has("docs/d.md"), "the PR's own file must still be reported");
+    assert.ok(
+      !viaHead.has("src/a.ts"),
+      "a file only master touched must not be attributed to this PR",
+    );
+  } finally {
+    rm();
+  }
+});
+
+test("master moving a cited file under a merge-ref checkout is inherited, not fatal", async () => {
+  const { root, base, head, rm } = await mergeRefFixture();
+  try {
+    const doc = "`parseThing` (`src/a.ts:2`)";
+    const atHead = checkDocument({
+      docPath: "docs/d.md",
+      docText: doc,
+      readSource: () => `// pushed down\n${SOURCE}`,
+    });
+    const atBase = checkDocument({ docPath: "docs/d.md", docText: doc, readSource: () => SOURCE });
+    assert.equal(atHead[0].status, "drifted", "the fixture must actually drift");
+
+    const [wrong] = attributeInherited(atHead, atBase, changedSince(base, root));
+    assert.ok(
+      !wrong.inherited,
+      "regression guard: the worktree diff attributes master's move to this PR",
+    );
+
+    const [right] = attributeInherited(atHead, atBase, changedSince(base, root, head));
+    assert.ok(right.inherited, "drift master caused must not fail this PR");
+    assert.ok(right.driftedSinceBase, "it resolved at the base, so it is drifted-since-base");
+  } finally {
+    rm();
+  }
+});
+
+test("a PR that moves the cited file still owns it under a merge-ref checkout", async () => {
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { execFileSync } = await import("node:child_process");
+  const root = mkdtempSync(join(tmpdir(), "anchor-mergeref-own-"));
+  const git = (...args) => execFileSync("git", args, { cwd: root, encoding: "utf8" }).trim();
+  try {
+    git("init", "-q", "-b", "master");
+    git("config", "user.email", "t@t");
+    git("config", "user.name", "t");
+    mkdirSync(join(root, "src"));
+    mkdirSync(join(root, "docs"));
+    writeFileSync(join(root, "src/a.ts"), SOURCE);
+    writeFileSync(join(root, "docs/d.md"), "`parseThing` (`src/a.ts:2`)\n");
+    git("add", "-A");
+    git("commit", "-qm", "base");
+    const base = git("rev-parse", "HEAD");
+
+    // This time the PR itself moves the cited code and never opens the document --
+    // the PEN-4932 case the whole check exists for. Narrowing attribution to the PR
+    // must not lose it.
+    git("checkout", "-q", "-b", "pr");
+    writeFileSync(join(root, "src/a.ts"), `// pushed down\n${SOURCE}`);
+    git("add", "-A");
+    git("commit", "-qm", "pr moves the cited file");
+    const head = git("rev-parse", "HEAD");
+
+    git("checkout", "-q", "master");
+    writeFileSync(join(root, "unrelated.txt"), "master did something else\n");
+    git("add", "-A");
+    git("commit", "-qm", "master");
+    git("checkout", "-q", "-b", "mergeref");
+    git("merge", "-q", "--no-ff", "-m", "Merge pr into master", "pr");
+
+    const doc = "`parseThing` (`src/a.ts:2`)";
+    const atHead = checkDocument({
+      docPath: "docs/d.md",
+      docText: doc,
+      readSource: () => `// pushed down\n${SOURCE}`,
+    });
+    const atBase = checkDocument({ docPath: "docs/d.md", docText: doc, readSource: () => SOURCE });
+    const [f] = attributeInherited(atHead, atBase, changedSince(base, root, head));
+    assert.equal(f.status, "drifted");
+    assert.ok(!f.inherited, "the PR moved the cited file, so it owns the citation");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The three tests above pin `changedSince` and `attributeInherited`. This one pins the
+// wiring between them and the command line -- a `main()` that parsed --head and then
+// never passed it on would satisfy all three and still ship the defect.
+test("end to end: --head decides whether master's drift fails the run", async () => {
+  const { writeFileSync } = await import("node:fs");
+  const { join, dirname } = await import("node:path");
+  const { spawnSync } = await import("node:child_process");
+  const { fileURLToPath } = await import("node:url");
+  const script = join(dirname(fileURLToPath(import.meta.url)), "check-doc-line-anchors.mjs");
+
+  const { root, base, head, rm } = await mergeRefFixture();
+  try {
+    // The glob the real run uses is docs/security/**; this fixture keeps its document
+    // at docs/, so point the checker at it explicitly.
+    writeFileSync(join(root, "docs/d.md"), "`parseThing` (`src/a.ts:2`)\n");
+    const run = (...extra) =>
+      spawnSync(process.execPath, [script, "--root", root, "--glob", "docs/*.md", "--quiet",
+        "--base", base, ...extra], { encoding: "utf8" });
+
+    const worktree = run();
+    assert.equal(worktree.status, 1, "without --head the merge ref's master commits are fatal");
+    assert.match(worktree.stderr, /DRIFTED/);
+
+    const pinned = run("--head", head);
+    assert.equal(pinned.status, 0, `--head confines attribution to the PR: ${pinned.stderr}`);
+    assert.match(pinned.stderr, /DRIFTED ON MASTER SINCE THE BASE/);
+
+    // A head the repository does not have must refuse to judge, not fall back to
+    // attributing everything to this PR. Asserted on the behaviour, not on which
+    // branch produces it -- the diff failing is a refusal just as much as a pre-check.
+    const bogus = run("--head", "0000000000000000000000000000000000000000");
+    assert.equal(bogus.status, 2, "an unresolvable --head is a refusal, not a verdict");
+    assert.match(bogus.stderr, /cannot judge/);
+  } finally {
+    rm();
+  }
+});
+
 test("attribution leaves passing anchors alone", () => {
   // The changed set is empty on purpose: every later branch would fall through to
   // `inherited` here, so this pins the status guard itself rather than riding on one
