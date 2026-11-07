@@ -38,7 +38,7 @@ authenticated verdict. It reads no credential value into your output.
   github-reachable:   yes (unauthenticated /rate_limit -> 200, x-ratelimit-limit 60)
   authenticated:      /installation/repositories -> 200, x-ratelimit-limit 9500, remaining 4730, reset 2026-11-03T04:53:38Z (1793681618)
   credential-channel: gh / curl / git (all re-read the mount per invocation)
-  mcp-channel:        covered — a loopback token proxy is listening and re-reads this same mount on every request, so the verdict below governs any `mcp__github__*` server behind it (PEN-5641). SCOPE: this probe establishes that A proxy is listening on this pod, not that YOUR server is behind it (PEN-5702). The port is bound once per pod, so if this pod started a second `github-mcp-server` it logged `already bound` on stderr, got no `GITHUB_HOST`, and is still pinned to its boot generation exactly as it would be with no proxy at all
+  mcp-channel:        covered — a loopback token proxy is listening and re-reads this same mount on every request, so the verdict below governs any `mcp__github__*` server behind it (PEN-5641). SCOPE: this probe establishes that A proxy is listening on this pod, not that YOUR server is behind it (PEN-5702). The port is bound once per pod, so if this pod started a second `github-mcp-server` it logged `already bound` on stderr, was not pointed at the proxy, and is still pinned to its boot generation exactly as it would be with no proxy at all
   verdict:            OK — valid GitHub App installation token (rate limit 9500/hr)
 ```
 
@@ -260,9 +260,9 @@ per request, so both channels now share one credential. **Read the
 - `covered` → a proxy is listening, and the verdict governs any
   `mcp__github__*` server behind it. It does **not** establish that any
   particular server is behind it: the port is bound once per pod, so a second
-  `github-mcp-server` logged `already bound` on stderr, got no `GITHUB_HOST`,
-  and is pinned to its boot generation exactly as in the `NOT COVERED` case
-  (PEN-5702).
+  `github-mcp-server` logged `already bound` on stderr, was not pointed at
+  the proxy, and is pinned to its boot generation exactly as in the
+  `NOT COVERED` case (PEN-5702).
 - `NOT COVERED` → the verdict governs the file-reading path **only**. After a
   rotation, `mcp__github__*` returning `401 Bad credentials` while `gh`/`curl`
   are green is **expected and is not a credential fault**. Use `gh`/`curl`/`git`;
