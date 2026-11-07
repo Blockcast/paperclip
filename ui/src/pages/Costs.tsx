@@ -29,6 +29,11 @@ import { useBreadcrumbs } from "../context/BreadcrumbContext";
 import { useCompany } from "../context/CompanyContext";
 import { useDateRange, PRESET_KEYS, PRESET_LABELS } from "../hooks/useDateRange";
 import { queryKeys } from "../lib/queryKeys";
+import {
+  capRefusalNotice,
+  clampNotice,
+  fetchByProjectWithinCap,
+} from "../lib/by-project-window";
 import { billingTypeDisplayName, cn, formatCents, formatTokens, providerDisplayName } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -255,16 +260,32 @@ export function Costs() {
   // overview -- summary, by-agent and by-model included, none of which are
   // affected and all of which are cheap. It is fetched separately so a refused
   // window degrades only the "By project" card.
+  //
+  // PEN-6038: the presets still offer windows wider than that cap -- `mtd`, the
+  // DEFAULT, is over it from the 6th of every month onward -- so left alone the
+  // card showed an error on most days of the year. The presets are not narrowed
+  // to the cap: this same range drives nine other aggregates that have no cap,
+  // and shrinking the menu would delete month-to-date and year-to-date spend
+  // reporting for the whole page. Instead the request clamps itself to the
+  // trailing N days, where N is read from the server's refusal rather than
+  // written down here. See `lib/by-project-window.ts`.
   const {
-    data: byProjectData,
+    data: byProjectResult,
     isLoading: byProjectLoading,
     error: byProjectError,
   } = useQuery({
     queryKey: queryKeys.costsByProject(companyId, from || undefined, to || undefined),
-    queryFn: () => costsApi.byProject(companyId, from || undefined, to || undefined),
+    queryFn: () => fetchByProjectWithinCap(companyId, from, to),
     enabled: !!selectedCompanyId && customReady,
     retry: false,
   });
+  const byProjectData = byProjectResult?.rows;
+  const byProjectClampNotice = clampNotice(byProjectResult);
+  // The clamp above means a capped window normally never reaches the error
+  // branch. It still can when the server constant is retuned DOWNWARD and this
+  // tab is holding the previous, now-too-wide cap -- so the refusal names the
+  // limit there too, rather than rendering a raw error string.
+  const byProjectRefusalNotice = capRefusalNotice(byProjectError);
 
   const { data: financeData, isLoading: financeLoading, error: financeError } = useQuery({
     queryKey: [
@@ -831,11 +852,22 @@ export function Costs() {
                   <Card>
                     <CardHeader className="px-5 pt-5 pb-2">
                       <CardTitle className="text-base">By project</CardTitle>
-                      <CardDescription>Run costs attributed through project-linked tasks.</CardDescription>
+                      <CardDescription>
+                        Run costs attributed through project-linked tasks.
+                        {byProjectClampNotice ? (
+                          <> <span className="text-foreground">{byProjectClampNotice}</span></>
+                        ) : null}
+                      </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-2 px-5 pb-5 pt-2">
                       {byProjectError ? (
-                        <p className="text-sm text-destructive">{(byProjectError as Error).message}</p>
+                        byProjectRefusalNotice ? (
+                          <p className="text-sm text-muted-foreground">{byProjectRefusalNotice}</p>
+                        ) : (
+                          <p className="text-sm text-destructive">
+                            Project costs are unavailable for this range.
+                          </p>
+                        )
                       ) : byProjectLoading ? (
                         <p className="text-sm text-muted-foreground">Loading project costs...</p>
                       ) : (byProjectData?.length ?? 0) === 0 ? (
