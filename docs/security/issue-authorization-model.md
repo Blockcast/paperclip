@@ -184,7 +184,7 @@ reintroduce them: the next edit to `authorization.ts` rots them again.
 | `allow_instance_admin` | A | A | A | instance-admin row, never for `cloud_tenant` |
 | `allow_company_member` | A | A | — | cloud-tenant board user — `decideBase`'s board branch, entered on `input.actor.type === "board"` and narrowed by `input.actor.source === "cloud_tenant" && input.actor.userId` — with active membership, `membershipRole !== "viewer"` |
 | `allow_self` | A | A | — | `resource.assigneeAgentId === actor` |
-| `allow_company_agent` | A | A | — | `resource.assigneeAgentId` is null — **no *agent* assignee, which is not the same as "no assignee"**: a row handed to a named human via `assigneeUserId` satisfies this condition and is mutable by every agent in the company (`PEN-5900`, open decision — see "No assignee" vs "no agent assignee" below) — and is not a review/escalation shell |
+| `allow_company_agent` | A | A | — | `resource.assigneeAgentId` is null, and the issue is not a review/escalation shell. **`mutate` additionally requires `assigneeUserId` to be null**: "no *agent* assignee" is not "no assignee", and a row handed to a named human carries `comment` only (`PEN-5920` — see "No assignee" vs "no agent assignee" below) |
 | `allow_issue_creator` | A | — | — | `resource.createdByAgentId === actor` |
 | `allow_manager_chain` | A | — | — | `isManagerOf(actor, resource.assigneeAgentId)` |
 | `allow_issue_mention_grant` | A | — | — | a live, non-deleted `agent://<actor>` **markdown-link** mention whose **comment author** is the issue's own assignee agent, or a user with an active company membership. No other author grants anything — not the manager, not the creator, not the CEO, not the mentioned agent itself (`commentAuthorCanGrantIssueMention`). See "Who may grant a mention" below |
@@ -285,22 +285,32 @@ Terminal denials:
 
 ## "No assignee" vs "no agent assignee"
 
-`allow_company_agent`'s condition used to be stated more narrowly than the code
-implements, and the gap is load-bearing: **an issue assigned to a named human is,
-to `decideBase`, an unassigned issue.**
-
-The claim branch tests `assigneeAgentId` and nothing else:
+`allow_company_agent`'s condition reads `assigneeAgentId`, and **"no *agent*
+assignee" is not "no assignee"**. An issue handed to a named human via
+`assigneeUserId` has nobody *agent-side* holding it, and for `issue:comment` that
+is exactly right — an agent may speak on a person's row. For `issue:mutate` it is
+not, and since `PEN-5920` the claim is split by action:
 
 ```js
-if (!resource?.assigneeAgentId) {            // NOT assigneeUserId
-  // ... suppressed only for the two origin kinds below ...
+if (!resource?.assigneeAgentId) {
+  // ... suppressed outright for the two origin kinds below ...
+  // ... and withheld for `issue:mutate` alone when `assigneeUserId` is set ...
   return allow({ reason: "allow_company_agent",
                  explanation: "Allowed because the issue has no agent assignee." });
 }
 ```
 
-The suppression it consults, `recoveryOrReviewIssueBlocksUnassignedAgentClaim`, keys
-on `AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS` — two origin kinds. One of them,
+So a row a person holds behaves, for writes, like a row an agent holds: the
+generic claim does not reach it, and `issue:mutate` falls through to the ordinary
+relations — `allow_self`, and the `allow_productivity_review_grant` exception.
+A genuinely unheld row — **both** assignee fields null — is unaffected on both
+actions; that is the case the relation was written for.
+
+### Why it is keyed on `assigneeUserId`
+
+The suppression the claim branch consults,
+`recoveryOrReviewIssueBlocksUnassignedAgentClaim`, keys on
+`AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS` — two origin kinds. One of them,
 `productivityReviewEscalation`, is denied with this stated rationale:
 
 > created with `assigneeAgentId: null` and `assigneeUserId` set
@@ -308,34 +318,49 @@ on `AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS` — two origin kinds. One of the
 > it answers the question that was asked of the user.
 
 That rationale names **human-addressing** — a property of `assigneeUserId`. The
-predicate implements **provenance** — a property of `originKind`. Where the two
-correlate the guard holds; where they do not, the same already-articulated hazard
-is unguarded. Measured 2026-11-07 against the company's dominant human assignee:
-56 open human-assigned rows, 15 `critical`, of which **53 carry `originKind:
-"manual"`** and so fall outside the allowlist. The class is dominated by human
-decision gates — confirmation gates, credential-holder decisions, founder reviews —
-and a gate any agent may set to `done` is not a gate.
+predicate implemented **provenance** — a property of `originKind`. Where the two
+correlate the guard held; where they did not, the same already-articulated hazard
+was unguarded. Measured 2026-11-07 against the company's dominant human assignee:
+56 open human-assigned rows, 15 `critical`, of which **53 carried `originKind:
+"manual"`** and so fell outside the allowlist. The class is dominated by human
+decision gates — confirmation gates, credential-holder decisions, founder reviews
+— and a gate any agent may set to `done` is not a gate.
+
+`PEN-5920` keys the write half on the property the hazard is actually about,
+rather than on a proxy for it. This is the file's existing convention, not a new
+policy: two other boundaries already treat `assigneeUserId` as a hard stop for a
+restricted actor — *"Low-trust agents cannot assign work to board users"* and
+*"Task bridge keys cannot assign work to board users"*. The claim branch was the
+outlier.
+
+**Deliberately not done**, both of which read as narrowings and are not:
+
+- **`allow_issue_creator` was not extended to `issue:mutate`.** It is gated to
+  `issue:comment` and that gate is correct. Of the 57 open operator-assigned rows
+  measured 2026-11-07, **43 were created by an agent**, including 10 of the 15
+  open `critical` ones. "The filer may still correct it" re-opens the hole on
+  three-quarters of the class. The filer's route is a comment.
+- **No field mask was added.** This layer is action-level throughout. The
+  established way to carve out a sensitive sub-capability here is a *new action*
+  — `issue:coordination_metadata` is the precedent — not a field list inside
+  `issue:mutate`.
 
 **Consequences for readers of this file:**
 
-- The explanation string `"the issue has no agent assignee"` is accurate. The
-  relation label `unassigned_issue` and the former grid wording "issue has no
-  assignee" are not, and those are what readers carry. Three seats reached three
-  different and mutually inconsistent models from them inside 24 hours
-  (`PEN-5900`): that human-assigned rows are writable by nobody, that they are
-  correctly protected, and that they have no assignee at all.
-- Clearing an agent assignee in favour of a human **widens** write access, from
-  "the assignee alone" to "every agent in the company". It does not narrow it.
-  See escape hatch 2, which recommends that move and now says so.
-
-⚠️ **Open decision (`PEN-5900`).** Whether this behaviour is correct is undecided
-and is the CTO's call; the options on the table are to withhold `issue:mutate`
-(not `issue:comment`) when `assigneeUserId` is set, to extend the suppression to
-the hazard it already names, or to accept the behaviour explicitly. This section
-is **descriptive of what ships**, consistent with the status note at the top of
-this file, and is not a ratification of it. The `human_assigned` row of the matrix
-regression test pins the same fact in code; whichever option lands, both change
-together.
+- The explanation string `"the issue has no agent assignee"` is accurate, and is
+  still the `comment` allow's explanation. The relation label `unassigned_issue`
+  is not accurate, and it is what readers carry. Three seats reached three
+  different and mutually inconsistent models from it inside 24 hours (`PEN-5900`):
+  that human-assigned rows were writable by nobody, that they were correctly
+  protected, and that they had no assignee at all. The second of those is now
+  true; it was not when it was written.
+- Clearing an agent assignee in favour of a human no longer widens write access.
+  It moves the row from "the assignee alone may mutate" to "no agent may mutate
+  through the generic claim". See escape hatch 2.
+- An `issue:mutate` denial on such a row names
+  `ISSUE_MUTATE_EVALUATED_RELATIONS` and says so explicitly, rather than falling
+  into the generic message — which ends "or take assignment", the one piece of
+  advice that must not be followed on a row a person is holding.
 
 ## Who may grant a mention
 
@@ -619,13 +644,21 @@ In order of cost. All three are supported today; none requires a code change.
    an active non-`viewer` membership, holds `issue:mutate`
    (`allow_company_member`). Setting `assigneeUserId` hands the row to that
    person's queue; a board session can edit the description directly.
-   ⚠️ **This widens agent write access to the row; it does not restrict it.**
-   `assigneeUserId` is not read by the agent claim branch, so clearing the agent
-   assignee in favour of a human moves the row from "only the assignee may
-   mutate" to `allow_company_agent` — **every agent in the company may rewrite
-   and close it**. Use this hatch to put a criterion in front of a human, never
-   as a way to protect a row from agents; for that, keep an agent assignee. See
-   `"No assignee" vs "no agent assignee"` above and `PEN-5900`.
+   ⚠️ **The privilege consequence of setting `assigneeUserId`:** it withdraws
+   the generic agent write claim on that row. Clearing the agent assignee in
+   favour of a human moves the row from "only the assignee may mutate" to "no
+   agent may mutate through `allow_company_agent`" — agents keep
+   `issue:comment`, and `issue:mutate` is left to the human and to the narrow
+   `allow_productivity_review_grant` exception. Since `PEN-5920` this hatch is
+   therefore safe to use on a decision gate. **It was not before**: until that
+   change `assigneeUserId` was not read by the claim branch at all, so the same
+   move handed `issue:mutate` to *every agent in the company*, and this file
+   recommended it as containment while it did. Do not carry the older reading
+   across. See `"No assignee" vs "no agent assignee"` above.
+   ⚠️ Note the residual: clearing the agent assignee **without** setting
+   `assigneeUserId` leaves the row genuinely unheld, which is still the
+   `allow_company_agent` branch on both actions. The protection comes from the
+   human assignment, not from the absence of an agent one.
 3. **Attach the criterion as a dependency.** Blocker edges *are* reachable by a
    manager holding `tasks:assign` (`issue:coordination_metadata`), so the criterion
    can be filed as its own issue and attached with `blockedByIssueIds`. It is the
