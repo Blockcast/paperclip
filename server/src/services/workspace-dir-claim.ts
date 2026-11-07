@@ -117,6 +117,65 @@ const CLAIM_EVIDENCE_PREFIX = ".dir-claim-released-";
  * leak on a mount every agent pod shares. The newest are the only ones anybody
  * would read.
  */
+/**
+ * How an agent pod's spelling of a shared path maps onto the server's.
+ *
+ * PEN-5865, measured 2026-11-07: the API server mounts PVC `paperclip-data`
+ * (CephFS subvolume `csi-vol-3bdd0e68-...`) at `/paperclip` with NO subPath,
+ * while the agent pods mount a COMPANY-SCOPED subPath of the SAME subvolume --
+ * volume `work/<companyId>` at `/paperclip/work`, `wt/<companyId>` at
+ * `/paperclip/wt`. So one directory has two names:
+ *
+ *     agent pod:   /paperclip/work/cto-5865
+ *     API server:  /paperclip/work/<companyId>/cto-5865
+ *
+ * This lives HERE, beside the claim layout, rather than at the HTTP route,
+ * because the route is not the only place the mapping has to be applied. A
+ * linked worktree's `.git` pointer is written by git ON THE AGENT POD, so it
+ * too is in agent spelling, and the claim LOCATION is derived from it. The
+ * route, `acquireWorkspaceDirClaim` and `releaseWorkspaceDirClaim` each
+ * resolve that location independently; if any one of them re-spelled and
+ * another did not, the claim would be written in one place and looked for in
+ * another -- the precise failure this module exists to prevent. One home, one
+ * answer, and `WorkspaceClaimRespelling` is passed to all three as DATA rather
+ * than as behaviour so they cannot diverge.
+ *
+ * ONE candidate per root, not a search: the company segment goes directly
+ * below the first segment under the root, which is where the subPath mounts
+ * put it. It can only ever NARROW what a caller reaches, because the segment
+ * inserted is the CALLING run's own company.
+ */
+export type WorkspaceClaimRespelling = {
+  /** Resolved claim roots, as `resolveWorkspaceClaimRoots` produced them. */
+  roots: string[];
+  /** The calling run's company. Null fails closed: no candidates. */
+  companyId: string | null;
+};
+
+export function companyScopedRespellings(
+  roots: string[],
+  lexicalPath: string,
+  companyId: string | null,
+): string[] {
+  if (!companyId) return [];
+  const candidates = new Set<string>();
+  for (const root of roots) {
+    const rel = path.relative(root, lexicalPath);
+    // Strictly below the root: `path.relative` rather than a string prefix, so
+    // `/paperclip-other` is not read as living inside `/paperclip`.
+    if (rel === "" || rel.startsWith("..") || path.isAbsolute(rel)) continue;
+    const segments = rel.split(path.sep).filter(Boolean);
+    // A mount segment AND something below it. `<root>/work` is the mount point
+    // itself, which is never a claimable directory, and re-spelling it would
+    // produce `<root>/<companyId>` -- a different thing entirely.
+    if (segments.length < 2) continue;
+    // Already company-scoped; re-spelling would yield `work/<cid>/<cid>/...`.
+    if (segments[1] === companyId) continue;
+    candidates.add(path.join(root, segments[0], companyId, ...segments.slice(1)));
+  }
+  return [...candidates];
+}
+
 const MAX_RETAINED_CLAIM_EVIDENCE = 20;
 
 /**
@@ -153,27 +212,66 @@ const MAX_RETAINED_CLAIM_EVIDENCE = 20;
  * would have to remember a location across processes, which is the kind of
  * durable side-state this module exists to avoid.
  */
-export async function resolveWorkspaceClaimLocation(dirPath: string): Promise<{
+export async function resolveWorkspaceClaimLocation(
+  dirPath: string,
+  respelling?: WorkspaceClaimRespelling,
+): Promise<{
   claimPath: string;
   /** Directory for staging and evidence files. Always on the claim's own filesystem. */
   scratchDir: string;
   inGitDir: boolean;
+  /**
+   * Set when a `.git` FILE named a gitdir that could not be resolved to a
+   * directory -- in the literal spelling, and in the company-scoped one if a
+   * `respelling` was supplied.
+   *
+   * PEN-5865, raised by Ally on #3498. This used to be invisible: an
+   * unresolvable pointer fell through to the plain-directory branch, so the
+   * claim was written into the WORKING TREE, which is the hazard the header
+   * above exists to prevent -- `git add -A` commits it, `git clean -fd`
+   * deletes it, and the mutual exclusion goes with it. It was unreachable from
+   * an agent pod only because `realpath` on the agent's spelling threw before
+   * anything got here. Re-spelling made it reachable, so the degradation is
+   * now REPORTED rather than silent, and the route refuses on it.
+   */
+  unresolvedGitDir: string | null;
 }> {
+  const isDirectory = async (candidate: string) =>
+    (await fs.stat(candidate).catch(() => null))?.isDirectory() === true;
+
   const dotGit = path.join(dirPath, ".git");
   const marker = await fs.stat(dotGit).catch(() => null);
   let gitDir: string | null = null;
+  /** Only a POINTER can be unresolvable; a `.git` directory either is one or is not. */
+  let pointedGitDir: string | null = null;
   if (marker?.isDirectory()) {
     gitDir = dotGit;
   } else if (marker?.isFile()) {
     const pointer = await fs.readFile(dotGit, "utf8").catch(() => null);
     const match = pointer?.match(/^\s*gitdir:\s*(.+?)\s*$/m);
-    if (match) gitDir = path.resolve(dirPath, match[1]);
+    if (match) {
+      gitDir = path.resolve(dirPath, match[1]);
+      pointedGitDir = gitDir;
+    }
   }
-  if (gitDir && (await fs.stat(gitDir).catch(() => null))?.isDirectory()) {
+  // A linked worktree's pointer was written by git on the AGENT POD, so it is
+  // in agent spelling just as `dirPath` was. Literal first, for the same
+  // reason as everywhere else: a pointer that already resolves is never
+  // redirected.
+  if (gitDir && !(await isDirectory(gitDir)) && respelling) {
+    for (const candidate of companyScopedRespellings(respelling.roots, gitDir, respelling.companyId)) {
+      if (await isDirectory(candidate)) {
+        gitDir = candidate;
+        break;
+      }
+    }
+  }
+  if (gitDir && (await isDirectory(gitDir))) {
     return {
       claimPath: path.join(gitDir, WORKSPACE_CLAIM_GIT_FILENAME),
       scratchDir: gitDir,
       inGitDir: true,
+      unresolvedGitDir: null,
     };
   }
   return {
@@ -184,6 +282,7 @@ export async function resolveWorkspaceClaimLocation(dirPath: string): Promise<{
     // equipped to interpret.
     scratchDir: path.dirname(dirPath),
     inGitDir: false,
+    unresolvedGitDir: pointedGitDir,
   };
 }
 
@@ -828,8 +927,15 @@ export async function acquireWorkspaceDirClaim(input: {
   self: WorkspaceDirClaimIdentity;
   readOwnerLiveness: (runId: string) => Promise<ClaimOwnerLiveness>;
   now?: () => Date;
+  /**
+   * The SAME value the caller resolved the location with. This resolver is
+   * stateless and re-reads the layout on every call, so a caller that
+   * re-spelled when it validated and omitted it here would write the claim
+   * somewhere other than where it checked -- see `WorkspaceClaimRespelling`.
+   */
+  respelling?: WorkspaceClaimRespelling;
 }): Promise<WorkspaceDirClaimOutcome> {
-  const { claimPath, scratchDir } = await resolveWorkspaceClaimLocation(input.dirPath);
+  const { claimPath, scratchDir } = await resolveWorkspaceClaimLocation(input.dirPath, input.respelling);
   const record: WorkspaceDirClaim = {
     version: WORKSPACE_CLAIM_VERSION,
     runId: input.self.runId,
@@ -970,8 +1076,10 @@ export async function acquireWorkspaceDirClaim(input: {
 export async function releaseWorkspaceDirClaim(input: {
   dirPath: string;
   runId: string;
+  /** As on `acquireWorkspaceDirClaim`: must match what the claim was taken with. */
+  respelling?: WorkspaceClaimRespelling;
 }): Promise<{ released: boolean; reason: string | null }> {
-  const { claimPath } = await resolveWorkspaceClaimLocation(input.dirPath);
+  const { claimPath } = await resolveWorkspaceClaimLocation(input.dirPath, input.respelling);
   const raw = await fs.readFile(claimPath, "utf8").catch(() => null);
   if (raw === null) return { released: false, reason: "no claim present" };
   const claim = parseWorkspaceDirClaim(raw);
