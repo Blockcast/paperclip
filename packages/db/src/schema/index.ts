@@ -88,6 +88,7 @@ export { assets } from "./assets.js";
 export { issueAttachments } from "./issue_attachments.js";
 export { documents } from "./documents.js";
 export { documentRevisions } from "./document_revisions.js";
+export { issueFieldRevisions } from "./issue_field_revisions.js";
 export { issueDocuments } from "./issue_documents.js";
 export { summarySlots } from "./summary_slots.js";
 export { routineDocuments } from "./routine_documents.js";
