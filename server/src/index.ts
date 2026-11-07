@@ -92,6 +92,7 @@ import {
   recordHeartbeatRecoveryChainInflight,
   recordHeartbeatRecoveryChainSkipped,
   recordHeartbeatRecoveryChainStalled,
+  recordIssuesLastActivityDriftRepairPass,
 } from "./services/metrics.js";
 import { createApiTierPluginWorkerManagerStub } from "./services/plugin-worker-manager-stub.js";
 import {
@@ -3122,7 +3123,26 @@ export async function startServer(): Promise<StartedServer> {
         onBatchError: (err, afterId) =>
           logger.warn({ err, afterId }, "issues.last_activity_at drift repair batch failed; skipped"),
       })
-        .then((result) => logger.info(result, "issues.last_activity_at drift repair pass finished"))
+        .then((result) => {
+          // PEN-5385: this log line was, until now, the ONLY record that a pass
+          // ran — emitted once at lease acquisition, so on a long-lived leader
+          // it sits at the head of the log where `--tail` cannot reach it, and
+          // confirming a single pass took a Loki head query. Publish the same
+          // result as a scrape; `repaired` is the drifted-row count at the
+          // moment the pass began.
+          //
+          // Logged FIRST and the metric write contained: this `.then` shares a
+          // `.catch` with the repair itself, so an exception from the metrics
+          // registry would otherwise be reported as "drift repair pass failed"
+          // — the one misreading that would send a reader hunting a repair
+          // that in fact succeeded.
+          logger.info(result, "issues.last_activity_at drift repair pass finished");
+          try {
+            recordIssuesLastActivityDriftRepairPass(result);
+          } catch (err) {
+            logger.warn({ err }, "issues.last_activity_at drift repair metrics publish failed");
+          }
+        })
         .catch((err) => logger.error({ err }, "issues.last_activity_at drift repair pass failed"));
       return () => {
         stopped = true;
