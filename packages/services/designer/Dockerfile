@@ -19,7 +19,13 @@
 #   COPY --from=designer-runtime /usr/bin/google-chrome-stable /usr/bin/
 #   ... (or use designer-runtime as base directly and add agent on top)
 
-FROM node:24-bookworm-slim
+# The base arrives as a resolved <repo>@sha256:... reference from
+# docker-designer.yml (scripts/resolve-base-digest.sh); the default below is the
+# floating tag so a local build still works. A CI image is always pinned and
+# records its base in org.opencontainers.image.base.name (PEN-5927).
+ARG BASE=node:24-bookworm-slim
+
+FROM ${BASE}
 
 # Chrome + Xvfb + minimal fonts/libs + utilities for the launcher script.
 # google-chrome-stable is the official Debian package from dl.google.com.

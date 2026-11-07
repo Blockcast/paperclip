@@ -16,7 +16,14 @@
 # Stay on the playwright base — it ships browser binaries (Chromium /
 # Firefox / WebKit) at /ms-playwright + has Node 22 + Python 3.10.
 # v1.49.1 matches the npm playwright pinned by the bot's existing script.
-FROM mcr.microsoft.com/playwright:v1.49.1-jammy
+# The base arrives as a resolved <repo>@sha256:... reference from
+# docker-webflow-bot.yml (scripts/resolve-base-digest.sh); the default below is
+# the tag, so a local build still works. v1.49.1 is patch-specific but still
+# mutable — the jammy layer underneath it is rebuilt — so the digest is what
+# actually names this base (PEN-5927).
+ARG BASE=mcr.microsoft.com/playwright:v1.49.1-jammy
+
+FROM ${BASE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 
