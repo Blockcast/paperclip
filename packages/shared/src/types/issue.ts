@@ -807,6 +807,17 @@ export interface IssueExecutionMonitorState {
   nextCheckAt: string | null;
   lastTriggeredAt: string | null;
   attemptCount: number;
+  /**
+   * PEN-5902: free prose the arming run addressed to the next waking run.
+   *
+   * Unlike every other field here this does NOT survive a clear. A cleared
+   * monitor's notes have no reader but a person or agent inspecting the row,
+   * to whom retired operating instructions read as live work — and no verb
+   * could write to this copy, so the mistake was permanent. A clear therefore
+   * nulls it, except for `clearReason: "cancelled"`, whose recovery handoff is
+   * emitted on a later tick and re-hydrates the notes from here. The durable
+   * audit record is the `issue.monitor_cleared` activity entry.
+   */
   notes: string | null;
   scheduledBy: IssueMonitorScheduledBy | null;
   kind?: IssueExecutionMonitorKind | null;
@@ -828,7 +839,7 @@ export interface IssueExecutionMonitorState {
    * PEN-5343: the `nextCheckAt` the monitor was holding when it was cleared.
    *
    * Every other field of the armed monitor already survives a clear
-   * (`notes`, `attemptCount`, `maxAttempts`, `gateSignals`, plus
+   * (`attemptCount`, `maxAttempts`, `gateSignals`, plus
    * `clearReason`/`clearedAt`), but the due time did not: the clear nulls
    * `nextCheckAt` here and `monitorNextCheckAt` on the row, so the one fact
    * that says *a wake was owed and when* was readable only by diffing the
