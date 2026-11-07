@@ -3414,6 +3414,14 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // `null` and `[]` take OPPOSITE safe directions, and collapsing them is how a run
     // talks itself into treating an agent-registered row as disclaiming ownership.
     expect(markdown).toContain("`owningIdentifiers: null` means NOT RECORDED");
+    // The DIRECTION of the null arm, not just the warning. A membership-only filter
+    // excludes every `null` row no matter what the following sentence says about absence
+    // proving nothing -- the instruction wins over the caution -- and those are exactly
+    // the agent-registered rows whose registration IS the ownership claim. Pinned as the
+    // operative clause so the filter cannot quietly narrow back to membership alone.
+    expect(markdown).toContain("whose `owningIdentifiers` is `null`");
+    expect(markdown).toContain("a `null` row stays IN");
+    expect(markdown).toContain("an `[]` row is OUT");
   });
 
   // The empty result had no documented action at all: the run was told an empty list is
@@ -3422,8 +3430,14 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
   it("names the pull request itself as the home for a constraint with no owning row", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
-    expect(markdown).toContain("no Paperclip owning row at all");
+    expect(markdown).toContain("no Paperclip owning row you can write to");
     expect(markdown).toContain("COMMENT ON THE PULL REQUEST itself");
+    // The TRIGGER, pinned explicitly. Keyed on `owners: []` alone, a non-empty result
+    // whose every row is mention-adjacency leaves the run with zero homes AND no
+    // fallback, silently dropping the constraint. That is strictly worse than the empty
+    // case this clause was written for, because nothing about it looks unusual.
+    expect(markdown).toContain("If NO row survives that filter");
+    expect(markdown).toContain("non-empty with every row removed as mention-adjacency");
     // Scope, pinned because `withheldForAuthorizationCount: 0` reads as a global
     // all-clear and is not one -- the service filters by company before the route ever
     // computes the count, so an owner in another company is invisible AND uncounted.

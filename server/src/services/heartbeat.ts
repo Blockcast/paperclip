@@ -14035,6 +14035,22 @@ export function buildPaperclipTaskMarkdown(input: {
     // is the discriminator and it stayed correct on every spurious row, which is what
     // makes the filter cheap to state and safe to follow.
     //
+    // THE NULL ARM IS LOAD-BEARING AND DEFAULTS TO IN -- same reasoning as
+    // `recovery/service.ts`, opposite operative direction because the harm is opposite.
+    // `recordedPullRequestOwners` returns `null` for "not recorded / unreadable" and keeps
+    // that strictly apart from the authoritative `[]`, and every writer of the field lives
+    // in `github-webhook.ts`, so an agent-registered (`provenance: "asserted"`) row NEVER
+    // carries it. Filtering on membership alone therefore drops exactly the rows most
+    // likely to be the real owner: an agent registering its own PR as a work product is a
+    // direct ownership claim. There absence exempts a row from seizure, here it keeps a row
+    // eligible to receive the constraint; in both the rule is that absence proves nothing.
+    //
+    // ...which is also why the fallback below triggers on "no row survived the filter"
+    // rather than on "`owners` was empty". A non-empty `owners` whose rows are all
+    // mention-adjacency leaves the run with zero homes and, keyed the other way, no
+    // fallback either -- silently dropping the constraint, which is the exact failure this
+    // whole directive exists to prevent.
+    //
     // EMPTY. 59 of 107 open PRs in that repo (55%) return `owners: []` with
     // `withheldForAuthorizationCount: 0`, and that is the TRUTH, not a binding failure:
     // their only issue key is an external tracker's (`BLO-*`), which is not a Paperclip
@@ -14044,8 +14060,8 @@ export function buildPaperclipTaskMarkdown(input: {
     // assumes a row-shaped home exists, and for most of this repo none does. Naming the
     // PR as the fallback is the only thing that makes the rule total; nothing else was
     // anybody's stated obligation.
-    "⚠ `owners` is WIDER than the owner set, and filtering it is not optional. A row means the PR NAMED that issue somewhere, not that the issue owns the PR. Every row carries `owningIdentifiers` -- the resolved true owner -- and it stays correct even on the spurious rows. Record the constraint only on rows whose own `identifier` appears in their `owningIdentifiers`. Measured 2026-11-07: 20 rows returned for 6 real owners, so 14 of 20 were mention-adjacency; writing to those delivers a false constraint to a row whose owner has no context to evaluate it. `owningIdentifiers: null` means NOT RECORDED (an agent-registered or pre-field row) and is NOT \"owns nothing\"; an empty array IS authoritative.",
-    "If `owners` is empty AND `withheldForAuthorizationCount` is 0, the artifact has no Paperclip owning row at all -- usually correct rather than broken: a PR whose only issue key belongs to an external tracker references no Paperclip row, so none is written (measured 2026-11-07: 55% of open `Blockcast/onprem-k8s` PRs). You still owe the constraint a home, so record it as a COMMENT ON THE PULL REQUEST itself -- that is the only place a run working that artifact will look. Note the count is scoped to the company you queried: it reports authorization withholding inside that company and can never reveal an owner outside it.",
+    "⚠ `owners` is WIDER than the owner set, and filtering it is not optional. A row means the PR NAMED that issue somewhere, not that the issue owns the PR. Every row reports `owningIdentifiers` -- the resolved true owner, or `null` where it was never recorded -- and where it is recorded it stays correct even on the spurious rows. Record the constraint on rows whose own `identifier` appears in their `owningIdentifiers`, OR whose `owningIdentifiers` is `null`. Measured 2026-11-07: 20 rows returned for 6 real owners, so 14 of 20 were mention-adjacency; writing to those delivers a false constraint to a row whose owner has no context to evaluate it. The two absent shapes take OPPOSITE directions and collapsing them is the whole trap. `owningIdentifiers: null` means NOT RECORDED -- only the webhook ever writes the field, so an agent-registered row never carries it -- and absence is evidence of nothing, so a `null` row stays IN and you record on it; an agent registering its own PR is itself an ownership claim. An empty ARRAY is the opposite: authoritative, the PR named no owner in its branch, title or labeled body, so an `[]` row is OUT.",
+    "If NO row survives that filter -- `owners` empty, or non-empty with every row removed as mention-adjacency -- AND `withheldForAuthorizationCount` is 0, the artifact has no Paperclip owning row you can write to. The empty case is the common one and is usually correct rather than broken: a PR whose only issue key belongs to an external tracker references no Paperclip row, so none is written (measured 2026-11-07: 55% of open `Blockcast/onprem-k8s` PRs). Either way you still owe the constraint a home, so record it as a COMMENT ON THE PULL REQUEST itself -- that is the only place a run working that artifact will look. Note the count is scoped to the company you queried: it reports authorization withholding inside that company and can never reveal an owner outside it.",
   );
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
