@@ -132,7 +132,7 @@ describeEmbeddedPostgres("heartbeat reconcileUndeliverableIssueMonitors", () => 
       .then((rows) => rows[0]!);
   }
 
-  it("clears a monitor stranded by a raw status park, and keeps the notes readable (BLO-33539)", async () => {
+  it("clears a monitor stranded by a raw status park, and keeps what it was watching readable (BLO-33539, PEN-5902)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const dueAt = new Date(Date.now() - 60 * 60 * 1000);
     const issueId = await seedArmedIssue(companyId, agentId, dueAt);
@@ -149,8 +149,15 @@ describeEmbeddedPostgres("heartbeat reconcileUndeliverableIssueMonitors", () => 
     expect(row.monitorNextCheckAt).toBeNull();
     expect((row.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
       .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
-    // ...and what it was watching survives on the issue.
-    expect((row.executionState as { monitor?: { notes?: string } }).monitor?.notes).toBe(MONITOR_NOTES);
+    // ...and PEN-5902 moved WHERE what it was watching survives. BLO-33539 kept
+    // the notes on `executionState.monitor.notes` as a second copy, reasoning
+    // that the clear had just nulled the column. That copy turned out to be the
+    // hazard: it is on the surface the next run reads, it is named identically
+    // to the live field, and no verb could write to it — so a stranded row's
+    // retired operating instructions were permanent and read as a live gate.
+    // The guarantee is unchanged, the surface moved to the activity entry
+    // asserted below, which is append-only and actor-stamped.
+    expect((row.executionState as { monitor?: { notes?: string | null } }).monitor?.notes).toBeNull();
     // The issue is NOT promoted back into an eligible state: clearing a dead
     // monitor must never hand out the wake the monitor could not deliver.
     expect(row.status).toBe("blocked");
@@ -161,6 +168,8 @@ describeEmbeddedPostgres("heartbeat reconcileUndeliverableIssueMonitors", () => 
       .where(eq(activityLog.entityId, issueId));
     expect(logged).toHaveLength(1);
     expect(logged[0]).toMatchObject({ action: "issue.monitor_cleared_undeliverable" });
+    // BLO-33539's actual requirement, and now the only copy: a human asking
+    // "what was this row waiting for" can still answer it.
     expect(logged[0]!.details).toMatchObject({ clearReason: "invalid_status", notes: MONITOR_NOTES });
   });
 

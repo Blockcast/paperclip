@@ -517,6 +517,259 @@ describe("monitor recovery handoff bookkeeping (PEN-5346)", () => {
   });
 });
 
+/**
+ * PEN-5902 — a cleared monitor's `notes` used to outlive it forever.
+ *
+ * `monitor.notes` is free prose the arming run addresses to the NEXT WAKING
+ * RUN: what to check on wake, which gate is live, what not to touch. PEN-1995
+ * nulled the `monitorNotes` column on every clear for exactly that reason, on
+ * the stated premise that the copy on `executionState.monitor.notes` was a
+ * harmless audit duplicate. It was not harmless — it is reachable by every
+ * reader of the row, it is named identically to the live field, and no verb
+ * could write to it. Measured on PEN-4929: `paperclipClearIssueMonitor`
+ * returned 200, nulled the column, and left 500 characters of operating
+ * instructions byte-identical on the state, including a rule that had been
+ * void company-wide for two days.
+ *
+ * So the clear now scrubs the archived copy too. The exemption is keyed on
+ * whether a clear has a DEFERRED reader of those notes, which is `cancelled`
+ * alone — `reconcileCancelledIssueMonitorRecoveries` emits that row's recovery handoff
+ * on a later tick, after the column is gone, and that recovery issue may be
+ * the only surviving carrier of the obligation.
+ */
+describe("a clear scrubs the archived monitor notes (PEN-5902)", () => {
+  const armedAt = "2099-04-11T12:30:00.000Z";
+  const notes = "ON WAKE: merged -> crit6; else verify heads, change nothing.";
+
+  const armedPolicy = () =>
+    normalizeIssueExecutionPolicy({
+      stages: [],
+      monitor: { nextCheckAt: armedAt, scheduledBy: "assignee", notes },
+    })!;
+
+  const armedIssue = (overrides: Record<string, unknown> = {}) => ({
+    status: "in_progress",
+    assigneeAgentId: coderAgentId,
+    assigneeUserId: null,
+    monitorNextCheckAt: new Date(armedAt),
+    monitorNotes: notes,
+    executionState: null,
+    ...overrides,
+  });
+
+  const monitorOf = (state: unknown) =>
+    (state as { monitor?: Record<string, unknown> } | null)?.monitor ?? null;
+
+  // `issueExecutionStateSchema` requires the whole stage block; a partial
+  // object fails `safeParse`, `parseIssueExecutionState` hands back null, and
+  // every assertion below would go vacuously true.
+  const stateWithMonitor = (monitor: Record<string, unknown>) =>
+    ({
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor,
+    }) as unknown as IssueExecutionState;
+
+  const clearedMonitor = (overrides: Record<string, unknown> = {}) => ({
+    status: "cleared",
+    nextCheckAt: null,
+    lastTriggeredAt: null,
+    attemptCount: 7,
+    notes,
+    scheduledBy: "assignee",
+    clearedAt: "2026-11-06T20:07:29.721Z",
+    clearReason: "manual",
+    clearedNextCheckAt: armedAt,
+    recoveryEmittedAt: null,
+    ...overrides,
+  });
+
+  it("nulls the archived notes on an explicit clear, not just the column", () => {
+    // The exact call the Security Engineer made: DELETE /issues/:id/monitor,
+    // which always records `clearReason: "manual"`.
+    const policy = armedPolicy();
+    const result = applyIssueMonitorPolicyTransition({
+      issue: armedIssue({ executionPolicy: policy }),
+      policy: stripMonitorFromExecutionPolicy(policy),
+      previousPolicy: policy,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    expect(result.patch.monitorNotes).toBeNull();
+    expect(monitorOf(result.patch.executionState)).toMatchObject({
+      status: "cleared",
+      clearReason: "manual",
+      notes: null,
+      // The rest of the object is an audit record and survives — scrubbing
+      // `notes` is not licence to blank the row's history.
+      clearedNextCheckAt: armedAt,
+    });
+  });
+
+  it("nulls them on a status-driven clear too", () => {
+    // The commonest path by far, and the one that accumulates the carriers:
+    // park on an external wait with notes, finish the work, set `done`.
+    // Nobody calls the clear verb here at all.
+    const patch = buildIssueMonitorEligibilityPatch(
+      armedIssue({ status: "done", executionPolicy: armedPolicy() }),
+    );
+
+    expect(monitorOf(patch.executionState)).toMatchObject({ status: "cleared", notes: null });
+  });
+
+  it("keeps them for a cancelled clear, whose recovery handoff reads them later", () => {
+    // `reconcileCancelledIssueMonitorRecoveries` runs on a LATER tick and rebuilds the
+    // dispatch row as `{ ...row, monitorNotes: monitorState.notes }`. Scrub
+    // here and that re-hydration silently reads null, so the recovery issue —
+    // possibly the only surviving carrier, since the source row is cancelled —
+    // loses the whole record of what was being waited on.
+    const patch = buildIssueMonitorEligibilityPatch(
+      armedIssue({ status: "cancelled", executionPolicy: armedPolicy() }),
+    );
+
+    expect(monitorOf(patch.executionState)).toMatchObject({
+      status: "cleared",
+      clearReason: "cancelled",
+      notes,
+      recoveryEmittedAt: null,
+    });
+  });
+
+  it("retracts notes left behind by a clear that predates this behaviour", () => {
+    // The retroactive half. Every row cleared before this change still holds
+    // its notes, and the ordinary clear branch declines an already-cleared
+    // monitor, so without this there is no write path to them at all — which
+    // was the actual complaint on PEN-5902.
+    const result = applyIssueMonitorPolicyTransition({
+      issue: armedIssue({
+        status: "todo",
+        monitorNextCheckAt: null,
+        monitorNotes: null,
+        executionPolicy: null,
+        executionState: stateWithMonitor(clearedMonitor()),
+      }),
+      policy: null,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    expect(monitorOf(result.patch.executionState)).toMatchObject({
+      notes: null,
+      // Re-stamping these would falsify when and why the monitor actually
+      // died, which is why this is a notes-only scrub and not a re-clear.
+      clearedAt: "2026-11-06T20:07:29.721Z",
+      clearReason: "manual",
+      attemptCount: 7,
+      clearedNextCheckAt: armedAt,
+    });
+  });
+
+  it("declines the retraction while a cancelled handoff is still owed", () => {
+    const result = applyIssueMonitorPolicyTransition({
+      issue: armedIssue({
+        status: "todo",
+        monitorNextCheckAt: null,
+        monitorNotes: null,
+        executionPolicy: null,
+        executionState: stateWithMonitor(
+          clearedMonitor({ clearReason: "cancelled", recoveryEmittedAt: null }),
+        ),
+      }),
+      policy: null,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    expect(result.patch.executionState).toBeUndefined();
+  });
+
+  it("allows it once that handoff has been discharged", () => {
+    const result = applyIssueMonitorPolicyTransition({
+      issue: armedIssue({
+        status: "todo",
+        monitorNextCheckAt: null,
+        monitorNotes: null,
+        executionPolicy: null,
+        executionState: stateWithMonitor(
+          clearedMonitor({
+            clearReason: "cancelled",
+            recoveryEmittedAt: "2026-11-06T20:09:00.000Z",
+          }),
+        ),
+      }),
+      policy: null,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    expect(monitorOf(result.patch.executionState)).toMatchObject({
+      notes: null,
+      clearReason: "cancelled",
+      recoveryEmittedAt: "2026-11-06T20:09:00.000Z",
+    });
+  });
+
+  it("writes nothing when the archived notes are already empty", () => {
+    // Idempotence. Without this the retraction branch would rewrite
+    // `executionState` on every clear of an already-clean cleared row, which
+    // is a write the convergence and activity machinery would have to absorb.
+    const result = applyIssueMonitorPolicyTransition({
+      issue: armedIssue({
+        status: "todo",
+        monitorNextCheckAt: null,
+        monitorNotes: null,
+        executionPolicy: null,
+        executionState: stateWithMonitor(clearedMonitor({ notes: null })),
+      }),
+      policy: null,
+      previousPolicy: null,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: true,
+    });
+
+    expect(result.patch.executionState).toBeUndefined();
+  });
+
+  it("does not let an incidental transition destroy the notes of a LIVE monitor", () => {
+    // The guard that keeps the scrub honest: only a caller who explicitly
+    // wrote the monitor clears it. A status-only carry-forward must leave an
+    // armed monitor — and its notes — completely alone.
+    const policy = armedPolicy();
+    const result = applyIssueMonitorPolicyTransition({
+      issue: armedIssue({ executionPolicy: policy }),
+      policy,
+      previousPolicy: policy,
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      monitorExplicitlyUpdated: false,
+    });
+
+    expect(result.patch.monitorNotes).not.toBeNull();
+    expect(derivePersistedMonitorState({
+      issue: armedIssue({ executionPolicy: policy }),
+      state: null,
+      policy,
+    })).toMatchObject({ status: "scheduled", notes });
+  });
+});
+
 describe("normalizeIssueExecutionPolicy", () => {
   it("returns null for null/undefined input", () => {
     expect(normalizeIssueExecutionPolicy(null)).toBeNull();
@@ -2100,8 +2353,14 @@ describe("issue execution policy transitions", () => {
         monitor: {
           status: "cleared",
           clearReason: "manual",
-          // Audit copy is retained on the state, so nulling the column is lossless.
-          notes: "Read lastHeartbeatAt after the capacity reset",
+          // PEN-5902: this used to assert the opposite — that the audit copy
+          // was retained on the state, which was what made nulling the column
+          // "lossless". That copy was the defect's hiding place: same name as
+          // the live field, on the surface every reader of the row reaches,
+          // and no verb could write to it. What makes nulling the column
+          // lossless is the `issue.monitor_cleared` activity entry, written
+          // from the pre-clear row.
+          notes: null,
         },
       });
     });
