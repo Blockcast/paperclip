@@ -2186,7 +2186,7 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
     name: "AGENT_HOME",
     classification: "SAFE_LITERAL",
     reason:
-      "Filesystem path to the agent's home directory. For an external instructions bundle this is `instructionsRootPath`, the per-seat dir on the mounted `paperclip-data` PVC; otherwise the server-provided workspace agent home. A path either way, never a credential. (The unqualified \"on the mounted PVC\" this reason used to claim was false for the second case — see the AGENT_HOME resolution in buildEnvVars, PEN-2585.)",
+      "Filesystem path to the agent's home directory. When the agent's instructions bundle sits on the data mount this is its `agentBundleRoot` — the per-seat dir on the mounted `paperclip-data` PVC, the same path the writable instructions mount is derived from; otherwise the server-provided workspace agent home. A path either way, never a credential. (The unqualified \"on the mounted PVC\" this reason used to claim was false for the second case — see the AGENT_HOME resolution in buildEnvVars, PEN-2585.)",
   },
 
   // --- SAFE_LITERAL: runtime services -----------------------------------
@@ -2706,25 +2706,60 @@ function buildEnvVars(
   // and 4 of 4 `$AGENT_HOME`-relative paths in the `para-memory-files` skill — which
   // is MANDATED via `desiredSkills` for at least one seat — resolve to nothing.
   //
-  // The fix is the one opencode_k8s already shipped: for an "external" instructions
-  // bundle, point AGENT_HOME at `instructionsRootPath`. That root is the per-seat
-  // CephFS dir on the `paperclip-data` PVC, and THIS adapter already binds it into the
-  // pod (`agentBundleRoot` -> `resolveScopedWritableMounts`), so it is mounted, durable
-  // and writable by construction. It is also where the charter's companions actually
-  // live, so `$AGENT_HOME/{HEARTBEAT,SOUL,TOOLS}.md` resolve for the first time.
+  // THE FIX IS A JOIN, NOT A VALUE. The old bug was an env var with no relation to
+  // any mount. So resolve AGENT_HOME through `agentBundleRoot` — the SAME helper
+  // `resolveScopedWritableMounts` derives the writable instructions mount from, fed
+  // the SAME input (`config.instructionsFilePath`, which that resolver receives as
+  // `agentInstructionsFilePath`). Not a second spelling of the path: the file already
+  // states that discipline fifty lines below `agentBundleRoot`, for the read-only
+  // withdrawal — "two derivations of this path could disagree, and the permissive
+  // direction of that disagreement is the rw mount this exists to withdraw." The
+  // permissive direction here is an AGENT_HOME naming a tree the pod never mounted,
+  // which is the whole defect.
+  //
+  // Keying on `instructionsBundleMode === "external"` + `instructionsRootPath` — the
+  // first cut of this fix — is such a second spelling, and the two AGREE ONLY FOR
+  // `external`. `syncInstructionsBundleConfigFromFilePath` persists
+  // `instructionsRootPath = dirname(instructionsFilePath)`, so for a `managed` bundle
+  // at `.../agents/<id>/instructions/AGENTS.md` the root is the `instructions/` dir
+  // while `agentBundleRoot` returns its PARENT `.../agents/<id>` — which is what gets
+  // mounted, and what the candidate list's own comment calls for ("open the whole
+  // agent dir so `memory/` is covered too"). That branch therefore missed `managed`
+  // seats entirely, and extending it to `|| "managed"` would have handed them an
+  // AGENT_HOME one level too deep, putting `$AGENT_HOME/memory/` inside the
+  // instructions bundle: durable, mounted, and silently the wrong directory forever.
+  // Caught in review by @Ceo before merge (PEN-2585, 2026-11-07T02:1xZ).
+  //
+  // The on-volume test is the other half of the join and is NOT redundant:
+  // `agentBundleRoot` only refuses the volume root, so an operator-set bundle outside
+  // the data mount (the case `warnIfPersistentTreeIsOffVolume` exists for) would
+  // otherwise produce a durable-LOOKING AGENT_HOME that no mount backs — this very
+  // bug by a new route. `resolveScopedWritableMounts` creates the mount iff its
+  // `accept()` predicate holds, so AGENT_HOME is mounted iff the same test holds here.
+  //
+  // Falls back to the server-provided workspace agentHome when there is no bundle on
+  // the volume (legacy / single-file agents — unchanged, and still a fallback onto
+  // nothing; the suite's negative control pins that).
   //
   // NOTE for anyone porting from the sibling tree: opencode_k8s's comment at this same
   // call site asserts "claude_k8s agents (whose AGENT_HOME already IS the bundle dir)
   // worked". That premise is FALSE and was never measured here — this adapter had no
   // such branch until now, which is exactly why the bug survived the fix that named it.
-  //
-  // Falls back to the server-provided workspace agentHome when no external bundle is
-  // configured (single-file / legacy agents — unchanged).
-  const instructionsBundleMode = asString(config.instructionsBundleMode, "").trim();
-  const instructionsRootPathForHome = asString(config.instructionsRootPath, "").trim();
-  const externalBundleHome =
-    instructionsBundleMode === "external" && instructionsRootPathForHome ? instructionsRootPathForHome : "";
-  setIfPresent("AGENT_HOME", externalBundleHome || workspaceContext.agentHome);
+  const agentHomeDataMountPath = resolveDataMountPath(config);
+  const agentHomeDataPrefix = agentHomeDataMountPath.endsWith("/")
+    ? agentHomeDataMountPath
+    : `${agentHomeDataMountPath}/`;
+  const agentHomeBundleRoot = agentBundleRoot(
+    asString(config.instructionsFilePath, "").trim() || null,
+    agentHomeDataMountPath,
+  );
+  const mountedBundleHome =
+    agentHomeBundleRoot &&
+    path.posix.isAbsolute(agentHomeBundleRoot) &&
+    agentHomeBundleRoot.startsWith(agentHomeDataPrefix)
+      ? agentHomeBundleRoot
+      : "";
+  setIfPresent("AGENT_HOME", mountedBundleHome || workspaceContext.agentHome);
 
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
