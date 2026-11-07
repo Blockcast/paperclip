@@ -35553,6 +35553,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // running, so its createdAt can be old; queuedAt resets its
         // dispatch-wait clock to this re-queue instant, same reasoning as
         // promoteScheduledRetryRun above.
+        //
+        // ⚠️ PEN-5310: that last clause is wrong and the stamp is kept only
+        // for the rest of the sentence. This run never LEFT `queued` --
+        // BLO-48769 keeps a deferred run there deliberately -- so unlike a
+        // promotion there is no new queue entry here to restart a clock for,
+        // and the queued-run age gauges that read this column were silently
+        // zeroing a run that had been waiting for hours. They now discount a
+        // `queued_at` written beside a forward `retryAt`; see
+        // `deferWroteQueuedAtSql` in `dispatch-readiness.ts`. The column is
+        // left as-is because it has no control-plane effect and other readers
+        // treat it as "last touched".
         queuedAt: now,
         updatedAt: now,
       })
@@ -35660,6 +35671,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         contextSnapshot: context,
         // BLO-25024: same as deferRunForK8sIsolationConflict above. This run was
         // already running, so reset its dispatch-wait clock to this re-queue.
+        //
+        // ⚠️ PEN-5310: and it inherits that function's correction too -- this
+        // run never left `queued`, so the stamp is an in-place touch rather
+        // than a new queue entry, and the age gauges discount it. See
+        // `deferWroteQueuedAtSql` in `dispatch-readiness.ts`.
         queuedAt: now,
         updatedAt: now,
       })

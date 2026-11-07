@@ -505,6 +505,164 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
     expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBeLessThan(43000);
   });
 
+  // PEN-5310. The three `queued_at` writers do not mean the same thing, and
+  // the two defer writers stamp a row that never left `queued` -- so the stamp
+  // resets the measured age of a run that has been waiting all along. These
+  // pin the discriminator in BOTH directions: the block above must keep
+  // passing (promotion still ages off `queued_at`, onprem-k8s#2013 intact)
+  // while a defer re-stamp is ignored.
+  describe("defer re-stamps do not reset the measured age (PEN-5310)", () => {
+    for (const [writer, retryAtKey] of [
+      ["deferRunForK8sIsolationConflict", "paperclipK8sIsolationRetryAt"],
+      ["deferRunForBranchClaimConflict", "paperclipBranchClaimRetryAt"],
+    ] as const) {
+      it(`ages a run re-stamped by ${writer} off createdAt`, async () => {
+        // The measurement this issue was filed on: a run queued 7,214s that
+        // reported ~86s because a defer touched `queued_at` in place. The run
+        // never left `queued`, so none of that wait was served.
+        //
+        // Both defer writers stamp `retryAt = now + backoff` in the SAME
+        // `.set()` as `queuedAt: now`, so `retryAt > queued_at` is what marks
+        // the stamp as defer-written. Backoff here is the 300s ceiling.
+        const { companyId, agentId } = await insertCompanyAndAgent();
+        const now = new Date("2026-08-04T12:00:00.000Z");
+        const createdAt = new Date(now.getTime() - 7_214_000);
+        const queuedAt = new Date(now.getTime() - 86_000);
+
+        await db.insert(heartbeatRuns).values({
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          status: "queued",
+          contextSnapshot: {
+            // Already elapsed, so the run is dispatch-READY and reaches the
+            // claimable gauge too -- a still-future stamp would be filtered as
+            // deferred and the claimable assertion would pass for the wrong
+            // reason. Still strictly after `queuedAt`, which is what the
+            // discriminator reads.
+            [retryAtKey]: new Date(queuedAt.getTime() + 56_000).toISOString(),
+          },
+          createdAt,
+          queuedAt,
+          updatedAt: queuedAt,
+        });
+
+        await refreshQueuedRunAgeMetrics(db, now);
+        const { body } = await renderMetrics();
+        expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(7214);
+        expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(7214);
+      });
+    }
+
+    it("still ages off queuedAt when a promoted run only INHERITED a defer stamp", async () => {
+      // The route that makes presence-keying unsound, and the reason this
+      // discriminator reads the stamp's value instead. There is no
+      // `queued -> scheduled_retry` transition, so a row cannot defer and then
+      // be promoted. But a successor minted by `carryRetryContextSnapshot`
+      // inherits its predecessor's defer keys -- `stripRunScopedSnapshotMarkers`
+      // does not list them -- and is then promoted normally. It carries stamps
+      // it never earned, and its `queued_at` is a legitimate promotion.
+      // Reporting its whole park as dispatch wait is exactly the
+      // false-stranded-run alert onprem-k8s#2013 removed.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-08-04T12:00:00.000Z");
+      const createdAt = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+      const queuedAt = new Date(now.getTime() - 90_000);
+
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "queued",
+        contextSnapshot: {
+          // Predecessor-era: written before this row was promoted, so it sorts
+          // BEFORE `queuedAt` and is correctly read as not-defer-written.
+          paperclipK8sIsolationRetryAt: new Date(
+            queuedAt.getTime() - 4 * 60 * 60 * 1000,
+          ).toISOString(),
+          paperclipK8sIsolationRetryAttempt: 7,
+        },
+        createdAt,
+        queuedAt,
+        updatedAt: queuedAt,
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(90);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBeLessThan(43000);
+    });
+
+    it("does not abort the refresh on a malformed inherited stamp", async () => {
+      // A cast to timestamptz would raise here and take the whole refresh
+      // down, zeroing `..._refresh_success` and blinding the alert -- one bad
+      // row costing every seat its gauge. Text comparison cannot raise.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-08-04T12:00:00.000Z");
+
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "queued",
+        contextSnapshot: { paperclipK8sIsolationRetryAt: "not-a-timestamp" },
+        createdAt: new Date(now.getTime() - 600_000),
+        updatedAt: now,
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 1`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(600);
+    });
+
+    it("reports the defer-re-stamped head rather than the younger untouched run behind it", async () => {
+      // The defect is worse than a per-run zeroing. `dispatchRank` ages from
+      // `created_at`, so the oldest rows are considered -- and under
+      // saturation refused -- most often, and every refusal re-stamps them
+      // further down this ordering. Without the discriminator the gauge's head
+      // is whichever run the dispatcher has touched LEAST, so the number reads
+      // better exactly as the queue gets worse. Measured 2026-11-07: a true
+      // oldest of 11.70h published as 3.33h against an 1800s threshold.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-08-04T12:00:00.000Z");
+      const restampedQueuedAt = new Date(now.getTime() - 60_000);
+
+      // Contended: oldest, thrashing, re-stamped seconds ago.
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "queued",
+        contextSnapshot: {
+          paperclipK8sIsolationRetryAt: new Date(
+            restampedQueuedAt.getTime() + 50_000,
+          ).toISOString(),
+          paperclipK8sIsolationRetryAttempt: 48,
+        },
+        createdAt: new Date(now.getTime() - 11 * 60 * 60 * 1000),
+        queuedAt: restampedQueuedAt,
+        updatedAt: now,
+      });
+      // Uncontended: younger, never deferred. This is the run the unfixed
+      // gauge promotes to head.
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "queued",
+        contextSnapshot: {},
+        createdAt: new Date(now.getTime() - 3 * 60 * 60 * 1000),
+        updatedAt: now,
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(11 * 3600);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(11 * 3600);
+    });
+  });
+
   it("marks the age snapshot stale after a refresh failure without publishing a false zero", async () => {
     const { companyId, agentId } = await insertCompanyAndAgent();
     const now = new Date("2026-08-04T12:00:00.000Z");
