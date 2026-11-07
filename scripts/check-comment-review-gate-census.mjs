@@ -60,9 +60,32 @@ const DEFAULT_PR_LIMIT = 60;
  * adding its alternative here is silent — the census simply stops seeing that
  * population — which is why `pr-comment-review-gate.test.ts` pins each one
  * against this predicate rather than against a copy of it.
+ *
+ * Two alternatives quote the gate's sentence in full rather than its opening
+ * clause, and that length is load-bearing (PEN-5565). The predicate used to
+ * read `no head SHA was supplied` and `The PR author is unknown` — the two
+ * shortest alternatives, and both generic enough that another team's status
+ * could say them by coincidence. That was tolerable only while this predicate
+ * was confined to the `review/` namespace. It no longer is: PEN-5781 widened
+ * the audit to every namespace, so a foreign green borrowing either phrase now
+ * lands in `unclassified`, the bucket whose whole purpose is to shout RENAME.
+ * A false rename alarm on a job that reds is worse than a missed row, because
+ * it is the alarm nobody can act on and therefore the one that gets muted.
+ *
+ * Lengthening costs no coverage. `No head SHA was supplied to evaluate
+ * against.` and `The PR author is unknown, so this head's attestation cannot
+ * be shown to be independent.` are what `pr-comment-review-gate.ts` posts
+ * verbatim (`description: verdict.reason`), at 45 and 87 characters against
+ * the 140-character commit-status cap, so neither is ever truncated into the
+ * short form. Measured 2026-11-06 over 1,876 statuses on 544 pull requests in
+ * `paperclip`, `onprem-k8s` and `penstock-llm-proxy-core`: the old and new
+ * predicates match the same 724 rows, nothing lost and nothing gained, and
+ * NEITHER short fragment appears in a single live status — both branches are
+ * ones this gate almost never reaches. The long forms are strictly narrower on
+ * foreign wording and identical on our own.
  */
 const NOT_EVALUATED_DESCRIPTION_PATTERN =
-  /no (?:independent )?Ally consolidated-review comment attests|no head SHA was supplied|attesting this head is the PR author's own|attesting this head is a plain issue comment|The PR author is unknown/i;
+  /no (?:independent )?Ally consolidated-review comment attests|No head SHA was supplied to evaluate against|attesting this head is the PR author's own|attesting this head is a plain issue comment|this head's attestation cannot be shown to be independent/i;
 
 export function isReviewNamespacedContext(context) {
   return typeof context === "string" && context.trim().toLowerCase().startsWith("review/");

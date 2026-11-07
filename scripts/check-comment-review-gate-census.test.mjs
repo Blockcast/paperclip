@@ -72,6 +72,19 @@ describe("admitsNothingEvaluated", () => {
     // module never wrote.
     assert.equal(admitsNothingEvaluated("The PR author has not requested a review yet."), false);
     assert.equal(admitsNothingEvaluated("octocat approved head abc1234 as the PR author."), false);
+
+    // PEN-5565. These two are the regression guard for the shortest pair of
+    // alternatives, which used to read `The PR author is unknown` and `no head
+    // SHA was supplied`. Both sentences are ones an unrelated status could
+    // plausibly write, and under the PEN-5781 all-namespace audit a match puts
+    // the foreign row in `unclassified` — the bucket that reports a RENAME.
+    // Each case below is green only while the alternative quotes enough of the
+    // gate's own sentence to exclude it.
+    assert.equal(admitsNothingEvaluated("The PR author is unknown to this changelog bot."), false);
+    assert.equal(
+      admitsNothingEvaluated("Skipped: no head SHA was supplied by the workflow dispatch."),
+      false,
+    );
   });
 
   it("does not flag a genuine reviewed-and-clean description", () => {
