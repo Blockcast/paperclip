@@ -15,10 +15,12 @@ import {
 } from "../services/issue-execution-lock.js";
 import {
   acquireWorkspaceDirClaim,
+  companyScopedRespellings,
   refuseUnlockedIssueDirectory,
   releaseWorkspaceDirClaim,
   resolveWorkspaceClaimLocation,
   type ClaimOwnerLiveness,
+  type WorkspaceClaimRespelling,
 } from "../services/workspace-dir-claim.js";
 
 /**
@@ -150,60 +152,17 @@ export function isInsideRootInclusive(root: string, child: string): boolean {
 }
 
 /**
- * The agent pod's spelling of a shared path is NOT the server's spelling, and
- * PEN-5865 is what that costs.
+ * Why `companyScopedRespellings` is imported rather than defined here.
  *
- * Measured on this deployment 2026-11-07: the API server mounts PVC
- * `paperclip-data` (CephFS subvolume `csi-vol-3bdd0e68-...`) at `/paperclip`
- * with NO subPath, while the agent pods mount a COMPANY-SCOPED subPath of the
- * SAME subvolume -- volume `work/<companyId>` at `/paperclip/work`, volume
- * `wt/<companyId>` at `/paperclip/wt`. So one directory has two names:
- *
- *     agent pod:   /paperclip/work/cto-5865
- *     API server:  /paperclip/work/<companyId>/cto-5865
- *
- * NEITHER candidate cause filed on PEN-5865 was live. The volume IS shared,
- * and the roots ARE correct -- `PAPERCLIP_WORKSPACE_CLAIM_ROOTS` is unset on
- * the deployment, so the `/paperclip` default applies and contains BOTH
- * spellings. The agent simply could not name the directory in terms the server
- * resolves, `realpath` threw, and the refusal said "does not exist" about a
- * path the caller was standing in. Every claim from an agent pod refused,
- * which made PEN-5352's remedy absent rather than weak.
- *
- * So the server re-spells, because it is the only party that can: it knows the
- * calling run's company and it knows its own mount layout. ONE candidate, not
- * a search -- the company segment goes directly below the first segment under
- * the root, which is where the subPath mounts put it. A guessed insertion at
- * every depth would turn a precise refusal into a fishing expedition.
- *
- * This can only ever NARROW what the caller reached: the segment inserted is
- * the CALLING run's own company, so a re-spelling cannot land in a tenant's
- * tree the literal path did not already name. It is tried ONLY when the
- * literal path does not resolve, so it can never silently redirect a claim
- * away from a directory that does exist. The winner is then put through the
- * same stat, strict-root and write-location checks as any other path -- this
- * decides WHICH path is meant, never whether it is allowed.
+ * PEN-5865's mapping is not only needed for the path the caller names: a
+ * linked worktree's `.git` pointer is written by git ON THE AGENT POD, so it
+ * carries the agent's spelling too, and the claim LOCATION is derived from it.
+ * Three places resolve that location independently -- this route,
+ * `acquireWorkspaceDirClaim` and `releaseWorkspaceDirClaim` -- so the mapping
+ * lives beside the layout it feeds, and all three are handed the same
+ * `WorkspaceClaimRespelling` value. See that type for the measured mount
+ * layout and for why this can only narrow what a caller reaches.
  */
-export function companyScopedRespellings(
-  roots: string[],
-  lexicalPath: string,
-  companyId: string | null,
-): string[] {
-  if (!companyId) return [];
-  const candidates = new Set<string>();
-  for (const root of roots) {
-    if (!isStrictlyInsideRoot(root, lexicalPath)) continue;
-    const segments = path.relative(root, lexicalPath).split(path.sep).filter(Boolean);
-    // A mount segment AND something below it. `<root>/work` is the mount point
-    // itself, which is never a claimable directory, and re-spelling it would
-    // produce `<root>/<companyId>` -- a different thing entirely.
-    if (segments.length < 2) continue;
-    // Already company-scoped; re-spelling would yield `work/<cid>/<cid>/...`.
-    if (segments[1] === companyId) continue;
-    candidates.add(path.join(root, segments[0], companyId, ...segments.slice(1)));
-  }
-  return [...candidates];
-}
 
 /**
  * The refusal for a path the server cannot resolve.
@@ -306,7 +265,7 @@ export function workspaceDirClaimRoutes(db: Db) {
   async function resolveClaimDir(
     rawDirPath: string,
     companyId: string | null,
-  ): Promise<{ dirPath: string; note?: string } | { refusal: string }> {
+  ): Promise<{ dirPath: string; respelling: WorkspaceClaimRespelling; note?: string } | { refusal: string }> {
     const roots = await realRoots(resolveWorkspaceClaimRoots(process.env, companyId));
     if (roots.length === 0) {
       return {
@@ -325,6 +284,7 @@ export function workspaceDirClaimRoutes(db: Db) {
     // path always wins when it resolves: re-spelling is a fallback, never a
     // rewrite of a path that already names something.
     const lexicalPath = path.resolve(rawDirPath);
+    const respelling: WorkspaceClaimRespelling = { roots, companyId };
     const respellings = companyScopedRespellings(roots, lexicalPath, companyId);
     let resolved = await realpath(rawDirPath).catch(() => null);
     let respelledTo: string | null = null;
@@ -341,6 +301,30 @@ export function workspaceDirClaimRoutes(db: Db) {
     if (resolved === null) {
       return { refusal: refuseUnresolvablePath({ rawDirPath, lexicalPath, roots, respellings }) };
     }
+    // LITERAL-FIRST IS SAFE BUT NOT UNAMBIGUOUS, and the ambiguity is worth a
+    // log line rather than silence (Ally, #3498). Under the measured layout a
+    // literal hit beneath a subPath-mounted segment is usually an UNSCOPED
+    // server-side tree, not the directory the agent is standing in -- and two
+    // companies' runs that both name `/paperclip/work/foo` then collide on
+    // that one directory, which is the opposite of what the company segment is
+    // for. Not a confinement problem: the claim still lands inside the roots,
+    // and inverting the preference would be worse, since it would redirect a
+    // server-local caller's perfectly good path. So it is reported, not
+    // changed -- a collision that gets investigated beats one that does not.
+    if (respelledTo === null && respellings.length > 0) {
+      const shadowed: string[] = [];
+      for (const candidate of respellings) {
+        if ((await stat(candidate).catch(() => null))?.isDirectory()) shadowed.push(candidate);
+      }
+      if (shadowed.length > 0) {
+        logger.warn(
+          { rawDirPath, resolved, shadowed, companyId },
+          "workspace dir claim: literal path resolved while a company-scoped directory of the same name also" +
+            " exists; the claim is on the literal one",
+        );
+      }
+    }
+
     // Say so rather than re-spelling silently. The response already echoes the
     // resolved `dirPath`, but a caller comparing it to what it sent deserves
     // to know WHY it moved -- and the next investigator deserves to find the
@@ -381,9 +365,30 @@ export function workspaceDirClaimRoutes(db: Db) {
     // the caller named.
     //
     // Inclusive containment here, strict above: see `isInsideRootInclusive`.
-    const location = await resolveWorkspaceClaimLocation(resolved).catch(() => null);
+    const location = await resolveWorkspaceClaimLocation(resolved, respelling).catch(() => null);
     if (!location) {
       return { refusal: `PATH REFUSED: the claim location for "${resolved}" could not be resolved.` };
+    }
+    // REFUSE RATHER THAN DEGRADE. An unresolvable `.git` pointer used to fall
+    // through to the plain-directory branch, which puts the claim in the
+    // WORKING TREE -- an untracked file that `git add -A` commits into
+    // somebody's PR and `git clean -fd` deletes, taking the mutual exclusion
+    // with it. From an agent pod that branch was unreachable before PEN-5865,
+    // because `realpath` threw on the agent's spelling first; re-spelling is
+    // what makes it reachable, so it is closed in the same change that opens
+    // it (Ally, #3498).
+    if (location.unresolvedGitDir) {
+      return {
+        refusal:
+          `PATH REFUSED: "${resolved}" carries a .git pointer to "${location.unresolvedGitDir}", which does not` +
+          " resolve to a directory on the server in either spelling (literal or company-scoped)." +
+          " A linked worktree's pointer is written by git on YOUR pod, so it names the gitdir the way your pod" +
+          " does; this server could not find it either way, which usually means the repository it points into" +
+          " is not on the shared volume." +
+          " The claim is NOT placed in the working tree instead: a claim there is an untracked file that" +
+          " `git add -A` commits and `git clean -fd` deletes, which would silently drop the exclusion this" +
+          " call exists to take.",
+      };
     }
     for (const [label, target] of [
       ["claim", path.dirname(location.claimPath)],
@@ -405,7 +410,7 @@ export function workspaceDirClaimRoutes(db: Db) {
         };
       }
     }
-    return note ? { dirPath: resolved, note } : { dirPath: resolved };
+    return note ? { dirPath: resolved, respelling, note } : { dirPath: resolved, respelling };
   }
 
   router.post("/workspace-dir-claims", validate(claimBodySchema), async (req, res) => {
@@ -493,6 +498,7 @@ export function workspaceDirClaimRoutes(db: Db) {
 
     const outcome = await acquireWorkspaceDirClaim({
       dirPath,
+      respelling: resolvedDir.respelling,
       self: {
         runId: actor.runId,
         agentId: actor.agentId ?? null,
@@ -522,7 +528,11 @@ export function workspaceDirClaimRoutes(db: Db) {
     }
     // `releaseWorkspaceDirClaim` refuses to remove a claim that is not ours, so
     // the run id is the authorization and there is nothing to check here.
-    const result = await releaseWorkspaceDirClaim({ dirPath: resolvedDir.dirPath, runId: actor.runId });
+    const result = await releaseWorkspaceDirClaim({
+      dirPath: resolvedDir.dirPath,
+      runId: actor.runId,
+      respelling: resolvedDir.respelling,
+    });
     res.status(200).json({
       ...result,
       dirPath: resolvedDir.dirPath,
