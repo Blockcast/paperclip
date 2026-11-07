@@ -34,6 +34,18 @@ export const issues = pgTable(
     targetDate: date("target_date"),
     title: text("title").notNull(),
     description: text("description"),
+    // PEN-5876: pointer to the newest `issue_field_revisions` row for this
+    // issue, and its number. Deliberately a plain uuid with no FK, exactly as
+    // `documents.latest_revision_id` is, to keep the two tables free of a
+    // circular reference.
+    //
+    // This column is what makes the precondition a real compare-and-set: the
+    // equality is repeated in the UPDATE's WHERE clause, so it is re-evaluated
+    // against the latest row version when the statement blocks on a concurrent
+    // transaction. Checking it only against the row the route read would leave
+    // exactly the window this issue was filed about. 0 means "never revised".
+    latestFieldRevisionId: uuid("latest_field_revision_id"),
+    latestFieldRevisionNumber: integer("latest_field_revision_number").notNull().default(0),
     status: text("status").notNull().default("backlog"),
     workMode: text("work_mode").notNull().default("standard"),
     harnessKind: text("harness_kind"),

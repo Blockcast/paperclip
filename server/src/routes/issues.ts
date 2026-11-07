@@ -11309,6 +11309,27 @@ export function issueRoutes(
     res.json(result.document);
   });
 
+  // PEN-5876: readable revision history for the guarded scalar text field set.
+  // Read-only and gated by the ordinary issue read check — history is evidence,
+  // so anyone who may read the field may read how it got there.
+  router.get("/issues/:id/field-revisions", async (req, res) => {
+    const id = req.params.id as string;
+    const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
+    if (!issue) return;
+    if (!(await assertIssueReadAllowed(req, res, issue))) return;
+    const limitRaw = Number.parseInt(String(req.query.limit ?? "50"), 10);
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 200) : 50;
+    const revisions = await svc.listFieldRevisions(issue.id, limit);
+    res.json({
+      issueId: issue.id,
+      // Echo the pointer so a caller can read the history and take a base
+      // revision for its next write in one round trip.
+      latestFieldRevisionId: issue.latestFieldRevisionId ?? null,
+      latestFieldRevisionNumber: issue.latestFieldRevisionNumber ?? 0,
+      revisions,
+    });
+  });
+
   router.get("/issues/:id/documents/:key/revisions", async (req, res) => {
     const id = req.params.id as string;
     const issue = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
@@ -13397,6 +13418,9 @@ export function issueRoutes(
       resume: resumeRequested,
       interrupt: interruptRequested,
       hiddenAt: hiddenAtRaw,
+      // PEN-5876: destructured out so it never reaches the column set — it is a
+      // precondition, not a field to write.
+      baseRevisionId: baseFieldRevisionId,
       ...updateFields
     } = req.body;
     const shouldCancelActiveRunForCancelledStatus =
@@ -13929,6 +13953,24 @@ export function issueRoutes(
             expectedCurrentExecutionRunId: currentRunMutationOwnershipSnapshot.executionRunId,
           }
         : {};
+    // PEN-5876: optional compare-and-set over `title` + `description`.
+    //
+    // Honoured WHENEVER SUPPLIED, including on a patch that writes neither
+    // field. Scoping it to writes that touch the field set was the first draft
+    // and is wrong for this row of all rows: it would accept a precondition,
+    // ignore it, and answer 200 — a payload silently doing something other than
+    // what it said, which is the defect class this issue is about. There is no
+    // back-compat cost, because no caller sends this field today; anyone who
+    // sends it is new code that opted in and means it.
+    //
+    // Keyed on the data ("has this field moved since I read it?"), never on who
+    // holds the checkout: that lock is advisory at the field-write layer, and in
+    // the incident this was filed from the lock HOLDER is the party whose
+    // content was destroyed, so a holder-keyed test catches one ordering only.
+    const fieldRevisionPrecondition =
+      baseFieldRevisionId !== undefined
+        ? { expectedCurrentFieldRevisionId: baseFieldRevisionId as string }
+        : {};
 
     let issue;
     try {
@@ -13943,6 +13985,8 @@ export function issueRoutes(
               actorUserId: actor.actorType === "user" ? actor.actorId : null,
               ...executionSnapshotPreconditions,
               ...currentRunMutationPreconditions,
+              ...fieldRevisionPrecondition,
+              actorRunId: actor.runId ?? null,
               ...(authorizationPinnedAssignee
                 ? {
                     ...(delegateRecoveryPatchInFlight ? { expectedCurrentStatus: "blocked" } : {}),
@@ -13997,6 +14041,8 @@ export function issueRoutes(
           actorUserId: actor.actorType === "user" ? actor.actorId : null,
           ...executionSnapshotPreconditions,
           ...currentRunMutationPreconditions,
+          ...fieldRevisionPrecondition,
+          actorRunId: actor.runId ?? null,
           ...(authorizationPinnedAssignee
             ? {
                 ...(delegateRecoveryPatchInFlight ? { expectedCurrentStatus: "blocked" } : {}),
