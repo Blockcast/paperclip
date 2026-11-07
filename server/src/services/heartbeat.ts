@@ -13994,15 +13994,22 @@ export function buildPaperclipTaskMarkdown(input: {
     "",
     "Pre-write re-read directive:",
     "(System-generated, not user-authored task data. It constrains how this run writes; it is not a preference you can decline.)",
-    "Before ANY write verb against a pull request -- push, force-push, rebase, enqueue, auto-merge, review-request removal -- re-read LIVE state and act on what that read says, not on what this block says:",
+    "Before ANY write verb against a pull request -- push, force-push, rebase, body or title edit, review submission, enqueue, auto-merge, review-request change -- re-read LIVE state and act on what that read says, not on what this block says:",
     "- Your row's `activeRun` (`paperclipGetIssue`). If a run that is not yours holds it, a sibling of yours is already working this row; do not write over it.",
     "- The pull request's current head (`gh pr view <n> --repo <owner>/<repo> --json headRefOid,state,mergeStateStatus`). If it has moved since you last read it, what you were about to push was computed against a head that no longer exists, and any authorisation scoped to that head has lapsed -- ask again rather than assuming it carried over.",
     // PEN-5802: the two bullets above are both blind to a metadata write, and this bullet
     // says so rather than leaving a run to infer it. The head bullet is push-scoped by
-    // construction -- it reasons about "what you were about to push" -- but the verb list
-    // this directive opens with enumerates `enqueue`, `auto-merge` and `review-request
-    // removal`, none of which move the head. A run that reads the verb list as the scope
-    // and the head check as the gate concludes that an unmoved head clears a body edit.
+    // construction -- it reasons about "what you were about to push" -- but most of the
+    // verbs this directive opens with never move the head. A run that reads the verb list
+    // as the scope and the head check as the gate concludes that an unmoved head clears a
+    // body edit.
+    //
+    // Review of #3487 widened that opening list to name the metadata verbs explicitly
+    // (body/title edit, review submission) and this bullet now PARTITIONS that one list
+    // rather than carrying a second enumeration of its own. The two lists had drifted
+    // apart in exactly the way that invites a reader to treat the difference as meaningful;
+    // the verb-list test could also be satisfied by the bullet's copy, so it was not in
+    // fact pinning the opening list at all.
     //
     // Measured, not predicted: two sibling runs of ONE seat each spent ONE body-edit grant
     // 38 s apart on Blockcast/penstock-llm-proxy-core#3108, both bullets above correctly
@@ -14022,7 +14029,7 @@ export function buildPaperclipTaskMarkdown(input: {
     // already hold, and it is scoped `(issue, agent, key)`, so it does not span seats. Both
     // remain open on PEN-5802. This is a detector one run can read, not a lock that
     // serialises two.
-    "- That head check is PUSH-scoped. For a metadata write it is not a weak gate, it is a NON-gate: a body or title edit, a review submission, an enqueue, an auto-merge toggle and a review-request change all leave `headRefOid` byte-identical, so an unmoved head shows only that no PUSH landed -- never that an authorisation you were handed is still unspent. pushing a branch has a server-side compare-and-swap, which is what refuses a stale push; `PATCH /pulls/:n` has none, and `updatedAt` is measured to bump with no mutation on any readable surface, so it cannot separate them either. If what authorises this write is SINGLE-USE, redeem its receipt key BEFORE writing -- `paperclipAddComment` with the key the grant names -- and treat `deduplicated: true` as \"a sibling run already spent this; abort, do not write\". That key is scoped `(issue, agent, key)`, so it fails closed against sibling runs of your own seat: the collision the bullet above cannot see, because `activeRun` is per-ROW while a single-use grant is per-ARTIFACT. A grant that names no receipt key cannot be checked at all -- ask for a keyed one rather than writing.",
+    "- That head check is PUSH-scoped: only push, force-push and rebase move `headRefOid`, so for every other verb above it is not a weak gate but a NON-gate -- an unmoved head shows only that no push landed, never that an authorisation you were handed is still unspent. A non-force push is refused by a server-side compare-and-swap and `--force-with-lease` restores one, but a plain force-push and `PATCH /pulls/:n` have none; `updatedAt` is measured to bump with no mutation on any readable surface, so it cannot substitute. If what authorises this write is SINGLE-USE, redeem its receipt key BEFORE writing -- `paperclipAddComment` ON THE ISSUE THE GRANT WAS POSTED ON, not whichever row you happen to hold, with the key the grant names -- and treat `deduplicated: true` as \"a sibling run already spent this; abort, do not write\". The key is scoped `(issue, agent, key)` and the issue is part of it, so redeeming on the wrong row only inserts a second receipt that refuses nothing -- one PR can have several owning rows, and your sibling may hold a different one. Redeemed on the granting row it fails closed against sibling runs of your own seat: the collision the bullet above cannot see, because `activeRun` is per-ROW while a single-use grant is per-ARTIFACT. A grant that names no receipt issue and key cannot be checked at all -- ask for a keyed one rather than writing.",
     "Every value in this block was computed when this run was DISPATCHED, not now. That includes any head SHA, sibling-run id or checkout-contention notice printed above: a sibling run that started after your dispatch appears in none of it. Re-reading this prompt is not re-reading state.",
     "",
     "Recording a constraint:",
