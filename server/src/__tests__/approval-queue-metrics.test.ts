@@ -91,16 +91,22 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     updatedAt?: Date;
     decidedAt?: Date | null;
     requestedByAgentId?: string;
+    /** Attach a `payload.gate`, which is what the `gated` label reads (PEN-5885). */
+    gate?: { kind: string; prNumber?: number; runId?: number };
+    gateSatisfied?: boolean | null;
+    decisionNote?: string;
   }) {
     await db.insert(approvals).values({
       companyId: input.companyId,
       requestedByAgentId: input.requestedByAgentId ?? null,
       type: input.type ?? "request_board_approval",
       status: input.status,
-      payload: {},
+      payload: input.gate ? { gate: input.gate } : {},
       createdAt: input.createdAt,
       updatedAt: input.updatedAt ?? input.createdAt,
       decidedAt: input.decidedAt ?? null,
+      gateSatisfied: input.gateSatisfied ?? null,
+      decisionNote: input.decisionNote ?? null,
     });
   }
 
@@ -128,10 +134,10 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     await refreshApprovalQueueMetrics(db, NOW);
     const { body } = await renderMetrics();
 
-    expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type: "request_board_approval" })).toBe(2);
-    expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type: "hire_agent" })).toBe(1);
+    expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type: "request_board_approval", gated: "false" })).toBe(2);
+    expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type: "hire_agent", gated: "false" })).toBe(1);
     // Oldest of the two, not the newest and not their sum.
-    expect(series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { ...board, type: "request_board_approval" })).toBe(600);
+    expect(series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { ...board, type: "request_board_approval", gated: "false" })).toBe(600);
     expect(body).toContain(`${APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC} 1`);
   });
 
@@ -162,12 +168,13 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     const age = series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, {
       ...agent,
       type: "request_board_approval",
+      gated: "false",
     });
     // 90 minutes of board-owned wait, not 8 days -- and specifically BELOW the
     // 7d (604800s) PaperclipApprovalStarved threshold this card used to trip.
     expect(age).toBe(5_400);
     expect(age!).toBeLessThan(604_800);
-    expect(series(body, APPROVALS_PENDING_METRIC, { ...agent, type: "request_board_approval" })).toBe(1);
+    expect(series(body, APPROVALS_PENDING_METRIC, { ...agent, type: "request_board_approval", gated: "false" })).toBe(1);
   });
 
   // The guard on the fix itself: GREATEST must not let a backdated `updated_at`
@@ -187,7 +194,7 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     await refreshApprovalQueueMetrics(db, NOW);
     const { body } = await renderMetrics();
 
-    expect(series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { ...board, type: "request_board_approval" })).toBe(3_600);
+    expect(series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { ...board, type: "request_board_approval", gated: "false" })).toBe(3_600);
   });
 
   // THE LOAD-BEARING CASE. This is the defect the issue was filed on: the 8 most
@@ -197,7 +204,13 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
   // alert silently resets itself every time the backlog self-cleans, and the
   // stopped queue is never detected. Deleting the BOARD_DECISION_STATUSES filter
   // must turn this test red.
-  it("does NOT advance the last-decision timestamp on withdrawn or cancelled cards", async () => {
+  //
+  // The `cancelled` row here carries a null `gate_satisfied`: no gate adjudicated
+  // it, so it is ordinary cleanup and stays excluded exactly as before. PEN-5885
+  // narrows the exclusion to that case and to gate-DIED (`false`); the two tests
+  // below pin both sides of that narrowing, and this one pins what it must not
+  // touch.
+  it("does NOT advance the last-decision timestamp on withdrawn or ungated cancelled cards", async () => {
     const companyId = await insertCompany();
     const boardDecidedAt = new Date("2026-08-19T20:52:50.000Z");
     const withdrawnAt = new Date("2026-08-22T23:00:00.000Z");
@@ -236,7 +249,199 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     // threshold while pending > 0, i.e. it would have paged at 2026-08-20T02:52Z.
     const stalenessSeconds = NOW.getTime() / 1000 - boardDecidedAt.getTime() / 1000;
     expect(stalenessSeconds).toBeGreaterThan(21_600);
-    expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type: "request_board_approval" })).toBe(1);
+    expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type: "request_board_approval", gated: "false" })).toBe(1);
+  });
+
+  // THE LOAD-BEARING CASE FOR PEN-5885. A `payload.gate` card asks a human to
+  // merge a pull request; when they do, the reconciler closes it `cancelled` with
+  // no `decided_by_user_id`, because nobody touched the card UI. Excluding the
+  // whole status read that as requester-side cleanup, so the board merging twenty
+  // pull requests inside one 72h window left this gauge frozen and paged Platform
+  // for 11 days against a board that was working. Reverting the filter to
+  // BOARD_DECISION_STATUSES alone must turn this test red.
+  it("advances the last-decision timestamp when a MERGE gate was satisfied", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId);
+    const boardDecidedAt = new Date("2026-08-19T20:52:50.000Z");
+    const mergedAt = new Date("2026-08-22T23:00:00.000Z");
+
+    await insertApproval({
+      companyId,
+      status: "approved",
+      requestedByAgentId: agentId,
+      createdAt: new Date(boardDecidedAt.getTime() - 3_600_000),
+      decidedAt: boardDecidedAt,
+    });
+    // The gated PR merged: the board served this ask, through GitHub.
+    await insertApproval({
+      companyId,
+      status: "cancelled",
+      requestedByAgentId: agentId,
+      gate: { kind: "github_pr_merged", prNumber: 3461 },
+      gateSatisfied: true,
+      createdAt: new Date(mergedAt.getTime() - 3_600_000),
+      decidedAt: mergedAt,
+    });
+
+    await refreshApprovalQueueMetrics(db, NOW);
+    const { body } = await renderMetrics();
+
+    expect(series(body, APPROVAL_LAST_DECISION_TIMESTAMP_METRIC, agent)).toBe(mergedAt.getTime() / 1000);
+  });
+
+  // The other half, and the one that keeps the fix honest. A gate dies
+  // unsatisfied when the pull request is CLOSED UNMERGED -- nobody served
+  // anything, the ask simply evaporated. It lands in the same status, on the same
+  // code path, with the same null `decided_by_user_id` as the case above, and the
+  // only thing separating them is the column PEN-5885 adds. Reading
+  // `gate_satisfied IS NOT FALSE`, or admitting `cancelled` wholesale, lets an
+  // abandoned branch read as recovery -- the same false-recovery failure the
+  // withdrawal exclusion exists to prevent, through a new door.
+  it("does NOT advance the last-decision timestamp when a gate DIED unsatisfied", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId);
+    const boardDecidedAt = new Date("2026-08-19T20:52:50.000Z");
+    const abandonedAt = new Date("2026-08-22T23:00:00.000Z");
+
+    await insertApproval({
+      companyId,
+      status: "approved",
+      requestedByAgentId: agentId,
+      createdAt: new Date(boardDecidedAt.getTime() - 3_600_000),
+      decidedAt: boardDecidedAt,
+    });
+    await insertApproval({
+      companyId,
+      status: "cancelled",
+      requestedByAgentId: agentId,
+      gate: { kind: "github_pr_merged", prNumber: 3461 },
+      gateSatisfied: false,
+      createdAt: new Date(abandonedAt.getTime() - 3_600_000),
+      decidedAt: abandonedAt,
+    });
+    await insertApproval({
+      companyId,
+      status: "pending",
+      requestedByAgentId: agentId,
+      createdAt: new Date(NOW.getTime() - 86_400_000),
+    });
+
+    await refreshApprovalQueueMetrics(db, NOW);
+    const { body } = await renderMetrics();
+
+    expect(series(body, APPROVAL_LAST_DECISION_TIMESTAMP_METRIC, agent)).toBe(boardDecidedAt.getTime() / 1000);
+  });
+
+  // The third gate case, and the one `gate_satisfied` alone gets WRONG. On a
+  // `github_actions_run` gate `satisfied` means only "the run this card named
+  // finished green" -- `approval-gate-reconciler.ts` says so on
+  // SUCCESS_CONCLUSION itself, and PEN-5103 exists because a card can name a run
+  // on a pull request whose ask is "a human must REVIEW this". Nobody served
+  // anything when CI went green, so admitting it here would let a build robot
+  // push this gauge to now and silence PaperclipApprovalQueueNotServicing for a
+  // full window against an idle board -- the same false recovery as a withdrawal
+  // burst, through a third door. Dropping the kind conjunct from
+  // MERGE_GATE_DECISION must turn this test red; note the row below is
+  // `gate_satisfied = true`, so the boolean alone cannot save it.
+  it("does NOT advance the last-decision timestamp when a satisfied gate is a CI run, not a merge", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId);
+    const boardDecidedAt = new Date("2026-08-19T20:52:50.000Z");
+    const runWentGreenAt = new Date("2026-08-22T23:00:00.000Z");
+
+    await insertApproval({
+      companyId,
+      status: "approved",
+      requestedByAgentId: agentId,
+      createdAt: new Date(boardDecidedAt.getTime() - 3_600_000),
+      decidedAt: boardDecidedAt,
+    });
+    await insertApproval({
+      companyId,
+      status: "cancelled",
+      requestedByAgentId: agentId,
+      gate: { kind: "github_actions_run", runId: 40434542378 },
+      gateSatisfied: true,
+      createdAt: new Date(runWentGreenAt.getTime() - 3_600_000),
+      decidedAt: runWentGreenAt,
+    });
+    await insertApproval({
+      companyId,
+      status: "pending",
+      requestedByAgentId: agentId,
+      createdAt: new Date(NOW.getTime() - 86_400_000),
+    });
+
+    await refreshApprovalQueueMetrics(db, NOW);
+    const { body } = await renderMetrics();
+
+    expect(series(body, APPROVAL_LAST_DECISION_TIMESTAMP_METRIC, agent)).toBe(boardDecidedAt.getTime() / 1000);
+  });
+
+  // PEN-5885 done-when #6. The pending population is two queues wearing one
+  // label: a gated card retires itself when its PR merges, an ungated one can
+  // leave only by a board verb no agent can use. Over this control plane's whole
+  // history no gated card stayed pending past 2.35d while 80 ungated ones passed
+  // 7d, so `{gated="false"}` is the depth the alerts actually fire on. `type`
+  // cannot express it -- both cards below are `request_board_approval`, which is
+  // what the whole measured backlog was.
+  it("splits pending depth and oldest age by whether the card carries a gate", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId);
+    await insertApproval({
+      companyId,
+      status: "pending",
+      requestedByAgentId: agentId,
+      gate: { kind: "github_pr_merged", prNumber: 3461 },
+      createdAt: new Date(NOW.getTime() - 3_600_000),
+    });
+    await insertApproval({
+      companyId,
+      status: "pending",
+      requestedByAgentId: agentId,
+      createdAt: new Date(NOW.getTime() - 86_400_000),
+    });
+
+    await refreshApprovalQueueMetrics(db, NOW);
+    const { body } = await renderMetrics();
+
+    const pending = (gated: string) =>
+      series(body, APPROVALS_PENDING_METRIC, { ...agent, type: "request_board_approval", gated });
+    const age = (gated: string) =>
+      series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { ...agent, type: "request_board_approval", gated });
+
+    expect(pending("true")).toBe(1);
+    expect(pending("false")).toBe(1);
+    // The 24h ungated card is the one the starvation alert is about; the 1h
+    // gated card must not dilute it, and the unsplit gauge could not say so.
+    expect(age("false")).toBe(86_400);
+    expect(age("true")).toBe(3_600);
+  });
+
+  // The depth gauge seeds BOTH halves, so a drained board-owned queue reads an
+  // explicit `{gated="false"} 0` rather than dropping out of the vector --
+  // "board-owned depth is zero" and "this label was never exported" are the two
+  // readings a responder must never have to guess between. The age gauge is not
+  // seeded, for the reason the drained-type test above gives.
+  it("seeds both halves of the gated label so a drained half reads 0, not absent", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId);
+    await insertApproval({
+      companyId,
+      status: "pending",
+      requestedByAgentId: agentId,
+      gate: { kind: "github_pr_merged", prNumber: 3461 },
+      createdAt: new Date(NOW.getTime() - 3_600_000),
+    });
+
+    await refreshApprovalQueueMetrics(db, NOW);
+    const { body } = await renderMetrics();
+
+    expect(series(body, APPROVALS_PENDING_METRIC, { ...agent, type: "request_board_approval", gated: "true" })).toBe(1);
+    expect(series(body, APPROVALS_PENDING_METRIC, { ...agent, type: "request_board_approval", gated: "false" })).toBe(0);
+    expect(
+      series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { ...agent, type: "request_board_approval", gated: "false" }),
+    ).toBeNull();
   });
 
   it("treats revision_requested as a board decision but not as pending", async () => {
@@ -255,7 +460,7 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     expect(series(body, APPROVAL_LAST_DECISION_TIMESTAMP_METRIC, board)).toBe(decidedAt.getTime() / 1000);
     // The card is back in the requester's court, so it must not hold the
     // board-unresponsiveness alert's pending>0 gate open.
-    expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type: "request_board_approval" })).toBe(0);
+    expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type: "request_board_approval", gated: "false" })).toBe(0);
   });
 
   it("resets a drained type to an explicit 0 rather than leaving a stale series", async () => {
@@ -267,7 +472,11 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     });
     await refreshApprovalQueueMetrics(db, NOW);
     expect(
-      series((await renderMetrics()).body, APPROVALS_PENDING_METRIC, { ...board, type: "request_board_approval" }),
+      series((await renderMetrics()).body, APPROVALS_PENDING_METRIC, {
+        ...board,
+        type: "request_board_approval",
+        gated: "false",
+      }),
     ).toBe(1);
 
     await db.execute(sql`UPDATE approvals SET status = 'approved', decided_at = now()`);
@@ -277,7 +486,7 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     // An absent series is what "never exported" looks like, so drained must be a
     // real 0 -- for the drained type and for every type the queue could hold.
     for (const type of APPROVAL_TYPES) {
-      expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type })).toBe(0);
+      expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type, gated: "false" })).toBe(0);
     }
     // No pending card means no oldest card: absent, not a misleading 0.
     expect(body).not.toContain(`${APPROVAL_OLDEST_PENDING_AGE_METRIC}{`);
@@ -407,13 +616,13 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     expect(body).not.toMatch(new RegExp(`^${APPROVAL_LAST_DECISION_TIMESTAMP_METRIC} `, "m"));
 
     const pending = (companyId: string, requester: typeof agent | typeof board, type: string) =>
-      series(body, APPROVALS_PENDING_METRIC, { company_id: companyId, ...requester, type });
+      series(body, APPROVALS_PENDING_METRIC, { company_id: companyId, ...requester, type, gated: "false" });
     expect(pending(companyA, agent, "request_board_approval")).toBe(1);
     expect(pending(companyA, board, "request_board_approval")).toBe(0);
     expect(pending(companyB, agent, "hire_agent")).toBe(1);
     expect(pending(companyB, agent, "request_board_approval")).toBe(0);
     expect(
-      series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { company_id: companyB, ...agent, type: "hire_agent" }),
+      series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { company_id: companyB, ...agent, type: "hire_agent", gated: "false" }),
     ).toBe(120);
   });
 
@@ -490,7 +699,7 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     const { body } = await renderMetrics();
 
     expect(body).toContain(`${APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC} 0`);
-    expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type: "request_board_approval" })).toBe(1);
-    expect(series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { ...board, type: "request_board_approval" })).toBe(600);
+    expect(series(body, APPROVALS_PENDING_METRIC, { ...board, type: "request_board_approval", gated: "false" })).toBe(1);
+    expect(series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, { ...board, type: "request_board_approval", gated: "false" })).toBe(600);
   });
 });

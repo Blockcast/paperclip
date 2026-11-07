@@ -585,6 +585,13 @@ async function closeAndAnnounce(
       .update(approvals)
       .set({
         status: "cancelled",
+        // The discriminator, as data rather than as English (PEN-5885). `status`
+        // is `cancelled` on both branches above and the four `note` strings were
+        // the only surviving trace of which branch ran, so every downstream
+        // reader had to match a sentence -- and the one reader that mattered, the
+        // board-decision gauge, excluded the whole status instead. Writing the
+        // boolean that picked the sentence is the entire fix on this side.
+        gateSatisfied: disposition.satisfied,
         decisionNote: note,
         decidedAt: now,
         updatedAt: now,

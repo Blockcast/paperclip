@@ -1,6 +1,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, approvals } from "@paperclipai/db";
+import type { ApprovalGateKind } from "@paperclipai/shared";
 import {
   setApprovalQueueMetricsRefreshSuccess,
   setApprovalQueuePendingMetrics,
@@ -17,8 +18,106 @@ import {
  * were all `withdrawn`, which a depth-only metric scores as progress. Because
  * the last-decision timestamp below ignores them, a withdrawal-driven drain
  * leaves the staleness alert firing, which is the correct reading.
+ *
+ * That reasoning is exactly right for `withdrawn` and it OVER-REACHED on
+ * `cancelled` (PEN-5885). `cancelled` is not one event: the approval-gate
+ * reconciler writes it both when the gated pull request MERGED -- the board
+ * acting on the ask, through GitHub instead of through the card -- and when the
+ * pull request was closed unmerged and the ask simply died. Only the second is
+ * requester-side cleanup. {@link MERGE_GATE_DECISION} below admits the first
+ * and keeps the second out; `withdrawn` stays excluded in full.
  */
 const BOARD_DECISION_STATUSES = ["approved", "rejected", "revision_requested"] as const;
+
+/**
+ * The gate kind whose satisfaction is somebody serving the ask (PEN-5885).
+ *
+ * Typed against `ApprovalGateKind` rather than written as a bare string so that
+ * renaming the kind breaks this file at compile time instead of silently
+ * matching nothing -- a predicate that quietly stops matching restores the exact
+ * under-reporting this constant exists to remove, and nothing would report it.
+ */
+const MERGE_GATE_KIND: ApprovalGateKind = "github_pr_merged";
+
+/**
+ * The board serving an ask by MERGING the pull request it asked about (PEN-5885).
+ *
+ * A `payload.gate` card says "I need a human to merge this PR"; when that
+ * happens the reconciler closes the card `cancelled` with no `decided_by_user_id`,
+ * because no one touched the card UI. Reading that as requester-side cleanup --
+ * which {@link BOARD_DECISION_STATUSES} did, by excluding the whole status --
+ * made the service invisible: 20 asks were served this way inside one 72h window
+ * that the gauge reported as a dead channel, and 7 more inside a disjoint 60h
+ * window in which the decide verb was not used once. The alert that fired on
+ * that reading accused a board that was working the entire time.
+ *
+ * And it was getting worse, not drifting: `payload.gate` is the pattern that
+ * stops a satisfied card sitting pending forever, so the fleet is being told to
+ * adopt it -- and every adoption moved one more ask out of the population that
+ * could advance this gauge. Alert health and correct agent behaviour were
+ * anti-correlated, which is why this is fixed at the platform rather than in
+ * guidance.
+ *
+ * ⛔ THE KIND FILTER IS LOAD-BEARING AND IS NOT A REFINEMENT. `gate_satisfied`
+ * is true for BOTH live gate kinds, and for `github_actions_run` it means only
+ * "the run this card named ended green" -- `approval-gate-reconciler.ts` says so
+ * on `SUCCESS_CONCLUSION` itself ("a property of the RUN, never of the card's
+ * ask"), and PEN-5103 exists to stop downstream code reading it as the ask being
+ * met. Admitting that kind here would let a green CI run that no human touched
+ * push this gauge to now, which silences `PaperclipApprovalQueueNotServicing`
+ * for a full window while the board is idle -- the same false recovery the
+ * `withdrawn` exclusion was written to prevent, re-entering through the gate
+ * door. The base rate does not soften it: this is a LAST-timestamp gauge, not a
+ * counter, so one wrongly admitted row is a full window of silence regardless of
+ * how rare it is. Measured on company b1d3f3d3 at 2026-11-07T14:10Z, the 35
+ * cancellations split 29 satisfied `github_pr_merged` / 2 satisfied + 4 died
+ * `github_actions_run`, the most recent satisfied run 8 days old -- live, not
+ * legacy.
+ *
+ * ⚠️ What a merged gate establishes is that SOMEONE merged the pull request the
+ * card asked about, which serves the ask. It does not by itself establish that a
+ * human did: this repo requires no review and lands through a merge queue, so an
+ * agent or an auto-merge could in principle be the merger. Dated state, not an
+ * invariant: at 2026-11-07 the 8 most recent gate-satisfied pull requests across
+ * all three repos were merged by the same human account, because agent seats are
+ * barred from enqueuing agent-authored pull requests. If that bar lifts, this
+ * predicate stops implying a human and wants re-measuring -- it will not
+ * self-correct, and nothing here will report the change. Admitting it anyway is
+ * still right, because unlike a green run a merge does discharge the ask.
+ *
+ * `gate_satisfied IS TRUE`, never `IS NOT FALSE`: the three-valued column reads
+ * null on every row no gate adjudicated, and null here must behave as "not a
+ * board decision". The gate-DIED-unsatisfied half (`false`) stays excluded on
+ * purpose -- the PR was closed unmerged, nobody served anything, and admitting
+ * it would let an abandoned branch read as recovery in exactly the way a
+ * withdrawal burst must not.
+ */
+const MERGE_GATE_DECISION = sql`${approvals.status} = 'cancelled' and ${approvals.gateSatisfied} is true and ${approvals.payload}->'gate'->>'kind' = ${MERGE_GATE_KIND}`;
+
+/**
+ * Whether a pending card can retire itself, as a gauge label (PEN-5885/PEN-5719).
+ *
+ * The pending population is two channels with different owners wearing one
+ * label. A card carrying `payload.gate` retires when its pull request merges; a
+ * card without one can leave only by an `approved`/`rejected`/`revision_requested`
+ * verb that no agent can use. Measured over this control plane's entire history
+ * (80 days, 982 retired cards): NO card carrying a gate has ever stayed pending
+ * beyond 2.35 days, while 80 ungated cards passed 7 days and the oldest reached
+ * 65.4. The ungated half is the whole tail, and the alerts fire on the tail.
+ *
+ * `type` cannot separate them -- every card in the measured backlog was
+ * `request_board_approval` -- so `{gated="false"}` is the first expression that
+ * states board-owned depth without a `payload` query. Four seats re-derived that
+ * split by hand on four separate days because nothing exported it; this is the
+ * one field the aggregate already has to read.
+ *
+ * Keyed on gate PRESENCE, not on gate validity. A card advertising a gate kind
+ * the reconciler does not handle is still `gated="true"` here, which is the
+ * honest reading: the label reports what the card claims about itself. A gate
+ * that is never reconciled is a different defect, and `listCandidateApprovals`
+ * derives its predicate from `APPROVAL_GATE_KINDS` precisely so it cannot occur.
+ */
+const IS_GATED = sql<boolean>`${approvals.payload}->'gate'->>'kind' is not null`;
 
 /**
  * The one board decision whose ROW cannot be trusted to remember it.
@@ -119,7 +218,12 @@ const PENDING_SINCE = sql`greatest(${approvals.createdAt}, ${approvals.updatedAt
  * Labelled by company_id + requester (BLO-48410). PEN-3652 forbids reading the
  * cross-company aggregate: a decision in company B must never mask starvation in
  * company A, so the rules join `on(company_id)`. `requester` is "agent" when the
- * card has a requesting agent, else "board". Cardinality is companies x 2 x types.
+ * card has a requesting agent, else "board". The depth gauges carry `gated` as
+ * well (PEN-5885, see {@link IS_GATED}), so cardinality is
+ * companies x 2 requesters x types x 2. Every existing rule collapses the
+ * vector with `max by (company_id[, requester])`, which absorbs the new label
+ * without a rule change -- verified against the live rule file, where all five
+ * expressions do so.
  */
 export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Promise<void> {
   try {
@@ -130,12 +234,13 @@ export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Pro
           companyId: approvals.companyId,
           requester,
           type: approvals.type,
+          gated: IS_GATED,
           pending: sql<number | string>`count(*)`,
           oldestPendingSince: sql<Date | string | null>`min(${PENDING_SINCE})`,
         })
         .from(approvals)
         .where(eq(approvals.status, PENDING_STATUS))
-        .groupBy(approvals.companyId, requester, approvals.type),
+        .groupBy(approvals.companyId, requester, approvals.type, IS_GATED),
       // One row per (company, requester) with ANY history, so a channel that was
       // never decided still gets a series (at 0) -- the rule contract (BLO-48410).
       // A decided row with a null `decided_at` carries no timing information and
@@ -144,7 +249,7 @@ export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Pro
         .select({
           companyId: approvals.companyId,
           requester,
-          decidedAt: sql<Date | string | null>`max(${approvals.decidedAt}) filter (where ${inArray(approvals.status, [...BOARD_DECISION_STATUSES])} and ${approvals.decidedAt} is not null)`,
+          decidedAt: sql<Date | string | null>`max(${approvals.decidedAt}) filter (where (${inArray(approvals.status, [...BOARD_DECISION_STATUSES])} or (${MERGE_GATE_DECISION})) and ${approvals.decidedAt} is not null)`,
         })
         .from(approvals)
         .groupBy(approvals.companyId, requester),
@@ -195,6 +300,7 @@ export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Pro
         companyId: row.companyId,
         requester: row.requester,
         type: row.type,
+        gated: Boolean(row.gated),
         pending: Number(row.pending),
         oldestAgeSeconds: row.oldestPendingSince
           ? Math.max(0, (now.getTime() - new Date(row.oldestPendingSince).getTime()) / 1000)
