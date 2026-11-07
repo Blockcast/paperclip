@@ -102,7 +102,14 @@ async function seedIssue(db: Db, company: { id: string; issuePrefix: string }, n
 /** A row shaped exactly as the GitHub webhook writes it. */
 async function seedWebhookPullRequest(
   db: Db,
-  input: { companyId: string; issueId: string; externalId: string; owningIdentifiers: string[] },
+  input: {
+    companyId: string;
+    issueId: string;
+    externalId: string;
+    // Omitted means the writer recorded no ownership at all, which is a
+    // distinct state from `[]` and must stay distinguishable here (PEN-5836).
+    owningIdentifiers?: string[];
+  },
 ) {
   await db.insert(issueWorkProducts).values({
     companyId: input.companyId,
@@ -116,11 +123,20 @@ async function seedWebhookPullRequest(
     sourceTrust: PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST,
     metadata: {
       source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
-      owningIdentifiers: input.owningIdentifiers,
+      ...(input.owningIdentifiers === undefined
+        ? {}
+        : { owningIdentifiers: input.owningIdentifiers }),
       branch: "devops/pen-5181-broker-soak-queries",
       headSha: "eb2dc73765df23dd583890e7cf3ab7c6bfa4a733",
     },
   });
+}
+
+/** The response entries keyed by issue id, for assertions that span rows. */
+type OwnerEntry = { issueId: string; identifier: string; relation: string; provenance: string };
+
+function ownersById(owners: OwnerEntry[]): Map<string, OwnerEntry> {
+  return new Map(owners.map((owner) => [owner.issueId, owner]));
 }
 
 describeEmbeddedPostgres("GET /api/companies/:companyId/work-products/by-external-id", () => {
@@ -306,5 +322,106 @@ describeEmbeddedPostgres("GET /api/companies/:companyId/work-products/by-externa
     expect(res.status).toBe(200);
     expect(res.body.owners).toHaveLength(1);
     expect(res.body.owners[0].issueId).toBe(myIssue.id);
+  }, 120_000);
+
+  // PEN-5836: the defect this endpoint shipped with. A work product is written
+  // for EVERY issue a PR references, so `owners` carries mentioning rows, and
+  // `provenance` is "webhook" on both -- the agent-facing directive named that
+  // marker as the binding, so a run recording a freeze wrote it onto rows with
+  // no relation to the PR. `relation` is the field that actually separates them.
+  it("marks a mentioning row as a mention, with provenance identical to the owner's", async () => {
+    const company = await seedCompany(db, "Relation");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Owns the PR");
+    const mentioned = await seedIssue(db, company, 2, "Named in the PR body only");
+    // Both rows record the SAME owning set -- that is what the webhook writes.
+    const owningIdentifiers = [`${company.issuePrefix}-1`];
+    await seedWebhookPullRequest(db, { companyId: company.id, issueId: owner.id, externalId: PR, owningIdentifiers });
+    await seedWebhookPullRequest(db, { companyId: company.id, issueId: mentioned.id, externalId: PR, owningIdentifiers });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    const byId = ownersById(res.body.owners);
+    expect(byId.get(owner.id)!.relation).toBe("owner");
+    expect(byId.get(mentioned.id)!.relation).toBe("mention");
+    // The point of the row: provenance cannot be used for this, and the
+    // mentioning row is still RETURNED -- filtering it would trade a visible
+    // over-report for a silent under-report.
+    expect(byId.get(owner.id)!.provenance).toBe("webhook");
+    expect(byId.get(mentioned.id)!.provenance).toBe("webhook");
+    expect(res.body.withheldForAuthorizationCount).toBe(0);
+  }, 120_000);
+
+  // The arm a two-valued predicate loses. Agent-registered rows record no
+  // ownership, so `null` is the commonest value in the table; answering
+  // "mention" for them would turn this endpoint's visible over-reporting into
+  // silent under-reporting on the majority case.
+  it("reports undetermined, not mention, when the row recorded no ownership", async () => {
+    const company = await seedCompany(db, "Unrecorded");
+    const agent = await seedAgent(db, company.id);
+    const unrecorded = await seedIssue(db, company, 1, "Registered without ownership");
+    await seedWebhookPullRequest(db, { companyId: company.id, issueId: unrecorded.id, externalId: PR });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(1);
+    expect(res.body.owners[0].owningIdentifiers).toBeNull();
+    expect(res.body.owners[0].relation).toBe("undetermined");
+  }, 120_000);
+
+  // `[]` is authoritative where `null` is not: the resolver ran and found no
+  // owning ref in title, labeled body or branch. So it IS a negative.
+  it("reports a mention when the recorded owning set is authoritatively empty", async () => {
+    const company = await seedCompany(db, "EmptyOwning");
+    const agent = await seedAgent(db, company.id);
+    const named = await seedIssue(db, company, 1, "Named by an ownerless PR");
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: named.id,
+      externalId: PR,
+      owningIdentifiers: [],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners[0].owningIdentifiers).toEqual([]);
+    expect(res.body.owners[0].relation).toBe("mention");
+  }, 120_000);
+
+  // A PR legitimately closing two issues owns both, so `relation` must not
+  // collapse a multi-owner PR to a single winner.
+  it("marks every row of a multi-owner PR as an owner", async () => {
+    const company = await seedCompany(db, "MultiOwner");
+    const agent = await seedAgent(db, company.id);
+    const first = await seedIssue(db, company, 1, "First owner");
+    const second = await seedIssue(db, company, 2, "Second owner");
+    const mentioned = await seedIssue(db, company, 3, "Only mentioned");
+    const owningIdentifiers = [`${company.issuePrefix}-1`, `${company.issuePrefix}-2`];
+    for (const issue of [first, second, mentioned]) {
+      await seedWebhookPullRequest(db, { companyId: company.id, issueId: issue.id, externalId: PR, owningIdentifiers });
+    }
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    const byId = ownersById(res.body.owners);
+    expect(byId.get(first.id)!.relation).toBe("owner");
+    expect(byId.get(second.id)!.relation).toBe("owner");
+    expect(byId.get(mentioned.id)!.relation).toBe("mention");
   }, 120_000);
 });

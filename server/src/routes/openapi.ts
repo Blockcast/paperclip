@@ -2012,6 +2012,20 @@ registry.registerPath({
   path: "/api/companies/{companyId}/work-products/by-external-id",
   tags: ["issues"],
   summary: "Find the issues that own an external artifact (reverse of list issue work products)",
+  // PEN-5836: `owners` is a superset of the owning rows and always has been --
+  // the webhook writes a work product for every issue a PR references anywhere.
+  // The contract did not say so, and `provenance` reads like it discriminates.
+  description:
+    "`owners` includes rows the artifact merely MENTIONS, not only rows that own it. " +
+    "`provenance` does NOT separate them -- it reports who maintains the row (`webhook` vs " +
+    "self-`asserted`), and a mentioning row written by the webhook is `webhook` too. Use the " +
+    "per-entry `relation`: `owner` (the artifact's recorded owning set names this row), " +
+    "`mention` (ownership was recorded and this row is not in it), or `undetermined` " +
+    "(no ownership recorded -- the common case for agent-registered rows, and NOT a negative). " +
+    "The answer can also be too SHORT: `withheldForAuthorizationCount > 0` means owners were " +
+    "filtered out, and because the query is company-scoped an owner in another company is " +
+    "outside it entirely and is counted in neither number -- an entry's `owningIdentifiers` " +
+    "naming a key absent from `owners` is that case.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: workProductExternalIdLookupQuerySchema,

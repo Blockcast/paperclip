@@ -14020,7 +14020,28 @@ export function buildPaperclipTaskMarkdown(input: {
     // remainder as `withheldForAuthorizationCount`. Promising "EVERY owning row" would
     // teach a run that a short list means no owner -- the false absence this endpoint
     // exists to remove.
-    "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, with `provenance: \"webhook\"` marking the authoritative binding. `withheldForAuthorizationCount > 0` means owners exist that it did not show you -- an empty `owners` list is NOT proof the artifact is unowned.",
+    "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, each carrying a `relation`.",
+    // PEN-5836: `provenance: "webhook"` was documented here as "the authoritative
+    // binding", and it is not one. The webhook writes a work product for every issue a
+    // PR references anywhere -- deliberately, see `buildPullRequestWorkProductFields` --
+    // so a mentioning row is `"webhook"` too. Measured: one PR returned 11 owners of
+    // which 1 owned it, and a long-lived registry row had accumulated 26 PRs of which 8
+    // named it. A run following "record it on each" literally wrote constraints onto
+    // uninvolved rows, which is the specific way a prohibition gets discounted by the
+    // next reader of that row.
+    //
+    // The three-valued `relation` is computed server-side (see
+    // `pullRequestOwnershipRelation`) rather than left as a documented predicate the
+    // caller runs itself. The predicate is easy to state and its obvious two-valued
+    // form is wrong: `owningIdentifiers` is `null` on agent-registered rows, and a
+    // caller-side `identifier in (owningIdentifiers ?? [])` turns this endpoint's noisy
+    // over-reporting into silent under-reporting on the commonest row in the table.
+    //
+    // Both error directions are stated because a run told only about the short one
+    // reads a long list as settled truth, and that is the direction measured here.
+    "Read `relation`, NOT `provenance`. A work product is written for EVERY issue the pull request references anywhere, so `owners` also contains rows the PR merely MENTIONS -- and they carry `provenance: \"webhook\"` exactly like a real owner does, so that marker does not discriminate. `relation: \"owner\"` is a row the PR declares it owns; `\"mention\"` is a row it only names, so do not record the constraint there; `\"undetermined\"` means ownership was never recorded (agent-registered rows record none) and reads as UNKNOWN -- treat it as a possible owner, never as a no.",
+    "The list errs in BOTH directions, and only one of them announces itself. Too LONG: mentioning rows inflate it, so a frequently-cited row accumulates pull requests it has no relation to -- noisy, but visible. Too SHORT, and silent: `withheldForAuthorizationCount > 0` means owners exist that it did not show you -- an empty `owners` list is NOT proof the artifact is unowned -- and that counter does NOT cover an owner in another company, which is outside this company-scoped query and is counted nowhere. An entry whose `owningIdentifiers` names a key absent from `owners` is that case: say so on the row, rather than silently recording on the reachable subset.",
+    "This lookup is necessary for recording a constraint and is not sufficient for it. It is keyed on the ARTIFACT, while the hazard is keyed on the FILE SET: a row whose planned work edits the same files is bound to no pull request and so does not appear here at all. Enumerate those yourself.",
   );
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
