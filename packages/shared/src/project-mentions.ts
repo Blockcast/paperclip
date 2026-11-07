@@ -467,6 +467,22 @@ export interface UnboundMentionScanOptions {
    * label is not reported; every other `@` token is.
    */
   boundAgentIds?: readonly string[];
+  /**
+   * PEN-5812. The subset of {@link boundAgentIds} whose wake THIS author was
+   * not entitled to raise on THIS row — the ids the caller's
+   * `commentAuthorCanGrantIssueMention` guard would `continue` past.
+   *
+   * Binding and entitlement are different mechanisms evaluated in different
+   * places, so this set cannot be derived here: resolution is a property of
+   * the body, entitlement is a property of the author and the row. The caller
+   * supplies it; this scanner only reduces those ids to the names the author
+   * wrote, using the same {@link boundLabelName} reduction as `bound`.
+   *
+   * Ids not also present in `boundAgentIds` are ignored. A mention that did not
+   * resolve is already reported in `unbound`, and reporting it twice would make
+   * the three lists stop partitioning cleanly.
+   */
+  withoutGrantAgentIds?: readonly string[];
 }
 
 /**
@@ -527,6 +543,43 @@ export interface MentionBindingReport {
    * `bound`.
    */
   unbound: string[];
+  /**
+   * PEN-5812. Names that resolved — so they are in `bound`, never in `unbound`
+   * — but whose wake the author was not entitled to raise on this row, and
+   * which therefore woke nobody and conferred no grant.
+   *
+   * Normally a subset of `bound`, and that overlap IS the report: `bound` alone
+   * cannot distinguish a mention that did something from one that did nothing,
+   * because it is computed from `findMentionedAgents` alone and never consults
+   * `commentAuthorCanGrantIssueMention`. There is no pair of inputs — one
+   * grantable mention, one not — that makes `bound` differ. A name appearing in
+   * both lists means: the link was well formed, the agent exists, and nothing
+   * happened.
+   *
+   * ⚠ NOT a subset "by construction" — the two lists are capped INDEPENDENTLY
+   * at {@link MAX_UNBOUND_MENTION_TOKENS}, so a body carrying more than that
+   * many distinct resolved names can report a name in `withoutGrant` that was
+   * pushed out of `bound`. Pinned by "a name past the `bound` cap is still
+   * reported" in the tests.
+   *
+   * That is deliberate, and the asymmetry decides it: an extra "this may not
+   * have reached anyone" costs one re-send, while dropping it costs the whole
+   * coordination path. Gating the push on `bound` having room would make the
+   * inert-mention warning the FIRST thing discarded at the cap. Do not "tidy"
+   * this into a shared cap without re-reading that trade — and do not restate
+   * the subset claim in a doc comment, which is the over-claim PEN-5367 exists
+   * to stop.
+   *
+   * SELF-MENTIONS ARE INCLUDED. The predicate's `authorAgentId ===
+   * mentionedAgentId` arm also returns false, and a self-mention is the one
+   * case where suppressing as noise would blind the field where it is most
+   * needed: PEN-5834 is a live instance of exactly that — a CI gate notification
+   * @-mentions the shared App identity, which is a self-mention, so no seat
+   * wakes and 7 of 50 open PRs sat red, the oldest for 4d18h. PEN-5364 shipped
+   * an instrument that was blindest in the case it was built for; including
+   * self-mentions here is the refusal to repeat that.
+   */
+  withoutGrant: string[];
 }
 
 /**
@@ -598,6 +651,12 @@ function boundLabelName(label: string): string | null {
  * A token directly followed by `/<scope-char>` is skipped for the same reason —
  * `@types/node` is a package, not a person (PEN-5187).
  *
+ * `withoutGrant` reports the resolved names called out by
+ * `options.withoutGrantAgentIds` — see {@link MentionBindingReport.withoutGrant},
+ * including why it is not a subset of `bound` at the token cap. It is reduced by
+ * the same `boundLabelName` and deduped on the same lowercased key, so all three
+ * lists stay directly comparable.
+ *
  * The masking applies to `unbound` only. `bound` is read off the raw link scan
  * on purpose, because that is what the wake itself does: `findMentionedAgents`
  * runs `extractAgentMentionIds` over the unmasked body, so an `agent://` link
@@ -608,9 +667,10 @@ export function extractMentionBindingReport(
   markdown: string,
   options: UnboundMentionScanOptions = {},
 ): MentionBindingReport {
-  if (!markdown) return { bound: [], unbound: [] };
+  if (!markdown) return { bound: [], unbound: [], withoutGrant: [] };
 
   const boundIds = new Set(options.boundAgentIds ?? []);
+  const withoutGrantIds = new Set(options.withoutGrantAgentIds ?? []);
   // Indexed by UTF-16 code unit, which is the offset space every `RegExp`
   // below reports in, so masking stays aligned with the original string.
   const units = markdown.split("");
@@ -627,6 +687,8 @@ export function extractMentionBindingReport(
   // blanked part of its href.
   const boundSeen = new Set<string>();
   const boundTokens: string[] = [];
+  const withoutGrantSeen = new Set<string>();
+  const withoutGrantTokens: string[] = [];
   const linkScanner = new RegExp(ANY_MENTION_LINK_RE.source, ANY_MENTION_LINK_RE.flags);
   let link: RegExpExecArray | null;
   while ((link = linkScanner.exec(markdown)) !== null) {
@@ -645,6 +707,17 @@ export function extractMentionBindingReport(
         if (!boundSeen.has(key) && boundTokens.length < MAX_UNBOUND_MENTION_TOKENS) {
           boundSeen.add(key);
           boundTokens.push(name);
+        }
+        // PEN-5812: this link resolved, so it is in `bound` either way. Record
+        // it a second time when the caller says the author could not grant it,
+        // which is the only place the inertness is visible.
+        if (
+          withoutGrantIds.has(parsed.agentId)
+          && !withoutGrantSeen.has(key)
+          && withoutGrantTokens.length < MAX_UNBOUND_MENTION_TOKENS
+        ) {
+          withoutGrantSeen.add(key);
+          withoutGrantTokens.push(name);
         }
       }
     }
@@ -686,7 +759,7 @@ export function extractMentionBindingReport(
     if (tokens.length >= MAX_UNBOUND_MENTION_TOKENS) break;
   }
 
-  return { bound: boundTokens, unbound: tokens };
+  return { bound: boundTokens, unbound: tokens, withoutGrant: withoutGrantTokens };
 }
 
 /**

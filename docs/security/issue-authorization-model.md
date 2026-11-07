@@ -314,7 +314,7 @@ readers:
   comment to every same-company agent, and load-bearing on a review or escalation
   shell, where it deliberately does not (`BLO-19094`).
 
-### Binding and entitlement are different mechanisms, and only binding is reported
+### Binding and entitlement are different mechanisms, and only binding used to be reported
 
 Mention **binding** asks "does this href resolve to a live agent?". Mention
 **entitlement** asks "may this author grant?". They are evaluated in different
@@ -338,9 +338,9 @@ places and only the first is ever reported back to the author. A well-formed
   surfaces that describe the field — `packages/shared/src/project-mentions.ts`,
   `packages/shared/src/validators/issue.ts`, `packages/mcp-server/src/tools.ts` —
   now say "resolved", not "woken", and say explicitly that the field reports
-  nothing about entitlement. The field itself is unchanged, so this paragraph is
-  still the only place the entitlement half is stated. Making it machine-readable
-  is `PEN-5812`;
+  nothing about entitlement. `boundMentions` itself is unchanged and still cannot
+  distinguish the two; what changed is that it is no longer the only signal —
+  `PEN-5812` adds the sibling `mentionsWithoutGrant`, below;
 - raises **no** `issue_comment_mentioned` wake — the wake is gated on this same
   predicate at all three comment-create paths in `server/src/routes/issues.ts`. Each
   is a `continue` on a failed `commentAuthorCanGrantIssueMention({ ... })` guard
@@ -353,11 +353,113 @@ places and only the first is ever reported back to the author. A well-formed
   `server/src/__tests__/issue-update-comment-wakeup-routes.test.ts`;
 - confers **no** grant.
 
-So such a mention is **wholly inert, and silent on every surface its author can
-read**: a 201, an empty `unboundMentions`, no wake, no grant, and no field anywhere
-naming the reason. The would-be granter has every available signal saying the
-invitation was delivered. The blocked agent is never woken and stays blocked, so the
-failure does not even surface as a refused run — it surfaces as nothing at all.
+So such a mention **is wholly inert**: a 201, no wake, no grant. Until `PEN-5812` it
+was also **silent on every surface its author could read**, and worse than silent once
+`PEN-5364` landed — `boundMentions` showed the author an affirmative success signal
+naming the very mention that did nothing. The would-be granter had every available
+signal saying the invitation was delivered. The blocked agent is never woken and stays
+blocked, so the failure does not even surface as a refused run — it surfaces as nothing
+at all.
+
+#### Why `boundMentions` could never have shown this (`PEN-5812`)
+
+**Argue this from the predicate, not from a measurement.** `boundMentions` is derived
+from `findMentionedAgents` alone; `commentAuthorCanGrantIssueMention` appears nowhere
+in its derivation. There is therefore **no pair of inputs** — one grantable mention,
+one not — that makes `boundMentions` differ. A control arm can only ever exhibit one
+such pair; the source shows the pair does not exist. Any experiment on this field is
+evidence about how its output is **read**, never about the mechanism, and citing one
+as a control arm is an over-claim of exactly the kind this section documents.
+
+The remedy is the create response's third list, **`mentionsWithoutGrant`**: the
+`agent://` mentions in this body that **resolved** but whose wake this author was not
+entitled to raise on this row. It is computed from the same
+`commentAuthorCanGrantIssueMention`, with the same arguments, against the same
+`currentIssue`, as the `continue` guards at the three wake sites.
+
+**How tightly the receipt tracks the gate depends on the path, and only the unkeyed one
+is airtight.** On the unkeyed `POST /issues/:id/comments` path the two additionally share
+one memoized membership read, and the wake loop is awaited before the response body is
+built, so the receipt and the gate answer from the same fact and cannot drift. That
+guarantee is scoped to that path. On the **idempotency-keyed** path the wake is decided
+inside `buildKeyedCommentEffectIntents`, which performs its own `findMentionedAgents` and
+`getActiveCompanyMembership` reads; the response then evaluates the predicate a second
+time, independently. On a keyed **replay** whose effects already exist, that second
+evaluation judges the *current* assignee and membership rather than the state the original
+wake was decided under — so if the author became the assignee in between, the replay
+reports an empty `mentionsWithoutGrant` for a mention that never woke anyone. The window
+is narrow, but the rule to carry is that **a replay receipt describes entitlement now, not
+the verdict the original comment was judged under.**
+
+Three properties are load-bearing:
+
+- **It is strictly additive.** `unboundMentions` and `boundMentions` keep their exact
+  prior semantics. A name can appear in **both** `boundMentions` and
+  `mentionsWithoutGrant`; that overlap is the defect made legible, not a contradiction.
+  It reads: the link was well formed, the agent exists, and this author was not
+  entitled to raise the wake here.
+  (It is *usually* a subset of `boundMentions` but not one by construction: the lists
+  are capped independently at 20 names, so a body with more distinct resolved names
+  than that can report one in `mentionsWithoutGrant` that was pushed out of
+  `boundMentions`. Deliberate — at the cap, the warning is the last thing that should
+  be discarded, not the first.)
+- **It is unconditional**, like its two siblings, so an absent key cannot be confused
+  with a server that predates it.
+- **Self-mentions are included.** The predicate's `authorAgentId === mentionedAgentId`
+  arm also returns false, and suppressing those as noise would blind the field exactly
+  where it is most needed — `PEN-5834` is a live instance, where a CI gate's
+  notification `@`-mentions the shared App identity (a self-mention), no seat wakes,
+  and 7 of 50 open PRs sat red, the oldest for 4d18h.
+
+#### What an empty `mentionsWithoutGrant` does **not** prove
+
+It models `commentAuthorCanGrantIssueMention` and nothing else. The wake loop has a second
+term the predicate does not model, and that term is evaluated **first** (the
+`router.post("/issues/:id/comments", …)` handler in `server/src/routes/issues.ts`):
+
+```js
+if (isClosedIssueStatus(currentIssue.status) && !reopened) continue;  // ← runs first
+if (!commentAuthorCanGrantIssueMention({ … })) continue;              // ← the modelled term
+```
+
+So on a `done` / `cancelled` row that the comment does not reopen, **every** mention wake
+is skipped before entitlement is reached — and the row's assignee wake with it. A
+grantable mention there wakes nobody and comes back **absent** from
+`mentionsWithoutGrant`: an affirmative empty array on a comment that reached no one.
+
+The field's *name* is still correct. The grant **does** attach on a closed row, and the
+reason is stronger than "the predicate has no status term". `agentHasMentionGrantOnIssue`
+(`server/src/services/authorization.ts:1546`) re-derives the grant **at decision time**,
+by re-reading the persisted `issueComments` rows:
+
+```js
+.where(and(
+  eq(issueComments.companyId, input.companyId),
+  eq(issueComments.issueId,  input.issueId),
+  isNull(issueComments.deletedAt),
+  sql`${issueComments.body} LIKE ${"%agent://" + input.actorAgentId + "%"}`,
+))
+```
+
+The wake loop writes nothing that query reads, so the `continue` above cannot reach it —
+**not merely because today's extra term happens to be `status`, but because no term the
+wake loop ever grows can appear in this predicate.** "No status term" closes the question
+for the guard that exists now; read-time derivation closes it for every guard anyone adds
+later. So "without grant" is accurate.
+
+What does not follow from absence is **"nothing happened"**; the two are different claims,
+and the earlier copy on this field merged them. The three wake sites do not even agree
+with one another on the closed-status term (`PEN-5846`: the keyed path has no closed
+guard, so passing an `idempotencyKey` decides whether a mention on a closed row wakes
+anyone), which is why this section describes **entitlement** rather than reachability —
+there is no single reachability rule available to state.
+
+Pinned by `"an empty mentionsWithoutGrant is not proof of a wake: a closed row suppresses
+every mention wake"` in `server/src/__tests__/issue-update-comment-wakeup-routes.test.ts`.
+
+**None of this widens the grant.** The rule below is unchanged: the assignee carries
+write, a mention does not authorize, and mention grants do not chain agent-to-agent.
+`PEN-5812` makes the refusal legible; it does not relax it.
 
 This is the same shape as the `issue:mutate` silence recorded above, which cost
 `PEN-2394` / `PEN-3940` / `PEN-4462` a run each, and the remedy is the same: make the
@@ -497,10 +599,14 @@ without re-deciding the model itself:
   active-membership user** — a manager, the creator, the CEO, a peer, or itself:
   denied `issue:comment`. Otherwise mention grants would chain agent-to-agent and
   every control in this list would be reachable by two agents mentioning each
-  other. This control is **worse than silent** — the mention still binds, so it is
-  absent from `unboundMentions` and PRESENT in `boundMentions`, and no wake is
-  raised either, so the author is shown a success the mention did not earn and
-  neither party learns anything; see "Who may grant a mention".
+  other. This control used to be **worse than silent** — the mention still binds,
+  so it is absent from `unboundMentions` and PRESENT in `boundMentions`, and no
+  wake is raised either, so the author was shown a success the mention did not
+  earn. `PEN-5812` makes the refusal legible to the **author**: the name is
+  reported in `mentionsWithoutGrant` on the create response. The **grantee** half
+  is still silent — the agent who was not granted is never woken and learns
+  nothing until it tries and is refused (`PEN-2394`). See "Who may grant a
+  mention".
 - An agent assigned a parent or sibling issue: denied on the target issue.
   Ancestry is not a declared dependency; only a `blocks` edge is.
 - An agent across a `blocks` edge: denied `issue:mutate` — the edge grants a

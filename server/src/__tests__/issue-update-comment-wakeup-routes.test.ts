@@ -1511,6 +1511,328 @@ describe("issue update comment wakeups", () => {
       });
     });
 
+    // PEN-5812. Mention BINDING and mention ENTITLEMENT are different
+    // mechanisms, evaluated in different places, and until this field only
+    // binding was reported. `boundMentions` is derived from
+    // `findMentionedAgents` alone and never consults
+    // `commentAuthorCanGrantIssueMention`, so there is NO pair of inputs — one
+    // grantable mention, one not — that makes it differ. That is why the proof
+    // is the predicate and not a measurement, and why the control arm below has
+    // to assert on the THIRD list: it is the only output that can vary.
+    //
+    // The 14:22Z PEN-5793 experiment that prompted this row was NOT a control
+    // arm. Both of its mentions were on the same side of the predicate (the
+    // author was not the assignee, so neither could grant), and its identical
+    // output demonstrated nothing about entitlement. It is evidence that an
+    // author MISREAD an affirmative `boundMentions` as delivery — real, and a
+    // different claim. These tests are the control arm that experiment was not.
+    describe("mentionsWithoutGrant separates an inert mention from a live one (PEN-5812)", () => {
+      const GRANTED_NAME = "QA";
+      const SELF_NAME = "Self";
+
+      it("CONTROL ARM: one body, two resolved mentions, only the non-grantable one is reported", async () => {
+        // The two arms differ on exactly one axis — the predicate's verdict.
+        // Same body, same call, both resolve, both are therefore in
+        // `boundMentions`. The author IS the assignee, so the peer mention
+        // grants; the self-mention never can (`authorAgentId ===
+        // mentionedAgentId`), so it wakes nobody.
+        const existing = makeIssue({
+          assigneeAgentId: ASSIGNEE_AGENT_ID,
+          assigneeUserId: null,
+          status: "todo",
+        });
+        const body = `[@${GRANTED_NAME}](agent://${MENTIONED_AGENT_ID}) please inspect — `
+          + `[@${SELF_NAME}](agent://${ASSIGNEE_AGENT_ID}) is tracking it`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-without-grant-control-arm",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([
+          MENTIONED_AGENT_ID,
+          ASSIGNEE_AGENT_ID,
+        ]);
+
+        const res = await request(await createApp({
+          type: "agent",
+          agentId: ASSIGNEE_AGENT_ID,
+          companyId: existing.companyId,
+          source: "agent_key",
+        }))
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        // Both resolved, so `boundMentions` cannot tell them apart. This is the
+        // defect, asserted directly.
+        expect(res.body.boundMentions).toEqual([GRANTED_NAME, SELF_NAME]);
+        expect(res.body.unboundMentions).toEqual([]);
+        // The third list does tell them apart.
+        expect(res.body.mentionsWithoutGrant).toEqual([SELF_NAME]);
+
+        // And the wakes match the report: the peer was woken, the author was not.
+        await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+          MENTIONED_AGENT_ID,
+          expect.objectContaining({ reason: "issue_comment_mentioned" }),
+        ));
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+          ASSIGNEE_AGENT_ID,
+          expect.objectContaining({ reason: "issue_comment_mentioned" }),
+        );
+      });
+
+      it("names the mention an author wrote on a row they are not assigned", async () => {
+        // The PEN-5793 shape, and the reason this row exists: the mention
+        // resolves, is reported as bound, wakes nobody and grants nothing.
+        const existing = makeIssue({
+          assigneeAgentId: ASSIGNEE_AGENT_ID,
+          assigneeUserId: null,
+          status: "in_progress",
+        });
+        const body = `[@${GRANTED_NAME}](agent://${MENTIONED_AGENT_ID}) you have the grant now`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-without-grant-non-assignee",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+        const res = await request(await createApp({
+          type: "agent",
+          agentId: PREVIOUS_AGENT_ID,
+          companyId: existing.companyId,
+          source: "agent_key",
+        }))
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        // The affirmative signal that misled the author at 14:22Z...
+        expect(res.body.boundMentions).toEqual([GRANTED_NAME]);
+        // ...now paired with the one that corrects it.
+        expect(res.body.mentionsWithoutGrant).toEqual([GRANTED_NAME]);
+        await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+          MENTIONED_AGENT_ID,
+          expect.objectContaining({ reason: "issue_comment_mentioned" }),
+        );
+      });
+
+      it("POSITIVE CONTROL: stays empty when the assignee makes the mention", async () => {
+        // Without this the field could be constant noise and still pass above.
+        const existing = makeIssue({
+          assigneeAgentId: ASSIGNEE_AGENT_ID,
+          assigneeUserId: null,
+          status: "todo",
+        });
+        const body = `[@${GRANTED_NAME}](agent://${MENTIONED_AGENT_ID}) please inspect this`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-without-grant-positive-control",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+        const res = await request(await createApp({
+          type: "agent",
+          agentId: ASSIGNEE_AGENT_ID,
+          companyId: existing.companyId,
+          source: "agent_key",
+        }))
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        expect(res.body.boundMentions).toEqual([GRANTED_NAME]);
+        expect(res.body.mentionsWithoutGrant).toEqual([]);
+        await vi.waitFor(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+          MENTIONED_AGENT_ID,
+          expect.objectContaining({ reason: "issue_comment_mentioned" }),
+        ));
+      });
+
+      it("reports a user author whose company membership is not active", async () => {
+        // The other arm of the predicate. Same body, same row, the only change
+        // is that the author's membership no longer resolves.
+        mockGetActiveCompanyMembership.mockResolvedValue(null);
+        const existing = makeIssue({ assigneeUserId: "active-user", status: "in_progress" });
+        const body = `[@${GRANTED_NAME}](agent://${MENTIONED_AGENT_ID}) please inspect this`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-without-grant-inactive-user",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+        const res = await request(await createApp({
+          type: "board",
+          userId: "active-user",
+          companyIds: [existing.companyId],
+          source: "session",
+          isInstanceAdmin: false,
+        }))
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        expect(res.body.boundMentions).toEqual([GRANTED_NAME]);
+        expect(res.body.mentionsWithoutGrant).toEqual([GRANTED_NAME]);
+      });
+
+      it("is unconditional, so an absent key cannot mean an older server", async () => {
+        const existing = makeIssue({ status: "in_progress" });
+        const body = "No mentions at all in this body.";
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-without-grant-unconditional",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([]);
+
+        const res = await request(await createApp())
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        expect(res.body).toHaveProperty("mentionsWithoutGrant");
+        expect(res.body.mentionsWithoutGrant).toEqual([]);
+      });
+
+      it("is present on the idempotent-replay response too", async () => {
+        // A replay returns 200 from a different branch. An author who retried
+        // must read the same verdict, or the retry is the one call that still
+        // reports an inert mention as delivered.
+        const existing = makeIssue({
+          assigneeAgentId: ASSIGNEE_AGENT_ID,
+          assigneeUserId: null,
+          status: "in_progress",
+        });
+        const body = `[@${GRANTED_NAME}](agent://${MENTIONED_AGENT_ID}) you have the grant now`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-without-grant-replay",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+          deduplicated: true,
+          idempotencyProcessedAt: new Date().toISOString(),
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+        const res = await request(await createApp({
+          type: "agent",
+          agentId: PREVIOUS_AGENT_ID,
+          companyId: existing.companyId,
+          source: "agent_key",
+        }))
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body, idempotencyKey: "pen5812-replay" });
+
+        expect(res.status).toBe(200);
+        expect(res.body.boundMentions).toEqual([GRANTED_NAME]);
+        expect(res.body.mentionsWithoutGrant).toEqual([GRANTED_NAME]);
+      });
+
+      it("fails toward 'nothing bound' when mention resolution throws", async () => {
+        // All three lists degrade together. `mentionsWithoutGrant` only ever
+        // names something that resolved, so with nothing resolved there is
+        // nothing it can honestly name — and `unboundMentions` still carries
+        // the token, so the author is told to re-send rather than told all is
+        // well.
+        const existing = makeIssue({
+          assigneeAgentId: ASSIGNEE_AGENT_ID,
+          assigneeUserId: null,
+          status: "in_progress",
+        });
+        const body = `[@${GRANTED_NAME}](agent://${MENTIONED_AGENT_ID}) and @${GRANTED_NAME}`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-without-grant-resolution-failure",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockRejectedValue(new Error("resolution exploded"));
+
+        const res = await request(await createApp({
+          type: "agent",
+          agentId: PREVIOUS_AGENT_ID,
+          companyId: existing.companyId,
+          source: "agent_key",
+        }))
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        expect(res.body.boundMentions).toEqual([]);
+        expect(res.body.mentionsWithoutGrant).toEqual([]);
+        expect(res.body.unboundMentions).toEqual([GRANTED_NAME]);
+      });
+
+      it("an empty mentionsWithoutGrant is not proof of a wake: a closed row suppresses every mention wake", async () => {
+        // The limit of the field, pinned so the copy on the two description
+        // surfaces cannot drift back to "nothing happened".
+        //
+        // `mentionsWithoutGrant` models `commentAuthorCanGrantIssueMention` and
+        // nothing else. The wake loop carries an EARLIER term it does not model:
+        // `isClosedIssueStatus(currentIssue.status) && !reopened`. Here the
+        // author IS the assignee, so entitlement passes and the name is rightly
+        // absent from the list — and the row is `done` and not reopened, so the
+        // wake is skipped anyway. Affirmative empty array, comment reached no
+        // one. The field's NAME survives this: `agentHasMentionGrantOnIssue`
+        // re-derives the grant at decision time from the persisted comment rows,
+        // which the wake loop never writes to, so the grant attaches on a closed
+        // row — and would under any term the wake loop later grows, not just this
+        // one. "Without grant" stays accurate; it is "nothing happened" that does
+        // not follow.
+        // PEN-5846 tracks the three sites disagreeing on the closed term.
+        const existing = makeIssue({
+          assigneeAgentId: ASSIGNEE_AGENT_ID,
+          assigneeUserId: null,
+          status: "done",
+        });
+        const body = `[@${GRANTED_NAME}](agent://${MENTIONED_AGENT_ID}) please pick this back up`;
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: "comment-without-grant-closed-row",
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+        const res = await request(await createApp({
+          type: "agent",
+          agentId: ASSIGNEE_AGENT_ID,
+          companyId: existing.companyId,
+          source: "agent_key",
+        }))
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body });
+
+        expect(res.status).toBe(201);
+        expect(res.body.boundMentions).toEqual([GRANTED_NAME]);
+        // Entitlement passed, so the list is empty...
+        expect(res.body.mentionsWithoutGrant).toEqual([]);
+        // ...and yet nobody was woken. This is the pair the copy must not merge.
+        await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+        expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+          MENTIONED_AGENT_ID,
+          expect.objectContaining({ reason: "issue_comment_mentioned" }),
+        );
+      });
+    });
+
     it("still reports the signal when mention resolution throws", async () => {
       // Fail toward reporting: a false "this may not have reached anyone" costs
       // a re-send, a false silence costs a day.
