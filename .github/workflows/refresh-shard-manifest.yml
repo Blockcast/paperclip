@@ -44,10 +44,25 @@ on:
 #      reconciler does, and cancelling mid-measurement discards up to six hours
 #      of runner time and leaves the manifest un-refreshed for the week.
 #
-# Losing a run here is also self-announcing rather than silent: the manifest
-# stops being refreshed and the drift it exists to catch reappears in the PR it
-# would have opened. That is the opposite of review-gate-sweep, whose whole
-# failure mode was that a lost run took the alarm-on-the-lost-run with it.
+# Losing a run here announces itself ONLY through the drift reappearing in the
+# next PR this opens. That is a real channel but a slow and passive one, and it
+# is not the prompt signal the word "self-announcing" claimed here before
+# PEN-5832 measured it: 2026-10-05 and 2026-10-19 had no scheduled run at all,
+# nothing reported either loss, and the compensation was a manual
+# workflow_dispatch on 11-03 and 11-05 -- a human noticing, which is precisely
+# the failure mode this workflow exists to remove (BLO-24241).
+#
+# It is still not worth alarming on, but for the other reason: PEN-5832 also
+# measured what a lost run COSTS, and it is ~+9.9s of shard makespan for a
+# missed week -- against `General tests (server N/6)` jobs whose makespan runs
+# 56.5min at the median and which already carry a 25.1min shard-to-shard spread
+# of their own (n=22 commits where all six shards genuinely ran, over the 360
+# most recent master commits). So the contrast with review-gate-sweep holds on
+# price rather than on volume -- not that a loss here is loud, but that a loss
+# here is cheap. The measurement, and the decision to accept the drift rather
+# than guard it, are recorded on this workflow's entry in
+# EXEMPT_SCHEDULED_WORKFLOWS (scripts/check-scheduled-guard-liveness.mjs) --
+# which is where the next person asking "should this be watched?" will look.
 concurrency:
   group: refresh-shard-manifest-master
   cancel-in-progress: false
