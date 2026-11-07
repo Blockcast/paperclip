@@ -232,6 +232,16 @@ export function workProductService(db: Db) {
           provider: key.provider,
           type: key.type,
           externalId: key.externalId,
+          // Both stamps come from the SAME clock. `updatedAt` is bound here
+          // from JS while `createdAt` would otherwise fall through to the
+          // column's `defaultNow()`, which Postgres evaluates at statement
+          // execution -- after this function has built ~15 SQL fragments and
+          // paid a round trip. The row then lands with `updatedAt` EARLIER than
+          // `createdAt` (measured 382ms and 88ms on the two owners of
+          // `Blockcast/onprem-k8s#8006`, PEN-5850), which quietly breaks
+          // `updatedAt` as a monotonic change detector -- and `config.ts`
+          // reads exactly this column for work-product recency.
+          createdAt: data.createdAt ?? now,
           updatedAt: now,
         })
         .onConflictDoUpdate({
@@ -251,6 +261,18 @@ export function workProductService(db: Db) {
             metadata: sql`case when ${acceptIncoming} then excluded.metadata else ${issueWorkProducts.metadata} end`,
             sourceTrust: sql`case when ${acceptIncoming} then excluded.source_trust else ${issueWorkProducts.sourceTrust} end`,
             updatedAt: sql`case when ${acceptIncoming} then ${nowSql} else ${issueWorkProducts.updatedAt} end`,
+            // `reviewState` is deliberately ABSENT, and `createdAt` with it.
+            //
+            // `reviewState` is Paperclip BOARD-REVIEW state, not a mirror of
+            // the external system's review -- a webhook has no business
+            // writing it, and adding it here would let PR traffic clobber a
+            // board decision. A `provider: "github"` row therefore stays at
+            // the `none` default for life, which is the correct value and is
+            // NOT a staleness bug (PEN-5850). Anything asking "has this head
+            // been reviewed?" must read GitHub: `reviewDecision`,
+            // `commits/<sha>/status`, or the `pull_request_review_state`
+            // table. Do not "fix" the stale-looking `none` by wiring
+            // `pull_request_review` into this upsert.
           },
         })
         .returning()
