@@ -276,13 +276,14 @@ describe("extractMentionBindingReport", () => {
         `[@Cfo](${boundHref}) please rule — @Cfo also owns the ledger question`,
         opts,
       ),
-    ).toEqual({ bound: ["Cfo"], unbound: ["Cfo"] });
+    ).toEqual({ bound: ["Cfo"], unbound: ["Cfo"], withoutGrant: [] });
   });
 
   it("CONTRAST: the bare-only body reports the same unbound list and NO bound one", () => {
     expect(extractMentionBindingReport("@Cfo please rule on this", opts)).toEqual({
       bound: [],
       unbound: ["Cfo"],
+      withoutGrant: [],
     });
   });
 
@@ -290,6 +291,7 @@ describe("extractMentionBindingReport", () => {
     expect(extractMentionBindingReport(`[@Cfo](${boundHref}) please rule`, opts)).toEqual({
       bound: ["Cfo"],
       unbound: [],
+      withoutGrant: [],
     });
   });
 
@@ -299,25 +301,26 @@ describe("extractMentionBindingReport", () => {
     // all-clear this field exists to prevent.
     expect(
       extractMentionBindingReport(`[@Ghost](${buildAgentMentionHref("agent-gone", null)})`, opts),
-    ).toEqual({ bound: [], unbound: ["Ghost"] });
+    ).toEqual({ bound: [], unbound: ["Ghost"], withoutGrant: [] });
   });
 
   it("does not report non-agent mention schemes as bound", () => {
     const body = `[@Taylor](${buildUserMentionHref("user-1")})`;
-    expect(extractMentionBindingReport(body, opts)).toEqual({ bound: [], unbound: [] });
+    expect(extractMentionBindingReport(body, opts)).toEqual({ bound: [], unbound: [], withoutGrant: [] });
   });
 
   it("reads a bare label, the `[Cfo](agent://…)` form", () => {
     expect(extractMentionBindingReport(`[Cfo](${boundHref}) please rule`, opts)).toEqual({
       bound: ["Cfo"],
       unbound: [],
+      withoutGrant: [],
     });
   });
 
   it("reads the @-token out of a label carrying extra prose", () => {
     expect(
       extractMentionBindingReport(`[@Cfo — please rule](${boundHref}) and @Cfo again`, opts),
-    ).toEqual({ bound: ["Cfo"], unbound: ["Cfo"] });
+    ).toEqual({ bound: ["Cfo"], unbound: ["Cfo"], withoutGrant: [] });
   });
 
   it("RESIDUAL: a label with no name in it reports nothing bound", () => {
@@ -326,13 +329,14 @@ describe("extractMentionBindingReport", () => {
     expect(extractMentionBindingReport(`[the CFO](${boundHref}) please rule`, opts)).toEqual({
       bound: [],
       unbound: [],
+      withoutGrant: [],
     });
   });
 
   it("dedupes bound names case-insensitively, as `unbound` does", () => {
     expect(
       extractMentionBindingReport(`[@Cfo](${boundHref}) and [@cfo](${boundHref})`, opts),
-    ).toEqual({ bound: ["Cfo"], unbound: [] });
+    ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: [] });
   });
 
   it("reports a bound link inside a code fence, because the wake really fires", () => {
@@ -340,15 +344,16 @@ describe("extractMentionBindingReport", () => {
     // body, so a fenced `agent://` link does raise a wake. Masking it here
     // would report a wake that happened as one that did not.
     const body = ["```md", `[@Cfo](${boundHref})`, "```"].join("\n");
-    expect(extractMentionBindingReport(body, opts)).toEqual({ bound: ["Cfo"], unbound: [] });
+    expect(extractMentionBindingReport(body, opts)).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: [] });
   });
 
   it("returns both halves empty for a mention-free body", () => {
     expect(extractMentionBindingReport("no mentions at all", opts)).toEqual({
       bound: [],
       unbound: [],
+      withoutGrant: [],
     });
-    expect(extractMentionBindingReport("", opts)).toEqual({ bound: [], unbound: [] });
+    expect(extractMentionBindingReport("", opts)).toEqual({ bound: [], unbound: [], withoutGrant: [] });
   });
 
   it("extractUnboundMentionTokens stays the unbound half, unchanged", () => {
@@ -356,5 +361,106 @@ describe("extractMentionBindingReport", () => {
     expect(extractUnboundMentionTokens(body, opts)).toEqual(
       extractMentionBindingReport(body, opts).unbound,
     );
+  });
+
+  // PEN-5812. `withoutGrant` reports the subset of `bound` the CALLER says the
+  // author was not entitled to wake. It cannot be derived here: resolution is a
+  // property of the body, entitlement a property of the author and the row.
+  describe("withoutGrant (PEN-5812)", () => {
+    const OTHER_AGENT_ID = "agent-qa-1";
+    const otherHref = buildAgentMentionHref(OTHER_AGENT_ID, null);
+
+    it("CONTROL ARM: two bound links, only the non-grantable one is reported", () => {
+      // Identical in every respect except which side of the caller's predicate
+      // they fall on. `bound` carries both — it has no access to that axis —
+      // and `withoutGrant` carries one.
+      expect(
+        extractMentionBindingReport(`[@Cfo](${boundHref}) and [@Qa](${otherHref})`, {
+          boundAgentIds: [BOUND_AGENT_ID, OTHER_AGENT_ID],
+          withoutGrantAgentIds: [OTHER_AGENT_ID],
+        }),
+      ).toEqual({ bound: ["Cfo", "Qa"], unbound: [], withoutGrant: ["Qa"] });
+    });
+
+    it("is empty when the caller names nobody", () => {
+      expect(
+        extractMentionBindingReport(`[@Cfo](${boundHref}) please rule`, opts),
+      ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: [] });
+    });
+
+    it("reduces the name exactly as `bound` does, so the lists stay comparable", () => {
+      // Same `boundLabelName` reduction: the @-token is read out of a label
+      // carrying prose, and a label with no name in it reports nothing.
+      expect(
+        extractMentionBindingReport(`[@Cfo — please rule](${boundHref})`, {
+          ...opts,
+          withoutGrantAgentIds: [BOUND_AGENT_ID],
+        }),
+      ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: ["Cfo"] });
+      expect(
+        extractMentionBindingReport(`[the CFO](${boundHref})`, {
+          ...opts,
+          withoutGrantAgentIds: [BOUND_AGENT_ID],
+        }),
+      ).toEqual({ bound: [], unbound: [], withoutGrant: [] });
+    });
+
+    it("dedupes case-insensitively, as both siblings do", () => {
+      expect(
+        extractMentionBindingReport(`[@Cfo](${boundHref}) and [@cfo](${boundHref})`, {
+          ...opts,
+          withoutGrantAgentIds: [BOUND_AGENT_ID],
+        }),
+      ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: ["Cfo"] });
+    });
+
+    it("ignores an id that did not resolve, so the three lists stay disjoint from `unbound`", () => {
+      // A mention that never bound is already reported in `unbound`. Naming it
+      // here too would stop the lists partitioning cleanly.
+      expect(
+        extractMentionBindingReport("@Ceo please rule", {
+          boundAgentIds: [],
+          withoutGrantAgentIds: ["agent-never-resolved"],
+        }),
+      ).toEqual({ bound: [], unbound: ["Ceo"], withoutGrant: [] });
+    });
+
+    it("a name past the `bound` cap is still reported, so this is NOT a strict subset", () => {
+      // The two lists are capped independently. With more distinct resolved
+      // names than MAX_UNBOUND_MENTION_TOKENS, a non-grantable name can be
+      // pushed out of `bound` and still appear in `withoutGrant`.
+      //
+      // Deliberate: an extra "this may not have reached anyone" costs one
+      // re-send, dropping it costs the coordination path. Gating on `bound`
+      // having room would discard the inert-mention warning FIRST at the cap.
+      // This test exists so the doc comment cannot quietly re-acquire a
+      // "strict subset by construction" claim the code does not honour.
+      const ids = Array.from({ length: MAX_UNBOUND_MENTION_TOKENS + 1 }, (_, i) => `agent-${i}`);
+      const body = ids
+        .map((id, i) => `[@N${i}](${buildAgentMentionHref(id, null)})`)
+        .join(" ");
+      const last = ids[ids.length - 1]!;
+      const report = extractMentionBindingReport(body, {
+        boundAgentIds: ids,
+        withoutGrantAgentIds: [last],
+      });
+
+      expect(report.bound).toHaveLength(MAX_UNBOUND_MENTION_TOKENS);
+      expect(report.bound).not.toContain("N20");
+      expect(report.withoutGrant).toEqual(["N20"]);
+    });
+
+    it("leaves `bound` and `unbound` byte-identical to a call without the option", () => {
+      const body = `[@Cfo](${boundHref}) please rule — @Ceo also owns this`;
+      const without = extractMentionBindingReport(body, opts);
+      const with_ = extractMentionBindingReport(body, {
+        ...opts,
+        withoutGrantAgentIds: [BOUND_AGENT_ID],
+      });
+      expect(with_.bound).toEqual(without.bound);
+      expect(with_.unbound).toEqual(without.unbound);
+      expect(with_.withoutGrant).toEqual(["Cfo"]);
+      expect(without.withoutGrant).toEqual([]);
+    });
   });
 });
