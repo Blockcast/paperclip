@@ -112,3 +112,126 @@ describe("issueApprovalService", () => {
     ]);
   });
 });
+
+/**
+ * PEN-5511: `linkCoverageForIssue` is the completeness report for an issue-scoped
+ * approval query. The query it reports on reads through `issue_approvals`, so it
+ * returns LINKED cards only; before PEN-5511 a card filed by a non-assignee could
+ * not be linked to the row it was about at all, which made that count silently
+ * partial in the direction that understates board exposure.
+ *
+ * The contract worth pinning is not the SQL but the three verdicts it can reach,
+ * because they are three different answers and only two of them are measurements:
+ * candidates found, none found, and "not measurable on this row".
+ */
+function dbForLinkCoverage(linkedCount: number, candidateCount: number) {
+  const counts = [[{ count: linkedCount }], [{ count: candidateCount }]];
+  let call = 0;
+  return {
+    select: vi.fn(() => {
+      const rows = counts[call++] ?? [];
+      const terminal = async () => rows;
+      return {
+        from: vi.fn(() => ({
+          innerJoin: vi.fn(() => ({ where: terminal })),
+          where: terminal,
+        })),
+      };
+    }),
+  };
+}
+
+describe("issueApprovalService.linkCoverageForIssue (PEN-5511)", () => {
+  it("flags an issue whose identifier is named by undecided cards that are not linked to it", async () => {
+    const svc = issueApprovalService(dbForLinkCoverage(3, 1) as never);
+
+    const coverage = await svc.linkCoverageForIssue(
+      "company-1",
+      { id: "issue-1", identifier: "PEN-5379" },
+      { approvalReadAllowed: true },
+    );
+
+    // The measured PEN-5379 shape: three linked, a fourth standing ask unlinked.
+    expect(coverage).toEqual({
+      linkedCount: 3,
+      unlinkedMentionCandidateCount: 1,
+      potentiallyUnlinkedCards: true,
+      basis: "undecided_payload_identifier_mention",
+    });
+  });
+
+  it("reports false, with the basis that was actually measured, when no candidate is found", async () => {
+    const svc = issueApprovalService(dbForLinkCoverage(2, 0) as never);
+
+    const coverage = await svc.linkCoverageForIssue(
+      "company-1",
+      { id: "issue-1", identifier: "PEN-5379" },
+      { approvalReadAllowed: true },
+    );
+
+    expect(coverage.potentiallyUnlinkedCards).toBe(false);
+    expect(coverage.unlinkedMentionCandidateCount).toBe(0);
+    // `basis` is what keeps `false` honest: it is a lower bound from one specific
+    // probe, not a proof of completeness, and the caller is told which probe ran.
+    expect(coverage.basis).toBe("undecided_payload_identifier_mention");
+  });
+
+  it("answers NULL, not false, when the row has no identifier to match on", async () => {
+    // The distinction this test exists for: "no candidates found" and "no search was
+    // possible" are different answers, and only the first is evidence. Collapsing
+    // the second to `false` would report completeness it never established — the
+    // exact failure shape PEN-5511 was filed about.
+    const svc = issueApprovalService(dbForLinkCoverage(1, 99) as never);
+
+    const coverage = await svc.linkCoverageForIssue(
+      "company-1",
+      { id: "issue-1", identifier: null },
+      { approvalReadAllowed: true },
+    );
+
+    expect(coverage.potentiallyUnlinkedCards).toBeNull();
+    expect(coverage.unlinkedMentionCandidateCount).toBeNull();
+    expect(coverage.basis).toBe("identifier_unavailable");
+    expect(coverage.linkedCount).toBe(1);
+  });
+
+  it("does not run the company-wide probe at all for an actor that may not read approvals", async () => {
+    // The candidate query scans undecided cards company-wide that are NOT linked to
+    // this row — approval data about OTHER rows. On `GET /issues/:id/approvals`, which
+    // is gated only on reading the issue, answering it for an actor outside the
+    // approval-read boundary would make this report a cross-row oracle. The probe must
+    // be unreachable, not merely unreported, so assert the second query never ran.
+    const db = dbForLinkCoverage(3, 7);
+    const svc = issueApprovalService(db as never);
+
+    const coverage = await svc.linkCoverageForIssue(
+      "company-1",
+      { id: "issue-1", identifier: "PEN-5379" },
+      { approvalReadAllowed: false },
+    );
+
+    expect(coverage).toEqual({
+      linkedCount: 3,
+      unlinkedMentionCandidateCount: null,
+      potentiallyUnlinkedCards: null,
+      basis: "approval_read_unavailable",
+    });
+    // Linked count only. Had the candidate probe run it would be two.
+    expect(db.select).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports the READ boundary, not the identifier, when the actor fails both", async () => {
+    // Ordering matters for honesty: `identifier_unavailable` tells the caller a count
+    // was waiting behind a better-identified row. For an actor that may not read
+    // approvals that is false, so the authorization answer has to win.
+    const svc = issueApprovalService(dbForLinkCoverage(1, 0) as never);
+
+    const coverage = await svc.linkCoverageForIssue(
+      "company-1",
+      { id: "issue-1", identifier: null },
+      { approvalReadAllowed: false },
+    );
+
+    expect(coverage.basis).toBe("approval_read_unavailable");
+  });
+});

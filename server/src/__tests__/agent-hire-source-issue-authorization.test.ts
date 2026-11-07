@@ -225,9 +225,19 @@ beforeEach(() => {
 });
 
 /** Peer's issue, `in_progress`: the evaluator's retryable refusal, not a permanent one. */
+/**
+ * Clears the `issue:mutate` boundary so a case reaches the assignee/checkout
+ * branches rather than short-circuiting on a permanent refusal.
+ *
+ * PEN-5511: `issue:comment` is denied here on purpose. It is the participation half
+ * of the `requested_by_self` relation, and this helper's callers are about the
+ * checkout and watchdog boundaries — an actor that holds it would be allowed
+ * through those branches by design, which would make those cases pass or fail for
+ * a reason they are not about. The relation's own cases set it explicitly.
+ */
 function decideClearingBoundary() {
   mockAccessService.decide.mockImplementation(async (input: any) => {
-    if (input.action === "tasks:manage_active_checkouts") {
+    if (input.action === "tasks:manage_active_checkouts" || input.action === "issue:comment") {
       return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "" };
     }
     return { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "" };

@@ -595,6 +595,19 @@ export function attentionService(db: Db) {
         collected.push({ ...item, dismissal });
       };
 
+      // PEN-5511, the board-queue half of that finding: THIS SURFACE DOES NOT SHARE
+      // the issue-scoped undercount. It selects every pending card in the company
+      // straight off `approvals`, filtered on company and status alone, so a card
+      // nobody linked still reaches the board. The `issue_approvals` join below is
+      // decoration only — it supplies `details.issueId` — and is therefore the one
+      // thing a missing link costs here.
+      //
+      // That cost is not nothing: an unlinked card arrives with `issueId: null`, so
+      // the board sees the ask without the row it is about, which is exactly the
+      // context-free escalation BLO-23036 exists to prevent. Until PEN-5511 the
+      // assignee-only link relation was *causing* that for every cross-seat card.
+      // Note also that `approvalIssueMap` keeps only the FIRST issue per approval,
+      // so a card linked to several rows is announced against one of them.
       const pendingApprovals = await db
         .select({
           id: approvals.id,
