@@ -545,6 +545,7 @@ import {
   isRunClaimable,
   K8S_ISOLATION_RETRY_AT_CONTEXT_KEY,
   K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY,
+  QUEUE_ENTERED_AT_CONTEXT_KEY,
   TERMINAL_ISSUE_STATUSES,
 } from "./dispatch-readiness.js";
 import {
@@ -9278,11 +9279,22 @@ export function describeIntervalOverrunCoalesceBypass(input: {
  * propagated marker has no log line at all, so the two counts can differ in
  * both directions and an operator is back to an unattributable discrepancy.
  *
- * Register a key here when it records why *this* run was created. Keys that
- * describe the work rather than the mint (`issueId`, `wakeReason`,
- * `depBlockedFirstParkedAt`) are meant to survive a retry and must not go here.
+ * Register a key here when it records why *this* run was created, or what
+ * happened to this run specifically. Keys that describe the work rather than
+ * the mint (`issueId`, `wakeReason`, `depBlockedFirstParkedAt`) are meant to
+ * survive a retry and must not go here.
+ *
+ * PEN-5310 added {@link QUEUE_ENTERED_AT_CONTEXT_KEY}: it records when THIS
+ * run entered the dispatch queue, so a successor inheriting it would be aged
+ * from its predecessor's queue entry and over-report by that whole lineage --
+ * the onprem-k8s#2013 false-stranded reading again. A successor that is itself
+ * promoted gets its own stamp at that point; one inserted straight into
+ * `queued` correctly falls back to its own `created_at`.
  */
-const RUN_SCOPED_SNAPSHOT_MARKER_KEYS = [STALLED_COALESCE_BYPASS_SNAPSHOT_KEY] as const;
+const RUN_SCOPED_SNAPSHOT_MARKER_KEYS = [
+  STALLED_COALESCE_BYPASS_SNAPSHOT_KEY,
+  QUEUE_ENTERED_AT_CONTEXT_KEY,
+] as const;
 
 /**
  * Copy a prior run's snapshot for carry-forward onto its replacement, dropping
@@ -24149,6 +24161,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // wait clock to this promotion instant so the age gauge measures
           // time queued for a slot, not lifetime since createdAt.
           queuedAt: now,
+          // PEN-5310: and record the same instant somewhere a later defer
+          // cannot overwrite it. `queued_at` alone cannot carry it, because
+          // `promote -> claim -> defer` is reachable and the defer re-stamps
+          // the column; the gauges then discount that stamp and would fall
+          // back to `created_at`, which on a promoted row is when the retry
+          // was SCHEDULED -- republishing the whole park as dispatch wait,
+          // i.e. the #2013 reading this `queuedAt` write exists to prevent.
+          //
+          // Merged in SQL rather than spread from `dueRun.contextSnapshot` so
+          // this write cannot clobber a snapshot change made since that row
+          // was read. Measurement only: no admission gate reads this key.
+          contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || ${JSON.stringify(
+            { [QUEUE_ENTERED_AT_CONTEXT_KEY]: now.toISOString() },
+          )}::jsonb`,
           updatedAt: now,
         })
         .where(
@@ -35851,15 +35877,22 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // promoteScheduledRetryRun above.
         //
         // ⚠️ PEN-5310: that last clause is wrong and the stamp is kept only
-        // for the rest of the sentence. This run never LEFT `queued` --
-        // BLO-48769 keeps a deferred run there deliberately -- so unlike a
-        // promotion there is no new queue entry here to restart a clock for,
-        // and the queued-run age gauges that read this column were silently
-        // zeroing a run that had been waiting for hours. They now discount a
-        // `queued_at` written beside a forward `retryAt`; see
+        // for the rest of the sentence. This run was put back before it did
+        // any work -- BLO-48769 requeues a K8s-deferred run rather than
+        // failing it -- so the wait since its last queue entry is unserved,
+        // and unlike a promotion there is no new queue entry here to restart a
+        // clock for. The queued-run age gauges that read this column were
+        // silently zeroing a run that had been waiting for hours. They now
+        // discount a `queued_at` written beside a forward `retryAt`; see
         // `deferWroteQueuedAtSql` in `dispatch-readiness.ts`. The column is
         // left as-is because it has no control-plane effect and other readers
         // treat it as "last touched".
+        //
+        // The row DOES leave `queued` -- the `.where` below is guarded on
+        // `running` and `startedAt: null` above reverts the claim. Saying
+        // otherwise here would be load-bearing, not cosmetic: it is what makes
+        // `promote -> claim -> defer` look impossible, and that order is why
+        // `paperclipQueueEnteredAt` exists.
         queuedAt: now,
         updatedAt: now,
       })
@@ -35969,8 +36002,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // already running, so reset its dispatch-wait clock to this re-queue.
         //
         // ⚠️ PEN-5310: and it inherits that function's correction too -- this
-        // run never left `queued`, so the stamp is an in-place touch rather
-        // than a new queue entry, and the age gauges discount it. See
+        // run was put back before it did any work, so the stamp is an in-place
+        // touch rather than a new queue entry, and the age gauges discount it.
+        // The row does leave `queued` on the way here (see the `.where` on
+        // `running` below); it is the *queue entry* that is not new. See
         // `deferWroteQueuedAtSql` in `dispatch-readiness.ts`.
         queuedAt: now,
         updatedAt: now,
@@ -37705,6 +37740,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       isolationIdentity: k8sIsolationIdentity,
     });
     if (k8sRunIsolation) {
+      // PEN-5310: these three are the admission backoff, which this dispatch
+      // has just satisfied. `paperclipQueueEnteredAt` is deliberately NOT in
+      // this list -- it must survive `promote -> claim -> defer`, which is the
+      // whole path it was added for. Deleting it here would restore the
+      // `created_at` fallback it exists to close.
       delete context[K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY];
       delete context[K8S_ISOLATION_RETRY_AT_CONTEXT_KEY];
       delete context[K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY];

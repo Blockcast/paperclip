@@ -505,12 +505,12 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
     expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBeLessThan(43000);
   });
 
-  // PEN-5310. The three `queued_at` writers do not mean the same thing, and
-  // the two defer writers stamp a row that never left `queued` -- so the stamp
-  // resets the measured age of a run that has been waiting all along. These
-  // pin the discriminator in BOTH directions: the block above must keep
-  // passing (promotion still ages off `queued_at`, onprem-k8s#2013 intact)
-  // while a defer re-stamp is ignored.
+  // PEN-5310. The three `queued_at` writers do not mean the same thing. The
+  // two defer writers stamp a run they put back before it did any work -- so
+  // the stamp resets the measured age of a run that has been waiting all
+  // along. These pin the discriminator in BOTH directions: the block above
+  // must keep passing (promotion still ages off `queued_at`, onprem-k8s#2013
+  // intact) while a defer re-stamp is ignored.
   describe("defer re-stamps do not reset the measured age (PEN-5310)", () => {
     for (const [writer, retryAtKey] of [
       ["deferRunForK8sIsolationConflict", "paperclipK8sIsolationRetryAt"],
@@ -519,7 +519,11 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
       it(`ages a run re-stamped by ${writer} off createdAt`, async () => {
         // The measurement this issue was filed on: a run queued 7,214s that
         // reported ~86s because a defer touched `queued_at` in place. The run
-        // never left `queued`, so none of that wait was served.
+        // was put back before it did any work, so none of that wait was
+        // served. It carries no `paperclipQueueEnteredAt`, i.e. it was never
+        // promoted out of `scheduled_retry` -- so `created_at` IS its queue
+        // entry and the defer arm falls back to it. The promoted case is
+        // covered separately below, and must NOT land here.
         //
         // Both defer writers stamp `retryAt = now + backoff` in the SAME
         // `.set()` as `queuedAt: now`, so `retryAt > queued_at` is what marks
@@ -660,6 +664,88 @@ describeEmbeddedPostgres("refreshQueuedRunAgeMetrics (BLO-21116)", () => {
       const { body } = await renderMetrics();
       expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(11 * 3600);
       expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(11 * 3600);
+    });
+
+    // PEN-5310 / Ally review of `53718b7`. `promote -> claim -> defer` is the
+    // order the discriminator alone gets wrong, and it is reachable: the defer
+    // UPDATEs are guarded `.where(status = 'running')`, so a promoted run that
+    // is claimed and then hits an isolation or branch conflict comes back to
+    // `queued` with a defer-written `queued_at`. The discriminator fires, and
+    // without `paperclipQueueEnteredAt` the arm falls back to `created_at` --
+    // which on a promoted row is when the RETRY WAS SCHEDULED, hours earlier.
+    // That republishes the whole `scheduled_retry` park as dispatch wait: the
+    // onprem-k8s#2013 false-stranded reading, reached from the opposite
+    // direction from the zeroing this issue was filed on, and common exactly
+    // under the saturation that makes the 1800s alert matter.
+    for (const [writer, retryAtKey] of [
+      ["deferRunForK8sIsolationConflict", "paperclipK8sIsolationRetryAt"],
+      ["deferRunForBranchClaimConflict", "paperclipBranchClaimRetryAt"],
+    ] as const) {
+      it(`ages a promoted run deferred by ${writer} from its promotion, not its creation`, async () => {
+        const { companyId, agentId } = await insertCompanyAndAgent();
+        const now = new Date("2026-08-04T12:00:00.000Z");
+        // Retry scheduled 12h ago, promoted 3h ago, claimed, deferred 60s ago.
+        const createdAt = new Date(now.getTime() - 12 * 60 * 60 * 1000);
+        const promotedAt = new Date(now.getTime() - 3 * 60 * 60 * 1000);
+        const deferredAt = new Date(now.getTime() - 60_000);
+
+        await db.insert(heartbeatRuns).values({
+          companyId,
+          agentId,
+          invocationSource: "assignment",
+          status: "queued",
+          contextSnapshot: {
+            // Written by `promoteScheduledRetryRun` and NOT overwritten by the
+            // defer -- that asymmetry is the entire fix.
+            paperclipQueueEnteredAt: promotedAt.toISOString(),
+            // Elapsed, so the row is dispatch-READY and reaches the claimable
+            // gauge as well; still strictly after `queuedAt`, which is what
+            // marks the stamp as defer-written.
+            [retryAtKey]: new Date(deferredAt.getTime() + 50_000).toISOString(),
+          },
+          createdAt,
+          queuedAt: deferredAt,
+          updatedAt: deferredAt,
+        });
+
+        await refreshQueuedRunAgeMetrics(db, now);
+        const { body } = await renderMetrics();
+        // 3h: served-wait since the promotion. Not 60s (the defer re-stamp,
+        // which is what upstream publishes) and not 12h (bare `created_at`,
+        // which is what this PR published before the review).
+        expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(3 * 3600);
+        expect(gaugeValue(body, QUEUED_RUN_OLDEST_CLAIMABLE_AGE_METRIC, agentId)).toBe(3 * 3600);
+      });
+    }
+
+    it("falls back to createdAt on a malformed queue-entry stamp without aborting the refresh", async () => {
+      // Same reasoning as the malformed-retry-stamp case: a bare
+      // `::timestamptz` on one unparseable value would raise and take the
+      // whole refresh down, zeroing `..._refresh_success` and blinding every
+      // seat's gauge over one row. The shape guard yields NULL instead and the
+      // arm degrades to its pre-PEN-5310 fallback.
+      const { companyId, agentId } = await insertCompanyAndAgent();
+      const now = new Date("2026-08-04T12:00:00.000Z");
+      const deferredAt = new Date(now.getTime() - 60_000);
+
+      await db.insert(heartbeatRuns).values({
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        status: "queued",
+        contextSnapshot: {
+          paperclipQueueEnteredAt: "yesterday",
+          paperclipK8sIsolationRetryAt: new Date(deferredAt.getTime() + 50_000).toISOString(),
+        },
+        createdAt: new Date(now.getTime() - 7_214_000),
+        queuedAt: deferredAt,
+        updatedAt: deferredAt,
+      });
+
+      await refreshQueuedRunAgeMetrics(db, now);
+      const { body } = await renderMetrics();
+      expect(body).toContain(`${QUEUED_RUN_AGE_METRICS_REFRESH_SUCCESS_METRIC} 1`);
+      expect(gaugeValue(body, QUEUED_RUN_OLDEST_AGE_METRIC, agentId)).toBe(7214);
     });
   });
 

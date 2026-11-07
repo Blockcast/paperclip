@@ -958,7 +958,12 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     expect(duePromotion).toEqual({ promoted: 1, runIds: [scheduled.run.id] });
 
     const promotedRun = await db
-      .select({ status: heartbeatRuns.status, queuedAt: heartbeatRuns.queuedAt, createdAt: heartbeatRuns.createdAt })
+      .select({
+        status: heartbeatRuns.status,
+        queuedAt: heartbeatRuns.queuedAt,
+        createdAt: heartbeatRuns.createdAt,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
       .from(heartbeatRuns)
       .where(eq(heartbeatRuns.id, scheduled.run.id))
       .then((rows) => rows[0] ?? null);
@@ -973,6 +978,23 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     // the latter at insert time -- an artifact of the test harness, not of
     // the promotion logic under test.)
     expect(promotedRun?.queuedAt?.toISOString()).toBe(expectedDueAt.toISOString());
+
+    // PEN-5310: the same instant, recorded where a later defer cannot
+    // overwrite it. `queued_at` alone cannot carry the queue entry, because
+    // `promote -> claim -> defer` is reachable and the defer re-stamps that
+    // column; the age gauges discount a defer-written stamp and would then
+    // fall back to `created_at` -- which on this row is when the retry was
+    // SCHEDULED, republishing the whole park as dispatch wait. That is the
+    // #2013 reading the `queuedAt` assertion above exists to prevent, reached
+    // from the other direction. Writer side of the exporter cases in
+    // `queued-run-age-metrics.test.ts`.
+    const promotedSnapshot = promotedRun?.contextSnapshot as Record<string, unknown>;
+    expect(promotedSnapshot.paperclipQueueEnteredAt).toBe(expectedDueAt.toISOString());
+    // The stamp is merged into the snapshot in SQL rather than spread from the
+    // row the promotion sweep read, so pin that it adds a key instead of
+    // replacing the object -- a clobbering write would silently drop the
+    // retry-chain seniority asserted above.
+    expect(promotedSnapshot.retryChainCreatedAt).toBe(now.toISOString());
   });
 
   it("bounds a retry owned by a periodic routine and persists the pre-clamp instant", async () => {
