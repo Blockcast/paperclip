@@ -9290,10 +9290,48 @@ export function describeIntervalOverrunCoalesceBypass(input: {
  * the onprem-k8s#2013 false-stranded reading again. A successor that is itself
  * promoted gets its own stamp at that point; one inserted straight into
  * `queued` correctly falls back to its own `created_at`.
+ *
+ * PEN-5958 added the five defer stamps written by
+ * `deferRunForK8sIsolationConflict` and `deferRunForBranchClaimConflict`. They
+ * record a conflict THIS run lost; a successor has never attempted the bind, so
+ * every one of them is false on it. Three consequences, in increasing order of
+ * cost:
+ *
+ * 1. Admission. {@link isQueuedRunAdmissionDeferred} gates on the `RetryAt`
+ *    pair, so an inherited stamp holds a successor back for a conflict it never
+ *    had. Near-empty in practice -- all three carry sites take a predecessor
+ *    that was *running*, and a deferred run is `queued`, so death follows the
+ *    stamp and the inherited gate is normally already lapsed.
+ * 2. The attempt ladder. The `RetryAttempt` pair is both the backoff exponent
+ *    and the observation behind
+ *    `paperclip_k8s_isolation_conflict_deferral_attempt` /
+ *    `paperclip_branch_claim_conflict_deferral_attempt`. Inherited, those
+ *    histograms count per LINEAGE rather than per run, so the measured tail
+ *    those buckets were sized for cannot be read as one run thrashing. The
+ *    branch-claim pair has no disposal site anywhere, so on a chained row it
+ *    only ever goes up.
+ * 3. A phantom waiter, which costs OTHER runs. `liveIsolationWaiters` in
+ *    `external-runtime-reservations.ts` reads a `queued` run as still
+ *    contending on {@link K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY} while its
+ *    `RetryAt` is under 10 min old, reasoning that deferral re-stamps the time.
+ *    An inherited stamp is a COPY, not a re-stamp -- so a successor that never
+ *    raced the key sits in the oldest-first queue for it and refuses younger
+ *    arrivals the bind with `elder_waiter`, a cause whose own docs say it names
+ *    a run that holds nothing.
+ *
+ * {@link K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY} carries no independent defect once
+ * its `RetryAt` sibling is stripped -- the liveness conjunction already fails --
+ * but it is stamped and disposed in the same breath as the other two and is the
+ * other half of (3), so it is registered with them rather than left behind.
  */
 const RUN_SCOPED_SNAPSHOT_MARKER_KEYS = [
   STALLED_COALESCE_BYPASS_SNAPSHOT_KEY,
   QUEUE_ENTERED_AT_CONTEXT_KEY,
+  K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY,
+  K8S_ISOLATION_RETRY_AT_CONTEXT_KEY,
+  K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY,
+  BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY,
+  BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY,
 ] as const;
 
 /**
