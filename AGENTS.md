@@ -370,8 +370,8 @@ credentials` — measured at 2026-11-05T04:49Z on URLs `curl` answered `200`
 (PEN-5641). `mcp-channel: covered` means a loopback token proxy is listening,
 so the verdict governs any `mcp__github__*` server behind it — it does **not**
 establish that a given server is behind it, because the port is bound once per
-pod: a second `github-mcp-server` logged `already bound` on stderr, got no
-`GITHUB_HOST`, and is pinned to its boot generation anyway (PEN-5702).
+pod: a second `github-mcp-server` logged `already bound` on stderr, was not
+pointed at the proxy, and is pinned to its boot generation anyway (PEN-5702).
 `mcp-channel: NOT COVERED` means the verdict governs the file-reading path
 **only**: `gh` working while `mcp__github__*` 401s is then *expected* after a
 rotation and is **not** evidence of a credential problem — use

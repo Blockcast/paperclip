@@ -2250,7 +2250,7 @@ test("reports the MCP channel as covered when the token proxy answers (PEN-5641)
 // above it used to assert "the MCP server reaches GitHub through the loopback
 // token proxy", which is strictly stronger and is false for every server after
 // the first. The port is bound once per pod: later `github-mcp-server` spawns
-// take a null handle, are started with no GITHUB_HOST, and stay pinned to
+// take a null handle, are not pointed at the proxy, and stay pinned to
 // their boot generation while this probe still sees the winner's listener.
 //
 // An oracle answering confidently for a channel it does not govern is the
@@ -2268,6 +2268,10 @@ test("the covered verdict scopes its claim to servers actually behind the proxy 
         assert.match(proc.stdout, /already bound/);
         // The overstatement itself must not come back.
         assert.doesNotMatch(proc.stdout, /the MCP server reaches GitHub through the loopback token proxy/);
+        // Nor the narrower one: a null handle leaves `process.env` untouched,
+        // so on a pod that already sets GITHUB_HOST the loser HAS one -- just
+        // not the proxy's (PEN-5950).
+        assert.doesNotMatch(proc.stdout, /got no `GITHUB_HOST`/);
         assert.equal(proc.status, 0);
       });
     });
