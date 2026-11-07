@@ -167,6 +167,91 @@ describeEmbeddedPostgres("issue title/description compare-and-set (PEN-5876)", (
     ).rejects.toMatchObject({ status: 409 });
   });
 
+  it("accepts `null` as the base revision on a row that has never been revised", async () => {
+    // Every row predating this feature has a NULL pointer, so this is the
+    // common case rather than an edge one. `null` means "expect no revision
+    // yet" and is enforced; omitting the field means unchecked. A guid-only
+    // contract collapsed the two and left the first edit of every legacy row
+    // unprotectable — any uuid is stale by construction against NULL, so two
+    // runs that both read such a row could only write unguarded, which is the
+    // exact lost update this issue was filed for. (Ally review of #3509.)
+    const { issueId } = await seedIssue("legacy text");
+    const before = await svc.getById(issueId);
+    expect(before?.latestFieldRevisionId ?? null).toBeNull();
+
+    const updated = await svc.update(issueId, {
+      description: "first guarded edit of a legacy row",
+      expectedCurrentFieldRevisionId: null,
+    });
+    expect(updated?.description).toBe("first guarded edit of a legacy row");
+    expect(updated?.latestFieldRevisionId).toBeTruthy();
+  });
+
+  it("refuses the SECOND of two writers that both read a never-revised row", async () => {
+    // The null arm has to be a real IS NULL test rather than an equality — and
+    // it has to stop being satisfiable the moment a revision exists. If `null`
+    // were merely accepted and not enforced, this second write would land.
+    const { issueId } = await seedIssue("legacy text");
+
+    await svc.update(issueId, {
+      description: "writer A",
+      expectedCurrentFieldRevisionId: null,
+    });
+
+    await expect(
+      svc.update(issueId, {
+        description: "writer B, from the same pre-revision read",
+        expectedCurrentFieldRevisionId: null,
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+
+    const after = await svc.getById(issueId);
+    expect(after?.description).toBe("writer A");
+  });
+
+  it("lets exactly one of two CONCURRENT writes against one base revision win", async () => {
+    // Every other case in this file runs sequentially, which exercises the
+    // pre-check and not the WHERE clause. The whole reason this suite needs a
+    // real Postgres is that the guard is re-evaluated against the latest row
+    // version when the statement blocks on a concurrent transaction — so one
+    // test has to actually block on one. (Ally review of #3509.)
+    const { issueId } = await seedIssue();
+    const first = await svc.update(issueId, { description: "first" });
+    const base = first!.latestFieldRevisionId!;
+
+    const results = await Promise.allSettled([
+      svc.update(issueId, { description: "racer A", expectedCurrentFieldRevisionId: base }),
+      svc.update(issueId, { description: "racer B", expectedCurrentFieldRevisionId: base }),
+    ]);
+
+    const fulfilled = results.filter((r) => r.status === "fulfilled");
+    const rejected = results.filter((r) => r.status === "rejected");
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    expect((rejected[0] as PromiseRejectedResult).reason).toMatchObject({ status: 409 });
+    // ⛔ The ONLY path that reaches the zero-matched-rows fallback. Every
+    // precondition in the WHERE is also pre-checked against a read taken
+    // BEFORE the row lock, so single-threaded the pre-check always fires
+    // first — which is why this assertion cannot be made anywhere else in
+    // this file, and why the branch that decides whether to stamp
+    // `stale_base_revision` is only exercised here.
+    const loserDetails = ((rejected[0] as PromiseRejectedResult).reason as HttpError)
+      .details as Record<string, unknown>;
+    expect(loserDetails.expectedRevisionId).toBe(base);
+    expect(loserDetails.code).toBe("stale_base_revision");
+
+    // The decisive assertion is not the 409 but that the winner's text is what
+    // the row holds, and that the loser left no revision behind.
+    const winner = (fulfilled[0] as PromiseFulfilledResult<any>).value;
+    const after = await svc.getById(issueId);
+    expect(after?.description).toBe(winner.description);
+    expect(["racer A", "racer B"]).toContain(after?.description);
+
+    const revisions = await svc.listFieldRevisions(issueId);
+    expect(revisions[0].description).toBe(after?.description);
+    expect(revisions.map((r) => r.revisionNumber)).toEqual([3, 2, 1]);
+  });
+
   it("guards `title` on the same contract — description is not special", async () => {
     // The gap sits in `updateIssueSchema`, above any individual field, so a
     // description-only precondition would leave this race wide open.
@@ -209,6 +294,72 @@ describeEmbeddedPostgres("issue title/description compare-and-set (PEN-5876)", (
     // rather than misattributing the prior text to this run.
     expect(revisions[1].revisionNumber).toBe(1);
     expect(revisions[1].createdByRunId).toBeNull();
+  });
+
+  it("records a revision for the pr_review dedupe rewrite, so a later stale PATCH is refused", async () => {
+    // ⛔ `update:` is not the field set's only writer. The `pr_review` dedupe
+    // branch in `create:` rewrites `title` and `description` on an EXISTING
+    // row. Left out of the history it would leave `latest_field_revision_id`
+    // pointing at the pre-rewrite revision, so a later PATCH carrying that id
+    // as `baseRevisionId` MATCHES and overwrites text the compare-and-set was
+    // meant to protect — a guard that reads as protection and is not one, which
+    // is the exact end state this issue's rejected "harder rule" bullet warns
+    // about. (Ally review of #3509.)
+    const { companyId } = await seedIssue();
+    const target = { repoFullName: "Blockcast/paperclip", prNumber: 4242 };
+    // Identical head in both titles, so the dedupe branch takes no GitHub
+    // round trip: this test is about the revision record, not the stale-head
+    // guard that sits above it.
+    const title = "Review Blockcast/paperclip PR #4242 exact head abc1234";
+
+    const first = await svc.create(companyId, {
+      title,
+      description: "the first filing",
+      status: "todo",
+      priority: "medium",
+      prReviewTarget: target,
+    } as any);
+
+    const baseAfterCreate = (await svc.getById(first.id))?.latestFieldRevisionId ?? null;
+
+    // A duplicate filing for the same PR: dedupes onto the existing row and
+    // rewrites its description.
+    const second = await svc.create(companyId, {
+      title,
+      description: "the dedupe rewrite",
+      status: "todo",
+      priority: "medium",
+      prReviewTarget: target,
+    } as any);
+    expect(second.id).toBe(first.id);
+
+    const afterDedupe = await svc.getById(first.id);
+    expect(afterDedupe?.description).toBe("the dedupe rewrite");
+
+    // The pointer MOVED, and the pre-rewrite text is recoverable.
+    expect(afterDedupe?.latestFieldRevisionId).not.toBe(baseAfterCreate);
+    const revisions = await svc.listFieldRevisions(first.id);
+    expect(revisions[0].description).toBe("the dedupe rewrite");
+    expect(revisions.some((r) => r.description === "the first filing")).toBe(true);
+
+    // And the consequence that makes it matter: a PATCH rebased on what the
+    // row read BEFORE the dedupe is now refused rather than silently winning.
+    if (baseAfterCreate) {
+      await expect(
+        svc.update(first.id, {
+          description: "clobbers the dedupe rewrite",
+          expectedCurrentFieldRevisionId: baseAfterCreate,
+        }),
+      ).rejects.toMatchObject({ status: 409 });
+    } else {
+      await expect(
+        svc.update(first.id, {
+          description: "clobbers the dedupe rewrite",
+          expectedCurrentFieldRevisionId: null,
+        }),
+      ).rejects.toMatchObject({ status: 409 });
+    }
+    expect((await svc.getById(first.id))?.description).toBe("the dedupe rewrite");
   });
 
   it("does not record a revision for a write that touches neither field", async () => {

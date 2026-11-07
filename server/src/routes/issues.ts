@@ -13847,9 +13847,15 @@ export function issueRoutes(
     // holds the checkout: that lock is advisory at the field-write layer, and in
     // the incident this was filed from the lock HOLDER is the party whose
     // content was destroyed, so a holder-keyed test catches one ordering only.
+    //
+    // `null` is forwarded as `null`, not coerced away: it is the "I read this
+    // row before it had any revision" assertion, and the service turns it into
+    // an IS NULL arm. Collapsing it to `undefined` here would silently drop the
+    // precondition on exactly the rows that need it most — every row predating
+    // this feature, on its first guarded edit.
     const fieldRevisionPrecondition =
       baseFieldRevisionId !== undefined
-        ? { expectedCurrentFieldRevisionId: baseFieldRevisionId as string }
+        ? { expectedCurrentFieldRevisionId: (baseFieldRevisionId ?? null) as string | null }
         : {};
 
     let issue;

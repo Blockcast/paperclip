@@ -956,7 +956,17 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   // already exists, so "required on update" would mean required on every
   // PATCH touching these fields and would break every current caller at once.
   // Phase 2 flips it to mandatory for this field set once callers migrate.
-  baseRevisionId: z.string().guid().optional(),
+  //
+  // ⛔ `null` is accepted and is NOT the same as omitting the field: it
+  // asserts "this row has no revision yet", the state every row predating this
+  // feature is in. A guid-only schema rejected `null` with a 400 and left those
+  // rows unable to protect their FIRST edit — any uuid is stale by
+  // construction against a NULL pointer — so two runs that both read a
+  // never-revised row could only write unguarded, which is precisely the lost
+  // update this was filed for. `upsertIssueDocumentSchema` already spells the
+  // same "no revision yet" case `.nullable().optional()`; matching it is what
+  // "do not invent a second shape" means. (Ally review of #3509.)
+  baseRevisionId: z.string().guid().nullable().optional(),
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
