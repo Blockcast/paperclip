@@ -14,7 +14,7 @@
 // `docs/security/PEN-3920-egress-entropy-identifier-decision.md`; the author
 // looked for it in the repository they were pushing to, where it 404s, and the
 // refusal's only offered route was a dead end. Two separate messages carried
-// the same defect, written years apart by different hands — which is why the
+// the same defect, written independently of each other — which is why the
 // pointers live HERE now rather than being spelled out at each call site. Add
 // a new record to this module, not to a message body.
 //

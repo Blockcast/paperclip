@@ -23,6 +23,7 @@ import {
   type GitPushFinding,
   type GitReader,
 } from "./github-git-egress-shim.js";
+import { IDENTIFIER_CLASS_DECISION_URL } from "./security-decision-records.js";
 
 /**
  * An environment dump, assembled rather than pasted.
@@ -907,6 +908,22 @@ describe("scanAnnotatedTags", () => {
   });
 });
 
+/**
+ * Every `docs/...` pointer in a message that is NOT preceded by a scheme and
+ * host — i.e. every pointer that only resolves for a reader standing in this
+ * repository.
+ *
+ * PEN-4939: the defect was not that one path was wrong, it was that a path
+ * relative to the DETECTOR'S checkout was printed to a reader in someone
+ * else's. Asserting the one known URL would pass again the moment a third
+ * message is written by hand, so the regression guard is shaped as "find any
+ * relative one" rather than "check the two we fixed".
+ */
+const relativeDocsPointers = (message: string): string[] =>
+  Array.from(message.matchAll(/(\S*)docs\/[A-Za-z0-9._\/-]+/g))
+    .filter(([, prefix]) => !prefix.includes("//"))
+    .map(([match]) => match);
+
 describe("formatRefusal", () => {
   it("names the commit, the class, and a reachable remedy", () => {
     const message = formatRefusal([
@@ -947,12 +964,26 @@ describe("formatRefusal", () => {
     expect(message).toContain("derive it at runtime");
     // ...but it is no longer the ONLY one. The author must be told where the
     // identifier class is recorded and how to report a value that cannot move.
-    expect(message).toContain("docs/security/PEN-3920-egress-entropy-identifier-decision.md");
     expect(message).toContain("file against the detector");
     expect(message).toContain("Prometheus label matcher");
     // And the refusal must say WHY exoneration is name-anchored, so a reader
     // can tell "wrong name" from "wrong shape" without reading the source.
     expect(message).toContain("exonerated under the label name");
+
+    // PEN-4939: the route must be openable from where the message is READ.
+    // This door refuses a push to an arbitrary repository from inside an agent
+    // container, and `docs/security/` exists only in the detector's own
+    // repository, so the repo-relative path this used to print was a 404 for
+    // the author it was printed to. That is the filing this row came from.
+    expect(message).toContain(IDENTIFIER_CLASS_DECISION_URL);
+    expect(IDENTIFIER_CLASS_DECISION_URL).toMatch(/^https:\/\//);
+    // The surrounding advice says "this repository" meaning the AUTHOR'S, so
+    // the message has to be explicit about whose repository holds the record.
+    expect(message).toContain("the detector's own repository");
+    // And this half is what catches the NEXT one: no `docs/` pointer anywhere
+    // in the message may be relative. It fails here rather than in someone
+    // else's repository, which is the only place the old form ever failed.
+    expect(relativeDocsPointers(message)).toEqual([]);
   });
 
   // PEN-4428: the reporting ask is itself part of the control. Everyone who

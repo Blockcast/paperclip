@@ -21,6 +21,7 @@ import {
   type GitHubEgressScrubClass,
   scrubGitHubEgressText,
 } from "./github-egress-scrub.js";
+import { IDENTIFIER_CLASS_DECISION_URL } from "./security-decision-records.js";
 
 /**
  * Git global options that consume a SEPARATE following token.
@@ -1708,8 +1709,17 @@ export function formatRefusal(findings: readonly GitPushFinding[]): string {
   lines.push(
     "If this is a false positive: when the value is a test fixture, derive it at runtime instead of embedding a literal — that is what the existing fixtures in this repository do, and it closes the finding permanently rather than suppressing it.",
   );
+  // PEN-4939: the pointer is an ABSOLUTE URL and must stay one. This door runs
+  // inside an agent container and refuses a push to an ARBITRARY repository,
+  // while `docs/security/` exists only in the detector's own repository — so
+  // the repo-relative path this used to print 404ed for the reader standing in
+  // the repository they were pushing to, which is how PEN-4939 was filed. The
+  // surrounding sentences say "this repository" meaning the AUTHOR'S, so the
+  // message also has to say whose repository the record is in.
   lines.push(
-    "When the value cannot leave the blob — a Prometheus label matcher, a Kubernetes object name, any identifier a config file has to spell out — deriving it at runtime is not available, and there is no allowlist or override by design. That case is a known class with a home: see docs/security/PEN-3920-egress-entropy-identifier-decision.md, and file against the detector so the rule can be narrowed. Identifiers are exonerated under the label name that binds them, so a refusal here usually means a name or a shape the rule does not cover yet.",
+    "When the value cannot leave the blob — a Prometheus label matcher, a Kubernetes object name, any identifier a config file has to spell out — deriving it at runtime is not available, and there is no allowlist or override by design. That case is a known class with a home, recorded in the detector's own repository rather than the one you are pushing to: see " +
+      IDENTIFIER_CLASS_DECISION_URL +
+      ", and file against the detector so the rule can be narrowed. Identifiers are exonerated under the label name that binds them, so a refusal here usually means a name or a shape the rule does not cover yet.",
   );
   lines.push(
     "Report the binding name — the label or key the value sits under — and the value's shape: its length, which character classes it mixes, and how long its longest digit run is. Do not paste the refused value. The name is what decides exoneration and the shape is what the rule is measured on, so those two are enough to narrow it; and if the detector is right rather than you, quoting the value would publish a live credential somewhere more durable and more widely read than the push this door just refused.",
