@@ -467,12 +467,38 @@ function forcePushRefusal(forcePush: GitForcePush): GitEgressRuntimeError {
   // needs no upstream — hence the rendered fallback on the second line rather
   // than a comment nobody reading a refusal would see.
   //
+  // The no-reflog fallback is the branch that actually gets read (PEN-5947).
+  // `git clone` writes no `update by push` entry, agent runs get fresh per-run
+  // clones, and the previous run's terminal output is long gone — so on this
+  // fleet the fallback is the COMMON case, not the edge one, and whatever it
+  // names is what most refused authors will actually do. It used to say only
+  // "use the sha your last push printed", which names nothing reachable once
+  // that output is gone; the easiest thing left to reach for is a live read of
+  // the branch, i.e. the defect above, arrived at by following the remedy.
+  //
+  // So the fallback names the axis rather than a tool: a source is safe when it
+  // was RECORDED AT PUSH TIME, and that is the whole of it. A sha captured then
+  // — by the push's own output, by the PR/issue the push updated, by a review
+  // of that push — predates any later push and so can disagree with the branch,
+  // which is exactly what a lease needs. A richer API is not the property:
+  // `gh pr view --json headRefOid` returns the branch's current head, the same
+  // value as `ls-remote`, and naming it here would reintroduce the defect in a
+  // shape that LOOKS fixed — worse than weak wording, because it reads as
+  // authoritative. No live-read spelling appears in the rendered text for that
+  // reason; the test pins their absence, where a refused author will not meet
+  // them.
+  //
   // `ls-remote` stays on the far side of the comparison: disagreeing with the
   // reflog means a co-author pushed, which is the one case worth stopping for,
   // and is exactly the case the `contention` paragraph below is written for.
   const lease = [
     "    git reflog show origin/<branch>   # newest `update by push` = <expected-sha>, the sha YOU last pushed",
-    "                                      #   (never pushed from this clone? use the sha your last push printed)",
+    "                                      #   no entry? a fresh clone has none — the usual agent case. Then",
+    "                                      #   <expected-sha> is a sha RECORDED WHEN YOU PUSHED: what the push",
+    "                                      #   printed, the head the PR or issue captured from it, a review's",
+    "                                      #   `Reviewed head:`. The axis is WHEN the value was captured, not",
+    "                                      #   which tool read it — anything read off the branch now is the",
+    "                                      #   head the lease is compared against, so it can never refuse.",
     "    git ls-remote origin refs/heads/<branch>   # still <expected-sha>? if not, a co-author pushed — STOP",
     // paperclip:allow-git-push: remediation text shown to the author, not an invocation
     "    git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>",
