@@ -205,6 +205,15 @@ Terminal denials:
   cloud-tenant user reaches the coordination fields through `issue:mutate` instead.
 - `deny_missing_grant` on the `unassignedClaimSuppressed` branch — generic
   unassigned-issue access cannot claim a recovery or review shell (`BLO-19094`).
+- `deny_human_assigned_issue` for `issue:mutate` on a row a person holds
+  (`PEN-5920`) — `assigneeAgentId` null, `assigneeUserId` set. It labels the
+  same boundary as `deny_missing_grant` (`"grant"`), so the 403 an agent reads
+  is unchanged, and it carries the same `ISSUE_MUTATE_EVALUATED_RELATIONS`. It
+  is a distinct **string** for one reason: `POST /issues/:id/checkout` has to
+  tell this denial apart from every other way `issue:mutate` reaches
+  `deny_missing_grant` — see "Checkout delegates it" below. Ordered **after**
+  the `unassignedClaimSuppressed` branch, so a row that is both human-held and a
+  review/escalation shell keeps the more specific `BLO-19094` denial above.
 - `deny_scope`, both arms of the `issue:coordination_metadata` branch — coordination
   metadata on a self-owned, unassigned, or unmanaged issue.
 - `deny_missing_grant` for `issue:comment` — returned at the end of the agent
@@ -306,6 +315,38 @@ relations — `allow_self`, and the `allow_productivity_review_grant` exception.
 A genuinely unheld row — **both** assignee fields null — is unaffected on both
 actions; that is the case the relation was written for.
 
+### Checkout delegates it
+
+`POST /issues/:id/checkout` is the one caller that does **not** act on this
+denial, and that exemption is keyed on the reason string
+`deny_human_assigned_issue` rather than on the row's shape.
+
+The denial says *a person holds this row, so generic unassigned-issue access
+stops short of the write* — a statement about writing to somebody else's issue.
+Checkout is not that: it asks to **take** the row, and the service already
+answers no in the claiming `UPDATE`'s own `WHERE` clause. Every arm fails on a
+human-held row — `unassignedAgentCheckoutCondition` requires **both** assignee
+columns null, the same-run arm requires the actor to be the agent assignee, and
+the source-scoped recovery-owner arm carries the same `assigneeUserId` term
+since `PEN-5940`. So the exemption grants nothing; the row is never taken.
+
+What it preserves is hygiene that only exists on the refusal path.
+`clearStaleExecutionLock` runs **inside** `svc.checkout`, and a refused checkout
+is the only caller that reaps a dead run's execution lock off this class of row
+— `releaseExecutionLockIfOwnerReapable`'s other caller is the recovery
+escalation loop, which does not cover it. A 403 raised at the route, upstream of
+the service, skips it, and a human-held `in_review` row then keeps a dead run's
+lock indefinitely. Pinned end-to-end by the two human-reviewer cases in
+`issue-stale-execution-lock-routes.test.ts`, which assert `409` and the cleared
+lock, and at the route by a pair in
+`issue-agent-mutation-ownership-routes.test.ts` — one for the delegation, one
+control proving a human-held row refused for **any other** reason still gets its
+403 at the door.
+
+⚠️ This is why the reason is the key and `assigneeUserId` is not. Exempting the
+door on the row's shape would also swallow the `BLO-19094` denial on a
+human-held review/escalation shell, which must stay a 403 with its own message.
+
 ### Why it is keyed on `assigneeUserId`
 
 The suppression the claim branch consults,
@@ -357,7 +398,8 @@ outlier.
 - Clearing an agent assignee in favour of a human no longer widens write access.
   It moves the row from "the assignee alone may mutate" to "no agent may mutate
   through the generic claim". See escape hatch 2.
-- An `issue:mutate` denial on such a row names
+- An `issue:mutate` denial on such a row carries its own reason
+  (`deny_human_assigned_issue`), names
   `ISSUE_MUTATE_EVALUATED_RELATIONS` and says so explicitly, rather than falling
   into the generic message — which ends "or take assignment", the one piece of
   advice that must not be followed on a row a person is holding. That holds on
@@ -672,7 +714,11 @@ In order of cost. All three are supported today; none requires a code change.
    parked-disposition and scoped-recovery shapes. All predate `PEN-5920` and
    none is the generic claim this hatch withdraws — but each is agent-reachable
    on a human-held row, so read the hatch as closing the *generic* door, not
-   every door.
+   every door. `POST /issues/:id/checkout` also stops acting on this denial
+   (`deny_human_assigned_issue`, see "Checkout delegates it" above) — but that
+   one is **not** a residual path: the service's own claim predicate refuses a
+   human-held row unconditionally, so checkout answers `409` rather than taking
+   it.
    ⚠️ Note the residual: clearing the agent assignee **without** setting
    `assigneeUserId` leaves the row genuinely unheld, which is still the
    `allow_company_agent` branch on both actions. The protection comes from the

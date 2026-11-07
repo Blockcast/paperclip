@@ -2210,13 +2210,17 @@ describeEmbeddedPostgres("authorization service", () => {
     // `assigneeUserId` were not a concept.
     //
     // PEN-5920: that field being set now ALSO withholds the generic
-    // `issue:mutate` claim on its own, so the mutate cell below is
-    // overdetermined — it would be denied by either suppression alone and no
-    // longer isolates this one. The `issue:comment` assertion is what keeps the
-    // `originKind` path honestly tested: the PEN-5920 predicate is
+    // `issue:mutate` claim on its own, so the mutate cell below is reached by
+    // two independent suppressions. The REASON is what still separates them:
+    // this row is denied `deny_missing_grant` by the origin allowlist, which
+    // runs first, while an ordinary human-assigned row is denied
+    // `deny_human_assigned_issue` (the PEN-5920 case below). Asserting the
+    // reason here is therefore load-bearing — it pins the ORDER, and the
+    // ordering is what keeps this row's more specific message. The
+    // `issue:comment` assertion is the other half: the PEN-5920 predicate is
     // mutate-only, so a comment denial here can only have come from the origin
-    // allowlist. Drop that assertion and this case stops covering the thing its
-    // own name claims.
+    // allowlist. Drop either and this case stops covering the thing its own
+    // name claims.
     const escalationIssue = await createIssue(db, company.id, {
       title: "Orphaned productivity review escalation",
       assigneeAgentId: null,
@@ -2304,11 +2308,18 @@ describeEmbeddedPostgres("authorization service", () => {
 
     // The narrowing. An unrelated agent may no longer rewrite or close a row
     // addressed to a named human.
+    //
+    // `deny_human_assigned_issue`, not `deny_missing_grant`: the two are one
+    // boundary ("grant") and the 403 body is identical, but
+    // `POST /issues/:id/checkout` keys its delegation on this reason, so the
+    // string is a contract and not a label. Flipping it back to the generic
+    // reason re-breaks the two human-reviewer cases in
+    // `issue-stale-execution-lock-routes.test.ts`, silently.
     await expect(authorization.decide({
       actor: actorContext,
       action: "issue:mutate",
       resource,
-    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_human_assigned_issue" });
 
     // Control, and the fixture pin: the SAME row with no human assignee is
     // still mutable. This is the branch `allow_company_agent` was written for —
@@ -5249,12 +5260,15 @@ describeEmbeddedPostgres("authorization service", () => {
         // outside. The mutate cell is now the denial, and the divergence from
         // `unassigned` directly above is the assertion: these two rows differ
         // only in `assigneeUserId`, so the grid can no longer be read as
-        // covering both ownership kinds alike.
+        // covering both ownership kinds alike. The reason is its own
+        // (`deny_human_assigned_issue`) because one caller — the checkout door
+        // — has to tell this denial apart from the rest of
+        // `deny_missing_grant`; the boundary it labels is still "grant".
         relation: "human_assigned",
         note: "PEN-5920 — `assigneeUserId` set, `assigneeAgentId` null: a person holds it, so comment but not mutate",
         cells: [
           { action: "issue:comment", allowed: true, reason: "allow_company_agent" },
-          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
+          { action: "issue:mutate", allowed: false, reason: "deny_human_assigned_issue" },
           { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
         ],
       },

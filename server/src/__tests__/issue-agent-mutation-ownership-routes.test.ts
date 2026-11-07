@@ -1335,7 +1335,7 @@ describe("agent issue mutation checkout ownership", () => {
     mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
       allowed: input.action === "issue:comment" || input.action === "issue:read",
       action: input.action,
-      reason: input.action === "issue:mutate" ? "deny_missing_grant" : "allow_company_agent",
+      reason: input.action === "issue:mutate" ? "deny_human_assigned_issue" : "allow_company_agent",
       explanation:
         input.action === "issue:mutate"
           ? "This issue is assigned to a person, so generic unassigned-issue access carries "
@@ -3420,6 +3420,87 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(500);
     expect(res.body.error).toBe("Failed to verify recovery checkout authorization");
     expect(res.body.reason).toBe("recovery_lookup_failed");
+    expect(mockIssueService.checkout).not.toHaveBeenCalled();
+  });
+
+  // PEN-5920. The checkout door does NOT answer the human-hold question; it
+  // delegates it to `svc.checkout`'s claim predicate, which refuses atomically
+  // AND clears a dead run's execution lock on the way out. Answering it here
+  // instead would turn that 409 into a 403 raised upstream of
+  // `clearStaleExecutionLock`, stranding the lock on the row — the two named
+  // human-reviewer cases in `issue-stale-execution-lock-routes.test.ts` are the
+  // end-to-end proof; this pair pins the route contract that makes them pass.
+  it("delegates checkout on a person's row to the claim predicate instead of denying at the boundary", async () => {
+    const { HttpError } = await vi.importActual<typeof import("../errors.js")>("../errors.js");
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: "board-user-1",
+    }));
+    // Exactly what `decideBase` returns for this row since PEN-5920.
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action !== "issue:mutate",
+      action: input.action,
+      reason: input.action === "issue:mutate" ? "deny_human_assigned_issue" : "allow_company_agent",
+      explanation:
+        input.action === "issue:mutate"
+          ? "This issue is assigned to a person, so generic unassigned-issue access carries "
+            + "issue:comment but not issue:mutate."
+          : "Allowed by test issue boundary.",
+    }));
+    // What the real service does with it: `unassignedAgentCheckoutCondition`
+    // requires BOTH assignee columns null, so no arm of the claiming UPDATE
+    // matches and the service 409s — after running the stale-lock sweep.
+    mockIssueService.checkout.mockRejectedValue(new HttpError(409, "Issue checkout conflict"));
+
+    const actor = peerActor();
+    const res = await request(await createApp(actor))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: peerAgentId, expectedStatuses: ["in_review"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.error).toBe("Issue checkout conflict");
+    // The load-bearing assertion: the service was reached at all.
+    expect(mockIssueService.checkout).toHaveBeenCalledWith(
+      issueId,
+      peerAgentId,
+      ["in_review"],
+      actor.runId,
+      { allowSourceScopedRecoveryOwner: false, allowExecutionStageParticipantClaim: false, recoveryActionId: null, recoveryActionStatus: null },
+    );
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+  });
+
+  // The control that keeps the exemption honest, and the reason it is keyed on
+  // the REASON rather than on the row's shape. A human-held row that is also a
+  // review/escalation shell is denied earlier, by the origin allowlist, under
+  // the ordinary `deny_missing_grant` — and that 403, with its own message,
+  // must survive. Matching on `assigneeUserId` at the door would have swallowed
+  // it; without this row, that blanket version passes the case above.
+  it("still denies checkout at the boundary when a person's row is refused for any other reason", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      status: "todo",
+      assigneeAgentId: null,
+      assigneeUserId: "board-user-1",
+      originKind: "productivity_review_escalation",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action !== "issue:mutate",
+      action: input.action,
+      reason: input.action === "issue:mutate" ? "deny_missing_grant" : "allow_company_agent",
+      explanation:
+        input.action === "issue:mutate"
+          ? "Agents cannot claim a recovery or review shell they were not assigned; "
+            + "ownership of it confers access to the issue it reviews."
+          : "Allowed by test issue boundary.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: peerAgentId, expectedStatuses: ["todo"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.reason).toBe("deny_missing_grant");
     expect(mockIssueService.checkout).not.toHaveBeenCalled();
   });
 

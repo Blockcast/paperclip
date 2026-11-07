@@ -149,6 +149,14 @@ export type AuthorizationDecision = {
     | "deny_company_boundary"
     | "deny_missing_membership"
     | "deny_missing_grant"
+    // PEN-5920. A narrowing of `deny_missing_grant`, not a new boundary — it
+    // labels "grant" like its parent and the 403 body reads identically. It
+    // exists because one caller has to tell this denial apart from the rest of
+    // `deny_missing_grant`: `POST /issues/:id/checkout` delegates the
+    // human-hold question to `svc.checkout`'s claim predicate, and a reason
+    // string is the only thing that distinguishes "a person holds this row"
+    // from the half-dozen other ways `issue:mutate` reaches that same reason.
+    | "deny_human_assigned_issue"
     | "deny_missing_consent"
     | "deny_no_grant"
     | "deny_policy_restricted"
@@ -767,6 +775,7 @@ export function authorizationBoundaryLabel(reason: AuthorizationDecision["reason
     case "deny_company_boundary":
       return "company-mismatch";
     case "deny_missing_grant":
+    case "deny_human_assigned_issue":
     case "deny_no_grant":
     case "deny_missing_consent":
       return "grant";
@@ -2883,10 +2892,20 @@ export function authorizationService(db: Db) {
       // worked around rather than answered. Same reason the mutate list was
       // stated at all in PEN-4495 — a denial nobody can read gets routed around
       // instead of obeyed.
+      //
+      // `deny_human_assigned_issue` rather than `deny_missing_grant` for the
+      // same reason, one layer down: `POST /issues/:id/checkout` has to tell
+      // THIS denial apart from every other way `issue:mutate` reaches
+      // `deny_missing_grant`, because checkout does not write to the row on a
+      // person's behalf — it asks to take the row, and that question is already
+      // answered, atomically and with its own lock hygiene, by
+      // `svc.checkout`'s claim predicate. The explanation string cannot carry
+      // that; a reason can. The boundary label is unchanged ("grant"), so the
+      // 403 an agent reads is byte-identical.
       if (humanAssignedMutateClaimSuppressed) {
         return deny({
           action: input.action,
-          reason: "deny_missing_grant",
+          reason: "deny_human_assigned_issue",
           explanation:
             "This issue is assigned to a person, so generic unassigned-issue access carries " +
             "issue:comment but not issue:mutate. Comment on the issue instead — the assignee " +
