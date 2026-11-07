@@ -2244,10 +2244,11 @@ describeEmbeddedPostgres("authorization service", () => {
   // matches neither, so every agent in the company holds `issue:mutate` on it.
   // That is the same hazard the suppression allowlist already articulates for
   // `productivityReviewEscalation` ("an agent claiming it answers the question
-  // that was asked of the user"), reached by the 53-of-56 open rows that the
-  // allowlist does not name. Human decision gates are the dominant use of human
-  // assignment in this company, and a gate any agent may set to `done` is not a
-  // gate.
+  // that was asked of the user"), reached by every human-assigned row whose
+  // `originKind` the allowlist does not name. Human decision gates are the
+  // dominant use of human assignment in this company, and a gate any agent may
+  // set to `done` is not a gate. (Fleet counts are a dated snapshot and live in
+  // docs/security/issue-authorization-model.md and on PEN-5900, not here.)
   it("treats a human-assigned issue as unassigned: every company agent may mutate it (PEN-5900)", async () => {
     const company = await createCompany(db, "HumanAssignedIssueClaim");
     const actor = await createAgent(db, company.id, { role: "engineer" });
@@ -2255,8 +2256,8 @@ describeEmbeddedPostgres("authorization service", () => {
     const actorContext = { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_key" } as const;
 
     // The shape the CTO described on PEN-2526 as "not unassigned": no agent
-    // holds it, a named human does. `originKind: "manual"` is the default and
-    // is the measured shape of 53 of the 56 open instances.
+    // holds it, a named human does. `originKind: "manual"` is the default, so
+    // this row sits outside the two-element suppression allowlist.
     const humanAssigned = await createIssue(db, company.id, {
       title: "CONFIRMATION GATE - operator to confirm",
       assigneeAgentId: null,
