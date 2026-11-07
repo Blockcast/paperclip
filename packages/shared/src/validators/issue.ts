@@ -1036,6 +1036,18 @@ export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
  * PEN-5367 corrects what that half claims. It knows the `agent://` id resolved
  * and nothing beyond that: not that a wake was raised, not that the mention
  * authorized anyone, and not that the echoed name matches the agent's.
+ *
+ * PEN-5812 adds `mentionsWithoutGrant`, the entitlement half. Binding and
+ * entitlement are different mechanisms evaluated in different places, and until
+ * that field only binding was reported — so a mention that woke nobody and
+ * granted nothing was reported identically to one that did.
+ *
+ * The copy below is deliberately narrower than "nothing happened". The field
+ * models `commentAuthorCanGrantIssueMention` and nothing else, while the wake
+ * loop ALSO skips every mention on a closed, non-reopened row before the
+ * predicate is reached. So a name in the list is inert, but an empty list does
+ * not prove a wake fired, and the note has to say so — an affirmative all-clear
+ * is the one direction this family is not allowed to fail in.
  */
 export const COMMENT_UNBOUND_MENTIONS_NOTE =
   "⚠ A plain `@Name` MENTIONS NOBODY. The extractor binds only a markdown link "
@@ -1068,7 +1080,28 @@ export const COMMENT_UNBOUND_MENTIONS_NOTE =
   + "name YOU WROTE, never the agent's: the reported name is the link label "
   + "reduced to its first `@`-token, so `[@Security Engineer](…)` reports "
   + "`Security`, and an equality check against the real name is a false negative. "
-  + "(PEN-5367)";
+  + "(PEN-5367) "
+  + "⚠ THE THIRD LIST, `mentionsWithoutGrant`, REPORTS THAT ENTITLEMENT VERDICT "
+  + "— the resolved mentions this author was NOT entitled to raise a wake for on "
+  + "this row. Only the issue's own ASSIGNEE (or a user with active company "
+  + "membership) can raise one, and an agent can never grant to itself. A name in "
+  + "BOTH `boundMentions` and `mentionsWithoutGrant` means the link was well "
+  + "formed, the agent exists, and nothing was granted. Do not re-send the same "
+  + "body to the same row; it will do the same nothing. Ask the row's assignee to "
+  + "make the mention, or escalate. Self-mentions are listed too, since those also "
+  + "wake nobody. "
+  + "⛔ THE CONVERSE DOES NOT HOLD: an EMPTY `mentionsWithoutGrant` is NOT proof "
+  + "that a wake fired. It models entitlement and ONLY entitlement, while the "
+  + "wake has a second term it does not model and which is evaluated FIRST: on a "
+  + "CLOSED (`done`/`cancelled`) row that your comment does not reopen, EVERY "
+  + "mention wake is skipped before entitlement is consulted, and the row's "
+  + "assignee wake with it. A grantable mention there wakes nobody and comes "
+  + "back ABSENT from this list. The field's NAME stays accurate — the grant "
+  + "itself does attach on a closed row, because it is re-derived at decision "
+  + "time from the persisted comment row and no term the wake loop grows can "
+  + "reach that query — it is \"nothing happened\" that does not follow from "
+  + "absence, and the two are different claims. `mentionsWithoutGrant` is "
+  + "likewise always present; absent means the server predates it. (PEN-5812)";
 
 export const addIssueCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)).describe(COMMENT_UNBOUND_MENTIONS_NOTE),

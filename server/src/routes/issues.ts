@@ -5149,9 +5149,14 @@ export function issueRoutes(
   // site in this file runs the SAME predicate and skips a mention that fails it,
   // so a non-entitled author's mention raises no wake at all — and because it
   // still BINDS, it is also absent from the create response's `unboundMentions`,
-  // which is PEN-5180's only signal. Its author therefore sees a 201 and an empty
-  // unbound list, the mentioned agent is never woken, and nothing anywhere names
-  // the reason: more silent than the failure the old text described, not less.
+  // which is PEN-5180's only signal.
+  //
+  // PEN-5812: that used to end "and nothing anywhere names the reason". It now
+  // does. The create response carries `mentionsWithoutGrant`, the resolved
+  // mentions whose wake this author was not entitled to raise on this row —
+  // computed from this same predicate, so the receipt cannot drift from the
+  // gate. A name in both `boundMentions` and `mentionsWithoutGrant` is the
+  // inert mention, named. The gate itself is unchanged; only the silence is.
   //
   // PEN-5353: the three sites are cited by symbol, not by line. They are the
   // `continue`-on-failed-`commentAuthorCanGrantIssueMention` guards in
@@ -16793,6 +16798,31 @@ export function issueRoutes(
       }
       return resolvedMentionAgentIds;
     };
+    // PEN-5812: the author-membership half of `commentAuthorCanGrantIssueMention`,
+    // memoized and shared with the wake loop below so the receipt and the gate
+    // answer from the SAME fact. Two independent reads could disagree under a
+    // concurrent membership change, and a receipt that disagrees with the gate
+    // is worse than no receipt — it is the affirmative-but-wrong signal this
+    // row exists to remove. Short-circuits exactly as the wake loop used to:
+    // only a user author with at least one mention is looked up.
+    let resolvedAuthorUserIsActiveMember: boolean | null = null;
+    const resolveAuthorUserIsActiveMember = async (hasMentions: boolean): Promise<boolean> => {
+      if (resolvedAuthorUserIsActiveMember !== null) return resolvedAuthorUserIsActiveMember;
+      if (!hasMentions || actor.actorType !== "user") return false;
+      try {
+        resolvedAuthorUserIsActiveMember = Boolean(
+          await getActiveCompanyMembership(db, currentIssue.companyId, "user", actor.actorId),
+        );
+      } catch (err) {
+        logger.warn({ err, issueId: id }, "failed to resolve comment author membership for @-mentions");
+        // Fail toward reporting, not toward silence: an unresolved membership
+        // is treated as "cannot grant", which puts the mention in
+        // `mentionsWithoutGrant` and costs one re-send. The wake loop reaches
+        // the same verdict from the same value, so the two cannot diverge.
+        resolvedAuthorUserIsActiveMember = false;
+      }
+      return resolvedAuthorUserIsActiveMember;
+    };
     // Always present on the response, never conditional: an absent key cannot
     // be told apart from a server that predates this report, which is the
     // ambiguity the `unrecognizedPayloadKeys` note calls out. An empty array
@@ -16808,21 +16838,70 @@ export function issueRoutes(
     // Additive on purpose — `unboundMentions` keeps its semantics, and
     // `boundMentions` is likewise unconditional so an absent key cannot be
     // confused with an older server.
+    //
+    // PEN-5812: `mentionsWithoutGrant` is the third list, and it reports the
+    // mechanism the first two structurally cannot. `boundMentions` is computed
+    // from `findMentionedAgents` alone — it never consults
+    // `commentAuthorCanGrantIssueMention` — so there is NO pair of inputs, one
+    // grantable mention and one not, that makes it differ. A mention written on
+    // a row the author is not assigned resolves, is reported as bound, raises no
+    // wake and confers no grant, and until this field nothing anywhere said so.
+    // The grantor was not merely told nothing: since PEN-5364 they were shown an
+    // affirmative success signal naming the inert mention. (PEN-2394 established
+    // the grantee half; the grantee at least eventually hits a 403 and learns.)
+    //
+    // Strictly a reporting change. The guard below is untouched: assignee
+    // carries write, a mention does not authorize, and mention grants must not
+    // chain agent-to-agent. Widening that is not what this is.
+    //
+    // A name can appear in BOTH `boundMentions` and `mentionsWithoutGrant`, and
+    // that pair is the defect made legible rather than a contradiction.
+    //
+    // It models this predicate and NOTHING ELSE, so the copy on both description
+    // surfaces is deliberately narrower than "nothing happened". The wake loop
+    // below carries an earlier term this does not — `isClosedIssueStatus(...) &&
+    // !reopened` — so on a closed, non-reopened row every mention wake is skipped
+    // before entitlement is consulted and a grantable mention comes back ABSENT
+    // from this list. A name here is inert; an EMPTY list is not proof of a wake.
+    // The field's name stays right either way: `agentHasMentionGrantOnIssue`
+    // (authorization.ts) re-derives the grant AT DECISION TIME from the persisted
+    // `issueComments` rows, and the wake loop writes nothing that query reads — so
+    // the grant does attach on a closed row, and would still attach whatever term
+    // the wake loop grows next. PEN-5846 tracks the three sites disagreeing on the
+    // closed term; this is a reporting surface and does not try to settle it.
     const commentResponseBody = async () => {
       let unboundMentions: string[] = [];
       let boundMentions: string[] = [];
+      let mentionsWithoutGrant: string[] = [];
       try {
+        const boundAgentIds = await resolveMentionedAgentIds();
+        const authorUserIsActiveMember = await resolveAuthorUserIsActiveMember(boundAgentIds.length > 0);
+        // The same predicate, with the same arguments, that the wake loop
+        // `continue`s on. Evaluated against `currentIssue` at response time, so
+        // a reopen or an in-request reassignment reports the assignee the wake
+        // was actually judged against.
+        const withoutGrantAgentIds = boundAgentIds.filter((mentionedAgentId) => !commentAuthorCanGrantIssueMention({
+          mentionedAgentId,
+          issueAssigneeAgentId: currentIssue.assigneeAgentId,
+          authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+          authorUserIsActiveMember,
+        }));
         const mentionReport = extractMentionBindingReport(persistedComment.body, {
-          boundAgentIds: await resolveMentionedAgentIds(),
+          boundAgentIds,
+          withoutGrantAgentIds,
         });
         unboundMentions = mentionReport.unbound;
         boundMentions = mentionReport.bound;
+        mentionsWithoutGrant = mentionReport.withoutGrant;
       } catch (err) {
         // Fail toward "nothing bound": a false re-send costs one round trip, a
-        // false all-clear costs the wake.
+        // false all-clear costs the wake. `mentionsWithoutGrant` defaults empty
+        // for the same reason its siblings do — an empty list here is weaker
+        // than a populated one, and the body is still readable from
+        // `unboundMentions`.
         logger.warn({ err, issueId: id }, "failed to scan comment for unbound @-mentions");
       }
-      return { ...persistedComment, unboundMentions, boundMentions };
+      return { ...persistedComment, unboundMentions, boundMentions, mentionsWithoutGrant };
     };
 
     if ("deduplicated" in comment && comment.deduplicated) {
@@ -17071,16 +17150,10 @@ export function issueRoutes(
 
       const mentionedIds = await resolveMentionedAgentIds();
 
-      let authorUserIsActiveMember = false;
-      if (mentionedIds.length > 0 && actor.actorType === "user") {
-        try {
-          authorUserIsActiveMember = Boolean(
-            await getActiveCompanyMembership(db, issue.companyId, "user", actor.actorId),
-          );
-        } catch (err) {
-          logger.warn({ err, issueId: id }, "failed to resolve comment author membership for @-mentions");
-        }
-      }
+      // PEN-5812: shared with `commentResponseBody()` above, so the wake this
+      // loop raises and the `mentionsWithoutGrant` the author reads back are
+      // derived from one membership read rather than two.
+      const authorUserIsActiveMember = await resolveAuthorUserIsActiveMember(mentionedIds.length > 0);
 
       for (const mentionedId of mentionedIds) {
         if (isClosedIssueStatus(currentIssue.status) && !reopened) continue;
