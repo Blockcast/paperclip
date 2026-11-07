@@ -1,0 +1,175 @@
+# PEN-5781: run the BLO-29711 comment-review-gate census against the repo whose
+# merge gate it describes.
+#
+# WHAT WAS WRONG
+#
+# `scripts/check-comment-review-gate-census.mjs` shipped as the guard against
+# "a merged PR carrying a green status that admits nothing reviewed the head",
+# and then was never invoked. Its only reference in .github/workflows was
+# pr.yml running its *unit tests*. CI proved the census would detect the
+# condition; nothing ever asked it to.
+#
+# PEN-3281's scheduled-guard liveness check cannot catch that, and the reason is
+# structural rather than an oversight: it watches guards that STOP running, and
+# this one never started. Hence step two below.
+#
+# WHY THE SCHEDULE WAS NOT THE WHOLE FIX — AND HAD TO COME SECOND
+#
+# The census filtered candidate statuses on `startsWith("review/")`. BLO-33657's
+# mitigation for this very defect had already moved the live context OUT of that
+# namespace, to `gate/ally-comment-findings` — which, measured 2026-11-06, is the
+# SOLE ruleset-required status context on master (ruleset 25827389).
+#
+# So scheduling the census BEFORE widening its predicate would have been worse
+# than leaving it idle. Measured over the 12 most recently merged PRs, the old
+# predicate found 10 violations — every one of them the retired `review/ally-comment`
+# mirror, which is required by nothing — and ZERO on the context that actually
+# gates merge. A triager would have seen a working-looking detector producing
+# findings, allowlisted the retirement, read `OK: N merged PRs ...`, and closed
+# the class. Idle silence claims nothing; a blinded detector manufactures
+# reassurance. The predicate was widened first, in the same PR.
+#
+# WHY THIS JOB DOES NOT RED ON THE VIOLATION COUNT
+#
+# It would be born permanently red and stay that way. The `required-gate` and
+# `review-namespace` populations are a known, tracked, OPEN defect (PEN-5565,
+# itself blocked on PEN-4275): 10 of the 12 most recently merged PRs are in it.
+#
+# This repo already carries that failure three times over and names it —
+# scheduled-guard-liveness.yml records that `ally-review-consistency` has 0
+# successes in its last 100 runs and `production-environment-protection-guard`
+# is 61 failures out of 61, and cites PEN-2847: "a permanently-red auditor
+# cannot signal a new violation." Adding a fourth knowingly would make a
+# documented problem worse, and would bury the one signal here that IS
+# actionable today.
+#
+# So the split is: the full verdict is always published (log + step summary, per
+# surface, never summed), and the job reds only on conditions that can be acted
+# on the day they appear —
+#
+#   1. `unclassified` is non-empty. A green carrying wording only this gate
+#      emits, under a context in neither audited set. That means the gate was
+#      RENAMED again and this census has been blinded a second time — the exact
+#      event this PR exists to recover from, and the one it cannot self-heal.
+#   2. The census could not be computed at all (crash, auth, no summary written).
+#      A guard that fails to run must not look like a guard that ran and found
+#      nothing — that is the whole thesis of PEN-3281.
+#
+# ⚠️ WHEN PEN-5565 LANDS, FLIP THIS TO A HARD RED on `violatingPrs > 0`. The
+# reporter posture is justified ONLY by that defect being open and tracked. Left
+# in place afterwards it becomes the thing it was built to replace: an
+# instrument that watches a now-empty class and reports nothing either way.
+#
+# Liveness of this workflow is watched by scheduled-guard-liveness.yml
+# (WATCHED_GUARDS in scripts/check-scheduled-guard-liveness.mjs), so a census
+# that stops running is itself detected. That entry is mandatory, not optional:
+# check-scheduled-guard-liveness.test.mjs enumerates every scheduled workflow
+# and fails the PR if one is neither watched nor exempted.
+name: Comment Review Gate Census
+
+on:
+  schedule:
+    # 06:37 UTC daily. Minute 37 is clear of every hourly guard on this repo
+    # (:03/:09/:13/:17/:23/:27/:33/:41/:43/:47/:53/:58), with 4 minutes of
+    # separation either side, so this does not pile onto their burst. Daily
+    # rather than hourly because the cost is ~1 + CENSUS_PR_LIMIT API calls per
+    # run and the subject — the merged-PR population — moves slowly (PEN-4427).
+    - cron: "37 6 * * *"
+  workflow_dispatch:
+    inputs:
+      pr_limit:
+        description: "how many recently merged PRs to examine"
+        required: false
+        default: ""
+
+permissions:
+  # Read-only throughout. `contents: read` is required because a workflow-level
+  # permissions block sets every unlisted scope to none, and the checkout needs
+  # it; `pull-requests: read` for `gh pr list`; `statuses: read` for the status
+  # WRITE HISTORY, which is what the census reads instead of the collapsed
+  # combined status (see the script header for why).
+  contents: read
+  pull-requests: read
+  statuses: read
+
+jobs:
+  census:
+    name: merged PRs carry no green status that admits nothing reviewed the head
+    # Same read-only API pool the other `gh api` guards on this repo use.
+    runs-on: arc-paperclip-light
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # The census exits 1 whenever it finds ANY violation, which is the
+      # expected state today. So its exit code is captured rather than allowed
+      # to abort the job, and the verdict is read from the JSON summary below.
+      # Nothing about detection is changed here — see the header for which
+      # conditions this job then reds on.
+      - name: Run the comment-review-gate census
+        id: census
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Explicit, and load-bearing: DEFAULT_REPO in the script points at
+          # Blockcast/penstock-llm-proxy-core, so an unparameterised schedule
+          # would run happily and silently measure the wrong repository.
+          CENSUS_REPO: Blockcast/paperclip
+          CENSUS_PR_LIMIT: ${{ inputs.pr_limit || '60' }}
+          CENSUS_SUMMARY_PATH: ${{ runner.temp }}/census-summary.json
+        run: |
+          set +e
+          node scripts/check-comment-review-gate-census.mjs 2>&1 | tee "${RUNNER_TEMP}/census.txt"
+          echo "exit_code=${PIPESTATUS[0]}" >> "${GITHUB_OUTPUT}"
+          exit 0
+
+      # Publishing the verdict unconditionally is what makes the reporter
+      # posture honest: the counts are visible on every run, so a reader can see
+      # the population move even though the job is green.
+      - name: Publish the verdict
+        run: |
+          {
+            echo "## Comment review gate census — Blockcast/paperclip"
+            echo
+            if [ -f "${RUNNER_TEMP}/census-summary.json" ]; then
+              echo '```json'
+              cat "${RUNNER_TEMP}/census-summary.json"
+              echo '```'
+            else
+              echo "No summary was written — the census did not complete."
+            fi
+            echo
+            echo "<details><summary>Full census output</summary>"
+            echo
+            echo '```'
+            cat "${RUNNER_TEMP}/census.txt" || true
+            echo '```'
+            echo
+            echo "</details>"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      # Condition 2 first: a census that could not run must never be mistaken
+      # for a census that ran and found nothing.
+      - name: Fail if the census could not be computed
+        if: ${{ steps.census.outputs.exit_code != '0' && steps.census.outputs.exit_code != '1' }}
+        run: |
+          echo "::error::The census did not complete (exit ${{ steps.census.outputs.exit_code }}); its verdict is UNKNOWN, not clean."
+          exit 1
+
+      # Condition 1: the rename tripwire. Also re-checks that the summary exists
+      # even on an exit code that claims success, because a missing summary on a
+      # 0/1 exit means the script changed shape under this job.
+      - name: Fail if the gate was renamed out from under the census
+        env:
+          SUMMARY: ${{ runner.temp }}/census-summary.json
+        run: |
+          if [ ! -f "${SUMMARY}" ]; then
+            echo "::error::The census wrote no summary; its verdict is UNKNOWN, not clean."
+            exit 1
+          fi
+          unclassified="$(node -e 'process.stdout.write(String(require(process.argv[1]).unclassifiedPrs))' "${SUMMARY}")"
+          if [ "${unclassified}" != "0" ]; then
+            echo "::error::${unclassified} merged PR(s) carry this gate's not-evaluated wording under an UNRECOGNIZED context. The gate has almost certainly been renamed and this census is blind to it again (PEN-5781). Add the new context to DEFAULT_GATE_CONTEXTS in scripts/check-comment-review-gate-census.mjs."
+            exit 1
+          fi
+          echo "No unrecognized context carries this gate's wording; the census is still pointed at the right contexts."
