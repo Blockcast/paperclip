@@ -774,6 +774,48 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-4939 regression: a word followed by a ticket number is still a word", () => {
+    // Assembled, never embedded: until this fix deploys the pre-push guard
+    // refuses these literals, which is the bug. Same convention as the
+    // BLO-44747 fixtures above.
+    const probe = (ticket: string) => ["zz", ticket, "hostnet", "probe"].join("-");
+
+    it.each([
+      ["a PEN ticket number", probe("pen3261")],
+      ["a BLO ticket number", probe("blo49591")],
+    ])("exonerates a probe-object name carrying %s", (_label, name) => {
+      const text = `name="${name}"`;
+      expect(scrubGitHubEgressText(text).classes).toEqual([]);
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+
+    it("exonerates the name and the one-character variant it was renamed to", () => {
+      // The two differ only in where a hyphen falls. Before this fix the guard
+      // refused the first and passed the second, which is what taught authors
+      // to reshape names until the door opened.
+      for (const name of [probe("pen3261"), ["zz", "pen", "3261", "hostnet", "probe"].join("-")]) {
+        expect(scrubGitHubEgressText(`name="${name}"`).classes).toEqual([]);
+      }
+    });
+
+    it.each([
+      // The UUID invariant BLO-44747 documents: `e454` must stay opaque, so the
+      // digits need at least TWO letters ahead of them.
+      ["a single-letter prefix", ["e454", "cdn", "forward", "queue", "federate"]],
+      ["a digit-led segment", ["386c81e8", "cdn", "forward", "queue", "federate"]],
+      // Digits must terminate the segment; `orc888r` stays refused as before.
+      ["a 3-digit run followed by a letter", ["orc888r", "cdn", "forward", "queue", "federate"]],
+      ["a 6-digit run", ["orc888888", "cdn", "forward", "queue", "federate"]],
+      ["two mixed segments", ["pen3261", "blo49591", "forward", "queue", "federate"]],
+      ["a fixed-layout key", ["xotjia", "uzvdso", "mhknub", "sn1prx"]],
+    ])("still refuses %s", (_label, parts) => {
+      const token = parts.join("-");
+      const result = scrubGitHubEgressText(`sessionkey=${token}`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+  });
+
   describe("BLO-43580: a nested assignment is not swallowed by the one before it", () => {
     // Every binding is assembled at runtime: written out contiguously each one
     // is the material the deployed guard refuses, so a literal would make this
