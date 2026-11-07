@@ -79,6 +79,7 @@ import {
   resolveApprovalSchema,
   requestApprovalRevisionSchema,
   resubmitApprovalSchema,
+  updateApprovalPayloadSchema,
   withdrawApprovalSchema,
   addApprovalCommentSchema,
   // Cost / budget
@@ -3036,6 +3037,37 @@ registry.registerPath({
   path: "/api/approvals/{id}",
   tags: ["approvals"],
   summary: "Get an approval",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "patch",
+  path: "/api/approvals/{id}",
+  tags: ["approvals"],
+  summary:
+    "Correct a pending card's payload in place (requesting agent only). `createdAt` is untouched, so the edit does not move the card in the queue — which is the whole point: withdraw-and-refile corrects the evidence and jumps the line in the same keystroke. The payload is revalidated exactly as a create would validate it, and `gate` is immutable because it is the retirement contract; omitting it is refused rather than read as \"keep the old one\". Refuses a non-requester or a board actor (403 — the board's path is `request-revision` then the filer's `resubmit`), a card that is not `pending` (409), and a payload a create would have refused (422). Each superseded payload is retained and readable at `GET /api/approvals/{id}/payload-revisions`; the card carries `payloadRevision` / `payloadEditedAt` so a decider can see that the text changed after they read it.",
+  request: {
+    params: z.object({ id: z.string() }),
+    body: jsonBody(updateApprovalPayloadSchema),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
+  method: "get",
+  path: "/api/approvals/{id}/payload-revisions",
+  tags: ["approvals"],
+  summary:
+    "List this card's superseded payloads, oldest first — the readable half of the edit marker `PATCH /api/approvals/{id}` sets. Archived payloads run through the same redaction projection as the live one, so history cannot be used to read a withheld field.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
 });
