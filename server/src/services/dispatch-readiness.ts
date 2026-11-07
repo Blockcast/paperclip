@@ -1,3 +1,4 @@
+import { sql, type SQL } from "drizzle-orm";
 import { ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS } from "./issue-tree-control.js";
 import { extractWakeCommentIds } from "./deferred-wake-reopen.js";
 
@@ -160,10 +161,67 @@ export function isQueuedRunAdmissionDeferred(
 }
 
 /**
+ * SQL predicate: did a DEFER write this queued run's `queued_at`, rather than a
+ * genuine re-enqueue? (PEN-5310)
+ *
+ * `queued_at` has three writers and they do not mean the same thing.
+ * `promoteScheduledRetryRun` stamps a row that really is re-entering the queue
+ * after a `scheduled_retry` park, and measuring that row from `created_at`
+ * would report the whole park as dispatch wait -- the false-stranded-run alert
+ * onprem-k8s#2013 removed. The two defer writers stamp a row that never left
+ * `queued` (BLO-48769 keeps a deferred run there deliberately), so there the
+ * stamp resets the measured age of a run that has been waiting all along.
+ *
+ * Keyed on the stamp's VALUE, not its presence. Both defer writers set
+ * `retryAt = now + computeK8sIsolationRetryDelayMs(n)` -- bounded [15s, 300s],
+ * strictly positive -- in the SAME `.set()` as `queuedAt: now`, so immediately
+ * after a defer `retryAt > queued_at`. Promotion writes `queued_at = now` and
+ * leaves whatever stamp was already there, which is necessarily older.
+ *
+ * ⛔ Presence alone is NOT a sound discriminator, and the reason is not the
+ * obvious one. There is no `queued -> scheduled_retry` transition at all
+ * (`scheduled_retry` is only ever set by `.insert()`), so a row cannot defer
+ * and then be promoted. The reachable route is cross-row INHERITANCE: a
+ * successor minted by `carryRetryContextSnapshot` inherits the predecessor's
+ * defer keys, because `stripRunScopedSnapshotMarkers` does not list them. That
+ * successor carries stamps it never earned, and presence-keying would report
+ * its entire park as dispatch wait. Value-keying gets it right for free -- the
+ * inherited `retryAt` is predecessor-era and its `queued_at` is the promotion
+ * instant, so `retryAt < queued_at`.
+ *
+ * ⚠️ Residual, stated rather than glossed: a predecessor that dies and whose
+ * successor is minted, scheduled and promoted all INSIDE the predecessor's
+ * remaining backoff still satisfies `retryAt > queued_at` and is
+ * misclassified. Bounded by `K8S_ISOLATION_RETRY_MAX_DELAY_MS` (300s) and it
+ * errs toward over-reporting. Closing it belongs at the INSERT site -- listing
+ * these keys as run-scoped markers -- which is a control-plane behaviour
+ * change and does not belong in a measurement change.
+ *
+ * Compared as TEXT against an ISO-8601 rendering of `queued_at` rather than
+ * cast to `timestamptz`: the writers emit `Date.toISOString()`, which is
+ * fixed-width UTC and therefore orders lexicographically exactly as it orders
+ * chronologically, and a malformed inherited value then compares false instead
+ * of raising. A cast would abort the whole refresh and zero
+ * `..._refresh_success`, turning one bad row into a blind gauge.
+ *
+ * Lives here, beside the key constants, because re-derivation is the bug class
+ * this module exists to prevent -- see the header. Callers must not rebuild
+ * this expression in their own SQL.
+ */
+export function deferWroteQueuedAtSql(
+  columns: { contextSnapshot: unknown; queuedAt: unknown },
+): SQL {
+  const queuedAtIso = sql`to_char(${columns.queuedAt} at time zone 'utc', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`;
+  return sql`(
+    coalesce(${columns.contextSnapshot} ->> ${K8S_ISOLATION_RETRY_AT_CONTEXT_KEY}, '') > ${queuedAtIso}
+    or coalesce(${columns.contextSnapshot} ->> ${BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY}, '') > ${queuedAtIso}
+  )`;
+}
+
+/**
  * `dispatchRank`'s `ready` screen (BLO-22091), and the full definition of
  * "could dispatch advance this row right now".
- *
- * Deliberately narrower than `heartbeat.ts`'s `isRunClaimable`: it omits the
+ * * Deliberately narrower than `heartbeat.ts`'s `isRunClaimable`: it omits the
  * terminal-issue check on purpose. By the time a row reaches the ranking step,
  * `queuedRuns` has already been pruned for terminal issues by the main scan via
  * `evaluateQueuedRunStaleness` -- the same function `claimQueuedRun` itself
