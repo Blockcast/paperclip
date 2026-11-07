@@ -1,0 +1,114 @@
+name: Unreported Job Failure Detector
+
+# PEN-5738: a self-hosted runner that loses external DNS at `CompleteJobAsync`
+# finishes its work, fails to report, and GitHub times the job out and writes
+# `conclusion: failure`. The PR then shows a RED TEST SHARD FOR TESTS THAT ALL
+# PASSED — and the uploaded log truncates ~16 minutes before GitHub closed the
+# job, so the evidence that nothing failed is ABSENT rather than contradictory.
+#
+# This job finds those and says so on the PR. See
+# scripts/unreported-job-failure-detector.mjs for the discriminator and the
+# measurement behind it (97 failed jobs sampled 2026-11-06: 94 genuine, 3 false
+# reds, all three being the PEN-5738 victims — 0 false alarms).
+#
+# WHY THIS SHIPS AHEAD OF A RUNNER REAPER
+#
+# The same fault also strands the runner pod, burning a concurrency slot — two
+# of `arc-paperclip-general`'s four, with 7 jobs queued 3h38m behind them. A
+# reaper for that is designed (PEN-5738 `orphaned-runner-reaper-design`) and
+# deliberately NOT built yet: it must delete live Kubernetes objects on the
+# strength of a remote API read, and design review has already found two
+# distinct ways for it to delete a HEALTHY runner. This job cannot delete
+# anything. It addresses the more expensive half of the fault — an author
+# debugging a suite that was never broken — at zero blast radius.
+#
+# WHY `arc-paperclip-light`, AND WHY THAT IS NOT INCIDENTAL
+#
+# The fault being reported on saturates `arc-paperclip-general`. A detector
+# queued in that pool would be waiting behind the very zombies it exists to
+# report, and would be least able to run exactly when it had most to say. It
+# must live in a different pool. (This is the same coupling that shapes the
+# reaper design: do not let the detector share a failure domain with the fault.)
+#
+# WHY A SCHEDULE AND NOT `check_run: completed`
+#
+# `check_run` would be the timeliest trigger — it fires within seconds of
+# GitHub writing the conclusion, and such workflows always run from the default
+# branch. It is rejected on volume: it fires for EVERY check run on the repo,
+# so even with a job-level `if` that skips immediately, this repo's check volume
+# would bury the Actions tab in near-empty runs.
+#
+# `workflow_run: completed` is the other obvious trigger and is WORSE THAN THE
+# SCHEDULE, not better. It fires when the RUN finishes, and in the incident this
+# exists for the run still had 7 jobs queued 3h38m after the false reds were
+# already rendered on the PR. It would have reported hours late, which is long
+# after an author has started fixing the wrong thing.
+#
+# A 15-minute scan bounds the lag to ≤15 minutes, costs 6-ish API calls per run,
+# and is the same shape as scripts/ci-mass-cancellation-detector.mjs.
+#
+# NO `concurrency` BLOCK — DELIBERATE, SAME REASONING AS scheduled-guard-liveness.yml
+#
+# `cancel-in-progress: true` would let a run queued behind an arc-light backlog
+# be killed by the next cycle's, yielding no verdict for as long as the backlog
+# lasts — and a backlog is a plausible variant of the condition being detected.
+# `false` does not fix it either: GitHub holds at most one PENDING run per group,
+# so a new arrival evicts the waiting one. With no group, runs accumulate
+# instead of evicting. Overlap is cheap here; losing the verdict is not.
+
+on:
+  schedule:
+    # :04/:19/:34/:49 — clear of every cron minute already used on this repo
+    # (:09 :13 :17 :23 :27 :29 :37 :41 :43 :47 :53 :58) so this does not pile
+    # onto an existing burst.
+    - cron: "4,19,34,49 * * * *"
+  workflow_dispatch:
+    inputs:
+      lookback_minutes:
+        description: "how far back to scan for failed jobs"
+        required: false
+        default: "60"
+      comment:
+        description: "post/update the PR annotation (false = detect only)"
+        required: false
+        default: "true"
+
+permissions:
+  # A workflow-level `permissions:` block sets every unlisted scope to `none`,
+  # so `contents: read` is required for the checkout below — without it this
+  # works only while the repo happens to be public.
+  contents: read
+  actions: read
+  # The entire point is to tell the PR author. This is the one write scope, and
+  # it is bounded to PR comments.
+  pull-requests: write
+
+jobs:
+  detect:
+    name: no red check is a silently-unreported runner
+    # NOT arc-paperclip-general — see the header. This must not queue behind the
+    # saturation it reports on.
+    runs-on: arc-paperclip-light
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Detect unreported job failures and annotate affected PRs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UNREPORTED_JOB_REPO: ${{ github.repository }}
+          # Dispatch inputs reach the script through the environment, never
+          # through `${{ }}` interpolation into the shell body. Only a
+          # dispatcher with write access can set them, so this is defence in
+          # depth rather than a live hole — but interpolating an input into a
+          # `run:` block is a shell-injection SHAPE, and the cost of not having
+          # it is one line. (Ally review, PEN-5738.)
+          REPO: ${{ github.repository }}
+          LOOKBACK_MINUTES: ${{ inputs.lookback_minutes || '60' }}
+          POST_COMMENT: ${{ inputs.comment || 'true' }}
+        run: |
+          node scripts/unreported-job-failure-detector.mjs \
+            --repo "$REPO" \
+            --lookback-minutes "$LOOKBACK_MINUTES" \
+            --comment "$POST_COMMENT"
