@@ -732,9 +732,14 @@ const LEXICAL_SEGMENT_RE = /^(?:[A-Za-z]+|[0-9]+)$/;
  *  strict form above refused them: the orc8r CDN forward-queue federate job, a
  *  Prometheus scrape-job name already public on onprem-k8s master, made every
  *  agent push touching that file unpublishable. Bounded so it stays a word:
- *  must open with a letter, one digit run of at most 2, and an exonerated value
- *  may carry at most ONE such segment, written in a single case. A UUID stays
- *  opaque — `386c81e8` opens with a digit, `e454` has a 3-digit run.
+ *  must open with a letter, carry ONE digit run (at most 2 digits here; see
+ *  the PEN-4939 paragraph below, which admits 3-5 when they TERMINATE the
+ *  segment behind two letters), and an exonerated value may carry at most ONE
+ *  such segment, written in a single case. A UUID stays opaque: `386c81e8`
+ *  opens with a digit, and `e454` has only a single letter ahead of its
+ *  digits, so it satisfies neither branch. ⚠ The digit-run width alone is NOT
+ *  what holds the UUID invariant — the leading-letter count is. Do not reason
+ *  from "digit run <= 2" when editing either branch.
  *
  *  This DOES widen exoneration for random tokens, and the residual is measured,
  *  not zero (Ally, review 5496550156). A random token often has all-but-one
