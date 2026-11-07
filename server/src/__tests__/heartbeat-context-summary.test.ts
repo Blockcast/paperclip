@@ -3321,6 +3321,53 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("--json headRefOid,state,mergeStateStatus");
   });
 
+  // PEN-5802. The head check above is push-scoped, and the directive's own verb list
+  // includes verbs that never move the head. Two sibling runs of one seat each spent one
+  // body-edit grant 38 s apart with both prescribed gates correctly passing, so the
+  // directive has to say that an unmoved head is not evidence a grant is unspent, and name
+  // the one surface that is. Pinned on the SAME no-PR-context wake as the measurement
+  // above: the run that double-spends is not necessarily the one woken about the PR.
+  it("states that the head check is push-scoped and names the redemption receipt", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      wakeComment: {
+        id: "comment-1",
+        body: "Do not push to this head until the board rules.",
+      },
+    });
+
+    // The non-gate claim itself, and the verbs it is about. A test pinning only the
+    // remedy would pass against a bullet that had lost the reason anyone needs it.
+    expect(markdown).toContain("That head check is PUSH-scoped");
+    expect(markdown).toContain("it is not a weak gate but a NON-gate");
+    // The partition, not a second verb list: the bullet names the three verbs that DO move
+    // the head and defers to the directive's own list for the rest. Pinned because getting
+    // this set wrong inverts the bullet -- it would tell a run the head gates a push.
+    expect(markdown).toContain("only push, force-push and rebase move `headRefOid`");
+    // A plain force-push overwrites unconditionally, and force-push is the second verb in
+    // the list above, so an unqualified "pushes have a CAS" is false for a verb the
+    // directive governs.
+    expect(markdown).toContain("`--force-with-lease` restores one");
+    // The remedy, and the abort condition that makes it fail closed rather than merely
+    // leave a trace. `deduplicated: true` is the readable signal; without it the bullet
+    // tells a run to write a receipt and not what to do when the write is refused.
+    expect(markdown).toContain("redeem its receipt key BEFORE writing");
+    expect(markdown).toContain("`deduplicated: true`");
+    expect(markdown).toContain("abort, do not write");
+    // WHICH issue the receipt goes on, which is the half the first cut of this bullet left
+    // out. The unique index leads with `issue_id`, so two sibling runs redeeming the same
+    // key on two owning rows of ONE pull request produce two distinct tuples, both inserts
+    // succeed, and neither sees `deduplicated: true`. A receipt that refuses nothing is
+    // worse than none, because it is trusted -- so this is the single choice that decides
+    // whether the CAS catches the case the whole bullet is written for.
+    expect(markdown).toContain("ON THE ISSUE THE GRANT WAS POSTED ON");
+    expect(markdown).toContain("not whichever row you happen to hold");
+    // The unkeyed-grant refusal: the clause that closes the loop when the GRANTOR forgets,
+    // so it is the one most likely to be trimmed as belt-and-braces. Now covers a grant
+    // that names a key but no issue, which is uncheckable for the reason just above.
+    expect(markdown).toContain("A grant that names no receipt issue and key cannot be checked");
+  });
+
   it("renders on an issue-only wake, with no wake comment and no PR", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
@@ -3357,9 +3404,14 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
       "push",
       "force-push",
       "rebase",
+      // PEN-5802 review: the metadata verbs were absent, which left the directive with two
+      // overlapping verb lists -- this one, and a second enumeration inside the
+      // push-scope bullet. They are now one list, and the bullet partitions it by name.
+      "body or title edit",
+      "review submission",
       "enqueue",
       "auto-merge",
-      "review-request removal",
+      "review-request change",
     ]) {
       expect(markdown).toContain(verb);
     }
