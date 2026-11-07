@@ -3,7 +3,12 @@ import type { Db } from "@paperclipai/db";
 import { agents, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "./ccrotate-capacity-retry.js";
-import { deferWroteQueuedAtSql, isDispatchRankReady } from "./dispatch-readiness.js";
+import {
+  QUEUE_ENTERED_AT_CONTEXT_KEY,
+  deferWroteQueuedAtSql,
+  isDispatchRankReady,
+  queueEnteredAtSql,
+} from "./dispatch-readiness.js";
 import { listIssueDependencyReadinessMap } from "./issues.js";
 import type { QueuedRunAgentIdentity } from "./metrics.js";
 import {
@@ -26,11 +31,24 @@ const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
  * gauges in this file (PEN-5310).
  *
  * `coalesce(queued_at, created_at)` on its own is wrong, because a defer
- * re-stamps `queued_at` on a run that never left `queued` and so resets the
- * measured age of a run that has been waiting all along. A run whose stamp a
- * defer wrote is therefore aged from `created_at`; every other row keeps
- * `coalesce(queued_at, created_at)`, which is what preserves onprem-k8s#2013
- * for `promoteScheduledRetryRun`.
+ * re-stamps `queued_at` on a run it put back without serving it and so resets
+ * the measured age of a run that has been waiting all along. A run whose stamp
+ * a defer wrote is therefore aged from its recorded queue entry instead; every
+ * other row keeps `coalesce(queued_at, created_at)`, which is what preserves
+ * onprem-k8s#2013 for `promoteScheduledRetryRun`.
+ *
+ * ⚠️ The defer arm must NOT be bare `created_at`, however obviously it
+ * suggests itself, and the reason is not the one two paragraphs down. A run
+ * promoted out of a long `scheduled_retry` park CAN then be claimed and
+ * deferred -- `promote -> claim -> defer` -- and `created_at` on that row is
+ * the instant the retry was SCHEDULED, hours earlier. Aging it from there
+ * republishes the whole park as dispatch wait: the #2013 false-stranded
+ * reading, reached from the opposite direction, and common exactly under the
+ * saturation that makes the 1800 s alert matter. So the arm reads
+ * {@link QUEUE_ENTERED_AT_CONTEXT_KEY}, which `promoteScheduledRetryRun`
+ * stamps and no defer writer overwrites, and only falls back to `created_at`
+ * for a run that was never promoted -- where `created_at` really is the
+ * queue-entry instant.
  *
  * The defect is not a per-run zeroing. `dispatchRank` ages from `created_at`,
  * so the oldest rows are considered -- and under saturation refused -- most
@@ -40,9 +58,16 @@ const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
  * 2026-11-07: a true oldest queued run of 11.70 h published as 3.33 h, against
  * an 1800 s alert threshold.
  *
- * ⚠️ Bare `created_at` for everything is NOT the fix, however often it
- * suggests itself: `queued_at` is always `> created_at`, so it collapses to
- * reverting onprem-k8s#2013 and re-introduces the alert that change removed.
+ * ⚠️ Bare `created_at` for EVERYTHING is likewise not the fix: `queued_at` is
+ * always `> created_at`, so it collapses to reverting onprem-k8s#2013 and
+ * re-introduces the alert that change removed.
+ *
+ * ℹ️ The stranded-run reaper does not share this basis -- it still ranks on
+ * plain `coalesce(queued_at, created_at)` -- so after this change the gauge
+ * and the reaper can disagree about the same row's age. That is deliberate and
+ * not a drift to reconcile: the reaper is deciding whether to act on a row,
+ * where a defer touch is real evidence of recent attention, while these gauges
+ * are reporting how long a seat's work has gone unserved.
  *
  * The discriminator itself lives in `dispatch-readiness.ts` beside the keys it
  * reads -- see {@link deferWroteQueuedAtSql} for why it is keyed on the
@@ -55,7 +80,10 @@ function effectiveQueuedAtSql() {
       contextSnapshot: heartbeatRuns.contextSnapshot,
       queuedAt: heartbeatRuns.queuedAt,
     })}
-    then ${heartbeatRuns.createdAt}
+    then coalesce(
+      ${queueEnteredAtSql({ contextSnapshot: heartbeatRuns.contextSnapshot })},
+      ${heartbeatRuns.createdAt}
+    )
     else coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt})
   end`;
 }

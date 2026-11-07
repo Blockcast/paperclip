@@ -119,6 +119,36 @@ export const BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY = "paperclipBranchClaimRetryAt";
 // the writer lock can admit waiters on one key oldest-first.
 export const K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY = "paperclipK8sIsolationWaitKey";
 
+/**
+ * PEN-5310: the instant this run last ENTERED the dispatch queue, as an
+ * ISO-8601 string. Measurement only -- nothing gates on it, and it is not a
+ * backoff stamp despite living beside them.
+ *
+ * `queued_at` cannot answer that question on its own, because the two defer
+ * writers overwrite it on a run they put BACK without ever serving it. The
+ * age gauges therefore discount a defer-written `queued_at` (see
+ * {@link deferWroteQueuedAtSql}) -- and then need the real queue-entry instant
+ * from somewhere those writers do not touch, or they fall back to `created_at`
+ * and report a promoted run's entire `scheduled_retry` park as dispatch wait.
+ * That is the onprem-k8s#2013 false-stranded reading, reached by the opposite
+ * route from the one this issue was filed on.
+ *
+ * Written by `promoteScheduledRetryRun` only, in the same `.set()` as
+ * `queuedAt`, because promotion is the only transition that re-enters the
+ * queue. A run inserted straight into `queued` carries no key and ages off
+ * `created_at`, which already IS its queue-entry instant.
+ *
+ * Two properties it has to keep, both easy to break from a distance:
+ *   - the dispatch path must NOT delete it the way it deletes the isolation
+ *     stamps (`heartbeat.ts`, around the `paperclipK8sIsolation` descriptor
+ *     write). It survives `promote -> claim -> defer` on purpose; deleting it
+ *     restores the exact finding it was added to close.
+ *   - it IS run-scoped and must be stripped by `stripRunScopedSnapshotMarkers`,
+ *     or a successor minted by `carryRetryContextSnapshot` inherits its
+ *     predecessor's queue entry and over-reports by that whole lineage.
+ */
+export const QUEUE_ENTERED_AT_CONTEXT_KEY = "paperclipQueueEnteredAt";
+
 function isRetryStampDeferred(
   context: Record<string, unknown> | null | undefined,
   key: string,
@@ -168,9 +198,20 @@ export function isQueuedRunAdmissionDeferred(
  * `promoteScheduledRetryRun` stamps a row that really is re-entering the queue
  * after a `scheduled_retry` park, and measuring that row from `created_at`
  * would report the whole park as dispatch wait -- the false-stranded-run alert
- * onprem-k8s#2013 removed. The two defer writers stamp a row that never left
- * `queued` (BLO-48769 keeps a deferred run there deliberately), so there the
- * stamp resets the measured age of a run that has been waiting all along.
+ * onprem-k8s#2013 removed. The two defer writers stamp a run that was put back
+ * before it did any work, so the wait since its last queue entry is unserved
+ * and the stamp resets the measured age of a run that has been waiting all
+ * along.
+ *
+ * ⚠️ The defer writers DO move the row `running -> queued` -- both UPDATEs are
+ * guarded `.where(status = 'running')` and both write `startedAt: null`. An
+ * earlier draft of this comment said they stamp "a row that never left
+ * `queued`"; that is false, and it is load-bearing rather than cosmetic,
+ * because it makes `promote -> claim -> defer` look impossible. It is not: see
+ * {@link QUEUE_ENTERED_AT_CONTEXT_KEY}, which exists because that order is
+ * reachable and common under saturation. What BLO-48769 actually guarantees is
+ * that the run comes back to `queued` rather than failing, not that it never
+ * left.
  *
  * Keyed on the stamp's VALUE, not its presence. Both defer writers set
  * `retryAt = now + computeK8sIsolationRetryDelayMs(n)` -- bounded [15s, 300s],
@@ -219,9 +260,42 @@ export function deferWroteQueuedAtSql(
 }
 
 /**
+ * SQL: this run's {@link QUEUE_ENTERED_AT_CONTEXT_KEY} as a `timestamptz`, or
+ * NULL when it carries none (PEN-5310).
+ *
+ * Only ever read in the arm where {@link deferWroteQueuedAtSql} is true, which
+ * is where `queued_at` has been overwritten by a defer and the fallback would
+ * otherwise be bare `created_at`.
+ *
+ * Parsed behind a shape guard rather than cast outright, for the same reason
+ * the discriminator above compares text: `promoteScheduledRetryRun` writes
+ * `Date.toISOString()`, but an old row, a hand-edited snapshot or a future
+ * writer could hold anything, and a raw `::timestamptz` on one bad value
+ * raises and aborts the whole refresh -- zeroing `..._refresh_success` and
+ * blinding the alert for every seat over one row. A value that does not match
+ * the exact `toISOString()` shape yields NULL and falls through to
+ * `created_at`, which is the pre-PEN-5310 behaviour.
+ *
+ * The pattern uses `[0-9]`/`[.]` rather than `\d`/`\.` deliberately: a
+ * backslash in a JS template literal is an escape before Postgres ever sees
+ * it, so `\d` would reach the server as a bare `d` and the guard would reject
+ * every well-formed stamp -- failing closed, silently, into exactly the
+ * `created_at` fallback this function exists to avoid.
+ */
+export function queueEnteredAtSql(columns: { contextSnapshot: unknown }): SQL {
+  const raw = sql`(${columns.contextSnapshot} ->> ${QUEUE_ENTERED_AT_CONTEXT_KEY})`;
+  return sql`(case
+    when ${raw} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$'
+    then ${raw}::timestamptz
+    else null
+  end)`;
+}
+
+/**
  * `dispatchRank`'s `ready` screen (BLO-22091), and the full definition of
  * "could dispatch advance this row right now".
- * * Deliberately narrower than `heartbeat.ts`'s `isRunClaimable`: it omits the
+ *
+ * Deliberately narrower than `heartbeat.ts`'s `isRunClaimable`: it omits the
  * terminal-issue check on purpose. By the time a row reaches the ranking step,
  * `queuedRuns` has already been pruned for terminal issues by the main scan via
  * `evaluateQueuedRunStaleness` -- the same function `claimQueuedRun` itself
