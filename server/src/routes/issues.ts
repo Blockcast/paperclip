@@ -5148,6 +5148,14 @@ export function issueRoutes(
      * being handed work by someone else".
      */
     currentAssigneeAgentId?: string | null;
+    /**
+     * PEN-5940: the *user* the row currently carries, as distinct from
+     * `assigneeUserId`, which is the user work is being handed TO. Pass it
+     * wherever the caller has already loaded the row; omitting it is safe but
+     * makes the guard reload the row, and a wrong `null` is not — it is the
+     * fail-open direction, so pass the live field rather than a literal.
+     */
+    currentAssigneeUserId?: string | null;
   };
 
   async function resolveAssignmentProjectId(input: {
@@ -5180,6 +5188,11 @@ export function issueRoutes(
         assigneeAgentId: assignmentScope?.assigneeAgentId ?? null,
         assigneeUserId: assignmentScope?.assigneeUserId ?? null,
         currentAssigneeAgentId: assignmentScope?.currentAssigneeAgentId ?? null,
+        // PEN-5940: left `undefined` (not `??`-collapsed to null) for the same
+        // reason as `originKind` below — the guard must be able to tell "no
+        // user holds this row" from "the caller did not look", and reload only
+        // in the latter case. Collapsing to `null` is the fail-open direction.
+        currentAssigneeUserId: assignmentScope?.currentAssigneeUserId,
         // BLO-19094: `originKind` is left `undefined` (not `??`-collapsed to
         // null) when the caller did not supply it, so the self-claim guard can
         // tell "no origin kind" from "not looked up" and reload only in the
@@ -13881,6 +13894,12 @@ export function issueRoutes(
             : updateFields.parentId) as string | null | undefined,
           assigneeAgentId: nextAssigneeAgentId,
           assigneeUserId: nextAssigneeUserId,
+          // PEN-5940: the row's current human holder, so this door enforces the
+          // same rule as checkout without depending on the `issue:mutate` deny
+          // upstream of it. The three legitimate moves off a human-held row all
+          // skip this call: the agent-to-creator hand-back, the scoped-recovery
+          // return, and workflow-controlled assignment, tested just above.
+          currentAssigneeUserId: existing.assigneeUserId ?? null,
         });
       }
     }
@@ -15311,12 +15330,19 @@ export function issueRoutes(
           projectId: issue.projectId ?? null,
           parentIssueId: issue.parentId ?? null,
           assigneeAgentId: req.body.agentId,
+          // Correctly `null`: this route's assignment target is an agent, so
+          // nobody is being handed work as a user. PEN-5940 — the field that
+          // reads the row's CURRENT human holder is `currentAssigneeUserId`
+          // below; it is a different question and it had no field until then.
           assigneeUserId: null,
           // BLO-19094: this is the self-appointment door. Supplying both lets
           // the `tasks:assign` guard refuse a claim on a review/recovery shell
           // the actor was not assigned, without reloading the row.
           originKind: issue.originKind ?? null,
           currentAssigneeAgentId: issue.assigneeAgentId ?? null,
+          // PEN-5940: and refuse a claim on a row a PERSON holds. Read from the
+          // live row — a literal here is what made the guard inert.
+          currentAssigneeUserId: issue.assigneeUserId ?? null,
         });
       } catch (err) {
         if (recoveryCheckoutLookupError) {
