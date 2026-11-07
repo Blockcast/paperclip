@@ -937,6 +937,322 @@ describe("scrubGitHubEgressText", () => {
     );
   });
 
+  describe("PEN-5734 regression: the force-push form another control MANDATES is publishable", () => {
+    // Derived, never embedded — the same convention as the BLO-46448 /
+    // BLO-47509 / PEN-3920 blocks above, and here it is load-bearing twice
+    // over. Until this fix deploys, the SHIPPED scrubber redacts the literal,
+    // so a contiguous `--force-with-lease=<ref>:<oid>` anywhere in this file
+    // would make the file itself unpushable through the very door it tests.
+    const lease = (ref: string, expected?: string) =>
+      // paperclip:allow-git-push: fixture text only — `lease()` BUILDS the recipe string this suite feeds to the scrubber. It is input to a detector, never a command; no child process and no remote.
+      `git push ${["--force-with-lease", expected === undefined ? ref : `${ref}:${expected}`].join("=")}`;
+    const pair = (name: string, value: string) => [name, value].join("=");
+
+    /** The branch from the measured instance, PR #3055 (PEN-5215). A branch
+     *  name is PUBLIC — this is not a secret, it is the value the control
+     *  mistook for one. */
+    const BRANCH = ["chore", "/", "PEN-5215-lock-holder-notes-and-render-guards"].join("");
+    /** The abbreviated OID the measured instance pinned. */
+    const EXPECTED_OID = "ff113077";
+
+    // ---- the three attempts from the row, pinned exactly as measured -------
+    //
+    // Attempts 1 and 2 are what the CTO ran against #3055 on 2026-11-06; both
+    // published `--force-with-lease=[…marker…]:<oid>`, a non-command, from a
+    // `gh pr edit` that exited 0. Attempt 3 is the variable workaround that
+    // got the correct recipe into that PR body, and it must keep working: it
+    // is what every already-published recipe uses.
+    it.each([
+      ["attempt 1: pinned lease, full 40-hex OID", lease(BRANCH, `${EXPECTED_OID}${"a".repeat(32)}`)],
+      ["attempt 2: pinned lease, abbreviated OID", lease(BRANCH, EXPECTED_OID)],
+      ["bare lease, no expectation", lease(BRANCH)],
+      // paperclip:allow-git-push: fixture text only — the quoted recipe form, fed to the scrubber as input. Never executed.
+      ["quoted, as a shell recipe writes it", `git push ${["--force-with-lease", `"${BRANCH}:${EXPECTED_OID}"`].join("=")}`],
+      ["fully-qualified ref", lease(`refs/heads/${BRANCH}`, EXPECTED_OID)],
+    ])("publishes %s byte-exact", (_label, text) => {
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    it("attempt 3, the variable workaround, still passes exactly as it was written", () => {
+      // Verbatim from PR #3055's body, two-character variable name included.
+      const text = [
+        pair("BR", BRANCH),
+        pair("EXPECT", EXPECTED_OID),
+        // paperclip:allow-git-push: fixture text only — attempt 3 from the row, fed to the scrubber as input. Never executed.
+        `git push ${["--force-with-lease", '"$BR:$EXPECT"'].join("=")}`,
+      ].join("\n");
+
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+
+    it("…but only because `BR` is two characters — the workaround is fragile", () => {
+      // Worth pinning, because it changes what the workaround is worth. The
+      // row reads attempt 3 as evidence that the BINDING NAME discriminates,
+      // and it does — but `BR` also happens to sit below `ASSIGNMENT_RE`'s
+      // three-character name floor, so that particular spelling never reached
+      // the detector at all. Rename the variable to anything a person would
+      // more naturally write and the workaround silently stops working: the
+      // branch is redacted out of the assignment instead of out of the flag,
+      // and the recipe is corrupted in a different place.
+      //
+      // That is the argument against leaving this as a documented workaround
+      // rather than fixing the anchor. It is not merely undiscoverable; it is
+      // undiscoverably conditional on the length of a name nobody chose for
+      // this reason.
+      for (const name of ["BRANCH_REF", "BRANCH", "REF"]) {
+        const text = [
+          pair(name, BRANCH),
+          pair("EXPECT", EXPECTED_OID),
+          // paperclip:allow-git-push: fixture text only — the shell-variable workaround from the row, fed to the scrubber as input. Never executed.
+          `git push ${["--force-with-lease", `"$${name}:$EXPECT"`].join("=")}`,
+        ].join("\n");
+
+        const result = scrubGitHubEgressText(text);
+        expect(result.classes).toContain("high-entropy-assignment");
+        expect(result.text).not.toContain(BRANCH);
+      }
+    });
+
+    // ---- the discriminating negative: the fix is ANCHORED, not a weakening --
+    //
+    // This is the half that stops the block becoming a vacuous pass. Widening
+    // the entropy rule, or lowering the floor, would make the five cases above
+    // pass while silently exonerating the same branch string everywhere else.
+    // Each name below must STILL be refused.
+    //
+    // ⚠ A note on the row's own attempt 3, because replicating it with a
+    // different variable name gives a different answer and the reason is not
+    // the one the row infers. `BR=<branch>` passed in the measured session,
+    // but not because `BR` is unanchored: `ASSIGNMENT_RE` requires a name of
+    // at least three characters, so a two-character name never reaches the
+    // detector at all. `BRANCH=<the same string>` IS refused, before this fix
+    // and after it. The row's CONCLUSION — that the discriminator is the
+    // binding name — is right; that particular evidence had a second cause.
+    it.each(["BR"])("a name too short for the detector is untested, not exonerated (%s)", (name) => {
+      expect(scrubGitHubEgressText(pair(name, BRANCH)).redacted).toBe(false);
+      // The positive control that proves the line above is about NAME LENGTH.
+      expect(scrubGitHubEgressText(pair(`${name}ANCH`, BRANCH)).classes).toContain(
+        "high-entropy-assignment",
+      );
+    });
+
+    it.each(["BRANCH", "lease", "my_lease", "password", "ref_name"])(
+      "still refuses the same branch string under the unanchored name %s",
+      (name) => {
+        const result = scrubGitHubEgressText(pair(name, BRANCH));
+        expect(result.classes).toContain("high-entropy-assignment");
+        expect(result.text).not.toContain(BRANCH);
+      },
+    );
+
+    it("the anchor is the literal flag, not the captured name `lease`", () => {
+      // `ASSIGNMENT_RE` captures `lease` from `--force-with-lease=` because
+      // `-` is outside the name alphabet. Exonerating that captured name would
+      // reach every one of these, none of which any control mandates.
+      for (const nearMiss of ["--lease", "--force-lease", "--with-lease", "-force-with-lease"]) {
+        // paperclip:allow-git-push: fixture text only — near-miss flag strings fed to the scrubber to assert they are still REFUSED. Never executed.
+        const text = `git push ${[nearMiss, `${BRANCH}:${EXPECTED_OID}`].join("=")}`;
+        const result = scrubGitHubEgressText(text);
+        expect(result.classes).toContain("high-entropy-assignment");
+        expect(result.text).not.toContain(BRANCH);
+      }
+    });
+
+    // ---- per-segment bounds on BOTH halves ---------------------------------
+    //
+    // The anchor must never admit `<ref>:<opaque>` as a unit. The halves are
+    // bounded independently, and these pin each one.
+
+    it("refuses an opaque EXPECTATION even beside a clean ref — the half that had no bound at all", () => {
+      // Before PEN-5734 this published byte-exact: `:` ends ASSIGNMENT_RE's
+      // value capture, so nothing after the colon was offered to any detector.
+      // The ref half here is deliberately short and clean, so the only thing
+      // that can fire is the new expectation bound.
+      const opaque = ["xJ9vQ2mTzR4pLw8", "KdH3NbYcF6sEa0UgV"].join("");
+      const result = scrubGitHubEgressText(lease("main", opaque));
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(opaque);
+      expect(result.text).toContain("main:");
+    });
+
+    it("refuses an opaque expectation that hides behind a SECOND colon", () => {
+      // Ally, review 5797006954, measured at e765389: the expectation pass
+      // originally stopped at the NEXT colon, so `<ref>:sha256:<token>`
+      // captured only `sha256` — not an OID, not opaque, match returned
+      // untouched — and the token published BYTE-EXACT. Group 1 still stops at
+      // the first colon, so this is the expectation half, not the ref half.
+      //
+      // This is the done-when's "must not admit an opaque `<ref>:<opaque>`
+      // whole" in its least obvious form: the opaque part is not the whole
+      // expectation, it is a suffix of it behind a plausible algorithm label.
+      const opaque = ["Xq7rLm2PvYw9TbNc", "4HsKdFgJ8ZaQe3Ui"].join("");
+      const result = scrubGitHubEgressText(lease("feature/pen-5734-x", `sha256:${opaque}`));
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(opaque);
+    });
+
+    it("still admits the mandated pinned form, which carries exactly one colon", () => {
+      // The negative half of the test above: widening the expectation alphabet
+      // to include `:` must not cost the form PEN-4869 REQUIRES. Exoneration
+      // is `LEASE_EXPECTED_OID_RE` alone, which rejects anything with a colon,
+      // so admitting `:` can only ever offer MORE to the detector.
+      const result = scrubGitHubEgressText(lease(BRANCH, EXPECTED_OID));
+
+      expect(result.redacted).toBe(false);
+      expect(result.text).toContain(BRANCH);
+      expect(result.text).toContain(EXPECTED_OID);
+    });
+
+    it("treats `:` as a SEPARATOR, so a dangling colon does not eat the pinned OID", () => {
+      // Ally, review 5798756712, measured at 19c9b48: with `:` a plain member
+      // of the expectation alphabet, prose that punctuates the command with a
+      // trailing colon captured `<oid>:`, which LEASE_EXPECTED_OID_RE rejects
+      // — so a VALID pinned OID was redacted. That is PEN-5734's own defect
+      // (the mandated form is unpublishable) reintroduced by PEN-5734's fix,
+      // in a narrower case. Failing closed is not good enough here: this
+      // binding exists precisely so the mandated form survives prose.
+      // A FULL 40-hex OID, deliberately: the 8-hex `EXPECTED_OID` the row
+      // measured is too short to read as opaque once a colon is appended, so
+      // it survives under BOTH forms and cannot discriminate. The mandated
+      // pinned lease normally carries the full object name, which is exactly
+      // the value the looser form ate.
+      const fullOid = "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8";
+      const result = scrubGitHubEgressText(`${lease(BRANCH, fullOid)}: then push`);
+
+      expect(result.redacted).toBe(false);
+      expect(result.text).toContain(fullOid);
+    });
+
+    it("refuses an opaque expectation hidden behind a DOUBLED colon", () => {
+      // Ally, review 5798876353, measured at 3ee44ad, and reproduced here
+      // before the fix. The single-separator form `[.:]` admits exactly ONE
+      // colon before each alphabet run, so `::` ENDS the capture and the tail
+      // is never offered to the detector at all — the regex did not match,
+      // and the token published BYTE-EXACT.
+      //
+      // Note this is the escape the SECOND-colon test above was meant to
+      // close, returning in a form that test could not see. The lesson is in
+      // the block comment: "cannot widen exoneration" says nothing about
+      // material that never enters the match. Monotonic exoneration and total
+      // capture are different properties; only the second closes an escape.
+      const opaque = ["Xq7rLm2PvYw9TbNc", "4HsKdFgJ8ZaQe3Ui"].join("");
+      const result = scrubGitHubEgressText(lease("feature/pen-5734-x", `:${opaque}`));
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(opaque);
+    });
+
+    it("refuses a DOUBLED-colon tail even when a valid OID precedes it", () => {
+      // The nastier half: `<ref>:<oid>::<token>` captured only `<oid>`, which
+      // LEASE_EXPECTED_OID_RE EXONERATES — so the match was returned untouched
+      // and the token after `::` published byte-exact. A well-formed pinned
+      // OID was acting as cover for the opaque tail behind it.
+      const fullOid = "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8";
+      const opaque = ["Xq7rLm2PvYw9TbNc", "4HsKdFgJ8ZaQe3Ui"].join("");
+      const result = scrubGitHubEgressText(
+        lease("feature/pen-5734-x", `${fullOid}::${opaque}`),
+      );
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(opaque);
+    });
+
+    it("refuses an opaque REF even beside a well-formed OID", () => {
+      const opaque = ["Qz7Z4mWvT2pK", "9dLxR6bN3sYcH1gF"].join("");
+      const result = scrubGitHubEgressText(lease(opaque, EXPECTED_OID));
+
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(opaque);
+    });
+
+    it("refuses BOTH halves when both are opaque — the composite is never admitted whole", () => {
+      const left = ["Qz7Z4mWvT2pK", "9dLxR6bN3sYcH1gF"].join("");
+      const right = ["xJ9vQ2mTzR4pLw8", "KdH3NbYcF6sEa0UgV"].join("");
+      const result = scrubGitHubEgressText(lease(left, right));
+
+      expect(result.text).not.toContain(left);
+      expect(result.text).not.toContain(right);
+    });
+
+    it("refuses an expectation that is not a git object name", () => {
+      // Hex is the shape; an opaque token of the same length under the same
+      // anchor is not exonerated by it.
+      const notAnOid = ["Zm9vYmFy", "QmF6UXV4MTIzNDU2Nzg5"].join("");
+      expect(scrubGitHubEgressText(lease("main", notAnOid)).text).not.toContain(notAnOid);
+    });
+
+    it("admits no opaque run inside the ref, however it is segmented", () => {
+      // The ref rule spends ZERO opaque budget: every run must be a word, a
+      // number, or a bounded word-with-digits. A generated segment glued to
+      // real words is still refused.
+      for (const ref of [
+        `${BRANCH}-${["k3Jx9Qm2", "Vb7Td4Ns"].join("")}`,
+        ["release", "/", "deploy-", ["a1B2c3D4e5F6g7H8"].join("")].join(""),
+      ]) {
+        expect(scrubGitHubEgressText(lease(ref, EXPECTED_OID)).classes).toContain(
+          "high-entropy-assignment",
+        );
+      }
+    });
+
+    // ---- the two conjuncts that HOLD the ref rule --------------------------
+    //
+    // Pinned by a failing mutation apiece, the convention the POSIX path rule
+    // above states ("each is pinned by a failing mutation in the test file,
+    // because each one is load-bearing on its own"). Without these, deleting
+    // either bound leaves every other assertion in this block green while the
+    // measured residual triples — see PEN-3920 §11.3 for the table.
+
+    it("requires GIT_REF_MIN_WORD_MASS characters of letter runs", () => {
+      // Word mass is the conjunct that keeps real credential FORMATS out:
+      // none musters fourteen characters of letter runs. The pair below sits
+      // either side of the floor and is otherwise identical in shape.
+      const refusedMass13 = ["release", "/", "deploy-4471-20261106"].join("");
+      const admittedMass15 = ["release", "/", "deployed-4471-20261106"].join("");
+
+      expect(scrubGitHubEgressText(lease(refusedMass13, EXPECTED_OID)).classes).toContain(
+        "high-entropy-assignment",
+      );
+      expect(scrubGitHubEgressText(lease(admittedMass15, EXPECTED_OID)).redacted).toBe(false);
+    });
+
+    it("caps the ref at GIT_REF_MAX_COMPONENTS slash components", () => {
+      // `/` is the separator the chopped-token families use to reach a
+      // word-only rule, so this is a real bound rather than hygiene. The cap
+      // sits exactly on the corpus maximum: `refs/remotes/origin/<branch>`.
+      const admittedFour = ["Zephyr", "Mordant", "Quibble", "Fathom"].join("/");
+      const refusedFive = ["release", admittedFour].join("/");
+
+      expect(scrubGitHubEgressText(lease(admittedFour, EXPECTED_OID)).redacted).toBe(false);
+      expect(scrubGitHubEgressText(lease(refusedFive, EXPECTED_OID)).classes).toContain(
+        "high-entropy-assignment",
+      );
+    });
+
+    it("keeps a more specific class's marker rather than re-redacting over it", () => {
+      // A vendor-keyed expectation is caught by VENDOR_KEY_RE first; the
+      // expectation pass must not then replace that marker with its own and
+      // leave `classes` naming a class with no visible marker.
+      const text = lease("main", ["AKIA", "IOSFODNN7EXAMPLE"].join(""));
+      const result = scrubGitHubEgressText(text);
+
+      expect(result.classes).toContain("vendor-key");
+      for (const cls of result.classes) expect(result.text).toContain(redactionMarker(cls));
+    });
+
+    it("does not swallow the sentence a recipe is written into", () => {
+      // The expectation capture admits `.` only BETWEEN token runs. Borrowing
+      // ASSIGNMENT_RE's alphabet whole would take the full stop, turn a clean
+      // 40-hex OID into a 41-character non-OID, and redact it.
+      const text = `Run ${lease(BRANCH, `${EXPECTED_OID}${"a".repeat(32)}`)}.`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+  });
+
   describe("PEN-3920 regression: an identifier carrying bounded digit runs is not a credential", () => {
     // Derived, not embedded, throughout this block: several of these pairs are
     // the exact material the SHIPPED rule refuses, so writing one contiguously

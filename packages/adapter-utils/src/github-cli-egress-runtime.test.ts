@@ -292,3 +292,155 @@ describe("github-cli-egress-runtime", () => {
     });
   });
 });
+
+describe("PEN-5734: a rewrite is announced, never silent", () => {
+  /**
+   * The defect this block pins, stated as the measurement that found it.
+   *
+   * On 2026-11-06 a `gh pr edit --body-file` carrying a force-push recipe ran,
+   * exited 0, and printed NOTHING on either stream — while the body GitHub
+   * then served back had the author's text replaced in place by a redaction
+   * marker. Nothing in the tool result, the exit code, or the output
+   * distinguished that from a clean write. The only reason anyone noticed was
+   * that the author happened to read the artifact back.
+   *
+   * That is strictly worse than the refusal every other door in this family
+   * performs: a refusal fails closed and tells you, whereas this published a
+   * corrupted instruction and reported success, on a WRITE path, where the
+   * corrupted text becomes the artifact other agents and humans then execute.
+   */
+  const opaqueValue = ["xJ9vQ2mTzR4pLw8", "KdH3NbYcF6sEa0UgV"].join("");
+  const assignment = ["SOME_UNENUMERATED_NAME", opaqueValue].join("=");
+
+  function captureNotices(argv: string[], io?: { readText(p: string): string }) {
+    const notices: string[] = [];
+    const result = prepareGitHubCliInvocation({
+      target: "/usr/bin/gh",
+      argv,
+      io: { notify: (message) => notices.push(message) },
+      ...(io ?? {}),
+    });
+    return { notices, result };
+  }
+
+  it("announces an inline --body rewrite", () => {
+    const { notices, result } = captureNotices([
+      "issue",
+      "comment",
+      "1435",
+      "--body",
+      `before\n${assignment}\nafter`,
+    ]);
+
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("REWROTE outbound text");
+    // Names the FIELD, so a caller knows which of several values moved.
+    expect(notices[0]).toContain("`--body`");
+    expect(notices[0]).toContain("high-entropy-assignment");
+    // Names the SPAN: the 1-based line within the value that fired.
+    expect(notices[0]).toContain("2: ");
+    // The argv really was rewritten — the notice is not decorative.
+    expect(result.argv.join(" ")).not.toContain(opaqueValue);
+  });
+
+  it("announces a --body-file rewrite and names the file", () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), "paperclip-gh-egress-rewrite-"));
+    temporaryDirectories.push(directory);
+    const bodyPath = path.join(directory, "body.md");
+    writeFileSync(bodyPath, `line one\n${assignment}\nline three\n`);
+
+    const { notices, result } = captureNotices(["pr", "edit", "3055", "--body-file", bodyPath]);
+
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("`--body-file`");
+    expect(notices[0]).toContain(bodyPath);
+    expect(notices[0]).toContain("2: ");
+    // gh is handed a different file, and that file carries the marker.
+    const rewrittenPath = result.argv[result.argv.length - 1] as string;
+    expect(rewrittenPath).not.toBe(bodyPath);
+    expect(readFileSync(rewrittenPath, "utf8")).toContain(
+      redactionMarker("high-entropy-assignment"),
+    );
+    if (result.temporaryDirectory) rmSync(result.temporaryDirectory, { recursive: true, force: true });
+  });
+
+  it("never echoes the material it removed", () => {
+    // The excerpt is the SCRUBBED line. Echoing the raw match would send the
+    // material into agent stderr and from there into run logs and whatever the
+    // agent pastes when it reports — PEN-2526's shape, reached from inside the
+    // control built to prevent it.
+    const { notices } = captureNotices([
+      "issue",
+      "comment",
+      "1435",
+      "--body",
+      `token ${syntheticCredential}`,
+    ]);
+
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).not.toContain(syntheticCredential);
+    expect(notices[0]).toContain("vendor-key");
+  });
+
+  it("says nothing when the payload passes through byte-exact", () => {
+    // The notice has to stay rare enough to mean something. A clean call must
+    // be silent, or the signal is noise and the next reader filters it out.
+    const { notices, result } = captureNotices([
+      "issue",
+      "comment",
+      "1435",
+      "--body",
+      "## Review\n\nOne finding in `server/src/routes/issues.ts`. LGTM otherwise.",
+    ]);
+
+    expect(notices).toEqual([]);
+    expect(result.rewrites).toEqual([]);
+    expect(result.argv).toContain("## Review\n\nOne finding in `server/src/routes/issues.ts`. LGTM otherwise.");
+  });
+
+  it("is silent on the force-push recipe that provoked the row", () => {
+    // Both halves of the fix in one assertion: the mandated form is no longer
+    // rewritten, so there is nothing to announce.
+    const branch = ["chore", "/", "PEN-5215-lock-holder-notes-and-render-guards"].join("");
+    // paperclip:allow-git-push: fixture text only — a recipe STRING handed to the egress runtime as input to assert it is NOT rewritten. Never executed; no remote is contacted.
+    const recipe = `git push ${["--force-with-lease", `${branch}:ff113077`].join("=")}`;
+
+    const { notices, result } = captureNotices(["pr", "edit", "3055", "--body", recipe]);
+
+    expect(notices).toEqual([]);
+    expect(result.argv).toContain(recipe);
+  });
+
+  it("reports every rewritten value, not just the first", () => {
+    const { notices } = captureNotices([
+      "issue",
+      "comment",
+      "1435",
+      "--title",
+      `t ${syntheticCredential}`,
+      "--body",
+      `b ${assignment}`,
+    ]);
+
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("`--title`");
+    expect(notices[0]).toContain("`--body`");
+  });
+
+  it("keeps the notice OFF the refusal path, which still fails closed", () => {
+    // A repository-content field is refused rather than rewritten, and the two
+    // dispositions must not blur: a refusal that also printed "REWROTE" would
+    // tell the author their bytes were published when they were not.
+    expect(() =>
+      prepareGitHubCliInvocation({
+        target: "/usr/bin/gh",
+        argv: ["api", "repos/o/r/contents/f", "-f", `content=${syntheticCredential}`],
+        io: {
+          notify: () => {
+            throw new Error("a refusal must not emit a rewrite notice");
+          },
+        },
+      }),
+    ).toThrow(/refusing to rewrite GitHub repository content/);
+  });
+});
