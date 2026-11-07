@@ -2207,10 +2207,16 @@ describeEmbeddedPostgres("authorization service", () => {
     // and the resource. It previously was not — this comment named the property
     // while nothing in the suite established it, so the case was green on
     // `originKind` alone and would have been byte-identically green if
-    // `assigneeUserId` were not a concept. Setting it does NOT change this
-    // verdict, and that is the point worth pinning: the denial is reached
-    // through `originKind`, never through "addressed to a human". The row
-    // below proves the gap that distinction leaves open.
+    // `assigneeUserId` were not a concept.
+    //
+    // PEN-5920: that field being set now ALSO withholds the generic
+    // `issue:mutate` claim on its own, so the mutate cell below is
+    // overdetermined — it would be denied by either suppression alone and no
+    // longer isolates this one. The `issue:comment` assertion is what keeps the
+    // `originKind` path honestly tested: the PEN-5920 predicate is
+    // mutate-only, so a comment denial here can only have come from the origin
+    // allowlist. Drop that assertion and this case stops covering the thing its
+    // own name claims.
     const escalationIssue = await createIssue(db, company.id, {
       title: "Orphaned productivity review escalation",
       assigneeAgentId: null,
@@ -2218,38 +2224,51 @@ describeEmbeddedPostgres("authorization service", () => {
       originKind: "productivity_review_escalation",
       originId: manualIssue.id,
     });
+    const escalationResource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: escalationIssue.id,
+      assigneeAgentId: null,
+      assigneeUserId: escalationIssue.assigneeUserId,
+      status: "todo",
+    } as const;
     await expect(authorization.decide({
       actor: actorContext,
       action: "issue:mutate",
-      resource: {
-        type: "issue",
-        companyId: company.id,
-        issueId: escalationIssue.id,
-        assigneeAgentId: null,
-        assigneeUserId: escalationIssue.assigneeUserId,
-        status: "todo",
-      },
+      resource: escalationResource,
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    // The isolating cell. An ordinary human-assigned row allows `issue:comment`
+    // (see the PEN-5920 case below); this one does not, and the only difference
+    // is `originKind`.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "issue:comment",
+      resource: escalationResource,
     })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
   });
 
-  // PEN-5900. CHARACTERIZATION, NOT RATIFICATION: this pins what `decideBase`
-  // ships today, which the ratified model doc and the `allow_company_agent`
-  // relation label both describe incorrectly. The decision on whether this
-  // behaviour is correct is the CTO's and is open; whichever option lands, THIS
-  // is the test that must change, which is the whole reason it exists.
+  // PEN-5920, implementing the PEN-5900 done-when 1 ruling (option 1). This
+  // replaces the characterization case that pinned the opposite cell: until
+  // this change a row addressed to a named human was rewritable, and closable,
+  // by every agent in the company, because the claim branch keyed on
+  // `assigneeAgentId` alone while suppression keyed on a two-element
+  // `originKind` allowlist that most human-assigned rows fall outside.
   //
-  // The gap: the claim branch keys on `assigneeAgentId` alone, and suppression
-  // keys on a two-element `originKind` allowlist. A row handed to a human —
-  // `assigneeAgentId: null`, `assigneeUserId` set, `originKind: "manual"` —
-  // matches neither, so every agent in the company holds `issue:mutate` on it.
-  // That is the same hazard the suppression allowlist already articulates for
-  // `productivityReviewEscalation` ("an agent claiming it answers the question
-  // that was asked of the user"), reached by every human-assigned row whose
-  // `originKind` the allowlist does not name. Human decision gates are the
-  // dominant use of human assignment in this company, and a gate any agent may
-  // set to `done` is not a gate. (Fleet counts are a dated snapshot and live in
-  // docs/security/issue-authorization-model.md and on PEN-5900, not here.)
-  it("treats a human-assigned issue as unassigned: every company agent may mutate it (PEN-5900)", async () => {
+  // What is pinned now is the split: `allow_company_agent` carries
+  // `issue:comment` on a person's row and stops short of `issue:mutate`. That
+  // is the ratified model's own one-liner enforced — an agent may say anything
+  // on an issue it is related to; it may change only one it holds — and it is
+  // the same hazard the suppression allowlist already states for
+  // `productivityReviewEscalation`, now keyed on the property that hazard is
+  // actually about. Human decision gates are the dominant use of human
+  // assignment in this company, and a gate any agent may set to `done` is not
+  // a gate.
+  //
+  // The genuinely-unowned control below is load-bearing, not decoration: it is
+  // what makes this case fail if `assigneeUserId` is dropped from the fixture.
+  // Without it the suite would be green on `assigneeAgentId: null` alone — the
+  // exact defect PEN-5900 Finding 2 found in the case above this one.
+  it("lets any company agent comment on a human-assigned issue but not mutate it (PEN-5920)", async () => {
     const company = await createCompany(db, "HumanAssignedIssueClaim");
     const actor = await createAgent(db, company.id, { role: "engineer" });
     const authorization = authorizationService(db);
@@ -2257,7 +2276,8 @@ describeEmbeddedPostgres("authorization service", () => {
 
     // The shape the CTO described on PEN-2526 as "not unassigned": no agent
     // holds it, a named human does. `originKind: "manual"` is the default, so
-    // this row sits outside the two-element suppression allowlist.
+    // this row sits outside the two-element suppression allowlist — the claim
+    // is withheld by the assignee predicate, not by provenance.
     const humanAssigned = await createIssue(db, company.id, {
       title: "CONFIRMATION GATE - operator to confirm",
       assigneeAgentId: null,
@@ -2274,25 +2294,52 @@ describeEmbeddedPostgres("authorization service", () => {
       status: "todo",
     } as const;
 
-    // Asserted because it is useful and uncontested: an agent may speak on a
-    // human's row. No option under consideration removes this.
+    // Unchanged by this row and deliberately preserved: an agent may speak on
+    // a person's row. The comment is the route a non-assignee has onto it.
     await expect(authorization.decide({
       actor: actorContext,
       action: "issue:comment",
       resource,
     })).resolves.toMatchObject({ allowed: true, reason: "allow_company_agent" });
 
-    // The finding. An unrelated agent may REWRITE a row addressed to a named
-    // human — including closing it. Flip this cell when the decision lands.
+    // The narrowing. An unrelated agent may no longer rewrite or close a row
+    // addressed to a named human.
     await expect(authorization.decide({
       actor: actorContext,
       action: "issue:mutate",
       resource,
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // Control, and the fixture pin: the SAME row with no human assignee is
+    // still mutable. This is the branch `allow_company_agent` was written for —
+    // nobody is accountable yet, so any same-company agent may pick it up — and
+    // it proves the narrowing is keyed on `assigneeUserId` rather than having
+    // removed the generic claim outright. Delete `assigneeUserId` from the
+    // fixture above and the two mutate assertions contradict each other, so
+    // this case cannot go green without the field.
+    const unowned = await createIssue(db, company.id, {
+      title: "Held by nobody at all",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      originKind: "manual",
+    });
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: unowned.id,
+        assigneeAgentId: null,
+        assigneeUserId: null,
+        originKind: "manual",
+        status: "todo",
+      },
     })).resolves.toMatchObject({ allowed: true, reason: "allow_company_agent" });
 
-    // Control: the gap is in the predicate, not in the fixture. The identical
-    // row with an AGENT assignee is denied, so `assigneeUserId` is carrying no
-    // weight at this bar — it is `assigneeAgentId` doing all of the work.
+    // Control: a row an AGENT holds was already denied, and still is. The
+    // human-assigned row above now lands on the same verdict, which is the
+    // whole point of the change — the two ownership kinds stop diverging.
     const agentAssigned = await createIssue(db, company.id, {
       title: "Same row, held by an agent",
       assigneeAgentId: (await createAgent(db, company.id, { role: "engineer" })).id,
@@ -4942,19 +4989,19 @@ describeEmbeddedPostgres("authorization service", () => {
         case "unassigned": {
           // Deliberately `originKind: "manual"`: a review or escalation shell is
           // suppressed here on purpose (BLO-19094) and is covered elsewhere.
-          // Genuinely unheld — no agent AND no human. The human-assigned case is
-          // its own row below, because `decideBase` does not distinguish them
-          // and the grid used to imply it did (PEN-5900).
+          // Genuinely unheld — no agent AND no human. This is the only shape
+          // `allow_company_agent` carries `issue:mutate` for; the
+          // human-assigned case is its own row below and no longer matches it
+          // (PEN-5920).
           issueInput.assigneeAgentId = null;
           actorAgentId = (await createAgent(db, company.id, { role: "engineer" })).id;
           break;
         }
         case "human_assigned": {
-          // PEN-5900. `assigneeAgentId: null` + `assigneeUserId` set: the row is
-          // held by a named human, not by nobody. The claim branch reads only
-          // `assigneeAgentId`, so this lands on `allow_company_agent` exactly
-          // like the row above. Pinned separately so the grid cannot again be
-          // read as covering only genuinely unheld rows.
+          // PEN-5920. `assigneeAgentId: null` + `assigneeUserId` set: the row is
+          // held by a named human, not by nobody. It differs from the row above
+          // in exactly one field, which is what makes the pair an assertion
+          // about `assigneeUserId` rather than about `assigneeAgentId`.
           issueInput.assigneeAgentId = null;
           issueInput.assigneeUserId = `user-${randomUUID()}`;
           actorAgentId = (await createAgent(db, company.id, { role: "engineer" })).id;
@@ -5193,20 +5240,21 @@ describeEmbeddedPostgres("authorization service", () => {
         ],
       },
       {
-        // PEN-5900, OPEN DECISION — characterization, not ratification. The
-        // mutate cell is the finding: a row addressed to a named human is
-        // rewritable, and closable, by every agent in the company. It reads
-        // identically to `unassigned` above because `decideBase` keys the claim
-        // branch on `assigneeAgentId` alone, while the suppression that WOULD
-        // catch it keys on a two-element `originKind` allowlist that 53 of the
-        // 56 measured open instances fall outside. Whichever remediation the
-        // CTO lands, this row changes; until then it is here so the grid states
-        // what ships.
+        // PEN-5920, implementing the PEN-5900 done-when 1 ruling. This row used
+        // to read identically to `unassigned` above, and that was the finding:
+        // a row addressed to a named human was rewritable, and closable, by
+        // every agent in the company, because the claim branch keyed on
+        // `assigneeAgentId` alone while the suppression that would have caught
+        // it keyed on a two-element `originKind` allowlist most such rows fall
+        // outside. The mutate cell is now the denial, and the divergence from
+        // `unassigned` directly above is the assertion: these two rows differ
+        // only in `assigneeUserId`, so the grid can no longer be read as
+        // covering both ownership kinds alike.
         relation: "human_assigned",
-        note: "PEN-5900 — `assigneeUserId` set, `assigneeAgentId` null: held by a human, treated as unheld",
+        note: "PEN-5920 — `assigneeUserId` set, `assigneeAgentId` null: a person holds it, so comment but not mutate",
         cells: [
           { action: "issue:comment", allowed: true, reason: "allow_company_agent" },
-          { action: "issue:mutate", allowed: true, reason: "allow_company_agent" },
+          { action: "issue:mutate", allowed: false, reason: "deny_missing_grant" },
           { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
         ],
       },
@@ -5355,7 +5403,9 @@ describeEmbeddedPostgres("authorization service", () => {
       // `human_assigned` (PEN-5900). That last one is NOT a 19th grid row: it
       // is the second shape of the single `allow_company_agent` row, split out
       // because the grid's one condition covers two materially different
-      // states — unheld, and held by a named human — and said only the first.
+      // states — unheld, and held by a named human. Since PEN-5920 those two
+      // shapes no longer decide alike, which is why they cannot be collapsed
+      // back into one relation.
       expect(MATRIX).toHaveLength(21);
       for (const row of MATRIX) {
         expect(row.cells.map((cell) => cell.action), row.relation).toEqual([
@@ -5378,6 +5428,12 @@ describeEmbeddedPostgres("authorization service", () => {
         "recovery_handoff",
         "blocked_issue_assignee",
         "blocking_issue_assignee",
+        // PEN-5920. The newest member of the set, and the only one that is not
+        // a relation the actor has to the issue — it is a property of the
+        // issue: a person holds it. Listed here rather than exempted, because
+        // the asymmetry it creates is the same one every other row asserts —
+        // say anything, change only what you hold.
+        "human_assigned",
       ]));
     });
 

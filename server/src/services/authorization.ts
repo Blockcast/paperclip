@@ -2724,6 +2724,11 @@ export function authorizationService(db: Db) {
         });
       }
       let unassignedClaimSuppressed = false;
+      // PEN-5920, implementing the PEN-5900 done-when 1 ruling. Set when the
+      // row carries no agent assignee but IS held by a named human, and the
+      // action is the write. `allow_company_agent` still carries
+      // `issue:comment` on such a row; it stops short of `issue:mutate`.
+      let humanAssignedMutateClaimSuppressed = false;
       if (!resource?.assigneeAgentId) {
         // Suppress only the generic default; do NOT return here. An explicit
         // grant below (mention, recovery handoff, productivity review) is a
@@ -2734,7 +2739,27 @@ export function authorizationService(db: Db) {
         unassignedClaimSuppressed = Boolean(
           resource && await recoveryOrReviewIssueBlocksUnassignedAgentClaim(resource),
         );
-        if (!unassignedClaimSuppressed) {
+        // `assigneeAgentId: null` is not the same as "nobody holds this". A row
+        // with `assigneeUserId` set is addressed to a person on purpose, and
+        // the hazard is the one the suppression allowlist above already states
+        // for `productivityReviewEscalation`: "an agent claiming it answers the
+        // question that was asked of the user". That allowlist keys on
+        // `originKind`, so it catches the machine-generated case and misses the
+        // same hazard reached by every other route onto a person's queue —
+        // which is the dominant use of human assignment here, and is mostly
+        // decision gates. A gate any agent may set to `done` is not a gate.
+        //
+        // Split by action rather than suppressed outright, which is the
+        // ratified model's own one-liner enforced: an agent may say anything on
+        // an issue it is related to; it may change only one it holds. Like
+        // `unassignedClaimSuppressed` this withdraws only the GENERIC claim —
+        // the explicit relations below still apply, so a productivity review
+        // still reaches `issue:mutate` on its source. Two other boundaries in
+        // this file already treat `assigneeUserId` as a hard stop for a
+        // restricted actor (`:1290`, `:1407`); this branch was the outlier.
+        humanAssignedMutateClaimSuppressed =
+          input.action === "issue:mutate" && Boolean(resource?.assigneeUserId);
+        if (!unassignedClaimSuppressed && !humanAssignedMutateClaimSuppressed) {
           return allow({
             action: input.action,
             reason: "allow_company_agent",
@@ -2845,6 +2870,28 @@ export function authorizationService(db: Db) {
           action: input.action,
           reason: "deny_missing_grant",
           explanation: "Review and escalation issues cannot be claimed through generic unassigned-issue access.",
+        });
+      }
+      // PEN-5920. Placed after the suppression deny above so an escalation
+      // shell — which is human-assigned AND origin-suppressed, so both flags
+      // are set — keeps its existing, more specific message byte-for-byte.
+      //
+      // Named separately from the generic `issue:mutate` fallthrough below
+      // because that one ends "Ask the assignee to make the write, or take
+      // assignment", and on a row held by a person that second half is the
+      // wrong advice: taking assignment off a human is how the denial gets
+      // worked around rather than answered. Same reason the mutate list was
+      // stated at all in PEN-4495 — a denial nobody can read gets routed around
+      // instead of obeyed.
+      if (humanAssignedMutateClaimSuppressed) {
+        return deny({
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation:
+            "This issue is assigned to a person, so generic unassigned-issue access carries " +
+            "issue:comment but not issue:mutate. Comment on the issue instead — the assignee " +
+            "reads the thread and makes the write.",
+          evaluatedRelations: [...ISSUE_MUTATE_EVALUATED_RELATIONS],
         });
       }
       // Name every relation that was evaluated, so a denial is diagnosable from
