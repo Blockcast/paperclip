@@ -15,6 +15,15 @@
  * this"; `false` means "a gate ran and the ask died". The decision gauge excludes
  * both, so the distinction is invisible there — and that is precisely why a test
  * has to hold it, since nothing else will notice when it is lost.
+ *
+ * Note what this column does NOT decide: both satisfied families backfill `true`,
+ * including `Gate completed …` on a `github_actions_run` gate, where "satisfied"
+ * means only that the named run finished green. That is faithful to what the
+ * reconciler measured and to what it writes live. Whether a satisfied gate counts
+ * as the ask being SERVED is the consumer's question, and the board-decision gauge
+ * answers it by conjoining `payload.gate.kind = 'github_pr_merged'` — so do not
+ * "fix" this backfill by nulling the run rows; that would make history disagree
+ * with the live write and would not change any gauge.
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
