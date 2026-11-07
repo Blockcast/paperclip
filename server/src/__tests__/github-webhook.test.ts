@@ -61,6 +61,7 @@ import {
   __test_resolvePrCommentReviewGateWebhookTrigger,
   __test_resolveDependabotAlertContext,
   __test_resolveEventContext,
+  __test_isWakeDrivingPullRequestLabel,
   __test_shouldFirePrReviewerWake,
   __test_verifyGithubSignature,
   __test_wakeIdempotencySuffix,
@@ -1008,6 +1009,71 @@ describe("github-webhook pure helpers", () => {
       });
       expect(__test_shouldFirePrReviewerWake(ctx)).toBe(false);
     }
+  });
+
+  // PEN-5747. Before this, a label placement could not reach Paperclip by ANY
+  // route: `labeled` died at the action filter, and the generic carriers that
+  // might have substituted (`workflow_run`, `check_run`) bind identifiers from
+  // the branch with the uppercase-only extractor, which the lowercase branch
+  // below never matches. The branch here is deliberately lowercase for exactly
+  // that reason -- it is what makes this a test of the claim that
+  // `pull_request` is the one event whose resolution survives this fleet's
+  // branch convention.
+  it("admits pull_request label placements and carries the label and the actor", () => {
+    for (const [action, wakeReason] of [
+      ["labeled", "github_pr_labeled"],
+      ["unlabeled", "github_pr_unlabeled"],
+    ]) {
+      const ctx = __test_resolveEventContext("pull_request", {
+        action,
+        label: { name: "landing-hold" },
+        sender: { login: "a-human" },
+        pull_request: {
+          number: 5747,
+          title: "Carry the hold PEN-5747",
+          body: null,
+          state: "open",
+          html_url: "https://github.com/Blockcast/paperclip/pull/5747",
+          head: { ref: "devops/pen-5747-landing-hold", sha: "label1sha" },
+          updated_at: "2026-11-06T09:00:00Z",
+        },
+        repository: { full_name: "Blockcast/paperclip" },
+      });
+      // Admitted at all -- on master this returned null, which is the defect.
+      expect(ctx).toMatchObject({
+        identifiers: ["PEN-5747"],
+        wakeReason,
+        prNumber: 5747,
+        prAction: action,
+        prLabelName: "landing-hold",
+        // The actor. A hold is a claim made BY somebody; a placement whose
+        // actor is unrecorded cannot be told apart from one never made.
+        prSenderLogin: "a-human",
+        prState: "open",
+      });
+      // The lowercase branch still resolves an OWNING identifier, which is the
+      // property the generic carriers lack and the reason this event was
+      // chosen. Without it the author wake is dropped as no_owning_reference.
+      expect(ctx?.owningIdentifiers).toContain("PEN-5747");
+      // No label may ever spend a review pass, allowlisted or not.
+      expect(__test_shouldFirePrReviewerWake(ctx)).toBe(false);
+    }
+  });
+
+  it("gates the label wake on the allowlist, and fails closed on an unreadable label", () => {
+    expect(__test_isWakeDrivingPullRequestLabel("landing-hold")).toBe(true);
+    // GitHub compares label names case-insensitively; so does the allowlist.
+    expect(__test_isWakeDrivingPullRequestLabel("Landing-Hold")).toBe(true);
+    expect(__test_isWakeDrivingPullRequestLabel("  landing-hold  ")).toBe(true);
+    // The containment: every other label in the repo records and does not wake.
+    expect(__test_isWakeDrivingPullRequestLabel("stale-base")).toBe(false);
+    expect(__test_isWakeDrivingPullRequestLabel("size/XL")).toBe(false);
+    expect(__test_isWakeDrivingPullRequestLabel("landing-hold-2")).toBe(false);
+    // Fails CLOSED: an absent or empty name is not in the allowlist, so the
+    // event records and does not wake.
+    expect(__test_isWakeDrivingPullRequestLabel(null)).toBe(false);
+    expect(__test_isWakeDrivingPullRequestLabel(undefined)).toBe(false);
+    expect(__test_isWakeDrivingPullRequestLabel("   ")).toBe(false);
   });
 
   it("resolves a wake reason for pull_request opened", () => {
@@ -4496,6 +4562,14 @@ describeEmbeddedPostgres("github-webhook route", () => {
       beforeSha?: string | null;
       headSha?: string;
       updatedAt?: string;
+      // PEN-5747. `label`/`sender` are opt-in so every pre-existing payload in
+      // this file is byte-identical to before. `state` is defaulted, and the
+      // default reproduces the old behaviour exactly: it is "closed" precisely
+      // when the action is `closed`, which is the only witness the status
+      // mapping had before this change.
+      label?: string;
+      sender?: string;
+      state?: string;
     }) {
       const defaultUpdatedAtByAction: Record<string, string> = {
         opened: "2026-04-30T10:00:00Z",
@@ -4508,8 +4582,11 @@ describeEmbeddedPostgres("github-webhook route", () => {
       return {
         action: opts.action,
         ...(opts.beforeSha ? { before: opts.beforeSha } : {}),
+        ...(opts.label ? { label: { name: opts.label } } : {}),
+        ...(opts.sender ? { sender: { login: opts.sender } } : {}),
         pull_request: {
           number: opts.number ?? 4242,
+          state: opts.state ?? (opts.action === "closed" ? "closed" : "open"),
           title: opts.title === undefined ? `Fix ${opts.identifier}` : opts.title,
           body: null,
           html_url: `https://github.com/Blockcast/paperclip/pull/${opts.number ?? 4242}`,
@@ -4623,6 +4700,209 @@ describeEmbeddedPostgres("github-webhook route", () => {
         .where(eq(issueWorkProducts.issueId, issueId));
       expect(rows).toHaveLength(1);
       expect(rows[0]?.status).toBe("merged");
+    });
+
+    // PEN-5747. The three tests below are one claim split into its two halves
+    // plus the hazard admitting them introduces. The halves are deliberately
+    // asserted against the SAME surface -- work product AND wake, on every one
+    // -- because the whole design is that those two move independently, and a
+    // test that only looked at one of them could not tell the split from its
+    // absence.
+    async function labelWakes(agentId: string) {
+      return db
+        .select({
+          reason: agentWakeupRequests.reason,
+          payload: agentWakeupRequests.payload,
+        })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.agentId, agentId),
+            inArray(agentWakeupRequests.reason, ["github_pr_labeled", "github_pr_unlabeled"]),
+          ),
+        );
+    }
+
+    it("wakes the owning issue when an allowlisted label is placed, and records the actor", async () => {
+      const { issueId, agentId } = await seedIssueWithIdentifier("BLO-40010");
+      const app = buildApp();
+
+      const res = await postPr(
+        app,
+        prPayload({
+          action: "labeled",
+          identifier: "BLO-40010",
+          number: 4250,
+          label: "landing-hold",
+          sender: "a-human",
+          updatedAt: "2026-11-06T09:00:00Z",
+        }),
+        "wp-label-hold",
+      );
+      expect(res.status).toBe(200);
+
+      // Half one: the placement is RECORDED.
+      const rows = await db
+        .select()
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({ lastEventAction: "labeled" });
+
+      // Half two: and because the label is allowlisted, it also INTERRUPTS.
+      const wakes = await labelWakes(agentId);
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]?.payload).toMatchObject({ prNumber: 4250 });
+
+      // The label and the actor are asserted on the RUN's contextSnapshot,
+      // which is the surface the woken agent actually reads -- the wakeup
+      // request's own payload is a narrower routing projection and carries
+      // neither. A wake that reached the right agent without saying which
+      // label moved, or who moved it, would be the non-attestation defect
+      // this change exists to close, so it is pinned where it is consumed.
+      const runs = await db
+        .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toContainEqual(
+        expect.objectContaining({
+          contextSnapshot: expect.objectContaining({
+            issueId,
+            wakeReason: "github_pr_labeled",
+            githubPrLabelName: "landing-hold",
+            githubPrSenderLogin: "a-human",
+            githubPrNumber: 4250,
+            prRole: "author",
+          }),
+        }),
+      );
+    });
+
+    it("wakes on the LIFT of an allowlisted label, not only its placement", async () => {
+      const { agentId } = await seedIssueWithIdentifier("BLO-40011");
+      const app = buildApp();
+
+      // The allowlist is read off the label the EVENT carries, never off the
+      // labels the PR currently has -- by the time an `unlabeled` arrives the
+      // PR no longer carries it, so a current-labels check would miss every
+      // lift. The hold being over is exactly what a blocked row waits to learn.
+      await postPr(
+        app,
+        prPayload({
+          action: "unlabeled",
+          identifier: "BLO-40011",
+          number: 4251,
+          label: "landing-hold",
+          sender: "a-human",
+          updatedAt: "2026-11-06T09:05:00Z",
+        }),
+        "wp-label-lift",
+      );
+
+      const wakes = await labelWakes(agentId);
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]?.reason).toBe("github_pr_unlabeled");
+    });
+
+    // THE NEGATIVE CASE, and the one that pins the containment. `labeled` fires
+    // for every label in the repo; admitting all of them for a wake would be an
+    // unbounded agent-wake amplifier. A non-allowlisted label must add the row
+    // and fire NO run -- the `enqueued`/`dequeued` behaviour exactly.
+    it("records a non-allowlisted label as evidence and fires no wake at all", async () => {
+      const { issueId, agentId } = await seedIssueWithIdentifier("BLO-40012");
+      const app = buildApp();
+
+      const res = await postPr(
+        app,
+        prPayload({
+          action: "labeled",
+          identifier: "BLO-40012",
+          number: 4252,
+          label: "stale-base",
+          sender: "some-bot[bot]",
+          updatedAt: "2026-11-06T09:10:00Z",
+        }),
+        "wp-label-stale-base",
+      );
+      expect(res.status).toBe(200);
+
+      // The row is still written: recording is unconditional, and it is most of
+      // what this change is for.
+      const rows = await db
+        .select()
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.metadata).toMatchObject({ lastEventAction: "labeled" });
+
+      // And nothing ran. Asserted across ALL of this agent's wakes, not just
+      // the label-shaped ones: the claim is "no run", not "no label-reasoned
+      // run", and a label leaking into some other reason would satisfy the
+      // narrower assertion while still being the amplifier.
+      const allWakes = await db
+        .select({ reason: agentWakeupRequests.reason })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(allWakes).toHaveLength(0);
+    });
+
+    // The hazard that comes WITH admitting these actions, pinned separately.
+    // GitHub lets a CLOSED PR be labelled, and that event carries a strictly
+    // later `updated_at` -- so acceptIncoming takes it on the timestamp
+    // comparison before rank is ever consulted. With `action === "closed"` as
+    // the only witness for closure, the label demoted a terminal row back to
+    // `ready_for_review`, which nothing later repairs (a closed PR emits no
+    // further webhook) and which PEN-2791's stranded-assigned sweep then reads
+    // as a live event-wake path forever.
+    it("does not let a label on a CLOSED pull request demote its terminal row", async () => {
+      const { issueId } = await seedIssueWithIdentifier("BLO-40013");
+      const app = buildApp();
+
+      await postPr(
+        app,
+        prPayload({ action: "opened", identifier: "BLO-40013", number: 4253 }),
+        "wp-label-closed-1",
+      );
+      await postPr(
+        app,
+        prPayload({
+          action: "closed",
+          identifier: "BLO-40013",
+          number: 4253,
+          updatedAt: "2026-11-06T09:00:00Z",
+        }),
+        "wp-label-closed-2",
+      );
+
+      const afterClose = await db
+        .select({ status: issueWorkProducts.status })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(afterClose[0]?.status).toBe("closed");
+
+      // Strictly later timestamp, so this event wins acceptIncoming outright.
+      await postPr(
+        app,
+        prPayload({
+          action: "labeled",
+          identifier: "BLO-40013",
+          number: 4253,
+          label: "stale-base",
+          state: "closed",
+          updatedAt: "2026-11-06T09:30:00Z",
+        }),
+        "wp-label-closed-3",
+      );
+
+      const afterLabel = await db
+        .select({ status: issueWorkProducts.status, metadata: issueWorkProducts.metadata })
+        .from(issueWorkProducts)
+        .where(eq(issueWorkProducts.issueId, issueId));
+      expect(afterLabel).toHaveLength(1);
+      // It DID win -- the row took the label event ...
+      expect(afterLabel[0]?.metadata).toMatchObject({ lastEventAction: "labeled" });
+      // ... and still reads closed, because the PR's own state witnesses it.
+      expect(afterLabel[0]?.status).toBe("closed");
     });
 
     it("does not let a stale synchronize event overwrite a terminal merge state", async () => {
