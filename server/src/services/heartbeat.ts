@@ -2699,6 +2699,14 @@ export function summarizeQueuedRunClaimRefusals(
 // threshold. Issue/worktree ownership stays more conservative: a running row
 // holds its issue until it reaches a terminal/missing lifecycle state.
 const EXTERNAL_LIFECYCLE_STALE_MS = RUN_STALE_SILENCE_MS;
+// BLO-54719: cross-process pre-launch ownership. Every worker re-stamps the
+// `updated_at` of the pre-launch reservations it is driving every RENEW
+// interval (see renewPrelaunchReservationOwnership); the reaper on ANY worker
+// treats a stamp younger than STALE as a live owner. `activeRunExecutions` is
+// process-local, so under replicas=2 it alone let the reaper on one pod
+// reap the other pod's in-flight launch as process_lost.
+export const PRELAUNCH_OWNER_RENEW_MS = 30_000;
+const PRELAUNCH_OWNER_STALE_MS = 2 * 60_000;
 // BLO-19722: bounded so a pathological backlog cannot stall startup recovery
 // ahead of the reattach and reaper passes; the next start picks up the rest.
 const WORKER_CRASH_RECONCILE_MAX_RUNS = 200;
@@ -30085,6 +30093,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  /**
+   * BLO-54719: heartbeat for the reaper's pre-launch owner guard. Stamps
+   * `updated_at` on every still-pre-launch reservation (no Job identity yet)
+   * whose run this process is executing. Must run on EVERY worker, not only
+   * the scheduler-lease leader: the reaper reads the stamp from the other pod.
+   * Other writes to `updated_at` are one-shot lifecycle transitions, so they
+   * can extend the shield by at most PRELAUNCH_OWNER_STALE_MS, and the
+   * EXTERNAL_LIFECYCLE_HARD_STALE_MS ceiling from reservedAt still bounds it.
+   */
+  async function renewPrelaunchReservationOwnership() {
+    const runIds = [...activeRunExecutions];
+    if (runIds.length === 0) return;
+    await db
+      .update(externalRuntimeReservations)
+      .set({ updatedAt: new Date() })
+      .where(and(
+        inArray(externalRuntimeReservations.runId, runIds),
+        isNull(externalRuntimeReservations.releasedAt),
+        isNull(externalRuntimeReservations.jobName),
+        isNull(externalRuntimeReservations.jobUid),
+        inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
+      ));
+  }
+
   async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; suppressDispatchAfterReap?: boolean }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
     const now = new Date();
@@ -30881,7 +30913,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           && (reservation.state === "reserved" || reservation.state === "launching")
           && reservation.jobName === null
           && reservation.jobUid === null
-          && activeRunExecutions.has(run.id)
+          && (
+            activeRunExecutions.has(run.id)
+            // BLO-54719: the owner may be the OTHER worker. Its renewal keeps
+            // `updatedAt` fresh; a dead/stalled owner stops renewing and the
+            // run reaps PRELAUNCH_OWNER_STALE_MS later, as before.
+            || now.getTime() - new Date(reservation.updatedAt).getTime() < PRELAUNCH_OWNER_STALE_MS
+          )
           && Number.isFinite(reservationReservedAt)
           && reservationReservedAt > 0
           && now.getTime() - reservationReservedAt < EXTERNAL_LIFECYCLE_HARD_STALE_MS,
@@ -47206,8 +47244,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      * the test mimic the in-flight-await state without spinning up a real
      * `executeRun` flow. Do not call from production code.
      */
+    renewPrelaunchReservationOwnership,
     __test_unsafelyTrackActiveRunExecution: (runId: string) =>
       activeRunExecutions.add(runId),
+    /** Test-only inverse of the above: simulate a run owned by ANOTHER worker. */
+    __test_unsafelyUntrackActiveRunExecution: (runId: string) =>
+      activeRunExecutions.delete(runId),
 
     /**
      * Test-only awaitable handle on `executeRun`. Production callers fire

@@ -90,6 +90,7 @@ export { financeService } from "./finance.js";
 export {
   heartbeatService,
   EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
+  PRELAUNCH_OWNER_RENEW_MS,
   resolveHeartbeatSchedulingSuppression,
 } from "./heartbeat.js";
 export {

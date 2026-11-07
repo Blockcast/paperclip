@@ -2260,6 +2260,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(persistedReservation?.releasedAt).toBeNull();
   });
 
+  // BLO-54719: with replicas=2 the reaper on worker B cannot see worker A's
+  // process-local activeRunExecutions. A's renewal stamp is the cross-process
+  // liveness signal; the module-level Set is shared by every service instance
+  // in one process, so "worker B" is simulated by untracking after A renews.
+  it("does not reap another worker's in-flight pre-launch run past 15m while its owner renews (BLO-54719)", async () => {
+    const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    await seedPrelaunchReservation({ companyId, agentId, runId, state: "launching", reservedAt });
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId); // worker A owns it
+    await heartbeat.renewPrelaunchReservationOwnership();
+    heartbeat.__test_unsafelyUntrackActiveRunExecution(runId); // worker B's view
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).not.toContain(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+  });
+
+  it("reaps another worker's pre-launch run once its ownership heartbeat is stale (BLO-54719)", async () => {
+    const reservedAt = new Date(Date.now() - 16 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    const reservation = await seedPrelaunchReservation({ companyId, agentId, runId, state: "launching", reservedAt });
+    // Owner last renewed 3 min ago, then died: past PRELAUNCH_OWNER_STALE_MS.
+    await db
+      .update(externalRuntimeReservations)
+      .set({ updatedAt: new Date(Date.now() - 3 * 60 * 1000) })
+      .where(eq(externalRuntimeReservations.id, reservation.id));
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect((await heartbeat.getRun(runId))?.errorCode).toBe("process_lost");
+  });
+
   it("reaps an in-process pre-adapter run past the hard ceiling (BLO-33820 wedge bound)", async () => {
     const reservedAt = new Date(Date.now() - 46 * 60 * 1000);
     const { companyId, agentId, runId } = await seedRunFixture({
