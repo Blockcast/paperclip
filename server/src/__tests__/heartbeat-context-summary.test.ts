@@ -3555,6 +3555,85 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(hop).toBeGreaterThan(lookup);
   });
 
+  // PEN-5904, the SURFACE axis. Everything above this point is the ROW axis, and a run
+  // can satisfy all of it and still lose the constraint. Measured on PEN-5524/PEN-5137:
+  // eight correct copies across all four owning rows, and seven hours later a reader who
+  // knew to check that row read the newest comment plus the park note, found neither
+  // carried it, and proceeded -- the nearer copy was at comment depth 10 of 55. Pinned
+  // per clause rather than on the heading, because a section that had quietly lost one of
+  // the four would pass a heading-only assertion while leaving the hole it was written
+  // for wide open.
+  it("names the description as the required surface, with the comment as announcement", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("A comment is the announcement; the description is the record");
+    // The threshold itself. Without it the clause is a preference; with it a run can tell
+    // whether what it just wrote counts.
+    expect(markdown).toContain("comment depth >= 2 has not been recorded, it has been mentioned");
+    // Retirement, not only recording. A depth-0 constraint that nobody amends is the cost
+    // this rule knowingly accepts, so the directive has to say who pays it and why.
+    expect(markdown).toContain("amend the DESCRIPTION as well as announcing it");
+    // The two rows that already did this per-incident, before any directive asked. Cited
+    // so the clause reads as a practice being written down rather than one being invented.
+    expect(markdown).toContain("PEN-5734 and PEN-5524 are the worked pattern");
+  });
+
+  // The two ways the row-axis rule ends with no row to write on. They are different
+  // failures -- no target at all, versus a known target that refuses the write -- and they
+  // end in the same place, which is why both are pinned here: the constraint lands
+  // wherever the author CAN write, i.e. depth 1 on the author's own row.
+  it("names a fallback target with no external id, and a fallback placement on a 403", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    // Target. `by-external-id` is defined for artifacts that HAVE an external id; a
+    // control-plane artifact has none, and the conclusion a literal reader reaches from
+    // the lookup paragraph alone is "not applicable".
+    expect(markdown).toContain("Target, when the artifact has no external id");
+    expect(markdown).toContain("'not applicable' is not the conclusion");
+    expect(markdown).toContain("which run could act against this constraint");
+    // State and consequence, not a prohibition. The actor usually has every right to do
+    // the thing; what they lack is the cost.
+    expect(markdown).toContain("they need to know what it costs");
+
+    // Placement. A 403 on the owning row is not a licence to write it anywhere.
+    expect(markdown).toContain("Placement, when the right target refuses you");
+    expect(markdown).toContain("does not license writing the constraint wherever you happen to have access");
+    // The honesty clause: a partial placement that reads as a complete one is the exact
+    // failure this directive exists to prevent, so an unplaced constraint must say so.
+    expect(markdown).toContain("treat it as unplaced until someone holding the grant places it");
+  });
+
+  // Depth 0 raises the read rate AND the cost of an error, and the two are not
+  // symmetrical: a description has no next-comment-in-thread, so it must be EDITED, by
+  // someone holding write access -- who per the Placement clause may not be whoever finds
+  // the error. PEN-5524's depth-0 block carried a wrong `monitorStatus: cleared` for six
+  // hours and its own author reproduced the error from it the next morning.
+  it("tells a depth-0 author to name who to tell when the constraint is wrong", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("A description has no next-comment-in-thread to carry a correction");
+    expect(markdown).toContain("name who to tell if it is wrong");
+  });
+
+  // Ordering, asserted rather than left to reading order. Target and Placement both
+  // answer "the lookup gave me nothing I can write to", so they are unreadable before the
+  // lookup paragraph they are the fallback for.
+  it("places the surface clauses after the owner lookup they fall back from", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    const lookup = markdown.indexOf("work-products/by-external-id");
+    const surface = markdown.indexOf("Surface. Record the constraint");
+    const target = markdown.indexOf("Target, when the artifact has no external id");
+    const placement = markdown.indexOf("Placement, when the right target refuses you");
+    const correction = markdown.indexOf("Correction. A description has no");
+
+    expect(lookup).toBeGreaterThan(-1);
+    expect(surface).toBeGreaterThan(lookup);
+    expect(target).toBeGreaterThan(surface);
+    expect(placement).toBeGreaterThan(target);
+    expect(correction).toBeGreaterThan(placement);
+  });
+
   // The containment-only path -- a notice with no issue, wake comment, prReview or
   // ancestors -- renders the directive too. An earlier revision gated it out as a run
   // "structurally unable to write", which was false: every refusal the containment

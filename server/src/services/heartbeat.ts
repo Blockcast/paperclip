@@ -14142,6 +14142,37 @@ export function buildPaperclipTaskMarkdown(input: {
     // the documented way to ACQUIRE the relation, not only a way to delegate the write.
     // Name the next action so a blocked run does not fall back to its own row, silently.
     "If the write to an owning row returns `403 deny_missing_grant`, you cannot record there -- do not stop at your own row. Comment on the row you do hold, naming the artifact, the constraint, and each owning row you could not write to, and link the owning row's assignee (or your chain of command) with `[@Name](agent://<uuid>)` so they record it as that row's assignee. A bare `@Name` mentions nobody. State on your own row that the constraint has NOT yet reached the owning row, until the assignee confirms.",
+    // PEN-5904: the SURFACE axis, plus the two cases where the row-axis rule above has
+    // no target or no write access. The three paragraphs above say which ROWS a
+    // constraint goes on and nothing about which surface of those rows, and a run that
+    // follows them perfectly still produces a record a later run will not find.
+    //
+    // Measured 2026-11-06/07 on PEN-5524 / PEN-5137. The constraint was recorded on ALL
+    // FOUR of the artifact's owning rows -- exactly what the rule prescribes -- twice
+    // each, by two different seats, inside a 39-second window and again 4.5h later.
+    // Eight correct copies. Seven hours after that a reader who KNEW to check, on a row
+    // they had written one of the copies on themselves, read the newest comment plus the
+    // park note, found neither carried it, and proceeded. The nearer copy on that row was
+    // at comment depth 10 of 55; the copies on two other rows sat at depths 3 and 4. It
+    // was not buried -- the read heuristic a run actually performs samples depth 1, and
+    // every copy sat at depth >= 3. Cross-posting multiplies copies along the axis that
+    // was never failing: a fifth row would have produced a ninth copy at depth >= 3 and
+    // changed nothing. The description is depth 0 -- the only surface every run loads
+    // unconditionally, before it chooses which comments to read, and the surface
+    // `buildPaperclipTaskMarkdown` puts in front of a woken agent verbatim.
+    //
+    // The Target and Placement clauses close the two ways the row-axis rule ends with no
+    // reachable row, and they end in the SAME place as the depth failure: the constraint
+    // lands wherever the author can write, which is depth 1 on the author's own row.
+    //
+    // Correction exists because depth 0 raises the read rate AND the cost of an error.
+    // PEN-5524's depth-0 block carried a wrong `monitorStatus: cleared` for six hours and
+    // its own author reproduced the error from it the next morning: arriving at a record
+    // and being able to fix it are different permissions.
+    "Surface. Record the constraint in the owning row's DESCRIPTION, not only in a comment. A comment is the announcement; the description is the record. A run loads a row's description unconditionally and reads only the newest comment or two, so a constraint at comment depth >= 2 has not been recorded, it has been mentioned. PEN-5734 and PEN-5524 are the worked pattern -- each opens its description with the standing constraint, and both were written that way per-incident before any directive asked for it. When you retire or amend the constraint, amend the DESCRIPTION as well as announcing it: leaving a stale constraint at depth 0 is the failure this rule trades for, and it is the cheaper one, because a stale record is visible to every reader while a missing one is visible to none.",
+    "Target, when the artifact has no external id. The lookup above is defined for artifacts that have one. For a control-plane artifact -- a row's wake reachability, a monitor, an approval card -- `by-external-id` has no answer, and 'not applicable' is not the conclusion. Name the target by asking which run could act against this constraint, and which row that run would have loaded; record it there. Write it as state and consequence ('these four statuses of PEN-5612 strand PEN-5524'), not as a prohibition: nobody needs permission to land their own work, they need to know what it costs.",
+    "Placement, when the right target refuses you. A 403 on the owning row does not license writing the constraint wherever you happen to have access. Fall back in this order: (1) the artifact itself, if it carries text a later run will load -- a PR body, a card payload value; (2) your own row, PLUS a mention of the owning row's assignee naming the exact text and where it goes. A constraint recorded only on the author's own row is the depth-1 failure this directive exists to prevent: say plainly that it is unplaced, and treat it as unplaced until someone holding the grant places it.",
+    "Correction. A description has no next-comment-in-thread to carry a correction -- it must be EDITED, by someone holding write access to that row, who per the clause above may not be the person who finds the error. When you place a constraint at depth 0, name who to tell if it is wrong.",
   );
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
