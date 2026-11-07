@@ -450,9 +450,30 @@ function withSignoff(
 function forcePushRefusal(forcePush: GitForcePush): GitEgressRuntimeError {
   const { reason, token } = forcePush;
 
+  // The expectation has to be the sha this clone last PUBLISHED, and the
+  // remote-tracking ref's REFLOG is the only source that means exactly that: a
+  // push writes an `update by push` entry, a fetch writes a different one, so
+  // the newest `update by push` is our own publication and nothing else.
+  //
+  // What this replaced was `git fetch origin` then `git rev-parse
+  // origin/<branch>` — the tracking ref's CURRENT value, which is the very
+  // thing the lease is checked against, read one command earlier. It therefore
+  // equalled that ref by construction and the lease could never refuse. That is
+  // the `bare-lease` hazard described below wearing the accepted shape, and the
+  // same defect PEN-5807 removed from the two CI remedy texts; `ls-remote` and
+  // `@{u}` are that current value too, so neither is a way out. `@{u}` also
+  // dies with `fatal: no upstream configured` on a worktree that pushed via
+  // `git push origin HEAD:<branch>`, the common agent shape, whereas the reflog
+  // needs no upstream — hence the rendered fallback on the second line rather
+  // than a comment nobody reading a refusal would see.
+  //
+  // `ls-remote` stays on the far side of the comparison: disagreeing with the
+  // reflog means a co-author pushed, which is the one case worth stopping for,
+  // and is exactly the case the `contention` paragraph below is written for.
   const lease = [
-    "    git fetch origin",
-    "    git rev-parse origin/<branch>          # <expected-sha>",
+    "    git reflog show origin/<branch>   # newest `update by push` = <expected-sha>, the sha YOU last pushed",
+    "                                      #   (never pushed from this clone? use the sha your last push printed)",
+    "    git ls-remote origin refs/heads/<branch>   # still <expected-sha>? if not, a co-author pushed — STOP",
     // paperclip:allow-git-push: remediation text shown to the author, not an invocation
     "    git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>",
   ].join("\n");
