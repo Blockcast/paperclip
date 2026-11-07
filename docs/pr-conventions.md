@@ -328,6 +328,113 @@ local `kubectl` answer was not evidence about the capability that mattered. Like
 `resources_list` means "absent" only if the same query shape returns a known-present object.
 Pair every negative with a positive control in the same breath, then record the verdict.
 
+## Writing a claim that survives being read out of context
+
+**Three rules.** They are deliberately **not** *"state the scope of every claim"* — applied to
+every claim in every PR that is unachievable, so it gets ignored, and an ignored convention is
+worse than none because it still carries the appearance of a guard.
+
+All three come from one incident. [PEN-5760](https://paperclip.blockcast.net/PEN/issues/PEN-5760)
+/ [#3454](https://github.com/Blockcast/paperclip/pull/3454) produced three instances of the same
+error class in one document, **each one produced while fixing the previous one**, and three
+readers passed over the third. The diagnosis: *a document that says "name your scope" is unusually
+good at hiding an unscoped sentence, because every reader is checking the claims and not the
+quantifiers.*
+
+### 1. Scope a claim at the SENTENCE — on surfaces read out of context
+
+Two surfaces where this applies, and they fail **differently**; one where it does not. Flattening
+(a) and (b) together is itself an instance of the error class.
+
+**(a) Fully out of context — the sentence must stand alone.**
+
+Rule 1(a) applies to: tool and schema field descriptions, error strings, monitor notes, and
+convention text that gets quoted piecemeal — including this file. The reader receives one
+paragraph and *none* of its neighbours, in either direction, so the sentence cannot inherit
+scope from the page it sits on. The author structurally cannot perceive this, because the author
+is looking at the page where the scope is visibly established two paragraphs up.
+
+> **The check for 1(a) is mechanical: lift the sentence out alone — is it still true?**
+
+⚠️ The 1(a) check is strictly stronger than *"render it and read it as a stranger"*, which is
+the prescription that failed on PEN-5760. A stranger reads **in order** and therefore *infers*
+scope from the neighbours: on PEN-5760 the unscoped rule sat between two buckets that *did* name
+their scope, so its silence read as deliberate. The defect is visible only when read out of order,
+one sentence at a time, which is how the real reader receives it.
+
+**(b) Truncated — the tail is destroyed and the head survives.**
+
+Rule 1(b) applies to: issue descriptions longer than 1200 code points, as served by
+`paperclipListIssues` and `paperclip_search_issues`. This is the weaker, **directional** form of
+(a) — text before the claim does travel with it, and only text after the cut is lost. Run three
+checks, **in this order**:
+
+1. **Does the rendered first 1200 code points read as FINISHED?** If it ends mid-word or
+   mid-structure, the reader sees a fragment and opens the row — the defect is mild, so stop here.
+   ⭐ The operative property is whether what survives reads as complete, not how much was cut.
+   PEN-5792's own description loses all three of these rules and is nearly harmless, because its
+   prefix stops mid-word and the reader opens the row. PEN-5760 lost **one table row** — its
+   single disconfirming case, which began fourteen code points past the cut — and that was
+   catastrophic, because its prefix read as finished. A visible fragment is self-correcting; a
+   coherent remainder is not.
+2. **If it reads as finished: is what survives true, and still as uncertain as it should be?** Put
+   the **disconfirming case first** — not merely the qualifier before the claim. A qualifier is a
+   sentence and sentences get cut too: a draft of PEN-5760's own repair put the qualifier first,
+   was cut *inside* it, and the half that survived was the confirming half alone.
+3. **Any count in the surviving part must be accurate.** ⭐ Prefer this one. It is the cheapest of
+   the three, and the only one that works at *reading* time rather than at authoring time — the
+   other two need an author who remembers to run them. PEN-5760's measurement heading read *"four
+   responses"* above a **five**-row table; the cut left exactly four. So the prefix was not merely
+   truncated, it was **self-corroborating**: a heading promising four, followed by four, in a
+   table, agreeing. Every consistency check a careful reader runs on that prefix passed, and
+   nothing was available to notice. Had the heading said *five*, the prefix would have announced
+   its own loss to every future reader, for free, without the author having to predict where the
+   cut would land.
+
+**Scope of (b), stated so it survives being lifted out of this file:** the 1200-code-point cut was
+measured on `paperclipListIssues` row projections over one company's corpus on 2026-11-06 — 864 of
+1000 rows truncated, at exactly 1200 code points, with no other prefix length observed.
+`paperclipGetIssue` returns the full column and is unaffected. `paperclip_search_issues` was **not
+probed**; it is documented as sharing the cap, and that is carried here on documentation rather
+than on measurement. Every list row carries a `descriptionTruncated` flag — prefer reading it over
+measuring the string.
+
+**(c) Rule 1 does NOT apply to:** PR bodies and code comments. There the surrounding text
+genuinely does travel with the claim — a PR body is rendered whole, and for a comment the code
+*is* the scope.
+
+### 2. Pin the failure mode, not the content
+
+A test that pins prose should pin **the token that this document's *observed* failure mode
+destroys** — not the token that seems important.
+
+- Observed three times on PEN-5760: an editor narrows or widens a claim and the **quantifier** goes
+  with it, silently. ⇒ pin the quantifier.
+- Never observed there: an editor deleting a field name from an omission list. ⇒ pinning that list
+  buys nothing and goes stale.
+
+**The binding constraint is the useful half: in a prose pin, you may only pin what you have
+watched fail.** That is what stops a test accreting important-looking assertions — which is
+exactly how `c10a6df5`'s test came to defend a *false* sentence. It pinned that sentence because
+the sentence mattered, not because anything had ever broken it, and the pin would then have
+nudged the next correct editor into reverting the fix.
+
+⚠️ Rule 2 is not *"always pin the scope"*. It is *pin what you have watched break*.
+
+### 3. A test assertion that pins prose ships with a demonstrated failing revert
+
+**Scope: this governs an assertion once you have decided to write one. Rule 2 decides whether to
+pin at all.** It does not require that any given prose be pinned — and this section is its own
+example: nothing has been observed deleting these three rules, so by rule 2 no test pins them.
+
+When you do pin prose: revert the text, watch **that exact assertion** fail, restore. A prose
+assertion nobody has seen fail is not a guard, and PEN-5760 has a measured instance of one that
+was actively harmful.
+
+⚠️ Rule 3 cannot reach a claim that lives in a database prose field — an issue description has no
+test to revert. Rule 1(b)(3)'s accurate count is the nearest thing to a guard available in a
+database prose field, which is part of why it is rated above the other two checks in 1(b).
+
 ## Dev Cycle Rules
 
 **Requires PR**: code logic, APIs, DB schema, agent configs, infrastructure
