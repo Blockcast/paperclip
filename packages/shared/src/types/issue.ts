@@ -212,6 +212,25 @@ export interface IssueRelationIssueSummary {
   priority: IssuePriority;
   assigneeAgentId: string | null;
   assigneeUserId: string | null;
+  /**
+   * PEN-5782: the blocker's deliberate park, so `status` can be read correctly.
+   *
+   * A parked row keeps whatever `status` it had — `todo` is the common case — so a
+   * consumer that follows a dependency edge and reads only `status` scores a blocker
+   * that cannot move until a future date as actionable right now. That is the
+   * fail-open direction: it invites a run against a deliberate park, or a report that
+   * the parent is unblocked when it is not.
+   *
+   * ⚠️ OPTIONAL ON PURPOSE, and it must stay that way. Only the dependency-edge
+   * projections (`blockedBy`, `blocks`, `terminalBlockers`) select the column. A site
+   * that cannot select it leaves the key ABSENT rather than emitting `null`, because
+   * `null` means "not parked" and is indistinguishable from "never asked" — which is
+   * the very defect this field exists to close. `relatedWork` is such a site.
+   *
+   * ⇒ `has("parkedUntil")` separates "this surface answers the question" from "this
+   * surface does not". Once present, `null` is a real answer: not parked.
+   */
+  parkedUntil?: Date | string | null;
   terminalBlockers?: IssueRelationIssueSummary[];
   activeRecoveryAction?: IssueRecoveryAction | null;
 }
