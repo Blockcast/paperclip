@@ -2185,7 +2185,8 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
   {
     name: "AGENT_HOME",
     classification: "SAFE_LITERAL",
-    reason: "Filesystem path to the agent's home directory on the mounted PVC.",
+    reason:
+      "Filesystem path to the agent's home directory. For an external instructions bundle this is `instructionsRootPath`, the per-seat dir on the mounted `paperclip-data` PVC; otherwise the server-provided workspace agent home. A path either way, never a credential. (The unqualified \"on the mounted PVC\" this reason used to claim was false for the second case — see the AGENT_HOME resolution in buildEnvVars, PEN-2585.)",
   },
 
   // --- SAFE_LITERAL: runtime services -----------------------------------
@@ -2683,7 +2684,47 @@ function buildEnvVars(
   setIfPresent("PAPERCLIP_WORKSPACE_REPO_REF", workspaceContext.repoRef);
   setIfPresent("PAPERCLIP_WORKSPACE_BRANCH", workspaceContext.branchName);
   setIfPresent("PAPERCLIP_WORKSPACE_WORKTREE_PATH", workspaceContext.worktreePath);
-  setIfPresent("AGENT_HOME", workspaceContext.agentHome);
+  // PEN-2585: AGENT_HOME must name a path the POD mounts, not one the SERVER made.
+  //
+  // `workspaceContext.agentHome` is `resolveDefaultAgentWorkspaceDir(agent.id)` =
+  // `<instanceRoot>/workspaces/<agentId>`, and the server `mkdir -p`s it on ITS own
+  // `/paperclip` mount just before handing it over (services/heartbeat.ts, the
+  // `buildPaperclipWorkspaceContext({ agentHome })` call site). The pod mounts no such
+  // path: `instances/default` arrives as the 16 MiB `instance-overlay` emptyDir with
+  // `data/` and `skills/` bound over it and NOTHING bound at `workspaces/`. So the
+  // variable is exported, points at an identically-spelled directory on a volume this
+  // pod does not have, and every `$AGENT_HOME/...` read is ENOENT.
+  //
+  // This is PEN-4932 invariant 9 — the one `isWorkspaceLessFallbackWorkspaceDir`
+  // already describes for the workspace cwd ("the server realizes every execution
+  // workspace onto its OWN /paperclip mount ... the pod's identically-spelled path
+  // resolves to nothing") — reached through a second variable that nothing guards.
+  //
+  // Measured 2026-11-07 on the live Cto pod (claude_k8s, external bundle):
+  //   the exported agent-home path -> <instanceRoot>/workspaces/<agentId> -> ENOENT
+  //   ls /paperclip/instances/default                                     -> data  skills
+  // and 4 of 4 `$AGENT_HOME`-relative paths in the `para-memory-files` skill — which
+  // is MANDATED via `desiredSkills` for at least one seat — resolve to nothing.
+  //
+  // The fix is the one opencode_k8s already shipped: for an "external" instructions
+  // bundle, point AGENT_HOME at `instructionsRootPath`. That root is the per-seat
+  // CephFS dir on the `paperclip-data` PVC, and THIS adapter already binds it into the
+  // pod (`agentBundleRoot` -> `resolveScopedWritableMounts`), so it is mounted, durable
+  // and writable by construction. It is also where the charter's companions actually
+  // live, so `$AGENT_HOME/{HEARTBEAT,SOUL,TOOLS}.md` resolve for the first time.
+  //
+  // NOTE for anyone porting from the sibling tree: opencode_k8s's comment at this same
+  // call site asserts "claude_k8s agents (whose AGENT_HOME already IS the bundle dir)
+  // worked". That premise is FALSE and was never measured here — this adapter had no
+  // such branch until now, which is exactly why the bug survived the fix that named it.
+  //
+  // Falls back to the server-provided workspace agentHome when no external bundle is
+  // configured (single-file / legacy agents — unchanged).
+  const instructionsBundleMode = asString(config.instructionsBundleMode, "").trim();
+  const instructionsRootPathForHome = asString(config.instructionsRootPath, "").trim();
+  const externalBundleHome =
+    instructionsBundleMode === "external" && instructionsRootPathForHome ? instructionsRootPathForHome : "";
+  setIfPresent("AGENT_HOME", externalBundleHome || workspaceContext.agentHome);
 
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
