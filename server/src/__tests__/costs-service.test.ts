@@ -297,6 +297,37 @@ describe("cost routes", () => {
       expect(() => assertByProjectWindowWithinCap({ to: now }, now)).toThrow(/'from' is required/i);
     });
 
+    it("rejects an inverted range instead of letting a negative span pass the cap", async () => {
+      const { assertByProjectWindowWithinCap } = await loadCostParsers();
+      expect(() => assertByProjectWindowWithinCap({ from: now, to: daysBefore(1) }, now))
+        .toThrow(/'to' precedes 'from'/i);
+    });
+
+    // The unit tests above call the guard directly, so on their own they cannot
+    // show the ROUTE calls it -- nor that it runs BEFORE the query, which is the
+    // whole point: the cost of this statement is paid in full even when it is
+    // cancelled, so refusing after the call would not prevent the shed.
+    it("refuses a wide window at the route, without reaching the cost service", async () => {
+      const app = await createApp();
+      const res = await request(app)
+        .get("/api/companies/company-1/costs/by-project")
+        .query({ from: "2026-10-01T00:00:00.000Z", to: "2026-10-31T00:00:00.000Z" });
+
+      expect(res.status).toBe(400);
+      expect(res.body.details?.code).toBe("window_too_wide");
+      expect(mockCostService.byProject).not.toHaveBeenCalled();
+    });
+
+    it("serves a window within the cap at the route", async () => {
+      const app = await createApp();
+      const res = await request(app)
+        .get("/api/companies/company-1/costs/by-project")
+        .query({ from: "2026-10-28T00:00:00.000Z", to: "2026-10-31T00:00:00.000Z" });
+
+      expect(res.status).toBe(200);
+      expect(mockCostService.byProject).toHaveBeenCalled();
+    });
+
     it("refuses before the query runs, as a 400 rather than a 503", async () => {
       const { assertByProjectWindowWithinCap } = await loadCostParsers();
       try {

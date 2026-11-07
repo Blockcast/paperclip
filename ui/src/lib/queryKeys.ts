@@ -359,6 +359,10 @@ export const queryKeys = {
   activity: (companyId: string) => ["activity", companyId] as const,
   costs: (companyId: string, from?: string, to?: string) =>
     ["costs", companyId, from, to] as const,
+  // PEN-5591: `by-project` is fetched on its own key, not inside the `costs`
+  // bundle, so that its failure cannot take the rest of the overview with it.
+  costsByProject: (companyId: string, from?: string, to?: string) =>
+    ["costs-by-project", companyId, from, to] as const,
   usageByProvider: (companyId: string, from?: string, to?: string) =>
     ["usage-by-provider", companyId, from, to] as const,
   usageByBiller: (companyId: string, from?: string, to?: string) =>
