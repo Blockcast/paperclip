@@ -23,6 +23,17 @@ function readBudget(): string {
   return readFileSync(BUDGET_PATH, "utf8");
 }
 
+const VALUES_PATH = fileURLToPath(
+  new URL("../../../deploy/helm/paperclip/values.blockcast.yaml", import.meta.url),
+);
+
+/** `  <key>: <int>` directly under the top-level `<block>:` of the deployed values. */
+function readValuesInt(values: string, block: string, key: string): number {
+  const body = values.match(new RegExp(`^${block}:\\n((?:(?: .*|#.*)?\\n)*)`, "m"));
+  if (!body) throw new Error(`values.blockcast.yaml has no top-level \`${block}:\``);
+  return readNumber(body[1], new RegExp(`^  ${key}: *(\\d+) *$`, "m"), `${block}.${key}`);
+}
+
 function readNumber(doc: string, pattern: RegExp, label: string): number {
   const match = doc.match(pattern);
   if (!match) throw new Error(`budget doc does not state ${label}`);
@@ -40,6 +51,21 @@ describe("postgres connection budget", () => {
     // rather than just this number — the whole point of the row is that the
     // constant must stay derived from a budget, not restated in prose.
     expect(stated).toBe(POSTGRES_POOL_MAX);
+  });
+
+  it("counts peak processes from the deployed replica counts", () => {
+    // BLO-49067: the doc's peak-process line was the only consumer-model input
+    // with no tie to what actually deploys. BLO-45764 set worker replicas 1 -> 2,
+    // peak went 4 -> 5, and this file stayed green while 5 x 18 overflowed the
+    // budget. API rollouts surge by maxSurge; the worker StatefulSet replaces in
+    // place and never surges, so it contributes exactly its replicas.
+    const values = readFileSync(VALUES_PATH, "utf8");
+    const derived =
+      readValuesInt(values, "api", "replicas") +
+      readValuesInt(values, "api", "maxSurge") +
+      readValuesInt(values, "worker", "replicas");
+    const stated = readNumber(readBudget(), /^[÷/] *(\d+) +peak processes/m, "peak processes");
+    expect(stated).toBe(derived);
   });
 
   it("keeps peak demand inside the server's ceiling with the stated margin", () => {
