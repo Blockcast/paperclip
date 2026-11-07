@@ -84,6 +84,7 @@ async function createIssue(
     projectId?: string | null;
     parentId?: string | null;
     assigneeAgentId?: string | null;
+    assigneeUserId?: string | null;
     createdByAgentId?: string | null;
     originKind?: string | null;
     originId?: string | null;
@@ -100,6 +101,7 @@ async function createIssue(
       projectId: input.projectId ?? null,
       parentId: input.parentId ?? null,
       assigneeAgentId: input.assigneeAgentId ?? null,
+      assigneeUserId: input.assigneeUserId ?? null,
       createdByAgentId: input.createdByAgentId ?? null,
       originKind: input.originKind ?? "manual",
       originId: input.originId ?? null,
@@ -2307,7 +2309,35 @@ describeEmbeddedPostgres("authorization service", () => {
 
     // CONTROL on the caller-supplied short-circuit: a supplied `originKind` is
     // still answered without a row read, so the `undefined` / `null`
-    // distinction the branch is built around survives the guard.
+    // distinction the branch is built around survives the guard. Taken on a
+    // READABLE row — see the next case for why it moved off the foreign one.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: ownIssue.id,
+        assigneeAgentId: actor.id,
+        currentAssigneeAgentId: null,
+        originKind: null,
+      },
+    })).resolves.toMatchObject({ allowed: true });
+
+    // PEN-5940, and a deliberate tightening: supplying `originKind: null` no
+    // longer buys a foreign row an allow. The short-circuit above answers THIS
+    // guard's question without a read, but the human-held guard added for
+    // PEN-5940 asks a second one — "does a person hold this row?" — and the
+    // caller supplied no `currentAssigneeUserId`, so it reloads and finds the
+    // row unreadable. Both guards treat unreadable as blocking, for the same
+    // reason: an id this company cannot read is foreign or dangling, not "a row
+    // nobody holds".
+    //
+    // No production caller is affected. `previewAssignment` /
+    // `explainAssignment` pass neither field (plugin-host-services.ts:3406,
+    // 3422), so a foreign row from them already took the `undefined` path and
+    // was already denied above; this case is reachable only by a caller that
+    // asserts an origin kind for a row it cannot read.
     await expect(authorization.decide({
       actor: actorContext,
       action: "tasks:assign",
@@ -2319,7 +2349,7 @@ describeEmbeddedPostgres("authorization service", () => {
         currentAssigneeAgentId: null,
         originKind: null,
       },
-    })).resolves.toMatchObject({ allowed: true });
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
   });
 
   it("does not let an agent self-appoint onto a review shell through tasks:assign", async () => {
@@ -2420,8 +2450,114 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: true });
   });
 
-  it("leaves recovery and liveness shells claimable when they lose their assignee", async () => {
-    // These two kinds confer no downstream grant and exist to unstick stalled
+  it("does not let an agent reassign a row a person holds, to itself or anyone else", async () => {
+    // PEN-5940. The sibling guard above asks what the row IS; this one asks who
+    // HOLDS it. `assigneeUserId` on this resource cannot answer that — on
+    // `tasks:assign` it is the assignment TARGET, which is what the low-trust
+    // and task-bridge guards read — so the question had no field at all and
+    // POST /issues/:id/checkout could take a row a person was holding.
+    const company = await createCompany(db, "HumanHeldRowNotReassignable");
+    const actor = await createAgent(db, company.id, { role: "engineer" });
+    const other = await createAgent(db, company.id, { role: "engineer" });
+    const holder = await createUser(db);
+    const authorization = authorizationService(db);
+    const actorContext = { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_key" } as const;
+
+    const humanHeldIssue = await createIssue(db, company.id, {
+      title: "Confirmation gate a person owns",
+      assigneeAgentId: null,
+      assigneeUserId: holder,
+      originKind: "manual",
+    });
+    const agentHeldIssue = await createIssue(db, company.id, {
+      title: "Ordinary agent work",
+      assigneeAgentId: other.id,
+      originKind: "manual",
+    });
+
+    // The self-claim the remediation text used to recommend.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: humanHeldIssue.id,
+        assigneeAgentId: actor.id,
+        assigneeUserId: null,
+        currentAssigneeAgentId: null,
+        currentAssigneeUserId: holder,
+        originKind: "manual",
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // And the one-hop version of it. Scoping this guard to self-claims — the way
+    // the BLO-19094 guard above is scoped — would leave this open and the
+    // escalation intact, just longer.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: humanHeldIssue.id,
+        assigneeAgentId: other.id,
+        assigneeUserId: null,
+        currentAssigneeAgentId: null,
+        currentAssigneeUserId: holder,
+        originKind: "manual",
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // The guard must reload the row rather than fail open when the caller did
+    // not supply the field. This is the half that makes the route change
+    // load-bearing in the other direction: a caller that forgets it still gets
+    // the right answer, and only pays a read for it.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: humanHeldIssue.id,
+        assigneeAgentId: actor.id,
+        originKind: "manual",
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+
+    // A row no person holds is untouched — this guard is about who holds the
+    // row, not about checkout in general.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: agentHeldIssue.id,
+        assigneeAgentId: actor.id,
+        assigneeUserId: null,
+        currentAssigneeAgentId: other.id,
+        currentAssigneeUserId: null,
+        originKind: "manual",
+      },
+    })).resolves.toMatchObject({ allowed: true });
+
+    // ... including through the reload path, so the fallback cannot be the
+    // thing that makes every ordinary claim fail.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "tasks:assign",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: agentHeldIssue.id,
+        assigneeAgentId: actor.id,
+        originKind: "manual",
+      },
+    })).resolves.toMatchObject({ allowed: true });
+  });
+
+  it("leaves recovery and liveness shells claimable when they lose their assignee", async () => {    // These two kinds confer no downstream grant and exist to unstick stalled
     // work — an unassigned stranded-recovery row is a normal reachable state
     // (it inherits a null assignee from its source). Freezing them on assignee
     // loss would deadlock the mechanism that unfreezes the graph, so they are
