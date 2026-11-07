@@ -2675,6 +2675,87 @@ async function labelMapForIssues(dbOrTx: any, issueIds: string[]): Promise<Map<s
   return map;
 }
 
+/**
+ * PEN-5876: append the revision rows for a write that touched the guarded
+ * scalar text field set (`title` + `description`), and repoint the issue at the
+ * newest one. Returns the new pointer, or `null` when nothing was recorded.
+ *
+ * ⛔ Shared because the field set has TWO writers, not one. `update:` is the
+ * obvious one; the `pr_review` dedupe branch in `create:` also rewrites both
+ * fields on an EXISTING row. A history that covers only one of them is worse
+ * than no history at all: the pointer stays where it was, so a later PATCH
+ * carrying the pre-rewrite `baseRevisionId` still MATCHES and the compare-and-set
+ * reports success over text it has just destroyed — a guard that reads as
+ * protection and is not one. (Ally review of #3509.)
+ *
+ * The caller must already hold the row's `FOR UPDATE` lock: revision numbering
+ * is read-then-write, so without it two concurrent writers can mint the same
+ * `revisionNumber`.
+ */
+async function recordIssueFieldRevisions(
+  tx: any,
+  before: typeof issues.$inferSelect,
+  after: typeof issues.$inferSelect,
+  attribution: {
+    actorAgentId?: string | null;
+    actorUserId?: string | null;
+    actorRunId?: string | null;
+    changeSummary?: string | null;
+  },
+): Promise<{ latestFieldRevisionId: string; latestFieldRevisionNumber: number } | null> {
+  const revisionRows: Array<typeof issueFieldRevisions.$inferInsert> = [];
+  let nextRevisionNumber = before.latestFieldRevisionNumber ?? 0;
+  // Lazily seed a baseline from the PRE-write state the first time a row's
+  // field set is written. Without it, the one revision anybody actually wants
+  // back — the text that was just overwritten — is the one the history lacks.
+  if (nextRevisionNumber === 0) {
+    nextRevisionNumber += 1;
+    revisionRows.push({
+      companyId: before.companyId,
+      issueId: before.id,
+      revisionNumber: nextRevisionNumber,
+      title: before.title,
+      description: before.description,
+      changeSummary: "baseline recorded before the first guarded field write",
+      createdByAgentId: null,
+      createdByUserId: null,
+      createdByRunId: null,
+    });
+  }
+  nextRevisionNumber += 1;
+  revisionRows.push({
+    companyId: after.companyId,
+    issueId: after.id,
+    revisionNumber: nextRevisionNumber,
+    title: after.title,
+    description: after.description,
+    changeSummary: attribution.changeSummary ?? null,
+    createdByAgentId: attribution.actorAgentId ?? null,
+    createdByUserId: attribution.actorUserId ?? null,
+    // The column the second measured instance turned on: a write that landed
+    // and announced itself on no row at all. Attribution survived there only
+    // by residue and luck; this is the record.
+    createdByRunId: attribution.actorRunId ?? null,
+  });
+
+  const inserted = await tx.insert(issueFieldRevisions).values(revisionRows).returning();
+  const latest = inserted[inserted.length - 1];
+  if (!latest) return null;
+  const [repointed] = await tx
+    .update(issues)
+    .set({
+      latestFieldRevisionId: latest.id,
+      latestFieldRevisionNumber: latest.revisionNumber,
+    })
+    .where(eq(issues.id, after.id))
+    .returning();
+  if (!repointed) return null;
+  return {
+    latestFieldRevisionId: repointed.latestFieldRevisionId as string,
+    latestFieldRevisionNumber: repointed.latestFieldRevisionNumber as number,
+  };
+}
+
 async function withIssueLabels<T extends IssueRow>(
   dbOrTx: any,
   rows: T[],
@@ -11500,15 +11581,55 @@ export function issueService(db: Db) {
             }
           }
           if (existingIssue && !staleHead) {
+            // PEN-5876: this branch is the field set's SECOND writer. Lock the
+            // row and keep its pre-write text, so the rewrite below is recorded
+            // in the revision history on the same terms as a PATCH. Left
+            // unrecorded it would leave `latest_field_revision_id` pointing at
+            // the pre-rewrite revision, and a later PATCH carrying that id as
+            // `baseRevisionId` would MATCH and overwrite text the CAS was meant
+            // to protect. (Ally review of #3509.)
+            //
+            // The lock is taken HERE and not at the dedupe SELECT above on
+            // purpose: that select is followed by a GitHub head-SHA fetch with a
+            // 5s timeout, and a row lock must not be held across network I/O.
+            await tx.execute(
+              sql`SELECT ${issues.id} FROM ${issues}
+                  WHERE ${eq(issues.id, existingIssue.id)}
+                  FOR UPDATE`,
+            );
+            const [beforeRewrite] = await tx
+              .select()
+              .from(issues)
+              .where(eq(issues.id, existingIssue.id));
+            const preRewrite = beforeRewrite ?? existingIssue;
             [existingIssue] = await tx
               .update(issues)
               .set({
                 title: issueData.title,
-                description: issueData.description ?? existingIssue.description,
+                description: issueData.description ?? preRewrite.description,
                 updatedAt: new Date(),
               })
               .where(eq(issues.id, existingIssue.id))
               .returning();
+            const repointed = await recordIssueFieldRevisions(
+              tx,
+              preRewrite,
+              existingIssue,
+              {
+                // Attributed to the run that filed the duplicate, not left
+                // anonymous: "whose text is this?" is half of what the history
+                // exists to answer, and this path is precisely one where the
+                // rewrite announces itself on no row at all.
+                actorAgentId: issueData.createdByAgentId ?? null,
+                actorUserId: issueData.createdByUserId ?? null,
+                actorRunId: actorRunId ?? null,
+                changeSummary: "pr_review dedupe retargeted this row onto a newer filing",
+              },
+            );
+            if (repointed) {
+              existingIssue.latestFieldRevisionId = repointed.latestFieldRevisionId;
+              existingIssue.latestFieldRevisionNumber = repointed.latestFieldRevisionNumber;
+            }
             deduplicationReason = "pr_review_target";
           }
         }
@@ -12205,8 +12326,18 @@ export function issueService(db: Db) {
          * others: only the WHERE is re-evaluated against the latest row version
          * when the statement blocks on a concurrent transaction, so a snapshot
          * comparison alone would leave the very window this guards.
+         *
+         * ⛔ `null` is MEANINGFUL and distinct from omission: it asserts "this
+         * row has no revision yet", which is the state EVERY row predating this
+         * feature is in. Without it no legacy row could protect its FIRST edit
+         * — any uuid is stale by construction against a NULL pointer — so two
+         * runs that both read a never-revised row could only write unguarded,
+         * which is the exact lost update this was filed for.
+         * `paperclipUpsertIssueDocument` already takes `null` for the same "no
+         * revision yet" case; matching it is what "do not invent a second
+         * shape" means here. (Ally review of #3509.)
          */
-        expectedCurrentFieldRevisionId?: string;
+        expectedCurrentFieldRevisionId?: string | null;
         /**
          * Pins the execution-stage snapshot that authorized a decision. A
          * concurrent decision or stage advance must not be overwritten by a
@@ -12977,13 +13108,19 @@ export function issueService(db: Db) {
                   ? isNull(issues.executionRunId)
                   : eq(issues.executionRunId, expectedCurrentExecutionRunId),
               ]),
-          // PEN-5876: the compare-and-set itself. A row that has never been
-          // revised has a NULL pointer, so any supplied base revision is stale
-          // by definition — mirroring the "document does not exist yet" branch
-          // the pipeline document route already takes.
+          // PEN-5876: the compare-and-set itself. `null` asserts "no revision
+          // yet" and must become an IS NULL test, not an equality: `col = NULL`
+          // matches nothing in SQL, so an equality arm here would make every
+          // never-revised row — i.e. every row predating this feature —
+          // unprotectable on its first edit, which is the lost update this was
+          // filed for. Same shape as the `expectedCurrent*` arms above.
           ...(expectedCurrentFieldRevisionId === undefined
             ? []
-            : [eq(issues.latestFieldRevisionId, expectedCurrentFieldRevisionId)]),
+            : [
+                expectedCurrentFieldRevisionId === null
+                  ? isNull(issues.latestFieldRevisionId)
+                  : eq(issues.latestFieldRevisionId, expectedCurrentFieldRevisionId),
+              ]),
           ...(expectedCurrentExecutionState === undefined
             ? []
             : [
@@ -13025,6 +13162,24 @@ export function issueService(db: Db) {
           // above — the precondition genuinely failed, so surface 409 rather
           // than the 404 that a bare `return null` would produce.
           if (writePreconditions.length > 0) {
+            // PEN-5876: WHICH arm of the WHERE missed is not knowable from the
+            // row count — several preconditions share it. Stamping
+            // `stale_base_revision` merely because a base revision was supplied
+            // sends a caller that rebases on the code round-tripping against the
+            // wrong cause when the real failure was status, assignee or
+            // execution ownership. Claim the code only when the pointer is
+            // genuinely the thing that moved. (Ally review of #3509.)
+            //
+            // `lockedExisting` is the right operand and needs no extra query:
+            // it was read under the `FOR UPDATE` lock this transaction still
+            // holds, so it is exactly the row version the UPDATE's WHERE was
+            // evaluated against. The pre-check above compares a DIFFERENT read
+            // — `existing`, taken before the lock — which is why this branch is
+            // reachable at all.
+            const fieldRevisionActuallyStale =
+              expectedCurrentFieldRevisionId !== undefined &&
+              (lockedExisting.latestFieldRevisionId ?? null) !==
+                (expectedCurrentFieldRevisionId ?? null);
             throw conflict("Issue changed before the update could be applied", {
               issueId: id,
               ...(expectedCurrentStatus === undefined ? {} : { expectedStatus: expectedCurrentStatus }),
@@ -13039,7 +13194,10 @@ export function issueService(db: Db) {
                 : { expectedExecutionRunId: expectedCurrentExecutionRunId }),
               ...(expectedCurrentFieldRevisionId === undefined
                 ? {}
-                : { code: "stale_base_revision", expectedRevisionId: expectedCurrentFieldRevisionId }),
+                : {
+                    expectedRevisionId: expectedCurrentFieldRevisionId,
+                    ...(fieldRevisionActuallyStale ? { code: "stale_base_revision" } : {}),
+                  }),
               ...(expectedCurrentExecutionState === undefined
                 ? {}
                 : { expectedExecutionState: true }),
@@ -13121,52 +13279,11 @@ export function issueService(db: Db) {
         // never wrote". A history covering only opted-in writers would
         // reproduce that gap for everyone else.
         if (touchesGuardedFieldSet) {
-          const revisionRows: Array<typeof issueFieldRevisions.$inferInsert> = [];
-          let nextRevisionNumber = lockedExisting.latestFieldRevisionNumber;
-          // Lazily seed a baseline from the PRE-write state the first time a
-          // row's field set is written. Without it, the one revision anybody
-          // actually wants back — the text that was just overwritten — is the
-          // one the history does not hold.
-          if (nextRevisionNumber === 0) {
-            nextRevisionNumber += 1;
-            revisionRows.push({
-              companyId: lockedExisting.companyId,
-              issueId: lockedExisting.id,
-              revisionNumber: nextRevisionNumber,
-              title: lockedExisting.title,
-              description: lockedExisting.description,
-              changeSummary: "baseline recorded before the first guarded field write",
-              createdByAgentId: null,
-              createdByUserId: null,
-              createdByRunId: null,
-            });
-          }
-          nextRevisionNumber += 1;
-          revisionRows.push({
-            companyId: updated.companyId,
-            issueId: updated.id,
-            revisionNumber: nextRevisionNumber,
-            title: updated.title,
-            description: updated.description,
-            changeSummary: null,
-            createdByAgentId: actorAgentId ?? null,
-            createdByUserId: actorUserId ?? null,
-            // The column the second measured instance turned on: a write that
-            // landed and announced itself on no row at all. Attribution
-            // survived there only by residue and luck; this is the record.
-            createdByRunId: actorRunId ?? null,
+          const repointed = await recordIssueFieldRevisions(tx, lockedExisting, updated, {
+            actorAgentId,
+            actorUserId,
+            actorRunId,
           });
-
-          const inserted = await tx.insert(issueFieldRevisions).values(revisionRows).returning();
-          const latest = inserted[inserted.length - 1];
-          const [repointed] = await tx
-            .update(issues)
-            .set({
-              latestFieldRevisionId: latest.id,
-              latestFieldRevisionNumber: latest.revisionNumber,
-            })
-            .where(eq(issues.id, updated.id))
-            .returning();
           if (repointed) {
             updated.latestFieldRevisionId = repointed.latestFieldRevisionId;
             updated.latestFieldRevisionNumber = repointed.latestFieldRevisionNumber;
