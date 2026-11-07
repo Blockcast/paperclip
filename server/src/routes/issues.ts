@@ -15297,10 +15297,16 @@ export function issueRoutes(
     // somebody's issue, and checkout is not that. Checkout asks to TAKE the
     // row, and `svc.checkout` already answers no, atomically, in the claiming
     // UPDATE's own WHERE clause: `unassignedAgentCheckoutCondition` requires
-    // BOTH assignee columns null, the same-run arm requires the actor to be the
-    // agent assignee, and the recovery-owner arm (PEN-5940, #3508) carries the
-    // same `assigneeUserId` term. No arm can match a human-held row, so the row
-    // is never taken and this exemption grants nothing.
+    // BOTH assignee columns null, and the same-run arm requires the actor to be
+    // the agent assignee. The recovery-owner arm cannot apply here at all — it
+    // is built only when `allowSourceScopedRecoveryOwner` is passed, and this
+    // block already excludes that actor, before and after this change. So no
+    // arm can match a human-held row on any request that reaches this
+    // exemption, and it therefore grants nothing.
+    //
+    // (That arm does need an `assigneeUserId` term of its own, on the path that
+    // DOES enable it — a live `master` hole, independent of this PR, which
+    // PEN-5940 / #3508 closes. Nothing here depends on it landing first.)
     //
     // What it keeps is the hygiene. `clearStaleExecutionLock` runs INSIDE
     // `svc.checkout`, on the refusal path, and a refused checkout is the only
