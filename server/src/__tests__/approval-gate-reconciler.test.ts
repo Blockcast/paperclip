@@ -161,6 +161,7 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
       .select({
         status: approvals.status,
         decisionNote: approvals.decisionNote,
+        gateSatisfied: approvals.gateSatisfied,
         decidedAt: approvals.decidedAt,
       })
       .from(approvals)
@@ -225,6 +226,7 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     expect(row?.decidedAt).not.toBeNull();
     expect(row?.decisionNote).toContain("died undecided");
     expect(row?.decisionNote).toContain("32338832082");
+    expect(row?.gateSatisfied).toBe(false);
 
     const comments = await commentsFor(issueId);
     expect(comments).toHaveLength(1);
@@ -335,6 +337,8 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
 
     expect((await approvalRow(approvalId))?.status).toBe("cancelled");
     expect((await approvalRow(approvalId))?.decisionNote).toContain("completed before a decision");
+    // PEN-5885: the run-gate kind carries the same discriminator as the PR kind.
+    expect((await approvalRow(approvalId))?.gateSatisfied).toBe(true);
     const comments = await commentsFor(issueId);
     expect(comments[0]?.body).toContain("has already completed");
     expect(comments[0]?.body).not.toContain("died undecided");
@@ -703,6 +707,11 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     expect(row?.status).toBe("cancelled");
     expect(row?.decisionNote).toContain("pull request merged");
     expect(row?.decisionNote).toContain("Blockcast/paperclip#1122");
+    // PEN-5885: `status` is identical on both gate branches, so this column is the
+    // only structured trace of WHICH one ran. Dropping the write leaves the
+    // discriminator recoverable solely by matching the English above -- which is
+    // what let the board-decision gauge report twenty served asks as a dead channel.
+    expect(row?.gateSatisfied).toBe(true);
 
     const comments = await commentsFor(issueId);
     expect(comments[0]?.body).toContain("has merged");
@@ -758,6 +767,11 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
     expect(row?.status).toBe("cancelled");
     expect(row?.decisionNote).toContain("no live ask left");
     expect(row?.decisionNote).toContain("reopened");
+    // PEN-5885: `false`, never null. Null means "no gate adjudicated this row" and
+    // is what the decision gauge reads for ordinary cancellations; a gate that ran
+    // and found the PR closed unmerged is a measurement that WAS taken, and the
+    // answer was no. Collapsing the two loses the ability to say so.
+    expect(row?.gateSatisfied).toBe(false);
 
     const comments = await commentsFor(issueId);
     expect(comments[0]?.body).toContain("closed without merging");
