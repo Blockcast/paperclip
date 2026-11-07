@@ -54,6 +54,52 @@ const REVISION_REQUESTED_ACTIVITY = "approval.revision_requested";
 const PENDING_STATUS = "pending";
 
 /**
+ * Why the oldest-pending age is dated from `GREATEST(created_at, updated_at)`
+ * rather than `created_at` (PEN-5719).
+ *
+ * `resubmit` is the one write that returns a row to `pending`, and it keeps the
+ * original `created_at`. Dating the age from that column therefore bills the
+ * board for two spans it does not own: the stretch the card sat in
+ * `revision_requested` -- the REQUESTER's court, which {@link PENDING_STATUS}
+ * above is at pains to exclude from the depth gauge for exactly this reason --
+ * and the pre-revision stretch the board already discharged by ruling on it.
+ * The two gauges in this family then disagree about who owns revision time,
+ * and the starvation alert is the one that misattributes it.
+ *
+ * Not hypothetical: PEN-5719 fired on a card the board HAD served. Filed
+ * 10-30T03:11Z, `revision_requested` 11-03T01:26Z, resubmitted 11-04T09:33Z.
+ * At the 11-06T04:11Z firing its true pending age was 1.8d against a 7d
+ * threshold, but the gauge read 7.2d and the oldest-pending anchor jumped
+ * BACKWARDS 5h at the moment of resubmission -- visible in the range query as a
+ * +29039s step where every neighbour steps +10800s.
+ *
+ * `updated_at` is safe to read here for the same reason, and under the same
+ * proof, that `hasPendingBoardApprovalWakePath` in `recovery/service.ts` reads
+ * it: this query is scoped to `pending`, the column has no `$onUpdate` and no
+ * trigger, and of the eleven `update(approvals)` sites under `server/src`
+ * (`grep -rn 'update(approvals)' server/src --include='*.ts' | grep -v
+ * __tests__` -- re-runnable rather than asserted) the only one that leaves a
+ * row `pending` while touching `updated_at` is `resubmit`. The nearest miss is
+ * `services/agents.ts`, which edits `payload` on pending rows but does not set
+ * `updated_at`. So on a pending row the column carries exactly one signal:
+ * when this card most recently became the board's problem.
+ *
+ * GREATEST, not a bare `updated_at`, because `updated_at >= created_at` is a
+ * convention and rows that violate it already exist: pending approval
+ * `e1b6747a` carries an `updated_at` 1 ms BEFORE its `created_at`. On a bare
+ * `updated_at` such a row anchors EARLIER than it was filed and so reports an
+ * age LARGER than its true one -- reintroducing, by a different route, the
+ * very overstatement this constant exists to remove. GREATEST clamps the
+ * anchor so it can never precede the filing.
+ *
+ * Note it is `Math.max(0, ...)` at the call site, NOT this GREATEST, that
+ * keeps the age non-negative: a negative age needs an anchor in the FUTURE,
+ * and against that GREATEST is actively unhelpful, since it would prefer the
+ * future timestamp. The two guards cover opposite ends and are both load-bearing.
+ */
+const PENDING_SINCE = sql`greatest(${approvals.createdAt}, ${approvals.updatedAt})`;
+
+/**
  * Refresh the board-approval-queue depth/staleness gauges (BLO-29850).
  *
  * Follows the `refreshExternalRuntimeReservationStrandMetrics` shape (BLO-28865)
@@ -85,7 +131,7 @@ export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Pro
           requester,
           type: approvals.type,
           pending: sql<number | string>`count(*)`,
-          oldestCreatedAt: sql<Date | string | null>`min(${approvals.createdAt})`,
+          oldestPendingSince: sql<Date | string | null>`min(${PENDING_SINCE})`,
         })
         .from(approvals)
         .where(eq(approvals.status, PENDING_STATUS))
@@ -150,8 +196,8 @@ export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Pro
         requester: row.requester,
         type: row.type,
         pending: Number(row.pending),
-        oldestAgeSeconds: row.oldestCreatedAt
-          ? Math.max(0, (now.getTime() - new Date(row.oldestCreatedAt).getTime()) / 1000)
+        oldestAgeSeconds: row.oldestPendingSince
+          ? Math.max(0, (now.getTime() - new Date(row.oldestPendingSince).getTime()) / 1000)
           : 0,
       })),
     });
