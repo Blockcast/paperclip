@@ -43,7 +43,21 @@ Returns per-agent cost breakdown for the current month.
 GET /api/companies/{companyId}/costs/by-project
 ```
 
-Returns per-project cost breakdown for the current month.
+Returns per-project cost breakdown for the requested window.
+
+**`from` is required, and the window may be at most 5 days (PEN-5591).** Unlike the
+other cost aggregates, this one joins run-to-project attribution, which cannot be
+answered for a wider window inside the database statement timeout — and the attempt
+is what sheds unrelated routes, so it is refused up front with `400` rather than
+left to time out as `503`. A wider or unbounded range returns:
+
+```json
+{ "error": "costs/by-project window is 30.0 days; the maximum is 5. ...",
+  "details": { "code": "window_too_wide", "maxWindowDays": 5, "issue": "PEN-5591" } }
+```
+
+This is a stopgap, not the intended ceiling; it is lifted by durable forward
+project attribution, which removes the join entirely.
 
 ## Budget Management
 

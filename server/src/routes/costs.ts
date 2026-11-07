@@ -40,6 +40,76 @@ export function parseCostDateRange(query: Record<string, unknown>) {
 }
 
 /**
+ * PEN-5591: a window cap on `costs/by-project`, and ONLY on that route.
+ *
+ * This is a stopgap against a fleet-wide shed, not a fix. `by-project` joins
+ * `run_project_links`, whose cost does not scale with the window the caller
+ * asked for in the way the two previous narrowings (PEN-5585's window bound,
+ * PEN-5591's NULL-project bound) were meant to make it. Measured in production
+ * on 2026-11-07T09:1x-09:2xZ, against `cf90ee33` -- the first image carrying
+ * BOTH narrowings -- for the company that triggered the incident:
+ *
+ *   |  3 d | 200 | 0.5 - 1 s   |
+ *   |  5 d | 200 | 2.5 - 5 s   |
+ *   |  7 d | 200 | 20 - 30 s   |
+ *   | 10 d | 503 | > 30 s, cancelled by `statement_timeout`  |
+ *
+ * 14 d and 30 d are entailed `503` by monotonicity and were deliberately NOT
+ * driven: each costs a full 30 s of the burn this cap exists to prevent.
+ *
+ * Why 5 days and not 7, when 7 still answers `200`: the fleet-shed mechanism
+ * is the >30 s statement holding a connection while ten unrelated routes pass
+ * their own `statement_timeout` (PEN-5585, 191/191 `503`). A 7 d request at
+ * 20-30 s IS that burn -- it merely survives it. 5 d at 2.5-5 s keeps a 6-12x
+ * margin under the 30 s timeout, and the margin is what the cap is buying.
+ * The cliff also marches toward shorter windows as fleet activity accumulates,
+ * so a ceiling pinned to the longest window that still returns 200 falsifies
+ * itself within days.
+ *
+ * Retune this ONE constant when the successor lands; nothing else encodes it.
+ */
+export const BY_PROJECT_MAX_WINDOW_DAYS = 5;
+
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+/**
+ * Reject a `by-project` window wider than the cap, and reject an unbounded one.
+ *
+ * An absent `from` is NOT lenient -- it is the worst case, the full-history
+ * scan that cost 191/191 requests in the incident, so it is refused rather
+ * than defaulted. An absent `to` means "now", which is bounded and fine.
+ */
+export function assertByProjectWindowWithinCap(
+  range: { from?: Date; to?: Date } | undefined,
+  now: Date = new Date(),
+): void {
+  const from = range?.from;
+  if (!from) {
+    throw badRequest(
+      `'from' is required on costs/by-project and the window must be at most `
+      + `${BY_PROJECT_MAX_WINDOW_DAYS} days. An unbounded window cannot complete inside the `
+      + `database statement timeout and sheds unrelated routes (PEN-5591).`,
+      { code: "window_unbounded", maxWindowDays: BY_PROJECT_MAX_WINDOW_DAYS, issue: "PEN-5591" },
+    );
+  }
+  const to = range?.to ?? now;
+  const spanDays = (to.getTime() - from.getTime()) / MS_PER_DAY;
+  if (spanDays > BY_PROJECT_MAX_WINDOW_DAYS) {
+    throw badRequest(
+      `costs/by-project window is ${spanDays.toFixed(1)} days; the maximum is `
+      + `${BY_PROJECT_MAX_WINDOW_DAYS}. Wider windows cannot complete inside the database `
+      + `statement timeout and shed unrelated routes (PEN-5591). Request a shorter range.`,
+      {
+        code: "window_too_wide",
+        requestedWindowDays: Number(spanDays.toFixed(1)),
+        maxWindowDays: BY_PROJECT_MAX_WINDOW_DAYS,
+        issue: "PEN-5591",
+      },
+    );
+  }
+}
+
+/**
  * PEN-4902: `agentId` on the agent-keyed cost aggregates. Previously accepted
  * and dropped — the route read `companyId` and the date range and nothing
  * else — so a per-seat request answered with all nine seats and a caller
@@ -340,6 +410,9 @@ export function costRoutes(
     assertCompanyAccess(req, companyId);
     if (!(await assertCompanyCostReadAllowed(req, res, companyId))) return;
     const range = parseCostDateRange(req.query);
+    // PEN-5591: refuse before touching the database -- the cost of this query is
+    // paid in full even when it is cancelled, so the cap has to gate the call.
+    assertByProjectWindowWithinCap(range);
     const rows = await costs.byProject(companyId, range);
     res.json(rows);
   });
