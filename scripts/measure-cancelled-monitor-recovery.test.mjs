@@ -3,6 +3,8 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import {
+  carriersBySource,
+  classifyMultiCarrier,
   classifyRow,
   destroyedDueTimes,
   findHandoffFailures,
@@ -12,6 +14,7 @@ import {
   isMainModule,
   isOwnerlessSource,
   nextCursor,
+  recoveryObligationKeys,
   summarize,
 } from "./measure-cancelled-monitor-recovery.mjs";
 
@@ -26,6 +29,22 @@ function issue(overrides = {}) {
     monitorNextCheckAt: null,
     executionState: { monitor: { clearReason: "cancelled", ...monitor } },
     ...rest,
+  };
+}
+
+/**
+ * One `issue.monitor_recovery_issue_created` row. `details.nextCheckAt` on THIS
+ * action is `performIssueMonitorRecovery`'s `scheduledAtIso`, which the
+ * cancelled-monitor pass supplies as `monitorState.clearedAt` — so it names the
+ * clear this recovery discharged, one value per obligation. The identically
+ * named field on `issue.monitor_cleared_undeliverable` holds the destroyed DUE
+ * time instead; the two are not equal and are never joined on.
+ */
+function recoveryEvent(clearedAt) {
+  return {
+    action: "issue.monitor_recovery_issue_created",
+    createdAt: "2026-11-05T19:25:47.888Z",
+    details: { clearReason: "cancelled", nextCheckAt: clearedAt, recoveryIdentifier: "PEN-5694" },
   };
 }
 
@@ -119,35 +138,148 @@ describe("summarize", () => {
   });
 });
 
+describe("recoveryObligationKeys", () => {
+  it("keys each recovery on the clear it discharged and collapses re-drives", () => {
+    // Two clears on a recycled row, plus a re-drive of the FIRST one: the pass
+    // crashed between emit and stamp, re-entered, reused the carrier, and logged
+    // the same clearedAt again. Three events, two obligations, two carriers.
+    const found = recoveryObligationKeys([
+      recoveryEvent("2026-11-05T01:30:34.554Z"),
+      recoveryEvent("2026-11-05T01:30:34.554Z"),
+      recoveryEvent("2026-11-05T19:24:08.284Z"),
+      { action: "issue.monitor_cleared_undeliverable", details: { nextCheckAt: "2026-11-05T06:30:00.000Z" } },
+    ]);
+    assert.deepEqual(found, { events: 3, distinct: 2, unkeyed: 0 });
+  });
+
+  it("counts an unkeyed recovery event rather than silently dropping it", () => {
+    assert.deepEqual(recoveryObligationKeys([recoveryEvent(null), recoveryEvent("2026-11-05T01:30:34.554Z")]), {
+      events: 2,
+      distinct: 1,
+      unkeyed: 1,
+    });
+    assert.deepEqual(recoveryObligationKeys([]), { events: 0, distinct: 0, unkeyed: 0 });
+    assert.deepEqual(recoveryObligationKeys(undefined), { events: 0, distinct: 0, unkeyed: 0 });
+  });
+});
+
+describe("classifyMultiCarrier", () => {
+  it("clears a recycled row whose carriers each discharge their own clear", () => {
+    const { verdict } = classifyMultiCarrier(2, [
+      recoveryEvent("2026-11-05T01:30:34.554Z"),
+      recoveryEvent("2026-11-05T19:24:08.284Z"),
+    ]);
+    assert.equal(verdict, "ok");
+  });
+
+  it("reports two carriers for ONE clear as duplicated", () => {
+    const { verdict, detail } = classifyMultiCarrier(2, [
+      recoveryEvent("2026-11-05T01:30:34.554Z"),
+      recoveryEvent("2026-11-05T01:30:34.554Z"),
+    ]);
+    assert.equal(verdict, "duplicated");
+    assert.match(detail, /2 carriers across 1 distinct obligation\b/);
+  });
+
+  it("refuses to decide when the obligation count is not established", () => {
+    // No feed at all.
+    assert.equal(classifyMultiCarrier(2, undefined).verdict, "unresolved");
+    // An event that cannot be attributed to a clear.
+    assert.equal(
+      classifyMultiCarrier(2, [recoveryEvent(null), recoveryEvent("2026-11-05T01:30:34.554Z")]).verdict,
+      "unresolved",
+    );
+    // FEWER events than carriers. The server's creation log is best-effort (its
+    // rejection is swallowed to keep the committed carrier discoverable by
+    // originId), so a lost line is a designed-for state, and under it "two
+    // carriers, one event" cannot be told from one obligation emitted twice.
+    const short = classifyMultiCarrier(2, [recoveryEvent("2026-11-05T01:30:34.554Z")]);
+    assert.equal(short.verdict, "unresolved");
+    assert.match(short.detail, /best-effort/);
+  });
+
+  it("never asserts a count it has not established", () => {
+    for (const feed of [undefined, [recoveryEvent(null)], [recoveryEvent("2026-11-05T01:30:34.554Z")]]) {
+      assert.doesNotMatch(classifyMultiCarrier(2, feed).detail, /for one obligation/);
+    }
+  });
+});
+
+describe("carriersBySource", () => {
+  it("groups carriers by the source row they were emitted for", () => {
+    const grouped = carriersBySource([{ originId: "a" }, { originId: "b" }, { originId: "a" }]);
+    assert.equal(grouped.get("a").length, 2);
+    assert.equal(grouped.get("b").length, 1);
+    assert.equal(grouped.get("c"), undefined);
+    assert.equal(carriersBySource(undefined).size, 0);
+  });
+});
+
 describe("findHandoffFailures", () => {
   const stamped = issue({ monitor: { recoveryEmittedAt: "2026-11-03T18:00:00.000Z" } });
+  const carrier = () => ({ originId: stamped.id });
 
   it("reports a stamped row with no carrier — the one reading that falsifies the design", () => {
-    const { lost, duplicated } = findHandoffFailures([stamped], []);
+    const { lost, duplicated, unresolved } = findHandoffFailures([stamped], []);
     assert.equal(lost.length, 1);
     assert.equal(lost[0].identifier, "PEN-4835");
     // The source id travels with the finding so the re-check never has to look
     // the row back up by identifier, which can miss and throw.
     assert.equal(lost[0].id, stamped.id);
     assert.equal(duplicated.length, 0);
+    assert.equal(unresolved.length, 0);
   });
 
-  it("reports two carriers for one obligation separately from a lost one", () => {
+  it("does NOT report a re-flapped row whose two carriers discharge two clears", () => {
+    // PEN-5838, measured on PEN-4917: 9 cancelled clears, 2 recoveries, 2
+    // carriers. An alert row is recycled, so it incurs a new obligation on every
+    // flap — this is the common case in the only corpus this instrument is ever
+    // pointed at, and keying on originId alone reported it as a fault.
+    const feeds = new Map([
+      [
+        stamped.id,
+        [recoveryEvent("2026-11-05T01:30:34.554Z"), recoveryEvent("2026-11-05T19:24:08.284Z")],
+      ],
+    ]);
+    const { lost, duplicated, unresolved } = findHandoffFailures(
+      [stamped],
+      [carrier(), carrier()],
+      feeds,
+    );
+    assert.deepEqual({ lost, duplicated, unresolved }, { lost: [], duplicated: [], unresolved: [] });
+  });
+
+  it("still reports two carriers that discharge the SAME clear", () => {
     // The single-flight gap: a duplicate carrier still carries the obligation,
     // so this is a defect but not a falsification of the handoff.
-    const carriers = [{ originId: stamped.id }, { originId: stamped.id }];
-    const { lost, duplicated } = findHandoffFailures([stamped], carriers);
+    const feeds = new Map([
+      [stamped.id, [recoveryEvent("2026-11-05T01:30:34.554Z"), recoveryEvent("2026-11-05T01:30:34.554Z")]],
+    ]);
+    const { lost, duplicated, unresolved } = findHandoffFailures(
+      [stamped],
+      [carrier(), carrier()],
+      feeds,
+    );
     assert.equal(lost.length, 0);
+    assert.equal(unresolved.length, 0);
     assert.equal(duplicated.length, 1);
-    assert.match(duplicated[0].detail, /2 carriers/);
+    assert.match(duplicated[0].detail, /2 carriers across 1 distinct obligation\b/);
+  });
+
+  it("parks a multi-carrier row with no readable feed under unresolved, not duplicated", () => {
+    const { duplicated, unresolved } = findHandoffFailures([stamped], [carrier(), carrier()]);
+    assert.equal(duplicated.length, 0);
+    assert.equal(unresolved.length, 1);
+    assert.equal(unresolved[0].id, stamped.id);
+    assert.match(unresolved[0].detail, /not established/);
   });
 
   it("is silent on a correctly handed-back row and on an unstamped one", () => {
-    const ok = findHandoffFailures([stamped], [{ originId: stamped.id }]);
-    assert.deepEqual(ok, { lost: [], duplicated: [] });
+    const ok = findHandoffFailures([stamped], [carrier()]);
+    assert.deepEqual(ok, { lost: [], duplicated: [], unresolved: [] });
     // Unstamped rows are still owed, not failures — they are the `owed` count.
     const unstamped = findHandoffFailures([issue()], []);
-    assert.deepEqual(unstamped, { lost: [], duplicated: [] });
+    assert.deepEqual(unstamped, { lost: [], duplicated: [], unresolved: [] });
   });
 });
 
