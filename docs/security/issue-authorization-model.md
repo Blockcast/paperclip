@@ -324,11 +324,17 @@ denial, and that exemption is keyed on the reason string
 The denial says *a person holds this row, so generic unassigned-issue access
 stops short of the write* — a statement about writing to somebody else's issue.
 Checkout is not that: it asks to **take** the row, and the service already
-answers no in the claiming `UPDATE`'s own `WHERE` clause. Every arm fails on a
-human-held row — `unassignedAgentCheckoutCondition` requires **both** assignee
-columns null, the same-run arm requires the actor to be the agent assignee, and
-the source-scoped recovery-owner arm carries the same `assigneeUserId` term
-since `PEN-5940`. So the exemption grants nothing; the row is never taken.
+answers no in the claiming `UPDATE`'s own `WHERE` clause.
+`unassignedAgentCheckoutCondition` requires **both** assignee columns null, and
+the same-run arm requires the actor to be the agent assignee. The source-scoped
+recovery-owner arm cannot apply here at all: it is built only when
+`allowSourceScopedRecoveryOwner` is passed, and that actor is already exempt
+from this boundary check. So no arm can match a human-held row on any request
+that reaches the exemption; it grants nothing.
+
+> That recovery-owner arm separately wants an `assigneeUserId` term of its own,
+> on the path that *does* enable it — a live `master` gap independent of this
+> change, closed by `PEN-5940`. The delegation here does not rest on it.
 
 What it preserves is hygiene that only exists on the refusal path.
 `clearStaleExecutionLock` runs **inside** `svc.checkout`, and a refused checkout
