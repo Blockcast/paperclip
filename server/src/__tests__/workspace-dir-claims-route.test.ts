@@ -344,12 +344,30 @@ describe("path bounding", () => {
     }
   });
 
-  it("refuses a path that does not exist, and says to claim after materialising", async () => {
+  it("refuses a path that does not exist, naming the roots and the server-side check", async () => {
     const res = await request(await createApp())
       .post("/api/workspace-dir-claims")
-      .send({ dirPath: path.join(root, "never-made") });
+      .send({ dirPath: path.join(root, "work", "never-made") });
     expect(res.status).toBe(400);
-    expect(res.body.refusal).toMatch(/does not exist/);
+    // PEN-5865 defect 2: this branch used to carry only "claim after the clone
+    // is materialised" -- advice about a mistake the caller may not have made,
+    // and the one message that could not name the real cause. It now carries
+    // the two facts the root-membership branch carries.
+    expect(res.body.refusal).toMatch(/does not exist ON THE SERVER/);
+    expect(res.body.refusal).toContain(`Allowed roots: ${root}`);
+    expect(res.body.refusal).toMatch(/SERVER's filesystem/);
+    expect(res.body.refusal).toMatch(/both the server and the agent pods can see/);
+    // ...and it still says the thing it used to say.
+    expect(res.body.refusal).toMatch(/final shape exists/);
+  });
+
+  it("names the roots and the shared-filesystem rule even when the path is outside them", async () => {
+    const res = await request(await createApp())
+      .post("/api/workspace-dir-claims")
+      .send({ dirPath: path.join(root, "..", "pen5865-nowhere", "x") });
+    expect(res.status).toBe(400);
+    expect(res.body.refusal).toContain(`Allowed roots: ${root}`);
+    expect(res.body.refusal).toMatch(/both the server and the agent pods can see/);
   });
 
   it("refuses a file", async () => {
@@ -364,6 +382,194 @@ describe("path bounding", () => {
     const res = await request(await createApp()).post("/api/workspace-dir-claims").send({ dirPath: "./relative" });
     expect(res.status).toBe(400);
     expect(res.body.refusal).toContain("not absolute");
+  });
+});
+
+describe("PEN-5865: the agent pod's spelling of a shared path is not the server's", () => {
+  /**
+   * Measured cause: the API server mounts the shared CephFS subvolume at
+   * `/paperclip` with no subPath, while agent pods mount `work/<companyId>`
+   * OF THAT SAME SUBVOLUME at `/paperclip/work`. So the agent's
+   * `/paperclip/work/cto-5865` is the server's
+   * `/paperclip/work/<companyId>/cto-5865`, `realpath` threw on the former,
+   * and EVERY claim from an agent pod refused. The roots were never wrong and
+   * the volume was always shared -- neither cause filed on the row was live.
+   */
+  /** The mapping lives beside the claim layout it feeds, not at the route. */
+  async function loadModule() {
+    vi.resetModules();
+    return import("../services/workspace-dir-claim.js") as Promise<
+      typeof import("../services/workspace-dir-claim.js")
+    >;
+  }
+
+  it("claims the directory when only the company-scoped spelling resolves", async () => {
+    const dir = await makeDir(path.join("work", "company-1", "cto-5865"));
+    const asTheAgentPodNamesIt = path.join(root, "work", "cto-5865");
+
+    const res = await request(await createApp())
+      .post("/api/workspace-dir-claims")
+      .send({ dirPath: asTheAgentPodNamesIt });
+
+    expect(res.status).toBe(200);
+    expect(res.body.acquired).toBe(true);
+    expect(res.body.dirPath).toBe(dir);
+    expect(res.body.note).toMatch(/company-scoped subPaths/);
+    const claim = JSON.parse(await readFile(path.join(dir, ".paperclip-dir-claim.json"), "utf8"));
+    expect(claim.runId).toBe(RUN_SELF);
+  });
+
+  it("releases through the same re-spelling, so a claim is not strandable by its own spelling", async () => {
+    const dir = await makeDir(path.join("work", "company-1", "cto-5865"));
+    const asTheAgentPodNamesIt = path.join(root, "work", "cto-5865");
+    const app = await createApp();
+    await request(app).post("/api/workspace-dir-claims").send({ dirPath: asTheAgentPodNamesIt });
+
+    const res = await request(app)
+      .post("/api/workspace-dir-claims/release")
+      .send({ dirPath: asTheAgentPodNamesIt });
+
+    expect(res.status).toBe(200);
+    expect(res.body.released).toBe(true);
+    expect(res.body.dirPath).toBe(dir);
+  });
+
+  it("prefers the literal path, so re-spelling never redirects a claim that already resolves", async () => {
+    const literal = await makeDir(path.join("work", "cto-5865"));
+    await makeDir(path.join("work", "company-1", "cto-5865"));
+
+    const res = await request(await createApp())
+      .post("/api/workspace-dir-claims")
+      .send({ dirPath: literal });
+
+    expect(res.status).toBe(200);
+    expect(res.body.dirPath).toBe(literal);
+    expect(res.body.note).toBeUndefined();
+    // ...but the ambiguity is reported rather than passed over in silence:
+    // under the measured layout the literal is usually an unscoped tree, and
+    // two companies naming it would collide there (Ally, #3498).
+    const { logger } = await import("../middleware/logger.js");
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.objectContaining({ shadowed: [path.join(root, "work", "company-1", "cto-5865")] }),
+      expect.stringContaining("company-scoped directory of the same name also exists"),
+    );
+  });
+
+  it("cannot reach another company's tree: the segment inserted is the CALLER's company", async () => {
+    // The victim's directory exists and is spelled exactly as a re-spelling
+    // would be -- for a DIFFERENT company. Re-spelling inserts `company-1`,
+    // so this is unreachable rather than merely unclaimed.
+    await makeDir(path.join("work", "company-2", "victim"));
+
+    const res = await request(await createApp())
+      .post("/api/workspace-dir-claims")
+      .send({ dirPath: path.join(root, "work", "victim") });
+
+    expect(res.status).toBe(400);
+    expect(res.body.acquired).toBe(false);
+    expect(res.body.refusal).toContain("PATH REFUSED");
+  });
+
+  /**
+   * Ally, #3498. A linked worktree's `.git` is a FILE whose `gitdir:` pointer
+   * git wrote ON THE AGENT POD, so it carries the agent's spelling too — and
+   * the claim LOCATION is derived from it. Re-spelling `dirPath` alone would
+   * leave the pointer unresolvable server-side, and the resolver used to
+   * degrade silently to the plain-directory branch: claim in the WORKING TREE,
+   * where `git add -A` commits it and `git clean -fd` deletes it. That branch
+   * was unreachable from an agent pod before this change, because `realpath`
+   * threw on the agent's spelling first.
+   */
+  async function makeLinkedWorktree(opts: { pointsAt: string }): Promise<string> {
+    const tree = await makeDir(path.join("work", "company-1", "cto-wt"));
+    await writeFile(path.join(tree, ".git"), `gitdir: ${opts.pointsAt}\n`);
+    return tree;
+  }
+
+  it("re-spells the worktree's .git pointer too, so the claim lands in the gitdir", async () => {
+    const gitDir = await makeDir(path.join("work", "company-1", "repo", ".git", "worktrees", "wt1"));
+    // As git wrote it on the agent pod: no company segment.
+    const tree = await makeLinkedWorktree({
+      pointsAt: path.join(root, "work", "repo", ".git", "worktrees", "wt1"),
+    });
+
+    const res = await request(await createApp())
+      .post("/api/workspace-dir-claims")
+      .send({ dirPath: path.join(root, "work", "cto-wt") });
+
+    expect(res.status).toBe(200);
+    expect(res.body.acquired).toBe(true);
+    const claim = JSON.parse(await readFile(path.join(gitDir, "paperclip-dir-claim.json"), "utf8"));
+    expect(claim.runId).toBe(RUN_SELF);
+    // The hazard: NOT in the working tree, where `git clean -fd` would take it.
+    await expect(readFile(path.join(tree, ".paperclip-dir-claim.json"), "utf8")).rejects.toThrow();
+  });
+
+  it("releases a worktree claim through the same pointer re-spelling", async () => {
+    const gitDir = await makeDir(path.join("work", "company-1", "repo", ".git", "worktrees", "wt1"));
+    await makeLinkedWorktree({ pointsAt: path.join(root, "work", "repo", ".git", "worktrees", "wt1") });
+    const app = await createApp();
+    const asTheAgentPodNamesIt = path.join(root, "work", "cto-wt");
+    await request(app).post("/api/workspace-dir-claims").send({ dirPath: asTheAgentPodNamesIt });
+
+    const res = await request(app)
+      .post("/api/workspace-dir-claims/release")
+      .send({ dirPath: asTheAgentPodNamesIt });
+
+    expect(res.status).toBe(200);
+    expect(res.body.released).toBe(true);
+    await expect(readFile(path.join(gitDir, "paperclip-dir-claim.json"), "utf8")).rejects.toThrow();
+  });
+
+  it("REFUSES a .git pointer that resolves in neither spelling, rather than claiming in-tree", async () => {
+    const tree = await makeLinkedWorktree({
+      pointsAt: path.join(root, "work", "gone", ".git", "worktrees", "wt1"),
+    });
+
+    const res = await request(await createApp())
+      .post("/api/workspace-dir-claims")
+      .send({ dirPath: path.join(root, "work", "cto-wt") });
+
+    expect(res.status).toBe(400);
+    expect(res.body.acquired).toBe(false);
+    expect(res.body.refusal).toMatch(/carries a \.git pointer/);
+    expect(res.body.refusal).toMatch(/git clean -fd/);
+    // Nothing was written into the tree on the way to refusing.
+    await expect(readFile(path.join(tree, ".paperclip-dir-claim.json"), "utf8")).rejects.toThrow();
+  });
+
+  it("leaves a plain directory alone: no pointer, no refusal", async () => {
+    // A `.git` FILE with no `gitdir:` line is not a pointer, so the
+    // plain-directory branch is still correct for it.
+    const dir = await makeDir(path.join("work", "company-1", "odd"));
+    await writeFile(path.join(dir, ".git"), "not a pointer\n");
+
+    const res = await request(await createApp())
+      .post("/api/workspace-dir-claims")
+      .send({ dirPath: path.join(root, "work", "odd") });
+
+    expect(res.status).toBe(200);
+    expect(res.body.acquired).toBe(true);
+  });
+
+  it("re-spells only below the mount segment, and not for a run with no company", async () => {
+    const { companyScopedRespellings } = await loadModule();
+    const roots = ["/paperclip"];
+
+    expect(companyScopedRespellings(roots, "/paperclip/work/cto-5865", "c1")).toEqual([
+      "/paperclip/work/c1/cto-5865",
+    ]);
+    expect(companyScopedRespellings(roots, "/paperclip/wt/pen-4522/repo", "c1")).toEqual([
+      "/paperclip/wt/c1/pen-4522/repo",
+    ]);
+    // The mount point itself is never claimable, so there is nothing to re-spell.
+    expect(companyScopedRespellings(roots, "/paperclip/work", "c1")).toEqual([]);
+    // Already company-scoped; re-spelling would produce work/c1/c1/...
+    expect(companyScopedRespellings(roots, "/paperclip/work/c1/cto-5865", "c1")).toEqual([]);
+    // Outside every root.
+    expect(companyScopedRespellings(roots, "/tmp/elsewhere/x", "c1")).toEqual([]);
+    // No company: fails closed rather than guessing a segment.
+    expect(companyScopedRespellings(roots, "/paperclip/work/cto-5865", null)).toEqual([]);
   });
 });
 
