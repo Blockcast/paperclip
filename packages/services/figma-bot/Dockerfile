@@ -5,8 +5,13 @@
 # Bake once, reuse — Camoufox download is 250MB; we don't want every Python
 # service redoing it.
 
-ARG WEBFLOW_BOT_TAG=latest
-FROM harbor.blockcast.net/paperclip-webflow-bot/webflow-bot:${WEBFLOW_BOT_TAG}
+# Whole reference, not a tag: docker-figma-bot.yml resolves the sibling image
+# to <repo>@sha256:... (scripts/resolve-base-digest.sh) and passes it here, so
+# this image records exactly which webflow-bot build it was layered on. `latest`
+# moves on every webflow-bot push, which made it the most floating base in the
+# repo (PEN-5927). Replaces the WEBFLOW_BOT_TAG knob, which had no other reader.
+ARG WEBFLOW_BOT_IMAGE=harbor.blockcast.net/paperclip-webflow-bot/webflow-bot:latest
+FROM ${WEBFLOW_BOT_IMAGE}
 
 # Copy the figma_bot package into the image. Build context is the
 # paperclip monorepo root (see docker-figma-bot.yml); paths below are
