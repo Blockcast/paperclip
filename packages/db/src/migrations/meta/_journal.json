@@ -1863,6 +1863,13 @@
       "when": 1792004201477,
       "tag": "0275_approval_payload_revisions",
       "breakpoints": true
+    },
+    {
+      "idx": 276,
+      "version": "7",
+      "when": 1792004301477,
+      "tag": "0276_approvals_gate_satisfied",
+      "breakpoints": true
     }
   ]
 }

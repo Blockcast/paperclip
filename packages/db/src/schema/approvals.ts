@@ -1,4 +1,4 @@
-import { pgTable, uuid, text, timestamp, jsonb, integer, index, uniqueIndex } from "drizzle-orm/pg-core";
+import { pgTable, uuid, text, timestamp, jsonb, integer, boolean, index, uniqueIndex } from "drizzle-orm/pg-core";
 import { sql } from "drizzle-orm";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
@@ -18,6 +18,21 @@ export const approvals = pgTable(
     // enforced while the approval is still undecided — see the partial indexes below.
     idempotencyKey: text("idempotency_key"),
     decisionNote: text("decision_note"),
+    // Whether the `payload.gate` this card advertised was SATISFIED when the
+    // reconciler closed it, as structured data (PEN-5885).
+    //
+    // `cancelled` is written on both branches of the gate close -- "the gated PR
+    // merged" and "the gated PR was closed unmerged" land in the same column with
+    // the same value -- so the one fact that separates a served ask from a dead
+    // one survived only inside `decision_note` prose. Anything downstream that
+    // needed it had to match an English sentence; the decision gauge did not try,
+    // and so read twenty served asks as a dead channel.
+    //
+    // Three-valued on purpose, and the null is the common case: null means "no
+    // gate adjudicated this card", which is true of every decided, withdrawn and
+    // human-cancelled row and of every row that predates this column. Only the
+    // reconciler writes it. See `approval-gate-reconciler.ts`.
+    gateSatisfied: boolean("gate_satisfied"),
     decidedByUserId: text("decided_by_user_id"),
     decidedAt: timestamp("decided_at", { withTimezone: true }),
     // How many times the payload has been edited in place by its requester, and
