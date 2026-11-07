@@ -3495,6 +3495,60 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
     expect(markdown).toContain("never a bare `#123`");
+  // PEN-5836: the directive used to name `provenance: "webhook"` as "the
+  // authoritative binding". It is not one -- the webhook writes a work product
+  // for every issue a PR references, so a mentioning row carries that same
+  // marker. Pinned clause by clause because each closes a specific misreading
+  // that was measured in the field, not hypothesised.
+  it("sends the run to `relation`, and says `provenance` does not discriminate", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("Read `relation`, NOT `provenance`");
+    // Without the reason, "read relation" is a rule a run can talk itself out
+    // of the moment the old field looks sufficient.
+    expect(markdown).toContain("rows the PR merely MENTIONS");
+    expect(markdown).toContain("does not discriminate");
+    // The arm that costs most if lost: `undetermined` must not read as "no".
+    expect(markdown).toContain("never as a no");
+  });
+
+  // The whole point of the correction: a run told only that the list can be too
+  // SHORT reads a long list as settled. Both directions, or neither.
+  //
+  // This assertion was rewritten when the branch was rebased. It used to pin the
+  // sentence "`withheldForAuthorizationCount > 0` means owners exist", which
+  // PEN-5340 item 5 had meanwhile DELETED from the directive and pinned negatively
+  // in the test above -- the branch predates that work. Taking this side of the
+  // conflict wholesale would have reinstated the counter as the completeness
+  // signal and failed its own repo's test; the two corrections are on different
+  // axes and compose, so the under-binding half is now asserted through
+  // `ownerListComplete`, which is where PEN-5340 moved it.
+  it("documents the over-binding direction alongside the completeness signal", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("errs in BOTH directions");
+    expect(markdown).toContain("Too LONG");
+    // The completeness signal must survive the rewrite -- this is an addition,
+    // not a replacement.
+    expect(markdown).toContain("`ownerListComplete: true` is the only thing");
+    expect(markdown).toContain("is NOT proof the artifact is unowned");
+    // Completeness is not soundness: the flag is defined over owners that are
+    // missing, so `true` says nothing about entries that are present and are not
+    // owners. Measured at 27 mentioners in 38 rows with the flag `true` on 8 of 8
+    // over-binding artifacts, so this is the common answer, not a corner.
+    expect(markdown).toContain("Completeness is not soundness");
+    // The gap neither number reports.
+    expect(markdown).toContain("another company's identifier space");
+  });
+
+  // Keyed on the artifact, while the hazard is keyed on the file set. A run that
+  // reads the lookup as discharging the obligation misses the row whose planned
+  // work edits the same files and which is bound to no PR at all.
+  it("says the lookup is necessary but not sufficient", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("necessary for recording a constraint and is not sufficient");
+    expect(markdown).toContain("FILE SET");
   });
 
   // Placement, asserted rather than left to reading order. The sentence is author-side

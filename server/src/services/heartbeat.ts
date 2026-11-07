@@ -14092,7 +14092,44 @@ export function buildPaperclipTaskMarkdown(input: {
     // directive exists to prevent, inside the remedy for it. The route now answers the
     // completeness question directly and this names that one field instead: a control
     // read under time pressure should not require the reader to combine three.
-    "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, with `provenance: \"webhook\"` marking the authoritative binding. **`ownerListComplete: true` is the only thing that tells you the list is whole. `ownerListComplete: false` means it is NOT verified whole, and you must not act as though you have seen every owner.** `false` spans two states, and it deliberately does not distinguish them, because your next move is the same either way. Either the answer is SHORT -- a row withheld from your seat (`withheldForAuthorizationCount`), or an owner the artifact declares that the lookup could not return (`unresolvedOwningIdentifiers` -- another company's identifier space, a deleted or mistyped one). Or completeness is UNVERIFIABLE: no authoritative row in the answer records what the artifact declared (`owningIdentifiersUnrecorded`), so there is nothing to check the rows you got against. The second says owners MAY be missing, not that they are. Do NOT read `withheldForAuthorizationCount: 0` as complete on its own; it reports only the first cause, and those two fields can describe the same owner, so do not add them up. An empty `owners` list is NOT proof the artifact is unowned. Name artifacts as `owner/repo#123` or a full URL, never a bare `#123`: the same number is a different pull request in every repo, and the lookup answers a wrong-repo key confidently rather than emptily.",
+    //
+    // PEN-5836: the clause this string used to carry -- `provenance: "webhook"` as
+    // "the authoritative binding" -- was false, and only that clause is replaced. The
+    // webhook writes a work product for every issue a PR references anywhere (see
+    // `buildPullRequestWorkProductFields`), so a mentioning row is `"webhook"` too.
+    // Everything else here is PEN-5340's completeness contract and is kept verbatim,
+    // because the two answer different questions: COMPLETENESS is whether owners are
+    // missing, SOUNDNESS is whether the rows you got are owners at all. This branch
+    // was cut before `ownerListComplete` and the PEN-5674 hop landed, and replacing
+    // the paragraph instead of the clause would have deleted both.
+    "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, each carrying a `relation`. **`ownerListComplete: true` is the only thing that tells you the list is whole. `ownerListComplete: false` means it is NOT verified whole, and you must not act as though you have seen every owner.** `false` spans two states, and it deliberately does not distinguish them, because your next move is the same either way. Either the answer is SHORT -- a row withheld from your seat (`withheldForAuthorizationCount`), or an owner the artifact declares that the lookup could not return (`unresolvedOwningIdentifiers` -- another company's identifier space, a deleted or mistyped one). Or completeness is UNVERIFIABLE: no authoritative row in the answer records what the artifact declared (`owningIdentifiersUnrecorded`), so there is nothing to check the rows you got against. The second says owners MAY be missing, not that they are. Do NOT read `withheldForAuthorizationCount: 0` as complete on its own; it reports only the first cause, and those two fields can describe the same owner, so do not add them up. An empty `owners` list is NOT proof the artifact is unowned. Name artifacts as `owner/repo#123` or a full URL, never a bare `#123`: the same number is a different pull request in every repo, and the lookup answers a wrong-repo key confidently rather than emptily.",
+    // PEN-5836: `provenance: "webhook"` was documented here as "the authoritative
+    // binding", and it is not one. The webhook writes a work product for every issue a
+    // PR references anywhere -- deliberately, see `buildPullRequestWorkProductFields` --
+    // so a mentioning row is `"webhook"` too. Measured: one PR returned 11 owners of
+    // which 1 owned it, and a long-lived registry row had accumulated 26 PRs of which 8
+    // named it. A run following "record it on each" literally wrote constraints onto
+    // uninvolved rows, which is the specific way a prohibition gets discounted by the
+    // next reader of that row.
+    //
+    // The three-valued `relation` is computed server-side (see
+    // `pullRequestOwnershipRelation`) rather than left as a documented predicate the
+    // caller runs itself. The predicate is easy to state and its obvious two-valued
+    // form is wrong: `owningIdentifiers` is `null` on agent-registered rows, and a
+    // caller-side `identifier in (owningIdentifiers ?? [])` turns this endpoint's noisy
+    // over-reporting into silent under-reporting on the commonest row in the table.
+    //
+    // Both error directions are stated because a run told only about the short one
+    // reads a long list as settled truth, and that is the direction measured here.
+    "Read `relation`, NOT `provenance`. A work product is written for EVERY issue the pull request references anywhere, so `owners` also contains rows the PR merely MENTIONS -- and they carry `provenance: \"webhook\"` exactly like a real owner does, so that marker does not discriminate. `relation: \"owner\"` is a row the PR declares it owns; `\"mention\"` is a row it only names, so do not record the constraint there; `\"undetermined\"` means ownership was never recorded (agent-registered rows record none) and reads as UNKNOWN -- treat it as a possible owner, never as a no.",
+    // PEN-5836, from Security Engineer's 9-artifact measurement on this row: 27 of 38
+    // returned rows were mentioners, and `ownerListComplete` read `true` on all 8 of
+    // the 8 artifacts that over-bound. The flag is defined over owners that are
+    // MISSING, so it is silent by construction about rows that are present and are not
+    // owners -- stated here because a reader told to check one flag reasonably reads it
+    // as the all-clear for the whole answer.
+    "The list errs in BOTH directions and `ownerListComplete` covers only one. Too SHORT is the completeness question that flag answers. Too LONG it does not answer at all: mentioning rows inflate the list, so `ownerListComplete: true` is routinely returned over an answer most of whose entries are not owners. Completeness is not soundness and there is no soundness flag -- read `relation` on every entry, not only when the list looks wrong.",
+    "This lookup is necessary for recording a constraint and is not sufficient for it. It is keyed on the ARTIFACT, while the hazard is keyed on the FILE SET: a row whose planned work edits the same files is bound to no pull request and so does not appear here at all. Enumerate those yourself.",
     // PEN-5674: the rule above is unsatisfiable for an agent holding NONE of the relations in
     // `ISSUE_COMMENT_EVALUATED_RELATIONS` to the owning row -- its comment there returns 403
     // `deny_missing_grant`. Deliberately not "an agent that is not assigned to it": assignment

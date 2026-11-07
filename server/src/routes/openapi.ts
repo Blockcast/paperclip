@@ -2015,9 +2015,21 @@ registry.registerPath({
   summary: "Find the issues that own an external artifact (reverse of list issue work products)",
   // PEN-5340: the completeness limit belongs in the contract, because a caller that
   // cannot see it reads every answer as complete.
+  //
+  // PEN-5836: and the soundness limit alongside it. `owners` is a superset of the
+  // owning rows and always has been -- the webhook writes a work product for every
+  // issue a PR references anywhere. The contract did not say so, and `provenance`
+  // reads like it discriminates. One description carrying both limits rather than
+  // two that replace each other: they are independent and a caller needs both.
   description:
-    "Returns `owners`, every owning row the caller may read, authoritative (`provenance: " +
-    "\"webhook\"`) first. **Read `ownerListComplete` before treating the list as the whole " +
+    "Returns `owners`, every row the caller may read that carries this external id. **Read " +
+    "the per-entry `relation`, NOT `provenance`.** A work product is written for every issue " +
+    "the artifact references anywhere, so `owners` includes rows it merely MENTIONS, and a " +
+    "mentioning row is `provenance: \"webhook\"` exactly like a real owner -- that marker " +
+    "does not discriminate. `relation: \"owner\"` means the recorded owning set names this " +
+    "row; `\"mention\"` means ownership was recorded and this row is not in it; " +
+    "`\"undetermined\"` means none was recorded (the common case for agent-registered rows) " +
+    "and is NOT a negative. **Read `ownerListComplete` before treating the list as the whole " +
     "owner set.** `true` means the owner set is verified whole; `false` means it is not, which " +
     "spans two states the caller must treat identically. The answer may be SHORT: a matched row " +
     "withheld from this seat (`withheldForAuthorizationCount`), or an owner the artifact declares " +
@@ -2031,7 +2043,10 @@ registry.registerPath({
     "`withheldForAuthorizationCount: 0` does NOT mean complete -- it reports one cause only. " +
     "`owners` is not a join on `owningIdentifiers`: owners are the work-product rows carrying " +
     "this external id, while `owningIdentifiers` is provenance copied off the pull request, and " +
-    "neither set contains the other. An empty `owners` is not proof the artifact is unowned.",
+    "neither set contains the other. An empty `owners` is not proof the artifact is " +
+    "unowned. `ownerListComplete` answers COMPLETENESS only -- it is defined over owners " +
+    "that are MISSING, so it reads `true` over an answer whose entries are mostly mentions. " +
+    "There is no soundness flag; the per-entry `relation` is it.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: workProductExternalIdLookupQuerySchema,

@@ -272,6 +272,50 @@ export function recordedPullRequestOwners(value: unknown): string[] | null {
   return strings;
 }
 
+/**
+ * How a single issue row relates to a pull request, derived from the owning set
+ * `resolveOwningPaperclipIdentifiers` recorded at webhook time (PEN-5836).
+ *
+ * Three-valued on purpose, because the obvious two-valued predicate
+ * (`identifier` is or is not in the array) silently misclassifies the most
+ * common row in the table. A PR work product is written for EVERY issue the PR
+ * references anywhere -- see the `owningIdentifiers` docblock above -- so the
+ * array is the only thing separating an owner from a row the PR name-drops,
+ * and `provenance` is not: `provenance: "webhook"` says the webhook maintains
+ * the row, which is equally true of both.
+ *
+ *   - "owner"        -- the PR's own recorded owning set names this row.
+ *   - "mention"      -- ownership WAS recorded and this row is not in it. An
+ *                       authoritative negative, including when the recorded set
+ *                       is `[]` (the PR named no owner in its title, labeled
+ *                       body, or branch), which is exactly how the other
+ *                       consumers of this field already read `[]`.
+ *   - "undetermined" -- ownership is unknown: nothing was recorded (`null`), or
+ *                       the row carries no identifier to match. NOT a negative. Agent-
+ *                       registered rows pass no ownership and are the common
+ *                       case, so this arm is load-bearing indefinitely rather
+ *                       than a migration artifact that ages out.
+ *
+ * Collapsing "undetermined" into "mention" would convert this endpoint's known,
+ * noisy over-reporting into silent under-reporting -- a caller would drop a row
+ * that may well own the PR, and nothing in the response would say so. That is
+ * the failure direction `withheldForAuthorizationCount` exists to prevent, so
+ * it must not be reintroduced here by a defaulted `?? []`.
+ */
+export type PullRequestOwnershipRelation = "owner" | "mention" | "undetermined";
+
+export function pullRequestOwnershipRelation(
+  identifier: string | null,
+  recordedOwners: readonly string[] | null,
+): PullRequestOwnershipRelation {
+  // A row with no identifier cannot be matched against the owning set at all,
+  // so the honest answer is the same as an unrecorded one: not known. Returning
+  // "mention" here would be the silent negative this type exists to prevent,
+  // arriving by the other input.
+  if (identifier === null || recordedOwners === null) return "undetermined";
+  return recordedOwners.includes(identifier) ? "owner" : "mention";
+}
+
 export function buildPullRequestWorkProductFields(
   input: PullRequestWorkProductInput,
 ): PullRequestWorkProductFields {
