@@ -1317,6 +1317,155 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockIssueService.remove).not.toHaveBeenCalled();
   });
 
+  // PEN-5920: the route-level half of the human-held narrowing. `decideBase`
+  // returns its own "comment on the issue instead" explanation for a row a
+  // person holds, but the agent reads the ROUTE response, and
+  // `issueMutationGrantRemediation` lands in the same `details` object — so a
+  // remediation that still offered "have the issue assigned to you" would undo
+  // the narrowing one key away from where it was made. That is the PEN-5334
+  // shape exactly: the doc describes the decision function while the agent
+  // reads the route. Pin it here, on `PATCH /issues/:id`, because that is the
+  // main write route and the one the claim in
+  // docs/security/issue-authorization-model.md is about.
+  it("offers the comment route, not reassignment, when the patched issue is held by a person", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: null,
+      assigneeUserId: "board-user-1",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:comment" || input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:mutate" ? "deny_missing_grant" : "allow_company_agent",
+      explanation:
+        input.action === "issue:mutate"
+          ? "This issue is assigned to a person, so generic unassigned-issue access carries "
+            + "issue:comment but not issue:mutate. Comment on the issue instead — the assignee "
+            + "reads the thread and makes the write."
+          : "Allowed because the issue has no agent assignee.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    const remediation = res.body.details.remediation as string;
+    expect(remediation).toEqual(expect.any(String));
+    // The one piece of advice that must not be given on a row a person holds —
+    // taking assignment off them is how the denial gets worked around rather
+    // than answered. Both phrasings of the offer, since the generic string has
+    // used each.
+    expect(remediation).not.toMatch(/have the issue assigned to you/i);
+    expect(remediation).not.toMatch(/take assignment/i);
+    // Dropping the wrong route is only half of it: a remediation that names no
+    // route at all leaves the agent with no next move, which is the PEN-4495
+    // defect this string was written to fix. Pin the replacement.
+    expect(remediation).toMatch(/assigned to a person, not to an agent/i);
+    expect(remediation).toMatch(/comment on the issue/i);
+    // And say so, rather than leaving reassignment merely unmentioned — the
+    // agent arrives here already holding `tasks:assign` on plenty of rows.
+    expect(remediation).toMatch(/do not reassign the row to yourself/i);
+    // No agent assignee means there is no agent:// id to chase for the write.
+    // Narrow to a resolvable id — the bare scheme still appears, correctly, in
+    // the "do not post an agent:// mention" clause.
+    expect(remediation).not.toMatch(/agent:\/\/[0-9a-f]/i);
+    // Unchanged half: the mention door stays explicitly closed (PEN-4495).
+    expect(remediation).toMatch(/no grant can satisfy issue:mutate/i);
+    expect(remediation).toMatch(/being @-mentioned here does not authorize it/i);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // The agent-assigned control for the case above: same denial, same route, and
+  // the reassignment route is still correct there, so it must still be offered.
+  // Without this row the assertion set above is satisfied by deleting the
+  // branch outright.
+  it("keeps the reassignment route in the remediation when the patched issue is held by an agent", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({ assigneeAgentId: ownerAgentId }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_company_agent" : "deny_missing_grant",
+      explanation: "Missing permission.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    const remediation = res.body.details.remediation as string;
+    expect(remediation).toMatch(/have the issue assigned to you/i);
+    expect(remediation).toContain(`agent://${ownerAgentId}`);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // The UNOWNED control, and the one that carries the weight: both assignee
+  // fields null. PEN-5900 Finding 2 was a test that named `assigneeUserId` and
+  // was byte-identically green without it, because nothing in the fixture set
+  // ever varied that field. Keying this branch on `!assigneeAgentId` alone
+  // would pass both rows above — the human-held row and the agent-held row
+  // differ in `assigneeAgentId` too — so only a row that holds
+  // `assigneeAgentId: null` fixed while varying `assigneeUserId` can tell the
+  // two predicates apart. A genuinely unheld row is still the
+  // `allow_company_agent` branch on both actions, so there is no person to
+  // route a comment to and the generic advice is correct here.
+  it("keeps the generic routes in the remediation when the patched issue is held by nobody", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: null,
+      assigneeUserId: null,
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_company_agent" : "deny_missing_grant",
+      explanation: "Missing permission.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    const remediation = res.body.details.remediation as string;
+    expect(remediation).toMatch(/have the issue assigned to you/i);
+    expect(remediation).not.toMatch(/assigned to a person/i);
+    // Nobody holds it, so there is no assignee clause at all.
+    expect(remediation).not.toMatch(/agent:\/\/[0-9a-f]/i);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // The fourth corner, and the one that pins the OTHER conjunct: both fields
+  // set. `decideBase` only reaches its human-held deny inside
+  // `if (!resource?.assigneeAgentId)`, so a row carrying an agent assignee
+  // takes the generic path there however `assigneeUserId` reads — and the
+  // remediation has to agree with it. Keyed on `assigneeUserId` alone this row
+  // would be told "assigned to a person, not to an agent" in the same string
+  // that prints the agent's own `agent://` id, and would lose the "ask the
+  // assignee" route that is the one thing it can actually do.
+  it("keeps the reassignment route when the patched issue names both an agent and a person", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue({
+      assigneeAgentId: ownerAgentId,
+      assigneeUserId: "board-user-1",
+    }));
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_company_agent" : "deny_missing_grant",
+      explanation: "Missing permission.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ status: "done" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    const remediation = res.body.details.remediation as string;
+    expect(remediation).toContain(`agent://${ownerAgentId}`);
+    expect(remediation).toMatch(/ask the assignee to make the write for you/i);
+    expect(remediation).not.toMatch(/assigned to a person, not to an agent/i);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   // BLO-19094: a productivity review is assigned to a reviewer, but every
   // remedy it can order (block / cancel / reassign / snooze) is a mutation of
   // the SOURCE issue. Unlike the recovery handoff above, this grant therefore
