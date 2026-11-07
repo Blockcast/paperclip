@@ -5376,14 +5376,16 @@ export function issueRoutes(
   // advice the narrowing exists to withdraw: taking assignment off a person is
   // how the denial gets worked around rather than answered. Branch the route
   // clause on who holds the row — a human-held row has one route out, and it is
-  // not reassignment.
+  // not reassignment. `deny_human_assigned_issue` is accepted alongside
+  // `deny_missing_grant` below because that denial is the one this branch is
+  // for; it is a narrowing of the same boundary, not a different one.
   function issueMutationGrantRemediation(input: {
     actorAgentId: string;
     assigneeAgentId: string | null;
     assigneeUserId: string | null;
     reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
   }): string | null {
-    if (input.reason !== "deny_missing_grant") return null;
+    if (input.reason !== "deny_missing_grant" && input.reason !== "deny_human_assigned_issue") return null;
     if (input.assigneeAgentId === input.actorAgentId) return null;
     const humanHeld = !input.assigneeAgentId && Boolean(input.assigneeUserId);
     const assigneeClause = input.assigneeAgentId
@@ -15288,9 +15290,38 @@ export function issueRoutes(
     // ordinary boundary (which denies, since the row is assigned to someone
     // else), and `svc.checkout` re-validates the action atomically in the
     // UPDATE's WHERE clause.
+    //
+    // PEN-5920: `deny_human_assigned_issue` is exempt here, and only here. That
+    // denial says "a person holds this row, so generic unassigned-issue access
+    // stops short of the write" — which is a statement about writing to
+    // somebody's issue, and checkout is not that. Checkout asks to TAKE the
+    // row, and `svc.checkout` already answers no, atomically, in the claiming
+    // UPDATE's own WHERE clause: `unassignedAgentCheckoutCondition` requires
+    // BOTH assignee columns null, the same-run arm requires the actor to be the
+    // agent assignee, and the recovery-owner arm (PEN-5940, #3508) carries the
+    // same `assigneeUserId` term. No arm can match a human-held row, so the row
+    // is never taken and this exemption grants nothing.
+    //
+    // What it keeps is the hygiene. `clearStaleExecutionLock` runs INSIDE
+    // `svc.checkout`, on the refusal path, and a refused checkout is the only
+    // caller that reaps a dead run's execution lock off this class of row —
+    // `releaseExecutionLockIfOwnerReapable`'s other caller is the recovery
+    // escalation loop, which does not cover it. A 403 raised here instead of
+    // the service's 409 skips that, so a human-held `in_review` row keeps a
+    // dead run's lock forever. Measured by the CTO against this branch and
+    // reproduced here: the two named human-reviewer cases in
+    // `issue-stale-execution-lock-routes.test.ts` fail, and the second is that
+    // hygiene. #3508 removed the identical defect from the `tasks:assign` door
+    // the same way.
+    //
+    // Deliberately keyed on the reason and not on the row's shape. A human-held
+    // row that is ALSO a review/escalation shell is denied earlier, by
+    // `recoveryOrReviewIssueBlocksUnassignedAgentClaim`, under the ordinary
+    // `deny_missing_grant` — and that 403, with its own message, is unchanged.
+    // Matching on `assigneeUserId` here would have swallowed it too.
     if (req.actor.type === "agent" && !allowSourceScopedRecoveryOwnerCheckout && !watchdogScopeAuthorized) {
       const checkoutBoundaryDecision = await decideIssueAccess(req, issue, "issue:mutate");
-      if (!checkoutBoundaryDecision.allowed) {
+      if (!checkoutBoundaryDecision.allowed && checkoutBoundaryDecision.reason !== "deny_human_assigned_issue") {
         await recordDeniedIssueWrite(req, issue, "issue:mutate", {
           reason: deniedBoundaryReason(checkoutBoundaryDecision.reason),
           boundaryReason: checkoutBoundaryDecision.reason,
