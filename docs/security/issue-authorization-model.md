@@ -360,7 +360,15 @@ outlier.
 - An `issue:mutate` denial on such a row names
   `ISSUE_MUTATE_EVALUATED_RELATIONS` and says so explicitly, rather than falling
   into the generic message — which ends "or take assignment", the one piece of
-  advice that must not be followed on a row a person is holding.
+  advice that must not be followed on a row a person is holding. That holds on
+  the **route response** as well as in `decideBase`: the 403 from
+  `PATCH /issues/:id` and its ~25 siblings carries a `details.remediation`
+  alongside the decision's explanation, and on a human-held row that string
+  offers the comment route instead of reassignment
+  (`issueMutationGrantRemediation`, `server/src/routes/issues.ts`). Both halves
+  of what the agent reads say the same thing; pinned by
+  `issue-agent-mutation-ownership-routes.test.ts` across all four corners of
+  the two assignee fields, so neither conjunct can be dropped and still pass.
 
 ## Who may grant a mention
 
@@ -648,13 +656,23 @@ In order of cost. All three are supported today; none requires a code change.
    the generic agent write claim on that row. Clearing the agent assignee in
    favour of a human moves the row from "only the assignee may mutate" to "no
    agent may mutate through `allow_company_agent`" — agents keep
-   `issue:comment`, and `issue:mutate` is left to the human and to the narrow
-   `allow_productivity_review_grant` exception. Since `PEN-5920` this hatch is
-   therefore safe to use on a decision gate. **It was not before**: until that
-   change `assigneeUserId` was not read by the claim branch at all, so the same
-   move handed `issue:mutate` to *every agent in the company*, and this file
-   recommended it as containment while it did. Do not carry the older reading
-   across. See `"No assignee" vs "no agent assignee"` above.
+   `issue:comment`, and through the authorization layer `issue:mutate` is left
+   to the human and to the narrow `allow_productivity_review_grant` exception.
+   Since `PEN-5920` this hatch is therefore safe to use on a decision gate.
+   **It was not before**: until that change `assigneeUserId` was not read by the
+   claim branch at all, so the same move handed `issue:mutate` to *every agent
+   in the company*, and this file recommended it as containment while it did.
+   Do not carry the older reading across. See
+   `"No assignee" vs "no agent assignee"` above.
+   ⚠️ **"Through the authorization layer" is load-bearing, and this list is not
+   exhaustive of the route.** `assertAgentIssueMutationAllowed`
+   (`server/src/routes/issues.ts`) accepts several paths that never reach
+   `decideBase`: the current execution-run lock (`isCurrentIssueExecutionRun`),
+   the active recovery-action owner, and the opt-in coordination-metadata,
+   parked-disposition and scoped-recovery shapes. All predate `PEN-5920` and
+   none is the generic claim this hatch withdraws — but each is agent-reachable
+   on a human-held row, so read the hatch as closing the *generic* door, not
+   every door.
    ⚠️ Note the residual: clearing the agent assignee **without** setting
    `assigneeUserId` leaves the row genuinely unheld, which is still the
    `allow_company_agent` branch on both actions. The protection comes from the
