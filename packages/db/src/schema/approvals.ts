@@ -32,6 +32,18 @@ export const approvals = pgTable(
     // gate adjudicated this card", which is true of every decided, withdrawn and
     // human-cancelled row and of every row that predates this column. Only the
     // reconciler writes it. See `approval-gate-reconciler.ts`.
+    //
+    // ⛔ TRUE DOES NOT MEAN THE ASK WAS SERVED, and reading it that way is the
+    // defect PEN-5103 exists to prevent. It carries the reconciler's own narrow
+    // sense of `satisfied`: "the event this card NAMED terminated green". For a
+    // `github_pr_merged` gate that is the pull request merging, which does
+    // discharge the ask. For a `github_actions_run` gate it is only a workflow
+    // run going green, which can happen on a pull request whose card asks a human
+    // to REVIEW it -- nobody served anything. The column stays kind-agnostic
+    // because that is what the reconciler measured and widening it here would be
+    // asserting a fact nobody checked; any consumer that means "served" must
+    // conjoin `payload->'gate'->>'kind'` itself, as the board-decision gauge in
+    // `approval-queue-metrics.ts` does.
     gateSatisfied: boolean("gate_satisfied"),
     decidedByUserId: text("decided_by_user_id"),
     decidedAt: timestamp("decided_at", { withTimezone: true }),

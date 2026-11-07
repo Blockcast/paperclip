@@ -92,7 +92,7 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     decidedAt?: Date | null;
     requestedByAgentId?: string;
     /** Attach a `payload.gate`, which is what the `gated` label reads (PEN-5885). */
-    gate?: { kind: string; prNumber?: number };
+    gate?: { kind: string; prNumber?: number; runId?: number };
     gateSatisfied?: boolean | null;
     decisionNote?: string;
   }) {
@@ -259,7 +259,7 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
   // pull requests inside one 72h window left this gauge frozen and paged Platform
   // for 11 days against a board that was working. Reverting the filter to
   // BOARD_DECISION_STATUSES alone must turn this test red.
-  it("advances the last-decision timestamp when a gate was SATISFIED", async () => {
+  it("advances the last-decision timestamp when a MERGE gate was satisfied", async () => {
     const companyId = await insertCompany();
     const agentId = await insertAgent(companyId);
     const boardDecidedAt = new Date("2026-08-19T20:52:50.000Z");
@@ -318,6 +318,52 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
       gateSatisfied: false,
       createdAt: new Date(abandonedAt.getTime() - 3_600_000),
       decidedAt: abandonedAt,
+    });
+    await insertApproval({
+      companyId,
+      status: "pending",
+      requestedByAgentId: agentId,
+      createdAt: new Date(NOW.getTime() - 86_400_000),
+    });
+
+    await refreshApprovalQueueMetrics(db, NOW);
+    const { body } = await renderMetrics();
+
+    expect(series(body, APPROVAL_LAST_DECISION_TIMESTAMP_METRIC, agent)).toBe(boardDecidedAt.getTime() / 1000);
+  });
+
+  // The third gate case, and the one `gate_satisfied` alone gets WRONG. On a
+  // `github_actions_run` gate `satisfied` means only "the run this card named
+  // finished green" -- `approval-gate-reconciler.ts` says so on
+  // SUCCESS_CONCLUSION itself, and PEN-5103 exists because a card can name a run
+  // on a pull request whose ask is "a human must REVIEW this". Nobody served
+  // anything when CI went green, so admitting it here would let a build robot
+  // push this gauge to now and silence PaperclipApprovalQueueNotServicing for a
+  // full window against an idle board -- the same false recovery as a withdrawal
+  // burst, through a third door. Dropping the kind conjunct from
+  // MERGE_GATE_DECISION must turn this test red; note the row below is
+  // `gate_satisfied = true`, so the boolean alone cannot save it.
+  it("does NOT advance the last-decision timestamp when a satisfied gate is a CI run, not a merge", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId);
+    const boardDecidedAt = new Date("2026-08-19T20:52:50.000Z");
+    const runWentGreenAt = new Date("2026-08-22T23:00:00.000Z");
+
+    await insertApproval({
+      companyId,
+      status: "approved",
+      requestedByAgentId: agentId,
+      createdAt: new Date(boardDecidedAt.getTime() - 3_600_000),
+      decidedAt: boardDecidedAt,
+    });
+    await insertApproval({
+      companyId,
+      status: "cancelled",
+      requestedByAgentId: agentId,
+      gate: { kind: "github_actions_run", runId: 40434542378 },
+      gateSatisfied: true,
+      createdAt: new Date(runWentGreenAt.getTime() - 3_600_000),
+      decidedAt: runWentGreenAt,
     });
     await insertApproval({
       companyId,

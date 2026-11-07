@@ -41,6 +41,25 @@ ALTER TABLE "approvals" ADD COLUMN IF NOT EXISTS "gate_satisfied" boolean;
 -- column has nothing to say about this row". Collapsing them would assert a
 -- measurement that was never taken.
 --
+-- WHY `Gate completed before a decision was recorded (` IS BACKFILLED TRUE even
+-- though a green Actions run is NOT somebody serving the ask: this column
+-- records what the reconciler measured, which is "the named event terminated
+-- green", and that sentence is emitted exactly when it did. Writing null for it
+-- would make the backfill disagree with the live write on identical rows, and
+-- would hide the died/satisfied split on `github_actions_run` gates from every
+-- future reader for no gain. The narrowing to "served" belongs to the CONSUMER
+-- and lives there: the board-decision gauge conjoins
+-- `payload->'gate'->>'kind' = 'github_pr_merged'`, so these rows are backfilled
+-- faithfully and are still excluded from it. `payload.gate.kind` is structured
+-- and present on every gated row, so no consumer has to parse prose for the
+-- kind -- the regex is load-bearing only for the satisfied/died half, where it
+-- matches reconciler-generated text rather than anything a human wrote.
+--
+-- Classification coverage, measured on company b1d3f3d3 at 2026-11-07T14:10Z:
+-- 35 of 35 cancelled rows match one of the four templates, 0 unclassified --
+-- 31 satisfied / 4 died, and by kind 29 merged-satisfied, 2 run-satisfied,
+-- 4 run-died.
+--
 -- The alternative was to state in the PR that history stays unclassified and
 -- backfill nothing. Rejected because the recovery the fix is supposed to produce
 -- is `time() - gauge` falling, and with no backfill that only happens at the NEXT
