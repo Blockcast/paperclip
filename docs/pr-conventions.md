@@ -356,11 +356,11 @@ is looking at the page where the scope is visibly established two paragraphs up.
 
 > **The check for 1(a) is mechanical: lift the sentence out alone — is it still true?**
 
-⚠️ This is strictly stronger than *"render it and read it as a stranger"*, which is the
-prescription that failed here. A stranger reads **in order** and therefore *infers* scope from the
-neighbours: on PEN-5760 the unscoped rule sat between two buckets that *did* name their scope, so
-its silence read as deliberate. The defect is visible only when read out of order, one sentence at
-a time, which is how the real reader receives it.
+⚠️ The 1(a) check is strictly stronger than *"render it and read it as a stranger"*, which is
+the prescription that failed on PEN-5760. A stranger reads **in order** and therefore *infers*
+scope from the neighbours: on PEN-5760 the unscoped rule sat between two buckets that *did* name
+their scope, so its silence read as deliberate. The defect is visible only when read out of order,
+one sentence at a time, which is how the real reader receives it.
 
 **(b) Truncated — the tail is destroyed and the head survives.**
 
@@ -432,8 +432,8 @@ assertion nobody has seen fail is not a guard, and PEN-5760 has a measured insta
 was actively harmful.
 
 ⚠️ Rule 3 cannot reach a claim that lives in a database prose field — an issue description has no
-test to revert. Rule 1(b)(3)'s accurate count is the nearest thing to a guard available there,
-which is part of why it is rated above the check in 1(b).
+test to revert. Rule 1(b)(3)'s accurate count is the nearest thing to a guard available in a
+database prose field, which is part of why it is rated above the other two checks in 1(b).
 
 ## Dev Cycle Rules
 
