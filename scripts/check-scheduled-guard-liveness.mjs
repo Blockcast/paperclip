@@ -460,7 +460,26 @@ export const EXEMPT_SCHEDULED_WORKFLOWS = [
       "Not a guard. It opens a PR refreshing a shard-duration manifest (BLO-24241); nothing is " +
       "enforced, so its stopping costs test-sharding accuracy rather than coverage. Its weekly " +
       "cron also makes any liveness bar coarse to the point of noise — a threshold would have to " +
-      "exceed 7 days to clear ordinary jitter, by which point it reports nothing worth waking for.",
+      "exceed 7 days to clear ordinary jitter, by which point it reports nothing worth waking for. " +
+      "PEN-5832 MEASURED that cost rather than leaving it asserted, because the premise that the " +
+      "schedule delivers weekly is false: 2026-10-05 and 2026-10-19 had no scheduled run at all, so " +
+      "the nominal weekly cron delivered fortnightly twice in six weeks, and the two refreshes after " +
+      "it were manual workflow_dispatches. The cost of that staleness, simulated against the real " +
+      "LPT packer and the real manifest with new-suite weights drawn from the 161 suites seven " +
+      "routine refreshes actually added: a missed week +9.9s of shard makespan on average, a missed " +
+      "fortnight +14.5s, and 60 unmeasured suites (a month of total refresh failure) +19.9s. " +
+      "Measured against the jobs that pay it — `General tests (server N/6)` over the 360 most recent " +
+      "master commits, n=22 where all six shards genuinely ran: makespan median 56.5min, and a " +
+      "shard-to-shard spread of 25.1min median ALREADY PRESENT — a missed week is 0.2% of wall clock " +
+      "and ~152x smaller than the imbalance these shards carry anyway. The manifest models only " +
+      "~16min, i.e. ~28% of a median job's wall clock, so it is not what makes these shards uneven " +
+      "and refreshing it faster cannot make them even. Watching this workflow would buy a detectable " +
+      "signal for an undetectable cost. Revisit if the manifest's share of job wall clock rises " +
+      "materially above that ~28%. Noted separately, and NOT a reason to watch this workflow: one " +
+      "of those 22 makespans reached 100.5min against the matrix's 110min timeout_minutes, leaving " +
+      "~9.5min. It is a single excursion, not a trend — the other 21 sit between 42 and 75min — so " +
+      "it is recorded rather than acted on here. Staleness contributes at most ~20s of it either " +
+      "way; the ~72% of wall clock this manifest does not model is where cap pressure comes from.",
   },
   {
     workflow: "merge-queue-orphan-sweeper.yml",
