@@ -22,6 +22,7 @@ import {
   everOfferedQueueSlot,
   allyVerdictAtHead,
   approvalLanes,
+  approvalAttestsHead,
   checkSettlement,
   classifyAll,
   classifyFromListing,
@@ -214,15 +215,55 @@ describe("classifyPr rule order", () => {
     assert.equal(row.detail, "kkroo");
   });
 
+  // PEN-5997. A human approval is credited only when it was submitted after
+  // the head it is filed against came into existence, so these fixtures date
+  // the head explicitly — exactly as the hydrated `timeline` does in
+  // production. `commit_id` cannot carry that on its own: GitHub re-anchors it
+  // forward onto the new head, so it reads HEAD on a stale approval too.
+  const headCommittedAt = (at) => [{ event: "committed", sha: HEAD, committer: { date: at } }];
+  const ownerApproval = (submittedAt) => ({
+    id: 2,
+    state: "APPROVED",
+    user: { login: "kkroo", id: 1845185, type: "User" },
+    commit_id: HEAD,
+    submitted_at: submittedAt,
+    body: "lgtm",
+  });
+
   it("enqueues once the code owner has APPROVED at the current head", () => {
+    // POSITIVE CONTROL for the PEN-5997 tightening: the gate must still be
+    // satisfiable by a real approval, or it is unsatisfiable rather than safe.
     const row = classify({
       reviewRequests: [{ login: "kkroo" }],
-      reviews: [
-        review(),
-        { id: 2, state: "APPROVED", user: { login: "kkroo", id: 1845185, type: "User" }, commit_id: HEAD, body: "lgtm" },
-      ],
+      timeline: headCommittedAt("2026-09-13T04:00:00Z"),
+      reviews: [review(), ownerApproval("2026-09-13T07:00:00Z")],
     });
     assert.equal(row.action, "enqueue");
+  });
+
+  it("does not credit a re-anchored approval submitted before this head existed", () => {
+    // PEN-5997, the measured #1044 shape: `commit_id === headRefOid` is TRUE
+    // because GitHub re-anchored it, while the approval predates the head's
+    // commit by hours. Crediting it clears a code-owner hold on a tree no
+    // human ever read, and this script's output is "merge it".
+    const row = classify({
+      reviewRequests: [{ login: "kkroo" }],
+      timeline: headCommittedAt("2026-09-13T04:00:00Z"),
+      reviews: [review(), ownerApproval("2026-09-13T03:00:00Z")],
+    });
+    assert.equal(row.action, "codeowner-review-requested");
+    assert.equal(row.detail, "kkroo");
+  });
+
+  it("holds rather than crediting an approval when the head cannot be dated", () => {
+    // PEN-5997. No datable timeline event means no stamp, so credit nobody —
+    // the posture `impliedOwners` already takes on an unreadable CODEOWNERS.
+    const row = classify({
+      reviewRequests: [{ login: "kkroo" }],
+      timeline: [],
+      reviews: [review(), ownerApproval("2026-09-13T07:00:00Z")],
+    });
+    assert.equal(row.action, "codeowner-review-requested");
   });
 
   it("skips DIRTY/UNSTABLE/UNKNOWN merge states but enqueues BLOCKED and BEHIND", () => {
@@ -2019,6 +2060,61 @@ describe("CODEOWNERS scoping of the owner hold", () => {
     );
     assert.equal(impliedOwners({ codeownerRules: RULES, files: null }), null);
     assert.deepEqual([...impliedOwners({ codeownerRules: RULES, files: ["unowned.ts"] })], []);
+  });
+});
+
+describe("approvalAttestsHead — dating a human approval (PEN-5997)", () => {
+  const AT = Date.parse("2026-09-13T04:00:00Z");
+  const approval = (overrides = {}) => ({
+    state: "APPROVED",
+    user: { login: "kkroo", id: 1845185, type: "User" },
+    commit_id: HEAD,
+    submitted_at: "2026-09-13T07:00:00Z",
+    ...overrides,
+  });
+
+  it("credits an approval submitted after the head was committed", () => {
+    assert.equal(approvalAttestsHead(approval(), HEAD, AT), true);
+  });
+
+  it("rejects a re-anchored approval that predates the head it is filed against", () => {
+    // The whole defect. Measured on Blockcast/paperclip 2026-11-07: #1044,
+    // #1465, #1506, #1512, #1551 and #2731 all satisfy `commit_id === head`
+    // while having been submitted before that head's commit existed.
+    assert.equal(
+      approvalAttestsHead(approval({ submitted_at: "2026-09-13T03:00:00Z" }), HEAD, AT),
+      false,
+    );
+  });
+
+  it("breaks a same-second tie toward the hold", () => {
+    // One-second timeline resolution makes the pair genuinely unordered. This
+    // is the difference between `>` and `>=`, which no other assertion sees.
+    assert.equal(
+      approvalAttestsHead(approval({ submitted_at: "2026-09-13T04:00:00Z" }), HEAD, AT),
+      false,
+    );
+  });
+
+  it("rejects every state that is not APPROVED", () => {
+    for (const state of ["COMMENTED", "CHANGES_REQUESTED", "DISMISSED", "PENDING", ""]) {
+      assert.equal(approvalAttestsHead(approval({ state }), HEAD, AT), false, state);
+    }
+  });
+
+  it("keeps the commit_id conjunct, which still rejects a review GitHub did not re-anchor", () => {
+    assert.equal(approvalAttestsHead(approval({ commit_id: OTHER }), HEAD, AT), false);
+    assert.equal(approvalAttestsHead(approval({ commit_id: null }), HEAD, AT), false);
+  });
+
+  it("credits nobody when the head, its date, or the submission time is unreadable", () => {
+    assert.equal(approvalAttestsHead(approval(), HEAD, null), false, "undatable head");
+    assert.equal(approvalAttestsHead(approval(), "", AT), false, "unknown head");
+    assert.equal(approvalAttestsHead(approval(), null, AT), false, "null head");
+    for (const submitted_at of ["not-a-date", undefined, null, ""]) {
+      assert.equal(approvalAttestsHead(approval({ submitted_at }), HEAD, AT), false, String(submitted_at));
+    }
+    assert.equal(approvalAttestsHead(null, HEAD, AT), false, "no review");
   });
 });
 

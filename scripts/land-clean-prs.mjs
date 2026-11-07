@@ -822,6 +822,59 @@ export function impliedOwners(pr) {
 }
 
 /**
+ * Whether an APPROVED review can be read as attesting `headSha`, given the
+ * moment that head came into existence (`headMovedAt`).
+ *
+ * PEN-5997. `commit_id` alone cannot answer this, and it fails in the
+ * permissive direction. GitHub RE-ANCHORS an APPROVED review's `commit_id`
+ * forward onto the new head when the branch moves, so the equality is true of
+ * precisely the stale approvals it looks like it rejects. Measured on
+ * `Blockcast/paperclip` itself 2026-11-07, over the 100 most recent
+ * `kkroo`-reviewed PRs: 8 approvals, across 6 PRs, satisfy
+ * `commit_id === headRefOid` while having been submitted BEFORE that head's
+ * commit existed — #1044 by 7h07m,
+ * #1506 by 1h55m, #1512 by 9h29m, #1551 by 11h28m, #2731 (2026-10-14) by
+ * 9h08m, #1465 by 1d20h21m. Each would have cleared a code-owner hold here,
+ * on the one path in this repo that arms `gh pr merge --auto` with no human
+ * in the loop.
+ *
+ * Dating the approval needs no body marker, which is what makes it usable on
+ * a human review. The ordering is one-directional and that is what makes it
+ * sound: a commit's `committer.date` is a LOWER bound on when it was pushed,
+ * and nobody can approve a head before it is pushed, so a `submitted_at`
+ * earlier than the head's commit time PROVES the approval never saw this
+ * tree. The converse is not proven, only possible — an approval submitted
+ * between the head's commit time and its push time is still credited. That
+ * residual is bounded by the commit-to-push gap; the one it replaces was
+ * unbounded. It is the same ceiling `headMovedAt` documents for
+ * `ejectionsAtHead`, inherited from the same stamp.
+ *
+ * Both conjuncts are kept. The `commit_id` equality still rejects a review
+ * GitHub did NOT re-anchor, so dropping it for the timestamp alone would
+ * loosen the gate rather than tighten it.
+ *
+ * ⚠ An undatable head (`headMovedAt` null) credits NOBODY. That is the
+ * posture `impliedOwners` already takes on an unreadable CODEOWNERS, for the
+ * reason stated there — this script's output is "merge it", so every unknown
+ * has to over-hold. In production `timeline` is hydrated on the same branch as
+ * `reviews`, so a null stamp means that read failed, and the resulting hold
+ * surfaces as a reported `codeowner-review-requested` row naming the owner
+ * rather than passing silently.
+ *
+ * The tie at equal stamps breaks toward the HOLD, matching `ejectionsAtHead`:
+ * timeline stamps have one-second resolution, so same-second events are
+ * genuinely unordered and nothing here can tell which came first.
+ */
+export function approvalAttestsHead(review, headSha, headAt) {
+  if (String(review?.state ?? "").toUpperCase() !== "APPROVED") return false;
+  const head = lower(headSha);
+  if (head === "" || lower(review?.commit_id) !== head) return false;
+  if (headAt === null) return false;
+  const submitted = Date.parse(review?.submitted_at ?? "");
+  return Number.isFinite(submitted) && submitted > headAt;
+}
+
+/**
  * Requested reviewers with no APPROVED review at the current head, scoped to
  * the ones CODEOWNERS still names for this PR's current file list.
  *
@@ -853,21 +906,33 @@ export function impliedOwners(pr) {
  * never the instrument for one: `SKIP_LABELS` and draft state are, both
  * machine-readable and both withdrawable by the human who set them.
  *
- * This matches on `commit_id` rather than a body attestation because a human
- * approval carries no attestation to read. That inherits GitHub's own
- * re-anchoring behaviour on force-push, i.e. it can read a re-anchored stale
- * approval as current. The residual is bounded by `dismiss_stale_reviews_on_push`
- * server-side, and the direction matches what GitHub's own merge gate would do.
+ * A human approval carries no attestation to read, so this cannot use the
+ * `Reviewed head:` body marker `allyVerdictAtHead` relies on. It dates the
+ * approval instead — `approvalAttestsHead` is the whole of the APPROVED test
+ * here, and its comment carries the measurement.
+ *
+ * PEN-5997: this used to match on `commit_id` alone and claim the residual was
+ * "bounded by `dismiss_stale_reviews_on_push` server-side". That bound was
+ * never cited and does not hold, so it is gone rather than restated.
+ * `administration: read` is granted to no agent seat on this fleet —
+ * `GET /repos/Blockcast/paperclip/branches/master/protection` is 403 for this
+ * App (2026-11-07; 404 on a nonexistent repo, so the 403 is a real boundary,
+ * and the three sibling repos answer alike), and `rulesets` carries no
+ * `pull_request` rule. The setting is therefore unreadable from here, but the
+ * BEHAVIOUR is not: over the 100 most recent `kkroo`-reviewed PRs on this
+ * repo, 34 carry a head committed after a human approval (52 such approvals
+ * in all), and exactly one review was ever dismissed — #1022, by hand,
+ * carrying a CTO dismissal
+ * message. Zero automatic push-dismissals. Nothing server-side was bounding
+ * this.
  */
 export function unsatisfiedOwners(pr) {
-  const head = lower(pr?.headRefOid);
+  // Read once: `headMovedAt` walks the whole timeline, and every review is
+  // judged against the same head stamp.
+  const headAt = headMovedAt(pr?.timeline, pr?.headRefOid);
   const approved = new Set(
     (pr?.reviews ?? [])
-      .filter(
-        (review) =>
-          String(review?.state ?? "").toUpperCase() === "APPROVED" &&
-          lower(review?.commit_id) === head,
-      )
+      .filter((review) => approvalAttestsHead(review, pr?.headRefOid, headAt))
       .map((review) => lower(review?.user?.login)),
   );
   const outstanding = (pr?.reviewRequests ?? [])
@@ -894,6 +959,15 @@ export function unsatisfiedOwners(pr) {
  * suffix is a naming convention any account may adopt, and identity is what
  * decides whether a person was spent. Head is deliberately not considered — the
  * approval was paid for whether or not the branch has moved since.
+ *
+ * ⛔ PEN-5997 disposition: do NOT harmonise this with `unsatisfiedOwners`, and
+ * do not "fix" the missing head check. The two ask different questions of the
+ * same review and must give opposite answers. `unsatisfiedOwners` asks whether
+ * an approval AUTHORIZES this head, so a stale one must not count;
+ * this asks whether a PERSON WAS SPENT, so a stale one must. Applying the
+ * head-dating fix here would make this report undercount exactly the cohort it
+ * exists to find — a PR that rotted after a person said yes has a moved head
+ * by definition, so the filter would drop every one of them.
  */
 export function approvalLanes(pr) {
   const human = new Set();
