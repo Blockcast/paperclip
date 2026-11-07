@@ -248,7 +248,7 @@ refuse_api_ready() {
 #     review object's body, and a count taken only over `issues/{n}/comments`
 #     read zero — so checking the comment surface alone under-reads it.
 #
-# This refuses both shapes before they reach GitHub.
+# When armed, this refuses both shapes before they reach GitHub.
 #
 # ⚠ It is a guard against writing reviewer evidence BY ACCIDENT, not a security
 # boundary. A process holding the reviewer's key can set the escape hatch below,
@@ -492,6 +492,18 @@ reviewer_evidence_input_graphql() {
     sed -n 's/.*"query"[[:blank:]]*:[[:blank:]]*"//p'
 }
 
+# The comment body an `--input` payload carries in its `body` member, extracted
+# the same way as `query` above and for the same reason: the whole-payload match
+# is line-anchored, and in a JSON document the body does not start a line — it
+# starts after `{"body":"`. So a heading on the body's FIRST line was invisible
+# to it, while the identical heading one line lower matched, because the `\n`
+# before it becomes a real newline. Cutting the prefix off puts the body's first
+# line at column 0, where the `^` anchors can see it.
+reviewer_evidence_input_body() {
+  reviewer_evidence_input_payloads "$@" |
+    sed -n 's/.*"body"[[:blank:]]*:[[:blank:]]*"//p'
+}
+
 # `-` means stdin, which by this point lives in REVIEWER_EVIDENCE_STDIN. An
 # unreadable path emits nothing rather than failing: this function only decides
 # whether to refuse, and the real gh is the right place for that error.
@@ -534,6 +546,16 @@ refuse_reviewer_evidence() {
 /g' | grep -qiE "${REVIEWER_EVIDENCE_RE}"; then
     reviewer_evidence_refusal "publish a consolidated-review heading or a \`Reviewed head:\` attestation"
   fi
+  # 2b. The same match against an `--input` payload's `body` member on its own.
+  # Additive rather than a replacement for the whole-payload pass above: that
+  # pass still catches a heading anywhere below the body's first line, and it
+  # reads shapes this extractor does not (a `body` spread over several members,
+  # a payload whose heading sits outside `body`). This only reaches the one case
+  # the prefix hid.
+  if [ "${mode}" = api ] && reviewer_evidence_input_body "$@" | sed 's/\\n/\
+/g' | grep -qiE "${REVIEWER_EVIDENCE_RE}"; then
+    reviewer_evidence_refusal "publish a consolidated-review heading or a \`Reviewed head:\` attestation"
+  fi
 }
 
 # A body passed as `-` is read from stdin, which can only be consumed once. Slurp
@@ -541,17 +563,40 @@ refuse_reviewer_evidence() {
 # stdin at that file so the real gh still receives it verbatim. Only runs when an
 # argument actually names stdin, so the common case adds no read and `gh` keeps
 # its terminal stdin for prompts.
+#
+# "Actually names stdin" is narrower than "is the token `-`". A bare `-` means
+# stdin only where it is the VALUE of a flag that takes a file; everywhere else
+# `gh` treats it as an ordinary string. `gh pr comment 1 --body -` posts the
+# literal one-character body `-` and never reads stdin at all, so slurping on
+# the token alone blocked until the pipe closed — on a pipe that stays open,
+# forever (measured rc=124 under `timeout`). The failure was a hang rather than
+# a wrong answer, which is worse: it is invisible until something kills it, and
+# only an armed seat ever reached it. So the bare `-` is accepted only after a
+# flag that takes a file, while the self-contained spellings below still stand
+# on their own.
 REVIEWER_EVIDENCE_STDIN=''
 buffer_stdin_for_reviewer_evidence() {
   # Nothing downstream reads the buffer unless the guard is armed, and the
   # comments above `reviewer_evidence_armed` promise an unarmed seat pays
   # nothing — so make that true here rather than only for the matching.
   reviewer_evidence_armed || return 0
+  reviewer_evidence_prev=''
   for a in "$@"; do
+    reviewer_evidence_is_stdin=no
     case "${a}" in
-      - | @- | body=@- | query=@- | --body-file=- | --input=- | -F- | -f-) ;;
-      *) continue ;;
+      @- | body=@- | query=@- | --body-file=- | --input=- | -F- | -f-)
+        reviewer_evidence_is_stdin=yes
+        ;;
+      -)
+        # Only these three take a file, so only after one of them is a bare `-`
+        # stdin. `--body`/`-b` take a string and are deliberately absent.
+        case "${reviewer_evidence_prev}" in
+          --body-file | -F | --input) reviewer_evidence_is_stdin=yes ;;
+        esac
+        ;;
     esac
+    reviewer_evidence_prev="${a}"
+    [ "${reviewer_evidence_is_stdin}" = yes ] || continue
     reviewer_evidence_buf="$(mktemp "${TMPDIR:-/tmp}/gh-stdin.XXXXXX")"
     cat > "${reviewer_evidence_buf}"
     # Hold the buffer open twice — fd 0 so the real gh reads the body verbatim
