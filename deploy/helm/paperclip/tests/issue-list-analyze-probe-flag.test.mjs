@@ -19,6 +19,15 @@ import { fileURLToPath } from "node:url";
  * Box 4 flips the value to "" (off). At that point the ENABLED test is the one
  * assertion that has to change, and it changing is the point: the flip should
  * be a deliberate edit with a reviewer looking at it, not silent drift.
+ *
+ * ✅ Box 4 EXECUTED 2026-11-06 — the probe fired at 11:34:23Z and the
+ * measurement landed, so the term is now "" and the ENABLED assertion below
+ * is inverted to pin it OFF. The other three assertions are UNCHANGED and
+ * deliberately so: presence, both-tiers and admissibility all still hold for
+ * an empty-valued flag, and keeping them live is what stops the "off" state
+ * from quietly becoming a deleted-flag state that nothing checks. The
+ * boolean-shape assertion also stays — it is vacuous at "" and is there for
+ * whoever re-enables.
  */
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../..");
 const VALUES_FILE = "deploy/helm/paperclip/values.blockcast.yaml";
@@ -69,8 +78,17 @@ function render(showOnly) {
 const api = render("templates/deployment-api.yaml");
 const worker = render("templates/statefulset.yaml");
 
-test("the ANALYZE probe flag carries a search term on the API tier (PEN-5296 box 2; box 4 clears it)", () => {
-  assert.notEqual(probeTerm(api), "", `${FLAG} is empty, so no probe will ever fire`);
+test("the ANALYZE probe is OFF on the API tier (PEN-5296 box 4 executed)", () => {
+  // Inverted by box 4. The measurement is done (probe fired 2026-11-06
+  // 11:34:23Z); leaving a statement-doubling instrument armed past the
+  // investigation that needed it is the drift this pins against. Re-enabling
+  // means editing THIS assertion too, in front of a reviewer.
+  assert.equal(
+    probeTerm(api),
+    "",
+    `${FLAG} is set, so the probe is armed and every matching search costs ~2x. `
+      + "If that is deliberate, say so on PEN-5296 and flip this assertion with it.",
+  );
 });
 
 test("the probe term is not boolean-shaped, which would be a silent no-op", () => {

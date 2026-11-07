@@ -543,10 +543,22 @@ env:
     # timeout with this term, the probe captures THAT company's actuals rather
     # than the Penstock proxy. Read `companyId` off the log line.
     #
-    # ⏳ PEN-5296 box 4 turns this back to "" once a probe has landed. Leaving
-    # it on is a decision that has to be recorded there, not a default.
+    # ✅ PEN-5296 box 4 EXECUTED 2026-11-06: the probe fired at 11:34:23Z, the
+    # measurement landed (PEN-5296 cmt `90eaabbd`, PEN-3596 cmt `c4b03742`),
+    # and the term is back to "" — OFF. An instrument enabled for one
+    # investigation must not become permanent by default; re-enabling it is a
+    # deliberate edit with a reviewer looking at it, which is exactly what the
+    # ENABLED assertion in tests/issue-list-analyze-probe-flag.test.mjs makes
+    # it. The flag stays PRESENT with an empty value rather than being
+    # deleted, so the admissibility and both-tiers assertions keep covering it
+    # and a re-enable is a one-token change to a reviewed line.
+    #
+    # To re-enable: set this to the search term to probe (NOT `true` — the
+    # value IS the term, and a boolean-shaped value probes a term that matches
+    # nothing, which the test refuses by name). Everything above records how
+    # `timeout` was chosen, and stays as the guidance for choosing the next.
     - name: PAPERCLIP_EXPLAIN_ANALYZE_ISSUE_LIST_TERM
-      value: "timeout"
+      value: ""
 
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
