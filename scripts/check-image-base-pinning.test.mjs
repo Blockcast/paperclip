@@ -34,8 +34,8 @@
 // is satisfied by an unrelated `NODE_BASE=` in the same file, so a workflow that
 // supplies the wrong arg entirely would still pass — the gate failing open,
 // which is the one direction a gate must never fail. Found in review of the
-// commit that introduced this file; `supplies a bare substring match` below is
-// the regression test.
+// commit that introduced this file; the regression test below is
+// `a build-arg whose name merely ends with the one we need does not satisfy it`.
 //
 // WHY THIS ASSERTS THE SEAM AND NOT THE VALUE
 //
