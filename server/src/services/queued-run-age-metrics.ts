@@ -3,7 +3,12 @@ import type { Db } from "@paperclipai/db";
 import { agents, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "./ccrotate-capacity-retry.js";
-import { isDispatchRankReady } from "./dispatch-readiness.js";
+import {
+  QUEUE_ENTERED_AT_CONTEXT_KEY,
+  deferWroteQueuedAtSql,
+  isDispatchRankReady,
+  queueEnteredAtSql,
+} from "./dispatch-readiness.js";
 import { listIssueDependencyReadinessMap } from "./issues.js";
 import type { QueuedRunAgentIdentity } from "./metrics.js";
 import {
@@ -22,8 +27,70 @@ import {
 const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
 /**
+ * The instant a `queued` run's dispatch wait actually started, for both age
+ * gauges in this file (PEN-5310).
+ *
+ * `coalesce(queued_at, created_at)` on its own is wrong, because a defer
+ * re-stamps `queued_at` on a run it put back without serving it and so resets
+ * the measured age of a run that has been waiting all along. A run whose stamp
+ * a defer wrote is therefore aged from its recorded queue entry instead; every
+ * other row keeps `coalesce(queued_at, created_at)`, which is what preserves
+ * onprem-k8s#2013 for `promoteScheduledRetryRun`.
+ *
+ * ⚠️ The defer arm must NOT be bare `created_at`, however obviously it
+ * suggests itself, and the reason is not the one two paragraphs down. A run
+ * promoted out of a long `scheduled_retry` park CAN then be claimed and
+ * deferred -- `promote -> claim -> defer` -- and `created_at` on that row is
+ * the instant the retry was SCHEDULED, hours earlier. Aging it from there
+ * republishes the whole park as dispatch wait: the #2013 false-stranded
+ * reading, reached from the opposite direction, and common exactly under the
+ * saturation that makes the 1800 s alert matter. So the arm reads
+ * {@link QUEUE_ENTERED_AT_CONTEXT_KEY}, which `promoteScheduledRetryRun`
+ * stamps and no defer writer overwrites, and only falls back to `created_at`
+ * for a run that was never promoted -- where `created_at` really is the
+ * queue-entry instant.
+ *
+ * The defect is not a per-run zeroing. `dispatchRank` ages from `created_at`,
+ * so the oldest rows are considered -- and under saturation refused -- most
+ * often, and every refusal lifts them further out of this ordering. The head
+ * these gauges report is biased towards the rows the dispatcher has touched
+ * LEAST, so the number reads better exactly as the queue gets worse. Measured
+ * 2026-11-07: a true oldest queued run of 11.70 h published as 3.33 h, against
+ * an 1800 s alert threshold.
+ *
+ * ⚠️ Bare `created_at` for EVERYTHING is likewise not the fix: `queued_at` is
+ * always `> created_at`, so it collapses to reverting onprem-k8s#2013 and
+ * re-introduces the alert that change removed.
+ *
+ * ℹ️ The stranded-run reaper does not share this basis -- it still ranks on
+ * plain `coalesce(queued_at, created_at)` -- so after this change the gauge
+ * and the reaper can disagree about the same row's age. That is deliberate and
+ * not a drift to reconcile: the reaper is deciding whether to act on a row,
+ * where a defer touch is real evidence of recent attention, while these gauges
+ * are reporting how long a seat's work has gone unserved.
+ *
+ * The discriminator itself lives in `dispatch-readiness.ts` beside the keys it
+ * reads -- see {@link deferWroteQueuedAtSql} for why it is keyed on the
+ * stamp's value rather than its presence, and for the residual it leaves.
+ * Do not re-derive it here.
+ */
+function effectiveQueuedAtSql() {
+  return sql`case
+    when ${deferWroteQueuedAtSql({
+      contextSnapshot: heartbeatRuns.contextSnapshot,
+      queuedAt: heartbeatRuns.queuedAt,
+    })}
+    then coalesce(
+      ${queueEnteredAtSql({ contextSnapshot: heartbeatRuns.contextSnapshot })},
+      ${heartbeatRuns.createdAt}
+    )
+    else coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt})
+  end`;
+}
+
+/**
  * Refresh the per-agent oldest-`queued`-run-age gauge (BLO-21116). Recomputed
- * from a MIN(coalesce(queued_at, created_at)) aggregate over `heartbeatRuns`
+ * from a MIN({@link effectiveQueuedAtSql}) aggregate over `heartbeatRuns`
  * status='queued', the same "recompute, never trust a stale cache" shape as
  * {@link refreshExternalRuntimeReservationMetrics}. Driven by the background
  * collector in `scrape-metrics-collector.ts`, not by the scrape itself: it ran
@@ -34,7 +101,7 @@ const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
  * scheduler tick to pick it up, which is exactly the "invisible strand" this
  * issue reports -- not a run that failed to enqueue in the first place.
  *
- * Ages off `coalesce(queued_at, created_at)`, not bare `created_at` (Ally
+ * Ages off {@link effectiveQueuedAtSql}, not bare `created_at` (Ally
  * review, onprem-k8s#2013): `queued_at` is null for a fresh `queued` insert,
  * where `created_at` already IS the queue-entry time, but gets stamped with
  * `now()` by the specific transitions that put an *existing* row back into
@@ -43,7 +110,9 @@ const UUID_PATTERN = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{
  * Without the coalesce target, a run
  * promoted after hours in `scheduled_retry` backoff would instantly report
  * that entire backoff as queued-dispatch wait -- the false-stranded-run alert
- * this gauge exists to prevent.
+ * this gauge exists to prevent. PEN-5310: only the first of those three
+ * transitions re-enters the queue, so only it gets the reset; see
+ * {@link effectiveQueuedAtSql} for why the other two must not.
  *
  * Queries every agent id (not just ones with an active company/heartbeat
  * enabled) so a genuinely idle agent reads back an explicit 0 rather than an
@@ -65,7 +134,7 @@ export async function refreshQueuedRunAgeMetrics(db: Db, now = new Date()): Prom
       db
         .select({
           agentId: heartbeatRuns.agentId,
-          oldestQueuedAt: sql<Date | string | null>`min(coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt}))`,
+          oldestQueuedAt: sql<Date | string | null>`min(${effectiveQueuedAtSql()})`,
         })
         .from(heartbeatRuns)
         .where(eq(heartbeatRuns.status, "queued"))
@@ -234,10 +303,10 @@ async function refreshClaimableQueuedRunAgeMetrics(
         ${heartbeatRuns.companyId} as company_id,
         ${heartbeatRuns.contextIssueId} as context_issue_id,
         ${heartbeatRuns.contextSnapshot} as context_snapshot,
-        coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt}) as effective_queued_at,
+        ${effectiveQueuedAtSql()} as effective_queued_at,
         row_number() over (
           partition by ${heartbeatRuns.agentId}
-          order by coalesce(${heartbeatRuns.queuedAt}, ${heartbeatRuns.createdAt}) asc
+          order by ${effectiveQueuedAtSql()} asc
         ) as rn
       from ${heartbeatRuns}
       where ${heartbeatRuns.status} = 'queued'
