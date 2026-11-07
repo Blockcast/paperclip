@@ -15031,10 +15031,31 @@ export function issueRoutes(
         return participant?.type === "agent" && participant.agentId === req.body.agentId;
       })();
 
+    // PEN-5940: a row a PERSON holds is refused at this door by `svc.checkout`'s
+    // own claim predicate, atomically and on every branch that writes
+    // `assigneeAgentId`, so asking `tasks:assign` the same question here is
+    // redundant — it covers no claim the predicate does not.
+    //
+    // It is not merely redundant, it is worse than nothing: the refusal this
+    // door owes a human-held row is the service's 409, because that path also
+    // clears a dead run's execution lock on its way out. A 403 raised here
+    // fires before `svc.checkout` and preempts the hygiene. Both halves are
+    // pinned by "does not let agent checkout seize an in_review issue assigned
+    // to a human reviewer" and "clears but does not adopt a stale execution
+    // lock on an in_review issue assigned to a human reviewer".
+    //
+    // Delegating is safe only because the predicate is complete, which is a
+    // property that had to be established rather than assumed — the
+    // recovery-owner branch was missing the term until this change, and that
+    // branch skips every route-level gate by design. The guard remains live on
+    // the PATCH assignment door, which has no such predicate under it.
+    const humanHeldRowEnforcedByClaimPredicate = Boolean(issue.assigneeUserId);
+
     if (
       issue.assigneeAgentId !== req.body.agentId &&
       !allowSourceScopedRecoveryOwnerCheckout &&
-      !allowExecutionStageParticipantClaim
+      !allowExecutionStageParticipantClaim &&
+      !humanHeldRowEnforcedByClaimPredicate
     ) {
       try {
         await assertCanAssignTasks(req, issue.companyId, {
@@ -15043,18 +15064,15 @@ export function issueRoutes(
           parentIssueId: issue.parentId ?? null,
           assigneeAgentId: req.body.agentId,
           // Correctly `null`: this route's assignment target is an agent, so
-          // nobody is being handed work as a user. PEN-5940 — the field that
-          // reads the row's CURRENT human holder is `currentAssigneeUserId`
-          // below; it is a different question and it had no field until then.
+          // nobody is being handed work as a user. PEN-5940 — this is NOT the
+          // row's current human holder, which is a different question and is
+          // answered for this door by `svc.checkout`'s claim predicate, above.
           assigneeUserId: null,
           // BLO-19094: this is the self-appointment door. Supplying both lets
           // the `tasks:assign` guard refuse a claim on a review/recovery shell
           // the actor was not assigned, without reloading the row.
           originKind: issue.originKind ?? null,
           currentAssigneeAgentId: issue.assigneeAgentId ?? null,
-          // PEN-5940: and refuse a claim on a row a PERSON holds. Read from the
-          // live row — a literal here is what made the guard inert.
-          currentAssigneeUserId: issue.assigneeUserId ?? null,
         });
       } catch (err) {
         if (recoveryCheckoutLookupError) {

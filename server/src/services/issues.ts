@@ -12982,18 +12982,31 @@ export function issueService(db: Db) {
         ? or(isNull(issues.executionRunId), eq(issues.executionRunId, checkoutRunId))
         : isNull(issues.executionRunId);
       const activeRecoveryOwnerCondition = options.allowSourceScopedRecoveryOwner
-        ? exists(
-          db
-            .select({ id: issueRecoveryActions.id })
-            .from(issueRecoveryActions)
-            .where(
-              and(
-                eq(issueRecoveryActions.companyId, issues.companyId),
-                eq(issueRecoveryActions.sourceIssueId, issues.id),
-                eq(issueRecoveryActions.ownerAgentId, agentId),
-                inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+        ? and(
+          // PEN-5940: a row a PERSON holds is not claimable here either. The
+          // other two terms of the `or` below already carry this — the
+          // unassigned condition tests it directly, and the same-run condition
+          // needs `assigneeAgentId = agentId`, which a human-held row never
+          // satisfies. This one did not, and it is the branch with no route
+          // above it: the recovery owner skips `assertCanAssignTasks` AND the
+          // BLO-22856 `issue:mutate` boundary, both deliberately, because this
+          // predicate is what re-validates it atomically. So the predicate has
+          // to carry the whole rule. Without this term the UPDATE's
+          // `assigneeUserId: null` blanks the person off the row.
+          isNull(issues.assigneeUserId),
+          exists(
+            db
+              .select({ id: issueRecoveryActions.id })
+              .from(issueRecoveryActions)
+              .where(
+                and(
+                  eq(issueRecoveryActions.companyId, issues.companyId),
+                  eq(issueRecoveryActions.sourceIssueId, issues.id),
+                  eq(issueRecoveryActions.ownerAgentId, agentId),
+                  inArray(issueRecoveryActions.status, [...ACTIVE_RECOVERY_ACTION_STATUSES]),
+                ),
               ),
-            ),
+          ),
         )
         : undefined;
       const updated = await withLockedIssueCheckoutExecution(id, issueCompany.companyId, checkoutRunId, agentId, now, async (
