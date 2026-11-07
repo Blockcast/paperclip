@@ -1,6 +1,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, approvals } from "@paperclipai/db";
+import type { ApprovalGateKind } from "@paperclipai/shared";
 import {
   setApprovalQueueMetricsRefreshSuccess,
   setApprovalQueuePendingMetrics,
@@ -23,10 +24,20 @@ import {
  * reconciler writes it both when the gated pull request MERGED -- the board
  * acting on the ask, through GitHub instead of through the card -- and when the
  * pull request was closed unmerged and the ask simply died. Only the second is
- * requester-side cleanup. {@link GATE_SATISFIED_DECISION} below admits the first
+ * requester-side cleanup. {@link MERGE_GATE_DECISION} below admits the first
  * and keeps the second out; `withdrawn` stays excluded in full.
  */
 const BOARD_DECISION_STATUSES = ["approved", "rejected", "revision_requested"] as const;
+
+/**
+ * The gate kind whose satisfaction is somebody serving the ask (PEN-5885).
+ *
+ * Typed against `ApprovalGateKind` rather than written as a bare string so that
+ * renaming the kind breaks this file at compile time instead of silently
+ * matching nothing -- a predicate that quietly stops matching restores the exact
+ * under-reporting this constant exists to remove, and nothing would report it.
+ */
+const MERGE_GATE_KIND: ApprovalGateKind = "github_pr_merged";
 
 /**
  * The board serving an ask by MERGING the pull request it asked about (PEN-5885).
@@ -47,6 +58,33 @@ const BOARD_DECISION_STATUSES = ["approved", "rejected", "revision_requested"] a
  * anti-correlated, which is why this is fixed at the platform rather than in
  * guidance.
  *
+ * ⛔ THE KIND FILTER IS LOAD-BEARING AND IS NOT A REFINEMENT. `gate_satisfied`
+ * is true for BOTH live gate kinds, and for `github_actions_run` it means only
+ * "the run this card named ended green" -- `approval-gate-reconciler.ts` says so
+ * on `SUCCESS_CONCLUSION` itself ("a property of the RUN, never of the card's
+ * ask"), and PEN-5103 exists to stop downstream code reading it as the ask being
+ * met. Admitting that kind here would let a green CI run that no human touched
+ * push this gauge to now, which silences `PaperclipApprovalQueueNotServicing`
+ * for a full window while the board is idle -- the same false recovery the
+ * `withdrawn` exclusion was written to prevent, re-entering through the gate
+ * door. The base rate does not soften it: this is a LAST-timestamp gauge, not a
+ * counter, so one wrongly admitted row is a full window of silence regardless of
+ * how rare it is. Measured on company b1d3f3d3 at 2026-11-07T14:10Z, the 35
+ * cancellations split 29 satisfied `github_pr_merged` / 2 satisfied + 4 died
+ * `github_actions_run`, the most recent satisfied run 8 days old -- live, not
+ * legacy.
+ *
+ * ⚠️ What a merged gate establishes is that SOMEONE merged the pull request the
+ * card asked about, which serves the ask. It does not by itself establish that a
+ * human did: this repo requires no review and lands through a merge queue, so an
+ * agent or an auto-merge could in principle be the merger. Dated state, not an
+ * invariant: at 2026-11-07 the 8 most recent gate-satisfied pull requests across
+ * all three repos were merged by the same human account, because agent seats are
+ * barred from enqueuing agent-authored pull requests. If that bar lifts, this
+ * predicate stops implying a human and wants re-measuring -- it will not
+ * self-correct, and nothing here will report the change. Admitting it anyway is
+ * still right, because unlike a green run a merge does discharge the ask.
+ *
  * `gate_satisfied IS TRUE`, never `IS NOT FALSE`: the three-valued column reads
  * null on every row no gate adjudicated, and null here must behave as "not a
  * board decision". The gate-DIED-unsatisfied half (`false`) stays excluded on
@@ -54,7 +92,7 @@ const BOARD_DECISION_STATUSES = ["approved", "rejected", "revision_requested"] a
  * it would let an abandoned branch read as recovery in exactly the way a
  * withdrawal burst must not.
  */
-const GATE_SATISFIED_DECISION = sql`${approvals.status} = 'cancelled' and ${approvals.gateSatisfied} is true`;
+const MERGE_GATE_DECISION = sql`${approvals.status} = 'cancelled' and ${approvals.gateSatisfied} is true and ${approvals.payload}->'gate'->>'kind' = ${MERGE_GATE_KIND}`;
 
 /**
  * Whether a pending card can retire itself, as a gauge label (PEN-5885/PEN-5719).
@@ -211,7 +249,7 @@ export async function refreshApprovalQueueMetrics(db: Db, now = new Date()): Pro
         .select({
           companyId: approvals.companyId,
           requester,
-          decidedAt: sql<Date | string | null>`max(${approvals.decidedAt}) filter (where (${inArray(approvals.status, [...BOARD_DECISION_STATUSES])} or (${GATE_SATISFIED_DECISION})) and ${approvals.decidedAt} is not null)`,
+          decidedAt: sql<Date | string | null>`max(${approvals.decidedAt}) filter (where (${inArray(approvals.status, [...BOARD_DECISION_STATUSES])} or (${MERGE_GATE_DECISION})) and ${approvals.decidedAt} is not null)`,
         })
         .from(approvals)
         .groupBy(approvals.companyId, requester),
