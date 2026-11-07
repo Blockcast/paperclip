@@ -1130,6 +1130,64 @@ type IssueMonitorStatusProjection = {
   monitorStatus: IssueExecutionMonitorStateStatus | null;
 };
 /**
+ * PEN-5935: the TypeScript half of the `monitorStatus` projection, for the surfaces that
+ * cannot use the SQL half.
+ *
+ * `issueListSelect` derives the field in SQL. The single-issue reads below
+ * (`getIssueByUuid` / `getIssueByIdentifier`) run a bare `select()` over the table, and
+ * `monitorStatus` is not a column — so the key was simply ABSENT from the whole
+ * `GET /api/issues/:id` surface while populated on every list row, for the same rows.
+ * Absent is not null, but `jq` / `.get()` / optional chaining all render it as null, and
+ * the published contract defines `monitorStatus: null` as "no monitor was ever armed on
+ * this row". So the natural read of a GET reported a row with a FIRED monitor, actively
+ * held by `tickExpiredIssueMonitors`, as never monitored — the fail-open direction for
+ * every attendance sweep, and the exact shape of the nested `scheduledRetry` arm this
+ * surface already warns about at length.
+ *
+ * ## Agreement with the SQL arm is the point, so this mirrors `->>`, not the parsed type
+ *
+ * `executionState -> 'monitor' ->> 'status'` yields SQL NULL when the state is absent,
+ * when `monitor` is missing, when it is a JSON `null`, when it is a scalar or an array,
+ * and when `status` itself is absent. Each of those returns null here, so the two
+ * surfaces answer identically on every shape the writers can produce. The one boundary
+ * where they could still differ is a `status` stored as a non-string JSON scalar, which
+ * `->>` renders as text (`5` → `"5"`) and this returns as null; no write path can produce
+ * it, since the three builders in `issue-execution-policy.ts` are the only writers of
+ * `executionState.monitor` and they write the union.
+ *
+ * A `status` that IS a string is returned verbatim and deliberately NOT narrowed against
+ * the union: narrowing would make a future member this build does not know about read
+ * null on GET and non-null on the list, which is the divergence this closes, reopened one
+ * value at a time.
+ */
+export function issueMonitorStatusFromExecutionState(
+  executionState: unknown,
+): IssueExecutionMonitorStateStatus | null {
+  if (!executionState || typeof executionState !== "object" || Array.isArray(executionState)) {
+    return null;
+  }
+  const monitor = (executionState as { monitor?: unknown }).monitor;
+  if (!monitor || typeof monitor !== "object" || Array.isArray(monitor)) {
+    return null;
+  }
+  const status = (monitor as { status?: unknown }).status;
+  return typeof status === "string" ? (status as IssueExecutionMonitorStateStatus) : null;
+}
+
+/**
+ * PEN-5935: attach `monitorStatus` to a single-issue read.
+ *
+ * Applied at every exit of the single-issue getters rather than in the route, so the UUID
+ * path, the identifier path and the legacy-identifier path cannot drift apart, and so every
+ * consumer of `issuesSvc.getById` sees the same key the list rows carry rather than only
+ * the one route that remembered to compose it. Unconditional: the key is present on every
+ * row, holding null where no monitor was ever armed, because a key a caller has to test for
+ * is the defect this closes.
+ */
+function withMonitorStatus<T extends IssueRow>(row: T): T & IssueMonitorStatusProjection {
+  return { ...row, monitorStatus: issueMonitorStatusFromExecutionState(row.executionState) };
+}
+/**
  * A row as `issueListSelect` actually returns it: every table column, plus the columns that
  * projection computes in SQL. `dbOrTx` is untyped, so the select's shape cannot be inferred
  * at the call sites and has to be stated — state it as this, never as the bare `IssueRow`,
@@ -4473,6 +4531,15 @@ const issueListSelect = {
   // NULL too, so absent and never-armed both read null, which is the honest answer. Cost is
   // two `->`/`->>` lookups on a column this row already carries, strictly less than the
   // `jsonb_each` + `jsonb_object_agg` the `executionState` projection above already pays.
+  //
+  // PEN-5935: this is ONE OF TWO ARMS and they must stay in step.
+  // `issueMonitorStatusFromExecutionState` is the other, for the single-issue reads, which
+  // run a bare `select()` and so cannot use this SQL. While only this arm existed, the GET
+  // surface answered "no monitor was ever armed" for every monitored row in the company —
+  // measured on PEN-5900 (`triggered`) and PEN-5920 (`scheduled`), key absent on both.
+  // Change the semantics here and change it there, in the same commit;
+  // `issue-list-monitor-status.test.ts` drives both off one set of stored rows and fails if
+  // either is dropped or if they disagree.
   monitorStatus: sql<IssueExecutionMonitorStateStatus | null>`${issues.executionState} -> 'monitor' ->> 'status'`,
   monitorAttemptCount: issues.monitorAttemptCount,
   monitorNotes: issues.monitorNotes,
@@ -6735,7 +6802,7 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
-    return enriched;
+    return withMonitorStatus(enriched);
   }
 
   async function getIssueByIdentifier(identifier: string) {
@@ -6749,7 +6816,7 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (row) {
       const [enriched] = await withIssueLabels(db, [row]);
-      return enriched;
+      return withMonitorStatus(enriched);
     }
     // Legacy fallback: 0084's BLO→PCL backfill stashed the pre-rename
     // identifier in `legacy_identifier` so old URLs (bookmarks, agent
@@ -6767,7 +6834,7 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!legacyRow) return null;
     const [enriched] = await withIssueLabels(db, [legacyRow]);
-    return enriched;
+    return withMonitorStatus(enriched);
   }
 
   async function getCurrentScheduledRetryForIssue(issueId: string, companyId: string): Promise<IssueScheduledRetryRow | null> {

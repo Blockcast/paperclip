@@ -178,7 +178,44 @@ describe("paperclip MCP tools", () => {
     expect(description).toMatch(/gate does not save you because that key can never appear on this surface/);
     // And the fields that need NO translation are named, so the warning does
     // not read as "nothing on this surface is top-level".
-    expect(description).toMatch(/`monitorNextCheckAt` and `activeRun` ARE top-level/);
+    expect(description).toMatch(/`monitorNextCheckAt`, `monitorStatus` and `activeRun` ARE top-level/);
+  });
+
+  // PEN-5935. The sentence above used to close by calling the retry arm the only one that
+  // changes shape. That was true when written, and PEN-5481 falsified it by shipping
+  // `monitorStatus` on the list projection alone, leaving the key ABSENT here — so the
+  // contract told a reader who did the right thing, and read it before trusting the field,
+  // that no monitor field needed translating, about the one monitor field attendance now
+  // turns on. Pinned NEGATIVELY as well as positively: a revert of the projection that
+  // restored the old sentence would otherwise pass every assertion above.
+  //
+  // This is why the correction in the description PARAPHRASES the retired claim instead of
+  // quoting it. A `not.toContain` cannot tell a quotation from a restoration, so a
+  // correction that quotes its own target disarms the guard against it — this assertion
+  // failed on exactly that, first run. Keeping the retired wording out of the file makes it
+  // a tripwire: a grep that hits means the claim is live again, not merely discussed.
+  it("paperclipGetIssue does not claim the retry arm is the only one that changes shape", () => {
+    const { description } = getTool("paperclipGetIssue");
+    expect(description).not.toContain("it is only the retry arm that changes shape");
+    expect(description).toContain("CALLING THE RETRY ARM THE ONLY ONE THAT CHANGES SHAPE");
+    expect(description).toContain("FALSE FOR `monitorStatus` BETWEEN PEN-5481 AND PEN-5935");
+  });
+
+  // The field is only useful if its meanings are the list's meanings, and the null is the
+  // one that inverts: absent renders as null and null is contractually "never armed", so a
+  // skewed server reports a row a sweep is holding as one nothing ever watched. The
+  // description has to carry the presence gate, and it has to say why the list's gloss of
+  // absence — "an old deploy, it will fix itself" — does not transfer to this surface,
+  // where absence was permanent.
+  it("paperclipGetIssue carries the monitorStatus skew gate and refuses the list's gloss of absence", () => {
+    const { description } = getTool("paperclipGetIssue");
+    expect(description).toContain('has("monitorStatus")');
+    expect(description).toContain("NO MONITOR WAS EVER ARMED on this row");
+    expect(description).toMatch(/do NOT carry over the list description's gloss of that absence as deploy skew/);
+    expect(description).toContain("permanent and by design until PEN-5935");
+    // The semantics live in one place; this surface points at it rather than forking a
+    // second copy that can drift.
+    expect(description).toMatch(/Read the attendance predicate, the `null` meaning, and the status\/assignee precondition on a `triggered` monitor from the paperclipListIssues description/);
   });
 
   // The shared issue-list `limit` schema (paperclipListIssues, paperclip_search_issues)
