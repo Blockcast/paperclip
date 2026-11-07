@@ -285,9 +285,9 @@ Terminal denials:
 
 ## "No assignee" vs "no agent assignee"
 
-`allow_company_agent` is the only row of the grid whose condition used to be stated
-more narrowly than the code implements, and the gap is load-bearing: **an issue
-assigned to a named human is, to `decideBase`, an unassigned issue.**
+`allow_company_agent`'s condition used to be stated more narrowly than the code
+implements, and the gap is load-bearing: **an issue assigned to a named human is,
+to `decideBase`, an unassigned issue.**
 
 The claim branch tests `assigneeAgentId` and nothing else:
 
