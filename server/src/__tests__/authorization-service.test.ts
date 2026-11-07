@@ -84,6 +84,7 @@ async function createIssue(
     projectId?: string | null;
     parentId?: string | null;
     assigneeAgentId?: string | null;
+    assigneeUserId?: string | null;
     createdByAgentId?: string | null;
     originKind?: string | null;
     originId?: string | null;
@@ -100,6 +101,7 @@ async function createIssue(
       projectId: input.projectId ?? null,
       parentId: input.parentId ?? null,
       assigneeAgentId: input.assigneeAgentId ?? null,
+      assigneeUserId: input.assigneeUserId ?? null,
       createdByAgentId: input.createdByAgentId ?? null,
       originKind: input.originKind ?? "manual",
       originId: input.originId ?? null,
@@ -2200,9 +2202,19 @@ describeEmbeddedPostgres("authorization service", () => {
     // Escalations addressed to a human (`assigneeAgentId: null` +
     // `assigneeUserId`) are the second denied kind: an agent claiming one
     // answers the question that was put to the user.
+    //
+    // PEN-5900: `assigneeUserId` is now actually SET here, on both the fixture
+    // and the resource. It previously was not — this comment named the property
+    // while nothing in the suite established it, so the case was green on
+    // `originKind` alone and would have been byte-identically green if
+    // `assigneeUserId` were not a concept. Setting it does NOT change this
+    // verdict, and that is the point worth pinning: the denial is reached
+    // through `originKind`, never through "addressed to a human". The row
+    // below proves the gap that distinction leaves open.
     const escalationIssue = await createIssue(db, company.id, {
       title: "Orphaned productivity review escalation",
       assigneeAgentId: null,
+      assigneeUserId: `user-${randomUUID()}`,
       originKind: "productivity_review_escalation",
       originId: manualIssue.id,
     });
@@ -2214,6 +2226,88 @@ describeEmbeddedPostgres("authorization service", () => {
         companyId: company.id,
         issueId: escalationIssue.id,
         assigneeAgentId: null,
+        assigneeUserId: escalationIssue.assigneeUserId,
+        status: "todo",
+      },
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+  });
+
+  // PEN-5900. CHARACTERIZATION, NOT RATIFICATION: this pins what `decideBase`
+  // ships today, which the ratified model doc and the `allow_company_agent`
+  // relation label both describe incorrectly. The decision on whether this
+  // behaviour is correct is the CTO's and is open; whichever option lands, THIS
+  // is the test that must change, which is the whole reason it exists.
+  //
+  // The gap: the claim branch keys on `assigneeAgentId` alone, and suppression
+  // keys on a two-element `originKind` allowlist. A row handed to a human —
+  // `assigneeAgentId: null`, `assigneeUserId` set, `originKind: "manual"` —
+  // matches neither, so every agent in the company holds `issue:mutate` on it.
+  // That is the same hazard the suppression allowlist already articulates for
+  // `productivityReviewEscalation` ("an agent claiming it answers the question
+  // that was asked of the user"), reached by every human-assigned row whose
+  // `originKind` the allowlist does not name. Human decision gates are the
+  // dominant use of human assignment in this company, and a gate any agent may
+  // set to `done` is not a gate. (Fleet counts are a dated snapshot and live in
+  // docs/security/issue-authorization-model.md and on PEN-5900, not here.)
+  it("treats a human-assigned issue as unassigned: every company agent may mutate it (PEN-5900)", async () => {
+    const company = await createCompany(db, "HumanAssignedIssueClaim");
+    const actor = await createAgent(db, company.id, { role: "engineer" });
+    const authorization = authorizationService(db);
+    const actorContext = { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_key" } as const;
+
+    // The shape the CTO described on PEN-2526 as "not unassigned": no agent
+    // holds it, a named human does. `originKind: "manual"` is the default, so
+    // this row sits outside the two-element suppression allowlist.
+    const humanAssigned = await createIssue(db, company.id, {
+      title: "CONFIRMATION GATE - operator to confirm",
+      assigneeAgentId: null,
+      assigneeUserId: `user-${randomUUID()}`,
+      originKind: "manual",
+    });
+    const resource = {
+      type: "issue",
+      companyId: company.id,
+      issueId: humanAssigned.id,
+      assigneeAgentId: null,
+      assigneeUserId: humanAssigned.assigneeUserId,
+      originKind: "manual",
+      status: "todo",
+    } as const;
+
+    // Asserted because it is useful and uncontested: an agent may speak on a
+    // human's row. No option under consideration removes this.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "issue:comment",
+      resource,
+    })).resolves.toMatchObject({ allowed: true, reason: "allow_company_agent" });
+
+    // The finding. An unrelated agent may REWRITE a row addressed to a named
+    // human — including closing it. Flip this cell when the decision lands.
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "issue:mutate",
+      resource,
+    })).resolves.toMatchObject({ allowed: true, reason: "allow_company_agent" });
+
+    // Control: the gap is in the predicate, not in the fixture. The identical
+    // row with an AGENT assignee is denied, so `assigneeUserId` is carrying no
+    // weight at this bar — it is `assigneeAgentId` doing all of the work.
+    const agentAssigned = await createIssue(db, company.id, {
+      title: "Same row, held by an agent",
+      assigneeAgentId: (await createAgent(db, company.id, { role: "engineer" })).id,
+      originKind: "manual",
+    });
+    await expect(authorization.decide({
+      actor: actorContext,
+      action: "issue:mutate",
+      resource: {
+        type: "issue",
+        companyId: company.id,
+        issueId: agentAssigned.id,
+        assigneeAgentId: agentAssigned.assigneeAgentId,
+        assigneeUserId: null,
+        originKind: "manual",
         status: "todo",
       },
     })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
@@ -4775,6 +4869,7 @@ describeEmbeddedPostgres("authorization service", () => {
       | "cloud_tenant_support"
       | "assignee"
       | "unassigned"
+      | "human_assigned"
       | "creator"
       | "manager"
       | "manager_with_tasks_assign"
@@ -4847,7 +4942,21 @@ describeEmbeddedPostgres("authorization service", () => {
         case "unassigned": {
           // Deliberately `originKind: "manual"`: a review or escalation shell is
           // suppressed here on purpose (BLO-19094) and is covered elsewhere.
+          // Genuinely unheld — no agent AND no human. The human-assigned case is
+          // its own row below, because `decideBase` does not distinguish them
+          // and the grid used to imply it did (PEN-5900).
           issueInput.assigneeAgentId = null;
+          actorAgentId = (await createAgent(db, company.id, { role: "engineer" })).id;
+          break;
+        }
+        case "human_assigned": {
+          // PEN-5900. `assigneeAgentId: null` + `assigneeUserId` set: the row is
+          // held by a named human, not by nobody. The claim branch reads only
+          // `assigneeAgentId`, so this lands on `allow_company_agent` exactly
+          // like the row above. Pinned separately so the grid cannot again be
+          // read as covering only genuinely unheld rows.
+          issueInput.assigneeAgentId = null;
+          issueInput.assigneeUserId = `user-${randomUUID()}`;
           actorAgentId = (await createAgent(db, company.id, { role: "engineer" })).id;
           break;
         }
@@ -4995,6 +5104,7 @@ describeEmbeddedPostgres("authorization service", () => {
           projectId: issue.projectId,
           parentIssueId,
           assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
           createdByAgentId: issue.createdByAgentId,
           status: issue.status,
         } as const,
@@ -5075,7 +5185,25 @@ describeEmbeddedPostgres("authorization service", () => {
       },
       {
         relation: "unassigned",
-        note: "nobody is accountable yet, so any same-company agent may pick it up",
+        note: "no agent AND no human holds it, so any same-company agent may pick it up",
+        cells: [
+          { action: "issue:comment", allowed: true, reason: "allow_company_agent" },
+          { action: "issue:mutate", allowed: true, reason: "allow_company_agent" },
+          { action: "issue:coordination_metadata", allowed: false, reason: "deny_scope" },
+        ],
+      },
+      {
+        // PEN-5900, OPEN DECISION — characterization, not ratification. The
+        // mutate cell is the finding: a row addressed to a named human is
+        // rewritable, and closable, by every agent in the company. It reads
+        // identically to `unassigned` above because `decideBase` keys the claim
+        // branch on `assigneeAgentId` alone, while the suppression that WOULD
+        // catch it keys on a two-element `originKind` allowlist that 53 of the
+        // 56 measured open instances fall outside. Whichever remediation the
+        // CTO lands, this row changes; until then it is here so the grid states
+        // what ships.
+        relation: "human_assigned",
+        note: "PEN-5900 — `assigneeUserId` set, `assigneeAgentId` null: held by a human, treated as unheld",
         cells: [
           { action: "issue:comment", allowed: true, reason: "allow_company_agent" },
           { action: "issue:mutate", allowed: true, reason: "allow_company_agent" },
@@ -5222,9 +5350,13 @@ describeEmbeddedPostgres("authorization service", () => {
     it("covers every relation the model documents, in both directions", () => {
       // Guards against a row being deleted to make a failure go away, and
       // against a cell being dropped rather than fixed.
-      // 20 = the 18 rows of the doc's grid, with its parent-or-sibling and
-      // dependency-edge rows each modelled as two relations.
-      expect(MATRIX).toHaveLength(20);
+      // 21 = the 18 rows of the doc's grid, with its parent-or-sibling and
+      // dependency-edge rows each modelled as two relations, plus
+      // `human_assigned` (PEN-5900). That last one is NOT a 19th grid row: it
+      // is the second shape of the single `allow_company_agent` row, split out
+      // because the grid's one condition covers two materially different
+      // states — unheld, and held by a named human — and said only the first.
+      expect(MATRIX).toHaveLength(21);
       for (const row of MATRIX) {
         expect(row.cells.map((cell) => cell.action), row.relation).toEqual([
           "issue:comment",
