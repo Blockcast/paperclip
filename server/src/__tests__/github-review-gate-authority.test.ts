@@ -102,6 +102,8 @@ function reviewPayload(options: {
   headSha?: string;
   reviewCommitId?: string;
   baseRef?: string;
+  /** `null` drops `review.user` entirely -- the unresolvable-reviewer case. */
+  reviewerLogin?: string | null;
 } = {}): Record<string, unknown> {
   return {
     action: options.action ?? "submitted",
@@ -115,7 +117,9 @@ function reviewPayload(options: {
     review: {
       state: options.state ?? "approved",
       commit_id: options.reviewCommitId ?? REVIEW_HEAD,
-      user: { login: "kkroo" },
+      ...(options.reviewerLogin === null
+        ? {}
+        : { user: { login: options.reviewerLogin ?? "kkroo" } }),
     },
   };
 }
@@ -398,13 +402,13 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
   // is the scarcest resource in the system. Retracting the gate to `pending`
   // when one is cast knocks a required context out of `success` for minutes,
   // and a lander that re-reads merge state inside that window withdraws the
-  // approval it just spent -- 14 destroyed across 6 PRs. An approval only ever
-  // ADDS clearing evidence, so the retraction has nothing to revoke there.
+  // approval it just spent. A DISTINCT reviewer's approval only ever ADDS
+  // clearing evidence, so the retraction has nothing to revoke there.
   //
   // Mutation control: delete the `approved` conjunct (or the whole guard) in
-  // `approvalCannotInvalidateStandingVerdict` and this goes red on the first
+  // `approvalAddsOnlyClearingEvidence` and this goes red on the first
   // assertion -- the status POST reappears.
-  it("does not retract the gate to pending when an approval is submitted", async () => {
+  it("does not retract the gate to pending when a distinct reviewer's approval is submitted", async () => {
     await enqueue({ eventName: "pull_request_review", payload: reviewPayload() });
     const fetchMock = installGithubStub();
 
@@ -417,19 +421,33 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
     const delivered = await readDelivery();
     expect(delivered).toMatchObject({ status: "delivered" });
     expect(delivered?.lastResult).toMatchObject({
-      pendingRetractionSkipped: "review_approval_cannot_invalidate_standing_verdict",
+      pendingRetractionSkipped: "approval_adds_only_clearing_evidence",
     });
   });
 
-  // The other three review shapes can each LOWER the verdict, so each must keep
-  // retracting. Without these a future widening of the guard to "any review
-  // event" would leave a stale `success` standing on a head whose clearing
-  // evidence has just been removed -- the fail-OPEN direction on a required gate.
-  it.each([
-    ["dismissed", { action: "dismissed" as const, state: "dismissed" }],
-    ["changes_requested", { action: "submitted" as const, state: "changes_requested" }],
-    ["commented", { action: "submitted" as const, state: "commented" }],
-    ["an edited approval", { action: "edited" as const, state: "approved" }],
+  // Every other review shape can LOWER the verdict, so each must keep
+  // retracting. Without these a widening of the guard to "any review event", or
+  // to "any approval", would leave a stale `success` standing on a head whose
+  // clearing evidence has just been removed -- the fail-OPEN direction on a
+  // required gate.
+  //
+  // ALLY'S OWN approval is in this set, and it is the row that is easy to get
+  // wrong: the consumer evaluator runs its blocking-body classifier on Ally
+  // APPROVED reviews exactly as on COMMENTED ones, so an Ally approval carrying
+  // `Critical/Important Issues (N>0)` resolves to `failure` and outranks the
+  // standing `success`. Both spellings are covered, because `normalizeLogin` is
+  // the only thing that makes them one identity.
+  //
+  // The last row is the uncertainty case: a payload that names no reviewer
+  // cannot be told apart from an Ally one, so it retracts.
+  it.each<[string, Parameters<typeof reviewPayload>[0]]>([
+    ["dismissed", { action: "dismissed", state: "dismissed" }],
+    ["changes_requested", { action: "submitted", state: "changes_requested" }],
+    ["commented", { action: "submitted", state: "commented" }],
+    ["an edited approval", { action: "edited", state: "approved" }],
+    ["an Ally App approval", { reviewerLogin: "allyblockcast[bot]" }],
+    ["an Ally approval spelled without the bot suffix", { reviewerLogin: "AllyBlockcast" }],
+    ["an approval whose payload names no reviewer", { reviewerLogin: null }],
   ])("still retracts the gate to pending on %s", async (_label, options) => {
     await enqueue({ eventName: "pull_request_review", payload: reviewPayload(options) });
     const fetchMock = installGithubStub();
@@ -438,6 +456,29 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
 
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${LIVE_HEAD}`))).toBe(true);
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${REVIEW_HEAD}`))).toBe(true);
+    expect(await readDelivery()).toMatchObject({ status: "delivered" });
+  });
+
+  // The final uncertainty case, which cannot be reached through `enqueue`:
+  // `enqueueGithubReviewGateDelivery` defaults an unconfigured
+  // `reviewerBotLogin` to `allyblockcast[bot]` before persisting, so the column
+  // is never blank on that path. The guard still tests it, because the column
+  // is only `NOT NULL` -- blank is representable -- and reaching it requires
+  // writing the row, which is what this does. Without the `reviewer !== ""`
+  // conjunct a blank column normalizes to `""`, every reviewer compares
+  // unequal to it, and EVERY approval including Ally's would skip the
+  // retraction: the widest possible fail-open, from a missing config value.
+  it("still retracts the gate to pending when the row carries no reviewer login", async () => {
+    await enqueue({ eventName: "pull_request_review", payload: reviewPayload() });
+    await db
+      .update(githubReviewGateDeliveries)
+      .set({ reviewerBotLogin: "" })
+      .where(eq(githubReviewGateDeliveries.deliveryId, "delivery-1"));
+    const fetchMock = installGithubStub();
+
+    await pollGithubReviewGateDeliveriesOnce(db);
+
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${LIVE_HEAD}`))).toBe(true);
     expect(await readDelivery()).toMatchObject({ status: "delivered" });
   });
 

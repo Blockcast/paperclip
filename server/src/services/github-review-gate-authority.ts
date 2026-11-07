@@ -83,6 +83,8 @@ interface Candidate {
   action: string;
   /** Lower-cased `review.state` on a `pull_request_review`; null on every other event. */
   reviewState: string | null;
+  /** `review.user.login` through `normalizeLogin`; null on every other event, and null when the payload carries none. */
+  reviewerLogin: string | null;
   eventBaseRef: string | null;
   eventHeadShas: string[];
   recoveryHeadSha: string | null;
@@ -163,6 +165,7 @@ function resolveCandidate(
       eventName,
       action,
       reviewState: null,
+      reviewerLogin: null,
       eventBaseRef: stringField(base?.ref),
       eventHeadShas: [fullSha(head?.sha)].filter((sha): sha is string => Boolean(sha)),
       recoveryHeadSha: action === "synchronize" ? fullSha(payload.before) : null,
@@ -185,6 +188,7 @@ function resolveCandidate(
       eventName,
       action,
       reviewState: (stringField(review?.state) ?? "").toLowerCase() || null,
+      reviewerLogin: normalizeLogin(record(review?.user)?.login) || null,
       eventBaseRef: stringField(base?.ref),
       eventHeadShas: [fullSha(head?.sha), fullSha(review?.commit_id)]
         .filter((sha): sha is string => Boolean(sha)),
@@ -208,6 +212,7 @@ function resolveCandidate(
       eventName,
       action,
       reviewState: null,
+      reviewerLogin: null,
       eventBaseRef: null,
       eventHeadShas: signals.headShas,
       recoveryHeadSha: null,
@@ -447,29 +452,36 @@ type PendingRevocationResult =
 
 // The `pending` write above exists for ONE job: retracting a standing `success`
 // that the incoming event may have invalidated, so the gate fails closed while
-// the authoritative evaluator recomputes. An approval submission cannot
-// invalidate one. It only ever ADDS clearing evidence -- if the head reads
-// `success` the premises behind it (a clean exact-head Ally review, an
-// allowlisted authoring lane, an existing distinct-reviewer approval) are all
-// untouched by a further approval, and if the head does not read `success`
-// there is no green to protect. So on this one event the retraction has nothing
-// to revoke, and it is pure cost.
+// the authoritative evaluator recomputes. An approval from a reviewer OTHER
+// than Ally cannot invalidate one. It only ever ADDS clearing evidence:
+// `distinctReviewerSignalsForHead` maps APPROVED to `success` or `pending` and
+// never to `failure`, and `gateSignalsForSelfReview` keeps a standing Ally
+// `success` unless a distinct reviewer's current verdict is a failure -- which
+// only CHANGES_REQUESTED can be. So on this one event the retraction has
+// nothing to revoke, and it is pure cost.
 //
-// That cost is the scarcest resource in the system. `review/ally-complete` is
-// one of ten required contexts on the consumer's protected base, and PRs are
-// authored by the App, which GitHub bars from approving its own PR -- so a
-// non-Ally human approval is the only way most PRs here ever merge. Casting one
-// fires this webhook, which knocks the context out of `success` ~3-4s later, and
-// the dispatched evaluator takes MINUTES to put it back. Any lander that
-// approves and then re-reads merge state inside that window sees BLOCKED, or
-// gets `405 Base branch policy prohibits the merge` on a non-admin merge, and
-// withdraws the approval it just spent. Measured on Blockcast/penstock-llm-proxy-core:
-// 14 approvals destroyed across 6 PRs, 0 live human approvals across 88 blocked
-// PRs. #2983 took it three times (2026-11-06T01:09Z, 01:34Z, 2026-11-07T02:28Z);
-// its recovery windows were 4m27s and 8m36s, so this is not a sub-minute blip
-// that a short wait absorbs. The withdrawal is itself a `dismissed` review
-// event, which re-enters this function and re-arms the race for the next
-// attempt (PEN-5868).
+// ALLY'S OWN approvals are excluded, and that exclusion is load-bearing rather
+// than caution. The evaluator runs the blocking-body classifier on Ally
+// APPROVED reviews exactly as it does on COMMENTED ones, so an Ally approval
+// whose body carries `Critical/Important Issues (N>0)` or an explicit
+// changes-requested marker resolves to `failure`; `chooseCurrentSignal`
+// short-circuits on a review failure and `reduceCurrentAuthorSignals` keeps
+// only that author's latest signal, so it outranks the earlier `success`.
+// Skipping the retraction there would leave a stale green published for the
+// whole dispatch round trip -- fail-OPEN on a required context, the direction
+// this gate exists to prevent. An unresolvable reviewer login, or an
+// unconfigured `reviewerBotLogin`, is the same uncertainty and retracts too.
+// `commentSignals`' `?? "allyblockcast[bot]"` default is deliberately NOT
+// reused: there a wrong guess over-includes events, here it would under-retract.
+//
+// The cost this buys back is the scarcest resource in the system: on the
+// consumer repo `review/ally-complete` is required and PRs are App-authored,
+// which GitHub bars from approving itself, so a distinct human approval is the
+// only way most PRs there ever merge. Casting one fired this webhook and took
+// the context out of `success` for minutes; a lander that re-read merge state
+// inside that window withdrew the approval it had just spent, and the
+// withdrawal is itself a `dismissed` event that re-entered here and re-armed
+// the race. Census, recovery windows and timestamps: PEN-5868.
 //
 // The dispatch is deliberately NOT skipped: the evaluator still recomputes and
 // republishes the verdict for this head on exactly the same path it always did.
@@ -480,12 +492,19 @@ type PendingRevocationResult =
 // carry blocking findings, `dismissed` removes an approval a `success` may rest
 // on, and `edited` can rewrite a `Reviewed head:` marker -- every one of those
 // can lower the verdict, so every one of them still retracts.
-function approvalCannotInvalidateStandingVerdict(candidate: Candidate): boolean {
-  return (
-    candidate.eventName === "pull_request_review" &&
-    candidate.action === "submitted" &&
-    candidate.reviewState === "approved"
-  );
+function approvalAddsOnlyClearingEvidence(
+  candidate: Candidate,
+  reviewerBotLogin: string | null | undefined,
+): boolean {
+  if (
+    candidate.eventName !== "pull_request_review" ||
+    candidate.action !== "submitted" ||
+    candidate.reviewState !== "approved"
+  ) {
+    return false;
+  }
+  const reviewer = normalizeLogin(reviewerBotLogin);
+  return reviewer !== "" && candidate.reviewerLogin !== null && candidate.reviewerLogin !== reviewer;
 }
 
 async function postPendingStatusesForDelivery(row: DeliveryRow): Promise<PendingRevocationResult> {
@@ -533,7 +552,7 @@ async function postPendingStatusesForDelivery(row: DeliveryRow): Promise<Pending
   ].filter((sha): sha is string => Boolean(sha)))];
   const origin = originRequestId(row.deliveryId);
   const targetUrl = candidate.targetUrl ?? pullRequest.targetUrl;
-  const retractionSkipped = approvalCannotInvalidateStandingVerdict(candidate);
+  const retractionSkipped = approvalAddsOnlyClearingEvidence(candidate, row.reviewerBotLogin);
   const statusResults = retractionSkipped
     ? []
     : await Promise.all(
@@ -564,7 +583,7 @@ async function postPendingStatusesForDelivery(row: DeliveryRow): Promise<Pending
       headShas,
       originRequestId: origin,
       ...(retractionSkipped
-        ? { pendingRetractionSkipped: "review_approval_cannot_invalidate_standing_verdict" }
+        ? { pendingRetractionSkipped: "approval_adds_only_clearing_evidence" }
         : {}),
     },
   };
