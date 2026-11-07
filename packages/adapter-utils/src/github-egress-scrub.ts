@@ -432,6 +432,35 @@ const K8S_NAME_MAX_GENERATED_LENGTH = 10;
 /** Total opaque mass. This is the entropy budget the rule spends; see the
  *  residual note above for what it buys and what it costs. */
 const K8S_NAME_MAX_GENERATED_MASS = 16;
+/** PEN-5921: the alphabet Kubernetes itself draws generated segments from —
+ *  `alphanums` in k8s.io/apimachinery/pkg/util/rand, used by `rand.String`
+ *  for a pod's suffix and by `rand.SafeEncodeString` for a ReplicaSet's
+ *  pod-template-hash. It is deliberately VOWEL-FREE and also drops `0`, `1`,
+ *  `3` and `y`, so it is 27 symbols wide rather than base36's 36. That is
+ *  what makes it a real conjunct and not decoration: a hex or base36 payload
+ *  only wears it by accident at (11/16)^15 and (27/36)^15 respectively.
+ *  Measured on a live 1054-pod cluster: 1215/1470 generated segments conform,
+ *  and every non-conformer is an ARC runner name embedding UUID fragments,
+ *  which this rule declines on word mass anyway. */
+const K8S_GENERATED_SEGMENT_RE = /^[bcdfghjklmnpqrstvwxz2456789]+$/;
+/** A pod's own suffix is exactly this wide — `randomLength` in
+ *  k8s.io/apiserver/pkg/storage/names. Fixed, not a range. */
+const K8S_POD_SUFFIX_LENGTH = 5;
+/** A pod-template-hash as `rand.SafeEncodeString` emits it. The upper bound is
+ *  K8S_NAME_MAX_GENERATED_LENGTH; the lower one is what keeps a short opaque
+ *  run from standing in for a hash. */
+const K8S_POD_TEMPLATE_HASH_MIN_LENGTH = 8;
+/** Word mass demanded of a name admitted by the LAYOUT rule below. Half the
+ *  general floor, and the price this rule pays; see the residual note. */
+const K8S_GENERATED_LAYOUT_MIN_WORD_MASS = 8;
+/** Widest MID-NAME generated segment admitted without the alphabet conjunct.
+ *  A segment that is neither the suffix nor the pod-template-hash is part of
+ *  the service name a human chose — `ipv6`, `e2e`, `orc8r` — and those are
+ *  short. Measured across the 89 live names this rule frees: every mid-name
+ *  generated segment is either <= 5 characters or already conforms to the k8s
+ *  alphabet, so this cap costs nothing and stops a 10-character unconstrained
+ *  run from riding along behind a word. */
+const K8S_INLINE_GENERATED_MAX_LENGTH = 5;
 /** PEN-4438 (D7): names whose values take the Kubernetes object-name shape.
  *  BLO-49591 added `namespace` (a DNS-1123 label, e.g. a preview namespace
  *  carrying an issue number) and `node` / `host_name` (a node name, as
@@ -450,31 +479,151 @@ const K8S_OBJECT_NAME_VALUE_NAMES = new Set([
   "pod",
 ]);
 
-/** True when a value is a Kubernetes object name or in-cluster DNS name. */
-function isKubernetesObjectName(value: string): boolean {
-  if (value.length > K8S_NAME_MAX_LENGTH) return false;
+interface K8sNameParts {
+  /** Every hyphen-separated segment, in order, across every dot-label. */
+  segments: string[];
+  wordMass: number;
+  generatedSegments: number;
+  generatedMass: number;
+}
+
+/** Split a value into the segment classes the rules below score, or null when
+ *  it is not a DNS-1123 subdomain within the structural caps at all. Shared so
+ *  that the layout rule cannot drift from the general rule's shape gate. */
+function k8sNameParts(value: string): K8sNameParts | null {
+  if (value.length > K8S_NAME_MAX_LENGTH) return null;
   const labels = value.split(".");
-  if (labels.length > K8S_NAME_MAX_LABELS) return false;
+  if (labels.length > K8S_NAME_MAX_LABELS) return null;
+  const segments: string[] = [];
   let wordMass = 0;
   let generatedSegments = 0;
   let generatedMass = 0;
   for (const label of labels) {
-    if (!K8S_DNS_LABEL_RE.test(label)) return false;
+    if (!K8S_DNS_LABEL_RE.test(label)) return null;
     for (const segment of label.split("-")) {
+      segments.push(segment);
       if (/^[a-z]+$/.test(segment)) {
         wordMass += segment.length;
         continue;
       }
       if (/^[0-9]+$/.test(segment)) continue;
-      if (segment.length > K8S_NAME_MAX_GENERATED_LENGTH) return false;
+      if (segment.length > K8S_NAME_MAX_GENERATED_LENGTH) return null;
       generatedSegments += 1;
       generatedMass += segment.length;
     }
   }
+  if (generatedSegments > K8S_NAME_MAX_GENERATED_SEGMENTS) return null;
+  if (generatedMass > K8S_NAME_MAX_GENERATED_MASS) return null;
+  return { segments, wordMass, generatedSegments, generatedMass };
+}
+
+/** True when a value is a Kubernetes object name or in-cluster DNS name. */
+function isKubernetesObjectName(value: string): boolean {
+  const parts = k8sNameParts(value);
+  return parts !== null && parts.wordMass >= K8S_NAME_MIN_WORD_MASS;
+}
+
+/** PEN-5921: true when a value wears the layout a Kubernetes POD CONTROLLER
+ *  emits, as opposed to merely scoring enough word mass to look like one.
+ *
+ *  WHY A SECOND RULE RATHER THAN A LOWER FLOOR. The general rule above prices
+ *  admission in word mass, and a generated pod name spends its length on the
+ *  pod-template-hash and the 5-character suffix — so a SHORT service name
+ *  cannot reach the floor however real it is. `llm-proxy-7d4f9bc85x-k2mnp`
+ *  musters 8 and is refused while the 40-character
+ *  `penstock-llm-proxy-core-7d4f9bc85x-k2mnp` passes: length is not the
+ *  discriminator in either direction. Measured against a live 1054-pod
+ *  cluster, the shipped rule refuses 209 of them under `pod=`; this rule
+ *  frees 89 and newly blocks none.
+ *
+ *  Lowering K8S_NAME_MIN_WORD_MASS to 12 was the obvious knob and is REFUSED.
+ *  It is name-free in effect — it reaches all eight anchored names — and it
+ *  multiplies the escape rate of exactly the shape real API keys take:
+ *  measured per 100k random tokens wearing a hyphenated layout, 10 -> 767 for
+ *  hex and 3876 -> 22518 for base36. It unblocks 73 of the 209 live names and
+ *  buys that with a 5.8x residual on the family that matters.
+ *
+ *  THE SHAPE. On top of every conjunct the general rule already applies, a
+ *  value is admitted here when its trailing segments are the two layouts a
+ *  controller actually emits —
+ *
+ *    <words>-<pod-template-hash 8-10>-<suffix 5>   Deployment / ReplicaSet
+ *    <words>-<suffix 5>                            DaemonSet / Job / bare pod
+ *
+ *  — the suffix and the pod-template-hash are drawn from
+ *  K8S_GENERATED_SEGMENT_RE, any wider mid-name generated segment is too
+ *  (K8S_INLINE_GENERATED_MAX_LENGTH), and the word mass reaches
+ *  K8S_GENERATED_LAYOUT_MIN_WORD_MASS.
+ *
+ *  Both alphabet conjuncts are FREE on the live cluster: they cost zero real
+ *  names out of the 89 this rule frees, and they are what keep the rule from
+ *  being a blanket exemption for its own layout. Measured per 100k random
+ *  tokens through the WHOLE pipeline under `pod=`, shipped -> patched:
+ *
+ *    <w8>-<hash10 hex>-<suffix5 hex> ............... 3697 -> 4105
+ *    <w8>-<hash10 base36>-<suffix5 base36> ......... 3807 -> 5127
+ *    <w8>-<10 base36>-<word>-<suffix5 k8s> ........ 25138 -> 29259
+ *    flat base36 @32 / hex @40 / 3-5 groups ....... unchanged
+ *
+ *  Without the mid-name conjunct that third row reads 99895: a 10-character
+ *  unconstrained run sitting behind a trailing word wears the layout without
+ *  paying for it, and that is the hole the cap closes.
+ *
+ *  THE RESIDUAL, stated plainly because it is large and it is the price.
+ *  A value DELIBERATELY built as `<8+ letters>-<10>-<5>` with both opaque
+ *  runs drawn from the k8s alphabet is exonerated BY CONSTRUCTION — 99873
+ *  per 100k, essentially everything that wears the shape. The alphabet
+ *  conjuncts buy nothing against an author who CHOOSES that alphabet; they
+ *  buy the rows above only against ACCIDENTAL disclosure, which is the threat
+ *  this file guards (PEN-3920 section 4, PEN-3183) and the reason the trade
+ *  is accepted. The opaque mass admitted is unchanged at
+ *  K8S_NAME_MAX_GENERATED_MASS: worst case 10 characters over the 27-symbol
+ *  alphabet plus a 5-character suffix, ~71 bits — BELOW the ~83 bits the
+ *  general rule already admits at word mass 16, and well below the ~141 bits
+ *  `isLexicalIdentifier` exonerates under every name in the fleet. This rule
+ *  does NOT raise the opaque-mass ceiling; it lowers the word-mass PRICE from
+ *  16 to 8, for two layouts, under one binding name.
+ *
+ *  WHAT IT DELIBERATELY DOES NOT FIX. A hand-written synthetic name such as
+ *  `penstock-gateway-rs1-pod1` (word mass 15, one short of the general floor)
+ *  stays refused: `rs1` and `pod1` are not segments any controller emits.
+ *  That is a fixture author's choice and a fixture author can rename it,
+ *  whereas an operator cannot rename a real pod — so the asymmetry is
+ *  deliberate, and closing it would require the floor change refused above.
+ *
+ *  Anchored to `pod` alone. Do not widen the name set without re-reading
+ *  PEN-3920 section 4, and never move this shape into a name-free rule. */
+function isGeneratedPodName(value: string): boolean {
+  const parts = k8sNameParts(value);
+  if (parts === null) return false;
+  if (parts.wordMass < K8S_GENERATED_LAYOUT_MIN_WORD_MASS) return false;
+  const { segments } = parts;
+  if (segments.length < 2) return false;
+  const suffix = segments[segments.length - 1]!;
+  if (suffix.length !== K8S_POD_SUFFIX_LENGTH) return false;
+  if (!K8S_GENERATED_SEGMENT_RE.test(suffix)) return false;
+  // A digits-only run is a StatefulSet ordinal, never a generated suffix; the
+  // general rule already treats it as free and must keep sole ownership of it.
+  if (/^[0-9]+$/.test(suffix)) return false;
+  // Every generated segment BEFORE the suffix is part of the chosen service
+  // name unless it is the pod-template-hash checked below. Short ones are
+  // admitted as-is; anything wider must look like something a controller
+  // emitted, so an opaque run cannot hide mid-name behind a trailing word.
+  for (const segment of segments.slice(0, -1)) {
+    if (/^[a-z]+$/.test(segment) || /^[0-9]+$/.test(segment)) continue;
+    if (segment.length <= K8S_INLINE_GENERATED_MAX_LENGTH) continue;
+    if (!K8S_GENERATED_SEGMENT_RE.test(segment)) return false;
+  }
+  const preceding = segments[segments.length - 2]!;
+  if (/^[a-z]+$/.test(preceding) || /^[0-9]+$/.test(preceding)) {
+    // <words>-<suffix 5>: DaemonSet, Job, or a bare pod with generateName.
+    return true;
+  }
+  // <words>-<pod-template-hash>-<suffix 5>.
   return (
-    wordMass >= K8S_NAME_MIN_WORD_MASS &&
-    generatedSegments <= K8S_NAME_MAX_GENERATED_SEGMENTS &&
-    generatedMass <= K8S_NAME_MAX_GENERATED_MASS
+    preceding.length >= K8S_POD_TEMPLATE_HASH_MIN_LENGTH &&
+    preceding.length <= K8S_NAME_MAX_GENERATED_LENGTH &&
+    K8S_GENERATED_SEGMENT_RE.test(preceding)
   );
 }
 
@@ -487,6 +636,7 @@ function isContentDigestAssignment(name: string, value: string): boolean {
     if (name === "module" && BLACKBOX_MODULE_RE.test(value)) return true;
   }
   if (K8S_OBJECT_NAME_VALUE_NAMES.has(name) && isKubernetesObjectName(value)) return true;
+  if (name === "pod" && isGeneratedPodName(value)) return true;
   if (GIT_OBJECT_NAME_VALUE_NAMES.has(name) && GIT_COMMIT_SHA_RE.test(value)) return true;
   if (UUID_VALUE_NAMES.has(name) && CANONICAL_UUID_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);

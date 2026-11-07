@@ -1142,6 +1142,91 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-5921 regression: a generated pod name with a short service name", () => {
+    // Derived, not embedded, for the reason the PEN-4438 block states: every
+    // positive here is material the SHIPPED rule refuses, so writing one
+    // contiguously would make this file unpushable until the fix deploys.
+    const pair = (name: string, value: string) => [name, value].join("=");
+    // The pod-template-hash and the 5-character suffix, drawn from the
+    // alphabet k8s.io/apimachinery/pkg/util/rand actually emits.
+    const HASH = ["7d4f9", "bc85x"].join("");
+    const SUFFIX = ["k2", "mnp"].join("");
+
+    // Word mass 8 and 13 against the general floor of 16. These are ordinary
+    // Deployment pods; the author does not choose the trailing segments.
+    it.each([
+      ["short service name", ["llm", "proxy", HASH, SUFFIX].join("-")],
+      ["two-word service name", ["penstock", "proxy", HASH, SUFFIX].join("-")],
+      // DaemonSet / Job layout: one generated suffix, no pod-template-hash.
+      ["daemonset layout", ["alloy", "ebpf", "logs", SUFFIX].join("-")],
+    ])("passes a %s pod label matcher byte-exact", (_why, value) => {
+      const text = `            kube_pod_info{${pair("pod", `"${value}"`)}}`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    // The anchor is the load-bearing half. This layout is admitted under
+    // `pod` ALONE — not under the other seven names the general rule anchors,
+    // and not under a credential-ish name.
+    it.each([
+      ["password", ["llm", "proxy", HASH, SUFFIX].join("-")],
+      ["token", ["llm", "proxy", HASH, SUFFIX].join("-")],
+      ["name", ["llm", "proxy", HASH, SUFFIX].join("-")],
+      ["instance", ["llm", "proxy", HASH, SUFFIX].join("-")],
+      ["namespace", ["llm", "proxy", HASH, SUFFIX].join("-")],
+    ])("refuses the same layout bound to %s instead", (name, value) => {
+      const result = scrubGitHubEgressText(pair(name, value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    // One case per conjunct of the layout rule, each failing on a different
+    // one, so loosening any single constant fails a test.
+    it.each([
+      // Word mass 7 against the layout floor of 8.
+      ["layout word mass", ["llm", "prox", HASH, SUFFIX].join("-")],
+      // A vowel in the suffix: not an alphabet k8s rand can emit.
+      ["suffix alphabet", ["llm", "proxy", HASH, ["k2", "mna"].join("")].join("-")],
+      // `0` and `1` are outside the k8s rand alphabet too.
+      ["hash alphabet", ["llm", "proxy", ["7d410", "bc85x"].join(""), SUFFIX].join("-")],
+      // Suffix of 4 against a fixed width of 5.
+      ["suffix width", ["llm", "proxy", HASH, ["k2", "mn"].join("")].join("-")],
+      // A 7-character run standing in for a pod-template-hash, against a
+      // floor of 8. Padded past HIGH_ENTROPY_MIN_LENGTH so the value is
+      // actually scanned rather than passing on length alone.
+      ["hash width", ["llm", "proxy", "service", ["7d4f", "9bc"].join(""), SUFFIX].join("-")],
+      // The hand-written synthetic name the rule deliberately leaves refused:
+      // `rs1` and `pod1` are segments no controller emits.
+      ["synthetic segments", ["penstock", "gateway", "rs1", "pod1"].join("-")],
+      // A wide opaque run hiding MID-NAME behind a trailing word: the suffix
+      // and the layout are both impeccable, and the run is what matters.
+      ["inline generated width", ["llm", "proxy", ["0a1e3", "u9xyq"].join(""), "fix", SUFFIX].join("-")],
+    ])("still refuses a value failing the %s conjunct, under pod", (_why, value) => {
+      const result = scrubGitHubEgressText(pair("pod", value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    // The mid-name cap is a cap, not a blanket refusal: a SHORT mixed segment
+    // is an ordinary service-name fragment and still passes. `ipv6` here is
+    // the exact shape the live cluster carries in `cilium-ipv6-ndp-fix-…`.
+    it("still admits a short mixed service-name segment mid-name", () => {
+      const value = ["cilium", "ipv6", "ndp", "fix", SUFFIX].join("-");
+      const text = `            kube_pod_info{${pair("pod", `"${value}"`)}}`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    // The general rule keeps sole ownership of the StatefulSet ordinal: a
+    // digits-only trailing run is not a generated suffix.
+    it("does not admit a five-digit trailing run as a generated suffix", () => {
+      const value = ["llm", "proxy", HASH, "24567"].join("-");
+      const result = scrubGitHubEgressText(pair("pod", value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+  });
+
   describe("BLO-49591 regression: a namespace or node name is not a credential", () => {
     // Derived, not embedded: these are the exact values the shipped rule
     // refused in Blockcast/onprem-k8s promtool fixtures, so writing them
