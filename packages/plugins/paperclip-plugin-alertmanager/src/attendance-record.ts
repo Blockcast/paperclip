@@ -38,14 +38,21 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  * 2. **It does not record `executed`.** It records what the ladder observed
  *    about attendance. Whether the resulting work was actually done is a
  *    different question with a different source, and nothing here answers it.
- * 3. **It is not a second obligation surface.** The record lives in this
- *    plugin's own namespace and is queryable there — no new channel, no new
- *    notification, no new place to look. (No route or SDK read exposes this
- *    table; the README's queries are raw SQL against that namespace, and this
- *    sentence claims nothing more.) That distinction is
+ * 3. **It is not a second obligation surface.** The record adds no channel, no
+ *    notification and nothing anyone is obliged to poll. That distinction is
  *    load-bearing: the 2026-10-03 ruling on PEN-3315 refused a GitHub-issue
  *    audit trail *beside* Paperclip. This removes a place where a computed fact
- *    was discarded; it does not add a place to look.
+ *    was discarded; it does not add a place anyone must look.
+ *
+ *    ⛔ **Amended 2026-11-07 (PEN-2918 (D)).** This clause used to read: *"(No
+ *    route or SDK read exposes this table; the README's queries are raw SQL
+ *    against that namespace, and this sentence claims nothing more.)"* Two
+ *    read-only routes now do — see `attendance-read.ts`, which carries the
+ *    argument. In short: the no-read-path position is sound about
+ *    **notification** and does not transfer to **audit**, and PEN-2918's own
+ *    second criterion already required the record to be written *and
+ *    readable*. Nothing about the sentence this clause still makes — no
+ *    obligation, no channel, no poll — is changed by it.
  * 4. **It changes no ladder behaviour.** Rung timing, climb order, who is woken,
  *    auto-cancel withholding and the PEN-4337 monitor deferral are all exactly
  *    as they were. Every write here is an INSERT into a new table, and every
