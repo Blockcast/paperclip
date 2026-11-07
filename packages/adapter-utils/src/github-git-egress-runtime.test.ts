@@ -20,7 +20,7 @@ import {
   runGitEgressRuntime,
   runPrePushHook,
 } from "./github-git-egress-runtime.js";
-import { commitsForRefUpdate, type GitReader } from "./github-git-egress-shim.js";
+import { classifyForcePush, commitsForRefUpdate, type GitReader } from "./github-git-egress-shim.js";
 
 // Every fixture repo is registered here when created and removed when the file
 // finishes, so test runs do not leave throwaway repos behind in $TMPDIR (BLO-44941).
@@ -1381,7 +1381,7 @@ describe("buildGitArgv force-push refusal (PEN-4869)", () => {
       // the sha — prose that only says "use a lease" is what SKILL.md already
       // said, and it is the control that failed.
       expect(() => buildGitArgv([...argv], { ...PRESENT })).toThrow(
-        /git rev-parse origin\/<branch>/,
+        /git reflog show origin\/<branch>/,
       );
       expect(() => buildGitArgv([...argv], { ...PRESENT })).toThrow(
         /--force-with-lease=refs\/heads\/<branch>:<expected-sha>/,
@@ -1410,6 +1410,95 @@ describe("buildGitArgv force-push refusal (PEN-4869)", () => {
     expect(() =>
       buildGitArgv(["push", "--force-with-lease=refs/heads/main", "origin"], { ...PRESENT }),
     ).toThrow(/lease with no expected sha/);
+  });
+
+  // PEN-5830. The refusal's own remedy had the defect the refusal exists to
+  // describe: it read the expected sha from `origin/<branch>` one command after
+  // fetching it, so the lease equalled the ref it is compared against and could
+  // never refuse. This is the most-read of the four instances — it prints on
+  // every refused force push, to an author already mid-recovery — and it is the
+  // one that contradicted itself, since the `bare-lease` wording a few lines
+  // below states the rule the block broke. Asserted on every shape, because all
+  // three wordings share the one `lease` constant.
+  describe("the remedy's expected sha (PEN-5830)", () => {
+    const shapes = [
+      ["force-flag", ["push", "--force", "origin", "main"]],
+      ["plus-refspec", ["push", "origin", "+main"]],
+      ["bare-lease", ["push", "--force-with-lease", "origin", "main"]],
+      ["mirror", ["push", "--mirror", "origin"]],
+    ] as const;
+
+    function refusal(argv: readonly string[]): string {
+      try {
+        buildGitArgv([...argv], { ...PRESENT });
+      } catch (error) {
+        return (error as Error).message;
+      }
+      throw new Error(`expected a refusal for ${argv.join(" ")}`);
+    }
+
+    for (const [label, argv] of shapes) {
+      it(`names a sha not derived from a just-fetched ref (${label})`, () => {
+        const message = refusal(argv);
+        // The source is the tracking ref's REFLOG — a push writes an `update by
+        // push` entry, a fetch writes a different one — never the ref's current
+        // value, which is the thing the lease is checked against.
+        expect(message).toMatch(/git reflog show origin\/<branch>/);
+        expect(message).toMatch(/update by push/);
+        // A clone that never pushed has no such entry, and an author reading a
+        // refusal will not read a source comment, so the fallback is rendered.
+        expect(message).toMatch(/never pushed from this clone/);
+        // The three ways of spelling "the ref the lease is compared against".
+        // `@{u}` resolves to `origin/<branch>`, so it is the same hazard, and
+        // it additionally dies on a worktree with no upstream configured.
+        expect(message).not.toMatch(/git fetch origin\n/);
+        expect(message).not.toMatch(/rev-parse origin\/<branch>/);
+        expect(message).not.toMatch(/rev-parse @\{u\}/);
+        // Inline derivation satisfies the wrapper's argv predicate while
+        // reproducing the hazard, which is worse than being refused.
+        expect(message).not.toMatch(/--force-with-lease=\S*:\$\(/);
+        // `ls-remote` is admitted, but only on the comparison side.
+        expect(message).toMatch(
+          /git ls-remote origin refs\/heads\/<branch>\s+# still <expected-sha>\?/,
+        );
+        expect(message).toMatch(/--force-with-lease=refs\/heads\/<branch>:<expected-sha>/);
+      });
+    }
+
+    it("emits a push the live classifier accepts, on every shape", () => {
+      for (const [label, argv] of shapes) {
+        const line = refusal(argv)
+          .split("\n")
+          .map((text) => text.trim())
+          // paperclip:allow-git-push: reads the refusal's own remediation text; nothing here invokes git
+          .find((text) => text.startsWith("git push "));
+        expect(line, `${label} must carry a runnable push`).toBeDefined();
+        // The real classifier, not a regex over the text: a remedy that the
+        // wrapper would itself refuse sends an already-blocked author round the
+        // same loop. `<branch>` and `<expected-sha>` are placeholders, which the
+        // classifier does not resolve — it reads argv shape only.
+        expect(classifyForcePush(line!.split(" ").slice(1)), label).toBeNull();
+      }
+    });
+
+    it("mutation check: the stale shape would have failed these assertions", () => {
+      // Guards the assertions above against passing vacuously. This is the text
+      // that shipped before PEN-5830, and every clause that should reject it
+      // does.
+      const stale = [
+        "    git fetch origin",
+        "    git rev-parse origin/<branch>          # <expected-sha>",
+        // paperclip:allow-git-push: the pre-PEN-5830 remediation text, asserted on; not an invocation
+        "    git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>",
+      ].join("\n");
+      expect(stale).not.toMatch(/git reflog show origin\/<branch>/);
+      expect(stale).not.toMatch(/never pushed from this clone/);
+      expect(stale).toMatch(/rev-parse origin\/<branch>/);
+      // ...while still passing the one assertion the stale text DID satisfy,
+      // which is why a pinned-lease check alone never caught this.
+      expect(stale).toMatch(/--force-with-lease=refs\/heads\/<branch>:<expected-sha>/);
+      expect(classifyForcePush(stale.split("\n")[2]!.trim().split(" ").slice(1))).toBeNull();
+    });
   });
 
   it("lets an explicit --force-with-lease=<ref>:<sha> through, hooks path injected", () => {
