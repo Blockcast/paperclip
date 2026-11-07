@@ -96,6 +96,30 @@ function pullRequestPayload(options: {
   };
 }
 
+function reviewPayload(options: {
+  action?: "submitted" | "edited" | "dismissed";
+  state?: string;
+  headSha?: string;
+  reviewCommitId?: string;
+  baseRef?: string;
+} = {}): Record<string, unknown> {
+  return {
+    action: options.action ?? "submitted",
+    repository: { full_name: REPO },
+    pull_request: {
+      number: PR_NUMBER,
+      head: { sha: options.headSha ?? LIVE_HEAD },
+      base: { ref: options.baseRef ?? "main" },
+      html_url: PR_URL,
+    },
+    review: {
+      state: options.state ?? "approved",
+      commit_id: options.reviewCommitId ?? REVIEW_HEAD,
+      user: { login: "kkroo" },
+    },
+  };
+}
+
 function issueCommentPayload(action: "created" | "edited" | "deleted" = "deleted") {
   return {
     action,
@@ -366,6 +390,54 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
     await makeDue();
     installGithubStub();
     await pollGithubReviewGateDeliveriesOnce(db);
+    expect(await readDelivery()).toMatchObject({ status: "delivered" });
+  });
+
+  // PEN-5868. `review/ally-complete` is a required context on the consumer's
+  // protected base and PRs there are App-authored, so a non-Ally human approval
+  // is the scarcest resource in the system. Retracting the gate to `pending`
+  // when one is cast knocks a required context out of `success` for minutes,
+  // and a lander that re-reads merge state inside that window withdraws the
+  // approval it just spent -- 14 destroyed across 6 PRs. An approval only ever
+  // ADDS clearing evidence, so the retraction has nothing to revoke there.
+  //
+  // Mutation control: delete the `approved` conjunct (or the whole guard) in
+  // `approvalCannotInvalidateStandingVerdict` and this goes red on the first
+  // assertion -- the status POST reappears.
+  it("does not retract the gate to pending when an approval is submitted", async () => {
+    await enqueue({ eventName: "pull_request_review", payload: reviewPayload() });
+    const fetchMock = installGithubStub();
+
+    await pollGithubReviewGateDeliveriesOnce(db);
+
+    const statusPosts = fetchMock.mock.calls.filter(([url]) => String(url).includes("/statuses/"));
+    expect(statusPosts).toHaveLength(0);
+    // The evaluator is still asked to recompute; only the interim retraction is gone.
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/dispatches"))).toBe(true);
+    const delivered = await readDelivery();
+    expect(delivered).toMatchObject({ status: "delivered" });
+    expect(delivered?.lastResult).toMatchObject({
+      pendingRetractionSkipped: "review_approval_cannot_invalidate_standing_verdict",
+    });
+  });
+
+  // The other three review shapes can each LOWER the verdict, so each must keep
+  // retracting. Without these a future widening of the guard to "any review
+  // event" would leave a stale `success` standing on a head whose clearing
+  // evidence has just been removed -- the fail-OPEN direction on a required gate.
+  it.each([
+    ["dismissed", { action: "dismissed" as const, state: "dismissed" }],
+    ["changes_requested", { action: "submitted" as const, state: "changes_requested" }],
+    ["commented", { action: "submitted" as const, state: "commented" }],
+    ["an edited approval", { action: "edited" as const, state: "approved" }],
+  ])("still retracts the gate to pending on %s", async (_label, options) => {
+    await enqueue({ eventName: "pull_request_review", payload: reviewPayload(options) });
+    const fetchMock = installGithubStub();
+
+    await pollGithubReviewGateDeliveriesOnce(db);
+
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${LIVE_HEAD}`))).toBe(true);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/statuses/${REVIEW_HEAD}`))).toBe(true);
     expect(await readDelivery()).toMatchObject({ status: "delivered" });
   });
 
