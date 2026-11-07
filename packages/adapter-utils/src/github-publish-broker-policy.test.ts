@@ -19,6 +19,7 @@ import {
   WRAPPER_CREDENTIAL_CONFIG_ASSIGNMENTS,
 } from "./github-publish-broker-policy.js";
 import { buildGitArgv } from "./github-git-egress-runtime.js";
+import { EGRESS_ENFORCEMENT_BOUNDARY_DECISION_URL } from "./security-decision-records.js";
 
 // PEN-4933 / PEN-3183 D1. Every case here is a route from "the broker runs a
 // command for me" back to "I hold the token", which is the failure the decision
@@ -140,6 +141,34 @@ describe("gh admission", () => {
     }
     // `gh auth token` is the literal case; naming it keeps the reason legible.
     expectRefusal(() => admitGhInvocation(["auth", "token"]), /auth` prints it/);
+  });
+
+  // PEN-4939: this refusal cites the boundary record, and the agent reading it
+  // is working in some arbitrary repository where `docs/security/` does not
+  // exist. The repo-relative path this used to print therefore 404ed for every
+  // reader it was printed to, which is the filing PEN-4939 came from. A
+  // refusal that names an unreachable route is the shape §5 itself argues gets
+  // a control switched off.
+  it("points at the boundary record with a URL the reader can actually open", () => {
+    let message = "";
+    try {
+      admitGhInvocation(["auth", "token"]);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+
+    expect(message).toContain(EGRESS_ENFORCEMENT_BOUNDARY_DECISION_URL);
+    expect(EGRESS_ENFORCEMENT_BOUNDARY_DECISION_URL).toMatch(/^https:\/\//);
+    // The section number is the part a refused `gh auth` actually needs.
+    expect(message).toContain(`${EGRESS_ENFORCEMENT_BOUNDARY_DECISION_URL} §5`);
+    // And this half catches the NEXT one: no `docs/` pointer in the message
+    // may be relative. It fails here rather than in someone else's repository,
+    // which is the only place the old form ever failed.
+    expect(
+      Array.from(message.matchAll(/(\S*)docs\/[A-Za-z0-9._\/-]+/g))
+        .filter(([, prefix]) => !prefix.includes("//"))
+        .map(([match]) => match),
+    ).toEqual([]);
   });
 
   it("admits ordinary work", () => {
