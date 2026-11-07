@@ -4527,6 +4527,73 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(source?.contextSnapshot).toHaveProperty(STALLED_COALESCE_BYPASS_SNAPSHOT_KEY);
   });
 
+  // PEN-5958: the defer stamps record a workspace conflict THIS run lost. A
+  // successor has never attempted the bind, so inheriting them gates it on a
+  // backoff it never earned, prices its first real conflict at the
+  // predecessor's attempt number, and — via `paperclipK8sIsolationWaitKey` plus
+  // a `RetryAt` that `liveIsolationWaiters` cannot tell from a fresh re-stamp —
+  // parks it in the oldest-first waiter queue for a key it never raced, where
+  // it refuses younger arrivals the bind as `elder_waiter`.
+  //
+  // Asserted on the same `process_lost` carry as the bypass marker above: all
+  // three `carryRetryContextSnapshot` sites share one strip, and this is the
+  // reachable one. Both deferral writers stamp onto the run's own snapshot, so
+  // a predecessor that died while deferred is exactly this fixture.
+  it("drops both defer-backoff stamp pairs when carrying a snapshot onto a process-loss retry", async () => {
+    const deferStampKeys = [
+      "paperclipK8sIsolationRetryAttempt",
+      "paperclipK8sIsolationRetryAt",
+      "paperclipK8sIsolationWaitKey",
+      "paperclipBranchClaimRetryAttempt",
+      "paperclipBranchClaimRetryAt",
+    ];
+    const { companyId, runId } = await seedRunFixture({
+      adapterType: "openclaw_gateway",
+      agentStatus: "idle",
+      processPid: null,
+      processGroupId: null,
+      contextSnapshot: {
+        wakeReason: "issue_monitor_due",
+        nextCheckAt: "2026-03-19T00:00:00.000Z",
+        paperclipK8sIsolationRetryAttempt: 7,
+        paperclipK8sIsolationRetryAt: "2026-03-19T00:05:00.000Z",
+        paperclipK8sIsolationWaitKey: "workspace-tree:project-primary:9f258778",
+        paperclipBranchClaimRetryAttempt: 4,
+        paperclipBranchClaimRetryAt: "2026-03-19T00:04:00.000Z",
+      },
+    });
+    const heartbeat = createHeartbeat();
+
+    expect(await heartbeat.reapOrphanedRuns()).toEqual({ reaped: 1, runIds: [runId] });
+
+    const retry = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)))
+      .then((rows) => rows[0] ?? null);
+    expect(retry).not.toBeNull();
+    for (const key of deferStampKeys) {
+      expect(retry?.contextSnapshot).not.toHaveProperty(key);
+    }
+    // Same guard as the bypass case: a strip that emptied the snapshot would
+    // satisfy every assertion above. `nextCheckAt` is the carried key with no
+    // other source on the retry.
+    expect(retry?.contextSnapshot).toMatchObject({
+      wakeReason: "process_lost_retry",
+      nextCheckAt: "2026-03-19T00:00:00.000Z",
+    });
+    // The stamps still belong to the run that actually lost the conflict — the
+    // strip copies rather than deleting in place.
+    const source = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    for (const key of deferStampKeys) {
+      expect(source?.contextSnapshot).toHaveProperty(key);
+    }
+  });
+
   // PEN-3582 (carried from Ally's non-blocking review 2 on PR #2003).
   //
   // PR #2003 guarded three `startNextQueuedRunForAgent` call sites so one

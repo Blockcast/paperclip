@@ -484,4 +484,36 @@ describe("stripRunScopedSnapshotMarkers", () => {
 
     expect(stripRunScopedSnapshotMarkers(original)).toEqual(original);
   });
+
+  // PEN-5958. Spelled as literals rather than by importing the key constants:
+  // these names are the wire format of a persisted `context_snapshot`, read by
+  // `dispatch-readiness.ts` and by a raw `->>` in
+  // `external-runtime-reservations.ts`. An import would follow a rename and
+  // keep passing while every live row still carried the old spelling.
+  it("drops both defer-backoff stamp pairs and the isolation wait key", () => {
+    expect(
+      stripRunScopedSnapshotMarkers({
+        issueId: "issue-1",
+        paperclipK8sIsolationRetryAttempt: 7,
+        paperclipK8sIsolationRetryAt: "2026-03-19T00:05:00.000Z",
+        paperclipK8sIsolationWaitKey: "workspace-tree:project-primary:9f258778",
+        paperclipBranchClaimRetryAttempt: 4,
+        paperclipBranchClaimRetryAt: "2026-03-19T00:04:00.000Z",
+      }),
+    ).toEqual({ issueId: "issue-1" });
+  });
+
+  it("strips a defer stamp whatever its value, including a falsy attempt count", () => {
+    // The strip is unconditional, so `0` and `""` must go the same way a
+    // populated stamp does. A `if (snapshot[key])` implementation would pass
+    // every other test here and leave these two behind, where
+    // `isQueuedRunAdmissionDeferred` ignores them but the ladder read
+    // (`Math.floor(asNumber(...)) + 1`) does not.
+    expect(
+      stripRunScopedSnapshotMarkers({
+        paperclipK8sIsolationRetryAttempt: 0,
+        paperclipBranchClaimRetryAt: "",
+      }),
+    ).toEqual({});
+  });
 });
