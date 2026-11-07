@@ -264,6 +264,43 @@ const manifest: PaperclipPluginManifestV1 = {
       capability: "api.routes.register",
       companyResolution: { from: "body", key: "companyId" },
     },
+    // PEN-2918 (D) — read the attendance record the ladder writes.
+    //
+    // ⛔ These two routes OVERTURN a shipped decision, and the reason is in
+    // `src/attendance-read.ts`. `migrations/007_attendance_observations.sql`
+    // says there is "deliberately no route or SDK read" for this table. That
+    // reason is sound about NOTIFICATION — PEN-2918 refuses louder, more
+    // durable and more frequent signals by measurement — and does not transfer
+    // to AUDIT. Nothing polls these, nothing alerts on them, nothing pages.
+    //
+    // ⛔ Both are GET, and that is load-bearing rather than stylistic: the
+    // authorization this implements is read-only, and a POST sibling here would
+    // be a different change needing a different argument. `ctx.db.query`
+    // refuses anything but SELECT at the host, so the read-only claim is
+    // enforced rather than asserted.
+    //
+    // `board-or-agent`, matching `list-aggregate-firing-fences` and for the
+    // same reason: an alert row is diagnosed from the row, by whoever holds it.
+    // Unlike that route there is no bearer-equivalent field to strip — these
+    // rows carry ids, a disposition vocabulary and fixed sentences, never a
+    // token and never raw error text — so the agent and board views are
+    // identical and no actor-type branch is needed.
+    {
+      routeKey: "attendance-observations-summary",
+      method: "GET",
+      path: "/attendance-observations/summary",
+      auth: "board-or-agent",
+      capability: "api.routes.register",
+      companyResolution: { from: "query", key: "companyId" },
+    },
+    {
+      routeKey: "attendance-observations-undelivered",
+      method: "GET",
+      path: "/attendance-observations/undelivered",
+      auth: "board-or-agent",
+      capability: "api.routes.register",
+      companyResolution: { from: "query", key: "companyId" },
+    },
   ],
   // No tools registered for V1 — pure event/webhook plugin.
   tools: [],

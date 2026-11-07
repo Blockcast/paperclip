@@ -322,10 +322,90 @@ SELECT disposition, wake_outcome, count(*)
 queryable*. It does not make non-acknowledgement *oblige anybody*, and it does
 not record whether the resulting work was **executed** — that is a different
 question with a different source. A query over this table is not an on-call
-rota. It is also not a second place to look: the record lives in this plugin's
-own namespace and is queryable there with the SQL above, adding no channel and
-no notification. (There is deliberately no route or SDK read for this table —
-"queryable in the plugin namespace" is the whole claim.)
+rota. It is also not a second place to look: the record adds no channel and no
+notification, and nothing is obliged to poll it.
+
+> ⛔ **Amended 2026-11-07 (PEN-2918 (D)).** This paragraph used to end: *"(There
+> is deliberately no route or SDK read for this table — 'queryable in the plugin
+> namespace' is the whole claim.)"* **That is no longer true**, and the two
+> read-only routes below are a deliberate **overturn** of that decision rather
+> than a bugfix against an oversight — see *Reading the record* immediately
+> below for the argument the overturn rests on.
+>
+> ⚠️ **The identical claim also sits in
+> `migrations/007_attendance_observations.sql`, and it CANNOT BE CORRECTED
+> THERE.** Applied plugin migrations are sha256-checksummed by the host
+> (`Plugin migration checksum mismatch`), so editing that file would throw at
+> worker startup for every company that has already applied it. It is recorded
+> here as a known-stale carrier rather than silently left: a reader who opens
+> `007` alone will read a sentence this package has since made false.
+> `migrations/008_attendance_read_path_note.sql` attaches the correction to the
+> table itself with `COMMENT ON`, which is the one adjacent channel that file
+> has — `\d+` and `obj_description()` reach it, a reader of the raw `.sql` does
+> not.
+
+### Reading the record (PEN-2918 (D))
+
+Two **read-only** routes expose the table, under
+`/api/plugins/<pluginId>/api`. Both are `GET`, both are `board-or-agent`, and
+both are company-scoped by the host from the `companyId` query parameter.
+
+| route | answers |
+|---|---|
+| `GET /attendance-observations/summary` | how many observations exist, by `disposition` and `wake_outcome`, over a window |
+| `GET /attendance-observations/undelivered` | every pass whose wake never reached a run (`wake_outcome IN ('refused', 'declined')`) |
+
+Both accept `since` (ISO-8601) **or** `sinceHours`; the undelivered listing also
+accepts `limit` (default 100, max 500). An unparseable window is a `400`, never
+a silent fall back to the default — a window that quietly answered a different
+question than the one asked would be this row's own defect, in this row's own
+instrument.
+
+```sh
+# (a) What has the ladder determined since the 2026-11-06 roll?
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "$BASE/api/plugins/$PLUGIN_ID/api/attendance-observations/summary?companyId=$CO&since=2026-11-06T00:00:00Z"
+
+# (b) Which escalations did this platform believe it delivered and did not?
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "$BASE/api/plugins/$PLUGIN_ID/api/attendance-observations/undelivered?companyId=$CO&sinceHours=168"
+```
+
+⛔ **Why this is not the thing PEN-2918 excludes.** That row refuses *delivery*,
+*durability* and *volume* as remedies **by measurement** — its founding datum is
+an alert delivered ~4,900 times over 96h with zero delivery failures and zero
+action — and the 2026-10-03 ruling on PEN-3315 separately refused a second audit
+surface beside Paperclip. The original "no read path" sentence applied that
+reasoning to this table. It is **sound about notification and does not transfer
+to audit**: a read path nobody is obliged to poll creates no obligation surface.
+PEN-2918's second criterion had already required this in its own words — it
+closes when a determination is written *and readable*.
+
+It was also overturned on evidence. On 2026-11-07 the question *"is this table
+being written at all?"* was asked with the source open and **could not be
+answered**, which produced a confident, false *"zero observations can exist"* —
+an inference from the wrong population, since rows are appended per ladder
+**determination over an already-open alert row**, not per alert row created. An
+instrument nobody can read cannot be caught being wrong.
+
+⚠️ **Expect the first summary to look like mass neglect, and do not report it
+as such.** The ladder's attendance test is `hasArmedMonitor(issue, now) ||
+hasLiveBlocker(...)` and nothing else — **`parkedUntil` appears nowhere in it**.
+A deliberately parked row carrying its owner's unpark conditions is attended by
+this estate's primary attendance instrument and is still classified
+`unattended_*` here. Measured 2026-11-07: of the six open alertmanager-origin
+rows, five were attended solely by a park. So a high `unattended_*` count is
+**first** evidence that the instrument is miscalibrated against how this company
+works. That caveat is returned **inside the summary response body**, not only
+here, because a qualification a reader has to go and find is precisely the
+failure PEN-2918 measures.
+
+⛔ **Still true, and unchanged by these routes:** nothing polls them, nothing
+alerts on them, nothing pages, and no schedule or dashboard depends on them.
+Making non-acknowledgement *readable* is not making it *bind*. PEN-2918's
+criterion that non-acknowledgement must oblige a named person is **untouched**,
+and this estate has no on-call owner **by board decision** (card `b94c4d7d`,
+Option B) rather than by omission.
 
 ### Liveness is pulled, not assumed (BLO-40739)
 
