@@ -199,6 +199,35 @@ describe("per-route HTTP request-duration histogram (PEN-5136)", () => {
     expect(edges.some((e) => e <= 1)).toBe(true);
   });
 
+  /**
+   * PEN-5783. The 30s edge above straddles a bound that does NOT operate in
+   * this family's worst case: during the ~16-minute `paperclip-pg-0` absence
+   * on 2026-11-06, `57014` read zero on every route, because a statement that
+   * never acquires a pooled connection never starts and so is never cancelled
+   * by a per-statement timeout. The requests that ran longest were the ones
+   * the 30s edge could not see.
+   *
+   * 120s is the API tier's `PROXY_REQUEST_TIMEOUT_MS` -- the deadline past
+   * which a delivery is destroyed -- so this edge is what makes "how much
+   * traffic crossed the deadline" queryable. Measured in that window: 361 of
+   * the 414 completed responses above `le="30"` were also above `le="60"`, and
+   * without a further finite edge all 361 collapse into `+Inf`.
+   */
+  it("places a bucket edge at the tier's 120s delivery deadline", async () => {
+    await call(buildApp(), "/api/companies/c1/issues", 200);
+
+    const edges = await bucketEdges();
+
+    expect(edges).toContain(120);
+    // The deadline must be the LAST finite edge: anything past it is already
+    // undeliverable, so a further edge would spend cardinality separating
+    // populations that are equally lost.
+    expect(Math.max(...edges)).toBe(120);
+    // It must sit above the statement-timeout edge, or it is measuring the
+    // same question twice rather than the one 30s is blind to.
+    expect(edges.some((e) => e > 30 && e < 120)).toBe(true);
+  });
+
   it("exposes the histogram family under the documented metric name", async () => {
     await call(buildApp(), "/api/companies/c1/issues", 200);
 
