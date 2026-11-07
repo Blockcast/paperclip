@@ -4,6 +4,7 @@ import {
   askUserQuestionsPayloadSchema,
   checkoutIssueSchema,
   createApprovalSchema,
+  updateApprovalPayloadSchema,
   createIssueInputSchema,
   createMilestoneSchema,
   issueExecutionMonitorPolicySchema,
@@ -340,6 +341,10 @@ const approvalDecisionSchema = z.object({
 const createApprovalToolSchema = z.object({
   companyId: companyIdOptional,
 }).merge(createApprovalSchema);
+
+const updateApprovalToolSchema = z.object({
+  approvalId: approvalIdSchema,
+}).merge(updateApprovalPayloadSchema);
 
 const milestoneIdSchema = z.string().guid();
 
@@ -771,6 +776,20 @@ export function createToolDefinitions(client: PaperclipApiClient): ToolDefinitio
       "Get an approval by id",
       z.object({ approvalId: approvalIdSchema }),
       async ({ approvalId }) => client.requestJson("GET", `/approvals/${encodeURIComponent(approvalId)}`),
+    ),
+    makeTool(
+      "paperclipUpdateApproval",
+      "Correct the payload of a PENDING approval you filed, IN PLACE — without changing its queue position. Use this instead of withdraw-and-refile whenever a card's stated evidence has gone stale (the PR you called \"fully green\" is now red, the figure you quoted has moved, the attestation you cited no longer covers the current head).\n\n⭐ WHY THIS EXISTS, and why refiling is the wrong move: a re-file mints a NEW card with a NEW createdAt, and board service is measurably recency-skewed — the 2026-11-03 burst decided 17 cards, 16 of them created LATER than the oldest card it left pending (PEN-3918 cmt d00b4081 §4). So withdrawing and refiling for accuracy does not just cost you your own place in line, it takes position from specific, older cards filed by other agents. This route touches neither createdAt nor row identity, so it moves your card in NEITHER direction. Standing company policy is that no filer may refile for accuracy; this is the route that makes that policy followable.\n\nThe edit is VISIBLE, deliberately: the card carries `payloadRevision` (0 = never edited) and `payloadEditedAt`, and every superseded version is readable at `GET /approvals/:id/payload-revisions`. That disclosure is the trade — an editable payload means a decider can approve a card whose text changed after they read it, which is a real cost, accepted only because the failure it replaces (false evidence that CANNOT be corrected) is silent while this one is on the card.\n\nFour refusals, narrowest first: (1) 403 if you are not the requesting agent — a board actor changes a card with requestRevision, which returns it to its filer; (2) 409 if the card is not `pending` — a `revision_requested` card takes `resubmit` instead, a decided one takes neither; (3) 422 `approval_payload_gate_immutable` if `payload.gate` differs from the stored gate IN ANY WAY, INCLUDING BEING OMITTED — the gate is the card's retirement contract, so send it back byte-identical alongside your edits, and retrofitting/changing/removing one stays a withdraw-and-refile; (4) 422 if the new payload is one a create would have refused (a `budget_override_required` card cannot edit away its `enforcement_assertions`, and a gate cannot go terminal between filing and edit).\n\n⚠️ `payload` REPLACES the stored payload wholesale — it is not a merge. Read the card first (`paperclipGetApproval`), change what is stale, and send the whole thing back including `title` and any `gate`.",
+      updateApprovalToolSchema,
+      async ({ approvalId, ...body }) =>
+        client.requestJson("PATCH", `/approvals/${encodeURIComponent(approvalId)}`, { body }),
+    ),
+    makeTool(
+      "paperclipListApprovalPayloadRevisions",
+      "List the superseded payloads of an approval, oldest first — the prior text behind a card's `payloadRevision` / `payloadEditedAt` edit marker. Each row's `payload` is the value as it stood BEFORE the edit that archived it; the live one is on the approval itself. Read this when a card shows `payloadRevision > 0` and you need to know what a decider may have read earlier, or what changed since.",
+      z.object({ approvalId: approvalIdSchema }),
+      async ({ approvalId }) =>
+        client.requestJson("GET", `/approvals/${encodeURIComponent(approvalId)}/payload-revisions`),
     ),
     makeTool(
       "paperclipGetApprovalIssues",

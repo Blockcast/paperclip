@@ -220,6 +220,47 @@ export const resubmitApprovalSchema = z.object({
 export type ResubmitApproval = z.infer<typeof resubmitApprovalSchema>;
 
 /**
+ * In-place correction of a PENDING card's payload, by the agent that filed it.
+ *
+ * ## Why this exists (PEN-5766)
+ *
+ * A pending card's payload used to be immutable to its own requester: `resubmit`
+ * is gated on `revision_requested`, and nothing else writes `payload`. So a filer
+ * whose stated evidence had gone stale — a PR that was "fully green" when the card
+ * was filed and is now showing red, say — had two moves, and both are bad:
+ *
+ *   - leave false evidence in front of a human decider, or
+ *   - `withdraw` and re-file.
+ *
+ * The second mints a new row with a new `createdAt`, and board service is
+ * measurably recency-skewed (PEN-3918 cmt `d00b4081` §4: the 11-03 burst decided
+ * 17 cards, 16 of them created later than the oldest card it left pending). So
+ * re-filing for accuracy takes queue position from specific, older, named cards.
+ * **Being scrupulous about your evidence and jumping the queue were the same
+ * keystroke.** This route separates them: an edit preserves `createdAt` and row
+ * identity, so it changes queue position in neither direction.
+ *
+ * ## `gate` is not editable, and omitting it is not how you drop it
+ *
+ * The submitted payload's `gate` must deep-equal the stored one — including
+ * both-absent. The gate is the card's retirement contract: a card that retires on
+ * a different event than the one it was filed against is PEN-5103 by construction.
+ * Omission is refused rather than silently treated as "keep the old gate", because
+ * a caller who believes it just removed a gate would otherwise get a `200` for an
+ * operation that did not happen. Retrofitting or changing a gate stays a
+ * withdraw-and-refile, which is the correct cost for changing what the ask IS.
+ *
+ * The payload is otherwise revalidated exactly as a create would validate it, so
+ * an edit cannot land a payload that `POST /companies/:id/approvals` would have
+ * refused.
+ */
+export const updateApprovalPayloadSchema = z.object({
+  payload: approvalPayloadSchema,
+});
+
+export type UpdateApprovalPayload = z.infer<typeof updateApprovalPayloadSchema>;
+
+/**
  * Withdrawal is the requester's own exit from the approval queue, so the reason
  * is required rather than optional: a rescinded request must say why it became
  * moot, otherwise the audit trail cannot distinguish it from an abandoned one.
