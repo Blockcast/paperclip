@@ -5022,6 +5022,14 @@ export function issueRoutes(
      * being handed work by someone else".
      */
     currentAssigneeAgentId?: string | null;
+    /**
+     * PEN-5940: the *user* the row currently carries, as distinct from
+     * `assigneeUserId`, which is the user work is being handed TO. Pass it
+     * wherever the caller has already loaded the row; omitting it is safe but
+     * makes the guard reload the row, and a wrong `null` is not — it is the
+     * fail-open direction, so pass the live field rather than a literal.
+     */
+    currentAssigneeUserId?: string | null;
   };
 
   async function resolveAssignmentProjectId(input: {
@@ -5054,6 +5062,11 @@ export function issueRoutes(
         assigneeAgentId: assignmentScope?.assigneeAgentId ?? null,
         assigneeUserId: assignmentScope?.assigneeUserId ?? null,
         currentAssigneeAgentId: assignmentScope?.currentAssigneeAgentId ?? null,
+        // PEN-5940: left `undefined` (not `??`-collapsed to null) for the same
+        // reason as `originKind` below — the guard must be able to tell "no
+        // user holds this row" from "the caller did not look", and reload only
+        // in the latter case. Collapsing to `null` is the fail-open direction.
+        currentAssigneeUserId: assignmentScope?.currentAssigneeUserId,
         // BLO-19094: `originKind` is left `undefined` (not `??`-collapsed to
         // null) when the caller did not supply it, so the self-claim guard can
         // tell "no origin kind" from "not looked up" and reload only in the
@@ -5259,10 +5272,34 @@ export function issueRoutes(
   function issueMutationGrantRemediation(input: {
     actorAgentId: string;
     assigneeAgentId: string | null;
+    // PEN-5940: required, not optional. The clause naming the holder was gated
+    // on `assigneeAgentId`, which is null on exactly the rows where the advice
+    // below is dangerous — so a human-held row read as unowned and then got
+    // told to take it. An optional parameter would have let the two call sites
+    // keep producing that text by omission.
+    assigneeUserId: string | null;
     reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
   }): string | null {
     if (input.reason !== "deny_missing_grant") return null;
     if (input.assigneeAgentId === input.actorAgentId) return null;
+    // PEN-5940: on a human-held row, "have the issue assigned to you" is not a
+    // route, it is the bypass — `POST /issues/:id/checkout` would have taken
+    // the row, and the deny this text accompanies is precisely the one saying
+    // it must not. Name the person instead, and offer only routes that leave
+    // the row where it is.
+    if (!input.assigneeAgentId && input.assigneeUserId) {
+      return (
+        `Writes to this issue — including its documents — are relationship-gated, not ` +
+        `grant-gated. A PERSON holds this issue (user ${input.assigneeUserId}), so no agent ` +
+        `route authorizes this write: being @-mentioned here does not, and neither does ` +
+        `managing anyone, creating the issue, or holding a blocks edge to it. Do not take ` +
+        `assignment of it to get the write — reassigning a row away from the person holding ` +
+        `it is the thing this denial exists to prevent, and it is refused too. The routes ` +
+        `that do work: comment here with what you would have written and let them make the ` +
+        `change, or write your findings on an issue you are assigned to and reference this ` +
+        `one. See docs/security/issue-authorization-model.md for the full model.`
+      );
+    }
     const assigneeClause = input.assigneeAgentId
       ? `This issue is assigned to agent://${input.assigneeAgentId}. `
       : "";
@@ -7070,6 +7107,7 @@ export function issueRoutes(
           respondIssueBoundaryDenied(res, boundaryDecision, issueMutationGrantRemediation({
             actorAgentId,
             assigneeAgentId: issue.assigneeAgentId,
+            assigneeUserId: issue.assigneeUserId,
             reason: boundaryDecision.reason,
           }));
           return false;
@@ -7083,6 +7121,7 @@ export function issueRoutes(
         respondIssueBoundaryDenied(res, boundaryDecision, issueMutationGrantRemediation({
           actorAgentId,
           assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
           reason: boundaryDecision.reason,
         }));
         return false;
@@ -13567,6 +13606,12 @@ export function issueRoutes(
             : updateFields.parentId) as string | null | undefined,
           assigneeAgentId: nextAssigneeAgentId,
           assigneeUserId: nextAssigneeUserId,
+          // PEN-5940: the row's current human holder, so this door enforces the
+          // same rule as checkout without depending on the `issue:mutate` deny
+          // upstream of it. The three legitimate moves off a human-held row all
+          // skip this call: the agent-to-creator hand-back, the scoped-recovery
+          // return, and workflow-controlled assignment, tested just above.
+          currentAssigneeUserId: existing.assigneeUserId ?? null,
         });
       }
     }
@@ -14997,12 +15042,19 @@ export function issueRoutes(
           projectId: issue.projectId ?? null,
           parentIssueId: issue.parentId ?? null,
           assigneeAgentId: req.body.agentId,
+          // Correctly `null`: this route's assignment target is an agent, so
+          // nobody is being handed work as a user. PEN-5940 — the field that
+          // reads the row's CURRENT human holder is `currentAssigneeUserId`
+          // below; it is a different question and it had no field until then.
           assigneeUserId: null,
           // BLO-19094: this is the self-appointment door. Supplying both lets
           // the `tasks:assign` guard refuse a claim on a review/recovery shell
           // the actor was not assigned, without reloading the row.
           originKind: issue.originKind ?? null,
           currentAssigneeAgentId: issue.assigneeAgentId ?? null,
+          // PEN-5940: and refuse a claim on a row a PERSON holds. Read from the
+          // live row — a literal here is what made the guard inert.
+          currentAssigneeUserId: issue.assigneeUserId ?? null,
         });
       } catch (err) {
         if (recoveryCheckoutLookupError) {

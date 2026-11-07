@@ -3198,6 +3198,91 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
+  // PEN-5940. These three are deliberately at the ROUTE, not against decideBase.
+  // The defect being pinned is a guard that is real and a route that does not
+  // feed it: `assigneeUserId` was a hardcoded `null` here, so an
+  // `assigneeUserId` predicate in the `tasks:assign` block would have passed
+  // its own unit test and done nothing in production. A decideBase test cannot
+  // tell those two worlds apart; this one fails if either half is reverted.
+  it("hands the tasks:assign decision the row's current human holder on checkout", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "todo", assigneeAgentId: null, assigneeUserId: "board-user" }),
+    );
+
+    await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: peerAgentId, expectedStatuses: ["todo"] });
+
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "tasks:assign",
+      resource: expect.objectContaining({ currentAssigneeUserId: "board-user" }),
+    }));
+    // And `assigneeUserId` keeps meaning the assignment TARGET, which on this
+    // route is an agent. Conflating the two would silently re-aim the low-trust
+    // and task-bridge "cannot assign work to board users" guards at the wrong
+    // person.
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "tasks:assign",
+      resource: expect.objectContaining({ assigneeUserId: null }),
+    }));
+  });
+
+  it("refuses checkout of a row a person holds", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "todo", assigneeAgentId: null, assigneeUserId: "board-user" }),
+    );
+    mockAccessService.decide.mockImplementation(async (input: {
+      action: string;
+      resource?: { currentAssigneeUserId?: string | null };
+    }) => {
+      const humanHeld = input.action === "tasks:assign" && Boolean(input.resource?.currentAssigneeUserId);
+      return {
+        allowed: !humanHeld,
+        action: input.action,
+        reason: humanHeld ? "deny_missing_grant" : "allow_test_default",
+        explanation: humanHeld
+          ? "This issue is assigned to a person, so agents cannot reassign it — including to themselves."
+          : "Allowed by test default.",
+      };
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: peerAgentId, expectedStatuses: ["todo"] });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockIssueService.checkout).not.toHaveBeenCalled();
+  });
+
+  it("does not tell an agent to take a row a person holds when it denies the write", async () => {
+    // The 403 from the mutation boundary gated the clause naming the holder on
+    // `assigneeAgentId` — null on exactly these rows — so a human-held row read
+    // as unowned and the message then closed with "have the issue assigned to
+    // you". The denial was a signed map around itself.
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ status: "todo", assigneeAgentId: null, assigneeUserId: "board-user" }),
+    );
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: input.action === "issue:read",
+      action: input.action,
+      reason: input.action === "issue:read" ? "allow_company_agent" : "deny_missing_grant",
+      explanation: input.action === "issue:read" ? "Allowed by test read default." : "Missing permission.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ priority: "low" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(res.body.details.remediation).toEqual(expect.any(String));
+    // Pinned by what the text has to DO, not by its wording, so the prose stays
+    // editable while the two actionable halves cannot regress.
+    expect(res.body.details.remediation).toMatch(/person holds this issue/i);
+    expect(res.body.details.remediation).toContain("board-user");
+    expect(res.body.details.remediation).not.toMatch(/have the issue assigned to you/i);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
   it("returns a contextual 500 when recovery checkout lookup fails and assignment fallback is denied", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue({ status: "blocked", assigneeAgentId: ownerAgentId }));
     mockIssueRecoveryActionService.getActiveForIssue.mockRejectedValue(new Error("database timeout"));

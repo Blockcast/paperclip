@@ -106,6 +106,20 @@ export type AuthorizationResource =
        * onto an unowned shell from one re-claiming work it already holds.
        */
       currentAssigneeAgentId?: string | null;
+      /**
+       * PEN-5940: the *user* the row currently carries, which is NOT
+       * `assigneeUserId`. On `tasks:assign` that field is the assignment
+       * target — the user work is being handed to, which is what the
+       * low-trust (:1290) and task-bridge (:1407) guards refuse. The question
+       * "does a person already hold this row?" had no field at all, so
+       * `POST /issues/:id/checkout` could take a human-held row and the
+       * `tasks:assign` block had nothing to test.
+       *
+       * `undefined` means the caller did not look it up and the guard reloads
+       * the row; `null` means it looked and no user holds it. Do not collapse
+       * the two — see assignmentOntoHumanHeldIssueIsRefused.
+       */
+      currentAssigneeUserId?: string | null;
       createdByAgentId?: string | null;
       originKind?: string | null;
       originId?: string | null;
@@ -1915,6 +1929,33 @@ export function authorizationService(db: Db) {
     return AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.has(issue.originKind ?? "");
   }
 
+  // PEN-5940: does a *person* already hold this row? The companion to the guard
+  // above, and deliberately a separate question: that one asks what the row IS
+  // (its origin kind), this one asks who HOLDS it.
+  //
+  // `resource.assigneeUserId` cannot answer it. On `tasks:assign` that field is
+  // the assignment *target*, which is why :1290 and :1407 read it as "work is
+  // being handed to a board user" — a different sentence about a different
+  // person. Every caller populates it that way, so reusing it here would have
+  // conflated the two and made the two existing guards wrong.
+  async function assignmentOntoHumanHeldIssueIsRefused(
+    resource: Extract<AuthorizationResource, { type: "issue" }>,
+  ) {
+    // Same `undefined` vs `null` rule as the origin-kind guard above: `null` is
+    // the caller having looked and found no user, which is the common case and
+    // must not pay for a reload.
+    if (resource.currentAssigneeUserId !== undefined) {
+      return Boolean(resource.currentAssigneeUserId);
+    }
+    if (!resource.issueId) return false;
+    const issue = await loadIssue(resource.companyId, resource.issueId);
+    // Fail closed, for the same reason and in the same direction as the sibling
+    // guard: an id this company cannot read is foreign or dangling, not "a row
+    // nobody holds". Answering `false` there would be the permissive direction.
+    if (!issue) return true;
+    return Boolean(issue.assigneeUserId);
+  }
+
   async function decideBase(input: {
     actor: AuthorizationActor;
     action: AuthorizationAction;
@@ -2561,6 +2602,37 @@ export function authorizationService(db: Db) {
           reason: "deny_missing_grant",
           explanation:
             "Agents cannot claim a recovery or review shell they were not assigned; ownership of it confers access to the issue it reviews.",
+        });
+      }
+      // PEN-5940: a row a person holds is not reassignable by an agent, to
+      // itself or to anybody else.
+      //
+      // PEN-5900 closes the PATCH door (`issue:mutate` is withheld on a
+      // human-held row). It does not close this one: `POST /issues/:id/checkout`
+      // authorizes on `tasks:assign` and never reaches that branch, so an agent
+      // could take the row, become `assigneeAgentId`, and collect `issue:mutate`
+      // through `allow_self`. The 403 from the PATCH door even recommended it —
+      // see issueMutationGrantRemediation in routes/issues.ts.
+      //
+      // NOT scoped to self-claims, unlike the BLO-19094 guard above. Narrowing
+      // it that way leaves the same escalation one hop longer — agent A assigns
+      // the human's row to agent B — and the rule being enforced is not "do not
+      // appoint yourself", it is "a row a person holds changes only by that
+      // person's hand". The two routes that legitimately move such a row are
+      // untouched because neither reaches here: a user actor is decided before
+      // this agent branch, and an agent handing its OWN row back to a human
+      // (`isAgentReturningIssueToCreator`) bypasses assertCanAssignTasks
+      // entirely, as does `workflowControlledAssignment`.
+      if (
+        input.resource.type === "issue" &&
+        (await assignmentOntoHumanHeldIssueIsRefused(input.resource))
+      ) {
+        return deny({
+          action: input.action,
+          reason: "deny_missing_grant",
+          explanation:
+            "This issue is assigned to a person, so agents cannot reassign it — including to themselves. " +
+            "Ask that person to make the change, or to hand the issue over.",
         });
       }
       if (policyEffect.kind === "restricted") {

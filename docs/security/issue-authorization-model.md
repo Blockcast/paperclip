@@ -454,6 +454,19 @@ without re-deciding the model itself:
   absent from `unboundMentions` and PRESENT in `boundMentions`, and no wake is
   raised either, so the author is shown a success the mention did not earn and
   neither party learns anything; see "Who may grant a mention".
+- An agent asked to assign a row a **person** holds (`assigneeUserId` set), to
+  itself or to any other agent: denied `tasks:assign` (`PEN-5940`). This is the
+  one control in this list whose *bypass was published by another control's own
+  error message*: the `issue:mutate` denial recommended "have the issue assigned
+  to you", and `POST /issues/:id/checkout` would have obliged. Two halves, and
+  **each is inert alone** — the predicate lives in `decideBase`'s `tasks:assign`
+  block, and the route must hand it `currentAssigneeUserId` from the live row.
+  ⚠️ That field is **not** `assigneeUserId`, which on `tasks:assign` names the
+  assignment *target* and is what the low-trust and task-bridge guards read;
+  conflating the two re-aims those at the wrong person. The three moves that
+  legitimately take a row off a person all bypass this call: a user actor is
+  decided in an earlier branch, and the agent-to-creator hand-back and
+  workflow-controlled assignment never reach `assertCanAssignTasks`.
 - An agent assigned a parent or sibling issue: denied on the target issue.
   Ancestry is not a declared dependency; only a `blocks` edge is.
 - An agent across a `blocks` edge: denied `issue:mutate` — the edge grants a
@@ -505,6 +518,19 @@ The wake half is pinned in
 mentioned agent when an agent comment cannot grant reply access"** and **"does not
 enqueue a keyed mention wake when an agent cannot grant reply access"**, each paired
 with a positive control that asserts the entitled author *does* wake it.
+
+The human-held control is pinned in two places on purpose, because a predicate and
+the route that feeds it fail independently and a single test cannot tell them apart:
+**"does not let an agent reassign a row a person holds, to itself or anyone else"**
+in the same file is the predicate, and **"hands the tasks:assign decision the row's
+current human holder on checkout"** plus **"refuses checkout of a row a person
+holds"** in
+`server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts` are the route.
+Reverting either half fails its own pair and leaves the other green — which is the
+whole point: `assigneeUserId` was a hardcoded `null` at that call site, so a
+predicate added without the route change would have passed every unit test and
+denied nothing in production. The remediation half is pinned by **"does not tell an
+agent to take a row a person holds when it denies the write"**.
 
 Escape hatch 3's scope is pinned by the sibling case **"blocker edge (escape hatch 3)
 gates checkout and in_progress, not done"** in the same describe block. It fails if
