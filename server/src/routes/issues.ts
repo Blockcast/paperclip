@@ -202,6 +202,7 @@ import { assertEnvironmentSelectionForCompany } from "./environment-selection.js
 import { executionWorkspaceService as executionWorkspaceServiceDirect } from "../services/execution-workspaces.js";
 import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
+import { pullRequestOwnershipRelation } from "../services/pull-request-work-products.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import {
   ISSUE_LIST_APPLIED_LIMIT_HEADER,
@@ -10501,6 +10502,15 @@ export function issueRoutes(
         assigneeAgentId: owner.issue.assigneeAgentId,
         assigneeUserId: owner.issue.assigneeUserId,
         owningIdentifiers: owner.owningIdentifiers,
+        // PEN-5836: the owner/mention discriminator, computed here instead of
+        // left to each caller. `owners` contains every row the PR references
+        // anywhere, and `provenance` does not separate them -- a mentioning row
+        // is `"webhook"` too -- so a caller reading `provenance` as the binding
+        // records constraints on rows with no relation to the PR. Deriving it
+        // once, in the code that owns the null-vs-empty meaning of
+        // `owningIdentifiers`, is what keeps the `null` arm from being lost to
+        // a caller-side `?? []`.
+        relation: pullRequestOwnershipRelation(owner.issue.identifier, owner.owningIdentifiers),
         workProduct: owner.workProduct,
       })),
       // An empty `owners` is ambiguous on its own -- no such PR, or none this

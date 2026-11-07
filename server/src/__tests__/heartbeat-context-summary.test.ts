@@ -3397,6 +3397,48 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("externalId=<the PR's URL>");
   });
 
+  // PEN-5836: the directive used to name `provenance: "webhook"` as "the
+  // authoritative binding". It is not one -- the webhook writes a work product
+  // for every issue a PR references, so a mentioning row carries that same
+  // marker. Pinned clause by clause because each closes a specific misreading
+  // that was measured in the field, not hypothesised.
+  it("sends the run to `relation`, and says `provenance` does not discriminate", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("Read `relation`, NOT `provenance`");
+    // Without the reason, "read relation" is a rule a run can talk itself out
+    // of the moment the old field looks sufficient.
+    expect(markdown).toContain("rows the PR merely MENTIONS");
+    expect(markdown).toContain("does not discriminate");
+    // The arm that costs most if lost: `undetermined` must not read as "no".
+    expect(markdown).toContain("never as a no");
+  });
+
+  // The whole point of the correction: a run told only that the list can be too
+  // SHORT reads a long list as settled. Both directions, or neither.
+  it("documents the over-binding direction alongside the withheld-count warning", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("errs in BOTH directions");
+    expect(markdown).toContain("Too LONG");
+    // The pre-existing under-binding warning must survive the rewrite -- this is
+    // an addition, not a replacement.
+    expect(markdown).toContain("`withheldForAuthorizationCount > 0`");
+    expect(markdown).toContain("is NOT proof the artifact is unowned");
+    // The gap neither number reports.
+    expect(markdown).toContain("an owner in another company");
+  });
+
+  // Keyed on the artifact, while the hazard is keyed on the file set. A run that
+  // reads the lookup as discharging the obligation misses the row whose planned
+  // work edits the same files and which is bound to no PR at all.
+  it("says the lookup is necessary but not sufficient", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("necessary for recording a constraint and is not sufficient");
+    expect(markdown).toContain("FILE SET");
+  });
+
   // Placement, asserted rather than left to reading order. The sentence is author-side
   // -- it belongs to the rule that says record a constraint on the artifact's owning
   // row, which cannot be followed without enumerating the owners. In the pre-write list
