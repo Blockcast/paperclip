@@ -5895,8 +5895,8 @@ let projectCheckoutOriginMismatch:
   | null = null;
 let projectCheckoutOriginReconcileCompared: Gauge | null = null;
 let projectCheckoutOriginReconcileMetricsRefreshSuccess: Gauge | null = null;
-let approvalsPending: Gauge<"type" | "company_id" | "requester"> | null = null;
-let approvalOldestPendingAge: Gauge<"type" | "company_id" | "requester"> | null = null;
+let approvalsPending: Gauge<"type" | "company_id" | "requester" | "gated"> | null = null;
+let approvalOldestPendingAge: Gauge<"type" | "company_id" | "requester" | "gated"> | null = null;
 let approvalLastDecisionTimestamp: Gauge<"company_id" | "requester"> | null = null;
 let approvalQueueMetricsRefreshSuccess: Gauge | null = null;
 let acceptedInteractionOutcome: Gauge<"bucket"> | null = null;
@@ -6194,8 +6194,8 @@ function ensureRegistry(): {
   projectCheckoutOriginMismatchGauge: Gauge<"project_workspace_id" | "company_id" | "project_id">;
   projectCheckoutOriginReconcileComparedGauge: Gauge;
   projectCheckoutOriginReconcileMetricsRefreshSuccessGauge: Gauge;
-  approvalsPendingGauge: Gauge<"type" | "company_id" | "requester">;
-  approvalOldestPendingAgeGauge: Gauge<"type" | "company_id" | "requester">;
+  approvalsPendingGauge: Gauge<"type" | "company_id" | "requester" | "gated">;
+  approvalOldestPendingAgeGauge: Gauge<"type" | "company_id" | "requester" | "gated">;
   approvalLastDecisionTimestampGauge: Gauge<"company_id" | "requester">;
   approvalQueueMetricsRefreshSuccessGauge: Gauge;
   acceptedInteractionOutcomeGauge: Gauge<"bucket">;
@@ -7719,8 +7719,14 @@ function ensureRegistry(): {
         + "alert's GATE, never its trigger -- depth alone is a staffing opinion; see "
         + APPROVAL_LAST_DECISION_TIMESTAMP_METRIC + " for the fault signal. Labelled by company_id "
         + "and requester ('agent' when requested_by_agent_id is set, else 'board'); the type seed "
-        + "covers every (company_id, requester) pair with any approval history (BLO-48410).",
-      labelNames: ["type", "company_id", "requester"],
+        + "covers every (company_id, requester) pair with any approval history (BLO-48410). "
+        + "`gated` is 'true' when the card carries a payload.gate that can retire it when its "
+        + "pull request merges, 'false' when only a board verb can clear it (PEN-5885). "
+        + "{gated=\"false\"} is the board-owned depth: over 80 days no gated card stayed pending "
+        + "past 2.35d while 80 ungated ones passed 7d, so the two are different queues and the "
+        + "tail is entirely the ungated one. Both values are seeded with 0, so a drained half "
+        + "reads an explicit 0 rather than vanishing.",
+      labelNames: ["type", "company_id", "requester", "gated"],
       registers: [registry],
     });
     approvalOldestPendingAge = new Gauge({
@@ -7731,21 +7737,27 @@ function ensureRegistry(): {
         + "healthy rate can still strand one card forever, which the last-decision timestamp alone "
         + "cannot see. Reset-then-set every refresh; a type with nothing pending has no series here "
         + "(its " + APPROVALS_PENDING_METRIC + " reads 0), because 0 would read as a card filed this "
-        + "instant. Labelled by company_id + requester like " + APPROVALS_PENDING_METRIC + ".",
-      labelNames: ["type", "company_id", "requester"],
+        + "instant. Labelled by company_id + requester + gated like " + APPROVALS_PENDING_METRIC
+        + "; unlike that gauge the gated halves are NOT seeded, for the same reason types are not "
+        + "-- a half with nothing pending has no oldest card.",
+      labelNames: ["type", "company_id", "requester", "gated"],
       registers: [registry],
     });
     approvalLastDecisionTimestamp = new Gauge({
       name: APPROVAL_LAST_DECISION_TIMESTAMP_METRIC,
       help:
         "Unix timestamp (seconds) of the most recent BOARD decision on an approval -- "
-        + "approved/rejected/revision_requested only (BLO-29850). `withdrawn` and `cancelled` are "
-        + "excluded because they are requester-side cleanup: a burst of agents retiring their own "
-        + "moot cards drains the pending count without the board deciding anything, and a "
-        + "depth-only metric scores that as progress. Excluding them here is what makes "
-        + "`time() - <this>` a true service-liveness signal. A revision request is also read from "
-        + "the append-only activity log, because the requester's resubmit/withdraw erases it from "
-        + "the approval row. Labelled by company_id + requester (BLO-48410). Every "
+        + "approved/rejected/revision_requested, plus a gate-SATISFIED close (BLO-29850, "
+        + "PEN-5885). `withdrawn` is excluded because it is requester-side cleanup: a burst of "
+        + "agents retiring their own moot cards drains the pending count without the board "
+        + "deciding anything, and a depth-only metric scores that as progress. `cancelled` is "
+        + "admitted ONLY when approvals.gate_satisfied is true -- the gated pull request MERGED, "
+        + "which is the board acting on the ask through GitHub rather than through the card. A "
+        + "gate that died because its pull request was closed unmerged (gate_satisfied false) "
+        + "stays excluded, as does every cancellation no gate adjudicated (null). Excluding those "
+        + "is what keeps `time() - <this>` a true service-liveness signal. A revision request is "
+        + "also read from the append-only activity log, because the requester's resubmit/withdraw "
+        + "erases it from the approval row. Labelled by company_id + requester (BLO-48410). Every "
         + "(company_id, requester) pair with any approval history is emitted, at 0 when it has never "
         + "been decided, so a never-served channel reads as maximally stale instead of dropping out "
         + "of the vector; alerts gate on " + APPROVAL_QUEUE_METRICS_REFRESH_SUCCESS_METRIC
@@ -11136,6 +11148,8 @@ export function setApprovalQueuePendingMetrics(input: {
     companyId: string;
     requester: string;
     type: string;
+    /** Card carries a `payload.gate` that can retire it without a board verb (PEN-5885). */
+    gated: boolean;
     pending: number;
     oldestAgeSeconds: number;
   }>;
@@ -11146,7 +11160,15 @@ export function setApprovalQueuePendingMetrics(input: {
   metrics.approvalLastDecisionTimestampGauge.reset();
   for (const channel of input.channels) {
     const labels = { company_id: channel.companyId, requester: channel.requester };
-    for (const type of APPROVAL_TYPES) metrics.approvalsPendingGauge.set({ ...labels, type }, 0);
+    // Seeded on BOTH halves of `gated`, not just the types (PEN-5885). The series
+    // this exists for is `{gated="false"}` -- the depth only a board verb can
+    // clear -- and the moment it matters most is the moment it drains to zero,
+    // when an unseeded series would simply disappear and leave a responder unable
+    // to tell "board-owned depth is zero" from "this label was never exported".
+    for (const type of APPROVAL_TYPES) {
+      metrics.approvalsPendingGauge.set({ ...labels, type, gated: "false" }, 0);
+      metrics.approvalsPendingGauge.set({ ...labels, type, gated: "true" }, 0);
+    }
     const at = channel.lastDecisionTimestampSeconds;
     // 0 = never decided. The rule contract needs the series present (BLO-48410).
     metrics.approvalLastDecisionTimestampGauge.set(
@@ -11159,6 +11181,7 @@ export function setApprovalQueuePendingMetrics(input: {
       company_id: entry.companyId,
       requester: entry.requester,
       type: entry.type || "unknown",
+      gated: entry.gated ? "true" : "false",
     };
     const pending = Number.isFinite(entry.pending) ? Math.max(0, entry.pending) : 0;
     const age = Number.isFinite(entry.oldestAgeSeconds) ? Math.max(0, entry.oldestAgeSeconds) : 0;
