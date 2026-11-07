@@ -32571,11 +32571,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    *    nextCheckAt untouched, so a CAS on those two would wave it through.
    *
    * The monitor's `notes` are the whole record of what the run was waiting for,
-   * so they are preserved twice over: `buildIssueMonitorClearedPatch` keeps an
-   * audit copy on `executionState.monitor.notes`, and the activity entry below
-   * carries them alongside the clear reason. Deliberately an activity row and
-   * not an issue comment — a comment fires an `issue_commented` wake, which
-   * would turn a bookkeeping sweep into wake fan-out across every stranded row.
+   * so the activity entry below carries them alongside the clear reason, read
+   * from the pre-clear row. PEN-5902: that entry is now the ONLY copy for this
+   * clear reason — `buildIssueMonitorClearedPatch` keeps the audit copy on
+   * `executionState.monitor.notes` for `cancelled` alone, because a cancelled
+   * row's recovery handoff is emitted on a later tick and has nowhere else to
+   * read them from. Deliberately an activity row and not an issue comment — a
+   * comment fires an `issue_commented` wake, which would turn a bookkeeping
+   * sweep into wake fan-out across every stranded row.
    */
   async function reconcileUndeliverableIssueMonitors(opts?: {
     companyId?: string;
@@ -32992,6 +32995,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // this pass runs. Re-hydrate from the audit copy: the notes are the
       // whole record of what the run was waiting for, and they feed the
       // recovery body, the activity details and the wake payload alike.
+      //
+      // PEN-5902: `cancelled` is the ONE clear reason whose state copy
+      // survives, and this pass is why — see `clearedMonitorKeepsNotes`. If
+      // that exemption is ever removed, this re-hydration silently starts
+      // reading null and the handoff loses the only record it carries.
       const claimed: IssueMonitorDispatchRow = { ...row, monitorNotes: monitorState.notes ?? null };
       const clearedAtIso = monitorState.clearedAt;
 

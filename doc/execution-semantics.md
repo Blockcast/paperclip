@@ -514,7 +514,24 @@ Use the dedicated monitor write path. It touches the monitor and nothing else:
 
 Both carry the same authorization as the legacy path (`assertCanManageIssueMonitor`: the assignee agent, the agent holding the current execution run, or a board user), and both are exposed as `paperclipSetIssueMonitor` / `paperclipClearIssueMonitor`.
 
-`DELETE` is also the only reliable exit for a wedged monitor. Once a monitor fires, the trigger strips it out of `executionPolicy` and it survives only in `executionState`, so the clear keys on `executionState` rather than on a policy field that is already gone. It clears a `triggered` — and even a bounds-exhausted — monitor, and nulls `monitorNotes` so the next run does not inherit a retired monitor's notes as a live gate.
+`DELETE` is also the only reliable exit for a wedged monitor. Once a monitor fires, the trigger strips it out of `executionPolicy` and it survives only in `executionState`, so the clear keys on `executionState` rather than on a policy field that is already gone. It clears a `triggered` — and even a bounds-exhausted — monitor.
+
+##### What a clear nulls (PEN-5902)
+
+A clear nulls the columns `monitorNextCheckAt`, `monitorWakeRequestedAt` and `monitorNotes`, **and** the archived copy at `executionState.monitor.notes`, so that a retired monitor's operating instructions are not inherited by the next run as a live gate on either surface.
+
+The rest of `executionState.monitor` is an audit record and is kept: `status`, `clearedAt`, `clearReason`, `clearedNextCheckAt`, `attemptCount`, `gateSignals` and the convergence counters. `attemptCount` is not reset, so a later re-arm is still bounded by it.
+
+`notes` is the only field of that object that a clear destroys, and it is the only free-prose one. The trade-off was settled by asking which clears have a *reader* of the archived copy, not by whether the object is nominally an audit record:
+
+- `clearReason: "cancelled"` is the single exemption. `reconcileCancelledIssueMonitorRecoveries` emits that row's recovery handoff on a **later tick**, when `monitorNotes` is already null, and re-hydrates the notes from the state. A cancelled row may never be opened again, so its recovery issue is the only surviving carrier of the obligation and the notes have to travel with it. The copy is kept until that handoff is stamped (`recoveryEmittedAt`).
+- Every other clear reason either runs its recovery **inline**, while the scheduler still holds the pre-clear row and reads the live column, or has no recovery at all.
+
+The durable audit record of the notes is the `issue.monitor_cleared` activity entry, which is written from the pre-clear row on every clear path — including the retraction below, so a scrub is itself recorded.
+
+`DELETE` on an **already-cleared** monitor is the retraction path for notes left behind by a clear that predates this behaviour. It scrubs `executionState.monitor.notes` and touches nothing else — `clearedAt` and `clearReason` keep saying when and why the monitor really died — requires no particular issue status, re-arms nothing, and spends no attempt budget. It is declined while a `cancelled` handoff is still owed on those notes. When the notes are already empty it writes nothing.
+
+Confirm a clear by re-reading `monitorNextCheckAt`, `executionState.monitor.status` and `executionState.monitor.notes`. A `200` is not evidence: the defect this section documents was a clear that returned `200` and left the archived notes byte-identical.
 
 Recovery actions: an arm through `PATCH /api/issues/:id/monitor` revalidates the issue's active recovery action the same way an arm through `PATCH /api/issues/:id` does, so both paths agree on whether that action is still `active`. A `DELETE` deliberately skips that revalidation. Revalidation retires an action because the issue now has its own way of being re-driven, and a clear only removes one, so it is never a reason to retire an action that may be the row's remaining wake path. The legacy `{"executionPolicy": {}}` clear still revalidates and can cancel that action; that is the one place the two paths still differ.
 

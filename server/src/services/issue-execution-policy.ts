@@ -383,6 +383,27 @@ function buildTriggeredMonitorState(input: {
   };
 }
 
+/**
+ * PEN-5902: whether a clear with this reason still owes a reader the monitor's
+ * `notes`, and so must keep the audit copy on `executionState.monitor.notes`.
+ *
+ * Exactly one consumer re-hydrates from that copy, and it is deferred:
+ * `reconcileCancelledIssueMonitorRecoveries` runs on a later tick, after the clear has
+ * committed and `issues.monitorNotes` is already null, and CASes on
+ * `clearReason = 'cancelled' AND recoveryEmittedAt IS NULL`. For a cancelled
+ * row the recovery issue it mints may be the only surviving carrier of the
+ * obligation, so the notes have to travel with it.
+ *
+ * Every other clear reason either runs its recovery inline — the scheduler
+ * still holds the pre-clear row, so it reads the live column, not the archive —
+ * or has no recovery at all. For those the archived copy has no reader, and
+ * `monitorRecoveryComment` only reaches `clearedMonitor` in its `cancelled`
+ * branch.
+ */
+function clearedMonitorKeepsNotes(clearReason: IssueExecutionMonitorClearReason): boolean {
+  return clearReason === "cancelled";
+}
+
 function buildClearedMonitorState(input: {
   previous: IssueExecutionMonitorState | null;
   clearReason: IssueExecutionMonitorClearReason;
@@ -395,7 +416,14 @@ function buildClearedMonitorState(input: {
     nextCheckAt: null,
     lastTriggeredAt: input.previous?.lastTriggeredAt ?? null,
     attemptCount: input.previous?.attemptCount ?? 0,
-    notes: input.previous?.notes ?? null,
+    // PEN-5902: the notes are operating instructions addressed to the next
+    // waking run. A retired monitor's copy of them has no reader except a
+    // human or agent inspecting the row, to whom they read as live work —
+    // and until now nothing could write to this field, so the mistake was
+    // permanent. Keep them only where a deferred consumer needs them; the
+    // durable audit record is the `issue.monitor_cleared` activity entry,
+    // which carries `notes` on every clear path.
+    notes: clearedMonitorKeepsNotes(input.clearReason) ? input.previous?.notes ?? null : null,
     scheduledBy: input.previous?.scheduledBy ?? null,
     ...monitorMetadataFromState(input.previous),
     ...monitorConvergenceFields(input.previous, null, input.convergence),
@@ -1382,9 +1410,16 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
  * but used to leave the notes column populated, so a retired monitor's notes
  * survived as a live-looking instruction. Observed cost: notes registering a
  * discriminator to read at a trigger time outlived their monitor by four days,
- * and the next reader treated them as an active gate. The audit copy lives on
- * `executionState.monitor.notes` (`buildClearedMonitorState` carries it
- * forward), so nulling the column loses nothing.
+ * and the next reader treated them as an active gate.
+ *
+ * PEN-5902: this used to say the audit copy on `executionState.monitor.notes`
+ * made nulling the column lossless. That copy is where the same defect went to
+ * hide — it is reachable by every reader of the row, named identically to the
+ * live field, and no verb could write to it. `buildClearedMonitorState` now
+ * keeps it only for the one clear reason with a deferred consumer
+ * (`clearedMonitorKeepsNotes`). What makes nulling the column lossless is the
+ * `issue.monitor_cleared` activity entry, which records `notes` read from the
+ * pre-clear row on every clear path.
  *
  * Applied by every clear site so a future branch cannot forget one.
  */
@@ -1609,6 +1644,28 @@ function applyMonitorTransition(
           : monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId) ?? "manual",
       clearedAt: new Date(),
     });
+  } else if (
+    // PEN-5902: an explicit clear of an ALREADY-cleared monitor, which the
+    // branch above deliberately declines. Rows cleared before that change
+    // still hold the retired monitor's `notes`, and a re-clear through the
+    // branch above would be the wrong repair — it would stamp a fresh
+    // `clearedAt`, overwrite `clearReason` with `manual` and reset
+    // `recoveryEmittedAt`, falsifying when the monitor actually died and
+    // re-arming a recovery handoff that was already discharged.
+    //
+    // So scrub the one free-prose field and leave the audit record alone.
+    // `monitorStatesEqual` makes this a no-op write when the notes are
+    // already empty, which is every row cleared after that change.
+    input.monitorExplicitlyUpdated &&
+    currentMonitorState?.status === "cleared" &&
+    currentMonitorState.notes != null &&
+    // Never destroy an input the deferred cancelled-recovery pass has not
+    // consumed yet — it re-hydrates the notes from here precisely because the
+    // column is gone by the time it runs.
+    !(clearedMonitorKeepsNotes(currentMonitorState.clearReason ?? "manual") && !currentMonitorState.recoveryEmittedAt)
+  ) {
+    clearArmedMonitorColumns(patch);
+    targetMonitorState = { ...currentMonitorState, notes: null };
   }
 
   if (stagePatch.executionState !== undefined || !monitorStatesEqual(currentMonitorState, targetMonitorState)) {

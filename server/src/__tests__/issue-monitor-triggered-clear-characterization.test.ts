@@ -80,6 +80,11 @@ describe("BLO-27586 AC1 — clearing a `triggered` monitor", () => {
     expect(patch.executionState?.monitor).toMatchObject({
       status: "cleared",
       clearReason: "manual",
+      // PEN-5902: and the ARCHIVED copy too. This test was named "drops the
+      // stale notes" while asserting only the column, which is exactly the
+      // half-truth the tool description carried — the clear returned 200 and
+      // left this field byte-identical.
+      notes: null,
     });
     // PEN-1995: the armed-monitor columns are nulled, so the next run does not
     // inherit a retired monitor's notes as a live gate.
