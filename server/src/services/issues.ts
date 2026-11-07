@@ -14,6 +14,7 @@ import {
   companyMemberships,
   costEvents,
   documentRevisions,
+  issueFieldRevisions,
   documents,
   financeEvents,
   goals,
@@ -11727,6 +11728,34 @@ export function issueService(db: Db) {
       return createdIssue;
     },
 
+    /**
+     * PEN-5876: the readable half. A compare-and-set tells a writer it lost;
+     * only a history tells a later reader WHAT was lost and WHO wrote it.
+     *
+     * `createdByRunId` is the field that answers the second measured instance —
+     * a write that landed and claimed nothing — where "did I lose?" was never
+     * the open question and "whose text is this?" was.
+     */
+    listFieldRevisions: async (issueId: string, limit = 50) =>
+      db
+        .select({
+          id: issueFieldRevisions.id,
+          companyId: issueFieldRevisions.companyId,
+          issueId: issueFieldRevisions.issueId,
+          revisionNumber: issueFieldRevisions.revisionNumber,
+          title: issueFieldRevisions.title,
+          description: issueFieldRevisions.description,
+          changeSummary: issueFieldRevisions.changeSummary,
+          createdByAgentId: issueFieldRevisions.createdByAgentId,
+          createdByUserId: issueFieldRevisions.createdByUserId,
+          createdByRunId: issueFieldRevisions.createdByRunId,
+          createdAt: issueFieldRevisions.createdAt,
+        })
+        .from(issueFieldRevisions)
+        .where(eq(issueFieldRevisions.issueId, issueId))
+        .orderBy(desc(issueFieldRevisions.revisionNumber))
+        .limit(limit),
+
     update: async (
       id: string,
       data: Partial<typeof issues.$inferInsert> & {
@@ -11734,6 +11763,12 @@ export function issueService(db: Db) {
         blockedByIssueIds?: string[];
         actorAgentId?: string | null;
         actorUserId?: string | null;
+        /**
+         * PEN-5876: the run that authored this write, stamped onto any
+         * `issue_field_revisions` row it produces. Attribution, not
+         * authorization — nothing is gated on it.
+         */
+        actorRunId?: string | null;
         /**
          * BLO-18797: optimistic-concurrency guard. When set, the row must still
          * carry this status at write time or the update is rejected with 409.
@@ -11814,6 +11849,26 @@ export function issueService(db: Db) {
         expectedCurrentCheckoutRunId?: string | null;
         expectedCurrentExecutionRunId?: string | null;
         /**
+         * PEN-5876: compare-and-set over the scalar text field set (`title` +
+         * `description`). The caller passes the `latestFieldRevisionId` it read;
+         * if anyone has written either field since, the update is refused 409
+         * `stale_base_revision` instead of silently overwriting them.
+         *
+         * Unlike the pins above this is NOT an authorization snapshot — it is a
+         * lost-update guard a caller opts into, and it is keyed on THE DATA
+         * ("has this field moved since I read it?") rather than on who holds a
+         * lock. That is deliberate: the issue checkout lock excludes nothing at
+         * the field-write layer, and in the incident this was filed from the
+         * lock HOLDER is the party whose content was destroyed, so a
+         * holder-keyed refusal is one-sided and catches only one ordering.
+         *
+         * Repeated in the UPDATE's WHERE clause for the same reason as the
+         * others: only the WHERE is re-evaluated against the latest row version
+         * when the statement blocks on a concurrent transaction, so a snapshot
+         * comparison alone would leave the very window this guards.
+         */
+        expectedCurrentFieldRevisionId?: string;
+        /**
          * Pins the execution-stage snapshot that authorized a decision. A
          * concurrent decision or stage advance must not be overwritten by a
          * former participant acting on stale route state.
@@ -11873,12 +11928,14 @@ export function issueService(db: Db) {
         blockedByIssueIds,
         actorAgentId,
         actorUserId,
+        actorRunId,
         expectedCurrentStatus,
         expectedCurrentAssigneeAgentId,
         expectedNoUnresolvedBlockers,
         expectedCurrentAssigneeAgentNonInvokable,
         expectedCurrentCheckoutRunId,
         expectedCurrentExecutionRunId,
+        expectedCurrentFieldRevisionId,
         expectedCurrentExecutionState,
         expectedCurrentExecutionPolicy,
         suppressRoutineSchedulerFailureHeartbeat,
@@ -11931,6 +11988,21 @@ export function issueService(db: Db) {
           issueId: id,
           expectedExecutionRunId: expectedCurrentExecutionRunId,
           currentExecutionRunId: existing.executionRunId,
+        });
+      }
+      if (
+        expectedCurrentFieldRevisionId !== undefined &&
+        existing.latestFieldRevisionId !== expectedCurrentFieldRevisionId
+      ) {
+        // PEN-5876. The details carry the current revision so the caller can
+        // re-read, rebase its edit and retry without a second round trip —
+        // "write, and be told you lost" is the whole point of the primitive.
+        throw conflict("Issue title/description changed before the update could be applied", {
+          code: "stale_base_revision",
+          issueId: id,
+          expectedRevisionId: expectedCurrentFieldRevisionId,
+          latestRevisionId: existing.latestFieldRevisionId,
+          latestRevisionNumber: existing.latestFieldRevisionNumber,
         });
       }
       if (
@@ -12056,6 +12128,13 @@ export function issueService(db: Db) {
         });
       }
 
+      // PEN-5876: did this write touch the guarded scalar text field set?
+      // Keyed on the KEY being present rather than on the value differing:
+      // a caller that re-sends identical text still performed a write, and a
+      // history that silently drops no-op writes cannot be used to reason
+      // about who wrote when.
+      const touchesGuardedFieldSet =
+        issueData.title !== undefined || issueData.description !== undefined;
       const patch: Partial<typeof issues.$inferInsert> = {
         ...issueData,
         updatedAt: new Date(),
@@ -12559,6 +12638,13 @@ export function issueService(db: Db) {
                   ? isNull(issues.executionRunId)
                   : eq(issues.executionRunId, expectedCurrentExecutionRunId),
               ]),
+          // PEN-5876: the compare-and-set itself. A row that has never been
+          // revised has a NULL pointer, so any supplied base revision is stale
+          // by definition — mirroring the "document does not exist yet" branch
+          // the pipeline document route already takes.
+          ...(expectedCurrentFieldRevisionId === undefined
+            ? []
+            : [eq(issues.latestFieldRevisionId, expectedCurrentFieldRevisionId)]),
           ...(expectedCurrentExecutionState === undefined
             ? []
             : [
@@ -12612,6 +12698,9 @@ export function issueService(db: Db) {
               ...(expectedCurrentExecutionRunId === undefined
                 ? {}
                 : { expectedExecutionRunId: expectedCurrentExecutionRunId }),
+              ...(expectedCurrentFieldRevisionId === undefined
+                ? {}
+                : { code: "stale_base_revision", expectedRevisionId: expectedCurrentFieldRevisionId }),
               ...(expectedCurrentExecutionState === undefined
                 ? {}
                 : { expectedExecutionState: true }),
@@ -12679,6 +12768,69 @@ export function issueService(db: Db) {
                 })
                 .where(eq(executionWorkspaces.id, workspace.id));
             }
+          }
+        }
+        // PEN-5876: record a revision whenever this write touched the guarded
+        // scalar text field set. In the same transaction as the UPDATE and under
+        // the `FOR UPDATE` row lock taken above, so revision numbers cannot
+        // interleave.
+        //
+        // Recorded even when the caller supplied no precondition. History is
+        // what makes a lost update detectable AFTER THE FACT — the measured
+        // incident could not be adjudicated at all, because nothing
+        // distinguished "the holder's edit was clobbered" from "the holder
+        // never wrote". A history covering only opted-in writers would
+        // reproduce that gap for everyone else.
+        if (touchesGuardedFieldSet) {
+          const revisionRows: Array<typeof issueFieldRevisions.$inferInsert> = [];
+          let nextRevisionNumber = lockedExisting.latestFieldRevisionNumber;
+          // Lazily seed a baseline from the PRE-write state the first time a
+          // row's field set is written. Without it, the one revision anybody
+          // actually wants back — the text that was just overwritten — is the
+          // one the history does not hold.
+          if (nextRevisionNumber === 0) {
+            nextRevisionNumber += 1;
+            revisionRows.push({
+              companyId: lockedExisting.companyId,
+              issueId: lockedExisting.id,
+              revisionNumber: nextRevisionNumber,
+              title: lockedExisting.title,
+              description: lockedExisting.description,
+              changeSummary: "baseline recorded before the first guarded field write",
+              createdByAgentId: null,
+              createdByUserId: null,
+              createdByRunId: null,
+            });
+          }
+          nextRevisionNumber += 1;
+          revisionRows.push({
+            companyId: updated.companyId,
+            issueId: updated.id,
+            revisionNumber: nextRevisionNumber,
+            title: updated.title,
+            description: updated.description,
+            changeSummary: null,
+            createdByAgentId: actorAgentId ?? null,
+            createdByUserId: actorUserId ?? null,
+            // The column the second measured instance turned on: a write that
+            // landed and announced itself on no row at all. Attribution
+            // survived there only by residue and luck; this is the record.
+            createdByRunId: actorRunId ?? null,
+          });
+
+          const inserted = await tx.insert(issueFieldRevisions).values(revisionRows).returning();
+          const latest = inserted[inserted.length - 1];
+          const [repointed] = await tx
+            .update(issues)
+            .set({
+              latestFieldRevisionId: latest.id,
+              latestFieldRevisionNumber: latest.revisionNumber,
+            })
+            .where(eq(issues.id, updated.id))
+            .returning();
+          if (repointed) {
+            updated.latestFieldRevisionId = repointed.latestFieldRevisionId;
+            updated.latestFieldRevisionNumber = repointed.latestFieldRevisionNumber;
           }
         }
         const [enriched] = await withIssueLabels(tx, [updated]);

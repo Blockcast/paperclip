@@ -924,6 +924,24 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   // create path carries `parkedDispositionCreateGuardShape`, and this `.extend()` is what
   // overrides that rejection back to the real schema on update.
   parkedDisposition: issueParkedDispositionSchema.nullable().optional(),
+  // PEN-5876: optional compare-and-set over the scalar text field set
+  // (`title` + `description`). Supply the `latestFieldRevisionId` you read,
+  // and the write is refused 409 `stale_base_revision` if anyone has written
+  // either field since. Omit it and the write proceeds unchecked, exactly as
+  // before — phase 1 is additive, so no existing caller changes behaviour.
+  //
+  // Deliberately NOT `baseUpdatedAt`: a comment bumps row `updatedAt` while
+  // `description` stays byte-identical, so a timestamp precondition would
+  // refuse writes on ordinary thread traffic and still could not distinguish
+  // a real overwrite from that noise.
+  //
+  // The name and the 409 semantics are `paperclipUpsertIssueDocument`'s, so
+  // this is not a second shape. Only the OPTIONALITY is phased: documents
+  // require the precondition once the document exists, but every issue row
+  // already exists, so "required on update" would mean required on every
+  // PATCH touching these fields and would break every current caller at once.
+  // Phase 2 flips it to mandatory for this field set once callers migrate.
+  baseRevisionId: z.string().guid().optional(),
 });
 
 export type UpdateIssue = z.infer<typeof updateIssueSchema>;
