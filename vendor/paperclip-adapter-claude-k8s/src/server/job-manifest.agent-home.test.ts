@@ -24,6 +24,19 @@ const AGENT_ID = "29033747-e513-46d5-8a13-dcb5dac10017";
 const INSTRUCTIONS_ROOT = "/paperclip/.paperclip/instances/default/companies/Penstock/agents/cto";
 const INSTRUCTIONS_SUBPATH = ".paperclip/instances/default/companies/Penstock/agents/cto";
 
+// A `managed` bundle — the ONLY other mode `agent-instructions.ts` can persist
+// (`type BundleMode = "managed" | "external"`). Its canonical file sits one level
+// deeper, under `instructions/`, so `instructionsRootPath` (= `dirname(file)`) and
+// the mounted `agentBundleRoot` (= its PARENT) DISAGREE here. That divergence is the
+// whole reason this resolves through `agentBundleRoot` and not through the root path.
+const MANAGED_AGENT_ID = "6f9c2a71-0b3d-4e52-9a18-5c7d0e4b1f88";
+const MANAGED_AGENT_DIR = `/paperclip/instances/default/companies/co1/agents/${MANAGED_AGENT_ID}`;
+const MANAGED_INSTRUCTIONS_ROOT = `${MANAGED_AGENT_DIR}/instructions`;
+const MANAGED_AGENT_SUBPATH = `instances/default/companies/co1/agents/${MANAGED_AGENT_ID}`;
+
+/** An operator-set bundle outside the data mount — nothing binds it into the pod. */
+const OFF_VOLUME_ROOT = "/srv/agent-bundles/cto";
+
 /** What the server hands over today, and what the pod cannot see. */
 const SERVER_SIDE_HOME_DIR = `/paperclip/instances/default/workspaces/${AGENT_ID}`;
 
@@ -124,21 +137,86 @@ describe("AGENT_HOME on an external instructions bundle (PEN-2585)", () => {
     expect(mounts.some((m) => m.mountPath === SERVER_SIDE_HOME_DIR)).toBe(false);
   });
 
-  it("falls back to the workspace agent home when the bundle is not external", () => {
-    // Single-file / legacy agents — unchanged behaviour, stated so the change is not
-    // read as fleet-wide.
+  it("falls back to the workspace agent home when there is no instructions bundle", () => {
+    // The real legacy shape. `syncInstructionsBundleConfigFromFilePath` DELETES the
+    // mode, root and entry keys whenever `instructionsFilePath` is absent, so "no
+    // bundle" is all four fields unset together — never a bundle file with the mode
+    // or root cleared out from under it. Unchanged behaviour, stated so the change is
+    // not read as fleet-wide.
     const built = buildJobManifest({
-      ctx: makeCtx({ instructionsBundleMode: "inline" }),
+      ctx: makeCtx({
+        instructionsFilePath: "",
+        instructionsRootPath: "",
+        instructionsEntryFile: "",
+        instructionsBundleMode: "",
+      }),
       selfPod,
     });
     expect(agentHomeEnv(built)).toBe(SERVER_SIDE_HOME_DIR);
   });
 
-  it("falls back when the bundle is external but no root is configured", () => {
+  it("falls back when the bundle is off the data mount, and does not name it", () => {
+    // `agentBundleRoot` only refuses the volume ROOT — it does not test that the path
+    // is on the volume at all. Without the on-volume half of the join, an operator-set
+    // bundle outside the data mount would become a durable-LOOKING AGENT_HOME that no
+    // mount backs: PEN-2585 again, by a new route. This is the control for that half.
     const built = buildJobManifest({
-      ctx: makeCtx({ instructionsRootPath: "" }),
+      ctx: makeCtx({
+        instructionsFilePath: `${OFF_VOLUME_ROOT}/AGENTS.md`,
+        instructionsRootPath: OFF_VOLUME_ROOT,
+        instructionsBundleMode: "external",
+      }),
       selfPod,
     });
     expect(agentHomeEnv(built)).toBe(SERVER_SIDE_HOME_DIR);
+    expect(agentHomeEnv(built)).not.toBe(OFF_VOLUME_ROOT);
+    const mounts = agentContainer(built)?.volumeMounts ?? [];
+    expect(mounts.some((m) => m.mountPath === OFF_VOLUME_ROOT)).toBe(false);
+  });
+});
+
+describe("AGENT_HOME on a managed instructions bundle (PEN-2585)", () => {
+  function managedCtx() {
+    return makeCtx({
+      instructionsFilePath: `${MANAGED_INSTRUCTIONS_ROOT}/AGENTS.md`,
+      instructionsRootPath: MANAGED_INSTRUCTIONS_ROOT,
+      instructionsBundleMode: "managed",
+    });
+  }
+
+  it("points at the agent dir, NOT one level deeper at the instructions root", () => {
+    // The regression this suite exists to hold. Keying the fix on `instructionsRootPath`
+    // passes every `external` fixture — the two derivations coincide there — and hands a
+    // `managed` seat an AGENT_HOME inside its own instructions bundle, putting
+    // `$AGENT_HOME/memory/` somewhere mounted, durable and silently wrong forever.
+    const built = buildJobManifest({ ctx: managedCtx(), selfPod });
+    expect(agentHomeEnv(built)).toBe(MANAGED_AGENT_DIR);
+    expect(agentHomeEnv(built)).not.toBe(MANAGED_INSTRUCTIONS_ROOT);
+    expect(agentHomeEnv(built)).not.toBe(SERVER_SIDE_HOME_DIR);
+  });
+
+  it("names a root the pod actually mounts", () => {
+    // Same join as the external case. It is the point of asserting it in BOTH modes:
+    // against the `instructionsRootPath` spelling this assertion is vacuous for
+    // `external` (the derivations agree) and is the one that fails for `managed`.
+    const built = buildJobManifest({ ctx: managedCtx(), selfPod });
+    const home = agentHomeEnv(built);
+    const mounts = agentContainer(built)?.volumeMounts ?? [];
+    expect(mounts).toContainEqual({
+      name: "data",
+      mountPath: MANAGED_AGENT_DIR,
+      subPath: MANAGED_AGENT_SUBPATH,
+    });
+    expect(mounts.some((m) => m.mountPath === home)).toBe(true);
+  });
+
+  it("covers a sibling memory/ dir, which the instructions root would not", () => {
+    // `resolveScopedWritableMounts` opens the whole agent dir precisely so `memory/`
+    // is covered. Assert AGENT_HOME is an ancestor of that tree rather than a peer
+    // inside the bundle — the difference between the two candidate spellings.
+    const built = buildJobManifest({ ctx: managedCtx(), selfPod });
+    const home = agentHomeEnv(built) ?? "";
+    expect(`${MANAGED_AGENT_DIR}/memory`.startsWith(`${home}/`)).toBe(true);
+    expect(`${MANAGED_AGENT_DIR}/memory`.startsWith(`${MANAGED_INSTRUCTIONS_ROOT}/`)).toBe(false);
   });
 });
