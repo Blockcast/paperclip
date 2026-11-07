@@ -139,29 +139,165 @@ export function summarize(issues) {
 }
 
 /**
+ * Carriers grouped by the SOURCE ROW they were emitted for.
+ *
+ * `originId` identifies the row, NOT the obligation, which is the whole reason
+ * the duplicate reading below needs a second key. Exported so `main` can decide
+ * which feeds to read using the same grouping the classifier uses, rather than
+ * a second copy of it that can drift.
+ */
+export function carriersBySource(recoveryRows) {
+  const bySource = new Map();
+  for (const row of recoveryRows ?? []) {
+    const list = bySource.get(row.originId) ?? [];
+    list.push(row);
+    bySource.set(row.originId, list);
+  }
+  return bySource;
+}
+
+/**
+ * PEN-5838 — the per-OBLIGATION key, recovered from the source row's own feed.
+ *
+ * An alert row is recycled, so it incurs a NEW obligation on every flap: two
+ * carriers for one `originId` is the normal outcome, and keying the duplicate
+ * reading on `originId` alone reported `PEN-4917` — 9 cancelled clears, 2
+ * recoveries, 2 carriers — as a fault. Re-flap is the common case in the only
+ * corpus this instrument is ever pointed at, so that false positive accrues
+ * monotonically and retires the count as a signal.
+ *
+ * The key is `issue.monitor_recovery_issue_created.details.nextCheckAt`. Mind
+ * the name: on THIS action it is `performIssueMonitorRecovery`'s
+ * `scheduledAtIso`, which the cancelled-monitor pass calls with
+ * `monitorState.clearedAt` — so it holds the CLEAR THIS RECOVERY DISCHARGED,
+ * one value per obligation. On the sibling `issue.monitor_cleared_undeliverable`
+ * the identically-named field holds the destroyed DUE time instead. The two are
+ * not equal and must not be joined on: measured on PEN-4917, the clear logged
+ * `nextCheckAt=2026-11-05T06:30:00Z` at `createdAt=01:30:35.317Z` while its
+ * recovery keyed `01:30:34.554Z` — the clearedAt, 763 ms before the clear's own
+ * activity row landed. Recoveries are therefore keyed against EACH OTHER, never
+ * against the clear feed.
+ *
+ * Re-drives collapse by construction: a crash between emit and stamp re-enters
+ * the pass, `findOpenIssueMonitorRecoveryIssue` reuses the carrier, and the
+ * second log line repeats the same `clearedAt` — one key, one carrier.
+ *
+ * Preferred over the carrier's own `- Cleared at:` description line, which is
+ * the cheaper-looking discriminator and the wrong one: that body is free text an
+ * assignee may rewrite, the list projection clips descriptions at 1200
+ * characters, and only the `cancelled` branch of `monitorRecoveryComment` emits
+ * the line at all — an `external_service` carrier on the same row has no such
+ * field. `originFingerprint` is no better: it is `issue_monitor:<clearReason>`,
+ * constant across every flap of the same reason.
+ */
+export function recoveryObligationKeys(activityEvents) {
+  const keys = new Set();
+  let events = 0;
+  let unkeyed = 0;
+  for (const event of activityEvents ?? []) {
+    if (event?.action !== "issue.monitor_recovery_issue_created") continue;
+    events += 1;
+    const key = event?.details?.nextCheckAt ?? null;
+    if (key === null) unkeyed += 1;
+    else keys.add(key);
+  }
+  return { events, distinct: keys.size, unkeyed };
+}
+
+/**
+ * Decides the multi-carrier reading for ONE source row, given its feed.
+ *
+ * Returns `duplicated` only when the feed can actually carry the claim, because
+ * the count exists to catch an emerging double-emit and a flag that also fires
+ * on correct behaviour is one people learn to ignore. Three things can make the
+ * obligation count unestablished, and all three resolve to `unresolved` rather
+ * than to either verdict:
+ *
+ *  - no feed was read for the row (unreadable, or not requested);
+ *  - a recovery event carries no `nextCheckAt`, so it cannot be attributed;
+ *  - FEWER events than carriers. Every carrier is created inside the block that
+ *    logs the event, but that `logActivity` is deliberately best-effort — the
+ *    server swallows its rejection to keep the committed carrier discoverable by
+ *    `originId`. So a lost log line is a real, designed-for state, and under it
+ *    "two carriers, one event" is indistinguishable from "one obligation emitted
+ *    twice". Asserting the latter would reintroduce exactly the false positive
+ *    this function exists to remove.
+ *
+ * With events ≥ carriers and every event keyed, `distinct < carriers` means at
+ * least one obligation has more than one carrier. That is established, and only
+ * then is it reported.
+ */
+export function classifyMultiCarrier(carrierCount, feed) {
+  if (!feed) {
+    return {
+      verdict: "unresolved",
+      detail: `${carrierCount} carriers, obligations not established (no recovery-event feed read)`,
+    };
+  }
+  const { events, distinct, unkeyed } = recoveryObligationKeys(feed);
+  if (unkeyed > 0) {
+    return {
+      verdict: "unresolved",
+      detail:
+        `${carrierCount} carriers, obligations not established ` +
+        `(${unkeyed} of ${events} recovery events carry no clear key)`,
+    };
+  }
+  if (events < carrierCount) {
+    return {
+      verdict: "unresolved",
+      detail:
+        `${carrierCount} carriers but only ${events} recovery events ` +
+        `(the creation log is best-effort, so a lost line is not a duplicate)`,
+    };
+  }
+  if (distinct < carrierCount) {
+    return {
+      verdict: "duplicated",
+      detail: `${carrierCount} carriers across ${distinct} distinct obligation${distinct === 1 ? "" : "s"}`,
+    };
+  }
+  return {
+    verdict: "ok",
+    detail: `${carrierCount} carriers across ${distinct} distinct obligations (recycled row)`,
+  };
+}
+
+/**
  * The one reading that falsifies the design, named by its author: a row stamped
  * `recoveryEmittedAt` with no recovery row carrying that `originId`. That is the
  * emit-then-stamp ordering having failed, and it is the only way the pass loses
  * an obligation rather than merely duplicating one.
  *
- * The DUAL failure — two carriers for one obligation — is a separate reading and
+ * The DUAL failure — two carriers for ONE obligation — is a separate reading and
  * is NOT a falsification of the handoff: a duplicate carrier still carries the
  * obligation. It is reported, not thrown, because the wake idempotency key means
  * only one of the two ever gets woken, so the second is a silent `todo`.
+ *
+ * PEN-5838: "one obligation" is the load-bearing word there, and `originId`
+ * cannot establish it — see {@link classifyMultiCarrier}. A multi-carrier row is
+ * now split three ways: `duplicated` when the feed establishes fewer obligations
+ * than carriers, `unresolved` when it cannot establish the count at all, and
+ * silence when each carrier discharges its own clear (a recycled row, which on
+ * the alert corpus is the common case). `lost` is unaffected: "stamped with no
+ * carrier at all" is well defined under an `originId` key, and it stays the
+ * decisive reading and the only one that exits non-zero.
+ *
+ * @param recoveryEventsBySourceId Map of source issue id → that row's activity
+ *   feed. Only multi-carrier rows need an entry; everything else is decided
+ *   without a feed, and a missing entry is reported as unestablished rather than
+ *   assumed either way.
  */
-export function findHandoffFailures(issues, recoveryRows) {
-  const byOrigin = new Map();
-  for (const row of recoveryRows ?? []) {
-    const list = byOrigin.get(row.originId) ?? [];
-    list.push(row);
-    byOrigin.set(row.originId, list);
-  }
+export function findHandoffFailures(issues, recoveryRows, recoveryEventsBySourceId) {
+  const bySource = carriersBySource(recoveryRows);
+  const feeds = recoveryEventsBySourceId ?? new Map();
 
   const lost = [];
   const duplicated = [];
+  const unresolved = [];
   for (const issue of issues ?? []) {
     if (!hasRecoveryEmitted(issue)) continue;
-    const carriers = byOrigin.get(issue.id) ?? [];
+    const carriers = bySource.get(issue.id) ?? [];
     if (carriers.length === 0) {
       lost.push({
         id: issue.id,
@@ -169,14 +305,13 @@ export function findHandoffFailures(issues, recoveryRows) {
         detail: "stamped recoveryEmittedAt, no carrier",
       });
     } else if (carriers.length > 1) {
-      duplicated.push({
-        id: issue.id,
-        identifier: issue.identifier,
-        detail: `${carriers.length} carriers for one obligation`,
-      });
+      const { verdict, detail } = classifyMultiCarrier(carriers.length, feeds.get(issue.id));
+      const finding = { id: issue.id, identifier: issue.identifier, detail };
+      if (verdict === "duplicated") duplicated.push(finding);
+      else if (verdict === "unresolved") unresolved.push(finding);
     }
   }
-  return { lost, duplicated };
+  return { lost, duplicated, unresolved };
 }
 
 /**
@@ -370,7 +505,32 @@ async function main() {
   // from the stamp alone, i.e. it trusts the very stamp whose correctness is the
   // thing under test, and a stamp-without-carrier reads as a clean pass.
   const carriers = await walkList(companyId, `&originKind=${CARRIER_ORIGIN_KIND}`);
-  const { lost, duplicated } = findHandoffFailures(issues, carriers);
+
+  // PEN-5838: the multi-carrier reading needs a per-OBLIGATION key, and that key
+  // lives in the source row's own activity feed. Read a feed only for rows that
+  // actually have more than one carrier -- on the alert corpus that is a handful,
+  // and reading every stamped row's feed would cost one GET per row across the
+  // whole scan to answer a question all but a few of them cannot even raise.
+  const bySource = carriersBySource(carriers);
+  const contested = issues.filter(
+    (issue) => hasRecoveryEmitted(issue) && (bySource.get(issue.id) ?? []).length > 1,
+  );
+  const contestedFeeds = await mapSettled(contested, concurrency, async (issue) => ({
+    id: issue.id,
+    events: await api(`/api/issues/${issue.id}/activity`),
+  }));
+  // A feed we could not read is simply absent from this map, which
+  // `classifyMultiCarrier` reports as unestablished rather than as either verdict
+  // -- the same honesty the scan already applies to an unreadable row.
+  const recoveryEventsBySourceId = new Map(
+    contestedFeeds.filter((row) => row.ok).map((row) => [row.value.id, row.value.events]),
+  );
+  const contestedFeedFailures = contestedFeeds.filter((row) => !row.ok);
+  const { lost, duplicated, unresolved } = findHandoffFailures(
+    issues,
+    carriers,
+    recoveryEventsBySourceId,
+  );
 
   // `lost` is the decisive reading, so it is re-checked against a targeted query
   // before it is allowed to exit non-zero. A walk artifact must not be reportable
@@ -395,6 +555,7 @@ async function main() {
 
   for (const row of confirmedLost) console.error(`LOST: ${row.identifier} ${row.detail}`);
   for (const row of duplicated) console.error(`DUPLICATED: ${row.identifier} ${row.detail}`);
+  for (const row of unresolved) console.error(`UNRESOLVED: ${row.identifier} ${row.detail}`);
 
   console.log(
     `\ncompany=${companyId} walked=${ids.length} read=${issues.length} ` +
@@ -403,17 +564,19 @@ async function main() {
   );
   console.log(
     `carriers=${carriers.length} lost=${confirmedLost.length} duplicated=${duplicated.length} ` +
+      `unresolved-multi-carrier=${unresolved.length} ` +
       `cancelled-clear-events-on-owed=${clears} carrying-due-time=${withDueTime} ` +
       `unreadable-feeds=${feedFailures.length}`,
   );
 
-  if (failures.length > 0 || feedFailures.length > 0) {
+  if (failures.length > 0 || feedFailures.length > 0 || contestedFeedFailures.length > 0) {
     console.error(
-      `\nINCOMPLETE: ${failures.length} of ${ids.length} rows and ` +
-        `${feedFailures.length} of ${owedIssues.length} activity feeds could not be read.`,
+      `\nINCOMPLETE: ${failures.length} of ${ids.length} rows, ` +
+        `${feedFailures.length} of ${owedIssues.length} owed-row activity feeds and ` +
+        `${contestedFeedFailures.length} of ${contested.length} multi-carrier feeds could not be read.`,
     );
     console.error(
-      [...failures, ...feedFailures]
+      [...failures, ...feedFailures, ...contestedFeedFailures]
         .slice(0, 5)
         .map((row) => `  ${row.item?.identifier ?? row.item}: ${row.error}`)
         .join("\n"),
