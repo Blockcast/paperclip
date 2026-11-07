@@ -998,7 +998,7 @@ auth_check_container_start() {
 # than theoretical. startGitHubMcpTokenProxy() runs once per
 # `github-mcp-server` spawn (github-mcp-egress-runtime.ts); on a pod running
 # more than one, the first binds the port and every later one takes a null
-# handle, is spawned with no GITHUB_HOST, and stays pinned to its boot
+# handle, is not pointed at the proxy, and stays pinned to its boot
 # generation. The probe sees the winner's listener and cannot tell the losers
 # apart from it -- no loopback question distinguishes them, because what
 # differs is the callers, not the listener. So the `covered` text reports the
@@ -1181,7 +1181,7 @@ paperclip_auth_check() {
 
   mcp_channel_state="$(auth_check_mcp_channel)"
   if [ "${mcp_channel_state}" = covered ]; then
-    mcp_channel="covered — a loopback token proxy is listening and re-reads this same mount on every request, so the verdict below governs any \`mcp__github__*\` server behind it (PEN-5641). SCOPE: this probe establishes that A proxy is listening on this pod, not that YOUR server is behind it (PEN-5702). The port is bound once per pod, so if this pod started a second \`github-mcp-server\` it logged \`already bound\` on stderr, got no \`GITHUB_HOST\`, and is still pinned to its boot generation exactly as it would be with no proxy at all"
+    mcp_channel="covered — a loopback token proxy is listening and re-reads this same mount on every request, so the verdict below governs any \`mcp__github__*\` server behind it (PEN-5641). SCOPE: this probe establishes that A proxy is listening on this pod, not that YOUR server is behind it (PEN-5702). The port is bound once per pod, so if this pod started a second \`github-mcp-server\` it logged \`already bound\` on stderr, was not pointed at the proxy, and is still pinned to its boot generation exactly as it would be with no proxy at all"
   else
     mcp_channel="NOT COVERED — no token proxy is listening, so \`github-mcp-server\` is pinned to whichever generation it started with. The verdict below is measured on the file-reading path ONLY. After a rotation, \`mcp__github__*\` returns \`401 Bad credentials\` while gh/curl/git stay green: that is EXPECTED and is NOT a credential fault. Use gh/curl/git; the MCP GitHub tools recover only when their server restarts (PEN-5641)"
   fi
