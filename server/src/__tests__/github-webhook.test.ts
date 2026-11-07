@@ -9146,11 +9146,19 @@ describeEmbeddedPostgres("github-webhook route", () => {
 
   // PEN-5834: `check_run`, `check_suite` and `workflow_run` carry no PR title
   // or body, so the branch ref is their only identifier source. They bound it
-  // with the UPPERCASE-only `extractPaperclipIdentifiers`, while every branch
-  // branchTemplate emits is lowercase -- so all three resolved to zero
+  // with the UPPERCASE-only `extractPaperclipIdentifiers`, while the branches
+  // this repo actually carries are lowercase -- so all three resolved to zero
   // identifiers on every real PR and the red-CI author wake (BLO-46732) was
   // dark fleet-wide. The whole existing suite above missed it because its
   // fixtures use `fix/BLO-3182-webflow`, an uppercase ref no real branch has.
+  //
+  // On "lowercase", measured rather than assumed, and NOT attributable to
+  // branchTemplate: `applyIssueIdentifierToBranchName` prepends the uppercase
+  // ref when the rendered name lacks it, so the programmatic path preserves an
+  // extractor-matchable form. The lowercase refs are the hand-created ones,
+  // which are the fleet norm. `paperclip-identifiers.ts` records the resulting
+  // measurement on the very tier this fix reuses: "across 175 PRs active in
+  // the trailing 7 days it fired for 1".
   describe("PEN-5834: CI-completion wakes bind lowercase branch refs", () => {
     const ciDelivery = (event: string, branch: string, headSha: string, conclusion: string) => {
       const obj = {
@@ -9166,7 +9174,7 @@ describeEmbeddedPostgres("github-webhook route", () => {
         payload: { action: "completed", [key]: obj, repository: { full_name: "Blockcast/paperclip" } },
       };
     };
-    const send = async (app: express.Express, d: ReturnType<typeof ciDelivery>) => {
+    const post = async (app: express.Express, d: ReturnType<typeof ciDelivery>) => {
       const { body, signature } = signedRequest(d.payload);
       const res = await request(app)
         .post("/api/webhooks/github")
@@ -9176,8 +9184,16 @@ describeEmbeddedPostgres("github-webhook route", () => {
         .set("content-type", "application/json")
         .send(body);
       expect(res.status).toBe(200);
-      return (res.body.wakes as unknown[]).length;
+      return res;
     };
+    // A delivery that matches no issue exits at `no_matching_issue`, and that
+    // response carries NO `wakes` key at all -- so read it as "nobody was
+    // woken" rather than dereferencing it. Asserting `.length` on the absent
+    // key throws a TypeError, which reads as a broken fix rather than as the
+    // passing assertion it actually is.
+    const wakeCount = (res: { body: { wakes?: unknown[] } }) => (res.body.wakes ?? []).length;
+    const send = async (app: express.Express, d: ReturnType<typeof ciDelivery>) =>
+      wakeCount(await post(app, d));
 
     // The four branches measured red on `review` 2026-11-06, verbatim. Each is
     // the real ref of the PR named beside it.
@@ -9211,9 +9227,15 @@ describeEmbeddedPostgres("github-webhook route", () => {
       // branches precisely so `undici-7.29.0` cannot resolve to `UNDICI-7`.
       await seedIssueWithIdentifier("UNDICI-7");
       const app = buildApp({ resolveCiHeadSettlement: async () => "settled" });
-      expect(
-        await send(app, ciDelivery("workflow_run", "blo-21612-undici-7.29.0", "head-dep", "failure")),
-      ).toBe(0);
+      const res = await post(app, ciDelivery("workflow_run", "blo-21612-undici-7.29.0", "head-dep", "failure"));
+      // Assert on what was EXTRACTED, because that is the claim. A bare wake
+      // count of 0 also passes when the branch tier binds NOTHING, so it
+      // cannot tell "did not manufacture UNDICI-7" apart from "this fix is
+      // inert" -- the real ref must still bind for the test to mean anything.
+      expect(res.body.identifiers).toContain("BLO-21612");
+      expect(res.body.identifiers).not.toContain("UNDICI-7");
+      // No BLO-21612 issue is seeded, so nobody is woken either way.
+      expect(wakeCount(res)).toBe(0);
     });
   });
 
