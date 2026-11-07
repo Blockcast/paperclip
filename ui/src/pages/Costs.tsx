@@ -237,15 +237,33 @@ export function Costs() {
   const { data: spendData, isLoading: spendLoading, error: spendError } = useQuery({
     queryKey: queryKeys.costs(companyId, from || undefined, to || undefined),
     queryFn: async () => {
-      const [summary, byAgent, byProject, byAgentModel] = await Promise.all([
+      const [summary, byAgent, byAgentModel] = await Promise.all([
         costsApi.summary(companyId, from || undefined, to || undefined),
         costsApi.byAgent(companyId, from || undefined, to || undefined),
-        costsApi.byProject(companyId, from || undefined, to || undefined),
         costsApi.byAgentModel(companyId, from || undefined, to || undefined),
       ]);
-      return { summary, byAgent, byProject, byAgentModel };
+      return { summary, byAgent, byAgentModel };
     },
     enabled: !!selectedCompanyId && customReady,
+  });
+
+  // PEN-5591: `by-project` is the one aggregate that can refuse a window --
+  // it joins run-to-project attribution, which cannot be answered for a wide
+  // window inside the database statement timeout, so the server caps it and
+  // returns `400`. It used to sit in the `Promise.all` above, which meant that
+  // refusal rejected the whole bundle and `overviewError` replaced the ENTIRE
+  // overview -- summary, by-agent and by-model included, none of which are
+  // affected and all of which are cheap. It is fetched separately so a refused
+  // window degrades only the "By project" card.
+  const {
+    data: byProjectData,
+    isLoading: byProjectLoading,
+    error: byProjectError,
+  } = useQuery({
+    queryKey: queryKeys.costsByProject(companyId, from || undefined, to || undefined),
+    queryFn: () => costsApi.byProject(companyId, from || undefined, to || undefined),
+    enabled: !!selectedCompanyId && customReady,
+    retry: false,
   });
 
   const { data: financeData, isLoading: financeLoading, error: financeError } = useQuery({
@@ -816,10 +834,14 @@ export function Costs() {
                       <CardDescription>Run costs attributed through project-linked tasks.</CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-2 px-5 pb-5 pt-2">
-                      {(spendData?.byProject.length ?? 0) === 0 ? (
+                      {byProjectError ? (
+                        <p className="text-sm text-destructive">{(byProjectError as Error).message}</p>
+                      ) : byProjectLoading ? (
+                        <p className="text-sm text-muted-foreground">Loading project costs...</p>
+                      ) : (byProjectData?.length ?? 0) === 0 ? (
                         <p className="text-sm text-muted-foreground">No project-attributed run costs yet.</p>
                       ) : (
-                        spendData?.byProject.map((row, index) => (
+                        byProjectData?.map((row, index) => (
                           <div
                             key={row.projectId ?? `unattributed-${index}`}
                             className="flex items-center justify-between gap-3 border border-border px-3 py-2 text-sm"

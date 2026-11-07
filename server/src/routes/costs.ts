@@ -94,6 +94,16 @@ export function assertByProjectWindowWithinCap(
   }
   const to = range?.to ?? now;
   const spanDays = (to.getTime() - from.getTime()) / MS_PER_DAY;
+  // An inverted range yields a NEGATIVE span, which would slip under the cap
+  // below and reach the database. It is harmless today -- the window is bounded
+  // and the result empty -- but it passes the guard for the wrong reason, and
+  // the generic date parser does not reject it either.
+  if (spanDays < 0) {
+    throw badRequest(
+      `costs/by-project 'to' precedes 'from'.`,
+      { code: "window_inverted", issue: "PEN-5591" },
+    );
+  }
   if (spanDays > BY_PROJECT_MAX_WINDOW_DAYS) {
     throw badRequest(
       `costs/by-project window is ${spanDays.toFixed(1)} days; the maximum is `
