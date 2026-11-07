@@ -586,7 +586,9 @@ places and only the first is ever reported back to the author. A well-formed
   predicate rather than trusting a line number:
   `grep -n commentAuthorCanGrantIssueMention server/src/routes/issues.ts` returns the
   import plus exactly those three call sites. Each has a positive control in
-  `server/src/__tests__/issue-update-comment-wakeup-routes.test.ts`;
+  `server/src/__tests__/issue-update-comment-wakeup-routes.test.ts`. Entitlement is
+  **not the only gate on the wake** — see "The wake carries a closed-status term,
+  the grant does not" below, and do not read this bullet as the complete rule;
 - confers **no** grant.
 
 So such a mention **is wholly inert**: a 201, no wake, no grant. Until `PEN-5812` it
@@ -704,6 +706,51 @@ rule legible rather than widen it. `PEN-5334` was filed from a live instance on
 amplified by the CEO without anyone stating that **only the assignee can discharge
 it** — leaving two other principals positioned to "help" with a mention that cannot
 work and reports nothing when it does not.
+
+### The wake carries a closed-status term, the grant does not
+
+Two gates sit on an `issue_comment_mentioned` wake, and only the first is the
+entitlement predicate this section is otherwise about:
+
+1. `commentAuthorCanGrantIssueMention` — may this author grant?
+2. `isClosedIssueStatus(<the post-mutation issue status>)` — is this row finished?
+
+**A mention on a `done` or `cancelled` row raises no wake, however entitled its
+author is.** The two inline sites spell the second term
+`isClosedIssueStatus(...) && !reopened`; `buildKeyedCommentEffectIntents` spells it
+without the `!reopened` because a keyed comment cannot reopen (`POST
+/issues/:id/comments` refuses `idempotencyKey` together with any move-to-todo), so
+there the status is already `todo` or the request was already refused.
+
+**The grant has no status term, and is not missing one.**
+`agentHasMentionGrantOnIssue` (`server/src/services/authorization.ts`) filters on
+`companyId`, `issueId`, `deletedAt` and the `agent://` `LIKE`, then re-runs the
+author predicate per matching row. It never reads the issues table, so there is no
+status to suppress on and adding one would mean adding a join that does not exist
+today.
+
+⚠️ **The asymmetry is deliberate.** On a closed row an entitled author's mention
+**grants `issue:comment` and wakes nobody**: a closing "this is done, over to you"
+should hand over access without dispatching a run onto work that is finished. Do
+not remove the status term from the wake, and do not add one to the grant.
+
+**One consequence to carry, because nothing reports it.** The 403 body built by
+`issueCommentGrantRemediation` tells a blocked agent to ask the assignee to post a
+mention link. On a closed row the assignee doing exactly that succeeds — the grant
+attaches — and the blocked agent is never woken to use it. The author sees a 201,
+an empty `unboundMentions`, and the mentioned name in `boundMentions`. That is the
+mirror image of the inert mention described above: there the mention bound and
+granted nothing; here it binds and grants, and nothing is dispatched. Both read
+identically to their author.
+
+The three wake sites disagreed on term 2 until `PEN-5846`: the two inline paths
+suppressed and the `idempotencyKey` path did not, so passing a **dedupe** key was
+what decided whether a mention on a closed row reached anyone. The ruling
+(`PEN-5846`, 2026-11-07) was *suppress at all three*, on the statement of intent
+already in the code above `skipAssigneeCommentWake` in the
+`router.patch("/issues/:id", ...)` handler: *"Terminal issues are closed work for
+every agent, including explicitly mentioned peers. Only an explicit reopen makes
+the thread actionable again."*
 
 ### Why the rule stays narrow
 
@@ -992,6 +1039,14 @@ The wake half is pinned in
 mentioned agent when an agent comment cannot grant reply access"** and **"does not
 enqueue a keyed mention wake when an agent cannot grant reply access"**, each paired
 with a positive control that asserts the entitled author *does* wake it.
+
+Those two are a per-path pair on the **entitlement** axis, and a per-path pair cannot
+see a divergence *between* paths on the **status** axis — which is how `PEN-5846`
+survived both of them. The status term is pinned separately, in the same file, by
+**"closed-row mention wakes do not depend on `idempotencyKey` (PEN-5846)"**: it posts
+the same body to the same closed row with and without a key and compares the two wake
+sets **to each other**, with an open-row positive control proving the comparison can
+see a wake at all. Add status cases there rather than as a third per-path pair.
 
 The human-held control is pinned in two places on purpose, because a predicate and
 the route that feeds it fail independently and a single test cannot tell them apart:

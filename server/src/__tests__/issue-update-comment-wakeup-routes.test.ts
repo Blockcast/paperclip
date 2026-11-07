@@ -1231,6 +1231,174 @@ describe("issue update comment wakeups", () => {
     ));
   });
 
+  // PEN-5846. Three sites in `routes/issues.ts` raise an
+  // `issue_comment_mentioned` wake. Two suppressed on closed status and the
+  // `idempotencyKey` path did not, so passing a DEDUPE key was what decided
+  // whether a mention on a `done` row reached anybody — same row, same body,
+  // same author, same mentioned agent, opposite outcomes, and a create response
+  // that looked identical either way.
+  //
+  // These cases are DIFFERENTIAL on purpose, and that is the whole reason they
+  // exist. The entitlement cases above are a careful per-path pair, one for the
+  // inline path and one for the keyed path, each asserting against a constant.
+  // A per-path pair is structurally blind to a divergence BETWEEN the paths:
+  // both passed throughout, on every day this defect was live. So the assertion
+  // below is that the two wake sets equal EACH OTHER. Adding a third per-path
+  // pair here would reproduce the blind spot rather than close it.
+  describe("closed-row mention wakes do not depend on `idempotencyKey` (PEN-5846)", () => {
+    const MENTION_BODY = `[@QA](agent://${MENTIONED_AGENT_ID}) over to you`;
+
+    // Every agent this request would wake with `issue_comment_mentioned`,
+    // whichever transport the path chose: the inline paths dispatch straight
+    // through `heartbeatService.wakeup`, the keyed path enqueues `wake` effect
+    // intents for the outbox to drain. Unioning the two is what makes the
+    // comparison cross-path — read off one transport only and the keyed path is
+    // invisible, which is the shape of the original miss.
+    function wokenMentionTargets(): string[] {
+      const dispatched = mockHeartbeatService.wakeup.mock.calls
+        .filter(([, wakeup]: any[]) => wakeup?.reason === "issue_comment_mentioned")
+        .map(([agentId]: any[]) => String(agentId));
+      const enqueued = mockCommentEffects.enqueueCommentEffects.mock.calls
+        .flatMap(([, args]: any[]) => (args?.effects ?? []) as any[])
+        .filter((effect: any) =>
+          effect?.effectKind === "wake" &&
+          effect?.payload?.wakeup?.reason === "issue_comment_mentioned")
+        .map((effect: any) => String(effect.payload.agentId));
+      return [...new Set([...dispatched, ...enqueued])].sort();
+    }
+
+    // The author is a board user with an active membership and the row has no
+    // agent assignee, so `commentAuthorCanGrantIssueMention` passes on both
+    // paths. The status term is then the only thing left that can differ, which
+    // is what isolates the axis under test from the entitlement axis.
+    async function postMention(status: string, idempotencyKey?: string) {
+      const existing = makeIssue({
+        status,
+        assigneeAgentId: null,
+        assigneeUserId: "active-user",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      // Returned, not left undefined, so an unexpected implicit move-to-todo
+      // shows up as the explicit `update` assertion below failing rather than as
+      // a 404 nobody reads back to this cause.
+      mockIssueService.update.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: `comment-${status}-${idempotencyKey ? "keyed" : "unkeyed"}`,
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: MENTION_BODY,
+        ...(idempotencyKey ? { idempotencyKey, idempotencyProcessedAt: null } : {}),
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp({
+        type: "board",
+        userId: "active-user",
+        companyIds: [existing.companyId],
+        source: "session",
+        isInstanceAdmin: false,
+      }))
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: MENTION_BODY, ...(idempotencyKey ? { idempotencyKey } : {}) });
+
+      expect(res.status).toBe(201);
+      // Precondition, not decoration: "suppressed on a closed row" says nothing
+      // if the request quietly reopened the row first.
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+      // The inline wake block is a detached async IIFE, so the response resolves
+      // before it runs. `findMentionedAgents` is awaited inside it, after the
+      // assignee-wake decision — without this anchor a negative assertion can
+      // pass by racing ahead of the code it is guarding.
+      await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+      return wokenMentionTargets();
+    }
+
+    function clearWakeObservations() {
+      mockHeartbeatService.wakeup.mockClear();
+      mockCommentEffects.enqueueCommentEffects.mockClear();
+      mockIssueService.update.mockClear();
+      mockIssueService.findMentionedAgents.mockClear();
+    }
+
+    it.each(["done", "cancelled"] as const)(
+      "suppresses the mention wake on a terminal %s row on both paths",
+      async (status) => {
+        const unkeyed = await postMention(status);
+        clearWakeObservations();
+        const keyed = await postMention(status, `pen-5846:${status}`);
+
+        expect(keyed).toEqual(unkeyed);
+        expect(unkeyed).toEqual([]);
+      },
+    );
+
+    // POSITIVE CONTROL, and it is load-bearing twice over. Without it, two paths
+    // that both stopped waking anyone would satisfy the equality above: the
+    // instrument has to be shown capable of reporting a wake before its silence
+    // means anything. It also pins that the suppression is the STATUS term and
+    // not the author predicate, since only `status` differs from the cases above.
+    it("POSITIVE CONTROL: wakes the mentioned agent on an open row on both paths", async () => {
+      const unkeyed = await postMention("in_progress");
+      clearWakeObservations();
+      const keyed = await postMention("in_progress", "pen-5846:open");
+
+      expect(keyed).toEqual(unkeyed);
+      expect(unkeyed).toEqual([MENTIONED_AGENT_ID]);
+    });
+  });
+
+  // PEN-5846: the third site. The two POST paths are covered by the differential
+  // cases above; this pins the `router.patch("/issues/:id", ...)` comment arm, in
+  // the shape that arm actually meets a closed row — one PATCH that both closes
+  // the issue and posts the closing mention, so the guard has to read the
+  // POST-update status (BLO-29821) to see it. Its positive control is "applies
+  // mention grant wake eligibility to PATCH comments" above, which is the same
+  // request on an open row.
+  it.each(["done", "cancelled"] as const)(
+    "does not wake a mentioned agent when one PATCH both %s the issue and posts the mention",
+    async (status) => {
+      const existing = makeIssue({
+        assigneeAgentId: null,
+        assigneeUserId: "active-user",
+        status: "in_progress",
+      });
+      const updated = makeIssue({
+        assigneeAgentId: null,
+        assigneeUserId: "active-user",
+        status,
+      });
+      const body = `[@QA](agent://${MENTIONED_AGENT_ID}) over to you`;
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.update.mockResolvedValue(updated);
+      mockIssueService.addComment.mockResolvedValue({
+        id: `comment-patch-close-mention-${status}`,
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp({
+        type: "board",
+        userId: "active-user",
+        companyIds: [existing.companyId],
+        source: "session",
+        isInstanceAdmin: false,
+      }))
+        .patch(`/api/issues/${existing.id}`)
+        .send({ status, comment: body });
+
+      expect(res.status).toBe(200);
+      // See the note on the agent-closer case above: the negative assertion is
+      // only meaningful once the detached wakeup IIFE has reached the mention loop.
+      await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+        MENTIONED_AGENT_ID,
+        expect.objectContaining({ reason: "issue_comment_mentioned" }),
+      );
+    },
+  );
+
   // PEN-5180. The defect of record: a body containing a plain `@Ceo` matches no
   // mention extractor, binds to nobody and raises no wake, yet the write
   // returned a bare 200 with nothing the author could read saying so. The

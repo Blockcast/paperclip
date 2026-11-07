@@ -4720,6 +4720,47 @@ export function issueRoutes(
       input.mentions ??
       (await resolveCommentMentionContext({ issue: input.issue, body: input.comment.body, actor }));
     for (const mentionedId of mentionedIds) {
+      // PEN-5846: suppress a mention wake onto a closed row, exactly as the
+      // assignee arm above already does and as the two inline paths
+      // (`router.patch("/issues/:id", ...)` and
+      // `router.post("/issues/:id/comments", ...)`) already did. Until this
+      // guard, `idempotencyKey` — a DEDUPE mechanism — was what decided whether
+      // a mention on a `done` row reached anybody: same row, same body, same
+      // author, same mentioned agent, wake raised with the key and no wake
+      // without it. Nothing on the create response distinguished the two.
+      //
+      // The decision is "suppress at all three sites" (PEN-5846, 2026-11-07),
+      // and it rests on a statement of intent that was already in this file
+      // before the divergence was found. It is the comment above
+      // `skipAssigneeCommentWake` in the `router.patch("/issues/:id", ...)`
+      // handler — NOT above that handler's mention loop, which carries a bare
+      // guard with no prose: "Terminal issues are closed work for every agent,
+      // including explicitly mentioned peers. Only an explicit reopen makes the
+      // thread actionable again." That sentence sits on the assignee arm and
+      // deliberately reaches past it to name mentioned peers, which is why it
+      // settles this arm too. It is cited rather than restated so the two
+      // cannot drift.
+      //
+      // Note what is NOT here: the inline sites spell this
+      // `isClosedIssueStatus(...) && !reopened`, and the missing `&& !reopened`
+      // is deliberate, not an omission. A keyed comment cannot reopen —
+      // `POST /issues/:id/comments` refuses `idempotencyKey` together with any
+      // move-to-todo ("Idempotent comments cannot change issue state", 400),
+      // and on the replay path `effectiveMoveToTodoRequested` is forced false by
+      // `!idempotentReplay`. So by the time this builder runs, a reopen has
+      // either already rewritten `input.issue.status` to `todo`, making the
+      // check false by itself, or been refused. `reopened` is not even in scope
+      // here. This is the same reason the assignee arm above carries the bare
+      // check.
+      //
+      // The GRANT, by contrast, carries no status term and must not acquire
+      // one: `agentHasMentionGrantOnIssue` never reads the issues table, so a
+      // mention on a closed row still authorizes the mentioned agent to reply.
+      // Wake and grant are asymmetric ON PURPOSE — a closing handoff should
+      // still hand over access without dispatching a run onto finished work.
+      // Do not "fix" the asymmetry in either direction. See
+      // docs/security/issue-authorization-model.md, "Who may grant a mention".
+      if (isClosedIssueStatus(input.issue.status)) continue;
       if (!commentAuthorCanGrantIssueMention({
         mentionedAgentId: mentionedId,
         issueAssigneeAgentId: input.issue.assigneeAgentId,
@@ -5297,6 +5338,26 @@ export function issueRoutes(
   // gate. A name in both `boundMentions` and `mentionsWithoutGrant` is the
   // inert mention, named. The gate itself is unchanged; only the silence is.
   //
+  // PEN-5846: "the SAME predicate" above is true, and it is not the whole gate.
+  // A mention wake carries TWO terms, not one — the entitlement predicate named
+  // above, and a closed-status term (`isClosedIssueStatus(...)`, spelled
+  // `&& !reopened` at the two inline sites, where a reopen is reachable). A
+  // mention on a `done` or `cancelled` row raises no wake however entitled its
+  // author is. Note the lineage before trusting the one-gate sentence: this
+  // block first said the wake path applied NO gate, PEN-5334 corrected that to
+  // one, and the truth is two — a sentence reads MORE settled for having been
+  // corrected once, so the paragraph above is left standing and qualified here
+  // rather than quietly rewritten.
+  //
+  // The closed term is on the WAKE only. The GRANT has no status term:
+  // `agentHasMentionGrantOnIssue` never reads the issues table at all, so there
+  // is nothing there to suppress and adding a status term would mean adding a
+  // join that does not exist. On a closed row an entitled author's mention
+  // therefore GRANTS `issue:comment` and WAKES NOBODY, and that asymmetry is
+  // the decision, not a leftover: a closing "this is done, over to you" should
+  // hand over access without dispatching a run onto finished work. Do not
+  // remove the status term from the wake, and do not add one to the grant.
+  //
   // PEN-5353: the three sites are cited by symbol, not by line. They are the
   // `continue`-on-failed-`commentAuthorCanGrantIssueMention` guards in
   // `buildKeyedCommentEffectIntents`, in the `router.patch("/issues/:id", ...)`
@@ -5310,7 +5371,13 @@ export function issueRoutes(
   // grant reply access" and "does not enqueue a keyed mention wake when an agent
   // cannot grant reply access" in
   // __tests__/issue-update-comment-wakeup-routes.test.ts, each with a positive
-  // control.
+  // control. Those two are a per-path pair on the ENTITLEMENT axis, and a
+  // per-path pair is structurally blind to a cross-path divergence on the
+  // STATUS axis — which is how PEN-5846 survived. The status term is pinned by
+  // the differential cases in "closed-row mention wakes do not depend on
+  // `idempotencyKey` (PEN-5846)" in the same file, which post the same body to
+  // the same closed row with and without a key and compare the two wake sets to
+  // each other rather than to a constant.
   //
   // The wake and the grant are co-extensive only AT CREATE TIME. The grant is
   // re-derived per request against the issue's CURRENT assignee (`decideBase`
