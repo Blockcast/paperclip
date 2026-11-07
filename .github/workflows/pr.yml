@@ -1799,6 +1799,20 @@ jobs:
         run: pnpm run test:residual-report
         timeout-minutes: 1
 
+      # The base-digest resolver fails image builds closed, so its failure modes
+      # are the thing to keep honest (PEN-5927).
+      - name: Test base-image digest resolver (PEN-5927)
+        if: ${{ !cancelled() }}
+        run: pnpm run test:resolve-base-digest
+        timeout-minutes: 1
+
+      # The ratchet: fails the PR that adds the next image whose base is decided
+      # by its build date rather than by the build (PEN-5927).
+      - name: Check CI-published images pin their base (PEN-5927)
+        if: ${{ !cancelled() }}
+        run: pnpm run test:image-base-pinning
+        timeout-minutes: 1
+
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}
         run: |

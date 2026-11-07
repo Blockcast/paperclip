@@ -164,6 +164,17 @@ jobs:
           driver: remote
           endpoint: ${{ steps.buildkit-endpoint.outputs.endpoint }}
 
+      # Name the base by digest instead of letting the build date decide it
+      # (PEN-5927). Fails the build when the base cannot be resolved — see
+      # scripts/resolve-base-digest.sh for why that is the cheap failure.
+      - name: Resolve base image digest
+        id: base
+        run: |
+          set -euo pipefail
+          resolved="$(scripts/resolve-base-digest.sh 'node:22-alpine')"
+          echo "image=${resolved}" >> "$GITHUB_OUTPUT"
+          echo "Base pinned to ${resolved}"
+
       - name: Docker meta
         id: meta
         uses: docker/metadata-action@v6
@@ -192,6 +203,8 @@ jobs:
           push: true
           provenance: false
           sbom: false
+          build-args: |
+            NODE_BASE=${{ steps.base.outputs.image }}
           cache-from: |
             type=registry,ref=harbor.blockcast.net/paperclip-mcp-gateway/paperclip-mcp-gateway:buildcache-v6
             type=gha,scope=paperclip-mcp-gateway
@@ -199,7 +212,9 @@ jobs:
             ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'type=registry,ref=harbor.blockcast.net/paperclip-mcp-gateway/paperclip-mcp-gateway:buildcache-v6,mode=max,image-manifest=true,oci-mediatypes=true,ignore-error=true' || '' }}
             ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'type=gha,scope=paperclip-mcp-gateway,mode=min,ignore-error=true' || '' }}
           tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.base.name=${{ steps.base.outputs.image }}
 
   # PEN-6034. A build that publishes no image must reach somebody. Issues are
   # DISABLED on this repository, so this routes through Alertmanager — the
