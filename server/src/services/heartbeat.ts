@@ -14020,6 +14020,32 @@ export function buildPaperclipTaskMarkdown(input: {
     // teach a run that a short list means no owner -- the false absence this endpoint
     // exists to remove.
     "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, with `provenance: \"webhook\"` marking the authoritative binding. `withheldForAuthorizationCount > 0` means owners exist that it did not show you -- an empty `owners` list is NOT proof the artifact is unowned.",
+    // PEN-5788: the two readings of that result which the sentence above does not
+    // close, both measured 2026-11-07 against `Blockcast/onprem-k8s`.
+    //
+    // OVER-WIDE. `owners` is not the owner set and never was. The webhook writes one
+    // work product per issue the PR REFERENCES (`github-webhook.ts` resolves
+    // `context.identifiers` -- every identifier in branch, title and body -- against a
+    // globally-unique `issues.identifier`, with no company filter), while ownership is
+    // the far narrower ranked answer from `resolveOwningPaperclipIdentifiers`. That is
+    // deliberate and documented at the producer (BLO-20886, `pull-request-work-products.ts`):
+    // the row is evidence about the PR, not a claim of ownership. So the directive's own
+    // "record it on each" is a trap when read against `owners` -- 6 bound PRs sampled
+    // returned 20 rows for 6 real owners, and all 6 were strict supersets. `owningIdentifiers`
+    // is the discriminator and it stayed correct on every spurious row, which is what
+    // makes the filter cheap to state and safe to follow.
+    //
+    // EMPTY. 59 of 107 open PRs in that repo (55%) return `owners: []` with
+    // `withheldForAuthorizationCount: 0`, and that is the TRUTH, not a binding failure:
+    // their only issue key is an external tracker's (`BLO-*`), which is not a Paperclip
+    // row here, so nothing resolves and nothing is written. Verified 13/13 against the
+    // live endpoint -- 7 PRs with no `PEN-*` reference all empty, 6 with one all bound.
+    // The gap this leaves is real even though the mechanism is correct: the rule above
+    // assumes a row-shaped home exists, and for most of this repo none does. Naming the
+    // PR as the fallback is the only thing that makes the rule total; nothing else was
+    // anybody's stated obligation.
+    "⚠ `owners` is WIDER than the owner set, and filtering it is not optional. A row means the PR NAMED that issue somewhere, not that the issue owns the PR. Every row carries `owningIdentifiers` -- the resolved true owner -- and it stays correct even on the spurious rows. Record the constraint only on rows whose own `identifier` appears in their `owningIdentifiers`. Measured 2026-11-07: 20 rows returned for 6 real owners, so 14 of 20 were mention-adjacency; writing to those delivers a false constraint to a row whose owner has no context to evaluate it. `owningIdentifiers: null` means NOT RECORDED (an agent-registered or pre-field row) and is NOT \"owns nothing\"; an empty array IS authoritative.",
+    "If `owners` is empty AND `withheldForAuthorizationCount` is 0, the artifact has no Paperclip owning row at all -- usually correct rather than broken: a PR whose only issue key belongs to an external tracker references no Paperclip row, so none is written (measured 2026-11-07: 55% of open `Blockcast/onprem-k8s` PRs). You still owe the constraint a home, so record it as a COMMENT ON THE PULL REQUEST itself -- that is the only place a run working that artifact will look. Note the count is scoped to the company you queried: it reports authorization withholding inside that company and can never reveal an owner outside it.",
   );
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,

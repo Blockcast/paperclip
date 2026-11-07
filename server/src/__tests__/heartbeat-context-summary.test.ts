@@ -3397,6 +3397,39 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("externalId=<the PR's URL>");
   });
 
+  // PEN-5788. The lookup sentence above tells a run how to enumerate owners; these two
+  // tell it how to READ what comes back, and both close a misreading that was measured
+  // rather than imagined. Pinned separately from the endpoint test because that one
+  // passes against a result the run then mishandles -- naming the route is not the same
+  // as teaching the two shapes it returns.
+  it("tells the run to filter owners on owningIdentifiers, not to write to every row", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("`owners` is WIDER than the owner set");
+    // The discriminator itself, and the test for it. A sentence that warned about
+    // over-width without naming the field leaves the run with a caution it cannot act
+    // on -- the whole value here is that the filter is mechanical.
+    expect(markdown).toContain("`owningIdentifiers`");
+    expect(markdown).toContain("own `identifier` appears in their `owningIdentifiers`");
+    // `null` and `[]` take OPPOSITE safe directions, and collapsing them is how a run
+    // talks itself into treating an agent-registered row as disclaiming ownership.
+    expect(markdown).toContain("`owningIdentifiers: null` means NOT RECORDED");
+  });
+
+  // The empty result had no documented action at all: the run was told an empty list is
+  // not proof of no owner, and then left there. That is the 55% case in the repo that
+  // motivated this, so "rare edge" is exactly backwards -- it is the common one.
+  it("names the pull request itself as the home for a constraint with no owning row", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("no Paperclip owning row at all");
+    expect(markdown).toContain("COMMENT ON THE PULL REQUEST itself");
+    // Scope, pinned because `withheldForAuthorizationCount: 0` reads as a global
+    // all-clear and is not one -- the service filters by company before the route ever
+    // computes the count, so an owner in another company is invisible AND uncounted.
+    expect(markdown).toContain("scoped to the company you queried");
+  });
+
   // Placement, asserted rather than left to reading order. The sentence is author-side
   // -- it belongs to the rule that says record a constraint on the artifact's owning
   // row, which cannot be followed without enumerating the owners. In the pre-write list
