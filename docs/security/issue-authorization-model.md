@@ -184,7 +184,7 @@ reintroduce them: the next edit to `authorization.ts` rots them again.
 | `allow_instance_admin` | A | A | A | instance-admin row, never for `cloud_tenant` |
 | `allow_company_member` | A | A | — | cloud-tenant board user — `decideBase`'s board branch, entered on `input.actor.type === "board"` and narrowed by `input.actor.source === "cloud_tenant" && input.actor.userId` — with active membership, `membershipRole !== "viewer"` |
 | `allow_self` | A | A | — | `resource.assigneeAgentId === actor` |
-| `allow_company_agent` | A | A | — | issue has no assignee, and is not a review/escalation shell |
+| `allow_company_agent` | A | A | — | `resource.assigneeAgentId` is null — **no *agent* assignee, which is not the same as "no assignee"**: a row handed to a named human via `assigneeUserId` satisfies this condition and is mutable by every agent in the company (`PEN-5900`, open decision — see "No assignee" vs "no agent assignee" below) — and is not a review/escalation shell |
 | `allow_issue_creator` | A | — | — | `resource.createdByAgentId === actor` |
 | `allow_manager_chain` | A | — | — | `isManagerOf(actor, resource.assigneeAgentId)` |
 | `allow_issue_mention_grant` | A | — | — | a live, non-deleted `agent://<actor>` **markdown-link** mention whose **comment author** is the issue's own assignee agent, or a user with an active company membership. No other author grants anything — not the manager, not the creator, not the CEO, not the mentioned agent itself (`commentAuthorCanGrantIssueMention`). See "Who may grant a mention" below |
@@ -282,6 +282,60 @@ Terminal denials:
   are relationship-gated, not grant-gated, and mapping them would make every agent
   holding `tasks:assign` — which is nearly all of them, unscoped — a writer on every
   issue in the company.
+
+## "No assignee" vs "no agent assignee"
+
+`allow_company_agent` is the only row of the grid whose condition used to be stated
+more narrowly than the code implements, and the gap is load-bearing: **an issue
+assigned to a named human is, to `decideBase`, an unassigned issue.**
+
+The claim branch tests `assigneeAgentId` and nothing else:
+
+```js
+if (!resource?.assigneeAgentId) {            // NOT assigneeUserId
+  // ... suppressed only for the two origin kinds below ...
+  return allow({ reason: "allow_company_agent",
+                 explanation: "Allowed because the issue has no agent assignee." });
+}
+```
+
+The suppression it consults, `recoveryOrReviewIssueBlocksUnassignedAgentClaim`, keys
+on `AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS` — two origin kinds. One of them,
+`productivityReviewEscalation`, is denied with this stated rationale:
+
+> created with `assigneeAgentId: null` and `assigneeUserId` set
+> (productivity-review.ts), i.e. addressed to a human on purpose. An agent claiming
+> it answers the question that was asked of the user.
+
+That rationale names **human-addressing** — a property of `assigneeUserId`. The
+predicate implements **provenance** — a property of `originKind`. Where the two
+correlate the guard holds; where they do not, the same already-articulated hazard
+is unguarded. Measured 2026-11-07 against the company's dominant human assignee:
+56 open human-assigned rows, 15 `critical`, of which **53 carry `originKind:
+"manual"`** and so fall outside the allowlist. The class is dominated by human
+decision gates — confirmation gates, credential-holder decisions, founder reviews —
+and a gate any agent may set to `done` is not a gate.
+
+**Consequences for readers of this file:**
+
+- The explanation string `"the issue has no agent assignee"` is accurate. The
+  relation label `unassigned_issue` and the former grid wording "issue has no
+  assignee" are not, and those are what readers carry. Three seats reached three
+  different and mutually inconsistent models from them inside 24 hours
+  (`PEN-5900`): that human-assigned rows are writable by nobody, that they are
+  correctly protected, and that they have no assignee at all.
+- Clearing an agent assignee in favour of a human **widens** write access, from
+  "the assignee alone" to "every agent in the company". It does not narrow it.
+  See escape hatch 2, which recommends that move and now says so.
+
+⚠️ **Open decision (`PEN-5900`).** Whether this behaviour is correct is undecided
+and is the CTO's call; the options on the table are to withhold `issue:mutate`
+(not `issue:comment`) when `assigneeUserId` is set, to extend the suppression to
+the hazard it already names, or to accept the behaviour explicitly. This section
+is **descriptive of what ships**, consistent with the status note at the top of
+this file, and is not a ratification of it. The `human_assigned` row of the matrix
+regression test pins the same fact in code; whichever option lands, both change
+together.
 
 ## Who may grant a mention
 
@@ -565,6 +619,13 @@ In order of cost. All three are supported today; none requires a code change.
    an active non-`viewer` membership, holds `issue:mutate`
    (`allow_company_member`). Setting `assigneeUserId` hands the row to that
    person's queue; a board session can edit the description directly.
+   ⚠️ **This widens agent write access to the row; it does not restrict it.**
+   `assigneeUserId` is not read by the agent claim branch, so clearing the agent
+   assignee in favour of a human moves the row from "only the assignee may
+   mutate" to `allow_company_agent` — **every agent in the company may rewrite
+   and close it**. Use this hatch to put a criterion in front of a human, never
+   as a way to protect a row from agents; for that, keep an agent assignee. See
+   `"No assignee" vs "no agent assignee"` above and `PEN-5900`.
 3. **Attach the criterion as a dependency.** Blocker edges *are* reachable by a
    manager holding `tasks:assign` (`issue:coordination_metadata`), so the criterion
    can be filed as its own issue and attached with `blockedByIssueIds`. It is the
@@ -625,7 +686,8 @@ without re-deciding the model itself:
 `server/src/__tests__/authorization-service.test.ts`, describe block
 **"issue authorization matrix (BLO-30034)"**. It is table-driven over
 (principal relation × action): one relation per row of the principal × field grid —
-the five board principals included, and the parent-or-sibling row split into two —
+the five board principals included, the parent-or-sibling row split into two, and
+`allow_company_agent` split into `unassigned` and `human_assigned` (`PEN-5900`) —
 asserting every action verdict in the allow-path table, including the denials. The
 four historical incidents are rows in that table rather than separate cases, which
 is the specific thing that was missing when each of them shipped.
