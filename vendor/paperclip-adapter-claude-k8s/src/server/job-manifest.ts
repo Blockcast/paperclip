@@ -2185,7 +2185,8 @@ export const ENV_NAME_CLASSIFICATION: readonly EnvNameClassification[] = [
   {
     name: "AGENT_HOME",
     classification: "SAFE_LITERAL",
-    reason: "Filesystem path to the agent's home directory on the mounted PVC.",
+    reason:
+      "Filesystem path to the agent's home directory. When the agent's instructions bundle sits on the data mount this is its `agentBundleRoot` — the per-seat dir on the mounted `paperclip-data` PVC, the same path the writable instructions mount is derived from; otherwise the server-provided workspace agent home. A path either way, never a credential. (The unqualified \"on the mounted PVC\" this reason used to claim was false for the second case — see the AGENT_HOME resolution in buildEnvVars, PEN-2585.)",
   },
 
   // --- SAFE_LITERAL: runtime services -----------------------------------
@@ -2683,7 +2684,82 @@ function buildEnvVars(
   setIfPresent("PAPERCLIP_WORKSPACE_REPO_REF", workspaceContext.repoRef);
   setIfPresent("PAPERCLIP_WORKSPACE_BRANCH", workspaceContext.branchName);
   setIfPresent("PAPERCLIP_WORKSPACE_WORKTREE_PATH", workspaceContext.worktreePath);
-  setIfPresent("AGENT_HOME", workspaceContext.agentHome);
+  // PEN-2585: AGENT_HOME must name a path the POD mounts, not one the SERVER made.
+  //
+  // `workspaceContext.agentHome` is `resolveDefaultAgentWorkspaceDir(agent.id)` =
+  // `<instanceRoot>/workspaces/<agentId>`, and the server `mkdir -p`s it on ITS own
+  // `/paperclip` mount just before handing it over (services/heartbeat.ts, the
+  // `buildPaperclipWorkspaceContext({ agentHome })` call site). The pod mounts no such
+  // path: `instances/default` arrives as the 16 MiB `instance-overlay` emptyDir with
+  // `data/` and `skills/` bound over it and NOTHING bound at `workspaces/`. So the
+  // variable is exported, points at an identically-spelled directory on a volume this
+  // pod does not have, and every `$AGENT_HOME/...` read is ENOENT.
+  //
+  // This is PEN-4932 invariant 9 — the one `isWorkspaceLessFallbackWorkspaceDir`
+  // already describes for the workspace cwd ("the server realizes every execution
+  // workspace onto its OWN /paperclip mount ... the pod's identically-spelled path
+  // resolves to nothing") — reached through a second variable that nothing guards.
+  //
+  // Measured 2026-11-07 on the live Cto pod (claude_k8s, external bundle):
+  //   the exported agent-home path -> <instanceRoot>/workspaces/<agentId> -> ENOENT
+  //   ls /paperclip/instances/default                                     -> data  skills
+  // and 4 of 4 `$AGENT_HOME`-relative paths in the `para-memory-files` skill — which
+  // is MANDATED via `desiredSkills` for at least one seat — resolve to nothing.
+  //
+  // THE FIX IS A JOIN, NOT A VALUE. The old bug was an env var with no relation to
+  // any mount. So resolve AGENT_HOME through `agentBundleRoot` — the SAME helper
+  // `resolveScopedWritableMounts` derives the writable instructions mount from, fed
+  // the SAME input (`config.instructionsFilePath`, which that resolver receives as
+  // `agentInstructionsFilePath`). Not a second spelling of the path: the file already
+  // states that discipline fifty lines below `agentBundleRoot`, for the read-only
+  // withdrawal — "two derivations of this path could disagree, and the permissive
+  // direction of that disagreement is the rw mount this exists to withdraw." The
+  // permissive direction here is an AGENT_HOME naming a tree the pod never mounted,
+  // which is the whole defect.
+  //
+  // Keying on `instructionsBundleMode === "external"` + `instructionsRootPath` — the
+  // first cut of this fix — is such a second spelling, and the two AGREE ONLY FOR
+  // `external`. `syncInstructionsBundleConfigFromFilePath` persists
+  // `instructionsRootPath = dirname(instructionsFilePath)`, so for a `managed` bundle
+  // at `.../agents/<id>/instructions/AGENTS.md` the root is the `instructions/` dir
+  // while `agentBundleRoot` returns its PARENT `.../agents/<id>` — which is what gets
+  // mounted, and what the candidate list's own comment calls for ("open the whole
+  // agent dir so `memory/` is covered too"). That branch therefore missed `managed`
+  // seats entirely, and extending it to `|| "managed"` would have handed them an
+  // AGENT_HOME one level too deep, putting `$AGENT_HOME/memory/` inside the
+  // instructions bundle: durable, mounted, and silently the wrong directory forever.
+  // Caught in review by @Ceo before merge (PEN-2585, 2026-11-07T02:1xZ).
+  //
+  // The on-volume test is the other half of the join and is NOT redundant:
+  // `agentBundleRoot` only refuses the volume root, so an operator-set bundle outside
+  // the data mount (the case `warnIfPersistentTreeIsOffVolume` exists for) would
+  // otherwise produce a durable-LOOKING AGENT_HOME that no mount backs — this very
+  // bug by a new route. `resolveScopedWritableMounts` creates the mount iff its
+  // `accept()` predicate holds, so AGENT_HOME is mounted iff the same test holds here.
+  //
+  // Falls back to the server-provided workspace agentHome when there is no bundle on
+  // the volume (legacy / single-file agents — unchanged, and still a fallback onto
+  // nothing; the suite's negative control pins that).
+  //
+  // NOTE for anyone porting from the sibling tree: opencode_k8s's comment at this same
+  // call site asserts "claude_k8s agents (whose AGENT_HOME already IS the bundle dir)
+  // worked". That premise is FALSE and was never measured here — this adapter had no
+  // such branch until now, which is exactly why the bug survived the fix that named it.
+  const agentHomeDataMountPath = resolveDataMountPath(config);
+  const agentHomeDataPrefix = agentHomeDataMountPath.endsWith("/")
+    ? agentHomeDataMountPath
+    : `${agentHomeDataMountPath}/`;
+  const agentHomeBundleRoot = agentBundleRoot(
+    asString(config.instructionsFilePath, "").trim() || null,
+    agentHomeDataMountPath,
+  );
+  const mountedBundleHome =
+    agentHomeBundleRoot &&
+    path.posix.isAbsolute(agentHomeBundleRoot) &&
+    agentHomeBundleRoot.startsWith(agentHomeDataPrefix)
+      ? agentHomeBundleRoot
+      : "";
+  setIfPresent("AGENT_HOME", mountedBundleHome || workspaceContext.agentHome);
 
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((v): v is string => typeof v === "string" && v.trim().length > 0)
