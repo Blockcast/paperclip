@@ -13,6 +13,7 @@ import {
   listUnfinishedEffects,
   markCommentProcessedIfSettled,
   processCommentEffects,
+  pruneSettledCommentEffects,
   releaseEffect,
   renewEffectLease,
   resetLeaselessProcessing,
@@ -430,6 +431,139 @@ describeEmbeddedPostgres("issue comment effect ledger", () => {
     expect(after.idempotencyProcessedAt).not.toBeNull();
     expect(await listSettledUnprocessedComments(db as never, 10)).not.toContain(commentId);
   }, 60_000);
+
+  describe("retention (PEN-5681)", () => {
+    /** Drive every effect of the seeded comment to `processed` and stamp it. */
+    async function settleAndStamp() {
+      for (const effect of await listUnfinishedEffects(db as never, commentId)) {
+        const claimed = await claimEffect(db as never, effect.id);
+        await completeEffect(db as never, claimed!);
+      }
+      expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
+    }
+
+    const age = (id: string) =>
+      db
+        .update(issueComments)
+        .set({ idempotencyProcessedAt: sql`now() - interval '48 hours'` })
+        .where(eq(issueComments.id, id));
+
+    const remaining = async () =>
+      db.select().from(issueCommentEffects).where(eq(issueCommentEffects.commentId, commentId));
+
+    it("deletes every row of a stamped, fully-processed comment past the window", async () => {
+      await seed();
+      await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+      await settleAndStamp();
+      await age(commentId);
+
+      expect(await pruneSettledCommentEffects(db as never, 50)).toBe(intents.length);
+      // All-or-nothing: `routes/issues.ts` only re-enqueues a replay's intents
+      // when the comment has NO effect rows, so a partial survivor would leave
+      // the comment neither replayable nor complete.
+      expect(await remaining()).toHaveLength(0);
+    });
+
+    it("never deletes a `failed` row, at any age", async () => {
+      await seed();
+      await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+      const unfinished = await listUnfinishedEffects(db as never, commentId);
+      // One row parked in retry backoff; the rest processed.
+      await exhaustEffect(unfinished[0].id);
+      for (const effect of unfinished.slice(1)) {
+        const claimed = await claimEffect(db as never, effect.id);
+        await completeEffect(db as never, claimed!);
+      }
+      // Stamp it by hand: the comment must look maximally eligible, so the only
+      // thing refusing the delete is the `failed` sibling itself.
+      await db
+        .update(issueComments)
+        .set({ idempotencyProcessedAt: sql`now() - interval '48 hours'` })
+        .where(eq(issueComments.id, commentId));
+
+      expect(await pruneSettledCommentEffects(db as never, 50)).toBe(0);
+      // `failed` is a retry backoff state, not settlement. Deleting the comment's
+      // rows would drop an effect that is still owed — the exact failure the
+      // ledger exists to prevent.
+      expect(await remaining()).toHaveLength(intents.length);
+    });
+
+    it.each(["queued", "processing"])("never deletes a `%s` row, at any age", async (status) => {
+      await seed();
+      await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+      const unfinished = await listUnfinishedEffects(db as never, commentId);
+      for (const effect of unfinished.slice(1)) {
+        const claimed = await claimEffect(db as never, effect.id);
+        await completeEffect(db as never, claimed!);
+      }
+      await db
+        .update(issueCommentEffects)
+        .set({ status })
+        .where(eq(issueCommentEffects.id, unfinished[0].id));
+      await db
+        .update(issueComments)
+        .set({ idempotencyProcessedAt: sql`now() - interval '48 hours'` })
+        .where(eq(issueComments.id, commentId));
+
+      expect(await pruneSettledCommentEffects(db as never, 50)).toBe(0);
+      expect(await remaining()).toHaveLength(intents.length);
+    });
+
+    it("never deletes an UNSTAMPED comment's rows even when all are processed", async () => {
+      await seed();
+      await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+      for (const effect of await listUnfinishedEffects(db as never, commentId)) {
+        const claimed = await claimEffect(db as never, effect.id);
+        await completeEffect(db as never, claimed!);
+      }
+      const [row] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+      expect(row.idempotencyProcessedAt).toBeNull();
+
+      // This is precisely the settlement sweep's answer set. Pruning it would
+      // delete the evidence the sweep needs to stamp the comment, and the stamp
+      // is what makes a later same-key replay short-circuit.
+      expect(await listSettledUnprocessedComments(db as never, 10)).toContain(commentId);
+      expect(await pruneSettledCommentEffects(db as never, 50)).toBe(0);
+      expect(await remaining()).toHaveLength(intents.length);
+    });
+
+    it("keeps a stamped, settled comment that is still inside the retention window", async () => {
+      await seed();
+      await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+      await settleAndStamp();
+
+      // Just stamped, so inside any positive window.
+      expect(await pruneSettledCommentEffects(db as never, 50)).toBe(0);
+      expect(await remaining()).toHaveLength(intents.length);
+      // ...and eligible once the window is collapsed, which is what proves the
+      // window — not some other predicate — is what held it back above.
+      expect(await pruneSettledCommentEffects(db as never, 50, 0)).toBe(intents.length);
+    });
+
+    it("does not reach a soft-deleted comment's rows (the residue PEN-5681 names)", async () => {
+      await seed();
+      await enqueueCommentEffects(db as never, { companyId, issueId, commentId, effects: intents });
+      for (const effect of await listUnfinishedEffects(db as never, commentId)) {
+        const claimed = await claimEffect(db as never, effect.id);
+        await completeEffect(db as never, claimed!);
+      }
+      await db
+        .update(issueComments)
+        .set({ deletedAt: sql`now() - interval '48 hours'` })
+        .where(eq(issueComments.id, commentId));
+
+      // `markCommentProcessedIfSettled` requires `deleted_at IS NULL`, so this
+      // comment can never be stamped and so can never satisfy the predicate —
+      // while the FK cascade needs a hard delete that does not happen. The rows
+      // are un-prunable by construction. Pinned so that widening the predicate
+      // to reach them is a deliberate change with a failing test, not a drift.
+      expect(await markCommentProcessedIfSettled(db as never, commentId)).toBe(true);
+      const [row] = await db.select().from(issueComments).where(eq(issueComments.id, commentId));
+      expect(row.idempotencyProcessedAt).toBeNull();
+      expect(await pruneSettledCommentEffects(db as never, 50, 0)).toBe(0);
+      expect(await remaining()).toHaveLength(intents.length);
+    });
+  });
 
   it("reconciles an exhausted effect after durable backoff and settles only after recovery", async () => {
     await seed();

@@ -446,6 +446,29 @@ export async function hasUnsettledEffects(db: Db, commentId: string): Promise<bo
  * The plan reads every effect row and probes `issue_comments` once per
  * effect-bearing comment, so it costs O(ledger) however empty the result is;
  * the reconciler runs it on its own slow cadence (BLO-52498).
+ *
+ * That cost is NOT made index-independent here, and deliberately so. No index
+ * can start this query from "effect rows whose comment is unstamped" -- the
+ * selective predicate lives in the other table -- and the obvious inversion is
+ * worse: a partial index on `issue_comments (id) where idempotency_processed_at
+ * is null` covers every comment ever written on the inline path, a set larger
+ * than the ledger and growing faster.
+ *
+ * What bounds it instead is `pruneSettledCommentEffects`. With retention
+ * running, the ledger holds only unsettled rows, settled-but-unstamped rows
+ * (this query's own answer), rows inside the retention window, and the
+ * soft-deleted residue named on that function. The scan is then O(retention
+ * window x comment throughput), independent of total history -- which is the
+ * property wanted, obtained from retention rather than from an index.
+ *
+ * Explicit acceptability bound, so this is a number and not a shrug: at the
+ * measured ceiling of ~3.8k comments/24h x 6-9 effect rows, a 24 h window is
+ * ~23k-34k rows. A seq scan of that is single-digit milliseconds once a minute.
+ * This plan stops being acceptable around 10^6 rows, where the scan reaches
+ * roughly a second and starts to rival the 1 s reconciler tick; reaching that
+ * under a 24 h window would take a ~30x rise in comment rate. If the ledger is
+ * ever observed above 10^6 with retention running, the residue classes are the
+ * cause and this query needs the reshape, not a longer cadence.
  */
 export async function listSettledUnprocessedComments(
   db: Db,
@@ -521,6 +544,93 @@ export async function processCommentEffects(
   return markCommentProcessedIfSettled(db, commentId);
 }
 
+/**
+ * How long a fully-settled, stamped comment's effect rows are kept before
+ * `pruneSettledCommentEffects` may remove them.
+ *
+ * This window is operator headroom, not a correctness requirement. A
+ * `processed` row's one remaining job is to be the dedup tombstone that makes
+ * `enqueueCommentEffects`' `onConflictDoNothing` a no-op on replay — and once
+ * the comment is stamped, the replay that would need it is unreachable: the
+ * route returns at `routes/issues.ts` (`existingComment.idempotencyProcessedAt`
+ * -> 200 `deduplicated`) before it can reach the enqueue. So the rows are dead
+ * weight the moment the stamp lands; a day of them is kept only so an incident
+ * has something to read.
+ */
+export const SETTLED_COMMENT_EFFECT_RETENTION_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Delete the effect rows of comments that are fully settled AND stamped.
+ *
+ * `issue_comment_effects` had no retention of any kind: a `processed` row lived
+ * as long as its comment, and comments are soft-deleted, so the `ON DELETE
+ * cascade` mostly never fires. That is a storage problem second and a latency
+ * problem first — `listSettledUnprocessedComments` has no index that can start
+ * from "effect rows whose comment is unstamped", so it reads the ledger and
+ * probes `issue_comments` once per effect-bearing comment, costing O(ledger)
+ * however empty the result is (BLO-52498 bought cadence, not complexity).
+ * Bounding the ledger is what bounds that scan.
+ *
+ * The predicate deletes a row only when BOTH hold, and is deliberately no wider:
+ *
+ *  - its comment carries `idempotency_processed_at`, and
+ *  - every sibling row of that comment is `processed`.
+ *
+ * `failed` is a retry backoff state, not settlement, so an aged `failed` row is
+ * never eligible at any age — "delete old failures" would silently drop an
+ * effect that is still owed, which is the exact failure this table exists to
+ * prevent. `queued` and `processing` are likewise never eligible.
+ *
+ * Deletion is all-or-nothing per comment. `routes/issues.ts` re-enqueues a
+ * replay's intents only when `hasCommentEffects` is false, so a comment left
+ * holding a partial row set would be neither replayable nor complete. Selecting
+ * by `comment_id` and deleting every row of the chosen comments keeps that
+ * invariant; the `limit` bounds comments, not rows.
+ *
+ * Safety under concurrency: a row can only be added by `enqueueCommentEffects`,
+ * which a stamped comment's replay cannot reach. Were one to commit between
+ * this statement's snapshot and its delete, it is outside the snapshot and
+ * survives — the comment is then unstamped-with-work, which the resumable query
+ * already handles. Nothing is lost in either interleaving.
+ *
+ * NOT covered, and it is the residue that matters: a soft-deleted comment is
+ * never stamped (`markCommentProcessedIfSettled` requires `deleted_at IS NULL`),
+ * so its rows can never satisfy this predicate at any age, while the FK cascade
+ * needs a hard delete that does not happen. Those rows are un-prunable here by
+ * construction and are still scanned by every sweep. Widening this predicate to
+ * reach them is not in scope and must not be done casually: a soft-deleted
+ * comment can still hold `queued` work. See PEN-5681.
+ */
+export async function pruneSettledCommentEffects(
+  db: Db,
+  limit: number,
+  retentionMs: number = SETTLED_COMMENT_EFFECT_RETENTION_MS,
+): Promise<number> {
+  const rows = await db
+    .delete(issueCommentEffects)
+    .where(
+      inArray(
+        issueCommentEffects.commentId,
+        sql`(
+          select candidate.comment_id
+          from ${issueCommentEffects} candidate
+          inner join ${issueComments} c on c.id = candidate.comment_id
+          where c.idempotency_processed_at is not null
+            and c.idempotency_processed_at < now() - ${sql.raw(`interval '${Math.max(0, Math.floor(retentionMs / 1000))} seconds'`)}
+            and not exists (
+              select 1 from ${issueCommentEffects} sibling
+              where sibling.comment_id = candidate.comment_id
+                and sibling.status <> 'processed'
+            )
+          group by candidate.comment_id
+          limit ${limit}
+        )`,
+      ),
+    )
+    .returning({ id: issueCommentEffects.id });
+  return rows.length;
+}
+
 export function startIssueCommentEffectReconciler(
   db: Db,
   process: (commentId: string) => Promise<unknown>,
@@ -528,12 +638,20 @@ export function startIssueCommentEffectReconciler(
   // The settlement sweep only writes bookkeeping, so a minute of latency costs
   // nothing; run every pass, it was the largest consumer of DB time (BLO-52498).
   sweepIntervalMs: number = 60_000,
+  // Retention only deletes rows that are already dead weight, so it is the
+  // coldest work here; an hour of staleness costs a fraction of a day's ledger.
+  pruneIntervalMs: number = 3_600_000,
 ): () => Promise<void> {
   let pass: Promise<void> = Promise.resolve();
   let polling = false;
   let stopped = false;
   // The first pass sweeps, so a restart still settles whatever stranded while it was down.
   let lastSweepAt = Number.NEGATIVE_INFINITY;
+  // Retention does NOT run on the first pass. The sweep above is what rescues a
+  // settled-but-unstamped comment, and an unstamped comment is not prunable, so
+  // pruning before the first sweep could only ever delete rows the sweep did not
+  // need -- but deferring it keeps restart cost on the recovery path, not here.
+  let lastPruneAt = performance.now();
   void resetLeaselessProcessing(db).catch((err) =>
     logger.warn({ err }, "issue-comment-effects: stale-processing reset failed"));
   const timer = setInterval(() => {
@@ -556,6 +674,16 @@ export function startIssueCommentEffectReconciler(
         if (stopped) break;
         await markCommentProcessedIfSettled(db, commentId).catch((err) =>
           logger.warn({ err, commentId }, "issue-comment-effects: settlement sweep failed"));
+      }
+      // Retention. Runs after the sweep, never before: the sweep is what turns a
+      // settled-but-unstamped comment into a stamped one, and only a stamped
+      // comment is prunable, so this order prunes a comment the same pass it
+      // becomes eligible instead of an interval later.
+      if (stopped || performance.now() - lastPruneAt < pruneIntervalMs) return;
+      lastPruneAt = performance.now();
+      const pruned = await pruneSettledCommentEffects(db, 500);
+      if (pruned > 0) {
+        logger.info({ pruned }, "issue-comment-effects: pruned settled effect rows");
       }
     })()
       .catch((err) => logger.warn({ err }, "issue-comment-effects: reconciliation pass failed"))
