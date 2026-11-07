@@ -3407,36 +3407,48 @@ describe("agent issue mutation checkout ownership", () => {
     );
   });
 
-  // PEN-5940. These three are deliberately at the ROUTE, not against decideBase.
-  // The defect being pinned is a guard that is real and a route that does not
-  // feed it: `assigneeUserId` was a hardcoded `null` here, so an
-  // `assigneeUserId` predicate in the `tasks:assign` block would have passed
-  // its own unit test and done nothing in production. A decideBase test cannot
-  // tell those two worlds apart; this one fails if either half is reverted.
-  it("hands the tasks:assign decision the row's current human holder on checkout", async () => {
+  // PEN-5940. These are deliberately at the ROUTE, not against decideBase. The
+  // defect being pinned is a guard that is real and a route that does not feed
+  // it: a `currentAssigneeUserId` predicate in the `tasks:assign` block passes
+  // its own unit test and does nothing in production unless a route supplies
+  // the field. A decideBase test cannot tell those two worlds apart.
+  //
+  // The PATCH assignment door is where that guard is load-bearing, so that is
+  // where the field is pinned. The checkout door deliberately does NOT ask the
+  // question — see the delegation test below.
+  it("hands the tasks:assign decision the row's current human holder on the PATCH assignment door", async () => {
+    // Deliberately NOT `createdByUserId` ("board-user"): a row whose holder is
+    // also its creator takes the agent-to-creator hand-back exemption, which
+    // skips this door for a legitimate reason and would make the assertion
+    // below pass for the wrong one.
     mockIssueService.getById.mockResolvedValue(
-      makeIssue({ status: "todo", assigneeAgentId: null, assigneeUserId: "board-user" }),
+      makeIssue({ status: "todo", assigneeAgentId: null, assigneeUserId: "holder-user" }),
     );
+    mockAgentService.resolveByReference.mockResolvedValue({
+      ambiguous: false,
+      agent: makeAgent(peerAgentId),
+    });
 
     await request(await createApp(peerActor()))
-      .post(`/api/issues/${issueId}/checkout`)
-      .send({ agentId: peerAgentId, expectedStatuses: ["todo"] });
+      .patch(`/api/issues/${issueId}`)
+      .send({ assigneeAgentId: peerAgentId });
 
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
       action: "tasks:assign",
-      resource: expect.objectContaining({ currentAssigneeUserId: "board-user" }),
-    }));
-    // And `assigneeUserId` keeps meaning the assignment TARGET, which on this
-    // route is an agent. Conflating the two would silently re-aim the low-trust
-    // and task-bridge "cannot assign work to board users" guards at the wrong
-    // person.
-    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
-      action: "tasks:assign",
-      resource: expect.objectContaining({ assigneeUserId: null }),
+      resource: expect.objectContaining({ currentAssigneeUserId: "holder-user" }),
     }));
   });
 
-  it("refuses checkout of a row a person holds", async () => {
+  // The checkout door delegates this question to `svc.checkout`'s claim
+  // predicate, which refuses a human-held row atomically on every branch that
+  // writes `assigneeAgentId`. Denying here instead was not merely redundant: a
+  // 403 raised at `assertCanAssignTasks` fires BEFORE `svc.checkout` and so
+  // preempts the stale-execution-lock clear that a refused checkout performs on
+  // its way out — pinned in issue-stale-execution-lock-routes, against a real
+  // database, where the refusal and the hygiene are both observable. This test
+  // is the regression guard for that preemption: if the route starts refusing
+  // early again, it fails here before it fails there.
+  it("delegates a human-held row at checkout to the claim predicate rather than denying early", async () => {
     mockIssueService.getById.mockResolvedValue(
       makeIssue({ status: "todo", assigneeAgentId: null, assigneeUserId: "board-user" }),
     );
@@ -3459,8 +3471,13 @@ describe("agent issue mutation checkout ownership", () => {
       .post(`/api/issues/${issueId}/checkout`)
       .send({ agentId: peerAgentId, expectedStatuses: ["todo"] });
 
-    expect(res.status, JSON.stringify(res.body)).toBe(403);
-    expect(mockIssueService.checkout).not.toHaveBeenCalled();
+    expect(res.status, JSON.stringify(res.body)).not.toBe(403);
+    expect(mockIssueService.checkout).toHaveBeenCalled();
+    // The `tasks:assign` call is skipped entirely on this branch, so a guard
+    // keyed on the field cannot fire here however the decision is wired.
+    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+      action: "tasks:assign",
+    }));
   });
 
   it("does not tell an agent to take a row a person holds when it denies the write", async () => {

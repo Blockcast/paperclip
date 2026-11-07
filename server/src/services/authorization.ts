@@ -2742,7 +2742,12 @@ export function authorizationService(db: Db) {
           reason: "deny_missing_grant",
           explanation:
             "This issue is assigned to a person, so agents cannot reassign it — including to themselves. " +
-            "Ask that person to make the change, or to hand the issue over.",
+            // Kept in step with issueMutationGrantRemediation in routes/issues.ts:
+            // an agent that hits the service-level denial (checkout's 403) sees
+            // only this string, so naming the same non-bypass routes here is what
+            // stops it from going looking for a door that is merely less guarded.
+            "Comment here with what you would have written and let them make the change, or write your " +
+            "findings on an issue you are assigned to and reference this one.",
         });
       }
       if (policyEffect.kind === "restricted") {
