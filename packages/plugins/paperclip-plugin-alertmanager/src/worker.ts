@@ -36,6 +36,10 @@ import {
   handleRecoveryApiRequest,
   registerRecoveryAction,
 } from "./recovery-action.js";
+import {
+  handleAttendanceApiRequest,
+  isAttendanceRoute,
+} from "./attendance-read.js";
 
 let pluginCtx: PluginContext | null = null;
 
@@ -146,8 +150,16 @@ export const plugin = definePlugin({
     if (!ctx) {
       return {
         status: 503,
-        body: { error: "Alertmanager recovery API is not ready" },
+        body: { error: "Alertmanager plugin API is not ready" },
       };
+    }
+    // PEN-2918 (D). Dispatched ahead of the recovery handler because that one
+    // ends in a catch-all 404, so an unrouted key there is indistinguishable
+    // from a missing route. Keep new read routes on this branch: it is the
+    // read-only half, and `handleRecoveryApiRequest` gates everything past its
+    // listing on `isBoardUser`.
+    if (isAttendanceRoute(input.routeKey)) {
+      return handleAttendanceApiRequest(ctx, input);
     }
     return handleRecoveryApiRequest(ctx, input);
   },
