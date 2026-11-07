@@ -167,8 +167,20 @@ async function createAppWithActor(actor: any) {
 }
 
 async function loadCostParsers() {
-  const { parseCostDateRange, parseCostLimit, parseCostAgentId } = await import("../routes/costs.js");
-  return { parseCostDateRange, parseCostLimit, parseCostAgentId };
+  const {
+    parseCostDateRange,
+    parseCostLimit,
+    parseCostAgentId,
+    assertByProjectWindowWithinCap,
+    BY_PROJECT_MAX_WINDOW_DAYS,
+  } = await import("../routes/costs.js");
+  return {
+    parseCostDateRange,
+    parseCostLimit,
+    parseCostAgentId,
+    assertByProjectWindowWithinCap,
+    BY_PROJECT_MAX_WINDOW_DAYS,
+  };
 }
 
 beforeEach(() => {
@@ -228,6 +240,103 @@ describe("cost routes", () => {
     })).toEqual({
       from: new Date("2026-01-01T00:00:00.000Z"),
       to: new Date("2026-01-31T23:59:59.999Z"),
+    });
+  });
+
+  // PEN-5591: `by-project` cannot answer a wide window inside the 30s
+  // `statement_timeout`, and the attempt is what sheds the rest of the fleet --
+  // the incident was 191/191 `503` on this route while ten unrelated routes
+  // blew their own timeouts. Measured post-fix on 2026-11-07 at `cf90ee33`:
+  // 3d/5d answer in 0.5-1s and 2.5-5s, 7d takes 20-30s, 10d is cancelled. The
+  // cap is set at the last window with real margin, not the last that answers.
+  describe("by-project window cap (PEN-5591)", () => {
+    const now = new Date("2026-11-07T12:00:00.000Z");
+    const daysBefore = (n: number) => new Date(now.getTime() - n * 24 * 60 * 60 * 1000);
+
+    it("admits a window at exactly the cap", async () => {
+      const { assertByProjectWindowWithinCap, BY_PROJECT_MAX_WINDOW_DAYS } = await loadCostParsers();
+      expect(() => assertByProjectWindowWithinCap(
+        { from: daysBefore(BY_PROJECT_MAX_WINDOW_DAYS), to: now },
+        now,
+      )).not.toThrow();
+    });
+
+    it("admits a window shorter than the cap", async () => {
+      const { assertByProjectWindowWithinCap } = await loadCostParsers();
+      expect(() => assertByProjectWindowWithinCap({ from: daysBefore(1), to: now }, now)).not.toThrow();
+    });
+
+    it("refuses a window wider than the cap", async () => {
+      const { assertByProjectWindowWithinCap, BY_PROJECT_MAX_WINDOW_DAYS } = await loadCostParsers();
+      expect(() => assertByProjectWindowWithinCap(
+        { from: daysBefore(BY_PROJECT_MAX_WINDOW_DAYS + 1), to: now },
+        now,
+      )).toThrow(/costs\/by-project window is .* the maximum is/i);
+    });
+
+    // The 30-day window the incident's caller polled every 60s.
+    it("refuses the 30-day window that caused the incident", async () => {
+      const { assertByProjectWindowWithinCap } = await loadCostParsers();
+      expect(() => assertByProjectWindowWithinCap({ from: daysBefore(30), to: now }, now))
+        .toThrow(/PEN-5591/);
+    });
+
+    // An absent `to` means "now" -- bounded, so it is the span that decides.
+    it("measures an absent 'to' against now rather than refusing it", async () => {
+      const { assertByProjectWindowWithinCap } = await loadCostParsers();
+      expect(() => assertByProjectWindowWithinCap({ from: daysBefore(1) }, now)).not.toThrow();
+      expect(() => assertByProjectWindowWithinCap({ from: daysBefore(30) }, now)).toThrow(/PEN-5591/);
+    });
+
+    // An absent `from` is the FULL-HISTORY scan, i.e. the worst case -- so it
+    // must fail closed. Defaulting it to anything would silently re-admit the
+    // query the cap exists to refuse.
+    it("refuses an unbounded window rather than defaulting it", async () => {
+      const { assertByProjectWindowWithinCap } = await loadCostParsers();
+      expect(() => assertByProjectWindowWithinCap(undefined, now)).toThrow(/'from' is required/i);
+      expect(() => assertByProjectWindowWithinCap({ to: now }, now)).toThrow(/'from' is required/i);
+    });
+
+    it("rejects an inverted range instead of letting a negative span pass the cap", async () => {
+      const { assertByProjectWindowWithinCap } = await loadCostParsers();
+      expect(() => assertByProjectWindowWithinCap({ from: now, to: daysBefore(1) }, now))
+        .toThrow(/'to' precedes 'from'/i);
+    });
+
+    // The unit tests above call the guard directly, so on their own they cannot
+    // show the ROUTE calls it -- nor that it runs BEFORE the query, which is the
+    // whole point: the cost of this statement is paid in full even when it is
+    // cancelled, so refusing after the call would not prevent the shed.
+    it("refuses a wide window at the route, without reaching the cost service", async () => {
+      const app = await createApp();
+      const res = await request(app)
+        .get("/api/companies/company-1/costs/by-project")
+        .query({ from: "2026-10-01T00:00:00.000Z", to: "2026-10-31T00:00:00.000Z" });
+
+      expect(res.status).toBe(400);
+      expect(res.body.details?.code).toBe("window_too_wide");
+      expect(mockCostService.byProject).not.toHaveBeenCalled();
+    });
+
+    it("serves a window within the cap at the route", async () => {
+      const app = await createApp();
+      const res = await request(app)
+        .get("/api/companies/company-1/costs/by-project")
+        .query({ from: "2026-10-28T00:00:00.000Z", to: "2026-10-31T00:00:00.000Z" });
+
+      expect(res.status).toBe(200);
+      expect(mockCostService.byProject).toHaveBeenCalled();
+    });
+
+    it("refuses before the query runs, as a 400 rather than a 503", async () => {
+      const { assertByProjectWindowWithinCap } = await loadCostParsers();
+      try {
+        assertByProjectWindowWithinCap({ from: daysBefore(30), to: now }, now);
+        expect.unreachable("expected the cap to refuse a 30-day window");
+      } catch (err) {
+        expect((err as { status?: number }).status).toBe(400);
+        expect((err as { details?: { code?: string } }).details?.code).toBe("window_too_wide");
+      }
     });
   });
 
