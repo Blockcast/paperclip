@@ -55,6 +55,7 @@ import {
   backfillLegacyToolOAuthTokens,
   bootstrapExecutionPolicyFromEnv,
   EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS,
+  PRELAUNCH_OWNER_RENEW_MS,
   environmentCustomImageService,
   executionWorkspaceCleanupService,
   heartbeatService,
@@ -1459,6 +1460,13 @@ export async function startServer(): Promise<StartedServer> {
       productivityReviewMonitorSchedulerIntervalMs: config.heartbeatSchedulerIntervalMs,
     });
     workerHeartbeat = heartbeat;
+    // BLO-54719: every worker, not just the lease leader -- the peer's reaper
+    // reads these stamps to tell a live pre-launch owner from an orphan.
+    setInterval(() => {
+      heartbeat.renewPrelaunchReservationOwnership().catch((err) =>
+        logger.warn({ err }, "failed to renew pre-launch reservation ownership"),
+      );
+    }, PRELAUNCH_OWNER_RENEW_MS).unref?.();
     // BLO-19722 AC 2/3: hand the entrypoint crash guard a way to terminalize
     // this worker's in-flight runs before the process dies. Registered here
     // rather than passed at install time because the guard is installed before

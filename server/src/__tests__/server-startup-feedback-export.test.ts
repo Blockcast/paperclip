@@ -66,6 +66,7 @@ const {
     // `reapOrphanedRuns`, so the two spies keep those call sites distinguishable;
     // asserting the periodic latch on `reapOrphanedRuns` would silently pass.
     reapOrphanedRunsPeriodic: vi.fn(async () => ({ reaped: 0, runIds: [] })),
+    renewPrelaunchReservationOwnership: vi.fn(async () => undefined),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
     reconcileStrandedAssignedIssues: vi.fn(async () => ({
@@ -375,6 +376,7 @@ vi.mock("../realtime/live-events-ws.js", () => ({
 
 vi.mock("../services/index.js", () => ({
   EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS: 0,
+  PRELAUNCH_OWNER_RENEW_MS: 30_000,
   backfillLegacyToolOAuthTokens: vi.fn(async () => ({
     scannedConnections: 0,
     migratedConnections: 0,
