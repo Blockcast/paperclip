@@ -2004,6 +2004,16 @@ registry.registerPath({
   path: "/api/issues/{id}/work-products",
   tags: ["issues"],
   summary: "List issue work products",
+  description:
+    "⛔ `workProduct.reviewState` is Paperclip BOARD-REVIEW state, NOT a mirror of GitHub's "
+    + "`reviewDecision`. The GitHub webhook never writes it, so every `provider: \"github\"` row "
+    + "reads `none` permanently — that is the correct value (\"never board-reviewed\"), not a stale "
+    + "one, and it carries NO information about whether the pull request has been reviewed. Reading "
+    + "it as a review signal under-reports review in the UNSAFE direction: a human-APPROVED PR looks "
+    + "untouched, which on PEN-5850 was the stated premise of a grant to force-push a head carrying a "
+    + "live human approval. For review state read GitHub directly — `gh pr view <n> --json reviewDecision`, "
+    + "`repos/<o>/<r>/commits/<sha>/status`, or `repos/<o>/<r>/pulls/<n>/reviews`. Likewise `status` is "
+    + "webhook-derived and only as fresh as the last delivery.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
 });
@@ -2054,8 +2064,16 @@ registry.registerPath({
     "so a `provider` in any other casing than `github` reports `exact` and matches nothing -- the " +
     "reported mode always describes the comparison that was performed. Read it when `owners` is " +
     "empty: it is what distinguishes a server that folds the casing from one that does not " +
-    "(PEN-6056).",
-
+    "(PEN-6056)."
+    + "⛔ `workProduct.reviewState` is Paperclip BOARD-REVIEW state, NOT a mirror of GitHub's "
+    + "`reviewDecision`. The GitHub webhook never writes it, so every `provider: \"github\"` row "
+    + "reads `none` permanently — that is the correct value (\"never board-reviewed\"), not a stale "
+    + "one, and it carries NO information about whether the pull request has been reviewed. Reading "
+    + "it as a review signal under-reports review in the UNSAFE direction: a human-APPROVED PR looks "
+    + "untouched, which on PEN-5850 was the stated premise of a grant to force-push a head carrying a "
+    + "live human approval. For review state read GitHub directly — `gh pr view <n> --json reviewDecision`, "
+    + "`repos/<o>/<r>/commits/<sha>/status`, or `repos/<o>/<r>/pulls/<n>/reviews`. Likewise `status` is "
+    + "webhook-derived and only as fresh as the last delivery.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: workProductExternalIdLookupQuerySchema,

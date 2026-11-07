@@ -34,6 +34,17 @@ export const issueWorkProducts = pgTable(
     title: text("title").notNull(),
     url: text("url"),
     status: text("status").notNull(),
+    /**
+     * Paperclip BOARD-REVIEW state. NOT a mirror of GitHub's `reviewDecision`
+     * — see the `IssueWorkProductReviewState` doc comment in
+     * `@paperclipai/shared` for the full contract.
+     *
+     * The GitHub webhook never writes this column, so every
+     * `provider: "github"` row sits at the `none` default permanently. That is
+     * correct ("never board-reviewed"), and it says nothing about whether the
+     * PR has been reviewed on GitHub. Reading it as a GitHub signal
+     * under-reports review and nearly cost a human approval (PEN-5850).
+     */
     reviewState: text("review_state").notNull().default("none"),
     isPrimary: boolean("is_primary").notNull().default(false),
     healthStatus: text("health_status").notNull().default("unknown"),
