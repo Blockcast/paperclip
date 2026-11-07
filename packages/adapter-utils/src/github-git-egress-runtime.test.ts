@@ -1447,7 +1447,9 @@ describe("buildGitArgv force-push refusal (PEN-4869)", () => {
         expect(message).toMatch(/update by push/);
         // A clone that never pushed has no such entry, and an author reading a
         // refusal will not read a source comment, so the fallback is rendered.
-        expect(message).toMatch(/never pushed from this clone/);
+        // Reworded by PEN-5947; what is pinned here is that a fallback EXISTS,
+        // with its content pinned in the PEN-5947 block below.
+        expect(message).toMatch(/a fresh clone has none/);
         // The three ways of spelling "the ref the lease is compared against".
         // `@{u}` resolves to `origin/<branch>`, so it is the same hazard, and
         // it additionally dies on a worktree with no upstream configured.
@@ -1492,12 +1494,163 @@ describe("buildGitArgv force-push refusal (PEN-4869)", () => {
         "    git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>",
       ].join("\n");
       expect(stale).not.toMatch(/git reflog show origin\/<branch>/);
-      expect(stale).not.toMatch(/never pushed from this clone/);
+      expect(stale).not.toMatch(/a fresh clone has none/);
       expect(stale).toMatch(/rev-parse origin\/<branch>/);
       // ...while still passing the one assertion the stale text DID satisfy,
       // which is why a pinned-lease check alone never caught this.
       expect(stale).toMatch(/--force-with-lease=refs\/heads\/<branch>:<expected-sha>/);
       expect(classifyForcePush(stale.split("\n")[2]!.trim().split(" ").slice(1))).toBeNull();
+    });
+  });
+
+  // PEN-5947. PEN-5830 sourced the expected sha from the reflog, which is right
+  // whenever a reflog exists. On this fleet it usually does not: `git clone`
+  // writes no `update by push` entry, agent runs get fresh per-run clones, and
+  // the previous run's output is gone — so the FALLBACK is the branch most
+  // refused authors read. It used to say only "use the sha your last push
+  // printed", which names nothing reachable once that output is gone, leaving a
+  // live read of the branch as the easiest thing to reach for: the very defect
+  // PEN-5830, PEN-5807, PEN-5055 and PEN-4869 exist to remove, arrived at by
+  // following the remedy. These assertions pin the axis the fallback names
+  // (recorded AT PUSH TIME) and the absence of every live-read spelling.
+  describe("the no-reflog fallback (PEN-5947)", () => {
+    const shapes = [
+      ["force-flag", ["push", "--force", "origin", "main"]],
+      ["plus-refspec", ["push", "origin", "+main"]],
+      ["bare-lease", ["push", "--force-with-lease", "origin", "main"]],
+      ["mirror", ["push", "--mirror", "origin"]],
+    ] as const;
+
+    function refusal(argv: readonly string[]): string {
+      try {
+        buildGitArgv([...argv], { ...PRESENT });
+      } catch (error) {
+        return (error as Error).message;
+      }
+      throw new Error(`expected a refusal for ${argv.join(" ")}`);
+    }
+
+    // The fallback is the run of comment continuation lines after the `reflog`
+    // line. Scoping to it is the point: `ls-remote` is legitimately in the text
+    // one line further down, on the COMPARISON side, so a whole-message search
+    // for it cannot tell the admitted use from the forbidden one. This is the
+    // region an author reads when the reflog came back empty.
+    function fallbackOf(message: string): string {
+      const lines = message.split("\n");
+      const at = lines.findIndex((line) => line.trim().startsWith("git reflog show"));
+      expect(at, "the refusal must carry a reflog line").toBeGreaterThanOrEqual(0);
+      const out: string[] = [];
+      for (const line of lines.slice(at + 1)) {
+        if (!line.trim().startsWith("#")) break;
+        out.push(line);
+      }
+      return out.join("\n");
+    }
+
+    // Every way of spelling "read the branch's head right now". Each returns the
+    // value the lease is compared against, so a lease built from any of them
+    // equals it by construction and can never refuse. `gh pr view --json
+    // headRefOid` is listed because it is the obvious-looking fix and the
+    // dangerous one: a richer API is not the property that makes a source safe,
+    // and naming it would reintroduce the defect in a shape that looks fixed.
+    const LIVE_READS: ReadonlyArray<readonly [string, RegExp]> = [
+      ["ls-remote", /ls-remote/],
+      ["rev-parse", /rev-parse/],
+      ["@{u}", /@\{u\}/],
+      ["gh pr view", /gh\s+pr\s+view/],
+      ["headRefOid", /headRefOid/],
+    ];
+
+    for (const [label, argv] of shapes) {
+      it(`names a recorded-at-push-time source, not a live read (${label})`, () => {
+        const message = refusal(argv);
+        const fallback = fallbackOf(message);
+
+        // The fallback must exist and must say why the reflog can be empty —
+        // otherwise an author in the common case does not know they are in it.
+        expect(fallback, `${label} must render a fallback`).not.toEqual("");
+        expect(fallback).toMatch(/a fresh clone has none/);
+
+        // The axis, stated: WHEN the value was captured. This is the whole of
+        // the rule, and it is what makes the named sources safe — not the tool
+        // that produced them.
+        expect(fallback).toMatch(/RECORDED WHEN YOU PUSHED/);
+        expect(fallback).toMatch(/WHEN the value was captured/);
+        // ...and at least one concrete source captured at that moment, so the
+        // axis is reachable rather than an abstraction the author must apply.
+        expect(fallback).toMatch(/Reviewed head:/);
+
+        // No live-read spelling anywhere in the fallback.
+        for (const [name, pattern] of LIVE_READS) {
+          expect(fallback, `${label}: fallback must not name ${name}`).not.toMatch(pattern);
+        }
+
+        // `gh pr view` / `headRefOid` must not appear anywhere in the refusal at
+        // all — unlike `ls-remote`, neither has an admitted use here.
+        expect(message).not.toMatch(/gh\s+pr\s+view/);
+        expect(message).not.toMatch(/headRefOid/);
+
+        // The admitted `ls-remote` is still present, still on the comparison
+        // side, so narrowing the fallback did not delete the contention check.
+        expect(message).toMatch(
+          /git ls-remote origin refs\/heads\/<branch>\s+# still <expected-sha>\?/,
+        );
+      });
+    }
+
+    it("emits a push the live classifier accepts, on every shape", () => {
+      // Re-checked here rather than inherited from the PEN-5830 block: this
+      // change rewrites lines inside the same `lease` constant the push line
+      // lives in, and a remedy the wrapper would itself refuse sends an
+      // already-blocked author round the same loop.
+      for (const [label, argv] of shapes) {
+        const line = refusal(argv)
+          .split("\n")
+          .map((text) => text.trim())
+          // paperclip:allow-git-push: reads the refusal's own remediation text; nothing here invokes git
+          .find((text) => text.startsWith("git push "));
+        expect(line, `${label} must carry a runnable push`).toBeDefined();
+        expect(classifyForcePush(line!.split(" ").slice(1)), label).toBeNull();
+      }
+    });
+
+    it("mutation check: the PEN-5830 fallback would have failed these assertions", () => {
+      // Guards against passing vacuously. This is the text that shipped between
+      // PEN-5830 and PEN-5947: correct about the reflog, and silent about what
+      // to do when there is not one beyond an output that no longer exists.
+      const stale = [
+        "    git reflog show origin/<branch>   # newest `update by push` = <expected-sha>, the sha YOU last pushed",
+        "                                      #   (never pushed from this clone? use the sha your last push printed)",
+      ].join("\n");
+      const fallback = stale.split("\n").slice(1).join("\n");
+
+      // It renders a fallback, so an existence check alone never caught this.
+      expect(fallback).not.toEqual("");
+      // But it states no axis and names no source captured at push time.
+      expect(fallback).not.toMatch(/RECORDED WHEN YOU PUSHED/);
+      expect(fallback).not.toMatch(/WHEN the value was captured/);
+      expect(fallback).not.toMatch(/Reviewed head:/);
+      expect(fallback).not.toMatch(/a fresh clone has none/);
+
+      // The live-read pins pass against it too — the old text did not NAME a
+      // live read, it just left one as the only thing an author could reach.
+      // That is why the positive assertions above are the ones doing the work.
+      for (const [, pattern] of LIVE_READS) {
+        expect(fallback).not.toMatch(pattern);
+      }
+    });
+
+    it("mutation check: a fallback naming gh pr view --json headRefOid is rejected", () => {
+      // The obvious-looking fix, and the one the issue singles out: it returns
+      // the branch's current head, the same value `ls-remote` returns, so it is
+      // the defect wearing an authoritative-looking shape.
+      const tempting =
+        "                                      #   no entry? gh pr view --json headRefOid gives <expected-sha>";
+      let rejected = 0;
+      for (const [, pattern] of LIVE_READS) {
+        if (pattern.test(tempting)) rejected += 1;
+      }
+      expect(rejected, "the live-read pins must reject it").toBeGreaterThan(0);
     });
   });
 
