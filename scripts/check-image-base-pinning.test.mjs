@@ -25,10 +25,17 @@
 // `js-yaml` is in package.json only as a version override, not a dependency, so
 // it does not resolve in CI (see the header of scripts/check-workflows-parse.mjs
 // for the full reasoning, and why declaring it is not available either). The
-// workflow side of this check is therefore a plain substring search for the
-// build-arg name, which is enough to answer "does the workflow supply it?" and
-// has nothing to go subtly wrong. Structural validity of the workflow files is
-// already guaranteed by check-workflows-parse.mjs.
+// workflow side of this check is therefore a search for the build-arg name in
+// the workflow text, which is enough to answer "does the workflow supply it?".
+// Structural validity of the workflow files is already guaranteed by
+// check-workflows-parse.mjs.
+//
+// That search is ANCHORED, and must stay anchored. A bare `includes("BASE=")`
+// is satisfied by an unrelated `NODE_BASE=` in the same file, so a workflow that
+// supplies the wrong arg entirely would still pass — the gate failing open,
+// which is the one direction a gate must never fail. Found in review of the
+// commit that introduced this file; `supplies a bare substring match` below is
+// the regression test.
 //
 // WHY THIS ASSERTS THE SEAM AND NOT THE VALUE
 //
@@ -73,6 +80,13 @@ const ALLOWED_LITERAL_BASES = new Map([
 ]);
 
 const VARIABLE = /^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$/;
+
+// Does `workflowText` supply a build-arg literally named `argName`? Anchored on
+// a line start or whitespace so `BASE` is not matched by `NODE_BASE=`. argName
+// comes from VARIABLE above, so it holds no regex metacharacters.
+export function suppliesBuildArg(workflowText, argName) {
+  return new RegExp(`(^|[\\s|])${argName}=`, "m").test(workflowText);
+}
 
 // Every FROM in order, flagged for whether it names an earlier stage in the same
 // file — such a FROM inherits that stage's pinning and needs none of its own.
@@ -129,7 +143,7 @@ test("every CI-published image takes its external base through a build-arg the w
       }
 
       const argName = variable[1];
-      if (!workflowText.includes(`${argName}=`)) {
+      if (!suppliesBuildArg(workflowText, argName)) {
         problems.push(
           `${dockerfile} reads \`${line}\` but ${workflow} never passes ${argName}=, so the ` +
             "build falls back to the floating default in the Dockerfile and the published " +
@@ -141,6 +155,18 @@ test("every CI-published image takes its external base through a build-arg the w
 
   assert.ok(checked > 0, "no FROM lines were examined — the Dockerfile scan found nothing");
   assert.deepEqual(problems, [], `\n${problems.join("\n\n")}\n`);
+});
+
+test("a build-arg whose name merely ends with the one we need does not satisfy it", () => {
+  // The fail-open shape: `BASE` must NOT be satisfied by `NODE_BASE=`, or a
+  // workflow supplying entirely the wrong arg passes this gate.
+  const workflow = ["        build-args: |", "          NODE_BASE=${{ steps.base.outputs.image }}"].join("\n");
+  assert.equal(suppliesBuildArg(workflow, "NODE_BASE"), true);
+  assert.equal(suppliesBuildArg(workflow, "BASE"), false);
+  assert.equal(suppliesBuildArg(workflow, "WEBFLOW_BOT_IMAGE"), false);
+  // A first-on-the-line arg, and one after a YAML block scalar pipe, both count.
+  assert.equal(suppliesBuildArg("BASE=x", "BASE"), true);
+  assert.equal(suppliesBuildArg("build-args: |BASE=x", "BASE"), true);
 });
 
 test("the known-unpinned allowlist still describes something real", () => {
