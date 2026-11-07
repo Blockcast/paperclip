@@ -26,7 +26,7 @@ const MONITOR_SCHEDULING_FIELDS = {
   scheduledBy: "assignee" as const,
 };
 
-describeEmbeddedPostgres("issue list projection of the monitor lifecycle state (PEN-5481)", () => {
+describeEmbeddedPostgres("projections of the monitor lifecycle state (PEN-5481, PEN-5935)", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let companyId!: string;
@@ -43,6 +43,7 @@ describeEmbeddedPostgres("issue list projection of the monitor lifecycle state (
     // The shapes that would make a naive `->>` lie rather than return null.
     ["monitor is json null", { status: "idle", monitor: null }, null],
     ["monitor is a string", { status: "idle", monitor: "nope" }, null],
+    ["monitor is an array", { status: "idle", monitor: [{ status: "triggered" }] }, null],
     ["monitor present, status absent", { status: "idle", monitor: { ...MONITOR_SCHEDULING_FIELDS } }, null],
   ];
 
@@ -59,7 +60,7 @@ describeEmbeddedPostgres("issue list projection of the monitor lifecycle state (
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(agents).values({ id: randomUUID(), companyId, name: "Owner", role: "engineer" });
-    for (const [label, state] of cases) {
+    for (const [index, [label, state]] of cases.entries()) {
       // Mirror the JSON into the monitor_* column the same way the real write path does,
       // so the triggered-vs-cleared comparison below is against a POPULATED column rather
       // than two nulls that would match trivially.
@@ -73,6 +74,12 @@ describeEmbeddedPostgres("issue list projection of the monitor lifecycle state (
           companyId,
           title: label,
           status: "in_review",
+          // Set explicitly: these columns are nullable with no default, and the raw insert
+          // here bypasses the create path that normally allocates them. The identifier is
+          // what `getByIdentifier` resolves on, and that is the branch `paperclipGetIssue`
+          // actually takes — agents pass `PEN-5935`, not a UUID.
+          issueNumber: index + 1,
+          identifier: `LMS-${index + 1}`,
           // Cast deliberately: several cases store shapes the parsed type forbids, because
           // the point is that the projection refuses them by returning null rather than
           // by throwing or by inventing a status.
@@ -139,5 +146,90 @@ describeEmbeddedPostgres("issue list projection of the monitor lifecycle state (
     // carries one, so attendance does not need it, and keying attendance off a budget
     // bound is the read-side form of the mistake PEN-5481 fixed on the write side.
     expect(triggered).not.toHaveProperty("monitorTimeoutAt");
+  });
+
+  // PEN-5935. PEN-5481 shipped the field on ONE of the two read surfaces. The single-issue
+  // read runs a bare `select()` over the table, `monitorStatus` is not a column, and so the
+  // key was absent from `GET /api/issues/:id` — for the same rows, in the same deploy, that
+  // the list served it populated on. Absent is rendered `null` by `jq`, `.get()` and
+  // optional chaining, and `null` on this field is CONTRACTUALLY "no monitor was ever armed
+  // on this row", so a GET answered the opposite of the truth for every monitored row.
+  //
+  // These assert the PAIR, not the new arm: each reads the same stored jsonb through both
+  // projections and compares them. Dropping either one fails here. A test that only
+  // exercised the new arm would pass on a tree where the list projection had been removed,
+  // which is the half of this defect that made it survivable in the first place.
+  describe("agreement between the list and single-issue surfaces (PEN-5935)", () => {
+    it("is present on the single-issue read for every stored shape", async () => {
+      for (const [label] of cases) {
+        const issue = await issueService(db).getById(issueIdByLabel.get(label)!);
+        // `toHaveProperty` is the load-bearing assertion, exactly as on the list arm:
+        // comparing against null would pass on the absent key that IS the defect.
+        expect(issue, `getById returned no row for ${label}`).not.toBeNull();
+        expect(issue, `single-issue projection for ${label}`).toHaveProperty("monitorStatus");
+      }
+    });
+
+    it("answers identically on both surfaces for every stored shape", async () => {
+      const rows = await issueService(db).list(companyId);
+      const listById = new Map(rows.map((row) => [row.id, row]));
+      for (const [label, , expected] of cases) {
+        const id = issueIdByLabel.get(label)!;
+        const listRow = listById.get(id)!;
+        const issue = await issueService(db).getById(id);
+        expect(listRow.monitorStatus, `list projection for ${label}`).toBe(expected);
+        expect(issue!.monitorStatus, `single-issue projection for ${label}`).toBe(expected);
+        // Stated as a direct comparison too, so the failure message on a future divergence
+        // names the two surfaces rather than one of them and a literal.
+        expect(issue!.monitorStatus, `surfaces disagree for ${label}`).toBe(listRow.monitorStatus);
+      }
+    });
+
+    // The identifier path is a second entry point into the same getter pair, and it is the
+    // one agents actually use — `paperclipGetIssue("PEN-5935")` routes here, not through the
+    // UUID branch. It had its own `return enriched`, so it could have been fixed on one
+    // branch and left on the other.
+    it("answers identically when the row is fetched by identifier", async () => {
+      const rows = await issueService(db).list(companyId);
+      const listById = new Map(rows.map((row) => [row.id, row]));
+      for (const [label] of cases) {
+        const id = issueIdByLabel.get(label)!;
+        const identifier = listById.get(id)!.identifier!;
+        expect(identifier).toBeTruthy();
+        const byIdentifier = await issueService(db).getByIdentifier(identifier);
+        expect(byIdentifier, `getByIdentifier returned no row for ${label}`).not.toBeNull();
+        expect(byIdentifier!.id).toBe(id);
+        expect(byIdentifier!.monitorStatus, `identifier projection for ${label}`)
+          .toBe(listById.get(id)!.monitorStatus);
+      }
+    });
+
+    // The whole reason the field exists, restated on the surface that was missing it: a
+    // fired monitor and a cleared one are byte-identical on every other column of a GET
+    // response too, and only this field separates "a sweep owns this row" from "nothing
+    // does".
+    it("separates triggered from cleared on the single-issue read", async () => {
+      const triggered = await issueService(db).getById(issueIdByLabel.get("monitor triggered")!);
+      const cleared = await issueService(db).getById(issueIdByLabel.get("monitor cleared")!);
+
+      expect(triggered!.monitorNextCheckAt).toBeNull();
+      expect(cleared!.monitorNextCheckAt).toBeNull();
+      expect(triggered!.monitorLastTriggeredAt).not.toBeNull();
+      expect(triggered!.monitorLastTriggeredAt).toEqual(cleared!.monitorLastTriggeredAt);
+
+      expect(triggered!.monitorStatus).toBe("triggered");
+      expect(cleared!.monitorStatus).toBe("cleared");
+    });
+
+    // `null` on this field means "no monitor was ever armed", and an absent key renders as
+    // `null` through every reader the fleet uses. So the only way a consumer can tell the
+    // two apart is key presence — which is exactly what the published contract tells them
+    // to gate on, and what the GET surface could not satisfy.
+    it("reports a never-armed row as a present key holding null, not as an absent key", async () => {
+      const neverArmed = await issueService(db).getById(issueIdByLabel.get("no execution state at all")!);
+      expect(neverArmed).toHaveProperty("monitorStatus");
+      expect(Object.keys(neverArmed!)).toContain("monitorStatus");
+      expect(neverArmed!.monitorStatus).toBeNull();
+    });
   });
 });
