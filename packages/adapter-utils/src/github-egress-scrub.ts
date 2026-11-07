@@ -744,8 +744,31 @@ const LEXICAL_SEGMENT_RE = /^(?:[A-Za-z]+|[0-9]+)$/;
  *  of isOpaqueSecretValue, 100k random values per shape: base64url-32 ~1e-4,
  *  lower+digit with random separators ~3–5e-4 at 24–28 chars and ~2e-5 at 32,
  *  fixed-layout 4×6 / 5×5 keys and base64url-43 0. Accepted: the alternative was refusing every agent
- *  push touching a file that names an `orc8r` job. */
-const MIXED_LEXICAL_SEGMENT_RE = /^(?=.{2,8}$)(?:[a-z]+[0-9]{1,2}[a-z]*|[A-Z]+[0-9]{1,2}[A-Z]*)$/;
+ *  push touching a file that names an `orc8r` job.
+ *
+ *  PEN-4939: the last two alternatives add a WORD FOLLOWED BY A TICKET NUMBER
+ *  — `pen3261`, `blo49591`. The digit-run cap above is 2, and every identifier
+ *  in this fleet that names an issue carries 4 (`PEN-####`) or 5 (`BLO-#####`),
+ *  so the shape our own naming convention produces was the one shape this rule
+ *  could never exonerate. Measured: a 24-char probe-object name built from a
+ *  ticket number refused, the same name with the digits spelled as a separate
+ *  segment passed, and the two differ only in a hyphen. That taught authors to
+ *  shorten names until the door opened, which is the failure mode that gets a
+ *  control switched off.
+ *
+ *  Kept narrow so the documented invariants above still hold. The digits must
+ *  TERMINATE the segment and be preceded by at least TWO letters, so `e454` —
+ *  named above as the reason a UUID stays opaque — is still refused, as are
+ *  `386c81e8`, `9a1a` and `5f22`. Simply widening the existing alternatives to
+ *  `[0-9]{1,4}` would have admitted `e454` and broken that invariant.
+ *
+ *  Residual, same method as above, 100k random values per shape through the
+ *  whole of isOpaqueSecretValue: base64url-32, base64url-43, alnum-24,
+ *  alnum-40, lower+digit-24/32 and fixed-layout 4×6 / 5×5 keys all UNCHANGED
+ *  to the count. The only movement is lower+digit with random separators —
+ *  2166→2181 per 100k at 24 chars, 532→540 at 28, 203→207 at 32. */
+const MIXED_LEXICAL_SEGMENT_RE =
+  /^(?=.{2,8}$)(?:[a-z]+[0-9]{1,2}[a-z]*|[A-Z]+[0-9]{1,2}[A-Z]*|[a-z]{2,}[0-9]{3,5}|[A-Z]{2,}[0-9]{3,5})$/;
 
 /** Longest segment an identifier may carry and still be exonerated. This is
  *  identifier HEADROOM, not a security bound: 16 random lowercase letters is
