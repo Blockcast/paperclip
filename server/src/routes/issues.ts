@@ -4592,11 +4592,55 @@ export function issueRoutes(
     };
   }
 
+  type CommentMentionContext = {
+    mentionedAgentIds: string[];
+    authorUserIsActiveMember: boolean;
+  };
+
+  /**
+   * Resolve the @-mention fan-out for a comment body.
+   *
+   * Split out of `buildKeyedCommentEffectIntents` so the caller can run it
+   * BEFORE opening the insert transaction. The builder is called inside that
+   * transaction, and an `issue_comments` INSERT fires
+   * `issue_comments_bump_issue_last_activity_at`, which takes
+   * `FOR NO KEY UPDATE` on the parent `issues` row and holds it to commit
+   * (migration 0229). Every query the builder made was therefore made while
+   * holding a write lock on the hot `issues` row. Hoisting them leaves the
+   * transaction holding that lock across the comment INSERT and the effect
+   * INSERT and nothing else, which is what the keyed path was already
+   * documented to do.
+   */
+  async function resolveCommentMentionContext(input: {
+    issue: IssueRouteSnapshot;
+    body: string;
+    actor: PersistedCommentActor;
+  }): Promise<CommentMentionContext> {
+    const mentionedAgentIds = await svc.findMentionedAgents(input.issue.companyId, input.body);
+    let authorUserIsActiveMember = false;
+    if (mentionedAgentIds.length > 0 && input.actor.actorType === "user") {
+      try {
+        authorUserIsActiveMember = Boolean(
+          await getActiveCompanyMembership(db, input.issue.companyId, "user", input.actor.actorId),
+        );
+      } catch (err) {
+        logger.warn({ err, issueId: input.issue.id }, "failed to resolve keyed comment author membership for @-mentions");
+      }
+    }
+    return { mentionedAgentIds, authorUserIsActiveMember };
+  }
+
   async function buildKeyedCommentEffectIntents(input: {
     issue: IssueRouteSnapshot;
     comment: typeof issueComments.$inferSelect;
     actor: ReturnType<typeof getActorInfo>;
     referenceSummaryBefore: Awaited<ReturnType<typeof issueReferencesSvc.listIssueReferenceSummary>>;
+    /**
+     * Pre-resolved mention fan-out for `comment.body`. Pass it whenever this
+     * runs inside the insert transaction; omit it and the lookups happen here,
+     * which is fine on the out-of-transaction replay path.
+     */
+    mentions?: CommentMentionContext;
   }): Promise<CommentEffectIntent[]> {
     const actor = persistedCommentActor(input.actor);
     const effects: CommentEffectIntent[] = [
@@ -4636,17 +4680,9 @@ export function issueRoutes(
       });
     }
 
-    const mentionedIds = await svc.findMentionedAgents(input.issue.companyId, input.comment.body);
-    let authorUserIsActiveMember = false;
-    if (mentionedIds.length > 0 && actor.actorType === "user") {
-      try {
-        authorUserIsActiveMember = Boolean(
-          await getActiveCompanyMembership(db, input.issue.companyId, "user", actor.actorId),
-        );
-      } catch (err) {
-        logger.warn({ err, issueId: input.issue.id }, "failed to resolve keyed comment author membership for @-mentions");
-      }
-    }
+    const { mentionedAgentIds: mentionedIds, authorUserIsActiveMember } =
+      input.mentions ??
+      (await resolveCommentMentionContext({ issue: input.issue, body: input.comment.body, actor }));
     for (const mentionedId of mentionedIds) {
       if (!commentAuthorCanGrantIssueMention({
         mentionedAgentId: mentionedId,
@@ -4812,6 +4848,53 @@ export function issueRoutes(
   const processKeyedCommentEffects = (commentId: string) =>
     processCommentEffects(db, commentId, executeKeyedCommentEffect);
   opts.registerCommentEffectProcessor?.(processKeyedCommentEffects);
+
+  /**
+   * Drain a committed comment's effects inline, and never fail the response for
+   * doing so (PEN-5669).
+   *
+   * By the time this runs the comment AND the full set of effect intents it
+   * owes have committed together, so the work is already guaranteed to happen:
+   * `processCommentEffects` writes a failed effect back as `queued`/`failed`
+   * with a backoff (`releaseEffect`) BEFORE it rethrows, and
+   * `startIssueCommentEffectReconciler` polls for due work every second.
+   *
+   * That release is itself a write and can fail too — the same deadlock, or a
+   * second blip. Do NOT tighten this catch on the assumption that the row is
+   * always back to `queued`: an un-released row stays `processing` with its
+   * lease, and `listCommentsWithResumableEffects` reclaims it once the lease
+   * expires. Recovery then waits out the lease rather than the backoff, which
+   * is slower but equally certain. The
+   * rethrow's only remaining effect was to tell the caller its write had failed
+   * about work the system was about to complete regardless — a 503 whose own
+   * advice ("replay the request") is at best a no-op. The one traced victim was
+   * the `markCommentProcessedIfSettled` stamp, the last statement of the drain,
+   * whose own contract is that a minute of latency costs nothing.
+   *
+   * What a same-key replay sees while the effects are still `queued`: the keyed
+   * lookup finds the comment, `idempotencyProcessedAt` is still null, so the
+   * early `200`-and-return does NOT fire. The request falls through, finds the
+   * intents already enqueued (`hasCommentEffects`), re-drains, and answers 200
+   * with `deduplicated: true`. No second comment is inserted and no intent is
+   * duplicated — `enqueueCommentEffects` conflicts on
+   * `(comment_id, effect_key)`. The early-return becomes reachable only once
+   * every effect has settled, which is the condition it was always asserting;
+   * swallowing the drain failure does not weaken it, it just stops a comment
+   * that is genuinely unfinished from being reported as a failed write.
+   *
+   * A failure BEFORE the commit still fails the request, and must: there the
+   * caller's comment genuinely did not land.
+   */
+  async function drainCommentEffectsAfterCommit(input: { commentId: string; issueId: string }) {
+    try {
+      await processKeyedCommentEffects(input.commentId);
+    } catch (err) {
+      logger.warn(
+        { err, commentId: input.commentId, issueId: input.issueId },
+        "inline issue-comment effect drain failed after commit; left to the reconciler",
+      );
+    }
+  }
 
   function parseDateQuery(value: unknown, field: string) {
     if (typeof value !== "string" || value.trim().length === 0) return undefined;
@@ -16726,6 +16809,14 @@ export function issueRoutes(
           sourceTrust: await sourceTrustForActorWrite(currentIssue, actor),
         };
         if (req.body.idempotencyKey) {
+          // Resolved before the transaction opens: see
+          // `resolveCommentMentionContext` for why the lock held by the INSERT's
+          // trigger must not span these reads.
+          const mentionContext = await resolveCommentMentionContext({
+            issue: currentIssue,
+            body: req.body.body,
+            actor: persistedCommentActor(actor),
+          });
           comment = await db.transaction(async (tx) => {
             const accepted = await svc.addComment(id, req.body.body, commentActor, commentOptions, tx);
             const effects = await buildKeyedCommentEffectIntents({
@@ -16733,6 +16824,29 @@ export function issueRoutes(
               comment: accepted,
               actor,
               referenceSummaryBefore: commentReferenceSummaryBefore,
+              // `mentionContext` was resolved from `req.body.body`, but the
+              // intents are built against `accepted`, and those are not always
+              // the same text. The builder has always asked about the PERSISTED
+              // body, so reuse the hoisted answer only when it describes it:
+              //
+              //  - Two concurrent same-key requests can both miss the
+              //    out-of-transaction pre-check and both enter this branch. The
+              //    loser's `svc.addComment` hits `onConflictDoNothing` and
+              //    returns the WINNER's row with `deduplicated: true`. Building
+              //    from the loser's body would enqueue `wake:<agent>:<issue>`
+              //    keys for agents the stored comment never mentions — and
+              //    those keys do not conflict with the winner's, so the
+              //    `(comment_id, effect_key)` dedup cannot catch them. The
+              //    result is a wake for a mention nobody can read.
+              //  - With `censorUsernameInLogs` on, the stored body is
+              //    `redactCurrentUserText(body)`, so a mention token matching
+              //    the OS username survives in the request body and not in the
+              //    persisted one.
+              //
+              // Falling back costs the in-transaction lookup this hoist exists
+              // to remove, but only on those paths: correctness there is worth
+              // more than the lock time, and the common case is unaffected.
+              mentions: accepted.body === req.body.body ? mentionContext : undefined,
             });
             await enqueueCommentEffects(tx as unknown as Db, {
               companyId: currentIssue.companyId,
@@ -16767,17 +16881,19 @@ export function issueRoutes(
     // not-null narrowing, and the resolution is memoized.
     //
     // That memo spans the UNKEYED path only, where the wake (below) and the
-    // response share one lookup. The idempotency-keyed path resolves
-    // separately inside `buildKeyedCommentEffectIntents`, which calls
-    // `svc.findMentionedAgents` directly, and then again here via
-    // `commentResponseBody()` — so a keyed first write makes two queries. (A
-    // keyed replay whose effects already exist makes one.) Both sites pass the
-    // same company and the same body to the same resolver, so they ask the
-    // same question and only use the answer differently: one builds wake
-    // intents, one reports which tokens bound. They are left separate because
-    // threading the memo through the effect builder would couple the two for
-    // no gain, and the duplicate read is cheap — not because the lookups
-    // differ.
+    // response share one lookup. The idempotency-keyed path resolves separately
+    // via `resolveCommentMentionContext` before its transaction, and then again
+    // here via `commentResponseBody()`, so a keyed first write makes two
+    // queries. (A keyed replay whose effects already exist makes one.) The two sites are
+    // deliberately NOT merged: the pre-insert resolution asks about
+    // `req.body.body`, while this one asks about `persistedComment.body`. Those
+    // usually coincide on a first write, but not always — `censorUsernameInLogs`
+    // stores `redactCurrentUserText(body)`, and a same-key replay (or a loser of
+    // the concurrent-insert race) carries the ORIGINAL request's body, which a
+    // replay sending different text must still be told about. Sharing one memo
+    // would silently answer the response question with the request's body; the
+    // insert transaction guards the same divergence by reusing its hoisted
+    // context only when `accepted.body` matches what it resolved from.
     const persistedComment = comment;
     let resolvedMentionAgentIds: string[] | null = null;
     const resolveMentionedAgentIds = async (): Promise<string[]> => {
@@ -16850,7 +16966,7 @@ export function issueRoutes(
           });
         }
       }
-      await processKeyedCommentEffects(comment.id);
+      await drainCommentEffectsAfterCommit({ commentId: comment.id, issueId: currentIssue.id });
       res.status(idempotentReplay ? 200 : 201).json(await commentResponseBody());
       return;
     }

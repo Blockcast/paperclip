@@ -834,7 +834,19 @@ describe("issue update comment wakeups", () => {
         idempotencyKey: "health:window:fingerprint",
       });
 
-    expect(first.status).toBe(500);
+    // PEN-5669: the inline drain threw, but the comment and the full set of
+    // effect intents it owes had already committed together, so the response
+    // reports the create. `releaseEffect` writes the unfinished effect back as
+    // `queued`/`failed` with a backoff BEFORE `processCommentEffects` rethrows,
+    // and the reconciler owns it from there. This asserted 500 until PEN-5669:
+    // a failed-write verdict on a write that had landed and was visible to
+    // everyone else.
+    expect(first.status).toBe(201);
+    // The replay runs while those effects are still unsettled, which is the
+    // case most likely to break: `idempotencyProcessedAt` is still null, so the
+    // early 200-and-return does NOT fire. The request falls through, finds the
+    // intents already enqueued, re-drains, and answers 200 `deduplicated: true`
+    // without inserting a second comment or a second intent.
     expect(second.status).toBe(200);
     expect(second.body).toMatchObject({ id: "comment-idempotent", deduplicated: true });
     expect(mockIssueService.addComment).toHaveBeenCalledTimes(1);
