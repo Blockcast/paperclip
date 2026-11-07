@@ -13,6 +13,7 @@ import {
   pullRequestMergeQueueState,
   pullRequestWorkProductSourceEventActionOrder,
   pullRequestWorkProductStatus,
+  pullRequestOwnershipRelation,
   recordedPullRequestOwners,
   TERMINAL_PULL_REQUEST_WORK_PRODUCT_STATUSES,
 } from "../services/pull-request-work-products.js";
@@ -374,5 +375,55 @@ describe("recordedPullRequestOwners", () => {
     // direction here is to keep what parsed -- unlike the all-unreadable case,
     // where keeping it would flip the meaning from "notify" to "stay silent".
     expect(recordedPullRequestOwners(["BLO-1", 42])).toEqual(["BLO-1"]);
+  });
+});
+// PEN-5836: `by-external-id` returned mentioning rows inside `owners` with no
+// field separating them from real owners, and `provenance: "webhook"` -- which
+// the agent-facing directive named as the binding -- is true of both. These
+// pin the three-valued answer, especially the arm a two-valued predicate loses.
+describe("pullRequestOwnershipRelation", () => {
+  it("names a row the recorded owning set contains", () => {
+    expect(pullRequestOwnershipRelation("BLO-1", ["BLO-1"])).toBe("owner");
+    expect(pullRequestOwnershipRelation("BLO-2", ["BLO-1", "BLO-2"])).toBe("owner");
+  });
+
+  it("names a row the PR references but does not own", () => {
+    expect(pullRequestOwnershipRelation("BLO-9", ["BLO-1"])).toBe("mention");
+  });
+
+  it("treats the authoritative empty set as a real negative", () => {
+    // `[]` means the resolver found no owning ref in title, labeled body or
+    // branch -- a weekly-refresh PR naming no issue. Every other consumer of
+    // this field already reads `[]` as "owns nothing", so a row cannot be an
+    // owner under it.
+    expect(pullRequestOwnershipRelation("BLO-1", [])).toBe("mention");
+  });
+
+  it("does NOT report a mention when ownership was never recorded", () => {
+    // The arm that matters. Agent-registered rows pass no ownership, so `null`
+    // is the commonest value in the table, and the obvious caller-side
+    // predicate -- `identifier in (owningIdentifiers ?? [])` -- answers
+    // "mention" for every one of them. That would convert this endpoint's
+    // known, visible over-reporting into silent under-reporting: a caller would
+    // drop a row that may well own the PR with nothing in the response saying
+    // so. "undetermined" is not a negative and must not collapse into one.
+    expect(pullRequestOwnershipRelation("BLO-1", null)).toBe("undetermined");
+  });
+
+  it("does NOT report a mention for a row that carries no identifier", () => {
+    // `issues.identifier` is nullable, so this is reachable. An unmatchable row
+    // is unknown, not a negative -- the same reasoning as the null owning set,
+    // arriving by the other input.
+    expect(pullRequestOwnershipRelation(null, ["BLO-1"])).toBe("undetermined");
+    expect(pullRequestOwnershipRelation(null, [])).toBe("undetermined");
+  });
+
+  it("composes with recordedPullRequestOwners on an unreadable recording", () => {
+    // An unparseable recording reads as null, so it must reach the undetermined
+    // arm rather than being mistaken for the authoritative empty set.
+    expect(pullRequestOwnershipRelation("BLO-1", recordedPullRequestOwners([42]))).toBe(
+      "undetermined",
+    );
+    expect(pullRequestOwnershipRelation("BLO-1", recordedPullRequestOwners([]))).toBe("mention");
   });
 });
