@@ -23,6 +23,7 @@ import path from "node:path";
 
 import { classifyGitInvocation, type GitEgressEnv } from "./github-git-egress-shim.js";
 import type { BrokeredTool } from "./github-publish-broker-protocol.js";
+import { EGRESS_ENFORCEMENT_BOUNDARY_DECISION_URL } from "./security-decision-records.js";
 
 export class PublishBrokerRefusal extends Error {
   constructor(message: string) {
@@ -288,11 +289,15 @@ export const REFUSED_GH_SUBCOMMANDS: readonly string[] = ["auth", "alias", "exte
 export function admitGhInvocation(argv: readonly string[]): void {
   const verb = argv.find((token) => !token.startsWith("-"));
   if (verb !== undefined && REFUSED_GH_SUBCOMMANDS.includes(verb.toLowerCase())) {
+    // PEN-4939: ABSOLUTE URL, deliberately. The agent reading this refusal is
+    // working in some other repository entirely, where `docs/security/` does
+    // not exist; a reviewer tidying this back to a repo-relative path restores
+    // the dead pointer PEN-4939 was filed about.
     throw new PublishBrokerRefusal(
       `refusing \`gh ${verb}\`: it is a route from "the broker runs gh for me" back to holding the token ` +
         "itself (`auth` prints it; `alias` and `extension` run shell beside it). The broker holds the " +
-        "credential so that nothing at uid 1000 does — see docs/security/" +
-        "PEN-3183-git-egress-enforcement-boundary-decision.md §5.",
+        "credential so that nothing at uid 1000 does — see " +
+        `${EGRESS_ENFORCEMENT_BOUNDARY_DECISION_URL} §5.`,
     );
   }
   for (const token of argv) {
