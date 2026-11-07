@@ -940,6 +940,229 @@ describe("issue update comment wakeups", () => {
     );
   });
 
+  // PEN-5846. All three comment-create paths run the same
+  // `commentAuthorCanGrantIssueMention` gate, but only the two UNKEYED ones also
+  // suppressed a mention wake on a terminal row. So the same body, by the same
+  // entitled author, on the same `done` issue, woke nobody without an
+  // `idempotencyKey` and woke the mentioned agent with one: a dedupe mechanism
+  // deciding reachability.
+  //
+  // These are deliberately DIFFERENTIAL — the same scenario run across two paths,
+  // or across two statuses, asserting the answers agree. The pair that already
+  // guards this area ("does not wake a mentioned agent when an agent comment
+  // cannot grant reply access" / "does not enqueue a keyed mention wake when an
+  // agent cannot grant reply access") is one careful test per path on the
+  // ENTITLEMENT axis, and that shape is precisely why a cross-path divergence on
+  // the STATUS axis survived: each path was self-consistent. If you add another
+  // per-path pair, leave the differential ones beside it.
+  describe("closed-row mention wakes, suppressed on every path (PEN-5846)", () => {
+    const CLOSED_ROW_BODY = `[@QA](agent://${MENTIONED_AGENT_ID}) please inspect this`;
+
+    // Minimal pair with "enqueues a keyed mention wake when an active member
+    // grants reply access" above: identical setup, `in_progress` -> `done`.
+    // `assigneeAgentId` stays null so a user comment on a terminal row does not
+    // trip the implicit reopen in `shouldImplicitlyMoveCommentedIssueToTodo`,
+    // which would make the row `todo` before the guard is ever reached.
+    it("does not enqueue a keyed mention wake on a terminal issue", async () => {
+      const existing = makeIssue({
+        assigneeAgentId: null,
+        assigneeUserId: "active-user",
+        status: "done",
+      });
+      const comment = {
+        id: "comment-keyed-closed-row-mention",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        authorType: "user",
+        authorAgentId: null,
+        authorUserId: "active-user",
+        body: CLOSED_ROW_BODY,
+        presentation: null,
+        metadata: null,
+        idempotencyKey: "mention:closed-row",
+        idempotencyProcessedAt: null,
+        createdAt: new Date("2026-08-11T00:00:00.000Z"),
+        updatedAt: new Date("2026-08-11T00:00:00.000Z"),
+      };
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue(comment);
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp({
+        type: "board",
+        userId: "active-user",
+        companyIds: [existing.companyId],
+        source: "session",
+        isInstanceAdmin: false,
+      }))
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: comment.body, idempotencyKey: comment.idempotencyKey });
+
+      expect(res.status).toBe(201);
+      expect(mockCommentEffects.enqueueCommentEffects).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          effects: expect.not.arrayContaining([
+            expect.objectContaining({
+              effectKind: "wake",
+              payload: expect.objectContaining({ agentId: MENTIONED_AGENT_ID }),
+            }),
+          ]),
+        }),
+      );
+    });
+
+    // The two halves of the divergence of record, same scenario either side of
+    // `idempotencyKey`: the assignee agent signs off on its own finished row and
+    // @-mentions a peer — the "this is done, over to you" handoff, and the one
+    // shape that reaches a closed row with an agent assignee at all
+    // (`isAssigneeSelfCommentOnTerminalIssue` forces the reopen path off, and an
+    // agent author never triggers the implicit one). It is entitled: the author
+    // IS the assignee. Before PEN-5846 the keyed half woke the peer and the
+    // unkeyed half did not.
+    it("does not enqueue a keyed mention wake when the assignee signs off on its own terminal issue", async () => {
+      const existing = makeIssue({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        status: "done",
+      });
+      const comment = {
+        id: "comment-keyed-closed-row-handoff",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        authorType: "agent",
+        authorAgentId: ASSIGNEE_AGENT_ID,
+        authorUserId: null,
+        body: CLOSED_ROW_BODY,
+        presentation: null,
+        metadata: null,
+        idempotencyKey: "mention:closed-row-handoff",
+        idempotencyProcessedAt: null,
+        createdAt: new Date("2026-08-11T00:00:00.000Z"),
+        updatedAt: new Date("2026-08-11T00:00:00.000Z"),
+      };
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue(comment);
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: ASSIGNEE_AGENT_ID,
+        companyId: existing.companyId,
+        source: "agent_key",
+      }))
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: comment.body, idempotencyKey: comment.idempotencyKey });
+
+      expect(res.status).toBe(201);
+      expect(mockCommentEffects.enqueueCommentEffects).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({
+          effects: expect.not.arrayContaining([
+            expect.objectContaining({
+              effectKind: "wake",
+              payload: expect.objectContaining({ agentId: MENTIONED_AGENT_ID }),
+            }),
+          ]),
+        }),
+      );
+    });
+
+    it("does not wake a mentioned agent when the assignee signs off on its own terminal issue without a key", async () => {
+      const existing = makeIssue({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        status: "done",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-unkeyed-closed-row-handoff",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: CLOSED_ROW_BODY,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: ASSIGNEE_AGENT_ID,
+        companyId: existing.companyId,
+        source: "agent_key",
+      }))
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: CLOSED_ROW_BODY });
+
+      expect(res.status).toBe(201);
+      await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+        MENTIONED_AGENT_ID,
+        expect.objectContaining({ reason: "issue_comment_mentioned" }),
+      );
+    });
+
+    it("does not wake a mentioned agent when a PATCH comments on a terminal issue", async () => {
+      const existing = makeIssue({
+        assigneeAgentId: ASSIGNEE_AGENT_ID,
+        assigneeUserId: null,
+        status: "done",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+      mockIssueService.update.mockResolvedValue(existing);
+      mockIssueService.addComment.mockResolvedValue({
+        id: "comment-patch-closed-row",
+        issueId: existing.id,
+        companyId: existing.companyId,
+        body: CLOSED_ROW_BODY,
+      });
+      mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+
+      const res = await request(await createApp({
+        type: "agent",
+        agentId: ASSIGNEE_AGENT_ID,
+        companyId: existing.companyId,
+        source: "agent_key",
+      }))
+        .patch(`/api/issues/${existing.id}`)
+        .send({ comment: CLOSED_ROW_BODY });
+
+      expect(res.status).toBe(200);
+      await vi.waitFor(() => expect(mockIssueService.findMentionedAgents).toHaveBeenCalled());
+      expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+        MENTIONED_AGENT_ID,
+        expect.objectContaining({ reason: "issue_comment_mentioned" }),
+      );
+    });
+
+    // Pins the reason the keyed guard carries no `!reopened` term where the two
+    // unkeyed loops do: a keyed comment cannot BE a reopen. `addIssueCommentSchema`
+    // refuses the combination outright, so the keyed path is only ever reached with
+    // `reopened === false` and the term would be dead code. This is the tripwire —
+    // if that exclusivity is ever relaxed, this test fails and whoever relaxes it
+    // learns that the closed-row mention guard above now needs the term, instead of
+    // silently swallowing every reopen handoff on the keyed path.
+    it("refuses a keyed comment that also asks to reopen", async () => {
+      const existing = makeIssue({
+        assigneeAgentId: null,
+        assigneeUserId: "active-user",
+        status: "done",
+      });
+      mockIssueService.getById.mockResolvedValue(existing);
+
+      const res = await request(await createApp({
+        type: "board",
+        userId: "active-user",
+        companyIds: [existing.companyId],
+        source: "session",
+        isInstanceAdmin: false,
+      }))
+        .post(`/api/issues/${existing.id}/comments`)
+        .send({ body: CLOSED_ROW_BODY, idempotencyKey: "mention:reopen", reopen: true });
+
+      expect(res.status).toBe(400);
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
+  });
+
   it("does not route a plain-text agent name on a human-owned issue comment", async () => {
     const existing = makeIssue({
       assigneeAgentId: null,

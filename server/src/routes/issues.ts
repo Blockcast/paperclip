@@ -4613,6 +4613,15 @@ export function issueRoutes(
     const wakeups = new Map<string, { agentId: string; wakeup: IssueWakeupRequest }>();
     const assigneeId = input.issue.assigneeAgentId;
     const selfComment = actor.actorType === "agent" && actor.actorId === assigneeId;
+    // PEN-5846: this closed-status term and the identical one in the mention loop
+    // below are ONE policy, not two coincidences — keep them together. Both arms
+    // write into the same `wakeups` map under the same `${agentId}:${issueId}` key,
+    // and the mention loop skips an occupied key. So while the mention loop went
+    // unguarded, this guard did not reduce the assignee's wake count on a closed
+    // row at all: for an assignee who was also @-mentioned it only changed the
+    // REASON the wake arrived under, `issue_commented` -> `issue_comment_mentioned`.
+    // Guarding one arm and not the other does not half-apply the policy; it
+    // disables it and disguises the result.
     if (assigneeId && !selfComment && !isClosedIssueStatus(input.issue.status)) {
       wakeups.set(`${assigneeId}:${input.issue.id}`, {
         agentId: assigneeId,
@@ -4648,6 +4657,34 @@ export function issueRoutes(
       }
     }
     for (const mentionedId of mentionedIds) {
+      // PEN-5846: a mention on a terminal issue raises no wake, exactly as the
+      // assignee arm above refuses one. The canonical statement of that policy is
+      // the comment above `skipAssigneeCommentWake` in the
+      // `router.patch("/issues/:id", ...)` handler: "Terminal issues are closed work
+      // for every agent, including explicitly mentioned peers. Only an explicit
+      // reopen makes the thread actionable again." That decision (PEN-5776) was
+      // implemented at the two unkeyed paths and never reached this one, so until
+      // PEN-5846 passing an `idempotencyKey` was the difference between a closed-row
+      // mention waking someone and not. A dedupe key must not decide reachability.
+      //
+      // No `!reopened` term here, deliberately, and it is not an oversight to be
+      // tidied up later: a keyed comment can never BE a reopen. `addIssueCommentSchema`
+      // (packages/shared/src/validators/issue.ts) refuses `idempotencyKey` together
+      // with `reopen`, `resume` or `interrupt` — "Idempotent comments cannot reopen,
+      // resume, or interrupt issues" — so this path is only ever reached with
+      // `reopened === false` and the extra term would be dead code. The two unkeyed
+      // loops accept a reopen in the same write and genuinely need it. Pinned by
+      // "refuses a keyed comment that also asks to reopen" in
+      // __tests__/issue-update-comment-wakeup-routes.test.ts: if that exclusivity is
+      // ever relaxed, that test fails and this guard needs the term added.
+      //
+      // The GRANT deliberately keeps no status term: `agentHasMentionGrantOnIssue`
+      // never reads the issues table, so a mention still confers `issue:comment` on
+      // a finished row. That asymmetry is the decision, not an oversight — "may this
+      // agent write here" stays yes, "should it run now" becomes no. Do not
+      // "restore" symmetry in either direction. See
+      // docs/security/issue-authorization-model.md, "Who may grant a mention".
+      if (isClosedIssueStatus(input.issue.status)) continue;
       if (!commentAuthorCanGrantIssueMention({
         mentionedAgentId: mentionedId,
         issueAssigneeAgentId: input.issue.assigneeAgentId,
@@ -5161,6 +5198,25 @@ export function issueRoutes(
   // the import plus exactly those three. This comment previously carried raw line
   // numbers; they went stale on the very PR that added this block, which is why
   // they are gone.
+  //
+  // PEN-5846: entitlement is NOT the only gate on a mention wake. The correction
+  // above moved this block's account from "no gate" to "one gate" and stopped
+  // there; there are TWO. Alongside the author predicate, every one of those three
+  // loops suppresses on terminal status (`done`/`cancelled`). At the two unkeyed
+  // loops an explicit reopen in the same write bypasses it; the keyed one cannot
+  // be a reopen at all, so there it is unconditional. A mention can therefore be
+  // written by a fully entitled author, bind, confer a grant, and still wake
+  // nobody, purely because the row is closed. Until PEN-5846 the keyed site
+  // carried the author gate and not the status gate, which made `idempotencyKey`
+  // — a dedupe mechanism — decide whether a closed-row mention reached anyone.
+  //
+  // And the GRANT has neither term: `agentHasMentionGrantOnIssue` filters on
+  // company, issue, `deletedAt` and the `agent://` link, and never reads the
+  // issues table, so it cannot see status at all. That divergence is deliberate.
+  // `(binds) and (grants) and (no wake)` is therefore a permanent, decided class
+  // on every closed row — not a bug to be harmonised away. Note it is the exact
+  // complement of what PEN-5812's `mentionsWithoutGrant` reports, so a receipt
+  // reading `mentionsWithoutGrant: []` does not mean anyone was woken.
   //
   // Pinned by "does not wake a mentioned agent when an agent comment cannot
   // grant reply access" and "does not enqueue a keyed mention wake when an agent

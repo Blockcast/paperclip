@@ -306,6 +306,48 @@ places and only the first is ever reported back to the author. A well-formed
   `server/src/__tests__/issue-update-comment-wakeup-routes.test.ts`;
 - confers **no** grant.
 
+### Entitlement is not the only gate on the wake
+
+Each of those three loops carries a **second**, independent suppression: terminal
+issue status. A mention on a `done` or `cancelled` row raises no wake. At the two
+unkeyed paths an explicit reopen in the same write bypasses it; at
+`buildKeyedCommentEffectIntents` it is unconditional, because `addIssueCommentSchema`
+refuses `idempotencyKey` together with `reopen`/`resume`/`interrupt` — a keyed
+comment can never be a reopen. The policy is stated in the comment above
+`skipAssigneeCommentWake` in the `router.patch("/issues/:id", ...)` handler —
+*"Terminal issues are closed work for every agent, including explicitly mentioned
+peers"* — and it is deliberately broader than the arm it annotates.
+
+⛔ **The grant has neither gate.** `agentHasMentionGrantOnIssue` filters on company,
+issue, `deletedAt` and the `agent://` link; it never reads the issues table, so it
+cannot see status at all. A mention on a closed row therefore **grants
+`issue:comment` and wakes nobody**, permanently and by decision (`PEN-5846`):
+
+| | question it answers | answer on a closed row |
+|---|---|---|
+| grant (`agentHasMentionGrantOnIssue`) | may this agent write here? | **yes** — a finished row is still a row someone may legitimately need to record on |
+| wake (`issue_comment_mentioned`) | should this agent run *now*? | **no** — a closed row holds no monitor, takes no checkout, and expects no status work |
+
+Do not harmonise these. The asymmetry is the design; symmetry in either direction
+breaks one of the two questions.
+
+Two consequences worth stating, because both are silent:
+
+- The remediation this document recommends — *ask the assignee to mention you* —
+  **records without notifying** when the owning row is closed. The assignee does
+  exactly the right thing, access genuinely attaches, and nothing dispatches the
+  agent that asked. It reaches them only if some later run loads the row for its own
+  reasons.
+- `mentionsWithoutGrant` (`PEN-5812`) reports *(binds) ∧ (no grant)*, which is the
+  **complement** of this class. A receipt carrying `mentionsWithoutGrant: []` is
+  byte-identical between "your mention woke them" and "your mention granted them and
+  woke nobody". It is an entitlement signal, not a reachability one.
+
+Before `PEN-5846` the status gate was present at the two unkeyed paths and missing
+from `buildKeyedCommentEffectIntents`, so passing an `idempotencyKey` — a dedupe
+mechanism — decided whether a closed-row mention reached anyone. All three now
+suppress.
+
 So such a mention is **wholly inert, and silent on every surface its author can
 read**: a 201, an empty `unboundMentions`, no wake, no grant, and no field anywhere
 naming the reason. The would-be granter has every available signal saying the
