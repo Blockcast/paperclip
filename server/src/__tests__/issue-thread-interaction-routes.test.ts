@@ -918,6 +918,66 @@ describe.sequential("issue thread interaction routes", () => {
     );
   });
 
+  // PEN-5920: deny_human_assigned_issue is a narrowing of deny_missing_grant
+  // for a row that changed hands to a person. It is the same reassignment case
+  // the fallback above exists for, so the creator must keep its path through —
+  // otherwise narrowing the reason silently strips stale-card cleanup on the
+  // one handover the creator can least undo.
+  it("lets the interaction's creator through when the row is now held by a person", async () => {
+    mockAccessDecide.mockResolvedValueOnce({
+      allowed: false,
+      action: "issue:mutate",
+      reason: "deny_human_assigned_issue",
+      explanation:
+        "This issue is assigned to a person, so generic unassigned-issue access carries " +
+        "issue:comment but not issue:mutate.",
+    });
+    mockInteractionService.getById.mockResolvedValueOnce({
+      id: "interaction-2",
+      createdByAgentId: CREATED_AGENT_ID,
+    });
+    const app = await createApp(AGENT_ACTOR);
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
+      .send({ reason: "Withdrawing my own stale card" });
+
+    expect(res.status).toBe(200);
+    expect(mockInteractionService.getById).toHaveBeenCalledWith("interaction-2");
+    // Withdrawing your own card is not a write to the person's row, and the
+    // service still pins it to the creator in its UPDATE ... WHERE.
+    expect(mockInteractionService.withdrawInteraction).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }),
+      "interaction-2",
+      { reason: "Withdrawing my own stale card" },
+      expect.objectContaining({ agentId: CREATED_AGENT_ID, userId: null }),
+      { requireCreatedByAgentId: CREATED_AGENT_ID },
+    );
+  });
+
+  it("keeps a human-held denial terminal when the caller is not the creator", async () => {
+    mockAccessDecide.mockResolvedValueOnce({
+      allowed: false,
+      action: "issue:mutate",
+      reason: "deny_human_assigned_issue",
+      explanation:
+        "This issue is assigned to a person, so generic unassigned-issue access carries " +
+        "issue:comment but not issue:mutate.",
+    });
+    mockInteractionService.getById.mockResolvedValueOnce({
+      id: "interaction-2",
+      createdByAgentId: "33333333-3333-4333-8333-333333333333",
+    });
+    const app = await createApp(AGENT_ACTOR);
+
+    const res = await request(app)
+      .post("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa/interactions/interaction-2/withdraw")
+      .send({});
+
+    expect(res.status).toBe(403);
+    expect(mockInteractionService.withdrawInteraction).not.toHaveBeenCalled();
+  });
+
   it("keeps the boundary denial when the caller is boundary-denied AND not the creator", async () => {
     mockAccessDecide.mockResolvedValueOnce({
       allowed: false,

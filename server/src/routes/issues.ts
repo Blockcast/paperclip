@@ -15301,8 +15301,20 @@ export function issueRoutes(
     // the agent assignee. The recovery-owner arm cannot apply here at all — it
     // is built only when `allowSourceScopedRecoveryOwner` is passed, and this
     // block already excludes that actor, before and after this change. So no
-    // arm can match a human-held row on any request that reaches this
-    // exemption, and it therefore grants nothing.
+    // OWNERSHIP arm can match a human-held row on a request that reaches this
+    // exemption: checkout answers 409 and the row stays the person's.
+    //
+    // One arm does still apply, and it is not an ownership arm. The BLO-22666
+    // execution-stage participant claim (`allowExecutionStageParticipantClaim`,
+    // `services/issues.ts`) is NOT excluded by this block's condition, so it
+    // reaches here, and it has no `assigneeUserId` term — on a human-held
+    // `in_review` row whose PENDING stage names this agent, it succeeds. That
+    // is correct and is exactly what the base allowed before this change: it
+    // writes the lock columns only (`checkoutRunId` + the execution patch),
+    // leaving `assigneeAgentId`, `assigneeUserId`, `status` and `startedAt`
+    // untouched, and it re-asserts the participant pin inside its own UPDATE.
+    // So the exemption grants a lock to a named stage participant, never
+    // ownership to anyone.
     //
     // (That arm does need an `assigneeUserId` term of its own, on the path that
     // DOES enable it — a live `master` hole, independent of this PR, which
@@ -16030,7 +16042,7 @@ export function issueRoutes(
           // its own, so give a genuine creator one more path through it instead
           // of leaving the card permanently stuck.
           //
-          // Scoped to deny_missing_grant deliberately. Only that reason means
+          // Scoped to the two grant-loss reasons deliberately. Only they mean
           // "this agent lost the issue-level grant", which is the reassignment
           // case above. Other denials are narrower than the agent and creator
           // identity cannot stand in for them: a skill_test or task_bridge key
@@ -16040,8 +16052,24 @@ export function issueRoutes(
           // about whether *this credential* may touch *this* issue. Treating
           // every !allowed alike would let a narrowly scoped key withdraw on
           // an out-of-scope issue purely because its agent authored the card.
+          //
+          // PEN-5920: deny_human_assigned_issue is accepted alongside it. That
+          // reason is a narrowing of deny_missing_grant for the row class this
+          // route's whole exemption is about — the issue changed hands, here to
+          // a person — so excluding it would re-break exactly the stale-card
+          // cleanup BLO-22670 exists to preserve, on the one handover the
+          // creator can least undo. It is safe on the credential-scope test
+          // above because it is a property of the ROW, not of the key: it is
+          // reachable only from decideBase's humanAssignedMutateClaimSuppressed
+          // branch (services/authorization.ts), which sits downstream of the
+          // key-scoped deciders — an out-of-scope key has already returned
+          // deny_scope and never reaches it. Withdrawing your own card is also
+          // not a write to the person's row, and requireCreatedByAgentId below
+          // still pins it to the creator inside the service's UPDATE ... WHERE.
           const createdInteraction =
-            actor.agentId && boundaryDecision.reason === "deny_missing_grant"
+            actor.agentId &&
+            (boundaryDecision.reason === "deny_missing_grant" ||
+              boundaryDecision.reason === "deny_human_assigned_issue")
               ? await issueThreadInteractionService(db).getById(interactionId)
               : null;
           if (!createdInteraction || createdInteraction.createdByAgentId !== actor.agentId) {

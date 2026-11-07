@@ -329,8 +329,20 @@ answers no in the claiming `UPDATE`'s own `WHERE` clause.
 the same-run arm requires the actor to be the agent assignee. The source-scoped
 recovery-owner arm cannot apply here at all: it is built only when
 `allowSourceScopedRecoveryOwner` is passed, and that actor is already exempt
-from this boundary check. So no arm can match a human-held row on any request
-that reaches the exemption; it grants nothing.
+from this boundary check. So no **ownership** arm can match a human-held row on
+a request that reaches the exemption: checkout answers `409` and the row stays
+the person's.
+
+One arm does still apply, and it is not an ownership arm. The `BLO-22666`
+execution-stage participant claim (`server/src/services/issues.ts`) is **not**
+excluded by the boundary block's condition, so it reaches the exemption, and it
+carries no `assigneeUserId` term — on a human-held `in_review` row whose
+**pending** stage names the calling agent, it succeeds. That is correct, and it
+is what the base allowed before this change: the claim writes the lock columns
+only (`checkoutRunId` plus the execution patch), leaving `assigneeAgentId`,
+`assigneeUserId`, `status` and `startedAt` untouched, and it re-asserts the
+participant pin inside its own `UPDATE`. The exemption therefore grants a
+**lock** to a named stage participant, never ownership to anyone.
 
 > That recovery-owner arm separately wants an `assigneeUserId` term of its own,
 > on the path that *does* enable it — a live `master` gap independent of this
@@ -352,6 +364,29 @@ control proving a human-held row refused for **any other** reason still gets its
 ⚠️ This is why the reason is the key and `assigneeUserId` is not. Exempting the
 door on the row's shape would also swallow the `BLO-19094` denial on a
 human-held review/escalation shell, which must stay a 403 with its own message.
+
+### The other consumer: stale-card withdrawal
+
+Checkout is the only caller that *exempts* this denial, but it is not the only
+one that has to recognise it. `POST /issues/:id/interactions/:interactionId/withdraw`
+runs the same `issue:mutate` boundary and, on a grant-loss denial only, lets the
+interaction's genuine creator through to withdraw its own stale card
+(`BLO-22670`). That fallback accepts `deny_human_assigned_issue` alongside
+`deny_missing_grant`, because a row that changed hands **to a person** is the
+same reassignment case the fallback exists for — narrowing the reason without
+teaching this consumer would have silently removed stale-card cleanup on the one
+handover the creator can least undo.
+
+It stays safe on the credential-scope test that fallback is otherwise careful
+about: `deny_human_assigned_issue` is a property of the **row**, not of the key.
+It is reachable only from the `humanAssignedMutateClaimSuppressed` branch of
+`decideBase`, which sits downstream of the `skill_test` and `task_bridge`
+deciders — an out-of-scope key has already returned `deny_scope` and never
+reaches it. Withdrawing your own card is also not a write to the person's row,
+and the service still pins it to the creator inside its `UPDATE ... WHERE`.
+Pinned by a creator-allowed / non-creator-denied pair in
+`issue-thread-interaction-routes.test.ts`, beside the existing `deny_scope`
+control that proves the fallback has not widened.
 
 ### Why it is keyed on `assigneeUserId`
 
@@ -722,9 +757,10 @@ In order of cost. All three are supported today; none requires a code change.
    on a human-held row, so read the hatch as closing the *generic* door, not
    every door. `POST /issues/:id/checkout` also stops acting on this denial
    (`deny_human_assigned_issue`, see "Checkout delegates it" above) — but that
-   one is **not** a residual path: the service's own claim predicate refuses a
-   human-held row unconditionally, so checkout answers `409` rather than taking
-   it.
+   one is **not** a residual path: the service's own claim predicate refuses
+   every *ownership* arm on a human-held row, so checkout answers `409` rather
+   than taking it. The one arm that still succeeds there, the `BLO-22666` stage
+   participant claim, writes the lock columns only and never the assignee.
    ⚠️ Note the residual: clearing the agent assignee **without** setting
    `assigneeUserId` leaves the row genuinely unheld, which is still the
    `allow_company_agent` branch on both actions. The protection comes from the
