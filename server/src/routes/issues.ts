@@ -5256,24 +5256,42 @@ export function issueRoutes(
   // grant to obtain; it names the two routes that actually exist (hatch 1 and the
   // assignment itself) and closes the mention door explicitly, because leaving it
   // unmentioned is what kept sending agents through it.
+  // PEN-5920: this text is the half the agent actually reads. `decideBase` now
+  // returns a dedicated explanation for a row a person holds, but every route
+  // through `assertAgentIssueMutationAllowed` attaches this remediation to the
+  // same 403 `details` — so for `assigneeAgentId: null` with `assigneeUserId`
+  // set, the decision said "comment instead" while this string, one key away,
+  // still offered "have the issue assigned to you". That is precisely the
+  // advice the narrowing exists to withdraw: taking assignment off a person is
+  // how the denial gets worked around rather than answered. Branch the route
+  // clause on who holds the row — a human-held row has one route out, and it is
+  // not reassignment.
   function issueMutationGrantRemediation(input: {
     actorAgentId: string;
     assigneeAgentId: string | null;
+    assigneeUserId: string | null;
     reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
   }): string | null {
     if (input.reason !== "deny_missing_grant") return null;
     if (input.assigneeAgentId === input.actorAgentId) return null;
+    const humanHeld = !input.assigneeAgentId && Boolean(input.assigneeUserId);
     const assigneeClause = input.assigneeAgentId
       ? `This issue is assigned to agent://${input.assigneeAgentId}. `
-      : "";
+      : humanHeld
+        ? `This issue is assigned to a person, not to an agent. `
+        : "";
+    const routeClause = humanHeld
+      ? `The route that works: comment on the issue — the person holding it reads the thread ` +
+        `and makes the write. Do not reassign the row to yourself to get around this.`
+      : `The routes that do work: ask the assignee to make the write for you (they hold every ` +
+        `field), or have the issue assigned to you.`;
     return (
       `Writes to this issue — including its documents — are relationship-gated, not ` +
       `grant-gated. ${assigneeClause}Unlike issue:comment, no grant can satisfy issue:mutate: ` +
       `being @-mentioned here does not authorize it, and neither does managing the assignee, ` +
       `creating the issue, or holding a blocks edge to it — those do not authorize this write. ` +
-      `Do not post an agent:// mention expecting it to grant this; it will not. The routes that ` +
-      `do work: ask the assignee to make the write for you (they hold every field), or have the ` +
-      `issue assigned to you. If you need to record findings the assignee has not promoted yet, ` +
+      `Do not post an agent:// mention expecting it to grant this; it will not. ${routeClause} ` +
+      `If you need to record findings the assignee has not promoted yet, ` +
       `write them on an issue you are assigned to and reference this one. See ` +
       `docs/security/issue-authorization-model.md for the full model.`
     );
@@ -7070,6 +7088,7 @@ export function issueRoutes(
           respondIssueBoundaryDenied(res, boundaryDecision, issueMutationGrantRemediation({
             actorAgentId,
             assigneeAgentId: issue.assigneeAgentId,
+            assigneeUserId: issue.assigneeUserId,
             reason: boundaryDecision.reason,
           }));
           return false;
@@ -7083,6 +7102,7 @@ export function issueRoutes(
         respondIssueBoundaryDenied(res, boundaryDecision, issueMutationGrantRemediation({
           actorAgentId,
           assigneeAgentId: issue.assigneeAgentId,
+          assigneeUserId: issue.assigneeUserId,
           reason: boundaryDecision.reason,
         }));
         return false;
