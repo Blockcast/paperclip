@@ -811,15 +811,28 @@ without re-deciding the model itself:
   itself or to any other agent: denied `tasks:assign` (`PEN-5940`). This is the
   one control in this list whose *bypass was published by another control's own
   error message*: the `issue:mutate` denial recommended "have the issue assigned
-  to you", and `POST /issues/:id/checkout` would have obliged. Two halves, and
-  **each is inert alone** — the predicate lives in `decideBase`'s `tasks:assign`
-  block, and the route must hand it `currentAssigneeUserId` from the live row.
+  to you", and the remediation text now names the holder and withholds that
+  advice instead. The predicate lives in `decideBase`'s `tasks:assign` block and
+  is inert unless the route hands it `currentAssigneeUserId` from the live row,
+  which the **PATCH assignment door** does.
   ⚠️ That field is **not** `assigneeUserId`, which on `tasks:assign` names the
   assignment *target* and is what the low-trust and task-bridge guards read;
   conflating the two re-aims those at the wrong person. The three moves that
   legitimately take a row off a person all bypass this call: a user actor is
   decided in an earlier branch, and the agent-to-creator hand-back and
   workflow-controlled assignment never reach `assertCanAssignTasks`.
+  ⭐ **`POST /issues/:id/checkout` deliberately does not ask this question.**
+  `svc.checkout`'s claim predicate already refuses a human-held row atomically on
+  every branch that writes `assigneeAgentId`, so a `tasks:assign` deny there
+  covers no claim the predicate misses — and it is raised *before* `svc.checkout`,
+  which preempts the stale-execution-lock clear a refused checkout performs on its
+  way out. The route delegates; the predicate enforces. That delegation is only
+  sound because the predicate is complete, which had to be established rather than
+  assumed: the **recovery-owner** branch carried no `assigneeUserId` term until
+  `PEN-5940`, and it is the one claimant that skips *both* route-level gates
+  (`assertCanAssignTasks` and the BLO-22856 `issue:mutate` boundary) by design.
+  Since the claim UPDATE sets `assigneeUserId: null`, a successful claim there did
+  not just take the row — it blanked the person off it.
 - An agent assigned a parent or sibling issue: denied on the target issue.
   Ancestry is not a declared dependency; only a `blocks` edge is.
 - An agent across a `blocks` edge: denied `issue:mutate` — the edge grants a
@@ -877,14 +890,24 @@ The human-held control is pinned in two places on purpose, because a predicate a
 the route that feeds it fail independently and a single test cannot tell them apart:
 **"does not let an agent reassign a row a person holds, to itself or anyone else"**
 in the same file is the predicate, and **"hands the tasks:assign decision the row's
-current human holder on checkout"** plus **"refuses checkout of a row a person
-holds"** in
-`server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts` are the route.
-Reverting either half fails its own pair and leaves the other green — which is the
-whole point: `assigneeUserId` was a hardcoded `null` at that call site, so a
-predicate added without the route change would have passed every unit test and
-denied nothing in production. The remediation half is pinned by **"does not tell an
-agent to take a row a person holds when it denies the write"**.
+current human holder on the PATCH assignment door"** in
+`server/src/__tests__/issue-agent-mutation-ownership-routes.test.ts` is the route
+that feeds it. A predicate added without a route that supplies the field passes
+every unit test and denies nothing in production, which is the failure mode this
+pairing exists to catch.
+
+The **checkout** door is pinned the other way round, because there the enforcement
+is deliberately in the service and not in the authorization layer. Three cases in
+`server/src/__tests__/issue-stale-execution-lock-routes.test.ts` run against a real
+database: **"does not let agent checkout seize an in_review issue assigned to a
+human reviewer"**, **"clears but does not adopt a stale execution lock on an
+in_review issue assigned to a human reviewer"** — which is what a route-level 403
+silently costs, since it fires before the clear — and **"does not let a
+source-scoped recovery owner check out a row a person holds"**, which covers the
+one branch no route-level gate sees. **"delegates a human-held row at checkout to
+the claim predicate rather than denying early"** is the regression guard for the
+preemption itself. The remediation half is pinned by **"does not tell an agent to
+take a row a person holds when it denies the write"**.
 
 Escape hatch 3's scope is pinned by the sibling case **"blocker edge (escape hatch 3)
 gates checkout and in_progress, not done"** in the same describe block. It fails if

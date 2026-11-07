@@ -13,6 +13,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueExecutionDecisions,
+  issueRecoveryActions,
   issueRelations,
   issues,
 } from "@paperclipai/db";
@@ -2854,6 +2855,76 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
       assigneeUserId: reviewerUserId,
       checkoutRunId: null,
       executionRunId: null,
+    });
+  });
+
+  // PEN-5940. The two cases above are refused by `unassignedAgentCheckoutCondition`,
+  // which tests `assigneeUserId` directly. The recovery owner does not go through
+  // that term — it gets its own `activeRecoveryOwnerCondition` — and it is the one
+  // claimant that reaches `svc.checkout` having skipped BOTH route-level gates:
+  // `assertCanAssignTasks` and the BLO-22856 `issue:mutate` boundary are each
+  // deliberately exempted for it, on the stated grounds that the claim predicate
+  // re-validates atomically. So the predicate is the only thing standing here, and
+  // until this test it was not carrying the human-hold term: the UPDATE sets
+  // `assigneeUserId: null`, so the claim did not merely take the row, it blanked
+  // the person off it.
+  it("does not let a source-scoped recovery owner check out a row a person holds", async () => {
+    const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+    const issueId = randomUUID();
+    const reviewerUserId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Human-held row under an active recovery action",
+      status: "in_review",
+      priority: "high",
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    });
+    // The exact shape the route's `allowSourceScopedRecoveryOwnerCheckout` accepts:
+    // active, owned by this agent, and source-scoped to this very issue.
+    await db.insert(issueRecoveryActions).values({
+      companyId,
+      sourceIssueId: issueId,
+      kind: "stranded_assigned_issue",
+      status: "active",
+      ownerType: "agent",
+      ownerAgentId: agentId,
+      cause: "stranded_assigned_issue",
+      fingerprint: `fingerprint-${randomUUID()}`,
+      nextAction: "Diagnose the stranded row.",
+    });
+
+    const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({
+        agentId,
+        expectedStatuses: ["todo", "backlog", "blocked", "in_review"],
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+
+    const row = await db
+      .select({
+        status: issues.status,
+        assigneeAgentId: issues.assigneeAgentId,
+        assigneeUserId: issues.assigneeUserId,
+        checkoutRunId: issues.checkoutRunId,
+      })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    // `assigneeUserId` is the assertion that matters: a successful claim would
+    // have nulled it, which is the row silently ceasing to be human-held.
+    expect(row).toEqual({
+      status: "in_review",
+      assigneeAgentId: null,
+      assigneeUserId: reviewerUserId,
+      checkoutRunId: null,
     });
   });
 
