@@ -48,6 +48,8 @@
     "check:no-raw-nul": "node scripts/check-no-raw-nul.mjs",
     "test:check-no-raw-nul": "node --test scripts/check-no-raw-nul.test.mjs",
     "test:measure-cancelled-monitor-recovery": "node --test scripts/measure-cancelled-monitor-recovery.test.mjs",
+    "test:resolve-base-digest": "node --test scripts/resolve-base-digest.test.mjs",
+    "test:image-base-pinning": "node --test scripts/check-image-base-pinning.test.mjs",
     "test:online-index-registry": "node --test scripts/check-online-index-registry-overlap.test.js",
     "test:fast-uri-advisory": "node --test scripts/fast-uri-advisory.test.js",
     "test:agent-health-preflight": "node --test scripts/agent-health-preflight.test.mjs",
