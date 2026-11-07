@@ -750,6 +750,53 @@ export const ISSUE_EXECUTION_MONITOR_CLEAR_REASONS = [
 export type IssueExecutionMonitorClearReason = (typeof ISSUE_EXECUTION_MONITOR_CLEAR_REASONS)[number];
 
 /**
+ * PEN-5346: how a cancelled monitor's handoff obligation was discharged.
+ *
+ * `recovery_issue` — a carrier row was created and an agent owns it. This is
+ * the handoff the row's design decided on and the only disposition that hands
+ * the obligation to something that can act.
+ *
+ * `auto_discharged_past_horizon` — the obligation was stamped WITHOUT a
+ * carrier, because the wake it carried had been moot for longer than
+ * {@link CANCELLED_MONITOR_HANDOFF_HORIZON_MS} and the source owned no open
+ * work product. A carrier here buys nothing and costs a full agent run; see
+ * the horizon's own comment in `reconcileCancelledIssueMonitorRecoveries` for
+ * the measurement that motivated it.
+ *
+ * Absent means "stamped before this field existed" — every row the first
+ * deployed passes emitted. That is NOT the same claim as `recovery_issue`, and
+ * the optionality is what keeps the two separable.
+ */
+export const ISSUE_EXECUTION_MONITOR_RECOVERY_DISPOSITIONS = [
+  "recovery_issue",
+  "auto_discharged_past_horizon",
+] as const;
+export type IssueExecutionMonitorRecoveryDisposition =
+  (typeof ISSUE_EXECUTION_MONITOR_RECOVERY_DISPOSITIONS)[number];
+
+/**
+ * PEN-5346: how long after a destroyed wake's own due time the handoff
+ * obligation is still presumed live.
+ *
+ * The handoff exists so that an obligation a cancel destroyed reaches somebody
+ * who can act on it. That presumption decays. Measured on BLO 2026-11-05
+ * (kkroo drive session, 291 carriers created between 11-04 19:34Z and 11-05
+ * 01:44Z): of 24 closed carriers sampled evenly across the 221 then done,
+ * 24/24 closed as "obligation discharged" and NONE carried live work — their
+ * gates pointed at runner pods, alerts and PRs from August to October that no
+ * longer exist. Each of those was a full agent run, and they queue at
+ * `priority: "high"` ahead of real remediation: PlatformSRE held 92 queued
+ * runs, 46 of them carriers, with 89 blocked rows waiting behind them.
+ *
+ * 7 days is deliberately far outside the band this row's defect operates in.
+ * The destructions it was opened for land 1h01m–14h43m BEFORE their due time
+ * and the flapping row re-resolves on a 41-minute median, so every live
+ * obligation is orders of magnitude inside the horizon. What falls outside it
+ * is the historical backfill, which is the population measured inert.
+ */
+export const CANCELLED_MONITOR_HANDOFF_HORIZON_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
  * BLO-18294: which signal the convergence guard fingerprinted for a re-arm.
  *
  * `gates` — the issue's unresolved blocker edges and/or the monitor's declared

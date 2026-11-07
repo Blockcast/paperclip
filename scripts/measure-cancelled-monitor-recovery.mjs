@@ -56,6 +56,11 @@ import { fileURLToPath } from "node:url";
 const LIST_PAGE_LIMIT = 1000;
 const WALK_MAX_PAGES = 1000;
 const CARRIER_ORIGIN_KIND = "stranded_issue_recovery";
+// Mirrors `ISSUE_EXECUTION_MONITOR_RECOVERY_DISPOSITIONS` in @paperclipai/shared.
+// Duplicated as a literal because this script is a standalone .mjs that runs
+// against a deployed API without the workspace build; if the shared value is
+// renamed, this is the line that must move with it.
+const AUTO_DISCHARGED_DISPOSITION = "auto_discharged_past_horizon";
 
 /**
  * Disjunct A — the destroyed-monitor shape this row exists to fix.
@@ -107,6 +112,21 @@ export function isOwnerlessSource(issue) {
   return !issue?.assigneeAgentId;
 }
 
+/**
+ * A row the horizon wrote off: stamped `recoveryEmittedAt` with NO carrier, on
+ * purpose. `hasRecoveryEmitted` cannot tell this apart from a carrier that was
+ * meant to exist and does not, so without this predicate every horizon-drained
+ * row reads as the one failure that falsifies #3352 — and the backfill is
+ * precisely the population the horizon exists to drain, so the instrument would
+ * report hundreds of LOST rows and exit non-zero the moment the fix worked.
+ *
+ * Read off `recoveryDisposition` rather than inferred from "stamped and no
+ * carrier", which is the very reading being disambiguated.
+ */
+export function isAutoDischarged(issue) {
+  return issue?.executionState?.monitor?.recoveryDisposition === AUTO_DISCHARGED_DISPOSITION;
+}
+
 export function classifyRow(issue) {
   const disjunctA = isCancelledClear(issue);
   const disjunctB = isLiveMonitorOnCancelledRow(issue);
@@ -144,6 +164,11 @@ export function summarize(issues) {
  * emit-then-stamp ordering having failed, and it is the only way the pass loses
  * an obligation rather than merely duplicating one.
  *
+ * A row the HORIZON wrote off is excluded from that reading entirely and
+ * reported in its own bucket — see `isAutoDischarged`. It is stamped with no
+ * carrier deliberately, so scoring it as lost would make the instrument report
+ * the drain it was built to confirm as the failure it was built to catch.
+ *
  * The DUAL failure — two carriers for one obligation — is a separate reading and
  * is NOT a falsification of the handoff: a duplicate carrier still carries the
  * obligation. It is reported, not thrown, because the wake idempotency key means
@@ -159,9 +184,29 @@ export function findHandoffFailures(issues, recoveryRows) {
 
   const lost = [];
   const duplicated = [];
+  const autoDischarged = [];
   for (const issue of issues ?? []) {
     if (!hasRecoveryEmitted(issue)) continue;
     const carriers = byOrigin.get(issue.id) ?? [];
+    if (isAutoDischarged(issue)) {
+      // Discharged WITHOUT a carrier by construction, so "no carrier" is the
+      // expected shape here and not a loss. Reported in its own bucket, never
+      // in `lost`, because `lost` is the exit-1 path.
+      //
+      // The carrier count is still carried: a horizon discharge that somehow
+      // DID produce a carrier is an anomaly worth seeing, and asserting zero
+      // here rather than checking it would be assuming the thing under test.
+      autoDischarged.push({
+        id: issue.id,
+        identifier: issue.identifier,
+        carriers: carriers.length,
+        detail:
+          carriers.length === 0
+            ? "auto-discharged past horizon, no carrier (by construction)"
+            : `auto-discharged past horizon, but ${carriers.length} carrier(s) exist`,
+      });
+      continue;
+    }
     if (carriers.length === 0) {
       lost.push({
         id: issue.id,
@@ -176,7 +221,7 @@ export function findHandoffFailures(issues, recoveryRows) {
       });
     }
   }
-  return { lost, duplicated };
+  return { lost, duplicated, autoDischarged };
 }
 
 /**
@@ -370,7 +415,7 @@ async function main() {
   // from the stamp alone, i.e. it trusts the very stamp whose correctness is the
   // thing under test, and a stamp-without-carrier reads as a clean pass.
   const carriers = await walkList(companyId, `&originKind=${CARRIER_ORIGIN_KIND}`);
-  const { lost, duplicated } = findHandoffFailures(issues, carriers);
+  const { lost, duplicated, autoDischarged } = findHandoffFailures(issues, carriers);
 
   // `lost` is the decisive reading, so it is re-checked against a targeted query
   // before it is allowed to exit non-zero. A walk artifact must not be reportable
@@ -395,6 +440,11 @@ async function main() {
 
   for (const row of confirmedLost) console.error(`LOST: ${row.identifier} ${row.detail}`);
   for (const row of duplicated) console.error(`DUPLICATED: ${row.identifier} ${row.detail}`);
+  // Non-fatal and expected to be empty: a horizon discharge builds no carrier,
+  // so one existing means something else emitted against the same source.
+  for (const row of autoDischarged.filter((entry) => entry.carriers > 0)) {
+    console.error(`ANOMALY: ${row.identifier} ${row.detail}`);
+  }
 
   console.log(
     `\ncompany=${companyId} walked=${ids.length} read=${issues.length} ` +
@@ -403,6 +453,7 @@ async function main() {
   );
   console.log(
     `carriers=${carriers.length} lost=${confirmedLost.length} duplicated=${duplicated.length} ` +
+      `auto-discharged=${autoDischarged.length} ` +
       `cancelled-clear-events-on-owed=${clears} carrying-due-time=${withDueTime} ` +
       `unreadable-feeds=${feedFailures.length}`,
   );
