@@ -461,6 +461,14 @@ const K8S_GENERATED_LAYOUT_MIN_WORD_MASS = 8;
  *  alphabet, so this cap costs nothing and stops a 10-character unconstrained
  *  run from riding along behind a word. */
 const K8S_INLINE_GENERATED_MAX_LENGTH = 5;
+/** PEN-6046: how much MID-NAME opaque mass the layout rule admits once the
+ *  pod-template-hash and the 5-character suffix are taken out of the budget.
+ *  One segment of at most K8S_LAYOUT_MAX_INLINE_MASS characters: that is what
+ *  a version or product token inside a chosen service name looks like —
+ *  `orc8r`, `v6`, `k8s`, `ds74`. Measured on a live 1045-pod cluster, raising
+ *  either bound frees no further name, so the caps sit at the knee. */
+const K8S_LAYOUT_MAX_INLINE_SEGMENTS = 1;
+const K8S_LAYOUT_MAX_INLINE_MASS = 5;
 /** PEN-4438 (D7): names whose values take the Kubernetes object-name shape.
  *  BLO-49591 added `namespace` (a DNS-1123 label, e.g. a preview namespace
  *  carrying an issue number) and `node` / `host_name` (a node name, as
@@ -489,8 +497,14 @@ interface K8sNameParts {
 
 /** Split a value into the segment classes the rules below score, or null when
  *  it is not a DNS-1123 subdomain within the structural caps at all. Shared so
- *  that the layout rule cannot drift from the general rule's shape gate. */
-function k8sNameParts(value: string): K8sNameParts | null {
+ *  that the layout rule cannot drift from the general rule's shape gate.
+ *
+ *  PEN-6046: this is the STRUCTURE only. The generated-segment budget lives in
+ *  `k8sNameParts` below, because the two rules price it differently — see
+ *  `k8sGeneratedLayoutBudgetOk`. Everything that decides whether a value is a
+ *  Kubernetes name AT ALL, and how its segments classify, stays here so that
+ *  neither rule can drift from the other on the part that is not a trade. */
+function k8sNameSegments(value: string): K8sNameParts | null {
   if (value.length > K8S_NAME_MAX_LENGTH) return null;
   const labels = value.split(".");
   if (labels.length > K8S_NAME_MAX_LABELS) return null;
@@ -512,9 +526,16 @@ function k8sNameParts(value: string): K8sNameParts | null {
       generatedMass += segment.length;
     }
   }
-  if (generatedSegments > K8S_NAME_MAX_GENERATED_SEGMENTS) return null;
-  if (generatedMass > K8S_NAME_MAX_GENERATED_MASS) return null;
   return { segments, wordMass, generatedSegments, generatedMass };
+}
+
+/** The structure above, plus the GENERAL rule's generated-segment budget. */
+function k8sNameParts(value: string): K8sNameParts | null {
+  const parts = k8sNameSegments(value);
+  if (parts === null) return null;
+  if (parts.generatedSegments > K8S_NAME_MAX_GENERATED_SEGMENTS) return null;
+  if (parts.generatedMass > K8S_NAME_MAX_GENERATED_MASS) return null;
+  return parts;
 }
 
 /** True when a value is a Kubernetes object name or in-cluster DNS name. */
@@ -536,6 +557,12 @@ function isKubernetesObjectName(value: string): boolean {
  *  cluster, the shipped rule refuses 209 of them under `pod=`; this rule
  *  frees 89 and newly blocks none.
  *
+ *  Re-measured 2026-11-07 (PEN-6046) on an independent 1045-name snapshot of
+ *  the same cluster, every name through the WHOLE pipeline as `pod="<name>"`:
+ *  pre-PEN-5921 refuses 200 (19.1%), this rule takes it to 110 (10.5%), and
+ *  k8sGeneratedLayoutBudgetOk below takes it to 51 (4.9%). Neither step
+ *  newly blocks a name.
+ *
  *  Lowering K8S_NAME_MIN_WORD_MASS to 12 was the obvious knob and is REFUSED.
  *  It is name-free in effect — it reaches all eight anchored names — and it
  *  multiplies the escape rate of exactly the shape real API keys take:
@@ -554,6 +581,11 @@ function isKubernetesObjectName(value: string): boolean {
  *  K8S_GENERATED_SEGMENT_RE, any wider mid-name generated segment is too
  *  (K8S_INLINE_GENERATED_MAX_LENGTH), and the word mass reaches
  *  K8S_GENERATED_LAYOUT_MIN_WORD_MASS.
+ *
+ *  What the two POSITIONAL segments cost is priced separately, in
+ *  k8sGeneratedLayoutBudgetOk — read that next. PEN-6046 measured that the
+ *  general rule's budget, applied to them, refused most real Deployment pods
+ *  BEFORE any conjunct listed here was consulted.
  *
  *  Both alphabet conjuncts are FREE on the live cluster: they cost zero real
  *  names out of the 89 this rule frees, and they are what keep the rule from
@@ -580,9 +612,14 @@ function isKubernetesObjectName(value: string): boolean {
  *  K8S_NAME_MAX_GENERATED_MASS: worst case 10 characters over the 27-symbol
  *  alphabet plus a 5-character suffix, ~71 bits — BELOW the ~83 bits the
  *  general rule already admits at word mass 16, and well below the ~141 bits
- *  `isLexicalIdentifier` exonerates under every name in the fleet. This rule
- *  does NOT raise the opaque-mass ceiling; it lowers the word-mass PRICE from
- *  16 to 8, for two layouts, under one binding name.
+ *  `isLexicalIdentifier` exonerates under every name in the fleet.
+ *
+ *  ⛔ PEN-6046. This paragraph used to end `This rule does NOT raise the
+ *  opaque-mass ceiling; it lowers the word-mass PRICE from 16 to 8`. True of
+ *  this rule as PEN-5921 shipped it, FALSE once k8sGeneratedLayoutBudgetOk
+ *  is in the path: the ceiling moves to ~97 bits. It is replaced rather than
+ *  footnoted, because a reader who skims a stated design property and stops
+ *  has already acted on it. The current ceiling is stated on that function.
  *
  *  WHAT IT DELIBERATELY DOES NOT FIX. A hand-written synthetic name such as
  *  `penstock-gateway-rs1-pod1` (word mass 15, one short of the general floor)
@@ -594,7 +631,7 @@ function isKubernetesObjectName(value: string): boolean {
  *  Anchored to `pod` alone. Do not widen the name set without re-reading
  *  PEN-3920 section 4, and never move this shape into a name-free rule. */
 function isGeneratedPodName(value: string): boolean {
-  const parts = k8sNameParts(value);
+  const parts = k8sNameSegments(value);
   if (parts === null) return false;
   if (parts.wordMass < K8S_GENERATED_LAYOUT_MIN_WORD_MASS) return false;
   const { segments } = parts;
@@ -617,13 +654,102 @@ function isGeneratedPodName(value: string): boolean {
   const preceding = segments[segments.length - 2]!;
   if (/^[a-z]+$/.test(preceding) || /^[0-9]+$/.test(preceding)) {
     // <words>-<suffix 5>: DaemonSet, Job, or a bare pod with generateName.
+    // One positional segment — the suffix — is identified, so only it is
+    // exempt from the general budget.
+    return k8sGeneratedLayoutBudgetOk(parts, 1);
+  }
+  // <words>-<pod-template-hash>-<suffix 5>. Two positional segments.
+  if (preceding.length < K8S_POD_TEMPLATE_HASH_MIN_LENGTH) return false;
+  if (preceding.length > K8S_NAME_MAX_GENERATED_LENGTH) return false;
+  if (!K8S_GENERATED_SEGMENT_RE.test(preceding)) return false;
+  return k8sGeneratedLayoutBudgetOk(parts, 2);
+}
+
+/** PEN-6046: the entropy budget the LAYOUT rule spends. Two paths, and the
+ *  disjunction is deliberate and load-bearing: path 1 IS the general rule's
+ *  budget, so this function can only ever ADMIT MORE than the budget shipped
+ *  in #3514 — never less. That is a structural guarantee, not a measurement,
+ *  and it is why the relaxation below cannot introduce a new false positive.
+ *
+ *  `positional` is the number of trailing segments the caller has already
+ *  identified BY POSITION and pinned to K8S_GENERATED_SEGMENT_RE and to a
+ *  fixed width: the suffix alone, or the pod-template-hash and the suffix.
+ *
+ *  WHY PATH 2 EXISTS. The general budget charges the hash and the suffix like
+ *  any other opaque segment, and a real Deployment pod spends 2 of its 2
+ *  permitted generated segments and 15 of its 16 permitted characters on
+ *  them. One more mixed letter/digit segment anywhere in the service name —
+ *  an ordinary version or product token — therefore exhausts the budget
+ *  before any conjunct of the layout rule is consulted. Path 2 takes the two
+ *  segments the LAYOUT has already identified out of the budget and prices
+ *  only what is left, which is the part of the name a human chose.
+ *
+ *  WHAT WAS ACTUALLY REFUSING THESE NAMES. PEN-6046 was filed reporting the
+ *  MASS cap (K8S_NAME_MAX_GENERATED_MASS) as the binding conjunct. Measured
+ *  here by tagging each refusal site in this file rather than by
+ *  reimplementing it, the SEGMENT-COUNT cap is the one that fires first on
+ *  94 of the 101 names the shared gate refused, and the mass cap alone binds
+ *  on exactly ONE. Exempting the positional segments from the mass cap only
+ *  — the candidate as filed — would therefore have freed one name. Path 2
+ *  exempts them from BOTH, which is why it frees 59.
+ *
+ *  THE CEILING, THEN AND NOW — this is the price, and it is a real one.
+ *  PEN-5921 admitted at most a 10-character pod-template-hash and a
+ *  5-character suffix, both over the 27-symbol K8S_GENERATED_SEGMENT_RE
+ *  alphabet: 15 characters, ~71 bits. Path 2 adds up to
+ *  K8S_LAYOUT_MAX_INLINE_MASS mid-name characters which are NOT
+ *  alphabet-constrained (they are below K8S_INLINE_GENERATED_MAX_LENGTH, so
+ *  they are admitted as-is): 20 characters, ~97 bits. That is a genuine rise
+ *  and the sentence on isGeneratedPodName denying one has been withdrawn.
+ *  It remains below the ~141 bits `isLexicalIdentifier` exonerates under
+ *  EVERY binding name in the fleet, which is the comparison that decided it.
+ *
+ *  Measured per 100k random tokens through the WHOLE pipeline under `pod=`,
+ *  each family drawn from its OWN seeded stream so a figure here reproduces
+ *  on its own, PEN-5921 -> with this budget:
+ *
+ *    <w8>-<hash10 hex>-<suf5 hex> .................. 1174 ->  1174
+ *    <w8>-<hash10 b36>-<suf5 b36> ................. 13182 -> 13182
+ *    <w8>-<5 b36>-<hash10 b36>-<suf5 b36> ......... 20551 -> 21325
+ *    <w8>-<6 b36>-<hash10 k8s>-<suf5 k8s> ......... 27972 -> 27972
+ *    <w8>-<5 b36>-<hash10 k8s>-<suf5 k8s> ......... 40855 -> 99843
+ *    <w8>-<5 k8s>-<hash10 k8s>-<suf5 k8s> ......... 42462 -> 99838
+ *    flat b36 @32 / hex @40 / b62 @24 / groups .... unchanged
+ *
+ *  Row 4 is the cap doing its work: one character over
+ *  K8S_LAYOUT_MAX_INLINE_MASS and path 2 declines. Rows 5 and 6 are the
+ *  price, and they are the by-construction case PEN-5921 already accepted —
+ *  an author who CHOOSES the k8s alphabet for both trailing runs now also
+ *  gets the mid-name allowance. Rows 1-3 are the ACCIDENTAL shapes this file
+ *  actually guards (PEN-3920 section 4, PEN-3183), and there the budget
+ *  costs between nothing and 1.04x.
+ *
+ *  THE RESIDUAL. 51 of the 1045 live names stay refused, and the shared
+ *  shape gate is no longer what refuses most of them: 35 fail the layout
+ *  rule's own word-mass floor (`orc8r-accessd-…` musters 7, because `orc8r`
+ *  scores as generated and not as a word), 9 carry a segment wider than
+ *  K8S_NAME_MAX_GENERATED_LENGTH, 5 end in an 8-character `-listener`
+ *  rather than a suffix, and 2 carry a mid-name segment outside the
+ *  alphabet. The agent-container pods (`ac-<uuid>-<uuid>-…`) are in the
+ *  first group and are genuinely uuid-dense; nothing short of the refused
+ *  floor change reaches them. */
+function k8sGeneratedLayoutBudgetOk(parts: K8sNameParts, positional: number): boolean {
+  if (
+    parts.generatedSegments <= K8S_NAME_MAX_GENERATED_SEGMENTS &&
+    parts.generatedMass <= K8S_NAME_MAX_GENERATED_MASS
+  ) {
     return true;
   }
-  // <words>-<pod-template-hash>-<suffix 5>.
+  let inlineSegments = 0;
+  let inlineMass = 0;
+  for (const segment of parts.segments.slice(0, parts.segments.length - positional)) {
+    if (/^[a-z]+$/.test(segment) || /^[0-9]+$/.test(segment)) continue;
+    inlineSegments += 1;
+    inlineMass += segment.length;
+  }
   return (
-    preceding.length >= K8S_POD_TEMPLATE_HASH_MIN_LENGTH &&
-    preceding.length <= K8S_NAME_MAX_GENERATED_LENGTH &&
-    K8S_GENERATED_SEGMENT_RE.test(preceding)
+    inlineSegments <= K8S_LAYOUT_MAX_INLINE_SEGMENTS &&
+    inlineMass <= K8S_LAYOUT_MAX_INLINE_MASS
   );
 }
 

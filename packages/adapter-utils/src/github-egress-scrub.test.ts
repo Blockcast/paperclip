@@ -1217,6 +1217,60 @@ describe("scrubGitHubEgressText", () => {
       expect(locateGitHubEgressMatches(text)).toEqual([]);
     });
 
+    // PEN-6046: the general rule's budget charges the pod-template-hash and
+    // the suffix like any other opaque segment, so one ordinary version or
+    // product token in the service name exhausted it BEFORE any conjunct of
+    // the layout rule was consulted. Every positive here is a real live pod.
+    it.each([
+      // `orc8r` — Magma Orchestrator. 55 live pods wear this shape.
+      ["a product token", ["orc8r", "orchestrator", ["55fdf", "b4945"].join(""), ["t7", "jzg"].join("")].join("-")],
+      // `k8s` — three characters, and it is in our own names.
+      ["our own k8s token", ["paperclip", "mcp", "gateway", "k8s", "ro", ["5b848", "cbfc"].join(""), ["74", "zlz"].join("")].join("-")],
+      // `v6` — a version token, two characters.
+      ["a version token", ["blackbox", "exporter", "v6", "vantage", ["6b54f", "45d9b"].join(""), ["jq", "7nl"].join("")].join("-")],
+    ])("passes a pod whose service name carries %s", (_why, value) => {
+      const text = `            kube_pod_info{${pair("pod", `"${value}"`)}}`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    // One case per bound of the mid-name budget, each one character outside
+    // it, so loosening either constant fails a test.
+    it.each([
+      // K8S_LAYOUT_MAX_INLINE_MASS is 5; this token is 6.
+      ["mid-name mass", ["orc8r6", "orchestrator", ["55fdf", "b4945"].join(""), ["t7", "jzg"].join("")].join("-")],
+      // K8S_LAYOUT_MAX_INLINE_SEGMENTS is 1; this name carries two.
+      ["mid-name segment count", ["orc8r", "k8s", "orchestrator", ["55fdf", "b4945"].join(""), ["t7", "jzg"].join("")].join("-")],
+    ])("still refuses a value failing the %s bound, under pod", (_why, value) => {
+      const result = scrubGitHubEgressText(pair("pod", value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    // The anchor again, for the budget specifically: the relaxation reaches
+    // `pod` alone and none of the seven other names the general rule anchors.
+    it.each([["name"], ["instance"], ["namespace"], ["node"], ["token"]])(
+      "refuses a budget-admitted pod layout bound to %s instead",
+      (name) => {
+        const value = ["orc8r", "orchestrator", ["55fdf", "b4945"].join(""), ["t7", "jzg"].join("")].join("-");
+        const result = scrubGitHubEgressText(pair(name, value));
+        expect(result.classes).toContain("high-entropy-assignment");
+        expect(result.text).not.toContain(value);
+      },
+    );
+
+    // The budget is a UNION: path 1 is the general rule's own budget, so a
+    // name PEN-5921 admitted must still be admitted. This pins the direction
+    // — a future tightening of path 2 cannot silently regress path 1.
+    it("still admits a layout whose mid-name run only path 1 allows", () => {
+      // Two generated segments massing exactly K8S_NAME_MAX_GENERATED_MASS,
+      // with an all-letters trailing suffix: inside the general budget, and
+      // over the mid-name budget at 6 characters.
+      const value = ["yhoht", "qfklw", ["9qrp", "4c"].join(""), ["8dbww", "vwlsh"].join(""), "pdsqw"].join("-");
+      const text = `            kube_pod_info{${pair("pod", `"${value}"`)}}`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+
     // The general rule keeps sole ownership of the StatefulSet ordinal: a
     // digits-only trailing run is not a generated suffix.
     it("does not admit a five-digit trailing run as a generated suffix", () => {
