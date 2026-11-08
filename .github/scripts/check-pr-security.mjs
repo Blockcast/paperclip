@@ -22,6 +22,27 @@ const SECRET_PATTERNS = [
   { name: 'Google API key', re: /AIza[0-9A-Za-z\-_]{35}/ },
   { name: 'AWS access key', re: /AKIA[0-9A-Z]{16}/ },
   { name: 'Private key', re: /-----BEGIN (RSA|EC|OPENSSH) PRIVATE KEY-----/ },
+  // PEN-6162: this `\s*[=:]\s*` is the only spacing-tolerant reading of an
+  // assignment anywhere in this repo. The push door's ASSIGNMENT_RE
+  // (packages/adapter-utils/src/github-egress-scrub.ts) requires an UNSPACED
+  // `NAME=VALUE`, so an opaque secret in prettier/PEP8/gofmt formatting reaches
+  // this pattern and nothing else. It is NOT a door, in four ways:
+  //   - it never refuses anything — this script exits 0 whether or not it flags
+  //     (see the header), so a flag is a silent advisory;
+  //   - it reads the PR diff, so it never sees a push to a branch with no PR;
+  //   - it is repo-local. Blockcast/onprem-k8s and
+  //     Blockcast/penstock-llm-proxy-core run gitleaks with `useDefault = true`
+  //     (penstock's config states a finding blocks the merge); this repo has no
+  //     .gitleaks.toml and no gitleaks workflow, so this line is all there is;
+  //   - it is name-anchored on detection, which github-egress-scrub.ts
+  //     documents as unsound for exactly that: material hides under names
+  //     nobody enumerated. Measured 2026-11-08, one synthetic value — it flags
+  //     under `SESSION_SIGNING_KEY` and `WEBHOOK_SECRET`, and passes under
+  //     `signingMaterial`, `SEED`, `sig` and `hmacMaterial`. gitleaks' own
+  //     generic-api-key rule is anchored the same way
+  //     (access|auth|api|credential|creds|key|password|secret|token), so the
+  //     sibling repos share that blind spot.
+  // Do not read a green run here as evidence that a secret is not in the diff.
   { name: 'High-entropy secret', re: /[a-zA-Z_]*(key|token|secret|password|credential)[a-zA-Z_]*\s*[=:]\s*["'][^"']{20,}["']/i },
 ];
 

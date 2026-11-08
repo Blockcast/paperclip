@@ -454,6 +454,57 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-6162: the assignment net requires an unspaced NAME=VALUE", () => {
+    // ASSIGNMENT_RE's `=` is literal and adjacent, so a secret written to
+    // prettier/PEP8/gofmt spacing is not matched at all. That gap is accepted
+    // and dated in the detector's own comment block, which also records why
+    // the naive `[ \t]*=[ \t]*` widening is refused and what gates the
+    // affordable variant. These cases pin the gap in BOTH directions: if a
+    // spaced arm lands, the first group goes red and whoever lands it has to
+    // read the PEN-6163 coupling before touching them.
+    //
+    // Assembled at runtime, same convention as the fixtures above: written out
+    // contiguously each unspaced line is material the deployed guard refuses,
+    // which would make this file unpushable.
+    const T = SYNTHETIC_OPAQUE_VALUE;
+    const spaced = (decl: string, name: string) => `${decl}${name} = "${T}"`;
+
+    it.each([
+      ["TypeScript", spaced("const ", "SESSION_SIGNING_KEY")],
+      ["Python", spaced("", "WEBHOOK_SECRET")],
+      ["Go", spaced("var ", "apiSecret")],
+    ])("passes a spaced %s assignment through byte-exact", (_language, text) => {
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+    });
+
+    it.each([
+      ["TypeScript", `const SESSION_SIGNING_KEY="${T}";`],
+      ["dotenv", `WEBHOOK_SECRET=${T}`],
+    ])("still redacts the same bytes unspaced in %s", (_language, text) => {
+      // The positive control. Without it the group above is a mute instrument:
+      // a detector that fired on nothing would pass it just as happily.
+      const result = scrubGitHubEgressText(text);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(T);
+    });
+
+    it("passes a colon-bound value at any spacing (PEN-6167, not the gap above)", () => {
+      // `:` is not `=`, so this never reaches ASSIGNMENT_RE and removing the
+      // space changes nothing. Pinned here so the YAML/JSON gap is not mistaken
+      // for the whitespace one and read as fixed when the spaced arm lands.
+      const spacedText = `webhook_secret: "${T}"`;
+      const tightText = `webhook_secret:"${T}"`;
+      expect(scrubGitHubEgressText(spacedText).text).toBe(spacedText);
+      expect(scrubGitHubEgressText(tightText).text).toBe(tightText);
+      // Control: the detector does read this line — a vendor prefix on the same
+      // shape still redacts, so the pass above is the operator, not blindness.
+      const vendor = `webhook_secret: "ghp_${"A1b2C3d4E5f6G7h8I9j0"}"`;
+      expect(scrubGitHubEgressText(vendor).classes).toContain("vendor-key");
+    });
+  });
+
   describe("BLO-41262 regression: a hyphenated identifier is not a credential", () => {
     // `draft-ramadan-moq-multicast-00` scores 3.74 bits/char, above the 3.5
     // floor, so the entropy test alone read an RFC-XML <seriesInfo> element as
