@@ -448,7 +448,21 @@ const K8S_GENERATED_SEGMENT_RE = /^[bcdfghjklmnpqrstvwxz2456789]+$/;
 const K8S_POD_SUFFIX_LENGTH = 5;
 /** A pod-template-hash as `rand.SafeEncodeString` emits it. The upper bound is
  *  K8S_NAME_MAX_GENERATED_LENGTH; the lower one is what keeps a short opaque
- *  run from standing in for a hash. */
+ *  run from standing in for a hash.
+ *
+ *  ⚠ PEN-5921: 8 is OUR floor, not the emitter's minimum, and the sentence
+ *  above was read as claiming otherwise. `ComputeHash` ends in
+ *  `rand.SafeEncodeString(fmt.Sprint(hasher.Sum32()))`; `fmt.Sprint` of a
+ *  uint32 is its DECIMAL form, 1-10 digits, and SafeEncodeString is
+ *  length-preserving, so the width emitted IS that digit count. 10^7/2^32 of
+ *  hash values — about 1 in 429 — are 7 characters or fewer, and those pods
+ *  stay refused by this bound. Direction is over-redaction, not a leak: the
+ *  push fails closed and the author sees a false positive. The bound stays
+ *  anyway, because lowering it lets any short opaque run stand in for a hash,
+ *  which is the whole thing it exists to stop. A live 1045-pod corpus carried
+ *  no sub-8 hash, which at p = 0.0023 over ~1470 generated segments is the
+ *  expected outcome (P(none) ~ 3%), so the arithmetic is the authority here
+ *  and the corpus is weak evidence either way. */
 const K8S_POD_TEMPLATE_HASH_MIN_LENGTH = 8;
 /** Word mass demanded of a name admitted by the LAYOUT rule below. Half the
  *  general floor, and the price this rule pays; see the residual note. */
