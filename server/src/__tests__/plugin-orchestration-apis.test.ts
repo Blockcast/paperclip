@@ -1235,6 +1235,79 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     ).resolves.toMatchObject({ queued: expect.any(Boolean) });
   });
 
+  /**
+   * PEN-6121 — a dropped wake must name the gate that dropped it.
+   *
+   * The escalation ladder measured 23 of 29 rung wakes undelivered (79.3%) and
+   * could not triage one of them: a throw arrived as prose a plugin could only
+   * substring-match, and `queued: false` was a six-way disjunction with no
+   * discriminator at all. Both halves now carry the SAME vocabulary — the
+   * `writeSkippedRequest` tokens — so one consumer records one cause whichever
+   * way the host lost the wake.
+   */
+  it("names the gate in details.code when a wake is refused for a non-invokable agent", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.update(agents).set({ status: "paused", pauseReason: "manual" }).where(eq(agents.id, agentId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Alert", status: "todo", priority: "critical", assigneeAgentId: agentId,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    // Asserted on `details.code`, not on the message: the message is prose, and
+    // `workerHostErrorData` forwards only `code` to a plugin worker — so `code`
+    // is the only field a plugin can actually branch on.
+    await expect(
+      services.issues.requestWakeup({ issueId, companyId, reason: "alert_escalation_deadline" }),
+    ).rejects.toMatchObject({ details: { code: "agent.not_invokable" } });
+  });
+
+  it("names the gate in undeliveredReason when a wake is declined without throwing", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    // `wakeOnDemand: false` is one of the six gates that resolve `queued: false`
+    // rather than throwing — the larger and quieter half of the dropped wakes.
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { enabled: true, wakeOnDemand: false } } })
+      .where(eq(agents.id, agentId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Alert", status: "todo", priority: "critical", assigneeAgentId: agentId,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await expect(
+      services.issues.requestWakeup({ issueId, companyId, reason: "alert_escalation_deadline" }),
+    ).resolves.toMatchObject({ queued: false, undeliveredReason: "heartbeat.wakeOnDemand.disabled" });
+  });
+
+  /**
+   * ⛔ The converse, and it is the one that fails OPEN: a DELIVERED wake must
+   * report a null cause. A reader who treats a populated `undeliveredReason` as
+   * the outcome, rather than `queued`, would otherwise be right by accident on
+   * the failing path and wrong on the succeeding one.
+   */
+  it("reports no cause when the wake was queued", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db
+      .update(agents)
+      .set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, agentId));
+    await db.insert(heartbeatRuns).values({
+      companyId, agentId, status: "running", invocationSource: "assignment",
+      startedAt: new Date(), lastUsefulActionAt: new Date(), contextSnapshot: {},
+    });
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Alert", status: "todo", priority: "critical", assigneeAgentId: agentId,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    const result = await services.issues.requestWakeup({ issueId, companyId, reason: "alert_escalation_deadline" });
+    expect(result.queued).toBe(true);
+    expect(result.undeliveredReason).toBeNull();
+  });
+
   it("narrows orchestration cost summaries by subtree and billing code", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const rootIssueId = randomUUID();

@@ -282,6 +282,37 @@ export interface AlertStateRecord {
    */
   cancelWithheldForRunId?: string | null;
   cancelWithheldAt?: string | null;
+  /**
+   * PEN-6121 — the agent whose rung wake the host did NOT deliver, so the next
+   * sweep can retry that delivery instead of climbing past someone who was
+   * never actually woken.
+   *
+   * Measured before this existed: 23 of 29 rung wakes (79.3%) never reached a
+   * run, over 11 alert rows, every one with the alert still firing — and two
+   * rows ran the full three-rung ladder with every rung undelivered. The ladder
+   * swallowed each drop by design (a dropped wake must not repeat the rung),
+   * which correctly prevented a comment storm and incorrectly spent the whole
+   * escalation chain on wakes nobody received.
+   *
+   * Set to the agent we tried to wake; `null`/absent once a wake is delivered
+   * or the retry budget is spent. Compared against the issue's CURRENT
+   * assignee, so an operator reassignment retires the marker on its own rather
+   * than retrying a wake for someone who no longer owns the row.
+   */
+  escalationWakePendingAgentId?: string | null;
+  /**
+   * PEN-6121 — consecutive undelivered wakes for `escalationWakePendingAgentId`
+   * at the rung already announced. Bounded by `MAX_WAKE_DELIVERY_RETRIES`.
+   *
+   * ⛔ The bound is what makes this safe without the host telling us whether the
+   * cause is recoverable. `agent.not_invokable` covers `paused` (clears when
+   * someone resumes the seat) and `terminated` (never clears) under one token,
+   * and the host deliberately does not forward the finer status to a worker. An
+   * unbounded retry would therefore pin the ladder on a dead seat forever. A
+   * bounded one costs a terminated seat two extra rung intervals and then
+   * climbs exactly as before.
+   */
+  escalationWakeRetries?: number;
 }
 
 /**

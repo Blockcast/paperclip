@@ -286,10 +286,32 @@ zero delivery failures and zero action, so an `acknowledged` derived from
 successful delivery would restate the defect rather than expose it.
 
 **`refused` and `declined` are the state a three-state model cannot express.**
-The rung posts `"waking current owner <name>"` *before* calling
-`issues.requestWakeup`, and swallows a dropped wake by design so the rung does
-not repeat. The thread is then asserting a wake that never happened. This column
-is where that discrepancy lands; the comment text is deliberately unchanged.
+A rung whose wake the host dropped reached nobody, however complete every other
+surface looks.
+
+⛔ **PEN-6121 — this paragraph used to end "The rung posts `"waking current
+owner <name>"` *before* calling `issues.requestWakeup` … the thread is then
+asserting a wake that never happened; the comment text is deliberately
+unchanged." That is no longer true, and the reason it changed is what this
+column was built to find.** The first read of this table measured **23 of 29**
+rung wakes undelivered — 79.3%, over 11 alert rows, every one with the alert
+still firing, and two rows that ran the full three-rung ladder with not one rung
+delivered. The ladder now attempts the wake *first* and the comment *reports its
+outcome*; an undelivered wake does not spend the rung, and is retried for up to
+`MAX_WAKE_DELIVERY_RETRIES` sweeps before the ladder climbs past the agent it
+announced. Rows observed before that change still carry the old `wake_detail`
+sentence, which says the comment asserted the wake regardless — read
+`wake_detail`, not this README, to tell an old row from a new one.
+
+**`wake_cause` names WHICH gate dropped it** (PEN-6121). `wake_outcome` sizes
+the problem; `wake_cause` triages it, because `refused` and `declined` are each
+a disjunction rather than a diagnosis. The host stamps one vocabulary on both
+halves — the `writeSkippedRequest` tokens, e.g. `agent.not_invokable`,
+`budget.blocked`, `heartbeat.cooldown`, `worktree_execution_cutoff`.
+⛔ **`NULL` means NOT RECORDED** — a row written before this column, a branch
+that attempted no wake, or a host that dropped the wake without naming a cause.
+It never means the wake was delivered; `wake_outcome` is the field that answers
+that, and it has always been `NOT NULL`.
 
 ⛔ **They are two tokens because the host drops a wake in two ways and only one
 of them throws.** `requestWakeup` *rejects* on a terminal status, an unresolved
@@ -316,6 +338,14 @@ SELECT disposition, wake_outcome, count(*)
   FROM plugin_alertmanager_184163d1ba.alert_attendance_observations
  WHERE company_id = $1 AND observed_at > now() - interval '7 days'
  GROUP BY 1, 2 ORDER BY 3 DESC;
+
+-- PEN-6121: WHICH gate dropped the undelivered wakes. `unrecorded` counts rows
+-- written before the cause was plumbed, so that bucket shrinking over time is
+-- the rollout signal.
+SELECT coalesce(wake_cause, 'unrecorded') AS cause, count(*)
+  FROM plugin_alertmanager_184163d1ba.alert_attendance_observations
+ WHERE company_id = $1 AND wake_outcome IN ('refused', 'declined')
+ GROUP BY 1 ORDER BY 2 DESC;
 ```
 
 ⛔ **What this does not do.** It makes non-acknowledgement *visible and
@@ -352,7 +382,7 @@ both are company-scoped by the host from the `companyId` query parameter.
 
 | route | answers |
 |---|---|
-| `GET /attendance-observations/summary` | how many observations exist, by `disposition` and `wake_outcome`, over a window |
+| `GET /attendance-observations/summary` | how many observations exist, by `disposition` and `wake_outcome`, over a window — plus `byWakeCause`, the undelivered wakes grouped by the gate that dropped them (PEN-6121) |
 | `GET /attendance-observations/undelivered` | every pass whose wake never reached a run (`wake_outcome IN ('refused', 'declined')`) |
 
 Both accept `since` (ISO-8601) **or** `sinceHours`; the undelivered listing also

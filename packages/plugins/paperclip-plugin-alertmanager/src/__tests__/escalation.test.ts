@@ -125,9 +125,9 @@ function buildFakeAlertmanagerStore() {
       // PEN-2918 attendance observations are append-only; keep them so tests
       // can assert the determination rather than only its side effects.
       if (text.includes("alert_attendance_observations")) {
-        const [id, company_id, alert_issue_id, alertname, disposition, escalation_attempt, subject_agent_id, wake_outcome, wake_detail, alert_liveness] =
-          params as [string, string, string, string, string, number | null, string | null, string, string | null, string];
-        attendance.push({ id, company_id, alert_issue_id, alertname, disposition, escalation_attempt, subject_agent_id, wake_outcome, wake_detail, alert_liveness });
+        const [id, company_id, alert_issue_id, alertname, disposition, escalation_attempt, subject_agent_id, wake_outcome, wake_detail, alert_liveness, wake_cause] =
+          params as [string, string, string, string, string, number | null, string | null, string, string | null, string, string | null];
+        attendance.push({ id, company_id, alert_issue_id, alertname, disposition, escalation_attempt, subject_agent_id, wake_outcome, wake_detail, alert_liveness, wake_cause });
         return { rowCount: 1 };
       }
       if (text.includes("alertmanager_aggregate_lifecycle_fences")) {
@@ -1739,12 +1739,16 @@ describe("PEN-2918 attendance observations", () => {
   /**
    * C4 — the cell a three-state model does not have.
    *
-   * The comment posted immediately before the wake says "waking current owner
-   * Engineer". The wake is then refused and swallowed. Everything a reader of
-   * the thread can see says the owner was woken; this row is the only place
-   * that says otherwise.
+   * ⛔ PEN-6121 INVERTED THIS ASSERTION, deliberately, and the inversion is the
+   * regression guard. This test used to be named "...while the thread still
+   * claims the owner was woken" and pinned `createComment` containing "waking
+   * current owner Engineer" — it documented the defect rather than a
+   * requirement. The first read of the column it was written to justify found
+   * 23 of 29 rung wakes undelivered (79.3%) with the thread asserting every
+   * one, so the sentence it pinned is the thing that had to go. It now pins
+   * the opposite: the thread must NOT claim a wake that did not happen.
    */
-  it("records a REFUSED wake as such, while the thread still claims the owner was woken", async () => {
+  it("records a REFUSED wake as such, and the thread says so instead of claiming the owner was woken", async () => {
     const store = buildFakeAlertmanagerStore();
     const { ctx, mocks } = sweepContext(due(), "cto", store);
     mocks.issues.requestWakeup = vi.fn(async () => { throw new Error("Issue is not wakeable in status: backlog"); });
@@ -1752,10 +1756,157 @@ describe("PEN-2918 attendance observations", () => {
 
     expect(store.attendance).toHaveLength(1);
     expect(store.attendance[0]).toMatchObject({ disposition: "unattended_rung", wake_outcome: "refused" });
-    // The discrepancy this column exists to expose, pinned from both sides.
-    expect(mocks.issues.createComment).toHaveBeenCalledWith("issue-1", expect.stringContaining("waking current owner Engineer"), "company-1");
+    const [, body] = mocks.issues.createComment.mock.calls[0] as unknown as [string, string, string];
+    expect(body).not.toContain("waking current owner");
+    expect(body).toContain("no run was queued for Engineer");
     // Fixed sentence only — never the raw error, which is operator-readable here.
     expect(String(store.attendance[0].wake_detail)).not.toContain("not wakeable in status");
+    expect(body).not.toContain("not wakeable in status");
+  });
+
+  /**
+   * PEN-6121 — the cause, not just the outcome.
+   *
+   * `refused` is a disjunction (`agent.not_invokable`, `budget.blocked`,
+   * `company.inactive`) and so is `declined` (six gates). The host stamps a
+   * machine-readable token on both halves; the ladder used to drop it by
+   * stringifying the error, which is why `wake_detail` told a reader to look in
+   * a plugin log that did not contain the discriminator.
+   */
+  it("records the host's cause token for a refused wake, from the error data rather than its message", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => {
+      throw Object.assign(new Error("Agent is not invokable in its current state"), {
+        data: { code: "agent.not_invokable" },
+      });
+    });
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance[0]).toMatchObject({ wake_outcome: "refused", wake_cause: "agent.not_invokable" });
+  });
+
+  it("records the host's cause token for a declined wake, from undeliveredReason", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: "heartbeat.cooldown" }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance[0]).toMatchObject({ wake_outcome: "declined", wake_cause: "heartbeat.cooldown" });
+  });
+
+  /**
+   * ⛔ A host predating the cause plumbing omits the field entirely, and
+   * `undefined` must record as NULL rather than as the string "undefined" —
+   * this column is the triage key, and a literal "undefined" bucket would read
+   * as a cause rather than as an absence.
+   */
+  it("records a NULL cause, never the string \"undefined\", when the host names none", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(store.attendance[0].wake_cause).toBeNull();
+  });
+
+  /**
+   * PEN-6121 — an undelivered wake must not spend the rung.
+   *
+   * Two alert rows in the founding measurement (`02f0018c`, `f57196cd`) ran the
+   * FULL three-rung ladder with every rung undelivered: a complete escalation
+   * to the top of the chain in which not one wake reached a run. The ladder
+   * climbed past each agent on the strength of a call that failed.
+   */
+  it("does not advance the rung when the wake was undelivered, and marks it for retry", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: "heartbeat.cooldown" }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, AlertStateRecord, unknown]>;
+    const final = writes[writes.length - 1][1];
+    expect(final.escalationWakePendingAgentId).toBe("engineer");
+    expect(final.escalationWakeRetries).toBe(0);
+  });
+
+  it("retries the delivery on the next sweep without reassigning or re-announcing the rung", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "engineer", escalationWakeRetries: 0 }), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: "heartbeat.cooldown" }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    // The rung was already announced; retrying must not climb to `cto`...
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    // ...nor post a second escalation comment, which would be the comment storm
+    // the CAS ordering exists to prevent.
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    // The determination is still recorded, against the UNCHANGED rung.
+    expect(store.attendance[0]).toMatchObject({ disposition: "unattended_rung", escalation_attempt: 1, wake_outcome: "declined" });
+    const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, AlertStateRecord, unknown]>;
+    expect(writes[0][1].escalationAttempt).toBe(1);
+    expect(writes[writes.length - 1][1].escalationWakeRetries).toBe(1);
+  });
+
+  /**
+   * ⛔ The bound is what makes the retry safe without the host telling us
+   * whether the cause is recoverable: `agent.not_invokable` covers `paused`
+   * (clears) and `terminated` (never clears) under one token. Unbounded retries
+   * would pin the ladder on a dead seat forever.
+   */
+  it("climbs once the retry budget for a rung is spent", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "engineer", escalationWakeRetries: 2 }), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+    expect(store.attendance[0]).toMatchObject({ escalation_attempt: 2 });
+  });
+
+  /**
+   * The marker is compared against the CURRENT assignee, so a row an operator
+   * moved retires it with no special case — re-waking the agent we failed to
+   * reach would be waking someone who no longer owns the row.
+   */
+  it("ignores a retry marker naming an agent who is no longer the assignee", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "someone-else", escalationWakeRetries: 0 }), "cto", store);
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    // Not a retry: the ladder climbs normally.
+    expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+  });
+
+  it("clears the retry marker once a wake is delivered", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "engineer", escalationWakeRetries: 1 }), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: true, runId: "run-1" }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, AlertStateRecord, unknown]>;
+    const final = writes[writes.length - 1][1];
+    expect(final.escalationWakePendingAgentId).toBeNull();
+    expect(final.escalationWakeRetries).toBe(0);
+    // A delivered retry DOES speak up — the thread said the earlier attempt
+    // was not delivered, so it has to say when that is no longer true.
+    const [, body] = mocks.issues.createComment.mock.calls[0] as unknown as [string, string, string];
+    expect(body).toContain("reached the queue on retry");
+  });
+
+  /**
+   * A healthy rung must still cost exactly one state write. The marker write is
+   * a second CAS, and making every rung pay for it would be a regression in the
+   * common case.
+   */
+  it("writes no extra state when a first-attempt wake is delivered", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due(), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: true, runId: "run-1" }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(mocks.state.set).toHaveBeenCalledTimes(1);
   });
 
   /**
@@ -1780,8 +1931,10 @@ describe("PEN-2918 attendance observations", () => {
     // The point of the separate token: this did NOT throw, so the pre-fix
     // implementation reached its `return "enqueued"` on exactly this input.
     expect(store.attendance[0].wake_outcome).not.toBe("enqueued");
-    // Same discrepancy as the refused case, pinned from both sides.
-    expect(mocks.issues.createComment).toHaveBeenCalledWith("issue-1", expect.stringContaining("waking current owner Engineer"), "company-1");
+    // Same inversion as the refused case (PEN-6121), pinned from both sides.
+    const [, declinedBody] = mocks.issues.createComment.mock.calls[0] as unknown as [string, string, string];
+    expect(declinedBody).not.toContain("waking current owner");
+    expect(declinedBody).toContain("no run was queued for Engineer");
     // `declined` must not borrow the refused sentence: nothing threw.
     expect(String(store.attendance[0].wake_detail)).toContain("queued=false");
     expect(String(store.attendance[0].wake_detail)).not.toContain("threw");

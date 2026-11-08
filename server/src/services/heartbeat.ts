@@ -5826,10 +5826,52 @@ class WakeDispatchClaimLostError extends Error {
   }
 }
 
+/**
+ * PEN-6121 — an out-parameter a caller can pass to learn WHY a wake produced no
+ * run, without changing `wakeup`'s return type for the ~dozen callers that do
+ * not care.
+ *
+ * `enqueueWakeup` already records the cause durably (`writeSkippedRequest`
+ * funnels every `return null` gate and both skip-then-throw gates through one
+ * token), and `wakeupWithDispatchRetry` already collects it into
+ * `WakeSuppressionOutcome` so the BLO-18859 delivery counter can label a
+ * suppression. Until now that token died inside the service: `wakeup` resolves
+ * to `null` and the caller is left with a SIX-WAY DISJUNCTION —
+ * `heartbeat.wakeOnDemand.disabled`, the cooldown, `company.inactive`,
+ * `heartbeat.scheduling_suppressed`, `worktree_execution_cutoff`, or a capacity
+ * deferral — which, as PEN-6121 puts it, cannot be triaged.
+ *
+ * An out-parameter rather than a widened return because that is this function's
+ * own established shape: `enqueueWakeup` takes `suppression?:
+ * WakeSuppressionOutcome` for exactly this reason. Every existing caller is
+ * untouched and keeps today's `run | null`.
+ */
+export interface WakeupDispatchOutcome {
+  /**
+   * The `writeSkippedRequest` token naming why no run was enqueued, e.g.
+   * `heartbeat.cooldown`. `null` when a run WAS enqueued, and also `null` on
+   * the (unexpected) path where a gate declined without recording a cause —
+   * absence here means "not recorded", never "no cause".
+   */
+  skipReason: string | null;
+  /**
+   * Late, not lost: a `scheduled_retry` run is committed and the scheduler
+   * re-drives it when provider capacity returns. Callers that treat a null run
+   * as a dropped delivery must not count this one.
+   */
+  providerCapacityDeferred: boolean;
+}
+
 interface WakeupOptions {
   source?: "timer" | "assignment" | "on_demand" | "automation";
   triggerDetail?: "manual" | "ping" | "callback" | "system";
   reason?: string | null;
+  /**
+   * PEN-6121: optional sink filled in by `wakeupWithDispatchRetry` just before
+   * it resolves, so a caller can report WHY a wake was declined. Never read by
+   * the dispatch path — writing to it cannot change what the wake does.
+   */
+  outcomeSink?: WakeupDispatchOutcome;
   payload?: Record<string, unknown> | null;
   idempotencyKey?: string | null;
   /**
@@ -42078,7 +42120,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     if (!company || company.status !== "active") {
       const companyStatus = company?.status ?? "missing";
       if (opts.requestedByActorType === "user") {
-        throw conflict("Company is not active", { status: companyStatus });
+        throw conflict("Company is not active", { status: companyStatus, code: "company.inactive" });
       }
       await writeSkippedRequest("company.inactive", {
         error: `Wake suppressed because company status is ${companyStatus}`,
@@ -42213,6 +42255,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       throw conflict(budgetBlock.reason, {
         scopeType: budgetBlock.scopeType,
         scopeId: budgetBlock.scopeId,
+        code: "budget.blocked",
       });
     }
 
@@ -42228,6 +42271,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         reason: invokability.reason,
         invalidOrgChain: invokability.invalidOrgChain,
         ...invokability.details,
+        code: "agent.not_invokable",
       });
     }
 
@@ -44842,6 +44886,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               cause: suppression.durableSkipReason,
             });
           }
+        }
+        // PEN-6121 — publish the cause to a caller that asked for it. Written
+        // on the resolving path only: a throw carries its own machine-readable
+        // `details.code` (see the three `conflict(...)` gates in
+        // `enqueueWakeup`), so a caller that catches is already served and a
+        // half-filled sink here would be worse than an empty one.
+        if (opts.outcomeSink) {
+          opts.outcomeSink.skipReason = result ? null : suppression.durableSkipReason;
+          opts.outcomeSink.providerCapacityDeferred = !result && suppression.providerCapacityDeferred;
         }
         return result;
       } catch (err) {

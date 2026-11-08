@@ -1602,6 +1602,32 @@ export interface PluginIssueCheckoutOwnership {
 export interface PluginIssueWakeupResult {
   queued: boolean;
   runId: string | null;
+  /**
+   * PEN-6121 — when `queued` is false, the host's own token for WHY no run was
+   * enqueued (e.g. `heartbeat.cooldown`, `company.inactive`,
+   * `worktree_execution_cutoff`). `null` when a run was queued, and also `null`
+   * when the host declined without recording a cause.
+   *
+   * ⛔ Absent/`null` means "not recorded", NEVER "no cause". A host predating
+   * this field omits it entirely, and optional chaining renders that
+   * identically to a recorded `null` — so do not read absence as evidence the
+   * wake succeeded. `queued` is the only field that answers that.
+   *
+   * Exists because `queued: false` alone is a six-way disjunction — heartbeats
+   * disabled, cooldown, inactive company, scheduling suppressed, worktree
+   * cutoff, or a capacity deferral — and a dropped wake whose reason is a
+   * disjunction cannot be triaged. The same vocabulary is used for the
+   * THROWING half: those arrive as `PluginRpcError.data.code` carrying
+   * `agent.not_invokable`, `budget.blocked` or `company.inactive`, so one
+   * consumer can record one cause whichever way the host dropped it.
+   */
+  undeliveredReason?: string | null;
+  /**
+   * PEN-6121 — true when the host committed a `scheduled_retry` run and will
+   * re-drive this wake itself when provider capacity returns. The delivery is
+   * late, not lost, so a caller counting dropped wakes must not count it.
+   */
+  deferredForCapacity?: boolean;
 }
 
 export interface PluginIssueWakeupBatchResult {

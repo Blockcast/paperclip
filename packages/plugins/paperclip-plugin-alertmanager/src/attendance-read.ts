@@ -117,6 +117,16 @@ export interface AttendanceSummary {
   totalIssues: number;
   byDisposition: Record<string, number>;
   byWakeOutcome: Record<string, number>;
+  /**
+   * PEN-6121 — undelivered wakes by the host's cause token, the triage read.
+   *
+   * Scoped to UNDELIVERED rows only: a delivered wake has no cause, and
+   * including `not_attempted` branches would bury the signal under deferrals.
+   * The key `unrecorded` counts undelivered rows whose cause the host did not
+   * name — rows written before the cause was plumbed land there, so this
+   * bucket shrinking over time is itself the rollout signal.
+   */
+  byWakeCause: Record<string, number>;
   buckets: AttendanceSummaryBucket[];
   caveats: readonly string[];
 }
@@ -130,6 +140,15 @@ export interface UndeliveredObservation {
   subjectAgentId: string | null;
   wakeOutcome: WakeOutcome | string;
   wakeDetail: string | null;
+  /**
+   * PEN-6121 — the host's own token for which gate dropped this wake
+   * (`agent.not_invokable`, `heartbeat.cooldown`, …).
+   *
+   * `null` means NOT RECORDED — a row written before the cause was plumbed, or
+   * a host that dropped the wake without naming one. It never means the wake
+   * was delivered: every row on this route is undelivered by construction.
+   */
+  wakeCause: string | null;
   alertLiveness: ObservedAlertLiveness | string;
 }
 
@@ -151,6 +170,7 @@ type UndeliveredRow = {
   subject_agent_id: string | null;
   wake_outcome: string;
   wake_detail: string | null;
+  wake_cause: string | null;
   alert_liveness: string;
 };
 
@@ -316,6 +336,26 @@ export async function summariseAttendance(
     totalObservations += bucket.observations;
   }
 
+  // PEN-6121 — which gate dropped each undelivered wake. Deliberately a second
+  // query rather than a third GROUP BY key on the one above: adding
+  // `wake_cause` there would split every delivered and not_attempted bucket by
+  // a column that is always null for them, multiplying the bucket list for no
+  // information.
+  const causeRows = await ctx.db.query<{ wake_cause: string | null; observations: string | number }>(
+    `SELECT wake_cause, count(*) AS observations
+       FROM ${ctx.db.namespace}.${ATTENDANCE_TABLE}
+      WHERE company_id = $1
+        AND observed_at >= $2
+        AND wake_outcome IN (${undeliveredWakeOutcomeSqlList()})
+      GROUP BY wake_cause
+      ORDER BY count(*) DESC`,
+    [companyId, since.toISOString()],
+  );
+  const byWakeCause: Record<string, number> = {};
+  for (const row of causeRows) {
+    byWakeCause[row.wake_cause ?? "unrecorded"] = int(row.observations);
+  }
+
   // Issue counts do NOT sum across buckets — one issue contributes to several —
   // so the distinct total is read separately rather than derived from them.
   const [totals] = await ctx.db.query<{ issues: string | number }>(
@@ -333,6 +373,7 @@ export async function summariseAttendance(
     totalIssues: totals ? int(totals.issues) : 0,
     byDisposition,
     byWakeOutcome,
+    byWakeCause,
     buckets,
     caveats: SUMMARY_CAVEATS,
   };
@@ -341,11 +382,19 @@ export async function summariseAttendance(
 /**
  * Acceptance question (b): every pass whose wake never reached a run.
  *
- * This is the sharpest read of the set. The rung posts `"waking current owner
- * <name>"` as an issue comment *before* calling `issues.requestWakeup`, and
- * swallows a dropped wake by design so the rung does not repeat — so a row here
- * is a thread that asserts a wake which never happened. Before this route the
- * only way to count them was direct database access.
+ * This is the sharpest read of the set: a row here is a rung whose wake never
+ * reached a run. Before this route the only way to count them was direct
+ * database access.
+ *
+ * ⛔ PEN-6121 — this paragraph used to end "so a row here is a thread that
+ * asserts a wake which never happened", describing the ordering defect that
+ * made the first reading of this table (23 of 29 undelivered, 79.3%) so
+ * alarming. That is now false and deliberately not restated: the rung attempts
+ * the wake first and the comment reports the outcome. A row here still means
+ * the wake was not delivered — it no longer means the thread claimed otherwise.
+ * Rows observed before that change DO carry the old `wake_detail` sentence,
+ * which says so in as many words; read `wake_detail`, not this comment, to tell
+ * an old row from a new one.
  */
 export async function listUndeliveredWakes(
   ctx: PluginContext,
@@ -362,6 +411,7 @@ export async function listUndeliveredWakes(
             subject_agent_id,
             wake_outcome,
             wake_detail,
+            wake_cause,
             alert_liveness
        FROM ${ctx.db.namespace}.${ATTENDANCE_TABLE}
       WHERE company_id = $1
@@ -381,6 +431,7 @@ export async function listUndeliveredWakes(
     subjectAgentId: row.subject_agent_id ?? null,
     wakeOutcome: row.wake_outcome,
     wakeDetail: row.wake_detail ?? null,
+    wakeCause: row.wake_cause ?? null,
     alertLiveness: row.alert_liveness,
   }));
 }
