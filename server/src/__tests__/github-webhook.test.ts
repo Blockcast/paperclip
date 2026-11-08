@@ -9136,6 +9136,29 @@ describeEmbeddedPostgres("github-webhook route", () => {
       expect(await send(app, ciDelivery("check_run", 2, "head-rerun", "failure"))).toBe(1);
     });
 
+    it("a green Actions check_run defers to its suite/workflow events without reading settlement (BLO-53662)", async () => {
+      await seedIssueWithIdentifier("BLO-3182");
+      let reads = 0;
+      const app = buildApp({ resolveCiHeadSettlement: async () => { reads += 1; return "settled"; } });
+      const actionsLane = (n: number, conclusion: string, head = "head-actions") => {
+        const d = ciDelivery("check_run", n, head, conclusion);
+        (d.payload.check_run as Record<string, unknown>).app = { slug: "github-actions" };
+        return d;
+      };
+      expect(await send(app, actionsLane(1, "success"))).toBe(0);
+      expect(await send(app, actionsLane(2, "success"))).toBe(0);
+      expect(reads).toBe(0);
+      expect(await send(app, ciDelivery("check_suite", 1, "head-actions", "success"))).toBe(1);
+      expect(reads).toBe(1);
+      // Red is still immediate, and another App's green run still reads.
+      expect(await send(app, actionsLane(3, "failure", "head-actions-red"))).toBe(1);
+      expect(reads).toBe(1);
+      const ally = ciDelivery("check_run", 4, "head-ally", "neutral");
+      (ally.payload.check_run as Record<string, unknown>).app = { slug: "allyblockcast" };
+      expect(await send(app, ally)).toBe(1);
+      expect(reads).toBe(2);
+    });
+
     it("fails open when settlement is unknown, still collapsing to one wake per head", async () => {
       await seedIssueWithIdentifier("BLO-3182");
       const app = buildApp({ resolveCiHeadSettlement: async () => "unknown" });
