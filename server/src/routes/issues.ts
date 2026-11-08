@@ -219,6 +219,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  ISSUE_WAKE_DIAGNOSTICS_STATEMENT_TIMEOUT_MS,
   listBlockedDependentIssueIds,
   recomputeBlockedIssuesStatusIfReady,
 } from "../services/issues.js";
@@ -1853,10 +1854,28 @@ function buildIssueWakeDiagnosis(input: {
   events: IssueWakeDiagnosticEvent[];
   blockerDiagnostics: IssueBlockerDiagnosticsResponse;
   truncated: boolean;
+  degradedSections?: { wakeRequests: boolean; activityRecords: boolean };
   maxWakeRequests: number;
   maxActivityRecords: number;
   lookbackDays: number;
+  statementTimeoutMs?: number;
 }) {
+  // PEN-6085: degradation is reported FIRST and outranks truncation. A degraded
+  // section was not read at all, so every downstream branch here -- all of which
+  // reason from `events[0]` -- would be drawing a confident conclusion from an
+  // incomplete list. Saying "the most recent wake was X" when the wake table
+  // could not be read is exactly the wrong answer for an audit surface.
+  const degraded = input.degradedSections;
+  if (degraded?.wakeRequests || degraded?.activityRecords) {
+    const missing = [
+      degraded.wakeRequests ? "wake requests" : null,
+      degraded.activityRecords ? "activity records" : null,
+    ].filter((part): part is string => part !== null);
+    return `Wake diagnostics for ${blockerDiagnosticLabel(input.issue)} are INCOMPLETE: ${missing.join(
+      " and ",
+    )} could not be read within ${input.statementTimeoutMs ?? 0}ms and were returned empty. Absence of events in a degraded section is not evidence that none exist.`;
+  }
+
   if (input.truncated) {
     return `Wake diagnostics for ${blockerDiagnosticLabel(input.issue)} are truncated to ${
       input.maxWakeRequests
@@ -1946,7 +1965,9 @@ function buildIssueWakeDiagnosis(input: {
   return null;
 }
 
-function buildIssueWakeDiagnosticsResponse(input: {
+/** Exported for tests (PEN-6085): the degraded/truncated precedence is a
+ *  deliberate ordering and regressing it would re-hide an unreadable section. */
+export function buildIssueWakeDiagnosticsResponse(input: {
   issue: IssueBlockerDiagnosticReadableIssue;
   wakeRequests: Array<{
     agentId: string;
@@ -1972,10 +1993,13 @@ function buildIssueWakeDiagnosticsResponse(input: {
   blockerDiagnostics: IssueBlockerDiagnosticsResponse;
   truncatedWakeRequests: boolean;
   truncatedActivityRecords: boolean;
+  degradedWakeRequests?: boolean;
+  degradedActivityRecords?: boolean;
   includeInternalIds: boolean;
   maxWakeRequests?: number;
   maxActivityRecords?: number;
   lookbackDays?: number;
+  statementTimeoutMs?: number;
 }): IssueWakeDiagnosticsResponse {
   const issue = toIssueBlockerDiagnosticSummary(input.issue);
   const events: IssueWakeDiagnosticEvent[] = [
@@ -1990,14 +2014,22 @@ function buildIssueWakeDiagnosticsResponse(input: {
   const maxWakeRequests = input.maxWakeRequests ?? ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS;
   const maxActivityRecords = input.maxActivityRecords ?? ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS;
   const lookbackDays = input.lookbackDays ?? ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS;
+  const statementTimeoutMs = input.statementTimeoutMs ?? ISSUE_WAKE_DIAGNOSTICS_STATEMENT_TIMEOUT_MS;
+  const degradedSections = {
+    wakeRequests: input.degradedWakeRequests ?? false,
+    activityRecords: input.degradedActivityRecords ?? false,
+  };
+  const degraded = degradedSections.wakeRequests || degradedSections.activityRecords;
   const diagnosis = buildIssueWakeDiagnosis({
     issue,
     events,
     blockerDiagnostics: input.blockerDiagnostics,
     truncated,
+    degradedSections,
     maxWakeRequests,
     maxActivityRecords,
     lookbackDays,
+    statementTimeoutMs,
   });
 
   return {
@@ -2012,10 +2044,13 @@ function buildIssueWakeDiagnosticsResponse(input: {
       wakeRequests: input.truncatedWakeRequests,
       activityRecords: input.truncatedActivityRecords,
     },
+    degraded,
+    degradedSections,
     caps: {
       maxWakeRequests,
       maxActivityRecords,
       lookbackDays,
+      statementTimeoutMs,
     },
   };
 }
@@ -9979,6 +10014,8 @@ export function issueRoutes(
       blockerDiagnostics: blockerResponse,
       truncatedWakeRequests: wakeDiagnostic.truncatedWakeRequests,
       truncatedActivityRecords: wakeDiagnostic.truncatedActivityRecords,
+      degradedWakeRequests: wakeDiagnostic.degradedWakeRequests,
+      degradedActivityRecords: wakeDiagnostic.degradedActivityRecords,
       includeInternalIds,
     });
 
@@ -9991,6 +10028,8 @@ export function issueRoutes(
         activityRecordCount: response.activityRecordCount,
         internalIdsIncluded: includeInternalIds,
         truncated: response.truncated,
+        degraded: response.degraded,
+        degradedSections: response.degradedSections,
       },
       "issue wake diagnostics read",
     );

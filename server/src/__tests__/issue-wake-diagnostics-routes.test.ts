@@ -24,6 +24,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes, ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS } from "../routes/issues.js";
 import { ISSUE_PARK_EXPIRED_WAKE_REASON } from "../services/issue-park-expiry.js";
+import { ISSUE_WAKE_DIAGNOSTICS_STATEMENT_TIMEOUT_MS } from "../services/issues.js";
 import {
   locklessDeferredWakeDisposition,
   locklessDeferredWakeTerminalError,
@@ -255,6 +256,8 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
       wakeRequestCount: 1,
       activityRecordCount: 0,
       truncated: false,
+      degraded: false,
+      degradedSections: { wakeRequests: false, activityRecords: false },
       caps: { maxWakeRequests: 50, maxActivityRecords: 50, lookbackDays: 14 },
     });
     expect(res.body.events).toHaveLength(1);
@@ -957,7 +960,16 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(res.body.truncated).toBe(true);
     expect(res.body.truncatedSections).toEqual({ wakeRequests: true, activityRecords: false });
     expect(res.body.diagnosis).toContain("truncated to 50 wake requests");
-    expect(res.body.caps).toEqual({ maxWakeRequests: 50, maxActivityRecords: 50, lookbackDays: 14 });
+    expect(res.body.caps).toEqual({
+      maxWakeRequests: 50,
+      maxActivityRecords: 50,
+      lookbackDays: 14,
+      statementTimeoutMs: ISSUE_WAKE_DIAGNOSTICS_STATEMENT_TIMEOUT_MS,
+    });
+    // PEN-6085: a capped read is TRUNCATED, never DEGRADED. The two must stay
+    // distinguishable -- this is the whole point of carrying both flags.
+    expect(res.body.degraded).toBe(false);
+    expect(res.body.degradedSections).toEqual({ wakeRequests: false, activityRecords: false });
   });
 });
 
