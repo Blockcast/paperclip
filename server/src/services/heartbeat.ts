@@ -7705,6 +7705,21 @@ const CANONICAL_UUID_PATTERN =
  * whose run has NOT finished for the same reason -- the watermark is write-once, so an
  * attribution derived from partial activity would be frozen wrong.
  *
+ * That ordering has a visible cost, stated here rather than left to be rediscovered:
+ * between a cost event being written and its run finishing, a row carrying NO write-time
+ * `project_id` is attributed to nothing, so `costs/by-project` drops it. The deleted
+ * read-time join attributed those rows live. Rows that DO carry a write-time
+ * `project_id` are unaffected -- `coalesce(project_id, attributed_project_id)` returns
+ * them immediately. The window is therefore one run's remaining lifetime, for its
+ * unscoped events only, and it closes by itself.
+ *
+ * A run that dies without finalizing does NOT widen that window indefinitely:
+ * `reapOrphanedRunsPeriodic` (index.ts, every scheduler tick, `staleThresholdMs` 5 min)
+ * finalizes it `failed` with `finished_at` set, after which the backfill stamps its rows
+ * on the next pass. So the deferral needs no age bound of its own, and must not grow one
+ * -- an age bound would stamp a run that is merely slow, which is the frozen-partial
+ * attribution this ordering exists to prevent.
+ *
  * The ordering here must match `repairCostEventProjectAttribution`
  * (packages/db/src/cost-events-project-attribution-repair.ts) exactly, or a row's
  * attribution would depend on whether the writer or the backfill reached it first.

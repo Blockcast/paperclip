@@ -120,6 +120,18 @@ import type { Db } from "./client.js";
  *
  * `project_id` is READ (to apply step 1) and never WRITTEN. Nothing here may widen the
  * scope `services/budgets.ts` enforces project budget policies on.
+ *
+ * ## What deferral costs while it holds
+ *
+ * A deferred row is attributed to nothing, so `costs/by-project` drops it until its run
+ * is over -- the read-time join this replaces attributed such a row live. Only rows with
+ * NO write-time `project_id` are affected; the rest are returned immediately through
+ * `coalesce(project_id, attributed_project_id)`. The window closes on its own, and a run
+ * that dies without finalizing is finalized for it by `reapOrphanedRunsPeriodic`
+ * (`server/src/index.ts`, every scheduler tick, 5-minute stale threshold), which sets a
+ * terminal status and `finished_at`. That is why there is no age bound here and must not
+ * be one: an age bound would stamp a run that is merely slow, which is exactly the
+ * frozen-partial attribution the deferral exists to prevent.
  */
 export type CostEventProjectAttributionRepairResult = {
   batches: number;
