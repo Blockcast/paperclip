@@ -3067,6 +3067,20 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // sessions.  404 (namespace not found) is treated as a hard failure;
     // other errors (5xx, network) are also surfaced.
     const msg = err instanceof Error ? err.message : String(err);
+    // Pod-stdout record: the run-log line below is invisible to `kubectl logs`,
+    // so before this an unreachable guard left no trace on the worker (BLO-54721).
+    console.warn(
+      JSON.stringify({
+        level: "warn",
+        event: "claude_k8s.concurrency_guard_unreachable",
+        companyId: ctx.agent.companyId,
+        agentId: ctx.agent.id,
+        runId: ctx.runId,
+        namespace: guardNamespace,
+        errorName: err instanceof Error ? err.name : "unknown",
+        error: msg,
+      }),
+    );
     await onLog("stderr", `[paperclip] Concurrency guard failed: unable to list jobs: ${msg}\n`);
     return {
       exitCode: null,
