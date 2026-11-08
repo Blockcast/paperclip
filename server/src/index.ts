@@ -29,7 +29,7 @@ import {
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
   repairIssuesLastActivityDrift,
-  repairCostEventProjectAttribution,
+  startCostEventProjectAttributionRepair,
   reconcilePendingMigrationHistory,
   readInheritedTimeoutSettings,
   formatInheritedTimeoutSettings,
@@ -3164,30 +3164,35 @@ export async function startServer(): Promise<StartedServer> {
     });
   }
 
-  // cost_events run->project attribution backfill (PEN-5937). Fills the column
+  // cost_events run->project attribution repair (PEN-5937). Fills the column
   // `costs/by-project` now reads instead of rebuilding attribution from
   // `activity_log` per request. Deliberately NOT in migration 0276: the
-  // derivation reads activity_log through `issues.id::text`, so in a migration
-  // transaction it is the BLO-51377 shape that froze activity_log writes for
-  // ~35 min. One pass of short autocommit batches per lease acquisition;
-  // idempotent via the `attributed_project_at` watermark, so a drained table
-  // costs one keyset query that reads no activity_log row at all. Stays armed
-  // rather than one-shot: 0276 lands before the image that populates the column
-  // forward, and rows written in that gap have a NULL watermark.
+  // derivation reads activity_log, so in a migration transaction it is the
+  // BLO-51377 shape that froze activity_log writes for ~35 min. Short
+  // autocommit batches, idempotent via the `attributed_project_at` watermark.
+  //
+  // PERIODIC, not once per lease acquisition. The forward writer
+  // (`resolveLedgerScopeForRun`) covers only the rows it writes, and rows that
+  // never get a watermark keep arriving: `POST /companies/:id/cost-events`
+  // takes a `heartbeatRunId` and writes no attribution, a replica on the old
+  // image writes none during a roll, and this repair itself defers rows whose
+  // run is still in flight. Each of those is INVISIBLE to `by-project` until a
+  // pass reaches it -- the inner join drops a NULL effective project -- so at
+  // once-per-lease they would wait for the next deploy or failover. A drained
+  // pass is one scan of `cost_events_unattributed_idx` (0277), the partial
+  // index that holds exactly the rows still awaiting a watermark, and reads no
+  // activity_log row at all.
   if (config.paperclipNodeRole !== "api") {
-    superviseLeased("cost-events-project-attribution-repair", () => {
-      let stopped = false;
-      void repairCostEventProjectAttribution(db as any, {
-        shouldStop: () => stopped,
+    superviseLeased("cost-events-project-attribution-repair", () =>
+      startCostEventProjectAttributionRepair(db as any, 15 * 60 * 1000, {
         onBatchError: (err, afterId) =>
           logger.warn({ err, afterId }, "cost_events project attribution batch failed; skipped"),
-      })
-        .then((result) => logger.info(result, "cost_events project attribution pass finished"))
-        .catch((err) => logger.error({ err }, "cost_events project attribution pass failed"));
-      return () => {
-        stopped = true;
-      };
-    });
+        onPassComplete: (result) =>
+          logger.info(result, "cost_events project attribution pass finished"),
+        onPassError: (err) =>
+          logger.error({ err }, "cost_events project attribution pass failed"),
+      }),
+    );
   }
 
   // Human-gated ageing digest (BLO-29420). Worker-tier singleton. BLO-19130's

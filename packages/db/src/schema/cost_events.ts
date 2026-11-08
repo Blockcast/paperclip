@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { pgTable, uuid, text, timestamp, integer, index } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
@@ -105,5 +106,18 @@ export const costEvents = pgTable(
     // BLO-47753: per-issue cost rollups. Without it the generic plan filters
     // issue_id through the heartbeat-run index (~2 s/call at 431k rows).
     companyIssueIdx: index("cost_events_company_issue_idx").on(table.companyId, table.issueId),
+    // PEN-5937 (migration 0277): the keyset driver for
+    // `repairCostEventProjectAttribution`, which runs on an interval rather than once per
+    // lease acquisition and would otherwise walk the whole primary key heap-fetching a
+    // column no index carries. PARTIAL on the repair's own predicate, so it holds only
+    // rows still awaiting a watermark -- largest during the initial backfill, then
+    // collapsing to the few rows deferred because their run is still in flight.
+    //
+    // Deliberately NOT company-scoped: the repair is a fleet-wide drain with no company
+    // in its predicate, and adding one would make the index unusable for the only query
+    // that reads it.
+    unattributedIdx: index("cost_events_unattributed_idx")
+      .on(table.id)
+      .where(sql`${table.attributedProjectAt} is null`),
   }),
 );
