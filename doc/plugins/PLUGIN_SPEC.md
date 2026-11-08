@@ -929,6 +929,8 @@ Minimum event set:
 - `cost_event.created`
 - `activity.logged`
 
+`agent.run.started` is emitted once per run, when the run is first claimed. A run that is deferred back to the queue (for example behind a Kubernetes isolation writer or a branch claim) and claimed again does not emit it a second time.
+
 Each event must include:
 
 - event id
