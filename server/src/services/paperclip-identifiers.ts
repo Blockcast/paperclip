@@ -29,6 +29,44 @@ export function expandPaperclipIdentifierToken(token: string): string[] {
   return [firstNumber, ...tailNumbers].map((number) => `${prefix}-${number}`);
 }
 
+// PEN-6137: a CVE id is not a Paperclip ref, but its first two components are
+// shaped exactly like one. `CVE-2026-59873` matches the pattern above as
+// `CVE-2026` -- `[A-Z][A-Z0-9]{1,9}` takes `CVE`, `\d{1,6}` takes `2026`, and
+// the trailing `\b` is satisfied because the next character is `-`. The token
+// resolves in no company, so it survives into `unresolvedOwningIdentifiers`
+// and pins `ownerListComplete: false` for the life of the PR -- selectively on
+// security-remediation PRs, which are exactly the ones where recording a
+// constraint on the right owning row matters most.
+//
+// Scoped to the CVE shape rather than to any `A-N-N` continuation, and
+// measurement is what settles that. Over the 1500 most recent commits on
+// master (PR titles and bodies), the broad pattern produces a token
+// immediately followed by `-<digit>` 22 times, across exactly two distinct
+// tokens: `CVE-2026` (16) and `CVE-2023` (6). Nothing else in real PR text has
+// this shape. But over the repo's 916 live branches the same continuation
+// fires twice, and one of them is a REAL ref -- `fix/blo-1489-1490-ssh-probe`,
+// a PR carrying two issues, where a general continuation guard would drop
+// `BLO-1489` and with it the author wake the owning tiers exist to deliver.
+// So the general form is measured lossy and the CVE form is measured lossless.
+//
+// `\d{4,}` is the published CVE format (`CVE-YYYY-NNNN+`), which keeps the
+// guard as narrow as the evidence: a bare `CVE-2026` with no sequence number
+// is still extracted normally, so a company that ever took the `CVE` prefix
+// loses nothing it could otherwise have resolved.
+const CVE_IDENTIFIER_PATTERN = /^CVE-\d{4}-\d{4,}/i;
+
+/**
+ * True when a matched token is only the leading half of a CVE id in `source`.
+ *
+ * Takes the source and the token's own offset rather than the token, because
+ * the token (`CVE-2026`) is indistinguishable from a legitimate identifier
+ * once it has been cut out of its context -- the `-59873` that disqualifies it
+ * is exactly the part the match does not carry.
+ */
+function startsCveIdentifier(source: string, tokenStart: number): boolean {
+  return CVE_IDENTIFIER_PATTERN.test(source.slice(tokenStart));
+}
+
 export function extractPaperclipIdentifiers(...sources: Array<string | null | undefined>): string[] {
   const found = new Set<string>();
   for (const source of sources) {
@@ -36,6 +74,7 @@ export function extractPaperclipIdentifiers(...sources: Array<string | null | un
     const matches = source.matchAll(PAPERCLIP_IDENTIFIER_PATTERN);
     for (const match of matches) {
       if (match[1]) {
+        if (startsCveIdentifier(source, match.index + (match[0].length - match[1].length))) continue;
         for (const identifier of expandPaperclipIdentifierToken(match[1])) {
           found.add(identifier);
         }
@@ -434,6 +473,15 @@ export function extractBranchIdentifiers(branch: string | null | undefined): str
   for (const match of branch.matchAll(BRANCH_IDENTIFIER_PATTERN)) {
     const token = match[1];
     if (!token) continue;
+    // PEN-6137, same guard as the broad extractor. No branch in this repo's
+    // 916 live refs carries a CVE today, so this tier is guarded on structure
+    // rather than on an observed miss: `BRANCH_IDENTIFIER_PATTERN` is
+    // case-insensitive and segment-anchored, so the branch a security fix
+    // actually gets -- `fix/cve-2026-59873-upgrade-tar` -- puts `cve-2026`
+    // right after a `/`, clearing the anchor, with `-` clearing both `\b` and
+    // the version guard. The existing guards here reject a VERSION
+    // continuation (`undici-7.29.0`); this rejects a CVE sequence number.
+    if (startsCveIdentifier(branch, match.index + (match[0].length - token.length))) continue;
     for (const identifier of expandPaperclipIdentifierToken(token.toUpperCase())) {
       found.add(identifier);
     }

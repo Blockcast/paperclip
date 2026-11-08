@@ -37,6 +37,13 @@ const ADMISSION_FRESH_HEAD_MS = 2 * 60 * 1000;
 // with no build step, outside the server's TS project. Keep the two in sync.
 const PAPERCLIP_IDENTIFIER_PATTERN = /\b([a-z][a-z0-9]{1,9}-\d{1,6}(?:\/\d{1,6})*)\b/gi;
 const PAPERCLIP_COMPACT_IDENTIFIER_PATTERN = /^([a-z][a-z0-9]{1,9})-(\d{1,6})((?:\/\d{1,6})*)$/i;
+// PEN-6137: mirrors the CVE guard in the same module. `CVE-2026-59873` matches
+// the pattern above as `CVE-2026` -- the prefix class takes `CVE`, the digits
+// take `2026`, and `\b` is satisfied by the following `-`. This script emits
+// whatever it extracts into a comment body that the webhook's extractor then
+// reads back out, so an unguarded copy here reintroduces the bogus owning
+// identifier by the long way round.
+const CVE_IDENTIFIER_PATTERN = /^CVE-\d{4}-\d{4,}/i;
 
 function expandPaperclipIdentifierToken(token) {
   const match = token.match(PAPERCLIP_COMPACT_IDENTIFIER_PATTERN);
@@ -61,7 +68,10 @@ export function extractPaperclipIdentifiers(...sources) {
   for (const source of sources) {
     if (!source) continue;
     for (const match of source.matchAll(PAPERCLIP_IDENTIFIER_PATTERN)) {
-      if (match[1]) for (const id of expandPaperclipIdentifierToken(match[1])) found.add(id);
+      if (!match[1]) continue;
+      const tokenStart = match.index + (match[0].length - match[1].length);
+      if (CVE_IDENTIFIER_PATTERN.test(source.slice(tokenStart))) continue;
+      for (const id of expandPaperclipIdentifierToken(match[1])) found.add(id);
     }
   }
   return Array.from(found);
