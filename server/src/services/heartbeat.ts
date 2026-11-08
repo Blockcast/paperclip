@@ -3295,8 +3295,17 @@ function brokerEnabledAtAgentScope(baseConfig: Record<string, unknown>): boolean
   return baseConfig.enableGitHubPublishBroker === true;
 }
 
-/** The pinned key set for this run: the unconditional keys, plus the brokered-pod composition keys when the broker is on. */
-function agentScopeOnlyConfigKeysFor(baseConfig: Record<string, unknown>): ReadonlySet<string> {
+/**
+ * The pinned key set for this run: the unconditional keys, plus the
+ * brokered-pod composition keys when the broker is on.
+ *
+ * Exported for `routes/agents.ts`, which refuses an AGENT-authored write of
+ * these same keys on `PATCH /api/agents/:id` (PEN-6188). The two enforcement
+ * points share one definition on purpose: this list's own maintenance
+ * obligation above says it is exactly as complete as its last edit, and two
+ * copies of it would be exactly as complete as the *less* recently edited one.
+ */
+export function agentScopeOnlyConfigKeysFor(baseConfig: Record<string, unknown>): ReadonlySet<string> {
   if (!brokerEnabledAtAgentScope(baseConfig)) return AGENT_SCOPE_ONLY_CONFIG_KEYS;
   return new Set([...AGENT_SCOPE_ONLY_CONFIG_KEYS, ...BROKERED_POD_COMPOSITION_CONFIG_KEYS]);
 }
