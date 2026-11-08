@@ -188,6 +188,20 @@ type PrincipalGrantDecision = AuthorizationDecision & {
  */
 type DependencyEdgeProbe = { held: boolean; nearMiss: boolean };
 
+/**
+ * Outcome of the `agent_mention` check (PEN-6027). Same two-field shape as
+ * `DependencyEdgeProbe` and for the same reason, but `nearMiss` means something
+ * relation-specific and the types are kept apart so each can say what: here it
+ * is true when a live link-form mention of the actor does exist on the target,
+ * but no author of such a mention had standing to grant on it. Never read by
+ * any allow/deny branch.
+ *
+ * Unlike the dependency-edge probe, this one is consumed by two callers with
+ * *different* disclosure entitlements, so `nearMiss` is deliberately not safe
+ * to report everywhere `held` is read — see the call sites.
+ */
+type MentionGrantProbe = { held: boolean; nearMiss: boolean };
+
 function companyIdForResource(resource: AuthorizationResource) {
   return resource.companyId;
 }
@@ -1284,16 +1298,26 @@ export function authorizationService(db: Db) {
       if (await issueResourceWithinLowTrustBoundary(boundary, input.resource)) {
         return lowTrustAllow("Allowed inside the low-trust issue boundary.");
       }
+      // `.held` only, and the `.nearMiss` half is dropped on purpose (PEN-6027).
+      // `decideBase` reports its near miss because every actor who reaches that
+      // branch can already `GET /issues/:id/comments` on the target — `issue:read`
+      // is `allow_company_agent` there, so the message discloses nothing new.
+      // Here that argument is exactly inverted: an actor outside this boundary is
+      // refused `issue:read` on the target by this very function, so naming a
+      // comment on it — that one exists, and that its author lacked standing —
+      // would disclose the existence and provenance of a comment the trust
+      // boundary exists to hide. The stock text below stays unchanged. The near
+      // miss is still logged inside the probe, where only operators see it.
       if (
         input.action !== "issue:mutate" &&
         input.resource.issueId &&
-        await agentHasMentionGrantOnIssue({
+        (await agentHasMentionGrantOnIssue({
           action: input.action,
           companyId: boundary.companyId,
           issueId: input.resource.issueId,
           issueAssigneeAgentId: input.resource.assigneeAgentId ?? null,
           actorAgentId: input.actorAgentId,
-        })
+        })).held
       ) {
         return allowIssueMentionGrant(input.action);
       }
@@ -1569,7 +1593,7 @@ export function authorizationService(db: Db) {
     issueId: string;
     issueAssigneeAgentId: string | null;
     actorAgentId: string;
-  }) {
+  }): Promise<MentionGrantProbe> {
     const rows = await db
       .select({
         id: issueComments.id,
@@ -1620,10 +1644,34 @@ export function authorizationService(db: Db) {
           grantedAction: input.action,
           grant: "issue_mention_comment",
         }, "authorized issue mention-scoped comment grant");
-        return true;
+        return { held: true, nearMiss: false };
       }
     }
-    return false;
+    // Mentions of the actor exist on the target, but none was written by a
+    // principal with standing to grant on it: the actor holds the relation and
+    // missed only the author conjunct (PEN-6027). `mentionRows`, not `rows`, is
+    // the right population — `rows` is the SQL `LIKE` prefilter, which also
+    // matches a bare `agent://<id>` in prose or in a code fence, and the
+    // extractor binds only the markdown link form. A mention that never bound
+    // is not a near miss; the actor holds nothing.
+    //
+    // Logged at BOTH call sites, including the low-trust one that deliberately
+    // suppresses this from its response (see there). Done-when #3 of PEN-6027:
+    // the operator-side record is not gated on the caller's disclosure
+    // entitlement, and the log may be strictly more informative than the 403.
+    if (mentionRows.length > 0) {
+      logger.info({
+        actorAgentId: input.actorAgentId,
+        issueId: input.issueId,
+        companyId: input.companyId,
+        requestedAction: input.action,
+        grant: "agent_mention_comment",
+        candidateMentions: mentionRows.length,
+        failedConjunct: "mention_author_standing",
+      }, "agent mention comment grant near miss: no mention author had standing on the target");
+      return { held: false, nearMiss: true };
+    }
+    return { held: false, nearMiss: false };
   }
 
   function allowIssueMentionGrant(action: AuthorizationAction): AuthorizationDecision {
@@ -2769,18 +2817,22 @@ export function authorizationService(db: Db) {
           explanation: "Allowed because the actor manages the issue assignee in the reporting chain.",
         });
       }
-      if (
-        input.action === "issue:comment" &&
-        resource?.issueId &&
-        await agentHasMentionGrantOnIssue({
+      // Held in a local so the denial below can report a near miss, exactly as
+      // `dependencyEdge` is (PEN-6027). Same predicate, same order, same
+      // outcome as the inline `await` it replaces — only the discarded half of
+      // the result is now kept.
+      let mentionGrant: MentionGrantProbe = { held: false, nearMiss: false };
+      if (input.action === "issue:comment" && resource?.issueId) {
+        mentionGrant = await agentHasMentionGrantOnIssue({
           action: input.action,
           companyId,
           issueId: resource.issueId,
           issueAssigneeAgentId: resource.assigneeAgentId ?? null,
           actorAgentId,
-        })
-      ) {
-        return allowIssueMentionGrant(input.action);
+        });
+        if (mentionGrant.held) {
+          return allowIssueMentionGrant(input.action);
+        }
       }
       if (
         input.action === "issue:comment" &&
@@ -2859,25 +2911,71 @@ export function authorizationService(db: Db) {
         // reachable action instead. Nothing is suppressed: the actor is
         // assigned the issue carrying the edge, so the edge's existence is
         // already theirs to read, and the message adds no state they lack.
-        // Argued for `dependency_edge` only — `agent_mention` has the same
-        // shape but a different disclosure question, and gets its own row.
-        if (dependencyEdge.nearMiss) {
+        //
+        // PEN-6027 added `agent_mention` on its own disclosure argument rather
+        // than by reading this one across, because this one does not transfer:
+        // it is *relational* (the actor owns the edge), and a mention is a
+        // comment on the target, which the actor need hold no relation to. The
+        // argument that does hold there is *structural* — every actor who can
+        // reach this branch can already read the target's comments, authors
+        // included. `issue:read` for a same-company agent is
+        // `allow_company_agent`, `GET /issues/:id/comments` gates on exactly
+        // that and filters no rows, and the three deciders upstream of here
+        // (skill-test, task-bridge, low-trust) either decide `issue:comment`
+        // outright or, for low-trust, return null on an action-independent
+        // trust resolution. So reaching this line implies `issue:read` on the
+        // same resource resolves the same way. ⛔ That is a property of THIS
+        // call site, not of the relation: the low-trust call site is refused
+        // `issue:read` on the target and so must keep suppressing its near
+        // miss — see the comment there. If `issue:read` is ever narrowed below
+        // `allow_company_agent`, this argument lapses and the mention text
+        // below must be reconsidered; the test named for that premise in
+        // `authorization-service.test.ts` is what makes that lapse loud.
+        const nearMissRelations = [
+          ...(mentionGrant.nearMiss ? ["agent_mention"] : []),
+          ...(dependencyEdge.nearMiss ? ["dependency_edge"] : []),
+        ];
+        if (nearMissRelations.length > 0) {
+          // One paragraph per near-missed relation, in `evaluatedRelations`
+          // order. Composed rather than prioritised: reporting only the first
+          // of two live near misses would re-create, one level up, exactly the
+          // collapsing this field exists to undo.
+          const explanation = [
+            ...(mentionGrant.nearMiss
+              ? [
+                "A link-form @-mention of you does exist on this issue, but it was not written by a principal " +
+                "with standing to grant on it, so it confers no reach — otherwise any agent could mint comment " +
+                "access by mentioning itself here. Only this issue's CURRENT assignee, or a board user with " +
+                "active company membership, can grant by mentioning you; an agent can never mention itself in. " +
+                "Note \"current\": standing is re-derived on each request against the assignee as it is now, so " +
+                "a mention written by a previous assignee was valid when posted and lapsed when this issue was " +
+                "reassigned. Re-posting the mention yourself is not a remedy — a self-authored mention is " +
+                "refused by that same guard. The remedy is to ask this issue's current assignee to @-mention " +
+                "you here, in the markdown link form [@you](agent://<your-agent-id>); a bare @name binds nobody " +
+                "and grants nothing.",
+              ]
+              : []),
+            ...(dependencyEdge.nearMiss
+              ? [
+                "A blocks edge does join this issue to a non-terminal issue you are assigned, but no recorded " +
+                "creator of such an edge had standing on this issue, so it confers no reach — otherwise any agent " +
+                "could mint comment access by pointing its own blockedBy at this issue. Re-sending the same " +
+                "dependency will not change that: an unchanged edge keeps its original creator stamp, so " +
+                "re-declaring it is a no-op. Inverting the edge is not a remedy either: it records a " +
+                "dependency that does not hold. The remedy that works in one act is a mention: ask this " +
+                "issue's assignee to @-mention you here, which " +
+                "grants comment access by itself. Re-stamping the edge also works, but it is two writes — the edge " +
+                "must be removed and re-added by a principal with standing on this issue who can also write the " +
+                "blocker set that holds it, which for an edge on your own issue's blocker set means a board user.",
+              ]
+              : []),
+          ].join(" ");
           return deny({
             action: input.action,
             reason: "deny_missing_grant",
-            explanation:
-              "A blocks edge does join this issue to a non-terminal issue you are assigned, but no recorded " +
-              "creator of such an edge had standing on this issue, so it confers no reach — otherwise any agent " +
-              "could mint comment access by pointing its own blockedBy at this issue. Re-sending the same " +
-              "dependency will not change that: an unchanged edge keeps its original creator stamp, so " +
-              "re-declaring it is a no-op. Inverting the edge is not a remedy either: it records a " +
-              "dependency that does not hold. The remedy that works in one act is a mention: ask this " +
-              "issue's assignee to @-mention you here, which " +
-              "grants comment access by itself. Re-stamping the edge also works, but it is two writes — the edge " +
-              "must be removed and re-added by a principal with standing on this issue who can also write the " +
-              "blocker set that holds it, which for an edge on your own issue's blocker set means a board user.",
+            explanation,
             evaluatedRelations: [...ISSUE_COMMENT_EVALUATED_RELATIONS],
-            nearMissRelations: ["dependency_edge"],
+            nearMissRelations,
           });
         }
         return deny({

@@ -217,16 +217,39 @@ Terminal denials:
   *which* part failed. Where the actor came within one conjunct of holding a
   relation, the denial also carries `details.nearMissRelations` — a subset of
   `evaluatedRelations` — and an explanation naming the failed conjunct and the
-  remedy that actually reaches it. Today exactly one relation reports this:
+  remedy that actually reaches it. Two relations report this, and both are
+  conjunctions whose second conjunct is an anti-self-grant guard:
   `dependency_edge`, when a live edge joins T to a non-terminal issue the actor
-  is assigned but no creator of such an edge had standing on T. Without it the
-  two states below are byte-identical, and the stock "no relation holds" text is
-  false for the second — the actor *does* hold the edge:
+  is assigned but no creator of such an edge had standing on T; and
+  `agent_mention`, when a bound link-form mention of the actor sits on T but no
+  author of one had standing to grant on T. Without it the states below collapse
+  pairwise into byte-identical 403s, and the stock "no relation holds" text is
+  false for the near-miss row of each pair — the actor *does* hold the relation:
 
   | state | `nearMissRelations` | remedy |
   |---|---|---|
   | no `blocks` edge reaches T | absent | nothing here reaches T; escalate to an ancestor |
   | edge live, no recorded creator with standing on T | `["dependency_edge"]` | ask T's assignee to **@-mention you on T** — one act, and it grants comment by itself |
+  | no bound mention of the actor on T | absent | nothing here reaches T; escalate to an ancestor |
+  | mention bound, no author with standing on T | `["agent_mention"]` | ask T's **current** assignee to re-post the mention in link form |
+
+  The field is a **list**, and the two near misses compose: an actor can hold
+  both at once, and both are then named, ordered as
+  `ISSUE_COMMENT_EVALUATED_RELATIONS` orders them. Reporting only the
+  highest-priority one would re-create the same collapsing one level up — the
+  reader fixes the named conjunct, retries, and is refused again with no hint
+  the second existed.
+
+  The `agent_mention` remedy says **current** assignee, and that word is
+  load-bearing. Standing is re-derived per request against T's assignee as it is
+  *now*, so a mention written by a *previous* assignee granted correctly when it
+  was posted and lapses the moment T is reassigned. It lands in this branch with
+  nobody at fault, and "ask whoever mentioned you" would send the reader to the
+  one principal who can no longer help. The remedy also has to say *link form*:
+  a bare `agent://<id>` binds nothing, so an actor who only ever received that
+  holds no relation at all and is correctly reported as **absent**, not as a
+  near miss — the SQL `LIKE` in the probe is a prefilter that over-matches, and
+  the near-miss population is the rows the extractor actually bound.
 
   The remedy column says *mention*, not *re-declare the edge from your side*.
   That is the intuitive answer and it is wrong in both directions the edge can
@@ -249,17 +272,60 @@ Terminal denials:
   `PEN-5780` is why: the collapsed answer misdiagnosed two experienced readers
   in one morning and produced a proposed one-line "fix" — drop the creator
   conjunct — whose only satisfiable implementation is a self-grant
-  vulnerability, since that conjunct *is* the anti-self-grant guard. The field
-  is **advisory and additive**: it never changes an allow/deny outcome. A near
-  miss also emits a server-side log line (`grant: "dependency_edge_comment"`,
-  `failedConjunct: "edge_creator_standing"`), as the recovery-handoff TTL lapse
-  already did, so the distinction survives into an operator's logs too.
-  Disclosure was argued per relation, not assumed: naming this conjunct leaks
-  nothing, because the actor is assigned the issue carrying the edge and can
-  already read that the edge exists. `agent_mention` has the same conjunctive
-  shape but a different disclosure question — its grant turns on *who authored*
-  a comment on T, which an actor with no relation to T cannot otherwise read —
-  so it is deliberately **not** reported here and needs its own argument first.
+  vulnerability, since that conjunct *is* the anti-self-grant guard. `PEN-2394`
+  is the same cost for `agent_mention`, and its title records it plainly: *"the
+  `deny_missing_grant` remediation is a no-op"* — the stock text told a reader
+  to post the documented mention, and the documented mention did not grant.
+  The field is **advisory and additive**: it never changes an allow/deny
+  outcome. Each near miss also emits a server-side log line
+  (`grant: "dependency_edge_comment"`, `failedConjunct: "edge_creator_standing"`;
+  `grant: "agent_mention_comment"`, `failedConjunct: "mention_author_standing"`,
+  with the candidate count that is deliberately kept out of the response), as
+  the recovery-handoff TTL lapse already did, so the distinction survives into
+  an operator's logs too.
+
+  **Disclosure is argued per relation, never read across** — and the two
+  arguments here are different, which is why `agent_mention` was held back for
+  its own row rather than patched in alongside `dependency_edge`:
+
+  - `dependency_edge` is **relational**: the actor is assigned the issue
+    carrying the edge, so the edge is already theirs to read and the message
+    adds no state they lack.
+  - `agent_mention` is **structural**: a mention is a comment on T, which the
+    actor need hold no relation to — so the relational argument does not
+    transfer. What holds instead is that *every actor who can reach this branch
+    can already read T's comments*. `issue:read` for a same-company agent is
+    `allow_company_agent`; `GET /issues/:id/comments` gates on exactly that and
+    filters no rows; and the three deciders upstream of this branch either
+    decide `issue:comment` outright (skill-test, task-bridge) or, for
+    low-trust, return `null` on a trust resolution that takes no `action`. So
+    reaching this branch implies `issue:read` on the same resource resolves the
+    same way.
+
+  ⛔ `PEN-6027` filed the second bullet expecting the opposite answer, on the
+  premise — stated as settled in this file before that row — that the mention's
+  author is something *"an actor with no relation to T cannot otherwise read."*
+  **That premise was false and was corrected by measurement, not by argument.**
+  It is recorded here because a disclosure claim that was once written down as
+  settled is the kind a later reader will reuse rather than re-derive.
+
+  ⛔ The structural argument is a property of **this call site**, not of the
+  relation. `agentHasMentionGrantOnIssue` has a second caller inside the
+  low-trust path, where it is exactly inverted: an actor outside its trust
+  boundary is refused `issue:read` on T by that same function, so naming a
+  comment on T would disclose the existence and provenance of a comment the
+  boundary exists to hide. That caller therefore reads only the probe's `held`
+  half and keeps its stock `deny_low_trust_boundary` text; the near miss is
+  still logged, where only operators see it. The suppression is deliberate and
+  pinned by a test, because a reader comparing the two call sites would
+  otherwise "fix" the asymmetry.
+
+  Because the structural argument is contingent on `issue:read` staying
+  `allow_company_agent`, a test pins **the premise** and not just the
+  behaviour: it asserts that an actor refused `issue:comment` with
+  `nearMissRelations: ["agent_mention"]` is allowed `issue:read` on the same
+  resource. Narrowing issue read without re-arguing this would otherwise turn
+  the explanation into a leak silently, with every near-miss test still green.
 - `deny_missing_grant` for `issue:mutate` — returned at the end of the same block
   with `details.evaluatedRelations` (`ISSUE_MUTATE_EVALUATED_RELATIONS`): three
   entries where comment has eight, and the explanation states that no grant and no
@@ -652,6 +718,22 @@ find it:
 - **"grants only on the markdown mention link, not on a bare `agent://` string from the
   same assignee"** — the binding half held against the right author: correct granter,
   wrong form, no grant (`PEN-2394`).
+
+Three further cases pin the *diagnosis* rather than the outcome, added with the
+`agent_mention` near miss (`PEN-6027`). They are listed apart because none of them
+may be relaxed to make an outcome test pass — each one guards a disclosure
+decision, not a grant:
+
+- **"tells an agent-mention near miss apart from no mention at all"** — the two
+  states and the assertion that their 403 bodies are not byte-identical, plus the
+  bound that the explanation names neither the mention's author nor the assignee.
+- **"leaves an agent-mention near miss readable: the actor it refuses `issue:comment`
+  still holds `issue:read`"** — pins the *premise* the disclosure argument rests on,
+  so narrowing issue read cannot silently turn the explanation into a leak. If it
+  reds, re-argue disclosure; do not relax it.
+- **"suppresses the agent-mention near miss for a low-trust actor, which cannot read
+  the target"** — pins the deliberate asymmetry between the two call sites, which
+  otherwise reads as an oversight to be tidied up.
 
 The wake half is pinned in
 `server/src/__tests__/issue-update-comment-wakeup-routes.test.ts` by **"does not wake a

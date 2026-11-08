@@ -5534,6 +5534,287 @@ describeEmbeddedPostgres("authorization service", () => {
       expect(authorizationDeniedDetails(decided).nearMissRelations).toEqual(["dependency_edge"]);
     });
 
+    it("tells an agent-mention near miss apart from no mention at all (PEN-6027)", async () => {
+      // The `dependency_edge` sibling above, for the other conjunctive relation.
+      // Two states, opposite remedies, byte-identical before this:
+      //   no mention    -> nothing here reaches T; escalate.
+      //   author miss   -> a mention of you IS here; ask T's CURRENT assignee
+      //                    to re-post it, because the one you have was written
+      //                    by a principal without standing.
+      // PEN-2394 measured the cost of the collapsed answer directly: it is
+      // titled "the deny_missing_grant remediation is a no-op", because the
+      // stock text sent a reader to post the documented mention and the
+      // documented mention did not grant.
+      const company = await createCompany(db, "Matrix-agent-mention-nearmiss");
+      const owner = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+      const bystander = await createAgent(db, company.id, { role: "engineer" });
+      const target = await createIssue(db, company.id, { title: "Target", assigneeAgentId: owner.id });
+      const authorization = authorizationService(db);
+      const actorPrincipal = {
+        type: "agent", agentId: actor.id, companyId: company.id, source: "agent_jwt",
+      } as const;
+      const resource = {
+        type: "issue",
+        companyId: company.id,
+        issueId: target.id,
+        assigneeAgentId: owner.id,
+        createdByAgentId: null,
+        status: target.status,
+      } as const;
+      const decideComment = () => authorization.decide({
+        actor: actorPrincipal, action: "issue:comment", resource,
+      });
+
+      // State 1: nothing on the issue names the actor at all.
+      const absent = await decideComment();
+      expect(absent.allowed).toBe(false);
+      const absentDetails = authorizationDeniedDetails(absent);
+      expect(absentDetails.evaluatedRelations).toContain("agent_mention");
+      expect(absentDetails).not.toHaveProperty("nearMissRelations");
+
+      // State 2: a well-formed link mention of the actor, written by someone
+      // with no standing on T. This is the shape that misdiagnosed PEN-5334
+      // and PEN-2394 — note the actor did nothing wrong and cannot fix it from
+      // their side, which is exactly why the remedy has to be spelled out.
+      await db.insert(issueComments).values({
+        companyId: company.id,
+        issueId: target.id,
+        body: `[@Actor](agent://${actor.id}) can you look at this?`,
+        authorAgentId: bystander.id,
+      });
+      const nearMiss = await decideComment();
+      expect(nearMiss.allowed).toBe(false);
+      expect(nearMiss.reason).toBe("deny_missing_grant");
+      const nearMissDetails = authorizationDeniedDetails(nearMiss);
+      expect(nearMissDetails.nearMissRelations).toEqual(["agent_mention"]);
+      expect(nearMissDetails.evaluatedRelations).toContain("agent_mention");
+
+      // The point of the row: the two 403 bodies must not be byte-identical.
+      expect(JSON.stringify(nearMissDetails)).not.toBe(JSON.stringify(absentDetails));
+      expect(nearMiss.explanation).not.toBe(absent.explanation);
+
+      // The remediation must name an act the reader can perform, and must say
+      // CURRENT assignee: standing is re-derived per request, so a mention
+      // from a PREVIOUS assignee lands in exactly this branch having been
+      // valid when posted. "Ask whoever mentioned you" would send the reader
+      // to the one principal who can no longer help. Asserted by keyword
+      // rather than by sentence so rewording the prose does not red this.
+      expect(nearMiss.explanation).toMatch(/current/i);
+      expect(nearMiss.explanation).toMatch(/assignee/i);
+
+      // Disclosure bound (PEN-6027 §7): the response says a mention exists and
+      // names the remedy, and stops there. It must NOT name the author or
+      // count the mentions — both are already reachable by the actor's own
+      // read today, so neither buys anything, and both become real leaks the
+      // moment the read premise pinned below lapses. Counts go to the log.
+      expect(nearMiss.explanation).not.toContain(bystander.id);
+      expect(nearMiss.explanation).not.toContain(owner.id);
+    });
+
+    it("leaves an agent-mention near miss readable: the actor it refuses issue:comment still holds issue:read (PEN-6027 disclosure premise)", async () => {
+      // THIS TEST PINS THE DISCLOSURE ARGUMENT, NOT A BEHAVIOUR. The near-miss
+      // text above is permitted only because it discloses nothing the actor
+      // cannot already read: `issue:read` for a same-company agent is
+      // `allow_company_agent`, and `GET /issues/:id/comments` gates on exactly
+      // that and filters no rows, so the refused actor can fetch the mention
+      // verbatim with its author.
+      //
+      // That premise is contingent, and if it is ever narrowed the explanation
+      // becomes a leak with nothing to announce it — the near-miss tests above
+      // would all still pass. This test is the alarm. If it reds, do not relax
+      // it: re-argue the disclosure question on PEN-6027's analysis and narrow
+      // the explanation to match, as the low-trust call site already is.
+      const company = await createCompany(db, "Matrix-agent-mention-read-premise");
+      const owner = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+      const bystander = await createAgent(db, company.id, { role: "engineer" });
+      const target = await createIssue(db, company.id, { title: "Target", assigneeAgentId: owner.id });
+      await db.insert(issueComments).values({
+        companyId: company.id,
+        issueId: target.id,
+        body: `[@Actor](agent://${actor.id}) please take a look`,
+        authorAgentId: bystander.id,
+      });
+      const authorization = authorizationService(db);
+      const actorPrincipal = {
+        type: "agent", agentId: actor.id, companyId: company.id, source: "agent_jwt",
+      } as const;
+      const resource = {
+        type: "issue",
+        companyId: company.id,
+        issueId: target.id,
+        assigneeAgentId: owner.id,
+        createdByAgentId: null,
+        status: target.status,
+      } as const;
+
+      // The near miss is live...
+      const denied = await authorization.decide({
+        actor: actorPrincipal, action: "issue:comment", resource,
+      });
+      expect(denied.allowed).toBe(false);
+      expect(authorizationDeniedDetails(denied).nearMissRelations).toEqual(["agent_mention"]);
+
+      // ...and the same actor, on the same resource, may read it.
+      await expect(authorization.decide({
+        actor: actorPrincipal, action: "issue:read", resource,
+      })).resolves.toMatchObject({ allowed: true, reason: "allow_company_agent" });
+    });
+
+    it("suppresses the agent-mention near miss for a low-trust actor, which cannot read the target (PEN-6027)", async () => {
+      // The one place the disclosure argument inverts. `decideBase` may report
+      // because its actors can read T; a low-trust actor outside its boundary
+      // is refused `issue:read` on T by the very same function, so naming a
+      // comment on T — that one exists, and that its author lacked standing —
+      // would disclose the existence and provenance of a comment the boundary
+      // exists to hide. The probe still computes `nearMiss` and still logs it;
+      // only the response withholds it.
+      //
+      // Pinned because the suppression is DELIBERATE and otherwise looks like
+      // an oversight: a later reader comparing the two call sites would
+      // "fix" the asymmetry by reporting here too.
+      const company = await createCompany(db, "Matrix-agent-mention-lowtrust-suppressed");
+      const allowedProject = await createProject(db, company.id, "LowTrustAllowed");
+      const targetProject = await createProject(db, company.id, "LowTrustTarget");
+      const owner = await createAgent(db, company.id, { role: "engineer" });
+      const bystander = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, {
+        role: "engineer",
+        permissions: {
+          trustPreset: LOW_TRUST_REVIEW_PRESET,
+          authorizationPolicy: {
+            trustBoundary: {
+              mode: LOW_TRUST_REVIEW_PRESET,
+              companyId: company.id,
+              projectIds: [allowedProject.id],
+            },
+          },
+        },
+      });
+      const target = await createIssue(db, company.id, {
+        title: "Target outside the boundary",
+        projectId: targetProject.id,
+        assigneeAgentId: owner.id,
+      });
+      // The same near-miss shape as the reported case above.
+      await db.insert(issueComments).values({
+        companyId: company.id,
+        issueId: target.id,
+        body: `[@Actor](agent://${actor.id}) take a look`,
+        authorAgentId: bystander.id,
+      });
+      const authorization = authorizationService(db);
+      const actorPrincipal = {
+        type: "agent", agentId: actor.id, companyId: company.id, source: "agent_key",
+      } as const;
+      const resource = {
+        type: "issue",
+        companyId: company.id,
+        issueId: target.id,
+        projectId: target.projectId,
+        assigneeAgentId: owner.id,
+        status: target.status,
+      } as const;
+
+      // The premise that makes suppression necessary: this actor cannot read T.
+      await expect(authorization.decide({
+        actor: actorPrincipal, action: "issue:read", resource,
+      })).resolves.toMatchObject({ allowed: false, reason: "deny_low_trust_boundary" });
+
+      const denied = await authorization.decide({
+        actor: actorPrincipal, action: "issue:comment", resource,
+      });
+      expect(denied.allowed).toBe(false);
+      expect(denied.reason).toBe("deny_low_trust_boundary");
+      expect(authorizationDeniedDetails(denied)).not.toHaveProperty("nearMissRelations");
+      expect(denied.explanation).toBe("Issue is outside this low-trust boundary.");
+      expect(denied.explanation).not.toMatch(/mention/i);
+    });
+
+    it("counts only a bound link mention as an agent-mention near miss, not a bare agent:// string (PEN-6027)", async () => {
+      // The SQL `LIKE` in the probe is a prefilter and over-matches: a bare
+      // `agent://<id>` in prose, or one inside a code fence, satisfies it and
+      // binds nothing, because `extractAgentMentionIds` takes only the markdown
+      // link form. Such a comment confers no relation at all, so reporting it
+      // as a near miss would tell an actor they hold something they do not and
+      // send them to ask for a re-post that was never the problem. Absent, not
+      // near miss.
+      const company = await createCompany(db, "Matrix-agent-mention-unbound");
+      const owner = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+      const bystander = await createAgent(db, company.id, { role: "engineer" });
+      const target = await createIssue(db, company.id, { title: "Target", assigneeAgentId: owner.id });
+      await db.insert(issueComments).values({
+        companyId: company.id,
+        issueId: target.id,
+        body: `Granting access: agent://${actor.id}`,
+        authorAgentId: bystander.id,
+      });
+      const authorization = authorizationService(db);
+      const denied = await authorization.decide({
+        actor: { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_jwt" },
+        action: "issue:comment",
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: target.id,
+          assigneeAgentId: owner.id,
+          createdByAgentId: null,
+          status: target.status,
+        },
+      });
+      expect(denied.allowed).toBe(false);
+      expect(authorizationDeniedDetails(denied)).not.toHaveProperty("nearMissRelations");
+    });
+
+    it("reports both near-missed relations rather than only the first (PEN-6027)", async () => {
+      // `nearMissRelations` is a list, and an actor can hold two conjunctive
+      // relations at once. Reporting only the highest-priority one would
+      // re-create, one level up, exactly the collapsing this field exists to
+      // undo: the reader would fix the named conjunct, retry, and be refused
+      // again with no hint the second ever existed.
+      const company = await createCompany(db, "Matrix-near-miss-composition");
+      const owner = await createAgent(db, company.id, { role: "engineer" });
+      const actor = await createAgent(db, company.id, { role: "engineer" });
+      const bystander = await createAgent(db, company.id, { role: "engineer" });
+      const target = await createIssue(db, company.id, { title: "Target", assigneeAgentId: owner.id });
+      const consumer = await createIssue(db, company.id, { title: "Consumer", assigneeAgentId: actor.id });
+      await db.insert(issueComments).values({
+        companyId: company.id,
+        issueId: target.id,
+        body: `[@Actor](agent://${actor.id}) look here`,
+        authorAgentId: bystander.id,
+      });
+      await issueService(db).update(consumer.id, {
+        blockedByIssueIds: [target.id],
+        actorAgentId: actor.id,
+      });
+      const denied = await authorizationService(db).decide({
+        actor: { type: "agent", agentId: actor.id, companyId: company.id, source: "agent_jwt" },
+        action: "issue:comment",
+        resource: {
+          type: "issue",
+          companyId: company.id,
+          issueId: target.id,
+          assigneeAgentId: owner.id,
+          createdByAgentId: null,
+          status: target.status,
+        },
+      });
+
+      expect(denied.allowed).toBe(false);
+      expect(denied.reason).toBe("deny_missing_grant");
+      // Ordered as `ISSUE_COMMENT_EVALUATED_RELATIONS` orders them.
+      expect(authorizationDeniedDetails(denied).nearMissRelations).toEqual([
+        "agent_mention",
+        "dependency_edge",
+      ]);
+      // Both diagnoses are present, not just the first.
+      expect(denied.explanation).toMatch(/blocks edge/i);
+      expect(denied.explanation).toMatch(/link-form @-mention/i);
+    });
+
     it("rewriting a blocker set keeps the original creator stamp on unchanged edges (BLO-30968)", async () => {
       const company = await createCompany(db, "Matrix-dependency-edge-stamp");
       const owner = await createAgent(db, company.id, { role: "engineer" });
