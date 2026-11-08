@@ -1936,6 +1936,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const first = await svc.listRuntimeSkillEntries(companyId);
     const publishedDir = first.find((candidate) => candidate.key === skillKey)!.source;
     await expect(fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8")).resolves.toContain("Atomic Publish");
+    // BLO-54784: an unchanged tree is no longer republished, so change it.
+    await db.update(companySkills).set({ markdown: "# Atomic Publish\n\nMaterialized from DB, v2.\n" }).where(eq(companySkills.id, skillId));
 
     const samples: Array<{ exists: boolean; hasSkillFile: boolean; entries: string[] }> = [];
     const realWriteFile = fs.writeFile;
@@ -1982,6 +1984,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
   // they are cleaned up and that nothing undotted is left behind.
   it("leaves no staging or retired trees behind in __runtime__ (BLO-32167)", async () => {
     const companyId = randomUUID();
+    const skillId = randomUUID();
     const skillKey = `company/${companyId}/staging-cleanup`;
     const missingSkillDir = path.join(await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-staging-cleanup-")), "gone");
     cleanupDirs.add(path.dirname(missingSkillDir));
@@ -1993,7 +1996,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
       requireBoardApprovalForNewAgents: false,
     });
     await db.insert(companySkills).values({
-      id: randomUUID(),
+      id: skillId,
       companyId,
       key: skillKey,
       slug: "staging-cleanup",
@@ -2021,6 +2024,7 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     // path where both a staging and a retired tree exist transiently.
     let publishedDir = "";
     for (let pass = 0; pass < 3; pass += 1) {
+      await db.update(companySkills).set({ markdown: `# Staging Cleanup\n\nPass ${pass}.\n` }).where(eq(companySkills.id, skillId));
       const entries = await svc.listRuntimeSkillEntries(companyId);
       publishedDir = entries.find((candidate) => candidate.key === skillKey)!.source;
     }
@@ -2030,9 +2034,10 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(leftovers).toEqual([path.basename(publishedDir)]);
   });
 
-  // Seeds a DB-backed skill whose local source is gone, so every
-  // `listRuntimeSkillEntries` call re-materializes it into `__runtime__`, and
-  // returns the tree it publishes to.
+  // Seeds a DB-backed skill whose local source is gone, so
+  // `listRuntimeSkillEntries` materializes it into `__runtime__`, and returns
+  // the tree it publishes to. Call `bumpContent` to make the next listing
+  // republish — an unchanged tree is left in place (BLO-54784).
   async function seedRematerializingSkill(companyId: string, slug: string) {
     const skillId = randomUUID();
     const skillKey = `company/${companyId}/${slug}`;
@@ -2073,7 +2078,12 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     const entries = await svc.listRuntimeSkillEntries(companyId);
     const publishedDir = entries.find((candidate) => candidate.key === skillKey)!.source;
     await expect(fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8")).resolves.toContain("Materialized from DB");
-    return { skillId, skillKey, publishedDir };
+    const bumpContent = () =>
+      db
+        .update(companySkills)
+        .set({ markdown: `# ${slug}\n\nMaterialized from DB, republished.\n` })
+        .where(eq(companySkills.id, skillId));
+    return { skillId, skillKey, publishedDir, bumpContent };
   }
 
   // Records every `fs.rm` target while passing the call through, so a test can
@@ -2095,7 +2105,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
   // published ours, so the ENOTEMPTY comes from the kernel, not from a stub.
   it("retires a concurrently published tree by rename on collision, never rm in place (BLO-32167)", async () => {
     const companyId = randomUUID();
-    const { skillKey, publishedDir } = await seedRematerializingSkill(companyId, "collision");
+    const { skillKey, publishedDir, bumpContent } = await seedRematerializingSkill(companyId, "collision");
+    await bumpContent();
 
     let collided = false;
     const realRename = fs.rename;
@@ -2127,7 +2138,8 @@ describeEmbeddedPostgres("companySkillService.list", () => {
   // complete tree back and leave nothing else in `__runtime__`.
   it("restores the previous tree when the publish rename fails (BLO-32167)", async () => {
     const companyId = randomUUID();
-    const { publishedDir } = await seedRematerializingSkill(companyId, "rollback");
+    const { publishedDir, bumpContent } = await seedRematerializingSkill(companyId, "rollback");
+    await bumpContent();
 
     let failed = false;
     const realRename = fs.rename;
@@ -2148,6 +2160,47 @@ describeEmbeddedPostgres("companySkillService.list", () => {
     expect(failed).toBe(true);
     await expect(fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8")).resolves.toContain("Materialized from DB");
     expect(await fs.readdir(path.dirname(publishedDir))).toEqual([path.basename(publishedDir)]);
+  });
+
+  // BLO-54784. Every run start resolves its skills through
+  // `listRuntimeSkillEntries`, and the adapter hashes the published tree from
+  // another process while it does. Republishing an unchanged tree swapped the
+  // directory out from under that reader — the gap between the two renames is
+  // a missing SKILL.md, i.e. a `skill_materialization_pending` run failure.
+  it("leaves an unchanged runtime skill tree in place under concurrent run starts (BLO-54784)", async () => {
+    const companyId = randomUUID();
+    const { skillKey, publishedDir } = await seedRematerializingSkill(companyId, "concurrent");
+
+    const touched: string[] = [];
+    const realRename = fs.rename;
+    const renameSpy = vi.spyOn(fs, "rename").mockImplementation(async (from, to) => {
+      if (String(from) === publishedDir || String(to) === publishedDir) touched.push(`${from} -> ${to}`);
+      return realRename(from, to);
+    });
+    const missing: string[] = [];
+    let listing = true;
+    const reader = (async () => {
+      while (listing) {
+        await fs.readFile(path.join(publishedDir, "SKILL.md"), "utf8").catch((error) => missing.push(String(error)));
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+    })();
+
+    try {
+      const results = await Promise.all(
+        Array.from({ length: 5 }, () => svc.listRuntimeSkillEntries(companyId)),
+      );
+      for (const entries of results) {
+        expect(entries.find((candidate) => candidate.key === skillKey)).toMatchObject({ sourceStatus: "available" });
+      }
+    } finally {
+      listing = false;
+      await reader;
+      renameSpy.mockRestore();
+    }
+
+    expect(touched).toEqual([]);
+    expect(missing).toEqual([]);
   });
 
   // BLO-32167. When the stored SKILL.md can no longer be materialized the

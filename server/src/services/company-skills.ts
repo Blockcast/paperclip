@@ -5334,39 +5334,47 @@ export function companySkillService(db: Db) {
   async function materializeRuntimeSkillFiles(companyId: string, skill: CompanySkill) {
     const runtimeRoot = path.resolve(resolveManagedSkillsRoot(companyId), "__runtime__");
     const skillDir = path.resolve(runtimeRoot, buildSkillRuntimeName(skill.key, skill.slug));
+    const files = new Map<string, string>();
+    for (const entry of skill.fileInventory) {
+      const normalizedPath = normalizePortablePath(entry.path);
+      if (!normalizedPath) continue;
+      const detail = await readFile(companyId, skill.id, normalizedPath).catch(() => null);
+      const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
+      if (content === null) continue;
+      files.set(normalizedPath, content);
+    }
+
+    if (!files.has("SKILL.md")) {
+      // A skill whose stored SKILL.md has gone must stop being served —
+      // `resolveRuntimeSkillSource` would otherwise keep resolving the stale
+      // directory through `resolveExistingSkillDirectory`. Retired by rename,
+      // not `rm` in place: this tree was complete and live a moment ago, and
+      // unlinking it file by file would expose exactly the state this
+      // function exists to prevent.
+      await removeDirectoryByRename(skillDir);
+      throw unprocessable("Company skill could not be materialized because its stored SKILL.md copy is missing.");
+    }
+
+    // BLO-54784: every run start resolves its skills through here, so an
+    // unconditional republish swapped this shared directory out from under
+    // every concurrent run hashing it — the gap between the two renames is a
+    // missing SKILL.md to them (`skill_materialization_pending`). Only a real
+    // content change may move the published tree.
+    if (await materializedTreeMatches(skillDir, files)) return skillDir;
+
     // BLO-32167: staged beside the destination and published by rename (see
     // `createDirectoryReplacement`), so a concurrent reader sees the previous
     // complete tree, ENOENT, or the new complete tree — never a directory
     // without `SKILL.md`. The staging and retired siblings are dot-prefixed and
     // a runtime name never starts with a dot, so nothing enumerating
-    // `__runtime__` can mistake them for a skill. The window this closes was
-    // not small: the loop below performs a database read per inventory entry,
-    // so writing in place exposed a partial tree for N round-trips.
+    // `__runtime__` can mistake them for a skill.
     const replacement = await createDirectoryReplacement(skillDir);
     try {
-      let wroteSkillFile = false;
-      for (const entry of skill.fileInventory) {
-        const normalizedPath = normalizePortablePath(entry.path);
-        const detail = await readFile(companyId, skill.id, normalizedPath).catch(() => null);
-        const content = detail?.content ?? (normalizedPath === "SKILL.md" ? skill.markdown : null);
-        if (content === null) continue;
-        const targetPath = path.resolve(replacement.stagingDir, entry.path);
+      for (const [relativePath, content] of files) {
+        const targetPath = path.resolve(replacement.stagingDir, relativePath);
         await fs.mkdir(path.dirname(targetPath), { recursive: true });
         await fs.writeFile(targetPath, content, "utf8");
-        if (normalizedPath === "SKILL.md") wroteSkillFile = true;
       }
-
-      if (!wroteSkillFile) {
-        // A skill whose stored SKILL.md has gone must stop being served —
-        // `resolveRuntimeSkillSource` would otherwise keep resolving the stale
-        // directory through `resolveExistingSkillDirectory`. Retired by rename,
-        // not `rm` in place: this tree was complete and live a moment ago, and
-        // unlinking it file by file would expose exactly the state this
-        // function exists to prevent.
-        await replacement.removeTarget();
-        throw unprocessable("Company skill could not be materialized because its stored SKILL.md copy is missing.");
-      }
-
       await replacement.commit();
       return skillDir;
     } finally {
@@ -5423,7 +5431,11 @@ export function companySkillService(db: Db) {
     if (!sawSkillFile) {
       throw unprocessable("Company skill version could not be materialized because its SKILL.md snapshot is missing.");
     }
+    return materializedTreeMatches(skillDir, expected);
+  }
 
+  /** True when `skillDir` holds exactly `expected` (relative path -> content), nothing more or less. */
+  async function materializedTreeMatches(skillDir: string, expected: ReadonlyMap<string, string>) {
     const existingFiles = await listMaterializedFiles(skillDir);
     if (!existingFiles || existingFiles.length !== expected.size) return false;
     for (const relativePath of existingFiles) {
