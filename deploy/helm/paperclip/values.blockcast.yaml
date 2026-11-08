@@ -729,6 +729,8 @@ worker:
     # policy (onprem-k8s paperclip-public-tools.yaml) rejects non-PAPERCLIP_
     # env names outside its allowlist, so this must not go in env.extra. It is
     # not on the agent inherit allowlist, so agent Jobs do not receive it.
+    # Side effect: RECLAIM_FS_OUTSTANDING_LIMIT (workspace-runtime.ts) is
+    # floor(pool/2), so the wedged-root reclaim backstop moves from 2 to 8.
     - name: UV_THREADPOOL_SIZE
       value: "16"
     # BLO-19123: turns on the stranded-recovery hand-back drain, which returns
