@@ -132,10 +132,35 @@ async function migrationFilesRequiringPrecreation(): Promise<string[]> {
 describe("PRECREATE_REQUIRED_INDEXES registry", () => {
   it("covers every migration that raises for online index precreation", async () => {
     const onDisk = await migrationFilesRequiringPrecreation();
-    const registered = PRECREATE_REQUIRED_INDEXES.map((spec) => spec.migration).sort();
+    // DEDUPED, and the dedupe is not cosmetic: the registry is a list of
+    // INDEXES and `onDisk` is a list of FILES, which coincided only while every
+    // migration shipped exactly one index. PEN-6104's 0278 ships four under one
+    // filename, so a raw `.map()` would compare `[0278, 0278, 0278, 0278]`
+    // against `[0278]` and fail on a registry that is in fact complete. The
+    // property this test exists to hold -- every guarded migration reaches the
+    // pre-flight -- is set equality over migrations, which is what this asserts.
+    const registered = [...new Set(PRECREATE_REQUIRED_INDEXES.map((spec) => spec.migration))].sort();
     // A guarded migration missing from the registry is invisible to the
     // pre-flight, which reproduces the exact outage this module prevents.
     expect(registered).toEqual(onDisk);
+  });
+
+  it("registers one entry per index, so a multi-index migration is not half-covered", async () => {
+    // The flip side of the dedupe above. Collapsing to migrations is right for
+    // COVERAGE and wrong for REMEDIATION: the pre-flight prints one
+    // `CREATE INDEX CONCURRENTLY` per entry, so a migration whose four indexes
+    // were registered as one entry would print a command that leaves three
+    // indexes absent and the migration still failing closed. Pinned on 0278,
+    // the first migration in the registry to carry more than one.
+    const multi = PRECREATE_REQUIRED_INDEXES.filter(
+      (spec) => spec.migration === "0278_agent_wakeup_requests_payload_target_indexes.sql",
+    );
+    expect(multi.map((spec) => spec.name).sort()).toEqual([
+      "agent_wakeup_requests_payload_context_issue_idx",
+      "agent_wakeup_requests_payload_context_task_idx",
+      "agent_wakeup_requests_payload_issue_idx",
+      "agent_wakeup_requests_payload_task_idx",
+    ]);
   });
 
   it("catches a guarded migration whose raise wording escapes the marker", async () => {
@@ -590,66 +615,88 @@ describe("guarded migrations gate their raise on table population", () => {
     // nine (the four `ELSIF` files plus 0236). The mismatch raise is
     // identifiable by its `DROP INDEX CONCURRENTLY` hint.
     //
-    // Comments are stripped before searching, and the hint is asserted unique.
-    // Both matter: 0237 mentions `DROP INDEX CONCURRENTLY` in prose 61 lines
-    // ahead of its real HINT, so searching the raw text anchors on the comment
-    // and leaves 0237's whole structural branch inside the guard window. The
-    // uniqueness assertion means any future second occurrence fails loudly
-    // here rather than silently shifting that window again.
+    // Comments are stripped before searching, and the hint is asserted unique
+    // PER `DO $$` BLOCK. Both matter: 0237 mentions `DROP INDEX CONCURRENTLY`
+    // in prose 61 lines ahead of its real HINT, so searching the raw text
+    // anchors on the comment and leaves 0237's whole structural branch inside
+    // the guard window. The uniqueness assertion means any future second
+    // occurrence in one block fails loudly here rather than silently shifting
+    // that window again.
+    //
+    // ⚠️ PER BLOCK, not per file (PEN-6104). 0278 registers FOUR indexes under
+    // one filename and so carries four independent `DO $$` guards, each with
+    // its own structural raise and its own emptiness check. A file-wide
+    // uniqueness assertion read that as "no unique anchor" and failed a
+    // migration that holds the property four times over; a file-wide ORDERING
+    // assertion would have been worse -- block 1's emptiness check precedes
+    // block 2's structural raise, which is correct and which a flat scan
+    // reports as the exact defect this test exists to catch. Every migration
+    // registered before 0278 has exactly one block, so this is the same
+    // assertion on all of them.
     for (const spec of PRECREATE_REQUIRED_INDEXES) {
       const contents = await readFile(`${migrationsDir}/${spec.migration}`, "utf8");
-      // Offsets below are all into `sql`, never into `contents`.
+      // Offsets below are all into `block`, never into `contents`.
       const sql = contents
         .split("\n")
         .filter((line) => !/^\s*--/.test(line))
         .join("\n");
 
-      const hints = [...sql.matchAll(/DROP INDEX CONCURRENTLY/g)];
+      // One entry per `DO $$ ... $$;` guard. A file with no `DO` block is one
+      // block, which is how this stays identical for the pre-0278 shapes.
+      const blocks = sql.split(/(?=DO \$\$)/).filter((part) => /DROP INDEX CONCURRENTLY/.test(part));
       expect(
-        hints.length,
-        `${spec.migration} has no unique mismatch remediation to anchor on`,
-      ).toBe(1);
-      const structuralHint = hints[0].index;
-
-      // Deliberately looser than the single-line form the files use today, so
-      // an emptiness gate reformatted across lines or written `SELECT *` is
-      // still seen rather than silently dropping out of the guard window.
-      //
-      // Anchored on the spec's own table, which is what makes the looseness
-      // safe: every one of these files opens with a multiline
-      // `EXISTS (\n SELECT 1\n FROM pg_index ...)` structural probe, and a
-      // pattern ending at a bare `FROM` matches that too — it sits ahead of
-      // the hint and would fail the ordering assertion on every registered
-      // file. An emptiness check is by definition a check on the guarded
-      // table.
-      const emptinessChecks = [
-        ...sql.matchAll(
-          new RegExp(`EXISTS\\s*\\(\\s*SELECT\\s+\\S+\\s+FROM\\s+"?${spec.table}"?`, "g"),
-        ),
-      ].map((match) => match.index);
-      expect(
-        emptinessChecks.length,
-        `${spec.migration} lost its empty-table guard; the pre-flight exemption assumes one`,
+        blocks.length,
+        `${spec.migration} has no mismatch remediation to anchor on`,
       ).toBeGreaterThan(0);
 
-      // Every emptiness check sits after the structural raise, so no emptiness
-      // test can gate it. A half-built index therefore raises on an empty
-      // table too — which is why the exemption must not cover it.
-      for (const at of emptinessChecks) {
+      for (const block of blocks) {
+        const hints = [...block.matchAll(/DROP INDEX CONCURRENTLY/g)];
         expect(
-          at,
-          `${spec.migration} gained an emptiness check that could gate its structural raise`,
-        ).toBeGreaterThan(structuralHint);
-      }
+          hints.length,
+          `${spec.migration} has no unique mismatch remediation to anchor on in one of its guards`,
+        ).toBe(1);
+        const structuralHint = hints[0].index;
 
-      // And the absent-index path really does build the index itself, inline
-      // and without CONCURRENTLY — which is what makes an empty table need no
-      // operator at all. Checked against `sql` so a commented-out example
-      // cannot satisfy it; the required quote already rules out the unquoted
-      // `CREATE INDEX CONCURRENTLY` inside the hint text.
-      expect(sql, `${spec.migration} no longer builds its index inline`).toMatch(
-        /CREATE (?:UNIQUE )?INDEX "/,
-      );
+        // Deliberately looser than the single-line form the files use today, so
+        // an emptiness gate reformatted across lines or written `SELECT *` is
+        // still seen rather than silently dropping out of the guard window.
+        //
+        // Anchored on the spec's own table, which is what makes the looseness
+        // safe: every one of these files opens with a multiline
+        // `EXISTS (\n SELECT 1\n FROM pg_index ...)` structural probe, and a
+        // pattern ending at a bare `FROM` matches that too — it sits ahead of
+        // the hint and would fail the ordering assertion on every registered
+        // file. An emptiness check is by definition a check on the guarded
+        // table.
+        const emptinessChecks = [
+          ...block.matchAll(
+            new RegExp(`EXISTS\\s*\\(\\s*SELECT\\s+\\S+\\s+FROM\\s+"?${spec.table}"?`, "g"),
+          ),
+        ].map((match) => match.index);
+        expect(
+          emptinessChecks.length,
+          `${spec.migration} lost its empty-table guard; the pre-flight exemption assumes one`,
+        ).toBeGreaterThan(0);
+
+        // Every emptiness check sits after the structural raise, so no emptiness
+        // test can gate it. A half-built index therefore raises on an empty
+        // table too — which is why the exemption must not cover it.
+        for (const at of emptinessChecks) {
+          expect(
+            at,
+            `${spec.migration} gained an emptiness check that could gate its structural raise`,
+          ).toBeGreaterThan(structuralHint);
+        }
+
+        // And the absent-index path really does build the index itself, inline
+        // and without CONCURRENTLY — which is what makes an empty table need no
+        // operator at all. Checked against the comment-stripped block so a
+        // commented-out example cannot satisfy it; the required quote already
+        // rules out the unquoted `CREATE INDEX CONCURRENTLY` inside the hint.
+        expect(block, `${spec.migration} no longer builds its index inline`).toMatch(
+          /CREATE (?:UNIQUE )?INDEX "/,
+        );
+      }
     }
   });
 });

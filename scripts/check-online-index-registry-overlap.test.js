@@ -56,6 +56,11 @@ const EXPECTED_OVERLAP = [
   // remediation needs two statements: its index cannot be built without
   // `btree_gin`, which migration 0268 creates.
   "0269_issue_comments_company_scoped_trigram_search_index.sql",
+  // PEN-6104. The first migration in either registry that carries FOUR index
+  // entries under one filename. Both registries key on the migration, not on
+  // the index, so it contributes exactly one member here -- the overlap is a
+  // set of migrations.
+  "0278_agent_wakeup_requests_payload_target_indexes.sql",
 ];
 
 test("both registries are non-empty and parsed from `migration:` keys, not from prose", () => {

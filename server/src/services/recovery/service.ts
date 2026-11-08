@@ -51,6 +51,7 @@ import { loadConfig } from "../../config.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
+import { wakeRequestTargetsIssueCondition } from "../agent-wakeup-target.js";
 import { isDeliberateParkActive } from "../issue-park-expiry.js";
 import { HttpError, forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
@@ -17140,12 +17141,7 @@ export function recoveryService(
               and(
                 eq(agentWakeupRequests.companyId, updated.companyId),
                 eq(agentWakeupRequests.status, "deferred_issue_execution"),
-                sql`(
-                  ${agentWakeupRequests.payload} ->> 'issueId' = ${updated.id}
-                  or ${agentWakeupRequests.payload} ->> 'taskId' = ${updated.id}
-                  or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId' = ${updated.id}
-                  or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId' = ${updated.id}
-                )`,
+                wakeRequestTargetsIssueCondition(updated.id),
               ),
             )
             .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
