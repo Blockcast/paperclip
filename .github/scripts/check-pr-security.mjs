@@ -30,20 +30,40 @@ const SECRET_PATTERNS = [
   //   - it never refuses anything — this script exits 0 whether or not it flags
   //     (see the header), so a flag is a silent advisory;
   //   - it reads the PR diff, so it never sees a push to a branch with no PR;
-  //   - it is repo-local. Measured 2026-11-08: Blockcast/onprem-k8s and
-  //     Blockcast/penstock-llm-proxy-core run gitleaks with `useDefault = true`
-  //     (penstock's config states a finding blocks the merge); this repo has no
-  //     .gitleaks.toml and no gitleaks workflow, so this line is all there is.
-  //     That is a DATED reading of two OTHER repos, which can gain or lose a
-  //     scanner without this file changing — re-read them before relying on it;
+  //   - it is repo-local, and the sibling repos are NOT the backstop a reader
+  //     assumes. Measured first-party 2026-11-08 (PEN-6170) over both branch-
+  //     protection surfaces plus a content grep of each tracked tree:
+  //       * penstock-llm-proxy-core DOES gate — .github/workflows/security.yml
+  //         and ci.yml run gitleaks pinned 8.28.0, diff-aware, `--exit-code 2`,
+  //         and `secret-scan` is a REQUIRED status context on `main`;
+  //       * onprem-k8s does NOT. It carries a .gitleaks.toml (`useDefault =
+  //         true`), but nothing scans with it: the only gitleaks mention under
+  //         .github/ installs the binary in a workflow_dispatch-gated harness
+  //         and runs `gitleaks version`. Its required contexts are
+  //         `ci/dispatched-lanes` and `review/ally-complete`. Its own CLAUDE.md
+  //         says "a `.gitleaks.toml` gate exists" — that is config, not a gate;
+  //       * this repo has neither a .gitleaks.toml nor a gitleaks workflow, so
+  //         this line is all there is.
+  //     A config is not a scan, and a scan is not a required check. Check all
+  //     three before citing any repo as covered, and re-read before relying on
+  //     this — it describes OTHER repos, which can gain or lose a scanner
+  //     without this file changing;
   //   - it is name-anchored on detection, which github-egress-scrub.ts
   //     documents as unsound for exactly that: material hides under names
   //     nobody enumerated. Measured 2026-11-08, one synthetic value — it flags
   //     under `SESSION_SIGNING_KEY` and `WEBHOOK_SECRET`, and passes under
   //     `signingMaterial`, `SEED`, `sig` and `hmacMaterial`. gitleaks' own
   //     generic-api-key rule is anchored the same way
-  //     (access|auth|api|credential|creds|key|password|secret|token), so the
-  //     sibling repos share that blind spot.
+  //     (access|auth|api|credential|creds|key|password|secret|token), so
+  //     adopting either sibling config HERE would not close this gap. Measured
+  //     against the pinned gitleaks 8.28.0 (PEN-6170): with default rules and
+  //     with each sibling config, one synthetic opaque value passes under
+  //     `signingMaterial = "<v>"`, `signingMaterial: "<v>"`, a k8s stringData
+  //     `seed-value: "<v>"` and `nonce = "<v>"`, while the same bytes under
+  //     `apiSecret` are caught — same naming blind spot as this line, reached
+  //     by a different tool. Closing it needs a name-free entropy rule, which
+  //     fires 13,609 times on this tree today (1,297 excluding generated
+  //     artifacts and lockfiles), so it is not a drop-in.
   // Do not read a green run here as evidence that a secret is not in the diff.
   { name: 'High-entropy secret', re: /[a-zA-Z_]*(key|token|secret|password|credential)[a-zA-Z_]*\s*[=:]\s*["'][^"']{20,}["']/i },
 ];
