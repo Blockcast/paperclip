@@ -2129,6 +2129,28 @@ registry.registerPath({
 
 registry.registerPath({
   method: "get",
+  path: "/api/issues/{id}/field-revisions",
+  tags: ["issues"],
+  summary: "List issue guarded-field revisions",
+  request: {
+    params: z.object({ id: z.string() }),
+    // PEN-5876: the `limit` is clamped server-side rather than refused, so a
+    // caller that sends 0 or 5000 gets a page instead of a 400. Declared with
+    // the clamp stated, because the alternative is the undocumented-query-param
+    // hole PEN-4458 closed on the sibling comments route.
+    query: z.object({
+      limit: z.coerce
+        .number()
+        .int()
+        .optional()
+        .describe("Page size. Clamped server-side to 1..200; defaults to 50."),
+    }),
+  },
+  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({
+  method: "get",
   path: "/api/issues/{id}/documents/{key}/revisions",
   tags: ["issues"],
   summary: "List issue document revisions",
