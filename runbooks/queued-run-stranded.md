@@ -1373,15 +1373,26 @@ Dated re-measurement on the run table (the authoritative instrument; not
 truncated by the page start (05:51Z). The quiet is real in the sense that
 matters least: 73 starts, zero failures, so it is not an absence of dispatch.
 
-⛔ **It is NOT yet evidence of recovery, and six hours cannot be.** The
-fleet-wide read in
-[onprem-k8s#8401](https://github.com/Blockcast/onprem-k8s/pull/8401) bounds the
-window *exactly* to one deployment generation (ReplicaSet
-`paperclip-api-84c88b9b78`, rolled 11-07T08:08Z, replaced 11-08T07:48Z) — and
-that generation itself **ran ~7 h clean before its own onset**. Any quiet
-shorter than ~7 h is indistinguishable from "not yet saturated". Take the
-discriminating re-measurement at least ~7 h after the roll, on the run table,
-with the denominator.
+⛔ **It was not evidence of recovery — and the ~7 h bar this paragraph used to
+prescribe is REFUTED, measured 2026-11-08T18:2xZ.** It read: *"take the
+discriminating re-measurement at least ~7 h after the roll"*. That measurement
+was taken and it passed — the quiet reached **8.62 h** on Security Engineer and
+**10.41 h** on Cto — and **the failure recurred anyway at `16:23:25Z`**, inside
+the same ReplicaSet generation, with no new deploy.
+
+⇒ **a roll resets a clock; it does not clear a defect.** Two generations put
+their first failure **6.59 h and 6.66 h after the roll** (four minutes apart)
+and escalate to a sustained regime 1.2–1.9 h later, while the last clean
+generation lived 21.7 h and never escalated. n=2; the one generation too
+short-lived to discriminate is excluded rather than counted.
+
+✅ **Keep the instrument, drop the bar.** The run table bucketed by `startedAt`
+hour against the started denominator is still the authoritative read. What it
+cannot support is a *verdict* from elapsed quiet: report the quiet as a dated
+observation and keep re-measuring. Full generation table and the narrowed
+suspect commit range in
+[onprem-k8s#8440](https://github.com/Blockcast/onprem-k8s/pull/8440),
+superseding [#8401](https://github.com/Blockcast/onprem-k8s/pull/8401).
 
 ## Agent start lock aborted (PEN-3328)
 
