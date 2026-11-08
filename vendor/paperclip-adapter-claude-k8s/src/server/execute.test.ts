@@ -935,9 +935,19 @@ describe("execute: concurrency guard", () => {
 
   it("returns k8s_concurrency_guard_unreachable when listNamespacedJob throws", async () => {
     mockBatchListJobs.mockRejectedValue(new Error("K8s API unavailable"));
-    const result = await execute(makeCtx());
-    expect(result.errorCode).toBe("k8s_concurrency_guard_unreachable");
-    expect(result.errorMessage).toContain("K8s API unavailable");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const result = await execute(makeCtx());
+      expect(result.errorCode).toBe("k8s_concurrency_guard_unreachable");
+      expect(result.errorMessage).toContain("K8s API unavailable");
+      const line = warn.mock.calls
+        .map((c) => String(c[0]))
+        .find((l) => l.includes("claude_k8s.concurrency_guard_unreachable"));
+      expect(line).toBeDefined();
+      expect(JSON.parse(line!)).toMatchObject({ error: "K8s API unavailable", errorName: "Error" });
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("fails closed when listNamespacedJob never settles", async () => {
