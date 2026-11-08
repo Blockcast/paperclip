@@ -102,10 +102,37 @@ function parseLockfilePackageDiffEntry(line) {
 }
 
 const TEST_FILE_RE = /\.(test|spec)\.(ts|js|tsx|jsx)$|\/(?:__tests__|tests?)\//;
+
+// `exec` and `spawn` are not shell-only names. Matching the bare token made
+// this arm fire on `RegExp.prototype.exec` and on a Postgres client's
+// `pg.exec()` -- 94 lines across 53 tracked test files that never mention
+// `child_process` (PEN-6177). A noisy advisory detector trains its readers to
+// dismiss it, which costs the true positives too, so the arm is split in two:
+//
+//   1. a call with NO receiver -- `execSync(...)` after a destructured import,
+//      and the spread form `...spawnSync(...)` -- reported on its own, and
+//   2. a MEMBER call -- `cp.exec(...)` after `import * as cp from
+//      "node:child_process"` -- reported only when the same patch also brings
+//      `child_process` in.
+//
+// Honest bound on (2): this scanner only ever sees `file.patch`, so an import
+// that sits outside the hunks is invisible to it and a member call in such a
+// patch is not reported. (1) is unaffected, and a destructured import is the
+// dominant shape, so the uncorroborated member call is the only gap.
+const SHELL_EXEC_FNS = 'execSync|spawnSync|execFileSync|execFile|exec|spawn';
+const SHELL_EXEC_CALL_RE = new RegExp(String.raw`\+.*(?:(?<![.\w$])|(?<=\.\.\.))(?:${SHELL_EXEC_FNS})\(`);
+const SHELL_EXEC_MEMBER_CALL_RE = new RegExp(String.raw`\+.*\.(?:${SHELL_EXEC_FNS})\(`);
+const CHILD_PROCESS_RE = /child_process/;
+
+function matchesShellExec(patch) {
+  if (SHELL_EXEC_CALL_RE.test(patch)) return true;
+  return CHILD_PROCESS_RE.test(patch) && SHELL_EXEC_MEMBER_CALL_RE.test(patch);
+}
+
 const SUSPICIOUS_PATTERNS = [
   { name: 'outbound-network', re: /\+.*(fetch\(|axios\.|http\.request|https\.request)/ },
   { name: 'env-var-read', re: /\+.*process\.env\.(?!(?:NODE_ENV|CI|TEST|VITEST|npm_))([A-Z_]{4,})/ },
-  { name: 'shell-exec', re: /\+.*(execSync\(|spawnSync\(|exec\(|spawn\()/ },
+  { name: 'shell-exec', match: matchesShellExec },
   { name: 'absolute-file-read', re: /\+.*(readFile|readFileSync)\s*\(\s*["'`]?\// },
 ];
 
@@ -113,8 +140,8 @@ export function scanTestPatterns(files) {
   const flags = [];
   for (const file of files) {
     if (!TEST_FILE_RE.test(file.filename) || !file.patch) continue;
-    for (const { name, re } of SUSPICIOUS_PATTERNS) {
-      if (re.test(file.patch)) {
+    for (const { name, re, match } of SUSPICIOUS_PATTERNS) {
+      if (match ? match(file.patch) : re.test(file.patch)) {
         flags.push({ check: 'suspicious-test', file: file.filename, pattern: name });
       }
     }
