@@ -500,6 +500,23 @@ jobs:
         run: node --test ./scripts/check-docker-agent-alert-channel.test.js
         timeout-minutes: 1
 
+      # PEN-6034: the mcp-gateway image lane had the same silence in a second
+      # shape. A `timeout-minutes` kill is recorded as `conclusion: cancelled`,
+      # not `failure`, so run 42326582436 built `e079fc2b` for 15m13s against a
+      # 15-minute ceiling, published nothing, and registered on no signal at
+      # all — caught only because PEN-5690 happened to re-verify its CVE re-pin
+      # target instead of carrying it. This pins both halves of the fix: the
+      # `Build and push` step budget sitting STRICTLY BELOW the job ceiling (a
+      # step timeout reports `failure`, a job timeout reports `cancelled`), and
+      # the classifier that lets the alert page on a kill while staying quiet on
+      # the concurrency supersedes `cancel-in-progress: true` produces
+      # routinely. Both are invisible at runtime if they regress: the workflow
+      # would simply go quiet again.
+      - name: Validate mcp-gateway image alert channel and timeout budgets (PEN-6034)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-mcp-gateway-image-alert-channel.test.js
+        timeout-minutes: 1
+
       # BLO-31598: pins the abandon-in-flight escape hatch's wiring. The
       # approval holds a lock until its rollout lands, so a deploy dying between
       # the approval step and `helm upgrade` strands a lock nothing can clear
