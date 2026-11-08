@@ -1,0 +1,55 @@
+# PEN-6123 corpus: assignment values that CANNOT hold a secret, one per line.
+# A run of environment assignments is exempted from the `environment-dump`
+# rule only when EVERY value in it is one of these shapes.
+#
+# The bar is "cannot be a secret", not "does not look like one". That is the
+# whole design: PEN-6123 measured four wider value shapes against the 142 files
+# in Blockcast/onprem-k8s this rule refuses today, and every one of them that
+# cleared a worthwhile share of those files also admitted a matched generator
+# of short human-chosen secrets at a 100% rate --
+#
+#   contains a space            cleared 63/142   defeated by a passphrase
+#   contains a slash            cleared 43/142   defeated by /srv/keys/dragon417
+#   contains a colon            cleared 35/142   defeated by admin:hunter22
+#   lowercase dashed identifier cleared 44/142   defeated by dragon-4471
+#
+# Human-chosen secrets and hand-written config are drawn from one lexical
+# space, so no value-shape allowlist can separate them. The shapes below sidestep
+# that by carrying no information at all: there is no secret you can encode in
+# `true`, in `30s`, or in a `$VAR` whose literal is not in the blob.
+#
+# NOT represented, deliberately: anything with an alphabetic body that is not a
+# fixed keyword. A single such value anywhere in a run re-arms the entire run.
+
+# -- empty --
+
+# -- shell expansion: the literal is not in the blob at all --
+$NAMESPACE
+${NAMESPACE}
+${NAMESPACE:-default}
+$(kubectl config current-context)
+`date -u +%Y%m%d`
+
+# -- numbers, with and without a unit suffix --
+0
+1
+3000
+-1
+0.5
+5Gi
+30s
+250m
+80%
+2048
+
+# -- booleans and the standard absent-value keywords --
+true
+false
+True
+FALSE
+yes
+no
+on
+off
+null
+none

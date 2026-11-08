@@ -23,6 +23,7 @@ import {
   type GitPushFinding,
   type GitReader,
 } from "./github-git-egress-shim.js";
+import { ENVIRONMENT_DUMP_MIN_RUN } from "./github-egress-scrub.js";
 import { IDENTIFIER_CLASS_DECISION_URL } from "./security-decision-records.js";
 
 /**
@@ -1014,6 +1015,72 @@ describe("formatRefusal", () => {
     // ...and the prohibition, stated rather than implied.
     expect(message).toContain("Do not paste the refused value");
     expect(message).not.toContain("quoting the refused value");
+  });
+
+  // PEN-6123: the advice above is written for the VALUE-level rule — it asks
+  // for "the binding name and the value's shape" and describes exoneration
+  // under a binding name. An `environment-dump` finding has neither: it is a
+  // property of the LAYOUT of a region, matched on a run of consecutive
+  // assignment lines whatever they hold. A reporter who follows those
+  // sentences literally cannot describe what was refused.
+  const dumpFinding = {
+    commit: "d".repeat(40),
+    shortCommit: "dddddddddddd",
+    subject: "add kuttl write-boundary fixture",
+    where: "content" as const,
+    classes: ["environment-dump" as const],
+  };
+
+  it("does not ask an environment-dump reporter for a binding name", () => {
+    const message = formatRefusal([dumpFinding]);
+
+    // The value-level questions are the mis-route, and they are the whole
+    // defect: there is no answer to them for this class.
+    expect(message).not.toContain("Report the binding name");
+    expect(message).not.toContain("exonerated under the label name");
+    // What it must say instead: that the finding is about shape.
+    expect(message).toContain("SHAPE, not about any one value");
+    expect(message).toContain(String(ENVIRONMENT_DUMP_MIN_RUN));
+    // ...and what a usable report for THIS class actually contains.
+    expect(message).toContain("how many assignment lines the run has");
+    expect(message).toContain("do not paste the run");
+  });
+
+  // Not vacuous: the generic advice and the finding line must still be there,
+  // or the negative assertions above would pass on an empty message.
+  it("still gives an environment-dump reporter the generic route", () => {
+    const message = formatRefusal([dumpFinding]);
+    expect(message).toContain("derive it at runtime");
+    expect(message).toContain("environment-dump");
+    expect(relativeDocsPointers(message)).toEqual([]);
+  });
+
+  // The layout edit that clears this rule — interleaving a comment between the
+  // assignments — is a one-line change indistinguishable from ordinary style,
+  // and PEN-6123 measured it clearing a genuinely secret-bearing sectioned
+  // `.env` as well as the benign fixture that prompted the filing. Naming it
+  // here would retire the detector in practice while leaving it switched on.
+  it("never suggests the layout edit that evades the rule", () => {
+    const message = formatRefusal([dumpFinding]).toLowerCase();
+    for (const hint of [
+      "blank line",
+      "comment line",
+      "interleav",
+      "separate the assignments",
+      "break up the run",
+    ]) {
+      expect(message).not.toContain(hint);
+    }
+  });
+
+  // The two classes must not bleed: a push carrying both gets both answers.
+  it("gives each class its own advice when both fired", () => {
+    const message = formatRefusal([
+      dumpFinding,
+      { ...dumpFinding, classes: ["high-entropy-assignment" as const] },
+    ]);
+    expect(message).toContain("SHAPE, not about any one value");
+    expect(message).toContain("Report the binding name");
   });
 
   // The remedy was widened; the control was NOT. PEN-3920 section 5.3: the
