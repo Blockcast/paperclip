@@ -36,6 +36,7 @@ import {
 } from "../lib/by-project-window";
 import {
   UNATTRIBUTED_PROJECT_LABEL,
+  projectCostWindowTotal,
   reconcileProjectCosts,
   toProjectCostRows,
 } from "../lib/project-cost-rows";
@@ -292,12 +293,15 @@ export function Costs() {
   // limit there too, rather than rendering a raw error string.
   const byProjectRefusalNotice = capRefusalNotice(byProjectError);
 
-  // PEN-6084: `by-project` now serves an unattributed bucket, so these rows sum to the
-  // Summary card's spend over the same `from`/`to` -- which both queries above share.
+  // PEN-6084: `by-project` now serves an unattributed bucket, so its rows account for all
+  // of the window's spend. Both sides of the check below come from THAT response -- the
+  // rows and the `windowTotalCents` served beside them, one statement and one snapshot.
+  // It used to compare against `spendData.summary`, a separate request and so a separate
+  // snapshot, which reported a mismatch whenever an event landed between the two reads.
   const projectCostRows = useMemo(() => toProjectCostRows(byProjectData), [byProjectData]);
   const projectCostReconciliation = useMemo(
-    () => reconcileProjectCosts(projectCostRows, spendData?.summary.spendCents ?? 0),
-    [projectCostRows, spendData?.summary.spendCents],
+    () => reconcileProjectCosts(projectCostRows, projectCostWindowTotal(byProjectData)),
+    [projectCostRows, byProjectData],
   );
 
   const { data: financeData, isLoading: financeLoading, error: financeError } = useQuery({
@@ -920,10 +924,15 @@ export function Costs() {
                           {/*
                             PEN-6084: the reconciliation the two cards previously failed, stated on
                             screen. `by-project` used to drop every event that resolved to no project,
-                            so this card under-reported the Summary card beside it over the same window
-                            with nothing saying so. The mismatch line waits for `spendData` -- while the
-                            summary is still loading there is no number to disagree with, and claiming a
-                            shortfall against a not-yet-loaded 0 would cry wolf on every page load.
+                            so this card under-reported the window with nothing saying so.
+
+                            Both numbers come from the SAME `by-project` response, so this cannot fire
+                            on a race. It used to compare against the separately-fetched Summary card
+                            and so needed a `spendData` guard; that guard only covered the not-yet-
+                            loaded case, never the real one -- two requests are two database snapshots,
+                            and a cost event committing between them made a correct split render a
+                            "report it" warning. The cross-route invariant is pinned by the server
+                            test instead.
                           */}
                           <div className="flex items-center justify-between gap-3 px-3 pt-1 text-sm">
                             <span className="text-muted-foreground">Total</span>
@@ -931,11 +940,11 @@ export function Costs() {
                               {formatCents(projectCostReconciliation.totalCents)}
                             </span>
                           </div>
-                          {spendData && !projectCostReconciliation.reconciles ? (
+                          {!projectCostReconciliation.reconciles ? (
                             <p className="px-3 text-sm text-destructive">
-                              This does not match company spend of{" "}
-                              {formatCents(projectCostReconciliation.summaryCents)} for the same dates.
-                              Treat the per-project split as incomplete and report it.
+                              This window recorded{" "}
+                              {formatCents(projectCostReconciliation.windowTotalCents)} of spend, so
+                              the split above is incomplete. Report it.
                             </p>
                           ) : null}
                         </>

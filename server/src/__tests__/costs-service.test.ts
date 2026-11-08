@@ -1463,6 +1463,16 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     const totalReported = rows.reduce((sum, row) => sum + row.costCents, 0);
     expect(totalReported).toBe(summary.spendCents);
 
+    // PEN-6084: the SAME invariant, checkable from this response alone. The portal needs
+    // both sides of its on-screen reconciliation to come from one statement -- comparing
+    // the rows against a separately-fetched `costs/summary` is two snapshots and reports
+    // a mismatch whenever an event commits between the two reads. So the window total
+    // rides along, identical on every row and equal to what `summary` computes.
+    expect(new Set(rows.map((row) => row.windowTotalCents))).toEqual(
+      new Set([summary.spendCents]),
+    );
+    expect(totalReported).toBe(rows[0]?.windowTotalCents);
+
     const unattributed = rows.filter((row) => row.projectId === null);
     // ONE bucket, not one anonymous row per unattributable shape.
     expect(unattributed).toHaveLength(1);
@@ -1555,6 +1565,9 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       const summary = await costs.summary(companyId);
 
       expect(rows.reduce((sum, row) => sum + row.costCents, 0)).toBe(summary.spendCents);
+      // The window total is read straight from `cost_events`, so a dangling project
+      // reference cannot move it even though it changes which bucket the row lands in.
+      expect(rows[0]?.windowTotalCents).toBe(summary.spendCents);
 
       const unattributed = rows.filter((row) => row.projectId === null);
       expect(unattributed).toHaveLength(1);

@@ -1,5 +1,5 @@
 import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
-import { alias } from "drizzle-orm/pg-core";
+import { alias, type PgColumn } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
 import { notFound, unprocessable } from "../errors.js";
@@ -602,9 +602,19 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
     },
 
     byProject: async (companyId: string, range?: CostDateRange) => {
-      const conditions: ReturnType<typeof eq>[] = [eq(costEvents.companyId, companyId)];
-      if (range?.from) conditions.push(gte(costEvents.occurredAt, range.from));
-      if (range?.to) conditions.push(lte(costEvents.occurredAt, range.to));
+      // One definition of the window, applied to the grouped rows AND to the window total
+      // served alongside them, so the two sides of the portal's reconciliation check
+      // cannot drift apart as this function changes. It takes the two COLUMNS rather than
+      // the table because the total reads through an alias, and `alias()` carries the new
+      // name in the table's type -- so a `typeof costEvents` parameter rejects it.
+      const windowConditions = (companyCol: PgColumn, occurredCol: PgColumn) => {
+        const scoped: ReturnType<typeof eq>[] = [eq(companyCol, companyId)];
+        if (range?.from) scoped.push(gte(occurredCol, range.from));
+        if (range?.to) scoped.push(lte(occurredCol, range.to));
+        return scoped;
+      };
+
+      const conditions = windowConditions(costEvents.companyId, costEvents.occurredAt);
 
       /**
        * PEN-5585: the window has to reach `run_project_links`, not just `cost_events`.
@@ -755,11 +765,54 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       // before `true`, so this is an ordering rule, not a second sort key on cost.
       const unattributedLast = sql`${projects.id} is null`;
 
+      /**
+       * PEN-6084 (Ally review of #3544): the card's reconciliation check has to read BOTH
+       * of its numbers from ONE database snapshot.
+       *
+       * The portal first compared `sum(rows)` against `costs/summary`. Those are two HTTP
+       * requests, so two snapshots, and they refetch independently -- on window focus, on
+       * a cache invalidation that hits one key, or when one errors and the other does not.
+       * Any cost event that commits between the two reads makes the numbers differ, and
+       * the card then renders a destructive-styled "report it" warning against a split
+       * that is in fact correct. That is the NORMAL case here rather than an edge one: the
+       * 5-day cap (PEN-5591) means this card effectively renders only for a custom range,
+       * and a custom range ending today stays open until 23:59:59.999 while events keep
+       * landing inside it. False reports filed against a correct aggregate are the
+       * opposite of what the warning is for.
+       *
+       * So the window total is served from THIS statement, under the same window
+       * definition (`windowConditions`, applied to both column sets), and the portal
+       * compares against it instead of against `costs/summary`.
+       *
+       * It deliberately does NOT pass through the joins or the grouping below, and that is
+       * what keeps the comparison a real check rather than a tautology: a `sum(sum(...))
+       * over ()` window function would sum the groups that SURVIVED and so could never
+       * report a dropped row. This reads `cost_events` directly under the same window --
+       * the same number `costs/summary` computes -- so reintroducing an inner join or a
+       * null filter above shows up as a genuine mismatch, while a concurrent write cannot.
+       *
+       * The explicit alias is load-bearing. Interpolating an aliased table into a raw
+       * `sql` FROM emits only the alias, so the relation is named once by `${costEvents}`
+       * and bound to `window_events` by `sql.identifier`; the column references then carry
+       * that alias. Without it the subquery's `cost_events` would still resolve to its own
+       * FROM by Postgres scoping, but silently and by shadowing -- which reads like a
+       * correlated subquery to anyone skimming it. It is uncorrelated, hence constant per
+       * row, which is why Postgres accepts it in the select list of a grouped query with
+       * no entry in `GROUP BY`.
+       */
+      const windowEvents = alias(costEvents, "window_events");
+      const windowTotalCentsExpr = sql<number>`(
+        select coalesce(sum(${windowEvents.costCents}), 0)::double precision
+        from ${costEvents} as ${sql.identifier("window_events")}
+        where ${and(...windowConditions(windowEvents.companyId, windowEvents.occurredAt))}
+      )`;
+
       return db
         .select({
           projectId: bucketProjectId,
           projectName: bucketProjectName,
           costCents: costCentsExpr,
+          windowTotalCents: windowTotalCentsExpr,
           consumptionCents: consumptionCentsSum,
           inputTokens: sumAsNumber(costEvents.inputTokens),
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
