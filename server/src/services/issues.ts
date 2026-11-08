@@ -5774,6 +5774,23 @@ async function listIssueBlockedInboxAttentionMap(
               ${heartbeatRuns.contextSnapshot} ->> 'taskId'
             )`, graphIssueIds),
           )),
+    // PEN-6104: this `coalesce` is ATTRIBUTION -- "which single issue does this
+    // wake belong to" -- and it is correct here, because the blocked inbox counts
+    // each wake against exactly one row. ⛔ It is NOT interchangeable with the
+    // four-arm DISJUNCTION in `wakeRequestTargetsIssue`, which asks MEMBERSHIP:
+    // "does this wake target issue X". `coalesce` returns the FIRST non-null key,
+    // so a row whose `_paperclipWakeContext.issueId` names a different issue than
+    // its top-level `issueId` is attributed to the top level only and is invisible
+    // to a `coalesce` lookup on the nested one. Measured, not assumed:
+    // `packages/db/src/agent-wakeup-payload-index-shape.bench.ts` seeds exactly
+    // that row and reports disjunction 1 / coalesce 0.
+    //
+    // The two are therefore deliberately different and must stay so. The reason
+    // it matters beyond documentation: PEN-6104's candidate 3 proposed persisting
+    // THIS expression as a generated column and indexing it to serve the
+    // membership query. The same bench measures that substitution finding 0 rows,
+    // i.e. silently dropping wake history. Do not collapse them in either
+    // direction.
     graphIssueIds.length === 0
       ? Promise.resolve([])
       : dbOrTx
@@ -10080,6 +10097,11 @@ export function issueService(db: Db) {
           blockersByIssueId.set(normalized.blockedIssueId, rows);
         }
 
+        // PEN-6104: ATTRIBUTION, not membership -- the subtree view groups each
+        // wake under one node, so `coalesce` is the right expression here. See
+        // the longer note on the blocked-inbox read above for why this must not
+        // be swapped for `wakeRequestTargetsIssue`'s four-arm disjunction, or
+        // persisted as a generated column to serve it.
         const wakeTargetIssueIdSql = sql<string>`
           coalesce(
             wake.payload ->> 'issueId',
