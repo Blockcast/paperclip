@@ -477,8 +477,46 @@ const JOB_NAME_RE = /^[a-z]+\d{0,2}(?:_[a-z]+\d{0,2})+$/;
  *  label selector or a kubectl example, as onprem-k8s rule tests write it.
  *  Kinds are the same UpperCamelCase shape as alert names, so this reuses
  *  ALERT_NAME_RE under the same name-anchored trade: the residual is the one
- *  measured on BLO-46448, now reachable under one more exact name. */
-const CAMEL_CASE_VALUE_NAMES = new Set(["alertname", "kind"]);
+ *  measured on BLO-46448, now reachable under one more exact name.
+ *
+ *  PEN-6163 added the onprem-k8s lockstep guard tests' assertion kwarg: a
+ *  guard test asserts that a script prints a given alert name, and the alert
+ *  name is the literal it has to spell out. Same shape, same trade, one more
+ *  exact name.
+ *
+ *  ⚠️ This one is a WEAKER name anchor than the two above, and the difference
+ *  is recorded rather than smoothed over. `alertname` and `kind` are TYPED
+ *  bindings: the name itself constrains what the value may legitimately be, so
+ *  the name and the shape agree. The assertion kwarg is UNTYPED — it means
+ *  only "whatever this test expects to find in some output", which puts no
+ *  constraint of its own on the value. So here the SHAPE anchor carries the
+ *  whole trade and the name anchor only narrows where it applies.
+ *
+ *  What makes that acceptable is that the shape anchor is the half that was
+ *  measured, and it is unchanged. Residual under this name, 200k random values
+ *  per cell against the shipped rule, at 24 / 32 / 40 chars:
+ *
+ *    letters-only, mixed case ..... 2.28e-1 / 2.22e-1 / 2.14e-1
+ *    base62 ....................... 1.80e-2 / 6.37e-3 / 2.14e-3
+ *    base64url .................... 7.32e-3 / 1.92e-3 / 5.05e-4
+ *    lowercase hex ................ 0 / 0 / 0   (0 of 600k)
+ *
+ *  The base62 column reproduces the 1.81e-2 D4 already records above, which is
+ *  the cross-check that this is the same measurement and not a new one. The
+ *  letters-only column is the adversarial worst case and is the number to
+ *  quote when arguing against this exemption; it is also the alphabet no key,
+ *  token or digest is issued in. The alphabets an ACCIDENTAL paste actually
+ *  arrives in are the lower three, and hex — the shape of every digest and
+ *  most generated secrets here — is exonerated at zero.
+ *
+ *  ⛔ Do NOT generalise this to a `want_*` prefix or a `*_SELECTOR` suffix.
+ *  That is the `/Id$/` cleanup declined for UUID_VALUE_NAMES below, in the
+ *  same shape: a pattern would exonerate `want_token`, `want_secret` and
+ *  `API_KEY_SELECTOR`, where an UpperCamelCase value may genuinely be the
+ *  credential. Exact names, one at a time, each on a measured false positive.
+ *  A test pins those as still refused so the generalisation cannot land
+ *  silently. */
+const CAMEL_CASE_VALUE_NAMES = new Set(["alertname", "kind", "want_in_output"]);
 
 /** PEN-3920 (D5): names whose values take the snake_case identifier shape.
  *  Separate from CAMEL_CASE_VALUE_NAMES because the shapes differ; the
