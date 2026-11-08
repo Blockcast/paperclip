@@ -470,7 +470,13 @@ async function seed(sql: postgres.Sql) {
   return counts[0];
 }
 
-/** The shipped post-0268 union, from `issueSearchMatchCondition` in server/src/services/issues.ts. */
+/**
+ * The post-0268 union. ⚠️ SUPERSEDED by PEN-3596's second cut: `list()` now
+ * builds `issueSearchArmsSubquery()` (server/src/services/issues.ts), which
+ * carries the relevance rank as well and is JOINed rather than tested in the
+ * WHERE. Kept verbatim because the shapes this bench measures are the ones it
+ * was written against; re-aim it before quoting it as current.
+ */
 const SHIPPED_SEARCH_UNION = `
   issues.id IN (
     SELECT issues.id FROM issues WHERE issues.company_id = $1 AND issues.title ILIKE $2 ESCAPE '\\'

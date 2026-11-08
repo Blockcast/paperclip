@@ -5461,66 +5461,150 @@ function issueRef(row: Pick<IssueRow, "id" | "identifier" | "title" | "status" |
 }
 
 /**
- * PEN-3596: the issues-list search predicate — one indexable id set per branch,
- * unioned, rather than the four predicates ORed together.
+ * PEN-3596: the issues-list search arms — one indexable id set per branch,
+ * `UNION ALL`'d and aggregated to `MIN(rank)`, joined once.
  *
- * The `or(...)` this replaces is what blew the 30s statement_timeout.
- * `commentContainsMatch` is a semi-join, and a semi-join cannot take part in a
- * BitmapOr, so its presence under the OR forced the entire disjunction to be
- * evaluated as a per-row FILTER: every issue in the company was fetched and
- * `description ILIKE '%term%'` run against all ~6KB of it. The three gin_trgm
- * indexes on these columns existed the whole time and were simply unreachable.
+ * ── WHY A RANKED DERIVED TABLE AND NOT A PREDICATE ────────────────────────
  *
- * ⛔ This is NOT de-correlation, which was tried and refuted — PostgreSQL
- * already flattens that EXISTS into a hashed SubPlan on its own, and
- * hand-writing the flattening measured as noise. Nor is it an index gap:
- * adding indexes without this restructure measured as nothing at all. See
- * `packages/db/src/issues-list-search-cost-shape.test.ts` for the plan
- * assertions and the measured table.
+ * This replaces `issueSearchMatchCondition()`, which returned
+ * `issues.id IN (<the same four arms, UNION'd>)` for the WHERE and left the
+ * relevance ranking to a `CASE` in the ORDER BY that RE-DERIVED the same four
+ * facts per candidate row. Three of those re-derivations are free (the
+ * columns are already on the fetched row); the fourth was a correlated
+ * `EXISTS` over `issue_comments`, and in production it was the single most
+ * expensive thing the query did.
  *
- * Each arm is a standalone indexable predicate, so each is served by its own
- * company-scoped trigram index: the three `issues` arms by migration 0268, the
- * comment arm by `issue_comments_company_body_search_idx` (migration 0269).
- * Semantics are unchanged — this is the same disjunction, expressed so the
- * planner can reach the indexes.
+ * Measured on the only production `EXPLAIN (ANALYZE, BUFFERS)` this question
+ * has ever had (2026-11-06T11:34:23Z, Penstock, term `timeout`, 3,980ms total,
+ * fully warm — PEN-3596 comment `c4b03742`):
  *
- * ⚠️ The comment arm was NOT company-scoped between 0268 and 0269, and that
- * was the residual: `issue_comments_body_search_idx` BitmapAnd'ed with
- * `issue_comments_company_idx` built the term's trigram bitmap across every
- * company before intersecting it, so a common term still cost 16–22s in
- * production against the 30s bound while a no-match term cost 0.251s. 0269
- * company-scopes it (~6x on this arm) and drops the un-scoped index, which had
- * no remaining caller. Do not reintroduce an un-scoped trigram index on
- * `issue_comments.body`.
+ *   SubPlan 2 -> Index Scan using issue_comments_company_issue_created_at_idx
+ *     (actual time=2.054..2.054 rows=0.90 loops=1184)
+ *     Rows Removed by Filter: 9   Buffers: shared hit=44998
+ *
+ *   2.054ms x 1,184 loops  = ~2,432ms  = ~61% of execution
+ *   44,998 of 79,501 buffers          = 56.6% of ALL buffer traffic
+ *
+ * The loop count identifies the node beyond doubt: the `Nested Loop` emitted
+ * 1,239 rows, the title arm matched 55, and 1,239 − 55 = 1,184 — exactly the
+ * rows that fall past `WHEN titleStartsWith`/`WHEN titleContains` and reach
+ * the comment arm of the `CASE`.
+ *
+ * ⛔ THIS IS THE SAME DEFECT CLASS PEN-5213 REMOVED FROM THE OTHER SORT KEY,
+ * and it must be read that way rather than as an index gap. The cost was
+ * CANDIDATE-bound, not page-bound: every row the WHERE admitted paid a
+ * comment probe before `LIMIT` could discard it, so `limit=15` and
+ * `limit=1000` cost the same. On a company with ~7.5x Penstock's candidate
+ * set that one node alone projects past the 30s role `statement_timeout` —
+ * which is what this row was filed for.
+ *
+ * ── WHY NOT THE TWO REMEDIES ALREADY ON THE RECORD ────────────────────────
+ *
+ * ⛔ NOT de-correlation (`id IN (SELECT ...)` in the sort key). That is
+ * refuted lead 3 in `packages/db/src/issues-list-search-cost-shape.test.ts`
+ * and the refutation stands on its own terms — but it would also make the
+ * comment trigram scan run TWICE, once for the WHERE and once for the rank.
+ * This shape runs it once and shares the result, so it is not that proposal.
+ *
+ * ⛔ NOT "the seed says the planner already flattens it". It does, at seed
+ * size: that suite asserts `hashed SubPlan` with <=2 comment-scan loops, and
+ * the in-line note this replaces priced the probe at ~0.01ms x 490 loops.
+ * Production ran the same construct at 2.054ms x 1,184 loops with no hash —
+ * a ~200x miss per loop. ⭐ A seed can measure a SHAPE; it cannot measure the
+ * planner's CHOICE at production statistics, and this is the second time on
+ * this row that a seeded number has been read as a production one (the first
+ * was 0268's −11ms on a single-company corpus). Do not re-price this node
+ * from a seed.
+ *
+ * ── THE SHAPE ─────────────────────────────────────────────────────────────
+ *
+ * Each arm is still a standalone indexable predicate served by its own
+ * company-scoped trigram index — the three `issues` arms by migration 0268,
+ * the comment arm by `issue_comments_company_body_search_idx` (0269). What is
+ * new is that each arm also emits the rank it would have been assigned by the
+ * `CASE`, and `MIN(rank)` over the group reproduces "first matching WHEN"
+ * exactly, because the `CASE` branches are ordered by increasing rank. The
+ * `GROUP BY` does the de-duplication the `UNION` used to do, so the candidate
+ * set is byte-identical; `UNION ALL` is used because the aggregate dedupes.
+ *
+ * Ranks are the ORIGINAL ones and the ordering is unchanged:
+ *   0 title starts-with · 1 title contains · 2 identifier starts-with
+ *   3 identifier contains · 4 comment body contains · 5 description contains
+ * The old `ELSE 6` arm is gone because it was unreachable: the join admits
+ * only rows that matched at least one arm.
+ *
+ * ⚠️ The derived table is joined, NOT lateral, so it cannot reference the
+ * outer `issues` at all. Accidental correlation is now a parse error rather
+ * than a silent per-row re-scan — which is the failure this change removes.
  *
  * ⚠️ Exported, and extracted from `list()` rather than written inline, so the
  * shape itself is assertable: `issues-service.test.ts` renders this fragment
- * and fails if the UNION collapses back to an `OR` over an `EXISTS`. The
- * cost-shape suite in `packages/db` proves the *Postgres* behaviour against a
- * hand-written copy of this predicate, which by construction cannot notice a
- * revert here — this is the guard that can.
+ * and fails if the arms collapse back to an `OR`, or if a correlated `EXISTS`
+ * reappears. The cost-shape suite in `packages/db` proves the *Postgres*
+ * behaviour against a hand-written copy, which by construction cannot notice
+ * a revert here — this is the guard that can.
+ *
+ * ⚠️ Do not reintroduce an un-scoped trigram index on `issue_comments.body`;
+ * 0269 dropped it deliberately (see its header).
+ *
+ * ⚠️ STATEMENT-TEXT NOTE for anyone classifying `paperclip-pg-0` timeouts:
+ * the class-A (search) signature CHANGES with this commit. It was 10
+ * `ILIKE ... ESCAPE` occurrences plus a correlated `EXISTS`; it is now 6
+ * `ILIKE ... ESCAPE` and no `EXISTS`. A classifier keyed on the old counts
+ * reads post-deploy class-A statements as unclassifiable, which fails in the
+ * "nothing to see" direction. Key on the four searched columns instead.
  */
-export function issueSearchMatchCondition(companyId: string, containsPattern: string): SQL {
-  return sql<boolean>`
-    ${issues.id} IN (
-      SELECT ${issues.id} FROM ${issues}
+export const ISSUE_SEARCH_ARMS_ALIAS = "issue_search_arms";
+
+export function issueSearchArmsSubquery(
+  companyId: string,
+  startsWithPattern: string,
+  containsPattern: string,
+): SQL {
+  const alias = sql.identifier(ISSUE_SEARCH_ARMS_ALIAS);
+  return sql`(
+    SELECT arm.issue_id AS issue_id, MIN(arm.search_rank) AS search_rank
+    FROM (
+      SELECT ${issues.id} AS issue_id,
+             CASE WHEN ${issues.title} ILIKE ${startsWithPattern} ESCAPE '\\' THEN 0 ELSE 1 END AS search_rank
+      FROM ${issues}
       WHERE ${issues.companyId} = ${companyId}
         AND ${issues.title} ILIKE ${containsPattern} ESCAPE '\\'
-      UNION
-      SELECT ${issues.id} FROM ${issues}
+      UNION ALL
+      SELECT ${issues.id},
+             CASE WHEN ${issues.identifier} ILIKE ${startsWithPattern} ESCAPE '\\' THEN 2 ELSE 3 END
+      FROM ${issues}
       WHERE ${issues.companyId} = ${companyId}
         AND ${issues.identifier} ILIKE ${containsPattern} ESCAPE '\\'
-      UNION
-      SELECT ${issues.id} FROM ${issues}
-      WHERE ${issues.companyId} = ${companyId}
-        AND ${issues.description} ILIKE ${containsPattern} ESCAPE '\\'
-      UNION
-      SELECT ${issueComments.issueId} FROM ${issueComments}
+      UNION ALL
+      SELECT ${issueComments.issueId}, 4
+      FROM ${issueComments}
       WHERE ${issueComments.companyId} = ${companyId}
         AND ${issueComments.deletedAt} IS NULL
         AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
-    )
-  `;
+      UNION ALL
+      SELECT ${issues.id}, 5
+      FROM ${issues}
+      WHERE ${issues.companyId} = ${companyId}
+        AND ${issues.description} ILIKE ${containsPattern} ESCAPE '\\'
+    ) arm
+    GROUP BY arm.issue_id
+  ) ${alias}`;
+}
+
+/** A column of the joined {@link issueSearchArmsSubquery} derived table, fully qualified. */
+function searchArmsColumn(column: "issue_id" | "search_rank"): SQL {
+  return sql`${sql.identifier(ISSUE_SEARCH_ARMS_ALIAS)}.${sql.identifier(column)}`;
+}
+
+/** The join predicate binding {@link issueSearchArmsSubquery} to the outer `issues` row. */
+export function issueSearchArmsJoinOn(): SQL {
+  return sql`${searchArmsColumn("issue_id")} = ${issues.id}`;
+}
+
+/** The relevance sort key, read straight off the joined arms rather than recomputed per row. */
+export function issueSearchRankExpr(): SQL<number> {
+  return sql<number>`${searchArmsColumn("search_rank")}`;
 }
 
 function hasPlanDocumentCondition(companyId: string, hasPlanDocument: boolean): SQL {
@@ -9095,21 +9179,11 @@ export function issueService(db: Db) {
       const escapedSearch = hasSearch ? escapeLikePattern(rawSearch) : "";
       const startsWithPattern = `${escapedSearch}%`;
       const containsPattern = `%${escapedSearch}%`;
-      const titleStartsWithMatch = sql<boolean>`${issues.title} ILIKE ${startsWithPattern} ESCAPE '\\'`;
-      const titleContainsMatch = sql<boolean>`${issues.title} ILIKE ${containsPattern} ESCAPE '\\'`;
-      const identifierStartsWithMatch = sql<boolean>`${issues.identifier} ILIKE ${startsWithPattern} ESCAPE '\\'`;
-      const identifierContainsMatch = sql<boolean>`${issues.identifier} ILIKE ${containsPattern} ESCAPE '\\'`;
-      const descriptionContainsMatch = sql<boolean>`${issues.description} ILIKE ${containsPattern} ESCAPE '\\'`;
-      const commentContainsMatch = sql<boolean>`
-        EXISTS (
-          SELECT 1
-          FROM ${issueComments}
-          WHERE ${issueComments.issueId} = ${issues.id}
-            AND ${issueComments.companyId} = ${companyId}
-            AND ${issueComments.deletedAt} IS NULL
-            AND ${issueComments.body} ILIKE ${containsPattern} ESCAPE '\\'
-        )
-      `;
+      // PEN-3596: the four search branches and their relevance ranks are built
+      // ONCE, by `issueSearchArmsSubquery`, and joined. They used to be six
+      // per-row `ILIKE`/`EXISTS` fragments re-derived in the ORDER BY `CASE`;
+      // the comment one was a correlated probe costing ~61% of execution in
+      // production. See that function's header for the measurement.
       if (filters?.descendantOf) {
         conditions.push(sql<boolean>`
           ${issues.id} IN (
@@ -9183,9 +9257,10 @@ export function issueService(db: Db) {
         if (labeledIssueIds.length === 0) return [];
         conditions.push(inArray(issues.id, labeledIssueIds.map((row) => row.issueId)));
       }
-      if (hasSearch) {
-        conditions.push(issueSearchMatchCondition(companyId, containsPattern));
-      }
+      // PEN-3596: membership in the search arms is expressed as the JOIN below,
+      // not as a WHERE predicate, so the same indexed pass yields both "does
+      // this row match?" and "how well?". Pushing an `id IN (...)` here as
+      // well would run the four arms a second time.
       if (
         (filters?.excludeRoutineExecutions && !filters?.originKind && !filters?.originKindPrefix && !filters?.originId) ||
         shouldExcludeRoutineExecutionIssues(filters)
@@ -9198,29 +9273,24 @@ export function issueService(db: Db) {
         );
       }
       const priorityOrder = sql`CASE ${issues.priority} WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END`;
-      // PEN-3596: `commentContainsMatch` stays a correlated EXISTS *here*, on
-      // purpose. Once the WHERE above narrows the candidate set, the planner
-      // serves it as an index scan over just those rows (490 loops on the seed,
-      // ~0.01ms each); re-expressing it as the same `IN (SELECT ...)` the WHERE
-      // uses makes it a second full trigram scan of issue_comments, and measured
-      // WORSE on the production-shaped seed (76-82ms against 57-72ms, in the
-      // four-composite-index variant the comparison was run in). Likewise
-      // `descriptionContainsMatch` is cheap here now — it only ever runs on
-      // rows that already matched.
-      const searchOrder = sql<number>`
-        CASE
-          WHEN ${titleStartsWithMatch} THEN 0
-          WHEN ${titleContainsMatch} THEN 1
-          WHEN ${identifierStartsWithMatch} THEN 2
-          WHEN ${identifierContainsMatch} THEN 3
-          WHEN ${commentContainsMatch} THEN 4
-          WHEN ${descriptionContainsMatch} THEN 5
-          ELSE 6
-        END
-      `;
-      const baseQuery = db
-        .select(issueListSelect)
-        .from(issues)
+      // PEN-3596: the relevance key is now a COLUMN off the joined arms, not a
+      // `CASE` that re-derives four `ILIKE`s (one of them a correlated probe
+      // over `issue_comments`) for every candidate row before `LIMIT` can
+      // discard it. Ranks and ordering are unchanged — see
+      // `issueSearchArmsSubquery` for the equivalence argument and the
+      // production measurement that motivated it.
+      const searchOrder = issueSearchRankExpr();
+      // `$dynamic()` so the join can be conditional without the builder type
+      // changing under the assignment; the no-search statement is byte-identical
+      // to what it was before this change.
+      const scopedQuery = db.select(issueListSelect).from(issues).$dynamic();
+      const joinedQuery = hasSearch
+        ? scopedQuery.innerJoin(
+          issueSearchArmsSubquery(companyId, startsWithPattern, containsPattern),
+          issueSearchArmsJoinOn(),
+        )
+        : scopedQuery;
+      const baseQuery = joinedQuery
         .where(and(...conditions))
         .orderBy(...issueListOrderBy({
           hasSearch,

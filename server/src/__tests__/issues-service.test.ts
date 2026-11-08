@@ -44,7 +44,9 @@ import {
   extractExecutiveHoldMarker,
   findActiveExecutiveHold,
   ISSUE_LIST_MAX_LIMIT,
-  issueSearchMatchCondition,
+  issueSearchArmsJoinOn,
+  issueSearchArmsSubquery,
+  issueSearchRankExpr,
   issueService,
   parseExecutiveHoldMarkerTimestamp,
   recomputeBlockedIssuesStatusIfReady,
@@ -89,17 +91,20 @@ describe("issues-list search predicate shape (PEN-3596)", () => {
   // pushes, so that revert fails here instead of shipping silently.
   const COMPANY_ID = "6f1d2a3b-4c5d-6e7f-8a9b-0c1d2e3f4a5b";
   const CONTAINS_PATTERN = "%statement%";
+  const STARTS_WITH_PATTERN = "statement%";
 
-  const rendered = () => new PgDialect().sqlToQuery(issueSearchMatchCondition(COMPANY_ID, CONTAINS_PATTERN));
+  const rendered = () => new PgDialect().sqlToQuery(
+    issueSearchArmsSubquery(COMPANY_ID, STARTS_WITH_PATTERN, CONTAINS_PATTERN),
+  );
 
   it("unions one standalone id set per search branch rather than ORing them", () => {
     const { sql: text } = rendered();
     const normalized = text.replace(/\s+/g, " ").toLowerCase();
 
-    // Four branches => exactly three UNIONs, and the whole thing is an IN (...)
-    // over id sets rather than a disjunction of row predicates.
-    expect(normalized.match(/\bunion\b/g) ?? []).toHaveLength(3);
-    expect(normalized).toContain('"id" in (');
+    // Four branches => exactly three UNION ALLs. `ALL` is load-bearing: the
+    // GROUP BY below does the de-duplication a plain UNION used to do, and it
+    // has to see every arm a row matched to pick the right MIN(rank).
+    expect(normalized.match(/\bunion all\b/g) ?? []).toHaveLength(3);
     expect(normalized).not.toContain(" or ");
   });
 
@@ -117,20 +122,56 @@ describe("issues-list search predicate shape (PEN-3596)", () => {
     for (const column of ['"title"', '"identifier"', '"description"', '"body"']) {
       expect(text).toContain(column);
     }
-    // One company_id + one pattern per branch, nothing inlined into the text.
+    // One company_id + one contains-pattern per branch, nothing inlined into
+    // the text. The starts-with pattern appears twice: it ranks the title and
+    // identifier arms, and nothing else.
     expect(params.filter((param) => param === COMPANY_ID)).toHaveLength(4);
     expect(params.filter((param) => param === CONTAINS_PATTERN)).toHaveLength(4);
+    expect(params.filter((param) => param === STARTS_WITH_PATTERN)).toHaveLength(2);
     expect(text).not.toContain(COMPANY_ID);
     expect(text).not.toContain(CONTAINS_PATTERN);
+    expect(text).not.toContain(STARTS_WITH_PATTERN);
   });
 
   it("preserves the escape clause and the soft-delete filter on the comment branch", () => {
     const { sql: text } = rendered();
-    // One ESCAPE per ILIKE branch, and the escape character is a single
-    // backslash -- `containsPattern` is built by `escapeLikePattern`, so losing
-    // this turns a user-supplied `%` into a wildcard.
-    expect(text.split("ESCAPE '\\'").length - 1).toBe(4);
+    // One ESCAPE per ILIKE: four contains-branches plus the two starts-with
+    // rank tests. Losing one turns a user-supplied `%` into a wildcard, since
+    // `containsPattern` is built by `escapeLikePattern`.
+    expect(text.split("ESCAPE '\\'").length - 1).toBe(6);
     expect(text.replace(/\s+/g, " ").toLowerCase()).toContain('"deleted_at" is null');
+  });
+
+  it("carries the relevance rank out of the arms instead of leaving it to the sort key", () => {
+    const { sql: text } = rendered();
+    const normalized = text.replace(/\s+/g, " ").toLowerCase();
+
+    // MIN over the group reproduces "first matching WHEN" of the CASE this
+    // replaced, because the branches are ordered by increasing rank. Without
+    // the aggregate the join would fan a row out once per matching arm.
+    expect(normalized).toContain("min(arm.search_rank)");
+    expect(normalized).toContain("group by arm.issue_id");
+    // The six original ranks, still in their original order.
+    for (const rank of ["then 0 else 1", "then 2 else 3", ", 4", ", 5"]) {
+      expect(normalized).toContain(rank);
+    }
+  });
+
+  it("ranks from a joined column, never from a per-row re-derivation", () => {
+    // ⛔ THE REGRESSION THIS GUARDS. The sort key used to be a CASE that
+    // re-ran four ILIKEs per candidate row, one of them a correlated EXISTS
+    // over issue_comments. Production measured that probe at 2.054ms x 1,184
+    // loops -- ~61% of execution and 56.6% of all buffer traffic -- because
+    // the cost was candidate-bound and LIMIT could not reach it. The sort key
+    // must stay a plain column reference.
+    const { sql: text, params } = new PgDialect().sqlToQuery(issueSearchRankExpr());
+    expect(text.replace(/\s+/g, " ").toLowerCase()).toBe('"issue_search_arms"."search_rank"');
+    expect(params).toHaveLength(0);
+
+    const joinOn = new PgDialect().sqlToQuery(issueSearchArmsJoinOn());
+    expect(joinOn.sql.replace(/\s+/g, " ").toLowerCase())
+      .toBe('"issue_search_arms"."issue_id" = "issues"."id"');
+    expect(joinOn.params).toHaveLength(0);
   });
 });
 
