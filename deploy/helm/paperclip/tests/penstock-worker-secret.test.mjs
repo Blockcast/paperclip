@@ -192,6 +192,12 @@ const WORKER_ONLY_ENV_LITERALS = new Map([
     "PAPERCLIP_STRANDED_RECOVERY_HAND_BACK_DRAIN_ENABLED",
     "server-side scheduler flag; no agent-side reader",
   ],
+  [
+    // BLO-54721. Sizes the worker's own libuv pool. Agent Jobs run their own
+    // Node processes and must keep the default.
+    "UV_THREADPOOL_SIZE",
+    "worker libuv pool sizing; agent Jobs must not inherit it",
+  ],
 ]);
 
 test("every literal worker.extraEnv name is inheritable by agent Jobs", () => {
