@@ -18,6 +18,7 @@
 // without a repository, a remote, or a network.
 
 import {
+  ENVIRONMENT_DUMP_MIN_RUN,
   type GitHubEgressScrubClass,
   scrubGitHubEgressText,
 } from "./github-egress-scrub.js";
@@ -1716,14 +1717,38 @@ export function formatRefusal(findings: readonly GitPushFinding[]): string {
   // the repository they were pushing to, which is how PEN-4939 was filed. The
   // surrounding sentences say "this repository" meaning the AUTHOR'S, so the
   // message also has to say whose repository the record is in.
-  lines.push(
-    "When the value cannot leave the blob — a Prometheus label matcher, a Kubernetes object name, any identifier a config file has to spell out — deriving it at runtime is not available, and there is no allowlist or override by design. That case is a known class with a home, recorded in the detector's own repository rather than the one you are pushing to: see " +
-      IDENTIFIER_CLASS_DECISION_URL +
-      ", and file against the detector so the rule can be narrowed. Identifiers are exonerated under the label name that binds them, so a refusal here usually means a name or a shape the rule does not cover yet.",
+  // PEN-6123: everything from here down was written for the VALUE-level rule
+  // — it asks for "the binding name and the value's shape", and exoneration
+  // under a binding name is the only route it describes. An `environment-dump`
+  // finding has neither: it is a property of the LAYOUT of a region, matched on
+  // a run of consecutive assignment lines whatever the values are, so a
+  // reporter who follows these sentences literally cannot describe what was
+  // refused and lands on the wrong rule. Route each class to advice that fits.
+  const firedClasses = new Set<GitHubEgressScrubClass>(
+    findings.flatMap((finding) => finding.classes),
   );
-  lines.push(
-    "Report the binding name — the label or key the value sits under — and the value's shape: its length, which character classes it mixes, and how long its longest digit run is. Do not paste the refused value. The name is what decides exoneration and the shape is what the rule is measured on, so those two are enough to narrow it; and if the detector is right rather than you, quoting the value would publish a live credential somewhere more durable and more widely read than the push this door just refused.",
-  );
+
+  if (firedClasses.has("environment-dump")) {
+    lines.push(
+      `An \`environment-dump\` finding is about SHAPE, not about any one value: ${ENVIRONMENT_DUMP_MIN_RUN} or more consecutive \`NAME=VALUE\` lines are read as a dump whatever they hold, because the material this catches — short, low-entropy, human-chosen secrets in bulk — is invisible to every value-level rule. There is no binding name to report and no single value to describe, so the binding-name-and-shape report this door asks for on value-level findings does not apply to it. Report instead how many assignment lines the run has and what kind of file it is in, and do not paste the run.`,
+    );
+    // Deliberately NOT naming the layout edit that clears this rule. It is a
+    // one-line change indistinguishable from ordinary style, so printing it
+    // here would retire the detector in practice while leaving it switched on,
+    // and the author would never learn whether the finding was real. PEN-6123
+    // measured that same edit clearing a secret-bearing sectioned `.env`.
+  }
+
+  if (firedClasses.has("high-entropy-assignment")) {
+    lines.push(
+      "When the value cannot leave the blob — a Prometheus label matcher, a Kubernetes object name, any identifier a config file has to spell out — deriving it at runtime is not available, and there is no allowlist or override by design. That case is a known class with a home, recorded in the detector's own repository rather than the one you are pushing to: see " +
+        IDENTIFIER_CLASS_DECISION_URL +
+        ", and file against the detector so the rule can be narrowed. Identifiers are exonerated under the label name that binds them, so a refusal here usually means a name or a shape the rule does not cover yet.",
+    );
+    lines.push(
+      "Report the binding name — the label or key the value sits under — and the value's shape: its length, which character classes it mixes, and how long its longest digit run is. Do not paste the refused value. The name is what decides exoneration and the shape is what the rule is measured on, so those two are enough to narrow it; and if the detector is right rather than you, quoting the value would publish a live credential somewhere more durable and more widely read than the push this door just refused.",
+    );
+  }
 
   return lines.join("\n");
 }

@@ -227,6 +227,109 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-6123: a run of values that cannot hold a secret is not a dump", () => {
+    // Every value here is zero-information: nothing, a shell expansion whose
+    // literal is not in the blob, a number, or a fixed keyword.
+    const ZERO_ENTROPY_CORPUS = readFileSync(
+      new URL("./github-egress-scrub.zero-entropy-values.txt", import.meta.url),
+      "utf8",
+    )
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => !line.startsWith("#"));
+
+    const runOf = (values: string[]) => values.map((value, i) => `VAR_${i}=${value}`).join("\n");
+
+    it("exempts a run drawn entirely from the corpus", () => {
+      // The corpus carries an intentional empty-value line; keep it.
+      expect(ZERO_ENTROPY_CORPUS.length).toBeGreaterThanOrEqual(ENVIRONMENT_DUMP_MIN_RUN);
+      const text = runOf(ZERO_ENTROPY_CORPUS);
+      const result = scrubGitHubEgressText(text);
+
+      expect(result.classes).not.toContain("environment-dump");
+      expect(result.text).toBe(text);
+    });
+
+    it("is not vacuous: the same run is a dump without the exemption", () => {
+      // Guard against a corpus the run regex never matched in the first place.
+      // Swapping one value for an opaque one must re-arm the rule, which can
+      // only happen if every other line is genuinely part of a matched run.
+      const rearmed = runOf([
+        ...ZERO_ENTROPY_CORPUS.slice(0, ENVIRONMENT_DUMP_MIN_RUN - 1),
+        "s3cr3t-99",
+      ]);
+      expect(scrubGitHubEgressText(rearmed).classes).toContain("environment-dump");
+    });
+
+    it.each([
+      ["at the end", ENVIRONMENT_DUMP_MIN_RUN - 1],
+      ["in the middle", Math.floor(ENVIRONMENT_DUMP_MIN_RUN / 2)],
+      ["at the start", 0],
+    ])("one non-exempt value %s re-arms the whole run", (_label, index) => {
+      const values = Array.from({ length: ENVIRONMENT_DUMP_MIN_RUN }, () => "true");
+      values[index] = "hunter2swordfish";
+      expect(scrubGitHubEgressText(runOf(values)).classes).toContain("environment-dump");
+    });
+
+    it("strips shell quoting before testing the value", () => {
+      const text = [
+        "VAR_A='$NAMESPACE'",
+        'VAR_B="5"',
+        'VAR_C="true"',
+        "VAR_D=off",
+        "VAR_E=0.5",
+      ].join("\n");
+      expect(scrubGitHubEgressText(text).classes).not.toContain("environment-dump");
+    });
+
+    // The whole point of the count rule is bulk secrets no value-level rule can
+    // see. PEN-6123 rejected four wider allowlist clauses because each admitted
+    // one of these generators outright; they are pinned here so a later
+    // widening cannot reintroduce the hole quietly.
+    it.each([
+      [
+        "short symbol passwords",
+        ["hunter2!", "Tr0ub4dor", "s3cr3t-99", "letmein12", "p@ssw0rd1"],
+      ],
+      [
+        "a passphrase per line",
+        [
+          "dragon winter 42",
+          "falcon sunset 17",
+          "monkey shadow 91",
+          "master orange 33",
+          "silver qwerty 58",
+        ],
+      ],
+      [
+        "path-like secrets",
+        [
+          "/srv/keys/dragon417",
+          "/srv/keys/falcon221",
+          "/srv/keys/monkey908",
+          "/srv/keys/sunset144",
+          "/srv/keys/winter673",
+        ],
+      ],
+      [
+        "user:pass pairs",
+        [
+          "admin:hunter22",
+          "admin:dragon41",
+          "admin:falcon77",
+          "admin:monkey18",
+          "admin:winter63",
+        ],
+      ],
+      [
+        "dashed lowercase tokens",
+        ["dragon-4471", "falcon-2210", "monkey-9083", "sunset-1447", "winter-6735"],
+      ],
+    ])("still refuses a bulk dump of %s", (_label, values) => {
+      expect(scrubGitHubEgressText(runOf(values)).classes).toContain("environment-dump");
+    });
+  });
+
   describe("PEN-3907: content digests are not credentials", () => {
     // A lowercase-hex digest saturates the 4.0 bits/char ceiling a 16-symbol
     // alphabet allows, so entropy alone cannot separate it from a hex-encoded

@@ -106,6 +106,43 @@ const ENVIRONMENT_DUMP_RE = new RegExp(
   "gm",
 );
 
+/** Splits one matched assignment line into its value, shell quoting removed. */
+const ENV_RUN_VALUE_RE = /^[ \t]*[A-Z][A-Z0-9_]{2,}=([^\r\n]*)$/;
+
+/** A value that cannot be carrying a secret because it carries no secret-sized
+ *  information at all: nothing, a shell expansion (the literal is not in the
+ *  blob), a number with an optional unit, or a boolean-ish keyword.
+ *
+ *  PEN-6123: this is the ONLY exemption the run rule admits, and the bar is
+ *  deliberately "cannot be a secret" rather than "does not look like one".
+ *  Measured over the 142 files in Blockcast/onprem-k8s that this rule refuses
+ *  today, every wider value shape that cleared a worthwhile share of them also
+ *  admitted a matched generator of short human-chosen secrets at a 100% rate:
+ *  `contains a space` (63/142) is defeated by a passphrase, `contains a slash`
+ *  (43/142) by a path-like secret, `contains a colon` (35/142) by `user:pass`,
+ *  and `lowercase dashed identifier` (44/142) by `dragon-4471`. Human-chosen
+ *  secrets and hand-written config are drawn from one lexical space, so a
+ *  value-shape allowlist cannot separate them; this clause sidesteps that by
+ *  not reasoning about shape at all. It clears 28 of the 142 at a measured 0
+ *  slips in 10,000 synthetic secret dumps. Corpus and the rejected wider
+ *  clauses: `github-egress-scrub.zero-entropy-values.txt`.
+ */
+const ZERO_ENTROPY_VALUE_RE =
+  /^(?:|\$[A-Za-z_{(][^\r\n]*|`[^\r\n]*|-?\d+(?:\.\d+)?[A-Za-z%]{0,3}|true|false|yes|no|on|off|null|none)$/i;
+
+/** True when EVERY assignment in the run has a value that cannot hold a secret.
+ *  Unanimity is the point: one unrecognised value re-arms the whole run, so the
+ *  exemption fails closed on anything it has not been shown to be safe. */
+function isZeroEntropyRun(match: string): boolean {
+  const lines = match.split(/\r?\n/).filter((line) => line.length > 0);
+  return lines.every((line) => {
+    const value = ENV_RUN_VALUE_RE.exec(line)?.[1];
+    if (value === undefined) return false;
+    const unquoted = /^(['"])([\s\S]*)\1$/.exec(value.trim());
+    return ZERO_ENTROPY_VALUE_RE.test((unquoted ? unquoted[2] : value).trim());
+  });
+}
+
 // NAME=VALUE where the value is long and opaque. This is the fail-closed net
 // under the count threshold: one interpolated secret is not a "dump" but is
 // still a secret. Structural — it tests the value, not the name.
@@ -1455,6 +1492,11 @@ export function scrubGitHubEgressText(input: string): GitHubEgressScrubResult {
   // class in vain. The invariant is: every class reported in `classes` has a
   // visible marker in `text`.
   text = text.replace(ENVIRONMENT_DUMP_RE, (match) => {
+    // PEN-6123: a run of `FOO=$BAR` / `COUNT=5` / `ENABLED=true` is a constants
+    // block, not a dump. Checked before the marker so an exempt run is left
+    // byte-identical and its lines stay visible to the value-level detectors
+    // below — the run rule must not shadow them for a run it is declining.
+    if (isZeroEntropyRun(match)) return match;
     const nested = [...new Set(match.match(NESTED_MARKER_RE) ?? [])];
     fired.add("environment-dump");
     return [redactionMarker("environment-dump"), ...nested].join(" ");
