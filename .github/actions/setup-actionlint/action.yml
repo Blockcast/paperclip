@@ -27,6 +27,20 @@
 # been the wrong shape. A cache is writable by any run in scope; it is treated
 # here as untrusted bytes that happen to arrive quickly.
 #
+# THE RESTORED DIRECTORY IS NEVER PUT ON $GITHUB_PATH
+#
+# The checksum gates ONE file — the tarball. It says nothing about whatever
+# else a cache entry happens to contain, and a restore unpacks the whole entry.
+# So the directory the entry lands in is never the directory added to PATH:
+# the verified tarball is extracted into a freshly-created $RUNNER_TEMP
+# directory and THAT is what goes on $GITHUB_PATH. $GITHUB_PATH PREPENDS, so
+# pointing it at the restored directory would let an entry that passes the
+# tarball check still ship extra executables — a `jq`, a `node` — that shadow
+# the real ones for every later step in `policy`, which is the job that gates
+# the merge queue. Keeping the two directories apart is what makes the
+# tarball-only sentence above an invariant rather than a description of what
+# the entry currently happens to hold.
+#
 # This action NEVER saves. A save inside `policy` would upload into a
 # `refs/pull/N/merge` or single-use `gh-readonly-queue/*` scope that no later
 # run reads, and the post-step upload is itself a lane-killer — PEN-5032
@@ -146,9 +160,20 @@ runs:
       run: |
         set -euo pipefail
 
-        dest="${HOME}/.cache/actionlint"
-        mkdir -p "$dest"
-        tarball="${dest}/actionlint.tar.gz"
+        # Two directories, deliberately: `cache_dir` is the restore target and
+        # holds exactly one file this action ever reads — the tarball, and only
+        # after it matches the pin. `bindir` is created fresh here, receives the
+        # binary extracted from that verified tarball, and is the only one of
+        # the two added to $GITHUB_PATH. See the header: the checksum gates the
+        # tarball, not the entry, and $GITHUB_PATH prepends.
+        cache_dir="${HOME}/.cache/actionlint"
+        mkdir -p "$cache_dir"
+        tarball="${cache_dir}/actionlint.tar.gz"
+
+        bindir="${RUNNER_TEMP}/actionlint-${VERSION}"
+        rm -rf "$bindir"
+        mkdir -p "$bindir"
+
         url="https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
 
         # `sha256sum --check` is the single gate both paths pass through: a
@@ -211,15 +236,16 @@ runs:
           }
         fi
 
-        tar -xzf "$tarball" -C "$dest" actionlint
-        chmod +x "${dest}/actionlint"
+        tar -xzf "$tarball" -C "$bindir" actionlint
+        chmod +x "${bindir}/actionlint"
 
-        echo "bin=${dest}/actionlint" >> "$GITHUB_OUTPUT"
+        echo "bin=${bindir}/actionlint" >> "$GITHUB_OUTPUT"
         # The $GITHUB_PATH write is the load-bearing wiring, not the output
         # above: the gate resolves the binary by name off PATH
         # (ACTIONLINT_BIN || "actionlint" in scripts/check-workflows-parse.mjs)
         # and pr.yml uses this action without an `id:`, so it never reads
         # `outputs.bin`. Removing this line breaks the gate even though the
-        # output still looks correct.
-        echo "${dest}" >> "$GITHUB_PATH"
-        "${dest}/actionlint" --version
+        # output still looks correct. It names `bindir` and must never be
+        # repointed at `cache_dir` — see the header.
+        echo "${bindir}" >> "$GITHUB_PATH"
+        "${bindir}/actionlint" --version

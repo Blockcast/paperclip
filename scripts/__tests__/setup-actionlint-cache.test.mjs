@@ -58,12 +58,19 @@ function makeTarball(dir, body) {
   return { tarball, digest };
 }
 
-function runInstall({ cachedTarball, sha256, version = "9.9.9" }) {
+function runInstall({ cachedTarball, sha256, version = "9.9.9", extraCacheFiles = {} }) {
   const home = mkdtempSync(path.join(tmpdir(), "setup-actionlint-"));
   const cacheDir = path.join(home, ".cache", "actionlint");
   mkdirSync(cacheDir, { recursive: true });
   if (cachedTarball) {
     writeFileSync(path.join(cacheDir, "actionlint.tar.gz"), readFileSync(cachedTarball));
+  }
+  // Anything else a restored entry might carry. The checksum gates the
+  // tarball alone, so these stand in for the bytes nothing verifies.
+  for (const [name, body] of Object.entries(extraCacheFiles)) {
+    const extra = path.join(cacheDir, name);
+    writeFileSync(extra, body);
+    chmodSync(extra, 0o755);
   }
 
   // curl fails on every attempt: the degraded-egress case. sleep is a no-op so
@@ -79,6 +86,10 @@ function runInstall({ cachedTarball, sha256, version = "9.9.9" }) {
     chmodSync(stub, 0o755);
   }
 
+  const runnerTemp = path.join(home, "runner-temp");
+  mkdirSync(runnerTemp, { recursive: true });
+  const githubPath = path.join(home, "github_path");
+
   const scriptPath = path.join(home, "install.sh");
   writeFileSync(scriptPath, installScript());
   const result = spawnSync("bash", [scriptPath], {
@@ -86,17 +97,25 @@ function runInstall({ cachedTarball, sha256, version = "9.9.9" }) {
     env: {
       ...process.env,
       HOME: home,
+      RUNNER_TEMP: runnerTemp,
       PATH: `${stubBin}:${process.env.PATH}`,
       VERSION: version,
       SHA256: sha256,
       GITHUB_OUTPUT: path.join(home, "github_output"),
-      GITHUB_PATH: path.join(home, "github_path"),
+      GITHUB_PATH: githubPath,
     },
   });
   return {
     status: result.status,
     output: `${result.stdout || ""}${result.stderr || ""}`,
-    installedBinary: path.join(cacheDir, "actionlint"),
+    cacheDir,
+    // Where the action says it put the binary, and where it asked the job to
+    // look for it. Read from the real $GITHUB_PATH / $GITHUB_OUTPUT files
+    // rather than recomputed, so a change to either is visible here.
+    installedBinary: path.join(runnerTemp, `actionlint-${version}`, "actionlint"),
+    pathEntries: existsSync(githubPath)
+      ? readFileSync(githubPath, "utf8").split("\n").filter(Boolean)
+      : [],
     cleanup: () => rmSync(home, { recursive: true, force: true }),
   };
 }
@@ -114,6 +133,50 @@ test("a cached tarball matching the pin installs with no network draw", () => {
       assert.match(run.output, /restored from cache; no network draw/);
       assert.doesNotMatch(run.output, /download attempt/);
       assert.ok(existsSync(run.installedBinary), "the binary must be extracted from the restored tarball");
+    } finally {
+      run.cleanup();
+    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test("the restored cache directory is never put on $GITHUB_PATH", () => {
+  // The regression this guards is the one that shipped in the first cut of
+  // PEN-6132: `dest` was both the restore target and the directory handed to
+  // $GITHUB_PATH. The checksum gates ONE file -- the tarball -- but a restore
+  // unpacks the WHOLE entry, and $GITHUB_PATH PREPENDS, so any extra
+  // executable in that entry would shadow the real one for every later step
+  // in `policy`, the job that gates the merge queue. The tarball check passes
+  // here, so this case fails only on the PATH wiring and nothing else.
+  const scratch = mkdtempSync(path.join(tmpdir(), "actionlint-fixture-"));
+  try {
+    const { tarball, digest } = makeTarball(scratch, "#!/bin/sh\necho 9.9.9\n");
+    const run = runInstall({
+      cachedTarball: tarball,
+      sha256: digest,
+      extraCacheFiles: { jq: "#!/bin/sh\necho shadowed\n" },
+    });
+    try {
+      assert.equal(run.status, 0, `expected success from the cache, got:\n${run.output}`);
+      assert.ok(run.pathEntries.length > 0, "the action must write a $GITHUB_PATH entry");
+      assert.ok(
+        !run.pathEntries.includes(run.cacheDir),
+        `the restored cache directory must never reach PATH, got: ${run.pathEntries.join(", ")}`,
+      );
+      // ...and what it DOES put on PATH must hold the verified binary and
+      // nothing that rode along in the entry.
+      for (const entry of run.pathEntries) {
+        assert.ok(
+          !existsSync(path.join(entry, "jq")),
+          `an unverified file from the cache entry reached a PATH directory: ${entry}`,
+        );
+      }
+      assert.ok(existsSync(run.installedBinary), "the binary must be extracted from the restored tarball");
+      assert.ok(
+        run.pathEntries.includes(path.dirname(run.installedBinary)),
+        "the directory holding the verified binary must be the one added to PATH",
+      );
     } finally {
       run.cleanup();
     }
