@@ -2611,6 +2611,62 @@ function isClosedIssueStatus(status: string | null | undefined): status is "done
   return status === "done" || status === "cancelled";
 }
 
+/**
+ * What one `agent://` mention did, as the mention-wake paths decide it.
+ *
+ * `granted_without_wake` is the case PEN-6035 exists for: the author WAS
+ * entitled, so `agentHasMentionGrantOnIssue` will re-derive standing
+ * `issue:comment` access from this comment row forever after, and no wake was
+ * raised because the row is closed.
+ */
+type IssueMentionWakeVerdict = "wake" | "granted_without_wake" | "without_grant";
+
+/**
+ * The whole mention-wake decision, in one place.
+ *
+ * PEN-6035. Every mention-wake site used to spell this as two consecutive
+ * `continue` guards, and the receipt (`mentionsWithoutGrant`) re-expressed only
+ * the second of them. That is how a mention could grant standing access, wake
+ * nobody, and come back on the receipt looking exactly like a delivered one:
+ * the receipt modelled entitlement and the wake carried entitlement AND a
+ * status term, so the two were never the same statement.
+ *
+ * Both the wake sites and the receipt now read this one function, so a term
+ * added here reaches the behaviour and the report in the same edit. A second
+ * derivation of "would this have woken?" is precisely the PEN-5846 defect — one
+ * rule written down twice, free to drift — and reproducing it on the reporting
+ * side would be worse than the gap it closes, because the receipt would then be
+ * affirmatively wrong rather than merely silent.
+ *
+ * `reopened` is the inline sites' `&& !reopened`. The keyed path passes `false`
+ * and cannot do otherwise: `POST /issues/:id/comments` refuses an
+ * `idempotencyKey` together with any move-to-todo, so by the time the keyed
+ * builder runs a reopen has either already rewritten the status or been
+ * refused.
+ */
+function classifyIssueMentionWake(input: {
+  mentionedAgentId: string;
+  issueStatus: string | null | undefined;
+  reopened: boolean;
+  issueAssigneeAgentId: string | null | undefined;
+  authorAgentId: string | null;
+  authorUserIsActiveMember: boolean;
+}): IssueMentionWakeVerdict {
+  // Entitlement first, and the order is a reporting decision rather than a
+  // behavioural one — every non-`wake` verdict leads to the same `continue`.
+  // An unentitled mention confers nothing on a closed row either, so asking
+  // about the grant first keeps `without_grant` meaning exactly what it meant
+  // before this function existed, on rows of every status.
+  if (!commentAuthorCanGrantIssueMention({
+    mentionedAgentId: input.mentionedAgentId,
+    issueAssigneeAgentId: input.issueAssigneeAgentId ?? null,
+    authorAgentId: input.authorAgentId,
+    authorUserIsActiveMember: input.authorUserIsActiveMember,
+  })) return "without_grant";
+  if (isClosedIssueStatus(input.issueStatus) && !input.reopened) return "granted_without_wake";
+  return "wake";
+}
+
 function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   issueStatus: string | null | undefined;
   assigneeAgentId: string | null | undefined;
@@ -4823,13 +4879,20 @@ export function issueRoutes(
       // still hand over access without dispatching a run onto finished work.
       // Do not "fix" the asymmetry in either direction. See
       // docs/security/issue-authorization-model.md, "Who may grant a mention".
-      if (isClosedIssueStatus(input.issue.status)) continue;
-      if (!commentAuthorCanGrantIssueMention({
+      //
+      // PEN-6035 folded both terms into `classifyIssueMentionWake` so the
+      // receipt this route returns is derived from the same function, not from
+      // a second copy of these guards. The `granted_without_wake` verdict is
+      // exactly the asymmetry two paragraphs up, named rather than implied.
+      // `reopened: false` is the "not even in scope here" above.
+      if (classifyIssueMentionWake({
         mentionedAgentId: mentionedId,
+        issueStatus: input.issue.status,
+        reopened: false,
         issueAssigneeAgentId: input.issue.assigneeAgentId,
         authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
         authorUserIsActiveMember,
-      })) continue;
+      }) !== "wake") continue;
       const key = `${mentionedId}:${input.issue.id}`;
       if (wakeups.has(key)) continue;
       wakeups.set(key, {
@@ -5422,13 +5485,17 @@ export function issueRoutes(
   // remove the status term from the wake, and do not add one to the grant.
   //
   // PEN-5353: the three sites are cited by symbol, not by line. They are the
-  // `continue`-on-failed-`commentAuthorCanGrantIssueMention` guards in
+  // `continue`-on-non-`"wake"`-`classifyIssueMentionWake` guards in
   // `buildKeyedCommentEffectIntents`, in the `router.patch("/issues/:id", ...)`
   // handler, and in the `router.post("/issues/:id/comments", ...)` handler.
-  // `grep -n commentAuthorCanGrantIssueMention server/src/routes/issues.ts` lists
-  // the import plus exactly those three. This comment previously carried raw line
-  // numbers; they went stale on the very PR that added this block, which is why
-  // they are gone.
+  // `grep -n classifyIssueMentionWake server/src/routes/issues.ts` lists the
+  // definition plus exactly those three and the `commentResponseBody()`
+  // partition — which is the point of the function: the receipt is a fourth
+  // READER of the decision, not a fourth copy of it (PEN-6035). This comment
+  // previously carried raw line numbers; they went stale on the very PR that
+  // added this block, which is why they are gone. It cited
+  // `commentAuthorCanGrantIssueMention` until PEN-6035 moved the call inside
+  // `classifyIssueMentionWake`, where it is now the first of two terms.
   //
   // Pinned by "does not wake a mentioned agent when an agent comment cannot
   // grant reply access" and "does not enqueue a keyed mention wake when an agent
@@ -5440,7 +5507,9 @@ export function issueRoutes(
   // the differential cases in "closed-row mention wakes do not depend on
   // `idempotencyKey` (PEN-5846)" in the same file, which post the same body to
   // the same closed row with and without a key and compare the two wake sets to
-  // each other rather than to a constant.
+  // each other rather than to a constant. "the receipt separates a granted
+  // mention that woke nobody from one that woke (PEN-6035)" pins the third
+  // axis: that the REPORT of the decision tracks the decision.
   //
   // The wake and the grant are co-extensive only AT CREATE TIME. The grant is
   // re-derived per request against the issue's CURRENT assignee (`decideBase`
@@ -5497,10 +5566,30 @@ export function issueRoutes(
     assigneeAgentId: string | null;
     reason: Awaited<ReturnType<typeof decideIssueAccess>>["reason"];
     nearMissRelations?: string[];
+    issueStatus?: string | null;
   }): string | null {
     if (input.reason !== "deny_missing_grant") return null;
     if (!input.assigneeAgentId) return null;
     if (input.assigneeAgentId === input.actorAgentId) return null;
+    // PEN-6035: checked against the PEN-5846 ruling and found SOUND but
+    // incomplete on a closed row. The instruction itself still works there —
+    // `agentHasMentionGrantOnIssue` never reads the issues table, so the
+    // assignee's mention grants exactly as described, `done`/`cancelled` or
+    // not. What changes is that nothing announces it: the mention raises no
+    // wake, so the reader of this message is not told the grant arrived, and
+    // the assignee is not woken by the ask either. A reader who takes "it takes
+    // effect immediately" to mean "you will hear about it" waits forever, which
+    // is the one way this text can mislead. Say so rather than weaken the
+    // remedy, and say it only where it is true.
+    const closedRowNote = isClosedIssueStatus(input.issueStatus)
+      ? (
+        ` Note this issue is ${input.issueStatus}: a mention still grants on a closed issue, but it wakes ` +
+        `nobody — not you when the grant lands, and not the assignee when you ask for it. Nothing will ` +
+        `notify you, so retry the write rather than waiting, and raise the ask somewhere that does wake ` +
+        `them. The assignee sees it on their side: a mention that grants without waking is reported as ` +
+        `mentionsGrantedWithoutWake on their comment receipt.`
+      )
+      : "";
     // PEN-5780: a `dependency_edge` near miss is not the state the text below
     // describes. The actor already holds a live edge, so "respond on an issue
     // you are assigned to and reference this one" is what they just tried, and
@@ -5520,7 +5609,7 @@ export function issueRoutes(
         `set changes nothing. Inverting the edge is not a remedy either: it records a dependency that ` +
         `does not hold. Re-stamping is possible but takes two writes, by a principal with standing on ` +
         `this issue who can also write the blocker set that holds the edge; for an edge on your own ` +
-        `issue's blocker set that is a board user.`
+        `issue's blocker set that is a board user.` + closedRowNote
       );
     }
     return (
@@ -5535,7 +5624,7 @@ export function issueRoutes(
       `to mention you here. If ` +
       `you need to reach this assignee across many issues at once, do not collect grants one ` +
       `issue at a time: escalate the batch to an agent above them in the reportsTo chain, ` +
-      `which carries issue:comment on their assignees' issues without any grant.`
+      `which carries issue:comment on their assignees' issues without any grant.` + closedRowNote
     );
   }
 
@@ -5758,6 +5847,7 @@ export function issueRoutes(
         assigneeAgentId: issue.assigneeAgentId,
         reason: boundaryDecision.reason,
         nearMissRelations: boundaryDecision.nearMissRelations,
+        issueStatus: issue.status,
       });
       return {
         allowed: false,
@@ -15359,13 +15449,19 @@ export function issueRoutes(
         }
 
         for (const mentionedId of mentionedIds) {
-          if (isClosedIssueStatus(issue.status) && !reopened) continue;
-          if (!commentAuthorCanGrantIssueMention({
+          // PEN-6035: the two guards that stood here are the two terms of
+          // `classifyIssueMentionWake`, in the same order. This route returns
+          // no mention receipt, so nothing here reads the verdict apart from
+          // the `continue` — it shares the function so that a term added for
+          // the comment route cannot silently skip this one.
+          if (classifyIssueMentionWake({
             mentionedAgentId: mentionedId,
+            issueStatus: issue.status,
+            reopened,
             issueAssigneeAgentId: issue.assigneeAgentId,
             authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
             authorUserIsActiveMember,
-          })) continue;
+          }) !== "wake") continue;
           addWakeup(mentionedId, {
             source: "automation",
             triggerDetail: "system",
@@ -17665,39 +17761,96 @@ export function issueRoutes(
     // the grant does attach on a closed row, and would still attach whatever term
     // the wake loop grows next. PEN-5846 tracks the three sites disagreeing on the
     // closed term; this is a reporting surface and does not try to settle it.
+    //
+    // PEN-6035: `mentionsGrantedWithoutWake` is the fourth list, and it is the
+    // DISJOINT MIRROR of the third — the paragraph above describes the gap it
+    // closes and stops one step short of closing it. `mentionsWithoutGrant`
+    // reports (bound) ∧ (no grant); this reports (bound) ∧ (grant) ∧ (no wake).
+    // A bound mention is in exactly one of the two sets, or in neither because
+    // it woke somebody, so `mentionsWithoutGrant: []` can no longer be read as
+    // delivery.
+    //
+    // It is a fourth field rather than a wider `mentionsWithoutGrant` because
+    // that field is NAMED after the grant: reporting a case where the grant did
+    // attach would make its name lie, and a new meaning for a shipped name is
+    // the defect PEN-5886 exists to stop. It is not a wake dimension on
+    // `boundMentions` either — that changes a shipped contract for every reader
+    // of a field whose documented meaning is "resolved", and resolution is not
+    // what moved.
+    //
+    // Why this is worth one unconditional key on every comment response: the
+    // closed-row grant is the HIGH-VOLUME, LEAST-DELIBERATE mention there is.
+    // Measured over two seats' rows (PEN-6035), 127 grant-creating mentions
+    // produced 19 standing grants and NOT ONE was written as an access
+    // decision — all of them were a thanks, a routing ping, a closing handoff.
+    // Nobody is going to go looking for this; it has to arrive on the receipt.
     const commentResponseBody = async () => {
       let unboundMentions: string[] = [];
       let boundMentions: string[] = [];
       let mentionsWithoutGrant: string[] = [];
+      let mentionsGrantedWithoutWake: string[] = [];
       try {
         const boundAgentIds = await resolveMentionedAgentIds();
         const authorUserIsActiveMember = await resolveAuthorUserIsActiveMember(boundAgentIds.length > 0);
-        // The same predicate, with the same arguments, that the wake loop
-        // `continue`s on. Evaluated against `currentIssue` at response time, so
-        // a reopen or an in-request reassignment reports the assignee the wake
-        // was actually judged against.
-        const withoutGrantAgentIds = boundAgentIds.filter((mentionedAgentId) => !commentAuthorCanGrantIssueMention({
-          mentionedAgentId,
-          issueAssigneeAgentId: currentIssue.assigneeAgentId,
-          authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
-          authorUserIsActiveMember,
-        }));
+        // PEN-6035: the whole wake decision, not half of it. This used to apply
+        // `commentAuthorCanGrantIssueMention` alone, which is the wake's SECOND
+        // term; the first is the closed-status one, and a mention suppressed by
+        // it landed in no list at all. Classifying once and partitioning the
+        // result is what makes the receipt and the wake one statement — see
+        // `classifyIssueMentionWake`.
+        //
+        // Evaluated against `currentIssue` at response time, so a reopen or an
+        // in-request reassignment reports the row the wake was actually judged
+        // against.
+        const withoutGrantAgentIds: string[] = [];
+        const grantedWithoutWakeAgentIds: string[] = [];
+        for (const mentionedAgentId of boundAgentIds) {
+          switch (classifyIssueMentionWake({
+            mentionedAgentId,
+            issueStatus: currentIssue.status,
+            reopened,
+            issueAssigneeAgentId: currentIssue.assigneeAgentId,
+            authorAgentId: actor.actorType === "agent" ? actor.actorId : null,
+            authorUserIsActiveMember,
+          })) {
+            case "without_grant":
+              withoutGrantAgentIds.push(mentionedAgentId);
+              break;
+            case "granted_without_wake":
+              grantedWithoutWakeAgentIds.push(mentionedAgentId);
+              break;
+            default:
+              break;
+          }
+        }
         const mentionReport = extractMentionBindingReport(persistedComment.body, {
           boundAgentIds,
           withoutGrantAgentIds,
+          grantedWithoutWakeAgentIds,
         });
         unboundMentions = mentionReport.unbound;
         boundMentions = mentionReport.bound;
         mentionsWithoutGrant = mentionReport.withoutGrant;
+        mentionsGrantedWithoutWake = mentionReport.grantedWithoutWake;
       } catch (err) {
         // Fail toward "nothing bound": a false re-send costs one round trip, a
         // false all-clear costs the wake. `mentionsWithoutGrant` defaults empty
         // for the same reason its siblings do — an empty list here is weaker
         // than a populated one, and the body is still readable from
-        // `unboundMentions`.
+        // `unboundMentions`. `mentionsGrantedWithoutWake` defaults empty on the
+        // same reasoning, with one difference worth naming: an empty value
+        // there is the ALREADY-AMBIGUOUS reading this field was added to
+        // disambiguate, so the failure degrades the receipt to its pre-PEN-6035
+        // state rather than to a new wrong claim.
         logger.warn({ err, issueId: id }, "failed to scan comment for unbound @-mentions");
       }
-      return { ...persistedComment, unboundMentions, boundMentions, mentionsWithoutGrant };
+      return {
+        ...persistedComment,
+        unboundMentions,
+        boundMentions,
+        mentionsWithoutGrant,
+        mentionsGrantedWithoutWake,
+      };
     };
 
     if ("deduplicated" in comment && comment.deduplicated) {
@@ -17952,13 +18105,17 @@ export function issueRoutes(
       const authorUserIsActiveMember = await resolveAuthorUserIsActiveMember(mentionedIds.length > 0);
 
       for (const mentionedId of mentionedIds) {
-        if (isClosedIssueStatus(currentIssue.status) && !reopened) continue;
-        if (!commentAuthorCanGrantIssueMention({
+        // PEN-6035: one classification, shared with `commentResponseBody()`
+        // above — the receipt and the wake are now two readings of the same
+        // verdict rather than two expressions of one rule.
+        if (classifyIssueMentionWake({
           mentionedAgentId: mentionedId,
+          issueStatus: currentIssue.status,
+          reopened,
           issueAssigneeAgentId: currentIssue.assigneeAgentId,
           authorAgentId: actorIsAgent ? actor.actorId : null,
           authorUserIsActiveMember,
-        })) continue;
+        }) !== "wake") continue;
         addWakeup(mentionedId, {
           source: "automation",
           triggerDetail: "system",

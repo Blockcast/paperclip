@@ -276,7 +276,7 @@ describe("extractMentionBindingReport", () => {
         `[@Cfo](${boundHref}) please rule — @Cfo also owns the ledger question`,
         opts,
       ),
-    ).toEqual({ bound: ["Cfo"], unbound: ["Cfo"], withoutGrant: [] });
+    ).toEqual({ bound: ["Cfo"], unbound: ["Cfo"], withoutGrant: [], grantedWithoutWake: [] });
   });
 
   it("CONTRAST: the bare-only body reports the same unbound list and NO bound one", () => {
@@ -284,6 +284,7 @@ describe("extractMentionBindingReport", () => {
       bound: [],
       unbound: ["Cfo"],
       withoutGrant: [],
+      grantedWithoutWake: [],
     });
   });
 
@@ -292,6 +293,7 @@ describe("extractMentionBindingReport", () => {
       bound: ["Cfo"],
       unbound: [],
       withoutGrant: [],
+      grantedWithoutWake: [],
     });
   });
 
@@ -301,12 +303,12 @@ describe("extractMentionBindingReport", () => {
     // all-clear this field exists to prevent.
     expect(
       extractMentionBindingReport(`[@Ghost](${buildAgentMentionHref("agent-gone", null)})`, opts),
-    ).toEqual({ bound: [], unbound: ["Ghost"], withoutGrant: [] });
+    ).toEqual({ bound: [], unbound: ["Ghost"], withoutGrant: [], grantedWithoutWake: [] });
   });
 
   it("does not report non-agent mention schemes as bound", () => {
     const body = `[@Taylor](${buildUserMentionHref("user-1")})`;
-    expect(extractMentionBindingReport(body, opts)).toEqual({ bound: [], unbound: [], withoutGrant: [] });
+    expect(extractMentionBindingReport(body, opts)).toEqual({ bound: [], unbound: [], withoutGrant: [], grantedWithoutWake: [] });
   });
 
   it("reads a bare label, the `[Cfo](agent://…)` form", () => {
@@ -314,13 +316,14 @@ describe("extractMentionBindingReport", () => {
       bound: ["Cfo"],
       unbound: [],
       withoutGrant: [],
+      grantedWithoutWake: [],
     });
   });
 
   it("reads the @-token out of a label carrying extra prose", () => {
     expect(
       extractMentionBindingReport(`[@Cfo — please rule](${boundHref}) and @Cfo again`, opts),
-    ).toEqual({ bound: ["Cfo"], unbound: ["Cfo"], withoutGrant: [] });
+    ).toEqual({ bound: ["Cfo"], unbound: ["Cfo"], withoutGrant: [], grantedWithoutWake: [] });
   });
 
   it("RESIDUAL: a label with no name in it reports nothing bound", () => {
@@ -330,13 +333,14 @@ describe("extractMentionBindingReport", () => {
       bound: [],
       unbound: [],
       withoutGrant: [],
+      grantedWithoutWake: [],
     });
   });
 
   it("dedupes bound names case-insensitively, as `unbound` does", () => {
     expect(
       extractMentionBindingReport(`[@Cfo](${boundHref}) and [@cfo](${boundHref})`, opts),
-    ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: [] });
+    ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: [], grantedWithoutWake: [] });
   });
 
   it("reports a bound link inside a code fence, because the wake really fires", () => {
@@ -344,7 +348,7 @@ describe("extractMentionBindingReport", () => {
     // body, so a fenced `agent://` link does raise a wake. Masking it here
     // would report a wake that happened as one that did not.
     const body = ["```md", `[@Cfo](${boundHref})`, "```"].join("\n");
-    expect(extractMentionBindingReport(body, opts)).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: [] });
+    expect(extractMentionBindingReport(body, opts)).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: [], grantedWithoutWake: [] });
   });
 
   it("returns both halves empty for a mention-free body", () => {
@@ -352,8 +356,9 @@ describe("extractMentionBindingReport", () => {
       bound: [],
       unbound: [],
       withoutGrant: [],
+      grantedWithoutWake: [],
     });
-    expect(extractMentionBindingReport("", opts)).toEqual({ bound: [], unbound: [], withoutGrant: [] });
+    expect(extractMentionBindingReport("", opts)).toEqual({ bound: [], unbound: [], withoutGrant: [], grantedWithoutWake: [] });
   });
 
   it("extractUnboundMentionTokens stays the unbound half, unchanged", () => {
@@ -379,13 +384,13 @@ describe("extractMentionBindingReport", () => {
           boundAgentIds: [BOUND_AGENT_ID, OTHER_AGENT_ID],
           withoutGrantAgentIds: [OTHER_AGENT_ID],
         }),
-      ).toEqual({ bound: ["Cfo", "Qa"], unbound: [], withoutGrant: ["Qa"] });
+      ).toEqual({ bound: ["Cfo", "Qa"], unbound: [], withoutGrant: ["Qa"], grantedWithoutWake: [] });
     });
 
     it("is empty when the caller names nobody", () => {
       expect(
         extractMentionBindingReport(`[@Cfo](${boundHref}) please rule`, opts),
-      ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: [] });
+      ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: [], grantedWithoutWake: [] });
     });
 
     it("reduces the name exactly as `bound` does, so the lists stay comparable", () => {
@@ -396,13 +401,13 @@ describe("extractMentionBindingReport", () => {
           ...opts,
           withoutGrantAgentIds: [BOUND_AGENT_ID],
         }),
-      ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: ["Cfo"] });
+      ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: ["Cfo"], grantedWithoutWake: [] });
       expect(
         extractMentionBindingReport(`[the CFO](${boundHref})`, {
           ...opts,
           withoutGrantAgentIds: [BOUND_AGENT_ID],
         }),
-      ).toEqual({ bound: [], unbound: [], withoutGrant: [] });
+      ).toEqual({ bound: [], unbound: [], withoutGrant: [], grantedWithoutWake: [] });
     });
 
     it("dedupes case-insensitively, as both siblings do", () => {
@@ -411,7 +416,7 @@ describe("extractMentionBindingReport", () => {
           ...opts,
           withoutGrantAgentIds: [BOUND_AGENT_ID],
         }),
-      ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: ["Cfo"] });
+      ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: ["Cfo"], grantedWithoutWake: [] });
     });
 
     it("ignores an id that did not resolve, so the three lists stay disjoint from `unbound`", () => {
@@ -422,7 +427,7 @@ describe("extractMentionBindingReport", () => {
           boundAgentIds: [],
           withoutGrantAgentIds: ["agent-never-resolved"],
         }),
-      ).toEqual({ bound: [], unbound: ["Ceo"], withoutGrant: [] });
+      ).toEqual({ bound: [], unbound: ["Ceo"], withoutGrant: [], grantedWithoutWake: [] });
     });
 
     it("a name past the `bound` cap is still reported, so this is NOT a strict subset", () => {
@@ -461,6 +466,64 @@ describe("extractMentionBindingReport", () => {
       expect(with_.unbound).toEqual(without.unbound);
       expect(with_.withoutGrant).toEqual(["Cfo"]);
       expect(without.withoutGrant).toEqual([]);
+    });
+  });
+
+  describe("grantedWithoutWake (PEN-6035)", () => {
+    const OTHER_AGENT_ID = "agent-qa-1";
+    const otherHref = buildAgentMentionHref(OTHER_AGENT_ID, null);
+
+    it("reports the names the caller says were granted but woke nobody", () => {
+      expect(
+        extractMentionBindingReport(`[@Cfo](${boundHref}) over to you`, {
+          ...opts,
+          grantedWithoutWakeAgentIds: [BOUND_AGENT_ID],
+        }),
+      ).toEqual({ bound: ["Cfo"], unbound: [], withoutGrant: [], grantedWithoutWake: ["Cfo"] });
+    });
+
+    it("CONTROL ARM: splits one body across the two disjoint lists", () => {
+      // The whole reason this is a separate field. Same body, same scan, two
+      // resolved names, and the caller places each on a different side of the
+      // wake decision. Neither name may appear in both lists.
+      const report = extractMentionBindingReport(
+        `[@Cfo](${boundHref}) and [@Qa](${otherHref})`,
+        {
+          boundAgentIds: [BOUND_AGENT_ID, OTHER_AGENT_ID],
+          withoutGrantAgentIds: [OTHER_AGENT_ID],
+          grantedWithoutWakeAgentIds: [BOUND_AGENT_ID],
+        },
+      );
+      expect(report).toEqual({
+        bound: ["Cfo", "Qa"],
+        unbound: [],
+        withoutGrant: ["Qa"],
+        grantedWithoutWake: ["Cfo"],
+      });
+      expect(report.withoutGrant.filter((n) => report.grantedWithoutWake.includes(n))).toEqual([]);
+    });
+
+    it("ignores an id that did not resolve, as its sibling does", () => {
+      expect(
+        extractMentionBindingReport("@Ceo please rule", {
+          boundAgentIds: [],
+          grantedWithoutWakeAgentIds: ["agent-never-resolved"],
+        }),
+      ).toEqual({ bound: [], unbound: ["Ceo"], withoutGrant: [], grantedWithoutWake: [] });
+    });
+
+    it("leaves every other list byte-identical to a call without the option", () => {
+      const body = `[@Cfo](${boundHref}) please rule — @Ceo also owns this`;
+      const without = extractMentionBindingReport(body, opts);
+      const with_ = extractMentionBindingReport(body, {
+        ...opts,
+        grantedWithoutWakeAgentIds: [BOUND_AGENT_ID],
+      });
+      expect(with_.bound).toEqual(without.bound);
+      expect(with_.unbound).toEqual(without.unbound);
+      expect(with_.withoutGrant).toEqual(without.withoutGrant);
+      expect(with_.grantedWithoutWake).toEqual(["Cfo"]);
+      expect(without.grantedWithoutWake).toEqual([]);
     });
   });
 });

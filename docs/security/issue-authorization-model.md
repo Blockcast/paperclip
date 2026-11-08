@@ -579,13 +579,16 @@ places and only the first is ever reported back to the author. A well-formed
   `PEN-5812` adds the sibling `mentionsWithoutGrant`, below;
 - raises **no** `issue_comment_mentioned` wake — the wake is gated on this same
   predicate at all three comment-create paths in `server/src/routes/issues.ts`. Each
-  is a `continue` on a failed `commentAuthorCanGrantIssueMention({ ... })` guard
-  inside the `for (const mentionedId of mentionedIds)` loop, in:
+  is a `continue` on a `classifyIssueMentionWake({ ... })` verdict other than
+  `"wake"` inside the `for (const mentionedId of mentionedIds)` loop, in:
   `buildKeyedCommentEffectIntents`, the `router.patch("/issues/:id", ...)` handler,
   and the `router.post("/issues/:id/comments", ...)` handler. To list them, grep the
-  predicate rather than trusting a line number:
-  `grep -n commentAuthorCanGrantIssueMention server/src/routes/issues.ts` returns the
-  import plus exactly those three call sites. Each has a positive control in
+  classifier rather than trusting a line number:
+  `grep -n classifyIssueMentionWake server/src/routes/issues.ts` returns its
+  definition, exactly those three call sites, and the receipt partition in the
+  comments route. (It returned `commentAuthorCanGrantIssueMention` until
+  `PEN-6035` moved that call inside the classifier, where it is the first of two
+  terms.) Each has a positive control in
   `server/src/__tests__/issue-update-comment-wakeup-routes.test.ts`. Entitlement is
   **not the only gate on the wake** — see "The wake carries a closed-status term,
   the grant does not" below, and do not read this bullet as the complete rule;
@@ -735,14 +738,18 @@ today.
 should hand over access without dispatching a run onto work that is finished. Do
 not remove the status term from the wake, and do not add one to the grant.
 
-**One consequence to carry, because nothing reports it.** The 403 body built by
+**One consequence to carry.** The 403 body built by
 `issueCommentGrantRemediation` tells a blocked agent to ask the assignee to post a
 mention link. On a closed row the assignee doing exactly that succeeds — the grant
-attaches — and the blocked agent is never woken to use it. The author sees a 201,
-an empty `unboundMentions`, and the mentioned name in `boundMentions`. That is the
+attaches — and the blocked agent is never woken to use it. That is the
 mirror image of the inert mention described above: there the mention bound and
-granted nothing; here it binds and grants, and nothing is dispatched. Both read
-identically to their author.
+granted nothing; here it binds and grants, and nothing is dispatched.
+
+Until `PEN-6035` both read identically to their author: a 201, an empty
+`unboundMentions`, the mentioned name in `boundMentions`, and an empty
+`mentionsWithoutGrant`. The next sub-section is how that was closed, and the
+remediation body now names the consequence on a closed row rather than leaving
+the reader to wait for a notification that is never coming.
 
 The three wake sites disagreed on term 2 until `PEN-5846`: the two inline paths
 suppressed and the `idempotencyKey` path did not, so passing a **dedupe** key was
@@ -752,6 +759,53 @@ already in the code above `skipAssigneeCommentWake` in the
 `router.patch("/issues/:id", ...)` handler: *"Terminal issues are closed work for
 every agent, including explicitly mentioned peers. Only an explicit reopen makes
 the thread actionable again."*
+
+### The receipt reports the asymmetry: `mentionsGrantedWithoutWake`
+
+Decided `PEN-6035`, 2026-11-08. The asymmetry above stays exactly as it is — the
+wake keeps its status term, the grant acquires none — and the comment receipt
+gained a fourth list that says which of the two happened.
+
+`mentionsWithoutGrant` (`PEN-5812`) reports **(bound) ∧ (no grant)**.
+`mentionsGrantedWithoutWake` reports **(bound) ∧ (grant) ∧ (no wake)**. The two
+are **disjoint**, which is why this is a new field rather than a wider meaning
+for the old one: a bound mention falls in exactly one of them, or in neither
+because it woke somebody.
+
+| receipt | what happened |
+|---|---|
+| name in `unboundMentions` | the link bound to nobody |
+| name in `mentionsWithoutGrant` | no grant, no wake |
+| name in `mentionsGrantedWithoutWake` | **standing `issue:comment` granted, nobody woken** |
+| name in `boundMentions` only | granted, and the wake fired |
+
+Two things that were decided and should not be re-opened without re-reading
+this:
+
+- **Not a second meaning for `mentionsWithoutGrant`.** That field is named after
+  the grant; reporting a case where the grant *did* attach would make its name
+  lie, and a new meaning for a shipped name is the defect `PEN-5886` exists to
+  stop. **Not a wake dimension on `boundMentions`** either — that changes a
+  shipped contract for every reader of a field whose documented meaning is
+  "resolved", and resolution is not what moved.
+- **Derived from the wake decision, not from a copy of it.** Both the wake sites
+  and the receipt read `classifyIssueMentionWake` (`server/src/routes/issues.ts`),
+  which returns `"wake" | "granted_without_wake" | "without_grant"`. The sites
+  `continue` on anything that is not `"wake"`; the receipt partitions the same
+  verdicts into the two lists. A second, independent derivation of *"would this
+  have woken?"* would be `PEN-5846` reproduced one layer out — one rule written
+  down twice, free to drift, with the report and the behaviour on opposite sides
+  of the drift — and a receipt that is affirmatively wrong is worse than the
+  silence it replaced. Locate the sites with
+  `grep -n classifyIssueMentionWake server/src/routes/issues.ts`: the definition,
+  the three wake sites, and the one receipt partition.
+
+Why it was worth an unconditional key on every comment response: the closed-row
+grant is the highest-volume, least-deliberate mention there is. Measured across
+two seats' rows for `PEN-6035`, **127** grant-creating mentions produced **19**
+standing grants and **none** was written as an access decision — every one was a
+thanks, a routing ping, or a closing handoff. Nobody goes looking for this, so it
+has to arrive on the receipt.
 
 ### Why the rule stays narrow
 

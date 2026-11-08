@@ -483,6 +483,23 @@ export interface UnboundMentionScanOptions {
    * the three lists stop partitioning cleanly.
    */
   withoutGrantAgentIds?: readonly string[];
+  /**
+   * PEN-6035. The subset of {@link boundAgentIds} whose wake THIS author WAS
+   * entitled to raise — so the mention did confer the standing `issue:comment`
+   * grant — and which the wake path skipped anyway, on a term that is not
+   * entitlement. Today that term is the closed-status one; the name does not
+   * say "closed" because the caller classifies against whatever terms the wake
+   * actually carries, so a term added later lands here without a rename.
+   *
+   * Disjoint from {@link withoutGrantAgentIds} in both directions: a bound
+   * mention either conferred the grant or did not. The caller derives both sets
+   * from ONE classification of the wake decision, so they cannot overlap and
+   * neither can disagree with the wake that was really raised.
+   *
+   * Ids not also present in `boundAgentIds` are ignored, for the reason
+   * `withoutGrantAgentIds` ignores them.
+   */
+  grantedWithoutWakeAgentIds?: readonly string[];
 }
 
 /**
@@ -580,6 +597,37 @@ export interface MentionBindingReport {
    * self-mentions here is the refusal to repeat that.
    */
   withoutGrant: string[];
+  /**
+   * PEN-6035. Names that resolved AND whose author was entitled to grant them
+   * — so each one now holds standing `issue:comment` access on this row — and
+   * which woke nobody regardless, because the wake carries a term entitlement
+   * does not: the row is closed (`done`/`cancelled`) and this comment did not
+   * reopen it.
+   *
+   * This is the DISJOINT MIRROR of {@link withoutGrant}, and that is the whole
+   * reason it is a separate field rather than a wider meaning for that one. A
+   * bound mention is in exactly one of the two sets or neither:
+   *
+   *   - in `withoutGrant` — no grant, no wake;
+   *   - here — grant, no wake;
+   *   - in neither — grant, and the wake was raised.
+   *
+   * So `withoutGrant: []` was never evidence that a wake fired, and before this
+   * field nothing on the receipt could tell "your mention woke them" from "your
+   * mention handed them standing access and woke nobody". Read the two together
+   * or neither: a reader holding only `withoutGrant` will reasonably assume it
+   * covers this case, and it cannot — the predicates share nothing but the call
+   * site.
+   *
+   * SELF-MENTIONS ARE NEVER HERE. A self-mention fails the entitlement
+   * predicate, so it is reported in `withoutGrant` on a closed row exactly as
+   * on an open one.
+   *
+   * Capped independently of `bound`, like `withoutGrant`, and for the same
+   * trade: an extra "this reached nobody" costs one re-send, dropping it costs
+   * the coordination path.
+   */
+  grantedWithoutWake: string[];
 }
 
 /**
@@ -657,6 +705,10 @@ function boundLabelName(label: string): string | null {
  * the same `boundLabelName` and deduped on the same lowercased key, so all three
  * lists stay directly comparable.
  *
+ * `grantedWithoutWake` reports `options.grantedWithoutWakeAgentIds` the same
+ * way — see {@link MentionBindingReport.grantedWithoutWake} for why it is the
+ * disjoint mirror of `withoutGrant` rather than a wider reading of it.
+ *
  * The masking applies to `unbound` only. `bound` is read off the raw link scan
  * on purpose, because that is what the wake itself does: `findMentionedAgents`
  * runs `extractAgentMentionIds` over the unmasked body, so an `agent://` link
@@ -667,10 +719,11 @@ export function extractMentionBindingReport(
   markdown: string,
   options: UnboundMentionScanOptions = {},
 ): MentionBindingReport {
-  if (!markdown) return { bound: [], unbound: [], withoutGrant: [] };
+  if (!markdown) return { bound: [], unbound: [], withoutGrant: [], grantedWithoutWake: [] };
 
   const boundIds = new Set(options.boundAgentIds ?? []);
   const withoutGrantIds = new Set(options.withoutGrantAgentIds ?? []);
+  const grantedWithoutWakeIds = new Set(options.grantedWithoutWakeAgentIds ?? []);
   // Indexed by UTF-16 code unit, which is the offset space every `RegExp`
   // below reports in, so masking stays aligned with the original string.
   const units = markdown.split("");
@@ -689,6 +742,8 @@ export function extractMentionBindingReport(
   const boundTokens: string[] = [];
   const withoutGrantSeen = new Set<string>();
   const withoutGrantTokens: string[] = [];
+  const grantedWithoutWakeSeen = new Set<string>();
+  const grantedWithoutWakeTokens: string[] = [];
   const linkScanner = new RegExp(ANY_MENTION_LINK_RE.source, ANY_MENTION_LINK_RE.flags);
   let link: RegExpExecArray | null;
   while ((link = linkScanner.exec(markdown)) !== null) {
@@ -718,6 +773,17 @@ export function extractMentionBindingReport(
         ) {
           withoutGrantSeen.add(key);
           withoutGrantTokens.push(name);
+        }
+        // PEN-6035: the other half of the same silence. Here the grant DID
+        // attach and the wake still did not fire, so `bound` and `withoutGrant`
+        // together read as a delivered mention.
+        if (
+          grantedWithoutWakeIds.has(parsed.agentId)
+          && !grantedWithoutWakeSeen.has(key)
+          && grantedWithoutWakeTokens.length < MAX_UNBOUND_MENTION_TOKENS
+        ) {
+          grantedWithoutWakeSeen.add(key);
+          grantedWithoutWakeTokens.push(name);
         }
       }
     }
@@ -759,7 +825,12 @@ export function extractMentionBindingReport(
     if (tokens.length >= MAX_UNBOUND_MENTION_TOKENS) break;
   }
 
-  return { bound: boundTokens, unbound: tokens, withoutGrant: withoutGrantTokens };
+  return {
+    bound: boundTokens,
+    unbound: tokens,
+    withoutGrant: withoutGrantTokens,
+    grantedWithoutWake: grantedWithoutWakeTokens,
+  };
 }
 
 /**

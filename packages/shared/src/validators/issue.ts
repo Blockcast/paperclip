@@ -1091,6 +1091,16 @@ export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
  * predicate is reached. So a name in the list is inert, but an empty list does
  * not prove a wake fired, and the note has to say so — an affirmative all-clear
  * is the one direction this family is not allowed to fail in.
+ *
+ * PEN-6035 adds `mentionsGrantedWithoutWake`, the disjoint mirror of that
+ * third list and the end of the paragraph above: the resolved mentions this
+ * author WAS entitled to raise, which therefore conferred standing
+ * `issue:comment` access, and which woke nobody because the row is closed. The
+ * two lists partition the bound mentions that did not wake, so `[]` on both is
+ * now positive evidence of delivery instead of the ambiguity it used to be.
+ * They ship together because a reader holding one will reasonably assume it
+ * covers the other, and it cannot — the predicates share nothing but the call
+ * site.
  */
 export const COMMENT_UNBOUND_MENTIONS_NOTE =
   "⚠ A plain `@Name` MENTIONS NOBODY. The extractor binds only a markdown link "
@@ -1144,7 +1154,25 @@ export const COMMENT_UNBOUND_MENTIONS_NOTE =
   + "time from the persisted comment row and no term the wake loop grows can "
   + "reach that query — it is \"nothing happened\" that does not follow from "
   + "absence, and the two are different claims. `mentionsWithoutGrant` is "
-  + "likewise always present; absent means the server predates it. (PEN-5812)";
+  + "likewise always present; absent means the server predates it. (PEN-5812) "
+  + "⚠ THE FOURTH LIST, `mentionsGrantedWithoutWake`, IS THAT CASE — read it "
+  + "WITH `mentionsWithoutGrant`, never instead of it. It reports the resolved "
+  + "mentions you WERE entitled to raise, which therefore handed the named agent "
+  + "standing `issue:comment` access on this row, and which woke nobody anyway "
+  + "because the row is closed and this comment did not reopen it. The two lists "
+  + "are DISJOINT and that is the point: a bound mention appears in "
+  + "`mentionsWithoutGrant` (no grant, no wake), in "
+  + "`mentionsGrantedWithoutWake` (grant, no wake), or in neither (grant, and "
+  + "the wake fired). So both empty, with the name in `boundMentions`, is now "
+  + "positive evidence of delivery — before this field it was the ambiguity. A "
+  + "name here means: they can reply, and NOTHING TOLD THEM. If you need them "
+  + "to act, reopen the row, or reach them on a row that is open; re-sending "
+  + "the same body to the same closed row does the same nothing. It is computed "
+  + "from the same classification the wake sites branch on, not a second "
+  + "derivation of it, so it cannot drift from the behaviour it reports. "
+  + "Self-mentions never appear here — a self-mention fails entitlement, so it "
+  + "is in `mentionsWithoutGrant` on a closed row exactly as on an open one. "
+  + "Always present; absent means the server predates it. (PEN-6035)";
 
 export const addIssueCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)).describe(COMMENT_UNBOUND_MENTIONS_NOTE),
