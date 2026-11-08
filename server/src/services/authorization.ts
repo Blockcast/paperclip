@@ -118,6 +118,28 @@ export type AuthorizationResource =
        * `undefined` means the caller did not look it up and the guard reloads
        * the row; `null` means it looked and no user holds it. Do not collapse
        * the two — see assignmentOntoHumanHeldIssueIsRefused.
+       *
+       * PEN-6049: exactly one caller passes a literal `null` while knowing the
+       * row may have a holder — `POST /issues/:id/checkout`, where the question
+       * is settled atomically by `svc.checkout`'s claim predicate instead. That
+       * is the single sanctioned exception to the rule above, and what sanctions
+       * it is not the value but the predicate: the hazard the rule names is a
+       * literal standing in for the ONLY control. Do not generalise it to a call
+       * site that has no predicate under it — the PATCH assignment door is one,
+       * and there the live field is still the only control and must still be
+       * passed.
+       *
+       * The full argument — including why OMITTING the field is worse than
+       * passing `null`, and what auditing that line actually requires — lives at
+       * that call site in `server/src/routes/issues.ts`; grep
+       * `humanHeldQuestionDelegatedToClaimPredicate`. It is restated once more,
+       * in the model's own register, under "An agent asked to assign a row a
+       * person holds" in `docs/security/issue-authorization-model.md`. This
+       * comment is deliberately a pointer rather than a third copy: the two that
+       * remain have distinct readers — the auditor who lands on the bare `null`,
+       * and the reader studying the model — whereas a copy on the type
+       * declaration has neither, and three copies of one rationale drift without
+       * a later reader being able to tell which is stale (Ally, #3508 @ 308ea1e33).
        */
       currentAssigneeUserId?: string | null;
       createdByAgentId?: string | null;

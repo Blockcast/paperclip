@@ -887,18 +887,43 @@ without re-deciding the model itself:
   legitimately take a row off a person all bypass this call: a user actor is
   decided in an earlier branch, and the agent-to-creator hand-back and
   workflow-controlled assignment never reach `assertCanAssignTasks`.
-  ⭐ **`POST /issues/:id/checkout` deliberately does not ask this question.**
-  `svc.checkout`'s claim predicate already refuses a human-held row atomically on
-  every branch that writes `assigneeAgentId`, so a `tasks:assign` deny there
-  covers no claim the predicate misses — and it is raised *before* `svc.checkout`,
-  which preempts the stale-execution-lock clear a refused checkout performs on its
-  way out. The route delegates; the predicate enforces. That delegation is only
-  sound because the predicate is complete, which had to be established rather than
-  assumed: the **recovery-owner** branch carried no `assigneeUserId` term until
-  `PEN-5940`, and it is the one claimant that skips *both* route-level gates
+  ⭐ **`POST /issues/:id/checkout` deliberately does not ask this question**, and
+  passes `currentAssigneeUserId: null` to say so. `svc.checkout`'s claim predicate
+  already refuses a human-held row atomically on every branch that writes
+  `assigneeAgentId`, so a `tasks:assign` deny there covers no claim the predicate
+  misses — and it is raised *before* `svc.checkout`, which preempts the
+  stale-execution-lock clear a refused checkout performs on its way out. The route
+  delegates; the predicate enforces. That delegation is only sound because the
+  predicate is complete, which had to be established rather than assumed: the
+  **recovery-owner** branch carried no `assigneeUserId` term until `PEN-5940`, and
+  it is the one claimant that skips *both* route-level gates
   (`assertCanAssignTasks` and the BLO-22856 `issue:mutate` boundary) by design.
   Since the claim UPDATE sets `assigneeUserId: null`, a successful claim there did
   not just take the row — it blanked the person off it.
+  ⛔ **Delegate the QUESTION, not the CALL (`PEN-6049`).** That `null` was briefly
+  expressed instead as a conjunct that skipped `assertCanAssignTasks` altogether on
+  a human-held row — which also dropped the **BLO-19094 origin-kind guard** and the
+  restricted-policy grant check, neither of which the delegation argument says
+  anything about and neither of which the claim predicate re-checks. The route's
+  `issue` is a **pre-read**, so a person unassigned between it and the claiming
+  UPDATE leaves `unassignedAgentCheckoutCondition` matching and the claim lands with
+  `tasks:assign` never having run — on a review shell the actor was never assigned.
+  A skipped call delegates everything the call did; a parameter delegates exactly
+  itself.
+  ⚠️ **And `null` here is not the fail-open literal `PEN-5940` was filed about.**
+  The discriminator is not the value but **whether anything else enforces the rule**:
+  that hazard is a literal standing in for the *only* control, and the claim
+  predicate sits in the `WHERE` clause of the claiming UPDATE, strictly stronger
+  than any answer a route can compute from a row it read earlier. It is the
+  pre-read, not the rule, that the literal declines to speak for. The **PATCH
+  assignment door** has no predicate under it, so there the live field is still the
+  only control and must still be passed. Auditing that line means auditing the
+  predicate's completeness, not the call.
+  ℹ️ **Omitting the field is worse than `null`, not safer.** `undefined` means "the
+  caller did not look", which reloads the row inside
+  `assignmentOntoHumanHeldIssueIsRefused` — so the common case pays the `SELECT`
+  that `undefined`/`null` split exists to avoid, and a reload that finds a holder
+  denies *before* `svc.checkout` runs, reinstating the very preemption above.
 - An agent assigned a parent or sibling issue: denied on the target issue.
   Ancestry is not a declared dependency; only a `blocks` edge is.
 - An agent across a `blocks` edge: denied `issue:mutate` — the edge grants a
@@ -988,8 +1013,13 @@ silently costs, since it fires before the clear — and **"does not let a
 source-scoped recovery owner check out a row a person holds"**, which covers the
 one branch no route-level gate sees. **"delegates a human-held row at checkout to
 the claim predicate rather than denying early"** is the regression guard for the
-preemption itself. The remediation half is pinned by **"does not tell an agent to
-take a row a person holds when it denies the write"**.
+preemption itself — and it asserts the `tasks:assign` call is MADE, with
+`currentAssigneeUserId: null`, rather than asserting it is absent: an absence
+assertion also passes when the guard has been deleted outright. Its `PEN-6049`
+companion **"still runs the BLO-19094 origin-kind guard on a row a person holds"**
+is what fails if the delegation ever moves back from the parameter to the `if`.
+The remediation half is pinned by **"does not tell an agent to take a row a person
+holds when it denies the write"**.
 
 Escape hatch 3's scope is pinned by the sibling case **"blocker edge (escape hatch 3)
 gates checkout and in_progress, not done"** in the same describe block. It fails if

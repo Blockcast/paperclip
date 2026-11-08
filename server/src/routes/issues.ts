@@ -5447,7 +5447,12 @@ export function issueRoutes(
     const assigneeClause = input.assigneeAgentId
       ? `This issue is assigned to agent://${input.assigneeAgentId}. `
       : humanHeld
-        ? `This issue is assigned to a person, not to an agent. `
+        ? // PEN-5940: name the holder. "A person" alone leaves the agent with no
+          // one to ask, which is the PEN-4495 defect — a remediation that names
+          // no route at all — reappearing one level down. The phrasing itself is
+          // pinned twice in issue-agent-mutation-ownership-routes.test.ts, so
+          // extend it rather than rewording it.
+          `This issue is assigned to a person, not to an agent (user ${input.assigneeUserId}). `
         : "";
     const routeClause = humanHeld
       ? `The route that works: comment on the issue — the person holding it reads the thread ` +
@@ -15321,29 +15326,35 @@ export function issueRoutes(
 
     // PEN-5940: a row a PERSON holds is refused at this door by `svc.checkout`'s
     // own claim predicate, atomically and on every branch that writes
-    // `assigneeAgentId`, so asking `tasks:assign` the same question here is
-    // redundant — it covers no claim the predicate does not.
-    //
-    // It is not merely redundant, it is worse than nothing: the refusal this
-    // door owes a human-held row is the service's 409, because that path also
-    // clears a dead run's execution lock on its way out. A 403 raised here
-    // fires before `svc.checkout` and preempts the hygiene. Both halves are
-    // pinned by "does not let agent checkout seize an in_review issue assigned
-    // to a human reviewer" and "clears but does not adopt a stale execution
-    // lock on an in_review issue assigned to a human reviewer".
+    // `assigneeAgentId`, so asking `tasks:assign` the same question here adds
+    // no refusal the predicate does not already make — and it subtracts one.
+    // The refusal this door owes a human-held row is the service's 409, because
+    // that path also clears a dead run's execution lock on its way out; a 403
+    // raised here fires before `svc.checkout` and preempts the hygiene. Both
+    // halves are pinned by "does not let agent checkout seize an in_review
+    // issue assigned to a human reviewer" and "clears but does not adopt a
+    // stale execution lock on an in_review issue assigned to a human reviewer".
     //
     // Delegating is safe only because the predicate is complete, which is a
     // property that had to be established rather than assumed — the
-    // recovery-owner branch was missing the term until this change, and that
+    // recovery-owner branch was missing the term until PEN-5940, and that
     // branch skips every route-level gate by design. The guard remains live on
     // the PATCH assignment door, which has no such predicate under it.
-    const humanHeldRowEnforcedByClaimPredicate = Boolean(issue.assigneeUserId);
+    //
+    // PEN-6049: delegate the QUESTION, not the CALL. This was briefly a fourth
+    // conjunct of the `if` below, which skipped `assertCanAssignTasks` outright
+    // on a human-held row — and with it the BLO-19094 origin-kind guard and the
+    // restricted-policy grant check, neither of which the argument above says
+    // anything about. `issue` is a pre-read: a person unassigned between it and
+    // the claiming UPDATE leaves `unassignedAgentCheckoutCondition` matching,
+    // so the claim lands with `tasks:assign` never having run. The question is
+    // delegated at the parameter instead, where its scope is exactly itself.
+    const humanHeldQuestionDelegatedToClaimPredicate = null;
 
     if (
       issue.assigneeAgentId !== req.body.agentId &&
       !allowSourceScopedRecoveryOwnerCheckout &&
-      !allowExecutionStageParticipantClaim &&
-      !humanHeldRowEnforcedByClaimPredicate
+      !allowExecutionStageParticipantClaim
     ) {
       try {
         await assertCanAssignTasks(req, issue.companyId, {
@@ -15353,14 +15364,37 @@ export function issueRoutes(
           assigneeAgentId: req.body.agentId,
           // Correctly `null`: this route's assignment target is an agent, so
           // nobody is being handed work as a user. PEN-5940 — this is NOT the
-          // row's current human holder, which is a different question and is
-          // answered for this door by `svc.checkout`'s claim predicate, above.
+          // row's current human holder, which is the different question that
+          // `currentAssigneeUserId` below asks.
           assigneeUserId: null,
           // BLO-19094: this is the self-appointment door. Supplying both lets
           // the `tasks:assign` guard refuse a claim on a review/recovery shell
           // the actor was not assigned, without reloading the row.
           originKind: issue.originKind ?? null,
           currentAssigneeAgentId: issue.assigneeAgentId ?? null,
+          // PEN-6049. This `null` is this door DECLINING to answer the
+          // human-held question — not asserting that nobody holds the row. It
+          // may; the pre-read above can see that it may.
+          //
+          // That is not the fail-open literal PEN-5940 was filed about, and the
+          // discriminator is not the value but whether anything else enforces
+          // the rule. The PEN-5940 hazard was a literal standing in for the
+          // ONLY control. Here the control is `svc.checkout`'s claim predicate,
+          // which sits in the WHERE clause of the claiming UPDATE and so is
+          // strictly stronger than any answer this route could compute from a
+          // row it read earlier — and it is that pre-read, not the rule, that
+          // the literal declines to speak for. The PATCH assignment door has no
+          // predicate under it, so there the live field is still the only
+          // control and is still passed; auditing this line means auditing the
+          // predicate's completeness, not this call.
+          //
+          // Omitting the field is the worse of the two, not the safer:
+          // `undefined` means "the caller did not look", which reloads the row
+          // inside `assignmentOntoHumanHeldIssueIsRefused`, making every
+          // ordinary checkout pay a SELECT that split exists to avoid — and
+          // denying 403 before `svc.checkout`, the exact preemption the comment
+          // above this `if` exists to prevent.
+          currentAssigneeUserId: humanHeldQuestionDelegatedToClaimPredicate,
         });
       } catch (err) {
         if (recoveryCheckoutLookupError) {
@@ -15459,6 +15493,17 @@ export function issueRoutes(
     // (That arm does need an `assigneeUserId` term of its own, on the path that
     // DOES enable it — a live `master` hole, independent of this PR, which
     // PEN-5940 / #3508 closes. Nothing here depends on it landing first.)
+    //
+    // PEN-6049, measured when #3508 finally landed: read that parenthetical
+    // narrowly. #3508 adds `isNull(issues.assigneeUserId)` to exactly ONE arm,
+    // `activeRecoveryOwnerCondition` in `services/issues.ts` — the ownership
+    // arm, the one whose UPDATE sets `assigneeUserId: null`. It adds NOTHING to
+    // the BLO-22666 stage-participant claim, which still has no such term. That
+    // is deliberate and is not a gap left open: the participant UPDATE writes
+    // the lock columns only, so there is no ownership for a term to protect.
+    // Recorded because a reader arriving after #3508 would otherwise take the
+    // line above as saying both arms were closed, and the one that was not is
+    // the one that reads as still needing something.
     //
     // What it keeps is the hygiene. `clearStaleExecutionLock` runs INSIDE
     // `svc.checkout`, on the refusal path, and a refused checkout is the only

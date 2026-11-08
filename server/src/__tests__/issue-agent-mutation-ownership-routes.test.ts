@@ -3414,8 +3414,9 @@ describe("agent issue mutation checkout ownership", () => {
   // the field. A decideBase test cannot tell those two worlds apart.
   //
   // The PATCH assignment door is where that guard is load-bearing, so that is
-  // where the field is pinned. The checkout door deliberately does NOT ask the
-  // question — see the delegation test below.
+  // where the live field is pinned. The checkout door deliberately answers the
+  // human-held question with `null` and leaves it to the claim predicate, while
+  // still asking every OTHER question in that call — see the two tests below.
   it("hands the tasks:assign decision the row's current human holder on the PATCH assignment door", async () => {
     // Deliberately NOT `createdByUserId` ("board-user"): a row whose holder is
     // also its creator takes the agent-to-creator hand-back exemption, which
@@ -3473,11 +3474,73 @@ describe("agent issue mutation checkout ownership", () => {
 
     expect(res.status, JSON.stringify(res.body)).not.toBe(403);
     expect(mockIssueService.checkout).toHaveBeenCalled();
-    // The `tasks:assign` call is skipped entirely on this branch, so a guard
-    // keyed on the field cannot fire here however the decision is wired.
-    expect(mockAccessService.decide).not.toHaveBeenCalledWith(expect.objectContaining({
+    // PEN-6049: the delegation is expressed at the PARAMETER, not by skipping
+    // the call. `currentAssigneeUserId: null` is this door declining to answer
+    // the human-held question — the mock above denies on a truthy value, so a
+    // route that went back to passing the live field fails here. Asserting the
+    // call is ABSENT instead would pass for the wrong reason: it also passes
+    // when the whole guard is gone.
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
       action: "tasks:assign",
+      resource: expect.objectContaining({ currentAssigneeUserId: null }),
     }));
+  });
+
+  // PEN-6049, the companion to the test above and the reason the delegation had
+  // to move from the `if` to the parameter. Skipping `assertCanAssignTasks`
+  // wholesale on a human-held row delegated far more than the human-held
+  // question: the BLO-19094 origin-kind guard and the restricted-policy grant
+  // check went with it, and neither is anything `svc.checkout`'s claim
+  // predicate re-checks.
+  //
+  // What made that reachable rather than merely untidy: `issue` here is a
+  // PRE-READ. A person unassigned between it and the claiming UPDATE leaves
+  // `unassignedAgentCheckoutCondition` (`assigneeAgentId IS NULL AND
+  // assigneeUserId IS NULL`) matching, so the claim lands — on a review shell
+  // the actor was never assigned, with `tasks:assign` never having run. The
+  // race is not agent-openable, but the guard it drops is the one that stops an
+  // unrelated agent owning a productivity review and collecting `issue:mutate`
+  // on the issue it reviews.
+  //
+  // The pin is at the route because that is where the defect was: the guard
+  // itself was never broken, it was simply not called.
+  it("still runs the BLO-19094 origin-kind guard on a row a person holds", async () => {
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({
+        status: "todo",
+        assigneeAgentId: null,
+        assigneeUserId: "holder-user",
+        originKind: "issue_productivity_review",
+      }),
+    );
+    mockAccessService.decide.mockImplementation(async (input: {
+      action: string;
+      resource?: { originKind?: string | null };
+    }) => {
+      const claimingAReviewShell =
+        input.action === "tasks:assign" && input.resource?.originKind === "issue_productivity_review";
+      return {
+        allowed: !claimingAReviewShell,
+        action: input.action,
+        reason: claimingAReviewShell ? "deny_missing_grant" : "allow_test_default",
+        explanation: claimingAReviewShell
+          ? "Agents cannot claim a recovery or review shell they were not assigned; ownership of it confers access to the issue it reviews."
+          : "Allowed by test default.",
+      };
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/checkout`)
+      .send({ agentId: peerAgentId, expectedStatuses: ["todo"] });
+
+    // The row's origin kind reached the decision at all — the assertion that
+    // fails if the call is skipped again.
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "tasks:assign",
+      resource: expect.objectContaining({ originKind: "issue_productivity_review" }),
+    }));
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockIssueService.checkout).not.toHaveBeenCalled();
   });
 
   it("does not tell an agent to take a row a person holds when it denies the write", async () => {
@@ -3503,7 +3566,7 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.body.details.remediation).toEqual(expect.any(String));
     // Pinned by what the text has to DO, not by its wording, so the prose stays
     // editable while the two actionable halves cannot regress.
-    expect(res.body.details.remediation).toMatch(/person holds this issue/i);
+    expect(res.body.details.remediation).toMatch(/assigned to a person, not to an agent/i);
     expect(res.body.details.remediation).toContain("board-user");
     expect(res.body.details.remediation).not.toMatch(/have the issue assigned to you/i);
     expect(mockIssueService.update).not.toHaveBeenCalled();
