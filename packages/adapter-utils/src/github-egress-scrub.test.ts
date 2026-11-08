@@ -517,18 +517,23 @@ describe("scrubGitHubEgressText", () => {
     // here stays green, which reads as "PEN-6167 is closed" while nothing a
     // human would actually write has changed. Measured 2026-11-08: that one
     // character newly refuses 2,301 lines of this repo, 1,969 of them ordinary
-    // `https://` URLs, and closes one of the six forms below.
+    // `https://` URLs, and closes one of the seven forms below.
     //
     // Assembled at runtime, same convention as the fixtures above: written out
     // contiguously these are material the deployed guard refuses, which would
     // make this file unpushable.
     const T = SYNTHETIC_OPAQUE_VALUE;
+    // Derived, not written out, for the same reason as the PEN-3907 fixtures
+    // above: a 64-hex literal is credential-shaped to the deployed pre-push
+    // guard in its `=` form, and deriving it keeps this file pushable.
+    const HEX64 = createHash("sha256").update("pen-6167 fixture").digest("hex");
 
     it.each([
       ["a k8s Secret stringData entry", `  webhook-signing-key: "${T}"`],
       ["a quoted YAML value", `webhook_secret: "${T}"`],
       ["a bare YAML scalar", `signing_key: ${T}`],
       ["a JSON quoted key", `{"sessionSecret": "${T}"}`],
+      ["a JSON 64-hex value", `{"hmacKey": "${HEX64}"}`],
       ["a quoted YAML key", `"webhook_secret": "${T}"`],
       ["an unspaced colon", `webhook_secret:"${T}"`],
     ])("passes %s through byte-exact", (_form, text) => {
