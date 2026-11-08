@@ -331,6 +331,32 @@ function agentBundleRoot(file: string | null, dataMountPath: string): string {
   return root === dataMountPath || root === "/" ? "" : root;
 }
 
+/**
+ * The agent's own bundle root, but ONLY when it is a path this pod mounts — the
+ * value `AGENT_HOME` is set to, and `""` when there is no such root.
+ *
+ * PEN-2585. Two callers need this answer and they must not derive it twice.
+ * `buildEnvVars` exports it; `execute.ts` names `<root>/memory/` in the generated
+ * path directive, because the harness system prompt tells every run its memory
+ * lives under the run-scoped session root and that directory dies at teardown.
+ * A directive naming a different root than the variable would be worse than
+ * silence: both spellings look durable, and the run cannot tell which one the
+ * pod actually backs. Same reason `execute.ts` imports `resolvePromptCacheRoot`
+ * and `resolveDataClaimName` from here rather than re-deriving them.
+ *
+ * The on-volume test is the second half of the join, not a redundancy:
+ * `agentBundleRoot` only refuses the volume root, so an operator-set bundle
+ * outside the data mount would otherwise yield a durable-LOOKING root that no
+ * mount backs. `resolveScopedWritableMounts` creates the mount iff this same
+ * test holds, so the root is mounted iff this returns it.
+ */
+export function resolveMountedAgentBundleHome(config: Record<string, unknown>): string {
+  const dataMountPath = resolveDataMountPath(config);
+  const prefix = dataMountPath.endsWith("/") ? dataMountPath : `${dataMountPath}/`;
+  const root = agentBundleRoot(asString(config.instructionsFilePath, "").trim() || null, dataMountPath);
+  return root && path.posix.isAbsolute(root) && root.startsWith(prefix) ? root : "";
+}
+
 export function resolveScopedWritableMounts(input: {
   dataMountPath: string;
   isolation: JobIsolation;
@@ -2745,21 +2771,7 @@ function buildEnvVars(
   // call site asserts "claude_k8s agents (whose AGENT_HOME already IS the bundle dir)
   // worked". That premise is FALSE and was never measured here — this adapter had no
   // such branch until now, which is exactly why the bug survived the fix that named it.
-  const agentHomeDataMountPath = resolveDataMountPath(config);
-  const agentHomeDataPrefix = agentHomeDataMountPath.endsWith("/")
-    ? agentHomeDataMountPath
-    : `${agentHomeDataMountPath}/`;
-  const agentHomeBundleRoot = agentBundleRoot(
-    asString(config.instructionsFilePath, "").trim() || null,
-    agentHomeDataMountPath,
-  );
-  const mountedBundleHome =
-    agentHomeBundleRoot &&
-    path.posix.isAbsolute(agentHomeBundleRoot) &&
-    agentHomeBundleRoot.startsWith(agentHomeDataPrefix)
-      ? agentHomeBundleRoot
-      : "";
-  setIfPresent("AGENT_HOME", mountedBundleHome || workspaceContext.agentHome);
+  setIfPresent("AGENT_HOME", resolveMountedAgentBundleHome(config) || workspaceContext.agentHome);
 
   const linkedIssueIds = Array.isArray(context.issueIds)
     ? context.issueIds.filter((v): v is string => typeof v === "string" && v.trim().length > 0)

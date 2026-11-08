@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import type { AdapterExecutionContext } from "@paperclipai/adapter-utils";
-import { buildJobManifest } from "./job-manifest.js";
+import { buildJobManifest, resolveMountedAgentBundleHome } from "./job-manifest.js";
 import type { SelfPodInfo } from "./k8s-client.js";
 
 // PEN-2585 — AGENT_HOME must name a path the POD mounts.
@@ -218,5 +218,71 @@ describe("AGENT_HOME on a managed instructions bundle (PEN-2585)", () => {
     const home = agentHomeEnv(built) ?? "";
     expect(`${MANAGED_AGENT_DIR}/memory`.startsWith(`${home}/`)).toBe(true);
     expect(`${MANAGED_AGENT_DIR}/memory`.startsWith(`${MANAGED_INSTRUCTIONS_ROOT}/`)).toBe(false);
+  });
+});
+
+describe("resolveMountedAgentBundleHome (PEN-2585)", () => {
+  // The resolver `buildEnvVars` exports as AGENT_HOME and `execute.ts` names in the
+  // durable-memory directive. It is shared so those two cannot disagree: both
+  // spellings of a durable path look durable from inside the pod, and a run handed
+  // the wrong one has no way to find out before its memory is already gone.
+
+  it("returns the agent dir for an external bundle", () => {
+    expect(resolveMountedAgentBundleHome({ instructionsFilePath: `${INSTRUCTIONS_ROOT}/AGENTS.md` })).toBe(
+      INSTRUCTIONS_ROOT,
+    );
+  });
+
+  it("climbs out of instructions/ for a managed bundle", () => {
+    expect(
+      resolveMountedAgentBundleHome({ instructionsFilePath: `${MANAGED_INSTRUCTIONS_ROOT}/AGENTS.md` }),
+    ).toBe(MANAGED_AGENT_DIR);
+  });
+
+  it("returns empty for a bundle the pod does not mount", () => {
+    // The on-volume half of the join. `agentBundleRoot` alone refuses only the volume
+    // root, so an operator-set bundle elsewhere would otherwise come back as a
+    // durable-LOOKING root that nothing backs — the filed bug by a new route.
+    expect(resolveMountedAgentBundleHome({ instructionsFilePath: `${OFF_VOLUME_ROOT}/AGENTS.md` })).toBe("");
+  });
+
+  it("returns empty when there is no bundle at all", () => {
+    // Legacy / single-file agents. The caller must fall back, and the directive must
+    // say there is no durable root rather than printing the server-made one.
+    expect(resolveMountedAgentBundleHome({})).toBe("");
+    expect(resolveMountedAgentBundleHome({ instructionsFilePath: "" })).toBe("");
+  });
+
+  it("refuses the data-mount root itself", () => {
+    // Returning it would make AGENT_HOME the whole volume and `$AGENT_HOME/memory/`
+    // a shared directory every company could write.
+    expect(resolveMountedAgentBundleHome({ instructionsFilePath: "/paperclip/AGENTS.md" })).toBe("");
+  });
+
+  it("agrees with the AGENT_HOME the manifest exports, in both bundle modes", () => {
+    // The join itself, asserted directly rather than inferred from the two suites
+    // above passing separately. This is the invariant the directive rests on.
+    for (const cfg of [
+      { instructionsFilePath: `${INSTRUCTIONS_ROOT}/AGENTS.md`, instructionsRootPath: INSTRUCTIONS_ROOT },
+      {
+        instructionsFilePath: `${MANAGED_INSTRUCTIONS_ROOT}/AGENTS.md`,
+        instructionsRootPath: MANAGED_INSTRUCTIONS_ROOT,
+        instructionsBundleMode: "managed",
+      },
+    ]) {
+      const built = buildJobManifest({ ctx: makeCtx(cfg), selfPod });
+      expect(agentHomeEnv(built)).toBe(resolveMountedAgentBundleHome(makeCtx(cfg).config));
+    }
+  });
+
+  it("does NOT agree when there is no mounted bundle — the caller's fallback is visible here", () => {
+    // Negative control for the assertion above, so it cannot pass vacuously: where the
+    // resolver returns "" the manifest deliberately falls back to the server-provided
+    // home, and that fallback is still a path the pod cannot see. The directive's
+    // no-durable-root branch exists for exactly this run.
+    const cfg = { instructionsFilePath: `${OFF_VOLUME_ROOT}/AGENTS.md`, instructionsRootPath: OFF_VOLUME_ROOT };
+    const built = buildJobManifest({ ctx: makeCtx(cfg), selfPod });
+    expect(resolveMountedAgentBundleHome(makeCtx(cfg).config)).toBe("");
+    expect(agentHomeEnv(built)).toBe(SERVER_SIDE_HOME_DIR);
   });
 });
