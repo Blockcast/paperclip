@@ -1739,6 +1739,22 @@ export function formatRefusal(findings: readonly GitPushFinding[]): string {
     // measured that same edit clearing a secret-bearing sectioned `.env`.
   }
 
+  // PEN-6123 review: the two value-level blocks below are gated on
+  // `high-entropy-assignment` because the route they name — exoneration under a
+  // binding name, so the rule can be narrowed — is that rule's route and no
+  // other's. But the don't-paste sentence inside them is NOT a property of that
+  // rule: PEN-4428 added it because the one reader who reaches any of these
+  // sentences is someone who has judged a refused value harmless, and an issue
+  // tracker is more durable and more widely read than the push just refused.
+  // That argument holds for every class. So gate the ROUTE, never the warning —
+  // a push refused solely for `vendor-key`, `jwt`, `credentialed-uri` or
+  // `private-key-block` must still be told not to quote what was refused.
+  if (!firedClasses.has("high-entropy-assignment") && !firedClasses.has("environment-dump")) {
+    lines.push(
+      "Do not paste the refused value into an issue, a comment or a commit message. If the detector is right rather than you, quoting it would publish a live credential somewhere more durable and more widely read than the push this door just refused. Report the class that fired and the kind of file it is in; that is enough to look into it.",
+    );
+  }
+
   if (firedClasses.has("high-entropy-assignment")) {
     lines.push(
       "When the value cannot leave the blob — a Prometheus label matcher, a Kubernetes object name, any identifier a config file has to spell out — deriving it at runtime is not available, and there is no allowlist or override by design. That case is a known class with a home, recorded in the detector's own repository rather than the one you are pushing to: see " +

@@ -1073,6 +1073,33 @@ describe("formatRefusal", () => {
     }
   });
 
+  // PEN-6123 review: gating the value-level blocks on `high-entropy-assignment`
+  // also gated the don't-paste warning they contain, which PEN-4428 put there
+  // as a property of the DOOR, not of that rule. These four classes reach the
+  // message without either value-level block, so they need their own.
+  it.each(["vendor-key", "jwt", "credentialed-uri", "private-key-block"] as const)(
+    "warns a %s reporter not to paste the refused value",
+    (cls) => {
+      const message = formatRefusal([{ ...dumpFinding, classes: [cls] }]);
+      expect(message).toContain("Do not paste the refused value");
+      // The value-entropy ROUTE is correctly still withheld: exoneration under
+      // a binding name is that rule's remedy and means nothing for these.
+      expect(message).not.toContain("Report the binding name");
+    },
+  );
+
+  // Control: the warning is not simply unconditional. Both classes that carry
+  // their own don't-paste sentence must not also get the generic one, or the
+  // message says it twice.
+  it.each(["high-entropy-assignment", "environment-dump"] as const)(
+    "does not duplicate the warning for %s, which carries its own",
+    (cls) => {
+      const message = formatRefusal([{ ...dumpFinding, classes: [cls] }]);
+      expect(message).not.toContain("Do not paste the refused value into an issue");
+      expect(message.toLowerCase()).toContain("paste");
+    },
+  );
+
   // The two classes must not bleed: a push carrying both gets both answers.
   it("gives each class its own advice when both fired", () => {
     const message = formatRefusal([
