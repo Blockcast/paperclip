@@ -314,7 +314,16 @@ export interface CostWindowSpendRow {
 
 /** cost attributed to a project via heartbeat run → activity log → issue → project chain */
 export interface CostByProject {
+  /**
+   * PEN-6084: `null` is the UNATTRIBUTED bucket, and it is a real row rather than an
+   * absence. It carries every windowed cost event whose effective project is NULL (a run
+   * that touched no project) or names a project that has since been deleted — both causes
+   * collapse into this one row. It was always declared nullable here but never served:
+   * the aggregate dropped those rows, so `by-project` did not sum to `costs/summary` over
+   * the same window. It does now, and that is the invariant to hold.
+   */
   projectId: string | null;
+  /** `null` exactly when {@link CostByProject.projectId} is — the unattributed bucket has no name to render. */
   projectName: string | null;
   costCents: number;
   /** PEN-4902: list-price CONSUMPTION for the same rows — the quantity enforcement reads. See {@link CostSummary.consumptionCents}. */

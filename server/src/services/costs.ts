@@ -716,10 +716,49 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
 
       const costCentsExpr = sumAsNumber(costEvents.costCents);
 
+      /**
+       * PEN-6084: bucket the spend that resolves to no project instead of dropping it.
+       *
+       * This aggregate used to end in `innerJoin(projects, …)` plus
+       * `where(effectiveProjectId is not null)`, so a cost event was OMITTED -- not
+       * bucketed -- when its effective project was NULL, or named a project that has
+       * since been deleted. The "By project" card therefore did not sum to the "Summary"
+       * card rendered beside it on the same page over the same window, and nothing on
+       * screen said so. Measured 2026-11-08 on company `b1d3f3d3` over
+       * `2026-11-05T20:00Z -> 2026-11-08T20:00Z`: `summary` 1,703,634c, `by-agent` summed
+       * 1,703,634c (exact, so `summary` is the windowed `cost_events` total), `by-project`
+       * summed 1,002,603c -- 58.85% of spend served, 701,031c (41.15%) silently dropped.
+       *
+       * The invariant this restores is `sum(by-project) == summary` over the same window,
+       * and that is what the test pins. The MAGNITUDE above is a dated sample, not a
+       * contract: PEN-5937/#3531 adds write-time attribution that SHRINKS this bucket, so
+       * the percentage is expected to move and a test pinned to it would go red exactly
+       * when that fix works.
+       *
+       * A residual is permanent by construction, not a transitional artifact: an event can
+       * legitimately belong to no project (a run that touched none), so the bucket is the
+       * honest shape of the answer rather than a backlog of unresolved rows.
+       *
+       * Grouping on `projects.id` -- the LEFT-joined column, not `effectiveProjectId` --
+       * is what collapses BOTH causes into ONE bucket. `projects.id` is non-null exactly
+       * when the effective project still exists, and equals `effectiveProjectId` when it
+       * does; grouping on `effectiveProjectId` instead would scatter every dangling
+       * reference into its own anonymous row, one per deleted project.
+       *
+       * Neither left join can fan out a row and inflate the total: `run_project_links` is
+       * `DISTINCT ON (run_id)` and is joined on `run_id` alone (PEN-5604), and `projects`
+       * is joined on its primary key, so each matches at most once.
+       */
+      const bucketProjectId = sql<string | null>`${projects.id}`;
+      const bucketProjectName = sql<string | null>`${projects.name}`;
+      // Real projects first, by spend; the residual bucket last. Postgres sorts `false`
+      // before `true`, so this is an ordering rule, not a second sort key on cost.
+      const unattributedLast = sql`${projects.id} is null`;
+
       return db
         .select({
-          projectId: effectiveProjectId,
-          projectName: projects.name,
+          projectId: bucketProjectId,
+          projectName: bucketProjectName,
           costCents: costCentsExpr,
           consumptionCents: consumptionCentsSum,
           inputTokens: sumAsNumber(costEvents.inputTokens),
@@ -738,10 +777,10 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
             isNull(costEvents.projectId),
           ),
         )
-        .innerJoin(projects, sql`${projects.id} = ${effectiveProjectId}`)
-        .where(and(...conditions, sql`${effectiveProjectId} is not null`))
-        .groupBy(effectiveProjectId, projects.name)
-        .orderBy(desc(costCentsExpr));
+        .leftJoin(projects, sql`${projects.id} = ${effectiveProjectId}`)
+        .where(and(...conditions))
+        .groupBy(projects.id, projects.name)
+        .orderBy(unattributedLast, desc(costCentsExpr));
     },
   };
 }

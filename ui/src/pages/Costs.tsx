@@ -34,6 +34,11 @@ import {
   clampNotice,
   fetchByProjectWithinCap,
 } from "../lib/by-project-window";
+import {
+  UNATTRIBUTED_PROJECT_LABEL,
+  reconcileProjectCosts,
+  toProjectCostRows,
+} from "../lib/project-cost-rows";
 import { billingTypeDisplayName, cn, formatCents, formatTokens, providerDisplayName } from "../lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -286,6 +291,14 @@ export function Costs() {
   // tab is holding the previous, now-too-wide cap -- so the refusal names the
   // limit there too, rather than rendering a raw error string.
   const byProjectRefusalNotice = capRefusalNotice(byProjectError);
+
+  // PEN-6084: `by-project` now serves an unattributed bucket, so these rows sum to the
+  // Summary card's spend over the same `from`/`to` -- which both queries above share.
+  const projectCostRows = useMemo(() => toProjectCostRows(byProjectData), [byProjectData]);
+  const projectCostReconciliation = useMemo(
+    () => reconcileProjectCosts(projectCostRows, spendData?.summary.spendCents ?? 0),
+    [projectCostRows, spendData?.summary.spendCents],
+  );
 
   const { data: financeData, isLoading: financeLoading, error: financeError } = useQuery({
     queryKey: [
@@ -853,7 +866,8 @@ export function Costs() {
                     <CardHeader className="px-5 pt-5 pb-2">
                       <CardTitle className="text-base">By project</CardTitle>
                       <CardDescription>
-                        Run costs attributed through project-linked tasks.
+                        Run costs by project. Spend from runs that touched no project is bucketed as
+                        {" "}{UNATTRIBUTED_PROJECT_LABEL.toLowerCase()}, so this card totals to company spend.
                         {byProjectClampNotice ? (
                           <> <span className="text-foreground">{byProjectClampNotice}</span></>
                         ) : null}
@@ -881,18 +895,50 @@ export function Costs() {
                         )
                       ) : byProjectLoading ? (
                         <p className="text-sm text-muted-foreground">Loading project costs...</p>
-                      ) : (byProjectData?.length ?? 0) === 0 ? (
-                        <p className="text-sm text-muted-foreground">No project-attributed run costs yet.</p>
+                      ) : projectCostRows.length === 0 ? (
+                        <p className="text-sm text-muted-foreground">No run costs in this window yet.</p>
                       ) : (
-                        byProjectData?.map((row, index) => (
-                          <div
-                            key={row.projectId ?? `unattributed-${index}`}
-                            className="flex items-center justify-between gap-3 border border-border px-3 py-2 text-sm"
-                          >
-                            <span className="truncate">{row.projectName ?? row.projectId ?? "Unattributed"}</span>
-                            <span className="font-medium tabular-nums">{formatCents(row.costCents)}</span>
+                        <>
+                          {projectCostRows.map((row) => (
+                            <div
+                              key={row.key}
+                              className="flex items-center justify-between gap-3 border border-border px-3 py-2 text-sm"
+                            >
+                              <span className={cn("truncate", row.unattributed && "text-muted-foreground")}>
+                                {row.label}
+                              </span>
+                              <span
+                                className={cn(
+                                  "font-medium tabular-nums",
+                                  row.unattributed && "text-muted-foreground",
+                                )}
+                              >
+                                {formatCents(row.costCents)}
+                              </span>
+                            </div>
+                          ))}
+                          {/*
+                            PEN-6084: the reconciliation the two cards previously failed, stated on
+                            screen. `by-project` used to drop every event that resolved to no project,
+                            so this card under-reported the Summary card beside it over the same window
+                            with nothing saying so. The mismatch line waits for `spendData` -- while the
+                            summary is still loading there is no number to disagree with, and claiming a
+                            shortfall against a not-yet-loaded 0 would cry wolf on every page load.
+                          */}
+                          <div className="flex items-center justify-between gap-3 px-3 pt-1 text-sm">
+                            <span className="text-muted-foreground">Total</span>
+                            <span className="font-medium tabular-nums">
+                              {formatCents(projectCostReconciliation.totalCents)}
+                            </span>
                           </div>
-                        ))
+                          {spendData && !projectCostReconciliation.reconciles ? (
+                            <p className="px-3 text-sm text-destructive">
+                              This does not match company spend of{" "}
+                              {formatCents(projectCostReconciliation.summaryCents)} for the same dates.
+                              Treat the per-project split as incomplete and report it.
+                            </p>
+                          ) : null}
+                        </>
                       )}
                     </CardContent>
                   </Card>
