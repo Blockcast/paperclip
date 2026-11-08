@@ -929,7 +929,15 @@ export function approvalAttestsHead(review, headSha, headAt) {
 export function unsatisfiedOwners(pr) {
   // Read once: `headMovedAt` walks the whole timeline, and every review is
   // judged against the same head stamp.
-  const headAt = headMovedAt(pr?.timeline, pr?.headRefOid);
+  //
+  // PEN-6105: `attestingOnly` because this consumer's unsafe direction is the
+  // OPPOSITE of `ejectionsAtHead`'s. The unnarrowed fallback hands back a
+  // stamp off a commit that is not the head — typically OLDER than the real
+  // head — which makes `submitted_at > headAt` easier and credits exactly the
+  // stale approval PEN-5997 closed. `null` credits nobody, which is the
+  // posture this function's own comment already claims for an undatable head
+  // and, before this, was never handed.
+  const headAt = headMovedAt(pr?.timeline, pr?.headRefOid, { attestingOnly: true });
   const approved = new Set(
     (pr?.reviews ?? [])
       .filter((review) => approvalAttestsHead(review, pr?.headRefOid, headAt))
@@ -1301,6 +1309,23 @@ export function classifyFromListing(pr, { now = Date.now() } = {}) {
  * function's pre-PEN-5028 behaviour byte for byte, so narrowing can only ever
  * happen on positive evidence about the head.
  *
+ * ⛔ PEN-6105: THAT FALLBACK IS SAFE FOR ITS ORIGINAL CONSUMER ONLY. Its
+ * failure direction is a property of the CALLER, not of this function, and
+ * the paragraph above argues it from `ejectionsAtHead` alone. For that
+ * consumer an older stamp counts MORE ejections ⇒ hold ⇒ safe. For
+ * `approvalAttestsHead` the identical stamp runs the other way: an older
+ * `headAt` makes `submitted_at > headAt` EASIER to satisfy, so it credits a
+ * stale approval — on the code-owner gate `unsatisfiedOwners` says nothing
+ * else backstops. Same branch, opposite direction, two consumers.
+ *
+ * `{ attestingOnly: true }` returns `null` instead of falling back, for a
+ * caller whose unknown must credit NOBODY. ⛔ It is an opt-in and must not
+ * become the default: the stranding above is real and `ejectionsAtHead` still
+ * needs the fallback. Under `attestingOnly` an absent or unreadable `headSha`
+ * is undatable too, which is the same fail-closed answer for the same reason.
+ * Reachability when this landed: 0 of 80 `Blockcast/paperclip` PRs carried an
+ * unattested head, so this is a hardening, not a live hole.
+ *
  * ponytail: every stamp here is a COMMIT time, never a push time, and the
  * REST timeline records no push time for a non-force push. A commit created
  * BEFORE an ejection but pushed AFTER it therefore dates the new head earlier
@@ -1315,7 +1340,7 @@ export function classifyFromListing(pr, { now = Date.now() } = {}) {
  * unreadable case, not the "head is infinitely old" case, and
  * `ejectionsAtHead` treats it as such.
  */
-export function headMovedAt(timeline, headSha = null) {
+export function headMovedAt(timeline, headSha = null, { attestingOnly = false } = {}) {
   const events = (Array.isArray(timeline) ? timeline : []).filter(
     (event) => event?.event === "committed" || event?.event === "head_ref_force_pushed",
   );
@@ -1331,9 +1356,17 @@ export function headMovedAt(timeline, headSha = null) {
     head === ""
       ? []
       : events.filter((event) => lower(event?.sha) === head || lower(event?.commit_id) === head);
-  // Unparseable stamps on the attesting events fall back too: an attesting
-  // event nobody can date is no more informative than no attesting event.
+  // Unparseable stamps on the attesting events take the same branch as no
+  // attesting event at all: an attesting event nobody can date is no more
+  // informative than none. So they fall back by default, and under
+  // `attestingOnly` they report null — each the fail-safe answer for the
+  // consumer that asked.
   const narrowed = stampsOf(attesting);
+  // ⛔ PEN-6105: the fallback on the next line is fail-SAFE for
+  // `ejectionsAtHead` and fail-OPEN for `approvalAttestsHead`. Its safety is
+  // consumer-relative; the doc-comment carries the argument. `attestingOnly`
+  // is the opt-out for the second consumer, never a new default.
+  if (attestingOnly) return narrowed.length ? Math.max(...narrowed) : null;
   const stamps = narrowed.length ? narrowed : stampsOf(events);
   return stamps.length ? Math.max(...stamps) : null;
 }
