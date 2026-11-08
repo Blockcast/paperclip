@@ -376,7 +376,8 @@ vi.mock("../realtime/live-events-ws.js", () => ({
 
 vi.mock("../services/index.js", () => ({
   EXTERNAL_LIFECYCLE_COLD_BOOT_REATTACH_GRACE_MS: 0,
-  PRELAUNCH_OWNER_RENEW_MS: 30_000,
+  // Not 30_000: tests below pick the scheduler interval out by that delay.
+  PRELAUNCH_OWNER_RENEW_MS: 20_000,
   backfillLegacyToolOAuthTokens: vi.fn(async () => ({
     scannedConnections: 0,
     migratedConnections: 0,
