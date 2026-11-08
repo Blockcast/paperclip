@@ -1232,6 +1232,8 @@ interface ResolvedEventContext {
   headSha?: string | null;
   // BLO-46732: conclusion of the completed check_run / check_suite / workflow_run.
   ciConclusion?: string | null;
+  // BLO-53662: slug of the App that published a completed check_run.
+  ciCheckRunAppSlug?: string | null;
   prPreviousHeadSha?: string | null;
   // pull_request_review.submitted only — drives the author-facing directive
   // so the assignee wake's prompt carries the reviewer's findings without
@@ -1560,6 +1562,7 @@ function resolveEventContextRaw(
         eventUrl: readStringField(checkRun, "html_url"),
         headSha: readStringField(checkRun, "head_sha"),
         ciConclusion: readStringField(checkRun, "conclusion"),
+        ciCheckRunAppSlug: readStringField(checkRun.app as Record<string, unknown> | undefined, "slug"),
       };
     }
     case "check_suite": {
@@ -7615,11 +7618,20 @@ export function githubWebhookRoutes(db: Db, config: GithubWebhookConfig) {
       authorWakeCandidates.length > 0 &&
       !RED_CI_CONCLUSIONS.has(context.ciConclusion ?? "")
     ) {
-      const settlement = await (config.resolveCiHeadSettlement ?? githubHeadChecksSettlement)({
-        repoFullName: context.repoFullName as string,
-        headSha: ciCompletionHeadSha,
-      }).catch(() => "unknown" as const);
-      ciHeadPending = settlement === "pending";
+      // BLO-53662: a green Actions lane is always followed by its own
+      // check_suite.completed and workflow_run.completed on this head, and those
+      // do the settlement read. Reading here too was ~2/3 of the App's REST
+      // egress. Other Apps' API-created runs (gate/ally-comment-findings) can
+      // land in an already-completed suite with no new suite event, so they keep it.
+      if (context.wakeReason === "github_check_completed" && context.ciCheckRunAppSlug === "github-actions") {
+        ciHeadPending = true;
+      } else {
+        const settlement = await (config.resolveCiHeadSettlement ?? githubHeadChecksSettlement)({
+          repoFullName: context.repoFullName as string,
+          headSha: ciCompletionHeadSha,
+        }).catch(() => "unknown" as const);
+        ciHeadPending = settlement === "pending";
+      }
     }
 
     for (const issue of suppressAuthorWake ? [] : authorWakeCandidates) {
