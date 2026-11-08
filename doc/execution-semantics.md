@@ -326,6 +326,22 @@ Issue-thread comments and document-scoped comments have different wake semantics
 
 A top-level issue comment created by a board user or other user on an agent-assigned, non-terminal issue may wake that issue's assignee. This is the normal "the owner should see new issue-thread feedback" path, and the wake payload should identify the issue comment that caused the wake when possible.
 
+#### The wake payload carries two different comment rows, and neither is "the latest"
+
+A wake payload deliberately holds **two** comment surfaces, selected by different rules over different sets:
+
+- the **inlined comment** — the issue's newest comment *at payload-assembly time*. `buildPaperclipWakePayload` overrides the requested id list with it so a coalesced wake never hands an agent an hours-old answer as its only body.
+- the **wake comment** — the last comment that woke *this run*: `deriveCommentId`, the final entry of the run's accumulated `wakeCommentIds`. It is what the run was woken *for*, which is why it is carried even when it is not newest.
+
+They are the same row only when nothing arrived after the wake was enqueued. Whenever a later comment exists — including one that woke a *sibling* run, which never enters this run's id list — they are different rows, and the wake comment can be arbitrarily old.
+
+Two rules follow, and both are load-bearing:
+
+- **Neither surface may be labelled with a currency claim.** The prompt heading for the wake comment names its subject and its timestamp; it must not say "latest". Measured twice ~6h apart (PEN-6039): once over a body that two later comments had explicitly retracted, under a heading asserting it was current, closing with "No action wanted from you". A reader who trusts such a heading and stops has already acted, and leaves no trace distinguishable from a correct no-op.
+- **When the two rows differ, the prompt must say so before rendering the body**, naming the newer row. A disclaimer after the body reaches only the reader who was going to keep reading anyway.
+
+Resolving both surfaces to the newest comment is *not* the fix: it deletes the triggering comment from the payload, which on a mention wake is the one thing the run needs.
+
 Issue document comments, document annotation comments, and document review comments do not wake the issue assignee by default. They remain visible as document activity and should be discoverable from the issue's document/review surfaces, but document activity is not itself an issue execution path. A document comment can provide evidence or context for the next run, but it must not be treated as a queued wake, monitor, approval, interaction response, blocker, or terminal disposition.
 
 Document-scoped activity may still route work when it is converted into an explicit action-path primitive. Valid routing exceptions include:

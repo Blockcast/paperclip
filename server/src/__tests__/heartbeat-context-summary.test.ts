@@ -693,11 +693,103 @@ describe("buildPaperclipTaskMarkdown", () => {
       supersededWakeCommentCount: 1,
     });
 
-    expect(markdown).toContain("Latest wake comment:");
+    expect(markdown).toContain("Wake comment -- the comment that TRIGGERED this wake:");
     expect(markdown).toContain("the correction");
     expect(markdown).toContain("Earlier wake comment NOT shown above (1):");
     expect(markdown).toContain("comment-1");
     expect(markdown).toContain("Read it on the issue before acting");
+  });
+
+  // PEN-6039: the heading used to read "Latest wake comment", which asserts the
+  // one property this block cannot carry. It holds the comment that TRIGGERED
+  // the wake; a comment posted after the wake was enqueued -- including one that
+  // woke a sibling run -- is newer and is not in this run's id list. Measured
+  // twice ~6h apart on unrelated rows, once over a body two later comments had
+  // explicitly retracted.
+  describe("PEN-6039 wake comment currency", () => {
+    const issue = {
+      id: "issue-1",
+      identifier: "PEN-6039",
+      title: "Wake comment currency",
+      workMode: "standard",
+      description: null,
+    };
+
+    it("heads the block by its subject and dates it, never claiming it is latest", () => {
+      const markdown = buildPaperclipTaskMarkdown({
+        issue,
+        wakeComment: {
+          id: "comment-wake",
+          body: "the retracted downgrade",
+          createdAt: "2026-11-07T11:52:56.000Z",
+        },
+      });
+
+      expect(markdown).toContain(
+        "Wake comment -- the comment that TRIGGERED this wake, created 2026-11-07T11:52:56.000Z:",
+      );
+      // The claim itself, in any casing: the heading must never assert currency.
+      expect(markdown).not.toContain("Latest wake comment");
+    });
+
+    it("warns that the rendered body is not the newest -- ABOVE the body, not below it", () => {
+      const markdown = buildPaperclipTaskMarkdown({
+        issue,
+        wakeComment: {
+          id: "comment-wake",
+          body: "the retracted downgrade",
+          createdAt: "2026-11-07T11:52:56.000Z",
+        },
+        latestIssueComment: {
+          id: "comment-newest",
+          createdAt: "2026-11-07T17:06:28.000Z",
+        },
+      });
+
+      expect(markdown).toContain("This is NOT the newest comment on this issue.");
+      expect(markdown).toContain("comment-newest");
+      expect(markdown).toContain("(created 2026-11-07T17:06:28.000Z)");
+      expect(markdown).toContain("correct or RETRACT the one below");
+      // Placement is the whole point: the reader this protects reads the block
+      // and stops, so a notice after the fence reaches only the reader who was
+      // going to keep reading anyway.
+      expect(markdown.indexOf("This is NOT the newest comment on this issue.")).toBeLessThan(
+        markdown.indexOf("the retracted downgrade"),
+      );
+    });
+
+    it("stays silent when the wake comment IS the newest", () => {
+      const markdown = buildPaperclipTaskMarkdown({
+        issue,
+        wakeComment: {
+          id: "comment-wake",
+          body: "the only comment",
+          createdAt: "2026-11-07T11:52:56.000Z",
+        },
+        latestIssueComment: {
+          id: "comment-wake",
+          createdAt: "2026-11-07T11:52:56.000Z",
+        },
+      });
+
+      expect(markdown).toContain("Wake comment -- the comment that TRIGGERED this wake");
+      expect(markdown).not.toContain("This is NOT the newest comment on this issue.");
+    });
+
+    it("degrades to the undated heading rather than inventing a time", () => {
+      const markdown = buildPaperclipTaskMarkdown({
+        issue,
+        wakeComment: { id: "comment-wake", body: "undated body" },
+        latestIssueComment: { id: "comment-newest", createdAt: null },
+      });
+
+      expect(markdown).toContain("Wake comment -- the comment that TRIGGERED this wake:");
+      // The warning still fires -- knowing a newer comment exists does not
+      // depend on either timestamp being available.
+      expect(markdown).toContain("This is NOT the newest comment on this issue.");
+      expect(markdown).toContain("comment-newest");
+      expect(markdown).not.toContain("(created ");
+    });
   });
 
   it("pluralizes and reports the exact count when the id list is capped", () => {

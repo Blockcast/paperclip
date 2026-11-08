@@ -253,11 +253,74 @@ describeEmbeddedPostgres("coalesced wake comment surfacing", () => {
     // The prompt shows `second order`; the invariant is that it never then
     // sends the run after a body it just rendered. Asserted FIRST so a
     // regression reports as the disjointness failure it is.
-    expect(markdown).toContain("Latest wake comment:");
+    expect(markdown).toContain("Wake comment -- the comment that TRIGGERED this wake:");
     expect(markdown).toContain("second order");
     expect(markdown).not.toContain(secondId);
     // ...while still naming the one order that genuinely reached neither surface.
     expect(markdown).toContain("Earlier wake comment NOT shown above (1):");
     expect(markdown).toContain(firstId);
+  });
+
+  // PEN-6039: the other half of the same seam. The freshness override inlines
+  // the issue's NEWEST comment while the prompt separately renders the LAST
+  // ABSORBED wake comment, so on any issue that moved on after the wake was
+  // enqueued the payload carries two different rows -- and the prompt headed the
+  // older one "Latest wake comment". Measured twice ~6h apart on unrelated rows;
+  // on PEN-5940 the body under that heading had been explicitly retracted by two
+  // later comments and closed with "No action wanted from you".
+  it("tells the run that the wake comment it renders is not the issue's newest", async () => {
+    const { companyId, issueId, commentIds } = await seedIssueWithComments([
+      "the downgrade, later retracted",
+      "my earlier correction was ALSO wrong",
+      "unwind that",
+    ]);
+    const [wakeCommentId, , newestId] = commentIds as [string, string, string];
+    // The shape that produced both measured instances: the wake carries an old
+    // comment id, and the thread has moved on since.
+    const contextSnapshot = {
+      issueId,
+      wakeReason: "issue_comment_mentioned",
+      wakeCommentIds: [wakeCommentId],
+      wakeCommentId,
+    };
+
+    const payload = await buildPaperclipWakePayload({ db, companyId, contextSnapshot });
+
+    // The freshness override: what the payload inlines is the NEWEST comment,
+    // which is not the comment the prompt renders.
+    expect(payload?.latestCommentId).toBe(newestId);
+    expect(extractWakeCommentIds(contextSnapshot).at(-1)).toBe(wakeCommentId);
+
+    const inlinedNewest = (payload?.comments ?? []).find((comment) => comment?.id === newestId);
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: issueId,
+        identifier: "CW-2",
+        title: "Wake comment currency",
+        workMode: "standard",
+        description: null,
+      },
+      wakeComment: { id: wakeCommentId, body: "the downgrade, later retracted" },
+      latestIssueComment: {
+        id: newestId,
+        createdAt: (inlinedNewest?.createdAt as string | undefined) ?? null,
+      },
+      supersededWakeCommentIds: payload?.commentWindow?.supersededCommentIds ?? null,
+      supersededWakeCommentCount: payload?.commentWindow?.supersededCount ?? null,
+    });
+
+    expect(markdown).toContain("Wake comment -- the comment that TRIGGERED this wake");
+    expect(markdown).not.toContain("Latest wake comment");
+    expect(markdown).toContain("This is NOT the newest comment on this issue.");
+    expect(markdown).toContain(newestId);
+    // The warning must precede the body it is about.
+    expect(markdown.indexOf("This is NOT the newest comment on this issue.")).toBeLessThan(
+      markdown.indexOf("the downgrade, later retracted"),
+    );
+    // Nothing was absorbed-but-unshown here: the wake carried one id and the
+    // prompt rendered it. The currency warning is not a superseded-order notice
+    // and must not be confused with one.
+    expect(payload?.commentWindow?.supersededCount).toBe(0);
+    expect(markdown).not.toContain("Earlier wake comment NOT shown above");
   });
 });
