@@ -1098,10 +1098,21 @@ export type IssueCommentMetadata = z.infer<typeof issueCommentMetadataSchema>;
  * author WAS entitled to raise, which therefore conferred standing
  * `issue:comment` access, and which woke nobody because the row is closed. The
  * two lists partition the bound mentions that did not wake, so `[]` on both is
- * now positive evidence of delivery instead of the ambiguity it used to be.
+ * now positive evidence that a wake was RAISED instead of the ambiguity it used
+ * to be. Raised, not delivered: the classifier decides the wake, not what
+ * becomes of it.
  * They ship together because a reader holding one will reasonably assume it
  * covers the other, and it cannot — the predicates share nothing but the call
  * site.
+ *
+ * The fourth list is the only one of the four that reports a historical EVENT
+ * rather than a predicate re-derived per request, which is why it alone goes
+ * `null` on an idempotent replay. Binding, entitlement and the grant all
+ * answer about the world as it is when you ask; a wake was raised once, by the
+ * request that created the comment, and a replay cannot see the snapshot that
+ * decision was made against. Restating it from the current row is wrong in
+ * both directions — see the `wakeDecidedHere` comment in
+ * `routes/issues.ts` — so the replay declines to restate it.
  */
 export const COMMENT_UNBOUND_MENTIONS_NOTE =
   "⚠ A plain `@Name` MENTIONS NOBODY. The extractor binds only a markdown link "
@@ -1165,15 +1176,28 @@ export const COMMENT_UNBOUND_MENTIONS_NOTE =
   + "`mentionsWithoutGrant` (no grant, no wake), in "
   + "`mentionsGrantedWithoutWake` (grant, no wake), or in neither (grant, and "
   + "the wake fired). So both empty, with the name in `boundMentions`, is now "
-  + "positive evidence of delivery — before this field it was the ambiguity. A "
-  + "name here means: they can reply, and NOTHING TOLD THEM. If you need them "
-  + "to act, reopen the row, or reach them on a row that is open; re-sending "
-  + "the same body to the same closed row does the same nothing. It is computed "
-  + "from the same classification the wake sites branch on, not a second "
-  + "derivation of it, so it cannot drift from the behaviour it reports. "
-  + "Self-mentions never appear here — a self-mention fails entitlement, so it "
-  + "is in `mentionsWithoutGrant` on a closed row exactly as on an open one. "
-  + "Always present; absent means the server predates it. (PEN-6035)";
+  + "positive evidence that a WAKE WAS RAISED — before this field it was the "
+  + "ambiguity. Raised is not the same as acted on: this classifies the wake "
+  + "decision, and says nothing about a target that is paused, terminated, or "
+  + "whose wake coalesces with one it already had. A name here means: they can "
+  + "reply, and NOTHING TOLD THEM. If you need them to act, reopen the row, or "
+  + "reach them on a row that is open; re-sending the same body to the same "
+  + "closed row does the same nothing. It is computed from the same "
+  + "classification the wake sites branch on, not a second derivation of it, so "
+  + "it cannot drift from the behaviour it reports. Self-mentions never appear "
+  + "here — a self-mention fails entitlement, so it is in `mentionsWithoutGrant` "
+  + "on a closed row exactly as on an open one. ⛔ ON A REPLAY IT IS `null`, "
+  + "NOT `[]` — and `null` is NOT an empty list. A wake is raised once, by the "
+  + "request that created the comment; re-sending that `idempotencyKey` returns "
+  + "200 without raising anything, and the row's status may have moved either "
+  + "way in between, so this server will not restate a verdict it cannot "
+  + "re-derive. Read the verdict off the FIRST write's receipt. `null` here "
+  + "also voids the \"both empty\" reading above: only an ARRAY on this field "
+  + "makes an empty `mentionsWithoutGrant` evidence of anything. The other "
+  + "three lists stay live and correct on a replay, because binding, "
+  + "entitlement and the grant are all re-derived per request — only the wake "
+  + "is historical. Always present; absent means the server predates it. "
+  + "(PEN-6035)";
 
 export const addIssueCommentSchema = z.object({
   body: multilineTextSchema.pipe(z.string().min(1)).describe(COMMENT_UNBOUND_MENTIONS_NOTE),

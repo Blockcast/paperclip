@@ -777,9 +777,16 @@ because it woke somebody.
 | name in `unboundMentions` | the link bound to nobody |
 | name in `mentionsWithoutGrant` | no grant, no wake |
 | name in `mentionsGrantedWithoutWake` | **standing `issue:comment` granted, nobody woken** |
-| name in `boundMentions` only | granted, and the wake fired |
+| name in `boundMentions` only | granted, and the wake was raised |
+| `mentionsGrantedWithoutWake` is `null` | idempotent replay — not evaluated, see below |
 
-Two things that were decided and should not be re-opened without re-reading
+"The wake was raised" is the strongest thing the fourth list can say. It reports
+the wake **decision**, not what became of it: a target that is paused,
+terminated, or whose wake coalesces with one it already held is indistinguishable
+here from one that ran. The three older lists are unchanged by that — none of
+them ever claimed delivery either.
+
+Three things that were decided and should not be re-opened without re-reading
 this:
 
 - **Not a second meaning for `mentionsWithoutGrant`.** That field is named after
@@ -799,6 +806,28 @@ this:
   silence it replaced. Locate the sites with
   `grep -n classifyIssueMentionWake server/src/routes/issues.ts`: the definition,
   the three wake sites, and the one receipt partition.
+- **`null` on a replay, and that is not an empty list.** The fourth list is the
+  only one of the four that reports a historical **event**. Binding, entitlement
+  and the grant are all re-derived per request — `agentHasMentionGrantOnIssue`
+  re-reads the persisted comment rows every time it is asked — so a live answer
+  to those is the current answer, which is exactly what they claim. A wake is
+  raised **once**, by the request that created the comment. Re-sending its
+  `idempotencyKey` returns 200 having raised nothing, against a row whose status
+  may have moved in either direction since, so classifying at response time
+  there is wrong in **both**: a mention that woke somebody on a then-open row
+  would read `granted_without_wake` once the row closed, and a mention that woke
+  nobody on a then-closed row would drop out of both lists once the row reopened
+  — which under the table above reads as a wake. The replay therefore answers
+  `null`: *not evaluated, the verdict is on the first write's receipt.* `null`
+  rather than an omitted key, because an absent key already means "this server
+  predates the field". It is **not** reconstructed from the durable effect
+  ledger either: the `wake` rows are there, but `pruneSettledCommentEffects`
+  deletes them 24h after the comment settles, so a ledger read would answer
+  correctly for a day and then answer `granted_without_wake` for every replay —
+  a verdict whose correctness expires on a timer, with nothing at the call site
+  to say which side of it you are on. It would also be a second derivation of
+  "was a wake raised", which is the bullet above. (Found in review of
+  `#3541`, 2026-11-08.)
 
 Why it was worth an unconditional key on every comment response: the closed-row
 grant is the highest-volume, least-deliberate mention there is. Measured across

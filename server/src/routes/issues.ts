@@ -17784,11 +17784,43 @@ export function issueRoutes(
     // produced 19 standing grants and NOT ONE was written as an access
     // decision — all of them were a thanks, a routing ping, a closing handoff.
     // Nobody is going to go looking for this; it has to arrive on the receipt.
-    const commentResponseBody = async () => {
+    //
+    // PEN-6035 (review follow-up): `wakeDecidedHere` is whether the wake this
+    // receipt describes was decided BY THIS REQUEST. The three older lists are
+    // safe either way — binding and entitlement are re-derived per request, and
+    // `agentHasMentionGrantOnIssue` re-derives the grant at decision time too,
+    // so a live answer IS the current answer and that is all they claim. The
+    // wake is not like that. It is a historical EVENT, raised once; on a keyed
+    // replay that finds intents already in the ledger it was raised by an
+    // earlier request, against a snapshot this one cannot see. The row's status
+    // may have moved either way since, so classifying at response time there is
+    // wrong in BOTH directions: a mention that woke somebody on a then-open row
+    // reads `granted_without_wake` once the row closes, and a mention that woke
+    // nobody on a then-closed row drops out of both lists once the row reopens
+    // — which under the note on `addIssueCommentSchema` reads as positive
+    // evidence that a wake was raised. A receipt that is affirmatively wrong is
+    // worse than the silence this field replaced, so a replay answers `null`:
+    // NOT EVALUATED, the verdict belongs to the receipt of the request that
+    // created the comment. `null` rather than an omitted key because an absent
+    // key already means "this server predates the field", and those are
+    // different facts.
+    //
+    // Deliberately NOT reconstructed from the effect ledger. The rows are there
+    // (`issue_comment_effects`, `effectKind: "wake"`), but
+    // `pruneSettledCommentEffects` deletes them 24h after the comment settles
+    // (`SETTLED_COMMENT_EFFECT_RETENTION_MS`), so a ledger read answers
+    // correctly for a day and then answers `granted_without_wake` for every
+    // replay — a verdict whose correctness expires on a timer, with nothing at
+    // the call site to say which side of it you are on. It would also be a
+    // SECOND derivation of "was a wake raised", from rows rather than from
+    // `classifyIssueMentionWake`, which is the drift class this field exists to
+    // avoid.
+    const commentResponseBody = async (options?: { wakeDecidedHere?: boolean }) => {
+      const wakeDecidedHere = options?.wakeDecidedHere ?? true;
       let unboundMentions: string[] = [];
       let boundMentions: string[] = [];
       let mentionsWithoutGrant: string[] = [];
-      let mentionsGrantedWithoutWake: string[] = [];
+      let mentionsGrantedWithoutWake: string[] | null = wakeDecidedHere ? [] : null;
       try {
         const boundAgentIds = await resolveMentionedAgentIds();
         const authorUserIsActiveMember = await resolveAuthorUserIsActiveMember(boundAgentIds.length > 0);
@@ -17801,7 +17833,10 @@ export function issueRoutes(
         //
         // Evaluated against `currentIssue` at response time, so a reopen or an
         // in-request reassignment reports the row the wake was actually judged
-        // against.
+        // against — true exactly when this request is the one that judged it,
+        // which is what `wakeDecidedHere` asserts. Where it is false the WAKE
+        // half of the verdict is discarded below and the GRANT half still
+        // stands, because entitlement really is re-derived per request.
         const withoutGrantAgentIds: string[] = [];
         const grantedWithoutWakeAgentIds: string[] = [];
         for (const mentionedAgentId of boundAgentIds) {
@@ -17831,7 +17866,7 @@ export function issueRoutes(
         unboundMentions = mentionReport.unbound;
         boundMentions = mentionReport.bound;
         mentionsWithoutGrant = mentionReport.withoutGrant;
-        mentionsGrantedWithoutWake = mentionReport.grantedWithoutWake;
+        mentionsGrantedWithoutWake = wakeDecidedHere ? mentionReport.grantedWithoutWake : null;
       } catch (err) {
         // Fail toward "nothing bound": a false re-send costs one round trip, a
         // false all-clear costs the wake. `mentionsWithoutGrant` defaults empty
@@ -17841,7 +17876,9 @@ export function issueRoutes(
         // same reasoning, with one difference worth naming: an empty value
         // there is the ALREADY-AMBIGUOUS reading this field was added to
         // disambiguate, so the failure degrades the receipt to its pre-PEN-6035
-        // state rather than to a new wrong claim.
+        // state rather than to a new wrong claim. On a replay the default is
+        // `null` instead, and that is the stronger of the two: it says the
+        // question was not answered rather than answering it emptily.
         logger.warn({ err, issueId: id }, "failed to scan comment for unbound @-mentions");
       }
       return {
@@ -17856,14 +17893,25 @@ export function issueRoutes(
     if ("deduplicated" in comment && comment.deduplicated) {
       idempotentReplay = true;
       if (comment.idempotencyProcessedAt) {
-        res.status(200).json(await commentResponseBody());
+        // Settled replay: every effect this comment owed has already run, so
+        // this request raises nothing and decided no wake.
+        res.status(200).json(await commentResponseBody({ wakeDecidedHere: false }));
         return;
       }
     }
 
     if (req.body.idempotencyKey) {
+      // PEN-6035: a first write builds its intents from `currentIssue` inside
+      // the insert transaction above, and an unstamped replay whose intents
+      // never landed builds them from `currentIssue` right here — both decided
+      // the wake in this request, so the receipt may classify live. A replay
+      // that finds intents already in the ledger did NOT: it re-drains someone
+      // else's decision, and the row may have opened or closed since.
+      let wakeDecidedHere = true;
       if (idempotentReplay) {
-        if (!(await hasCommentEffects(db, comment.id))) {
+        if (await hasCommentEffects(db, comment.id)) {
+          wakeDecidedHere = false;
+        } else {
           const effects = await buildKeyedCommentEffectIntents({
             issue: currentIssue,
             comment,
@@ -17879,7 +17927,7 @@ export function issueRoutes(
         }
       }
       await drainCommentEffectsAfterCommit({ commentId: comment.id, issueId: currentIssue.id });
-      res.status(idempotentReplay ? 200 : 201).json(await commentResponseBody());
+      res.status(idempotentReplay ? 200 : 201).json(await commentResponseBody({ wakeDecidedHere }));
       return;
     }
 
