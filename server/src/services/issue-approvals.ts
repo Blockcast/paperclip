@@ -54,6 +54,15 @@ export function issueApprovalService(db: Db) {
      * Both default to WITHHOLDING, so a caller that does not resolve a verdict discloses nothing.
      * That default is load-bearing here: two of this method's five callers read only `status` and
      * pass no options at all.
+     *
+     * ⚠️ This is a DECISION surface, so the projection below must carry `payloadRevision` and
+     * `payloadEditedAt` (PEN-6107). `GET /issues/:id/approvals` is what `ApprovalCard` renders from
+     * on `IssueDetail` and in `CommentThread` — the card with the working Approve/Reject buttons —
+     * and `paperclipListIssueApprovals` reads the same endpoint. An editable payload (PEN-5766) was
+     * accepted on disclosure alone; prevention was deliberately deferred. A column dropped here does
+     * not fail loudly: an absent key and an unedited `0` are indistinguishable through JS property
+     * access, so an edited card would render as never-edited, and the shared `Approval` type
+     * declares `payloadRevision` non-optional, so the compiler cannot flag the omission either.
      */
     listApprovalsForIssue: async (
       issueId: string,
@@ -79,6 +88,8 @@ export function issueApprovalService(db: Db) {
           decidedAt: approvals.decidedAt,
           createdAt: approvals.createdAt,
           updatedAt: approvals.updatedAt,
+          payloadRevision: approvals.payloadRevision,
+          payloadEditedAt: approvals.payloadEditedAt,
         })
         .from(issueApprovals)
         .innerJoin(approvals, eq(issueApprovals.approvalId, approvals.id))
