@@ -479,6 +479,87 @@ describeEmbeddedPostgres("issue wake diagnostics route", () => {
     expect(ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(ISSUE_PARK_EXPIRED_WAKE_REASON)).toBe(true);
   });
 
+  // PEN-6156: the same shape as the park-expiry test above, and for the same reason --
+  // the issue-monitor scheduler's reasons reach `agent_wakeup_requests.reason` through
+  // `enqueueWakeup({ reason: wakeReason })`, where `wakeReason` is a function
+  // PARAMETER destructured from `input`. Neither writer-derived scan can resolve that,
+  // so these three entries have no protection other than this test.
+  //
+  // It is emphatically not hypothetical. Measured on this route 2026-11-08 by
+  // correlating `heartbeat_runs.contextSnapshot.wakeReason` against what the projector
+  // returned for the same wake row: `issue_monitor_due` read "other" on 8/8 exact
+  // matches across 11 issues, `issue_monitor_recovery` on 11/14, and
+  // `issue_monitor_recovery_issue` on 5/5. Over a 13-day census of 11,956 runs
+  // `issue_monitor_due` is 1,817 of them -- the most common issue-scoped wake in the
+  // fleet -- so "other" was the MODAL answer to "why did this row wake?".
+  it("names the issue-monitor scheduler's reasons on monitor-fired wakes", async () => {
+    const company = await seedCompany(db);
+    const agent = await seedAgent(db, company.id);
+    const project = await seedProject(db, company.id, "Core");
+    const issue = await seedIssue(db, {
+      companyId: company.id,
+      projectId: project.id,
+      title: "Row whose monitor has fired",
+      status: "in_progress",
+      assigneeAgentId: agent.id,
+    });
+
+    // Ordered oldest-first here; the route returns newest-first, so the expectation
+    // below reverses it rather than restating the literals in a second order.
+    const reasons = [
+      "issue_monitor_due",
+      "issue_monitor_recovery",
+      "issue_monitor_recovery_issue",
+    ];
+    for (const [index, reason] of reasons.entries()) {
+      await db.insert(agentWakeupRequests).values({
+        companyId: company.id,
+        agentId: agent.id,
+        source: "automation",
+        reason,
+        status: "completed",
+        // The binding that makes the row reachable at all: `wakeRequestTargetsIssue`
+        // coalesces `payload ->> 'issueId'` first. This mirrors the writers, which all
+        // pass the payload through `withRecoveryModelProfileHint` -- `issueId` is not a
+        // hint key, so the scrub preserves it.
+        payload: { issueId: issue.id, monitorAttemptCount: 1 },
+        runId: null,
+        requestedAt: new Date(Date.now() - (reasons.length - index) * 60_000),
+      });
+    }
+
+    const res = await request(createApp(db, boardActor(company)))
+      .get(`/api/issues/${issue.id}/diagnostics/wakes`);
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(res.body.events).toHaveLength(reasons.length);
+    expect(res.body.events.map((event: { reason: string }) => event.reason)).toEqual(
+      [...reasons].reverse(),
+    );
+    for (const reason of reasons) {
+      expect(ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has(reason)).toBe(true);
+    }
+
+    // Binds the fixture to its writers. The scans cannot prove these spellings, so
+    // without this a rename in `heartbeat.ts` would leave the test green while the
+    // live column reached "other" again -- exactly the regression PEN-6156 fixed.
+    // `dispatchClaimedIssueMonitor` is matched on its default (`?? "issue_monitor_due"`)
+    // because the literal never appears at the `enqueueWakeup` call itself.
+    const heartbeatTs = readFileSync(
+      fileURLToPath(new URL("../services/heartbeat.ts", import.meta.url)),
+      "utf8",
+    );
+    expect(heartbeatTs).toContain('wakeReason: input?.wakeReason ?? "issue_monitor_due"');
+    expect(heartbeatTs).toContain('reason: "issue_monitor_recovery"');
+    expect(heartbeatTs).toContain('reason: "issue_monitor_recovery_issue"');
+
+    // The fourth sibling, held out. `startNextQueuedRunForAgent` is the dispatcher, not
+    // a wake writer, so this spelling must never appear as an `enqueueWakeup` reason --
+    // see the `UNREACHABLE_BY_CONSTRUCTION` entry.
+    expect(heartbeatTs).toContain('reason: "issue_monitor_dispatch_watchdog"');
+    expect(ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS.has("issue_monitor_dispatch_watchdog")).toBe(false);
+  });
+
   it("returns null diagnosis for an unblocked issue with no wake history", async () => {
     const company = await seedCompany(db);
     const project = await seedProject(db, company.id, "Core");
@@ -1291,6 +1372,17 @@ describe("issue wake diagnostic reason allowlist", () => {
     {
       reason: "issue_assignment_recovery_capacity_reservation",
       why: "ephemeral capacity token: no payload, and deleted in a finally",
+    },
+    // PEN-6156: the fourth issue-monitor reason, and the only one of the four held
+    // out. Its three siblings are admitted; this one is
+    // `startNextQueuedRunForAgent(agentId, { reason })` -- a DISPATCHER argument, not
+    // an `agent_wakeup_requests` insert -- so the watchdog writes no wake row at all.
+    // Measured over a 13-day census of 11,956 runs: 0 occurrences, against 1,817 for
+    // `issue_monitor_due`. Admitting it would assert a reachability this route does
+    // not have, and the four look identical from a grep of reason strings.
+    {
+      reason: "issue_monitor_dispatch_watchdog",
+      why: "dispatcher argument, not a wake insert: the watchdog writes no wake row",
     },
   ];
   const UNREACHABLE_REASONS = UNREACHABLE_BY_CONSTRUCTION.map((entry) => entry.reason);

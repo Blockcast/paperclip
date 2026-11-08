@@ -1692,6 +1692,48 @@ export const ISSUE_WAKE_DIAGNOSTIC_KNOWN_REASONS: ReadonlySet<string> = new Set(
   "agent.not_invokable",
   "heartbeat.cooldown.active",
   "issue_execution_ownership_changed",
+  // PEN-6156: the issue-monitor scheduler's three wake reasons. All three reach the
+  // `reason` COLUMN through `enqueueWakeup`, and all three are issue-scoped by
+  // construction -- their `payload` carries `issueId`, which is not among
+  // `RECOVERY_MODEL_PROFILE_HINT_KEYS`, so `withRecoveryModelProfileHint` preserves it
+  // and coalesce arm 1 (`payload ->> 'issueId'`) binds under a WHERE with no status
+  // predicate.
+  //
+  // Neither writer-derived scan can see them, for the same reason the
+  // `issue_park_expired` block above gives: these are not direct
+  // `insert(agentWakeupRequests)` sites at all, and the value does not reach
+  // `enqueueWakeup` as an inline literal either. `dispatchClaimedIssueMonitor` passes
+  // `reason: wakeReason`, where `wakeReason` is destructured from `input` -- a function
+  // PARAMETER, which resolves to nothing statically. So, like `issue_park_expired`,
+  // each entry here is held by a named route test in
+  // `issue-wake-diagnostics-routes.test.ts` rather than by the scan.
+  //
+  // Reachability is measured on the route, not inferred from the payload. Correlating
+  // `heartbeat_runs.contextSnapshot.wakeReason` (the writer's own record) against what
+  // this projector returned for the same wake row, 2026-11-08:
+  //   - `issue_monitor_due`             8/8 exact-timestamp matches read "other",
+  //                                     over 11 distinct issues
+  //   - `issue_monitor_recovery`        11/14 read "other"; the other 3 matched a
+  //                                     different wake row coalesced onto the same run
+  //   - `issue_monitor_recovery_issue`  5/5 read "other" (PEN-5588/5589/5693/5694/5695)
+  //
+  // This is the largest single degradation the list has carried. Over a 13-day census
+  // of 11,956 runs, `issue_monitor_due` alone is 1,817 of them (15.1%) -- more than
+  // `issue_commented` (1,527) and more than any other issue-scoped reason, so "other"
+  // was the MODAL answer this route gave to the one question it exists to answer.
+  // `issue_monitor_recovery` adds 94 and `issue_monitor_recovery_issue` 5.
+  //
+  // Deliberately NOT admitted: `issue_monitor_dispatch_watchdog`. It is the odd one of
+  // the four -- `startNextQueuedRunForAgent(watchedRun.agentId, { reason })` is a
+  // DISPATCHER argument, not an `agent_wakeup_requests` insert, so the watchdog writes
+  // no wake row at all and nothing it does can ever reach this projector. Confirmed
+  // against the same 13-day census: 0 occurrences, versus 1,817 for its sibling.
+  // Listing it would assert a reachability this route does not have -- the same rule
+  // the timer-scheduler and `recovery/service.ts` exclusions above are held to. The
+  // negative test in `issue-wake-diagnostics-routes.test.ts` is what holds that out.
+  "issue_monitor_due",
+  "issue_monitor_recovery",
+  "issue_monitor_recovery_issue",
 ]);
 
 const ISSUE_WAKE_DIAGNOSTIC_KNOWN_STATUSES = new Set([
