@@ -13601,6 +13601,21 @@ export function buildPaperclipTaskMarkdown(input: {
   wakeComment?: {
     id: string;
     body: string;
+    // PEN-6039: so the heading can state WHEN the rendered body was written
+    // instead of leaving the reader to assume it is current. Optional because
+    // the renderer must keep working for callers that cannot supply it; the
+    // heading degrades to the undated form rather than inventing a time.
+    createdAt?: string | null;
+  } | null;
+  // PEN-6039: the issue's NEWEST comment at payload-assembly time -- the row
+  // `buildPaperclipWakePayload`'s freshness override inlines, which the adapter
+  // prompt renders as a `Comment:` block ABOVE this one. It is a DIFFERENT row
+  // from `wakeComment` whenever a comment arrived after the wake that triggered
+  // this run (including one that woke a sibling run), and the prompt said
+  // nothing about the difference while heading the older body "Latest".
+  latestIssueComment?: {
+    id: string;
+    createdAt?: string | null;
   } | null;
   // PEN-3743: comment ids this wake absorbed but whose bodies are NOT inlined
   // above, because the freshness override in `buildPaperclipWakePayload` kept
@@ -13983,7 +13998,48 @@ export function buildPaperclipTaskMarkdown(input: {
     }
   }
   if (wakeComment?.body.trim()) {
-    lines.push("", "Latest wake comment:", fenceTaskText(wakeComment.body.trim()));
+    // PEN-6039: this block holds the comment that TRIGGERED this wake --
+    // `deriveCommentId`, the last entry of the run's accumulated
+    // `wakeCommentIds` -- and the heading used to call it "Latest wake comment".
+    // That is the one property it cannot carry: a comment posted after the wake
+    // was enqueued, or one that woke a sibling run, is newer and is not in this
+    // run's id list, so the rendered body is routinely not the thread's newest.
+    //
+    // Measured twice ~6h apart by Security Engineer, on two unrelated rows:
+    //   PEN-5940 -- rendered a body written 11:52:56Z while the same payload's
+    //     `Comment:` block carried 17:06:28Z. TWO comments in between explicitly
+    //     RETRACTED the rendered one ("my 11:52Z correction was ALSO wrong"),
+    //     and the rendered one closed with "No action wanted from you", so a
+    //     reader who trusted the heading and stopped there would have recorded
+    //     a withdrawn downgrade as current and terminated, leaving no trace
+    //     distinguishable from a correct no-op.
+    //   PEN-6016 -- rendered 22:11:50Z against an inlined 00:52:24Z, five
+    //     comments later. Harmless only because of what happened to be in the
+    //     slot; the selection fired identically, and nothing at dispatch time
+    //     can know which case it is in.
+    //
+    // So: name the SUBJECT ("Wake comment"), and when a newer comment exists,
+    // say so BEFORE the body rather than after it. The reader this protects is
+    // the one who reads the block and stops; a notice below the fence reaches
+    // only the reader who was going to keep reading anyway.
+    const wakeCommentCreatedAt = readNonEmptyString(wakeComment.createdAt);
+    const latestIssueComment = input.latestIssueComment ?? null;
+    const latestIssueCommentId = readNonEmptyString(latestIssueComment?.id);
+    lines.push(
+      "",
+      wakeCommentCreatedAt
+        ? `Wake comment -- the comment that TRIGGERED this wake, created ${wakeCommentCreatedAt}:`
+        : "Wake comment -- the comment that TRIGGERED this wake:",
+    );
+    if (latestIssueCommentId && latestIssueCommentId !== wakeComment.id) {
+      const latestCreatedAt = readNonEmptyString(latestIssueComment?.createdAt);
+      lines.push(
+        `This is NOT the newest comment on this issue. The newest is ${latestIssueCommentId}${
+          latestCreatedAt ? ` (created ${latestCreatedAt})` : ""
+        }, a different comment, carried separately in this wake's payload. A later comment can correct or RETRACT the one below. Read the issue thread in timestamp order before acting on it.`,
+      );
+    }
+    lines.push(fenceTaskText(wakeComment.body.trim()));
   }
   // PEN-3743: a coalesced wake inlines only the newest comment, so every earlier
   // order it absorbed reaches the agent as silence. Name them. The ids are the
@@ -36304,6 +36360,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               deletedByUserId: issueComments.deletedByUserId,
               deletedByRunId: issueComments.deletedByRunId,
               sourceTrust: issueComments.sourceTrust,
+              // PEN-6039: the rendered body's own timestamp. Normalized to an
+              // ISO string in the mapper below rather than carried as a Date,
+              // because this row is also persisted into the run's
+              // `contextSnapshot` as `paperclipWakeComment`.
+              createdAtRaw: issueComments.createdAt,
             })
             .from(issueComments)
             .where(and(
@@ -36312,8 +36373,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(issueComments.companyId, agent.companyId),
             ))
             .then((rows) => {
-              const row = rows[0] ?? null;
-              return row?.deletedAt
+              const found = rows[0] ?? null;
+              if (!found) return null;
+              const { createdAtRaw, ...rest } = found;
+              const row = {
+                ...rest,
+                createdAt: createdAtRaw ? createdAtRaw.toISOString() : null,
+              };
+              return row.deletedAt
                 ? {
                     ...row,
                     body: "",
@@ -36527,6 +36594,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       delete context[PAPERCLIP_WAKE_PAYLOAD_KEY];
     }
     const paperclipPrReview = derivePaperclipPrReview(context);
+    // PEN-6039: the row `buildPaperclipWakePayload`'s freshness override inlined
+    // -- the issue's NEWEST comment at payload-assembly time, which the adapter
+    // prompt renders as a `Comment:` block. Read it from the payload we just
+    // built rather than re-querying, so the prompt's statement about which row
+    // is newest cannot disagree with the row the payload actually carried.
+    const latestInlinedComment = (() => {
+      const latestId = readNonEmptyString(paperclipWakePayload?.latestCommentId);
+      if (!latestId) return null;
+      const inlined = (paperclipWakePayload?.comments ?? []).find(
+        (comment) => readNonEmptyString(comment?.id) === latestId,
+      );
+      return { id: latestId, createdAt: readNonEmptyString(inlined?.createdAt) };
+    })();
     const taskMarkdown = buildPaperclipTaskMarkdown({
       issue: issueRef
         ? {
@@ -36539,6 +36619,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null,
       ancestors: issueAncestors,
       wakeComment: safeWakeCommentContext,
+      // PEN-6039: the newest comment the payload inlined, so the prompt can say
+      // out loud when the wake comment it renders is NOT it.
+      latestIssueComment: latestInlinedComment,
       // PEN-3743: carry the absorbed-but-not-inlined ids from the payload we
       // just built into the prompt. The payload subtracts BOTH shown surfaces
       // -- its own inlined `comments` and the `deriveCommentId` row this call
