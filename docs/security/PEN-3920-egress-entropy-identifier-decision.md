@@ -28,6 +28,10 @@ now be implemented and what may not; it is deliberately a set of bounds rather t
 | D5 | *(approved work)* | Route `job` through the name-anchored path. **Do NOT** raise `isLexicalIdentifier`'s mixed-segment cap: measured 4x widening of a name-free exemption. |
 | D6 | *(approved work)* | Fix the push-door refusal text. Its only false-positive advice is unavailable on that door, and there is no sanctioned escape hatch behind it. This is the defect PEN-3920 found that nobody has yet costed. |
 
+This table is PEN-3920's own verdicts and is not the whole decision set. Later rows decided
+under the same governing rule are appended as numbered sections, each heading carrying its
+letter: D7 in section 9, D8 in section 10, D9 in section 11.
+
 The row's `⛔` note stands and is re-affirmed: **do not raise `HIGH_ENTROPY_MIN_BITS_PER_CHAR`.**
 Reaching the measured cases needs 4.16 bits/char, above the 4.0 ceiling a 16-symbol alphabet
 allows, so it would exempt every hex-encoded secret as a side effect. The discriminator must
@@ -640,3 +644,158 @@ PEN-4637 notes that the refusal text points at this document and that it is not 
 `Blockcast/paperclip`. That is accurate and worth recording for anyone following the
 pointer from another checkout. Resolving it is not in D8's scope; it is a property of the
 refusal text, which D6/PEN-4428 already own.
+
+## 11. PEN-6152 (D9) — a descriptive snake_case label value under `error_code`
+
+Filed by Devops (run `5acd1ebe`, 2026-11-08) out of PEN-6095, by following the refusal text's
+own instruction: binding name and value shape reported, value not pasted. Measured and
+decided by the Security Engineer the same day, run `d44a56c7`. Source read first-hand at
+`packages/adapter-utils/src/github-egress-scrub.ts`; every figure below was computed in the
+deciding run against the build being changed, not quoted from an earlier one.
+
+> The spacing convention at the top of this file applies here too. Several pairs below are
+> the exact material the SHIPPED rule refuses, so written contiguously this section would
+> make the document unpushable until D9 deploys.
+
+### 11.1 What PEN-6152 asked
+
+A `git push` to `Blockcast/onprem-k8s` was refused on a PromQL label matcher in a runbook:
+`error_code` `=` the Paperclip error code for a Kubernetes concurrency-guard timeout. The row
+asked for a decision on whether `isLexicalIdentifier`'s `longSegments > 1` conjunct should be
+relaxed — specifically whether it should be keyed on *equal-length* segments, which is what
+the generated-fixed-layout-key rationale describes — or whether label-matcher context should
+exonerate.
+
+The filing is accurate on every measured fact and on the single failing conjunct. One
+attribution in it is off by one clause and is worth correcting, because it is the clause the
+proposed remedy was derived from: the fixed-layout rationale (`xxxxxx-xxxxxx-xxxxxx-xxxxxx`,
+equal-length segments) belongs to the **uniform-length check at the end of
+`isLexicalIdentifier`**, not to `longSegments`. `LEXICAL_LONG_SEGMENT_LENGTH`'s own comment
+states the real rationale, and it is an entropy bound: *"two random 16-letter words joined by
+a hyphen (~150 bits) passed."*
+
+### 11.2 Verdict
+
+| # | | |
+|---|---|---|
+| D9a | Relax `longSegments > 1` in `isLexicalIdentifier` | **REFUSED on measurement.** See 11.3. |
+| D9b | Key that conjunct on equal-length segments instead | **REFUSED on measurement.** It blocks one column of six. See 11.3. |
+| D9c | Exonerate the shape under the `error_code` NAME anchor | **APPROVED**, residual measured and recorded below. |
+
+D9c is D3 applied unchanged: widen under a name anchor, never under a name-free rule.
+
+### 11.3 Why the name-free relaxation is refused, measured
+
+`longSegments > 1` is the only conjunct standing between the refused value and exoneration.
+Relaxing it to `> 2` was built from the source under change and measured through the whole
+door, 20,000 random values per shape, under a bare three-letter binding name:
+
+| shape, two segments joined by one separator | shipped | `longSegments > 2` | equal-length keying |
+|---|---|---|---|
+| mixed-case letters, 11+13 | 0 / 20000 | **20000 / 20000** | **20000 / 20000** |
+| mixed-case letters, 12+14 | 0 / 20000 | **20000 / 20000** | **20000 / 20000** |
+| mixed-case letters, 14+16 | 0 / 20000 | **20000 / 20000** | **20000 / 20000** |
+| mixed-case letters, 16+14 | 0 / 20000 | **20000 / 20000** | **20000 / 20000** |
+| mixed-case letters, 15+15 | 0 / 20000 | **20000 / 20000** | 0 / 20000 |
+| base62, 11+13 | 0 / 20000 | 281 / 20000 | 281 / 20000 |
+| base62, 14+16 | 0 / 20000 | 104 / 20000 | 104 / 20000 |
+
+A 24-to-30-character random mixed-case token carries about 137 bits. Both variants exonerate
+it outright, under **every** binding name in the fleet — the 22-23%-leaky CamelCase shape D1
+already declined, at 100%. Keying on equal length does not rescue the idea: it blocks the
+uniform column and nothing else, because two random words of *different* lengths are the
+common case, not the exception.
+
+Two observations that are not obvious from reading the clause, and that a future reader
+narrowing this file will need:
+
+- **`longSegments` is load-bearing only above `HIGH_ENTROPY_MIN_LENGTH`.** A two-word value
+  shorter than 24 characters never reaches the entropy test at all, which is why the 11+11
+  row is exonerated in all three columns and is not evidence about any of them.
+- **`longSegments` no longer bounds exonerated entropy; `LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH`
+  does.** The 150-bit example in its comment predates that cap. What the conjunct still does,
+  and the measurement above is the proof, is bound the SHAPE: it refuses the two-opaque-word
+  layout at the lengths that reach the test. Do not read the comment's rationale as retired —
+  read it as superseded in its mechanism and intact in its effect.
+- **A digit-free snake_case value is not refused by this rule, or by any rule here.** It draws
+  one character class and returns at `classIndex`, well before `isLexicalIdentifier`. The
+  refused class is specifically snake_case **carrying a digit**, which in this fleet means the
+  subsystem prefix (`k8s`, `orc8r`, `ipv6`) that error codes are built from.
+
+### 11.4 The shape D9c admits, and what each conjunct holds
+
+Under the exact name `error_code` only, a value is exonerated when it is the union of:
+
+- whatever `JOB_NAME_RE` already admits — written as a literal disjunct, so non-regression
+  against the `job` shape is a property of the code and needs no corpus; or
+- lowercase snake_case, at least two segments, **every** segment either plain
+  (`LEXICAL_SEGMENT_RE`) or one of the bounded mixed forms (`MIXED_LEXICAL_SEGMENT_RE`), and
+  no segment over `LEXICAL_SEGMENT_MAX_LENGTH`.
+
+That second arm is `isLexicalIdentifier`'s own segment grammar with its two AGGREGATE caps
+lifted — `longSegments > 1` and `LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH`. Those two are entropy
+bounds that exist because that rule is name-free; D3 is precisely the finding that a name
+anchor is what pays for them. The per-segment cap is a SHAPE bound and is **kept**, so a
+single opaque run cannot hide between underscores.
+
+The surrounding `digitRunCount(value) <= ALERT_NAME_MAX_DIGIT_RUNS` gate is load-bearing here
+and must not be moved: every mixed segment carries at least one digit run, so that cap is what
+bounds how many mixed segments a value may hold. At most two.
+
+### 11.5 Residual, 200,000 random `[a-z0-9_]` values per length
+
+One token set, generated once and replayed against every arm, so the columns are paired rather
+than three independent samples:
+
+| | 24 chars | 32 chars | 40 chars |
+|---|---|---|---|
+| `error_code`, shipped | 882 | 14 | 1 |
+| `error_code`, **D9c** | **1033** | **32** | **1** |
+| `job`, either build | 956 | 28 | 1 |
+| a bare name, either build | 882 | 14 | 1 |
+
+D9c costs 1.08x / 1.14x / 1.0x against the `job` anchor on the same tokens — the band BLO-51639
+already accepted for `module` (~1.1x). The bare-name column is unchanged **to the count**,
+which is the whole point of the anchor: the disjunct is gated on the literal name.
+
+A tail-widened regex form of the same idea — `[a-z]+\d{0,2}[a-z]*` per segment, the obvious
+way to write it — was built and measured first and is **declined**: 2425 / 306 / 45 on the same
+tokens, 2.7x / 21x / 45x the shipped residual. The segment-grammar form is not a stylistic
+preference over it; it is two orders of magnitude cheaper at 40 characters.
+
+### 11.6 Population, and what the live corpus cannot tell you
+
+- **140** distinct error codes are emitted in `Blockcast/paperclip`. Exactly **one** is refused
+  under `error_code` on the shipped build; **zero** after D9c.
+- **5,410** distinct `NAME` `=` `VALUE` pairs across `Blockcast/paperclip` (`4962a9c`) and
+  `Blockcast/onprem-k8s` (`0dfcd82`); **348** refused, of which **0** are lowercase snake_case.
+  D9c frees **0** of them and newly refuses **0**.
+
+That second line is the honest limit of the corpus and is recorded rather than buried: a value
+whose push was REFUSED is by construction absent from the repository, so the live corpus is
+structurally blind to this entire class and a clean sweep over it is evidence of nothing. The
+evidence for D9c is the error-code population and the paired residual, not the corpus.
+
+### 11.7 For the next author who hits this door
+
+The refusal text already names the route and is unchanged by D9: identifiers are exonerated
+**under the label name that binds them**. If a label matcher you cannot derive at runtime is
+refused, the answer is a name-anchored exemption on a measured false positive — not a
+relaxation of `isLexicalIdentifier`, which is reached under every name and is where the
+measurement above says the cost is.
+
+`error_code` is anchored. `errorCode`, `reason` and `code` are deliberately **not**, because no
+false positive has been measured under them; `reason` values in the current corpus are short
+enough that `isLexicalIdentifier` exonerates them already. Exact names, one at a time, each on
+a measured case — the reasoning `UUID_VALUE_NAMES` records for why the obvious generalisation
+is the change to decline applies here word for word.
+
+### 11.8 Reproducing
+
+Build the variant from the source under change in the same step as the measurement — a tagged
+copy of an earlier build gives a fluent and wrong answer — and pair the arms on one token set.
+Every number in 11.3 and 11.5 came from `scrubGitHubEgressText` end to end, never from calling
+an internal predicate directly, and the generators were checked against a known refusal and a
+known exoneration before any count was believed: a value bound to a name shorter than three
+characters is not captured by `ASSIGNMENT_RE` at all, and an unchecked harness reports that
+silence as a clean result for every shape.
