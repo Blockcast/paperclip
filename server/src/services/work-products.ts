@@ -1,7 +1,11 @@
 import { and, desc, eq, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { issueWorkProducts, issues } from "@paperclipai/db";
-import type { IssueWorkProduct } from "@paperclipai/shared";
+import {
+  type IssueWorkProduct,
+  workProductExternalIdMatchKey,
+  workProductExternalIdMatchMode,
+} from "@paperclipai/shared";
 import {
   PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
@@ -326,11 +330,35 @@ export function workProductService(db: Db) {
      * Scoped to one company by the caller. Issue-level read authorization is NOT
      * applied here -- the route applies it, because the actor lives on the
      * request.
+     *
+     * THE KEY IS MATCHED CASE-INSENSITIVELY FOR GITHUB PULL REQUESTS (PEN-6056),
+     * and only for those -- `workProductExternalIdMatchMode` owns that decision
+     * and documents why a git branch must keep matching byte-exactly. This used
+     * to be a plain `eq`, which made a casing difference in either segment of
+     * `owner/repo` return the empty set: the same response a genuinely unowned
+     * artifact produces, down to `withheldForAuthorizationCount: 0`. The caller
+     * cannot know the stored casing -- it is whatever GitHub sent the webhook --
+     * so the miss was unattributable from the response and the directive that
+     * sends every run here failed silently and closed.
      */
     listOwnersByExternalId: async (
       companyId: string,
       key: { provider: string; type: string; externalId: string },
     ) => {
+      // Folded on BOTH sides by the same helper, and folded in JS rather than with
+      // a second `lower()` around the bound value, so the comparison is against a
+      // constant and stays sargable on the `lower(external_id)` index (migration
+      // 0279). `lower()` and `String.prototype.toLowerCase()` agree over the
+      // `[A-Za-z0-9._-]` alphabet the canonical key is restricted to.
+      const matchMode = workProductExternalIdMatchMode(key.provider, key.type);
+      // Equal to `key.externalId` in the `exact` branch by construction, so both
+      // branches read the key from the one function that owns the fold.
+      const matchKey = workProductExternalIdMatchKey(key.provider, key.type, key.externalId);
+      const externalIdMatches =
+        matchMode === "case_insensitive"
+          ? sql`lower(${issueWorkProducts.externalId}) = ${matchKey}`
+          : eq(issueWorkProducts.externalId, matchKey);
+
       const rows = await db
         .select({
           workProduct: issueWorkProducts,
@@ -362,7 +390,7 @@ export function workProductService(db: Db) {
             eq(issueWorkProducts.companyId, companyId),
             eq(issueWorkProducts.provider, key.provider),
             eq(issueWorkProducts.type, key.type),
-            eq(issueWorkProducts.externalId, key.externalId),
+            externalIdMatches,
           ),
         )
         .orderBy(desc(issueWorkProducts.isPrimary), desc(issueWorkProducts.updatedAt));

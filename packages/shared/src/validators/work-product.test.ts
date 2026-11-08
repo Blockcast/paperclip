@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { attachmentArtifactWorkProductMetadataSchema } from "./work-product.js";
+import {
+  attachmentArtifactWorkProductMetadataSchema,
+  workProductExternalIdMatchKey,
+  workProductExternalIdMatchMode,
+} from "./work-product.js";
 
 describe("attachmentArtifactWorkProductMetadataSchema", () => {
   it("accepts the attachment-backed artifact metadata contract", () => {
@@ -37,5 +41,41 @@ describe("attachmentArtifactWorkProductMetadataSchema", () => {
       "openPath",
       "downloadPath",
     ]);
+  });
+});
+
+// PEN-6056. The fold is decided here and applied in two places that must agree:
+// the query predicate in `listOwnersByExternalId` and the `lower(external_id)`
+// index expression (migration 0279). A drift between them reintroduces the
+// original defect silently, because a lookup that matches nothing is
+// byte-identical to an artifact nobody owns.
+describe("workProductExternalIdMatchMode", () => {
+  it("folds a GitHub pull-request key, which GitHub itself treats case-insensitively", () => {
+    expect(workProductExternalIdMatchMode("github", "pull_request")).toBe("case_insensitive");
+    expect(workProductExternalIdMatchKey("github", "pull_request", "Blockcast/Paperclip#3205"))
+      .toBe("blockcast/paperclip#3205");
+  });
+
+  // The number must survive the fold. Folding the whole canonical string is only
+  // safe because digits cannot change case.
+  it("leaves the pull-request number exact", () => {
+    expect(workProductExternalIdMatchKey("github", "pull_request", "Blockcast/Paperclip#3205"))
+      .toMatch(/#3205$/);
+  });
+
+  // NOT "external ids are case-insensitive". A branch key names a git ref and refs
+  // ARE case-sensitive: `feature/Foo` and `feature/foo` are two branches, so
+  // folding them would merge two real artifacts into one.
+  it("leaves every other artifact kind matching byte-exactly", () => {
+    for (const type of ["branch", "commit", "preview_url", "artifact", "document"]) {
+      expect(workProductExternalIdMatchMode("github", type)).toBe("exact");
+      expect(workProductExternalIdMatchKey("github", type, "feature/Foo")).toBe("feature/Foo");
+    }
+  });
+
+  // The fold is a property of the PROVIDER, not of the key's shape: another
+  // provider's `pull_request` has made no such promise.
+  it("leaves another provider's pull request matching byte-exactly", () => {
+    expect(workProductExternalIdMatchMode("gitlab", "pull_request")).toBe("exact");
   });
 });

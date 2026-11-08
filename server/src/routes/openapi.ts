@@ -2046,7 +2046,13 @@ registry.registerPath({
     "neither set contains the other. An empty `owners` is not proof the artifact is " +
     "unowned. `ownerListComplete` answers COMPLETENESS only -- it is defined over owners " +
     "that are MISSING, so it reads `true` over an answer whose entries are mostly mentions. " +
-    "There is no soundness flag; the per-entry `relation` is it.",
+    "There is no soundness flag; the per-entry `relation` is it. " +
+    "`externalIdMatch` reports how the key was compared: `case_insensitive` for a GitHub pull " +
+    "request, whose `owner/repo` GitHub itself treats case-insensitively, and `exact` for every " +
+    "other artifact kind, because a branch key names a git ref and refs ARE case-sensitive. The " +
+    "pull-request number is matched exactly either way. Read it when `owners` is empty: it is " +
+    "what distinguishes a server that folds the casing from one that does not (PEN-6056).",
+
   request: {
     params: z.object({ companyId: z.string() }),
     query: workProductExternalIdLookupQuerySchema,

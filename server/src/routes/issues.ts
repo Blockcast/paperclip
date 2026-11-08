@@ -39,6 +39,7 @@ import {
   createIssueWorkProductSchema,
   workProductExternalIdLookupQuerySchema,
   canonicalizeWorkProductExternalIdForWrite,
+  workProductExternalIdMatchMode,
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
@@ -10807,6 +10808,14 @@ export function issueRoutes(
       type,
       externalId,
     });
+    // Reported, not just performed. PEN-6056 closed a false empty that no field in
+    // this response could attribute -- a casing difference in `owner/repo` matched
+    // no row and answered exactly as a genuinely unowned artifact does. The fold
+    // makes that unreachable, but "unreachable" is a property of the server, and the
+    // caller is reading a response. Stating the match mode is what lets a caller
+    // holding an empty `owners` tell a server that folds from one that does not,
+    // without having to re-run the lookup under a second casing to find out.
+    const externalIdMatch = workProductExternalIdMatchMode(provider, type);
     // Visibility is applied to the ISSUE, not to the work product: the answer
     // names rows, so a seat that cannot read a row must not learn of it here.
     const readableIssueIds = new Set(
@@ -10880,6 +10889,11 @@ export function issueRoutes(
       externalId,
       provider,
       type,
+      // `case_insensitive` for a GitHub pull request, whose `owner/repo` GitHub
+      // itself treats case-insensitively; `exact` for everything else, because a
+      // git branch key names a ref and refs ARE case-sensitive. The PR number is
+      // matched exactly either way -- digits do not fold.
+      externalIdMatch,
       owners: owners.map((owner) => ({
         provenance: owner.provenance,
         issueId: owner.issue.id,

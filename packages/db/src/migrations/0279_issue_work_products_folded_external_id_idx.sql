@@ -1,0 +1,38 @@
+-- PEN-6056: back the case-insensitive owner lookup on
+-- `work-products/by-external-id`.
+--
+-- GitHub is case-insensitive on BOTH segments of `owner/repo`, and every form a
+-- run actually holds the key in accepts any casing -- `gh`, a pasted browser
+-- URL, a repo name typed from memory. The STORED key is whatever casing the
+-- webhook received, which the caller has no way to know. Matched byte-exactly,
+-- `blockcast/penstock-llm-proxy-core#3055` returned `owners: []` with
+-- `withheldForAuthorizationCount: 0` while `Blockcast/penstock-llm-proxy-core#3055`
+-- returned three owners in the same sitting -- and the empty answer is
+-- byte-identical to a genuinely unowned pull request, so a run following the
+-- "record the constraint on the owning row" directive recorded it nowhere.
+--
+-- The query side (`listOwnersByExternalId`) now compares `lower(external_id)`
+-- against a pre-folded constant. `issue_work_products_company_provider_external_id_idx`
+-- (migration 0035) cannot serve that: it indexes the RAW column, so the folded
+-- predicate is not an index condition and degrades to a (company_id, provider)
+-- range scan with a heap filter over every artifact the company has recorded.
+-- This index is the other half of the fix.
+--
+-- WHY `type` IS A LEADING KEY AND THE INDEX IS NOT PARTIAL. The fold applies only
+-- to `provider = 'github' and type = 'pull_request'` -- a git branch key names a
+-- ref, and refs are case-sensitive, so folding those would merge two real
+-- artifacts. That looks like a partial-index predicate and must not be one: the
+-- query binds provider and type as PARAMETERS, and Postgres can only prove a
+-- partial index applicable against constants. A partial index would build, look
+-- correct in `\di`, and never be chosen by the planner. Ordinary leading columns
+-- are chosen whatever the parameter values are.
+--
+-- Plain, not CONCURRENTLY: Drizzle migrations are transactional and
+-- issue_work_products is in the small bucket
+-- (packages/db/src/table-size-estimates.ts), so the SHARE lock is held only for a
+-- build over a few thousand rows.
+--
+-- Coexists with 0035 rather than replacing it. The byte-exact index still serves
+-- every non-folded caller, including the webhook's own
+-- `selectIssuesLinkedToPullRequest`.
+CREATE INDEX IF NOT EXISTS "issue_work_products_company_folded_external_id_idx" ON "issue_work_products" USING btree ("company_id","provider","type",lower("external_id"));
