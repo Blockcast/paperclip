@@ -91,7 +91,7 @@
  * such question is asked against a corpus that can answer it.
  *
  * ⚠️ WHAT THIS SUITE DOES AND DOES NOT PROVE. `SHIPPED_SEARCH_WHERE` below is
- * a hand-written copy of the predicate `issueSearchMatchCondition()` builds,
+ * a hand-written copy of the predicate `issueSearchArmsSubquery()` builds,
  * not the predicate itself — this package cannot import the server service.
  * So these tests prove the POSTGRES behaviour of the two shapes, and would
  * stay green if `list()` reverted to `or(...)` tomorrow. The guard against
@@ -123,12 +123,22 @@
  *     chosen, as an Index Only Scan Backward, by the bench above.
  *  3. "`commentContainsMatch` is a correlated EXISTS, so it re-executes per
  *     row; de-correlate it to `id IN (SELECT ...)`."
- *     ⛔ PostgreSQL ALREADY DOES THIS. It pulls the correlated EXISTS up into
- *     an uncorrelated `hashed SubPlan` — the first test below asserts that
- *     directly. Rewriting that ONE predicate by hand was measured at no
- *     improvement (147-152ms before, 140-163ms after, i.e. noise) and was
- *     reverted. The fix is not de-correlation; it is removing the semi-join
- *     from the disjunction so the OTHER three branches become indexable.
+ *     ⛔ PostgreSQL ALREADY DOES THIS — ⚠️ AT THIS SEED SIZE. It pulls the
+ *     correlated EXISTS up into an uncorrelated `hashed SubPlan`; the first
+ *     test below asserts that directly, and it still passes. Rewriting that
+ *     ONE predicate by hand was measured at no improvement (147-152ms before,
+ *     140-163ms after, i.e. noise) and was reverted. The fix is not
+ *     de-correlation; it is removing the semi-join from the disjunction so
+ *     the OTHER three branches become indexable.
+ *     ⛔ BUT DO NOT READ THAT AS A PRODUCTION CLAIM — it was, and it was
+ *     wrong. The production plan (capture `c4b03742`, 2026-11-06) shows the
+ *     sort key's copy of this EXISTS running as a plain SubPlan at **1,184
+ *     loops**, 2.054ms each, with no hash anywhere: ~61% of execution and
+ *     56.6% of all buffer traffic. The seed priced the same node at ~0.01ms
+ *     over 490 loops — a ~200x miss. ⭐ A SEED CAN MEASURE A SHAPE; IT CANNOT
+ *     MEASURE THE PLANNER'S CHOICE AT PRODUCTION STATISTICS. That is the same
+ *     lesson as the single-company corpus two sections up, and it is the
+ *     second time it has cost this row a cut. See "THE SECOND CUT" below.
  *
  * Note the per-row cost is CPU, not I/O, and that was measured rather than
  * assumed: a 6KB description of repetitive prose is pglz-compressed to well
@@ -152,6 +162,50 @@
  * ⚠️ The SQL below mirrors `list()` in server/src/services/issues.ts by hand
  * (this package cannot import the server). If that query's search shape
  * changes, change these with it.
+ *
+ * ── THE SECOND CUT: THE RANKING, NOT THE PREDICATE ────────────────────────
+ *
+ * Everything above is about the WHERE. The ORDER BY was left alone, and it
+ * re-derived all four branches per candidate row inside a `CASE`:
+ *
+ *   CASE WHEN title ILIKE 'term%'  THEN 0 WHEN title ILIKE '%term%'      THEN 1
+ *        WHEN identifier ILIKE ... THEN 2/3
+ *        WHEN EXISTS (comment body ILIKE '%term%') THEN 4      <- the probe
+ *        WHEN description ILIKE '%term%' THEN 5 ELSE 6 END
+ *
+ * Three of those are free — the columns are already on the fetched row. The
+ * fourth is the node measured at 1,184 loops above. Its loop count identifies
+ * it beyond argument: the `Nested Loop` emitted 1,239 rows and the title arm
+ * matched 55, and 1,239 − 55 = 1,184 — exactly the rows that fall past the
+ * two title branches and reach the comment branch.
+ *
+ * ⭐ THE COST WAS CANDIDATE-BOUND, NOT PAGE-BOUND. Every row the WHERE
+ * admitted paid a comment probe before `LIMIT` could discard it, so
+ * `limit=15` and `limit=1000` cost the same. This is the same defect class
+ * PEN-5213 removed from the OTHER sort key (the `GREATEST(...)` of two
+ * correlated MAXes), one layer further in.
+ *
+ * The fix: each arm also emits the rank the `CASE` would have given it, the
+ * arms are aggregated to `MIN(rank)`, and the result is JOINED. One indexed
+ * pass now answers both "does this row match?" and "how well?", and the sort
+ * key is a joined column. `MIN` reproduces "first matching WHEN" exactly
+ * because the branches were ordered by increasing rank, so the page comes
+ * back in the same order — asserted below over 200 rows, not just the
+ * members. Measured on a local production-shaped corpus (5,000 issues in the
+ * searched company; arm sizes 54/0/384/3,750 against production's
+ * 55/0/380/3,772; ~6KB descriptions, ~4KB comment bodies):
+ *
+ *   superseded (CASE sort key) ......... 534-770ms, median 660ms
+ *   shipped    (joined ranked arms) .... 274-489ms, median 311ms   (2.1x)
+ *
+ * ⚠️ AND THAT 2.1x IS THE SMALLER OF THE TWO WINS, which is why no timing is
+ * asserted. That corpus is in the regime where the planner DOES hash the
+ * SubPlan, so what the join removes there is a duplicate full scan of the
+ * comment arm. Production is in the regime where it does NOT, where the same
+ * join removes 1,184 index probes instead. ⭐ The shipped shape has no
+ * sublink left for the planner to hash or not hash, so it is the one shape
+ * whose cost does not depend on which regime a company lands in — and THAT,
+ * not a millisecond count, is what the tests below pin.
  *
  * ── SEE ALSO: the production-SCALE companion ───────────────────────────────
  *
@@ -272,7 +326,8 @@ const SUPERSEDED_SEARCH_WHERE = `(
 
 /**
  * The WHERE as `list()` builds it now: one id set per branch, unioned.
- * ⚠️ Hand-copied from `issueSearchMatchCondition()` — see the header note; the
+ * ⚠️ Hand-copied from the predicate `issueSearchArmsSubquery()` replaced — see
+ * the header note; the
  * revert guard is the server-side shape suite, not this constant.
  */
 const SHIPPED_SEARCH_WHERE = `i.id IN (
@@ -289,6 +344,82 @@ const SHIPPED_SEARCH_WHERE = `i.id IN (
   WHERE c.company_id = '${COMPANY}'::uuid AND c.deleted_at IS NULL
     AND c.body ILIKE '%${TERM}%' ESCAPE '\\'
 )`;
+
+/**
+ * PEN-3596: the arms as `list()` builds them NOW — the same four branches, each
+ * also emitting the rank the ORDER BY `CASE` used to re-derive, aggregated to
+ * `MIN(rank)` and joined once.
+ *
+ * ⚠️ Hand-copied from `issueSearchArmsSubquery()` — see the header note; the
+ * revert guard is the server-side shape suite, not this constant.
+ */
+const SHIPPED_SEARCH_ARMS = `(
+  SELECT arm.issue_id AS issue_id, MIN(arm.search_rank) AS search_rank
+  FROM (
+    SELECT s.id AS issue_id,
+           CASE WHEN s.title ILIKE '${TERM}%' ESCAPE '\\' THEN 0 ELSE 1 END AS search_rank
+    FROM issues s
+    WHERE s.company_id = '${COMPANY}'::uuid AND s.title ILIKE '%${TERM}%' ESCAPE '\\'
+    UNION ALL
+    SELECT s.id, CASE WHEN s.identifier ILIKE '${TERM}%' ESCAPE '\\' THEN 2 ELSE 3 END
+    FROM issues s
+    WHERE s.company_id = '${COMPANY}'::uuid AND s.identifier ILIKE '%${TERM}%' ESCAPE '\\'
+    UNION ALL
+    SELECT c.issue_id, 4
+    FROM issue_comments c
+    WHERE c.company_id = '${COMPANY}'::uuid AND c.deleted_at IS NULL
+      AND c.body ILIKE '%${TERM}%' ESCAPE '\\'
+    UNION ALL
+    SELECT s.id, 5
+    FROM issues s
+    WHERE s.company_id = '${COMPANY}'::uuid AND s.description ILIKE '%${TERM}%' ESCAPE '\\'
+  ) arm
+  GROUP BY arm.issue_id
+) issue_search_arms`;
+
+/** The relevance `CASE` the arms replaced, verbatim, for the A/B below. */
+const SUPERSEDED_SEARCH_ORDER = `(CASE
+  WHEN i.title ILIKE '${TERM}%' ESCAPE '\\' THEN 0
+  WHEN i.title ILIKE '%${TERM}%' ESCAPE '\\' THEN 1
+  WHEN i.identifier ILIKE '${TERM}%' ESCAPE '\\' THEN 2
+  WHEN i.identifier ILIKE '%${TERM}%' ESCAPE '\\' THEN 3
+  WHEN ${CORRELATED_COMMENT_MATCH} THEN 4
+  WHEN i.description ILIKE '%${TERM}%' ESCAPE '\\' THEN 5
+  ELSE 6
+END)`;
+
+const PAGE_TAIL = `i.priority, i.last_activity_at DESC, i.updated_at DESC, i.id DESC`;
+
+/** The whole shipped statement: arms joined, rank read off the join. */
+function rankedPageQuery(limit = 15) {
+  return `
+    SELECT i.id FROM issues i
+    INNER JOIN ${SHIPPED_SEARCH_ARMS} ON issue_search_arms.issue_id = i.id
+    WHERE i.company_id = '${COMPANY}'::uuid AND i.hidden_at IS NULL
+    ORDER BY issue_search_arms.search_rank, ${PAGE_TAIL}
+    LIMIT ${limit}`;
+}
+
+/** The whole statement as it stood before: id-set in the WHERE, `CASE` in the sort key. */
+function supersededPageQuery(limit = 15) {
+  return `
+    SELECT i.id FROM issues i
+    WHERE i.company_id = '${COMPANY}'::uuid AND i.hidden_at IS NULL
+      AND ${SHIPPED_SEARCH_WHERE}
+    ORDER BY ${SUPERSEDED_SEARCH_ORDER}, ${PAGE_TAIL}
+    LIMIT ${limit}`;
+}
+
+/** Loops on `issue_comments` scans that sit under a SubPlan — the per-candidate probe. */
+function subplanCommentLoops(node: any, insideSubplan = false): number {
+  if (!node || typeof node !== "object") return 0;
+  const here = insideSubplan || typeof node["Subplan Name"] === "string";
+  const self = here && node["Relation Name"] === "issue_comments"
+    ? Number(node["Actual Loops"] ?? 0)
+    : 0;
+  const children: any[] = Array.isArray(node.Plans) ? node.Plans : [];
+  return children.reduce((sum, child) => sum + subplanCommentLoops(child, here), self);
+}
 
 /** Mirrors production: the predicate sits in the SORT KEY, so LIMIT cannot skip it. */
 function listQuery(predicate: string) {
@@ -419,6 +550,63 @@ describeEmbeddedPostgres("issues-list search cost shape (PEN-3596)", () => {
 
     const before = (await sql.unsafe(searchQuery(SUPERSEDED_SEARCH_WHERE))) as any[];
     const after = (await sql.unsafe(searchQuery(SHIPPED_SEARCH_WHERE))) as any[];
+
+    expect(after.length).toBeGreaterThan(0);
+    expect(after.map((row) => row.id)).toEqual(before.map((row) => row.id));
+  }, 180_000);
+
+  // PEN-3596, second cut. The WHERE restructure above left the RANKING behind:
+  // the sort key re-derived all four branches per candidate row, and the
+  // comment one was a correlated EXISTS. Production measured that at
+  // 2.054ms x 1,184 loops -- ~61% of execution and 56.6% of all buffer traffic
+  // (capture `c4b03742`, 2026-11-06). The arms now carry the rank, so the sort
+  // key reads a joined column and scans nothing.
+  //
+  // ⚠️ THIS ASSERTION IS STRUCTURAL AND THAT IS NOT A COMPROMISE HERE -- it is
+  // the only form that survives the planner's freedom. At THIS seed size
+  // PostgreSQL hashes the superseded SubPlan (1 loop, the whole comment arm
+  // scanned a second time); in production it did not (1,184 loops, one index
+  // probe per candidate). The win differs by an order of magnitude between
+  // those two regimes, so a wall-clock assertion here would pin the wrong one.
+  // What holds in BOTH is that the shipped shape has no sublink left to hash
+  // or not hash. Measured locally at a production-shaped corpus (5,000 issues
+  // in the searched company, arm sizes 54/0/384/3,750 against production's
+  // 55/0/380/3,772): 660ms -> 311ms, 2.1x, in the regime where the planner
+  // DOES hash -- i.e. the smaller of the two wins.
+  it("carries relevance out of the sort key, so no comment scan is per-candidate", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-ranked-");
+    await populateMultiCompany(sql);
+
+    const shipped = (await sql.unsafe(
+      `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${rankedPageQuery()}`,
+    )) as any[];
+    const shippedRoot = shipped[0]["QUERY PLAN"][0].Plan;
+
+    // No SubPlan at all, so nothing is evaluated per candidate row.
+    expect(subplanCommentLoops(shippedRoot)).toBe(0);
+    expect(JSON.stringify(shippedRoot)).not.toContain("SubPlan");
+    // The comment arm is still there -- once, in the join, where an index serves it.
+    expect(commentScanLoops(shippedRoot)).toBeGreaterThan(0);
+    expect(commentScanLoops(shippedRoot)).toBeLessThanOrEqual(2);
+
+    // The control: the shape this replaced does carry one.
+    const superseded = (await sql.unsafe(
+      `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${supersededPageQuery()}`,
+    )) as any[];
+    expect(JSON.stringify(superseded[0]["QUERY PLAN"][0].Plan)).toContain("SubPlan");
+  }, 180_000);
+
+  // Semantics, again, and this is the load-bearing one: the ranks are the
+  // ORIGINAL ranks. `MIN(rank)` over the arms reproduces "first matching WHEN"
+  // exactly, because the CASE branches were ordered by increasing rank -- so
+  // the page must come back in the same order, not merely with the same members.
+  it("returns the same page, in the same order, as the sort-key CASE it replaced", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-rank-equivalence-");
+    await populateMultiCompany(sql);
+
+    // Large enough to span every rank the corpus produces, not just rank 4.
+    const before = (await sql.unsafe(supersededPageQuery(200))) as any[];
+    const after = (await sql.unsafe(rankedPageQuery(200))) as any[];
 
     expect(after.length).toBeGreaterThan(0);
     expect(after.map((row) => row.id)).toEqual(before.map((row) => row.id));

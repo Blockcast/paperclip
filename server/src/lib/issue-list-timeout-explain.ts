@@ -216,9 +216,8 @@ function renderExplain(query: SQL): { sql: string; params: unknown[] } | null {
  * ## Pass 1 — map known parameters to their placeholders, LONGEST FIRST
  *
  * Order is load-bearing, and index order is wrong. A short parameter that is a
- * substring of a longer one fragments it: `?status=blocked&q=blocked prod
- * deploy` binds `'blocked'` BEFORE `'%blocked prod deploy%'` (status is pushed
- * into `conditions` ahead of `issueSearchMatchCondition` in `list()`), so
+ * substring of a longer one fragments it: on `?status=blocked&q=blocked prod
+ * deploy`, binding `'blocked'` BEFORE `'%blocked prod deploy%'` and then
  * substituting in index order yields
  *
  * ```
@@ -229,6 +228,15 @@ function renderExplain(query: SQL): { sql: string; params: unknown[] } | null {
  * longer appears, so a fail-closed check that looks for the WHOLE parameter is
  * satisfied and the plan is logged. Longest-first removes the containing value
  * before anything can fragment it.
+ *
+ * ⚠️ PEN-3596 moved the search patterns OUT of `conditions` and into a JOINed
+ * derived table (`issueSearchArmsSubquery`), which drizzle renders ahead of
+ * the WHERE — so on that example the pattern now binds FIRST and index order
+ * would happen to be safe. ⛔ That is luck, not a fix, and it is exactly why
+ * this pass does not depend on binding order: any filter pushed into
+ * `conditions` ahead of a longer search term reinstates the hazard, and
+ * nothing about the rendering guarantees an order. Do not "simplify" this to
+ * index order on the strength of the current one.
  *
  * ## Pass 2 — blank every literal that is not exactly a placeholder
  *

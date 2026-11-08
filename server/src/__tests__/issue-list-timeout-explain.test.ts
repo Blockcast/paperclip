@@ -260,11 +260,14 @@ describe("redactBoundValues", () => {
   // Ally review on #3237: substituting in INDEX order let a short parameter
   // fragment a longer one, after which the whole-parameter fail-closed check
   // passed and the plan was logged with the rest of the user's search term in
-  // clear. This is the realistic binding order, not a contrived one.
+  // clear.
   it("does not fragment the search pattern with a shorter param bound earlier", () => {
-    // `?status=blocked&q=blocked prod deploy` — `eq(issues.status, ...)` is
-    // pushed into `conditions` before `issueSearchMatchCondition` in `list()`,
-    // so 'blocked' binds as $1 and the pattern as $2.
+    // `?status=blocked&q=blocked prod deploy`, with the status filter bound
+    // before the search pattern. ⚠️ PEN-3596 moved the search patterns into a
+    // JOINed derived table, which renders ahead of the WHERE, so `list()` no
+    // longer produces THIS order for THIS pair — but nothing guarantees an
+    // order, and any filter bound ahead of a longer term reinstates the
+    // hazard. The rule under test is longest-first, not a particular binding.
     const params = ["blocked", "%blocked prod deploy%"];
     const plan = "Filter: ((issues.title ~~* '%blocked prod deploy%'::text))";
     const redacted = redactBoundValues(plan, params);
