@@ -1,0 +1,95 @@
+name: actionlint cache prime
+
+# PEN-6132: seed the `master` scope with the pinned actionlint tarball so
+# `pr.yml`'s `policy` job restores it instead of fetching it from GitHub's
+# release CDN on every run.
+#
+# WHY A SEPARATE WORKFLOW AND NOT A SAVE IN `policy`
+#
+# A cache saved by a `merge_group` run lives on that run's single-use
+# `gh-readonly-queue/*` ref, and one saved by a `pull_request` run on
+# `refs/pull/<n>/merge`; neither is readable from the next queue entry or a
+# sibling PR. Only `master` is readable from every scope. That is the same
+# reason `playwright-cache-prime.yml` exists and the same split
+# `restore-pnpm-store` uses, and `ci-cache-routing.test.mjs` already asserts
+# that `pr.yml` restores and never saves.
+#
+# The second reason is the post-step upload itself. PEN-5032 measured 3 of 14
+# sampled heavy jobs CANCELLED inside an `actions/cache` save, after every work
+# step had passed, and `verify` fails on a cancelled lane — so a save added to
+# `policy` would have traded a rare download failure for a rare upload failure,
+# in the same job, with the same ejection cost.
+#
+# WHAT THIS CHANGES
+#
+# Only whether `policy` reaches the network for actionlint. The pinned SHA256
+# in `.github/actions/setup-actionlint/action.yml` is verified on both paths by
+# the same line, so a restored tarball is trusted exactly as far as a
+# downloaded one; the gate's behaviour on a bad artifact is unchanged. The key
+# embeds the version AND the digest, so a pin bump is a different key and
+# cannot be served stale from a warm cache — and the bump arrives as a push to
+# the action file, which is what fires this.
+#
+# WHAT HAPPENS IF THE ENTRY GOES AWAY
+#
+# `policy` downloads, exactly as it did before PEN-6132, with BLO-54857's
+# six-attempt budget intact. A miss is a slower run, never a new failure mode,
+# which is why this carries no cron: GitHub evicts an entry only after 7 days
+# with no ACCESS, and `policy` restores this key dozens of times a day, so an
+# eviction needs the repo's 10 GB ceiling to LRU out the single hottest 2 MB
+# entry in it. Re-prime by hand with `workflow_dispatch` if that ever happens;
+# a scheduled re-prime would have to be registered in
+# `scripts/check-scheduled-guard-liveness.mjs`, and a once-weekly non-guard is
+# exactly what that file's exemption list argues should not be added without a
+# coverage reason.
+
+on:
+  push:
+    branches: [master]
+    paths:
+      # The only two files that can change the key or how it is restored.
+      - .github/actions/setup-actionlint/action.yml
+      - .github/workflows/actionlint-cache-prime.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  prime:
+    name: Prime actionlint cache
+    # arc-paperclip-light: a checkout, a 2 MB download and a 2 MB upload. Not
+    # arc-paperclip-general — nothing here installs dependencies, so the 16 GiB
+    # pool playwright-cache-prime.yml needs for its cold-store install would be
+    # idle capacity taken from the heavy lanes.
+    runs-on: arc-paperclip-light
+    # Sized against the step list, not a measured distribution: checkout
+    # (fetch-depth 1), one release-asset fetch whose own worst case is the
+    # action's ~3 min retry budget, and one cache upload. 10 minutes is a hang
+    # detector over that, with room for the retry path to run in full.
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+
+      # Runs the same action `policy` runs, so the tarball this saves is
+      # byte-identical to the one `policy` would have fetched, and the pin is
+      # read from one place.
+      - name: Setup actionlint
+        id: actionlint
+        uses: ./.github/actions/setup-actionlint
+
+      # The path and key come from the action's own outputs rather than being
+      # repeated here. actions/cache versions an entry by the literal path
+      # STRING, so a prime that wrote `/home/runner/.cache/actionlint` while
+      # the action restores `~/.cache/actionlint` would save an entry that can
+      # never be restored — and both halves would look correct in isolation.
+      # Consuming the outputs makes that drift unrepresentable rather than
+      # merely tested; ci-cache-routing.test.mjs asserts the wiring stays.
+      - name: Save the actionlint tarball to the master cache
+        if: steps.actionlint.outputs.cache_hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.actionlint.outputs.cache_path }}
+          key: ${{ steps.actionlint.outputs.cache_key }}

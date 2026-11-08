@@ -744,6 +744,17 @@ jobs:
         run: node --test ./scripts/__tests__/ci-cache-routing.test.mjs
         timeout-minutes: 1
 
+      # Runs the action's own `run:` body against a stubbed curl, so the branch
+      # that decides whether to trust a restored cache entry is asserted rather
+      # than read. Offline: the fixtures are built in the test and the pin is
+      # supplied per-case, so it neither fetches the real asset nor depends on
+      # its bytes. 1 minute: three bash invocations, ~0.8s measured, and `sleep`
+      # is stubbed so the six-attempt retry budget costs no wall-clock.
+      - name: Test actionlint cache-first install (PEN-6132)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/setup-actionlint-cache.test.mjs
+        timeout-minutes: 1
+
       # PEN-3916 removed two steps that stood here: a known-bad-pin assertion
       # (`opencode-k8s-runtime-cache-pin.test.js`) and a network reachability +
       # tree-property probe (`check-opencode-k8s-pin-reachable.mjs`, BLO-33204).

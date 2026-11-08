@@ -9,6 +9,8 @@ const dockerWorkflowPath = ".github/workflows/docker.yml";
 const dockerAgentWorkflowPath = ".github/workflows/docker-agent.yml";
 const refreshLockfileWorkflowPath = ".github/workflows/refresh-lockfile.yml";
 const playwrightCachePrimeWorkflowPath = ".github/workflows/playwright-cache-prime.yml";
+const actionlintCachePrimeWorkflowPath = ".github/workflows/actionlint-cache-prime.yml";
+const setupActionlintActionPath = ".github/actions/setup-actionlint/action.yml";
 const masterHealthWorkflowPath = ".github/workflows/master-health.yml";
 const restorePnpmStoreActionPath = ".github/actions/restore-pnpm-store/action.yml";
 const pluginBuildDepsActionPath = ".github/actions/plugin-build-deps/action.yml";
@@ -311,4 +313,63 @@ test("shared image cache exports accept only default-branch sources", async () =
       assert.match(workflow, /value=buildcache-inline,enable=\$\{\{ github\.ref == 'refs\/heads\/master'/);
     }
   }
+});
+
+// PEN-6132. `policy`'s last unconditional external draw is the actionlint
+// release-asset fetch, and `policy` is what every other lane `needs:` -- a
+// failed fetch reds the run and, in a merge_group, ejects the entry. The
+// restore removes the draw; these assertions keep the two halves able to find
+// each other, because every way they can drift apart looks correct in
+// isolation and shows up only as a permanent, silent cache miss.
+test("setup-actionlint restores the pinned tarball and never saves", async () => {
+  const action = await readFile(setupActionlintActionPath, "utf8");
+
+  // Restore-only, for the same two reasons pr.yml is: a save from a
+  // merge_group lands in a single-use `gh-readonly-queue/*` scope no later run
+  // reads, and the post-step upload is itself a lane-killer (PEN-5032
+  // cancelled 3 of 14 sampled heavy jobs inside one).
+  assert.match(action, /uses: actions\/cache\/restore@v4\n/);
+  assert.doesNotMatch(action, /uses: actions\/cache\/save@/);
+  assert.doesNotMatch(action, /uses: actions\/cache@/);
+
+  // The digest, not just the version, is in the key: a pin bump must be a
+  // different key or a warm cache serves the superseded binary.
+  const version = action.match(/\n {8}VERSION: "([^"]+)"\n/)?.[1];
+  const sha256 = action.match(/\n {8}SHA256: "([0-9a-f]{64})"\n/)?.[1];
+  assert.ok(version && sha256, "setup-actionlint must pin a version and a SHA256");
+  assert.match(action, /echo "cache_key=actionlint-\$\{RUNNER_OS\}-\$\{arch\}-\$\{VERSION\}-\$\{SHA256\}"/);
+
+  // The checksum is the trust anchor on BOTH paths, so the cache stores the
+  // TARBALL and the same `sha256sum --check` gates it. Caching the extracted
+  // binary instead would leave the restore path unverified.
+  assert.match(action, /if \[ -f "\$tarball" \] && echo "\$\{SHA256\}  \$\{tarball\}" \| sha256sum --check --status; then/);
+  assert.equal((action.match(/sha256sum --check --status/g) || []).length, 2,
+    "both the restore path and the download path must run the checksum");
+});
+
+test("the actionlint cache prime saves exactly what setup-actionlint restores, only on master", async () => {
+  const action = await readFile(setupActionlintActionPath, "utf8");
+  const prime = await readFile(actionlintCachePrimeWorkflowPath, "utf8");
+
+  // actions/cache versions an entry by the literal path STRING, so a prime
+  // that saved `/home/runner/.cache/actionlint` while the action restores
+  // `~/.cache/actionlint` would write an entry that can never be restored.
+  // The prime consumes the action's outputs rather than repeating the
+  // literals, which makes that drift unrepresentable instead of merely caught.
+  assert.match(action, /\n {8}path: ~\/\.cache\/actionlint\n/);
+  assert.match(action, /\n {4}value: \$\{\{ steps\.pin\.outputs\.cache_path \}\}\n/);
+  assert.match(prime, /\n {10}path: \$\{\{ steps\.actionlint\.outputs\.cache_path \}\}\n/);
+  assert.match(prime, /\n {10}key: \$\{\{ steps\.actionlint\.outputs\.cache_key \}\}\n/);
+  assert.match(prime, /\n {8}id: actionlint\n {8}uses: \.\/\.github\/actions\/setup-actionlint\n/);
+
+  // Only `master` is readable from every scope, which is the whole point of
+  // priming; and the key only changes when the action file does, so that path
+  // must stay in the trigger or a pin bump ships an unseeded key.
+  assert.match(prime, /\n {2}push:\n {4}branches: \[master\]\n/);
+  assert.match(prime, /\n {6}- \.github\/actions\/setup-actionlint\/action\.yml\n/);
+  assert.doesNotMatch(prime, /\n {2}pull_request:/);
+
+  // Re-downloading on a hit would defeat the prime's own purpose and re-upload
+  // bytes already in the scope.
+  assert.match(prime, /\n {8}if: steps\.actionlint\.outputs\.cache_hit != 'true'\n/);
 });

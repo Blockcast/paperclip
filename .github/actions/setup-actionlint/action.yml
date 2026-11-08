@@ -9,6 +9,36 @@
 # binary sidesteps both constraints. See scripts/check-workflows-parse.mjs
 # for the full reasoning.
 #
+# WHY THE CACHE COMES FIRST (PEN-6132)
+#
+# The download is `policy`'s last unconditional external draw, and `policy` is
+# what every other lane `needs:` — so one failed fetch reds the whole run and,
+# in a merge_group, ejects the entry. Measured over the 325 decided merge_group
+# `PR` runs from 2026-10-30T03:50Z to 2026-11-08T15:05Z (9.55 d): 39 failures,
+# of which `Setup actionlint` is 4 and the now-removed `Set up Python` is 2.
+# BLO-54857 made the fetch more patient (2 attempts -> 6, jittered); it did not
+# make it avoidable. A restore from the master-seeded cache avoids it outright:
+# on a hit nothing here touches the network.
+#
+# The trust anchor does not move. The cache stores the TARBALL, not the
+# extracted binary, so the pinned SHA256 below is checked on BOTH paths by the
+# same line of code — a poisoned cache entry fails exactly as a poisoned
+# download does, which is why caching the already-extracted binary would have
+# been the wrong shape. A cache is writable by any run in scope; it is treated
+# here as untrusted bytes that happen to arrive quickly.
+#
+# This action NEVER saves. A save inside `policy` would upload into a
+# `refs/pull/N/merge` or single-use `gh-readonly-queue/*` scope that no later
+# run reads, and the post-step upload is itself a lane-killer — PEN-5032
+# cancelled 3 of 14 sampled heavy jobs inside exactly that upload, after every
+# work step had passed. `.github/workflows/actionlint-cache-prime.yml` is the
+# sole writer and it writes on `master`, which every scope can read. That is
+# the same split `restore-pnpm-store` and `playwright-cache-prime.yml` use.
+#
+# A miss is not a failure: it falls back to the download this action has always
+# done, with BLO-54857's retry budget intact. The cache is a mitigation, so the
+# worst case is today's behaviour rather than a new one.
+#
 # WHY PINNED BY CHECKSUM AND NOT JUST VERSION
 #
 # A release tag can be moved and a release asset can be replaced. This action
@@ -25,6 +55,10 @@
 #   curl -sSL https://github.com/rhysd/actionlint/releases/download/v<X.Y.Z>/actionlint_<X.Y.Z>_checksums.txt \
 #     | grep linux_amd64
 #
+# Both values are in the cache key, so a bump is a different key and cannot
+# serve the old binary from a warm cache. Pushing the bump to `master` fires
+# the prime workflow on this file's path and seeds the new key.
+#
 # LIMIT
 #
 # linux/amd64 only. Every ARC runner in this repo is linux/amd64, and a
@@ -32,7 +66,7 @@
 # prevent, so an unsupported platform is an error rather than a skip.
 
 name: Setup actionlint
-description: Install the pinned actionlint binary, verified by SHA256.
+description: Install the pinned actionlint binary, verified by SHA256. Restores from cache; downloads only on a miss.
 
 outputs:
   bin:
@@ -41,12 +75,29 @@ outputs:
     # $GITHUB_PATH write in the install step below.
     description: Absolute path to the verified actionlint binary.
     value: ${{ steps.install.outputs.bin }}
+  cache_path:
+    # Unexpanded on purpose. actions/cache versions an entry by the literal
+    # path STRING, so `~/.cache/actionlint` and `/home/runner/.cache/actionlint`
+    # are two different cache versions and a prime that saved the expanded form
+    # would never be restored here. The prime workflow consumes this output
+    # rather than repeating the literal, so the two cannot drift.
+    description: Path to hand actions/cache, exactly as this action restores it.
+    value: ${{ steps.pin.outputs.cache_path }}
+  cache_key:
+    description: Cache key to hand actions/cache, exactly as this action restores it.
+    value: ${{ steps.pin.outputs.cache_key }}
+  cache_hit:
+    description: '"true" when the tarball came from the cache and nothing was downloaded.'
+    value: ${{ steps.restore.outputs.cache-hit }}
 
 runs:
   using: composite
   steps:
-    - name: Install actionlint
-      id: install
+    # The platform check lives here rather than in the install step so an
+    # unsupported runner fails before a cache round-trip, and so the key can
+    # name the architecture it was built for.
+    - name: Resolve the actionlint pin
+      id: pin
       shell: bash
       env:
         # 1.7.12, not 1.7.7: 1.7.7's hardcoded activity-type list for
@@ -67,46 +118,98 @@ runs:
           exit 1
         fi
 
-        dest="${RUNNER_TEMP}/actionlint"
+        {
+          echo "version=${VERSION}"
+          echo "sha256=${SHA256}"
+          echo "cache_path=~/.cache/actionlint"
+          # The digest is in the key, not just the version, so the entry is
+          # self-describing: a key can only ever name bytes that satisfy the
+          # check below.
+          echo "cache_key=actionlint-${RUNNER_OS}-${arch}-${VERSION}-${SHA256}"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Restore the cached actionlint tarball
+      id: restore
+      uses: actions/cache/restore@v4
+      with:
+        # Must stay byte-identical to the `cache_path` output above and to what
+        # actionlint-cache-prime.yml saves; ci-cache-routing.test.mjs asserts it.
+        path: ~/.cache/actionlint
+        key: ${{ steps.pin.outputs.cache_key }}
+
+    - name: Install actionlint
+      id: install
+      shell: bash
+      env:
+        VERSION: ${{ steps.pin.outputs.version }}
+        SHA256: ${{ steps.pin.outputs.sha256 }}
+      run: |
+        set -euo pipefail
+
+        dest="${HOME}/.cache/actionlint"
         mkdir -p "$dest"
         tarball="${dest}/actionlint.tar.gz"
         url="https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
 
-        # Six attempts, exponential and jittered (~2.5-3.5 min worst case).
-        # BLO-54857: on 2026-11-08 08:52-10:31Z GitHub's release-asset path
-        # returned 504 to the ARC runners intermittently (githubstatus
-        # "Increase in timeouts for some unauthenticated users"), failing 13
-        # of 50 `policy` runs, merge-queue included. Green runs were
-        # interleaved minutes apart, so the 504 is per-request, not an
-        # outage -- but two tries 10s apart lost the coin flip both times.
-        # Jitter so pr.yml's fan-out does not re-synchronise into a burst.
-        # A sustained outage is still red, deliberately: continuing without
-        # the linter is the bug this gate fixes.
-        max_attempts=6
-        for attempt in $(seq 1 "$max_attempts"); do
-          # -w names who answered (final URL after the redirect, peer IP,
-          # status), so a failure log identifies the hop that returned it.
-          if info=$(curl -sSL --fail --max-time 60 -o "$tarball" \
-              -w '%{http_code} %{remote_ip} %{url_effective}' "$url"); then
-            break
+        # `sha256sum --check` is the single gate both paths pass through: a
+        # restored tarball is verified before it is trusted, exactly as a
+        # downloaded one is. A cache entry that does not match the pin is
+        # discarded and re-downloaded rather than failing the job -- a stale or
+        # truncated upload is not an integrity incident, and the download that
+        # replaces it is still checked fail-closed below. A DOWNLOAD that does
+        # not match stays fatal.
+        if [ -f "$tarball" ] && echo "${SHA256}  ${tarball}" | sha256sum --check --status; then
+          echo "actionlint ${VERSION} restored from cache; no network draw."
+        else
+          if [ -f "$tarball" ]; then
+            echo "::warning::cached actionlint tarball failed the ${VERSION} checksum; re-downloading."
+            rm -f "$tarball"
           fi
-          echo "actionlint download attempt ${attempt}/${max_attempts} failed: ${info:-no response}"
-          if [ "$attempt" = "$max_attempts" ]; then
-            echo "::error::Could not download actionlint ${VERSION} after ${max_attempts} attempts."
-            exit 1
-          fi
-          base=$(( 5 * (1 << (attempt - 1)) ))
-          [ "$base" -gt 60 ] && base=60
-          delay=$(( base + RANDOM % 11 ))
-          echo "retrying in ${delay}s"
-          sleep "$delay"
-        done
 
-        # Fail closed before the file is ever executable.
-        echo "${SHA256}  ${tarball}" | sha256sum --check --status || {
-          echo "::error::actionlint checksum mismatch. Expected ${SHA256}, got $(sha256sum "$tarball" | cut -d' ' -f1)."
-          exit 1
-        }
+          # Six attempts, exponential and jittered (~2.5-3.5 min worst case).
+          # BLO-54857: on 2026-11-08 08:52-10:31Z GitHub's release-asset path
+          # returned 504 to the ARC runners intermittently (githubstatus
+          # "Increase in timeouts for some unauthenticated users"), failing 13
+          # of 50 `policy` runs, merge-queue included. Green runs were
+          # interleaved minutes apart, so the 504 is per-request, not an
+          # outage -- but two tries 10s apart lost the coin flip both times.
+          # Jitter so pr.yml's fan-out does not re-synchronise into a burst.
+          # A sustained outage is still red, deliberately: continuing without
+          # the linter is the bug this gate fixes.
+          #
+          # Unchanged by PEN-6132 on purpose. The cache above makes this the
+          # fallback rather than the common path, and the remaining idea for it
+          # -- authenticate the fetch, since the incident githubstatus entry
+          # names UNAUTHENTICATED users specifically -- is reasoned from that
+          # title and has never been measured against the anonymous path under
+          # degradation. It is recorded on PEN-6132 as the missing measurement
+          # rather than shipped here on the strength of the reasoning.
+          max_attempts=6
+          for attempt in $(seq 1 "$max_attempts"); do
+            # -w names who answered (final URL after the redirect, peer IP,
+            # status), so a failure log identifies the hop that returned it.
+            if info=$(curl -sSL --fail --max-time 60 -o "$tarball" \
+                -w '%{http_code} %{remote_ip} %{url_effective}' "$url"); then
+              break
+            fi
+            echo "actionlint download attempt ${attempt}/${max_attempts} failed: ${info:-no response}"
+            if [ "$attempt" = "$max_attempts" ]; then
+              echo "::error::Could not download actionlint ${VERSION} after ${max_attempts} attempts."
+              exit 1
+            fi
+            base=$(( 5 * (1 << (attempt - 1)) ))
+            [ "$base" -gt 60 ] && base=60
+            delay=$(( base + RANDOM % 11 ))
+            echo "retrying in ${delay}s"
+            sleep "$delay"
+          done
+
+          # Fail closed before the file is ever executable.
+          echo "${SHA256}  ${tarball}" | sha256sum --check --status || {
+            echo "::error::actionlint checksum mismatch. Expected ${SHA256}, got $(sha256sum "$tarball" | cut -d' ' -f1)."
+            exit 1
+          }
+        fi
 
         tar -xzf "$tarball" -C "$dest" actionlint
         chmod +x "${dest}/actionlint"
