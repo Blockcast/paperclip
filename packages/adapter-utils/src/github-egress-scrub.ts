@@ -124,6 +124,60 @@ const ENVIRONMENT_DUMP_RE = new RegExp(
 //
 // This capture IS the alphabet gate: isOpaqueSecretValue used to re-test the
 // value against the same class, which can no longer fail, so it was removed.
+//
+// PEN-6162: the `=` is LITERAL AND ADJACENT. There is no `\s*` on either side,
+// so `NAME = "<value>"` is not matched at all — at any value, any length, any
+// entropy. That is the standard formatting of every mainstream `=`-binding
+// language, so an opaque secret hardcoded to prettier, PEP8 or gofmt spacing
+// passes this net. Measured 2026-11-08 against the shipped detector, one
+// synthetic 32-char value: the TypeScript, Python and Go spaced forms all pass
+// and the same bytes unspaced fire, so spacing alone is the discriminator.
+//
+// The gap is DELIBERATE AND DATED, not an oversight, and it is accepted only
+// until the two gates below clear. Its scope is narrow because the other five
+// classes do not share it — each was measured in spaced form: vendor-key, jwt,
+// credentialed-uri and private-key-block all redact, and environment-dump is
+// unspaced by construction. What is left is exactly an opaque secret with no
+// recognisable vendor prefix (an HMAC or signing key, a session key, a
+// generated password, a base64 blob) written as a quoted literal in source.
+//
+// Widening to `[ \t]*=[ \t]*` is the change a reader reaches for first, and it
+// is REFUSED on measured cost. Over this repo at 3fe0df7e3 — 5,043 tracked
+// .ts/.tsx/.js/.mjs/.py/.go/.yaml/.yml/.md files, 2,054,755 lines, each
+// candidate rewritten to the unspaced form and run back through this detector —
+// it fires on 8,989 lines that pass today: 4.375 per 1k against today's 358 at
+// 0.174, a 25x increase. Essentially all of them are `const x =
+// someLongCamelCaseCallee(...)`: the capture stops at the first out-of-alphabet
+// character, so an ordinary >=24-char camelCase callee IS a two-class,
+// no-separator, high-entropy token and `isLexicalIdentifier` cannot exonerate
+// it. On a push-BLOCKING door that is unshippable.
+//
+// The affordable variant requires a CLOSED quoted string literal on the spaced
+// arm — a hardcoded secret is a literal, `someCallee(` is not. Measured the
+// same way: 325 new lines, 0.158 per 1k, 27x fewer than the naive widening. It
+// has NOT landed, and two things gate it, both tracked on PEN-6162:
+//   - the 325 are the PEN-3920 family arriving through a new door — alert-name
+//     constants, 40-hex commit and UUID fixtures, migration filenames,
+//     `this.name = "SomeError"`, and ~72 lowerCamelCase metadata-key constants
+//     (`paperclipK8sIsolationRetryAt`) that no existing exemption reaches,
+//     since ALERT_NAME_RE is UpperCamelCase and name-anchored to
+//     `alertname`/`kind`. That exemption work is the bulk of the change.
+//   - PEN-6163. Every module-level alert-name constant in every guard script in
+//     the fleet is exempt TODAY ONLY because of this whitespace gap, so landing
+//     the spaced arm turns that row's single kwarg into a whole population.
+//
+// If the spaced arm does land, the two arms will NOT be equivalent: requiring
+// the closing quote is precisely the narrowing BLO-43580 removed above, and it
+// is defensible on a separate additive branch only because a secret in spaced
+// source is a literal by construction. Tidying them together reopens
+// BLO-43580. `github-egress-scrub.test.ts` pins the gap in both directions, so
+// a widening cannot land silently.
+//
+// Not reached by any of the above: `:` is not `=`. `name: "<opaque>"` — YAML,
+// JSON, a Kubernetes Secret `stringData` block — never matches this net at any
+// spacing, which is a separate and wider gap tracked on PEN-6167. Measured
+// 2026-11-08: removing the space from `webhook_secret: "<v>"` changes nothing,
+// while the same line with `=` fires.
 const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([A-Za-z0-9+/=_.\-]{16,})/g;
 
 // PEN-3907: a cryptographic content digest bound to a name that says so.
