@@ -6,11 +6,12 @@
 // in the script reds at least one of them.
 
 import { strict as assert } from "node:assert";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 import {
   CLEAR,
@@ -27,6 +28,7 @@ import {
   reviewNoticeDue,
   reviewOwed,
   touchedWatchedPaths,
+  parseCommitMessageLog,
   parsePerCommitLog,
   readRange,
   touchingCommits,
@@ -675,17 +677,235 @@ test("readRange sees a RENAMED watched file at its old path, per commit too", ()
   }
 });
 
-test("an unreadable per-commit chunk is refused, not skipped", () => {
-  // The silent-failure path: skipping a chunk returns FEWER commits than the
+// One record of `git log -z --name-only --format=%x00%H`: an empty field, the
+// hash, then one NUL-terminated path per file. Built here rather than written
+// as a literal so the shape under test is stated once.
+const record = (sha, ...paths) => `\0${sha}\0${paths.map((p) => `${p}\0`).join("")}`;
+const SHA_A = "a".repeat(40);
+const SHA_B = "b".repeat(40);
+
+test("an unreadable per-commit record is refused, not skipped", () => {
+  // The silent-failure path: skipping a record returns FEWER commits than the
   // range holds, and a short coverage note is indistinguishable from a
   // well-covered range. Loud beats short.
-  const good = "\x01abc\x02subject\x03\nfile.ts\n";
-  assert.equal(parsePerCommitLog(good).length, 1);
-  assert.throws(() => parsePerCommitLog(`${good}\x01no-delimiters-here`), /could not parse/);
-  assert.throws(() => parsePerCommitLog("\x01abc\x03out\x02of\x02order"), /could not parse/);
+  const good = record(SHA_A, "file.ts");
+  assert.deepEqual(parsePerCommitLog(good, ["subject"]), [
+    { sha: SHA_A, message: "subject", paths: ["file.ts"] },
+  ]);
+  // A record that does not begin at an empty field, and a field in the hash
+  // slot that is not a hash, are both refused rather than guessed at.
+  assert.throws(() => parsePerCommitLog(`${SHA_A}\0file.ts\0`, ["x"]), /could not parse/);
+  assert.throws(() => parsePerCommitLog(record("not-a-sha", "f.ts"), ["x"]), /could not parse/);
+  assert.throws(() => parsePerCommitLog(record(SHA_A.toUpperCase()), ["x"]), /could not parse/);
   // An empty blob is an empty range, which is a real answer and not an error.
-  assert.deepEqual(parsePerCommitLog(""), []);
-  assert.deepEqual(parsePerCommitLog(null), []);
+  assert.deepEqual(parsePerCommitLog("", []), []);
+  assert.deepEqual(parsePerCommitLog(null, []), []);
+});
+
+test("the per-commit log and the message list must agree on how many commits there are", () => {
+  // The zip is BY INDEX, so a disagreement is a misattribution waiting to
+  // happen: every message after the gap lands on the wrong commit, and the
+  // coverage note then says a commit carried a trailer it never carried.
+  const two = `${record(SHA_A, "a.ts")}${record(SHA_B, "b.ts")}`;
+  assert.equal(parsePerCommitLog(two, ["ma", "mb"]).length, 2);
+  assert.throws(() => parsePerCommitLog(two, ["only-one"]), /disagree: 2 commit\(s\) vs 1/);
+  assert.throws(() => parsePerCommitLog(two, ["a", "b", "c"]), /disagree: 2 commit\(s\) vs 3/);
+  // Not an array at all is the shape that would otherwise index to `undefined`
+  // and report every commit as carrying no trailer.
+  assert.throws(() => parsePerCommitLog(two, undefined), /must be an array/);
+  assert.throws(() => parsePerCommitLog(two, "ma"), /must be an array/);
+});
+
+test("the message list keeps EMPTY messages, because dropping one desynchronises the zip", () => {
+  // `git commit --allow-empty-message` is accepted by git, so this is an input
+  // an author can produce, not a hypothetical. The `commitMessages` read beside
+  // it filters empties and is right to — it only counts attestations — but a
+  // filtered list cannot be zipped by index.
+  assert.deepEqual(parseCommitMessageLog("first\0\nsecond\0\n\0\nfourth\0\n"), [
+    "first",
+    "second",
+    "",
+    "fourth",
+  ]);
+  // The field after the final NUL is git's own trailing newline, never a
+  // message, and is always dropped.
+  assert.deepEqual(parseCommitMessageLog("only\0\n"), ["only"]);
+  assert.deepEqual(parseCommitMessageLog(""), []);
+  assert.deepEqual(parseCommitMessageLog(null), []);
+});
+
+test("a commit message cannot forge a per-commit row, whatever bytes it carries", () => {
+  // The premise an earlier framing rested on — that `\x01`/`\x02`/`\x03` are
+  // "bytes a commit message cannot carry" — is false. NUL is the only byte git
+  // refuses. Under that framing a body of `A\x03\x01<40-hex>\x02B\x03` parsed
+  // WITHOUT ERROR into two commits and reported the real commit's watched paths
+  // under a hash the author invented, and a body containing `\x01` threw, which
+  // reached the exit code.
+  //
+  // Neither is reachable now, and not because the parser validates them: this
+  // read carries no message at all, so there is nothing for a body to split.
+  const repo = scratchRepo();
+  try {
+    for (const p of WATCHED_PATHS) repo.write(p, "base\n");
+    repo.write("README.md", "base\n");
+    const base = repo.commit("base");
+
+    repo.write(WATCHED_PATHS[0], "touched\n");
+    const forged = "f".repeat(40);
+    const head = repo.commit(`A\x03\x01${forged}\x02B\x03 and a \x01 for good measure`);
+
+    const range = readRange(base, head, { cwd: repo.dir });
+    assert.equal(range.commitsError, null, "a control-character body must not break the read");
+    assert.deepEqual(
+      range.commits.map((c) => c.sha),
+      [head],
+      "the body invented a commit the range does not contain",
+    );
+    assert.deepEqual(range.commits[0].paths, [WATCHED_PATHS[0]]);
+    const rows = touchingCommits(range.commits);
+    assert.deepEqual(rows.map((r) => r.sha), [head]);
+    assert.ok(
+      !renderReport(evaluate({ ...range, today: BEFORE }), { base, head, today: BEFORE }).includes(
+        forged.slice(0, 9),
+      ),
+      "the report named a hash the author wrote into their own message",
+    );
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test("an EMPTY commit message does not shift every later attribution", () => {
+  // The desync the message read is unfiltered to prevent, measured against git
+  // rather than against a hand-built blob.
+  const repo = scratchRepo();
+  try {
+    for (const p of WATCHED_PATHS) repo.write(p, "base\n");
+    repo.write("README.md", "base\n");
+    const base = repo.commit("base");
+
+    repo.write(WATCHED_PATHS[0], "touched\n");
+    const touching = repo.commit(`touches the shim\n\n${TRAILER}: read both, nothing reaches an exec`);
+
+    repo.write("README.md", "unrelated\n");
+    repo.git("add", "-A");
+    repo.git("commit", "-q", "--no-gpg-sign", "--allow-empty-message", "-m", "");
+    const head = repo.git("rev-parse", "HEAD").trim();
+
+    const range = readRange(base, head, { cwd: repo.dir });
+    assert.equal(range.commitsError, null);
+    assert.deepEqual(range.commits.map((c) => c.sha), [head, touching]);
+    assert.equal(range.commits[0].message, "");
+    assert.match(range.commits[1].message, /touches the shim/);
+    // The trailer stays on the commit that actually carries it.
+    assert.deepEqual(
+      touchingCommits(range.commits).map((r) => [r.sha, r.attested]),
+      [[touching, true]],
+    );
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test("a per-commit read that fails goes UNMEASURED, and changes no verdict", () => {
+  // ⛔ The regression this case exists for: the coverage note is informational,
+  // so no failure inside it may reach the exit code. It could — a throw from
+  // the parser propagated out of `readRange`, `main` read it as an unreadable
+  // range, and a run that would have exited OWED or CLEAR exited UNREADABLE.
+  //
+  // `maxBuffer: 1` is the one seam that forces the per-commit read to fail on a
+  // repository that is otherwise perfectly readable, which is exactly the shape
+  // being pinned: the authoritative arms still read, and only the note degrades.
+  // It is also the ENOBUFS case on a long range, reached the same way.
+  const repo = scratchRepo();
+  try {
+    for (const p of WATCHED_PATHS) repo.write(p, "base\n");
+    repo.write("README.md", "base\n");
+    const base = repo.commit("base");
+    repo.write(WATCHED_PATHS[0], "touched with no attestation\n");
+    const head = repo.commit("touches the shim and attests nothing");
+
+    const healthy = readRange(base, head, { cwd: repo.dir });
+    const starved = readRange(base, head, { cwd: repo.dir, maxBuffer: 1 });
+
+    assert.equal(healthy.commitsError, null);
+    assert.ok(starved.commitsError, "the starved read must report why it could not measure");
+    assert.equal(starved.commits, null, "a failed read must be (not measured), never (none)");
+    // The authoritative arms are untouched by the failure.
+    assert.deepEqual(starved.changedPaths, healthy.changedPaths);
+    assert.deepEqual(starved.commitMessages, healthy.commitMessages);
+    assert.deepEqual(starved.headPaths, healthy.headPaths);
+
+    const healthyResult = evaluate({ ...healthy, today: BEFORE });
+    const starvedResult = evaluate({ ...starved, today: BEFORE });
+    for (const key of ["trailerOwed", "calendarOwed", "watchStale", "verdict"]) {
+      assert.equal(
+        starvedResult[key],
+        healthyResult[key],
+        `${key} moved when only the informational arm failed`,
+      );
+    }
+    assert.deepEqual(starvedResult.touched, healthyResult.touched);
+    assert.equal(starvedResult.coverageUnstated, false);
+    // `(not measured)` and `(none)` must stay distinct: collapsing them is how a
+    // report asserts a clean read that nothing performed.
+    assert.match(
+      renderReport(starvedResult, { base, head, today: BEFORE }),
+      /touched_commits= \(not measured\)/,
+    );
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test("a control-character commit message does not change the EXIT CODE", () => {
+  // The finding end to end, through `main` rather than through the exported
+  // pieces, because the defect was in where a throw was CAUGHT and no unit
+  // call can see that. Run against a repo where the only unusual thing is a
+  // body git happily accepts.
+  const script = fileURLToPath(new URL("./check-git-egress-exec-closure-reread.mjs", import.meta.url));
+  const run = (dir, base, head) =>
+    spawnSync(process.execPath, [script], {
+      cwd: dir,
+      encoding: "utf8",
+      env: { ...process.env, PR_BASE_SHA: base, PR_HEAD_SHA: head, REREAD_TODAY: BEFORE },
+    });
+
+  for (const [label, body] of [
+    ["plain", "touches the shim and attests nothing"],
+    ["control characters", "harmless\x01 text\x03 and \x02 more"],
+  ]) {
+    // Touching a watched file with no trailer is OWED; touching nothing is
+    // CLEAR. Both were turned into UNREADABLE by a `\x01`, so both are asserted.
+    for (const [touched, expected] of [
+      [WATCHED_PATHS[0], OWED],
+      ["README.md", CLEAR],
+    ]) {
+      const repo = scratchRepo();
+      try {
+        for (const p of WATCHED_PATHS) repo.write(p, "base\n");
+        repo.write("README.md", "base\n");
+        const base = repo.commit("base");
+        repo.write(touched, "changed\n");
+        repo.git("add", "-A");
+        repo.git("commit", "-q", "--no-gpg-sign", "-m", body);
+        const head = repo.git("rev-parse", "HEAD").trim();
+
+        const out = run(repo.dir, base, head);
+        assert.equal(
+          out.status,
+          expected,
+          `${label} / touched ${touched}: expected ${expected}, got ${out.status}\n${out.stderr}`,
+        );
+        assert.ok(
+          !String(out.stderr).includes("cannot read the commit range"),
+          `${label}: an informational arm took the range read down\n${out.stderr}`,
+        );
+      } finally {
+        repo.cleanup();
+      }
+    }
+  }
 });
 
 test("the per-commit arm reads the SAME commit set as the attestation arm", () => {

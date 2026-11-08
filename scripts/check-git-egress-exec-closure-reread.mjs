@@ -109,6 +109,14 @@ export const CLEAR = 0;
 export const OWED = 1;
 export const UNREADABLE = 2;
 
+/**
+ * Output ceiling for the two per-commit reads, well above Node's 1 MiB default.
+ * `git log --name-only` over a long range is much larger than the `%B` read it
+ * sits beside; this is a reporting ceiling, not a safety one, since the `try`
+ * in `readRange` contains an overrun either way.
+ */
+const PER_COMMIT_MAX_BUFFER = 64 * 1024 * 1024;
+
 /** Which watched files a changed-path list touches. */
 export function touchedWatchedPaths(changedPaths) {
   const set = new Set(changedPaths ?? []);
@@ -484,39 +492,96 @@ function emitReviewNotice(noticeDue) {
 }
 
 /**
- * Split one `git log --name-only --format=\x01%H\x02%B\x03` blob into commits.
+ * Split a NUL-delimited `git log --format=%B%x00` blob into one message per
+ * commit, IN TRAVERSAL ORDER AND WITHOUT DROPPING ANY.
+ *
+ * Separate from the `commitMessages` read in `readRange`, which filters empty
+ * messages out, because this list is ZIPPED BY INDEX against the per-commit
+ * log below and a filtered list desynchronises it. `git commit
+ * --allow-empty-message` is accepted by git, so an empty message is an input an
+ * author can actually produce — and silently shifting every later message onto
+ * the wrong commit is exactly the misattribution this arm must not invent.
+ *
+ * `%B%x00` emits `<body>NUL` per commit and git writes its own newline between
+ * records, so the field after the final NUL is always that trailing newline and
+ * is always dropped. An empty range yields one empty field and therefore no
+ * messages, which is the right answer rather than an error.
+ */
+export function parseCommitMessageLog(text) {
+  const fields = String(text ?? "").split("\0");
+  fields.pop();
+  return fields.map((m) => m.trim());
+}
+
+/**
+ * Split one `git log -z --name-only --format=%x00%H` blob into commits and zip
+ * each with its message.
  *
  * Separate and exported because it is the one piece of `readRange` that can
  * fail SILENTLY. The git invocations around it fail loudly — a bad revision is
- * a non-zero exit and `main` routes that to UNREADABLE — whereas a parser that
- * does not recognise a chunk can simply return fewer commits than the range
- * holds, and a short list renders as a shorter coverage note that looks exactly
- * like a well-covered range.
+ * a non-zero exit — whereas a parser that does not recognise a chunk can simply
+ * return fewer commits than the range holds, and a short list renders as a
+ * shorter coverage note that looks exactly like a well-covered range. So an
+ * unrecognised field THROWS rather than being skipped, and `readRange` contains
+ * that throw rather than letting it reach the verdict.
  *
- * So an unreadable chunk THROWS rather than being skipped. The delimiters are
- * control characters because %B is a raw body containing whatever an author
- * typed; they are the bytes a commit message cannot carry.
+ * ⚠ NUL IS THE DELIMITER BECAUSE IT IS THE ONLY BYTE GIT REFUSES. An earlier
+ * version framed this read with `\x01`/`\x02`/`\x03` on the premise that those
+ * are "bytes a commit message cannot carry". That premise is FALSE: git rejects
+ * NUL in a message and nothing else, so an author could write `\x01` into a body
+ * and split their own chunk (which threw, and the throw reached the exit code),
+ * or write `\x03<40-hex>\x02` and have their file list reported under a sha they
+ * invented (which did not throw at all). Both are closed here by construction
+ * rather than by validation: THIS READ CARRIES NO MESSAGE. `--format=%x00%H`
+ * emits only an empty field and a hash, `-z` makes `--name-only` NUL-terminate
+ * its paths, and the messages arrive from a separate `%B%x00` read. The only
+ * author-controlled bytes left in this blob are pathnames, and a pathname can
+ * neither contain a NUL nor be empty — so an empty field unambiguously starts a
+ * record, and one commit's paths can never run into the next commit's hash.
  */
-export function parsePerCommitLog(text) {
-  const commits = [];
-  for (const chunk of String(text ?? "").split("\x01")) {
-    if (!chunk.trim()) continue;
-    const shaEnd = chunk.indexOf("\x02");
-    const bodyEnd = chunk.indexOf("\x03");
-    if (shaEnd === -1 || bodyEnd === -1 || bodyEnd < shaEnd) {
-      throw new Error(`could not parse the per-commit log near: ${chunk.slice(0, 80)}`);
-    }
-    commits.push({
-      sha: chunk.slice(0, shaEnd).trim(),
-      message: chunk.slice(shaEnd + 1, bodyEnd),
-      paths: chunk
-        .slice(bodyEnd + 1)
-        .split("\n")
-        .map((l) => l.trim())
-        .filter(Boolean),
-    });
+export function parsePerCommitLog(text, messages) {
+  if (!Array.isArray(messages)) {
+    throw new Error(`per-commit messages must be an array; got ${messages}`);
   }
-  return commits;
+  const fields = String(text ?? "").split("\0");
+  // The blob ends with the last record's terminating NUL, so the field after it
+  // is always empty and is never a record of its own. An empty range is the
+  // empty string, which splits to one empty field and yields no commits.
+  fields.pop();
+  const commits = [];
+  let i = 0;
+  while (i < fields.length) {
+    if (fields[i] !== "") {
+      throw new Error(`could not parse the per-commit log near: ${fields[i].slice(0, 80)}`);
+    }
+    i += 1;
+    const sha = String(fields[i] ?? "").trim();
+    // A pathname that happens to be 40 hex characters must never be mistaken
+    // for the next record's hash, which is why the record boundary is the empty
+    // field above and this is only a shape check on what follows it.
+    if (!/^[0-9a-f]{40}$/.test(sha)) {
+      throw new Error(
+        `could not parse the per-commit log near: ${String(fields[i] ?? "").slice(0, 80)}`,
+      );
+    }
+    i += 1;
+    const paths = [];
+    while (i < fields.length && fields[i] !== "") {
+      // git writes one newline between the format output and the first path.
+      // Only that separator is stripped: a path is kept whole, embedded
+      // newlines included, because splitting on them would turn one oddly named
+      // file into several that match nothing.
+      paths.push(fields[i].replace(/^\n+/, ""));
+      i += 1;
+    }
+    commits.push({ sha, message: "", paths: paths.filter(Boolean) });
+  }
+  if (commits.length !== messages.length) {
+    throw new Error(
+      `the per-commit log and the message read disagree: ${commits.length} commit(s) vs ${messages.length} message(s)`,
+    );
+  }
+  return commits.map((commit, idx) => ({ ...commit, message: messages[idx] }));
 }
 
 /**
@@ -532,8 +597,18 @@ export function parsePerCommitLog(text) {
  * invokes this (from the repo root). It is a parameter only so the test can
  * point it at a scratch repository without `process.chdir`, which is global
  * state shared with every other case in the file.
+ *
+ * `maxBuffer` is a parameter for the same reason and no other: it is the one
+ * way a test can force the per-commit read to fail on a repository that is
+ * otherwise perfectly readable, which is what pins the containment below — the
+ * authoritative arms still read, and only the coverage note goes unmeasured. A
+ * `try` whose catch no test can reach is an argument, not a guard.
  */
-export function readRange(base, head, { cwd = process.cwd() } = {}) {
+export function readRange(
+  base,
+  head,
+  { cwd = process.cwd(), maxBuffer = PER_COMMIT_MAX_BUFFER } = {},
+) {
   // `--no-renames` is load-bearing, not tidiness. Rename detection is ON by
   // default (`diff.renames`, since git 2.9), and under it a renamed watched
   // file is reported ONLY at its new path — so the old path never appears,
@@ -577,19 +652,49 @@ export function readRange(base, head, { cwd = process.cwd() } = {}) {
   });
   const commitMessages = log.split("\0").map((m) => m.trim()).filter(Boolean);
   // The same two-dot commit set, split per commit with its own file list, for
-  // the coverage note. Read in one `git log` with three control-character
-  // delimiters rather than N+1 invocations: %B is a raw body that can contain
-  // anything a human types, so the separators have to be bytes a commit message
-  // cannot carry. `--no-renames` for the same reason it is on the diff above —
-  // under rename detection a moved watched file is reported only at its new
-  // path, and the move would show no touching commit at all.
-  const perCommitLog = execFileSync(
-    "git",
-    ["log", "--no-renames", "--name-only", "--format=\x01%H\x02%B\x03", `${base}..${head}`],
-    { cwd, encoding: "utf8" },
-  );
-  const commits = parsePerCommitLog(perCommitLog);
-  return { changedPaths, commitMessages, headPaths, commits };
+  // the coverage note.
+  //
+  // ⛔ EVERY FAILURE IN HERE IS CONTAINED, AND THAT IS THE POINT OF THE `try`.
+  // The coverage note is informational — it never feeds `verdict` — so it must
+  // never be able to change an exit code either, and before this `try` it
+  // could: a throw from the parser propagated out of `readRange`, `main` read
+  // that as an unreadable range, and a run that `master` exits 1 (owed) or 0
+  // (clear) exited 2 (UNREADABLE) instead. Any author could reach it, from a
+  // commit that touches no watched file at all. `null` lands in the
+  // `(not measured)` state this arm already renders, which is the honest answer
+  // and leaves `touched`, `attestations`, `trailerOwed` and `verdict` reading
+  // exactly as they did before this arm existed.
+  //
+  // `maxBuffer` is raised off Node's 1 MiB default because `--name-only` over a
+  // long range (a branch that merged a newer `master` while `PR_BASE_SHA` is
+  // older) is far larger than the `%B` read beside it, and ENOBUFS here would
+  // otherwise be one more way an informational line takes the check down. The
+  // `try` covers it regardless; the ceiling is so the common case still reports.
+  //
+  // `--no-renames` for the same reason it is on the diff above — under rename
+  // detection a moved watched file is reported only at its new path, and the
+  // move would show no touching commit at all.
+  let commits = null;
+  let commitsError = null;
+  try {
+    const perCommitLog = execFileSync(
+      "git",
+      ["log", "--no-renames", "--name-only", "-z", "--format=%x00%H", `${base}..${head}`],
+      { cwd, encoding: "utf8", maxBuffer },
+    );
+    // Deliberately a SECOND read rather than a reuse of `commitMessages` above:
+    // that list drops empty messages, and zipping a filtered list by index
+    // attributes every later message to the wrong commit.
+    const perCommitMessages = execFileSync(
+      "git",
+      ["log", "--format=%B%x00", `${base}..${head}`],
+      { cwd, encoding: "utf8", maxBuffer },
+    );
+    commits = parsePerCommitLog(perCommitLog, parseCommitMessageLog(perCommitMessages));
+  } catch (error) {
+    commitsError = error.message;
+  }
+  return { changedPaths, commitMessages, headPaths, commits, commitsError };
 }
 
 async function main() {
@@ -639,6 +744,16 @@ async function main() {
   }
 
   console.log(renderReport(result, { base, head, today }));
+  // A contained per-commit failure is said out loud and nowhere else. It is a
+  // warning rather than an error precisely because it changes no verdict: the
+  // report already reads `touched_commits= (not measured)`, and the exit code
+  // below is the one `master` would have produced.
+  if (range.commitsError) {
+    console.error(
+      "::warning::PEN-5186: the per-commit coverage note could not be measured and reads " +
+        `"(not measured)". This is informational and changes no verdict or exit code: ${range.commitsError}`,
+    );
+  }
   emitReviewNotice(result.noticeDue);
   process.exit(result.verdict === "clear" ? CLEAR : OWED);
 }
