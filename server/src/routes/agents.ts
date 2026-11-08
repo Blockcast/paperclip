@@ -81,7 +81,7 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { derivePaperclipPrReview } from "../services/heartbeat.js";
+import { agentScopeOnlyConfigKeysFor, derivePaperclipPrReview } from "../services/heartbeat.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "../services/ccrotate-capacity-retry.js";
 import {
   evaluateStrandedRunRecovery,
@@ -2306,6 +2306,77 @@ export function agentRoutes(
     return effective;
   }
 
+  /**
+   * An agent must not be able to change the top-level `adapterConfig` keys
+   * that decide where its credential lands, at what uid it runs, or off which
+   * volume — INCLUDING ON ITSELF (PEN-6188).
+   *
+   * PEN-5017 pinned these keys against the ISSUE-scope overlay, on the
+   * reasoning that "a boundary the constrained principal can decline per-run
+   * is not a boundary, it is a default". That pin is taken against AGENT
+   * scope, and agent scope is self-writable: `agent_config:update` resolves
+   * `allow_self` for an actor patching its own row (`authorization.ts`), with
+   * no grant and no consent. So the constrained principal could decline the
+   * same boundary one scope up, by the route the pin assumes is operator-only.
+   * Measured 2026-11-08: a PEER write is already refused (`deny_no_grant`,
+   * needs `agents:configure`); it is the SELF write that was open.
+   *
+   * Two keys this reaches are worth naming, because neither is obvious from
+   * the list: `enableGitHubPublishBroker` is D1's gate, and `image` feeds
+   * `brokerImage` in the claude_k8s adapter — the container that holds the
+   * GitHub push credential. (`image` is NOT pinned here; see the note below.)
+   *
+   * DIFF-BASED, not a presence test, for the reason `assertNoAgentInstructions
+   * ConfigMutation` records above: this also runs against the EFFECTIVE config,
+   * which shallow-merges onto the stored one, so every agent carrying a pinned
+   * key would otherwise have every `adapterConfig` write refused — including a
+   * verbatim no-op round-trip (the BLO-32332 shape).
+   *
+   * BOTH DIRECTIONS, which is why removal is checked as well as introduction:
+   * the adapter reads these with `asBoolean(config.x, false)`, so DELETING a
+   * pinned key is how an agent would opt out of a boundary that is on. A
+   * `replaceAdapterConfig: true` that drops the key is a change, and is
+   * refused.
+   *
+   * The pinned SET is run-dependent and comes from
+   * `agentScopeOnlyConfigKeysFor`, shared with the heartbeat merge rather than
+   * copied: the brokered-pod composition keys (`enableDocker`, `dockerImage`,
+   * `workspaceVolumeClaim`) are pinned only when the broker is on at agent
+   * scope. It is computed against the STORED config, which is sound because
+   * `enableGitHubPublishBroker` is itself unconditionally pinned — an agent
+   * cannot move the conditional's own input, so "before" and "after" agree.
+   * Consequence worth stating: with the broker off, as the whole fleet is
+   * today, only the two unconditional keys are refused, so this change cannot
+   * alter any current agent's behaviour.
+   *
+   * NOT pinned here, deliberately, and both are open questions rather than
+   * oversights: `image` and `serviceAccountName`. Both are self-writable and
+   * both are security-relevant (`image` becomes `brokerImage`;
+   * `serviceAccountName` selects the pod's Kubernetes identity), but `image`
+   * is also written by the operator image-bump path and refusing it here may
+   * collide with flows this change has not measured. Raised on PEN-6188 for a
+   * decision; do not read their absence as a finding that they are safe.
+   */
+  function assertNoAgentPinnedAdapterConfigMutation(
+    req: Request,
+    adapterConfig: Record<string, unknown> | null | undefined,
+    path = "adapterConfig",
+    existingAdapterConfig?: Record<string, unknown> | null,
+  ) {
+    if (req.actor.type !== "agent" || !adapterConfig) return;
+    const existing = existingAdapterConfig ?? {};
+    const changedPinnedKeys = [...agentScopeOnlyConfigKeysFor(existing)]
+      .filter((key) => JSON.stringify(adapterConfig[key]) !== JSON.stringify(existing[key]))
+      .map((key) => `${path}.${key}`);
+    if (changedPinnedKeys.length === 0) return;
+    throw forbidden(
+      "Agent-authenticated callers cannot change adapter configuration keys that are pinned to "
+        + `agent scope (${changedPinnedKeys.join(", ")}). `
+        + "These decide where the agent's credential lands, at what uid it runs, and off which "
+        + "volume, so they must be set by a board actor.",
+    );
+  }
+
   function assertNoAgentAdapterConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown>,
@@ -2336,6 +2407,15 @@ export function agentRoutes(
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),
+    );
+    // Reads the EFFECTIVE config for the same reason the secret-binding guard
+    // above does: a PATCH shallow-merges, so the request body alone overstates
+    // what this write removes.
+    assertNoAgentPinnedAdapterConfigMutation(
+      req,
+      options?.effectiveAdapterConfig ?? adapterConfig,
+      path,
+      options?.existingAdapterConfig ?? null,
     );
   }
 
@@ -3545,6 +3625,44 @@ export function agentRoutes(
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
     await assertCanUpdateAgent(req, existing);
+
+    // PEN-6188. Rollback restores a stored `adapterConfig` WHOLESALE
+    // (`configPatchFromSnapshot` -> `updateAgent`) and this route carried NONE
+    // of the agent-actor guards `PATCH /api/agents/:id` applies. Every boundary
+    // those guards hold — instructions bundle paths, secret bindings, host
+    // workspace commands, and the agent-scope pinned keys — was reachable here
+    // by restoring a revision that predates it. `allow_self` admits an agent to
+    // its own row, so this was a self-service bypass rather than a peer one.
+    //
+    // It is not reachable by a GRANTLESS agent today, and that is deliberately
+    // not the control being relied on: the revision id is unguessable and both
+    // revision read routes are company-scoped (PEN-5231), so a grantless agent
+    // cannot enumerate one. But an agent holding `agents:suggest-changes` — the
+    // consented-diff tier, whose write is supposed to require accepted consent
+    // (`deny_missing_consent`) — CAN list its own revisions, and reaches this
+    // route through `allow_self`, which asks for no consent at all. An
+    // unguessable identifier is not an authorization check.
+    //
+    // Scoped to `adapterConfig` ON PURPOSE. The snapshot patch also restores
+    // `name`, `role`, `title`, `capabilities` and `reportsTo`, which bypasses
+    // the BLO-27751 profile-change consent gate by this same route. That arm is
+    // NOT closed here and is filed separately — do not read this guard as
+    // covering it.
+    if (req.actor.type === "agent") {
+      const revision = await svc.getConfigRevision(id, revisionId);
+      if (!revision) {
+        res.status(404).json({ error: "Revision not found" });
+        return;
+      }
+      const restoredAdapterConfig = asRecord(asRecord(revision.afterConfig)?.adapterConfig) ?? {};
+      // A rollback REPLACES rather than shallow-merges, so the restored config
+      // already IS the effective one — unlike the PATCH path, where the request
+      // body understates what survives.
+      assertNoAgentAdapterConfigMutation(req, restoredAdapterConfig, "adapterConfig", {
+        existingAdapterConfig: asRecord(existing.adapterConfig) ?? {},
+        effectiveAdapterConfig: restoredAdapterConfig,
+      });
+    }
 
     const actor = getActorInfo(req);
     const updated = await svc.rollbackConfigRevision(id, revisionId, {
