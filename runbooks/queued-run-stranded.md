@@ -1239,6 +1239,17 @@ was already populated when the stall fired, so the await above is **named by
 measurement rather than inferred**. It is the same BLO-36922 cause, in the
 chronic-overrun regime rather than the lockstep one.
 
+⇒ **Read this together with
+[onprem-k8s#8401](https://github.com/Blockcast/onprem-k8s/pull/8401)**, the
+fleet-wide read of the same episode (n=430 over two days) in the alert's own
+runbook. It reaches the same verdict on the apiserver and on fail-fast from
+independent data, and carries two things this section does not: the
+deployment-generation bound above, and a `UV_THREADPOOL_SIZE` lead (Node
+default **4**; DNS and FS callbacks share that pool) which it correctly labels
+a correlate rather than a finding. The `reap`/`slot_check` phases below are a
+plausible *driver* of that queue depth — the orphan reap is fleet-wide — so the
+two reads are complementary, not rival.
+
 Read 2026-11-08T13:0xZ by Devops. `max by (phase) (...)`, 10m step:
 
 | phase | 05:30→07:10Z | peak | after the 07:49–07:57Z pod roll |
@@ -1359,8 +1370,18 @@ evidence the roll fixed anything.
 Dated re-measurement on the run table (the authoritative instrument; not
 `increase()`), Devops seat, guard-fail/started per hour:
 **05Z 1/1 · 06Z 6/6 · 07Z 13/18 · 08Z–13Z 0/73.** The 05Z denominator is
-truncated by the page start (05:51Z). The quiet is real and not an absence of
-dispatch: 73 starts, zero failures, over six hours.
+truncated by the page start (05:51Z). The quiet is real in the sense that
+matters least: 73 starts, zero failures, so it is not an absence of dispatch.
+
+⛔ **It is NOT yet evidence of recovery, and six hours cannot be.** The
+fleet-wide read in
+[onprem-k8s#8401](https://github.com/Blockcast/onprem-k8s/pull/8401) bounds the
+window *exactly* to one deployment generation (ReplicaSet
+`paperclip-api-84c88b9b78`, rolled 11-07T08:08Z, replaced 11-08T07:48Z) — and
+that generation itself **ran ~7 h clean before its own onset**. Any quiet
+shorter than ~7 h is indistinguishable from "not yet saturated". Take the
+discriminating re-measurement at least ~7 h after the roll, on the run table,
+with the denominator.
 
 ## Agent start lock aborted (PEN-3328)
 
