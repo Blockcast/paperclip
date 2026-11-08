@@ -980,6 +980,7 @@ export type {
   Goal,
   Approval,
   ApprovalComment,
+  ApprovalPayloadRevision,
   BudgetPolicy,
   BudgetPolicySummary,
   BudgetIncident,

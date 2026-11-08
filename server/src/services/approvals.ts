@@ -338,6 +338,24 @@ export function approvalService(db: Db) {
      * deliberate human decision. That misread reached live reasoning twice before
      * PEN-5432, including one card resubmitted past a human's return.
      *
+     * `payloadRevision`/`payloadEditedAt` are in this set for the same reason, and
+     * the argument is stronger here because disclosure is the ENTIRE safety case for
+     * the edit route (PEN-5766, PEN-6107). An editable payload was accepted only
+     * because the edit is visible on the card; prevention — an
+     * `expectedPayloadRevision` interlock on the decision routes — was priced and
+     * deliberately deferred, so there is no second line of defence behind this. A
+     * disclosure absent from the surface a decider scans is not a partial mitigation,
+     * it is none, and this is the view the API itself steers callers toward for a
+     * cheap queue read. Both are plain scalar columns and ship no payload body, so
+     * they cost nothing against the cheapness rationale above — the omission they
+     * replace was not a saving.
+     *
+     * ⚠️ `label` does not substitute. A filer CAN write "corrected in place" into the
+     * title and have it surface there, but that is filer-supplied prose: nothing can
+     * sweep for it, and a filer who edits and does not say so produces a row
+     * byte-indistinguishable from an untouched one — which is precisely the case the
+     * marker exists for.
+     *
      * `issueId` filters through the issue_approvals join table.
      */
     listSummary: async (
@@ -357,6 +375,8 @@ export function approvalService(db: Db) {
           createdAt: approvals.createdAt,
           decidedAt: approvals.decidedAt,
           decidedByUserId: approvals.decidedByUserId,
+          payloadRevision: approvals.payloadRevision,
+          payloadEditedAt: approvals.payloadEditedAt,
           title: sql<string | null>`${approvals.payload} ->> 'title'`,
           summary: sql<string | null>`${approvals.payload} ->> 'summary'`,
           description: sql<string | null>`${approvals.payload} ->> 'description'`,

@@ -662,7 +662,7 @@ export type {
 } from "./issue-tree-control.js";
 export type { Goal } from "./goal.js";
 export type { Milestone, CreateMilestoneInput, UpdateMilestoneInput } from "./milestone.js";
-export type { Approval, ApprovalComment } from "./approval.js";
+export type { Approval, ApprovalComment, ApprovalPayloadRevision } from "./approval.js";
 export type {
   BudgetPolicy,
   BudgetPolicySummary,

@@ -124,6 +124,8 @@ describe("blank payload.title fallback (BLO-21032)", () => {
       linkedAgentId: null,
       status: "pending",
       payload: untitledPayload,
+      payloadRevision: 0,
+      payloadEditedAt: null,
       decisionNote: null,
       decidedByUserId: null,
       decidedAt: null,

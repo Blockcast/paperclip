@@ -82,6 +82,8 @@ function makeApproval(status: Approval["status"]): Approval {
     linkedAgentId: null,
     status,
     payload: {},
+    payloadRevision: 0,
+    payloadEditedAt: null,
     decisionNote: null,
     decidedByUserId: null,
     decidedAt: null,

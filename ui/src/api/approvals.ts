@@ -1,4 +1,4 @@
-import type { Approval, ApprovalComment, Issue } from "@paperclipai/shared";
+import type { Approval, ApprovalComment, ApprovalPayloadRevision, Issue } from "@paperclipai/shared";
 import { api } from "./client";
 
 export const approvalsApi = {
@@ -18,6 +18,10 @@ export const approvalsApi = {
   resubmit: (id: string, payload?: Record<string, unknown>) =>
     api.post<Approval>(`/approvals/${id}/resubmit`, { payload }),
   listComments: (id: string) => api.get<ApprovalComment[]>(`/approvals/${id}/comments`),
+  // The readable half of the edit marker: an "Edited" badge a reader cannot expand
+  // is a claim, not evidence (PEN-6107).
+  listPayloadRevisions: (id: string) =>
+    api.get<ApprovalPayloadRevision[]>(`/approvals/${id}/payload-revisions`),
   addComment: (id: string, body: string) =>
     api.post<ApprovalComment>(`/approvals/${id}/comments`, { body }),
   listIssues: (id: string) => api.get<Issue[]>(`/approvals/${id}/issues`),

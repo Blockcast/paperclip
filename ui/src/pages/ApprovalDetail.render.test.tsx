@@ -32,6 +32,7 @@ const approvalsApiMock = vi.hoisted(() => ({
   reject: vi.fn(),
   requestRevision: vi.fn(),
   addComment: vi.fn(),
+  listPayloadRevisions: vi.fn(),
 }));
 
 const agentsApiMock = vi.hoisted(() => ({ list: vi.fn() }));
