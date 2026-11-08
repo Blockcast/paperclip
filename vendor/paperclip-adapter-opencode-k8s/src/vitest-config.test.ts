@@ -19,7 +19,11 @@ const CONFIG_PATH = fileURLToPath(
 describe("vitest config (PEN-5982)", () => {
   it("keeps the per-test timeout at 30 s or more", () => {
     const source = readFileSync(CONFIG_PATH, "utf8");
-    const match = source.match(/^\s*testTimeout:\s*([\d_]+)\s*,/m);
+    // Not anchored on a trailing comma: `testTimeout` as the last property
+    // carries none, and a correct config should not red the guard. A
+    // non-literal form (`30 * 1000`, a named constant) still fails here
+    // rather than passing unchecked -- deliberate, and the message says so.
+    const match = source.match(/^\s*testTimeout:\s*([\d_]+)\b/m);
 
     // Fail closed: a config that declares no testTimeout at all has silently
     // fallen back to the 5 s default this guard exists to prevent.
