@@ -3368,6 +3368,54 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("A grant that names no receipt issue and key cannot be checked");
   });
 
+  // PEN-6145. Five distribution waves amended this rule in the per-seat instruction roots
+  // over 46 hours and not one enumerated the generated surface, which outreaches all of them
+  // -- it is emitted on every non-null return, including wakes with no issue and no PR. This
+  // case is the standing check that makes the NEXT correction to this rule unable to land in
+  // the roots alone: it fails here, in this repo, where a reviewer sees it.
+  //
+  // Anchored on the CALL SIGNATURE -- `paperclipAddComment` plus the `idempotencyKey` field --
+  // and on the ordering clause, never on a heading or a digest of the block. The roots carry
+  // this rule under five different headings and a licence to re-word it in each seat's own
+  // idiom, so a heading or hash anchor is dissolved by exactly the seats that complied, and
+  // reports ABSENT on text that is already correct. A call signature cannot be re-worded while
+  // the rule still needs it.
+  it("names the redemption call signature and the establish-redeem-write ordering (PEN-6145)", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    // The call signature. `idempotencyKey` is pinned as the FIELD because leaving the
+    // parameter implicit invites a run to put the key in the comment body, or to pass a
+    // comment id -- both dedupe against nothing and post a receipt that reads as a spend.
+    expect(markdown).toContain("`paperclipAddComment`");
+    expect(markdown).toContain("passed as the `idempotencyKey` field");
+
+    // The ordering, and the scope of "BEFORE" that the sentence above it does not fix on its
+    // own. "redeem its receipt key BEFORE writing" lifted out of this block was read by a
+    // grantee as "redeem FIRST, then PATCH" (PEN-5296), i.e. before the precondition check.
+    expect(markdown).toContain("relative to the WRITE and never to the precondition check");
+    expect(markdown).toContain("THEN redeem; THEN write, with nothing in between");
+
+    // The compliant path is the failure this whole rule exists for: not a run that writes
+    // when it should not, but one that redeems, re-reads, correctly declines, and has
+    // destroyed a grant nothing can give back. Trim this and the ordering reads as style.
+    expect(markdown).toContain("STOP and do NOT redeem");
+    expect(markdown).toContain("DESTROYS the grant on the COMPLIANT path");
+
+    // Where it concentrates. A wake fired by the authorising event finds the precondition
+    // true; a scheduled one usually does not, so redeem-first costs a key at every tick.
+    expect(markdown).toContain("wherever the wake is fired by a TIMER");
+
+    // The clause this amendment must NOT have inverted. The emitted ordering was already
+    // correct relative to the two live reads the directive mandates, and the repair was
+    // additive; a later edit that "fixes" the ordering by moving the redemption after the
+    // write would make the one surface every run reads worse, and would pass every
+    // assertion above. Pinned here so that edit fails.
+    expect(markdown).toContain("redeem its receipt key BEFORE writing");
+    expect(markdown.indexOf("redeem its receipt key BEFORE writing")).toBeLessThan(
+      markdown.indexOf("relative to the WRITE and never to the precondition check"),
+    );
+  });
+
   it("renders on an issue-only wake, with no wake comment and no PR", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
