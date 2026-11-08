@@ -1413,6 +1413,53 @@ describe("scrubGitHubEgressText", () => {
       expect(result.text).not.toContain(value);
     });
 
+    // PEN-6152, Ally review at 9feae3e2: the segment grammar has no aggregate
+    // bound of its own, and the digit-run gate does not supply one for PLAIN
+    // segments — only a MIXED segment must carry a digit run. So before
+    // ERROR_CODE_MAX_CONTENT_LENGTH, one digit-bearing prefix could tow any
+    // number of 16-letter plain segments: measured 0/200 refused at every
+    // width from 1 to 8 segments, up to 139 characters and ~602 bits, while
+    // the same values are refused 200/200 under a bare name from 3 segments.
+    // These pin the cap. Deterministic letters, so the boundary is exact.
+    const A16 = "abcdefghijklmnop";
+    const B16 = "qrstuvwxyzabcdef";
+
+    it("exonerates a value at exactly ERROR_CODE_MAX_CONTENT_LENGTH", () => {
+      const value = ["k8s", A16, B16, "ghijklmnop"].join("_");
+      expect(value).toHaveLength(48);
+      expect(reachesEntropyTest(value)).toBe(true);
+      const text = pair("error_code", value);
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+
+    it.each([
+      // One character over the cap: the same shape, refused.
+      ["one over the cap", ["k8s", A16, B16, "ghijklmnopq"].join("_"), 49],
+      // The unbounded tail the cap exists to close.
+      ["three plain 16-letter segments", ["k8s", A16, B16, A16].join("_"), 54],
+      ["five plain 16-letter segments", ["k8s", A16, B16, A16, B16, A16].join("_"), 88],
+    ])("refuses %s under error_code", (_label: string, value: string, length: number) => {
+      expect(value).toHaveLength(length);
+      expect(reachesEntropyTest(value)).toBe(true);
+      // Not vacuous: every segment is within the per-segment cap and the value
+      // carries one digit run, so the ONLY conjunct refusing it is the content
+      // cap. Without it this value is exonerated.
+      expect(value.split("_").every((s: string) => s.length <= 16)).toBe(true);
+      const result = scrubGitHubEgressText(pair("error_code", value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    it("keeps the cap clear of the live error-code population", () => {
+      // 153 distinct codes in this repo: p50 21, p90 30, p99 36, longest 38.
+      // The cap must clear the longest with room, or it reintroduces the very
+      // false positive this row exists to fix — silently, for a later author.
+      const longest = ["routine", "execution", "duplicate", "suppressed"].join("_");
+      expect(longest).toHaveLength(38);
+      const headroom = 48 - longest.length;
+      expect(headroom).toBeGreaterThanOrEqual(10);
+    });
+
     // PEN-6152's decision, pinned so it cannot be undone by a later "cleanup".
     // Relaxing isLexicalIdentifier's long-segment count — the one conjunct that
     // refused the value above — exonerates 20000/20000 random mixed-case

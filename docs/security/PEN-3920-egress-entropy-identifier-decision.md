@@ -729,18 +729,72 @@ Under the exact name `error_code` only, a value is exonerated when it is the uni
 - whatever `JOB_NAME_RE` already admits — written as a literal disjunct, so non-regression
   against the `job` shape is a property of the code and needs no corpus; or
 - lowercase snake_case, at least two segments, **every** segment either plain
-  (`LEXICAL_SEGMENT_RE`) or one of the bounded mixed forms (`MIXED_LEXICAL_SEGMENT_RE`), and
-  no segment over `LEXICAL_SEGMENT_MAX_LENGTH`.
+  (`LEXICAL_SEGMENT_RE`) or one of the bounded mixed forms (`MIXED_LEXICAL_SEGMENT_RE`),
+  no segment over `LEXICAL_SEGMENT_MAX_LENGTH`, and the whole value no longer than
+  `ERROR_CODE_MAX_CONTENT_LENGTH` (48).
 
-That second arm is `isLexicalIdentifier`'s own segment grammar with its two AGGREGATE caps
-lifted — `longSegments > 1` and `LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH`. Those two are entropy
-bounds that exist because that rule is name-free; D3 is precisely the finding that a name
-anchor is what pays for them. The per-segment cap is a SHAPE bound and is **kept**, so a
-single opaque run cannot hide between underscores.
+That second arm is `isLexicalIdentifier`'s own segment grammar with **one** of its two
+AGGREGATE caps lifted — `longSegments > 1`, the conjunct PEN-6152 exists to get past.
+`LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH` is **not** lifted; it is re-imposed as
+`ERROR_CODE_MAX_CONTENT_LENGTH`, sized to this population (11.4a). D3 is precisely the
+finding that a name anchor is what pays for relaxing an entropy bound — it does not pay for
+removing one outright. The per-segment cap is a SHAPE bound and is **kept**, so a single
+opaque run cannot hide between underscores.
 
 The surrounding `digitRunCount(value) <= ALERT_NAME_MAX_DIGIT_RUNS` gate is load-bearing here
-and must not be moved: every mixed segment carries at least one digit run, so that cap is what
-bounds how many mixed segments a value may hold. At most two.
+and must not be moved: every **mixed** segment carries at least one digit run, so that cap is
+what bounds how many **mixed** segments a value may hold. At most two.
+
+### 11.4a The aggregate cap, and the measurement that required it
+
+⛔ **An earlier revision of this section said D9c lifted BOTH aggregate caps, and described the
+digit-run gate as what bounds the arm. That is corrected above, and the correction is the
+substance of this subsection, not an editorial tidy.** The digit-run gate bounds only the
+*mixed* segments, because only a mixed segment must carry a digit run. It says nothing about
+*plain* segments — so one digit-bearing prefix could tow an unbounded number of 16-letter
+plain segments.
+
+Measured through `scrubGitHubEgressText` end to end, 200 values per width — `k8s_` followed by
+N random 16-letter lowercase segments:
+
+| N segments | length | ~bits | refused under `error_code` | under a bare name | under `job` |
+|---|---|---|---|---|---|
+| 1 | 20 | 75 | 0/200 | 0/200 | — |
+| 2 | 37 | 150 | 0/200 | 189/200 | 188/200 |
+| 3 | 54 | 226 | 0/200 | 200/200 | 200/200 |
+| 4–8 | 71–139 | 301–602 | **0/200** | **200/200** | **200/200** |
+
+The N=1 row is the internal control: at 20 characters it is below `HIGH_ENTROPY_MIN_LENGTH`
+and never reaches the entropy test, so it is refused nowhere and is evidence about nothing.
+From N=3 the shape is refused everywhere **except** under the anchor D9c added.
+
+Two further notes on attribution, both measured the same way:
+
+- The `k8s_`-prefixed shape is admitted by the **segment-grammar arm only** — `k8s` fails
+  `JOB_NAME_RE` (its `[a-z]+\d{0,2}` form cannot match a letter after a digit), and the same
+  values are refused 188–200/200 under `job`. So this class is one D9c introduced, and the cap
+  belongs on that arm.
+- A `JOB_NAME_RE`-shaped value with a digit tail (`abc12_` + N plain 16-letter segments) is
+  exonerated at every width under **both** `job` and `error_code`, and refused 199–200/200
+  under a bare name. That is **pre-existing** behaviour of the `job` anchor, which D9c unions
+  in deliberately; the cap is placed *after* the `JOB_NAME_RE` disjunct so that non-regression
+  against the `job` shape stays a property of the code. Widening that arm's bound is not in
+  PEN-6152's scope — it is the `job` anchor's, adjacent to PEN-5828.
+
+⭐ The generator worth carrying: **11.5's residual is measured over a population that cannot
+contain this shape.** A random `[a-z0-9_]` token carries many digit runs, so the digit-run gate
+refuses it before this rule is ever consulted; pure-lowercase-letter tokens are drawn from that
+alphabet with negligible probability. The residual table is therefore sound for what it
+measures and must not be read as an upper bound on what the anchor admits.
+
+⚠ `ERROR_CODE_MAX_CONTENT_LENGTH` is 48, sized to the live population — 153 distinct error
+codes in this repo: p50 21, p90 30, p99 36, longest 38
+(`routine_execution_duplicate_suppressed`), most segments 6. It clears the longest by ten
+characters, about one more word. Chosen on the failure **directions** rather than headroom
+alone: a code that outgrows the cap is REFUSED, which is loud, arrives at the author at push
+time and is fixed by widening a number here; an uncapped exoneration is SILENT and nothing
+ever reports it.
+
 
 ### 11.5 Residual, 200,000 random `[a-z0-9_]` values per length
 
