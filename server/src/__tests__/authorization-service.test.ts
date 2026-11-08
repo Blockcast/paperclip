@@ -2707,11 +2707,12 @@ describeEmbeddedPostgres("authorization service", () => {
     })).resolves.toMatchObject({ allowed: true });
   });
 
-  it("leaves recovery and liveness shells claimable when they lose their assignee", async () => {    // These two kinds confer no downstream grant and exist to unstick stalled
-    // work — an unassigned stranded-recovery row is a normal reachable state
-    // (it inherits a null assignee from its source). Freezing them on assignee
-    // loss would deadlock the mechanism that unfreezes the graph, so they are
-    // deliberately outside AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.
+  // These two kinds confer no downstream grant and exist to unstick stalled
+  // work — an unassigned stranded-recovery row is a normal reachable state
+  // (it inherits a null assignee from its source). Freezing them on assignee
+  // loss would deadlock the mechanism that unfreezes the graph, so they are
+  // deliberately outside AGENT_UNASSIGNED_CLAIM_DENIED_ORIGIN_KINDS.
+  it("leaves recovery and liveness shells claimable when they lose their assignee", async () => {
     const company = await createCompany(db, "UnassignedRecoveryShellsClaimable");
     const actor = await createAgent(db, company.id, { role: "engineer" });
     const authorization = authorizationService(db);
