@@ -25,6 +25,7 @@ import {
 } from "../services/approval-gate-reconciler.js";
 import type {
   PullRequestGateResult,
+  PullRequestMerger,
   WorkflowRunLookup,
 } from "../services/github-app-auth.js";
 
@@ -661,10 +662,27 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
   // the ask succeeds, because `withdraw` 409s on a decided card. These pin the
   // mechanism that replaces that prose, in both directions.
 
-  const prFound = (state: "open" | "closed", merged: boolean): PullRequestGateResult => ({
+  const prFound = (
+    state: "open" | "closed",
+    merged: boolean,
+    mergedBy: PullRequestMerger | null = null,
+  ): PullRequestGateResult => ({
     state,
     merged,
+    mergedBy,
   });
+
+  // PEN-6055 fixtures: the two account types measured on the 40 reconciler
+  // cancellations in the 2026-11-06/07 window — 35 by this human, 5 by this bot.
+  // Both read live from `GET /repos/{owner}/{repo}/pulls/{n}` on 2026-11-08; the bot
+  // triple is byte-identical across all five of the measured bot merges
+  // (penstock-vault-node#1177, paperclip#3463/#3483/#3491/#3493).
+  const HUMAN_MERGER: PullRequestMerger = { login: "kkroo", id: 1845185, type: "User" };
+  const BOT_MERGER: PullRequestMerger = {
+    login: "allyblockcast[bot]",
+    id: 290875700,
+    type: "Bot",
+  };
 
   it("leaves a card alone while its gated pull request is still open", async () => {
     const { companyId, agentId } = await createCompany("AGRP");
@@ -721,6 +739,110 @@ describeEmbeddedPostgres("reconcileApprovalGates", () => {
         { type: "key_value", label: "Named pull request merged", value: "yes" },
       ]),
     );
+  });
+
+  // ── PEN-6055: the retirement names WHO merged ───────────────────────────────
+  //
+  // A merge-ask's `payload.gate` is scoped to the ACT (`github_pr_merged`) while its
+  // `payload.body` routinely asks for a specific ACTOR — "a human with merge rights".
+  // A bot merge therefore satisfies the gate and retires the ask, and the cancellation
+  // used to be byte-identical to one where a human did what was asked: 35 human merges
+  // and 5 bot merges across the 2026-11-06/07 window, indistinguishable from the cards.
+  //
+  // These pin the fix at the surface the defect was reported on — the CARD — because
+  // that is what done-when 2 requires to be readable with no GitHub call.
+
+  it("records the merger's login, id and type on a card retired by a bot merge", async () => {
+    const { companyId, agentId } = await createCompany("AGRP");
+    const issueId = await insertIssue(companyId, "AGRP-20");
+    // The shape of `fe821110` (`merge-pr-3483:PEN-5812`), one of the measured five.
+    const approvalId = await insertApproval({
+      companyId,
+      agentId,
+      gate: prGateFor(3483),
+      issueId,
+      title: "Merge #3483 — a human with merge rights",
+    });
+
+    const result = await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => prFound("closed", true, BOT_MERGER),
+      logger: silentLogger,
+    });
+
+    expect(result).toMatchObject({ closed: 1, announced: 1 });
+
+    const row = await approvalRow(approvalId);
+    expect(row?.status).toBe("cancelled");
+    // All three fields, because no one of them answers the question alone: the login
+    // is renameable, the id is the only stable identifier, and the type is what
+    // separates an automated merge from a human one.
+    expect(row?.decisionNote).toContain("merged_by=`allyblockcast[bot]`");
+    expect(row?.decisionNote).toContain("id `290875700`");
+    expect(row?.decisionNote).toContain("type `Bot`");
+    // ⚠ Recording the actor is not judging it. The sweep takes no position on whether
+    // an automated lander is authorised, so the note must stay neutral and the gate
+    // verdict must be untouched — merged is still satisfied.
+    expect(row?.decisionNote).toContain("merged before a decision was recorded");
+    for (const judgement of ["bypass", "unauthorised", "unauthorized", "violation"]) {
+      expect((row?.decisionNote ?? "").toLowerCase()).not.toContain(judgement);
+    }
+
+    // Machine-readable too: the prose answers a human reading one card, but only the
+    // structured row answers "which of these 40 cancellations were bot merges?".
+    expect(issueCommentMetadataSchema.parse((await commentsFor(issueId))[0]?.metadata)
+      .sections[0]?.rows).toEqual(
+      expect.arrayContaining([
+        {
+          type: "key_value",
+          label: "Merged by",
+          value: "allyblockcast[bot] (id 290875700, type Bot)",
+        },
+      ]),
+    );
+  });
+
+  it("makes a human merge distinguishable from a bot merge by reading the card alone", async () => {
+    const { companyId, agentId } = await createCompany("AGRP");
+    const issueId = await insertIssue(companyId, "AGRP-21");
+    const approvalId = await insertApproval({
+      companyId,
+      agentId,
+      gate: prGateFor(3484),
+      issueId,
+    });
+
+    await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => prFound("closed", true, HUMAN_MERGER),
+      logger: silentLogger,
+    });
+
+    // Done-when 2, stated as the discriminator rather than as a substring: the two
+    // notes must not be equal, and the field that separates them must be `type`.
+    const note = (await approvalRow(approvalId))?.decisionNote ?? "";
+    expect(note).toContain("merged_by=`kkroo`");
+    expect(note).toContain("type `User`");
+    expect(note).not.toContain("type `Bot`");
+  });
+
+  it("still names a merged_by clause when GitHub does not name the merger", async () => {
+    const { companyId, agentId } = await createCompany("AGRP");
+    const issueId = await insertIssue(companyId, "AGRP-22");
+    const approvalId = await insertApproval({
+      companyId,
+      agentId,
+      gate: prGateFor(3485),
+      issueId,
+    });
+
+    await reconcileApprovalGates(db, {
+      fetchPullRequest: async () => prFound("closed", true, null),
+      logger: silentLogger,
+    });
+
+    // `unknown` rather than an omitted clause. Dropping it would make "GitHub did not
+    // name a merger" indistinguishable from "this note predates PEN-6055" — the same
+    // absence-reads-as-clean failure this change exists to remove, one layer up.
+    expect((await approvalRow(approvalId))?.decisionNote).toContain("merged_by=`unknown`");
   });
 
   it("closes a card whose pull request was closed unmerged, without claiming it can never merge", async () => {
@@ -1264,6 +1386,74 @@ describe("classifyPullRequestGateLookup", () => {
     expect(classifyPullRequestGateLookup({ state: "closed", merged: true })).toMatchObject({
       kind: "terminal",
       satisfied: true,
+    });
+  });
+
+  // PEN-6055 — the merger rides on the disposition, in prose and structurally.
+  describe("merger attribution", () => {
+    it("renders login, id and type into the summary for a merged pull request", () => {
+      expect(
+        classifyPullRequestGateLookup({
+          state: "closed",
+          merged: true,
+          mergedBy: { login: "allyblockcast[bot]", id: 290875700, type: "Bot" },
+        }),
+      ).toMatchObject({
+        kind: "terminal",
+        satisfied: true,
+        summary:
+          "state=`closed`, merged=`true`, merged_by=`allyblockcast[bot]` (id `290875700`, type `Bot`)",
+        mergedBy: { login: "allyblockcast[bot]", id: 290875700, type: "Bot" },
+      });
+    });
+
+    it("falls back to `unknown` per field rather than dropping the clause", () => {
+      // A partial actor is still worth recording: demanding all three would discard
+      // the useful half of one.
+      expect(
+        classifyPullRequestGateLookup({
+          state: "closed",
+          merged: true,
+          mergedBy: { login: null, id: 290875700, type: null },
+        }),
+      ).toMatchObject({
+        summary: "state=`closed`, merged=`true`, merged_by=`unknown` (id `290875700`, type `unknown`)",
+      });
+
+      // No actor at all — still a `merged_by=` token, so a reader can tell this apart
+      // from a note written before this field existed.
+      expect(
+        classifyPullRequestGateLookup({ state: "closed", merged: true, mergedBy: null }),
+      ).toMatchObject({ summary: "state=`closed`, merged=`true`, merged_by=`unknown`" });
+    });
+
+    it("adds no merger to a closed-unmerged disposition, which was merged by nobody", () => {
+      const disposition = classifyPullRequestGateLookup(
+        { state: "closed", merged: false, closedAt: "2026-11-05T08:00:00.000Z" },
+        { now: new Date("2026-11-05T08:40:00.000Z") },
+      );
+      // Pinned by equality rather than by a substring probe: inventing an `unknown`
+      // merger here would report an actor for an event that has none.
+      expect(disposition).toMatchObject({
+        kind: "terminal",
+        satisfied: false,
+        summary: "state=`closed`, merged=`false`",
+        mergedBy: null,
+      });
+    });
+
+    it("leaves the gate verdict untouched — a bot merge still satisfies the gate", () => {
+      // The sweep records the actor; it takes no position on whether an automated
+      // lander is authorised. `satisfied` is a property of the PR reaching `merged`.
+      for (const type of ["Bot", "User"]) {
+        expect(
+          classifyPullRequestGateLookup({
+            state: "closed",
+            merged: true,
+            mergedBy: { login: "someone", id: 1, type },
+          }),
+        ).toMatchObject({ kind: "terminal", satisfied: true });
+      }
     });
   });
 

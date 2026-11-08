@@ -376,8 +376,30 @@ export type ReviewerEvidenceResult =
  * recorded as a design note rather than an objection.
  */
 export type PullRequestGateResult =
-  | { state: "open" | "closed"; merged: boolean; closedAt?: string | null }
+  | {
+      state: "open" | "closed";
+      merged: boolean;
+      closedAt?: string | null;
+      mergedBy?: PullRequestMerger | null;
+    }
   | { error: string; notFound?: true };
+
+/**
+ * Who merged a pull request, as GitHub names them (PEN-6055).
+ *
+ * All three fields are carried because no one of them answers the question on its
+ * own. `login` is the human-readable name but is not stable — accounts are renamed,
+ * and `allyblockcast[bot]` is a login shape, not a type. `type` (`User` / `Bot`) is
+ * the discriminator that separates a human merge from an automated one, which is the
+ * distinction the reconciler's note could not previously record. `id` is the only
+ * stable identifier and is what an audit compares against, since every agent seat in
+ * this org posts under one shared App id.
+ *
+ * Each field is independently nullable rather than the object being all-or-nothing: a
+ * partial `merged_by` is still worth recording, and a reader that demanded all three
+ * would discard the useful half of one.
+ */
+export type PullRequestMerger = { login: string | null; id: number | null; type: string | null };
 
 export type GitHubCommitEvidenceResult =
   | { found: true }
@@ -470,6 +492,7 @@ export async function githubGetPullRequestGate(input: {
     state?: string;
     merged?: boolean;
     closed_at?: string | null;
+    merged_by?: unknown;
   } | null;
   if (body?.state !== "open" && body?.state !== "closed") {
     return { error: "pull_request_state_missing" };
@@ -481,7 +504,32 @@ export async function githubGetPullRequestGate(input: {
   // the one consumer parses it, and a value this reader cannot parse is not this
   // reader's to discard.
   const closedAt = typeof body.closed_at === "string" ? body.closed_at : null;
-  return { state: body.state, merged: body.merged === true, closedAt };
+  // `merged_by` rides along for the same reason and on the same terms (PEN-6055): the
+  // reconciler already pays for this GET to learn `merged`, and the actor is in the
+  // response it gets back. Reading it here costs nothing and is the only moment the
+  // answer is cheaply available — reconstructing it later means a second GitHub call
+  // against a card that has already been closed.
+  const mergedBy = readPullRequestMerger(body.merged_by);
+  return { state: body.state, merged: body.merged === true, closedAt, mergedBy };
+}
+
+/**
+ * Narrow GitHub's `merged_by` into a `PullRequestMerger`, or `null` (PEN-6055).
+ *
+ * Total over anything the API can return. `merged_by` is `null` on every unmerged
+ * pull request, and GitHub substitutes a `ghost` account for a deleted user, so an
+ * absent or partial actor is an ordinary outcome rather than a fault — it must not
+ * fail the lookup, because the gate verdict does not depend on it.
+ */
+function readPullRequestMerger(raw: unknown): PullRequestMerger | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const actor = raw as { login?: unknown; id?: unknown; type?: unknown };
+  const login = typeof actor.login === "string" ? actor.login : null;
+  const id = typeof actor.id === "number" && Number.isFinite(actor.id) ? actor.id : null;
+  const type = typeof actor.type === "string" ? actor.type : null;
+  // An object with none of the three fields readable carries no more information than
+  // its absence, so it is reported as absence rather than as a row of `unknown`s.
+  return login === null && id === null && type === null ? null : { login, id, type };
 }
 
 export type OpenPullRequestOnBase = {
