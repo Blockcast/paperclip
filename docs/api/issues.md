@@ -458,7 +458,13 @@ bucket being the two reads running sequentially under the 30 s role default.
 the budget against. Under live load the same route answered one row correctly in
 14.3 s that had taken 1.6 s an hour earlier, and cancelled two others at 30.9 s
 and 32.9 s. The instrument is slowest during exactly the incidents it exists to
-diagnose, so the budget is deliberately generous rather than median-fitted.
+diagnose, so the budget is set above the idle median rather than fitted to it.
+
+⛔ 10 s does **not** cover that 14.3 s read — a read that succeeded and that this
+budget would report as `degraded`. 10 s is a burn-vs-coverage compromise picked
+against a sample of one loaded success, not a value fitted to the data. Re-tune
+it against the observed `degraded` rate in production, which this flag is what
+makes measurable; if degraded reads are common, raise it.
 
 The budget bounds the burn; making the predicate index-served is the structural
 fix and is tracked separately.

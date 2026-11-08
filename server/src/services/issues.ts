@@ -271,14 +271,24 @@ export const ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS = 14;
  * That is the whole tension. This instrument is needed MOST during the
  * high-contention incidents that make it slowest, so a bound tight enough to
  * look good against the median would blind the tool exactly when it is being
- * read. 5 s was the first choice here and is rejected on that measurement: it
- * would have degraded a read that succeeded.
+ * read.
  *
- * 10 s keeps the healthy-but-loaded reads and still cuts the worst case from
- * ~60 s wall (two sequential 30 s budgets) to ~10 s wall and 20 connection-
- * seconds. Re-tune it against the `degraded` rate once this has run in
- * production — which is a thing the flag now makes measurable, and was not
- * before.
+ * ⛔ 10 s does NOT cover that measurement, and this comment must not be read as
+ * claiming it does: the 14.3 s read above is a read that SUCCEEDED and that
+ * 10 s would have degraded. No bound below ~15 s covers it, and a bound that
+ * high gives up most of the burn reduction that motivates this change at all.
+ * So 10 s is a burn-vs-coverage COMPROMISE, not a fitted value — twice the
+ * idle-period p77 (≈2.5 s), a third of the 30 s it replaces, and short of the
+ * one loaded success we have. It is picked against a sample of ONE loaded
+ * success and is the weakest-evidenced number in this change.
+ *
+ * ⇒ Re-tune it against the `degraded` rate once this has run in production:
+ * that flag is what makes the question answerable, and it was not measurable
+ * before. If degraded reads are common, raise it; the burn ceiling is the cost
+ * to weigh, not the median latency.
+ *
+ * Either way 10 s still cuts the worst case from ~60 s wall (two sequential
+ * 30 s budgets) to ~10 s wall and 20 connection-seconds.
  *
  * This bounds the burn; it does not remove it. Making the predicate
  * index-served is the structural fix and is filed separately — see the module

@@ -18,11 +18,18 @@ import { buildIssueWakeDiagnosticsResponse } from "../routes/issues.js";
  * PEN-6085: the per-section statement budget behind
  * `GET /api/issues/:id/diagnostics/wakes`.
  *
- * The route returned `503 statement_timeout` on every attempt three separate
- * seats made over two days, because neither of its two reads can be
+ * The route returned `503 statement_timeout` on all six attempts three
+ * separate seats made over two days, because neither of its two reads can be
  * index-served and the two ran as SEQUENTIAL `await`s under the 30 s role
  * default — so the route's worst case was 2x `statement_timeout` and a caller
  * waited a full minute to be told nothing.
+ *
+ * ⚠️ It is INTERMITTENT, not dead, and this matters for anyone re-testing it:
+ * measured 2026-11-08T11:0x–11:1xZ, PEN-5734 returned `503` and then returned
+ * `200` about ten minutes later with no deploy in between, while a light row
+ * (12 wake requests) answered fast both times. So a single green probe does
+ * NOT show the route is fixed — it is contention-dependent, which is exactly
+ * why the remedy here is a bounded partial rather than a faster query.
  *
  * Two properties are asserted here, and the first is the one most likely to
  * break silently: that `SET LOCAL statement_timeout` is actually APPLIED to the
@@ -54,7 +61,7 @@ describeEmbeddedPostgres("wake diagnostics statement budget (PEN-6085)", () => {
   }, 180_000);
 
   afterAll(async () => {
-    await database?.stop?.();
+    await database?.cleanup();
   });
 
   it("applies the budget to the statement, as a transaction-local setting", async () => {
@@ -96,9 +103,9 @@ describeEmbeddedPostgres("wake diagnostics statement budget (PEN-6085)", () => {
       "activityRecords",
       "issue-under-test",
       async (tx) => {
-        // Narrower than the section budget so the test does not wait 5s for a
-        // real cancellation. The cancellation itself is genuine: this is
-        // Postgres raising 57014, not a stub.
+        // Narrower than the section budget so the test does not wait out the
+        // full 10s budget for a real cancellation. The cancellation itself is
+        // genuine: this is Postgres raising 57014, not a stub.
         await tx.execute(sql.raw("SET LOCAL statement_timeout = '50ms'"));
         await tx.execute(sql`SELECT pg_sleep(2)`);
         return [{ unreachable: true }];
