@@ -654,8 +654,17 @@ function isGeneratedPodName(value: string): boolean {
   const preceding = segments[segments.length - 2]!;
   if (/^[a-z]+$/.test(preceding) || /^[0-9]+$/.test(preceding)) {
     // <words>-<suffix 5>: DaemonSet, Job, or a bare pod with generateName.
-    // One positional segment — the suffix — is identified, so only it is
-    // exempt from the general budget.
+    // Only ONE positional segment is identified here, and at that width the
+    // mid-name budget CANNOT reach past the general one, so this call is the
+    // general budget and nothing more: path 2 admits at most
+    // K8S_LAYOUT_MAX_INLINE_SEGMENTS mid-name segments massing
+    // K8S_LAYOUT_MAX_INLINE_MASS, plus the suffix — 2 segments and 10
+    // characters against the general rule's 2 and 16, so every value path 2
+    // admits here path 1 has already admitted. The call is kept rather than
+    // inlined so both branches price themselves the same way, but it buys no
+    // relaxation: a DaemonSet-layout pod is freed by this rule's word-mass
+    // floor, never by its budget. PEN-6046 review (#3521), pinned by
+    // "does not let the daemonset branch relax the general budget".
     return k8sGeneratedLayoutBudgetOk(parts, 1);
   }
   // <words>-<pod-template-hash>-<suffix 5>. Two positional segments.

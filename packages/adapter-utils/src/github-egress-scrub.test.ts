@@ -1181,7 +1181,12 @@ describe("scrubGitHubEgressText", () => {
     });
 
     // One case per conjunct of the layout rule, each failing on a different
-    // one, so loosening any single constant fails a test.
+    // one, so loosening any single constant fails a test. Verified by
+    // mutation rather than asserted: each case below flips to admitted when
+    // its own constant is loosened by one, and stays refused under every
+    // other. The one exception is `synthetic segments`, which is refused by
+    // the suffix WIDTH and the suffix ALPHABET at once and so pins neither on
+    // its own; it is kept as the documented residual, not as a bound.
     it.each([
       // Word mass 7 against the layout floor of 8.
       ["layout word mass", ["llm", "prox", HASH, SUFFIX].join("-")],
@@ -1234,14 +1239,42 @@ describe("scrubGitHubEgressText", () => {
       expect(locateGitHubEgressMatches(text)).toEqual([]);
     });
 
-    // One case per bound of the mid-name budget, each one character outside
-    // it, so loosening either constant fails a test.
+    // One case per bound of the mid-name budget. A fixture only pins a bound
+    // if it REACHES it, so both of these are built to clear every conjunct
+    // that runs first and then fail on the budget alone — each verified by
+    // loosening its own constant by one and watching the case flip to
+    // admitted, and verified NOT to flip under any of the other six
+    // (K8S_GENERATED_LAYOUT_MIN_WORD_MASS, K8S_GENERATED_SEGMENT_RE,
+    // K8S_POD_SUFFIX_LENGTH, K8S_POD_TEMPLATE_HASH_MIN_LENGTH,
+    // K8S_INLINE_GENERATED_MAX_LENGTH, and each other's).
+    //
+    // Both mid-name tokens are CONSTRUCTED, not live names: the bound needs a
+    // token drawn from K8S_GENERATED_SEGMENT_RE, and the real tokens that
+    // motivated this rule (`orc8r`, `chrome150`) all carry vowels, so none of
+    // them can reach the budget at all. The case below this one is that trap.
     it.each([
-      // K8S_LAYOUT_MAX_INLINE_MASS is 5; this token is 6.
-      ["mid-name mass", ["orc8r6", "orchestrator", ["55fdf", "b4945"].join(""), ["t7", "jzg"].join("")].join("-")],
-      // K8S_LAYOUT_MAX_INLINE_SEGMENTS is 1; this name carries two.
-      ["mid-name segment count", ["orc8r", "k8s", "orchestrator", ["55fdf", "b4945"].join(""), ["t7", "jzg"].join("")].join("-")],
+      // K8S_LAYOUT_MAX_INLINE_MASS is 5; this token is 6, and every character
+      // is inside K8S_GENERATED_SEGMENT_RE, so it reaches the budget.
+      ["mid-name mass", ["bgp4v6", "orchestrator", ["55fdf", "b4945"].join(""), ["t7", "jzg"].join("")].join("-")],
+      // K8S_LAYOUT_MAX_INLINE_SEGMENTS is 1; this name carries two, massing
+      // exactly 5 so the mass cap cannot refuse it first.
+      ["mid-name segment count", ["v6", "k8s", "orchestrator", ["55fdf", "b4945"].join(""), ["t7", "jzg"].join("")].join("-")],
     ])("still refuses a value failing the %s bound, under pod", (_why, value) => {
+      const result = scrubGitHubEgressText(pair("pod", value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    // The trap the two cases above are built to avoid, pinned so it stays
+    // visible: a WIDE mid-name token carrying a vowel is refused by the
+    // alphabet conjunct in isGeneratedPodName and never reaches the budget at
+    // all. `orc8r6` is `orc8r` plus one character — it looks like the obvious
+    // mass-bound fixture and is not one, because `o` is outside
+    // K8S_GENERATED_SEGMENT_RE and the token is over
+    // K8S_INLINE_GENERATED_MAX_LENGTH. Loosening EITHER budget constant
+    // leaves this refused, which is why it pins neither.
+    it("refuses a wide vowel-bearing mid-name token before the budget", () => {
+      const value = ["orc8r6", "orchestrator", ["55fdf", "b4945"].join(""), ["t7", "jzg"].join("")].join("-");
       const result = scrubGitHubEgressText(pair("pod", value));
       expect(result.classes).toContain("high-entropy-assignment");
       expect(result.text).not.toContain(value);
@@ -1269,6 +1302,21 @@ describe("scrubGitHubEgressText", () => {
       const value = ["yhoht", "qfklw", ["9qrp", "4c"].join(""), ["8dbww", "vwlsh"].join(""), "pdsqw"].join("-");
       const text = `            kube_pod_info{${pair("pod", `"${value}"`)}}`;
       expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+
+    // PEN-6046 review (#3521): the DaemonSet/Job branch passes positional=1,
+    // and at that width the mid-name budget cannot reach past the general
+    // one — so that branch is the general budget and buys no relaxation.
+    // This pins the direction rather than the arithmetic: the value below is
+    // a DaemonSet layout the general budget refuses (3 generated segments
+    // massing 17), and it must STAY refused. It flips to admitted if the
+    // mid-name caps are ever raised far enough to make that branch a real
+    // relaxation, which is the change the comment there says is not happening.
+    it("does not let the daemonset branch relax the general budget", () => {
+      const value = ["alloy", ["bgp4", "v6"].join(""), ["nvdp", "24"].join(""), "logs", SUFFIX].join("-");
+      const result = scrubGitHubEgressText(pair("pod", value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
     });
 
     // The general rule keeps sole ownership of the StatefulSet ordinal: a
