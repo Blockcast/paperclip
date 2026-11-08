@@ -371,6 +371,7 @@ import { resolveStaleDependabotAlertWakeIssue } from "./dependabot-alert-issues.
 import { createToolGatewayService } from "./tool-gateway.js";
 import { toolAccessService } from "./tool-access.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { wakeRequestTargetsIssueCondition } from "./agent-wakeup-target.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.js";
 import {
   ISSUE_PARK_EXPIRED_WAKE_REASON,
@@ -20769,12 +20770,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               eq(agentWakeupRequests.companyId, issue.companyId),
               eq(agentWakeupRequests.agentId, run.agentId),
               inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed"]),
-              sql`(
-                ${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}
-                or ${agentWakeupRequests.payload} ->> 'taskId' = ${issue.id}
-                or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId' = ${issue.id}
-                or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId' = ${issue.id}
-              )`,
+              wakeRequestTargetsIssueCondition(issue.id),
             ),
           )
           .limit(1)

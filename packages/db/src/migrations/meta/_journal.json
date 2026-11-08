@@ -1877,6 +1877,13 @@
       "when": 1792004401477,
       "tag": "0277_issue_field_revisions",
       "breakpoints": true
+    },
+    {
+      "idx": 278,
+      "version": "7",
+      "when": 1792004501477,
+      "tag": "0278_agent_wakeup_requests_payload_target_indexes",
+      "breakpoints": true
     }
   ]
 }

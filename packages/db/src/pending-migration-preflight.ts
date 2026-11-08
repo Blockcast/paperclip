@@ -242,6 +242,46 @@ export const PRECREATE_REQUIRED_INDEXES: readonly PrecreateRequiredIndex[] = [
     // extension. The migration's HINT carries the same two statements, which
     // the "identical to the migration's own HINT" test pins.
   },
+  // PEN-6104 / 0278. Four indexes under one migration; the deploy-time
+  // precreation step builds them one at a time. An operator hand-running the
+  // remediation should do the same -- each build holds back the xmin horizon,
+  // on the largest table in the schema, pruned only to a 14-day window.
+  {
+    migration: "0278_agent_wakeup_requests_payload_target_indexes.sql",
+    name: "agent_wakeup_requests_payload_issue_idx",
+    table: "agent_wakeup_requests",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_payload_issue_idx " +
+      "ON agent_wakeup_requests USING btree (company_id, (payload ->> 'issueId'), requested_at DESC) " +
+      "WHERE payload ? 'issueId'",
+  },
+  {
+    migration: "0278_agent_wakeup_requests_payload_target_indexes.sql",
+    name: "agent_wakeup_requests_payload_task_idx",
+    table: "agent_wakeup_requests",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_payload_task_idx " +
+      "ON agent_wakeup_requests USING btree (company_id, (payload ->> 'taskId'), requested_at DESC) " +
+      "WHERE payload ? 'taskId'",
+  },
+  {
+    migration: "0278_agent_wakeup_requests_payload_target_indexes.sql",
+    name: "agent_wakeup_requests_payload_context_issue_idx",
+    table: "agent_wakeup_requests",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_payload_context_issue_idx " +
+      "ON agent_wakeup_requests USING btree (company_id, ((payload -> '_paperclipWakeContext') ->> 'issueId'), requested_at DESC) " +
+      "WHERE payload -> '_paperclipWakeContext' ? 'issueId'",
+  },
+  {
+    migration: "0278_agent_wakeup_requests_payload_target_indexes.sql",
+    name: "agent_wakeup_requests_payload_context_task_idx",
+    table: "agent_wakeup_requests",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_payload_context_task_idx " +
+      "ON agent_wakeup_requests USING btree (company_id, ((payload -> '_paperclipWakeContext') ->> 'taskId'), requested_at DESC) " +
+      "WHERE payload -> '_paperclipWakeContext' ? 'taskId'",
+  },
 ];
 
 export type PreflightBlocker = {

@@ -193,6 +193,7 @@ import {
   BLOCKED_AUTO_RESUME_SUPPRESSING_RECOVERY_ACTION_STATUSES,
 } from "./issue-recovery-actions.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { wakeRequestTargetsIssueCondition } from "./agent-wakeup-target.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 
 /** BLO-27572: a routine-execution cancellation observed under the row lock, held
@@ -507,12 +508,7 @@ const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = ["issue.tree_hold_wakeup_deferre
  * the failure this row exists to fix rather than reproduce.
  */
 function wakeRequestTargetsIssue(issueId: string) {
-  return sql`(
-    ${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}
-    or ${agentWakeupRequests.payload} ->> 'taskId' = ${issueId}
-    or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'issueId' = ${issueId}
-    or ${agentWakeupRequests.payload} -> '_paperclipWakeContext' ->> 'taskId' = ${issueId}
-  )`;
+  return wakeRequestTargetsIssueCondition(issueId);
 }
 
 function wakeDiagnosticActivityTargetsIssue(issueId: string) {

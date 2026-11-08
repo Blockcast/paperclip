@@ -22,6 +22,7 @@ import { logActivity } from "./activity-log.js";
 import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { wakeRequestTargetsAnyIssueCondition, wakeRequestTargetsIssueCondition } from "./agent-wakeup-target.js";
 import { TASK_WATCHDOG_ORIGIN_KIND } from "./task-watchdog-scope.js";
 
 const TASK_WATCHDOG_STOP_FINGERPRINT_PREFIX = "task_watchdog_stop:";
@@ -853,12 +854,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         .where(and(
           eq(agentWakeupRequests.companyId, companyId),
           inArray(agentWakeupRequests.status, [...TASK_WATCHDOG_WAKE_REQUEST_STATUSES]),
-          or(
-            inArray(sql`${agentWakeupRequests.payload}->>'issueId'`, subtreeIssueIds),
-            inArray(sql`${agentWakeupRequests.payload}->>'taskId'`, subtreeIssueIds),
-            inArray(sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId'`, subtreeIssueIds),
-            inArray(sql`${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'taskId'`, subtreeIssueIds),
-          ),
+          wakeRequestTargetsAnyIssueCondition(subtreeIssueIds),
         )),
       db
         .select({
@@ -1065,10 +1061,7 @@ export function taskWatchdogService(db: Db, deps: TaskWatchdogServiceDeps = {}) 
         .where(and(
           eq(agentWakeupRequests.companyId, companyId),
           inArray(agentWakeupRequests.status, [...TASK_WATCHDOG_WAKE_REQUEST_STATUSES]),
-          sql`(${agentWakeupRequests.payload}->>'issueId' = ${issueId}
-            OR ${agentWakeupRequests.payload}->>'taskId' = ${issueId}
-            OR ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'issueId' = ${issueId}
-            OR ${agentWakeupRequests.payload}->'_paperclipWakeContext'->>'taskId' = ${issueId})`,
+          wakeRequestTargetsIssueCondition(issueId),
         ))
         .limit(1)
         .then((rows) => rows[0] ?? null),

@@ -235,6 +235,80 @@ export const PENDING_CONCURRENT_INDEXES: readonly ConcurrentIndexSpec[] = [
       + "ON issue_comments USING gin (company_id, body gin_trgm_ops)",
     dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS issue_comments_company_body_search_idx",
   },
+  // PEN-6104. Four entries, ONE migration, and the guard builds them
+  // sequentially -- which is the point: each `CREATE INDEX CONCURRENTLY` holds
+  // back the xmin horizon for its duration, and `agent_wakeup_requests` is the
+  // largest table in the schema, pruned only to a 14-day window. Four at once
+  // would stack those windows.
+  //
+  // ⛔ These are reachable ONLY from the guarded reader in
+  // server/src/services/agent-wakeup-target.ts. The partial predicate is
+  // `payload ? '<key>'`, and a query arm written as a bare
+  // `payload ->> '<key>' = $1` does not IMPLY it as far as the planner is
+  // concerned, so it never probes the index -- measured at 2M rows as 124 MB
+  // of object the plan does not touch. `predicate` below is therefore not
+  // decoration: a precreate built without it, or with ASC in place of the
+  // trailing DESC, is a different index and is rejected rather than tolerated.
+  {
+    migration: "0278_agent_wakeup_requests_payload_target_indexes.sql",
+    name: "agent_wakeup_requests_payload_issue_idx",
+    table: "agent_wakeup_requests",
+    requiredColumns: ["company_id", "payload", "requested_at"],
+    accessMethod: "btree",
+    keyColumns: ["company_id", "(payload ->> 'issueId'::text)", "requested_at"],
+    keyOptions: [0, 0, 3],
+    predicate: "payload ? 'issueId'::text",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_payload_issue_idx "
+      + "ON agent_wakeup_requests USING btree (company_id, (payload ->> 'issueId'), requested_at DESC) "
+      + "WHERE payload ? 'issueId'",
+    dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS agent_wakeup_requests_payload_issue_idx",
+  },
+  {
+    migration: "0278_agent_wakeup_requests_payload_target_indexes.sql",
+    name: "agent_wakeup_requests_payload_task_idx",
+    table: "agent_wakeup_requests",
+    requiredColumns: ["company_id", "payload", "requested_at"],
+    accessMethod: "btree",
+    keyColumns: ["company_id", "(payload ->> 'taskId'::text)", "requested_at"],
+    keyOptions: [0, 0, 3],
+    predicate: "payload ? 'taskId'::text",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_payload_task_idx "
+      + "ON agent_wakeup_requests USING btree (company_id, (payload ->> 'taskId'), requested_at DESC) "
+      + "WHERE payload ? 'taskId'",
+    dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS agent_wakeup_requests_payload_task_idx",
+  },
+  {
+    migration: "0278_agent_wakeup_requests_payload_target_indexes.sql",
+    name: "agent_wakeup_requests_payload_context_issue_idx",
+    table: "agent_wakeup_requests",
+    requiredColumns: ["company_id", "payload", "requested_at"],
+    accessMethod: "btree",
+    keyColumns: ["company_id", "((payload -> '_paperclipWakeContext'::text) ->> 'issueId'::text)", "requested_at"],
+    keyOptions: [0, 0, 3],
+    predicate: "(payload -> '_paperclipWakeContext'::text) ? 'issueId'::text",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_payload_context_issue_idx "
+      + "ON agent_wakeup_requests USING btree (company_id, ((payload -> '_paperclipWakeContext') ->> 'issueId'), requested_at DESC) "
+      + "WHERE payload -> '_paperclipWakeContext' ? 'issueId'",
+    dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS agent_wakeup_requests_payload_context_issue_idx",
+  },
+  {
+    migration: "0278_agent_wakeup_requests_payload_target_indexes.sql",
+    name: "agent_wakeup_requests_payload_context_task_idx",
+    table: "agent_wakeup_requests",
+    requiredColumns: ["company_id", "payload", "requested_at"],
+    accessMethod: "btree",
+    keyColumns: ["company_id", "((payload -> '_paperclipWakeContext'::text) ->> 'taskId'::text)", "requested_at"],
+    keyOptions: [0, 0, 3],
+    predicate: "(payload -> '_paperclipWakeContext'::text) ? 'taskId'::text",
+    createStatement:
+      "CREATE INDEX CONCURRENTLY IF NOT EXISTS agent_wakeup_requests_payload_context_task_idx "
+      + "ON agent_wakeup_requests USING btree (company_id, ((payload -> '_paperclipWakeContext') ->> 'taskId'), requested_at DESC) "
+      + "WHERE payload -> '_paperclipWakeContext' ? 'taskId'",
+    dropStatement: "DROP INDEX CONCURRENTLY IF EXISTS agent_wakeup_requests_payload_context_task_idx",
+  },
 ];
 
 export const DEFAULT_STATEMENT_TIMEOUT_MS = 10 * 60 * 1000;
