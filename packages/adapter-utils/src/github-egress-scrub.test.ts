@@ -2410,6 +2410,97 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-6187 regression: a gbrain source id under source is not a credential", () => {
+    // Derived, not embedded, so this file stays pushable before the fix
+    // deploys. Same convention as the PEN-4438 and PEN-3907 blocks above.
+    const pair = (name: string, value: string) => [name, value].join("=");
+    // The legacy layout: the `gstack` namespace, the `code` strategy, a
+    // four-letter repo slug, and the two hex runs the id generator appends.
+    // A promtool fixture has to spell the label value out, so "derive it at
+    // runtime" is unavailable — the class PEN-4428 removed from the refusal
+    // text. The hex payloads here are synthetic; what this rule pins is the
+    // SHAPE, and the live ids differ from these only in those two runs.
+    const HASH = ["2ff5", "f7ed"].join("");
+    const TAIL = ["16c", "bdc"].join("");
+    const SOURCE_ID = ["gstack", "code", "rtal", HASH, TAIL].join("-");
+
+    it("passes a source label matcher byte-exact, in the form a rule test writes it", () => {
+      const text = `      - series: 'gbrain_code_index_source_last_sync_timestamp_seconds{${pair("source", `"${SOURCE_ID}"`)}}'`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(scrubGitHubEgressText(text).redacted).toBe(false);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    // The name anchor is the load-bearing half of the usual trade (PEN-3920
+    // section 4), and here it is only half of it: the `gstack` segment is the
+    // other. This rule is anchored to `source` ALONE — not to the eight names
+    // the general Kubernetes rule anchors, not to the adjacent `source_id`,
+    // and not to `paperclip_dedupe_domain`, which carries the same value in
+    // the same fixture and is deliberately left refused until it is measured.
+    it.each(["password", "token", "source_id", "paperclip_dedupe_domain", "pod", "name", "instance", "namespace"])(
+      "refuses the same gbrain source id bound to %s instead",
+      (name) => {
+        const result = scrubGitHubEgressText(pair(name, SOURCE_ID));
+        expect(result.classes).toContain("high-entropy-assignment");
+        expect(result.text).not.toContain(SOURCE_ID);
+      },
+    );
+
+    // One case per conjunct, each failing on a different one, so loosening any
+    // single constant fails a test. Every payload below carries both a letter
+    // and a digit, so no segment can be reclassified as a word and pass for a
+    // reason the case was not written to test.
+    it.each([
+      // No namespace segment: the conjunct the whole rule rests on.
+      ["namespace literal", ["gbrain", "code", "rtal", HASH, TAIL].join("-")],
+      // The namespace as a prefix rather than a segment.
+      ["namespace as a segment", ["gstackcode", "rtal", HASH, TAIL].join("-")],
+      // Second segment opaque rather than a strategy word.
+      ["strategy word", ["gstack", HASH, "rtal", TAIL].join("-")],
+      // Word mass 8 against a floor of 10.
+      ["word mass", ["gstack", "co", HASH + "ab", TAIL].join("-")],
+      // An 11-character run against K8S_NAME_MAX_GENERATED_LENGTH.
+      ["generated length", ["gstack", "code", "rtal", HASH + "a1b", TAIL].join("-")],
+      // Generated mass 20 against K8S_NAME_MAX_GENERATED_MASS, with both runs
+      // inside the per-segment length cap so only the mass conjunct fails.
+      ["generated mass", ["gstack", "code", "rtal", HASH + "ab", TAIL + "cd12"].join("-")],
+      // Three generated segments against K8S_NAME_MAX_GENERATED_SEGMENTS,
+      // summing to exactly the mass cap so only the count conjunct fails.
+      ["generated count", ["gstack", "code", "rtal", "2ff5f7", TAIL, "9f3c"].join("-")],
+      // base36 rather than hex: pins the generator's alphabet, and is what
+      // keeps a base36 or base62 payload from riding in behind the namespace.
+      ["generated alphabet", ["gstack", "code", "rtal", "2ffz7ywq", "16kbxc"].join("-")],
+      // Uppercase is not a DNS-1123 label, and this is the half that keeps
+      // every mixed-case credential alphabet out of the rule entirely.
+      ["dns-1123 label", ["gstack", "code", "RTAL", HASH, TAIL].join("-")],
+      // `_` is not the separator a gbrain source id uses.
+      ["separator", ["gstack", "code", "rtal", HASH, TAIL].join("_")],
+      // A flat opaque run wearing no structure.
+      ["opaque run", SYNTHETIC_OPAQUE_VALUE],
+      // A UUID stays opaque here for the same reason it does elsewhere in
+      // this file: its groups are neither words nor numbers.
+      ["uuid", ["386c81e8", "e454", "4f2a", "9b31", "7c5d2e8a1f04"].join("-")],
+      // A 40-hex digest: hex segments are admitted, a flat hex run is not.
+      ["hex digest", "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8"],
+    ])("still refuses a value failing the %s conjunct, under source", (_why, value) => {
+      const result = scrubGitHubEgressText(pair("source", value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    // The `-cluster` ids the generator emits today never reached the entropy
+    // test at all — one character class — so this rule must not be read as
+    // what makes them pass. Pinned so a later widening cannot quietly claim
+    // credit for them, and so the two paths cannot be confused when the next
+    // false positive in this family is triaged.
+    it("leaves the single-character-class cluster ids on their existing path", () => {
+      const value = ["gstack", "code", "paperclip", "cluster"].join("-");
+      const text = `gbrain_code_index_source_never_synced{${pair("source", `"${value}"`)}}`;
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+  });
+
   describe("PEN-4637 regression: an absolute POSIX path is not a credential", () => {
     // Derived, not embedded, throughout. Every positive below is the exact
     // material the SHIPPED rule refuses, so a contiguous `name=value` literal

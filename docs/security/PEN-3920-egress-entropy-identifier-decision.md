@@ -30,7 +30,7 @@ now be implemented and what may not; it is deliberately a set of bounds rather t
 
 This table is PEN-3920's own verdicts and is not the whole decision set. Later rows decided
 under the same governing rule are appended as numbered sections, each heading carrying its
-letter: D7 in section 9, D8 in section 10, D9 in section 11, D10 in section 12, D11 in section 13.
+letter: D7 in section 9, D8 in section 10, D9 in section 11, D10 in section 12, D11 in section 13, D12 in section 14.
 
 The row's `⛔` note stands and is re-affirmed: **do not raise `HIGH_ENTROPY_MIN_BITS_PER_CHAR`.**
 Reaching the measured cases needs 4.16 bits/char, above the 4.0 ceiling a 16-symbol alphabet
@@ -1387,3 +1387,190 @@ largest classes are 72 lowerCamelCase metadata-key constants and 41 `this.name =
 assignments. `ALERT_NAME_RE` reaches **neither** — they fail the *shape* half, not just the
 name half — so widening `CAMEL_CASE_VALUE_NAMES` cannot cover them. Those remain separate
 exemption decisions, each needing its own measurement, and they still gate any spaced arm.
+## 14. PEN-6187 (D12) — a gbrain source id under `source`, and a namespace literal as the second anchor
+
+Added 2026-11-08 by the DevOps Engineer, on a refusal hit while shipping PEN-6149
+(`Blockcast/onprem-k8s#8443`). Same method as sections 9 and 10: read-only against the
+shipped bundle (`/opt/paperclip-bundled-adapters/...`) through the exported
+`scrubGitHubEgressText` / `locateGitHubEgressMatches`, patched copy of the same bundle for
+the delta. Convention of section 2 applies — no `name = value` pair below is written
+contiguously, and per PEN-4428 no refused value is pasted at all.
+
+| # | Decision |
+|---|---|
+| D12 | **ANCHOR `source` to a gbrain source-id shape**, whose load-bearing conjunct is a LITERAL NAMESPACE SEGMENT rather than word mass. One name, one measured false positive. |
+| D12a | **DECLINED: exonerate identifiers inside a Prometheus label matcher `{key="value"}`**, which is what the row proposed. It is name-FREE, so section 4 refuses it — and it is the widest possible rule in this file, not a narrow one. |
+| D12b | **DECLINED: adding `source` to `K8S_OBJECT_NAME_VALUE_NAMES`.** Measured: it fixes nothing. The value is refused under `pod` and `name` today. |
+| D12c | **Refused, unchanged:** `K8S_NAME_MIN_WORD_MASS` (PEN-5921), `isLexicalIdentifier`'s caps, `HIGH_ENTROPY_MIN_BITS_PER_CHAR`, door parity, and any allowlist, env override or bypass. |
+
+### 14.1 What was refused
+
+One value, under one binding name: a gbrain source id in a `source = …` label matcher
+inside a `- series:` key of a promtool unit-test fixture
+(`monitoring/gbrain-code-index-freshness/prometheus-rule_test.yml`). A promtool fixture has
+to spell the label value out, so "derive it at runtime" is unavailable — the gap PEN-4428
+removed from the refusal text, reported through the route that text now names.
+
+The shape, stated as the refusal asks for it: 32 characters; lowercase letters, digits and
+hyphens; longest digit run 6; laid out as a `gstack` namespace segment, a strategy word, a
+four-letter repo slug, and two trailing hex runs of 8 and 6.
+
+Scored against the shipped predicates, it fails on exactly one conjunct:
+
+| conjunct | value | bound |
+|---|---|---|
+| DNS-1123 subdomain, length, label count | ok | — |
+| generated segments | 2 | `K8S_NAME_MAX_GENERATED_SEGMENTS` = 2 |
+| longest generated segment | 8 | `K8S_NAME_MAX_GENERATED_LENGTH` = 10 |
+| generated mass | 14 | `K8S_NAME_MAX_GENERATED_MASS` = 16 |
+| **word mass** | **14** | **`K8S_NAME_MIN_WORD_MASS` = 16** |
+
+Two characters, on the one conjunct section 9.3 calls "the whole rule".
+
+### 14.2 Why the two obvious fixes are both wrong
+
+**D12b — anchoring `source` to the existing Kubernetes shape fixes nothing, and this was
+measured rather than reasoned.** The value is refused *today* under `pod` and under `name`,
+which are already anchored. A patch that only extends `K8S_OBJECT_NAME_VALUE_NAMES` would
+ship, pass review, redeploy, and leave the fixture exactly as unpushable as before. This is
+worth recording because it is the change a reader of section 9 reaches for first.
+
+**Lowering the word-mass floor is the other knob, and PEN-5921 already refused it** — it is
+name-free in effect, reaching all eight anchored names, and costs a 5.8x residual on
+precisely the hyphenated alphabets real API keys take. Nothing here re-opens it.
+
+So the price has to be paid in a conjunct the general rule does not have.
+
+### 14.3 D12a — why the row's own suggestion is declined
+
+PEN-6187 proposed exonerating identifiers that appear inside a Prometheus label matcher,
+and described that as "more narrowly and probably better" than anchoring the name. It is
+neither. The author of that suggestion is the author of this section, so it is recorded
+plainly rather than dropped.
+
+A label matcher is a SYNTACTIC CONTEXT, not a name. `{token="…"}`, `{password="…"}` and
+`{api_key="…"}` are all label matchers. The proposed rule therefore exonerates every
+binding name that exists or ever will, inside a context an agent writes routinely and can
+type at will — which is section 4's name-free case at its weakest, with no shape conjunct
+at all to carry it. It would be the widest exemption in this file by a wide margin, and the
+fact that it *reads* narrow — "only inside a matcher" — is exactly what makes it dangerous
+to leave unanswered in the row.
+
+The half of the suggestion that is correct is the observation it rests on: a matcher
+literal cannot be derived at runtime. That is true, it is why this class keeps recurring,
+and section 9.1 and PEN-4428 already record it. It is an argument for anchoring the names
+this class binds, one measured false positive at a time. It is not an argument for keying
+on the context.
+
+### 14.4 The shape, and the conjunct that carries it
+
+Every structural conjunct the general Kubernetes rule applies — DNS-1123 subdomain within
+`K8S_NAME_MAX_LENGTH` and `K8S_NAME_MAX_LABELS`, at most `K8S_NAME_MAX_GENERATED_SEGMENTS`
+generated segments, each at most `K8S_NAME_MAX_GENERATED_LENGTH`, summing to at most
+`K8S_NAME_MAX_GENERATED_MASS` — with the word-mass floor of 16 replaced by three conjuncts
+of its own:
+
+- the FIRST segment is the literal namespace `gstack`;
+- the SECOND segment is a bare lowercase word (the sync strategy);
+- every generated segment is lowercase hex;
+- word mass reaches 10 — the namespace (6) plus a four-letter strategy word.
+
+**The namespace literal is the whole rule, and it is a STRONGER anchor than a name.**
+Section 4 accepts a name anchor because an accidental leak does not choose its binding
+name: the name comes from whatever code interpolated the value. Here that argument runs
+twice. For material to reach this exemption it must land under the name `source` AND wear a
+seven-character literal prefix as its own first hyphen-separated segment. Accident arranges
+neither, and it certainly does not arrange both.
+
+The hex conjunct is free on the live corpus — 3 of 3 legacy ids conform — and it is what
+keeps a base36 or base62 payload from riding in behind the namespace. Same trade, and the
+same "free on the corpus" justification, as `K8S_GENERATED_SEGMENT_RE` in section 9.
+
+**The opaque-mass ceiling is NOT raised.** Worst case is still
+`K8S_NAME_MAX_GENERATED_MASS` characters, now over 16 symbols rather than 36: ~64 bits,
+BELOW the ~83 the general rule admits at word mass 16 (9.5), below the ~71 PEN-5921's pod
+layout admits, and far below the ~141 `isLexicalIdentifier` exonerates under EVERY name in
+the fleet. What D12 lowers is the word-mass PRICE, from 16 to 10, for one namespace, under
+one binding name.
+
+### 14.5 Residual
+
+Fraction NEWLY exonerated under the anchored name `source`, shipped bundle vs. patched
+bundle, through the WHOLE pipeline. Varying-length segment generators per the measurement
+trap in 6.3.
+
+| family | n | newly exonerated |
+|---|---|---|
+| base62 @24, base62 @32, base64url @24, base64url @43, base32 @32, lowercase hex @32, lowercase hex @40, mixed-case letters @24, UUID v4 layout | 200,000 each | **0** each |
+| base36, 4-6 varying groups of 2-8, `-` | 200,000 | **0** |
+| base36, 3-5 varying groups of 3-7, `-` | 200,000 | **0** |
+| base36, 2-4 varying groups of 4-10, `-` | 200,000 | **0** |
+| base36, 3-4 varying groups of 3-9, `.` | 200,000 | **0** |
+| Kubernetes suffix alphabet, 3-5 varying groups of 3-9, `-` | 200,000 | **0** |
+
+Credential-format check, same method as 9.4: 28 real formats (GitHub classic / fine-grained
+/ App installation, Slack, Stripe, AWS id and secret, Google, Anthropic, OpenAI, Vault,
+GitLab, npm, Grafana, JWT, base32 TOTP seed, Kubernetes bootstrap token, UUID, raw hex and
+base64 and base36 blobs, legacy 40-hex PAT, Paperclip service key, docker registry auth,
+litellm master key, Harbor robot secret, a database password), 20,000 synthesized samples
+each: **0 of 560,000** newly exonerated.
+
+**3,560,000 samples, 0 newly exonerated**, for the structural reason stated in 11.4: no
+random token wears the namespace segment.
+
+⚠️ Two honest notes on that table, because a wall of zeros is the reading most likely to be
+taken at face value.
+
+**(a) The zeros are not a clean sweep unless the instrument can report a non-zero, so the
+known positive was measured in the SAME invocation**: the live 36-source gbrain corpus,
+under `source`, goes from **3 refused** on the shipped bundle to **0 refused** on the
+patched one. Those three are the entire false-positive class; the other 33 ids are
+single-character-class (`<slug>-cluster`) values that never reached the entropy test at all
+and are NOT freed by this rule — pinned by a test so a later widening cannot claim credit
+for them.
+
+**(b) One row of the table is degenerate and is kept rather than quietly dropped.** The
+"lowercase words" family refuses 0 of 200,000 on the SHIPPED bundle too — a single-character-class
+value never reaches the entropy rule — so its zero in the delta column measures nothing. It is
+listed so the next reader does not re-derive it as evidence.
+
+### 14.6 Every cap is a cap, measured
+
+Each bound was measured with its segments FORCED to be generated — at least one letter and
+at least one digit each — because a uniformly-random base36 run is all-letters about 4% of
+the time, which reclassifies the segment as a word and brings the value back inside the caps.
+Without that forcing the sampler produces apparent leakage of 10-12% through conjuncts that
+are in fact exact. This is the same family of measurement trap 6.3 records for fixed-length
+segment generators, reached from the other direction.
+
+Newly exonerated, 20,000 samples each, under `source`: an 11-character run **0**; a generated
+mass of 18 **0**; a third generated segment **0**; a non-hex (base36) payload **0**; a missing
+namespace segment **0**; a second segment that is not a word **0**; word mass 8 **0**; and the
+whole shape bound to `pod` **0** or to `token` **0**.
+
+### 14.7 What it admits, stated plainly
+
+A value DELIBERATELY built as `gstack-<word>-<10 hex>-<6 hex>` is exonerated BY
+CONSTRUCTION — 20,000 of 20,000 measured. The namespace literal buys nothing against an
+author who chooses to type it.
+
+That is the price, and it is accepted on the same ground as 9.5 and PEN-5921: this file
+guards ACCIDENTAL disclosure (section 4, PEN-3183), deliberate bypass is out of scope and
+needs no exemption in this file at all, and the opaque mass admitted is strictly below what
+two already-shipped rules admit — one of them name-free, under every binding name.
+
+### 14.8 Corpus and scope
+
+36 registered gbrain sources, read live. 3 refused today, all three the pre-`-cluster`
+legacy layout; 0 after D12. No other binding name is touched: `source_id` and
+`paperclip_dedupe_domain` — which carries the same value in the same fixture — stay refused
+until one of them is measured too, and tests pin that, in the manner the `networkID` note
+asks for. The `gstack` namespace is not admitted under any other name.
+
+### 14.9 Downstream
+
+PEN-6149's fixture currently uses a synthetic id and does not need changing; what that test
+case pins is the shape, not the row. Once this lands and the bundle redeploys, the fixture
+*may* go back to the legacy id, which is marginally more faithful. It is optional, and it
+should not be done on the strength of this document alone — section 8's rule applies: the
+door still refuses until the shipped bundle carries the change.
