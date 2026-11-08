@@ -23,7 +23,10 @@ import {
   logActivity,
   secretService,
 } from "../services/index.js";
-import { evaluateAgentIssueApprovalLinkAuthorization } from "./issue-approval-link-authorization.js";
+import {
+  evaluateAgentIssueApprovalLinkAuthorization,
+  type IssueApprovalLinkSubject,
+} from "./issue-approval-link-authorization.js";
 import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { projectApprovalPayloadForRead, type AgentWorkspaceCommandViewer } from "../agent-redaction.js";
 import { resolveWorkspaceRuntimeViewer } from "./workspace-response.js";
@@ -657,11 +660,33 @@ export function approvalRoutes(
   ) {
     if (req.actor.type !== "agent" || issueIds.length === 0) return true;
 
+    // PEN-5511: at this door the card does not exist yet and the actor IS its
+    // requester — `requestedByAgentId` is derived from the authenticated actor a few
+    // lines below in the create handler and can never be nominated by the body — so
+    // the filer-of-the-card relation holds by construction for every id in the set.
+    //
+    // One case is worth naming: a create that collapses onto an existing card under
+    // a server-derived coalescing key (`dedupeScope: "company"`) attaches THAT card,
+    // which another agent may have filed. That is intended. The caller attempted to
+    // file its own card about the same incident, the server chose to collapse the
+    // two, and the reserved key namespace is unforgeable (see the guard on the
+    // create route), so the link it gets is the one its own card would have made.
+    const subject: IssueApprovalLinkSubject = {
+      approvalId: null,
+      companyId,
+      requestedByAgentId: req.actor.agentId ?? null,
+    };
+
     const refusals: Array<{ issueId: string; status: 403 | 409 } & Record<string, unknown>> = [];
     for (const issueId of issueIds) {
       const issue = await issuesSvc.getById(issueId);
       if (!issue || issue.companyId !== companyId) continue;
-      const verdict = await evaluateAgentIssueApprovalLinkAuthorization({ access, db }, req, issue);
+      const verdict = await evaluateAgentIssueApprovalLinkAuthorization(
+        { access, db },
+        req,
+        issue,
+        subject,
+      );
       if (verdict.allowed) continue;
       refusals.push({
         issueId,
@@ -716,6 +741,32 @@ export function approvalRoutes(
     };
     if (view === "count") {
       const count = await svc.countBy(companyId, filters);
+      // PEN-5511: the one view on this route whose body is already an object, so it
+      // is the one that can report its own completeness without breaking a consumer
+      // that indexes the array views. An `issueId`-filtered count reads only LINKED
+      // cards; `linkCoverage` says how partial that may be. See
+      // `issueApprovalService.linkCoverageForIssue` for what the candidate count does and
+      // does not establish — in particular, `false` is not proof of completeness.
+      if (issueId) {
+        const issue = await issuesSvc.getById(issueId);
+        if (issue && issue.companyId === companyId) {
+          res.json({
+            count,
+            linkCoverage: await issueApprovalsSvc.linkCoverageForIssue(
+              companyId,
+              { id: issue.id, identifier: issue.identifier ?? null },
+              {
+                // Unconditionally true here, and only here: this whole route is
+                // already behind `assertApprovalAccessAllowed`, which is the same
+                // `company_scope:read` decision the coverage probe needs. An actor
+                // that could not read approvals never reached this line.
+                approvalReadAllowed: true,
+              },
+            ),
+          });
+          return;
+        }
+      }
       res.json({ count });
       return;
     }
