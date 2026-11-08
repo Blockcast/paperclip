@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 
 import {
+  ENVIRONMENT_DUMP_MAX_INERT_GAP,
   ENVIRONMENT_DUMP_MIN_RUN,
   GITHUB_EGRESS_REGION_CLASSES,
   type GitHubEgressScrubClass,
@@ -305,6 +306,168 @@ describe("scrubGitHubEgressText", () => {
       const text = runOf(values);
       expect(scrubGitHubEgressText(text).classes).not.toContain("environment-dump");
       expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+  });
+
+  // PEN-6127. Until 2026-11-08 the run had to be physically adjacent, so ONE
+  // interleaved comment or blank line defeated the rule outright. These values
+  // are short and low-entropy on purpose: every one is below
+  // HIGH_ENTROPY_MIN_LENGTH, so `isOpaqueSecretValue` never sees them and this
+  // count rule is the ONLY layer that can refuse them. If it does not fire,
+  // nothing does. All synthetic.
+  describe("PEN-6127: an inert line does not break the run", () => {
+    const SHORT_SECRETS = ["hunter2!", "Tr0ub4dor", "s3cr3t-99", "letmein12", "p@ssw0rd1"];
+
+    it("pins the gap the literal layouts below assume", () => {
+      // The behavioural tests in this block are written against LITERAL
+      // layouts so that widening the constant turns them red instead of
+      // moving with it. This assertion is the other half of that: it names
+      // the value those literals were chosen for, so a deliberate change to
+      // the bound arrives here first rather than as a puzzling failure in a
+      // test about blank lines.
+      expect(ENVIRONMENT_DUMP_MAX_INERT_GAP).toBe(2);
+    });
+
+    // The headline of the filing: a realistic sectioned `.env`. Nine values,
+    // three of them short passwords, grouped into stanzas. Byte-identical
+    // content to a contiguous dump — only the layout differs.
+    const SECTIONED_ENV = [
+      "# database",
+      "DB_HOST=postgres.internal",
+      "DB_PORT=5432",
+      "DB_USER=appuser",
+      "DB_PASSWORD=hunter2!",
+      "",
+      "# redis",
+      "REDIS_HOST=redis.internal",
+      "REDIS_PASSWORD=Tr0ub4dor",
+      "",
+      "# smtp",
+      "SMTP_HOST=smtp.internal",
+      "SMTP_USER=mailer",
+      "SMTP_PASSWORD=s3cr3t-99",
+    ].join("\n");
+
+    it("refuses a sectioned .env that the adjacency rule let through", () => {
+      const result = scrubGitHubEgressText(SECTIONED_ENV);
+
+      expect(result.classes).toContain("environment-dump");
+      // The point of the row: the values must not survive into the output.
+      for (const secret of ["hunter2!", "Tr0ub4dor", "s3cr3t-99"]) {
+        expect(result.text).not.toContain(secret);
+      }
+    });
+
+    it("refuses the same run separated by a single comment line", () => {
+      const dump = SHORT_SECRETS.flatMap((v, i) => [`# stanza ${i}`, `SECRET_${i}=${v}`]).join("\n");
+      const result = scrubGitHubEgressText(dump);
+
+      expect(result.classes).toContain("environment-dump");
+      for (const secret of SHORT_SECRETS) expect(result.text).not.toContain(secret);
+    });
+
+    it("refuses the same run separated by a single blank line", () => {
+      const dump = SHORT_SECRETS.map((v, i) => `SECRET_${i}=${v}`).join("\n\n");
+      const result = scrubGitHubEgressText(dump);
+
+      expect(result.classes).toContain("environment-dump");
+      for (const secret of SHORT_SECRETS) expect(result.text).not.toContain(secret);
+    });
+
+    it("refuses a blank line AND a comment between every assignment", () => {
+      // Exactly ENVIRONMENT_DUMP_MAX_INERT_GAP inert lines — the stanza break
+      // the constant is sized for, and the shape the filing measured passing.
+      const dump = SHORT_SECRETS.map((v, i) => `SECRET_${i}=${v}`).join("\n\n# next\n");
+      expect(scrubGitHubEgressText(dump).classes).toContain("environment-dump");
+    });
+
+    it("still collapses an inert-separated run into exactly one marker", () => {
+      const dump = Array.from({ length: 12 }, (_, i) => `VAR_${i}=value_${i}`).join("\n\n# s\n");
+      const text = scrubGitHubEgressText(dump).text;
+
+      expect(text.split(redactionMarker("environment-dump")).length - 1).toBe(1);
+    });
+
+    // ---- positive controls: the rule must still DISCRIMINATE, not just fire.
+    // A narrowing verified only by "the dump is now refused" cannot tell a
+    // widened rule from one that refuses everything. Mirror of PEN-6123 #4.
+
+    it("leaves a shell script whose constants are separated by CODE alone", () => {
+      // A non-inert line breaks the run at every gap setting. This is what
+      // keeps the rule off ordinary scripts, and it is the whole reason the
+      // gap admits blank/comment rather than "any line".
+      const script = [
+        "#!/bin/bash",
+        "NAMESPACE=arc-systems",
+        'kubectl create ns "$NAMESPACE" || true',
+        "CHART_VERSION=1.2.3",
+        "helm repo update",
+        "RELEASE=gateway",
+        'helm upgrade --install "$RELEASE" ./chart',
+        "TIMEOUT=300s",
+        'kubectl rollout status deploy/"$RELEASE"',
+        "REPLICAS=3",
+      ].join("\n");
+      const result = scrubGitHubEgressText(script);
+
+      expect(result.text).toBe(script);
+      expect(result.redacted).toBe(false);
+    });
+
+    it("leaves a benign constants block one assignment under the threshold", () => {
+      // Guards against the pins above passing vacuously on a widened rule: if
+      // the gap logic ever stopped counting, this would start to fire.
+      const block = Array.from(
+        { length: ENVIRONMENT_DUMP_MIN_RUN - 1 },
+        (_, i) => `# why ${i}\nCONST_${i}=short`,
+      ).join("\n");
+      const result = scrubGitHubEgressText(block);
+
+      expect(result.text).toBe(block);
+      expect(result.redacted).toBe(false);
+    });
+
+    it("breaks the run at 3 consecutive inert lines", () => {
+      // The layouts below are LITERAL, not derived from
+      // ENVIRONMENT_DUMP_MAX_INERT_GAP. A test written in terms of the constant
+      // moves with it and can never fail: raising the constant to 99 was
+      // measured to leave such a test green, which makes it no control at all.
+      // Pinning the literal means widening the bound turns this red and has to
+      // be a deliberate decision rather than a tuning tweak.
+      const dump = SHORT_SECRETS.map((v, i) => `SECRET_${i}=${v}`).join("\n\n\n\n");
+      const result = scrubGitHubEgressText(dump);
+
+      expect(result.text).toBe(dump);
+      expect(result.redacted).toBe(false);
+    });
+
+    it("spans exactly 2 inert lines and no more", () => {
+      // Both halves pinned literally, so the bound is located rather than
+      // merely bounded on one side.
+      const two = SHORT_SECRETS.map((v, i) => `SECRET_${i}=${v}`).join("\n\n# next\n");
+      const three = SHORT_SECRETS.map((v, i) => `SECRET_${i}=${v}`).join("\n\n# next\n\n");
+
+      expect(scrubGitHubEgressText(two).classes).toContain("environment-dump");
+      expect(scrubGitHubEgressText(three).redacted).toBe(false);
+    });
+
+    it("does not treat a line of code as inert", () => {
+      // Guards the ENV_INERT_LINE pattern itself: if it ever widened to "any
+      // line", the run would span real statements. Measured to be the mutation
+      // the code-separated control above also catches — kept separate because
+      // this one names the single interleaved line rather than a whole script.
+      const dump = SHORT_SECRETS.map((v, i) => `SECRET_${i}=${v}`).join("\necho hello\n");
+      expect(scrubGitHubEgressText(dump).redacted).toBe(false);
+    });
+
+    it("counts assignments, not inert lines, toward the threshold", () => {
+      // ENVIRONMENT_DUMP_MIN_RUN - 1 assignments padded with many comments must
+      // not reach the threshold on line count alone.
+      const padded = Array.from(
+        { length: ENVIRONMENT_DUMP_MIN_RUN - 1 },
+        (_, i) => `# c\n# c\nVAR_${i}=v`,
+      ).join("\n");
+      expect(scrubGitHubEgressText(padded).redacted).toBe(false);
     });
   });
 
