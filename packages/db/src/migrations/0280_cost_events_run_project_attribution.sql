@@ -1,0 +1,38 @@
+-- PEN-5937: give `costs/by-project` a durable run->project attribution column so the
+-- aggregate can stop reconstructing one from `activity_log` on every request.
+--
+-- `by-project` resolves a project for cost events that carry a `heartbeat_run_id` but no
+-- `project_id`. It did that at READ time, with a `DISTINCT ON` over `activity_log` inner
+-- joined to `issues` on `activity_log.entity_id = issues.id::text`. Two narrowings of that
+-- subquery landed (PEN-5585 #3391, PEN-5591 #3455) and neither bounded it: measured
+-- 2026-11-07 against `cf90ee33`, the first image carrying BOTH, the route answered 3 d in
+-- ~1 s, 5 d in ~5 s, 7 d in 20-30 s, and was cancelled by `statement_timeout` at 10 d.
+-- The >20x step between 5 d and 7 d is a plan flip, not growth -- past it the planner
+-- stops using the `run_id` restriction to drive index probes and falls back to a seq scan
+-- plus hash semi-join, so the restriction is evaluated AFTER the scan it was meant to
+-- avoid and no further predicate-narrowing of the join input can help.
+--
+-- TWO COLUMNS, and `project_id` IS NOT TOUCHED. `project_id` is the run's WRITE-TIME
+-- scope and `services/budgets.ts` enforces every `scopeType: "project"` budget policy on
+-- it. Backfilling a DERIVED "project this run touched" into it would silently widen what
+-- counts against a project's cap -- a financial gate moving because a reporting query
+-- wanted a cheaper join. Readers use `coalesce(project_id, attributed_project_id)`.
+--
+-- `attributed_project_at` is the resolution watermark. NULL in `attributed_project_id`
+-- alone cannot distinguish "never resolved" from "resolved, and this run touched no
+-- project", so the backfill would re-derive every unattributable row on every pass.
+--
+-- NO BACKFILL IN THIS MIGRATION, deliberately -- see BLO-51377/BLO-51379. The
+-- `issues.last_activity_at` backfill that 0270 ran inside its migration transaction held
+-- SHARE ROW EXCLUSIVE on `activity_log` plus every repaired row lock until commit and
+-- froze the fleet's activity_log writes for ~35 min in production. This backfill reads
+-- the SAME table through the SAME expensive cast, so it is strictly worse in that shape.
+-- It runs instead as `repairCostEventProjectAttribution`
+-- (packages/db/src/cost-events-project-attribution-repair.ts), one short autocommit
+-- statement per batch under a worker lease, exactly like 0271's successor.
+--
+-- Both columns are plain nullable adds: no default, no rewrite, no table scan, no FK.
+-- `IF NOT EXISTS` keeps a partially-applied dev database converging.
+ALTER TABLE "cost_events" ADD COLUMN IF NOT EXISTS "attributed_project_id" uuid;
+--> statement-breakpoint
+ALTER TABLE "cost_events" ADD COLUMN IF NOT EXISTS "attributed_project_at" timestamp with time zone;

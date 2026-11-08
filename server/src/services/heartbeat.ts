@@ -7675,6 +7675,62 @@ export function resolveLedgerCostStatus(input: {
   return input.costUsd == null && hasTokenUsage ? "unpriced" : "reported";
 }
 
+/**
+ * PEN-5937: the run's project, resolved ONCE at finalization and written down.
+ *
+ * `issueId`/`projectId` are the run's WRITE-TIME scope and are unchanged -- they land on
+ * `cost_events.issue_id`/`project_id`, which `services/budgets.ts` enforces every
+ * `scopeType: "project"` policy on. Nothing here may widen them.
+ *
+ * `attributedProjectId` is the NEW, separate, derived value. It fills the gap that forced
+ * `costs/by-project` to rebuild attribution from `activity_log` at read time: a run whose
+ * `contextSnapshot` carries no issue and no project can still have worked issues -- an
+ * agent that picked work up mid-run is the common case -- and that work is visible only
+ * in the `activity_log` rows the run wrote. Resolving it HERE is cheap because it is one
+ * run (`activity_log_run_id_idx`); resolving it at read time meant the whole company's
+ * history through `issues.id::text`, which is what could not finish inside
+ * `statement_timeout`.
+ *
+ * Finalization is the correct point: the run is terminal, so its activity_log rows are
+ * already committed and the answer cannot change afterwards.
+ *
+ * The ordering here must match `repairCostEventProjectAttribution`
+ * (packages/db/src/cost-events-project-attribution-repair.ts) exactly, or a row's
+ * attribution would depend on whether the writer or the backfill reached it first.
+ */
+async function resolveRunActivityProjectId(
+  db: Db,
+  companyId: string,
+  runId: string,
+): Promise<string | null> {
+  const row = await db
+    .select({ projectId: issues.projectId })
+    .from(activityLog)
+    .innerJoin(
+      issues,
+      and(
+        eq(activityLog.entityType, "issue"),
+        eq(issues.companyId, companyId),
+        sql`${issues.id}::text = ${activityLog.entityId}`,
+      ),
+    )
+    .where(
+      and(
+        eq(activityLog.runId, runId),
+        eq(activityLog.companyId, companyId),
+        isNotNull(issues.projectId),
+      ),
+    )
+    // PEN-5624: `created_at` is `defaultNow()` -- transaction start time -- so two rows
+    // written by one run in one transaction tie by construction, and `id` is a v4 UUID
+    // with no time component. The tiebreaker makes the pick STABLE, not recency-correct;
+    // at a true tie there is no recency answer to be faithful to.
+    .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+    .limit(1)
+    .then((rows) => rows[0]?.projectId ?? null);
+  return row;
+}
+
 async function resolveLedgerScopeForRun(
   db: Db,
   companyId: string,
@@ -7688,6 +7744,10 @@ async function resolveLedgerScopeForRun(
     return {
       issueId: null,
       projectId: contextProjectId,
+      // Only a run with no write-time project needs deriving; `coalesce` at read time
+      // would ignore the derived value anyway, and the lookup is not free.
+      attributedProjectId:
+        contextProjectId ?? (await resolveRunActivityProjectId(db, companyId, run.id)),
     };
   }
 
@@ -7700,9 +7760,12 @@ async function resolveLedgerScopeForRun(
     .where(and(eq(issues.id, contextIssueId), eq(issues.companyId, companyId)))
     .then((rows) => rows[0] ?? null);
 
+  const projectId = issue?.projectId ?? contextProjectId;
   return {
     issueId: issue?.id ?? null,
-    projectId: issue?.projectId ?? contextProjectId,
+    projectId,
+    attributedProjectId:
+      projectId ?? (await resolveRunActivityProjectId(db, companyId, run.id)),
   };
 }
 
@@ -34841,6 +34904,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         agentId: agent.id,
         issueId: ledgerScope.issueId,
         projectId: ledgerScope.projectId,
+        // PEN-5937: derived run-level attribution, distinct from `projectId` above.
+        // `byProject` reads `coalesce(project_id, attributed_project_id)` instead of
+        // rebuilding a link table from `activity_log` per request. The watermark says
+        // "resolved" so the backfill does not revisit this row.
+        attributedProjectId: ledgerScope.attributedProjectId,
+        attributedProjectAt: new Date(),
         provider,
         biller,
         billingType,

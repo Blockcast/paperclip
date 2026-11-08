@@ -80,6 +80,10 @@ export {
   repairIssuesLastActivityDrift,
   type IssuesLastActivityDriftRepairResult,
 } from "./issues-last-activity-drift-repair.js";
+export {
+  repairCostEventProjectAttribution,
+  type CostEventProjectAttributionRepairResult,
+} from "./cost-events-project-attribution-repair.js";
 export { issueRelations } from "./schema/issue_relations.js";
 export { issueReferenceMentions } from "./schema/issue_reference_mentions.js";
 export * from "./schema/index.js";

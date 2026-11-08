@@ -1,4 +1,4 @@
-import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, sql } from "drizzle-orm";
+import { and, desc, eq, gte, lt, lte, sql } from "drizzle-orm";
 import { alias, type PgColumn } from "drizzle-orm/pg-core";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, companies, costEvents, heartbeatRuns, issues, projects } from "@paperclipai/db";
@@ -617,112 +617,49 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       const conditions = windowConditions(costEvents.companyId, costEvents.occurredAt);
 
       /**
-       * PEN-5585: the window has to reach `run_project_links`, not just `cost_events`.
+       * PEN-5937: attribution is a COLUMN READ. There is no `activity_log` here, no
+       * `run_project_links` subquery, and no `issues.id::text` cast -- this aggregate now
+       * scans exactly what `byAgent` scans, which answered 30 days in ~0.1 s while this
+       * route was being cancelled by `statement_timeout` at 10.
        *
-       * `run_project_links` exists only to supply a project for cost events that carry a
-       * `heartbeat_run_id` but no `project_id`. It used to be built from the company's
-       * ENTIRE `activity_log` history whatever window the caller asked for, so its cost
-       * grew monotonically with fleet activity and never came back down — and the join it
-       * feeds is `activity_log.entity_id = issues.id::text`, where the cast defeats any
-       * ordinary index on `issues.id`, so that full join fed a `DISTINCT ON` sort.
+       * ## What was here, and why narrowing it could not work
        *
-       * On 2026-11-04 that stopped fitting inside the 30s `statement_timeout`: a client
-       * polling a pinned 30-day window every 60s got 503 on 191/191 attempts, and the
-       * always-in-flight 30s query pushed ten other routes over their own timeouts
-       * (peak 103 `57014`/hour against a 0-1/hour baseline).
+       * `by-project` has to resolve a project for cost events that carry a
+       * `heartbeat_run_id` but no `project_id`. It did that at READ time, rebuilding a
+       * run->project link table per request with a `DISTINCT ON` over `activity_log`
+       * inner joined to `issues` on `activity_log.entity_id = issues.id::text`, where the
+       * cast defeats any ordinary index on `issues.id`.
        *
-       * Restricting to the runs that actually appear in the windowed `cost_events` is
-       * EXACTLY result-preserving, not an approximation: the outer `leftJoin` is on
-       * `cost_events.heartbeat_run_id = run_project_links.run_id`, so a link row whose
-       * `run_id` is absent from that set can never match and contributes nothing. It is
-       * deliberately not a `created_at` bound — a run may log activity long before or
-       * after the cost event it bills, and no run-duration slack is provably safe.
+       * Two narrowings of that subquery landed and neither bounded it -- PEN-5585
+       * (#3391) restricted it to the runs appearing in the windowed `cost_events`,
+       * PEN-5591 (#3455) restricted it further to the runs whose cost events have a NULL
+       * `project_id`. Measured 2026-11-07 against `cf90ee33`, the first image carrying
+       * BOTH: 3 d ~1 s, 5 d ~5 s, 7 d 20-30 s, 10 d `503`. The >20x step between 5 d and
+       * 7 d is a PLAN FLIP, not growth: past it the planner stops using the `run_id`
+       * restriction to drive index probes and falls back to a seq scan plus hash
+       * semi-join, so the restriction is evaluated AFTER the scan it was meant to avoid.
+       * Once that happens no further predicate-narrowing of the join input can help, and
+       * two independent narrowings confirmed it empirically. The lever was never a better
+       * predicate; it was not performing the join at read time at all.
        *
-       * The inner select is served by `cost_events_company_occurred_idx`, and the
-       * resulting `run_id` restriction by `activity_log_run_id_idx`.
+       * ## Where the value comes from now
+       *
+       * `cost_events.attributed_project_id`, written once per run at finalization by
+       * `resolveLedgerScopeForRun` (services/heartbeat.ts) and backfilled for historical
+       * rows by `repairCostEventProjectAttribution` (packages/db). Both derive it with
+       * the same `ORDER BY created_at DESC, id DESC` the subquery used, so this is the
+       * same attribution, read instead of recomputed -- and because it is now written
+       * down, it can no longer flip between two requests over identical data.
+       *
+       * ## Why `coalesce` and not just the new column
+       *
+       * `project_id` is the run's WRITE-TIME scope and stays authoritative: it is what
+       * `services/budgets.ts` enforces project budget policies on, and it is set on rows
+       * that never had a heartbeat run at all (`POST /cost-events`). The derived column
+       * only ever fills a gap. This is the same `coalesce` the old query applied to the
+       * link table, over a column instead of a join.
        */
-      /**
-       * PEN-5591: narrow the SAME restriction one step further, to the runs whose cost
-       * events can actually consume a link.
-       *
-       * The outer `leftJoin` below matches on
-       * `cost_events.heartbeat_run_id = run_project_links.run_id AND cost_events.project_id IS NULL`.
-       * A link row whose `run_id` has no NULL-project cost event in the window therefore
-       * cannot satisfy that predicate under any row ordering, and contributes nothing to
-       * the aggregate. Dropping it here is EXACTLY result-preserving -- the same argument
-       * the window bound above rests on, with a strictly stronger predicate on the same
-       * `cost_events_company_occurred_idx` scan. It is not an approximation and it is not
-       * a sampling bound.
-       *
-       * Why it was still needed after the window bound: measured in production on
-       * 2026-11-06 against the deployed bound, `by-project` answers 1/7/10-day windows
-       * (~2s/~12s/~22s) and is cancelled by `statement_timeout` at 14 and 30 days. The
-       * same company, same window and same outer `cost_events` scan via `by-agent` --
-       * which carries no `run_project_links` join -- answers 30 days in ~0.1s. The scan
-       * is ~0.3% of the budget; the join is the rest of it, so narrowing what feeds the
-       * join is the lever that remains.
-       *
-       * `project_id` is resolved ONCE per run (`resolveLedgerScopeForRun`) and reused for
-       * every cost event that run writes, so this predicate partitions runs cleanly rather
-       * than splitting a run's events. The runs it drops are the issue-scoped ones -- which
-       * are also the runs that write the most `activity_log` rows -- so it prunes the join
-       * input by more than its share of runs.
-       */
-      const windowedRunIds = db
-        .selectDistinct({ runId: costEvents.heartbeatRunId })
-        .from(costEvents)
-        .where(and(
-          ...conditions,
-          isNotNull(costEvents.heartbeatRunId),
-          isNull(costEvents.projectId),
-        ));
-
-      const issueIdAsText = sql<string>`${issues.id}::text`;
-      // PEN-5604: dedup by RUN, not by (run, project) pair. Pair-dedup emitted one link
-      // row per project a run touched, and since the join below matches on `run_id`
-      // alone, every cost event of a multi-project run was counted once per project --
-      // so `sum(byProject[].costCents)` exceeded actual spend. Run-dedup also makes the
-      // `ORDER BY ... created_at DESC` below mean what it was written to mean: of the
-      // projects this run touched, attribute its run-level cost to the most recent one.
-      const runProjectLinks = db
-        .selectDistinctOn([activityLog.runId], {
-          runId: activityLog.runId,
-          projectId: issues.projectId,
-        })
-        .from(activityLog)
-        .innerJoin(
-          issues,
-          and(
-            eq(activityLog.entityType, "issue"),
-            eq(activityLog.entityId, issueIdAsText),
-          ),
-        )
-        .where(
-          and(
-            eq(activityLog.companyId, companyId),
-            eq(issues.companyId, companyId),
-            isNotNull(activityLog.runId),
-            isNotNull(issues.projectId),
-            inArray(activityLog.runId, windowedRunIds),
-          ),
-        )
-        // PEN-5624: `activity_log.created_at` is `defaultNow()`, which renders as `now()`
-        // -- TRANSACTION start time, constant within a transaction. Two issue activity
-        // rows written by one run in one transaction therefore tie by CONSTRUCTION, and
-        // `DISTINCT ON` would otherwise keep whichever row the executor presented first,
-        // letting attribution flip between requests over identical data.
-        //
-        // `activityLog.id` is `defaultRandom()` -- a v4 UUID with NO time component. So
-        // this tiebreaker makes the pick STABLE, not recency-correct: at a true
-        // `created_at` tie there is no recency answer to be faithful to, and this picks
-        // arbitrarily but deterministically. Stable beats flapping; a genuinely
-        // recency-correct tiebreaker would need a per-statement monotonic column that
-        // does not exist today (e.g. `clock_timestamp()`), which is a schema change.
-        // Totals are unaffected either way -- run-dedup already yields one row per run.
-        .orderBy(activityLog.runId, desc(activityLog.createdAt), desc(activityLog.id))
-        .as("run_project_links");
-
-      const effectiveProjectId = sql<string | null>`coalesce(${costEvents.projectId}, ${runProjectLinks.projectId})`;
+      const effectiveProjectId = sql<string | null>`coalesce(${costEvents.projectId}, ${costEvents.attributedProjectId})`;
 
       const costCentsExpr = sumAsNumber(costEvents.costCents);
 
@@ -755,9 +692,10 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
        * does; grouping on `effectiveProjectId` instead would scatter every dangling
        * reference into its own anonymous row, one per deleted project.
        *
-       * Neither left join can fan out a row and inflate the total: `run_project_links` is
-       * `DISTINCT ON (run_id)` and is joined on `run_id` alone (PEN-5604), and `projects`
-       * is joined on its primary key, so each matches at most once.
+       * The left join cannot fan out a row and inflate the total: `projects` is joined on
+       * its primary key, so it matches at most once. PEN-5937 removed the second left
+       * join this paragraph used to also cover (`run_project_links`, deduped
+       * `DISTINCT ON (run_id)` under PEN-5604) by making attribution a column read.
        */
       const bucketProjectId = sql<string | null>`${projects.id}`;
       const bucketProjectName = sql<string | null>`${projects.name}`;
@@ -820,16 +758,13 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
           outputTokens: sumAsNumber(costEvents.outputTokens),
         })
         .from(costEvents)
-        // Only rows WITHOUT a direct project need run attribution. Narrowing the join
-        // here is safe under LEFT JOIN -- a row that already carries a project simply
-        // does not match, and `coalesce(direct, null)` returns that project unchanged.
-        .leftJoin(
-          runProjectLinks,
-          and(
-            eq(costEvents.heartbeatRunId, runProjectLinks.runId),
-            isNull(costEvents.projectId),
-          ),
-        )
+        // PEN-6084's LEFT join and its `projects.id` grouping, kept verbatim: spend that
+        // resolves to no project is BUCKETED, not dropped, and `sum(by-project)` still
+        // reconciles against the window total. PEN-5937 changes only what feeds
+        // `effectiveProjectId` -- a column read instead of the `run_project_links` join
+        // that used to sit above this line -- so the two changes compose rather than
+        // compete. Write-time attribution SHRINKS the residual bucket; it does not
+        // remove it, and a residual is permanent by construction.
         .leftJoin(projects, sql`${projects.id} = ${effectiveProjectId}`)
         .where(and(...conditions))
         .groupBy(projects.id, projects.name)

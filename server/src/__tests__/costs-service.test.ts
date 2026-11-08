@@ -14,6 +14,7 @@ import {
   heartbeatRuns,
   issues,
   projects,
+  repairCostEventProjectAttribution,
 } from "@paperclipai/db";
 import { costService } from "../services/costs.js";
 import { financeService } from "../services/finance.js";
@@ -243,13 +244,17 @@ describe("cost routes", () => {
     });
   });
 
-  // PEN-5591: `by-project` cannot answer a wide window inside the 30s
-  // `statement_timeout`, and the attempt is what sheds the rest of the fleet --
-  // the incident was 191/191 `503` on this route while ten unrelated routes
-  // blew their own timeouts. Measured post-fix on 2026-11-07 at `cf90ee33`:
-  // 3d/5d answer in 0.5-1s and 2.5-5s, 7d takes 20-30s, 10d is cancelled. The
-  // cap is set at the last window with real margin, not the last that answers.
-  describe("by-project window cap (PEN-5591)", () => {
+  // PEN-5937: the cap is now 31 days, raised from PEN-5591's stopgap 5.
+  //
+  // The 5 tracked a PLAN CLIFF -- `by-project` rebuilt a run->project link table from
+  // `activity_log` per request, and measured at `cf90ee33` that cost 3d/5d 0.5-5s, 7d
+  // 20-30s, 10d cancelled. That join is deleted, so there is no cliff to track and the
+  // 31 is a product bound (the widest window the UI asks for) rather than a performance
+  // one. Nothing about a month decays as the fleet grows.
+  //
+  // An unbounded window is STILL refused, for the reason it always was: `from` absent is
+  // a full-history scan, the PEN-5585 incident's worst case.
+  describe("by-project window cap (PEN-5937)", () => {
     const now = new Date("2026-11-07T12:00:00.000Z");
     const daysBefore = (n: number) => new Date(now.getTime() - n * 24 * 60 * 60 * 1000);
 
@@ -274,18 +279,23 @@ describe("cost routes", () => {
       )).toThrow(/costs\/by-project window is .* the maximum is/i);
     });
 
-    // The 30-day window the incident's caller polled every 60s.
-    it("refuses the 30-day window that caused the incident", async () => {
+    // PEN-5937 done-when 3, and the 30-day window the incident's caller polled every
+    // 60s. It was refused under the stopgap cap; the whole point of deleting the join is
+    // that it is answerable again.
+    it("admits the 30-day window the stopgap cap refused", async () => {
       const { assertByProjectWindowWithinCap } = await loadCostParsers();
       expect(() => assertByProjectWindowWithinCap({ from: daysBefore(30), to: now }, now))
-        .toThrow(/PEN-5591/);
+        .not.toThrow();
     });
 
     // An absent `to` means "now" -- bounded, so it is the span that decides.
     it("measures an absent 'to' against now rather than refusing it", async () => {
-      const { assertByProjectWindowWithinCap } = await loadCostParsers();
+      const { assertByProjectWindowWithinCap, BY_PROJECT_MAX_WINDOW_DAYS } = await loadCostParsers();
       expect(() => assertByProjectWindowWithinCap({ from: daysBefore(1) }, now)).not.toThrow();
-      expect(() => assertByProjectWindowWithinCap({ from: daysBefore(30) }, now)).toThrow(/PEN-5591/);
+      expect(() => assertByProjectWindowWithinCap(
+        { from: daysBefore(BY_PROJECT_MAX_WINDOW_DAYS + 10) },
+        now,
+      )).toThrow(/the maximum is/i);
     });
 
     // An absent `from` is the FULL-HISTORY scan, i.e. the worst case -- so it
@@ -311,7 +321,7 @@ describe("cost routes", () => {
       const app = await createApp();
       const res = await request(app)
         .get("/api/companies/company-1/costs/by-project")
-        .query({ from: "2026-10-01T00:00:00.000Z", to: "2026-10-31T00:00:00.000Z" });
+        .query({ from: "2026-08-01T00:00:00.000Z", to: "2026-10-31T00:00:00.000Z" });
 
       expect(res.status).toBe(400);
       expect(res.body.details?.code).toBe("window_too_wide");
@@ -322,7 +332,9 @@ describe("cost routes", () => {
       const app = await createApp();
       const res = await request(app)
         .get("/api/companies/company-1/costs/by-project")
-        .query({ from: "2026-10-28T00:00:00.000Z", to: "2026-10-31T00:00:00.000Z" });
+        // 30 days: over the PEN-5591 stopgap cap, under the PEN-5937 one. This is
+        // done-when 3 asserted at the ROUTE rather than on the guard in isolation.
+        .query({ from: "2026-10-01T00:00:00.000Z", to: "2026-10-31T00:00:00.000Z" });
 
       expect(res.status).toBe(200);
       expect(mockCostService.byProject).toHaveBeenCalled();
@@ -331,8 +343,8 @@ describe("cost routes", () => {
     it("refuses before the query runs, as a 400 rather than a 503", async () => {
       const { assertByProjectWindowWithinCap } = await loadCostParsers();
       try {
-        assertByProjectWindowWithinCap({ from: daysBefore(30), to: now }, now);
-        expect.unreachable("expected the cap to refuse a 30-day window");
+        assertByProjectWindowWithinCap({ from: daysBefore(90), to: now }, now);
+        expect.unreachable("expected the cap to refuse a 90-day window");
       } catch (err) {
         expect((err as { status?: number }).status).toBe(400);
         expect((err as { details?: { code?: string } }).details?.code).toBe("window_too_wide");
@@ -983,6 +995,13 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       },
     ]);
 
+    // PEN-5937: attribution is now DERIVED ONCE and written down. The backfill is what
+    // reaches rows written before the forward writer shipped, which is exactly the shape
+    // of these fixtures.
+    const repair = await repairCostEventProjectAttribution(db as never, { pauseMs: 0 });
+    expect(repair.failedBatches).toBe(0);
+    expect(repair.attributed).toBe(2);
+
     const capturedSql: string[] = [];
     const costsWithCapture = costService(withSqlCapture(db, capturedSql));
 
@@ -995,7 +1014,10 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(rows[0]?.projectId).toBe(inWindowProjectId);
     expect(rows[0]?.costCents).toBe(700);
 
-    // The pruned run is not lost data — ask for its window and it attributes normally.
+    // The out-of-window run is not lost data — ask for its window and it attributes
+    // normally. Under the read-time join this proved the window restriction pruned
+    // without dropping; under a column read it proves the backfill reached BOTH runs,
+    // which is the property that replaced it.
     const earlierRows = await costsWithCapture.byProject(companyId, {
       from: new Date("2026-01-01T00:00:00.000Z"),
       to: new Date("2026-01-31T23:59:59.999Z"),
@@ -1004,16 +1026,24 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(earlierRows[0]?.projectId).toBe(outOfWindowProjectId);
     expect(earlierRows[0]?.costCents).toBe(999);
 
-    // PEN-5585: the assertions above guard ATTRIBUTION, not the pruning — the bound is
-    // result-preserving by construction, so they pass identically whether the restriction
-    // is emitted or silently dropped by a drizzle API mistake. Only the compiled SQL
-    // distinguishes those two, so read it off the query the service actually built.
-    const emitted = capturedSql.filter((text) => text.includes("run_project_links"));
-    expect(emitted.length).toBeGreaterThan(0);
-    for (const text of emitted) {
-      expect(text).toContain('"activity_log"."run_id" in (');
-      expect(text).toContain('select distinct "heartbeat_run_id" from "cost_events"');
+    // PEN-5937, done-when 2: the join is GONE, not merely narrowed. The attribution
+    // assertions above cannot see that — they read identically whether the value came
+    // from a column or from a subquery — so this reads it off the compiled statement.
+    // Asserted on EVERY captured byProject statement, not on "some statement lacks it",
+    // which an empty capture would also satisfy.
+    expect(capturedSql.length).toBeGreaterThan(0);
+    for (const text of capturedSql) {
+      expect(text).not.toContain("run_project_links");
+      expect(text).not.toContain("activity_log");
+      // The `issues.id::text` cast went with it. PEN-5606/PEN-5643 are moot here.
+      expect(text).not.toContain('"issues"."id"::text');
     }
+
+    // Idempotent: a second pass finds nothing, because the watermark says these rows
+    // were resolved. Without the watermark column, the rows this run left unattributed
+    // would be re-derived on every pass forever.
+    const second = await repairCostEventProjectAttribution(db as never, { pauseMs: 0 });
+    expect(second.stamped).toBe(0);
   });
 
   // PEN-5591: the window bound above left `run_project_links` fed by EVERY run in the
@@ -1160,6 +1190,9 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       },
     ]);
 
+    const repair = await repairCostEventProjectAttribution(db as never, { pauseMs: 0 });
+    expect(repair.failedBatches).toBe(0);
+
     const capturedSql: string[] = [];
     const costsWithCapture = costService(withSqlCapture(db, capturedSql));
 
@@ -1170,23 +1203,35 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
 
     const byProjectId = new Map(rows.map((row) => [row.projectId, row.costCents]));
     expect(rows).toHaveLength(2);
-    // Direct attribution survives the narrowing untouched...
+    // PEN-5937: WRITE-TIME scope still wins. The backfill stamps this row too, and its
+    // run touched `linkProjectId`, so `attributed_project_id` disagrees with
+    // `project_id` here by construction -- and `coalesce(project_id, attributed)` must
+    // keep the direct one. This is the assertion that stops the derived column from
+    // leaking into the scope `services/budgets.ts` enforces project policies on.
     expect(byProjectId.get(directProjectId)).toBe(700);
-    // ...and the run that NEEDS the link still gets it. A narrowing that pruned this one
-    // would read as a pass on the SQL assertion below while silently losing attribution.
+    // ...and the run that has no direct project is attributed from the derived column.
     expect(byProjectId.get(linkProjectId)).toBe(250);
 
-    const emitted = capturedSql.filter((text) => text.includes("run_project_links"));
-    expect(emitted.length).toBeGreaterThan(0);
-    for (const text of emitted) {
-      // The PEN-5585 window bound, still present...
-      expect(text).toContain('select distinct "heartbeat_run_id" from "cost_events"');
-      // ...now also carrying the PEN-5591 narrowing. Asserted on the subquery text rather
-      // than on the whole statement, because `project_id is null` also appears in the
-      // outer join predicate -- a whole-statement match would pass with the narrowing
-      // absent.
-      const subquery = text.slice(text.indexOf('select distinct "heartbeat_run_id" from "cost_events"'));
-      expect(subquery.slice(0, subquery.indexOf(")"))).toContain('"cost_events"."project_id" is null');
+    // The backfill applies the SAME precedence the writer does: a row that already
+    // carries write-time scope is never derived from `activity_log` at all. `directRunId`
+    // has activity against `linkProjectId`, so a backfill that derived regardless would
+    // have written that here -- and would then disagree with the forward writer, which
+    // skips the lookup. It must read back as the direct project.
+    const directRow = await db
+      .select({
+        projectId: costEvents.projectId,
+        attributedProjectId: costEvents.attributedProjectId,
+      })
+      .from(costEvents)
+      .where(eq(costEvents.heartbeatRunId, directRunId))
+      .then((found) => found[0]);
+    expect(directRow?.projectId).toBe(directProjectId);
+    expect(directRow?.attributedProjectId).toBe(directProjectId);
+
+    expect(capturedSql.length).toBeGreaterThan(0);
+    for (const text of capturedSql) {
+      expect(text).not.toContain("run_project_links");
+      expect(text).not.toContain("activity_log");
     }
   });
 
@@ -1327,10 +1372,18 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       },
     ]);
 
+    await repairCostEventProjectAttribution(db as never, { pauseMs: 0 });
+
     const rows = await costs.byProject(companyId);
     const totalReported = rows.reduce((sum, row) => sum + (row.costCents ?? 0), 0);
 
     // The invariant: by-project totals must equal actual spend over the same window.
+    //
+    // PEN-5937 carries this one over unchanged, and it is done-when 2. The fan-out
+    // PEN-5604 fixed is now structurally impossible rather than defended: attribution is
+    // ONE column on the cost event, so a multi-project run has exactly one value and no
+    // join exists to multiply its rows. A regression here would mean the aggregate grew
+    // a new join, which is the thing this row deleted.
     expect(totalReported).toBe(350);
 
     const byProjectId = new Map(rows.map((row) => [row.projectId, row.costCents]));
@@ -1454,6 +1507,16 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       // Unattributed, cause 2: no run to attribute through in the first place.
       { ...base, costCents: 90, occurredAt: new Date("2026-11-07T06:00:00.000Z") },
     ]);
+
+    // PEN-5937: `byProject` reads `cost_events.attributed_project_id` instead of
+    // rebuilding a run->project link from `activity_log` at request time, so the
+    // second event above -- no direct project, attributable only through the run that
+    // touched a project-linked issue -- needs its watermark stamped before the read.
+    // The forward writer covers rows a run writes itself; this fixture inserts them
+    // directly, so the backfill pass is what supplies the column here. Without it that
+    // event lands in the unattributed bucket and this test measures the absence of
+    // attribution rather than the bucketing PEN-6084 added.
+    await repairCostEventProjectAttribution(db as never, { pauseMs: 0 });
 
     const rows = await costs.byProject(companyId, range);
     const summary = await costs.summary(companyId, range);
@@ -1759,6 +1822,9 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
       },
     ]);
 
+    const repair = await repairCostEventProjectAttribution(db as never, { pauseMs: 0 });
+    expect(repair.failedBatches).toBe(0);
+
     const capturedSql: string[] = [];
     const costsWithCapture = costService(withSqlCapture(db, capturedSql));
 
@@ -1778,10 +1844,15 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     // Stability across repeated calls over identical data -- the flap PEN-5624 names.
     expect(second).toEqual(first);
 
-    const emitted = capturedSql.filter((text) => text.includes("run_project_links"));
-    expect(emitted.length).toBeGreaterThan(0);
-    for (const text of emitted) {
-      expect(text).toContain('order by "activity_log"."run_id", "activity_log"."created_at" desc, "activity_log"."id" desc');
+    // PEN-5937: the tiebreaker moved from the read to the RESOLVER, so it is no longer
+    // observable in the aggregate's SQL. It is asserted above on the values the backfill
+    // wrote, and the stability property is now structural rather than defended: the
+    // answer is written down once, so two requests over identical data cannot differ
+    // even if the ordering were wrong.
+    expect(capturedSql.length).toBeGreaterThan(0);
+    for (const text of capturedSql) {
+      expect(text).not.toContain("run_project_links");
+      expect(text).not.toContain("activity_log");
     }
   });
 

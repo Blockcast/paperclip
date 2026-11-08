@@ -40,35 +40,56 @@ export function parseCostDateRange(query: Record<string, unknown>) {
 }
 
 /**
- * PEN-5591: a window cap on `costs/by-project`, and ONLY on that route.
+ * PEN-5937: raised from 5 to 31 now that `by-project` no longer joins `activity_log`.
  *
- * This is a stopgap against a fleet-wide shed, not a fix. `by-project` joins
- * `run_project_links`, whose cost does not scale with the window the caller
- * asked for in the way the two previous narrowings (PEN-5585's window bound,
- * PEN-5591's NULL-project bound) were meant to make it. Measured in production
- * on 2026-11-07T09:1x-09:2xZ, against `cf90ee33` -- the first image carrying
- * BOTH narrowings -- for the company that triggered the incident:
+ * ## What the 5 was, and why it is gone
  *
- *   |  3 d | 200 | 0.5 - 1 s   |
- *   |  5 d | 200 | 2.5 - 5 s   |
- *   |  7 d | 200 | 20 - 30 s   |
- *   | 10 d | 503 | > 30 s, cancelled by `statement_timeout`  |
+ * PEN-5591 set it as a STOPGAP against a fleet-wide shed. `by-project` rebuilt a
+ * run->project link table per request from `activity_log` inner joined to `issues` on
+ * `issues.id::text`, and measured 2026-11-07 against `cf90ee33` that cost 3 d ~1 s,
+ * 5 d ~5 s, 7 d 20-30 s, 10 d `503`. The >20x step between 5 d and 7 d was a plan flip,
+ * so the cap was tracking a CLIFF -- and a cliff that marches toward shorter windows as
+ * fleet activity accumulates, which is why the constant decayed silently (PEN-5886) and
+ * why PEN-5591 wrote that only its successor could lift it.
  *
- * 14 d and 30 d are entailed `503` by monotonicity and were deliberately NOT
- * driven: each costs a full 30 s of the burn this cap exists to prevent.
+ * That join is now deleted (services/costs.ts). Attribution is a column read, so this
+ * aggregate scans exactly what `byAgent` scans -- and `byAgent` answered 30 days in
+ * ~0.1 s for the same company, same window, while this route was being cancelled at 10.
+ * There is no cliff left for a cap to track.
  *
- * Why 5 days and not 7, when 7 still answers `200`: the fleet-shed mechanism
- * is the >30 s statement holding a connection while ten unrelated routes pass
- * their own `statement_timeout` (PEN-5585, 191/191 `503`). A 7 d request at
- * 20-30 s IS that burn -- it merely survives it. 5 d at 2.5-5 s keeps a 6-12x
- * margin under the 30 s timeout, and the margin is what the cap is buying.
- * The cliff also marches toward shorter windows as fleet activity accumulates,
- * so a ceiling pinned to the longest window that still returns 200 falsifies
- * itself within days.
+ * ## Why 31 and not removal
  *
- * Retune this ONE constant when the successor lands; nothing else encodes it.
+ * Removal was considered and declined. `byAgent` carries no cap and nobody calls that a
+ * defect, so coherence argues for removing this one too -- but the cost model above is
+ * reasoned from the shape of the new plan, not measured in production, and this is the
+ * one route that has already shed the fleet once. 31 days covers every bounded window
+ * the product actually asks for (`30d`, and `mtd` on any calendar month) while leaving
+ * a bound on connection-hold time during the first deploy that runs without the join.
+ *
+ * This number is NOT the old one retuned. The 5 named the longest window that still
+ * returned 200; 31 names the widest window the product asks for, and nothing about it
+ * decays as the fleet grows -- a month does not get longer. Widen it on evidence from
+ * the live route, not on a re-measurement of a cliff that no longer exists.
+ *
+ * ## An unbounded window is still refused
+ *
+ * Not for cost symmetry -- because `from` absent is a full-history scan, the incident's
+ * worst case (PEN-5585: 191/191 `503`), and no window the product offers needs it. The
+ * portal reads this value out of the `400` payload and clamps (PEN-6038, #3520), so
+ * `ytd` and `all` degrade to the trailing 31 days rather than erroring.
+ *
+ * ## The backstop this deliberately does NOT ship
+ *
+ * A `SET LOCAL statement_timeout` scoped to this one query would bound the quantity that
+ * actually harms us -- connection-hold time -- and would not decay. It is recorded on
+ * PEN-5937 as a design consideration and explicitly NOT as an accepted remedy: it is
+ * untested here, and what would establish it is that a sub-cap `SET LOCAL` survives the
+ * pool's startup packet and composes with the inherited-timeout accounting in
+ * `db-inherited-timeouts.ts`. Shipping an unmeasured mechanism as the only bound, in the
+ * same change that deletes the measured one, would be trading a known bound for a hoped
+ * one. The two are complementary; this change keeps the cap and leaves that open.
  */
-export const BY_PROJECT_MAX_WINDOW_DAYS = 5;
+export const BY_PROJECT_MAX_WINDOW_DAYS = 31;
 
 const MS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -87,9 +108,9 @@ export function assertByProjectWindowWithinCap(
   if (!from) {
     throw badRequest(
       `'from' is required on costs/by-project and the window must be at most `
-      + `${BY_PROJECT_MAX_WINDOW_DAYS} days. An unbounded window cannot complete inside the `
-      + `database statement timeout and sheds unrelated routes (PEN-5591).`,
-      { code: "window_unbounded", maxWindowDays: BY_PROJECT_MAX_WINDOW_DAYS, issue: "PEN-5591" },
+      + `${BY_PROJECT_MAX_WINDOW_DAYS} days. An unbounded window is a full-history scan, `
+      + `which is the worst case that shed unrelated routes in the PEN-5585 incident.`,
+      { code: "window_unbounded", maxWindowDays: BY_PROJECT_MAX_WINDOW_DAYS, issue: "PEN-5937" },
     );
   }
   const to = range?.to ?? now;
@@ -107,13 +128,13 @@ export function assertByProjectWindowWithinCap(
   if (spanDays > BY_PROJECT_MAX_WINDOW_DAYS) {
     throw badRequest(
       `costs/by-project window is ${spanDays.toFixed(1)} days; the maximum is `
-      + `${BY_PROJECT_MAX_WINDOW_DAYS}. Wider windows cannot complete inside the database `
-      + `statement timeout and shed unrelated routes (PEN-5591). Request a shorter range.`,
+      + `${BY_PROJECT_MAX_WINDOW_DAYS}. This bounds how long one request may hold a `
+      + `database connection. Request a shorter range.`,
       {
         code: "window_too_wide",
         requestedWindowDays: Number(spanDays.toFixed(1)),
         maxWindowDays: BY_PROJECT_MAX_WINDOW_DAYS,
-        issue: "PEN-5591",
+        issue: "PEN-5937",
       },
     );
   }

@@ -53,6 +53,31 @@ export const costEvents = pgTable(
     // every free row forever. Readers use coalesce(consumption_cents, cost_cents) --
     // see computeObservedAmount (services/budgets.ts) for the ordering constraint.
     consumptionCents: integer("consumption_cents"),
+    // PEN-5937: DERIVED run-level project attribution. Deliberately a SECOND column
+    // rather than a backfill of `project_id`, and the two must not be merged.
+    //
+    // `project_id` is the run's WRITE-TIME scope, and `services/budgets.ts` enforces
+    // every `scopeType: "project"` budget policy on it (`:198`, `:275`). Widening it to
+    // "a project this run touched" would silently enlarge what counts against a project's
+    // cap -- a financial gate moving because a reporting query wanted a cheaper join.
+    // This column carries the attribution `costs.byProject` used to reconstruct at read
+    // time from `activity_log`, and NOTHING reads it but that aggregate.
+    //
+    // Readers use `coalesce(project_id, attributed_project_id)`: write-time scope wins,
+    // and the derived value only ever fills a gap. A row whose `project_id` is set is
+    // never re-attributed.
+    attributedProjectId: uuid("attributed_project_id"),
+    // Resolution WATERMARK, and the reason `attributed_project_id` alone is not enough:
+    // NULL there means both "never resolved" and "resolved, this run touched no project",
+    // so the backfill could not tell what it had already visited and would re-derive every
+    // unattributable row on every pass, forever. NULL here means "never resolved"; a
+    // timestamp means "resolved", whatever the answer was.
+    //
+    // No DB-level FK on `attributed_project_id` on purpose: adding one to a populated
+    // table takes a lock and a validation scan to protect a DERIVED, advisory value. A
+    // deleted project leaves a dangling id, which `byProject`'s `innerJoin(projects)`
+    // drops exactly as it drops a NULL -- the same outcome a FK's ON DELETE would give.
+    attributedProjectAt: timestamp("attributed_project_at", { withTimezone: true }),
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   },
