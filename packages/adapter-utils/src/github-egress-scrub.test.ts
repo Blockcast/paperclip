@@ -227,59 +227,27 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
-  describe("PEN-6123: a run of values that cannot hold a secret is not a dump", () => {
-    // Every value here is zero-information: nothing, a shell expansion whose
-    // literal is not in the blob, a number, or a fixed keyword.
-    const ZERO_ENTROPY_CORPUS = readFileSync(
-      new URL("./github-egress-scrub.zero-entropy-values.txt", import.meta.url),
-      "utf8",
-    )
-      .split("\n")
-      .map((line) => line.trim())
-      .filter((line) => !line.startsWith("#"));
-
+  describe("PEN-6123: the run rule is value-blind, and stays that way", () => {
     const runOf = (values: string[]) => values.map((value, i) => `VAR_${i}=${value}`).join("\n");
 
-    it("exempts a run drawn entirely from the corpus", () => {
-      // The corpus carries an intentional empty-value line; keep it.
-      expect(ZERO_ENTROPY_CORPUS.length).toBeGreaterThanOrEqual(ENVIRONMENT_DUMP_MIN_RUN);
-      const text = runOf(ZERO_ENTROPY_CORPUS);
-      const result = scrubGitHubEgressText(text);
-
-      expect(result.classes).not.toContain("environment-dump");
-      expect(result.text).toBe(text);
-    });
-
-    it("is not vacuous: the same run is a dump without the exemption", () => {
-      // Guard against a corpus the run regex never matched in the first place.
-      // Swapping one value for an opaque one must re-arm the rule, which can
-      // only happen if every other line is genuinely part of a matched run.
-      const rearmed = runOf([
-        ...ZERO_ENTROPY_CORPUS.slice(0, ENVIRONMENT_DUMP_MIN_RUN - 1),
-        "s3cr3t-99",
-      ]);
-      expect(scrubGitHubEgressText(rearmed).classes).toContain("environment-dump");
-    });
-
+    // A "zero-entropy value" exemption was written for this rule and withdrawn
+    // before merge (see the long note in github-egress-scrub.ts). These are the
+    // values that defeated it. Each is a literal secret sitting in the blob
+    // behind a shape the clause read as information-free, and each is under the
+    // 16-character floor of ASSIGNMENT_RE, so nothing else catches them: if the
+    // run rule declines, they ship. Pinned as still-refused so the clause
+    // cannot be reintroduced in that form without turning this suite red.
     it.each([
-      ["at the end", ENVIRONMENT_DUMP_MIN_RUN - 1],
-      ["in the middle", Math.floor(ENVIRONMENT_DUMP_MIN_RUN / 2)],
-      ["at the start", 0],
-    ])("one non-exempt value %s re-arms the whole run", (_label, index) => {
-      const values = Array.from({ length: ENVIRONMENT_DUMP_MIN_RUN }, () => "true");
-      values[index] = "hunter2swordfish";
+      ["a default value is a literal in the blob", "${DB_PASSWORD:-hunter22}"],
+      ["a password that begins with $", "$ecretP4ss"],
+      ["a command substitution carrying a literal", "$(echo dragon417)"],
+      ["a backtick substitution carrying a literal", "`echo admin:hunter22`"],
+      ["the quoted form of a default value", '"${API_KEY:-s3cr3t-pw}"'],
+      ["an unbounded digit run is a PIN", "824193"],
+      ["digits behind an arbitrary alpha suffix", "4471xyz"],
+    ])("refuses a bulk dump of %s", (_label, value) => {
+      const values = Array.from({ length: ENVIRONMENT_DUMP_MIN_RUN }, () => value);
       expect(scrubGitHubEgressText(runOf(values)).classes).toContain("environment-dump");
-    });
-
-    it("strips shell quoting before testing the value", () => {
-      const text = [
-        "VAR_A='$NAMESPACE'",
-        'VAR_B="5"',
-        'VAR_C="true"',
-        "VAR_D=off",
-        "VAR_E=0.5",
-      ].join("\n");
-      expect(scrubGitHubEgressText(text).classes).not.toContain("environment-dump");
     });
 
     // The whole point of the count rule is bulk secrets no value-level rule can
@@ -327,6 +295,16 @@ describe("scrubGitHubEgressText", () => {
       ],
     ])("still refuses a bulk dump of %s", (_label, values) => {
       expect(scrubGitHubEgressText(runOf(values)).classes).toContain("environment-dump");
+    });
+
+    // Control for the two blocks above: they must not be passing because the
+    // run regex never matched. A run one line under the threshold is untouched,
+    // so the matches above are the rule firing and not a malformed fixture.
+    it("is not vacuous: one line under the threshold is left alone", () => {
+      const values = Array.from({ length: ENVIRONMENT_DUMP_MIN_RUN - 1 }, () => "$ecretP4ss");
+      const text = runOf(values);
+      expect(scrubGitHubEgressText(text).classes).not.toContain("environment-dump");
+      expect(scrubGitHubEgressText(text).text).toBe(text);
     });
   });
 
