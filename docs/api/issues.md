@@ -401,3 +401,64 @@ backlog -> todo -> in_progress -> in_review -> done
 - `started_at` auto-set on `in_progress`
 - `completed_at` auto-set on `done`
 - Terminal states: `done`, `cancelled`
+
+## Wake Diagnostics
+
+```
+GET /api/issues/{issueId}/diagnostics/wakes
+```
+
+Returns why this issue's recent wakes fired, over a 14-day lookback, as a merged
+event list drawn from two sections: `agent_wakeup_requests` and the
+wake-related slice of `activity_log`.
+
+**Read `degraded` before you read `events` (PEN-6085).** Each section is read
+under its own `caps.statementTimeoutMs` budget (10 s). A section that exceeds it
+is returned EMPTY and flagged, rather than failing the whole request with
+`503` — a bounded partial is usable, a `503` is not.
+
+```json
+{
+  "truncated": true,
+  "truncatedSections": { "wakeRequests": true, "activityRecords": false },
+  "degraded": false,
+  "degradedSections": { "wakeRequests": false, "activityRecords": false },
+  "caps": {
+    "maxWakeRequests": 50,
+    "maxActivityRecords": 50,
+    "lookbackDays": 14,
+    "statementTimeoutMs": 10000
+  }
+}
+```
+
+⚠️ `truncated` and `degraded` are **not** the same claim, and conflating them on
+an audit surface is the failure this split exists to prevent:
+
+| flag | meaning | is an empty list evidence of absence? |
+|---|---|---|
+| `truncated` | more rows exist beyond `caps` | n/a — the rows returned are correct |
+| `degraded` | the section could not be read at all | **no** |
+
+When `degraded` is true, `diagnosis` says `INCOMPLETE` and names the sections
+that were not read. Do not conclude from a degraded section that an issue never
+woke — that is precisely the mistaken inference the flag exists to block.
+
+### Why the route has its own budget
+
+Neither section can be index-served: both filter on JSONB keys
+(`payload ->> 'issueId'` and friends; `details ->> 'issueId'`) that carry no
+index, so each read walks the company's whole 14-day range and rechecks every
+row. `LIMIT` does not bound that walk — it short-circuits only while matches are
+dense near the top of the range. Measured in production on 2026-11-08, ~77% of
+requests answered under 2.5 s and ~9% landed in the 30–60 s bucket, the upper
+bucket being the two reads running sequentially under the 30 s role default.
+
+⚠️ That histogram is dominated by idle periods and is the wrong thing to tune
+the budget against. Under live load the same route answered one row correctly in
+14.3 s that had taken 1.6 s an hour earlier, and cancelled two others at 30.9 s
+and 32.9 s. The instrument is slowest during exactly the incidents it exists to
+diagnose, so the budget is deliberately generous rather than median-fitted.
+
+The budget bounds the burn; making the predicate index-served is the structural
+fix and is tracked separately.

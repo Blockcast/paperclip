@@ -343,10 +343,26 @@ export interface IssueWakeDiagnosticsResponse {
     wakeRequests: boolean;
     activityRecords: boolean;
   };
+  /**
+   * True when at least one section could not be read inside
+   * `caps.statementTimeoutMs` and was returned EMPTY (PEN-6085).
+   *
+   * ⚠️ Read this before concluding anything from `events`. It is categorically
+   * different from `truncated`: a truncated section is correct as far as the cap
+   * allows, whereas a degraded section was not read at all, so an empty
+   * `events` array under `degraded: true` is NOT evidence that no wakes exist.
+   */
+  degraded: boolean;
+  degradedSections: {
+    wakeRequests: boolean;
+    activityRecords: boolean;
+  };
   caps: {
     maxWakeRequests: number;
     maxActivityRecords: number;
     lookbackDays: number;
+    /** Per-section statement budget; a section exceeding it degrades (PEN-6085). */
+    statementTimeoutMs: number;
   };
 }
 

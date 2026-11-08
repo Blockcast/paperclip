@@ -93,6 +93,7 @@ import {
 import { logger } from "../middleware/logger.js";
 import { captureIssueListAnalyzeProbe } from "../lib/issue-list-analyze-probe.js";
 import { captureTimedOutIssueListPlan } from "../lib/issue-list-timeout-explain.js";
+import { findPgError, STATEMENT_TIMEOUT_SQLSTATE } from "../lib/db-retry.js";
 import { recordProjectPrimaryWorkspaceFallback } from "./metrics.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -221,6 +222,69 @@ export const ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS = 100;
 export const ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS = 50;
 export const ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS = 50;
 export const ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS = 14;
+/**
+ * Per-statement budget for the two wake-diagnostics reads (PEN-6085).
+ *
+ * ## Why this route needs its own bound rather than the 30 s role default
+ *
+ * Neither read can be index-served. `wakeRequestTargetsIssue` is a four-arm
+ * disjunction over `agent_wakeup_requests.payload`, and that column carries no
+ * index of any kind (`packages/db/src/schema/agent_wakeup_requests.ts`) — so
+ * the only object available is `agent_wakeup_requests_company_requested_idx`
+ * `(company_id, requested_at)`, and the JSONB arms are a per-row recheck on top
+ * of it. The activity read is the same shape against `activity_log`: its
+ * `action` allowlist and the `details ->> 'issueId'` arms are both unindexed,
+ * so it walks `(company_id, created_at)` too.
+ *
+ * ⚠️ **`LIMIT 51` does not bound either walk.** It short-circuits only while
+ * matches are DENSE near the top of the range. A row whose wakes are sparse in
+ * the window — which is most rows, and every row the operator is most likely to
+ * be investigating — is answered only after the whole 14-day company range has
+ * been walked and rechecked. Both tables are in the `large` bucket
+ * (`packages/db/src/table-size-estimates.ts`: ~13.2M and ~5.7M estimated rows)
+ * and `agent_wakeup_requests` is pruned by nothing, so that range grows
+ * without bound while the cap on what is RETURNED stays at 50.
+ *
+ * Measured on production 2026-11-08 (`GET /api/issues/:id/diagnostics/wakes`,
+ * `paperclip_http_request_duration_seconds_bucket`, 24 h): ~77% of requests
+ * answer under 2.5 s, and ~9% land in the **30–60 s** bucket. The upper bucket
+ * is the two reads being SEQUENTIAL `await`s, each separately bounded by the
+ * 30 s role default — so the route's worst case was 2x `statement_timeout`,
+ * and a caller saw `503` after a minute.
+ *
+ * ## Why 10 s, and why not 5
+ *
+ * The burn is the point: PEN-5591 measured that a statement's cost is paid IN
+ * FULL even when it is cancelled, and that this burn is the mechanism by which
+ * one route sheds the rest of the fleet. A diagnostic read — low traffic, never
+ * on a user request path — has no claim on 30 s of a pool whose contention was
+ * measured at 47–69 waiting queries against a max of 72 at the exact minutes
+ * this route returned `503`.
+ *
+ * ⚠️ But a degraded answer is still a FAILURE of what this surface is for, and
+ * the bound must not be tuned against quiet-period numbers. The 24 h histogram
+ * (p77 ≈ 2.5 s) is dominated by idle time and is the wrong calibration input:
+ * re-probed under live load on 2026-11-08T09:21Z, one row answered correctly in
+ * **14.3 s** having taken 1.6 s an hour earlier, while two others were cancelled
+ * at 30.9 s and 32.9 s.
+ *
+ * That is the whole tension. This instrument is needed MOST during the
+ * high-contention incidents that make it slowest, so a bound tight enough to
+ * look good against the median would blind the tool exactly when it is being
+ * read. 5 s was the first choice here and is rejected on that measurement: it
+ * would have degraded a read that succeeded.
+ *
+ * 10 s keeps the healthy-but-loaded reads and still cuts the worst case from
+ * ~60 s wall (two sequential 30 s budgets) to ~10 s wall and 20 connection-
+ * seconds. Re-tune it against the `degraded` rate once this has run in
+ * production — which is a thing the flag now makes measurable, and was not
+ * before.
+ *
+ * This bounds the burn; it does not remove it. Making the predicate
+ * index-served is the structural fix and is filed separately — see the module
+ * note on {@link wakeRequestTargetsIssue}.
+ */
+export const ISSUE_WAKE_DIAGNOSTICS_STATEMENT_TIMEOUT_MS = 10_000;
 export const ISSUE_SUBTREE_DIAGNOSTICS_MAX_DEPTH = 8;
 export const ISSUE_SUBTREE_DIAGNOSTICS_MAX_NODES = 100;
 export const ISSUE_SUBTREE_DIAGNOSTICS_MAX_BLOCKERS_PER_NODE = 20;
@@ -401,6 +465,32 @@ const ISSUE_CREATE_IDEMPOTENCY_KEY_CLEANUP_BATCH_SIZE = 500;
 const DELETED_ISSUE_COMMENT_BODY = "";
 const ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS = ["issue.tree_hold_wakeup_deferred"] as const;
 
+/**
+ * Match the wake requests that target `issueId`.
+ *
+ * ⚠️ **This predicate cannot be index-served, and that is the whole cost of
+ * `GET /api/issues/:id/diagnostics/wakes` (PEN-6085).** `payload` carries no
+ * index — not btree, not GIN, not an expression index — so each of these four
+ * arms is a per-row recheck that forces a heap fetch and a `jsonb` detoast.
+ * The only object the planner can use is
+ * `agent_wakeup_requests_company_requested_idx` `(company_id, requested_at)`,
+ * which bounds the walk to the caller's lookback window and nothing finer.
+ *
+ * The same four-arm shape is read by `heartbeat.ts`, `recovery/service.ts`,
+ * `task-watchdogs.ts` and `successful-run-handoff-state.ts`, so an index that
+ * serves it would serve those too — but `agent_wakeup_requests` is the largest
+ * table in the schema and the candidate shapes differ in what they cost to
+ * maintain, so that is a sized change rather than a drive-by. It is filed
+ * separately; {@link ISSUE_WAKE_DIAGNOSTICS_STATEMENT_TIMEOUT_MS} bounds the
+ * damage until it lands.
+ *
+ * ⛔ Do NOT collapse these arms to the `coalesce(...)` used by the blocked-inbox
+ * and subtree reads. `coalesce` returns the FIRST non-null key, so it matches
+ * only one identity per row; this disjunction matches a row whose nested
+ * `_paperclipWakeContext` names a different issue than its top-level `issueId`.
+ * Narrowing it would silently drop wake history from an audit surface, which is
+ * the failure this row exists to fix rather than reproduce.
+ */
 function wakeRequestTargetsIssue(issueId: string) {
   return sql`(
     ${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}
@@ -416,6 +506,55 @@ function wakeDiagnosticActivityTargetsIssue(issueId: string) {
     or ${activityLog.details} ->> 'issueId' = ${issueId}
     or ${activityLog.details} ->> 'rootIssueId' = ${issueId}
   )`;
+}
+
+/**
+ * Run one wake-diagnostics read under its own bounded transaction, degrading to
+ * an empty section instead of failing the request when the bound is hit
+ * (PEN-6085).
+ *
+ * `SET LOCAL statement_timeout` NARROWS the role default here rather than
+ * widening it, and it reverts with the transaction, so the tightened bound can
+ * never leak onto a pooled connection serving ordinary traffic.
+ *
+ * ⚠️ A degraded section is NOT a truncated one and the response reports them
+ * separately. `truncated` means "more rows exist beyond the cap" — the answer is
+ * correct as far as it goes. `degraded` means "this section could not be read at
+ * all", so an EMPTY list is not evidence of absence. Collapsing the two would
+ * let a timed-out read present as a confident "no wakes recorded", which is the
+ * worst possible failure for an audit surface whose whole job is reconstructing
+ * wakes that went missing.
+ *
+ * Only `57014` degrades. Any other error is a real fault and still throws.
+ *
+ * Exported for tests.
+ */
+export async function readBoundedWakeDiagnosticsSection<T>(
+  db: Db,
+  section: "wakeRequests" | "activityRecords",
+  issueId: string,
+  read: (tx: DbTransaction) => Promise<T[]>,
+): Promise<{ rows: T[]; degraded: boolean }> {
+  try {
+    const rows = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql.raw(`SET LOCAL statement_timeout = '${ISSUE_WAKE_DIAGNOSTICS_STATEMENT_TIMEOUT_MS}ms'`),
+      );
+      return read(tx);
+    });
+    return { rows, degraded: false };
+  } catch (error) {
+    if (findPgError(error)?.code !== STATEMENT_TIMEOUT_SQLSTATE) throw error;
+    logger.warn(
+      {
+        issueId,
+        section,
+        statementTimeoutMs: ISSUE_WAKE_DIAGNOSTICS_STATEMENT_TIMEOUT_MS,
+      },
+      "issue wake diagnostics section degraded on statement timeout",
+    );
+    return { rows: [], degraded: true };
+  }
 }
 
 function assertTransition(from: string, to: string) {
@@ -9923,61 +10062,79 @@ export function issueService(db: Db) {
       );
       const since = new Date(Date.now() - lookbackDays * 24 * 60 * 60 * 1000);
 
-      const wakeRows = await db
-        .select({
-          agentId: agentWakeupRequests.agentId,
-          source: agentWakeupRequests.source,
-          reason: agentWakeupRequests.reason,
-          status: agentWakeupRequests.status,
-          coalescedCount: agentWakeupRequests.coalescedCount,
-          runId: agentWakeupRequests.runId,
-          requestedAt: agentWakeupRequests.requestedAt,
-          claimedAt: agentWakeupRequests.claimedAt,
-          finishedAt: agentWakeupRequests.finishedAt,
-          error: agentWakeupRequests.error,
-        })
-        .from(agentWakeupRequests)
-        .where(
-          and(
-            eq(agentWakeupRequests.companyId, issue.companyId),
-            gte(agentWakeupRequests.requestedAt, since),
-            wakeRequestTargetsIssue(issue.id),
-          ),
-        )
-        .orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.createdAt))
-        .limit(maxWakeRequests + 1);
+      // PEN-6085: each read gets its own transaction, its own budget, and
+      // its own degradation. They run CONCURRENTLY -- they are independent, and
+      // as sequential `await`s the route's worst case was the SUM of two 30 s
+      // statement budgets, which is what put ~9% of requests in the 30-60 s
+      // bucket and returned `503` to the caller after a minute. Two
+      // transactions burn the same connection-seconds as one did sequentially;
+      // only the wall time halves.
+      const [wakeOutcome, activityOutcome] = await Promise.all([
+        readBoundedWakeDiagnosticsSection(db, "wakeRequests", issue.id, (tx) =>
+          tx
+            .select({
+              agentId: agentWakeupRequests.agentId,
+              source: agentWakeupRequests.source,
+              reason: agentWakeupRequests.reason,
+              status: agentWakeupRequests.status,
+              coalescedCount: agentWakeupRequests.coalescedCount,
+              runId: agentWakeupRequests.runId,
+              requestedAt: agentWakeupRequests.requestedAt,
+              claimedAt: agentWakeupRequests.claimedAt,
+              finishedAt: agentWakeupRequests.finishedAt,
+              error: agentWakeupRequests.error,
+            })
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, issue.companyId),
+                gte(agentWakeupRequests.requestedAt, since),
+                wakeRequestTargetsIssue(issue.id),
+              ),
+            )
+            .orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.createdAt))
+            .limit(maxWakeRequests + 1),
+        ),
+        readBoundedWakeDiagnosticsSection(db, "activityRecords", issue.id, (tx) =>
+          tx
+            .select({
+              action: activityLog.action,
+              entityType: activityLog.entityType,
+              entityId: activityLog.entityId,
+              agentId: activityLog.agentId,
+              runId: activityLog.runId,
+              details: activityLog.details,
+              createdAt: activityLog.createdAt,
+            })
+            .from(activityLog)
+            .where(
+              and(
+                eq(activityLog.companyId, issue.companyId),
+                gte(activityLog.createdAt, since),
+                inArray(activityLog.action, [...ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS]),
+                wakeDiagnosticActivityTargetsIssue(issue.id),
+              ),
+            )
+            .orderBy(desc(activityLog.createdAt))
+            .limit(maxActivityRecords + 1),
+        ),
+      ]);
 
-      const activityRows = await db
-        .select({
-          action: activityLog.action,
-          entityType: activityLog.entityType,
-          entityId: activityLog.entityId,
-          agentId: activityLog.agentId,
-          runId: activityLog.runId,
-          details: activityLog.details,
-          createdAt: activityLog.createdAt,
-        })
-        .from(activityLog)
-        .where(
-          and(
-            eq(activityLog.companyId, issue.companyId),
-            gte(activityLog.createdAt, since),
-            inArray(activityLog.action, [...ISSUE_WAKE_DIAGNOSTICS_ACTIVITY_ACTIONS]),
-            wakeDiagnosticActivityTargetsIssue(issue.id),
-          ),
-        )
-        .orderBy(desc(activityLog.createdAt))
-        .limit(maxActivityRecords + 1);
+      const wakeRows = wakeOutcome.rows;
+      const activityRows = activityOutcome.rows;
 
       return {
         wakeRequests: wakeRows.slice(0, maxWakeRequests) as IssueWakeDiagnosticsWakeRequestRow[],
         activityRecords: activityRows.slice(0, maxActivityRecords) as IssueWakeDiagnosticsActivityRow[],
         truncatedWakeRequests: wakeRows.length > maxWakeRequests,
         truncatedActivityRecords: activityRows.length > maxActivityRecords,
+        degradedWakeRequests: wakeOutcome.degraded,
+        degradedActivityRecords: activityOutcome.degraded,
         caps: {
           maxWakeRequests: ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
           maxActivityRecords: ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
           lookbackDays: ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
+          statementTimeoutMs: ISSUE_WAKE_DIAGNOSTICS_STATEMENT_TIMEOUT_MS,
         },
       };
     },
