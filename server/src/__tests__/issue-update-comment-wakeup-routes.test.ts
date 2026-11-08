@@ -2156,6 +2156,75 @@ describe("issue update comment wakeups", () => {
         );
       });
 
+      // A SETTLED REPLAY of a key raises no wake at all — the one that mattered
+      // was raised by the request that created the comment, against a row whose
+      // status has since been free to move. Both arms below re-send the same key
+      // onto a row that moved the OTHER way, and the thing being asserted is
+      // that the receipt declines to restate the verdict rather than computing a
+      // fresh one from a snapshot the original decision never saw. Found in
+      // review of #3541 (PEN-6035).
+      const replayAs = async (status: string, commentId: string) => {
+        const existing = makeIssue({
+          assigneeAgentId: ASSIGNEE_AGENT_ID,
+          assigneeUserId: null,
+          status,
+        });
+        mockIssueService.getById.mockResolvedValue(existing);
+        mockIssueService.addComment.mockResolvedValue({
+          id: commentId,
+          issueId: existing.id,
+          companyId: existing.companyId,
+          body,
+          deduplicated: true,
+          idempotencyProcessedAt: new Date().toISOString(),
+        });
+        mockIssueService.findMentionedAgents.mockResolvedValue([MENTIONED_AGENT_ID]);
+        return request(await createApp({
+          type: "agent",
+          agentId: ASSIGNEE_AGENT_ID,
+          companyId: existing.companyId,
+          source: "agent_key",
+        }))
+          .post(`/api/issues/${existing.id}/comments`)
+          .send({ body, idempotencyKey: `pen-6035-replay-${commentId}` });
+      };
+
+      it("a settled replay answers null, because the row may have CLOSED since the wake fired", async () => {
+        // Arm one of the reviewer's pair. The original keyed write landed on an
+        // open row and woke the agent. Classifying at response time once the row
+        // is `done` would put the name in `mentionsGrantedWithoutWake` — an
+        // affirmative "nobody was told" about a mention that demonstrably told
+        // somebody, which is worse than the silence this field replaced.
+        const res = await replayAs("done", "comment-granted-without-wake-replay-closed");
+
+        expect(res.status).toBe(200);
+        expect(res.body.mentionsGrantedWithoutWake).toBeNull();
+        expect(res.body.mentionsGrantedWithoutWake).not.toEqual([GRANTED_NAME]);
+        // The other three are re-derived per request and stay live on a replay.
+        expect(res.body.boundMentions).toEqual([GRANTED_NAME]);
+        expect(res.body.unboundMentions).toEqual([]);
+        expect(res.body.mentionsWithoutGrant).toEqual([]);
+      });
+
+      it("a settled replay answers null, because the row may have REOPENED since the wake was suppressed", async () => {
+        // Arm two, and the worse direction: the original landed on a closed row
+        // and woke nobody. On a now-open row a response-time classification
+        // returns `wake`, so the name falls out of BOTH lists — which the note
+        // on `addIssueCommentSchema` tells the reader is positive evidence that
+        // a wake was raised. `null` is what keeps that reading honest: it says
+        // the question was not answered, so the "both empty" rule does not apply.
+        // `todo`, not `in_progress`: the assignee commenting on its own
+        // in-progress row is separately required to carry a run id (401). Both
+        // are open statuses, and open is the whole of what this arm needs.
+        const res = await replayAs("todo", "comment-granted-without-wake-replay-reopened");
+
+        expect(res.status).toBe(200);
+        expect(res.body.mentionsGrantedWithoutWake).toBeNull();
+        expect(res.body.mentionsGrantedWithoutWake).not.toEqual([]);
+        expect(res.body.boundMentions).toEqual([GRANTED_NAME]);
+        expect(res.body.mentionsWithoutGrant).toEqual([]);
+      });
+
       it("is unconditional, so an absent key cannot mean an older server", async () => {
         const existing = makeIssue({
           assigneeAgentId: ASSIGNEE_AGENT_ID,
