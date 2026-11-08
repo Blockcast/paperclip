@@ -189,4 +189,99 @@ describeEmbeddedPostgres("multilingual issue routes", () => {
     expect(heartbeatContextRes.body.issue.description).toBe(description);
     expect(heartbeatContextRes.body.commentCursor.totalComments).toBe(2);
   });
+
+  // PEN-5954. Until this row, `multilineTextSchema` rewrote a literal
+  // backslash-n, backslash-r and backslash-r-backslash-n to a single U+000A
+  // during input validation, so the field stored a different value than the
+  // caller sent and nothing in the response reported it. These cases ride on
+  // the same embedded-Postgres instance above and assert the round trip by
+  // byte identity, read back through a separate request.
+  //
+  // `literalEscapeSpecimen` is deliberately a SINGLE line: every shape in it is
+  // a literal backslash sequence, so a stored value carrying any U+000A at all
+  // means the write path invented one.
+  const literalEscapeSpecimen = [
+    String.raw`\n`,
+    String.raw`\r`,
+    String.raw`\r\n`,
+    String.raw`\\n`,
+    String.raw`\t`,
+    String.raw`\\`,
+    String.raw`\"`,
+    String.raw`\u0041`,
+    String.raw`\U00000041`,
+    String.raw`\x41`,
+    String.raw`\0`,
+    String.raw`\b`,
+    String.raw`\f`,
+    String.raw`\v`,
+    String.raw`\a`,
+    String.raw`\/`,
+    String.raw`\'`,
+    String.raw`\N`,
+    String.raw`\z`,
+  ].join(" ");
+
+  it("stores literal backslash escapes in a title and description verbatim", async () => {
+    const createRes = await request(app)
+      .post(`/api/companies/${companyId}/issues`)
+      .send({
+        title: `escape specimen ${String.raw`\n`}`,
+        description: literalEscapeSpecimen,
+        status: "todo",
+        priority: "medium",
+      });
+
+    expect(createRes.status, JSON.stringify(createRes.body)).toBe(201);
+    expect(createRes.body.identifier).toBe("LNG-2");
+
+    const getRes = await request(app).get("/api/issues/LNG-2");
+    expect(getRes.status, JSON.stringify(getRes.body)).toBe(200);
+    expect(getRes.body.title).toBe(`escape specimen ${String.raw`\n`}`);
+    expect(getRes.body.description).toBe(literalEscapeSpecimen);
+    expect(getRes.body.description).not.toContain("\n");
+  });
+
+  it("stores literal backslash escapes in a comment body verbatim", async () => {
+    const commentRes = await request(app)
+      .post("/api/issues/LNG-2/comments")
+      .send({ body: literalEscapeSpecimen });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+
+    const commentsRes = await request(app).get("/api/issues/LNG-2/comments").query({ order: "asc" });
+    expect(commentsRes.status, JSON.stringify(commentsRes.body)).toBe(200);
+    expect(commentsRes.body.map((comment: { body: string }) => comment.body)).toEqual([
+      literalEscapeSpecimen,
+    ]);
+    expect(commentsRes.body[0].body).not.toContain("\n");
+  });
+
+  it("stores literal backslash escapes in a document body verbatim", async () => {
+    const documentRes = await request(app)
+      .put("/api/issues/LNG-2/documents/escape-specimen")
+      .send({
+        title: "Escape specimen",
+        format: "markdown",
+        body: literalEscapeSpecimen,
+      });
+    expect(documentRes.status, JSON.stringify(documentRes.body)).toBe(201);
+
+    const readRes = await request(app).get("/api/issues/LNG-2/documents/escape-specimen");
+    expect(readRes.status, JSON.stringify(readRes.body)).toBe(200);
+    expect(readRes.body.body).toBe(literalEscapeSpecimen);
+    expect(readRes.body.body).not.toContain("\n");
+  });
+
+  it("keeps a real line break a real line break", async () => {
+    // The control arm: the fix must not reach text that genuinely carries
+    // U+000A, or the assertions above would pass on a path that strips
+    // newlines instead of one that preserves bytes.
+    const realNewlines = "first line\nsecond line";
+    const commentRes = await request(app)
+      .post("/api/issues/LNG-2/comments")
+      .send({ body: realNewlines });
+    expect(commentRes.status, JSON.stringify(commentRes.body)).toBe(201);
+    expect(commentRes.body.body).toBe(realNewlines);
+    expect(commentRes.body.body.split("\n")).toHaveLength(2);
+  });
 });
