@@ -29,6 +29,7 @@ import {
   createEmbeddedPostgresLogBuffer,
   prepareEmbeddedPostgresNativeRuntime,
   repairIssuesLastActivityDrift,
+  repairCostEventProjectAttribution,
   reconcilePendingMigrationHistory,
   readInheritedTimeoutSettings,
   formatInheritedTimeoutSettings,
@@ -3155,6 +3156,32 @@ export async function startServer(): Promise<StartedServer> {
       })
         .then((result) => logger.info(result, "issues.last_activity_at drift repair pass finished"))
         .catch((err) => logger.error({ err }, "issues.last_activity_at drift repair pass failed"));
+      return () => {
+        stopped = true;
+      };
+    });
+  }
+
+  // cost_events run->project attribution backfill (PEN-5937). Fills the column
+  // `costs/by-project` now reads instead of rebuilding attribution from
+  // `activity_log` per request. Deliberately NOT in migration 0276: the
+  // derivation reads activity_log through `issues.id::text`, so in a migration
+  // transaction it is the BLO-51377 shape that froze activity_log writes for
+  // ~35 min. One pass of short autocommit batches per lease acquisition;
+  // idempotent via the `attributed_project_at` watermark, so a drained table
+  // costs one keyset query that reads no activity_log row at all. Stays armed
+  // rather than one-shot: 0276 lands before the image that populates the column
+  // forward, and rows written in that gap have a NULL watermark.
+  if (config.paperclipNodeRole !== "api") {
+    superviseLeased("cost-events-project-attribution-repair", () => {
+      let stopped = false;
+      void repairCostEventProjectAttribution(db as any, {
+        shouldStop: () => stopped,
+        onBatchError: (err, afterId) =>
+          logger.warn({ err, afterId }, "cost_events project attribution batch failed; skipped"),
+      })
+        .then((result) => logger.info(result, "cost_events project attribution pass finished"))
+        .catch((err) => logger.error({ err }, "cost_events project attribution pass failed"));
       return () => {
         stopped = true;
       };
