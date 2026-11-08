@@ -7609,7 +7609,8 @@ function ensureRegistry(): {
     });
     externalRuntimeReservationReleasePendingOldestAge = new Gauge({
       name: EXTERNAL_RUNTIME_RESERVATION_RELEASE_PENDING_OLDEST_AGE_METRIC,
-      help: "Age in seconds of the oldest reservation counted by " + EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC + ".",
+      help: "Seconds since the oldest reservation counted by " + EXTERNAL_RUNTIME_RESERVATIONS_RELEASE_PENDING_METRIC
+        + " became releasable (its last state change or its run finishing, whichever is later).",
       registers: [registry],
     });
     environmentLeasesOrphanedActive = new Gauge({
@@ -7622,7 +7623,8 @@ function ensureRegistry(): {
     });
     environmentLeasesOrphanedOldestAge = new Gauge({
       name: ENVIRONMENT_LEASES_ORPHANED_OLDEST_AGE_METRIC,
-      help: "Age in seconds of the oldest lease counted by " + ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC + ".",
+      help: "Seconds since the oldest lease counted by " + ENVIRONMENT_LEASES_ORPHANED_ACTIVE_METRIC
+        + " was orphaned (its run finished; acquisition time if the run has no finish time).",
       registers: [registry],
     });
     orphanedRuntimeResourceMetricsRefreshSuccess = new Gauge({
