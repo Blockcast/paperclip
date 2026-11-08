@@ -11,8 +11,12 @@
   (`## What changed` / `## Why` / `## How to test` / `## Related`) that
   `.github/scripts/check-pr-template.mjs` does not accept — the two sets do not
   intersect, so a body written from that template fails all five section checks
-  and red-lights the `review` gate. Only the `## PR Body Template` section below
-  differs from the company copy; everything else is carried verbatim.
+  and red-lights the `review` gate.
+
+  Two sections now differ from the company copy: `## PR Body Template`, for the
+  reason above, and `## Labels`, whose company text names a six-name taxonomy
+  that does not exist in this repository (PEN-6116). Everything else is carried
+  verbatim.
 
   Because this file shadows the company copy for this repository, company-level
   edits to `pr-conventions.md` do NOT reach agents here. Mirror them into this
@@ -116,7 +120,31 @@ Notes on the three sections that fail most often:
 
 ## Labels
 
-Apply one primary label: `feature`, `bug`, `docs`, `chore`, `infra`, `agent`.
+**Optional, and the label set is per-repo.** Nothing requires a label on a PR
+here: `check-pr-template`, `check-pr-linked-issue` and `check-pr-dedup-search`
+read the title and the body, never the labels, and no other gate reads them
+either. A PR carrying no label passes every check.
+
+So apply one only where it genuinely helps a reader — and read the repo's own
+set first. `gh pr edit --add-label <name>` fails outright on a name the repo
+does not define, and this document is injected into agents working several
+repositories whose label sets are not known to agree:
+
+```
+gh label list --repo <owner>/<repo>
+```
+
+For `Blockcast/paperclip` that read returned 11 labels on 2026-11-08 — `bug`,
+`do-not-merge`, `documentation`, `duplicate`, `enhancement`, `good first issue`,
+`help wanted`, `invalid`, `production-deploy-stall`, `question`, `wontfix`.
+Treat that as a dated observation rather than a list to pick from: the set
+changes without notice, and nothing updates this paragraph when it does.
+
+Two of those are machine-owned and neither describes what a PR is about.
+`do-not-merge` is in `SKIP_LABELS` (`scripts/land-clean-prs.mjs`), so applying
+it makes the automated lander skip the PR. `production-deploy-stall` is applied
+by `.github/scripts/deploy-stall-record.mjs` to the stall record it opens. Do
+not reach for either as a description.
 
 ## Review Workflow
 
