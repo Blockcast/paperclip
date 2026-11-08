@@ -24,8 +24,9 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { eq } from "drizzle-orm";
-import { approvalPayloadRevisions, approvals, companies, createDb } from "@paperclipai/db";
+import { approvalPayloadRevisions, approvals, companies, createDb, issueApprovals, issues } from "@paperclipai/db";
 import { approvalService } from "../services/approvals.js";
+import { issueApprovalService } from "../services/issue-approvals.js";
 import { approvalGatesEquivalent } from "../services/approval-gate-reconciler.js";
 import {
   asStoredGate,
@@ -244,6 +245,66 @@ describeEmbeddedPostgres("approvalService.updatePayload", () => {
     // And the cheap view stays cheap — the marker is two scalar columns, not a
     // relaxation of the payload omission that is the whole reason `summary` exists.
     expect(editedRow).not.toHaveProperty("payload");
+  }, 60_000);
+
+  /**
+   * ⭐ PEN-6107, the same invariant on the OTHER decision surface — the one the
+   * summary test above cannot reach (Ally, PR 3550).
+   *
+   * `GET /issues/:id/approvals` is what `ApprovalCard` renders from on `IssueDetail`
+   * and in `CommentThread`: the card that carries the working Approve and Reject
+   * buttons, and the surface `paperclipListIssueApprovals` reads. It has its own
+   * explicit column set in a different service, so fixing `listSummary` does nothing
+   * for it, and nothing fails when it falls behind — `payloadRevision` is declared
+   * non-optional on the shared type, so the compiler cannot see the omission, and an
+   * absent key reads to the client exactly like an unedited `0`.
+   *
+   * ⚠️ The sibling suite structurally cannot hold this. `issue-approvals-service.test.ts`
+   * mocks `db.select`, so it spreads whatever the fixture supplies and reports the
+   * keys present however the projection is written. The defect lives in the column
+   * set the mock bypasses, so this assertion only means anything through a real
+   * database.
+   */
+  it("⭐ reports the edit marker on the issue-linked view, by key presence", async () => {
+    const companyId = await seedCompany();
+    const untouched = await seedApproval(companyId, new Date("2026-11-01T00:00:00.000Z"), "never edited");
+    const edited = await seedApproval(companyId, new Date("2026-11-02T00:00:00.000Z"), "stale evidence");
+
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Decide the card from the issue page",
+      status: "in_progress",
+      priority: "medium",
+    });
+    await db.insert(issueApprovals).values([
+      { companyId, issueId, approvalId: untouched },
+      { companyId, issueId, approvalId: edited },
+    ]);
+
+    await approvalService(db).updatePayload(edited, { title: "corrected in place" }, editor);
+
+    const rows = await issueApprovalService(db).listApprovalsForIssue(issueId);
+    const editedRow = rows.find((row) => row.id === edited);
+    const untouchedRow = rows.find((row) => row.id === untouched);
+
+    // Present on BOTH rows, for the same reason the summary test checks both: a
+    // caller cannot tell "reported clean" from "not reported at all" by value.
+    expect(editedRow).toHaveProperty("payloadRevision");
+    expect(editedRow).toHaveProperty("payloadEditedAt");
+    expect(untouchedRow).toHaveProperty("payloadRevision");
+    expect(untouchedRow).toHaveProperty("payloadEditedAt");
+
+    expect(editedRow?.payloadRevision).toBe(1);
+    expect(editedRow?.payloadEditedAt).not.toBeNull();
+    expect(untouchedRow?.payloadRevision).toBe(0);
+    expect(untouchedRow?.payloadEditedAt).toBeNull();
+
+    // Unlike `summary`, this view does carry the payload — and the redaction
+    // projection it runs every row through still applies.
+    expect(editedRow).toHaveProperty("payload");
+    expect(editedRow?.payload).toEqual({ title: "corrected in place" });
   }, 60_000);
   /**
    * ⭐ The review finding this suite existed to be unable to catch (Ally, PR 3456).
