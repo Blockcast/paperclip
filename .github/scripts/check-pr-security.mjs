@@ -150,43 +150,98 @@ const TEST_FILE_RE = /\.(test|spec)\.(ts|js|tsx|jsx)$|\/(?:__tests__|tests?)\//;
 // this arm fire on `RegExp.prototype.exec` and on a Postgres client's
 // `pg.exec()` -- 94 lines across 53 tracked test files that never mention
 // `child_process` (PEN-6177). A noisy advisory detector trains its readers to
-// dismiss it, which costs the true positives too, so the arm is split in two:
+// dismiss it, which costs the true positives too, so the arm is split in three:
 //
 //   1. a call with NO receiver -- `execSync(...)` after a destructured import,
-//      and the spread form `...spawnSync(...)` -- reported on its own, and
-//   2. a MEMBER call -- `cp.exec(...)` after `import * as cp from
+//      and the spread form `...spawnSync(...)` -- reported on its own;
+//   2. a member call on a SHELL-CAPABLE receiver -- `Bun.spawn(...)` --
+//      reported on its own, because the receiver names the mechanism; and
+//   3. any other member call -- `cp.exec(...)` after `import * as cp from
 //      "node:child_process"` -- reported only when the same patch also brings
 //      `child_process` in.
 //
-// Honest bound on (2): this scanner only ever sees `file.patch`, so an import
-// that sits outside the hunks is invisible to it and a member call in such a
-// patch is not reported. (1) is unaffected, and a destructured import is the
-// dominant shape, so the uncorroborated member call is the only gap.
+// All three accept the optional-call form, `execSync?.(...)`, which still
+// invokes (PEN-6204 item 2).
+//
+// Honest bound -- these are the gaps this arm is KNOWN to have. It is not a
+// proof that there are no others, and a reader who treats it as one stops
+// looking:
+//
+//   * The main gap is (3): this scanner only ever sees `file.patch`, so an
+//     import that sits outside the hunks is invisible to it and a member call
+//     in such a patch is not reported. (1) and (2) are unaffected, and a
+//     destructured import is the dominant shape.
+//   * (2)'s receiver allowlist is `Bun` alone. Measured on this tree
+//     2026-11-08: zero `Bun.*` references and zero other shell-capable
+//     receivers, against 20 `execSync(` call sites as a positive control
+//     (PEN-6204 item 1). A runtime namespace nobody here uses yet is not
+//     covered, and the list has to be extended by hand when one arrives.
+//   * Indirection defeats all three -- `const e = execSync; e(cmd)`, a call
+//     reached through `globalThis[name]`, or a name rebuilt from fragments.
+//   * `fork` is a real `child_process` entry point and is deliberately NOT in
+//     the name set: measured on this tree, zero corroborated `*.fork(` call
+//     sites against five bare `fork(` ones, so today it buys noise only
+//     (PEN-6204 item 5).
 const SHELL_EXEC_FNS = 'execSync|spawnSync|execFileSync|execFile|exec|spawn';
-const SHELL_EXEC_CALL_RE = new RegExp(String.raw`\+.*(?:(?<![.\w$])|(?<=\.\.\.))(?:${SHELL_EXEC_FNS})\(`);
-const SHELL_EXEC_MEMBER_CALL_RE = new RegExp(String.raw`\+.*\.(?:${SHELL_EXEC_FNS})\(`);
+// Receivers that identify the shell mechanism without corroboration.
+const SHELL_EXEC_RECEIVERS = 'Bun';
+// `(` or the optional-call `?.(`; both invoke.
+const CALL_OPEN = String.raw`(?:\?\.)?\(`;
+// `^...` under /m: a patch line that is genuinely ADDED. Unanchored, a `+`
+// anywhere earlier in a context or removed line satisfied `\+.*` and the arm
+// reported a line the PR does not introduce (PEN-6204 item 4).
+const ADDED_LINE = String.raw`^\+.*`;
+
+const SHELL_EXEC_CALL_RE = new RegExp(
+  String.raw`${ADDED_LINE}(?:(?<![.\w$])|(?<=\.\.\.))(?:${SHELL_EXEC_FNS})${CALL_OPEN}`, 'm');
+const SHELL_EXEC_RECEIVER_CALL_RE = new RegExp(
+  String.raw`${ADDED_LINE}(?<![.\w$])(?:${SHELL_EXEC_RECEIVERS})\??\.(?:${SHELL_EXEC_FNS})${CALL_OPEN}`, 'm');
+const SHELL_EXEC_MEMBER_CALL_RE = new RegExp(
+  String.raw`${ADDED_LINE}\??\.(?:${SHELL_EXEC_FNS})${CALL_OPEN}`, 'm');
 const CHILD_PROCESS_RE = /child_process/;
 
+// The arms that may report in THIS patch. Returning the list rather than a
+// boolean is what lets the flag name the line it matched: reporting a line
+// matched by an arm that did not fire would point the reader at the wrong one.
+function shellExecArms(patch) {
+  const arms = [SHELL_EXEC_CALL_RE, SHELL_EXEC_RECEIVER_CALL_RE];
+  if (CHILD_PROCESS_RE.test(patch)) arms.push(SHELL_EXEC_MEMBER_CALL_RE);
+  return arms;
+}
+
 function matchesShellExec(patch) {
-  if (SHELL_EXEC_CALL_RE.test(patch)) return true;
-  return CHILD_PROCESS_RE.test(patch) && SHELL_EXEC_MEMBER_CALL_RE.test(patch);
+  return shellExecArms(patch).some(re => re.test(patch));
 }
 
 const SUSPICIOUS_PATTERNS = [
-  { name: 'outbound-network', re: /\+.*(fetch\(|axios\.|http\.request|https\.request)/ },
-  { name: 'env-var-read', re: /\+.*process\.env\.(?!(?:NODE_ENV|CI|TEST|VITEST|npm_))([A-Z_]{4,})/ },
-  { name: 'shell-exec', match: matchesShellExec },
-  { name: 'absolute-file-read', re: /\+.*(readFile|readFileSync)\s*\(\s*["'`]?\// },
+  { name: 'outbound-network', re: /^\+.*(fetch\(|axios\.|http\.request|https\.request)/m },
+  { name: 'env-var-read', re: /^\+.*process\.env\.(?!(?:NODE_ENV|CI|TEST|VITEST|npm_))([A-Z_]{4,})/m },
+  { name: 'shell-exec', match: matchesShellExec, arms: shellExecArms },
+  { name: 'absolute-file-read', re: /^\+.*(readFile|readFileSync)\s*\(\s*["'`]?\//m },
 ];
+
+// The matched line, so a reader can act on the flag without re-deriving the
+// pattern from this file and grepping for it (PEN-6204 item 3). Same shape and
+// same 120-char cap as `scanSecrets` above; `formatFlagList` already renders a
+// `line`, and `formatCheckRunFlag` deliberately still omits it, so the check-run
+// summary is unchanged.
+const FLAG_LINE_MAX_LENGTH = 120;
+
+function firstMatchingLine(patch, arms) {
+  for (const line of patch.split('\n')) {
+    if (arms.some(re => re.test(line))) return line.slice(0, FLAG_LINE_MAX_LENGTH);
+  }
+  return null;
+}
 
 export function scanTestPatterns(files) {
   const flags = [];
   for (const file of files) {
     if (!TEST_FILE_RE.test(file.filename) || !file.patch) continue;
-    for (const { name, re, match } of SUSPICIOUS_PATTERNS) {
-      if (match ? match(file.patch) : re.test(file.patch)) {
-        flags.push({ check: 'suspicious-test', file: file.filename, pattern: name });
-      }
+    for (const { name, re, match, arms } of SUSPICIOUS_PATTERNS) {
+      if (!(match ? match(file.patch) : re.test(file.patch))) continue;
+      const line = firstMatchingLine(file.patch, arms ? arms(file.patch) : [re]);
+      flags.push({ check: 'suspicious-test', file: file.filename, pattern: name, ...(line ? { line } : {}) });
     }
   }
   return flags;
