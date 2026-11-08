@@ -1,0 +1,38 @@
+-- PEN-5937: back the repair's keyset scan, so it can run on an INTERVAL instead of once
+-- per lease acquisition.
+--
+-- `repairCostEventProjectAttribution` drives off
+--
+--   SELECT ... FROM cost_events
+--    WHERE attributed_project_at IS NULL AND id > $1
+--    ORDER BY id LIMIT 500
+--
+-- and `attributed_project_at` is in no index, so `cost_events_pkey` can serve the
+-- ordering and the keyset bound but never the filter -- every pass walks the whole
+-- primary key and heap-fetches each row to test a column that, once the backfill drains,
+-- is non-NULL almost everywhere. The cost is paid in full to return nothing, and it grows
+-- with the table.
+--
+-- That was tolerable at one pass per deploy. It is not tolerable on an interval, and the
+-- interval is required: the forward writer covers only the rows it writes, while
+-- `POST /companies/:id/cost-events` (which takes a `heartbeatRunId` and writes no
+-- attribution), replicas still serving the pre-0276 image during a roll, and rows the
+-- repair defers because their run is still in flight all keep arriving with a NULL
+-- watermark -- and a NULL effective project is DROPPED by `byProject`'s inner join, not
+-- bucketed. See the module header for the full argument.
+--
+-- PARTIAL on exactly the repair's predicate, so the index holds only rows still awaiting
+-- a watermark. It is therefore largest during the initial backfill and collapses to the
+-- handful of in-flight rows afterwards -- the opposite of the growth curve above, and the
+-- reason this does not become its own maintenance cost on the `cost_events` write path.
+-- `id` is the ordering column, so the scan is a bounded index range rather than a sort.
+--
+-- Plain, not CONCURRENTLY, for 0254's and 0266's reason: Drizzle migrations are
+-- transactional, so CONCURRENTLY is unavailable here. `cost_events` is in the MEDIUM
+-- bucket (packages/db/src/table-size-estimates.ts), not the large one that
+-- `large-create-index-not-concurrently` guards -- and the partial predicate means the
+-- build writes an entry only for an unwatermarked row, which at this point is every row
+-- (0276 added the column nullable, with no backfill) and after the first repair pass is
+-- almost none. Production can precreate this exact idempotent index online beforehand;
+-- `IF NOT EXISTS` makes that a no-op rather than a conflict.
+CREATE INDEX IF NOT EXISTS "cost_events_unattributed_idx" ON "cost_events" USING btree ("id") WHERE "cost_events"."attributed_project_at" is null;

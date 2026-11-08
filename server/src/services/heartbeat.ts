@@ -7990,6 +7990,15 @@ export function resolveLedgerCostStatus(input: {
 }
 
 /**
+ * Canonical lowercase UUID with the dash positions pinned -- exactly the strings
+ * `uuid::text` renders. Guards the `::uuid` cast in the issue probe below; see that
+ * function's note on why the probe is pkey-driven. Mirrors `CANONICAL_UUID_PATTERN` in
+ * packages/db/src/cost-events-project-attribution-repair.ts, which must stay identical.
+ */
+const CANONICAL_UUID_PATTERN =
+  "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$";
+
+/**
  * PEN-5937: the run's project, resolved ONCE at finalization and written down.
  *
  * `issueId`/`projectId` are the run's WRITE-TIME scope and are unchanged -- they land on
@@ -8006,11 +8015,25 @@ export function resolveLedgerCostStatus(input: {
  * `statement_timeout`.
  *
  * Finalization is the correct point: the run is terminal, so its activity_log rows are
- * already committed and the answer cannot change afterwards.
+ * already committed and the answer cannot change afterwards. The backfill defers any row
+ * whose run has NOT finished for the same reason -- the watermark is write-once, so an
+ * attribution derived from partial activity would be frozen wrong.
  *
  * The ordering here must match `repairCostEventProjectAttribution`
  * (packages/db/src/cost-events-project-attribution-repair.ts) exactly, or a row's
  * attribution would depend on whether the writer or the backfill reached it first.
+ *
+ * ⚠️ The issue probe is driven from `issues_pkey`, by casting `activity_log.entity_id` to
+ * `uuid` -- NOT by the `issues.id::text = activity_log.entity_id` form the deleted
+ * read-time query used. That form defeats the pkey, so every evaluation reached `issues`
+ * through `company_id` alone and scanned every issue the company owns. Moving an
+ * unindexed probe out of a per-request path and into EVERY run finalization would have
+ * relocated this row's cliff rather than removing it. `activity_log.entity_id` is `text`
+ * and holds ids of every entity type, so the cast is guarded by a regex inside a `CASE`
+ * -- the one construct whose evaluation order Postgres guarantees -- and the pattern is
+ * lowercase-canonical, exactly the strings `uuid::text` renders, so the rewrite admits no
+ * row the text comparison would have rejected. A non-match yields NULL and matches
+ * nothing, as the text comparison did. Keep this identical to the lateral in the backfill.
  */
 async function resolveRunActivityProjectId(
   db: Db,
@@ -8025,7 +8048,7 @@ async function resolveRunActivityProjectId(
       and(
         eq(activityLog.entityType, "issue"),
         eq(issues.companyId, companyId),
-        sql`${issues.id}::text = ${activityLog.entityId}`,
+        sql`${issues.id} = case when ${activityLog.entityId} ~ ${CANONICAL_UUID_PATTERN} then ${activityLog.entityId}::uuid end`,
       ),
     )
     .where(

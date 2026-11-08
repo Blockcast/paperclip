@@ -82,6 +82,7 @@ export {
 } from "./issues-last-activity-drift-repair.js";
 export {
   repairCostEventProjectAttribution,
+  startCostEventProjectAttributionRepair,
   type CostEventProjectAttributionRepairResult,
 } from "./cost-events-project-attribution-repair.js";
 export { issueRelations } from "./schema/issue_relations.js";
