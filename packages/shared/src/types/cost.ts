@@ -326,6 +326,22 @@ export interface CostByProject {
   /** `null` exactly when {@link CostByProject.projectId} is — the unattributed bucket has no name to render. */
   projectName: string | null;
   costCents: number;
+  /**
+   * PEN-6084: TOTAL windowed spend, repeated identically on every row, and equal to
+   * `costs/summary`'s `spendCents` over the same `from`/`to`.
+   *
+   * It is computed in the SAME statement as the rows, reading `cost_events` directly
+   * rather than through this aggregate's joins, so `sum(rows[].costCents) ===
+   * windowTotalCents` is a real check that nothing was dropped AND is immune to a
+   * concurrent write. Comparing the rows against a separately-fetched `costs/summary` is
+   * not: those are two requests and so two snapshots, and an event committing between
+   * them reported a mismatch that did not exist.
+   *
+   * It rides on the rows rather than in an envelope so this response stays an array for
+   * existing consumers. Consequence: an EMPTY response carries no total, which is sound
+   * here only because the window total is zero exactly when the row set is empty.
+   */
+  windowTotalCents: number;
   /** PEN-4902: list-price CONSUMPTION for the same rows — the quantity enforcement reads. See {@link CostSummary.consumptionCents}. */
   consumptionCents: number;
   inputTokens: number;
