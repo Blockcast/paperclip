@@ -38,6 +38,7 @@ import {
   extractMentionBindingReport,
   createIssueWorkProductSchema,
   workProductExternalIdLookupQuerySchema,
+  canonicalizeWorkProductExternalIdForWrite,
   createIssueLabelSchema,
   createAcceptedPlanDecompositionSchema,
   checkoutIssueSchema,
@@ -117,7 +118,7 @@ import {
   recordUnrecognizedInteractionPayloadKeys,
   type IssueDuplicateCandidateLookupOutcome,
 } from "../services/metrics.js";
-import { STATEMENT_TIMEOUT_SQLSTATE } from "../lib/db-retry.js";
+import { findPgError, STATEMENT_TIMEOUT_SQLSTATE } from "../lib/db-retry.js";
 import * as serviceIndex from "../services/index.js";
 import {
   accessService,
@@ -905,6 +906,27 @@ function requiresPaperclipAttachmentMetadata(input: {
   const type = typeof input.type === "string" ? input.type : fallback?.type ?? null;
   const provider = typeof input.provider === "string" ? input.provider : fallback?.provider ?? null;
   return type === "artifact" && provider === "paperclip";
+}
+
+/**
+ * Migration 0216's partial unique index on
+ * (company_id, issue_id, provider, type, external_id) WHERE external_id IS NOT NULL.
+ *
+ * PEN-6119: `createForIssue` is a plain INSERT (only the GitHub webhook's
+ * `upsertByExternalId` names this as a conflict target), so a second row for
+ * one pull request on one issue raises 23505. The error handler treats 23505 as
+ * non-transient and answers a bare 500 -- which says nothing about what to do,
+ * on a request whose remedy is "patch the row you already have". Canonicalising
+ * on write widens the set of inputs that land here: a pull-request URL and the
+ * canonical key used to be two distinct keys, and are now one.
+ */
+const WORK_PRODUCT_EXTERNAL_IDENTITY_CONSTRAINT =
+  "issue_work_products_issue_provider_type_external_id_uniq";
+
+function isWorkProductExternalIdentityConflict(error: unknown) {
+  const pgError = findPgError(error);
+  return pgError?.code === "23505"
+    && pgError.constraint === WORK_PRODUCT_EXTERNAL_IDENTITY_CONSTRAINT;
 }
 
 const attachmentArtifactMetadataInputSchema = z.object({
@@ -11592,13 +11614,47 @@ export function issueRoutes(
     const createdByRunId = await resolveWorkProductCreatedByRunId(req, res, issue.companyId, req.body, "create");
     if (createdByRunId === undefined) return;
     createInput.createdByRunId = createdByRunId;
+    // PEN-6119. The lookup only ever asks for `owner/repo#123`, so a key stored
+    // in any other shape is a row nothing can reach -- `owners: []` with
+    // `withheldForAuthorizationCount: 0`, indistinguishable from "this pull
+    // request is unowned". Canonicalise here, where `type` and `provider` are
+    // both known, rather than in the schema: the update schema is this one made
+    // partial, so a PATCH carries neither field.
+    const externalIdForWrite = canonicalizeWorkProductExternalIdForWrite({
+      type: createInput.type,
+      provider: createInput.provider,
+      externalId: createInput.externalId,
+    });
+    if (!externalIdForWrite.ok) {
+      res.status(400).json({
+        error: externalIdForWrite.message,
+        code: "work_product_external_id_not_canonical",
+      });
+      return;
+    }
+    if (externalIdForWrite.externalId !== undefined) {
+      createInput.externalId = externalIdForWrite.externalId;
+    }
     if (requiresPaperclipAttachmentMetadata(createInput)) {
       createInput.metadata = await canonicalizePaperclipArtifactMetadata({
         issue,
         metadata: req.body.metadata ?? null,
       });
     }
-    const product = await workProductsSvc.createForIssue(issue.id, issue.companyId, createInput);
+    const product = await workProductsSvc.createForIssue(issue.id, issue.companyId, createInput)
+      .catch((error: unknown) => {
+        if (!isWorkProductExternalIdentityConflict(error)) throw error;
+        return "external_identity_conflict" as const;
+      });
+    if (product === "external_identity_conflict") {
+      res.status(409).json({
+        error: `This issue already owns a ${createInput.provider} ${createInput.type} work product `
+          + `with externalId ${JSON.stringify(createInput.externalId)}. Patch that row rather than `
+          + "creating a second one.",
+        code: "work_product_external_identity_conflict",
+      });
+      return;
+    }
     if (!product) {
       res.status(422).json({ error: "Invalid work product payload" });
       return;
@@ -11782,6 +11838,30 @@ export function issueRoutes(
     const createdByRunId = await resolveWorkProductCreatedByRunId(req, res, existing.companyId, req.body, "update");
     if (createdByRunId === undefined && Object.prototype.hasOwnProperty.call(req.body, "createdByRunId")) return;
     if (createdByRunId !== undefined) patch.createdByRunId = createdByRunId;
+    // PEN-6119, the same guard as the create route. The effective type/provider
+    // come from the patch where it names them and from the stored row where it
+    // does not, which is why this cannot live in the schema.
+    //
+    // It judges only the value this request WRITES. A PATCH that leaves
+    // `externalId` alone is not refused because the row's existing key is
+    // non-canonical: that would block unrelated edits -- a title fix, a status
+    // move -- on the legacy rows written before this guard existed, which is a
+    // regression and repairs nothing.
+    if (Object.prototype.hasOwnProperty.call(req.body, "externalId")) {
+      const externalIdForWrite = canonicalizeWorkProductExternalIdForWrite({
+        type: patch.type ?? existing.type,
+        provider: patch.provider ?? existing.provider,
+        externalId: patch.externalId,
+      });
+      if (!externalIdForWrite.ok) {
+        res.status(400).json({
+          error: externalIdForWrite.message,
+          code: "work_product_external_id_not_canonical",
+        });
+        return;
+      }
+      patch.externalId = externalIdForWrite.externalId;
+    }
     if (requiresPaperclipAttachmentMetadata(patch, existing)) {
       if (patch.metadata !== undefined) {
         patch.metadata = await canonicalizePaperclipArtifactMetadata({
@@ -11807,7 +11887,20 @@ export function issueRoutes(
       // evidence about their own issue. Clearing it demotes the row to an
       // ordinary actor-authored work product, which the review ignores.
       sourceTrust: sourceTrust ?? null,
+    }).catch((error: unknown) => {
+      if (!isWorkProductExternalIdentityConflict(error)) throw error;
+      return "external_identity_conflict" as const;
     });
+    if (product === "external_identity_conflict") {
+      res.status(409).json({
+        error: `This issue already owns a ${patch.provider ?? existing.provider} `
+          + `${patch.type ?? existing.type} work product with externalId `
+          + `${JSON.stringify(patch.externalId)}. Patch that row rather than pointing a second one `
+          + "at the same artifact.",
+        code: "work_product_external_identity_conflict",
+      });
+      return;
+    }
     if (!product) {
       res.status(404).json({ error: "Work product not found" });
       return;
