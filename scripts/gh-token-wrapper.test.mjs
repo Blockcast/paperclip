@@ -3242,3 +3242,97 @@ test("an --input payload whose body is ordinary prose still passes (PEN-5724)", 
     assert.match(proc.stdout, /ARGS=api -X POST/);
   });
 });
+
+// --- `-F` takes a file in `pr` mode only (PEN-5906) -------------------------
+//
+// PEN-5724 narrowed the bare-`-` buffer to tokens following `--body-file`,
+// `-F` or `--input` — true of `pr` mode, false of `api`, where `-F` is
+// `--field key=value` and reads a file only through an `@-` VALUE. So
+// `gh api … -F -` is a malformed field that real gh rejects without touching
+// stdin, and buffering on it hung on an open pipe exactly as `--body -` did.
+// `-f` (`--raw-field`) never reads a file in any mode or spelling.
+for (const [label, args] of [
+  ["-F -", ["api", "repos/o/r", "-F", "-"]],
+  ["-F-", ["api", "repos/o/r", "-F-"]],
+  ["-f -", ["api", "repos/o/r", "-f", "-"]],
+  ["-f-", ["api", "repos/o/r", "-f-"]],
+  ["--body-file -", ["api", "repos/o/r", "--body-file", "-"]],
+]) {
+  test(`gh api ${label} does not block on an open stdin pipe (PEN-5906)`, async () => {
+    await withTempDirAsync(async (dir) => {
+      const proc = await runGuardWithOpenStdin(dir, args);
+      assert.equal(proc.timedOut, false, `the wrapper slurped stdin and hung on api ${label}`);
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.match(proc.stdout, /ARGS=api repos\/o\/r/);
+    });
+  });
+}
+
+// The mirror image, and the direction that would fail open: `--input` is an
+// `api` flag with no counterpart on `pr review`/`pr comment`.
+test("gh pr comment --input - does not block on an open stdin pipe (PEN-5906)", async () => {
+  await withTempDirAsync(async (dir) => {
+    const proc = await runGuardWithOpenStdin(dir, ["pr", "comment", "5", "--input", "-"]);
+    assert.equal(proc.timedOut, false, "the wrapper slurped stdin and hung on pr comment --input -");
+  });
+});
+
+// --- The `--input` body extractor reaches the TOP-LEVEL body (PEN-5906) -----
+//
+// The first revision reused `query`'s `s/.*"body"…//`, whose `.*` is greedy and
+// so matched the LAST `"body"` member on the line. A `pulls/{n}/reviews`
+// payload carrying inline comments is exactly that shape — and it is a credited
+// surface, so the heading-on-first-line case the extractor exists to catch was
+// invisible again whenever a `comments` array followed it.
+for (const [label, payload] of [
+  [
+    "a trailing comments array",
+    {
+      body: "## Ally — Consolidated PR Review\n0 Critical",
+      comments: [{ path: "a", position: 1, body: "nit" }],
+    },
+  ],
+  [
+    "a leading comments array",
+    {
+      comments: [{ path: "a", position: 1, body: "nit" }],
+      body: "## Ally — Consolidated PR Review\n0 Critical",
+    },
+  ],
+  [
+    "an attestation beside a comments array",
+    {
+      body: "Reviewed head: 2ee3d4561f0e4a1b9c8d7e6f5a4b3c2d1e0f9a8b\n",
+      comments: [{ path: "a", position: 1, body: "nit" }],
+    },
+  ],
+]) {
+  test(`gh api --input with a first-line heading and ${label} is refused (PEN-5906)`, () => {
+    withTempDir((dir) => {
+      const file = path.join(dir, "payload.json");
+      writeFileSync(file, JSON.stringify(payload));
+      assertRefused(runGuard(dir, ["api", "-X", "POST", "repos/o/r/pulls/5/reviews", "--input", file]), EVIDENCE);
+    });
+  });
+}
+
+test("an --input review payload with inline comments and prose bodies still passes (PEN-5906)", () => {
+  // Emitting every `"body"` member must not turn an inline review comment into
+  // a refusal on its own — only a reviewer-shaped one.
+  withTempDir((dir) => {
+    const file = path.join(dir, "payload.json");
+    writeFileSync(
+      file,
+      JSON.stringify({
+        body: "I am the author; CI is green.",
+        comments: [
+          { path: "a", position: 1, body: "nit: rename this" },
+          { path: "b", position: 2, body: "why not a map here?" },
+        ],
+      }),
+    );
+    const proc = runGuard(dir, ["api", "-X", "POST", "repos/o/r/pulls/5/reviews", "--input", file]);
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.match(proc.stdout, /ARGS=api -X POST/);
+  });
+});

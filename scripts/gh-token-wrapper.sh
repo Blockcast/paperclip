@@ -499,9 +499,23 @@ reviewer_evidence_input_graphql() {
 # to it, while the identical heading one line lower matched, because the `\n`
 # before it becomes a real newline. Cutting the prefix off puts the body's first
 # line at column 0, where the `^` anchors can see it.
+#
+# EVERY `"body"` member is emitted, one per line, not just one of them. The
+# first revision used `query`'s single `s/.*"body"…//` and so matched the LAST
+# member on the line, because `.*` is greedy — and a `pulls/{n}/reviews` payload
+# carrying inline comments is exactly that shape, `{"body":"…","comments":
+# [{…,"body":"nit"}]}`, on a credited surface (PEN-5906). Splitting ahead of
+# each member and stripping the prefix line-wise has no "which one" to get
+# wrong, so it reaches the top-level body whether it is first, last or neither.
+# A value's own `\"body\"` would split too; that costs a spurious line in a
+# refusal check that only ever asks whether SOME line matches, so it cannot
+# produce a false pass. `query` keeps the single-match form: a payload carries
+# one `query`, and the variables ceiling above is the real gap there.
 reviewer_evidence_input_body() {
   reviewer_evidence_input_payloads "$@" |
-    sed -n 's/.*"body"[[:blank:]]*:[[:blank:]]*"//p'
+    sed 's/"body"[[:blank:]]*:[[:blank:]]*"/\
+&/g' |
+    sed -n 's/^"body"[[:blank:]]*:[[:blank:]]*"//p'
 }
 
 # `-` means stdin, which by this point lives in REVIEWER_EVIDENCE_STDIN. An
@@ -572,26 +586,52 @@ refuse_reviewer_evidence() {
 # forever (measured rc=124 under `timeout`). The failure was a hang rather than
 # a wrong answer, which is worse: it is invisible until something kills it, and
 # only an armed seat ever reached it. So the bare `-` is accepted only after a
-# flag that takes a file, while the self-contained spellings below still stand
-# on their own.
+# flag that takes a file.
+#
+# WHICH FLAGS TAKE A FILE IS MODE-DEPENDENT, and the first revision's "only
+# these three take a file" was true of `pr` mode only. Read off real gh's own
+# help (`gh api --help`, `gh pr comment --help`):
+#
+#   pr review / pr comment   -F, --body-file file   "-" reads stdin
+#                            -b, --body text        a string, never a file
+#   api                      --input file           "-" reads stdin
+#                            -F, --field key=value  a FIELD; reads a file only
+#                                                   via the `@<path>`/`@-` VALUE
+#                            -f, --raw-field        never reads a file at all
+#
+# So `gh api … -F -` is `--field` holding a malformed value — real gh rejects it
+# without ever touching stdin — and buffering on it hung the same way
+# `--body -` did (PEN-5906). `-F-`, `--body-file=-`, `--input=-` and `-f-` are
+# the same claim in self-contained spellings, so they are gated the same way;
+# `-f-` names stdin in no mode and drops out entirely.
+#
+# `@-`/`body=@-`/`query=@-` stay unconditional. They are `--field` VALUES, where
+# `@-` genuinely is stdin, and the over-broad case — `-f body=@-`, which real gh
+# sends as the literal string — buffers a body that is then inspected rather
+# than missed. That is the fail-closed direction and it is pinned by a test;
+# narrowing it is a separate change from closing a hang.
 REVIEWER_EVIDENCE_STDIN=''
 buffer_stdin_for_reviewer_evidence() {
   # Nothing downstream reads the buffer unless the guard is armed, and the
   # comments above `reviewer_evidence_armed` promise an unarmed seat pays
   # nothing — so make that true here rather than only for the matching.
   reviewer_evidence_armed || return 0
+  # Derived the same way as in `refuse_reviewer_evidence`, from the subcommand.
+  reviewer_evidence_mode=api
+  case "${1:-} ${2:-}" in "pr review" | "pr comment") reviewer_evidence_mode=pr ;; esac
   reviewer_evidence_prev=''
   for a in "$@"; do
     reviewer_evidence_is_stdin=no
     case "${a}" in
-      @- | body=@- | query=@- | --body-file=- | --input=- | -F- | -f-)
-        reviewer_evidence_is_stdin=yes
-        ;;
+      @- | body=@- | query=@-) reviewer_evidence_is_stdin=yes ;;
+    esac
+    case "${reviewer_evidence_mode}:${a}" in
+      pr:--body-file=- | pr:-F- | api:--input=-) reviewer_evidence_is_stdin=yes ;;
+    esac
+    case "${a}" in
       -)
-        # Only these three take a file, so only after one of them is a bare `-`
-        # stdin. `--body`/`-b` take a string and are deliberately absent.
-        case "${reviewer_evidence_prev}" in
-          --body-file | -F | --input) reviewer_evidence_is_stdin=yes ;;
+        case "${reviewer_evidence_mode}:${reviewer_evidence_prev}" in
+          pr:--body-file | pr:-F | api:--input) reviewer_evidence_is_stdin=yes ;;
         esac
         ;;
     esac
