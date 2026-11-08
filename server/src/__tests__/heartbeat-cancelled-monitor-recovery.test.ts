@@ -743,24 +743,181 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
     expect(residueOf((await readIssue(issueId)).executionState).recoveryEmittedAt).toBeTruthy();
   });
 
-  it("creates exactly one carrier when two passes run concurrently", async () => {
-    const { companyId, agentId } = await seedCompanyAndAgent();
-    const issueId = await seedCancelledResidue(companyId, agentId);
+  /**
+   * PEN-5457 item 2 — two passes over ONE obligation.
+   *
+   * `setInterval` starts tick N+1 whether or not tick N settled, and the
+   * startup pass can overlap the first periodic one, so two passes reading the
+   * same unstamped residue is the normal case rather than the exotic one.
+   *
+   * `index.ts`'s `cancelledMonitorRecoveryInFlight` latch is a COST fix and
+   * says so: its comment's premise is that the duplicate carrier is made
+   * impossible by `issues_active_stranded_issue_recovery_uq` rather than by
+   * the latch, and that the loser's price is a 23505 recorded as a misleading
+   * `failed`. That premise was carried by prose alone. The suite's only
+   * concurrency case asserted `a.recovered + b.recovered >= 1`, a disjunction
+   * satisfied by the reuse path, by the unique index, and by a pass that threw
+   * and was swallowed — the three outcomes the premise is a claim ABOUT.
+   *
+   * A real `Promise.all` cannot settle that: which branch the loser takes is a
+   * property of how two connections interleave, so the mechanism is whatever
+   * the scheduler happened to pick — both branches were observed from the same
+   * unchanged case while this was written. So the first two cases below reach
+   * one branch each DETERMINISTICALLY, and the `Promise.all` case keeps only
+   * the assertions that hold whichever branch it lands on.
+   */
+  describe("two passes over one obligation (PEN-5457)", () => {
+    /**
+     * The 23505 as the pass sees it. Drizzle wraps the driver error, so the
+     * constraint name is never on the outermost error — the same `cause` walk
+     * `isOpenRoutineExecutionLockConflict` does in `services/issues.ts`.
+     */
+    function uniqueViolationOf(err: unknown): { code: string; constraint?: string } | null {
+      const seen = new Set<unknown>();
+      let current: unknown = err;
+      while (current && typeof current === "object" && !seen.has(current)) {
+        seen.add(current);
+        const maybe = current as {
+          code?: string;
+          constraint?: string;
+          constraint_name?: string;
+          cause?: unknown;
+        };
+        if (maybe.code === "23505") {
+          return { code: maybe.code, constraint: maybe.constraint ?? maybe.constraint_name };
+        }
+        current = maybe.cause;
+      }
+      return null;
+    }
 
-    // `setInterval` starts tick N+1 whether or not tick N settled, and the
-    // startup pass can overlap the first periodic one. `index.ts` single-flights
-    // this pass for cost; `issues_active_stranded_issue_recovery_uq` is what
-    // makes a duplicate carrier impossible even when the latch is bypassed, as
-    // it is here and as it would be across two replicas.
-    const [a, b] = await Promise.all([
-      heartbeat.reconcileCancelledIssueMonitorRecoveries(),
-      heartbeat.reconcileCancelledIssueMonitorRecoveries(),
-    ]);
+    function failureLines(warn: { mock: { calls: unknown[][] } }) {
+      return warn.mock.calls.filter(
+        (call) => typeof call[1] === "string" && call[1].includes("recovery failed"),
+      );
+    }
 
-    expect(await readRecoveryIssues(issueId)).toHaveLength(1);
-    // One obligation, one carrier, and no pass invented a second one.
-    expect(a.recovered + b.recovered).toBeGreaterThanOrEqual(1);
-    expect(residueOf((await readIssue(issueId)).executionState).recoveryEmittedAt).toBeTruthy();
+    it("reuses the winner's carrier when a second pass overlaps the emit window", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = await seedCancelledResidue(companyId, agentId);
+
+      // `beforeRecover` fires between this pass's selection and its emit, so a
+      // whole second pass run inside it IS the overlap — the loser selected the
+      // obligation while it was still unstamped and reaches its emit after the
+      // winner has already committed a carrier.
+      const overlapping: Array<Awaited<ReturnType<typeof heartbeat.reconcileCancelledIssueMonitorRecoveries>>> = [];
+      const info = vi.spyOn(logger, "info").mockImplementation(() => logger);
+      try {
+        const loser = await heartbeat.reconcileCancelledIssueMonitorRecoveries({
+          beforeRecover: async () => {
+            overlapping.push(await heartbeat.reconcileCancelledIssueMonitorRecoveries());
+          },
+        });
+
+        // Both passes recovered, and that is the point: the loser did not fail
+        // and did not skip — `findOpenIssueMonitorRecoveryIssue` handed it the
+        // winner's row. The two assertions TOGETHER are what name the
+        // mechanism: had the loser created, the unique index would have made it
+        // `failed: 1`; had it created successfully, there would be two carriers.
+        expect(overlapping).toHaveLength(1);
+        expect(overlapping[0]).toMatchObject({ scanned: 1, recovered: 1, unowned: 0, skipped: 0, failed: 0 });
+        expect(loser).toMatchObject({ scanned: 1, recovered: 1, unowned: 0, skipped: 0, failed: 0 });
+        expect(await readRecoveryIssues(issueId)).toHaveLength(1);
+
+        // And WHICH pass was the loser is pinned rather than inferred: the
+        // stamp CASes on `recoveryEmittedAt is null`, so exactly one of the two
+        // can write it and the other says so.
+        const casLines = info.mock.calls.filter(
+          (call) => typeof call[1] === "string" && call[1].includes("handoff stamp lost a CAS"),
+        );
+        expect(casLines).toHaveLength(1);
+        expect(casLines[0]![0]).toMatchObject({ issueId });
+
+        // One obligation, one discharge, recorded once.
+        const residue = residueOf((await readIssue(issueId)).executionState);
+        expect(residue.recoveryEmittedAt).toBeTruthy();
+        expect(residue.recoveryDisposition).toBe("recovery_issue");
+      } finally {
+        info.mockRestore();
+      }
+    });
+
+    it("lets the unique index, not the finder, refuse the duplicate carrier", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = await seedCancelledResidue(companyId, agentId);
+
+      // The finder and the index do NOT cover the same rows, and this is the
+      // gap: `findOpenIssueMonitorRecoveryIssue` filters through
+      // `visibleIssueCondition()`, which excludes a non-null `harnessKind`;
+      // `issues_active_stranded_issue_recovery_uq` does not mention that
+      // column. So a carrier shaped like this is invisible to the read and
+      // still counted by the index — the one in-tree state that reaches the
+      // insert's losing branch without racing two connections for it.
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId,
+        title: `Carry forward the wake cancelled on ${issueId}`,
+        status: "todo",
+        priority: "high",
+        assigneeAgentId: agentId,
+        parentId: issueId,
+        originKind: "stranded_issue_recovery",
+        originId: issueId,
+        originFingerprint: "issue_monitor:cancelled",
+        harnessKind: "skill_test",
+      });
+
+      const warn = vi.spyOn(logger, "warn").mockImplementation(() => logger);
+      try {
+        const result = await heartbeat.reconcileCancelledIssueMonitorRecoveries();
+
+        // The latch's stated cost, now measured rather than asserted in a
+        // comment: the loser pays the whole selection and emit, and records the
+        // constraint violation as `failed` — an outcome that reads like a bug
+        // and is not one.
+        const failures = failureLines(warn);
+        expect(failures).toHaveLength(1);
+        expect(uniqueViolationOf((failures[0]![0] as { err?: unknown }).err)).toMatchObject({
+          code: "23505",
+          constraint: "issues_active_stranded_issue_recovery_uq",
+        });
+
+        expect(result).toMatchObject({ scanned: 1, recovered: 0, unowned: 0, failed: 1 });
+        // No second carrier: the index refused the insert outright.
+        expect(await readRecoveryIssues(issueId)).toHaveLength(1);
+        // And the obligation stays OWED. The stamp runs after the emit, so a
+        // refused carrier must not read as a discharged handoff — the next pass
+        // re-drives it, which is the property that makes a 23505 survivable.
+        expect(residueOf((await readIssue(issueId)).executionState).recoveryEmittedAt ?? null).toBeNull();
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it("creates exactly one carrier when two passes genuinely overlap", async () => {
+      const { companyId, agentId } = await seedCompanyAndAgent();
+      const issueId = await seedCancelledResidue(companyId, agentId);
+
+      const [a, b] = await Promise.all([
+        heartbeat.reconcileCancelledIssueMonitorRecoveries(),
+        heartbeat.reconcileCancelledIssueMonitorRecoveries(),
+      ]);
+
+      // Deliberately only the interleaving-independent half. WHICH branch each
+      // pass took is the scheduler's choice here; the two cases above pin that.
+      expect(await readRecoveryIssues(issueId)).toHaveLength(1);
+      expect(a.recovered + b.recovered).toBeGreaterThanOrEqual(1);
+      expect(residueOf((await readIssue(issueId)).executionState).recoveryEmittedAt).toBeTruthy();
+
+      // Every scanned row lands in a NAMED outcome on both passes. Without
+      // this, a pass that threw somewhere the counters do not model is
+      // indistinguishable from one that was correctly deduped — which is the
+      // third reading the old disjunction could not exclude.
+      for (const pass of [a, b]) {
+        expect(pass.recovered + pass.skipped + pass.unowned + pass.autoDischarged + pass.failed)
+          .toBe(pass.scanned);
+      }
+    });
   });
 
   it("does not let rows it can never discharge starve the ones it can", async () => {

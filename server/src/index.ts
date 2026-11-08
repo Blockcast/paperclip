@@ -1375,6 +1375,14 @@ export async function startServer(): Promise<StartedServer> {
   // counter, not corruption. Every pass is idempotent and re-drivable from
   // persisted state, so a tick that finds one running skips it with no loss.
   // The startup pass holds it too, so the first periodic tick cannot double it.
+  //
+  // PEN-5457: both claims above are pinned by tests rather than asserted here.
+  // `server/src/__tests__/heartbeat-cancelled-monitor-recovery.test.ts`, under
+  // "two passes over one obligation", drives the carrier-reuse branch and the
+  // unique index's 23505-recorded-as-`failed` branch deterministically. The
+  // suite's only concurrency case used to assert a disjunction that those two
+  // branches AND a swallowed throw all satisfied, so it could not tell which
+  // mechanism it was exercising — which is the whole of what this comment says.
   let cancelledMonitorRecoveryInFlight = false;
   // 10 scheduler intervals. Above the normal case (a sweep routinely outlives
   // one interval — that is what the latch is for) and far below the hours a
