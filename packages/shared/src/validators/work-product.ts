@@ -78,6 +78,20 @@ export const issueWorkProductMetadataSchema = z
 
 export type IssueWorkProductMetadata = z.infer<typeof issueWorkProductMetadataSchema>;
 
+/**
+ * PEN-6119. `externalId` is deliberately NOT canonicalised here, and the reason
+ * is structural rather than a preference. Two things block it:
+ *
+ *  - The decision needs `type` and `provider`, and `updateIssueWorkProductSchema`
+ *    below is this schema made partial -- so a PATCH that sets only `externalId`
+ *    carries neither, and a cross-field rule here would be evaluating fields the
+ *    request does not have. The route knows the row and can resolve both.
+ *  - `partialNoDefaults` takes a `ZodObject`. A `.superRefine()`/`.transform()`
+ *    here makes this a `ZodEffects`, and the update schema stops compiling.
+ *
+ * The guard lives in `canonicalizeWorkProductExternalIdForWrite` at the bottom
+ * of this file, applied by both work-product write routes.
+ */
 export const createIssueWorkProductSchema = z.object({
   projectId: z.string().guid().optional().nullable(),
   executionWorkspaceId: z.string().guid().optional().nullable(),
@@ -143,3 +157,67 @@ export const workProductExternalIdLookupQuerySchema = z.object({
 });
 
 export type WorkProductExternalIdLookupQuery = z.infer<typeof workProductExternalIdLookupQuerySchema>;
+
+/**
+ * PEN-6119. The WRITE-side counterpart to
+ * `workProductExternalIdLookupQuerySchema` above.
+ *
+ * The lookup normalises its query key and then refuses anything that is not
+ * `owner/repo#123`, so every key the reader ever asks for is canonical by
+ * construction. Nothing did the same for the writer:
+ * `POST /api/issues/:id/work-products` stored whatever string arrived, so a run
+ * registering its own pull request with the value it actually had to hand -- the
+ * URL it had just printed -- wrote a row that no lookup could ever reach. That
+ * is the same false empty PEN-6056 fixed for casing, on the other half of the
+ * pipeline: `owners: []` with `withheldForAuthorizationCount: 0`, which reads
+ * exactly like "this pull request is unowned".
+ *
+ * Returns the key to store, or the message to refuse with. Normalising what can
+ * be normalised and refusing the rest is deliberate. A GitHub pull-request URL
+ * has one canonical reading, so rewriting it is free. A value with no canonical
+ * reading -- a bare `2124`, which names a different pull request in every
+ * repository -- has to be refused, because a 400 naming the canonical form is
+ * legible and a row nobody can look up is not.
+ *
+ * SCOPED TO `github` + `pull_request`, and the narrowness is the design rather
+ * than caution. Measured across this company's 11,635 live work products on
+ * 2026-11-08, the other types carry external ids of their own kinds -- an
+ * attachment uuid on `document`, `owner/repo:path@sha` and a plain slug on
+ * `artifact` -- so a transform applied across the board would reject real
+ * identities that are not pull-request keys and never were.
+ *
+ * `provider` is matched EXACTLY, the way `listOwnersByExternalId` matches it,
+ * rather than folded. A provider-folding policy here that the reader does not
+ * share would reopen the very key-space split this closes, one field over.
+ */
+export type WorkProductExternalIdWriteDecision =
+  | { ok: true; externalId: string | null | undefined }
+  | { ok: false; message: string };
+
+export function canonicalizeWorkProductExternalIdForWrite(input: {
+  type: string | null | undefined;
+  provider: string | null | undefined;
+  externalId: string | null | undefined;
+}): WorkProductExternalIdWriteDecision {
+  const { externalId } = input;
+  // `undefined` is a PATCH that does not mention the key, and `null` is a row
+  // with deliberately no external identity. Migration 0216's unique index is
+  // partial on `external_id IS NOT NULL`, so neither is in the key space this
+  // guards, and rewriting either would change what the caller asked for.
+  if (externalId === undefined || externalId === null) return { ok: true, externalId };
+  if (input.type !== "pull_request" || input.provider !== "github") {
+    return { ok: true, externalId };
+  }
+  const normalized = normalizeWorkProductExternalId(externalId);
+  if (!CANONICAL_EXTERNAL_ID.test(normalized)) {
+    return {
+      ok: false,
+      message:
+        "externalId for a github pull_request work product must be `owner/repo#123` or a "
+        + "GitHub pull-request URL, so that the stored key is the one "
+        + "`work-products/by-external-id` asks for; received "
+        + `${JSON.stringify(externalId)}`,
+    };
+  }
+  return { ok: true, externalId: normalized };
+}

@@ -516,6 +516,7 @@ export {
   updateIssueWorkProductSchema,
   workProductExternalIdLookupQuerySchema,
   normalizeWorkProductExternalId,
+  canonicalizeWorkProductExternalIdForWrite,
   attachmentArtifactWorkProductMetadataSchema,
   issueWorkProductTypeSchema,
   issueWorkProductStatusSchema,
@@ -524,6 +525,7 @@ export {
   type IssueWorkProductMetadata,
   type UpdateIssueWorkProduct,
   type WorkProductExternalIdLookupQuery,
+  type WorkProductExternalIdWriteDecision,
 } from "./work-product.js";
 
 export {
