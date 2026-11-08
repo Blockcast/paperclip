@@ -30,10 +30,12 @@ const SECRET_PATTERNS = [
   //   - it never refuses anything — this script exits 0 whether or not it flags
   //     (see the header), so a flag is a silent advisory;
   //   - it reads the PR diff, so it never sees a push to a branch with no PR;
-  //   - it is repo-local. Blockcast/onprem-k8s and
+  //   - it is repo-local. Measured 2026-11-08: Blockcast/onprem-k8s and
   //     Blockcast/penstock-llm-proxy-core run gitleaks with `useDefault = true`
   //     (penstock's config states a finding blocks the merge); this repo has no
-  //     .gitleaks.toml and no gitleaks workflow, so this line is all there is;
+  //     .gitleaks.toml and no gitleaks workflow, so this line is all there is.
+  //     That is a DATED reading of two OTHER repos, which can gain or lose a
+  //     scanner without this file changing — re-read them before relying on it;
   //   - it is name-anchored on detection, which github-egress-scrub.ts
   //     documents as unsound for exactly that: material hides under names
   //     nobody enumerated. Measured 2026-11-08, one synthetic value — it flags
