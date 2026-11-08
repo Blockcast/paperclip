@@ -2283,7 +2283,7 @@ test("the covered verdict scopes its claim to servers actually behind the proxy 
         // Nor the narrower one: a null handle leaves `process.env` untouched,
         // so on a pod that already sets GITHUB_HOST the loser HAS one -- just
         // not the proxy's (PEN-5950).
-        assert.doesNotMatch(proc.stdout, /got no `GITHUB_HOST`/);
+        assert.doesNotMatch(proc.stdout, /\bno `?GITHUB_HOST/);
         assert.equal(proc.status, 0);
       });
     });
