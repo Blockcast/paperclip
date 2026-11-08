@@ -1522,6 +1522,8 @@ export function normalizeHeartbeatTimerSchedulerExclusion(reason: string | null 
     : UNKNOWN_HEARTBEAT_TIMER_SCHEDULER_EXCLUSION;
 }
 export const AGENT_NO_USAGE_STREAK_METRIC = "paperclip_agent_zero_token_completed_run_streak";
+export const AGENT_NO_USAGE_STREAK_UPDATED_METRIC =
+  "paperclip_agent_zero_token_completed_run_streak_last_updated_timestamp_seconds";
 export const EXTERNAL_RUNTIME_RESERVATION_EVENTS_METRIC = "paperclip_external_runtime_reservation_events_total";
 export const EXTERNAL_RUNTIME_RESERVATIONS_ACTIVE_METRIC = "paperclip_external_runtime_reservations_active";
 export const EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC = "paperclip_external_runtime_reservation_oldest_age_seconds";
@@ -5869,6 +5871,7 @@ let heartbeatPostTerminalRunEventDropped: Counter<"status"> | null = null;
 let heartbeatTimerChecked: Counter | null = null;
 let heartbeatTimerEnqueued: Counter | null = null;
 let agentZeroTokenCompletedRunStreak: Gauge<"agent_id" | "adapter"> | null = null;
+let agentZeroTokenCompletedRunStreakUpdated: Gauge<"agent_id" | "adapter"> | null = null;
 let externalRuntimeReservationEvents: Counter<"event"> | null = null;
 let k8sIsolationConflictDeferrals: Counter<"key_shape" | "cause"> | null = null;
 let k8sIsolationConflictDeferralAttempt: Histogram<"key_shape"> | null = null;
@@ -6104,6 +6107,7 @@ function ensureRegistry(): {
   heartbeatTimerCheckedCounter: Counter;
   heartbeatTimerEnqueuedCounter: Counter;
   zeroTokenCompletedRunStreakGauge: Gauge<"agent_id" | "adapter">;
+  zeroTokenCompletedRunStreakUpdatedGauge: Gauge<"agent_id" | "adapter">;
   externalRuntimeReservationEventsCounter: Counter<"event">;
   k8sIsolationConflictDeferralsCounter: Counter<"key_shape" | "cause">;
   k8sIsolationConflictDeferralAttemptHistogram: Histogram<"key_shape">;
@@ -6278,6 +6282,7 @@ function ensureRegistry(): {
     || !heartbeatTimerChecked
     || !heartbeatTimerEnqueued
     || !agentZeroTokenCompletedRunStreak
+    || !agentZeroTokenCompletedRunStreakUpdated
     || !externalRuntimeReservationEvents
     || !k8sIsolationConflictDeferrals
     || !k8sIsolationConflictDeferralAttempt
@@ -6677,6 +6682,17 @@ function ensureRegistry(): {
       help:
         "Current count of consecutive terminal heartbeat runs for an agent that completed with zero token usage. "
         + "Alerts at >=3 catch poisoned-session or pre-model throttle loops within minutes (BLO-10891).",
+      labelNames: ["agent_id", "adapter"],
+      registers: [registry],
+    });
+    // BLO-54745: each worker pod exports its own streak child and only rewrites it when
+    // that pod finalizes a run, so a pod that stopped finalizing for an agent keeps a
+    // frozen value. This timestamp lets the alert pick the pod that wrote most recently.
+    agentZeroTokenCompletedRunStreakUpdated = new Gauge({
+      name: AGENT_NO_USAGE_STREAK_UPDATED_METRIC,
+      help:
+        "Unix time this process last wrote " + AGENT_NO_USAGE_STREAK_METRIC + " for the agent. "
+        + "Select the series with the newest value across worker pods (BLO-54745).",
       labelNames: ["agent_id", "adapter"],
       registers: [registry],
     });
@@ -9361,6 +9377,7 @@ function ensureRegistry(): {
     heartbeatTimerCheckedCounter: heartbeatTimerChecked,
     heartbeatTimerEnqueuedCounter: heartbeatTimerEnqueued,
     zeroTokenCompletedRunStreakGauge: agentZeroTokenCompletedRunStreak,
+    zeroTokenCompletedRunStreakUpdatedGauge: agentZeroTokenCompletedRunStreakUpdated,
     externalRuntimeReservationEventsCounter: externalRuntimeReservationEvents,
     k8sIsolationConflictDeferralsCounter: k8sIsolationConflictDeferrals,
     k8sIsolationConflictDeferralAttemptHistogram: k8sIsolationConflictDeferralAttempt,
@@ -10120,15 +10137,19 @@ export function recordAgentZeroTokenCompletedRunStreak(
     adapter: typeof input.adapter === "string" && input.adapter.length > 0 ? input.adapter : "unknown",
   };
   const streak = Number.isFinite(input.streak) ? Math.max(0, Math.floor(input.streak)) : 0;
-  const gauge = ensureRegistry().zeroTokenCompletedRunStreakGauge;
+  const metrics = ensureRegistry();
+  const gauge = metrics.zeroTokenCompletedRunStreakGauge;
+  const updatedGauge = metrics.zeroTokenCompletedRunStreakUpdatedGauge;
   // Retire the previous adapter's child before minting the new one, so an agent
   // that changed adapterType stops exporting a frozen series under the old label.
   const previousAdapter = zeroTokenStreakAdapterByAgentId.get(labels.agent_id);
   if (previousAdapter !== undefined && previousAdapter !== labels.adapter) {
     gauge.remove({ agent_id: labels.agent_id, adapter: previousAdapter });
+    updatedGauge.remove({ agent_id: labels.agent_id, adapter: previousAdapter });
   }
   zeroTokenStreakAdapterByAgentId.set(labels.agent_id, labels.adapter);
   gauge.set(labels, streak);
+  updatedGauge.set(labels, Date.now() / 1000);
   return { ...labels, streak };
 }
 
@@ -12896,6 +12917,7 @@ export function __resetMetricsForTest(): void {
   heartbeatTimerChecked = null;
   heartbeatTimerEnqueued = null;
   agentZeroTokenCompletedRunStreak = null;
+  agentZeroTokenCompletedRunStreakUpdated = null;
   zeroTokenStreakAdapterByAgentId.clear();
   externalRuntimeReservationEvents = null;
   k8sIsolationConflictDeferrals = null;
