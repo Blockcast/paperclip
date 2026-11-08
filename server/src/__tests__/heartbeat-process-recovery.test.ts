@@ -2306,6 +2306,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect((await heartbeat.getRun(runId))?.errorCode).toBe("process_lost");
   });
 
+  it("does not renew a pre-launch reservation past the hard ceiling (BLO-54719)", async () => {
+    const reservedAt = new Date(Date.now() - 46 * 60 * 1000);
+    const { companyId, agentId, runId } = await seedRunFixture({
+      adapterType: "opencode_k8s",
+      processPid: null,
+      processGroupId: null,
+      includeIssue: false,
+      lastOutputAt: null,
+    });
+    const reservation = await seedPrelaunchReservation({ companyId, agentId, runId, state: "launching", reservedAt });
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId);
+    await heartbeat.renewPrelaunchReservationOwnership();
+    heartbeat.__test_unsafelyUntrackActiveRunExecution(runId);
+
+    const [row] = await db
+      .select({ updatedAt: externalRuntimeReservations.updatedAt })
+      .from(externalRuntimeReservations)
+      .where(eq(externalRuntimeReservations.id, reservation.id));
+    expect(row.updatedAt.getTime()).toBe(reservation.updatedAt.getTime());
+  });
+
   it("reaps an in-process pre-adapter run past the hard ceiling (BLO-33820 wedge bound)", async () => {
     const reservedAt = new Date(Date.now() - 46 * 60 * 1000);
     const { companyId, agentId, runId } = await seedRunFixture({

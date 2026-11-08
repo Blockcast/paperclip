@@ -2889,7 +2889,9 @@ const STARVATION_RECOVERY_ESCALATION_MS = 10 * 60 * 1000;
 //      protecting a Job that already EXISTS.
 //   2. `isolationSetupGraceActive` in the reservation reclaim sweep — keyed on
 //      `reservation.updatedAt`, which last moves at
-//      `markExternalRuntimeReservationLaunching`.
+//      `markExternalRuntimeReservationLaunching`, except that a live owner's
+//      pre-launch renewal (BLO-54719) re-stamps it every 30s until a Job
+//      identity lands or EXTERNAL_LIFECYCLE_HARD_STALE_MS from reservedAt.
 //   3. The orphaned-lease reclaim sweep — keyed on the newer of the lease's
 //      `acquired_at`/`last_used_at`, which is strictly LATER than (2)'s clock.
 // (2) and (3) are the inverse of (1): they bound a runtime that is STARTING,
@@ -29466,7 +29468,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           //
           // The four launch-path anchors are straight-line inside `executeRun`:
           //   1. `markExternalRuntimeReservationLaunching` — the last
-          //      `reservation.updatedAt` bump before the Job.
+          //      lifecycle `reservation.updatedAt` bump before the Job (the
+          //      BLO-54719 owner renewal may also re-stamp it until then).
           //   2. `acquireForRun` — lease created, `acquired_at` =
           //      `last_used_at` = now.
           //   3. `realizeForRun` — realize → provision (`timeoutMs: 300_000`,
@@ -30086,8 +30089,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * whose run this process is executing. Must run on EVERY worker, not only
    * the scheduler-lease leader: the reaper reads the stamp from the other pod.
    * Other writes to `updated_at` are one-shot lifecycle transitions, so they
-   * can extend the shield by at most PRELAUNCH_OWNER_STALE_MS, and the
-   * EXTERNAL_LIFECYCLE_HARD_STALE_MS ceiling from reservedAt still bounds it.
+   * can extend the shield by at most PRELAUNCH_OWNER_STALE_MS. The renewal
+   * itself stops at EXTERNAL_LIFECYCLE_HARD_STALE_MS from reservedAt, the same
+   * ceiling the reaper applies.
    */
   async function renewPrelaunchReservationOwnership() {
     const runIds = [...activeRunExecutions];
@@ -30101,6 +30105,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         isNull(externalRuntimeReservations.jobName),
         isNull(externalRuntimeReservations.jobUid),
         inArray(externalRuntimeReservations.state, ["reserved", "launching"]),
+        // Never renew past the reaper's own ceiling, so no updatedAt-keyed
+        // reader is extended beyond it by a wedged in-process owner.
+        gt(externalRuntimeReservations.reservedAt, new Date(Date.now() - EXTERNAL_LIFECYCLE_HARD_STALE_MS)),
       ));
   }
 
@@ -47029,6 +47036,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     reconcileOrphanedEnvironmentLeases,
     refreshOrphanedRuntimeResourceMetrics,
     resumeRunningExternalRuntimeRuns,
+    renewPrelaunchReservationOwnership,
 
     /**
      * Test-only handle on the in-process await tracking Set populated by
@@ -47041,7 +47049,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      * the test mimic the in-flight-await state without spinning up a real
      * `executeRun` flow. Do not call from production code.
      */
-    renewPrelaunchReservationOwnership,
     __test_unsafelyTrackActiveRunExecution: (runId: string) =>
       activeRunExecutions.add(runId),
     /** Test-only inverse of the above: simulate a run owned by ANOTHER worker. */
