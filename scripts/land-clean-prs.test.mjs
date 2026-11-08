@@ -2118,6 +2118,61 @@ describe("approvalAttestsHead — dating a human approval (PEN-5997)", () => {
   });
 });
 
+describe("the unattested-head fallback must not reach the code-owner gate (PEN-6105)", () => {
+  // The fixture PEN-5997 could not have: every timeline it added either
+  // attests the head or is empty, so `unsatisfiedOwners` was never handed the
+  // fallback stamp that poisons it. Here the timeline carries a real
+  // `committed` event and NONE of them is the head.
+  const committed = (at, sha) => ({ event: "committed", sha, committer: { date: at } });
+  const approval = (submitted_at) => ({
+    state: "APPROVED",
+    user: { login: "kkroo", id: 1845185, type: "User" },
+    // Re-anchored forward by GitHub onto the current head, which is exactly
+    // why this equality proves nothing on its own (PEN-5997).
+    commit_id: HEAD,
+    submitted_at,
+  });
+  // No `codeownerRules`, so `impliedOwners` is null and the CODEOWNERS filter
+  // is out of the way: what these assert is the head-dating and nothing else.
+  const pr = (timeline, submitted_at) => ({
+    headRefOid: HEAD,
+    timeline,
+    reviews: [approval(submitted_at)],
+    reviewRequests: [{ login: "kkroo" }],
+  });
+  const UNATTESTED = [committed("2026-09-13T01:00:00Z", OTHER)];
+  const ATTESTED = [committed("2026-09-13T04:00:00Z", HEAD)];
+
+  it("A: holds when nothing attests the head and the approval predates it", () => {
+    // The defect. Before PEN-6105 the fallback dated this head 01:00 off a
+    // commit that is NOT the head, 03:00 > 01:00 credited the approval, and
+    // the hold cleared on the one path that arms `gh pr merge --auto` with no
+    // human in the loop.
+    assert.deepEqual(unsatisfiedOwners(pr(UNATTESTED, "2026-09-13T03:00:00Z")), ["kkroo"]);
+  });
+
+  it("A: and an unattested head credits nobody even when the approval is LATE", () => {
+    // Discriminates the fix from "the timestamps happened to order right":
+    // under the fallback a 07:00 approval cleared the hold too. An undatable
+    // head credits NOBODY, which `approvalAttestsHead` already claimed and
+    // was never handed.
+    assert.deepEqual(unsatisfiedOwners(pr(UNATTESTED, "2026-09-13T07:00:00Z")), ["kkroo"]);
+  });
+
+  it("B: holds when the head IS attested and the approval predates it", () => {
+    assert.deepEqual(unsatisfiedOwners(pr(ATTESTED, "2026-09-13T03:00:00Z")), ["kkroo"]);
+  });
+
+  it("C: holds when the timeline is empty", () => {
+    assert.deepEqual(unsatisfiedOwners(pr([], "2026-09-13T03:00:00Z")), ["kkroo"]);
+  });
+
+  it("D: still credits a genuine approval of an attested head", () => {
+    // The must-pass input. Holding everything passes A, B and C.
+    assert.deepEqual(unsatisfiedOwners(pr(ATTESTED, "2026-09-13T07:00:00Z")), []);
+  });
+});
+
 describe(`stale-hold report (held >${STALE_HOLD_HOURS}h, PEN-5005)`, () => {
   // Every fixture is anchored on NOW so the clock under test is the only
   // moving part.
@@ -2326,6 +2381,58 @@ describe("ejected-at-current-head hold (PEN-5022)", () => {
       const timeline = [committed("2026-09-13T08:00:00Z"), committed("2026-09-13T10:00:00Z")];
       assert.equal(headMovedAt(timeline, HEAD), Date.parse("2026-09-13T10:00:00Z"));
       assert.equal(headMovedAt(timeline, HEAD), headMovedAt(timeline));
+    });
+
+    it("PEN-6105: `attestingOnly` reports null instead of falling back", () => {
+      // Same timeline and same head as the fallback test directly above, one
+      // option apart — so if the two answers ever agree, the option does
+      // nothing. The fallback stays because `ejectionsAtHead` needs it; this
+      // exists because `approvalAttestsHead` is poisoned by it.
+      const timeline = [committed("2026-09-13T08:00:00Z"), committed("2026-09-13T10:00:00Z")];
+      assert.equal(headMovedAt(timeline, HEAD, { attestingOnly: true }), null);
+      assert.equal(headMovedAt(timeline, HEAD), Date.parse("2026-09-13T10:00:00Z"));
+    });
+
+    it("PEN-6105: `attestingOnly` still dates a head the timeline DOES attest", () => {
+      // The must-pass input. An option that only ever returned null would
+      // satisfy the fail-closed assertion above and gate every PR forever.
+      const timeline = [
+        committed("2026-09-13T08:00:00Z", HEAD),
+        committed("2026-09-13T10:00:00Z", OTHER),
+      ];
+      assert.equal(
+        headMovedAt(timeline, HEAD, { attestingOnly: true }),
+        Date.parse("2026-09-13T08:00:00Z"),
+      );
+      // And off `commit_id`, which is where a force-pushed head carries its sha.
+      assert.equal(
+        headMovedAt([forcePushed("2026-09-13T09:00:00Z", HEAD)], HEAD, { attestingOnly: true }),
+        Date.parse("2026-09-13T09:00:00Z"),
+      );
+    });
+
+    it("PEN-6105: `attestingOnly` treats an unknown head as undatable, not as 'any commit will do'", () => {
+      const timeline = [committed("2026-09-13T08:00:00Z", HEAD)];
+      for (const head of [null, undefined, ""]) {
+        assert.equal(headMovedAt(timeline, head, { attestingOnly: true }), null, String(head));
+      }
+    });
+
+    it("PEN-6105: `ejectionsAtHead` is NOT switched — it still takes the fallback", () => {
+      // The "only one caller moves" box, as an assertion rather than a
+      // promise. Nothing attests this head, so under `attestingOnly` the
+      // stamp is null, every historical ejection counts, and the count goes
+      // 1 -> 2: the permanent unclearable hold EJECTIONS_BEFORE_HOLD exists
+      // to rule out. If this ever goes red, the wrong caller was switched.
+      const timeline = [
+        added("2026-09-13T07:50:00Z"),
+        ejected("2026-09-13T08:00:00Z"),
+        committed("2026-09-13T09:00:00Z"),
+        added("2026-09-13T09:50:00Z"),
+        ejected("2026-09-13T10:00:00Z"),
+      ];
+      assert.equal(headMovedAt(timeline, HEAD, { attestingOnly: true }), null);
+      assert.equal(ejectionsAtHead(timeline, HEAD).count, 1);
     });
 
     it("PEN-5028 CEILING: dates the head by COMMIT time, so a commit-before-ejection, push-after keeps the ejection", () => {
