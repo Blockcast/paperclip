@@ -6,6 +6,10 @@
 // in the script reds at least one of them.
 
 import { strict as assert } from "node:assert";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import {
@@ -23,6 +27,9 @@ import {
   reviewNoticeDue,
   reviewOwed,
   touchedWatchedPaths,
+  parsePerCommitLog,
+  readRange,
+  touchingCommits,
 } from "./check-git-egress-exec-closure-reread.mjs";
 // Namespace import as well as the named ones: the constant-parity test below
 // derives its set from what this module actually exports, which named imports
@@ -363,9 +370,10 @@ test("an unmeasured staleness arm is not reported as a clean watch", () => {
     { touched: null, attestations: null, trailerOwed: false, calendarOwed: true, missing: null, watchStale: false, verdict: "owed" },
     { base: undefined, head: undefined, today: "2027-02-01" },
   );
-  // All three measured fields, not just the one that prompted this.
+  // Every measured field, not just the one that prompted this.
   assert.match(unread, /touched        = \(not measured\)/);
   assert.match(unread, /attestations   = \(not measured\)/);
+  assert.match(unread, /touched_commits= \(not measured\)/);
   assert.match(unread, /missing_at_head= \(not measured\)/);
   assert.doesNotMatch(unread, /= \(none\)/);
   assert.doesNotMatch(unread, /attestations   = 0/);
@@ -373,11 +381,12 @@ test("an unmeasured staleness arm is not reported as a clean watch", () => {
   // ...and a measured-clean read still says so, so "(not measured)" has not
   // simply replaced the clean wording everywhere.
   const measured = renderReport(
-    evaluate({ changedPaths: [], commitMessages: [], today: BEFORE, headPaths: BOTH_PRESENT }),
+    evaluate({ changedPaths: [], commitMessages: [], commits: [], today: BEFORE, headPaths: BOTH_PRESENT }),
     { base: "a", head: "b", today: BEFORE },
   );
   assert.match(measured, /touched        = \(none\)/);
   assert.match(measured, /attestations   = 0/);
+  assert.match(measured, /touched_commits= \(none\)/);
   assert.match(measured, /missing_at_head= \(none\)/);
   assert.doesNotMatch(measured, /not measured/);
 });
@@ -389,4 +398,327 @@ test("the report always states the watched set and the verdict", () => {
   );
   assert.match(report, /verdict\s+= clear/);
   for (const p of WATCHED_PATHS) assert.ok(report.includes(p), `report omits ${p}`);
+});
+
+
+// ---------------------------------------------------------------------------
+// Per-commit attestation coverage (PEN-5186 re-read, 2026-11-08).
+//
+// Measured on PR #3336: a range of two commits BOTH touching
+// `github-git-egress-runtime.ts`, carrying one trailer between them, cleared
+// with `attestations = 1` and no statement anywhere that the attestation had
+// two commits to cover. These cases pin the note that states it, and pin just
+// as hard that it stays a note.
+// ---------------------------------------------------------------------------
+
+// `git log --format=%H` always emits 40 hex characters and the report
+// abbreviates to 9, so fixtures are padded to full length rather than written
+// short. A 9-character fixture would pass straight through the abbreviation and
+// hide whether it happens at all.
+const sha40 = (prefix) => prefix.padEnd(40, "0");
+const commit = (sha, paths, message = "subject") => ({ sha: sha40(sha), paths, message });
+const attested = (sha, paths) =>
+  commit(sha, paths, `subject\n\n${TRAILER}: read it, nothing new reaches an exec`);
+
+test("touchingCommits keeps only commits that touch a watched file", () => {
+  const rows = touchingCommits([
+    commit("aaaaaaaaa1", ["README.md"]),
+    commit("bbbbbbbbb2", [RUNTIME, "README.md"]),
+    attested("ccccccccc3", [SHIM]),
+  ]);
+  assert.deepEqual(
+    rows,
+    [
+      { sha: sha40("bbbbbbbbb2"), touched: [RUNTIME], attested: false },
+      { sha: sha40("ccccccccc3"), touched: [SHIM], attested: true },
+    ],
+  );
+});
+
+test("a commit's own attestation is read from its own message, not the range", () => {
+  // The whole point of the arm: `rereadAttestations` over the range would say
+  // "attested" for both rows here. Per commit, exactly one is.
+  const rows = touchingCommits([
+    commit("aaaaaaaaa1", [RUNTIME]),
+    attested("bbbbbbbbb2", [RUNTIME]),
+  ]);
+  assert.deepEqual(rows.map((r) => r.attested), [false, true]);
+});
+
+test("a per-commit input that was never supplied is 'not measured', not 'none'", () => {
+  const unmeasured = evaluate({
+    changedPaths: [RUNTIME],
+    commitMessages: [`${TRAILER}: read it`],
+    today: BEFORE,
+    headPaths: BOTH_PRESENT,
+  });
+  assert.equal(unmeasured.perCommit, null);
+  assert.equal(unmeasured.coverageUnstated, false);
+  assert.match(renderReport(unmeasured, {}), /touched_commits= \(not measured\)/);
+});
+
+test("the report names each touching commit and whether it carries a trailer", () => {
+  const report = renderReport(
+    evaluate({
+      changedPaths: [RUNTIME],
+      commitMessages: [`${TRAILER}: read both`],
+      commits: [commit("a7ceaf998", [RUNTIME]), attested("c53e80b94", [RUNTIME])],
+      today: BEFORE,
+      headPaths: BOTH_PRESENT,
+    }),
+    { base: "a", head: "b", today: BEFORE },
+  );
+  assert.match(report, /touched_commits= a7ceaf998 \[no trailer\], c53e80b94 \[trailer\]/);
+});
+
+test("the coverage note fires on an uncovered sibling and names it", () => {
+  const result = evaluate({
+    changedPaths: [RUNTIME],
+    commitMessages: [`${TRAILER}: read both`],
+    commits: [commit("a7ceaf998", [RUNTIME]), attested("c53e80b94", [RUNTIME])],
+    today: BEFORE,
+    headPaths: BOTH_PRESENT,
+  });
+  assert.equal(result.coverageUnstated, true);
+  const report = renderReport(result, { base: "a", head: "b", today: BEFORE });
+  assert.match(report, /2 commit\(s\) in this range touch a watched file/);
+  assert.match(report, /These carry no trailer of their own: a7ceaf998\./);
+  // Named, so a reviewer can go and read the one that was not attested.
+  assert.doesNotMatch(report, /c53e80b94 are the commits/);
+});
+
+test("the coverage note changes no verdict and no exit code", () => {
+  // This is the line that keeps it a note. If it ever reaches `verdict`, it has
+  // become a second gate nobody agreed to — the same bar the notice arm holds.
+  const shared = {
+    changedPaths: [RUNTIME],
+    commitMessages: [`${TRAILER}: read both`],
+    today: BEFORE,
+    headPaths: BOTH_PRESENT,
+  };
+  const noted = evaluate({
+    ...shared,
+    commits: [commit("a7ceaf998", [RUNTIME]), attested("c53e80b94", [RUNTIME])],
+  });
+  const quiet = evaluate({ ...shared, commits: [attested("c53e80b94", [RUNTIME])] });
+  assert.equal(noted.coverageUnstated, true);
+  assert.equal(quiet.coverageUnstated, false);
+  // Same verdict, same trailerOwed, either way.
+  assert.equal(noted.verdict, "clear");
+  assert.equal(quiet.verdict, "clear");
+  assert.equal(noted.trailerOwed, false);
+  assert.equal(quiet.trailerOwed, false);
+});
+
+test("one touching commit attested somewhere ELSE still raises the note", () => {
+  // The shape an earlier draft suppressed with a `perCommit.length > 1` clause,
+  // and the one where the coverage question is sharpest: the range carries an
+  // attestation, so `trailerOwed` is false and the check clears — but the
+  // trailer sits on a commit that touched nothing watched, and nothing else
+  // would say so. A mutation test found this; the clause is gone.
+  const result = evaluate({
+    changedPaths: [RUNTIME],
+    commitMessages: ["subject", `docs only\n\n${TRAILER}: read it`],
+    commits: [commit("aaaaaaaaa1", [RUNTIME]), attested("bbbbbbbbb2", ["README.md"])],
+    today: BEFORE,
+    headPaths: BOTH_PRESENT,
+  });
+  assert.equal(result.trailerOwed, false);
+  assert.equal(result.verdict, "clear");
+  assert.equal(result.coverageUnstated, true);
+  // Abbreviated to 9 characters from the 40 the fixture carries.
+  assert.match(renderReport(result, {}), /These carry no trailer of their own: aaaaaaaaa\./);
+});
+
+test("a single touching commit that attests itself raises no coverage note", () => {
+  // PR #3496's measured shape. One commit, one trailer, nothing to say — a note
+  // that fired here would be noise on the correct case, which is how a note
+  // teaches people to skim the one that matters.
+  const result = evaluate({
+    changedPaths: [RUNTIME],
+    commitMessages: [`${TRAILER}: read it`],
+    commits: [attested("5aaec87f0", [RUNTIME])],
+    today: BEFORE,
+    headPaths: BOTH_PRESENT,
+  });
+  assert.equal(result.coverageUnstated, false);
+  assert.doesNotMatch(renderReport(result, {}), /carry no trailer of their own/);
+});
+
+test("two touching commits that each attest raise no coverage note", () => {
+  const result = evaluate({
+    changedPaths: [RUNTIME],
+    commitMessages: [`${TRAILER}: read it`],
+    commits: [attested("aaaaaaaaa1", [RUNTIME]), attested("bbbbbbbbb2", [SHIM])],
+    today: BEFORE,
+    headPaths: BOTH_PRESENT,
+  });
+  assert.equal(result.coverageUnstated, false);
+});
+
+test("a range with no commit input is refused rather than read as empty", () => {
+  // `touchingCommits` is the one place a bad input could quietly become "no
+  // commits touched anything", which renders identically to a clean range.
+  assert.throws(() => touchingCommits(undefined), /must be an array/);
+  assert.throws(() => touchingCommits("a7ceaf998"), /must be an array/);
+});
+
+// ---------------------------------------------------------------------------
+// `readRange` against a real repository.
+//
+// Everything in `readRange` is a git invocation, so none of its flags are
+// reachable from the pure-function cases above: they are handed synthetic path
+// lists and never run git at all. That gap was not theoretical — a mutation
+// dropping `--no-renames` from the per-commit log survived the entire suite.
+// ---------------------------------------------------------------------------
+
+function scratchRepo() {
+  const dir = mkdtempSync(path.join(tmpdir(), "pen5186-"));
+  const git = (...args) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" });
+  git("init", "-q", "-b", "main");
+  git("config", "user.email", "t@example.invalid");
+  git("config", "user.name", "T");
+  // Rename detection ON, so a run that forgot `--no-renames` reads this repo
+  // the way CI would rather than the way the test wishes.
+  git("config", "diff.renames", "true");
+  const write = (rel, body) => {
+    mkdirSync(path.join(dir, path.dirname(rel)), { recursive: true });
+    writeFileSync(path.join(dir, rel), body);
+  };
+  const commit = (message) => {
+    git("add", "-A");
+    git("commit", "-q", "--no-gpg-sign", "-m", message);
+    return git("rev-parse", "HEAD").trim();
+  };
+  return { dir, git, write, commit, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+test("readRange attributes each touching commit and finds the trailer on it", () => {
+  const repo = scratchRepo();
+  try {
+    repo.write("README.md", "base\n");
+    // BOTH watched files, or the staleness arm reports the missing one and the
+    // verdict below would be "owed" for a reason this case is not about.
+    for (const p of WATCHED_PATHS) repo.write(p, "base\n");
+    const base = repo.commit("base");
+
+    repo.write(WATCHED_PATHS[1], "one\n");
+    const bare = repo.commit("touches the runtime, attests nothing");
+
+    repo.write(WATCHED_PATHS[1], "two\n");
+    // A body carrying the characters a naive parser might split on, so the
+    // delimiter choice is exercised rather than assumed.
+    const withTrailer = repo.commit(
+      `touches it again\n\nnotes: a % and a \\x01-looking literal\n\n${TRAILER}: read both, nothing reaches an exec`,
+    );
+
+    const range = readRange(base, withTrailer, { cwd: repo.dir });
+    assert.deepEqual(range.changedPaths, [WATCHED_PATHS[1]]);
+    assert.deepEqual(range.headPaths.sort(), [...WATCHED_PATHS].sort());
+    assert.equal(range.commitMessages.length, 2);
+    assert.deepEqual(range.commits.map((c) => c.sha), [withTrailer, bare]);
+
+    const rows = touchingCommits(range.commits);
+    assert.deepEqual(
+      rows.map((r) => [r.sha, r.attested]),
+      [[withTrailer, true], [bare, false]],
+    );
+
+    // End to end: the range clears (one attestation) and still says the other
+    // commit carried none of its own.
+    const result = evaluate({ ...range, today: BEFORE });
+    assert.equal(result.verdict, "clear");
+    assert.equal(result.coverageUnstated, true);
+    assert.match(
+      renderReport(result, { base, head: withTrailer, today: BEFORE }),
+      new RegExp(`These carry no trailer of their own: ${bare.slice(0, 9)}\\.`),
+    );
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test("readRange sees a RENAMED watched file at its old path, per commit too", () => {
+  // `--no-renames` is load-bearing on BOTH git reads. Under rename detection a
+  // moved watched file is reported only at its new path, so the watched path
+  // never appears, no commit is attributed, and the move sails through with no
+  // attestation owed. This is the mutation that survived every other case.
+  const repo = scratchRepo();
+  try {
+    repo.write(WATCHED_PATHS[1], "exactly the same bytes, so git scores the rename 100%\n");
+    repo.write("README.md", "base\n");
+    const base = repo.commit("base");
+
+    repo.git("mv", WATCHED_PATHS[1], "packages/adapter-utils/src/moved-elsewhere.ts");
+    const moved = repo.commit("move the watched file away");
+
+    const range = readRange(base, moved, { cwd: repo.dir });
+    assert.ok(
+      range.changedPaths.includes(WATCHED_PATHS[1]),
+      `the range-wide arm lost the old path: ${range.changedPaths.join(", ")}`,
+    );
+    const rows = touchingCommits(range.commits);
+    assert.deepEqual(
+      rows.map((r) => r.sha),
+      [moved],
+      "the per-commit arm did not attribute the move to the commit that made it",
+    );
+
+    // Both arms fire: a re-read is owed AND the watch is now pointing at
+    // nothing. A trailer does not clear the second one.
+    const result = evaluate({ ...range, today: BEFORE });
+    assert.equal(result.trailerOwed, true);
+    assert.equal(result.watchStale, true);
+    assert.equal(result.verdict, "owed");
+  } finally {
+    repo.cleanup();
+  }
+});
+
+test("an unreadable per-commit chunk is refused, not skipped", () => {
+  // The silent-failure path: skipping a chunk returns FEWER commits than the
+  // range holds, and a short coverage note is indistinguishable from a
+  // well-covered range. Loud beats short.
+  const good = "\x01abc\x02subject\x03\nfile.ts\n";
+  assert.equal(parsePerCommitLog(good).length, 1);
+  assert.throws(() => parsePerCommitLog(`${good}\x01no-delimiters-here`), /could not parse/);
+  assert.throws(() => parsePerCommitLog("\x01abc\x03out\x02of\x02order"), /could not parse/);
+  // An empty blob is an empty range, which is a real answer and not an error.
+  assert.deepEqual(parsePerCommitLog(""), []);
+  assert.deepEqual(parsePerCommitLog(null), []);
+});
+
+test("the per-commit arm reads the SAME commit set as the attestation arm", () => {
+  // Both must be two-dot. `git log A...B` is the SYMMETRIC difference, so a
+  // three-dot per-commit read on a diverged history pulls in commits from the
+  // base side that the attestation count never saw — and the two arms would
+  // then disagree about which commits were considered, which is the one
+  // property the coverage note's docstring promises.
+  const repo = scratchRepo();
+  try {
+    for (const p of WATCHED_PATHS) repo.write(p, "base\n");
+    repo.write("README.md", "base\n");
+    const root = repo.commit("root");
+
+    repo.git("checkout", "-q", "-b", "topic");
+    repo.write(WATCHED_PATHS[1], "topic\n");
+    const head = repo.commit("topic touches the runtime");
+
+    // The base branch moves on after the fork point, which is what makes the
+    // two readings differ at all.
+    repo.git("checkout", "-q", "main");
+    repo.write("README.md", "base moved on\n");
+    const base = repo.commit("base side moved");
+    assert.notEqual(base, root);
+
+    const range = readRange(base, head, { cwd: repo.dir });
+    assert.equal(
+      range.commits.length,
+      range.commitMessages.length,
+      "the per-commit arm and the attestation arm read different commit sets",
+    );
+    assert.deepEqual(range.commits.map((c) => c.sha), [head]);
+  } finally {
+    repo.cleanup();
+  }
 });
