@@ -11,6 +11,7 @@ import {
   typeLabel,
 } from "./ApprovalPayload";
 import { timeAgo } from "../lib/timeAgo";
+import { ApprovalEditMarker, approvalWasEdited } from "./ApprovalEditMarker";
 import type { Approval, Agent } from "@paperclipai/shared";
 import { cn } from "@/lib/utils";
 import { Card } from "@/components/ui/card";
@@ -74,6 +75,14 @@ export function ApprovalCard({
                     <Identity name={requesterAgent.name} size="sm" className="inline-flex" />
                   </div>
                 )}
+                {/*
+                  This card offers Approve and Reject directly, so it is the primary
+                  decision surface — not a preview of one. The edit marker belongs
+                  HERE for the same reason the buttons do: a decider who never opens
+                  the detail page must still be able to see that the text moved after
+                  it was filed (PEN-6107).
+                */}
+                <ApprovalEditMarker approval={approval} />
               </div>
               <div className="space-y-1">
                 <h3 className="text-base font-semibold leading-6 text-foreground">
@@ -82,6 +91,18 @@ export function ApprovalCard({
                 <p className="text-xs leading-5 text-muted-foreground">
                   Approval request created {timeAgo(approval.createdAt)}
                 </p>
+                {approvalWasEdited(approval) && (
+                  <p className="text-xs leading-5 text-amber-700 dark:text-amber-300">
+                    The text below was edited after this request was filed.
+                    {detailLink || onOpen ? (
+                      <>
+                        {" "}
+                        Open <span className="font-medium">View details</span> to read the
+                        superseded version{approval.payloadRevision > 1 ? "s" : ""} before deciding.
+                      </>
+                    ) : null}
+                  </p>
+                )}
               </div>
             </div>
           </div>

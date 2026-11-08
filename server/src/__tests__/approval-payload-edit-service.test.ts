@@ -199,6 +199,52 @@ describeEmbeddedPostgres("approvalService.updatePayload", () => {
     expect(updated.decidedByUserId).toBeNull();
     expect(updated.decisionNote).toBeNull();
   }, 60_000);
+
+  /**
+   * ⭐ PEN-6107 — the edit marker has to reach the CHEAP view, which is the one a
+   * queue read is built from and the one the API's own tool description steers
+   * callers toward.
+   *
+   * Disclosure is the ENTIRE safety case for an editable payload: prevention (an
+   * `expectedPayloadRevision` interlock on the decision routes) was priced and
+   * deliberately deferred, so there is nothing behind this. A marker absent from the
+   * surface a decider scans is not a partial mitigation; on that surface it is none.
+   *
+   * ⚠️ This asserts KEY PRESENCE, not just the value, and that is the point. An
+   * absent key and an unedited `0` are indistinguishable through `jq` and through JS
+   * property access, so a projection that silently dropped the column again would
+   * read to every caller as "this card was never edited" — the exact misread the
+   * marker exists to remove, in the one direction that is unsafe.
+   */
+  it("⭐ reports the edit marker on the summary view, by key presence", async () => {
+    const companyId = await seedCompany();
+    const untouched = await seedApproval(companyId, new Date("2026-11-01T00:00:00.000Z"), "never edited");
+    const edited = await seedApproval(companyId, new Date("2026-11-02T00:00:00.000Z"), "stale evidence");
+
+    const svc = approvalService(db);
+    await svc.updatePayload(edited, { title: "corrected in place" }, editor);
+
+    const rows = await svc.listSummary(companyId, {});
+    const editedRow = rows.find((row) => row.id === edited);
+    const untouchedRow = rows.find((row) => row.id === untouched);
+
+    // Present on BOTH rows. The unedited card has to carry the keys too, or a
+    // caller cannot tell "this server reports edit state and this card is clean"
+    // from "this server does not report edit state at all".
+    expect(editedRow).toHaveProperty("payloadRevision");
+    expect(editedRow).toHaveProperty("payloadEditedAt");
+    expect(untouchedRow).toHaveProperty("payloadRevision");
+    expect(untouchedRow).toHaveProperty("payloadEditedAt");
+
+    expect(editedRow?.payloadRevision).toBe(1);
+    expect(editedRow?.payloadEditedAt).not.toBeNull();
+    expect(untouchedRow?.payloadRevision).toBe(0);
+    expect(untouchedRow?.payloadEditedAt).toBeNull();
+
+    // And the cheap view stays cheap — the marker is two scalar columns, not a
+    // relaxation of the payload omission that is the whole reason `summary` exists.
+    expect(editedRow).not.toHaveProperty("payload");
+  }, 60_000);
   /**
    * ⭐ The review finding this suite existed to be unable to catch (Ally, PR 3456).
    *

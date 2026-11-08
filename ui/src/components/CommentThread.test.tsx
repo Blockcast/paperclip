@@ -316,6 +316,8 @@ describe("CommentThread", () => {
         title: "Approve hosting spend",
         text: "Estimated monthly cost is $42.",
       },
+      payloadRevision: 0,
+      payloadEditedAt: null,
       decisionNote: null,
       decidedByUserId: null,
       decidedAt: null,

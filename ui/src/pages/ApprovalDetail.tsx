@@ -9,6 +9,7 @@ import { queryKeys } from "../lib/queryKeys";
 import { StatusBadge } from "../components/StatusBadge";
 import { Identity } from "../components/Identity";
 import { approvalLabel, typeIcon, defaultTypeIcon, ApprovalPayloadRenderer } from "../components/ApprovalPayload";
+import { ApprovalEditMarker, approvalWasEdited } from "../components/ApprovalEditMarker";
 import { PageSkeleton } from "../components/PageSkeleton";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -72,6 +73,7 @@ export function ApprovalDetail() {
   const [commentBody, setCommentBody] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [showRawPayload, setShowRawPayload] = useState(false);
+  const [showPriorPayloads, setShowPriorPayloads] = useState(false);
 
   const { data: approval, isLoading } = useQuery({
     queryKey: queryKeys.approvals.detail(approvalId!),
@@ -90,6 +92,14 @@ export function ApprovalDetail() {
     queryKey: queryKeys.approvals.issues(approvalId!),
     queryFn: () => approvalsApi.listIssues(approvalId!),
     enabled: !!approvalId,
+  });
+
+  // Only fetched for a card that says it was edited. An unedited card has no
+  // revisions to show, and the marker is what licenses the request.
+  const { data: priorPayloads } = useQuery({
+    queryKey: queryKeys.approvals.payloadRevisions(approvalId!),
+    queryFn: () => approvalsApi.listPayloadRevisions(approvalId!),
+    enabled: !!approvalId && !!approval && approvalWasEdited(approval),
   });
 
   const { data: agents } = useQuery({
@@ -256,6 +266,15 @@ export function ApprovalDetail() {
           </div>
           <StatusBadge status={approval.status} />
         </div>
+        {approvalWasEdited(approval) && (
+          <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 dark:border-amber-700/40 dark:bg-amber-900/20">
+            <ApprovalEditMarker approval={approval} />
+            <p className="text-xs text-amber-800 dark:text-amber-200">
+              The request text was edited after filing. The superseded
+              version{approval.payloadRevision > 1 ? "s are" : " is"} below.
+            </p>
+          </div>
+        )}
         <div className="text-sm space-y-1">
           {approval.requestedByAgentId && (
             <div className="flex items-center gap-2">
@@ -279,6 +298,45 @@ export function ApprovalDetail() {
             <pre className="text-xs bg-muted/40 rounded-md p-3 overflow-x-auto">
               {JSON.stringify(payload, null, 2)}
             </pre>
+          )}
+          {approvalWasEdited(approval) && (
+            <>
+              <button
+                type="button"
+                className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors mt-2"
+                onClick={() => setShowPriorPayloads((v) => !v)}
+              >
+                <ChevronRight className={`h-3 w-3 transition-transform ${showPriorPayloads ? "rotate-90" : ""}`} />
+                See what this request said before
+                {priorPayloads ? ` (${priorPayloads.length})` : ""}
+              </button>
+              {showPriorPayloads &&
+                (priorPayloads === undefined ? (
+                  <p className="text-xs text-muted-foreground">Loading previous versions…</p>
+                ) : priorPayloads.length === 0 ? (
+                  // The card claims an edit but no archived text came back. Say so
+                  // rather than rendering nothing: an empty disclosure that looks
+                  // like an unedited card is the failure this marker exists to stop.
+                  <p className="text-xs text-muted-foreground">
+                    This card records {approval.payloadRevision} edit
+                    {approval.payloadRevision > 1 ? "s" : ""}, but no superseded text is readable here.
+                  </p>
+                ) : (
+                  [...priorPayloads]
+                    .sort((a, b) => b.revision - a.revision)
+                    .map((revision) => (
+                      <div key={revision.id} className="mt-2 space-y-1">
+                        <p className="text-xs text-muted-foreground">
+                          Revision {revision.revision} — superseded{" "}
+                          {new Date(revision.createdAt).toLocaleString()}
+                        </p>
+                        <pre className="text-xs bg-muted/40 rounded-md p-3 overflow-x-auto">
+                          {JSON.stringify(revision.payload, null, 2)}
+                        </pre>
+                      </div>
+                    ))
+                ))}
+            </>
           )}
           {approval.decisionNote && (
             <p className="text-xs text-muted-foreground">Decision note: {approval.decisionNote}</p>
