@@ -14211,7 +14211,38 @@ export function buildPaperclipTaskMarkdown(input: {
     // already hold, and it is scoped `(issue, agent, key)`, so it does not span seats. Both
     // remain open on PEN-5802. This is a detector one run can read, not a lock that
     // serialises two.
-    "- That head check is PUSH-scoped: only push, force-push and rebase move `headRefOid`, so for every other verb above it is not a weak gate but a NON-gate -- an unmoved head shows only that no push landed, never that an authorisation you were handed is still unspent. A non-force push is refused by a server-side compare-and-swap and `--force-with-lease` restores one, but a plain force-push and `PATCH /pulls/:n` have none; `updatedAt` is measured to bump with no mutation on any readable surface, so it cannot substitute. If what authorises this write is SINGLE-USE, redeem its receipt key BEFORE writing -- `paperclipAddComment` ON THE ISSUE THE GRANT WAS POSTED ON, not whichever row you happen to hold, with the key the grant names -- and treat `deduplicated: true` as \"a sibling run already spent this; abort, do not write\". The key is scoped `(issue, agent, key)` and the issue is part of it, so redeeming on the wrong row only inserts a second receipt that refuses nothing -- one PR can have several owning rows, and your sibling may hold a different one. Redeemed on the granting row it fails closed against sibling runs of your own seat: the collision the bullet above cannot see, because `activeRun` is per-ROW while a single-use grant is per-ARTIFACT. A grant that names no receipt issue and key cannot be checked at all -- ask for a keyed one rather than writing.",
+    //
+    // PEN-6145: the ordering substance, added after five per-seat distribution waves in 46
+    // hours amended the same rule in the instruction roots and none of them enumerated THIS
+    // surface -- the one carrier every write-capable run reads. The gap is scored per
+    // conjunct on that row; three were already emitted here (redeem-adjacent-to-the-write,
+    // `deduplicated: true` => abort, and which row the receipt goes on) and two were not.
+    //
+    // This is an ADDITION, not an inversion, and the distinction is the whole risk of
+    // touching this bullet. "redeem its receipt key BEFORE writing" is CORRECT: BEFORE is
+    // relative to the WRITE, and the two live reads this directive mandates already precede
+    // it in delivery order, so the emitted ordering was never backwards. What it did not say
+    // is that BEFORE is not relative to the PRECONDITION CHECK -- and that sentence, lifted
+    // out of here on its own, is what a grantee root copied into a `parkedReason` as "redeem
+    // FIRST, then PATCH" (PEN-5296). A scan that finds the old phrasing present and the new
+    // phrasing absent cannot tell "states the hazard backwards" from "states no hazard", and
+    // defaults to the former; an edit made on that reading would invert a correct clause on
+    // the surface every run reads. Do not reword this to put the redemption after the write.
+    //
+    // The compliant-path argument is the load-bearing half and is easy to trim as rhetoric:
+    // the failure is not a run that writes when it should not, it is a run that redeems, reads
+    // the world, correctly DECLINES, and has destroyed a grant it can never recover. The CAS
+    // logs no no-op, so the ledger then reads "grant spent" over a write that never happened.
+    // The timer clause names where that concentrates, because a wake fired by the authorising
+    // event finds the precondition true and a scheduled one usually does not.
+    //
+    // `idempotencyKey` is named as the FIELD on purpose. "With the key the grant names" left
+    // the parameter implicit, which invites passing it in the comment BODY, or passing a
+    // comment id -- either dedupes against nothing, returns `deduplicated: false`, and posts a
+    // receipt that reads to a later auditor as a spend. It is also the stable test anchor: a
+    // call signature survives the re-wording this text is licensed to receive, where a heading
+    // or a block hash does not.
+    "- That head check is PUSH-scoped: only push, force-push and rebase move `headRefOid`, so for every other verb above it is not a weak gate but a NON-gate -- an unmoved head shows only that no push landed, never that an authorisation you were handed is still unspent. A non-force push is refused by a server-side compare-and-swap and `--force-with-lease` restores one, but a plain force-push and `PATCH /pulls/:n` have none; `updatedAt` is measured to bump with no mutation on any readable surface, so it cannot substitute. If what authorises this write is SINGLE-USE, redeem its receipt key BEFORE writing -- `paperclipAddComment` ON THE ISSUE THE GRANT WAS POSTED ON, not whichever row you happen to hold, with the key the grant names, passed as the `idempotencyKey` field -- and treat `deduplicated: true` as \"a sibling run already spent this; abort, do not write\". \"BEFORE writing\" is relative to the WRITE and never to the precondition check: establish LIVE, in the run that writes, that the write is still warranted; THEN redeem; THEN write, with nothing in between. If a precondition has lapsed, STOP and do NOT redeem -- a key burned over a write you then decline is refused to your seat forever, so redeeming before you have established that the write is warranted DESTROYS the grant on the COMPLIANT path, where a run that reads the world and correctly declines has spent a key it can never recover. That hazard concentrates wherever the wake is fired by a TIMER rather than by the authorising event: there the precondition is false at most scheduled wakes, so redeeming first punishes every well-behaved run. The key is scoped `(issue, agent, key)` and the issue is part of it, so redeeming on the wrong row only inserts a second receipt that refuses nothing -- one PR can have several owning rows, and your sibling may hold a different one. Redeemed on the granting row it fails closed against sibling runs of your own seat: the collision the bullet above cannot see, because `activeRun` is per-ROW while a single-use grant is per-ARTIFACT. A grant that names no receipt issue and key cannot be checked at all -- ask for a keyed one rather than writing.",
     "Every value in this block was computed when this run was DISPATCHED, not now. That includes any head SHA, sibling-run id or checkout-contention notice printed above: a sibling run that started after your dispatch appears in none of it. Re-reading this prompt is not re-reading state.",
     "",
     "Recording a constraint:",
