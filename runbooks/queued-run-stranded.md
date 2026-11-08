@@ -1232,6 +1232,136 @@ A `phase` of `reap` with `phaseMs` close to `heldMs` confirms this cause. Any
 other phase means it is something else — most likely recall latency on the
 critical path (BLO-35878), which is **not** excluded.
 
+### 2026-11-08 episode — the breadcrumb answered, and it said `reap` (PEN-6095)
+
+The first episode recorded here where `paperclip_agent_start_lock_phase_seconds`
+was already populated when the stall fired, so the await above is **named by
+measurement rather than inferred**. It is the same BLO-36922 cause, in the
+chronic-overrun regime rather than the lockstep one.
+
+Read 2026-11-08T13:0xZ by Devops. `max by (phase) (...)`, 10m step:
+
+| phase | 05:30→07:10Z | peak | after the 07:49–07:57Z pod roll |
+|---|---|---|---|
+| `reap` | 68.5–119.7 s | **362.7 s** @07:20, 294.5 s @07:30 | **1.4 s** @08:00, 3.0 s @08:10 |
+| `slot_check` | 32.1–316.2 s | **503.8 s** @06:40 | series absent |
+| `claim` | 0.7–30.2 s | 30.2 s @07:00 | series absent |
+
+⚠️ **This episode would NOT have fired the lockstep alert.**
+`count(paperclip_agent_start_lock_held_seconds > 300)` never exceeded **2**,
+against the 3→14 ramp of 2026-09-26. Same cause, an order of magnitude less
+visible — so a quiet lockstep count is not evidence this is absent. Read the
+phase gauge, which answered here when the count would not have.
+
+#### The 15 s guard timeout is NOT reporting a real upstream condition
+
+`k8s_concurrency_guard_unreachable` text is verbatim `Concurrency guard
+unreachable: Kubernetes Job concurrency guard timed out after 15s`. That string
+can only come from `withK8sConcurrencyGuardTimeout`
+(`vendor/paperclip-adapter-claude-k8s/src/server/execute.ts`), whose 15 s budget
+wraps **exactly one** operation: the label-selected `listNamespacedJob` at the
+top of the guard. Everything else in the guard — the stale-Job reap loop, the
+per-Job `fetchHeartbeatRunSnapshot` calls — sits outside it.
+
+The apiserver did not serve those lists slowly. Over the burst window
+(05:45–07:45Z) it served **1466** of them, **all `200`**, and the `le=15`
+bucket equals `le=20/30/45/60`: **zero** requests fell between 15 s and 60 s,
+one exceeded 60 s. All **3/3** apiserver instances were scraped.
+
+```
+# the bucket equality IS the test — p99 hides a 20-request tail, this does not
+sum by (le) (increase(apiserver_request_duration_seconds_bucket{resource="jobs",verb="LIST"}[2h]))
+sum by (code) (increase(apiserver_request_total{resource="jobs",verb="LIST"}[2h]))
+count(count by (instance) (apiserver_request_total))   # confirm the sample is whole
+```
+
+So the expiry is client-side queueing inside the control-plane pod's shared
+Kubernetes client, exactly as the 2026-09-26 episode concluded from the other
+direction (`kubectl` from outside answered in 1.6 s). Also falsified for this
+episode, each over the burst window and not merely at read time: event-loop lag
+(`nodejs_eventloop_lag_max_seconds` ≤ **1.52 s**), heap (0.6–1.4 GB against a
+10 Gi limit), socket/fd leak (40–87 sockets, flat), CoreDNS (p99 **7.4 ms**),
+and apiserver throttling (**0** `429` on `jobs`).
+
+⛔ **Do not "fix" this by adding `resourceVersion: "0"` to the guard's list.**
+A watch-cache read can miss a Job created moments earlier, which is precisely
+the admission the guard exists to refuse. The list is not the problem.
+
+#### The guard timeout is a small part of the slot burn
+
+PEN-6095 attributes a p50 270 s slot cost to the guard. The guard's own budget
+is 15 s of it. Devops' 20 failures that day ran **104–898 s** (median 172 s), so
+the 15 s is ~**9 %** of the median burn. For the seven that never reached an
+agent session (474-byte logs), first output landed at **+10 to +36 s** — the
+pre-guard `getSelfPodInfo` and orphan-secret sweep, both going through the same
+queued client — and the remaining ~75–140 s is post-guard teardown.
+
+⇒ **failing the guard faster buys ~15 s of a ~172 s burn.** The lever is the
+`reap`/`slot_check` critical section above, not the guard's timeout.
+
+#### The no-successor tail is real: 3 of 97, and 2 of them are a genuine gap
+
+PEN-6095's tail reproduces exactly. Over Cto's 1000-row page
+(11-06T13:16Z→11-08T13:15Z), **97** guard failures: 93 have a successor
+(`retryOfRunId` pointing back), 29 carry their own `scheduledRetryReason`, and
+**3 have neither**. Do not test this on the failed row's own
+`scheduledRetryReason` — that is null on **68 of 97**, because the bookkeeping
+normally lives on the successor. The successor join is the test:
+
+```
+# the tail = guard failures that are nobody's retryOfRunId AND carry no retry reason
+jq '[.[]|select(.retryOfRunId!=null)|.retryOfRunId] as $p
+    | [.[]|select(.errorCode=="k8s_concurrency_guard_unreachable")
+         |select((.id as $i|$p|index($i))==null and .scheduledRetryReason==null)]' runs.json
+```
+
+The retry arm is `heartbeat.ts` (BLO-17938), and it is scoped:
+
+```ts
+if (run.errorCode === "k8s_concurrent_run_blocked" ||
+    run.errorCode === "k8s_concurrency_guard_unreachable" ||
+    run.errorCode === "k8s_agent_workspace_pvc_failed") {
+  return isIssueRun || isPrReviewRetryContext(contextSnapshot);
+}
+```
+
+⇒ **the tail splits, and only one half is by design.**
+
+- **1 of 3 is correct.** `953fadda` was a `heartbeat_timer` wake carrying **no
+  `issueId`**, so `isIssueRun` is false and the arm declines it deliberately —
+  *"Timer and maintenance runs remain terminal to avoid retry leaks."* The next
+  timer tick supersedes it; no wake is lost.
+- **2 of 3 should have retried and did not.** `d6bda4eb` (`github_pr_closed`,
+  PEN-4999) and `3ac49c51` (`issue_continuation_needed`) both carry an
+  `issueId`, so `isIssueRun` is true, and both show
+  `scheduledRetryAttempt: 0` against an observed budget reaching **4** — the
+  bound was not spent. Neither has a successor.
+
+Those two were **not** permanently dropped, but recovery was incidental, not a
+retry: each issue drew a later unrelated wake (`issue_park_expired` 10:01Z and
+`issue_commented` 10:33Z), both of which were still **queued, never started**
+at 13:15Z — roughly **9.5 h** after the lost wake. On an issue with no other
+traffic there is nothing to supply that rescue.
+
+⚠️ **Not yet measured: why the arm did not fire for those two.** The
+classification above admits them, so the drop is downstream of it, in the retry
+mint (`resolveAutomaticRunRetryOpts` and its callers) — which this pass did not
+read. That is the next step for anyone picking this up, and it is cheap.
+
+#### Do not credit a restart
+
+The last guard failure was **07:40:31Z**; the pods rolled at **07:49–07:57Z**,
+*after* it, and `reap` was already back to 119.5 s at 07:40 and 105.7 s at
+07:50 — both pre-roll. The episode self-cleared, as every episode above did.
+The post-roll 1.4 s `reap` cannot be separated from the quiet period and is not
+evidence the roll fixed anything.
+
+Dated re-measurement on the run table (the authoritative instrument; not
+`increase()`), Devops seat, guard-fail/started per hour:
+**05Z 1/1 · 06Z 6/6 · 07Z 13/18 · 08Z–13Z 0/73.** The 05Z denominator is
+truncated by the page start (05:51Z). The quiet is real and not an absence of
+dispatch: 73 starts, zero failures, over six hours.
+
 ## Agent start lock aborted (PEN-3328)
 
 `PaperclipAgentStartLockAborted` — `warning`, not a page.
