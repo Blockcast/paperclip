@@ -47,11 +47,56 @@ export function redactionMarker(cls: GitHubEgressScrubClass): string {
 const NESTED_MARKER_RE = /\[paperclip-egress-scrub redacted: [a-z-]+\]/g;
 
 
-/** A run of this many consecutive NAME=VALUE lines reads as an environment
- *  dump regardless of which variables it holds. Five is low enough to catch
- *  the interpolation that caused PEN-2526 and high enough that a changelog
- *  listing a couple of config defaults passes through untouched. */
+/** A run of this many NAME=VALUE lines reads as an environment dump regardless
+ *  of which variables it holds. Five is low enough to catch the interpolation
+ *  that caused PEN-2526 and high enough that a changelog listing a couple of
+ *  config defaults passes through untouched.
+ *
+ *  This count is the ONLY layer covering short, low-entropy, human-chosen
+ *  secrets in bulk: every value below HIGH_ENTROPY_MIN_LENGTH is invisible to
+ *  `isOpaqueSecretValue`, so once a run is not recognised nothing else fires.
+ *  PEN-6123 measured that no value-shape test can narrow this rule without
+ *  admitting a matched secret generator outright — config and hand-chosen
+ *  secrets are drawn from one lexical space — so the rule stays value-blind
+ *  and the run count carries the whole decision.
+ *
+ *  What the count ranges over is therefore load-bearing, and it is NOT "lines
+ *  of the file": see ENVIRONMENT_DUMP_MAX_INERT_GAP. */
 export const ENVIRONMENT_DUMP_MIN_RUN = 5;
+
+/** How many consecutive INERT lines — blank, or a `#` comment — may sit
+ *  between two assignments without breaking the run.
+ *
+ *  PEN-6127: at 0, which is what shipped until 2026-11-08, the run had to be
+ *  physically adjacent, and ONE interleaved comment or blank line defeated the
+ *  rule completely. Measured: a sectioned `.env` carrying nine values, three of
+ *  them short passwords, grouped under `# database` / `# redis` / `# smtp`,
+ *  PASSED — while the same nine values contiguous were REFUSED. Byte-identical
+ *  content; the only difference was layout. That made the single most natural
+ *  edit an author reaches for — and which reads as ordinary good style — a
+ *  complete bypass of the one rule that covers this class.
+ *
+ *  Two is not a fitted constant. It is the width of a stanza break in a
+ *  sectioned `.env`: one blank line, then one comment naming the next stanza.
+ *  Three recovers nothing further on the measured corpora; one leaves the
+ *  headline bypass open, because blank-then-comment is two lines.
+ *
+ *  ⚠ A line that is neither an assignment nor inert — any line of actual code —
+ *  still breaks the run, at every setting. That is what keeps a shell script
+ *  whose constants are separated by real statements out of the rule.
+ *
+ *  ⚠ And state the bound honestly, because the comment this replaced did not:
+ *  this is a LAYOUT rule, and a layout rule is defeated by layout. Three blank
+ *  lines between stanzas still passes. It is calibrated against dumps that
+ *  tools and people actually emit — contiguous `env` output, and the sectioned
+ *  `.env` above — NOT against an author working to evade the door, who has
+ *  easier paths than reformatting. It raises the cost of an ACCIDENT; it is not
+ *  a barrier to a determined bypass and must not be described as one.
+ *
+ *  ⚠ Widening this is a behaviour change, not a tuning knob: the tests pin the
+ *  bound against LITERAL layouts, not against this constant, precisely so that
+ *  raising it turns them red rather than moving with it. */
+export const ENVIRONMENT_DUMP_MAX_INERT_GAP = 2;
 
 /** Minimum length before an assignment's value is entropy-tested. Short values
  *  are ordinary config (`LOG_LEVEL=debug`); long random ones are not. */
@@ -101,8 +146,23 @@ const VENDOR_KEY_RE = new RegExp(
 // A single environment assignment line, anchored to line start under /m.
 const ENV_ASSIGNMENT_LINE = String.raw`^[ \t]*[A-Z][A-Z0-9_]{2,}=[^\r\n]*$`;
 
+// A line carrying no content of its own: blank, or a `#` comment.
+//
+// `#` only, deliberately. Widening to `//`, `;` or `--` was measured to change
+// nothing on either corpus (165 and 35 refused files, identical sets), and each
+// of them is a CODE prefix somewhere that matters here — `--set foo=bar \` is a
+// Helm continuation line, and onprem-k8s is full of them. Equal measured cost
+// means the narrowest option is free, so take it. `#` is also the comment
+// marker of every format this rule is actually about: `.env`, shell, YAML.
+const ENV_INERT_LINE = String.raw`^[ \t]*(?:#[^\r\n]*)?$`;
+
+// Assignment, then its line ending, then up to MAX_INERT_GAP inert lines.
+// Anything else between two assignments ends the run.
+const ENV_RUN_SEPARATOR =
+  `\\r?\\n(?:${ENV_INERT_LINE}\\r?\\n){0,${ENVIRONMENT_DUMP_MAX_INERT_GAP}}`;
+
 const ENVIRONMENT_DUMP_RE = new RegExp(
-  `(?:${ENV_ASSIGNMENT_LINE}\\r?\\n){${ENVIRONMENT_DUMP_MIN_RUN - 1},}${ENV_ASSIGNMENT_LINE}`,
+  `(?:${ENV_ASSIGNMENT_LINE}${ENV_RUN_SEPARATOR}){${ENVIRONMENT_DUMP_MIN_RUN - 1},}${ENV_ASSIGNMENT_LINE}`,
   "gm",
 );
 
