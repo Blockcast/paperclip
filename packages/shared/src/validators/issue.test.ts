@@ -40,21 +40,21 @@ describe("issue validators", () => {
       .toBeUndefined();
   });
 
-  it("normalizes JSON-escaped line breaks in issue descriptions", () => {
+  it("stores a literal backslash-n in an issue description verbatim", () => {
     const parsed = createIssueSchema.parse({
       title: "Follow up PR",
       description: "PR: https://example.com/pr/1\\n\\nShip the follow-up.",
     });
 
-    expect(parsed.description).toBe("PR: https://example.com/pr/1\n\nShip the follow-up.");
+    expect(parsed.description).toBe("PR: https://example.com/pr/1\\n\\nShip the follow-up.");
   });
 
-  it("normalizes escaped line breaks in issue update comments", () => {
+  it("stores a literal backslash-n in an issue update comment verbatim", () => {
     const parsed = updateIssueSchema.parse({
       comment: "Done\\n\\n- Verified the route",
     });
 
-    expect(parsed.comment).toBe("Done\n\n- Verified the route");
+    expect(parsed.comment).toBe("Done\\n\\n- Verified the route");
   });
 
   it("keeps issue attribution fields create-only", () => {
@@ -206,12 +206,12 @@ describe("issue validators", () => {
     ).toBe(false);
   });
 
-  it("normalizes escaped line breaks in issue comment bodies", () => {
+  it("stores a literal backslash-r backslash-n in an issue comment body verbatim", () => {
     const parsed = addIssueCommentSchema.parse({
       body: "Progress update\\r\\n\\r\\nNext action.",
     });
 
-    expect(parsed.body).toBe("Progress update\n\nNext action.");
+    expect(parsed.body).toBe("Progress update\\r\\n\\r\\nNext action.");
   });
 
   it("accepts structured issue comment presentation and metadata", () => {
@@ -256,17 +256,17 @@ describe("issue validators", () => {
     expect(parsed.success).toBe(false);
   });
 
-  it("normalizes escaped line breaks in generated task drafts", () => {
+  it("stores a literal backslash-n in a generated task draft verbatim", () => {
     const parsed = suggestedTaskDraftSchema.parse({
       clientKey: "task-1",
       title: "Follow up",
       description: "Line 1\\n\\nLine 2",
     });
 
-    expect(parsed.description).toBe("Line 1\n\nLine 2");
+    expect(parsed.description).toBe("Line 1\\n\\nLine 2");
   });
 
-  it("normalizes escaped line breaks in thread summaries and documents", () => {
+  it("stores a literal backslash-n in thread summaries and documents verbatim", () => {
     const response = respondIssueThreadInteractionSchema.parse({
       answers: [],
       summaryMarkdown: "Summary\\n\\nNext action",
@@ -276,8 +276,8 @@ describe("issue validators", () => {
       body: "# Plan\\n\\nShip it",
     });
 
-    expect(response.summaryMarkdown).toBe("Summary\n\nNext action");
-    expect(document.body).toBe("# Plan\n\nShip it");
+    expect(response.summaryMarkdown).toBe("Summary\\n\\nNext action");
+    expect(document.body).toBe("# Plan\\n\\nShip it");
   });
 
   it("clamps oversized requestDepth values on create", () => {
