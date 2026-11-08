@@ -49,12 +49,22 @@ Rules: lowercase after colon, no period, under 72 chars.
 
 ## PR Body Template
 
-Use the five `##` sections below **exactly as spelled**. They are enforced by
-`.github/scripts/check-pr-template.mjs`, which matches each heading with a
-case-sensitive `indexOf` on the literal string — `## What changed` does not
-satisfy `## What Changed`. A body missing any of them fails the `review` gate,
-and unlike `check-pr-linked-issue` and `check-pr-dedup-search` this checker has
-no skip list, so it fires on every PR regardless of the title prefix.
+The template below carries **seven** `##` sections. Use all seven, spelled
+exactly as shown.
+
+`.github/scripts/check-pr-template.mjs` enforces five of the seven —
+`## Thinking Path`, `## What Changed`, `## Verification`, `## Risks` and
+`## Model Used`. It matches each heading with a case-sensitive `indexOf` on the
+literal string — `## What changed` does not satisfy `## What Changed`. A body
+missing any of those five fails the `review` gate, and unlike
+`check-pr-linked-issue` and `check-pr-dedup-search` this checker has no skip
+list, so it fires on every PR regardless of the title prefix.
+
+The other two — `## Linked Issues or Issue Description` and `## Checklist` — are
+matched by no gate at all: `check-pr-linked-issue` and `check-pr-dedup-search`
+scan the whole body for a pattern and never read a heading. Write them anyway —
+they are where a reader looks for the backlink and the dedup checkbox, and where
+the text those two gates scan for conventionally sits.
 
 `.github/PULL_REQUEST_TEMPLATE.md` is the authoritative long form. GitHub only
 pre-fills it in the web UI, so a PR opened with `gh pr create --body-file` never
@@ -104,7 +114,7 @@ Three gates read the body, and each keys on something specific:
 
 | gate | what it reads | skips `docs\|chore\|build\|ci\|style\|test\|revert` prefixes |
 |---|---|---|
-| `check-pr-template` | the five `##` headings above | **no** |
+| `check-pr-template` | the five `##` headings named above | **no** |
 | `check-pr-linked-issue` | `Fixes:`/`Closes`/`Refs` + `#N` or `PREFIX-N`, or a `paperclip.blockcast.net` issue URL | yes |
 | `check-pr-dedup-search` | a `- [x]` checkbox line reading `searched … similar … PRs` | yes |
 
