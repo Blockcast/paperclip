@@ -3597,6 +3597,21 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("externalId=<the PR's URL>");
   });
 
+  // PEN-6056. The lookup matched `owner/repo` byte-exactly, so a casing difference
+  // in either segment returned `owners: []` with `withheldForAuthorizationCount: 0`
+  // -- byte-identical to a genuinely unowned pull request, including the one field
+  // this directive names as the escape hatch for a false empty. The server now
+  // folds the casing; this pins that the directive SAYS so. Without the clause a
+  // run holding an empty answer has no way to rule out its own typing, and the
+  // cheapest thing to try -- re-running under another casing -- is now pure waste.
+  it("tells the reader the owner/repo casing is folded", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("work-products/by-external-id");
+    expect(markdown).toContain("CASING IN `owner/repo` DOES NOT MATTER");
+    expect(markdown).toContain('externalIdMatch: "case_insensitive"');
+  });
+
   // PEN-5340 item 5, asserted as a prohibition rather than only as a presence.
   // The failure being closed is a run reading a complete-looking answer off the
   // one counter this sentence used to advertise, so it is not enough that the

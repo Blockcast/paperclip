@@ -647,4 +647,218 @@ describeEmbeddedPostgres("GET /api/companies/:companyId/work-products/by-externa
     expect(byId.get(second.id)!.relation).toBe("owner");
     expect(byId.get(mentioned.id)!.relation).toBe("mention");
   }, 120_000);
+
+  // PEN-6056. GitHub is case-insensitive on the OWNER segment, the stored key is
+  // whatever casing the webhook received, and a caller composing the key by hand
+  // has no way to know it. Byte-exact matching answered `owners: []` with
+  // `withheldForAuthorizationCount: 0` -- byte-identical to a genuinely unowned
+  // artifact, including the one field the pre-write directive names as the escape
+  // hatch for a false empty.
+  //
+  // THE TWO SEGMENTS ARE SEPARATE TESTS ON PURPOSE. A fix that folded only the
+  // owner, or only the repo, passes a test that varies both at once: the measured
+  // defect was that EACH segment alone loses every owner.
+  it("finds the owner when only the OWNER segment is cased differently", async () => {
+    const company = await seedCompany(db, "OwnerCase");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Owner");
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: owner.id,
+      externalId: PR,
+      owningIdentifiers: [`${company.issuePrefix}-1`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    // `Blockcast` -> `blockcast`; the repo segment and the number are untouched.
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: "blockcast/paperclip#3205" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(1);
+    expect(res.body.owners[0].issueId).toBe(owner.id);
+    expect(res.body.ownerListComplete).toBe(true);
+    // Echoed as the caller sent it, NOT rewritten to the stored casing: the echo
+    // exists so a caller can see the key its answer was computed for.
+    expect(res.body.externalId).toBe("blockcast/paperclip#3205");
+    // The stored row still carries GitHub's own casing -- nothing was rewritten.
+    expect(res.body.owners[0].workProduct.externalId).toBe(PR);
+  }, 120_000);
+
+  it("finds the owner when only the REPO segment is cased differently", async () => {
+    const company = await seedCompany(db, "RepoCase");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Owner");
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: owner.id,
+      externalId: PR,
+      owningIdentifiers: [`${company.issuePrefix}-1`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    // `paperclip` -> `Paperclip`; the owner segment and the number are untouched.
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: "Blockcast/Paperclip#3205" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(1);
+    expect(res.body.owners[0].issueId).toBe(owner.id);
+    expect(res.body.ownerListComplete).toBe(true);
+  }, 120_000);
+
+  // The URL form is what a run actually holds, and it is where the casing arrives
+  // from: a URL pasted out of a review comment carries whatever the pasting tool
+  // lower-cased.
+  it("finds the owner from a differently-cased pull-request URL", async () => {
+    const company = await seedCompany(db, "UrlCase");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Owner");
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: owner.id,
+      externalId: PR,
+      owningIdentifiers: [`${company.issuePrefix}-1`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: "https://github.com/blockcast/PAPERCLIP/pull/3205" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(1);
+    expect(res.body.owners[0].issueId).toBe(owner.id);
+  }, 120_000);
+
+  // The PR NUMBER must stay exact. Folding the whole canonical string is only safe
+  // because digits cannot change under a case fold -- this pins that the fold did
+  // not turn into a looser match on the way past.
+  it("still distinguishes two pull requests that differ only by number", async () => {
+    const company = await seedCompany(db, "Number");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Owner of 3205");
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: owner.id,
+      externalId: PR,
+      owningIdentifiers: [`${company.issuePrefix}-1`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: "blockcast/paperclip#3206" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toEqual([]);
+  }, 120_000);
+
+  // The other direction of the same fold, and the reason it is scoped to GitHub
+  // pull requests: a run that recorded the key in one casing must find it when it
+  // asks in GitHub's.
+  it("finds a row stored under a casing the caller did not use", async () => {
+    const company = await seedCompany(db, "StoredCase");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Owner");
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: owner.id,
+      // Stored lower-cased, asked for in GitHub's own casing.
+      externalId: "blockcast/paperclip#3205",
+      owningIdentifiers: [`${company.issuePrefix}-1`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toHaveLength(1);
+    expect(res.body.owners[0].issueId).toBe(owner.id);
+  }, 120_000);
+
+  // THE NEGATIVE CONTROL, and it is the half that makes the three above mean
+  // anything: an answer that is empty must still be empty. A fold implemented as a
+  // looser predicate would pass every test above and quietly report an unrelated
+  // repo's owners here.
+  it("does not fold two different repositories together", async () => {
+    const company = await seedCompany(db, "Distinct");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Owner of a different repo");
+    await seedWebhookPullRequest(db, {
+      companyId: company.id,
+      issueId: owner.id,
+      externalId: "Blockcast/penstock-llm-proxy-core#3205",
+      owningIdentifiers: [`${company.issuePrefix}-1`],
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toEqual([]);
+    // An empty answer is still reported as unverifiable rather than as "unowned".
+    expect(res.body.ownerListComplete).toBe(false);
+  }, 120_000);
+
+  // PEN-6056 done-when 2. The fold makes a casing miss unreachable, but that is a
+  // property of the SERVER and the caller is reading a RESPONSE. `externalIdMatch`
+  // is how a caller holding `owners: []` tells a server that folds from one that
+  // does not, without re-running the lookup under a second casing to find out.
+  it("states the match mode so an empty answer is attributable", async () => {
+    const company = await seedCompany(db, "MatchMode");
+    const agent = await seedAgent(db, company.id);
+    const app = await createApp(db, agentActor(company.id, agent.id));
+
+    const res = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR });
+
+    expect(res.status).toBe(200);
+    expect(res.body.owners).toEqual([]);
+    expect(res.body.externalIdMatch).toBe("case_insensitive");
+  }, 120_000);
+
+  // THE SCOPE OF THE FOLD, asserted rather than left to the helper's docblock. A
+  // git branch key names a ref and refs ARE case-sensitive -- `feature/Foo` and
+  // `feature/foo` are two branches -- so folding them would merge two real
+  // artifacts, which is the opposite failure and a worse one. Only the GitHub
+  // pull-request key folds.
+  it("keeps a non-pull-request key matching byte-exactly", async () => {
+    const company = await seedCompany(db, "Branch");
+    const agent = await seedAgent(db, company.id);
+    const owner = await seedIssue(db, company, 1, "Owner of a branch");
+    await db.insert(issueWorkProducts).values({
+      companyId: company.id,
+      issueId: owner.id,
+      type: "branch",
+      provider: "github",
+      externalId: "Blockcast/paperclip#3205",
+      title: "feature/Foo",
+      status: "active",
+      metadata: {},
+    });
+
+    const app = await createApp(db, agentActor(company.id, agent.id));
+
+    const exact = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR, type: "branch" });
+    expect(exact.status).toBe(200);
+    expect(exact.body.externalIdMatch).toBe("exact");
+    expect(exact.body.owners).toHaveLength(1);
+
+    const folded = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: "blockcast/paperclip#3205", type: "branch" });
+    expect(folded.status).toBe(200);
+    expect(folded.body.externalIdMatch).toBe("exact");
+    expect(folded.body.owners).toEqual([]);
+  }, 120_000);
 });

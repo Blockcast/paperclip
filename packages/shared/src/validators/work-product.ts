@@ -139,6 +139,61 @@ export function normalizeWorkProductExternalId(raw: string): string {
   return trimmed;
 }
 
+/**
+ * How `external_id` equality is decided for an artifact kind.
+ *
+ * PEN-6056. GitHub is case-insensitive on BOTH segments of `owner/repo`, and so
+ * is every tool a run actually holds the key in -- `gh`, a pasted browser URL, a
+ * repo name typed from memory. The STORED key is whatever casing the webhook
+ * received, which the caller has no way to know. Matching it byte-exactly made
+ * `Blockcast/penstock-llm-proxy-core#3055` and
+ * `blockcast/penstock-llm-proxy-core#3055` two different artifacts: the second
+ * returned `owners: []` with `withheldForAuthorizationCount: 0` -- byte-identical
+ * to a genuinely unowned pull request, including the one field the pre-write
+ * directive names as the escape hatch for a false empty. Nothing was withheld, so
+ * nothing was counted; the lookup simply matched no row. A caller following the
+ * "record the constraint on the owning row" directive exactly then recorded it
+ * nowhere, which is the failure that directive exists to prevent.
+ *
+ * NARROW ON PURPOSE. This is NOT "external ids are case-insensitive". A
+ * `type: "branch"` key names a git ref, and git refs ARE case-sensitive --
+ * `feature/Foo` and `feature/foo` are two branches -- so folding them would merge
+ * two real artifacts into one, which is the opposite failure and a worse one.
+ * Only the GitHub pull-request key folds, because only there is the
+ * case-insensitivity a property of the provider rather than an assumption about
+ * the caller.
+ *
+ * Folding the WHOLE canonical `owner/repo#123` is both safe and sufficient: the
+ * `#123` is digits, which no case fold can touch, so the number stays exact
+ * without being split out and compared separately.
+ */
+export type WorkProductExternalIdMatchMode = "case_insensitive" | "exact";
+
+export function workProductExternalIdMatchMode(
+  provider: string,
+  type: string,
+): WorkProductExternalIdMatchMode {
+  return provider.toLowerCase() === "github" && type === "pull_request"
+    ? "case_insensitive"
+    : "exact";
+}
+
+/**
+ * The value to compare against a column folded the same way. Keeping the fold in
+ * ONE function is what stops the query side and the index expression drifting
+ * apart -- a mismatch there reintroduces the empty answer silently, since a
+ * lookup that matches nothing looks exactly like an artifact nobody owns.
+ */
+export function workProductExternalIdMatchKey(
+  provider: string,
+  type: string,
+  externalId: string,
+): string {
+  return workProductExternalIdMatchMode(provider, type) === "case_insensitive"
+    ? externalId.toLowerCase()
+    : externalId;
+}
+
 export const workProductExternalIdLookupQuerySchema = z.object({
   externalId: z
     .string()

@@ -60,6 +60,26 @@ export const issueWorkProducts = pgTable(
       table.provider,
       table.externalId,
     ),
+    // PEN-6056 (migration 0279). Backs the case-insensitive arm of
+    // `listOwnersByExternalId`: GitHub treats both segments of `owner/repo`
+    // case-insensitively, so the reverse lookup folds the key, and the index above
+    // cannot serve a folded comparison -- `lower(external_id)` is not the indexed
+    // value. Without this the lookup degrades to an (company_id, provider) range
+    // scan plus a heap filter over every artifact the company has ever recorded.
+    //
+    // NOT partial on `provider = 'github' and type = 'pull_request'`, even though
+    // that is exactly when the folded arm runs. The query binds provider and type
+    // as PARAMETERS, and Postgres can only prove a partial index applicable against
+    // constants -- a partial index here would be built, look correct, and never be
+    // chosen. Both columns are therefore ordinary leading keys instead.
+    companyProviderTypeFoldedExternalIdIdx: index(
+      "issue_work_products_company_folded_external_id_idx",
+    ).on(
+      table.companyId,
+      table.provider,
+      table.type,
+      sql`lower(${table.externalId})`,
+    ),
     companyUpdatedIdx: index("issue_work_products_company_updated_idx").on(
       table.companyId,
       table.updatedAt,
