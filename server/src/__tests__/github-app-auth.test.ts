@@ -175,38 +175,122 @@ describe("getInstallationToken", () => {
 
 describe("githubGetPullRequestGate", () => {
   it.each([
-    { state: "open", merged: false, closed_at: null },
-    { state: "closed", merged: false, closed_at: "2026-11-05T08:37:27Z" },
-    { state: "closed", merged: true, closed_at: "2026-10-30T11:02:04Z" },
-  ] as const)("returns the authoritative PR gate state: $state merged=$merged", async (gate) => {
-    setCreds();
-    const fetchMock = vi.fn(async (url: string | URL) => {
-      if (String(url).includes("/access_tokens")) {
-        return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-      }
-      expect(String(url)).toContain("/repos/Blockcast/paperclip/pulls/847");
-      return jsonResponse(gate);
-    });
-    vi.stubGlobal("fetch", fetchMock);
+    {
+      body: { state: "open", merged: false, closed_at: null, merged_by: null },
+      expected: { state: "open", merged: false, closedAt: null, mergedBy: null },
+    },
+    {
+      body: {
+        state: "closed",
+        merged: false,
+        closed_at: "2026-11-05T08:37:27Z",
+        merged_by: null,
+      },
+      expected: {
+        state: "closed",
+        merged: false,
+        closedAt: "2026-11-05T08:37:27Z",
+        mergedBy: null,
+      },
+    },
+    {
+      // PEN-6055: a merged pull request names its merger, and GitHub's actor object
+      // carries far more than the three fields kept. The extra keys are dropped
+      // rather than passed through, so the stored shape is the documented one.
+      body: {
+        state: "closed",
+        merged: true,
+        closed_at: "2026-10-30T11:02:04Z",
+        merged_by: {
+          login: "allyblockcast[bot]",
+          id: 290875700,
+          type: "Bot",
+          node_id: "BOT_kgDOEU3dtA",
+          site_admin: false,
+        },
+      },
+      expected: {
+        state: "closed",
+        merged: true,
+        closedAt: "2026-10-30T11:02:04Z",
+        mergedBy: { login: "allyblockcast[bot]", id: 290875700, type: "Bot" },
+      },
+    },
+  ] as const)(
+    "returns the authoritative PR gate state: $body.state merged=$body.merged",
+    async ({ body, expected }) => {
+      setCreds();
+      const fetchMock = vi.fn(async (url: string | URL) => {
+        if (String(url).includes("/access_tokens")) {
+          return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+        }
+        expect(String(url)).toContain("/repos/Blockcast/paperclip/pulls/847");
+        return jsonResponse(body);
+      });
+      vi.stubGlobal("fetch", fetchMock);
 
-    // `closedAt` is surfaced alongside `{ state, merged }` so the closed-unmerged
-    // retirement can tell a durable close from a close/reopen transient (PEN-5662).
-    // Carried through verbatim: this reader does not parse it, and the one consumer
-    // that does treats anything unparseable as "fall back to the shipped rule".
+      // `closedAt` is surfaced alongside `{ state, merged }` so the closed-unmerged
+      // retirement can tell a durable close from a close/reopen transient (PEN-5662).
+      // Carried through verbatim: this reader does not parse it, and the one consumer
+      // that does treats anything unparseable as "fall back to the shipped rule".
+      //
+      // `mergedBy` rides the same GET for the same reason (PEN-6055): the approval-gate
+      // reconciler already pays for this call to learn `merged`, and the actor is in
+      // the response it gets back.
+      await expect(githubGetPullRequestGate({
+        repoFullName: "Blockcast/paperclip",
+        prNumber: 847,
+      })).resolves.toEqual(expected);
+    },
+  );
+
+  it("keeps a partial merged_by rather than discarding the readable half (PEN-6055)", async () => {
+    // GitHub substitutes a `ghost` account for a deleted user, and a proxy could drop
+    // fields. Each field is independently nullable, so a partial actor still records
+    // what is known instead of collapsing to "unknown".
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) =>
+      String(url).includes("/access_tokens")
+        ? jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO })
+        : jsonResponse({
+            state: "closed",
+            merged: true,
+            closed_at: null,
+            merged_by: { id: 1845185 },
+          })));
+
     await expect(githubGetPullRequestGate({
       repoFullName: "Blockcast/paperclip",
       prNumber: 847,
     })).resolves.toEqual({
-      state: gate.state,
-      merged: gate.merged,
-      closedAt: gate.closed_at,
+      state: "closed",
+      merged: true,
+      closedAt: null,
+      mergedBy: { login: null, id: 1845185, type: null },
     });
+  });
+
+  it("reports an unreadable merged_by as absent rather than as a row of nulls (PEN-6055)", async () => {
+    // An actor object with none of the three fields readable carries no more
+    // information than its absence. Reading it must never fail the lookup: the gate
+    // verdict does not depend on who merged, only on whether it merged.
+    setCreds();
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) =>
+      String(url).includes("/access_tokens")
+        ? jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO })
+        : jsonResponse({ state: "closed", merged: true, closed_at: null, merged_by: "ghost" })));
+
+    await expect(githubGetPullRequestGate({
+      repoFullName: "Blockcast/paperclip",
+      prNumber: 847,
+    })).resolves.toEqual({ state: "closed", merged: true, closedAt: null, mergedBy: null });
   });
 
   it("normalises a missing closed_at to null rather than undefined", async () => {
     // GitHub always sends the field, but a proxy or a future payload change could
     // drop it. `null` keeps the success arm one shape, so a consumer destructuring
-    // it cannot tell "absent" from "present and empty" by accident.
+    // it cannot tell "absent" from "present and empty" by accident. `mergedBy`
+    // follows the same rule for the same reason.
     setCreds();
     vi.stubGlobal("fetch", vi.fn(async (url: string | URL) =>
       String(url).includes("/access_tokens")
@@ -216,7 +300,12 @@ describe("githubGetPullRequestGate", () => {
     await expect(githubGetPullRequestGate({
       repoFullName: "Blockcast/paperclip",
       prNumber: 847,
-    })).resolves.toEqual({ state: "closed", merged: false, closedAt: null });
+    })).resolves.toEqual({
+      state: "closed",
+      merged: false,
+      closedAt: null,
+      mergedBy: null,
+    });
   });
 
   it("threads the caller's signal into the installation-token mint, not just the resource fetch (BLO-38257)", async () => {

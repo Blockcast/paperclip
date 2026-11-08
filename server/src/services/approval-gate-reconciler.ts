@@ -55,6 +55,7 @@ import {
   githubGetPullRequestGate,
   githubGetWorkflowRun,
   type PullRequestGateResult,
+  type PullRequestMerger,
   type WorkflowRunLookup,
 } from "./github-app-auth.js";
 
@@ -265,7 +266,23 @@ type GateDisposition =
    * which is a different rule and not this PR's to change.
    */
   | { kind: "unreadable"; reason: string }
-  | { kind: "terminal"; summary: string; satisfied: boolean; url: string | null };
+  | {
+      kind: "terminal";
+      summary: string;
+      satisfied: boolean;
+      url: string | null;
+      /**
+       * Who merged the pull request, for a `github_pr_merged` gate that merged
+       * (PEN-6055). Absent on every other disposition: the Actions arm has no such
+       * actor, and a closed-unmerged pull request was merged by nobody.
+       *
+       * Carried structurally as well as in `summary` so the announcement can record
+       * the actor in a `key_value` row. The prose answers a human reading one card;
+       * only the structured row answers "which of these 40 cancellations were bot
+       * merges?" without re-parsing a sentence.
+       */
+      mergedBy?: PullRequestMerger | null;
+    };
 
 function toRows<T>(rows: unknown): T[] {
   return (Array.isArray(rows) ? rows : ((rows as { rows?: unknown[] })?.rows ?? [])) as T[];
@@ -456,10 +473,48 @@ export function classifyPullRequestGateLookup(
 
   return {
     kind: "terminal",
-    summary: `state=\`closed\`, merged=\`${lookup.merged ? "true" : "false"}\``,
+    summary: lookup.merged
+      ? `state=\`closed\`, merged=\`true\`, ${describeMerger(lookup.mergedBy)}`
+      : "state=`closed`, merged=`false`",
     satisfied: lookup.merged,
     url: null,
+    mergedBy: lookup.merged ? (lookup.mergedBy ?? null) : null,
   };
+}
+
+/**
+ * Render the merger for the retirement note (PEN-6055).
+ *
+ * ## What this fixes
+ *
+ * The note used to record that the gated pull request merged and nothing about who
+ * merged it, leaving the card `cancelled` with `decidedByUserId: null` and no actor
+ * anywhere on it. A merge-ask's `payload.gate` is scoped to the ACT (`github_pr_merged`)
+ * while its `payload.body` routinely asks for a specific ACTOR — "a human with merge
+ * rights". An automated merge therefore satisfies the gate and retires the ask, and the
+ * resulting cancellation was byte-identical to one where a human did what was asked.
+ * Measured over the 40 reconciler cancellations in the 2026-11-06/07 window: 35 human
+ * merges and 5 bot merges, indistinguishable from the cards alone.
+ *
+ * ⚠️ This records the actor; it does NOT judge it. Whether an automated lander is
+ * authorised is a separate question this sweep takes no position on, and the note is
+ * deliberately neutral — a bot merge is rendered in the same shape as a human one, with
+ * `type` carrying the distinction. The sweep's `satisfied` verdict is untouched: the
+ * gate is still the merge, and it still terminates on one.
+ *
+ * ## `unknown` rather than omission
+ *
+ * An unreadable actor prints `unknown` instead of dropping the clause, so every merged
+ * retirement carries a `merged_by=` token. Omitting it would make "GitHub did not name a
+ * merger" indistinguishable from "this note predates PEN-6055" — the same
+ * absence-reads-as-clean failure this change exists to remove, one layer up.
+ */
+function describeMerger(merger: PullRequestMerger | null | undefined): string {
+  if (!merger) return "merged_by=`unknown`";
+  const login = merger.login ?? "unknown";
+  const id = merger.id === null || merger.id === undefined ? "unknown" : String(merger.id);
+  const type = merger.type ?? "unknown";
+  return `merged_by=\`${login}\` (id \`${id}\`, type \`${type}\`)`;
 }
 
 function gateLabel(gate: ApprovalGate, fallbackUrl: string | null): string {
@@ -554,6 +609,9 @@ function announcementBody(input: {
  */
 const RECONCILED_CARD_LABEL = "Reconciled approval card";
 
+/** Label of the metadata row naming who merged the gated pull request (PEN-6055). */
+const MERGED_BY_LABEL = "Merged by";
+
 /**
  * Dedupe key for an announcement, unique per (issue, approval).
  *
@@ -575,7 +633,9 @@ function announcementMetadata(input: {
   approvalId: string;
   gate: ApprovalGate;
   satisfied: boolean;
+  mergedBy?: PullRequestMerger | null;
 }): IssueCommentMetadata {
+  const isMergedPullRequest = input.gate.kind === "github_pr_merged" && input.satisfied;
   return {
     version: 1,
     sections: [
@@ -601,10 +661,35 @@ function announcementMetadata(input: {
                 : "Named run finished green",
             value: input.satisfied ? "yes" : "no",
           },
+          // PEN-6055: the actor, on the one disposition that has one. Emitted only for
+          // a merged pull request — an Actions gate has no merger, and a card retired
+          // on closed-unmerged was merged by nobody, so a row there would invent an
+          // actor to report as `unknown`.
+          ...(isMergedPullRequest
+            ? ([
+                {
+                  type: "key_value",
+                  label: MERGED_BY_LABEL,
+                  value: mergerRowValue(input.mergedBy),
+                },
+              ] as const)
+            : []),
         ],
       },
     ],
   };
+}
+
+/**
+ * The `Merged by` row's value: the same three fields `describeMerger` renders, without
+ * the note's backticks, since a `key_value` row is read as data rather than markdown.
+ */
+function mergerRowValue(merger: PullRequestMerger | null | undefined): string {
+  if (!merger) return "unknown";
+  const login = merger.login ?? "unknown";
+  const id = merger.id === null || merger.id === undefined ? "unknown" : String(merger.id);
+  const type = merger.type ?? "unknown";
+  return `${login} (id ${id}, type ${type})`;
 }
 
 async function listCandidateApprovals(
@@ -736,6 +821,7 @@ async function closeAndAnnounce(
               approvalId: candidate.id,
               gate,
               satisfied: disposition.satisfied,
+              mergedBy: disposition.mergedBy,
             }),
           })
           .onConflictDoNothing()
