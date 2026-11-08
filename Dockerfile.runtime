@@ -19,9 +19,14 @@ ARG USER_GID=1000
 RUN rm -f /etc/apt/apt.conf.d/docker-clean \
   && echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
 
+# `apt-get upgrade` because the harbor node mirror lags Debian point/security
+# releases, so packages inherited from the base stay vulnerable even on a fresh
+# runtime build (BLO-54733: libbrotli1, libsqlite3-0, libpcre2-8-0, apt; same
+# cause as BLO-51885).
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \
   apt-get update \
+  && apt-get -y upgrade \
   && apt-get install -y --no-install-recommends \
        ca-certificates gosu curl git wget ripgrep python3 \
        openssh-client rsync jq zsh \
