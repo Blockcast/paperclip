@@ -11,6 +11,75 @@ name: Docker (mcp-gateway)
 # Trigger: any change under packages/mcp-gateway/. Master and tags only;
 # no PR builds (HARBOR_PASSWORD org secret isn't available to forks
 # anyway, so a PR build would just 401 on push).
+#
+# PEN-6034 — THIS LANE USED TO FAIL SILENTLY, IN TWO SEPARATE WAYS.
+#
+# 1. A `timeout-minutes` KILL IS RECORDED AS `cancelled`, NOT `failure`.
+#    Run 42326582436 built e079fc2b for 15m13s against a 15-minute job
+#    ceiling and was killed. `sha-e079fc2` was never published and nothing
+#    said so: no signal in this repo keys on `cancelled`, and this workflow
+#    sets `cancel-in-progress: true`, so a routine supersede produces the
+#    identical conclusion. The only reason it surfaced is that PEN-5690
+#    happened to re-verify its CVE re-pin target instead of carrying it
+#    forward — one more careless step and a remediation would have been
+#    pinned to a tag no build ever produced.
+#
+#    Fixed at the source rather than only at the detector: `Build and push`
+#    now carries its own `timeout-minutes` STRICTLY BELOW the job ceiling.
+#    A step-level timeout concludes `failure` (banked from a real kill in
+#    this repo — run 34154564717 job 101843653563, pinned in
+#    scripts/__tests__/policy-step-kill-classifier.test.mjs), so an overrun
+#    is now loud by construction and never reaches the ambiguous path. The
+#    job ceiling above it is demoted to a pure backstop for a stall OUTSIDE
+#    the build step, and the alert jobs below classify it if it ever fires.
+#
+#    THE BUDGETS ARE MEASURED, NOT GUESSED. Job-level durations across all
+#    44 lifetime runs (fully paginated to 2026-05-14), which is the right
+#    unit because `timeout-minutes` bounds job EXECUTION and excludes queue
+#    wait:
+#
+#      worst SUCCESSFUL job      8.73 min  df2f245, 2026-07-23
+#      next worst                5.28 min  cdfc3df
+#      median                   ~1.7  min
+#      the two timeout kills    15.22 / 15.48 min, of which the
+#                               `Build and push` step alone took 14.37 / 13.27
+#
+#    PEN-6034 quotes df2f245 as a 28.0-minute success. That figure is
+#    `created_at -> updated_at` at RUN level and contains 17.7 min of queue
+#    wait; the job ran 8.73 min. The correction does not weaken the case —
+#    it strengthens it, because the two kills prove real demand ABOVE 14.4
+#    min in the build step whose true value is unknown, having been killed.
+#    So the budget cannot be sized from the successes alone. 30 min for the
+#    step matches what docker-designer, docker-webflow-bot and
+#    docker-figma-bot already give their build jobs, is 3.4x the worst
+#    observed success, and is twice the longest killed attempt. The job gets
+#    35 so the STEP is always what bites, with room for checkout/login/buildx
+#    (measured 36s-1m43s) and the post-steps.
+#
+#    FALSIFIER, pre-registered: if a `Build and push` step on master exceeds
+#    30 minutes within the next 20 terminal runs of this workflow, 30 is
+#    under-sized and must be re-derived from observed demand rather than from
+#    the sibling norm. PEN-5927 (#3511) makes the next build a guaranteed
+#    cold cache miss — it moves every FROM to a digest via build-args, so
+#    every layer cache key changes — which is the single most likely run to
+#    fire this falsifier and the one worth watching.
+#
+# 2. A FAILED BUILD REACHED NOBODY. `alert-on-failure` below routes the
+#    verdict to Alertmanager, the channel this org actually runs on
+#    (BLO-33382, PEN-5261). A `cancelled` is classified from the job's
+#    check-run annotations before it pages, because the conclusion field is
+#    ambiguous and the annotations are not — 4 of 4 cancellations in this
+#    workflow's history name their own cause, and only the kills page.
+#
+# ⚠ WHAT IS STILL NOT COVERED, AND IT IS NOT FIXABLE HERE. PEN-6034's
+# Finding 2 is a 34-day window with six qualifying pushes and ZERO runs. That
+# is not a defect of this file: across 2026-10, `GET /actions/runs?created=`
+# returns zero runs of ANY event type on 13 of 31 days — including the
+# contiguous block 10-13 -> 10-21 — while master took 13-106 commits on each
+# of those days, and all six of Finding 2's pushes land on such days. A run
+# that is never created cannot be detected from inside a run. That half needs
+# an observer outside GitHub Actions; it is recorded on PEN-6034 rather than
+# closed with a detector that shares the failure domain it is watching.
 
 on:
   push:
@@ -32,7 +101,14 @@ jobs:
     # (refs/tags/mcp-gateway-v*) keep a runner once group 1 is scoped to
     # master-pinned workflows (BLO-40782).
     runs-on: arc-paperclip-buildkit
-    timeout-minutes: 15
+    # PEN-6034: a BACKSTOP, not the operative budget. `Build and push` carries
+    # its own, lower `timeout-minutes` below, and that is what should ever bite
+    # — a step timeout concludes `failure`, a job timeout concludes `cancelled`
+    # and is indistinguishable from a supersede on the conclusion field alone.
+    # Reaching THIS ceiling means something stalled outside the build step, and
+    # the alert job classifies it from the job annotations rather than guessing.
+    # Keep it strictly above the step budget; the header derives both numbers.
+    timeout-minutes: 35
     concurrency:
       group: docker-mcp-gateway-${{ github.ref }}
       cancel-in-progress: true
@@ -99,6 +175,15 @@ jobs:
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push
+        # PEN-6034: THE OPERATIVE BUDGET, and the whole reason an overrun is now
+        # loud. A step-level timeout marks the step — and so the job — `failure`;
+        # the job-level ceiling marks it `cancelled`, which this workflow's own
+        # `cancel-in-progress: true` also produces on every routine supersede.
+        # Keeping this strictly below the job's 35 means the kill that actually
+        # happens is the self-reported one. Derivation in the file header; the
+        # relationship between the two numbers is asserted in
+        # scripts/check-mcp-gateway-image-alert-channel.test.js.
+        timeout-minutes: 30
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -115,3 +200,87 @@ jobs:
             ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && 'type=gha,scope=paperclip-mcp-gateway,mode=min,ignore-error=true' || '' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+
+  # PEN-6034. A build that publishes no image must reach somebody. Issues are
+  # DISABLED on this repository, so this routes through Alertmanager — the
+  # channel the org actually runs on, reachable from the in-cluster `arc-*`
+  # pools with no credential, and fanned to the paperclip-plugin-alertmanager
+  # webhook so it becomes a Paperclip issue in the platform lane, deduped on the
+  # alert fingerprint and refreshed in place. Same delivery path as
+  # docker-agent.yml (BLO-33382) and scheduled-guard-liveness.yml (PEN-5261).
+  #
+  # `cancelled` IS INCLUDED, AND THAT IS THE POINT OF THE ROW — a
+  # `timeout-minutes` kill is recorded as `cancelled`, so a condition keyed on
+  # `failure` alone would have missed run 42326582436 exactly as everything else
+  # did. It is also why the script CLASSIFIES before it pages: with
+  # `cancel-in-progress: true`, supersession is the ordinary outcome of two
+  # master landings in quick succession, and paging on every supersede would
+  # make this alert noise within a week. A noisy alert gets muted, and a muted
+  # alert is the silence this row exists to end.
+  alert-on-failure:
+    needs: [build-and-push]
+    if: >-
+      always() && github.event_name != 'workflow_dispatch' &&
+      (needs.build-and-push.result == 'failure' || needs.build-and-push.result == 'cancelled')
+    runs-on: arc-paperclip-light
+    # actions: read + checks: read are what let the script tell a timeout kill
+    # from a concurrency supersede and from a human cancel. All three report
+    # `cancelled`; only the annotations separate them, and without these scopes
+    # every cancellation would classify `unknown` and page (fail-closed, but
+    # uselessly noisy).
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Report the unpublished image to Alertmanager
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: firing
+          GH_REPO: ${{ github.repository }}
+          # Collapsed to a single value for tags so the label set stays bounded:
+          # the fingerprint hashes every label, and one identity per tag would
+          # fragment the alert the bridge dedupes on (BLO-28616).
+          BRANCH: ${{ github.ref_type == 'tag' && 'tags' || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        run: node .github/scripts/post-mcp-gateway-image-alert.mjs
+
+  # The other half of an honest alert: without it `endsAt` would be the only
+  # thing retiring the firing alert, so the lane would go quiet on a TIMER
+  # rather than on a fix. Pushing the identical label set with a past `endsAt`
+  # makes Alertmanager send `resolved` (send_resolved: true on the paperclip
+  # receiver), which cancels the issue.
+  #
+  # It is also the continuous capability probe. Gateway builds are sparse — 44
+  # in the six months to 2026-11-07, with a 34-day stretch carrying none — so a
+  # channel that rots here would otherwise be discovered by the next outage,
+  # which is precisely how BLO-33382 went unnoticed for 27h. Every green build
+  # exercises the exact delivery path the failure path depends on.
+  #
+  # A separate job rather than a step inside build-and-push, deliberately: a
+  # delivery failure here must not flip `build-and-push.result` to `failure` and
+  # fire a spurious "the build is failing" alert about itself.
+  resolve-on-success:
+    needs: [build-and-push]
+    if: >-
+      always() && github.event_name != 'workflow_dispatch' &&
+      needs.build-and-push.result == 'success'
+    runs-on: arc-paperclip-light
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Resolve the image-delivery alert (and prove the channel still works)
+        env:
+          BUILD_RESULT: ${{ needs.build-and-push.result }}
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          STATE: resolved
+          GH_REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_type == 'tag' && 'tags' || github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        run: node .github/scripts/post-mcp-gateway-image-alert.mjs
