@@ -72,21 +72,33 @@ runs:
         tarball="${dest}/actionlint.tar.gz"
         url="https://github.com/rhysd/actionlint/releases/download/v${VERSION}/actionlint_${VERSION}_linux_amd64.tar.gz"
 
-        # One retry, jittered. pr.yml fans out several jobs; a constant
-        # backoff would re-synchronise them into a second burst against a
-        # host that is already struggling. This survives a blip, not an
-        # outage — a sustained failure is still red, deliberately, because
-        # continuing without the linter is the bug being fixed.
-        for attempt in 1 2; do
-          if curl -sSL --fail --max-time 120 -o "$tarball" "$url"; then
+        # Six attempts, exponential and jittered (~2.5-3.5 min worst case).
+        # BLO-54857: on 2026-11-08 08:52-10:31Z GitHub's release-asset path
+        # returned 504 to the ARC runners intermittently (githubstatus
+        # "Increase in timeouts for some unauthenticated users"), failing 13
+        # of 50 `policy` runs, merge-queue included. Green runs were
+        # interleaved minutes apart, so the 504 is per-request, not an
+        # outage -- but two tries 10s apart lost the coin flip both times.
+        # Jitter so pr.yml's fan-out does not re-synchronise into a burst.
+        # A sustained outage is still red, deliberately: continuing without
+        # the linter is the bug this gate fixes.
+        max_attempts=6
+        for attempt in $(seq 1 "$max_attempts"); do
+          # -w names who answered (final URL after the redirect, peer IP,
+          # status), so a failure log identifies the hop that returned it.
+          if info=$(curl -sSL --fail --max-time 60 -o "$tarball" \
+              -w '%{http_code} %{remote_ip} %{url_effective}' "$url"); then
             break
           fi
-          if [ "$attempt" = "2" ]; then
-            echo "::error::Could not download actionlint ${VERSION} after 2 attempts."
+          echo "actionlint download attempt ${attempt}/${max_attempts} failed: ${info:-no response}"
+          if [ "$attempt" = "$max_attempts" ]; then
+            echo "::error::Could not download actionlint ${VERSION} after ${max_attempts} attempts."
             exit 1
           fi
-          delay=$(( 5 + RANDOM % 11 ))
-          echo "actionlint download failed; retrying once in ${delay}s"
+          base=$(( 5 * (1 << (attempt - 1)) ))
+          [ "$base" -gt 60 ] && base=60
+          delay=$(( base + RANDOM % 11 ))
+          echo "retrying in ${delay}s"
           sleep "$delay"
         done
 

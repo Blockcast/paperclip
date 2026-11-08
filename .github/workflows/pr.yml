@@ -1144,30 +1144,19 @@ jobs:
       # ever running at PR time. Running it here separates "the code under
       # review is broken" from "a PR needs a human".
       #
-      # `setup-python` explicitly rather than a bare `python3`: this job runs on
-      # `arc-merge-queue` for merge_group events, that scale set is currently
-      # at zero replicas, and its image's python is therefore unverifiable --
-      # on a job every PR and every merge-queue candidate depends on, an
-      # unproven `command not found` would be worse than the gap it closes.
-      # setup-python is image-independent and is this repo's own pattern for
-      # python (docker-figma-bot.yml / docker-webflow-bot.yml), verified green
-      # on the ARC fleet. 3.10 matches those two; the suite uses no 3.11+
-      # constructs.
-      - name: Set up Python for the review-gate sweep suite
+      # The image's system python3, not actions/setup-python (BLO-54857).
+      # setup-python had no 3.10 in the runner toolcache, so every run fetched
+      # the interpreter tarball from GitHub's release CDN; on 2026-11-08 that
+      # fetch 504'd for ~1h40m and failed the step on both arc-paperclip-light
+      # and arc-merge-queue -- while the very next step, run anyway via
+      # `!cancelled()`, passed all 262 tests on the image's own python3 on
+      # BOTH scale sets (jobs 128687124089, 128701290125). The suite is
+      # stdlib-only, so the download bought nothing but an outage dependency.
+      # The floor below keeps the old "3.10+" contract fail-closed.
+      - name: Check python3 for the review-gate sweep suite
         if: ${{ !cancelled() }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-        # ~2.6x the 1.95m p100. This is a 100% tool-cache miss by
-        # construction -- both the fast and the slow run log "Version 3.10 was
-        # not found in the local cache" and then fetch the interpreter tarball
-        # from the python-versions release page -- i.e. an unconditional
-        # network draw on every run, which is exactly the degraded-registry
-        # mode this BLO-28813 -> BLO-31690 family is about. `setup-python`'s
-        # `cache:` input caches pip packages, not the interpreter, so it is a
-        # no-op against this term; bounding it is what makes a slow draw fail
-        # as itself.
-        timeout-minutes: 5
+        run: python3 -c 'import sys; print(sys.version); assert sys.version_info >= (3, 10), "review-gate sweep suite needs python >= 3.10"'
+        timeout-minutes: 1
 
       - name: Test stalled-Ally-review sweep decision logic (BLO-28203)
         if: ${{ !cancelled() }}

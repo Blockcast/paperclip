@@ -115,20 +115,10 @@ function stepName(step) {
 // for asserting no figure at all -- the cap moves, and a number written beside
 // it rots silently into a lie.
 //
-// The setup bounds `assertSetupBounded` guards are larger and do NOT all clear
-// that hurdle the same way. Checkout is step 1 and pnpm step 3, so nothing has
-// spent the budget before them and their 12m/3m bounds are reached as written.
-// `Set up Python` is NOT near the front -- step 43 of 77 as this is written,
-// and the exact index is expected to rot, which is the point: what matters is
-// only that dozens of steps precede it. Measured over 167 `policy` job attempts
-// in 2026-09-21..09-23, step-time already spent when it starts is p50 4.28m,
-// p90 7.32m. Its 5m bound is attribution only while that spend leaves 5m of
-// room under the cap, which today it does (the step's own p100 is 1.95m, so the
-// bound fires as intended in essentially every observed run). Checkout is the
-// dominant term in that preceding spend and drifts upward with history, so
-// checkout growth is what would convert python's bound from attribution into a
-// no-op -- re-check this one when checkout moves, rather than assuming the
-// step-1 argument covers it.
+// The setup bounds `assertSetupBounded` guards are larger. Checkout is step 1
+// and pnpm step 3, so nothing has spent the budget before them and their
+// bounds are reached as written. (A third, `Set up Python`, sat dozens of steps
+// in; it was removed in BLO-54857 in favour of the image's system python3.)
 //
 // Summing the bounds against the cap would be the wrong
 // stronger rule — bounds are per-step worst cases and every step is expected to
@@ -962,7 +952,6 @@ test("the chart render job pins the helm it renders with (BLO-31516)", () => {
 const POLICY_SETUP_STEPS = [
   { label: "checkout", marker: "uses: actions/checkout@" },
   { label: "pnpm", marker: "uses: ./.github/actions/setup-pnpm" },
-  { label: "python", marker: "uses: actions/setup-python@" },
 ];
 
 function findSetupStep(region, marker) {
