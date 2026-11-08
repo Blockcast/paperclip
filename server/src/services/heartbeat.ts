@@ -29590,7 +29590,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const [releasePendingSnapshot] = await db
       .select({
         count: sql<number>`count(*)`,
-        oldestUpdatedAt: sql<Date | null>`min(${externalRuntimeReservations.updatedAt})`,
+        // BLO-32052: age from when the row became releasable, not from launch. A
+        // reservation still `launched` under a terminal run becomes releasable at
+        // the run's finish; `greatest` ignores a null `finished_at`.
+        oldestUpdatedAt: sql<Date | null>`min(greatest(${externalRuntimeReservations.updatedAt}, ${heartbeatRuns.finishedAt}))`,
       })
       .from(externalRuntimeReservations)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, externalRuntimeReservations.runId))
@@ -29617,7 +29620,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const [orphanedLeaseSnapshot] = await db
       .select({
         count: sql<number>`count(*)`,
-        oldestAcquiredAt: sql<Date | null>`min(${environmentLeases.acquiredAt})`,
+        // BLO-32052: a lease is orphaned from its run's finish, not its acquisition;
+        // lease lifetime made this gauge unusable as an alert gate.
+        oldestAcquiredAt: sql<Date | null>`min(greatest(${environmentLeases.acquiredAt}, ${heartbeatRuns.finishedAt}))`,
       })
       .from(environmentLeases)
       .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, environmentLeases.heartbeatRunId))
