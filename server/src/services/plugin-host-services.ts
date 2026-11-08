@@ -49,7 +49,7 @@ import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { createMilestonesService } from "./milestones.js";
 import { documentService } from "./documents.js";
-import { heartbeatService, type HeartbeatServiceOptions } from "./heartbeat.js";
+import { heartbeatService, type HeartbeatServiceOptions, type WakeupDispatchOutcome } from "./heartbeat.js";
 import { budgetService } from "./budgets.js";
 import { financeService } from "./finance.js";
 import { issueApprovalService } from "./issue-approvals.js";
@@ -2428,7 +2428,18 @@ export function buildHostServices(
           throw new Error(budgetBlock.reason);
         }
         const contextSource = params.contextSource ?? "plugin.issue.requestWakeup";
+        // PEN-6121 — collect the host's own reason for a declined wake. Until
+        // this sink existed a plugin saw `queued: false` and nothing else, so
+        // the six distinct gates behind it (heartbeats disabled, cooldown,
+        // inactive company, scheduling suppressed, worktree cutoff, capacity
+        // deferral) were one undiagnosable token. The escalation ladder in
+        // paperclip-plugin-alertmanager records this per determination.
+        const outcomeSink: WakeupDispatchOutcome = {
+          skipReason: null,
+          providerCapacityDeferred: false,
+        };
         const run = await heartbeat.wakeup(issue.assigneeAgentId, {
+          outcomeSink,
           source: "assignment",
           triggerDetail: "system",
           reason: params.reason ?? "plugin_issue_wakeup_requested",
@@ -2469,7 +2480,15 @@ export function buildHostServices(
             contextSource,
           },
         });
-        return { queued: Boolean(run), runId: run?.id ?? null };
+        return {
+          queued: Boolean(run),
+          runId: run?.id ?? null,
+          // Reported only on the declined path: a queued wake has no cause to
+          // name, and reporting one there would invite a reader to treat the
+          // field as the outcome rather than `queued`.
+          undeliveredReason: run ? null : outcomeSink.skipReason,
+          deferredForCapacity: !run && outcomeSink.providerCapacityDeferred,
+        };
       },
       async requestWakeups(params) {
         const companyId = ensureCompanyId(params.companyId);

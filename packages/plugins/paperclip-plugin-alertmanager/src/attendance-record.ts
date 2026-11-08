@@ -128,6 +128,15 @@ export interface AttendanceObservation {
   wakeOutcome: WakeOutcome;
   /** Fixed sentence only — never raw error text. See the migration's column comment. */
   wakeDetail?: string | null;
+  /**
+   * PEN-6121 — the host's own machine-readable token for why no run was
+   * enqueued (`agent.not_invokable`, `heartbeat.cooldown`, …).
+   *
+   * This is the triage column; `wakeDetail` is the prose one. `null` means NOT
+   * RECORDED — a branch that attempted no wake, or a host that dropped the wake
+   * without naming a cause — and never "delivered". Read `wakeOutcome` for that.
+   */
+  wakeCause?: string | null;
   escalationAttempt?: number | null;
   /**
    * The agent this determination was ABOUT — not, in general, an agent who was
@@ -162,8 +171,8 @@ export async function recordAttendanceObservation(
     await ctx.db.execute(
       `INSERT INTO ${ctx.db.namespace}.${ATTENDANCE_TABLE}
          (id, company_id, alert_issue_id, alertname, disposition, escalation_attempt,
-          subject_agent_id, wake_outcome, wake_detail, alert_liveness)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          subject_agent_id, wake_outcome, wake_detail, alert_liveness, wake_cause)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
       [
         randomUUID(),
         observation.companyId,
@@ -175,6 +184,7 @@ export async function recordAttendanceObservation(
         observation.wakeOutcome,
         observation.wakeDetail ?? null,
         observation.alertLiveness,
+        observation.wakeCause ?? null,
       ],
     );
   } catch (err) {

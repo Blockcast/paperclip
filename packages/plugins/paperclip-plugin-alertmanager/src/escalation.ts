@@ -2,13 +2,43 @@ import { randomUUID } from "node:crypto";
 import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
 import { isNonHumanUserSentinel } from "@paperclipai/shared";
 import { DEFAULT_COVER_CLOSE_HOLD_MINUTES, DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, alertStateRef } from "./constants.js";
-import { type WakeOutcome, recordAttendanceObservation } from "./attendance-record.js";
+import { UNDELIVERED_WAKE_OUTCOMES, type WakeOutcome, recordAttendanceObservation } from "./attendance-record.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
 
 /** Origin kind stamped on board-owned "chain exhausted" cover issues. */
 export const COVER_ORIGIN = "plugin:paperclip-plugin-alertmanager:escalation";
 const MAX_ATTEMPTS = 3;
+/**
+ * PEN-6121 — how many extra sweeps a rung may spend trying to DELIVER its wake
+ * before the ladder climbs past the agent it announced.
+ *
+ * Not a poll: a retry happens once per rung interval (the escalation deadline,
+ * tens of minutes to hours), on the sweep that was going to run anyway, and
+ * only while the alert is still firing and the row still unattended. Nothing
+ * here can hit a busy agent repeatedly — the host dedups by
+ * `alert-escalation:<issue>:<rung>` and the retry is one call per sweep.
+ *
+ * Bounded because the plugin cannot tell a recoverable cause from a permanent
+ * one: the host folds `paused` (clears when a seat resumes) and `terminated`
+ * (never clears) into one `agent.not_invokable` token and deliberately does not
+ * forward the finer status to a worker process. Unbounded retries would pin the
+ * whole ladder on a dead seat; two bounded ones cost a dead seat two rung
+ * intervals and then climb exactly as before.
+ */
+const MAX_WAKE_DELIVERY_RETRIES = 2;
+
+/**
+ * What one `issues.requestWakeup` attempt actually did.
+ *
+ * `cause` is the host's own machine-readable token — `agent.not_invokable`,
+ * `heartbeat.cooldown`, … — and is `null` when the host named none. It is the
+ * triage field; see `wakeDetailFor` for the operator-readable sentence.
+ */
+interface WakeAttempt {
+  outcome: WakeOutcome;
+  cause: string | null;
+}
 const COVERS_TABLE = "alert_escalation_covers";
 const MEMBERS_TABLE = "alert_escalation_cover_members";
 const STUCK_COVER_RECONCILE_LIMIT = 200;
@@ -920,7 +950,30 @@ async function advanceIssueLadder(
   const attempt = state.escalationAttempt ?? 0;
   const current = issue.assigneeAgentId ? await ctx.agents.get(issue.assigneeAgentId, companyId) : null;
 
-  if (!(attempt === 0 && current) && !(current?.reportsTo && attempt < MAX_ATTEMPTS)) {
+  // PEN-6121 — is this sweep finishing a rung whose wake the host never
+  // delivered, rather than starting a new one?
+  //
+  // The marker is compared against the issue's CURRENT assignee on purpose. If
+  // an operator (or a later rung) moved the row, the agent we failed to wake is
+  // no longer the owner, so re-waking them would be wrong and the marker
+  // retires itself with no special case.
+  const wakeRetries = state.escalationWakeRetries ?? 0;
+  const pendingWakeAgentId = state.escalationWakePendingAgentId ?? null;
+  const retryingWakeDelivery =
+    pendingWakeAgentId !== null &&
+    pendingWakeAgentId === (issue.assigneeAgentId ?? null) &&
+    wakeRetries < MAX_WAKE_DELIVERY_RETRIES;
+  // Retry sweeps spent at this rung once THIS attempt is counted. A fresh rung
+  // resets to 0: the count belongs to the rung, not to the alert.
+  const nextRetryCount = retryingWakeDelivery ? wakeRetries + 1 : 0;
+  const retriesRemainAfterThisAttempt = nextRetryCount < MAX_WAKE_DELIVERY_RETRIES;
+
+  // `retryingWakeDelivery` short-circuits the cover branch: the chain is not
+  // exhausted while the rung it is standing on was never actually delivered.
+  // Covering here would hand the board an escalation whose own last rung
+  // reached nobody — the exact shape PEN-6121 measured on `02f0018c` and
+  // `f57196cd`, each of which ran all three rungs undelivered.
+  if (!retryingWakeDelivery && !(attempt === 0 && current) && !(current?.reportsTo && attempt < MAX_ATTEMPTS)) {
     // Chain exhausted (or no agent owner at all): board cover. Cover creation
     // stays ahead of the state write — it dedups via originKind/originId (and,
     // cross-issue, via originFingerprint), so a partial failure retries next
@@ -987,7 +1040,18 @@ async function advanceIssueLadder(
   // this write, so losing the swap aborts the rung before anyone is paged
   // rather than after.
   const next = attempt + 1;
-  const advanced = await casAlertState(ctx, ref, state, { ...state, escalationAttempt: next, escalationComplete: false, nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString() });
+  // PEN-6121 — a retry re-claims the SAME rung. The counter must not advance,
+  // or "retry the delivery" silently becomes "escalate", which is the behaviour
+  // being fixed. `nextEscalationAt` still moves forward, so a retry costs one
+  // rung interval and never spins.
+  const claimedAttempt = retryingWakeDelivery ? attempt : next;
+  const claimed: AlertStateRecord = {
+    ...state,
+    escalationAttempt: claimedAttempt,
+    escalationComplete: false,
+    nextEscalationAt: new Date(now.getTime() + rungIntervalMs(state, config)).toISOString(),
+  };
+  const advanced = await casAlertState(ctx, ref, state, claimed);
   if (!advanced) {
     // A webhook rewrote the record while this rung was being assembled. It is
     // the authoritative writer, so it wins; re-deciding happens next sweep
@@ -997,36 +1061,52 @@ async function advanceIssueLadder(
     return;
   }
 
-  // PEN-2918 — the wake outcome is captured rather than discarded. Note the
-  // ORDER this records, because it is the defect being made visible: the
-  // escalation comment above asserts "waking current owner <name>" and is
-  // posted BEFORE the wake is attempted, and `requestWakeupBestEffort`
-  // swallows a refusal by design so the rung does not repeat. A paused agent,
-  // a budget block or an unresolved blocker therefore produced a thread
-  // claiming a wake, a log line nobody reads, and nothing else. The
-  // `wake_outcome` column is where "we said we woke them and we did not" now
-  // lands.
+  // PEN-6121 — the wake is attempted BEFORE the comment that reports it, and
+  // the comment states the outcome.
   //
-  // The comment text is deliberately NOT changed here. That would be a
-  // behaviour change, and this change is behaviour-neutral by construction;
-  // making the thread itself honest is a separate decision with a separate
-  // blast radius.
+  // PEN-2918 captured the outcome into `wake_outcome` and deliberately left
+  // this ordering alone as "a separate decision with a separate blast radius".
+  // The first read of that column is that decision's evidence: 23 of 29 rung
+  // wakes never reached a run (79.3%), over 11 alert rows, every one with the
+  // alert still firing — and the thread asserted every one of them. An agent
+  // arriving at "[alert-escalation 1/3] waking current owner Cto" had no way
+  // to learn that no run was ever enqueued.
+  //
+  // The comment-storm property the old ordering protected is preserved: the
+  // comment still sits BEHIND the CAS above, so a sweep that loses the swap
+  // posts nothing. What changes is only that the sentence is written after its
+  // subject is known. The reassignment stays ahead of the wake because
+  // `requestWakeup` wakes the issue's ASSIGNEE — the new owner has to be the
+  // assignee before there is anyone to wake.
   let notified: string | null = null;
-  let wake: WakeOutcome = "not_attempted";
-  if (attempt === 0 && current) {
+  let attemptedWake: WakeAttempt | null = null;
+  if (retryingWakeDelivery) {
+    // The rung was already announced and the owner already set; only the
+    // DELIVERY failed. Re-attempt it without reassigning anyone and without a
+    // second escalation comment — a repeat announcement would be the comment
+    // storm the CAS ordering exists to prevent, and nothing has changed that a
+    // reader needs told until the outcome does.
+    notified = issue.assigneeAgentId ?? null;
+    attemptedWake = await requestWakeupBestEffort(ctx, issue, companyId, attempt);
+    if (attemptedWake.outcome === "enqueued") {
+      await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt}/${MAX_ATTEMPTS}] The wake for ${current?.name ?? "the current owner"} reached the queue on retry ${wakeRetries + 1}; the earlier attempt at this rung was not delivered.\n\n${livenessLine(liveness, state, now)}`, companyId);
+    }
+  } else if (attempt === 0 && current) {
     notified = current.id ?? issue.assigneeAgentId ?? null;
-    await ctx.issues.createComment(issue.id, `[alert-escalation 1/${MAX_ATTEMPTS}] Escalation deadline reached with this issue still open; waking current owner ${current.name}.\n\n${livenessLine(liveness, state, now)}`, companyId);
-    wake = await requestWakeupBestEffort(ctx, issue, companyId, next);
+    attemptedWake = await requestWakeupBestEffort(ctx, issue, companyId, next);
+    await ctx.issues.createComment(issue.id, `[alert-escalation 1/${MAX_ATTEMPTS}] Escalation deadline reached with this issue still open; ${wakeSentence(current.name, attemptedWake, retriesRemainAfterThisAttempt)}\n\n${livenessLine(liveness, state, now)}`, companyId);
   } else if (current?.reportsTo) {
     const manager = await ctx.agents.get(current.reportsTo, companyId);
     notified = current.reportsTo;
     await ctx.issues.update(issue.id, { assigneeAgentId: current.reportsTo, assigneeUserId: null }, companyId);
-    await ctx.issues.createComment(issue.id, `[alert-escalation ${next}/${MAX_ATTEMPTS}] Escalation deadline reached again with this issue still open; reassigned from ${current.name} to ${manager?.name ?? current.reportsTo}.\n\n${livenessLine(liveness, state, now)}`, companyId);
     // Plugin-side issues.update does not fire core's assignment wake, so the
     // new owner is woken explicitly — otherwise the reassignment just sits in
     // their backlog until the next scheduled heartbeat.
-    wake = await requestWakeupBestEffort(ctx, issue, companyId, next);
+    attemptedWake = await requestWakeupBestEffort(ctx, issue, companyId, next);
+    await ctx.issues.createComment(issue.id, `[alert-escalation ${next}/${MAX_ATTEMPTS}] Escalation deadline reached again with this issue still open; reassigned from ${current.name} to ${manager?.name ?? current.reportsTo}. ${wakeSentence(manager?.name ?? current.reportsTo, attemptedWake, retriesRemainAfterThisAttempt)}\n\n${livenessLine(liveness, state, now)}`, companyId);
   }
+
+  const wake: WakeOutcome = attemptedWake?.outcome ?? "not_attempted";
   await recordAttendanceObservation(ctx, {
     companyId,
     alertIssueId: issue.id,
@@ -1035,9 +1115,70 @@ async function advanceIssueLadder(
     alertLiveness: liveness.state,
     wakeOutcome: wake,
     wakeDetail: wakeDetailFor(wake),
-    escalationAttempt: next,
+    wakeCause: attemptedWake?.cause ?? null,
+    escalationAttempt: claimedAttempt,
     subjectAgentId: notified,
   });
+
+  // PEN-6121 — persist (or retire) the undelivered-wake marker, so the next
+  // sweep retries the DELIVERY rather than climbing past an agent who was
+  // never woken.
+  //
+  // A second CAS rather than folding this into the claim above, because the
+  // outcome is not known until the wake has been attempted and the claim has
+  // to stay ahead of the side effects. Losing this swap is benign and is not
+  // retried here: an authoritative webhook rewrote the record, so the next
+  // sweep re-decides against ITS state, which is the same rule every other CAS
+  // in this file follows.
+  const markerNext: AlertStateRecord = UNDELIVERED_WAKE_OUTCOMES.includes(wake) && retriesRemainAfterThisAttempt
+    ? { ...claimed, escalationWakePendingAgentId: notified, escalationWakeRetries: nextRetryCount }
+    : { ...claimed, escalationWakePendingAgentId: null, escalationWakeRetries: 0 };
+  // Skipped when nothing moves, which is the common case: a delivered wake on a
+  // rung that carried no marker writes the same two fields it already had. That
+  // keeps a healthy rung at exactly one state write, as before this change.
+  const markerMoved =
+    (markerNext.escalationWakePendingAgentId ?? null) !== (claimed.escalationWakePendingAgentId ?? null) ||
+    (markerNext.escalationWakeRetries ?? 0) !== (claimed.escalationWakeRetries ?? 0);
+  if (markerMoved && !await casAlertState(ctx, ref, claimed, markerNext)) {
+    ctx.logger.info(`alert-escalation: wake-delivery marker for ${issue.identifier ?? issue.id} was not stored; alert state changed under the sweep`);
+  }
+}
+
+/**
+ * The half-sentence the escalation comment uses to report what the wake did.
+ *
+ * ⛔ Written so that the UNDELIVERED cases are the explicit ones. The defect
+ * this replaces was not a missing sentence — it was a confident one ("waking
+ * current owner X") that was wrong 79.3% of the time. A reader who skims must
+ * come away knowing whether anyone was actually woken, so the failure wording
+ * leads with the fact and never with the intent.
+ *
+ * `enqueued` is stated as "queued a run", not "woke": the host ACCEPTED the
+ * request. It is not evidence that a run started and it is never
+ * acknowledgement — the same distinction `wake_outcome` carries.
+ *
+ * ℹ️ `willRetry` is false only when retries are DISABLED
+ * (`MAX_WAKE_DELIVERY_RETRIES = 0`), because a first attempt always has the
+ * whole budget ahead of it and the retry branch does not call this function on
+ * a failure. That arm is therefore the kill switch's wording, not dead code:
+ * setting the bound to 0 restores the pre-PEN-6121 climb-immediately behaviour
+ * while keeping the thread honest about what happened.
+ */
+function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): string {
+  const retryClause = willRetry
+    ? " This rung is NOT spent: the next sweep retries the delivery before the ladder escalates."
+    : " The retry budget for this rung is spent; the ladder will escalate on the next sweep.";
+  const cause = wake.cause ? ` (${wake.cause})` : "";
+  switch (wake.outcome) {
+    case "enqueued":
+      return `queued a run for current owner ${name}.`;
+    case "refused":
+      return `**no run was queued for ${name}** — the host refused the wake${cause}.${retryClause}`;
+    case "declined":
+      return `**no run was queued for ${name}** — the host accepted the request and enqueued nothing${cause}.${retryClause}`;
+    default:
+      return `no wake was attempted for ${name}.`;
+  }
 }
 
 /**
@@ -1049,13 +1190,21 @@ async function advanceIssueLadder(
  * status, blocker, budget), a decline is about the agent or the company
  * (heartbeats disabled, cooldown, suppression, capacity). One sentence saying
  * "threw" would have been false for every decline.
+ *
+ * ⛔ PEN-6121 — BOTH sentences used to end "The escalation comment posted
+ * immediately before this asserts the wake regardless", which was true and is
+ * now false: the comment is written after the wake and states its outcome. They
+ * also used to route a reader to the plugin log for the cause, which never
+ * contained it — the ladder stringified the error and dropped the `details`
+ * carrying the discriminator. The cause now has its own column; these sentences
+ * point at it rather than restating a disjunction.
  */
 function wakeDetailFor(wake: WakeOutcome): string | null {
   switch (wake) {
     case "refused":
-      return "issues.requestWakeup threw; the error is in the plugin log. The escalation comment posted immediately before this asserts the wake regardless.";
+      return "issues.requestWakeup threw: the host refused the wake. Read wake_cause for which gate (agent.not_invokable, budget.blocked, company.inactive); a null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
     case "declined":
-      return "issues.requestWakeup resolved queued=false: the host accepted the call and enqueued no run (heartbeats disabled, cooldown, inactive company, scheduling suppressed, worktree cutoff, or a capacity deferral). The escalation comment posted immediately before this asserts the wake regardless.";
+      return "issues.requestWakeup resolved queued=false: the host accepted the call and enqueued no run. Read wake_cause for which gate (heartbeats disabled, cooldown, inactive company, scheduling suppressed, worktree cutoff, or a capacity deferral); a null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
     default:
       return null;
   }
@@ -1089,22 +1238,38 @@ function wakeDetailFor(wake: WakeOutcome): string | null {
  * `enqueued` means the host accepted the request. It is not evidence that a run
  * started, and it is not acknowledgement.
  */
-async function requestWakeupBestEffort(ctx: PluginContext, issue: SweepIssue, companyId: string, rung: number): Promise<WakeOutcome> {
+async function requestWakeupBestEffort(ctx: PluginContext, issue: SweepIssue, companyId: string, rung: number): Promise<WakeAttempt> {
   try {
     const result = await ctx.issues.requestWakeup(issue.id, companyId, { reason: "alert_escalation_deadline", contextSource: "alertmanager-escalation", idempotencyKey: `alert-escalation:${issue.id}:${rung}` });
     // Tested against `=== false` rather than falsiness on purpose: a host (or
     // a fake) that resolves without the field is making no claim either way,
     // and must not be reported as a drop.
     if ((result as { queued?: boolean } | null | undefined)?.queued === false) {
-      ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} was declined by the host (queued=false)`);
-      return "declined";
+      const cause = readWakeCause((result as { undeliveredReason?: unknown } | null | undefined)?.undeliveredReason);
+      ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} was declined by the host (queued=false, cause=${cause ?? "unrecorded"})`);
+      return { outcome: "declined", cause };
     }
-    return "enqueued";
+    return { outcome: "enqueued", cause: null };
   } catch (err) {
-    // The escalation comment already landed and the ladder state already
-    // advanced; a refused wake (paused agent, budget block) must not repeat
-    // the rung.
-    ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} failed: ${String(err)}`);
-    return "refused";
+    // PEN-6121 — the cause is lifted off the error BEFORE it is stringified.
+    // `String(err)` keeps the message and discards `details`, and the host puts
+    // its machine-readable token in `details.code` (forwarded to a worker as
+    // `PluginRpcError.data.code`). That discard is why 15 refusals were
+    // recorded over four days with `wake_detail` saying "the error is in the
+    // plugin log" and the log not containing the discriminator.
+    const cause = readWakeCause((err as { data?: { code?: unknown } } | null)?.data?.code);
+    ctx.logger.warn(`alert-escalation: wakeup for ${issue.identifier ?? issue.id} rung ${rung} failed (cause=${cause ?? "unrecorded"}): ${String(err)}`);
+    return { outcome: "refused", cause };
   }
+}
+
+/**
+ * Accepts the host's cause token only when it is a non-empty string.
+ *
+ * A host predating PEN-6121 omits the field, and `undefined` must record as
+ * `null` ("not recorded") rather than as the string "undefined" — this column
+ * is the triage key, and a literal "undefined" bucket would read as a cause.
+ */
+function readWakeCause(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
 }

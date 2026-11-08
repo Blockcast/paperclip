@@ -35,7 +35,9 @@ import {
   SUMMARY_CAVEATS,
   handleAttendanceApiRequest,
   isAttendanceRoute,
+  listUndeliveredWakes,
   resolveSince,
+  summariseAttendance,
   undeliveredWakeOutcomeSqlList,
 } from "../attendance-read.js";
 import {
@@ -297,6 +299,76 @@ describe("PEN-2918 (D) — acceptance, against real Postgres", () => {
     expect(comment).toContain("SUPERSEDES the header of migration 007");
     expect(comment).toContain("per determination over an already-open alert row");
     expect(comment).toContain("parkedUntil is not consulted");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PEN-6121 — the cause column
+// ---------------------------------------------------------------------------
+
+describe("PEN-6121 — an undelivered wake names which gate dropped it", () => {
+  let db: PGlite;
+  let ctx: PluginContext;
+
+  beforeAll(async () => {
+    db = new PGlite();
+    await applyMigrations(db);
+    await db.query(`INSERT INTO public.companies (id) VALUES ($1)`, [COMPANY]);
+    await db.query(`INSERT INTO public.issues (id) VALUES ($1)`, [ISSUE_A]);
+    ctx = realCtx(db).ctx;
+  });
+  afterAll(async () => { await db?.close(); });
+  beforeEach(async () => { await db.query(`DELETE FROM ${TABLE}`); });
+
+  const base = {
+    companyId: COMPANY,
+    alertIssueId: ISSUE_A,
+    alertname: "SyntheticAlert",
+    disposition: "unattended_rung" as const,
+    alertLiveness: "firing" as const,
+  };
+
+  it("round-trips the cause through the undelivered route", async () => {
+    await observe(ctx, db, { ...base, wakeOutcome: "refused", wakeCause: "agent.not_invokable" }, "2026-11-08T01:00:00Z");
+
+    const rows = await listUndeliveredWakes(ctx, COMPANY, new Date("2026-11-01T00:00:00Z"), 10);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.wakeCause).toBe("agent.not_invokable");
+  });
+
+  /**
+   * ⛔ A row written before this column existed, and a host that declined
+   * without naming a cause, are both NULL here. NULL means NOT RECORDED — it
+   * must never be read as "delivered", which is what `wake_outcome` answers.
+   */
+  it("reports a null cause as null rather than inventing one", async () => {
+    await observe(ctx, db, { ...base, wakeOutcome: "declined" }, "2026-11-08T01:00:00Z");
+
+    const rows = await listUndeliveredWakes(ctx, COMPANY, new Date("2026-11-01T00:00:00Z"), 10);
+    expect(rows[0]!.wakeCause).toBeNull();
+    expect(rows[0]!.wakeOutcome).toBe("declined");
+  });
+
+  /**
+   * The triage read: 15 of the 23 undelivered wakes in the founding
+   * measurement shared ONE cause, and nothing could say so.
+   */
+  it("aggregates undelivered wakes by cause, bucketing unrecorded ones separately", async () => {
+    await observe(ctx, db, { ...base, wakeOutcome: "refused", wakeCause: "agent.not_invokable" }, "2026-11-08T01:00:00Z");
+    await observe(ctx, db, { ...base, wakeOutcome: "refused", wakeCause: "agent.not_invokable" }, "2026-11-08T02:00:00Z");
+    await observe(ctx, db, { ...base, wakeOutcome: "declined", wakeCause: "heartbeat.cooldown" }, "2026-11-08T03:00:00Z");
+    await observe(ctx, db, { ...base, wakeOutcome: "declined" }, "2026-11-08T04:00:00Z");
+    // Delivered and not-attempted rows must not appear: they have no cause, and
+    // including them would bury the signal under deferrals.
+    await observe(ctx, db, { ...base, wakeOutcome: "enqueued" }, "2026-11-08T05:00:00Z");
+    await observe(ctx, db, { ...base, disposition: "attended_monitor", alertLiveness: "not_read", wakeOutcome: "not_attempted" }, "2026-11-08T06:00:00Z");
+
+    const summary = await summariseAttendance(ctx, COMPANY, new Date("2026-11-01T00:00:00Z"), 720);
+    expect(summary.byWakeCause).toEqual({
+      "agent.not_invokable": 2,
+      "heartbeat.cooldown": 1,
+      unrecorded: 1,
+    });
   });
 });
 
