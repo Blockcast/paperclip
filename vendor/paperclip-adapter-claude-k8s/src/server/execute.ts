@@ -2760,6 +2760,112 @@ async function deleteRunSecrets(
   }
 }
 
+/**
+ * PEN-2585. The harness system prompt tells every run it has a "persistent
+ * file-based memory" at `<sessionRoot>/.claude/projects/<cwd-slug>/memory/`.
+ * In `run` isolation `sessionRoot` is `/runtime-cache/paperclip-runs/<runId>/
+ * session` on a 20 GiB emptyDir, deliberately so — BLO-31443 keeps it per-run
+ * precisely so a saved session cannot be resumed against a root that never
+ * held it. The memory tree is collateral: it inherits an ephemerality the
+ * session wants and memory cannot survive.
+ *
+ * It fails in the one mode that produces no error. The `Write` succeeds, a
+ * same-run `Read` confirms the file, wikilinks resolve — every check available
+ * INSIDE the run passes, and the tree is gone at teardown. Measured on the Ceo
+ * seat: 9 of 40 banked memories absent, and the losing run's own verification
+ * had reported success. Only a cross-run read can see it, and nothing prompts
+ * for one.
+ *
+ * So the remedy is an announcement, not a mount: say which root is durable, at
+ * the one site every seat's charter already passes through. Moving `sessionRoot`
+ * onto the PVC instead would hand run B a `--resume` for a transcript run A
+ * wrote, which is the defect BLO-31443 exists to prevent.
+ *
+ * Pure and exported so the arms can be rendered in a test. The first revision
+ * assembled this inline and was pinned by source regexes, which is exactly why
+ * it shipped asserting ephemerality in every isolation mode (Ally review of
+ * #3537): a regex over the source can see that a sentence exists, never that
+ * the run receiving it is the run it is true of.
+ */
+export function buildMemoryDirective(input: {
+  /** The caller's one `resolveMountedAgentBundleHome` result — `""` when this pod mounts no agent bundle. */
+  memoryHome: string;
+  /** PEN-5191 invariant 8. False ⇒ the agent root is mounted READ-ONLY. */
+  serverHoldsDataClaim: boolean;
+  /**
+   * `isolation.storage.session === "ephemeral"`, which at the producer
+   * (`buildK8sRunIsolationDescriptor`, `server/src/services/heartbeat.ts` —
+   * grep `const persistent =`) is exactly `isolationMode === "run"`, the one
+   * mode whose `sessionRoot` is both run-scoped and off the volume.
+   *
+   * ⚠ Do NOT infer this from the path looking run-scoped, and do not default it
+   * true. `shared` isolation — whose own comment calls itself "the common case"
+   * — puts `sessionRoot` on the PVC, as do config-isolated runs and the
+   * disabled path. Telling one of those that its harness tree is scratch is
+   * this issue's failure with the sign FLIPPED, and the flipped sign is worse:
+   * a destroyed write eventually shows up as an absence, whereas a run that
+   * obeys "do not record anything you need next run" and records nothing is
+   * byte-identical to a run that had nothing to say. That arm can never be
+   * audited, so it is the one to get right first.
+   */
+  harnessSessionIsEphemeral: boolean;
+}): string {
+  const { memoryHome, serverHoldsDataClaim, harnessSessionIsEphemeral } = input;
+  // Naming the durable root is only half the remedy: a run told two roots and
+  // not told which claim is false has no way to choose, and the harness states
+  // its own with more authority. So the rebuttal is shared text on every arm —
+  // but it is a claim about THIS run's session root, so it is only ever as
+  // strong as what that root actually is.
+  const harnessClaim = harnessSessionIsEphemeral
+    ? `The harness system prompt names a memory directory under the run-scoped session root instead. ` +
+      `That tree is pod-local scratch: a write to it returns success and a same-run read confirms it, ` +
+      `and it is destroyed when this run ends, so nothing you can check from inside this run ` +
+      `distinguishes "persisted" from "persisted until teardown."`
+    : `The harness system prompt names a memory directory under this run's session root instead. ` +
+      `That root is NOT run-scoped in this pod, so that tree is not destroyed at teardown — but it is ` +
+      `addressed by the session root and the working directory, and nothing guarantees the next run ` +
+      `resolves the same path, so a write there is not reliably readable next run.`;
+  // Both negative arms end on the same question — this run has no writable
+  // canonical memory root, so what do I do with what I would have recorded —
+  // and the answer turns on the same fact `harnessClaim` turns on. Derived from
+  // it once, so no later edit can leave one arm asserting what the other denies.
+  const noDestinationTail = harnessSessionIsEphemeral
+    ? `There is no durable memory destination for this run: report what you would have recorded rather ` +
+      `than writing it somewhere that will not survive, and do not record anything you need next run.`
+    : `There is no canonical memory destination for this run: report what you would have recorded rather ` +
+      `than writing it somewhere the next run has no reason to look.`;
+  // Three cases, and the two negative ones are the point — a directive that only
+  // knew how to name a good path would have to invent one for the pods that have
+  // none, which is this bug by a new route.
+  if (!memoryHome) {
+    return (
+      `\n\nThis pod mounts no durable agent root, so no directory here is your seat's canonical memory ` +
+      `root. ${harnessClaim} ${noDestinationTail}`
+    );
+  }
+  if (serverHoldsDataClaim) {
+    return (
+      `\n\nYour durable memory root in this pod is ${memoryHome}/memory/ — it is on the mounted ` +
+      `data volume and survives this run. ${harnessClaim} Write memory to the durable root above, ` +
+      `and confirm next run that what you wrote is still there.`
+    );
+  }
+  // `resolveScopedWritableMounts` emits the agent root READ-ONLY on a foreign
+  // claim rather than dropping it, so the root exists and a write EROFSes.
+  // Saying "durable" here would be true of the directory and false of the write.
+  //
+  // It is also EMPTY: a per-agent claim is a fresh subvolume (see that function's
+  // own doc), and the canonical charter is read through the server's mount. So
+  // the run must be told what an absent tree there means, or it reads nothing and
+  // concludes it has never recorded anything — a false negative in the same
+  // family as the false positive this directive exists to close.
+  return (
+    `\n\nThis pod mounts your agent root ${memoryHome} READ-ONLY, so ${memoryHome}/memory/ can be ` +
+    `READ but a write to it fails with EROFS, and it is a fresh per-agent claim, so expect it to be ` +
+    `EMPTY: nothing there does not mean you never recorded anything. ${harnessClaim} ${noDestinationTail}`
+  );
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, runtime, config: rawConfig, onLog, onMeta } = ctx;
   const onExternalRuntimeLaunched = (ctx as AdapterExecutionContext & {
@@ -3232,46 +3338,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `have been delivered into the "${PROMPT_BUNDLE_INSTRUCTIONS_DIR}/" directory beside this file; ` +
           `resolve every relative instruction reference from there. ` +
           `A file named by these instructions but absent from that directory was not delivered and does not exist in this pod.`;
-      // PEN-2585. The harness system prompt tells every run it has a "persistent
-      // file-based memory" at `<sessionRoot>/.claude/projects/<cwd-slug>/memory/`.
-      // In `run` isolation `sessionRoot` is `/runtime-cache/paperclip-runs/<runId>/
-      // session` on a 20 GiB emptyDir, deliberately so — BLO-31443 keeps it per-run
-      // precisely so a saved session cannot be resumed against a root that never
-      // held it. The memory tree is collateral: it inherits an ephemerality the
-      // session wants and memory cannot survive.
+      // PEN-2585. The memory directive is built by `buildMemoryDirective` above —
+      // pure, exported and rendered in the tests, because its correctness is a
+      // property of WHICH arm a given run receives, which no regex over this file
+      // can see. The first revision learned that the expensive way.
       //
-      // It fails in the one mode that produces no error. The `Write` succeeds, a
-      // same-run `Read` confirms the file, wikilinks resolve — every check available
-      // INSIDE the run passes, and the tree is gone at teardown. Measured on the Ceo
-      // seat: 9 of 40 banked memories absent, and the losing run's own verification
-      // had reported success. Only a cross-run read can see it, and nothing prompts
-      // for one.
-      //
-      // So the remedy is an announcement, not a mount: say which root is durable, at
-      // the one site every seat's charter already passes through. Moving `sessionRoot`
-      // onto the PVC instead would hand run B a `--resume` for a transcript run A
-      // wrote, which is the defect BLO-31443 exists to prevent.
-      //
-      // Three cases, and the two negative ones are the point — a directive that only
-      // knew how to name a good path would have to invent one for the pods that have
-      // none, which is this bug by a new route.
-      const memoryHome = resolveMountedAgentBundleHome(config);
-      const harnessClaim =
-        `The harness system prompt names a memory directory under the run-scoped session root instead. ` +
-        `That tree is pod-local scratch: a write to it returns success and a same-run read confirms it, ` +
-        `and it is destroyed when this run ends, so nothing you can check from inside this run ` +
-        `distinguishes "persisted" from "persisted until teardown."`;
-      const memoryDirective = !memoryHome
-        ? `\n\nThis pod mounts no durable agent root, so NO memory directory here survives the run. ` +
-          `${harnessClaim} Treat it as scratch and do not record anything you need next run.`
-        : serverHoldsDataClaim
-          ? `\n\nYour durable memory root in this pod is ${memoryHome}/memory/ — it is on the mounted ` +
-            `data volume and survives this run. ${harnessClaim} Write memory to the durable root above, ` +
-            `and confirm next run that what you wrote is still there.`
-          : `\n\nThis pod mounts your agent root ${memoryHome} READ-ONLY, so ${memoryHome}/memory/ can be ` +
-            `READ but a write to it fails with EROFS. ${harnessClaim} There is no durable memory ` +
-            `destination for this run: read your existing memory from the root above, and report what you ` +
-            `would have recorded rather than writing it somewhere that will not survive.`;
+      // `jobIsolation.storage.session` is the only sound test for the rebuttal:
+      // `sessionRoot` is run-scoped and off the volume in `run` isolation and on
+      // the PVC in every other mode, and the path alone does not say which.
+      const memoryDirective = buildMemoryDirective({
+        memoryHome: resolveMountedAgentBundleHome(config),
+        serverHoldsDataClaim,
+        harnessSessionIsEphemeral: jobIsolation.storage.session === "ephemeral",
+      });
       instructionsContents = raw + pathDirective + memoryDirective;
     } catch (err) {
       await onLog(

@@ -153,6 +153,7 @@ const {
   describeProjectionRefusal,
   rememberProjectionSizingUnlessUncacheable,
   peekProjectionSizing,
+  buildMemoryDirective,
 } = await import("./execute.js");
 
 // Real class, not a stub: the prompt-cache mock above is a partial that passes
@@ -4864,59 +4865,124 @@ describe("execute: instructions path directive (PEN-5183, invariant 6)", () => {
 });
 
 describe("execute: durable memory directive (PEN-2585)", () => {
-  // Same source-level idiom and same reason as the block above: the directive is
-  // assembled inside `execute()` before the CLI is spawned.
-  //
   // The defect it closes is not a wrong path, it is a CONFIDENT one. The harness
   // system prompt calls `<sessionRoot>/.claude/projects/<cwd-slug>/memory/` a
   // "persistent file-based memory"; under `run` isolation that root is an emptyDir
   // and dies at teardown. Every check available inside the run passes anyway — the
   // write succeeds, the read confirms, the links resolve — so the only instrument
   // that sees the loss is a read in the NEXT run, which nothing asks for.
+  //
+  // These render the directive rather than regexing the source. The first revision
+  // did the latter and shipped asserting ephemerality in every isolation mode: a
+  // regex can see that a sentence exists, never that the run receiving it is the
+  // run it is true of.
 
-  it("appends the memory directive to the path directive, never instead of it", async () => {
-    // The two answer different questions — where siblings resolve, and where memory
-    // survives — and the second must not displace the first on either claim branch.
-    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
-    expect(source).toMatch(/instructionsContents = raw \+ pathDirective \+ memoryDirective;/);
-    expect(source).not.toMatch(/instructionsContents = raw \+ memoryDirective/);
+  const EPHEMERAL = { harnessSessionIsEphemeral: true };
+  const PERSISTENT = { harnessSessionIsEphemeral: false };
+  const HOME = "/paperclip/.paperclip/instances/default/companies/Penstock/agents/cto";
+
+  it("names the durable root and asks for the cross-run check", () => {
+    const text = buildMemoryDirective({ memoryHome: HOME, serverHoldsDataClaim: true, ...EPHEMERAL });
+    expect(text).toContain(`${HOME}/memory/`);
+    expect(text).toContain("survives this run");
+    // The only instrument that can see this failure. Nothing inside a run can
+    // distinguish "persisted" from "persisted until teardown."
+    expect(text).toContain("confirm next run that what you wrote is still there");
   });
 
-  it("contradicts the harness claim explicitly on every branch", async () => {
-    // Naming the durable root is only half the remedy. A run that is told two roots
-    // and not told which claim is false has no way to choose, and the harness states
-    // its own with more authority. So the rebuttal is shared text, not per-branch
-    // prose that a later edit could drop from one arm.
-    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
-    expect(source).toMatch(/const harnessClaim =/);
-    expect(source).toMatch(/That tree is pod-local scratch/);
-    expect(source).toMatch(/distinguishes "persisted" from "persisted until teardown\."/);
-    const branches = source.slice(source.indexOf("const memoryDirective ="), source.indexOf("instructionsContents = raw +"));
-    expect(branches.match(/\$\{harnessClaim\}/g)?.length ?? 0).toBe(3);
-  });
-
-  it("refuses to name a durable root when the pod mounts none", async () => {
+  it("refuses to name a durable root when the pod mounts none", () => {
     // The case that would reintroduce the bug by a new route: with no bundle on the
     // volume, AGENT_HOME falls back to the server-made workspace dir, which is ENOENT
     // in the pod. A directive that printed it would be the filed defect, re-filed.
-    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
-    expect(source).toMatch(/!memoryHome\s*\n?\s*\?\s*`\\n\\nThis pod mounts no durable agent root/);
-    expect(source).toMatch(/do not record anything you need next run/);
+    const text = buildMemoryDirective({ memoryHome: "", serverHoldsDataClaim: true, ...EPHEMERAL });
+    expect(text).toContain("mounts no durable agent root");
+    expect(text).toContain("do not record anything you need next run");
+    expect(text).not.toContain("survives this run");
+    expect(text).not.toMatch(/durable memory root in this pod is/);
   });
 
-  it("tells a foreign-claim run its memory root is readable but not writable", async () => {
-    // `resolveScopedWritableMounts` emits the agent root READ-ONLY on a foreign
-    // claim rather than dropping it, so the root exists and a write EROFSes. Saying
-    // "durable" there would be true of the directory and false of the write.
+  it("tells a foreign-claim run its memory root is readable, unwritable and empty", () => {
+    // `resolveScopedWritableMounts` emits the agent root READ-ONLY on a foreign claim
+    // rather than dropping it, so the root exists and a write EROFSes — and it is a
+    // fresh subvolume, so it is also empty. Both halves have to be said: "durable"
+    // would be true of the directory and false of the write, and an unannounced empty
+    // tree reads as "I have never recorded anything."
+    const text = buildMemoryDirective({ memoryHome: HOME, serverHoldsDataClaim: false, ...EPHEMERAL });
+    expect(text).toContain("READ-ONLY");
+    expect(text).toContain("fails with EROFS");
+    expect(text).toContain("EMPTY: nothing there does not mean you never recorded anything");
+    // It must DENY durability, not merely omit the promise. An arm that only described
+    // the mount would leave the run to infer the consequence, and the available
+    // inference is "mounted, therefore durable" — which is the error.
+    expect(text).toContain("There is no durable memory destination for this run");
+    expect(text).not.toContain("survives this run");
+  });
+
+  it("contradicts the harness claim on every branch", () => {
+    // Naming the durable root is only half the remedy. A run that is told two roots
+    // and not told which claim is false has no way to choose, and the harness states
+    // its own with more authority. So the rebuttal is on every arm, not prose a later
+    // edit could drop from one of them.
+    for (const serverHoldsDataClaim of [true, false]) {
+      for (const memoryHome of [HOME, ""]) {
+        for (const session of [EPHEMERAL, PERSISTENT]) {
+          const text = buildMemoryDirective({ memoryHome, serverHoldsDataClaim, ...session });
+          expect(text).toContain("The harness system prompt names a memory directory under");
+        }
+      }
+    }
+  });
+
+  // The Ally review of #3537 caught this and it is the reason the suite above renders
+  // instead of greps. `storage.session` is `"ephemeral"` only in `run` isolation; in
+  // `shared` (whose own comment calls it "the common case"), config-isolated and
+  // disabled modes `sessionRoot` is on the PVC. Asserting scratch there is this
+  // issue's failure with the sign FLIPPED — and the flipped sign is the worse one,
+  // because a run that obeys "do not record anything you need next run" and records
+  // nothing is byte-identical to a run that had nothing to say. That arm leaves no
+  // artifact, so nothing can ever audit it.
+  describe("the scratch claim is gated on the session root actually being run-scoped", () => {
+    it("asserts teardown only when the session storage is ephemeral", () => {
+      const text = buildMemoryDirective({ memoryHome: HOME, serverHoldsDataClaim: true, ...EPHEMERAL });
+      expect(text).toContain("pod-local scratch");
+      expect(text).toContain("destroyed when this run ends");
+      expect(text).toContain('distinguishes "persisted" from "persisted until teardown."');
+    });
+
+    it("never claims teardown on a persistent session root", () => {
+      for (const serverHoldsDataClaim of [true, false]) {
+        for (const memoryHome of [HOME, ""]) {
+          const text = buildMemoryDirective({ memoryHome, serverHoldsDataClaim, ...PERSISTENT });
+          expect(text).not.toContain("pod-local scratch");
+          expect(text).not.toContain("destroyed when this run ends");
+          expect(text).not.toContain("will not survive");
+          expect(text).not.toContain("do not record anything you need next run");
+          expect(text).toContain("NOT run-scoped in this pod");
+        }
+      }
+    });
+
+    it("still refuses to promise the harness tree on a persistent session root", () => {
+      // The symmetric error, and the reason this arm says something rather than
+      // nothing: a PVC-backed session root is not destroyed, but it is addressed by
+      // session root and cwd, so the next run is not guaranteed to resolve it. The
+      // run is owed that distinction, not a second confident claim in the other
+      // direction.
+      const text = buildMemoryDirective({ memoryHome: HOME, serverHoldsDataClaim: true, ...PERSISTENT });
+      expect(text).toContain("not reliably readable next run");
+      // ...and the canonical root is still the instruction.
+      expect(text).toContain(`${HOME}/memory/`);
+      expect(text).toContain("Write memory to the durable root above");
+    });
+  });
+
+  it("is appended to the path directive, never instead of it", async () => {
+    // The two answer different questions — where siblings resolve, and where memory
+    // survives — and the second must not displace the first on either claim branch.
+    // Structural by necessity: the composition happens inside `execute()`.
     const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
-    expect(source).toMatch(/READ-ONLY, so \$\{memoryHome\}\/memory\/ can be /);
-    expect(source).toMatch(/READ but a write to it fails with EROFS/);
-    // ...and it must DENY durability rather than merely omitting the promise. An arm
-    // that only described the mount would leave the run to infer the consequence, and
-    // the available inference is "mounted, therefore durable" — which is the error.
-    const foreignArm = source.slice(source.indexOf("READ-ONLY, so"), source.indexOf("instructionsContents = raw +"));
-    expect(foreignArm).toMatch(/There is no durable memory `?\s*\+?\s*`?destination for this run/);
-    expect(foreignArm).not.toMatch(/survives this run/);
+    expect(source).toMatch(/instructionsContents = raw \+ pathDirective \+ memoryDirective;/);
+    expect(source).not.toMatch(/instructionsContents = raw \+ memoryDirective/);
   });
 
   it("derives the root through the shared resolver, not a second spelling", async () => {
@@ -4924,13 +4990,17 @@ describe("execute: durable memory directive (PEN-2585)", () => {
     // path `buildEnvVars` exports as AGENT_HOME are the same function's output. Two
     // derivations could disagree, and both spellings look durable from inside the pod.
     const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
-    expect(source).toMatch(/const memoryHome = resolveMountedAgentBundleHome\(config\);/);
+    expect(source).toMatch(/memoryHome: resolveMountedAgentBundleHome\(config\),/);
     expect(source).toMatch(/^\s*resolveMountedAgentBundleHome,$/m);
     expect(source.match(/resolveMountedAgentBundleHome\(/g)?.length ?? 0).toBe(1);
   });
 
-  it("asks for the cross-run check, which is the only thing that can see the failure", async () => {
+  it("reads the session storage off the resolved isolation, not off the path", async () => {
+    // `sessionRoot` under `/runtime-cache/...` looks run-scoped and `.../k8s-isolation/...`
+    // looks durable, but only `storage.session` is authoritative — `buildK8sRunIsolationDescriptor`
+    // sets it from the isolation MODE, and `readDescriptorStorage` throws on anything
+    // that is not one of the two literals, so there is no third value to default.
     const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
-    expect(source).toMatch(/confirm next run that what you wrote is still there/);
+    expect(source).toMatch(/harnessSessionIsEphemeral: jobIsolation\.storage\.session === "ephemeral",/);
   });
 });
