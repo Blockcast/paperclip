@@ -171,6 +171,52 @@ export function rereadAttestations(commitMessages) {
 }
 
 /**
+ * Which commits in the range touch a watched file, and which of those carry a
+ * trailer of their own.
+ *
+ * INFORMATIONAL. It reaches no verdict and changes no exit code — `trailerOwed`
+ * is unchanged and still clears on ONE attestation anywhere in the range. That
+ * is deliberate and is not an oversight to be tightened later:
+ *
+ *  - A per-commit REQUIREMENT would red on the better behaviour. Measured on
+ *    PR #3336 (2026-11-03): two commits both touched
+ *    `github-git-egress-runtime.ts`, one carried the trailer, and that trailer
+ *    said "re-read BOTH runtime changes in this range" and named each. One
+ *    attestation reasoning about the combined change is worth more than two
+ *    narrow ones, and a security guard that reds on the right answer is a
+ *    security guard somebody deletes.
+ *  - It would also be satisfiable by pasting the same trailer onto every
+ *    commit, which adds mechanical compliance and no thought — the exact
+ *    failure `rereadAttestations` is written to refuse.
+ *
+ * What was actually missing is that NOTHING anywhere said the range had two
+ * touching commits and one attestation. The attester could not see what their
+ * trailer had to cover, and a reviewer could not check that it did. So this arm
+ * states that, and leaves the judgement where it already was.
+ *
+ * ⚠ It is NOT a decomposition of the range-wide `touched` arm and must not be
+ * read as one. `touched` comes from `git diff base...head` (three-dot, the
+ * merge-base diff); this reads `git log base..head` (two-dot), the same commit
+ * set `commitMessages` already uses, so the attestation count and the per-commit
+ * list can never disagree about which commits were considered. Merge commits
+ * carry no file list under `git log --name-only`, so a path arriving only
+ * through a merge appears in `touched` and in no row here. `touched` is the
+ * authoritative per-change arm; this one is the coverage note beside it.
+ */
+export function touchingCommits(commits) {
+  if (!Array.isArray(commits)) {
+    throw new Error(`commits must be an array of {sha, message, paths}; got ${commits}`);
+  }
+  return commits
+    .map((commit) => ({
+      sha: String(commit?.sha ?? ""),
+      touched: touchedWatchedPaths(commit?.paths),
+      attested: rereadAttestations([commit?.message]).length > 0,
+    }))
+    .filter((commit) => commit.touched.length > 0);
+}
+
+/**
  * Is the calendar review owed?
  *
  * `today < due` is clear. Once due, only a completion dated ON OR AFTER the due
@@ -227,10 +273,15 @@ export function reviewNoticeDue(today, notice = REVIEW_NOTICE, due = REVIEW_DUE)
 }
 
 /** The whole verdict, as data, so the renderer and the tests read the same thing. */
-export function evaluate({ changedPaths, commitMessages, today, headPaths }) {
+export function evaluate({ changedPaths, commitMessages, today, headPaths, commits }) {
   const touched = touchedWatchedPaths(changedPaths);
   const attestations = rereadAttestations(commitMessages);
   const trailerOwed = touched.length > 0 && attestations.length === 0;
+  // `null` when the caller supplied no per-commit input, so the report can say
+  // "(not measured)" rather than "(none)". Collapsing those two is how a report
+  // asserts a clean read that nothing performed, and this file refuses that
+  // everywhere else — see `fieldOrUnmeasured`.
+  const perCommit = commits == null ? null : touchingCommits(commits);
   const calendarOwed = reviewOwed(today);
   // Advisory only, and deliberately absent from `verdict` below — the ask was a
   // notice arm with no exit-code change, and this is the line that keeps it one.
@@ -247,6 +298,19 @@ export function evaluate({ changedPaths, commitMessages, today, headPaths }) {
     noticeDue,
     missing,
     watchStale,
+    perCommit,
+    // Informational, and deliberately absent from `verdict` below — the same
+    // line that keeps `noticeDue` a notice keeps this one a note.
+    //
+    // The predicate is exactly "a commit touched a watched file and did not
+    // attest to it", with no clause about how many commits are in the range. An
+    // earlier draft also required MORE THAN ONE touching commit, on the theory
+    // that a single commit could have nothing to say. That was wrong, and a
+    // mutation test is what showed it: with one touching commit whose trailer
+    // sits on a DIFFERENT commit, the extra clause suppressed the note on the
+    // one shape where the coverage question is sharpest. The fully-covered
+    // cases are already quiet without it, because `some` is false there.
+    coverageUnstated: perCommit != null && perCommit.some((c) => !c.attested),
     verdict: trailerOwed || calendarOwed || watchStale ? "owed" : "clear",
   };
 }
@@ -275,6 +339,19 @@ export function renderReport(result, { base, head, today } = {}) {
     // nothing. The two must never render the same.
     `touched        = ${fieldOrUnmeasured(result.touched)}`,
     `attestations   = ${result.attestations == null ? "(not measured)" : result.attestations.length}`,
+    // Which commits the one attestation count above had to cover. Nothing in
+    // this report said that before PEN-5186's 2026-11-08 re-read, so an
+    // attester could not see the range their trailer was clearing and a
+    // reviewer could not check that it covered it.
+    `touched_commits= ${
+      result.perCommit == null
+        ? "(not measured)"
+        : result.perCommit.length === 0
+          ? "(none)"
+          : result.perCommit
+              .map((c) => `${c.sha.slice(0, 9)} [${c.attested ? "trailer" : "no trailer"}]`)
+              .join(", ")
+    }`,
     `missing_at_head= ${fieldOrUnmeasured(result.missing)}`,
     `review_due     = ${REVIEW_DUE}  last_completed = ${REVIEW_LAST_COMPLETED ?? "(never)"}`,
     `review_notice  = ${REVIEW_NOTICE}`,
@@ -301,6 +378,25 @@ export function renderReport(result, { base, head, today } = {}) {
       "",
       "Context: docs/security/PEN-5016-github-publish-broker-enablement-plan.md §8,",
       "carrier row PEN-5186.",
+    );
+  }
+
+  if (result.coverageUnstated) {
+    const bare = result.perCommit.filter((c) => !c.attested).map((c) => c.sha.slice(0, 9));
+    lines.push(
+      "",
+      `NOTE — ${result.perCommit.length} commit(s) in this range touch a watched file.`,
+      `These carry no trailer of their own: ${bare.join(", ")}.`,
+      "",
+      "Nothing is owed and nothing is blocked: one trailer anywhere in the range",
+      "clears this check, on purpose. A single attestation that reasons about the",
+      "combined change is worth more than one pasted onto each commit, so this is a",
+      "note and not a second gate.",
+      "",
+      "It is here because the attestation is only sound if it COVERS the range, and",
+      "that is the one thing no assertion can check. If you wrote the trailer, say",
+      "which commits you read. If you are reviewing, this is the line that tells you",
+      "what the attestation had to cover.",
     );
   }
 
@@ -387,7 +483,57 @@ function emitReviewNotice(noticeDue) {
   );
 }
 
-function readRange(base, head) {
+/**
+ * Split one `git log --name-only --format=\x01%H\x02%B\x03` blob into commits.
+ *
+ * Separate and exported because it is the one piece of `readRange` that can
+ * fail SILENTLY. The git invocations around it fail loudly — a bad revision is
+ * a non-zero exit and `main` routes that to UNREADABLE — whereas a parser that
+ * does not recognise a chunk can simply return fewer commits than the range
+ * holds, and a short list renders as a shorter coverage note that looks exactly
+ * like a well-covered range.
+ *
+ * So an unreadable chunk THROWS rather than being skipped. The delimiters are
+ * control characters because %B is a raw body containing whatever an author
+ * typed; they are the bytes a commit message cannot carry.
+ */
+export function parsePerCommitLog(text) {
+  const commits = [];
+  for (const chunk of String(text ?? "").split("\x01")) {
+    if (!chunk.trim()) continue;
+    const shaEnd = chunk.indexOf("\x02");
+    const bodyEnd = chunk.indexOf("\x03");
+    if (shaEnd === -1 || bodyEnd === -1 || bodyEnd < shaEnd) {
+      throw new Error(`could not parse the per-commit log near: ${chunk.slice(0, 80)}`);
+    }
+    commits.push({
+      sha: chunk.slice(0, shaEnd).trim(),
+      message: chunk.slice(shaEnd + 1, bodyEnd),
+      paths: chunk
+        .slice(bodyEnd + 1)
+        .split("\n")
+        .map((l) => l.trim())
+        .filter(Boolean),
+    });
+  }
+  return commits;
+}
+
+/**
+ * Exported for the scratch-repo test below it in
+ * `check-git-egress-exec-closure-reread.test.mjs`. Everything this function
+ * does is a git invocation, so its flags cannot be covered by the pure-function
+ * cases: `--no-renames`, `--full-tree` and the per-commit delimiter parser were
+ * each justified in a comment and verified by hand, which is an argument rather
+ * than a test. A mutation that drops `--no-renames` from the per-commit log
+ * survived the whole suite until this was exported.
+ *
+ * `cwd` defaults to the process working directory, which is exactly how CI
+ * invokes this (from the repo root). It is a parameter only so the test can
+ * point it at a scratch repository without `process.chdir`, which is global
+ * state shared with every other case in the file.
+ */
+export function readRange(base, head, { cwd = process.cwd() } = {}) {
   // `--no-renames` is load-bearing, not tidiness. Rename detection is ON by
   // default (`diff.renames`, since git 2.9), and under it a renamed watched
   // file is reported ONLY at its new path — so the old path never appears,
@@ -397,7 +543,7 @@ function readRange(base, head) {
   const changedPaths = execFileSync(
     "git",
     ["diff", "--no-renames", "--name-only", `${base}...${head}`],
-    { encoding: "utf8" },
+    { cwd, encoding: "utf8" },
   )
     .split("\n")
     .map((l) => l.trim())
@@ -418,7 +564,7 @@ function readRange(base, head) {
   const headPaths = execFileSync(
     "git",
     ["ls-tree", "-r", "--full-tree", "--name-only", head, "--", ...WATCHED_PATHS],
-    { encoding: "utf8" },
+    { cwd, encoding: "utf8" },
   )
     .split("\n")
     .map((l) => l.trim())
@@ -426,10 +572,24 @@ function readRange(base, head) {
   // %B is the raw body, and the NUL delimiter keeps a message containing the
   // separator from splitting into two.
   const log = execFileSync("git", ["log", "--format=%B%x00", `${base}..${head}`], {
+    cwd,
     encoding: "utf8",
   });
   const commitMessages = log.split("\0").map((m) => m.trim()).filter(Boolean);
-  return { changedPaths, commitMessages, headPaths };
+  // The same two-dot commit set, split per commit with its own file list, for
+  // the coverage note. Read in one `git log` with three control-character
+  // delimiters rather than N+1 invocations: %B is a raw body that can contain
+  // anything a human types, so the separators have to be bytes a commit message
+  // cannot carry. `--no-renames` for the same reason it is on the diff above —
+  // under rename detection a moved watched file is reported only at its new
+  // path, and the move would show no touching commit at all.
+  const perCommitLog = execFileSync(
+    "git",
+    ["log", "--no-renames", "--name-only", "--format=\x01%H\x02%B\x03", `${base}..${head}`],
+    { cwd, encoding: "utf8" },
+  );
+  const commits = parsePerCommitLog(perCommitLog);
+  return { changedPaths, commitMessages, headPaths, commits };
 }
 
 async function main() {
@@ -464,7 +624,7 @@ async function main() {
     }
     console.error(`::error::cannot read the commit range, so the per-change arm could not run: ${rangeError}`);
     if (calendarOwed) {
-      console.log(renderReport({ touched: null, attestations: null, trailerOwed: false, calendarOwed, noticeDue, missing: null, watchStale: false, verdict: "owed" }, { base, head, today }));
+      console.log(renderReport({ touched: null, attestations: null, trailerOwed: false, calendarOwed, noticeDue, missing: null, watchStale: false, perCommit: null, coverageUnstated: false, verdict: "owed" }, { base, head, today }));
     }
     emitReviewNotice(noticeDue);
     process.exit(UNREADABLE);
