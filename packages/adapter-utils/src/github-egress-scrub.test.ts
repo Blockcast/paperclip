@@ -1698,6 +1698,98 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-6152 regression: a descriptive snake_case label value under error_code", () => {
+    // Derived, not embedded, throughout: every positive below is the exact
+    // material the SHIPPED rule refuses, so a contiguous `name=value` literal
+    // here would make this file unpushable until the fix deploys. Same
+    // convention as the BLO-51639 and PEN-3920 blocks above.
+    const pair = (name: string, value: string) => [name, value].join("=");
+    // A Paperclip error code: `<subsystem>_<what failed>`. Two segments over
+    // LEXICAL_LONG_SEGMENT_LENGTH, and the subsystem prefix carries the only
+    // digit, which is what lifts it to two character classes.
+    const ERROR_CODE = ["k8s", "concurrency", "guard", "unreachable"].join("_");
+    // Guards the negative controls against vacuity: a value that never reaches
+    // the entropy test proves nothing about a bound on the exemption. A
+    // digit-free snake_case value scores ONE class and is exonerated well
+    // before any rule in this file, so it is not a control either.
+    const reachesEntropyTest = (value: string) =>
+      value.length >= 24 && [/[a-z]/, /[A-Z]/, /[0-9]/].filter((re) => re.test(value)).length >= 2;
+
+    it("pins the shape this rule is about", () => {
+      expect(reachesEntropyTest(ERROR_CODE)).toBe(true);
+      const segments = ERROR_CODE.split("_");
+      expect(segments.filter((s) => s.length > 10)).toHaveLength(2);
+    });
+
+    it("passes an error_code label matcher byte-exact", () => {
+      const text = `paperclip_heartbeat_run_failed_total{${pair("error_code", `"${ERROR_CODE}"`)}}`;
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    it.each([
+      // An interior digit run, which JOB_NAME_RE's tail-only form refuses.
+      ["orc8r", "concurrency", "guard", "unreachable"],
+      // Two mixed segments, which isLexicalIdentifier refuses under any name.
+      ["k8s", "i18n", "concurrency", "guard", "unreachable"],
+      // Whatever `job` admits, admitted here too: the rule is a union with it.
+      // This one is over LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH, so only the
+      // union arm reaches it — isLexicalIdentifier refuses it under any name.
+      ["penstock", "registration", "config", "reconcile", "v2"],
+    ])("passes %s… through byte-exact", (...segments: string[]) => {
+      const value = segments.join("_");
+      const text = pair("error_code", value);
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+    });
+
+    it.each([
+      ["error_code", SYNTHETIC_OPAQUE_VALUE],
+      // A single opaque run cannot hide between underscores: the per-segment
+      // cap LEXICAL_SEGMENT_MAX_LENGTH is kept.
+      ["error_code", ["k8s", "abcdefghijklmnopq", "guard"].join("_")],
+      // Three digit runs: pins ALERT_NAME_MAX_DIGIT_RUNS, which is what bounds
+      // how many mixed segments a value may carry.
+      ["error_code", ["k8s", "i18n", "ipv6", "concurrency", "guard"].join("_")],
+      // A UUID and a hex digest stay opaque under the anchored name too.
+      ["error_code", ["386c81e8", "e454", "4f2a", "9b31", "7c5d2e8a1f04"].join("-")],
+      // The exemption is the conjunction of name AND shape: the same value
+      // under any other name is unchanged by this rule.
+      ["job", ["k8s", "concurrency", "guard", "unreachable"].join("_")],
+      ["reason", ["k8s", "concurrency", "guard", "unreachable"].join("_")],
+      ["token", ["k8s", "concurrency", "guard", "unreachable"].join("_")],
+    ])("still refuses a credential-shaped or unanchored value under %s", (name, value) => {
+      expect(reachesEntropyTest(value)).toBe(true);
+      const result = scrubGitHubEgressText(pair(name, value));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+
+    // PEN-6152's decision, pinned so it cannot be undone by a later "cleanup".
+    // Relaxing isLexicalIdentifier's long-segment count — the one conjunct that
+    // refused the value above — exonerates 20000/20000 random mixed-case
+    // letters-only tokens at every two-word split from 11+13 to 15+15, under
+    // EVERY binding name, against 0/20000 today. Keying it on equal-length
+    // segments blocks only the uniform column. These stay refused.
+    it.each([
+      ["Qwertyuiopas", "dfghjklzxcvbn"],
+      ["Mnbvcxzlkjhg", "fdsapoiuytrewq"],
+      ["Zaqwsxcdevfrb", "gtnhymjukilop"],
+      ["Plmoknijbuhvy", "gctfxrdzeswaq"],
+    ])("keeps two long mixed-case word segments refused under a bare name (%s)", (a, b) => {
+      for (const separator of ["-", "_", "."]) {
+        const value = [a, b].join(separator);
+        expect(reachesEntropyTest(value)).toBe(true);
+        expect(value.split(/[-._]/).filter((s) => s.length > 10)).toHaveLength(2);
+        for (const name of ["val", "error_code", "job"]) {
+          const result = scrubGitHubEgressText(pair(name, value));
+          expect(result.classes).toContain("high-entropy-assignment");
+        }
+      }
+    });
+  });
+
   describe("PEN-4637 regression: an absolute POSIX path is not a credential", () => {
     // Derived, not embedded, throughout. Every positive below is the exact
     // material the SHIPPED rule refuses, so a contiguous `name=value` literal

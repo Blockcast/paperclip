@@ -436,6 +436,64 @@ const SNAKE_CASE_VALUE_NAMES = new Set(["job"]);
  *  The digit-run cap still applies. */
 const BLACKBOX_MODULE_RE = /^[a-z]+\d{0,3}(?:_[a-z]+\d{0,3})+$/;
 
+/** PEN-6152: a Paperclip error-code label value, as a PromQL matcher in a
+ *  runbook, an alert rule or a dashboard JSON has to spell it — the value is
+ *  a fixed constant emitted by paperclip-api, so the refusal's standard advice
+ *  (derive it at runtime) is unavailable, and no allowlist exists by design
+ *  (docs/security/PEN-3920-egress-entropy-identifier-decision.md).
+ *
+ *  Measured false positive: ONE value out of the 140 distinct error codes in
+ *  this repo. A code is refused only when it clears HIGH_ENTROPY_MIN_LENGTH,
+ *  draws two character classes (so it must carry a digit — a digit-free
+ *  snake_case value scores one class and never reaches the entropy test), and
+ *  carries TWO segments over LEXICAL_LONG_SEGMENT_LENGTH. The fleet's codes
+ *  are `<subsystem>_<what failed>`, and the subsystem prefix is where the
+ *  digit lives, so this combination is a property of the naming convention
+ *  rather than an accident.
+ *
+ *  Routed through the NAME anchor, deliberately. The one conjunct standing in
+ *  the way is `isLexicalIdentifier`'s long-segment count, and relaxing it
+ *  there is REFUSED on measurement: `longSegments > 2` exonerates 20000/20000
+ *  random mixed-case letters-only tokens at every two-word split from 11+13 to
+ *  15+15 (24–30 characters, ~137 bits), under EVERY binding name in the fleet,
+ *  against 0/20000 today. That is the 23%-leaky shape PEN-3920 D1 already
+ *  declined, at 100%. Keying the relaxation on equal-length segments does not
+ *  rescue it: it blocks only the uniform column (15+15) and leaves 11+13,
+ *  12+14, 14+16 and 16+14 at 20000/20000.
+ *
+ *  SHAPE: the union of whatever `job` admits and `isLexicalIdentifier`'s own
+ *  segment grammar with the two AGGREGATE caps lifted. Those caps —
+ *  `longSegments > 1` and LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH — are entropy
+ *  bounds for a name-free rule; the per-segment bound LEXICAL_SEGMENT_MAX_LENGTH
+ *  is a shape bound and is KEPT, so a single opaque run cannot hide between
+ *  underscores. Written as a union with JOB_NAME_RE so non-regression against
+ *  the `job` shape is a property of the code and needs no corpus.
+ *
+ *  Residual, 200k random `[a-z0-9_]` tokens per length through the whole door,
+ *  one token set paired across every arm: 1033 / 32 / 1 per 200k at 24 / 32 /
+ *  40 characters, against `job`'s 956 / 28 / 1 on the same tokens — 1.08x /
+ *  1.14x / 1.0x, the band BLO-51639 already accepted for `module` (~1.1x).
+ *  Nothing moves under any other name: the disjunct below is gated on the
+ *  exact name, and the measured `val` column is unchanged to the count.
+ *
+ *  ⛔ The digit-run cap above still applies, and it is load-bearing here: each
+ *  mixed segment carries at least one digit run, so ALERT_NAME_MAX_DIGIT_RUNS
+ *  is what bounds how many of them a value may hold. Do not move this call out
+ *  from under it. And do not add a second name on the strength of this one —
+ *  `errorCode`, `reason` and `code` are NOT here, because no false positive has
+ *  been measured under them. Exact names, one at a time, each on a measured
+ *  case; see UUID_VALUE_NAMES for why the obvious generalisation is the change
+ *  to decline. */
+const ERROR_CODE_VALUE_NAMES = new Set(["error_code"]);
+
+function isErrorCodeValue(value: string): boolean {
+  if (JOB_NAME_RE.test(value)) return true;
+  if (!/^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(value)) return false;
+  const segments = value.split("_");
+  if (segments.some((s) => s.length > LEXICAL_SEGMENT_MAX_LENGTH)) return false;
+  return segments.every((s) => LEXICAL_SEGMENT_RE.test(s) || MIXED_LEXICAL_SEGMENT_RE.test(s));
+}
+
 /** BLO-50225: an orc8r network id — a canonical lowercase UUID — spelled out
  *  in a Prometheus label matcher (`networkID="…"`), which cannot derive it at
  *  runtime. A UUID is opaque by design and stays refused under every other
@@ -953,6 +1011,7 @@ function isContentDigestAssignment(name: string, value: string): boolean {
     if (CAMEL_CASE_VALUE_NAMES.has(name) && ALERT_NAME_RE.test(value)) return true;
     if (SNAKE_CASE_VALUE_NAMES.has(name) && JOB_NAME_RE.test(value)) return true;
     if (name === "module" && BLACKBOX_MODULE_RE.test(value)) return true;
+    if (ERROR_CODE_VALUE_NAMES.has(name) && isErrorCodeValue(value)) return true;
   }
   if (K8S_OBJECT_NAME_VALUE_NAMES.has(name) && isKubernetesObjectName(value)) return true;
   if (name === "pod" && isGeneratedPodName(value)) return true;
