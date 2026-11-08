@@ -1709,6 +1709,69 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-6163 regression: an alert name asserted by a lockstep guard test is not a credential", () => {
+    // Derived, not embedded, throughout: the SHIPPED rule refuses this pair,
+    // so writing it contiguously would make this file unpushable until the fix
+    // deploys. Same convention as the BLO-47509 and PEN-5406 blocks.
+    const KWARG = ["want", "in", "output"].join("_");
+    const pair = (name: string, value: string) => [name, value].join("=");
+    // The measured false positive: the onprem-k8s lockstep guard tests assert
+    // that a script prints a given alert name, so the alert name is a literal
+    // the test has to spell out and cannot derive.
+    const ALERT = "ArcScaleSetDarkWhileUnhealthy";
+
+    it("passes the asserted alert name through byte-exact, quoted or not", () => {
+      for (const text of [
+        `        ${pair(KWARG, `"${ALERT}"`)},`,
+        `    ${pair(KWARG, ALERT)}`,
+      ]) {
+        expect(scrubGitHubEgressText(text).text).toBe(text);
+        expect(scrubGitHubEgressText(text).redacted).toBe(false);
+        expect(locateGitHubEgressMatches(text)).toEqual([]);
+      }
+    });
+
+    // Shape half: the name alone exonerates nothing. A value that fails
+    // ALERT_NAME_RE — or carries more digit runs than D4 allows — is still
+    // refused under this name, exactly as it is under `alertname` and `kind`.
+    it.each([
+      SYNTHETIC_OPAQUE_VALUE,
+      // Digit-bearing beyond the two-run D4 bound.
+      "Kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5",
+      // A trailing bare acronym run, which fails the CamelCase shape.
+      "KqVtLmXbNdWpZcYrHjTgPsQF",
+      // Lowercase opaque: no CamelCase structure at all.
+      "kq2vt9lm4xb8nd3wp6zc1yr5",
+      // Separator-bearing: a `.` is outside ALERT_NAME_RE's alphabet.
+      // NB a `-` or `_` separated run of plain words is NOT a usable fixture
+      // here: it is exonerated name-free by isLexicalIdentifier, so it would
+      // pass under every name and pin nothing about this exemption.
+      ["ArcScaleSet", "DarkWhileUnhealthy"].join("."),
+    ])("still refuses the non-alert-name value %s bound to the assertion kwarg", (token) => {
+      const result = scrubGitHubEgressText(pair(KWARG, token));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(token);
+    });
+
+    // ⛔ The guard rail on the refused generalisation. If anyone replaces the
+    // exact name in CAMEL_CASE_VALUE_NAMES with a `want_*` prefix test or a
+    // `*_SELECTOR` suffix test, these fail. An UpperCamelCase value genuinely
+    // CAN be the credential under these names, so each must keep refusing
+    // until someone brings a measured false positive for it specifically.
+    it.each([
+      ["want", "token"].join("_"),
+      ["want", "secret"].join("_"),
+      ["want", "password"].join("_"),
+      ["API", "KEY", "SELECTOR"].join("_"),
+      ["CREDENTIAL", "SELECTOR"].join("_"),
+      ["want", "in", "output", "token"].join("_"),
+    ])("still refuses an alert-shaped value bound to %s", (name) => {
+      const result = scrubGitHubEgressText(pair(name, ALERT));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(ALERT);
+    });
+  });
+
   describe("PEN-3920 regression: an identifier carrying bounded digit runs is not a credential", () => {
     // Derived, not embedded, throughout this block: several of these pairs are
     // the exact material the SHIPPED rule refuses, so writing one contiguously

@@ -30,7 +30,7 @@ now be implemented and what may not; it is deliberately a set of bounds rather t
 
 This table is PEN-3920's own verdicts and is not the whole decision set. Later rows decided
 under the same governing rule are appended as numbered sections, each heading carrying its
-letter: D7 in section 9, D8 in section 10, D9 in section 11, D10 in section 12.
+letter: D7 in section 9, D8 in section 10, D9 in section 11, D10 in section 12, D11 in section 13.
 
 The row's `⛔` note stands and is re-affirmed: **do not raise `HIGH_ENTROPY_MIN_BITS_PER_CHAR`.**
 Reaching the measured cases needs 4.16 bits/char, above the 4.0 ceiling a 16-symbol alphabet
@@ -1300,3 +1300,90 @@ rule.
   floor. `BRANCH=<the same string>` is redacted, before D10 and after it. The row's conclusion
   — that the binding name discriminates — is right; that particular evidence had a second
   cause. A test pins both halves so the distinction cannot be lost.
+## 13. PEN-6163 (D11) — an alert name asserted by a lockstep guard test
+
+Measured 2026-11-08 against the shipped detector
+(`github-egress-scrub.js`, `sha256:8af54ecc6d3a71961507526d6546fdf84474b0f819f624dd0f4ac560f5288841`).
+Filed from a refused push of `Blockcast/onprem-k8s#8395`.
+
+### 13.1 The false positive
+
+`ALERT_NAME_RE` exonerates an UpperCamelCase alert name, but only under
+`CAMEL_CASE_VALUE_NAMES`, which was `{alertname, kind}`. Under any other binding name the
+identical value is `high-entropy-assignment`. Same value, both rows:
+
+| line | verdict |
+|---|---|
+| `alertname="<AlertName>"` | exempt |
+| `kind="<AlertName>"` | exempt |
+| the assertion kwarg `want_in_output`, bound to the same `<AlertName>` | **refused** |
+
+The `onprem-k8s` lockstep guard tests assert that a guard script prints a given alert name,
+so the alert name is a literal the test has to spell out. `scripts/check-arc-manifests.sh`
+makes a lockstep test close to mandatory for a new alert, so the family grows with the
+alert set. Three such test files exist today.
+
+### 13.2 Verdict: anchor the one exact name
+
+`want_in_output` joins `CAMEL_CASE_VALUE_NAMES`. The shape anchor (`ALERT_NAME_RE`, and the
+D4 digit-run bound) is unchanged. This is the same trade BLO-47509 made for `kind` and
+PEN-5406 made for `companyId`: one exact name, on a measured false positive.
+
+### 13.3 ⚠️ Where this differs from the two precedents, stated rather than smoothed over
+
+`alertname` and `kind` are **typed** bindings — the name itself constrains what the value may
+legitimately be, so name and shape agree and §4's name anchor is doing real work on its own.
+`want_in_output` is **untyped**: it means only *"whatever this test expects to find in some
+output"*, and puts no constraint of its own on the value. So under this name the **shape**
+anchor carries the whole trade.
+
+That is acceptable because the shape anchor is the half that was measured, and it is
+unchanged — but it should not be recorded as parity with the two precedents, and a future
+name that is *both* untyped *and* shape-free must be refused on these grounds.
+
+§4 still holds and was re-read before this was taken: an accidental leak does not choose its
+binding name. For material to reach this exemption it must land under one enumerated name
+**and** take the UpperCamelCase shape; accident arranges neither.
+
+### 13.4 Residual, 200,000 random values per cell
+
+Measured through the shipped rule at 24 / 32 / 40 characters:
+
+| alphabet | 24 | 32 | 40 |
+|---|---|---|---|
+| letters-only, mixed case | 2.28e-1 | 2.22e-1 | 2.14e-1 |
+| base62 | 1.80e-2 | 6.37e-3 | 2.14e-3 |
+| base64url | 7.32e-3 | 1.92e-3 | 5.05e-4 |
+| lowercase hex | 0 | 0 | 0 (0 of 600k) |
+
+The base62 column reproduces the `1.81e-2` D4 already records, which is the cross-check that
+this is the same measurement rather than a new one; the letters-only column reproduces §3's
+23%. The letters-only row is the adversarial worst case and is the honest number to quote
+*against* this exemption — it is also the alphabet in which no key, token or digest is
+issued. The alphabets an accidental paste actually arrives in are the lower three, and hex —
+the shape of every digest and most generated secrets here — is exonerated at zero.
+
+### 13.5 ⛔ Refused: a `want_*` prefix or a `*_SELECTOR` suffix
+
+This is the `/Id$/` cleanup declined for `UUID_VALUE_NAMES`, in the same shape. A pattern
+would exonerate `want_token`, `want_secret`, `want_password`, `API_KEY_SELECTOR` and
+`CREDENTIAL_SELECTOR`, where an UpperCamelCase value may genuinely be the credential. Exact
+names, one at a time, each on a measured false positive. A test pins those six as still
+refused so the generalisation cannot land silently; a mutation control confirms all six red
+under exactly that widening, and that the five shape pins stay green.
+
+### 13.6 Blast radius, and what this does *not* settle
+
+At `onprem-k8s` `fa88a4f` the three lockstep test files carry **81** `want_in_output=` lines
+and **0** of them are refused by the shipped door — the longest value asserted today is
+snake_case and exempt by a different route. (Positive control: planting the refused line into
+the same corpus yields exactly 1 refusal, so the zero is a real zero.) The hazard is therefore
+**prospective**, not an outstanding breakage: the cost of *not* taking D11 is a refused push the
+next time a guard test asserts an UpperCamelCase alert name, not an ongoing tax.
+
+⛔ **D11 does not discharge PEN-6162's precondition.** PEN-6162 (the unspaced-`=` gap) would, if
+its spaced arm ever landed, newly refuse a measured 325 lines in `Blockcast/paperclip`, whose
+largest classes are 72 lowerCamelCase metadata-key constants and 41 `this.name = "SomeError"`
+assignments. `ALERT_NAME_RE` reaches **neither** — they fail the *shape* half, not just the
+name half — so widening `CAMEL_CASE_VALUE_NAMES` cannot cover them. Those remain separate
+exemption decisions, each needing its own measurement, and they still gate any spaced arm.
