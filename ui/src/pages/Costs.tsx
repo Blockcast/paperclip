@@ -866,6 +866,17 @@ export function Costs() {
                         ) : (
                           <p className="text-sm text-destructive">
                             Project costs are unavailable for this range.
+                            {/* Keep the server's own wording. For a 503 statement
+                                timeout or a 403 it is the only clue to what went
+                                wrong, and the fixed sentence above hides it. */}
+                            {(byProjectError as Error).message ? (
+                              <>
+                                {" "}
+                                <span className="text-muted-foreground">
+                                  {(byProjectError as Error).message}
+                                </span>
+                              </>
+                            ) : null}
                           </p>
                         )
                       ) : byProjectLoading ? (

@@ -100,6 +100,14 @@ export function isClamped(from: string, window: ByProjectWindow): boolean {
 // claim to know the cap, and an unclamped request is the correct way to find
 // out. The refusal is cheap by construction -- PEN-5591 rejects before
 // touching the database, which is the whole point of it being a 400.
+//
+// shortcut: this only ever learns DOWNWARD-compatible information -- a cap is
+// recorded when the server refuses, never re-widened when it stops refusing.
+// If the server constant is raised, an already-open tab keeps clamping to the
+// old smaller value until it is reloaded, and nothing errors to say so. That
+// is bounded and harmless (a narrower window than asked for, reported as such
+// by `clampNotice`), and the alternative -- probing the full range again on
+// some interval -- reintroduces the expensive request the cap exists to stop.
 let rememberedCapDays: number | null = null;
 
 export function getRememberedCapDays(): number | null {
