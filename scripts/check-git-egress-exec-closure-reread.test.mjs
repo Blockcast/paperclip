@@ -28,6 +28,7 @@ import {
   reviewNoticeDue,
   reviewOwed,
   touchedWatchedPaths,
+  forAnnotation,
   parseCommitMessageLog,
   parsePerCommitLog,
   readRange,
@@ -683,6 +684,33 @@ test("readRange sees a RENAMED watched file at its old path, per commit too", ()
 const record = (sha, ...paths) => `\0${sha}\0${paths.map((p) => `${p}\0`).join("")}`;
 const SHA_A = "a".repeat(40);
 const SHA_B = "b".repeat(40);
+
+test("no derived text can forge a workflow command in an annotation", () => {
+  // A GitHub Actions workflow command is recognised PER LINE, so a newline
+  // inside an interpolated message ends the annotation and lets what follows be
+  // read as a command of its own. Measured at 42cca946: the commit message
+  // `\n::error::INJ-SENTINEL\n\x01x` reached the policy job's log as
+  // `::error::INJ-SENTINEL`, from a commit touching no watched file.
+  const injected = "\n::error::INJ-SENTINEL\n";
+  const flattened = forAnnotation(`could not parse the per-commit log near: ${injected}`);
+  assert.ok(!flattened.includes("\n"), `a line break survived: ${JSON.stringify(flattened)}`);
+  assert.ok(
+    flattened.includes("INJ-SENTINEL"),
+    "the text must still be READABLE -- a sanitiser that deletes the message hides the failure",
+  );
+  // Every line terminator, including the two this repo's own review-gate
+  // readers disagree about.
+  for (const sep of ["\n", "\r", "\r\n", "\u2028", "\u2029"]) {
+    assert.equal(forAnnotation(`a${sep}::error::x`), "a ::error::x", `${JSON.stringify(sep)} survived`);
+  }
+  // Bounded, so one hostile message cannot flood the log, and the truncation is
+  // visible rather than silent.
+  const long = forAnnotation("x".repeat(5000));
+  assert.ok(long.length <= 301, `not bounded: ${long.length}`);
+  assert.ok(long.endsWith("…"), "truncation must be marked");
+  assert.equal(forAnnotation(null), "");
+  assert.equal(forAnnotation(undefined), "");
+});
 
 test("an unreadable per-commit record is refused, not skipped", () => {
   // The silent-failure path: skipping a record returns FEWER commits than the

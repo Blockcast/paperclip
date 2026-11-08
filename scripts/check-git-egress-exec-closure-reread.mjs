@@ -492,6 +492,42 @@ function emitReviewNotice(noticeDue) {
 }
 
 /**
+ * Flatten derived text so it cannot forge a GitHub Actions workflow command.
+ *
+ * ⛔ A WORKFLOW COMMAND IS RECOGNISED PER LINE, so any newline inside a string
+ * interpolated into a `::warning::` or `::error::` ends that annotation and
+ * lets whatever follows be read as a new command. Three of the four call sites
+ * below interpolate a message derived from git — and after this PR added a
+ * per-commit read, one of them could carry a COMMIT MESSAGE, which is
+ * author-controlled and may contain anything but NUL.
+ *
+ * Measured at `42cca946`, before this: a commit whose message was
+ * `\n::error::INJ-SENTINEL\n\x01x` made the parser throw with the body in the
+ * error, and the policy job's log received `::error::INJ-SENTINEL` as a command
+ * of its own — from a commit touching no watched file. The NUL framing and the
+ * containment beside it already keep a commit message out of every annotation;
+ * this is the second layer, so that a message reaching one is merely ugly.
+ *
+ * Applied to the pre-existing `::error::` sites too. They carry git's stderr
+ * rather than a commit message and were not reachable this way on `master`, but
+ * one sanitised site beside three bare ones reads as though the other three had
+ * been examined and cleared. It changes no verdict and no exit code.
+ *
+ * ONE `\\s+` collapse does the whole job, and the redundant
+ * `[\\r\\n\\u2028\\u2029]+` pass that stood here first is deliberately gone: JS
+ * `\\s` is WhiteSpace PLUS LineTerminator, so it already matches `\\r`, `\\n` and
+ * U+2028/U+2029 — the two this repo's own review-gate readers disagree about.
+ * Deleting it was not tidying. With both passes present, removing either one
+ * left the test GREEN, so neither was pinned and the suite would have accepted
+ * a build with no sanitiser reachable by that case at all. A guard that two
+ * mechanisms both satisfy is a guard no mutation can red.
+ */
+export function forAnnotation(text, limit = 300) {
+  const flat = String(text ?? "").replace(/\s+/g, " ").trim();
+  return flat.length > limit ? `${flat.slice(0, limit)}…` : flat;
+}
+
+/**
  * Split a NUL-delimited `git log --format=%B%x00` blob into one message per
  * commit, IN TRAVERSAL ORDER AND WITHOUT DROPPING ANY.
  *
@@ -724,10 +760,13 @@ async function main() {
       calendarOwed = reviewOwed(today);
       noticeDue = reviewNoticeDue(today);
     } catch (error) {
-      console.error(`::error::${error.message}`);
+      console.error(`::error::${forAnnotation(error.message)}`);
       process.exit(UNREADABLE);
     }
-    console.error(`::error::cannot read the commit range, so the per-change arm could not run: ${rangeError}`);
+    console.error(
+      "::error::cannot read the commit range, so the per-change arm could not run: " +
+        forAnnotation(rangeError),
+    );
     if (calendarOwed) {
       console.log(renderReport({ touched: null, attestations: null, trailerOwed: false, calendarOwed, noticeDue, missing: null, watchStale: false, perCommit: null, coverageUnstated: false, verdict: "owed" }, { base, head, today }));
     }
@@ -739,7 +778,7 @@ async function main() {
   try {
     result = evaluate({ ...range, today });
   } catch (error) {
-    console.error(`::error::${error.message}`);
+    console.error(`::error::${forAnnotation(error.message)}`);
     process.exit(UNREADABLE);
   }
 
@@ -751,7 +790,7 @@ async function main() {
   if (range.commitsError) {
     console.error(
       "::warning::PEN-5186: the per-commit coverage note could not be measured and reads " +
-        `"(not measured)". This is informational and changes no verdict or exit code: ${range.commitsError}`,
+        `"(not measured)". This is informational and changes no verdict or exit code: ${forAnnotation(range.commitsError)}`,
     );
   }
   emitReviewNotice(result.noticeDue);
