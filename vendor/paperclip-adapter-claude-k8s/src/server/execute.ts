@@ -374,6 +374,12 @@ import {
   POD_LOG_STREAM_MARKER,
   resolveDataMountPath,
   resolveJobIsolation,
+  // PEN-2585: the directive below names this run's durable memory root, and
+  // `buildEnvVars` exports the same root as AGENT_HOME. Imported rather than
+  // re-derived for the same reason as `resolvePromptCacheRoot` above — two
+  // spellings of a durable path both LOOK durable, and a run handed the wrong
+  // one cannot tell, which is the whole failure mode this directive closes.
+  resolveMountedAgentBundleHome,
   sanitizeLabelValue,
   // PEN-4932: lives in job-manifest.ts because `buildJobManifest`'s
   // `data_claim_foreign` warning has to name the very directory this resolves.
@@ -3226,7 +3232,47 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           `have been delivered into the "${PROMPT_BUNDLE_INSTRUCTIONS_DIR}/" directory beside this file; ` +
           `resolve every relative instruction reference from there. ` +
           `A file named by these instructions but absent from that directory was not delivered and does not exist in this pod.`;
-      instructionsContents = raw + pathDirective;
+      // PEN-2585. The harness system prompt tells every run it has a "persistent
+      // file-based memory" at `<sessionRoot>/.claude/projects/<cwd-slug>/memory/`.
+      // In `run` isolation `sessionRoot` is `/runtime-cache/paperclip-runs/<runId>/
+      // session` on a 20 GiB emptyDir, deliberately so — BLO-31443 keeps it per-run
+      // precisely so a saved session cannot be resumed against a root that never
+      // held it. The memory tree is collateral: it inherits an ephemerality the
+      // session wants and memory cannot survive.
+      //
+      // It fails in the one mode that produces no error. The `Write` succeeds, a
+      // same-run `Read` confirms the file, wikilinks resolve — every check available
+      // INSIDE the run passes, and the tree is gone at teardown. Measured on the Ceo
+      // seat: 9 of 40 banked memories absent, and the losing run's own verification
+      // had reported success. Only a cross-run read can see it, and nothing prompts
+      // for one.
+      //
+      // So the remedy is an announcement, not a mount: say which root is durable, at
+      // the one site every seat's charter already passes through. Moving `sessionRoot`
+      // onto the PVC instead would hand run B a `--resume` for a transcript run A
+      // wrote, which is the defect BLO-31443 exists to prevent.
+      //
+      // Three cases, and the two negative ones are the point — a directive that only
+      // knew how to name a good path would have to invent one for the pods that have
+      // none, which is this bug by a new route.
+      const memoryHome = resolveMountedAgentBundleHome(config);
+      const harnessClaim =
+        `The harness system prompt names a memory directory under the run-scoped session root instead. ` +
+        `That tree is pod-local scratch: a write to it returns success and a same-run read confirms it, ` +
+        `and it is destroyed when this run ends, so nothing you can check from inside this run ` +
+        `distinguishes "persisted" from "persisted until teardown."`;
+      const memoryDirective = !memoryHome
+        ? `\n\nThis pod mounts no durable agent root, so NO memory directory here survives the run. ` +
+          `${harnessClaim} Treat it as scratch and do not record anything you need next run.`
+        : serverHoldsDataClaim
+          ? `\n\nYour durable memory root in this pod is ${memoryHome}/memory/ — it is on the mounted ` +
+            `data volume and survives this run. ${harnessClaim} Write memory to the durable root above, ` +
+            `and confirm next run that what you wrote is still there.`
+          : `\n\nThis pod mounts your agent root ${memoryHome} READ-ONLY, so ${memoryHome}/memory/ can be ` +
+            `READ but a write to it fails with EROFS. ${harnessClaim} There is no durable memory ` +
+            `destination for this run: read your existing memory from the root above, and report what you ` +
+            `would have recorded rather than writing it somewhere that will not survive.`;
+      instructionsContents = raw + pathDirective + memoryDirective;
     } catch (err) {
       await onLog(
         "stderr",

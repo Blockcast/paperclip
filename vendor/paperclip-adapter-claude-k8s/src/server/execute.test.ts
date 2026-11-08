@@ -4862,3 +4862,75 @@ describe("execute: instructions path directive (PEN-5183, invariant 6)", () => {
     expect(source).toMatch(/asString\(config\.instructionsRootPath, ""\)\.trim\(\) \|\|/);
   });
 });
+
+describe("execute: durable memory directive (PEN-2585)", () => {
+  // Same source-level idiom and same reason as the block above: the directive is
+  // assembled inside `execute()` before the CLI is spawned.
+  //
+  // The defect it closes is not a wrong path, it is a CONFIDENT one. The harness
+  // system prompt calls `<sessionRoot>/.claude/projects/<cwd-slug>/memory/` a
+  // "persistent file-based memory"; under `run` isolation that root is an emptyDir
+  // and dies at teardown. Every check available inside the run passes anyway — the
+  // write succeeds, the read confirms, the links resolve — so the only instrument
+  // that sees the loss is a read in the NEXT run, which nothing asks for.
+
+  it("appends the memory directive to the path directive, never instead of it", async () => {
+    // The two answer different questions — where siblings resolve, and where memory
+    // survives — and the second must not displace the first on either claim branch.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/instructionsContents = raw \+ pathDirective \+ memoryDirective;/);
+    expect(source).not.toMatch(/instructionsContents = raw \+ memoryDirective/);
+  });
+
+  it("contradicts the harness claim explicitly on every branch", async () => {
+    // Naming the durable root is only half the remedy. A run that is told two roots
+    // and not told which claim is false has no way to choose, and the harness states
+    // its own with more authority. So the rebuttal is shared text, not per-branch
+    // prose that a later edit could drop from one arm.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/const harnessClaim =/);
+    expect(source).toMatch(/That tree is pod-local scratch/);
+    expect(source).toMatch(/distinguishes "persisted" from "persisted until teardown\."/);
+    const branches = source.slice(source.indexOf("const memoryDirective ="), source.indexOf("instructionsContents = raw +"));
+    expect(branches.match(/\$\{harnessClaim\}/g)?.length ?? 0).toBe(3);
+  });
+
+  it("refuses to name a durable root when the pod mounts none", async () => {
+    // The case that would reintroduce the bug by a new route: with no bundle on the
+    // volume, AGENT_HOME falls back to the server-made workspace dir, which is ENOENT
+    // in the pod. A directive that printed it would be the filed defect, re-filed.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/!memoryHome\s*\n?\s*\?\s*`\\n\\nThis pod mounts no durable agent root/);
+    expect(source).toMatch(/do not record anything you need next run/);
+  });
+
+  it("tells a foreign-claim run its memory root is readable but not writable", async () => {
+    // `resolveScopedWritableMounts` emits the agent root READ-ONLY on a foreign
+    // claim rather than dropping it, so the root exists and a write EROFSes. Saying
+    // "durable" there would be true of the directory and false of the write.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/READ-ONLY, so \$\{memoryHome\}\/memory\/ can be /);
+    expect(source).toMatch(/READ but a write to it fails with EROFS/);
+    // ...and it must DENY durability rather than merely omitting the promise. An arm
+    // that only described the mount would leave the run to infer the consequence, and
+    // the available inference is "mounted, therefore durable" — which is the error.
+    const foreignArm = source.slice(source.indexOf("READ-ONLY, so"), source.indexOf("instructionsContents = raw +"));
+    expect(foreignArm).toMatch(/There is no durable memory `?\s*\+?\s*`?destination for this run/);
+    expect(foreignArm).not.toMatch(/survives this run/);
+  });
+
+  it("derives the root through the shared resolver, not a second spelling", async () => {
+    // The invariant that makes the directive trustworthy: the path it names and the
+    // path `buildEnvVars` exports as AGENT_HOME are the same function's output. Two
+    // derivations could disagree, and both spellings look durable from inside the pod.
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/const memoryHome = resolveMountedAgentBundleHome\(config\);/);
+    expect(source).toMatch(/^\s*resolveMountedAgentBundleHome,$/m);
+    expect(source.match(/resolveMountedAgentBundleHome\(/g)?.length ?? 0).toBe(1);
+  });
+
+  it("asks for the cross-run check, which is the only thing that can see the failure", async () => {
+    const source = await readFile(new URL("./execute.ts", import.meta.url), "utf-8");
+    expect(source).toMatch(/confirm next run that what you wrote is still there/);
+  });
+});
