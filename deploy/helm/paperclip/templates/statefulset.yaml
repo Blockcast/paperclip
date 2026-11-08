@@ -598,8 +598,8 @@ spec:
                 echo "seed: skipping mcp.json — bridge stdio.js not found at ${MCP_BRIDGE_JS}"
               fi
 
-              # Install Claude Code plugins from claude-plugins-official +
-              # Blockcast/hindsight marketplaces. The image bakes
+              # Install Claude Code plugins from the claude-plugins-official
+              # marketplace. The image bakes
               # @anthropic-ai/claude-code but no plugins; the PVC at /paperclip
               # masks anything baked under HOME, so plugins must be installed
               # at pod boot (idempotent — `claude plugin install` no-ops if
@@ -628,11 +628,6 @@ spec:
                 }
                 echo "seed: registering Claude Code plugin marketplaces"
                 run_claude_plugin_seed "marketplace add claude-plugins-official" "${CLAUDE_BIN}" plugin marketplace add anthropics/claude-plugins-official | grep -v "already" || true
-                if jq -e '.hindsight.source.repo == "vectorize-io/hindsight"' "${BASE}/.claude/plugins/known_marketplaces.json" >/dev/null 2>&1; then
-                  echo "seed: replacing hindsight marketplace with Blockcast fork"
-                  run_claude_plugin_seed "marketplace remove old hindsight" "${CLAUDE_BIN}" plugin marketplace remove hindsight | grep -v "not found" || true
-                fi
-                run_claude_plugin_seed "marketplace add Blockcast/hindsight" "${CLAUDE_BIN}" plugin marketplace add Blockcast/hindsight | grep -v "already" || true
                 echo "seed: installing Claude Code plugins (idempotent)"
                 for plugin in \
                   pr-review-toolkit@claude-plugins-official \
@@ -644,10 +639,16 @@ spec:
                   agent-sdk-dev@claude-plugins-official \
                   plugin-dev@claude-plugins-official \
                   frontend-design@claude-plugins-official \
-                  hindsight-memory@hindsight \
                 ; do
                   run_claude_plugin_seed "plugin install ${plugin}" "${CLAUDE_BIN}" plugin install "${plugin}" | tail -2 || true
                 done
+                # hindsight-memory@hindsight is no longer installed here. Its
+                # install re-cloned the Blockcast/hindsight marketplace and hit
+                # the 45s timeout on every boot, so the PVC copy never moved
+                # past 0.6.5, and upstream has retired the plugin in favour of
+                # @vectorize-io/hindsight-coding-agents. The 0.6.5 copy already
+                # on the PVC is left installed and keeps using the config
+                # written below; a fresh PVC does not get it.
                 # The init container already runs as UID/GID 1000. Never walk
                 # the shared .claude tree here: it can contain millions of
                 # CephFS-backed files and prevent the worker pod from starting.
@@ -655,8 +656,8 @@ spec:
                 echo "seed: skipping plugin install — claude not at ${CLAUDE_BIN}"
               fi
 
-              # Hindsight-memory plugin config. The plugin installs above as
-              # a Claude Code plugin, but it only activates on UserPromptSubmit
+              # Hindsight-memory plugin config, for the 0.6.5 copy already on
+              # the PVC (no longer installed above). It only activates on UserPromptSubmit
               # /Stop hooks when ${HOME}/.hindsight/claude-code.json exists
               # with a bankId. Without this, the plugin loads silently and
               # never recalls or retains.
@@ -668,10 +669,11 @@ spec:
               # banks via the paperclip event bus; the CC plugin here
               # captures the orthogonal layer (intra-session learnings,
               # UserPromptSubmit context) and shares it across agents.
-              # /paperclip is the PVC mount and ${HOME}=/paperclip for all
-              # claude_k8s Job pods, so a single config here is visible to
-              # every agent. Re-writes each pod start to stay in sync if
-              # the API endpoint or bank changes.
+              # Only sessions with ${HOME}=/paperclip see it. Isolated
+              # claude_k8s Job pods do not: they run with a per-run
+              # CLAUDE_CONFIG_DIR that has no installed plugins. Re-writes
+              # each pod start to stay in sync if the API endpoint or bank
+              # changes.
               HS_CONFIG="${BASE}/.hindsight/claude-code.json"
               mkdir -p "$(dirname "${HS_CONFIG}")"
               cat > "${HS_CONFIG}" <<'EOF'
