@@ -2283,7 +2283,9 @@ test("the covered verdict scopes its claim to servers actually behind the proxy 
         // Nor the narrower one: a null handle leaves `process.env` untouched,
         // so on a pod that already sets GITHUB_HOST the loser HAS one -- just
         // not the proxy's (PEN-5950).
-        assert.doesNotMatch(proc.stdout, /\bno `?GITHUB_HOST/);
+        // Case-insensitive on purpose: a sentence-initial "No GITHUB_HOST"
+        // restores the overstatement and passes a case-sensitive pin (PEN-6176).
+        assert.doesNotMatch(proc.stdout, /\bno `?GITHUB_HOST/i);
         assert.equal(proc.status, 0);
       });
     });
