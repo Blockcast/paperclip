@@ -92,7 +92,11 @@ import {
 } from "./issue-checkout-status.js";
 import { logger } from "../middleware/logger.js";
 import { captureIssueListAnalyzeProbe } from "../lib/issue-list-analyze-probe.js";
-import { captureTimedOutIssueListPlan } from "../lib/issue-list-timeout-explain.js";
+import { captureWakeDiagnosticsAnalyzeProbe } from "../lib/issue-wake-diagnostics-analyze-probe.js";
+import {
+  captureTimedOutIssueListPlan,
+  type ExplainableQuery,
+} from "../lib/issue-list-timeout-explain.js";
 import { findPgError, STATEMENT_TIMEOUT_SQLSTATE } from "../lib/db-retry.js";
 import { recordProjectPrimaryWorkspaceFallback } from "./metrics.js";
 import { parseObject } from "../adapters/utils.js";
@@ -10079,9 +10083,35 @@ export function issueService(db: Db) {
       // bucket and returned `503` to the caller after a minute. Two
       // transactions burn the same connection-seconds as one did sequentially;
       // only the wall time halves.
+      //
+      // PEN-6104: the wake section's builder is captured out of its callback so
+      // the probe below can re-plan the EXACT statement that ran, parameters
+      // and all, rather than a reconstruction of it. It is bound to that
+      // section's transaction, but `getSQL()` renders identically either way
+      // and the probe executes on its own transaction, so nothing is retained
+      // past the section that owns it.
+      let wakeQuery: ExplainableQuery | null = null;
+      // PEN-6104: wall time of the wake section AS THE HANDLER PAYS IT.
+      //
+      // ⚠️ This is measured around `readBoundedWakeDiagnosticsSection`, NOT
+      // around the inner `await`, and that is deliberate: it keeps pool
+      // acquisition, `BEGIN`, `SET LOCAL statement_timeout` and `COMMIT` INSIDE
+      // the number. Those terms are the whole point -- `wakeStatementMs` minus
+      // the plan's own `Execution Time` is approximately pool wait + setup
+      // round trips + planning, and a large remainder is the evidence for
+      // reading (b) (the floor is contention, not the scan) rather than (a).
+      // Timed around the inner `await` instead, the remainder would collapse
+      // and the instrument would answer (a) by construction.
+      //
+      // ⚠️ Since PEN-6085 the two sections race each other for a connection, so
+      // this sample is pessimistic by whatever the activity read takes from the
+      // same pool. That is a property of the endpoint as shipped, not an
+      // artifact of the probe.
+      let wakeStatementMs = 0;
+      const wakeSectionStartedAt = Date.now();
       const [wakeOutcome, activityOutcome] = await Promise.all([
-        readBoundedWakeDiagnosticsSection(db, "wakeRequests", issue.id, (tx) =>
-          tx
+        readBoundedWakeDiagnosticsSection(db, "wakeRequests", issue.id, (tx) => {
+          const query = tx
             .select({
               agentId: agentWakeupRequests.agentId,
               source: agentWakeupRequests.source,
@@ -10103,8 +10133,12 @@ export function issueService(db: Db) {
               ),
             )
             .orderBy(desc(agentWakeupRequests.requestedAt), desc(agentWakeupRequests.createdAt))
-            .limit(maxWakeRequests + 1),
-        ),
+            .limit(maxWakeRequests + 1);
+          wakeQuery = query;
+          return query;
+        }).finally(() => {
+          wakeStatementMs = Date.now() - wakeSectionStartedAt;
+        }),
         readBoundedWakeDiagnosticsSection(db, "activityRecords", issue.id, (tx) =>
           tx
             .select({
@@ -10132,6 +10166,31 @@ export function issueService(db: Db) {
 
       const wakeRows = wakeOutcome.rows;
       const activityRows = activityOutcome.rows;
+
+      // PEN-6104 done-when 1: default-off, and reaching it requires an operator
+      // to have named this exact issue in
+      // `PAPERCLIP_EXPLAIN_ANALYZE_WAKE_DIAGNOSTICS_ISSUE_IDS`, so it cannot
+      // fire on arbitrary tenant traffic. Deliberately NOT awaited -- the
+      // response is already complete -- and it never rejects (it swallows
+      // everything).
+      //
+      // ⛔ `!wakeOutcome.degraded` is what keeps PEN-5223's "never ANALYZE a
+      // timed-out statement" rule true here. Before PEN-6085 a timed-out read
+      // THREW and the success-path placement gave that for free; now it is
+      // caught and returned as `degraded` with an empty `rows`, so an unguarded
+      // probe would re-run a statement that had just burned its full budget --
+      // the exact case the prohibition names. The guard restores the property
+      // by construction rather than by convention.
+      if (wakeQuery && !wakeOutcome.degraded) {
+        void captureWakeDiagnosticsAnalyzeProbe({
+          db,
+          query: wakeQuery,
+          companyId: issue.companyId,
+          issueId: issue.id,
+          rowsReturned: wakeRows.length,
+          statementMs: wakeStatementMs,
+        });
+      }
 
       return {
         wakeRequests: wakeRows.slice(0, maxWakeRequests) as IssueWakeDiagnosticsWakeRequestRow[],
