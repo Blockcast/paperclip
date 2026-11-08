@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import {
   AGENT_NO_USAGE_STREAK_METRIC,
+  AGENT_NO_USAGE_STREAK_UPDATED_METRIC,
   AUTH_REQUEST_METRIC,
   BACKSTOP_CANDIDATES_SKIPPED_METRIC,
   BACKSTOP_DEFERRED_CANDIDATES_METRIC,
@@ -775,6 +776,21 @@ describe("recordAgentZeroTokenCompletedRunStreak + renderMetrics", () => {
     expect(body).toContain(
       `${AGENT_NO_USAGE_STREAK_METRIC}{agent_id="agent-a",adapter="opencode_k8s"} 3`,
     );
+  });
+
+  // BLO-54745: the alert picks the worker pod that wrote the streak most recently.
+  it("stamps when the streak was written, and retires the stamp with the adapter", async () => {
+    const knownAgentIds = new Set(["agent-a"]);
+    const before = Date.now() / 1000;
+    recordAgentZeroTokenCompletedRunStreak({ agentId: "agent-a", adapter: "opencode_k8s", streak: 7, knownAgentIds });
+    recordAgentZeroTokenCompletedRunStreak({ agentId: "agent-a", adapter: "claude_k8s", streak: 0, knownAgentIds });
+
+    const { body } = await renderMetrics();
+    const stamp = body.match(
+      new RegExp(`^${AGENT_NO_USAGE_STREAK_UPDATED_METRIC}\\{agent_id="agent-a",adapter="claude_k8s"\\} (\\S+)$`, "m"),
+    );
+    expect(Number(stamp?.[1])).toBeGreaterThanOrEqual(Math.floor(before));
+    expect(body).not.toContain(`${AGENT_NO_USAGE_STREAK_UPDATED_METRIC}{agent_id="agent-a",adapter="opencode_k8s"}`);
   });
 
   it("collapses unknown agents and invalid streaks to bounded values", async () => {
