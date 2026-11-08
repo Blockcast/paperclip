@@ -145,8 +145,16 @@ const ENVIRONMENT_DUMP_RE = new RegExp(
 // is REFUSED on measured cost. Over this repo at 3fe0df7e3 — 5,043 tracked
 // .ts/.tsx/.js/.mjs/.py/.go/.yaml/.yml/.md files, 2,054,755 lines, each
 // candidate rewritten to the unspaced form and run back through this detector —
-// it fires on 8,989 lines that pass today: 4.375 per 1k against today's 358 at
-// 0.174, a 25x increase. Essentially all of them are `const x =
+// it fires on 8,989 lines that pass today: 4.375 per 1k, against the 68 lines
+// `high-entropy-assignment` refuses across the whole corpus — a 132x increase
+// in the population of THIS rule.
+//
+// Beware the other baseline. 358 is every egress class COMBINED (vendor-key
+// 156, credentialed-uri 95, high-entropy-assignment 68, private-key-block 34,
+// jwt 5); comparing a widening of one rule against the total understates it by
+// ~5x. Both figures re-measured at 4962a9c78 and reproduce exactly.
+//
+// Essentially all of the 8,989 are `const x =
 // someLongCamelCaseCallee(...)`: the capture stops at the first out-of-alphabet
 // character, so an ordinary >=24-char camelCase callee IS a two-class,
 // no-separator, high-entropy token and `isLexicalIdentifier` cannot exonerate
@@ -154,7 +162,9 @@ const ENVIRONMENT_DUMP_RE = new RegExp(
 //
 // The affordable variant requires a CLOSED quoted string literal on the spaced
 // arm — a hardcoded secret is a literal, `someCallee(` is not. Measured the
-// same way: 325 new lines, 0.158 per 1k, 27x fewer than the naive widening. It
+// same way: 325 new lines, 0.158 per 1k, 27x fewer than the naive widening —
+// though still ~4.8x the 68 lines this rule refuses today, which is the honest
+// framing of its headroom. It
 // has NOT landed, and two things gate it, both tracked on PEN-6162:
 //   - the 325 are the PEN-3920 family arriving through a new door — alert-name
 //     constants, 40-hex commit and UUID fixtures, migration filenames,
@@ -177,7 +187,51 @@ const ENVIRONMENT_DUMP_RE = new RegExp(
 // JSON, a Kubernetes Secret `stringData` block — never matches this net at any
 // spacing, which is a separate and wider gap tracked on PEN-6167. Measured
 // 2026-11-08: removing the space from `webhook_secret: "<v>"` changes nothing,
-// while the same line with `=` fires.
+// while the same line with `=` fires. So the operator is the variable there,
+// not the spacing, and the spaced `=` arm above would close none of it.
+//
+// PEN-6167 DISPOSITION, 2026-11-08: the colon gap is ACCEPTED, and no
+// operator-level widening of this regex is pursued. Not deferred for want of
+// measurement — priced at 4962a9c78 over the same corpus, so the numbers live
+// here next to the regex rather than only on the row. "closes" counts the
+// seven colon-bound forms PEN-6167 reports as passing today:
+//
+//   arm                                        closes   new lines refused
+//   `[=:]` — one character, still adjacent      1 / 7     +2,301   (33.8x)
+//   `[ \t]*:[ \t]*`, bare key, any value        4 / 7    +17,933  (264x)
+//   ...bare key, closed quoted literal          3 / 7       +775   (11.4x)
+//   ...quoted key tolerated, any value          7 / 7    +18,035  (265x)
+//   ...quoted key tolerated, quoted literal     6 / 7       +804   (11.8x)
+//
+// The `[=:]` row was measured by patching that one character into a copy of
+// the shipped detector; the rest by the candidate-rewriting method described
+// above. Three things in that table decide it:
+//
+//  - The one-character change is a TRAP, not a cheap win. `[=:]` is still
+//    ADJACENT, so it reaches only `webhook_secret:"<v>"` — the one spelling
+//    nobody writes. Every realistic form (`key: "<v>"`, a stringData block,
+//    any JSON) stays blind, so it buys the appearance of a fix. And 86% of
+//    what it DOES newly refuse is ordinary URLs — 1,969 of 2,301 — because
+//    `https` is a name, `:` the operator and `//github.com/...` sits inside
+//    the value alphabet. `:` is the URI scheme separator before it is a
+//    binding operator, and a credentialed URI already has its own class.
+//  - Only the quoted-key arms reach the JSON forms, and they cost ~11.8x the
+//    entire current population of this rule on a push-BLOCKING door.
+//  - The residual is not an enumerable exemption family the way PEN-3920's
+//    alert names were. It is ordinary structured-data syntax: TypeScript type
+//    annotations, AWS `Sid:` values, UUID fixtures, file paths, and JS
+//    ternaries read as bindings (`alertname: fired ? 'A' : 'B'`) — which lands
+//    on the alert-posting scripts and manufactures more of PEN-6163.
+//
+// SCOPE of what is accepted, measured and not inferred: vendor-key, jwt,
+// credentialed-uri and private-key-block were each exercised in colon form and
+// all four redact. What passes is exactly an opaque secret with NO recognisable
+// vendor prefix — an HMAC or signing key, a session key, a generated password,
+// a base64 blob — bound with `:` in YAML, JSON or a Secret manifest. The right
+// control for that population is a repo-level secret scanner that reads `:`
+// natively, not a wider regex on this door; Blockcast/paperclip runs none
+// today, which is PEN-6170. Revisit this disposition if that population stops
+// being covered elsewhere, or if the quoted-key residual becomes enumerable.
 const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([A-Za-z0-9+/=_.\-]{16,})/g;
 
 // PEN-3907: a cryptographic content digest bound to a name that says so.

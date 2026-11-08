@@ -505,6 +505,56 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-6167: a colon-bound value never reaches the assignment net", () => {
+    // `:` is not `=`, so YAML, JSON and a Kubernetes Secret `stringData` block
+    // pass at any spacing. That gap is ACCEPTED and dated in the detector's own
+    // comment block, which prices every candidate widening and records why none
+    // of them lands.
+    //
+    // The whole reported set is pinned rather than one example, because the
+    // obvious one-character fix — `=` to `[=:]` — is still ADJACENT and so
+    // reaches ONLY the unspaced spelling below. Land it and every spaced case
+    // here stays green, which reads as "PEN-6167 is closed" while nothing a
+    // human would actually write has changed. Measured 2026-11-08: that one
+    // character newly refuses 2,301 lines of this repo, 1,969 of them ordinary
+    // `https://` URLs, and closes one of the six forms below.
+    //
+    // Assembled at runtime, same convention as the fixtures above: written out
+    // contiguously these are material the deployed guard refuses, which would
+    // make this file unpushable.
+    const T = SYNTHETIC_OPAQUE_VALUE;
+
+    it.each([
+      ["a k8s Secret stringData entry", `  webhook-signing-key: "${T}"`],
+      ["a quoted YAML value", `webhook_secret: "${T}"`],
+      ["a bare YAML scalar", `signing_key: ${T}`],
+      ["a JSON quoted key", `{"sessionSecret": "${T}"}`],
+      ["a quoted YAML key", `"webhook_secret": "${T}"`],
+      ["an unspaced colon", `webhook_secret:"${T}"`],
+    ])("passes %s through byte-exact", (_form, text) => {
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+    });
+
+    it("still redacts other classes on the same colon shapes", () => {
+      // The positive control. Without it the group above is a mute instrument:
+      // a detector that read none of these lines would pass it just as happily.
+      // Both of these are colon-bound too, so what differs is the class, not
+      // the syntax — which is what makes the passes above a statement about
+      // `high-entropy-assignment` specifically.
+      const vendor = `  webhook-signing-key: "ghp_${"A1b2C3d4E5f6G7h8I9j0"}"`;
+      expect(scrubGitHubEgressText(vendor).classes).toContain("vendor-key");
+
+      // Split across two pieces so this source line is not ITSELF a
+      // credentialed URI — written contiguously, the deployed push guard
+      // refuses it and this file stops being pushable.
+      const uri = `{"dsn": "postgres://dbuser:${T}` + `@db.internal:5432/app"}`;
+      expect(scrubGitHubEgressText(uri).classes).toContain("credentialed-uri");
+      expect(scrubGitHubEgressText(uri).text).not.toContain(T);
+    });
+  });
+
   describe("BLO-41262 regression: a hyphenated identifier is not a credential", () => {
     // `draft-ramadan-moq-multicast-00` scores 3.74 bits/char, above the 3.5
     // floor, so the entropy test alone read an RFC-XML <seriesInfo> element as
