@@ -452,6 +452,18 @@ describe("stripRunScopedSnapshotMarkers", () => {
     ).toEqual({});
   });
 
+  it("drops the run-started-announced marker so a retry announces its own start", () => {
+    // BLO-55110: the marker holds the deferred run's own id. Correctness does
+    // not depend on stripping it (a different run's id never matches), but a
+    // retry should not carry its predecessor's marker.
+    expect(
+      stripRunScopedSnapshotMarkers({
+        issueId: "issue-1",
+        paperclipRunStartedAnnouncedRunId: "run-1",
+      }),
+    ).toEqual({ issueId: "issue-1" });
+  });
+
   it("keeps every key that describes the work rather than the mint", () => {
     const carried = {
       issueId: "issue-1",

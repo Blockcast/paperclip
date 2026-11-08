@@ -13,6 +13,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issues,
+  pluginEventOutbox,
   projects,
 } from "@paperclipai/db";
 import type {
@@ -21,6 +22,7 @@ import type {
 } from "@paperclipai/adapter-utils";
 import { heartbeatService } from "../services/heartbeat.js";
 import { logger } from "../middleware/logger.js";
+import { resetPluginEventOutboxDbForTests, setPluginEventOutboxDb } from "../services/activity-log.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -134,6 +136,9 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("heartbeat-external-runtime-retry-");
     db = createDb(tempDb.connectionString);
+    // BLO-55110: run lifecycle plugin events are enqueued into the outbox only
+    // when an outbox db is wired; the defer tests count agent.run.started rows.
+    setPluginEventOutboxDb(db);
     heartbeat = heartbeatService(db, {
       penstockAvailabilityGate: {
         checkAdapter: async () => ({ allow: true }),
@@ -184,8 +189,18 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
   }, 120_000);
 
   afterAll(async () => {
+    resetPluginEventOutboxDbForTests();
     await tempDb?.cleanup();
   });
+
+  /** Outbox rows of one plugin event type for one heartbeat run. */
+  async function lifecycleEventsForRun(runId: string, eventType: string) {
+    const rows = await db
+      .select()
+      .from(pluginEventOutbox)
+      .where(eq(pluginEventOutbox.eventType, eventType));
+    return rows.filter((row) => row.payload.entityId === runId);
+  }
 
   /**
    * Read a single sample out of the rendered exposition rather than reaching
@@ -870,10 +885,15 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(contender.queuedAt!.getTime()).toBeGreaterThanOrEqual(contender.createdAt.getTime());
     expect(contender.contextSnapshot).toMatchObject({
       paperclipK8sIsolationRetryAttempt: 1,
+      // BLO-55110: the claim announced agent.run.started; the defer records it.
+      paperclipRunStartedAnnouncedRunId: contenderRunId,
     });
     expect(new Date(String(contender.contextSnapshot?.paperclipK8sIsolationRetryAt)).getTime()).toBeGreaterThan(
       Date.now(),
     );
+    await vi.waitFor(async () => {
+      expect(await lifecycleEventsForRun(contenderRunId, "agent.run.started")).toHaveLength(1);
+    }, { timeout: 10_000 });
     expect(contenderReservation).toMatchObject({
       state: "released",
       releaseReason: "external_runtime_isolation_conflict",
@@ -929,6 +949,13 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     // deferred on.
     expect(mockAdapterExecute).toHaveBeenCalled();
     expect(completedContender.status).toBe("succeeded");
+    // BLO-55110: the re-claim after the defer must not announce started again.
+    // Outbox inserts are enqueued in order, so once the finished row is there
+    // every earlier started row for this run has landed too.
+    await vi.waitFor(async () => {
+      expect(await lifecycleEventsForRun(contenderRunId, "agent.run.finished")).toHaveLength(1);
+    }, { timeout: 10_000 });
+    expect(await lifecycleEventsForRun(contenderRunId, "agent.run.started")).toHaveLength(1);
     expect(reusedReservation.id).not.toBe(contenderReservation?.id);
     expect(reusedReservation.isolationMode).toBe("workspace");
     expect(reusedReservation.isolationKey).toBe(`workspace:${sharedWorkspaceId}`);
@@ -1037,7 +1064,9 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
         invocationSource: "assignment",
         triggerDetail: "system",
         status: "queued",
-        contextSnapshot: { issueId: contenderIssueId },
+        // BLO-55110: a marker inherited from a different run must not suppress
+        // this run's own first agent.run.started.
+        contextSnapshot: { issueId: contenderIssueId, paperclipRunStartedAnnouncedRunId: randomUUID() },
       },
     ]);
     await acquireBranchRunClaim(db, {
@@ -1061,7 +1090,11 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(contender.status).toBe("queued");
     expect(contender.contextSnapshot).toMatchObject({
       paperclipBranchClaimRetryAttempt: 1,
+      paperclipRunStartedAnnouncedRunId: contenderRunId,
     });
+    await vi.waitFor(async () => {
+      expect(await lifecycleEventsForRun(contenderRunId, "agent.run.started")).toHaveLength(1);
+    }, { timeout: 10_000 });
     // The inserted row has queuedAt null, so this fails if the defer stops
     // stamping it.
     expect(contender.queuedAt).not.toBeNull();

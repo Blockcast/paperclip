@@ -904,6 +904,12 @@ const K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipK8sIsolationRetryAttem
 const K8S_ISOLATION_RETRY_BASE_DELAY_MS = 15_000;
 const K8S_ISOLATION_RETRY_MAX_DELAY_MS = 5 * 60_000;
 const BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipBranchClaimRetryAttempt";
+// BLO-55110: a run that was claimed (and so announced agent.run.started) and
+// then deferred back to `queued` carries its own id here, so its re-claims do
+// not announce started again. The value is this run's id, not `true`, so a copy
+// inherited by a different run can never suppress that run's first start.
+// Every running->queued writer must stamp it; today those are the two defers.
+const RUN_STARTED_ANNOUNCED_CONTEXT_KEY = "paperclipRunStartedAnnouncedRunId";
 // BLO-21602: renewal cadence for an in-flight run's branch claim. Kept well
 // under DEFAULT_BRANCH_CLAIM_LEASE_MS (30m) so a couple of missed ticks (e.g.
 // a slow DB write) still can't let the lease lapse out from under a live run.
@@ -9332,6 +9338,7 @@ const RUN_SCOPED_SNAPSHOT_MARKER_KEYS = [
   K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY,
   BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY,
   BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY,
+  RUN_STARTED_ANNOUNCED_CONTEXT_KEY,
 ] as const;
 
 /**
@@ -20214,6 +20221,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       typeof run.contextSnapshot === "object" && run.contextSnapshot !== null
         ? (run.contextSnapshot as Record<string, unknown>)
         : {};
+    // BLO-55110: a deferred run is claimed again on every retry; plugins get
+    // one started per run, at its first claim.
+    if (eventType === "agent.run.started" && ctx[RUN_STARTED_ANNOUNCED_CONTEXT_KEY] === run.id) return;
     const paperclipIssue =
       typeof ctx.paperclipIssue === "object" && ctx.paperclipIssue !== null
         ? (ctx.paperclipIssue as Record<string, unknown>)
@@ -35925,6 +35935,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     context[K8S_ISOLATION_RETRY_ATTEMPT_CONTEXT_KEY] = retryAttempt;
     context[K8S_ISOLATION_RETRY_AT_CONTEXT_KEY] = retryAt.toISOString();
     context[K8S_ISOLATION_WAIT_KEY_CONTEXT_KEY] = conflict.isolationKey;
+    context[RUN_STARTED_ANNOUNCED_CONTEXT_KEY] = run.id;
 
     const releasedReservation = await releaseExternalRuntimeReservation(db, {
       runId: run.id,
@@ -36061,6 +36072,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const retryAt = new Date(now.getTime() + computeK8sIsolationRetryDelayMs(retryAttempt));
     context[BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY] = retryAttempt;
     context[BRANCH_CLAIM_RETRY_AT_CONTEXT_KEY] = retryAt.toISOString();
+    context[RUN_STARTED_ANNOUNCED_CONTEXT_KEY] = run.id;
 
     const deferredRun = await db
       .update(heartbeatRuns)
