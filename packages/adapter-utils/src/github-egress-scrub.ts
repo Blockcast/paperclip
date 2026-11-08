@@ -462,12 +462,14 @@ const BLACKBOX_MODULE_RE = /^[a-z]+\d{0,3}(?:_[a-z]+\d{0,3})+$/;
  *  12+14, 14+16 and 16+14 at 20000/20000.
  *
  *  SHAPE: the union of whatever `job` admits and `isLexicalIdentifier`'s own
- *  segment grammar with the two AGGREGATE caps lifted. Those caps —
- *  `longSegments > 1` and LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH — are entropy
- *  bounds for a name-free rule; the per-segment bound LEXICAL_SEGMENT_MAX_LENGTH
- *  is a shape bound and is KEPT, so a single opaque run cannot hide between
- *  underscores. Written as a union with JOB_NAME_RE so non-regression against
- *  the `job` shape is a property of the code and needs no corpus.
+ *  segment grammar with ONE aggregate cap lifted — `longSegments > 1`, the
+ *  conjunct this row exists to get past. The other aggregate cap is NOT
+ *  lifted: LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH is re-imposed, at a value
+ *  sized to this population, as ERROR_CODE_MAX_CONTENT_LENGTH below. The
+ *  per-segment bound LEXICAL_SEGMENT_MAX_LENGTH is a shape bound and is also
+ *  KEPT, so a single opaque run cannot hide between underscores. Written as a
+ *  union with JOB_NAME_RE so non-regression against the `job` shape is a
+ *  property of the code and needs no corpus.
  *
  *  Residual, 200k random `[a-z0-9_]` tokens per length through the whole door,
  *  one token set paired across every arm: 1033 / 32 / 1 per 200k at 24 / 32 /
@@ -476,18 +478,47 @@ const BLACKBOX_MODULE_RE = /^[a-z]+\d{0,3}(?:_[a-z]+\d{0,3})+$/;
  *  Nothing moves under any other name: the disjunct below is gated on the
  *  exact name, and the measured `val` column is unchanged to the count.
  *
- *  ⛔ The digit-run cap above still applies, and it is load-bearing here: each
- *  mixed segment carries at least one digit run, so ALERT_NAME_MAX_DIGIT_RUNS
- *  is what bounds how many of them a value may hold. Do not move this call out
- *  from under it. And do not add a second name on the strength of this one —
+ *  ⚠ That residual is measured over a population that CANNOT CONTAIN the worst
+ *  shape, and must not be read as bounding it. A random `[a-z0-9_]` token of
+ *  any length carries many digit runs, so ALERT_NAME_MAX_DIGIT_RUNS refuses it
+ *  before this rule is consulted; the shape that gets through is PURE LOWERCASE
+ *  LETTERS under one digit-bearing prefix, which that alphabet draws with
+ *  negligible probability. Measured separately, through the whole door, 200
+ *  values per width: `k8s_` + N random 16-letter segments, refused 0/200 at
+ *  every N from 1 to 8 — up to 139 characters, ~602 bits — while the same
+ *  values are refused 200/200 under a bare name from N=3 and 188/200 under
+ *  `job` at N=2. ERROR_CODE_MAX_CONTENT_LENGTH is what bounds that arm.
+ *
+ *  ⛔ The digit-run cap above still applies and is load-bearing, but it bounds
+ *  only the MIXED segments: a mixed segment must carry a digit run, so
+ *  ALERT_NAME_MAX_DIGIT_RUNS bounds how many of THOSE a value may hold. It
+ *  says nothing about PLAIN segments, which carry no digit run at all and were
+ *  therefore unbounded in both count and total length until the content cap
+ *  below was added. Do not move this call out from under the digit-run gate,
+ *  and do not read that gate as an aggregate entropy bound. And do not add a
+ *  second name on the strength of this one —
  *  `errorCode`, `reason` and `code` are NOT here, because no false positive has
  *  been measured under them. Exact names, one at a time, each on a measured
  *  case; see UUID_VALUE_NAMES for why the obvious generalisation is the change
  *  to decline. */
 const ERROR_CODE_VALUE_NAMES = new Set(["error_code"]);
 
+/** PEN-6152: aggregate bound on the segment-grammar arm below, standing in for
+ *  the LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH that arm lifts. Sized to the live
+ *  population rather than guessed: 153 distinct error codes in this repo, p50
+ *  21, p90 30, p99 36, longest 38 (`routine_execution_duplicate_suppressed`),
+ *  most segments 6. 48 clears the longest by ten characters — about one more
+ *  word — and bounds the plain-segment tail measured above.
+ *
+ *  Chosen on the failure DIRECTIONS, not on the headroom alone: a code that
+ *  outgrows this cap is REFUSED, which is loud, lands on the author at push
+ *  time and is recoverable by widening a number here; an uncapped exoneration
+ *  is SILENT and nothing ever reports it. Prefer the loud direction. */
+const ERROR_CODE_MAX_CONTENT_LENGTH = 48;
+
 function isErrorCodeValue(value: string): boolean {
   if (JOB_NAME_RE.test(value)) return true;
+  if (value.length > ERROR_CODE_MAX_CONTENT_LENGTH) return false;
   if (!/^[a-z][a-z0-9]*(?:_[a-z0-9]+)+$/.test(value)) return false;
   const segments = value.split("_");
   if (segments.some((s) => s.length > LEXICAL_SEGMENT_MAX_LENGTH)) return false;
