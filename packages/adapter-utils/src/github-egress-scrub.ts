@@ -1170,6 +1170,108 @@ function k8sGeneratedLayoutBudgetOk(parts: K8sNameParts, positional: number): bo
   );
 }
 
+/** PEN-6187: names whose values take the gbrain source-id shape. ONE name, on
+ *  ONE measured false positive, in the manner the `networkID` note above asks
+ *  for: `source_id`, `paperclip_dedupe_domain` and every other adjacent name
+ *  stay refused until one of them is measured too. */
+const GBRAIN_SOURCE_ID_VALUE_NAMES = new Set(["source"]);
+
+/** The literal first segment every gbrain source id carries. This is the
+ *  conjunct that carries the rule, and the reason it is a literal rather than
+ *  a shape. PEN-3920 section 4 accepts a name anchor because an accidental
+ *  leak does not choose its BINDING NAME; here the same argument runs twice,
+ *  because accident does not prepend a namespace segment to the material
+ *  either. Measured against the shipped detector over 15 random-value
+ *  families at 200k samples each — base62 at 24/32, base64url at 24/43,
+ *  base32 at 32, lowercase hex at 32/40, mixed-case letters at 24, UUID v4
+ *  layout, and five varying-length segmented families over base36, the
+ *  Kubernetes suffix alphabet and lowercase words — plus 28 real credential
+ *  formats at 20k each: 0 of 3,560,000 newly exonerated. No random token
+ *  wears this segment. */
+const GBRAIN_SOURCE_ID_NAMESPACE = "gstack";
+
+/** Word mass demanded on top of the namespace literal: `gstack` (6) plus a
+ *  four-letter strategy word (`code`, the only strategy the generator emits
+ *  today) is the shortest form a real id can take. This is NOT the
+ *  load-bearing conjunct — the namespace literal is — and it is kept as a
+ *  floor so the opaque mass admitted below stays bounded and the stated bound
+ *  stays honest. The live 36-source corpus sits at 14 and above. */
+const GBRAIN_SOURCE_ID_MIN_WORD_MASS = 10;
+
+/** The alphabet gbrain's id generator draws its two trailing runs from. Free
+ *  on the live corpus — 3 of 3 legacy ids conform — and it is what keeps this
+ *  rule from admitting a base36 or base62 payload behind the namespace: it
+ *  cuts the worst-case opaque mass this rule can carry from ~83 bits to ~64.
+ *  Same trade, and the same "free on the corpus" justification, as
+ *  K8S_GENERATED_SEGMENT_RE above. */
+const GBRAIN_SOURCE_ID_GENERATED_SEGMENT_RE = /^[0-9a-f]+$/;
+
+/** PEN-6187: true when a value is a gbrain source id, as a `PrometheusRule`
+ *  unit-test fixture writes it — `source="gstack-code-<slug>-<8 hex>-<6 hex>"`.
+ *  A promtool fixture has to spell the label value out, so "derive it at
+ *  runtime" is unavailable; this is the class PEN-4428 removed from the
+ *  refusal text, reported through the route that text now names.
+ *
+ *  WHY THE EXISTING RULES DO NOT REACH IT, measured rather than assumed. The
+ *  value scores word mass 14 against K8S_NAME_MIN_WORD_MASS's floor of 16, so
+ *  adding `source` to K8S_OBJECT_NAME_VALUE_NAMES fixes NOTHING — the same
+ *  value is refused today under `pod` and under `name`, both already
+ *  anchored. Lowering that floor is the other obvious knob and is REFUSED by
+ *  PEN-5921: it is name-free in effect and costs a 5.8x residual on the
+ *  hyphenated alphabets real keys take. So the price has to be paid in a
+ *  conjunct the general rule does not have, which is the namespace literal.
+ *
+ *  THE SHAPE. Every structural conjunct the general Kubernetes rule applies —
+ *  a DNS-1123 subdomain within K8S_NAME_MAX_LENGTH and K8S_NAME_MAX_LABELS,
+ *  at most K8S_NAME_MAX_GENERATED_SEGMENTS generated segments, each at most
+ *  K8S_NAME_MAX_GENERATED_LENGTH, summing to at most
+ *  K8S_NAME_MAX_GENERATED_MASS — with the word-mass floor of 16 replaced by
+ *  the namespace literal, a strategy word, and
+ *  GBRAIN_SOURCE_ID_MIN_WORD_MASS, and with every generated segment drawn
+ *  from lowercase hex.
+ *
+ *  THE OPAQUE-MASS CEILING IS NOT RAISED. Worst case is still
+ *  K8S_NAME_MAX_GENERATED_MASS characters, now over 16 symbols rather than
+ *  36: ~64 bits, BELOW the ~83 the general rule already admits at word mass
+ *  16, below the ~71 PEN-5921's pod layout admits, and far below the ~141
+ *  `isLexicalIdentifier` exonerates under EVERY name in the fleet. What this
+ *  rule lowers is the word-mass PRICE, from 16 to 10, for one namespace,
+ *  under one binding name.
+ *
+ *  THE RESIDUAL, stated plainly because it is the price and it is large. A
+ *  value DELIBERATELY built as `gstack-<word>-<10 hex>-<6 hex>` is exonerated
+ *  BY CONSTRUCTION — 20000 of 20000 measured. The namespace literal buys
+ *  nothing against an author who chooses to type it; it buys the 3,560,000
+ *  samples above only against ACCIDENTAL disclosure, which is the threat this
+ *  file guards (PEN-3920 section 4, PEN-3183), and that is why the trade is
+ *  accepted. Deliberate bypass needs no exemption in this file at all.
+ *
+ *  Every cap is a cap and not a licence, measured with segments forced to be
+ *  generated (>=1 letter and >=1 digit, so the sampler cannot reclassify one
+ *  as a word): an 11-character run, a generated mass of 18, a third generated
+ *  segment, a non-hex run, a missing namespace segment, a second segment that
+ *  is not a word, and the whole shape bound to `pod` instead — 0 of 20000
+ *  newly exonerated on each.
+ *
+ *  Anchored to `source` alone. Do not widen the name set without re-reading
+ *  PEN-3920 section 4, and never move this shape into a name-free rule. */
+function isGbrainSourceId(value: string): boolean {
+  const parts = k8sNameParts(value);
+  if (parts === null) return false;
+  if (parts.wordMass < GBRAIN_SOURCE_ID_MIN_WORD_MASS) return false;
+  const { segments } = parts;
+  // `<namespace>-<strategy>-<at least one more>`: the id is never just the
+  // namespace and a payload, and the strategy is always a bare word.
+  if (segments.length < 3) return false;
+  if (segments[0] !== GBRAIN_SOURCE_ID_NAMESPACE) return false;
+  if (!/^[a-z]+$/.test(segments[1]!)) return false;
+  for (const segment of segments) {
+    if (/^[a-z]+$/.test(segment) || /^[0-9]+$/.test(segment)) continue;
+    if (!GBRAIN_SOURCE_ID_GENERATED_SEGMENT_RE.test(segment)) return false;
+  }
+  return true;
+}
+
 /** True when a NAME=VALUE pair is a content digest pin rather than a secret. */
 function isContentDigestAssignment(name: string, value: string): boolean {
   if (name === "patch_hash" && PNPM_PATCH_HASH_RE.test(value)) return true;
@@ -1182,6 +1284,7 @@ function isContentDigestAssignment(name: string, value: string): boolean {
   if (K8S_OBJECT_NAME_VALUE_NAMES.has(name) && isKubernetesObjectName(value)) return true;
   if (INTERNET_DRAFT_NAME_VALUE_NAMES.has(name) && INTERNET_DRAFT_NAME_RE.test(value) && isKubernetesObjectName(value)) return true;
   if (name === "pod" && isGeneratedPodName(value)) return true;
+  if (GBRAIN_SOURCE_ID_VALUE_NAMES.has(name) && isGbrainSourceId(value)) return true;
   if (GIT_OBJECT_NAME_VALUE_NAMES.has(name) && GIT_COMMIT_SHA_RE.test(value)) return true;
   if (UUID_VALUE_NAMES.has(name) && CANONICAL_UUID_RE.test(value)) return true;
   return DIGEST_NAME_RE.test(name) && HEX_DIGEST_RE.test(value);
