@@ -3,7 +3,7 @@ import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { afterAll, afterEach, beforeAll } from "vitest";
 import { randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import {
   createDb,
   companies,
@@ -1338,6 +1338,233 @@ describeEmbeddedPostgres("cost and finance aggregate overflow handling", () => {
     expect(byProjectId.get(earlierProjectId)).toBe(250);
     // Run attribution resolves to the project the run most recently touched.
     expect(byProjectId.get(laterProjectId)).toBe(100);
+  });
+
+  // PEN-6084: `byProject` used to end in `innerJoin(projects)` + `where(effective is not
+  // null)`, so an event that resolved to NO project was omitted rather than bucketed --
+  // the "By project" card silently under-reported the "Summary" card beside it, over the
+  // same window, with nothing on screen saying so. Measured 2026-11-08 on the live fleet:
+  // 1,002,603c served against a 1,703,634c summary, a 41.15% silent drop.
+  //
+  // This pins the INVARIANT -- `sum(by-project) == summary` -- and deliberately not the
+  // magnitude. PEN-5937/#3531 adds write-time attribution that shrinks the unattributed
+  // bucket, so a test pinned to 41.15% would go red exactly when that fix works.
+  it("buckets spend that resolves to no project so by-project sums to the summary", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const projectId = randomUUID();
+    const issueId = randomUUID();
+    const attributedRunId = randomUUID();
+    const projectlessRunId = randomUUID();
+    const range = {
+      from: new Date("2026-11-05T20:00:00.000Z"),
+      to: new Date("2026-11-08T20:00:00.000Z"),
+    };
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Bucket Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Gateway", status: "active" });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      projectId,
+      title: "Touched by the attributed run",
+      status: "in_progress",
+      priority: "medium",
+      issueNumber: 1,
+      identifier: "BKT-1",
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: attributedRunId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "completed",
+        startedAt: new Date("2026-11-06T00:00:00.000Z"),
+        finishedAt: new Date("2026-11-06T00:01:00.000Z"),
+      },
+      {
+        id: projectlessRunId,
+        companyId,
+        agentId,
+        invocationSource: "on_demand",
+        status: "completed",
+        startedAt: new Date("2026-11-07T00:00:00.000Z"),
+        finishedAt: new Date("2026-11-07T00:01:00.000Z"),
+      },
+    ]);
+    // Only the attributed run touches an issue, so only it can resolve a project.
+    await db.insert(activityLog).values({
+      companyId,
+      runId: attributedRunId,
+      actorType: "agent",
+      actorId: agentId,
+      agentId,
+      action: "issue.checked_out",
+      entityType: "issue",
+      entityId: issueId,
+      details: {},
+    });
+
+    const base = {
+      companyId,
+      agentId,
+      provider: "anthropic",
+      biller: "anthropic",
+      billingType: "metered_api",
+      model: "claude-opus-5",
+      inputTokens: 1_000,
+      cachedInputTokens: 0,
+      outputTokens: 500,
+    } as const;
+
+    await db.insert(costEvents).values([
+      // Attributable: a direct project.
+      { ...base, projectId, costCents: 700, occurredAt: new Date("2026-11-06T00:00:30.000Z") },
+      // Attributable: no direct project, but the run touched a project-linked task.
+      {
+        ...base,
+        heartbeatRunId: attributedRunId,
+        costCents: 250,
+        occurredAt: new Date("2026-11-06T00:00:40.000Z"),
+      },
+      // Unattributed, cause 1: a run that touched no task at all.
+      {
+        ...base,
+        heartbeatRunId: projectlessRunId,
+        costCents: 130,
+        occurredAt: new Date("2026-11-07T00:00:30.000Z"),
+      },
+      // Unattributed, cause 2: no run to attribute through in the first place.
+      { ...base, costCents: 90, occurredAt: new Date("2026-11-07T06:00:00.000Z") },
+    ]);
+
+    const rows = await costs.byProject(companyId, range);
+    const summary = await costs.summary(companyId, range);
+
+    // THE invariant. Written against the summary rather than against a literal so it
+    // keeps meaning the same thing if the fixture's amounts are ever edited.
+    const totalReported = rows.reduce((sum, row) => sum + row.costCents, 0);
+    expect(totalReported).toBe(summary.spendCents);
+
+    const unattributed = rows.filter((row) => row.projectId === null);
+    // ONE bucket, not one anonymous row per unattributable shape.
+    expect(unattributed).toHaveLength(1);
+    expect(unattributed[0]?.costCents).toBe(220);
+    expect(unattributed[0]?.projectName).toBeNull();
+
+    const attributed = rows.filter((row) => row.projectId !== null);
+    expect(attributed).toHaveLength(1);
+    expect(attributed[0]?.projectId).toBe(projectId);
+    expect(attributed[0]?.costCents).toBe(950);
+
+    // The residual sorts last, so a named project is never pushed off the card by it.
+    expect(rows[rows.length - 1]?.projectId).toBeNull();
+  });
+
+  // PEN-6084, the second cause named on the row: an effective project that no longer
+  // exists. It is UNREACHABLE on today's schema and this test says so by construction --
+  // both paths to a project id (`cost_events.project_id` and `issues.project_id`) are
+  // `ON DELETE no action` since migration 0000 and have never been altered, and
+  // `projectService.remove` is a bare DELETE, so Postgres REFUSES to orphan a row.
+  //
+  // It is pinned anyway because the fix's non-obvious half is the grouping key: grouping
+  // on the LEFT-joined `projects.id` rather than on `coalesce(...)` is what collapses a
+  // dangling reference into the SAME single bucket instead of scattering one anonymous
+  // row per deleted project. Relaxing that FK to `set null` -- or dropping it -- is a
+  // plausible future change, and this is what keeps the card correct through it.
+  it("keeps a dangling project reference in the same single unattributed bucket", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const liveProjectId = randomUUID();
+    const deletedProjectId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Dangle Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(projects).values({ id: liveProjectId, companyId, name: "Gateway", status: "active" });
+
+    const base = {
+      companyId,
+      agentId,
+      provider: "anthropic",
+      biller: "anthropic",
+      billingType: "metered_api",
+      model: "claude-opus-5",
+      inputTokens: 1_000,
+      cachedInputTokens: 0,
+      outputTokens: 500,
+    } as const;
+
+    // The referential integrity that makes this state unreachable, asserted rather than
+    // assumed -- if this stops throwing, the premise above has changed and the reader
+    // should be told by a failing test rather than by a wrong dashboard.
+    await db.insert(projects).values({ id: deletedProjectId, companyId, name: "Retired", status: "active" });
+    await db.insert(costEvents).values({
+      ...base,
+      projectId: deletedProjectId,
+      costCents: 40,
+      occurredAt: new Date("2026-11-07T00:00:30.000Z"),
+    });
+    await expect(db.delete(projects).where(eq(projects.id, deletedProjectId))).rejects.toThrow();
+
+    // Contrary-to-fact from here: drop the constraint to reach the state the FK forbids,
+    // and restore it whatever happens so the rest of this file keeps its guarantees.
+    await db.execute(
+      sql`alter table "cost_events" drop constraint "cost_events_project_id_projects_id_fk"`,
+    );
+    try {
+      await db.delete(projects).where(eq(projects.id, deletedProjectId));
+      await db.insert(costEvents).values([
+        { ...base, projectId: liveProjectId, costCents: 700, occurredAt: new Date("2026-11-07T01:00:00.000Z") },
+        // A SECOND dangling project: one bucket must absorb both, not one row each.
+        { ...base, projectId: randomUUID(), costCents: 60, occurredAt: new Date("2026-11-07T02:00:00.000Z") },
+      ]);
+
+      const rows = await costs.byProject(companyId);
+      const summary = await costs.summary(companyId);
+
+      expect(rows.reduce((sum, row) => sum + row.costCents, 0)).toBe(summary.spendCents);
+
+      const unattributed = rows.filter((row) => row.projectId === null);
+      expect(unattributed).toHaveLength(1);
+      expect(unattributed[0]?.costCents).toBe(100);
+    } finally {
+      await db.delete(costEvents);
+      await db.execute(
+        sql`alter table "cost_events" add constraint "cost_events_project_id_projects_id_fk" foreign key ("project_id") references "public"."projects"("id") on delete no action on update no action`,
+      );
+    }
   });
 
   // PEN-5624: `activity_log.created_at` is `defaultNow()` = `now()` = TRANSACTION start
