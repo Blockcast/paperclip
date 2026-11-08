@@ -82,6 +82,7 @@ import {
   getMetricsRegistry,
 } from "../services/metrics.js";
 import {
+  extractBranchIdentifiers,
   resolveLinkSourceForIdentifier,
   resolveOwningPaperclipIdentifiers,
 } from "../services/paperclip-identifiers.js";
@@ -150,6 +151,34 @@ describe("github-webhook pure helpers", () => {
     expect(__test_extractPaperclipIdentifiers("frontend-X-44")).toEqual([]);
     // Punctuation around match is fine.
     expect(__test_extractPaperclipIdentifiers("(BLO-3182): work")).toEqual(["BLO-3182"]);
+  });
+
+  it("does not mint an owning identifier from a CVE id (PEN-6137)", () => {
+    // `CVE-2026-59873` matched the identifier pattern as `CVE-2026`: the
+    // prefix class takes `CVE`, `\d{1,6}` takes `2026`, and the trailing `\b`
+    // is satisfied by the following `-`. That token resolves in no company, so
+    // it survived into `unresolvedOwningIdentifiers` and pinned
+    // `ownerListComplete: false` for the life of the PR -- selectively on
+    // security-remediation PRs, the ones where recording a constraint on the
+    // right owning row matters most.
+    expect(__test_extractPaperclipIdentifiers("CVE-2026-59873")).toEqual([]);
+    expect(__test_extractPaperclipIdentifiers("fixes CVE-2021-44228 now")).toEqual([]);
+    expect(__test_extractPaperclipIdentifiers("xc-m3w5 / CVE-2023-54404 affects")).toEqual([]);
+    // Lowercase, and the branch shape a security fix actually gets. The branch
+    // tier is case-insensitive and segment-anchored, so `cve-2026` clears the
+    // anchor exactly the way a real lowercase ref does.
+    expect(extractBranchIdentifiers("fix/cve-2026-59873-upgrade-tar")).toEqual([]);
+
+    // Scoped to the published CVE format (`CVE-YYYY-NNNN+`) rather than to any
+    // `A-N-N` continuation, because the general form is MEASURED LOSSY: over
+    // this repo's 916 live branches a continuation guard drops `BLO-1489` from
+    // `fix/blo-1489-1490-ssh-probe`, a PR carrying two issues, and with it the
+    // author wake the owning tiers exist to deliver.
+    expect(extractBranchIdentifiers("fix/blo-1489-1490-ssh-probe")).toEqual(["BLO-1489"]);
+    // A bare `CVE-2026` carries no sequence number and is still extracted, so
+    // a company that ever took the `CVE` prefix loses nothing it could have
+    // resolved. The issue lookup disambiguates, as it does for every prefix.
+    expect(__test_extractPaperclipIdentifiers("CVE-2026")).toEqual(["CVE-2026"]);
   });
 
   it("resolves the PR's OWNING identifier as title > labeled Fixes:/Closes:/Refs: body line > branch, never a bare Related: mention (BLO-20886)", () => {
@@ -2614,6 +2643,58 @@ describe("github-webhook pure helpers", () => {
 
     expect(ctx?.owningIdentifiers).toEqual(["BLO-20886"]);
     expect(ctx?.identifiers).toContain("BLO-20886");
+  });
+
+  it("keeps the real owner and its wake on a PR that also names a CVE (PEN-6137)", () => {
+    // The regression that matters for the CVE guard is a WAKE that stops
+    // firing, not a flag that stays red -- so the control is a PR carrying
+    // BOTH a CVE and a real ref, asserted through the same round trip the
+    // owner/wake path actually uses. `CVE-2026` must be absent from both sets
+    // while PEN-5836 survives in both: author wakes are computed as
+    // `matched.filter(m => owning.includes(m.identifier))` and `matched`
+    // derives from the broad `identifiers`, so an owner missing from either
+    // set yields no candidates.
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 8277,
+        title: "security: bump tar to patch CVE-2026-59873",
+        body: "- Refs: PEN-5836\n\nUpgrades the vendored tar that CVE-2026-59873 hits.",
+        head: { ref: "sec/pen-5836-bump-tar", sha: "deadbeef" },
+        user: { login: "kkroo" },
+      },
+      review: { state: "commented", body: "looks fine", user: { login: "ally" } },
+      repository: { full_name: "Blockcast/onprem-k8s" },
+    });
+
+    expect(ctx?.owningIdentifiers).toEqual(["PEN-5836"]);
+    expect(ctx?.identifiers).toContain("PEN-5836");
+    expect(ctx?.owningIdentifiers).not.toContain("CVE-2026");
+    expect(ctx?.identifiers).not.toContain("CVE-2026");
+  });
+
+  it("resolves no owner at all from a CVE-only branch rather than a bogus one (PEN-6137)", () => {
+    // The branch tier is the last resort, so a security PR that names no issue
+    // anywhere must fail CLOSED to "no owning reference" -- the state the
+    // caller already handles -- instead of owning a `CVE-2026` that can never
+    // resolve. This is the tier with no observed miss in the 916 live branches
+    // today; it is guarded on structure, since the branch a security fix gets
+    // (`fix/cve-2026-59873-...`) puts `cve-2026` right after a `/`.
+    const ctx = __test_resolveEventContext("pull_request_review", {
+      action: "submitted",
+      pull_request: {
+        number: 8278,
+        title: "bump tar",
+        body: "No issue reference in this body at all.",
+        head: { ref: "fix/cve-2026-59873-upgrade-tar", sha: "deadbeef" },
+        user: { login: "kkroo" },
+      },
+      review: { state: "commented", body: "ok", user: { login: "ally" } },
+      repository: { full_name: "Blockcast/onprem-k8s" },
+    });
+
+    expect(ctx?.owningIdentifiers ?? []).toEqual([]);
+    expect(ctx?.identifiers ?? []).not.toContain("CVE-2026");
   });
 
   it("extracts review body / state / author from pull_request_review.submitted so the assignee wake can render it inline (BLO-6300)", () => {
