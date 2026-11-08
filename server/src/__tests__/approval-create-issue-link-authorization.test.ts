@@ -200,9 +200,20 @@ function decideByAssignee() {
  * This is the only way to reach the 409 checkout-conflict verdict: a boundary
  * refusal is permanent, so it is a 403 and never a conflict.
  */
+/**
+ * Clears the `issue:mutate` boundary so a case reaches the assignee/checkout
+ * branches instead of short-circuiting on a permanent refusal.
+ *
+ * PEN-5511: `issue:comment` is denied on purpose. It is the participation half of
+ * the `requested_by_self` relation, which overrides the checkout refusal by design
+ * — and at this door the filer half holds for every actor, since the card being
+ * created is theirs. Leaving it allowed would make the checkout case pass or fail
+ * for a reason it is not about. The relation has its own cases in
+ * `approval-link-route-equivalence.test.ts`, where both doors are mounted.
+ */
 function decideAllowingBoundary() {
   mockAccessService.decide.mockImplementation(async (input: any) => {
-    if (input.action === "tasks:manage_active_checkouts") {
+    if (input.action === "tasks:manage_active_checkouts" || input.action === "issue:comment") {
       return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "" };
     }
     return { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "" };
@@ -372,7 +383,27 @@ describe("POST /companies/:companyId/approvals — issueIds authorization (BLO-2
     ]);
   });
 
-  it("refuses a creator/manager-chain grant, which is comment-only", async () => {
+  /**
+   * PEN-5511 SUPERSEDES THIS CASE'S OLD VERDICT AT THIS DOOR, deliberately. It used
+   * to assert 403: a creator/manager-chain grant is comment-only (BLO-18113 /
+   * BLO-18797), so the evaluator narrowed it rather than letting it carry a link.
+   *
+   * `requested_by_self` is "the actor filed this card AND may comment on this row".
+   * A manager-of-assignee satisfies the second half by definition — it is one of the
+   * eight `ISSUE_COMMENT_EVALUATED_RELATIONS` — and at THIS door the first half holds
+   * for every actor, since the card being created is theirs. So the narrowing is now
+   * unreachable here for an agent, and that is the coherent outcome rather than an
+   * erosion: without it a merely *mentioned* agent would be allowed to link (its
+   * `issue:mutate` denial is `deny_missing_grant`, which the relation overrides)
+   * while the issue's own creator or the assignee's manager — strictly stronger
+   * relations — would be refused.
+   *
+   * The narrowing still does its job where it still has one: at the LINK door, for a
+   * card the actor did not file. That is pinned by "refuses a participant attaching
+   * SOMEONE ELSE'S card" and by the manager-chain case in
+   * `approval-link-requested-by-self.test.ts`, which mounts both doors.
+   */
+  it("lets a manager-chain grant link the card it filed, which PEN-5511 admits", async () => {
     mockAccessService.decide.mockImplementation(async (input: any) => {
       if (input.action === "company_scope:read") {
         return { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "" };
@@ -390,8 +421,34 @@ describe("POST /companies/:companyId/approvals — issueIds authorization (BLO-2
       .post(`/api/companies/${COMPANY_ID}/approvals`)
       .send(createBody([PEER_ISSUE_ID]));
 
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(mockIssueApprovalService.linkManyForApproval).toHaveBeenCalled();
+  });
+
+  it("still refuses a comment-only grant when the row admits no participation", async () => {
+    // The half of the old assertion that PEN-5511 does NOT supersede: the relation
+    // needs participation, so a grant that clears `issue:mutate` without clearing
+    // `issue:comment` is still narrowed exactly as before.
+    mockAccessService.decide.mockImplementation(async (input: any) => {
+      if (input.action === "company_scope:read") {
+        return { allowed: true, action: input.action, reason: "allow_explicit_grant", explanation: "" };
+      }
+      if (input.action === "tasks:manage_active_checkouts" || input.action === "issue:comment") {
+        return { allowed: false, action: input.action, reason: "deny_missing_grant", explanation: "" };
+      }
+      return { allowed: true, action: input.action, reason: "allow_manager_chain", explanation: "" };
+    });
+    mockIssueService.getById.mockResolvedValue(
+      makeIssue({ id: PEER_ISSUE_ID, assigneeAgentId: PEER_AGENT_ID, status: "todo" }),
+    );
+
+    const res = await request(await createApp(agentActor()))
+      .post(`/api/companies/${COMPANY_ID}/approvals`)
+      .send(createBody([PEER_ISSUE_ID]));
+
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     expect(res.body.details.refusedIssueIds).toEqual([PEER_ISSUE_ID]);
+    expect(mockIssueApprovalService.linkManyForApproval).not.toHaveBeenCalled();
   });
 
   it("rejects an issueIds array over the cap before authorizing any id", async () => {
