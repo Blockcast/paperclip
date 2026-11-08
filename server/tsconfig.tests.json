@@ -59,6 +59,7 @@
     "src/__tests__/issue-list-timeout-explain-postgres.test.ts",
     "src/__tests__/issue-list-timeout-explain.test.ts",
     "src/__tests__/issue-park-expiry-sweep.test.ts",
+    "src/__tests__/issue-wake-diagnostics-statement-budget.test.ts",
     "src/__tests__/stranded-sweep-park-suppression.test.ts",
     "src/__tests__/issue-tree-hold-metrics.test.ts",
     "src/__tests__/metrics-help-cross-reference.test.ts",
