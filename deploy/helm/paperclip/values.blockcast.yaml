@@ -715,6 +715,22 @@ worker:
     # the launcher scrubs every PENSTOCK_* name from both child processes.
     - name: PENSTOCK_READY_TIMEOUT_MS
       value: "60000"
+    # BLO-54721: libuv's threadpool defaults to 4 threads and is shared by
+    # async fs, dns.lookup and zlib. The worker keeps 20-30 FSReqPromise
+    # requests queued against it on the /paperclip CephFS claim, so DNS
+    # lookups pile up behind fs (p0: GetAddrInfoReqWrap averaged 455 in flight
+    # 2026-11-08 02-05Z while CoreDNS p99 was 7 ms). So does the gunzip of
+    # every compressed Kubernetes LIST, because client-node 1.4's node-fetch
+    # sends Accept-Encoding: gzip. Start-lock reaps then stop completing and
+    # dispatch stalls (BLO-32064, BLO-49316).
+    # 16 covers the measured steady-state backlog. Cost: each extra thread may
+    # take its own glibc arena (PEN-3314); the worker's 24h peak working set was
+    # ~35% of its limit. Worker-only on purpose: the api Deployment's admission
+    # policy (onprem-k8s paperclip-public-tools.yaml) rejects non-PAPERCLIP_
+    # env names outside its allowlist, so this must not go in env.extra. It is
+    # not on the agent inherit allowlist, so agent Jobs do not receive it.
+    - name: UV_THREADPOOL_SIZE
+      value: "16"
     # BLO-19123: turns on the stranded-recovery hand-back drain, which returns
     # mis-owned rows to their real owner instead of leaving them parked on a
     # manager. The code shipped dark in #1549/#1580 so that enabling it stayed a
