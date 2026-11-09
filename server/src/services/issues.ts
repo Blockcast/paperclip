@@ -1341,6 +1341,75 @@ export function issueMonitorStatusFromExecutionState(
 function withMonitorStatus<T extends IssueRow>(row: T): T & IssueMonitorStatusProjection {
   return { ...row, monitorStatus: issueMonitorStatusFromExecutionState(row.executionState) };
 }
+
+/**
+ * PEN-6129: the deliberate park, read back under the SAME NAME the writer used.
+ *
+ * The park had two vocabularies and they did not overlap. `PATCH /api/issues/:id` accepts
+ * `parkedDisposition: {reason, until}` and REFUSES all four flat keys
+ * (`misplacedIssueParkedInputShape`); both read surfaces carried only the flat `parked_*`
+ * columns and never `parkedDisposition`. So the obvious post-write check — PATCH the
+ * nested key, GET, read it back — was not a weak predicate but a CONSTANT: the key was
+ * absent on a parked row and an unparked row alike, `jq` / `.get()` / optional chaining
+ * render absent as `null`, and the standing defence against this whole class ("gate on key
+ * presence, not on value") could not reach it, because `has("parkedDisposition")` was
+ * false for both states. Measured 2026-11-08: a reader took `parkedDisposition: null` on a
+ * parked row to mean the park was gone, and began building a second claim — an invented
+ * sweep that had supposedly dropped it — on top of the false reading.
+ *
+ * ⚠️ NON-NULL MEANS "A PARK IS RECORDED ON THIS ROW", NOT "THE PARK IS ACTIVE". This
+ * mirrors the columns exactly, and the columns OUTLIVE the park: expiry deliberately does
+ * not clear them (`services/issue-park-expiry.ts`), which is what lets the release edge
+ * reason about the window between the deadline and the next re-park. Suppression keys on
+ * `parkedUntil` being in the FUTURE — `isDeliberateParkActive` — and so must any consumer
+ * of this field. Mirroring is the deliberate choice: making this null on a lapsed park
+ * would have the two names disagree about the same row, which is the defect this closes,
+ * reopened one state at a time.
+ */
+export type IssueParkedDispositionRead = {
+  reason: string | null;
+  until: Date;
+};
+type IssueParkedDispositionProjection = {
+  parkedDisposition: IssueParkedDispositionRead | null;
+};
+
+/**
+ * Keyed on `parkedUntil` ALONE, so this agrees with `isDeliberateParkActive` and with the
+ * liveness classifier about which rows carry a park at all — a projection that disagreed
+ * with the suppression predicate about the existence of the park would be a third
+ * vocabulary, not a fix for the second.
+ *
+ * `reason` is nullable here even though the write schema requires it. The two columns are
+ * independently nullable at the DB level, and a projection that threw, or that reported
+ * "not parked", on a half-written row would hide exactly the inconsistency a reader needs
+ * to see. `until` is the `Date` the row already carries, not a re-formatted string, so
+ * this key and the flat `parkedUntil` serialize to the identical instant through the same
+ * `JSON.stringify` — two names for one value, which is the whole point.
+ */
+export function issueParkedDispositionFromRow(
+  row: { parkedUntil?: Date | null; parkedReason?: string | null },
+): IssueParkedDispositionRead | null {
+  if (!row.parkedUntil) return null;
+  return { reason: row.parkedReason ?? null, until: row.parkedUntil };
+}
+
+/**
+ * PEN-6129: attach `parkedDisposition` to a single-issue read.
+ *
+ * Applied at every exit of the single-issue getters, for the reason `withMonitorStatus`
+ * above is: the UUID path, the identifier path and the legacy-identifier path each have
+ * their own `return`, so a fix applied in the route — or on one branch — drifts. The list
+ * arm lives in `withActiveRuns`; both call `issueParkedDispositionFromRow`, so the two
+ * surfaces agree by construction rather than by review, and
+ * `issue-parked-disposition.test.ts` drives both off one set of stored rows.
+ *
+ * Unconditional: the key is present on every row, holding null where no park is recorded,
+ * because a key the caller has to test for is the defect this closes.
+ */
+function withParkedDisposition<T extends IssueRow>(row: T): T & IssueParkedDispositionProjection {
+  return { ...row, parkedDisposition: issueParkedDispositionFromRow(row) };
+}
 /**
  * A row as `issueListSelect` actually returns it: every table column, plus the columns that
  * projection computes in SQL. `dbOrTx` is untyped, so the select's shape cannot be inferred
@@ -1352,7 +1421,8 @@ type IssueWithLabelsAndRun = IssueWithLabels
   & { activeRun: IssueActiveRunRow | null }
   & IssueScheduledRetryProjection
   & IssueProductivityReviewProjection
-  & IssueMonitorStatusProjection;
+  & IssueMonitorStatusProjection
+  & IssueParkedDispositionProjection;
 type IssueUserCommentStats = {
   issueId: string;
   myLastCommentAt: Date | null;
@@ -4820,8 +4890,8 @@ const issueListSelect = {
 };
 
 /**
- * Attaches the two derived liveness projections every list row carries:
- * `activeRun` and the flat `scheduledRetry*` scalars (BLO-28843).
+ * Attaches the derived liveness projections every list row carries: `activeRun`, the flat
+ * `scheduledRetry*` scalars (BLO-28843), and `parkedDisposition` (PEN-6129).
  *
  * `retryMap` is deliberately a **required** parameter. The defect this closes
  * was a projection that silently omitted a key, so the failure mode has to be a
@@ -4833,6 +4903,13 @@ const issueListSelect = {
  * `issueListSelect` fails here rather than shipping a row missing a key. That is
  * what caught `monitorStatus` (PEN-5481) — add new projections to both this
  * signature and `IssueListSelectRow`, never to only one.
+ *
+ * `parkedDisposition` is computed here in TypeScript rather than in `issueListSelect`,
+ * unlike `monitorStatus`: the flat `parked_*` columns the list already selects are its
+ * only inputs, and deriving both arms from one function (`issueParkedDispositionFromRow`)
+ * makes the list and the single-issue read agree by construction — including on how
+ * `until` is serialized, which a `jsonb_build_object` arm would have had to re-derive and
+ * could have got wrong by a format rather than by a value.
  */
 function withActiveRuns(
   issueRows: (IssueWithLabels & IssueProductivityReviewProjection & IssueMonitorStatusProjection)[],
@@ -4843,6 +4920,7 @@ function withActiveRuns(
     ...row,
     activeRun: row.executionRunId ? (runMap.get(activeRunMapKey(row.companyId, row.executionRunId)) ?? null) : null,
     ...(retryMap.get(row.id) ?? EMPTY_SCHEDULED_RETRY_PROJECTION),
+    parkedDisposition: issueParkedDispositionFromRow(row),
   }));
 }
 
@@ -7160,7 +7238,7 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [enriched] = await withIssueLabels(db, [row]);
-    return withMonitorStatus(enriched);
+    return withParkedDisposition(withMonitorStatus(enriched));
   }
 
   async function getIssueByIdentifier(identifier: string) {
@@ -7174,7 +7252,7 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (row) {
       const [enriched] = await withIssueLabels(db, [row]);
-      return withMonitorStatus(enriched);
+      return withParkedDisposition(withMonitorStatus(enriched));
     }
     // Legacy fallback: 0084's BLO→PCL backfill stashed the pre-rename
     // identifier in `legacy_identifier` so old URLs (bookmarks, agent
@@ -7192,7 +7270,7 @@ export function issueService(db: Db) {
       .then((rows) => rows[0] ?? null);
     if (!legacyRow) return null;
     const [enriched] = await withIssueLabels(db, [legacyRow]);
-    return withMonitorStatus(enriched);
+    return withParkedDisposition(withMonitorStatus(enriched));
   }
 
   async function getCurrentScheduledRetryForIssue(issueId: string, companyId: string): Promise<IssueScheduledRetryRow | null> {
