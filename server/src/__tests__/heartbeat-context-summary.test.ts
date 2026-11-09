@@ -3930,6 +3930,26 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("you have a FILE transport and should PREFER it");
     // The reason it is preferred, stated so it transfers past this one field.
     expect(markdown).toContain("REMOVES the step a digest can only check");
+    // The two files are distinct and the clause must say which is hashed and which is sent.
+    // Collapsing them is what made the first version of this segment unperformable: the
+    // digest has to cover the raw description text, and the request body cannot BE that text.
+    expect(markdown).toContain("It takes TWO files and they are not interchangeable");
+    expect(markdown).toContain("jq -Rs '{description: .}' desc.md > body.json");
+    // Both credential and content type, because dropping either one fails and they fail
+    // DIFFERENTLY -- measured 2026-11-09T16:1xZ with a discriminating control on each arm.
+    expect(markdown).toContain("Authorization: Bearer $PAPERCLIP_API_KEY");
+    expect(markdown).toContain("Content-Type: application/json");
+    // 404, not 401: the refusal is disguised as a mistyped issue id.
+    expect(markdown).toContain("returns `404`, not `401`");
+    // The one that matters most: a 200 that writes nothing is the exact failure this whole
+    // clause exists to detect, reachable THROUGH the command the clause recommends.
+    expect(markdown).toContain("returns `200 OK` and writes NOTHING");
+    // --data silently changes the bytes you hashed; --data-binary does not.
+    expect(markdown).toContain("Pass `--data-binary`, never `--data`");
+    // And the append reading is gone: the clause says PREPEND two sentences earlier, and the
+    // Surface clause's pattern ("opens its description with the standing constraint") only
+    // holds if the block goes in front.
+    expect(markdown).not.toContain("concatenate your block onto that file");
     // The fallback survives: a seat without that transport still gets a performable step.
     expect(markdown).toContain("Where that is unavailable and the only write path takes the body as an inline string argument");
     expect(markdown).toContain("the transcription is the step being checked");
