@@ -2188,6 +2188,201 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         ]),
       );
     });
+
+    // PEN-6282: the `in_review` fence (assertPendingReviewRunOwnership, forked
+    // off assertCheckoutOwner by BLO-22666) inherited the TERMINAL-only lock
+    // clear and never gained a liveness test, so it disagreed with
+    // `isReapableHeartbeatRunRow` on exactly the case the predicate above was
+    // written for: a holder that exists but has never executed. Measured on a
+    // live row 2026-11-08 — the 409 body carried `holderLiveness: "not_live"`
+    // while refusing the assignee's own document write, and the longest
+    // same-shape dispatch stall observed was 11h 00m 44.7s queued, never
+    // started.
+    //
+    // These tests pin the invariant at BOTH entry points on purpose. The
+    // predicate's own doc comment says the implementations "must not drift",
+    // and a test that covers only the `in_progress` ladder is what let this
+    // fork ship with the terminal-only clear in the first place.
+    describe("the in_review fence agrees with the reapable predicate (PEN-6282)", () => {
+      const svc = () => issueService(db);
+
+      function pendingReviewExecutionState(agentId: string, stageId: string) {
+        return {
+          status: "pending" as const,
+          currentStageId: stageId,
+          currentStageIndex: 0,
+          currentStageType: "review" as const,
+          currentParticipant: { type: "agent" as const, agentId },
+          returnAssignee: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        };
+      }
+
+      async function seedPendingReviewIssueOwnedByRun(input: {
+        companyId: string;
+        agentId: string;
+        ownerRunId: string;
+        title: string;
+      }) {
+        const issueId = randomUUID();
+        const stageId = randomUUID();
+        await db.insert(issues).values({
+          id: issueId,
+          companyId: input.companyId,
+          title: input.title,
+          status: "in_review",
+          priority: "high",
+          assigneeAgentId: input.agentId,
+          checkoutRunId: input.ownerRunId,
+          executionRunId: input.ownerRunId,
+          executionAgentNameKey: "codexcoder",
+          executionLockedAt: new Date(),
+          executionPolicy: {
+            stages: [{
+              id: stageId,
+              type: "review",
+              participants: [{ type: "agent", agentId: input.agentId }],
+            }],
+          },
+          executionState: pendingReviewExecutionState(input.agentId, stageId),
+        });
+        return issueId;
+      }
+
+      async function seedLiveForeignOwnerRun(input: { companyId: string; agentId: string }) {
+        const runId = randomUUID();
+        await db.insert(heartbeatRuns).values({
+          id: runId,
+          companyId: input.companyId,
+          agentId: input.agentId,
+          status: "running",
+          invocationSource: "assignment",
+          // The discriminator against the never-started holder: this one ran.
+          startedAt: new Date(),
+          createdAt: new Date("2026-01-01T00:00:00.000Z"),
+        });
+        return runId;
+      }
+
+      for (const holderStatus of ["queued", "scheduled_retry"] as const) {
+        it(`lets the assignee's own run write a pending review held by a ${holderStatus} run that never started`, async () => {
+          const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+          const neverStartedOwnerRunId = await seedNeverStartedOwnerRun({
+            companyId,
+            agentId,
+            status: holderStatus,
+          });
+          const issueId = await seedPendingReviewIssueOwnedByRun({
+            companyId,
+            agentId,
+            ownerRunId: neverStartedOwnerRunId,
+            title: `Never-started ${holderStatus} owner must not fence the pending review`,
+          });
+
+          await expect(
+            svc().assertPendingReviewRunOwnership(issueId, agentId, currentRunId),
+          ).resolves.toEqual({ owned: true, fenced: false });
+        });
+      }
+
+      it("writes the document the reported 409 refused, with a queued never-started holder", async () => {
+        const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+        const neverStartedOwnerRunId = await seedNeverStartedOwnerRun({
+          companyId,
+          agentId,
+          status: "queued",
+        });
+        const issueId = await seedPendingReviewIssueOwnedByRun({
+          companyId,
+          agentId,
+          ownerRunId: neverStartedOwnerRunId,
+          title: "Queued owner must not shut the document surface",
+        });
+
+        const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+          .put(`/api/issues/${issueId}/documents/plan`)
+          .send({ format: "markdown", body: "# Plan\n\nWritten past a never-started holder." });
+
+        // 201: the upsert CREATED the document. Before this fix the same
+        // request was answered 409 `pending_review_stage_locked_by_another_run`.
+        expect(res.status, JSON.stringify(res.body)).toBe(201);
+        expect(res.body).toMatchObject({ key: "plan", latestRevisionNumber: 1 });
+      });
+
+      // The must-fail input. A fence that opens for a never-started holder is
+      // only correct if it still shuts for a live one — the two-runs-of-one
+      // -agent case BLO-22666 AC2 exists to refuse.
+      it("still fences a pending review held by a live running run of the same agent", async () => {
+        const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+        const liveOwnerRunId = await seedLiveForeignOwnerRun({ companyId, agentId });
+        const issueId = await seedPendingReviewIssueOwnedByRun({
+          companyId,
+          agentId,
+          ownerRunId: liveOwnerRunId,
+          title: "Live sibling owner still fences the pending review",
+        });
+
+        const res = await request(createApp(agentActor(companyId, agentId, currentRunId)))
+          .put(`/api/issues/${issueId}/documents/plan`)
+          .send({ format: "markdown", body: "# Plan" });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        expect(res.body.details).toMatchObject({
+          reason: "pending_review_stage_locked_by_another_run",
+          holderLiveness: "live",
+          concurrentSiblingRun: true,
+        });
+      });
+
+      // The drift guard proper: one never-started holder shape, both entry
+      // points, one verdict. `assertCheckoutOwner` reaches
+      // `isReapableHeartbeatRunRow` through adoptStaleExecutionLock;
+      // `assertPendingReviewRunOwnership` reaches the same answer through the
+      // liveness gate. If a later fork of either re-inherits the terminal-only
+      // clear, exactly one half of this test fails.
+      it("answers the never-started holder identically at the in_progress and in_review entry points", async () => {
+        const { companyId, agentId, currentRunId } = await seedCompanyAgentAndRuns();
+        const inProgressOwnerRunId = await seedNeverStartedOwnerRun({
+          companyId,
+          agentId,
+          status: "queued",
+        });
+        const inReviewOwnerRunId = await seedNeverStartedOwnerRun({
+          companyId,
+          agentId,
+          status: "queued",
+        });
+        const inProgressIssueId = await seedIssueOwnedByRun({
+          companyId,
+          agentId,
+          ownerRunId: inProgressOwnerRunId,
+          title: "in_progress entry point, never-started holder",
+        });
+        const inReviewIssueId = await seedPendingReviewIssueOwnedByRun({
+          companyId,
+          agentId,
+          ownerRunId: inReviewOwnerRunId,
+          title: "in_review entry point, never-started holder",
+        });
+
+        const actor = agentActor(companyId, agentId, currentRunId);
+        const inProgressRes = await request(createApp(actor))
+          .patch(`/api/issues/${inProgressIssueId}`)
+          .send({ status: "todo" });
+        const inReviewRes = await request(createApp(actor))
+          .put(`/api/issues/${inReviewIssueId}/documents/plan`)
+          .send({ format: "markdown", body: "# Plan" });
+
+        // Compared as one object so a failure names WHICH entry point drifted,
+        // rather than stopping at the first assertion.
+        expect(
+          { in_progress: inProgressRes.status, in_review: inReviewRes.status },
+          JSON.stringify({ inProgress: inProgressRes.body, inReview: inReviewRes.body }),
+        ).toEqual({ in_progress: 200, in_review: 201 });
+      });
+    });
   });
 
   it("allows only one concurrent decision from a participant whose assignee drifted", async () => {
