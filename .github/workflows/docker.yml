@@ -212,27 +212,88 @@ jobs:
           else
             PREFERRED_ORDINAL=0
           fi
+
+          # Which ordinal to prefer (above, BLO-55269) and whether the chosen
+          # one is usable (below, PEN-6371) are separate questions. The marked
+          # region is extracted and executed by
+          # scripts/check-buildkit-endpoint-selection.test.js, which drives
+          # PREFERRED_ORDINAL directly; the resolution above is pinned by
+          # scripts/__tests__/ci-cache-routing.test.mjs and stays outside.
+          # BEGIN SELECT_BUILDKIT_ENDPOINT
           if [[ ! "${PREFERRED_ORDINAL}" =~ ^[01]$ ]]; then
             echo "Invalid BuildKit ordinal: ${PREFERRED_ORDINAL}" >&2
             exit 1
           fi
 
-          probe_buildkit() {
+          # Phase 1. A pod that is gone fails here in seconds instead of
+          # waiting out the solve's dial timeout. Necessary, never sufficient.
+          probe_tcp() {
             local host="$1"
             local timeout_seconds="$2"
             timeout "${timeout_seconds}" nc -z -w "${timeout_seconds}" "${host}" 1234
           }
 
+          # Phase 2, PEN-6371. The gate phase 1 cannot be. A TCP connect is not
+          # a health check for a build: on 2026-11-09 run 42629411195 the
+          # connect above returned 0 against buildkit-amd64-1 and the very next
+          # step died with `frontend grpc server closed unexpectedly`, on the
+          # same commit (220d2ae1f441) that had built clean on ordinal 0 two
+          # hours earlier. The daemon was listening and could not serve a
+          # solve, so the fallback this step exists to provide never engaged --
+          # and because only workflow_dispatch is pinned to ordinal 1, the
+          # production deploy lane is the only lane that pays. `FROM scratch`
+          # over an empty context drives buildkitd's dockerfile.v0 gateway
+          # frontend -- the exact path that died -- pulling nothing and
+          # exporting nothing.
+          probe_solve() {
+            local host="$1" budget="$2" ctx builder rc=0
+            # "Cannot measure" is not "unhealthy". Without a client this
+            # degrades to the pre-PEN-6371 behaviour (keep the preferred
+            # ordinal) rather than silently routing every build to the
+            # ClusterIP and dissolving the cache affinity above.
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "::warning::docker is unavailable; cannot verify ${host} can complete a solve"
+              return 0
+            fi
+            ctx="$(mktemp -d)"
+            printf 'FROM scratch\n' > "${ctx}/Dockerfile"
+            builder="pen6371-probe-${host%%.*}-${GITHUB_RUN_ID:-0}-${GITHUB_RUN_ATTEMPT:-0}-$$"
+            if timeout "${budget}" docker buildx create --name "${builder}" --driver remote "tcp://${host}:1234" >/dev/null 2>&1; then
+              timeout "${budget}" docker buildx build --builder "${builder}" --output type=cacheonly "${ctx}" >/dev/null 2>&1 || rc=1
+              timeout 30 docker buildx rm "${builder}" >/dev/null 2>&1 || true
+            else
+              rc=1
+            fi
+            rm -rf "${ctx}"
+            return "${rc}"
+          }
+
           preferred="buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local"
           fallback="buildkit-amd64.ci.svc.cluster.local"
           host="${preferred}"
-          if ! probe_buildkit "${preferred}" 5; then
-            echo "::warning::Preferred BuildKit ${preferred} is unavailable; using the healthy service endpoint"
+          if ! probe_tcp "${preferred}" 5; then
+            echo "::warning::Preferred BuildKit ${preferred} does not accept connections; using the healthy service endpoint"
             host="${fallback}"
-            probe_buildkit "${fallback}" 10
+          elif ! probe_solve "${preferred}" 90; then
+            echo "::warning::Preferred BuildKit ${preferred} accepts connections but cannot complete a solve; using the healthy service endpoint"
+            host="${fallback}"
           fi
+
+          if [ "${host}" = "${fallback}" ]; then
+            # The ClusterIP is the last endpoint there is -- it balances over
+            # whichever pods the Service reports Ready, so there is nothing
+            # further to demote to. Keep the pre-existing hard gate on
+            # reachability, and report an unserviceable fallback as a warning
+            # rather than failing here: buildx's own error on the real build is
+            # strictly more informative than anything this step could print.
+            probe_tcp "${fallback}" 10
+            probe_solve "${fallback}" 90 \
+              || echo "::warning::Fallback BuildKit ${fallback} accepts connections but did not complete a probe solve; continuing"
+          fi
+
           echo "endpoint=tcp://${host}:1234" >> "$GITHUB_OUTPUT"
           echo "Using BuildKit endpoint tcp://${host}:1234"
+          # END SELECT_BUILDKIT_ENDPOINT
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
