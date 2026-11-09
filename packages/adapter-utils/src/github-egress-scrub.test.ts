@@ -586,6 +586,70 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("PEN-6255: a value with no binding name at all is never a candidate", () => {
+    // ASSIGNMENT_RE captures a binding NAME before it ever looks at the value,
+    // so this gap is one axis wider than PEN-6162 (spacing) or PEN-6167 (the
+    // operator): both of those still have a binder to widen toward and this
+    // has none. Accepted and dated in the detector's own comment block, which
+    // also records that no operator-level widening can reach it.
+    //
+    // Pinned in BOTH directions. If a no-binder arm ever lands, the first
+    // group goes red and whoever lands it has to read the cost paragraphs
+    // beside ASSIGNMENT_RE before touching these.
+    //
+    // Assembled at runtime, same convention as the fixtures above: written out
+    // contiguously the control line is material the deployed guard refuses,
+    // which would make this file unpushable.
+    const T = SYNTHETIC_OPAQUE_VALUE;
+
+    it.each([
+      ["a Python tuple element", `    "${T}",`],
+      ["a YAML sequence item", `tokens:\n  - ${T}`],
+      ["a positional argument", `assert_token("${T}")`],
+      ["a JSON array element", `{"tokens": ["${T}"]}`],
+      ["a Go slice literal", `keys := []string{"${T}"}`],
+      ["a bare return", `    return "${T}"`],
+    ])("passes %s through byte-exact", (_form, text) => {
+      const result = scrubGitHubEgressText(text);
+      expect(result.text).toBe(text);
+      expect(result.redacted).toBe(false);
+    });
+
+    it("still redacts the same bytes the moment a binder is adjacent", () => {
+      // The positive control. Without it the group above is a mute instrument:
+      // the same value clears the shape and entropy floors here, so what
+      // exempts it above is purely structural and not a judgement that
+      // material written that way is safe.
+      const result = scrubGitHubEgressText(`apiSecret="${T}"`);
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(T);
+    });
+
+    it.each([
+      ["vendor-key", `    "${["ghp", "S7kq2Vt9Lm4Xb8Nd3Wp6Zc1Yr5Hj0TgAbCd"].join("_")}",`],
+      ["jwt", `    "${SYNTHETIC_JWT}",`],
+      // Split at the `:` for the same reason as the vendor-key row above: written
+      // out contiguously this line is itself a credentialed URI to the deployed
+      // pre-push guard, which would make this file unpushable. Caught by running
+      // that guard over this very diff.
+      [
+        "credentialed-uri",
+        `    "${["https://svc", `${T}@db.internal:5432/app`].join(":")}",`,
+      ],
+    ])("still fires %s on a bare sequence element, which bounds the exposure", (cls, text) => {
+      // The name-free classes are binder-independent, so what passes above is
+      // exactly an opaque secret with NO recognisable vendor prefix.
+      expect(scrubGitHubEgressText(text).classes).toContain(cls);
+    });
+
+    it("still fires private-key-block on an indented bare sequence element", () => {
+      const text = SYNTHETIC_PEM.split("\n")
+        .map((line) => `    ${line}`)
+        .join("\n");
+      expect(scrubGitHubEgressText(text).classes).toContain("private-key-block");
+    });
+  });
+
   describe("PEN-6167: a colon-bound value never reaches the assignment net", () => {
     // `:` is not `=`, so YAML, JSON and a Kubernetes Secret `stringData` block
     // pass at any spacing. That gap is ACCEPTED and dated in the detector's own
@@ -2066,6 +2130,17 @@ describe("scrubGitHubEgressText", () => {
 
     it("returns nothing for clean text", () => {
       expect(locateGitHubEgressMatches("ordinary review prose")).toEqual([]);
+    });
+
+    it("returns nothing for a private key, so an empty result is not a clean verdict", () => {
+      // PEN-6255. The region rule is deliberate and is documented on the
+      // function, but a measurer who reads an empty result as "this line is
+      // clean" is fail-open on the class that matters most: two line-by-line
+      // sweeps of this detector were built that way and neither sample
+      // contained a PEM, so both read clean. This pins the divergence against
+      // the only verdict there is, so the warning cannot go stale silently.
+      expect(scrubGitHubEgressText(SYNTHETIC_PEM).classes).toContain("private-key-block");
+      expect(locateGitHubEgressMatches(SYNTHETIC_PEM)).toEqual([]);
     });
 
     it("attributes no line when a region class fires, so nothing inside the region is echoed", () => {
