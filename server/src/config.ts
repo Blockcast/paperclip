@@ -595,17 +595,27 @@ export const NUMERIC_SETTING_BOUNDS = {
   // The column has no `$onUpdate` and no trigger, so it moves solely where a write sets
   // it. The survey behind that claim, stated so the next reader can re-run it rather than
   // trust it: `grep -rn 'update(approvals)' server/src --include='*.ts' | grep -v
-  // __tests__` returns eleven sites, and exactly one leaves the row `pending` afterwards
-  // (`resubmit`, `services/approvals.ts`). Comments are inserted into `approval_comments`
-  // without touching the parent. So on a `pending` row `updated_at` cannot carry comment
-  // noise — it carries a resubmission instant or nothing.
+  // __tests__`.
+  //
+  // ⚠ RE-RUN 2026-11-09 (PEN-5818) AND THE CLAIM HAS DRIFTED, exactly as the paragraph
+  // below predicted. The survey returned eleven sites when this was written, exactly one
+  // of which left the row `pending` afterwards (`resubmit`, `services/approvals.ts`). It
+  // now returns TWELVE and TWO qualify: `updatePayload` in the same file corrects a
+  // pending card's payload in place and sets `updated_at` under a `status = 'pending'`
+  // guard. Comments are still inserted into `approval_comments` without touching the
+  // parent, so `updated_at` still cannot carry comment noise — but it no longer carries
+  // "a resubmission instant or nothing". It carries a resubmission OR an in-place
+  // correction, and this bound cannot tell them apart, which silently extends the
+  // exemption by up to the full grace on any card its filer corrected.
   //
   // The nearest miss is worth naming, because it is the shape that would break this and
   // it already exists: `services/agents.ts` edits `payload` on rows explicitly scoped to
   // `pending`/`revision_requested`. It is safe here for one reason only — it does not set
-  // `updatedAt`. A future "bump"/nudge write, or an idempotency replay that touches a
-  // pending row's `updated_at`, would silently extend this exemption by up to the full
-  // grace, which is the over-exemption direction. No test covers that drift, and the
+  // `updatedAt`. A "bump"/nudge write, or an idempotency replay that touches a pending
+  // row's `updated_at`, silently extends this exemption by up to the full grace, which is
+  // the over-exemption direction — and that is no longer hypothetical: the in-place
+  // payload correction named above is exactly such a write, and it shipped. No test
+  // covers that drift, and the
   // obvious candidate does not: `issue-recovery-actions.test.ts` drives the real
   // revision→resubmit chain, but freshness there is produced by the two writers jointly
   // (`requestRevision` moves `updated_at` first), so removing it from `resubmit` alone

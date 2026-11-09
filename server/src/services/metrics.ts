@@ -7755,7 +7755,31 @@ function ensureRegistry(): {
         + "(its " + APPROVALS_PENDING_METRIC + " reads 0), because 0 would read as a card filed this "
         + "instant. Labelled by company_id + requester + gated like " + APPROVALS_PENDING_METRIC
         + "; unlike that gauge the gated halves are NOT seeded, for the same reason types are not "
-        + "-- a half with nothing pending has no oldest card.",
+        + "-- a half with nothing pending has no oldest card. "
+        + "WHO OWNS REVISION TIME -- the semantics this gauge shares with "
+        + APPROVALS_PENDING_METRIC + ", stated here rather than split across two "
+        + "half-explanations (PEN-5719). The age is dated from the LATEST of a card's filing "
+        + "and its most recent row update, NOT from its filing alone, so a card the board sent "
+        + "back and the requester RESUBMITTED is aged from that resubmission -- the point at "
+        + "which it most recently became the board's problem. Dating it from the filing would "
+        + "bill the board for two spans it does not own: the stretch the card sat in "
+        + "`revision_requested` (the REQUESTER's court, which is why that status is excluded "
+        + "from the depth gauge outright) and the pre-revision stretch the board already "
+        + "discharged by ruling on it. Not hypothetical -- PEN-5719 fired on a card the board "
+        + "HAD served, whose true pending age was 1.8d against a 7d threshold while this gauge "
+        + "read 7.2d. "
+        + "KNOWN OVER-RESET, so do not read this series as resubmission-only (PEN-5818): "
+        + "`resubmit` is no longer the only write that leaves a row `pending` while moving "
+        + "`updated_at`. An in-place payload correction by the filing agent "
+        + "(`PATCH /approvals/{id}`, `updatePayload`) does so too, and this query cannot tell "
+        + "the two apart -- so a card corrected in place, which by design keeps its queue "
+        + "position and never leaves the board's court, reads here as though it were freshly "
+        + "filed. That is "
+        + "the FLATTERING direction: the series improves when a filer does the diligent thing. "
+        + "The card's own `payload_revision`/`payload_edited_at` markers separate an edit from "
+        + "a resubmission and this query does not yet consult them, so cross-check a "
+        + "suspiciously low reading against " + APPROVAL_LAST_DECISION_TIMESTAMP_METRIC
+        + ", which no payload edit can move.",
       labelNames: ["type", "company_id", "requester", "gated"],
       registers: [registry],
     });

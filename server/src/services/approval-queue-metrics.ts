@@ -172,16 +172,47 @@ const PENDING_STATUS = "pending";
  * BACKWARDS 5h at the moment of resubmission -- visible in the range query as a
  * +29039s step where every neighbour steps +10800s.
  *
- * `updated_at` is safe to read here for the same reason, and under the same
- * proof, that `hasPendingBoardApprovalWakePath` in `recovery/service.ts` reads
- * it: this query is scoped to `pending`, the column has no `$onUpdate` and no
- * trigger, and of the eleven `update(approvals)` sites under `server/src`
- * (`grep -rn 'update(approvals)' server/src --include='*.ts' | grep -v
- * __tests__` -- re-runnable rather than asserted) the only one that leaves a
- * row `pending` while touching `updated_at` is `resubmit`. The nearest miss is
- * `services/agents.ts`, which edits `payload` on pending rows but does not set
- * `updated_at`. So on a pending row the column carries exactly one signal:
- * when this card most recently became the board's problem.
+ * `updated_at` is read here for the same reason, and was justified under the
+ * same proof, that `hasPendingBoardApprovalWakePath` in `recovery/service.ts`
+ * reads it: this query is scoped to `pending`, and the column has no
+ * `$onUpdate` and no trigger, so it moves solely where a write sets it.
+ *
+ * ⚠ THAT PROOF NO LONGER HOLDS, and the re-runnable survey it was stated as is
+ * what caught it (PEN-5818). The survey -- `grep -rn 'update(approvals)'
+ * server/src --include='*.ts' | grep -v __tests__` -- returned eleven sites
+ * when this constant was written, of which exactly one left a row `pending`
+ * while touching `updated_at`: `resubmit`. It now returns TWELVE, and TWO
+ * qualify. The new one is the in-place payload correction in
+ * `services/approvals.ts` (`updatePayload`, the route behind
+ * `PATCH /approvals/{id}`), which sets `payloadEditedAt` AND
+ * `updatedAt` under a `where ... status = 'pending'` guard -- so it leaves the
+ * row pending by construction. `services/agents.ts` is still the nearest miss
+ * and is still harmless for the stated reason: it edits `payload` on pending
+ * rows without setting `updated_at`.
+ *
+ * So on a pending row `updated_at` no longer carries exactly one signal. It
+ * carries "resubmitted" OR "payload corrected in place", and this expression
+ * cannot tell them apart. The second is the opposite of what the gauge wants:
+ * an in-place correction exists precisely so a filer can fix stale evidence
+ * WITHOUT moving the card in the queue (see the route's own contract), and it
+ * re-dates the age as though the card were freshly filed. The failure is in
+ * the flattering direction -- the queue reads healthier every time a filer does
+ * the diligent thing -- and three in-place amendments on the current band were
+ * measured to be enough to clear a live `PaperclipApprovalStarved` page with
+ * zero board decisions.
+ *
+ * The discriminator already exists on the row and this expression does not yet
+ * consult it: `payload_edited_at` equals `updated_at` exactly when the bump was
+ * an in-place edit, which was clean on 7/7 of the pending band over 7d on
+ * 2026-11-08. Fixing that is a query change and is tracked separately; this
+ * comment and the gauge's HELP text are deliberately the only thing PEN-5818
+ * moved, so the correction is not mistaken for a silent semantics change.
+ *
+ * Note what did NOT catch this: no test does. `approval-queue-metrics.test.ts`
+ * drives the revision->resubmit chain, but it sets `updatedAt` directly, so it
+ * cannot distinguish which writer moved it. Re-running the survey above is
+ * still the only control. Re-run it rather than trusting the count in this
+ * paragraph, which is itself a measurement with a date on it.
  *
  * GREATEST, not a bare `updated_at`, because `updated_at >= created_at` is a
  * convention and rows that violate it already exist: pending approval
