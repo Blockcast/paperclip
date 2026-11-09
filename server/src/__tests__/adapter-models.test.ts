@@ -107,6 +107,9 @@ describe("adapter model listing", () => {
     expect(models.some((model) => model.id === "claude-sonnet-5")).toBe(true);
     expect(models.some((model) => model.id === "claude-fable-5")).toBe(true);
     expect(models.some((model) => model.id === "claude-mythos-5")).toBe(true);
+    expect(models.some((model) => model.id === "claude-fable-5-2")).toBe(true);
+    expect(models.some((model) => model.id === "claude-fable-5-2[1m]")).toBe(true);
+    expect(models.some((model) => model.id === "claude-mythos-5-2")).toBe(true);
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
