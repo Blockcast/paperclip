@@ -1233,9 +1233,39 @@ therefore keyed one step earlier, and it is a designed path rather than a failur
 - **After `2026-11-05`: escalation is available again, priced on stage-2 proximity and not on the
   calendar.** Nothing about `2026-11-06` makes the card urgent, and the lapse is not an instruction
   to escalate on that date either.
-- **Trigger — if card `800bc387` is still undecided when stage 1 exits**, which is the signal that
-  stage 2 is imminent, **raise it with the CEO (`97583521`), who will escalate it.** Stated as a
-  predicate rather than a date because stage 2's start moves with stage 1's exit.
+- **Trigger — a three-arm disjunction. ANY arm raises card `800bc387` with the CEO (`97583521`),
+  who escalates it.** Every arm is evaluable by whoever runs this gate, and **no arm requires an act
+  by the board.** Supersedes the single-arm form of `be83080d` — CEO ruling 2026-11-09T01:0xZ
+  (run `0e6a1634`), on the CTO's finding of 2026-11-09T00:4xZ recorded on PEN-4933 (`8c6bac63`).
+  - **(a) Proximity — unchanged from `be83080d`.** Card `800bc387` is undecided when stage 1 exits.
+    Stated as a predicate rather than a date because stage 2's start moves with stage 1's exit.
+  - **(b) Co-tenancy — the board is already seated on this programme.** Card `800bc387` is
+    undecided **and** some other board ask on this plan is itself `pending`. Raise them in the same
+    breath rather than in series: a second item put to a board already deciding this programme costs
+    little, where a serial second round trip costs a full channel latency (Security's measurement,
+    dated 2026-11-08T22:3xZ on card `e3850bf3` — last human decision ~119 h earlier, 55 pending,
+    median age ~60 h; pending re-read first-party as 56 at 2026-11-09T00:5xZ). ⛔ **Raise alongside;
+    never bundle.** Do not widen another card to carry this one — Security declined exactly that on
+    `e3850bf3` (`duplicate_check`) and was right: a bundled card cannot be half-decided.
+  - **(c) Liveness floor.** Card `800bc387` has been `pending` more than 72 h **and** stage 1 has
+    not started. This arm asserts no urgency. It exists so that *never evaluated* is not a reachable
+    state, and it is discharged by a **recorded deferral** as readily as by an escalation. 72 h is
+    §11.3's own board-ask threshold — same document, same programme, deliberately not a second
+    number to maintain.
+
+⭐⭐⭐ **Why (b) and (c) exist, so the defect is not re-introduced elsewhere in this plan.** Arm (a)
+alone keyed the detector to **stage 1 exiting** — and stage 1's *start* is itself held by an
+undecided board ask (card `e3850bf3`, filed 2026-11-08T22:53:49Z, read `pending`, `decidedAt: null`
+first-party at 2026-11-09T00:5xZ). **A detector whose firing requires an act by the party it detects
+against is not a detector.** If the board does not act, the predicate is never evaluated, and an
+un-evaluated predicate is byte-identical to one still correctly waiting — so it fails quiet, and in
+the patient-looking direction. ✅ **The question to put to any gate in this plan, beside "does it
+resolve / does it discriminate / can anything satisfy it": *who must ACT for this gate to be
+EVALUATED at all?*** Where the answer is the party the gate governs, give it an arm that does not
+depend on them. ⚠️ Arm (a) was not wrong when written: it priced escalation on stage-2 proximity
+rather than on the calendar, which is right. What it got wrong is measuring proximity by a
+**downstream event** instead of by the cost of acting now — and those two come apart exactly in the
+case the escalation exists for, a programme stalled upstream.
 
 ⛔ **Carried is not waived.** §11.3: *"It must be in hand before stage 2."* Observing that predicate
 is **this row's carrier obligation** — [PEN-5195](https://paperclip.blockcast.net/PEN/issues/PEN-5195)
