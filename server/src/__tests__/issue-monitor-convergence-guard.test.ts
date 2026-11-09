@@ -585,6 +585,110 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
     });
   });
 
+  /**
+   * PEN-6327 — the carve-outs must DISCRIMINATE, not merely exist.
+   *
+   * `evaluateIssueMonitorConvergence` opens with two early returns, on
+   * `scheduledBy !== "assignee"` and on `kind === "external_service"`. The
+   * exemption tests above each pin one of them, but none of them pins the
+   * discrimination: they drive the exempt monitors on a gate set declared one
+   * way (gateSignals, or blocker edges) and the refused monitor on a gate set
+   * declared the other, so the exempt rows and the escalating row are not
+   * otherwise-identical. A refactor that stopped the guard firing at all — an
+   * early return moved up, a predicate inverted, a threshold mis-read — leaves
+   * every exemption assertion in this file green, because "not scored" and
+   * "scored but never refused" produce the same observations on an exempt row.
+   *
+   * This table fixes that. One gate set, one cycle count, one declaration
+   * style; the rows differ ONLY in the dimension that exempts them, and the
+   * control differs in nothing. Dropping either early return reddens an exempt
+   * row; breaking the guard itself reddens the control.
+   */
+  describe("the carve-outs discriminate (PEN-6327)", () => {
+    const GATES = ["pr:blockcast/paperclip#3592:merge"];
+    const REFUSING_ARM = DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD + 1;
+
+    /**
+     * Re-check the SAME gate set until the arm that a scored monitor refuses,
+     * driving fire/re-arm cycles the way the dispatcher does, and return the
+     * final arm. Every row below differs from every other only in `monitor`.
+     */
+    function replayIdenticalRecheck(monitor: Omit<MonitorInput, "nextCheckAt">) {
+      const issue = newIssue();
+      for (let cycle = 1; cycle < REFUSING_ARM; cycle += 1) {
+        arm(issue, { nextCheckAt: checkAt(cycle), gateSignals: GATES, ...monitor }, { blockers: [] });
+        fire(issue, checkAt(cycle));
+      }
+      const last = arm(
+        issue,
+        { nextCheckAt: checkAt(REFUSING_ARM), gateSignals: GATES, ...monitor },
+        { blockers: [] },
+      );
+      return { issue, last };
+    }
+
+    // The control. Scored, so the identical re-check sequence IS refused.
+    it("refuses the otherwise-identical assignee-scheduled monitor with kind null", () => {
+      const { issue, last } = replayIdenticalRecheck({ kind: null });
+
+      expect(last.monitorConvergence?.converged).toBe(true);
+      expect(last.monitorConvergence?.count).toBe(REFUSING_ARM);
+      expect(last.patch.monitorNextCheckAt).toBeNull();
+      expect(issue.monitorNextCheckAt).toBeNull();
+      expect(last.patch.status).toBe("blocked");
+      expect(monitorState(issue)).toMatchObject({
+        status: "cleared",
+        clearReason: "convergence_stalled",
+        convergenceStallCount: 1,
+      });
+    });
+
+    // The carve-outs. Each exempts the SAME sequence the control refuses.
+    const exempt: ReadonlyArray<readonly [string, Omit<MonitorInput, "nextCheckAt">]> = [
+      ["kind external_service", { kind: "external_service" }],
+      ["scheduledBy board", { scheduledBy: "board" }],
+      ["scheduledBy manager", { scheduledBy: "manager" }],
+    ];
+
+    for (const [label, monitor] of exempt) {
+      it(`does not refuse that sequence when ${label}`, () => {
+        const { issue, last } = replayIdenticalRecheck(monitor);
+
+        // Not scored at all: no verdict, so nothing to converge.
+        expect(last.monitorConvergence).toBeNull();
+        // Still armed, still re-arming, never escalated.
+        expect(issue.monitorNextCheckAt).toEqual(new Date(checkAt(REFUSING_ARM)));
+        expect(last.patch.monitorNextCheckAt).toEqual(new Date(checkAt(REFUSING_ARM)));
+        expect(last.patch.status).toBeUndefined();
+        expect(issue.status).toBe("in_progress");
+        expect(monitorState(issue)).toMatchObject({
+          status: "scheduled",
+          // PEN-6228: the exemption is from COUNTING, not from STORAGE — the
+          // gate identity is recorded even though it is never scored.
+          gateFingerprint: computeIssueMonitorGateFingerprint({ gateSignals: GATES }).fingerprint,
+          convergenceCount: 0,
+          convergenceStallCount: 0,
+        });
+      });
+    }
+
+    /**
+     * The counter is the field a reader reaches for to ask "how close is this
+     * to stalling?", and on an exempt monitor it answers that question wrongly
+     * by standing still. Pin it explicitly: the control climbs, the carve-outs
+     * do not, over the identical sequence.
+     */
+    it("advances convergenceCount only on the scored monitor", () => {
+      const scored = replayIdenticalRecheck({ kind: null });
+      expect(scored.last.monitorConvergence?.count).toBe(REFUSING_ARM);
+
+      for (const [, monitor] of exempt) {
+        const frozen = replayIdenticalRecheck(monitor);
+        expect(monitorState(frozen.issue)).toMatchObject({ convergenceCount: 0 });
+      }
+    });
+  });
+
   describe("BLO-13266 regression replay", () => {
     it("halts at or before rev47 when replaying the rev44 → rev52 signature sequence", () => {
       const issue = newIssue();
