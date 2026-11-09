@@ -225,6 +225,27 @@ env:
   # and a wrong-but-present default would fail at pod admission instead of at
   # Job build, which is the harder failure to read. See
   # values.blockcast.yaml for the Blockcast overlay that sets it.
+  #
+  # PEN-6275 — PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES. The adapter sets
+  # `automountServiceAccountToken` nowhere, so a Job pod inherits it from the
+  # ServiceAccount its config NAMES: naming a sibling account in the release
+  # namespace does not relabel the pod, it mounts that account's RBAC at
+  # /var/run/secrets/kubernetes.io/serviceaccount/token. Three scopes can write
+  # that name — the agent row, the issue-scope adapterConfig overlay, and an
+  # execution target's environment config — so the resolver checks the value it
+  # finally resolved against this allowlist:
+  #   - name: PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES
+  #     value: "agent-sa-one,agent-sa-two"       # comma or whitespace separated
+  # UNSET MEANS NOT ENFORCED, deliberately: a fleet is already running on
+  # whatever names it has, so refusing on an unset list would fail every
+  # dispatch on the deploy that carried it. Populate it only once you have
+  # enumerated the ServiceAccounts your agents actually resolve to --
+  #   kubectl -n <ns> get pods -l app.kubernetes.io/component=agent-job \
+  #     -o custom-columns=SA:.spec.serviceAccountName --no-headers | sort -u
+  # -- and decided that each is appropriate for an agent run. Note the
+  # enumeration must include PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME: the fleet
+  # default is NOT implicitly exempt, because on at least one cluster it is the
+  # single most privileged name in use.
 
 # -- Additional pod-level volumes. Used to mount Secrets/ConfigMaps that
 # plugins or runtime helpers read from disk (for example Authbot service keys).

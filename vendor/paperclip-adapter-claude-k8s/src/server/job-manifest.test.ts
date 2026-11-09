@@ -9,6 +9,8 @@ import { POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR, POD_LOG_REDACTOR_FILENAME, 
 import {
   buildJobManifest,
   buildPodLogPath,
+  parseServiceAccountAllowlist,
+  resolveServiceAccountName,
   sanitizeLabelValue,
   isSensitiveEnvName,
   classifyEnvName,
@@ -115,12 +117,20 @@ function createClaudeConfigDirWithSession(sessionId: string, workingDir = "/pape
 // resolves. File-scoped so every describe block below gets a working
 // default; the "serviceAccountName" describe block overrides/clears it
 // per case to exercise the actual resolution and refusal behavior.
+//
+// PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES (PEN-6275) is CLEARED rather than set
+// here: unset means "allowlist not enforced", which is the state every other
+// describe block in this file needs. Clearing it in both hooks also stops a
+// case in the "serviceAccountName" block leaking a refusal into the ~2400
+// unrelated cases that build a manifest with the default SA.
 beforeEach(() => {
   process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "test-default-sa";
+  delete process.env.PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES;
 });
 
 afterEach(() => {
   delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
+  delete process.env.PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES;
 });
 
 describe("buildJobManifest", () => {
@@ -2483,6 +2493,108 @@ describe("buildJobManifest", () => {
     it("refuses to build the manifest — never silently lands on the namespace `default` ServiceAccount — when neither serviceAccountName nor the fleet default is set", () => {
       delete process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME;
       expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/serviceAccountName/);
+    });
+
+    // PEN-6275. `resolveServiceAccountName` took config.serviceAccountName
+    // verbatim: no allowlist, no pattern, no validation. The pod inherits
+    // `automountServiceAccountToken` from the ServiceAccount it NAMES, so
+    // naming a sibling account in the namespace does not relabel the pod — it
+    // mounts that account's RBAC. This resolver is the one chokepoint
+    // DOWNSTREAM of every scope that can write the key (agent config, the
+    // issue-scope `assigneeAdapterOverrides.adapterConfig` overlay, and
+    // `mergeEnvironmentConfig`), which is why the gate lives here.
+    describe("allowlist (PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES)", () => {
+      // THE MUST-PASS ARM. A gate that only ever refuses is not shown to work:
+      // without this case, a resolver that threw unconditionally would pass
+      // every refusal assertion below.
+      it("admits a per-agent serviceAccountName that is on the allowlist", () => {
+        process.env.PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES = "penstock-general-agent,other-agent";
+        ctx.config = { serviceAccountName: "penstock-general-agent" };
+        const { job, serviceAccountName } = buildJobManifest({ ctx, selfPod });
+        expect(job.spec?.template?.spec?.serviceAccountName).toBe("penstock-general-agent");
+        expect(serviceAccountName).toBe("penstock-general-agent");
+      });
+
+      // THE MUST-FAIL ARM.
+      it("refuses a per-agent serviceAccountName that is not on the allowlist", () => {
+        process.env.PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES = "penstock-general-agent";
+        ctx.config = { serviceAccountName: "paperclip-ci-deploy" };
+        expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/paperclip-ci-deploy/);
+        expect(() => buildJobManifest({ ctx, selfPod })).toThrow(
+          /PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES/,
+        );
+      });
+
+      // THE TRAP THIS TEST EXISTS TO PIN, and it is not hypothetical: the
+      // Blockcast overlay sets PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME to
+      // `paperclip` — the control plane's own Helm-managed ServiceAccount,
+      // which carries `automountServiceAccountToken: true` and a Role granting
+      // namespace-wide `secrets` and `batch/jobs`. Measured 2026-11-09: 16 of
+      // 39 live agent-job pods resolve to it, by the FLEET DEFAULT and with no
+      // per-agent override anywhere. So exempting the fleet default — the
+      // tempting shape, since it is set by the same operator on the same
+      // Deployment as the allowlist — would exempt exactly the case this gate
+      // exists for, and the gate would read as shipped while refusing nothing
+      // that actually occurs.
+      it("applies the allowlist to the FLEET DEFAULT too, not only to the per-agent override", () => {
+        process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "paperclip";
+        process.env.PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES = "penstock-general-agent";
+        ctx.config = {};
+        expect(() => buildJobManifest({ ctx, selfPod })).toThrow(/"paperclip"/);
+      });
+
+      it("admits the fleet default when it IS on the allowlist", () => {
+        process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME = "penstock-general-agent";
+        process.env.PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES = "penstock-general-agent";
+        ctx.config = {};
+        const { serviceAccountName } = buildJobManifest({ ctx, selfPod });
+        expect(serviceAccountName).toBe("penstock-general-agent");
+      });
+
+      // Unset is INERT, deliberately. 39 live agent-job pods resolve to four
+      // different ServiceAccounts today; a resolver that refused on an unset
+      // allowlist would fail every dispatch in the fleet on the deploy that
+      // carried it. The allowlist's value is forcing the enumeration, not the
+      // refusal — so it ships off and an operator turns it on.
+      it("is inert when the allowlist env var is unset", () => {
+        delete process.env.PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES;
+        ctx.config = { serviceAccountName: "any-unvetted-name" };
+        const { serviceAccountName } = buildJobManifest({ ctx, selfPod });
+        expect(serviceAccountName).toBe("any-unvetted-name");
+      });
+
+      // Same `.trim()` discipline as the other two values this resolver reads:
+      // a whitespace-only env var is "unset", not "an allowlist of one empty
+      // name" — which would refuse every run in the fleet.
+      it("treats a whitespace-only allowlist as unset rather than as an empty allowlist", () => {
+        process.env.PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES = "   ";
+        ctx.config = { serviceAccountName: "any-unvetted-name" };
+        expect(() => buildJobManifest({ ctx, selfPod })).not.toThrow();
+      });
+
+      it("accepts comma, whitespace and newline separators, and trims each entry", () => {
+        expect(parseServiceAccountAllowlist("a, b\nc\t d ,, e ")).toEqual(
+          new Set(["a", "b", "c", "d", "e"]),
+        );
+      });
+
+      it("parses an unset, empty or whitespace-only value to null — the 'not configured' disposition", () => {
+        expect(parseServiceAccountAllowlist(undefined)).toBeNull();
+        expect(parseServiceAccountAllowlist(null)).toBeNull();
+        expect(parseServiceAccountAllowlist("")).toBeNull();
+        expect(parseServiceAccountAllowlist(" ,, \n ")).toBeNull();
+      });
+
+      // The refusal must name the offending value and the knob that refused
+      // it. An operator reading only "Job build failed" cannot tell this from
+      // the BLO-21812 nothing-resolved refusal, which has a different remedy.
+      it("names the refused ServiceAccount, the env var and the admitted set in the error", () => {
+        process.env.PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES = "zeta,alpha";
+        ctx.config = { serviceAccountName: "paperclip-k8s-mcp-admin" };
+        expect(() => resolveServiceAccountName({ serviceAccountName: "paperclip-k8s-mcp-admin" })).toThrow(
+          /"paperclip-k8s-mcp-admin".*PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES \(alpha, zeta\)/s,
+        );
+      });
     });
   });
 
