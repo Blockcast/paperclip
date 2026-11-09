@@ -188,12 +188,48 @@ const manifest: PaperclipPluginManifestV1 = {
         description:
           "e.g. http://alertmanager.monitoring.svc.cluster.local:9093. The escalation sweep reads /api/v2/alerts here before a rung posts or reassigns, so it can tell 'still firing' from 'the resolve webhook was never delivered'. Leave unset to keep the ladder running without a liveness claim — rung comments then say liveness was not verified instead of asserting it.",
       },
+      prometheusApiUrl: {
+        type: "string",
+        title: "Prometheus base URL (for cover-close liveness reads)",
+        description:
+          "e.g. http://prometheus.monitoring.svc.cluster.local:9090. Read by the cover CLOSE path only, to ask whether a source alertname still has any ALERTS series — pending or firing. Alertmanager has no pending state, so without this the close cannot see a condition that is re-arming. Configured the same way as the Alertmanager base URL above; falls back to the PAPERCLIP_PROMETHEUS_API_URL environment variable. Leave unset to keep closing without a liveness claim — the close then records the verdict liveness_check_unconfigured instead of asserting the source was clear. Must be http:// or https://; any other scheme is refused and read as unknown.",
+      },
+      prometheusReadTimeoutMs: {
+        type: "number",
+        title: "Prometheus read timeout (ms)",
+        description:
+          "Per-call timeout for the cover-close liveness read above. Unset uses the shipped default of 5000. An unreachable or timed-out read is treated as unknown, which defers the close rather than asserting the source cleared.",
+      },
       reconcileReceivers: {
         type: "array",
         title: "Alertmanager receivers to reconcile (lost-webhook backfill)",
         description:
           "Alertmanager receiver names whose alerts belong to this company, e.g. [\"paperclip\"]. Every 5 minutes the reconcile job reads active alerts from alertmanagerApiUrl and files any routed to one of these receivers that has no issue yet — the alerts whose webhook Alertmanager gave up on while the control plane was down (BLO-44820). Leave unset to disable.",
         items: { type: "string", minLength: 1 },
+      },
+      coverDedupWindowMinutes: {
+        type: "number",
+        title: "Board-cover dedup window (minutes)",
+        description:
+          "Concurrent escalation ladders for the same alertname that reach the cover rung inside one window bucket share a single retained cover instead of each opening its own (BLO-15982). Unset uses the shipped default of 120.",
+      },
+      coverCloseHoldMinutes: {
+        type: "number",
+        title: "Cover close hold (minutes)",
+        description:
+          "How long every source alert of a board cover must stay resolved before the cover closes (BLO-42259). Unset uses the shipped default of 15. Raise it where source rules have a long `for:` and resolve-then-refire is common.",
+      },
+      coverLivenessRecheckLimitMinutes: {
+        type: "number",
+        title: "Cover close liveness recheck limit (minutes)",
+        description:
+          "How long past the close hold a LIVE or unreadable Prometheus answer may keep deferring a cover's close, measured from the newest member resolved_at. Past it the cover closes with the verdict recorded, so a fail-closed guard cannot become an unbounded freeze. Unset uses the shipped default of 240.",
+      },
+      operatorSuppressionHours: {
+        type: "number",
+        title: "Operator-close suppression (hours)",
+        description:
+          "How long an operator-closed issue suppresses re-fires of its fingerprint before the plugin re-opens it anyway (BLO-24234). Unset uses the shipped default of 24. Set to 0 to suppress indefinitely — note an Alertmanager fingerprint is hash(sorted(labels)), so one provider-agnostic alert re-uses a single fingerprint across every future root cause, and 0 therefore mutes unrelated future outages too.",
       },
     },
     // No fields are schema-required: the bootstrap auto-config endpoint
