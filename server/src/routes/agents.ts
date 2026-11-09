@@ -1795,6 +1795,7 @@ export function agentRoutes(
     req: Request,
     runtimeConfig: unknown,
     existingRuntimeConfig?: unknown,
+    agentAdapterConfig?: Record<string, unknown> | null,
   ) {
     const existingByProfileKey = new Map(
       listRuntimeModelProfileAdapterConfigs(existingRuntimeConfig).map((entry) =>
@@ -1804,6 +1805,22 @@ export function agentRoutes(
     for (const entry of listRuntimeModelProfileAdapterConfigs(runtimeConfig)) {
       assertNoAgentAdapterConfigMutation(req, entry.adapterConfig, entry.path, {
         existingAdapterConfig: existingByProfileKey.get(entry.profileKey) ?? null,
+        // The DIFF baseline above is the profile's own stored counterpart, which
+        // is right. The PINNED-KEY SET is a different question with a different
+        // answer: `agentScopeOnlyConfigKeysFor` reads `enableGitHubPublishBroker`,
+        // and that flag is only meaningful at AGENT scope — `withAgentScoped
+        // ConfigProvenance` restores it from the agent's config and discards any
+        // profile-supplied value. Computing the set from the profile judges the
+        // broker-conditional keys against a flag that decides nothing, so the
+        // guard under-refuses whenever the agent has the broker on and the
+        // profile does not. Pass the agent's config in when the caller has one.
+        //
+        // Stated structurally on purpose. The reason this is not yet a live
+        // hazard is that the merge discards profile-supplied pinned keys
+        // regardless — NOT that "the broker is off fleet-wide", which stops
+        // being true at D1 stage 1 (PEN-6148). The structural reason does not
+        // expire.
+        pinnedKeySourceConfig: agentAdapterConfig ?? null,
       });
     }
   }
@@ -2344,10 +2361,17 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown> | null | undefined,
     path = "adapterConfig",
     existingAdapterConfig?: Record<string, unknown> | null,
+    /**
+     * Config the PINNED SET is computed from, when that is a different object
+     * from the diff baseline. Only the nested model-profile call site passes
+     * one; see the note there for why the two cannot be the same object.
+     */
+    pinnedKeySourceConfig?: Record<string, unknown> | null,
   ) {
     if (req.actor.type !== "agent" || !adapterConfig) return;
     const existing = existingAdapterConfig ?? {};
-    const changedPinnedKeys = [...agentScopeOnlyConfigKeysFor(existing)]
+    const pinnedKeySource = pinnedKeySourceConfig ?? existing;
+    const changedPinnedKeys = [...agentScopeOnlyConfigKeysFor(pinnedKeySource)]
       .filter((key) => JSON.stringify(adapterConfig[key]) !== JSON.stringify(existing[key]))
       .map((key) => `${path}.${key}`);
     if (changedPinnedKeys.length === 0) return;
@@ -2372,6 +2396,13 @@ export function agentRoutes(
        * request alone understates what survives and overstates what is removed.
        */
       effectiveAdapterConfig?: Record<string, unknown> | null;
+      /**
+       * Config the agent-scope pinned KEY SET is computed from, when that is a
+       * different object from `existingAdapterConfig`. Omit everywhere the two
+       * coincide (the top-level `adapterConfig` call sites); see the nested
+       * model-profile call site for the one place they do not.
+       */
+      pinnedKeySourceConfig?: Record<string, unknown> | null;
     },
   ) {
     assertNoAgentInstructionsConfigMutation(
@@ -2398,6 +2429,7 @@ export function agentRoutes(
       options?.effectiveAdapterConfig ?? adapterConfig,
       path,
       options?.existingAdapterConfig ?? null,
+      options?.pinnedKeySourceConfig ?? null,
     );
   }
 
@@ -3625,11 +3657,34 @@ export function agentRoutes(
     // route through `allow_self`, which asks for no consent at all. An
     // unguessable identifier is not an authorization check.
     //
-    // Scoped to `adapterConfig` ON PURPOSE. The snapshot patch also restores
-    // `name`, `role`, `title`, `capabilities` and `reportsTo`, which bypasses
-    // the BLO-27751 profile-change consent gate by this same route. That arm is
-    // NOT closed here and is filed separately — do not read this guard as
-    // covering it.
+    // WHAT THIS BLOCK COVERS, AND WHAT IT DOES NOT. Enumerated against
+    // `configPatchFromSnapshot` (`services/agents.ts`) — the function that
+    // decides what a rollback writes — rather than from memory, because the
+    // first version of this list named five fields and read as exhaustive
+    // while omitting `runtimeConfig`, which is the arm PEN-6201 then had to
+    // file. A list a reader takes for complete is worse than no list.
+    //
+    // COVERED: `adapterConfig`, and the model-profile adapter configs nested
+    // in `runtimeConfig.modelProfiles.*.adapterConfig` (PEN-6201). The second
+    // is a real adapter config — `mergeModelProfileAdapterConfig` spreads it
+    // OVER the agent's own at dispatch — and the only key class the merge
+    // itself restores from agent scope is `agentScopeOnlyConfigKeysFor`, so
+    // the instructions-bundle keys ride through to the run. That is the guard
+    // `assertNoAgentRuntimeConfigAdapterConfigMutation` holds on PATCH, and
+    // this route carried no equivalent.
+    //
+    // NOT COVERED, every remaining field the snapshot patch restores:
+    //   - `name`, `role`, `title`, `capabilities` — the BLO-27751
+    //     profile-change consent gate, bypassable by this same route.
+    //   - `reportsTo`, `adapterType`, `defaultEnvironmentId`, `metadata`.
+    //   - `runtimeConfig` outside `modelProfiles.*.adapterConfig` (e.g.
+    //     `heartbeat`).
+    //   - `budgetMonthlyCents`, which is the sharpest of these: `PATCH
+    //     /api/agents/:id` refuses it with a 422 outright (BLO-27626, "would
+    //     not change enforcement"), and a rollback writes it. Enforcement
+    //     reads `budget_policies`, so that is a display-mirror desync rather
+    //     than a cap change — PEN-6225, filed rather than fixed here.
+    // Do not read this guard as covering any of them.
     if (req.actor.type === "agent") {
       const revision = await svc.getConfigRevision(id, revisionId);
       if (!revision) {
@@ -3644,6 +3699,17 @@ export function agentRoutes(
         existingAdapterConfig: asRecord(existing.adapterConfig) ?? {},
         effectiveAdapterConfig: restoredAdapterConfig,
       });
+      // No `restoreRedactedRuntimeConfigValues` here, unlike the PATCH call
+      // site: that undoes a sentinel a caller echoed back from a redacted GET,
+      // and a stored revision is a literal config the server wrote. A revision
+      // that does carry a sentinel never reaches this point —
+      // `rollbackConfigRevision` refuses it with `containsRedactedMarker`.
+      assertNoAgentRuntimeConfigAdapterConfigMutation(
+        req,
+        asRecord(revision.afterConfig)?.runtimeConfig,
+        existing.runtimeConfig,
+        asRecord(existing.adapterConfig) ?? {},
+      );
     }
 
     const actor = getActorInfo(req);
@@ -4469,7 +4535,12 @@ export function agentRoutes(
         existing.runtimeConfig,
         runtimeConfig,
       );
-      assertNoAgentRuntimeConfigAdapterConfigMutation(req, requestedRuntimeConfig, existing.runtimeConfig);
+      assertNoAgentRuntimeConfigAdapterConfigMutation(
+        req,
+        requestedRuntimeConfig,
+        existing.runtimeConfig,
+        asRecord(existing.adapterConfig) ?? {},
+      );
     }
     const touchesAdapterConfiguration =
       hasOwn(patchData, "adapterType") ||
