@@ -28,7 +28,7 @@ const LITERAL_ESCAPE_SHAPES: ReadonlyArray<readonly [string, string]> = [
   ["backslash t", String.raw`\t`],
   ["backslash backslash", String.raw`\\`],
   ["backslash quote", String.raw`\"`],
-  ["backslash u0041", String.raw`A`],
+  ["backslash u0041", String.raw`\u0041`],
   ["backslash U00000041", String.raw`\U00000041`],
   ["backslash x41", String.raw`\x41`],
   ["backslash zero", String.raw`\0`],
