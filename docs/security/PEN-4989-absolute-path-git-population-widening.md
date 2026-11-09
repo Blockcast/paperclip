@@ -411,6 +411,95 @@ is the opposite of what the arms' ordering suggests: in this window nothing spaw
 deep enough to need the environment arm. Arm 3 is doing the load-bearing work, including for the 18
 observations caught mid-`exec` whose `argv` was not yet readable — see §2.
 
+### 1.4 Re-measurement on a changed surface — 2026-11-09, root `pnpm test`, **0 from the workload**
+
+§4's staleness rule fired a third time and **PEN-5663** discharged it. Everything here is a statement
+about **one pod, one image, two windows on one surface.** Do not generalise from it.
+
+**Which branch of §4 this is.** The fingerprint differed and `wrapperAhead` was `true`, so this is the
+*staleness* branch — **not** the control-failure branch. A bare `git` still reached the wrapper.
+
+⭐ **One component of five changed, and the per-file table §4.1 added on 2026-11-05 is what made that
+a one-step lookup.** The 2026-11-03 mismatch needed a 650-permutation sweep to attribute; this one
+needed a table comparison. Only the egress runtime moved (`a7de00b0…` → `00b6e22e…`); the wrapper, the
+credential helper and both real-`git` inodes are byte-identical. It attributes to two named,
+egress-hardening commits landing after the previous reading — `c8222fd1` (PEN-5830, force-push lease)
+and `3a849604` (PEN-5947, no-reflog fallback). **Publishing the components paid for itself on the
+first firing after it was added.**
+
+| | |
+|---|---|
+| **Population** | one agent pod `ac-7500672d-efe6-40-264966b1-6d95-4b-77b4ed-jr6bf`, ns `paperclip`, node `k8s-paperclip-3`, agent **Security Engineer** (`7500672d-…`), run `264966b1-…`, task PEN-5663 |
+| **Image** | `…/paperclip-agent:sha-972f4e5-k8s-vendored`, digest `sha256:e49e39ae…ca99e` — the **sixth** distinct image tag this record names |
+| **Surface fingerprint** | `b46cfbd85c40232421c8b3605e62d4764523cc1d088abdc588af9407b122ec04` (rule **v2**, §4) |
+| **Repo under test** | `Blockcast/penstock-llm-proxy-core` @ `origin/main` `f5ef2807`, in a **clean clone** |
+
+⚠ **The clean clone is load-bearing, not hygiene.** The shared agent checkout in this pod was
+**1,214 commits behind `origin/main`** and still carries the *pre-fix* site, so a window run there
+would have measured the old code and reported it as the new one.
+
+| | **Window A** — the population spec | **Window B** — site-scoped |
+|---|---|---|
+| **Window** | `11:34:07Z` → `11:49:30Z` (**15.4** min, `403,363` sweeps, `4,254` distinct processes) | `11:50:57Z` → `11:51:25Z` (`12,333` sweeps, `292` distinct processes) |
+| **Workload** | root-package `pnpm test` (`vitest run`) — 712 files / 14,544 tests, 918 s | `vitest run test/secret-scan-budget.test.ts` alone — **49 tests, all passing** |
+| Class-A+B observed | `4,019` | `266` |
+| — wrapped | `4,017` | `266` |
+| **— UNWRAPPED** | **`2`** | **`0`** |
+| **— attributable to the workload** | **`0`** | **`0`** |
+| Indeterminate | `11` | `0` |
+
+**The fingerprint was read three times — `11:29:54Z` (before A), `11:49:31Z` (after A) and `11:51:25Z`
+(after B) — byte-identical each time**, so both numbers describe one surface rather than an average
+over two.
+
+**Calibration.** Quoted for the watched inodes directly, as §2.1 requires rather than the copy's
+figure: `/usr/bin/git` **270/300 = 0.900**, `/usr/lib/git-core/git` **270/300 = 0.900**, in a separate
+run so the deliberate reaches could not contaminate the count. At that rate, 26 recurrences would be
+missed entirely with probability ≈ `1e-26`, so window B's zero is not a catch-rate artifact.
+
+#### ⭐ The 26 are gone AT THAT SITE — mitigated by PEN-5012, not closed as a class
+
+§1.3's 26 were all one mechanism: `test/secret-scan-budget.test.ts` narrowing `PATH` to
+`${bin}:/usr/bin:/bin`, dropping the guard directory. **PEN-5012 fixed that site** — `guardedPath()`,
+merged to `penstock-llm-proxy-core` `main` 2026-11-07T13:21Z in #2983, *after* the last reading.
+
+Window B is the direct before/after: the same file, the same scratch repos, **266 reaches, 266
+wrapped, 0 unwrapped, 0 indeterminate.** The reaches did not disappear — they are still happening and
+are now all going **through** the wrapper, which is what a working mitigation looks like rather than a
+quiet absence.
+
+⚠ **Window B is also the reachability control, and it was needed.** Window A's log contains no mention
+of the site, which reads like "the file never ran" — but that reporter prints **zero** `✓` lines for
+*any* passing file, so its silence is not evidence either way. Window B settles it positively.
+A window that does not demonstrably reach the site is not a zero about the site.
+
+#### ⚠ Window A's 2 unwrapped — recorded as an observation, **not** as a mechanism
+
+Both are `/usr/lib/git-core/git maintenance run --auto --no-quiet --detach`, in **the measuring run's
+own scratch clone** of `Blockcast/paperclip` under `/tmp` — not in the repo under test, and not from
+`pnpm test`. Both scored `viaArgv:false, viaEnv:false, viaAncestor:false` with `environReadable:true`.
+
+⛔ **Two targeted controls refute the obvious mechanism, so this record does not name one.**
+
+| control | result |
+|---|---|
+| wrapped parent → explicit `maintenance run --task=gc --detach` **and** `--auto --detach` | **0 unwrapped / 16**, and the detached subtree demonstrably ran — `gc --no-detach`, `pack-refs`, `repack`, `pack-objects`, `worktree prune`, `rerere gc`, all **wrapped** |
+| replay of the exact clone/sparse-checkout/`fetch --depth` sequence that produced them | **0 unwrapped / 24**, including the **identical** `maintenance run --auto --no-quiet --detach` argv — **wrapped** |
+
+So "detaching loses the wrapper" is **measured false**, and auto-maintenance is not inherently
+unwrapped. The leading remaining hypothesis is a sampling-time classification artifact on a
+daemonising process, and it is **explicitly not asserted** — it was not tested. What is recorded is
+that 2 reaches were observed, are not reproducible in two attempts, and are **unattributed**.
+
+⚠ **Bound, stated rather than buried:** 11 samples in window A are `indeterminate` — `/usr/lib/git-core/git`
+with unreadable `argv` and no arm firing — so window A's unwrapped figure is **2, with an upper bound of
+13** if every indeterminate were in fact unwrapped. Window B has no such bound (`0` indeterminate).
+
+⚠ Two test files failed in window A (`database-deployment-migration`,
+`managed-commercial-acceptance-validation`, 53 tests). Both are environmental — the sandbox has no
+Kubernetes API proxy, so `kubectl` validation fails on `dial tcp [::1]:8080`. Neither touches git
+egress, and the workload still ran to completion across all 712 files.
+
 ## 2. Instrument validation
 
 All controls were run against the shipped script inside the window.
@@ -626,7 +715,7 @@ Rules:
   carries the firing, so the evidence is safe here — but any later §7.1 text written off such a run
   must say the zero is *remediated*, not *never observed* (hazard raised by Engineer, 2026-10-29).
 
-### 4.1 This section's *staleness* trigger has fired twice; observed turnover is 2–5 days
+### 4.1 This section's *staleness* trigger has fired three times; observed turnover is 2–5 days
 
 ⛔ **"Fired" here means §4's re-measurement trigger — the surface changed, so a prior count no
 longer applies. It does *not* mean §7.2 trigger 4.** Those are different triggers with different
@@ -640,6 +729,7 @@ this duty cannot be discharged by a document:
 | 2026-10-29 (§1) | `d81423fe…` | — | baseline |
 | 2026-11-03 | `50aab1b9…` | **differs** | staleness; `wrapperAhead: true`. `/usr/bin/git` **unchanged** — the whole delta was the three paperclip-authored files |
 | 2026-11-05 (§1.3) | `83aef063…` | **differs** | staleness; `wrapperAhead: true`; re-measured → **26** |
+| 2026-11-09 (§1.4) | `b46cfbd8…` | **differs** | staleness; `wrapperAhead: true`; re-measured → **0 from the workload** (2 pod-wide, unattributed). Only the egress runtime moved — 4 of 5 components byte-identical |
 
 — i.e. the egress surface turned over twice in seven days, on a roughly **2-to-5-day** cadence. A
 measurement is stale about that fast. ⚠ The 2026-11-03 evaluation was a *fingerprint* reading only:
@@ -664,6 +754,21 @@ record's presentation. For `83aef063…`:
 | `356db14e102d68a1` | `/bin/git` |
 
 Layout `[wrapper, wrapper, /usr/bin/git, /bin/git]`; `wrapperAhead: true`.
+
+**And for `b46cfbd8…` (2026-11-09, §1.4) — the first firing where the table above was available to
+compare against, which reduced attribution from a 650-permutation sweep to one lookup:**
+
+| sha256 (first 16) | path | vs `83aef063…` |
+|---|---|---|
+| `deee13f66acd1792` | `/usr/local/libexec/paperclip/bin/git` (wrapper) | same |
+| `00b6e22e37be0265` | `…/@paperclipai/adapter-utils/dist/github-git-egress-runtime.js` | **CHANGED** |
+| `aed180246980bb08` | `/usr/local/libexec/paperclip/bin/github-token-credential-helper` | same |
+| `356db14e102d68a1` | `/usr/bin/git` | same |
+| `356db14e102d68a1` | `/bin/git` | same |
+
+Layout and `wrapperAhead` unchanged. ⭐ `/usr/bin/git` is **still** `356db14e…` — the real binary
+remains untouched across every firing recorded here, and every delta so far has been confined to the
+paperclip-authored files.
 ⭐ **`/usr/bin/git` is `356db14e…` — the same value PEN-4986 recorded for both class-A inodes on two
 images, and the same one §1.1's pooling check reports.** The real binary is untouched across every
 firing so far, and the entire delta each time has been the three paperclip-authored files.

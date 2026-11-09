@@ -438,8 +438,8 @@ the cluster**, so nothing would currently report trigger 4 firing in another pod
 on the §7.2 triggers is already permitted by §8 without further security review, and is the cheapest
 remaining improvement here.
 
-⚠ **That re-take has since been owed twice, and taken once — so the "six windows" above is now seven
-(PEN-5663, 2026-11-05).** The egress-relevant surface changed on 2026-11-03 (`50aab1b9…`) and again on
+⚠ **That re-take has since been owed three times and taken twice — so the "six windows" above is now
+nine (PEN-5663, latest 2026-11-09).** The egress-relevant surface changed on 2026-11-03 (`50aab1b9…`) and again on
 2026-11-05 (`83aef063…`), against the `d81423fe…` the six windows were taken on — a roughly
 **2-to-5-day** turnover, so a measurement here is stale about that fast. The seventh window re-took it
 on `83aef063…` under a **root-package `pnpm test`** workload — 28.0 min, 2,192 organic observations —
@@ -451,6 +451,26 @@ failure; ⛔ it is **not** a second firing of §7.2 trigger 4, because the instr
 invocation and the acceptance a firing would end has **already ended** (above); and 26-against-28 is
 **not** a shrinking class — the two numbers were taken on different surfaces under different workloads,
 which §4 says makes them incomparable in **both** directions.
+
+⚠ **Re-taken again 2026-11-09 on a third surface (`b46cfbd8…`): the 26 reaches from
+`test/secret-scan-budget.test.ts` are gone AT THAT SITE — mitigated, not closed as a class.**
+Windows eight and nine (PEN-5663; `PEN-4989-…-widening.md` §1.4). PEN-5012's
+`guardedPath()` landed on `penstock-llm-proxy-core` `main` 2026-11-07T13:21Z (#2983) and restores the
+guard directory to the narrowed `PATH`. A site-scoped window over that exact file measured **266 reaches,
+266 wrapped, 0 unwrapped, 0 indeterminate**; the full root `pnpm test` window measured **0 unwrapped
+attributable to the workload** (15.4 min, 4,019 observations). Calibration for the watched inodes was
+**0.900** each at n=300, so the zero is not a catch-rate artifact. Three bounds, all of which cut
+against over-reading this:
+
+- ⛔ It is **still not** a second firing of §7.2 trigger 4, for the same reasons as above, and it does
+  **not** re-open the acceptance — which remains **ended**. A zero does not un-fire a trigger.
+- ⚠ The full window did record **2** unwrapped reaches pod-wide, both
+  `git maintenance run --auto --detach` in the *measuring run's own scratch clone* rather than in the
+  repo under test. **Two targeted controls failed to reproduce them** and showed the same process shape
+  scoring *wrapped*, so the mechanism is **unattributed** and is deliberately not named. Upper bound 13,
+  counting 11 indeterminate samples.
+- ⚠ `guardedPath()` is a **mitigation, not a fix**, by its own header: a caller that does not use it is
+  unaffected. The durable close remains D1 (§7.3). PEN-5012 is `in_review`, not closed.
 
 ⚠ **Status, 2026-10-29 (PEN-4933):** D1 is **built** and merged behind a default-off rollout gate;
 see §7.3. The residual statement above still describes the deployed fleet — but it is **no longer
