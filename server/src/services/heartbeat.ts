@@ -909,6 +909,9 @@ const BRANCH_CLAIM_RETRY_ATTEMPT_CONTEXT_KEY = "paperclipBranchClaimRetryAttempt
 // not announce started again. The value is this run's id, not `true`, so a copy
 // inherited by a different run can never suppress that run's first start.
 // Every running->queued writer must stamp it; today those are the two defers.
+// Every writer that rewrites the snapshot from a copy read earlier must keep
+// it; the coalesce writes go through coalescedContextSnapshotSql. Only
+// claimQueuedRun announces started (see publishRunLifecyclePluginEvent).
 const RUN_STARTED_ANNOUNCED_CONTEXT_KEY = "paperclipRunStartedAnnouncedRunId";
 // BLO-21602: renewal cadence for an in-flight run's branch claim. Kept well
 // under DEFAULT_BRANCH_CLAIM_LEASE_MS (30m) so a couple of missed ticks (e.g.
@@ -11746,6 +11749,17 @@ function githubStateChangeContextPredicate(taskKey: string) {
   )`;
 }
 
+/**
+ * BLO-55110: a coalesce merges a wake into a run snapshot it read earlier, in
+ * JS. A defer can commit in between: it moves the run back to `queued`, which
+ * the coalesce guards still accept, and stamps the started marker. The stale
+ * merge would drop the marker, so the re-claim would announce
+ * agent.run.started again. Write the merge with the row's own marker kept.
+ */
+export function coalescedContextSnapshotSql(merged: Record<string, unknown>) {
+  return sql`${JSON.stringify(merged)}::jsonb || jsonb_strip_nulls(jsonb_build_object(${RUN_STARTED_ANNOUNCED_CONTEXT_KEY}::text, ${heartbeatRuns.contextSnapshot} -> ${RUN_STARTED_ANNOUNCED_CONTEXT_KEY}::text))`;
+}
+
 async function coalesceQueuedGithubStateWake(input: {
   tx: WakeCoalescingDb;
   companyId: string;
@@ -11787,7 +11801,7 @@ async function coalesceQueuedGithubStateWake(input: {
     .set({
       invocationSource: input.source,
       triggerDetail: input.triggerDetail,
-      contextSnapshot: mergedContextSnapshot,
+      contextSnapshot: coalescedContextSnapshotSql(mergedContextSnapshot),
       updatedAt: now,
     })
     .where(and(eq(heartbeatRuns.id, existingRun.id), eq(heartbeatRuns.status, "queued")))
@@ -11931,7 +11945,7 @@ async function coalescePendingTaskScopeWake(input: {
     .set({
       invocationSource: input.source,
       triggerDetail: input.triggerDetail,
-      contextSnapshot: mergedContextSnapshot,
+      contextSnapshot: coalescedContextSnapshotSql(mergedContextSnapshot),
       updatedAt: now,
     })
     .where(
@@ -20284,7 +20298,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: current.finishedAt ? new Date(current.finishedAt).toISOString() : null,
       },
     });
-    publishRunLifecyclePluginEvent(current);
+    publishRunLifecyclePluginEvent(current, expectedStatus);
     if (TERMINAL_RUN_STATUSES.has(current.status)) {
       void refreshExternalRuntimeReservationMetrics(db).catch((err) => {
         logger.warn({ err, runId: current.id }, "failed to refresh external-runtime reservation metrics");
@@ -20303,7 +20317,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     return { run: current, updated: true as const };
   }
 
-  function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect) {
+  function publishRunLifecyclePluginEvent(run: typeof heartbeatRuns.$inferSelect, previousStatus?: string) {
     const eventType =
       run.status === "running"
         ? "agent.run.started"
@@ -20319,9 +20333,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       typeof run.contextSnapshot === "object" && run.contextSnapshot !== null
         ? (run.contextSnapshot as Record<string, unknown>)
         : {};
-    // BLO-55110: a deferred run is claimed again on every retry; plugins get
-    // one started per run, at its first claim.
-    if (eventType === "agent.run.started" && ctx[RUN_STARTED_ANNOUNCED_CONTEXT_KEY] === run.id) return;
+    // BLO-55110: plugins get one started per run, at its first claim. Only a
+    // write that moved the row out of `queued` may announce it. setRunStatus
+    // does not know the prior status; its one `running` write is the reaper's
+    // unguarded detached-process flag on a row it saw running, which can race a
+    // finalize or a defer and is never a claim. A deferred run carries its own
+    // id in the marker, so its re-claims stay quiet.
+    if (
+      eventType === "agent.run.started" &&
+      (previousStatus !== "queued" || ctx[RUN_STARTED_ANNOUNCED_CONTEXT_KEY] === run.id)
+    ) {
+      return;
+    }
     const paperclipIssue =
       typeof ctx.paperclipIssue === "object" && ctx.paperclipIssue !== null
         ? (ctx.paperclipIssue as Record<string, unknown>)
@@ -26482,7 +26505,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         finishedAt: claimed.finishedAt ? new Date(claimed.finishedAt).toISOString() : null,
       },
     });
-    publishRunLifecyclePluginEvent(claimed);
+    publishRunLifecyclePluginEvent(claimed, "queued");
 
     await setWakeupStatus(claimed.wakeupRequestId, "claimed", { claimedAt });
 
@@ -43861,7 +43884,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 ...(isGithubStateChangeWake(enrichedContextSnapshot)
                   ? { invocationSource: source, triggerDetail }
                   : {}),
-                contextSnapshot: mergedContextSnapshot,
+                contextSnapshot: coalescedContextSnapshotSql(mergedContextSnapshot),
                 updatedAt: new Date(),
               })
               .where(eq(heartbeatRuns.id, availableActiveExecutionRun.id))
@@ -44457,7 +44480,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const mergedRun = await db
         .update(heartbeatRuns)
         .set({
-          contextSnapshot: mergedContextSnapshot,
+          contextSnapshot: coalescedContextSnapshotSql(mergedContextSnapshot),
           updatedAt: new Date(),
         })
         .where(and(eq(heartbeatRuns.id, coalescedTargetRun.id), eq(heartbeatRuns.status, observedStatus)))

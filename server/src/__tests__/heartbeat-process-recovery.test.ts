@@ -1832,6 +1832,27 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  it("does not announce agent.run.started when it flags a detached process on a running run (BLO-55110)", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({ processPid: child.pid ?? null, includeIssue: false });
+    const startedEvents = () =>
+      emittedPluginEvents.filter((event) => event.eventType === "agent.run.started" && event.entityId === runId);
+
+    await heartbeat.reapOrphanedRuns();
+    expect((await heartbeat.getRun(runId))?.errorCode).toBe("process_detached");
+    await drainOutbox();
+    expect(startedEvents()).toHaveLength(0);
+
+    // Activity clears the warning, so the next sweep flags the run again.
+    await heartbeat.reportRunActivity(runId);
+    expect((await heartbeat.getRun(runId))?.errorCode).toBeNull();
+    await heartbeat.reapOrphanedRuns();
+    expect((await heartbeat.getRun(runId))?.errorCode).toBe("process_detached");
+    await drainOutbox();
+    expect(startedEvents()).toHaveLength(0);
+  });
+
   it("deduplicates concurrent process_lost reaps of the same local run", async () => {
     const { runId, wakeupRequestId } = await seedRunFixture({
       processPid: 999_999_999,
