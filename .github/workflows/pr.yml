@@ -2681,6 +2681,360 @@ jobs:
             echo "Update the 'Current version' row in vendor/paperclip-adapter-opencode-k8s/PROVENANCE.md to: $pkg"
             exit 1
           fi
+  # SECRET SCAN (PEN-6245), under the PEN-6170 item-1 ruling.
+  #
+  # WHY THIS IS A LANE IN `pr.yml` RATHER THAN ITS OWN REQUIRED CONTEXT.
+  # Adding a required status check is a branch-protection write, and that route
+  # is 403 to every agent identity in this fleet — so as originally filed this
+  # control was blocked on a human with repo admin, for no benefit. `verify` is
+  # ALREADY required on `master` (legacy protection surface) and is an
+  # aggregate fan-in job whose own comment says it exists as that extension
+  # point. A lane in `verify`'s verdict is merge-blocking the moment it lands,
+  # with no admin and no second ask. It also inherits the merge queue's re-run
+  # of the required set on the queue's own commit, so a secret introduced by a
+  # merge resolution is scanned too.
+  #
+  # ⛔ WIRING IS FOUR POINTS, NOT ONE (PEN-6232). `verify` does NOT decide from
+  # `needs.*` — it decides from hand-maintained bash arrays. A lane added to
+  # `needs:` and nowhere else leaves `verify` GREEN while the lane is RED. This
+  # lane is wired at: (1) `verify`'s `needs:`; (2) the classify step's `env:` +
+  # `lane_names`/`lane_results`/`lane_job_names`; (3) the DECISION step's
+  # `env:` + `lane_names`/`lane_results`; (4)
+  # scripts/__tests__/pr-verify-lane-outcome.test.mjs, which now asserts every
+  # `needs:` entry appears in BOTH steps' arrays. Point (3) is the one that
+  # decides the gate; the test's mutation control removes exactly that and must
+  # go red. PEN-6232 remains open and is not discharged by this lane — it is
+  # the structural guard for the NEXT lane somebody adds; this is one correct
+  # instance, not a guard.
+  #
+  # ⚠️ AND IT IS SIX POINTS IN THIS REPO, NOT FOUR. PEN-6245 enumerated the
+  # four above from `verify` alone; running the suite found two more consumers
+  # of `lane_job_names` — `MERGE_GROUP_GATING_JOBS` in
+  # scripts/merge-queue-eviction-detector.mjs and `GATING_JOBS` in
+  # .github/scripts/sweep-orphaned-merge-group-runs.sh, which decide whether a
+  # cancelled merge-group run is scored as a check failure and whether an
+  # orphaned run may be cancelled. Both are already pinned to pr.yml by their
+  # own tests, so they fail LOUDLY rather than silently — which is why they are
+  # a note here and not a second defect. A third list, the lane-result defaults
+  # in scripts/__tests__/ally-verdict-gate.test.mjs, is the same shape.
+  #
+  # ⛔ THIS LANE DOES NOT CLOSE PEN-6170. Measured first-party against this
+  # repo's own .gitleaks.toml on 2026-11-09, and previously against bare
+  # defaults and both sibling repos' configs in six combinations: gitleaks
+  # 8.28.0 MISSES an opaque, non-vendor-prefixed value under an unremarkable
+  # name (`signingMaterial`, `nonce`, a k8s `stringData` key), while HITTING
+  # the same value under a keyword-bearing name. `generic-api-key` is anchored
+  # on the same keyword family as .github/scripts/check-pr-security.mjs, so the
+  # two controls share that blind spot rather than covering for each other.
+  # What this lane DOES buy over the push-time egress door is spacing and
+  # operator insensitivity — a SPACED `=` (PEN-6162) and a `:` binding
+  # including YAML/JSON and Kubernetes `stringData` (PEN-6167). See
+  # .gitleaks.toml's header for the full measurement.
+  #
+  # DIFF-AWARE, NOT WHOLE-TREE, AND THAT IS THE WHOLE ADOPTION ARGUMENT.
+  # Measured at master 556fd2c0 on 2026-11-09 with the pinned 8.28.0 and this
+  # repo's config, over the 250 most recent master commit ranges: 0 fired, 0
+  # errors, ~2.1 s per scan. So this gate lands with NO remediation backlog and
+  # needed no allowlist sweep. The same invocation over three commits that
+  # demonstrably introduced a matching line exits 2 every time (c4af9273,
+  # 3fc061c2, ea1d2267) — that positive control is why the 0 is a real zero
+  # rather than a mute instrument. A whole-tree scan of the same tree returns
+  # 74 findings, all documented false positives and zero credentials; none of
+  # them reach this lane, because this lane never scans the tree.
+  #
+  # `needs: [policy]`, deliberately NOT `ally_verdict`. A secret gate must not
+  # sit behind review scheduling: it has to be able to go red on the first push
+  # of a PR nobody has looked at yet. It is also light (a blobless checkout and
+  # a seconds-long scan), so it does not belong to the CPU waste the Ally hold
+  # exists to prevent. Fail-closed either way — if `policy` fails this lane is
+  # `skipped`, and the decision step below treats `skipped` as non-success.
+  #
+  # NO `paths:` FILTER, and do not add one. A credential can arrive in any
+  # file, so the trigger must be a superset of the scan. A filter here would
+  # make the gate silent on exactly the PR that introduces a secret in a file
+  # class nobody predicted.
+  secret_scan:
+    name: Secret scan
+    needs: [policy]
+    runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-light' }}
+    # HANG DETECTOR, NOT A PERFORMANCE BUDGET (BLO-35615 rule). This job has no
+    # run history of its own, so there is no W95 and no T_best to put in the
+    # formula, and inventing one would be worse than borrowing a measured
+    # neighbour. BORROWED AND DATED 2026-11-08/09, NOT MEASURED ON THIS JOB:
+    # penstock-llm-proxy-core's byte-adjacent `secret-scan` is 20 (PEN-4058,
+    # sized against a 1063 s observed max on the same arc-light class), and
+    # Blockcast/onprem-k8s#8493 took the same 20 for the same reason. The work
+    # here is I/O-bound by inspection — one blobless full-history checkout, one
+    # release download, and a scan measured at ~2.1 s over 250 ranges — so the
+    # CPU-seconds term does not bound its wall clock and the rule's I/O-bound
+    # branch applies. Re-size against this job's own runs once it has ~50.
+    timeout-minutes: 20
+    # A job-level block REPLACES the workflow-level one rather than merging
+    # into it (same note as `policy` and `verify`), and pr.yml declares no
+    # workflow-level `permissions:`. `contents: read` is what lets checkout
+    # read the repo AND what the one-shot http.extraheader below authenticates
+    # the scan's lazy blob fetches with. Nothing here writes.
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          # fetch-depth: 0 — the scan's range is `<base>..HEAD`, so both ends
+          # and everything between them have to be in the object store. A
+          # shallow checkout would silently truncate the range at the graft
+          # boundary, which is the PEN-4087 failure mode wearing a different
+          # hat: fewer commits scanned, still exit 0.
+          fetch-depth: 0
+          # filter: blob:none is what makes fetch-depth: 0 affordable here —
+          # this repo is 9,593 commits and a blobless full clone measured ~8 s
+          # on 2026-11-09. The commit graph is complete and exact; the blobs
+          # `git log -p` names are fetched on demand.
+          #
+          # ⚠️ Lazy blob fetching costs ONE fetch PER COMMIT, so it is fine for
+          # a PR range (a handful of commits) and PATHOLOGICAL for a wide one:
+          # measured 2026-11-09 on this repo, a 239-commit range over a
+          # blobless clone had not finished after 8 minutes, against 15.7 s to
+          # bulk-fetch all blobs once and 7 s to then scan. If a future arm
+          # ever scans a wide range, bulk-fetch first — do NOT "fix" it by
+          # narrowing the range, which is PEN-4087 again.
+          filter: blob:none
+          # Keep checkout from writing the token into .git/config: the scan
+          # step injects a one-shot http.extraheader through Git's environment
+          # config instead, so no credential is left on disk for anything else
+          # in the job to read.
+          persist-credentials: false
+
+      - name: Install pinned gitleaks
+        id: install_gitleaks
+        timeout-minutes: 5
+        env:
+          # VERSION and SHA256 are held adjacent so a bump has to move both or
+          # it fails loudly. 8.28.0 is the version penstock-llm-proxy-core and
+          # Blockcast/onprem-k8s both pin.
+          #
+          # The digest is upstream's own published
+          # `gitleaks_8.28.0_checksums.txt` value for linux_x64, independently
+          # re-derived by two seats downloading and hashing the artifact
+          # (@Devops on #8493 and this seat, 2026-11-08/09 — both agree).
+          #
+          # Why the checksum is load-bearing rather than hygiene: this binary
+          # is put on the runner PATH and executed, so an unverified download
+          # is an arbitrary-code path on arc-light. `curl --fail` rejects an
+          # HTTP error, not a served-but-wrong artifact.
+          VERSION: 8.28.0
+          SHA256: a65b5253807a68ac0cafa4414031fd740aeb55f54fb7e55f386acb52e6a840eb
+        run: |
+          set -euo pipefail
+
+          bin_dir="$RUNNER_TEMP/gitleaks-bin"
+          tarball="$RUNNER_TEMP/gitleaks.tar.gz"
+          mkdir -p "$bin_dir"
+
+          curl --fail --location --silent --show-error \
+            --output "$tarball" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+
+          echo "${SHA256}  ${tarball}" | sha256sum --check --strict -
+
+          tar -xzf "$tarball" -C "$bin_dir" gitleaks
+          chmod 0755 "$bin_dir/gitleaks"
+          echo "$bin_dir" >> "$GITHUB_PATH"
+
+          # Asserted, not printed: a version that does not match the pin means
+          # the PATH entry above lost to something else on the runner, and the
+          # scan would then be an unpinned scanner wearing a pinned version
+          # number in the logs.
+          test "$("$bin_dir/gitleaks" version)" = "$VERSION"
+
+      # Behavioural self-test of the two choices in the scan step that LOOK
+      # correct while inert if mis-edited — `--diff-merges=remerge` and the
+      # `^{commit}` peel in the range guard. Ported from onprem-k8s#8493, where
+      # stripping the peel passed every assertion that existed at the time
+      # (PEN-6227). It runs here, inside the lane, against the same pinned
+      # binary the scan uses, so it cannot drift away from what it pins.
+      - name: Test the scan's merge-diff and range-guard contracts
+        timeout-minutes: 3
+        run: bash scripts/test-secret-scan-merge-diff.sh "$RUNNER_TEMP/gitleaks-bin/gitleaks"
+
+      - name: gitleaks
+        id: gitleaks
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          args=(detect --source . --config .gitleaks.toml --redact --verbose --no-banner)
+
+          # `--verbose` is NOT noise and must not be dropped: without it
+          # gitleaks 8.28.0 prints only `leaks found: N` and NO file, line or
+          # rule, so a red lane would be unactionable. `--redact` keeps the
+          # matched value out of the log while the location is still reported
+          # (verified against the pinned binary, 2026-11-09).
+          #
+          # `--diff-merges=remerge` makes `git log` show a merge commit's
+          # CONFLICT-RESOLUTION changes. Plain `git log -p` omits merges
+          # entirely; raw `-m` also emits the second-parent/base-side diff,
+          # which is outside this PR's range. On a pull_request the checked-out
+          # HEAD is GitHub's merge ref, so without this a secret introduced by
+          # a merge resolution is scanned by nothing.
+          #
+          # Every revision the range names is collected rather than re-derived,
+          # so the assertion below cannot drift from the range it guards.
+          refs=()
+
+          case "$GITHUB_EVENT_NAME" in
+            pull_request | merge_group)
+              # pull_request: HEAD is refs/pull/N/merge, whose first parent is
+              # the base tip, and `base.sha` is that tip — so `base..HEAD` is
+              # exactly this PR's own commits plus the merge resolution.
+              # merge_group: `base_sha..head_sha` is exactly what the queue
+              # entry proposes to land.
+              #
+              # Asserted rather than defaulted: an empty base here would be an
+              # event-payload contract change, and defaulting it to anything
+              # would silently rescan either all history — which fires on the
+              # 74 documented whole-tree false positives — or nothing at all.
+              # PR_BASE_SHA is the workflow-level `env:` above — inherited,
+              # not re-declared, the same way every other consumer in this
+              # file reads it. It resolves to `pull_request.base.sha` on a
+              # PR and to `merge_group.base_sha` in the queue.
+              test -n "$PR_BASE_SHA"
+              refs+=("$PR_BASE_SHA" HEAD)
+              args+=(--log-opts "--diff-merges=remerge ${PR_BASE_SHA}..HEAD")
+              ;;
+            *)
+              echo "::error title=Secret scan has no range for this event::\`${GITHUB_EVENT_NAME}\` is not an event this job knows how to scope a commit range for. Refusing rather than scanning an unintended range."
+              exit 1
+              ;;
+          esac
+
+          # PEN-4087, reproduced first-party against the pinned 8.28.0: a
+          # `--log-opts` range naming a ref that does not resolve logs
+          # `error="stderr is not empty"` at ERR and then EXITS 0 reporting `0
+          # commits scanned` and `no leaks found`. `--exit-code 2` does not
+          # change that — it changes the code for a FINDING. So the gate's one
+          # dangerous failure is also its silent one, and nothing downstream
+          # can recover it: the summary step below would see a step that exited
+          # 0 and truthfully report that the scan passed. It did pass. It never
+          # looked at a commit.
+          #
+          # Keyed on whether each revision RESOLVES, deliberately not on the
+          # commit count gitleaks reports: an empty range is legitimately zero
+          # commits, so a count-based guard would fail those for no reason
+          # while this one passes them.
+          #
+          # `^{commit}` is load-bearing, not decoration. `git rev-parse
+          # --verify` accepts a well-formed object NAME without checking the
+          # object exists, so an ABSENT 40-hex sha — exactly the shape of
+          # `base.sha` — exits 0 unpeeled and 1 peeled. Drop the peel and this
+          # guard is inert while still reading correct; the step above pins it.
+          for ref in "${refs[@]}"; do
+            if ! git rev-parse --verify --quiet "${ref}^{commit}" >/dev/null 2>&1; then
+              echo "::error title=Secret scan could not read its commit range::\`${ref}\` does not resolve to a commit in this checkout, so the ${GITHUB_EVENT_NAME} range would have scanned 0 commits and reported no leaks found. Nothing was scanned; this range is UNVERIFIED, not clean."
+              exit 1
+            fi
+          done
+
+          test -n "$GITHUB_TOKEN"
+          token_b64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+
+          # PEN-4072. `--exit-code 2` is what lets the summary step tell "found
+          # a secret" from "could not scan": against the pinned 8.28.0 a
+          # finding exits 2, a config that will not load exits 1, an unknown
+          # flag 126, a missing binary 127. The branch below tests `== 2`
+          # rather than `!= 0` because 1 is not exclusively "gitleaks errored"
+          # — the `test -n` assertions above also exit 1 under `set -e` — but
+          # nothing except a finding can exit 2.
+          #
+          # `set +e` starts here, deliberately AFTER those assertions so they
+          # stay fatal. The code is published as a step output AND re-raised,
+          # so a finding still fails the step and the lane still goes red.
+          set +e
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${token_b64}" \
+            gitleaks "${args[@]}" --exit-code 2
+          code=$?
+          unset token_b64
+          # Published while `set -e` is still off, deliberately. Re-armed
+          # first, a failed output write on a real finding would abort the step
+          # before publishing, the summary step would read `none`, and it would
+          # announce "not a secret" over a live credential.
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          set -e
+          exit "$code"
+
+      # Diagnostics only. `if: always()` plus `continue-on-error` is
+      # load-bearing: this step must never be the reason the lane passes or
+      # fails, and it must still run when the scan failed — which is the only
+      # time anyone reads it.
+      - name: Explain how this lane ended
+        if: always()
+        continue-on-error: true
+        env:
+          INSTALL_OUTCOME: ${{ steps.install_gitleaks.outcome }}
+          GITLEAKS_OUTCOME: ${{ steps.gitleaks.outcome }}
+          GITLEAKS_CODE: ${{ steps.gitleaks.outputs.code }}
+        run: |
+          set -euo pipefail
+          code="${GITLEAKS_CODE:-none}"
+          {
+            if [ "$GITLEAKS_OUTCOME" = success ]; then
+              echo "### Secret scan passed"
+              echo
+              echo "gitleaks 8.28.0 scanned this PR's own commit range — every revision of"
+              echo "which was asserted readable before the scan — and found nothing."
+              echo
+              echo "This is DIFF-AWARE and says nothing about the rest of the tree, and it"
+              echo "is name-anchored: it does not see an opaque value under an unremarkable"
+              echo "name (PEN-6170). See \`.gitleaks.toml\`'s header."
+            elif [ "$GITLEAKS_OUTCOME" = failure ] && [ "$code" = 2 ]; then
+              echo "### Secret scan found a secret"
+              echo
+              echo "**Verdict: this is a gitleaks FINDING, not infrastructure.** Exit code 2"
+              echo "is reachable only from a finding (PEN-4072), and the range was asserted"
+              echo "readable before the scan ran (PEN-4087)."
+              echo
+              echo "Read the redacted finding — file, line and rule — in the \`gitleaks\` step."
+              echo
+              echo "**If it is real: ROTATE THE CREDENTIAL FIRST.** It is already pushed to a"
+              echo "remote branch on GitHub, so rewriting or dropping the commit does not"
+              echo "un-disclose it. Rotation is the remedy; the history edit is cleanup."
+              echo
+              echo "**If it is a false positive: add a documented entry to \`.gitleaks.toml\`"
+              echo "in THIS PR** and it will go green — gitleaks resolves the config from the"
+              echo "WORKING TREE, not from the scanned commits, so the allowlist in force is"
+              echo "the one at this PR's own head."
+              echo
+              echo "> **WARNING — that is also why the PR that trips this scanner can silence it.**"
+              echo "> \`.gitleaks.toml\`'s own header states the policy — *\"NO real secret is ever"
+              echo "> allowlisted ... documented false positives only\"* — and NOTHING IN THE TOOL"
+              echo "> ENFORCES IT. It is enforceable only by review of the \`.gitleaks.toml\` diff."
+              echo "> Reviewer: if this PR adds an allowlist entry, that entry IS the change under"
+              echo "> review. Author: say in the PR body what the matched value actually is and"
+              echo "> why it is not a credential."
+            else
+              echo "### Secret scan did NOT reach a verdict"
+              echo
+              echo "**This is not an all-clear and it is not a finding.** The scan did not"
+              echo "complete, so this range is UNVERIFIED."
+              echo
+              echo "| step | outcome |"
+              echo "|---|---|"
+              echo "| install gitleaks | ${INSTALL_OUTCOME:-not-reached} |"
+              echo "| gitleaks | ${GITLEAKS_OUTCOME:-not-reached} |"
+              echo "| gitleaks exit code | ${code} |"
+              echo
+              echo "An exit code of \`none\` means the step failed before the scanner returned"
+              echo "— a failed download, a checksum mismatch, or the commit-range assertion"
+              echo "refusing a range it could not read. A \`skipped\` outcome means \`policy\`"
+              echo "did not succeed; check that job, not this one."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   # ALLY-GATED HEAVY CI (R1). Owner directive 2026-10-07 (~01:55Z): "also
   # actively work to reduce and isolate CPU waste from CI. CI is suboptimal
   # across the org as you saw in this conversation, with jobs running without
@@ -2868,6 +3222,7 @@ jobs:
         build,
         vendor_claude_k8s,
         vendor_opencode_k8s,
+        secret_scan,
         ally_verdict,
       ]
     runs-on: ${{ github.event_name == 'merge_group' && 'arc-merge-queue' || 'arc-paperclip-light' }}
@@ -2956,6 +3311,7 @@ jobs:
           BUILD_RESULT: ${{ needs.build.result }}
           VENDOR_CLAUDE_K8S_RESULT: ${{ needs.vendor_claude_k8s.result }}
           VENDOR_OPENCODE_K8S_RESULT: ${{ needs.vendor_opencode_k8s.result }}
+          SECRET_SCAN_RESULT: ${{ needs.secret_scan.result }}
         run: |
           # Keep these three arrays in the same order — scripts/__tests__/
           # pr-verify-lane-outcome.test.mjs asserts the pairing, and also
@@ -2970,6 +3326,7 @@ jobs:
             build
             vendor_claude_k8s
             vendor_opencode_k8s
+            secret_scan
           )
           lane_results=(
             "$HELM_CHART_RESULT"
@@ -2981,6 +3338,7 @@ jobs:
             "$BUILD_RESULT"
             "$VENDOR_CLAUDE_K8S_RESULT"
             "$VENDOR_OPENCODE_K8S_RESULT"
+            "$SECRET_SCAN_RESULT"
           )
           lane_job_names=(
             "Helm chart"
@@ -2992,6 +3350,7 @@ jobs:
             "Build"
             "Vendored claude_k8s adapter"
             "Vendored opencode_k8s adapter"
+            "Secret scan"
           )
 
           # `failed` and `job_names` are built in lockstep so the Nth failed
@@ -3075,6 +3434,7 @@ jobs:
           BUILD_RESULT: ${{ needs.build.result }}
           VENDOR_CLAUDE_K8S_RESULT: ${{ needs.vendor_claude_k8s.result }}
           VENDOR_OPENCODE_K8S_RESULT: ${{ needs.vendor_opencode_k8s.result }}
+          SECRET_SCAN_RESULT: ${{ needs.secret_scan.result }}
         run: |
           lane_names=(
             helm_chart
@@ -3086,6 +3446,7 @@ jobs:
             build
             vendor_claude_k8s
             vendor_opencode_k8s
+            secret_scan
           )
           lane_results=(
             "$HELM_CHART_RESULT"
@@ -3097,6 +3458,7 @@ jobs:
             "$BUILD_RESULT"
             "$VENDOR_CLAUDE_K8S_RESULT"
             "$VENDOR_OPENCODE_K8S_RESULT"
+            "$SECRET_SCAN_RESULT"
           )
 
           cancelled_lanes=()

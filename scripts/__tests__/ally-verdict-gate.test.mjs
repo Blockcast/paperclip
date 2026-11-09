@@ -349,6 +349,14 @@ const laneEnv = (overrides) => ({
   BUILD_RESULT: "success",
   VENDOR_CLAUDE_K8S_RESULT: "success",
   VENDOR_OPENCODE_K8S_RESULT: "success",
+  // PEN-6245. This is the SECOND hand-maintained copy of the lane defaults —
+  // pr-verify-lane-outcome.test.mjs has the other, and only that one asserts
+  // itself against pr.yml's arrays. A lane added to the workflow without an
+  // entry here leaves $X_RESULT empty, which the script's `case` scores as a
+  // failure, so every scenario in this file reds at once (BLO-17980's shape).
+  // `secret_scan` needs only `policy`, so it is NOT held by `ally_verdict` and
+  // stays `success` in the `held` fixture below.
+  SECRET_SCAN_RESULT: "success",
   ALLY_VERDICT_RESULT: "success",
   RUN_ATTEMPT: "1",
   ...overrides,

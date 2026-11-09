@@ -67,6 +67,7 @@ function laneEnv(results) {
     BUILD_RESULT: results.build ?? "success",
     VENDOR_CLAUDE_K8S_RESULT: results.vendor_claude_k8s ?? "success",
     VENDOR_OPENCODE_K8S_RESULT: results.vendor_opencode_k8s ?? "success",
+    SECRET_SCAN_RESULT: results.secret_scan ?? "success",
     // Not a lane: the Ally-gated schedule hold (pr.yml `ally_verdict`). Its
     // cases live in ally-verdict-gate.test.mjs; default it to released so every
     // scenario here keeps testing the lanes alone.
@@ -1081,6 +1082,89 @@ test("both verify steps list the same lanes", () => {
     "the classify and aggregation steps must cover the same lanes — a lane present in only " +
       "one of them silently loses runner-kill detection while both steps keep working",
   );
+});
+
+// PEN-6232 / PEN-6245. `verify` decides pass/fail from the hand-maintained
+// arrays above, NOT from `needs.*` — the only `contains(needs.*.result, ...)`
+// expressions in the job are `if:` gates on the classify step, which chooses
+// WORDING and never the verdict. So a lane added to `needs:` and omitted from
+// the arrays leaves `verify` GREEN while that lane is RED: GitHub waits for
+// the job, the job fails, and the aggregation loop never looks at it. Nothing
+// above catches that — the two tests either side of this one pin the arrays
+// against EACH OTHER and against the job `name:`s, so a lane missing from both
+// arrays is consistent with every one of them.
+//
+// Asserted in both directions:
+//   needs ⊆ arrays   closes the fail-OPEN hole above.
+//   arrays ⊆ needs   closes the mirror: a lane in the arrays but not in
+//                    `needs:` reads `$X_RESULT` as empty, which the script's
+//                    `case` treats as `*)` — a permanent, unexplained red.
+//
+// NON_LANE_NEEDS is an explicit allowlist rather than a filter so that adding
+// another non-lane dependency is a deliberate edit with a reason attached,
+// not something that silently widens the exception.
+const NON_LANE_NEEDS = new Set([
+  // Not a lane: the Ally-gated schedule hold. It has its own branch in the
+  // aggregation script (`ALLY_VERDICT_RESULT`) and is deliberately kept out of
+  // the lane arrays so the classifier never reads it as a runner kill. Its
+  // cases live in ally-verdict-gate.test.mjs.
+  "ally_verdict",
+]);
+
+test("every job verify needs is wired into BOTH lane arrays, and nothing else is", () => {
+  const verifyJob = getVerifyJobBlock();
+  const needsBlock = verifyJob.match(/\n    needs:\n      \[\n((?:        [^\n]*\n)+)      \]\n/)?.[1];
+  assert.ok(needsBlock, "could not parse verify's `needs:` list out of pr.yml");
+  const needs = needsBlock
+    .split("\n")
+    .map((line) => line.trim().replace(/,$/, ""))
+    .filter(Boolean);
+  assert.ok(needs.length > 1, `verify's needs list parsed as ${needs.length} entries`);
+
+  const readLaneNames = (haystack, from = 0) => {
+    const start = haystack.indexOf("lane_names=(", from);
+    assert.notEqual(start, -1, "could not find lane_names");
+    return haystack
+      .slice(start + "lane_names=(".length, haystack.indexOf(")", start))
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  };
+
+  const classifyStart = workflow.indexOf(
+    "\n      - name: Classify failed lanes as infrastructure kills or real failures\n",
+  );
+  assert.notEqual(classifyStart, -1, "pr.yml must define the lane classification step");
+  const steps = [
+    ["classify", readLaneNames(workflow, classifyStart)],
+    // The DECISION step. This is the one that sets `any_non_success` and exits
+    // 1, so a lane missing here is the fail-open case specifically — the
+    // classify step can be perfectly wired and `verify` still goes green.
+    ["decision", readLaneNames(getVerifyLaneScript())],
+  ];
+
+  for (const [label, lanes] of steps) {
+    const laneSet = new Set(lanes);
+    for (const job of needs) {
+      if (NON_LANE_NEEDS.has(job)) continue;
+      assert.ok(
+        laneSet.has(job),
+        `verify needs '${job}' but the ${label} step's lane_names does not list it. ` +
+          `verify decides from these arrays, not from needs.*, so '${job}' could fail ` +
+          `while verify reports success. Add it to lane_names, lane_results` +
+          `${label === "classify" ? ", lane_job_names" : ""} and its env: block, ` +
+          `or add it to NON_LANE_NEEDS with a reason.`,
+      );
+    }
+    for (const lane of lanes) {
+      assert.ok(
+        needs.includes(lane),
+        `the ${label} step's lane_names lists '${lane}' but verify does not need it, so ` +
+          `$${lane.toUpperCase()}_RESULT is always empty and the script's \`case\` scores it ` +
+          `as a failure on every run`,
+      );
+    }
+  }
 });
 
 // The classify step carries a THIRD parallel array mapping each lane to the
