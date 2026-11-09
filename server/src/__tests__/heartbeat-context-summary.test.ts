@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   buildPaperclipTaskMarkdown,
   derivePaperclipPrReview,
+  triggeredMonitorForPrompt,
   evaluatePrReviewCompletionEvidence,
   mergeCoalescedContextSnapshot,
   prReviewAlreadyReviewedVetoCue,
@@ -3435,6 +3436,101 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
     // Control: the block that IS unconditional still renders, so this is a scoped
     // absence and not an empty build.
     expect(markdown).toContain("Pre-write re-read directive:");
+  });
+
+  // The GATE itself, not just the rendering. Ally's review of this PR caught the
+  // original helper reading `executionState.monitor.status` directly while three
+  // comments claimed it derived the state the sweep tests -- and nothing failed,
+  // because every test above passes `triggeredMonitor` in by hand and so exercises
+  // the caller rather than the derivation that decides it.
+  //
+  // `derivePersistedMonitorState` gives the `monitor*` COLUMNS precedence over the
+  // JSON, so these cases pin the two readings apart. A JSON-only implementation
+  // passes the first and fails the second and third.
+  describe("triggeredMonitorForPrompt", () => {
+    const base = { status: "in_progress", assigneeAgentId: "agent-1", executionPolicy: null };
+    // `issueExecutionMonitorStateSchema` requires `nextCheckAt`, `notes`,
+    // `scheduledBy`, `clearedAt` and `clearReason` to be PRESENT (nullable, not
+    // prefaulted), so a hand-built partial monitor fails `parseIssueExecutionState`
+    // and the whole state parses to null. That is the fail-closed direction -- the
+    // directive is simply not emitted -- but it would make these cases pass for the
+    // wrong reason, so the fixture carries the full persisted shape.
+    // `issueExecutionStateSchema` likewise requires the stage fields to be PRESENT
+    // (nullable, not prefaulted), so `{ monitor }` alone parses to null and every
+    // case below would pass for the wrong reason. This is the shape a real row
+    // carries.
+    const executionStateWith = (monitor: Record<string, unknown> | null) => ({
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor,
+    });
+    const monitorState = (overrides: Record<string, unknown>) => ({
+      status: "triggered",
+      nextCheckAt: null,
+      lastTriggeredAt: null,
+      attemptCount: 0,
+      notes: null,
+      scheduledBy: "assignee",
+      clearedAt: null,
+      clearReason: null,
+      ...overrides,
+    });
+
+    it("derives a triggered monitor from executionState", () => {
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        executionState: executionStateWith(monitorState({
+          lastTriggeredAt: "2026-11-08T19:30:27.629Z",
+          attemptCount: 4,
+          maxAttempts: 24,
+          serviceName: "github-pr-human-approval",
+        })),
+      })).toMatchObject({
+        lastTriggeredAt: "2026-11-08T19:30:27.629Z",
+        attemptCount: 4,
+        maxAttempts: 24,
+        serviceName: "github-pr-human-approval",
+      });
+    });
+
+    // THE case that separates the derived reading from the JSON one. A live
+    // `monitorNextCheckAt` means the monitor is scheduled again -- there is no
+    // outstanding obligation -- however stale the JSON still reads. A JSON-only
+    // helper emits the directive here, claiming an obligation the sweep does not
+    // see, which is the exact failure the comments promised could not happen.
+    it("returns null when the COLUMN says the monitor is scheduled again", () => {
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        monitorNextCheckAt: new Date("2026-11-09T00:00:00.000Z"),
+        executionState: executionStateWith(monitorState({ lastTriggeredAt: "2026-11-08T19:30:27.629Z", attemptCount: 4 })),
+      })).toBeNull();
+    });
+
+    // The other direction: the columns can carry a triggered monitor whose
+    // `executionState.monitor` is absent, and the sweep reaps those too. A
+    // JSON-only helper stays silent about an obligation that does exist.
+    it("derives a triggered monitor from the columns with no executionState", () => {
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        monitorLastTriggeredAt: new Date("2026-11-08T19:30:27.629Z"),
+        monitorAttemptCount: 2,
+        executionState: null,
+      })).toMatchObject({ lastTriggeredAt: "2026-11-08T19:30:27.629Z", attemptCount: 2 });
+    });
+
+    it("returns null for a cleared monitor and for no row at all", () => {
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        executionState: executionStateWith(monitorState({ status: "cleared", clearReason: "manual", clearedAt: "2026-11-08T20:00:00.000Z" })),
+      })).toBeNull();
+      expect(triggeredMonitorForPrompt(null)).toBeNull();
+    });
   });
 
   // A monitor can be triggered with none of its descriptive fields populated. The
