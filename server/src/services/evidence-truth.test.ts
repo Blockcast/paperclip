@@ -812,12 +812,14 @@ describe("buildGithubTruthProbe", () => {
     expect(other.diagnostics).toContain("linked-prs-not-owning-issue:PEN-6254:Blockcast/paperclip#3577");
   });
 
-  // Filtering every attached PR out reads as "no pull request OWNS this
-  // issue", which is the honest answer and the same one an issue with nothing
-  // attached gets. It can never CREDIT a shape — `detections` is empty on both
-  // paths — but it must say why, or the row looks like one no PR was ever
-  // attached to.
-  it("all attached PRs disclaiming this issue → noLinkedPullRequest, with the exclusion named", async () => {
+  // Filtering every attached PR out is its OWN state, and must not be
+  // reported as `noLinkedPullRequest`. The two differ on satisfiability,
+  // which is the axis `prLessUnlabeledTruthDrop` turns on: an issue with
+  // nothing attached can never satisfy the shape and is de-required, whereas
+  // this issue's assignee CAN satisfy it — so it keeps the shape and only
+  // loses the escalation. Collapsing them would retire a shape that is merely
+  // unmet. (Found by @Cto reviewing this fix before it merged.)
+  it("all attached PRs disclaiming this issue → noOwningPullRequest, NOT noLinkedPullRequest", async () => {
     const r = await buildGithubTruthProbe(deps())({
       workProducts: [wp({ prNumber: 3582, merged: true, owningIdentifiers: ["PEN-6254"] })],
       owningIdentifier: "PEN-6181",
@@ -826,12 +828,27 @@ describe("buildGithubTruthProbe", () => {
       detections: {},
       diagnostics: [
         "linked-prs-not-owning-issue:PEN-6181:Blockcast/paperclip#3582",
-        "no-linked-pull-request",
+        "no-owning-pull-request",
       ],
       probeFailed: false,
-      noLinkedPullRequest: true,
+      noLinkedPullRequest: false,
+      noOwningPullRequest: true,
       reviewerAuthoredPr: false,
     });
+  });
+
+  // The discriminating pair for the field above: NOTHING attached still reads
+  // `noLinkedPullRequest`, so the new flag reports the disclaiming set rather
+  // than the empty one. Without this, setting both flags true on every empty
+  // result would pass the test above.
+  it("nothing attached at all → still noLinkedPullRequest, and noOwningPullRequest false", async () => {
+    const r = await buildGithubTruthProbe(deps())({
+      workProducts: [],
+      owningIdentifier: "PEN-6181",
+    });
+    expect(r.noLinkedPullRequest).toBe(true);
+    expect(r.noOwningPullRequest).toBe(false);
+    expect(r.diagnostics).toEqual(["no-linked-pull-request"]);
   });
 
   it("no linked PR → no detections, a diagnostic, and NOT a probe failure", async () => {
@@ -846,6 +863,7 @@ describe("buildGithubTruthProbe", () => {
       diagnostics: ["no-linked-pull-request"],
       probeFailed: false,
       noLinkedPullRequest: true,
+      noOwningPullRequest: false,
       reviewerAuthoredPr: false,
     });
   });

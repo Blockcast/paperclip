@@ -148,6 +148,7 @@ export async function runEvidenceGate(
   let externalDetections: Partial<Record<EvidenceShape, boolean>> | undefined;
   let probeFailed = false;
   let noLinkedPullRequest = false;
+  let noOwningPullRequest = false;
   let reviewerAuthoredPr = false;
   const truthDiagnostics: string[] = [];
   if (truth) {
@@ -162,6 +163,7 @@ export async function runEvidenceGate(
     externalDetections = probed.detections;
     probeFailed = probed.probeFailed;
     noLinkedPullRequest = probed.noLinkedPullRequest;
+    noOwningPullRequest = probed.noOwningPullRequest;
     reviewerAuthoredPr = probed.reviewerAuthoredPr;
     truthDiagnostics.push(...probed.diagnostics);
   }
@@ -181,6 +183,7 @@ export async function runEvidenceGate(
     externalDetections,
     probeFailed,
     noLinkedPullRequest,
+    noOwningPullRequest,
     reviewerAuthoredPr,
     unlabeledTruthBlock: options?.unlabeledTruthBlock,
   });

@@ -97,6 +97,27 @@ export interface TruthProbeResult {
    */
   noLinkedPullRequest: boolean;
   /**
+   * True when pull requests ARE attached but every one of them recorded an
+   * owning set this issue is not in, so the ownership filter emptied a
+   * non-empty set (PEN-6321).
+   *
+   * A FIFTH state, and kept off `noLinkedPullRequest` because the two differ
+   * on exactly the axis `prLessUnlabeledTruthDrop` turns on: SATISFIABILITY.
+   * An issue with nothing attached is the doc-only population — there is no
+   * code to open a PR for, the shape is unsatisfiable forever, and the drop
+   * de-requires it. An issue whose attached PRs disclaim it is NOT that: its
+   * assignee can satisfy the shape, by opening a PR that declares the row or
+   * by getting the ownership recorded. Reporting it as `noLinkedPullRequest`
+   * would hand it a drop reserved for work nobody can ever do, and retire a
+   * shape that is merely unmet.
+   *
+   * So this field reaches the escalation suppressor and nothing else: the
+   * shape stays in `missing`, the verdict stays `warn`, and the gap stays
+   * measurable — the same posture `reviewerAuthoredPr` takes, for the same
+   * reason. Found by @Cto reviewing the PEN-6321 fix, before it merged.
+   */
+  noOwningPullRequest: boolean;
+  /**
    * True when the linked set's failure to produce `review:ally-clean` is
    * attributable ENTIRELY to the reviewer identity authoring the PR — the
    * App-authored population (PEN-4265).
@@ -108,11 +129,12 @@ export interface TruthProbeResult {
    * Every agent-opened PR in this estate is authored by the shared GitHub App
    * and Ally reviews as that same App, so no agent behaviour can move it.
    *
-   * Kept off `probeFailed` and `noLinkedPullRequest` deliberately — each of
-   * the three writes a different `unlabeled-truth-block-suppressed:<reason>`
-   * into an operator-visible verdict, and the rollout runbook's seven-day
-   * measurement reads them apart. Folding this one into either would report a
-   * GitHub outage, or a PR-less issue, on an issue that is neither.
+   * Kept off `probeFailed`, `noLinkedPullRequest` and `noOwningPullRequest`
+   * deliberately — each of the four writes a different
+   * `unlabeled-truth-block-suppressed:<reason>` into an operator-visible
+   * verdict, and the rollout runbook's seven-day measurement reads them
+   * apart. Folding this one into any of them would report a GitHub outage, a
+   * PR-less issue, or a disclaimed one, on an issue that is none of those.
    */
   reviewerAuthoredPr: boolean;
 }
@@ -896,20 +918,32 @@ export function buildGithubTruthProbe(
     // Not a failure: plenty of issues legitimately have no PR. The evaluator
     // records the shapes as missing and, unlabeled, only warns.
     //
-    // Reached when the filter above emptied a non-empty attached set, and
-    // that reading is the honest one: no pull request OWNS this issue, so the
-    // shape is exactly as unsatisfiable as it is for an issue with nothing
-    // attached. It cannot launder a shape into existence — `detections` stays
-    // empty either way, so nothing is ever CREDITED here. What it does reach,
-    // for an UNLABELED issue only, is `truth-shapes-not-required`, moving
-    // `warn` to `pass`; that warn was itself the false negative PEN-6321 is
-    // about. A labeled code issue keeps the shape required and still warns.
+    // TWO different states reach this branch, and they are reported apart
+    // because a downstream consumer turns on the difference (PEN-6321).
+    //
+    //   - Nothing was attached at all. The doc-only / refactor population:
+    //     there is no code to open a PR for, so the shape is unsatisfiable
+    //     forever. `noLinkedPullRequest`, unchanged — and `prLessUnlabeled-
+    //     TruthDrop` de-requires the shape for it, which is what that drop is
+    //     for.
+    //   - PRs ARE attached and every one recorded an owning set this issue is
+    //     not in. `noOwningPullRequest`. The assignee CAN satisfy the shape
+    //     here, so it must NOT take that drop: it only suppresses the
+    //     escalation, leaving the shape in `missing` and the verdict at
+    //     `warn`.
+    //
+    // Neither can CREDIT a shape — `detections` is empty on both paths, so
+    // this branch can only ever withhold.
     if (all.length === 0)
       return {
         detections: {},
-        diagnostics: [...ownershipDiagnostics, "no-linked-pull-request"],
+        diagnostics: [
+          ...ownershipDiagnostics,
+          notOwned.length === 0 ? "no-linked-pull-request" : "no-owning-pull-request",
+        ],
         probeFailed: false,
-        noLinkedPullRequest: true,
+        noLinkedPullRequest: notOwned.length === 0,
+        noOwningPullRequest: notOwned.length > 0,
         reviewerAuthoredPr: false,
       };
 
@@ -954,6 +988,7 @@ export function buildGithubTruthProbe(
         diagnostics: [...diagnostics, "truth-probe-deadline"],
         probeFailed: true,
         noLinkedPullRequest: false,
+        noOwningPullRequest: false,
         reviewerAuthoredPr: false,
       };
     }
@@ -992,6 +1027,13 @@ export function buildGithubTruthProbe(
       detections["review:ally-clean"] !== true &&
       result.every((r) => r.clean || r.authorIsReviewer) &&
       result.some((r) => r.authorIsReviewer);
-    return { detections, diagnostics, probeFailed, noLinkedPullRequest: false, reviewerAuthoredPr };
+    return {
+      detections,
+      diagnostics,
+      probeFailed,
+      noLinkedPullRequest: false,
+      noOwningPullRequest: false,
+      reviewerAuthoredPr,
+    };
   };
 }

@@ -74,6 +74,25 @@ export interface EvaluateEvidenceInput {
    */
   noLinkedPullRequest?: boolean;
   /**
+   * True when pull requests ARE attached but every one recorded an owning set
+   * this issue is not in, so the ownership filter emptied a non-empty set
+   * (PEN-6321).
+   *
+   * ⛔ DELIBERATELY NOT read by `prLessUnlabeledTruthDrop`, and that omission
+   * is the whole point of the field existing. That drop's criterion is
+   * SATISFIABILITY — it de-requires a shape no assignee can ever meet. This
+   * population can meet it: open a PR that declares the row, or get the
+   * ownership recorded. Routing it through `noLinkedPullRequest` would give
+   * it a drop reserved for work nobody can do and retire a shape that is
+   * merely unmet, which is a strictly larger loosening than the false
+   * negative PEN-6321 set out to fix.
+   *
+   * It reaches the escalation suppressor only, so the shape stays in
+   * `missing` and the verdict stays `warn` — the gap stays measurable and
+   * honest, exactly as `reviewerAuthoredPr` leaves it.
+   */
+  noOwningPullRequest?: boolean;
+  /**
    * True when the probe established that `review:ally-clean` is absent for the
    * whole linked set ONLY because the reviewer identity authored the PRs — the
    * App-authored population (PEN-4265).
@@ -828,6 +847,15 @@ export function evaluateEvidence(
   // the escalation is suppressed, so an outage can never launder a gap into a
   // `pass`.
   //
+  // `noOwningPullRequest` gets NO drop either, for the same reason read off
+  // the satisfiability line above: PRs ARE attached, they just recorded an
+  // owning set this issue is not in, and the assignee CAN satisfy the shape —
+  // open a PR that declares the row, or get the ownership recorded. It is the
+  // LABELED-with-no-linked-PR case in substance, so it takes that case's
+  // posture: shape required, `truth-gap-warn-only`, escalation suppressed.
+  // Keep the two flags apart; folding them loses exactly this distinction
+  // (PEN-6321).
+  //
   // Can only move a verdict warn -> pass; it shrinks `required` and never grows
   // it. A mixed gap is untouched.
   const prLessUnlabeledTruthDrop =
@@ -992,9 +1020,11 @@ export function evaluateEvidence(
         ? "probe-failed"
         : input.noLinkedPullRequest === true
           ? "no-linked-pull-request"
-          : input.reviewerAuthoredPr === true
-            ? "reviewer-authored-pr"
-            : null;
+          : input.noOwningPullRequest === true
+            ? "no-owning-pull-request"
+            : input.reviewerAuthoredPr === true
+              ? "reviewer-authored-pr"
+              : null;
     if (suppress !== null) {
       diagnostics.push(`unlabeled-truth-block-suppressed:${suppress}`);
     } else {

@@ -1929,6 +1929,37 @@ describe("evaluateEvidence — no linked PR: unsatisfiable, so not required (BLO
     expect(result.diagnostics).not.toContain("truth-shapes-not-required:no-linked-pull-request");
   });
 
+  // PEN-6321. `noOwningPullRequest` must NOT get the drop either, and this is
+  // the regression guard for the review finding against that fix: PRs ARE
+  // attached, they merely recorded an owning set this issue is not in, and the
+  // assignee CAN satisfy the shape — by opening a PR that declares the row, or
+  // by getting the ownership recorded. That puts it in the LABELED-with-no-PR
+  // class, not the doc-only one, so it keeps the shape and loses only the
+  // escalation. Routing it through `noLinkedPullRequest` instead would retire
+  // a shape that is merely unmet, a strictly larger loosening than the false
+  // negative PEN-6321 set out to fix.
+  it("PRs attached but none OWNING keeps the shape required (no drop) and only suppresses", () => {
+    const input = {
+      issue: { description: DONE_WHEN, labels: [] },
+      comments: [agentComment(CHECKLIST)],
+      workProducts: [],
+      registry: DEFAULT_EVIDENCE_REGISTRY,
+      noOwningPullRequest: true,
+    };
+    const off = evaluateEvidence(input);
+    expect(off.verdict).toBe("warn");
+    expect(off.missing).toEqual(["review:ally-clean"]);
+    expect(off.diagnostics).not.toContain("truth-shapes-not-required:no-linked-pull-request");
+
+    // Flag on: suppressed with its OWN reason, never blocked. Distinct from
+    // `no-linked-pull-request` so the runbook's measurement reads them apart.
+    const on = evaluateEvidence({ ...input, unlabeledTruthBlock: true, probeFailed: false });
+    expect(on.verdict).toBe("warn");
+    expect(on.diagnostics).toContain("unlabeled-truth-block-suppressed:no-owning-pull-request");
+    expect(on.diagnostics).not.toContain("unlabeled-truth-block");
+    expect(on.diagnostics).not.toContain("truth-shapes-not-required:no-linked-pull-request");
+  });
+
   // A mixed gap is untouched — the drop shrinks `required`, so it can only ever
   // move a verdict warn -> pass, never reach down and clear a shape the agent
   // does own.
