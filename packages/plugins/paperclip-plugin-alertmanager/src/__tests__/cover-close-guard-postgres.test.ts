@@ -12,7 +12,7 @@
  *  - the eligibility and recheck-window predicates as SQL, including
  *    `make_interval(mins => …)` and the interaction of the `$2` hold with the
  *    `$3` hold+limit window;
- *  - that the claim UPDATE really does write the verdict columns migration 009
+ *  - that the claim UPDATE really does write the verdict columns migration 010
  *    adds, i.e. that the code and the migration that ships with it agree;
  *  - the backfill regex, which is a Postgres `substring(… from …)` and has no
  *    JS equivalent to model.
@@ -42,7 +42,7 @@ async function applyMigrations(pg: PGlite): Promise<void> {
   const files = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
   // Fail loudly if this migration is renamed or dropped: every assertion below
   // is about columns it adds, and without it they would fail far from the cause.
-  expect(files).toContain("009_cover_close_verdict.sql");
+  expect(files).toContain("010_cover_close_verdict.sql");
   await pg.exec(`
     CREATE TABLE IF NOT EXISTS public.companies (id uuid PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS public.issues (id uuid PRIMARY KEY);
@@ -173,7 +173,7 @@ describe("PEN-6236 close guard, real SQL", () => {
     expect(readSourceState).not.toHaveBeenCalled();
   });
 
-  it("migration 009's backfill regex recovers the alertname from every real fingerprint shape", async () => {
+  it("migration 010's backfill regex recovers the alertname from every real fingerprint shape", async () => {
     const { rows } = await db.query<{ parsed: string | null }>(
       `SELECT substring(fp from '^cover:(.*):[0-9]+$') AS parsed
          FROM (VALUES ('cover:PaperclipApprovalStarved:1'),
@@ -193,7 +193,7 @@ describe("PEN-6236 close guard, real SQL", () => {
     ]);
   });
 
-  it("the 009 columns exist with the defaults the code assumes", async () => {
+  it("the 010 columns exist with the defaults the code assumes", async () => {
     const { rows } = await db.query<{ column_name: string; is_nullable: string; column_default: string | null }>(
       `SELECT column_name, is_nullable, column_default FROM information_schema.columns
         WHERE table_schema = $1 AND table_name = 'alert_escalation_covers'
