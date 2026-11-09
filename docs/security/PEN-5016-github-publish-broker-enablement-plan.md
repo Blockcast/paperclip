@@ -413,6 +413,14 @@ re-runner who sees a non-zero count cannot tell a render from a quotation withou
 **2 of 6** attempts when measured for #3590 on 2026-11-08/09 — and an empty reply is not a zero. Re-run until it returns, and pair the probe with a liveness control
 (§11.6 check 3) and an expressiveness control — a zero is only a reading when both fire.
 
+✅ **The expressiveness control that was actually run — reuse it rather than inventing one.** The two
+probes above were paired with a sibling needle on the same stream, differing only in the event key:
+`{namespace="paperclip",container="paperclip"} |= "\"event\":\"claude_k8s.prompt_bundle_projection_sized\""`,
+which returned **7928 / 2d** — a non-zero, which is what makes the `"event":` form's **0** above a
+real zero and not a mute matcher. ⚠️ This was measured for #3590 on 2026-11-08/09 and recorded only
+in that PR's body until now. Re-run it beside the probe rather than citing this number: if the
+sibling needle ever returns zero, the matcher is mute and there is no reading.
+
 ✅ The standing §7.2 detector `scripts/check-git-egress-residual-triggers.mjs` (run by
 `.github/workflows/git-egress-residual-trigger-check.yml`) already uses this **exact** string, and
 `check-git-egress-residual-triggers.test.mjs` asserts it — including a case requiring that prose
@@ -674,7 +682,8 @@ silent broker and a broker nobody asked to publish are the same observation (§5
 **Stage 1 — one agent, one company.** **Does not start on a date. It starts when every precondition
 below is on `master`**, target **2026-11-06**, which is an earliest-start and not a commitment (CTO,
 2026-10-29). Duration ≥ 3 working days. ✅ **Set in §11.3, with the mechanical entry gate in §11.6 —
-none of whose five stage-1 checks fails as measured (1-4 on 2026-10-30, 5 on 2026-11-01), three
+whose check 3 now reads `❓ re-run required` while checks 1, 2, 4 and 5 do not fail as measured
+(1, 2 and 4 on 2026-10-30, 5 on 2026-11-01), three
 of the five being perishable and owed a
 re-run at the gate (§11.6 is authoritative; a green there is not a go).** §11.6 check 6 is
 **stage-2-and-later and is not one of these five** (PEN-5195).
@@ -1332,12 +1341,13 @@ is **this row's carrier obligation** — [PEN-5195](https://paperclip.blockcast.
 [PEN-5181](https://paperclip.blockcast.net/PEN/issues/PEN-5181) cannot hold it: it is the stage-0
 carrier and may legitimately close on `2026-11-05`, before stage 1 has started.
 
-**None of the five stage-1 checks fails as measured — checks 1-4 on 2026-10-30, check 5 on
-2026-11-01. ⛔ That is NOT a stage-1 go, and this row must not be read or cited as one.** Three
+**Check 3 reads `❓ re-run required` under the two-control criterion, so the five are NOT all green.
+Checks 1, 2, 4 and 5 do not fail as measured — 1, 2 and 4 on 2026-10-30, check 5 on 2026-11-01.
+⛔ That is NOT a stage-1 go, and this row must not be read or cited as one.** Three
 things still stand between this table and a start, and the first of them is unconditional:
 
 1. **§11.3's date floor governs and is not satisfied.** Stage 0 is `2026-11-05`; stage 1 is earliest
-   `2026-11-06`. Five green checks do not move that by a day. The checks are a
+   `2026-11-06`. Green checks do not move that by a day. The checks are a
    *necessary* condition that §11.3's condition 2 names — never a sufficient one.
 2. **Checks 3, 4 and 5 are perishable, and this row is the measurement that proves it.** Checks 3
    and 4 are point-in-time reads of a live fleet; check 5 is a point-in-time read of `master`, which
