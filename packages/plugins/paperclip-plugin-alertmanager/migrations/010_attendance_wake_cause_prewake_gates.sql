@@ -35,8 +35,8 @@
 -- `pause_reason <> 'budget'` — an operator pause, whose own `reason` says so.
 -- Coding that one `budget.blocked` makes `wake_cause` read "budget" for an
 -- administrative pause. NULL meant "not recorded"; a CONFIDENTLY WRONG cause is
--- worse for triage than NULL, which would have inverted this column's whole
--- purpose. The block now carries a `kind: 'budget' | 'paused'` discriminator
+-- worse for triage than NULL, which would have inverted the whole purpose
+-- of this column. The block now carries a `kind: 'budget' | 'paused'` discriminator
 -- and the call sites map the `paused` branch to `company.inactive` — which is
 -- also the token `enqueueWakeup` gives that same condition downstream, since it
 -- gates on `company.status <> 'active'` before reaching its own budget gate.
@@ -51,6 +51,16 @@
 -- editing `009` would be inert at best and a load failure at worst, depending
 -- on whether it had already been applied. `008` is the precedent for a
 -- note-only migration.
+--
+-- EDITOR NOTE (PEN-5951): keep an EVEN number of apostrophes in this header, or
+-- avoid them here entirely. The host validator strips quoted literals BEFORE it
+-- strips `--` comments (`stripSqlForKeywordScan` in
+-- server/src/services/plugin-database.ts), so an unpaired apostrophe in this
+-- prose pairs forward with the opening quote of the body literal below and
+-- swallows the COMMENT keyword with it. The statement then normalises to the
+-- empty string and the migration is refused at plugin load with a message about
+-- DDL that says nothing about quoting. That is how this file was first written,
+-- and it reddened CI rather than anything in the diff.
 
 COMMENT ON COLUMN plugin_alertmanager_184163d1ba.alert_attendance_observations.wake_cause IS
   'PEN-6121, extended PEN-6229: the host''s own token for why this wake '
