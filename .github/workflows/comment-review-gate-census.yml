@@ -97,6 +97,41 @@
 #      `summarizeViolations` already publishes per surface, NOT on
 #      `violatingPrs`.
 #
+#   5. And re-arm the RENAME tripwire separately — it does not survive the
+#      remedy either. This job's only red arm is `unclassifiedPrs != 0` below,
+#      and `unclassified` is gated by the SAME wording predicate as the other
+#      two buckets: findPrViolations admits on state and wording before
+#      classifyAuditedContext ever runs, and all five alternatives of
+#      NOT_EVALUATED_DESCRIPTION_PATTERN are `outcome: "not_evaluated"` reasons
+#      this gate emits (:1145, :1275, :1316, :1420, :1599). An OUTCOME-scoped
+#      remedy stops emitting all five, so `unclassified` reads 0 permanently. A
+#      remedy scoped on the `authorIsReviewer` MARKER stops only :1316's
+#      marker-bearing arm — the marker is conditional on
+#      selfAttestedDeferrals === 0 while the string is not — so four of five
+#      keep publishing and the tripwire is degraded rather than dead, onto
+#      populations this file measured at zero live statuses (:1145, :1275)
+#      and this row at ~2% (:1599). Either way it reads 0, and 0 is this
+#      alarm's HEALTHY value, so the signal built to shout "this census went
+#      blind" is silenced by the change that blinds it.
+#      ⛔ Step 2 does not fix that, and must NOT be applied to the whole
+#      predicate. `unclassified` is wording-keyed BY DESIGN: this predicate was
+#      lengthened precisely so a foreign green cannot land there — see the note
+#      on NOT_EVALUATED_DESCRIPTION_PATTERN, "a false rename alarm on a job
+#      that reds is worse than a missed row". A structural predicate has no
+#      wording term, so under an unrecognized name it matches every green in
+#      the repo and the alarm gets muted instead. Re-key the REQUIRED-GATE
+#      admission structurally; keep a wording-keyed admission for the rename
+#      bucket, on wording the remedy does not remove. NAME THAT WORDING, or
+#      this instruction is unsatisfiable under the scope it just asked for: the
+#      remedy withholds the `not_evaluated` OUTCOME and nothing else, so the
+#      `clean` and `deferred_finding` reasons survive it
+#      (pr-comment-review-gate.ts :1430 and :1353 — both template literals, so
+#      key on their invariant fragments) and are the only gate-owned wording a
+#      post-remedy rename detector can key on. One predicate cannot
+#      serve both — this file already knows its two COUNTS must never be
+#      summed, and this is the same non-summability one level down, in the
+#      ADMISSION rather than in the count.
+#
 # A flip onto a blind detector converts a tracked open defect into a silently
 # closed one. That is strictly worse than the reporter posture it replaces, and
 # it is the failure this whole file exists to make impossible.
