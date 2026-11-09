@@ -218,6 +218,50 @@ describe("paperclip MCP tools", () => {
     expect(description).toMatch(/Read the attendance predicate, the `null` meaning, and the status\/assignee precondition on a `triggered` monitor from the paperclipListIssues description/);
   });
 
+  // PEN-6129. The park is the sharpest member of this family, because the hazard is not a
+  // nested key or a surface that lags — it is a NAME that existed on the write route and on
+  // NO read route. `.parkedDisposition` on a GET was a constant `null`: true of a parked row
+  // and an unparked row alike, with `has()` false for both, so the gate every other
+  // description in this file prescribes could not separate the states either. The key now
+  // ships on both read surfaces, and these pin the three things a reader has to be told:
+  // that it reads back, that an ABSENT key (a server predating the fix) is not an answer,
+  // and that non-null is RECORDED rather than ACTIVE.
+  it.each(["paperclipGetIssue", "paperclipListIssues"])(
+    "%s says the park reads back under parkedDisposition and how to read an absent key",
+    (name) => {
+      const { description } = getTool(name);
+      expect(description).toContain("parkedDisposition");
+      // The presence gate, and the reason it is needed here specifically.
+      expect(description).toMatch(/PEN-6129/);
+      expect(description).toMatch(/[Gg]ate on key presence/);
+      // Absent is not an answer — stated as the thing a skewed server does, because that
+      // is the only state in which this key can still mislead.
+      expect(description).toMatch(/ABSENT `parkedDisposition`|a server predating PEN-6129 omits/);
+      // The second misreading the new key makes possible, and the one nothing else warns
+      // about: expiry does not clear the columns.
+      expect(description).toMatch(/NON-NULL MEANS RECORDED, NOT ACTIVE|NON-NULL means a park is RECORDED, not ACTIVE/);
+      // The translation, not just the warning: what to read instead.
+      expect(description).toContain("parkedUntil");
+    },
+  );
+
+  // The write side of the same name. A reader who just parked a row is exactly the reader
+  // at risk, and this field's schema carried no note at all — while its neighbour
+  // `blockedByIssueIds` has carried a write-only warning for a year.
+  it("paperclipUpdateIssue's parkedDisposition names itself the only writable park name and says what to re-read", () => {
+    const tool = getTool("paperclipUpdateIssue");
+    const fieldDescription =
+      (tool.schema.shape.parkedDisposition as { description?: string }).description ?? "";
+    expect(fieldDescription).toContain("ONLY writable park name");
+    // Never verify a park on the write response — the sibling hazard (PEN-5760) that makes
+    // the wrong read feel like the careful one.
+    expect(fieldDescription).toMatch(/DO NOT VERIFY A PARK BY RE-READING THIS WRITE RESPONSE/);
+    expect(fieldDescription).toContain("GET /api/issues/:id");
+    // Both names, so the writer is not sent back to a surface that answers to only one.
+    expect(fieldDescription).toContain("parkedUntil");
+    expect(fieldDescription).toContain("PEN-6129");
+  });
+
   // The shared issue-list `limit` schema (paperclipListIssues, paperclip_search_issues)
   // made the same claim with no caveat, and it is independently measured false:
   // `limit: 1000` returned exactly 1000 rows as a bare array, `offset: 1000` a
