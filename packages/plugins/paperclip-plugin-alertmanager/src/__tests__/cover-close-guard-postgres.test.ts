@@ -42,7 +42,20 @@ async function applyMigrations(pg: PGlite): Promise<void> {
   const files = (await readdir(dir)).filter((f) => f.endsWith(".sql")).sort();
   // Fail loudly if this migration is renamed or dropped: every assertion below
   // is about columns it adds, and without it they would fail far from the cause.
-  expect(files).toContain("010_cover_close_verdict.sql");
+  expect(files).toContain("011_cover_close_verdict.sql");
+  // Two PRs stacked on one base each pick the next free number and each is
+  // green on its own tree, so the collision only exists after both land. The
+  // runner tolerates it -- it keys on the full filename and sorts by it -- so
+  // nothing else in the repo will ever say anything: the numbering guards in
+  // packages/db cover packages/db/src/migrations only. This is the one place
+  // that reads this directory whole, so the check belongs here.
+  const byNumber = new Map<string, string[]>();
+  for (const file of files) {
+    const number = /^(\d+)_/.exec(file)?.[1];
+    expect(number, `${file} does not start with a migration number`).toBeDefined();
+    byNumber.set(number!, [...(byNumber.get(number!) ?? []), file]);
+  }
+  expect([...byNumber.values()].filter((group) => group.length > 1)).toEqual([]);
   await pg.exec(`
     CREATE TABLE IF NOT EXISTS public.companies (id uuid PRIMARY KEY);
     CREATE TABLE IF NOT EXISTS public.issues (id uuid PRIMARY KEY);

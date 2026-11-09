@@ -1,5 +1,21 @@
 -- PEN-6236 — two defects in the `[user-cover]` artifact, one table change.
 --
+-- Numbered 011, not 010, deliberately. This branch and PEN-6229's #3589 were
+-- both stacked on #3556; when that base merged (2026-11-09T07:21:55Z, taking
+-- `009`) each child rebased independently and each took the next free number,
+-- so both claimed `010`. Nothing refuses that: the plugin migration runner
+-- keys the ledger on the FULL filename (`migrationKey = entry.name`, unique on
+-- `(pluginId, migrationKey)`) and orders by `localeCompare` over the full
+-- name, so two `010_*.sql` both apply, in a deterministic but
+-- alphabetical-within-the-number order. The repo's own numbering guards --
+-- `packages/db/src/check-migration-numbering.ts` and
+-- `scripts/check-migration-journal-base.mjs` -- are scoped to
+-- `packages/db/src/migrations` and do not look at plugin directories at all.
+-- `#3589` is the earlier claimant and its `010` is the direct successor to
+-- `009` on the same column, so this one yields. See the assertion in
+-- `src/__tests__/cover-close-guard-postgres.test.ts`, which now fails on any
+-- repeated numeric prefix so the next collision is red rather than silent.
+--
 -- ## Defect A: the cover is cancelled while its source alert is mid-`for:`
 --
 -- `DEFAULT_COVER_CLOSE_HOLD_MINUTES` is 15, and the hold's own design note
