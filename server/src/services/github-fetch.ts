@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { unprocessable } from "../errors.js";
 import {
+  recordGithubApiHeld,
   recordGithubApiRefusal,
   recordGithubApiRequest,
   type GithubApiRefusalReason,
@@ -275,6 +276,24 @@ function countGithubApiAttempt(url: string): void {
 }
 
 /**
+ * Count one call answered by a local rate-limit hold, instead of by GitHub
+ * (PEN-6243). Never throws.
+ *
+ * Guarded for the same reason the attempt counter is, and it matters slightly
+ * more here: this runs on the path taken when the shared installation is
+ * already exhausted, i.e. the one minute an operator is most likely to be
+ * reading these series through. An observation fault must lose the
+ * observation, never the caller's 403.
+ */
+function countGithubApiHeld(url: string, resource: string): void {
+  try {
+    recordGithubApiHeld(resource, classifyGithubApiRoute(url));
+  } catch {
+    // Observation is best-effort; the caller's response is not.
+  }
+}
+
+/**
  * Classify and count one response. Never throws, never alters the response.
  *
  * Wrapped rather than inlined so that a defect in classification — or in the
@@ -374,11 +393,19 @@ export async function ghFetch(url: string, init?: RequestInit): Promise<Response
   // than the default, and the default must still bound a caller that passes none.
   const deadline = AbortSignal.timeout(deadlineMs);
   const signal = init?.signal ? AbortSignal.any([init.signal, deadline]) : deadline;
-  // Held calls never reach GitHub, so they deliberately skip both counters.
+  // A held call never reaches GitHub, so it is deliberately absent from BOTH
+  // counters below: it is not an attempt against GitHub, and the 403 it gets is
+  // not one GitHub issued. It is counted in its own series instead (PEN-6243) --
+  // until that series existed the hold's own work was in no counter anywhere,
+  // which made `paperclip_github_api_refusals_total` read as roughly one refusal
+  // per (credential, budget, reset window) rather than as blocked work.
   const holdKey = rateLimitHoldKey(url, init, inferRateLimitResource(url));
   const hold = rateLimitHolds.get(holdKey);
   if (hold) {
-    if (hold.resetMs > Date.now()) return heldResponse(hold.resetMs, hold.resource);
+    if (hold.resetMs > Date.now()) {
+      countGithubApiHeld(url, hold.resource);
+      return heldResponse(hold.resetMs, hold.resource);
+    }
     rateLimitHolds.delete(holdKey);
   }
   // Before the request leaves, so the denominator counts attempts and keeps
