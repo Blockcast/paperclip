@@ -333,6 +333,162 @@ describe("PATCH /api/agents/:id — agent-scope pinned adapterConfig keys (PEN-6
   });
 });
 
+// PEN-6259. `image` is pinned on the WRITE side only — it is NOT in
+// `AGENT_SCOPE_ONLY_CONFIG_KEYS`, so the heartbeat overlay still honours a
+// lower scope's agent-container image, and it IS in
+// `agentActorUnwritableConfigKeys`, so an agent actor cannot set it on the
+// agent row. These arms pin that split in both directions; harmonising the two
+// sets would break one of them.
+describe("agent-actor write pin on `image` (PEN-6259)", () => {
+  const OPERATOR_IMAGE = "ghcr.io/blockcast/paperclip-agent:operator";
+  const AGENT_CHOSEN_IMAGE = "ghcr.io/attacker/agent:self-chosen";
+
+  // THE REGRESSION. `image` becomes `brokerImage` in job-manifest.ts, which
+  // execs the publish hook with the GitHub push credential at uid 1001, and no
+  // image allowlist exists at any layer.
+  it("refuses an agent setting image on ITSELF", async () => {
+    const app = await createApp(selfAgentActor());
+    const res = await patchAgent(app, { adapterConfig: { image: AGENT_CHOSEN_IMAGE } });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("adapterConfig.image");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  // THE DISCRIMINATING ARM, and the reason `image` is unconditional while the
+  // composition keys are broker-conditional. The refusal set is computed
+  // against the config AS STORED. With the broker off — the whole fleet today
+  // — a broker-conditional `image` would not be in the set here, the write
+  // would land, and an OPERATOR flipping `enableGitHubPublishBroker` later
+  // (D1 stage 1, PEN-6190) would promote the already-stored agent-chosen value
+  // into `brokerImage`. A guard whose condition is set by a later, independent
+  // act is not a guard. Add `image` to BROKERED_POD_COMPOSITION_CONFIG_KEYS
+  // instead and THIS test goes green-to-red.
+  it("refuses image even while the broker is OFF at agent scope", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({ adapterConfig: { model: "stored-model" } }));
+    const app = await createApp(selfAgentActor());
+    const res = await patchAgent(app, { adapterConfig: { image: AGENT_CHOSEN_IMAGE } });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("adapterConfig.image");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM. The boundary moves the write to a board actor; it does not
+  // abolish it. The operator image-bump path does not pass through this route
+  // at all (`services/agent-image-bump.ts` writes in-process), so this is the
+  // only image write the guard can even see.
+  it("allows a BOARD actor to set image", async () => {
+    const app = await createApp(boardActor());
+    const res = await patchAgent(app, { adapterConfig: { image: OPERATOR_IMAGE } });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM. Diff-based, not presence-based: once an agent HAS an image,
+  // a presence test would refuse every subsequent adapterConfig write it makes,
+  // naming a key it never changed (the BLO-32332 shape).
+  it("allows an agent resending image at its stored value", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({
+      adapterConfig: { enableGitHubPublishBroker: true, model: "stored-model", image: OPERATOR_IMAGE },
+    }));
+    const app = await createApp(selfAgentActor());
+    const res = await patchAgent(app, { adapterConfig: { image: OPERATOR_IMAGE, model: "new-model" } });
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  // Removal is the other half, as it is for every key in this set: the adapter
+  // falls back to the server's own image when `image` is absent, so DROPPING a
+  // pinned operator image is a change the agent chose.
+  it("refuses an agent dropping a stored image via replaceAdapterConfig", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({
+      adapterConfig: { enableGitHubPublishBroker: true, model: "stored-model", image: OPERATOR_IMAGE },
+    }));
+    const app = await createApp(selfAgentActor());
+    const res = await patchAgent(app, {
+      replaceAdapterConfig: true,
+      adapterConfig: { enableGitHubPublishBroker: true, model: "stored-model" },
+    });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("adapterConfig.image");
+  });
+
+  it("refuses an agent rolling back to a revision that changes image", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({
+      adapterConfig: { enableGitHubPublishBroker: true, model: "stored-model", image: OPERATOR_IMAGE },
+    }));
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: REVISION_ID,
+      agentId: AGENT_ID,
+      afterConfig: {
+        adapterConfig: {
+          enableGitHubPublishBroker: true,
+          model: "stored-model",
+          image: AGENT_CHOSEN_IMAGE,
+        },
+      },
+    });
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("adapterConfig.image");
+    expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+  });
+
+  // Create/hire carries no stored config, so the diff baseline is `{}` and ANY
+  // supplied `image` is a change — including one identical to the default.
+  // That is the full blast radius of this arm and it is stated rather than
+  // worked around: no agent-authored hire path supplies `image` today.
+  it("refuses an agent hire that supplies image", async () => {
+    mockAccessService.decide.mockImplementation(async (input: any) =>
+      input.action === "agents:create"
+        ? { allowed: true, reason: "allow_grant", explanation: "Granted." }
+        : decideAsAgentWithNoGrants(input));
+    const app = await createApp(selfAgentActor());
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post("/api/companies/company-1/agent-hires").send({
+        name: "Hired",
+        role: "engineer",
+        adapterType: "codex_local",
+        adapterConfig: { image: AGENT_CHOSEN_IMAGE },
+      }));
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("adapterConfig.image");
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM, and the SCOPE decision rather than an oversight. A
+  // model-profile `adapterConfig` is not the object the broker reads its image
+  // from — `buildJobManifest` resolves `brokerImage` off `ctx.agent.adapter
+  // Config`, the agent row verbatim, before any merge. Refusing `image` here
+  // would cost a capability and close no hazard, so `configScope:
+  // "model_profile"` deliberately uses the narrower overlay set. If this turns
+  // red, someone has applied the write-side set uniformly.
+  it("allows an agent setting image on a MODEL PROFILE", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({
+      runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { model: "profile-model" } } } },
+    }));
+    const app = await createApp(selfAgentActor());
+    const res = await patchAgent(app, {
+      runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { model: "profile-model", image: AGENT_CHOSEN_IMAGE } } } },
+    });
+
+    // Asserted on a PROGRESS MARKER as well as the status, for the reason the
+    // hire must-pass arm below records: a bare `not.toBe(403)` passes whether
+    // the guard allowed the write or the request died somewhere past it.
+    // `agentService.update` is the first mocked call after the runtimeConfig
+    // guard, so calling it is positive evidence the guard let this through.
+    expect(res.status).not.toBe(403);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+});
+
 describe("POST /api/agents/:id/config-revisions/:revisionId/rollback (PEN-6188)", () => {
   function reviseTo(adapterConfig: Record<string, unknown>) {
     mockAgentService.getConfigRevision.mockResolvedValue({

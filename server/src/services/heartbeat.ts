@@ -3222,11 +3222,32 @@ const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([
 //
 // The membership rule, so this stays a rule and not a list of incidents: WHEN
 // THE CREDENTIAL IS BROKERED, WHAT CODE RUNS IN THE POD, AT WHAT PRIVILEGE,
-// AND OFF WHICH VOLUME IS AGENT SCOPE'S TO DECIDE. `image` is deliberately NOT
-// here — it is pinned adapter-side for the broker container alone, which is
-// strictly stronger and leaves the agent container's image freely overridable.
+// AND OFF WHICH VOLUME IS AGENT SCOPE'S TO DECIDE.
+//
+// `image` is still deliberately NOT in THIS set — the OVERLAY set — and that
+// half stands: the adapter resolves the broker's image from the agent row
+// alone, allows the agent CONTAINER to diverge on purpose, and ignores rather
+// than throws, so pinning it here would buy nothing and could brick a dispatch.
+//
+// ⛔ But the REASON this comment gave for leaving it out is superseded, and is
+// re-quoted one marked line per line so a grep arrival meets the correction
+// rather than the claim (PEN-6259, 2026-11-09):
+//   SUPERSEDED 2026-11-09: "it is pinned adapter-side for the broker container"
+//   SUPERSEDED 2026-11-09: "alone, which is strictly stronger and leaves the"
+//   SUPERSEDED 2026-11-09: "agent container's image freely overridable."
+// Adapter-side pinning is strictly stronger only against a LOWER scope. It
+// pins the broker to `ctx.agent.adapterConfig.image` — the agent ROW — and
+// PEN-6188 measured that row to be self-writable by the subject agent through
+// `allow_self`. So the point of use pins the broker to a value the constrained
+// principal can choose, which is the one direction that pin cannot cover.
+//
+// The remedy is the WRITE side, not this one: `agentActorUnwritableConfigKeys`
+// below refuses an agent-authored write of `image` on the agent row, while this
+// set keeps deciding only which scope wins at render. Two questions, two sets.
+//
 // Add a key here when it answers the question above and cannot be pinned at
-// the point of use.
+// the point of use. Add it to the write-side set instead when the question it
+// answers is WHO MAY SET IT, not WHICH SCOPE WINS.
 //
 // PEN-5027 adds the third clause and `workspaceVolumeClaim` under it.
 // `buildJobManifest` narrows the shared data volume to read-only and re-mounts
@@ -3308,6 +3329,64 @@ function brokerEnabledAtAgentScope(baseConfig: Record<string, unknown>): boolean
 export function agentScopeOnlyConfigKeysFor(baseConfig: Record<string, unknown>): ReadonlySet<string> {
   if (!brokerEnabledAtAgentScope(baseConfig)) return AGENT_SCOPE_ONLY_CONFIG_KEYS;
   return new Set([...AGENT_SCOPE_ONLY_CONFIG_KEYS, ...BROKERED_POD_COMPOSITION_CONFIG_KEYS]);
+}
+
+// PEN-6259. Keys an AGENT ACTOR may not write on an agent row, over and above
+// the overlay-pinned set — today just `image`.
+//
+// UNCONDITIONAL, deliberately, where the composition keys above are
+// broker-conditional. The conditional form has a write-ordering hole that the
+// overlay form does not: the refusal set is computed against the config AS
+// STORED, so with the broker off (the whole fleet today) `image` would not be
+// in the set, an agent could set it freely, and an OPERATOR flipping
+// `enableGitHubPublishBroker` later — exactly what the D1 rollout does —
+// would promote that already-stored agent-chosen value into `brokerImage`.
+// The pin would be evaluated at a moment when it does not yet apply, against a
+// value that is still there when it does.
+//
+// ⚠ That is NOT a defect in the existing conditional. Computing against the
+// stored config is sound for the composition keys because
+// `enableGitHubPublishBroker` is itself unconditionally pinned, so the AGENT
+// cannot move the conditional's own input. An OPERATOR can, and may — this set
+// is what makes that safe.
+const AGENT_ACTOR_UNWRITABLE_EXTRA_CONFIG_KEYS = new Set([
+  // Becomes the broker container's image (`brokerImage`, job-manifest.ts),
+  // which execs the publish hook with the GitHub push credential in its
+  // environment at uid 1001. No image allowlist exists at any layer, so a
+  // self-written `image` on a brokered agent is a choice of what code holds
+  // the credential.
+  "image",
+]);
+
+/**
+ * The key set an AGENT-authenticated write of an agent row may not change:
+ * `agentScopeOnlyConfigKeysFor` plus the write-side-only keys above.
+ *
+ * Defined in terms of that function rather than beside it, so there is still
+ * ONE list to maintain — the anti-drift property the overlay set's own comment
+ * argues for ("two copies would be exactly as complete as the less recently
+ * edited one") is preserved, not forked.
+ *
+ * The two sides answer different questions and `image` is the first key where
+ * the answers differ:
+ *   - OVERLAY (`agentScopeOnlyConfigKeysFor`): which SCOPE wins at render?
+ *   - WRITE  (this): may this PRINCIPAL set the agent row at all?
+ * The write side is strictly stronger than the overlay side, always — so this
+ * is a superset by construction and must never be the smaller of the two.
+ *
+ * ⚠ Scope, stated because it is a decision and not an oversight: this is for
+ * the TOP-LEVEL agent `adapterConfig` only. A model-profile `adapterConfig`
+ * does not feed `brokerImage` — the adapter reads the broker's image off the
+ * agent row verbatim — so refusing `image` there would cost a capability and
+ * close no hazard. `routes/agents.ts` passes `configScope` to say which it has.
+ */
+export function agentActorUnwritableConfigKeys(
+  baseConfig: Record<string, unknown>,
+): ReadonlySet<string> {
+  return new Set([
+    ...agentScopeOnlyConfigKeysFor(baseConfig),
+    ...AGENT_ACTOR_UNWRITABLE_EXTRA_CONFIG_KEYS,
+  ]);
 }
 
 /**
