@@ -7,6 +7,7 @@
     "noEmit": true
   },
   "include": [
+    "src/__tests__/activity-log-lone-surrogate.test.ts",
     "src/__tests__/github-fetch-rate-limit-hold.test.ts",
     "src/__tests__/issue-comment-effect-outbox-routes.test.ts",
     "src/__tests__/open-pull-requests-at-head.test.ts",
