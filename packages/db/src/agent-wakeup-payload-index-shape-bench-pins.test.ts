@@ -177,6 +177,13 @@ describe("agent_wakeup_requests payload index-shape bench", () => {
       block,
       "the docblock no longer states that PEN6104_ISSUES is NOT confirmed by " +
         "the recorded figures",
-    ).toMatch(/NOT confirmed[\s\S]*?`PEN6104_ISSUES`/);
+      // ⛔ `[^.]*`, NOT `[\s\S]*?`. This pin exists to catch the retracted
+      // claim being re-inflated, and the retracted argument is QUOTED a few
+      // lines below the NOT-confirmed list -- quoting it is correct, but it
+      // means a cross-sentence match reaches that quote's own
+      // `PEN6104_ISSUES` and passes on a docblock that no longer lists the
+      // knob as unconfirmed. Confining the match to one sentence is what
+      // makes this assertion discriminate.
+    ).toMatch(/NOT confirmed[^.]*`PEN6104_ISSUES`/);
   });
 });
