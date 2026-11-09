@@ -115,8 +115,10 @@ export const DEFAULT_COVER_DEDUP_WINDOW_MINUTES = 120;
 export const DEFAULT_COVER_CLOSE_HOLD_MINUTES = 15;
 
 /**
- * PEN-6236 — the bound on how long a `pending` (or unreadable) Prometheus may
- * hold a cover's close open, measured from the newest member `resolved_at`.
+ * PEN-6236 — the bound on how long a LIVE (or unreadable) Prometheus source
+ * may hold a cover's close open, measured from the newest member
+ * `resolved_at`. "Live" is any `ALERTS` series for the alertname, `pending` or
+ * `firing`: both mean the condition has not cleared.
  *
  * The hold above cannot be the answer to defect A, and the reason is a
  * measurement rather than a preference: for the guard to work by waiting, the
@@ -136,16 +138,16 @@ export const DEFAULT_COVER_CLOSE_HOLD_MINUTES = 15;
  * It deliberately does NOT cover the 72 h tail — a cover frozen for three days
  * on an unreadable endpoint is worse than one closed with a named verdict —
  * so an estate that routes very long-`for:` rules into covers should raise
- * `coverPendingRecheckLimitMinutes` knowingly.
+ * `coverLivenessRecheckLimitMinutes` knowingly.
  */
-export const DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES = 240;
+export const DEFAULT_COVER_LIVENESS_RECHECK_LIMIT_MINUTES = 240;
 
 /**
- * Per-call cap on the Prometheus pending read, covering headers AND body.
+ * Per-call cap on the Prometheus source-state read, covering headers AND body.
  * Matches `ALERTMANAGER_READ_TIMEOUT_MS` for the same reason: the close pass
  * walks ready covers sequentially, so a reachable-but-hanging endpoint must
  * cost it seconds rather than the host fetch default. Combined with
- * `createSweepPendingReader`'s transport short-circuit, one hanging Prometheus
+ * `createSweepSourceStateReader`'s transport short-circuit, one hanging Prometheus
  * costs a pass at most one of these however many covers are ready.
  */
 export const DEFAULT_PROMETHEUS_READ_TIMEOUT_MS = 5_000;
@@ -371,7 +373,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
   coverDedupWindowMinutes: DEFAULT_COVER_DEDUP_WINDOW_MINUTES,
   coverCloseHoldMinutes: DEFAULT_COVER_CLOSE_HOLD_MINUTES,
-  coverPendingRecheckLimitMinutes: DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES,
+  coverLivenessRecheckLimitMinutes: DEFAULT_COVER_LIVENESS_RECHECK_LIMIT_MINUTES,
 };
 
 /**

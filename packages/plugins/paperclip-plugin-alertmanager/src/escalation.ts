@@ -4,11 +4,11 @@ import { isNonHumanUserSentinel } from "@paperclipai/shared";
 import {
   DEFAULT_COVER_CLOSE_HOLD_MINUTES,
   DEFAULT_COVER_DEDUP_WINDOW_MINUTES,
-  DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES,
+  DEFAULT_COVER_LIVENESS_RECHECK_LIMIT_MINUTES,
   DEFAULT_ESCALATION_DEADLINE_MINUTES,
   alertStateRef,
 } from "./constants.js";
-import { createSweepPendingReader, hasPrometheusEndpoint, type PendingReader } from "./prometheus-pending.js";
+import { createSweepSourceStateReader, hasPrometheusEndpoint, type SourceStateReader } from "./prometheus-source-state.js";
 import { UNDELIVERED_WAKE_OUTCOMES, type WakeOutcome, recordAttendanceObservation } from "./attendance-record.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
@@ -477,6 +477,43 @@ async function upsertOpenMember(ctx: PluginContext, coverIssueId: string, alertI
  *     (BLO-16120) — not a free-form comment — so resolving any one member
  *     never has to guess whether siblings are still firing.
  */
+/**
+ * `createdAt` as a sortable number.
+ *
+ * Typed `Date` by the SDK and delivered as an ISO string in production — the
+ * worker boundary is JSON-RPC, the same split `hasArmedMonitor` documents. A
+ * comparator written against `Date` alone sorts production's strings as `NaN`,
+ * which leaves the array untouched and silently restores the ordering bug this
+ * exists to fix. Unparseable stamps sort oldest, so they can never displace a
+ * comment whose time is known from the carried set.
+ */
+function commentTime(comment: { createdAt?: Date | string | null }): number {
+  const raw = comment.createdAt;
+  if (raw === null || raw === undefined) return 0;
+  const at = raw instanceof Date ? raw.getTime() : Date.parse(String(raw));
+  return Number.isFinite(at) ? at : 0;
+}
+
+/**
+ * Defuses agent mentions in text carried from another row.
+ *
+ * `[@Name](agent://<uuid>)` is this platform's wake primitive: there is one
+ * mention syntax and it carries no courtesy register, so copying a
+ * predecessor's comment verbatim into a new issue description would re-assert
+ * every mention it contained — waking seats who were addressed about a cover
+ * that has already closed, from a row none of them has anything to do with.
+ * Reduced to the plain label, which is what a CITATION should have been in the
+ * first place.
+ *
+ * Precautionary rather than a measured defect: whether descriptions are
+ * mention-parsed on create is the host's business and may change. The cost of
+ * being wrong in the other direction is spurious wakes, which is the whole
+ * failure class PEN-2918 is about, so this does not wait for a measurement.
+ */
+function defuseAgentMentions(body: string): string {
+  return body.replace(/\[([^\]]*)\]\(agent:\/\/[^)]*\)/g, "$1");
+}
+
 /** Upper bounds on the carried excerpt — see `previousCoverCarryOver`. */
 const CARRY_OVER_MAX_COMMENTS = 3;
 const CARRY_OVER_MAX_CHARS = 1_800;
@@ -546,8 +583,21 @@ async function previousCoverCarryOver(
       + `. Anything decided there still applies unless it is superseded here — the ladder restarted, the ask did not.`;
 
     const comments = await ctx.issues.listComments(previous.cover_issue_id, companyId);
+    // ⚠ SORT, DO NOT TRUST THE HOST'S ORDER. `ctx.issues.listComments` reaches
+    // `issues.listComments(issueId)` with no options, and that function
+    // DEFAULTS TO `order: "desc"` — so this array arrives NEWEST-FIRST. An
+    // earlier draft took `.slice(-N)` of it, which is the N OLDEST, and
+    // rendered the first remarks on the predecessor while dropping exactly the
+    // later executable dispositions that defect B exists to carry. It passed
+    // its test only because the mock seeded ascending order, which is the
+    // shape production never sends.
+    //
+    // Sorting explicitly rather than reversing makes this independent of that
+    // default: whichever way the host orders the page, the N carried here are
+    // the N most recent, rendered oldest-first so the section reads forwards.
     const furnished = comments
       .filter((c) => !c.deletedAt && c.authorType !== "system" && !c.body.startsWith("[alert-escalation]"))
+      .sort((a, b) => commentTime(a) - commentTime(b))
       .slice(-CARRY_OVER_MAX_COMMENTS);
     if (furnished.length === 0) {
       return `${header}\n\n${label} carried no furnished comment of its own, so there is nothing to quote here.`;
@@ -559,9 +609,10 @@ async function previousCoverCarryOver(
       // wrong about which shape arrives is how a guard passes its tests and is
       // inert in production, so both are handled.
       const at = c.createdAt instanceof Date ? c.createdAt.toISOString() : String(c.createdAt ?? "");
-      const body = c.body.length > CARRY_OVER_MAX_CHARS
-        ? `${c.body.slice(0, CARRY_OVER_MAX_CHARS)}\n\n… truncated; the full comment is on ${label}.`
-        : c.body;
+      const safe = defuseAgentMentions(c.body);
+      const body = safe.length > CARRY_OVER_MAX_CHARS
+        ? `${safe.slice(0, CARRY_OVER_MAX_CHARS)}\n\n… truncated; the full comment is on ${label}.`
+        : safe;
       return `**${at}**\n\n${body.split("\n").map((line) => `> ${line}`).join("\n")}`;
     }).join("\n\n");
     return `${header}\n\n### Carried from ${label} (${furnished.length} most recent furnished comment(s))\n\n${quoted}`;
@@ -770,7 +821,7 @@ async function closeCoverIfEligible(
  * that window the cover closes with a verdict naming which of the two it was.
  * A deferral is therefore strictly bounded and cannot become the unbounded
  * freeze that a longer hold would be — see
- * `DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES`.
+ * `DEFAULT_COVER_LIVENESS_RECHECK_LIMIT_MINUTES`.
  */
 async function decideCoverClose(
   ctx: PluginContext,
@@ -783,7 +834,7 @@ async function decideCoverClose(
   // Prometheus configured must issue exactly the queries it issued before this
   // change, so "behaviour-neutral until configured" is a property of the call
   // graph rather than of the answers.
-  if (!guard || !guard.configured) return { verdict: "pending_check_unconfigured", detail: null };
+  if (!guard || !guard.configured) return { verdict: "liveness_check_unconfigured", detail: null };
   const [row] = await ctx.db.query<{ alertname: string | null; eligible: boolean; within_recheck: boolean }>(
     `SELECT c.alertname,
             NOT EXISTS (
@@ -805,32 +856,35 @@ async function decideCoverClose(
   if (!row || !row.eligible) return null;
   if (!row.alertname) return { verdict: "alertname_unknown", detail: null };
 
-  const pending = await guard.readPending(row.alertname);
-  if (pending.state === "not-pending") {
-    return { verdict: "source_cleared", detail: `Read at ${pending.readAt}.` };
+  const sourceState = await guard.readSourceState(row.alertname);
+  if (sourceState.state === "cleared") {
+    return { verdict: "source_cleared", detail: `Read at ${sourceState.readAt}.` };
   }
   if (row.within_recheck) {
     // Still inside the bounded window: hold the cover open and say so. This is
     // the whole of defect A — today the cover is cancelled here, underneath a
     // rule that is re-accumulating `for:` and cannot re-fire in time to reopen
-    // membership.
+    // membership. It also covers the inverse race: a rule that has ALREADY
+    // re-fired in Prometheus but whose webhook has not landed, where
+    // `reopenOpenCoverMembership` has not run and nothing else would stop the
+    // close.
     await ctx.db.execute(
       `UPDATE ${q(ns, COVERS_TABLE)}
-          SET pending_deferral_count = pending_deferral_count + 1,
-              last_pending_deferral_at = now(), updated_at = now()
+          SET close_deferral_count = close_deferral_count + 1,
+              last_close_deferral_at = now(), updated_at = now()
         WHERE cover_issue_id = $1 AND closing_claimed_at IS NULL AND cancelled_at IS NULL`,
       [coverIssueId],
     );
     ctx.logger.info(
-      pending.state === "pending"
-        ? `alert-escalation: holding cover ${coverIssueId} open; source alertname ${row.alertname} is pending in Prometheus (${pending.detail})`
-        : `alert-escalation: holding cover ${coverIssueId} open; the Prometheus pending check for ${row.alertname} was inconclusive (${pending.reason})`,
+      sourceState.state === "live"
+        ? `alert-escalation: holding cover ${coverIssueId} open; source alertname ${row.alertname} is still live in Prometheus (${sourceState.detail})`
+        : `alert-escalation: holding cover ${coverIssueId} open; the Prometheus source-state check for ${row.alertname} was inconclusive (${sourceState.reason})`,
     );
     return null;
   }
-  return pending.state === "pending"
-    ? { verdict: "pending_recheck_expired", detail: `Last read at ${pending.readAt}: ${pending.detail}.` }
-    : { verdict: "pending_check_unavailable", detail: `Reason: ${pending.reason}.` };
+  return sourceState.state === "live"
+    ? { verdict: "source_live_recheck_expired", detail: `Last read at ${sourceState.readAt}: ${sourceState.detail}.` }
+    : { verdict: "liveness_check_unavailable", detail: `Reason: ${sourceState.reason}.` };
 }
 
 /**
@@ -1030,11 +1084,11 @@ export function coverCloseHoldMinutes(config: AlertmanagerPluginConfig): number 
  * "defer" would silently delay every close on such an instance by up to
  * `recheckLimitMinutes`. With the flag, an unconfigured instance closes
  * exactly when it does today and records the verdict
- * `pending_check_unconfigured` — so this change is behaviour-neutral until an
+ * `liveness_check_unconfigured` — so this change is behaviour-neutral until an
  * operator points it at a Prometheus.
  */
 export interface CoverCloseGuard {
-  readPending: PendingReader;
+  readSourceState: SourceStateReader;
   recheckLimitMinutes: number;
   configured: boolean;
 }
@@ -1045,8 +1099,8 @@ export function buildCoverCloseGuard(
   logger: PluginContext["logger"],
 ): CoverCloseGuard {
   return {
-    readPending: createSweepPendingReader(config, now, logger),
-    recheckLimitMinutes: config.coverPendingRecheckLimitMinutes ?? DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES,
+    readSourceState: createSweepSourceStateReader(config, now, logger),
+    recheckLimitMinutes: config.coverLivenessRecheckLimitMinutes ?? DEFAULT_COVER_LIVENESS_RECHECK_LIMIT_MINUTES,
     configured: hasPrometheusEndpoint(config),
   };
 }
@@ -1062,14 +1116,14 @@ export function buildCoverCloseGuard(
  * as clears is making exactly the error this vocabulary exists to expose.
  */
 export type CoverCloseVerdict =
-  /** Prometheus was read and reported no `pending` series for the alertname. */
+  /** Prometheus was read and carried NO `ALERTS` series for the alertname at all. */
   | "source_cleared"
   /** No `prometheusApiUrl` on this instance; the check is not available at all. */
-  | "pending_check_unconfigured"
+  | "liveness_check_unconfigured"
   /** Configured but unreadable past the recheck window; closed without the check. */
-  | "pending_check_unavailable"
-  /** The source stayed `pending` past the recheck window; closed anyway, bounded. */
-  | "pending_recheck_expired"
+  | "liveness_check_unavailable"
+  /** The source was still `pending` or `firing` past the recheck window; closed anyway, bounded. */
+  | "source_live_recheck_expired"
   /** The cover carries no alertname (a pre-migration row whose fingerprint did not parse). */
   | "alertname_unknown";
 
@@ -1078,13 +1132,13 @@ function closeVerdictLine(verdict: CoverCloseVerdict, detail: string | null): st
   const suffix = detail ? ` ${detail}` : "";
   switch (verdict) {
     case "source_cleared":
-      return `Close verdict: \`source_cleared\` — Prometheus reports no \`pending\` series for this cover's source alertname, so the rule is not re-accumulating \`for:\`.${suffix}`;
-    case "pending_check_unconfigured":
-      return `⚠ Close verdict: \`pending_check_unconfigured\` — no \`prometheusApiUrl\` is configured, so nothing checked whether the source rule is mid-\`for:\`. Alertmanager cannot answer that question (it has no \`pending\` state), so the absence of an active alert is NOT evidence the condition cleared.${suffix}`;
-    case "pending_check_unavailable":
-      return `⚠ Close verdict: \`pending_check_unavailable\` — the Prometheus pending check could not be completed within the recheck window, and the cover was closed without it. The condition may still hold.${suffix}`;
-    case "pending_recheck_expired":
-      return `⚠ Close verdict: \`pending_recheck_expired\` — the source alertname was still \`pending\` in Prometheus when the recheck window expired, so this close is BOUNDED rather than evidenced: the condition may well still hold.${suffix}`;
+      return `Close verdict: \`source_cleared\` — Prometheus carries no \`ALERTS\` series for this cover's source alertname in any state, so the rule is neither firing nor re-accumulating \`for:\`.${suffix}`;
+    case "liveness_check_unconfigured":
+      return `⚠ Close verdict: \`liveness_check_unconfigured\` — no \`prometheusApiUrl\` is configured, so nothing checked whether the source rule is still live. Alertmanager cannot answer that question (it has no \`pending\` state), so the absence of an active alert is NOT evidence the condition cleared.${suffix}`;
+    case "liveness_check_unavailable":
+      return `⚠ Close verdict: \`liveness_check_unavailable\` — the Prometheus source-state check could not be completed within the recheck window, and the cover was closed without it. The condition may still hold.${suffix}`;
+    case "source_live_recheck_expired":
+      return `⚠ Close verdict: \`source_live_recheck_expired\` — the source alertname still had a live \`ALERTS\` series in Prometheus when the recheck window expired, so this close is BOUNDED rather than evidenced: the condition may well still hold.${suffix}`;
     case "alertname_unknown":
       return `⚠ Close verdict: \`alertname_unknown\` — this cover predates the alertname column and its dedup fingerprint did not parse, so the pending check could not be addressed to anything.${suffix}`;
   }
