@@ -21,9 +21,10 @@
 --
 -- `alertname` is what lets the close path ask Prometheus the one question
 -- Alertmanager cannot answer. Alertmanager has no representation of `pending`;
--- only Prometheus does, as `ALERTS{alertstate="pending"}`. Every liveness path
--- in this plugin reads `/api/v2/alerts` and nothing else, so the close was
--- blind to exactly the state that makes it wrong.
+-- Prometheus does, and its `ALERTS` series carries both `pending` and
+-- `firing`, so presence in either state means the condition has not cleared.
+-- Every liveness path in this plugin reads `/api/v2/alerts` and nothing else,
+-- so the close was blind to exactly the state that makes it wrong.
 --
 -- The column is carried on the cover rather than parsed out of
 -- `dedup_fingerprint` at read time. Every member of a cover shares one
@@ -55,8 +56,8 @@ ALTER TABLE plugin_alertmanager_184163d1ba.alert_escalation_covers
   ADD COLUMN alertname text,
   ADD COLUMN close_verdict text,
   ADD COLUMN close_verdict_detail text,
-  ADD COLUMN pending_deferral_count integer NOT NULL DEFAULT 0,
-  ADD COLUMN last_pending_deferral_at timestamptz;
+  ADD COLUMN close_deferral_count integer NOT NULL DEFAULT 0,
+  ADD COLUMN last_close_deferral_at timestamptz;
 
 -- Backfill from the dedup fingerprint, whose format is `cover:<alertname>:<n>`
 -- where `<n>` is the window bucket. The `.*` is greedy and the `[0-9]+$` is

@@ -24,7 +24,7 @@ import { PGlite } from "@electric-sql/pglite";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { recordSourceResolvedAndCloseCovers, type CoverCloseGuard } from "../escalation.js";
-import type { PrometheusPendingState } from "../prometheus-pending.js";
+import type { SourceAlertState } from "../prometheus-source-state.js";
 
 const NAMESPACE = "plugin_alertmanager_184163d1ba";
 const COVERS = `${NAMESPACE}.alert_escalation_covers`;
@@ -73,13 +73,13 @@ function realCtx(pg: PGlite) {
   return { ctx: mocks as unknown as PluginContext, mocks };
 }
 
-const guardOf = (answer: PrometheusPendingState, recheckLimitMinutes = 240): CoverCloseGuard => ({
-  readPending: async () => answer,
+const guardOf = (answer: SourceAlertState, recheckLimitMinutes = 240): CoverCloseGuard => ({
+  readSourceState: async () => answer,
   recheckLimitMinutes,
   configured: true,
 });
-const PENDING: PrometheusPendingState = { state: "pending", readAt: "2026-11-09T06:00:00.000Z", detail: "1 series pending" };
-const NOT_PENDING: PrometheusPendingState = { state: "not-pending", readAt: "2026-11-09T06:00:00.000Z" };
+const LIVE: SourceAlertState = { state: "live", readAt: "2026-11-09T06:00:00.000Z", detail: "1 series, alertstate=pending" };
+const CLEARED: SourceAlertState = { state: "cleared", readAt: "2026-11-09T06:00:00.000Z" };
 
 /** A cover whose only member resolved `minutesAgo` ago. */
 async function seed(minutesAgo: number, alertname: string | null = ALERTNAME): Promise<void> {
@@ -112,19 +112,19 @@ describe("PEN-6236 close guard, real SQL", () => {
   it("refuses the claim and records the deferral while the source is pending past the hold", async () => {
     await seed(20);
     const { ctx, mocks } = realCtx(db);
-    await recordSourceResolvedAndCloseCovers(ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(PENDING));
+    await recordSourceResolvedAndCloseCovers(ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(LIVE));
     const row = await coverRow();
     expect(row.closing_claimed_at).toBeNull();
     expect(row.cancelled_at).toBeNull();
-    expect(Number(row.pending_deferral_count)).toBe(1);
-    expect(row.last_pending_deferral_at).not.toBeNull();
+    expect(Number(row.close_deferral_count)).toBe(1);
+    expect(row.last_close_deferral_at).not.toBeNull();
     expect(mocks.issues.update).not.toHaveBeenCalled();
   });
 
   it("claims and stamps source_cleared when the source is not pending", async () => {
     await seed(20);
     const { ctx, mocks } = realCtx(db);
-    await recordSourceResolvedAndCloseCovers(ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(NOT_PENDING));
+    await recordSourceResolvedAndCloseCovers(ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(CLEARED));
     const row = await coverRow();
     expect(row.closing_claimed_at).not.toBeNull();
     expect(row.cancelled_at).not.toBeNull();
@@ -136,41 +136,41 @@ describe("PEN-6236 close guard, real SQL", () => {
 
   it("the recheck window really is hold + limit: 20m resolved defers at limit 240, 300m resolved does not", async () => {
     await seed(20);
-    await recordSourceResolvedAndCloseCovers(realCtx(db).ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(PENDING, 240));
+    await recordSourceResolvedAndCloseCovers(realCtx(db).ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(LIVE, 240));
     expect((await coverRow()).close_verdict).toBeNull();
 
     await db.exec(`DELETE FROM ${MEMBERS}; DELETE FROM ${COVERS};`);
     await seed(300);
-    await recordSourceResolvedAndCloseCovers(realCtx(db).ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(PENDING, 240));
-    expect((await coverRow()).close_verdict).toBe("pending_recheck_expired");
+    await recordSourceResolvedAndCloseCovers(realCtx(db).ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(LIVE, 240));
+    expect((await coverRow()).close_verdict).toBe("source_live_recheck_expired");
   });
 
   it("the boundary is the configured limit, not a constant: a short limit expires the same cover", async () => {
     await seed(20);
     // hold 15 + limit 1 = 16m < 20m resolved ⇒ outside the window already.
-    await recordSourceResolvedAndCloseCovers(realCtx(db).ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(PENDING, 1));
-    expect((await coverRow()).close_verdict).toBe("pending_recheck_expired");
+    await recordSourceResolvedAndCloseCovers(realCtx(db).ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(LIVE, 1));
+    expect((await coverRow()).close_verdict).toBe("source_live_recheck_expired");
   });
 
   it("an unresolved member blocks the close whatever Prometheus says", async () => {
     await seed(20);
     await db.query(`UPDATE ${MEMBERS} SET resolved_at = NULL`);
     const { ctx, mocks } = realCtx(db);
-    await recordSourceResolvedAndCloseCovers(ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(NOT_PENDING));
+    await recordSourceResolvedAndCloseCovers(ctx, COMPANY, ALERT, HOLD_MINUTES, guardOf(CLEARED));
     // the resolve cascade re-marks THIS member, but it is the only one, so the
     // close is decided on the hold — not yet elapsed, so nothing is claimed.
     const row = await coverRow();
     expect(row.closing_claimed_at).toBeNull();
-    expect(Number(row.pending_deferral_count)).toBe(0);
+    expect(Number(row.close_deferral_count)).toBe(0);
     expect(mocks.issues.update).not.toHaveBeenCalled();
   });
 
   it("a NULL alertname closes as alertname_unknown and never addresses a read", async () => {
     await seed(20, null);
-    const readPending = vi.fn(async () => PENDING);
-    await recordSourceResolvedAndCloseCovers(realCtx(db).ctx, COMPANY, ALERT, HOLD_MINUTES, { readPending, recheckLimitMinutes: 240, configured: true });
+    const readSourceState = vi.fn(async () => LIVE);
+    await recordSourceResolvedAndCloseCovers(realCtx(db).ctx, COMPANY, ALERT, HOLD_MINUTES, { readSourceState, recheckLimitMinutes: 240, configured: true });
     expect((await coverRow()).close_verdict).toBe("alertname_unknown");
-    expect(readPending).not.toHaveBeenCalled();
+    expect(readSourceState).not.toHaveBeenCalled();
   });
 
   it("migration 009's backfill regex recovers the alertname from every real fingerprint shape", async () => {
@@ -197,14 +197,14 @@ describe("PEN-6236 close guard, real SQL", () => {
     const { rows } = await db.query<{ column_name: string; is_nullable: string; column_default: string | null }>(
       `SELECT column_name, is_nullable, column_default FROM information_schema.columns
         WHERE table_schema = $1 AND table_name = 'alert_escalation_covers'
-          AND column_name IN ('alertname','close_verdict','close_verdict_detail','pending_deferral_count','last_pending_deferral_at')
+          AND column_name IN ('alertname','close_verdict','close_verdict_detail','close_deferral_count','last_close_deferral_at')
         ORDER BY column_name`,
       [NAMESPACE],
     );
     expect(rows.map((r) => r.column_name)).toEqual([
-      "alertname", "close_verdict", "close_verdict_detail", "last_pending_deferral_at", "pending_deferral_count",
+      "alertname", "close_deferral_count", "close_verdict", "close_verdict_detail", "last_close_deferral_at",
     ]);
-    const count = rows.find((r) => r.column_name === "pending_deferral_count")!;
+    const count = rows.find((r) => r.column_name === "close_deferral_count")!;
     // NOT NULL DEFAULT 0 — the deferral UPDATE increments in place and would
     // produce NULL on an existing row if either were missing.
     expect(count.is_nullable).toBe("NO");

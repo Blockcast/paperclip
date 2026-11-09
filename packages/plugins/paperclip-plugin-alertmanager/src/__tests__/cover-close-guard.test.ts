@@ -12,11 +12,11 @@ import {
   type CoverCloseGuard,
 } from "../escalation.js";
 import {
-  createSweepPendingReader,
+  createSweepSourceStateReader,
   hasPrometheusEndpoint,
   resolvePrometheusApiUrl,
-  type PrometheusPendingState,
-} from "../prometheus-pending.js";
+  type SourceAlertState,
+} from "../prometheus-source-state.js";
 import type { AlertmanagerPluginConfig, AlertStateRecord } from "../types.js";
 
 /**
@@ -68,8 +68,8 @@ interface CoverRow {
   cancelled_at: string | null;
   close_verdict: string | null;
   close_verdict_detail: string | null;
-  pending_deferral_count: number;
-  last_pending_deferral_at: string | null;
+  close_deferral_count: number;
+  last_close_deferral_at: string | null;
 }
 
 function buildStore() {
@@ -99,12 +99,12 @@ function buildStore() {
     namespace: "ns",
     async execute(sql: string, params: unknown[] = []) {
       const text = sql.replace(/\s+/g, " ").trim();
-      if (text.includes("pending_deferral_count = pending_deferral_count + 1")) {
+      if (text.includes("close_deferral_count = close_deferral_count + 1")) {
         const [coverIssueId] = params as [string];
         const c = covers.get(coverIssueId);
         if (!c || c.closing_claimed_at !== null || c.cancelled_at !== null) return { rowCount: 0 };
-        c.pending_deferral_count += 1;
-        c.last_pending_deferral_at = new Date().toISOString();
+        c.close_deferral_count += 1;
+        c.last_close_deferral_at = new Date().toISOString();
         return { rowCount: 1 };
       }
       if (text.includes("ON CONFLICT (cover_issue_id, alert_issue_id)")) {
@@ -125,7 +125,7 @@ function buildStore() {
           cover_issue_id: coverIssueId, company_id: companyId, dedup_fingerprint: fingerprint,
           alertname: alertname ?? null, closing_claimed_at: null, resolution_comment_posted_at: null,
           cancelled_at: null, close_verdict: null, close_verdict_detail: null,
-          pending_deferral_count: 0, last_pending_deferral_at: null,
+          close_deferral_count: 0, last_close_deferral_at: null,
         });
         return { rowCount: 1 };
       }
@@ -245,7 +245,7 @@ function seedResolvedCover(store: ReturnType<typeof buildStore>, resolvedMinutes
   store.covers.set("cover-1", {
     cover_issue_id: "cover-1", company_id: "company-1", dedup_fingerprint: `cover:${ALERTNAME}:1`,
     alertname, closing_claimed_at: null, resolution_comment_posted_at: null, cancelled_at: null,
-    close_verdict: null, close_verdict_detail: null, pending_deferral_count: 0, last_pending_deferral_at: null,
+    close_verdict: null, close_verdict_detail: null, close_deferral_count: 0, last_close_deferral_at: null,
   });
   store.members.set("cover-1:alert-A", {
     id: randomUUID(), cover_issue_id: "cover-1", alert_issue_id: "alert-A",
@@ -273,15 +273,15 @@ function coverCtx(store: ReturnType<typeof buildStore>, comments: unknown[] = []
 }
 
 /** A guard whose Prometheus answer is fixed, so the close decision is the only variable. */
-const stubGuard = (answer: PrometheusPendingState, recheckLimitMinutes = 240): CoverCloseGuard => ({
-  readPending: async () => answer,
+const stubGuard = (answer: SourceAlertState, recheckLimitMinutes = 240): CoverCloseGuard => ({
+  readSourceState: async () => answer,
   recheckLimitMinutes,
   configured: true,
 });
 
-const PENDING: PrometheusPendingState = { state: "pending", readAt: "2026-11-09T06:00:00.000Z", detail: "1 series pending" };
-const NOT_PENDING: PrometheusPendingState = { state: "not-pending", readAt: "2026-11-09T06:00:00.000Z" };
-const UNKNOWN: PrometheusPendingState = { state: "unknown", reason: "the Prometheus request failed; the error is in the plugin log", unreachable: true };
+const LIVE: SourceAlertState = { state: "live", readAt: "2026-11-09T06:00:00.000Z", detail: "1 series, alertstate=pending" };
+const CLEARED: SourceAlertState = { state: "cleared", readAt: "2026-11-09T06:00:00.000Z" };
+const UNKNOWN: SourceAlertState = { state: "unknown", reason: "the Prometheus request failed; the error is in the plugin log", unreachable: true };
 
 // ---------------------------------------------------------------------------
 // Defect A
@@ -298,7 +298,7 @@ describe(`PEN-6236 defect A — the close is refused while the source rule re-ac
     expect(SOURCE_FOR_SECONDS).toBeGreaterThan(HOLD_MINUTES * 60);
     const { ctx, mocks } = coverCtx(store);
 
-    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(PENDING));
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(LIVE));
 
     const cover = store.covers.get("cover-1")!;
     expect(cover.closing_claimed_at).toBeNull();
@@ -306,38 +306,57 @@ describe(`PEN-6236 defect A — the close is refused while the source rule re-ac
     expect(mocks.issues.update).not.toHaveBeenCalled();
     expect(mocks.issues.createComment).not.toHaveBeenCalled();
     // the deferral is recorded, not merely logged — an absence is not a record
-    expect(cover.pending_deferral_count).toBe(1);
-    expect(cover.last_pending_deferral_at).not.toBeNull();
-    expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("is pending in Prometheus"));
+    expect(cover.close_deferral_count).toBe(1);
+    expect(cover.last_close_deferral_at).not.toBeNull();
+    expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("still live in Prometheus"));
   });
 
   it("the cover survives to the re-fire: membership reopens and the cover is still open to receive it", async () => {
     const store = buildStore();
     seedResolvedCover(store, 20);
     const { ctx } = coverCtx(store);
-    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(PENDING));
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(LIVE));
     // 40 minutes later the rule finishes re-accumulating and fires again.
     expect(await reopenOpenCoverMembership(ctx, "alert-A")).toBe(1);
     expect(store.members.get("cover-1:alert-A")!.resolved_at).toBeNull();
     expect(store.covers.get("cover-1")!.cancelled_at).toBeNull();
   });
 
-  it("closes, and records source_cleared, when Prometheus reports the source NOT pending", async () => {
+  it("refuses the close when the source has already RE-FIRED but the webhook has not landed", async () => {
+    const store = buildStore();
+    seedResolvedCover(store, 20);
+    const { ctx, mocks } = coverCtx(store);
+    const refired: SourceAlertState = { state: "live", readAt: "2026-11-09T06:00:00.000Z", detail: "1 series, alertstate=firing" };
+
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(refired));
+
+    // `reopenOpenCoverMembership` cannot save this case: it only touches covers
+    // with `cancelled_at IS NULL AND closing_claimed_at IS NULL`, so once the
+    // close is claimed a late firing webhook mints a NEW cover instead of
+    // reopening this one — defect A's fix causing defect B.
+    const cover = store.covers.get("cover-1")!;
+    expect(cover.closing_claimed_at).toBeNull();
+    expect(cover.close_deferral_count).toBe(1);
+    expect(mocks.issues.update).not.toHaveBeenCalled();
+    expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("still live in Prometheus"));
+  });
+
+  it("closes, and records source_cleared, when Prometheus carries no series for the alertname", async () => {
     const store = buildStore();
     seedResolvedCover(store, 20);
     const { ctx, mocks } = coverCtx(store);
 
-    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(NOT_PENDING));
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(CLEARED));
 
     const cover = store.covers.get("cover-1")!;
     expect(cover.cancelled_at).not.toBeNull();
     expect(cover.close_verdict).toBe("source_cleared");
-    expect(cover.pending_deferral_count).toBe(0);
+    expect(cover.close_deferral_count).toBe(0);
     expect(mocks.issues.update).toHaveBeenCalledWith("cover-1", { status: "cancelled" }, "company-1");
     expect(mocks.issues.createComment).toHaveBeenCalledWith("cover-1", expect.stringContaining("`source_cleared`"), "company-1");
   });
 
-  it("an inconclusive read defers too — `unknown` is never folded into `not-pending`", async () => {
+  it("an inconclusive read defers too — `unknown` is never folded into `cleared`", async () => {
     const store = buildStore();
     seedResolvedCover(store, 20);
     const { ctx, mocks } = coverCtx(store);
@@ -345,68 +364,68 @@ describe(`PEN-6236 defect A — the close is refused while the source rule re-ac
     await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(UNKNOWN));
 
     expect(store.covers.get("cover-1")!.cancelled_at).toBeNull();
-    expect(store.covers.get("cover-1")!.pending_deferral_count).toBe(1);
+    expect(store.covers.get("cover-1")!.close_deferral_count).toBe(1);
     expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("inconclusive"));
   });
 
-  it("the deferral is BOUNDED: past the recheck window a still-pending source closes as pending_recheck_expired", async () => {
+  it("the deferral is BOUNDED: past the recheck window a still-live source closes as source_live_recheck_expired", async () => {
     const store = buildStore();
     // resolved 5 hours ago, recheck limit 240m — hold + limit = 255m < 300m.
     seedResolvedCover(store, 300);
     const { ctx, mocks } = coverCtx(store);
 
-    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(PENDING, 240));
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(LIVE, 240));
 
     const cover = store.covers.get("cover-1")!;
     expect(cover.cancelled_at).not.toBeNull();
-    expect(cover.close_verdict).toBe("pending_recheck_expired");
-    expect(cover.pending_deferral_count).toBe(0);
+    expect(cover.close_verdict).toBe("source_live_recheck_expired");
+    expect(cover.close_deferral_count).toBe(0);
     expect(mocks.issues.createComment).toHaveBeenCalledWith("cover-1", expect.stringContaining("BOUNDED rather than evidenced"), "company-1");
   });
 
-  it("past the window an unreadable Prometheus closes as pending_check_unavailable, not as a clear", async () => {
+  it("past the window an unreadable Prometheus closes as liveness_check_unavailable, not as a clear", async () => {
     const store = buildStore();
     seedResolvedCover(store, 300);
     const { ctx } = coverCtx(store);
     await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(UNKNOWN, 240));
-    expect(store.covers.get("cover-1")!.close_verdict).toBe("pending_check_unavailable");
+    expect(store.covers.get("cover-1")!.close_verdict).toBe("liveness_check_unavailable");
   });
 
   it("a cover with no alertname (pre-migration, unparseable fingerprint) closes as alertname_unknown rather than guessing", async () => {
     const store = buildStore();
     seedResolvedCover(store, 20, null);
     const { ctx } = coverCtx(store);
-    const guard = { ...stubGuard(PENDING), readPending: vi.fn(async () => PENDING) };
+    const guard = { ...stubGuard(LIVE), readSourceState: vi.fn(async () => LIVE) };
     await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, guard);
     expect(store.covers.get("cover-1")!.close_verdict).toBe("alertname_unknown");
     // and it never addressed a read to nothing
-    expect(guard.readPending).not.toHaveBeenCalled();
+    expect(guard.readSourceState).not.toHaveBeenCalled();
   });
 
   it("an UNCONFIGURED instance is behaviour-neutral: it closes as before, issues no extra query, and says so in the record", async () => {
     const store = buildStore();
     seedResolvedCover(store, 20);
     const { ctx, mocks } = coverCtx(store);
-    const readPending = vi.fn(async () => NOT_PENDING);
+    const readSourceState = vi.fn(async () => CLEARED);
     const querySpy = vi.spyOn(store.db, "query");
 
-    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, { readPending, recheckLimitMinutes: 240, configured: false });
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, { readSourceState, recheckLimitMinutes: 240, configured: false });
 
     expect(store.covers.get("cover-1")!.cancelled_at).not.toBeNull();
-    expect(store.covers.get("cover-1")!.close_verdict).toBe("pending_check_unconfigured");
-    expect(readPending).not.toHaveBeenCalled();
+    expect(store.covers.get("cover-1")!.close_verdict).toBe("liveness_check_unconfigured");
+    expect(readSourceState).not.toHaveBeenCalled();
     // the decision SELECT is never issued on an unconfigured instance
     expect(querySpy.mock.calls.filter(([sql]) => sql.includes("within_recheck"))).toHaveLength(0);
-    expect(mocks.issues.createComment).toHaveBeenCalledWith("cover-1", expect.stringContaining("`pending_check_unconfigured`"), "company-1");
+    expect(mocks.issues.createComment).toHaveBeenCalledWith("cover-1", expect.stringContaining("`liveness_check_unconfigured`"), "company-1");
   });
 
   it("a cover still inside the hold is not read at all — the guard costs no HTTP call on an ineligible cover", async () => {
     const store = buildStore();
     seedResolvedCover(store, 2); // well inside the 15m hold
     const { ctx } = coverCtx(store);
-    const readPending = vi.fn(async () => NOT_PENDING);
-    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, { readPending, recheckLimitMinutes: 240, configured: true });
-    expect(readPending).not.toHaveBeenCalled();
+    const readSourceState = vi.fn(async () => CLEARED);
+    await recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, { readSourceState, recheckLimitMinutes: 240, configured: true });
+    expect(readSourceState).not.toHaveBeenCalled();
     expect(store.covers.get("cover-1")!.cancelled_at).toBeNull();
   });
 
@@ -416,13 +435,13 @@ describe(`PEN-6236 defect A — the close is refused while the source rule re-ac
     const { ctx, mocks } = coverCtx(store);
     // First attempt wins the claim, stamps the verdict, then the comment throws.
     mocks.issues.createComment.mockRejectedValueOnce(new Error("transient"));
-    await expect(recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(PENDING, 240))).rejects.toThrow("transient");
-    expect(store.covers.get("cover-1")!.close_verdict).toBe("pending_recheck_expired");
+    await expect(recordSourceResolvedAndCloseCovers(ctx, "company-1", "alert-A", HOLD_MINUTES, stubGuard(LIVE, 240))).rejects.toThrow("transient");
+    expect(store.covers.get("cover-1")!.close_verdict).toBe("source_live_recheck_expired");
     // The sweep's reconcile pass resumes it. Prometheus has since gone clear —
     // the resumption must NOT relabel the close as source_cleared.
     await runAlertEscalationSweep(ctx, { defaultCompanyId: "company-1", autoCloseOnResolve: true } as AlertmanagerPluginConfig, new Date());
-    expect(store.covers.get("cover-1")!.close_verdict).toBe("pending_recheck_expired");
-    expect(mocks.issues.createComment).toHaveBeenLastCalledWith("cover-1", expect.stringContaining("`pending_recheck_expired`"), "company-1");
+    expect(store.covers.get("cover-1")!.close_verdict).toBe("source_live_recheck_expired");
+    expect(mocks.issues.createComment).toHaveBeenLastCalledWith("cover-1", expect.stringContaining("`source_live_recheck_expired`"), "company-1");
   });
 });
 
@@ -430,36 +449,54 @@ describe(`PEN-6236 defect A — the close is refused while the source rule re-ac
 // The reader itself — gate polarity, with a control arm on every branch.
 // ---------------------------------------------------------------------------
 
-describe("PEN-6236 the Prometheus pending reader", () => {
+describe("PEN-6236 the Prometheus source-state reader", () => {
   const cfg = (prometheusApiUrl?: string): AlertmanagerPluginConfig =>
     ({ defaultCompanyId: "company-1", autoCloseOnResolve: true, prometheusApiUrl }) as AlertmanagerPluginConfig;
 
-  it("reports `pending` for a matching series, and `not-pending` for an empty vector — both arms, so the probe discriminates", async () => {
+  it("reports `live` for a matching series, and `cleared` for an empty vector — both arms, so the probe discriminates", async () => {
     const base = await startServer((_req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ status: "success", data: { resultType: "vector", result: [{ metric: { alertname: ALERTNAME, alertstate: "pending" }, value: [0, "1"] }] } }));
     });
-    const read = createSweepPendingReader(cfg(base), new Date(), logger(), {});
-    expect((await read(ALERTNAME)).state).toBe("pending");
+    const read = createSweepSourceStateReader(cfg(base), new Date(), logger(), {});
+    expect((await read(ALERTNAME)).state).toBe("live");
 
     const empty = await startServer((_req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ status: "success", data: { resultType: "vector", result: [] } }));
     });
-    expect((await createSweepPendingReader(cfg(empty), new Date(), logger(), {}))(ALERTNAME).then((r) => r.state)).resolves.toBe("not-pending");
+    const emptyRead = createSweepSourceStateReader(cfg(empty), new Date(), logger(), {});
+    expect((await emptyRead(ALERTNAME)).state).toBe("cleared");
   });
 
-  it("re-applies both matchers locally, so a proxy that ignores the selector cannot freeze every close", async () => {
+  it("counts a FIRING series as live, not just a pending one — the fail-open this selector was widened to close", async () => {
+    const base = await startServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ status: "success", data: { result: [
+        { metric: { alertname: ALERTNAME, alertstate: "firing" } },
+      ] } }));
+    });
+    const read = createSweepSourceStateReader(cfg(base), new Date(), logger(), {});
+    const answer = await read(ALERTNAME);
+    // An earlier draft asked only for `alertstate="pending"`, so a source that
+    // had already RE-FIRED in Prometheus — webhook not yet delivered, so
+    // `reopenOpenCoverMembership` had not run — came back "not pending" and the
+    // cover closed stamped `source_cleared`, the one verdict this plugin calls
+    // positive evidence, over a live alert.
+    expect(answer.state).toBe("live");
+    expect(answer.state === "live" && answer.detail).toContain("firing");
+  });
+
+  it("re-applies the alertname matcher locally, so a proxy that ignores the selector cannot freeze every close", async () => {
     const base = await startServer((_req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ status: "success", data: { result: [
         { metric: { alertname: "SomethingElse", alertstate: "pending" } },
-        { metric: { alertname: ALERTNAME, alertstate: "firing" } },
+        { metric: { alertname: "AlsoNotOurs", alertstate: "firing" } },
       ] } }));
     });
-    const read = createSweepPendingReader(cfg(base), new Date(), logger(), {});
-    // neither row is "this alertname AND pending"
-    expect((await read(ALERTNAME)).state).toBe("not-pending");
+    const read = createSweepSourceStateReader(cfg(base), new Date(), logger(), {});
+    expect((await read(ALERTNAME)).state).toBe("cleared");
   });
 
   it.each([
@@ -467,21 +504,21 @@ describe("PEN-6236 the Prometheus pending reader", () => {
     ["a non-array result vector", 200, JSON.stringify({ status: "success", data: { result: { nope: true } } })],
     ["a body that is not JSON", 200, "<html>gateway</html>"],
     ["HTTP 500", 500, "boom"],
-  ])("answers `unknown`, never `not-pending`, for %s", async (_label, status, body) => {
+  ])("answers `unknown`, never `cleared`, for %s", async (_label, status, body) => {
     const base = await startServer((_req, res) => { res.writeHead(status, { "content-type": "application/json" }); res.end(body); });
-    const read = createSweepPendingReader(cfg(base), new Date(), logger(), {});
+    const read = createSweepSourceStateReader(cfg(base), new Date(), logger(), {});
     const answer = await read(ALERTNAME);
     expect(answer.state).toBe("unknown");
   });
 
   it("refuses a non-http scheme, so a `data:` URL cannot supply its own empty vector", async () => {
-    const read = createSweepPendingReader(cfg("data:application/json,%7B%22status%22%3A%22success%22%7D"), new Date(), logger(), {});
+    const read = createSweepSourceStateReader(cfg("data:application/json,%7B%22status%22%3A%22success%22%7D"), new Date(), logger(), {});
     expect((await read(ALERTNAME)).state).toBe("unknown");
     expect(hasPrometheusEndpoint(cfg("data:application/json,x"), {})).toBe(false);
   });
 
   it("an unset endpoint is `unknown`, and resolves config ahead of environment", async () => {
-    expect((await createSweepPendingReader(cfg(), new Date(), logger(), {})(ALERTNAME)).state).toBe("unknown");
+    expect((await createSweepSourceStateReader(cfg(), new Date(), logger(), {})(ALERTNAME)).state).toBe("unknown");
     expect(resolvePrometheusApiUrl(cfg("http://from-config:9090/"), { PAPERCLIP_PROMETHEUS_API_URL: "http://from-env:9090" })).toBe("http://from-config:9090");
     expect(resolvePrometheusApiUrl(cfg(), { PAPERCLIP_PROMETHEUS_API_URL: "http://from-env:9090/" })).toBe("http://from-env:9090");
     expect(hasPrometheusEndpoint(cfg(), {})).toBe(false);
@@ -491,7 +528,7 @@ describe("PEN-6236 the Prometheus pending reader", () => {
   it("memoises by alertname and short-circuits the whole pass on a transport failure", async () => {
     let hits = 0;
     const base = await startServer((_req, res) => { hits += 1; res.socket?.destroy(); });
-    const read = createSweepPendingReader(cfg(base), new Date(), logger(), {});
+    const read = createSweepSourceStateReader(cfg(base), new Date(), logger(), {});
     await read("A"); await read("B"); await read("A");
     expect(hits).toBe(1);
   });
@@ -503,13 +540,13 @@ describe("PEN-6236 the Prometheus pending reader", () => {
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify({ status: "success", data: { result: [] } }));
     });
-    await createSweepPendingReader(cfg(base), new Date(), logger(), {})('Weird"Name');
+    await createSweepSourceStateReader(cfg(base), new Date(), logger(), {})('Weird"Name');
     expect(decodeURIComponent(seen)).toContain('alertname="Weird\\"Name"');
   });
 
   it("buildCoverCloseGuard reports configured only when a usable endpoint exists", () => {
     expect(buildCoverCloseGuard(cfg(), new Date(), logger()).configured).toBe(false);
-    const guard = buildCoverCloseGuard({ ...cfg("http://p:9090"), coverPendingRecheckLimitMinutes: 77 }, new Date(), logger());
+    const guard = buildCoverCloseGuard({ ...cfg("http://p:9090"), coverLivenessRecheckLimitMinutes: 77 }, new Date(), logger());
     expect(guard.configured).toBe(true);
     expect(guard.recheckLimitMinutes).toBe(77);
     expect(buildCoverCloseGuard(cfg("http://p:9090"), new Date(), logger()).recheckLimitMinutes).toBe(240);
@@ -558,8 +595,8 @@ describe("PEN-6236 defect B — a re-minted cover carries its predecessor's furn
     store.covers.set("cover-prev", {
       cover_issue_id: "cover-prev", company_id: "company-1", dedup_fingerprint: `cover:${ALERTNAME}:0`,
       alertname: ALERTNAME, closing_claimed_at: "2026-11-08T14:38:00Z", resolution_comment_posted_at: "2026-11-08T14:38:00Z",
-      cancelled_at: "2026-11-08T14:38:31Z", close_verdict: "pending_recheck_expired", close_verdict_detail: null,
-      pending_deferral_count: 3, last_pending_deferral_at: "2026-11-08T14:20:00Z",
+      cancelled_at: "2026-11-08T14:38:31Z", close_verdict: "source_live_recheck_expired", close_verdict_detail: null,
+      close_deferral_count: 3, last_close_deferral_at: "2026-11-08T14:20:00Z",
     });
     store.coverIssuesById.set("cover-prev", { id: "cover-prev", identifier: "PEN-5903", status: "cancelled" });
   }
@@ -583,7 +620,7 @@ describe("PEN-6236 defect B — a re-minted cover carries its predecessor's furn
     expect(created.title).toContain("[user-cover]");
     expect(created.description).toContain("Previous cover for");
     expect(created.description).toContain("PEN-5903");
-    expect(created.description).toContain("pending_recheck_expired");
+    expect(created.description).toContain("source_live_recheck_expired");
     // the furnished dispositions travel
     expect(created.description).toContain("Stop admitting new approval cards");
     expect(created.description).toContain("restart is NOT the remedy");
@@ -591,6 +628,91 @@ describe("PEN-6236 defect B — a re-minted cover carries its predecessor's furn
     expect(created.description).not.toContain("have resolved; closing");
     expect(created.description).not.toContain("a system note");
     expect(created.description).not.toContain("a deleted thought");
+  });
+
+  /**
+   * The regression test for the ordering bug Ally caught on head `90aeb9d2`.
+   *
+   * `ctx.issues.listComments` reaches `issues.listComments(issueId)` with no
+   * options and that function defaults to `order: "desc"`, so production sends
+   * this array NEWEST-FIRST. The first draft took `.slice(-3)`, which is the
+   * three OLDEST, and shipped the predecessor's opening remarks while dropping
+   * the later executable dispositions — the exact content defect B exists to
+   * carry. The original test could not catch it: it seeded 2 comments, in
+   * ascending order, which is the shape production never sends.
+   *
+   * So this one seeds FIVE furnished comments in DESCENDING order.
+   */
+  it("carries the three MOST RECENT furnished comments when the host returns them newest-first", async () => {
+    const store = buildStore();
+    seedPredecessor(store);
+    const desc = [
+      { body: "FIFTH and newest: hold the queue, do not restart.", authorType: "agent", createdAt: new Date("2026-11-07T14:00:00Z"), deletedAt: null },
+      { body: "FOURTH: the servicing loop is wedged on PEN-4835.", authorType: "agent", createdAt: new Date("2026-11-07T13:00:00Z"), deletedAt: null },
+      { body: "THIRD: confirmed on a second read.", authorType: "agent", createdAt: new Date("2026-11-07T12:00:00Z"), deletedAt: null },
+      { body: "SECOND and stale: initial triage, superseded below.", authorType: "agent", createdAt: new Date("2026-11-07T11:00:00Z"), deletedAt: null },
+      { body: "FIRST and oldest: just noticed this row.", authorType: "agent", createdAt: new Date("2026-11-07T10:00:00Z"), deletedAt: null },
+    ];
+    const { ctx, mocks } = mintCtx(store, desc);
+
+    await runAlertEscalationSweep(ctx, { defaultCompanyId: "company-1", autoCloseOnResolve: true } as AlertmanagerPluginConfig, new Date("2026-11-09T06:00:00Z"));
+
+    const { description } = mocks.issues.create.mock.calls[0]![0] as { description: string };
+    for (const kept of ["FIFTH and newest", "FOURTH", "THIRD"]) expect(description).toContain(kept);
+    for (const dropped of ["SECOND and stale", "FIRST and oldest"]) expect(description).not.toContain(dropped);
+    // rendered oldest-first, so the section reads forwards
+    expect(description.indexOf("THIRD")).toBeLessThan(description.indexOf("FOURTH"));
+    expect(description.indexOf("FOURTH")).toBeLessThan(description.indexOf("FIFTH and newest"));
+  });
+
+  it("is independent of the host's order: the same five ascending give the same three", async () => {
+    const store = buildStore();
+    seedPredecessor(store);
+    const asc = [
+      { body: "FIRST and oldest: just noticed this row.", authorType: "agent", createdAt: new Date("2026-11-07T10:00:00Z"), deletedAt: null },
+      { body: "SECOND and stale: initial triage, superseded below.", authorType: "agent", createdAt: new Date("2026-11-07T11:00:00Z"), deletedAt: null },
+      { body: "THIRD: confirmed on a second read.", authorType: "agent", createdAt: new Date("2026-11-07T12:00:00Z"), deletedAt: null },
+      { body: "FOURTH: the servicing loop is wedged on PEN-4835.", authorType: "agent", createdAt: new Date("2026-11-07T13:00:00Z"), deletedAt: null },
+      { body: "FIFTH and newest: hold the queue, do not restart.", authorType: "agent", createdAt: new Date("2026-11-07T14:00:00Z"), deletedAt: null },
+    ];
+    const { ctx, mocks } = mintCtx(store, asc);
+    await runAlertEscalationSweep(ctx, { defaultCompanyId: "company-1", autoCloseOnResolve: true } as AlertmanagerPluginConfig, new Date("2026-11-09T06:00:00Z"));
+    const { description } = mocks.issues.create.mock.calls[0]![0] as { description: string };
+    for (const kept of ["FIFTH and newest", "FOURTH", "THIRD"]) expect(description).toContain(kept);
+    expect(description).not.toContain("FIRST and oldest");
+  });
+
+  it("sorts by the ISO-STRING createdAt too, which is the shape the worker boundary delivers", async () => {
+    const store = buildStore();
+    seedPredecessor(store);
+    const wireDesc = [
+      { body: "NEWEST on the wire", authorType: "agent", createdAt: "2026-11-07T14:00:00.000Z", deletedAt: null },
+      { body: "MIDDLE on the wire", authorType: "agent", createdAt: "2026-11-07T13:00:00.000Z", deletedAt: null },
+      { body: "OLDEST on the wire", authorType: "agent", createdAt: "2026-11-07T12:00:00.000Z", deletedAt: null },
+      { body: "ANCIENT on the wire", authorType: "agent", createdAt: "2026-11-07T11:00:00.000Z", deletedAt: null },
+    ];
+    const { ctx, mocks } = mintCtx(store, wireDesc);
+    await runAlertEscalationSweep(ctx, { defaultCompanyId: "company-1", autoCloseOnResolve: true } as AlertmanagerPluginConfig, new Date("2026-11-09T06:00:00Z"));
+    const { description } = mocks.issues.create.mock.calls[0]![0] as { description: string };
+    expect(description).toContain("NEWEST on the wire");
+    expect(description).not.toContain("ANCIENT on the wire");
+    expect(description).not.toContain("[object Object]");
+  });
+
+  it("defuses an agent mention carried out of the predecessor, so a closed cover's @-links wake nobody again", async () => {
+    const store = buildStore();
+    seedPredecessor(store);
+    const withMention = [{
+      body: "Handing to [@Devops](agent://11b9c48f-aee6-4ac4-8f4a-5ba60c73fb9c) — drain the queue head first.",
+      authorType: "agent", createdAt: new Date("2026-11-07T14:00:00Z"), deletedAt: null,
+    }];
+    const { ctx, mocks } = mintCtx(store, withMention);
+    await runAlertEscalationSweep(ctx, { defaultCompanyId: "company-1", autoCloseOnResolve: true } as AlertmanagerPluginConfig, new Date("2026-11-09T06:00:00Z"));
+    const { description } = mocks.issues.create.mock.calls[0]![0] as { description: string };
+    // the name survives as a citation; the wake primitive does not
+    expect(description).toContain("@Devops");
+    expect(description).toContain("drain the queue head first");
+    expect(description).not.toContain("agent://");
   });
 
   it("says so explicitly when the predecessor carried nothing, rather than implying it did", async () => {

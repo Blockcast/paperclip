@@ -159,12 +159,13 @@ export interface AlertmanagerPluginConfig {
   coverCloseHoldMinutes?: number;
   /**
    * Prometheus base URL (PEN-6236), e.g. `http://prometheus:9090`. Read by
-   * the cover CLOSE path only, to ask whether a source alertname is currently
-   * `pending` — the state Alertmanager cannot represent and the close was
-   * therefore blind to. Falls back to `PAPERCLIP_PROMETHEUS_API_URL`.
+   * the cover CLOSE path only, to ask whether a source alertname still has any
+   * `ALERTS` series — `pending` or `firing`. `pending` is the state
+   * Alertmanager cannot represent at all, and the close was therefore blind to
+   * it. Falls back to `PAPERCLIP_PROMETHEUS_API_URL`.
    *
    * Unset is a supported state: the close then records the verdict
-   * `pending_check_unconfigured` instead of asserting the source was clear.
+   * `liveness_check_unconfigured` instead of asserting the source was clear.
    * It is NOT read by the escalation ladder, whose question ("is this incident
    * live?") Alertmanager already answers.
    */
@@ -175,16 +176,16 @@ export interface AlertmanagerPluginConfig {
    */
   prometheusReadTimeoutMs?: number;
   /**
-   * Minutes past the close hold that a `pending` or unreadable Prometheus
-   * answer may keep deferring a cover's close (PEN-6236), measured from the
-   * newest member `resolved_at`. Past it the cover closes with the verdict
-   * recorded. Defaults to `DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES`.
+   * Minutes past the close hold that a LIVE or unreadable Prometheus answer may
+   * keep deferring a cover's close (PEN-6236), measured from the newest member
+   * `resolved_at`. Past it the cover closes with the verdict
+   * recorded. Defaults to `DEFAULT_COVER_LIVENESS_RECHECK_LIMIT_MINUTES`.
    *
    * This is the bound that keeps a fail-closed guard from becoming an
    * unbounded freeze; see the constant's own note for why a longer hold is not
    * the alternative.
    */
-  coverPendingRecheckLimitMinutes?: number;
+  coverLivenessRecheckLimitMinutes?: number;
 }
 
 // ---------------------------------------------------------------------------

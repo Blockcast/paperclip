@@ -511,9 +511,9 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `fallbackAgentName`  | string  | conditionally | Exact agent name used when no mapped owner or issue route resolves. Ownerless creation is refused if this is missing or ambiguous. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
 | `alertmanagerApiUrl` | string  | no       | Base URL of the Alertmanager these webhooks come from, e.g. `http://alertmanager.monitoring.svc.cluster.local:9093`. Enables the escalation liveness read above. If unset here, falls back to the host env var `PAPERCLIP_ALERTMANAGER_API_URL` (forwarded to plugin workers); a value set here always wins. Neither set = the ladder still runs but never claims liveness. |
-| `prometheusApiUrl` | string | no | Base URL of the Prometheus behind that Alertmanager, e.g. `http://prometheus.monitoring.svc.cluster.local:9090`. Read by the cover CLOSE path only (PEN-6236), to ask whether a source alertname is `pending`. Falls back to `PAPERCLIP_PROMETHEUS_API_URL`. Unset = the close records `pending_check_unconfigured` and behaves exactly as it did before PEN-6236. |
+| `prometheusApiUrl` | string | no | Base URL of the Prometheus behind that Alertmanager, e.g. `http://prometheus.monitoring.svc.cluster.local:9090`. Read by the cover CLOSE path only (PEN-6236), to ask whether a source alertname still has any `ALERTS` series (`pending` **or** `firing`). Falls back to `PAPERCLIP_PROMETHEUS_API_URL`. Unset = the close records `liveness_check_unconfigured` and behaves exactly as it did before PEN-6236. |
 | `prometheusReadTimeoutMs` | number | no | Per-call cap on that read, headers and body. Defaults to 5000. |
-| `coverPendingRecheckLimitMinutes` | number | no | How long past the close hold a `pending` or unreadable answer may keep deferring a cover's close, measured from the newest member `resolved_at`. Defaults to 240. Past it the cover closes with the verdict recorded. |
+| `coverLivenessRecheckLimitMinutes` | number | no | How long past the close hold a live or unreadable answer may keep deferring a cover's close, measured from the newest member `resolved_at`. Defaults to 240. Past it the cover closes with the verdict recorded. |
 | `coverCloseHoldMinutes` | number | no | Minutes every source alert must stay resolved before the cover closes (BLO-42259). Defaults to 15. ⚠ Raising this is NOT the remedy for a cover closing mid-incident — see below. |
 | `coverDedupWindowMinutes` | number | no | Width of the board-cover dedup window. Defaults to 120. |
 
@@ -550,17 +550,36 @@ The fix is a CHECK with a deadline. **Alertmanager has no representation of
 unanswerable with the instrument the plugin already had. Prometheus answers it
 as `ALERTS{alertstate="pending"}`.
 
-| Prometheus says | inside `coverCloseHoldMinutes + coverPendingRecheckLimitMinutes` | past it |
+| Prometheus says | inside `coverCloseHoldMinutes + coverLivenessRecheckLimitMinutes` | past it |
 |---|---|---|
-| a pending series exists | close deferred, `pending_deferral_count` incremented | closes, `close_verdict = pending_recheck_expired` |
-| no pending series | closes, `close_verdict = source_cleared` | same |
-| unreadable / unparseable / non-2xx | close deferred | closes, `close_verdict = pending_check_unavailable` |
-| not configured | closes immediately, `close_verdict = pending_check_unconfigured` (no extra query is issued) | same |
+| an `ALERTS` series exists (`pending` **or** `firing`) | close deferred, `close_deferral_count` incremented | closes, `close_verdict = source_live_recheck_expired` |
+| no `ALERTS` series for the alertname | closes, `close_verdict = source_cleared` | same |
+| unreadable / unparseable / non-2xx | close deferred | closes, `close_verdict = liveness_check_unavailable` |
+| not configured | closes immediately, `close_verdict = liveness_check_unconfigured` (no extra query is issued) | same |
 
-`unknown` is never folded into `not-pending`. Every way the read can break
-produces the same empty-vector *shape* as the good news, so the three states
-are kept distinct and only an actual completed, well-formed read that found no
-pending sample permits a `source_cleared`.
+**The selector deliberately carries no `alertstate` matcher.** An `ALERTS`
+series exists only while an alert is pending *or* firing, so its mere presence
+answers the question — has the condition cleared? — and both states answer no.
+Asking only for `alertstate="pending"` is a fail-open: a rule that has already
+re-fired in Prometheus, whose firing webhook Alertmanager has not yet delivered,
+has no *pending* series, so the close would read "not pending" and stamp
+`source_cleared` over a live alert. `reopenOpenCoverMembership` cannot undo
+that — it only touches covers with `cancelled_at IS NULL AND closing_claimed_at
+IS NULL` — so the late webhook mints a *new* cover instead, which is defect A's
+fix causing defect B. (Caught in review on head `90aeb9d2`.)
+
+`unknown` is never folded into `cleared`. Every way the read can break produces
+the same empty-vector *shape* as the good news, so the three states are kept
+distinct and only an actual completed, well-formed read that found no series at
+all permits a `source_cleared`.
+
+⚠️ **The check is keyed on `alertname` only, so it is coarser than the cover.**
+A different series of the same alertname — another namespace, another
+`company_id` — being live defers this cover's close. That errs conservatively
+and is bounded by the recheck window, but it means `source_live_recheck_expired`
+and `close_deferral_count` can over-attribute: they say *some* series of that
+alertname was live, not necessarily this cover's. Read them that way in a
+census.
 
 ⚠ **Only `source_cleared` is positive evidence.** A census over
 `close_verdict` that counts the other four as clears is making exactly the
@@ -579,7 +598,22 @@ cover for <alertname>` section naming the predecessor row, its close verdict,
 and a bounded excerpt of its most recent furnished comments. Plugin-authored
 (`[alert-escalation]`), system and deleted comments are excluded — carrying
 those forward would fill the section with the machine's own sentences, which
-is precisely the content that is *not* furnished. The lookup is fail-safe in
+is precisely the content that is *not* furnished.
+
+Two details that are easy to get wrong and are both load-bearing:
+
+- **The comments are sorted by `createdAt` before slicing.**
+  `ctx.issues.listComments` reaches `issues.listComments(issueId)` with no
+  options, and that defaults to `order: "desc"` — so the page arrives
+  newest-first and a naive `.slice(-N)` takes the N *oldest*, shipping the
+  predecessor's opening remarks and dropping the later executable dispositions
+  this whole section exists to carry. Sorting rather than reversing makes it
+  independent of that default.
+- **Agent mentions in the carried text are defused**, `[@Name](agent://…)` →
+  `@Name`. There is one mention syntax on this platform and it carries no
+  courtesy register, so copying a predecessor's comment verbatim would
+  re-assert every wake it contained, onto a new row, about a cover that has
+  already closed. The lookup is fail-safe in
 the direction that keeps the cover: any error degrades the section and is
 logged, never blocks the mint.
 
