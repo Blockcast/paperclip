@@ -14,7 +14,7 @@ import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import type { ClaudePromptBundle } from "./prompt-cache.js";
 import { buildEnvGuardSetupShell } from "./env-guard.js";
-import { buildClaudeCodeRuntimeShell, buildImageWrapperPreflightShell, buildPrePushHookPreflightShell, claudeCodeRuntimeRoot, IMAGE_WRAPPER_BIN_DIR, resolveClaudeCodeVersion } from "./runtime-pin.js";
+import { buildClaudeCodeRuntimeShell, buildClaudeConfigRepairShell, buildImageWrapperPreflightShell, buildPrePushHookPreflightShell, claudeCodeRuntimeRoot, IMAGE_WRAPPER_BIN_DIR, resolveClaudeCodeVersion } from "./runtime-pin.js";
 import { buildPodLogRedactorSetupShell, POD_LOG_FILTER_ARG_VAR, POD_LOG_FILTER_VAR } from "./pod-log-redactor.js";
 import { SERVER_ONLY_ENV_DENY } from "./inherit-allowlist.js";
 import {
@@ -5128,7 +5128,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // so a verdict after it would describe a pod that had already reached GitHub.
   // Advisory — the push path already fails closed; this buys time-to-diagnosis.
   const prePushHookPreflight = buildPrePushHookPreflightShell({ dataMountPath });
-  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${promptBundleMaterialization ? `${promptBundleMaterialization} || exit $?; ` : ""}${promptBundleSkillLinkStep ? `${promptBundleSkillLinkStep} ` : ""}${sharedDocOverlaySetup ? `${sharedDocOverlaySetup}; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath, { failClosedOnFallOpen: streamPodLogToStdout })}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter}${podLogFilterSink}`;
+  const claudeInvocation = `set -o pipefail; ${imageWrapperPreflight}; ${prePushHookPreflight}; ${workspaceSetup ? `${workspaceSetup} || exit $?; ` : ""}${promptBundleMaterialization ? `${promptBundleMaterialization} || exit $?; ` : ""}${promptBundleSkillLinkStep ? `${promptBundleSkillLinkStep} ` : ""}${sharedDocOverlaySetup ? `${sharedDocOverlaySetup}; ` : ""}${buildEnvGuardSetupShell()}; ${claudeRuntime}${buildClaudeConfigRepairShell()}; ${ccrotateRefresh ? `${ccrotateRefresh}; ` : ""}${preparePodLog}; ${buildPodLogRedactorSetupShell(containerLogPath, { failClosedOnFallOpen: streamPodLogToStdout })}; cat /tmp/prompt/prompt.txt | ${launcherCommand} ${claudeArgsEscaped} | "$${POD_LOG_FILTER_VAR}" \${${POD_LOG_FILTER_ARG_VAR}:+"$${POD_LOG_FILTER_ARG_VAR}"} | tee ${quoteShellArg(containerLogPath)} | ${failFastFilter}${podLogFilterSink}`;
   // When the DinD sidecar is wired in, prepend the wait-for-socket loop
   // so the agent never starts before dockerd is listening on the shared
   // unix socket. Mirrors the opencode_k8s adapter.

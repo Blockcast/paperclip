@@ -540,3 +540,33 @@ export function buildPrePushHookPreflightShell(opts: { dataMountPath: string }):
     "unset __pchookrt __pchookmnt",
   ].join("; ");
 }
+
+export const CLAUDE_CONFIG_REPAIR_MARKER = "[paperclip] claude-config";
+
+/**
+ * POSIX sh snippet (no trailing separator) that moves an unparseable
+ * `.claude.json` aside before `claude` starts.
+ *
+ * Claude Code up to 2.1.317 replaced a `.claude.json` that was not valid JSON
+ * with defaults in non-interactive runs. 2.1.318 stopped doing that: the run
+ * fails with "Configuration error in …/.claude.json" and leaves the file as it
+ * is (anthropics/claude-code#87551). `CLAUDE_CONFIG_DIR` lives on the PVC per
+ * agent, so one truncated write would fail every later heartbeat of that agent
+ * until someone edited the file by hand. Moving it to `.corrupt-<epoch>` restores
+ * the old self-heal and keeps the bad copy for inspection. Covers the
+ * `claudeCodeVersion: "image"` runs too, so it is not part of the runtime pin.
+ *
+ * Skips silently when the file is missing or empty (both start fine) or when
+ * `node` is not on PATH. Always exits 0, and `unset`s its scratch variables.
+ */
+export function buildClaudeConfigRepairShell(): string {
+  return [
+    'if [ -n "${CLAUDE_CONFIG_DIR:-}" ]; then __pccfg="$CLAUDE_CONFIG_DIR/.claude.json"; else __pccfg="$HOME/.claude.json"; fi',
+    'if [ -s "$__pccfg" ] && command -v node >/dev/null 2>&1 && ' +
+      "! node -e 'JSON.parse(require(\"fs\").readFileSync(process.argv[1], \"utf8\"))' \"$__pccfg\" >/dev/null 2>&1; then " +
+      '__pccfgbad="$__pccfg.corrupt-$(date +%s)"; ' +
+      `mv -f "$__pccfg" "$__pccfgbad" && echo "${CLAUDE_CONFIG_REPAIR_MARKER} moved unparseable $__pccfg to $__pccfgbad; Claude Code 2.1.318+ no longer resets it and would fail every run" >&2; ` +
+    "fi",
+    "unset __pccfg __pccfgbad",
+  ].join("; ");
+}

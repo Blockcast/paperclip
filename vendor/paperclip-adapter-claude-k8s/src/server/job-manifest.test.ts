@@ -34,6 +34,7 @@ import {
 } from "./job-manifest.js";
 import type { JobIsolation } from "./job-manifest.js";
 import {
+  CLAUDE_CONFIG_REPAIR_MARKER,
   DEFAULT_CLAUDE_CODE_VERSION,
   IMAGE_WRAPPER_BINARIES,
   IMAGE_WRAPPER_PATH_RESOLVED,
@@ -3029,6 +3030,17 @@ describe("buildJobManifest", () => {
       expect(built.claudeCodeVersion).toBe("2.1.300");
       expect(command).toContain("__pcver='2.1.300'");
       expect(command).toContain('"@anthropic-ai/claude-code@$__pcver"');
+    });
+
+    it("moves an unparseable .claude.json aside after the runtime bootstrap and before claude, image CLI included", () => {
+      for (const claudeCodeVersion of [undefined, "image"]) {
+        ctx.config = claudeCodeVersion ? { claudeCodeVersion } : {};
+        const command = buildJobManifest({ ctx, selfPod }).job.spec?.template?.spec?.containers[0]?.command?.[2] ?? "";
+        const repairIdx = command.indexOf(CLAUDE_CONFIG_REPAIR_MARKER);
+        expect(repairIdx).toBeGreaterThan(command.indexOf('GUARD_DIR="'));
+        if (!claudeCodeVersion) expect(repairIdx).toBeGreaterThan(command.indexOf("__pcver="));
+        expect(command.indexOf("cat /tmp/prompt/prompt.txt | claude")).toBeGreaterThan(repairIdx);
+      }
     });
 
     it('"image" disables the bootstrap and leaves the pipeline on the bundled CLI', () => {
