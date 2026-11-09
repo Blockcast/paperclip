@@ -499,6 +499,24 @@ jobs:
           node ./scripts/check-git-egress-exec-closure-reread.mjs
         timeout-minutes: 2
 
+      # PEN-6280. The `opaque-high-entropy-token` staging rule is bounded
+      # `{32,120}`, and `.gitleaks-staging.toml`'s MANDATORY accepted-residual
+      # paragraph (PEN-6170 ruling (b)) is a closed three-clause enumeration
+      # defined over ENTROPY alone — so a >120-character opaque token satisfies
+      # clauses (1) and (2), fails (3), and reads as "covered by the entropy
+      # lane" by a rule that cannot match it. That overstatement was live at
+      # `5ec6f84f` and is the defect this pins.
+      #
+      # It runs here rather than in `secret_scan` for two reasons: that job is
+      # already over its own budget (capped steps sum to 28 against 20), and
+      # this test needs no gitleaks binary — it reads the shipped config and
+      # the workflow as TEXT. Both halves are keyed to the SAME bound parsed
+      # out of the regex, so prose and pattern cannot drift apart silently.
+      - name: Check gitleaks staging rule bounds (PEN-6280)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/gitleaks-staging-rule-bounds.test.mjs
+        timeout-minutes: 1
+
       - name: Validate Dockerfile deps stage
         if: ${{ !cancelled() }}
         run: |
@@ -3108,12 +3126,31 @@ jobs:
           set -e
           exit "$code"
 
-      # ⛔ WARN-ONLY STAGING STEP — PEN-6280. THIS STEP GATES NOTHING.
+      # ⛔ WARN-ONLY STAGING STEP — PEN-6280. NO FINDING HERE GATES ANYTHING.
       #
-      # `continue-on-error: true` means a finding here cannot fail this step's
-      # job, so it cannot move `needs.secret_scan.result`, so it cannot reach
-      # SECRET_SCAN_RESULT or the `verify` aggregate. That is deliberate: the
+      # `continue-on-error: true` means a FINDING here cannot fail this step's
+      # job, so no FINDING here can move `needs.secret_scan.result`, and so no
+      # FINDING here can reach SECRET_SCAN_RESULT or the `verify` aggregate.
+      # That is deliberate: the
       # `opaque-high-entropy-token` rule is being MEASURED here, not enforced.
+      #
+      # ⚠️ NARROWED 2026-11-09 (PEN-6280) — the unqualified form was false on
+      # one path, and is re-quoted here on its own marked line so a `grep`
+      # arrival meets the retraction rather than the claim:
+      #   WITHDRAWN 2026-11-09: "THIS STEP GATES NOTHING" (unqualified)
+      # `continue-on-error` is a STEP property and does NOT cover this JOB's
+      # `timeout-minutes: 20` budget, against which this step's 10 minutes are
+      # charged. Measured on this job: the capped steps sum to 28 (5 + 3 + 10
+      # + 10) against a budget of 20, and `Checkout repository` and `Explain
+      # how this lane ended` carry NO cap, so the arithmetic cannot bound the
+      # job's wall clock. A job over budget ends `conclusion: cancelled`,
+      # which DOES reach SECRET_SCAN_RESULT and fails `verify` CLOSED — the
+      # path this same file already records end-to-end at merge-queue head
+      # `c9021a88` (20m08s, cancelled, a clean PR ejected from the queue).
+      # ⇒ no FINDING here can block a merge; this step's RUNTIME can.
+      # ⛔ Sizing the step caps to sum under 20 does NOT close this while two
+      # steps are uncapped, and raising the budget trades away a bound whose
+      # own header calls it a hang detector, not a performance budget.
       # .gitleaks-staging.toml carries the promotion and withdrawal criteria
       # this step ships with, and the measured reason it is a SECOND
       # INVOCATION against a SECOND CONFIG.
@@ -3153,7 +3190,9 @@ jobs:
       #
       # ⛔ A FAILED OUTCOME HERE IS NOT A FAILED CHECK AND MUST NOT BE "FIXED"
       # BY ALLOWLISTING. It is this step working, and it did not block a thing
-      # — the job's own conclusion is unaffected, measured below. Triage the finding; if it is a
+      # — the job's own conclusion is unaffected BY A FINDING, measured below
+      # (its RUNTIME is a separate path; see the job-budget note above).
+      # Triage the finding; if it is a
       # false positive, that is a DATA POINT FOR THE WINDOW and belongs on
       # PEN-6280, not in an allowlist.
       - name: Secret scan (staging, warn-only)
