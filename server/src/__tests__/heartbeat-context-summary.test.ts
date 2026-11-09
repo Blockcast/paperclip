@@ -3833,6 +3833,89 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(correction).toBeGreaterThan(placement);
   });
 
+  // PEN-6097. The Surface clause above mandates a DESCRIPTION write, and a description
+  // write is a full-field replace -- the one placement where two runs destroy each other.
+  // The motivating incident is the SAME one Surface cites: two seats writing the same
+  // constraint 39 seconds apart. Those were comments, so they were safe; Surface redirects
+  // that exact fan-out onto the one field where concurrency is destructive. Pinned per
+  // clause like the four above, because a section that quietly loses one of these
+  // sentences still passes a heading-only assertion.
+  it("says the description write is a full-field replace, and prescribes re-read, prepend, independent verify", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("full-field REPLACE");
+    expect(markdown).toContain("Re-read the description immediately before writing, in the same run that writes it");
+    expect(markdown).toContain("PREPEND your constraint block and keep every existing byte");
+    // The failure mode by name, because "be careful" is not a procedure: a read-modify-
+    // write across two runs reports success to BOTH of them.
+    expect(markdown).toContain("last-writer-wins");
+    // Verification has to be an independent read; a write response is not evidence.
+    expect(markdown).toContain("re-reading the row with `paperclipGetIssue`, not off the write response");
+  });
+
+  // Concurrency is not the only way to transmit a wrong body, and framing it that way
+  // would ship a clause that misses the measured case. 2026-11-08, PEN-5904's own row:
+  // one writer, no race, a 13,176-byte description replaced by ~870 bytes of
+  // hand-composed text carrying a PLACEHOLDER token. 200 OK, in place 2m36s. The field
+  // has no length guard, no `If-Match` and no diff in the response, so a 93%-shorter
+  // body is indistinguishable from a deliberate rewrite. The author's pre-write re-read
+  // AND their additive-inversion proof both passed -- both ran on the file that was then
+  // not sent.
+  it("covers the single-writer short-body case, and requires a digest computed before the write", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("no length guard, no `If-Match`");
+    expect(markdown).toContain("Send the body from the file you composed it in");
+    expect(markdown).toContain("compute its `sha256` BEFORE the write");
+    // The generator, stated so it transfers past this one field.
+    expect(markdown).toContain("a check you ran on text you did not transmit verifies nothing");
+  });
+
+  // The announcement is NOT subject to the same caution, and saying so is the point. The
+  // author of the Surface clause skipped a comment on PEN-5793 on concurrency grounds and
+  // later corrected it: an append cannot overwrite anything, so the skip was pure loss.
+  it("exempts the comment, which is append-only, from the contention rule", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("A comment is append-only and carries none of this exposure");
+    expect(markdown).toContain("never the announcement");
+  });
+
+  // Both directives are correct, and read as covering appends they are together
+  // unsatisfiable with nothing saying which wins. Resolved in the text, not left to the
+  // reader -- a reader who resolves it the other way withholds a free, safe comment.
+  it("resolves the conflict with the pre-write re-read directive, naming which rule wins", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("governs mutations, not appends");
+    expect(markdown).toContain("the two rules meet only on the description, and there the concurrency rule wins");
+  });
+
+  // A fan-out that reached three of four rows is byte-identical to one that reached all
+  // four, at every surface a later reader can see. Only the author knows, and only while
+  // the run lasts.
+  it("requires an incomplete fan-out to name the rows it could not reach", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("name the rows you could not reach INSIDE the copies you could write");
+    expect(markdown).toContain("byte-identical to a complete one");
+  });
+
+  // Ordering, asserted rather than left to reading order, in the style the clause above
+  // established: Concurrency is HOW to perform the write Surface mandates, so it is
+  // unreadable before it and must precede the fallbacks for having no reachable row.
+  it("places the concurrency clause between the surface clause and its fallbacks", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    const surface = markdown.indexOf("Surface. Record the constraint");
+    const concurrency = markdown.indexOf("Concurrency. The description write");
+    const target = markdown.indexOf("Target, when the artifact has no external id");
+
+    expect(surface).toBeGreaterThan(-1);
+    expect(concurrency).toBeGreaterThan(surface);
+    expect(target).toBeGreaterThan(concurrency);
+  });
+
   // The containment-only path -- a notice with no issue, wake comment, prReview or
   // ancestors -- renders the directive too. An earlier revision gated it out as a run
   // "structurally unable to write", which was false: every refusal the containment
