@@ -4056,13 +4056,21 @@ export async function handleResolved(
         );
         if (description) {
           // PEN-6218: the only description write with no row already in hand.
-          // One extra read, and a failed one costs nothing a caller would
-          // notice — it falls through to `null`, i.e. the pre-PEN-6218 body,
-          // inside a block whose whole purpose is already best-effort.
-          const row = await ctx.issues.get(
-            aggregateResolution.issueId,
-            existing.paperclipCompanyId,
-          );
+          // One extra read, and `.catch` is load-bearing — without it a failed
+          // read aborts to the handler below and the refresh never lands, so
+          // the body goes on naming the alert that just cleared. That is the
+          // BLO-42850 wrong-close mechanism, and this path used to write
+          // unconditionally. Swallowing it degrades to the pre-PEN-6218 body
+          // for this one sync instead: the rendered half is refreshed and the
+          // notes half is lost, which the marker restores on the next sync.
+          const row = await ctx.issues
+            .get(aggregateResolution.issueId, existing.paperclipCompanyId)
+            .catch((err: unknown) => {
+              ctx.logger.warn(
+                `Alertmanager: could not read issue ${aggregateResolution.issueId} before refreshing its aggregate body; agent notes below the marker are dropped for this sync: ${String(err)}`,
+              );
+              return null;
+            });
           await ctx.issues.update(
             aggregateResolution.issueId,
             { description: composeDescription(description, row?.description) },
