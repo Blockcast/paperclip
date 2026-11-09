@@ -98,7 +98,8 @@
     "src/__tests__/recovery-actions-route-query-params.test.ts",
     "src/__tests__/approval-link-requested-by-self.test.ts",
     "src/__tests__/issue-approval-link-coverage-sql.test.ts",
-    "src/__tests__/issue-approvals-link-coverage-read-boundary.test.ts"
+    "src/__tests__/issue-approvals-link-coverage-read-boundary.test.ts",
+    "src/__tests__/work-product-external-id-write-canonicalization.test.ts"
   ],
   "exclude": ["node_modules", "dist"]
 }
