@@ -3208,7 +3208,11 @@ for (const [label, args] of [
 // the refusal at all proves the body was buffered and read.
 for (const [label, args] of [
   ["--body-file=-", ["pr", "comment", "5", "--body-file=-"]],
-  ["-f body=@-", ["api", "-X", "POST", "repos/o/r/issues/5/comments", "-f", "body=@-"]],
+  // Was `-f body=@-` until PEN-6135. `-f` is `--raw-field`, which real gh sends
+  // as the literal string `@-` without ever reading stdin, so buffering on it
+  // hung on an open pipe and refused a call that publishes nothing. `-F` is the
+  // spelling that does read stdin, and it is what this case was pinning.
+  ["-F body=@-", ["api", "-X", "POST", "repos/o/r/issues/5/comments", "-F", "body=@-"]],
 ]) {
   test(`reviewer-shaped evidence on stdin via ${label} is still refused (PEN-5724)`, () => {
     withTempDir((dir) => assertRefused(runGuard(dir, args, { input: REVIEWER_BODY }), EVIDENCE));
@@ -3280,6 +3284,129 @@ test("gh pr comment --input - does not block on an open stdin pipe (PEN-5906)", 
   await withTempDirAsync(async (dir) => {
     const proc = await runGuardWithOpenStdin(dir, ["pr", "comment", "5", "--input", "-"]);
     assert.equal(proc.timedOut, false, "the wrapper slurped stdin and hung on pr comment --input -");
+  });
+});
+
+// --- Attached and detached spellings of one flag read alike (PEN-6135) ------
+//
+// The buffer scan compared the whole argv token against `@-`/`body=@-`/
+// `query=@-`, so the DETACHED spellings matched and the ATTACHED ones — where
+// the value rides inside the token — never did. `reviewer_evidence_bodies`
+// strips the flag prefix and so read all of them, getting an EMPTY buffer for
+// the attached pair and letting the call through. A silent pass, the fail-OPEN
+// direction, where PEN-5724 and PEN-5906 were both fail-closed hangs.
+//
+// All spellings of one flag are pinned in ONE table so the attached/detached
+// split cannot come back on half of them. Run against the unfixed script the
+// `-F?*`/`--field=` rows fail and the detached rows pass, which is what makes
+// this table a pin rather than a restatement.
+const FIELD_STDIN_SPELLINGS = [
+  // `-F`/`--field` dereferences `key=@-` and really does read stdin.
+  ["-F body=@-", ["-F", "body=@-"], true],
+  ["--field body=@-", ["--field", "body=@-"], true],
+  ["-Fbody=@-", ["-Fbody=@-"], true],
+  ["--field=body=@-", ["--field=body=@-"], true],
+  // `-f`/`--raw-field` dereferences nothing in any spelling: real gh sends the
+  // literal string `@-` and never touches stdin, so the guard must not either.
+  // Narrowed by PEN-6135, which is PEN-5906 item 3; see the open-pipe probe
+  // below for the hang that narrowing closes.
+  ["-f body=@-", ["-f", "body=@-"], false],
+  ["--raw-field body=@-", ["--raw-field", "body=@-"], false],
+  ["-fbody=@-", ["-fbody=@-"], false],
+  ["--raw-field=body=@-", ["--raw-field=body=@-"], false],
+];
+
+for (const [label, flagArgs, refused] of FIELD_STDIN_SPELLINGS) {
+  test(`gh api ${label} on stdin is ${refused ? "refused" : "passed"} (PEN-6135)`, () => {
+    withTempDir((dir) => {
+      const args = ["api", "-X", "POST", "repos/o/r/issues/5/comments", ...flagArgs];
+      const proc = runGuard(dir, args, { input: REVIEWER_BODY });
+      if (refused) {
+        assertRefused(proc, EVIDENCE);
+      } else {
+        assert.equal(proc.status, 0, proc.stderr);
+        assert.match(proc.stdout, /ARGS=api -X POST/);
+      }
+    });
+  });
+}
+
+// `query=@-` is the GraphQL half of the same table, and it reaches the approval
+// scan rather than the body scan — so the attached split had to be pinned on
+// both surfaces, not just on `body`.
+for (const [label, flagArgs] of [
+  ["-F query=@-", ["-F", "query=@-"]],
+  ["-Fquery=@-", ["-Fquery=@-"]],
+  ["--field=query=@-", ["--field=query=@-"]],
+]) {
+  test(`gh api graphql ${label} on stdin is refused (PEN-6135)`, () => {
+    withTempDir((dir) =>
+      assertRefused(runGuard(dir, ["api", "graphql", ...flagArgs], { input: REVIEWER_BODY }), EVIDENCE),
+    );
+  });
+}
+
+// A field value is read only after its flag prefix comes off, so a literal body
+// must still be refused in every spelling too — including on `-f`, where the
+// value never was a file and the narrowing above does not reach.
+for (const [label, flagArgs] of [
+  ["-F body=<heading>", ["-F", `body=${REVIEWER_BODY.split("\n")[0]}`]],
+  ["-Fbody=<heading>", [`-Fbody=${REVIEWER_BODY.split("\n")[0]}`]],
+  ["-f body=<heading>", ["-f", `body=${REVIEWER_BODY.split("\n")[0]}`]],
+  ["--raw-field=body=<heading>", [`--raw-field=body=${REVIEWER_BODY.split("\n")[0]}`]],
+]) {
+  test(`gh api ${label} is still refused (PEN-6135)`, () => {
+    withTempDir((dir) =>
+      assertRefused(runGuard(dir, ["api", "-X", "POST", "repos/o/r/issues/5/comments", ...flagArgs]), EVIDENCE),
+    );
+  });
+}
+
+// The hang PEN-5906 item 3 left open, and the two spellings closing it the
+// other way would have added. `-f`/`--raw-field` reads a file in no mode or
+// spelling, so buffering on it blocked until the pipe closed — on a pipe that
+// stays open, forever. Measured rc=124 under `timeout` on the unfixed script
+// for all three of these.
+for (const [label, args] of [
+  ["-f body=@-", ["api", "repos/o/r", "-f", "body=@-"]],
+  ["-fbody=@-", ["api", "repos/o/r", "-fbody=@-"]],
+  ["--raw-field=body=@-", ["api", "repos/o/r", "--raw-field=body=@-"]],
+]) {
+  test(`gh api ${label} does not block on an open stdin pipe (PEN-6135)`, async () => {
+    await withTempDirAsync(async (dir) => {
+      const proc = await runGuardWithOpenStdin(dir, args);
+      assert.equal(proc.timedOut, false, `the wrapper slurped stdin and hung on api ${label}`);
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.match(proc.stdout, /ARGS=api repos\/o\/r/);
+    });
+  });
+}
+
+// And the direction that must NOT be narrowed with it: an attached `-F key=@-`
+// genuinely is stdin, so it has to keep blocking on an open pipe exactly as the
+// detached spelling does. Without this row the narrowing above could be
+// "fixed" by dropping the whole `@-` family and every other test still passes.
+for (const [label, args] of [
+  ["-F body=@-", ["api", "repos/o/r", "-F", "body=@-"]],
+  ["-Fbody=@-", ["api", "repos/o/r", "-Fbody=@-"]],
+  ["--field=body=@-", ["api", "repos/o/r", "--field=body=@-"]],
+]) {
+  test(`gh api ${label} still reads stdin (PEN-6135)`, async () => {
+    await withTempDirAsync(async (dir) => {
+      const proc = await runGuardWithOpenStdin(dir, args);
+      assert.equal(proc.timedOut, true, `${label} must still buffer stdin, but the wrapper returned`);
+    });
+  });
+}
+
+// A flag-shaped token that is some other flag's VALUE must not be re-read as a
+// flag of its own. The token scan could not tell these apart; splitting
+// (flag, value) the way the consumer does is what makes `--body` win here.
+test("gh pr comment --body '--field=body=@-' posts the literal body (PEN-6135)", async () => {
+  await withTempDirAsync(async (dir) => {
+    const proc = await runGuardWithOpenStdin(dir, ["pr", "comment", "5", "--body", "--field=body=@-"]);
+    assert.equal(proc.timedOut, false, "the wrapper read --body's value as a field and slurped stdin");
+    assert.equal(proc.status, 0, proc.stderr);
   });
 });
 

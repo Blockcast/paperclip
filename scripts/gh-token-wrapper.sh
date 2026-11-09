@@ -609,11 +609,36 @@ refuse_reviewer_evidence() {
 # the same claim in self-contained spellings, so they are gated the same way;
 # `-f-` names stdin in no mode and drops out entirely.
 #
-# `@-`/`body=@-`/`query=@-` stay unconditional. They are `--field` VALUES, where
-# `@-` genuinely is stdin, and the over-broad case — `-f body=@-`, which real gh
-# sends as the literal string — buffers a body that is then inspected rather
-# than missed. That is the fail-closed direction and it is pinned by a test;
-# narrowing it is a separate change from closing a hang.
+# A VALUE is read AFTER its flag prefix is stripped, never as a whole argv token.
+# The first two revisions compared the raw token against `@-`/`body=@-`/`query=@-`,
+# which is a per-token equality — so the DETACHED spellings matched and buffered
+# while the ATTACHED ones, where the value rides inside the token, never did:
+#
+#   -F body=@-        token is `body=@-`     → matched, buffered
+#   -Fbody=@-         token is `-Fbody=@-`   → never matched, never buffered
+#   --field=body=@-   token is `--field=…`   → never matched, never buffered
+#
+# `reviewer_evidence_bodies` strips the prefix and so reads all of them, getting
+# an EMPTY buffer for the attached pair and letting the call through — a silent
+# pass, the fail-open direction, where the two hangs above were fail-closed
+# (PEN-6135). So this splits (flag, value) exactly the way that function does,
+# which also stops a flag-shaped token being re-read as a value of its own:
+# `--body --field=body=@-` is a body string, not a field.
+#
+# With the value in hand the stdin test is just real gh's own table, above:
+# `-F`/`--body-file` in `pr` mode and `--input` in `api` mode read stdin on the
+# value `-`; `api`'s `-F`/`--field` reads it on a `key=@-` value.
+#
+# `-f`/`--raw-field` reads a file in NO mode or spelling, so it no longer
+# buffers (PEN-5906 item 3). Real gh sends `-f body=@-` as the literal string
+# `@-`, never touching stdin, and buffering on it blocked until the pipe closed
+# — on a pipe that stays open, forever (measured rc=124 under `timeout`),
+# exactly as `--body -` and `api -F -` did. Keeping it was defensible while it
+# was one spelling; stripping the prefix would have widened it to `-fbody=@-`
+# and `--raw-field=body=@-` as well, so the hang is closed instead of tripled.
+# This narrows BUFFERING only. Both consumers still dereference `-f key=@file`
+# — a real path, read without touching stdin — so the fail-closed reading of
+# `-f query=@file` on the approval surface is untouched.
 REVIEWER_EVIDENCE_STDIN=''
 buffer_stdin_for_reviewer_evidence() {
   # Nothing downstream reads the buffer unless the guard is armed, and the
@@ -623,23 +648,41 @@ buffer_stdin_for_reviewer_evidence() {
   # Derived the same way as in `refuse_reviewer_evidence`, from the subcommand.
   reviewer_evidence_mode=api
   case "${1:-} ${2:-}" in "pr review" | "pr comment") reviewer_evidence_mode=pr ;; esac
-  reviewer_evidence_prev=''
-  for a in "$@"; do
+  while [ "$#" -gt 0 ]; do
+    reviewer_evidence_flag="$1"
+    shift
+    reviewer_evidence_val=''
+    case "${reviewer_evidence_flag}" in
+      --body=* | --body-file=* | --field=* | --raw-field=* | --input=*)
+        reviewer_evidence_val="${reviewer_evidence_flag#*=}"
+        reviewer_evidence_flag="${reviewer_evidence_flag%%=*}"
+        ;;
+      -b?* | -f?* | -F?*)
+        reviewer_evidence_val="${reviewer_evidence_flag#-?}"
+        reviewer_evidence_flag="${reviewer_evidence_flag%"${reviewer_evidence_val}"}"
+        ;;
+      -b | --body | -f | -F | --body-file | --field | --raw-field | --input)
+        reviewer_evidence_val="${1:-}"
+        shift
+        ;;
+      # Anything else is a subcommand, a positional, or a flag that takes no
+      # file. Its value is consumed above when it has one, so a lone `-` only
+      # reaches here when no file-taking flag claimed it — `gh pr comment 5 -R -
+      # --body hi` names a repo, not a body.
+      *) continue ;;
+    esac
     reviewer_evidence_is_stdin=no
-    case "${a}" in
-      @- | body=@- | query=@-) reviewer_evidence_is_stdin=yes ;;
-    esac
-    case "${reviewer_evidence_mode}:${a}" in
-      pr:--body-file=- | pr:-F- | api:--input=-) reviewer_evidence_is_stdin=yes ;;
-    esac
-    case "${a}" in
-      -)
-        case "${reviewer_evidence_mode}:${reviewer_evidence_prev}" in
-          pr:--body-file | pr:-F | api:--input) reviewer_evidence_is_stdin=yes ;;
-        esac
+    case "${reviewer_evidence_mode}:${reviewer_evidence_flag}" in
+      "pr:-F" | "pr:--body-file" | "api:--input")
+        case "${reviewer_evidence_val}" in -) reviewer_evidence_is_stdin=yes ;; esac
+        ;;
+      "api:-F" | "api:--field")
+        # Every `key=@-`, not just `body`/`query`: real gh reads stdin for any
+        # field spelled that way, and the buffer is forwarded verbatim, so
+        # mirroring gh is strictly safer than mirroring what the guard inspects.
+        case "${reviewer_evidence_val}" in *=@-) reviewer_evidence_is_stdin=yes ;; esac
         ;;
     esac
-    reviewer_evidence_prev="${a}"
     [ "${reviewer_evidence_is_stdin}" = yes ] || continue
     reviewer_evidence_buf="$(mktemp "${TMPDIR:-/tmp}/gh-stdin.XXXXXX")"
     cat > "${reviewer_evidence_buf}"
