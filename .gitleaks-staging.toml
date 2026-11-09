@@ -1,0 +1,219 @@
+# gitleaks STAGING configuration for Blockcast/paperclip -- WARN ONLY.
+#
+# Read by the `Secret scan (staging, warn-only)` step of .github/workflows/pr.yml's
+# `secret_scan` job. PEN-6280, under @Cto's PEN-6170 ruling arm (A).
+#
+# ===========================================================================
+# ⛔ THIS FILE GATES NOTHING. A WARNING IS NOT A GATE.
+# ===========================================================================
+#
+# The step that reads this config carries `continue-on-error: true`, so a
+# finding here CANNOT fail the job, cannot fail the `verify` aggregate, and
+# cannot block a merge. Nothing in this file is a control. It is an
+# instrument, running to produce a measurement, with a decision attached to
+# the end of that measurement (see PROMOTION / WITHDRAWAL below).
+#
+# ⛔ DO NOT read a green PR as evidence that the rule below found nothing --
+# read the step summary. A step that never ran and a step that found nothing
+# are both green here, and that is the whole hazard of a warn-only step.
+#
+# ===========================================================================
+# WHY THIS IS A SECOND FILE AND A SECOND INVOCATION -- measured, not assumed
+# ===========================================================================
+#
+# gitleaks' exit code is per-RUN, not per-RULE: ANY finding from ANY rule
+# exits non-zero. So `useDefault = true` cannot block while the rule below
+# merely warns inside one invocation. Both ways of collapsing this into one
+# config are defects and one of them is silent:
+#
+#   one config + blocking lane  => this rule blocks on day one, which the
+#                                  warn-only ruling forbids;
+#   one config + continue-on-error => THE DEFAULT RULES STOP BLOCKING, which
+#                                  PEN-6245's whole purpose forbids. That
+#                                  failure is silent and green.
+#
+# MEASURED first-party against the pinned 8.28.0 (PEN-6280, 2026-11-09),
+# three configs x three ranges, every arm discriminating:
+#
+#   plant                       defaults-only   this-file-only   COMBINED
+#   bare opaque token           exit 0          exit 2           exit 2
+#   apiSecret="<v>"             exit 2          exit 2           exit 2
+#   no plant (negative ctrl)    exit 0          exit 0           exit 0
+#
+# The COMBINED column is the measurement that decides the design: a single
+# config carrying BOTH `useDefault = true` AND this rule exits 2 on a finding
+# from THIS RULE ALONE. There is no per-rule severity to escape with --
+# `severity = "WARN"` on a rule is SILENTLY ACCEPTED AND HAS NO EFFECT (still
+# exit 2, and the word never appears in the output), and no CLI flag offers
+# per-rule severity. `--exit-code` is per-run. Anyone who "simplifies" this
+# into one config will not get an error; they will get a de-fanged gate.
+#
+# ⚠️ ON BUILDING A CONTROL FOR THE DEFAULT-RULES ARM: `generic-api-key`
+# carries `[[rules.allowlists]] regexes = ['^[a-zA-Z_.-]+$']`, so it NEVER
+# reports a PURELY ALPHABETIC secret at any entropy. Measured 0/20 on
+# 32-char alphabetic synthetics against 20/20 on 32-char synthetics
+# containing at least one digit. A hand-written placeholder is usually
+# alphabetic, so a `generic-api-key` positive control built from one reads as
+# a dead control and is byte-identical to "the default rules do not fire
+# here". Same class as the base32 note PEN-6255 recorded for
+# `aws-access-token`. Check your fixture's ALPHABET before reading silence as
+# a tool property.
+#
+# ===========================================================================
+# WHAT THIS RULE SEES, AND WHAT IT DOES NOT -- a GRADIENT, not a half
+# ===========================================================================
+#
+# ⛔ NOBODY MAY WRITE "the coverable half is now covered." That overstates
+# mixed-alnum-32 by 21 points. The honest sentence is: reliably covers the
+# two long mixed-alphabet shapes; PARTIALLY covers mixed-alnum-32; does not
+# cover the rest. (PEN-6170 §5, framing corrected by @Cto 2026-11-09.)
+#
+#   base64-encoded 32-byte key (L=43), the modal modern token   99.8 %
+#   mixed-case alnum L=40                                       99.2 %
+#   mixed-case alnum L=32                                       79.1 %  <= misses ~1 in 5
+#   lowercase-alnum L=32                                        11.5 %
+#   hex at any length up to 64                                   0 %
+#   anything shorter than 32 characters           out of scope by construction
+#
+# A 64-char hex secret has Shannon entropy ~3.8 -- BELOW this repo's own
+# metric names at <=4.403. No entropy threshold separates them at any
+# setting. That is the instrument's ceiling, not a mis-set threshold.
+#
+# ===========================================================================
+# ACCEPTED RESIDUAL RISK -- stated here because no config header in this repo
+# may describe its secret scanning without it (PEN-6170 ruling (b))
+# ===========================================================================
+#
+# ACCEPTED RESIDUAL RISK -- Blockcast/paperclip, ruled by @Cto 2026-11-09,
+# PEN-6170. The repo has no control, blocking or advisory, over a value that
+# is SIMULTANEOUSLY: (1) carried under an identifier matching none of
+# access|auth|api|credential|creds|key|passwd|password|secret|token; (2)
+# carrying no recognised vendor prefix, and not a JWT, a credentialed URI or
+# a PEM block; and (3) encoded such that its Shannon entropy falls below 4.45
+# -- hex at any length, base32, lowercase-alnum at 32 characters, or any
+# value shorter than 32 characters. A value failing ANY ONE of those three is
+# covered by the push door, by the gitleaks lane (PEN-6245), or by the
+# entropy lane under (A). This is accepted as RESIDUAL RISK, not as a covered
+# population. It is not time-limited, and no row's closure revises it --
+# revision requires a new recorded decision.
+#
+# ⚠️ ONE PRECISION THE RULED TEXT CANNOT CARRY, because it was written before
+# this file existed: while this step is WARN-ONLY, "or by the entropy lane
+# under (A)" is FORWARD-LOOKING. Today the entropy rule below blocks nothing.
+# Until it is promoted, a value that fails ONLY clause (3) -- an opaque,
+# high-entropy value under an unremarkable name -- is covered by NO BLOCKING
+# control in this repo. It is reported in a step summary and nothing else.
+#
+# ===========================================================================
+# PROMOTION AND WITHDRAWAL -- stated before shipping, per ruling (A)-4
+# ===========================================================================
+#
+# A staging step nobody ever promotes becomes PEN-6179 by default rather than
+# by decision. So this file ships with its own end condition:
+#
+#   WINDOW     >= 14 days of real PR traffic from the date this merges.
+#   PROMOTE    if the step produces <= 1 NON-CREDENTIAL finding per 20 PRs
+#              SCANNED, measured and triaged PER FINDING. Promotion is then
+#              literally moving the [[rules]] block below into .gitleaks.toml
+#              and deleting this file and its step.
+#   RE-TUNE or WITHDRAW if it exceeds that.
+#   EITHER WAY, record a disposition when the window closes. This step must
+#              not outlive its own measurement window with no decision
+#              attached.
+#
+# ⚠️ THE THRESHOLD IS PER PR SCANNED, AND THE ONLY PRE-SHIP COST FIGURE IS
+# PER COMMIT -- they are different populations and one does not convert into
+# the other. Measured first-party 2026-11-09, this exact rule, diff-aware
+# over master's last 16 days: 11 findings / 1068 commits (1 per 97), 6 s,
+# of which 9 non-credential and 2 correct detections of synthetic test
+# vectors already in the tree. ZERO real credentials. That reproduces
+# PEN-6170's 11 / 1049 independently. It is NOT a reading of the promotion
+# criterion: whoever closes the window must count PRs SCANNED, not commits.
+#
+# ===========================================================================
+# THE TUNING HYPOTHESIS WAS MEASURED AND IS REJECTED -- do not re-litigate
+# without re-measuring
+# ===========================================================================
+#
+# @Cto flagged, explicitly as untested: 9 of the 11 findings are long paths /
+# URLs / doc identifiers, and the charclass includes `/`, so -- reject a
+# match containing two or more `/`, or require it not to begin mid-path with
+# `(?<![/\w.])`. Both arms were measured on 2026-11-09 and the directed
+# decision rule was "if it costs anything, keep the false positives."
+#
+#   THE LOOKBEHIND VARIANT IS NOT EXPRESSIBLE. gitleaks uses Go's RE2, which
+#   has no lookbehind: the config is REJECTED at load with
+#   `error parsing regexp: invalid named capture`.
+#
+#   THE TWO-SLASH VARIANT COSTS 14.5 % OF REAL DETECTION. Benefit: removes 8
+#   of the 9 non-credential findings. Cost, measured END TO END through
+#   gitleaks over 400 freshly generated base64-encoded 32-byte keys -- the
+#   modal modern token and the shape this rule covers best -- baseline
+#   detects 399/400, the tuned variant 341/400. 58 lost = 14.5 %.
+#
+# ⇒ REJECTED. 14.5 % of the one shape it reliably covers is not worth 8
+# findings per 16 days. ⚠️ The acceptance corpus did NOT detect this cost --
+# it carries one base64 row and that row survived the tuning, so on the
+# corpus the two variants are indistinguishable. A single sample of a shape
+# whose property is probabilistic is a MUTE arm; the 400-sample run is the
+# one that answered it.
+#
+# ⚠️ AND THE SLASH HYPOTHESIS COULD NOT HAVE REACHED ALL OF THEM ANYWAY. One
+# of the 9 is `buildReusedExecutionWorkspaceConfigPatchFromIssueSettings` in
+# a doc comment -- a 57-character camelCase IDENTIFIER at entropy 4.49, above
+# the 4.45 floor and carrying no slash at all. So the false-positive
+# population is not purely path-shaped, and PEN-6170's "every one of the 263
+# sits at <= 4.403" holds for the population it classified but does NOT
+# generalise to arbitrarily long identifiers. Expect a residual FP rate from
+# long camelCase names that no path-shaped tuning removes.
+#
+# ===========================================================================
+# ACCEPTANCE -- re-run against this exact file, 2026-11-09 (PEN-6280)
+# ===========================================================================
+#
+# 17 acceptance rows, all HIT, plus a live positive control:
+#   4/4  PEN-6170 "NOTHING SEES IT" rows (const/YAML signingMaterial,
+#        k8s stringData seed-value, nonce=)
+#   7/7  PEN-6170 carrier shapes (bare token, .env, base64 under data:,
+#        YAML folded >-, header string, array literal, Python triple-quote)
+#   6/6  PEN-6255 NO-BINDER forms (Python tuple, YAML sequence item,
+#        positional arg, JSON array element, Go slice literal, bare return)
+#   1/1  positive control apiSecret="<v>"
+# The same 18 files through the DEFAULT rules: 2/18 -- only the two carrying
+# a keyword in the name. That contrast is the point of this file.
+
+title = "Blockcast/paperclip -- staging (warn-only)"
+
+# ⛔ NO `[extend]`. This file must NOT carry `useDefault = true`. The default
+# rules are the BLOCKING step's job and they are configured in .gitleaks.toml.
+# Adding `useDefault` here would double-report every default finding into a
+# warn-only summary and invite someone to "deduplicate" by removing the
+# blocking step -- which is exactly the silent de-fanging measured above.
+
+[[rules]]
+id = "opaque-high-entropy-token"
+description = "Standalone opaque high-entropy token, any carrier, any name"
+regex = '''(?:^|[^A-Za-z0-9+/_-])([A-Za-z0-9+/_\-]{32,120}={0,2})(?:[^A-Za-z0-9+/=_-]|$)'''
+entropy = 4.45
+secretGroup = 1
+
+# ⛔ THESE EXCLUSIONS ARE FOR RUNTIME, NOT FOR NOISE, AND THE TWO MECHANISMS
+# MUST NOT BE COLLAPSED. The entropy floor buys PRECISION; this list buys
+# TRACTABILITY. A token-shaped regex matches every 32+ char run in every
+# diff, and generated artifacts carry thousands per file: measured, the same
+# rule WITHOUT this list did not finish 236 commits in minutes, and WITH it
+# scans 1068 in 6 s. Deleting an entry here because "the entropy floor
+# already removes the false positives" is true and irrelevant -- it will
+# stop the scan completing, which fails as a TIMEOUT rather than as a
+# finding. Neither mechanism is redundant; each needs its own assertion.
+[allowlist]
+paths = [
+  '''\.gitleaks\.toml$''',
+  '''\.gitleaks-staging\.toml$''',
+  '''graphify-out/''',
+  '''package-lock\.json$''',
+  '''pnpm-lock\.yaml$''',
+  '''yarn\.lock$''',
+  '''/migrations/meta/''',
+  '''\.snap$''',
+]
