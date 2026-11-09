@@ -14072,11 +14072,17 @@ export function buildPaperclipTaskMarkdown(input: {
     // which is unfollowable without enumerating the owners, and this endpoint is the
     // only thing that enumerates them.
     //
-    // "every owning row YOU MAY READ" is exact, not hedging: the service returns every
-    // row, then the route filters through `filterIssuesForActor` and reports the
-    // remainder as `withheldForAuthorizationCount`. Promising "EVERY owning row" would
-    // teach a run that a short list means no owner -- the false absence this endpoint
-    // exists to remove.
+    // "THAT YOU MAY READ" is exact, not hedging: the service returns every row, then the
+    // route filters through `filterIssuesForActor` and reports the remainder as
+    // `withheldForAuthorizationCount`. Promising "EVERY row" would teach a run that a
+    // short list means no owner -- the false absence this endpoint exists to remove.
+    //
+    // PEN-5836, review follow-up: the noun was "every OWNING row", which this same string
+    // contradicts two sentences later by saying `owners` also carries rows the PR merely
+    // mentions. The authorization qualifier is what that clause is for and is kept; the
+    // ownership claim is not the lookup's to make and is now the per-entry `relation`'s.
+    // Worded to agree with the route's own OpenAPI description, which already says
+    // "every row the caller may read that carries this external id".
     //
     // The `false` branch is worded to span both causes without asserting either, because
     // the strong reading -- "owners exist that it did not show you" -- is false whenever
@@ -14102,7 +14108,7 @@ export function buildPaperclipTaskMarkdown(input: {
     // missing, SOUNDNESS is whether the rows you got are owners at all. This branch
     // was cut before `ownerListComplete` and the PEN-5674 hop landed, and replacing
     // the paragraph instead of the clause would have deleted both.
-    "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every owning row YOU MAY READ, each carrying a `relation`. **`ownerListComplete: true` is the only thing that tells you the list is whole. `ownerListComplete: false` means it is NOT verified whole, and you must not act as though you have seen every owner.** `false` spans two states, and it deliberately does not distinguish them, because your next move is the same either way. Either the answer is SHORT -- a row withheld from your seat (`withheldForAuthorizationCount`), or an owner the artifact declares that the lookup could not return (`unresolvedOwningIdentifiers` -- another company's identifier space, a deleted or mistyped one). Or completeness is UNVERIFIABLE: no authoritative row in the answer records what the artifact declared (`owningIdentifiersUnrecorded`), so there is nothing to check the rows you got against. The second says owners MAY be missing, not that they are. Do NOT read `withheldForAuthorizationCount: 0` as complete on its own; it reports only the first cause, and those two fields can describe the same owner, so do not add them up. An empty `owners` list is NOT proof the artifact is unowned. Name artifacts as `owner/repo#123` or a full URL, never a bare `#123`: the same number is a different pull request in every repo, and the lookup answers a wrong-repo key confidently rather than emptily.",
+    "Look the owner up -- `GET /api/companies/:companyId/work-products/by-external-id?externalId=<the PR's URL>` (companyId from `paperclipMe`; a GitHub pull-request URL is accepted and normalised, so nothing needs escaping -- the canonical `owner/repo#123` also works, but then the `#` must be sent as `%23` or the value is truncated as a URL fragment). It returns every row BOUND TO THIS ARTIFACT THAT YOU MAY READ -- owning rows and mentioning ones alike -- each carrying a `relation`. **`ownerListComplete: true` is the only thing that tells you the list is whole. `ownerListComplete: false` means it is NOT verified whole, and you must not act as though you have seen every owner.** `false` spans two states, and it deliberately does not distinguish them, because your next move is the same either way. Either the answer is SHORT -- a row withheld from your seat (`withheldForAuthorizationCount`), or an owner the artifact declares that the lookup could not return (`unresolvedOwningIdentifiers` -- another company's identifier space, a deleted or mistyped one). Or completeness is UNVERIFIABLE: no authoritative row in the answer records what the artifact declared (`owningIdentifiersUnrecorded`), so there is nothing to check the rows you got against. The second says owners MAY be missing, not that they are. Do NOT read `withheldForAuthorizationCount: 0` as complete on its own; it reports only the first cause, and those two fields can describe the same owner, so do not add them up. An empty `owners` list is NOT proof the artifact is unowned. Name artifacts as `owner/repo#123` or a full URL, never a bare `#123`: the same number is a different pull request in every repo, and the lookup answers a wrong-repo key confidently rather than emptily.",
     // PEN-5836: `provenance: "webhook"` was documented here as "the authoritative
     // binding", and it is not one. The webhook writes a work product for every issue a
     // PR references anywhere -- deliberately, see `buildPullRequestWorkProductFields` --

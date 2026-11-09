@@ -3440,9 +3440,12 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("work-products/by-external-id");
     // Pinned individually because each clause closes a specific misreading, and a
     // test matching only the path would pass against a sentence that had lost them.
-    // `YOU MAY READ` is what stops an authorization-filtered result being read as
-    // "this artifact has no owner".
-    expect(markdown).toContain("every owning row YOU MAY READ");
+    // `THAT YOU MAY READ` is what stops an authorization-filtered result being read as
+    // "this artifact has no owner". The noun is pinned too: this sentence introduces the
+    // endpoint, and calling the list "every OWNING row" is the exact misreading the rest
+    // of this PR removes -- a reader who stops here never reaches `relation`.
+    expect(markdown).toContain("BOUND TO THIS ARTIFACT THAT YOU MAY READ");
+    expect(markdown).not.toContain("every owning row YOU MAY READ");
     // PEN-5340 item 5. The signal named here must be the one that covers EVERY
     // incompleteness cause. The sentence previously named
     // `withheldForAuthorizationCount > 0`, which covers only the authorization
@@ -3495,6 +3498,8 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
     expect(markdown).toContain("never a bare `#123`");
+  });
+
   // PEN-5836: the directive used to name `provenance: "webhook"` as "the
   // authoritative binding". It is not one -- the webhook writes a work product
   // for every issue a PR references, so a mentioning row carries that same
