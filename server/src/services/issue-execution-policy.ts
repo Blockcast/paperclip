@@ -179,12 +179,20 @@ function monitorMetadataFromState(state: IssueExecutionMonitorState | null | und
  * BLO-18294: the convergence bookkeeping a monitor state carries forward.
  * `previous` is the state we are superseding; `monitor`/`convergence` are only
  * present on an arm, where a freshly computed fingerprint replaces the old one.
+ *
+ * PEN-6228: `convergence` is null for a monitor the guard declines to score —
+ * `external_service`, or board/manager-scheduled. That exemption governs
+ * COUNTING, not STORAGE. Without `gateIdentity` such an arm refreshed
+ * `gateSignals` from the incoming policy while carrying the previous
+ * `gateFingerprint` forward, so the row stored a digest that was never computed
+ * from the signals sitting beside it, and nothing marked it stale. Callers that
+ * know the gate set pass `gateIdentity` so the stored pair always corresponds.
  */
 function monitorConvergenceFields(
   previous: IssueExecutionMonitorState | null | undefined,
   monitor?: IssueExecutionMonitorPolicy | null,
   convergence?: IssueMonitorConvergence | null,
-  options: { preservePrevious?: boolean } = {},
+  options: { preservePrevious?: boolean; gateIdentity?: IssueMonitorGateIdentity | null } = {},
 ) {
   if (options.preservePrevious) {
     return {
@@ -196,13 +204,25 @@ function monitorConvergenceFields(
       convergenceStalledAssigneeAgentId: previous?.convergenceStalledAssigneeAgentId ?? null,
     };
   }
+  const previousFingerprint = previous?.gateFingerprint ?? null;
+  // At most one of these is set: `convergence` when the guard scored this arm,
+  // `gateIdentity` when it declined to score but the caller knew the gate set.
+  const gateIdentity = convergence ?? options.gateIdentity ?? null;
   return {
     gateSignals: monitor
       ? normalizeIssueMonitorGateSignals(monitor.gateSignals)
       : previous?.gateSignals ?? null,
-    gateFingerprint: convergence?.fingerprint ?? previous?.gateFingerprint ?? null,
-    gateSource: convergence?.source ?? previous?.gateSource ?? null,
-    convergenceCount: convergence?.count ?? previous?.convergenceCount ?? 0,
+    gateFingerprint: gateIdentity?.fingerprint ?? previousFingerprint,
+    gateSource: gateIdentity?.source ?? previous?.gateSource ?? null,
+    // An unscored arm records no count of its own. Carrying the stored one
+    // across a gate set that MOVED would credit the new gates with re-checks
+    // the old ones earned, so reset it; an unchanged gate set keeps whatever
+    // evidence it had already accumulated.
+    convergenceCount:
+      convergence?.count
+      ?? (options.gateIdentity && options.gateIdentity.fingerprint !== previousFingerprint
+        ? 0
+        : previous?.convergenceCount ?? 0),
     convergenceStallCount: previous?.convergenceStallCount ?? 0,
     convergenceStalledAssigneeAgentId: previous?.convergenceStalledAssigneeAgentId ?? null,
   };
@@ -339,7 +359,7 @@ function buildScheduledMonitorState(
   previous: IssueExecutionMonitorState | null,
   monitor: IssueExecutionMonitorPolicy,
   convergence?: IssueMonitorConvergence | null,
-  options: { preserveConvergence?: boolean } = {},
+  options: { preserveConvergence?: boolean; gateIdentity?: IssueMonitorGateIdentity | null } = {},
 ): IssueExecutionMonitorState {
   return {
     status: "scheduled",
@@ -351,6 +371,7 @@ function buildScheduledMonitorState(
     ...monitorMetadataFromPolicy(monitor),
     ...monitorConvergenceFields(previous, monitor, convergence, {
       preservePrevious: options.preserveConvergence === true,
+      gateIdentity: options.gateIdentity ?? null,
     }),
     clearedAt: null,
     clearReason: null,
@@ -556,9 +577,18 @@ export function normalizeIssueMonitorConvergenceThreshold(value: number | null |
   return Math.min(rounded, MAX_ISSUE_MONITOR_CONVERGENCE_THRESHOLD);
 }
 
-export type IssueMonitorConvergence = {
+/**
+ * PEN-6228: the identity of the gate set an arm is waiting on — what
+ * `computeIssueMonitorGateFingerprint` returns, without the counting the
+ * convergence guard layers on top. Every arm that knows its gate set records
+ * this, including the arms the guard itself declines to score.
+ */
+export type IssueMonitorGateIdentity = {
   fingerprint: string;
   source: IssueMonitorGateSource;
+};
+
+export type IssueMonitorConvergence = IssueMonitorGateIdentity & {
   count: number;
   threshold: number;
   converged: boolean;
@@ -1584,12 +1614,26 @@ function applyMonitorTransition(
         if (sameAssigneeResetAfterPriorStall) {
           throw unprocessable(MONITOR_CONVERGENCE_RESET_REQUIRES_NON_ASSIGNEE_MESSAGE);
         }
-        convergence = input.monitorExplicitlyUpdated && input.unresolvedBlockerIssueIds !== null
+        const gateSetKnown = input.monitorExplicitlyUpdated && input.unresolvedBlockerIssueIds !== null;
+        convergence = gateSetKnown
           ? evaluateIssueMonitorConvergence({
             monitor: input.policy.monitor,
             previous: convergenceBaseMonitorState,
             unresolvedBlockerIssueIds: input.unresolvedBlockerIssueIds ?? [],
             threshold: input.monitorConvergenceThreshold ?? null,
+          })
+          : null;
+        // PEN-6228: the evaluator returns null for a monitor it does not score
+        // (`external_service`, or board/manager-scheduled). Record the gate
+        // identity anyway whenever this arm knows the gate set, so the stored
+        // `gateFingerprint`/`gateSource` describe the `gateSignals` persisted by
+        // this same write rather than a digest from an earlier, unrelated era.
+        // Only `convergenceCount` stays exempt — that is what the guard is for.
+        const gateIdentity = gateSetKnown && !convergence
+          ? computeIssueMonitorGateFingerprint({
+            gateSignals: input.policy.monitor.gateSignals,
+            unresolvedBlockerIssueIds: input.unresolvedBlockerIssueIds ?? [],
+            notes: input.policy.monitor.notes,
           })
           : null;
         if (convergence?.converged) {
@@ -1612,7 +1656,7 @@ function applyMonitorTransition(
             convergenceBaseMonitorState,
             input.policy.monitor,
             convergence,
-            { preserveConvergence },
+            { preserveConvergence, gateIdentity },
           );
         }
       }
