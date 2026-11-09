@@ -223,6 +223,7 @@ jobs:
       always() && github.event_name != 'workflow_dispatch' &&
       (needs.build-and-push.result == 'failure' || needs.build-and-push.result == 'cancelled')
     runs-on: arc-paperclip-light
+    timeout-minutes: 10
     # actions: read + checks: read are what let the script tell a timeout kill
     # from a concurrency supersede and from a human cancel. All three report
     # `cancelled`; only the annotations separate them, and without these scopes
@@ -270,6 +271,7 @@ jobs:
       always() && github.event_name != 'workflow_dispatch' &&
       needs.build-and-push.result == 'success'
     runs-on: arc-paperclip-light
+    timeout-minutes: 10
     permissions:
       contents: read
     steps:
