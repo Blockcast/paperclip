@@ -41,9 +41,14 @@ export const agentWakeupRequests = pgTable(
     // (`MAX(requested_at) ... WHERE source = 'timer' GROUP BY agent_id`), which
     // runs on every scheduler pass. `agentRequestedIdx` above cannot: it has no
     // `source` column, so Postgres must read each agent's entire history and
-    // filter — and this is the largest table in the schema with no pruning, so
-    // that scan grows without bound. Partial on `source = 'timer'` keeps it O(1)
-    // per agent regardless of table size.
+    // filter — and this is the largest table in the schema, pruned only to a
+    // 14-day window, so that scan grows with the whole retained window.
+    // ⚠️ The pruning is OUT OF THIS REPO and cannot be found by grepping it:
+    // onprem-k8s `paperclip/postgres-retention.yaml`, CronJob
+    // `paperclip-pg-retention` (ns `paperclip`, 04:30Z daily, runtime_days=14).
+    // It nulls `heartbeat_runs.wakeup_request_id` past the same cutoff FIRST,
+    // which releases the FK exemption on the DELETE below it.
+    // Partial on `source = 'timer'` keeps it O(1) per agent regardless of size.
     timerBaselineIdx: index("agent_wakeup_requests_timer_baseline_idx")
       .on(table.agentId, table.requestedAt.desc())
       .where(sql`${table.source} = 'timer'`),
