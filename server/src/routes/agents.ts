@@ -78,6 +78,7 @@ import {
   collectAgentAdapterWorkspaceCommandPaths,
 } from "./workspace-command-authz.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
+import { normalizeSnapshotBudgetCents } from "../services/agents.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
@@ -3741,21 +3742,26 @@ export function agentRoutes(
       //     whose revision carries the current cap restores it to itself and
       //     is allowed, so this does not refuse every rollback by every agent
       //     whose config history predates its current budget.
-      // Compared post-normalization, against the same `Math.max(0,
-      // Math.floor(...))` `configPatchFromSnapshot` applies, so a snapshot
-      // that only differs where the normalizer erases the difference is not
-      // refused for a write it would not have made.
+      // Compared post-normalization, through the very function
+      // `configPatchFromSnapshot` applies (`normalizeSnapshotBudgetCents`,
+      // exported from `services/agents.ts`), so a snapshot that only differs
+      // where the normalizer erases the difference is not refused for a write
+      // it would not have made. Shared rather than duplicated on purpose: a
+      // second copy could drift and make this guard answer about a value the
+      // rollback would never have written (PEN-6277).
       const restoredBudget = asRecord(revision.afterConfig)?.budgetMonthlyCents;
       if (
         typeof restoredBudget === "number"
         && Number.isFinite(restoredBudget)
-        && Math.max(0, Math.floor(restoredBudget)) !== existing.budgetMonthlyCents
+        && normalizeSnapshotBudgetCents(restoredBudget) !== existing.budgetMonthlyCents
       ) {
         res.status(422).json({
           error:
-            "This revision restores a different monthly budget cap. Use PATCH "
-            + "/api/agents/:agentId/budgets to change one: a rollback writes only the display "
-            + "mirror and would not change enforcement.",
+            "This revision restores a different monthly budget cap. Changing a cap requires "
+            + "a BOARD actor: enforcement reads `budget_policies`, written only by PATCH "
+            + "/api/agents/:agentId/budgets, which is board-only and refuses an agent. A "
+            + "rollback writes only the display mirror on the agent row and would not change "
+            + "enforcement.",
         });
         return;
       }
@@ -4524,8 +4530,10 @@ export function agentRoutes(
     if (hasOwn(req.body as object, "budgetMonthlyCents")) {
       res.status(422).json({
         error:
-          "Use PATCH /api/agents/:agentId/budgets to change a monthly budget cap. "
-          + "This route writes only the display mirror and would not change enforcement.",
+          "Changing a monthly budget cap requires a BOARD actor: enforcement reads "
+          + "`budget_policies`, written only by PATCH /api/agents/:agentId/budgets, which is "
+          + "board-only and refuses an agent. This route writes only the display mirror and "
+          + "would not change enforcement.",
       });
       return;
     }

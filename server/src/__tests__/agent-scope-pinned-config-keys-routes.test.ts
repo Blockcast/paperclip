@@ -566,6 +566,11 @@ describe("POST /api/agents/:id/config-revisions/:revisionId/rollback — budget 
     const res = await rollback(app);
 
     expect(res.status).toBe(422);
+    // PEN-6277. The route substring alone passed while the message read as a
+    // dead end: the budgets route is `assertBoard`-gated (`routes/costs.ts`),
+    // so an AGENT that followed it got a 403. Pin the actor class the reader
+    // has to escalate to, or the message can regress to naming the route alone.
+    expect(res.body.error).toMatch(/board/i);
     expect(res.body.error).toContain("/api/agents/:agentId/budgets");
     expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
   });
@@ -607,10 +612,13 @@ describe("POST /api/agents/:id/config-revisions/:revisionId/rollback — budget 
     expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalled();
   });
 
-  // MUST-PASS ARM: the comparison is taken AFTER `configPatchFromSnapshot`'s
-  // own `Math.max(0, Math.floor(...))`, so a snapshot that differs only where
-  // the normalizer erases the difference is not refused for a write the
-  // rollback would never have made.
+  // MUST-PASS ARM: the comparison is taken AFTER the normalizer
+  // `configPatchFromSnapshot` applies, which since PEN-6277 is the shared
+  // `normalizeSnapshotBudgetCents` rather than a second copy of the same
+  // expression -- so a snapshot that differs only where the normalizer erases
+  // the difference is not refused for a write the rollback would never have
+  // made. The normalizer's own CLAMP arm is pinned in
+  // `snapshot-budget-normalizer.test.ts`; this arm covers only the floor.
   it("allows a fractional snapshot value that normalizes to the current cap", async () => {
     reviseToBudget(1_300_000.7);
     const app = await createApp(selfAgentActor());
