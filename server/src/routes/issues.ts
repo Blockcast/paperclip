@@ -11842,16 +11842,33 @@ export function issueRoutes(
     // come from the patch where it names them and from the stored row where it
     // does not, which is why this cannot live in the schema.
     //
-    // It judges only the value this request WRITES. A PATCH that leaves
-    // `externalId` alone is not refused because the row's existing key is
+    // It judges only the value this request WRITES. A PATCH that leaves the
+    // row's SCOPE and its key alone is not refused because the stored key is
     // non-canonical: that would block unrelated edits -- a title fix, a status
     // move -- on the legacy rows written before this guard existed, which is a
     // regression and repairs nothing.
-    if (Object.prototype.hasOwnProperty.call(req.body, "externalId")) {
+    //
+    // `type` and `provider` are patchable on their own, though, and MOVING a
+    // row into the guarded `(github, pull_request)` space writes its key in
+    // every sense that matters here. `PATCH {type: "pull_request"}` on a github
+    // `artifact` row keyed `owner/repo:path@sha`, or `PATCH {provider:
+    // "github"}` on a gitlab `pull_request` row, would otherwise land a key the
+    // lookup can never ask for -- this same defect, reached one field over.
+    //
+    // The trigger is the scope CHANGING, not the body merely naming `type` or
+    // `provider`. Re-sending a row's existing type alongside a title edit moves
+    // nothing, and refusing it would reintroduce exactly the legacy-row
+    // regression the paragraph above rules out.
+    const bodyNamesExternalId = Object.prototype.hasOwnProperty.call(req.body, "externalId");
+    const effectiveType = patch.type ?? existing.type;
+    const effectiveProvider = patch.provider ?? existing.provider;
+    const workProductScopeChanged = effectiveType !== existing.type
+      || effectiveProvider !== existing.provider;
+    if (bodyNamesExternalId || workProductScopeChanged) {
       const externalIdForWrite = canonicalizeWorkProductExternalIdForWrite({
-        type: patch.type ?? existing.type,
-        provider: patch.provider ?? existing.provider,
-        externalId: patch.externalId,
+        type: effectiveType,
+        provider: effectiveProvider,
+        externalId: bodyNamesExternalId ? patch.externalId : existing.externalId,
       });
       if (!externalIdForWrite.ok) {
         res.status(400).json({
@@ -11860,7 +11877,13 @@ export function issueRoutes(
         });
         return;
       }
-      patch.externalId = externalIdForWrite.externalId;
+      // A scope-only PATCH writes `externalId` only where canonicalising it
+      // actually changed something -- a row moving OUT of the guarded space, or
+      // one whose key was already canonical, must not have a column the request
+      // never mentioned rewritten underneath it.
+      if (bodyNamesExternalId || externalIdForWrite.externalId !== existing.externalId) {
+        patch.externalId = externalIdForWrite.externalId;
+      }
     }
     if (requiresPaperclipAttachmentMetadata(patch, existing)) {
       if (patch.metadata !== undefined) {
@@ -11892,10 +11915,14 @@ export function issueRoutes(
       return "external_identity_conflict" as const;
     });
     if (product === "external_identity_conflict") {
+      // The key this patch would have landed. On a scope-only PATCH that is the
+      // row's existing key, which the body never named -- reading
+      // `patch.externalId` there would report `externalId undefined`.
+      const conflictingExternalId = patch.externalId !== undefined ? patch.externalId : existing.externalId;
       res.status(409).json({
-        error: `This issue already owns a ${patch.provider ?? existing.provider} `
-          + `${patch.type ?? existing.type} work product with externalId `
-          + `${JSON.stringify(patch.externalId)}. Patch that row rather than pointing a second one `
+        error: `This issue already owns a ${effectiveProvider} `
+          + `${effectiveType} work product with externalId `
+          + `${JSON.stringify(conflictingExternalId)}. Patch that row rather than pointing a second one `
           + "at the same artifact.",
         code: "work_product_external_identity_conflict",
       });

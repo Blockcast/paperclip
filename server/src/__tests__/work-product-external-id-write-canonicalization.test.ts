@@ -394,6 +394,173 @@ describeEmbeddedPostgres("work-product external-id write canonicalization", () =
     expect(res.body.externalId).toBe("2124");
   }, 120_000);
 
+  // The guard fires on the scope CHANGING, not on the body naming `type`. A
+  // request that re-sends the type a legacy row already has moves nothing, and
+  // refusing it would make the row uneditable for the reason the test above
+  // rules out -- just with one more key in the body.
+  it("does not refuse an edit that re-sends the type a non-canonical row already has", async () => {
+    const company = await seedCompany(db, "ScopeNoop");
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, company, 1);
+    const [legacy] = await db
+      .insert(issueWorkProducts)
+      .values({
+        companyId: company.id,
+        issueId: issue.id,
+        type: "pull_request",
+        provider: "github",
+        externalId: "2124",
+        title: "Written before this guard existed",
+        status: "active",
+      })
+      .returning();
+    const app = await createApp(db, agentActor(company.id, agent.id));
+
+    const res = await request(app)
+      .patch(`/api/work-products/${legacy!.id}`)
+      .send({ title: "Retitled", type: "pull_request" });
+
+    expect(res.status).toBe(200);
+    expect(res.body.title).toBe("Retitled");
+    expect(res.body.externalId).toBe("2124");
+  }, 120_000);
+
+  // `type` and `provider` are patchable on their own, so a PATCH that names
+  // NEITHER `externalId` nor anything else about the key can still move a row
+  // INTO the guarded `(github, pull_request)` space -- landing a stored key the
+  // lookup can never ask for, which is this PR's own defect one field over.
+  it("refuses a type-only PATCH that moves a non-canonical key into the pull_request space", async () => {
+    const company = await seedCompany(db, "ScopeType");
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, company, 1);
+    const app = await createApp(db, agentActor(company.id, agent.id));
+
+    // A real `artifact` external-id shape, which is legitimate for an artifact
+    // and meaningless as a pull-request key.
+    const created = await request(app)
+      .post(`/api/issues/${issue.id}/work-products`)
+      .send({
+        type: "artifact",
+        provider: "github",
+        externalId: "Blockcast/paperclip:server/src/routes/issues.ts@e51da62",
+        title: "A file at a commit",
+      });
+    expect(created.status).toBe(201);
+
+    const moved = await request(app)
+      .patch(`/api/work-products/${created.body.id}`)
+      .send({ type: "pull_request" });
+
+    expect(moved.status).toBe(400);
+    expect(moved.body.code).toBe("work_product_external_id_not_canonical");
+    const [row] = await db.select().from(issueWorkProducts);
+    expect(row!.type).toBe("artifact");
+    expect(row!.externalId).toBe("Blockcast/paperclip:server/src/routes/issues.ts@e51da62");
+  }, 120_000);
+
+  it("refuses a provider-only PATCH that moves a non-github pull_request key into the github space", async () => {
+    const company = await seedCompany(db, "ScopeProvider");
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, company, 1);
+    const app = await createApp(db, agentActor(company.id, agent.id));
+
+    const created = await request(app)
+      .post(`/api/issues/${issue.id}/work-products`)
+      .send({ type: "pull_request", provider: "gitlab", externalId: "group/project!7", title: "MR !7" });
+    expect(created.status).toBe(201);
+    expect(created.body.externalId).toBe("group/project!7");
+
+    const moved = await request(app)
+      .patch(`/api/work-products/${created.body.id}`)
+      .send({ provider: "github" });
+
+    expect(moved.status).toBe(400);
+    expect(moved.body.code).toBe("work_product_external_id_not_canonical");
+    const [row] = await db.select().from(issueWorkProducts);
+    expect(row!.provider).toBe("gitlab");
+  }, 120_000);
+
+  // The same scope move, with a key that DOES have a canonical reading: the row
+  // arrives in the guarded space reachable, rather than being refused.
+  it("canonicalises the stored key on a type-only PATCH when that key has a canonical reading", async () => {
+    const company = await seedCompany(db, "ScopeRepair");
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, company, 1);
+    const app = await createApp(db, agentActor(company.id, agent.id));
+
+    const created = await request(app)
+      .post(`/api/issues/${issue.id}/work-products`)
+      .send({ type: "artifact", provider: "github", externalId: PR_URL, title: "Filed as an artifact" });
+    expect(created.status).toBe(201);
+    expect(created.body.externalId).toBe(PR_URL);
+
+    const moved = await request(app)
+      .patch(`/api/work-products/${created.body.id}`)
+      .send({ type: "pull_request" });
+
+    expect(moved.status).toBe(200);
+    expect(moved.body.externalId).toBe(PR_CANONICAL);
+
+    const lookup = await request(app)
+      .get(`/api/companies/${company.id}/work-products/by-external-id`)
+      .query({ externalId: PR_CANONICAL });
+    expect(lookup.body.owners).toHaveLength(1);
+  }, 120_000);
+
+  // The must-not-fire control for the two refusals above: a scope PATCH moving
+  // a row OUT of the guarded space is neither refused nor rewritten, and the
+  // guard must not write a column the request never mentioned.
+  it("leaves a scope PATCH that moves a row out of the pull_request space alone", async () => {
+    const company = await seedCompany(db, "ScopeExit");
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, company, 1);
+    const app = await createApp(db, agentActor(company.id, agent.id));
+
+    const created = await request(app)
+      .post(`/api/issues/${issue.id}/work-products`)
+      .send({ type: "pull_request", provider: "github", externalId: "Blockcast/paperclip#1", title: "PR #1" });
+    expect(created.status).toBe(201);
+
+    const moved = await request(app)
+      .patch(`/api/work-products/${created.body.id}`)
+      .send({ type: "artifact" });
+
+    expect(moved.status).toBe(200);
+    expect(moved.body.type).toBe("artifact");
+    expect(moved.body.externalId).toBe("Blockcast/paperclip#1");
+  }, 120_000);
+
+  // A scope-only PATCH can now reach migration 0216's unique index too, and the
+  // 409 it raises must name the key that actually collided. That key lives on
+  // the stored row, not in the body -- reading the patch alone reports
+  // `externalId undefined` on the one message whose job is to name it.
+  it("names the colliding key in the 409 raised by a scope-only PATCH", async () => {
+    const company = await seedCompany(db, "ScopeConflict");
+    const agent = await seedAgent(db, company.id);
+    const issue = await seedIssue(db, company, 1);
+    const app = await createApp(db, agentActor(company.id, agent.id));
+
+    const incumbent = await request(app)
+      .post(`/api/issues/${issue.id}/work-products`)
+      .send({ type: "pull_request", provider: "github", externalId: PR_CANONICAL, title: "PR #3205" });
+    expect(incumbent.status).toBe(201);
+
+    const sameKeyOtherType = await request(app)
+      .post(`/api/issues/${issue.id}/work-products`)
+      .send({ type: "artifact", provider: "github", externalId: PR_CANONICAL, title: "Same key, other type" });
+    expect(sameKeyOtherType.status).toBe(201);
+
+    const collided = await request(app)
+      .patch(`/api/work-products/${sameKeyOtherType.body.id}`)
+      .send({ type: "pull_request" });
+
+    expect(collided.status).toBe(409);
+    expect(collided.body.code).toBe("work_product_external_identity_conflict");
+    expect(collided.body.error).toContain(PR_CANONICAL);
+    expect(collided.body.error).not.toContain("undefined");
+    expect(await db.select().from(issueWorkProducts)).toHaveLength(2);
+  }, 120_000);
+
   // Canonicalising on write MERGES two previously-distinct key spaces, so a URL
   // and the canonical key for one pull request can now collide on migration
   // 0216's unique index where they could not before. `createForIssue` is a plain
