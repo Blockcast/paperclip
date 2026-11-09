@@ -9,10 +9,15 @@ name: missing-review-sweep
 # set. The only surface carrying the fact is the workflow run's own
 # `conclusion`, which none of those readers consult.
 #
-# Measured 2026-11-09 on this repo: 22 of 35 `pull_request_target` runs in the
-# 16:02:12Z -> 18:43:24Z window ended `startup_failure` (62.9%, against 1.5%
-# over the 67 runs earlier that day), leaving 15 open PRs with no `review`
-# verdict. `merge_group` was a clean negative control at 0 of 15.
+# Measured 2026-11-09 on this repo, re-derived from the data's own edges over
+# 300 runs: 22 of the 26 `pull_request_target` runs in the 16:02:12Z ->
+# 17:45:43Z window ended `startup_failure` (84.6%), against 0.0% over the 181
+# prior-day runs and 0.0% over the 26 runs after it. It left 15 open PRs with
+# no `review` verdict and self-resolved with no action by anyone. `merge_group`
+# was a clean negative control at 0 of 300. The CAUSE IS UNNAMED -- a
+# `startup_failure` has no job and no log, so settling it needs Actions admin
+# on the org. An earlier attribution to a declared GitHub incident was
+# withdrawn: the burst ended 26m54s BEFORE that incident was declared.
 #
 # SIBLING, deliberately not merged with this one. review-gate-sweep.yml
 # backstops a lost Ally REVIEWER WAKE and keys on the absence of an Ally
@@ -78,8 +83,11 @@ jobs:
           node scripts/sweep-missing-review.mjs > sweep.json
           node scripts/report-missing-review-sweep.mjs sweep.json >> "$GITHUB_OUTPUT"
 
-      - name: Publish a NOT-MEASURED row on each head missing the verdict
-        if: steps.sweep.outputs.findings != '0'
+      - name: Publish NOT-MEASURED rows, and retire the ones now resolved
+        # Gated on `publish`, not `findings`: a sweep can find nothing new and
+        # still owe a retirement row on a head that recovered, and gating on
+        # `findings` would strand the stale `neutral` marker on exactly those.
+        if: steps.sweep.outputs.publish != '0'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
