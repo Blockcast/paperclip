@@ -79,6 +79,13 @@ vi.mock("../services/secrets.js", () => ({ secretService: () => mockSecretServic
 vi.mock("../services/environments.js", () => ({ environmentService: () => mockEnvironmentService }));
 vi.mock("../adapters/index.js", () => ({
   findServerAdapter: mockFindServerAdapter,
+  // Reached by `adapterSupportsInstructionsBundle` on the create/hire paths.
+  // `undefined` is the "adapter declares nothing" case, which falls back to
+  // DEFAULT_MANAGED_INSTRUCTIONS_ADAPTER_TYPES — the production shape for
+  // `codex_local`. Omitting it does not fail the test; it 500s the request
+  // BEFORE the guard under test, which reads as a refusal in one arm and as a
+  // pass in the other.
+  findActiveServerAdapter: vi.fn(() => undefined),
   listAdapterModels: vi.fn(),
 }));
 
@@ -88,6 +95,7 @@ function registerModuleMocks() {
   vi.doMock("../services/environments.js", () => ({ environmentService: () => mockEnvironmentService }));
   vi.doMock("../adapters/index.js", () => ({
     findServerAdapter: mockFindServerAdapter,
+    findActiveServerAdapter: vi.fn(() => undefined),
     listAdapterModels: vi.fn(),
   }));
 }
@@ -377,5 +385,205 @@ describe("POST /api/agents/:id/config-revisions/:revisionId/rollback (PEN-6188)"
 
     expect(res.status).toBe(200);
     expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalled();
+  });
+});
+
+// PEN-6201. `configPatchFromSnapshot` restores BOTH `adapterConfig` and
+// `runtimeConfig`, and the block above closed only the first arm.
+// `runtimeConfig.modelProfiles.*.adapterConfig` is a real adapter config whose
+// instructions keys are honoured at dispatch (measured in
+// heartbeat-model-profile.test.ts, "instructions-bundle reachability"), and
+// `assertNoAgentRuntimeConfigAdapterConfigMutation` is the guard PATCH holds
+// over it. Rollback made no such call.
+describe("POST /api/agents/:id/config-revisions/:revisionId/rollback — runtimeConfig (PEN-6201)", () => {
+  function reviseTo(afterConfig: Record<string, unknown>) {
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: REVISION_ID,
+      agentId: AGENT_ID,
+      afterConfig: { adapterConfig: { enableGitHubPublishBroker: true }, ...afterConfig },
+    });
+  }
+
+  function withModelProfile(adapterConfig: Record<string, unknown>) {
+    return { runtimeConfig: { modelProfiles: { cheap: { adapterConfig } } } };
+  }
+
+  // THE REGRESSION. Pre-fix this returned 200 and the restored profile config
+  // reached the run's effective adapter config, re-pointing the instructions
+  // bundle the agent runs from.
+  it("refuses an agent rolling back to a profile adapterConfig with a different instructions path", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({
+      runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { instructionsRootPath: "/paperclip/agents/self" } } } },
+    }));
+    reviseTo(withModelProfile({ instructionsRootPath: "/tmp/attacker" }));
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("runtimeConfig.modelProfiles.cheap.adapterConfig.instructionsRootPath");
+    expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+  });
+
+  // A profile the agent's stored runtimeConfig does not have at all. The diff
+  // baseline is `null` there, so an introduction has to count as a change — a
+  // guard keyed only on "this profile's stored value differs" would pass this.
+  it("refuses an agent rolling back to a NEW profile carrying an instructions path", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({ runtimeConfig: {} }));
+    reviseTo(withModelProfile({ instructionsFilePath: "/tmp/attacker/AGENTS.md" }));
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("runtimeConfig.modelProfiles.cheap.adapterConfig.instructionsFilePath");
+  });
+
+  // The `pinnedKeySourceConfig` half, and the one arm that is about WHICH
+  // object the pinned SET is read from rather than about the diff. The agent's
+  // own config has the broker ON, so the composition keys are pinned for this
+  // run; the PROFILE's stored config does not mention the broker. Computing
+  // the set from the profile — which is what this guard did — reads the
+  // conditional's input off an object that cannot carry it, and lets
+  // `enableDocker` through.
+  it("refuses a profile enableDocker because the AGENT's config has the broker on", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({
+      runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { model: "profile-model" } } } },
+    }));
+    reviseTo(withModelProfile({ model: "profile-model", enableDocker: true }));
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("runtimeConfig.modelProfiles.cheap.adapterConfig.enableDocker");
+  });
+
+  // MUST-PASS ARM. Same shape as the refusal above with the broker OFF at
+  // AGENT scope — the composition keys are then not pinned for this run, so
+  // this must still be allowed. Without it, the arm above would also pass a
+  // guard that simply refuses every profile write.
+  it("allows a profile enableDocker while the broker is OFF at agent scope", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({
+      adapterConfig: { model: "stored-model" },
+      runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { model: "profile-model" } } } },
+    }));
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: REVISION_ID,
+      agentId: AGENT_ID,
+      afterConfig: {
+        adapterConfig: { model: "stored-model" },
+        ...withModelProfile({ model: "profile-model", enableDocker: true }),
+      },
+    });
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM: a rollback whose profile config moves no guarded key.
+  it("allows an agent rolling back a profile adapterConfig that moves only a model", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({
+      runtimeConfig: { modelProfiles: { cheap: { adapterConfig: { model: "newer-model" } } } },
+    }));
+    reviseTo(withModelProfile({ model: "older-model" }));
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM: a verbatim round-trip of the stored profile config is not a
+  // change. This is the BLO-32332 shape at one level of nesting — a presence
+  // test here would refuse every rollback by an agent that has any profile.
+  it("allows a rollback that restores the profile config byte-for-byte", async () => {
+    const profileConfig = { instructionsRootPath: "/paperclip/agents/self", model: "profile-model" };
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({
+      runtimeConfig: { modelProfiles: { cheap: { adapterConfig: profileConfig } } },
+    }));
+    reviseTo(withModelProfile({ ...profileConfig }));
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(200);
+  });
+
+  // MUST-PASS ARM: board rollback across the same profile key is untouched.
+  it("allows a BOARD actor to roll back across a profile instructions path", async () => {
+    mockAgentService.getById.mockResolvedValue(makeBrokeredAgent({ runtimeConfig: {} }));
+    reviseTo(withModelProfile({ instructionsRootPath: "/tmp/other" }));
+    const app = await createApp(boardActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalled();
+  });
+});
+
+// PEN-6201, carried over from the same review: the guard runs on agent-authored
+// CREATE and HIRE and nothing pinned that. Those paths pass no
+// `existingAdapterConfig`, so `existing = {}` and
+// `JSON.stringify(false) !== JSON.stringify(undefined)` — a hire carrying
+// `enableGitHubPublishBroker: false` is refused even though `false` is the
+// fleet-wide value.
+//
+// That refusal is INTENDED, not a defect to soften: without it an agent opts
+// out of the boundary by proxy, by hiring a new agent with the key already
+// cleared and working there instead. It is pinned here because it is
+// surprising — an agent-driven hire flow that copies an existing config
+// verbatim starts failing — and an intended refusal nobody wrote down is
+// indistinguishable from a regression when someone meets it.
+describe("POST /api/companies/:companyId/agent-hires — agent-authored (PEN-6201)", () => {
+  const BASE_HIRE = {
+    name: "Hired",
+    role: "engineer",
+    adapterType: "codex_local",
+  };
+
+  function hire(app: express.Express, body: Record<string, unknown>) {
+    return requestApp(app, (baseUrl) =>
+      request(baseUrl).post("/api/companies/company-1/agent-hires").send(body));
+  }
+
+  // `agents:create` has to be allowed for the request to REACH the guard; the
+  // shared `decideAsAgentWithNoGrants` denies it, which would 403 one layer
+  // early and make the refusal arm below pass for the wrong reason.
+  beforeEach(() => {
+    mockAccessService.decide.mockImplementation(async (input: any) =>
+      input.action === "agents:create"
+        ? { allowed: true, reason: "allow_grant", explanation: "Granted." }
+        : decideAsAgentWithNoGrants(input));
+  });
+
+  it("refuses an agent hiring with enableGitHubPublishBroker present, even at false", async () => {
+    const app = await createApp(selfAgentActor());
+    const res = await hire(app, { ...BASE_HIRE, adapterConfig: { enableGitHubPublishBroker: false } });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("adapterConfig.enableGitHubPublishBroker");
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).not.toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM, and the half that makes the refusal above a finding about
+  // THIS key rather than about the hire path refusing everything.
+  //
+  // Asserted on a PROGRESS MARKER, not on the status, and that is the point:
+  // this suite does not mock the hire route's `db.select` for the company, so
+  // the request 500s a few statements past the guard either way. A plain
+  // `expect(status).not.toBe(403)` therefore passes whether the guard allowed
+  // the write or the request died before ever reaching it — measured, it was
+  // passing for the second reason while the adapters mock was missing
+  // `findActiveServerAdapter`.
+  //
+  // `secretService.normalizeAdapterConfigForPersistence` is the first mocked
+  // call AFTER both guards (`routes/agents.ts`, hire path), so calling it is
+  // positive evidence the guard let the request through, and the refusal arm
+  // above asserts the converse.
+  it("does not refuse an agent hire that names no pinned key", async () => {
+    const app = await createApp(selfAgentActor());
+    const res = await hire(app, { ...BASE_HIRE, adapterConfig: { model: "some-model" } });
+
+    expect(res.status).not.toBe(403);
+    expect(mockSecretService.normalizeAdapterConfigForPersistence).toHaveBeenCalled();
   });
 });

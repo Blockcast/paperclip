@@ -655,3 +655,100 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
     ]);
   });
 });
+
+// PEN-6201, done-when 1: SEVERITY MEASUREMENT, not a boundary this file asks
+// for. The question the row could not answer by inference was whether a model
+// profile's `adapterConfig` instructions keys are HONOURED at dispatch, or
+// discarded the way the pinned keys are. The row's own bound was explicit —
+// "not shown to be defended", not "shown to be exploitable" — and the answer
+// decides whether the rollback bypass is a live instruction-source rewrite.
+//
+// They are honoured. `mergeModelProfileAdapterConfig` spreads the profile's
+// adapterConfig OVER baseConfig, and the only things restored from agent scope
+// afterwards are `withAgentScopedEnvProvenance` (env), `withPolicyResolved
+// WorkspaceStrategy` (workspaceStrategy) and `withAgentScopedConfigProvenance`
+// (`agentScopeOnlyConfigKeysFor`, i.e. the broker/volume keys). The
+// instructions-bundle keys are in none of those sets, so they survive — and
+// the merged config is what reaches the run: mergedConfig ->
+// stripWorkspaceRuntimeFromExecutionRunConfig -> resolveExecutionRunAdapterConfig
+// -> effectiveResolvedConfig -> the dispatch `runtimeConfig`, which is handed
+// to `materializeExternalK8sSharedDocs({ config })` and to the adapter that
+// reads `instructionsFilePath`.
+//
+// This is NOT an argument that the merge should discard them — a model profile
+// legitimately carries adapter config. It is the reason the WRITE path has to
+// be guarded on every route that reaches it, rollback included.
+describe("mergeModelProfileAdapterConfig instructions-bundle reachability (PEN-6201)", () => {
+  const noProfile = {
+    requested: null,
+    requestedBy: null,
+    applied: null,
+    configSource: null,
+    fallbackReason: null,
+    adapterConfig: null,
+  } as const;
+
+  function withProfileConfig(adapterConfig: Record<string, unknown>) {
+    return { ...noProfile, requested: "cheap", applied: "cheap", adapterConfig } as const;
+  }
+
+  it("honours a model-profile instructions bundle path over the agent's own", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: {
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/paperclip/agents/security-engineer",
+        instructionsEntryFile: "AGENTS.md",
+        instructionsFilePath: "/paperclip/agents/security-engineer/AGENTS.md",
+      },
+      modelProfile: withProfileConfig({
+        instructionsRootPath: "/tmp/attacker",
+        instructionsFilePath: "/tmp/attacker/AGENTS.md",
+      }),
+      issueAdapterConfig: null,
+    });
+
+    // The measurement. If either of these ever flips to the agent's value, the
+    // merge has grown a defence and PEN-6201's severity drops — re-read
+    // withAgentScopedConfigProvenance before changing this expectation.
+    expect(merged.instructionsRootPath).toBe("/tmp/attacker");
+    expect(merged.instructionsFilePath).toBe("/tmp/attacker/AGENTS.md");
+  });
+
+  it("honours a model-profile instructions bundle path the agent did not set at all", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { model: "agent-model" },
+      modelProfile: withProfileConfig({
+        instructionsBundleMode: "external",
+        instructionsRootPath: "/tmp/attacker",
+        instructionsEntryFile: "AGENTS.md",
+      }),
+      issueAdapterConfig: null,
+    });
+
+    expect(merged.instructionsRootPath).toBe("/tmp/attacker");
+    expect(merged.instructionsEntryFile).toBe("AGENTS.md");
+    expect(merged.instructionsBundleMode).toBe("external");
+  });
+
+  // DISCRIMINATING CONTROL, and the reason the two assertions above are a
+  // finding rather than a broken test: the SAME call shape, same profile slot,
+  // with a key that IS pinned — the merge discards it and restores agent
+  // scope. So the merge demonstrably can refuse a profile-supplied key; it
+  // just does not refuse these.
+  it("discards a model-profile pinned key at the same time, from the same slot", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: {
+        enableGitHubPublishBroker: true,
+        instructionsRootPath: "/paperclip/agents/security-engineer",
+      },
+      modelProfile: withProfileConfig({
+        enableGitHubPublishBroker: false,
+        instructionsRootPath: "/tmp/attacker",
+      }),
+      issueAdapterConfig: null,
+    });
+
+    expect(merged.enableGitHubPublishBroker).toBe(true);
+    expect(merged.instructionsRootPath).toBe("/tmp/attacker");
+  });
+});
