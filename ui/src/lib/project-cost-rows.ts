@@ -5,9 +5,14 @@ import type { CostByProject } from "@paperclipai/shared";
  *
  * The card's job changed when `costs/by-project` stopped dropping spend that resolves to
  * no project. It now serves an UNATTRIBUTED bucket (`projectId === null`), so the rows
- * sum to `costs/summary` over the same window and the two cards on the page agree. The
- * label and the reconciliation check live here rather than in `Costs.tsx` so they are
- * testable without mounting the page.
+ * sum to the window total served beside them. The label and the reconciliation check live
+ * here rather than in `Costs.tsx` so they are testable without mounting the page.
+ *
+ * PEN-6038 note: the page clamps the `by-project` REQUEST to the server's window cap
+ * (`lib/by-project-window.ts`), so this card's window can be narrower than the one the
+ * Summary card shows. Everything below is therefore stated against the window THIS
+ * response answered for -- do not restate it as "the two cards on the page agree", which
+ * holds only while the selection fits inside the cap.
  */
 
 /** DESIGN.md principle 7: one name per concept, declared once. */
