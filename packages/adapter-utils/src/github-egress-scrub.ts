@@ -232,6 +232,28 @@ const ENVIRONMENT_DUMP_RE = new RegExp(
 // natively, not a wider regex on this door; Blockcast/paperclip runs none
 // today, which is PEN-6170. Revisit this disposition if that population stops
 // being covered elsewhere, or if the quoted-key residual becomes enumerable.
+//
+// PEN-6255: the capture begins at a binding NAME, so the gap is one axis wider
+// than either the spacing (PEN-6162) or the operator (PEN-6167). Both of those
+// still have a binder to widen toward. A value with NO BINDER AT ALL is never
+// a candidate here, at any length, any entropy, any quoting, in any language —
+// so no operator-level change reaches it, and a reader who sees both of those
+// arms land must not read the generic net as general afterwards.
+//
+// Measured 2026-11-09 through the shim's own call shape
+// (`addedLinesFromPatch` then `scrubGitHubEgressText`), one synthetic 32-char
+// opaque value with no vendor prefix per row: a Python tuple element, a YAML
+// sequence item, a positional argument, a JSON array element, a Go slice
+// literal and a bare `return` all pass byte-exact, while `apiSecret="<v>"` on
+// the SAME bytes redacts. The exemption is purely structural — the value
+// clears the shape and entropy floors either way — and it is not a judgement
+// that material written this way is safe.
+//
+// The repo-level scanner named above only covers this population if the rule
+// it ships is TOKEN-shaped. Measured the same run: gitleaks 8.28.0's default
+// `generic-api-key` is name-anchored too and misses all six forms, with the
+// `apiSecret` control and two name-free liveness controls (`github-pat` on a
+// bare tuple element, `private-key` on a PEM) firing alongside.
 const ASSIGNMENT_RE = /\b([A-Za-z_][A-Za-z0-9_]{2,})=(["']?)([A-Za-z0-9+/=_.\-]{16,})/g;
 
 // PEN-3907: a cryptographic content digest bound to a name that says so.
@@ -1547,6 +1569,17 @@ const EXCERPT_MAX_LENGTH = 200;
  * dump rule exists to catch. So when any region class fires on the whole
  * value this returns no locations at all, and the caller reports the classes
  * without line attribution.
+ *
+ * PEN-6255: an empty return is therefore NOT evidence that the input is clean,
+ * and this must never be used to clear a line. `scrubGitHubEgressText` is the
+ * only verdict — it is what the push door itself calls
+ * (`github-git-egress-shim.ts`), and this runs only after that has already
+ * refused. A PEM is the live example: `scrub` reports `private-key-block`
+ * while this returns nothing at all, by the region rule above. Two
+ * line-by-line sweeps of this detector were built on this function and were
+ * fail-open on private keys for exactly that reason; neither sample happened
+ * to contain one, so both read clean. A test pins the divergence so the two
+ * cannot silently converge and make the warning stale.
  */
 export function locateGitHubEgressMatches(input: string): GitHubEgressMatchLocation[] {
   if (typeof input !== "string" || input.length === 0) return [];
