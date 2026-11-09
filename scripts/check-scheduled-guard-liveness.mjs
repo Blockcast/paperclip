@@ -437,6 +437,39 @@ export const WATCHED_GUARDS = [
     event: "schedule",
     graceUntil: "2026-11-10T00:00:00.000Z",
   },
+
+  // PEN-6352. Hourly (cron "41 * * * *") on `arc-paperclip-light`. Detects open
+  // PR heads carrying NO `review` check-run, which is what a `startup_failure`
+  // of commitperclip-review.yml leaves behind: no job, no annotation, no
+  // check-run, so the verdict is ABSENT rather than red and an enumeration of
+  // the head reads complete.
+  //
+  // Watching this one is worth the entry for the same reason the guard exists.
+  // The condition it detects is itself an absence, so a detector that silently
+  // stops producing findings is byte-indistinguishable from a repo with no
+  // missing verdicts -- "producer stopped" and "nothing to report" both render
+  // as an empty findings list. Its own liveness is the only thing separating
+  // them, exactly as for git-egress-residual-trigger-check above.
+  //
+  // The 2.75h bar is ADOPTED, not re-derived: this is an hourly cron on
+  // `arc-paperclip-light`, the same cadence and lane the PEN-3281/PEN-3379
+  // derivation covers (1634 completion gaps; no leg observed in the empty
+  // (118, 213) minute band). Re-derive from this guard's own gaps once it has a
+  // distribution of its own.
+  //
+  // `event: "schedule"` because the only other trigger is `workflow_dispatch`,
+  // and a manual dispatch would bump the newest-run timestamp and mask a dead
+  // cron for one threshold window.
+  //
+  // `graceUntil` because schedules fire only from the default branch, so this
+  // workflow has zero completed schedule runs at merge BY CONSTRUCTION and
+  // would otherwise be born red. After it expires this reverts to a hard red.
+  {
+    workflow: "missing-review-sweep.yml",
+    staleHours: 2.75,
+    event: "schedule",
+    graceUntil: "2026-11-12T00:00:00.000Z",
+  },
 ];
 
 /**

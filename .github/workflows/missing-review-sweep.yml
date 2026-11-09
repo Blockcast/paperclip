@@ -1,0 +1,86 @@
+name: missing-review-sweep
+
+# PEN-6352. Reconciler for a `review` verdict that is ABSENT rather than red.
+#
+# `commitperclip PR Review` can end in `startup_failure`. That conclusion
+# publishes NO job, NO annotation and NO check-run, so the head carries no
+# `review` row at all. Every reader that enumerates check-runs -- the lander, a
+# reviewing agent, a human reading the checks tab -- then sees a clean, complete
+# set. The only surface carrying the fact is the workflow run's own
+# `conclusion`, which none of those readers consult.
+#
+# Measured 2026-11-09 on this repo: 22 of 35 `pull_request_target` runs in the
+# 16:02:12Z -> 18:43:24Z window ended `startup_failure` (62.9%, against 1.5%
+# over the 67 runs earlier that day), leaving 15 open PRs with no `review`
+# verdict. `merge_group` was a clean negative control at 0 of 15.
+#
+# SIBLING, deliberately not merged with this one. review-gate-sweep.yml
+# backstops a lost Ally REVIEWER WAKE and keys on the absence of an Ally
+# consolidated report at the head. This keys on the absence of a CHECK-RUN from
+# a different producer (commitperclip-review.yml). Different producer, different
+# failure mode, disjoint predicates -- a PR can satisfy either one and fail the
+# other.
+#
+# SCOPE LIMIT, stated because it bounds what this can promise: this is itself a
+# GitHub Actions workflow, so it shares a failure domain with the thing it
+# watches and can be degraded by the same incident. It is a RESIDUE detector,
+# not a real-time one. That is sufficient here because the condition is
+# persistent -- a missing verdict stays missing until something re-triggers the
+# gate, so a later successful sweep still catches it. Do NOT read a green sweep
+# taken during an Actions incident as evidence that no verdict is missing;
+# scheduled-guard-liveness.yml is what reports this workflow going dark.
+
+on:
+  schedule:
+    # Hourly, at :41 to avoid the crowded top-of-hour minute that five existing
+    # guards already share (see the quorum note in WATCHED_GUARDS).
+    #
+    # Hourly and not finer is a deliberate reuse rather than a new number: the
+    # 2.75h staleness bar this guard registers under was derived for HOURLY
+    # crons on this lane over 1634 completion gaps (PEN-3281/PEN-3379). A
+    # 30-minute cadence would cut detection latency for a condition that is
+    # persistent anyway, and would put this guard outside the only cadence that
+    # bar has evidence for.
+    - cron: "41 * * * *"
+  workflow_dispatch:
+    inputs:
+      check_name:
+        description: "Check-run name that must be present at each open PR head"
+        required: false
+        default: "review"
+
+permissions:
+  checks: write
+  pull-requests: read
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: arc-paperclip-light
+    steps:
+      - name: Checkout default branch
+        # Pinned to the default branch on purpose. This job holds a
+        # checks-write token, so it must never run a tree a pull request
+        # supplied -- same reasoning as the checkout pin in review-gate.yml.
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Sweep open PR heads for a missing verdict
+        id: sweep
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SWEEP_OWNER: ${{ github.repository_owner }}
+          SWEEP_REPO: ${{ github.event.repository.name }}
+          SWEEP_CHECK_NAME: ${{ inputs.check_name || 'review' }}
+        run: |
+          node scripts/sweep-missing-review.mjs > sweep.json
+          node scripts/report-missing-review-sweep.mjs sweep.json >> "$GITHUB_OUTPUT"
+
+      - name: Publish a NOT-MEASURED row on each head missing the verdict
+        if: steps.sweep.outputs.findings != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: node scripts/publish-missing-review-checks.mjs sweep.json
