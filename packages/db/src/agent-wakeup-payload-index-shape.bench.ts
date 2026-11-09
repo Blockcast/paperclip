@@ -370,9 +370,37 @@ const TARGET_COMPANY = "33333333-3333-4333-8333-333333333333";
 const OTHER_COMPANIES = 19;
 
 /**
- * Scale knobs. The defaults are what every number in the header was taken at.
- * ⛔ A result taken at an override is not comparable to the table above: plan
- * CHOICE is scale-dependent even where per-row cost is not.
+ * Scale knobs. The defaults are what every header number EXCEPT Run B's column
+ * was taken at. ⛔ A result taken at one scale is not comparable to a result
+ * taken at another: plan CHOICE is scale-dependent even where per-row cost is
+ * not -- which is exactly why Run B exists, and why it is reported as its own
+ * column rather than folded into Run A's.
+ *
+ * ✅ Run B's invocation, so its column is reproducible from this file alone:
+ *
+ *   cd packages/db && PEN6104_ROWS=140000 \
+ *     pnpm tsx src/agent-wakeup-payload-index-shape.bench.ts
+ *
+ * ✅ Two of the three knobs are CONFIRMED by the recorded figures rather than
+ * merely asserted. The window falls 158,657 -> 11,116 (14.3x), which fixes
+ * `PEN6104_ROWS` at 140,000; and the dense probe issue's wake count falls
+ * 2,664 -> 186 by the SAME 14.3x, which it could not do had `PEN6104_ISSUES`
+ * scaled too -- per-issue density is `ROWS/ISSUES`, so a proportional `ISSUES`
+ * would have left it flat. `PEN6104_ISSUES` was therefore at its 20,000
+ * default.
+ *
+ * ⚠️ `PEN6104_WRITE_ROWS` is NOT confirmed that way, and the distinction is
+ * the point rather than a quibble: no figure recorded for Run B is a function
+ * of it, because no Run B write-throughput number was kept (finding 8 quotes
+ * none). That it sat at its 100,000 default rests on the run's own record of
+ * changing only the scale -- an author's report, not a derivation. Treat it as
+ * such.
+ *
+ * ⚠️ If it did sit at 100,000, that is ~5% of Run A's table and ~71% of Run
+ * B's -- a real asymmetry between the two columns, corrected nowhere. It does
+ * not reach the EXPLAIN figures, which are taken after the probe's
+ * `VACUUM (ANALYZE)` (see `writeProbe`), but it would make any Run B write
+ * figure incomparable to Run A's, which is the second reason none is quoted.
  */
 const scale = (name: string, fallback: number) => {
   const raw = process.env[name];
@@ -616,9 +644,14 @@ async function main() {
        * ABSOLUTE milliseconds and says nothing about the COMPARISON -- and the
        * comparison is the only thing this file is for.
        *
-       * `ANALYZE` as well as `VACUUM`: these probes insert and delete 5% of
-       * the table, and a plan measured against stale statistics answers a
-       * question about a table that is not there.
+       * `ANALYZE` as well as `VACUUM`: these probes insert and delete
+       * `PEN6104_WRITE_ROWS` rows against a `PEN6104_ROWS`-row table, and a
+       * plan measured against stale statistics answers a question about a
+       * table that is not there. ⚠️ That share is a KNOB, not the constant
+       * this comment used to quote as "5% of the table": it is 5% at the
+       * defaults, but the same 100,000-row default against Run B's 140,000
+       * rows would be ~71%. The smaller the table, the larger the disturbance
+       * this probe makes and the more the `ANALYZE` matters.
        */
       await sql.unsafe(`VACUUM (ANALYZE) agent_wakeup_requests`);
       return { label, rowsPerSec };
