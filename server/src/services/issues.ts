@@ -14355,6 +14355,11 @@ export function issueService(db: Db) {
     // question with no adoption: it clears locks held by TERMINAL runs first —
     // otherwise a dead run A would fence its own agent's run B forever — then
     // re-reads and fences only if a live foreign run still holds the row.
+    //
+    // PEN-6282: that last clause is enforced by the explicit liveness gate below.
+    // The terminal-only clear does not reach a NEVER-STARTED holder, so without
+    // the gate the stated predicate and the shipped one differed on exactly the
+    // `queued`-and-never-executed case.
     assertPendingReviewRunOwnership: async (
       id: string,
       actorAgentId: string,
@@ -14394,6 +14399,55 @@ export function issueService(db: Db) {
         return { owned: true as const, fenced: true as const };
       }
 
+      // PEN-6282: fence only on a holder this request can see to be LIVE.
+      //
+      // The first step clears TERMINAL holders only, while
+      // `isReapableHeartbeatRunRow` — the stated single source of truth for "is
+      // this lock owner reapable" — also reaps a NEVER-STARTED one (`queued` /
+      // `scheduled_retry` with `startedAt == null`). The two predicates
+      // disagreed on exactly that case, and `runOwnsIssueExecutionLock` above is
+      // pure run-id identity, so a `queued` run that had never executed fenced
+      // its own agent's document writes for as long as the dispatch stall
+      // lasted. Measured on a live row 2026-11-08: the 409 body carried
+      // `holderLiveness: "not_live"` while refusing the write, and the longest
+      // same-shape stall observed on that fleet was 11h 00m 44.7s of queued,
+      // never started. BLO-20321 fixed this once for `in_progress`; the drift it
+      // warned about reappeared here when BLO-22666 forked this entry point off
+      // assertCheckoutOwner and inherited the terminal-only clear without
+      // gaining the liveness test that made it sound there.
+      //
+      // The verdict is read from `describeIssueLockConflict`, which this path
+      // already called to build the 409 body — the same round trip now decides
+      // the outcome it was previously only describing, so this costs no extra
+      // query and cannot disagree with what the caller is told.
+      //
+      // Deliberately NOT fixed by widening `clearTerminalIssueRunLocksInTx` to
+      // reap never-started holders: that helper is shared with the checkout
+      // cleanup and the `in_progress` ladder, where adoptStaleCheckoutRun runs
+      // FIRST and its ordering is load-bearing. Fixing the fence keeps the
+      // change inside the one entry point that is wrong, which is the whole
+      // reason this entry point exists separately.
+      const holderConflict = await describeIssueLockConflict({
+        checkoutRunId: current.checkoutRunId,
+        executionRunId: current.executionRunId,
+        actorAgentId,
+        actorRunId,
+      });
+      // Opened on an AFFIRMATIVE "nothing live holds this row" only. `unknown`
+      // means the holder lookup threw, and a holder whose liveness could not be
+      // read is not a holder known to hold nothing — it keeps the fence shut,
+      // as does `live`. Enumerated positively rather than written `!== "live"`
+      // so a verdict added to this union later falls through to the throw
+      // instead of silently widening the opening.
+      const nothingLiveHoldsRow =
+        holderConflict.holderLiveness === "not_live" ||
+        // Unreachable while the `fenced` shape above requires a non-null lock
+        // column, but "no holder at all" is the same answer as "no live holder".
+        holderConflict.holderLiveness === "no_holder";
+      if (nothingLiveHoldsRow) {
+        return { owned: true as const, fenced: false as const };
+      }
+
       throw conflict("Issue run ownership conflict", {
         issueId: current.id,
         status: current.status,
@@ -14403,12 +14457,7 @@ export function issueService(db: Db) {
         actorAgentId,
         actorRunId,
         reason: "pending_review_stage_locked_by_another_run",
-        ...(await describeIssueLockConflict({
-          checkoutRunId: current.checkoutRunId,
-          executionRunId: current.executionRunId,
-          actorAgentId,
-          actorRunId,
-        })),
+        ...holderConflict,
       });
     },
 
