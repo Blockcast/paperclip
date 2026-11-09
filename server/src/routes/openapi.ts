@@ -3421,6 +3421,9 @@ registry.registerPath({
       // read goes blind the moment one retires, so this is the audit filter.
       sourceIssueId: z.string().guid().optional(),
       kind: z.string().optional(),
+      // PEN-6178: the one filter that takes several values, as a COMMA LIST
+      // (`status=resolved,cancelled`) — the service splits it into an `inArray`.
+      // The repeated-key form is a 400, so the spec has to say which form works.
       status: z.string().optional(),
       limit: z.string().optional(),
       offset: z.string().optional(),
