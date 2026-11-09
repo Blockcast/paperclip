@@ -220,6 +220,64 @@ describe("resolveTerminalGate", () => {
     expect(verdict).toMatchObject({ kind: "unresolved", reason: "unresolvable_signal" });
   });
 
+  // ---------------------------------------------------------------------
+  // PEN-6346: the scheduler's dispatch watchdog writes `heartbeat_run:<run id>`
+  // into the gate set to name the queued run it is polling. That is the
+  // scheduler's bookkeeping, not a gate on the issue's work, and nothing the
+  // owner or a re-check can clear. Before it was classified it took the
+  // `unresolvable_signal` branch above and declined the whole row — and since
+  // the watchdog used to REPLACE the declared gates in order to write it, the
+  // row it declined was exactly the stranded one this module exists to catch.
+  // ---------------------------------------------------------------------
+
+  it("ignores a dispatch-watchdog token and resolves on the gates the assignee declared", async () => {
+    const verdict = await resolveTerminalGate({
+      gateSignals: [
+        "heartbeat_run:5ba0efe5-be46-4f22-89f7-ca704ab5e722",
+        "pr:blockcast/paperclip#1281:merged",
+      ],
+      readPullRequestGate: mergedReader(new Set(["blockcast/paperclip#1281"])),
+    });
+    expect(verdict).toEqual({
+      kind: "satisfied",
+      // The watchdog token is absent: the reported set is what was adjudicated,
+      // so no reader is shown a token as part of a gate set nobody read.
+      signals: ["pr:blockcast/paperclip#1281:merged"],
+      mergedPullRequests: ["blockcast/paperclip#1281"],
+      dischargedHumanGates: [],
+    });
+  });
+
+  // The guard, and it is the fail-closed half of the same change. A monitor that
+  // declared no gates of its own and then took a dispatch lapse carries nothing
+  // BUT the watchdog token — a common row, not a corner. Skipping it leaves
+  // nothing adjudicable, and without this the loop falls through to `satisfied`
+  // with an empty `mergedPullRequests`: "there is nothing left to chase", over a
+  // row for which no gate was ever read.
+  it("refuses a gate set made of nothing but dispatch-watchdog tokens", async () => {
+    let reads = 0;
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["heartbeat_run:5ba0efe5-be46-4f22-89f7-ca704ab5e722"],
+      readPullRequestGate: async () => {
+        reads += 1;
+        return { state: "closed", merged: true };
+      },
+    });
+    expect(verdict).toEqual({ kind: "unresolved", reason: "no_adjudicable_gate_signals" });
+    expect(reads, "classification runs to completion before any network read").toBe(0);
+  });
+
+  it("never classifies a dispatch-watchdog token as a human gate", async () => {
+    // Announcing it as one would ask the row's owner to chase a decision nobody
+    // owes — the queue is not a person — which is why the prefix is its own
+    // class rather than an entry in HUMAN_GATE_TOKEN_PREFIXES.
+    const gate = parseTerminalGateSignal("heartbeat_run:5ba0efe5-be46-4f22-89f7-ca704ab5e722");
+    expect(gate).toEqual({
+      kind: "dispatch_watchdog",
+      raw: "heartbeat_run:5ba0efe5-be46-4f22-89f7-ca704ab5e722",
+    });
+  });
+
   // PEN-4545: the verdict between "satisfied" and "unresolved". The human gate
   // here names an artifact that is NOT among the declared pull requests, so
   // nothing discharges it and a person really is all that remains.

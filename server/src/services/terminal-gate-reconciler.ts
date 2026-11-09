@@ -64,6 +64,7 @@ import { issueComments, issueWorkProducts, issues } from "@paperclipai/db";
 import { logger as defaultLogger } from "../middleware/logger.js";
 import { githubGetPullRequestGate, type PullRequestGateResult } from "./github-app-auth.js";
 import {
+  ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX,
   exhaustedMonitorClearReason,
   issueAllowsMonitor,
   normalizeIssueMonitorGateSignals,
@@ -337,6 +338,14 @@ export type ParsedTerminalGateSignal =
        */
       holdProtocol: boolean;
     }
+  /**
+   * The dispatch watchdog's own bookkeeping token, `heartbeat_run:<run id>`
+   * (PEN-6346). Not a gate on the issue's work and not a human decision: it
+   * names a queued run the *scheduler* is watching, and it is resolved by the
+   * watchdog clearing its own monitor. Classified so this module can ignore
+   * it — see `resolveTerminalGate`.
+   */
+  | { kind: "dispatch_watchdog"; raw: string }
   | { kind: "unresolvable"; raw: string };
 
 export type TerminalGateVerdict =
@@ -409,6 +418,14 @@ export function parseTerminalGateSignal(raw: unknown): ParsedTerminalGateSignal 
   if (!token) return null;
   const match = PULL_REQUEST_GATE_PATTERN.exec(token);
   if (!match) {
+    // PEN-6346: the scheduler's own watchdog token, which is nobody's gate.
+    // Tested first because it is the cheapest discriminator and because it must
+    // never reach the human-gate allowlist below — a dispatch lapse is not a
+    // human decision, and announcing it as one would ask an owner to chase the
+    // queue.
+    if (token.startsWith(ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX)) {
+      return { kind: "dispatch_watchdog", raw: token };
+    }
     // Classify before giving up. A human-gate token is no more *readable* than
     // any other unparseable one — the difference is that nobody on a timer can
     // ever clear it, which is a different disposition, not a weaker one.
@@ -534,8 +551,24 @@ export async function resolveTerminalGate(input: {
 
   const parsed: Array<Extract<ParsedTerminalGateSignal, { kind: "pull_request" }>> = [];
   const humanGates: Array<Extract<ParsedTerminalGateSignal, { kind: "human_gate" }>> = [];
+  /**
+   * PEN-6346: the declared set minus the scheduler's own watchdog tokens. The
+   * verdicts below report this rather than the raw declaration, so a reader is
+   * never shown a token as part of a gate set that was not adjudicated.
+   */
+  const adjudicated: string[] = [];
   for (const signal of signals) {
     const gate = parseTerminalGateSignal(signal);
+    // PEN-6346: a dispatch-watchdog token is not a gate on this issue's work.
+    // It names a queued run the scheduler is watching, so it is cleared by the
+    // watchdog rather than by anything the owner or a re-check can do. Before
+    // it was classified it took the `unresolvable_signal` branch below, which
+    // declined the WHOLE row — and because the watchdog *replaced* the declared
+    // gates to write it, the row it declined was precisely the stranded one
+    // this module exists to catch. Skipping it adjudicates what the assignee
+    // actually declared; if that leaves nothing, the guard below fails closed.
+    if (gate?.kind === "dispatch_watchdog") continue;
+    adjudicated.push(signal);
     if (gate?.kind === "human_gate") {
       humanGates.push(gate);
       continue;
@@ -548,6 +581,17 @@ export async function resolveTerminalGate(input: {
       return { kind: "unresolved", reason: "unresolvable_signal", detail: signal };
     }
     parsed.push(gate);
+  }
+
+  // PEN-6346: a gate set made of nothing but watchdog tokens adjudicates
+  // nothing. Without this the loop above would fall all the way through to
+  // `satisfied` with an empty `mergedPullRequests` — announcing "there is
+  // nothing left to chase" over a row no gate was ever read for, which is the
+  // one direction this module refuses. Reachable on any monitor that declared
+  // no gates of its own and then took a dispatch lapse, which is a common row,
+  // not a corner.
+  if (parsed.length === 0 && humanGates.length === 0) {
+    return { kind: "unresolved", reason: "no_adjudicable_gate_signals" };
   }
 
   // Join each human gate to the declared pull request it names. A bare
@@ -658,7 +702,7 @@ export async function resolveTerminalGate(input: {
   if (standingHumanGates.length > 0) {
     return {
       kind: "human_gate_only",
-      signals,
+      signals: adjudicated,
       humanGates: standingHumanGates.sort(),
       heldPullRequests: [...heldOpen].sort(),
       mergedPullRequests: [...merged].sort(),
@@ -667,7 +711,7 @@ export async function resolveTerminalGate(input: {
 
   return {
     kind: "satisfied",
-    signals,
+    signals: adjudicated,
     mergedPullRequests: [...merged].sort(),
     dischargedHumanGates: dischargedHumanGates.sort(),
   };
