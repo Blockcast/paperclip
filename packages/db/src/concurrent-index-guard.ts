@@ -238,8 +238,8 @@ export const PENDING_CONCURRENT_INDEXES: readonly ConcurrentIndexSpec[] = [
   // PEN-6104. Four entries, ONE migration, and the guard builds them
   // sequentially -- which is the point: each `CREATE INDEX CONCURRENTLY` holds
   // back the xmin horizon for its duration, and `agent_wakeup_requests` is the
-  // largest table in the schema, pruned only to a 14-day window. Four at once
-  // would stack those windows.
+  // largest table in the schema with no pruning. Four at once would stack
+  // those windows.
   //
   // ⛔ These are reachable ONLY from the guarded reader in
   // server/src/services/agent-wakeup-target.ts. The partial predicate is
