@@ -82,6 +82,7 @@ import {
   refreshRssReleaseMetrics,
   startScrapeMetricsCollector,
 } from "./services/scrape-metrics-collector.js";
+import { startGithubRateLimitSampler } from "./services/github-rate-limit-sampler.js";
 import { startHeapPeakTracking } from "./services/heap-peak-tracker.js";
 import { startRssReleaseTracking } from "./services/rss-release-tracker.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
@@ -1189,6 +1190,16 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // the project data volume and every tier is a scrape target, so a reconciler
   // that ran on one tier only would leave the other publishing a permanently
   // stale freshness gauge.
+  // PEN-6341. NOT one of the scrape collector's refreshes: those take a `Db`
+  // and run in series inside a 15 s tick, while this makes outbound GitHub
+  // calls. At the collector's cadence three probes would be ~720 calls/h drawn
+  // from the very budget they measure; on their own 5-minute timer they are
+  // ~36/h. Its own timer also keeps a stalled GitHub from delaying every
+  // DB-backed gauge. Unconditional for the same reason as the collector above:
+  // every tier is a scrape target, and the budget is per-installation rather
+  // than per-tier, so a sampler on one tier only would leave the others
+  // publishing nothing while reading as deployed.
+  const stopGithubRateLimitSampler = startGithubRateLimitSampler();
   const stopProjectCheckoutOriginReconciler = startProjectCheckoutOriginReconciler(db);
   // PEN-3314: sample the V8 heap size far faster than the 60s scrape, so a heap
   // excursion that completes between two scrapes still leaves a durable number.
@@ -1327,6 +1338,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
     stopGitHubStatusDeliveryOutbox?.();
     stopPluginStatusCollector?.();
     stopIssueTreeHoldCollector?.();
+    stopGithubRateLimitSampler();
     stopScrapeMetricsCollector();
     stopProjectCheckoutOriginReconciler();
     stopHeapPeakTracking();
