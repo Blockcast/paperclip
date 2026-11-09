@@ -1,0 +1,22 @@
+# Claude Fable 5.2 and Mythos 5.2, and the Claude Code 2.1.321 runtime pin
+
+**Files:** `src/server/models.ts`, `src/server/models.test.ts`, `src/index.ts`,
+`src/server/runtime-pin.ts`, `README.md`.
+
+**Catalog.** Fable 5.2 and Mythos 5.2 were released on 2026-11-09. Direct API ids are
+`claude-fable-5-2` and `claude-mythos-5-2`, each also listed with the `[1m]` 1M-context
+form beside it. Bedrock geo inference ids are `us.anthropic.claude-fable-5-2` and
+`us.anthropic.claude-mythos-5-2`. Fable 5.2 takes the head of the direct list, the
+position Fable 5.1 held. Mythos 5.2 sits after Fable 5.1, because Anthropic's
+verification programs gate access to it. `src/index.ts` and `src/server/models.ts`
+carry the same rows.
+
+**Runtime pin.** `DEFAULT_CLAUDE_CODE_VERSION` moves from `2.1.311` to `2.1.321`.
+2.1.321 is the first release whose changelog adds Fable 5.2, and older clients get the
+API's "does not support this model" 400. 2.1.321 is the npm `latest` and `next`
+dist-tag; `stable` is still 2.1.311. This bump follows `latest` because no `stable`
+build supports the new models; the 2.1.311 bump followed `stable`. Agents without
+`adapterConfig.claudeCodeVersion` install 2.1.321 once into a fresh versioned
+directory on their next Job. Agents with an explicit value, including `"image"`, are
+unaffected. To roll an agent back, pin it to `2.1.311`; that install is still on the
+PVC. The `README.md` row and the config doc in `src/index.ts` follow the constant.

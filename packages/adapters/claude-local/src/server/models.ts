@@ -12,6 +12,8 @@ const BEDROCK_MODELS: AdapterModel[] = [
   { id: "us.anthropic.claude-opus-4-8-v1", label: "Bedrock Opus 4.8" },
   { id: "us.anthropic.claude-opus-5", label: "Bedrock Opus 5" },
   { id: "us.anthropic.claude-sonnet-5", label: "Bedrock Sonnet 5" },
+  { id: "us.anthropic.claude-fable-5-2", label: "Bedrock Fable 5.2" },
+  { id: "us.anthropic.claude-mythos-5-2", label: "Bedrock Mythos 5.2" },
   { id: "us.anthropic.claude-fable-5-1-v1", label: "Bedrock Fable 5.1" },
   { id: "us.anthropic.claude-fable-5-v1", label: "Bedrock Fable 5" },
   { id: "us.anthropic.claude-opus-4-6-v1", label: "Bedrock Opus 4.6" },

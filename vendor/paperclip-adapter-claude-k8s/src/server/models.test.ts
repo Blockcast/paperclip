@@ -29,6 +29,8 @@ describe("listK8sModels", () => {
     expect(new Set(models.map((m) => m.id)).size).toBe(models.length);
     expect(models.some((m) => m.id === "claude-opus-5")).toBe(true);
     expect(models.some((m) => m.id === "claude-opus-5[1m]")).toBe(true);
+    expect(models.some((m) => m.id === "claude-fable-5-2[1m]")).toBe(true);
+    expect(models.some((m) => m.id === "claude-mythos-5-2[1m]")).toBe(true);
     expect(models.some((m) => m.id === "claude-fable-5-1[1m]")).toBe(true);
     expect(models.some((m) => m.id === "claude-opus-5-5[1m]")).toBe(true);
     expect(models.some((m) => m.id === "claude-sonnet-5-5[1m]")).toBe(true);
@@ -45,6 +47,8 @@ describe("listK8sModels", () => {
     const models = await listK8sModels();
     expect(models.some((m) => m.id === "us.anthropic.claude-opus-5")).toBe(true);
     expect(models.some((m) => m.id === "us.anthropic.claude-sonnet-5")).toBe(true);
+    expect(models.some((m) => m.id === "us.anthropic.claude-fable-5-2")).toBe(true);
+    expect(models.some((m) => m.id === "us.anthropic.claude-mythos-5-2")).toBe(true);
     expect(models.some((m) => m.id.includes("anthropic."))).toBe(true);
     expect(models.every((m) => !m.id.startsWith("claude-"))).toBe(true);
   });
