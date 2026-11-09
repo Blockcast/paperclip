@@ -207,11 +207,20 @@ describe("per-route HTTP request-duration histogram (PEN-5136)", () => {
    * by a per-statement timeout. The requests that ran longest were the ones
    * the 30s edge could not see.
    *
-   * 120s is the API tier's `PROXY_REQUEST_TIMEOUT_MS` -- the deadline past
-   * which a delivery is destroyed -- so this edge is what makes "how much
-   * traffic crossed the deadline" queryable. Measured in that window: 361 of
-   * the 414 completed responses above `le="30"` were also above `le="60"`, and
-   * without a further finite edge all 361 collapse into `+Inf`.
+   * 120s is the API tier's `PROXY_REQUEST_TIMEOUT_MS`, so this edge makes the
+   * over-deadline band queryable instead of collapsing it into `+Inf`.
+   * Measured in that window: 361 of the 414 completed responses above
+   * `le="30"` were also above `le="60"`, and without a further finite edge all
+   * 361 collapse into `+Inf`.
+   *
+   * ⛔ The band above this edge is NOT "deliveries that were destroyed", and
+   * this docstring said it was until PEN-5783 measured it. Abandoned responses
+   * are not observed by this family at all (they carry the `"0"` status on the
+   * request counter), so a destroyed delivery is excluded by construction.
+   * Measured 2026-11-09 over 22.8 h: 144 completed responses above `le="120"`,
+   * 130 of them `GET /api/heartbeat-runs/:runId` -- a route with no `"0"`
+   * status series at all, i.e. 130 requests that crossed the deadline and were
+   * received. The band is a lower bound on deadline crossings, never a count.
    */
   it("places a bucket edge at the tier's 120s delivery deadline", async () => {
     await call(buildApp(), "/api/companies/c1/issues", 200);
@@ -219,9 +228,11 @@ describe("per-route HTTP request-duration histogram (PEN-5136)", () => {
     const edges = await bucketEdges();
 
     expect(edges).toContain(120);
-    // The deadline must be the LAST finite edge: anything past it is already
-    // undeliverable, so a further edge would spend cardinality separating
-    // populations that are equally lost.
+    // The deadline stays the LAST finite edge -- but not because traffic past
+    // it is lost (PEN-5783 measured 130 such requests delivered). It is that
+    // the completed population above 120s is rare and no decision currently
+    // turns on splitting it, so a further edge would spend cardinality for
+    // nothing. Revisit if an acquire-bound decision needs that resolution.
     expect(Math.max(...edges)).toBe(120);
     // It must sit above the statement-timeout edge, or it is measuring the
     // same question twice rather than the one 30s is blind to.

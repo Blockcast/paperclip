@@ -335,9 +335,24 @@ export const HTTP_REQUEST_DURATION_METRIC = "paperclip_http_request_duration_sec
  *   "inside the bound" into a directly queryable quantity.
  * - `60` -- over-bound completions, so a request that outruns the statement
  *   bound is still separable from the unbounded `+Inf` tail.
- * - `120` -- the API tier's `PROXY_REQUEST_TIMEOUT_MS`, i.e. the deadline that
- *   actually destroys a delivery. Same edge and same reason as
- *   {@link PLUGIN_METRIC_DURATION_BUCKETS_SECONDS}'s final finite bucket.
+ * - `120` -- the API tier's `PROXY_REQUEST_TIMEOUT_MS`. Same edge and same
+ *   reason as {@link PLUGIN_METRIC_DURATION_BUCKETS_SECONDS}'s final finite
+ *   bucket.
+ *
+ * ⛔ `le="120"` versus `+Inf` is NOT the deadline-crossing population, and
+ * this comment asserted that it was until PEN-5783 measured it. The two claims
+ * cannot both hold: a delivery the proxy deadline destroys is one the client is
+ * no longer receiving, and abandoned responses are not observed by this family
+ * at all (they carry the `"0"` status on {@link HTTP_REQUESTS_METRIC}). A
+ * genuinely destroyed delivery is therefore excluded from this histogram by
+ * construction, and what remains above `120` is the opposite population:
+ * requests that outran the tier's nominal timeout and were still delivered.
+ * Measured 2026-11-09 over the 22.8 h since this ladder deployed -- 144
+ * completed responses above `le="120"`, of which 130 were
+ * `GET /api/heartbeat-runs/:runId`, a route that carries no `"0"` status series
+ * at all. Those 130 crossed the deadline and were received. Read this edge as
+ * "outran the tier's nominal timeout and completed anyway": it is a lower bound
+ * on deadline crossings, never a count of them.
  *
  * ⚠️ PEN-5783 -- why the ladder could not end at `60`. Every edge above was
  * chosen to straddle the inherited 30s `statement_timeout`, and that is the
@@ -4161,7 +4176,11 @@ export const PLUGIN_METRIC_DURATION_METRIC = "paperclip_plugin_metric_duration_s
  * median crossed the baseline band" and "has it reached the claimed figure"
  * are each a single bucket comparison rather than an interpolation artifact.
  * `120` is the API tier's `PROXY_REQUEST_TIMEOUT_MS`, so the final finite
- * bucket is the deadline that actually destroys a delivery.
+ * bucket is the tier's nominal delivery deadline. ⛔ Do not read the band
+ * above it as "deliveries that were destroyed" -- abandoned responses are not
+ * observed by these families at all, so a destroyed delivery is excluded by
+ * construction and what sits above `120` is traffic that outran the nominal
+ * timeout and was delivered anyway (PEN-5783).
  *
  * 13 bounds => 15 series per (plugin, metric) including `+Inf`, `_sum` and
  * `_count`.
@@ -8733,9 +8752,12 @@ function ensureRegistry(): {
         + "That makes this family's _count LOWER than the request counter by the abort "
         + "rate, by design. Buckets straddle the inherited 30s statement_timeout, so "
         + "le=\"30\" separates requests served inside the bound from those that outran it, "
-        + "and le=\"120\" is the API tier's PROXY_REQUEST_TIMEOUT_MS -- the deadline past "
-        + "which a delivery is destroyed, so le=\"120\" versus +Inf is the deadline-crossing "
-        + "population (PEN-5783). Note a pool-starvation stall raises NO 57014 at all, since "
+        + "and le=\"120\" is the API tier's PROXY_REQUEST_TIMEOUT_MS. le=\"120\" versus +Inf "
+        + "is NOT the deadline-crossing population: a destroyed delivery is an abandoned one, "
+        + "and abandoned responses are excluded from this family (see above), so what sits above "
+        + "le=\"120\" is traffic that outran the nominal timeout and was delivered anyway -- a "
+        + "lower bound on deadline crossings, never a count (PEN-5783). "
+        + "Note a pool-starvation stall raises NO 57014 at all, since "
         + "a statement that never acquires a connection never starts, so the 30s edge is "
         + "blind to exactly this family's worst case. Nothing is zero-initialized -- an "
         + "absent series means no completed "
