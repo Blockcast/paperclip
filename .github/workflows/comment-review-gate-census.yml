@@ -97,40 +97,67 @@
 #      `summarizeViolations` already publishes per surface, NOT on
 #      `violatingPrs`.
 #
-#   5. And re-arm the RENAME tripwire separately — it does not survive the
-#      remedy either. This job's only red arm is `unclassifiedPrs != 0` below,
-#      and `unclassified` is gated by the SAME wording predicate as the other
-#      two buckets: findPrViolations admits on state and wording before
-#      classifyAuditedContext ever runs, and all five alternatives of
-#      NOT_EVALUATED_DESCRIPTION_PATTERN are `outcome: "not_evaluated"` reasons
-#      this gate emits (:1145, :1275, :1316, :1420, :1599). An OUTCOME-scoped
-#      remedy stops emitting all five, so `unclassified` reads 0 permanently. A
-#      remedy scoped on the `authorIsReviewer` MARKER stops only :1316's
-#      marker-bearing arm — the marker is conditional on
-#      selfAttestedDeferrals === 0 while the string is not — so four of five
-#      keep publishing and the tripwire is degraded rather than dead, onto
-#      populations this file measured at zero live statuses (:1145, :1275)
-#      and this row at ~2% (:1599). Either way it reads 0, and 0 is this
-#      alarm's HEALTHY value, so the signal built to shout "this census went
-#      blind" is silenced by the change that blinds it.
-#      ⛔ Step 2 does not fix that, and must NOT be applied to the whole
-#      predicate. `unclassified` is wording-keyed BY DESIGN: this predicate was
-#      lengthened precisely so a foreign green cannot land there — see the note
-#      on NOT_EVALUATED_DESCRIPTION_PATTERN, "a false rename alarm on a job
-#      that reds is worse than a missed row". A structural predicate has no
-#      wording term, so under an unrecognized name it matches every green in
-#      the repo and the alarm gets muted instead. Re-key the REQUIRED-GATE
-#      admission structurally; keep a wording-keyed admission for the rename
-#      bucket, on wording the remedy does not remove. NAME THAT WORDING, or
-#      this instruction is unsatisfiable under the scope it just asked for: the
-#      remedy withholds the `not_evaluated` OUTCOME and nothing else, so the
-#      `clean` and `deferred_finding` reasons survive it
-#      (pr-comment-review-gate.ts :1430 and :1353 — both template literals, so
-#      key on their invariant fragments) and are the only gate-owned wording a
-#      post-remedy rename detector can key on. One predicate cannot
-#      serve both — this file already knows its two COUNTS must never be
-#      summed, and this is the same non-summability one level down, in the
-#      ADMISSION rather than in the count.
+#   5. ⛔ WITHDRAWN 2026-11-09 by its author (CTO) — do NOT re-arm the rename
+#      tripwire, and do NOT widen this predicate. (PEN-5565 Done-when item 7.)
+#      It read that `unclassifiedPrs != 0` goes blind under an outcome-scoped
+#      remedy, since `unclassified` shares the one `state`+`wording` admission
+#      gate — findPrViolations admits before classifyAuditedContext ever runs —
+#      and so must be re-keyed onto the `clean` / `deferred_finding` wording
+#      the remedy leaves standing. Both halves fail.
+#      (a) PREMISE. `unclassified` is NOT an independent alarm whose subject is
+#      a rename; it is a ROUTING LABEL on the violation predicate, firing on
+#      (a violation exists) ∧ (its context name is in neither audited set). The
+#      remedy removes the FIRST conjunct under every name, so a post-remedy 0
+#      here is this arm reporting no violation anywhere — working, not blinded
+#      — and it stays ARMED: a re-introduced not_evaluated green, a new
+#      not_evaluated reason added without its alternative, or a second producer
+#      is still SEEN, landing in `unclassified` if renamed or `required-gate`
+#      if not. This file already says so twice, in its own voice: "Still a
+#      violation (the row is real whatever it is called)" and "A future rename
+#      changes which bucket a row lands in, never whether it is seen."
+#      (b) REMEDY. NOT_EVALUATED_DESCRIPTION_PATTERN is documented as the
+#      descriptions this gate emits WHEN IT ESTABLISHED NO REVIEW of the head;
+#      item 7 asked it to admit the two it emits when it DID review the head.
+#      Because admission is one shared gate applied BEFORE classification, that
+#      widening admits every `clean` (:1430) and `deferred_finding` (:1353)
+#      green and buckets it as `required-gate` — the exact surface item 4 above
+#      keys the flip to. Measured by Security Engineer 2026-11-09T07:0xZ and
+#      reproduced by CTO the same day against the real exported
+#      findPrViolations, two negative controls refusing under both predicates.
+#      The cost is the one this file already prices: "a false rename alarm on a
+#      job that reds is worse than a missed row". ⇒ KEEP admitsNothingEvaluated
+#      EXACTLY AS IT IS. The surviving-wording referent is correctly identified
+#      and is NOT needed; bucket-aware admission (classify first, admit per
+#      surface) would work but buys a capability this census never had, at the
+#      price of amending the header invariant above — do not spend it. One
+#      clause survives and is re-homed to step 2: a structural predicate has no
+#      wording term, so applied to the WHOLE predicate it matches every green
+#      in the repo and MUTES this alarm rather than blinding it.
+#
+#   6. Make 0 distinguishable from UNMEASURABLE on the flip arm — an
+#      instrument-integrity term, never an admission term. (PEN-5565 Done-when
+#      item 8; this is the real residual item 5 was reaching for.) Post-remedy
+#      a rename produces no signal at all — there is no violation left to
+#      mis-bucket — so DEFAULT_GATE_CONTEXTS can go stale silently, and step 4
+#      keys the flip to `surfaces["required-gate"]`, which on a stale name
+#      reads 0 because NOBODY PUBLISHES THAT NAME, not because the gate is
+#      fixed. That belongs to the family this header already names as its
+#      SECOND red condition — a census that could not run must never be
+#      mistaken for a census that ran and found nothing (PEN-3281) — and NOT in
+#      admitsNothingEvaluated, which is why no invariant above has to be
+#      amended and clean/deferred greens stay out of every bucket.
+#      NAMED REFERENT, NOT A VALIDATED REMEDY: have summarizeViolations also
+#      emit `auditedContextObserved` — the count of merged PRs on which ANY
+#      status under an audited gate context was observed at merge, IN ANY STATE
+#      — computed from the rows statusesAsOfMerge already returns (no new API
+#      call, no predicate change, no new permission), and make step 4's flip
+#      `required-gate === 0 AND auditedContextObserved > 0`. Two limits, both
+#      load-bearing: (i) nobody has implemented or run this; (ii) post-remedy
+#      the audited context is ABSENT BY DESIGN on unevaluated heads, so the
+#      signal rests on the window containing at least one EVALUATED head — on
+#      this repo the human-authored population. A window with no evaluated head
+#      must report UNMEASURABLE, never CLEAN; if that case is common the term
+#      needs a floor, which is a measurement nobody has taken.
 #
 # A flip onto a blind detector converts a tracked open defect into a silently
 # closed one. That is strictly worse than the reporter posture it replaces, and
