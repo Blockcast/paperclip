@@ -214,11 +214,25 @@ jobs:
 
       - name: Setup pnpm
         uses: ./.github/actions/setup-pnpm
-        # ~2.9x the 1.05m p100. Left unbounded while its ordinary cost was a
-        # 4.3m registry round-trip, because any bound had to clear the ~10.8m
-        # retry path too. Baking the pinned pnpm into the ARC image removed
-        # both, so the largest unbounded setup step now has a bound.
-        timeout-minutes: 3
+        # 15 is the BLO-28813 retry floor, NOT a multiple of a p100. Two guards
+        # pin this value from both sides and it has to satisfy both:
+        # BLO-31690 (`policy-node-test-timeouts.test.mjs`) requires a step bound
+        # strictly under the 29m job cap, so a wedged setup is an attributable
+        # step kill rather than an unattributable job-cap `cancelled`; BLO-28813
+        # (`pnpm-setup-retry.test.mjs`) requires it to clear MIN_TIMEOUT_MINUTES_
+        # FOR_RETRY, because a bound under the ~10.8m retry path does not bound
+        # the step, it deletes the wrapper's second attempt. Deleting the line is
+        # therefore not available here; 15 <= x < 29 is.
+        #
+        # This carried `timeout-minutes: 3` -- ~2.9x the 1.05m p100 -- on the
+        # premise that baking the pinned pnpm into the ARC image had retired the
+        # registry round-trip. PEN-6181: that premise does not hold on every
+        # runner. merge_group run 42503915820 landed on one with no baked pnpm,
+        # took the self-installer path, and was killed at 177287ms; the backoff
+        # got 89ms and the retry logged `conclusion=skipped`. #3520 was evicted
+        # from the queue for a failing required check. A baked-image percentile
+        # measures how OFTEN the slow path is taken, never how long it takes.
+        timeout-minutes: 15
 
       - name: Setup Node.js
         uses: actions/setup-node@v6
