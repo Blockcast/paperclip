@@ -13,3 +13,7 @@ tmp
 # ../server/ui-dist`). If it sneaks into `COPY . .` it shadows the freshly
 # built ui/dist because server/src/app.ts checks `../ui-dist` first.
 server/ui-dist
+
+# PEN-6237: written INTO the image by the Dockerfile's `build` stage.
+# A stale local copy must never reach the context or the repo.
+.paperclip-build-commit

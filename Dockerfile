@@ -624,6 +624,37 @@ RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" &
 # of silently shipping an image where the seed quietly skips.
 RUN test -f packages/mcp-server/dist/stdio.js || (echo "ERROR: mcp-server stdio bridge missing" && exit 1)
 
+# PEN-6237: stamp the image with the commit it was built from, at exactly the
+# path `readBuildCommit()` already resolves (`DEFAULT_BUILD_COMMIT_PATH`, i.e.
+# /app/.paperclip-build-commit -- see server/src/build-commit.ts).
+#
+# The image ships no `.git`, so `readGitInfo()`'s `git show` ALWAYS throws in
+# production and this file is the only input that can populate `serverInfo.git`
+# on `/api/health`. Without it that field is permanently
+# `{available: false, unavailableReason: "git_unavailable"}` on every deployed
+# pod -- measured in production 2026-11-09, where the read path, the fallback
+# and the access-controlled route all existed and nothing ever wrote the file.
+#
+# Why the IMAGE and not a Helm value or a deploy-time env var: `api.deployedCommit`
+# must change exactly one removable pod annotation and NOTHING else, or the
+# release job's `approvalPlanSha256` stops matching the approved plan and
+# production releases fail at the admission gate (see values.yaml and
+# deploy/helm/paperclip/tests/worker-deployed-commit.test.mjs). A file baked
+# into the image is also strictly better evidence: it describes the image's OWN
+# content, so it cannot disagree with the code sitting beside it the way a
+# deploy-set variable can.
+#
+# Declared here, after the expensive pnpm builds, so the per-commit value busts
+# only this one tiny layer. Unset for local builds, which write no file at all:
+# `parseBuildCommit` rejects anything that is not 40 lowercase hex, so an absent
+# or malformed marker leaves the field honestly unavailable rather than wrong.
+# The production stage's `COPY --chown=node:node --from=build` carries it over.
+ARG PAPERCLIP_BUILD_COMMIT=""
+RUN set -eu; \
+  if [ -n "${PAPERCLIP_BUILD_COMMIT}" ]; then \
+    printf '%s\n' "${PAPERCLIP_BUILD_COMMIT}" > /app/.paperclip-build-commit; \
+  fi
+
 FROM ${RUNTIME_IMAGE} AS production
 # Preserve the documented local-build defaults. docker-entrypoint.sh compares
 # these values with the inherited passwd entry and remaps node at startup when

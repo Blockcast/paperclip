@@ -409,8 +409,16 @@ jobs:
           # reliably serve attestation manifests.
           provenance: false
           sbom: false
+          # PEN-6237: PAPERCLIP_BUILD_COMMIT below is the same
+          # `steps.target.outputs.full` that feeds the image tag and
+          # `api.deployedCommit`, so the marker baked into the image, the tag it
+          # is pushed under and the pod annotation cannot disagree. The comment
+          # sits ABOVE the key on purpose: `build-args` is a block scalar parsed
+          # as KEY=VALUE lines, so a `#` line inside it is read as an argument
+          # NAME, not as a comment.
           build-args: |
             RUNTIME_IMAGE=${{ steps.runtime.outputs.image }}
+            PAPERCLIP_BUILD_COMMIT=${{ steps.target.outputs.full }}
           # Master refreshes the shared inline cache; manual releases only read
           # it. Persistent BuildKit retains retry graphs without extra SHA tags.
           cache-from: |
