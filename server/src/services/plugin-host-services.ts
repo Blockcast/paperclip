@@ -2450,10 +2450,22 @@ export function buildHostServices(
           projectId: issue.projectId,
         });
         if (budgetBlock) {
+          // PEN-6229 review — `getInvocationBlock` answers TWO questions under
+          // one return. Five of its six branches are budget hard-stops; the
+          // sixth is an operator pause (`company.status === "paused"` with
+          // `pauseReason !== "budget"`), whose own reason says so. Coding that
+          // one `budget.blocked` names the wrong gate, and `workerHostErrorData`
+          // forwards only `code` — so the plugin loses `scopeType` and the
+          // prose, and `wake_cause` would read "budget" for an operator pause.
+          // A confidently wrong cause is worse for triage than the NULL this
+          // change exists to remove. `enqueueWakeup` calls the same condition
+          // `company.inactive` downstream (it gates on
+          // `company.status !== "active"` before it reaches its budget gate),
+          // so this is also what makes the two layers agree.
           throw conflict(budgetBlock.reason, {
             scopeType: budgetBlock.scopeType,
             scopeId: budgetBlock.scopeId,
-            code: "budget.blocked",
+            code: budgetBlock.kind === "paused" ? "company.inactive" : "budget.blocked",
           });
         }
         const contextSource = params.contextSource ?? "plugin.issue.requestWakeup";
@@ -2553,10 +2565,12 @@ export function buildHostServices(
             projectId: issue.projectId,
           });
           if (budgetBlock) {
+            // Same split as `requestWakeup` above: an operator pause is not a
+            // budget condition and must not be coded as one.
             throw conflict(budgetBlock.reason, {
               scopeType: budgetBlock.scopeType,
               scopeId: budgetBlock.scopeId,
-              code: "budget.blocked",
+              code: budgetBlock.kind === "paused" ? "company.inactive" : "budget.blocked",
             });
           }
           const contextSource = params.contextSource ?? "plugin.issue.requestWakeups";

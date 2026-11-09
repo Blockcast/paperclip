@@ -14,18 +14,32 @@
 -- not WRONG — NULL does mean "not recorded" — but it is indistinguishable from
 -- a cause nobody coded, which is the exact ambiguity `009` exists to remove.
 --
---   refused  — now SEVEN gates throw:
+--   refused  — SIX DISTINCT tokens now throw, across two layers:
 --              pre-wake, in the plugin host (PEN-6229):
 --                `issue.no_assignee`    — the issue has no agent assignee;
 --                `issue.not_wakeable`   — terminal status (done/cancelled);
 --                `issue.blocked`        — an unresolved blocker edge;
---                `budget.blocked`       — an invocation budget block.
+--                `budget.blocked`       — a budget hard-stop;
+--                `company.inactive`     — an OPERATOR pause (see below).
 --              downstream, in `enqueueWakeup` (PEN-6121):
 --                `budget.blocked`, `company.inactive`, `agent.not_invokable`.
 --
--- `budget.blocked` deliberately appears on BOTH sides. It is one gate asked
--- twice on one path, and a reader triaging by cause wants the gate, not which
--- layer happened to ask first — so the token is shared rather than split.
+-- `budget.blocked` and `company.inactive` deliberately appear on BOTH sides: a
+-- reader triaging by cause wants the gate, not which layer happened to ask
+-- first, so the tokens are shared rather than split per layer.
+--
+-- ⛔ But the pre-wake budget pre-check emits TWO of them, and an earlier
+-- revision of this file got that wrong. `budgets.getInvocationBlock` answers
+-- two questions under one return: five of its six branches are budget
+-- hard-stops, and the sixth is `company.status = 'paused'` with
+-- `pause_reason <> 'budget'` — an operator pause, whose own `reason` says so.
+-- Coding that one `budget.blocked` makes `wake_cause` read "budget" for an
+-- administrative pause. NULL meant "not recorded"; a CONFIDENTLY WRONG cause is
+-- worse for triage than NULL, which would have inverted this column's whole
+-- purpose. The block now carries a `kind: 'budget' | 'paused'` discriminator
+-- and the call sites map the `paused` branch to `company.inactive` — which is
+-- also the token `enqueueWakeup` gives that same condition downstream, since it
+-- gates on `company.status <> 'active'` before reaching its own budget gate.
 --
 -- ⛔ This migration is a COMMENT REFRESH ONLY. It alters no column, adds no
 -- constraint and backfills nothing: every `wake_cause` row written before it is
@@ -41,7 +55,9 @@
 COMMENT ON COLUMN plugin_alertmanager_184163d1ba.alert_attendance_observations.wake_cause IS
   'PEN-6121, extended PEN-6229: the host''s own token for why this wake '
   'produced no run. THROWN (wake_outcome=refused), pre-wake in the plugin '
-  'host: issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked. '
+  'host: issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked '
+  '(a budget hard-stop), company.inactive (an operator pause -- the one '
+  'getInvocationBlock branch that is not a budget condition). '
   'THROWN downstream in enqueueWakeup: budget.blocked, company.inactive, '
   'agent.not_invokable. RESOLVED queued=false (wake_outcome=declined): '
   'heartbeat.wakeOnDemand.disabled, heartbeat.cooldown, company.inactive, '

@@ -1582,7 +1582,14 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
 
       if (company.status === "paused") {
         if (company.pauseReason !== "budget") {
+          // PEN-6229 — this is the ONE branch of this function that is not a
+          // budget condition: an operator paused the company, and
+          // `pauseReason` says it was not the hard-stop. Callers that project a
+          // machine-readable cause must not name the budget gate here. The
+          // `kind` discriminator exists so they do not have to re-derive that
+          // from `reason`, which is prose.
           return {
+            kind: "paused" as const,
             scopeType: "company" as const,
             scopeId: companyId,
             scopeName: company.name,
@@ -1591,6 +1598,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         }
         if (companyOverCap) {
           return {
+            kind: "budget" as const,
             scopeType: "company" as const,
             scopeId: companyId,
             scopeName: company.name,
@@ -1602,6 +1610,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
 
       if (companyOverCap) {
         return {
+          kind: "budget" as const,
           scopeType: "company" as const,
           scopeId: companyId,
           scopeName: company.name,
@@ -1615,6 +1624,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       if (agent.status === "paused" && agent.pauseReason === "budget") {
         if (agentOverCap) {
           return {
+            kind: "budget" as const,
             scopeType: "agent" as const,
             scopeId: agentId,
             scopeName: agent.name,
@@ -1626,6 +1636,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
 
       if (agentOverCap) {
         return {
+          kind: "budget" as const,
           scopeType: "agent" as const,
           scopeId: agentId,
           scopeName: agent.name,
@@ -1653,6 +1664,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       const projectOverCap = await hardStopStillBinds(projectPolicy);
       if (projectOverCap) {
         return {
+          kind: "budget" as const,
           scopeType: "project" as const,
           scopeId: project.id,
           scopeName: project.name,

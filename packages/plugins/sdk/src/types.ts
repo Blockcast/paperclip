@@ -1618,13 +1618,23 @@ export interface PluginIssueWakeupResult {
    * cutoff, or a capacity deferral — and a dropped wake whose reason is a
    * disjunction cannot be triaged. The same vocabulary is used for the
    * THROWING half: those arrive as `PluginRpcError.data.code`, so one consumer
-   * can record one cause whichever way the host dropped it. Seven gates throw
-   * — `issue.no_assignee`, `issue.not_wakeable`, `issue.blocked` and
-   * `budget.blocked` from the plugin host's own pre-checks (PEN-6229), and
-   * `budget.blocked`, `company.inactive`, `agent.not_invokable` from
-   * `enqueueWakeup` downstream (PEN-6121). `budget.blocked` is deliberately
-   * shared: it is one gate asked twice on one path, and a reader triaging by
-   * cause wants the gate, not the layer that happened to ask first.
+   * can record one cause whichever way the host dropped it. Six DISTINCT tokens
+   * throw, across two layers — `issue.no_assignee`, `issue.not_wakeable`,
+   * `issue.blocked`, `budget.blocked` and `company.inactive` from the plugin
+   * host's own pre-checks (PEN-6229), and `budget.blocked`, `company.inactive`,
+   * `agent.not_invokable` from `enqueueWakeup` downstream (PEN-6121). The two
+   * shared tokens are shared deliberately: a reader triaging by cause wants the
+   * gate, not the layer that happened to ask first.
+   *
+   * ⛔ The pre-wake BUDGET pre-check emits two of them, and that is not an
+   * inconsistency. `budgets.getInvocationBlock` answers two questions under one
+   * return: five of its six branches are budget hard-stops, the sixth is an
+   * operator pause (`company.status === "paused"` with
+   * `pauseReason !== "budget"`). Coding that one `budget.blocked` would make
+   * the cause read "budget" for an administrative pause — and a confidently
+   * WRONG cause is worse for triage than the `null` this field exists to
+   * replace. It maps to `company.inactive`, which is also what `enqueueWakeup`
+   * calls the same condition downstream.
    *
    * ⛔ Treat the token set as OPEN. It is documentation, not a closed union,
    * and the column that stores it carries no CHECK constraint for exactly that
