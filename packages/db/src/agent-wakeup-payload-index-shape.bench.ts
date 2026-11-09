@@ -9,10 +9,23 @@
  *   or payload -> '_paperclipWakeContext' ->> 'taskId' = $1
  *
  * -- is a per-row recheck over whatever `agent_wakeup_requests_company_requested_idx`
- * returns. Five call sites read that shape: `services/issues.ts`
+ * returns. Five call sites read that MEMBERSHIP shape: `services/issues.ts`
  * (`wakeRequestTargetsIssue`), `services/heartbeat.ts`,
- * `services/recovery/service.ts`, `services/task-watchdogs.ts` and
- * `services/successful-run-handoff-state.ts`.
+ * `services/recovery/service.ts`, and `services/task-watchdogs.ts` TWICE --
+ * its subtree scan and its per-issue live-wake probe are separate sites.
+ *
+ *   ⛔ `services/successful-run-handoff-state.ts` IS NOT ONE OF THEM, and the
+ *      first revision of this header said it was. That site, and `issues.ts`'s
+ *      blocked-inbox and subtree reads, are `coalesce(...)` ATTRIBUTION --
+ *      "which single issue does this wake belong to" -- which is a DIFFERENT
+ *      question from MEMBERSHIP, "does this wake target issue X". They are not
+ *      interchangeable and the divergence is measured, not asserted: a wake
+ *      whose `_paperclipWakeContext.issueId` names a different issue from its
+ *      top-level `issueId` is a MEMBER of both and ATTRIBUTED to only the
+ *      first (`agent-wakeup-payload-target-semantics.test.ts`). Rewriting an
+ *      attribution `coalesce` into this disjunction changes behaviour. The
+ *      two expressions read alike at a glance, which is the whole reason this
+ *      warning is here rather than left to the reader.
  *
  * ⚠️ WHAT THIS IS AND IS NOT -- identical in kind to
  * `issues-list-production-scale-plan-shape.bench.ts`, and for the same reason:
@@ -36,12 +49,26 @@
  *   issue_comments ..... 5,034 local ->  12,444 prod ... factor  2.5
  *
  * The real factor spans 2.5-186, so 250 is outside the observed range at both
- * ends and "13.2M" is not evidence of anything. `agent_wakeup_requests` is NOT
- * one of the six tables that exporter publishes, so its production row count is
- * UNKNOWN to this seat. 2,000,000 below is chosen as a defensible point inside
- * the `large` bucket, not as production's count. Everything reported here is
- * either a per-row cost or a ratio, so it carries to another count -- except
- * PLAN CHOICE, which is genuinely scale-sensitive. Re-run if a real count lands.
+ * ends and "13.2M" is not evidence of anything.
+ *
+ * ⭐ THE REAL COUNT HAS SINCE LANDED, AND THE 2,000,000 DEFAULT IS 14.3x TOO
+ * LARGE. When this file was first written `agent_wakeup_requests` was not one
+ * of the six tables `pg_paperclip_table_mvcc_n_live_tup` published, so its
+ * production count was unreadable from any engineering seat and 2,000,000 was
+ * stipulated as a defensible point inside the `large` bucket. PEN-6165 /
+ * `onprem-k8s#8416` added the seventh relname on 2026-11-08T20:55Z and the
+ * table measures 136,686 -> 139,789 live rows across four readings that
+ * evening -- a local->production factor of 2.6x, at the BOTTOM of the
+ * calibrated span, beside `issue_comments` (2.5) and `environment_leases`
+ * (2.9). Quote that as a FLOOR, not a census: `n_live_tup` is re-based only at
+ * VACUUM/ANALYZE, and the table's dead tuples peak at 1.20x live between
+ * autovacuums (trigger = 50 + 0.2 x live, an 11.4 h sawtooth).
+ *
+ * Everything reported here is either a per-row cost or a ratio, so it carries
+ * to another count -- except PLAN CHOICE, which is genuinely scale-sensitive.
+ * That exception is the whole reason the re-run below exists: it is the one
+ * claim the 2M table could not make about a 140k table, and it had to be
+ * measured rather than argued.
  *
  * Run it (NOT a vitest file -- `.bench.ts` is outside the test glob, so CI does
  * not run it; ~10 minutes and several GB of disk):
@@ -49,6 +76,12 @@
  *   cd packages/db && pnpm tsx src/agent-wakeup-payload-index-shape.bench.ts
  *
  * ── MEASURED 2026-11-08, by running THIS FILE at its defaults ─────────────
+ * ⛔ SUPERSEDED IN PART. This table was taken BEFORE the write probe's
+ * `VACUUM` (see `writeProbe` below) and at the 14.3x-oversized stipulation, so
+ * each candidate's `EXPLAIN` ran over a different amount of dead-tuple bloat.
+ * It is kept because it is the table every prior record quotes. The 2026-11-09
+ * re-runs below correct it: at constant scale every figure here survives to
+ * within ~15% EXCEPT C4's dense, which is wrong by 24x. Read both.
  * Embedded Postgres 18.1 (production is 18.4), harness defaults, no parallel
  * workers. 2,000,000 rows / 20 companies / 20,000 issues / 90-day spread.
  * Target company's 14-day window (the route's `lookbackDays`): 158,657 rows.
@@ -151,9 +184,12 @@
  * ARRAY, not a scalar. At 14 MB it is the SMALLEST index measured -- 11x
  * smaller than the GIN on `payload` -- because it indexes four short texts
  * instead of every root-to-leaf path in the document. ⚠️ But it inherits GIN's
- * ordering loss (dense 107.9 ms) and costs 168 MB of heap for the stored array,
+ * ordering loss and costs 168 MB of heap for the stored array,
  * so it is only the right answer if the rewrite in 5 is acceptable AND the
- * dense path is not.
+ * dense path is not. ⛔ An earlier revision priced that ordering loss at
+ * "dense 107.9 ms". Do not quote it: finding 7 shows the planner's choice for
+ * C4's dense case is not stable across statistics, so C4's dense cost is
+ * UNKNOWN rather than high.
  *
  * ⛔ 5 · BOTH GENERATED-COLUMN SHAPES TAKE AN `ACCESS EXCLUSIVE` TABLE REWRITE,
  * AND IT IS OUTAGE-CLASS AS PEN-6104 PREDICTED: 74.9 s (C3) and 66.8 s (C4) at
@@ -164,16 +200,109 @@
  *
  * ⭐ 6 · RECOMMENDATION: C2b, and it is NOT shipped by this file. It is the only
  * shape that is simultaneously exact, decisive on the pathological case
- * (1,188x), and reachable with `CREATE INDEX CONCURRENTLY` alone. Its price is
+ * (1,188x here; 1,167x on the clean 2M re-run and 43x at the real row count --
+ * findings 7 and 9), and reachable with `CREATE INDEX CONCURRENTLY` alone. Its price is
  * 124 MB, a 35% insert-throughput cost on the fleet's hottest table, and a
  * predicate rewrite at all five call sites.
  *
- * ⛔ That price is sized against 2M rows, and NOBODY HAS MEASURED THE REAL ONE
- * (see the second warning above). BLO-52494 has just dropped 784 MB of
- * `activity_log` indexes specifically for write cost, so a 35% write
- * regression bought at an unknown multiple is not a call to make from this
- * file. Land the migration once the production row count is known and
- * PEN-6104's done-when 1 production plan has been captured.
+ * ⛔ THAT PRICE WAS SIZED AGAINST 2M ROWS AND THE REAL COUNT HAS SINCE LANDED,
+ * so re-read the price before quoting it. At the measured 140k the same four
+ * indexes are 8.8 MB, not 124 MB -- but the RATIO is what the decision rested on
+ * and the ratio is unchanged (19.7% of heap at 2M, 20.1% at 140k; finding 10).
+ * BLO-52494 dropped 784 MB of `activity_log` indexes specifically for write
+ * cost, so a 35% write regression is still a real price -- it is simply now a
+ * priced one rather than an unbounded one. ⚠️ What has NOT been measured is the
+ * live plan: PEN-6104's done-when 1 production `EXPLAIN (ANALYZE, BUFFERS)` is
+ * still the arbiter, and no seeded bench substitutes for it.
+ *
+ * ── RE-MEASURED 2026-11-09, TWO RUNS, by running THIS FILE ────────────
+ * Both with the `writeProbe` `VACUUM (ANALYZE)` in place, same harness, same
+ * embedded Postgres 18.1. Run A re-takes the table above at ITS OWN defaults,
+ * so the ONLY variable against it is the bloat fix. Run B then changes ONLY the
+ * scale, to the production count PEN-6165 published. One variable each, which
+ * is what makes the two differences attributable.
+ *
+ *                        RUN A · 2,000,000 rows     RUN B · 140,000 rows
+ *                        window 158,657 / 627 MB    window 11,116 / 43.8 MB
+ *   shape                new idx  SPARSE    DENSE   new idx   SPARSE   DENSE
+ *   ────────────────────────────────────────────────────────────────
+ *   shipped baseline          --  253.3ms   5.19ms       --  11.78ms  4.25ms
+ *   C1  GIN + `@>`        151 MB    0.42ms 245.40ms  10.1 MB   1.14ms  3.66ms
+ *   C1b btree_gin         155 MB    6.06ms  36.61ms  10.3 MB   2.26ms 12.83ms
+ *   C2  partial UNGUARDED 124 MB  221.46ms   6.29ms   8.8 MB  14.22ms  4.21ms
+ *   C2b partial GUARDED   124 MB    0.22ms  11.80ms   8.8 MB   0.27ms  1.01ms
+ *   C3  scalar col+btree 74+42MB    0.13ms   0.31ms 5.2MB+3MB  0.13ms  0.30ms
+ *   C4  text[] col+GIN  14+168MB    3.24ms   4.44ms 0.8MB+12MB 1.52ms  5.75ms
+ *
+ * ⭐ 7 · THE BLOAT FIX CHANGES ONE VERDICT, AND IT IS NOT THE RECOMMENDED ONE.
+ * Run A against the 2026-11-08 table: baseline, C1, C1b, C2, C2b and C3 all land
+ * within ~15%, which is run-to-run noise on this harness. C2b's dense
+ * REGRESSION is real and survives -- 11.80 vs 5.19 ms, 2.27x, against 2.4x
+ * before. But C4's dense moves 107.9ms -> 4.44ms, and the cause is a PLAN FLIP,
+ * not a speed-up: with honest statistics the planner DECLINES the `text[]` GIN
+ * and falls back to `agent_wakeup_requests_company_requested_idx` with a `&&`
+ * filter, 3,086 rows removed -- the baseline's own plan.
+ *
+ *   ⛔ So C4's dense figure is not a cost, it is a coin-flip between two plans,
+ *      and NEITHER run should be quoted as C4's dense behaviour.
+ *
+ * ⚠️ Generalise the shape, not the number: **the bloat did not make the
+ * measurements slower, it made the PLANNER CHOOSE DIFFERENTLY.** So a bias audit
+ * that asks "did the milliseconds move?" clears a candidate whose entire plan
+ * was selected by the artifact -- the one candidate here that was actually
+ * mis-measured is the one that moved for a reason that check cannot see.
+ *
+ * ⭐ 8 · THE WRITE PROBE'S IMPOSSIBLE ORDERING WAS THE SAME ARTIFACT. The
+ * 2026-11-08 run measured C2 (four EXTRA indexes) at 8,962 rows/s against a
+ * BASELINE of 7,309 and this header called that "the tell". With the `VACUUM`
+ * in place the baseline is the fastest candidate, as it must be:
+ *
+ *   baseline 16,912 rows/s · C2/C2b 10,973 (-35%) · C1b 10,037 (-41%)
+ *   C1 8,784 (-48%) · C4 3,459 (-80%) · C3 3,292 (-81%)
+ *
+ * ⚠️ STILL not quotable throughput, for the reason given above -- `fsync` and
+ * `full_page_writes` stay on and the run is checkpoint-dominated, and C3/C4
+ * additionally pay for a heap their `ADD COLUMN` rewrite has just grown. What
+ * the fix buys is a MONOTONE ordering, not a trustworthy magnitude. C2/C2b's
+ * -35% is unchanged from the separate `fsync=off` run above; use that figure.
+ *
+ * ⭐ 9 · AT THE REAL ROW COUNT C2b's PLAN SURVIVES AND ITS DENSE REGRESSION
+ * INVERTS. This is the one claim the 2M table could not make, since plan choice
+ * is its single scale-sensitive output, and it is now measured. Run B's C2b plan
+ * is a `BitmapOr` across all four partial indexes with `company_id` AND the
+ * `requested_at` bound inside every `Index Cond`, and `Rows Removed by Filter`
+ * is 0 on both probes. Sparse 11.78 -> 0.27 ms (43x). Dense 4.25 -> 1.01 ms,
+ * i.e. **4.2x BETTER, where the same shape at 2M is 2.27x WORSE.**
+ *
+ *   Mechanism, because the inversion is not luck: C2b NEVER gets the index
+ *   ordering, at either scale -- its plan is a Bitmap Heap Scan plus a top-N
+ *   sort both times. Its dense cost is therefore set by HOW MANY ROWS THE PROBE
+ *   ISSUE HAS IN THE WINDOW (2,664 at 2M, 186 at 140k), not by the table size.
+ *   At 186 the sort is free; at 2,664 the baseline's early-stopping ordered
+ *   index scan wins instead.
+ *
+ * ⛔ WHICH IS WHY RUN B DOES NOT SETTLE THE DENSE CASE. The two axes this file
+ * scales TOGETHER -- window size and per-issue density -- are INDEPENDENT in
+ * production, and the sparse and dense verdicts hang off different ones.
+ * Production's per-issue wake distribution is UNMEASURED: the 2,664/6 pair is
+ * THIS SEED's and was never an observation, so do not cite it as production's.
+ * Production's window is ~11k rows, which Run B matches; its hottest issue could
+ * hold 186 wakes or 2,664, and the dense verdict flips between them.
+ *
+ *   ✅ What Run B DOES settle at the real size: the sparse win (43x), the
+ *      plan's reachability, and the disk ratio below. The missing measurement is
+ *      a per-issue wake-count histogram for the live table, and the
+ *      `EXPLAIN (ANALYZE, BUFFERS)` probe on PR #3571 is the cheapest
+ *      instrument that can take it.
+ *
+ * ⭐ 10 · THE ~20%-OF-HEAP PRICE HOLDS AT BOTH SCALES, which is the number the
+ * capacity decision rested on. Four partial btrees: 61.1 + 13.2 + 24.8 + 24.8 =
+ * 123.9 MB on a 627.3 MB heap = **19.7%** (Run A); 4.3 + 0.9 + 1.8 + 1.8 =
+ * 8.8 MB on a 43.8 MB heap = **20.1%** (Run B). A ratio measured at a stipulated
+ * scale was the thing that had to carry to the real one, and it does -- to
+ * within 0.4 points across a 14.3x change in table size.
+ *
+ *
  */
 import postgres from "postgres";
 import { startEmbeddedPostgresTestDatabase, getEmbeddedPostgresTestSupport } from "./test-embedded-postgres.js";
@@ -412,6 +541,27 @@ async function main() {
       const rowsPerSec = Math.round(WRITE_ROWS / (ms / 1000));
       log(`    write probe [${label}]: ${WRITE_ROWS.toLocaleString()} rows in ${sec(ms)} (${rowsPerSec} rows/s)`);
       await sql.unsafe(`DELETE FROM agent_wakeup_requests WHERE requested_at > now() - interval '1 minute'`);
+      /**
+       * ⛔ THE `VACUUM` IS LOAD-BEARING AND ITS ABSENCE BIASED EVERY NUMBER IN
+       * THE FIRST MEASURED TABLE. `DELETE` leaves the probe's tuples dead in
+       * the heap, so each candidate's `EXPLAIN` ran over the accumulated dead
+       * rows of every candidate before it -- 0 for the baseline (measured
+       * first), 100k/200k for C1/C1b, 300k for C2/C2b, and 0 again for C3/C4
+       * because their `ADD COLUMN ... STORED` rewrite compacts the heap. The
+       * probe rows carry `requested_at = now()`, so under `requested_at DESC`
+       * they are walked FIRST.
+       *
+       * ⭐ The handicap is UNEVEN BETWEEN THE CANDIDATES BEING COMPARED, which
+       * is what makes it a defect rather than noise. The header's standing
+       * "seeded statistics and bloat are not production's" warning bounds the
+       * ABSOLUTE milliseconds and says nothing about the COMPARISON -- and the
+       * comparison is the only thing this file is for.
+       *
+       * `ANALYZE` as well as `VACUUM`: these probes insert and delete 5% of
+       * the table, and a plan measured against stale statistics answers a
+       * question about a table that is not there.
+       */
+      await sql.unsafe(`VACUUM (ANALYZE) agent_wakeup_requests`);
       return { label, rowsPerSec };
     };
 
