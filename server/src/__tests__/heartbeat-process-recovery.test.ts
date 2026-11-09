@@ -2306,6 +2306,35 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect((await heartbeat.getRun(runId))?.errorCode).toBe("process_lost");
   });
 
+  // BLO-55216: same two-worker simulation for a LOCAL-adapter run. Its pid lives
+  // in worker A's namespace, so on worker B it reads dead, and the start-lock
+  // sweep passes no staleThresholdMs. Only A's updatedAt renewal shields it.
+  it("does not reap another worker's live local run while its owner renews (BLO-55216)", async () => {
+    const { runId } = await seedRunFixture({ processPid: 999_999_999, includeIssue: false });
+    heartbeat.__test_unsafelyTrackActiveRunExecution(runId); // worker A owns it
+    await heartbeat.renewPrelaunchReservationOwnership();
+    heartbeat.__test_unsafelyUntrackActiveRunExecution(runId); // worker B's view
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).not.toContain(runId);
+    expect((await heartbeat.getRun(runId))?.status).toBe("running");
+  });
+
+  it("reaps another worker's local run once its owner's renewal is stale (BLO-55216)", async () => {
+    const { runId } = await seedRunFixture({ processPid: 999_999_999, includeIssue: false });
+    // Owner last renewed 3 min ago, then died: past PRELAUNCH_OWNER_STALE_MS.
+    await db
+      .update(heartbeatRuns)
+      .set({ updatedAt: new Date(Date.now() - 3 * 60 * 1000) })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const result = await heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true });
+
+    expect(result.runIds).toContain(runId);
+    expect((await heartbeat.getRun(runId))?.errorCode).toBe("process_lost");
+  });
+
   it("does not renew a pre-launch reservation past the hard ceiling (BLO-54719)", async () => {
     const reservedAt = new Date(Date.now() - 46 * 60 * 1000);
     const { companyId, agentId, runId } = await seedRunFixture({
