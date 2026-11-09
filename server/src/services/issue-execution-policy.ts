@@ -1870,26 +1870,85 @@ export function buildIssueMonitorClearedPatch(input: {
  * `issuesSvc.update`. This is the same reconciliation for the set-based raw
  * writes (checkout-restore, release) that bypass the service layer.
  *
- * Deliberately keyed on `monitorNextCheckAt` alone: a monitor that already fired
- * and is sitting in `triggered` with a null check time is a different defect
- * (BLO-25865) and is left untouched here.
+ * PEN-6202 — this used to be keyed on `monitorNextCheckAt` alone, deferring a
+ * monitor that had already FIRED (`triggered`, null check time) to BLO-25865 as
+ * "a different defect". It is a different defect, and BLO-25865's net cannot
+ * reach the rows this pass creates: `tickExpiredIssueMonitors` is the only thing
+ * that clears a fired monitor, and its outer `where` carries
+ * `status in ('in_progress','in_review') and assignee_user_id is null` — exactly
+ * the eligibility this pass runs because the row has just LOST. So the two nets
+ * handed the case to each other and the demotion fell between them, in the same
+ * transaction, two statements apart.
+ *
+ * Measured 2026-11-08 across all 5615 company rows: 19 non-terminal rows carried
+ * a permanently unclearable `triggered` monitor, 3 of them for 91–106 days. All
+ * three were watching a pull request, all three of those PRs had merged, and no
+ * monitor could ever fire again to say so. The sharpest wrote its final note
+ * seven minutes AFTER the merge it was reporting as still open.
+ *
+ * Both axes of ineligibility reach this, not just status: a monitor that outlives
+ * its agent assignee strands identically, which is how the one row outside every
+ * agent intake surface (`in_review` + human-held) was stranded.
+ *
+ * This clears; it does not wake. The recovery wake `tickExpiredIssueMonitors`
+ * emits is deliberately not reproduced here — these call sites are raw set-based
+ * writes with no wake machinery, a demotion happens at the end of the run that
+ * would be woken, and a demoted row keeps an agent assignee and so stays visible
+ * through ordinary intake. Clearing removes the false-liveness signal, which is
+ * the harm; see PEN-6202 for the part this deliberately leaves open.
+ *
+ * A monitor still sitting `triggered` on an ELIGIBLE row is untouched, because
+ * `monitorClearReasonForIssue` declines there. That is what keeps BLO-35155's
+ * live-consumer grace intact: this fires at the instant the row leaves
+ * eligibility — the instant the hole opens — and never before.
  *
  * Returns an empty patch when the row holds no monitor or the monitor is still
  * deliverable, so callers can spread it unconditionally.
  */
 export function buildIssueMonitorEligibilityPatch(issue: IssueLike): Record<string, unknown> {
-  if (!issue.monitorNextCheckAt) return {};
+  const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
+  if (!issue.monitorNextCheckAt && !holdsTriggeredMonitor(issue, policy)) return {};
   const clearReason = monitorClearReasonForIssue(
     issue.status,
     issue.assigneeAgentId ?? null,
     issue.assigneeUserId ?? null,
   );
   if (!clearReason) return {};
-  return buildIssueMonitorClearedPatch({
+  return buildIssueMonitorClearedPatch({ issue, policy, clearReason });
+}
+
+/**
+ * PEN-6202 — does this row hold a monitor that has fired and not yet been
+ * cleared?
+ *
+ * Read through `derivePersistedMonitorState` rather than off
+ * `executionState.monitor.status` directly, so this agrees with the two other
+ * places that decide the same question (`tickExpiredIssueMonitors`' post-claim
+ * re-check, and `buildIssueMonitorClearedPatch` above) — including legacy rows whose
+ * trigger survives only in the `monitorLastTriggeredAt` / `monitorAttemptCount`
+ * columns with no `executionState` to read.
+ *
+ * An already-`cleared` monitor derives as `cleared` and is excluded, so this
+ * cannot rewrite a `clearReason` that a scheduler or an assignee already set —
+ * the clear is idempotent, and the second call through any of these write paths
+ * is a no-op.
+ */
+function holdsTriggeredMonitor(issue: IssueLike, policy: IssueExecutionPolicy | null): boolean {
+  // Cheap necessary condition, so the overwhelmingly common "row holds no
+  // monitor at all" case costs no `executionState` parse. `derivePersistedMonitorState`
+  // can only reach its `triggered` branch via one of these three, and
+  // `buildIssueMonitorTriggeredPatch` writes the column atomically with the
+  // JSON — the `executionState` arm is kept anyway so a row whose columns were
+  // reset without its state is still seen.
+  if (!issue.monitorLastTriggeredAt && !(issue.monitorAttemptCount ?? 0) && !issue.executionState) {
+    return false;
+  }
+  const state = derivePersistedMonitorState({
     issue,
-    policy: normalizeIssueExecutionPolicy(issue.executionPolicy ?? null),
-    clearReason,
+    state: parseIssueExecutionState(issue.executionState),
+    policy,
   });
+  return state?.status === "triggered";
 }
 
 export function applyIssueExecutionPolicyTransition(input: TransitionInput): TransitionResult {

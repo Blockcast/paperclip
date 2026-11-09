@@ -312,11 +312,21 @@ type RestoredRow = {
  * promotion worth keeping for it. This pass is also shared with
  * `issueService.release()`, which strips the assignee deliberately.
  *
+ * PEN-6202 — this pass used to skip any row whose `monitorNextCheckAt` was
+ * null, which is every monitor that had already FIRED. That is the one state a
+ * restore cannot leave recoverable: `holdsDispatchableMonitor` declines the
+ * restore outright while a monitor is ARMED, so the armed case never reaches a
+ * demotion at all, and the only monitor state that can survive one is
+ * `triggered` — precisely the state this pass excluded. The row then sat outside
+ * `tickExpiredIssueMonitors`' `in_progress`/`in_review` window forever. Measured
+ * at 91–106 days on three rows, each watching a pull request that had already
+ * merged. The skip is gone; `buildIssueMonitorEligibilityPatch` now decides.
+ *
  * The restore itself stays one set-based statement — the batch form exists
  * precisely so cleanup scales without N round-trips. Reconciliation is a
  * separate per-row pass because each row carries its own `executionPolicy` /
- * `executionState` JSON, and it runs only for rows that actually hold an armed
- * monitor. In the common case that is zero rows and zero extra statements.
+ * `executionState` JSON, and it runs only for rows that actually hold a monitor.
+ * In the common case that is zero rows and zero extra statements.
  *
  * Each clear is a compare-and-swap on `(status, monitor_next_check_at)`. The
  * restore may commit outside a transaction, so a concurrent actor can re-promote
@@ -324,13 +334,23 @@ type RestoredRow = {
  * this pass would silently delete that new monitor and cause the very stall it
  * exists to prevent. A lost CAS means the row is no longer the one we decided
  * about, so skipping is correct.
+ *
+ * For a fired monitor the first half of that CAS cannot be an equality — the
+ * value it would compare is null. `monitor_next_check_at is null` carries the
+ * same meaning (a concurrent re-arm makes it non-null and the CAS correctly
+ * fails), and it is paired with a second guard that the monitor has not been
+ * cleared underneath us, so a concurrent clear's `clearReason` is never
+ * overwritten with this pass's. That guard is `is distinct from 'cleared'`
+ * rather than `= 'triggered'` on purpose: a legacy row whose trigger survives
+ * only in the `monitor_last_triggered_at` / `monitor_attempt_count` columns has
+ * no `executionState.monitor` to read, derives as `triggered`, and must not be
+ * skipped by its own CAS.
  */
 async function reconcileRestoredMonitors(
   dbOrTx: DbOrTransaction,
   rows: readonly RestoredRow[],
 ): Promise<void> {
   for (const row of rows) {
-    if (!row.monitorNextCheckAt) continue;
     const patch = buildIssueMonitorEligibilityPatch({
       status: row.status,
       assigneeAgentId: row.assigneeAgentId,
@@ -352,7 +372,12 @@ async function reconcileRestoredMonitors(
         and(
           eq(issues.id, row.id),
           eq(issues.status, row.status),
-          eq(issues.monitorNextCheckAt, row.monitorNextCheckAt),
+          row.monitorNextCheckAt
+            ? eq(issues.monitorNextCheckAt, row.monitorNextCheckAt)
+            : and(
+                isNull(issues.monitorNextCheckAt),
+                sql`(${issues.executionState} -> 'monitor' ->> 'status') is distinct from 'cleared'`,
+              ),
         ),
       );
   }
