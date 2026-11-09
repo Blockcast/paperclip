@@ -871,7 +871,8 @@ export function Costs() {
                       <CardTitle className="text-base">By project</CardTitle>
                       <CardDescription>
                         Run costs by project. Spend from runs that touched no project is bucketed as
-                        {" "}{UNATTRIBUTED_PROJECT_LABEL.toLowerCase()}, so this card totals to company spend.
+                        {" "}{UNATTRIBUTED_PROJECT_LABEL.toLowerCase()}, so the rows below account for all
+                        spend in the window this card covers.
                         {byProjectClampNotice ? (
                           <> <span className="text-foreground">{byProjectClampNotice}</span></>
                         ) : null}
