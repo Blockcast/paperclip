@@ -5,6 +5,8 @@ import path from "node:path";
 import { describe, it, expect } from "vitest";
 import {
   CLAUDE_CODE_PACKAGE,
+  CLAUDE_CONFIG_REPAIR_MARKER,
+  buildClaudeConfigRepairShell,
   DEFAULT_CLAUDE_CODE_VERSION,
   buildClaudeCodeRuntimeShell,
   claudeCodeRuntimeDir,
@@ -397,6 +399,39 @@ describe("buildClaudeCodeRuntimeShell PATH precedence (PEN-3714)", () => {
       expect(resultPath.split(":")).not.toContain(IMAGE_WRAPPER_BIN_DIR);
     } finally {
       rmSync(base, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("buildClaudeConfigRepairShell", () => {
+  const snippet = buildClaudeConfigRepairShell();
+  const withConfigDir = (body: string | null) => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pccfg-"));
+    if (body !== null) writeFileSync(path.join(dir, ".claude.json"), body);
+    const r = spawnSync("sh", ["-c", `${snippet}; echo done`], {
+      encoding: "utf8",
+      env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: tmpdir(), CLAUDE_CONFIG_DIR: dir },
+    });
+    const files = readdirSync(dir);
+    rmSync(dir, { recursive: true, force: true });
+    return { ...r, files };
+  };
+
+  it("moves a truncated .claude.json aside and says so", () => {
+    const r = withConfigDir('{"numStartups": 3, "projects": {');
+    expect(r.status).toBe(0);
+    expect(r.stdout).toBe("done\n");
+    expect(r.stderr).toContain(`${CLAUDE_CONFIG_REPAIR_MARKER} moved unparseable`);
+    expect(r.files).not.toContain(".claude.json");
+    expect(r.files.filter((f) => /^\.claude\.json\.corrupt-\d+$/.test(f))).toHaveLength(1);
+  });
+
+  it("leaves a valid, empty or missing file alone", () => {
+    for (const body of ['{"numStartups": 3}', "", null]) {
+      const r = withConfigDir(body);
+      expect(r.status).toBe(0);
+      expect(r.stderr).toBe("");
+      expect(r.files).toEqual(body === null ? [] : [".claude.json"]);
     }
   });
 });

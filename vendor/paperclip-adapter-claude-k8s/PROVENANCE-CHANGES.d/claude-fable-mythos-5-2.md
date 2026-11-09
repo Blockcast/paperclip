@@ -1,7 +1,8 @@
 # Claude Fable 5.2 and Mythos 5.2, and the Claude Code 2.1.321 runtime pin
 
 **Files:** `src/server/models.ts`, `src/server/models.test.ts`, `src/index.ts`,
-`src/server/runtime-pin.ts`, `README.md`.
+`src/server/runtime-pin.ts`, `src/server/runtime-pin.test.ts`, `src/server/job-manifest.ts`,
+`src/server/job-manifest.test.ts`, `README.md`.
 
 **Catalog.** Fable 5.2 and Mythos 5.2 were released on 2026-11-09. Direct API ids are
 `claude-fable-5-2` and `claude-mythos-5-2`, each also listed with the `[1m]` 1M-context
@@ -20,3 +21,18 @@ build supports the new models; the 2.1.311 bump followed `stable`. Agents withou
 directory on their next Job. Agents with an explicit value, including `"image"`, are
 unaffected. To roll an agent back, pin it to `2.1.311`; that install is still on the
 PVC. The `README.md` row and the config doc in `src/index.ts` follow the constant.
+
+**What else 2.1.321 changes for agents.** The `fable` alias now resolves to
+`claude-fable-5-2`; an explicit `claude-fable-5-1` keeps the old model. No live agent used
+`fable` or `best` when this landed. On the subscription path Anthropic sees the penstock
+vault's `claude-cli/<version>` user agent, not this pin, so 5.2 needs the vault to present
+2.1.321 as well.
+
+**Corrupt `.claude.json` guard.** Since 2.1.318 a non-interactive start no longer replaces a
+`.claude.json` that is not valid JSON with defaults; it fails with "Configuration error in
+…/.claude.json" and leaves the file (anthropics/claude-code#87551). `CLAUDE_CONFIG_DIR` is
+per agent on the PVC, so one bad write would fail every later run of that agent.
+`buildClaudeConfigRepairShell` runs right before `claude`, for pinned and `"image"` runs
+alike, and moves an unparseable file to `.claude.json.corrupt-<epoch>` with a
+`[paperclip] claude-config` line on stderr. Missing and empty files are left alone; both
+start fine.
