@@ -19,6 +19,7 @@ import {
   alertStateRef,
   legacyInstanceAlertStateRef,
 } from "./constants.js";
+import { composeDescription } from "./description-notes.js";
 import {
   alertMatchesLabelFilter,
   buildAggregateIssueDescription,
@@ -216,6 +217,12 @@ type IssueReference = {
   status?: string | null;
   assigneeUserId?: string | null;
   assigneeAgentId?: string | null;
+  /**
+   * PEN-6218: the body already on the row. Carried so a description write can
+   * keep the notes half (see `composeDescription`) without a second read — the
+   * host returns it on every `issues.list`/`issues.get` row.
+   */
+  description?: string | null;
 };
 
 type AggregateMemberResolution = {
@@ -2787,7 +2794,7 @@ export async function handleFiring(
             existing.paperclipIssueId,
             {
               ...(issue.status !== "done" ? { status: "done" as const } : {}),
-              description: newDescription,
+              description: composeDescription(newDescription, issue.description),
               assigneeAgentId: null,
               assigneeUserId: null,
             },
@@ -2816,7 +2823,14 @@ export async function handleFiring(
             const takeOver = async (target: IssueReference) => {
               await ctx.issues.update(
                 target.id,
-                { description: await describeOnto(target.id) },
+                {
+                  description: composeDescription(
+                    await describeOnto(target.id),
+                    // The target row's own notes, not ours: this body is being
+                    // published onto a DIFFERENT row than `existing`.
+                    target.description,
+                  ),
+                },
                 existing.paperclipCompanyId,
                 undefined,
                 { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -2846,7 +2860,10 @@ export async function handleFiring(
             try {
               await ctx.issues.update(
                 existing.paperclipIssueId,
-                { status: reopenStatus, description: newDescription },
+                {
+                  status: reopenStatus,
+                  description: composeDescription(newDescription, issue?.description),
+                },
                 existing.paperclipCompanyId,
                 undefined,
                 { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -2910,7 +2927,7 @@ export async function handleFiring(
         } else if (decision.kind === "refresh") {
           await ctx.issues.update(
             existing.paperclipIssueId,
-            { description: newDescription },
+            { description: composeDescription(newDescription, issue?.description) },
             existing.paperclipCompanyId,
             undefined,
             { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -3439,7 +3456,10 @@ export async function handleFiring(
           companyId,
           fencing: firingFence(companyId, aggregateKey, firingToken),
           title,
-          description,
+          // PEN-6218: a brand-new row carries the marker and its banner from
+          // its first byte, so the first agent to write on it is warned and
+          // its notes survive the next sync. There is nothing to preserve yet.
+          description: composeDescription(description, null),
           priority,
           originKind: ORIGIN_KIND,
           originId: alert.fingerprint,
@@ -3573,7 +3593,7 @@ export async function handleFiring(
     try {
       await ctx.issues.update(
         issue.id,
-        { description },
+        { description: composeDescription(description, issue.description) },
         companyId,
         undefined,
         { fencing: firingFence(companyId, aggregateKey, firingToken) },
@@ -4035,9 +4055,17 @@ export async function handleResolved(
           null,
         );
         if (description) {
+          // PEN-6218: the only description write with no row already in hand.
+          // One extra read, and a failed one costs nothing a caller would
+          // notice — it falls through to `null`, i.e. the pre-PEN-6218 body,
+          // inside a block whose whole purpose is already best-effort.
+          const row = await ctx.issues.get(
+            aggregateResolution.issueId,
+            existing.paperclipCompanyId,
+          );
           await ctx.issues.update(
             aggregateResolution.issueId,
-            { description },
+            { description: composeDescription(description, row?.description) },
             existing.paperclipCompanyId,
           );
         }
