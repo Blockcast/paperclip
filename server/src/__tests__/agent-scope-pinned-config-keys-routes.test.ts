@@ -87,16 +87,29 @@ vi.mock("../adapters/index.js", () => ({
   // pass in the other.
   findActiveServerAdapter: vi.fn(() => undefined),
   listAdapterModels: vi.fn(),
+  // EXACTLY the class the comment above names, one export further down, and it
+  // bit the one arm that reaches the success path. The route awaits this on
+  // every `runtimeConfig.modelProfiles` write
+  // (`normalizeRuntimeConfigAdapterConfigsForPersistence`), which the refusal
+  // arms never reach because they throw at the guard first. Omitting it 500s
+  // the request PAST the guard, so `expect(res.status).not.toBe(403)` still
+  // passes and only the progress-marker assertion catches it. `[]` is the
+  // "adapter declares no model profiles" case.
+  listAdapterModelProfiles: vi.fn(async () => []),
 }));
 
 function registerModuleMocks() {
   vi.doMock("../services/index.js", () => serviceModuleMocks());
   vi.doMock("../services/secrets.js", () => ({ secretService: () => mockSecretService }));
   vi.doMock("../services/environments.js", () => ({ environmentService: () => mockEnvironmentService }));
+  // Keep this list in step with the hoisted `vi.mock` above: these are two
+  // copies of one mock surface, and THIS is the copy `createApp` gets after
+  // `vi.resetModules()`.
   vi.doMock("../adapters/index.js", () => ({
     findServerAdapter: mockFindServerAdapter,
     findActiveServerAdapter: vi.fn(() => undefined),
     listAdapterModels: vi.fn(),
+    listAdapterModelProfiles: vi.fn(async () => []),
   }));
 }
 
