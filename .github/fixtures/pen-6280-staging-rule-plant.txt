@@ -1,0 +1,17 @@
+PEN-6280 staging-rule liveness fixture. NOT A CREDENTIAL.
+
+The line below is a locally generated random string. It authenticates
+nothing, was never issued by any system, and is not derived from anything
+real. It exists so the warn-only `opaque-high-entropy-token` rule in
+.gitleaks-staging.toml has a known-positive input in this repository.
+
+It is deliberately BARE and deliberately carries no binding name, because
+that is the exact population the rule exists to reach and the exact
+population gitleaks' default rules do NOT reach -- measured, the default
+rules miss this file and the staging rule hits it.
+
+Because both scans are diff-aware, this fires ONLY in the pull request whose
+commit range touches this file. Editing it will light up the staging step
+again; that is intended and is how the rule's liveness is re-checked.
+
+2rzwWxFBevRP5hjTXUl5LcYqlGM8mbC23tpz67Pt

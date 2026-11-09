@@ -3108,6 +3108,128 @@ jobs:
           set -e
           exit "$code"
 
+      # ⛔ WARN-ONLY STAGING STEP — PEN-6280. THIS STEP GATES NOTHING.
+      #
+      # `continue-on-error: true` means a finding here cannot fail this step's
+      # job, so it cannot move `needs.secret_scan.result`, so it cannot reach
+      # SECRET_SCAN_RESULT or the `verify` aggregate. That is deliberate: the
+      # `opaque-high-entropy-token` rule is being MEASURED here, not enforced.
+      # .gitleaks-staging.toml carries the promotion and withdrawal criteria
+      # this step ships with, and the measured reason it is a SECOND
+      # INVOCATION against a SECOND CONFIG.
+      #
+      # TWO MECHANISMS, DIFFERENT JOBS, NEITHER REDUNDANT — stated because the
+      # obvious review note is "one of these is belt-and-braces, drop it":
+      #   the explicit `exit` codes below decide what a READER sees — red step
+      #     means "open the summary", green step means "scanned, found
+      #     nothing". That distinction is the whole output of this step.
+      #   `continue-on-error: true` decides what the JOB sees, and it also
+      #     covers the paths the exits below do NOT enumerate — the 10-minute
+      #     timeout, an unwritable $GITHUB_STEP_SUMMARY, an OOM-killed scan.
+      # Drop the exits and the step is a silent green forever. Drop
+      # `continue-on-error` and an unanticipated failure turns a warn-only
+      # measurement into a merge blocker.
+      #
+      # ⛔ DO NOT "simplify" this by moving the rule into .gitleaks.toml and
+      # deleting this step. gitleaks' exit code is per-RUN, not per-RULE:
+      # measured first-party 2026-11-09, a single config carrying both
+      # `useDefault = true` and that rule exits 2 on a finding from the entropy
+      # rule ALONE. There is no per-rule severity — `severity = "WARN"` is
+      # silently accepted and has no effect. One config can therefore block on
+      # BOTH or warn on BOTH, and warning on both silently de-fangs the default
+      # rules that PEN-6245 exists to make blocking.
+      #
+      # ⛔ A RED STEP HERE IS NOT A FAILED CHECK AND MUST NOT BE "FIXED" BY
+      # ALLOWLISTING. It is this step working. Triage the finding; if it is a
+      # false positive, that is a DATA POINT FOR THE WINDOW and belongs on
+      # PEN-6280, not in an allowlist.
+      - name: Secret scan (staging, warn-only)
+        id: gitleaks_staging
+        # Runs even when the blocking scan above went red, so both readings are
+        # always taken at the same head. Gated on the install step because
+        # without the binary this step has nothing to say, and it must not
+        # report its own absence as a clean scan.
+        if: always() && steps.install_gitleaks.outcome == 'success'
+        continue-on-error: true
+        timeout-minutes: 10
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+
+          summary() { echo "$@" >> "$GITHUB_STEP_SUMMARY"; }
+
+          # The range guard is REPEATED here rather than shared with the
+          # blocking step, deliberately. A value computed in that step is
+          # unavailable when that step fails — which is exactly when this step
+          # still has to run — and a staging step that silently scanned nothing
+          # is the one failure this whole design is written against.
+          if [ -z "${PR_BASE_SHA:-}" ] \
+             || ! git rev-parse --verify --quiet "${PR_BASE_SHA}^{commit}" >/dev/null 2>&1 \
+             || ! git rev-parse --verify --quiet "HEAD^{commit}" >/dev/null 2>&1; then
+            summary "### Secret scan (staging, warn-only) — NOT SCANNED"
+            summary ""
+            summary "The commit range was unreadable, so **nothing was scanned**. This is"
+            summary "UNVERIFIED, not clean. It blocks nothing — this step is warn-only —"
+            summary "but do NOT count this PR in the PEN-6280 staging window."
+            exit 1
+          fi
+
+          token_b64="$(printf 'x-access-token:%s' "$GITHUB_TOKEN" | base64 | tr -d '\n')"
+          GIT_CONFIG_COUNT=1 \
+          GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' \
+          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${token_b64}" \
+            gitleaks detect --source . --config .gitleaks-staging.toml \
+              --redact --verbose --no-banner --exit-code 2 \
+              --log-opts "--diff-merges=remerge ${PR_BASE_SHA}..HEAD" \
+              >"$RUNNER_TEMP/staging.out" 2>&1
+          code=$?
+          unset token_b64
+
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+
+          if [ "$code" = 0 ]; then
+            summary "### Secret scan (staging, warn-only) — no staging findings"
+            summary ""
+            summary "The \`opaque-high-entropy-token\` rule scanned this PR's own commit"
+            summary "range and matched nothing. **Count this PR in the PEN-6280 window.**"
+            exit 0
+          fi
+
+          if [ "$code" != 2 ]; then
+            summary "### Secret scan (staging, warn-only) — SCAN ERRORED (exit ${code})"
+            summary ""
+            summary "Nothing was scanned; this is UNVERIFIED, not clean. Do NOT count this"
+            summary "PR in the PEN-6280 staging window. This blocks nothing."
+            summary ""
+            summary '```'
+            sed -e 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/staging.out" | tail -40 >> "$GITHUB_STEP_SUMMARY"
+            summary '```'
+            exit "$code"
+          fi
+
+          summary "### Secret scan (staging, warn-only) — findings to TRIAGE"
+          summary ""
+          summary "⛔ **This blocked nothing and is not a verdict.** The"
+          summary "\`opaque-high-entropy-token\` rule is in a measurement window"
+          summary "(PEN-6280); it is warn-only until promoted or withdrawn. The red mark"
+          summary "on this step is the step working, not a failed check."
+          summary ""
+          summary "Matched values are redacted; file and line are reported so each"
+          summary "finding can be triaged. **If one is a real credential, ROTATE IT"
+          summary "FIRST** — the commit is already on a remote branch, so dropping it"
+          summary "does not un-disclose it. A real finding also means this rule has"
+          summary "earned promotion: say so on PEN-6280."
+          summary ""
+          summary "Expect false positives from long paths, URLs and long camelCase"
+          summary "identifiers — that population is what the window is measuring. Triage"
+          summary "them onto PEN-6280; do not allowlist them."
+          summary ""
+          summary '```'
+          sed -e 's/\x1b\[[0-9;]*m//g' "$RUNNER_TEMP/staging.out" >> "$GITHUB_STEP_SUMMARY"
+          summary '```'
+          exit "$code"
+
       # Diagnostics only. `if: always()` plus `continue-on-error` is
       # load-bearing: this step must never be the reason the lane passes or
       # fails, and it must still run when the scan failed — which is the only
