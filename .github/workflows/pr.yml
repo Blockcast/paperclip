@@ -596,6 +596,30 @@ jobs:
         run: node --test ./scripts/check-dispatch-deploy-outcome.test.js
         timeout-minutes: 1
 
+      # PEN-6371: the four above concern a dispatch that reached its deploy
+      # job. This one concerns a dispatch that never reached its build. The
+      # endpoint step chose a BuildKit daemon on `nc -z`, so on 2026-11-09 run
+      # 42629411195 the connect succeeded against buildkit-amd64-1 and the
+      # build died with `frontend grpc server closed unexpectedly` -- on the
+      # commit run 42612377459 had built clean on ordinal 0 two hours earlier.
+      # The ClusterIP fallback that step exists to provide could not engage,
+      # because a listening socket is all the old probe could see, and
+      # `PREFERRED_ORDINAL` pins only workflow_dispatch to ordinal 1 -- so the
+      # production deploy lane is the single lane that reaches the
+      # less-exercised builder, and a dispatch lost there waits for the next
+      # 07:23Z slot.
+      #
+      # Executable and genuinely mutation-tested rather than presence-checked,
+      # for its neighbours' reason: the step's real shell runs against real
+      # sockets -- one that serves and one that accepts then closes, which is
+      # the shape that defeated the old probe -- so both verdicts are produced
+      # by socket behaviour rather than asserted, and gutting the solve makes
+      # the file fail by name instead of degrading to a clean verdict.
+      - name: Validate BuildKit endpoint selection probes a solve (PEN-6371)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-buildkit-endpoint-selection.test.js
+        timeout-minutes: 2
+
       # BLO-33027: pins the negative admission probe that ends the deploy job.
       # It is the only production-side evidence that
       # ValidatingAdmissionPolicy/paperclip-api-image-approval is EVALUATED
