@@ -12,10 +12,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
   buildJobManifest,
   findServerOnlyEnvVarsInPodSpec,
+  parseServiceAccountAllowlist,
+  resolveServiceAccountName,
   sanitizeLabelValue,
   type JobBuildInput,
   validatePonytailPluginPath,
@@ -2823,5 +2825,117 @@ describe("the resume-delta gate is blind to warnings end to end (PEN-5336)", () 
       selfPod: mockSelfPod,
     });
     expect(result.promptMetrics.heartbeatPromptChars).toBeGreaterThan(0);
+  });
+});
+
+// PEN-6275, from Ally's review of
+// https://github.com/Blockcast/paperclip/pull/3606. That PR gated the
+// `claude_k8s` sibling's `resolveServiceAccountName` on
+// PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES and described it as the chokepoint
+// downstream of every scope that writes the key. True of that adapter, and not
+// of the fleet: THIS adapter is vendored into the same image, renders the same
+// `app.kubernetes.io/component: agent-job` label, and read
+// `config.serviceAccountName` verbatim — so an operator who set the env var
+// would have gated every `claude_k8s` run while an `opencode_k8s` agent naming
+// a sibling ServiceAccount still got that account's token mounted at
+// /var/run/secrets/kubernetes.io/serviceaccount/token.
+describe("buildJobManifest — serviceAccountName allowlist (PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES)", () => {
+  const ALLOWLIST = "PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES";
+
+  // Cleared in BOTH hooks. Unset means "not enforced", which is the state every
+  // other describe block in this file builds a manifest under; clearing it on
+  // the way out stops a refusal here leaking into them.
+  beforeEach(() => {
+    delete process.env[ALLOWLIST];
+  });
+  afterEach(() => {
+    delete process.env[ALLOWLIST];
+  });
+
+  const ctxWith = (config: Record<string, unknown>): JobBuildInput["ctx"] => ({ ...mockCtx, config });
+  const renderedSa = (config: Record<string, unknown>) =>
+    buildJobManifest({ ctx: ctxWith(config), selfPod: mockSelfPod }).job.spec?.template?.spec
+      ?.serviceAccountName;
+
+  // THE MUST-PASS ARM. A gate that only ever refuses is not shown to work:
+  // without this case a resolver that threw unconditionally would satisfy every
+  // refusal assertion below.
+  it("admits a serviceAccountName that is on the allowlist, and still renders it", () => {
+    process.env[ALLOWLIST] = "penstock-general-agent,other-agent";
+    expect(renderedSa({ serviceAccountName: "penstock-general-agent" })).toBe("penstock-general-agent");
+  });
+
+  // THE MUST-FAIL ARM.
+  it("refuses a serviceAccountName that is not on the allowlist", () => {
+    process.env[ALLOWLIST] = "penstock-general-agent";
+    expect(() => renderedSa({ serviceAccountName: "paperclip-ci-deploy" })).toThrow(
+      /paperclip-ci-deploy/,
+    );
+    expect(() => renderedSa({ serviceAccountName: "paperclip-ci-deploy" })).toThrow(
+      /PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES/,
+    );
+  });
+
+  // Unlike the claude sibling, which throws when nothing resolves, omitting the
+  // name is legal here: Kubernetes then runs the pod as the namespace's
+  // `default` ServiceAccount. That is an identity, not the absence of one —
+  // measured 2026-11-09, `RoleBinding/benchmark-h4-runner` binds
+  // `paperclip/default` to a Role granting `pods/portforward: create` with no
+  // resourceNames restriction. Gating only the NAMED case would leave an
+  // identity outside the set the operator enumerated, reachable by DELETING a
+  // config key rather than by setting one.
+  it("refuses the implicit `default` ServiceAccount when the allowlist does not admit it", () => {
+    process.env[ALLOWLIST] = "penstock-general-agent";
+    expect(() => renderedSa({})).toThrow(/"default"/);
+    expect(() => renderedSa({})).toThrow(/names no serviceAccountName/);
+  });
+
+  it("admits the implicit `default` when an operator lists it explicitly, and renders nothing", () => {
+    process.env[ALLOWLIST] = "penstock-general-agent default";
+    expect(renderedSa({})).toBeUndefined();
+  });
+
+  // Shipping inert is the whole reason this is an opt-in env var: a fleet is
+  // already running on whatever names it has, so refusing on an unset list
+  // would fail every dispatch on the deploy that carried it.
+  it("is INERT when unset — any name renders, including one no allowlist would admit", () => {
+    expect(renderedSa({ serviceAccountName: "paperclip-ci-deploy" })).toBe("paperclip-ci-deploy");
+    expect(renderedSa({})).toBeUndefined();
+  });
+
+  it("treats a whitespace-only allowlist as unset rather than as an empty set", () => {
+    process.env[ALLOWLIST] = "   ";
+    expect(renderedSa({ serviceAccountName: "paperclip-ci-deploy" })).toBe("paperclip-ci-deploy");
+  });
+
+  describe("parseServiceAccountAllowlist", () => {
+    it("distinguishes unset from configured, and splits on commas or whitespace", () => {
+      expect(parseServiceAccountAllowlist(undefined)).toBeNull();
+      expect(parseServiceAccountAllowlist("")).toBeNull();
+      expect(parseServiceAccountAllowlist("  \n ")).toBeNull();
+      expect(parseServiceAccountAllowlist("a,b")).toEqual(new Set(["a", "b"]));
+      expect(parseServiceAccountAllowlist(" a , b\nc ")).toEqual(new Set(["a", "b", "c"]));
+    });
+  });
+
+  describe("resolveServiceAccountName", () => {
+    // The rendered value is byte-identical to the expression this gate
+    // replaced, including for a padded string: `.trim()` is applied to the
+    // value COMPARED, never to the value RETURNED.
+    it("returns the raw value untrimmed when no allowlist is configured", () => {
+      expect(resolveServiceAccountName({ serviceAccountName: " padded " })).toBe(" padded ");
+      expect(resolveServiceAccountName({ serviceAccountName: "" })).toBeUndefined();
+      expect(resolveServiceAccountName({})).toBeUndefined();
+    });
+
+    it("compares the trimmed value against the allowlist", () => {
+      process.env[ALLOWLIST] = "penstock-general-agent";
+      expect(resolveServiceAccountName({ serviceAccountName: " penstock-general-agent " })).toBe(
+        " penstock-general-agent ",
+      );
+      expect(() => resolveServiceAccountName({ serviceAccountName: " paperclip " })).toThrow(
+        /"paperclip"/,
+      );
+    });
   });
 });

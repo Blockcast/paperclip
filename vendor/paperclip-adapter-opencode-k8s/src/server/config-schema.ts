@@ -89,7 +89,7 @@ export function getConfigSchema(): AdapterConfigSchema {
         key: "serviceAccountName",
         label: "Service Account",
         type: "text",
-        hint: "Kubernetes ServiceAccount name for the Job pod; defaults to the namespace 'default' SA. Use a dedicated SA (e.g. paperclip-developer) when the Job needs API access.",
+        hint: "Kubernetes ServiceAccount name for the Job pod; defaults to the namespace 'default' SA. Use a dedicated SA (e.g. paperclip-developer) when the Job needs API access. The pod inherits automountServiceAccountToken from the ServiceAccount named here, so this value decides which RBAC the pod mounts — when PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES is set on the paperclip Deployment, a name outside it refuses the run rather than mounting a sibling identity's token, and leaving this blank is checked under the name 'default' rather than exempted.",
         group: "Kubernetes",
       },
       {

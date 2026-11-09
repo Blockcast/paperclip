@@ -1101,6 +1101,121 @@ export function wakePayloadWithoutWorkspaceWarnings(wake: unknown): unknown {
   return { ...payload, executionWorkspace: workspaceWithoutWarnings };
 }
 
+/**
+ * Operator-controlled allowlist of ServiceAccount names an agent Job pod may
+ * run as. Comma- or whitespace-separated, set on the paperclip Deployment
+ * beside PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME.
+ *
+ * PEN-6275. The `claude_k8s` sibling carries the same constant, the same
+ * parser and the same env var name; this is a deliberate COPY and not an
+ * import. The two vendored adapters are independent packages with no
+ * dependency edge in either direction — neither `package.json` names the
+ * other — and adding one so that a security gate in THIS package is defined in
+ * THAT one would make an `opencode_k8s` dispatch depend on the claude tree
+ * being present. What the two must agree on is the string an operator types
+ * into one Deployment, so the coupling that matters is to the deployment, not
+ * to the sibling's source.
+ *
+ * UNSET MEANS NOT ENFORCED — see `resolveServiceAccountName` for why.
+ */
+export const SERVICE_ACCOUNT_ALLOWLIST_ENV = "PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES";
+
+/**
+ * The identity a pod runs as when its spec names none. This is not "no
+ * identity": Kubernetes assigns the namespace's `default` ServiceAccount, and
+ * in ns `paperclip` that account is not empty — measured 2026-11-09,
+ * `RoleBinding/benchmark-h4-runner` binds `paperclip/default` to a Role
+ * granting `pods/portforward: create` with NO `resourceNames` restriction,
+ * i.e. port-forward to any pod in the namespace.
+ */
+const IMPLICIT_SERVICE_ACCOUNT_NAME = "default";
+
+/**
+ * Parse the allowlist env var. Returns `null` for "no allowlist configured"
+ * and a non-empty Set otherwise — the two are different dispositions, so they
+ * get different types rather than an empty Set standing for both. An empty or
+ * whitespace-only value parses to `null`.
+ *
+ * Exported for unit tests.
+ */
+export function parseServiceAccountAllowlist(raw: string | null | undefined): Set<string> | null {
+  const names = (raw ?? "")
+    .split(/[\s,]+/)
+    .map((name) => name.trim())
+    .filter(Boolean);
+  return names.length > 0 ? new Set(names) : null;
+}
+
+/**
+ * Resolve the ServiceAccount name for this Job pod, refusing a name an
+ * operator-controlled allowlist does not admit.
+ *
+ * PEN-6275. Until this landed, `buildJobManifest` rendered
+ * `config.serviceAccountName` VERBATIM — no allowlist, no pattern, no
+ * validation. This adapter sets `automountServiceAccountToken` nowhere, so the
+ * pod inherits that setting from the ServiceAccount the config NAMES: naming a
+ * sibling account in the namespace does not relabel the pod, it mounts that
+ * account's RBAC at /var/run/secrets/kubernetes.io/serviceaccount/token.
+ *
+ * WHY HERE rather than upstream at the config merge. Three scopes can write
+ * this key and no single upstream point sees all three: the agent row, the
+ * issue-scope `assigneeAdapterOverrides.adapterConfig` overlay, and
+ * `mergeEnvironmentConfig` (`execute.ts`), which copies an execution target's
+ * config over the adapter config for every non-null key. PEN-6247 pinned the
+ * key into the server's AGENT_SCOPE_ONLY_CONFIG_KEYS, which closes the overlay
+ * and leaves the other two.
+ *
+ * WHY THIS PACKAGE AND NOT ONLY THE CLAUDE SIBLING. From Ally's review of
+ * [#3606](https://github.com/Blockcast/paperclip/pull/3606). That PR gated
+ * `claude_k8s` and described the gate as the chokepoint downstream of all three
+ * scopes — true of that adapter and NOT of the fleet, because this adapter is
+ * vendored into the same image, renders the same
+ * `app.kubernetes.io/component: agent-job` label, and read the name verbatim.
+ * An operator who set the env var would have gated every `claude_k8s` run and
+ * believed the boundary held fleet-wide. Measured 2026-11-09T12:4xZ: all 25
+ * live agent-job pods in ns `paperclip` are `claude_k8s`, so the gap was latent
+ * rather than realised — which bounds the severity and does not close it, since
+ * an `opencode_k8s` agent is dispatchable from the same image today.
+ *
+ * WHY UNSET MEANS NOT ENFORCED. A fleet is already running on whatever names it
+ * has; refusing on an unset list would fail every dispatch on the deploy that
+ * carried it. The value of this gate is forcing somebody to enumerate which
+ * identities are appropriate for an agent run, so it ships inert and an
+ * operator turns it on.
+ *
+ * WHY THE IMPLICIT `default` IS CHECKED TOO. Unlike the claude sibling — which
+ * throws when nothing resolves, so the question cannot arise there — this
+ * adapter has no fleet-wide default and omitting the name is legal: the pod
+ * then runs as the namespace's `default` ServiceAccount, which holds real
+ * grants (see `IMPLICIT_SERVICE_ACCOUNT_NAME`). Gating only the NAMED case
+ * would leave an identity outside the set the operator enumerated, reachable by
+ * deleting a config key. So when an allowlist is configured, the effective
+ * identity is checked under that name, and an operator who means to allow it
+ * lists `default` explicitly.
+ *
+ * WHEN UNSET, THE RENDERED VALUE IS BYTE-IDENTICAL to what this function
+ * replaced, including for a padded or empty string: `.trim()` is applied to the
+ * value COMPARED against the allowlist, never to the value returned.
+ */
+export function resolveServiceAccountName(config: Record<string, unknown>): string | undefined {
+  const raw = asString(config.serviceAccountName, "");
+  const rendered = raw || undefined;
+  const allowlist = parseServiceAccountAllowlist(process.env[SERVICE_ACCOUNT_ALLOWLIST_ENV]);
+  if (!allowlist) return rendered;
+  const effective = raw.trim() || IMPLICIT_SERVICE_ACCOUNT_NAME;
+  if (!allowlist.has(effective)) {
+    throw new Error(
+      `opencode_k8s: refusing to build a Job pod running as ServiceAccount "${effective}" — it is not in ${SERVICE_ACCOUNT_ALLOWLIST_ENV} (${[...allowlist].sort().join(", ")}). `
+        + "The pod inherits automountServiceAccountToken from the ServiceAccount it NAMES, so naming a sibling account in this namespace does not relabel the pod — it mounts that account's RBAC. "
+        + (raw.trim()
+          ? ""
+          : `This agent names no serviceAccountName, so the pod would run as the namespace's "${IMPLICIT_SERVICE_ACCOUNT_NAME}" ServiceAccount, which is an identity like any other and is not implicitly exempt. `)
+        + "Either correct the value for this agent, or add this name to the allowlist on the paperclip Deployment once someone has decided the identity is appropriate for agent runs (PEN-6275).",
+    );
+  }
+  return rendered;
+}
+
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   const { ctx, selfPod } = input;
   const { runId, agent, runtime, config: rawConfig, context, onLog } = ctx;
@@ -1116,6 +1231,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   assertSafePathComponent("runId", runId);
 
   const namespace = asString(config.namespace, "") || selfPod.namespace;
+  const serviceAccountName = resolveServiceAccountName(config);
   const image = asString(config.image, "") || selfPod.image;
   // Throws on anything but an exact version or "image" — the value is shell-interpolated.
   const opencodeVersion = resolveOpencodeVersion(config.opencodeVersion);
@@ -1787,7 +1903,7 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
         metadata: { labels },
         spec: {
           restartPolicy: "Never",
-          serviceAccountName: asString(config.serviceAccountName, "") || undefined,
+          serviceAccountName,
           securityContext: podSecurityContext,
           ...(selfPod.imagePullSecrets.length > 0 ? { imagePullSecrets: selfPod.imagePullSecrets } : {}),
           ...(selfPod.dnsConfig ? { dnsConfig: selfPod.dnsConfig } : {}),

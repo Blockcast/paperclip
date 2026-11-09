@@ -3456,8 +3456,16 @@ const DIND_WAIT_PREAMBLE =
  * PEN-6247 pinned the key into the server's AGENT_SCOPE_ONLY_CONFIG_KEYS,
  * which closes the overlay and leaves the other two — and environment scope is
  * not a theoretical route, it is the production writer of this key for the
- * Penstock fleet. `resolveServiceAccountName` is the single chokepoint
- * DOWNSTREAM of all three.
+ * Penstock fleet. `resolveServiceAccountName` is the chokepoint DOWNSTREAM of
+ * all three FOR THIS ADAPTER.
+ *
+ * SCOPE, because the sentence above is about `claude_k8s` and not about the
+ * fleet. `vendor/paperclip-adapter-opencode-k8s` is vendored into the same
+ * image, renders the same `app.kubernetes.io/component: agent-job` label, and
+ * has its own `resolveServiceAccountName` reading the same env var — a
+ * deliberate copy, since the two packages have no dependency edge. An operator
+ * who sets the allowlist gates both. Keep them in step: a change to the env var
+ * name or the parse rules here is only half a change.
  *
  * WHY UNSET MEANS NOT ENFORCED. Measured 2026-11-09: 39 live agent-job pods in
  * ns `paperclip` resolve to four different ServiceAccounts, and 21 of them
