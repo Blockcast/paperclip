@@ -115,6 +115,42 @@ export const DEFAULT_COVER_DEDUP_WINDOW_MINUTES = 120;
 export const DEFAULT_COVER_CLOSE_HOLD_MINUTES = 15;
 
 /**
+ * PEN-6236 — the bound on how long a `pending` (or unreadable) Prometheus may
+ * hold a cover's close open, measured from the newest member `resolved_at`.
+ *
+ * The hold above cannot be the answer to defect A, and the reason is a
+ * measurement rather than a preference: for the guard to work by waiting, the
+ * hold would have to exceed the longest source `for:`, which on this estate
+ * (2026-11-09, 1199 loaded alerting rules) runs to 259,200 s = 72 h. A 72-hour
+ * hold re-creates BLO-42259's precursor defect in the opposite direction — a
+ * genuinely resolved cover that never closes, i.e. nagging the board about an
+ * alert that is over.
+ *
+ * So the guard is a CHECK with a deadline, not a longer wait. Inside this
+ * window a `pending` or unreadable answer defers the close; past it the cover
+ * closes anyway, with the verdict recorded so the compromise is auditable
+ * rather than silent.
+ *
+ * 240 minutes is set against the sources that have actually minted covers,
+ * whose `for:` runs 600 s – 3600 s: 4× the longest of them, and 16× the hold.
+ * It deliberately does NOT cover the 72 h tail — a cover frozen for three days
+ * on an unreadable endpoint is worse than one closed with a named verdict —
+ * so an estate that routes very long-`for:` rules into covers should raise
+ * `coverPendingRecheckLimitMinutes` knowingly.
+ */
+export const DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES = 240;
+
+/**
+ * Per-call cap on the Prometheus pending read, covering headers AND body.
+ * Matches `ALERTMANAGER_READ_TIMEOUT_MS` for the same reason: the close pass
+ * walks ready covers sequentially, so a reachable-but-hanging endpoint must
+ * cost it seconds rather than the host fetch default. Combined with
+ * `createSweepPendingReader`'s transport short-circuit, one hanging Prometheus
+ * costs a pass at most one of these however many covers are ready.
+ */
+export const DEFAULT_PROMETHEUS_READ_TIMEOUT_MS = 5_000;
+
+/**
  * How long an operator-closed issue mutes re-fires of its fingerprint before
  * the plugin re-opens it anyway (BLO-24234).
  *
@@ -335,6 +371,7 @@ export const DEFAULT_CONFIG: AlertmanagerPluginConfig = {
   escalationDeadlineMinutes: DEFAULT_ESCALATION_DEADLINE_MINUTES,
   coverDedupWindowMinutes: DEFAULT_COVER_DEDUP_WINDOW_MINUTES,
   coverCloseHoldMinutes: DEFAULT_COVER_CLOSE_HOLD_MINUTES,
+  coverPendingRecheckLimitMinutes: DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES,
 };
 
 /**
