@@ -80,8 +80,10 @@
  * `VACUUM` (see `writeProbe` below) and at the 14.3x-oversized stipulation, so
  * each candidate's `EXPLAIN` ran over a different amount of dead-tuple bloat.
  * It is kept because it is the table every prior record quotes. The 2026-11-09
- * re-runs below correct it: at constant scale every figure here survives to
- * within ~15% EXCEPT C4's dense, which is wrong by 24x. Read both.
+ * re-runs below re-take it: at constant scale every figure here survives to
+ * within ~15%, which is this harness's noise floor -- the only large mover is
+ * C4's dense, and that is plan INSTABILITY rather than a corrected figure
+ * (finding 7). Read both; do not treat either as the more honest one.
  * Embedded Postgres 18.1 (production is 18.4), harness defaults, no parallel
  * workers. 2,000,000 rows / 20 companies / 20,000 issues / 90-day spread.
  * Target company's 14-day window (the route's `lookbackDays`): 158,657 rows.
@@ -187,9 +189,10 @@
  * ordering loss and costs 168 MB of heap for the stored array,
  * so it is only the right answer if the rewrite in 5 is acceptable AND the
  * dense path is not. ⛔ An earlier revision priced that ordering loss at
- * "dense 107.9 ms". Do not quote it: finding 7 shows the planner's choice for
- * C4's dense case is not stable across statistics, so C4's dense cost is
- * UNKNOWN rather than high.
+ * "dense 107.9 ms". Do not quote it, and do not quote Run A's 4.44 ms either:
+ * finding 7 shows C4's dense case flips between the GIN plan and the baseline's
+ * own `&&`-filter plan between runs at nominally identical state, so C4's dense
+ * cost is UNSTABLE -- not high, and not low.
  *
  * ⛔ 5 · BOTH GENERATED-COLUMN SHAPES TAKE AN `ACCESS EXCLUSIVE` TABLE REWRITE,
  * AND IT IS OUTAGE-CLASS AS PEN-6104 PREDICTED: 74.9 s (C3) and 66.8 s (C4) at
@@ -234,37 +237,93 @@
  *   C3  scalar col+btree 74+42MB    0.13ms   0.31ms 5.2MB+3MB  0.13ms  0.30ms
  *   C4  text[] col+GIN  14+168MB    3.24ms   4.44ms 0.8MB+12MB 1.52ms  5.75ms
  *
- * ⭐ 7 · THE BLOAT FIX CHANGES ONE VERDICT, AND IT IS NOT THE RECOMMENDED ONE.
- * Run A against the 2026-11-08 table: baseline, C1, C1b, C2, C2b and C3 all land
- * within ~15%, which is run-to-run noise on this harness. C2b's dense
- * REGRESSION is real and survives -- 11.80 vs 5.19 ms, 2.27x, against 2.4x
- * before. But C4's dense moves 107.9ms -> 4.44ms, and the cause is a PLAN FLIP,
- * not a speed-up: with honest statistics the planner DECLINES the `text[]` GIN
- * and falls back to `agent_wakeup_requests_company_requested_idx` with a `&&`
- * filter, 3,086 rows removed -- the baseline's own plan.
+ * ⭐ 7 · THE FIX IS CORRECT AND ITS MEASURED EFFECT IS BELOW THIS HARNESS'S
+ * NOISE FLOOR. Run A against the 2026-11-08 table: baseline, C1, C1b, C2, C2b
+ * and C3 all land within ~15%. ⚠️ And ~15% IS the noise floor here, which is
+ * the honest reading rather than a hedge -- the BASELINE carries ZERO dead
+ * tuples in BOTH runs, because its write probe runs FIRST (see `results.baseline`
+ * below) before any `DELETE` has happened, and it still moved 237.6 -> 253.3 ms
+ * sparse. Nothing the `VACUUM` could have done is larger than that. ✅ C2b's
+ * dense regression survives at 2.27x against 2.4x, so PEN-6104's "the 2.4x is an
+ * upper bound" annotation was directionally right and quantitatively inside the
+ * noise. The fix belongs here on its own reasoning -- an uneven handicap between
+ * the candidates being compared is a defect whether or not it moved a number --
+ * and NOT because it corrected the record.
  *
- *   ⛔ So C4's dense figure is not a cost, it is a coin-flip between two plans,
- *      and NEITHER run should be quoted as C4's dense behaviour.
+ * ⛔ RETRACTED, and this is the part worth reading: an earlier revision of this
+ * finding claimed the fix caused C4's dense plan flip (107.9 -> 4.44 ms). IT
+ * CANNOT HAVE. C4's `ADD COLUMN ... STORED` rewrite copies only live tuples and
+ * rebuilds every index, and `ANALYZE agent_wakeup_requests` runs immediately
+ * after it in BOTH runs, so C4's heap, indexes and statistics are identical with
+ * or without the `VACUUM`. The `writeProbe` comment below SAYS SO -- it records
+ * C4's dead-tuple count as 0 -- three paragraphs from the claim it refutes. The
+ * flip is run-to-run plan instability at nominally identical state.
  *
- * ⚠️ Generalise the shape, not the number: **the bloat did not make the
- * measurements slower, it made the PLANNER CHOOSE DIFFERENTLY.** So a bias audit
- * that asks "did the milliseconds move?" clears a candidate whose entire plan
- * was selected by the artifact -- the one candidate here that was actually
- * mis-measured is the one that moved for a reason that check cannot see.
+ *   ✅ The operational conclusion is unchanged and is the only thing to carry
+ *      forward: C4's dense cost is UNSTABLE between runs, so do not quote it,
+ *      in either direction. It is not a cost, it is a coin-flip between the GIN
+ *      plan and the baseline's own `&&`-filter plan.
  *
- * ⭐ 8 · THE WRITE PROBE'S IMPOSSIBLE ORDERING WAS THE SAME ARTIFACT. The
- * 2026-11-08 run measured C2 (four EXTRA indexes) at 8,962 rows/s against a
- * BASELINE of 7,309 and this header called that "the tell". With the `VACUUM`
- * in place the baseline is the fastest candidate, as it must be:
+ * ✅ CONFIRMED BY A THIRD RUN, since a structural argument is not a measurement.
+ * Same defaults, same `VACUUM`, same machine, nothing changed between them:
+ *
+ *   C4 dense, run A ...  4.44 ms  Index Scan `..._company_requested_idx`
+ *                                 + `&&` Filter, 3,086 rows removed
+ *   C4 dense, run C ... 91.83 ms  Bitmap Heap Scan, BitmapAnd of
+ *                                 `awr_target_issue_ids_gin` (17,142 entries)
+ *                                 and `..._agent_requested_idx`, 0 removed
+ *
+ * 21x apart, two DIFFERENT PLANS, identical state. C4's dense case is settled as
+ * unstable and unquotable.
+ *
+ * ⚠️ The same run shows C1's dense is unstable too -- 245.4 vs 39.8 ms, again
+ * two plans (14,478 vs 3,086 rows removed) -- which matches what this header
+ * already says about C1b ("the least stable number in this file", 38.3 vs
+ * 368.5 ms at one scale). ⭐ Read that as a property of the FAMILY, not of three
+ * unlucky numbers: a GIN arm's selectivity estimate is what the planner is
+ * guessing at, and every candidate whose dense figure has moved is a GIN one.
+ *
+ * ✅ And the control that makes the above mean something: C2b is the MOST stable
+ * number in the file. Across the two identical runs its dense moved 11.80 ->
+ * 11.27 ms (-4.5%) and its sparse 0.217 -> 0.213 ms (-1.8%), against a BASELINE
+ * that moved -12% on sparse. The recommended shape is the one whose figures you
+ * can actually rely on, which is a point in its favour that no single run could
+ * have made.
+ *
+ * ⭐⭐⭐ THE GENERATOR, since the error is more instructive than the number:
+ * THE AUTHOR OF A CORRECTION IS THE WORST-PLACED PERSON TO ATTRIBUTE WHAT IT
+ * CHANGED. I had the right mechanism -- bloat is uneven BETWEEN candidates --
+ * and reached for it to explain the biggest figure that moved, which happened to
+ * be the one candidate the mechanism provably cannot reach. Every small mover
+ * was consistent with the story, so the story felt confirmed six times over
+ * before it was tested once. ⚠️ And note the shape of the refutation: the
+ * disproof was ALREADY WRITTEN, by me, in this same diff. A claim is not checked
+ * by re-reading the paragraph that makes it. (Found by Ally in review of this
+ * change; the attribution was mine.)
+ *
+ * ⭐ 8 · THE WRITE PROBE'S ORDERING IS NOW MONOTONE, AND THE FIX IS NOT WHY.
+ * The 2026-11-08 run measured C2 -- four EXTRA indexes -- at 8,962 rows/s
+ * against a BASELINE of 7,309, and this header called that "the tell". In Run A
+ * the baseline is the fastest candidate, as it must be:
  *
  *   baseline 16,912 rows/s · C2/C2b 10,973 (-35%) · C1b 10,037 (-41%)
  *   C1 8,784 (-48%) · C4 3,459 (-80%) · C3 3,292 (-81%)
  *
- * ⚠️ STILL not quotable throughput, for the reason given above -- `fsync` and
+ * ⛔ But the baseline's probe runs FIRST, before any `DELETE` or `VACUUM` has
+ * executed, so the fix cannot touch it -- and the baseline moved 7,309 ->
+ * 16,912, a 2.3x jump that is most of why the ordering is now monotone. That is
+ * the checkpoint/`fsync` variance this header already describes above, not the
+ * bloat. ⚠️ Which also means the two runs' write figures are NOT comparable to
+ * each other at all: they were taken on different machines, and the one number
+ * guaranteed to be bloat-free moved more than anything the bloat could explain.
+ * (Ally's suggestion on this change.)
+ *
+ * ⚠️ The magnitudes remain unquotable for the reason given above -- `fsync` and
  * `full_page_writes` stay on and the run is checkpoint-dominated, and C3/C4
- * additionally pay for a heap their `ADD COLUMN` rewrite has just grown. What
- * the fix buys is a MONOTONE ordering, not a trustworthy magnitude. C2/C2b's
- * -35% is unchanged from the separate `fsync=off` run above; use that figure.
+ * additionally pay for a heap their `ADD COLUMN` rewrite has just grown.
+ * C2/C2b's -35% from the separate `fsync=off` run above is unchanged and is
+ * still the figure to use; it agrees with Run A's -35% by coincidence, not by
+ * corroboration.
  *
  * ⭐ 9 · AT THE REAL ROW COUNT C2b's PLAN SURVIVES AND ITS DENSE REGRESSION
  * INVERTS. This is the one claim the 2M table could not make, since plan choice
