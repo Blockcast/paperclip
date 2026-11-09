@@ -3381,6 +3381,100 @@ describe("merge-queue eviction wake (BLO-23395)", () => {
   });
 });
 
+describe("triggered-monitor exits directive (PEN-6271)", () => {
+  const issue = {
+    id: "issue-6271",
+    identifier: "PEN-6271",
+    title: "A run that deliberately stops polling has no way to say so",
+    workMode: "standard",
+    description: null,
+  };
+
+  // The measurement this directive exists for. PEN-6271, 2026-11-09, over a census
+  // paged to exhaustion: of 286 `trigger_stalled` clears, 87 (30.4%) were rows whose
+  // woken run `succeeded` -- it started after the fire, wrote to the row, and finished
+  // before the sweep -- against 15 (5.2%) whose run `failed`/`cancelled`. The dominant
+  // reader is therefore a run about to make the right decision and express it the wrong
+  // way, so the exits have to be stated BEFORE the run ends, not in the recovery comment
+  // that is minted once it is too late.
+  it("names both exits, and the cost of taking neither, when the monitor is triggered", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      triggeredMonitor: {
+        lastTriggeredAt: "2026-11-08T19:30:27.629Z",
+        attemptCount: 4,
+        maxAttempts: 24,
+        serviceName: "github-pr-human-approval",
+      },
+    });
+
+    expect(markdown).toContain("Triggered monitor -- the two exits that discharge it:");
+    // Each exit pinned INDIVIDUALLY. A test that pinned only the heading would pass
+    // against a section that had quietly lost one of the two, which is the whole
+    // failure this directive addresses.
+    expect(markdown).toContain("`paperclipSetIssueMonitor`");
+    expect(markdown).toContain("`paperclipClearIssueMonitor(issueId)`");
+    // ...and the consequence, which is the half that makes "do nothing" legible as a
+    // choice with a price rather than as a neutral default.
+    expect(markdown).toContain("`trigger_stalled`");
+    expect(markdown).toContain("byte-identical to this run having died");
+    // The row's own facts, so the run can tell which monitor is meant.
+    expect(markdown).toContain("fired 2026-11-08T19:30:27.629Z");
+    expect(markdown).toContain("attempt 4/24");
+    expect(markdown).toContain("waiting on `github-pr-human-approval`");
+  });
+
+  // Discrimination. The gate has to be able to say NO, or it is not a gate -- and an
+  // unconditional version of this block would be standing noise on every wake, which is
+  // how a directive stops being read.
+  it("is absent when no monitor is triggered", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).not.toContain("Triggered monitor -- the two exits");
+    expect(markdown).not.toContain("`paperclipClearIssueMonitor(issueId)`");
+    // Control: the block that IS unconditional still renders, so this is a scoped
+    // absence and not an empty build.
+    expect(markdown).toContain("Pre-write re-read directive:");
+  });
+
+  // A monitor can be triggered with none of its descriptive fields populated. The
+  // parenthetical must then be omitted entirely rather than rendered empty: a bare
+  // "()" reads as the gate having fired on a row with no monitor, which would teach
+  // the fleet that the gate means nothing.
+  it("omits the parenthetical rather than emitting an empty one", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      triggeredMonitor: {
+        lastTriggeredAt: null,
+        attemptCount: null,
+        maxAttempts: null,
+        serviceName: null,
+      },
+    });
+
+    expect(markdown).toContain("Triggered monitor -- the two exits that discharge it:");
+    expect(markdown).toContain("is sitting `triggered`. It stays `triggered`");
+    expect(markdown).not.toContain("()");
+  });
+
+  // `attemptCount` without `maxAttempts` is a real shape (the bound defaults), and the
+  // "/" separator must not be emitted with nothing after it.
+  it("renders an attempt count with no declared ceiling", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      triggeredMonitor: {
+        lastTriggeredAt: null,
+        attemptCount: 2,
+        maxAttempts: null,
+        serviceName: null,
+      },
+    });
+
+    expect(markdown).toContain("(attempt 2)");
+    expect(markdown).not.toContain("attempt 2/");
+  });
+});
+
 describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliverable B)", () => {
   const issue = {
     id: "issue-1",

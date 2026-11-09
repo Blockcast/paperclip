@@ -2458,6 +2458,129 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     expect(activity).toContain("issue.monitor_recovery_wake_queued");
   });
 
+
+  // PEN-6271: `trigger_stalled` was minted with ONE sentence -- "it fired but the woken
+  // run never re-armed or cleared it" -- which is true of a crashed run and of a run that
+  // completed and simply did not discharge the monitor. The sweep could not tell them
+  // apart, and the sentence lands on the permanent record, about a colleague's run, in
+  // front of an audience with no way to check.
+  //
+  // Measured 2026-11-09 over a census paged to exhaustion: of 286 such clears, 87 (30.4%)
+  // were rows whose woken run `succeeded`, against 15 (5.2%) that `failed`/`cancelled`.
+  // So the single sentence was wrong about the majority of the rows it was stamped on.
+  //
+  // These three cases are the discrimination the probe adds: a completed run, no run, and
+  // -- the one that must NOT be read as a hand-off -- a run that died.
+  async function seedConsumerRun(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    status: "succeeded" | "failed";
+    finishedAt: Date;
+  }) {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId: input.companyId,
+      agentId: input.agentId,
+      status: input.status,
+      invocationSource: "automation",
+      createdAt: new Date(input.finishedAt.getTime() - 60 * 60 * 1000),
+      startedAt: new Date(input.finishedAt.getTime() - 30 * 60 * 1000),
+      finishedAt: input.finishedAt,
+      // `contextIssueId` is a generated stored mirror of `context_snapshot ->> 'issueId'`
+      // (migration 0079) and is the column the probe's index keys on, so the snapshot is
+      // what binds the run to the issue.
+      contextSnapshot: { issueId: input.issueId, wakeReason: "issue_monitor_due" },
+    });
+    return runId;
+  }
+
+  async function recoveryCommentBody(issueId: string) {
+    const rows = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId))
+      .then((all) => all.filter((row) => row.body.includes("cleared the scheduled")));
+    expect(rows).toHaveLength(1);
+    return rows[0]!.body;
+  }
+
+  it("attributes a trigger_stalled clear to a run that COMPLETED without discharging the monitor", async () => {
+    const { issueId, companyId, agentId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    // Finished AFTER the fire, so it had the chance to re-arm or clear and did not.
+    await seedConsumerRun({
+      companyId,
+      agentId,
+      issueId,
+      status: "succeeded",
+      finishedAt: new Date(lastTriggeredAt.getTime() + 60 * 60 * 1000),
+    });
+    const heartbeat = createHeartbeat();
+
+    await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
+
+    const body = await recoveryCommentBody(issueId);
+    expect(body).toContain("the run it woke COMPLETED without re-arming or clearing it");
+    expect(body).toContain("a missed hand-off, not a dead run");
+    // The accusation this replaces must be gone, not merely supplemented.
+    expect(body).not.toContain("never re-armed or cleared it");
+  });
+
+  it("attributes a trigger_stalled clear with no completed run to nothing having come back", async () => {
+    const { issueId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    const heartbeat = createHeartbeat();
+
+    await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
+
+    const body = await recoveryCommentBody(issueId);
+    expect(body).toContain("no run on this issue has completed since, so nothing came back for it");
+    expect(body).not.toContain("COMPLETED without re-arming");
+  });
+
+  // The direction this attribution must not fail in. A run that `failed` is exactly the
+  // stall the sweep is named for, so counting it as a completed hand-off would launder a
+  // dead run into a deliberate decision -- the mirror of the defect being fixed, and the
+  // one that would make the new wording less true than the old.
+  it("does not read a FAILED run as a completed hand-off", async () => {
+    const { issueId, companyId, agentId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    await seedConsumerRun({
+      companyId,
+      agentId,
+      issueId,
+      status: "failed",
+      finishedAt: new Date(lastTriggeredAt.getTime() + 60 * 60 * 1000),
+    });
+    const heartbeat = createHeartbeat();
+
+    await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
+
+    const body = await recoveryCommentBody(issueId);
+    expect(body).toContain("no run on this issue has completed since");
+    expect(body).not.toContain("COMPLETED without re-arming");
+  });
+
+  // A run that completed BEFORE the monitor fired cannot be the run the fire woke, so it
+  // must not be credited with a hand-off it had no opportunity to make. `finishedAt > fire`
+  // is the conjunct that carries this, and without it any historical run on the issue
+  // would satisfy the probe.
+  it("ignores a completed run that finished BEFORE the monitor fired", async () => {
+    const { issueId, companyId, agentId, lastTriggeredAt } = await seedExpiredTriggeredFixture({ timeoutAt: null });
+    await seedConsumerRun({
+      companyId,
+      agentId,
+      issueId,
+      status: "succeeded",
+      finishedAt: new Date(lastTriggeredAt.getTime() - 60 * 60 * 1000),
+    });
+    const heartbeat = createHeartbeat();
+
+    await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
+
+    const body = await recoveryCommentBody(issueId);
+    expect(body).toContain("no run on this issue has completed since");
+  });
+
   // Control for the false-positive half of BLO-29606: inside the grace window the
   // trigger is simply outstanding — a live run may still be working it — so the
   // sweep must not clear it or burn an owner wake. This is the case a

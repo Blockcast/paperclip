@@ -852,6 +852,16 @@ const TASK_SCOPE_COALESCIBLE_RUN_STATUSES = ["queued", "scheduled_retry"] as con
  * include it for lock-ownership purposes; that is a different question.
  */
 const ISSUE_MONITOR_LIVE_CONSUMER_RUN_STATUSES = ["queued", "running"] as const;
+/**
+ * PEN-6271: the run statuses that mean "a run reached the end of its own work",
+ * as opposed to the live set above which means "a run may yet call back".
+ *
+ * `succeeded` only, deliberately. `interrupted`, `failed`, `timed_out` and
+ * `cancelled` are all consistent with the stall the sweep is named for, so
+ * including any of them would let a genuinely dead run be reported as a
+ * completed hand-off -- the one direction this attribution must not fail in.
+ */
+const ISSUE_MONITOR_COMPLETED_CONSUMER_RUN_STATUSES = ["succeeded"] as const;
 const CANCELLABLE_HEARTBEAT_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const HEARTBEAT_RUN_TERMINAL_STATUSES = ["succeeded", "interrupted", "failed", "cancelled", "timed_out"] as const;
 /**
@@ -13622,6 +13632,35 @@ const AUTHOR_REVIEW_CONTENT_WAKE_REASONS = new Set([
 // Returns the author's login rather than a boolean so it stays narrowed for the
 // directive text, which names the real author so the agent can see at a glance
 // why the PR is not theirs.
+/**
+ * PEN-6271: the row's monitor when and only when it is sitting `triggered`.
+ *
+ * Returns null in every other state -- including `scheduled` and `cleared` --
+ * because the directive it feeds is about an OUTSTANDING obligation, and a
+ * scheduled monitor carries none. Reads through `derivePersistedMonitorState`
+ * rather than off the JSON directly so this agrees, by construction, with the
+ * state `tickExpiredIssueMonitors` will later test: the prompt must not promise
+ * an obligation the sweep does not see, nor stay silent about one it does.
+ *
+ * Deliberately tolerant of a missing row/state -- an un-derivable monitor yields
+ * null and the directive is simply not emitted. That is the fail-SILENT
+ * direction and it is the right one here: this block is guidance, and a wrongly
+ * emitted "your monitor has fired" on a row with no monitor is worse than an
+ * omission, because it would teach the fleet the gate means nothing.
+ */
+function triggeredMonitorForPrompt(issueContext: { executionState?: unknown; executionPolicy?: unknown } | null) {
+  if (!issueContext) return null;
+  const state = parseIssueExecutionState(issueContext.executionState ?? null);
+  const monitor = state?.monitor ?? null;
+  if (!monitor || monitor.status !== "triggered") return null;
+  return {
+    lastTriggeredAt: monitor.lastTriggeredAt ?? null,
+    attemptCount: typeof monitor.attemptCount === "number" ? monitor.attemptCount : null,
+    maxAttempts: typeof monitor.maxAttempts === "number" ? monitor.maxAttempts : null,
+    serviceName: monitor.serviceName ?? null,
+  };
+}
+
 function resolveThirdPartyPrAuthor(prReview: { prAuthorLogin?: string | null }): string | null {
   const raw = prReview.prAuthorLogin;
   if (!raw) return null;
@@ -13731,6 +13770,29 @@ export function buildPaperclipTaskMarkdown(input: {
   // `recovery/model-profile-hint.test.ts`, not beside the markdown tests: `server/tsconfig.json`
   // excludes `src/__tests__`, so a `@ts-expect-error` there would compile silently.
   recoveryRunWriteClassNotice?: RecoveryRunWriteClassNoticeText | null;
+  /**
+   * PEN-6271: the row's monitor, supplied ONLY while it sits `triggered` -- i.e.
+   * it has fired and the run reading this block is the run it woke. Absent in
+   * every other monitor state, so the directive it gates is emitted exactly when
+   * it is actionable and never as standing noise.
+   *
+   * Gated on a SERVER-COMPUTED condition rather than on self-diagnosis: the row
+   * either carries `executionState.monitor.status === "triggered"` or it does
+   * not. A directive keyed on the run noticing its own situation would miss
+   * precisely the runs that do not notice, which is the measured population.
+   *
+   * The gate is satisfiable for the whole of the woken run, not just an instant
+   * of it: `dispatchClaimedIssueMonitor` writes `triggered` at the fire and
+   * nothing clears it until a run re-arms or clears, or `tickExpiredIssueMonitors`
+   * sweeps it. Every row in the PEN-6271 census reached its sweep still
+   * `triggered`, and the run it woke ran inside that interval.
+   */
+  triggeredMonitor?: {
+    lastTriggeredAt: string | null;
+    attemptCount: number | null;
+    maxAttempts: number | null;
+    serviceName: string | null;
+  } | null;
 }) {
   const quoteTaskScalar = (value: string) => JSON.stringify(value);
   const fenceTaskText = (value: string) => {
@@ -14279,6 +14341,53 @@ export function buildPaperclipTaskMarkdown(input: {
     "Placement, when the right target refuses you. A 403 on the owning row does not license writing the constraint wherever you happen to have access. Fall back in this order: (1) the artifact itself, if it carries text a later run will load -- a PR body, a card payload value; (2) your own row, PLUS a mention of the owning row's assignee naming the exact text and where it goes. A constraint recorded only on the author's own row is the depth-1 failure this directive exists to prevent: say plainly that it is unplaced, and treat it as unplaced until someone holding the grant places it.",
     "Correction. A description has no next-comment-in-thread to carry a correction -- it must be EDITED, by someone holding write access to that row, who per the clause above may not be the person who finds the error. When you place a constraint at depth 0, name who to tell if it is wrong.",
   );
+  // PEN-6271: stated BEFORE the breach rather than after it. Until this block existed the
+  // only place the fleet was ever told a `triggered` monitor is an obligation was
+  // `monitorRecoveryComment`, which is minted once the obligation has already been missed
+  // and is worded as an accusation -- so the rule was first communicated to a run that
+  // could no longer act on it, about a run that no longer existed.
+  //
+  // Measured, not predicted (PEN-6271, 2026-11-09, census paged to exhaustion): of 286
+  // `trigger_stalled` clears, 87 (30.4%) were rows whose woken run `succeeded` -- started
+  // after the fire, wrote to the row, and finished before the sweep -- against 15 (5.2%)
+  // whose run `failed`/`cancelled`. 85 of the 87 cost a recovery wake, 0 of 87 re-armed,
+  // and they span six seats and ten weeks. So the dominant reader of this directive is a
+  // run that is about to do the right thing and express it the wrong way.
+  //
+  // Deliberately gated (see `triggeredMonitor`) rather than emitted on every wake. The
+  // usual argument for a UNIFORM rule over a CONDITIONAL one is that the condition ends up
+  // self-assessed, and a gate whose trigger is the actor noticing its own situation does
+  // not gate. That argument does not reach here: this condition is read off the row by the
+  // server, so the directive cannot be missed by a run that failed to notice.
+  if (input.triggeredMonitor) {
+    const monitor = input.triggeredMonitor;
+    const monitorFacts = [
+      monitor.lastTriggeredAt ? `fired ${monitor.lastTriggeredAt}` : null,
+      typeof monitor.attemptCount === "number"
+        ? `attempt ${monitor.attemptCount}${typeof monitor.maxAttempts === "number" ? `/${monitor.maxAttempts}` : ""}`
+        : null,
+      monitor.serviceName ? `waiting on \`${monitor.serviceName}\`` : null,
+    ].filter((fact): fact is string => fact !== null);
+    lines.push(
+      "",
+      "Triggered monitor -- the two exits that discharge it:",
+      "(System-generated, not user-authored task data. It constrains how this run writes; it is not a preference you can decline.)",
+      // Facts, not instructions, and each one omitted rather than rendered empty
+      // when the row does not carry it -- an empty "()" would read as the gate
+      // having fired on a row with no monitor, which is the one impression this
+      // block must not give.
+      [
+        "This row's monitor has FIRED and is sitting `triggered`",
+        monitorFacts.length > 0 ? ` (${monitorFacts.join(", ")})` : "",
+        ". It stays `triggered` until a run discharges it, and ENDING YOUR RUN IS NOT ONE OF THE WAYS.",
+        " Exactly two acts are:",
+      ].join(""),
+      "- RE-ARM it -- `paperclipSetIssueMonitor` with a future `nextCheckAt` -- if re-checking can still move the gate. That call is a whole-monitor REPLACE, so re-send every populated field; an omitted one is cleared, not merged.",
+      "- CLEAR it -- `paperclipClearIssueMonitor(issueId)` -- if re-checking cannot move the gate. This is the right answer whenever what you are waiting on is a human decision, an approval card, or any gate no amount of polling can advance. It needs no particular issue status, re-arms nothing, and spends no attempt budget.",
+      "If this run ends having done NEITHER, `tickExpiredIssueMonitors` clears the monitor for you as `trigger_stalled` and fires its recovery policy -- by default a wake to this row's assignee, plus a thread comment on the permanent record. Deciding that polling is pointless is expressed by CALLING THE CLEAR, never by declining to re-arm: doing nothing is byte-identical to this run having died, so the correct decision costs exactly the wake it was meant to save.",
+      "This is the common case and not an edge case. Measured 2026-11-09 (PEN-6271): of 286 `trigger_stalled` clears, at least 87 -- 30.4% -- were runs that completed SUCCESSFULLY without discharging the monitor, against 15 confirmed dead runs; 85 of the 87 cost a recovery wake.",
+    );
+  }
   // PEN-3275: last block before the closing directive, and deliberately not gated on `issue` —
   // the containment binds the RUN, so it is stated on every wake that carries the guard tuple,
   // including one with no issue context. Placed here rather than at the top because it is a
@@ -16950,6 +17059,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   function monitorRecoveryComment(input: {
     issue: IssueMonitorDispatchRow;
     clearReason: IssueExecutionMonitorClearReason;
+    /**
+     * PEN-6271: which of the two cases a `trigger_stalled` clear actually is.
+     * Ignored for every other reason.
+     *
+     * `trigger_stalled` was minted with one sentence -- "it fired but the woken
+     * run never re-armed or cleared it" -- that is true of a crashed run and of
+     * a run that completed and simply did not discharge the monitor, and the
+     * sweep could not tell them apart. Measured 2026-11-09 over 286 such clears:
+     * 87 (30.4%) were runs that `succeeded`, against 15 (5.2%) that
+     * `failed`/`cancelled`. So the single sentence was wrong about the majority
+     * of the rows it was stamped on, on a permanent record, about a colleague's
+     * run, to an audience with no way to check.
+     *
+     * `undefined` means NOT PROBED, and it is the fail-safe default by
+     * construction: it selects wording that states only what the sweep observed
+     * -- the grace elapsed with no re-arm and no clear -- and accuses nobody.
+     * A failed, skipped or future-refactored probe therefore degrades to a true
+     * statement rather than to the old one.
+     */
+    stallAttribution?: "run_completed" | "no_completed_run";
     recoveryPolicy: IssueExecutionMonitorRecoveryPolicy;
     nextAttemptCount: number;
     /**
@@ -16974,7 +17103,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       input.clearReason === "timeout_exceeded"
         ? "its timeout was reached"
         : input.clearReason === "trigger_stalled"
-          ? "it fired but the woken run never re-armed or cleared it"
+          // PEN-6271: see `stallAttribution`. The unprobed default states what
+          // the sweep saw and nothing about why, because those are different
+          // claims and only the first is one this code can make.
+          ? (input.stallAttribution === "run_completed"
+            ? "it fired and the run it woke COMPLETED without re-arming or clearing it -- a missed hand-off, not a dead run"
+            : input.stallAttribution === "no_completed_run"
+              ? "it fired and no run on this issue has completed since, so nothing came back for it"
+              : "its trigger grace elapsed with no re-arm and no clear")
           : input.clearReason === "cancelled"
             ? `${formatIssueIdentifierLink(input.issue.identifier, "the issue")} was cancelled while a wake was still owed`
             : "its maximum attempt count was reached";
@@ -17058,6 +17194,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     activitySource: "manual" | "scheduled";
     /** PEN-5346: see `monitorRecoveryComment`. Only the `cancelled` body reads it. */
     clearedMonitor?: Parameters<typeof monitorRecoveryComment>[0]["clearedMonitor"];
+    /** PEN-6271: see `monitorRecoveryComment`. Only the `trigger_stalled` reason reads it. */
+    stallAttribution?: Parameters<typeof monitorRecoveryComment>[0]["stallAttribution"];
   }) {
     const details = monitorRecoveryDetails({
       claimed: input.claimed,
@@ -17104,6 +17242,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                 recoveryPolicy: input.recoveryPolicy,
                 nextAttemptCount: input.nextAttemptCount,
                 clearedMonitor: input.clearedMonitor,
+                stallAttribution: input.stallAttribution,
               }),
               "",
               suppressionNote,
@@ -17165,6 +17304,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             recoveryPolicy: input.recoveryPolicy,
             nextAttemptCount: input.nextAttemptCount,
             clearedMonitor: input.clearedMonitor,
+            stallAttribution: input.stallAttribution,
           }),
           status: "todo",
           priority: "high",
@@ -17289,6 +17429,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           recoveryPolicy: input.recoveryPolicy,
           nextAttemptCount: input.nextAttemptCount,
           clearedMonitor: input.clearedMonitor,
+          stallAttribution: input.stallAttribution,
         }),
       });
 
@@ -17329,6 +17470,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           recoveryPolicy: input.recoveryPolicy,
           nextAttemptCount: input.nextAttemptCount,
           clearedMonitor: input.clearedMonitor,
+          stallAttribution: input.stallAttribution,
         }),
       });
     } catch (err) {
@@ -17390,6 +17532,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     });
   }
 
+  /**
+   * PEN-6271: did a run on this issue COMPLETE after the monitor fired?
+   *
+   * This is the question `trigger_stalled` has always implied an answer to and
+   * never asked. The sweep's live-consumer guard (see
+   * `expiredMonitorTimeoutCondition`) establishes that no run is live RIGHT NOW,
+   * which is a different claim from "the woken run never called back" -- and the
+   * in-source note there that `trigger_stalled` therefore "means what it says"
+   * is the thing this probe corrects. Measured 2026-11-09 across 286 such
+   * clears, 87 had a run that `succeeded` after the fire.
+   *
+   * Mirrors the live guard's shape exactly so it probes the same index
+   * (`idx_heartbeat_runs_company_agent_context_issue_created`, migration 0104):
+   * bound on company + agent + `context_issue_id`, with the cast on
+   * `issues.id` rather than on the indexed `contextIssueId` column, and a
+   * `created_at` floor to keep it off a full scan of the issue's history.
+   *
+   * The floor is anchored on the FIRE rather than on `now`, and is the same 24h
+   * width the live guard uses, for the same reason it gives: a monitor wake can
+   * be coalesced into an already-queued run rather than creating a row, so the
+   * consumer is routinely OLDER than the trigger. `finishedAt > fire` is the
+   * conjunct that carries the actual question -- the run ended after the monitor
+   * fired, so it had the opportunity to discharge it and did not.
+   *
+   * Returns `undefined`, not `false`, when there is no datable fire instant.
+   * `false` is a claim ("no run completed"); `undefined` selects wording that
+   * makes no claim at all. A probe that cannot run must not be able to produce
+   * an accusation -- the whole defect being fixed here is a sentence asserting
+   * more than the code knew.
+   */
+  async function probeTriggerStallAttribution(
+    claimed: IssueMonitorDispatchRow,
+  ): Promise<"run_completed" | "no_completed_run" | undefined> {
+    const firedAt = claimed.monitorLastTriggeredAt;
+    if (!firedAt) return undefined;
+    const firedDate = firedAt instanceof Date ? firedAt : new Date(firedAt);
+    if (Number.isNaN(firedDate.getTime())) return undefined;
+    if (!claimed.assigneeAgentId) return undefined;
+    const consumerFloor = new Date(firedDate.getTime() - ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS);
+    const [completed] = await db
+      .select({ found: sql`1` })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, claimed.companyId),
+          eq(heartbeatRuns.agentId, claimed.assigneeAgentId),
+          eq(heartbeatRuns.contextIssueId, sql`${claimed.id}::text`),
+          inArray(heartbeatRuns.status, ISSUE_MONITOR_COMPLETED_CONSUMER_RUN_STATUSES),
+          gte(heartbeatRuns.createdAt, consumerFloor),
+          gt(heartbeatRuns.finishedAt, firedDate),
+        ),
+      )
+      .limit(1);
+    return completed ? "run_completed" : "no_completed_run";
+  }
+
   async function clearIssueMonitorAndRecover(input: {
     claimed: IssueMonitorDispatchRow;
     policy: ReturnType<typeof normalizeIssueExecutionPolicy>;
@@ -17404,6 +17602,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     agentId: string | null;
     runId: string | null;
     activitySource: "manual" | "scheduled";
+    /** PEN-6271: see `monitorRecoveryComment`. Only the `trigger_stalled` reason reads it. */
+    stallAttribution?: Parameters<typeof monitorRecoveryComment>[0]["stallAttribution"];
   }) {
     await db
       .update(issues)
@@ -17450,6 +17650,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       agentId: input.agentId,
       runId: input.runId,
       activitySource: input.activitySource,
+      stallAttribution: input.stallAttribution,
     });
 
     return { outcome: "skipped" as const, reason: input.clearReason };
@@ -18966,10 +19167,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           now,
         }) ?? "trigger_stalled";
         const recoveryPolicy = monitorRecoveryPolicy(monitor);
+        // PEN-6271: one indexed EXISTS, and only on the reason that needs it --
+        // the other reasons (`timeout_exceeded`, `max_attempts_exhausted`) make
+        // no claim about the woken run, so there is nothing for it to correct.
+        const stallAttribution = clearReason === "trigger_stalled"
+          ? await probeTriggerStallAttribution(claimed)
+          : undefined;
 
         await clearIssueMonitorAndRecover({
           claimed,
           policy,
+          stallAttribution,
           // The instant this monitor's road actually ran out. It reaches two
           // places: `nextCheckAt` on the `issue.monitor_exhausted` activity
           // details, and the recovery wake's `idempotencyKey`. Only a deadline
@@ -36727,6 +36935,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // here is the one the route guards will test — a wake that coalesced onto a queued
       // status-only one is therefore announced as what it will actually execute as.
       recoveryRunWriteClassNotice: recoveryRunWriteClassNotice(context),
+      // PEN-6271: supplied only while the monitor is `triggered`, so the directive
+      // fires exactly for the run the monitor woke. Derived from the same
+      // `issueContext.executionState` this function already reads, via the same
+      // `derivePersistedMonitorState` the scheduler uses, so the prompt cannot
+      // disagree with the state the sweep will test.
+      triggeredMonitor: triggeredMonitorForPrompt(issueContext),
     });
     if (issueRef) {
       context.paperclipIssue = {
