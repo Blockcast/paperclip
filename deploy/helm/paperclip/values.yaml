@@ -233,7 +233,9 @@ env:
   # /var/run/secrets/kubernetes.io/serviceaccount/token. Three scopes can write
   # that name — the agent row, the issue-scope adapterConfig overlay, and an
   # execution target's environment config — so the resolver checks the value it
-  # finally resolved against this allowlist:
+  # finally resolved against this allowlist. Both vendored k8s adapters read
+  # this same variable (`claude_k8s` and `opencode_k8s`), so one value gates
+  # every agent Job pod the control plane renders:
   #   - name: PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES
   #     value: "agent-sa-one,agent-sa-two"       # comma or whitespace separated
   # UNSET MEANS NOT ENFORCED, deliberately: a fleet is already running on
@@ -242,10 +244,17 @@ env:
   # enumerated the ServiceAccounts your agents actually resolve to --
   #   kubectl -n <ns> get pods -l app.kubernetes.io/component=agent-job \
   #     -o custom-columns=SA:.spec.serviceAccountName --no-headers | sort -u
-  # -- and decided that each is appropriate for an agent run. Note the
-  # enumeration must include PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME: the fleet
-  # default is NOT implicitly exempt, because on at least one cluster it is the
-  # single most privileged name in use.
+  # -- and decided that each is appropriate for an agent run. Two names that
+  # enumeration will not hand you, and neither is implicitly exempt:
+  #   * PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME, the `claude_k8s` fleet default.
+  #     It is set by the same operator on this same Deployment, which is exactly
+  #     why it reads as already-approved — and on at least one cluster it is the
+  #     single most privileged name in use.
+  #   * `default`. `opencode_k8s` has no fleet default and omitting the name is
+  #     legal there, so the pod runs as the namespace's `default` ServiceAccount
+  #     — an identity like any other, which the command above prints as `<none>`
+  #     rather than by name. Setting the allowlist refuses it unless you list
+  #     `default` explicitly.
 
 # -- Additional pod-level volumes. Used to mount Secrets/ConfigMaps that
 # plugins or runtime helpers read from disk (for example Authbot service keys).
