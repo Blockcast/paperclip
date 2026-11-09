@@ -124,6 +124,25 @@ function repoProbes(repoFullName: string): readonly GithubRateLimitProbe[] {
 
 export const GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV = "PAPERCLIP_GITHUB_RATE_LIMIT_SAMPLE_REPO";
 
+/**
+ * Default repository for the repo-scoped probes.
+ *
+ * NOT a convenience. Without it the DEPLOYED default is `REPO_FREE_PROBES`
+ * alone -- `rate_limit`, which this module's own doc above says sits on the hot
+ * shard and "cannot be the whole instrument". Nothing in this repo sets the env
+ * var, so unset is not a hypothetical: the series would exist, `sample_success`
+ * would read 1, and grouping by `reset_seconds` could never return more than
+ * one group. That is a sampler which reads as deployed and is structurally
+ * incapable of showing the partition it was built to show -- the same
+ * single-counter error that makes `GET /rate_limit` unusable here, reproduced
+ * by this module's own default. (Raised by Ally on #3626, 2026-11-09.)
+ *
+ * It grants nothing and asserts nothing about access: the repo probes are
+ * chosen for their HEADERS, and a 403/404/422 carries the full `x-ratelimit-*`
+ * set, so an inaccessible default still samples correctly.
+ */
+export const DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_REPO = "Blockcast/paperclip";
+
 /** Default cadence. 5 min × 3 probes is ~36 calls/h against a ~19,300/h installation budget. */
 export const DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_INTERVAL_MS = 5 * 60_000;
 
@@ -141,12 +160,39 @@ const PROBE_DEADLINE_MS = 10_000;
  */
 const REPO_FULL_NAME = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 
+/** One-shot, so a rejected value is reported once rather than every 5 minutes. */
+let malformedSampleRepoLogged = false;
+
+/** Per-route one-shot latch for the non-core resource warning, same reasoning. */
+const unexpectedResourceLogged = new Set<string>();
+
+/** Test seam: reset the once-only log latch. */
+export function resetGithubRateLimitProbeWarnings(): void {
+  malformedSampleRepoLogged = false;
+  unexpectedResourceLogged.clear();
+}
+
 export function githubRateLimitProbes(
   repoFullName: string | undefined = process.env[GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV]?.trim(),
 ): readonly GithubRateLimitProbe[] {
-  return repoFullName && REPO_FULL_NAME.test(repoFullName)
-    ? [...REPO_FREE_PROBES, ...repoProbes(repoFullName)]
-    : REPO_FREE_PROBES;
+  if (repoFullName && REPO_FULL_NAME.test(repoFullName)) {
+    return [...REPO_FREE_PROBES, ...repoProbes(repoFullName)];
+  }
+  if (repoFullName && !malformedSampleRepoLogged) {
+    // Set but malformed -- a typo, or a URL pasted where a slug was expected.
+    // Fall back to the DEFAULT rather than to free-only, because free-only is
+    // the single-shard failure described above; but say so, because silently
+    // substituting would hide the very typo REPO_FULL_NAME exists to catch.
+    malformedSampleRepoLogged = true;
+    logger.warn(
+      {
+        env: GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV,
+        fallback: DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_REPO,
+      },
+      "github rate-limit sampler: rejected a malformed repository value; probing the default instead",
+    );
+  }
+  return [...REPO_FREE_PROBES, ...repoProbes(DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_REPO)];
 }
 
 /**
@@ -199,15 +245,32 @@ export async function readGithubRateLimitProbe(
   }
   const remaining = headerInt(response, "x-ratelimit-remaining");
   const limit = headerInt(response, "x-ratelimit-limit");
+  const used = headerInt(response, "x-ratelimit-used");
+  const resetSeconds = headerInt(response, "x-ratelimit-reset");
+  const resource = response.headers.get("x-ratelimit-resource")?.trim() || null;
+
+  // The headers are the whole payload as far as this probe is concerned. With
+  // undici an unconsumed body holds its socket out of the pool until GC, and
+  // `check-runs?per_page=1` would otherwise download a page nobody reads.
+  // Cancelled BEFORE the PASS test below, so the early return cannot leak it.
+  await response.body?.cancel().catch(() => {});
+
   if (remaining === null || limit === null) return null;
-  return {
-    route: probe.route,
-    remaining,
-    limit,
-    used: headerInt(response, "x-ratelimit-used"),
-    resetSeconds: headerInt(response, "x-ratelimit-reset"),
-    resource: response.headers.get("x-ratelimit-resource")?.trim() || null,
-  };
+
+  // `resource` is not published -- it would be a second label on a closed set
+  // and says nothing a reader of this gauge needs. It IS worth one line when it
+  // disagrees: every probe here is expected to draw on `core`, and a probe
+  // quietly reading some other budget would be grouped with `core` routes by
+  // `reset_seconds` and silently mis-partition the shard view.
+  if (resource !== null && resource !== "core" && !unexpectedResourceLogged.has(probe.route)) {
+    unexpectedResourceLogged.add(probe.route);
+    logger.warn(
+      { route: probe.route, resource },
+      "github rate-limit sampler: probe reported a non-core rate-limit resource",
+    );
+  }
+
+  return { route: probe.route, remaining, limit, used, resetSeconds, resource };
 }
 
 /** Sample every configured probe once, publishing each result independently. */
