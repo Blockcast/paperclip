@@ -395,9 +395,10 @@ samples. Same reasoning applies here, so this uses the same query:
 ⛔ **Match the `"event":` JSON form, not the bare token.** (Backticks are a LogQL raw string;
 `|= "\"event\":\"claude_k8s.data_mount_broad_rw\""` is equivalent.) The discriminating anchor is
 the `event: "claude_k8s.data_mount_broad_rw"` **key**, emitted by
-`console.warn(JSON.stringify({level, event: "claude_k8s.data_mount_broad_rw", ...}))` — at
-`job-manifest.ts:4423` when this was written, but **anchor on the key, not the line number**: the key
-is stable under edits to that file and the line number is not. So the `"event":"..."` form is what
+`console.warn(JSON.stringify({level, event: "claude_k8s.data_mount_broad_rw", ...}))` in
+`vendor/paperclip-adapter-claude-k8s/src/server/job-manifest.ts`. ⛔ **Anchor on the key, never on a
+line number** — this plan has cited that one call site as `:4423`, `:4426` and `:4438` at different
+times while the key itself never moved. So the `"event":"..."` form is what
 identifies a render. The bare token additionally matches **prose
 that quotes it**: `paperclip-api` logs `reqBody` on a 4xx, so a comment POST that fails and happens to
 discuss this check becomes a hit in it.
@@ -408,8 +409,8 @@ not a broad render. The same divergence was measured at 2026-11-08T19:3xZ, so it
 
 ⚠️ Direction is **false failure**, and it grows with how much the fleet writes about this check — a
 re-runner who sees a non-zero count cannot tell a render from a quotation without opening the line.
-⚠️ Loki intermittently answers this 14-day range with an empty reply rather than a result, and an
-empty reply is not a zero. Re-run until it returns, and pair the probe with a liveness control
+⚠️ Loki intermittently answers this 14-day range with an empty reply rather than a result — on
+**2 of 6** attempts when measured for #3590 on 2026-11-08/09 — and an empty reply is not a zero. Re-run until it returns, and pair the probe with a liveness control
 (§11.6 check 3) and an expressiveness control — a zero is only a reading when both fire.
 
 ✅ The standing §7.2 detector `scripts/check-git-egress-residual-triggers.mjs` (run by
@@ -1251,7 +1252,7 @@ has a stated failing value, so "I checked" is falsifiable. **Checks 1-5 are the 
 |---|---|---|---|
 | 1 | `BROKERED_POD_COMPOSITION_CONFIG_KEYS` on `master` | **three** keys incl. `workspaceVolumeClaim` | ✅ **three — PASSES** since [#3133](https://github.com/Blockcast/paperclip/pull/3133) (§11.2) |
 | 2 | §11.1 ledger | six of six on `master` | ✅ **six of six — PASSES** as measured 2026-10-30T11:1xZ on `584068888`. ⚠ The sixth is discharged by **content on `master`**, #3112 having been closed unmerged — a check that reads `merged` fails this row wrongly (§11.1, §11.2) |
-| 3 | §4 trigger-2 query, re-read over a window overlapping stage 0 | zero broad renders **and both controls fire** — a **liveness** control (the stream is answering at all) **and** an **expressiveness** control (a sibling `"event":` needle on the same stream returns non-zero, proving this matcher can still emit). ⛔ A zero with either control missing is **not a reading** and does not pass: Loki answered this 14-day range with an empty reply on **2 of 6** measured attempts, and an empty reply renders as `0` through a naive parser — byte-identical to a pass (§4) | ✅ **pass** (§11.7) |
+| 3 | §4 trigger-2 query, re-read over a window overlapping stage 0 | zero broad renders **and both controls fire** — a **liveness** control (the stream is answering at all) **and** an **expressiveness** control (a sibling `"event":` needle on the same stream returns non-zero, proving this matcher can still emit). ⛔ A zero with either control missing is **not a reading** and does not pass: Loki answered this 14-day range with an empty reply on **2 of 6** measured attempts, and an empty reply renders as `0` through a naive parser — byte-identical to a pass (§4) | ❓ **re-run required under the two-control criterion.** §11.7's recorded reading is a **liveness** control only (newest `container="paperclip"` entry seconds old at 2026-10-30T01:01:02Z) and it predates the `"event":` form (#3590), so it shows nothing about whether *that* matcher can emit. ⛔ §11.7's **1634** in-window renders are **not** an expressiveness control for this query — they were counted with the **bare token**, which also matches prose quoting it. The earlier `✅ pass` is **withdrawn**: it was graded against the one-control criterion this row no longer uses |
 | 4 | §3.5a privilege pre-flight across the stage-1 population | no privileged container beside the broker | ✅ **pass** (§11.7) |
 | 5 | #3089's env-credential refusal is live on `master` | Both files are in `vendor/paperclip-adapter-claude-k8s/src/server/` — **not** the opencode adapter, which carries a same-named `job-manifest.ts` with no such guard, so a basename grep can land on the wrong one and read this row as failing. `findAgentGitHubCredentialEnvNames` is called under `brokerEnabled` in `job-manifest.ts`, **and** `job-manifest.github-publish-broker.test.ts` **passes** — *run it, do not read it*: `npm ci --include=dev && npm test` in `vendor/paperclip-adapter-claude-k8s/` (**`--include=dev` is load-bearing** — on a `NODE_ENV=production` runner a plain install omits vitest and the run becomes a silent no-op, which is the very failure this row exists to catch), or CI’s **Vendored claude_k8s adapter** job — asserting the throw for all four credential names with the positive control intact | ✅ **pass** — **run**, not read: `28 passed (28)` on 2026-11-01 (§3.4, PEN-5184; method per PEN-5193) |
 | 6 | ⚠ **STAGE 2 AND LATER ONLY — not a stage-1 check.** The §3.4 board-level scope read is answered (§11.3) | Board card `800bc387-eac5-4f19-93e5-7eaf89387a04` reads a decision (`status` ≠ `pending`, `decidedAt` non-null) **and** its answer — "clean", or a credential name at a named scope — is recorded in §3.4 and on carrier row [PEN-5195](https://paperclip.blockcast.net/PEN/issues/PEN-5195). ⚠ **Evaluate the CARD, not the read.** The card's decision is readable from any agent seat; the underlying `GET /api/environments/:id` is **`403 Board access required` from every agent seat** (reproduced independently from Devops, CTO and Security, 2026-11-01), so a re-runner who evaluates this by attempting the read will wrongly score it unevaluable. **Failing value:** card still `pending` at a stage-2 widening, or decided with its answer recorded nowhere | ❓ **pending** — card filed 2026-11-01T09:20:53Z; `status: pending`, `decidedAt: null`, re-read 2026-11-03T06:5xZ from the Security seat — still `status: pending`, `decidedAt: null`, unmoved for 2 days. ⛔ **Not a stage-1 blocker**: §11.3 re-dates this item to stage 2 and **stage 1's earliest start does not move for it** |
