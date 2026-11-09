@@ -435,6 +435,61 @@ was actively harmful.
 test to revert. Rule 1(b)(3)'s accurate count is the nearest thing to a guard available in a
 database prose field, which is part of why it is rated above the other two checks in 1(b).
 
+## Changing an MCP tool description and the behaviour behind it (PEN-6237)
+
+An MCP tool's **description** and the **server code** that honours it ship in two
+different container images, from two different Harbor repositories, on
+independent rollout cadences:
+
+| half | image | reaches an agent |
+|---|---|---|
+| the description — the contract agents read | `paperclip-agent/paperclip-agent`, run as a stdio child process **inside each agent pod** | on the pod's next pull, i.e. **minutes** |
+| the behaviour — the route handler | `paperclip/paperclip`, the `paperclip-api` Deployment | on the next production deploy, **daily, ~07:40–10:10Z** |
+
+**You do not get to choose which half lands first.** Both are in your one commit,
+and the agent image is structurally the fresher of the two, so the description
+is live for every agent **hours before** the behaviour exists. Reordering
+commits cannot change this, and splitting the PR makes it worse, not better.
+
+⚠️ **The window fails OPEN, and it defeats the most careful reader first.** A
+description that says "read the field back to confirm" is good advice that, in
+this window, converts a deploy lag into a false bug report: a *not-yet-deployed*
+fix and a *broken* one are byte-identical to the caller. Measured on
+2026-11-08 — [#3503](https://github.com/Blockcast/paperclip/pull/3503) merged
+16:06:37Z, the API was still serving the pre-merge build 15 hours later, and an
+agent that did exactly what the new description told it to do filed the result
+as a code defect.
+
+### What the author owes the window
+
+1. **Write the description so it is true in BOTH states.** State the behaviour,
+   and give the reader the discriminator in the same breath — never a bare
+   read-back instruction. The discriminator is the server's own build:
+   `GET /api/health` returns `serverInfo.git.fullSha` to agent and board actors
+   (it is withheld from anonymous callers, so read it authenticated). A
+   description may therefore say *"this requires server ≥ `<sha>`; compare
+   `serverInfo.git.fullSha` from `/api/health` before reading a missing field as
+   a defect."*
+2. **Never assert a new behaviour in the present tense without that qualifier**
+   when the same PR is what adds it. "It is present now" is false for every
+   agent until the deploy lands, and it is the sentence a careful reader trusts.
+3. **A field that an older server omits is an ABSENT KEY, not `null`.** Say which
+   it is, and say what absence means, because `jq`, `.get()` and optional
+   chaining all render an absent key as `null` — usually as the reassuring
+   value. If absence and a legitimate `null` are indistinguishable, the
+   description must tell the reader to gate on key presence.
+4. **Do not record the window as a defect in the behaviour.** If a tool appears
+   not to honour its own description, read the serving build first. See
+   PEN-6186, which was filed as a code defect and resolved as deploy lag.
+
+⛔ **Do not try to fix this by making the chart carry the contract.**
+`api.deployedCommit` must change exactly one removable pod annotation and
+nothing else, or the release job's `approvalPlanSha256` stops matching the
+approved plan and production releases fail at the admission gate. The build
+identifier is baked into the **image** for that reason — see the `ARG
+PAPERCLIP_BUILD_COMMIT` block in `Dockerfile` and
+`scripts/check-build-commit-stamp.test.mjs`.
+
 ## Dev Cycle Rules
 
 **Requires PR**: code logic, APIs, DB schema, agent configs, infrastructure

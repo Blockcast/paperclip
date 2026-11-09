@@ -422,6 +422,18 @@ jobs:
           node --test ./scripts/prove-agent-image-git-config-controls.test.mjs
         timeout-minutes: 2
 
+      # PEN-6237. The build marker is a three-part chain -- the workflow passes
+      # the commit, the Dockerfile writes it to /app/.paperclip-build-commit,
+      # and build-commit.ts reads it back -- and each part was individually
+      # correct while the chain sat open, so `/api/health` reported
+      # `git_unavailable` on every deployed pod. Only a test that asserts the
+      # parts AGREE can catch that, and it must run on every PR: the alternative
+      # is finding out from a field that is empty rather than wrong.
+      - name: Test build-commit stamp wiring (PEN-6237)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/check-build-commit-stamp.test.mjs
+        timeout-minutes: 2
+
       # PEN-4988. The standing detector for §7.2 trigger 2 of the PEN-3183
       # git-egress boundary decision, plus the Alertmanager payload it pages
       # with. Reviewed on every PR rather than only when the hourly cron next
