@@ -829,19 +829,35 @@ agent_provenance_body() {
 # endpoint this does not recognise is simply left unmarked, which the
 # "absence proves nothing" contract above already covers.
 #
-# Tokens that look like flags or `key=value` fields are skipped so a path-shaped
-# string inside a body cannot select the endpoint for us.
+# Tokens that look like flags, and `key=value` fields, are skipped so a
+# path-shaped string inside a body cannot select the endpoint for us.
 agent_provenance_api_path() {
   while [ "$#" -gt 0 ]; do
-    case "$1" in
-      -* | *=*) ;;
+    ap_tok="$1"
+    shift
+    case "${ap_tok}" in
+      -*) continue ;;
+    esac
+    # PEN-6329 residual 2: discriminate a field from an endpoint by where the
+    # `=` sits, not by whether there is one. `case` takes the FIRST matching
+    # pattern, so testing a bare `*=*` ahead of the endpoint alternatives
+    # skipped every real query string before they were ever tried — and made
+    # the `\?*` alternatives below look dead, when in fact they were only
+    # shadowed and are still reached by a query string carrying no `=` at all
+    # (`…/comments?draft`). In a field the `=` precedes any `/`
+    # (`body=see repos/o/r/issues/1/comments`); in an endpoint carrying a query
+    # string the path precedes the first `=` (`…/pulls/5/reviews?per_page=1`).
+    case "${ap_tok%%=*}" in
+      */*) ;;
+      *) case "${ap_tok}" in *=*) continue ;; esac ;;
+    esac
+    case "${ap_tok}" in
       */issues/*/comments | */issues/*/comments\?* \
         | */issues/comments/* \
         | */pulls/*/reviews | */pulls/*/reviews\?* \
         | */pulls/*/comments | */pulls/*/comments\?* \
         | */pulls/comments/*) return 0 ;;
     esac
-    shift
   done
   return 1
 }
@@ -875,10 +891,21 @@ mark_agent_authored() {
       --body=* | --body-file=* | --field=* | --raw-field=*) v="${a#*=}" a="${a%%=*}" ap_split=yes ;;
       -b?* | -f?* | -F?*) v="${a#-?}" a="${a%"${v}"}" ap_split=yes ;;
       -b | --body | -f | -F | --body-file | --field | --raw-field)
-        v="${1:-}"
-        shift
-        i=$((i + 1))
-        ap_split=yes
+        # PEN-6329 residual 1: this loop pops the head of "$@" and pushes
+        # processed arguments onto the TAIL of the same "$@", so once i == n the
+        # originals are exhausted and "$1" is the first REBUILT element. Taking
+        # it would both invent a body out of an already-processed argument and
+        # eat that argument out of the rebuilt argv — `gh pr comment 5 --body`
+        # became `comment 5 --body-file <tmp>` with the body `pr`, so the real
+        # gh answered `unknown command "comment"` instead of `flag needs an
+        # argument`. A flag in last position simply has no value: hand it back
+        # untouched and let the real gh print its own usage error.
+        if [ "${i}" -lt "${n}" ]; then
+          v="${1:-}"
+          shift
+          i=$((i + 1))
+          ap_split=yes
+        fi
         ;;
     esac
     if [ "${ap_split}" = no ]; then
