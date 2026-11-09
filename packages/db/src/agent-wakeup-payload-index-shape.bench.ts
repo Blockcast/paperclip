@@ -340,9 +340,15 @@
  *   At 186 the sort is free; at 2,664 the baseline's early-stopping ordered
  *   index scan wins instead.
  *
- * ⛔ WHICH IS WHY RUN B DOES NOT SETTLE THE DENSE CASE. The two axes this file
- * scales TOGETHER -- window size and per-issue density -- are INDEPENDENT in
- * production, and the sparse and dense verdicts hang off different ones.
+ * ⛔ WHICH IS WHY RUN B DOES NOT SETTLE THE DENSE CASE. The two axes that move
+ * together between Run A and Run B -- window size, and the DENSE probe's own
+ * density -- are INDEPENDENT in production, and the sparse and dense verdicts
+ * hang off different ones. ⚠️ They move together here by CONSTRUCTION and not
+ * by a knob: the dense probe is the seed's hot issue, a fixed 1/50 of the
+ * table whatever `PEN6104_ISSUES` is (see the scale-knob docblock, which
+ * retracts an argument that read it the other way). The SPARSE probe's density
+ * is `ROWS/ISSUES`, which the reported invocation holds FIXED across the two
+ * runs, so the sparse win is measured against a changed window alone.
  * Production's per-issue wake distribution is UNMEASURED: the 2,664/6 pair is
  * THIS SEED's and was never an observation, so do not cite it as production's.
  * Production's window is ~11k rows, which Run B matches; its hottest issue could
@@ -376,31 +382,50 @@ const OTHER_COMPANIES = 19;
  * not -- which is exactly why Run B exists, and why it is reported as its own
  * column rather than folded into Run A's.
  *
- * ✅ Run B's invocation, so its column is reproducible from this file alone:
+ * ✅ Run B's invocation, as the run that produced that column reported it --
+ * all three knobs scaled by the same 0.07, so Run B differs from Run A in
+ * table size and in nothing else:
  *
- *   cd packages/db && PEN6104_ROWS=140000 \
+ *   cd packages/db && PEN6104_ROWS=140000 PEN6104_ISSUES=1400 \
+ *     PEN6104_WRITE_ROWS=7000 \
  *     pnpm tsx src/agent-wakeup-payload-index-shape.bench.ts
  *
- * ✅ Two of the three knobs are CONFIRMED by the recorded figures rather than
- * merely asserted. The window falls 158,657 -> 11,116 (14.3x), which fixes
- * `PEN6104_ROWS` at 140,000; and the dense probe issue's wake count falls
- * 2,664 -> 186 by the SAME 14.3x, which it could not do had `PEN6104_ISSUES`
- * scaled too -- per-issue density is `ROWS/ISSUES`, so a proportional `ISSUES`
- * would have left it flat. `PEN6104_ISSUES` was therefore at its 20,000
- * default.
+ * ⛔ EXACTLY ONE of the three is confirmed by the recorded figures; the other
+ * two are an author's report, and an earlier revision of this docblock claimed
+ * two were confirmed. CONFIRMED: the window falls 158,657 -> 11,116 (14.3x),
+ * which fixes `PEN6104_ROWS` at 140,000. NOT confirmed, and not confirmable
+ * from anything recorded here: `PEN6104_ISSUES` and `PEN6104_WRITE_ROWS`.
  *
- * ⚠️ `PEN6104_WRITE_ROWS` is NOT confirmed that way, and the distinction is
- * the point rather than a quibble: no figure recorded for Run B is a function
- * of it, because no Run B write-throughput number was kept (finding 8 quotes
- * none). That it sat at its 100,000 default rests on the run's own record of
- * changing only the scale -- an author's report, not a derivation. Treat it as
- * such.
+ * ⛔ The retracted argument, quoted because it is the kind that READS as a
+ * derivation: that the dense probe's wake count falling 2,664 -> 186 by the
+ * same 14.3x "could not happen had `PEN6104_ISSUES` scaled too, since
+ * per-issue density is `ROWS/ISSUES`". It is wrong, and it is wrong about this
+ * file's own seed. The dense probe is always issue #1, which `seed` picks out
+ * with `CASE WHEN g % 50 = 0 THEN 1`, so its row count is `ROWS / 50` -- a
+ * function of `PEN6104_ROWS` ALONE, falling by exactly the `ROWS` ratio under
+ * EVERY value of `PEN6104_ISSUES`. (`ISSUES` reaches issue #1 only through the
+ * `ELSE` arm, and 50 divides both 20,000 and 1,400, so that arm adds no row to
+ * it at either value.) ✅ Corroboration that the dense arm is `ISSUES`-blind:
+ * the measured count is the same FRACTION of `ROWS / 50` in both runs --
+ * 2,664/40,000 = 0.0666 and 186/2,800 = 0.0664 -- so the window and company
+ * filters cut it identically, which is what an `ISSUES`-independent arm looks
+ * like and not what a changed per-issue density would produce.
  *
- * ⚠️ If it did sit at 100,000, that is ~5% of Run A's table and ~71% of Run
- * B's -- a real asymmetry between the two columns, corrected nowhere. It does
- * not reach the EXPLAIN figures, which are taken after the probe's
- * `VACUUM (ANALYZE)` (see `writeProbe`), but it would make any Run B write
- * figure incomparable to Run A's, which is the second reason none is quoted.
+ * ✅ What WOULD have discriminated `PEN6104_ISSUES`, and is the figure to keep
+ * next time: Run B's SPARSE probe count. The sparse probe is the
+ * MINIMUM-count issue, i.e. `ROWS/ISSUES` cut by the same window -- ~6 at
+ * `ISSUES=1400` (Run A's own sparse count, since that holds the ratio fixed)
+ * against ~1 at the 20,000 default. The header kept Run B's dense count and
+ * not its sparse one, so the one figure that separates the two readings is the
+ * one not kept.
+ *
+ * ⚠️ `PEN6104_WRITE_ROWS` reaches no recorded Run B figure under either
+ * reading: no Run B write-throughput number was kept (finding 8 quotes none),
+ * and the EXPLAIN figures are taken after the probe's `VACUUM (ANALYZE)` (see
+ * `writeProbe`). At the reported 7,000 it is ~5% of Run B's table -- the same
+ * share Run A's 100,000 default is of Run A's -- so the two columns' write
+ * probes are comparable, and an earlier revision's warning that they were not
+ * (~5% against ~71%) assumed the default and is retracted with it.
  */
 const scale = (name: string, fallback: number) => {
   const raw = process.env[name];
