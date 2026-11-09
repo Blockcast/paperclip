@@ -996,6 +996,65 @@ re-fire. That is deliberate — a title that churned with every member would mak
 the row unrecognisable between heartbeats — so the title is a label, not an
 inventory. The body is the inventory.
 
+### Writing on an alert row — what survives a sync (PEN-6218)
+
+**The top of an alert row's `description` is plugin-owned. Anything you write
+there is overwritten, silently, within one `repeat_interval`.** Every firing,
+join, rebind and resolve path publishes a WHOLESALE `description` PATCH
+carrying the freshly rendered body — that is the point, and it is what the
+three guarantees above rest on: a body that drifted from the alert is the
+wrong-close mechanism BLO-41538 was reopened for.
+
+What makes it expensive is that the loss is invisible from the writing side.
+Measured first-party on
+[PEN-4835](https://paperclip.blockcast.net/PEN/issues/PEN-4835): **69**
+description rewrites on one row, at a ~65-minute cadence, and an agent's
+append-only write survived **11 minutes**. The write returns 200, a same-run
+read-back verifies byte-exact, and the revert lands minutes later in another
+actor's transaction with no comment and no event the writer would think to
+watch.
+
+So the row now carries a split point:
+
+```
+<rendered body — re-rendered on every sync, your edits here are discarded>
+
+---
+
+⚠️ Everything above this line is re-rendered ... Notes written below the line
+are preserved across syncs ...
+<!-- paperclip-plugin-alertmanager:notes-below -->
+<everything here is carried forward verbatim, forever>
+```
+
+| | |
+|---|---|
+| **Writing durable state on an alert row** | put it **below** the marker, or in a **comment**. The plugin writes `description`, `status` and the assignee pair, and never touches comments |
+| **The marker string** | `<!-- paperclip-plugin-alertmanager:notes-below -->`. It is a contract with rows already on disk — renaming it orphans every one of them and their notes are lost on the next sync |
+| **The banner wording** | rendered *above* the marker, i.e. in the half the plugin rewrites, so an edit to it reaches every live row on its next sync rather than only rows filed afterwards |
+| **A row written before this shipped** | has no marker. An append made on a body this render still reproduces byte-for-byte is rescued on the first sync (the shape measured on PEN-4835); anything else falls through to the pre-PEN-6218 behaviour and is lost, which is no worse than before |
+| **Notes that quote the marker** | safe. The split is on the **first** occurrence, so a copy inside someone's notes costs a duplicated marker, never their text |
+
+**Not taken: suppressing the write when the body is unchanged.** The churn is
+real — those 69 rewrites re-sent one byte-identical 3,182-char body — and it is
+*not* what was fixed here. Two things to know before anyone does fix it.
+
+On its own it would not have reached this defect at all. The comparison it
+implies is *rendered vs. stored*, and a row carrying agent text is by
+definition not equal to the render, so the write lands and the text is still
+destroyed. It suppresses writes on exactly the rows that have nothing to lose.
+
+With the preservation above in place it becomes exact — `composeDescription`
+is a fixed point, so *composed vs. stored* is byte-equality including the notes
+half — and a steady alert would then write nothing at all. What stops it being
+a free win is that it retires an observable: the terminal-severity branch
+touches the row on **every** re-fire *on purpose*, so `updatedAt` keeps proving
+the in-cluster delivery leg accepts POSTs (`webhook-handler.ts`, the
+`terminal && issue` branch), and the test helpers in
+`aggregate-description.test.ts` assert an issue write per delivery for the same
+reason. Someone has to price that trade and re-home that evidence; it is not a
+prerequisite for anything above.
+
 ### Channel precision policy
 
 **Cancellation rate is not the precision metric. Do not use it.** The resolve
