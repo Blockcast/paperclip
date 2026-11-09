@@ -2857,6 +2857,41 @@ jobs:
     # so general_tests remains the required aggregate for both test families.
     name: verify
     if: ${{ always() && !cancelled() }}
+    # ⛔ THIS LIST IS NOT THE VERDICT (PEN-6232). `verify` does not decide from
+    # `needs.*`. The `Fail if any split verify lane failed` step below IS the
+    # gate, and it decides from hand-maintained bash arrays — `lane_names` and
+    # `lane_results`, fed by an explicitly enumerated `env:` block — setting
+    # `any_non_success` from that loop alone. Every
+    # `contains(needs.*.result, 'failure')` expression in this job is an `if:`
+    # gate on a classify-path step, and those steps choose the WORDING of the
+    # failure annotation, never whether `verify` passes; the classify step says
+    # so in its own comment.
+    #
+    # ⇒ A JOB ADDED HERE AND NOWHERE ELSE IS INVISIBLE TO THE VERDICT. GitHub
+    # waits for it, the job fails, the aggregation loop never looks at it, and
+    # `verify` reports success — the required context is green and the gate did
+    # not run.
+    #
+    # Adding a lane means wiring it at EVERY one of these, not only here:
+    #   1. this `needs:` list;
+    #   2. `Classify failed lanes as infrastructure kills or real failures` —
+    #      its `env:` block, plus `lane_names`, `lane_results`, `lane_job_names`;
+    #   3. `Fail if any split verify lane failed`, THE DECISION STEP — its
+    #      `env:` block, plus `lane_names` and `lane_results`. This is the point
+    #      that decides the gate: 2 can be wired perfectly and `verify` still
+    #      goes green while the lane is red;
+    #   4. scripts/__tests__/pr-verify-lane-outcome.test.mjs, the suite that
+    #      pins this wiring. Run it after any change here.
+    # `lane_job_names` also has consumers OUTSIDE this file, which score whether
+    # a cancelled or orphaned merge-group run counts as a check failure:
+    # `MERGE_GROUP_GATING_JOBS` in scripts/merge-queue-eviction-detector.mjs and
+    # `GATING_JOBS` in .github/scripts/sweep-orphaned-merge-group-runs.sh. Both
+    # are pinned to this file by their own tests, so they fail loudly rather
+    # than silently.
+    #
+    # `ally_verdict` is deliberately NOT a lane: it has its own branch in the
+    # decision step (`ALLY_VERDICT_RESULT`) and is kept out of the lane arrays
+    # so the classifier never reads a schedule hold as a runner kill.
     needs:
       [
         helm_chart,
