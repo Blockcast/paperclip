@@ -8,6 +8,17 @@
 ARG WEBFLOW_BOT_TAG=latest
 FROM harbor.blockcast.net/paperclip-webflow-bot/webflow-bot:${WEBFLOW_BOT_TAG}
 
+# Pull Ubuntu security updates into this image. The webflow-bot base is
+# retired and seldom rebuilt, and nothing in it runs `apt-get upgrade`, so
+# its jammy OS packages (gnupg, git, openssl, apt, libtiff5, libbrotli1, ...)
+# keep Harbor findings that already have fixes upstream (BLO-54878).
+# shortcut: BuildKit caches this layer by instruction text, so only the first
+# build after an edit refreshes it. Add a cache-busting ARG if it needs to be refreshed on every build.
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq \
+ && apt-get upgrade -y -qq \
+ && rm -rf /var/lib/apt/lists/*
+
 # Copy the figma_bot package into the image. Build context is the
 # paperclip monorepo root (see docker-figma-bot.yml); paths below are
 # relative to that root.
