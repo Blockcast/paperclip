@@ -1489,6 +1489,48 @@ describe("merge-gate reader", () => {
       );
     });
 
+    // BLO-55385: the third dead_runs() residual, seen in the wild. 8 paperclip
+    // heads on 2026-11-09 carried a `commitperclip PR Review`
+    // (pull_request_target) run that ended `startup_failure` publishing nothing,
+    // later followed by a same-lane success (e.g. #3602 @ a3f7d784: 42657738616
+    // then 42674613058). GitHub refuses to re-run it, so the NO-VERDICT could
+    // never clear. pending_runs() withholds it; dead_runs() is unchanged.
+    const sf = (id, conclusion, start, event = "pull_request_target") =>
+      ["10", event, id, conclusion, start, "completed", "commitperclip PR Review"];
+    for (const conclusion of ["startup_failure", "timed_out", "stale", "action_required", "neutral"]) {
+      it(`drops a \`${conclusion}\` run a later same-lane success superseded`, () => {
+        const runs = [sf("111", conclusion, "2026-11-09T16:03:00Z"), sf("222", "success", "2026-11-09T18:30:00Z")];
+        assert.deepEqual(pending(runs), []);
+        assert.equal(dead(runs), "", "dead_runs() victim test must stay cancelled/failure only");
+        assert.deepEqual(read([["review", "success", "t", "222"]], "__none__", pend(...pending(runs).map((l) => l.split("\t")))), []);
+      });
+    }
+
+    it("still prints NO-VERDICT for a lone startup_failure with no later success", () => {
+      const p = pending([sf("111", "startup_failure", "2026-11-09T16:03:00Z")]);
+      assert.deepEqual(p, ["111\tstartup_failure\tcommitperclip PR Review"]);
+      assert.match(read([["x", "success", "t", "66"]], "__none__", p.join("\n")).join("\n"), /NO-VERDICT\trun=111$/m);
+    });
+
+    // The success must be LATER (start-ordered) and in the SAME lane (workflow
+    // AND event). An earlier success, or a success in a different event lane,
+    // does not speak for this run. Missing start fails closed.
+    it("keeps a startup_failure whose only success is earlier, cross-event, or undated", () => {
+      const v = sf("111", "startup_failure", "2026-11-09T16:03:00Z");
+      assert.equal(pending([v, sf("222", "success", "2026-11-09T15:00:00Z")]).length, 1);
+      assert.equal(pending([v, sf("222", "success", "2026-11-09T18:30:00Z", "pull_request")]).length, 1);
+      assert.equal(pending([["11", "pull_request_target", "222", "success", "2026-11-09T18:30:00Z", "completed", "x"], v]).length, 1);
+      assert.equal(pending([sf("111", "startup_failure", ""), sf("222", "success", "2026-11-09T18:30:00Z")]).length, 1);
+    });
+
+    // cancelled/failure stay DEAD's job, and in-flight runs are never withheld.
+    it("does not withhold cancelled, failure, or in-flight runs", () => {
+      const ok = sf("222", "success", "2026-11-09T18:30:00Z");
+      assert.equal(pending([sf("111", "cancelled", "2026-11-09T16:03:00Z"), ok]).length, 1);
+      assert.equal(pending([sf("111", "failure", "2026-11-09T16:03:00Z"), ok]).length, 1);
+      assert.equal(pending([["10", "pull_request_target", "111", "", "2026-11-09T16:03:00Z", "queued", "w"], ok]).length, 1);
+    });
+
     // Fails CLOSED on a missing status, on the same grounds as dead_runs()'s
     // missing-timestamp rule: an absent field must never be read as evidence
     // that a verdict exists.
