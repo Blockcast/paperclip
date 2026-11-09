@@ -23,6 +23,8 @@ import {
   githubGetWorkflowRun,
   githubHasCommitEvidence,
   githubHasReviewerEvidenceForPr,
+  ghGraphQlQuery,
+  githubHeadChecksSettlement,
   githubListReviewerSurfacesAtPr,
   githubGetLatestCommitStatusForContext,
   githubGetPrRequiredStatusContext,
@@ -2165,5 +2167,217 @@ describe("githubHasReviewerEvidenceForPr after delegating to the shared grammar"
     await expect(githubHasReviewerEvidenceForPr({ repoFullName, prNumber, headSha: head })).resolves.toEqual({
       found: false,
     });
+  });
+});
+
+// PEN-6341: answered from the GraphQL `statusCheckRollup` rather than by paging
+// `commits/:sha/check-runs`, to move the server's single largest REST read off
+// the exhausting `core` shard.
+//
+// The polarity is the whole point and it is NOT symmetric. The caller does
+// `ciHeadPending = settlement === "pending"`, so `settled` and `unknown` are
+// the same action -- wake -- and only `pending` holds a wake back. A wrong
+// `unknown` costs one duplicate run; a wrong `pending` means the assignee is
+// never woken at all. So every test below that feeds a broken, refused,
+// unrecognised or inconsistent read asserts `unknown`, never `pending`.
+describe("githubHeadChecksSettlement (PEN-6341)", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const headSha = "6cf6263813e0f25d1bfbb8c49cfa9399b8c26734";
+
+  /** Counts keyed by state, rendered the way GitHub does: every state, zeroes included. */
+  function rollup(counts: Record<string, number>) {
+    const all = [
+      "ACTION_REQUIRED", "CANCELLED", "COMPLETED", "FAILURE", "IN_PROGRESS", "NEUTRAL",
+      "PENDING", "QUEUED", "SKIPPED", "STALE", "STARTUP_FAILURE", "SUCCESS", "TIMED_OUT", "WAITING",
+    ];
+    const checkRunCount = Object.values(counts).reduce((a, b) => a + b, 0);
+    return {
+      repository: {
+        object: {
+          statusCheckRollup: {
+            contexts: {
+              checkRunCount,
+              checkRunCountsByState: all.map((state) => ({ state, count: counts[state] ?? 0 })),
+            },
+          },
+        },
+      },
+    };
+  }
+
+  /**
+   * Stub the token mint plus one GraphQL answer. `envelope` is sent verbatim,
+   * so it must carry the `data` / `errors` wrapper GitHub really returns --
+   * unwrapping it here would hide the very envelope handling under test.
+   * Returns the recorded GraphQL requests.
+   */
+  function stubGraphQlEnvelope(envelope: unknown, ok = true, status = 200) {
+    const calls: Array<{ url: string; body: { query?: string; variables?: Record<string, unknown> } }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const value = String(url);
+      if (value.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      calls.push({ url: value, body: JSON.parse(String(init?.body ?? "{}")) });
+      return jsonResponse(envelope, ok, status);
+    }));
+    return calls;
+  }
+
+  /** The common case: a successful read, wrapped the way GitHub wraps it. */
+  function stubGraphQl(data: unknown, ok = true, status = 200) {
+    return stubGraphQlEnvelope({ data }, ok, status);
+  }
+
+  it("asks GraphQL once, with no REST check-runs page and no pagination", async () => {
+    setCreds();
+    const calls = stubGraphQl(rollup({ SUCCESS: 23, SKIPPED: 11 }));
+
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("settled");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://api.github.com/graphql");
+    expect(calls[0].body.variables).toEqual({ owner: "Blockcast", name: "paperclip", sha: headSha });
+    // The REST route this replaces must not be reached at all -- that is the
+    // entire saving, and a silent fallback would spend the budget anyway.
+    expect(calls[0].body.query).not.toContain("check-runs");
+    expect(calls[0].body.query).toContain("checkRunCountsByState");
+  });
+
+  it("settles when every non-zero state is terminal, conclusions included", async () => {
+    setCreds();
+    stubGraphQl(rollup({ SUCCESS: 4, FAILURE: 2, NEUTRAL: 2, SKIPPED: 12, CANCELLED: 1, TIMED_OUT: 1 }));
+    // A red head is still SETTLED: the question is whether CI finished, not
+    // whether it passed. The caller routes red separately.
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("settled");
+  });
+
+  it.each(["QUEUED", "IN_PROGRESS", "WAITING", "PENDING"])(
+    "reports pending while any run is %s",
+    async (state) => {
+      setCreds();
+      stubGraphQl(rollup({ SUCCESS: 6, SKIPPED: 4, [state]: 15 }));
+      await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("pending");
+    },
+  );
+
+  it("does not count commit statuses as checks", async () => {
+    setCreds();
+    // The REST route it replaced read check-runs only. A head whose sole
+    // incomplete context is a STATUS must not be reported pending.
+    const payload = rollup({ SUCCESS: 3 }) as Record<string, any>;
+    payload.repository.object.statusCheckRollup.contexts.statusContextCount = 1;
+    payload.repository.object.statusCheckRollup.contexts.statusContextCountsByState = [{ state: "PENDING", count: 1 }];
+    stubGraphQl(payload);
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("settled");
+  });
+
+  it("answers unknown for a head carrying no check-runs", async () => {
+    setCreds();
+    stubGraphQl(rollup({}));
+    // Zero checks cannot establish that CI finished -- the REST form returned
+    // unknown for an empty first page for exactly this reason.
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("unknown");
+  });
+
+  it("answers unknown when the commit does not resolve", async () => {
+    setCreds();
+    stubGraphQl({ repository: { object: null } });
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("unknown");
+  });
+
+  it("answers unknown when the head carries no rollup at all", async () => {
+    setCreds();
+    stubGraphQl({ repository: { object: { statusCheckRollup: null } } });
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("unknown");
+  });
+
+  it("answers unknown on a GraphQL field error even though data is present", async () => {
+    setCreds();
+    // The shape GraphQL actually returns for a FORBIDDEN field: HTTP 200, a
+    // populated envelope, the failed subtree nulled. Reading `data` alone
+    // makes this indistinguishable from an honest "no such commit".
+    stubGraphQlEnvelope({
+      data: { repository: null },
+      errors: [{ type: "FORBIDDEN", path: ["repository", "object"] }],
+    });
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("unknown");
+  });
+
+  it("answers unknown when the read is refused", async () => {
+    setCreds();
+    stubGraphQlEnvelope({ message: "API rate limit exceeded" }, false, 403);
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("unknown");
+  });
+
+  it("answers unknown, never settled, for a state it does not recognise", async () => {
+    setCreds();
+    // A state GitHub adds after this code ships. It may well be non-terminal,
+    // so scoring it terminal would drop the wake; `unknown` only costs a run.
+    stubGraphQl(rollup({ SUCCESS: 3, SOME_FUTURE_STATE: 1 }));
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("unknown");
+  });
+
+  it("answers unknown when the per-state counts do not account for every run", async () => {
+    setCreds();
+    // A short breakdown means an unseen run, and the unseen one could be the
+    // incomplete one -- which would otherwise read as settled.
+    stubGraphQl({
+      repository: { object: { statusCheckRollup: { contexts: {
+        checkRunCount: 9,
+        checkRunCountsByState: [{ state: "SUCCESS", count: 3 }],
+      } } } },
+    });
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("unknown");
+  });
+
+  it("answers unknown without calling GitHub when the installation token is unavailable", async () => {
+    clearCreds();
+    const calls = stubGraphQl(rollup({ SUCCESS: 1 }));
+    await expect(githubHeadChecksSettlement({ repoFullName, headSha })).resolves.toBe("unknown");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("answers unknown for a repo name that is not owner/name", async () => {
+    setCreds();
+    const calls = stubGraphQl(rollup({ SUCCESS: 1 }));
+    await expect(githubHeadChecksSettlement({ repoFullName: "paperclip", headSha })).resolves.toBe("unknown");
+    await expect(githubHeadChecksSettlement({ repoFullName: "a/b/c", headSha })).resolves.toBe("unknown");
+    expect(calls).toHaveLength(0);
+  });
+});
+
+// PEN-6341: the GraphQL read door. It is exported so the remaining shard-B
+// readers can move through it, which is exactly why it has to refuse a write:
+// the file-granular writer guard is satisfied by this file scrubbing its REST
+// writes, so it is structurally unable to notice a mutation added here later.
+describe("ghGraphQlQuery (PEN-6341)", () => {
+  function stub() {
+    const urls: string[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+      urls.push(String(url));
+      return jsonResponse({ data: { viewer: { login: "allyblockcast" } } });
+    }));
+    return urls;
+  }
+
+  it("sends a query document and unwraps data", async () => {
+    const urls = stub();
+    await expect(ghGraphQlQuery({ token: "ghs_test", query: "query { viewer { login } }" }))
+      .resolves.toEqual({ ok: true, data: { viewer: { login: "allyblockcast" } } });
+    expect(urls).toEqual(["https://api.github.com/graphql"]);
+  });
+
+  it.each([
+    ["a mutation", "mutation { addComment(input: {}) { clientMutationId } }"],
+    ["a leading-whitespace mutation", "\n  mutation X { addComment(input: {}) { clientMutationId } }"],
+    ["an anonymous shorthand document", "{ viewer { login } }"],
+    ["a subscription", "subscription { x }"],
+  ])("refuses %s before it leaves the process", async (_label, query) => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const urls = stub();
+    await expect(ghGraphQlQuery({ token: "ghs_test", query }))
+      .resolves.toEqual({ ok: false, reason: "not_a_read_query" });
+    // The point is not the verdict but that nothing was sent.
+    expect(urls).toEqual([]);
+    expect(errorSpy).toHaveBeenCalled();
   });
 });
