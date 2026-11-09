@@ -385,11 +385,13 @@ import {
 } from "./issue-park-expiry.js";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX,
   buildIssueMonitorDispatchRearmPatch,
   buildIssueMonitorClearedPatch,
   buildIssueMonitorEligibilityPatch,
   buildIssueMonitorTriggeredPatch,
   derivePersistedMonitorState,
+  dispatchWatchdogGateSignals,
   exhaustedMonitorClearReason,
   issueAllowsMonitor,
   normalizeIssueExecutionPolicy,
@@ -1047,7 +1049,6 @@ function suppressedDispatchRearmDelayMs(attemptCount: number): number {
 }
 
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE = "paperclip_monitor_dispatch";
-const ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX = "heartbeat_run:";
 
 /**
  * PEN-6286: how long the dispatch watchdog may keep nudging a run that has
@@ -18904,6 +18905,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       if (previousMonitor?.status !== "triggered") continue;
       const nextCheckAt = new Date(now.getTime() + ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS);
       const previousPolicy = normalizeIssueExecutionPolicy(candidate.issue.executionPolicy ?? null);
+      // PEN-6346: the assignee's declared gates are carried, not replaced. They
+      // live only on the monitor STATE by now — clearing the fired monitor ran
+      // the policy through `stripMonitorFromExecutionPolicy`, so
+      // `previousPolicy.monitor` is null here for the same reason the
+      // monitor-nested opt-out below is.
+      const watchdogGates = dispatchWatchdogGateSignals({
+        declared: previousMonitor.gateSignals,
+        watchedRunId: candidate.run.id,
+      });
       const policy = normalizeIssueExecutionPolicy({
         mode: previousPolicy?.mode ?? "normal",
         commentRequired: previousPolicy?.commentRequired ?? true,
@@ -18914,6 +18924,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // by the time this runs, because clearing the fired monitor ran it
         // through `stripMonitorFromExecutionPolicy`, which drops `monitor`
         // wholesale (and collapses a monitor-only policy to null outright).
+        //
+        // PEN-6346 found the second field this had already dropped —
+        // `gateSignals`, below — which is why `serviceName` is the only
+        // substitution left here. Anything added to the monitor policy needs a
+        // line in this object or it silently does not survive a lapse.
         productivityReviewDisabled: previousPolicy?.productivityReviewDisabled ?? false,
         monitor: {
           nextCheckAt: nextCheckAt.toISOString(),
@@ -18924,7 +18939,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           timeoutAt: previousMonitor.timeoutAt ?? undefined,
           maxAttempts: previousMonitor.maxAttempts ?? undefined,
           recoveryPolicy: previousMonitor.recoveryPolicy ?? undefined,
-          gateSignals: [`${ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX}${candidate.run.id}`],
+          gateSignals: watchdogGates.gateSignals,
         },
       });
       if (!policy?.monitor) continue;
@@ -18960,6 +18975,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           watchedRunCreatedAt: candidate.run.createdAt.toISOString(),
           nextCheckAt: nextCheckAt.toISOString(),
           lapseMs: ISSUE_MONITOR_DISPATCH_LAPSE_MS,
+          // PEN-6346: the declared gates the re-arm carried, and how many had
+          // to be trimmed to keep the watchdog's own token inside the schema
+          // cap. Logged because a trim is a silent drop otherwise, which is
+          // the class this carry-forward exists to close.
+          gateSignals: watchdogGates.gateSignals,
+          droppedGateSignalCount: watchdogGates.dropped,
         },
       });
     }

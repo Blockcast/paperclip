@@ -30,6 +30,7 @@ import {
   ISSUE_THREAD_INTERACTION_KINDS,
   ISSUE_THREAD_INTERACTION_STATUSES,
   ISSUE_WATCHDOG_DISCOVERY_KINDS,
+  MAX_ISSUE_MONITOR_GATE_SIGNALS,
   MODEL_PROFILE_KEYS,
   REQUEST_CHECKBOX_CONFIRMATION_OPTION_LIMIT,
   REQUEST_ITEM_VERDICTS_ITEM_LIMIT,
@@ -190,7 +191,7 @@ export const issueExecutionMonitorPolicySchema = z.object({
   scheduledBy: z.enum(ISSUE_MONITOR_SCHEDULED_BY).prefault("assignee"),
   gateSignals: z
     .array(z.string().trim().min(1).max(200))
-    .max(20)
+    .max(MAX_ISSUE_MONITOR_GATE_SIGNALS)
     .optional()
     .nullable()
     .prefault(null)
@@ -325,7 +326,7 @@ export const issueExecutionMonitorStateSchema = z.object({
   attemptCount: z.number().int().nonnegative().prefault(0),
   notes: z.string().max(500).nullable(),
   scheduledBy: z.enum(ISSUE_MONITOR_SCHEDULED_BY).nullable(),
-  gateSignals: z.array(z.string().trim().min(1).max(200)).max(20).nullable().prefault(null),
+  gateSignals: z.array(z.string().trim().min(1).max(200)).max(MAX_ISSUE_MONITOR_GATE_SIGNALS).nullable().prefault(null),
   gateFingerprint: z.string().max(200).nullable().prefault(null),
   gateSource: z.enum(ISSUE_MONITOR_GATE_SOURCES).nullable().prefault(null),
   convergenceCount: z.number().int().nonnegative().prefault(0),

@@ -821,6 +821,18 @@ export const ISSUE_MONITOR_GATE_SOURCES = ["gates", "notes"] as const;
 export type IssueMonitorGateSource = (typeof ISSUE_MONITOR_GATE_SOURCES)[number];
 
 /**
+ * How many gate tokens one monitor may declare.
+ *
+ * Exported rather than left as a literal in the two `gateSignals` schemas
+ * because PEN-6346 made it load-bearing outside validation: the dispatch
+ * watchdog now *appends* its own token to the assignee's declared set, so a
+ * builder has to know the ceiling in order to stay under it. Overflowing is
+ * not a clamped write — the policy fails to parse, `normalizeIssueExecutionPolicy`
+ * returns null, and the watchdog re-arm is skipped outright for that row.
+ */
+export const MAX_ISSUE_MONITOR_GATE_SIGNALS = 20;
+
+/**
  * BLO-18294: how many consecutive re-checks may report the same gate set before
  * the monitor stops re-arming and the issue is escalated to `blocked`.
  */

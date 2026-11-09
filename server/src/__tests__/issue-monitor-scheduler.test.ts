@@ -272,6 +272,11 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
           attemptCount: monitorAttemptCount,
           notes: "Check deploy",
           scheduledBy: "assignee",
+          // PEN-6346: mirrored like the fields below it because a real arm
+          // copies the policy's gates into the state (`buildScheduledMonitorState`),
+          // and the watchdog re-arm reads them from the state — the policy's
+          // own monitor is already stripped by then.
+          gateSignals: Array.isArray(monitor.gateSignals) ? (monitor.gateSignals as string[]) : null,
           serviceName: typeof monitor.serviceName === "string" ? monitor.serviceName : null,
           externalRef: typeof monitor.externalRef === "string" ? monitor.externalRef : null,
           timeoutAt: typeof monitor.timeoutAt === "string" ? monitor.timeoutAt : null,
@@ -498,6 +503,59 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId));
     expect(activity.map((row) => row.action)).toContain("issue.monitor_rearmed_after_dispatch_lapse");
 
+  });
+
+  // PEN-6346: the watchdog re-arm is field-by-field (see BLO-39945 below), and
+  // `gateSignals` was the second field it silently dropped — it *replaced* the
+  // assignee's declared gates with its own `heartbeat_run:` token. Those gates
+  // are the only machine-readable statement of what the issue is waiting on,
+  // and `terminal-gate-reconciler` reads exactly that field to catch a row whose
+  // monitor stopped polling on a gate that has since resolved. The watchdog
+  // clears its own monitor minutes later, so the substitution left the row dark
+  // AND unreadable by its safety net — on the path where the net is needed.
+  //
+  // To watch this fail: restore the old literal at the re-arm site, which built
+  // the gate set from the watchdog token alone, and the declared tokens
+  // disappear from both the policy and the archived state.
+  it("re-arms after a dispatch lapse and keeps the assignee's declared gateSignals", async () => {
+    const declared = ["pr:blockcast/penstock-llm-proxy-core#2965:merged", "deploy:paperclip-api"];
+    const { issueId } = await seedFixture({ monitor: { gateSignals: declared } });
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+    await db
+      .update(issues)
+      .set({ executionRunId: queuedRun.id })
+      .where(eq(issues.id, issueId));
+
+    await heartbeat.tickTimers(new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS));
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    const watchdogToken = `heartbeat_run:${queuedRun.id}`;
+    const expected = [...declared, watchdogToken].sort();
+
+    expect(
+      normalizeIssueExecutionPolicy(issue.executionPolicy)?.monitor?.gateSignals,
+      "the watchdog appends its token; it does not replace the declared gate set",
+    ).toEqual(expected);
+    // The archived state is the surface `terminal-gate-reconciler` reads, so it
+    // is the one that decides whether the safety net can see this row at all.
+    expect(parseIssueExecutionState(issue.executionState)?.monitor?.gateSignals).toEqual(expected);
   });
 
   // BLO-39945: the watchdog re-arm rebuilds the policy field by field, so

@@ -15,6 +15,7 @@ import {
   DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD,
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   MAX_ISSUE_MONITOR_CONVERGENCE_THRESHOLD,
+  MAX_ISSUE_MONITOR_GATE_SIGNALS,
   issueExecutionPolicySchema,
   issueExecutionStateSchema,
   renewedIssueMonitorMaxAttempts,
@@ -546,6 +547,56 @@ export function normalizeIssueMonitorGateSignals(signals: readonly unknown[] | n
     if (token) unique.add(token);
   }
   return [...unique].sort();
+}
+
+/**
+ * Gate token the dispatch watchdog writes to name the queued run it is watching.
+ *
+ * Lives here, beside the rest of the gate-token vocabulary, rather than in
+ * `heartbeat.ts` where it was first written: two modules now read it and they
+ * must not drift. The watchdog reads the run id back out of the gate set in
+ * order to poll it, and `terminal-gate-reconciler` has to recognise the token
+ * in order to *ignore* it — a prefix known to one of those and not the other
+ * fails silently in opposite directions.
+ */
+export const ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX = "heartbeat_run:";
+
+/**
+ * The gate set a dispatch-watchdog re-arm carries (PEN-6346).
+ *
+ * The watchdog used to write `[heartbeat_run:<id>]` — *replacing* whatever the
+ * assignee had declared. That discarded the only machine-readable statement of
+ * what the issue was actually waiting on, and since the re-arm's own monitor is
+ * cleared a few minutes later, the row was left with no record of its gates at
+ * all. `terminal-gate-reconciler` is the designed safety net for exactly that
+ * row and reads precisely that field, so the substitution removed the net on
+ * the one path where it was needed. Appending keeps both: the declared gates
+ * survive into the archived monitor state, and the watchdog still finds its own
+ * token by prefix.
+ *
+ * `dropped` is returned rather than swallowed because the overflow case has to
+ * pick a loser. The schema admits `MAX_ISSUE_MONITOR_GATE_SIGNALS` tokens and
+ * overflow is not a clamped write — the policy fails to parse and the re-arm is
+ * skipped entirely — so one slot is reserved for the watchdog token and the
+ * declared tail is trimmed to fit. That trim is itself a silent drop of the
+ * kind this function exists to fix, so the caller logs the count: losing the
+ * watchdog token instead would strand the run it was watching, which is worse
+ * and also unobservable. A monitor declaring 20 gates is well outside the
+ * measured population (1-3), so the trim is a guard, not a routine path.
+ */
+export function dispatchWatchdogGateSignals(input: {
+  declared: readonly unknown[] | null | undefined;
+  watchedRunId: string;
+}): { gateSignals: string[]; dropped: number } {
+  const watchdogToken = `${ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX}${input.watchedRunId}`;
+  const declared = normalizeIssueMonitorGateSignals(input.declared)
+    .filter((token) => !token.startsWith(ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX));
+  const budget = Math.max(0, MAX_ISSUE_MONITOR_GATE_SIGNALS - 1);
+  const carried = declared.slice(0, budget);
+  return {
+    gateSignals: normalizeIssueMonitorGateSignals([...carried, watchdogToken]),
+    dropped: declared.length - carried.length,
+  };
 }
 
 export function computeIssueMonitorGateFingerprint(input: {
