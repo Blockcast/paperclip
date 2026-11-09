@@ -14080,7 +14080,38 @@ export function issueService(db: Db) {
         // Unreachable while the `fenced` shape above requires a non-null lock
         // column, but "no holder at all" is the same answer as "no live holder".
         holderConflict.holderLiveness === "no_holder";
-      if (nothingLiveHoldsRow) {
+
+      // Ally on #3607: the holder is only half the question, and gating on it
+      // alone opened this fence for a caller the server has already marked
+      // terminal. The `in_progress` ladder this is meant to be at parity with
+      // grants the lock only to an actor run whose status is exactly `running`
+      // — `adoptStaleCheckoutRun`'s `actorLive` test, and
+      // `runningCheckoutExecutionPatch`, which returns null for anything else.
+      // BLO-28441 records why that matters here: a run marked terminal keeps
+      // executing for ~10 more minutes while every health signal available to
+      // it reads clean. Past this fence sit the execution-stage-participant
+      // decision early-return and the approval-comment `done` transition, so
+      // without this conjunct run A — already dead — could decide run B's
+      // stage whenever B is a never-started holder. The unconditional throw
+      // this PR replaced refused that incidentally; this refuses it on purpose.
+      //
+      // Parity is exact rather than approximate, because the status-blind limb
+      // is also mirrored: `resolveSameRunOwnership` grants a run that is its
+      // own holder without reading its status, and `runOwnsIssueExecutionLock`
+      // above returns `fenced: true` for that same case before reaching here.
+      // So this gate governs only the non-owner opening, which is the one the
+      // `in_progress` side gates on `running` too.
+      //
+      // `=== "running"` affirmatively, the same polarity as the holder test: a
+      // null status is a row that was not read — absent `actorRunId`, missing
+      // run row, or a lookup that threw — and a caller whose own liveness could
+      // not be read is not a caller known to be alive. This narrows an opening
+      // that did not exist before this PR, so every actor it turns away is one
+      // that already received this 409; it cannot refuse anything that used to
+      // be allowed, and it cannot reach the never-started-holder case PEN-6282
+      // fixed, whose actor is by construction the live run making the request.
+      const actorRunIsLive = holderConflict.actorRunStatus === "running";
+      if (nothingLiveHoldsRow && actorRunIsLive) {
         return { owned: true as const, fenced: false as const };
       }
 
