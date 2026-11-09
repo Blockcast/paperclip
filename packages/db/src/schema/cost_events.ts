@@ -106,7 +106,7 @@ export const costEvents = pgTable(
     // BLO-47753: per-issue cost rollups. Without it the generic plan filters
     // issue_id through the heartbeat-run index (~2 s/call at 431k rows).
     companyIssueIdx: index("cost_events_company_issue_idx").on(table.companyId, table.issueId),
-    // PEN-5937 (migration 0277): the keyset driver for
+    // PEN-5937 (the `cost_events_unattributed_index` migration): the keyset driver for
     // `repairCostEventProjectAttribution`, which runs on an interval rather than once per
     // lease acquisition and would otherwise walk the whole primary key heap-fetching a
     // column no index carries. PARTIAL on the repair's own predicate, so it holds only
