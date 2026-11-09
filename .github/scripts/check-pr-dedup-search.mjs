@@ -10,7 +10,10 @@
  */
 import { fileURLToPath } from 'node:url';
 
-const SKIP_PREFIXES = ['docs', 'chore', 'build', 'ci', 'style', 'test', 'revert'];
+// Exported so sibling gates can compute, rather than restate, which title
+// prefixes this gate skips. check-pr-test-coverage.mjs reads it to tell an
+// author what a suggested retitle will newly require (PEN-6323).
+export const SKIP_PREFIXES = ['docs', 'chore', 'build', 'ci', 'style', 'test', 'revert'];
 
 // Match a markdown checkbox line whose label mentions searching for similar
 // PRs. Examples that should match (checked):
