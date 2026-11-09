@@ -45,6 +45,48 @@ To ask whether park wakes fired, read `agent_wakeup_requests` — see
 So the claim is written **before** the wake, and the wake cannot happen without
 it: **a fire implies a stamp was written.**
 
+## Reading a park back: two names, one value (PEN-6129)
+
+Until PEN-6129 the park had two vocabularies and they did not overlap. You
+**write** a park as `parkedDisposition: {reason, until}` on
+`PATCH /api/issues/:id` — the flat keys are refused there — and both read
+surfaces carried only the flat columns and never `parkedDisposition`. So the
+obvious verification (`PATCH` the nested key → `GET` → read `.parkedDisposition`)
+was not a weak predicate but a **constant**: the key was absent on a parked row
+and an unparked row alike, `jq` / `.get()` / optional chaining render absent as
+`null`, and `has("parkedDisposition")` could not separate the two states either,
+because the key was missing from both. Measured 2026-11-08: a reader took
+`parkedDisposition: null` on a live park to mean the park was gone, then began
+building a second claim — a sweep that had supposedly dropped it — on top.
+
+Both read surfaces now carry a derived `parkedDisposition` as well:
+
+| surface | park vocabulary |
+|---|---|
+| `PATCH /api/issues/:id` | `parkedDisposition: {reason, until}` — the only writable name |
+| `GET /api/issues/:id`, `/heartbeat-context` | `parkedDisposition` **and** `parkedUntil` · `parkedReason` · `parkedByAgentId` · `parkedAt` · `parkedWakeFiredAt` |
+| `GET /companies/:id/issues` (list) | the same |
+
+`issueParkedDispositionFromRow` (`server/src/services/issues.ts`) is the single
+derivation both arms call — `withParkedDisposition` on the single-issue getters,
+`withActiveRuns` on list rows — so the surfaces cannot drift;
+`server/src/__tests__/issue-parked-disposition.test.ts` compares them rather
+than comparing each against a literal.
+
+Two things to carry:
+
+- **Gate on key presence, not on value.** A server predating PEN-6129 omits the
+  key, and absent renders as `null`, which on this field reads as *"not
+  parked"* — the wrong answer in the reassuring direction. Treat an absent key
+  as "the park is not computable from this response" and read `parkedUntil`,
+  which has been there all along.
+- **Non-null means RECORDED, not ACTIVE.** Expiry deliberately does not clear
+  the columns (that is what makes the fire-once claim above work across the
+  window between the deadline and the next re-park), and this key mirrors the
+  columns exactly. Active-ness is `parkedUntil` — equivalently
+  `parkedDisposition.until` — being in the **future**, which is what
+  `isDeliberateParkActive` tests. Nothing on either read surface precomputes it.
+
 ## Why the stamp is usually gone anyway
 
 Three independent things set the column back to `null`, and only the first is

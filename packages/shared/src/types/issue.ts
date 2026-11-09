@@ -1012,6 +1012,17 @@ export interface Issue {
   // here) and written only via the nested `parkedDisposition` PATCH input. `parkedUntil`
   // in the future is the seventh explicit waiting path the liveness sweep accepts; once it
   // lapses the row is detectable again without anyone having to un-park it.
+  //
+  // PEN-6129: these are the COLUMNS, and they are no longer the only name the park answers
+  // to on a read. Both read surfaces also carry a derived `parkedDisposition:
+  // {reason, until} | null` — `issueParkedDispositionFromRow` in
+  // `server/src/services/issues.ts`, attached by `withParkedDisposition` on the
+  // single-issue getters and by `withActiveRuns` on list rows. It is NOT on this type for
+  // the same reason `monitorStatus` is not: this is the table shape and a projection
+  // cannot be a column. Before that fix the write name existed on no read surface at all,
+  // so `.parkedDisposition` on a GET was a constant `null` — true of a parked row and an
+  // unparked row alike — which is how a reader came to report a live park as gone and then
+  // invented a mechanism to explain its disappearance.
   parkedUntil?: Date | null;
   parkedReason?: string | null;
   parkedByAgentId?: string | null;

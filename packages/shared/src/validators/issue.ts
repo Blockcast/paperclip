@@ -939,7 +939,18 @@ export const updateIssueSchema = createIssueBaseSchema.omit({
   // create would let a row be born pre-suppressed. Enforced rather than conventional: the
   // create path carries `parkedDispositionCreateGuardShape`, and this `.extend()` is what
   // overrides that rejection back to the real schema on update.
-  parkedDisposition: issueParkedDispositionSchema.nullable().optional(),
+  //
+  // PEN-6129: the description below is the call-site half of the two-vocabulary fix. The
+  // read half — `parkedDisposition` present on both read surfaces, derived from the flat
+  // columns — is `issueParkedDispositionFromRow` in `server/src/services/issues.ts`. Keep
+  // the two in step: if the read projection is ever dropped, this text becomes a promise
+  // the API does not keep, and it fails in the silent direction the row documents.
+  parkedDisposition: issueParkedDispositionSchema
+    .nullable()
+    .optional()
+    .describe(
+      `Record or clear a deliberate park. This is the ONLY writable park name — the flat \`parkedUntil\` / \`parkedReason\` / \`parkedAt\` / \`parkedByAgentId\` keys are server-owned and are REFUSED here, and the whole shape is refused on create (POST /issues). Send \`{\"reason\":\"<why this row is deliberately not being worked, and what event ends the park>\",\"until\":\"<ISO-8601, in the future, at most ${PARKED_DISPOSITION_MAX_HORIZON_DAYS} days out>\"}\`, or \`null\` to un-park. A park is DELIBERATELY time-bounded: it suppresses the liveness invariants only until \`until\`, after which the row is detectable again without anyone un-parking it. ⚠ DO NOT VERIFY A PARK BY RE-READING THIS WRITE RESPONSE — like every field here, what comes back is an unhydrated projection (PEN-5760). Re-read with \`GET /api/issues/:id\`, where since PEN-6129 the park reads back under BOTH names: \`parkedDisposition\` (the name you wrote, present on every row, \`null\` when no park is recorded) and the five flat columns \`parkedUntil\` / \`parkedReason\` / \`parkedByAgentId\` / \`parkedAt\` / \`parkedWakeFiredAt\`. Before PEN-6129 only the flat names existed on reads, so \`.parkedDisposition\` on a GET was a CONSTANT \`null\` — true of a parked row and an unparked row alike — and \`has(\"parkedDisposition\")\` could not separate them either; if your server predates that fix the key is simply absent, so treat an absent key as 'not computable on this surface' and read \`parkedUntil\`. ⚠ A NON-NULL \`parkedDisposition\` means a park is RECORDED, not that it is ACTIVE: expiry does not clear the columns, so active-ness is \`parkedUntil\` being in the future, on either name.`,
+    ),
   // PEN-5876: optional compare-and-set over the scalar text field set
   // (`title` + `description`). Supply the `latestFieldRevisionId` you read,
   // and the write is refused 409 `stale_base_revision` if anyone has written
