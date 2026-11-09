@@ -560,6 +560,64 @@ env:
     - name: PAPERCLIP_EXPLAIN_ANALYZE_ISSUE_LIST_TERM
       value: ""
 
+    # PEN-6104 done-when 1: the deliberate `EXPLAIN (ANALYZE, BUFFERS)` probe
+    # for the wake-membership statement behind
+    # `GET /issues/:id/diagnostics/wakes`. Twin of the issues-list probe above.
+    # The probe itself shipped in #3571 (merged 2026-11-09T22:44:26Z); this
+    # flag is the only thing that turns it on, and done-when 1 is blocked on
+    # nothing else.
+    #
+    # ⚠️ THE VALUE IS A COMMA-SEPARATED LIST OF ISSUE **UUIDs** -- not a
+    # boolean, and not a `PEN-` identifier. `shouldProbeWakeDiagnostics`
+    # compares each entry against `issue.id` lower-cased, so `value: "PEN-6104"`
+    # would be valid YAML, would pass admission, would look enabled in every
+    # dashboard -- and would match nothing. That is this flag's silent no-op,
+    # the exact shape of the boolean trap on the flag above, and
+    # tests/wake-diagnostics-analyze-probe-flag.test.mjs refuses it by shape.
+    #
+    # WHY TWO IDS. The finding is that the cost is a function of WHICH row is
+    # asked for: the `LIMIT` bounds the scan only while matches are dense near
+    # the top of the `requested_at DESC` range, and a sparse row is answered
+    # only after the entire window has been walked and rejected. One id
+    # therefore measures nothing -- the dense/sparse PAIR is the measurement.
+    # Both are named here so that ONE deploy captures both halves; requiring a
+    # redeploy between them would put a deploy, and whatever else rode it, in
+    # the middle of the comparison.
+    #
+    #   ab382aa7-... = PEN-6104, the DENSE half. Measured 2026-11-09T22:44Z
+    #     against this endpoint: 50 wake rows and `truncated: true`, i.e. >= 50
+    #     inside the 14-day lookback. Actively worked, so it stays dense.
+    #
+    #   9f9c4695-... = PEN-3172, the SPARSE half. Measured 2026-11-09T22:57Z:
+    #     `wakeRequestCount: 0`, `truncated: false`, `degraded: false` -- the
+    #     whole window walked and every row rejected, which is the maximal case
+    #     of the finding rather than an approximation of it. `done` and dormant
+    #     since September, so it cannot acquire wakes before the capture. That
+    #     stability is why it was picked: an id baked into a values file is
+    #     chosen hours before anything reads it.
+    #
+    # ⛔ CAPTURE BEFORE MIGRATION 0278 (#3558) DEPLOYS. 0278 adds the four
+    # partial btrees that this plan is the before-picture of, and nothing can
+    # re-create a pre-index production plan once they exist. #3571 does not
+    # wait on #3558 and measures whichever plan is live -- but only one of the
+    # two is still obtainable.
+    #
+    # Bounded four ways, so leaving it on by accident is cheap rather than
+    # dangerous: default-off in code, at most 5 captures per process, a 10s
+    # `SET LOCAL statement_timeout` inside the probe's own transaction, and the
+    # success path only (`!wakeOutcome.degraded`, which is what keeps PEN-5223's
+    # "never ANALYZE a timed-out statement" rule true here). A matching request
+    # pays ~2x the statement; it is read-only and is not awaited, so no tenant
+    # response waits on it.
+    #
+    # To turn OFF once both plans are recorded on PEN-6104: empty the value and
+    # flip the ENABLED assertion in the test with it. Keep the flag PRESENT, as
+    # the issues-list flag above is, so the admissibility and both-tiers
+    # assertions keep covering it and a re-enable stays a one-token change to a
+    # reviewed line.
+    - name: PAPERCLIP_EXPLAIN_ANALYZE_WAKE_DIAGNOSTICS_ISSUE_IDS
+      value: "ab382aa7-feb9-4349-90a3-922fabd8a0ed,9f9c4695-a315-4be7-a3b4-b439a952109c"
+
 # Worker tier also runs plugin workers and scheduled plugin jobs. Linear's
 # periodic sync can transiently burn CPU over large BLO backlogs; keep enough
 # headroom for Alertmanager webhooks and health probes to complete.
