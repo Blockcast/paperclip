@@ -83,9 +83,61 @@ export function preservedNotes(
   const head = trimTrailingSpace(rendered);
   if (current.startsWith(head)) {
     const remainder = current.slice(head.length);
-    if (remainder.trim() !== "") return remainder;
+    // ...unless the render SHRANK. A prefix match says only that the stored
+    // body begins with this render, and a smaller render of the same alert is
+    // a prefix of a bigger one — our sections are appended in a fixed order
+    // and joined with blank lines, so dropping a trailing one leaves exactly
+    // this shape. The live case: a two-member aggregate loses a member, and
+    // `buildAggregateIssueDescription` returns the representative alone
+    // (`members.length < 2`), so the old `### Active members (2)` table — which
+    // still lists the alert that just cleared, and still says "Falsify every
+    // fingerprint here before closing" — reads as notes and is then carried
+    // forward verbatim FOREVER. That is the stale-body wrong-close mechanism
+    // of BLO-41538/BLO-42850, arriving through the fix for a different defect.
+    //
+    // So the rescue is refused whenever the remainder looks like something we
+    // rendered. It errs toward refusing: a genuine note that quotes one of our
+    // headings is dropped, which costs a one-time fall back to pre-PEN-6218
+    // behaviour on legacy rows only, because after the first sync the row
+    // carries the marker and this branch is never reached again. The opposite
+    // error is permanent and asserts a cleared alert is still firing.
+    if (remainder.trim() !== "" && !looksSelfRendered(remainder)) return remainder;
   }
   return "\n";
+}
+
+/**
+ * Every section start this plugin's own renderers emit (`buildIssueDescription`
+ * and `buildAggregateIssueDescription` in `issue-mapping.ts`). A shrinking
+ * render can only drop whole trailing sections, so one of these begins the
+ * dropped tail in every case but the one handled below.
+ *
+ * ⚠ Keep in step with those renderers. A section added there and not listed
+ * here is not a crash — it is a silent return to the behaviour above.
+ */
+const SELF_RENDERED_SECTIONS: readonly RegExp[] = [
+  /^### Active members \(/m,
+  /^### Labels\s*$/m,
+  /^### Drill in\s*$/m,
+  /^\*\*Summary\*\*:/m,
+  /^\*\*Started\*\*:/m,
+  /^\*\*Latest firing\*\*:/m,
+  /^\*\*Severity\*\*:/m,
+  /^\*\*Source\*\*:/m,
+  /^\*\*Runbook\*\*:/m,
+];
+
+/** Could this text have come off one of our own renderers rather than a person? */
+function looksSelfRendered(candidate: string): boolean {
+  if (SELF_RENDERED_SECTIONS.some((pattern) => pattern.test(candidate))) return true;
+
+  // The one shrink that drops no section header: the labels table losing its
+  // last row (keys are rendered sorted, so the last one leaves a prefix). The
+  // tail is then a bare `| key | value |` line. Tested on the FIRST non-empty
+  // line only — notes that merely contain a table further down are still
+  // rescued, since a person's append opens with prose or a heading.
+  const firstLine = candidate.split("\n").find((line) => line.trim() !== "");
+  return firstLine !== undefined && firstLine.trimStart().startsWith("|");
 }
 
 /**

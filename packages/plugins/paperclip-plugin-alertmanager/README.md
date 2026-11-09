@@ -898,7 +898,17 @@ are preserved across syncs ...
 | **The marker string** | `<!-- paperclip-plugin-alertmanager:notes-below -->`. It is a contract with rows already on disk — renaming it orphans every one of them and their notes are lost on the next sync |
 | **The banner wording** | rendered *above* the marker, i.e. in the half the plugin rewrites, so an edit to it reaches every live row on its next sync rather than only rows filed afterwards |
 | **A row written before this shipped** | has no marker. An append made on a body this render still reproduces byte-for-byte is rescued on the first sync (the shape measured on PEN-4835); anything else falls through to the pre-PEN-6218 behaviour and is lost, which is no worse than before |
+| **A render that SHRANK** | the rescue is refused. A prefix match alone does not mean "notes were appended": a smaller render of the same alert is a prefix of a bigger one, so a two-member aggregate losing a member would otherwise read its own `### Active members (2)` table — naming the alert that just cleared — as notes and carry it forward forever. `looksSelfRendered` in `description-notes.ts` refuses any tail that opens with a section this plugin renders, or with a table row. It errs toward refusing, because losing a note costs one sync on a legacy row and keeping stale rendered content is permanent |
 | **Notes that quote the marker** | safe. The split is on the **first** occurrence, so a copy inside someone's notes costs a duplicated marker, never their text |
+
+⚠️ The rescue is best-effort and one-shot by construction — it runs only
+while a row has no marker, and the row acquires one on its first sync. The two
+ways it can be wrong are deliberately asymmetric: dropping a note that quotes
+one of our own headings costs that one sync, while mistaking a dropped render
+for notes is permanent and re-asserts a cleared alert. `looksSelfRendered` is
+the guard, and it must be kept in step with `issue-mapping.ts` — a section
+added to the renderers and not listed there is not a crash, it is a silent
+return to the permanent failure.
 
 **Not taken: suppressing the write when the body is unchanged.** The churn is
 real — those 69 rewrites re-sent one byte-identical 3,182-char body — and it is
