@@ -147,6 +147,18 @@ const splitJobs = (body) => {
 // level below the one the floor check looked at, so a second hardcoded depth is
 // the last thing this file should grow. A step runs from its `- ` marker to the
 // next line indented no further than that marker.
+//
+// A `- ` marker indented DEEPER than the open step is a nested sequence inside
+// that step (`with:`/`env:` taking a list), not a sibling step, and it has to be
+// kept as a continuation. Treating it as a new step truncates the real one: the
+// nested marker opens a step at its own deeper indent, and the step's remaining
+// attributes -- `timeout-minutes` among them -- then read as "indented no
+// further" and close it, so the cap this file exists to find is never seen.
+// Caught in review of #3577 with a probe step carrying `env: { LIST: [- a] }`
+// before its `timeout-minutes: 3`: all eight tests passed and the 3m was
+// invisible. No wrapper step in the repo nests a sequence today, so this was
+// never live -- but it is the same fail-open shape as PEN-6181 itself, one
+// layer further in, sitting in the detector written to catch it.
 const splitSteps = (text) => {
   const steps = [];
   let current = null;
@@ -157,7 +169,7 @@ const splitSteps = (text) => {
     }
     const indent = line.match(/^(\s*)/)[1].length;
     const marker = line.match(/^(\s*)- /);
-    if (marker) {
+    if (marker && (!current || marker[1].length <= current.indent)) {
       current = { indent: marker[1].length, lines: [line] };
       steps.push(current);
       continue;
@@ -320,6 +332,45 @@ test("no setup-pnpm step caps itself below the floor its job clears", async () =
       }
     }
   }
+});
+
+test("a nested sequence inside a wrapper step does not hide the step's own budget", async () => {
+  // The guard above reads real workflows, so it can only ever be as good as the
+  // splitter underneath it -- and a splitter that fails open reports CLEAN. This
+  // probe is synthetic on purpose: the shape it covers (a `with:`/`env:` list
+  // inside a wrapper step) exists in no workflow here, which is exactly why
+  // nothing else in this file would notice if the splitter stopped handling it.
+  const job = [
+    "    steps:",
+    "      - uses: actions/checkout@v5",
+    "      - name: Setup pnpm",
+    "        uses: ./.github/actions/setup-pnpm",
+    "        env:",
+    "          CANDIDATES:",
+    "            - one",
+    "            - two",
+    "        timeout-minutes: 3",
+    "      - name: Install",
+    "        run: pnpm install",
+  ].join("\n");
+
+  const steps = splitSteps(job);
+  const wrapperSteps = steps.filter((s) => usesWrapper.test(s.lines.join("\n")));
+  assert.equal(wrapperSteps.length, 1, "the wrapper step must be found exactly once");
+
+  const budget = wrapperSteps[0].lines.join("\n").match(/^\s*timeout-minutes: (.+)$/m);
+  assert.ok(
+    budget,
+    "the nested sequence swallowed the step's `timeout-minutes` -- the step-cap guard " +
+      "above would read this workflow as declaring no step budget and pass (PEN-6181)",
+  );
+  assert.equal(budget[1].trim(), "3");
+
+  // The converse half: a marker at the step's own indent is still a sibling, so
+  // fixing the nested case must not fuse the whole `steps:` block into one step.
+  assert.equal(steps.length, 3);
+  assert.match(steps[2].lines.join("\n"), /run: pnpm install/);
+  assert.doesNotMatch(wrapperSteps[0].lines.join("\n"), /run: pnpm install/);
 });
 
 test("the wrapper is always preceded by a checkout in the same job", async () => {
