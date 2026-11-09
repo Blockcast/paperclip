@@ -5548,11 +5548,38 @@ function issueRef(row: Pick<IssueRow, "id" | "identifier" | "title" | "status" |
  * 0269 dropped it deliberately (see its header).
  *
  * ⚠️ STATEMENT-TEXT NOTE for anyone classifying `paperclip-pg-0` timeouts:
- * the class-A (search) signature CHANGES with this commit. It was 10
+ * the class-A (search) signature CHANGED with `0ec61da0` (#3539). It was 10
  * `ILIKE ... ESCAPE` occurrences plus a correlated `EXISTS`; it is now 6
  * `ILIKE ... ESCAPE` and no `EXISTS`. A classifier keyed on the old counts
  * reads post-deploy class-A statements as unclassifiable, which fails in the
- * "nothing to see" direction. Key on the four searched columns instead.
+ * "nothing to see" direction.
+ *
+ * ⛔ Keying on "the four searched columns" is NOT the fix — it absorbs the
+ * company-search aggregate (`services/company-search.ts`, one `db.execute`),
+ * which matches `issues.title`, `issues.identifier`, `issues.description` and
+ * `issue_comments.body`, company-scoped, with the same `deleted_at IS NULL`,
+ * and which is a DIFFERENT timeout population (PEN-5019 counts it in class D).
+ * That key fails in the opposite direction and reaches the same wrong
+ * conclusion — "class A did not collapse, so the fix did not work".
+ *
+ * ✅ Key on the CONJUNCTION of those four columns EACH carrying an explicit
+ * `ILIKE ... ESCAPE '\'`. It is invariant across both class-A shapes (all 10
+ * pre-change occurrences, all 6 of these), and company-search's aggregate
+ * arms carry none — its `ESCAPE`s are all in `countArtifacts()`, which are
+ * separate statements. Count COLUMNS, not occurrences:
+ * `services/company-artifacts.ts` has three statements carrying 3-4
+ * `ILIKE ... ESCAPE` each over `issues.title` / `issues.identifier`. Do not
+ * weaken it to a disjunction either — the blocked-inbox list and count
+ * statements are a lone `issue_comments.body ILIKE ... ESCAPE '\'`.
+ *
+ * ℹ️ `issues.description ILIKE ... ESCAPE '\'` is, measured 2026-11-09, the
+ * only one of the four fragments unique to this statement among PRODUCTION
+ * statements, so it works as a single-line marker where a multi-line
+ * conjunction is awkward to grep over a log. (Tree-wide it also appears in
+ * `__tests__/issue-list-analyze-probe-postgres.test.ts` and
+ * `__tests__/issue-list-timeout-explain-postgres.test.ts`, which build their
+ * own probe statements from test-only constants.) It is sufficient, not
+ * necessary: it dies the moment the description arm moves.
  */
 export const ISSUE_SEARCH_ARMS_ALIAS = "issue_search_arms";
 
