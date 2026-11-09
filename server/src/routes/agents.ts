@@ -3673,17 +3673,18 @@ export function agentRoutes(
     // `assertNoAgentRuntimeConfigAdapterConfigMutation` holds on PATCH, and
     // this route carried no equivalent.
     //
+    // COVERED, second arm: `budgetMonthlyCents` (PEN-6225). `PATCH
+    // /api/agents/:id` refuses that column with a 422 outright (BLO-27626),
+    // and a rollback wrote it — a column one agent-reachable route refuses by
+    // name was writable by another, through the same `allow_self`. See the
+    // guard below for what it refuses and why it is narrower than PATCH's.
+    //
     // NOT COVERED, every remaining field the snapshot patch restores:
     //   - `name`, `role`, `title`, `capabilities` — the BLO-27751
     //     profile-change consent gate, bypassable by this same route.
     //   - `reportsTo`, `adapterType`, `defaultEnvironmentId`, `metadata`.
     //   - `runtimeConfig` outside `modelProfiles.*.adapterConfig` (e.g.
     //     `heartbeat`).
-    //   - `budgetMonthlyCents`, which is the sharpest of these: `PATCH
-    //     /api/agents/:id` refuses it with a 422 outright (BLO-27626, "would
-    //     not change enforcement"), and a rollback writes it. Enforcement
-    //     reads `budget_policies`, so that is a display-mirror desync rather
-    //     than a cap change — PEN-6225, filed rather than fixed here.
     // Do not read this guard as covering any of them.
     if (req.actor.type === "agent") {
       const revision = await svc.getConfigRevision(id, revisionId);
@@ -3710,6 +3711,58 @@ export function agentRoutes(
         existing.runtimeConfig,
         asRecord(existing.adapterConfig) ?? {},
       );
+
+      // PEN-6225. `configPatchFromSnapshot` restores `budgetMonthlyCents`, and
+      // `updateAgent` spreads the patch with no column filter, so a rollback
+      // wrote the column that `PATCH /api/agents/:id`, on this same router,
+      // refuses by name. Same actor, same row, same column, opposite answers.
+      //
+      // It is NOT a cap escalation, and the refusal is not sold as one.
+      // Enforcement reads `budget_policies` (`getEnforcedBudgetByAgentIds`);
+      // the column is the display mirror, and `services/agents.ts` already
+      // names "config-revision restore" as one of the writers that can leave
+      // it stale. The harm is a mirror that disagrees with the policy while
+      // reading as authoritative — BLO-27626's own framing, reproduced by a
+      // route that did not get its refusal.
+      //
+      // REFUSES rather than silently dropping the column. Dropping it would
+      // return 200 for a rollback that did not restore what the revision says
+      // it restores, which is the same "looks applied, binds nothing" shape
+      // BLO-27626 exists to remove — one surface further along.
+      //
+      // NARROWER THAN PATCH'S ON PURPOSE, in two ways, and neither is an
+      // oversight to "align" later:
+      //   - AGENT ACTORS ONLY. PATCH's guard is actor-blind because naming the
+      //     column there is always a request to change it. A rollback's budget
+      //     move is incidental to restoring a snapshot, so refusing board
+      //     rollbacks would regress a path boards use to undo a bad config,
+      //     to buy nothing — a board actor can reach the budgets route.
+      //   - ONLY WHEN THE VALUE ACTUALLY MOVES. The must-pass arm: a rollback
+      //     whose revision carries the current cap restores it to itself and
+      //     is allowed, so this does not refuse every rollback by every agent
+      //     whose config history predates its current budget.
+      // Compared post-normalization, against the same `Math.max(0,
+      // Math.floor(...))` `configPatchFromSnapshot` applies, so a snapshot
+      // that only differs where the normalizer erases the difference is not
+      // refused for a write it would not have made.
+      const restoredBudget = asRecord(revision.afterConfig)?.budgetMonthlyCents;
+      if (
+        typeof restoredBudget === "number"
+        && Number.isFinite(restoredBudget)
+        && Math.max(0, Math.floor(restoredBudget)) !== existing.budgetMonthlyCents
+      ) {
+        res.status(422).json({
+          error:
+            "This revision restores a different monthly budget cap. Use PATCH "
+            + "/api/agents/:agentId/budgets to change one: a rollback writes only the display "
+            + "mirror and would not change enforcement.",
+        });
+        return;
+      }
+      // A non-numeric `budgetMonthlyCents` is deliberately NOT refused here —
+      // `configPatchFromSnapshot` throws `Invalid revision snapshot:
+      // budgetMonthlyCents` before any write lands, so the fall-through is
+      // fail-closed and a budget-shaped error message would misattribute it.
     }
 
     const actor = getActorInfo(req);

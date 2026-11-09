@@ -132,6 +132,11 @@ function makeBrokeredAgent(overrides: Record<string, unknown> = {}) {
     adapterConfig: { enableGitHubPublishBroker: true, model: "stored-model" },
     runtimeConfig: {},
     defaultEnvironmentId: null,
+    // `agents.budget_monthly_cents` is `integer().notNull().default(0)`, so a
+    // production row always carries a number. Omitting it here would leave
+    // `existing.budgetMonthlyCents` `undefined` and make the PEN-6225 guard's
+    // comparison meaningless.
+    budgetMonthlyCents: 1_300_000,
     permissions: null,
     updatedAt: new Date(),
     ...overrides,
@@ -533,6 +538,117 @@ describe("POST /api/agents/:id/config-revisions/:revisionId/rollback — runtime
 // surprising — an agent-driven hire flow that copies an existing config
 // verbatim starts failing — and an intended refusal nobody wrote down is
 // indistinguishable from a regression when someone meets it.
+// PEN-6225. The third field `configPatchFromSnapshot` restores that an agent
+// actor must not move through this route. `PATCH /api/agents/:id` refuses
+// `budgetMonthlyCents` with a 422 by name (BLO-27626) because the column is a
+// display mirror and enforcement reads `budget_policies`; rollback restored it
+// anyway, so the same actor got opposite answers on the same column depending
+// on which route it used.
+//
+// The refusal is narrower than PATCH's on both axes, and both are pinned below
+// rather than described: AGENT ACTORS ONLY, and ONLY WHEN THE VALUE MOVES.
+describe("POST /api/agents/:id/config-revisions/:revisionId/rollback — budget mirror (PEN-6225)", () => {
+  /** Revision whose adapterConfig matches the stored row, so only the budget moves. */
+  function reviseToBudget(budgetMonthlyCents: unknown) {
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: REVISION_ID,
+      agentId: AGENT_ID,
+      afterConfig: {
+        adapterConfig: { enableGitHubPublishBroker: true, model: "stored-model" },
+        budgetMonthlyCents,
+      },
+    });
+  }
+
+  it("refuses an agent rolling back to a revision carrying a different cap", async () => {
+    reviseToBudget(9_900_000);
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("/api/agents/:agentId/budgets");
+    expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+  });
+
+  // The direction is not the interesting part — the mirror desyncs either way,
+  // and a cap the agent LOWERS still disagrees with the policy that binds it.
+  it("refuses a LOWER cap too, not only a raise", async () => {
+    reviseToBudget(1);
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(422);
+    expect(mockAgentService.rollbackConfigRevision).not.toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM, and the one that keeps this from being a blanket refusal of
+  // every rollback by an agent whose history predates its current cap.
+  it("allows an agent rolling back a revision that carries the CURRENT cap", async () => {
+    reviseToBudget(1_300_000);
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM: a revision that names no budget at all — the shape every
+  // other rollback test in this file uses — is untouched.
+  it("allows a rollback whose snapshot carries no budget key", async () => {
+    mockAgentService.getConfigRevision.mockResolvedValue({
+      id: REVISION_ID,
+      agentId: AGENT_ID,
+      afterConfig: { adapterConfig: { enableGitHubPublishBroker: true, model: "stored-model" } },
+    });
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM: the comparison is taken AFTER `configPatchFromSnapshot`'s
+  // own `Math.max(0, Math.floor(...))`, so a snapshot that differs only where
+  // the normalizer erases the difference is not refused for a write the
+  // rollback would never have made.
+  it("allows a fractional snapshot value that normalizes to the current cap", async () => {
+    reviseToBudget(1_300_000.7);
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM: board rollback is untouched. PATCH's budget guard is
+  // actor-blind; this one is not, deliberately — a board actor can reach the
+  // budgets route, and refusing here would regress a path boards use to undo a
+  // bad config while buying nothing.
+  it("allows a BOARD actor to roll back across a different cap", async () => {
+    reviseToBudget(9_900_000);
+    const app = await createApp(boardActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalled();
+  });
+
+  // Pins the documented FALL-THROUGH, which is a refusal this guard
+  // deliberately does not make: a non-numeric snapshot value is refused by
+  // `configPatchFromSnapshot` (`Invalid revision snapshot: budgetMonthlyCents`)
+  // before any write lands, so answering it here with a budgets-route message
+  // would misattribute it. `rollbackConfigRevision` is mocked, so reaching it
+  // is exactly the assertion — the real service throws one layer further in.
+  it("does not answer a non-numeric snapshot budget with the budgets-route 422", async () => {
+    reviseToBudget("9900000");
+    const app = await createApp(selfAgentActor());
+    const res = await rollback(app);
+
+    expect(res.status).toBe(200);
+    expect(mockAgentService.rollbackConfigRevision).toHaveBeenCalled();
+  });
+});
+
 describe("POST /api/companies/:companyId/agent-hires — agent-authored (PEN-6201)", () => {
   const BASE_HIRE = {
     name: "Hired",
