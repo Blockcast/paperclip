@@ -3074,3 +3074,188 @@ describe("stage discharge on terminal status", () => {
     expect(reopened.executionState).toBeNull();
   });
 });
+
+// PEN-6202 — a monitor that has already FIRED must be cleared by the same
+// eligibility pass that clears an armed one.
+//
+// `buildIssueMonitorEligibilityPatch` used to open `if (!issue.monitorNextCheckAt)
+// return {}`, deferring the fired case to BLO-25865 as "a different defect". It
+// is a different defect, and BLO-25865's net cannot reach the rows this pass
+// creates: `tickExpiredIssueMonitors` is the only thing that clears a fired
+// monitor and its outer `where` carries
+// `status in ('in_progress','in_review') and assignee_user_id is null` — exactly
+// the eligibility the row has just lost. The two nets handed the case to each
+// other and the demotion fell between them.
+//
+// Census over all 5615 company rows, 2026-11-08: 19 non-terminal rows held a
+// permanently unclearable `triggered` monitor, 3 of them for 91-106 days, each
+// watching a pull request that had already merged.
+describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", () => {
+  const triggeredState = (overrides: Record<string, unknown> = {}) =>
+    ({
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor: {
+        status: "triggered",
+        nextCheckAt: null,
+        lastTriggeredAt: "2026-07-25T00:22:27.000Z",
+        attemptCount: 23,
+        notes: "#824 remains open and mergeable at head 013b86d5",
+        scheduledBy: "assignee",
+        clearedAt: null,
+        clearReason: null,
+        ...overrides,
+      },
+    }) as unknown as IssueExecutionState;
+
+  // A fired monitor, exactly as `buildIssueMonitorTriggeredPatch` leaves it:
+  // `nextCheckAt` consumed, the trigger recorded in both the JSON and the
+  // columns, and `monitor` stripped out of `executionPolicy`.
+  const fired = {
+    assigneeAgentId: coderAgentId,
+    assigneeUserId: null,
+    executionPolicy: null,
+    executionState: triggeredState(),
+    monitorNextCheckAt: null,
+    monitorLastTriggeredAt: new Date("2026-07-25T00:22:27.000Z"),
+    monitorAttemptCount: 23,
+    monitorNotes: "#824 remains open and mergeable at head 013b86d5",
+    monitorScheduledBy: "assignee",
+  };
+
+  const monitorOf = (patch: Record<string, unknown>) =>
+    (patch.executionState as { monitor?: Record<string, unknown> }).monitor!;
+
+  // PEN-1706 and PEN-2128: promoted on checkout, monitor armed, monitor fires,
+  // the run ends and checkout release restores the row to `todo`. Both sat at
+  // 106 and 91 days with `attemptCount` frozen.
+  it("clears when a checkout release demotes the row out of the dispatch window", () => {
+    const patch = buildIssueMonitorEligibilityPatch({ ...fired, status: "todo" });
+    const patchNotes = patch.monitorNotes;
+    const monitor = monitorOf(patch);
+
+    expect(monitor).toMatchObject({ status: "cleared", clearReason: "invalid_status" });
+    // The stale note is the thing a reader was being misled by — #824 had in
+    // fact merged seven minutes BEFORE that note was written, and it then sat
+    // on the row for 106 days reading as live work. Both copies go: the live
+    // column, and the archive, because `clearedMonitorKeepsNotes` keeps notes
+    // only for `cancelled` (PEN-5902). The durable record is the
+    // `issue.monitor_cleared` activity entry.
+    expect(patchNotes).toBeNull();
+    expect(monitor.notes).toBeNull();
+    // What a later reader DOES keep is the evidence the monitor ever fired,
+    // which is what makes a stranded row diagnosable after the fact.
+    expect(monitor).toMatchObject({ lastTriggeredAt: "2026-07-25T00:22:27.000Z", attemptCount: 23 });
+  });
+
+  it("clears on `blocked` too, not just `todo`", () => {
+    expect(monitorOf(buildIssueMonitorEligibilityPatch({ ...fired, status: "blocked" })))
+      .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
+  });
+
+  // PEN-2077, and the reason this fix belongs in the shared pass rather than in
+  // the restore: the clearing net also requires `assignee_user_id is null`, so a
+  // monitor that outlives its agent assignee strands on a status the net WOULD
+  // have admitted. That row was `in_review` and human-held — inside the status
+  // window, outside every agent intake surface, dark for 91 days.
+  it("clears when the row passes to a human assignee, on a status the net allows", () => {
+    expect(
+      monitorOf(
+        buildIssueMonitorEligibilityPatch({
+          ...fired,
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: ctoUserId,
+        }),
+      ),
+    ).toMatchObject({ status: "cleared", clearReason: "invalid_assignee" });
+  });
+
+  // The discrimination that keeps BLO-35155 intact. A fired monitor on a row
+  // that is STILL eligible is the normal in-flight case: the woken run may be
+  // sitting in the dispatch queue, and `tickExpiredIssueMonitors` deliberately
+  // waits out a grace window before reaping it. This pass must not pre-empt
+  // that — it fires at the instant the row leaves eligibility, never before.
+  it("leaves a fired monitor alone while the row can still be dispatched", () => {
+    expect(buildIssueMonitorEligibilityPatch({ ...fired, status: "in_progress" })).toEqual({});
+    expect(buildIssueMonitorEligibilityPatch({ ...fired, status: "in_review" })).toEqual({});
+  });
+
+  // Idempotence, and the falsification guard. `clearReason` is provenance — it
+  // is what tells a later reader whether the scheduler retired this monitor or
+  // an assignee stopped it — so a second pass over an already-cleared monitor
+  // must not overwrite it with this pass's reason.
+  it("does not rewrite a monitor that is already cleared", () => {
+    const alreadyCleared = {
+      ...fired,
+      status: "todo",
+      executionState: triggeredState({
+        status: "cleared",
+        clearedAt: "2026-07-26T00:00:00.000Z",
+        clearReason: "max_attempts_exhausted",
+      }),
+    };
+
+    expect(buildIssueMonitorEligibilityPatch(alreadyCleared)).toEqual({});
+
+    // And the clear this pass produces is itself a fixed point.
+    const cleared = buildIssueMonitorEligibilityPatch({ ...fired, status: "todo" });
+    expect(
+      buildIssueMonitorEligibilityPatch({
+        ...fired,
+        status: "todo",
+        executionState: cleared.executionState as IssueExecutionState,
+        monitorNotes: null,
+      }),
+    ).toEqual({});
+  });
+
+  // A row whose trigger survives only in the columns — no `executionState.monitor`
+  // to read. `derivePersistedMonitorState` reaches `triggered` through
+  // `monitorAttemptCount`/`monitorLastTriggeredAt`, and this is why the restore's
+  // compare-and-swap guards on `is distinct from 'cleared'` rather than
+  // `= 'triggered'`: keyed on the JSON alone, these rows would skip their own CAS.
+  it("clears a legacy row whose trigger is recorded only in the columns", () => {
+    expect(
+      monitorOf(
+        buildIssueMonitorEligibilityPatch({
+          status: "todo",
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: null,
+          monitorNextCheckAt: null,
+          monitorLastTriggeredAt: new Date("2026-08-09T13:22:20.000Z"),
+          monitorAttemptCount: 4,
+        }),
+      ),
+    ).toMatchObject({ status: "cleared", clearReason: "invalid_status" });
+  });
+
+  // The no-op floor: widening the guard must not start producing patches for
+  // rows that never held a monitor, at any of the nine call sites that spread
+  // this unconditionally.
+  it("still produces nothing for a row that never armed a monitor", () => {
+    for (const status of ["todo", "blocked", "done", "cancelled", "in_progress"]) {
+      expect(
+        buildIssueMonitorEligibilityPatch({
+          status,
+          assigneeAgentId: coderAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: null,
+          monitorNextCheckAt: null,
+          monitorAttemptCount: 0,
+        }),
+      ).toEqual({});
+    }
+  });
+});
