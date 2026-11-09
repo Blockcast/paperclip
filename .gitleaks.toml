@@ -1,0 +1,121 @@
+# gitleaks configuration for Blockcast/paperclip.
+#
+# Read by .github/workflows/pr.yml's `secret_scan` lane, which is one of the
+# lanes the required `verify` aggregate decides from. PEN-6245, under the
+# PEN-6170 item-1 ruling.
+#
+# ===========================================================================
+# POLICY -- NO REAL SECRET IS EVER ALLOWLISTED HERE. DOCUMENTED FALSE
+# POSITIVES ONLY.
+# ===========================================================================
+#
+# gitleaks resolves this file from the WORKING TREE, not from the commits it
+# scans. That is deliberate upstream behaviour and it has two consequences
+# that pull in opposite directions:
+#
+#   The affordable one -- a PR that trips a false positive adds a documented
+#   entry HERE, in that same PR, and goes green. No second unblocking PR, no
+#   admin in the loop. That is why this gate could land blocking on day one.
+#
+#   The dangerous one -- THE PR THAT TRIPS THE SCANNER CAN SILENCE IT.
+#   Nothing in the tool closes this. The policy above is enforceable ONLY by
+#   review of this file's diff. If a PR adds an entry below, that entry IS the
+#   change under review: the author must say in the PR body what the matched
+#   value actually is and why it is not a credential, and the reviewer must
+#   read it as a security change rather than as CI housekeeping.
+#
+# Mechanism measured by @Devops on Blockcast/onprem-k8s#8493 (2026-11-08,
+# three arms with a revert control: exit 2 as committed, exit 0 with an
+# allowlist path added in the working tree alone, exit 2 again once reverted).
+# The consequence for THIS repo was not re-measured; the mechanism is a
+# property of gitleaks, not of either repo.
+#
+# ===========================================================================
+# WHAT THIS GATE SEES, AND WHAT IT DOES NOT -- measured, not assumed
+# ===========================================================================
+#
+# ⛔ IT DOES NOT CLOSE PEN-6170, AND NOTHING SHOULD BE WRITTEN AS THOUGH IT
+# DOES. Measured first-party against this exact config (PEN-6245, 2026-11-09)
+# and previously against bare defaults and both sibling repos' configs in six
+# combinations (PEN-6170, 2026-11-08): gitleaks 8.28.0 MISSES an opaque,
+# non-vendor-prefixed value bound to an unremarkable name --
+#   const signingMaterial = "<32 opaque chars>";   MISS
+#   signingMaterial: "<32 opaque chars>"           MISS
+#   seed-value: "<32 opaque chars>"  (k8s stringData)   MISS
+#   nonce = "<32 opaque chars>"                    MISS
+# while the same value under a keyword-bearing name HITS. The cause is read at
+# source: `generic-api-key` in gitleaks' own config/gitleaks.toml requires one
+# of access|auth|api|credential|creds|key|passwd|password|secret|token within
+# ~50 characters of the binding. That is the SAME keyword family this repo's
+# own .github/scripts/check-pr-security.mjs is anchored on, so the two
+# controls share this blind spot verbatim rather than covering for each other.
+#
+# ✅ What it DOES buy, which the push-time egress scanner does not have:
+# gitleaks is operator- and spacing-insensitive. It matches a SPACED `=`
+# (PEN-6162) and a `:` binding including YAML/JSON and Kubernetes Secret
+# `stringData` (PEN-6167) -- the two measured blind spots of the push door --
+# for any secret whose NAME carries a keyword.
+#
+# ⚠️ It is a CONTAINMENT control, not prevention. By the time it runs, the
+# commit is already pushed to a remote branch on GitHub. If a finding is real,
+# ROTATE THE CREDENTIAL FIRST; rewriting or dropping the commit does not
+# un-disclose it.
+#
+# ===========================================================================
+# WHY THERE ARE NO ALLOWLIST ENTRIES BELOW, AND WHY THERE IS NO BASELINE FILE
+# ===========================================================================
+#
+# The lane is DIFF-AWARE: it scans the PR's own commit range, never the whole
+# tree. Measured first-party at master 556fd2c0 on 2026-11-09, this exact
+# config, pinned gitleaks 8.28.0, over the 250 most recent master commit
+# ranges (`<sha>^..<sha>`, --diff-merges=remerge):
+#
+#     250 ranges scanned, 0 fired, 0 errors, ~2.1 s per scan
+#
+# So this gate inherits NO remediation backlog and needed no allowlist sweep
+# before landing. A `--baseline-path` file would be an un-reviewed list of
+# accepted findings -- a believed control -- and since nothing here ever scans
+# whole-tree, none is needed. Do not add one.
+#
+# POSITIVE CONTROL, because `0 of 250` and a mute instrument are
+# byte-identical. The SAME binary, config and invocation, pointed at three
+# commits that demonstrably introduced a matching line, exits 2 every time
+# (measured 2026-11-09):
+#     c4af9273  fix(redaction): mask five vendor credential shapes   -> exit 2, 2 findings
+#     3fc061c2  security(egress): scrub credential-shaped material   -> exit 2, 5 findings
+#     ea1d2267  feat(plugin-sdk): plugin runtime hardening           -> exit 2, 2 findings
+# Re-run one of these before trusting a future zero. Note what the control has
+# to be: a commit that introduced a MATCHING LINE, not merely one that touched
+# a file which now carries findings -- 28 recent commits touching
+# finding-bearing files all exit 0, correctly.
+#
+# ⛔ THE ZERO ABOVE IS A PROPERTY OF THE DIFF-AWARE POPULATION AND SAYS
+# NOTHING ABOUT THE TREE. A whole-tree `gitleaks detect --no-git --redact
+# --source .` at 556fd2c0 returns 74 findings -- 68 in test fixtures and 6
+# elsewhere, and ZERO credentials. The six non-fixture ones, each read and
+# classified by hand: a secret_ref UUID in docs/deploy/secrets.md, two revoked
+# token UUIDs in a 2026-05 doc log, a regex literal matching a PEM header in
+# the exe-dev sandbox plugin, a deliberately wrong `Bearer wrong-smoke-key` in
+# a negative smoke assertion, and a shell variable block in
+# scripts/gh-token-wrapper.sh. None of them reach this gate, because this gate
+# never scans the tree. Reported so the 0 is never read as "the tree is
+# clean"; NOT triaged and NOT gated on.
+#
+# ===========================================================================
+# IF YOU ADD AN ENTRY BELOW
+# ===========================================================================
+#
+# Prefer `paths` scoped as narrowly as the false positive actually is, and
+# prefer a `[[rules.allowlist]]` on the one rule that fired over a global one.
+# Each entry needs a comment saying, in this order: which rule fired, what the
+# matched value really is, and why it is not a credential. An entry without
+# that comment is not reviewable and should be refused in review.
+
+title = "Blockcast/paperclip"
+
+[extend]
+# Upstream's rule set, unmodified. Nothing in this file disables, loosens or
+# re-scopes a default rule -- the sections above are the whole of the local
+# policy, and the measurement that justifies landing with no allowlist is the
+# 0-of-250 diff-aware reading, not a judgement that the defaults are noisy.
+useDefault = true

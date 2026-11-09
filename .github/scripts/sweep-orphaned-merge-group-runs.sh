@@ -77,6 +77,7 @@ GATING_JOBS=(
   "Build"
   "Vendored claude_k8s adapter"
   "Vendored opencode_k8s adapter"
+  "Secret scan"
   "policy"
   "ally-verdict"
 )
