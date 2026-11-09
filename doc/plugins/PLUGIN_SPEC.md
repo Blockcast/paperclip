@@ -929,7 +929,7 @@ Minimum event set:
 - `cost_event.created`
 - `activity.logged`
 
-`agent.run.started` is emitted once per run, when the run is first claimed. A run that is deferred back to the queue (for example behind a Kubernetes isolation writer or a branch claim) and claimed again does not emit it a second time.
+`agent.run.started` is emitted once per run, when the run is first claimed from the queue. It is not emitted again when a run that was deferred back to the queue (for example behind a Kubernetes isolation writer or a branch claim) is claimed again, or when a later status write touches a run that is already running. The started event's `startedAt` is the time of that first claim. A deferral clears the run's `startedAt` and the next claim stamps a new one, so the `startedAt` on `agent.run.finished`, `agent.run.failed` and `agent.run.cancelled` is the start of the run's last claim: it can be later than the started event's, and it is `null` for a run cancelled while back in the queue. Read the terminal event's `startedAt`/`finishedAt` as the run's execution window. A redelivered event keeps its event id, but the host can also publish a run's terminal event again under a new event id (for example when a liveness check revisits a finished run), so dedupe run lifecycle events on the run id and event type.
 
 Each event must include:
 

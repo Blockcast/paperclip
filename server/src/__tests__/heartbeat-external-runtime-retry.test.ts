@@ -20,7 +20,7 @@ import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
 } from "@paperclipai/adapter-utils";
-import { heartbeatService } from "../services/heartbeat.js";
+import { coalescedContextSnapshotSql, heartbeatService } from "../services/heartbeat.js";
 import { logger } from "../middleware/logger.js";
 import { resetPluginEventOutboxDbForTests, setPluginEventOutboxDb } from "../services/activity-log.js";
 import {
@@ -1100,6 +1100,81 @@ describeEmbeddedPostgres("heartbeat external-runtime retry ownership", () => {
     expect(contender.queuedAt).not.toBeNull();
     expect(contender.queuedAt!.getTime()).toBeGreaterThanOrEqual(contender.createdAt.getTime());
   }, 120_000);
+
+  it("keeps a run's own started marker when a coalesce writes a snapshot read before a defer (BLO-55110)", async () => {
+    // A coalesce rebuilds the snapshot from a copy it read earlier. If a defer
+    // stamped the marker in between, that copy lacks it; the write must keep
+    // the live row's marker or the re-claim announces agent.run.started again.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const markedRunId = randomUUID();
+    const unmarkedRunId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Coalesce Marker Co",
+      issuePrefix: "CMK",
+      requireBoardApprovalForNewAgents: false,
+      defaultResponsibleUserId: "responsible-user",
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Coalesce Marker Agent",
+      role: "engineer",
+      status: "idle",
+      adapterType: "claude_k8s",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values([
+      {
+        id: markedRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId, paperclipRunStartedAnnouncedRunId: markedRunId },
+      },
+      {
+        id: unmarkedRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "queued",
+        contextSnapshot: { issueId },
+      },
+    ]);
+
+    for (const runId of [markedRunId, unmarkedRunId]) {
+      await db
+        .update(heartbeatRuns)
+        .set({ contextSnapshot: coalescedContextSnapshotSql({ issueId, wakeReason: "issue_commented" }) })
+        .where(eq(heartbeatRuns.id, runId));
+    }
+
+    const snapshotOf = async (runId: string) =>
+      (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0]))
+        .contextSnapshot;
+    expect(await snapshotOf(markedRunId)).toEqual({
+      issueId,
+      wakeReason: "issue_commented",
+      paperclipRunStartedAnnouncedRunId: markedRunId,
+    });
+    expect(await snapshotOf(unmarkedRunId)).toEqual({ issueId, wakeReason: "issue_commented" });
+  });
+
+  it("writes every coalesced snapshot through coalescedContextSnapshotSql (BLO-55110)", async () => {
+    // The race the helper closes cannot be interleaved deterministically here,
+    // so guard the call sites: a coalesce that writes its JS merge directly
+    // can erase a defer's started marker again.
+    const source = await fs.readFile(new URL("../services/heartbeat.ts", import.meta.url), "utf8");
+    expect(source).not.toMatch(/contextSnapshot:\s*mergedContextSnapshot\b/);
+    expect(source).toContain("contextSnapshot: coalescedContextSnapshotSql(mergedContextSnapshot)");
+  });
 
   // BLO-16269: `createNamespacedJob` happens inside the bundled k8s adapter
   // (outside this repo) and can land in-cluster even after the reservation
