@@ -3193,6 +3193,55 @@ const AGENT_SCOPE_ONLY_CONFIG_KEYS = new Set([
   // Agent scope is unaffected, which is where the rollout actually happens —
   // this pin stops a LOWER scope reaching the key, in either direction.
   "enablePerAgentWorkspaceVolume",
+  // PEN-6247. Decides the Job pod's KUBERNETES IDENTITY.
+  // `resolveServiceAccountName` (job-manifest.ts) takes this value verbatim —
+  // no allowlist, no pattern — and `buildJobManifest` puts it on the pod spec,
+  // so it answers `what uid runs it` in the strongest available sense: not a
+  // uid inside the pod, but which principal the apiserver believes the pod is.
+  //
+  // What makes it belong in the UNCONDITIONAL set rather than the
+  // broker-conditional one below: it decides the pod's identity on EVERY run,
+  // brokered or not. Nothing about the hazard involves the broker.
+  //
+  // ⚠ THE CONTAINMENT IS A PROPERTY OF THE VALUE BEING OVERRIDDEN, which is
+  // why this is pinned rather than documented. The adapter sets
+  // `automountServiceAccountToken` NOWHERE, so the pod inherits it from the
+  // ServiceAccount object this key NAMES. Agent SAs carry
+  // `automountServiceAccountToken: false` (label
+  // `security.paperclip.dev/rbac: unbound`) and measurably mount no
+  // `kube-api-access-*` volume at all. Sibling SAs in the same namespace —
+  // `paperclip-ci-deploy`, `paperclip-k8s-mcp-admin` — set no such field, so it
+  // defaults to TRUE, and the first holds three ClusterRoleBindings. Naming one
+  // of those does not merely relabel the pod; it mounts a cluster-RBAC token at
+  // /var/run/secrets/kubernetes.io/serviceaccount/token. Overriding the value
+  // discards the containment in the same stroke, and no second layer notices:
+  // of the namespace's 47 ServiceAccounts exactly two are protected by a
+  // `*-serviceaccount-use` ValidatingAdmissionPolicy, each keyed on one literal
+  // SA name, and neither matches an agent-job pod.
+  //
+  // ⚠ CROSS-SEAT, unlike the `allow_self` route PEN-6188 closes, and this is
+  // the half that sets the severity. Measured 2026-11-09 (PEN-6274): this seat
+  // created an issue ASSIGNED TO ANOTHER AGENT carrying an arbitrary
+  // `assigneeAdapterOverrides.adapterConfig` key, and it persisted. The
+  // `assigneeAgentId === agent.id` gate on the overlay decides WHICH AGENT THE
+  // OVERLAY APPLIES TO, never WHO MAY WRITE IT — so any actor able to file an
+  // issue chooses the pod identity of the seat it is filed against. That is
+  // why `AGENT_SCOPE_ONLY_CONFIG_KEYS` (taken against the issue overlay) is
+  // load-bearing here independently of the route guard.
+  //
+  // ⚠ Blast radius is NOT nominal, unlike the keys above: an issue overlay can
+  // no longer set `serviceAccountName` for ANY run, brokered or not. Measured
+  // before landing — see the PR — zero live rows carry the key in an overlay,
+  // so the capability being removed is unused. Agent and environment scope are
+  // untouched, which is where a per-agent SA is actually configured.
+  //
+  // ⚠ This is the tourniquet, not the boundary. It constrains paperclip's own
+  // write and merge paths and binds no other creator of pods in that namespace,
+  // and it leaves the containment resting on a property of the named value. The
+  // durable fix is an operator-controlled allowlist consulted by
+  // `resolveServiceAccountName`, or a ValidatingAdmissionPolicy over
+  // `app.kubernetes.io/component: agent-job` pods — PEN-6248.
+  "serviceAccountName",
 ]);
 
 // PEN-5017, added in review. Keys pinned to agent scope ONLY WHEN the broker
