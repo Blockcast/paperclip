@@ -77,7 +77,7 @@ describeEmbeddedPostgres("heartbeat-run overdue scheduled-retry index migration"
     await applyPendingMigrations(database.connectionString);
 
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 
   it("rejects an invalid precreated index with repair instructions", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-overdue-retry-invalid-");
@@ -103,7 +103,7 @@ describeEmbeddedPostgres("heartbeat-run overdue scheduled-retry index migration"
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 
   it("rejects a same-name index that is missing the scheduled_retry_at column", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-overdue-retry-wrong-");
@@ -130,5 +130,5 @@ describeEmbeddedPostgres("heartbeat-run overdue scheduled-retry index migration"
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 });

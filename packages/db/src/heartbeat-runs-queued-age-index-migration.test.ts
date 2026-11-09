@@ -73,7 +73,7 @@ describeEmbeddedPostgres("heartbeat-run queued-age index migration", () => {
     expect(indexes).toHaveLength(1);
     expect(indexes[0]?.indexdef).toContain("COALESCE(queued_at, created_at)");
     expect(indexes[0]?.indexdef).toContain("WHERE (status = 'queued'::text)");
-  }, 60_000);
+  }, 120_000);
 
   it("rejects an invalid same-name precreated index", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-queued-age-invalid-");
@@ -96,5 +96,5 @@ describeEmbeddedPostgres("heartbeat-run queued-age index migration", () => {
       message: "migration 0217 found an invalid or incorrectly defined queued-age index",
       hint: expect.stringContaining(`DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME}`),
     });
-  }, 60_000);
+  }, 120_000);
 });

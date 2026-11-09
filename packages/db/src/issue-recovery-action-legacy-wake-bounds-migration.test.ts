@@ -196,5 +196,5 @@ describeEmbeddedPostgres("issue recovery action legacy wake bounds migration", (
     expect(boundedReplayed.updated_at.toISOString()).toBe(
       boundedAfter.updated_at.toISOString(),
     );
-  }, 90_000);
+  }, 120_000);
 });

@@ -34,7 +34,33 @@ export default defineConfig({
     // either changes nothing measurable now — which is exactly why the next
     // suite that forgets its own `}, 60_000)` would land on Vitest's bare 5s
     // test / 10s hook defaults instead. That inheritance is the whole value.
-    testTimeout: 60_000,
+    //
+    // 2026-11-09 (PEN-6254): that "not measured" caveat has now been paid.
+    // `cost-events-company-issue-index-migration.test.ts` timed out at 60 s on
+    // merge_group run 42548209136 and evicted #3530 from the queue — a suite
+    // that is unchanged on master since 2026-10-20 and that passed on the same
+    // head 19 h earlier. So `testTimeout` is raised 60 s -> 120 s here, and the
+    // reason is STRUCTURAL rather than a margin nudge:
+    //
+    //   WHERE a package boots embedded Postgres decides WHICH budget has to
+    //   cover the ~40 s ARC-contended startup that BLO-17026 measured.
+    //
+    // Counted 2026-11-09 over every `it`/hook body that reaches
+    // `startEmbeddedPostgresTestDatabase`, directly or through a file-local
+    // wrapper: server boots in a HOOK 315 times against 41 bodies, so its 120 s
+    // `hookTimeout` carries the startup and its 60 s `testTimeout` is correct.
+    // This package is the mirror image — 133 BODIES against 2 hooks — so here
+    // the startup lands inside `testTimeout`, and 60 s left ~20 s for the rest
+    // of the body. `cli` reached 120 s for exactly this reason (its own comment
+    // records "embedded-postgres startup + reseed can take ~40s under load —
+    // well past the previous 60s ceiling"); this package copied server's pair
+    // without copying server's shape.
+    //
+    // This is NOT a hang detector and must not be tuned as one. pr.yml's job
+    // `timeout-minutes` is the hang detector (BLO-35615); a per-test budget's
+    // only job is to exceed the fixed setup cost it contains, so that a red
+    // here means the code is wrong rather than the pool is busy.
+    testTimeout: 120_000,
     hookTimeout: 120_000,
   },
 });

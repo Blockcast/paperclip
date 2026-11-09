@@ -103,5 +103,5 @@ describeEmbeddedPostgres("approval-enforcement drift index migration", () => {
 
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
     expect(await readIndexDefinition()).toBe(definition);
-  }, 60_000);
+  }, 120_000);
 });

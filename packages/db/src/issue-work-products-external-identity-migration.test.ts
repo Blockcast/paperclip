@@ -203,6 +203,6 @@ describeEmbeddedPostgres("issue work products external identity migration", () =
       const finalState = await inspectMigrations(connectionString);
       expect(finalState.status).toBe("upToDate");
     },
-    60_000,
+    120_000,
   );
 });

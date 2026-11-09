@@ -87,7 +87,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
       select indisvalid from pg_index where indexrelid = to_regclass(${`public.${INDEX_NAME}`})
     `;
     expect(indisvalid).toBe(true);
-  }, 60_000);
+  }, 120_000);
 
   it("is a no-op when the index is already present and valid", async () => {
     const { database, sql } = await seedPopulatedDatabaseWithoutIndex();
@@ -105,7 +105,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
         action: "already-valid",
       },
     ]);
-  }, 60_000);
+  }, 120_000);
 
   it("drops and rebuilds an invalid leftover from a failed online build", async () => {
     const { database, sql } = await seedPopulatedDatabaseWithoutIndex();
@@ -131,7 +131,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
       select indisvalid from pg_index where indexrelid = to_regclass(${`public.${INDEX_NAME}`})
     `;
     expect(indisvalid).toBe(true);
-  }, 60_000);
+  }, 120_000);
 
   it("throws — rather than reporting success — when the online build does not leave a valid index", async () => {
     const { database } = await seedPopulatedDatabaseWithoutIndex();
@@ -148,7 +148,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     await expect(
       ensurePendingConcurrentIndexes(database.connectionString, { specs: [brokenSpec] }),
     ).rejects.toThrow();
-  }, 60_000);
+  }, 120_000);
 
   it("throws instead of silently trusting a same-named index with a different definition (BLO-21526 review)", async () => {
     const { database, sql } = await seedPopulatedDatabaseWithoutIndex();
@@ -176,7 +176,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
       select indexdef from pg_indexes where indexname = ${INDEX_NAME}
     `;
     expect(indexdef).toContain("(id, finished_at)");
-  }, 60_000);
+  }, 120_000);
 
   it("serializes concurrent callers with a session-scoped advisory lock (BLO-21526 review)", async () => {
     const { database } = await seedPopulatedDatabaseWithoutIndex();
@@ -215,7 +215,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
       table: "heartbeat_runs",
       action: "created",
     }]);
-  }, 60_000);
+  }, 120_000);
 
   it("surfaces the build failure rather than a cleanup failure, and still closes the pool (BLO-34039)", async () => {
     const { database } = await seedPopulatedDatabaseWithoutIndex();
@@ -274,7 +274,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
       if (!locked) await new Promise((resolve) => setTimeout(resolve, 100));
     }
     expect(locked).toBe(true);
-  }, 60_000);
+  }, 120_000);
 
   // PEN-3596 / 0269: the first GIN entry in the registry needs `btree_gin`
   // before its create statement will even parse. Without `requiredExtensions`
@@ -303,7 +303,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
       select to_regclass(${`public.${INDEX_NAME}`})::text as present
     `;
     expect(present).toBeNull();
-  }, 60_000);
+  }, 120_000);
 
   it("throws on a missing required extension when skipUnavailable is not set", async () => {
     const { database } = await seedPopulatedDatabaseWithoutIndex();
@@ -318,7 +318,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     await expect(
       ensurePendingConcurrentIndexes(database.connectionString, { specs: [spec] }),
     ).rejects.toThrow(/required extensions are missing: an_extension_that_does_not_exist/);
-  }, 60_000);
+  }, 120_000);
 
   it("builds normally when the required extensions are present", async () => {
     const { database } = await seedPopulatedDatabaseWithoutIndex();
@@ -334,7 +334,7 @@ describeEmbeddedPostgres("ensurePendingConcurrentIndexes", () => {
     });
 
     expect(results.map((result) => result.action)).toEqual(["created"]);
-  }, 60_000);
+  }, 120_000);
   // PEN-3596 / 0269 review: the operator class is the ONE axis on which a
   // plausible hand-typed mistake -- `gin (company_id, body)`, btree_gin's
   // default `text_ops`, instead of `gin (company_id, body gin_trgm_ops)` --

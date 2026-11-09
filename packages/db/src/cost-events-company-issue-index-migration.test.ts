@@ -91,7 +91,7 @@ describeEmbeddedPostgres("cost_events company/issue index migration", () => {
       message: "migration 0261 found an invalid or incorrectly defined cost_events_company_issue_idx",
       hint: expect.stringContaining(`DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME}`),
     });
-  }, 60_000);
+  }, 120_000);
 
   it.each(["force_custom_plan", "force_generic_plan"])(
     "serves the per-issue rollup from the index under %s",
@@ -110,6 +110,6 @@ describeEmbeddedPostgres("cost_events company/issue index migration", () => {
       const plan = JSON.stringify(rows[0]["QUERY PLAN"]);
       expect(plan).toContain(INDEX_NAME);
     },
-    60_000,
+    120_000,
   );
 });

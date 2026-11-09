@@ -314,5 +314,5 @@ describeEmbeddedPostgres("heartbeat timeout outcome repair migration", () => {
       error: "Timed out after 300s",
     });
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 });

@@ -84,7 +84,7 @@ describeEmbeddedPostgres("heartbeat-run queued dispatch index migration", () => 
     expect(indexes).toHaveLength(1);
     expect(indexes[0]?.indexdef).toContain("btree (agent_id, created_at, id)");
     expect(indexes[0]?.indexdef).toContain("WHERE (status = 'queued'::text)");
-  }, 60_000);
+  }, 120_000);
 
   it("rejects a same-name index that drops the id tiebreak", async () => {
     // `(agent_id, created_at)` is the plausible mistake: it looks equivalent,
@@ -112,7 +112,7 @@ describeEmbeddedPostgres("heartbeat-run queued dispatch index migration", () => 
       message: "migration 0237 found an invalid or incorrectly defined queued dispatch index",
       hint: expect.stringContaining(`DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME}`),
     });
-  }, 60_000);
+  }, 120_000);
 
   it("rejects a same-name index whose predicate is wider than the dispatch filter", async () => {
     // `status IN ('queued', 'scheduled_retry')` is 0208's predicate, and an
@@ -141,5 +141,5 @@ describeEmbeddedPostgres("heartbeat-run queued dispatch index migration", () => 
       message: "migration 0237 found an invalid or incorrectly defined queued dispatch index",
       hint: expect.stringContaining(`DROP INDEX CONCURRENTLY IF EXISTS ${INDEX_NAME}`),
     });
-  }, 60_000);
+  }, 120_000);
 });

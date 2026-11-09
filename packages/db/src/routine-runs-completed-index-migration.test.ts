@@ -56,7 +56,7 @@ describeEmbeddedPostgres("routine_runs completed partial index (migration 0254)"
     expect(indexes).toHaveLength(1);
     expect(indexes[0]?.indexdef).toContain("ON public.routine_runs USING btree (routine_id, completed_at)");
     expect(indexes[0]?.indexdef).toContain("WHERE (status = 'completed'::text)");
-  }, 60_000);
+  }, 120_000);
 
   it("answers the gauge's per-routine max(completed_at) probe from the index, not a table scan", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-routine-runs-completed-plan-");

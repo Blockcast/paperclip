@@ -88,7 +88,7 @@ describeEmbeddedPostgres("ensureOnlineIndexPrerequisites", () => {
 
     await applyPendingMigrations(database.connectionString);
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 
   it("precreates a pending migration's index on a populated table so the migration no longer crash-loops", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-precreate-online-index-");
@@ -127,7 +127,7 @@ describeEmbeddedPostgres("ensureOnlineIndexPrerequisites", () => {
     // does automatically).
     await applyPendingMigrations(database.connectionString);
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 
   it("is a no-op when the index already exists and is valid", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-precreate-online-index-noop-");
@@ -155,7 +155,7 @@ describeEmbeddedPostgres("ensureOnlineIndexPrerequisites", () => {
 
     await applyPendingMigrations(database.connectionString);
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 
   it("self-heals an INVALID leftover index from a previously-interrupted CONCURRENTLY build", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-precreate-online-index-invalid-");
@@ -193,7 +193,7 @@ describeEmbeddedPostgres("ensureOnlineIndexPrerequisites", () => {
 
     await applyPendingMigrations(database.connectionString);
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 
   it("touches nothing when no pending migration requires online index precreation", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-precreate-online-index-steady-state-");
@@ -205,7 +205,7 @@ describeEmbeddedPostgres("ensureOnlineIndexPrerequisites", () => {
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
     const results = await ensureOnlineIndexPrerequisites(database.connectionString);
     expect(results).toEqual([]);
-  }, 60_000);
+  }, 120_000);
 
   it("precreates every pending migration's index in one call for a multi-version upgrade jump", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-precreate-online-index-multi-");
@@ -239,5 +239,5 @@ describeEmbeddedPostgres("ensureOnlineIndexPrerequisites", () => {
 
     await applyPendingMigrations(database.connectionString);
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 });
