@@ -55,10 +55,51 @@
 #      A guard that fails to run must not look like a guard that ran and found
 #      nothing — that is the whole thesis of PEN-3281.
 #
-# ⚠️ WHEN PEN-5565 LANDS, FLIP THIS TO A HARD RED on `violatingPrs > 0`. The
-# reporter posture is justified ONLY by that defect being open and tracked. Left
-# in place afterwards it becomes the thing it was built to replace: an
-# instrument that watches a now-empty class and reports nothing either way.
+# ⚠️ WHEN PEN-5565 LANDS, FLIP THIS TO A HARD RED — BUT NOT ON `violatingPrs`,
+# AND NOT BEFORE THIS CENSUS IS RE-POINTED. The reporter posture is justified
+# ONLY by that defect being open and tracked; left in place afterwards it
+# becomes the thing it was built to replace, an instrument that watches a
+# now-empty class and reports nothing either way. That much is unchanged.
+#
+# What changed is the predicate. This header first said "a hard red on
+# `violatingPrs > 0`", and that flip would land on a detector the remedy itself
+# blinds. Read at source 2026-11-08/09 (PEN-5565; CTO, verified first-party by
+# DevOps), two independent blindnesses, either one sufficient:
+#
+#   a. This census reads the PR HEAD (`headRefOid`), never the commit that
+#      merged. For a REBASE merge queue the commit that lands is the queue head.
+#      Today that is harmless, because the gate writes its string at the PR head
+#      and scripts/mirror-comment-review-gate-to-merge-group.mjs copies that
+#      string verbatim onto the queue head. PEN-5565's remedy is "publish
+#      nothing at the PR head" — after which `findPrViolations` opens
+#      `if (status.state !== "success") continue` and admits nothing at all.
+#   b. `NOT_EVALUATED_DESCRIPTION_PATTERN` is keyed to GATE-owned wording. The
+#      mirror's own fail-open strings ("... passing open ...") match none of it,
+#      so re-pointing at the merge commit ALONE still reads clean: the string on
+#      the commit that merges names the MIRROR, not the review state.
+#
+# And `violatingPrs` is a distinct-PR count UNIONED across the buckets, so it
+# cannot distinguish "the required-gate bucket is fixed" from "the required-gate
+# bucket went blind while the review/ally-comment retirement row kept firing" —
+# that retirement row is a third object, under a second context name, from the
+# same publish path, and this predicate admits its wording too.
+#
+# So, in this order:
+#
+#   1. Re-point at `mergeCommit.oid` as well as `headRefOid`, reported as two
+#      surfaces and never summed — the discipline this file already applies to
+#      its two buckets.
+#   2. Re-key admission off gate-owned wording and onto the structural claim:
+#      a required name answered by a non-`failure` object with no independent
+#      evaluation behind it.
+#   3. Confirm the re-pointed census still reads NON-ZERO on today's population.
+#   4. Only then flip — and flip on `surfaces["required-gate"].prs > 0`, which
+#      `summarizeViolations` already publishes per surface, NOT on
+#      `violatingPrs`.
+#
+# A flip onto a blind detector converts a tracked open defect into a silently
+# closed one. That is strictly worse than the reporter posture it replaces, and
+# it is the failure this whole file exists to make impossible.
 #
 # Liveness of this workflow is watched by scheduled-guard-liveness.yml
 # (WATCHED_GUARDS in scripts/check-scheduled-guard-liveness.mjs), so a census
