@@ -2991,6 +2991,7 @@ async function fetchEvidenceForIssue(
   previousDescription: string | null = description,
   now: Date = new Date(),
   effectiveLabelNames: Array<{ name: string }> | null = null,
+  identifier: string | null = null,
 ): Promise<EvidenceFetchResult> {
   const [recentComments, operatorOverrideComments, workProductRows, labelsByIssueId, descriptionHistory] = await Promise.all([
     dbOrTx
@@ -3055,6 +3056,11 @@ async function fetchEvidenceForIssue(
   ].some((priorDescription) => countDoneWhenBullets(priorDescription ?? "") > 0);
   return {
     description,
+    // Passed in by the caller, which already holds the issue row: the truth
+    // probe needs it to tell a PR that owns this issue from one that merely
+    // mentions it (PEN-6321). `null` disables that filter rather than
+    // excluding everything.
+    identifier,
     doneWhenBulletsRemoved:
       countDoneWhenBullets(description ?? "") === 0 && hadPriorDoneWhenBullets,
     labels: effectiveLabelNames ?? issueLabels.map((l: { name: string }) => ({ name: l.name })),
@@ -12348,6 +12354,7 @@ export function issueService(db: Db) {
               existing.description,
               now,
               effectiveLabelNames,
+              existing.identifier,
             ),
             id,
             new Date(),
@@ -12525,6 +12532,7 @@ export function issueService(db: Db) {
               existing.description,
               now,
               effectiveLabelNames,
+              existing.identifier,
             ),
             id,
             new Date(),

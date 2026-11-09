@@ -20,6 +20,14 @@ import type { TruthProbe } from "./evidence-truth.js";
 
 export interface EvidenceFetchResult {
   description: string | null;
+  /**
+   * The issue's own identifier (`PEN-6181`). The truth probe uses it to drop
+   * attached PRs that recorded an owning set this issue is not in (PEN-6321).
+   * Nullable in the schema and optional here — absent means "do not filter",
+   * which is the safe direction: the filter only ever removes conjuncts from
+   * an `every`, so skipping it withholds a shape rather than inventing one.
+   */
+  identifier?: string | null;
   doneWhenBulletsRemoved?: boolean;
   labels: Array<{ name: string }>;
   comments: EvidenceCommentLite[];
@@ -149,6 +157,7 @@ export async function runEvidenceGate(
         metadata: wp.metadata,
         sourceTrust: wp.sourceTrust,
       })),
+      owningIdentifier: data.identifier ?? null,
     });
     externalDetections = probed.detections;
     probeFailed = probed.probeFailed;

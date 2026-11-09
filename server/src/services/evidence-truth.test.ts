@@ -55,6 +55,7 @@ function wp(
     headSha: string;
     prNumber: number;
     trust: TruthWorkProduct["sourceTrust"];
+    owningIdentifiers: unknown;
   }> = {},
 ): TruthWorkProduct {
   return {
@@ -65,6 +66,10 @@ function wp(
       headSha: over.headSha ?? HEAD,
       merged: over.merged ?? false,
       mergedAt: null,
+      // Absent unless a test declares one, which is the common shape on real
+      // rows: `owningIdentifiers` is only written when the webhook resolved an
+      // owning set, and an absent recording must never exclude a PR.
+      ...(over.owningIdentifiers === undefined ? {} : { owningIdentifiers: over.owningIdentifiers }),
     },
     sourceTrust: over.trust === undefined ? WEBHOOK : over.trust,
   };
@@ -102,23 +107,72 @@ function deps(o: Partial<GithubTruthDeps> = {}): GithubTruthDeps {
 
 describe("prRefsFromWorkProducts", () => {
   it("dedupes by repo+number and trusts `merged` only from webhook-stamped rows", () => {
-    const refs = prRefsFromWorkProducts([wp({ merged: true }), wp({ merged: true, trust: null })]);
+    const { refs } = prRefsFromWorkProducts([wp({ merged: true }), wp({ merged: true, trust: null })]);
     expect(refs).toHaveLength(1);
     expect(refs[0]!.webhookMerged).toBe(true);
     // An API-created row is a reference, not a fact: it says merged, and the
     // probe must still ask GitHub.
-    expect(prRefsFromWorkProducts([wp({ merged: true, trust: null })])[0]!.webhookMerged).toBe(false);
+    expect(prRefsFromWorkProducts([wp({ merged: true, trust: null })]).refs[0]!.webhookMerged).toBe(false);
   });
 
   it("ignores non-PR work products and rows without a repo or number", () => {
-    expect(prRefsFromWorkProducts([{ type: "deployment", metadata: { prNumber: 1 }, sourceTrust: null }])).toEqual([]);
-    expect(prRefsFromWorkProducts([{ type: "pull_request", metadata: { prNumber: 1 }, sourceTrust: null }])).toEqual([]);
+    expect(prRefsFromWorkProducts([{ type: "deployment", metadata: { prNumber: 1 }, sourceTrust: null }]).refs)
+      .toEqual([]);
+    expect(prRefsFromWorkProducts([{ type: "pull_request", metadata: { prNumber: 1 }, sourceTrust: null }]).refs)
+      .toEqual([]);
     expect(
       prRefsFromWorkProducts([
         { type: "pull_request", metadata: { repoFullName: "a/b", prNumber: "12" }, sourceTrust: null },
-      ]),
+      ]).refs,
     ).toEqual([]);
-    expect(prRefsFromWorkProducts([{ type: "pull_request", metadata: null, sourceTrust: null }])).toEqual([]);
+    expect(prRefsFromWorkProducts([{ type: "pull_request", metadata: null, sourceTrust: null }]).refs).toEqual([]);
+  });
+
+  // PEN-6321. Attachment keys on the BROAD mention set, so a PR that cites a
+  // row once in prose is attached to it; `owningIdentifiers` carries the
+  // narrow tier-ranked set that says whose PR it actually is.
+  it("excludes a PR whose recorded owning set omits this issue, and keeps every other shape", () => {
+    const wps = [
+      wp({ prNumber: 3577, owningIdentifiers: ["BLO-28813", "PEN-6181"] }),
+      wp({ prNumber: 3582, owningIdentifiers: ["PEN-6254"] }),
+    ];
+    const { refs, notOwned } = prRefsFromWorkProducts(wps, "PEN-6181");
+    expect(refs.map((r) => r.prNumber)).toEqual([3577]);
+    expect(notOwned.map((r) => r.prNumber)).toEqual([3582]);
+    // No identifier to compare against is "do not filter", never "exclude
+    // everything" — that is the pre-PEN-6321 behaviour and the safe direction.
+    expect(prRefsFromWorkProducts(wps).refs.map((r) => r.prNumber).sort()).toEqual([3577, 3582]);
+    expect(prRefsFromWorkProducts(wps, null).refs).toHaveLength(2);
+  });
+
+  it("keeps a PR whose owning set is not recorded, or is recorded unreadably", () => {
+    // Absent: the common shape. The row predates the field or its writer never
+    // resolved ownership. Excluding here would turn a fail-safe false negative
+    // into a fail-open false positive.
+    expect(prRefsFromWorkProducts([wp({ prNumber: 10 })], "PEN-1").refs).toHaveLength(1);
+    expect(prRefsFromWorkProducts([wp({ prNumber: 10, owningIdentifiers: null })], "PEN-1").refs).toHaveLength(1);
+    // Non-empty but unparseable is NOT the authoritative empty set — it lands
+    // in `recordedPullRequestOwners`' "not recorded" arm.
+    expect(prRefsFromWorkProducts([wp({ prNumber: 10, owningIdentifiers: [42] })], "PEN-1").refs).toHaveLength(1);
+    expect(prRefsFromWorkProducts([wp({ prNumber: 10, owningIdentifiers: "PEN-1" })], "PEN-1").refs).toHaveLength(1);
+    // An EMPTY array IS authoritative: the PR resolved an owning set and this
+    // issue is not in it.
+    expect(prRefsFromWorkProducts([wp({ prNumber: 10, owningIdentifiers: [] })], "PEN-1").refs).toEqual([]);
+  });
+
+  it("ORs ownership across duplicate rows for one PR", () => {
+    // One PR, two rows from two events. The older one predates the body line
+    // naming this issue; the newer one records it. Any row claiming ownership
+    // keeps the PR.
+    const { refs } = prRefsFromWorkProducts(
+      [
+        wp({ prNumber: 77, owningIdentifiers: ["PEN-9"] }),
+        wp({ prNumber: 77, owningIdentifiers: ["PEN-9", "PEN-1"], merged: true }),
+      ],
+      "PEN-1",
+    );
+    expect(refs).toHaveLength(1);
+    expect(refs[0]!.webhookMerged).toBe(true);
   });
 });
 
@@ -719,6 +773,65 @@ describe("buildGithubTruthProbe", () => {
     expect(r.detections["deploy:landed"]).toBe(true);
     expect(r.detections["review:ally-clean"]).toBeUndefined();
     expect(r.probeFailed).toBe(false);
+  });
+
+  // PEN-6321, the measured shape. PEN-6181 carried two attached PRs: #3577,
+  // the fix, recording `["BLO-28813", "PEN-6181"]`; and #3582, unrelated,
+  // recording `["PEN-6254"]` and attached only because its body cited
+  // PEN-6181 once as an analogy. Since the shapes are an `every`, the
+  // unrelated unmerged PR withheld `deploy:landed` from the citing row
+  // permanently, and that row's assignee could not clear it.
+  it("an attached PR that does not own this issue is not a conjunct in its landing evidence", async () => {
+    const probe = buildGithubTruthProbe(
+      deps({
+        getPullRequestGate: async (ref) => ({
+          state: ref.prNumber === 3577 ? "closed" : "open",
+          merged: ref.prNumber === 3577,
+        }),
+      }),
+    );
+    const workProducts = [
+      wp({ prNumber: 3577, owningIdentifiers: ["BLO-28813", "PEN-6181"] }),
+      wp({ prNumber: 3582, owningIdentifiers: ["PEN-6254"] }),
+    ];
+    const r = await probe({ workProducts, owningIdentifier: "PEN-6181" });
+    expect(r.detections["deploy:landed"]).toBe(true);
+    expect(r.probeFailed).toBe(false);
+    // Excluded, not merely outvoted — and named, so the exclusion is legible
+    // to an operator who can see two PRs on the row.
+    expect(r.diagnostics).toContain("linked-prs-not-owning-issue:PEN-6181:Blockcast/paperclip#3582");
+
+    // The defect itself, pinned: without the identifier the unrelated PR is
+    // still a conjunct and still withholds the shape.
+    expect((await probe({ workProducts })).detections["deploy:landed"]).toBeUndefined();
+
+    // And the filter does not reach the OTHER row: #3582 evaluated as its own
+    // issue keeps its PR, and #3577 is the one dropped.
+    const other = await probe({ workProducts, owningIdentifier: "PEN-6254" });
+    expect(other.detections["deploy:landed"]).toBeUndefined();
+    expect(other.diagnostics).toContain("linked-prs-not-owning-issue:PEN-6254:Blockcast/paperclip#3577");
+  });
+
+  // Filtering every attached PR out reads as "no pull request OWNS this
+  // issue", which is the honest answer and the same one an issue with nothing
+  // attached gets. It can never CREDIT a shape — `detections` is empty on both
+  // paths — but it must say why, or the row looks like one no PR was ever
+  // attached to.
+  it("all attached PRs disclaiming this issue → noLinkedPullRequest, with the exclusion named", async () => {
+    const r = await buildGithubTruthProbe(deps())({
+      workProducts: [wp({ prNumber: 3582, merged: true, owningIdentifiers: ["PEN-6254"] })],
+      owningIdentifier: "PEN-6181",
+    });
+    expect(r).toEqual({
+      detections: {},
+      diagnostics: [
+        "linked-prs-not-owning-issue:PEN-6181:Blockcast/paperclip#3582",
+        "no-linked-pull-request",
+      ],
+      probeFailed: false,
+      noLinkedPullRequest: true,
+      reviewerAuthoredPr: false,
+    });
   });
 
   it("no linked PR → no detections, a diagnostic, and NOT a probe failure", async () => {
