@@ -3438,6 +3438,42 @@ const DIND_WAIT_PREAMBLE =
  * `readInClusterNamespace()`). If neither resolves, refuse to build the Job
  * manifest so misprovisioning surfaces at launch as a named, actionable
  * error instead of a scattered `Forbidden` days later.
+ *
+ * PEN-6275: the resolved name is then checked against an operator-controlled
+ * allowlist (PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES). Until that landed this
+ * function took `config.serviceAccountName` VERBATIM — no allowlist, no
+ * pattern, no validation — and the adapter sets
+ * `automountServiceAccountToken` nowhere, so the pod inherits it from the
+ * ServiceAccount the config NAMES. Naming a sibling account in the namespace
+ * therefore does not relabel the pod; it mounts that account's RBAC at
+ * /var/run/secrets/kubernetes.io/serviceaccount/token.
+ *
+ * WHY THE GATE IS HERE rather than upstream at the config merge. Three scopes
+ * can write this key and they are not all reachable from one place:
+ * the agent row, the issue-scope `assigneeAdapterOverrides.adapterConfig`
+ * overlay, and `mergeEnvironmentConfig` (execute.ts), which copies an
+ * execution target's config over the adapter config for every non-null key.
+ * PEN-6247 pinned the key into the server's AGENT_SCOPE_ONLY_CONFIG_KEYS,
+ * which closes the overlay and leaves the other two — and environment scope is
+ * not a theoretical route, it is the production writer of this key for the
+ * Penstock fleet. `resolveServiceAccountName` is the single chokepoint
+ * DOWNSTREAM of all three.
+ *
+ * WHY UNSET MEANS NOT ENFORCED. Measured 2026-11-09: 39 live agent-job pods in
+ * ns `paperclip` resolve to four different ServiceAccounts, and 21 of them
+ * mount a token. A resolver that refused on an unset allowlist would fail
+ * every dispatch in the fleet on the deploy that carried it. The value of this
+ * gate is forcing somebody to enumerate which identities are appropriate for
+ * agent runs — so it ships inert and an operator turns it on.
+ *
+ * WHY THE FLEET DEFAULT IS NOT EXEMPT, even though it is set by the same
+ * operator on the same Deployment. The Blockcast overlay sets it to
+ * `paperclip` — the control plane's own ServiceAccount, with
+ * `automountServiceAccountToken: true` and a Role granting namespace-wide
+ * `secrets` and `batch/jobs` — and 16 of those 39 pods reach it by the DEFAULT
+ * with no per-agent value anywhere. Exempting the default would exempt
+ * precisely the case this gate exists for, and the gate would read as shipped
+ * while refusing nothing that actually occurs. A test pins that.
  */
 // ---------------------------------------------------------------------------
 // BLO-34477: per-child memory ceiling for tool-spawned processes.
@@ -3647,14 +3683,52 @@ export function buildToolRlimitInitShell(dir: string, limitKb: number): string[]
   return parts;
 }
 
+/**
+ * Operator-controlled allowlist of ServiceAccount names an agent Job pod may
+ * run as. Comma- or whitespace-separated, set on the paperclip Deployment
+ * beside PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME.
+ *
+ * UNSET MEANS NOT ENFORCED, and that is deliberate rather than an oversight:
+ * see `resolveServiceAccountName` for why, and for why the fleet default is
+ * NOT implicitly exempt.
+ */
+export const SERVICE_ACCOUNT_ALLOWLIST_ENV = "PAPERCLIP_ALLOWED_SERVICE_ACCOUNT_NAMES";
+
+/**
+ * Parse the allowlist env var. Returns `null` for "no allowlist configured"
+ * and a non-empty Set otherwise — the two are different dispositions, so they
+ * get different types rather than an empty Set standing for both. An empty or
+ * whitespace-only value parses to `null`, matching the `.trim()` discipline on
+ * the other two values this resolver reads.
+ *
+ * Exported for unit tests.
+ */
+export function parseServiceAccountAllowlist(raw: string | null | undefined): Set<string> | null {
+  const names = (raw ?? "")
+    .split(/[\s,]+/)
+    .map((name) => name.trim())
+    .filter(Boolean);
+  return names.length > 0 ? new Set(names) : null;
+}
+
 export function resolveServiceAccountName(config: Record<string, unknown>): string {
   const perAgent = asString(config.serviceAccountName, "").trim();
-  if (perAgent) return perAgent;
   const fleetDefault = (process.env.PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME ?? "").trim();
-  if (fleetDefault) return fleetDefault;
-  throw new Error(
-    'claude_k8s: no serviceAccountName resolved for this agent\'s Job pods. Set the agent\'s "Service Account" config field (serviceAccountName), or set PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME on the paperclip Deployment for a fleet-wide default. Refusing to fall back to the namespace\'s `default` ServiceAccount, which has no cluster-scoped read (BLO-21812).',
-  );
+  const resolved = perAgent || fleetDefault;
+  if (!resolved) {
+    throw new Error(
+      'claude_k8s: no serviceAccountName resolved for this agent\'s Job pods. Set the agent\'s "Service Account" config field (serviceAccountName), or set PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME on the paperclip Deployment for a fleet-wide default. Refusing to fall back to the namespace\'s `default` ServiceAccount, which has no cluster-scoped read (BLO-21812).',
+    );
+  }
+  const allowlist = parseServiceAccountAllowlist(process.env[SERVICE_ACCOUNT_ALLOWLIST_ENV]);
+  if (allowlist && !allowlist.has(resolved)) {
+    throw new Error(
+      `claude_k8s: refusing to build a Job pod running as ServiceAccount "${resolved}" — it is not in ${SERVICE_ACCOUNT_ALLOWLIST_ENV} (${[...allowlist].sort().join(", ")}). `
+        + "The pod inherits automountServiceAccountToken from the ServiceAccount it NAMES, so naming a sibling account in this namespace does not relabel the pod — it mounts that account's RBAC. "
+        + "Either correct the value for this agent, or add this name to the allowlist on the paperclip Deployment once someone has decided the identity is appropriate for agent runs (PEN-6275).",
+    );
+  }
+  return resolved;
 }
 
 export function buildJobManifest(input: JobBuildInput): JobBuildResult {
