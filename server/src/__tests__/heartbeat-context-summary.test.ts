@@ -3892,6 +3892,22 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("restore only what is actually gone");
   });
 
+  // Third finding at the third head, and the sharpest: the mismatch guidance above covers
+  // a sibling that writes AFTER you, which is the case that is VISIBLE. The case that
+  // actually loses data is a sibling writing in the window BETWEEN your re-read and your
+  // PATCH -- there your digest MATCHES, because your bytes did land, and their block is
+  // gone. The clause never claimed a match proves no loss, but a reader finishing a
+  // digest-centred procedure will infer it, and that inference is the whole failure. The
+  // re-read's ADJACENCY to the write is the only guard on that window, so the clause has
+  // to say so rather than leave the digest looking sufficient.
+  it("denies that a matching digest proves nothing was overwritten", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("a MATCHING digest proves only that your bytes landed");
+    expect(markdown).toContain("never that nothing was overwritten");
+    expect(markdown).toContain("the only guard on that window; the digest cannot see it");
+  });
+
   // The announcement is NOT subject to the same caution, and saying so is the point. The
   // author of the Surface clause skipped a comment on PEN-5793 on concurrency grounds and
   // later corrected it: an append cannot overwrite anything, so the skip was pure loss.
