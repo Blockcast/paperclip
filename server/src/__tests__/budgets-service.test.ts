@@ -312,6 +312,7 @@ describe("budgetService", () => {
     const block = await service.getInvocationBlock("company-1", "agent-1");
 
     expect(block).toEqual({
+      kind: "budget",
       scopeType: "agent",
       scopeId: "agent-1",
       scopeName: "Budget Agent",
@@ -359,6 +360,7 @@ describe("budgetService", () => {
     const block = await service.getInvocationBlock("company-1", "agent-1");
 
     expect(block).toEqual({
+      kind: "budget",
       scopeType: "company",
       scopeId: "company-1",
       scopeName: "Paperclip",
@@ -386,6 +388,7 @@ describe("budgetService", () => {
     const service = budgetService(dbStub.db as any);
 
     expect(await service.getInvocationBlock("company-1", "agent-1")).toEqual({
+      kind: "paused",
       scopeType: "company",
       scopeId: "company-1",
       scopeName: "Paperclip",
@@ -700,6 +703,7 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
 
     const block = await service.getInvocationBlock(companyId, agentId);
     expect(block).toEqual({
+      kind: "budget",
       scopeType: "agent",
       scopeId: agentId,
       scopeName: "Budget Agent SECRET_TOKEN_SHOULD_NOT_LEAK",
@@ -1264,6 +1268,7 @@ describeEmbeddedPostgres("budgetService release gate enforcement", () => {
     ).rejects.toThrow("New budget must exceed current observed spend");
 
     expect(await service.getInvocationBlock(companyId, agentId, { projectId })).toEqual({
+      kind: "budget",
       scopeType: "project",
       scopeId: projectId,
       scopeName: "Budget Project",

@@ -1195,11 +1195,21 @@ async function advanceIssueLadder(
  * identical in its closing clause. If you change either wording, change both:
  * they are two reachable paths to one statement, and a reader (or a grep)
  * should match one string.
+ *
+ * ⛔ The closing clause says the ladder MOVES ON, not that it will ESCALATE.
+ * Escalating is only one of the things the next sweep can do, and which one is
+ * a function of the CAUSE, which this sentence does not branch on: a
+ * `issue.not_wakeable` rung is terminal and a `issue.no_assignee` one has
+ * nobody to climb to, so for those the next sweep covers the alert or stops.
+ * Promising a climb would be a forward-looking assertion the ladder may not
+ * keep — the same defect class PEN-6121 exists to remove, one tense later, so
+ * the sentence states what is true for every cause instead. (Raised by Ally on
+ * #3589; the wording was inherited from the kill-switch arm above.)
  */
 function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): string {
   const retryClause = willRetry
     ? " This rung is NOT spent: the next sweep retries the delivery before the ladder escalates."
-    : " The retry budget for this rung is spent; the ladder will escalate on the next sweep.";
+    : " The retry budget for this rung is spent; the ladder moves on at the next sweep.";
   const cause = wake.cause ? ` (${wake.cause})` : "";
   switch (wake.outcome) {
     case "enqueued":
@@ -1238,7 +1248,7 @@ function retryBudgetSpentSentence(name: string, wake: WakeAttempt, retryNumber: 
   const how = wake.outcome === "refused"
     ? `the host refused the wake${cause}`
     : `the host accepted the request and enqueued nothing${cause}`;
-  return `**No run was queued for ${name}** — ${how}. Retry ${retryNumber} of ${MAX_WAKE_DELIVERY_RETRIES} failed. The retry budget for this rung is spent; the ladder will escalate on the next sweep.`;
+  return `**No run was queued for ${name}** — ${how}. Retry ${retryNumber} of ${MAX_WAKE_DELIVERY_RETRIES} failed. The retry budget for this rung is spent; the ladder moves on at the next sweep.`;
 }
 
 /**
@@ -1262,7 +1272,7 @@ function retryBudgetSpentSentence(name: string, wake: WakeAttempt, retryNumber: 
 function wakeDetailFor(wake: WakeOutcome): string | null {
   switch (wake) {
     case "refused":
-      return "issues.requestWakeup threw: the host refused the wake. Read wake_cause for which gate -- pre-wake in the plugin host (issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked) or downstream in enqueueWakeup (budget.blocked, company.inactive, agent.not_invokable). That set GROWS; it is documentation, not a closed list. A null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
+      return "issues.requestWakeup threw: the host refused the wake. Read wake_cause for which gate -- pre-wake in the plugin host (issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked, company.inactive) or downstream in enqueueWakeup (budget.blocked, company.inactive, agent.not_invokable). That set GROWS; it is documentation, not a closed list. A null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
     case "declined":
       return "issues.requestWakeup resolved queued=false: the host accepted the call and enqueued no run. Read wake_cause for which gate (heartbeats disabled, cooldown, inactive company, scheduling suppressed, worktree cutoff, or a capacity deferral); a null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
     default:

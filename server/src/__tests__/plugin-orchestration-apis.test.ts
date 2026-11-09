@@ -9,6 +9,7 @@ import {
   agentConfigRevisions,
   agentWakeupRequests,
   agents,
+  budgetPolicies,
   companies,
   costEvents,
   createDb,
@@ -70,6 +71,7 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     tempRoots.length = 0;
     await db.delete(activityLog);
     await db.delete(costEvents);
+    await db.delete(budgetPolicies);
     await db.delete(heartbeatRunEvents);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
@@ -1251,15 +1253,74 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
   });
 
   /**
-   * `budget.blocked` is the one token shared with `enqueueWakeup`: the same
-   * gate is asked twice on one path, and a reader triaging by cause wants the
-   * GATE, not which layer happened to ask first. Coding it here means a wake
-   * refused before the heartbeat records the same cause as one refused inside
-   * it, instead of NULL.
+   * ⛔ `budgets.getInvocationBlock` answers TWO questions under one return, and
+   * the pre-check must not collapse them. Five of its six branches are budget
+   * hard-stops; the sixth is `company.status === "paused"` with
+   * `pauseReason !== "budget"` — an OPERATOR pause, whose own `reason` reads
+   * "Company is paused and cannot start new work."
+   *
+   * An earlier revision of this test seeded exactly this row and asserted
+   * `budget.blocked`, which PINNED the mislabel as expected behaviour: the
+   * `wake_cause` column would have said "budget" for an administrative pause.
+   * NULL meant "not recorded"; a confidently WRONG cause is worse for triage
+   * than NULL, which would have inverted the purpose of coding these gates at
+   * all. (Raised by Ally on #3589.)
+   *
+   * `company.inactive` is also what `enqueueWakeup` calls this same condition
+   * downstream — it gates on `company.status !== "active"` before it reaches
+   * its own budget gate — so the two layers now agree rather than contradict.
    */
-  it("names budget.blocked in details.code when the invocation budget refuses the wake", async () => {
+  it("names company.inactive in details.code when an OPERATOR pause refuses the wake", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     await db.update(companies).set({ status: "paused", pauseReason: "manual" }).where(eq(companies.id, companyId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Alert", status: "todo", priority: "critical", assigneeAgentId: agentId,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await expect(
+      services.issues.requestWakeup({ issueId, companyId, reason: "alert_escalation_deadline" }),
+    ).rejects.toMatchObject({ details: { code: "company.inactive", scopeType: "company" } });
+  });
+
+  /**
+   * The other side of the discriminator: a genuine hard-stop still reports
+   * `budget.blocked`, the token shared with `enqueueWakeup`'s own budget gate.
+   *
+   * ⛔ The over-cap is seeded with a real `costEvents` row rather than by
+   * setting `pauseReason: "budget"` on the company. A budget PAUSE alone does
+   * not produce a block: `getInvocationBlock` re-asks `hardStopStillBinds` and,
+   * when the cap no longer binds, CLEARS the stale pause and returns null — so
+   * a test that only flipped the flag would assert against a wake that was
+   * never refused, and would pass for the wrong reason.
+   */
+  it("names budget.blocked in details.code when a budget hard-stop refuses the wake", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "company",
+      scopeId: companyId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 100,
+      warnPercent: 80,
+      hardStopEnabled: true,
+      notifyEnabled: false,
+      isActive: true,
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      provider: "anthropic",
+      biller: "anthropic",
+      billingType: "subscription",
+      model: "claude-opus-5",
+      inputTokens: 1_000,
+      outputTokens: 200,
+      costCents: 500,
+      occurredAt: new Date(),
+    });
     const issueId = randomUUID();
     await db.insert(issues).values({
       id: issueId, companyId, title: "Alert", status: "todo", priority: "critical", assigneeAgentId: agentId,

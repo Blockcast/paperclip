@@ -315,7 +315,8 @@ a disjunction rather than a diagnosis. The host stamps one vocabulary on both
 halves — the `writeSkippedRequest` tokens, e.g. `agent.not_invokable`,
 `budget.blocked`, `heartbeat.cooldown`, `worktree_execution_cutoff`, plus the
 plugin host's own pre-wake gates (`issue.no_assignee`, `issue.not_wakeable`,
-`issue.blocked`), which PEN-6229 coded. ⛔ The set is OPEN and will grow; it is
+`issue.blocked`, and `budget.blocked`/`company.inactive` depending on which
+question the invocation-budget pre-check answered), which PEN-6229 coded. ⛔ The set is OPEN and will grow; it is
 documentation, not a constraint.
 ⛔ **`NULL` means NOT RECORDED** — a row written before this column, a branch
 that attempted no wake, or a host that dropped the wake without naming a cause.
