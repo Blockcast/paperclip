@@ -463,10 +463,33 @@ missed entirely with probability ≈ `1e-26`, so window B's zero is not a catch-
 `${bin}:/usr/bin:/bin`, dropping the guard directory. **PEN-5012 fixed that site** — `guardedPath()`,
 merged to `penstock-llm-proxy-core` `main` 2026-11-07T13:21Z in #2983, *after* the last reading.
 
-Window B is the direct before/after: the same file, the same scratch repos, **266 reaches, 266
-wrapped, 0 unwrapped, 0 indeterminate.** The reaches did not disappear — they are still happening and
-are now all going **through** the wrapper, which is what a working mitigation looks like rather than a
-quiet absence.
+Window B measured **266 reaches, 266 wrapped, 0 unwrapped, 0 indeterminate.** The reaches did not
+disappear — they are still happening and are now all going **through** the wrapper, which is what a
+working mitigation looks like rather than a quiet absence.
+
+⛔ **A zero here is `remediated`, NOT "never observed"** (§4). Trigger 4 fired, the count was 28, and
+this record carries the firing; a later §7.1 text written off this run must say so.
+
+⭐ **Window C — the same-surface A/B, because comparing B against §1.3 would break this record's own
+rule.** §4 says a differing fingerprint means a prior result says nothing about the new one, and §7.1
+calls cross-surface counts incomparable in **both** directions. §1.3's 26 was taken on `83aef063…`, so
+citing it as the "before" would have been exactly the comparison §4 forbids — and the surface delta is
+the **egress runtime itself**, which is a live rival explanation for the zero. So the before-arm was
+re-taken **on `b46cfbd8…`**:
+
+| arm, all on `b46cfbd8…` | `test/secret-scan-budget.test.ts:622` | reaches | unwrapped |
+|---|---|---|---|
+| post-fix (window B) | `PATH: guardedPath([bin, "/usr/bin", "/bin"])` | `266` | **`0`** |
+| **pre-fix (window C)** | ``PATH: `${bin}:/usr/bin:/bin`,`` (a template literal) | `235` | **`27`** |
+
+Same pod, same image, same fingerprint (re-read `12:03:49Z`, byte-identical), same dependency tree,
+same 49 passing tests — **one line different.** All 27 are the §1.3 mechanism exactly:
+`git rev-parse --verify --quiet <rev>^{commit}` in `secret-scan-step-*/work`.
+
+⇒ the zero is attributable to `guardedPath()` **by measurement, not by inference**, and the egress-runtime
+change is excluded as the cause. ⚠ `27` is this run's pre-fix arm on *this* surface; it is **not** a
+reproduction of §1.3's `26`, and the two are not comparable across surfaces. The reverted line was
+restored and `git diff` confirmed empty before the arm was recorded.
 
 ⚠ **Window B is also the reachability control, and it was needed.** Window A's log contains no mention
 of the site, which reads like "the file never ran" — but that reporter prints **zero** `✓` lines for
@@ -729,16 +752,16 @@ this duty cannot be discharged by a document:
 | 2026-10-29 (§1) | `d81423fe…` | — | baseline |
 | 2026-11-03 | `50aab1b9…` | **differs** | staleness; `wrapperAhead: true`. `/usr/bin/git` **unchanged** — the whole delta was the three paperclip-authored files |
 | 2026-11-05 (§1.3) | `83aef063…` | **differs** | staleness; `wrapperAhead: true`; re-measured → **26** |
-| 2026-11-09 (§1.4) | `b46cfbd8…` | **differs** | staleness; `wrapperAhead: true`; re-measured → **0 from the workload** (2 pod-wide, unattributed). Only the egress runtime moved — 4 of 5 components byte-identical |
+| 2026-11-09 (§1.4) | `b46cfbd8…` | **differs** | staleness; `wrapperAhead: true`; re-measured → **0 from the workload, `remediated` not never-observed** (2 pod-wide, unattributed). Only the egress runtime moved — 4 of 5 components byte-identical |
 
-— i.e. the egress surface turned over twice in seven days, on a roughly **2-to-5-day** cadence. A
-measurement is stale about that fast. ⚠ The 2026-11-03 evaluation was a *fingerprint* reading only:
+— i.e. the egress surface turned over **three times in the eleven days** 2026-10-29 → 2026-11-09, on
+a roughly **2-to-5-day** cadence. A measurement is stale about that fast. ⚠ The 2026-11-03 evaluation was a *fingerprint* reading only:
 no count was taken against it, so no result is cited for that row.
 
 ⭐ **§1's fingerprint is no longer the only citable one.** §4's first rule — "a later run whose
 fingerprint **equals** the one in §1 may cite this measurement" — now reads: a run may cite the
-window whose fingerprint it matches, `d81423fe…` for §1 and `83aef063…` for §1.3. A run matching
-neither must re-take it.
+window whose fingerprint it matches, `d81423fe…` for §1, `83aef063…` for §1.3 and `b46cfbd8…` for
+§1.4. A run matching **none of the three** must re-take it.
 
 **Per-file hashes, published so the next firing is diagnosable in one comparison.** §1 published only
 the composite digest, which is why attributing the 2026-11-03 mismatch took a 650-permutation sweep
@@ -766,9 +789,9 @@ compare against, which reduced attribution from a 650-permutation sweep to one l
 | `356db14e102d68a1` | `/usr/bin/git` | same |
 | `356db14e102d68a1` | `/bin/git` | same |
 
-Layout and `wrapperAhead` unchanged. ⭐ `/usr/bin/git` is **still** `356db14e…` — the real binary
-remains untouched across every firing recorded here, and every delta so far has been confined to the
-paperclip-authored files.
+Layout and `wrapperAhead` unchanged; `/usr/bin/git` is **still** `356db14e…`, so the paragraph below
+now covers three firings rather than two.
+
 ⭐ **`/usr/bin/git` is `356db14e…` — the same value PEN-4986 recorded for both class-A inodes on two
 images, and the same one §1.1's pooling check reports.** The real binary is untouched across every
 firing so far, and the entire delta each time has been the three paperclip-authored files.

@@ -458,7 +458,11 @@ Windows eight and nine (PEN-5663; `PEN-4989-…-widening.md` §1.4). PEN-5012's
 `guardedPath()` landed on `penstock-llm-proxy-core` `main` 2026-11-07T13:21Z (#2983) and restores the
 guard directory to the narrowed `PATH`. A site-scoped window over that exact file measured **266 reaches,
 266 wrapped, 0 unwrapped, 0 indeterminate**; the full root `pnpm test` window measured **0 unwrapped
-attributable to the workload** (15.4 min, 4,019 observations). Calibration for the watched inodes was
+attributable to the workload** (15.4 min, 4,019 observations). ⛔ **That zero is `remediated`, not
+"never observed"** — trigger 4 fired and the count was 28. The attribution is **measured, not inferred**:
+the before-arm was re-taken on the *same* `b46cfbd8…` surface with only that one line reverted, and it
+produced **27** unwrapped of the §1.3 shape, so the egress-runtime change is excluded as the cause
+(§1.4, window C). ⚠ Cross-surface counts remain incomparable, so `27` is not a reproduction of `26`. Calibration for the watched inodes was
 **0.900** each at n=300, so the zero is not a catch-rate artifact. Three bounds, all of which cut
 against over-reading this:
 
