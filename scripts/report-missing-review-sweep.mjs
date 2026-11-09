@@ -1,12 +1,25 @@
 #!/usr/bin/env node
 /**
- * Render a sweep report (PEN-6352) as a job summary, and emit `findings=<n>`
- * for the workflow to branch on.
+ * Render a sweep report (PEN-6352) as a job summary, and emit the counts the
+ * workflow branches on.
+ *
+ *   findings=<n>  heads carrying no verdict, whether or not already reported
+ *   publish=<n>   rows the publish step would actually POST -- new findings
+ *                 plus retirements. The publish step gates on THIS, not on
+ *                 `findings`: a sweep can have zero new findings and still owe
+ *                 a retirement row, and gating on `findings` would strand the
+ *                 stale `neutral` marker on exactly the heads that recovered.
  *
  * Usage: node scripts/report-missing-review-sweep.mjs sweep.json >> "$GITHUB_OUTPUT"
  */
 
 import { appendFileSync, readFileSync } from "node:fs";
+
+/** Rows the publish step will actually POST. */
+export function publishableCount(report) {
+  const fresh = report.findings.filter((finding) => !finding.alreadyPublished).length;
+  return fresh + (report.resolutions?.length ?? 0);
+}
 
 export function renderSummary(report) {
   const lines = [];
@@ -14,13 +27,25 @@ export function renderSummary(report) {
   lines.push("");
   lines.push(`Scanned **${report.scanned}** open pull requests at ${report.measuredAt}.`);
 
-  if (report.partialErrorTypes.length) {
+  // An UNPROVEN head is the one skip reason that means "this sweep did not
+  // measure", and it must be visible WITHOUT opening a <details>. A guard that
+  // went quietly blind over half the repo renders, collapsed, exactly like a
+  // clean run.
+  const unproven = report.skipped.filter((entry) => /UNPROVEN/.test(entry.reason));
+  if (report.partialErrorTypes.length || unproven.length) {
     lines.push("");
     lines.push("> [!WARNING]");
+    if (report.partialErrorTypes.length) {
+      lines.push(`> Partial GraphQL errors (${report.partialErrorTypes.join(", ")}).`);
+    }
     lines.push(
-      `> Partial GraphQL errors (${report.partialErrorTypes.join(", ")}). Some heads could not be read` +
-        " whole and are reported as UNPROVEN, never as clean. Treat this run as incomplete.",
+      `> **${unproven.length}** of ${report.scanned} head(s) could not be read whole and are reported as` +
+        " UNPROVEN, never as clean. This sweep did not measure them, so a zero above is a floor on the" +
+        " real count, not the count. Treat this run as incomplete.",
     );
+    if (unproven.length) {
+      lines.push(`> Unproven: ${unproven.map((entry) => `#${entry.number}`).join(", ")}`);
+    }
   }
 
   lines.push("");
@@ -54,6 +79,26 @@ export function renderSummary(report) {
     );
   }
 
+  if (report.resolutions?.length) {
+    lines.push("");
+    lines.push(
+      `**${report.resolutions.length}** head(s) now carry a \`${report.checkName}\` verdict and had a` +
+        ` standing \`${report.selfCheckName ?? "review/verdict-present"}\` finding, which this run` +
+        " supersedes with a `success` row under the same name:" +
+        ` ${report.resolutions.map((entry) => `#${entry.number}`).join(", ")}.`,
+    );
+  }
+
+  const alreadyReported = report.findings.filter((finding) => finding.alreadyPublished);
+  if (alreadyReported.length) {
+    lines.push("");
+    lines.push(
+      `${alreadyReported.length} of the above already carry this sweep's finding at the same head and are` +
+        " not re-posted: " +
+        `${alreadyReported.map((finding) => `#${finding.number}`).join(", ")}.`,
+    );
+  }
+
   if (report.skipped.length) {
     lines.push("");
     lines.push(`<details><summary>${report.skipped.length} head(s) skipped as in-flight or unproven</summary>`);
@@ -76,4 +121,5 @@ if (invokedDirectly) {
     process.stderr.write(`${summary}\n`);
   }
   process.stdout.write(`findings=${report.findings.length}\n`);
+  process.stdout.write(`publish=${publishableCount(report)}\n`);
 }
