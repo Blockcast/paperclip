@@ -335,9 +335,10 @@ export const HTTP_REQUEST_DURATION_METRIC = "paperclip_http_request_duration_sec
  *   "inside the bound" into a directly queryable quantity.
  * - `60` -- over-bound completions, so a request that outruns the statement
  *   bound is still separable from the unbounded `+Inf` tail.
- * - `120` -- the API tier's `PROXY_REQUEST_TIMEOUT_MS`. Same edge and same
- *   reason as {@link PLUGIN_METRIC_DURATION_BUCKETS_SECONDS}'s final finite
- *   bucket.
+ * - `120` -- the API tier's `PROXY_REQUEST_TIMEOUT_MS`. The same edge as
+ *   {@link PLUGIN_METRIC_DURATION_BUCKETS_SECONDS}'s final finite bucket, but
+ *   NOT for the same reason: there it is ladder alignment and nothing else,
+ *   because that family does not observe HTTP responses at all.
  *
  * ⛔ `le="120"` versus `+Inf` is NOT the deadline-crossing population, and
  * this comment asserted that it was until PEN-5783 measured it. The two claims
@@ -346,13 +347,15 @@ export const HTTP_REQUEST_DURATION_METRIC = "paperclip_http_request_duration_sec
  * at all (they carry the `"0"` status on {@link HTTP_REQUESTS_METRIC}). A
  * genuinely destroyed delivery is therefore excluded from this histogram by
  * construction, and what remains above `120` is the opposite population:
- * requests that outran the tier's nominal timeout and were still delivered.
+ * requests that outran the tier's nominal timeout and completed anyway.
  * Measured 2026-11-09 over the 22.8 h since this ladder deployed -- 144
  * completed responses above `le="120"`, of which 130 were
  * `GET /api/heartbeat-runs/:runId`, a route that carries no `"0"` status series
- * at all. Those 130 crossed the deadline and were received. Read this edge as
- * "outran the tier's nominal timeout and completed anyway": it is a lower bound
- * on deadline crossings, never a count of them.
+ * at all. Those 130 crossed the deadline and COMPLETED -- which is exactly
+ * what `res.writableFinished` reports and no more: the response was flushed to
+ * the socket rather than abandoned, not that any client acknowledged it. Read
+ * this edge as "outran the tier's nominal timeout and completed anyway": it is
+ * a lower bound on deadline crossings, never a count of them.
  *
  * ⚠️ PEN-5783 -- why the ladder could not end at `60`. Every edge above was
  * chosen to straddle the inherited 30s `statement_timeout`, and that is the
@@ -4175,12 +4178,21 @@ export const PLUGIN_METRIC_DURATION_METRIC = "paperclip_plugin_metric_duration_s
  * therefore explicit boundaries — with those two edges present, "has the
  * median crossed the baseline band" and "has it reached the claimed figure"
  * are each a single bucket comparison rather than an interpolation artifact.
- * `120` is the API tier's `PROXY_REQUEST_TIMEOUT_MS`, so the final finite
- * bucket is the tier's nominal delivery deadline. ⛔ Do not read the band
- * above it as "deliveries that were destroyed" -- abandoned responses are not
- * observed by these families at all, so a destroyed delivery is excluded by
- * construction and what sits above `120` is traffic that outran the nominal
- * timeout and was delivered anyway (PEN-5783).
+ * `120` matches the API tier's `PROXY_REQUEST_TIMEOUT_MS`, which lines this
+ * ladder's top edge up with {@link HTTP_REQUEST_DURATION_BUCKETS_SECONDS}.
+ * That alignment is the whole reason for the value, and it is the only thing
+ * the value carries here.
+ *
+ * ⛔ The band above `120` has NO delivery semantics in this family, and this
+ * comment called that bucket "the deadline that actually destroys a delivery"
+ * until PEN-5783. This metric observes whatever a plugin hands
+ * `ctx.metrics.observe` -- the PEN-5140 per-alert webhook cost, for instance.
+ * That is not an HTTP response: there is no abandoned-request notion here and
+ * no `"0"` status, so nothing is excluded by construction and no abandonment
+ * argument of the kind {@link HTTP_REQUEST_DURATION_BUCKETS_SECONDS} carries
+ * transfers to it. A plugin observation above `120` says nothing about any
+ * delivery in either direction -- only that the plugin measured something that
+ * took longer than two minutes.
  *
  * 13 bounds => 15 series per (plugin, metric) including `+Inf`, `_sum` and
  * `_count`.
@@ -8757,7 +8769,8 @@ function ensureRegistry(): {
         + "and le=\"120\" is the API tier's PROXY_REQUEST_TIMEOUT_MS. le=\"120\" versus +Inf "
         + "is NOT the deadline-crossing population: a destroyed delivery is an abandoned one, "
         + "and abandoned responses are excluded from this family (see above), so what sits above "
-        + "le=\"120\" is traffic that outran the nominal timeout and was delivered anyway -- a "
+        + "le=\"120\" is traffic that outran the nominal timeout and completed anyway (completed "
+        + "meaning res.writableFinished -- flushed to the socket, not acknowledged by a client) -- a "
         + "lower bound on deadline crossings, never a count (PEN-5783). "
         + "Note a pool-starvation stall raises NO 57014 at all, since "
         + "a statement that never acquires a connection never starts, so the 30s edge is "

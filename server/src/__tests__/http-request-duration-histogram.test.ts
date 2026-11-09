@@ -219,8 +219,10 @@ describe("per-route HTTP request-duration histogram (PEN-5136)", () => {
    * request counter), so a destroyed delivery is excluded by construction.
    * Measured 2026-11-09 over 22.8 h: 144 completed responses above `le="120"`,
    * 130 of them `GET /api/heartbeat-runs/:runId` -- a route with no `"0"`
-   * status series at all, i.e. 130 requests that crossed the deadline and were
-   * received. The band is a lower bound on deadline crossings, never a count.
+   * status series at all, i.e. 130 requests that crossed the deadline and
+   * completed rather than being abandoned. "Completed" is only what
+   * `res.writableFinished` reports -- flushed to the socket, not acknowledged
+   * by a client. The band is a lower bound on deadline crossings, never a count.
    */
   it("places a bucket edge at the tier's 120s delivery deadline", async () => {
     await call(buildApp(), "/api/companies/c1/issues", 200);
@@ -229,7 +231,7 @@ describe("per-route HTTP request-duration histogram (PEN-5136)", () => {
 
     expect(edges).toContain(120);
     // The deadline stays the LAST finite edge -- but not because traffic past
-    // it is lost (PEN-5783 measured 130 such requests delivered). It is that
+    // it is lost (PEN-5783 measured 130 such requests completing). It is that
     // the completed population above 120s is rare and no decision currently
     // turns on splitting it, so a further edge would spend cardinality for
     // nothing. Revisit if an acquire-bound decision needs that resolution.
