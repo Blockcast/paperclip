@@ -44,6 +44,21 @@ on:
           - none
           - emergency
           - rollback
+      # BLO-55269: dispatches are pinned to buildkit-amd64-1 for cache
+      # affinity, and the fallback below only checks TCP, so a daemon that is
+      # listening but too degraded to build is still selected. Pick 0 to route
+      # this deploy's build to the other daemon (cold cache, slower build).
+      buildkit_ordinal:
+        description: >-
+          BuildKit StatefulSet ordinal for this build. Keep 1 unless
+          buildkit-amd64-1 is failing builds (for example, `frontend grpc
+          server closed unexpectedly`).
+        required: false
+        type: choice
+        default: "1"
+        options:
+          - "1"
+          - "0"
   push:
     branches:
       - "master"
@@ -186,9 +201,17 @@ jobs:
       - name: Select BuildKit endpoint
         id: buildkit-endpoint
         env:
-          PREFERRED_ORDINAL: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_ORDINAL: ${{ inputs.buildkit_ordinal }}
         run: |
           set -euo pipefail
+          # Default in shell, not in a `&& ||` expression, so a chosen "0" is
+          # never mistaken for an unset input.
+          if [[ "${EVENT_NAME}" == "workflow_dispatch" ]]; then
+            PREFERRED_ORDINAL="${INPUT_ORDINAL:-1}"
+          else
+            PREFERRED_ORDINAL=0
+          fi
           if [[ ! "${PREFERRED_ORDINAL}" =~ ^[01]$ ]]; then
             echo "Invalid BuildKit ordinal: ${PREFERRED_ORDINAL}" >&2
             exit 1

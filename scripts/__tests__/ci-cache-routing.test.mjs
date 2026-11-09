@@ -27,9 +27,12 @@ test("Docker builds use persistent remote BuildKit, master cache, and bounded co
 
   assert.ok(buildJob, "build-and-push job is missing");
   assert.match(buildJob, /\n    runs-on: arc-paperclip-buildkit\n/);
+  // BLO-55269: dispatch defaults to ordinal 1 but an operator can pick 0; push stays on 0.
+  assert.match(workflow, /\n      buildkit_ordinal:\n[\s\S]*?type: choice\n        default: "1"\n        options:\n          - "1"\n          - "0"\n/);
+  assert.match(buildJob, /INPUT_ORDINAL: \$\{\{ inputs\.buildkit_ordinal \}\}/);
   assert.match(
     buildJob,
-    /PREFERRED_ORDINAL: \$\{\{ github\.event_name == 'workflow_dispatch' && '1' \|\| '0' \}\}/,
+    /if \[\[ "\$\{EVENT_NAME\}" == "workflow_dispatch" \]\]; then\n\s+PREFERRED_ORDINAL="\$\{INPUT_ORDINAL:-1\}"\n\s+else\n\s+PREFERRED_ORDINAL=0\n\s+fi/,
   );
   assert.match(
     buildJob,
