@@ -1026,6 +1026,72 @@ const ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE = "paperclip_monitor_dispatch";
 const ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX = "heartbeat_run:";
 
 /**
+ * PEN-6286: how long the dispatch watchdog may keep nudging a run that has
+ * never left the queue, measured on that RUN's age.
+ *
+ * The watchdog used to be bounded by the ASSIGNEE's `maxAttempts` — it re-armed
+ * with an incremented `attemptCount`, so every nudge spent one of the gate
+ * observations the assignee had budgeted for. That made a queue backlog
+ * indistinguishable from a monitor whose gates ran out: measured 2026-11-09,
+ * 54 of the 69 `max_attempts_exhausted` clears in this company carried this
+ * watchdog's own `serviceName`, 49 of them dying at EXACTLY the number the
+ * assignee declared and the other 5 at exactly DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS.
+ * Those monitors re-checked their declared gates ZERO times.
+ *
+ * The bound itself is not the defect — BLO-22860 added it so a run that never
+ * moves is not polled forever, and that still holds. What was missing is a budget
+ * of the watchdog's OWN, so the two can run out independently.
+ *
+ * Deliberately a WALL CLOCK, not a count. `attempts x cadence` couples re-probe
+ * promptness to how long an outage is tolerated, so shortening a hop silently
+ * shrinks coverage with nothing failing — the coupling BLO-28919 removed from the
+ * ccrotate backstop after the same class recurred four times. See
+ * CAPACITY_ESCALATION_AFTER_MS for that argument in full.
+ *
+ * Pinned to {@link ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS} rather than chosen
+ * independently, because that constant already answers this exact question for the
+ * `trigger_stalled` sweep: how old may a queued run be and still count as a live
+ * consumer that is plausibly going to be dispatched. Past it the sweep stops
+ * believing in the run and reaps the row anyway, so a watchdog that kept nudging
+ * beyond this point would be arguing with a sibling of itself. Keep them equal; if
+ * one moves, move both.
+ *
+ * It is well clear of the recovery distribution it must not truncate. Measured over
+ * the same census, `monitorLastTriggeredAt` -> `clearedAt`: watchdog episodes that
+ * RECOVERED ran p50 51 min / p90 265 min, while the ones the old attempt bound
+ * killed died at p50 170 min — i.e. the budget was cutting off waits well inside
+ * the window where recoveries were still landing.
+ */
+export const ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS = ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS;
+
+/**
+ * Re-arm cadence for the dispatch watchdog, widening with the watched run's age.
+ *
+ * A flat {@link ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS} was affordable only because
+ * the assignee's budget killed the loop within the hour. Against the wall-clock
+ * ceiling above it would mean ~288 re-arms, each a row write and an activity row,
+ * to say "still queued" — the churn BLO-29606's docblock objects to one ladder up.
+ *
+ * Same shape as {@link suppressedDispatchRearmDelayMs}: prompt while a wedge is
+ * most likely and cheapest to clear, then backing off to a steady hourly poll.
+ * 5 min for the first half hour, doubling per half-hour band, capped at one hour —
+ * ~34 re-arms over the full ceiling instead of 288, with the first six inside the
+ * first 30 minutes.
+ *
+ * Derived from the run's age rather than from a persisted retry counter on purpose:
+ * a counter is a second piece of monitor state to carry through every re-arm,
+ * clear and rebuild, and the whole point of this change is that the watchdog should
+ * not need the monitor's attempt bookkeeping to bound itself.
+ */
+function dispatchWatchdogRearmDelayMs(watchedRunAgeMs: number): number {
+  const band = Math.floor(Math.max(0, watchedRunAgeMs) / (30 * 60 * 1000));
+  return Math.min(
+    ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS * Math.pow(2, band),
+    ISSUE_MONITOR_SUPPRESSED_REARM_MAX_DELAY_MS,
+  );
+}
+
+/**
  * Context-snapshot key holding how many GitHub review-request *deliveries* a
  * single `scheduled_retry` run will settle (BLO-18859 review follow-up).
  *
@@ -16970,7 +17036,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ? "it fired but the woken run never re-armed or cleared it"
           : input.clearReason === "cancelled"
             ? `${formatIssueIdentifierLink(input.issue.identifier, "the issue")} was cancelled while a wake was still owed`
-            : "its maximum attempt count was reached";
+            : input.clearReason === "dispatch_watchdog_exhausted"
+              ? "the run it woke never left the agent queue, so its gates were never re-checked"
+              : "its maximum attempt count was reached";
 
     // PEN-5346: the `cancelled` branch is a different artifact from the others.
     // Every other reason is a report about a row that is still there to be
@@ -17765,6 +17833,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             status: heartbeatRuns.status,
             startedAt: heartbeatRuns.startedAt,
             agentId: heartbeatRuns.agentId,
+            // PEN-6286: the watchdog's own ceiling is this run's age, so the
+            // re-arm decision needs it. It is NOT NULL in the schema; the guard
+            // at the re-arm site treats an unreadable value as expired anyway,
+            // so a failed read lands on "stop and escalate" rather than on
+            // "keep polling".
+            createdAt: heartbeatRuns.createdAt,
           })
           .from(heartbeatRuns)
           .where(eq(heartbeatRuns.id, watchedRunId))
@@ -17772,7 +17846,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
       const watchedRunIsWaiting = (
         run: { status: string; startedAt: Date | null } | null,
-      ): run is { status: string; startedAt: null; agentId: string } =>
+      ): run is { status: string; startedAt: null; agentId: string; createdAt: Date } =>
         Boolean(run) && run!.status === "queued" && !run!.startedAt;
       const settleWatchdogAsRecovered = async (
         run: { status: string; startedAt: Date | null } | null,
@@ -17831,11 +17905,35 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }
 
       // Still stuck after an explicit dispatch pass. Re-arm rather than consume
-      // the timer, but count the attempt so this is bounded: once maxAttempts is
-      // reached the clearReason path below surfaces/escalates the issue instead
-      // of polling a run that never moves.
-      if (!clearReason) {
-        const retryCheckAt = new Date(input.now.getTime() + ISSUE_MONITOR_DISPATCH_REARM_DELAY_MS);
+      // the timer, bounded by the watchdog's OWN wall clock rather than by the
+      // assignee's attempt budget (PEN-6286).
+      //
+      // This fire did real work — it re-dispatched the stuck run — and BLO-22860
+      // is right that it must not re-arm forever. What it must NOT do is pay for
+      // that out of `maxAttempts`, which is the number of times the ASSIGNEE
+      // asked to look at its own declared gates. Those gates are not even on this
+      // monitor any more: the lapse sweep replaced `gateSignals` with
+      // `heartbeat_run:<id>` when it minted the watchdog. So every nudge charged
+      // against that budget bought zero gate observations, and the budget running
+      // out stopped meaning "the polling was not working".
+      //
+      // `attemptCount: priorAttemptCount` therefore PRESERVES the count rather
+      // than restoring it: a refund (the omitted-argument default) would be wrong
+      // too, because the attempt the original fire consumed was a real fire of
+      // the assignee's monitor.
+      //
+      // An explicit `timeoutAt` still binds and is honoured below — that is a
+      // deadline the assignee declared against the wall clock, which is the same
+      // currency this ceiling is denominated in, so the two compose. Only the
+      // attempt-count arm is taken out of the watchdog's way.
+      const watchedRunAgeMs = input.now.getTime() - redispatchedRun.createdAt.getTime();
+      const watchdogExpired =
+        !Number.isFinite(watchedRunAgeMs) || watchedRunAgeMs >= ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS;
+      // Fail CLOSED: only a readable age strictly inside the ceiling keeps the
+      // loop alive. An unreadable or absurd timestamp escalates rather than
+      // polling forever, which is the direction BLO-22860 cares about.
+      if (clearReason !== "timeout_exceeded" && !watchdogExpired) {
+        const retryCheckAt = new Date(input.now.getTime() + dispatchWatchdogRearmDelayMs(watchedRunAgeMs));
         const retryPolicy = normalizeIssueExecutionPolicy({
           ...policy,
           monitor: { ...monitor, nextCheckAt: retryCheckAt.toISOString() },
@@ -17848,7 +17946,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             rearmPatch: buildIssueMonitorDispatchRearmPatch({
               issue: claimed,
               policy: retryPolicy,
-              attemptCount: nextAttemptCount,
+              // PEN-6286: preserve, do not spend. See the comment above the
+              // `watchdogExpired` guard for why neither incrementing (the old
+              // behaviour) nor refunding (the omitted-argument default) is right.
+              attemptCount: priorAttemptCount,
             }),
             updatedAt: input.now,
             actorType: input.actorType,
@@ -17874,7 +17975,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               watchedRunId,
               watchedRunAgentId: watchedRun.agentId,
               nextCheckAt: retryCheckAt.toISOString(),
-              monitorAttemptCount: nextAttemptCount,
+              // PEN-6286: unchanged by this re-arm, and reported so a reader can
+              // see that. `watchedRunAgeMs` against
+              // ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS is what bounds the
+              // loop now, so it is the pair worth logging.
+              monitorAttemptCount: priorAttemptCount,
+              watchedRunAgeMs,
+              watchdogMaxWaitMs: ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS,
             },
           });
           return {
@@ -17883,8 +17990,30 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           };
         }
       }
-      // Attempts exhausted — fall through to clearIssueMonitorAndRecover so the
-      // strand is surfaced to a human/recovery lane rather than polled forever.
+      // The watchdog is done with this run — give up and surface the strand to a
+      // human/recovery lane rather than polling a run that never moves.
+      //
+      // PEN-6286: reported under its own clear reason. `max_attempts_exhausted`
+      // here was a report about QUEUE BACKLOG wearing the label of a monitor
+      // whose gates ran out, and those two want opposite responses from the owner
+      // — re-arm and keep waiting versus stop waiting, the gate is not coming.
+      // An explicit `timeoutAt` keeps its own reason: the assignee set that
+      // deadline and is owed it by name.
+      return clearIssueMonitorAndRecover({
+        claimed,
+        policy,
+        scheduledAtIso,
+        nextAttemptCount,
+        clearReason: clearReason === "timeout_exceeded" ? clearReason : "dispatch_watchdog_exhausted",
+        recoveryPolicy,
+        monitor,
+        now: input.now,
+        actorType: input.actorType,
+        actorId: input.actorId,
+        agentId: input.agentId,
+        runId: input.runId,
+        activitySource: input.activitySource,
+      });
     }
 
     if (clearReason) {

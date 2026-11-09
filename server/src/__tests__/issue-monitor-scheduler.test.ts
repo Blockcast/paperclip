@@ -29,7 +29,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
-import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS, TIMER_PRE_DISPATCH_EXCLUSION_SOURCE } from "../services/heartbeat.js";
+import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS, ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS, TIMER_PRE_DISPATCH_EXCLUSION_SOURCE } from "../services/heartbeat.js";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   normalizeIssueExecutionPolicy,
@@ -573,6 +573,13 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   );
 
   it("re-dispatches and re-arms when the watchdog fires on a run that is still queued", async () => {
+    // PEN-6286: the BLO-22860 regression below still holds — the watchdog must
+    // re-arm rather than consume the timer. What changed is the CURRENCY the
+    // re-arm is paid in: it no longer increments `monitorAttemptCount`, because
+    // that counter is the assignee's budget for observing its OWN declared gates,
+    // and the watchdog monitor does not carry those gates any more (the lapse
+    // sweep replaced them with `heartbeat_run:<id>`).
+    //
     // Regression for BLO-22860: the watchdog re-armed a monitor but left the
     // stale run queued. When it fired, enqueueWakeup coalesced into that same
     // queued run without dispatching, and the triggered patch cleared
@@ -624,10 +631,18 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       status: "scheduled",
       serviceName: "paperclip_monitor_dispatch",
     });
+    // PEN-6286: this assertion used to read `.toBeGreaterThan(...)`, pinning the
+    // behaviour that made a queue backlog spend the ASSIGNEE's gate budget. It is
+    // deliberately a NEGATIVE now — the failure mode is a well-meant re-widening
+    // back to "count the attempt so the loop is bounded", which was true about
+    // boundedness and wrong about whose budget pays for it. The loop is still
+    // bounded; it is bounded by ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS, which
+    // the "gives up ... once the watched run is older than its own ceiling" test
+    // below exercises.
     expect(
       issue.monitorAttemptCount,
-      "a watchdog fire that did dispatch work consumes an attempt, so the retry loop is bounded",
-    ).toBeGreaterThan(armed.monitorAttemptCount ?? 0);
+      "a watchdog re-arm must not spend the assignee's gate-observation budget (PEN-6286)",
+    ).toBe(armed.monitorAttemptCount ?? 0);
 
     const activity = await db
       .select()
@@ -635,6 +650,125 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .where(eq(activityLog.entityId, issueId))
       .then((rows) => rows.map((row) => row.action));
     expect(activity).toContain("issue.monitor_dispatch_watchdog_redispatched");
+  });
+
+  it("re-arms the watchdog even when the assignee's attempt budget is already spent (PEN-6286)", async () => {
+    // The sharp regression. Before PEN-6286 the watchdog branch was gated on
+    // `if (!clearReason)`, where `clearReason` was computed from the ASSIGNEE's
+    // `maxAttempts`. So a monitor whose gate budget had run out could not be
+    // nudged at all — the platform stopped trying to dispatch a run it had
+    // already queued, and reported the result as "its maximum attempt count was
+    // reached", which is a statement about gate polling that never happened.
+    const { issueId } = await seedFixture({ monitor: { maxAttempts: 5 } });
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+    await db.update(issues).set({ executionRunId: queuedRun.id }).where(eq(issues.id, issueId));
+
+    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await heartbeat.tickTimers(lapseDetectedAt);
+    const armed = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(armed.monitorNextCheckAt, "watchdog armed").not.toBeNull();
+    const watchdogDueAt = armed.monitorNextCheckAt!;
+
+    // Spend the assignee's budget to its declared ceiling. `priorAttemptCount`
+    // is read off this column, and `maxAttempts` off the policy monitor the
+    // lapse sweep carried forward, so this is exactly the state a monitor
+    // reaches after a full run of genuine gate polling.
+    await db.update(issues).set({ monitorAttemptCount: 5 }).where(eq(issues.id, issueId));
+
+    await heartbeat.tickTimers(new Date(watchdogDueAt.getTime() + 1000));
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: watchdogDueAt })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(
+      issue.monitorNextCheckAt,
+      "an exhausted GATE budget must not stop the platform re-dispatching its own stuck run",
+    ).not.toBeNull();
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "scheduled",
+      serviceName: "paperclip_monitor_dispatch",
+    });
+    expect(issue.monitorAttemptCount, "still not spending the gate budget").toBe(5);
+  });
+
+  it("gives up as dispatch_watchdog_exhausted once the watched run is older than its own ceiling (PEN-6286)", async () => {
+    // The other half of the same change: taking the attempt bound out of the
+    // watchdog's way is only safe because the watchdog gained a bound of its
+    // own. BLO-22860's requirement — never poll a run that never moves, forever
+    // — is now carried by ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS on the
+    // watched run's age, and the give-up is reported under its own clear reason
+    // so a reader can tell it from a monitor whose gates genuinely ran out.
+    expect(
+      ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS,
+      "the ceiling is pinned to the live-consumer age the trigger_stalled sweep uses; move both or neither",
+    ).toBe(ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS);
+
+    const { issueId } = await seedFixture();
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+    await db.update(issues).set({ executionRunId: queuedRun.id }).where(eq(issues.id, issueId));
+
+    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await heartbeat.tickTimers(lapseDetectedAt);
+    const armed = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(armed.monitorNextCheckAt, "watchdog armed").not.toBeNull();
+    const watchdogDueAt = armed.monitorNextCheckAt!;
+
+    // Age the watched run past the watchdog's ceiling. Nothing about the
+    // assignee's attempt budget is touched — this must terminate on the clock
+    // alone.
+    const expiredAt = new Date(watchdogDueAt.getTime() + 1000);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(expiredAt.getTime() - ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS - 1000) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    await heartbeat.tickTimers(expiredAt);
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: expiredAt })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt, "the watchdog stops rather than polling forever").toBeNull();
+    const monitor = parseIssueExecutionState(issue.executionState)?.monitor;
+    expect(monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "dispatch_watchdog_exhausted",
+    });
+    expect(
+      monitor?.clearReason,
+      "a queue-backlog give-up must not be reported as the assignee's gate budget running out",
+    ).not.toBe("max_attempts_exhausted");
   });
 
   it("clears the watchdog once the watched run leaves the dispatch queue", async () => {
