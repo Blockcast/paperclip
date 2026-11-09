@@ -511,6 +511,77 @@ Configured per-instance via the host's plugin settings UI. Schema lives in
 | `fallbackAgentName`  | string  | conditionally | Exact agent name used when no mapped owner or issue route resolves. Ownerless creation is refused if this is missing or ambiguous. |
 | `issueRouteMap`      | object  | no       | `{ <labelKey>: { <labelValue>: { projectId, goalId, assigneeAgentId, status } } }`. |
 | `alertmanagerApiUrl` | string  | no       | Base URL of the Alertmanager these webhooks come from, e.g. `http://alertmanager.monitoring.svc.cluster.local:9093`. Enables the escalation liveness read above. If unset here, falls back to the host env var `PAPERCLIP_ALERTMANAGER_API_URL` (forwarded to plugin workers); a value set here always wins. Neither set = the ladder still runs but never claims liveness. |
+| `prometheusApiUrl` | string | no | Base URL of the Prometheus behind that Alertmanager, e.g. `http://prometheus.monitoring.svc.cluster.local:9090`. Read by the cover CLOSE path only (PEN-6236), to ask whether a source alertname is `pending`. Falls back to `PAPERCLIP_PROMETHEUS_API_URL`. Unset = the close records `pending_check_unconfigured` and behaves exactly as it did before PEN-6236. |
+| `prometheusReadTimeoutMs` | number | no | Per-call cap on that read, headers and body. Defaults to 5000. |
+| `coverPendingRecheckLimitMinutes` | number | no | How long past the close hold a `pending` or unreadable answer may keep deferring a cover's close, measured from the newest member `resolved_at`. Defaults to 240. Past it the cover closes with the verdict recorded. |
+| `coverCloseHoldMinutes` | number | no | Minutes every source alert must stay resolved before the cover closes (BLO-42259). Defaults to 15. ⚠ Raising this is NOT the remedy for a cover closing mid-incident — see below. |
+| `coverDedupWindowMinutes` | number | no | Width of the board-cover dedup window. Defaults to 120. |
+
+### Cover close: why the source is checked against Prometheus, not Alertmanager (PEN-6236)
+
+The close hold exists so a resolve-then-re-fire does not lose its cover: a
+re-fire inside the hold reopens membership. **A re-fire cannot arrive before
+`for:` has re-accumulated.** A Prometheus config reload replaces the rule
+group, which discards `activeAt`; the alert drops back to `pending` and the
+earliest it may fire again is `activeAt + for`. So the reopen branch is
+reachable only when `resolve_delivery_lag + hold > for`.
+
+Measured on the Blockcast estate 2026-11-09 over 1199 loaded alerting rules:
+
+| | |
+|---|---|
+| `for:` median | **900 s — exactly the default hold** |
+| `for: > 900 s` | **347 / 1199 = 28.9 %** |
+| `for:` max | **259,200 s = 72 h** |
+| `keep_firing_for > 0` | 24 / 1199 |
+
+⛔ **Do not fix this by raising `coverCloseHoldMinutes`.** To work by waiting,
+the hold would have to exceed the longest source `for:` — unbounded at 72 h
+here — and a 72-hour hold re-creates BLO-42259's precursor defect in the
+opposite direction: a genuinely resolved cover that never closes.
+
+⛔ **And do not fix it on the alert rules.** Lengthening `for:` makes it
+strictly worse (the gap the hold must cover *is* `for:`). `keep_firing_for`
+would work but is per-rule across 1199 rules, where the hold is one config
+value.
+
+The fix is a CHECK with a deadline. **Alertmanager has no representation of
+`pending`** — an alert enters it only once it fires — so the question is
+unanswerable with the instrument the plugin already had. Prometheus answers it
+as `ALERTS{alertstate="pending"}`.
+
+| Prometheus says | inside `coverCloseHoldMinutes + coverPendingRecheckLimitMinutes` | past it |
+|---|---|---|
+| a pending series exists | close deferred, `pending_deferral_count` incremented | closes, `close_verdict = pending_recheck_expired` |
+| no pending series | closes, `close_verdict = source_cleared` | same |
+| unreadable / unparseable / non-2xx | close deferred | closes, `close_verdict = pending_check_unavailable` |
+| not configured | closes immediately, `close_verdict = pending_check_unconfigured` (no extra query is issued) | same |
+
+`unknown` is never folded into `not-pending`. Every way the read can break
+produces the same empty-vector *shape* as the good news, so the three states
+are kept distinct and only an actual completed, well-formed read that found no
+pending sample permits a `source_cleared`.
+
+⚠ **Only `source_cleared` is positive evidence.** A census over
+`close_verdict` that counts the other four as clears is making exactly the
+error the column exists to expose.
+
+### A re-minted cover carries its predecessor's content (PEN-6236)
+
+On a ladder restart `escalationAttempt` resets and the rung-3 branch mints a
+**new** cover from the fixed template. Measured 2026-11-09: 14 covers against
+7 distinct source alerts, so half of all covers ever minted are re-mints of a
+source that already had one — and each arrived carrying nothing its
+predecessor had been told.
+
+A cover minted for an alertname that already had one now carries a `Previous
+cover for <alertname>` section naming the predecessor row, its close verdict,
+and a bounded excerpt of its most recent furnished comments. Plugin-authored
+(`[alert-escalation]`), system and deleted comments are excluded — carrying
+those forward would fill the section with the machine's own sentences, which
+is precisely the content that is *not* furnished. The lookup is fail-safe in
+the direction that keeps the cover: any error degrades the section and is
+logged, never blocks the mint.
 
 ### Example `AlertmanagerConfig` YAML
 

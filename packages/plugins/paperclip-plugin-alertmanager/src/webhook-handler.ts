@@ -37,7 +37,7 @@ import {
 } from "./owner-resolver.js";
 import type { CompanyAgentRoster } from "./owner-resolver.js";
 import { aggregateKeyForAlert } from "./aggregate-key.js";
-import { coverCloseHoldMinutes, escalationDeadlineMs, hasLiveBlocker, recordSourceResolvedAndCloseCovers, reopenOpenCoverMembership } from "./escalation.js";
+import { buildCoverCloseGuard, coverCloseHoldMinutes, escalationDeadlineMs, hasLiveBlocker, recordSourceResolvedAndCloseCovers, reopenOpenCoverMembership } from "./escalation.js";
 import {
   ORIGIN_KIND,
   type AlertStateRecord,
@@ -4067,6 +4067,11 @@ export async function handleResolved(
       existing.paperclipCompanyId,
       aggregateResolution.issueId,
       coverCloseHoldMinutes(config),
+      // PEN-6236 — the resolve path is where defect A actually bites: this is
+      // the delivery that marks the member resolved and starts the hold the
+      // source rule cannot re-fire inside. Built per delivery rather than
+      // hoisted, so the memoised read is scoped to this one close.
+      buildCoverCloseGuard(config, new Date(), ctx.logger),
     );
 
     // BLO-31736: authorship is a property of the *issue*, but this record is
@@ -4150,6 +4155,11 @@ export async function handleResolved(
       existing.paperclipCompanyId,
       aggregateResolution.issueId,
       coverCloseHoldMinutes(config),
+      // PEN-6236 — the resolve path is where defect A actually bites: this is
+      // the delivery that marks the member resolved and starts the hold the
+      // source rule cannot re-fire inside. Built per delivery rather than
+      // hoisted, so the memoised read is scoped to this one close.
+      buildCoverCloseGuard(config, new Date(), ctx.logger),
     );
 
     await ctx.events.emit(

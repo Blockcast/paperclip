@@ -157,6 +157,34 @@ export interface AlertmanagerPluginConfig {
    * cover closes (BLO-42259). Defaults to `DEFAULT_COVER_CLOSE_HOLD_MINUTES`.
    */
   coverCloseHoldMinutes?: number;
+  /**
+   * Prometheus base URL (PEN-6236), e.g. `http://prometheus:9090`. Read by
+   * the cover CLOSE path only, to ask whether a source alertname is currently
+   * `pending` — the state Alertmanager cannot represent and the close was
+   * therefore blind to. Falls back to `PAPERCLIP_PROMETHEUS_API_URL`.
+   *
+   * Unset is a supported state: the close then records the verdict
+   * `pending_check_unconfigured` instead of asserting the source was clear.
+   * It is NOT read by the escalation ladder, whose question ("is this incident
+   * live?") Alertmanager already answers.
+   */
+  prometheusApiUrl?: string;
+  /**
+   * Per-call timeout for that read. Defaults to
+   * `DEFAULT_PROMETHEUS_READ_TIMEOUT_MS`.
+   */
+  prometheusReadTimeoutMs?: number;
+  /**
+   * Minutes past the close hold that a `pending` or unreadable Prometheus
+   * answer may keep deferring a cover's close (PEN-6236), measured from the
+   * newest member `resolved_at`. Past it the cover closes with the verdict
+   * recorded. Defaults to `DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES`.
+   *
+   * This is the bound that keeps a fail-closed guard from becoming an
+   * unbounded freeze; see the constant's own note for why a longer hold is not
+   * the alternative.
+   */
+  coverPendingRecheckLimitMinutes?: number;
 }
 
 // ---------------------------------------------------------------------------

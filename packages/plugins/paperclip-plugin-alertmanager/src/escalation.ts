@@ -1,7 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { PLUGIN_STATE_PRECONDITION_FAILED_CODE, type PluginContext } from "@paperclipai/plugin-sdk";
 import { isNonHumanUserSentinel } from "@paperclipai/shared";
-import { DEFAULT_COVER_CLOSE_HOLD_MINUTES, DEFAULT_COVER_DEDUP_WINDOW_MINUTES, DEFAULT_ESCALATION_DEADLINE_MINUTES, alertStateRef } from "./constants.js";
+import {
+  DEFAULT_COVER_CLOSE_HOLD_MINUTES,
+  DEFAULT_COVER_DEDUP_WINDOW_MINUTES,
+  DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES,
+  DEFAULT_ESCALATION_DEADLINE_MINUTES,
+  alertStateRef,
+} from "./constants.js";
+import { createSweepPendingReader, hasPrometheusEndpoint, type PendingReader } from "./prometheus-pending.js";
 import { UNDELIVERED_WAKE_OUTCOMES, type WakeOutcome, recordAttendanceObservation } from "./attendance-record.js";
 import { resolveIssueRoute } from "./issue-route-resolver.js";
 import { ORIGIN_KIND, type AlertmanagerAlert, type AlertmanagerPluginConfig, type AlertStateRecord } from "./types.js";
@@ -470,6 +477,100 @@ async function upsertOpenMember(ctx: PluginContext, coverIssueId: string, alertI
  *     (BLO-16120) — not a free-form comment — so resolving any one member
  *     never has to guess whether siblings are still firing.
  */
+/** Upper bounds on the carried excerpt — see `previousCoverCarryOver`. */
+const CARRY_OVER_MAX_COMMENTS = 3;
+const CARRY_OVER_MAX_CHARS = 1_800;
+
+/**
+ * PEN-6236 defect B — what the predecessor cover was told, carried into its
+ * successor.
+ *
+ * ## The defect
+ *
+ * A cover's body is a fixed two-sentence template plus a liveness line.
+ * Nothing else ever reaches it. When the ladder restarts — a genuine
+ * resolve-and-re-fire, a suppression window reopening, or defect A cancelling
+ * the cover underneath a condition that never cleared — `escalationAttempt`
+ * resets, the rung-3 branch runs again, and it mints a BRAND NEW cover from
+ * that same template. Whatever the previous cover accumulated is left behind
+ * on a closed row, and nothing wakes anyone to re-write it.
+ *
+ * Re-minting is the dominant pattern, not an edge case: measured 2026-11-09,
+ * 14 covers against 7 distinct source alerts, so half of all covers ever
+ * minted are re-mints of a source that already had one. PEN-5903 was furnished
+ * by two seats with executable dispositions, was auto-closed, and its
+ * successor PEN-6224 arrived carrying the bare template.
+ *
+ * ## What is carried, and why a pointer is not enough on its own
+ *
+ * Both: a link the assignee can follow, AND a bounded excerpt of the most
+ * recent furnished comments. The excerpt is what makes the pointer worth
+ * following — a bare "see PEN-5903" reads as boilerplate, and the whole
+ * failure mode here is a board member opening a row that looks like it has
+ * nothing in it.
+ *
+ * Plugin-authored comments are excluded by prefix: every one this module
+ * writes starts `[alert-escalation]`, and carrying them forward would fill the
+ * section with the machine's own sentences — which is precisely the content
+ * that is NOT furnished.
+ *
+ * ## Fail-safe, in the direction that keeps the cover
+ *
+ * Every failure here is swallowed and degrades the section, never the cover.
+ * A cover that exists without its history is the status quo; a cover that
+ * failed to mint because a history lookup threw is a board escalation that
+ * never happened. `createCover` is already the last rung of the ladder, so
+ * there is nothing behind it to catch that.
+ */
+async function previousCoverCarryOver(
+  ctx: PluginContext,
+  companyId: string,
+  alertname: string,
+): Promise<string> {
+  const ns = ctx.db.namespace;
+  try {
+    const rows = await ctx.db.query<{ cover_issue_id: string; close_verdict: string | null }>(
+      `SELECT cover_issue_id, close_verdict
+         FROM ${q(ns, COVERS_TABLE)}
+        WHERE company_id = $1 AND alertname = $2 AND cancelled_at IS NOT NULL
+        ORDER BY cancelled_at DESC
+        LIMIT 1`,
+      [companyId, alertname],
+    );
+    const previous = rows[0];
+    if (!previous) return "";
+    const priorIssue = await ctx.issues.get(previous.cover_issue_id, companyId);
+    const label = priorIssue?.identifier ?? previous.cover_issue_id;
+    const header = `\n\n---\n\n## Previous cover for \`${alertname}\`: ${label}\n\nThis is not the first cover opened for this source. ${label} covered it before and is now closed`
+      + (previous.close_verdict ? ` (close verdict \`${previous.close_verdict}\`)` : "")
+      + `. Anything decided there still applies unless it is superseded here — the ladder restarted, the ask did not.`;
+
+    const comments = await ctx.issues.listComments(previous.cover_issue_id, companyId);
+    const furnished = comments
+      .filter((c) => !c.deletedAt && c.authorType !== "system" && !c.body.startsWith("[alert-escalation]"))
+      .slice(-CARRY_OVER_MAX_COMMENTS);
+    if (furnished.length === 0) {
+      return `${header}\n\n${label} carried no furnished comment of its own, so there is nothing to quote here.`;
+    }
+    const quoted = furnished.map((c) => {
+      // `createdAt` is typed `Date` but crosses the worker JSON-RPC boundary
+      // as an ISO string in production, the same split `hasArmedMonitor`
+      // documents. Rendering a `[object Object]` here would be cosmetic; being
+      // wrong about which shape arrives is how a guard passes its tests and is
+      // inert in production, so both are handled.
+      const at = c.createdAt instanceof Date ? c.createdAt.toISOString() : String(c.createdAt ?? "");
+      const body = c.body.length > CARRY_OVER_MAX_CHARS
+        ? `${c.body.slice(0, CARRY_OVER_MAX_CHARS)}\n\n… truncated; the full comment is on ${label}.`
+        : c.body;
+      return `**${at}**\n\n${body.split("\n").map((line) => `> ${line}`).join("\n")}`;
+    }).join("\n\n");
+    return `${header}\n\n### Carried from ${label} (${furnished.length} most recent furnished comment(s))\n\n${quoted}`;
+  } catch (err) {
+    ctx.logger.warn(`alert-escalation: could not carry over the previous cover for ${alertname}: ${String(err)}`);
+    return "";
+  }
+}
+
 async function createCover(
   ctx: PluginContext,
   issue: NonNullable<Awaited<ReturnType<PluginContext["issues"]["get"]>>>,
@@ -497,6 +598,10 @@ async function createCover(
 
   const windowMinutes = config.coverDedupWindowMinutes ?? DEFAULT_COVER_DEDUP_WINDOW_MINUTES;
   const fingerprint = coverDedupFingerprint(alertname, windowMinutes, now);
+  // PEN-6236: read once, ahead of the create/join loop, so a retry of the
+  // conflict branch does not pay for it twice and the two attempts cannot
+  // disagree about what the predecessor said.
+  const carryOver = await previousCoverCarryOver(ctx, companyId, alertname);
   const members = await ctx.access.members.list({ companyId });
   // `local-board` is a real `user` row with an owner membership, so a bare
   // role test picks it first and the cover — whose whole text is "Board
@@ -523,7 +628,7 @@ async function createCover(
         projectId: issue.projectId ?? undefined,
         goalId: issue.goalId ?? undefined,
         title: `[user-cover] unresolved alert escalation: ${issue.identifier ?? issue.title}`,
-        description: `Alert ${issue.identifier ?? issue.id} exhausted its agent chain while this issue remained open. Board direction is required.\n\n${livenessLine(liveness, state, now)}`,
+        description: `Alert ${issue.identifier ?? issue.id} exhausted its agent chain while this issue remained open. Board direction is required.\n\n${livenessLine(liveness, state, now)}${carryOver}`,
         status: "todo",
         priority: issue.priority,
         assigneeUserId: owner?.principalId ?? null,
@@ -532,10 +637,10 @@ async function createCover(
         originFingerprint: fingerprint,
       });
       await ctx.db.execute(
-        `INSERT INTO ${q(ns, COVERS_TABLE)} (cover_issue_id, company_id, dedup_fingerprint)
-         VALUES ($1, $2, $3)
+        `INSERT INTO ${q(ns, COVERS_TABLE)} (cover_issue_id, company_id, dedup_fingerprint, alertname)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (cover_issue_id) DO NOTHING`,
-        [created.id, companyId, fingerprint],
+        [created.id, companyId, fingerprint, alertname],
       );
       await upsertOpenMember(ctx, created.id, issue.id);
       return;
@@ -547,10 +652,10 @@ async function createCover(
       // whichever caller reaches it first, even if the winner's own insert
       // above hasn't landed yet (or failed) when this loser runs.
       await ctx.db.execute(
-        `INSERT INTO ${q(ns, COVERS_TABLE)} (cover_issue_id, company_id, dedup_fingerprint)
-         VALUES ($1, $2, $3)
+        `INSERT INTO ${q(ns, COVERS_TABLE)} (cover_issue_id, company_id, dedup_fingerprint, alertname)
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT (cover_issue_id) DO NOTHING`,
-        [retained.id, companyId, fingerprint],
+        [retained.id, companyId, fingerprint, alertname],
       );
       const attached = await upsertOpenMember(ctx, retained.id, issue.id);
       if (attached) {
@@ -611,11 +716,20 @@ export async function reopenOpenCoverMembership(ctx: PluginContext, alertIssueId
  * meant a `createComment` failure left the cover reading as "resolution
  * comment posted" when it never was, and nothing ever retried it.
  */
-async function closeCoverIfEligible(ctx: PluginContext, companyId: string, coverIssueId: string, holdMinutes: number): Promise<void> {
+async function closeCoverIfEligible(
+  ctx: PluginContext,
+  companyId: string,
+  coverIssueId: string,
+  holdMinutes: number,
+  guard: CoverCloseGuard | null,
+): Promise<void> {
   const ns = ctx.db.namespace;
+  const verdict = await decideCoverClose(ctx, coverIssueId, holdMinutes, guard);
+  if (!verdict) return; // not eligible yet, or the guard is holding the close open
   const claim = await ctx.db.execute(
     `UPDATE ${q(ns, COVERS_TABLE)} AS c
-     SET closing_claimed_at = now(), updated_at = now()
+     SET closing_claimed_at = now(), updated_at = now(),
+         close_verdict = $3, close_verdict_detail = $4
      WHERE c.cover_issue_id = $1
        AND c.closing_claimed_at IS NULL
        AND c.cancelled_at IS NULL
@@ -624,10 +738,99 @@ async function closeCoverIfEligible(ctx: PluginContext, companyId: string, cover
          WHERE m.cover_issue_id = c.cover_issue_id
            AND (m.resolved_at IS NULL OR m.resolved_at > now() - make_interval(mins => $2::int))
        )`,
-    [coverIssueId, holdMinutes],
+    [coverIssueId, holdMinutes, verdict.verdict, verdict.detail],
   );
   if (claim.rowCount === 0) return; // not yet eligible (open member, or still inside the hold), or another caller already claimed it
   await finalizeCoverCancellation(ctx, companyId, coverIssueId);
+}
+
+/**
+ * PEN-6236 — the close decision, ahead of the claim.
+ *
+ * Returns the verdict to stamp, or `null` to leave the cover open.
+ *
+ * ## Why this read sits BEFORE the claim and not inside it
+ *
+ * The claim is a single atomic UPDATE and must stay that way — it is what
+ * serialises concurrent closers. A network read cannot live inside it. So this
+ * runs first, as a cheap indexed SELECT that also short-circuits the HTTP call
+ * for the overwhelmingly common case of a cover that is not eligible anyway
+ * (an unresolved member, or still inside the hold).
+ *
+ * That ordering has a benign race: between this read and the claim, a member
+ * can re-open. The claim's own `NOT EXISTS` still sees it and refuses, so the
+ * cover stays open — the race can only make the close MORE conservative, never
+ * less. The verdict stamped is then simply never written, because the UPDATE
+ * that would have written it matched no row.
+ *
+ * ## Polarity
+ *
+ * `pending` and `unknown` both defer, inside a window bounded by
+ * `recheckLimitMinutes` measured from the newest member `resolved_at`. Past
+ * that window the cover closes with a verdict naming which of the two it was.
+ * A deferral is therefore strictly bounded and cannot become the unbounded
+ * freeze that a longer hold would be — see
+ * `DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES`.
+ */
+async function decideCoverClose(
+  ctx: PluginContext,
+  coverIssueId: string,
+  holdMinutes: number,
+  guard: CoverCloseGuard | null,
+): Promise<{ verdict: CoverCloseVerdict; detail: string | null } | null> {
+  const ns = ctx.db.namespace;
+  // Short-circuit ahead of the SELECT, not after it: an instance with no
+  // Prometheus configured must issue exactly the queries it issued before this
+  // change, so "behaviour-neutral until configured" is a property of the call
+  // graph rather than of the answers.
+  if (!guard || !guard.configured) return { verdict: "pending_check_unconfigured", detail: null };
+  const [row] = await ctx.db.query<{ alertname: string | null; eligible: boolean; within_recheck: boolean }>(
+    `SELECT c.alertname,
+            NOT EXISTS (
+              SELECT 1 FROM ${q(ns, MEMBERS_TABLE)} m
+              WHERE m.cover_issue_id = c.cover_issue_id
+                AND (m.resolved_at IS NULL OR m.resolved_at > now() - make_interval(mins => $2::int))
+            ) AS eligible,
+            EXISTS (
+              SELECT 1 FROM ${q(ns, MEMBERS_TABLE)} m
+              WHERE m.cover_issue_id = c.cover_issue_id
+                AND m.resolved_at > now() - make_interval(mins => $3::int)
+            ) AS within_recheck
+       FROM ${q(ns, COVERS_TABLE)} c
+      WHERE c.cover_issue_id = $1
+        AND c.closing_claimed_at IS NULL
+        AND c.cancelled_at IS NULL`,
+    [coverIssueId, holdMinutes, holdMinutes + guard.recheckLimitMinutes],
+  );
+  if (!row || !row.eligible) return null;
+  if (!row.alertname) return { verdict: "alertname_unknown", detail: null };
+
+  const pending = await guard.readPending(row.alertname);
+  if (pending.state === "not-pending") {
+    return { verdict: "source_cleared", detail: `Read at ${pending.readAt}.` };
+  }
+  if (row.within_recheck) {
+    // Still inside the bounded window: hold the cover open and say so. This is
+    // the whole of defect A — today the cover is cancelled here, underneath a
+    // rule that is re-accumulating `for:` and cannot re-fire in time to reopen
+    // membership.
+    await ctx.db.execute(
+      `UPDATE ${q(ns, COVERS_TABLE)}
+          SET pending_deferral_count = pending_deferral_count + 1,
+              last_pending_deferral_at = now(), updated_at = now()
+        WHERE cover_issue_id = $1 AND closing_claimed_at IS NULL AND cancelled_at IS NULL`,
+      [coverIssueId],
+    );
+    ctx.logger.info(
+      pending.state === "pending"
+        ? `alert-escalation: holding cover ${coverIssueId} open; source alertname ${row.alertname} is pending in Prometheus (${pending.detail})`
+        : `alert-escalation: holding cover ${coverIssueId} open; the Prometheus pending check for ${row.alertname} was inconclusive (${pending.reason})`,
+    );
+    return null;
+  }
+  return pending.state === "pending"
+    ? { verdict: "pending_recheck_expired", detail: `Last read at ${pending.readAt}: ${pending.detail}.` }
+    : { verdict: "pending_check_unavailable", detail: `Reason: ${pending.reason}.` };
 }
 
 /**
@@ -646,15 +849,29 @@ async function closeCoverIfEligible(ctx: PluginContext, companyId: string, cover
  */
 async function finalizeCoverCancellation(ctx: PluginContext, companyId: string, coverIssueId: string): Promise<void> {
   const ns = ctx.db.namespace;
-  const [row] = await ctx.db.query<{ closing_claimed_at: string | null; resolution_comment_posted_at: string | null; cancelled_at: string | null }>(
-    `SELECT closing_claimed_at, resolution_comment_posted_at, cancelled_at FROM ${q(ns, COVERS_TABLE)} WHERE cover_issue_id = $1`,
+  const [row] = await ctx.db.query<{ closing_claimed_at: string | null; resolution_comment_posted_at: string | null; cancelled_at: string | null; close_verdict: string | null; close_verdict_detail: string | null }>(
+    `SELECT closing_claimed_at, resolution_comment_posted_at, cancelled_at, close_verdict, close_verdict_detail FROM ${q(ns, COVERS_TABLE)} WHERE cover_issue_id = $1`,
     [coverIssueId],
   );
   if (!row || !row.closing_claimed_at || row.cancelled_at) return;
   if (!row.resolution_comment_posted_at) {
+    // PEN-6236: the verdict is carried in the comment as well as the column.
+    // The column is what a census reads; the comment is what the board member
+    // who was asked for direction actually opens, and until now it said the
+    // same thing whether the condition had cleared or its alert state had just
+    // been discarded underneath it.
+    //
+    // Read from the row rather than passed in, so the sweep's
+    // `reconcileStuckCovers` resumption posts the verdict the ORIGINAL claim
+    // decided rather than re-deriving one from a world that has since moved.
+    // A row written before this migration has `close_verdict` NULL, which
+    // renders as the legacy sentence alone — an honest absence, not a guess.
+    const verdictLine = row.close_verdict
+      ? `\n\n${closeVerdictLine(row.close_verdict as CoverCloseVerdict, row.close_verdict_detail)}`
+      : "";
     await ctx.issues.createComment(
       coverIssueId,
-      "[alert-escalation] All source alerts represented by this cover have resolved; closing.",
+      `[alert-escalation] All source alerts represented by this cover have resolved; closing.${verdictLine}`,
       companyId,
     );
     await ctx.db.execute(
@@ -686,6 +903,12 @@ export async function recordSourceResolvedAndCloseCovers(
   companyId: string,
   alertIssueId: string,
   holdMinutes = 0,
+  // PEN-6236. Defaulted rather than required so the many call sites that only
+  // mark membership resolved stay unchanged — but every PRODUCTION caller
+  // passes one, and `null` is the explicit "no pending check is possible here"
+  // value, which `decideCoverClose` records as a named verdict rather than
+  // treating as a clear.
+  guard: CoverCloseGuard | null = null,
 ): Promise<void> {
   const ns = ctx.db.namespace;
   const resolved = await ctx.db.execute(
@@ -701,7 +924,7 @@ export async function recordSourceResolvedAndCloseCovers(
     [alertIssueId],
   );
   for (const { cover_issue_id: coverIssueId } of coverRows) {
-    await closeCoverIfEligible(ctx, companyId, coverIssueId, holdMinutes);
+    await closeCoverIfEligible(ctx, companyId, coverIssueId, holdMinutes, guard);
   }
 }
 
@@ -711,7 +934,7 @@ export async function recordSourceResolvedAndCloseCovers(
  * every member has resolved — so the sweep is the trigger that closes a cover
  * whose members have all stayed resolved past the hold.
  */
-async function closeHeldCovers(ctx: PluginContext, companyId: string, holdMinutes: number): Promise<void> {
+async function closeHeldCovers(ctx: PluginContext, companyId: string, holdMinutes: number, guard: CoverCloseGuard): Promise<void> {
   const ns = ctx.db.namespace;
   const ready = await ctx.db.query<{ cover_issue_id: string }>(
     `SELECT c.cover_issue_id FROM ${q(ns, COVERS_TABLE)} c
@@ -725,7 +948,7 @@ async function closeHeldCovers(ctx: PluginContext, companyId: string, holdMinute
   );
   for (const { cover_issue_id: coverIssueId } of ready) {
     try {
-      await closeCoverIfEligible(ctx, companyId, coverIssueId, holdMinutes);
+      await closeCoverIfEligible(ctx, companyId, coverIssueId, holdMinutes, guard);
     } catch (err) {
       ctx.logger.warn(`alert-escalation: failed to close held cover ${coverIssueId}: ${String(err)}`);
     }
@@ -766,9 +989,13 @@ export async function runAlertEscalationSweep(ctx: PluginContext, config: Alertm
   if (!companyId) return;
   const issues = await ctx.issues.list({ companyId, originKind: ORIGIN_KIND, limit: 200 });
   const readLiveness = createSweepLivenessReader(config, now, ctx.logger);
+  // PEN-6236 — one guard per pass, memoised by alertname like the liveness
+  // reader, so a correlated outage that brings many covers ready at once costs
+  // at most one Prometheus timeout for the whole pass.
+  const closeGuard = buildCoverCloseGuard(config, now, ctx.logger);
   for (const issue of issues) {
     try {
-      await advanceIssueLadder(ctx, config, issue, companyId, now, readLiveness);
+      await advanceIssueLadder(ctx, config, issue, companyId, now, readLiveness, closeGuard);
     } catch (err) {
       // One broken issue must not stall the sweep for the rest of the fleet
       // (live incident 2026-07-11: a throwing requestWakeup aborted the whole
@@ -782,7 +1009,7 @@ export async function runAlertEscalationSweep(ctx: PluginContext, config: Alertm
     ctx.logger.warn(`alert-escalation: cover reconciliation pass failed: ${String(err)}`);
   }
   try {
-    await closeHeldCovers(ctx, companyId, coverCloseHoldMinutes(config));
+    await closeHeldCovers(ctx, companyId, coverCloseHoldMinutes(config), closeGuard);
   } catch (err) {
     ctx.logger.warn(`alert-escalation: held-cover close pass failed: ${String(err)}`);
   }
@@ -790,6 +1017,77 @@ export async function runAlertEscalationSweep(ctx: PluginContext, config: Alertm
 
 export function coverCloseHoldMinutes(config: AlertmanagerPluginConfig): number {
   return config.coverCloseHoldMinutes ?? DEFAULT_COVER_CLOSE_HOLD_MINUTES;
+}
+
+/**
+ * PEN-6236 — everything the cover CLOSE path needs to decide whether the
+ * source condition really cleared, built once per sweep pass or per webhook
+ * delivery.
+ *
+ * `configured` is a separate field rather than something inferred from the
+ * reader's answers, and that is load-bearing. An instance with no
+ * `prometheusApiUrl` gets `unknown` from every read, and treating `unknown` as
+ * "defer" would silently delay every close on such an instance by up to
+ * `recheckLimitMinutes`. With the flag, an unconfigured instance closes
+ * exactly when it does today and records the verdict
+ * `pending_check_unconfigured` — so this change is behaviour-neutral until an
+ * operator points it at a Prometheus.
+ */
+export interface CoverCloseGuard {
+  readPending: PendingReader;
+  recheckLimitMinutes: number;
+  configured: boolean;
+}
+
+export function buildCoverCloseGuard(
+  config: AlertmanagerPluginConfig,
+  now: Date,
+  logger: PluginContext["logger"],
+): CoverCloseGuard {
+  return {
+    readPending: createSweepPendingReader(config, now, logger),
+    recheckLimitMinutes: config.coverPendingRecheckLimitMinutes ?? DEFAULT_COVER_PENDING_RECHECK_LIMIT_MINUTES,
+    configured: hasPrometheusEndpoint(config),
+  };
+}
+
+/**
+ * Why a cover closed. Written at the moment the closing claim is won, so a
+ * closed cover's row answers a question the identical "all source alerts have
+ * resolved" sentence never could: did the condition CLEAR, or was its alert
+ * state DISCARDED while it still held?
+ *
+ * ⚠ Only `source_cleared` is positive evidence. The other four each name a
+ * specific reason the check could not be made, and a census that counts them
+ * as clears is making exactly the error this vocabulary exists to expose.
+ */
+export type CoverCloseVerdict =
+  /** Prometheus was read and reported no `pending` series for the alertname. */
+  | "source_cleared"
+  /** No `prometheusApiUrl` on this instance; the check is not available at all. */
+  | "pending_check_unconfigured"
+  /** Configured but unreadable past the recheck window; closed without the check. */
+  | "pending_check_unavailable"
+  /** The source stayed `pending` past the recheck window; closed anyway, bounded. */
+  | "pending_recheck_expired"
+  /** The cover carries no alertname (a pre-migration row whose fingerprint did not parse). */
+  | "alertname_unknown";
+
+/** The sentence the close comment carries, one per verdict. */
+function closeVerdictLine(verdict: CoverCloseVerdict, detail: string | null): string {
+  const suffix = detail ? ` ${detail}` : "";
+  switch (verdict) {
+    case "source_cleared":
+      return `Close verdict: \`source_cleared\` — Prometheus reports no \`pending\` series for this cover's source alertname, so the rule is not re-accumulating \`for:\`.${suffix}`;
+    case "pending_check_unconfigured":
+      return `⚠ Close verdict: \`pending_check_unconfigured\` — no \`prometheusApiUrl\` is configured, so nothing checked whether the source rule is mid-\`for:\`. Alertmanager cannot answer that question (it has no \`pending\` state), so the absence of an active alert is NOT evidence the condition cleared.${suffix}`;
+    case "pending_check_unavailable":
+      return `⚠ Close verdict: \`pending_check_unavailable\` — the Prometheus pending check could not be completed within the recheck window, and the cover was closed without it. The condition may still hold.${suffix}`;
+    case "pending_recheck_expired":
+      return `⚠ Close verdict: \`pending_recheck_expired\` — the source alertname was still \`pending\` in Prometheus when the recheck window expired, so this close is BOUNDED rather than evidenced: the condition may well still hold.${suffix}`;
+    case "alertname_unknown":
+      return `⚠ Close verdict: \`alertname_unknown\` — this cover predates the alertname column and its dedup fingerprint did not parse, so the pending check could not be addressed to anything.${suffix}`;
+  }
 }
 
 type SweepIssue = Awaited<ReturnType<PluginContext["issues"]["list"]>>[number];
@@ -857,6 +1155,7 @@ async function advanceIssueLadder(
   companyId: string,
   now: Date,
   readLiveness: LivenessReader,
+  closeGuard: CoverCloseGuard,
 ): Promise<void> {
   if (["done", "cancelled"].includes(issue.status) || !issue.originId) return;
   const ref = alertStateRef(companyId, issue.originId);
@@ -1010,7 +1309,7 @@ async function advanceIssueLadder(
       // keeps the cover open. A re-fire rather than a resolve leaves it open
       // too, which is what a firing alert should have.
       const winner = await ctx.state.get(ref) as AlertStateRecord | null;
-      if (winner?.resolvedAt) await recordSourceResolvedAndCloseCovers(ctx, companyId, issue.id, coverCloseHoldMinutes(config));
+      if (winner?.resolvedAt) await recordSourceResolvedAndCloseCovers(ctx, companyId, issue.id, coverCloseHoldMinutes(config), closeGuard);
       ctx.logger.info(`alert-escalation: abandoned cover rung for ${issue.identifier ?? issue.id}; alert state changed under the sweep`);
       return;
     }
