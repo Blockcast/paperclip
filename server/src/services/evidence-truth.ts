@@ -3,6 +3,8 @@
  * D5, D6, D11, D12).
  *
  *   workProducts ─► prRefsFromWorkProducts ─► ≤5 PrRef (webhook rows trusted for `merged`)
+ *        │          (minus PRs whose recorded
+ *        │           `owningIdentifiers` omit this issue)
  *        │                                      │
  *        │        per PR, concurrently, under one deadline:
  *        │          deploy:landed     = webhookMerged || getPullRequestGate().merged
@@ -24,6 +26,14 @@
  *    only from a webhook-stamped row; every other row is a reference whose
  *    facts GitHub must confirm.
  *
+ *    Linked is necessary and not sufficient: attachment keys on the BROAD
+ *    mention set, so a PR that cites a row once in prose is attached to it.
+ *    Since the shapes below are an `every`, that made an unrelated PR a
+ *    precondition for the citing row's `deploy:landed`. The narrow
+ *    tier-ranked set the webhook already records on the row —
+ *    `metadata.owningIdentifiers` — is what says the PR is this issue's, and
+ *    `prRefsFromWorkProducts` drops the rows that disclaim it (PEN-6321).
+ *
  * 2. `probeFailed` is not `!detected`. "GitHub says nobody reviewed this head"
  *    and "we could not ask GitHub" produce the same empty detections, and only
  *    the first is a fact about the work. The caller blocks on the first and
@@ -42,7 +52,10 @@ import {
   extractAllyReviewedHeadSha,
   hasActionablePrReviewFeedback,
 } from "./ally-review-detection.js";
-import { PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID } from "./pull-request-work-products.js";
+import {
+  PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
+  recordedPullRequestOwners,
+} from "./pull-request-work-products.js";
 import { githubSameActorLogin, type ReviewerSurfaces } from "./github-app-auth.js";
 
 export interface TruthWorkProduct {
@@ -53,6 +66,17 @@ export interface TruthWorkProduct {
 
 export interface TruthProbeInput {
   workProducts: TruthWorkProduct[];
+  /**
+   * The identifier of the issue being evaluated (`PEN-6181`), used to drop
+   * attached PRs that recorded an owning set this issue is not in (PEN-6321).
+   *
+   * Optional, and `null`/absent means "do not filter" — the caller could not
+   * tell us which issue this is, so every attached row stays in. That is the
+   * pre-PEN-6321 behaviour, and it is the safe direction here: the filter can
+   * only REMOVE conjuncts from the `every` below, so failing to apply it
+   * withholds a shape rather than manufacturing one.
+   */
+  owningIdentifier?: string | null;
 }
 
 export interface TruthProbeResult {
@@ -110,6 +134,22 @@ export interface PrRef {
   webhookMerged: boolean;
 }
 
+/**
+ * The attached pull requests, split by whether they own the issue being
+ * evaluated (PEN-6321).
+ *
+ * Returned as a pair rather than a filtered array so the exclusion is
+ * REPORTABLE. The cap branch below already establishes the rule: a PR dropped
+ * silently reads as a PR that was never attached, and the whole debugging
+ * story for a withheld shape is "which PRs did the probe actually judge?".
+ */
+export interface LinkedPrRefs {
+  /** The set the probe judges. */
+  refs: PrRef[];
+  /** Attached PRs excluded because they recorded an owning set this issue is not in. */
+  notOwned: PrRef[];
+}
+
 /** Read at most this many linked PRs. Beyond it the probe fails rather than answering from a subset. */
 export const MAX_LINKED_PRS = 5;
 /** Whole-probe budget. The gate runs inside a PATCH; a slow GitHub must not hold the request open. */
@@ -137,8 +177,36 @@ export const PER_CALL_TIMEOUT_MS = 1800;
  */
 export const MAX_SERIAL_CALLS = 4;
 
-export function prRefsFromWorkProducts(wps: TruthWorkProduct[]): PrRef[] {
-  const byKey = new Map<string, PrRef>();
+/**
+ * Does this work-product row claim to own the issue being evaluated?
+ *
+ * Work-product ATTACHMENT keys on the broad mention set — a PR that names a
+ * row once in narrative prose is attached to it — while
+ * `metadata.owningIdentifiers` records the NARROW tier-ranked set that
+ * `resolveOwningPaperclipIdentifiers` actually resolved. Reading the former
+ * and not the latter is what made an unrelated PR a conjunct in a citing
+ * row's landing evidence (PEN-6321).
+ *
+ * Three-valued, and `null` means INCLUDE. `recordedPullRequestOwners` returns
+ * `null` for "not recorded, or recorded in a shape this reader cannot parse",
+ * and every consumer picks its own safe direction there — the same discipline
+ * `pullRequestOwnsIssue` (`productivity-review.ts`) already applies to this
+ * exact question. Ours is to keep the PR: excluding on an unreadable
+ * recording would turn a fail-safe false negative into a fail-open false
+ * positive, which is strictly worse. An EMPTY recorded array is authoritative
+ * and excludes — the PR resolved an owning set and this issue is not in it.
+ */
+function rowOwnsIssue(metadata: Record<string, unknown>, owningIdentifier: string): boolean {
+  const recorded = recordedPullRequestOwners(metadata["owningIdentifiers"]);
+  if (recorded === null) return true;
+  return recorded.includes(owningIdentifier);
+}
+
+export function prRefsFromWorkProducts(
+  wps: TruthWorkProduct[],
+  owningIdentifier?: string | null,
+): LinkedPrRefs {
+  const byKey = new Map<string, PrRef & { owned: boolean }>();
   for (const wp of wps) {
     if (wp.type !== "pull_request" || !wp.metadata) continue;
     const repo = wp.metadata["repoFullName"];
@@ -154,9 +222,19 @@ export function prRefsFromWorkProducts(wps: TruthWorkProduct[]): PrRef[] {
       // OR across duplicates: one webhook row saying merged is enough, and an
       // untrusted row can never contribute the claim.
       webhookMerged: (prev?.webhookMerged ?? false) || (trusted && wp.metadata["merged"] === true),
+      // OR across duplicates for the same reason, and in the same safe
+      // direction as the `null` arm: one PR can have several rows, written at
+      // different times from different events, and an older one may predate
+      // the body line that named this issue. Any row claiming ownership keeps
+      // the PR; it is excluded only when EVERY row for it recorded a readable
+      // owning set omitting this issue.
+      owned: (prev?.owned ?? false) || !owningIdentifier || rowOwnsIssue(wp.metadata, owningIdentifier),
     });
   }
-  return Array.from(byKey.values());
+  const refs: PrRef[] = [];
+  const notOwned: PrRef[] = [];
+  for (const { owned, ...ref } of byKey.values()) (owned ? refs : notOwned).push(ref);
+  return { refs, notOwned };
 }
 
 export interface GithubTruthDeps {
@@ -803,20 +881,39 @@ export function buildGithubTruthProbe(
   const deadlineMs = timing.deadlineMs ?? PROBE_DEADLINE_MS;
   const perCallMs = timing.perCallMs ?? PER_CALL_TIMEOUT_MS;
 
-  return async ({ workProducts }) => {
-    const all = prRefsFromWorkProducts(workProducts);
+  return async ({ workProducts, owningIdentifier }) => {
+    const { refs: all, notOwned } = prRefsFromWorkProducts(workProducts, owningIdentifier);
+    // Named, never silent: an excluded PR is indistinguishable from one that
+    // was never attached, and this is the only record of why a shape the
+    // operator can see two PRs for was judged against one (PEN-6321).
+    const ownershipDiagnostics = notOwned.length === 0
+      ? []
+      : [
+        `linked-prs-not-owning-issue:${owningIdentifier}:${notOwned
+          .map((r) => `${r.repoFullName}#${r.prNumber}`)
+          .join(",")}`,
+      ];
     // Not a failure: plenty of issues legitimately have no PR. The evaluator
     // records the shapes as missing and, unlabeled, only warns.
+    //
+    // Reached when the filter above emptied a non-empty attached set, and
+    // that reading is the honest one: no pull request OWNS this issue, so the
+    // shape is exactly as unsatisfiable as it is for an issue with nothing
+    // attached. It cannot launder a shape into existence — `detections` stays
+    // empty either way, so nothing is ever CREDITED here. What it does reach,
+    // for an UNLABELED issue only, is `truth-shapes-not-required`, moving
+    // `warn` to `pass`; that warn was itself the false negative PEN-6321 is
+    // about. A labeled code issue keeps the shape required and still warns.
     if (all.length === 0)
       return {
         detections: {},
-        diagnostics: ["no-linked-pull-request"],
+        diagnostics: [...ownershipDiagnostics, "no-linked-pull-request"],
         probeFailed: false,
         noLinkedPullRequest: true,
         reviewerAuthoredPr: false,
       };
 
-    const diagnostics: string[] = [];
+    const diagnostics: string[] = [...ownershipDiagnostics];
     let probeFailed = false;
     const sorted = [...all].sort((a, b) => b.prNumber - a.prNumber);
     const refs = sorted.slice(0, MAX_LINKED_PRS);
