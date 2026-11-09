@@ -30308,10 +30308,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * can extend the shield by at most PRELAUNCH_OWNER_STALE_MS. The renewal
    * itself stops at EXTERNAL_LIFECYCLE_HARD_STALE_MS from reservedAt, the same
    * ceiling the reaper applies.
+   *
+   * BLO-55216: also stamps `heartbeat_runs.updated_at` on this process's
+   * running rows, so the peer's reaper can tell a live local-adapter run (no
+   * Job, pid only visible in this pod) from an orphan. External-lifecycle
+   * runs are stamped too but the reaper never reads `updatedAt` for them.
    */
   async function renewPrelaunchReservationOwnership() {
     const runIds = [...activeRunExecutions];
     if (runIds.length === 0) return;
+    await db
+      .update(heartbeatRuns)
+      .set({ updatedAt: new Date() })
+      .where(and(inArray(heartbeatRuns.id, runIds), eq(heartbeatRuns.status, "running")));
     await db
       .update(externalRuntimeReservations)
       .set({ updatedAt: new Date() })
@@ -31039,6 +31048,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // `activeRunExecutions` Set forever, quarantined from the reaper. Let
       // the silence/Job-liveness check below decide for external lifecycle.
       if (activeRunExecutions.has(run.id) && !externalLifecycleRun) continue;
+      // BLO-55216: the check above only sees THIS pod. Under replicas=2 a local
+      // run executing on the peer is in neither set here and its pid is not in
+      // our namespace, and the start-lock sweep runs with staleThresholdMs=0,
+      // so without this the peer's live run is reaped as process_lost. The
+      // owner renews updatedAt every PRELAUNCH_OWNER_RENEW_MS; a dead owner
+      // stops renewing and the run is reaped once the stamp is stale.
+      if (
+        !externalLifecycleRun &&
+        run.updatedAt &&
+        now.getTime() - new Date(run.updatedAt).getTime() < PRELAUNCH_OWNER_STALE_MS
+      ) continue;
       const externalLifecycleStarted = externalLifecycleRun
         ? (runsWithAdapterInvocation.has(run.id) || await timedHasAdapterInvocationEvent(run.id))
         : false;
