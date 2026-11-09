@@ -192,15 +192,26 @@ describe("PATCH /agents/:id rejects mirror-only budget writes", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
-  // The error has to name a route that actually works, or the caller retries
-  // against the same non-binding surface.
-  it("names the budgets route that writes both surfaces", async () => {
+  // The error has to tell the caller what to do next, or it retries against
+  // the same non-binding surface.
+  //
+  // PEN-6277 corrects what "next" is. This comment used to read "has to name a
+  // route that actually works" and the message named only the route -- but the
+  // budgets route is `assertBoard`-gated (`routes/costs.ts`), and this is the
+  // ONLY budget write an ordinary agent can reach, so for the exact actor
+  // class the 422 addresses the named route answers 403. Naming the required
+  // ACTOR is the actionable part; the route stays named because the reader
+  // still needs to know where enforcement lives (`budget_policies`, not the
+  // agent row).
+  it("names the board actor a cap change requires, and where enforcement lives", async () => {
     const app = createApp(boardActor);
     const res = await request(app)
       .patch(`/api/agents/${agentId}`)
       .send({ budgetMonthlyCents: 2_300_000 });
 
+    expect(res.body.error).toMatch(/board/i);
     expect(res.body.error).toContain("PATCH /api/agents/:agentId/budgets");
+    expect(res.body.error).toContain("budget_policies");
   });
 
   // Rejection is on the presence of the key, not on whether the value differs.
