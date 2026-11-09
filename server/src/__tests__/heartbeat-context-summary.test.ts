@@ -3908,6 +3908,35 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("the only guard on that window; the digest cannot see it");
   });
 
+  // Fourth finding at the fourth head, and the only one that corrects a statement of FACT
+  // rather than a gap. The clause's own escape hatch read "there is no file transport",
+  // which is measured FALSE for a seat in an agent container: PAPERCLIP_API_URL and
+  // PAPERCLIP_API_KEY are both set, and `curl -X PATCH --data @body.json` against
+  // /api/issues/<id> returns 200. That matters in the fail-CLOSED direction -- the false
+  // claim told every reader the safe path did not exist and routed them onto the one where
+  // transcription is the step under test. Demonstrated on this directive's own row
+  // 2026-11-09T14:2xZ: description read to a file, block concatenated onto it, file hashed,
+  // that file transmitted, independent re-read matching the pre-write digest
+  // (ad51ac27830514d8, 8,699 B) with the prior 6,403 bytes surviving as a byte-exact
+  // suffix. Zero transcription, so there was no transcription to check. An earlier run of
+  // mine asserted the API was unreachable from an agent pod on an HTTP 000 against the
+  // CLUSTER-INTERNAL host; the external host answers 200, and the inference from one host
+  // to all hosts is what produced the false parenthetical.
+  it("prefers the file transport where one exists, and keeps the inline-string fallback", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    // Written as a condition the reader ESTABLISHES, not a fact they must find already true.
+    expect(markdown).toContain("If your container has `PAPERCLIP_API_URL` and `PAPERCLIP_API_KEY` set");
+    expect(markdown).toContain("you have a FILE transport and should PREFER it");
+    // The reason it is preferred, stated so it transfers past this one field.
+    expect(markdown).toContain("REMOVES the step a digest can only check");
+    // The fallback survives: a seat without that transport still gets a performable step.
+    expect(markdown).toContain("Where that is unavailable and the only write path takes the body as an inline string argument");
+    expect(markdown).toContain("the transcription is the step being checked");
+    // And the old absolute is gone, not merely outranked.
+    expect(markdown).not.toContain("there is no file transport");
+  });
+
   // The announcement is NOT subject to the same caution, and saying so is the point. The
   // author of the Surface clause skipped a comment on PEN-5793 on concurrency grounds and
   // later corrected it: an append cannot overwrite anything, so the skip was pure loss.
