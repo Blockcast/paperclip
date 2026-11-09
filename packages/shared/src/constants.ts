@@ -740,6 +740,17 @@ export const ISSUE_EXECUTION_MONITOR_CLEAR_REASONS = [
   "dispatch_watchdog_recovered",
   "timeout_exceeded",
   "max_attempts_exhausted",
+  // PEN-6286: the dispatch watchdog gave up on a run that never left the queue.
+  // Distinct from `max_attempts_exhausted` for the same reason `dispatch_skipped`
+  // is distinct from `dispatch_watchdog_recovered` above: that count is the
+  // ASSIGNEE's gate-polling budget, and the watchdog is the platform retrying its
+  // own dispatch. Folding the two together made 78.3% of the `max_attempts_exhausted`
+  // population (54 of 69, measured 2026-11-09) a report about queue backlog wearing
+  // the label of a monitor whose gates ran out — and those two want opposite
+  // responses from the owner. Anything branching on this reason must also carry a
+  // branch in `monitorRecoveryComment`, whose trailing `else` says "its maximum
+  // attempt count was reached".
+  "dispatch_watchdog_exhausted",
   "convergence_stalled",
   // BLO-29606: a monitor that fired and whose woken run never called back, on a
   // policy that carries no `timeoutAt` to expire against. Distinct from
