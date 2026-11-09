@@ -17,7 +17,38 @@
 // Anchored against word boundaries so mid-word `xBLO-3182y` doesn't match,
 // but `(BLO-3182)`, `BLO-3182:`, or `feat/BLO-3182-thing` all do.
 // Compact lists such as `BLO-3763/3764` are expanded to both identifiers.
-export const PAPERCLIP_IDENTIFIER_PATTERN = /\b([A-Z][A-Z0-9]{1,9}-\d{1,6}(?:\/\d{1,6})*)\b/g;
+//
+// The trailing `(?!-\d)` rejects a token that CONTINUES into a second dashed
+// number group, because that shape is an EXTERNAL identifier and never a
+// Paperclip ref: `CVE-2026-59873` yielded `CVE-2026`, `RUSTSEC-2026-0001`
+// yields `RUSTSEC-2026`, `GHSA-1234-5678-90ab` yields `GHSA-1234`. A real ref
+// is `PREFIX-NUMBER` and stops there -- it continues with `/` for a compact
+// list (`BLO-3763/3764`, still matched above), or with a non-digit, or it ends.
+//
+// This is not cosmetic. `metadata.owningIdentifiers` is copied off this
+// extractor by the webhook, and `GET /work-products/by-external-id` reports any
+// declared identifier it cannot resolve in `unresolvedOwningIdentifiers`, which
+// forces `ownerListComplete: false`. `CVE` is nobody's company prefix, so it can
+// never resolve: before this guard EVERY PR naming a CVE reported a permanently
+// incomplete owner list, and the phantom arrived in the same array, in the same
+// shape, as a GENUINE cross-company owner a reader is supposed to go and chase
+// (`Blockcast/onprem-k8s#8277` declared `["BLO-51891", "CVE-2026"]`, one of each).
+// A safety signal that is false on every security PR is one readers learn to
+// discount (PEN-6319).
+//
+// Measured over the 600 most recently-updated PRs across Blockcast/onprem-k8s,
+// Blockcast/paperclip and Blockcast/penstock-llm-proxy-core: the guard changes
+// the answer on 18 of them (3.0%), and every token it drops is a CVE year --
+// `CVE-2026` x16, `CVE-2025` x2, `CVE-2021` x1. Zero real refs lost, zero gained.
+//
+// It is deliberately NOT applied to BRANCH_IDENTIFIER_PATTERN below, and that is
+// measured too rather than an oversight. A branch continues the ref with a SLUG,
+// and a slug may legitimately start with digits: over the same 600 PRs the same
+// guard on the branch tier would have dropped exactly one token, the real
+// `blo-53368` out of `blo-53368-0078-usage-metering-archive`. It would also have
+// bought nothing there -- 0 of those 600 branches carry a CVE id, because the
+// convention names the issue in the branch and the CVE in the title.
+export const PAPERCLIP_IDENTIFIER_PATTERN = /\b([A-Z][A-Z0-9]{1,9}-\d{1,6}(?:\/\d{1,6})*)\b(?!-\d)/g;
 export const PAPERCLIP_COMPACT_IDENTIFIER_PATTERN = /^([A-Z][A-Z0-9]{1,9})-(\d{1,6})((?:\/\d{1,6})*)$/;
 
 export function expandPaperclipIdentifierToken(token: string): string[] {

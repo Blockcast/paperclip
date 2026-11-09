@@ -152,6 +152,53 @@ describe("github-webhook pure helpers", () => {
     expect(__test_extractPaperclipIdentifiers("(BLO-3182): work")).toEqual(["BLO-3182"]);
   });
 
+  it("does not manufacture an owning identifier out of an external CVE/advisory id (PEN-6319)", () => {
+    // `CVE-2026-59873` used to yield `CVE-2026`. `CVE` is nobody's company
+    // prefix, so it could never resolve, and `by-external-id` reported it in
+    // `unresolvedOwningIdentifiers` -- forcing `ownerListComplete: false` on
+    // every PR that named a CVE, which is the normal convention for a security
+    // remediation. Verbatim titles of the two PRs that measured it.
+    expect(
+      __test_extractPaperclipIdentifiers(
+        null,
+        "fix(paperclip): give the public MCP gateway a deploy path so its CVE-2026-59873 re-pin can ship (PEN-6302)",
+      ),
+    ).toEqual(["PEN-6302"]);
+    // The DISCRIMINATING case (Blockcast/onprem-k8s#8277): this PR declared
+    // `["BLO-51891", "CVE-2026"]` -- one phantom and one GENUINE unresolved
+    // cross-company owner, arriving in the same array in the same shape. A fix
+    // that silences both has gone too far, so the real one must survive.
+    expect(
+      __test_extractPaperclipIdentifiers(
+        null,
+        "fix(paperclip): re-pin prometheus MCP gateway off tar CVE-2026-59873 image (BLO-51891)",
+      ),
+    ).toEqual(["BLO-51891"]);
+    // NEGATIVE ARM, so this pin cannot pass by matching nothing: the bare word
+    // `CVE` with no advisory id is the control that showed the trigger is the
+    // full `CVE-YYYY-NNNNN` pattern and not the substring `CVE`
+    // (Blockcast/onprem-k8s#8521, which reports `ownerListComplete: true`).
+    expect(
+      __test_extractPaperclipIdentifiers(null, "chore: tar hygiene, not a CVE fix (PEN-5690)"),
+    ).toEqual(["PEN-5690"]);
+    // Same mechanism, other external identifier spaces -- predicted by the
+    // shape and pinned so a narrower CVE-only exclusion cannot be substituted.
+    expect(
+      __test_extractPaperclipIdentifiers(null, "bump rustls: RUSTSEC-2026-0001 / GHSA-1234-5678-90ab"),
+    ).toEqual([]);
+    // A compact list is still a Paperclip ref and must keep working: it
+    // continues with `/`, not with a second dashed number group.
+    expect(__test_extractPaperclipIdentifiers("Closes BLO-3763/3764")).toEqual([
+      "BLO-3763",
+      "BLO-3764",
+    ]);
+    // The guard is deliberately NOT on the branch tier: a branch continues the
+    // ref with a SLUG, and a slug may start with digits. Real branch, real ref.
+    expect(
+      resolveOwningPaperclipIdentifiers({ branch: "blo-53368-0078-usage-metering-archive" }),
+    ).toEqual({ owning: ["BLO-53368"] });
+  });
+
   it("resolves the PR's OWNING identifier as title > labeled Fixes:/Closes:/Refs: body line > branch, never a bare Related: mention (BLO-20886)", () => {
     // Title outranks everything else.
     expect(
