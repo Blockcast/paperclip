@@ -336,9 +336,17 @@ pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
   # missing it is RED, but it breaks BLO-34114s own pinned control.
   #
   # That exclusion covers only the two conclusions dead_runs() admits as a
-  # victim, `cancelled`/`failure` — the other five emitted here fall through it
-  # and still print. See the third accepted residual in dead_runs() for the
-  # measurement and for why widening the victim test is refused.
+  # victim, `cancelled`/`failure`. The other five (startup_failure / timed_out /
+  # stale / action_required / neutral) are dropped HERE instead when a later
+  # same-lane success superseded them (BLO-55385, the third residual in
+  # dead_runs(), now seen in the wild). This only withholds a NO-VERDICT line:
+  # no check-run row is deleted and DEAD is unchanged, so it cannot turn a
+  # published red green. Same lane key and start-ordered `>=` test dead_runs()
+  # applies to `failure`; an empty start on either side fails CLOSED (kept).
+  # In-flight runs are never dropped. Measured: 8 paperclip heads on 2026-11-09,
+  # `commitperclip PR Review` (pull_request_target) runs that ended
+  # `startup_failure` publishing nothing (e.g. #3602 run 42657738616), each
+  # followed by a same-lane success at that head. GitHub refuses to re-run them.
   #
   # A missing status or conclusion ("" via @tsv on a null, or a short fixture
   # row) is not `completed`/`success`, so it is kept and STOPs. Fails CLOSED, on
@@ -354,9 +362,13 @@ pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
   # reader pipes a shell variable in, and an empty variable arrives as one blank
   # line whose $6 is "" — i.e. not `completed` — which would print a NO-VERDICT
   # naming no workflow at all on every head that has no runs.
-  awk -F'\t' '$3 != "" && !($6 == "completed" && ($4 == "success" || $4 == "skipped")) {
-                s = ($6 == "completed" ? $4 : $6)
-                print $3 "\t" (s == "" ? "?" : s) "\t" $7 }'
+  awk -F'\t' '$3 != "" && $4 == "success" { if ($5 > np[$1 FS $2]) np[$1 FS $2] = $5 }
+              $3 != "" && !($6 == "completed" && ($4 == "success" || $4 == "skipped")) {
+                s = ($6 == "completed" ? $4 : $6); n++
+                row[n] = $3 "\t" (s == "" ? "?" : s) "\t" $7; lane[n] = $1 FS $2; t[n] = $5
+                sup[n] = ($6 == "completed" && $4 != "cancelled" && $4 != "failure") }
+              END { for (i = 1; i <= n; i++)
+                      if (!(sup[i] && t[i] != "" && np[lane[i]] >= t[i])) print row[i] }'
 }
 
 require_sha() { # $1 = candidate -> stdout: a STOP line + rc 1 when not 40-hex
@@ -577,10 +589,11 @@ dead_runs() { # stdin: run rows; $1 = off-head witnesses; $2 non-empty = print o
   # Mechanism proven, frequency not established, same footing as the two above.
   # The fix is NOT to widen the victim test to match: every conclusion added here
   # deletes more runs, which is the merge-authorizing direction, and would buy a
-  # measured-zero false RED with an unmeasured false GREEN. If it is ever seen in
-  # the wild, widen the exemption in verdicts() instead — recompute it from the
-  # pend set so verdicts() prints FEWER spurious lines, rather than widening what
-  # dead_runs() deletes.
+  # measured-zero false RED with an unmeasured false GREEN.
+  # BLO-55385: seen in the wild (8 paperclip heads, 2026-11-09, superseded
+  # `startup_failure`) and CLOSED without touching this test: pending_runs()
+  # now withholds the pend row for such a run, so verdicts() prints FEWER lines
+  # and this function deletes nothing more. See the note in pending_runs().
   # BLO-38577: the sibling arm above asks `actions/runs?head_sha=`, so its
   # witness can only ever be a run AT THIS HEAD. A producer whose verdict run
   # lives at another head is therefore structurally unreachable by it, and its
@@ -874,9 +887,9 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD, $4 = RENAME
             # grounds as the `contributed` predicate above: two encodings of one
             # question drift, and the drift reads correctly on each side alone.
             # The reuse is only PARTIAL, and deliberately so: dead_runs() admits
-            # a victim on a narrower conclusion set than pending_runs() emits, so
-            # five conclusions fall through this exemption. Third residual in
-            # dead_runs() has the measurement and why widening it is refused.
+            # a victim on a narrower conclusion set than pending_runs() emits.
+            # The other five conclusions, when superseded, never reach this
+            # loop: pending_runs() withholds their pend rows (BLO-55385).
             for (i = 1; i <= k; i++) if (!(prid[i] in contributed) \
                                          && prid[i] !~ ("^(" dead ")$"))
               printf "STOP\t<%s: run %s, no check-run published>\tNO-VERDICT\trun=%s\n", \
