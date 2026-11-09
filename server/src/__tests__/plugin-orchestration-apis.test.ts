@@ -1197,6 +1197,99 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     ).rejects.toThrow("Issue is blocked by unresolved blockers");
   });
 
+  /**
+   * PEN-6229 — the FOUR refusal pre-checks the plugin host runs itself.
+   *
+   * PEN-6121 coded the three gates in `enqueueWakeup`, which is where the
+   * dominant measured refusal (`agent.not_invokable`, 15 of 23) is raised. It
+   * is not where the ladder's wake can first die: `requestWakeup` refuses on
+   * four conditions of its own BEFORE `heartbeat.wakeup` is reached, and until
+   * now every one threw a bare `Error`. A bare `Error` has no `details`, so
+   * `workerHostErrorData` projects nothing, `readWakeCause` resolves `null`,
+   * and the observation records `wake_cause = NULL` — which is honest
+   * ("not recorded") and indistinguishable from a cause nobody coded. That
+   * ambiguity is the thing PEN-6121 exists to remove.
+   *
+   * ⛔ Asserted on `details.code` rather than on the message, for the reason
+   * the `agent.not_invokable` test above gives: `workerHostErrorData` forwards
+   * ONLY `code` across the worker boundary, so `code` is the only field a
+   * plugin can branch on. The messages are deliberately unchanged — other
+   * tests in this repo match on them.
+   */
+  it.each([
+    ["issue.no_assignee", { assigneeAgentId: null }],
+    ["issue.not_wakeable", { status: "done" }],
+  ] as const)("names %s in details.code on a requestWakeup pre-check", async (code, overrides) => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Alert", status: "todo", priority: "critical", assigneeAgentId: agentId, ...overrides,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await expect(
+      services.issues.requestWakeup({ issueId, companyId, reason: "alert_escalation_deadline" }),
+    ).rejects.toMatchObject({ details: { code } });
+  });
+
+  it("names issue.blocked in details.code when a wake is refused for an unresolved blocker", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const blockerIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    await db.insert(issues).values([
+      { id: blockerIssueId, companyId, title: "Unresolved blocker", status: "todo", priority: "medium" },
+      { id: blockedIssueId, companyId, title: "Blocked issue", status: "todo", priority: "medium", assigneeAgentId: agentId },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId, issueId: blockerIssueId, relatedIssueId: blockedIssueId, type: "blocks",
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await expect(
+      services.issues.requestWakeup({ issueId: blockedIssueId, companyId, reason: "alert_escalation_deadline" }),
+    ).rejects.toMatchObject({ details: { code: "issue.blocked", blockerCount: 1 } });
+  });
+
+  /**
+   * `budget.blocked` is the one token shared with `enqueueWakeup`: the same
+   * gate is asked twice on one path, and a reader triaging by cause wants the
+   * GATE, not which layer happened to ask first. Coding it here means a wake
+   * refused before the heartbeat records the same cause as one refused inside
+   * it, instead of NULL.
+   */
+  it("names budget.blocked in details.code when the invocation budget refuses the wake", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    await db.update(companies).set({ status: "paused", pauseReason: "manual" }).where(eq(companies.id, companyId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Alert", status: "todo", priority: "critical", assigneeAgentId: agentId,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await expect(
+      services.issues.requestWakeup({ issueId, companyId, reason: "alert_escalation_deadline" }),
+    ).rejects.toMatchObject({ details: { code: "budget.blocked", scopeType: "company" } });
+  });
+
+  /**
+   * ⛔ `requestWakeups` REPEATS all four pre-checks in its own loop body, so
+   * coding only `requestWakeup` would leave the cause NULL depending on which
+   * call site ran — a half-fix that reads as complete. The review that raised
+   * this named two of the eight sites; this asserts the batch arm is coded too.
+   */
+  it("names the same gate in details.code on the batch requestWakeups arm", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Alert", status: "done", priority: "critical", assigneeAgentId: agentId,
+    });
+
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+    await expect(
+      services.issues.requestWakeups({ issueIds: [issueId], companyId, reason: "alert_escalation_deadline" }),
+    ).rejects.toMatchObject({ details: { code: "issue.not_wakeable", status: "done" } });
+  });
+
   it("allows plugin wakeups for assigned backlog issues (escalation ladders)", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     // This test covers the plugin wakeup contract, not adapter execution.

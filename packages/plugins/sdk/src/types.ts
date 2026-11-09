@@ -1617,9 +1617,19 @@ export interface PluginIssueWakeupResult {
    * disabled, cooldown, inactive company, scheduling suppressed, worktree
    * cutoff, or a capacity deferral — and a dropped wake whose reason is a
    * disjunction cannot be triaged. The same vocabulary is used for the
-   * THROWING half: those arrive as `PluginRpcError.data.code` carrying
-   * `agent.not_invokable`, `budget.blocked` or `company.inactive`, so one
-   * consumer can record one cause whichever way the host dropped it.
+   * THROWING half: those arrive as `PluginRpcError.data.code`, so one consumer
+   * can record one cause whichever way the host dropped it. Seven gates throw
+   * — `issue.no_assignee`, `issue.not_wakeable`, `issue.blocked` and
+   * `budget.blocked` from the plugin host's own pre-checks (PEN-6229), and
+   * `budget.blocked`, `company.inactive`, `agent.not_invokable` from
+   * `enqueueWakeup` downstream (PEN-6121). `budget.blocked` is deliberately
+   * shared: it is one gate asked twice on one path, and a reader triaging by
+   * cause wants the gate, not the layer that happened to ask first.
+   *
+   * ⛔ Treat the token set as OPEN. It is documentation, not a closed union,
+   * and the column that stores it carries no CHECK constraint for exactly that
+   * reason — a consumer that switches exhaustively on today's list will go
+   * silently wrong on the next gate someone codes.
    */
   undeliveredReason?: string | null;
   /**
