@@ -232,6 +232,7 @@ export type {
   Agent,
   AgentAccessState,
   AgentAccessStateFull,
+  DisclosedPrincipalPermissionGrant,
   AgentAccessStateRestricted,
   AgentTaskAssignSource,
   AgentChainOfCommandEntry,

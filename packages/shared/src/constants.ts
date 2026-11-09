@@ -1439,6 +1439,112 @@ export const PERMISSION_KEYS = [
 ] as const;
 export type PermissionKey = (typeof PERMISSION_KEYS)[number];
 
+/**
+ * PEN-6373: permission keys for which NO agent-reachable call site evaluates
+ * the AGENT subject space, so a grant written against `principalType: "agent"`
+ * is accepted, stored and displayed while remaining unreadable by every
+ * checker that names the key.
+ *
+ * ## What the membership of this list asserts
+ *
+ * Only this: every non-test call site naming the key sits behind `assertBoard`
+ * (`server/src/routes/authz.ts`, grep `export function assertBoard`), which
+ * refuses `req.actor.type !== "board"` BEFORE any permission key is read, and
+ * then reads the `"user"` subject space. An agent principal is therefore
+ * refused on ACTOR TYPE and the key is never consulted at all — granting one of
+ * these to an agent changes nothing, and so would revoking it.
+ *
+ * ## It is a FLOOR, not a census — read the absence correctly
+ *
+ * A key's ABSENCE from this list means "not established", NEVER "an agent
+ * grant for it works". Other keys in `PERMISSION_KEYS` are plausibly in the
+ * same position (`environments:manage` and `users:invite` both looked it on a
+ * 2026-11-09 grep) and are deliberately left out because they were not
+ * verified gate by gate. Failing in this direction is the point: an
+ * over-inclusive list would tell a seat it lacks capability it has, which is
+ * the expensive direction — nothing ever reports the work a false "inert"
+ * deterred.
+ *
+ * That is also why {@link AGENT_SUBJECT_EVALUATIONS} has no `"supported"`
+ * member. There is no value in this vocabulary that asserts a grant DOES
+ * work, because no such census has been taken.
+ *
+ * ## Evidence
+ *
+ * - `docs/AGENT-VISIBLE-CONFIG-EGRESS.md` §4 ("Out of scope — board-gated,
+ *   verified gate by gate") lists `tool connections ×5 (routes/tool-access.ts)`
+ *   and `MCP gateway auth/header policy ×3 (routes/tool-gateway.ts)` as
+ *   `assertBoard` + `tools:admin`, under the sentence "each is unreachable from
+ *   an agent seat. Verified individually, not assumed". Those routes return
+ *   structured config with **no redactor** precisely because an agent cannot
+ *   reach them, so the board-only gate is load-bearing for a second,
+ *   unrelated security control (PEN-3701).
+ * - First-party grep, 2026-11-09, `master` @ `1a3fbc48`: the only non-test
+ *   files naming these keys are `routes/tool-access.ts` and
+ *   `routes/tool-gateway.ts`, both of which call `assertBoard` first.
+ *
+ * `tools:manage_profiles` is here on a STRONGER and different ground, stated
+ * separately so nobody reads one argument as covering both: it has no
+ * evaluator in ANY subject space — zero non-test call sites — so it is not
+ * merely agent-inert, it is inert outright.
+ *
+ * ## Obligation when you add a reader
+ *
+ * If you add a call site that evaluates one of these keys for an agent
+ * principal — `access.hasPermission(companyId, "agent", …)`, or
+ * `access.decide({ action: <key> })`, whose generic fallback maps every
+ * `PermissionKey` to itself — REMOVE the key from this list in the same
+ * change. Leaving it here would publish `"none"` for a grant that now works,
+ * which is the false-negative direction above.
+ *
+ * ⚠️ Membership is a claim about CALL SITES, not about the authorization
+ * engine. `permissionForAction` (`server/src/services/authorization.ts`)
+ * returns every `PermissionKey` unchanged, so `decide()` WOULD honour an
+ * agent-subject grant for any of these if a call site ever asked it to. None
+ * does today. Do not restate this list as "the engine excludes agents".
+ */
+export const BOARD_ONLY_PERMISSION_KEYS = [
+  "tools:admin",
+  "tools:manage_connections",
+  "tools:manage_profiles",
+  "tools:view_audit",
+  "tools:manage_runtime",
+] as const satisfies readonly PermissionKey[];
+
+export type BoardOnlyPermissionKey = (typeof BOARD_ONLY_PERMISSION_KEYS)[number];
+
+/**
+ * How a stored grant's permission key fares in the AGENT subject space.
+ *
+ * `none`         — established: no agent-reachable call site evaluates it, so
+ *                  the grant authorises nothing (see
+ *                  {@link BOARD_ONLY_PERMISSION_KEYS}).
+ * `unclassified` — not established in either direction. NOT a statement that
+ *                  the grant works.
+ *
+ * There is deliberately no third member asserting that a grant IS evaluated.
+ */
+export const AGENT_SUBJECT_EVALUATIONS = ["none", "unclassified"] as const;
+export type AgentSubjectEvaluation = (typeof AGENT_SUBJECT_EVALUATIONS)[number];
+
+export function permissionKeyIsBoardOnly(permissionKey: string): permissionKey is BoardOnlyPermissionKey {
+  return (BOARD_ONLY_PERMISSION_KEYS as readonly string[]).includes(permissionKey);
+}
+
+/**
+ * Classify a grant for display. `principalType` is required because the whole
+ * finding is that the SAME key is live in the `"user"` space and inert in the
+ * `"agent"` one — a key-only signature would invite exactly the conflation
+ * this exists to remove.
+ */
+export function agentSubjectEvaluationForGrant(input: {
+  principalType: string;
+  permissionKey: string;
+}): AgentSubjectEvaluation {
+  if (input.principalType !== "agent") return "unclassified";
+  return permissionKeyIsBoardOnly(input.permissionKey) ? "none" : "unclassified";
+}
+
 export const TOOL_APPLICATION_TYPES = ["mcp_http", "mcp_stdio", "paperclip_plugin", "a2a"] as const;
 export type ToolApplicationType = (typeof TOOL_APPLICATION_TYPES)[number];
 

@@ -4,6 +4,7 @@ import type {
   PauseReason,
   AgentRole,
   AgentStatus,
+  AgentSubjectEvaluation,
 } from "../constants.js";
 import type {
   CompanyMembership,
@@ -78,12 +79,31 @@ export type AgentTaskAssignSource =
   | "ceo_role"
   | "none";
 
+/**
+ * A stored grant plus the one thing a holder cannot read off the row: whether
+ * anything can EVALUATE it for this principal (PEN-6373).
+ *
+ * The stored row is identical whether or not a checker exists, so an accepted,
+ * persisted, displayed grant that no code path can read is indistinguishable —
+ * at every surface an agent seat can reach — from one that works. Five
+ * `tools:*` management keys are in exactly that position on this fleet.
+ *
+ * ⚠️ `agentSubjectEvaluation` is NOT a capability field, and must not be read
+ * as the complement of one. Its vocabulary has no member asserting that a
+ * grant DOES work (see {@link AgentSubjectEvaluation}), because no census of
+ * agent-evaluable keys has been taken — `"unclassified"` is the honest answer
+ * for everything not positively established inert, not a quiet "yes".
+ */
+export interface DisclosedPrincipalPermissionGrant extends PrincipalPermissionGrant {
+  agentSubjectEvaluation: AgentSubjectEvaluation;
+}
+
 /** The access state a reader entitled to the subject's configuration receives. */
 export interface AgentAccessStateFull {
   canAssignTasks: boolean;
   taskAssignSource: AgentTaskAssignSource;
   membership: CompanyMembership | null;
-  grants: PrincipalPermissionGrant[];
+  grants: DisclosedPrincipalPermissionGrant[];
 }
 
 /**

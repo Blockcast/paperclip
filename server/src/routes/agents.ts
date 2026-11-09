@@ -41,6 +41,7 @@ import {
   updateAgentSchema,
   supportedEnvironmentDriversForAdapter,
   LOW_TRUST_REVIEW_PRESET,
+  agentSubjectEvaluationForGrant,
 } from "@paperclipai/shared";
 import {
   EXTERNAL_LIFECYCLE_ADAPTER_TYPES,
@@ -1045,7 +1046,25 @@ export function agentRoutes(
       };
     }
 
-    return { ...derived, membership, grants };
+    // PEN-6373: the disclosure carries, per grant, whether anything can
+    // EVALUATE it for this agent — five `tools:*` management keys are accepted,
+    // stored and shown here while no checker that names them ever reads the
+    // agent subject space, so a seat reading its own `grants` array could not
+    // tell capability from decoration. Derived at the route rather than added
+    // to `principalGrantColumns`, so it is reach granted by a decision instead
+    // of by the shape of a query (see `services/access-columns.ts`).
+    //
+    // `hasExplicitTaskAssignGrant` above still reads the RAW rows. Nothing
+    // about behaviour changes here; only the disclosure widens.
+    const disclosedGrants = grants.map((grant) => ({
+      ...grant,
+      agentSubjectEvaluation: agentSubjectEvaluationForGrant({
+        principalType: grant.principalType,
+        permissionKey: grant.permissionKey,
+      }),
+    }));
+
+    return { ...derived, membership, grants: disclosedGrants };
   }
 
   async function buildAgentDetail(
