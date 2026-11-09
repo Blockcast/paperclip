@@ -74,7 +74,7 @@ describeEmbeddedPostgres("routine_runs dispatched partial index (migration 0266)
     expect(indexes[0]?.indexdef).toContain("linked_issue_id IS NOT NULL");
     expect(indexes[0]?.indexdef).toContain("<> 'skipped'::text");
     expect(indexes[0]?.indexdef).toContain("<> 'coalesced'::text");
-  }, 60_000);
+  }, 120_000);
 
   it("answers the gauge's per-routine max(triggered_at) probe from the index, not a table scan", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-routine-runs-dispatched-plan-");

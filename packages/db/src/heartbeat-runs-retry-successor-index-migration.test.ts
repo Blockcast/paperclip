@@ -76,7 +76,7 @@ describeEmbeddedPostgres("heartbeat-run retry successor index migration", () => 
     await applyPendingMigrations(database.connectionString);
 
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 
   it("rejects an invalid precreated index with repair instructions", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-retry-successor-invalid-");
@@ -102,7 +102,7 @@ describeEmbeddedPostgres("heartbeat-run retry successor index migration", () => 
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 
   /**
    * A same-name index without the partial predicate would still answer the
@@ -134,5 +134,5 @@ describeEmbeddedPostgres("heartbeat-run retry successor index migration", () => 
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 });

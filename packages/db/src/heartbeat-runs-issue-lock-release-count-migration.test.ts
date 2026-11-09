@@ -146,6 +146,6 @@ describeEmbeddedPostgres("heartbeat-run issue lock release count migration", () 
       `;
       expect(inserted).toEqual([{ issue_lock_release_count: 0 }]);
     },
-    60_000,
+    120_000,
   );
 });

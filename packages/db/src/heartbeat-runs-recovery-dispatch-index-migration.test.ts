@@ -83,7 +83,7 @@ describeEmbeddedPostgres("heartbeat-run recovery dispatch index migration", () =
     await applyPendingMigrations(database.connectionString);
 
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 
   it("rejects an invalid precreated index with repair instructions", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-recovery-invalid-");
@@ -109,7 +109,7 @@ describeEmbeddedPostgres("heartbeat-run recovery dispatch index migration", () =
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 
   it("rejects a same-name index that is missing the id tiebreak column", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-recovery-cols-");
@@ -136,7 +136,7 @@ describeEmbeddedPostgres("heartbeat-run recovery dispatch index migration", () =
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 
   it("rejects a same-name index whose predicate omits the recovery-source clause", async () => {
     // The failure mode with teeth. An index on the right COLUMNS but predicated
@@ -168,7 +168,7 @@ describeEmbeddedPostgres("heartbeat-run recovery dispatch index migration", () =
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 
   it("rejects same-name indexes with broader or wrong recovery predicates", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-recovery-pred-shape-");
@@ -204,5 +204,5 @@ describeEmbeddedPostgres("heartbeat-run recovery dispatch index migration", () =
         pendingMigrations: [MIGRATION_FILE],
       });
     }
-  }, 90_000);
+  }, 120_000);
 });

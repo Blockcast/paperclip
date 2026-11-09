@@ -81,7 +81,7 @@ describeEmbeddedPostgres("Active PR review index migration", () => {
     expect((await inspectMigrations(database.connectionString)).status).toBe(
       "upToDate",
     );
-  }, 60_000);
+  }, 120_000);
 
   it("names pre-existing duplicate active pr_review rows instead of demanding an index that cannot be built", async () => {
     const database = await startEmbeddedPostgresTestDatabase(
@@ -144,7 +144,7 @@ describeEmbeddedPostgres("Active PR review index migration", () => {
     expect((await inspectMigrations(database.connectionString)).status).toBe(
       "upToDate",
     );
-  }, 60_000);
+  }, 120_000);
 
   it("rejects an incorrectly defined same-name index", async () => {
     const database = await startEmbeddedPostgresTestDatabase(
@@ -181,5 +181,5 @@ describeEmbeddedPostgres("Active PR review index migration", () => {
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 });

@@ -263,5 +263,5 @@ describeEmbeddedPostgres("exit-zero timeout repair after adapter migration", () 
     });
 
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 });

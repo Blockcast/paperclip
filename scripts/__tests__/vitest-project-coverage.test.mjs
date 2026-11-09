@@ -740,3 +740,329 @@ test("the Vitest-environment detector is not vacuous", () => {
       `legitimately gained or lost jsdom specs, update this control -- do not delete it`,
   );
 });
+
+// ---------------------------------------------------------------------------
+// The sweep above asks "did anyone CHOOSE a budget?" -- a boolean. PEN-6254 is
+// the next question, and a declared budget does not answer it: does the budget
+// that actually binds the embedded-Postgres startup EXCEED it?
+//
+// #3530 was evicted from the merge queue on 2026-11-09 by
+// `cost-events-company-issue-index-migration.test.ts` reporting "Test timed out
+// in 60000ms" -- in a package that passes the sweep above, on a suite unchanged
+// on master since 2026-10-20, at a head that had passed the same suite 19 h
+// earlier. Nothing about the diff was involved.
+//
+// Two facts compose into that, and neither is visible from the config alone:
+//
+//   1. BLO-17026 measured embedded-Postgres startup at ~40 s on the contended
+//      ARC pool, and server/vitest.config.ts records the remedy -- lift the
+//      baseline AND "the tight per-test overrides in the embedded-postgres
+//      suites are raised alongside this lift, since Vitest honors a per-test
+//      timeout over the global".
+//   2. WHICH budget carries that startup depends on WHERE the boot sits.
+//      Counted 2026-11-09 over every body/hook that constructs one: server
+//      boots in a HOOK 315 times against 41 bodies, so its 120 s `hookTimeout`
+//      carries it; packages/db is the mirror image at 133 bodies against 2
+//      hooks, so there it lands in `testTimeout`.
+//
+// packages/db had copied server's 60 s/120 s pair without copying server's
+// SHAPE, and 63 per-test overrides then re-pinned the binding budget to 60 s
+// one level below the config -- the same defeat PEN-6181 found in CI job
+// budgets, where a step-level `timeout-minutes` undercut a guard that only read
+// job-level ones. A guard that reads the config and stops is defeated by an
+// override it never looks at.
+//
+// So this sweep resolves the EFFECTIVE budget of every booting test body --
+// the per-test override where one exists, the project config otherwise -- and
+// holds it to the floor `cli` already reached by measurement for exactly this
+// shape ("embedded-postgres startup + reseed can take ~40s under load -- well
+// past the previous 60s ceiling").
+//
+// This is NOT a hang detector and must not be re-tuned as one: pr.yml's job
+// `timeout-minutes` is the hang detector (BLO-35615). A per-test budget's only
+// job is to exceed the fixed setup cost inside it, so that a red here means the
+// code is wrong rather than the pool is busy.
+// ---------------------------------------------------------------------------
+
+const EMBEDDED_POSTGRES_BODY_FLOOR_MS = 120_000;
+
+// Deliberately narrower than EMBEDDED_POSTGRES above, which answers "does this
+// file mention embedded Postgres at all?". Here the question is "does this body
+// START one?", so it matches a CONSTRUCTION call only. An earlier draft of this
+// guard reused the broad pattern and scored every helper taking a `pg: PGlite`
+// PARAMETER as a booting one, which inflated one package from 7 booting bodies
+// to 77 and would have raised budgets on tests that boot nothing -- the
+// unjustified-raise this guard exists to make unnecessary.
+const BOOTS_EMBEDDED_POSTGRES = /startEmbeddedPostgresTestDatabase\s*\(|new\s+PGlite\s*\(/;
+
+function matchingParen(code, openIndex) {
+  let depth = 0;
+  for (let index = openIndex; index < code.length; index += 1) {
+    if (code[index] === "(") depth += 1;
+    else if (code[index] === ")") {
+      depth -= 1;
+      if (depth === 0) return index;
+    }
+  }
+  return -1;
+}
+
+// File-local helpers whose own source reaches a boot. The suite that evicted
+// #3530 calls `startDatabase(...)` -- a four-line wrapper -- not the helper
+// directly, so a detector that only matches the direct call MISSES the exact
+// test this guard exists for. That was measured, not imagined: the first draft
+// scored that file clean. Three passes resolve a wrapper calling a wrapper.
+function bootingHelperNames(code) {
+  const names = new Set();
+  for (let pass = 0; pass < 3; pass += 1) {
+    const declarations =
+      /(?:async\s+)?function\s+([A-Za-z0-9_$]+)|(?:const|let)\s+([A-Za-z0-9_$]+)\s*=\s*(?:async\s*)?\(/g;
+    let match;
+    while ((match = declarations.exec(code))) {
+      const name = match[1] ?? match[2];
+      if (names.has(name)) continue;
+      const open = code.indexOf("{", match.index);
+      if (open === -1) continue;
+      let depth = 0;
+      let end = open;
+      for (; end < code.length; end += 1) {
+        if (code[end] === "{") depth += 1;
+        else if (code[end] === "}") {
+          depth -= 1;
+          if (depth === 0) break;
+        }
+      }
+      const body = code.slice(match.index, end + 1);
+      if (BOOTS_EMBEDDED_POSTGRES.test(body) || [...names].some((known) => callsHelper(body, known))) {
+        names.add(name);
+      }
+    }
+  }
+  return names;
+}
+
+function callsHelper(code, name) {
+  return new RegExp(`\\b${name}\\s*\\(`).test(code);
+}
+
+// Every `it`/`test` body in `code` that reaches a boot, with the per-test
+// budget attached to it (null when it inherits the project config). Split from
+// the file-reading wrapper below so the discrimination control can feed it a
+// synthetic source -- a sweep that cannot be shown to REJECT is not a sweep.
+function bootingTestBodiesInSource(code, label) {
+  if (!BOOTS_EMBEDDED_POSTGRES.test(code)) return [];
+
+  const helpers = bootingHelperNames(code);
+  const reachesBoot = (body) =>
+    BOOTS_EMBEDDED_POSTGRES.test(body) || [...helpers].some((name) => callsHelper(body, name));
+
+  const bodies = [];
+  const openers =
+    /\b(?:it|test)(?:\.each\([\s\S]*?\))?(?:\.(?:only|skip|concurrent|sequential))?\s*\(/g;
+  let match;
+  while ((match = openers.exec(code))) {
+    const close = matchingParen(code, openers.lastIndex - 1);
+    if (close === -1) continue;
+    const body = code.slice(match.index, close + 1);
+    if (reachesBoot(body)) {
+      // The budget is the trailing numeric argument of the call.
+      const budget = /,(\s*)([0-9_]+)(\s*,?\s*)\)$/.exec(body.slice(-40));
+      const title = /["'`](.+?)["'`]/.exec(body.slice(0, 300));
+      bodies.push({
+        file: label,
+        line: code.slice(0, match.index).split("\n").length,
+        budgetMs: budget ? Number(budget[2].replace(/_/g, "")) : null,
+        title: title ? title[1] : "(untitled)",
+      });
+    }
+    openers.lastIndex = close + 1;
+  }
+  return bodies;
+}
+
+function bootingTestBodies(file) {
+  return bootingTestBodiesInSource(readFileSync(file, "utf8"), path.relative(repoRoot, file));
+}
+
+function configuredTestTimeout(projectDir) {
+  let source;
+  try {
+    source = readFileSync(path.join(repoRoot, projectDir, "vitest.config.ts"), "utf8");
+  } catch {
+    return null;
+  }
+  // Same comment strip as declaredTimeouts above, and for the same reason:
+  // these configs discuss `testTimeout` in prose at length.
+  const code = source.replace(/^\s*\/\/.*$/gm, "");
+  const declared = /\btestTimeout\s*:\s*([0-9_]+)/.exec(code);
+  return declared ? Number(declared[1].replace(/_/g, "")) : null;
+}
+
+// Packages whose CONFIG-INHERITED booting bodies are known to sit under the
+// floor and are deliberately not moved by PEN-6254. Per-test OVERRIDES are
+// never excused here, in any package: an override is a local statement that
+// this body needs something other than what its package chose, and one set
+// below the floor on a booting body is the defect this guard exists for.
+//
+// Counted 2026-11-09. Both entries are real instances of the same shape, held
+// back for want of evidence rather than because they are safe:
+//
+//   server -- 41 booting bodies against 315 booting HOOKS. The hooks are
+//     covered by its 120s hookTimeout, and no server body appears in any
+//     merge-queue timeout sample, so the measured failure PEN-6254 fixes is
+//     not here. Raising this package's testTimeout touches the 6-shard,
+//     110-minute lane that is the PR critical path, which is not a change to
+//     make on a population with no observed failure.
+//   paperclip-plugin-alertmanager -- 7 booting bodies. BLO-37114 measured this
+//     package's ejections as HOOK timeouts (`beforeEach`), already fixed by
+//     its 120s hookTimeout; its bodies construct PGlite (WASM), a different
+//     and cheaper startup than the embedded cluster BLO-17026 timed at ~40s.
+//
+// WHAT WOULD SETTLE EITHER: a `Test timed out` in one of these bodies in a
+// merge_group run, or a measurement of copyEmbeddedPostgresTemplate's per-suite
+// cost on the contended pool. The template path (one migrated cluster per job,
+// copied per suite) is why a later boot is cheaper than the first, and nobody
+// has timed the copy -- so "these are fine" is unproven, not established.
+const BOOTING_BODY_CONFIG_FLOOR_EXCEPTIONS = new Map([
+  ["server", "PEN-6254: 41 bodies vs 315 hooks; no observed body timeout; lane is the PR critical path"],
+  [
+    "packages/plugins/paperclip-plugin-alertmanager",
+    "PEN-6254: BLO-37114 ejections were hook timeouts, already covered; bodies are PGlite/WASM",
+  ],
+]);
+
+// Effective budget = per-test override, else the project's configured
+// testTimeout, else Vitest's bare 5s default.
+function underBudgetedBootingBodies({ includeExcepted = false } = {}) {
+  const offenders = [];
+  for (const projectDir of readConfiguredProjectDirs()) {
+    const configured = configuredTestTimeout(projectDir) ?? 5_000;
+    const excepted = BOOTING_BODY_CONFIG_FLOOR_EXCEPTIONS.has(projectDir);
+    for (const file of testFilesUnder(path.join(repoRoot, projectDir))) {
+      for (const body of bootingTestBodies(file)) {
+        const effectiveMs = body.budgetMs ?? configured;
+        if (effectiveMs >= EMBEDDED_POSTGRES_BODY_FLOOR_MS) continue;
+        const source = body.budgetMs === null ? "config" : "per-test";
+        // The exception covers the inherited arm only.
+        if (!includeExcepted && excepted && source === "config") continue;
+        offenders.push({ ...body, projectDir, effectiveMs, source });
+      }
+    }
+  }
+  return offenders;
+}
+
+test("every test body that boots embedded Postgres budgets above the ARC startup cost", () => {
+  const offenders = underBudgetedBootingBodies();
+
+  assert.deepEqual(
+    offenders.map(({ file, line, effectiveMs, source }) => `${file}:${line} ${effectiveMs}ms (${source})`),
+    [],
+    `These test bodies START an embedded Postgres inside a budget smaller than ` +
+      `${EMBEDDED_POSTGRES_BODY_FLOOR_MS}ms, and BLO-17026 measured that startup at ~40s on the ` +
+      `contended ARC pool. They do not fail on their own merits -- they fail when the pool is ` +
+      `busy, and on merge_group that ejects the candidate and costs a full re-traverse of the ` +
+      `queue (PEN-6254, #3530).\n` +
+      `Raise the per-test budget, or move the boot into a hook so the project's hookTimeout ` +
+      `carries it (server/vitest.config.ts is the worked example of the second):\n` +
+      offenders
+        .map(({ file, line, title, effectiveMs, source }) => `  - ${file}:${line} ${effectiveMs}ms from ${source} -- ${title}`)
+        .join("\n"),
+  );
+});
+
+test("every booting-body floor exception is still needed", () => {
+  // Self-retiring, same contract as UNEXECUTED_WITH_TESTS above. If a package
+  // raises its testTimeout to the floor, or its last booting body goes away,
+  // the exception becomes a permanent hole nobody is watching -- so the sweep
+  // fails until the stale entry is deleted.
+  const stillUnderFloor = new Set(
+    underBudgetedBootingBodies({ includeExcepted: true })
+      .filter(({ source }) => source === "config")
+      .map(({ projectDir }) => projectDir),
+  );
+  const stale = [...BOOTING_BODY_CONFIG_FLOOR_EXCEPTIONS.keys()].filter(
+    (dir) => !stillUnderFloor.has(dir),
+  );
+
+  assert.deepEqual(
+    stale,
+    [],
+    `These packages no longer have config-inherited booting bodies under ` +
+      `${EMBEDDED_POSTGRES_BODY_FLOOR_MS}ms, so their entries in ` +
+      `BOOTING_BODY_CONFIG_FLOOR_EXCEPTIONS are dead text that would silently excuse a future ` +
+      `regression. Delete them: ${stale.join(", ")}`,
+  );
+});
+
+test("the booting-body detector sees through a file-local wrapper", () => {
+  // Positive control, and it pins the specific miss that let PEN-6254 land.
+  // `cost-events-company-issue-index-migration.test.ts` reaches the boot only
+  // through its own `startDatabase()` wrapper; a detector matching the direct
+  // helper call scores it clean, which is what the first draft of this guard
+  // did. Without this assertion that regression is silent -- the sweep above
+  // would pass by finding nothing, the same fail-open shape as the inert CLI
+  // flags documented further up this file.
+  const file = path.join(repoRoot, "packages/db/src/cost-events-company-issue-index-migration.test.ts");
+  const bodies = bootingTestBodies(file);
+  assert.ok(
+    bodies.length >= 3,
+    `expected the wrapper-reached bodies in ${path.relative(repoRoot, file)} to be detected, got ` +
+      `${bodies.length}. If that suite was renamed or removed, re-point this control at another ` +
+      `body that reaches its boot through a helper -- do not simply delete it.`,
+  );
+  assert.ok(
+    bodies.every(({ budgetMs }) => budgetMs === null || budgetMs >= EMBEDDED_POSTGRES_BODY_FLOOR_MS),
+    `the control suite itself is under-budgeted: ${JSON.stringify(bodies)}`,
+  );
+});
+
+test("the booting-body floor actually discriminates", () => {
+  // A sweep is only as good as its ability to REJECT, and a floor nothing can
+  // fail reads exactly like a clean repo. Feed it a body that boots inside a
+  // 60s budget -- the precise shape that evicted #3530 -- and require a hit.
+  const underBudgeted = bootingTestBodiesInSource(
+    `it("boots inside too small a budget", async () => {
+       const database = await startEmbeddedPostgresTestDatabase("probe-");
+       expect(database).toBeTruthy();
+     }, 60_000);`,
+    "<synthetic>",
+  );
+  assert.equal(underBudgeted.length, 1, "the detector missed a direct boot in a test body");
+  assert.equal(underBudgeted[0].budgetMs, 60_000);
+  assert.ok(
+    underBudgeted[0].budgetMs < EMBEDDED_POSTGRES_BODY_FLOOR_MS,
+    "the floor no longer rejects the 60s budget that evicted #3530",
+  );
+
+  // And the wrapper arm, which is the one that actually failed in production.
+  const viaWrapper = bootingTestBodiesInSource(
+    `async function startDatabase(prefix) {
+       return startEmbeddedPostgresTestDatabase(prefix);
+     }
+     it("boots through a wrapper", async () => {
+       const { sql } = await startDatabase("probe-");
+       expect(sql).toBeTruthy();
+     }, 60_000);`,
+    "<synthetic-wrapper>",
+  );
+  assert.equal(viaWrapper.length, 1, "the detector cannot see through a file-local wrapper");
+
+  // Negative control: a body that merely RECEIVES a handle must not be scored
+  // as booting, or this guard starts demanding budgets for setup that is not
+  // there. This is the over-match that inflated one package 7 -> 77.
+  const receivesOnly = bootingTestBodiesInSource(
+    `let db;
+     beforeEach(async () => { db = new PGlite(); });
+     async function countRows(pg, table) { return pg.query(table); }
+     it("uses an already-booted handle", async () => {
+       expect(await countRows(db, "issues")).toBeTruthy();
+     }, 20_000);`,
+    "<synthetic-receives>",
+  );
+  assert.deepEqual(
+    receivesOnly.map(({ title }) => title),
+    [],
+    "a body that only uses an existing handle was scored as booting one",
+  );
+});

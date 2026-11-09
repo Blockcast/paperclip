@@ -167,6 +167,6 @@ describeEmbeddedPostgres("heartbeat-run status-only document write refusal migra
         new Date("2026-09-04T17:00:00Z"),
       );
     },
-    60_000,
+    120_000,
   );
 });

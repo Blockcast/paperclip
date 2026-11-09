@@ -78,7 +78,7 @@ describeEmbeddedPostgres("Alertmanager aggregate index migration", () => {
     expect((await inspectMigrations(database.connectionString)).status).toBe(
       "upToDate",
     );
-  }, 60_000);
+  }, 120_000);
 
   it("rejects an incorrectly defined same-name index", async () => {
     const database = await startEmbeddedPostgresTestDatabase(
@@ -115,5 +115,5 @@ describeEmbeddedPostgres("Alertmanager aggregate index migration", () => {
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 });

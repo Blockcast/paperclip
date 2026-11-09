@@ -179,7 +179,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         await restoreSql.end();
       }
     },
-    60_000,
+    120_000,
   );
 
   it(
@@ -307,7 +307,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         await restoreSql.end();
       }
     },
-    60_000,
+    120_000,
   );
 
   it(
@@ -408,7 +408,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         await restoreSql.end();
       }
     },
-    60_000,
+    120_000,
   );
 
   it(
@@ -481,7 +481,7 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         await restoreSql.end();
       }
     },
-    60_000,
+    120_000,
   );
 
   it(
@@ -526,6 +526,6 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
         await restoreSql.end();
       }
     },
-    60_000,
+    120_000,
   );
 });

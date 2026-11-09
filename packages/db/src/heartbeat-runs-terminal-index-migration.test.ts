@@ -61,7 +61,7 @@ describeEmbeddedPostgres("heartbeat-run terminal index migration", () => {
     await applyPendingMigrations(database.connectionString);
 
     expect((await inspectMigrations(database.connectionString)).status).toBe("upToDate");
-  }, 60_000);
+  }, 120_000);
 
   it("rejects an invalid precreated index with repair instructions", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-terminal-invalid-");
@@ -87,7 +87,7 @@ describeEmbeddedPostgres("heartbeat-run terminal index migration", () => {
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 
   it("rejects an incorrectly defined same-name index", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-terminal-wrong-");
@@ -114,5 +114,5 @@ describeEmbeddedPostgres("heartbeat-run terminal index migration", () => {
       status: "needsMigrations",
       pendingMigrations: [MIGRATION_FILE],
     });
-  }, 60_000);
+  }, 120_000);
 });
