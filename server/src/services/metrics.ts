@@ -3932,6 +3932,72 @@ export const GITHUB_API_HELD_METRIC = "paperclip_github_api_held_total";
 export const ZERO_INIT_GITHUB_API_HELD_LABELS = { resource: "core", route: "other" } as const;
 
 /**
+ * GitHub's own `x-ratelimit-*` budget headers, per probed route (PEN-6341).
+ *
+ * The App installation's `core` budget is served by several route-pinned
+ * shards of 9,650/h that drain independently, so one shard can exhaust
+ * mid-window while another sits on thousands of unreachable spare requests.
+ * `GET /rate_limit` cannot show that — it reports a single `core` object, has
+ * been measured publishing `used == limit` exactly while another shard served
+ * 200 with 8,525 of that same `core` free, and is itself pinned to one shard.
+ *
+ * Labelled by ROUTE, never by shard. Which routes share a shard was measured
+ * MOVING within about seven hours on 2026-11-09, so a shard label would
+ * publish a confident mapping that had already decayed. Routes sharing a
+ * counter move together and report the same reset, so the partition stays
+ * recoverable at query time: group by `reset_seconds` and the shards fall out.
+ *
+ * Cardinality: `route` is closed at the probe set in
+ * `github-rate-limit-sampler.ts`. Nothing URL- or caller-derived reaches it.
+ */
+export const GITHUB_RATE_LIMIT_REMAINING_METRIC = "paperclip_github_rate_limit_remaining";
+
+/** Ceiling for the shard {@link GITHUB_RATE_LIMIT_REMAINING_METRIC} was read from. */
+export const GITHUB_RATE_LIMIT_LIMIT_METRIC = "paperclip_github_rate_limit_limit";
+
+/** Requests already drawn from that shard this window. */
+export const GITHUB_RATE_LIMIT_USED_METRIC = "paperclip_github_rate_limit_used";
+
+/**
+ * Unix seconds at which that shard's window resets.
+ *
+ * The shard discriminator, and the reason this family is query-partitionable
+ * without a shard label. NOT a stable shard identifier on its own: it is a
+ * deadline that rolls, and an idle counter reports `now + window` rather than
+ * a fixed instant, so two counters can print one value. Use it to group
+ * routes sampled in the SAME scrape, never to name a shard across time.
+ */
+export const GITHUB_RATE_LIMIT_RESET_SECONDS_METRIC = "paperclip_github_rate_limit_reset_seconds";
+
+/**
+ * 1 when the most recent probe of this route returned well-formed budget
+ * headers; 0 when it did not.
+ *
+ * Not optional. The four gauges above are only written on a good read, so
+ * without this a sampler that died and a budget that stopped moving render
+ * identically — and "remaining is flat and healthy" is the reading an operator
+ * would take. A 0 here means the numbers beside it are stale by at least one
+ * interval and must not be read as current.
+ *
+ * An ABSENT series is deliberately distinct from a 0, on the same principle as
+ * `process_open_fds_by_class`: no series at all means the App credentials are
+ * not configured, so nothing was ever probed; a 0 means the probe ran and
+ * failed. Folding those together would make an unconfigured deployment and a
+ * broken one read alike.
+ */
+export const GITHUB_RATE_LIMIT_SAMPLE_SUCCESS_METRIC = "paperclip_github_rate_limit_sample_success";
+
+/** One route's budget headers, as GitHub reported them. Nulls are headers the response omitted. */
+export interface GithubRateLimitSample {
+  route: string;
+  remaining: number;
+  limit: number;
+  used: number | null;
+  resetSeconds: number | null;
+  resource: string | null;
+}
+
+/**
  * Why GitHub refused. Closed set — see {@link GITHUB_API_REFUSALS_METRIC}.
  *
  * Deliberately NOT a catch-all `other`: every 403/429 lands on exactly one of
@@ -5966,6 +6032,11 @@ let branchClaimConflictDeferralAttempt: Histogram | null = null;
 let externalRuntimeReservationsActive: Gauge | null = null;
 let externalRuntimeReservationOldestAge: Gauge | null = null;
 let queuedRunAgeMetricsRefreshSuccess: Gauge | null = null;
+let githubRateLimitRemaining: Gauge<"route"> | null = null;
+let githubRateLimitLimit: Gauge<"route"> | null = null;
+let githubRateLimitUsed: Gauge<"route"> | null = null;
+let githubRateLimitResetSeconds: Gauge<"route"> | null = null;
+let githubRateLimitSampleSuccess: Gauge<"route"> | null = null;
 let deferredIssueExecutionWakeOldestAge: Gauge<"agent_id"> | null = null;
 let deferredIssueExecutionWakeAgeMetricsRefreshSuccess: Gauge | null = null;
 let coldInReviewIssueOldestAge: Gauge<"agent_id"> | null = null;
@@ -6233,6 +6304,11 @@ function ensureRegistry(): {
   routineFireIntervalGauge: Gauge<"routine_id">;
   routineFireGapMetricsRefreshSuccessGauge: Gauge;
   queuedRunAgeMetricsRefreshSuccessGauge: Gauge;
+  githubRateLimitRemainingGauge: Gauge<"route">;
+  githubRateLimitLimitGauge: Gauge<"route">;
+  githubRateLimitUsedGauge: Gauge<"route">;
+  githubRateLimitResetSecondsGauge: Gauge<"route">;
+  githubRateLimitSampleSuccessGauge: Gauge<"route">;
   deferredIssueExecutionWakeOldestAgeGauge: Gauge<"agent_id">;
   deferredIssueExecutionWakeAgeMetricsRefreshSuccessGauge: Gauge;
   coldInReviewIssueOldestAgeGauge: Gauge<"agent_id">;
@@ -6379,6 +6455,11 @@ function ensureRegistry(): {
     || !externalRuntimeReservationsActive
     || !externalRuntimeReservationOldestAge
     || !queuedRunAgeMetricsRefreshSuccess
+    || !githubRateLimitRemaining
+    || !githubRateLimitLimit
+    || !githubRateLimitUsed
+    || !githubRateLimitResetSeconds
+    || !githubRateLimitSampleSuccess
     || !externalRuntimeReservationsReleasePending
     || !externalRuntimeReservationReleasePendingOldestAge
     || !environmentLeasesOrphanedActive
@@ -6844,6 +6925,48 @@ function ensureRegistry(): {
     externalRuntimeReservationOldestAge = new Gauge({
       name: EXTERNAL_RUNTIME_RESERVATION_OLDEST_AGE_METRIC,
       help: "Age in seconds of the oldest unreleased external-runtime slot reservation.",
+      registers: [registry],
+    });
+    githubRateLimitRemaining = new Gauge({
+      name: GITHUB_RATE_LIMIT_REMAINING_METRIC,
+      help:
+        "Requests left in the GitHub core shard this route is pinned to, as GitHub's "
+        + "x-ratelimit-remaining reported it (PEN-6341). Labelled by route, not by shard: which "
+        + "routes share a shard was measured moving within ~7h, so group by "
+        + GITHUB_RATE_LIMIT_RESET_SECONDS_METRIC + " within one scrape to recover the partition. "
+        + "Only written on a good read -- pair it with " + GITHUB_RATE_LIMIT_SAMPLE_SUCCESS_METRIC
+        + ", or a dead sampler reads as a healthy flat budget.",
+      labelNames: ["route"],
+      registers: [registry],
+    });
+    githubRateLimitLimit = new Gauge({
+      name: GITHUB_RATE_LIMIT_LIMIT_METRIC,
+      help: "Ceiling of the GitHub core shard this route is pinned to (PEN-6341).",
+      labelNames: ["route"],
+      registers: [registry],
+    });
+    githubRateLimitUsed = new Gauge({
+      name: GITHUB_RATE_LIMIT_USED_METRIC,
+      help: "Requests already drawn from this route's GitHub core shard this window (PEN-6341).",
+      labelNames: ["route"],
+      registers: [registry],
+    });
+    githubRateLimitResetSeconds = new Gauge({
+      name: GITHUB_RATE_LIMIT_RESET_SECONDS_METRIC,
+      help:
+        "Unix seconds at which this route's GitHub core shard resets (PEN-6341). The shard "
+        + "discriminator WITHIN one scrape. Not a stable shard id across time: it is a rolling "
+        + "deadline, and an idle counter reports now+window, so two counters can print one value.",
+      labelNames: ["route"],
+      registers: [registry],
+    });
+    githubRateLimitSampleSuccess = new Gauge({
+      name: GITHUB_RATE_LIMIT_SAMPLE_SUCCESS_METRIC,
+      help:
+        "1 when the last probe of this route returned well-formed budget headers, 0 when it did "
+        + "not (PEN-6341). The other four gauges are written only on a good read, so without this "
+        + "a stopped sampler is indistinguishable from a budget that stopped moving.",
+      labelNames: ["route"],
       registers: [registry],
     });
     queuedRunAgeMetricsRefreshSuccess = new Gauge({
@@ -9555,6 +9678,11 @@ function ensureRegistry(): {
     branchClaimConflictDeferralAttemptHistogram: branchClaimConflictDeferralAttempt,
     externalRuntimeReservationsActiveGauge: externalRuntimeReservationsActive,
     externalRuntimeReservationOldestAgeGauge: externalRuntimeReservationOldestAge,
+    githubRateLimitRemainingGauge: githubRateLimitRemaining,
+    githubRateLimitLimitGauge: githubRateLimitLimit,
+    githubRateLimitUsedGauge: githubRateLimitUsed,
+    githubRateLimitResetSecondsGauge: githubRateLimitResetSeconds,
+    githubRateLimitSampleSuccessGauge: githubRateLimitSampleSuccess,
     queuedRunAgeMetricsRefreshSuccessGauge: queuedRunAgeMetricsRefreshSuccess,
     externalRuntimeReservationsReleasePendingGauge: externalRuntimeReservationsReleasePending,
     externalRuntimeReservationReleasePendingOldestAgeGauge: externalRuntimeReservationReleasePendingOldestAge,
@@ -10479,6 +10607,29 @@ export function setQueuedRunOldestClaimableAgeMetrics(
 }
 
 /** Mark whether the queued-run age gauge was refreshed from the database. */
+/**
+ * Publish one route's budget sample, or record that reading it failed.
+ *
+ * A null sample sets ONLY the success gauge to 0 and deliberately leaves the
+ * value gauges alone. Zeroing them would publish `remaining = 0`, which is the
+ * exhaustion signal itself -- a failed read would then be indistinguishable
+ * from the outage it is failing to observe, and would fire on the wrong one.
+ * Leaving them stale beside a 0 success gauge is the honest pairing: the
+ * values are last-known, and the flag says so.
+ */
+export function setGithubRateLimitSample(route: string, sample: GithubRateLimitSample | null): void {
+  const reg = ensureRegistry();
+  if (!sample) {
+    reg.githubRateLimitSampleSuccessGauge.set({ route }, 0);
+    return;
+  }
+  reg.githubRateLimitRemainingGauge.set({ route }, sample.remaining);
+  reg.githubRateLimitLimitGauge.set({ route }, sample.limit);
+  if (sample.used !== null) reg.githubRateLimitUsedGauge.set({ route }, sample.used);
+  if (sample.resetSeconds !== null) reg.githubRateLimitResetSecondsGauge.set({ route }, sample.resetSeconds);
+  reg.githubRateLimitSampleSuccessGauge.set({ route }, 1);
+}
+
 export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }
@@ -13129,6 +13280,11 @@ export function __resetMetricsForTest(): void {
   branchClaimConflictDeferralAttempt = null;
   externalRuntimeReservationsActive = null;
   externalRuntimeReservationOldestAge = null;
+  githubRateLimitRemaining = null;
+  githubRateLimitLimit = null;
+  githubRateLimitUsed = null;
+  githubRateLimitResetSeconds = null;
+  githubRateLimitSampleSuccess = null;
   queuedRunAgeMetricsRefreshSuccess = null;
   externalRuntimeReservationsReleasePending = null;
   externalRuntimeReservationReleasePendingOldestAge = null;
