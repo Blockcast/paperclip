@@ -163,9 +163,30 @@ function registerModuleMocks() {
     budgetService: () => mockBudgetService,
   }));
 
-  vi.doMock("../services/heartbeat.js", () => ({
-    heartbeatService: () => mockHeartbeatService,
-  }));
+  // Spread the NAMED exports routes/agents.ts imports from here: a total mock
+  // drops them, and the route then calls `undefined(...)` and 500s where it
+  // meant to 403. Measured on PR #3563 — the two "normalization creates a
+  // secret binding" cases below were the only two reaching the new pinned-key
+  // guard (every other case throws at an earlier guard on the raw body), so a
+  // stale total mock surfaced as exactly two failures in a file the PR does not
+  // touch.
+  //
+  // ⚠ Named explicitly rather than spread: heartbeat.ts is ~2.2 MB and this
+  // file mocks it out on purpose. Add a line here when routes/agents.ts starts
+  // importing another value from it. `derivePaperclipPrReview` was already
+  // undefined under this mock before PR #3563 and is supplied for the same
+  // reason, pre-emptively — nothing in this file reaches it today.
+  vi.doMock("../services/heartbeat.js", async () => {
+    const actual = await vi.importActual<typeof import("../services/heartbeat.js")>(
+      "../services/heartbeat.js",
+    );
+    return {
+      agentActorUnwritableConfigKeys: actual.agentActorUnwritableConfigKeys,
+      agentScopeOnlyConfigKeysFor: actual.agentScopeOnlyConfigKeysFor,
+      derivePaperclipPrReview: actual.derivePaperclipPrReview,
+      heartbeatService: () => mockHeartbeatService,
+    };
+  });
 
   vi.doMock("../services/issue-approvals.js", () => ({
     issueApprovalService: () => mockIssueApprovalService,

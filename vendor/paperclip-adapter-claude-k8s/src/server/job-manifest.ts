@@ -3694,8 +3694,22 @@ export function buildJobManifest(input: JobBuildInput): JobBuildResult {
   // key rather than by the gate.
   //
   // `ctx.agent.adapterConfig` is the agent row verbatim, before any merge, so
-  // it is the one image value in this function with agent provenance. Same
+  // it is the one image value in this function that no OVERLAY can move. Same
   // resolution rule as above, against that object.
+  //
+  // ⛔ That used to read "the one image value in this function with agent
+  // provenance", and the implied premise — that the agent row is operator
+  // controlled — was measured FALSE on 2026-11-08 (PEN-6188): `agent_config:
+  // update` resolves `allow_self`, so the subject agent could PATCH its own
+  // row. Pinning the broker here is only as strong as the row it reads.
+  //
+  // What makes the sentence true today is a SECOND control, server-side and in
+  // a different repo layer: `routes/agents.ts` refuses an agent-authored write
+  // of `adapterConfig.image` on the agent row (`agentActorUnwritableConfig
+  // Keys`, PEN-6259). This pin stops a lower SCOPE choosing the broker's code;
+  // that guard stops the subject PRINCIPAL choosing it. Neither covers the
+  // other, and this comment is not evidence for the second — if that guard is
+  // ever removed, this line stops being true and nothing here will say so.
   //
   // Divergence is allowed rather than refused. If a lower scope points the
   // agent container at a different image, the broker still runs the operator's

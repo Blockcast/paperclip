@@ -81,7 +81,11 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
-import { agentScopeOnlyConfigKeysFor, derivePaperclipPrReview } from "../services/heartbeat.js";
+import {
+  agentActorUnwritableConfigKeys,
+  agentScopeOnlyConfigKeysFor,
+  derivePaperclipPrReview,
+} from "../services/heartbeat.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "../services/ccrotate-capacity-retry.js";
 import {
   evaluateStrandedRunRecovery,
@@ -1839,6 +1843,14 @@ export function agentRoutes(
         // being true at D1 stage 1 (PEN-6148). The structural reason does not
         // expire.
         pinnedKeySourceConfig: agentAdapterConfig ?? null,
+        // A model-profile adapterConfig is NOT the object the broker reads its
+        // image from — `buildJobManifest` resolves `brokerImage` off
+        // `ctx.agent.adapterConfig`, the agent row verbatim, before any merge.
+        // So the write-side `image` pin (PEN-6259) does not apply here: it
+        // would refuse a profile-scoped agent-container image, which costs a
+        // capability and closes no hazard. Stated as a decision, not an
+        // omission.
+        configScope: "model_profile",
       });
     }
   }
@@ -2366,13 +2378,21 @@ export function agentRoutes(
    * today, only the two unconditional keys are refused, so this change cannot
    * alter any current agent's behaviour.
    *
-   * NOT pinned here, deliberately, and both are open questions rather than
-   * oversights: `image` and `serviceAccountName`. Both are self-writable and
-   * both are security-relevant (`image` becomes `brokerImage`;
-   * `serviceAccountName` selects the pod's Kubernetes identity), but `image`
-   * is also written by the operator image-bump path and refusing it here may
-   * collide with flows this change has not measured. Raised on PEN-6188 for a
-   * decision; do not read their absence as a finding that they are safe.
+   * `image` IS pinned here now, and only here — PEN-6259. It is refused to an
+   * agent actor on the TOP-LEVEL agent `adapterConfig` (`configScope:
+   * "agent_row"`, the default) and is deliberately NOT added to
+   * `AGENT_SCOPE_ONLY_CONFIG_KEYS`, because the overlay question and the write
+   * question have different answers for it: see
+   * `agentActorUnwritableConfigKeys`. The hold-back reason this comment used to
+   * give — that the operator image-bump path also writes `image` — was measured
+   * false on 2026-11-09: `services/agent-image-bump.ts` writes
+   * `db.update(agents).set({...})` in-process, so it never passes through this
+   * route and this guard cannot reach it.
+   *
+   * `serviceAccountName` is still NOT pinned here and is still an open
+   * question, tracked on PEN-6247 — it needs the issue-overlay route closed as
+   * well, which is a different home. Do not read its absence as a finding that
+   * it is safe.
    */
   function assertNoAgentPinnedAdapterConfigMutation(
     req: Request,
@@ -2385,19 +2405,28 @@ export function agentRoutes(
      * one; see the note there for why the two cannot be the same object.
      */
     pinnedKeySourceConfig?: Record<string, unknown> | null,
+    /**
+     * WHICH OBJECT this config is: the agent row's own `adapterConfig`, or one
+     * nested under `runtimeConfig.modelProfiles.*`. Not a style flag — it
+     * selects the key set, and the two sets genuinely differ (PEN-6259).
+     */
+    configScope: "agent_row" | "model_profile" = "agent_row",
   ) {
     if (req.actor.type !== "agent" || !adapterConfig) return;
     const existing = existingAdapterConfig ?? {};
     const pinnedKeySource = pinnedKeySourceConfig ?? existing;
-    const changedPinnedKeys = [...agentScopeOnlyConfigKeysFor(pinnedKeySource)]
+    const pinnedKeys = configScope === "agent_row"
+      ? agentActorUnwritableConfigKeys(pinnedKeySource)
+      : agentScopeOnlyConfigKeysFor(pinnedKeySource);
+    const changedPinnedKeys = [...pinnedKeys]
       .filter((key) => JSON.stringify(adapterConfig[key]) !== JSON.stringify(existing[key]))
       .map((key) => `${path}.${key}`);
     if (changedPinnedKeys.length === 0) return;
     throw forbidden(
       "Agent-authenticated callers cannot change adapter configuration keys that are pinned to "
         + `agent scope (${changedPinnedKeys.join(", ")}). `
-        + "These decide where the agent's credential lands, at what uid it runs, and off which "
-        + "volume, so they must be set by a board actor.",
+        + "These decide where the agent's credential lands, what code runs holding it, at what "
+        + "uid, and off which volume, so they must be set by a board actor.",
     );
   }
 
@@ -2421,6 +2450,13 @@ export function agentRoutes(
        * model-profile call site for the one place they do not.
        */
       pinnedKeySourceConfig?: Record<string, unknown> | null;
+      /**
+       * Which object `adapterConfig` is. Defaults to the agent row, which is
+       * every call site but the nested model-profile one. See
+       * `agentActorUnwritableConfigKeys` for why the distinction is load
+       * bearing rather than cosmetic.
+       */
+      configScope?: "agent_row" | "model_profile";
     },
   ) {
     assertNoAgentInstructionsConfigMutation(
@@ -2448,6 +2484,7 @@ export function agentRoutes(
       path,
       options?.existingAdapterConfig ?? null,
       options?.pinnedKeySourceConfig ?? null,
+      options?.configScope ?? "agent_row",
     );
   }
 
