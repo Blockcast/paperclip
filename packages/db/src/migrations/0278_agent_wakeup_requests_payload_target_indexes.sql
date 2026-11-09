@@ -51,7 +51,7 @@
 -- rewrite. Sparse probe 237.6 -> 0.2 ms (1,188x). Price: 124 MB total (~20% of
 -- this table's heap) and ~35% of insert throughput here. That price is
 -- deliberate and was approved as a capacity call on PEN-6104: the status quo
--- degrades LINEARLY with a table nothing prunes while this cost does not, and
+-- degrades LINEARLY with the retained window while this cost does not, and
 -- the read I/O removed lands on the same device as the writes.
 --
 -- ⛔ THE READER MUST CARRY THE `?` GUARD OR THESE FOUR OBJECTS ARE DEAD WEIGHT.
@@ -77,9 +77,9 @@
 -- again by the migration runner immediately before this file; the statements
 -- below then only validate them. That is not optional:
 -- `agent_wakeup_requests` is in the `large` bucket, is described in its own
--- schema comment as "the largest table in the schema with no pruning", and
--- takes a write on every wake. A plain transactional build would hold a
--- SHARE lock across all four. One at a time matters for a second reason:
+-- schema comment as "the largest table in the schema, pruned only to a 14-day
+-- window", and takes a write on every wake. A plain transactional build would
+-- hold a SHARE lock across all four. One at a time matters for a second reason:
 -- each CONCURRENTLY build holds back the xmin horizon for its
 -- duration -- watch `pg_paperclip_mvcc_xid_horizon_span` and
 -- `pg_paperclip_table_mvcc_n_dead_tup` across the window.

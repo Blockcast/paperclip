@@ -245,7 +245,7 @@ export const PRECREATE_REQUIRED_INDEXES: readonly PrecreateRequiredIndex[] = [
   // PEN-6104 / 0278. Four indexes under one migration; the deploy-time
   // precreation step builds them one at a time. An operator hand-running the
   // remediation should do the same -- each build holds back the xmin horizon,
-  // on the largest table in the schema, which has no pruning.
+  // on the largest table in the schema, pruned only to a 14-day window.
   {
     migration: "0278_agent_wakeup_requests_payload_target_indexes.sql",
     name: "agent_wakeup_requests_payload_issue_idx",
