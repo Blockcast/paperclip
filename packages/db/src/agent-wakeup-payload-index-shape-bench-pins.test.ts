@@ -1,20 +1,22 @@
 /**
- * PEN-6104: two pins on `agent-wakeup-payload-index-shape.bench.ts`, both for
- * defects that have already happened and would recur silently.
+ * PEN-6104: three pins on `agent-wakeup-payload-index-shape.bench.ts`, each
+ * for a defect that has already happened and would recur silently.
  *
  * The bench is a `.bench.ts`, so it is OUTSIDE the vitest glob and CI never
  * runs it. That is the point: nothing else in the tree executes the file, so a
  * regression in it is invisible until someone re-runs it by hand months later
  * and quotes the result. These are source-text assertions, which is weak
- * evidence in general -- but the two properties below are properties of the
- * TEXT, and the text is what the next reader acts on.
+ * evidence in general -- but the properties below are properties of the TEXT,
+ * and the text is what the next reader acts on.
  *
- * ⭐ Both pins are written as POSITIVE assertions about what the file now says,
+ * ⭐ All three pins are written as POSITIVE assertions about what the file says,
  * never as a grep for the defective string. A `-` on a carrier proves deletion
  * and never repair, and a grep for the old wording cannot tell a repaired file
  * apart from one where someone deleted the wrong line without writing the right
  * one -- nor from a file that quotes the defect as a negative example, which
- * this bench's header now deliberately does in both places.
+ * the bench header and PIN 1's docstring below BOTH now deliberately do.
+ * ⚠️ So a sweep for the retracted "24x" attribution hits THIS file too. That
+ * hit is the warning working, not the defect surviving; do not "repair" it.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -37,10 +39,22 @@ describe("agent_wakeup_requests payload index-shape bench", () => {
    * rewrite compacts the heap). The handicap is UNEVEN BETWEEN THE CANDIDATES
    * BEING COMPARED, and a comparison is the only thing this file produces.
    *
-   * Measured consequence, which is why this is pinned rather than commented:
-   * the bias did not merely inflate the milliseconds, it changed which PLAN the
-   * planner chose for C4, moving its dense figure by 24x. A reviewer re-reading
-   * the numbers cannot see that; only the plan shows it.
+   * Why this is pinned rather than commented -- and note what the reason is
+   * NOT. It is pinned because the handicap is uneven BETWEEN THE CANDIDATES,
+   * which is a defect whether or not it moved a number. Its measured effect
+   * turned out to be BELOW this harness's ~15% noise floor (bench finding 7),
+   * so there is no headline delta here and a reader who goes looking for one
+   * will not find it.
+   *
+   * ⛔ An earlier revision of this docstring gave a different reason: that the
+   * bias changed which PLAN the planner chose for C4, moving its dense figure by
+   * 24x. That attribution is RETRACTED in the bench header and it CANNOT be
+   * true -- C4's `ADD COLUMN ... STORED` rewrite copies only live tuples, and
+   * `ANALYZE agent_wakeup_requests` runs before EVERY candidate's EXPLAINs, so
+   * C4's heap, indexes and statistics are identical with or without this
+   * `VACUUM`. C4's dense figure is run-to-run plan instability at nominally
+   * identical state (4.44 ms vs 91.83 ms, two different plans, across two such
+   * runs). The assertions below were always correct; only this rationale was wrong.
    */
   it("VACUUMs after the write probe's DELETE, inside the probe itself", () => {
     const probeStart = source.indexOf("const writeProbe = async");
