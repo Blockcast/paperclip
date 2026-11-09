@@ -1896,6 +1896,16 @@ export const UNLANDED_ELIGIBLE_HOURS = 6;
  * not report clean. The case is narrow — it needs a rollup that is non-empty
  * but carries no timestamp on any entry — and a row that persists in it is a
  * true finding twice over, because nothing landed it AND nothing dated it.
+ *
+ * ⛔ AMENDED 2026-11-09 (PEN-6363). Everything above is about which rows this
+ * cohort CONTAINS and is unchanged. What was wrong is what the block SAYS about
+ * them: its closing sentence sent the reader to "check that the routine is
+ * firing", and at 2026-11-09T19:27Z that diagnostic returned FINE — the routine
+ * had enqueued 8 PRs 4h21m earlier and five of them had already merged —
+ * while 7 of the 8 rows named here had never once been offered a queue slot in
+ * their whole lives. The cohort was right and its remedy terminated. See
+ * `unlandedNeverQueued`, which reports that fact on the rows this predicate
+ * already holds, and note that NOTHING about this predicate changed.
  */
 export function unlandedEligible(
   prs,
@@ -1917,19 +1927,46 @@ export function unlandedEligible(
 export function renderUnlandedEligible(
   repo,
   stranded,
-  { staleHours = UNLANDED_ELIGIBLE_HOURS } = {},
+  { staleHours = UNLANDED_ELIGIBLE_HOURS, neverQueued = [] } = {},
 ) {
   if ((stranded ?? []).length === 0) return "";
+  // Intersected with `stranded` rather than trusted, so a caller that passes a
+  // wider set cannot make this block name a PR the cohort does not contain.
+  const asked = new Set(neverQueued ?? []);
+  const unoffered = (stranded ?? []).map((r) => r?.number).filter((n) => asked.has(n));
+  const marked = new Set(unoffered);
   const line = ({ number, reason, ageHours }) =>
     `  ${repo}#${number} — \`${reason}\`, ` +
-    (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`);
+    (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`) +
+    (marked.has(number) ? ", never once queued" : "");
   return (
     `unlanded-eligible (judgeable >${staleHours}h, nothing holding it) — ${stranded.length}:\n` +
     stranded.map(line).join("\n") +
     "\nThese carry no hold at all — the classifier said enqueue. So the thing " +
     "that has not happened is the landing itself, not a decision about it. " +
-    "Check that the routine is firing and that its enqueues are succeeding " +
-    "before looking at the PRs."
+    "Start at the routine — is it firing, and are its enqueues succeeding? " +
+    "⚠ A yes does not clear this cohort. The clock above is JUDGEABLE age, " +
+    "which starts at the head's newest check and not at the moment the PR " +
+    "became landable, so a PR whose last hold cleared recently has waited far " +
+    "less than its number says — and the landing routine fires four times a " +
+    "day, so one interval of ordinary schedule wait is normal." +
+    (unoffered.length === 0
+      ? ""
+      : `\n\nOf those, never once queued (>${CAP_STARVED_HOURS}h judgeable, no ` +
+        "`added_to_merge_queue` or `auto_merge_enabled` anywhere in the PR's " +
+        `timeline) — ${unoffered.length}: ` +
+        unoffered.map((n) => `${repo}#${n}`).join(", ") +
+        ".\nFor these the routine has never offered a slot at all, so a problem " +
+        "downstream of the queue is ruled out and exactly two explanations " +
+        "remain: the ACTING fire's per-fire cap did not reach them (the " +
+        "cap-starved block's subject), or no acting fire has run since they " +
+        "became eligible. THIS SWEEP CANNOT SEPARATE THEM — it runs `--alarm`, " +
+        "which cannot apply, so its own cap allocation is a simulation with " +
+        "`spent` 0 and its `enqueue`/`cap:` split is not the acting fire's. " +
+        "What separates them is whether the last acting fire offered a slot to " +
+        "ANY PR: if others carry `added_to_merge_queue` in a window these do " +
+        "not, the cap or its ordering is the cause and re-running the routine " +
+        "will not reach them.")
   );
 }
 
@@ -2109,6 +2146,83 @@ export function renderCapStarved(repo, starved, { staleHours = CAP_STARVED_HOURS
     "So demand is outrunning MAX_ENQUEUES_PER_FIRE rather than queueing behind " +
     "it. Raising throughput is the fix; re-running the routine is not."
   );
+}
+
+/**
+ * The numbers in an `unlandedEligible` cohort that have ALSO never once been
+ * offered a queue slot and are past CAP_STARVED_HOURS — the same predicate
+ * `capStarved` keys on, asked of the OTHER cohort.
+ *
+ * ## Why this exists: the discriminator was gated away from its population
+ *
+ * ⛔ Measured 2026-11-09T19:27Z (PEN-6363), `landing-sweep` run 42683577708 on
+ * Blockcast/paperclip. The receipt reported EIGHT PRs as `unlanded-eligible`.
+ * Reading all eight timelines for the exact `QUEUE_OFFER_EVENTS` pair, SEVEN
+ * of them — #3568 #3567 #3566 #3565 #3561 #3559 #3555, judgeable 12.7h to
+ * 21.7h — had never been offered a queue slot in their entire lives. That is
+ * `everOfferedQueueSlot === false` past CAP_STARVED_HOURS verbatim, which is
+ * what `capStarved` exists to detect, and `cap-starved` named none of them: it
+ * named #3578 #3575 #3574 #3572 instead. (Positive control, both arms: the
+ * filter is not vacuous — #3508 and #3596 return events under it — and the one
+ * cohort member that HAD been offered a slot, #3549, is also the only one
+ * under 12h, so the empty result is a real absence and not a mute read.)
+ *
+ * The cause is that BOTH cohorts gate on the action `classifyAll` assigned at
+ * ONE sweep: `unlandedEligible` takes `action === "enqueue"`, `capStarved`
+ * takes `skip` plus a `cap:` reason. `classifyAll` slices the eligible set
+ * oldest-first at `maxEnqueues - spent`, so a PR drifts between the two
+ * buckets as the window moves, and the OLDEST eligible PRs are — by
+ * oldest-first allocation — precisely the ones most often INSIDE the window
+ * when the hourly alarm samples. At 19:27Z the `enqueue` set was exactly 10
+ * and all seven sat inside it. So a whole-life fact was being consulted only
+ * behind a test on one instant's allocation, and it was gated away from the
+ * population it was written for.
+ *
+ * ## Why a refinement and not a wider predicate
+ *
+ * ⛔ `unlandedEligible`'s membership is UNCHANGED by this, deliberately, and a
+ * test pins that. Widening it to take `cap:` rows is refused on the bias
+ * argument in its own comment — the cap spends its budget on PRs that reported
+ * more recently, so an age test over the deferred set fires hardest when the
+ * routine is working hardest — and that argument still stands. This adds no
+ * row to any cohort; it reports one more FACT about rows already named, which
+ * is the only change that cannot import the bias.
+ *
+ * ## What the fact is worth, and what it is NOT
+ *
+ * ⚠ It does NOT establish starvation, and `renderUnlandedEligible` must not
+ * say it does. The separating datum is the ACTING fire's own allocation, and
+ * that fire is a six-hourly Paperclip routine (four fires a day on an
+ * America/Los_Angeles cron — the schedule is quoted in landing-sweep.yml,
+ * deliberately not here, because its spelling closes a block comment) whose
+ * receipt is posted to a ledger row in another company. Measured the same
+ * day, that row is `404` from an agent seat here and cross-company
+ * resolution is `403 Board access required`, so the datum is
+ * RETAINED AND WITHHELD rather than absent. A dry `--alarm` fire cannot
+ * reconstruct it: `spent` is 0 by construction. What the fact does buy is the
+ * elimination of everything downstream of the queue — a PR never offered a
+ * slot cannot have been ejected, cannot be wedged at a queue head, and cannot
+ * have failed a queue-branch check — which leaves exactly the two causes the
+ * block names and gives the reader a one-call way to tell them apart.
+ *
+ * ## Three-valued input, same posture as `capStarved`
+ *
+ * An UNREAD timeline (`everOfferedQueueSlot === null`) is NOT named: the claim
+ * is "nothing has ever offered this a slot" and an unread timeline cannot
+ * support it. An UNDATABLE row (`ageHours === null`) IS named, matching both
+ * sibling cohorts and for the same reason — an instrument that cannot see
+ * something must not report clean.
+ */
+export function unlandedNeverQueued(prs, stranded, { staleHours = CAP_STARVED_HOURS } = {}) {
+  const byNumber = new Map((prs ?? []).map((pr) => [pr?.number, pr]));
+  const unoffered = [];
+  for (const row of stranded ?? []) {
+    if (everOfferedQueueSlot(byNumber.get(row?.number)?.timeline) !== false) continue;
+    const ageHours = row?.ageHours;
+    if (typeof ageHours === "number" && ageHours < staleHours) continue;
+    unoffered.push(row?.number);
+  }
+  return unoffered;
 }
 
 /**
@@ -3947,7 +4061,10 @@ export function runRepo(options) {
   const blocks = [
     renderReceipt(rows),
     stalled,
-    renderUnlandedEligible(repo, eligible),
+    // PEN-6363. `eligible` is passed UNFILTERED — this only annotates rows the
+    // cohort already holds. See `unlandedNeverQueued` for why the fact is
+    // reported here rather than by widening either cohort's predicate.
+    renderUnlandedEligible(repo, eligible, { neverQueued: unlandedNeverQueued(prs, eligible) }),
     renderCapStarved(repo, capped),
   ];
   console.log(`## ${repo}\n\n${blocks.filter(Boolean).join("\n\n")}`);
@@ -4450,8 +4567,17 @@ function main() {
     console.error(
       `\nALARM: ${stranded.length} PR(s) have been landable for over ` +
         `${UNLANDED_ELIGIBLE_HOURS}h and are still open — ${stranded.join(", ")}.\n` +
-        "Nothing is holding them, so the landing routine is what has not run. " +
-        "See the unlanded-eligible block above.",
+        // ⛔ PEN-6363: this line used to end "so the landing routine is what has
+        // not run", and that attribution was measured FALSE at 2026-11-09T19:27Z
+        // — the routine had enqueued 8 PRs 4h21m earlier, five of which had
+        // already merged, while 7 of the 8 rows named here had never
+        // been offered a slot. An alarm must not name a cause its own dry run
+        // cannot decide; the block above carries what IS decidable.
+        "Nothing is holding them. WHICH of the two causes it is — the routine " +
+        "not running, or running and not reaching them — is not decided by this " +
+        "line: an `--alarm` fire cannot apply, so its cap allocation is a " +
+        "simulation. See the unlanded-eligible block above, which marks every " +
+        "row that has never once been offered a queue slot.",
     );
   }
   if (alarm && starved.length > 0) {

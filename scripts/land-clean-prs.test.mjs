@@ -20,6 +20,7 @@ import {
   capStarved,
   renderCapStarved,
   everOfferedQueueSlot,
+  unlandedNeverQueued,
   allyVerdictAtHead,
   approvalLanes,
   approvalAttestsHead,
@@ -4606,6 +4607,208 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
       assert.deepEqual(unreadable, ["a/broken (rows.map is not a function)"]);
       assert.deepEqual(swept, ["a/fine"], "and the fire CONTINUED to the next repo");
     });
+  });
+});
+
+describe(`unlanded-eligible rows never once offered a slot (PEN-6363)`, () => {
+  const checkAt = (iso) => [
+    { __typename: "CheckRun", name: "verify", conclusion: "SUCCESS", completedAt: iso },
+  ];
+  const event = (name, iso = "2026-09-12T10:00:00Z") => ({ event: name, created_at: iso });
+  // `timeline: []` is a READ timeline carrying no queue event — the shape this
+  // refinement exists to name. The UNREAD case OMITS the key, and cannot be
+  // spelled by passing `undefined`: a default parameter substitutes on
+  // `undefined`, so that call produces `[]` and silently tests the opposite
+  // thing. Same trap the cap-starved block records, same escape.
+  const pr = (number, iso, timeline = []) => ({
+    number,
+    statusCheckRollup: iso === null ? [] : checkAt(iso),
+    timeline,
+  });
+  const prUnread = (number, iso) => ({
+    number,
+    statusCheckRollup: iso === null ? [] : checkAt(iso),
+  });
+  const enqueueRow = (number) => ({ number, action: "enqueue", reason: "mergestate:CLEAN" });
+  const capRow = (number) => ({
+    number,
+    action: "skip",
+    reason: `cap:${MAX_ENQUEUES_PER_FIRE}-per-fire`,
+  });
+  const strandedRow = (number, ageHours) => ({ number, reason: "mergestate:CLEAN", ageHours });
+
+  const OLD = "2026-09-12T20:00:00Z"; // 16h before NOW — past CAP_STARVED_HOURS
+  const RECENT = "2026-09-13T04:00:00Z"; // 8h before NOW — inside it
+
+  it("names a row the classifier said yes to that has never once been queued", () => {
+    // ⛔ THE REGRESSION. #3555's shape, 2026-11-09T19:27Z: action `enqueue`
+    // (inside that fire's top-10 window), judgeable 12.7h, and NO
+    // `added_to_merge_queue` or `auto_merge_enabled` anywhere in its timeline.
+    // Six siblings carried the same shape at 12.7-21.7h. Before this, that
+    // fact was consulted only behind `action === "skip"`, so the whole band
+    // was reported as `unlanded-eligible` under a remedy that sends the reader
+    // to a routine which had fired 4h21m earlier and merged five of its eight
+    // enqueues.
+    const prs = [pr(3555, OLD)];
+    const stranded = unlandedEligible(prs, [enqueueRow(3555)], { now: NOW });
+    assert.deepEqual(stranded, [{ number: 3555, reason: "mergestate:CLEAN", ageHours: 16 }]);
+    assert.deepEqual(unlandedNeverQueued(prs, stranded), [3555]);
+  });
+
+  it("is reported regardless of which bucket the sweep's allocation put the row in", () => {
+    // ⛔ THE DEFECT ITSELF. One PR, one timeline, one age — and the only thing
+    // that differs between the two calls is the action `classifyAll` happened
+    // to assign at THIS fire. `capStarved` saw it when the cap had pushed it
+    // out of the window; nothing saw it when the window held it. Both arms
+    // must now report the same underlying fact, or the discriminator is
+    // gated away from its population again.
+    const prs = [pr(3555, OLD)];
+    assert.deepEqual(
+      capStarved(prs, [capRow(3555)], { now: NOW }).map((r) => r.number),
+      [3555],
+      "outside the window: the existing cohort names it",
+    );
+    assert.deepEqual(
+      unlandedNeverQueued(prs, unlandedEligible(prs, [enqueueRow(3555)], { now: NOW })),
+      [3555],
+      "inside the window: the fact is now reported there too",
+    );
+  });
+
+  it("does not name a PR the routine has offered a slot — either event", () => {
+    // The negative control, and the whole reason an age test cannot stand in
+    // for this one: a PR the queue has served is not starved, whatever its
+    // check stamps say.
+    for (const name of ["added_to_merge_queue", "auto_merge_enabled"]) {
+      const prs = [pr(1, OLD, [event(name)])];
+      assert.deepEqual(
+        unlandedNeverQueued(prs, unlandedEligible(prs, [enqueueRow(1)], { now: NOW })),
+        [],
+        `${name} clears the row`,
+      );
+    }
+  });
+
+  it("does not name a row inside the clock — the normal case", () => {
+    // UNLANDED_ELIGIBLE_HOURS (6) is a fire interval; CAP_STARVED_HOURS (12)
+    // is two. A row between them is the ordinary schedule wait the
+    // landing-sweep header describes, so the cohort still names it and this
+    // refinement must stay quiet about it.
+    const prs = [pr(1, RECENT)];
+    const stranded = unlandedEligible(prs, [enqueueRow(1)], { now: NOW });
+    assert.deepEqual(stranded.map((r) => r.number), [1], "control: the cohort does hold it");
+    assert.deepEqual(unlandedNeverQueued(prs, stranded), []);
+  });
+
+  it("does not name a row whose timeline was not read", () => {
+    // `null` is not `false`. The claim is "nothing has ever offered this a
+    // slot" and an unread timeline cannot support it — the same call
+    // `capStarved` makes, and the opposite of the undatable-clock call below,
+    // because the clock REFINES a finding that stands without it while the
+    // timeline IS the finding.
+    const prs = [prUnread(1, OLD)];
+    const stranded = unlandedEligible(prs, [enqueueRow(1)], { now: NOW });
+    assert.deepEqual(stranded.map((r) => r.number), [1], "control: the cohort does hold it");
+    assert.equal(everOfferedQueueSlot(prs[0].timeline), null);
+    assert.deepEqual(unlandedNeverQueued(prs, stranded), []);
+  });
+
+  it("names an undatable row, matching both sibling cohorts", () => {
+    // §4l: an instrument that cannot see something must not report clean. A
+    // row with no dated check that has also never been queued is a true
+    // finding twice over.
+    assert.deepEqual(unlandedNeverQueued([pr(1, null)], [strandedRow(1, null)]), [1]);
+  });
+
+  it("drops a row whose PR is absent, because no PR means no timeline", () => {
+    // The same divergence from its siblings that `capStarved` records: they
+    // keep such a row with a null clock, this cannot, and the reason is the
+    // unread-timeline rule above rather than a different §4l posture.
+    assert.deepEqual(unlandedNeverQueued([], [strandedRow(9, 16)]), []);
+  });
+
+  it("marks only the named rows and says what the fact does and does not settle", () => {
+    const stranded = [strandedRow(3555, 12.7), strandedRow(3549, 6.5)];
+    const block = renderUnlandedEligible("a/one", stranded, { neverQueued: [3555] });
+    assert.match(block, /a\/one#3555 — `mergestate:CLEAN`, 12\.7h, never once queued/);
+    assert.match(block, /a\/one#3549 — `mergestate:CLEAN`, 6\.5h$/m);
+    assert.doesNotMatch(block, /a\/one#3549 — .*never once queued/);
+    assert.match(block, /never once queued \(>12h judgeable/);
+    // ⛔ The remedy must name BOTH remaining causes and must not pick one. The
+    // acting fire's allocation is the separating datum and an `--alarm` fire
+    // does not have it, so asserting either cause here is the defect PEN-6363
+    // reported, in the other direction.
+    assert.match(block, /THIS SWEEP CANNOT SEPARATE THEM/);
+    assert.match(block, /no acting fire has run since they became eligible/);
+    assert.match(block, /the ACTING fire's per-fire cap did not reach them/);
+    // And the cohort's own closing sentence must stop short of "the routine
+    // has not run", which is what measured false.
+    assert.match(block, /A yes does not clear this cohort/);
+    assert.doesNotMatch(block, /before looking at the PRs/);
+  });
+
+  it("says nothing extra when no row qualifies — the quiet arm", () => {
+    // Both arms, because a paragraph that always prints is a paragraph nobody
+    // reads, and a marker that always attaches tells a reader nothing.
+    const block = renderUnlandedEligible("a/one", [strandedRow(3549, 6.5)]);
+    assert.match(block, /a\/one#3549 — `mergestate:CLEAN`, 6\.5h$/m);
+    assert.doesNotMatch(block, /never once queued/);
+    assert.doesNotMatch(block, /THIS SWEEP CANNOT SEPARATE THEM/);
+  });
+
+  it("⛔ is wired at the runRepo call site, not just available to it", () => {
+    // The predicate and the render are each pinned above, and deleting the
+    // OPTION THAT JOINS THEM was free: the block still printed, correctly, just
+    // without the fact — 6 of 7 mechanisms red under per-mechanism mutation and
+    // this one green. That is the same unenforced-call-site shape `runRepo`'s
+    // own option guards exist for (see its UNKNOWN/OMITTED pair), and it is the
+    // failure mode this whole issue is an instance of: a discriminator that
+    // exists and is not consulted.
+    const printed = [];
+    const log = console.log;
+    const realNow = Date.now;
+    Date.now = () => NOW;
+    console.log = (l) => printed.push(String(l));
+    try {
+      runRepo({
+        repo: "a/one",
+        apply: false,
+        settleMinutes: 0,
+        spent: 0,
+        rotted: [],
+        stranded: [],
+        starved: [],
+        queued: [],
+        fetch: () => [pr(3555, OLD)],
+        classify: () => [enqueueRow(3555)],
+        applyOne: () => "merge requested",
+        state: () => {},
+      });
+    } finally {
+      console.log = log;
+      Date.now = realNow;
+    }
+    const out = printed.join("\n");
+    assert.match(
+      out,
+      /unlanded-eligible \(judgeable >6h, nothing holding it\) — 1:/,
+      "control: the cohort itself still prints, so a red below is the FACT missing",
+    );
+    assert.match(out, /a\/one#3555 — `mergestate:CLEAN`, 16\.0h, never once queued/);
+    assert.match(out, /THIS SWEEP CANNOT SEPARATE THEM/);
+  });
+
+  it("cannot be made to name a PR the cohort does not hold", () => {
+    // The set is intersected with `stranded` rather than trusted. A caller
+    // that hands over a wider set — a future one computing it from `rows`
+    // instead of from the cohort — must not be able to add a row to this
+    // block, which is the one way this refinement could become the predicate
+    // widening its own comment refuses.
+    const block = renderUnlandedEligible("a/one", [strandedRow(3549, 6.5)], {
+      neverQueued: [3549 + 1, 777],
+    });
+    assert.doesNotMatch(block, /a\/one#777/);
+    assert.doesNotMatch(block, /never once queued/);
   });
 });
 
