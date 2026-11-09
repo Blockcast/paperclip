@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { checkTestCoverage } from '../check-pr-test-coverage.mjs';
+import { checkTestCoverage, retitleGateNote } from '../check-pr-test-coverage.mjs';
+import { SKIP_PREFIXES as DEDUP_SKIP_PREFIXES } from '../check-pr-dedup-search.mjs';
+import { SKIP_ISSUE_PREFIXES } from '../check-pr-linked-issue.mjs';
 
 const makeFiles = (filenames) =>
   filenames.map(filename => ({ filename, status: 'modified' }));
@@ -173,4 +175,89 @@ test('requires test when no prefix used', () => {
 
 test('handles scoped prefix like fix(server):', () => {
   assert.equal(checkTestCoverage(makeFiles(['src/foo.test.ts', 'src/foo.ts']), 'fix(server): bug').passed, true);
+});
+
+// PEN-6323: the retitle advice is composition-aware.
+//
+// Both retitle suggestions in this gate point authors OUT of the dedup-search
+// and linked-issue gates' skip sets, so an author who obeyed the advice exactly
+// traded one red gate for two others the comment never mentioned. The advice now
+// names what the retitle will newly require. These tests pin that against the
+// sibling gates' REAL exported skip lists, so the claim cannot go stale silently.
+
+test('mismatch advice names the gates the suggested prefixes do NOT skip', () => {
+  const result = checkTestCoverage(makeFiles(['server/src/api.ts', 'README.md']), 'docs: update');
+  assert.equal(result.passed, false);
+  const [failure] = result.failures;
+  assert.ok(failure.includes('dedup-search'), `missing dedup-search note: ${failure}`);
+  assert.ok(failure.includes('linked-issue'), `missing linked-issue note: ${failure}`);
+  assert.ok(failure.includes('also need'), `missing consequence clause: ${failure}`);
+});
+
+test('no-tests advice names them too when the current prefix IS exempt', () => {
+  // `test:` skips dedup-search and linked-issue but does NOT skip this gate, so
+  // a `test:` PR with no test file is told to retitle `refactor:` — which leaves
+  // both skip sets.
+  const result = checkTestCoverage(makeFiles(['server/src/api.ts']), 'test: tidy up');
+  assert.equal(result.passed, false);
+  const [failure] = result.failures;
+  assert.ok(failure.includes('dedup-search'), `missing dedup-search note: ${failure}`);
+  assert.ok(failure.includes('linked-issue'), `missing linked-issue note: ${failure}`);
+});
+
+test('no note when the current prefix is already subject to those gates', () => {
+  // `fix:` is in neither skip set, so retitling to `refactor:` adds nothing —
+  // the note would be noise, not news.
+  const [failure] = checkTestCoverage(makeFiles(['server/src/api.ts']), 'fix: bug').failures;
+  assert.ok(!failure.includes('also need'), `unexpected note: ${failure}`);
+});
+
+test('no note when the title carries no prefix at all', () => {
+  const [failure] = checkTestCoverage(makeFiles(['server/src/api.ts']), 'Some PR').failures;
+  assert.ok(!failure.includes('also need'), `unexpected note: ${failure}`);
+});
+
+test('retitleGateNote is empty when every suggested prefix is also exempt', () => {
+  // Discriminating control: the helper must be able to return nothing, or the
+  // assertions above are satisfied by a constant.
+  assert.equal(retitleGateNote('docs', ['chore']), '');
+  assert.equal(retitleGateNote('docs', ['chore', 'ci']), '');
+});
+
+test('retitleGateNote claims a gate IFF a suggested prefix leaves its skip set', () => {
+  // Computed against the sibling gates' real lists rather than a copy of them,
+  // so this stays true if either list changes — and reds if the note generator
+  // starts claiming a gate that does apply, or stops claiming one that does not.
+  const gates = [
+    { skip: DEDUP_SKIP_PREFIXES, requirement: 'the dedup-search checkbox' },
+    { skip: SKIP_ISSUE_PREFIXES, requirement: 'a linked issue' },
+  ];
+  for (const current of ['docs', 'chore', 'build', 'ci', 'fix', 'feat', 'test']) {
+    for (const suggestions of [['fix', 'feat', 'refactor'], ['refactor']]) {
+      const note = retitleGateNote(current, suggestions);
+      for (const gate of gates) {
+        const shouldClaim =
+          gate.skip.includes(current) && suggestions.some(p => !gate.skip.includes(p));
+        assert.equal(
+          note.includes(gate.requirement),
+          shouldClaim,
+          `current=${current} suggestions=${suggestions} gate=${gate.requirement} note=${note}`,
+        );
+      }
+    }
+  }
+});
+
+test('the advised prefixes are exactly the ones named in the advice text', () => {
+  // Today's configuration, asserted literally. If a sibling gate's skip list
+  // gains one of these prefixes this reds loudly, which is the point: the advice
+  // text is then claiming a requirement that no longer applies.
+  const [failure] = checkTestCoverage(makeFiles(['server/src/api.ts']), 'docs: update').failures;
+  for (const p of ['`fix:`', '`feat:`', '`refactor:`']) {
+    assert.ok(failure.includes(p), `advice no longer names ${p}: ${failure}`);
+  }
+  assert.ok(
+    failure.includes('the dedup-search checkbox and a linked issue'),
+    `unexpected requirement wording: ${failure}`,
+  );
 });

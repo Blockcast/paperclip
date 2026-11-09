@@ -7,6 +7,8 @@
  * Export: checkTestCoverage(files, prTitle) → { passed, failures }
  */
 import { fileURLToPath } from 'node:url';
+import { SKIP_PREFIXES as DEDUP_SKIP_PREFIXES } from './check-pr-dedup-search.mjs';
+import { SKIP_ISSUE_PREFIXES } from './check-pr-linked-issue.mjs';
 
 // `.mjs`/`.cjs` are included deliberately: the repo's own Node-native suites use
 // `*.test.mjs` (38 of them, including this checker's tests and everything run by
@@ -41,6 +43,83 @@ const SKIP_TEST_PREFIXES = ['docs', 'chore', 'build', 'ci', 'style', 'refactor',
 // Note: 'style' is excluded — formatting PRs legitimately touch source files
 const NO_SOURCE_CODE_PREFIXES = ['docs', 'chore', 'build', 'ci'];
 
+// The prefixes this gate suggests an author retitle to. Declared once so the
+// advice text and the side-effect note below cannot drift apart.
+const MISMATCH_RETITLE_SUGGESTIONS = ['fix', 'feat', 'refactor'];
+const NO_TESTS_RETITLE_SUGGESTIONS = ['refactor'];
+
+// Other gates in `run-quality-gates.mjs` are ALSO prefix-sensitive, and their
+// skip sets are not this one's. Every prefix this gate suggests is outside the
+// dedup-search and linked-issue skip sets, so an author on a `docs:`/`chore:`/
+// `build:`/`ci:` PR who follows the advice exactly trades the mismatch failure
+// for a missing-dedup-checkbox failure and a missing-linked-issue failure the
+// comment never mentioned (PEN-6323). Each gate's remedy text is correct about
+// its own gate and silent about the composition; the aggregator prints them all
+// and reconciles none.
+//
+// The skip sets are IMPORTED, not restated, so this note cannot go stale when a
+// sibling gate's list changes: a prefix added to one of those lists drops out of
+// `notExempt` and stops being claimed.
+const TITLE_SENSITIVE_GATES = [
+  {
+    name: 'dedup-search',
+    skipPrefixes: DEDUP_SKIP_PREFIXES,
+    requirement: 'the dedup-search checkbox',
+  },
+  {
+    name: 'linked-issue',
+    skipPrefixes: SKIP_ISSUE_PREFIXES,
+    requirement: 'a linked issue (or an inline issue description)',
+  },
+];
+
+function formatPrefixList(prefixes) {
+  const quoted = prefixes.map(p => `\`${p}:\``);
+  if (quoted.length === 1) return quoted[0];
+  if (quoted.length === 2) return `${quoted[0]} or ${quoted[1]}`;
+  return `${quoted.slice(0, -1).join(', ')}, or ${quoted[quoted.length - 1]}`;
+}
+
+function formatList(items) {
+  if (items.length === 1) return items[0];
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
+/**
+ * Sentence naming what a suggested retitle will NEWLY require, or '' when it
+ * requires nothing new. Fires only for a gate the CURRENT prefix is exempt from
+ * and at least one suggested prefix is not — a requirement that already applies
+ * is noise, not news.
+ *
+ * Exported for the test suite, which pins the advice against the real skip sets.
+ */
+export function retitleGateNote(currentPrefix, suggestedPrefixes) {
+  const groups = new Map();
+  for (const gate of TITLE_SENSITIVE_GATES) {
+    if (!currentPrefix || !gate.skipPrefixes.includes(currentPrefix)) continue;
+    const notExempt = suggestedPrefixes.filter(p => !gate.skipPrefixes.includes(p));
+    if (notExempt.length === 0) continue;
+    const key = notExempt.join(',');
+    if (!groups.has(key)) groups.set(key, { notExempt, names: [], requirements: [] });
+    groups.get(key).names.push(gate.name);
+    groups.get(key).requirements.push(gate.requirement);
+  }
+  if (groups.size === 0) return '';
+
+  const clauses = [...groups.values()].map(g => {
+    const verb = g.notExempt.length === 1 ? 'does' : 'do';
+    const gates = `${formatList(g.names)} gate${g.names.length === 1 ? '' : 's'}`;
+    return (
+      `${formatPrefixList(g.notExempt)} ${verb} not skip the ${gates} the way ` +
+      `\`${currentPrefix}:\` does, so the retitled PR will also need ` +
+      `${formatList(g.requirements)} in its body`
+    );
+  });
+
+  return ` Note: ${clauses.join('; ')}.`;
+}
+
 function parsePrefix(title) {
   if (!title) return null;
   const match = title.match(/^([a-z]+)(?:\([^)]*\))?:/);
@@ -66,8 +145,9 @@ export function checkTestCoverage(files, prTitle = '') {
           `PR is titled \`${prefix}:\` but includes source code changes ` +
           `(${sourceChanges.slice(0, 3).map(f => f.filename).join(', ')}` +
           `${sourceChanges.length > 3 ? ', ...' : ''}). ` +
-          `Please retitle as \`fix:\`, \`feat:\`, or \`refactor:\` so the right gates run, ` +
-          `or remove the source code changes if this is genuinely a \`${prefix}:\` PR.`,
+          `Please retitle as ${formatPrefixList(MISMATCH_RETITLE_SUGGESTIONS)} so the right gates run, ` +
+          `or remove the source code changes if this is genuinely a \`${prefix}:\` PR.` +
+          retitleGateNote(prefix, MISMATCH_RETITLE_SUGGESTIONS),
         ],
       };
     }
@@ -86,7 +166,9 @@ export function checkTestCoverage(files, prTitle = '') {
     passed: hasTests,
     failures: hasTests ? [] : [
       'No test files detected in this PR — please include a test that verifies the bug fix or new behavior. ' +
-      'If this PR genuinely doesn\'t need a test (e.g. a refactor), please retitle with `refactor:` prefix.',
+      `If this PR genuinely doesn't need a test (e.g. a refactor), please retitle with ` +
+      `${formatPrefixList(NO_TESTS_RETITLE_SUGGESTIONS)} prefix.` +
+      retitleGateNote(prefix, NO_TESTS_RETITLE_SUGGESTIONS),
     ],
   };
 }

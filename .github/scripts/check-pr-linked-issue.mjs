@@ -31,8 +31,10 @@ const ISSUE_PATTERNS = [
   /(?:^|[\s(])https:\/\/paperclip\.blockcast\.net\/[A-Za-z0-9]+\/issues\/[A-Za-z0-9]+-\d+(?=$|[\s),:;!?]|[.](?![\w-]))/i,
 ];
 
-// Prefixes where neither a linked issue nor an inline description is required
-const SKIP_ISSUE_PREFIXES = ['docs', 'chore', 'build', 'ci', 'style', 'test', 'revert'];
+// Prefixes where neither a linked issue nor an inline description is required.
+// Exported for the same reason as check-pr-dedup-search.mjs's SKIP_PREFIXES:
+// check-pr-test-coverage.mjs computes its retitle advice from it (PEN-6323).
+export const SKIP_ISSUE_PREFIXES = ['docs', 'chore', 'build', 'ci', 'style', 'test', 'revert'];
 
 // Minimum number of template fields the PR body must match to count as an
 // inline issue description.
