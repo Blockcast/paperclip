@@ -30,6 +30,7 @@
     "src/__tests__/approval-payload-edit-service.test.ts",
     "src/__tests__/budget-consumption-metric.test.ts",
     "src/__tests__/waitfor-default-budget.test.ts",
+    "src/__tests__/snapshot-budget-normalizer.test.ts",
     "src/__tests__/cold-in-review-issue-metrics.test.ts",
     "src/__tests__/costs-by-project-statement-naming-postgres.test.ts",
     "src/__tests__/dep-blocked-retry-dispersion.test.ts",

@@ -343,6 +343,23 @@ function diffConfigSnapshot(
   return CONFIG_REVISION_FIELDS.filter((field) => !jsonEqual(before[field], after[field]));
 }
 
+/**
+ * The ONE normalizer for a config revision's `budgetMonthlyCents`.
+ *
+ * Exported because `routes/agents.ts` must compare a revision's restored cap
+ * against the stored mirror POST-normalization, and it used to do that with a
+ * second copy of this expression. Two copies could drift, the guard would then
+ * answer about a value the rollback would never have written, and no test could
+ * see it (PEN-6277). Call this; do not re-derive it.
+ *
+ * The clamp is load-bearing, not defensive dressing: `budget_monthly_cents` is
+ * a non-negative display mirror, so a revision carrying a negative cap must
+ * restore 0 rather than write the negative through.
+ */
+export function normalizeSnapshotBudgetCents(value: number): number {
+  return Math.max(0, Math.floor(value));
+}
+
 function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$inferInsert> {
   if (!isPlainRecord(snapshot)) throw unprocessable("Invalid revision snapshot");
 
@@ -376,7 +393,7 @@ function configPatchFromSnapshot(snapshot: unknown): Partial<typeof agents.$infe
       typeof snapshot.defaultEnvironmentId === "string" || snapshot.defaultEnvironmentId === null
         ? snapshot.defaultEnvironmentId
         : null,
-    budgetMonthlyCents: Math.max(0, Math.floor(snapshot.budgetMonthlyCents)),
+    budgetMonthlyCents: normalizeSnapshotBudgetCents(snapshot.budgetMonthlyCents),
     metadata: isPlainRecord(snapshot.metadata) || snapshot.metadata === null ? snapshot.metadata : null,
   };
 }
