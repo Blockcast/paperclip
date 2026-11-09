@@ -667,8 +667,35 @@ export function inheritedTimeoutLogLevel(
     : "info";
 }
 
+// One JSON string escape. The first alternative takes an escaped surrogate pair whole;
+// the next two take a lone high or a lone low surrogate escape; `\\[^]` takes any other
+// escape, so an escaped backslash is consumed and never misread as the start of `\u`.
+const JSON_ESCAPE = /\\u[dD][89abAB][0-9a-fA-F]{2}\\u[dD][c-fC-F][0-9a-fA-F]{2}|(\\u[dD][89abAB][0-9a-fA-F]{2}|\\u[dD][c-fC-F][0-9a-fA-F]{2})|\\[^]/g;
+
+/**
+ * Replaces lone-surrogate escapes in JSON text with `\ufffd`.
+ *
+ * `.slice(0, n)` counts UTF-16 units and can cut an emoji in half. JSON.stringify writes
+ * the lone half as `\ud83d`, and Postgres rejects that json/jsonb value as invalid input
+ * (22P02), so the whole statement fails. U+FFFD is what a text column already stores for
+ * a lone surrogate. Valid escaped pairs and every other escape are left alone.
+ */
+export function wellFormedJsonText(value: unknown): unknown {
+  if (typeof value !== "string" || !/\\u[dD]/.test(value)) return value;
+  return value.replace(JSON_ESCAPE, (escape, lone: string | undefined) => (lone ? "\\ufffd" : escape));
+}
+
 export function createDbFromPostgresClient(sql: Sql) {
-  return drizzlePg(sql, { schema });
+  const db = drizzlePg(sql, { schema });
+  // drizzle stringifies json/jsonb values itself and sets these two serializers to the
+  // identity, so they receive the JSON text of every parameter Postgres types as json (114)
+  // or jsonb (3802): drizzle column writes, direct `${text}::jsonb` casts, and jsonb
+  // operator or function arguments. A text parameter cast later (`coalesce(${text},
+  // '{}')::jsonb`, `::text::jsonb`) is typed text and not covered, and neither is `\u0000`,
+  // which jsonb also rejects. A later `drizzle()` on this client would reset these.
+  sql.options.serializers[114] = wellFormedJsonText;
+  sql.options.serializers[3802] = wellFormedJsonText;
+  return db;
 }
 
 export async function getPostgresDataDirectory(url: string): Promise<string | null> {
