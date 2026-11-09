@@ -13,6 +13,24 @@
 # instrument, running to produce a measurement, with a decision attached to
 # the end of that measurement (see PROMOTION / WITHDRAWAL below).
 #
+# That is MEASURED, not assumed. First-party 2026-11-09 on this repo's own
+# `review` job, n=3 (PRs #3589, #3590, #3547): `Run quality gates` carries
+# `continue-on-error: true`; its OUTCOME was failure in all three -- its
+# consumer `Fail if quality gates failed` is gated on
+# `steps.quality.outcome == 'failure'` and fired -- and the job failed ONLY
+# because that consumer step explicitly re-raised it. The repo had to add a
+# step whose whole purpose is re-raising, which is itself the evidence that
+# the failure does not propagate on its own. Control, same PRs' passing
+# runs: the consumer reads SKIPPED and the job is SUCCESS.
+#
+# ⚠️ AND THE API CONFLATES THE TWO, so do not try to detect a staging finding
+# from the checks surface: a failed `continue-on-error` step reports OUTCOME
+# failure and CONCLUSION success, and only the conclusion is exposed. In all
+# three runs above the step reads `conclusion: SUCCESS` while having failed.
+# A scan for "a green job containing a failed step" is therefore
+# STRUCTURALLY MUTE -- it cannot return a hit, ever, and its clean answer is
+# not evidence. Read the step summary, or `outputs.code`.
+#
 # ⛔ DO NOT read a green PR as evidence that the rule below found nothing --
 # read the step summary. A step that never ran and a step that found nothing
 # are both green here, and that is the whole hazard of a warn-only step.

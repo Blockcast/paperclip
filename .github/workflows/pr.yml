@@ -3120,16 +3120,28 @@ jobs:
       #
       # TWO MECHANISMS, DIFFERENT JOBS, NEITHER REDUNDANT — stated because the
       # obvious review note is "one of these is belt-and-braces, drop it":
-      #   the explicit `exit` codes below decide what a READER sees — red step
-      #     means "open the summary", green step means "scanned, found
-      #     nothing". That distinction is the whole output of this step.
+      #   the explicit `exit` codes below set this step's OUTCOME, which is
+      #     what a reader and `steps.gitleaks_staging.outcome` see — failure
+      #     means "open the summary", success means "scanned, found nothing".
       #   `continue-on-error: true` decides what the JOB sees, and it also
       #     covers the paths the exits below do NOT enumerate — the 10-minute
       #     timeout, an unwritable $GITHUB_STEP_SUMMARY, an OOM-killed scan.
-      # Drop the exits and the step is a silent green forever. Drop
+      # Drop the exits and the step is a silent success forever. Drop
       # `continue-on-error` and an unanticipated failure turns a warn-only
       # measurement into a merge blocker.
       #
+      # ⛔ DO NOT BUILD ANY CONSUMER ON THIS STEP'S *CONCLUSION*. A
+      # `continue-on-error` step that fails reports OUTCOME failure and
+      # CONCLUSION success, and the checks API exposes only the latter —
+      # measured first-party 2026-11-09 on this repo's own `review` job, n=3
+      # (PRs #3589, #3590, #3547): `Run quality gates` carries
+      # `continue-on-error: true`, its outcome was failure in all three (its
+      # consumer `Fail if quality gates failed` is gated on
+      # `steps.quality.outcome == 'failure'` and fired), and the API reports
+      # that step as `conclusion: SUCCESS` every time. Control: on the same
+      # PRs' passing runs the consumer reads SKIPPED and the job is SUCCESS.
+      # ⇒ read `steps.gitleaks_staging.outputs.code` (0 clean / 2 findings /
+      # anything else not-scanned), never the step's conclusion.
       # ⛔ DO NOT "simplify" this by moving the rule into .gitleaks.toml and
       # deleting this step. gitleaks' exit code is per-RUN, not per-RULE:
       # measured first-party 2026-11-09, a single config carrying both
@@ -3139,8 +3151,9 @@ jobs:
       # BOTH or warn on BOTH, and warning on both silently de-fangs the default
       # rules that PEN-6245 exists to make blocking.
       #
-      # ⛔ A RED STEP HERE IS NOT A FAILED CHECK AND MUST NOT BE "FIXED" BY
-      # ALLOWLISTING. It is this step working. Triage the finding; if it is a
+      # ⛔ A FAILED OUTCOME HERE IS NOT A FAILED CHECK AND MUST NOT BE "FIXED"
+      # BY ALLOWLISTING. It is this step working, and it did not block a thing
+      # — the job's own conclusion is unaffected, measured below. Triage the finding; if it is a
       # false positive, that is a DATA POINT FOR THE WINDOW and belongs on
       # PEN-6280, not in an allowlist.
       - name: Secret scan (staging, warn-only)
