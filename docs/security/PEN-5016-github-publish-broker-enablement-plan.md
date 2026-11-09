@@ -755,8 +755,12 @@ this plan; §3.5a closes it structurally, which is why #3123 is a **stage-1 prec
 follow-up.
 
 **Stage 2 — one company, all agents.** Proposed **2026-11-11 → 2026-11-18** (≥ 5 working days).
-⚠ **§11.3 re-set this as `stage-1 exit + 1 working day`, with these dates as the earliest case** —
-a fixed calendar date downstream of a conditional start compresses the soak when the start slips.
+⚠ **§11.3 re-set this as `stage-1 exit + 1 working day`, and on 2026-11-09 STRUCK the calendar
+dates on the line above outright (CTO, PEN-6148 done-when 3)** — they were the earliest case for a
+stage-1 start of `2026-11-06` that did not happen. A fixed calendar date downstream of a conditional
+start compresses the soak when the start slips, and an "earliest case" illustration of a derived
+value goes stale silently. **The dates on the line above are §7's original PROPOSAL and are retained
+as history only; §11.3's derivation table is the live answer.**
 Population: all `claude_k8s` agents in `b1d3f3d3` (Penstock) — **9 of the 11 agents in the company**
 (§3.5a), the other two being `claude_local` and never rendering a Job. §4's broad-render history
 counts 8 *distinct agents* fleet-wide and this plan has **not** mapped those 8 to companies, so do
@@ -772,7 +776,9 @@ whose runs stopped completing.
 Exit: as stage 1, plus no scheduling regression attributable to the sidecar.
 
 **Stage 3 — fleet.** Proposed **2026-11-19 → 2026-11-26**.
-⚠ **§11.3 re-set this as `stage-2 exit + 1 working day`, these dates being the earliest case.**
+⚠ **§11.3 re-set this as `stage-2 exit + 1 working day`, and STRUCK the calendar dates on the line
+above on 2026-11-09 (CTO, PEN-6148 done-when 3).** Those dates are §7's original PROPOSAL, retained
+as history only; §11.3's derivation table is the live answer.
 Population: the second company (2 observed) and anything added since. A node-capacity check is a
 precondition here, not an observation.
 Exit: as stage 2, held for a full week.
@@ -1142,22 +1148,48 @@ instruction to skip them. Stage 1 starts on the first working day after **both**
 
 Duration unchanged: ≥ 3 working days and ≥ 10 runs, exit on all six observations of §7.
 
-**`2026-11-12` — escalation date. SET.** If §11.1 is not six-of-six by end of day 2026-11-12, that is
-an escalation to the CTO and **not a silent slip**. To be concrete about what escalation means here,
-because "escalate" has been doing too much work: the CTO re-reads §11.2, decides whether #3112 is
-still recoverable, and if it is not, files the pin as a new carrier row before anything else. The
-open PRs are the live risk in this plan, not the soak.
+**`2026-11-12` — escalation date. SET, and WIDENED 2026-11-09 (CTO, [PEN-6148](https://paperclip.blockcast.net/PEN/issues/PEN-6148) done-when 4) from one predicate to three, because the original could not fire on what actually happened.** It read *"if §11.1 is not six-of-six by end of day 2026-11-12"* — and §11.1 **is** six-of-six, and has been since 2026-10-30 (§11.1). So this plan's only dated backstop was keyed to the one failure mode that did not occur, while the mode that did — *every condition met, nobody starts* — had no date, no detector and no owner.
 
-**Stage 2 — one company, all agents. `stage-1 exit + 1 working day`, ≥ 5 working days. Earliest
-`2026-11-11 → 2026-11-18`.**
-**Stage 3 — fleet. `stage-2 exit + 1 working day`, held a full week. Earliest `2026-11-19 → 2026-11-26`.**
+⭐ **The general shape, because it will recur: a backstop keyed to the FAILURE OF A PRECONDITION cannot see a stall that happens AFTER every precondition is satisfied.** The better the preconditions are discharged, the more certainly such a clause is dead. That is why what follows is a disjunction over the **stall**, not over any one cause of it.
+
+**Escalate to the CTO (`29033747`) if ANY of these holds. Evaluate at end of day 2026-11-12, and at every subsequent wake of a stage-1 carrier row, until stage 1 has started:**
+
+1. **§11.1 is not six-of-six.** The original predicate, retained **unchanged** so a regression still fires. It is satisfied today; it is kept because satisfied-now is not satisfied-forever.
+2. **Stage 1 has not started although §11.3's conditions 1 and 2 both hold.** Mechanical, evaluable by any seat, and deliberately carrying **no self-assessment term** — a gate whose trigger is the actor's own diagnosis of the thing being gated does not gate. All three of: `kube_pod_init_container_info{container="github-publish-broker"}` is **empty** while its liveness control `count by (container) (kube_pod_init_container_info{namespace="paperclip"})` is **non-empty**; AND §11.1 reads six-of-six; AND no §11.6 check 1–5 sits at its stated failing value. ⚠ A zero from the probe **alone** is unmeasured, not clean — the control is what makes it an absence (PEN-6148's instrument note).
+3. **Stage 1's start is waiting on a board ask that has been `pending` for more than 72 h.** Read `status` and `decidedAt` on the card; both are readable from any agent seat. This arm exists because the stall that actually materialised is of exactly this kind and nothing else in this plan detects it: board card `e3850bf3-0c45-489c-a374-eabf46cf908c` (filed 2026-11-08T22:53:49Z, carried by [PEN-6190](https://paperclip.blockcast.net/PEN/issues/PEN-6190)) holds the stage-1 flip, **no agent principal may perform that write** — `enableGitHubPublishBroker` is in `AGENT_SCOPE_ONLY_CONFIG_KEYS` and `PATCH /api/agents/:id` admits only a board actor or the subject seat itself, which §3.2 pins it away from (PEN-6188) — and the board channel was measured at ≈119 h since its last human decision, matched precedent pending ≈132 h. ⛔ **A pending card and a declined one are indistinguishable to a carrier row**, so the absence of a decision has to fire something rather than read as patience. The 72 h is set against that channel's own measured distribution (median pending age ≈60 h) so that it fires **above typical**, not on every card. ⚠ It is a trigger to tell the **CTO** that a stage is stalled; it is **not** a complaint about board latency and **not** an instruction to escalate any card's queue position — that is governed by the CEO ruling in §11.6 and is untouched here.
+
+**What escalation means, concretely, per arm** — because "escalate" has been doing too much work:
+
+- **Arm 1:** the CTO re-reads §11.2, decides whether #3112 is still recoverable, and if it is not, files the pin as a new carrier row before anything else. The open PRs are the live risk in this plan, not the soak.
+- **Arms 2 and 3:** the CTO records, on the stage-1 carrier row, **either a re-dated stage-1 start with its blocker named and owned, or an explicit decision to stand the stage down.** ⛔ Neither arm is discharged by re-measuring and re-parking. A stall that has already been detected is not re-detected; it is decided.
+
+⚠ **Honest limit, stated rather than glossed: this clause makes the stall REPORTABLE, not OBSERVED.** Its evaluators are agent-run carrier rows ([PEN-6148](https://paperclip.blockcast.net/PEN/issues/PEN-6148), [PEN-6190](https://paperclip.blockcast.net/PEN/issues/PEN-6190)), each attended by a monitor that can itself lapse. There is no unattended detector behind any of the three arms. PEN-6148 was filed precisely because *"a stage that never starts is byte-identical, on every readable surface, to a stage correctly deferred"* — widening the predicate narrows that gap and does not close it.
+
+⚠ **§11.6's own escalation predicate (check 6, card `800bc387`) carries the SAME defect and is NOT fixed here, because it is not mine to re-key.** It fires *"if card `800bc387` is still undecided when stage 1 **exits**"* — but stage 1 cannot exit until it starts, and its start is now itself held by an undecided board ask (arm 3). ⭐ **An escalation predicate keyed to a milestone that the escalation TARGET controls cannot fire in the one case it exists for.** That trigger is a CEO ruling (`be83080d`, reaffirmed `289829bf` and `81a3d8c5`), so it is raised with the CEO rather than amended in this PR. Recorded here so the gap is visible while it is open.
+
+**Stage 2 — one company, all agents. `stage-1 exit + 1 working day`, ≥ 5 working days.**
+**Stage 3 — fleet. `stage-2 exit + 1 working day`, held a full week.**
+
+⛔ **The calendar pair that used to close those two lines — *"Earliest `2026-11-11 → 2026-11-18`"* and *"Earliest `2026-11-19 → 2026-11-26`"* — is STRUCK, not re-dated (CTO, 2026-11-09, PEN-6148 done-when 3).** Both were computed from a stage-1 start of `2026-11-06` that did not happen. Measured first-party 2026-11-09T00:3xZ: `kube_pod_init_container_info{container="github-publish-broker"}` is **empty**, liveness control non-empty (8 container names; `seed-writable-dirs` 27, `write-prompt` 27). Stage 1 has not started, so both pairs are unreachable.
+
+⭐ **They are struck rather than re-dated because re-dating them re-arms the trap.** The paragraph below already argues that fixed dates downstream of a conditional start are not a schedule — and then retained them anyway, "as the earliest case". **A hand-maintained illustration of a derived value goes stale the instant the derivation's input moves, and it goes stale silently**: nothing recomputes it, and the only thing that caught it here was somebody filing a row (PEN-6148, which is that row). Re-dating buys one correct pair and the same defect back. The earliest case is therefore **derived**, and the derivation is written out so that it stays as concrete as a date:
+
+| from a recorded stage-1 start on working day **D** | earliest |
+|---|---|
+| stage-1 exit | `D + 3 working days`, **and** ≥ 10 runs on the stage-1 seat, **and** all six §7 observations met |
+| stage 2 start | stage-1 exit `+ 1 working day` |
+| stage 2 exit | stage-2 start `+ 5 working days` |
+| stage 3 start | stage-2 exit `+ 1 working day` |
+| stage 3 exit | stage-3 start `+ 7 calendar days` |
+
+⛔ **`D` is the start RECORDED on the stage-1 carrier row — never §11.3's lapsed `2026-11-06` floor, and never the date a go was given.** The floor is a *not-before*. It is not an input to anything downstream, and reading it as one is what produced the two struck pairs. (Ruling restated from PEN-6190 `a986eeed` §5, where it was issued in a comment and therefore reached only that row.)
 
 ⚠ **This is a deliberate change from §7's proposal, which gave stages 2 and 3 fixed calendar dates.**
 Fixed dates downstream of a conditional start are not a schedule — they silently compress or skip the
 stage when the start slips, and the compression lands on the soak, which is the only part of this
-plan that produces evidence. The calendar dates are retained as the **earliest case**, i.e. what
-happens if stage 1 starts on 2026-11-06 and every exit is met on its first opportunity. They are not
-commitments and a slip upstream moves them.
+plan that produces evidence. §7's dates were first demoted to an "earliest case" illustration and are
+now replaced outright by the derivation above. Neither form was ever a commitment, and a slip
+upstream moves everything downstream of it.
 
 ### 11.4 Rollback owner — bound, and the unreachable-Security gap closed
 
