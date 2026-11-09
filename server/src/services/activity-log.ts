@@ -7,7 +7,8 @@ import { isUuidLike, PLUGIN_EVENT_TYPES, type PluginEventType } from "@paperclip
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 import { publishLiveEvent } from "./live-events.js";
 import { redactCurrentUserValue } from "../log-redaction.js";
-import { sanitizeRecord } from "../redaction.js";
+import { isPlainObject, sanitizeRecord } from "../redaction.js";
+import { assignRecordKey } from "../record-keys.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -169,6 +170,29 @@ export interface LogActivityInput {
   atomicPluginEvent?: boolean;
 }
 
+// A high surrogate with no low surrogate after it, or a low one with no high one before it.
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
+
+/**
+ * Replaces lone UTF-16 surrogates with U+FFFD in every string and key of a jsonb value.
+ *
+ * Callers build `bodySnippet` with `body.slice(0, 120)`, which counts UTF-16 units and so
+ * can cut an emoji's surrogate pair in half. JSON.stringify writes the lone half as
+ * `\ud83d`, and Postgres rejects that as invalid json. The activity_log insert then fails,
+ * and with it the comment-effect transaction that logs it, on every retry. U+FFFD is what a
+ * UTF-8 text column already stores for a lone surrogate.
+ */
+function withoutLoneSurrogates<T>(value: T): T {
+  if (typeof value === "string") return value.replace(LONE_SURROGATE, "\uFFFD") as T;
+  if (Array.isArray(value)) return value.map(withoutLoneSurrogates) as T;
+  if (!isPlainObject(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    assignRecordKey(out, withoutLoneSurrogates(key), withoutLoneSurrogates(entry));
+  }
+  return out as T;
+}
+
 function readNonEmptyString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
@@ -275,7 +299,7 @@ export async function logActivity(
   };
   const sanitizedDetails = input.details ? sanitizeRecord(input.details) : null;
   const redactedDetails = sanitizedDetails
-    ? redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions)
+    ? withoutLoneSurrogates(redactCurrentUserValue(sanitizedDetails, currentUserRedactionOptions))
     : null;
   const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
   await db.insert(activityLog).values({
@@ -303,10 +327,10 @@ export async function logActivity(
   // scrubbing is not applied anywhere else in comment sync, so doing it only
   // here would be both inconsistent and lossy.
   const redactedEventExtra = input.pluginEventPayloadExtra
-    ? (redactCurrentUserValue(
+    ? (withoutLoneSurrogates(redactCurrentUserValue(
         input.pluginEventPayloadExtra,
         currentUserRedactionOptions,
-      ) as Record<string, unknown>)
+      )) as Record<string, unknown>)
     : null;
   let pluginEvent: PluginEvent | null = null;
   if (pluginEventType) {
