@@ -26,7 +26,7 @@ import {
   extractAllyReviewedHeadSha,
   hasAllyConsolidatedReviewHeading,
 } from "./ally-review-detection.js";
-import { ghFetch, gitHubApiBase } from "./github-fetch.js";
+import { ghFetch, ghReadBody, gitHubApiBase, gitHubGraphQlUrl } from "./github-fetch.js";
 
 const GITHUB_HOST = "github.com";
 const GITHUB_API_HEADERS = { accept: "application/vnd.github+json" } as const;
@@ -2553,30 +2553,246 @@ export async function githubPostIssueComment(input: {
  */
 export type HeadChecksSettlement = "settled" | "pending" | "unknown";
 
-const HEAD_CHECKS_MAX_PAGES = 5;
+export type GhGraphQlResult<T> = { ok: true; data: T } | { ok: false; reason: string };
 
+/**
+ * A GraphQL READ against GitHub. Never throws, never reports a partial success,
+ * and -- by construction -- cannot carry a write.
+ *
+ * PEN-6341: this is the shared door for moving reads off the REST `core`
+ * budget. That budget is two route-pinned shards of 9,650/h that drain
+ * independently; every Paperclip-server route measured so far lands on the
+ * shard that exhausts roughly 44 minutes into each window, while the `graphql`
+ * resource is a separate bucket measured at 97-99% idle. Moving a read here is
+ * not a micro-optimisation -- it is the only lever available, because the
+ * shard holding the spare capacity cannot be reached by any REST call we get
+ * to choose.
+ *
+ * ## Why it refuses anything but a `query`
+ *
+ * This file's write helpers are scrubbed individually, and
+ * `github-write-egress-scrub.test.ts` asserts that no server-side GitHub
+ * writer sits outside that scrub. That guard is FILE-granular: it is satisfied
+ * by this file mentioning `scrubOutboundGitHubText` at all. So it is
+ * structurally unable to notice a GraphQL *mutation* added through this
+ * helper later -- authored text would reach GitHub through a door the guard
+ * reads as already covered.
+ *
+ * Scrubbing here instead is not the answer, and the reasoning is already
+ * recorded on `scrubOutboundGitHubText`: a serialized payload is the wrong
+ * altitude, because the detectors are tuned for prose and rewriting an opaque
+ * body risks mangling query text or an id. The free-text fields have to be
+ * named by a signature to be scrubbed for what they are.
+ *
+ * So the door is held shut instead of watched. A document that is not a
+ * `query` is refused before it leaves, which makes "this cannot carry authored
+ * text" a checked property rather than a comment. Writing to GitHub over
+ * GraphQL is still perfectly reasonable -- it just needs its own helper that
+ * names its prose fields and scrubs them, exactly as the REST writers do.
+ *
+ * ## Why any `errors` entry is a failure
+ *
+ * GraphQL reports a FIELD-level failure as HTTP 200, with `data` present and
+ * the failed subtree nulled -- and one FORBIDDEN field nulls every sibling
+ * under its parent, not just itself. A caller that reads `data` without
+ * reading `errors` is handed a well-formed object full of nulls that is
+ * indistinguishable from an honest "no such thing". They are separated here,
+ * where the `errors` array is still in scope, so that a caller choosing a
+ * fail-closed default actually gets one.
+ */
+export async function ghGraphQlQuery<T>(input: {
+  token: string;
+  query: string;
+  variables?: Record<string, unknown>;
+}): Promise<GhGraphQlResult<T>> {
+  if (!/^\s*query[\s({]/.test(input.query)) {
+    // A caller bug, not a runtime condition: surfaced loudly, and still
+    // returned as a failure so the never-throws contract holds.
+    console.error("[github-graphql] Refused a document that is not a `query`; GraphQL writes need a scrubbing helper.");
+    return { ok: false, reason: "not_a_read_query" };
+  }
+  const url = gitHubGraphQlUrl(GITHUB_HOST);
+  let response: Response;
+  try {
+    response = await ghFetch(url, {
+      method: "POST",
+      headers: {
+        ...GITHUB_API_HEADERS,
+        authorization: `Bearer ${input.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ query: input.query, variables: input.variables ?? {} }),
+    });
+  } catch {
+    return { ok: false, reason: "transport" };
+  }
+  // A rate-limited read arrives here as an ordinary refusal, including the
+  // synthetic one `ghFetch` serves from its own local hold.
+  if (!response.ok) return { ok: false, reason: `http_${response.status}` };
+  let body: { data?: T | null; errors?: unknown } | null;
+  try {
+    body = (await ghReadBody(url, () => response.json())) as typeof body;
+  } catch {
+    return { ok: false, reason: "unreadable_body" };
+  }
+  if (!body || typeof body !== "object") return { ok: false, reason: "unreadable_body" };
+  if (Array.isArray(body.errors) && body.errors.length > 0) return { ok: false, reason: "graphql_errors" };
+  if (body.data === null || body.data === undefined) return { ok: false, reason: "no_data" };
+  return { ok: true, data: body.data };
+}
+
+/**
+ * PEN-6341: the check-run states that are NOT terminal.
+ *
+ * `CheckRunState` -- the enum `checkRunCountsByState` is keyed on -- MERGES
+ * REST's `status` and `conclusion` into one value: an incomplete run reports
+ * its status, a completed one reports its conclusion. So the terminal side is
+ * "every conclusion GitHub has or will ever define" and grows without notice,
+ * while the non-terminal side is small and stable. Enumerating the SMALL side
+ * and sending everything unrecognised to `unknown` is what stops a state
+ * nobody has seen yet from being scored `settled` -- see the polarity note on
+ * the function below for why that direction is the load-bearing one.
+ *
+ * `REQUESTED` is in `CheckStatusState` but not in today's `CheckRunState`. It
+ * is listed anyway: the REST implementation this replaced tested
+ * `status !== "completed"`, which made `requested` non-terminal, so if GitHub
+ * ever surfaces it here parity holds instead of falling to the default branch.
+ */
+const NON_TERMINAL_CHECK_RUN_STATES: ReadonlySet<string> = new Set([
+  "QUEUED",
+  "IN_PROGRESS",
+  "WAITING",
+  "PENDING",
+  "REQUESTED",
+]);
+
+/** Every other `CheckRunState` value as of 2026-11-09, enumerated so that a NEW one is not silently terminal. */
+const TERMINAL_CHECK_RUN_STATES: ReadonlySet<string> = new Set([
+  "ACTION_REQUIRED",
+  "CANCELLED",
+  "COMPLETED",
+  "FAILURE",
+  "NEUTRAL",
+  "SKIPPED",
+  "STALE",
+  "STARTUP_FAILURE",
+  "SUCCESS",
+  "TIMED_OUT",
+]);
+
+/**
+ * `contexts(first: 1)` bounds a page of nodes we never read: `checkRunCount`
+ * and `checkRunCountsByState` are CONNECTION-level fields, so they describe
+ * every check-run on the head regardless of the page size. That is what
+ * removes the pagination the REST form needed, not a larger page.
+ *
+ * `statusContextCount` is deliberately not read. The REST route this replaces
+ * was `commits/:sha/check-runs`, which does not report commit statuses, and
+ * the rollup merges both node types into one connection -- counting statuses
+ * here would quietly widen what "every check" means.
+ */
+const HEAD_CHECKS_SETTLEMENT_QUERY = `query($owner: String!, $name: String!, $sha: GitObjectID!) {
+  repository(owner: $owner, name: $name) {
+    object(oid: $sha) {
+      ... on Commit {
+        statusCheckRollup {
+          contexts(first: 1) {
+            checkRunCount
+            checkRunCountsByState { state count }
+          }
+        }
+      }
+    }
+  }
+}`;
+
+type HeadChecksSettlementResponse = {
+  repository?: {
+    object?: {
+      statusCheckRollup?: {
+        contexts?: {
+          checkRunCount?: number | null;
+          checkRunCountsByState?: Array<{ state?: string | null; count?: number | null } | null> | null;
+        } | null;
+      } | null;
+    } | null;
+  } | null;
+};
+
+/**
+ * PEN-6341: answered from the GraphQL `statusCheckRollup` instead of paging
+ * `repos/:o/:r/commits/:ref/check-runs`.
+ *
+ * This read measured 36.4/min -- 16-18% of the REST `core` shard that
+ * exhausts mid-window -- and it is the single biggest line the server
+ * controls. The REST form paged up to 5 x 100; this is ONE request on the
+ * separate, near-idle `graphql` bucket, and it does not page at all.
+ *
+ * ## Polarity: only `pending` suppresses
+ *
+ * The caller does `ciHeadPending = settlement === "pending"`, so `settled` and
+ * `unknown` are the SAME action -- wake -- and `pending` is the only answer
+ * that holds a wake back. That makes `unknown` the cheap, safe answer (a
+ * duplicate run) and a WRONG `pending` the expensive one (the assignee is
+ * never woken at all). Every failure, every unrecognised state and every
+ * internally-inconsistent payload therefore lands on `unknown`. Nothing here
+ * may reach `settled` or `pending` from a read that did not positively
+ * establish it.
+ *
+ * ## What changed, and what deliberately did not
+ *
+ * - A head with no check-runs still answers `unknown`, as the REST form did
+ *   for an empty first page: zero checks cannot establish that CI finished.
+ * - The REST form answered `unknown` for a head carrying 500+ all-complete
+ *   check-runs, because that exhausted its page budget. That cap is gone, so
+ *   such a head now answers `settled`. The caller treats the two identically,
+ *   so this changes no behaviour -- it only stops spending five requests to
+ *   say "I could not tell".
+ * - The rollup reports the LATEST run per check; the REST call passed
+ *   `filter=latest`, which dedupes per check SUITE and can still return
+ *   several attempts of one check. Where they differ, the rollup ignores a
+ *   superseded attempt that REST would still have counted, which is the
+ *   reading a merge gate wants -- an older attempt displaced by a newer
+ *   complete one is not something to wait on.
+ */
 export async function githubHeadChecksSettlement(input: {
   repoFullName: string;
   headSha: string;
 }): Promise<HeadChecksSettlement> {
   const tokenResult = await getInstallationTokenResult();
   if (!tokenResult.ok) return "unknown";
-  const base = `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/commits/${input.headSha}/check-runs`;
-  for (let page = 1; page <= HEAD_CHECKS_MAX_PAGES; page++) {
-    let body: { check_runs?: Array<{ status?: string }> } | null;
-    try {
-      const res = await ghFetch(`${base}?filter=latest&per_page=100&page=${page}`, {
-        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${tokenResult.token}` },
-      });
-      if (!res.ok) return "unknown";
-      body = (await res.json().catch(() => null)) as typeof body;
-    } catch {
-      return "unknown";
-    }
-    const runs = body?.check_runs;
-    if (!Array.isArray(runs)) return "unknown";
-    if (runs.some((run) => run?.status !== "completed")) return "pending";
-    if (runs.length < 100) return page === 1 && runs.length === 0 ? "unknown" : "settled";
+  const [owner, name, ...rest] = input.repoFullName.split("/");
+  if (!owner || !name || rest.length > 0) return "unknown";
+
+  const result = await ghGraphQlQuery<HeadChecksSettlementResponse>({
+    token: tokenResult.token,
+    query: HEAD_CHECKS_SETTLEMENT_QUERY,
+    variables: { owner, name, sha: input.headSha },
+  });
+  if (!result.ok) return "unknown";
+
+  const contexts = result.data.repository?.object?.statusCheckRollup?.contexts;
+  const total = contexts?.checkRunCount;
+  const counts = contexts?.checkRunCountsByState;
+  if (typeof total !== "number" || !Array.isArray(counts) || total <= 0) return "unknown";
+
+  let counted = 0;
+  let pending = false;
+  for (const entry of counts) {
+    const count = entry?.count;
+    // The breakdown lists every state including the zeroes; only the non-zero
+    // ones say anything, and a malformed one is left uncounted so that the
+    // reconciliation below catches it.
+    if (typeof count !== "number" || count <= 0) continue;
+    const state = entry?.state;
+    if (typeof state !== "string") return "unknown";
+    counted += count;
+    if (NON_TERMINAL_CHECK_RUN_STATES.has(state)) pending = true;
+    else if (!TERMINAL_CHECK_RUN_STATES.has(state)) return "unknown";
   }
-  return "unknown";
+  // The per-state counts must account for every run the SAME response says
+  // exists. A short sum means we are reading a partial breakdown, and an
+  // unseen run could be the incomplete one -- which would read as `settled`.
+  if (counted !== total) return "unknown";
+  return pending ? "pending" : "settled";
 }

@@ -15,6 +15,24 @@ export function gitHubApiBase(hostname: string) {
   return isGitHubDotCom(hostname) ? "https://api.github.com" : `https://${hostname}/api/v3`;
 }
 
+/**
+ * GitHub's GraphQL endpoint.
+ *
+ * It is NOT a child of the REST base: on github.com it hangs off the API apex
+ * (`/graphql`), and on GHES it is `/api/graphql`, a SIBLING of `/api/v3` rather
+ * than a path under it. Deriving it from {@link gitHubApiBase} gets the GHES
+ * form wrong, which is why it is built here from the same `isGitHubDotCom`
+ * test instead.
+ *
+ * Both forms are already recognised downstream -- `classifyGithubApiRoute`
+ * labels them `graphql`, and `inferRateLimitResource` buckets them under the
+ * `graphql` rate-limit resource -- so a caller that goes through `ghFetch`
+ * keeps its metrics label and its per-resource hold without any further work.
+ */
+export function gitHubGraphQlUrl(hostname: string) {
+  return isGitHubDotCom(hostname) ? "https://api.github.com/graphql" : `https://${hostname}/api/graphql`;
+}
+
 export function resolveRawGitHubUrl(hostname: string, owner: string, repo: string, ref: string, filePath: string) {
   const p = filePath.replace(/^\/+/, "");
   return isGitHubDotCom(hostname)
