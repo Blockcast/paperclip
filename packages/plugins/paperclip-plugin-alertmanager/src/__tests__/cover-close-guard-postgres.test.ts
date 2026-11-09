@@ -12,7 +12,7 @@
  *  - the eligibility and recheck-window predicates as SQL, including
  *    `make_interval(mins => …)` and the interaction of the `$2` hold with the
  *    `$3` hold+limit window;
- *  - that the claim UPDATE really does write the verdict columns migration 010
+ *  - that the claim UPDATE really does write the verdict columns migration 011
  *    adds, i.e. that the code and the migration that ships with it agree;
  *  - the backfill regex, which is a Postgres `substring(… from …)` and has no
  *    JS equivalent to model.
@@ -186,7 +186,7 @@ describe("PEN-6236 close guard, real SQL", () => {
     expect(readSourceState).not.toHaveBeenCalled();
   });
 
-  it("migration 010's backfill regex recovers the alertname from every real fingerprint shape", async () => {
+  it("migration 011's backfill regex recovers the alertname from every real fingerprint shape", async () => {
     const { rows } = await db.query<{ parsed: string | null }>(
       `SELECT substring(fp from '^cover:(.*):[0-9]+$') AS parsed
          FROM (VALUES ('cover:PaperclipApprovalStarved:1'),
@@ -206,7 +206,7 @@ describe("PEN-6236 close guard, real SQL", () => {
     ]);
   });
 
-  it("the 010 columns exist with the defaults the code assumes", async () => {
+  it("the 011 columns exist with the defaults the code assumes", async () => {
     const { rows } = await db.query<{ column_name: string; is_nullable: string; column_default: string | null }>(
       `SELECT column_name, is_nullable, column_default FROM information_schema.columns
         WHERE table_schema = $1 AND table_name = 'alert_escalation_covers'
