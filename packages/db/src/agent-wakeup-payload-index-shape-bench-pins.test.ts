@@ -1,5 +1,5 @@
 /**
- * PEN-6104: three pins on `agent-wakeup-payload-index-shape.bench.ts`, each
+ * PEN-6104: four pins on `agent-wakeup-payload-index-shape.bench.ts`, each
  * for a defect that has already happened and would recur silently.
  *
  * The bench is a `.bench.ts`, so it is OUTSIDE the vitest glob and CI never
@@ -9,7 +9,7 @@
  * evidence in general -- but the properties below are properties of the TEXT,
  * and the text is what the next reader acts on.
  *
- * ⭐ All three pins are written as POSITIVE assertions about what the file says,
+ * ⭐ All four pins are written as POSITIVE assertions about what the file says,
  * never as a grep for the defective string. A `-` on a carrier proves deletion
  * and never repair, and a grep for the old wording cannot tell a repaired file
  * apart from one where someone deleted the wrong line without writing the right
@@ -134,5 +134,49 @@ describe("agent_wakeup_requests payload index-shape bench", () => {
       "the header does not cite PEN-6165, the row that published " +
         "pg_paperclip_table_mvcc_n_live_tup for this table",
     ).toMatch(/PEN-6165/);
+  });
+
+  /**
+   * PIN 4 -- the scale-knob docblock must name `PEN6104_ROWS` as the ONLY knob
+   * the recorded figures confirm, and must keep the mechanism that makes the
+   * dense arm unable to confirm `PEN6104_ISSUES`.
+   *
+   * An earlier revision claimed TWO of the three were confirmed, on the ground
+   * that the dense probe's count fell by the same 14.3x as `ROWS` and "could
+   * not have" done so had `ISSUES` scaled too. The dense probe is issue #1,
+   * which `seed` selects with `CASE WHEN g % 50 = 0 THEN 1`, so its count is
+   * `ROWS / 50` and falls by the `ROWS` ratio under EVERY value of `ISSUES`.
+   * That argument discriminated nothing while reading as a derivation, which
+   * is the same failure PIN 1's retracted "24x" rationale was -- twice now in
+   * this one file, which is the argument for pinning rather than warning.
+   *
+   * Pinning the MECHANISM (`g % 50 = 0`) and not the verdict: a later reader
+   * who re-inflates the claim has to delete the sentence that refutes it.
+   */
+  it("confirms only PEN6104_ROWS from the figures, and keeps the dense-arm mechanism", () => {
+    const start = source.indexOf(" * Scale knobs.");
+    expect(start, "the scale-knob docblock is gone -- has it been renamed?").toBeGreaterThan(-1);
+    const end = source.indexOf('const scale = (name: string', start);
+    expect(end, "could not bound the scale-knob docblock").toBeGreaterThan(start);
+    const block = source.slice(start, end);
+
+    expect(
+      block,
+      "the scale-knob docblock no longer says PEN6104_ROWS is the knob the " +
+        "recorded figures confirm",
+    ).toMatch(/CONFIRMED: the window falls[\s\S]*?`PEN6104_ROWS` at 140,000/);
+
+    expect(
+      block,
+      "the docblock no longer records that the dense probe is issue #1, " +
+        "selected by `g % 50 = 0` -- without that, the retracted argument " +
+        "that the dense count confirms PEN6104_ISSUES reads as sound again",
+    ).toMatch(/g % 50 = 0/);
+
+    expect(
+      block,
+      "the docblock no longer states that PEN6104_ISSUES is NOT confirmed by " +
+        "the recorded figures",
+    ).toMatch(/NOT confirmed[\s\S]*?`PEN6104_ISSUES`/);
   });
 });
