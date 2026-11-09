@@ -10582,7 +10582,6 @@ export function setQueuedRunOldestClaimableAgeMetrics(
   }
 }
 
-/** Mark whether the queued-run age gauge was refreshed from the database. */
 /**
  * Publish one route's budget sample, or record that reading it failed.
  *
@@ -10592,6 +10591,12 @@ export function setQueuedRunOldestClaimableAgeMetrics(
  * from the outage it is failing to observe, and would fire on the wrong one.
  * Leaving them stale beside a 0 success gauge is the honest pairing: the
  * values are last-known, and the flag says so.
+ *
+ * The asymmetry below is deliberate and follows from that same sentence. On a
+ * SUCCESSFUL sample the flag reads 1, so it no longer says anything of the
+ * kind -- a stale optional value would then be published as current. Hence a
+ * null `used`/`resetSeconds` on a good read REMOVES its series rather than
+ * leaving the previous one standing.
  */
 export function setGithubRateLimitSample(route: string, sample: GithubRateLimitSample | null): void {
   const reg = ensureRegistry();
@@ -10601,11 +10606,20 @@ export function setGithubRateLimitSample(route: string, sample: GithubRateLimitS
   }
   reg.githubRateLimitRemainingGauge.set({ route }, sample.remaining);
   reg.githubRateLimitLimitGauge.set({ route }, sample.limit);
+  // Absent optional header => REMOVE the series, never leave the last value
+  // standing. `reset_seconds` is the documented shard discriminator, so a stale
+  // one beside a fresh `sample_success = 1` would group this route with the
+  // wrong shard inside a single scrape -- a confident, wrong partition, which is
+  // worse than an absent one. Absence is readable; a stale number is not.
+  // (Raised by Ally on #3626, 2026-11-09.)
   if (sample.used !== null) reg.githubRateLimitUsedGauge.set({ route }, sample.used);
+  else reg.githubRateLimitUsedGauge.remove({ route });
   if (sample.resetSeconds !== null) reg.githubRateLimitResetSecondsGauge.set({ route }, sample.resetSeconds);
+  else reg.githubRateLimitResetSecondsGauge.remove({ route });
   reg.githubRateLimitSampleSuccessGauge.set({ route }, 1);
 }
 
+/** Mark whether the queued-run age gauge was refreshed from the database. */
 export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
   ensureRegistry().queuedRunAgeMetricsRefreshSuccessGauge.set(success ? 1 : 0);
 }

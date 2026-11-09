@@ -27,10 +27,14 @@
  */
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { logger } from "../middleware/logger.js";
 import { renderMetrics } from "../services/metrics.js";
 import {
   DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_INTERVAL_MS,
+  DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_REPO,
+  GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV,
   githubRateLimitProbes,
+  resetGithubRateLimitProbeWarnings,
   readGithubRateLimitProbe,
   sampleGithubRateLimits,
   startGithubRateLimitSampler,
@@ -59,6 +63,25 @@ const GOOD = {
 /** The overlap flag clears in a `.finally()`; let that microtask chain drain. */
 async function flushMicrotasks(): Promise<void> {
   for (let i = 0; i < 5; i += 1) await Promise.resolve();
+}
+
+/**
+ * Run `fn` with the sample-repo env var genuinely ABSENT.
+ *
+ * `githubRateLimitProbes(undefined)` does NOT mean "unset": an explicit
+ * `undefined` triggers the PARAMETER DEFAULT, which reads `process.env`. So a
+ * test named for the unset case would silently assert against whatever the
+ * ambient environment held -- vacuous where it matters most, since the unset
+ * path is the deployed one.
+ */
+function withSampleRepoUnset<T>(fn: () => T): T {
+  const previous = process.env[GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV];
+  delete process.env[GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV];
+  try {
+    return fn();
+  } finally {
+    if (previous !== undefined) process.env[GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV] = previous;
+  }
 }
 
 async function metricValue(metric: string, route: string): Promise<number | null> {
@@ -121,6 +144,30 @@ describe("readGithubRateLimitProbe", () => {
     expect(sample?.remaining).toBe(0);
   });
 
+  it("releases the response body, including on the early-return path", async () => {
+    // With undici an unconsumed body holds its socket out of the pool until GC.
+    // Asserted on BOTH paths: the good read and the one that bails because the
+    // headers were not well formed -- the early return is the easy one to miss.
+    const cancels: string[] = [];
+    const make = (headers: Record<string, string>, tag: string): Response => {
+      const r = response(headers);
+      Object.defineProperty(r, "body", {
+        value: { cancel: async () => void cancels.push(tag) },
+        configurable: true,
+      });
+      return r;
+    };
+    await readGithubRateLimitProbe(PROBE, {
+      token: "t",
+      fetchImpl: fetchReturning(make(GOOD, "good")),
+    });
+    await readGithubRateLimitProbe(PROBE, {
+      token: "t",
+      fetchImpl: fetchReturning(make({}, "malformed")),
+    });
+    expect(cancels).toEqual(["good", "malformed"]);
+  });
+
   it("returns null when the transport throws", async () => {
     const sample = await readGithubRateLimitProbe(PROBE, {
       token: "t",
@@ -163,6 +210,37 @@ describe("sampleGithubRateLimits", () => {
     // on a failed read would fire the alarm the sampler is failing to observe.
     expect(await metricValue("paperclip_github_rate_limit_remaining", "probe-stale")).toBe(4612);
     expect(await metricValue("paperclip_github_rate_limit_sample_success", "probe-stale")).toBe(0);
+  });
+
+  it("drops a stale reset_seconds rather than pairing it with a fresh success", async () => {
+    // `reset_seconds` is the documented shard discriminator. A good read that
+    // simply omits the header must not leave the PREVIOUS reset published
+    // beside `sample_success = 1`: within one scrape that groups this route
+    // with the wrong shard, which is a confident wrong partition. An absent
+    // series is readable; a stale number is not. Raised by Ally on #3626.
+    const probes = [{ route: "probe-reset-drop", path: "/rate_limit" }];
+    await sampleGithubRateLimits({
+      probes,
+      credentialsConfigured: () => true,
+      getToken: async () => "t",
+      fetchImpl: fetchReturning(response(GOOD)),
+    });
+    expect(await metricValue("paperclip_github_rate_limit_reset_seconds", "probe-reset-drop"))
+      .toBe(1794250878);
+
+    // A GOOD read (remaining + limit present) that omits reset and used.
+    await sampleGithubRateLimits({
+      probes,
+      credentialsConfigured: () => true,
+      getToken: async () => "t",
+      fetchImpl: fetchReturning(
+        response({ "x-ratelimit-remaining": "17", "x-ratelimit-limit": "9650" }),
+      ),
+    });
+    expect(await metricValue("paperclip_github_rate_limit_sample_success", "probe-reset-drop")).toBe(1);
+    expect(await metricValue("paperclip_github_rate_limit_remaining", "probe-reset-drop")).toBe(17);
+    expect(await metricValue("paperclip_github_rate_limit_reset_seconds", "probe-reset-drop")).toBeNull();
+    expect(await metricValue("paperclip_github_rate_limit_used", "probe-reset-drop")).toBeNull();
   });
 
   it("flags every probe when no token can be minted", async () => {
@@ -215,8 +293,23 @@ describe("sampleGithubRateLimits", () => {
 });
 
 describe("githubRateLimitProbes", () => {
-  it("samples only repo-free routes when no sample repo is configured", () => {
-    expect(githubRateLimitProbes("").map((p) => p.route)).toEqual(["rate_limit"]);
+  it("still spans two shards when no sample repo is configured", () => {
+    // NEGATIVE, replacing an assertion that pinned the defect. The previous
+    // version asserted `["rate_limit"]` -- repo-free only -- which is the
+    // DEPLOYED default, because nothing in this repo sets the env var. That
+    // leaves exactly one probe, on the hot shard, so `group by reset_seconds`
+    // can never return more than one group: the sampler reads as deployed and
+    // cannot show the partition it exists to show. Raised by Ally on #3626.
+    const routes = githubRateLimitProbes("").map((p) => p.route);
+    expect(routes).toContain("repos/actions/permissions");
+    expect(routes.length).toBeGreaterThan(1);
+  });
+
+  it("probes the default repository when the env var is unset", () => {
+    const probe = withSampleRepoUnset(() =>
+      githubRateLimitProbes().find((p) => p.route === "repos/actions/permissions"),
+    );
+    expect(probe?.path).toBe(`/repos/${DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_REPO}/actions/permissions`);
   });
 
   it("adds the second-shard witness when a repo is configured", () => {
@@ -229,11 +322,67 @@ describe("githubRateLimitProbes", () => {
   });
 
   it.each(["not-a-repo", "a/b/c", "owner/repo?x=1", "../../etc", "owner /repo", ""])(
-    "ignores a malformed sample repo (%s) rather than probing a path it invented",
+    "never probes a path invented from a malformed sample repo (%s)",
     (value) => {
-      expect(githubRateLimitProbes(value).map((p) => p.route)).toEqual(["rate_limit"]);
+      // The guard that matters is unchanged: the malformed value must not reach
+      // a request path. What changed is the FALLBACK -- to the default repo
+      // rather than to repo-free-only, since repo-free-only is the single-shard
+      // failure above. So assert on the paths, not on the route list.
+      for (const probe of githubRateLimitProbes(value)) {
+        expect(probe.path).not.toContain(value === "" ? "\u0000never" : value);
+      }
+      expect(githubRateLimitProbes(value).map((p) => p.route))
+        .toContain("repos/actions/permissions");
     },
   );
+
+  it("logs once, not every tick, when it rejects a malformed sample repo", () => {
+    resetGithubRateLimitProbeWarnings();
+    const warn = vi.spyOn(logger, "warn").mockImplementation((() => logger) as never);
+    try {
+      githubRateLimitProbes("owner/repo?x=1");
+      githubRateLimitProbes("owner/repo?x=1");
+      // Substituting the default silently would hide the operator typo that
+      // REPO_FULL_NAME exists to catch, so it must say so -- once.
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it("reads an ambient env value, and the unset-case helper really removes it", () => {
+    // CONTROL for the two assertions above. Without this, `withSampleRepoUnset`
+    // could be a no-op and the unset-case tests would still pass -- they would
+    // just be asserting against the default by accident. Both arms are needed:
+    // the first proves the env var is honoured at all, the second proves the
+    // helper genuinely clears it rather than merely passing `undefined`.
+    const previous = process.env[GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV];
+    process.env[GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV] = "Other/repo";
+    try {
+      const pathOf = () =>
+        githubRateLimitProbes().find((p) => p.route === "repos/actions/permissions")?.path;
+      expect(pathOf()).toBe("/repos/Other/repo/actions/permissions");
+      expect(withSampleRepoUnset(pathOf)).toBe(
+        `/repos/${DEFAULT_GITHUB_RATE_LIMIT_SAMPLE_REPO}/actions/permissions`,
+      );
+      // ...and it is restored afterwards, or it would leak into later tests.
+      expect(pathOf()).toBe("/repos/Other/repo/actions/permissions");
+    } finally {
+      if (previous === undefined) delete process.env[GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV];
+      else process.env[GITHUB_RATE_LIMIT_SAMPLE_REPO_ENV] = previous;
+    }
+  });
+
+  it("does not warn when the value is simply unset", () => {
+    resetGithubRateLimitProbeWarnings();
+    const warn = vi.spyOn(logger, "warn").mockImplementation((() => logger) as never);
+    try {
+      withSampleRepoUnset(() => githubRateLimitProbes());
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
 
   it("puts the configured repo in the path", () => {
     const probe = githubRateLimitProbes("Blockcast/paperclip")
