@@ -6,7 +6,7 @@ import type { Db } from "./client.js";
  * attribution that lets `costs/by-project` stop reconstructing one from `activity_log`
  * on every request.
  *
- * ## Why this is not in migration 0276
+ * ## Why this is not in the `cost_events_run_project_attribution` migration
  *
  * The derivation reads `activity_log` joined to `issues` -- the exact relationship whose
  * read-time cost this row exists to delete. Running it inside a migration transaction is
@@ -34,15 +34,16 @@ import type { Db } from "./client.js";
  *      `createEvent` with no attribution -- `createCostEventSchema` does not carry the
  *      column, and zod strips what it does not declare. Before this row such a cost event
  *      was attributed by the read-time join; now it has a NULL watermark, so
- *      `coalesce(project_id, attributed_project_id)` is NULL and `byProject`'s
- *      `innerJoin(projects)` DROPS the row.
- *   2. Rows written by a replica still serving the pre-0276 image during a roll.
+ *      `coalesce(project_id, attributed_project_id)` is NULL and `byProject` reports it
+ *      in the unattributed bucket (PEN-6084's LEFT join) until this pass stamps it.
+ *   2. Rows written by a replica still serving the pre-attribution image during a roll.
  *   3. Rows this pass deliberately DEFERS -- see the next section.
  *
  * A once-per-lease pass leaves all three invisible to `by-project` until the next deploy
  * or failover, which is hours to days. The interval converges them without an operator
  * and without a deploy. A drained pass is one index scan over
- * `cost_events_unattributed_idx` (migration 0277), a partial index whose entries are
+ * `cost_events_unattributed_idx` (the `cost_events_unattributed_index` migration), a
+ * partial index whose entries are
  * exactly the rows still awaiting a watermark -- so once drained it holds the in-flight
  * rows and nothing else, and the pass reads no `activity_log` row at all.
  *
