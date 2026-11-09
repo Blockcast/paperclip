@@ -266,12 +266,19 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
 
       for (let cycle = 1; cycle <= DEFAULT_ISSUE_MONITOR_CONVERGENCE_THRESHOLD + 3; cycle += 1) {
         const result = arm(issue, { nextCheckAt: checkAt(cycle), scheduledBy: "board" }, { blockers });
-        // The guard does not apply at all, so no convergence bookkeeping is
-        // recorded and nothing perturbs the persisted monitor state.
+        // The guard does not score this arm, so nothing accumulates and nothing
+        // escalates however many times it re-checks.
         expect(result.monitorConvergence).toBeNull();
         expect(issue.monitorNextCheckAt).toEqual(new Date(checkAt(cycle)));
         expect(result.patch.status).toBeUndefined();
-        expect(monitorState(issue)).toMatchObject({ gateFingerprint: null, convergenceCount: 0 });
+        // PEN-6228: the exemption is from COUNTING, not from STORAGE — the gate
+        // identity is still recorded, so the stored digest describes the signals
+        // stored beside it rather than some earlier era's.
+        expect(monitorState(issue)).toMatchObject({
+          gateFingerprint: computeIssueMonitorGateFingerprint({ unresolvedBlockerIssueIds: blockers }).fingerprint,
+          gateSource: "gates",
+          convergenceCount: 0,
+        });
         fire(issue, checkAt(cycle));
       }
     });
@@ -289,7 +296,9 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
       expect(result.patch.monitorScheduledBy).toBe("manager");
       expect(monitorState(issue)).toMatchObject({
         scheduledBy: "manager",
-        gateFingerprint: null,
+        // PEN-6228: recorded, but never scored.
+        gateFingerprint: computeIssueMonitorGateFingerprint({ unresolvedBlockerIssueIds: [BLOCKER_A] }).fingerprint,
+        gateSource: "gates",
         convergenceCount: 0,
       });
     });
@@ -310,6 +319,69 @@ describe("issue monitor convergence guard (BLO-18294)", () => {
         expect(result.patch.status).toBeUndefined();
         fire(issue, checkAt(cycle));
       }
+    });
+
+    /**
+     * PEN-6228: an exempt arm refreshed `gateSignals` from the incoming policy
+     * while carrying the previous `gateFingerprint` forward, so the row stored a
+     * digest computed from gates it was no longer waiting on — measured on
+     * PEN-5920, where a monitor retargeted from one PR to another kept the first
+     * PR's digest across two subsequent arms. Two seats then read the adjacent
+     * pair and derived two different wrong mechanisms for the guard.
+     */
+    it("records the moved gate set on an exempt external-service arm", () => {
+      const issue = newIssue();
+      const firstGates = ["pr:blockcast/paperclip#3495:merge"];
+      const secondGates = ["pr:blockcast/paperclip#3501:merge"];
+
+      arm(issue, { nextCheckAt: checkAt(1), kind: "external_service", gateSignals: firstGates }, { blockers: [] });
+
+      const first = monitorState(issue);
+      expect(first).toMatchObject({
+        gateSignals: firstGates,
+        gateFingerprint: computeIssueMonitorGateFingerprint({ gateSignals: firstGates }).fingerprint,
+        gateSource: "gates",
+        convergenceCount: 0,
+      });
+      fire(issue, checkAt(1));
+
+      // Retarget onto a different PR. The stored digest must move with the
+      // stored signals; carrying it forward is the defect.
+      arm(issue, { nextCheckAt: checkAt(2), kind: "external_service", gateSignals: secondGates }, { blockers: [] });
+
+      expect(monitorState(issue)).toMatchObject({
+        gateSignals: secondGates,
+        gateFingerprint: computeIssueMonitorGateFingerprint({ gateSignals: secondGates }).fingerprint,
+        gateSource: "gates",
+      });
+      expect(monitorState(issue)?.gateFingerprint).not.toBe(first?.gateFingerprint);
+    });
+
+    it("does not credit a moved gate set with re-checks the previous one earned", () => {
+      const issue = newIssue();
+      const gatesA = ["proxmox:donor-host-drain"];
+      const gatesB = ["ceph:pg-rebalance"];
+
+      // Two scored re-checks against gate set A.
+      arm(issue, { nextCheckAt: checkAt(1), gateSignals: gatesA }, { blockers: [] });
+      fire(issue, checkAt(1));
+      const scored = arm(issue, { nextCheckAt: checkAt(2), gateSignals: gatesA }, { blockers: [] });
+      expect(scored.monitorConvergence?.count).toBe(2);
+      fire(issue, checkAt(2));
+
+      // An exempt arm that leaves the gate set alone keeps that evidence, so a
+      // detour through an exempt era cannot launder away accumulated re-checks.
+      arm(issue, { nextCheckAt: checkAt(3), kind: "external_service", gateSignals: gatesA }, { blockers: [] });
+      expect(monitorState(issue)).toMatchObject({ convergenceCount: 2 });
+      fire(issue, checkAt(3));
+
+      // An exempt arm that MOVES it must not hand those re-checks to the new
+      // gates — that would stall a monitor that has never re-checked them.
+      arm(issue, { nextCheckAt: checkAt(4), kind: "external_service", gateSignals: gatesB }, { blockers: [] });
+      expect(monitorState(issue)).toMatchObject({
+        gateFingerprint: computeIssueMonitorGateFingerprint({ gateSignals: gatesB }).fingerprint,
+        convergenceCount: 0,
+      });
     });
 
     it("ignores transitions that merely carry an existing monitor forward", () => {
