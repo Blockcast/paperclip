@@ -2405,27 +2405,56 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        // PEN-6229 — these four pre-checks refuse the wake BEFORE
+        // `heartbeat.wakeup` is reached, so the gates `enqueueWakeup` codes
+        // downstream never see them. They are thrown as 4xx `HttpError`s
+        // carrying a `details.code` for two reasons:
+        //
+        //  1. `workerHostErrorData` projects `details.code` (and only that) onto
+        //     the JSON-RPC error `data`, so the plugin reads it as
+        //     `PluginRpcError.data.code` — the same sink `readWakeCause`
+        //     already consumes for `agent.not_invokable`, `budget.blocked` and
+        //     `company.inactive`. Without a code the ladder records
+        //     `wake_cause = NULL`, which is indistinguishable from "a cause
+        //     nobody coded" — the ambiguity PEN-6121 exists to remove.
+        //  2. `isHostCallDenial` treats a 4xx as the host REFUSING the call
+        //     rather than FAILING it, so an expected refusal stops being logged
+        //     as a host fault. A plain `Error` arrived as `INTERNAL_ERROR`.
+        //
+        // The messages are unchanged on purpose: callers and tests match on
+        // them, and this is a widening of what the error carries, not a
+        // rewording of what it says.
         if (!issue.assigneeAgentId) {
-          throw new Error("Issue has no assigned agent to wake");
+          throw conflict("Issue has no assigned agent to wake", { code: "issue.no_assignee" });
         }
         // "backlog" is deliberately wakeable here: plugin escalation flows
         // (e.g. alertmanager deadline ladders, BLO-14626) exist precisely to
         // wake assignees of issues nobody has started. Only terminal statuses
         // are refused.
         if (["done", "cancelled"].includes(issue.status)) {
-          throw new Error(`Issue is not wakeable in status: ${issue.status}`);
+          throw conflict(`Issue is not wakeable in status: ${issue.status}`, {
+            status: issue.status,
+            code: "issue.not_wakeable",
+          });
         }
         const relations = await issues.getRelationSummaries(issue.id);
         const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
         if (unresolvedBlockers.length > 0) {
-          throw new Error("Issue is blocked by unresolved blockers");
+          throw conflict("Issue is blocked by unresolved blockers", {
+            blockerCount: unresolvedBlockers.length,
+            code: "issue.blocked",
+          });
         }
         const budgetBlock = await budgets.getInvocationBlock(companyId, issue.assigneeAgentId, {
           issueId: issue.id,
           projectId: issue.projectId,
         });
         if (budgetBlock) {
-          throw new Error(budgetBlock.reason);
+          throw conflict(budgetBlock.reason, {
+            scopeType: budgetBlock.scopeType,
+            scopeId: budgetBlock.scopeId,
+            code: "budget.blocked",
+          });
         }
         const contextSource = params.contextSource ?? "plugin.issue.requestWakeup";
         // PEN-6121 — collect the host's own reason for a declined wake. Until
@@ -2496,25 +2525,39 @@ export function buildHostServices(
         const results = [];
         for (const issueId of [...new Set(params.issueIds)]) {
           const issue = requireInCompany("Issue", await issues.getById(issueId), companyId);
+          // PEN-6229 — same four gates, same tokens as `requestWakeup`
+          // above. Both arms are coded because the ladder reaches this one too
+          // and a cause recorded by only one of them is a cause that goes NULL
+          // depending on which call site ran.
           if (!issue.assigneeAgentId) {
-            throw new Error("Issue has no assigned agent to wake");
+            throw conflict("Issue has no assigned agent to wake", { code: "issue.no_assignee" });
           }
           // Backlog is wakeable (see requestWakeup above); only terminal
           // statuses are refused.
           if (["done", "cancelled"].includes(issue.status)) {
-            throw new Error(`Issue is not wakeable in status: ${issue.status}`);
+            throw conflict(`Issue is not wakeable in status: ${issue.status}`, {
+              status: issue.status,
+              code: "issue.not_wakeable",
+            });
           }
           const relations = await issues.getRelationSummaries(issue.id);
           const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
           if (unresolvedBlockers.length > 0) {
-            throw new Error("Issue is blocked by unresolved blockers");
+            throw conflict("Issue is blocked by unresolved blockers", {
+              blockerCount: unresolvedBlockers.length,
+              code: "issue.blocked",
+            });
           }
           const budgetBlock = await budgets.getInvocationBlock(companyId, issue.assigneeAgentId, {
             issueId: issue.id,
             projectId: issue.projectId,
           });
           if (budgetBlock) {
-            throw new Error(budgetBlock.reason);
+            throw conflict(budgetBlock.reason, {
+              scopeType: budgetBlock.scopeType,
+              scopeId: budgetBlock.scopeId,
+              code: "budget.blocked",
+            });
           }
           const contextSource = params.contextSource ?? "plugin.issue.requestWakeups";
           const run = await heartbeat.wakeup(issue.assigneeAgentId, {

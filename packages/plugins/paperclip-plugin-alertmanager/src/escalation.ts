@@ -1443,6 +1443,31 @@ async function advanceIssueLadder(
     attemptedWake = await requestWakeupBestEffort(ctx, issue, companyId, attempt);
     if (attemptedWake.outcome === "enqueued") {
       await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt}/${MAX_ATTEMPTS}] The wake for ${current?.name ?? "the current owner"} reached the queue on retry ${wakeRetries + 1}; the earlier attempt at this rung was not delivered.\n\n${livenessLine(liveness, state, now)}`, companyId);
+    } else if (UNDELIVERED_WAKE_OUTCOMES.includes(attemptedWake.outcome) && !retriesRemainAfterThisAttempt) {
+      // PEN-6229 — the LAST retry for this rung has just failed. Say so, once.
+      //
+      // Without this the thread read: "this rung is NOT spent: the next sweep
+      // retries the delivery before the ladder escalates" → silence → "[2/3]
+      // Escalation deadline reached again". The reader is never told the
+      // retries happened and failed, so the escalation appears to contradict
+      // the standing promise the rung-opening comment made. That is the same
+      // defect class PEN-6121 fixed one step earlier — there a FALSE assertion
+      // of delivery, here an UNRESOLVED forward-looking promise.
+      //
+      // ⛔ Bounded by the retry count, not by the sweep count: this is an
+      // `else if` on an UNDELIVERED outcome, so a delivered wake adds nothing
+      // (the `enqueued` arm above already reports that), and the
+      // `retriesRemainAfterThisAttempt` guard fires only on the final attempt.
+      // At `MAX_WAKE_DELIVERY_RETRIES = 2` a fully-failing rung therefore costs
+      // exactly ONE extra comment — retry 1's failure stays silent because the
+      // promise still holds while a retry remains. PEN-2918 measured volume as
+      // a non-remedy, so the budget here is honesty, not frequency.
+      //
+      // Unreachable at `MAX_WAKE_DELIVERY_RETRIES = 0` (the kill switch): the
+      // retry branch never runs, and `wakeSentence`'s own spent-budget arm
+      // carries the same wording on the rung-opening comment instead. The two
+      // never both fire.
+      await ctx.issues.createComment(issue.id, `[alert-escalation ${attempt}/${MAX_ATTEMPTS}] ${retryBudgetSpentSentence(current?.name ?? "the current owner", attemptedWake, wakeRetries + 1)}\n\n${livenessLine(liveness, state, now)}`, companyId);
     }
   } else if (attempt === 0 && current) {
     notified = current.id ?? issue.assigneeAgentId ?? null;
@@ -1516,6 +1541,13 @@ async function advanceIssueLadder(
  * a failure. That arm is therefore the kill switch's wording, not dead code:
  * setting the bound to 0 restores the pre-PEN-6121 climb-immediately behaviour
  * while keeping the thread honest about what happened.
+ *
+ * ⚠️ PEN-6229 — so at the SHIPPED bound this function never tells a reader the
+ * budget ran out, because it is not called again after the opening comment.
+ * `retryBudgetSpentSentence` carries that for the exhausted case, word-for-word
+ * identical in its closing clause. If you change either wording, change both:
+ * they are two reachable paths to one statement, and a reader (or a grep)
+ * should match one string.
  */
 function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): string {
   const retryClause = willRetry
@@ -1532,6 +1564,34 @@ function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): stri
     default:
       return `no wake was attempted for ${name}.`;
   }
+}
+
+/**
+ * PEN-6229 — the sentence posted when the LAST retry for a rung has failed.
+ *
+ * It exists to retract a promise. `wakeSentence` told the reader "This rung is
+ * NOT spent: the next sweep retries the delivery before the ladder escalates",
+ * and that sentence is true when written and silently stops being true once the
+ * budget runs out. Nothing else in the thread ever says so — the ladder simply
+ * escalates, and a reader comparing the two comments sees a contradiction
+ * rather than a sequence.
+ *
+ * ⛔ Leads with the OUTCOME, not with the retry bookkeeping, for the same
+ * reason `wakeSentence` does: the one fact a skimming reader must come away
+ * with is that nobody was woken. The retry count is context for why the ladder
+ * is about to move, not the headline.
+ *
+ * The closing clause is deliberately WORD-FOR-WORD `wakeSentence`'s
+ * `willRetry === false` arm. One rung-is-spent wording, reachable two ways —
+ * here on an exhausted budget, there on the `MAX_WAKE_DELIVERY_RETRIES = 0`
+ * kill switch — so a reader (or a grep) matches one string, not two.
+ */
+function retryBudgetSpentSentence(name: string, wake: WakeAttempt, retryNumber: number): string {
+  const cause = wake.cause ? ` (${wake.cause})` : "";
+  const how = wake.outcome === "refused"
+    ? `the host refused the wake${cause}`
+    : `the host accepted the request and enqueued nothing${cause}`;
+  return `**No run was queued for ${name}** — ${how}. Retry ${retryNumber} of ${MAX_WAKE_DELIVERY_RETRIES} failed. The retry budget for this rung is spent; the ladder will escalate on the next sweep.`;
 }
 
 /**
@@ -1555,7 +1615,7 @@ function wakeSentence(name: string, wake: WakeAttempt, willRetry: boolean): stri
 function wakeDetailFor(wake: WakeOutcome): string | null {
   switch (wake) {
     case "refused":
-      return "issues.requestWakeup threw: the host refused the wake. Read wake_cause for which gate (agent.not_invokable, budget.blocked, company.inactive); a null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
+      return "issues.requestWakeup threw: the host refused the wake. Read wake_cause for which gate -- pre-wake in the plugin host (issue.no_assignee, issue.not_wakeable, issue.blocked, budget.blocked) or downstream in enqueueWakeup (budget.blocked, company.inactive, agent.not_invokable). That set GROWS; it is documentation, not a closed list. A null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
     case "declined":
       return "issues.requestWakeup resolved queued=false: the host accepted the call and enqueued no run. Read wake_cause for which gate (heartbeats disabled, cooldown, inactive company, scheduling suppressed, worktree cutoff, or a capacity deferral); a null cause means the host named none. The escalation comment for this rung reports this outcome and does not assert a wake.";
     default:
@@ -1574,8 +1634,11 @@ function wakeDetailFor(wake: WakeOutcome): string | null {
  * this function.** The host drops a wake in two different ways and only one of
  * them throws:
  *
- *  - it **rejects** on a terminal status, an unresolved blocker or a budget
- *    block ⇒ `refused`;
+ *  - it **rejects** ⇒ `refused`. Seven gates throw: four pre-wake in the
+ *    plugin host — no assignee, a terminal status, an unresolved blocker, an
+ *    invocation budget block (PEN-6229 codes all four) — and three downstream
+ *    in `enqueueWakeup`: `budget.blocked`, `company.inactive`,
+ *    `agent.not_invokable`;
  *  - it **resolves `{ queued: false }`** when `enqueueWakeup` returns `null` —
  *    `heartbeat.wakeOnDemand.disabled`, the heartbeat cooldown,
  *    `company.inactive`, `heartbeat.scheduling_suppressed`,

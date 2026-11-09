@@ -299,7 +299,13 @@ still firing, and two rows that ran the full three-rung ladder with not one rung
 delivered. The ladder now attempts the wake *first* and the comment *reports its
 outcome*; an undelivered wake does not spend the rung, and is retried for up to
 `MAX_WAKE_DELIVERY_RETRIES` sweeps before the ladder climbs past the agent it
-announced. Rows observed before that change still carry the old `wake_detail`
+announced. PEN-6229: when the LAST of those retries also fails, the rung says so
+in the thread — once — before the ladder escalates, so the opening comment's
+"this rung is NOT spent: the next sweep retries" is retracted rather than left
+standing against a `[2/3]` that appears to contradict it. A fully-failing rung
+therefore costs exactly one extra comment; a delivered wake costs none, and the
+intermediate retries stay silent because the promise still holds while a retry
+remains. Rows observed before that change still carry the old `wake_detail`
 sentence, which says the comment asserted the wake regardless — read
 `wake_detail`, not this README, to tell an old row from a new one.
 
@@ -307,15 +313,19 @@ sentence, which says the comment asserted the wake regardless — read
 the problem; `wake_cause` triages it, because `refused` and `declined` are each
 a disjunction rather than a diagnosis. The host stamps one vocabulary on both
 halves — the `writeSkippedRequest` tokens, e.g. `agent.not_invokable`,
-`budget.blocked`, `heartbeat.cooldown`, `worktree_execution_cutoff`.
+`budget.blocked`, `heartbeat.cooldown`, `worktree_execution_cutoff`, plus the
+plugin host's own pre-wake gates (`issue.no_assignee`, `issue.not_wakeable`,
+`issue.blocked`), which PEN-6229 coded. ⛔ The set is OPEN and will grow; it is
+documentation, not a constraint.
 ⛔ **`NULL` means NOT RECORDED** — a row written before this column, a branch
 that attempted no wake, or a host that dropped the wake without naming a cause.
 It never means the wake was delivered; `wake_outcome` is the field that answers
 that, and it has always been `NOT NULL`.
 
 ⛔ **They are two tokens because the host drops a wake in two ways and only one
-of them throws.** `requestWakeup` *rejects* on a terminal status, an unresolved
-blocker or a budget block (`refused`) — but it *resolves* `{ queued: false }`
+of them throws.** `requestWakeup` *rejects* on no assignee, a terminal status,
+an unresolved blocker or a budget block — and, downstream, on `company.inactive`
+or `agent.not_invokable` (`refused`) — but it *resolves* `{ queued: false }`
 when `enqueueWakeup` returns `null`, which it does without throwing on
 `heartbeat.wakeOnDemand.disabled`, the heartbeat cooldown, `company.inactive`,
 `heartbeat.scheduling_suppressed`, `worktree_execution_cutoff` and the

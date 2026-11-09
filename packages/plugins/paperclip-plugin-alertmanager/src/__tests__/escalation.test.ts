@@ -1896,6 +1896,108 @@ describe("PEN-2918 attendance observations", () => {
   });
 
   /**
+   * PEN-6229 — the SILENT MIDDLE. Pins the whole three-comment sequence for a
+   * rung on which every attempt fails, because the defect was only ever visible
+   * as a shape across comments and no single-sweep test can see it.
+   *
+   * Before this, the thread read:
+   *
+   *   [1/3] ... This rung is NOT spent: the next sweep retries the delivery
+   *             before the ladder escalates.
+   *   (retry 1 fails — nothing written)
+   *   (retry 2 fails — nothing written, marker cleared)
+   *   [2/3] Escalation deadline reached again ...
+   *
+   * A reader is never told the two retries happened and failed, so the `[2/3]`
+   * appears to CONTRADICT the promise `[1/3]` made rather than follow from it.
+   * That is PEN-6121's own defect class one step milder: #3556 removed a false
+   * assertion of delivery, and this removes an unresolved forward-looking
+   * promise.
+   *
+   * ⛔ The counts are the assertion, not decoration. `toHaveLength(3)` is what
+   * fails if someone "improves" this into a per-sweep progress comment —
+   * PEN-2918 measured volume as a non-remedy, so the budget here is honesty,
+   * not frequency. Retry 1's silence is asserted for the same reason: while a
+   * retry remains the opening promise is still TRUE, and a comment there would
+   * be noise rather than a correction.
+   */
+  it("states the spent retry budget exactly once, between the rung it opened and the escalation that follows", async () => {
+    const store = buildFakeAlertmanagerStore();
+    let current: AlertStateRecord = due();
+    const { ctx, mocks } = sweepContext(current, "cto", store);
+    // Thread the real state across sweeps: the sequence under test spans four
+    // of them, and the retry marker is the whole mechanism being exercised.
+    mocks.state.get = vi.fn(async () => current);
+    mocks.state.set = vi.fn(async (_ref: unknown, next: AlertStateRecord) => { current = next; });
+    // Shaped like the real worker boundary: `details.code` on the host's throw
+    // arrives at the plugin as `JsonRpcCallError.data.code`, which is the sink
+    // PEN-6229 coded the eight plugin-host pre-checks into.
+    mocks.issues.requestWakeup = vi.fn(async () => {
+      throw Object.assign(new Error("Issue is blocked by unresolved blockers"), { data: { code: "issue.blocked" } });
+    });
+
+    // Four sweeps, each a rung interval apart (critical defaults to 30 min):
+    // rung 1 opens, retry 1 fails, retry 2 fails, the ladder climbs.
+    for (let sweep = 0; sweep < 4; sweep += 1) {
+      await runAlertEscalationSweep(ctx, config(), new Date(NOW.getTime() + sweep * 31 * 60_000));
+    }
+
+    const bodies = (mocks.issues.createComment.mock.calls as unknown as Array<[string, string, string]>).map(([, body]) => body);
+    expect(bodies).toHaveLength(3);
+
+    // 1. The rung opens and promises a retry.
+    expect(bodies[0]).toContain("[alert-escalation 1/3]");
+    expect(bodies[0]).toContain("This rung is NOT spent");
+
+    // 2. The promise is RETRACTED on the final failed retry — still rung 1, and
+    //    carrying the cause so the reader is not sent to a log for it.
+    expect(bodies[1]).toContain("[alert-escalation 1/3]");
+    expect(bodies[1]).toContain("Retry 2 of 2 failed");
+    expect(bodies[1]).toContain("The retry budget for this rung is spent");
+    expect(bodies[1]).toContain("issue.blocked");
+    // It reports the failure, never a delivery.
+    expect(bodies[1]).toContain("No run was queued");
+
+    // 3. Only THEN does the ladder climb — the escalation now follows from the
+    //    comment before it instead of contradicting it.
+    expect(bodies[2]).toContain("[alert-escalation 2/3]");
+    expect(bodies[2]).toContain("Escalation deadline reached again");
+
+    // The rung really did spend both retries before climbing.
+    expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(4);
+  });
+
+  /**
+   * PEN-6229 — the bound, from the other side. A rung whose retry SUCCEEDS must
+   * not gain a comment: the `enqueued` arm already reports that, and adding a
+   * second would be the comment storm the CAS ordering exists to prevent.
+   */
+  it("adds no spent-budget comment when the final retry is delivered", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "engineer", escalationWakeRetries: 1 }), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: true, runId: "run-1" }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    const bodies = (mocks.issues.createComment.mock.calls as unknown as Array<[string, string, string]>).map(([, body]) => body);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).toContain("reached the queue on retry");
+    expect(bodies[0]).not.toContain("retry budget for this rung is spent");
+  });
+
+  /**
+   * PEN-6229 — and a retry that still has budget left stays SILENT. The opening
+   * comment's promise is still true here, so there is nothing to correct.
+   */
+  it("says nothing on a failed retry while the rung still has budget", async () => {
+    const store = buildFakeAlertmanagerStore();
+    const { ctx, mocks } = sweepContext(due({ escalationAttempt: 1, escalationWakePendingAgentId: "engineer", escalationWakeRetries: 0 }), "cto", store);
+    mocks.issues.requestWakeup = vi.fn(async () => ({ queued: false, runId: null, undeliveredReason: "heartbeat.cooldown" }));
+    await runAlertEscalationSweep(ctx, config(), NOW);
+
+    expect(mocks.issues.createComment).not.toHaveBeenCalled();
+  });
+
+  /**
    * A healthy rung must still cost exactly one state write. The marker write is
    * a second CAS, and making every rung pay for it would be a regression in the
    * common case.
