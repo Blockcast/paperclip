@@ -80,12 +80,16 @@ exec_real_gh() {
     "pr review" | "pr comment")
       buffer_stdin_for_reviewer_evidence "$@"
       refuse_reviewer_evidence "$@"
+      # After the guard on purpose: an armed seat's refusal must be decided on
+      # the body the AUTHOR wrote, never on text this wrapper appended to it.
+      mark_agent_authored "$@"
       ;;
     "api "*)
       refuse_api_merge "$@"
       refuse_api_ready "$@"
       buffer_stdin_for_reviewer_evidence "$@"
       refuse_reviewer_evidence "$@"
+      mark_agent_authored "$@"
       ;;
   esac
   case "${1:-} ${2:-}" in
@@ -657,6 +661,281 @@ buffer_stdin_for_reviewer_evidence() {
     fi
     return 0
   done
+}
+
+# ── PEN-5983 / PEN-3193 box 5: mark an agent-authored write AS agent-authored ─
+#
+# The guard above is NEGATIVE: it refuses a write that wears the *reviewer's*
+# shape. It cannot make an ordinary author comment distinguishable from the
+# reviewer's own prose, because both publish as `allyblockcast[bot]` and nothing
+# in the thread says which process typed them. Until the author gets a
+# credential that is not the reviewer's (PEN-4275), the only thing standing
+# between a reader and that ambiguity is a banner the author remembered to type
+# by hand — a habit, not a control, which fails silently the first time anyone
+# forgets and has nothing that detects the omission.
+#
+# This appends that banner from the wrapper instead, so forgetting is not a
+# reachable state on the surfaces it covers.
+#
+# ── WHAT A MISSING MARKER PROVES: NOTHING ────────────────────────────────────
+# This is an aid to a human reader, NOT an authentication, and the scope
+# decision below is what makes that unavoidable rather than merely true. An
+# unmarked comment is equally consistent with:
+#   * a JSON-payload surface, which is deliberately out of scope (see below);
+#   * a caller outside an agent pod, where PAPERCLIP_AGENT_ID is unset;
+#   * a seat that has not been armed;
+#   * a bodiless write, which is left alone rather than given a body;
+#   * anyone at all holding the token, who can simply not add it — or add it
+#     verbatim, since it is plain text in a body they control.
+# So the marker's presence is informative and its ABSENCE is not evidence of
+# anything. Do not build a gate on it, and do not let a later reader infer an
+# authentication property this cannot have. The one integrity property it does
+# have is narrow and worth stating: the seat and run are read from
+# `PAPERCLIP_*` runtime env, which `isPaperclipRuntimeEnvKey`
+# (server/src/services/heartbeat.ts) strips out of adapter, environment,
+# project and routine config — so a lower-trust config writer cannot redirect
+# whose name this stamps, the same reasoning that keeps GH_SEAT_TOKEN_VALUE
+# *out* of that namespace, inverted.
+#
+# ── SCOPE: the non-JSON body surfaces only ───────────────────────────────────
+# Marked:   `gh pr comment` / `gh pr review` bodies (`-b/--body`,
+#           `-F/--body-file`, including `--body-file -`), and `gh api`
+#           `-f/-F/--field/--raw-field body=<text>` on a comment or review
+#           endpoint.
+# Unmarked: `--input` payloads and GraphQL mutations, and any `body=@<path>`
+#           field value.
+#
+# That split is deliberate. Appending inside a JSON document means
+# re-serialising JSON in POSIX sh, which this wrapper avoids everywhere else
+# for good reason — and the asymmetry is the argument: everything shipped so
+# far only READS these bodies, where a mis-parse costs a missed refusal, while
+# this WRITES them, where the same mis-parse corrupts a caller's payload. The
+# extractor has already been wrong once about which `"body"` member it picks
+# (PEN-5906); a reader that is wrong fails safe, a writer that is wrong does
+# not. `body=@<path>` is excluded for the same reason one level down: `-f` and
+# `-F` do not agree on whether `@` dereferences, `reviewer_evidence_bodies`
+# deliberately over-reads both because over-reading is the fail-closed
+# direction for a reader, and there is no corresponding safe direction for a
+# writer — rewriting the value is a corruption whichever way the ambiguity
+# resolves.
+#
+# ── APPEND, NEVER PREPEND ────────────────────────────────────────────────────
+# A review request is recognised only when `<!-- paperclip:review-request -->`
+# is the body's LITERAL FIRST BYTE. Anything inserted ahead of it drops the
+# review request with a server-side `logger.warn` and nothing at the call site
+# — i.e. prepending here would silently disable review requests fleet-wide and
+# look like it was working. Appending cannot touch byte 0; a test pins that.
+#
+# The trailer must also not itself match REVIEWER_EVIDENCE_RE, or an armed seat
+# would refuse every comment this had just stamped. That regex allows 0-3
+# leading spaces and makes the `#`/`**` prefix optional, so the rule is that no
+# line of the trailer may begin with `ally`, with a `#`/`*` run followed by
+# `ally`, or with `reviewed head:`. The prose line begins `*Posted`, which is
+# why the word `review` in it is safe where a line-initial one would not be. A
+# test matches the emitted trailer against the script's own regex rather than a
+# copy, so editing the trailer cannot quietly break that.
+#
+# ── WHY THIS IS DISARMED BY DEFAULT ──────────────────────────────────────────
+# Same structural reason as the refusal guard, different failure: `/usr/bin/gh`
+# in the agent image IS this wrapper and the reviewer agent runs in that same
+# image, so until the reviewer carries
+# GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE=i-am-the-reviewer it would stamp Ally's own
+# consolidated reviews with a trailer saying they are an author write. That is a
+# FALSE statement published on the one surface this whole programme exists to
+# keep trustworthy — milder than the refusal guard's fleet-wide outage, but
+# wrong in the same place and in the more insidious direction, because it looks
+# like it is working. The exemption lives in agent-record config, not in this
+# repo, so arming cannot ship atomically with it.
+#
+# Rollout, sharing step 1 with the refusal guard above:
+#   1. set GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE=i-am-the-reviewer on the reviewer
+#      agent, and confirm a real Ally review still publishes unmarked;
+#   2. set GH_WRAPPER_MARK_AGENT_AUTHORED=mark-agent-authored on the agent seats
+#      to be marked. This is independent of, and safe to arm before,
+#      GH_WRAPPER_REFUSE_REVIEWER_EVIDENCE: marking adds text and refuses
+#      nothing, so the worst case is a cosmetic trailer rather than a blocked
+#      write.
+# Until step 2 the wrapper behaves exactly as it did before this change.
+#
+# Retire the whole block — this and the guard above — when PEN-4275 gives the
+# author a credential that is not the reviewer's: GitHub then renders the two
+# identities distinctly and no in-body marker is needed.
+AGENT_PROVENANCE_ARM='mark-agent-authored'
+AGENT_PROVENANCE_MARKER='<!-- paperclip:agent-authored'
+
+# Armed only when the seat opts in, never for the reviewer's own harness, and
+# never outside an agent run — PAPERCLIP_AGENT_ID is what makes the stamp true,
+# so without it there is nothing honest to write. Checked before any body is
+# read, so an unarmed seat pays nothing.
+agent_provenance_armed() {
+  case "${GH_WRAPPER_MARK_AGENT_AUTHORED:-}" in
+    "${AGENT_PROVENANCE_ARM}") ;;
+    *) return 1 ;;
+  esac
+  case "${GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE:-}" in
+    "${REVIEWER_EVIDENCE_ESCAPE}") return 1 ;;
+  esac
+  [ -n "${PAPERCLIP_AGENT_ID:-}" ] || return 1
+  return 0
+}
+
+# A human-readable seat label when the runtime supplies one, else the id, which
+# is always set by the time `agent_provenance_armed` has passed. Both come from
+# the stripped-from-user-config `PAPERCLIP_*` namespace (see above).
+agent_provenance_seat() {
+  if [ -n "${PAPERCLIP_AGENT_NAME:-}" ]; then
+    printf '%s' "${PAPERCLIP_AGENT_NAME}"
+  else
+    printf '%s' "${PAPERCLIP_AGENT_ID}"
+  fi
+}
+
+# Copies $1 (a path, or `-` for stdin) to $2, appending the trailer.
+#
+# Idempotent by construction: the copy happens first and the marker is looked
+# for in the RESULT, so a body that already carries one is passed through
+# unchanged. That ordering is what makes stdin work too — it can only be read
+# once, so there is no "check, then read" available here.
+agent_provenance_body() {
+  ap_src="$1"
+  ap_dest="$2"
+  if [ "${ap_src}" = - ]; then cat; else cat -- "${ap_src}"; fi > "${ap_dest}"
+  if grep -qF "${AGENT_PROVENANCE_MARKER}" "${ap_dest}"; then
+    return 0
+  fi
+  # A `---` directly under a line of text is a setext H2 underlining that line,
+  # not a rule — so the body must end in a newline and the rule must have a
+  # blank line above it, or appending silently reformats the author's last
+  # sentence into a heading. `$(...)` strips trailing newlines, so a non-empty
+  # result means the last byte was not one.
+  if [ -s "${ap_dest}" ] && [ -n "$(tail -c1 -- "${ap_dest}")" ]; then
+    printf '\n' >> "${ap_dest}"
+  fi
+  ap_seat="$(agent_provenance_seat)"
+  printf '\n%s seat=%s agent=%s run=%s -->\n\n---\n\n*Posted by the Penstock `%s` agent seat through the `allyblockcast[bot]` App installation token — an agent **author** write, not a review by the Ally reviewer harness (PEN-3193).*\n' \
+    "${AGENT_PROVENANCE_MARKER}" \
+    "${ap_seat}" \
+    "${PAPERCLIP_AGENT_ID}" \
+    "${PAPERCLIP_RUN_ID:-unknown}" \
+    "${ap_seat}" >> "${ap_dest}"
+  return 0
+}
+
+# True when this `gh api` invocation addresses a comment or review endpoint.
+#
+# A positive allowlist rather than "any `gh api` carrying a body=": `gh api -f
+# body=…` also creates issues, releases and gists, and stamping those is both
+# out of this row's scope and a wider blast radius than it is worth. An
+# endpoint this does not recognise is simply left unmarked, which the
+# "absence proves nothing" contract above already covers.
+#
+# Tokens that look like flags or `key=value` fields are skipped so a path-shaped
+# string inside a body cannot select the endpoint for us.
+agent_provenance_api_path() {
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -* | *=*) ;;
+      */issues/*/comments | */issues/*/comments\?* \
+        | */issues/comments/* \
+        | */pulls/*/reviews | */pulls/*/reviews\?* \
+        | */pulls/*/comments | */pulls/*/comments\?* \
+        | */pulls/comments/*) return 0 ;;
+    esac
+    shift
+  done
+  return 1
+}
+
+# Rebuilds argv with every in-scope body replaced by a marked copy, then runs
+# the real gh itself so the temporaries can be cleaned up — the same shape, and
+# for the same reason, as squash_merge_without_ai_trailers above. When nothing
+# was in scope it returns and the caller `exec`s as usual, so the common path is
+# untouched.
+mark_agent_authored() {
+  agent_provenance_armed || return 0
+
+  ap_mode=api
+  case "${1:-} ${2:-}" in "pr review" | "pr comment") ap_mode=pr ;; esac
+  if [ "${ap_mode}" = api ] && ! agent_provenance_api_path "$@"; then
+    return 0
+  fi
+
+  ap_dir="$(mktemp -d "${TMPDIR:-/tmp}/gh-provenance.XXXXXX")"
+  ap_changed=no
+  ap_seq=0
+  n=$#
+  i=0
+  while [ "${i}" -lt "${n}" ]; do
+    a="$1"
+    shift
+    i=$((i + 1))
+    v=""
+    ap_split=no
+    case "${a}" in
+      --body=* | --body-file=* | --field=* | --raw-field=*) v="${a#*=}" a="${a%%=*}" ap_split=yes ;;
+      -b?* | -f?* | -F?*) v="${a#-?}" a="${a%"${v}"}" ap_split=yes ;;
+      -b | --body | -f | -F | --body-file | --field | --raw-field)
+        v="${1:-}"
+        shift
+        i=$((i + 1))
+        ap_split=yes
+        ;;
+    esac
+    if [ "${ap_split}" = no ]; then
+      set -- "$@" "${a}"
+      continue
+    fi
+
+    ap_seq=$((ap_seq + 1))
+    ap_file="${ap_dir}/body.${ap_seq}"
+    case "${ap_mode}:${a}" in
+      "pr:-b" | "pr:--body")
+        printf '%s' "${v}" | agent_provenance_body - "${ap_file}"
+        set -- "$@" --body-file "${ap_file}"
+        ap_changed=yes
+        continue
+        ;;
+      "pr:-F" | "pr:--body-file")
+        # `-` here genuinely is stdin: in `pr` mode it is the value of a flag
+        # that takes a file. The body is replaced by the marked copy, so the
+        # stdin the real gh would have read is no longer needed.
+        if [ "${v}" != - ] && [ ! -r "${v}" ]; then
+          # Not this wrapper's error to report — hand it back unchanged and let
+          # the real gh produce its own message.
+          set -- "$@" "${a}" "${v}"
+          continue
+        fi
+        agent_provenance_body "${v}" "${ap_file}"
+        set -- "$@" --body-file "${ap_file}"
+        ap_changed=yes
+        continue
+        ;;
+      "api:-f" | "api:-F" | "api:--field" | "api:--raw-field")
+        case "${v}" in
+          body=@*)
+            # Out of scope: see the `@` paragraph above.
+            ;;
+          body=*)
+            printf '%s' "${v#body=}" | agent_provenance_body - "${ap_file}"
+            set -- "$@" "${a}" "body=$(cat -- "${ap_file}")"
+            ap_changed=yes
+            continue
+            ;;
+        esac
+        ;;
+    esac
+    set -- "$@" "${a}" "${v}"
+  done
+
+  if [ "${ap_changed}" = no ]; then
+    rm -rf -- "${ap_dir}"
+    return 0
+  fi
+
+  status=0
+  "${REAL_GH}" "$@" || status=$?
+  rm -rf -- "${ap_dir}"
+  exit "${status}"
 }
 
 # BLO-51471: the body built in squash_merge_without_ai_trailers replaces GitHub's COMMIT_MESSAGES default, so a

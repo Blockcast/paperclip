@@ -3342,3 +3342,284 @@ test("an --input review payload with inline comments and prose bodies still pass
     assert.match(proc.stdout, /ARGS=api -X POST/);
   });
 });
+
+// --- PEN-5983 / PEN-3193 box 5: marking an agent-authored write -------------
+//
+// The guard above is negative — it refuses reviewer SHAPE. These cover the
+// positive half: the wrapper stamping its own writes so a reader can tell an
+// agent author from Ally's reviewer harness, both of which publish as
+// `allyblockcast[bot]`.
+//
+// The two shapes that matter most here are the ones that look harmless:
+// appending must never reach byte 0 (a `<!-- paperclip:review-request -->`
+// there is what makes a review request a review request), and the trailer must
+// never itself match REVIEWER_EVIDENCE_RE, or an armed seat would refuse every
+// comment this had just stamped.
+
+// Dumps any `--body-file` argument's contents, so a test can assert on the body
+// the wrapper actually handed to gh rather than on argv alone.
+const STUB_GH_DUMP_BODY_FILE = `#!/bin/sh
+echo "ARGS=$*"
+prev=""
+for a in "$@"; do
+  case "\${prev}" in
+    --body-file|-F) if [ -r "\${a}" ]; then echo "BODY<<"; cat -- "\${a}"; echo ">>BODY"; fi ;;
+  esac
+  prev="\${a}"
+done
+`;
+
+const MARK_ARM = "mark-agent-authored";
+const AGENT_ID = "11b9c48f-aee6-4ac4-8f4a-5ba60c73fb9c";
+const RUN_ID = "095454b9-9e7e-4a62-9217-6e07681757d6";
+
+// `armed` defaults to true because nearly every test here asserts on the
+// marker, but the SHIPPED default is disarmed — pinned by its own test below,
+// which is the one that says what merging this does to the fleet.
+function runMark(dir, args, { extraEnv = {}, input = "", armed = true, agentId = AGENT_ID } = {}) {
+  const stubGhPath = path.join(dir, "gh.real");
+  writeFileSync(stubGhPath, STUB_GH_DUMP_BODY_FILE);
+  chmodSync(stubGhPath, 0o755);
+  const tokenFilePath = path.join(dir, "token");
+  writeFileSync(tokenFilePath, "ghs_stub_token\n");
+
+  const env = sanitizedEnv({
+    GH_TOKEN_WRAPPER_REAL_GH: stubGhPath,
+    PAPERCLIP_GITHUB_TOKEN_FILE: tokenFilePath,
+  });
+  // None of these is a credential, so WRAPPER_CREDENTIAL_ENV_VARS does not
+  // strip them — and these tests run inside agent pods, where PAPERCLIP_AGENT_ID
+  // and PAPERCLIP_RUN_ID are genuinely set. Inheriting either would make the
+  // "unmarked outside an agent run" test vacuous, and inheriting an ambient
+  // arm/escape would silently flip every assertion below.
+  delete env.GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE;
+  delete env.GH_WRAPPER_REFUSE_REVIEWER_EVIDENCE;
+  delete env.GH_WRAPPER_MARK_AGENT_AUTHORED;
+  delete env.PAPERCLIP_AGENT_ID;
+  delete env.PAPERCLIP_AGENT_NAME;
+  delete env.PAPERCLIP_RUN_ID;
+  if (armed) env.GH_WRAPPER_MARK_AGENT_AUTHORED = MARK_ARM;
+  if (agentId) {
+    env.PAPERCLIP_AGENT_ID = agentId;
+    env.PAPERCLIP_AGENT_NAME = "devops";
+    env.PAPERCLIP_RUN_ID = RUN_ID;
+  }
+  Object.assign(env, extraEnv);
+  return spawnSync("sh", [WRAPPER, ...args], { env, encoding: "utf8", input });
+}
+
+// The body the wrapper handed to gh, or null when it passed the caller's own
+// argv through untouched.
+function markedBody(proc) {
+  const m = proc.stdout.match(/^BODY<<\n([\s\S]*?)\n>>BODY$/m);
+  return m ? m[1] : null;
+}
+
+const MARKER = "<!-- paperclip:agent-authored";
+
+test("an agent-authored pr comment is stamped with its seat and run (PEN-5983)", () => {
+  withTempDir((dir) => {
+    const proc = runMark(dir, ["pr", "comment", "5", "--body", "Looks good to me."]);
+    assert.equal(proc.status, 0, proc.stderr);
+    const body = markedBody(proc);
+    assert.ok(body, `expected a rewritten --body-file, got:\n${proc.stdout}`);
+    assert.match(body, /^Looks good to me\./);
+    assert.ok(body.includes(`${MARKER} seat=devops agent=${AGENT_ID} run=${RUN_ID} -->`), body);
+    assert.match(body, /agent \*\*author\*\* write, not a review by the Ally reviewer harness/);
+  });
+});
+
+test("the marker is appended, never prepended, so a review request keeps byte 0 (PEN-5983)", () => {
+  // `<!-- paperclip:review-request -->` is recognised only as the body's
+  // literal first byte. Anything ahead of it drops the review request with a
+  // server-side logger.warn and nothing at the call site — i.e. prepending
+  // would disable review requests fleet-wide and look like it was working.
+  withTempDir((dir) => {
+    const requested = "<!-- paperclip:review-request -->\n@ally please check the retry path\n";
+    const proc = runMark(dir, ["pr", "comment", "5", "--body", requested]);
+    const body = markedBody(proc);
+    assert.ok(body, proc.stdout);
+    assert.ok(
+      body.startsWith("<!-- paperclip:review-request -->"),
+      `review-request marker must stay at byte 0, body began: ${JSON.stringify(body.slice(0, 60))}`,
+    );
+    assert.ok(body.includes(MARKER), body);
+  });
+});
+
+test("the trailer does not match the wrapper's own REVIEWER_EVIDENCE_RE (PEN-5983)", () => {
+  // Read the regex out of the script rather than restating it: a test that
+  // carries its own copy stops tracking the guard the moment either is edited,
+  // and the failure that matters here is an armed seat refusing every comment
+  // this had just stamped.
+  const script = readFileSync(WRAPPER, "utf8");
+  const declared = script.match(/^REVIEWER_EVIDENCE_RE='([^']*)'$/m);
+  assert.ok(declared, "REVIEWER_EVIDENCE_RE is no longer a single-quoted one-liner");
+
+  withTempDir((dir) => {
+    const proc = runMark(dir, ["pr", "comment", "5", "--body", "plain author text"]);
+    const body = markedBody(proc);
+    assert.ok(body, proc.stdout);
+    const trailer = body.slice(body.indexOf(MARKER));
+
+    // Matched with the same tool and flags the wrapper uses, so this cannot
+    // diverge from the real check through a JS/POSIX regex dialect gap.
+    const trailerFile = path.join(dir, "trailer.md");
+    writeFileSync(trailerFile, trailer);
+    const grep = spawnSync("grep", ["-qiE", declared[1], trailerFile], { encoding: "utf8" });
+    assert.equal(grep.status, 1, `the trailer matches REVIEWER_EVIDENCE_RE and would be refused:\n${trailer}`);
+  });
+});
+
+test("an armed guard does not refuse a comment this wrapper has just stamped (PEN-5983)", () => {
+  // The composition, end to end: marking runs after the guard, so the refusal
+  // is decided on the author's own body — but a trailer that matched would
+  // still be wrong, and this is the assertion that would catch it in situ.
+  withTempDir((dir) => {
+    const proc = runMark(dir, ["pr", "comment", "5", "--body", "CI is green at this head."], {
+      extraEnv: { GH_WRAPPER_REFUSE_REVIEWER_EVIDENCE: "refuse-reviewer-evidence" },
+    });
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.ok(markedBody(proc)?.includes(MARKER), proc.stdout);
+  });
+});
+
+test("a body that already carries the marker is not stamped twice (PEN-5983)", () => {
+  // Re-invocation on an already-marked body — a retry, or a body round-tripped
+  // through a file — must not stack trailers.
+  withTempDir((dir) => {
+    const already = `Earlier text\n\n${MARKER} seat=devops agent=${AGENT_ID} run=older -->\n`;
+    const proc = runMark(dir, ["pr", "comment", "5", "--body", already]);
+    const body = markedBody(proc) ?? "";
+    assert.equal(body.split(MARKER).length - 1, 1, `expected exactly one marker, got:\n${body}`);
+    assert.ok(body.includes("run=older"), "the existing marker must be left alone");
+  });
+});
+
+test("the trailer's rule has a blank line above it, so it cannot underline the body as a heading (PEN-5983)", () => {
+  // `---` directly under a line of text is a setext H2 underlining that line,
+  // not a horizontal rule — so appending to a body with no trailing newline
+  // would silently reformat the author's last sentence into a heading.
+  withTempDir((dir) => {
+    const proc = runMark(dir, ["pr", "comment", "5", "--body", "no trailing newline"]);
+    const body = markedBody(proc) ?? "";
+    assert.ok(body.includes("\n\n---\n"), `the rule needs a blank line above it:\n${JSON.stringify(body)}`);
+    assert.doesNotMatch(body, /no trailing newline\n---/);
+  });
+});
+
+test("a body arriving on stdin is stamped (PEN-5983)", () => {
+  withTempDir((dir) =>
+    assert.ok(
+      markedBody(runMark(dir, ["pr", "comment", "5", "--body-file", "-"], { input: "from a pipe" }))?.includes(MARKER),
+    ),
+  );
+});
+
+test("a body arriving via --body-file is stamped (PEN-5983)", () => {
+  withTempDir((dir) => {
+    const bodyPath = path.join(dir, "body.md");
+    writeFileSync(bodyPath, "file-sourced body\n");
+    const body = markedBody(runMark(dir, ["pr", "comment", "5", "--body-file", bodyPath]));
+    assert.ok(body?.startsWith("file-sourced body"), body);
+    assert.ok(body?.includes(MARKER), body);
+  });
+});
+
+test("a review body is stamped on the review surface too (PEN-5983)", () => {
+  withTempDir((dir) =>
+    assert.ok(
+      markedBody(runMark(dir, ["pr", "review", "5", "--comment", "--body", "author note"]))?.includes(MARKER),
+    ),
+  );
+});
+
+test("`--body -` posts the literal dash and does not read stdin (PEN-5983, PEN-5906)", () => {
+  // In `pr` mode a bare `-` is stdin only as the value of `--body-file`.
+  // `--body -` is the one-character body `-`, and reading stdin on the token
+  // alone is what hung the guard in PEN-5906 — a hang, not a wrong answer,
+  // which is worse because nothing reports it.
+  withTempDir((dir) => {
+    const proc = runMark(dir, ["pr", "comment", "5", "--body", "-"], { input: "MUST NOT BE READ" });
+    assert.equal(proc.status, 0, proc.stderr);
+    const body = markedBody(proc) ?? "";
+    assert.match(body, /^-\n/);
+    assert.doesNotMatch(body, /MUST NOT BE READ/);
+  });
+});
+
+test("gh api -f body= on a comment endpoint is stamped, and sibling fields survive (PEN-5983)", () => {
+  withTempDir((dir) => {
+    const proc = runMark(dir, [
+      "api", "-X", "POST", "repos/o/r/pulls/5/reviews",
+      "-f", "body=author note", "-f", "event=COMMENT",
+    ]);
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.match(proc.stdout, new RegExp(MARKER.replace(/[-[\]{}()*+?.,\\^$|#]/g, "\\$&")));
+    assert.match(proc.stdout, /event=COMMENT/);
+  });
+});
+
+// The scope decision, pinned. Each of these is left UNMARKED on purpose, which
+// is why the absence of a marker proves nothing — see the block comment in the
+// wrapper. A test that "fixed" one of these would be widening the scope, not
+// repairing a bug.
+for (const [label, args] of [
+  ["a JSON --input payload", ["api", "-X", "POST", "repos/o/r/issues/5/comments", "--input", "PAYLOAD"]],
+  ["a body=@file field value", ["api", "repos/o/r/issues/5/comments", "-F", "body=@PAYLOAD"]],
+  ["an endpoint that is not a comment or review", ["api", "-X", "POST", "repos/o/r/releases", "-f", "body=notes"]],
+]) {
+  test(`${label} is deliberately left unmarked (PEN-5983)`, () => {
+    withTempDir((dir) => {
+      const payload = path.join(dir, "payload.json");
+      writeFileSync(payload, JSON.stringify({ body: "hi" }));
+      const proc = runMark(dir, args.map((a) => (a.endsWith("PAYLOAD") ? a.replace("PAYLOAD", payload) : a)));
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.doesNotMatch(proc.stdout, /paperclip:agent-authored/);
+    });
+  });
+}
+
+test("the reviewer's own harness is never marked (PEN-5983)", () => {
+  // Ally runs in this same image, so without its exemption the wrapper would
+  // stamp a consolidated review with a trailer saying it is an author write —
+  // a false statement on the one surface this programme exists to keep
+  // trustworthy. This is why arming is ordered behind the exemption.
+  withTempDir((dir) => {
+    const proc = runMark(dir, ["pr", "review", "5", "--comment", "--body", "## Ally — Consolidated PR Review\n"], {
+      extraEnv: { GH_WRAPPER_ALLOW_REVIEWER_EVIDENCE: "i-am-the-reviewer" },
+    });
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.doesNotMatch(proc.stdout, /paperclip:agent-authored/);
+  });
+});
+
+test("nothing is marked outside an agent run (PEN-5983)", () => {
+  // No PAPERCLIP_AGENT_ID means there is no seat to name, so there is nothing
+  // honest to stamp — a human running gh in this image is untouched.
+  withTempDir((dir) => {
+    const proc = runMark(dir, ["pr", "comment", "5", "--body", "hi"], { agentId: "" });
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.doesNotMatch(proc.stdout, /paperclip:agent-authored/);
+  });
+});
+
+test("marking is DISARMED by default — merging this changes nothing for the fleet (PEN-5983)", () => {
+  // The one that says what shipping this does. Arming is an ordered config
+  // change (reviewer exemption first), revertible without a release.
+  withTempDir((dir) => {
+    const proc = runMark(dir, ["pr", "comment", "5", "--body", "hi"], { armed: false });
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.doesNotMatch(proc.stdout, /paperclip:agent-authored/);
+    assert.match(proc.stdout, /ARGS=pr comment 5 --body hi/);
+  });
+});
+
+test("a bodiless write is left alone rather than given a body (PEN-5983)", () => {
+  withTempDir((dir) => {
+    const proc = runMark(dir, ["pr", "review", "5", "--request-changes"]);
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.match(proc.stdout, /ARGS=pr review 5 --request-changes/);
+    assert.doesNotMatch(proc.stdout, /paperclip:agent-authored/);
+  });
+});
