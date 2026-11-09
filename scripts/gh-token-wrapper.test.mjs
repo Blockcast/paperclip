@@ -2279,7 +2279,7 @@ test("the covered verdict scopes its claim to servers actually behind the proxy 
         assert.match(proc.stdout, /not that YOUR server is behind it/);
         assert.match(proc.stdout, /already bound/);
         // The overstatement itself must not come back.
-        assert.doesNotMatch(proc.stdout, /the MCP server reaches GitHub through the loopback token proxy/);
+        assert.doesNotMatch(proc.stdout, /the MCP server reaches GitHub through the loopback token proxy/i);
         // Nor the narrower one: a null handle leaves `process.env` untouched,
         // so on a pod that already sets GITHUB_HOST the loser HAS one -- just
         // not the proxy's (PEN-5950).
@@ -3620,4 +3620,100 @@ test("a bodiless write is left alone rather than given a body (PEN-5983)", () =>
     assert.match(proc.stdout, /ARGS=pr review 5 --request-changes/);
     assert.doesNotMatch(proc.stdout, /paperclip:agent-authored/);
   });
+});
+
+// --- PEN-6329: two argv-shape residuals, both reachable only once armed ------
+
+test("a pr body flag in LAST position is handed back untouched (PEN-6329)", () => {
+  // The rebuild loop pops the head of "$@" and pushes processed arguments onto
+  // the TAIL of the same "$@", so once i == n the originals are exhausted and
+  // "$1" is the first REBUILT element. Unguarded, the separate-value branch
+  // consumed it: `pr comment 5 --body` posted the body `pr` and handed gh
+  // `comment 5 --body-file <tmp>`, so gh answered `unknown command "comment"`
+  // instead of `flag needs an argument`. The input is malformed either way and
+  // nothing is posted — what regressed is gh's own diagnosis of it.
+  //
+  // Passing argv through VERBATIM is what makes the real gh produce that
+  // diagnosis, so argv equality is the assertion: no rewrite, no --body-file,
+  // no marker, and the flag still where the caller typed it.
+  withTempDir((dir) => {
+    const proc = runMark(dir, ["pr", "comment", "5", "--body"]);
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.match(proc.stdout, /ARGS=pr comment 5 --body\n/);
+    assert.doesNotMatch(proc.stdout, /--body-file/);
+    assert.doesNotMatch(proc.stdout, /paperclip:agent-authored/);
+  });
+});
+
+test("a trailing api field flag does not eat the subcommand (PEN-6329)", () => {
+  // The same residual on the `api` surface, and the worse half of it. Here a
+  // real `body=` field IS present, so the rebuild runs and its output is the
+  // argv gh receives — the trailing `-f` then consumed the already-rebuilt
+  // `api` and re-pushed it, yielding `-X POST … -f <body> -f api`: the
+  // subcommand relocated to the end as a spurious field value.
+  //
+  // A bare `api … -f` with no other body would NOT catch this: nothing is
+  // rewritten, so ap_changed stays `no`, the caller execs its own untouched
+  // argv and defective and fixed builds are byte-identical. That case was
+  // tried here first and discriminated nothing.
+  withTempDir((dir) => {
+    const proc = runMark(dir, [
+      "api", "-X", "POST", "repos/o/r/issues/5/comments", "-f", "body=hi", "-f",
+    ]);
+    assert.equal(proc.status, 0, proc.stderr);
+    assert.match(proc.stdout, /^ARGS=api -X POST repos\/o\/r\/issues\/5\/comments -f body=hi/m);
+    // The flag stays in last position for gh to reject; it must not come back
+    // carrying a value it invented.
+    assert.match(proc.stdout, / -f$/m);
+    assert.doesNotMatch(proc.stdout, / -f api$/m);
+  });
+});
+
+test("a comment endpoint carrying a query string is still marked (PEN-6329)", () => {
+  // `case` takes the FIRST matching pattern, and the `*=*` field skip was listed
+  // ahead of the endpoint alternatives — so any token containing an `=` was
+  // skipped before they were ever tried, and a real query string almost always
+  // contains one. The discriminator is the `=`'s POSITION: in a field it
+  // precedes any `/`, in an endpoint the path precedes the first `=`.
+  for (const endpoint of [
+    "repos/o/r/issues/5/comments?x=1",
+    "repos/o/r/pulls/5/reviews?per_page=1",
+    "repos/o/r/pulls/5/comments?page=2",
+    // Reachable only via a query string carrying no `=` at all. Ally's review
+    // called the `\?*` alternatives dead; they are SHADOWED, not dead, which is
+    // why the fix reorders the test rather than deleting them.
+    "repos/o/r/issues/5/comments?draft",
+  ]) {
+    withTempDir((dir) => {
+      const proc = runMark(dir, ["api", "-X", "POST", endpoint, "-f", "body=author note", "-f", "event=COMMENT"]);
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.ok(proc.stdout.includes(MARKER), `${endpoint} went unmarked:\n${proc.stdout}`);
+      assert.match(proc.stdout, /event=COMMENT/);
+    });
+  }
+});
+
+test("a non-comment endpoint stays unmarked, query string or not (PEN-6329)", () => {
+  // The negative control for the reordering above: widening the match to reach
+  // query strings must not widen it to reach endpoints that were never in scope.
+  for (const endpoint of ["repos/o/r/releases", "repos/o/r/releases?x=1"]) {
+    withTempDir((dir) => {
+      const proc = runMark(dir, ["api", "-X", "POST", endpoint, "-f", "body=notes"]);
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.doesNotMatch(proc.stdout, /paperclip:agent-authored/);
+    });
+  }
+});
+
+test("a path-shaped string inside a body cannot select the endpoint (PEN-6329)", () => {
+  // What the `*=*` skip is actually FOR. Reordering it must not cost this: the
+  // endpoint is chosen by the positional path, never by something the author
+  // happened to write in the body.
+  for (const field of ["body=see repos/o/r/issues/1/comments", "body=repos/o/r/pulls/5/reviews"]) {
+    withTempDir((dir) => {
+      const proc = runMark(dir, ["api", "-X", "POST", "repos/o/r/releases", "-f", field]);
+      assert.equal(proc.status, 0, proc.stderr);
+      assert.doesNotMatch(proc.stdout, /paperclip:agent-authored/);
+    });
+  }
 });
