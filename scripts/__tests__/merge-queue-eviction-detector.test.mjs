@@ -387,6 +387,19 @@ test("extractPaperclipIdentifiers returns empty for a branch/title/body with no 
   assert.deepEqual(extractPaperclipIdentifiers("chore/tidy-up", "Tidy up", null), []);
 });
 
+test("PEN-6137: a CVE id yields no identifier, and does not mask a real ref beside it", () => {
+  assert.deepEqual(extractPaperclipIdentifiers("CVE-2026-59873 / BLO-1"), ["BLO-1"]);
+  assert.deepEqual(extractPaperclipIdentifiers("fixes CVE-2021-44228 now", null, null), []);
+});
+
+test("PEN-6137: the guard is case-insensitive, because this copy's pattern is /gi", () => {
+  assert.deepEqual(extractPaperclipIdentifiers("fix/cve-2026-59873-upgrade-tar"), []);
+});
+
+test("PEN-6137: a bare CVE-prefixed ref with no sequence number still extracts", () => {
+  assert.deepEqual(extractPaperclipIdentifiers("CVE-2026"), ["CVE-2026"]);
+});
+
 // --- producer/consumer marker coupling (Ally review #1220, 5th pass) ---
 //
 // The detector PRODUCES the eviction comment and the webhook CONSUMES it via
