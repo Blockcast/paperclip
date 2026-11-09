@@ -3877,6 +3877,61 @@ export const GITHUB_API_REQUESTS_METRIC = "paperclip_github_api_requests_total";
 export const GITHUB_API_REQUESTS_BY_ROUTE_METRIC = "paperclip_github_api_requests_by_route_total";
 
 /**
+ * GitHub calls this process REFUSED LOCALLY without sending them, because a
+ * hold from BLO-53662 was in force for that credential and budget (PEN-6243).
+ *
+ * Deliberately a SEPARATE metric rather than a child of
+ * {@link GITHUB_API_REFUSALS_METRIC}, and the separation is the whole point.
+ * A held call costs GitHub nothing and draws nothing: folding it in would
+ * re-inflate the refusal counter with calls that never left this process and
+ * destroy its use as a draw signal, which is the one question an org owner
+ * sizing the PEN-3852 split actually asks it.
+ *
+ * It is also NOT counted in {@link GITHUB_API_REQUESTS_METRIC}. That
+ * denominator means "calls this process attempted against GitHub"; a held call
+ * is by construction not one, and adding it would make the refusal RATE read
+ * lower during exactly the window the control plane is most blocked.
+ *
+ * What this counter is for: before it existed, the hold made its own work
+ * INVISIBLE. `paperclip_github_api_refusals_total` counts GitHub-observed
+ * refusals, so once the hold installs on the first 403 of a window, every
+ * subsequent blocked call in that window landed in no series at all — measured
+ * 2026-11-09 at ~138 refusals/24h against ~8.1k calls the hold's own commit
+ * message says it suppresses, two orders of magnitude apart. The hold is
+ * correct and worth keeping; what was wrong was that nothing could see it.
+ *
+ * Read it ALONGSIDE the refusal counter, never instead of it:
+ *   - refusals climbing  => GitHub is refusing us; the installation is drawn down.
+ *   - held climbing while refusals are flat => we are inside a known-exhausted
+ *     window and this process is correctly not re-firing into it. The height of
+ *     this counter is the volume of control-plane work that budget is blocking.
+ *
+ * Cardinality: both labels are closed. `resource` is the budget whose hold
+ * answered the call, normalised through
+ * {@link normalizeGithubApiRefusalResource} — the same closed set the refusal
+ * counter uses, so the two join on it. `route` is the same CLOSED template
+ * {@link GITHUB_API_REQUESTS_BY_ROUTE_METRIC} uses, so the blocked work can be
+ * attributed to an endpoint family; it carries no owner, repo, number or SHA.
+ */
+export const GITHUB_API_HELD_METRIC = "paperclip_github_api_held_total";
+
+/**
+ * The single child of {@link GITHUB_API_HELD_METRIC} materialised at zero from
+ * process start.
+ *
+ * Same reasoning as {@link ZERO_INIT_GITHUB_API_REFUSAL_RESOURCE}, and the same
+ * bounded cost. "Was anything held?" is a question whose healthy answer is
+ * zero, and prom-client publishes no child until a first `inc()` — so without
+ * this, an absent series means both "nothing was held" and "this build has no
+ * such instrument", and no alert can tell them apart. Materialising the full
+ * resource x route product would publish ~200 constant-zero series to buy
+ * nothing. The cost: a query pinned to any OTHER pair is absent rather than
+ * zero until the first hold of that shape, so sum across labels for any
+ * expression that must distinguish "none" from "no instrument".
+ */
+export const ZERO_INIT_GITHUB_API_HELD_LABELS = { resource: "core", route: "other" } as const;
+
+/**
  * Why GitHub refused. Closed set — see {@link GITHUB_API_REFUSALS_METRIC}.
  *
  * Deliberately NOT a catch-all `other`: every 403/429 lands on exactly one of
@@ -5957,6 +6012,7 @@ let githubReviewCompletion: Counter<"status"> | null = null;
 let githubApiRefusals: Counter<"reason" | "resource"> | null = null;
 let githubApiRequests: Counter | null = null;
 let githubApiRequestsByRoute: Counter<"route"> | null = null;
+let githubApiHeld: Counter<"resource" | "route"> | null = null;
 let agentWakeupTerminalFailedUnresolved: Gauge<"error_code" | "scope"> | null = null;
 let agentWakeupTerminalFailedOldestAge: Gauge<"scope"> | null = null;
 let githubWorkflowRunConclusion: Counter<"conclusion" | "supersession"> | null = null;
@@ -6165,6 +6221,7 @@ function ensureRegistry(): {
   githubApiRefusalsCounter: Counter<"reason" | "resource">;
   githubApiRequestsCounter: Counter;
   githubApiRequestsByRouteCounter: Counter<"route">;
+  githubApiHeldCounter: Counter<"resource" | "route">;
   agentWakeupTerminalFailedUnresolvedGauge: Gauge<"error_code" | "scope">;
   agentWakeupTerminalFailedOldestAgeGauge: Gauge<"scope">;
   githubWorkflowRunConclusionCounter: Counter<"conclusion" | "supersession">;
@@ -6362,6 +6419,7 @@ function ensureRegistry(): {
     || !githubApiRefusals
     || !githubApiRequests
     || !githubApiRequestsByRoute
+    || !githubApiHeld
     || !agentWakeupTerminalFailedUnresolved
     || !agentWakeupTerminalFailedOldestAge
     || !githubWorkflowRunConclusion
@@ -8182,6 +8240,37 @@ function ensureRegistry(): {
       labelNames: ["route"],
       registers: [registry],
     });
+    githubApiHeld = new Counter({
+      name: GITHUB_API_HELD_METRIC,
+      help:
+        "Count of GitHub API calls this process refused LOCALLY, without sending them, while a "
+        + "BLO-53662 rate-limit hold was in force for that credential and budget (PEN-6243). "
+        + "Deliberately NOT folded into "
+        + GITHUB_API_REFUSALS_METRIC
+        + " (which would re-inflate it with calls that cost GitHub nothing and destroy its use "
+        + "as a draw signal) and NOT counted in "
+        + GITHUB_API_REQUESTS_METRIC
+        + " (a held call is not an attempt against GitHub). Read the two together: refusals "
+        + "climbing means GitHub is refusing us; THIS climbing while refusals are flat means we "
+        + "are inside a known-exhausted window and are correctly not re-firing into it, and its "
+        + "height is the volume of control-plane work that budget is blocking. Before this "
+        + "counter existed the hold installed on the first 403 of a window and every blocked "
+        + "call after it landed in no series at all. resource is the budget whose hold answered "
+        + "the call, on the same closed set "
+        + GITHUB_API_REFUSALS_METRIC
+        + " uses, so the two join on it; route is the same closed template "
+        + GITHUB_API_REQUESTS_BY_ROUTE_METRIC
+        + " uses and carries no owner, repo, number or SHA. Only "
+        + "{resource='core', route='other'} is zero-initialised, so sum across labels when the "
+        + "question is 'was anything held'.",
+      labelNames: ["resource", "route"],
+      registers: [registry],
+    });
+    // Zero-initialise exactly one child, for the reason the refusal counter
+    // does: an absent series reads identically as "nothing was held" and "this
+    // build has no such instrument", and the first of those is a claim an
+    // operator will want to make. 1 constant-zero series.
+    githubApiHeld.inc({ ...ZERO_INIT_GITHUB_API_HELD_LABELS }, 0);
     agentWakeupTerminalFailedUnresolved = new Gauge({
       name: AGENT_WAKEUP_TERMINAL_FAILED_UNRESOLVED_METRIC,
       help:
@@ -9485,6 +9574,7 @@ function ensureRegistry(): {
     githubApiRefusalsCounter: githubApiRefusals,
     githubApiRequestsCounter: githubApiRequests,
     githubApiRequestsByRouteCounter: githubApiRequestsByRoute,
+    githubApiHeldCounter: githubApiHeld,
     agentWakeupTerminalFailedUnresolvedGauge: agentWakeupTerminalFailedUnresolved,
     agentWakeupTerminalFailedOldestAgeGauge: agentWakeupTerminalFailedOldestAge,
     githubWorkflowRunConclusionCounter: githubWorkflowRunConclusion,
@@ -11647,6 +11737,27 @@ export function recordGithubApiRequest(route?: string): void {
   const reg = ensureRegistry();
   reg.githubApiRequestsCounter.inc();
   if (route) reg.githubApiRequestsByRouteCounter.inc({ route });
+}
+
+/**
+ * Record one GitHub call answered by a local rate-limit hold (PEN-6243).
+ *
+ * Called from the shared GitHub fetch wrapper INSTEAD OF
+ * {@link recordGithubApiRequest} — the two are mutually exclusive by
+ * construction, because a held call never leaves the process. See
+ * {@link GITHUB_API_HELD_METRIC} for why this is a separate series rather than
+ * a fourth `reason` on the refusal counter.
+ *
+ * `resource` is the budget recorded on the hold, which came from GitHub's own
+ * `x-ratelimit-resource` on the 403 that installed it, so it is normalised
+ * through the same closed set the refusal counter uses rather than trusted into
+ * the label.
+ */
+export function recordGithubApiHeld(resource: string | null, route: string): void {
+  ensureRegistry().githubApiHeldCounter.inc({
+    resource: normalizeGithubApiRefusalResource(resource),
+    route,
+  });
 }
 
 /**
