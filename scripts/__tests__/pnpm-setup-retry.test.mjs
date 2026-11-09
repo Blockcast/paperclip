@@ -14,6 +14,16 @@ const workflowDir = ".github/workflows";
 const actionPath = ".github/actions/setup-pnpm/action.yml";
 const wrapperRef = "./.github/actions/setup-pnpm";
 
+// `uses: <wrapperRef>` on a line of its own, or folded onto the step's own `- `
+// marker -- both are legal and the second form carries no `name:`, so matching
+// only the first would skip such a step SILENTLY, which is the fail-open
+// direction this file is about. The ref is escaped: unescaped, its `.`
+// characters are regex wildcards.
+const usesWrapper = new RegExp(
+  String.raw`^\s*(- )?uses: ${wrapperRef.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\s*$`,
+  "m",
+);
+
 // A job that sets up pnpm needs room for the wrapper's second attempt AND for
 // its own work. This floor used to be 10, derived from "two attempts at
 // (bootstrap + a 120s registry stall) plus up to 25s of jittered backoff, ~5
@@ -42,11 +52,14 @@ const wrapperRef = "./.github/actions/setup-pnpm";
 // bootstrap round-trip that every term in it is built on: `Setup pnpm` p100 in
 // `policy` is now 0.95m against the 4.3m above, a ~4.5x structural drop
 // (2026-09-21, 291 jobs, BLO-31690). The 10.8m retry path and the ~20m `policy`
-// projection derived from it describe a registry round-trip that no longer
-// happens, so do not carry either forward as a live figure -- and note the
-// residual they were recorded against is now closed the other way: with the
-// ordinary cost at 0.95m, `policy`'s pnpm step carries a 3m bound rather than
-// being left unbounded because no bound could clear a 10.8m path.
+// projection derived from it describe a registry round-trip that is no longer
+// the COMMON case -- but it is not gone, and it must not be carried forward as
+// though it were. PEN-6181: on 2026-11-08 a merge_group run landed on a runner
+// with no baked pnpm, took the self-installer path the 0.95m p100 was supposed
+// to have retired, and blew past a 3m step bound `policy` had been given on
+// exactly that reasoning. A baked-image percentile is a measurement of how
+// OFTEN the slow path is taken; it is not a measurement of how long it takes.
+// Size a budget against the path, not against the percentile.
 //
 // What 15 buys is unchanged, and is why the constant does not move: the
 // observed worst case -- a slow-but-successful setup plus the job's own work,
@@ -127,6 +140,36 @@ const splitJobs = (body) => {
     if (current) current.lines.push(line);
   }
   return jobs;
+};
+
+// Split a job's body into its steps. Indentation-relative rather than pinned to
+// a literal depth: the bug this guards (PEN-6181) was a budget hiding one indent
+// level below the one the floor check looked at, so a second hardcoded depth is
+// the last thing this file should grow. A step runs from its `- ` marker to the
+// next line indented no further than that marker.
+const splitSteps = (text) => {
+  const steps = [];
+  let current = null;
+  for (const line of text.split("\n")) {
+    if (/^\s*$/.test(line)) {
+      if (current) current.lines.push(line);
+      continue;
+    }
+    const indent = line.match(/^(\s*)/)[1].length;
+    const marker = line.match(/^(\s*)- /);
+    if (marker) {
+      current = { indent: marker[1].length, lines: [line] };
+      steps.push(current);
+      continue;
+    }
+    if (!current) continue;
+    if (indent <= current.indent) {
+      current = null;
+      continue;
+    }
+    current.lines.push(line);
+  }
+  return steps;
 };
 
 test("no workflow reaches for pnpm/action-setup outside the grandfathered v4 sites", async () => {
@@ -218,6 +261,61 @@ test("every job that sets up pnpm clears the measured setup floor", async () => 
             `is sized against the total rather than against any one leg. A budget under it ` +
             `leaves too little for the job's own work \u2014 the job dies at its cap as an ` +
             `unattributable \`cancelled\` (BLO-31690)`,
+        );
+      }
+    }
+  }
+});
+
+test("no setup-pnpm step caps itself below the floor its job clears", async () => {
+  // The floor above is enforced at JOB level -- `^ {4}timeout-minutes:`. A step
+  // attribute sits one indent deeper, so a job could clear 15m and then cap the
+  // wrapper step itself at a value the retry path cannot fit inside. That is not
+  // hypothetical: `policy` ran `timeout-minutes: 29` and `timeout-minutes: 3`
+  // simultaneously, and on 2026-11-08 a merge_group run landed on a runner with
+  // no baked pnpm, was killed at 2.95m mid-fetch, gave the backoff 89ms and
+  // logged the retry as `conclusion=skipped`. #3520 was evicted from the queue.
+  // Both surfaces read correct in isolation and this test was green throughout.
+  //
+  // The fail-open direction is what makes it worth a separate assertion: the
+  // wrapper exists to keep a second attempt reachable, and a short step cap
+  // removes the second attempt while every budget check in this file passes.
+  for (const { name, body } of await readWorkflows()) {
+    for (const job of splitJobs(stripComments(body))) {
+      for (const step of splitSteps(job.lines.join("\n"))) {
+        const text = step.lines.join("\n");
+        if (!usesWrapper.test(text)) continue;
+
+        const declared = text.match(/^\s*timeout-minutes: (.+)$/m);
+        // No step budget is the ordinary shape -- 27 of 28 wrapper steps carry
+        // none (2026-11-08) and the job budget governs them. It is NOT the
+        // remedy everywhere, so do not read this `continue` as recommending
+        // deletion: `policy` is held from the other side by BLO-31690
+        // (`policy-node-test-timeouts.test.mjs`), which requires its pnpm step
+        // to declare a bound strictly under the job cap so a wedged setup is an
+        // attributable step kill rather than an unattributable job-cap
+        // `cancelled`. Between the two guards that step has a window, not a
+        // choice: 15 <= x < 29.
+        if (!declared) continue;
+
+        const budget = Number(declared[1].trim());
+        assert.ok(
+          Number.isInteger(budget),
+          `${name} job "${job.name}" caps its setup-pnpm step at ` +
+            `timeout-minutes: ${declared[1].trim()}, which is not a literal number. ` +
+            `A step budget on this action has to be readable here to be held to the ` +
+            `${MIN_TIMEOUT_MINUTES_FOR_RETRY}m floor; express it as a literal or drop it ` +
+            `and let the job budget govern (PEN-6181)`,
+        );
+        assert.ok(
+          budget >= MIN_TIMEOUT_MINUTES_FOR_RETRY,
+          `${name} job "${job.name}" caps its setup-pnpm step at ` +
+            `timeout-minutes: ${budget}, below the ${MIN_TIMEOUT_MINUTES_FOR_RETRY}m floor. ` +
+            `The job budget clearing the floor does not help: the step dies first, the ` +
+            `wrapper's backoff and retry are skipped, and on a merge_group ref that ejects ` +
+            `the PR -- which is the exact outcome the wrapper exists to prevent. Drop the ` +
+            `step bound and let the job budget govern, or raise it to at least the floor ` +
+            `(PEN-6181, BLO-28813)`,
         );
       }
     }
