@@ -135,6 +135,35 @@ describe.sequential("GET /companies/:companyId/recovery-actions query params", (
     expect(mockRecoveryObservability.listActions).not.toHaveBeenCalled();
   });
 
+  it("points a repeated `status` at the comma form, and leaves other keys generic", async () => {
+    // PEN-6178. The MESSAGE is the deliverable here, not the 400 — the status code was
+    // already right. `status` is the one param the service splits on commas into an
+    // `inArray`, so a caller who reached for `?status=a&status=b` wants something this
+    // route supports and must be pointed at it. `kind` is matched with `eq`, so the
+    // same message there would offer a form that does not work; that arm is the control.
+    const app = await createApp();
+
+    const repeatedStatus = await request(app).get(
+      `/api/companies/${COMPANY_ID}/recovery-actions?status=resolved&status=cancelled`,
+    );
+    expect(repeatedStatus.status).toBe(400);
+    const statusMessage = String(
+      repeatedStatus.body.error ?? repeatedStatus.body.message ?? "",
+    );
+    expect(statusMessage).toContain("must be given at most once");
+    expect(statusMessage).toContain("status=resolved,cancelled");
+
+    const repeatedKind = await request(app).get(
+      `/api/companies/${COMPANY_ID}/recovery-actions?kind=a&kind=b`,
+    );
+    expect(repeatedKind.status).toBe(400);
+    const kindMessage = String(repeatedKind.body.error ?? repeatedKind.body.message ?? "");
+    expect(kindMessage).toContain("must be given at most once");
+    expect(kindMessage).not.toMatch(/comma|resolved,cancelled/);
+
+    expect(mockRecoveryObservability.listActions).not.toHaveBeenCalled();
+  });
+
   it("still accepts every supported key together", async () => {
     const app = await createApp();
     const ownerAgentId = randomUUID();

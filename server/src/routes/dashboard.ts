@@ -33,10 +33,14 @@ function parsePositiveNumber(
  * handler: `?sourceIssueId=<uuid>` returned 100 actions across 94 distinct source
  * issues, none of them the one requested, and nothing in the response said so.
  *
- * The breaking-change risk is bounded and was checked before shipping: the repo's
- * only callers are this route's own tests and the probe documented in
- * `services/recovery/workspace-validation-probe.ts`, both of which send supported
- * keys only. A caller that was relying on a dropped key was already getting the
+ * The breaking-change risk is bounded, and the check behind that is an AUDIT WITH A
+ * DATE rather than a standing claim about the repo — audited 2026-11-06 for PEN-5708
+ * and re-run 2026-11-09 for PEN-6178. On both dates the only in-repo callers of this
+ * route were its own tests (`__tests__/recovery-actions-route-query-params.test.ts`)
+ * and the probe documented in `services/recovery/workspace-validation-probe.ts`
+ * (`limit`/`offset`/`order` only), both sending supported keys. A caller added after
+ * that date makes the audit stale and nothing here re-checks it, so re-run it rather
+ * than cite it. A caller that was relying on a dropped key was already getting the
  * wrong rows, so failing it loudly is a strict improvement over failing it silently.
  */
 const RECOVERY_ACTION_QUERY_KEYS = new Set([
@@ -57,11 +61,27 @@ const RECOVERY_ACTION_QUERY_KEYS = new Set([
  * — i.e. into no filter at all, which is the same full-unfiltered-page failure as
  * an unknown key, reached by a different route. Rejecting is the only answer that
  * cannot be mistaken for a result.
+ *
+ * `remedy` exists because on ONE key the refusal is only half an answer. `status` is
+ * the sole param here that legitimately takes several values — the service splits it
+ * on commas into an `inArray` (`recovery-observability.ts`) — so a caller reaching
+ * for the repeated-key form wants something this route supports, and a message that
+ * names the constraint without the working form sends them away from it. Every other
+ * param is matched with `eq` and takes exactly one value, so there the generic
+ * message is the whole truth and a remedy would be a lie. Keep it opt-in per call
+ * site for that reason; do not promote it to a default.
  */
-function readSingleStringParam(value: unknown, name: string): string | undefined {
+function readSingleStringParam(
+  value: unknown,
+  name: string,
+  remedy?: string,
+): string | undefined {
   if (value === undefined) return undefined;
   if (typeof value !== "string") {
-    throw badRequest(`Query parameter ${name} must be given at most once`);
+    throw badRequest(
+      `Query parameter ${name} must be given at most once`
+      + (remedy === undefined ? "" : `; ${remedy}`),
+    );
   }
   return value;
 }
@@ -136,7 +156,13 @@ export function dashboardRoutes(db: Db) {
     // the sole audit surface could not be narrowed to the row being audited.
     const sourceIssueId = readUuidParam(req.query.sourceIssueId, "sourceIssueId");
     const kind = readSingleStringParam(req.query.kind, "kind");
-    const status = readSingleStringParam(req.query.status, "status");
+    // The one filter that takes several values, so its repeated-key refusal names the
+    // form that works instead of stopping at the constraint. See readSingleStringParam.
+    const status = readSingleStringParam(
+      req.query.status,
+      "status",
+      "use a comma-separated list for several values, e.g. status=resolved,cancelled",
+    );
     // Routed through the same single-value read as the filters. A repeated `limit`
     // is an array, and `parsePositiveNumber` would quietly fall back to 100 — which
     // is a smaller lie than a dropped filter but still a page the caller did not ask
