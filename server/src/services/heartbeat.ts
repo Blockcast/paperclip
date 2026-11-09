@@ -13836,6 +13836,58 @@ const AUTHOR_REVIEW_CONTENT_WAKE_REASONS = new Set([
 // Pushing there is actively harmful when the PR exists precisely to have a
 // non-bot author (#953 did), since a bot commit destroys that independence.
 //
+/**
+ * PEN-6271: the row's monitor when and only when it is sitting `triggered`.
+ *
+ * Returns null in every other state -- including `scheduled` and `cleared` --
+ * because the directive it feeds is about an OUTSTANDING obligation, and a
+ * scheduled monitor carries none.
+ *
+ * Derived through `derivePersistedMonitorState`, the SAME function
+ * `tickExpiredIssueMonitors` uses, so the prompt and the sweep cannot disagree
+ * about whether an obligation exists. That is not interchangeable with reading
+ * `executionState.monitor` directly: the columns take PRECEDENCE there, so a row
+ * with `monitorNextCheckAt` set derives as `scheduled` whatever the JSON says,
+ * and `monitorLastTriggeredAt`/`monitorAttemptCount` can carry a `triggered`
+ * monitor whose `executionState.monitor` is absent. Reading the JSON alone would
+ * let the directive claim an obligation the sweep does not see, or stay silent
+ * about one it does -- which is exactly what this block must not do. The call
+ * site's select carries the `monitor*` columns for this reason; dropping them
+ * silently degrades this to the JSON-only reading.
+ *
+ * Deliberately tolerant of a missing row/state -- an un-derivable monitor yields
+ * null and the directive is simply not emitted. That is the fail-SILENT
+ * direction and it is the right one here: this block is guidance, and a wrongly
+ * emitted "your monitor has fired" on a row with no monitor is worse than an
+ * omission, because it would teach the fleet the gate means nothing.
+ *
+ * Exported for test: the gate is the whole point of the directive, and pinning it
+ * through `buildPaperclipTaskMarkdown` alone would only exercise a caller passing
+ * the value in by hand -- never the derivation that decides it.
+ */
+export function triggeredMonitorForPrompt(
+  issueContext:
+    | (Parameters<typeof derivePersistedMonitorState>[0]["issue"] & {
+      executionState?: unknown;
+      executionPolicy?: unknown;
+    })
+    | null,
+) {
+  if (!issueContext) return null;
+  const monitor = derivePersistedMonitorState({
+    issue: issueContext,
+    state: parseIssueExecutionState(issueContext.executionState ?? null),
+    policy: normalizeIssueExecutionPolicy(issueContext.executionPolicy ?? null),
+  });
+  if (!monitor || monitor.status !== "triggered") return null;
+  return {
+    lastTriggeredAt: monitor.lastTriggeredAt ?? null,
+    attemptCount: typeof monitor.attemptCount === "number" ? monitor.attemptCount : null,
+    maxAttempts: typeof monitor.maxAttempts === "number" ? monitor.maxAttempts : null,
+    serviceName: monitor.serviceName ?? null,
+  };
+}
+
 // Every agent authors through the same GitHub App installation, so we cannot
 // tell WHICH agent wrote a bot-authored PR -- but we can tell for certain when
 // NO agent did. A PR authored by anyone other than the configured bot identity
@@ -13850,35 +13902,6 @@ const AUTHOR_REVIEW_CONTENT_WAKE_REASONS = new Set([
 // Returns the author's login rather than a boolean so it stays narrowed for the
 // directive text, which names the real author so the agent can see at a glance
 // why the PR is not theirs.
-/**
- * PEN-6271: the row's monitor when and only when it is sitting `triggered`.
- *
- * Returns null in every other state -- including `scheduled` and `cleared` --
- * because the directive it feeds is about an OUTSTANDING obligation, and a
- * scheduled monitor carries none. Reads through `derivePersistedMonitorState`
- * rather than off the JSON directly so this agrees, by construction, with the
- * state `tickExpiredIssueMonitors` will later test: the prompt must not promise
- * an obligation the sweep does not see, nor stay silent about one it does.
- *
- * Deliberately tolerant of a missing row/state -- an un-derivable monitor yields
- * null and the directive is simply not emitted. That is the fail-SILENT
- * direction and it is the right one here: this block is guidance, and a wrongly
- * emitted "your monitor has fired" on a row with no monitor is worse than an
- * omission, because it would teach the fleet the gate means nothing.
- */
-function triggeredMonitorForPrompt(issueContext: { executionState?: unknown; executionPolicy?: unknown } | null) {
-  if (!issueContext) return null;
-  const state = parseIssueExecutionState(issueContext.executionState ?? null);
-  const monitor = state?.monitor ?? null;
-  if (!monitor || monitor.status !== "triggered") return null;
-  return {
-    lastTriggeredAt: monitor.lastTriggeredAt ?? null,
-    attemptCount: typeof monitor.attemptCount === "number" ? monitor.attemptCount : null,
-    maxAttempts: typeof monitor.maxAttempts === "number" ? monitor.maxAttempts : null,
-    serviceName: monitor.serviceName ?? null,
-  };
-}
-
 function resolveThirdPartyPrAuthor(prReview: { prAuthorLogin?: string | null }): string | null {
   const raw = prReview.prAuthorLogin;
   if (!raw) return null;
@@ -13995,9 +14018,14 @@ export function buildPaperclipTaskMarkdown(input: {
    * it is actionable and never as standing noise.
    *
    * Gated on a SERVER-COMPUTED condition rather than on self-diagnosis: the row
-   * either carries `executionState.monitor.status === "triggered"` or it does
-   * not. A directive keyed on the run noticing its own situation would miss
-   * precisely the runs that do not notice, which is the measured population.
+   * either derives as a `triggered` monitor or it does not. A directive keyed on
+   * the run noticing its own situation would miss precisely the runs that do not
+   * notice, which is the measured population.
+   *
+   * "Derives as" and not "carries `executionState.monitor.status === triggered`":
+   * see `triggeredMonitorForPrompt`. The persisted state is a function of the
+   * `monitor*` COLUMNS and the JSON together, with the columns winning, and only
+   * the derived reading matches what the sweep will test.
    *
    * The gate is satisfiable for the whole of the woken run, not just an instant
    * of it: `dispatchClaimedIssueMonitor` writes `triggered` at the fire and
@@ -16693,6 +16721,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
         executionWorkspaceSettings: issues.executionWorkspaceSettings,
+        // PEN-6271: `derivePersistedMonitorState` gives these columns PRECEDENCE over
+        // `executionState.monitor` -- `monitorNextCheckAt` set means `scheduled`
+        // whatever the JSON says. `triggeredMonitorForPrompt` calls that function so the
+        // wake prompt and `tickExpiredIssueMonitors` cannot disagree about whether a
+        // monitor obligation is outstanding, and without these columns it would silently
+        // decay to the JSON-only reading. Additive: every existing consumer ignores them.
+        monitorNextCheckAt: issues.monitorNextCheckAt,
+        monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
+        monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+        monitorAttemptCount: issues.monitorAttemptCount,
+        monitorNotes: issues.monitorNotes,
+        monitorScheduledBy: issues.monitorScheduledBy,
         parentId: issues.parentId,
         createdByUserId: issues.createdByUserId,
         responsibleUserId: issues.responsibleUserId,
@@ -17376,6 +17416,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
      * of the rows it was stamped on, on a permanent record, about a colleague's
      * run, to an audience with no way to check.
      *
+     * Worded as "a run by this issue's assignee", NOT "the run it woke", because
+     * that is exactly what the probe can establish: a `succeeded` run of the
+     * CURRENT assignee, on this issue, that finished after the fire. It cannot
+     * show the completed run is the one the trigger woke -- a run already in
+     * flight at the fire qualifies, and a run by a previous assignee does not.
+     * This whole change exists to make the sentence match what the code knows, so
+     * do not re-widen it to the more natural phrasing.
+     *
      * `undefined` means NOT PROBED, and it is the fail-safe default by
      * construction: it selects wording that states only what the sweep observed
      * -- the grace elapsed with no re-arm and no clear -- and accuses nobody.
@@ -17411,9 +17459,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // the sweep saw and nothing about why, because those are different
           // claims and only the first is one this code can make.
           ? (input.stallAttribution === "run_completed"
-            ? "it fired and the run it woke COMPLETED without re-arming or clearing it -- a missed hand-off, not a dead run"
+            ? "it fired and a run by this issue's assignee COMPLETED after it fired without re-arming or clearing it -- a missed hand-off, not a dead run"
             : input.stallAttribution === "no_completed_run"
-              ? "it fired and no run on this issue has completed since, so nothing came back for it"
+              ? "it fired and no run by this issue's assignee has completed since, so nothing came back for it"
               : "its trigger grace elapsed with no re-arm and no clear")
           : input.clearReason === "cancelled"
             ? `${formatIssueIdentifierLink(input.issue.identifier, "the issue")} was cancelled while a wake was still owed`
@@ -37312,10 +37360,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // status-only one is therefore announced as what it will actually execute as.
       recoveryRunWriteClassNotice: recoveryRunWriteClassNotice(context),
       // PEN-6271: supplied only while the monitor is `triggered`, so the directive
-      // fires exactly for the run the monitor woke. Derived from the same
-      // `issueContext.executionState` this function already reads, via the same
-      // `derivePersistedMonitorState` the scheduler uses, so the prompt cannot
-      // disagree with the state the sweep will test.
+      // fires exactly for the run the monitor woke. Derived through the same
+      // `derivePersistedMonitorState` the sweep uses, over the `monitor*` columns
+      // AND `executionState` that `getIssueExecutionContext` selects -- the columns
+      // take precedence there, so reading the JSON alone would be a different
+      // question with a different answer.
       triggeredMonitor: triggeredMonitorForPrompt(issueContext),
     });
     if (issueRef) {

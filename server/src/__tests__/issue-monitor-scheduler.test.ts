@@ -2655,7 +2655,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
 
     const body = await recoveryCommentBody(issueId);
-    expect(body).toContain("the run it woke COMPLETED without re-arming or clearing it");
+    expect(body).toContain("a run by this issue's assignee COMPLETED after it fired without re-arming or clearing it");
     expect(body).toContain("a missed hand-off, not a dead run");
     // The accusation this replaces must be gone, not merely supplemented.
     expect(body).not.toContain("never re-armed or cleared it");
@@ -2668,7 +2668,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
 
     const body = await recoveryCommentBody(issueId);
-    expect(body).toContain("no run on this issue has completed since, so nothing came back for it");
+    expect(body).toContain("no run by this issue's assignee has completed since, so nothing came back for it");
     expect(body).not.toContain("COMPLETED without re-arming");
   });
 
@@ -2690,7 +2690,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
 
     const body = await recoveryCommentBody(issueId);
-    expect(body).toContain("no run on this issue has completed since");
+    expect(body).toContain("no run by this issue's assignee has completed since");
     expect(body).not.toContain("COMPLETED without re-arming");
   });
 
@@ -2712,7 +2712,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await heartbeat.tickTimers(new Date(lastTriggeredAt.getTime() + ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS + 60 * 1000));
 
     const body = await recoveryCommentBody(issueId);
-    expect(body).toContain("no run on this issue has completed since");
+    expect(body).toContain("no run by this issue's assignee has completed since");
   });
 
   // Control for the false-positive half of BLO-29606: inside the grace window the
