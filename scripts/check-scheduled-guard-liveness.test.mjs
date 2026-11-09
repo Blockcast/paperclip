@@ -1703,6 +1703,16 @@ describe("WATCHED_GUARDS is checked against the repo, not against memory", () =>
         "landing-sweep.yml",
         "lockfile-drift-monitor.yml",
         "master-health.yml",
+        // PEN-6352. Detects open PR heads carrying NO `review` check-run, the
+        // residue a `startup_failure` of commitperclip-review.yml leaves: no
+        // job, no annotation, no check-run, so the verdict is ABSENT rather
+        // than red and every reader that enumerates the head sees a complete
+        // set. Watched rather than exempt for the same reason as
+        // git-egress-residual-trigger-check.yml above — its subject IS an
+        // absence, so a dark detector and a repo with nothing missing both
+        // render as an empty findings list, and only its liveness separates
+        // them.
+        "missing-review-sweep.yml",
         "production-environment-protection-guard.yml",
         "relay-ssl-multicert-guard.yml",
         "review-gate-consumer-protection-guard.yml",
