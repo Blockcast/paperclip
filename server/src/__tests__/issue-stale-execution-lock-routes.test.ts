@@ -2337,6 +2337,92 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
         });
       });
 
+      // Ally on #3607: the second must-fail input, and the one the first
+      // version of this fix got wrong. The four tests above vary the HOLDER and
+      // hold the actor live; this holds the holder at the exact shape they open
+      // the fence for and varies the ACTOR, so the actor's run status is the
+      // only discriminator between this 409 and their 201.
+      //
+      // It matters because a run the server has marked terminal keeps executing
+      // for ~10 more minutes (BLO-28441) and cannot discover that its writes are
+      // refused, and because the two early-returns past this fence let it decide
+      // another run's review stage. `failedRunId` is the shape BLO-28441
+      // describes; the holder is a successor that is merely queued behind it.
+      it("still fences a never-started holder when the actor's own run is already terminal", async () => {
+        const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+        const neverStartedOwnerRunId = await seedNeverStartedOwnerRun({
+          companyId,
+          agentId,
+          status: "queued",
+        });
+        const issueId = await seedPendingReviewIssueOwnedByRun({
+          companyId,
+          agentId,
+          ownerRunId: neverStartedOwnerRunId,
+          title: "Terminal actor must not be granted a reaped holder's lock",
+        });
+
+        const res = await request(createApp(agentActor(companyId, agentId, failedRunId)))
+          .put(`/api/issues/${issueId}/documents/plan`)
+          .send({ format: "markdown", body: "# Plan" });
+
+        expect(res.status, JSON.stringify(res.body)).toBe(409);
+        // The holder really is reaped — this is the opening case — and the
+        // refusal is attributable to the caller instead, which is what the
+        // remediation string needs to say.
+        expect(res.body.details).toMatchObject({
+          reason: "pending_review_stage_locked_by_another_run",
+          holderLiveness: "not_live",
+          actorRunStatus: "failed",
+        });
+      });
+
+      // The parity claim the gate above rests on, measured rather than
+      // asserted: the `in_progress` ladder refuses a terminal actor too
+      // (`adoptStaleCheckoutRun`'s `actorLive`, and
+      // `runningCheckoutExecutionPatch`, which grants only an exactly-`running`
+      // run). Same holder shape as the drift guard below, same actor, so the
+      // pair of tests brackets the actor axis at both entry points the way that
+      // one brackets the holder axis.
+      it("answers a terminal actor identically at the in_progress and in_review entry points", async () => {
+        const { companyId, agentId, failedRunId } = await seedCompanyAgentAndRuns();
+        const inProgressOwnerRunId = await seedNeverStartedOwnerRun({
+          companyId,
+          agentId,
+          status: "queued",
+        });
+        const inReviewOwnerRunId = await seedNeverStartedOwnerRun({
+          companyId,
+          agentId,
+          status: "queued",
+        });
+        const inProgressIssueId = await seedIssueOwnedByRun({
+          companyId,
+          agentId,
+          ownerRunId: inProgressOwnerRunId,
+          title: "in_progress entry point, terminal actor",
+        });
+        const inReviewIssueId = await seedPendingReviewIssueOwnedByRun({
+          companyId,
+          agentId,
+          ownerRunId: inReviewOwnerRunId,
+          title: "in_review entry point, terminal actor",
+        });
+
+        const actor = agentActor(companyId, agentId, failedRunId);
+        const inProgressRes = await request(createApp(actor))
+          .patch(`/api/issues/${inProgressIssueId}`)
+          .send({ status: "todo" });
+        const inReviewRes = await request(createApp(actor))
+          .put(`/api/issues/${inReviewIssueId}/documents/plan`)
+          .send({ format: "markdown", body: "# Plan" });
+
+        expect(
+          { in_progress: inProgressRes.status, in_review: inReviewRes.status },
+          JSON.stringify({ inProgress: inProgressRes.body, inReview: inReviewRes.body }),
+        ).toEqual({ in_progress: 409, in_review: 409 });
+      });
+
       // The drift guard proper: one never-started holder shape, both entry
       // points, one verdict. `assertCheckoutOwner` reaches
       // `isReapableHeartbeatRunRow` through adoptStaleExecutionLock;
