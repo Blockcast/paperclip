@@ -422,6 +422,87 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
     expect(merged.enablePerAgentWorkspaceVolume).toBe(true);
   });
 
+  // PEN-6247. The pod's KUBERNETES IDENTITY. `resolveServiceAccountName` takes
+  // this verbatim, and the adapter sets `automountServiceAccountToken` nowhere
+  // — so the pod inherits it from the ServiceAccount this key NAMES. The agent
+  // SAs set it `false`; sibling SAs in the same namespace do not set it at all
+  // (⇒ true) and one holds three ClusterRoleBindings. The containment is
+  // therefore a property of the value being overridden, and overriding it
+  // discards the containment in the same stroke.
+  //
+  // Unconditional, not broker-gated: it decides the identity on every run.
+  it("does not let an issue adapter override choose the pod's service account", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { serviceAccountName: "penstock-general-agent" },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { serviceAccountName: "paperclip-ci-deploy" },
+    });
+
+    expect(merged.serviceAccountName).toBe("penstock-general-agent");
+  });
+
+  // The other direction, and it is not symmetric decoration. Deleting the key
+  // does not fall back to the agent's SA — `resolveServiceAccountName` falls
+  // through to PAPERCLIP_DEFAULT_SERVICE_ACCOUNT_NAME, a DIFFERENT identity
+  // chosen by whatever that env var holds, so a bare delete is also a way to
+  // move the pod off its intended SA.
+  it("does not let an issue adapter override delete an agent-scoped service account", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { serviceAccountName: "penstock-general-agent" },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { serviceAccountName: undefined },
+    });
+
+    expect(merged.serviceAccountName).toBe("penstock-general-agent");
+  });
+
+  // Introducing it where agent scope has none is the same exploit on an agent
+  // that relies on the fleet default: the overlay would name an SA the agent
+  // never chose.
+  it("does not let an issue adapter override introduce a service account the agent never set", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { model: "primary" },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { serviceAccountName: "paperclip-ci-deploy" },
+    });
+
+    expect(merged).not.toHaveProperty("serviceAccountName");
+  });
+
+  // The pin is taken against the model-profile overlay too, which can be
+  // agent-provenanced — same reason the keys above are: the key resolves from
+  // the agent's primary config and nowhere else, so there is one place to audit.
+  it("does not let a model profile overlay change the pod's service account", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { serviceAccountName: "penstock-general-agent" },
+      modelProfile: {
+        ...noProfile,
+        applied: "cheap",
+        configSource: "agent_runtime",
+        adapterConfig: { serviceAccountName: "paperclip-ci-deploy" },
+      },
+      issueAdapterConfig: null,
+    });
+
+    expect(merged.serviceAccountName).toBe("penstock-general-agent");
+  });
+
+  // Must-pass arm. A gate that only ever refuses is not shown to work: agent
+  // scope is where a per-agent SA is legitimately configured, and this pin must
+  // not reach it.
+  it("still lets agent scope set the pod's service account", () => {
+    const merged = mergeModelProfileAdapterConfig({
+      baseConfig: { serviceAccountName: "penstock-general-agent", model: "primary" },
+      modelProfile: { ...noProfile },
+      issueAdapterConfig: { model: "issue-explicit" },
+    });
+
+    expect(merged).toEqual({
+      serviceAccountName: "penstock-general-agent",
+      model: "issue-explicit",
+    });
+  });
+
   // Scoped, not blanket. `assigneeAdapterOverrides.adapterConfig` is
   // load-bearing for model selection and workspace strategy, and this row is
   // not a refactor of that surface.
@@ -633,6 +714,14 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
   // holds no credential once brokered) and never the broker. See
   // job-manifest.github-publish-broker.test.ts "broker image provenance".
   // If that adapter-side pin is ever removed, `image` belongs in this set.
+  //
+  // ⚠ `serviceAccountName` IS here (PEN-6247) and the contrast with `image` is
+  // the point, not an inconsistency. `image` has a per-use pin available —
+  // the broker renders from `ctx.agent.adapterConfig`, so an override moves
+  // only the credential-less agent container. `serviceAccountName` has no such
+  // narrower site: it is ONE field on the pod spec, read verbatim, and it
+  // decides the identity the apiserver grants the whole pod. There is nothing
+  // smaller to pin it at, so it is pinned here.
   it("pins the agent-scope-only top-level key sets", () => {
     const probe = {
       enableGitHubPublishBroker: false,
@@ -646,12 +735,16 @@ describe("mergeModelProfileAdapterConfig agent-scope-only top-level config bound
       env: {},
     };
 
-    expect(agentScopeOnlyConfigKeyOverrides(probe, {})).toEqual(["enableGitHubPublishBroker"]);
+    expect(agentScopeOnlyConfigKeyOverrides(probe, {})).toEqual([
+      "enableGitHubPublishBroker",
+      "serviceAccountName",
+    ]);
     expect(agentScopeOnlyConfigKeyOverrides(probe, { enableGitHubPublishBroker: true })).toEqual([
       "enableGitHubPublishBroker",
       "enableDocker",
       "dockerImage",
       "workspaceVolumeClaim",
+      "serviceAccountName",
     ]);
   });
 });
