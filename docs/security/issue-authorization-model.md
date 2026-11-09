@@ -666,8 +666,9 @@ grantable mention there wakes nobody and comes back **absent** from
 `mentionsWithoutGrant`: an affirmative empty array on a comment that reached no one.
 
 The field's *name* is still correct. The grant **does** attach on a closed row, and the
-reason is stronger than "the predicate has no status term". `agentHasMentionGrantOnIssue`
-(`server/src/services/authorization.ts:1546`) re-derives the grant **at decision time**,
+reason is stronger than "the predicate has no status term". The declaration at
+`server/src/services/authorization.ts:1599`
+(`async function agentHasMentionGrantOnIssue`) re-derives the grant **at decision time**,
 by re-reading the persisted `issueComments` rows:
 
 ```js
