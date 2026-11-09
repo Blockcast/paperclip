@@ -3699,18 +3699,27 @@ export function recoveryService(
    * resubmit, the row returns to `pending` and a fresh board decision is owed again.
    * Bounding on `createdAt` alone would date that live wait from the original filing, so
    * a card filed on day 0 and resubmitted on day 20 reports no path and is seizable while
-   * a genuine decision is still coming. `updatedAt` is safe to read here precisely because
-   * this predicate is scoped to `pending`: of the eleven `update(approvals)` sites under
-   * `server/src` (excluding tests — `grep -rn 'update(approvals)' server/src
-   * --include='*.ts' | grep -v __tests__`, re-runnable rather than asserted), the only one
-   * that leaves a row `pending` while touching `updatedAt` is `resubmit`
-   * (`services/approvals.ts`) — `addComment` writes `approval_comments` only, the column
-   * has no `$onUpdate` and no trigger, and every other write either moves the row out of
-   * `pending` or leaves `updatedAt` alone. The nearest miss is `services/agents.ts`, which
-   * edits `payload` on rows scoped to `pending` and is harmless only because it does not
-   * set `updatedAt`. So on a `pending` row `updatedAt` carries exactly one signal, and it
-   * is the one this predicate wants. See `pendingBoardApprovalAttendanceGraceMs` for the
-   * measured decision-latency distribution behind the 14d default.
+   * a genuine decision is still coming.
+   *
+   * ⚠ `updatedAt` WAS safe to read here on the strength of a survey that has since gone
+   * stale (PEN-5818). That survey — `grep -rn 'update(approvals)' server/src
+   * --include='*.ts' | grep -v __tests__`, re-runnable rather than asserted — returned
+   * eleven sites, of which exactly one left a row `pending` while touching `updatedAt`:
+   * `resubmit` (`services/approvals.ts`). It now returns TWELVE and TWO qualify: the
+   * in-place payload correction (`updatePayload`, same file) sets `updatedAt` under a
+   * `status = 'pending'` guard. `addComment` still writes `approval_comments` only, the
+   * column still has no `$onUpdate` and no trigger, and `services/agents.ts` is still the
+   * nearest miss, harmless only because it does not set `updatedAt`.
+   *
+   * The consequence HERE is the over-exemption direction `config.ts` predicted: a card
+   * whose payload was corrected in place reports a live wake path for up to the full
+   * grace, so its issue stays unattended on the strength of a decision that may not be
+   * coming. That is the safer of the two directions and it is still wrong. The row's
+   * `payload_edited_at` discriminates an edit from a resubmission and this predicate does
+   * not consult it; tracked separately rather than changed here. See
+   * `pendingBoardApprovalAttendanceGraceMs` for the measured decision-latency
+   * distribution behind the 14d default, and re-run the survey rather than trusting the
+   * count in this paragraph.
    */
   async function hasPendingBoardApprovalWakePath(
     issue: typeof issues.$inferSelect,
