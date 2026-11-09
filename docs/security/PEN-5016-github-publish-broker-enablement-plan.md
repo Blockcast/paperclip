@@ -389,8 +389,31 @@ the Job annotation, because agent Jobs carry `ttlSecondsAfterFinished: 300` and 
 samples. Same reasoning applies here, so this uses the same query:
 
 ```
-{namespace="paperclip",container="paperclip"} |= "claude_k8s.data_mount_broad_rw"
+{namespace="paperclip",container="paperclip"} |= `"event":"claude_k8s.data_mount_broad_rw"`
 ```
+
+⛔ **Match the `"event":` JSON form, not the bare token.** (Backticks are a LogQL raw string;
+`|= "\"event\":\"claude_k8s.data_mount_broad_rw\""` is equivalent.) The emit site is
+`job-manifest.ts:4423` — `console.warn(JSON.stringify({level, event: "claude_k8s.data_mount_broad_rw", ...}))`
+— so the `"event":"..."` form is what identifies a render. The bare token additionally matches **prose
+that quotes it**: `paperclip-api` logs `reqBody` on a 4xx, so a comment POST that fails and happens to
+discuss this check becomes a hit in it.
+
+Measured over a 14-day window at 2026-11-09T04:4xZ: bare token **1**, `"event":` form **0** — and the
+single bare-token hit is a `POST /issues/.../comments 403` access-log line quoting a go/no-go comment,
+not a broad render. The same divergence was measured at 2026-11-08T19:3xZ, so it is not a one-off.
+
+⚠️ Direction is **false failure**, and it grows with how much the fleet writes about this check — a
+re-runner who sees a non-zero count cannot tell a render from a quotation without opening the line.
+⚠️ Loki intermittently answers this 14-day range with an empty reply rather than a result, and an
+empty reply is not a zero. Re-run until it returns, and pair the probe with a liveness control
+(§11.6 check 3) and an expressiveness control — a zero is only a reading when both fire.
+
+✅ The standing §7.2 detector `scripts/check-git-egress-residual-triggers.mjs` (run by
+`.github/workflows/git-egress-residual-trigger-check.yml`) already uses this **exact** string, and
+`check-git-egress-residual-triggers.test.mjs` asserts it — including a case requiring that prose
+merely naming the event must not match. This block aligns the manual procedure with the automated
+one; the automation was already correct and only this document was behind.
 
 **Result over 14 days to 2026-10-29T13:33Z:**
 
