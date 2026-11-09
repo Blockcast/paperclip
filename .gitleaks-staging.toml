@@ -4,14 +4,35 @@
 # `secret_scan` job. PEN-6280, under @Cto's PEN-6170 ruling arm (A).
 #
 # ===========================================================================
-# ⛔ THIS FILE GATES NOTHING. A WARNING IS NOT A GATE.
+# ⛔ NO FINDING IN THIS FILE GATES ANYTHING. A WARNING IS NOT A GATE.
 # ===========================================================================
 #
 # The step that reads this config carries `continue-on-error: true`, so a
-# finding here CANNOT fail the job, cannot fail the `verify` aggregate, and
-# cannot block a merge. Nothing in this file is a control. It is an
-# instrument, running to produce a measurement, with a decision attached to
-# the end of that measurement (see PROMOTION / WITHDRAWAL below).
+# FINDING here cannot fail the job, no FINDING here can fail the `verify`
+# aggregate, and no FINDING here can block a merge. Nothing in this file is
+# a control: it is an instrument, running to produce a measurement, with a
+# decision attached to the end of it (see PROMOTION / WITHDRAWAL below).
+#
+# ⚠️ NARROWED 2026-11-09 (PEN-6280) -- THE UNQUALIFIED FORM WAS FALSE ON ONE
+# PATH. It is re-quoted below one marked line at a time, so a `grep` arrival
+# meets the retraction and never the bare claim:
+#   WITHDRAWN 2026-11-09: "THIS FILE GATES NOTHING" (unqualified heading)
+#   WITHDRAWN 2026-11-09: "a finding here CANNOT fail the job" (unqualified)
+#
+# `continue-on-error` is a STEP property covering step-level failure. It does
+# NOT cover the JOB's `timeout-minutes` budget, against which this step's own
+# wall clock is charged. Measured first-party 2026-11-09 on pr.yml's
+# `secret_scan`: the CAPPED steps sum to 28 minutes (5 + 3 + 10 + 10) against
+# a job budget of 20, and TWO steps -- `Checkout repository` and `Explain how
+# this lane ended` -- carry NO cap at all. A job over its budget ends
+# `conclusion: cancelled`, and that DOES reach `needs.secret_scan.result` ->
+# SECRET_SCAN_RESULT -> `verify`, failing it closed.
+#
+# ⇒ the bounded, honest claim: no FINDING here can block a merge; this step's
+# RUNTIME can, by helping the job exceed its budget. ⛔ Do NOT "fix" that by
+# sizing the step caps to sum under 20 -- two uncapped steps mean the
+# arithmetic cannot bound the job's wall clock, so it would read sound while
+# leaving the path open.
 #
 # That is MEASURED, not assumed. First-party 2026-11-09 on this repo's own
 # `review` job, n=3 (PRs #3589, #3590, #3547): `Run quality gates` carries
@@ -92,6 +113,18 @@
 #   lowercase-alnum L=32                                        11.5 %
 #   hex at any length up to 64                                   0 %
 #   anything shorter than 32 characters           out of scope by construction
+#   anything longer than 120 characters           out of scope by construction
+#
+# ⚠️ THE UPPER BOUND IS REAL AND IT SKEWS THE WRONG WAY. The rule's regex is
+# bounded `{32,120}` and requires a non-token boundary on BOTH sides, so every
+# character of a token run must be inside the match: a run LONGER than 120
+# cannot match at any offset. Measured first-party 2026-11-09 against the
+# pinned gitleaks 8.28.0 itself (not a regex-engine proxy), this exact file:
+# HIT at 32 / 40 / 43 / 119 / 120, NO HIT at 31 / 121 / 122 / 150 / 200.
+# A 128-byte key base64s to 172 characters, so the shapes this misses are
+# LARGER than the ones it catches, and larger is not less likely to be real.
+# `scripts/gitleaks-staging-rule-bounds.test.mjs` pins the bound AND pins that
+# this header keeps stating it, so the two cannot drift apart.
 #
 # A 64-char hex secret has Shannon entropy ~3.8 -- BELOW this repo's own
 # metric names at <=4.403. No entropy threshold separates them at any
@@ -114,6 +147,25 @@
 # entropy lane under (A). This is accepted as RESIDUAL RISK, not as a covered
 # population. It is not time-limited, and no row's closure revises it --
 # revision requires a new recorded decision.
+#
+# ⛔ AMENDED 2026-11-09 (PEN-6280): THAT ENUMERATION IS NOT CLOSED, AND READING
+# IT AS CLOSED OVERSTATES COVERAGE IN THE PERMISSIVE DIRECTION. The ruled text
+# defines clause (3) by ENTROPY alone, so a value failing clause (3) -- opaque,
+# ABOVE 4.45 -- reads as "covered ... by the entropy lane under (A)". The
+# entropy lane is additionally bounded by LENGTH, and the ruled text could not
+# say so because it was written before this file existed.
+#
+# ⇒ the entropy lane under (A) reaches a value failing clause (3) ONLY WHEN
+# that value is between 32 and 120 characters. A value that is (1) under an
+# unremarkable identifier, (2) carrying no vendor prefix, and (3) opaque at
+# high entropy but LONGER THAN 120 CHARACTERS is reached by NONE of the three
+# named controls. That population is narrower than "all long tokens" -- clause
+# (2) routes JWTs, PEM bodies and credentialed URIs elsewhere -- but it is
+# real, and it is the same defect class as "the coverable half", bounded by
+# LENGTH here instead of by entropy.
+#
+# This amendment states the gap; it does NOT revise what is accepted. Whether
+# to cover it is a new recorded decision, not this row's closure.
 #
 # ⚠️ ONE PRECISION THE RULED TEXT CANNOT CARRY, because it was written before
 # this file existed: while this step is WARN-ONLY, "or by the entropy lane
