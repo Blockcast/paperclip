@@ -3871,6 +3871,27 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("a check you ran on text you did not transmit verifies nothing");
   });
 
+  // Two gaps found independently at the same head: by me, while trying to OBEY this clause
+  // on its own row, and by Ally's review of 58f5d4da (suggestions 1 and 2). Both are about
+  // what happens AFTER the digest, which the first revision left unsaid.
+  //
+  // (1) "Send the body from the file you composed it in" is sound for a `curl --data @file`
+  //     caller and UNPERFORMABLE for one whose only write path is `paperclipUpdateIssue`,
+  //     which takes an inline string. A clause prescribing a step the reader's platform
+  //     cannot execute gets skipped whole, so it has to name the inline case and say what
+  //     to hash there -- the string actually passed, since transcription is what is on test.
+  // (2) A mismatch has two causes with OPPOSITE remedies: your transcription was wrong, or
+  //     a sibling legitimately prepended after your read. The natural reaction -- re-PATCH
+  //     your body to "fix" it -- is precisely the last-writer-wins loss this clause forbids.
+  it("names the inline-string write path, and says what a digest mismatch does and does not license", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("hash the exact string you are about to pass");
+    expect(markdown).toContain("the transcription is the step being checked");
+    expect(markdown).toContain("A digest mismatch afterwards is NOT by itself a loss");
+    expect(markdown).toContain("restore only what is actually gone");
+  });
+
   // The announcement is NOT subject to the same caution, and saying so is the point. The
   // author of the Surface clause skipped a comment on PEN-5793 on concurrency grounds and
   // later corrected it: an append cannot overwrite anything, so the skip was pure loss.
