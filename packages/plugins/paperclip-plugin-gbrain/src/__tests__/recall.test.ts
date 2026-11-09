@@ -113,6 +113,62 @@ describe("prefetchRunContext", () => {
     });
   });
 
+  it("keeps a hub whose own links array exceeds the byte cap (real gbrain shape)", async () => {
+    // BLO-21635: agent-uxdesigner's hub node carries 1,831 links (139 KB), so
+    // the byte cap used to drop the hub and return zero enrichment nodes.
+    const facts = Array.from({ length: 3000 }, (_, i) => `fact-${String(i).padStart(36, "0")}`);
+    const hubNodes = [
+      { slug: "agent-ux", title: "UX", type: "agent", depth: 0, links: facts.map((to_slug) => ({ to_slug, link_type: "authored_by" })) },
+      ...facts.map((slug) => ({ slug, title: slug, type: "fact", depth: 1, links: [] })),
+    ];
+    expect(Buffer.byteLength(JSON.stringify(hubNodes[0]))).toBeGreaterThan(MAX_ENRICHMENT_SERIALIZED_BYTES);
+    const client = {
+      call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
+        if (args.slug === "issue-blo-1") return [{ slug: "issue-blo-1", depth: 0, links: [] }];
+        if (args.slug === "agent-ux") return hubNodes;
+        return null;
+      }),
+    };
+
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      agentName: "UX",
+      depth: 2,
+    });
+
+    const graph = out.graph as Array<{ slug: string; links: Array<{ to_slug: string }> }>;
+    expect(graph.length).toBe(MAX_ENRICHMENT_NODES + 1);
+    const hub = graph.find((n) => n.slug === "agent-ux");
+    expect(hub).toBeDefined();
+    const kept = new Set(graph.map((n) => n.slug));
+    expect(hub!.links.length).toBe(MAX_ENRICHMENT_NODES - 1);
+    for (const link of hub!.links) expect(kept.has(link.to_slug)).toBe(true);
+    expect(out.reason).toMatch(/enriched with agent graph agent-ux/);
+  });
+
+  it("does not claim enrichment when the capped fallback contributes nothing", async () => {
+    const huge = { slug: "agent-ux", depth: 0, title: "x".repeat(MAX_ENRICHMENT_SERIALIZED_BYTES + 1) };
+    const hubNodes = [huge, { slug: "fact-1", depth: 1 }];
+    const client = {
+      call: vi.fn(async (_tool: string, args: Record<string, unknown>) => {
+        if (args.slug === "issue-blo-1") return [{ slug: "issue-blo-1" }];
+        if (args.slug === "agent-ux") return hubNodes;
+        return null;
+      }),
+    };
+
+    const out = await prefetchRunContext({
+      client: client as unknown as GbrainCallable,
+      issueIdentifier: "BLO-1",
+      agentName: "UX",
+      depth: 2,
+    });
+
+    expect(out.reason).not.toMatch(/enriched/);
+    expect(out.graph).toEqual([{ slug: "issue-blo-1" }]);
+  });
+
   it("caps an oversized agent-hub fallback (array shape) instead of attaching it whole", async () => {
     // BLO-21635: hub nodes like "agent-cto" can be linked to thousands of
     // unrelated fact-* nodes. Simulate that with a fallback far larger than

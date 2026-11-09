@@ -141,10 +141,13 @@ async function maybeFallback(
       const fallbackGraph = await traverseGraph(input.client, candidate.slug, depth);
       if (fallbackGraph === null || fallbackGraph === undefined) continue;
       if (classifyGraphShape(fallbackGraph).status !== "ok") continue;
+      // Classify AFTER capping: a hub that caps to nothing must not be reported as "enriched".
+      const cappedFallback = capEnrichmentGraph(fallbackGraph);
+      if (classifyGraphShape(cappedFallback).status !== "ok") continue;
       return {
         ok: true,
         issuePageSlug,
-        graph: mergeGraphs(issueGraph, fallbackGraph),
+        graph: mergeGraphs(issueGraph, cappedFallback),
         reason: `${issueReason}; enriched with ${candidate.label} graph ${candidate.slug}`,
       };
     } catch {
@@ -186,8 +189,7 @@ export const MAX_ENRICHMENT_NODES = 50;
 export const MAX_ENRICHMENT_EDGES = 100;
 export const MAX_ENRICHMENT_SERIALIZED_BYTES = 64 * 1024;
 
-function mergeGraphs(primary: unknown | null, fallback: unknown): unknown {
-  const cappedFallback = capEnrichmentGraph(fallback);
+function mergeGraphs(primary: unknown | null, cappedFallback: unknown): unknown {
 
   if (primary === null || primary === undefined) return cappedFallback;
   if (Array.isArray(primary) && primary.length === 0) return cappedFallback;
@@ -219,10 +221,10 @@ function mergeGraphs(primary: unknown | null, fallback: unknown): unknown {
  *  when nodes don't carry a `depth` field. */
 function capEnrichmentGraph(graph: unknown): unknown {
   if (Array.isArray(graph)) {
-    return capArrayBySerializedBytes(capNodesArray(graph, MAX_ENRICHMENT_NODES));
+    return capArrayBySerializedBytes(trimNodeLinks(capNodesArray(graph, MAX_ENRICHMENT_NODES)));
   }
   if (isRecord(graph) && Array.isArray(graph.nodes)) {
-    const kept = capArrayBySerializedBytes(capNodesArray(graph.nodes, MAX_ENRICHMENT_NODES));
+    const kept = capArrayBySerializedBytes(trimNodeLinks(capNodesArray(graph.nodes, MAX_ENRICHMENT_NODES)));
     const keptSlugs = new Set(kept.map(nodeSlug).filter((slug): slug is string => slug !== null));
     const edges = Array.isArray(graph.edges)
       ? capArrayBySerializedBytes(
@@ -245,6 +247,20 @@ function capEnrichmentGraph(graph: unknown): unknown {
 function capNodesArray(nodes: unknown[], limit: number): unknown[] {
   if (nodes.length <= limit) return nodes;
   return [...nodes].sort((a, b) => nodeRank(a) - nodeRank(b)).slice(0, limit);
+}
+
+// BLO-21635: a hub node carries one `links` entry per neighbour (1,831 on
+// agent-uxdesigner = 139 KB), so the hub alone exceeded the byte cap and the
+// whole enrichment capped to zero nodes. Keep only links into the kept set.
+function trimNodeLinks(nodes: unknown[]): unknown[] {
+  const keptSlugs = new Set(nodes.map(nodeSlug).filter((slug): slug is string => slug !== null));
+  return nodes.map((node) => {
+    if (!isRecord(node) || !Array.isArray(node.links)) return node;
+    return {
+      ...node,
+      links: node.links.filter((link) => !isRecord(link) || typeof link.to_slug !== "string" || keptSlugs.has(link.to_slug)),
+    };
+  });
 }
 
 function nodeRank(node: unknown): number {
