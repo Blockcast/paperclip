@@ -480,6 +480,26 @@ also that only a long-lived credential fits `GH_SEAT_TOKEN_VALUE`, which is a
 static agent-scope binding: an App *installation* token expires hourly and
 would need a refresh path written for it first.
 
+**What provisioning it takes, as scoped by PEN-4275 — four credential actions,
+no settings change and no code.** The row is deliberately a one-seat, one-repo
+pilot, not a fleet rollout:
+
+1. Create a GitHub machine user whose login is **not** `allyblockcast` (e.g.
+   `penstock-agent-cto`). Any login whose slug differs clears the table above.
+2. Issue it a **fine-grained PAT scoped to this repository alone**, with
+   Contents: write and Pull requests: write.
+3. Add that user as a collaborator on **this repository only**.
+4. Bind that PAT as `GH_SEAT_TOKEN_VALUE` on **one** agent seat.
+
+Two independent kill switches, and **either one alone ends the pilot** — with no
+deploy, no code change and no agent's cooperation: revoke the PAT, or remove the
+collaborator. Repo containment comes from the PAT's repository selection and the
+collaborator entry, never from the binding, which selects only *which agent*:
+`scripts/gh-token-wrapper.sh` exports the seat value for every `gh` and `git`
+call in that agent's runs, so the seat is confined to the pilot repo for the
+window. Expansion beyond the one seat and one repo is a separate decision taken
+on the pilot's evidence; provisioning this does not authorize it.
+
 Until one exists, a self-review block is escalated, not worked around. The
 `github-pr-workflow` skill already forbids *reviewing* or *approving* under this
 seat (§"Why the user seat must never post a review"); this note closes the
