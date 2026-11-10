@@ -47,28 +47,104 @@ export async function maybeTakeCpuProfile(opts: {
   return takeCpuProfile(opts);
 }
 
-/** Minimum stall that auto-starts a profile, and the gap between two auto-starts. */
+/** Minimum stall that dumps the flight recording, and the gap between two dumps. */
 export const STALL_PROFILE_MIN_STALL_MS = 3_000;
-export const STALL_PROFILE_COOLDOWN_MS = 60 * 60_000;
+export const STALL_PROFILE_COOLDOWN_MS = 15 * 60_000;
 let lastStallProfileAt = Number.NEGATIVE_INFINITY;
 
 /**
- * Stall-triggered capture (BLO-45336). A profile cannot look backwards, so it
- * cannot catch the stall that triggers it — but >=3 s stalls arrive in clusters
- * (12 between 11:49Z and 12:10Z on 2026-10-21), so a long window opened by the
- * first one catches the next. An off-CPU block (sync fs on CephFS) should still
- * show as a sample gap whose next sample carries the calling frame — unverified.
- * Resolves null when skipped.
+ * Flight recorder (BLO-51594). The old stall trigger started a profile AFTER
+ * the stall, so it could never contain it: 13 captures between 2026-11-06 and
+ * 11-08 were triggered by 14-57 s stalls and every one described only the
+ * 1-2 s noise that followed. Instead the profiler runs continuously in
+ * `segmentMs` segments at a coarse sampling interval, and a stall dumps the
+ * segment it happened in.
+ *
+ * Which segment that is depends on timer order: the stall delays the rotation
+ * timer and the stall sampler alike, so if rotation runs first the stall lands
+ * in the segment it just closed. Hence the last closed segment is kept and the
+ * dump writes whichever of the two holds the longer busy run.
  */
-export function maybeStartStallCpuProfile(
+type Recorder = { session: Session; previous: CpuProfile | null; timer: ReturnType<typeof setInterval>; queue: Promise<unknown> };
+let recorder: Recorder | null = null;
+
+function postTo(session: Session) {
+  return (method: string, params?: object) =>
+    new Promise<any>((resolve, reject) =>
+      session.post(method, params ?? {}, (err, res) => (err ? reject(err) : resolve(res))),
+    );
+}
+
+/** Serialize on the recorder so a rotation never interleaves with a dump. */
+function onRecorder<T>(rec: Recorder, fn: () => Promise<T>): Promise<T> {
+  const next = rec.queue.then(fn);
+  rec.queue = next.catch(() => undefined);
+  return next;
+}
+
+/**
+ * Idempotent. The timer is registered synchronously: startServer's tests rely
+ * on the heartbeat scheduler being the last timer it registers.
+ */
+export function startCpuFlightRecorder(opts: { segmentMs: number; samplingIntervalUs: number }): Promise<void> {
+  if (recorder) return Promise.resolve();
+  const session = new Session();
+  session.connect();
+  const post = postTo(session);
+  const rec: Recorder = {
+    session,
+    previous: null,
+    timer: setInterval(() => {
+      void onRecorder(rec, async () => {
+        const { profile } = await post("Profiler.stop");
+        rec.previous = profile;
+        await post("Profiler.start");
+      }).catch(() => undefined);
+    }, opts.segmentMs),
+    queue: Promise.resolve(),
+  };
+  rec.timer.unref?.();
+  recorder = rec;
+  return onRecorder(rec, async () => {
+    await post("Profiler.enable");
+    await post("Profiler.setSamplingInterval", { interval: opts.samplingIntervalUs });
+    await post("Profiler.start");
+  });
+}
+
+export function stopCpuFlightRecorder(): void {
+  if (!recorder) return;
+  clearInterval(recorder.timer);
+  recorder.session.disconnect();
+  recorder = null;
+}
+
+/** Resolves null when skipped (short stall, cooldown, or no recorder running). */
+export function maybeDumpStallFlightRecording(
   stallMs: number,
-  opts: { dir: string; durationMs: number; keep: number; now?: number },
+  opts: { dir: string; keep: number; now?: number },
 ): Promise<{ file: string; summary: CpuProfileSummary | { summaryError: string } } | null> {
   const now = opts.now ?? Date.now();
-  if (capturing || stallMs < STALL_PROFILE_MIN_STALL_MS) return Promise.resolve(null);
+  const rec = recorder;
+  if (!rec || stallMs < STALL_PROFILE_MIN_STALL_MS) return Promise.resolve(null);
   if (now - lastStallProfileAt < STALL_PROFILE_COOLDOWN_MS) return Promise.resolve(null);
   lastStallProfileAt = now;
-  return takeCpuProfile(opts);
+  return onRecorder(rec, async () => {
+    const post = postTo(rec.session);
+    const { profile: current } = await post("Profiler.stop");
+    await post("Profiler.start");
+    const busy = (p: CpuProfile) => {
+      try {
+        return summarizeCpuProfile(p, 0).longestBusyMs;
+      } catch {
+        return -1;
+      }
+    };
+    const previous = rec.previous;
+    rec.previous = null;
+    const pick = previous && busy(previous) > busy(current) ? previous : current;
+    return writeCpuProfile(pick, opts);
+  });
 }
 
 type ProfileNode = { id: number; callFrame: { functionName: string; url: string; lineNumber: number }; children?: number[] };
@@ -129,36 +205,40 @@ export function summarizeCpuProfile(profile: CpuProfile, top = 5): CpuProfileSum
   return { longestBusyMs: Math.round(best.us / 1000), topFrames };
 }
 
+async function writeCpuProfile(
+  profile: CpuProfile,
+  opts: { dir: string; keep: number },
+): Promise<{ file: string; summary: CpuProfileSummary | { summaryError: string } }> {
+  mkdirSync(opts.dir, { recursive: true });
+  const file = path.join(
+    opts.dir,
+    `${new Date().toISOString().replace(/[:.]/g, "-")}-pid${process.pid}${CPU_PROFILE_EXTENSION}`,
+  );
+  // Async: a 10-minute profile is megabytes, and this directory is CephFS.
+  await writeFile(`${file}.partial`, JSON.stringify(profile));
+  await rename(`${file}.partial`, file);
+  pruneCpuProfiles(opts.dir, opts.keep);
+  // A summarizer bug must not swallow the "profile written" line: the file is the fallback.
+  let summary: CpuProfileSummary | { summaryError: string };
+  try {
+    summary = summarizeCpuProfile(profile);
+  } catch (err) {
+    summary = { summaryError: String(err) };
+  }
+  return { file, summary };
+}
+
 async function takeCpuProfile(opts: { dir: string; durationMs: number; keep: number }): Promise<{ file: string; summary: CpuProfileSummary | { summaryError: string } }> {
   capturing = true;
   const session = new Session();
   try {
     session.connect();
-    const post = (method: string, params?: object) =>
-      new Promise<any>((resolve, reject) =>
-        session.post(method, params ?? {}, (err, res) => (err ? reject(err) : resolve(res))),
-      );
+    const post = postTo(session);
     await post("Profiler.enable");
     await post("Profiler.start");
     await new Promise((r) => setTimeout(r, opts.durationMs).unref());
     const { profile } = await post("Profiler.stop");
-    mkdirSync(opts.dir, { recursive: true });
-    const file = path.join(
-      opts.dir,
-      `${new Date().toISOString().replace(/[:.]/g, "-")}-pid${process.pid}${CPU_PROFILE_EXTENSION}`,
-    );
-    // Async: a 10-minute profile is megabytes, and this directory is CephFS.
-    await writeFile(`${file}.partial`, JSON.stringify(profile));
-    await rename(`${file}.partial`, file);
-    pruneCpuProfiles(opts.dir, opts.keep);
-    // A summarizer bug must not swallow the "profile written" line: the file is the fallback.
-    let summary: CpuProfileSummary | { summaryError: string };
-    try {
-      summary = summarizeCpuProfile(profile);
-    } catch (err) {
-      summary = { summaryError: String(err) };
-    }
-    return { file, summary };
+    return await writeCpuProfile(profile, opts);
   } finally {
     session.disconnect();
     capturing = false;

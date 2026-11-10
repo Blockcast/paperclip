@@ -1,14 +1,16 @@
 import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   CPU_PROFILE_EXTENSION,
   CPU_PROFILE_SENTINEL_BASENAME,
-  maybeStartStallCpuProfile,
+  maybeDumpStallFlightRecording,
   maybeTakeCpuProfile,
   STALL_PROFILE_COOLDOWN_MS,
   STALL_PROFILE_MIN_STALL_MS,
+  startCpuFlightRecorder,
+  stopCpuFlightRecorder,
   summarizeCpuProfile,
 } from "../services/cpu-profile.js";
 
@@ -41,19 +43,52 @@ describe("maybeTakeCpuProfile (BLO-45336)", () => {
   });
 });
 
-describe("maybeStartStallCpuProfile (BLO-45336)", () => {
-  it("ignores short stalls, captures on a long one, then honours the cooldown", async () => {
+function blockTheLoop(ms: number): void {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    // busy: a synchronous stall the profile must attribute
+  }
+}
+
+describe("CPU flight recorder (BLO-51594)", () => {
+  afterEach(() => stopCpuFlightRecorder());
+
+  // Assert on the busy run, not a frame name: V8 inlines blockTheLoop once hot.
+  const busyMs = (summary: object) => (summary as { longestBusyMs: number }).longestBusyMs;
+
+  it("dumps a profile that contains the stall that happened BEFORE the dump was asked for", async () => {
     const dir = mkdtempSync(path.join(tmpdir(), "cpuprof-"));
-    const opts = { dir, durationMs: 10, keep: 3 };
-    expect(await maybeStartStallCpuProfile(STALL_PROFILE_MIN_STALL_MS - 1, { ...opts, now: 1e12 })).toBeNull();
-    const file = (await maybeStartStallCpuProfile(STALL_PROFILE_MIN_STALL_MS, { ...opts, now: 1e12 }))?.file;
-    expect(file).not.toBeNull();
-    expect(Array.isArray(JSON.parse(readFileSync(file!, "utf8")).nodes)).toBe(true);
+    await startCpuFlightRecorder({ segmentMs: 60_000, samplingIntervalUs: 1_000 });
+    blockTheLoop(300);
+    const res = await maybeDumpStallFlightRecording(STALL_PROFILE_MIN_STALL_MS, { dir, keep: 3, now: 1e12 });
+    expect(res).not.toBeNull();
+    expect(Array.isArray(JSON.parse(readFileSync(res!.file, "utf8")).nodes)).toBe(true);
+    expect(busyMs(res!.summary)).toBeGreaterThanOrEqual(200);
+  });
+
+  it("still finds the stall when a segment rotation ran between the stall and the dump", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "cpuprof-"));
+    await startCpuFlightRecorder({ segmentMs: 200, samplingIntervalUs: 1_000 });
+    blockTheLoop(300);
+    // The overdue rotation fires once, right after the block, closing the
+    // segment that holds it; the next is 200 ms away.
+    await new Promise((r) => setTimeout(r, 50));
+    const res = await maybeDumpStallFlightRecording(STALL_PROFILE_MIN_STALL_MS, { dir, keep: 3, now: 2e12 });
+    expect(busyMs(res!.summary)).toBeGreaterThanOrEqual(200);
+  });
+
+  it("ignores short stalls, honours the cooldown, and is a no-op with no recorder", async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), "cpuprof-"));
+    const opts = { dir, keep: 3 };
+    expect(await maybeDumpStallFlightRecording(60_000, { ...opts, now: 3e12 })).toBeNull();
+    await startCpuFlightRecorder({ segmentMs: 60_000, samplingIntervalUs: 10_000 });
+    expect(await maybeDumpStallFlightRecording(STALL_PROFILE_MIN_STALL_MS - 1, { ...opts, now: 4e12 })).toBeNull();
+    expect(await maybeDumpStallFlightRecording(STALL_PROFILE_MIN_STALL_MS, { ...opts, now: 4e12 })).not.toBeNull();
     expect(
-      await maybeStartStallCpuProfile(60_000, { ...opts, now: 1e12 + STALL_PROFILE_COOLDOWN_MS - 1 }),
+      await maybeDumpStallFlightRecording(60_000, { ...opts, now: 4e12 + STALL_PROFILE_COOLDOWN_MS - 1 }),
     ).toBeNull();
     expect(
-      await maybeStartStallCpuProfile(60_000, { ...opts, now: 1e12 + STALL_PROFILE_COOLDOWN_MS }),
+      await maybeDumpStallFlightRecording(60_000, { ...opts, now: 4e12 + STALL_PROFILE_COOLDOWN_MS }),
     ).not.toBeNull();
   });
 });
