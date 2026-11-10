@@ -117,7 +117,7 @@ export type AuthorizationResource =
        *
        * `undefined` means the caller did not look it up and the guard reloads
        * the row; `null` means it looked and no user holds it. Do not collapse
-       * the two — see assignmentOntoHumanHeldIssueIsRefused.
+       * the two — see assignmentOntoHumanHeldIssueRefusal.
        *
        * PEN-6049: exactly one caller passes a literal `null` while knowing the
        * row may have a holder — `POST /issues/:id/checkout`, where the question
@@ -2070,22 +2070,33 @@ export function authorizationService(db: Db) {
   // being handed to a board user" — a different sentence about a different
   // person. Every caller populates it that way, so reusing it here would have
   // conflated the two and made the two existing guards wrong.
-  async function assignmentOntoHumanHeldIssueIsRefused(
+  /**
+   * PEN-6266: THREE-VALUED on purpose, not a boolean. Both non-null values
+   * refuse the assignment, but they refuse it for different reasons and the
+   * caller is told which:
+   *   "human_held"  - a person demonstrably holds this row.
+   *   "unreadable"  - this company cannot read the row, so we fail closed
+   *                   WITHOUT knowing who holds it.
+   * Collapsing the two is exactly the defect this row exists to remove, one
+   * branch over: reporting `deny_human_assigned_issue` for an unreadable
+   * foreign row asserts "a person holds this" about a row nobody here can see.
+   */
+  async function assignmentOntoHumanHeldIssueRefusal(
     resource: Extract<AuthorizationResource, { type: "issue" }>,
-  ) {
+  ): Promise<"human_held" | "unreadable" | null> {
     // Same `undefined` vs `null` rule as the origin-kind guard above: `null` is
     // the caller having looked and found no user, which is the common case and
     // must not pay for a reload.
     if (resource.currentAssigneeUserId !== undefined) {
-      return Boolean(resource.currentAssigneeUserId);
+      return resource.currentAssigneeUserId ? "human_held" : null;
     }
-    if (!resource.issueId) return false;
+    if (!resource.issueId) return null;
     const issue = await loadIssue(resource.companyId, resource.issueId);
     // Fail closed, for the same reason and in the same direction as the sibling
     // guard: an id this company cannot read is foreign or dangling, not "a row
-    // nobody holds". Answering `false` there would be the permissive direction.
-    if (!issue) return true;
-    return Boolean(issue.assigneeUserId);
+    // nobody holds". Answering `null` there would be the permissive direction.
+    if (!issue) return "unreadable";
+    return issue.assigneeUserId ? "human_held" : null;
   }
 
   async function decideBase(input: {
@@ -2755,13 +2766,15 @@ export function authorizationService(db: Db) {
       // this agent branch, and an agent handing its OWN row back to a human
       // (`isAgentReturningIssueToCreator`) bypasses assertCanAssignTasks
       // entirely, as does `workflowControlledAssignment`.
-      if (
-        input.resource.type === "issue" &&
-        (await assignmentOntoHumanHeldIssueIsRefused(input.resource))
-      ) {
+      const humanHeldRefusal =
+        input.resource.type === "issue"
+          ? await assignmentOntoHumanHeldIssueRefusal(input.resource)
+          : null;
+      if (humanHeldRefusal) {
         return deny({
           action: input.action,
-          // PEN-6266: the dedicated reason, not the generic `deny_missing_grant`.
+          // PEN-6266: the dedicated reason where a person really holds the row,
+          // instead of the generic `deny_missing_grant` for every case alike.
           // Both map to the "grant" boundary category, so nothing downstream
           // re-buckets — the discrimination is in `boundaryReason`, which is what
           // reaches the caller, since assertCanAssignTasks throws
@@ -2786,11 +2799,26 @@ export function authorizationService(db: Db) {
           //      gate; nothing in it reads this one.
           //   2. This deny cannot fire at that door at all: checkout passes
           //      `currentAssigneeUserId: humanHeldQuestionDelegatedToClaimPredicate`,
-          //      a literal `null`, so the predicate above is false there.
-          // => A NEW CALLER that passes the live `assigneeUserId` *and* needs the
-          // lock-clear breaks (2) and leaves only (1). Re-ask the exemption
-          // question when you add one; do not inherit this answer.
-          reason: "deny_human_assigned_issue",
+          //      a literal `null`, so the predicate above returns `null` there.
+          // => A NEW CALLER breaks (2) and leaves only (1) by EITHER route, and
+          // the second is the likelier one because it is the DEFAULT:
+          //   a. it passes the live `assigneeUserId` — the deliberate route; or
+          //   b. it OMITS `currentAssigneeUserId` entirely, so the predicate
+          //      takes its reload path and can refuse on what it finds. This is
+          //      what `assertCanOrchestrateSkillTestHarness`
+          //      (routes/company-skills.ts) already does; it is a pure
+          //      pass-through that reads no reason string and has no stale-lock
+          //      hygiene at stake, so it is unaffected today — but a future
+          //      caller reaches this deny by writing nothing at all.
+          // Re-ask the exemption question when you add one; do not inherit this
+          // answer, and do not read (b)'s silence as absence.
+          //
+          // PEN-6266, the branch: the dedicated reason is emitted ONLY where it
+          // is TRUE. `unreadable` refuses for a different reason — this company
+          // cannot read the row — so it keeps the generic reason rather than
+          // asserting a holder nobody here observed. Collapsing the two would
+          // re-create this fix's own defect one branch over.
+          reason: humanHeldRefusal === "human_held" ? "deny_human_assigned_issue" : "deny_missing_grant",
           explanation:
             "This issue is assigned to a person, so agents cannot reassign it — including to themselves. " +
             // Kept in step with issueMutationGrantRemediation in routes/issues.ts:
