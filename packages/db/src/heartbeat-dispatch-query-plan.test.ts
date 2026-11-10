@@ -245,6 +245,94 @@ function expectOrderedDispatchIndex(node: Record<string, unknown>) {
 }
 
 /**
+ * PEN-6336: the fixture precondition every plan assertion in this file rests
+ * on, made explicit, retried, and verified — because `VACUUM ANALYZE` on its
+ * own does not establish it.
+ *
+ * An index-only scan is costed against the visibility map, so every assertion
+ * here that forbids a `Sort` or a `Bitmap Heap Scan` is really an assertion
+ * about `pg_class.relallvisible / relpages`. The seed functions have always
+ * VACUUMed for that reason (see the long note at the other call site), and the
+ * unstated assumption was that a VACUUM which returns has marked the pages.
+ * It has not, whenever ANY transaction with a snapshot older than the seed
+ * INSERT is still open: `OldestXmin` is then held back, VACUUM cannot prove the
+ * tuples visible to everyone, and it returns success having marked nothing.
+ *
+ * Measured first-party 2026-11-10 on this fixture, interleaved seed, depth 1000
+ * and 5000, by sweeping `relallvisible` directly:
+ *
+ *   vis 100%  depth 1000  cost  4.39  ordered index, Index Only Scan   <- asserted
+ *   vis  40%  depth 1000  cost 20.39  ordered index, Index Only Scan
+ *   vis  20%  depth 1000  cost 24.09  ordered index, Sort + Bitmap Heap Scan
+ *   vis 100%  depth 5000  cost 11.05  ordered index, Index Only Scan   <- asserted
+ *   vis   0%  depth 5000  cost 452.71 heartbeat_runs_queued_age_idx, Sort + Bitmap
+ *
+ * Those last two lines are the two failure faces this test produced in CI, and
+ * they are ONE defect: `× ... expected one of <ordered indexes>, got
+ * [heartbeat_runs_queued_age_idx]` and `× ... expected [ 'Bitmap Heap Scan',
+ * ...(1) ] to not include 'Bitmap Heap Scan'` are the same plan collapse read
+ * at two depths. A census keyed on the index name finds only the first and
+ * undercounts the flake by two thirds.
+ *
+ * The competing explanation — ANALYZE's random sample moving the row estimate —
+ * is REFUTED here rather than left open: pinning `n_distinct` on `agent_id`
+ * across 2, 10, 50, 200, 1_000, 5_000, 20_000 and -1 moved the estimate only
+ * between 108 and 133 rows and never changed the plan at full visibility.
+ * `VACUUM (DISABLE_PAGE_SKIPPING)` does not rescue it either — the blocker is
+ * the snapshot horizon, not page skipping.
+ *
+ * So wait the horizon out rather than assuming it. The fixture cluster is
+ * private to this suite and carries exactly one client backend (measured:
+ * `pg_stat_activity` shows only this connection plus postmaster auxiliaries),
+ * which leaves an autovacuum worker as the only thing that can hold a
+ * conflicting snapshot — and those finish in seconds, so a bounded retry
+ * converts a coin flip into a wait. If it never clears, this throws naming the
+ * measured fraction and the backends still holding an xmin, so the failure is
+ * attributable to the fixture instead of surfacing as a planner mystery three
+ * assertions later.
+ */
+const FIXTURE_ALL_VISIBLE_ATTEMPTS = 20;
+const FIXTURE_ALL_VISIBLE_PAUSE_MS = 500;
+/** Measured good is exactly 1.0; the tolerance is for a stray page, not for the failure mode. */
+const FIXTURE_MIN_ALL_VISIBLE_FRACTION = 0.99;
+
+async function readAllVisibleFraction(sql: postgres.Sql, table: string) {
+  const [row] = await sql.unsafe(
+    `SELECT relpages::int AS relpages, relallvisible::int AS relallvisible
+       FROM pg_class WHERE relname = '${table}'`,
+  ) as Array<{ relpages: number; relallvisible: number }>;
+  return row;
+}
+
+async function vacuumAnalyzeUntilAllVisible(sql: postgres.Sql, table: string) {
+  let last = { relpages: 0, relallvisible: 0 };
+  for (let attempt = 1; attempt <= FIXTURE_ALL_VISIBLE_ATTEMPTS; attempt += 1) {
+    await sql.unsafe(`VACUUM (ANALYZE) ${table}`);
+    last = await readAllVisibleFraction(sql, table);
+    if (last.relpages > 0 && last.relallvisible >= last.relpages * FIXTURE_MIN_ALL_VISIBLE_FRACTION) {
+      return last;
+    }
+    await new Promise((resolve) => setTimeout(resolve, FIXTURE_ALL_VISIBLE_PAUSE_MS));
+  }
+
+  // Only reached when the horizon never advanced. Name who is holding it: with
+  // one client backend in this cluster, a row here is an autovacuum worker, and
+  // an EMPTY list means the cause is something this diagnosis does not cover.
+  const holders = await sql.unsafe(
+    `SELECT pid, backend_type, state, backend_xmin::text AS backend_xmin
+       FROM pg_stat_activity
+      WHERE pid <> pg_backend_pid() AND backend_xmin IS NOT NULL`,
+  ) as Array<Record<string, unknown>>;
+  throw new Error(
+    `fixture precondition not met: ${table} is ${last.relallvisible}/${last.relpages} pages all-visible `
+    + `after ${FIXTURE_ALL_VISIBLE_ATTEMPTS} VACUUM attempts. Every plan assertion in this file is a `
+    + `claim about the visibility map, so they are not meaningful below `
+    + `${FIXTURE_MIN_ALL_VISIBLE_FRACTION * 100}%. Backends still holding an xmin: `
+    + `${holders.length === 0 ? "none" : JSON.stringify(holders)}`,
+  );
+}
+
+/**
  * The keyset predicate as PostgreSQL renders a row comparison, e.g.
  * `((created_at, id) > ('...'::timestamptz, '...'::uuid))`. Matched as a row
  * constructor rather than by substring: bare `id` also appears inside
@@ -407,7 +495,8 @@ async function seed(sql: postgres.Sql) {
   // heartbeat_runs is continuously autovacuumed in production and the cost model
   // reads the table-wide relallvisible/relpages fraction, so vacuuming here is
   // what makes the fixture honest rather than what makes it pass.
-  await sql.unsafe(`VACUUM ANALYZE heartbeat_runs`);
+  // PEN-6336: a VACUUM that returns has not necessarily marked anything.
+  await vacuumAnalyzeUntilAllVisible(sql, "heartbeat_runs");
   await sql.unsafe(`ANALYZE issues`);
 }
 
@@ -678,7 +767,8 @@ async function seedInterleavedQueue(sql: postgres.Sql, depth: number) {
     FROM generate_series(1, ${TOTAL_RUNS}) AS series
   `);
   await sql.unsafe(`SET session_replication_role = origin`);
-  await sql.unsafe(`VACUUM ANALYZE heartbeat_runs`);
+  // PEN-6336: a VACUUM that returns has not necessarily marked anything.
+  await vacuumAnalyzeUntilAllVisible(sql, "heartbeat_runs");
 }
 
 
@@ -1054,6 +1144,48 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       expect(scanKinds(probe.root)).toContain("Index Only Scan");
       expect(rowsInspected(probe.root)).toBeLessThanOrEqual(HEAD_ABSOLUTE_BOUND);
 
+      /**
+       * PEN-6336 MUTATION CONTROL — the assertions above still fail on a
+       * genuinely regressed plan, and they do so for a structural reason
+       * rather than a cost margin.
+       *
+       * The fixture fix this block sits beside makes the visibility map a
+       * verified precondition instead of an assumed one, which removes the
+       * non-determinism — but a fixture change that makes a test stop failing
+       * is indistinguishable from one that makes it stop testing. This is the
+       * discriminator: with BOTH ordering-capable indexes gone, the queue-age
+       * index is the only remaining candidate for `status = 'queued'` and it
+       * carries `coalesce(queued_at, created_at)` as its second key, so it
+       * cannot supply this ORDER BY at ANY cost. A `Sort` is then guaranteed by
+       * the index definitions, at full visibility, at either depth.
+       *
+       * Deliberately NOT a visibility-map mutation. Forcing `relallvisible` to
+       * zero does reproduce both observed CI failures (measured — see
+       * `vacuumAnalyzeUntilAllVisible`), but what it reproduces is a COST
+       * comparison, and asserting on one is how this test became a merge-queue
+       * flake in the first place. A control must not be able to become the
+       * defect it controls for.
+       *
+       * Same BEGIN/ROLLBACK and same `max: 1` dependency as the generic-plan
+       * control below — read the note there before widening the pool.
+       */
+      const fixtureVisibility = await readAllVisibleFraction(sql, "heartbeat_runs");
+      expect(fixtureVisibility.relpages).toBeGreaterThan(0);
+      expect(fixtureVisibility.relallvisible).toBeGreaterThanOrEqual(
+        fixtureVisibility.relpages * FIXTURE_MIN_ALL_VISIBLE_FRACTION,
+      );
+
+      await sql.unsafe("BEGIN");
+      try {
+        for (const index of ORDERED_DISPATCH_INDEXES) await sql.unsafe(`DROP INDEX ${index}`);
+        const regressed = await explain(sql, DISPATCH_HEAD_PROBE);
+        record(`depth ${depth}: head probe, ordered indexes dropped (mutation control)`, regressed);
+        expect(planNodes(regressed.root).map((n) => n["Node Type"])).toContain("Sort");
+        expect(() => expectOrderedDispatchIndex(regressed.root)).toThrow();
+      } finally {
+        await sql.unsafe("ROLLBACK");
+      }
+
       // Same, resumed mid-queue: the cursor must be satisfied BY the index, not
       // rechecked after it, or every resumed pass re-walks the discarded prefix.
       const probeCursor = await explain(sql, DISPATCH_HEAD_PROBE_CURSOR);
@@ -1153,6 +1285,18 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
          * — forcing relallvisible to 0 brought the two within 0.24% but never
          * inverted them. So rather than chase a cost inversion this fixture
          * cannot produce, isolate the CAPABILITY the fix adds.
+         *
+         * PEN-6336 amends the "never inverted them" clause above, which is
+         * true of `seed`'s PACKED fixture and NOT of the interleaved one this
+         * test runs on. Measured 2026-11-10 at depth 5000, relallvisible
+         * forced to 0: the queue-age index WINS outright, 452.71 against the
+         * ordered index-only path, and the plan collapses to Sort + Bitmap.
+         * That is the inversion — it just needs the interleaved heap layout as
+         * well as the low visibility fraction. It is still not production's
+         * inversion (that one is on the GENERIC plan), and it is not reachable
+         * from the seeded fixture now that `vacuumAnalyzeUntilAllVisible`
+         * verifies the precondition, but do not read the sentence above as
+         * saying this fixture family cannot produce a cost inversion at all.
          *
          * Drop 0208's index inside a transaction that is always rolled back.
          * The queue-age index is then the only OTHER candidate, and it cannot
