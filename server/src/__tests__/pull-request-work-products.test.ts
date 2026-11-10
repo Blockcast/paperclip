@@ -8,7 +8,7 @@ import {
   buildPullRequestWorkProductFields,
   OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES,
   PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
-  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+  PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
   pullRequestExternalId,
   pullRequestHasMerged,
@@ -450,21 +450,48 @@ describe("reconciler provenance (PEN-6413)", () => {
     owningIdentifiers: ["PEN-5041"],
   };
 
-  it("defaults `metadata.source` to the webhook for every existing caller", () => {
-    const fields = buildPullRequestWorkProductFields(merged);
-    expect(fields.metadata.source).toBe(PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE);
-  });
-
-  it("marks a reconciler-sourced row so a census cannot read a backfill as a delivery", () => {
-    const fields = buildPullRequestWorkProductFields({
-      ...merged,
-      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
-    });
-    expect(fields.metadata.source).toBe(PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER);
-    // The two constants must stay distinct, or the marker discriminates nothing.
-    expect(PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER).not.toBe(
+  it("leaves `metadata.source` as the webhook constant for EVERY caller", () => {
+    // `source` is the trust key. Five readers gate on it, including the owner
+    // wake (`selectIssuesLinkedToPullRequest`) and `listOwnersByExternalId`'s
+    // `provenance`. A repaired row that failed those filters would stop
+    // receiving future events -- worse than the stale status being repaired.
+    // There is deliberately no input that can override it.
+    expect(buildPullRequestWorkProductFields(merged).metadata.source).toBe(
       PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
     );
+    expect(
+      buildPullRequestWorkProductFields({
+        ...merged,
+        repairedBy: PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER,
+      }).metadata.source,
+    ).toBe(PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE);
+  });
+
+  it("marks a repaired row so a census cannot read a backfill as a delivery", () => {
+    const delivered = buildPullRequestWorkProductFields(merged);
+    expect(delivered.metadata.repairedBy).toBeNull();
+    expect(delivered.metadata.repairedAt).toBeNull();
+
+    const repaired = buildPullRequestWorkProductFields({
+      ...merged,
+      repairedBy: PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER,
+      repairedAt: "2026-11-10T22:40:00Z",
+    });
+    expect(repaired.metadata.repairedBy).toBe(
+      PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER,
+    );
+    expect(repaired.metadata.repairedAt).toBe("2026-11-10T22:40:00Z");
+  });
+
+  it("never records a repair timestamp without a repair marker", () => {
+    // Otherwise a census filtering on `repairedAt is not null` and one
+    // filtering on `repairedBy is not null` disagree about the same row.
+    const fields = buildPullRequestWorkProductFields({
+      ...merged,
+      repairedAt: "2026-11-10T22:40:00Z",
+    });
+    expect(fields.metadata.repairedBy).toBeNull();
+    expect(fields.metadata.repairedAt).toBeNull();
   });
 
   it("still records the terminal state and the owning set it was given", () => {
@@ -475,7 +502,7 @@ describe("reconciler provenance (PEN-6413)", () => {
     // webhook does and passes it through.
     const fields = buildPullRequestWorkProductFields({
       ...merged,
-      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+      repairedBy: PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER,
     });
     expect(fields.status).toBe("merged");
     expect(fields.metadata.merged).toBe(true);
@@ -487,26 +514,30 @@ describe("reconciler provenance (PEN-6413)", () => {
     expect(fields.metadata.sourceEventActionOrder).toBe(50);
   });
 
-  it("carries a source timestamp so the guard keeps its strict comparison", () => {
-    // A null timestamp drops `upsertByExternalId` to its tie-break, which
-    // prefers a terminal row -- that would let a backfill overwrite a LATER
-    // delivered event. The repair falls back to the merge instant rather than
-    // passing null.
-    const fields = buildPullRequestWorkProductFields({
-      ...merged,
-      prUpdatedAt: null,
-      prMergedAt: "2026-11-07T02:49:13Z",
-      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
-    });
-    expect(fields.metadata.sourceEventTimestampMs).toBeNull();
-
-    const withFallback = buildPullRequestWorkProductFields({
+  it("stamps the source timestamp from whatever `prUpdatedAt` it is given", () => {
+    // The reconciler passes the MERGE INSTANT here, never the PR's current
+    // `updated_at` -- see the `prUpdatedAt` argument in
+    // `reconcileMergedPullRequests`. This asserts the mechanism the choice
+    // relies on: the value lands in `sourceEventTimestampMs`, which is what
+    // `upsertByExternalId` compares. The end-to-end consequence (a delivered
+    // row is not churned) is pinned in
+    // `pr-reconciler-work-product-repair.test.ts`.
+    const atMerge = buildPullRequestWorkProductFields({
       ...merged,
       prUpdatedAt: "2026-11-07T02:49:13Z",
-      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+      repairedBy: PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER,
     });
-    expect(withFallback.metadata.sourceEventTimestampMs).toBe(
-      Date.parse("2026-11-07T02:49:13Z"),
-    );
+    expect(atMerge.metadata.sourceEventTimestampMs).toBe(Date.parse("2026-11-07T02:49:13Z"));
+
+    // A null timestamp drops the guard to its tie-break, which prefers a
+    // terminal row -- that would let a backfill overwrite a LATER delivered
+    // event. The reconciler only reaches the builder when `merged_at` is
+    // present, so this case is unreachable from there by construction.
+    const withoutTimestamp = buildPullRequestWorkProductFields({
+      ...merged,
+      prUpdatedAt: null,
+      repairedBy: PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER,
+    });
+    expect(withoutTimestamp.metadata.sourceEventTimestampMs).toBeNull();
   });
 });

@@ -23,11 +23,27 @@ export interface PullRequestWorkProductInput {
   /** GitHub `action` from the pull_request event. */
   action: string;
   /**
-   * Provenance written to `metadata.source`. Defaults to the webhook constant,
-   * so every existing caller is unchanged; the merged-PR reconciler passes
-   * PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER (PEN-6413).
+   * PEN-6413. Marks a row written by the merged-PR RECONCILER rather than by a
+   * webhook delivery. Null (the default) for every webhook caller.
+   *
+   * This is deliberately NOT `metadata.source`. An earlier revision of this
+   * change overrode `source` instead, and `source` is the TRUST KEY: five
+   * readers gate on `metadata->>'source' = 'github_pull_request_webhook'`, and
+   * all five would have dropped a repaired row --
+   * `selectIssuesLinkedToPullRequest` (the owner wake and stacked-child
+   * fan-out), `terminal-gate-reconciler`'s `ownedPullRequests`,
+   * `recovery/service`, `productivity-review`, and `listOwnersByExternalId`,
+   * which would report `provenance: "asserted"` where the fleet ownership
+   * directive tells callers to expect `"webhook"`. A row that had missed ONE
+   * delivery would then have missed every FUTURE one as well -- the opposite
+   * of the defect this repair exists to close.
+   *
+   * Keeping `source` and adding a separate marker lets a census still tell a
+   * backfill from a delivery without taking the row out of any reader.
    */
-  source?: string | null;
+  repairedBy?: string | null;
+  /** ISO instant the repair above was written. Null when `repairedBy` is. */
+  repairedAt?: string | null;
   /**
    * Identifiers this PR *owns*, as resolved by the ranked tiers in
    * `resolveOwningPaperclipIdentifiers` — NOT every identifier it mentions
@@ -101,16 +117,20 @@ export interface PullRequestWorkProductFields {
 
 export const PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE = "github_pull_request_webhook";
 /**
- * PEN-6413. Provenance for a row written by the merged-PR reconciler rather
- * than by a webhook delivery. The webhook is otherwise the SOLE writer of this
- * table, so a lost `closed` delivery leaves the row permanently non-terminal --
- * measured company-wide at 24 of 4592 bound PRs (0.52%), in cross-repo bursts
- * that rule out per-PR payload parsing. Repaired rows must stay distinguishable
- * from delivered ones: a census that keys on `metadata.source` (as the PEN-6413
- * census did) would otherwise read a backfill as a delivery.
+ * PEN-6413. Value written to `metadata.repairedBy` by the merged-PR
+ * reconciler. The webhook is otherwise the SOLE writer of this table, so a
+ * lost `closed` delivery leaves the row permanently non-terminal -- measured
+ * company-wide at 24 of 4592 bound PRs (0.52%), in cross-repo bursts that rule
+ * out per-PR payload parsing.
+ *
+ * Repaired rows must stay distinguishable from delivered ones, so that a
+ * census cannot read a backfill as a delivery. They must ALSO stay inside
+ * every reader that gates on `metadata.source` -- see the `repairedBy`
+ * docblock on PullRequestWorkProductInput for why those two requirements
+ * cannot both be met by overriding `source`.
  */
-export const PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER =
-  "github_merged_pr_reconciler";
+export const PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER =
+  "merged_pr_reconciler";
 export const PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID = "github_pull_request_webhook";
 export const PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST: SourceTrustMetadata = {
   preset: "standard",
@@ -352,7 +372,13 @@ export function buildPullRequestWorkProductFields(
     url: input.prUrl ?? null,
     status,
     metadata: {
-      source: input.source ?? PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+      // PEN-6413. Always present; null means "delivered by the webhook", in
+      // the same way `mergeQueueState` is always present and null-means-no-
+      // signal. A census filters on `repairedBy is not null`; `source` stays
+      // the trust key every reader gates on.
+      repairedBy: input.repairedBy ?? null,
+      repairedAt: input.repairedBy ? (input.repairedAt ?? null) : null,
       sourceEventOrder: pullRequestWorkProductSourceEventOrder(status),
       sourceEventActionOrder: pullRequestWorkProductSourceEventActionOrder(input),
       sourceEventTimestamp,
