@@ -4579,7 +4579,7 @@ function main() {
         "simulation. See the unlanded-eligible block above, which marks the " +
         "rows that have never once been offered a queue slot AND are past " +
         `${CAP_STARVED_HOURS}h judgeable or undated. A never-queued row INSIDE ` +
-        "that clock is deliberately not marked, so an unmarked row there is " +
+        "that clock is deliberately not marked, so an unmarked row is " +
         "not evidence it has ever been queued.",
     );
   }

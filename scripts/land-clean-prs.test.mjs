@@ -4917,7 +4917,19 @@ describe("every cohort heading names the undated arm its gate admits (PEN-6392)"
     // file it never read.
     assert.match(SOURCE, /See the unlanded-eligible block above/, "control: the file was read");
     assert.doesNotMatch(SOURCE, /which marks every/);
-    assert.match(SOURCE, /are past " \+\n\s*`\$\{CAP_STARVED_HOURS\}h judgeable or undated/);
+    // Ally on #3645: the caveat must NOT be narrowed back to "an unmarked row
+    // THERE", i.e. to the 6-12h band. `unlandedNeverQueued` also leaves a row
+    // unmarked when its timeline could not be read (`everOfferedQueueSlot ===
+    // null`, the posture its own comment records), and an unread timeline
+    // happens past 12h too. So an unmarked row past the clock is not proof of
+    // a queue offer either, and a reader who takes "there" literally draws the
+    // wrong inference on exactly the undated arm this suite exists to protect.
+    assert.doesNotMatch(SOURCE, /unmarked row there/);
+    // Matched on text INSIDE one template literal, never across the
+    // concatenation seam. The earlier form pinned the line break after
+    // `are past " +`, so re-wrapping a sentence that was still correct would
+    // have redded this test; verified on #3645 against a collapsed seam.
+    assert.match(SOURCE, /judgeable or undated\. A never-queued row INSIDE/);
   });
 });
 
