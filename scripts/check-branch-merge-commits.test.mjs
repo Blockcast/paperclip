@@ -194,6 +194,21 @@ test("formatReport: the failure names the rebase remedy and never recommends mer
   // The no-upstream / never-pushed case must be in the RENDERED text, not only
   // in a source comment the report's reader never sees.
   assert.match(report, /never pushed from this clone/);
+  // PEN-6453: `.rebaseable` does not discriminate -- measured `true` on #3492 at
+  // the head this check FAILED and again at the rebased head it PASSED. The report
+  // may NAME the field, to disarm a reader who has already read `true` elsewhere,
+  // but it must never nominate it as the thing to read. Asserted as a NEGATIVE
+  // because the failure mode is a well-meant re-widening: "read `.rebaseable`"
+  // looks like helpful specificity to anyone who has not seen the measurement.
+  assert.doesNotMatch(
+    report,
+    /\bread\b[^\n]*\brebaseable\b/i,
+    "`.rebaseable` must not be nominated as the discriminator (PEN-6453)",
+  );
+  assert.match(report, /never a verdict/);
+  // ...and the instrument that replaces it is this script, run on both arms.
+  assert.match(report, /node scripts\/check-branch-merge-commits\.mjs/);
+  assert.match(report, /BOTH arms/);
 });
 
 test("formatReport: a PASS states its own one-sidedness", () => {
