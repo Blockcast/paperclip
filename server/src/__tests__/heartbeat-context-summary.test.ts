@@ -3671,6 +3671,14 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // outage-only hazard that waiting fixes.
     expect(markdown).toContain("GraphQL schema error 1");
     expect(markdown).toContain("reachable from a query you typed yourself");
+    expect(markdown).toContain("refuses, at rc 5");
+    expect(markdown).toContain("tracks the SHAPE of the document that arrived, never the cause");
+    expect(markdown).toContain("prints NO headers without `-i`");
+    expect(markdown).toContain("CANNOT be run on the probe's own response");
+    expect(markdown).toContain("is an artifact of the missing flag");
+    expect(markdown).toContain("`Retry-After` header is a SECONDARY rate limit");
+    expect(markdown).toContain("the causes are open-ended");
+    expect(markdown).toContain("refuses at rc 4 at full quota");
   });
 
   // PEN-5802. The head check above is push-scoped, and the directive's own verb list
