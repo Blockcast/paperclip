@@ -4336,6 +4336,39 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("PEN-5734 and PEN-5524 are the worked pattern");
   });
 
+  // PEN-6404, the CARRIER axis -- pinned separately from the clause above because it is the
+  // EXCEPTION to it, and a sweep that tidies the surface paragraph would otherwise take the
+  // exception with it and leave an assertion that still passes. Measured on PEN-6292
+  // (`plugin:paperclip-plugin-alertmanager`): ten field revisions, one distinct description
+  // sha256, 40-65 min apart, every one with `createdByAgentId` and `createdByRunId` null. The
+  // clause above makes the description THE record; on such a row that routes the record into a
+  // field the plugin replaces wholesale on every alert delivery, and no check available to the
+  // writing run can detect it, because the overwrite lands after the run ends.
+  it("carves plugin-rendered descriptions out of the surface rule, and names the check", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).toContain("Surface, when the description is MACHINE-OWNED");
+    // The recognisable tell, so a reader can ask the question before writing...
+    expect(markdown).toContain("`originKind` begins `plugin:`");
+    // ...and the one instrument that settles it per row, for any writer.
+    expect(markdown).toContain("paperclipListIssueFieldRevisions");
+    // A carve-out that only forbids leaves the constraint unplaced; it has to route.
+    expect(markdown).toContain("monitorNotes");
+  });
+
+  // Order is load-bearing: the exception has to read after the rule it qualifies, or a reader
+  // who stops at the surface paragraph has been told the description is the record and nothing
+  // more. Asserted rather than left to reading order, for the same reason the escalation hop is.
+  it("places the machine-owned carve-out after the surface rule it qualifies", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    const rule = markdown.indexOf("the description is the record");
+    const exception = markdown.indexOf("Surface, when the description is MACHINE-OWNED");
+
+    expect(rule).toBeGreaterThan(-1);
+    expect(exception).toBeGreaterThan(rule);
+  });
+
   // The two ways the row-axis rule ends with no row to write on. They are different
   // failures -- no target at all, versus a known target that refuses the write -- and they
   // end in the same place, which is why both are pinned here: the constraint lands

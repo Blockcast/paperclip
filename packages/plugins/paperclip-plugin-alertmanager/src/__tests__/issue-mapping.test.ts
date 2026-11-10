@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { ISSUE_PRIORITIES } from "@paperclipai/shared";
 import {
   alertMatchesLabelFilter,
+  buildAggregateIssueDescription,
   buildIssueDescription,
+  MACHINE_RENDERED_NOTICE,
   buildIssueTitle,
   effectiveAlertStatus,
   extractObservabilityUrls,
@@ -429,6 +431,60 @@ describe("buildIssueDescription", () => {
     // should appear with just that one entry.
     expect(body).toContain("### Drill in");
     expect(body).toContain("[Source query in Prometheus]");
+  });
+
+  /**
+   * PEN-6404 -- the body has to say it is not a record surface, at the top.
+   *
+   * Every firing delivery replaces this column wholesale and never reads what
+   * it replaces, so an agent recording a constraint here loses it inside the
+   * hour (measured on PEN-6292: ten revisions, one distinct hash, 40-65 min
+   * apart). No in-run check can see it -- the write succeeds, the same-run
+   * re-read succeeds, and the overwrite lands after the run has ended -- which
+   * is why the warning has to travel in the artifact rather than be left to a
+   * reader who already believes the description is the record.
+   *
+   * Pinned on POSITION, not only presence. The directive it mirrors tells a
+   * reader to decide at depth 0, so a notice that drifts below the labels
+   * table is reaching them after they have decided; and the aggregate renderer
+   * appends its members table after this body, so last-position would be
+   * mid-document on exactly the rows that are hardest to read.
+   */
+  it("leads the body with the machine-rendered notice, ahead of the summary", () => {
+    const body = buildIssueDescription(baseAlert());
+
+    expect(body.startsWith(MACHINE_RENDERED_NOTICE)).toBe(true);
+    expect(body.indexOf(MACHINE_RENDERED_NOTICE)).toBeLessThan(body.indexOf("**Summary**"));
+  });
+
+  /**
+   * The notice is only useful if it names somewhere else to write. A version
+   * trimmed to "machine-generated" tells a reader their text is doomed and
+   * leaves them nowhere to put it, which is the state this row was filed from.
+   */
+  it("names a durable alternative carrier in the notice", () => {
+    expect(MACHINE_RENDERED_NOTICE).toContain("COMMENT");
+    expect(MACHINE_RENDERED_NOTICE).toContain("monitorNotes");
+    expect(MACHINE_RENDERED_NOTICE).toContain("PEN-6404");
+  });
+
+  /**
+   * The aggregate renderer composes `[body, members table]`, so a notice
+   * appended to the single-subject body would sit between them. Position is
+   * asserted against the members heading specifically, because that is the
+   * only thing that can get in front of it.
+   */
+  it("keeps the notice first on an aggregate body, ahead of the members table", () => {
+    const body = buildAggregateIssueDescription([
+      { fingerprint: "aaaa", alert: baseAlert() },
+      { fingerprint: "bbbb", alert: baseAlert({ startsAt: "2026-04-29T09:00:00Z" }) },
+    ]);
+
+    expect(body).not.toBeNull();
+    expect(body!.startsWith(MACHINE_RENDERED_NOTICE)).toBe(true);
+    expect(body!.indexOf("### Active members")).toBeGreaterThan(
+      body!.indexOf(MACHINE_RENDERED_NOTICE),
+    );
   });
 });
 

@@ -194,10 +194,15 @@ platform cannot resolve automatically. Each runbook should be:
   its `status` is a sample rather than a fact (64 plugin-authored transitions on
   one row in 14 days) and each cancel silently destroys the assignee's armed
   monitor (13 of 13 clears paired with a plugin cancel, lag 3-26 s, none ever
-  fired). Covers how to read the row safely and how to tell a destroyed monitor
+  fired). Its `description` is machine-owned the same way — replaced wholesale
+  on every delivery of a still-firing alert, measured 40-65 min apart, so a
+  constraint recorded at depth 0 there is destroyed with no error and no
+  in-run check that can see it (PEN-6404). Covers how to read the row safely,
+  where to record a constraint instead, and how to tell a destroyed monitor
   from one that was never armed. Trigger: two agents reporting contradictory
-  `status` for the same alert row, or an armed monitor that produced no wake
-  while `monitorAttemptCount` stayed put.
+  `status` for the same alert row, text written into an alert row's
+  description that is no longer there, or an armed monitor that produced no
+  wake while `monitorAttemptCount` stayed put.
 - [`plugin-error.md`](plugin-error.md) — an installed plugin has sat at
   `plugins.status='error'` past the grace period, distinct from an
   operator-disabled plugin. Trigger: alert `PaperclipPluginCriticalErrored` or
