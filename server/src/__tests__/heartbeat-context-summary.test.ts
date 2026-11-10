@@ -3942,7 +3942,10 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // mismatch as the signal to go look for a sibling's clobber: a pipeline that cries wolf on
     // every clean write trains the reader to wave through the only detector that catches a real
     // loss. `jq -j` appends nothing and makes the check honest.
-    expect(markdown).toContain("Produce it with `jq -j '.description'`, never `jq -r`");
+    // `// ""` guards a null description: a bare `.description` under `jq -j` writes the four
+    // literal bytes `null` into desc.md, and the prepend then publishes the word.
+    expect(markdown).toContain("Produce it with `jq -j '.description // \"\"'`");
+    expect(markdown).toContain("never `jq -r` and never a bare `.description`");
     // The encoder is itself a transcription, and the one published here until 2026-11-10 was a
     // LOSSY one: jq-1.7's `-R` raw input replaces a multi-byte UTF-8 character straddling its
     // ~4096-byte in-line read chunk with two U+FFFD, at exit 0 and `200 OK`. Measured destroying
@@ -3955,8 +3958,27 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // false of the ENCODER, which is the step it quietly substituted.
     expect(markdown).toContain('python3 -I -c "import io,json;');
     expect(markdown).toContain(
-      "json.dumps({'description':io.open('desc.md',encoding='utf-8').read()})",
+      "json.dumps({'description':io.open('desc.md',encoding='utf-8',newline='').read()})",
     );
+    // `newline=''` is not decoration. Without it Python opens in text mode with
+    // newline=None, so universal-newline translation rewrites every CRLF and bare CR to LF
+    // before json.dumps sees the text -- the replacement encoder reproducing, in a quieter
+    // way, the exact defect class it was published to fix, and the same silent byte-rewrite
+    // this clause already warns about for `--data`. Measured: a\r\nb\rc round-trips False
+    // without it and True with it. Pinned on BOTH opens, because the write side is only a
+    // no-op by accident of os.linesep on Linux.
+    expect(markdown).toContain("io.open('body.json','w',encoding='utf-8',newline='')");
+    expect(markdown).toContain("`newline=''` is load-bearing on BOTH opens");
+    // The pre-send check has to be a ROUND-TRIP, not a U+FFFD search. json.dumps defaults to
+    // ensure_ascii=True, so a U+FFFD is emitted as the six ASCII characters of its escape and
+    // a search for the character finds nothing: that check cannot fire, and it would
+    // false-alarm anyway on a row already carrying U+FFFD from the damage this PR fixes. The
+    // round-trip catches the boundary corruption, a newline translation and a truncation in
+    // one line, and it is the check that caught the CR defect above.
+    expect(markdown).toContain(
+      "json.load(open('body.json'))['description'].encode('utf-8') == open('desc.md','rb').read()",
+    );
+    expect(markdown).not.toContain("Assert the encoded body contains zero U+FFFD");
     expect(markdown).toContain("two U+FFFD REPLACEMENT CHARACTERS");
     // Published as a PROHIBITION, not merely dropped. A command this directive taught for days is
     // still reachable from memory and from every seat root that copied it, and three runs of one
