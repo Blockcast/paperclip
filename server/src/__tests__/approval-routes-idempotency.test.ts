@@ -873,6 +873,7 @@ describe("approval routes idempotent retries", () => {
         requestedByAgentId: undefined,
         idempotencyKey: undefined,
       }),
+      { limit: undefined, offset: undefined },
     );
     expect(mockApprovalService.list).not.toHaveBeenCalled();
   });
@@ -954,13 +955,22 @@ describe("approval routes idempotent retries", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body[0]).toHaveProperty("payload");
-    expect(mockApprovalService.list).toHaveBeenCalledWith("company-1", {
-      status: "pending",
-      type: undefined,
-      issueId: undefined,
-      requestedByAgentId: undefined,
-      idempotencyKey: undefined,
-    });
+    // PEN-6425 added a third `page` argument to both list calls. It is pinned as
+    // explicitly-undefined rather than relaxed to `expect.anything()`: that is what
+    // asserts the route applies NO window when the caller asked for none, so a future
+    // default limit or implicit cap — which would hand this caller a silent PREFIX of
+    // the corpus — reds here instead of shipping.
+    expect(mockApprovalService.list).toHaveBeenCalledWith(
+      "company-1",
+      {
+        status: "pending",
+        type: undefined,
+        issueId: undefined,
+        requestedByAgentId: undefined,
+        idempotencyKey: undefined,
+      },
+      { limit: undefined, offset: undefined },
+    );
   });
 
   it("applies every accepted filter to the full listing", async () => {
@@ -972,13 +982,17 @@ describe("approval routes idempotent retries", () => {
       );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
-    expect(mockApprovalService.list).toHaveBeenCalledWith("company-1", {
-      status: "pending",
-      type: "request_board_approval",
-      issueId: "00000000-0000-0000-0000-000000000001",
-      requestedByAgentId: "00000000-0000-0000-0000-000000000002",
-      idempotencyKey: "rotate-creds",
-    });
+    expect(mockApprovalService.list).toHaveBeenCalledWith(
+      "company-1",
+      {
+        status: "pending",
+        type: "request_board_approval",
+        issueId: "00000000-0000-0000-0000-000000000001",
+        requestedByAgentId: "00000000-0000-0000-0000-000000000002",
+        idempotencyKey: "rotate-creds",
+      },
+      { limit: undefined, offset: undefined },
+    );
   });
 
   // BLO-23036: a productivity-review run is a cheap status-only run, and one of the four verdicts
