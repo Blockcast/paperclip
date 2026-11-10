@@ -3934,6 +3934,15 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // Collapsing them is what made the first version of this segment unperformable: the
     // digest has to cover the raw description text, and the request body cannot BE that text.
     expect(markdown).toContain("It takes TWO files and they are not interchangeable");
+    // The pre-image read was left to the reader, and the obvious improvisation is lossy in the
+    // OTHER direction: `jq -r` appends a trailing newline the stored value does not have, so the
+    // digest comparison this clause MANDATES mismatches by one byte on a write that lost nothing,
+    // and the stored description grows a byte per round-trip. Three independent runs measured it
+    // on 2026-11-10 at 45,510 B, 62,912 B and 12,276 B. It matters because this clause DEFINES a
+    // mismatch as the signal to go look for a sibling's clobber: a pipeline that cries wolf on
+    // every clean write trains the reader to wave through the only detector that catches a real
+    // loss. `jq -j` appends nothing and makes the check honest.
+    expect(markdown).toContain("Produce it with `jq -j '.description'`, never `jq -r`");
     // The encoder is itself a transcription, and the one published here until 2026-11-10 was a
     // LOSSY one: jq-1.7's `-R` raw input replaces a multi-byte UTF-8 character straddling its
     // ~4096-byte in-line read chunk with two U+FFFD, at exit 0 and `200 OK`. Measured destroying
