@@ -173,16 +173,27 @@ function registerModuleMocks() {
   //
   // ⚠ Named explicitly rather than spread: heartbeat.ts is ~2.2 MB and this
   // file mocks it out on purpose. Add a line here when routes/agents.ts starts
-  // importing another value from it. `derivePaperclipPrReview` was already
-  // undefined under this mock before PR #3563 and is supplied for the same
-  // reason, pre-emptively — nothing in this file reaches it today.
+  // importing another value from it.
+  //
+  // PEN-6335 NARROWED this list rather than deleting the mechanism, and the two
+  // halves are for different things:
+  //
+  //   - `agentActorUnwritableConfigKeys` / `agentScopeOnlyConfigKeysFor` are
+  //     GONE from here because they are gone from `heartbeat.js` — they live in
+  //     the leaf `services/agent-config-key-pins.js`, which this file does not
+  //     mock, so the route gets the real ones whatever happens to this mock.
+  //     That is the structural fix, and it is what keeps the `PATCH` guard's
+  //     coverage independent of any mock in any file.
+  //   - `derivePaperclipPrReview` STAYS, because that edge survives the move:
+  //     `routes/agents.ts` still imports it from `heartbeat.js` for the
+  //     run-transcript path. Dropping it reintroduces the original failure for
+  //     that symbol alone. Nothing in this file reaches it today; it is
+  //     supplied pre-emptively, for the same reason it was before.
   vi.doMock("../services/heartbeat.js", async () => {
     const actual = await vi.importActual<typeof import("../services/heartbeat.js")>(
       "../services/heartbeat.js",
     );
     return {
-      agentActorUnwritableConfigKeys: actual.agentActorUnwritableConfigKeys,
-      agentScopeOnlyConfigKeysFor: actual.agentScopeOnlyConfigKeysFor,
       derivePaperclipPrReview: actual.derivePaperclipPrReview,
       heartbeatService: () => mockHeartbeatService,
     };

@@ -4,8 +4,8 @@ import {
   listAdapterModelProfiles,
   type AdapterModelProfileDefinition,
 } from "../adapters/index.js";
+import { agentScopeOnlyConfigKeyOverrides } from "../services/agent-config-key-pins.ts";
 import {
-  agentScopeOnlyConfigKeyOverrides,
   mergeModelProfileAdapterConfig,
   normalizeModelProfileWakeContext,
   resolveModelProfileApplication,

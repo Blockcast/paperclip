@@ -81,11 +81,20 @@ import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { environmentService } from "../services/environments.js";
 import { resolveEnvironmentExecutionTarget } from "../services/environment-execution-target.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
+// PEN-6335. The pinned-key symbols come from a LEAF module, deliberately NOT
+// from `heartbeat.js`: a test file that total-mocks that 2.2 MB service would
+// otherwise replace them with `undefined` here and leave this route unable to
+// compute its refusal set. See `services/agent-config-key-pins.ts`.
 import {
   agentActorUnwritableConfigKeys,
   agentScopeOnlyConfigKeysFor,
-  derivePaperclipPrReview,
-} from "../services/heartbeat.js";
+} from "../services/agent-config-key-pins.js";
+// ⚠ This edge stays, deliberately: the run-transcript path below reads a
+// projection that belongs with the service. It is NOT what makes the move
+// save no import cost — `services/index.js` above imports `heartbeat.js` too,
+// so this module's closure is unchanged by any single edge cut. See the note
+// in `services/agent-config-key-pins.ts` for the measurement.
+import { derivePaperclipPrReview } from "../services/heartbeat.js";
 import { CCROTATE_CAPACITY_ADVERTISED_RESUME_AT_KEY } from "../services/ccrotate-capacity-retry.js";
 import {
   evaluateStrandedRunRecovery,
