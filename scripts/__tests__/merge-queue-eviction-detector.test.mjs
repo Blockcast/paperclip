@@ -6,15 +6,23 @@ import {
   MERGE_QUEUE_EVICTION_MARKER,
   buildEvictionCommentBody,
   buildRunSearchWindow,
+  causeFromDequeueReason,
   classifyAdmissionEvidence,
+  ghDequeueReason,
   ghHeadChecks,
+  ghRunHasFailedJob,
   classifyMergeQueueEviction,
   extractPaperclipIdentifiers,
   filterMergeGroupRunsForPr,
+  HAS_FAILED_JOB_UNKNOWN,
+  isFailureWitnessJobName,
   isGatingJobName,
   isQueueInitiatedRemoval,
+  MERGE_GROUP_FAILURE_WITNESS_JOBS,
   MERGE_GROUP_GATING_JOBS,
+  MERGE_QUEUE_DEQUEUE_REASON_CAUSES,
   mergeQueueHeadBranchPrefix,
+  selectDequeueReasonAt,
   selectLatestQueueAttemptWindow,
 } from "../merge-queue-eviction-detector.mjs";
 
@@ -1341,4 +1349,327 @@ test("PEN-4887: a fresh head whose checks HAD all completed is not reported as r
     }),
     "conflict_unstageable",
   );
+});
+
+
+// --- PEN-6460: a gating job killed by its own `timeout-minutes` budget -----
+//
+// Measured on `Blockcast/paperclip` 2026-11-10. The eviction of #3591 at
+// 22:41:30Z carried `reason: "failed_checks"` from GitHub, actor
+// `github-merge-queue`, and was reported to its reader as a
+// "manual / administrative dequeue ... re-add once whoever dequeued it
+// confirms the hold is over". Nobody had dequeued it: `Build` was killed at
+// 25.4m against its `timeout-minutes: 25`, GitHub records a budget kill as
+// `conclusion: cancelled` (never `timed_out`), and the run-level conclusion
+// was `cancelled` too -- so neither disjunct of the check-failure test could
+// fire. The matched control in the same hour, #3586 @ 21:59:45Z, carried the
+// same `failed_checks` reason with a gating job reading `failure`, and was
+// classified correctly. The verdict split exactly on `failure` vs
+// `cancelled`.
+//
+// Every assertion below is on the CAUSE STRING, never on the run-level
+// conclusion: `cancelled` is what both populations read, so a test that
+// pinned the conclusion would pass against the defect.
+
+test("PEN-6460: a cancelled run whose gating job hit its time budget is not `manual`", () => {
+  // The exact #3591 shape: the run reads `cancelled`, the per-job probe found
+  // no `failure`/`timed_out` GATING name (the killed job reads `cancelled`
+  // and `verify` was not a name it would accept), and GitHub said why.
+  const prShape = {
+    merged: false,
+    mergeGroupRuns: [{ conclusion: "success" }, { conclusion: "success" }, { conclusion: "cancelled", hasFailedJob: false }],
+  };
+
+  assert.equal(classifyMergeQueueEviction({ ...prShape, dequeueReason: "failed_checks" }), "check_failure");
+  assert.notEqual(classifyMergeQueueEviction({ ...prShape, dequeueReason: "failed_checks" }), "manual");
+  // ... and without the reason the module still has the second, independent
+  // route to the same answer: `verify` is a failure witness, so the probe
+  // returns true on this run rather than false.
+  assert.equal(
+    classifyMergeQueueEviction({ ...prShape, mergeGroupRuns: [{ conclusion: "cancelled", hasFailedJob: true }] }),
+    "check_failure",
+  );
+});
+
+test("PEN-6460: `verify` witnesses a gating failure without joining the gating list", () => {
+  // `verify` is pr.yml's required aggregate over exactly the ten gating jobs,
+  // declared `if: always() && !cancelled()`. A job killed by its own budget
+  // does not cancel the RUN, so verify runs and FAILS; a run cancelled from
+  // outside skips it, so it reads `cancelled`. Measured on both arms:
+  // run 42910342037 (#3591) verify FAILURE, run 42900870003 (#3586) verify
+  // CANCELLED.
+  assert.equal(isFailureWitnessJobName("verify"), true);
+  // The gating list is pinned byte-for-byte to pr.yml and to the sweeper's
+  // GATING_JOBS, and must NOT grow for this -- `verify` is not a job the
+  // sweeper may act on.
+  assert.equal(isGatingJobName("verify"), false);
+  assert.deepEqual(MERGE_GROUP_FAILURE_WITNESS_JOBS, [...MERGE_GROUP_GATING_JOBS, "verify"]);
+  // Everything gating is still a witness, and the non-gating jobs that cannot
+  // red `verify` are still excluded -- a witness set that admitted `e2e`
+  // would report a check failure the queue never saw.
+  for (const name of MERGE_GROUP_GATING_JOBS) assert.equal(isFailureWitnessJobName(name), true);
+  assert.equal(isFailureWitnessJobName("e2e"), false);
+  assert.equal(isFailureWitnessJobName("Canary Dry Run"), false);
+});
+
+test("PEN-6460: the jobs probe counts a `verify` failure and still refuses a bare `cancelled`", () => {
+  // Behavioural, through the `exec` seam: the jq is part of the contract, so
+  // a test that only called `isFailureWitnessJobName` would pass against a
+  // filter that never returns the name.
+  const calls = [];
+  const execReturning = (names) => (args) => {
+    calls.push(args.join(" "));
+    return names.join("\n");
+  };
+
+  assert.equal(ghRunHasFailedJob("Blockcast/paperclip", 42910342037, execReturning(["verify"])), true);
+  assert.equal(ghRunHasFailedJob("Blockcast/paperclip", 42900870003, execReturning(["General tests (workspaces-a)"])), true);
+  // The sweeper/dequeue shape: the probe's jq never emits a `cancelled` job,
+  // so an empty result is the only thing a cancelled-from-outside run can
+  // produce, and it must stay `false` rather than becoming a check failure.
+  assert.equal(ghRunHasFailedJob("Blockcast/paperclip", 1, execReturning([""])), false);
+  assert.ok(
+    calls.every((call) => call.includes('select(.conclusion=="failure" or .conclusion=="timed_out")')),
+    `the probe must keep refusing \`cancelled\` by conclusion; calls were:\n${calls.join("\n")}`,
+  );
+});
+
+test("PEN-6460: a jobs read that fails is `unknown`, never `manual`", () => {
+  const exec = () => {
+    throw new Error("HTTP 403: API rate limit exceeded for installation ID 138085375");
+  };
+  assert.equal(ghRunHasFailedJob("Blockcast/paperclip", 42910342037, exec), HAS_FAILED_JOB_UNKNOWN);
+
+  // The classifier must carry that through rather than asserting a person
+  // dequeued the PR. This is the fail-closed direction: the notice says it
+  // could not determine the cause.
+  const classification = classifyMergeQueueEviction({
+    merged: false,
+    mergeGroupRuns: [{ conclusion: "cancelled", hasFailedJob: HAS_FAILED_JOB_UNKNOWN }],
+  });
+  assert.equal(classification, "unknown");
+  assert.notEqual(classification, "manual");
+
+  // Positive evidence still outranks an unreadable sibling run.
+  assert.equal(
+    classifyMergeQueueEviction({
+      merged: false,
+      mergeGroupRuns: [
+        { conclusion: "cancelled", hasFailedJob: HAS_FAILED_JOB_UNKNOWN },
+        { conclusion: "cancelled", hasFailedJob: true },
+      ],
+    }),
+    "check_failure",
+  );
+  // And a clean `false` is still `manual` -- BLO-51600's verdict is untouched.
+  assert.equal(
+    classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [{ conclusion: "cancelled", hasFailedJob: false }] }),
+    "manual",
+  );
+});
+
+test("PEN-6460: the measured reason vocabulary maps onto the taxonomy", () => {
+  // `reason` is a nullable String in the GraphQL schema, not an enum, so this
+  // map is a sample and not a closed set. Measured over the 60
+  // most-recently-updated PRs on `Blockcast/paperclip`, 2026-11-10: 29
+  // removals -- failed_checks 15, merged 7, merge_conflict 6, manual 1.
+  assert.deepEqual(MERGE_QUEUE_DEQUEUE_REASON_CAUSES, {
+    merged: "merged",
+    failed_checks: "check_failure",
+    merge_conflict: "conflict_unstageable",
+    manual: "manual",
+  });
+  assert.equal(causeFromDequeueReason("FAILED_CHECKS"), "check_failure");
+  assert.equal(causeFromDequeueReason("  manual  "), "manual");
+  // An unrecognised value must change nothing rather than guess -- the value
+  // space is not introspectable, so a reason GitHub adds tomorrow has to fall
+  // back to the inference ladder, not to a wrong branch of it.
+  assert.equal(causeFromDequeueReason("some_reason_github_adds_later"), null);
+  assert.equal(causeFromDequeueReason(null), null);
+  assert.equal(causeFromDequeueReason(undefined), null);
+  // Not inherited from Object.prototype.
+  assert.equal(causeFromDequeueReason("toString"), null);
+});
+
+test("PEN-6460: a stated reason outranks the run-outcome inference, in both directions", () => {
+  const runs = [{ conclusion: "success" }];
+  assert.equal(classifyMergeQueueEviction({ merged: false, mergeGroupRuns: runs, dequeueReason: "merge_conflict" }), "conflict_unstageable");
+  assert.equal(classifyMergeQueueEviction({ merged: false, mergeGroupRuns: runs, dequeueReason: "manual" }), "manual");
+  // `reason: merged` is the queue saying it removed the entry BECAUSE it
+  // merged the PR. `pr.merged` is read from another surface and can still be
+  // lagging after the grace window; without this, a landed PR gets an
+  // eviction notice.
+  assert.equal(classifyMergeQueueEviction({ merged: false, mergeGroupRuns: runs, dequeueReason: "merged" }), "merged");
+  // A reason must never make a demonstrated check failure quieter.
+  assert.equal(
+    classifyMergeQueueEviction({ merged: false, mergeGroupRuns: [{ conclusion: "failure" }], dequeueReason: "manual" }),
+    "check_failure",
+  );
+});
+
+test("PEN-6460: the reason is deliberately NOT consulted in the zero-run branch", () => {
+  // A PEN-4887 admission rejection IS a removal for checks that did not pass,
+  // so `failed_checks` is the expected report for it. Answering
+  // `check_failure` there would retire `requirements_unmet`, whose value is
+  // telling the reader to wait for the head's checks or arm auto-merge
+  // instead of hunting a failing one. If you are here because you want to
+  // make the reason authoritative everywhere, bring a measured specimen of a
+  // zero-run eviction whose reason contradicts this ladder.
+  assert.equal(
+    classifyMergeQueueEviction({
+      merged: false,
+      mergeGroupRuns: [],
+      dequeueReason: "failed_checks",
+      dequeueActor: "github-merge-queue[bot]",
+      admissionEvidence: { rejected: true, headAgeAtEnqueueMs: 4000, completedByDequeue: 1, incompleteAtDequeue: ["Build"], checkCount: 11 },
+    }),
+    "requirements_unmet",
+  );
+  assert.equal(
+    classifyMergeQueueEviction({
+      merged: false,
+      mergeGroupRuns: [],
+      dequeueReason: "failed_checks",
+      dequeueActor: "github-merge-queue[bot]",
+    }),
+    "conflict_unstageable",
+  );
+  // ... and a human dequeue in the same branch is still `manual`.
+  assert.equal(
+    classifyMergeQueueEviction({
+      merged: false,
+      mergeGroupRuns: [],
+      dequeueReason: "failed_checks",
+      dequeueActor: "allyblockcast",
+    }),
+    "manual",
+  );
+});
+
+test("PEN-6460: the reason is read for THIS attempt's removal, not the newest one", () => {
+  // #3591 carried three queue attempts on 2026-11-10. Taking "the last
+  // removal" would read a later attempt's reason onto this one -- the same
+  // failure `selectLatestQueueAttemptWindow` exists to avoid on the REST side.
+  const removals = [
+    { createdAt: "2026-11-10T21:01:02Z", reason: "failed_checks" },
+    { createdAt: "2026-11-10T22:41:30Z", reason: "failed_checks" },
+    { createdAt: "2026-11-10T23:55:00Z", reason: "merge_conflict" },
+  ];
+  assert.equal(selectDequeueReasonAt(removals, "2026-11-10T22:41:30Z"), "failed_checks");
+  assert.equal(selectDequeueReasonAt(removals, "2026-11-10T23:55:00Z"), "merge_conflict");
+  // Sub-second rendering drift between the REST and GraphQL surfaces must not
+  // silently drop the enhancement.
+  assert.equal(selectDequeueReasonAt([{ createdAt: "2026-11-10T22:41:30.482Z", reason: "manual" }], "2026-11-10T22:41:30Z"), "manual");
+  // No match, no reason, unusable input: null, so the inference ladder runs.
+  assert.equal(selectDequeueReasonAt(removals, "2026-11-10T12:00:00Z"), null);
+  assert.equal(selectDequeueReasonAt([{ createdAt: "2026-11-10T22:41:30Z", reason: null }], "2026-11-10T22:41:30Z"), null);
+  assert.equal(selectDequeueReasonAt(null, "2026-11-10T22:41:30Z"), null);
+  assert.equal(selectDequeueReasonAt(removals, null), null);
+});
+
+test("PEN-6460: the reason is read over GraphQL, because REST does not carry it", () => {
+  // Measured first-party on #3591, 2026-11-10: the REST timeline's
+  // `removed_from_merge_queue` event has keys [actor, commit_id, commit_url,
+  // created_at, event, id, node_id, performed_via_github_app, url] and no
+  // `reason`. Asserted behaviourally through the `exec` seam rather than by
+  // grepping for the query text, which a dropped result would also satisfy.
+  const calls = [];
+  const exec = (args) => {
+    calls.push(args.join(" "));
+    return '{"createdAt":"2026-11-10T22:41:30Z","reason":"failed_checks"}\n';
+  };
+
+  assert.equal(ghDequeueReason("Blockcast/paperclip", 3591, "2026-11-10T22:41:30Z", exec), "failed_checks");
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].includes("gh api graphql"), `expected a GraphQL read; got: ${calls[0]}`);
+  assert.ok(calls[0].includes("RemovedFromMergeQueueEvent"), `the query must select the removal node; got: ${calls[0]}`);
+  assert.ok(calls[0].includes("number=3591"), `the PR number must be bound as a variable; got: ${calls[0]}`);
+
+  // A failed read restores the pre-PEN-6460 behaviour exactly. This read must
+  // never be able to manufacture a verdict it did not get.
+  assert.equal(
+    ghDequeueReason("Blockcast/paperclip", 3591, "2026-11-10T22:41:30Z", () => {
+      throw new Error("HTTP 502");
+    }),
+    null,
+  );
+  assert.equal(ghDequeueReason("not-a-repo", 3591, "2026-11-10T22:41:30Z", exec), null);
+});
+
+test("PEN-6460: main() threads the dequeue reason into the classifier, the notice and the result", () => {
+  // Same guard shape as the PEN-3926/PEN-4887 handoff tests: every assertion
+  // above passes the reason to the classifier directly, so a main() that read
+  // it and forgot to hand it over would leave this suite green while every
+  // live notice kept naming a dequeuer who does not exist.
+  const source = readFileSync(DETECTOR_SOURCE_PATH, "utf8");
+  const handoffs = source.match(/^\s*dequeueReason,$/gm) ?? [];
+  assert.equal(
+    handoffs.length,
+    3,
+    "expected `dequeueReason` shorthand at exactly three sites -- `classifyMergeQueueEviction`, " +
+      `\`buildEvictionCommentBody\`, and the printed result -- found ${handoffs.length}.`,
+  );
+  assert.match(
+    source,
+    /const dequeueReason = ghDequeueReason\(repo, prNumber, attemptWindow\.dequeuedAt\)/,
+    "the reason must be read for the attempt window this run anchored to",
+  );
+});
+
+test("PEN-6460: an undetermined notice says the probe could not read, and never names a dequeuer", () => {
+  const body = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 3591,
+    classification: "unknown",
+    mergeGroupRunCount: 3,
+    base: "master",
+    identifiers: [],
+    unknownReason: "unreadable_jobs",
+  });
+  assert.match(body, /job list could not be read/);
+  assert.ok(!/manual \/ administrative dequeue/.test(body), "an unreadable probe must not be reported as a dequeue");
+  assert.ok(!/sample cap/.test(body), "that is the OTHER cause of `unknown` and would misdirect the reader");
+
+  // The truncated-sample wording is unchanged and is still the default, so a
+  // caller that does not pass `unknownReason` keeps the pre-PEN-6460 notice.
+  const truncated = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 3591,
+    classification: "unknown",
+    mergeGroupRunCount: 0,
+    base: "master",
+    identifiers: [],
+  });
+  assert.match(truncated, /hit its sample cap/);
+});
+
+test("PEN-6460: the check_failure notice does not promise a `failure` run, and prints GitHub's reason", () => {
+  // "concluded failing" is what sent #3591's reader looking for a red run.
+  // The run read `cancelled`; the failing thing was a job inside it.
+  const body = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 3591,
+    classification: "check_failure",
+    mergeGroupRunCount: 3,
+    base: "master",
+    identifiers: ["PEN-6460"],
+    dequeueReason: "failed_checks",
+  });
+  assert.match(body, /failing required check/);
+  assert.match(body, /timeout-minutes/);
+  assert.ok(!/concluded failing/.test(body), "the run itself is often `cancelled`, not `failure`");
+  assert.match(body, /GitHub's stated removal reason: `failed_checks`\./);
+
+  // No reason read (an old gh, a 502, a value we do not map): the line is
+  // simply absent rather than printing an empty backtick pair at a reader.
+  const noReason = buildEvictionCommentBody({
+    repo: "Blockcast/paperclip",
+    prNumber: 3591,
+    classification: "check_failure",
+    mergeGroupRunCount: 3,
+    base: "master",
+    identifiers: [],
+  });
+  assert.ok(!/stated removal reason/.test(noReason));
+  assert.match(noReason, /\(3 `merge_group` run\(s\) found for this PR's queue head at Blockcast\/paperclip\.\)/);
 });
