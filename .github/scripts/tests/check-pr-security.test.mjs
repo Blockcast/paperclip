@@ -4,6 +4,8 @@ import {
   buildAdvisoryPayload,
   buildSecurityCheckRunOutput,
   formatCheckRunFlagList,
+  formatFlagList,
+  mdCode,
   findExistingDraftAdvisory,
   postFlaggedSecurityResult,
   postSecurityCheckRun,
@@ -707,4 +709,137 @@ test('watchdogBoundFetch: a read gets only the retry budget left before the watc
   clock = 1_000 + SCRIPT_WATCHDOG_MS;
   await gh('/repos/o/r/pulls/1', 'tok');
   assert.equal(seen[1].retryBudgetMs, 0, 'no budget once the watchdog deadline has passed');
+});
+
+// ── mdCode: repo-controlled values in advisory / check-run markdown ──────────
+//
+// `file`, `line` and `packages` all come from the PR under review. Reading them
+// back out of the rendered markdown needs an oracle that is independent of the
+// generator, so this is a scanner for CommonMark 6.2 code spans rather than a
+// string match against what `mdCode` happens to emit.
+function codeSpans(md) {
+  const spans = [];
+  let i = 0;
+  while (i < md.length) {
+    if (md[i] !== '`') { i += 1; continue; }
+    let j = i;
+    while (j < md.length && md[j] === '`') j += 1;
+    const fence = j - i;
+
+    let k = j;
+    let closed = null;
+    while (k < md.length) {
+      if (md[k] !== '`') { k += 1; continue; }
+      let m = k;
+      while (m < md.length && md[m] === '`') m += 1;
+      if (m - k === fence) { closed = [k, m]; break; }
+      k = m;
+    }
+    // An opening run with no matching closer is literal text, not a span.
+    if (!closed) { i = j; continue; }
+
+    let content = md.slice(j, closed[0]).replace(/\r\n|[\r\n]/g, ' ');
+    if (content.length >= 2 && content.startsWith(' ') && content.endsWith(' ') && content.trim() !== '') {
+      content = content.slice(1, -1);
+    }
+    spans.push(content);
+    i = closed[1];
+  }
+  return spans;
+}
+
+test('codeSpans oracle: reads the spans CommonMark defines', () => {
+  assert.deepEqual(codeSpans('`a`'), ['a']);
+  assert.deepEqual(codeSpans('``a`b``'), ['a`b']);
+  assert.deepEqual(codeSpans('`` ` ``'), ['`']);
+  assert.deepEqual(codeSpans('`a` and `b`'), ['a', 'b']);
+  assert.deepEqual(codeSpans('`unclosed'), [], 'an unclosed fence is literal text');
+  assert.deepEqual(codeSpans('``x`'), [], 'a 2-backtick fence is not closed by a 1-backtick run');
+});
+
+test('mdCode: fences longer than the longest backtick run in the content', () => {
+  assert.equal(mdCode('plain'), '`plain`');
+  assert.equal(mdCode('a`b'), '``a`b``');
+  assert.equal(mdCode('a``b'), '```a``b```');
+});
+
+test('mdCode: pads content that starts or ends with a backtick', () => {
+  assert.equal(mdCode('`'), '`` ` ``');
+  assert.equal(mdCode('`x`'), '`` `x` ``');
+});
+
+test('mdCode: every value round-trips out of its span unchanged', () => {
+  const values = ['plain', 'a`b', '`', '`x`', '``', 'a  b', ' lead', 'trail ', '   ', '__bold__', 'x\ny'];
+  for (const value of values) {
+    const expected = value.replace(/\r\n|[\r\n]/g, ' ');
+    assert.deepEqual(codeSpans(mdCode(value)), [expected], `round trip failed for ${JSON.stringify(value)}`);
+  }
+});
+
+test('mdCode: flattens line endings so a value cannot forge a second flag entry', () => {
+  const forged = mdCode('x\n- `secret-scan`: injected');
+  assert.ok(!forged.includes('\n'), `a newline survived: ${forged}`);
+  assert.deepEqual(codeSpans(forged), ['x - `secret-scan`: injected']);
+});
+
+test('mdCode: an absent value stays absent rather than becoming an empty span', () => {
+  assert.equal(mdCode(''), '');
+  assert.equal(mdCode(null), '');
+  assert.equal(mdCode(undefined), '');
+});
+
+// ── formatFlagList: the advisory body ────────────────────────────────────────
+
+test('formatFlagList: a __tests__ path is fenced instead of rendering as emphasis', () => {
+  const file = 'server/src/__tests__/a.test.ts';
+  const out = formatFlagList([{ check: 'suspicious-test', file, pattern: 'absolute-file-read' }]);
+  assert.ok(codeSpans(out).includes(file), `path is not inside a code span: ${out}`);
+});
+
+test('formatFlagList: a backtick in the matched line stays inside one code span', () => {
+  const line = '+const p = readFile(`/etc/hosts`);';
+  const out = formatFlagList([{ check: 'suspicious-test', file: 'a.test.ts', pattern: 'absolute-file-read', line }]);
+  assert.ok(codeSpans(out).includes(line), `line escaped its span: ${out}`);
+});
+
+test('formatFlagList: markdown in the matched line does not become live markup', () => {
+  const line = '+const p = readFile(`/etc/**OWNED**/x);';
+  const out = formatFlagList([{ check: 'secret-scan', file: 'a.test.ts', pattern: 'High-entropy secret', line }]);
+  assert.ok(codeSpans(out).includes(line), `line escaped its span: ${out}`);
+});
+
+test('formatFlagList: lockfile package names are fenced', () => {
+  const packages = ['evil-pkg', 'md__bold__`x`'];
+  const out = formatFlagList([{ check: 'supply-chain', packages }]);
+  for (const name of packages) {
+    assert.ok(codeSpans(out).includes(name), `package ${JSON.stringify(name)} is not fenced: ${out}`);
+  }
+});
+
+// must-NOT-break fixture: the ordinary flag keeps its exact rendering, so a fix
+// that over-escapes (backslashing every metacharacter, say) reds here.
+test('formatFlagList: an ordinary flag renders exactly as before, plus the fence', () => {
+  const out = formatFlagList([{ check: 'secret-scan', file: 'src/config.ts', pattern: 'OpenAI API key' }]);
+  assert.equal(out, '- `secret-scan`: `src/config.ts` (pattern: OpenAI API key)');
+});
+
+// ── formatCheckRunFlagList: the check-run summary ────────────────────────────
+
+test('formatCheckRunFlagList: a __tests__ path is fenced in the check-run summary too', () => {
+  const file = 'server/src/__tests__/a.test.ts';
+  const text = formatCheckRunFlagList([{ check: 'suspicious-test', file, pattern: 'absolute-file-read' }]);
+  assert.ok(codeSpans(text).includes(file), `path is not inside a code span: ${text}`);
+});
+
+test('formatCheckRunFlagList: an oversized part is dropped whole, never cut mid-span', () => {
+  const packages = Array.from({ length: 400 }, (_, index) => `pkg-${index}-${'y'.repeat(20)}`);
+  const text = formatCheckRunFlagList([{ check: 'supply-chain', file: 'pnpm-lock.yaml', packages }]);
+
+  assert.ok(!text.includes('(packages:'), `the oversized part was cut rather than dropped: ${text.slice(0, 200)}`);
+  assert.ok(codeSpans(text).includes('pnpm-lock.yaml'), 'the flag itself is still reported');
+});
+
+test('formatCheckRunFlagList: a packages list that fits is kept whole', () => {
+  const text = formatCheckRunFlagList([{ check: 'supply-chain', file: 'pnpm-lock.yaml', packages: ['evil-pkg'] }]);
+  assert.ok(codeSpans(text).includes('evil-pkg'), `small packages list was dropped: ${text}`);
 });

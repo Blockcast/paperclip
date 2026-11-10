@@ -274,12 +274,44 @@ function worstSeverity(flags) {
   }, 'low');
 }
 
+// Render arbitrary text as a markdown code span that it cannot break out of.
+//
+// The advisory body and the check-run summary are both markdown, and three of
+// the fields interpolated into them are repo-controlled: the flagged file path,
+// the matched source line, and the lockfile package names. Left bare, an
+// ORDINARY path renders wrong -- `server/src/__tests__/a.test.ts` comes out as
+// `server/src/<strong>tests</strong>/a.test.ts`, which a maintainer cannot copy
+// -- and a backtick in a matched line closes the span early, so the rest of that
+// line renders as live markup instead of as the evidence it is.
+//
+// CommonMark 6.2 lets a code span use any fence length provided its content
+// holds no backtick run that long, so pick the fence from the content rather
+// than escaping the content. Content that starts or ends with a backtick or a
+// space is padded with one space, which the renderer strips back off, so the
+// round trip is exact.
+export function mdCode(value) {
+  const text = String(value ?? '').replace(/\r\n|[\r\n]/g, ' ');
+  if (text === '') return '';
+
+  const longestBacktickRun = (text.match(/`+/g) ?? [])
+    .reduce((longest, run) => Math.max(longest, run.length), 0);
+  const fence = '`'.repeat(longestBacktickRun + 1);
+  // All-space content is never stripped, so padding it would change it.
+  const pad = /^[` ]|[` ]$/.test(text) && !/^ +$/.test(text) ? ' ' : '';
+
+  return `${fence}${pad}${text}${pad}${fence}`;
+}
+
+// `check` and `pattern` are internal constants -- 6 check names and 9 pattern
+// names, every one of them `[\w .-]+` -- so they are not reachable by repo
+// content and are left unfenced. Route them through `mdCode` too if either set
+// ever grows a markdown metacharacter.
 export function formatFlagList(flags) {
   return flags.map(f => [
-    `- \`${f.check}\`: ${f.file ?? ''}`,
+    `- \`${f.check}\`: ${mdCode(f.file ?? '')}`,
     f.pattern ? ` (pattern: ${f.pattern})` : '',
-    f.packages ? ` (packages: ${f.packages.join(', ')})` : '',
-    f.line ? `\n  \`${f.line}\`` : '',
+    f.packages ? ` (packages: ${f.packages.map(p => mdCode(p)).join(', ')})` : '',
+    f.line ? `\n  ${mdCode(f.line)}` : '',
   ].join('')).join('\n');
 }
 
@@ -287,11 +319,23 @@ const CHECK_RUN_TEXT_MAX_LENGTH = 60_000;
 const CHECK_RUN_FLAG_MAX_LENGTH = 1_000;
 
 function formatCheckRunFlag(flag) {
-  return [
-    `- \`${flag.check}\`: ${flag.file ?? ''}`,
+  const parts = [
+    `- \`${flag.check}\`: ${mdCode(flag.file ?? '')}`,
     flag.pattern ? ` (pattern: ${flag.pattern})` : '',
-    flag.packages ? ` (packages: ${flag.packages.join(', ')})` : '',
-  ].join('').slice(0, CHECK_RUN_FLAG_MAX_LENGTH);
+    flag.packages ? ` (packages: ${flag.packages.map(p => mdCode(p)).join(', ')})` : '',
+  ];
+
+  // Drop whole parts to fit instead of slicing the joined string: a slice can
+  // land inside a code span and leave an unterminated fence, which would render
+  // the remainder of the check-run summary as code. The first part is always
+  // kept so no flag is reported as blank; `formatCheckRunFlagList` enforces the
+  // real ceiling over the whole block and says what it omitted.
+  let line = parts[0];
+  for (const part of parts.slice(1)) {
+    if (line.length + part.length > CHECK_RUN_FLAG_MAX_LENGTH) break;
+    line += part;
+  }
+  return line;
 }
 
 export function formatCheckRunFlagList(flags) {
