@@ -1742,7 +1742,7 @@ export function renderStalledHolds(repo, held, { staleHours = STALE_HOLD_HOURS }
     `  ${repo}#${number} — \`${reason}\`, ` +
     (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`);
   return (
-    `stale-hold (judgeable >${staleHours}h, still held) — ${held.length}:\n` +
+    `stale-hold (judgeable >${staleHours}h or undated, still held) — ${held.length}:\n` +
     held.map(line).join("\n") +
     "\nThe age is time since this head last reported, not time the hold has " +
     "stood — a hold acquired this fire on old CI still counts. Each row " +
@@ -1940,7 +1940,7 @@ export function renderUnlandedEligible(
     (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`) +
     (marked.has(number) ? ", never once queued" : "");
   return (
-    `unlanded-eligible (judgeable >${staleHours}h, nothing holding it) — ${stranded.length}:\n` +
+    `unlanded-eligible (judgeable >${staleHours}h or undated, nothing holding it) — ${stranded.length}:\n` +
     stranded.map(line).join("\n") +
     "\nThese carry no hold at all — the classifier said enqueue. So the thing " +
     "that has not happened is the landing itself, not a decision about it. " +
@@ -1952,7 +1952,7 @@ export function renderUnlandedEligible(
     "day, so one interval of ordinary schedule wait is normal." +
     (unoffered.length === 0
       ? ""
-      : `\n\nOf those, never once queued (>${CAP_STARVED_HOURS}h judgeable, no ` +
+      : `\n\nOf those, never once queued (>${CAP_STARVED_HOURS}h judgeable or undated, no ` +
         "`added_to_merge_queue` or `auto_merge_enabled` anywhere in the PR's " +
         `timeline) — ${unoffered.length}: ` +
         unoffered.map((n) => `${repo}#${n}`).join(", ") +
@@ -2139,7 +2139,7 @@ export function renderCapStarved(repo, starved, { staleHours = CAP_STARVED_HOURS
     `  ${repo}#${number} — \`${reason}\`, ` +
     (ageHours === null ? "age unknown (no dated check on this head)" : `${ageHours.toFixed(1)}h`);
   return (
-    `cap-starved (judgeable >${staleHours}h, never once queued) — ${starved.length}:\n` +
+    `cap-starved (judgeable >${staleHours}h or undated, never once queued) — ${starved.length}:\n` +
     starved.map(line).join("\n") +
     "\nThese are eligible and were deferred for budget, not for a reason — and " +
     "unlike the usual cap deferral they have never been offered a slot at all. " +
@@ -4576,8 +4576,11 @@ function main() {
         "Nothing is holding them. WHICH of the two causes it is — the routine " +
         "not running, or running and not reaching them — is not decided by this " +
         "line: an `--alarm` fire cannot apply, so its cap allocation is a " +
-        "simulation. See the unlanded-eligible block above, which marks every " +
-        "row that has never once been offered a queue slot.",
+        "simulation. See the unlanded-eligible block above, which marks the " +
+        "rows that have never once been offered a queue slot AND are past " +
+        `${CAP_STARVED_HOURS}h judgeable or undated. A never-queued row INSIDE ` +
+        "that clock is deliberately not marked, so an unmarked row there is " +
+        "not evidence it has ever been queued.",
     );
   }
   if (alarm && starved.length > 0) {
