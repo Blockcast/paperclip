@@ -50,6 +50,16 @@
  * master-health.yml's own `SERVER_SUITES_RAN` rule: proof is positive evidence
  * that the work happened, never the absence of a failure.
  *
+ * ⛔ A RUN THAT DID NOT TEST `master` SAYS NOTHING ABOUT master. `push:` here
+ * is pinned to master and `schedule:` always runs there, but master-health.yml's
+ * `workflow_dispatch:` carries NO branch restriction, so
+ * `gh workflow run master-health.yml --ref <branch>` produces a run whose
+ * `workflow_run` event this consumer accepts. The label set below deliberately
+ * carries no branch, so that run would resolve THE SAME alert identity as
+ * master — clearing a standing red on the strength of a feature branch's green.
+ * An ABSENT branch refuses too: "I cannot tell which tree this tested" is not
+ * "it tested master".
+ *
  * THIS IS ROUTING PLUS A CLASSIFICATION OVER ROWS IT IS HANDED. It makes no
  * GitHub API call, computes no threshold, and re-runs no test: the workflow
  * fetches the job rows and this script decides which of the three dispositions
@@ -92,6 +102,9 @@ export const ALERT_TTL_MS = 24 * 60 * 60 * 1000;
 
 export const ALERTNAME = 'MasterGeneralTestsFailing';
 
+/** The only branch this alert describes. See the branch rule in the header. */
+export const MASTER_BRANCH = 'master';
+
 /** Matrix jobs are `Master tests (server 1/4)`, `Master tests (workspaces-a)`, ... */
 export const SUITE_JOB_PREFIX = 'Master tests (';
 
@@ -118,7 +131,34 @@ export function suiteJobs(jobs) {
  * Returns { state: 'firing' | 'resolved' | 'skip', reason, failedJobs }.
  * `skip` means "this run says nothing about master" and MUST push neither way.
  */
-export function decideAlertState({ runConclusion, jobs }) {
+export function decideAlertState({
+  runConclusion,
+  jobs,
+  headBranch,
+  headSha = '',
+  isReplay = false,
+  masterHeadSha = '',
+}) {
+  // ⛔ BRANCH FIRST, because it invalidates the run in BOTH directions. A
+  // feature-branch dispatch of master-health (its `workflow_dispatch:` takes any
+  // ref) reaches this consumer, and this alert's identity carries no branch
+  // label, so a green one would RESOLVE master's standing red and a red one
+  // would fire "master is RED" about a tree that is not master.
+  //
+  // Deliberately not `headBranch && headBranch !== MASTER_BRANCH`: an absent or
+  // unreadable branch must refuse too. Unknown is not master.
+  if (headBranch !== MASTER_BRANCH) {
+    return {
+      state: 'skip',
+      reason:
+        `run tested ${headBranch ? `branch '${headBranch}'` : 'an unknown branch'}, not ` +
+        `'${MASTER_BRANCH}'. master-health.yml accepts workflow_dispatch on any ref, and this ` +
+        'alert carries no branch label, so routing it either way would describe master using a ' +
+        'tree that is not master.',
+      failedJobs: [],
+    };
+  }
+
   if (runConclusion === 'cancelled') {
     return {
       state: 'skip',
@@ -136,8 +176,49 @@ export function decideAlertState({ runConclusion, jobs }) {
     return { state: 'firing', reason: `${failed.length} suite job(s) failed`, failedJobs: failed.map((j) => j.name) };
   }
 
+  // ⛔ `failure` IS NOT THE ONLY NON-SUCCESS A SHARD CAN CARRY. A job-level
+  // timeout concludes `timed_out`, an individual shard can be `cancelled`
+  // inside a run that was not, and a protection rule leaves `action_required`.
+  // Each is a shard whose result is UNKNOWN, and three green shards beside one
+  // timed-out shard is not a green master — the unknown one may be exactly the
+  // one that was red. So resolution requires every non-skipped row to be
+  // `success`: the header's positive-evidence rule applied per-ROW, not
+  // per-RUN. These do not FIRE either; an ambiguous shard is not evidence of a
+  // failing test, and a standing alert simply keeps standing.
+  const unresolved = suite.filter((j) => j.conclusion !== 'success' && j.conclusion !== 'skipped');
+  if (unresolved.length > 0) {
+    return {
+      state: 'skip',
+      reason:
+        `${unresolved.length} suite job(s) neither succeeded nor were skipped ` +
+        `(${unresolved.map((j) => `${j.name}: ${j.conclusion ?? 'no conclusion'}`).join(', ')}). ` +
+        'A shard whose result is unknown cannot clear a red that nothing re-tested.',
+      failedJobs: [],
+    };
+  }
+
   const succeeded = suite.filter((j) => j.conclusion === 'success');
   if (succeeded.length > 0) {
+    // ⛔ A REPLAY RESOLVES ONLY AT THE CURRENT master HEAD. `workflow_dispatch`
+    // takes an arbitrary run id, so replaying an OLD green run would clear an
+    // alert raised by a red that landed AFTER it.
+    //
+    // A LIVE event is deliberately NOT held to this, and that asymmetry is the
+    // point: the arc-paperclip-general queue puts ~3.5h between a push and its
+    // verdict, so master has ALWAYS moved on by the time a run concludes.
+    // Requiring equality on the live path would not be safer, it would make
+    // resolution impossible — every green would skip and the lane would only
+    // ever clear on the TTL.
+    if (isReplay && (!headSha || !masterHeadSha || headSha !== masterHeadSha)) {
+      return {
+        state: 'skip',
+        reason:
+          `replayed run tested ${headSha || 'an unknown head'}, which is not the current ` +
+          `${MASTER_BRANCH} head ${masterHeadSha || '(unreadable)'}. A replay of an older green ` +
+          'run would clear an alert raised by a red that landed after it.',
+        failedJobs: [],
+      };
+    }
     return {
       state: 'resolved',
       reason: `${succeeded.length} suite job(s) ran and succeeded, and none failed`,
@@ -224,6 +305,10 @@ async function main() {
   const headSha = process.env.HEAD_SHA ?? '';
   const headBranch = process.env.HEAD_BRANCH ?? '';
   const runConclusion = process.env.RUN_CONCLUSION ?? '';
+  // Set only on the workflow_dispatch replay path, where the operator chooses
+  // the run id and it may be arbitrarily old.
+  const isReplay = (process.env.IS_REPLAY ?? '') === 'true';
+  const masterHeadSha = process.env.MASTER_HEAD_SHA ?? '';
   const base = (process.env.ALERTMANAGER_URL || DEFAULT_ALERTMANAGER_URL).replace(/\/+$/, '');
 
   let jobs;
@@ -237,7 +322,14 @@ async function main() {
     process.exit(1);
   }
 
-  const { state, reason, failedJobs } = decideAlertState({ runConclusion, jobs });
+  const { state, reason, failedJobs } = decideAlertState({
+    runConclusion,
+    jobs,
+    headBranch,
+    headSha,
+    isReplay,
+    masterHeadSha,
+  });
 
   if (state === 'skip') {
     console.log(`Not routing: ${reason}`);

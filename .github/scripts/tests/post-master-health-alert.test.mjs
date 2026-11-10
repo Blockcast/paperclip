@@ -76,7 +76,7 @@ test('a cancelled run routes NEITHER way', () => {
   // (41 of the 50 most recent runs), and those runs never took a runner.
   // Firing on them would flood the lane; resolving on them would clear a real
   // red on the strength of a run that executed no tests.
-  const decision = decideAlertState({ runConclusion: 'cancelled', jobs: [] });
+  const decision = decideAlertState({ runConclusion: 'cancelled', jobs: [], headBranch: 'master' });
   assert.equal(decision.state, 'skip');
   assert.match(decision.reason, /cancelled/);
 });
@@ -87,12 +87,13 @@ test('a cancelled run routes neither way EVEN IF stale job rows say success', ()
   const decision = decideAlertState({
     runConclusion: 'cancelled',
     jobs: [{ name: 'Master tests (server 1/4)', conclusion: 'success' }],
+    headBranch: 'master',
   });
   assert.equal(decision.state, 'skip');
 });
 
 test('a failing suite job fires', () => {
-  const decision = decideAlertState({ runConclusion: 'failure', jobs: JSON.parse(FAILED_RUN_JOBS).jobs });
+  const decision = decideAlertState({ runConclusion: 'failure', jobs: JSON.parse(FAILED_RUN_JOBS).jobs, headBranch: 'master' });
   assert.equal(decision.state, 'firing');
   assert.deepEqual(decision.failedJobs, ['Master tests (server 1/4)']);
 });
@@ -106,6 +107,7 @@ test('a failure wins over a sibling success in the same run', () => {
       { name: 'Master tests (server 1/4)', conclusion: 'success' },
       { name: 'Master tests (server 3/4)', conclusion: 'failure' },
     ],
+    headBranch: 'master',
   });
   assert.equal(decision.state, 'firing');
 });
@@ -117,6 +119,7 @@ test('a suite that ran and passed resolves', () => {
       { name: 'Was this commit already proven by the merge queue?', conclusion: 'success' },
       { name: 'Master tests (server 1/4)', conclusion: 'success' },
     ],
+    headBranch: 'master',
   });
   assert.equal(decision.state, 'resolved');
 });
@@ -132,14 +135,178 @@ test('an ALL-SKIPPED matrix does NOT resolve, though the run concluded success',
       { name: 'Was this commit already proven by the merge queue?', conclusion: 'success' },
       { name: 'Master tests (${{ matrix.group_label }})', conclusion: 'skipped' },
     ],
+    headBranch: 'master',
   });
   assert.equal(decision.state, 'skip');
   assert.match(decision.reason, /skipped matrix still concludes success/);
 });
 
 test('a run with no suite job rows at all does not resolve', () => {
-  const decision = decideAlertState({ runConclusion: 'success', jobs: [] });
+  const decision = decideAlertState({ runConclusion: 'success', jobs: [], headBranch: 'master' });
   assert.equal(decision.state, 'skip');
+});
+
+test('a GREEN run on a NON-master branch does not resolve', () => {
+  // The silent false-resolve this file exists to rule out. master-health.yml's
+  // `workflow_dispatch:` has no branch restriction, so
+  // `gh workflow run master-health.yml --ref <branch>` makes a run this
+  // consumer accepts -- and the alert carries no branch label, so resolving
+  // here would clear master's standing red using a feature branch's green.
+  const decision = decideAlertState({
+    runConclusion: 'success',
+    jobs: [{ name: 'Master tests (server 1/4)', conclusion: 'success' }],
+    headBranch: 'devops/some-feature',
+  });
+  assert.equal(decision.state, 'skip');
+  assert.match(decision.reason, /not 'master'/);
+});
+
+test('a RED run on a non-master branch does not fire either', () => {
+  // The other direction: the alert says "master is RED", so firing it about a
+  // tree that is not master is a false alarm, not a safe default.
+  const decision = decideAlertState({
+    runConclusion: 'failure',
+    jobs: [{ name: 'Master tests (server 1/4)', conclusion: 'failure' }],
+    headBranch: 'devops/some-feature',
+  });
+  assert.equal(decision.state, 'skip');
+});
+
+test('an ABSENT branch refuses, rather than being assumed to be master', () => {
+  // Unknown is not master. If the branch could not be read back, the run's
+  // subject is unestablished and it must route neither way.
+  const decision = decideAlertState({
+    runConclusion: 'success',
+    jobs: [{ name: 'Master tests (server 1/4)', conclusion: 'success' }],
+  });
+  assert.equal(decision.state, 'skip');
+  assert.match(decision.reason, /unknown branch/);
+});
+
+test('a TIMED-OUT shard beside green ones does not resolve', () => {
+  // `failure` is not the only non-success a row can carry. The timed-out shard
+  // may be exactly the one that was red, so three greens are not a green
+  // master -- positive evidence is required per ROW, not per run.
+  const decision = decideAlertState({
+    runConclusion: 'success',
+    jobs: [
+      { name: 'Master tests (server 1/4)', conclusion: 'success' },
+      { name: 'Master tests (server 2/4)', conclusion: 'success' },
+      { name: 'Master tests (server 3/4)', conclusion: 'timed_out' },
+    ],
+    headBranch: 'master',
+  });
+  assert.equal(decision.state, 'skip');
+  assert.match(decision.reason, /timed_out/);
+});
+
+test('a shard with NO conclusion does not resolve', () => {
+  const decision = decideAlertState({
+    runConclusion: 'success',
+    jobs: [
+      { name: 'Master tests (server 1/4)', conclusion: 'success' },
+      { name: 'Master tests (server 2/4)', conclusion: null },
+    ],
+    headBranch: 'master',
+  });
+  assert.equal(decision.state, 'skip');
+});
+
+test('a skipped shard beside a green one still resolves', () => {
+  // Vacuity control for the two tests above: the stricter rule must not have
+  // made resolution unreachable. `skipped` is the one non-success that is
+  // legitimately not evidence of anything, and master-health skips shards by
+  // design when the gate finds a merge_group proof.
+  const decision = decideAlertState({
+    runConclusion: 'success',
+    jobs: [
+      { name: 'Master tests (server 1/4)', conclusion: 'success' },
+      { name: 'Master tests (server 2/4)', conclusion: 'skipped' },
+    ],
+    headBranch: 'master',
+  });
+  assert.equal(decision.state, 'resolved');
+});
+
+test('a REPLAY of an older green run does not resolve', () => {
+  // `workflow_dispatch` takes an arbitrary run id, so replaying a green run
+  // from before a red landed would clear the alert that red raised.
+  const decision = decideAlertState({
+    runConclusion: 'success',
+    jobs: [{ name: 'Master tests (server 1/4)', conclusion: 'success' }],
+    headBranch: 'master',
+    isReplay: true,
+    headSha: 'aaaaaaa',
+    masterHeadSha: 'bbbbbbb',
+  });
+  assert.equal(decision.state, 'skip');
+  assert.match(decision.reason, /not the current master head/);
+});
+
+test('a REPLAY at the CURRENT master head resolves', () => {
+  // Vacuity control: the documented "confirm a red master has recovered"
+  // replay must still work.
+  const decision = decideAlertState({
+    runConclusion: 'success',
+    jobs: [{ name: 'Master tests (server 1/4)', conclusion: 'success' }],
+    headBranch: 'master',
+    isReplay: true,
+    headSha: 'aaaaaaa',
+    masterHeadSha: 'aaaaaaa',
+  });
+  assert.equal(decision.state, 'resolved');
+});
+
+test('a replay whose master head could NOT be read does not resolve', () => {
+  const decision = decideAlertState({
+    runConclusion: 'success',
+    jobs: [{ name: 'Master tests (server 1/4)', conclusion: 'success' }],
+    headBranch: 'master',
+    isReplay: true,
+    headSha: 'aaaaaaa',
+    masterHeadSha: '',
+  });
+  assert.equal(decision.state, 'skip');
+});
+
+test('a LIVE green run resolves even though master has moved on', () => {
+  // The asymmetry is load-bearing. The arc-paperclip-general queue puts ~3.5h
+  // between a push and its verdict, so master has ALWAYS advanced by the time
+  // a run concludes. Holding the live path to the replay's head test would not
+  // be safer -- it would make resolution impossible and leave the lane to
+  // clear only on the 24h TTL.
+  const decision = decideAlertState({
+    runConclusion: 'success',
+    jobs: [{ name: 'Master tests (server 1/4)', conclusion: 'success' }],
+    headBranch: 'master',
+    isReplay: false,
+    headSha: 'aaaaaaa',
+    masterHeadSha: 'bbbbbbb',
+  });
+  assert.equal(decision.state, 'resolved');
+});
+
+test('a non-master run exits 0 WITHOUT delivering anything', async () => {
+  // Process-level control for the branch gate, matching the cancelled-run one:
+  // `exit 0` alone is also what a successful delivery produces, so the
+  // assertion is the request count.
+  const seen = [];
+  await withAlertmanager(
+    (req, res) => {
+      seen.push(req.url);
+      res.writeHead(200).end('{}');
+    },
+    async (base) => {
+      const { code, stdout } = await runScript({
+        ALERTMANAGER_URL: base,
+        HEAD_BRANCH: 'devops/some-feature',
+        RUN_CONCLUSION: 'success',
+      });
+      assert.equal(code, 0, stdout);
+      assert.equal(seen.length, 0, 'a run that did not test master must push nothing');
+      assert.match(stdout, /Not routing/);
+    },
+  );
 });
 
 test('suiteJobs ignores the gate job and tolerates junk rows', () => {

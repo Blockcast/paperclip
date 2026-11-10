@@ -69,13 +69,22 @@ jobs:
     # jobs). Without this gate each one would spend an arc-light runner to
     # decide it has nothing to say, ~40 times a day.
     #
-    # The script re-checks `cancelled` anyway and is tested on it. That is not
-    # redundancy for its own sake: this `if:` is a COST control, and the
-    # correctness of never resolving on a run that executed no tests must not
-    # depend on a YAML expression nothing can unit-test.
+    # The branch test is here for the same reason: master-health.yml's
+    # `workflow_dispatch:` carries no branch restriction, so a run of it on a
+    # feature branch reaches this consumer, and this alert carries no branch
+    # label -- a green one would RESOLVE master's standing red. On the dispatch
+    # replay arm the branch is not knowable at job level (we hold only a run
+    # id), so the script makes the same test on the value it reads back.
+    #
+    # The script re-checks `cancelled` and the branch anyway, and is tested on
+    # both. That is not redundancy for its own sake: this `if:` is a COST
+    # control, and the correctness of never resolving on a run that executed no
+    # tests -- or tested a tree that is not master -- must not depend on a YAML
+    # expression nothing can unit-test.
     if: >-
       ${{ github.event_name == 'workflow_dispatch'
-      || (github.event.workflow_run.conclusion != 'cancelled'
+      || (github.event.workflow_run.head_branch == 'master'
+      && github.event.workflow_run.conclusion != 'cancelled'
       && github.event.workflow_run.conclusion != 'skipped') }}
     # arc-light, never arc-merge-queue and never arc-paperclip-general: this is a
     # seconds-long `gh api` job and must not contend with the pools whose depth
@@ -109,6 +118,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+          IS_REPLAY: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           set -euo pipefail
           meta="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" \
@@ -118,6 +128,18 @@ jobs:
           echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
           echo "head_branch=${head_branch}" >> "$GITHUB_OUTPUT"
           echo "html_url=${html_url}" >> "$GITHUB_OUTPUT"
+          # Only the replay arm can hand us an arbitrarily old run, so only it
+          # needs the current master head to compare against. A LIVE event must
+          # NOT be held to that comparison: the arc-paperclip-general queue puts
+          # ~3.5h between a push and its verdict, so master has always moved on
+          # by the time a run concludes, and requiring equality there would stop
+          # the lane ever clearing on a fix.
+          master_head=""
+          if [ "${IS_REPLAY}" = "true" ]; then
+            master_head="$(gh api "repos/${REPO}/commits/master" --jq '.sha')"
+            echo "Current master head: ${master_head}"
+          fi
+          echo "master_head_sha=${master_head}" >> "$GITHUB_OUTPUT"
           echo "Run ${RUN_ID}: conclusion=${conclusion} head=${head_sha} branch=${head_branch}"
 
       # The job rows ARE the evidence. The run conclusion alone cannot
@@ -158,6 +180,8 @@ jobs:
           HEAD_SHA: ${{ steps.run.outputs.head_sha }}
           HEAD_BRANCH: ${{ steps.run.outputs.head_branch }}
           RUN_URL: ${{ steps.run.outputs.html_url }}
+          IS_REPLAY: ${{ github.event_name == 'workflow_dispatch' }}
+          MASTER_HEAD_SHA: ${{ steps.run.outputs.master_head_sha }}
         run: |
           MASTER_HEALTH_JOBS_JSON="$(cat "${RUNNER_TEMP}/master-health-jobs.json")" \
             node .github/scripts/post-master-health-alert.mjs

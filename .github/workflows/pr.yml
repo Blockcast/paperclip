@@ -452,6 +452,23 @@ jobs:
           node --test ./.github/scripts/tests/post-git-egress-residual-trigger-alert.test.mjs
         timeout-minutes: 2
 
+      # PEN-6398. The consumer that carries a RED master out of
+      # `master-health.yml` and into Alertmanager. Wired here by name because
+      # this repo has no glob runner for `.github/scripts/tests` -- every suite
+      # under it is named in this file individually, so a test file that is not
+      # listed here never runs at all.
+      #
+      # Reviewed on every PR rather than only when a red trunk next happens,
+      # for the same reason as the detector above: the failure mode is SILENCE.
+      # Three of the four branches exist only to refuse -- a run that tested a
+      # branch other than master, a shard whose result is unknown, and a replay
+      # of a stale green -- and each would clear a standing red if it regressed,
+      # which is invisible until the next real trunk failure goes unannounced.
+      - name: Test master-health alert routing (PEN-6398)
+        if: ${{ !cancelled() }}
+        run: node --test ./.github/scripts/tests/post-master-health-alert.test.mjs
+        timeout-minutes: 2
+
       # PEN-5186. Residual 4 of §8 of the D1 broker enablement plan: two git
       # config keys the agent owns in its own `.git/config` would reach an exec
       # inside the container that holds the publish credential, and both are
