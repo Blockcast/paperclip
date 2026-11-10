@@ -7,6 +7,8 @@ import { describe, expect, it } from "vitest";
 import {
   buildPullRequestWorkProductFields,
   OPEN_PULL_REQUEST_WORK_PRODUCT_STATUSES,
+  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
   PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID,
   pullRequestExternalId,
   pullRequestHasMerged,
@@ -425,5 +427,86 @@ describe("pullRequestOwnershipRelation", () => {
       "undetermined",
     );
     expect(pullRequestOwnershipRelation("BLO-1", recordedPullRequestOwners([]))).toBe("mention");
+  });
+});
+
+/**
+ * PEN-6413. The webhook is the only writer of this table, so a lost `closed`
+ * delivery leaves a row permanently non-terminal -- 24 of 4592 bound PRs
+ * (0.52%) company-wide on 2026-11-10. The merged-PR reconciler now repairs
+ * those from GitHub, and a repaired row must stay distinguishable from a
+ * delivered one.
+ */
+describe("reconciler provenance (PEN-6413)", () => {
+  const merged = {
+    repoFullName: "Blockcast/paperclip",
+    prNumber: 2991,
+    prTitle: "docs: rule on lane contention (PEN-5041)",
+    prBranch: "cto/pen-5041-lane-contention-ruling",
+    prMerged: true,
+    prMergedAt: "2026-11-07T02:49:13Z",
+    prUpdatedAt: "2026-11-07T02:49:14Z",
+    action: "closed",
+    owningIdentifiers: ["PEN-5041"],
+  };
+
+  it("defaults `metadata.source` to the webhook for every existing caller", () => {
+    const fields = buildPullRequestWorkProductFields(merged);
+    expect(fields.metadata.source).toBe(PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE);
+  });
+
+  it("marks a reconciler-sourced row so a census cannot read a backfill as a delivery", () => {
+    const fields = buildPullRequestWorkProductFields({
+      ...merged,
+      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+    });
+    expect(fields.metadata.source).toBe(PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER);
+    // The two constants must stay distinct, or the marker discriminates nothing.
+    expect(PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER).not.toBe(
+      PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+    );
+  });
+
+  it("still records the terminal state and the owning set it was given", () => {
+    // `metadata` is replaced wholesale when the ordering guard accepts a row,
+    // so a reconciler that passed `owningIdentifiers: null` would erase a
+    // recorded owning set and silently downgrade every consumer's `relation`
+    // from "owner" to "undetermined". The repair resolves it the same way the
+    // webhook does and passes it through.
+    const fields = buildPullRequestWorkProductFields({
+      ...merged,
+      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+    });
+    expect(fields.status).toBe("merged");
+    expect(fields.metadata.merged).toBe(true);
+    expect(fields.metadata.mergedAt).toBe("2026-11-07T02:49:13Z");
+    expect(fields.metadata.owningIdentifiers).toEqual(["PEN-5041"]);
+    // Rank must be the merge rank, not the `closed` rank, or a repaired row
+    // loses the tie-break against the non-terminal row it is replacing.
+    expect(fields.metadata.sourceEventOrder).toBe(30);
+    expect(fields.metadata.sourceEventActionOrder).toBe(50);
+  });
+
+  it("carries a source timestamp so the guard keeps its strict comparison", () => {
+    // A null timestamp drops `upsertByExternalId` to its tie-break, which
+    // prefers a terminal row -- that would let a backfill overwrite a LATER
+    // delivered event. The repair falls back to the merge instant rather than
+    // passing null.
+    const fields = buildPullRequestWorkProductFields({
+      ...merged,
+      prUpdatedAt: null,
+      prMergedAt: "2026-11-07T02:49:13Z",
+      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+    });
+    expect(fields.metadata.sourceEventTimestampMs).toBeNull();
+
+    const withFallback = buildPullRequestWorkProductFields({
+      ...merged,
+      prUpdatedAt: "2026-11-07T02:49:13Z",
+      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+    });
+    expect(withFallback.metadata.sourceEventTimestampMs).toBe(
+      Date.parse("2026-11-07T02:49:13Z"),
+    );
   });
 });

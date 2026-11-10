@@ -22,6 +22,11 @@ import { unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { computeAuthoredLoc, type GithubPullFile } from "./authored-loc.js";
 import {
+  buildPullRequestWorkProductFields,
+  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+} from "./pull-request-work-products.js";
+import { workProductService } from "./work-products.js";
+import {
   extractPaperclipIdentifiers,
   resolveLinkSourceForIdentifier,
   resolveOwningPaperclipIdentifiers,
@@ -306,6 +311,12 @@ interface GithubPullDetail {
   title?: string | null;
   body?: string | null;
   merged_at?: string | null;
+  // PEN-6413: `updated_at` feeds the work-product ordering guard, which accepts
+  // an incoming row only when its source timestamp is strictly later than the
+  // stored one. `html_url` is the row's link. Both are already present on the
+  // REST PR detail fetched below; neither was read before.
+  html_url?: string | null;
+  updated_at?: string | null;
   additions?: number | null;
   deletions?: number | null;
   head?: { ref?: string | null; sha?: string | null } | null;
@@ -337,7 +348,13 @@ export async function reconcileMergedPullRequests(
     token?: string | null;
     enrichLoc?: boolean;
   },
-): Promise<{ enumerated: number; linked: number; unlinked: number; enriched: number }> {
+): Promise<{
+  enumerated: number;
+  linked: number;
+  unlinked: number;
+  enriched: number;
+  workProductsRepaired: number;
+}> {
   const apiBase = gitHubApiBase(GITHUB_HOST);
   const headers = githubApiHeaders(input.token);
 
@@ -358,6 +375,8 @@ export async function reconcileMergedPullRequests(
   let linked = 0;
   let unlinked = 0;
   let enriched = 0;
+  let workProductsRepaired = 0;
+  const workProducts = workProductService(db);
 
   for (let page = 1; page <= 10; page += 1) {
     const url = `${apiBase}/search/issues?q=${encodeURIComponent(q)}&per_page=100&page=${page}`;
@@ -416,6 +435,91 @@ export async function reconcileMergedPullRequests(
       if (issueId) linked += 1;
       else unlinked += 1;
 
+      // PEN-6413. Repair the PR WORK PRODUCT from the same GitHub read.
+      //
+      // Two merged-PR records exist and only one of them was repairable. The
+      // link table above has this backfill but NO read route, so no consumer
+      // can see it. `issue_work_products` is the opposite: it backs
+      // `GET /issues/:id/work-products` and the by-external-id lookup that the
+      // fleet's "whose row owns this PR?" directive depends on, and the webhook
+      // is its ONLY writer -- so a lost `closed` delivery leaves it
+      // permanently non-terminal. The table with the repair had no readers; the
+      // table with the readers had no repair.
+      //
+      // Measured company-wide 2026-11-10 over 5815/5815 issues: 24 of 4592
+      // bound PRs (0.52%) carry a non-terminal work-product status while GitHub
+      // reports MERGED/CLOSED. The losses arrive in bursts -- four adjacent
+      // pairs within 60s, one of them spanning two repos, P < 1e-5 against a
+      // uniform null -- which rules out per-PR payload parsing and repo webhook
+      // config, and points at ingestion windows. Nothing re-reads GitHub for
+      // this table, so every one of those rows is permanent.
+      //
+      // Safe by construction against the ordering guard in
+      // `upsertByExternalId`: this row is accepted only when its source
+      // timestamp is strictly later than the stored one, and on an exact tie
+      // two terminal rows fall through to equal action/source ranks and the
+      // incoming one is REJECTED. A row already recording the merge is
+      // therefore left alone rather than churned.
+      //
+      // Writes one row per REFERENCED issue, mirroring the webhook, not just
+      // the single `issueId` the link table keeps -- the work product is
+      // evidence about the PR and every referencing row carries one.
+      // `owningIdentifiers` is resolved the same way the webhook resolves it,
+      // because `metadata` is replaced wholesale on accept: passing `null` here
+      // would erase a recorded owning set and silently downgrade every
+      // consumer's `relation` from "owner" to "undetermined".
+      const mergedAtIso = detail?.merged_at ?? null;
+      if (mergedAtIso) {
+        const owning = resolveOwningPaperclipIdentifiers({ branch, title, body }).owning;
+        const targets = new Set<string>([...identifiers, ...owning]);
+        const fields = buildPullRequestWorkProductFields({
+          repoFullName: input.repoFullName,
+          prNumber: item.number,
+          prTitle: title,
+          prUrl: detail?.html_url ?? null,
+          headSha: detail?.head?.sha ?? null,
+          previousHeadSha: null,
+          prBranch: branch,
+          prDraft: false,
+          prMerged: true,
+          prMergedAt: mergedAtIso,
+          // Falls back to the merge instant when the detail fetch above failed:
+          // null here would drop the guard to its tie-break, which prefers a
+          // terminal row and would accept this one against a LATER delivered
+          // event. A present timestamp keeps the strict comparison.
+          prUpdatedAt: detail?.updated_at ?? mergedAtIso,
+          action: "closed",
+          owningIdentifiers: owning,
+          source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+        });
+        for (const targetIdentifier of targets) {
+          const targetIssueId = issueByIdentifier.get(targetIdentifier);
+          if (!targetIssueId) continue;
+          try {
+            await workProducts.upsertByExternalId(
+              targetIssueId,
+              input.companyId,
+              { provider: "github", type: "pull_request", externalId: fields.externalId },
+              {
+                title: fields.title,
+                url: fields.url,
+                status: fields.status,
+                metadata: fields.metadata,
+                sourceTrust: fields.sourceTrust,
+              },
+            );
+            workProductsRepaired += 1;
+          } catch (err) {
+            // Best-effort, mirroring the webhook: a work-product write must
+            // never break the link reconciliation this function exists for.
+            logger.warn(
+              { err, prNumber: item.number, targetIdentifier },
+              "reconciler PR work-product repair failed",
+            );
+          }
+        }
+      }
+
       if (input.enrichLoc) {
         try {
           await enrichAuthoredLocForRow(db, row, { token: input.token });
@@ -429,7 +533,7 @@ export async function reconcileMergedPullRequests(
     if (items.length < 100) break;
   }
 
-  return { enumerated, linked, unlinked, enriched };
+  return { enumerated, linked, unlinked, enriched, workProductsRepaired };
 }
 
 // Test-only re-exports.
