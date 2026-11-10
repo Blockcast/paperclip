@@ -3076,7 +3076,12 @@ registry.registerPath({
     "board's preserved attribution OR the withdrawer, so it is not evidence of a board decision. " +
     "A server predating " +
     "PEN-5432 omits the key from summary rows entirely, where an absent key is not the same claim as " +
-    "a null one — read the decider from GET /api/approvals/{id} rather than inferring from its absence.",
+    "a null one — read the decider from GET /api/approvals/{id} rather than inferring from its absence. " +
+    "PEN-6425: limit/offset are honoured on the full and summary views, ordered by createdAt then id so " +
+    "offset paging is stable. There is no implicit cap — omitting limit returns every matching row, so a " +
+    "short array is a window the caller asked for and never a silent prefix. page/perPage/per_page are " +
+    "rejected 400 rather than dropped unread, and limit/offset are rejected with view=count because a " +
+    "count is already computed over every matching row.",
   request: {
     params: z.object({ companyId: z.string() }),
     query: listApprovalsQuerySchema,
