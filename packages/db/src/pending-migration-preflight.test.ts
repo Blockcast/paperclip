@@ -644,10 +644,24 @@ describe("guarded migrations gate their raise on table population", () => {
       // One entry per `DO $$ ... $$;` guard. A file with no `DO` block is one
       // block, which is how this stays identical for the pre-0278 shapes.
       const blocks = sql.split(/(?=DO \$\$)/).filter((part) => /DROP INDEX CONCURRENTLY/.test(part));
+      // EQUALITY against the registry, not `> 0` (PEN-6104). The filter above
+      // is what selects the blocks this test then inspects, so a block that
+      // LOST its structural raise does not fail here -- it silently leaves the
+      // population, and every assertion below runs over the survivors and
+      // passes. On a one-index migration that is harmless (0 survivors trips
+      // the floor), but 0278 registers four indexes as four `DO $$` guards, so
+      // deleting the raise from one of them left three blocks and a green
+      // suite. One index per guard is the shape the registry already asserts
+      // (`registers one entry per index` above), which makes the entry count
+      // the right expected value and keeps this identical for every
+      // single-index file.
+      const guardsExpected = PRECREATE_REQUIRED_INDEXES.filter(
+        (entry) => entry.migration === spec.migration,
+      ).length;
       expect(
         blocks.length,
-        `${spec.migration} has no mismatch remediation to anchor on`,
-      ).toBeGreaterThan(0);
+        `${spec.migration} should carry one mismatch remediation per registered index`,
+      ).toBe(guardsExpected);
 
       for (const block of blocks) {
         const hints = [...block.matchAll(/DROP INDEX CONCURRENTLY/g)];
