@@ -13,8 +13,9 @@ verification programs gate access to it. `src/index.ts` and `src/server/models.t
 carry the same rows.
 
 **Runtime pin.** `DEFAULT_CLAUDE_CODE_VERSION` moves from `2.1.311` to `2.1.321`.
-2.1.321 is the first release whose changelog adds Fable 5.2, and older clients get the
-API's "does not support this model" 400. 2.1.321 is the npm `latest` and `next`
+2.1.321 is the first release whose changelog adds Fable 5.2. An older client does not know
+the model: 2.1.311 logs `unrecognized_model` and runs it with a 200K context and 32K max
+output instead of 1M and 128K. That is a floor for the CLI, not for the API (see below). 2.1.321 is the npm `latest` and `next`
 dist-tag; `stable` is still 2.1.311. This bump follows `latest` because no `stable`
 build supports the new models; the 2.1.311 bump followed `stable`. Agents without
 `adapterConfig.claudeCodeVersion` install 2.1.321 once into a fresh versioned
@@ -25,8 +26,9 @@ PVC. The `README.md` row and the config doc in `src/index.ts` follow the constan
 **What else 2.1.321 changes for agents.** The `fable` alias now resolves to
 `claude-fable-5-2`; an explicit `claude-fable-5-1` keeps the old model. No live agent used
 `fable` or `best` when this landed. On the subscription path Anthropic sees the penstock
-vault's `claude-cli/<version>` user agent, not this pin, so 5.2 needs the vault to present
-2.1.321 as well.
+vault's `claude-cli/<version>` user agent, not this pin. The vaults present 2.1.299, and
+penstock usage_metering shows `claude-fable-5-2` served to them on 2026-11-09 at 20:06Z and
+20:20Z (penstock-llm-proxy-core#3267), so the vault needed no change for 5.2.
 
 **Corrupt `.claude.json` guard.** Since 2.1.318 a non-interactive start no longer replaces a
 `.claude.json` that is not valid JSON with defaults; it fails with "Configuration error in
