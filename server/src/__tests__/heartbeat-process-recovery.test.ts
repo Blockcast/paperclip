@@ -1847,6 +1847,13 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     // Activity clears the warning, so the next sweep flags the run again.
     await heartbeat.reportRunActivity(runId);
     expect((await heartbeat.getRun(runId))?.errorCode).toBeNull();
+    // BLO-55494: clearing the warning renews updatedAt, and the BLO-55216 owner
+    // shield skips a local run younger than PRELAUNCH_OWNER_STALE_MS (2 min).
+    // Age the stamp past it, as an orphaned run's would be by the next sweep.
+    await db
+      .update(heartbeatRuns)
+      .set({ updatedAt: new Date(Date.now() - 3 * 60 * 1000) })
+      .where(eq(heartbeatRuns.id, runId));
     await heartbeat.reapOrphanedRuns();
     expect((await heartbeat.getRun(runId))?.errorCode).toBe("process_detached");
     await drainOutbox();
