@@ -36,6 +36,36 @@ type ApprovalListFilters = {
   idempotencyKey?: string;
 };
 
+/**
+ * PEN-6425: paging lives in its own argument rather than inside
+ * {@link ApprovalListFilters}, so that `countBy` — which takes filters and must
+ * answer over the WHOLE matching set — cannot be handed a window by accident. A
+ * count that silently honoured `limit` would report the page size as the
+ * population, which is the same confident-wrong-answer class this fixes.
+ *
+ * `undefined` on either field means "no bound", not "zero".
+ */
+type ApprovalListPage = {
+  limit?: number;
+  offset?: number;
+};
+
+/**
+ * Shared ordering for both array views.
+ *
+ * `created_at` is the load-bearing half — see the note on `list` below — and
+ * `id` is a tiebreaker added with PEN-6425's paging. `created_at` alone is not a
+ * TOTAL order: two cards filed in the same millisecond may come back in either
+ * relative order from one statement to the next, and offset paging over a
+ * non-total order silently duplicates one row and drops another across the page
+ * boundary. The primary key is immutable and unique, so appending it makes the
+ * order total without moving any card relative to a card filed at a different
+ * time — the FIFO-by-filing-time property is unchanged.
+ */
+function approvalListOrderBy() {
+  return [asc(approvals.createdAt), asc(approvals.id)] as const;
+}
+
 export function approvalService(db: Db) {
   const agentsSvc = agentService(db);
   const instanceSettings = instanceSettingsService(db);
@@ -316,9 +346,21 @@ export function approvalService(db: Db) {
      * presentation: it re-opens the way an edit can move a card past cards that have
      * waited longer, which is the defect the edit route exists to close.
      */
-    list: (companyId: string, filters?: string | ApprovalListFilters) => {
+    list: (
+      companyId: string,
+      filters?: string | ApprovalListFilters,
+      page: ApprovalListPage = {},
+    ) => {
       const conditions = approvalListConditions(companyId, normalizeListFilters(filters));
-      return db.select().from(approvals).where(and(...conditions)).orderBy(asc(approvals.createdAt));
+      const baseQuery = db
+        .select()
+        .from(approvals)
+        .where(and(...conditions))
+        .orderBy(...approvalListOrderBy());
+      const { limit, offset } = page;
+      return offset !== undefined && offset > 0
+        ? (limit === undefined ? baseQuery.offset(offset) : baseQuery.limit(limit).offset(offset))
+        : (limit === undefined ? baseQuery : baseQuery.limit(limit));
     },
 
     /**
@@ -361,10 +403,11 @@ export function approvalService(db: Db) {
     listSummary: async (
       companyId: string,
       filters: ApprovalListFilters = {},
+      page: ApprovalListPage = {},
     ) => {
       const conditions = approvalListConditions(companyId, filters);
 
-      const rows = await db
+      const summaryQuery = db
         .select({
           id: approvals.id,
           type: approvals.type,
@@ -383,7 +426,12 @@ export function approvalService(db: Db) {
         })
         .from(approvals)
         .where(and(...conditions))
-        .orderBy(asc(approvals.createdAt));
+        .orderBy(...approvalListOrderBy());
+
+      const { limit, offset } = page;
+      const rows = await (offset !== undefined && offset > 0
+        ? (limit === undefined ? summaryQuery.offset(offset) : summaryQuery.limit(limit).offset(offset))
+        : (limit === undefined ? summaryQuery : summaryQuery.limit(limit)));
 
       return rows.map(({ title, summary, description, ...row }) => ({
         ...row,

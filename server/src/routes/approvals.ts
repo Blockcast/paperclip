@@ -15,6 +15,7 @@ import {
   withdrawApprovalSchema,
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
+import { parseUnsupportedPaginationParams } from "../lib/issue-list-query.js";
 import {
   accessService,
   approvalService,
@@ -723,12 +724,43 @@ export function approvalRoutes(
     assertCompanyAccess(req, companyId);
     if (!(await assertApprovalAccessAllowed(req, res, companyId))) return;
 
+    // BLO-24495/BLO-40714 one route over: `page`/`perPage`/`per_page` are not
+    // implemented here either, and Express hands an undeclared param through
+    // unread, so they returned the whole corpus with no error. `limit`/`offset`
+    // are NOT in this list — PEN-6425 implements them below rather than
+    // rejecting them, which is the same split the issue-list route carries.
+    const unsupportedPaginationParams = parseUnsupportedPaginationParams(req.query);
+    if (unsupportedPaginationParams.length > 0) {
+      res.status(400).json({
+        error: "page/perPage/per_page pagination is not supported on this endpoint; use limit and offset instead",
+        unsupportedParams: unsupportedPaginationParams,
+      });
+      return;
+    }
+
     const parsed = listApprovalsQuerySchema.safeParse(req.query);
     if (!parsed.success) {
       res.status(400).json({ error: "Invalid query", details: parsed.error.flatten() });
       return;
     }
-    const { view, status, type, issueId, requestedByAgentId, idempotencyKey } = parsed.data;
+    const { view, status, type, issueId, requestedByAgentId, idempotencyKey, limit, offset } = parsed.data;
+
+    // PEN-6425: a count answers over the whole matching set by construction, so a
+    // window on it is not a narrower answer — it is a different question nobody
+    // asked. Honouring it would report a page size as a population, and ignoring
+    // it is the silent-wrong-answer this change exists to remove, so refuse.
+    if (view === "count" && (limit !== undefined || offset !== undefined)) {
+      res.status(400).json({
+        error:
+          "limit/offset are not supported with view=count; a count is already computed over every matching row. " +
+          "Drop them, or use view=summary to page the rows themselves.",
+        unsupportedParams: [
+          ...(limit !== undefined ? ["limit"] : []),
+          ...(offset !== undefined ? ["offset"] : []),
+        ],
+      });
+      return;
+    }
 
     // `count` and `summary` exist so that checking whether an ask is already filed is
     // cheaper than filing it again. The default `full` view is unchanged.
@@ -772,12 +804,12 @@ export function approvalRoutes(
     }
 
     if (view === "summary") {
-      const rows = await svc.listSummary(companyId, filters);
+      const rows = await svc.listSummary(companyId, filters, { limit, offset });
       res.json(rows);
       return;
     }
 
-    const result = await svc.list(companyId, filters);
+    const result = await svc.list(companyId, filters, { limit, offset });
     const readOptions = await approvalReadOptions(req, companyId);
     res.json(result.map((approval) => redactApprovalPayload(approval, readOptions)));
   });

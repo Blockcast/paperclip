@@ -77,6 +77,39 @@ describe("approval validators", () => {
     expect(listApprovalsQuerySchema.safeParse({ view: "everything" }).success).toBe(false);
     expect(listApprovalsQuerySchema.safeParse({ status: "pendinggg" }).success).toBe(false);
   });
+
+  /**
+   * PEN-6425. `limit`/`offset` were not declared here at all, and `z.object()`
+   * STRIPS an undeclared key rather than rejecting it — so the route received
+   * `undefined` for a caller who had explicitly asked for a window, and answered
+   * with the whole corpus. Declaring them is what makes the window reach the
+   * query at all; these arms pin the declaration, independently of Express.
+   */
+  it("coerces limit and offset from their query-string form", () => {
+    const parsed = listApprovalsQuerySchema.parse({ view: "summary", limit: "3", offset: "10" });
+    expect(parsed.limit).toBe(3);
+    expect(parsed.offset).toBe(10);
+  });
+
+  it("leaves limit and offset undefined when the caller asks for no window", () => {
+    const parsed = listApprovalsQuerySchema.parse({ view: "summary" });
+    expect(parsed.limit).toBeUndefined();
+    expect(parsed.offset).toBeUndefined();
+  });
+
+  it.each(["0", "-1", "abc", "", "1.5", "99999999999999999999"])(
+    "rejects an unusable limit=%s rather than dropping it unread",
+    (limit) => {
+      expect(listApprovalsQuerySchema.safeParse({ limit }).success).toBe(false);
+    },
+  );
+
+  it.each(["-1", "abc", "1.5", "99999999999999999999"])(
+    "rejects an unusable offset=%s rather than dropping it unread",
+    (offset) => {
+      expect(listApprovalsQuerySchema.safeParse({ offset }).success).toBe(false);
+    },
+  );
 });
 
 describe("createApprovalSchema payload.title requirement", () => {

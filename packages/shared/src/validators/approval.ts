@@ -197,6 +197,43 @@ export const listApprovalsQuerySchema = z.object({
   requestedByAgentId: z.string().guid().optional(),
   idempotencyKey: z.string().trim().min(1).max(255).optional(),
   view: z.enum(["full", "summary", "count"]).prefault("full"),
+  /**
+   * PEN-6425: `limit`/`offset` were absent from this schema, and `z.object()`
+   * STRIPS an undeclared key rather than rejecting it — so `?limit=3` was dropped
+   * unread and the route answered with the whole corpus (measured 1082 rows) while
+   * reading as a bounded page. That is the BLO-40145/BLO-24495 shape one route over,
+   * and here it was worse than on `/companies/:id/issues`: there `limit` binds and
+   * only clamps, here it bound at no value at all.
+   *
+   * They are now IMPLEMENTED rather than rejected, because unlike `page`/`perPage`
+   * this route can honour them cheaply and the live cost of the old behaviour was
+   * paid by every caller on every read.
+   *
+   * No implicit cap and no default: omitting `limit` returns every matching row
+   * exactly as before, so no existing caller changes behaviour. That is deliberate —
+   * a default cap would hand a caller a silent PREFIX, which is PEN-4766's
+   * under-reporting failure direction and strictly worse than the over-reporting one
+   * this replaces. A window is only ever as narrow as a caller explicitly asked for,
+   * so a short array needs no truncation marker to be read correctly.
+   *
+   * Bounded by MAX_SAFE_INTEGER rather than a product cap: the only value this has to
+   * exclude is one that cannot be represented exactly, which would reach Postgres as
+   * something other than what the caller wrote. Same reasoning as `parseOffsetParam`.
+   */
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(Number.MAX_SAFE_INTEGER)
+    .optional()
+    .describe("Maximum rows to return (full/summary views). Omit for every matching row."),
+  offset: z.coerce
+    .number()
+    .int()
+    .min(0)
+    .max(Number.MAX_SAFE_INTEGER)
+    .optional()
+    .describe("Rows to skip before returning (full/summary views). Ordering is createdAt then id."),
 });
 
 export type ListApprovalsQuery = z.infer<typeof listApprovalsQuerySchema>;
