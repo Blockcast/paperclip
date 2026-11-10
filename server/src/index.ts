@@ -3164,7 +3164,8 @@ export async function startServer(): Promise<StartedServer> {
 
   // cost_events run->project attribution repair (PEN-5937). Fills the column
   // `costs/by-project` now reads instead of rebuilding attribution from
-  // `activity_log` per request. Deliberately NOT in migration 0276: the
+  // `activity_log` per request. Deliberately NOT in the
+  // `cost_events_run_project_attribution` migration: the
   // derivation reads activity_log, so in a migration transaction it is the
   // BLO-51377 shape that froze activity_log writes for ~35 min. Short
   // autocommit batches, idempotent via the `attributed_project_at` watermark.
@@ -3177,7 +3178,7 @@ export async function startServer(): Promise<StartedServer> {
   // run is still in flight. Each of those is INVISIBLE to `by-project` until a
   // pass reaches it -- the inner join drops a NULL effective project -- so at
   // once-per-lease they would wait for the next deploy or failover. A drained
-  // pass is one scan of `cost_events_unattributed_idx` (0277), the partial
+  // pass is one scan of `cost_events_unattributed_idx`, the partial
   // index that holds exactly the rows still awaiting a watermark, and reads no
   // activity_log row at all.
   if (config.paperclipNodeRole !== "api") {
