@@ -111,7 +111,8 @@ import {
 } from "./services/heap-snapshot.js";
 import {
   CPU_PROFILE_SENTINEL_BASENAME,
-  maybeStartStallCpuProfile,
+  maybeDumpStallFlightRecording,
+  startCpuFlightRecorder,
   maybeTakeCpuProfile,
 } from "./services/cpu-profile.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -1447,10 +1448,14 @@ export async function startServer(): Promise<StartedServer> {
           ),
         );
     }, 60_000).unref?.();
-    // Auto-capture on a >=3 s stall, 1 h cooldown: the operator sentinel needs
-    // someone watching when a stall cluster happens, and nobody is (BLO-45336).
+    // Flight recorder (BLO-51594): a profile started after a stall cannot
+    // contain it, so keep one running and dump the segment the stall landed in.
+    // 2-min segments at 10 ms sampling cost well under 1% CPU.
+    startCpuFlightRecorder({ segmentMs: 120_000, samplingIntervalUs: 10_000 }).catch((err) =>
+      logger.error({ err }, "CPU flight recorder failed to start"),
+    );
     setEventLoopStallListener((stallMs) => {
-      maybeStartStallCpuProfile(stallMs, { dir: config.heapSnapshotDir, durationMs: 600_000, keep: 3 })
+      maybeDumpStallFlightRecording(stallMs, { dir: config.heapSnapshotDir, keep: 3 })
         .then((res) => {
           if (res) logger.warn({ file: res.file, triggerStallMs: stallMs, ...res.summary }, "CPU profile written");
         })
