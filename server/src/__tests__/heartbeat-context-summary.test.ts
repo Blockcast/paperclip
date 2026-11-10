@@ -4353,7 +4353,13 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // ...and the one instrument that settles it per row, for any writer.
     expect(markdown).toContain("paperclipListIssueFieldRevisions");
     // A carve-out that only forbids leaves the constraint unplaced; it has to route.
-    expect(markdown).toContain("monitorNotes");
+    expect(markdown).toContain("in a COMMENT on the row");
+    // ...and it must route AWAY from that row's own monitor, which the same plugin destroys
+    // on close. Asserted as the prohibition and not as presence: this clause's first draft
+    // named `monitorNotes` as a carrier, and a bare toContain("monitorNotes") goes on passing
+    // over the correction -- it would be pinning a voided claim while still reading green.
+    expect(markdown).toContain("Do NOT route it into THAT row's `monitorNotes`");
+    expect(markdown).toContain("a row of your OWN");
   });
 
   // Order is load-bearing: the exception has to read after the rule it qualifies, or a reader

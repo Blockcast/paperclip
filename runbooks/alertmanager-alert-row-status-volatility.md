@@ -330,8 +330,18 @@ somebody has to keep current.
    usually also the surface the human actor reads;
 2. a **comment** on the alert row — append-only, and it survives every rewrite
    above;
-3. **`monitorNotes`** — 500 chars, and it is what the next woken run reads
-   first.
+3. **`monitorNotes` on a monitor armed on a row of your OWN** — 500 chars,
+   and it is what the next woken run reads first.
+
+⛔ **Not this row's monitor.** `monitorNotes` here survives the description
+rewrite and *not* the cancel: when the alert resolves the plugin cancels the
+row, the monitor is cleared as undeliverable, and the notes are nulled with it
+— 13 of 13 destructions above, each paired with the plugin's own cancel, every
+one before its due time. So on the alert row it is a within-incident
+scratchpad, never the durable carrier. This is Rule 2 restated for the carrier
+question, and the two have to be read together: a list that offers
+`monitorNotes` as somewhere safe routes the record straight back into the
+carrier Rule 2 forbids, one silent destroyer over.
 
 Say in the comment that depth 0 was refused and why. Absent that, the next
 reader has no way to tell a carrier that was ruled out from one nobody tried.
