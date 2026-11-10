@@ -1523,6 +1523,15 @@ describe("merge-gate reader", () => {
       assert.equal(pending([sf("111", "startup_failure", ""), sf("222", "success", "2026-11-09T18:30:00Z")]).length, 1);
     });
 
+    // The droppable set is a whitelist: a completed run with an EMPTY conclusion
+    // (null via @tsv) or a conclusion GitHub adds later must still fail CLOSED,
+    // even when a later same-lane success exists.
+    it("keeps a completed run with an empty or unknown conclusion despite a later success", () => {
+      const ok = sf("222", "success", "2026-11-09T18:30:00Z");
+      assert.deepEqual(pending([sf("111", "", "2026-11-09T16:03:00Z"), ok]), ["111\t?\tcommitperclip PR Review"]);
+      assert.equal(pending([sf("111", "some_future_conclusion", "2026-11-09T16:03:00Z"), ok]).length, 1);
+    });
+
     // cancelled/failure stay DEAD's job, and in-flight runs are never withheld.
     it("does not withhold cancelled, failure, or in-flight runs", () => {
       const ok = sf("222", "success", "2026-11-09T18:30:00Z");

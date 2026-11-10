@@ -352,6 +352,8 @@ pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
   # row) is not `completed`/`success`, so it is kept and STOPs. Fails CLOSED, on
   # the same grounds as the missing-timestamp rule in dead_runs(): an absent
   # field must never be read as evidence that a verdict exists.
+  # The droppable set is a WHITELIST of the five conclusions above, so an empty
+  # conclusion on a `completed` row, or one GitHub adds later, is kept too.
   #
   # The displayed state is the CONCLUSION once a run is completed. "run
   # completed, no check-run published" tells a reader to wait for something that
@@ -366,7 +368,7 @@ pending_runs() { # stdin: run rows -> stdout: pend rows for runs owing a verdict
               $3 != "" && !($6 == "completed" && ($4 == "success" || $4 == "skipped")) {
                 s = ($6 == "completed" ? $4 : $6); n++
                 row[n] = $3 "\t" (s == "" ? "?" : s) "\t" $7; lane[n] = $1 FS $2; t[n] = $5
-                sup[n] = ($6 == "completed" && $4 != "cancelled" && $4 != "failure") }
+                sup[n] = ($6 == "completed" && $4 ~ /^(startup_failure|timed_out|stale|action_required|neutral)$/) }
               END { for (i = 1; i <= n; i++)
                       if (!(sup[i] && t[i] != "" && np[lane[i]] >= t[i])) print row[i] }'
 }
