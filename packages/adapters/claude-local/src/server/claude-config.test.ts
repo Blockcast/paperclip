@@ -2,7 +2,11 @@ import * as fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { prepareClaudeConfigSeed } from "./claude-config.js";
+import {
+  prepareClaudeConfigSeed,
+  quarantineUnparseableClaudeConfig,
+  resolveClaudeGlobalConfigPath,
+} from "./claude-config.js";
 
 describe("prepareClaudeConfigSeed", () => {
   const cleanupDirs: string[] = [];
@@ -107,5 +111,51 @@ describe("prepareClaudeConfigSeed", () => {
       .rejects.toMatchObject({ code: "ENOENT" });
     await expect(fs.readFile(path.join(seedDir, "CLAUDE.md"), "utf8"))
       .resolves.toBe("local instructions");
+  });
+});
+
+describe("resolveClaudeGlobalConfigPath", () => {
+  it("uses CLAUDE_CONFIG_DIR when set, else HOME", () => {
+    expect(resolveClaudeGlobalConfigPath({ CLAUDE_CONFIG_DIR: "/x/cfg", HOME: "/h" })).toBe("/x/cfg/.claude.json");
+    expect(resolveClaudeGlobalConfigPath({ CLAUDE_CONFIG_DIR: "  ", HOME: "/h" })).toBe("/h/.claude.json");
+  });
+});
+
+describe("quarantineUnparseableClaudeConfig", () => {
+  const dirs: string[] = [];
+  afterEach(async () => {
+    await Promise.all(dirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
+  });
+  const withConfig = async (body: string | null) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "claude-cfg-"));
+    dirs.push(dir);
+    const file = path.join(dir, ".claude.json");
+    if (body !== null) await fs.writeFile(file, body);
+    return { dir, file };
+  };
+
+  it("moves a truncated file aside", async () => {
+    const { dir, file } = await withConfig('{"numStartups": 3, "projects": {');
+    const moved = await quarantineUnparseableClaudeConfig(file, 1);
+    expect(moved).toMatch(/\.claude\.json\.corrupt-\d+$/);
+    expect(await fs.readdir(dir)).toEqual([path.basename(moved!)]);
+    expect(await fs.readFile(moved!, "utf8")).toBe('{"numStartups": 3, "projects": {');
+  });
+
+  it("leaves a valid, empty or missing file alone", async () => {
+    for (const body of ['{"numStartups": 3}', "", null]) {
+      const { dir, file } = await withConfig(body);
+      expect(await quarantineUnparseableClaudeConfig(file, 1)).toBeNull();
+      expect(await fs.readdir(dir)).toEqual(body === null ? [] : [".claude.json"]);
+    }
+  });
+
+  it("leaves a file alone when a concurrent writer finishes before the re-read", async () => {
+    const { dir, file } = await withConfig('{"numStartups": 3, "proj');
+    const pending = quarantineUnparseableClaudeConfig(file, 100);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await fs.writeFile(file, '{"numStartups": 3, "projects": {}}');
+    expect(await pending).toBeNull();
+    expect(await fs.readdir(dir)).toEqual([".claude.json"]);
   });
 });

@@ -79,6 +79,8 @@ import {
   materializeRemoteClaudeConfig,
   prepareClaudeConfigSeed,
   resolveManagedClaudeRuntimeStateDir,
+  quarantineUnparseableClaudeConfig,
+  resolveClaudeGlobalConfigPath,
   resolveSharedClaudeConfigDir,
   writePaperclipClaudeMcpConfig,
 } from "./claude-config.js";
@@ -1172,6 +1174,16 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
+    if (!executionTargetIsRemote) {
+      const configPath = resolveClaudeGlobalConfigPath({ ...process.env, ...env });
+      const quarantinedTo = await quarantineUnparseableClaudeConfig(configPath);
+      if (quarantinedTo) {
+        await onLog(
+          "stderr",
+          `[paperclip] claude-config: moved unparseable ${configPath} to ${quarantinedTo}; Claude Code 2.1.318+ no longer resets it and would fail every run\n`,
+        );
+      }
+    }
     const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
       cwd,
       env,

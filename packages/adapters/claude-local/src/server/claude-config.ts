@@ -119,6 +119,59 @@ export function resolveSharedClaudeConfigDir(
   return fromEnv ? path.resolve(fromEnv) : path.join(os.homedir(), ".claude");
 }
 
+/** The global config file the Claude CLI reads for this environment. */
+export function resolveClaudeGlobalConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  const fromEnv = nonEmpty(env.CLAUDE_CONFIG_DIR);
+  return fromEnv
+    ? path.join(path.resolve(fromEnv), ".claude.json")
+    : path.join(nonEmpty(env.HOME) ?? os.homedir(), ".claude.json");
+}
+
+/**
+ * Moves a `.claude.json` that is not valid JSON to `<path>.corrupt-<epoch>` and
+ * returns the new path, or null when it left the file alone.
+ *
+ * Claude Code up to 2.1.317 replaced such a file with defaults in non-interactive
+ * runs. 2.1.318 stopped doing that: the run fails with "Configuration error in
+ * …/.claude.json" and leaves the file as it is (anthropics/claude-code#87551).
+ * Local runs without `CLAUDE_CONFIG_DIR` all share the server's `~/.claude.json`,
+ * so one bad write would fail every claude_local run until someone fixed the file.
+ *
+ * A missing, empty or unreadable file is left alone. A failed parse is re-read
+ * once after `retryDelayMs`, so a concurrent CLI caught mid-write is not mistaken
+ * for corruption.
+ */
+export async function quarantineUnparseableClaudeConfig(
+  configPath: string,
+  retryDelayMs = 250,
+): Promise<string | null> {
+  const parses = async () => {
+    let text: string;
+    try {
+      text = await fs.readFile(configPath, "utf8");
+    } catch {
+      return true;
+    }
+    if (text.length === 0) return true;
+    try {
+      JSON.parse(text);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  if (await parses()) return null;
+  await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+  if (await parses()) return null;
+  const quarantinePath = `${configPath}.corrupt-${Date.now()}`;
+  try {
+    await fs.rename(configPath, quarantinePath);
+  } catch {
+    return null;
+  }
+  return quarantinePath;
+}
+
 export function resolveManagedClaudeConfigSeedDir(
   env: NodeJS.ProcessEnv,
   companyId?: string,
