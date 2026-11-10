@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { renewedIssueMonitorMaxAttempts } from "@paperclipai/shared";
+import { MAX_ISSUE_MONITOR_GATE_SIGNALS, renewedIssueMonitorMaxAttempts } from "@paperclipai/shared";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   applyIssueExecutionPolicyTransition,
@@ -7,6 +7,7 @@ import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorEligibilityPatch,
   derivePersistedMonitorState,
+  dispatchWatchdogGateSignals,
   exhaustedMonitorClearReason,
   isMonitorNextCheckAtLive,
   normalizeIssueExecutionPolicy,
@@ -3257,5 +3258,53 @@ describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", 
         }),
       ).toEqual({});
     }
+  });
+});
+
+// PEN-6346: `dispatchWatchdogGateSignals` reserves one slot for its own token
+// and trims the declared tail to fit, because overflowing
+// `MAX_ISSUE_MONITOR_GATE_SIGNALS` is not a clamped write -- the policy fails
+// to parse and the re-arm is skipped outright. Which declared gate loses is
+// arbitrary and the count is logged; which token must NEVER lose is not
+// arbitrary. The watchdog finds the run it is watching by reading this prefix
+// back out of the gate set, so dropping the watchdog token strands that run,
+// and -- unlike a dropped declared gate -- nothing counts it.
+//
+// The declared tokens here sort BEFORE `heartbeat_run:` on purpose. The natural
+// wrong refactor is to trim after appending
+// (`normalizeIssueMonitorGateSignals([...declared, watchdogToken]).slice(0, MAX)`),
+// which drops whichever token sorts last. Built on `pr:` tokens that case would
+// pass by luck, so the test would assert nothing.
+describe("dispatchWatchdogGateSignals reserves the watchdog slot on overflow (PEN-6346)", () => {
+  const watchedRunId = "99999999-9999-4999-8999-999999999999";
+  const watchdogToken = `heartbeat_run:${watchedRunId}`;
+  const declared = Array.from(
+    { length: MAX_ISSUE_MONITOR_GATE_SIGNALS },
+    (_, index) => `deploy:svc-${String(index).padStart(2, "0")}`,
+  );
+
+  it("keeps its own token, trims exactly one declared gate, and reports the drop", () => {
+    const result = dispatchWatchdogGateSignals({ declared, watchedRunId });
+
+    expect(
+      result.gateSignals,
+      "the watchdog token never loses its slot: losing it strands the run being watched",
+    ).toContain(watchdogToken);
+    expect(result.gateSignals).toHaveLength(MAX_ISSUE_MONITOR_GATE_SIGNALS);
+    expect(result.dropped).toBe(1);
+    expect(result.gateSignals.filter((token) => token !== watchdogToken)).toEqual(
+      declared.slice(0, MAX_ISSUE_MONITOR_GATE_SIGNALS - 1),
+    );
+  });
+
+  // Control: one under the cap nothing is trimmed and `dropped` stays 0, so the
+  // case above is about the overflow branch rather than about a function that
+  // always drops something.
+  it("drops nothing when the declared set fits beside the watchdog token", () => {
+    const fits = declared.slice(0, MAX_ISSUE_MONITOR_GATE_SIGNALS - 1);
+    const result = dispatchWatchdogGateSignals({ declared: fits, watchedRunId });
+
+    expect(result.dropped).toBe(0);
+    expect(result.gateSignals).toEqual([...fits, watchdogToken].sort());
   });
 });
