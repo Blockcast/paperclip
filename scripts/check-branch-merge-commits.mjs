@@ -21,10 +21,13 @@
  * On 2026-11-04T05:50:11Z, 36 days later, #3352 was evicted from the queue and
  * the remedy applied was `git merge master into branch` (merge commit
  * e47e65dea, authored `Cto <cto@paperclip.blockcast.net>` — the same identity
- * as 0b1ce770). That fixed `mergeable`, left `rebaseable: false`, and added a
- * commit the REBASE queue must itself replay. Eviction #2 followed at
- * 09:10:53Z. Both evictions emitted ZERO `merge_group` runs, so no check
- * failure explains either; the only trace was a timeline event.
+ * as 0b1ce770). That fixed `mergeable` and added a commit the REBASE queue must
+ * itself replay, which is the whole defect -- and which `.rebaseable` does NOT
+ * report. (This sentence used to assert `rebaseable: false`; WITHDRAWN, PEN-6453.
+ * The measurement, and the instrument that replaces it, are in the comment above
+ * the diagnosis block in `formatReport`.) Eviction #2 followed at 09:10:53Z. Both
+ * evictions emitted ZERO `merge_group` runs, so no check failure explains either;
+ * the only trace was a timeline event.
  *
  * The documentation gap was therefore zero, and discoverability and cross-
  * linking were not the defect either: the actor who needed the rule had
@@ -272,10 +275,46 @@ export function formatReport(verdict, { base, head } = {}) {
   lines.push("    git ls-remote origin refs/heads/<branch>   # still <expected-sha>? if not, a co-author pushed -- STOP");
   lines.push("    git push --force-with-lease=refs/heads/<branch>:<expected-sha> origin <branch>");
   lines.push("");
-  lines.push("`git merge origin/master` and the GitHub \"Update branch\" button both make");
-  lines.push("`mergeable` true while leaving `rebaseable` false, which is the failure this");
-  lines.push("check exists to stop. Read `.rebaseable`, not `mergeable_state` — a");
-  lines.push("`mergeable_state: clean` masks it.");
+  // PEN-6453. This block used to read "Read `.rebaseable`, not `mergeable_state`".
+  // `.rebaseable` DOES NOT DISCRIMINATE, and it is nominated here no longer.
+  //
+  // It answers a GIT question -- can these commits be replayed onto the base
+  // without CONFLICT -- and a merge commit is frequently perfectly replayable, so
+  // `true` is the correct answer to the question GitHub was asked. This check
+  // asks a POLICY question: does a `mergeMethod: REBASE` queue forbid a merge
+  // commit in base..head? Nothing GitHub exposes answers that.
+  //
+  // Measured first-party on #3492, both arms, one PR, one day: `.rebaseable` read
+  // `true` at `6264ae50` -- produced by the "Update branch" button, the exact case
+  // named below, and REJECTED by this check -- and `true` again at the rebased
+  // `b3daeab5` it ACCEPTED. Same value, opposite verdicts. Independently recorded
+  // for #1595 in `docs/superpowers/plans/2026-09-05-track-a-landing-log.md`
+  // ("`rebaseable` alone under-reports"), two months before this gate was written.
+  //
+  // It is still NAMED below rather than deleted, because a reader arriving here
+  // has often already read `rebaseable: true` somewhere else and concluded the
+  // branch is fine; silence leaves that belief standing. Naming it as context is
+  // what disarms it.
+  lines.push("`git merge origin/master` and the GitHub \"Update branch\" button both add a");
+  lines.push("merge commit the REBASE queue must replay, which is the failure this check");
+  lines.push("exists to stop.");
+  lines.push("");
+  lines.push("DO NOT diagnose this from GitHub's `.rebaseable` (PEN-6453). That field asks");
+  lines.push("whether your commits can be REPLAYED without conflict, and a merge commit");
+  lines.push("usually can -- so it reads `true` on branches this check rejects. Measured on");
+  lines.push("#3492: `true` at the head this check FAILED, `true` again at the rebased head");
+  lines.push("it PASSED. It is context, never a verdict. `mergeable_state` is not the tell");
+  lines.push("either.");
+  lines.push("");
+  lines.push("The discriminator is this script. Run it on BOTH arms, so you watch it");
+  lines.push("discriminate rather than trusting a single green:");
+  lines.push("");
+  lines.push("    node scripts/check-branch-merge-commits.mjs \\");
+  lines.push("      --base $(git merge-base origin/master HEAD) --head HEAD");
+  lines.push("");
+  lines.push("  now              -> exit 1, and it names the offending merge commit(s) above");
+  lines.push("  after the rebase -> exit 0. The TRANSITION is the proof; a lone exit 0 is not,");
+  lines.push("                      because this check is one-sided (see the PASS note).");
   lines.push("");
   lines.push(`See ${RUNBOOK} ("The standard remedy is self-inflicted under \`REBASE\`").`);
   return lines.join("\n");
