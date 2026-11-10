@@ -3413,6 +3413,39 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("--json headRefOid,state,mergeStateStatus");
   });
 
+  // PEN-6385. The gate-read polarity rule. `gh api` puts its error document on STDOUT and a
+  // pipeline's `$?` is the last stage's, so the idiomatic read returns a clean verdict on a
+  // 403. Pinned here as individual conjuncts rather than by heading for the reason stated
+  // above, and with one extra reason specific to this section: the remedy has two halves
+  // whose RELATIVE importance depends on the shape of the surface being read, so a test
+  // that pinned only the heading would pass against a section that had dropped the half
+  // that happens to look redundant on the surface it was first measured on.
+  it("carries the gate-read polarity rule with both conjuncts and the surface-shape split", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      wakeComment: {
+        id: "comment-1",
+        body: "Do not push to this head until the board rules.",
+      },
+    });
+
+    expect(markdown).toContain("Reading a gate:");
+    // The rule itself: positive assertion, both conjuncts, and the verbs it binds. DEFERS is
+    // named because a read that makes a run stand down is as wrong as one that authorises.
+    expect(markdown).toContain("AUTHORISES, REPORTS or DEFERS");
+    expect(markdown).toContain("non-empty AND carry a known ROW");
+    // The half-fix must stay named. A reader who knows the mechanism reaches for pipefail
+    // first, and it restores rc while still leaving `0` on stdout.
+    expect(markdown).toContain("`set -o pipefail` is NOT the fix");
+    // The surface-shape split, which is the part that does not survive being guessed.
+    expect(markdown).toContain("returns ITS KEY COUNT");
+    expect(markdown).toContain("the non-empty test alone PASSES a 403");
+    // A probe with no control arm is not a probe.
+    expect(markdown).toContain("one that refuses everything is not a probe");
+    // Scope, so the rule is not widened into a claim about the GitHub API itself.
+    expect(markdown).toContain("`mcp__github__*` tools fail loudly");
+  });
+
   // PEN-5802. The head check above is push-scoped, and the directive's own verb list
   // includes verbs that never move the head. Two sibling runs of one seat each spent one
   // body-edit grant 38 s apart with both prescribed gates correctly passing, so the
