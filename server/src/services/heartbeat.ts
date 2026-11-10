@@ -33046,7 +33046,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   }
 
   /**
-   * BLO-33539 — clear a monitor that is armed on an issue it can never reach.
+   * BLO-33539 / PEN-6202 — clear a monitor that is ARMED or has already FIRED
+   * on an issue it can never reach.
    *
    * `tickDueIssueMonitors` only ever *selects* deliverable rows: agent-assigned
    * and `in_progress`/`in_review`. Nothing examines the complement, so a row
@@ -33072,6 +33073,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    *    change is that the dead monitor stops claiming to be scheduled. Handing
    *    out the wake the monitor could not deliver would bypass the very
    *    eligibility rule the scheduler enforces.
+   *  - PEN-6202: it never touches a FIRED monitor on an ELIGIBLE row. There
+   *    `tickExpiredIssueMonitors` is live and owns it — that sweep runs the
+   *    monitor's `recoveryPolicy`, so clearing here would silently cancel a
+   *    recovery rather than reconcile a dead row. The eligibility complement in
+   *    the candidate scan is what keeps the two nets disjoint, and it is the
+   *    whole reason the fired arm is safe to add.
    *  - It skips non-active companies. Those rows cannot fire either, but the
    *    cause is the company, not the issue, and it resolves if the company is
    *    reactivated — so clearing them would destroy live state to fix nothing.
@@ -33125,12 +33132,48 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         and(
           eq(companies.status, "active"),
           opts?.companyId ? eq(issues.companyId, opts.companyId) : undefined,
-          sql`${issues.monitorNextCheckAt} is not null`,
+          // PEN-6202: an ARMED monitor (`monitorNextCheckAt` populated) or a FIRED
+          // one. Keying on `monitorNextCheckAt` alone made this pass blind to
+          // exactly the rows that are permanently unreachable: a trigger nulls
+          // `monitorNextCheckAt`, and `tickExpiredIssueMonitors` -- the only net
+          // that clears a fired monitor -- carries the scheduler's eligibility in
+          // its outer `where`, which is the eligibility these rows have just
+          // LOST. So a fired monitor on an ineligible row was selected by
+          // neither pass. Measured 2026-11-08 across 5615 company rows: 19 such
+          // rows, 3 of them dark for 91-106 days, the oldest untouched since
+          // 2026-08 and therefore unreachable by any transition-time fix.
+          //
+          // The two arms are disjoint by construction (the triggered arm
+          // requires a null `monitorNextCheckAt`), and the triggered arm is a
+          // deliberate SUPERSET of `derivePersistedMonitorState`'s triggered
+          // branch -- it is a cheap SQL prefilter, and
+          // `buildIssueMonitorEligibilityPatch` remains the authority. Anything
+          // over-selected returns an empty patch and is counted `skipped`.
+          sql`(
+            ${issues.monitorNextCheckAt} is not null
+            or (
+              ${issues.monitorNextCheckAt} is null
+              and coalesce(${issues.executionState}->'monitor'->>'status', '') <> 'cleared'
+              and (
+                ${issues.executionState}->'monitor'->>'status' = 'triggered'
+                or ${issues.monitorLastTriggeredAt} is not null
+                or coalesce(${issues.monitorAttemptCount}, 0) > 0
+              )
+            )
+          )`,
           // The exact complement of the scheduler's eligibility predicate.
           sql`not (${issues.assigneeAgentId} is not null and ${issues.assigneeUserId} is null and ${issues.status} in ('in_progress', 'in_review'))`,
         ),
       )
-      .orderBy(asc(issues.monitorNextCheckAt), asc(issues.id))
+      .orderBy(
+        // PEN-6202: a fired monitor has a null `monitorNextCheckAt`, which sorts
+        // LAST under Postgres `asc`, so a backlog of armed rows would starve the
+        // fired ones out of every batch. Age-order both arms on whichever
+        // timestamp the row actually carries. For an armed row `coalesce`
+        // returns `monitorNextCheckAt`, so ordering within that arm is unchanged.
+        asc(sql`coalesce(${issues.monitorNextCheckAt}, ${issues.monitorLastTriggeredAt})`),
+        asc(issues.id),
+      )
       .limit(limit);
 
     let cleared = 0;
@@ -33153,7 +33196,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             and(
               eq(issues.id, candidate.id),
               eq(issues.status, candidate.status),
-              eq(issues.monitorNextCheckAt, candidate.monitorNextCheckAt!),
+              // PEN-6202: null-safe, because the fired arm reads this as null.
+              // `eq(col, null)` renders `= null`, which is never true, so the
+              // CAS would reject every fired row and the new arm would clear
+              // nothing -- a silent no-op that still reports `skipped`.
+              candidate.monitorNextCheckAt === null
+                ? isNull(issues.monitorNextCheckAt)
+                : eq(issues.monitorNextCheckAt, candidate.monitorNextCheckAt),
+              // PEN-6202: and pin the monitor's own lifecycle state. For an
+              // ARMED row `monitorNextCheckAt` is the lifecycle witness -- any
+              // clear or re-arm moves it -- but a FIRED row reads null before
+              // AND after a concurrent clear, so without this the CAS would pass
+              // and this pass would stamp a second `clearedAt`/`clearReason`
+              // over the first, falsifying when the monitor actually died (the
+              // error PEN-5902 documents). `is not distinct from` so a legacy
+              // row carrying no `executionState.monitor` at all compares equal
+              // to itself, while a concurrent clear -- which writes the key --
+              // still fails the CAS.
+              sql`${issues.executionState}->'monitor'->>'status' is not distinct from ${
+                (candidate.executionState as { monitor?: { status?: string } } | null)?.monitor?.status ?? null
+              }`,
               // Eligibility is (assignee_agent_id, assignee_user_id, status), so
               // the CAS has to cover all three or it guards a strict subset of
               // what it read. A row that was ineligible only for being
@@ -33197,8 +33259,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             status: candidate.status,
             nextCheckAt: candidate.monitorNextCheckAt?.toISOString() ?? null,
             attemptCount: candidate.monitorAttemptCount ?? 0,
+            // PEN-6202: `nextCheckAt` is null for a monitor that already fired,
+            // so on its own it dates nothing. Carry the trigger instant too, or
+            // the activity row cannot say when the monitor this pass just
+            // retired actually died.
+            lastTriggeredAt: candidate.monitorLastTriggeredAt?.toISOString() ?? null,
             // The record of what the run was waiting for. Kept here so it is
-            // readable without reaching into executionState.
+            // readable without reaching into executionState. For every
+            // `clearReason` except `cancelled` the clear nulls BOTH the column
+            // and the `executionState` archive, so this is the only surviving
+            // copy — see `buildClearedMonitorState`.
             notes: candidate.monitorNotes,
           },
         });
