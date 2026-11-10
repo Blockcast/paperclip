@@ -29383,8 +29383,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // emitted ~7,700 lines for a single row. The sharper case is correlated
     // failure — when the kube read is unavailable `terminalOrMissing` stays
     // false for the whole backlog at once, so `job_status_unreadable`
-    // (PEN-5316 split it out of `job_not_terminal_or_unreadable` precisely
-    // because this comment already knew the two were different conditions)
     // would fire for every pending row every 30 s, a log storm at exactly the
     // moment the other signals most need to stay legible.
     const noteStuckSkip = (
@@ -29504,7 +29502,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         let terminalOrMissing = launchedIdentityMatches;
-        let exactJobStatusUnreadable = false;
+        // PEN-5316: the refusal cause for the exact-lookup branch, decided
+        // below while `exact` is still live rather than reconstructed at the
+        // log site.
+        let exactRefusedBy: string | null = null;
         const jobName = reservation.jobName ?? reservation.expectedJobName;
         const isolationSetupGraceActive =
           !jobName &&
@@ -29524,11 +29525,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const jobReadStartedAt = Date.now();
           const exact = await readAgentJobRunStatusByName(jobName)
             .finally(() => { jobReadMs += Date.now() - jobReadStartedAt; });
-          // PEN-5316: remember WHY the probe did not clear the row. A null
-          // `exact` is the kube read failing, which is the opposite condition
-          // from a Job that answered and is still alive -- see the split label
-          // below.
-          exactJobStatusUnreadable = !exact;
           terminalOrMissing = Boolean(
             exact
             && exact.phase !== "active"
@@ -29538,23 +29534,54 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               || exact.uid === reservation.jobUid
             ),
           );
+          if (!terminalOrMissing) {
+            // PEN-5316: name WHY the probe did not clear the row. These three
+            // labels are the three conjuncts above, in order, and they are
+            // decided HERE rather than at the `noteStuckSkip` call below for a
+            // reason that is easy to undo by accident: at the log site `exact`
+            // is out of scope, so the cause has to be RECONSTRUCTED from a
+            // hoisted flag -- and a flag that carries only `!exact` cannot
+            // separate the third conjunct from the second, which silently
+            // relabels a finished-but-rotated Job as a live one.
+            //   - the read failed         -> the sweep is BLIND. It holds the
+            //     slot with no bound and no escalation, ratcheting the agent's
+            //     effective concurrency down by one for as long as the read
+            //     keeps failing.
+            //   - the Job is still active -> the sweep is correctly declining
+            //     to free a slot whose Job is alive. Healthy.
+            //   - anything else           -> `phase` is terminal. The enum is
+            //     active|succeeded|failed|missing and `missing` satisfies the
+            //     third conjunct, so the only way to arrive here is a recorded
+            //     `jobUid` that the answering Job does not carry: the name was
+            //     reused by a recreated Job. Finished, and not the one we
+            //     launched -- so neither "not terminal" nor "unreadable" is a
+            //     true description of it, and it is NOT the same observation
+            //     as the `job_identity_mismatch` branch above, which saw the
+            //     run in the namespace-wide list. This one found the list
+            //     silent and the recorded NAME answering for someone else.
+            exactRefusedBy = !exact
+              ? "job_status_unreadable"
+              : exact.phase === "active"
+                ? "job_not_terminal"
+                : "exact_job_identity_mismatch";
+          }
         }
         if (!terminalOrMissing) {
-          // PEN-5316: `job_not_terminal_or_unreadable` named two OPPOSITE
-          // conditions in one label and left the reader to guess which.
-          //   - the Job answered and is not finished  -> the sweep is correctly
-          //     declining to free a slot whose Job is alive. Healthy.
-          //   - the Job status could not be read      -> the sweep is BLIND and
-          //     is holding the slot with no bound and no escalation, ratcheting
-          //     the agent's effective concurrency down by one for as long as
-          //     the read keeps failing.
-          // A fleet-wide kube read outage and a fleet of healthy long runs
+          // PEN-5316: `job_not_terminal_or_unreadable` named opposite
+          // conditions in one label and left the reader to guess which. A
+          // fleet-wide kube read outage and a fleet of healthy long runs
           // produced the identical log field, so neither the logs nor any
           // consumer of them could tell a correct refusal from a blind one.
+          //
+          // `exactRefusedBy` is null only when `jobName` is falsy: a truthy
+          // `jobName` reaching here means the exact-lookup block ran and set
+          // it. The fallback therefore reports an unreachable control-flow
+          // state under its OWN name -- defaulting it to one of the real
+          // causes would re-create exactly the conflation this change removes.
           noteStuckSkip(
             reservation,
             jobName
-              ? (exactJobStatusUnreadable ? "job_status_unreadable" : "job_not_terminal")
+              ? (exactRefusedBy ?? "job_refusal_unattributed")
               : "launch_unfinished",
           );
           continue;

@@ -9900,12 +9900,15 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       warnSpy.mockRestore();
     });
 
-    // PEN-5316. The three tests below pin the `refusedBy` SPLIT, not the
-    // release behaviour: every one of them asserts the reservation stays
-    // unreleased, because fail-closed is correct in all three cases. What was
-    // broken is that a reader could not tell them apart -- a blind sweep and a
-    // healthy one wrote the same log field, and the identity-mismatch branch
-    // wrote none at all. Measured on the fleet 2026-11-10: a stranded
+    // PEN-5316. The tests below pin the `refusedBy` SPLIT, not the release
+    // behaviour: every one of them asserts the reservation stays unreleased,
+    // because fail-closed is correct in all of them. What was broken is that a
+    // reader could not tell them apart -- a blind sweep, a healthy one, and a
+    // finished Job under a rotated identity all wrote the same log field, and
+    // the list-read identity-mismatch branch wrote none at all. ("The tests
+    // below" and not a count on purpose: a count in a block header goes stale
+    // on the next append without going missing.) Measured on the fleet
+    // 2026-11-10: a stranded
     // reservation was present on the Devops seat for 311 of 1440 minutes
     // (21.6 %) with a worst age of 1.83 h, and the busiest seats were worst
     // hit, so which branch is doing the holding is the question that decides
@@ -10032,6 +10035,42 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .from(externalRuntimeReservations)
         .where(eq(externalRuntimeReservations.id, reservation!.id))
         .then((rows) => rows[0]);
+      expect(persisted?.releasedAt).toBeNull();
+    });
+
+    it("attributes a FINISHED Job carrying a rotated identity to its own branch, not to 'job_not_terminal' (PEN-5316)", async () => {
+      // The namespace-wide list is silent, so the `job_identity_mismatch`
+      // branch above never sees this row and the exact-name lookup is the only
+      // reader. The recorded NAME answers -- and answers for a DIFFERENT Job:
+      // terminal, with a uid we never launched (a recreated Job, or the
+      // BLO-28865 pre-change identity). This fails `terminalOrMissing`'s THIRD
+      // conjunct, not its second, which is the whole point of the case: a
+      // split that keys only on `!exact` labels it `job_not_terminal` and
+      // reports a finished Job as a live one. The Job IS finished; the refusal
+      // is an identity mismatch. Tests 1 and 2 both pass against that broken
+      // split, so this is the case that distinguishes a correct three-way
+      // attribution from a two-way one.
+      const { reservation } = await seedTerminalRunWithLaunchedReservation();
+      mockListManagedAgentJobs.mockResolvedValue(null);
+      mockListAgentJobRunStatuses.mockResolvedValue(null);
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) => ({
+        phase: "failed" as const,
+        reason: null,
+        message: null,
+        name,
+        uid: `${reservation!.jobUid}-rotated`,
+      }));
+
+      await expectStuckSkipReason(reservation!.id, "exact_job_identity_mismatch", () =>
+        heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true }));
+
+      const persisted = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation!.id))
+        .then((rows) => rows[0]);
+      // Fail-closed is still correct and still unchanged: a slot whose Job
+      // identity we cannot vouch for is not ours to free. Only the label moved.
       expect(persisted?.releasedAt).toBeNull();
     });
 
