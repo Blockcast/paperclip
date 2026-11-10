@@ -2761,7 +2761,36 @@ export function authorizationService(db: Db) {
       ) {
         return deny({
           action: input.action,
-          reason: "deny_missing_grant",
+          // PEN-6266: the dedicated reason, not the generic `deny_missing_grant`.
+          // Both map to the "grant" boundary category, so nothing downstream
+          // re-buckets — the discrimination is in `boundaryReason`, which is what
+          // reaches the caller, since assertCanAssignTasks throws
+          // `forbidden(..., authorizationDeniedDetails(decision))`. Without it a
+          // 403 here is byte-identical to the half-dozen other ways
+          // `tasks:assign` runs out of grant, and "a person holds this row" is
+          // precisely the case an agent must be able to tell apart: it is the one
+          // denial no grant can ever satisfy.
+          //
+          // Safe against all three sites that READ a reason string. Every one of
+          // them is `issue:mutate` and none sees this decision: the PEN-5920
+          // checkout exemption and the BLO-22670 card-withdraw exemption both key
+          // on `decideIssueAccess(req, issue, "issue:mutate")`, and
+          // issueMutationGrantRemediation is reached only from
+          // assertAgentIssueMutationAllowed. The checkout one is the one that
+          // matters, because it must keep reaching `svc.checkout` so
+          // clearStaleExecutionLock runs (PEN-6049). TWO independent reasons it is
+          // unaffected, EITHER of which suffices, and BOTH are properties of
+          // today's CALL SITES rather than of this deny:
+          //   1. Different decision object. That exemption reads an
+          //      `issue:mutate` decision, evaluated after this `tasks:assign`
+          //      gate; nothing in it reads this one.
+          //   2. This deny cannot fire at that door at all: checkout passes
+          //      `currentAssigneeUserId: humanHeldQuestionDelegatedToClaimPredicate`,
+          //      a literal `null`, so the predicate above is false there.
+          // => A NEW CALLER that passes the live `assigneeUserId` *and* needs the
+          // lock-clear breaks (2) and leaves only (1). Re-ask the exemption
+          // question when you add one; do not inherit this answer.
+          reason: "deny_human_assigned_issue",
           explanation:
             "This issue is assigned to a person, so agents cannot reassign it — including to themselves. " +
             // Kept in step with issueMutationGrantRemediation in routes/issues.ts:

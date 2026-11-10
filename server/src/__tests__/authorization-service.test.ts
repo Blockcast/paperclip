@@ -2639,7 +2639,7 @@ describeEmbeddedPostgres("authorization service", () => {
         currentAssigneeUserId: holder,
         originKind: "manual",
       },
-    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_human_assigned_issue" });
 
     // And the one-hop version of it. Scoping this guard to self-claims — the way
     // the BLO-19094 guard above is scoped — would leave this open and the
@@ -2657,7 +2657,7 @@ describeEmbeddedPostgres("authorization service", () => {
         currentAssigneeUserId: holder,
         originKind: "manual",
       },
-    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_human_assigned_issue" });
 
     // The guard must reload the row rather than fail open when the caller did
     // not supply the field. This is the half that makes the route change
@@ -2673,7 +2673,7 @@ describeEmbeddedPostgres("authorization service", () => {
         assigneeAgentId: actor.id,
         originKind: "manual",
       },
-    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    })).resolves.toMatchObject({ allowed: false, reason: "deny_human_assigned_issue" });
 
     // A row no person holds is untouched — this guard is about who holds the
     // row, not about checkout in general.
