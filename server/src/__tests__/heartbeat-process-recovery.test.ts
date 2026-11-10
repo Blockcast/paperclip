@@ -11137,6 +11137,194 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(loserWakeup?.status).toBe("skipped");
   });
 
+  // PEN-6407. The gate above is keyed on the ISSUE and was blind to WHY each
+  // run was woken, so a `github_*` webhook wake was cancelled because an
+  // unrelated `issue_commented` run happened to hold the row. Measured over
+  // `heartbeat_runs`: 22 of 23 such kills on 2026-11-06 had a non-github
+  // incumbent, and all 9 github wakes on `Blockcast/paperclip#3452` died this
+  // way across a 3h24m review strand.
+  //
+  // A webhook delivery is the only carrier of its event — there is no
+  // successor wake to re-read it from — so the cross-class case must survive
+  // the hold rather than be destroyed by it.
+  it("defers a github wake arriving against a non-github incumbent instead of cancelling it", async () => {
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
+    const incumbentRunId = randomUUID();
+    const webhookRunId = randomUUID();
+    const incumbentWakeupId = randomUUID();
+    const webhookWakeupId = randomUUID();
+    const incumbentTime = new Date(Date.now() - 1_000);
+    const webhookTime = new Date();
+
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: incumbentWakeupId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "comment",
+        reason: "issue_commented",
+        payload: { issueId },
+        status: "queued",
+      },
+      {
+        id: webhookWakeupId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "webhook",
+        reason: "github_pr_review_requested",
+        payload: { issueId },
+        status: "queued",
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: incumbentRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "comment",
+        status: "queued",
+        wakeupRequestId: incumbentWakeupId,
+        contextSnapshot: { issueId, wakeReason: "issue_commented" },
+        createdAt: incumbentTime,
+        updatedAt: incumbentTime,
+      },
+      {
+        id: webhookRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "webhook",
+        status: "queued",
+        wakeupRequestId: webhookWakeupId,
+        contextSnapshot: { issueId, wakeReason: "github_pr_review_requested" },
+        createdAt: webhookTime,
+        updatedAt: webhookTime,
+      },
+    ]);
+
+    const readSuppressed = async () => {
+      const { body } = await renderMetrics();
+      const m = body.match(/^paperclip_heartbeat_duplicate_dispatch_suppressed_total (\S+)$/m);
+      return Number(m?.[1]);
+    };
+    const suppressedBefore = await readSuppressed();
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, incumbentRunId);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .orderBy(asc(heartbeatRuns.createdAt));
+
+    const incumbent = runs.find((r) => r.id === incumbentRunId);
+    const deferred = runs.find((r) => r.id === webhookRunId);
+    expect(incumbent).toBeDefined();
+    expect(deferred).toBeDefined();
+    expect(incumbent?.status).not.toBe("queued");
+    expect(incumbent?.status).not.toBe("cancelled");
+
+    // The assertion is that the EVENT SURVIVED, not that the row sat still.
+    // Deferring means leaving it `queued`; the incumbent's completion then
+    // calls startNextQueuedRunForAgent again, which may legitimately claim it
+    // before this read. Pinning an exact status here would be asserting a race.
+    expect(deferred?.status).not.toBe("cancelled");
+    expect(deferred?.errorCode).not.toBe("duplicate_dispatch_suppressed");
+    expect(await readSuppressed()).toBe(suppressedBefore);
+
+    // The wake must not be retired either: `skipped` is what the cancel path
+    // writes, and a skipped wakeup is how the delivery becomes unrecoverable.
+    const deferredWakeup = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, webhookWakeupId))
+      .then((rows) => rows[0] ?? null);
+    expect(deferredWakeup?.status).not.toBe("skipped");
+  });
+
+  // PEN-6407 control arm. The deferral above must not have disabled the gate:
+  // a github wake arriving against a GITHUB incumbent is a same-class
+  // duplicate, which is the case the guard was built for and should keep
+  // collapsing. Without this, "nothing was cancelled" is equally consistent
+  // with "the gate stopped working".
+  it("still collapses a github wake arriving against a github incumbent", async () => {
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
+    const olderRunId = randomUUID();
+    const newerRunId = randomUUID();
+    const olderWakeupId = randomUUID();
+    const newerWakeupId = randomUUID();
+    const olderTime = new Date(Date.now() - 1_000);
+    const newerTime = new Date();
+
+    await db.insert(agentWakeupRequests).values([
+      {
+        id: olderWakeupId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "webhook-first",
+        reason: "github_pr_review_requested",
+        payload: { issueId },
+        status: "queued",
+      },
+      {
+        id: newerWakeupId,
+        companyId,
+        agentId,
+        source: "assignment",
+        triggerDetail: "webhook-second",
+        reason: "github_pr_review_requested",
+        payload: { issueId },
+        status: "queued",
+      },
+    ]);
+
+    await db.insert(heartbeatRuns).values([
+      {
+        id: olderRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "webhook-first",
+        status: "queued",
+        wakeupRequestId: olderWakeupId,
+        contextSnapshot: { issueId, wakeReason: "github_pr_review_requested" },
+        createdAt: olderTime,
+        updatedAt: olderTime,
+      },
+      {
+        id: newerRunId,
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "webhook-second",
+        status: "queued",
+        wakeupRequestId: newerWakeupId,
+        contextSnapshot: { issueId, wakeReason: "github_pr_review_requested" },
+        createdAt: newerTime,
+        updatedAt: newerTime,
+      },
+    ]);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, olderRunId);
+
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId))
+      .orderBy(asc(heartbeatRuns.createdAt));
+
+    const loser = runs.find((r) => r.id === newerRunId);
+    expect(loser?.status).toBe("cancelled");
+    expect(loser?.errorCode).toBe("duplicate_dispatch_suppressed");
+  });
+
   it("defers external-lifecycle queued dispatch while a terminating k8s pod still holds the agent slot", async () => {
     const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture({
       adapterType: "opencode_k8s",

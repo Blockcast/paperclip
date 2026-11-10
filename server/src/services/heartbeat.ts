@@ -2418,6 +2418,43 @@ export function isStaleMaintenanceSweepCandidate(contextSnapshot: Record<string,
   );
 }
 
+/**
+ * Which class of event woke a run, for the per-issue dispatch dedupe.
+ *
+ * `github_webhook` is a wake raised by an external GitHub delivery;
+ * `issue_local` is anything raised from the row itself (a comment, a monitor,
+ * a status change, an assignment). `null` means the snapshot carries no
+ * readable `wakeReason` and the class could not be established.
+ */
+export type HeartbeatWakeClass = "github_webhook" | "issue_local";
+
+/**
+ * PEN-6407. The per-issue dedupe below cancels a queued run when ANY other run
+ * for that issue is already dispatched, and justifies it with "the surviving
+ * run will continue the work". That premise holds for a same-class duplicate
+ * and does not hold across classes: an `issue_commented` run will not do the
+ * work of a `github_pr_review_requested` wake, because the webhook delivery is
+ * the only carrier of that event.
+ *
+ * This is the same asymmetry {@link isStaleMaintenanceSweepCandidate} already
+ * encodes one layer up (BLO-35488): an issue-local wake has a successor — the
+ * next one re-reads the whole row — while a GitHub webhook fires ONCE per push
+ * or review request, so a cancelled one is not deferred, it is destroyed.
+ *
+ * Measured 2026-11-10 over `heartbeat_runs`: of the `github_*` wakes cancelled
+ * `duplicate_dispatch_suppressed`, 33 of 47 classifiable kills had a NON-github
+ * incumbent (22 of 23 in a 2026-11-06 window). On `Blockcast/paperclip#3452`
+ * all 9 github wakes across a 3h24m strand were cancelled this way, 9 of 9
+ * against a comment-driven incumbent.
+ */
+export function classifyHeartbeatWakeClass(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): HeartbeatWakeClass | null {
+  const wakeReason = readNonEmptyString(contextSnapshot?.wakeReason);
+  if (wakeReason === null) return null;
+  return wakeReason.startsWith("github_") ? "github_webhook" : "issue_local";
+}
+
 type PrReviewFairnessRun = Pick<
   typeof heartbeatRuns.$inferSelect,
   "id" | "createdAt" | "contextSnapshot"
@@ -28014,13 +28051,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   // creation race, and surfaces a misleading
   // `Concurrent run blocked: orphaned Job ...` failure in the UI. Cancel the
   // loser at claim time so the surviving sibling does the work cleanly.
+  //
+  // PEN-6407: reaching this function now means the arrival is NOT a `github_*`
+  // wake landing on a non-github incumbent — that case defers upstream. The
+  // reason string says which ground was established rather than predicting what
+  // the surviving run will do, because the old wording ("the surviving run will
+  // continue the work") asserted a premise this path never checked and was
+  // measured wrong in 22 of 23 cancels on 2026-11-06.
   async function cancelQueuedRunForDuplicateDispatch(
     run: typeof heartbeatRuns.$inferSelect,
     issueId: string,
+    incumbentWakeClasses: ReadonlySet<HeartbeatWakeClass>,
   ) {
     const now = new Date();
+    const arrivalWakeReason = readNonEmptyString(parseObject(run.contextSnapshot).wakeReason);
+    const incumbentDescription =
+      incumbentWakeClasses.size > 0 ? [...incumbentWakeClasses].sort().join(", ") : "unclassified";
     const reason =
-      "Cancelled because a sibling run is already dispatched for this issue; the surviving run will continue the work";
+      "Cancelled because a sibling run is already dispatched for this issue and this wake does not "
+      + `require its own dispatch (arrival ${arrivalWakeReason ?? "unclassified"}, in flight `
+      + `${incumbentDescription}). A github wake arriving against a non-github incumbent is `
+      + "deferred instead — see the duplicate_dispatch_cross_reason_deferred refusal arm.";
     // BLO-20396: gate on status='queued'. Overlapping dispatch passes used to
     // each report cancelling the same row (the by-id write always "succeeds"),
     // and could stomp a row a concurrent pass had already claimed to `running`.
@@ -28052,7 +28103,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       stream: "system",
       level: "info",
       message: reason,
-      payload: { issueId, agentId: run.agentId },
+      // PEN-6407 done-when 3: carry the two classes the decision turned on, so
+      // a later audit can tell a same-class collapse from an unclassified one
+      // without re-deriving it from a company-wide heartbeat_runs census.
+      payload: {
+        issueId,
+        agentId: run.agentId,
+        arrivalWakeReason,
+        incumbentWakeClasses: [...incumbentWakeClasses].sort(),
+      },
     });
 
     return cancelled;
@@ -36382,11 +36441,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // its shared worktree. Reaper/lifecycle checks must move the old run out
       // of "running" before a queued same-issue retry can proceed.
       const inFlightIssueIds = new Set<string>();
+      // PEN-6407: the dedupe needs WHY each incumbent was woken, not just that
+      // one exists. Keyed by issue and accumulated as a set because an issue can
+      // legitimately hold more than one running row (a prior tick's run plus
+      // this pass's claim), and the arrival only has to match ONE of them for
+      // the duplicate premise to hold.
+      const inFlightIssueWakeClasses = new Map<string, Set<HeartbeatWakeClass>>();
+      const noteInFlightIssue = (issueId: string, wakeClass: HeartbeatWakeClass | null) => {
+        inFlightIssueIds.add(issueId);
+        // An unreadable class registers the issue without claiming a class, so
+        // the gate below cannot read "no github incumbent" as "a github
+        // incumbent that happens to be unlabelled".
+        if (!wakeClass) return;
+        const classes = inFlightIssueWakeClasses.get(issueId) ?? new Set<HeartbeatWakeClass>();
+        classes.add(wakeClass);
+        inFlightIssueWakeClasses.set(issueId, classes);
+      };
       const inFlightPrReviewTaskKeys = new Set<string>();
       for (const row of runningRunRows) {
         const snapshot = parseObject(row.contextSnapshot);
         const id = readNonEmptyString(snapshot.issueId);
-        if (id) inFlightIssueIds.add(id);
+        if (id) noteInFlightIssue(id, classifyHeartbeatWakeClass(snapshot));
         const taskKey = readNonEmptyString(snapshot.taskKey);
         if (taskKey && isPrReviewRetryContext(snapshot)) {
           inFlightPrReviewTaskKeys.add(taskKey);
@@ -36516,11 +36591,62 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const queuedSnapshot = parseObject(queuedRun.contextSnapshot);
           const queuedIssueId = readNonEmptyString(queuedSnapshot.issueId);
           if (queuedIssueId && inFlightIssueIds.has(queuedIssueId)) {
+            // PEN-6407: cancelling is only justified when the incumbent covers
+            // this wake, and across wake classes it does not. A `github_*`
+            // delivery is the sole carrier of its event — there is no successor
+            // wake to re-read it from — so when no in-flight run for this issue
+            // was woken by a webhook, DEFER instead of destroying it.
+            //
+            // Deferring means leaving the row `queued` and moving on, exactly
+            // as the `pr_review_task_in_flight` arm below already does: the row
+            // is reconsidered when the incumbent finishes (executeRun's
+            // `start_next_queued` step) and on every subsequent enqueue for this
+            // agent, and the stale-maintenance sweep cannot reach it because
+            // STALE_QUEUED_MAINTENANCE_WAKE_REASONS carries no `github_*`
+            // reason. It does not block the queue: the loop continues to the
+            // next candidate, and a same-class duplicate is still collapsed on
+            // the pass that finds the webhook run itself in flight.
+            //
+            // An unreadable incumbent class deliberately lands HERE rather than
+            // on the cancel: the cancel asserts a premise, so it is the branch
+            // that must be positively established. Measured 0 of 238 in-flight
+            // rows over a 5h window carried no `wakeReason`, so this fallback is
+            // near-unreachable in practice — but it fails toward keeping the
+            // event rather than toward an unproven claim about it.
+            const arrivalWakeClass = classifyHeartbeatWakeClass(queuedSnapshot);
+            const incumbentWakeClasses =
+              inFlightIssueWakeClasses.get(queuedIssueId) ?? new Set<HeartbeatWakeClass>();
+            const crossReasonGithubWake =
+              arrivalWakeClass === "github_webhook"
+              && !incumbentWakeClasses.has("github_webhook");
+            if (crossReasonGithubWake) {
+              logger.info(
+                {
+                  runId: queuedRun.id,
+                  agentId,
+                  issueId: queuedIssueId,
+                  arrivalWakeClass,
+                  arrivalWakeReason: readNonEmptyString(queuedSnapshot.wakeReason),
+                  incumbentWakeClasses: [...incumbentWakeClasses],
+                },
+                "startNextQueuedRunForAgent: deferred cross-reason github wake instead of cancelling it",
+              );
+              await notePreClaimSkip(
+                queuedRun,
+                queuedIssueId,
+                "duplicate_dispatch_cross_reason_deferred",
+              );
+              continue;
+            }
             // BLO-20396: only report the cancellation when this pass is the one
             // that actually moved the row. Previously every overlapping pass
             // logged it, which is why the same run ids appeared to be cancelled
             // repeatedly.
-            const cancelled = await cancelQueuedRunForDuplicateDispatch(queuedRun, queuedIssueId);
+            const cancelled = await cancelQueuedRunForDuplicateDispatch(
+              queuedRun,
+              queuedIssueId,
+              incumbentWakeClasses,
+            );
             if (cancelled) {
               logger.warn(
                 {
@@ -36587,7 +36713,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             continue;
           }
           claimedRuns.push(claimed);
-          if (queuedIssueId) inFlightIssueIds.add(queuedIssueId);
+          // PEN-6407: register the class this pass just put in flight, so a
+          // later candidate in the SAME pass is measured against it too. Without
+          // this, a webhook run claimed here would look like "no github
+          // incumbent" to the next github candidate and defer a genuine
+          // same-class duplicate instead of collapsing it.
+          if (queuedIssueId) {
+            noteInFlightIssue(queuedIssueId, classifyHeartbeatWakeClass(queuedSnapshot));
+          }
           if (queuedTaskKey && isPrReviewRetryContext(queuedSnapshot)) {
             inFlightPrReviewTaskKeys.add(queuedTaskKey);
           }

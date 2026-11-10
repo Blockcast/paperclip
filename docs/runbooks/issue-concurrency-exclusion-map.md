@@ -16,7 +16,7 @@ fix the anchor here.
 
 | # | Unit excluded | Signal read | On conflict | Anchor |
 |---|---|---|---|---|
-| L1 | issue | a `running` sibling of the **same agent** carrying this `issueId` in its `contextSnapshot` | cancels the queued run `duplicate_dispatch_suppressed` | `inFlightIssueIds` (`heartbeat.ts`) |
+| L1 | issue | a `running` sibling of the **same agent** carrying this `issueId` in its `contextSnapshot` | **same wake class:** cancels the queued run `duplicate_dispatch_suppressed`; **github wake vs non-github incumbent:** leaves it `queued` and reports `duplicate_dispatch_cross_reason_deferred` | `inFlightIssueWakeClasses`, `classifyHeartbeatWakeClass` (`heartbeat.ts`) |
 | L2 | issue | **`issues.executionRunId`** | claim UPDATE matches zero rows → cancels `issue_execution_lock_not_acquired` | `executionRunClaimCondition` (`heartbeat.ts`) |
 | L3 | issue | `activeRun`, and a sibling's armed `scheduled_retry` | withholds the row from self-selection | `isIssueHeldByForeignRun`, `isIssueHeldByForeignScheduledRetry` (`issue-run-holding.ts`) |
 | L4 | worktree | the resolved execution-workspace **tree** | second run serialises on the reservation index | `withTreeScopedReservationKey` (`heartbeat.ts`, BLO-31443) |
@@ -51,6 +51,16 @@ agent's dispatch pass, so it cannot see a holder whose `contextSnapshot` carries
 which is every **autonomous** run, because such a run selects its issue *after* dispatch. L2 is
 the backstop that catches exactly that case, because the autonomous holder's checkout did set the
 column.
+
+**L1 excludes concurrency; it does not decide that the arriving wake is redundant.** Those were the
+same thing until PEN-6407, which measured the difference: cancelling assumes the incumbent covers
+the arrival, and across wake classes it does not. An `issue_commented` run does not do the work of a
+`github_pr_review_requested` delivery, because an issue-local wake has a successor that re-reads the
+whole row while a GitHub webhook fires **once** per push or review request. So a `github_*` arrival
+landing on a non-github incumbent is now **deferred** — left `queued`, picked up when the incumbent
+finishes — rather than cancelled. Concurrency is still excluded either way; only the arrival's fate
+differs. (Same asymmetry `isStaleMaintenanceSweepCandidate` encodes for the stale-queued sweep,
+BLO-35488.)
 
 ## The one deliberate hole
 
@@ -174,6 +184,19 @@ A control keyed on `executionRunId` therefore does not depend on PEN-5351 landin
 seven consecutive days (2026-10-27 → 2026-11-02), mean ≈499/day. Read its own help text before
 quoting it: it is unlabelled, and it mixes benign same-tick wake dedupes with genuine
 stale-running losses, so it is not an alertable signal.
+
+⚠️ **Those figures predate PEN-6407 and are not comparable across it.** The cross-class population
+no longer reaches this counter at all — it is deferred, and reported as
+`paperclip_queued_run_claim_refused_total{arm="duplicate_dispatch_cross_reason_deferred"}`. Expect a
+step DOWN in the counter above on the deploy; that is the fix landing, not the gate breaking. Scale,
+measured over `heartbeat_runs` before the change: of the `github_*` wakes cancelled here, **33 of 47**
+classifiable kills on 2026-11-10 and **22 of 23** on 2026-11-06 had a non-github incumbent.
+
+The split is also the start of the separation this section asks for. It does **not** finish it: the
+residual `_suppressed` counter still mixes same-class benign dedupes with same-class stale-running
+losses, and only the *cross-class* population has been pulled out. ⛔ Do not read a non-zero
+`cross_reason_deferred` rate as a fault — a deferral is the correct outcome, and the arm is the
+measure of how often the old cancel's premise was wrong.
 
 **L2 has no counter.** `issue_execution_lock_not_acquired` is a durable `heartbeat_runs.error_code`
 and a log line only, so the layer that carries PEN-5082 done-when 1 is the one layer whose firing

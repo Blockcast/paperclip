@@ -5703,6 +5703,26 @@ export const KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS = [
    */
   "duplicate_dispatch_cas_lost",
   /**
+   * Same screen again — a running sibling owns this issue — but the arriving
+   * wake is a `github_*` webhook and the incumbent is NOT, so the duplicate
+   * premise does not hold and the row was DEFERRED instead of cancelled
+   * (PEN-6407).
+   *
+   * Fork (a), exactly like `pr_review_task_in_flight`: the row stays `queued`,
+   * `isDispatchRankReady` does not screen it, so the claimable gauge goes on
+   * aging it and this pass really did pass over claimable work.
+   *
+   * This is the arm that answers "how often was the cancel's premise wrong?".
+   * It is deliberately NOT a variant of `duplicate_dispatch_suppressed`: that
+   * name is joined against the cancelled row's `error_code` and against
+   * {@link HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC}, and nothing is
+   * cancelled here, so sharing the name would make those joins return rows
+   * that do not exist. Read the two together — `_suppressed` is the legitimate
+   * same-class collapse and should stay non-zero; this one is the population
+   * that used to be destroyed with it.
+   */
+  "duplicate_dispatch_cross_reason_deferred",
+  /**
    * The external-lifecycle slot pool refused the claim and did not say why.
    * Residual only: the pool now names its cause, so a non-zero rate here means
    * a refusal path that reports nothing — investigate rather than classify.
