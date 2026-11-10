@@ -1066,3 +1066,142 @@ test("the booting-body floor actually discriminates", () => {
     "a body that only uses an existing handle was scored as booting one",
   );
 });
+
+// ---------------------------------------------------------------------------
+// The sweep above answers "does a package that boots embedded Postgres declare
+// a budget?". This one answers the question that guard's PREDICATE could not:
+// does a package whose hooks do real I/O of ANY kind declare one?
+//
+// PEN-6455. `@paperclipai/adapter-utils` evicted #3583 from the merge queue on
+// 2026-11-10 with `Hook timed out in 10000ms` in the file-level `afterAll` of
+// github-git-egress-runtime.test.ts, which removes every git fixture repo the
+// file created. Its fixtures are git repos, not Postgres, so EMBEDDED_POSTGRES
+// matched it 0 times, the guard above never asked it for a budget, and it
+// declared none -- the package had no vitest.config.ts at all. Every test in
+// the file passed; only the teardown crossed the deadline, and the whole
+// ~50 min `merge_group` run was discarded.
+//
+// The guard above encodes the hazard INSTANCE that prompted it (embedded
+// Postgres) while its own comment states the general RULE: a package whose
+// hooks do real work on a budget nobody declared is a merge-queue ejection
+// waiting to happen. Git fixtures, process spawns and large recursive removals
+// are the same hazard. So this predicate is the hazard SHAPE -- real I/O inside
+// a hook -- rather than any one technology that happens to cause it. Widening
+// the regex to name git too would just move the same narrow-predicate defect
+// one notch out and wait for the next unlisted technology.
+//
+// This demands `hookTimeout` ONLY, where the Postgres guard demands both, and
+// that asymmetry is deliberate. A root CLI `--testTimeout` demonstrably reaches
+// a project's resolved config and `--hookTimeout` demonstrably does not
+// (BLO-37184, re-measured first-hand on vitest 4.1.8 for PEN-6455:
+// `--hookTimeout=60000` on a package with no config still reported "Hook timed
+// out in 10000ms", while the same 12s hook PASSED once the package declared its
+// own `hookTimeout: 60_000`). The hook knob is the one no flag can supply, so
+// it is the only one this sweep can usefully demand -- and demanding only what
+// is load-bearing is what keeps the offender list small enough to fix rather
+// than silence.
+// ---------------------------------------------------------------------------
+
+// Both the sync and the `fs/promises` spellings of each call. Listing only the
+// `*Sync` forms was the first draft of this very guard, and it missed five
+// packages that use `await rm(...)` / `await mkdtemp(...)` -- i.e. it had
+// reproduced, inside the fix, the exact narrow-predicate defect it exists to
+// correct. Bounded single-file calls (`writeFile`, `readdir`) are deliberately
+// NOT here: they appear in almost every hook, so including them would put every
+// project on the list and turn this guard into an exemption file.
+const HOOK_IO =
+  /\b(?:execFileSync|execSync|spawnSync|execFile|exec|spawn|mkdtempSync|mkdtemp|rmSync|rm|cpSync|cp|startEmbeddedPostgresTestDatabase)\s*\(|\bnew\s+PGlite\s*\(/;
+
+/** The names of every hook in `code` whose body reaches real I/O. */
+function hooksWithRealIo(code) {
+  const hooks = [];
+  const openers = /\b(?:beforeAll|afterAll|beforeEach|afterEach)\s*\(/g;
+  let match;
+  while ((match = openers.exec(code))) {
+    const close = matchingParen(code, openers.lastIndex - 1);
+    if (close === -1) continue;
+    if (HOOK_IO.test(code.slice(match.index, close + 1))) {
+      hooks.push(match[0].replace(/\s*\($/, ""));
+    }
+  }
+  return hooks;
+}
+
+function projectsWithRealIoHooks() {
+  return readConfiguredProjectDirs().filter((dir) =>
+    testFilesUnder(path.join(repoRoot, dir)).some(
+      (file) => hooksWithRealIo(readFileSync(file, "utf8")).length > 0,
+    ),
+  );
+}
+
+test("every project whose hooks do real I/O declares its own hookTimeout", () => {
+  const offenders = projectsWithRealIoHooks()
+    .map((dir) => ({ dir, ...declaredTimeouts(dir) }))
+    .filter(({ hookTimeout }) => !hookTimeout);
+
+  assert.deepEqual(
+    offenders,
+    [],
+    `These Vitest projects run hooks that spawn processes, create temp trees or remove them ` +
+      `recursively, but declare no hookTimeout of their own, so those hooks run on Vitest's bare ` +
+      `10s default -- a budget nobody chose. A root CLI --hookTimeout cannot supply one; it is ` +
+      `inert under Vitest 4 \`projects\` (BLO-37184). That is how PEN-6455 evicted #3583 from the ` +
+      `merge queue. Set \`hookTimeout\` in the package's own vitest.config.ts:\n` +
+      offenders
+        .map(({ dir, config }) => `  - ${dir} (${config ? "config, no hookTimeout" : "no vitest.config.ts"})`)
+        .join("\n"),
+  );
+});
+
+test("the real-I/O hook detector is not vacuous", () => {
+  // Positive control. Without it, a rename of the fs/child_process calls -- or
+  // a change to how hook bodies are sliced -- would make the sweep above pass
+  // by matching nothing at all, the same fail-open shape the inert CLI flags
+  // had. The anchors deliberately span distinct branches of HOOK_IO:
+  // adapter-utils is found via the git/temp-tree branch (it is the package
+  // PEN-6455 was filed for), packages/db and server via embedded Postgres.
+  const found = projectsWithRealIoHooks();
+  for (const anchor of ["packages/adapter-utils", "packages/db", "server", "cli"]) {
+    assert.ok(
+      found.includes(anchor),
+      `expected the real-I/O hook detector to find ${anchor}, got: ${found.join(", ") || "(none)"}`,
+    );
+  }
+});
+
+test("the real-I/O hook detector discriminates", () => {
+  // A sweep that cannot be shown to REJECT is not a sweep. Must-accept:
+  assert.deepEqual(
+    hooksWithRealIo(`afterAll(() => { for (const d of dirs) rmSync(d, { recursive: true }); });`),
+    ["afterAll"],
+    "a hook that removes trees recursively was not detected",
+  );
+  assert.deepEqual(
+    hooksWithRealIo(`beforeEach(() => { execFileSync("git", ["init", tmp]); });`),
+    ["beforeEach"],
+    "a hook that spawns a process was not detected",
+  );
+  // The `fs/promises` spelling, which the first draft of this guard missed.
+  assert.deepEqual(
+    hooksWithRealIo(`afterEach(async () => { await rm(tmp, { recursive: true, force: true }); });`),
+    ["afterEach"],
+    "the fs/promises removal spelling was not detected",
+  );
+
+  // Must-reject: a purely in-memory hook needs no budget, and widening the
+  // predicate until it matches one of these would put every project on the
+  // list and turn the fix into an exemption file.
+  assert.deepEqual(
+    hooksWithRealIo(`afterEach(() => { vi.restoreAllMocks(); state.clear(); });`),
+    [],
+    "an in-memory hook was scored as doing real I/O",
+  );
+  // I/O in a TEST body is a different hazard on a different knob -- the
+  // booting-body floor above owns that one, and `--testTimeout` can reach it.
+  assert.deepEqual(
+    hooksWithRealIo(`it("removes the tree", () => { rmSync(dir, { recursive: true }); });`),
+    [],
+    "I/O in a test body was scored against the hook budget",
+  );
+});
