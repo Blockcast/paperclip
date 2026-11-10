@@ -88,6 +88,91 @@ export function isTransientGhError(message) {
   );
 }
 
+/**
+ * The files that can SILENCE the `secret_scan` lane, and therefore must carry a
+ * code owner (PEN-6393).
+ *
+ * `.github/**` owns the lane that RUNS gitleaks; it does not reach these, which
+ * live at the repo root. gitleaks resolves its config from the working tree, so
+ * an allowlist entry added by a PR takes effect on that same PR — and the lane's
+ * own failure comment tells the author to add one. `.gitleaksignore` is a second
+ * channel that needs no config edit at all: gitleaks v8.28.0 auto-loads it from
+ * `--source` and drops findings by fingerprint.
+ *
+ * Listed by exact name because that is how `.github/CODEOWNERS` lists them: a
+ * config under a NEW name is not covered, and adding one means adding a line
+ * there and here together.
+ */
+export const SECRET_SCAN_SILENCING_PATHS = [
+  ".gitleaks.toml",
+  ".gitleaks-staging.toml",
+  ".gitleaksignore",
+];
+
+/**
+ * Splits CODEOWNERS text into `{line, pattern, owners}`, dropping comments and
+ * blank lines. An owner-less rule is kept, with `owners: []` — that is not noise,
+ * it is how CODEOWNERS REMOVES ownership, and the coverage check below depends on
+ * seeing it.
+ *
+ * Bound, stated because the parser looks more general than it is: a `#` anywhere
+ * on a line starts a comment. CODEOWNERS has no escape for a literal `#` in a
+ * pattern, and no rule here contains one.
+ *
+ * @param {string} text
+ * @returns {{line: number, pattern: string, owners: string[]}[]}
+ */
+export function parseCodeownersRules(text) {
+  const rules = [];
+  String(text ?? "")
+    .split(/\r?\n/)
+    .forEach((raw, index) => {
+      const fields = raw.replace(/#.*$/, "").trim().split(/\s+/).filter(Boolean);
+      if (fields.length === 0) return;
+      const [pattern, ...owners] = fields;
+      rules.push({ line: index + 1, pattern, owners });
+    });
+  return rules;
+}
+
+/**
+ * Owners of the LAST rule whose pattern is EXACTLY `pattern`, or `[]`.
+ *
+ * Last, not first, because CODEOWNERS resolves by last-match-wins — so a later
+ * owner-less line for the same pattern silently removes ownership, and taking the
+ * first match would report that as still covered.
+ */
+export function ownersForExactPattern(rules, pattern) {
+  const matching = (rules ?? []).filter((rule) => rule.pattern === pattern);
+  return matching.length === 0 ? [] : matching[matching.length - 1].owners;
+}
+
+/**
+ * Which silencing paths have NO code owner. `[]` is the sound state.
+ *
+ * ## What this asserts, and what it deliberately leaves to the guard above
+ *
+ * This answers "does a rule exist for this path, with an owner". It does NOT
+ * answer "is that owner real" — an entry naming an account without write access
+ * parses fine and enforces nothing (BLO-22899), which is precisely the failure
+ * `runGuard` exists to catch against GitHub's own `codeowners/errors` endpoint.
+ *
+ * ⛔ The two are NOT redundant and neither covers the other: a rule can exist
+ * with a dead owner (this passes, `runGuard` fails) or be deleted outright
+ * (`runGuard` passes — it only ever sees rules that are present — and this
+ * fails). Removing either leaves a real hole, so each carries its own assertion.
+ *
+ * ⚠ Bound: coverage is matched on the EXACT pattern string. Rewriting a rule to
+ * an equivalent form (`/.gitleaks.toml`) reds this check even though GitHub would
+ * still route it — conservative, and the fix is to update the literal list. Glob
+ * precedence is not modelled, so a later `*` rule could override a match this
+ * still reports as covered.
+ */
+export function uncoveredSecretScanPaths(text, paths = SECRET_SCAN_SILENCING_PATHS) {
+  const rules = parseCodeownersRules(text);
+  return paths.filter((path) => ownersForExactPattern(rules, path).length === 0);
+}
+
 function gh(args) {
   return execFileSync("gh", args, {
     encoding: "utf8",
