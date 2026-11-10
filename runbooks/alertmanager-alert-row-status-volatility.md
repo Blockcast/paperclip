@@ -1,7 +1,7 @@
-# An alert row's `status` disagrees between two agents, or the monitor / park you left on it vanished
+# An alert row is machine-owned: its `status` flips, its `description` is replaced, and the monitor / park you left on it vanishes
 
-Source: `packages/plugins/paperclip-plugin-alertmanager/src/webhook-handler.ts` (`handleResolved`, `decideRefire`, `ensureCancelWithheldComment`), `server/src/services/heartbeat.ts` (`reconcileUndeliverableIssueMonitors`), `server/src/services/issue-execution-policy.ts` (`buildIssueMonitorEligibilityPatch`, `buildClearedMonitorState`), `server/src/services/issue-park-expiry.ts` (`issueParkOwesReleaseWake`, `ISSUE_PARK_EXPIRY_WAKE_STATUSES`)
-Trigger: two agents report contradictory `status` for the same alert-backed issue; or an alert row you armed a monitor on produced no wake and now reads `monitorNextCheckAt: null` with `monitorAttemptCount` unmoved; or an alert row you parked produced no wake at its due time and still reads `parkedWakeFiredAt: null`.
+Source: `packages/plugins/paperclip-plugin-alertmanager/src/webhook-handler.ts` (`handleResolved`, `decideRefire`, `describeAggregate`, `ensureCancelWithheldComment`), `packages/plugins/paperclip-plugin-alertmanager/src/issue-mapping.ts` (`buildIssueDescription`), `server/src/services/heartbeat.ts` (`reconcileUndeliverableIssueMonitors`), `server/src/services/issue-execution-policy.ts` (`buildIssueMonitorEligibilityPatch`, `buildClearedMonitorState`), `server/src/services/issue-park-expiry.ts` (`issueParkOwesReleaseWake`, `ISSUE_PARK_EXPIRY_WAKE_STATUSES`)
+Trigger: two agents report contradictory `status` for the same alert-backed issue; or text you wrote into an alert row's `description` is not there any more; or an alert row you armed a monitor on produced no wake and now reads `monitorNextCheckAt: null` with `monitorAttemptCount` unmoved; or an alert row you parked produced no wake at its due time and still reads `parkedWakeFiredAt: null`.
 Owner: Platform / DevOps (PEN-5343)
 
 ## The hazard in one line
@@ -250,6 +250,71 @@ missing is only the sweep and a place to stamp "handed off", so that it is
 re-drivable and does not re-emit.
 
 Carried on PEN-6556.
+
+## Rule 5 — the `description` is machine-owned; never record anything there
+
+**The firing path replaces this column wholesale on every delivery of a
+still-firing alert, and never reads what it replaces.** `decideRefire` returns
+`{kind: "refresh"}` for *every* non-terminal row — there is no has-it-changed
+test and no diff — and the `refresh` branch writes `{description:
+newDescription}`, where `newDescription` comes from `describeAggregate`: a pure
+render off the `aggregate_members` table. The row's current body is never an
+input. The terminal and reopen/rebind branches write it the same way.
+
+Measured on PEN-6292, 2026-11-10 (`paperclipListIssueFieldRevisions`):
+
+| | |
+|---|---|
+| field revisions in one day | 10 |
+| distinct `description` sha256 across them | **1** |
+| spacing | 65 min × 6, plus one 55 and one 40 — every delta within 3 s of a multiple of 5 min |
+| revisions with `createdByAgentId` AND `createdByRunId` null | **10 / 10** |
+
+**The cadence is Alertmanager's, not the plugin's — nothing in this plugin
+polls.** Read the spacing as a bound, not a period: the only claim the code
+supports is *one write per delivery of a still-firing alert*, and how often
+that is depends entirely on the route's `group_interval` / `repeat_interval`.
+The 5-minute quantum above is consistent with a `5m` group tick and a `1h`
+repeat, which would put the mode at 65 min and make the shorter gaps extra
+deliveries after a membership change — but that is **inferred from the
+spacing**; the Alertmanager route config was not read (`AlertmanagerConfig` is
+forbidden to the read-only service account, and
+`Blockcast/onprem-k8s:monitoring/alertmanager-configmap.yaml` was not fetched
+before the GitHub `core` budget ran out). Do not quote 65 min as a property of
+anything; quote *every delivery*.
+
+**Why the usual care does not help.** PEN-6292's assignee recorded an operator
+procedure at depth 0, re-read it on an independent GET, and said so in writing.
+It was gone by morning. The write succeeds, the same-run verification succeeds,
+and a third party destroys the content after the run has ended — so there is no
+check available *inside* the writing run that can detect this. It is the same
+shape as an ephemeral-storage bug, and the note left behind is worse than
+silence: it tells the next run a record exists, so nobody re-derives it.
+
+**Establish the carrier before you trust depth 0, on any row you did not
+create.** `paperclipListIssueFieldRevisions(<row>)`; a run of revisions
+carrying **both** `createdByAgentId` and `createdByRunId` null, at a regular
+cadence, is a machine-owned field. That read is the only instrument that
+settles it, and it settles it for any writer rather than for a list of plugins
+somebody has to keep current.
+
+**Where to put it instead**, in order:
+
+1. the **artifact's own durable text** — a PR body is not regenerated, and is
+   usually also the surface the human actor reads;
+2. a **comment** on the alert row — append-only, and it survives every rewrite
+   above;
+3. **`monitorNotes`** — 500 chars, and it is what the next woken run reads
+   first.
+
+Say in the comment that depth 0 was refused and why. Absent that, the next
+reader has no way to tell a carrier that was ruled out from one nobody tried.
+
+The generated *Recording a constraint* directive carries this carve-out
+(`server/src/services/heartbeat.ts`), and the rendered body carries a notice of
+its own at the top (`MACHINE_RENDERED_NOTICE` in `issue-mapping.ts`) for the
+readers a directive cannot reach. Neither is a fix: the column is still
+replaced. See PEN-6404.
 
 ## What this runbook deliberately does not do
 

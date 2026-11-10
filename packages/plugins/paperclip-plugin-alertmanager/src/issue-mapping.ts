@@ -278,6 +278,34 @@ function renderLabelsTable(labels: Record<string, string>): string {
  * single-subject preview. When the two differ, the alert's own `startsAt` is
  * still rendered, as **Latest firing**.
  */
+/**
+ * PEN-6404 -- the body says, in the body, that the body is not a record surface.
+ *
+ * Every write site below replaces this column wholesale: the firing path's
+ * `refresh` branch re-renders from the members table on EVERY delivery of a
+ * still-firing alert and never reads what it is replacing. An agent that
+ * records a constraint here loses it on the next delivery -- measured on
+ * PEN-6292 at 40-65 minute spacing -- with no error, and no in-run check can
+ * detect it, because the overwrite lands after the writing run has ended.
+ *
+ * The generated `Recording a constraint` directive now carries the same rule
+ * (`server/src/services/heartbeat.ts`), and that is the load-bearing copy: it
+ * reaches every write-capable run. This one exists because it reaches the
+ * readers that one cannot -- an operator, and anyone reading this text quoted
+ * somewhere else -- and because it sits at the altitude where the mistake is
+ * made, at the top of the field somebody is about to write into.
+ *
+ * First, not last. The aggregate renderer appends its members table AFTER this
+ * body, so a footer here would land mid-document on exactly the rows that are
+ * hardest to read; and a reader deciding whether to write at depth 0 reads
+ * depth 0.
+ */
+export const MACHINE_RENDERED_NOTICE =
+  "> **This description is machine-generated and is REPLACED on every alert delivery**" +
+  " (measured 40-65 min apart). Anything written here is destroyed with no error and no" +
+  " signal, and a same-run re-read cannot detect it. Record durable notes in a COMMENT on" +
+  " this row, or in `monitorNotes`. See PEN-6404.";
+
 export function buildIssueDescription(
   alert: AlertmanagerAlert,
   startedAtAnchor?: string | null,
@@ -293,6 +321,7 @@ export function buildIssueDescription(
   const startedAt = startedAtAnchor || alert.startsAt;
 
   const sections: string[] = [];
+  sections.push(MACHINE_RENDERED_NOTICE);
   sections.push(`**Summary**: ${summary}`);
   if (description) sections.push(description);
   sections.push(
