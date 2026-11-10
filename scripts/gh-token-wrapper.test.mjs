@@ -2278,8 +2278,11 @@ test("the covered verdict scopes its claim to servers actually behind the proxy 
         assert.match(proc.stdout, /mcp-channel:\s+covered/);
         assert.match(proc.stdout, /not that YOUR server is behind it/);
         assert.match(proc.stdout, /already bound/);
-        // The overstatement itself must not come back.
-        assert.doesNotMatch(proc.stdout, /the MCP server reaches GitHub through the loopback token proxy/);
+        // The overstatement itself must not come back. Case-insensitive for the
+        // same reason as the sibling pin below: a sentence-initial "The MCP
+        // server reaches GitHub..." restores it and passes a case-sensitive
+        // pin (PEN-6397). Over-fire measured 0/62 at 394d48c8.
+        assert.doesNotMatch(proc.stdout, /the MCP server reaches GitHub through the loopback token proxy/i);
         // Nor the narrower one: a null handle leaves `process.env` untouched,
         // so on a pod that already sets GITHUB_HOST the loser HAS one -- just
         // not the proxy's (PEN-5950).
