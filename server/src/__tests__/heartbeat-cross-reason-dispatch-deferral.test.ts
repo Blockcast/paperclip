@@ -1,7 +1,11 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { classifyHeartbeatWakeClass } from "../services/heartbeat.js";
+import {
+  classifyHeartbeatWakeClass,
+  contextCarriesGithubWake,
+  mergeCoalescedContextSnapshot,
+} from "../services/heartbeat.js";
 import { KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS } from "../services/metrics.js";
 
 /**
@@ -20,6 +24,14 @@ import { KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS } from "../services/metrics.js";
  * The asymmetry is the one `isStaleMaintenanceSweepCandidate` already encodes
  * (BLO-35488): an issue-local wake has a successor that re-reads the whole row,
  * a GitHub webhook fires once per push or review request.
+ *
+ * Two halves, and the second is NOT a corner case. Deferring leaves the row
+ * `queued`, and a queued row is the FIRST coalesce target, so the next
+ * `issue_commented` wake merges into it and `{...existing, ...incoming}`
+ * overwrites `wakeReason` — after which the row reads issue-local and is
+ * cancelled as an ordinary duplicate. On this strand the hold is long precisely
+ * because comments keep arriving, so that merge is the normal case. Hence the
+ * sticky `carriesGithubWake` marker and the coalesce suite below.
  */
 
 const HEARTBEAT_SOURCE = readFileSync(
@@ -99,6 +111,80 @@ describe("classifyHeartbeatWakeClass", () => {
   });
 });
 
+/**
+ * PEN-6407 review follow-up. A deferred row is a COALESCE TARGET, so the
+ * sticky-marker half of the fix is what keeps the deferral from being undone by
+ * ordinary comment traffic — which is the normal case on the strand this gate
+ * exists for, not a corner case.
+ */
+describe("github provenance survives a coalesce onto a deferred row", () => {
+  const githubRow = {
+    issueId: "issue-1",
+    wakeReason: "github_pr_review_requested",
+    githubPrNumber: 3452,
+    githubRepoFullName: "Blockcast/paperclip",
+  };
+
+  it("keeps the row readable as a github wake after an issue-local wake merges in", () => {
+    // Without the sticky key this is the whole defect: the spread overwrites
+    // `wakeReason`, the next pass reads the row as issue-local, and the webhook
+    // is cancelled as an ordinary duplicate.
+    const merged = mergeCoalescedContextSnapshot(githubRow, {
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+    });
+
+    expect(merged.wakeReason).toBe("issue_commented");
+    expect(classifyHeartbeatWakeClass(merged)).toBe("issue_local");
+    expect(contextCarriesGithubWake(merged)).toBe(true);
+  });
+
+  it("survives a SECOND coalesce, so a run of comments cannot wear it off", () => {
+    const once = mergeCoalescedContextSnapshot(githubRow, {
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+    });
+    const twice = mergeCoalescedContextSnapshot(once, {
+      issueId: "issue-1",
+      wakeReason: "issue_monitor_due",
+    });
+    expect(contextCarriesGithubWake(twice)).toBe(true);
+  });
+
+  it("survives a coalesce naming a DIFFERENT pull request", () => {
+    // `GITHUB_PR_CONTEXT_KEYS` are dropped as a unit when the incoming wake
+    // names another PR — which is why the marker must not be one of them. A
+    // webhook is still owed a dispatch whichever PR it was for.
+    const merged = mergeCoalescedContextSnapshot(githubRow, {
+      issueId: "issue-1",
+      wakeReason: "issue_commented",
+      githubPrNumber: 9999,
+      githubRepoFullName: "Blockcast/paperclip",
+    });
+    expect(contextCarriesGithubWake(merged)).toBe(true);
+  });
+
+  it("does NOT invent github provenance where there was none (negative control)", () => {
+    // The marker must be earned. Without this, the test above would pass just
+    // as well against a helper that returned `true` for everything.
+    const merged = mergeCoalescedContextSnapshot(
+      { issueId: "issue-1", wakeReason: "issue_assigned" },
+      { issueId: "issue-1", wakeReason: "issue_commented" },
+    );
+    expect(contextCarriesGithubWake(merged)).toBe(false);
+    expect(merged.carriesGithubWake).toBeUndefined();
+  });
+
+  it("sets the marker when the INCOMING wake is the github one", () => {
+    // The other direction: a webhook coalescing onto a queued issue-local row.
+    const merged = mergeCoalescedContextSnapshot(
+      { issueId: "issue-1", wakeReason: "issue_commented" },
+      { issueId: "issue-1", wakeReason: "github_pr_review_requested" },
+    );
+    expect(contextCarriesGithubWake(merged)).toBe(true);
+  });
+});
+
 describe("the cross-reason deferral gates the cancel", () => {
   const loopSource = readDispatchCandidateLoopSource(HEARTBEAT_SOURCE);
 
@@ -108,6 +194,19 @@ describe("the cross-reason deferral gates the cancel", () => {
         "duplicate_dispatch_cross_reason_deferred",
       ),
     ).toBe(true);
+  });
+
+  it("reads the arrival through the sticky marker, not the raw wake class", () => {
+    // The one-character difference between the fix and the defect. If this
+    // reverts to `arrivalWakeClass === "github_webhook"` the gate still
+    // compiles, still defers a freshly-arrived webhook, and silently loses
+    // every webhook that a later comment coalesced onto.
+    const guard = loopSource.slice(
+      loopSource.indexOf("const crossReasonGithubWake"),
+      loopSource.indexOf('"duplicate_dispatch_cross_reason_deferred"'),
+    );
+    expect(guard).toContain("contextCarriesGithubWake(queuedSnapshot)");
+    expect(guard).not.toContain('arrivalWakeClass === "github_webhook"');
   });
 
   it("decides the class BEFORE cancelling, not after", () => {

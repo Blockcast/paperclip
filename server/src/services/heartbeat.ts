@@ -2455,6 +2455,47 @@ export function classifyHeartbeatWakeClass(
   return wakeReason.startsWith("github_") ? "github_webhook" : "issue_local";
 }
 
+/**
+ * Sticky marker: "this row carries at least one github webhook wake that has
+ * not been delivered yet."
+ *
+ * ⛔ Deliberately NOT a member of {@link GITHUB_PR_CONTEXT_KEYS}. Those keys
+ * describe WHICH pull request, and are dropped as a unit when an incoming wake
+ * names a different one; this key describes only that a webhook is still owed a
+ * dispatch, which stays true whichever PR it was for.
+ */
+const CARRIES_GITHUB_WAKE_CONTEXT_KEY = "carriesGithubWake";
+
+/**
+ * PEN-6407 review follow-up. `classifyHeartbeatWakeClass` alone is NOT a safe
+ * test for "this queued row is a webhook delivery", because a queued row is a
+ * COALESCE TARGET and the merge overwrites `wakeReason`.
+ *
+ * The path, which is exactly the #3452 scenario rather than a corner case: a
+ * github row is deferred and sits `queued` while an `issue_local` incumbent
+ * runs. The next `issue_commented` wake for that issue has the same task scope,
+ * so `rawCoalescedTarget` selects `sameScopeQueuedRun` — the deferred row —
+ * FIRST, and `mergeCoalescedContextSnapshot` spreads `{...existing, ...incoming}`
+ * so `wakeReason` becomes `issue_commented`. The next dispatch pass then reads
+ * the row as issue-local, the cross-class branch does not fire, and the webhook
+ * is cancelled after all. The strand this gate exists for is precisely a long
+ * comment-driven hold with more comments arriving during it, so the coalesce is
+ * the normal case there, not the unlucky one.
+ *
+ * ⭐ Asymmetric by design, and the asymmetry is the same gate-polarity rule the
+ * unreadable-class fallback follows: this test PROTECTS an event from
+ * destruction, so it is generous (sticky marker OR a github `wakeReason`); the
+ * INCUMBENT test LICENSES a destruction, so it stays strict and keeps reading
+ * `classifyHeartbeatWakeClass` alone. Over-detecting an incumbent would cancel a
+ * webhook; over-detecting an arrival only costs a deferral.
+ */
+export function contextCarriesGithubWake(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): boolean {
+  if (contextSnapshot?.[CARRIES_GITHUB_WAKE_CONTEXT_KEY] === true) return true;
+  return classifyHeartbeatWakeClass(contextSnapshot) === "github_webhook";
+}
+
 type PrReviewFairnessRun = Pick<
   typeof heartbeatRuns.$inferSelect,
   "id" | "createdAt" | "contextSnapshot"
@@ -11584,6 +11625,24 @@ export function mergeCoalescedContextSnapshot(
   }
   if (!hasInteractionContinuationWakeContext(incoming)) {
     clearInteractionContinuationWakeContext(merged);
+  }
+  // PEN-6407 review follow-up: `{...existing, ...incoming}` above overwrites
+  // `wakeReason`, so an issue-local wake coalescing into a DEFERRED github row
+  // erases the only evidence that a webhook is still owed a dispatch — and the
+  // next pass then cancels it as an ordinary same-class duplicate, losing the
+  // delivery the deferral existed to save. Carry the fact forward as its own
+  // sticky key. Set from EITHER side, and never cleared: the merge is the one
+  // place the provenance can be lost, so it is the one place that must preserve
+  // it.
+  //
+  // Not clearing it on dispatch is deliberate and harmless. Once the row leaves
+  // `queued` the ARRIVAL test never reads it again, and the INCUMBENT test reads
+  // `classifyHeartbeatWakeClass` alone — so a running row still carrying the
+  // marker counts as issue-local there, which errs toward DEFERRING the next
+  // github arrival rather than cancelling it. Both directions of the staleness
+  // land on the safe side.
+  if (contextCarriesGithubWake(existing) || contextCarriesGithubWake(incoming)) {
+    merged[CARRIES_GITHUB_WAKE_CONTEXT_KEY] = true;
   }
   return merged;
 }
@@ -36616,8 +36675,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             const arrivalWakeClass = classifyHeartbeatWakeClass(queuedSnapshot);
             const incumbentWakeClasses =
               inFlightIssueWakeClasses.get(queuedIssueId) ?? new Set<HeartbeatWakeClass>();
+            // ⭐ `contextCarriesGithubWake`, NOT `arrivalWakeClass`, on the
+            // arrival side: a deferred row is a coalesce target, and a later
+            // issue-local wake merging into it overwrites `wakeReason`. See
+            // that helper for why this side is generous and the incumbent side
+            // below stays strict.
             const crossReasonGithubWake =
-              arrivalWakeClass === "github_webhook"
+              contextCarriesGithubWake(queuedSnapshot)
               && !incumbentWakeClasses.has("github_webhook");
             if (crossReasonGithubWake) {
               logger.info(
@@ -36627,6 +36691,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
                   issueId: queuedIssueId,
                   arrivalWakeClass,
                   arrivalWakeReason: readNonEmptyString(queuedSnapshot.wakeReason),
+                  // Tells apart "woken by a webhook" from "an issue-local wake
+                  // coalesced onto a deferred webhook row", which read the same
+                  // on `arrivalWakeReason` alone.
+                  arrivalCarriesGithubWake: queuedSnapshot[CARRIES_GITHUB_WAKE_CONTEXT_KEY] === true,
                   incumbentWakeClasses: [...incumbentWakeClasses],
                 },
                 "startNextQueuedRunForAgent: deferred cross-reason github wake instead of cancelling it",

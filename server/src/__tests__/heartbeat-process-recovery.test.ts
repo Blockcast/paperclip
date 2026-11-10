@@ -11247,6 +11247,74 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(deferredWakeup?.status).not.toBe("skipped");
   });
 
+  // PEN-6407 review follow-up. The deferral leaves the row `queued`, and a
+  // queued row is the FIRST coalesce target (`sameScopeQueuedRun` heads the
+  // `??` chain in `enqueueWakeup`). `mergeCoalescedContextSnapshot` spreads
+  // `{...existing, ...incoming}`, so without a sticky marker the next
+  // `issue_commented` wake overwrites `wakeReason` and the webhook is cancelled
+  // as an ordinary duplicate on the following pass — the #3452 outcome, through
+  // a second door. That is the NORMAL case on this strand, not an unlucky one:
+  // the hold is long precisely because comments keep arriving.
+  it("keeps github provenance when a comment wake coalesces onto a deferred github row", async () => {
+    const { companyId, agentId, issueId } = await seedAssignedTodoNoRunFixture();
+    const webhookRunId = randomUUID();
+    const webhookWakeupId = randomUUID();
+
+    await db.insert(agentWakeupRequests).values({
+      id: webhookWakeupId,
+      companyId,
+      agentId,
+      source: "assignment",
+      triggerDetail: "webhook",
+      reason: "github_pr_review_requested",
+      payload: { issueId },
+      status: "queued",
+    });
+
+    await db.insert(heartbeatRuns).values({
+      id: webhookRunId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      triggerDetail: "webhook",
+      status: "queued",
+      wakeupRequestId: webhookWakeupId,
+      contextSnapshot: {
+        issueId,
+        wakeReason: "github_pr_review_requested",
+        githubPrNumber: 3452,
+        githubRepoFullName: "Blockcast/paperclip",
+      },
+      createdAt: new Date(Date.now() - 1_000),
+      updatedAt: new Date(Date.now() - 1_000),
+    });
+
+    // The real enqueue path, not a hand-built merge: this is the seam where a
+    // unit test on mergeCoalescedContextSnapshot can pass while the wiring is
+    // wrong.
+    await heartbeat.enqueueWakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "comment",
+      reason: "issue_commented",
+      payload: { issueId },
+      contextSnapshot: { issueId, wakeReason: "issue_commented" },
+    });
+
+    const row = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, webhookRunId))
+      .then((rows) => rows[0] ?? null);
+    expect(row).toBeDefined();
+
+    const snapshot = (row?.contextSnapshot ?? {}) as Record<string, unknown>;
+    // Proves the coalesce actually happened onto THIS row. Without this the
+    // assertion below could pass simply because nothing touched the row.
+    expect(snapshot.wakeReason).toBe("issue_commented");
+    // …and that the github provenance survived it.
+    expect(snapshot.carriesGithubWake).toBe(true);
+  });
+
   // PEN-6407 control arm. The deferral above must not have disabled the gate:
   // a github wake arriving against a GITHUB incumbent is a same-class
   // duplicate, which is the case the guard was built for and should keep

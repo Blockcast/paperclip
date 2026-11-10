@@ -5713,6 +5713,16 @@ export const KNOWN_QUEUED_RUN_CLAIM_REFUSAL_ARMS = [
    * aging it and this pass really did pass over claimable work.
    *
    * This is the arm that answers "how often was the cancel's premise wrong?".
+   * ⚠️ **It counts PASSES, not rows.** `notePreClaimSkip` fires on every dispatch
+   * pass that sees the row still deferred, so one webhook held behind a
+   * 55-minute incumbent contributes many increments, not one. `rate()` over it
+   * reads "how much dispatch attention cross-class deferral is absorbing",
+   * which is the useful alerting shape; ⛔ it is NOT a count of wakes saved, and
+   * must not be subtracted from, or compared like-for-like against,
+   * {@link HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC}, which counts DB rows
+   * once each. `pr_review_task_in_flight` has the identical per-pass meaning, so
+   * the two are comparable with each other.
+   *
    * It is deliberately NOT a variant of `duplicate_dispatch_suppressed`: that
    * name is joined against the cancelled row's `error_code` and against
    * {@link HEARTBEAT_DUPLICATE_DISPATCH_SUPPRESSED_METRIC}, and nothing is

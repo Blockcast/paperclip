@@ -198,6 +198,13 @@ losses, and only the *cross-class* population has been pulled out. ⛔ Do not re
 `cross_reason_deferred` rate as a fault — a deferral is the correct outcome, and the arm is the
 measure of how often the old cancel's premise was wrong.
 
+⛔ **The two counters are NOT like-for-like and must never be subtracted.** `_suppressed` counts DB
+rows, once each. The `cross_reason_deferred` arm counts **dispatch passes**: it fires on every pass
+that sees the row still deferred, so one webhook held behind a 55-minute incumbent contributes many
+increments. `rate()` over it reads *how much dispatch attention cross-class deferral is absorbing* —
+not *how many wakes were saved*. `pr_review_task_in_flight` has the identical per-pass meaning and is
+the right thing to compare it against.
+
 **L2 has no counter.** `issue_execution_lock_not_acquired` is a durable `heartbeat_runs.error_code`
 and a log line only, so the layer that carries PEN-5082 done-when 1 is the one layer whose firing
 rate is not in Prometheus. Same family as PEN-5357.
