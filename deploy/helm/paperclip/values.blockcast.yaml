@@ -67,6 +67,15 @@ env:
     # pluginPassthroughEnv. A value set in the plugin's instance config wins.
     - name: PAPERCLIP_ALERTMANAGER_API_URL
       value: "http://alertmanager.monitoring.svc.cluster.local:9093"
+    # PEN-6236: the same arrangement for the alertmanager plugin's
+    # `prometheusApiUrl`. The cover CLOSE path reads it to ask whether a source
+    # alertname still has any ALERTS series -- Alertmanager has no `pending`
+    # state, so without this a cover is closed while its source rule is still
+    # re-accumulating `for:` (measured reach: 347 of 1199 estate rules). Not a
+    # secret; forwarded to plugin workers via pluginPassthroughEnv. A value set
+    # in the plugin's instance config wins.
+    - name: PAPERCLIP_PROMETHEUS_API_URL
+      value: "http://prometheus.monitoring.svc.cluster.local:9090"
     # Production PostgreSQL backups are owned by the paperclip-pg-backup
     # CronJob in Blockcast/onprem-k8s. It writes validated custom-format dumps
     # to the dedicated backup PVC and authoritative Azure Blob destination,

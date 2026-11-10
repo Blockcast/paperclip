@@ -991,4 +991,33 @@ describe("pluginPassthroughEnv", () => {
     ).toEqual({ PAPERCLIP_ALERTMANAGER_API_URL: "http://am:9093" });
     expect(pluginPassthroughEnv({ PAPERCLIP_ALERTMANAGER_API_URL: "" })).toEqual({});
   });
+
+  it("forwards PAPERCLIP_PROMETHEUS_API_URL, which the cover close path needs (PEN-6236)", () => {
+    // The plugin worker is spawned with a built-from-scratch env (spawnProcess
+    // deliberately does NOT spread process.env), so a host env var that is not
+    // on this allowlist never reaches the plugin -- it is dropped silently and
+    // the alertmanager plugin's cover close then records
+    // `liveness_check_unconfigured` as though nothing were configured.
+    expect(
+      pluginPassthroughEnv({
+        PAPERCLIP_PROMETHEUS_API_URL: "http://prom:9090",
+        DATABASE_URL: "postgres://secret",
+      }),
+    ).toEqual({ PAPERCLIP_PROMETHEUS_API_URL: "http://prom:9090" });
+    expect(pluginPassthroughEnv({ PAPERCLIP_PROMETHEUS_API_URL: "" })).toEqual({});
+  });
+
+  it("forwards both allowlisted URLs together and still withholds everything else", () => {
+    expect(
+      pluginPassthroughEnv({
+        PAPERCLIP_ALERTMANAGER_API_URL: "http://am:9093",
+        PAPERCLIP_PROMETHEUS_API_URL: "http://prom:9090",
+        DATABASE_URL: "postgres://secret",
+        ANTHROPIC_API_KEY: "sk-should-not-pass",
+      }),
+    ).toEqual({
+      PAPERCLIP_ALERTMANAGER_API_URL: "http://am:9093",
+      PAPERCLIP_PROMETHEUS_API_URL: "http://prom:9090",
+    });
+  });
 });
