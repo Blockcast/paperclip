@@ -133,6 +133,12 @@ jobs:
       merge_group_trim_opencode_k8s_seed_cold_start: ${{ steps.merge_group_trim.outputs.merge_group_trim_opencode_k8s_seed_cold_start }}
       merge_group_trim_e2e: ${{ steps.merge_group_trim.outputs.merge_group_trim_e2e }}
       merge_group_trim_canary_dry_run: ${{ steps.merge_group_trim.outputs.merge_group_trim_canary_dry_run }}
+      # Pull-request heavy-lane carry-forward (scripts/pr-carry-forward.mjs,
+      # BLO-51600). general_tests skips a group ONLY on the literal 'true', ONLY
+      # on pull_request, and ONLY while PAPERCLIP_CI_PR_FULL_SUITE is unset.
+      carry_forward_general_server: ${{ steps.pr_carry_forward.outputs.carry_forward_general_server }}
+      carry_forward_workspaces_a: ${{ steps.pr_carry_forward.outputs.carry_forward_workspaces_a }}
+      carry_forward_workspaces_b: ${{ steps.pr_carry_forward.outputs.carry_forward_workspaces_b }}
 
     steps:
       - name: Checkout repository
@@ -292,6 +298,35 @@ jobs:
             exit 0
           fi
           MERGE_GROUP_TRIM_REPO_ROOT="$PWD" node "$trusted"
+        timeout-minutes: 3
+
+      # BLO-51600 (CTO ruling 2026-11-10). On a pull_request push, skip a General
+      # tests group when an earlier head of the same PR passed it and
+      # select-ci-suites on the earlier->this-head diff says the group is
+      # unreachable: the nit/doc push after a green run. Same trust model as the
+      # trim above: the PR BASE's copies of the decider and the two scripts it
+      # imports run, never the PR's. No copy at the base emits no outputs, which
+      # every consumer reads as "run". Fails open: see scripts/pr-carry-forward.mjs.
+      # Kill switch: repository variable PAPERCLIP_CI_PR_FULL_SUITE=true.
+      - name: Decide pull-request heavy-lane carry-forward
+        id: pr_carry_forward
+        if: ${{ !cancelled() && github.event_name == 'pull_request' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_FULL_SUITE: ${{ vars.PAPERCLIP_CI_PR_FULL_SUITE }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+        run: |
+          trusted="${RUNNER_TEMP}/pr-carry-forward"
+          mkdir -p "$trusted"
+          for f in pr-carry-forward.mjs merge-group-trim.mjs select-ci-suites.mjs; do
+            if ! git show "${PR_BASE_SHA}:scripts/$f" > "$trusted/$f"; then
+              echo "::warning title=carry-forward fell back to the full suite::no scripts/$f at PR base ${PR_BASE_SHA}"
+              exit 0
+            fi
+          done
+          PR_CARRY_FORWARD_REPO_ROOT="$PWD" node "$trusted/pr-carry-forward.mjs"
         timeout-minutes: 3
 
       - name: Setup actionlint
@@ -804,6 +839,11 @@ jobs:
         if: ${{ !cancelled() }}
         run: node --test ./scripts/__tests__/merge-group-trim.test.mjs
         timeout-minutes: 1
+
+      - name: Test pull-request heavy-lane carry-forward and its kill switch (BLO-51600)
+        if: ${{ !cancelled() }}
+        run: node --test ./scripts/__tests__/pr-carry-forward.test.mjs
+        timeout-minutes: 3
 
       - name: Test vendored-provenance union-merge invariants (BLO-34872)
         if: ${{ !cancelled() }}
@@ -2527,13 +2567,18 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           MERGE_GROUP_FULL_SUITE: ${{ vars.PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE }}
           MERGE_GROUP_TRIM_SERVER: ${{ needs.policy.outputs.merge_group_trim_general_server }}
+          PR_FULL_SUITE: ${{ vars.PAPERCLIP_CI_PR_FULL_SUITE }}
+          CARRY_GENERAL_SERVER: ${{ needs.policy.outputs.carry_forward_general_server }}
+          CARRY_WORKSPACES_A: ${{ needs.policy.outputs.carry_forward_workspaces_a }}
+          CARRY_WORKSPACES_B: ${{ needs.policy.outputs.carry_forward_workspaces_b }}
         run: |
           case "$GROUP" in
-            general-server) needed="$SERVER_TESTS_NEEDED" ;;
-            general-workspaces-a) needed="$WORKSPACES_A_TESTS_NEEDED" ;;
-            general-workspaces-b) needed="$WORKSPACES_B_TESTS_NEEDED" ;;
-            *) needed=true ;;
+            general-server) needed="$SERVER_TESTS_NEEDED"; carry="$CARRY_GENERAL_SERVER" ;;
+            general-workspaces-a) needed="$WORKSPACES_A_TESTS_NEEDED"; carry="$CARRY_WORKSPACES_A" ;;
+            general-workspaces-b) needed="$WORKSPACES_B_TESTS_NEEDED"; carry="$CARRY_WORKSPACES_B" ;;
+            *) needed=true; carry=false ;;
           esac
+          pr_full_suite=$(printf '%s' "$PR_FULL_SUITE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
           # Read the kill switch as decideTrim does (trim + lowercase), so TRUE or
           # " true" un-trims this lane too; interior whitespace only un-trims more.
           full_suite=$(printf '%s' "$MERGE_GROUP_FULL_SUITE" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
@@ -2544,6 +2589,9 @@ jobs:
             && [ "$full_suite" != "true" ] && [ "$MERGE_GROUP_TRIM_SERVER" = "true" ]; then
             echo "run=false" >> "$GITHUB_OUTPUT"
             echo "::notice title=General tests trimmed in merge group::the queued PR's head already passed every server shard in pull_request CI and the queue applies exactly that change set (see policy's 'Decide merge-group heavy-lane trim' step). Set PAPERCLIP_CI_MERGE_GROUP_FULL_SUITE=true to restore the full suite."
+          elif [ "$EVENT_NAME" = "pull_request" ] && [ "$pr_full_suite" != "true" ] && [ "$carry" = "true" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=General tests carried forward::an earlier head of this PR passed $GROUP and the diff since then cannot reach it (see policy's 'Decide pull-request heavy-lane carry-forward' step). Set PAPERCLIP_CI_PR_FULL_SUITE=true to restore the full suite."
           else
             echo "run=true" >> "$GITHUB_OUTPUT"
           fi
