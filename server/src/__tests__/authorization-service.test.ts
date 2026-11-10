@@ -2488,6 +2488,13 @@ describeEmbeddedPostgres("authorization service", () => {
     // 3422), so a foreign row from them already took the `undefined` path and
     // was already denied above; this case is reachable only by a caller that
     // asserts an origin kind for a row it cannot read.
+    // PEN-6266: DELIBERATELY the generic reason, and it must stay generic.
+    // This row is UNREADABLE to this company, so the refusal is "we cannot tell
+    // who holds it", NOT "a person holds it". `deny_human_assigned_issue` is
+    // reserved for a holder actually observed — see the three-valued
+    // assignmentOntoHumanHeldIssueRefusal. Do not "align" this with the
+    // human-held cases below; asserting a holder nobody here can see is the
+    // very mislabelling PEN-6266 exists to remove.
     await expect(authorization.decide({
       actor: actorContext,
       action: "tasks:assign",

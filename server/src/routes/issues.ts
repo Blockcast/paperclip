@@ -15681,7 +15681,7 @@ export function issueRoutes(
           //
           // Omitting the field is the worse of the two, not the safer:
           // `undefined` means "the caller did not look", which reloads the row
-          // inside `assignmentOntoHumanHeldIssueIsRefused`, making every
+          // inside `assignmentOntoHumanHeldIssueRefusal`, making every
           // ordinary checkout pay a SELECT that split exists to avoid — and
           // denying 403 before `svc.checkout`, the exact preemption the comment
           // above this `if` exists to prevent.

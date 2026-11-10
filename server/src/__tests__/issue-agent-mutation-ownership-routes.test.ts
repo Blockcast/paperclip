@@ -3462,7 +3462,7 @@ describe("agent issue mutation checkout ownership", () => {
         allowed: !humanHeld,
         action: input.action,
         // PEN-6266: keep this stub in step with the real deny's reason
-        // (services/authorization.ts, the assignmentOntoHumanHeldIssueIsRefused
+        // (services/authorization.ts, the assignmentOntoHumanHeldIssueRefusal
         // branch). It is never asserted here -- this suite reads `allowed`, not
         // `reason` -- so a drift passes silently and then reads to the next
         // reviewer as evidence that production emits `deny_missing_grant` on
