@@ -170,6 +170,87 @@ async function refusalBody(url: string, response: Response): Promise<string> {
 }
 
 /**
+ * How much of a GraphQL response is parsed when looking for a budget refusal.
+ *
+ * Bounds the pathological case only. GitHub's own error envelope is a few
+ * hundred bytes; the limit exists so that an HTML error page from a proxy, or
+ * an unusually large query RESULT that happens to reach the parse below, is
+ * abandoned rather than parsed.
+ */
+const GRAPHQL_REFUSAL_BODY_PARSE_LIMIT = 1_000_000;
+
+/**
+ * GitHub's GraphQL endpoint, in either of the two shapes {@link gitHubGraphQlUrl}
+ * builds. Shared with {@link inferRateLimitResource} rather than spelled twice,
+ * so the budget a GraphQL call is held under and the detector below can never
+ * disagree about what counts as GraphQL. Guarded because the detector's whole
+ * job is to observe, and an unparseable URL must degrade to "not GraphQL".
+ */
+function isGraphQlEndpoint(url: string): boolean {
+  try {
+    return new URL(url).pathname.endsWith("/graphql");
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Did GitHub refuse this GraphQL read for want of primary budget? (PEN-6341)
+ *
+ * GraphQL does not report an exhausted primary budget the way REST does. It
+ * answers **HTTP 200**, carrying `errors: [{ type: "RATE_LIMITED" }]` and a
+ * null `data`. Every status-keyed signal in this module therefore misses it:
+ * {@link classifyGithubRefusal} returns null, so the refusal never reaches the
+ * counter, and `rememberRateLimitHold` returns before it reads a header, so
+ * the spent bucket is re-sent into by every subsequent call for the rest of
+ * the window — which is the exact behaviour the hold exists to remove, in the
+ * one budget it could not see. That cost nothing while no caller here spoke
+ * GraphQL. `githubHeadChecksSettlement` now does.
+ *
+ * ## Why the body read is gated on the header, and why the gate admits ABSENT
+ *
+ * Cloning and buffering a body on every GraphQL 200 would put a full rollup
+ * payload through this path for nothing, so the header is consulted first. The
+ * gate admits `0` — the exhausted case — and ALSO an absent or empty header.
+ * That second arm is the load-bearing one: that GitHub sets
+ * `x-ratelimit-remaining: 0` alongside the error is a documented expectation
+ * that nobody has yet observed against a live exhausted `graphql` bucket.
+ * REQUIRING it would make this detector silently INERT if the expectation is
+ * wrong, and an inert detector is indistinguishable from a healthy budget. The
+ * extra arm costs a body read only on responses carrying no rate-limit headers
+ * at all, which in practice means test doubles.
+ *
+ * ## Why the error is matched structurally and never lexically
+ *
+ * A regex for `RATE_LIMITED` over the raw text would also match a query
+ * RESULT that contains the string — a PR body or an issue title quoting it —
+ * and a false positive here holds EVERY GraphQL call for up to an hour, which
+ * is a self-inflicted outage in a budget that was never spent. So the body is
+ * parsed and the `errors` array inspected; anything that is not a GraphQL
+ * error envelope is not a refusal.
+ *
+ * Never throws. The caller's response must survive a failure to observe it,
+ * and this runs inside `ghFetch`'s try, where an escape would be reported as a
+ * connection failure against a host that answered perfectly well.
+ */
+async function graphQlPrimaryBudgetRefusal(url: string, response: Response): Promise<boolean> {
+  try {
+    if (response?.status !== 200) return false;
+    if (!isGraphQlEndpoint(url)) return false;
+    const remaining = refusalHeader(response, "x-ratelimit-remaining")?.trim() ?? "";
+    if (remaining !== "" && remaining !== "0") return false;
+    if (typeof response.clone !== "function") return false;
+    const text = await ghReadBody(url, () => response.clone().text());
+    if (typeof text !== "string" || text.length === 0) return false;
+    if (text.length > GRAPHQL_REFUSAL_BODY_PARSE_LIMIT) return false;
+    const errors = (JSON.parse(text) as { errors?: unknown } | null)?.errors;
+    return Array.isArray(errors) && errors.some((e) => (e as { type?: unknown } | null)?.type === "RATE_LIMITED");
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Why GitHub refused this response, or null if it did not refuse it.
  *
  * Signals are consulted cheapest-first, and the ORDER is load-bearing rather
@@ -193,6 +274,15 @@ async function refusalBody(url: string, response: Response): Promise<string> {
  * with different remedies, and folding them in would make the counter a generic
  * error rate that no quota question can be asked of.
  *
+ * The ONE exception is passed in rather than derived here:
+ * `graphQlBudgetSpent` reports a GraphQL 200 that carries a `RATE_LIMITED`
+ * error (PEN-6341). That is a refusal GitHub chose to deliver with a success
+ * status, and it is reported under the same `rate_limited` reason as its REST
+ * equivalent — the `resource` label, read separately, is what tells an operator
+ * `graphql` from `core`. It is a parameter because detecting it costs a body
+ * read that `ghFetch` already has to make for the hold, and reading it twice
+ * would clone the body twice.
+ *
  * Exported for the unit tests: classification is the part with real GitHub
  * protocol knowledge in it, and it is worth pinning directly rather than only
  * through the counter.
@@ -200,7 +290,9 @@ async function refusalBody(url: string, response: Response): Promise<string> {
 export async function classifyGithubRefusal(
   url: string,
   response: Response,
+  graphQlBudgetSpent = false,
 ): Promise<GithubApiRefusalReason | null> {
+  if (graphQlBudgetSpent) return "rate_limited";
   const status = response?.status;
   if (status !== 403 && status !== 429) return null;
   if (refusalHeader(response, "x-ratelimit-remaining")?.trim() === "0") return "rate_limited";
@@ -319,9 +411,9 @@ function countGithubApiHeld(url: string, resource: string): void {
  * module's contract is that it returns what GitHub said; an observation that
  * fails must lose the observation, not the call.
  */
-async function countGithubRefusal(url: string, response: Response): Promise<void> {
+async function countGithubRefusal(url: string, response: Response, graphQlBudgetSpent: boolean): Promise<void> {
   try {
-    const reason = await classifyGithubRefusal(url, response);
+    const reason = await classifyGithubRefusal(url, response, graphQlBudgetSpent);
     if (reason) recordGithubApiRefusal(reason, classifyGithubRefusalResource(response));
   } catch {
     // Observation is best-effort; the caller's response is not.
@@ -358,8 +450,8 @@ export function _resetGhFetchRateLimitHoldsForTest() {
 }
 
 function inferRateLimitResource(url: string): string {
+  if (isGraphQlEndpoint(url)) return "graphql";
   const path = new URL(url).pathname;
-  if (path.endsWith("/graphql")) return "graphql";
   if (path.includes("/search/code")) return "code_search";
   if (path.includes("/search/")) return "search";
   return "core";
@@ -392,15 +484,32 @@ function heldResponse(resetMs: number, resource: string): Response {
   );
 }
 
-function rememberRateLimitHold(url: string, init: RequestInit | undefined, response: Response): void {
-  if (response?.status !== 403 && response?.status !== 429) return;
+function rememberRateLimitHold(
+  url: string,
+  init: RequestInit | undefined,
+  response: Response,
+  inferredResource: string,
+  graphQlBudgetSpent: boolean,
+): void {
+  // `graphQlBudgetSpent` is the only way a 200 reaches the rest of this
+  // function (PEN-6341). Everything below it is unchanged and still has to
+  // hold: a GraphQL refusal that arrives without `x-ratelimit-reset` arms
+  // NOTHING, because there is no reset to trust and inventing one would hold a
+  // live budget shut. That refusal is still counted, so an exhaustion this
+  // cannot hold is visible rather than silent.
+  if (response?.status !== 403 && response?.status !== 429 && !graphQlBudgetSpent) return;
   if (refusalHeader(response, "x-ratelimit-remaining")?.trim() !== "0") return;
   const resetSec = Number(refusalHeader(response, "x-ratelimit-reset"));
   if (!Number.isFinite(resetSec) || resetSec <= 0) return;
   const now = Date.now();
   const resetMs = Math.min(resetSec * 1000, now + RATE_LIMIT_HOLD_MAX_MS);
   if (resetMs <= now) return;
-  const resource = refusalHeader(response, "x-ratelimit-resource") ?? "core";
+  // Falling back to the INFERRED budget rather than the literal "core": the
+  // lookup side of this map keys on `inferRateLimitResource`, so a refusal that
+  // omits the header must be remembered under the same name the next call will
+  // ask for. Hardcoding "core" armed a hold that a `graphql` or `search` caller
+  // could never find — it did not fail loudly, it just never held anything.
+  const resource = refusalHeader(response, "x-ratelimit-resource") ?? inferredResource;
   // Rotated tokens never look their old key up again; sweep so the map stays bounded.
   for (const [key, hold] of rateLimitHolds) if (hold.resetMs <= now) rateLimitHolds.delete(key);
   rateLimitHolds.set(rateLimitHoldKey(url, init, resource), { resetMs, resource });
@@ -417,7 +526,8 @@ export async function ghFetch(url: string, init?: RequestInit): Promise<Response
   // until that series existed the hold's own work was in no counter anywhere,
   // which made `paperclip_github_api_refusals_total` read as roughly one refusal
   // per (credential, budget, reset window) rather than as blocked work.
-  const holdKey = rateLimitHoldKey(url, init, inferRateLimitResource(url));
+  const inferredResource = inferRateLimitResource(url);
+  const holdKey = rateLimitHoldKey(url, init, inferredResource);
   const hold = rateLimitHolds.get(holdKey);
   if (hold) {
     if (hold.resetMs > Date.now()) {
@@ -431,8 +541,11 @@ export async function ghFetch(url: string, init?: RequestInit): Promise<Response
   countGithubApiAttempt(url);
   try {
     const response = await fetch(url, { ...init, signal });
-    await countGithubRefusal(url, response);
-    rememberRateLimitHold(url, init, response);
+    // Read once and threaded into both observers: the GraphQL refusal signal
+    // lives in the body, and each of them would otherwise clone it separately.
+    const graphQlBudgetSpent = await graphQlPrimaryBudgetRefusal(url, response);
+    await countGithubRefusal(url, response, graphQlBudgetSpent);
+    rememberRateLimitHold(url, init, response, inferredResource, graphQlBudgetSpent);
     return response;
   } catch (err) {
     const aborted = abortFailure(url, err, init?.signal);

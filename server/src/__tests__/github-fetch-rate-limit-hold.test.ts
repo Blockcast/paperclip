@@ -221,3 +221,141 @@ describe("the hold's own work is counted, and only in its own series (PEN-6243)"
     expect(afterRoute - beforeRoute).toBe(0);
   });
 });
+
+const GRAPHQL = "https://api.github.com/graphql";
+
+/**
+ * GitHub's answer to a spent GraphQL primary budget: HTTP **200**, a null
+ * `data`, and the refusal in `errors`. Every status-keyed signal in
+ * `github-fetch.ts` was blind to this shape until PEN-6341, which is why these
+ * fixtures are 200s rather than 403s.
+ */
+function graphQlRateLimited(resetSec: number): Response {
+  return new Response(
+    JSON.stringify({ data: null, errors: [{ type: "RATE_LIMITED", message: "API rate limit exceeded" }] }),
+    {
+      status: 200,
+      headers: {
+        "content-type": "application/json",
+        "x-ratelimit-remaining": "0",
+        "x-ratelimit-reset": String(resetSec),
+        "x-ratelimit-resource": "graphql",
+      },
+    },
+  );
+}
+
+/**
+ * A GraphQL success, deliberately carrying `x-ratelimit-remaining: 0`.
+ *
+ * The zero is the point. The detector consults that header before it reads a
+ * body, so a fixture with headroom would be refused at the gate and the
+ * negative controls below would pass without ever reaching the parser they
+ * exist to pin.
+ */
+function graphQlOk(body: unknown): Response {
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: {
+      "content-type": "application/json",
+      "x-ratelimit-remaining": "0",
+      "x-ratelimit-resource": "graphql",
+    },
+  });
+}
+
+describe("GraphQL reports a spent primary budget with a 200 (PEN-6341)", () => {
+  it("arms the hold from a 200 carrying a RATE_LIMITED error", async () => {
+    const reset = Math.ceil(Date.now() / 1000) + 600;
+    const fetchMock = vi.fn(async () => graphQlRateLimited(reset));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const first = await ghFetch(GRAPHQL, auth("gql-a"));
+    const held = await ghFetch(GRAPHQL, auth("gql-a"));
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(held.status).toBe(403);
+    expect(held.headers.get("x-ratelimit-resource")).toBe("graphql");
+    expect(held.headers.get("x-ratelimit-reset")).toBe(String(reset));
+
+    // Observing the refusal must not consume it. The detector reads a CLONE,
+    // so the caller still receives GitHub's own unconsumed body -- without
+    // this, `ghGraphQlQuery` would report `unreadable_body` for every refusal
+    // and the reason an operator sees would name the wrong failure.
+    const body = await first.json();
+    expect(body.errors[0].type).toBe("RATE_LIMITED");
+  });
+
+  it("holds only the graphql budget, never core on the same credential", async () => {
+    const reset = Math.ceil(Date.now() / 1000) + 600;
+    const fetchMock = vi.fn(async () => graphQlRateLimited(reset));
+    vi.stubGlobal("fetch", fetchMock);
+    await ghFetch(GRAPHQL, auth("gql-b"));
+
+    fetchMock.mockImplementation(async () => new Response("{}", { status: 200 }));
+    expect((await ghFetch(CORE, auth("gql-b"))).status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not hold on an ordinary GraphQL 200", async () => {
+    const fetchMock = vi.fn(async () => graphQlOk({ data: { repository: { name: "paperclip" } } }));
+    vi.stubGlobal("fetch", fetchMock);
+    await ghFetch(GRAPHQL, auth("gql-c"));
+    await ghFetch(GRAPHQL, auth("gql-c"));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not hold on a RESULT that merely contains the marker", async () => {
+    // The control that justifies parsing the envelope instead of grepping the
+    // text. GitHub will happily return our own prose back to us, and a lexical
+    // match on a PR body quoting `RATE_LIMITED` would hold every GraphQL call
+    // for up to an hour against a budget that was never spent -- a
+    // self-inflicted outage, arriving silently.
+    const fetchMock = vi.fn(async () =>
+      graphQlOk({ data: { repository: { pullRequest: { body: 'we saw type: "RATE_LIMITED" yesterday' } } } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await ghFetch(GRAPHQL, auth("gql-d"));
+    await ghFetch(GRAPHQL, auth("gql-d"));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("counts the refusal under rate_limited, labelled graphql", async () => {
+    // Same reason as its REST equivalent, because it IS the same condition;
+    // `resource` is what tells an operator which budget went. That join is the
+    // whole reason this needs no new label value.
+    const labels = { reason: "rate_limited", resource: "graphql" };
+    const read = async () =>
+      counterValue((await renderMetrics()).body, GITHUB_API_REFUSALS_METRIC, labels) ?? 0;
+    const before = await read();
+
+    const reset = Math.ceil(Date.now() / 1000) + 600;
+    vi.stubGlobal("fetch", vi.fn(async () => graphQlRateLimited(reset)));
+    await ghFetch(GRAPHQL, auth("gql-e"));
+
+    expect((await read()) - before).toBe(1);
+  });
+
+  it("counts, but cannot hold, a refusal carrying no rate-limit headers", async () => {
+    // That GitHub sets `x-ratelimit-remaining: 0` beside the error is an
+    // expectation nobody has checked against a live exhausted graphql bucket.
+    // If it is wrong, the hold cannot arm -- there is no reset to trust, and
+    // inventing one would shut a live budget. What must still happen is the
+    // COUNT: an exhaustion this cannot hold has to stay visible, because an
+    // inert detector and a healthy budget read identically.
+    const labels = { reason: "rate_limited", resource: "unknown" };
+    const read = async () =>
+      counterValue((await renderMetrics()).body, GITHUB_API_REFUSALS_METRIC, labels) ?? 0;
+    const before = await read();
+
+    const fetchMock = vi.fn(
+      async () => new Response(JSON.stringify({ data: null, errors: [{ type: "RATE_LIMITED" }] }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    await ghFetch(GRAPHQL, auth("gql-f"));
+    await ghFetch(GRAPHQL, auth("gql-f"));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect((await read()) - before).toBe(2);
+  });
+});
