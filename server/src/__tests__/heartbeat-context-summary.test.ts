@@ -4232,7 +4232,11 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // `// ""` guards a null description: a bare `.description` under `jq -j` writes the four
     // literal bytes `null` into desc.md, and the prepend then publishes the word.
     expect(markdown).toContain("Produce it with `jq -j '.description // \"\"'`");
-    expect(markdown).toContain("never `jq -r` and never a bare `.description`");
+    expect(markdown).toContain("never `jq -r`, which appends a trailing newline");
+    // Split into its own sentence AFTER the `jq -r` one: as a parenthetical it made the
+    // following "which appends a trailing newline" attach to the bare `.description` instead
+    // of to `jq -r`, which is where the newline actually comes from.
+    expect(markdown).toContain("And never a bare `.description`: on a row whose description is null");
     // The encoder is itself a transcription, and the one published here until 2026-11-10 was a
     // LOSSY one: jq-1.7's `-R` raw input replaces a multi-byte UTF-8 character straddling its
     // ~4096-byte in-line read chunk with two U+FFFD, at exit 0 and `200 OK`. Measured destroying
@@ -4262,8 +4266,13 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // false-alarm anyway on a row already carrying U+FFFD from the damage this PR fixes. The
     // round-trip catches the boundary corruption, a newline translation and a truncation in
     // one line, and it is the check that caught the CR defect above.
+    // Published WITH `assert` and WITH the import, because the bare comparison is the third
+    // could-not-fail-loud guard in this one clause: run as `python3 -c "<expr>"` it evaluates
+    // to False and exits 0, passing silently on exactly the loss it exists to catch, and
+    // without `import json` it raises NameError instead of answering. A check published in a
+    // form that cannot fail is worse than no check, because it is reported as having passed.
     expect(markdown).toContain(
-      "json.load(open('body.json'))['description'].encode('utf-8') == open('desc.md','rb').read()",
+      "import json;assert json.load(open('body.json'))['description'].encode('utf-8') == open('desc.md','rb').read()",
     );
     expect(markdown).not.toContain("Assert the encoded body contains zero U+FFFD");
     expect(markdown).toContain("two U+FFFD REPLACEMENT CHARACTERS");
