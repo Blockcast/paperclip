@@ -9907,6 +9907,141 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       warnSpy.mockRestore();
     });
 
+    // PEN-5316. The three tests below pin the `refusedBy` SPLIT, not the
+    // release behaviour: every one of them asserts the reservation stays
+    // unreleased, because fail-closed is correct in all three cases. What was
+    // broken is that a reader could not tell them apart -- a blind sweep and a
+    // healthy one wrote the same log field, and the identity-mismatch branch
+    // wrote none at all. Measured on the fleet 2026-11-10: a stranded
+    // reservation was present on the Devops seat for 311 of 1440 minutes
+    // (21.6 %) with a worst age of 1.83 h, and the busiest seats were worst
+    // hit, so which branch is doing the holding is the question that decides
+    // the remedy.
+
+    async function expectStuckSkipReason(
+      reservationId: string,
+      expected: string,
+      run: () => Promise<unknown>,
+    ) {
+      const warnSpy = vi.spyOn(logger, "warn");
+      try {
+        await run();
+        const calls = warnSpy.mock.calls.filter(
+          (call) =>
+            call[1] === "external-runtime reservation still unreleased after reclaim sweep refused it"
+            && (call[0] as Record<string, unknown>)?.reservationId === reservationId,
+        );
+        expect(calls).toHaveLength(1);
+        expect(calls[0]![0] as Record<string, unknown>).toMatchObject({ refusedBy: expected });
+      } finally {
+        warnSpy.mockRestore();
+        // The suite's `afterEach` calls `vi.clearAllMocks()`, which clears CALLS
+        // but keeps implementations -- so a `mockResolvedValue`/`mockImplementation`
+        // set here would leak into every later test in this file and starve its
+        // Job lookups. `mockReset()` restores the implementation originally passed
+        // to `vi.fn(impl)`, i.e. the hoisted defaults.
+        mockListManagedAgentJobs.mockReset();
+        mockListAgentJobRunStatuses.mockReset();
+        mockReadAgentJobRunStatusByName.mockReset();
+      }
+    }
+
+    async function seedTerminalRunWithLaunchedReservation() {
+      const { companyId, agentId, runId } = await seedRunFixture({
+        adapterType: "codex_local",
+        runStatus: "failed",
+        processPid: null,
+        processGroupId: null,
+        includeIssue: false,
+      });
+      // `seedLaunchedReservation`'s default clocks sit far past the 30-min
+      // stuck gate, which is what makes the warn observable at all.
+      const reservation = await seedLaunchedReservation({ companyId, agentId, runId });
+      return { companyId, agentId, runId, reservation };
+    }
+
+    it("attributes an UNREADABLE Job status to its own branch, not to 'not terminal' (PEN-5316)", async () => {
+      // The sweep is blind: the Job status read returns null, so it cannot say
+      // whether the Job is alive. Holding the slot is right; reporting it as
+      // `job_not_terminal_or_unreadable` -- the same field a healthy live Job
+      // produces -- is what hid a kube-read outage behind normal operation.
+      const { runId, reservation } = await seedTerminalRunWithLaunchedReservation();
+      // Both job-status sources must be pinned: a null managed-job list falls
+      // back to `listAgentJobRunStatuses()`, and `vi.clearAllMocks()` keeps
+      // implementations set by earlier tests in this file.
+      mockListManagedAgentJobs.mockResolvedValue(null);
+      mockListAgentJobRunStatuses.mockResolvedValue(null);
+      mockReadAgentJobRunStatusByName.mockImplementation(async () => null);
+
+      await expectStuckSkipReason(reservation!.id, "job_status_unreadable", () =>
+        heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true }));
+
+      const persisted = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation!.id))
+        .then((rows) => rows[0]);
+      // Fail-closed is the correct behaviour here and this change does not
+      // relax it. Only the label moved.
+      expect(persisted?.releasedAt).toBeNull();
+      expect(runId).toBeTruthy();
+    });
+
+    it("attributes a Job that ANSWERED and is still active to 'job_not_terminal' (PEN-5316 control)", async () => {
+      // The discriminating control: same branch, same fail-closed outcome,
+      // different cause. Without this the test above would pass against an
+      // implementation that simply renamed the single label.
+      const { reservation } = await seedTerminalRunWithLaunchedReservation();
+      mockListManagedAgentJobs.mockResolvedValue(null);
+      mockListAgentJobRunStatuses.mockResolvedValue(null);
+      mockReadAgentJobRunStatusByName.mockImplementation(async (name) => ({
+        phase: "active" as const,
+        reason: null,
+        message: null,
+        name,
+        uid: reservation!.jobUid,
+      }));
+
+      await expectStuckSkipReason(reservation!.id, "job_not_terminal", () =>
+        heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true }));
+
+      const persisted = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation!.id))
+        .then((rows) => rows[0]);
+      expect(persisted?.releasedAt).toBeNull();
+    });
+
+    it("attributes the Job-identity mismatch branch, which reported nothing at all (PEN-5316)", async () => {
+      // This is the adapter-type-change strand shape (BLO-28865): the
+      // reservation still holds the pre-change Job identity. Five of the six
+      // refusal branches called `noteStuckSkip`; this one returned silently,
+      // so the one shape the strand gauge exists to watch was the one shape
+      // the log attribution could not name.
+      const { agentId, runId, reservation } = await seedTerminalRunWithLaunchedReservation();
+      mockListManagedAgentJobs.mockResolvedValue([{
+        phase: "active" as const,
+        reason: null,
+        message: null,
+        runId,
+        agentId,
+        name: reservation!.jobName!,
+        uid: `${reservation!.jobUid}-rotated`,
+        createdAt: new Date(),
+      }]);
+
+      await expectStuckSkipReason(reservation!.id, "job_identity_mismatch", () =>
+        heartbeat.reapOrphanedRuns({ suppressDispatchAfterReap: true }));
+
+      const persisted = await db
+        .select()
+        .from(externalRuntimeReservations)
+        .where(eq(externalRuntimeReservations.id, reservation!.id))
+        .then((rows) => rows[0]);
+      expect(persisted?.releasedAt).toBeNull();
+    });
+
     // BLO-21460 (Ally important 2): the three contracts this PR introduces that
     // no resource-release assertion can observe. Each is an argument-level or
     // control-flow property, so a refactor can drop any of them while every
