@@ -23,7 +23,7 @@ import { logger } from "../middleware/logger.js";
 import { computeAuthoredLoc, type GithubPullFile } from "./authored-loc.js";
 import {
   buildPullRequestWorkProductFields,
-  PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+  PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER,
 } from "./pull-request-work-products.js";
 import { workProductService } from "./work-products.js";
 import {
@@ -311,12 +311,13 @@ interface GithubPullDetail {
   title?: string | null;
   body?: string | null;
   merged_at?: string | null;
-  // PEN-6413: `updated_at` feeds the work-product ordering guard, which accepts
-  // an incoming row only when its source timestamp is strictly later than the
-  // stored one. `html_url` is the row's link. Both are already present on the
-  // REST PR detail fetched below; neither was read before.
+  // PEN-6413: `html_url` is the work-product row's link, already present on
+  // the REST PR detail fetched below and not read before this change.
+  //
+  // `updated_at` is deliberately NOT read here. It is the PR's CURRENT
+  // timestamp at sweep time, and it feeds the work-product ordering guard --
+  // see the `prUpdatedAt` argument below for why using it churns correct rows.
   html_url?: string | null;
-  updated_at?: string | null;
   additions?: number | null;
   deletions?: number | null;
   head?: { ref?: string | null; sha?: string | null } | null;
@@ -353,7 +354,7 @@ export async function reconcileMergedPullRequests(
   linked: number;
   unlinked: number;
   enriched: number;
-  workProductsRepaired: number;
+  workProductsOffered: number;
 }> {
   const apiBase = gitHubApiBase(GITHUB_HOST);
   const headers = githubApiHeaders(input.token);
@@ -375,7 +376,7 @@ export async function reconcileMergedPullRequests(
   let linked = 0;
   let unlinked = 0;
   let enriched = 0;
-  let workProductsRepaired = 0;
+  let workProductsOffered = 0;
   const workProducts = workProductService(db);
 
   for (let page = 1; page <= 10; page += 1) {
@@ -461,6 +462,18 @@ export async function reconcileMergedPullRequests(
       // incoming one is REJECTED. A row already recording the merge is
       // therefore left alone rather than churned.
       //
+      // That property is LOAD-BEARING ON `prUpdatedAt` BELOW, and nothing else
+      // enforces it: pass the PR's current `updated_at` instead of the merge
+      // instant and every correctly delivered row in the window is churned
+      // rather than left alone. If you change that argument, this paragraph
+      // stops being true.
+      //
+      // Provenance is carried by `metadata.repairedBy`, NOT by overriding
+      // `metadata.source`. `source` is the trust key five readers gate on, and
+      // a repaired row that failed their filter would stop receiving the owner
+      // wake on every FUTURE event -- see the `repairedBy` docblock in
+      // `pull-request-work-products.ts`.
+      //
       // Writes one row per REFERENCED issue, mirroring the webhook, not just
       // the single `issueId` the link table keeps -- the work product is
       // evidence about the PR and every referencing row carries one.
@@ -483,14 +496,33 @@ export async function reconcileMergedPullRequests(
           prDraft: false,
           prMerged: true,
           prMergedAt: mergedAtIso,
-          // Falls back to the merge instant when the detail fetch above failed:
-          // null here would drop the guard to its tie-break, which prefers a
-          // terminal row and would accept this one against a LATER delivered
-          // event. A present timestamp keeps the strict comparison.
-          prUpdatedAt: detail?.updated_at ?? mergedAtIso,
+          // THE MERGE INSTANT, never the PR's current `updated_at`.
+          //
+          // `prUpdatedAt` becomes `metadata.sourceEventTimestampMs`, which is
+          // what `upsertByExternalId`'s guard compares. A correctly delivered
+          // `closed` row stored the `updated_at` carried by that event, which
+          // is >= `merged_at`. GitHub bumps `updated_at` on ANY later activity
+          // -- a comment, a label, a deploy or review-gate bot post, all
+          // routine on this fleet -- so the sweep-time value is strictly LATER
+          // than the delivered row's, takes the strict-`>` branch, and
+          // replaces a correct row wholesale: `metadata` is overwritten and
+          // `updatedAt` (a liveness signal) is refreshed on a PR merged days
+          // ago. Passing the merge instant makes a delivered row tie or win,
+          // and two terminal rows of equal rank are rejected, so it is left
+          // alone.
+          //
+          // Known and accepted gap: a stale row whose last delivered
+          // `pull_request` event is itself POST-merge (a `labeled` that landed
+          // while the `closed` was lost) stores a timestamp later than
+          // `merged_at` and is not repaired. That fails CLOSED -- it leaves
+          // the row exactly as stale as it already was -- which is the right
+          // side to err on against relabelling every correctly delivered row
+          // in the window.
+          prUpdatedAt: mergedAtIso,
           action: "closed",
           owningIdentifiers: owning,
-          source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER,
+          repairedBy: PULL_REQUEST_WORK_PRODUCT_METADATA_REPAIRED_BY_RECONCILER,
+          repairedAt: new Date().toISOString(),
         });
         for (const targetIdentifier of targets) {
           const targetIssueId = issueByIdentifier.get(targetIdentifier);
@@ -508,7 +540,7 @@ export async function reconcileMergedPullRequests(
                 sourceTrust: fields.sourceTrust,
               },
             );
-            workProductsRepaired += 1;
+            workProductsOffered += 1;
           } catch (err) {
             // Best-effort, mirroring the webhook: a work-product write must
             // never break the link reconciliation this function exists for.
@@ -533,7 +565,7 @@ export async function reconcileMergedPullRequests(
     if (items.length < 100) break;
   }
 
-  return { enumerated, linked, unlinked, enriched, workProductsRepaired };
+  return { enumerated, linked, unlinked, enriched, workProductsOffered };
 }
 
 // Test-only re-exports.

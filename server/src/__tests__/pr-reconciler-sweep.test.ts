@@ -11,7 +11,7 @@ const zero: ReconcileResult = {
   linked: 0,
   unlinked: 0,
   enriched: 0,
-  workProductsRepaired: 0,
+  workProductsOffered: 0,
 };
 
 describe("computeReconcilerWindow", () => {
@@ -34,7 +34,7 @@ describe("runReconcilerSweep", () => {
     const seenWindows: string[] = [];
     const reconcile = vi.fn(async (_t: ReconcilerTarget, w: { since: Date; until: Date }) => {
       seenWindows.push(`${w.since.toISOString()}..${w.until.toISOString()}`);
-      return { enumerated: 5, linked: 3, unlinked: 2, enriched: 1, workProductsRepaired: 4 };
+      return { enumerated: 5, linked: 3, unlinked: 2, enriched: 1, workProductsOffered: 4 };
     });
 
     const res = await runReconcilerSweep({ targets, now, windowDays: 21, reconcile });
@@ -49,7 +49,7 @@ describe("runReconcilerSweep", () => {
       enriched: 2,
       // PEN-6413: repaired work-product rows aggregate like every other total,
       // so an operator can see whether the backfill is doing anything.
-      workProductsRepaired: 8,
+      workProductsOffered: 8,
     });
     // Both repos reconciled against one identical window.
     expect(new Set(seenWindows).size).toBe(1);
@@ -60,7 +60,7 @@ describe("runReconcilerSweep", () => {
     const onError = vi.fn();
     const reconcile = vi.fn(async (t: ReconcilerTarget) => {
       if (t.repoFullName === "Blockcast/a") throw new Error("rate limited");
-      return { enumerated: 4, linked: 4, unlinked: 0, enriched: 0, workProductsRepaired: 0 };
+      return { enumerated: 4, linked: 4, unlinked: 0, enriched: 0, workProductsOffered: 0 };
     });
 
     const res = await runReconcilerSweep({ targets, now, windowDays: 7, reconcile, onError });
@@ -72,7 +72,7 @@ describe("runReconcilerSweep", () => {
       linked: 4,
       unlinked: 0,
       enriched: 0,
-      workProductsRepaired: 0,
+      workProductsOffered: 0,
     });
     expect(onError).toHaveBeenCalledTimes(1);
     expect(onError.mock.calls[0][0]).toEqual({ companyId: "c1", repoFullName: "Blockcast/a" });
