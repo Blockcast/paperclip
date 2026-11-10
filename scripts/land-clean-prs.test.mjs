@@ -2289,7 +2289,7 @@ describe(`stale-hold report (held >${STALE_HOLD_HOURS}h, PEN-5005)`, () => {
     // The header names the clock that was measured. "held >13h" would claim a
     // duration this report does not have: a hold acquired this fire on CI
     // that finished 14h ago is reported, and that is correct.
-    assert.match(text, /stale-hold \(judgeable >13h, still held\)/);
+    assert.match(text, /stale-hold \(judgeable >13h or undated, still held\)/);
     assert.match(text, /time since this head last reported, not time the hold has stood/);
     assert.match(text, /a\/one#7 — `owner-approval-pending`, 40\.2h/);
     assert.match(text, /a\/one#8 — `checks:none`, age unknown/);
@@ -2858,7 +2858,7 @@ describe("unlanded-eligible PRs (PEN-5263)", () => {
       { number: 3241, reason: "mergestate:CLEAN", ageHours: 9.3 },
       { number: 8, reason: "mergestate:CLEAN", ageHours: null },
     ]);
-    assert.match(text, /unlanded-eligible \(judgeable >6h, nothing holding it\)/);
+    assert.match(text, /unlanded-eligible \(judgeable >6h or undated, nothing holding it\)/);
     // The remedy has to point AWAY from the PR: every one of these rows is
     // clean, so a reader sent to inspect the PR finds nothing and concludes
     // the report is noise.
@@ -4267,7 +4267,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
       { number: 3306, reason: "cap:10-per-fire", ageHours: 16 },
       { number: 3215, reason: "cap:10-per-fire", ageHours: null },
     ]);
-    assert.match(block, /^cap-starved \(judgeable >12h, never once queued\) — 2:/);
+    assert.match(block, /^cap-starved \(judgeable >12h or undated, never once queued\) — 2:/);
     assert.match(block, /a\/one#3306 — `cap:10-per-fire`, 16\.0h/);
     assert.match(block, /a\/one#3215 — `cap:10-per-fire`, age unknown/);
     // The remedy is the point: re-running the routine cannot reach these.
@@ -4349,7 +4349,7 @@ describe(`cap-starved PRs (judgeable >${CAP_STARVED_HOURS}h, never queued, PEN-5
     it("collects the cohort on a dry run and prints its block", () => {
       const { starved, printed } = sweep(false);
       assert.deepEqual(starved, ["a/one#3306"]);
-      assert.match(printed, /cap-starved \(judgeable >12h, never once queued\) — 1:/);
+      assert.match(printed, /cap-starved \(judgeable >12h or undated, never once queued\) — 1:/);
       assert.match(printed, /a\/one#3306/);
       assert.equal(
         alarmExitCode([], [], starved),
@@ -4733,7 +4733,7 @@ describe(`unlanded-eligible rows never once offered a slot (PEN-6363)`, () => {
     assert.match(block, /a\/one#3555 — `mergestate:CLEAN`, 12\.7h, never once queued/);
     assert.match(block, /a\/one#3549 — `mergestate:CLEAN`, 6\.5h$/m);
     assert.doesNotMatch(block, /a\/one#3549 — .*never once queued/);
-    assert.match(block, /never once queued \(>12h judgeable/);
+    assert.match(block, /never once queued \(>12h judgeable or undated/);
     // ⛔ The remedy must name BOTH remaining causes and must not pick one. The
     // acting fire's allocation is the separating datum and an `--alarm` fire
     // does not have it, so asserting either cause here is the defect PEN-6363
@@ -4791,7 +4791,7 @@ describe(`unlanded-eligible rows never once offered a slot (PEN-6363)`, () => {
     const out = printed.join("\n");
     assert.match(
       out,
-      /unlanded-eligible \(judgeable >6h, nothing holding it\) — 1:/,
+      /unlanded-eligible \(judgeable >6h or undated, nothing holding it\) — 1:/,
       "control: the cohort itself still prints, so a red below is the FACT missing",
     );
     assert.match(out, /a\/one#3555 — `mergestate:CLEAN`, 16\.0h, never once queued/);
@@ -4809,6 +4809,115 @@ describe(`unlanded-eligible rows never once offered a slot (PEN-6363)`, () => {
     });
     assert.doesNotMatch(block, /a\/one#777/);
     assert.doesNotMatch(block, /never once queued/);
+  });
+});
+
+describe("every cohort heading names the undated arm its gate admits (PEN-6392)", () => {
+  // All three cohorts DELIBERATELY keep a row they could not date
+  // (`ageHours === null`) — the §4l call each producer's comment records: an
+  // instrument that cannot see something must not report clean. Each block
+  // then prints that row as `age unknown`. A heading that states only a
+  // judgeable-age floor therefore contradicts, inside one block, the line two
+  // rows beneath it — and a reader takes the floor as the membership rule.
+  //
+  // ⚠ What these pin is PROSE, which is usually brittle and worth little.
+  // They are here because the prose is the whole deliverable: the cohorts'
+  // behaviour is covered above and was never wrong. What drifts is the
+  // sentence, and it drifts SILENTLY — PEN-6363 shipped the `never once
+  // queued` marking under a ">12h judgeable" heading, over a row the same
+  // block printed as undatable, and nothing failed.
+  //
+  // Each case drives the PRODUCER rather than a hand-built cohort, and
+  // asserts BOTH directions: that the gate admits the undated row, and that
+  // the heading says so. Either one moving alone reds this suite, which is
+  // the drift the two halves could otherwise do independently.
+  const NOW = Date.parse("2026-09-13T12:00:00Z");
+  // Non-empty but carrying no stamp on any entry — the narrow real case the
+  // producers' comments describe, not merely an empty rollup.
+  const undated = (number, extra = {}) => ({
+    number,
+    statusCheckRollup: [{ name: "verify", conclusion: "SUCCESS" }],
+    ...extra,
+  });
+  const row = (number, action, reason) => ({ number, action, reason });
+
+  it("stale-hold", () => {
+    const held = stalledHolds(
+      [undated(1)],
+      [row(1, "codeowner-review-requested", "owner-approval-pending")],
+      { now: NOW },
+    );
+    assert.deepEqual(
+      held.map((r) => r.ageHours),
+      [null],
+      "control: the gate admits the undated row",
+    );
+    const block = renderStalledHolds("a/one", held);
+    assert.match(block, /^stale-hold \(judgeable >\d+h or undated,/);
+    assert.match(block, /a\/one#1 — `owner-approval-pending`, age unknown/);
+  });
+
+  it("unlanded-eligible", () => {
+    const stranded = unlandedEligible([undated(1)], [row(1, "enqueue", "mergestate:CLEAN")], {
+      now: NOW,
+    });
+    assert.deepEqual(
+      stranded.map((r) => r.ageHours),
+      [null],
+      "control: the gate admits the undated row",
+    );
+    const block = renderUnlandedEligible("a/one", stranded);
+    assert.match(block, /^unlanded-eligible \(judgeable >\d+h or undated,/);
+    assert.match(block, /a\/one#1 — `mergestate:CLEAN`, age unknown/);
+  });
+
+  it("cap-starved", () => {
+    const prs = [undated(1, { timeline: [] })];
+    const starved = capStarved(prs, [row(1, "skip", `cap:${MAX_ENQUEUES_PER_FIRE}-per-fire`)], {
+      now: NOW,
+    });
+    assert.deepEqual(
+      starved.map((r) => r.ageHours),
+      [null],
+      "control: the gate admits the undated row",
+    );
+    const block = renderCapStarved("a/one", starved);
+    assert.match(block, /^cap-starved \(judgeable >\d+h or undated,/);
+    assert.match(block, /a\/one#1 — `cap:\d+-per-fire`, age unknown/);
+  });
+
+  it("the never-once-queued sub-block, whose own floor is the one PEN-6363 shipped", () => {
+    const prs = [undated(1, { timeline: [] })];
+    const stranded = unlandedEligible(prs, [row(1, "enqueue", "mergestate:CLEAN")], { now: NOW });
+    const neverQueued = unlandedNeverQueued(prs, stranded);
+    assert.deepEqual(neverQueued, [1], "control: the gate admits the undated row");
+    const block = renderUnlandedEligible("a/one", stranded, { neverQueued });
+    assert.match(block, /never once queued \(>\d+h judgeable or undated, no /);
+    assert.match(block, /a\/one#1 — `mergestate:CLEAN`, age unknown .*, never once queued/);
+  });
+
+  it("⛔ the `--alarm` summary does not claim the marking is universal", () => {
+    // Carrier A, and the only one of the five with a wrong ACTION behind it.
+    // The sentence used to read "...which marks every row that has never once
+    // been offered a queue slot". `unlandedNeverQueued` marks such a row only
+    // past CAP_STARVED_HOURS (12) while the cohort starts at
+    // UNLANDED_ELIGIBLE_HOURS (6), so a never-queued row in the 6-12h band is
+    // in the block and UNMARKED — and a reader who trusts "every" reads that
+    // unmarked row as one that HAS been queued, which is the exact inverse of
+    // its state and sends them looking downstream of a queue it never entered.
+    //
+    // Pinned as source text because the sentence lives inside `main`, which is
+    // not exported and self-invokes under `isMainModule` — the same seam the
+    // suite below works around, and with the same limits: this catches the
+    // regression, not a behavioural equivalent of it.
+    const SOURCE = readFileSync(new URL("./land-clean-prs.mjs", import.meta.url), "utf8");
+    // Shared-token control. A mistyped path or a short read yields a SOURCE in
+    // which every pattern below is absent, and absence is what two of these
+    // three assertions are looking for — so without this the test passes on a
+    // file it never read.
+    assert.match(SOURCE, /See the unlanded-eligible block above/, "control: the file was read");
+    assert.doesNotMatch(SOURCE, /which marks every/);
+    assert.match(SOURCE, /are past " \+\n\s*`\$\{CAP_STARVED_HOURS\}h judgeable or undated/);
   });
 });
 
