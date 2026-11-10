@@ -3651,6 +3651,26 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // shapes -- so neither protection route may be named as the in-effect one.
     expect(markdown).toContain("Three repos, three shapes");
     expect(markdown).toContain("take the UNION, per repo, live");
+    // PEN-6385 second review pass. The list-shaped recipe used to say the probe gives
+    // rc 0 when the login reviewed THIS HEAD. The filter tests the login and nothing
+    // else, so a review of a superseded tree returns rc 0 too (measured on fixtures).
+    // A recipe that promises more than its filter checks is the defect this whole
+    // section names, committed inside the section itself.
+    expect(markdown).toContain("not this head");
+    expect(markdown).toContain("State what a probe checks, never what you wish it checked");
+    // ...and the obvious repair is worse: commit_id is re-anchored forward on APPROVED
+    // reviews, so that conjunct is satisfied always on the one state carrying authority.
+    // Pinned so nobody "strengthens" the recipe back into vacuity.
+    expect(markdown).toContain("RE-ANCHORS an APPROVED review's `commit_id` forward");
+    // onprem is the mirror of PENSTOCK. paperclip is non-empty on both routes and so is
+    // neither; the earlier text named the wrong repo while reaching the right conclusion.
+    expect(markdown).toContain("the mirror of PENSTOCK, not of paperclip");
+    // The error class is wider than a quota outage: a GraphQL schema error reaches it at
+    // FULL quota on a HEALTHY transport, with key count 1 -- on a reviews surface the
+    // single most plausible answer there is. Pinned so the rule is not read as an
+    // outage-only hazard that waiting fixes.
+    expect(markdown).toContain("GraphQL schema error 1");
+    expect(markdown).toContain("reachable from a query you typed yourself");
   });
 
   // PEN-5802. The head check above is push-scoped, and the directive's own verb list
