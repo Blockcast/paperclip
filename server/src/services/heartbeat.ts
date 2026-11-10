@@ -29382,7 +29382,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // default 30 s scheduler tick the 64.6 h production strand would have
     // emitted ~7,700 lines for a single row. The sharper case is correlated
     // failure — when the kube read is unavailable `terminalOrMissing` stays
-    // false for the whole backlog at once, so `job_not_terminal_or_unreadable`
+    // false for the whole backlog at once, so `job_status_unreadable`
+    // (PEN-5316 split it out of `job_not_terminal_or_unreadable` precisely
+    // because this comment already knew the two were different conditions)
     // would fire for every pending row every 30 s, a log storm at exactly the
     // moment the other signals most need to stay legible.
     const noteStuckSkip = (
@@ -29483,6 +29485,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             { reservationId: reservation.id, runId: reservation.runId, observed },
             "refusing reservation release because observed Job identity does not match",
           );
+          // PEN-5316: this was the one refusal branch that returned without
+          // attributing itself. PEN-3640 added `refusedBy` so "which branch is
+          // holding this slot" is answerable from the logs alone rather than
+          // only as a rising gauge -- and five of the six branches got it. The
+          // adapter-type-change strand (BLO-28865) lands HERE, on a reservation
+          // still carrying the pre-change Job identity, so the one shape the
+          // strand gauge was built to watch was the one shape the attribution
+          // could not name. The `logger.error` above carries `observed` but not
+          // `refusedSeconds`/`heldSeconds`, and it is not rate-limited, so it
+          // cannot be joined to the other five or counted beside them.
+          noteStuckSkip(reservation, "job_identity_mismatch");
           continue;
         }
         if (observed?.phase === "active") {
@@ -29491,6 +29504,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
 
         let terminalOrMissing = launchedIdentityMatches;
+        let exactJobStatusUnreadable = false;
         const jobName = reservation.jobName ?? reservation.expectedJobName;
         const isolationSetupGraceActive =
           !jobName &&
@@ -29510,6 +29524,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           const jobReadStartedAt = Date.now();
           const exact = await readAgentJobRunStatusByName(jobName)
             .finally(() => { jobReadMs += Date.now() - jobReadStartedAt; });
+          // PEN-5316: remember WHY the probe did not clear the row. A null
+          // `exact` is the kube read failing, which is the opposite condition
+          // from a Job that answered and is still alive -- see the split label
+          // below.
+          exactJobStatusUnreadable = !exact;
           terminalOrMissing = Boolean(
             exact
             && exact.phase !== "active"
@@ -29521,7 +29540,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           );
         }
         if (!terminalOrMissing) {
-          noteStuckSkip(reservation, jobName ? "job_not_terminal_or_unreadable" : "launch_unfinished");
+          // PEN-5316: `job_not_terminal_or_unreadable` named two OPPOSITE
+          // conditions in one label and left the reader to guess which.
+          //   - the Job answered and is not finished  -> the sweep is correctly
+          //     declining to free a slot whose Job is alive. Healthy.
+          //   - the Job status could not be read      -> the sweep is BLIND and
+          //     is holding the slot with no bound and no escalation, ratcheting
+          //     the agent's effective concurrency down by one for as long as
+          //     the read keeps failing.
+          // A fleet-wide kube read outage and a fleet of healthy long runs
+          // produced the identical log field, so neither the logs nor any
+          // consumer of them could tell a correct refusal from a blind one.
+          noteStuckSkip(
+            reservation,
+            jobName
+              ? (exactJobStatusUnreadable ? "job_status_unreadable" : "job_not_terminal")
+              : "launch_unfinished",
+          );
           continue;
         }
 
