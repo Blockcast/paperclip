@@ -2,6 +2,11 @@ import express from "express";
 import request from "supertest";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import {
+  AGENT_PERMITTED_ISSUE_ADAPTER_CONFIG_KEYS,
+  collectAgentDisallowedIssueAdapterConfigPaths,
+} from "../routes/workspace-command-authz.js";
+
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
@@ -314,5 +319,175 @@ describe("issue workspace command authorization", () => {
     expect(res.status).toBe(403);
     expect(res.body.error).toContain("host-executed workspace commands");
     expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // PEN-6418. The two tests above pin the DENYLIST arm, and they also pin the
+  // ORDER: the host-command refusal is evaluated first, so a body that trips
+  // both guards still reports the command message. Do not reorder the two
+  // asserts in `assertNoAgentIssueHostControlledMutation` without updating
+  // them -- the command message is the more specific of the two and names the
+  // path that actually reaches a shell.
+
+  it("pins the agent adapter-config allowlist membership", () => {
+    // Empty on purpose (PEN-6418). Adding a key here is a deliberate act and
+    // must come with the reason it is safe for the LOWEST-privileged writer of
+    // an issue, not merely for the UI.
+    expect([...AGENT_PERMITTED_ISSUE_ADAPTER_CONFIG_KEYS].sort()).toEqual([]);
+  });
+
+  it("collects every adapter-config key an agent supplies, not only named ones", () => {
+    expect(
+      collectAgentDisallowedIssueAdapterConfigPaths({
+        assigneeAdapterOverrides: {
+          adapterConfig: { serviceAccountName: "paperclip-admin", image: "evil:latest" },
+        },
+      }),
+    ).toEqual([
+      "assigneeAdapterOverrides.adapterConfig.image",
+      "assigneeAdapterOverrides.adapterConfig.serviceAccountName",
+    ]);
+    // Nothing to overlay is nothing to refuse.
+    expect(
+      collectAgentDisallowedIssueAdapterConfigPaths({
+        assigneeAdapterOverrides: { adapterConfig: {} },
+      }),
+    ).toEqual([]);
+    expect(
+      collectAgentDisallowedIssueAdapterConfigPaths({
+        assigneeAdapterOverrides: { modelProfile: "cheap" },
+      }),
+    ).toEqual([]);
+    expect(collectAgentDisallowedIssueAdapterConfigPaths({})).toEqual([]);
+  });
+
+  it("rejects agent callers that create an issue adapter config override", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Overlay",
+        assigneeAdapterOverrides: { adapterConfig: { graceSec: 15 } },
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("issue adapter config overrides");
+    expect(res.body.error).toContain("assigneeAdapterOverrides.adapterConfig.graceSec");
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects agent callers that patch an issue adapter config override", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue());
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .patch("/api/issues/issue-1")
+      .send({ assigneeAdapterOverrides: { adapterConfig: { serviceAccountName: "paperclip-admin" } } });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("issue adapter config overrides");
+    expect(res.body.error).toContain("assigneeAdapterOverrides.adapterConfig.serviceAccountName");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("rejects agent callers that create a child issue adapter config override", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue());
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/issues/issue-1/children")
+      .send({
+        title: "Child overlay",
+        assigneeAdapterOverrides: { adapterConfig: { image: "evil:latest" } },
+      });
+
+    expect(res.status).toBe(403);
+    expect(res.body.error).toContain("issue adapter config overrides");
+    expect(mockIssueService.create).not.toHaveBeenCalled();
+  });
+
+  // MUST-PASS ARM. A refusal-only suite passes against a guard that refuses
+  // everything, so each of the next three asserts a PROGRESS MARKER -- the
+  // create/update mock having been reached -- and not merely `status !== 403`,
+  // which is satisfied by a request that dies before the guard.
+  it("admits an agent write of the typed modelProfile sibling", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Sanctioned model selection",
+        assigneeAdapterOverrides: { modelProfile: "cheap" },
+      });
+
+    expect(res.status).not.toBe(403);
+    expect(mockIssueService.create).toHaveBeenCalled();
+  });
+
+  it("admits an agent write carrying an empty adapter config", async () => {
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_key",
+      runId: "run-1",
+    });
+
+    const res = await request(app)
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Nothing to overlay",
+        assigneeAdapterOverrides: { adapterConfig: {} },
+      });
+
+    expect(res.status).not.toBe(403);
+    expect(mockIssueService.create).toHaveBeenCalled();
+  });
+
+  // NON-AGENT CONTROL. The guard returns early for any actor that is not an
+  // agent, so the board/UI "custom model lane" (ui/src/lib/issue-assignee-overrides.ts,
+  // which emits `adapterConfig.model` / `.effort` / `.chrome`) is untouched.
+  // Without this arm an allowlist that refused EVERY actor would also pass.
+  it("leaves a user actor's adapter config override alone", async () => {
+    const app = await createApp({
+      type: "user",
+      userId: "board-user",
+      companyId: "company-1",
+      source: "session",
+    });
+
+    const res = await request(app)
+      .post("/api/companies/company-1/issues")
+      .send({
+        title: "Board custom lane",
+        assigneeAdapterOverrides: { adapterConfig: { model: "claude-opus-5", chrome: true } },
+      });
+
+    expect(res.status).not.toBe(403);
+    expect(mockIssueService.create).toHaveBeenCalled();
   });
 });

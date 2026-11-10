@@ -164,10 +164,7 @@ import { logger } from "../middleware/logger.js";
 import { urlForLog } from "../middleware/http-log-policy.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unauthorized, unprocessable } from "../errors.js";
 import { actorCanReadAgentConfig, assertBoard, assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
-import {
-  assertNoAgentHostWorkspaceCommandMutation,
-  collectIssueWorkspaceCommandPaths,
-} from "./workspace-command-authz.js";
+import { assertNoAgentIssueHostControlledMutation } from "./workspace-command-authz.js";
 import { shouldWakeAssigneeOnCheckout } from "./issues-checkout-wakeup.js";
 import {
   executionWorkspaceIdentity,
@@ -12410,7 +12407,7 @@ export function issueRoutes(
       return;
     }
     if (await assertLowTrustControlPlaneDenied(req, res, companyId, null)) return;
-    assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
+    assertNoAgentIssueHostControlledMutation(req, req.body);
     const sanitizedBody = await sanitizeIssueCreateAttribution(db, req, res, companyId, req.body, {
       surface: "issues.create",
     });
@@ -12742,7 +12739,7 @@ export function issueRoutes(
     if (!isTaskBridgeKeyActor(req) && !(await assertIssueReadAllowed(req, res, parent))) return;
     if (!(await assertTaskWatchdogCreateIssueAllowed(req, res, parent.companyId, parent))) return;
     if (await assertLowTrustControlPlaneDenied(req, res, parent.companyId, parent)) return;
-    assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
+    assertNoAgentIssueHostControlledMutation(req, req.body);
     const sanitizedBody = await sanitizeIssueCreateAttribution(db, req, res, parent.companyId, req.body, {
       surface: "issues.children.create",
       entityId: parent.id,
@@ -12939,7 +12936,7 @@ export function issueRoutes(
         ...(normalizedAssigneeAgentId !== undefined ? { assigneeAgentId: normalizedAssigneeAgentId } : {}),
       };
       requestedChildren.push(childBody);
-      assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(childBody));
+      assertNoAgentIssueHostControlledMutation(req, childBody);
       if (!(await assertCheapRecoveryIssueAssigneeProfileAllowed(req, res, sourceIssue, childBody))) return;
       if (childBody.assigneeAgentId || childBody.assigneeUserId) {
         await assertCanAssignTasks(req, sourceIssue.companyId, {
@@ -13508,7 +13505,7 @@ export function issueRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Issue not found");
     if (!existing) return;
-    assertNoAgentHostWorkspaceCommandMutation(req, collectIssueWorkspaceCommandPaths(req.body));
+    assertNoAgentIssueHostControlledMutation(req, req.body);
     let activeRecoveryActionForPatch: ActiveIssueRecoveryAction | undefined;
     if (
       req.actor.type === "agent" &&

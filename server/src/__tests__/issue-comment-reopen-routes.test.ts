@@ -844,14 +844,23 @@ describe.sequential("issue comment reopen routes", () => {
     }));
 
     // A nested object with a huge leaf string, via a request field
-    // (assigneeAdapterOverrides.adapterConfig) whose schema permits
-    // arbitrary nested values — the original truncation only capped
-    // top-level string fields, so this would have passed through unbounded.
+    // (executionWorkspaceSettings.workspaceRuntime) whose schema is a bare
+    // `z.record(z.string(), z.unknown())` and so permits arbitrary nested
+    // values — the original truncation only capped top-level string fields,
+    // so this would have passed through unbounded.
+    //
+    // PEN-6418 moved this fixture off `assigneeAdapterOverrides.adapterConfig`,
+    // which carried the same open record until an agent-actor ALLOWLIST closed
+    // it. That guard refuses before the authorization decision, so an
+    // adapterConfig body now 403s without ever reaching the denied-write
+    // recorder this test is about. `workspaceRuntime` is the remaining
+    // agent-writable open record on this route and is tracked as the residual
+    // that allowlist does not cover.
     const hugeLeaf = "x".repeat(50_000);
     const secret = "sk-denied-secret-value";
     const res = await request(await installActor(createApp(), agentActor(outsideAgentId)))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ assigneeAdapterOverrides: { adapterConfig: { apiKey: secret, a: { b: { c: hugeLeaf } } } } });
+      .send({ executionWorkspaceSettings: { workspaceRuntime: { apiKey: secret, a: { b: { c: hugeLeaf } } } } });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     const call = mockLogActivity.mock.calls.find(
@@ -914,7 +923,9 @@ describe.sequential("issue comment reopen routes", () => {
     );
     const res = await request(await installActor(createApp(), agentActor(outsideAgentId)))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ assigneeAdapterOverrides: { adapterConfig: escapingHeavyConfig } });
+      // PEN-6418: see the fixture note above — `adapterConfig` is now refused
+      // by an agent-actor allowlist before the denied-write recorder runs.
+      .send({ executionWorkspaceSettings: { workspaceRuntime: escapingHeavyConfig } });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     const call = mockLogActivity.mock.calls.find(
