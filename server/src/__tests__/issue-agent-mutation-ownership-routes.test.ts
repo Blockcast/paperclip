@@ -3461,7 +3461,13 @@ describe("agent issue mutation checkout ownership", () => {
       return {
         allowed: !humanHeld,
         action: input.action,
-        reason: humanHeld ? "deny_missing_grant" : "allow_test_default",
+        // PEN-6266: keep this stub in step with the real deny's reason
+        // (services/authorization.ts, the assignmentOntoHumanHeldIssueIsRefused
+        // branch). It is never asserted here -- this suite reads `allowed`, not
+        // `reason` -- so a drift passes silently and then reads to the next
+        // reviewer as evidence that production emits `deny_missing_grant` on
+        // this path.
+        reason: humanHeld ? "deny_human_assigned_issue" : "allow_test_default",
         explanation: humanHeld
           ? "This issue is assigned to a person, so agents cannot reassign it — including to themselves."
           : "Allowed by test default.",
