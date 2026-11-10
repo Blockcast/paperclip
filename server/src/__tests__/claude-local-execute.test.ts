@@ -467,6 +467,46 @@ describe("claude execute", () => {
     }
   });
 
+  it("moves an unparseable ~/.claude.json aside before a local run starts the CLI", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-corrupt-config-"));
+    const { workspace, commandPath, capturePath, restore } = await setupExecuteEnv(root);
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    await fs.writeFile(path.join(root, ".claude.json"), '{"numStartups": 3, "projects": {');
+    const stderr: string[] = [];
+    try {
+      await execute({
+        runId: "run-corrupt-config",
+        agent: { id: "agent-corrupt-config", companyId: "co-1", name: "Corrupt config", adapterType: "claude_local", adapterConfig: { engine: "cli" } },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          env: { PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Do work.",
+        },
+        context: {},
+        authToken: "tok",
+        onLog: async (stream, chunk) => {
+          if (stream === "stderr") stderr.push(chunk);
+        },
+      });
+
+      const entries = await fs.readdir(root);
+      expect(entries).not.toContain(".claude.json");
+      expect(entries.filter((name) => /^\.claude\.json\.corrupt-\d+$/.test(name))).toHaveLength(1);
+      expect(stderr.join("")).toContain("[paperclip] claude-config: moved unparseable");
+      // The CLI still ran, after the guard.
+      expect(JSON.parse(await fs.readFile(capturePath, "utf8")).argv).toBeDefined();
+    } finally {
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir;
+      restore();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
   it("does not mark a timeout retryable after process output", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-output-timeout-"));
     const { workspace, commandPath, restore } = await setupExecuteEnv(root);
