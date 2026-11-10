@@ -1,0 +1,163 @@
+name: Master general tests alert
+
+# PEN-6398: `master-health.yml` DETECTS a red trunk and nothing CONSUMES the
+# verdict.
+#
+# On 2026-11-10 the BLO-55110 regression landed on master. `Master general
+# tests` caught it on two independent runs -- 42729590442 (push) and
+# 42730863371 (schedule), both `failure` at head 0e4e1b17f. Neither raised a
+# row, an alert or a wake. The red was eventually rediscovered by the PR fleet,
+# with at least four PRs each burning a full ~24-38 min lane on it: precisely
+# the cost BLO-27861 records and master-health.yml was built to end.
+#
+# Measured over all 46 workflow files at master, the `workflow_run` consumers
+# were dispatch-ally-verdict-ci.yml (`workflows: [PR]`), docker-agent.yml
+# (`["Docker"]`) and report-merge-queue-ejection.yml (`["PR", "Comment-review
+# gate (merge queue)"]`). None named `Master general tests`. This workflow is
+# that missing consumer.
+#
+# The routing target is Alertmanager, NOT a GitHub issue: issues are DISABLED on
+# this repository (`gh api repos/Blockcast/paperclip --jq .has_issues` -> false),
+# and BLO-33382 is the incident where an alert path assumed otherwise and failed
+# closed AND silently for 8 master failures in 27h. The reasoning, the label
+# cardinality argument and the firing/resolved rules live in
+# .github/scripts/post-master-health-alert.mjs; its tests are at
+# .github/scripts/tests/post-master-health-alert.test.mjs.
+
+on:
+  workflow_run:
+    workflows: ["Master general tests"]
+    types: [completed]
+  # Replay, and the only way to exercise the channel on demand -- a red trunk is
+  # not something to wait for in order to find out whether the pipe works.
+  # ⚠ This genuinely pushes to Alertmanager: a replay of a failed run raises a
+  # real alert in the platform lane, and a replay of a green one RESOLVES it.
+  # There is deliberately no dry-run arm; a path that exits 0 without delivering
+  # is the silent-success failure this whole file exists to remove.
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Master general tests run id to classify and route"
+        required: true
+
+permissions:
+  contents: read
+  # Reads the triggering run's job rows. `issues: write` is deliberately ABSENT:
+  # issues are disabled on this repo, and asking for a write scope this workflow
+  # cannot use would be a standing grant for nothing.
+  actions: read
+
+# NO `concurrency:` BLOCK, AND THAT IS A DECISION RATHER THAN AN OMISSION.
+# Supersession here would DROP an alert, which is the exact failure this
+# workflow exists to prevent -- and `cancel-in-progress: false` does not avoid
+# that, because GitHub keeps at most one PENDING run per group and cancels the
+# one it replaces. There is also nothing to serialise: master-health concludes a
+# run roughly every 3.8h (7 concluded runs in the 26.35h to 2026-11-10T06:44Z),
+# while this job finishes in well under a minute, so two instances overlapping
+# is not a case that arises.
+
+jobs:
+  route:
+    name: Route the trunk verdict to Alertmanager
+    # Skip the outcomes that say nothing, BEFORE taking a runner.
+    #
+    # `cancelled` is the MODAL outcome of master-health -- 41 of its 50 most
+    # recent runs -- and it is free and uninformative: master-health sets
+    # `cancel-in-progress: ${{ github.event_name != 'push' }}`, so a push run is
+    # never killed in flight and the cancellations are concurrency-PENDING runs
+    # superseded before dispatch (5 of 5 sampled returned `total_count: 0`
+    # jobs). Without this gate each one would spend an arc-light runner to
+    # decide it has nothing to say, ~40 times a day.
+    #
+    # The script re-checks `cancelled` anyway and is tested on it. That is not
+    # redundancy for its own sake: this `if:` is a COST control, and the
+    # correctness of never resolving on a run that executed no tests must not
+    # depend on a YAML expression nothing can unit-test.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch'
+      || (github.event.workflow_run.conclusion != 'cancelled'
+      && github.event.workflow_run.conclusion != 'skipped') }}
+    # arc-light, never arc-merge-queue and never arc-paperclip-general: this is a
+    # seconds-long `gh api` job and must not contend with the pools whose depth
+    # already sets trunk detection latency at ~3.5h. Same reasoning, and the same
+    # runner, as master-health.yml's own `gate` job.
+    runs-on: arc-paperclip-light
+    timeout-minutes: 5
+    steps:
+      # `ref: master` is a security control, not a default. A `workflow_run`
+      # job runs with a token that can reach the cluster's Alertmanager, and the
+      # triggering run's tree is whatever landed on master -- including a commit
+      # that is red precisely because something is wrong with it. Pinning the
+      # checkout to the default branch is the same containment
+      # report-merge-queue-ejection.yml applies, and the sparse set keeps it to
+      # the one file this job executes.
+      - name: Checkout the routing script from master
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: master
+          sparse-checkout: |
+            .github/scripts/post-master-health-alert.mjs
+          sparse-checkout-cone-mode: false
+
+      # One code path for both triggers. The `workflow_run` payload already
+      # carries conclusion/head_sha, but re-reading them from the API means the
+      # dispatch replay is classified by exactly the same values as a live
+      # event, rather than by a second, drifting set of expressions.
+      - name: Resolve the triggering run
+        id: run
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: |
+          set -euo pipefail
+          meta="$(gh api "repos/${REPO}/actions/runs/${RUN_ID}" \
+            --jq '[.conclusion // "", .head_sha // "", .head_branch // "", .html_url // ""] | @tsv')"
+          IFS=$'\t' read -r conclusion head_sha head_branch html_url <<< "$meta"
+          echo "conclusion=${conclusion}" >> "$GITHUB_OUTPUT"
+          echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
+          echo "head_branch=${head_branch}" >> "$GITHUB_OUTPUT"
+          echo "html_url=${html_url}" >> "$GITHUB_OUTPUT"
+          echo "Run ${RUN_ID}: conclusion=${conclusion} head=${head_sha} branch=${head_branch}"
+
+      # The job rows ARE the evidence. The run conclusion alone cannot
+      # distinguish "the suite ran and passed" from "the gate skipped the whole
+      # matrix and a skipped job still concludes success" -- the BLO-38228 shape,
+      # where run 36648202266 reported SUCCESS on a head that was already red
+      # because its merge_group proof had expired on the clock.
+      #
+      # `filter=latest` collapses re-run attempts to the current one. A
+      # master-health run has ~7 jobs against a page of 100, so this cannot
+      # truncate; `per_page` is stated rather than defaulted because the default
+      # is 30 and a silent short page here would read as a healthy master.
+      - name: Read the suite job rows
+        id: jobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id || inputs.run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${REPO}/actions/runs/${RUN_ID}/jobs?filter=latest&per_page=100" \
+            --jq '{jobs: [.jobs[] | {name, conclusion}]}' > "${RUNNER_TEMP}/master-health-jobs.json"
+          echo "Job rows:"
+          cat "${RUNNER_TEMP}/master-health-jobs.json"
+
+      # Fires on a red trunk, resolves on a green one that actually ran the
+      # suite, and pushes nothing on a run that proves neither. The script owns
+      # that decision and is unit-tested on every branch of it.
+      #
+      # If this step fails the job reds -- intentionally. A routing layer that
+      # fails silently is the entire defect being closed here, so an undelivered
+      # verdict must be visible as a failure rather than inferred from silence.
+      - name: Route the verdict to Alertmanager
+        env:
+          ALERTMANAGER_URL: ${{ vars.ALERTMANAGER_URL || 'http://alertmanager.monitoring.svc.cluster.local:9093' }}
+          GH_REPO: ${{ github.repository }}
+          RUN_CONCLUSION: ${{ steps.run.outputs.conclusion }}
+          HEAD_SHA: ${{ steps.run.outputs.head_sha }}
+          HEAD_BRANCH: ${{ steps.run.outputs.head_branch }}
+          RUN_URL: ${{ steps.run.outputs.html_url }}
+        run: |
+          MASTER_HEALTH_JOBS_JSON="$(cat "${RUNNER_TEMP}/master-health-jobs.json")" \
+            node .github/scripts/post-master-health-alert.mjs
