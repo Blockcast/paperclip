@@ -32,6 +32,15 @@ export interface ReconcileResult {
   linked: number;
   unlinked: number;
   enriched: number;
+  /**
+   * PEN-6413: PR work-product upserts OFFERED a terminal state. This is an
+   * UPPER BOUND on rows actually changed, not a count of repairs --
+   * `upsertByExternalId` resolves the ordering guard in SQL and does not report
+   * whether it accepted, so a row already recording the merge is counted here
+   * and correctly left untouched. Read it as reconciler reach, never as damage
+   * found.
+   */
+  workProductsRepaired: number;
 }
 
 export interface SweepResult {
@@ -86,7 +95,13 @@ export async function runReconcilerSweep(input: {
   onError?: (target: ReconcilerTarget, err: unknown) => void;
 }): Promise<SweepResult> {
   const window = computeReconcilerWindow(input.now, input.windowDays);
-  const totals: ReconcileResult = { enumerated: 0, linked: 0, unlinked: 0, enriched: 0 };
+  const totals: ReconcileResult = {
+    enumerated: 0,
+    linked: 0,
+    unlinked: 0,
+    enriched: 0,
+    workProductsRepaired: 0,
+  };
   let ok = 0;
   let failed = 0;
 
@@ -97,6 +112,7 @@ export async function runReconcilerSweep(input: {
       totals.linked += r.linked;
       totals.unlinked += r.unlinked;
       totals.enriched += r.enriched;
+      totals.workProductsRepaired += r.workProductsRepaired;
       ok += 1;
     } catch (err) {
       failed += 1;
@@ -128,7 +144,7 @@ export async function reconcilerSweepTick(
       targets: 0,
       ok: 0,
       failed: 0,
-      totals: { enumerated: 0, linked: 0, unlinked: 0, enriched: 0 },
+      totals: { enumerated: 0, linked: 0, unlinked: 0, enriched: 0, workProductsRepaired: 0 },
       window: computeReconcilerWindow(now, input.windowDays),
     };
   }

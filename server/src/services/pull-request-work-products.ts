@@ -23,6 +23,12 @@ export interface PullRequestWorkProductInput {
   /** GitHub `action` from the pull_request event. */
   action: string;
   /**
+   * Provenance written to `metadata.source`. Defaults to the webhook constant,
+   * so every existing caller is unchanged; the merged-PR reconciler passes
+   * PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER (PEN-6413).
+   */
+  source?: string | null;
+  /**
    * Identifiers this PR *owns*, as resolved by the ranked tiers in
    * `resolveOwningPaperclipIdentifiers` — NOT every identifier it mentions
    * (BLO-20886).
@@ -94,6 +100,17 @@ export interface PullRequestWorkProductFields {
 }
 
 export const PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE = "github_pull_request_webhook";
+/**
+ * PEN-6413. Provenance for a row written by the merged-PR reconciler rather
+ * than by a webhook delivery. The webhook is otherwise the SOLE writer of this
+ * table, so a lost `closed` delivery leaves the row permanently non-terminal --
+ * measured company-wide at 24 of 4592 bound PRs (0.52%), in cross-repo bursts
+ * that rule out per-PR payload parsing. Repaired rows must stay distinguishable
+ * from delivered ones: a census that keys on `metadata.source` (as the PEN-6413
+ * census did) would otherwise read a backfill as a delivery.
+ */
+export const PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE_RECONCILER =
+  "github_merged_pr_reconciler";
 export const PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST_ACTOR_ID = "github_pull_request_webhook";
 export const PULL_REQUEST_WORK_PRODUCT_SOURCE_TRUST: SourceTrustMetadata = {
   preset: "standard",
@@ -335,7 +352,7 @@ export function buildPullRequestWorkProductFields(
     url: input.prUrl ?? null,
     status,
     metadata: {
-      source: PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
+      source: input.source ?? PULL_REQUEST_WORK_PRODUCT_METADATA_SOURCE,
       sourceEventOrder: pullRequestWorkProductSourceEventOrder(status),
       sourceEventActionOrder: pullRequestWorkProductSourceEventActionOrder(input),
       sourceEventTimestamp,
