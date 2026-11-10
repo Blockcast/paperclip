@@ -1190,6 +1190,7 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // the project data volume and every tier is a scrape target, so a reconciler
   // that ran on one tier only would leave the other publishing a permanently
   // stale freshness gauge.
+  const stopProjectCheckoutOriginReconciler = startProjectCheckoutOriginReconciler(db);
   // PEN-6341. NOT one of the scrape collector's refreshes: those take a `Db`
   // and run in series inside a 15 s tick, while this makes outbound GitHub
   // calls. At the collector's cadence three probes would be ~720 calls/h drawn
@@ -1200,7 +1201,6 @@ ${error ? "" : "setTimeout(function(){window.close()},2000)"}
   // than per-tier, so a sampler on one tier only would leave the others
   // publishing nothing while reading as deployed.
   const stopGithubRateLimitSampler = startGithubRateLimitSampler();
-  const stopProjectCheckoutOriginReconciler = startProjectCheckoutOriginReconciler(db);
   // PEN-3314: sample the V8 heap size far faster than the 60s scrape, so a heap
   // excursion that completes between two scrapes still leaves a durable number.
   // Started beside the scrape collector and for the same reason: every tier is a
