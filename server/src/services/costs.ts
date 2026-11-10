@@ -712,11 +712,11 @@ export function costService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
        * a cache invalidation that hits one key, or when one errors and the other does not.
        * Any cost event that commits between the two reads makes the numbers differ, and
        * the card then renders a destructive-styled "report it" warning against a split
-       * that is in fact correct. That is the NORMAL case here rather than an edge one: the
-       * 5-day cap (PEN-5591) means this card effectively renders only for a custom range,
-       * and a custom range ending today stays open until 23:59:59.999 while events keep
-       * landing inside it. False reports filed against a correct aggregate are the
-       * opposite of what the warning is for.
+       * that is in fact correct. That is the NORMAL case here rather than an edge one:
+       * PEN-5937 raised the window cap to 31 days, so the portal's `mtd` / `7d` / `30d`
+       * presets all render, and any window ending today stays open until 23:59:59.999
+       * while events keep landing inside it. False reports filed against a correct
+       * aggregate are the opposite of what the warning is for.
        *
        * So the window total is served from THIS statement, under the same window
        * definition (`windowConditions`, applied to both column sets), and the portal

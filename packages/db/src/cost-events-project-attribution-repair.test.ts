@@ -79,7 +79,7 @@ async function seedGraph(sql: postgres.Sql) {
 }
 
 describeEmbeddedPostgres("cost_events project attribution repair (PEN-5937)", () => {
-  it("ships the 0277 partial index on exactly the repair's predicate", async () => {
+  it("ships the cost_events_unattributed_idx partial index on exactly the repair's predicate", async () => {
     const sql = await connect("paperclip-cost-events-unattributed-idx-");
 
     const indexes = await sql<{ indexdef: string }[]>`
