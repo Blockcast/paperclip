@@ -14314,6 +14314,40 @@ export function buildPaperclipTaskMarkdown(input: {
     // call signature survives the re-wording this text is licensed to receive, where a heading
     // or a block hash does not.
     "- That head check is PUSH-scoped: only push, force-push and rebase move `headRefOid`, so for every other verb above it is not a weak gate but a NON-gate -- an unmoved head shows only that no push landed, never that an authorisation you were handed is still unspent. A non-force push is refused by a server-side compare-and-swap and `--force-with-lease` restores one, but a plain force-push and `PATCH /pulls/:n` have none; `updatedAt` is measured to bump with no mutation on any readable surface, so it cannot substitute. If what authorises this write is SINGLE-USE, redeem its receipt key BEFORE writing -- `paperclipAddComment` ON THE ISSUE THE GRANT WAS POSTED ON, not whichever row you happen to hold, with the key the grant names, passed as the `idempotencyKey` field -- and treat `deduplicated: true` as \"a sibling run already spent this; abort, do not write\". \"BEFORE writing\" is relative to the WRITE and never to the precondition check: establish LIVE, in the run that writes, that the write is still warranted; THEN redeem; THEN write, with nothing in between. If a precondition has lapsed, STOP and do NOT redeem -- a key burned over a write you then decline is refused to your seat forever, so redeeming before you have established that the write is warranted DESTROYS the grant on the COMPLIANT path, where a run that reads the world and correctly declines has spent a key it can never recover. That hazard concentrates wherever the wake is fired by a TIMER rather than by the authorising event: there the precondition is false at most scheduled wakes, so redeeming first punishes every well-behaved run. The key is scoped `(issue, agent, key)` and the issue is part of it, so redeeming on the wrong row only inserts a second receipt that refuses nothing -- one PR can have several owning rows, and your sibling may hold a different one. Redeemed on the granting row it fails closed against sibling runs of your own seat: the collision the bullet above cannot see, because `activeRun` is per-ROW while a single-use grant is per-ARTIFACT. A grant that names no receipt issue and key cannot be checked at all -- ask for a keyed one rather than writing.",
+    // PEN-5876: the directive above is scoped to PULL REQUEST write verbs, and the gap it
+    // leaves is a row FIELD write. Measured twice on one row inside 16 minutes, same field,
+    // both times by two runs of ONE seat: first a run claimed edits in the past tense that
+    // are verifiably absent from the row, then a run made the winning write and announced
+    // it on no row at all. Neither direction was adjudicable after the fact, because the
+    // issue `description` had neither a compare-and-set nor a revision history while
+    // `paperclipUpsertIssueDocument` had both -- so a lost update here was not merely
+    // unprevented, it was UNOBSERVABLE.
+    //
+    // Keyed on THE DATA, deliberately, and this is the half a reader is most likely to
+    // "simplify" back out. The obvious rule -- refuse a field write from a run that does
+    // not hold `executionRunId` -- was considered and REJECTED on this row: the checkout
+    // lock excludes nothing at the field-write layer, and in the measured incident the
+    // lock HOLDER is the party whose content was destroyed. A holder-keyed test is
+    // one-sided and correct only by the accident of ordering; "has this field moved since
+    // I read it?" is symmetric and catches both.
+    //
+    // Named HERE rather than left to the per-seat instruction roots for the same reason
+    // the receipt-key remedy above is: those roots are per-seat mounts with no privileged
+    // writer, so a cross-seat change is one issue per seat and one drift opportunity per
+    // seat. This directive is the single surface every write-capable run reads. The
+    // primitive it names ships from THIS artifact, so there is no window in which the
+    // directive is live and the compare-and-set it cites is not.
+    //
+    // What this does NOT close, stated so it is not recorded as closing it: the CAS makes
+    // the SECOND writer fail closed. It serialises nothing, it gives no run a way to
+    // enumerate what its siblings are about to write, and it is opt-in -- a run that omits
+    // `baseRevisionId` is unchecked exactly as before. It is a detector one run can read,
+    // not a lock.
+    "The same applies to a row FIELD write -- `description`, `title` -- and the bullets above do not reach one: no head moves, and `activeRun` is per-ROW while the thing you are about to overwrite is a FIELD.",
+    "- Use the compare-and-set. Read `latestFieldRevisionId` (`paperclipGetIssue`, or `GET /api/issues/:id/field-revisions`) and pass it back as `baseRevisionId` on `paperclipUpdateIssue`: a write to `title` or `description` that landed since you read is then refused 409 `stale_base_revision` instead of silently overwriting yours, so you re-read, rebase your edit onto what is there now, and retry. Do not count on the error body to carry the current revision for you: the pre-check populates `latestRevisionId`, the under-lock race branch does not, and both are the same `code`. Send it on every `title` or `description` edit, FULL REWRITES INCLUDED -- there is no exemption for text you composed yourself. A value composed entirely in this run is the one MOST able to destroy a sibling's, not the least: a full replacement carries none of the prior value forward, and the window this refuses sits between your READ and your PATCH, which composing your own text does nothing to close. Omission is NOT `null` -- omitting the field means UNCHECKED, while `null` asserts \"nothing has revised this row yet\" and IS enforced, which is the common case because every row predating the feature starts null.",
+    "- The question it asks is \"has ANYONE written this field since I read it?\" -- a property of THE DATA, never \"do I hold the checkout?\". Anyone is literal: a board user, or a run of yours that has since finished, moves the pointer and is refused exactly the same way, so do not narrow this back to live sibling runs. That lock is advisory at this layer: in the incident this was built from, the lock HOLDER is the run whose content was destroyed, so a holder-keyed test catches one ordering and waves the other through.",
+    "- Afterwards, verify by CONTENT: compare what was STORED against what you MEANT to store. Re-reading the fields you did NOT write proves only that you caused no collateral damage and is silent on whether your own change survived -- which is precisely the direction concurrency breaks, because the field you wrote is the one a sibling can take back. This also catches the uncontended case, which needs no sibling at all: the write path normalises escape sequences, so one run making one unopposed write can still store something other than what it sent.",
+    "- A write RESPONSE is not that check. The echo already carries whatever the write path rewrote, honestly, and an echo cannot in general be trusted to be; only a SEPARATE read is the check. Nor is row `updatedAt` -- an ordinary comment bumps it while `description` stays byte-identical, so it false-positives on thread traffic and a real overwrite is indistinguishable from that noise. Compare the field itself.",
     "Every value in this block was computed when this run was DISPATCHED, not now. That includes any head SHA, sibling-run id or checkout-contention notice printed above: a sibling run that started after your dispatch appears in none of it. Re-reading this prompt is not re-reading state.",
     "",
     // PEN-6385. The block above governs WRITES; this one governs the READS that decide

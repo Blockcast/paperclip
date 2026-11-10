@@ -3765,6 +3765,79 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("A grant that names no receipt issue and key cannot be checked");
   });
 
+  // PEN-5876. Everything above this point is scoped to PULL REQUEST write verbs, and the
+  // measured loss was a row FIELD write: two runs of one seat overwrote each other's
+  // `description` twice in 16 minutes, and with no revision history neither direction was
+  // adjudicable afterwards. Pinned on the SAME no-PR-context wake as the two measurements
+  // above, deliberately -- a run that clobbers a field is frequently woken about no pull
+  // request at all, so a directive reachable only from a PR wake would miss it.
+  it("extends the pre-write re-read to row field writes and names the compare-and-set", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      wakeComment: {
+        id: "comment-1",
+        body: "Do not push to this head until the board rules.",
+      },
+    });
+
+    // The scope extension itself, and the reason the bullets above cannot be reused: a
+    // field write moves no head, and `activeRun` is per-ROW. A test pinning only the
+    // remedy would pass against a section that had lost the reason anyone needs it.
+    expect(markdown).toContain("The same applies to a row FIELD write");
+    expect(markdown).toContain("`activeRun` is per-ROW while the thing you are about to overwrite is a FIELD");
+    // The primitive, by name, on both sides of the round trip. Reading
+    // `latestFieldRevisionId` and sending `baseRevisionId` are different identifiers and a
+    // run that learns only one of them cannot complete the call.
+    expect(markdown).toContain("`latestFieldRevisionId`");
+    expect(markdown).toContain("`baseRevisionId`");
+    expect(markdown).toContain("409 `stale_base_revision`");
+    // Omission vs null. These are NOT the same request: omitting the field is unchecked,
+    // `null` is an enforced IS NULL test, and every row predating the feature starts null
+    // -- so a run that treats them as interchangeable gets no protection in the COMMON
+    // case while believing it opted in.
+    expect(markdown).toContain("Omission is NOT `null`");
+    // The data-keyed framing. This is the clause most likely to be "simplified" into a
+    // lock check, which is the rule this row explicitly rejected: the checkout lock is
+    // advisory here, and in the measured incident the HOLDER is the run that lost.
+    expect(markdown).toContain("never \"do I hold the checkout?\"");
+    // Ally review of #3622: "a live run other than mine" was NARROWER than what the CAS
+    // actually checks -- a board user, or a run of yours that has since finished, advances
+    // the pointer and is refused identically. Pinned because the narrow form reads as more
+    // precise and is the one a later edit would drift back toward.
+    expect(markdown).toContain("has ANYONE written this field since I read it?");
+    expect(markdown).toContain("do not narrow this back to live sibling runs");
+    // Same review: the directive must NOT promise the error body carries the current
+    // revision. The pre-check populates `latestRevisionId`; the under-lock race branch
+    // carries only `expectedRevisionId` and the code, so a run that relied on the body
+    // would find no current id in exactly the case the lock exists for.
+    expect(markdown).toContain("Do not count on the error body to carry the current revision");
+    // Same review: `title` is covered by the same CAS and named in the opening line, so the
+    // instruction to send the precondition must not silently drop it.
+    expect(markdown).toContain("Send it on every `title` or `description` edit");
+    // CEO ruling on PEN-5876 (comment `15f212c1`, 2026-11-09T21:5xZ): the earlier form
+    // exempted an edit "you did not author start to finish in this run". That lands the
+    // exemption on the MOST destructive write class rather than the least -- a full
+    // replacement carries none of the prior value forward, and the interleaving the CAS
+    // exists to catch sits between the READ and the PATCH, which composing your own text
+    // does nothing to close. It was also a condition the run SELF-ASSESSES, and the class
+    // needing the guard is exactly the class that answers "yes, I wrote all of it".
+    // Pinned POSITIVELY on the replacement and NEGATIVELY on the exemption, because the
+    // exempting form reads as helpful precision and is what a later edit drifts back toward.
+    expect(markdown).toContain("FULL REWRITES INCLUDED");
+    expect(markdown).not.toContain("start to finish");
+    expect(markdown).toContain("the lock HOLDER is the run whose content was destroyed");
+    // The cheap half, phrased so it catches BOTH failures: compare what was STORED against
+    // what you MEANT to store. "Did a sibling write?" catches only the concurrency case,
+    // and the write path normalises escape sequences, so a single uncontended write can
+    // store something other than what it sent.
+    expect(markdown).toContain("compare what was STORED against what you MEANT to store");
+    expect(markdown).toContain("Re-reading the fields you did NOT write");
+    // The two surfaces that look like that check and are not. Both are cheaper to reach
+    // than a re-read, which is exactly why they get substituted for it.
+    expect(markdown).toContain("A write RESPONSE is not that check");
+    expect(markdown).toContain("an ordinary comment bumps it while `description` stays byte-identical");
+  });
+
   // PEN-6145. Five distribution waves amended this rule in the per-seat instruction roots
   // over 46 hours and not one enumerated the generated surface, which outreaches all of them
   // -- it is emitted on every non-null return, including wakes with no issue and no PR. This
