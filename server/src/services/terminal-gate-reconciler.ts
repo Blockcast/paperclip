@@ -465,9 +465,53 @@ export function terminalGateResolutionIdempotencyKey(signals: readonly string[])
   return `${TERMINAL_GATE_RESOLVED_IDEMPOTENCY_PREFIX}${gateSignalDigest(signals)}`;
 }
 
-/** The digest every announcement key shares, so a re-arm invalidates all three at once. */
+/**
+ * PEN-6381: the declared set minus the scheduler's own dispatch-watchdog
+ * tokens — the same subtraction `resolveTerminalGate` makes before it
+ * adjudicates, so the announcement keys below are digested over what was
+ * actually read rather than over what happened to be stored.
+ *
+ * Routed through `parseTerminalGateSignal` rather than re-testing the prefix,
+ * so this subtraction and the adjudicator's `continue` cannot drift: there is
+ * one classifier and both read its verdict. It also inherits the parser's
+ * `raw.trim()`, so a legacy or hand-edited row storing a padded token is
+ * subtracted here exactly as it is subtracted there.
+ * `normalizeIssueMonitorGateSignals` trims on write, so that is the only row
+ * the trim covers.
+ *
+ * A `null` verdict (an empty or non-string token) is KEPT, which is the prior
+ * behaviour: such a token stays in the digest material, and the adjudicator
+ * separately declines the row as `unresolvable_signal`.
+ */
+function adjudicableGateSignals(signals: readonly string[]) {
+  return signals.filter((signal) => parseTerminalGateSignal(signal)?.kind !== "dispatch_watchdog");
+}
+
+/**
+ * The digest every announcement key shares, so a re-arm invalidates all three at once.
+ *
+ * PEN-6381: digested over the ADJUDICABLE set, not the raw declaration. The
+ * watchdog token was in this material while being excluded from adjudication,
+ * and every dispatch lapse writes a different run id — so a row whose declared
+ * gates were byte-identical got a fresh digest on each lapse, missed the
+ * idempotency index, and could be announced again. An announcement is a comment
+ * on the row and a comment on an open row costs its assignee a whole run, so
+ * the churn was not cosmetic. Subtracting the token makes the key change on the
+ * event these builders document as the invalidating one — a monitor re-armed on
+ * different gates — and on nothing else.
+ *
+ * `ISSUE_MONITOR_DISPATCH_LAPSE_MS` is 15 minutes and rows carrying 7 and 8
+ * redispatches were measured on one pass, so N lapses could mint N keys.
+ *
+ * Reachable only since PEN-6346: before it, the watchdog REPLACED the declared
+ * set, every such row adjudicated `unresolvable_signal`, and nothing was ever
+ * announced for it. The churn existed and was moot.
+ *
+ * `gateSignalDigestSql` performs the same subtraction in SQL and must keep
+ * doing so — see the warning on that constant.
+ */
 function gateSignalDigest(signals: readonly string[]) {
-  const material = [...signals].sort().join("\n");
+  const material = adjudicableGateSignals(signals).sort().join("\n");
   return createHash("sha256").update(material).digest("hex").slice(0, 32);
 }
 
@@ -914,6 +958,19 @@ export function buildTerminalGateHumanOnlyComment(input: {
  * described above, not a missed announcement, and a real gate token is
  * `pr:owner/repo#123:merged`.
  *
+ * PEN-6381: the `where` subtracts the scheduler's dispatch-watchdog tokens,
+ * mirroring `adjudicableGateSignals` on the TS side. These two must change
+ * together: this is the cheap anti-join prefilter and the TS key filter is the
+ * authoritative one, and a disagreement between them either re-announces (SQL
+ * stricter) or silently starves the row out of the window (SQL looser).
+ * Starvation is the worse half, which is why this is not a JS-only edit.
+ *
+ * `left(..., length(prefix))` rather than `like 'heartbeat_run:%'` because
+ * `_` is a LIKE wildcard and the prefix contains one, so the pattern form
+ * would also subtract a token reading `heartbeatXrun:` — a looser filter, i.e.
+ * the starving direction. `btrim` for the same reason the human-gate predicate
+ * uses it: `parseTerminalGateSignal` classifies `raw.trim()`.
+ *
  * `normalizeIssueMonitorGateSignals` already
  * lowercases, trims and sorts on write (issue-execution-policy.ts), so the
  * stored array is in that form and no normalization is restated here. If a
@@ -934,6 +991,8 @@ const gateSignalDigestSql = sql`substr(encode(sha256(convert_to((
       then ${issues.executionState} -> 'monitor' -> 'gateSignals'
       else '[]'::jsonb end
   ) as t(signal)
+  where left(btrim(t.signal), length(${ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX}::text))
+          <> ${ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX}
 ), 'UTF8')), 'hex'), 1, 32)`;
 
 /**

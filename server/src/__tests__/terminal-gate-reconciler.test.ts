@@ -267,6 +267,37 @@ describe("resolveTerminalGate", () => {
     expect(reads, "classification runs to completion before any network read").toBe(0);
   });
 
+  // PEN-6381, coverage for a boundary the guard above does NOT cover and must
+  // not: it requires `parsed.length === 0 && humanGates.length === 0`, so a
+  // watchdog token sitting beside a human gate leaves `humanGates` non-empty
+  // and falls through to the human-gate join. That is the correct disposition
+  // — a person really is all that remains — but nothing pinned it, so a future
+  // widening of the guard to `parsed.length === 0` alone would silently
+  // reclassify these rows as `no_adjudicable_gate_signals` and stop announcing
+  // them. No behaviour change is alleged here; this is the assertion that was
+  // missing.
+  it("reaches `human_gate_only` for a watchdog token beside a human gate, not `no_adjudicable_gate_signals`", async () => {
+    let reads = 0;
+    const verdict = await resolveTerminalGate({
+      gateSignals: ["approval:dcb2b957", "heartbeat_run:5ba0efe5-be46-4f22-89f7-ca704ab5e722"],
+      readPullRequestGate: async () => {
+        reads += 1;
+        return { state: "closed", merged: true };
+      },
+    });
+    expect(verdict).toEqual({
+      kind: "human_gate_only",
+      // The watchdog token is absent from the reported set for the same reason
+      // it is absent from the satisfied one: nobody is shown a token as part
+      // of a gate set that was not adjudicated.
+      signals: ["approval:dcb2b957"],
+      humanGates: ["approval:dcb2b957"],
+      heldPullRequests: [],
+      mergedPullRequests: [],
+    });
+    expect(reads, "no pull-request gate was declared, so nothing is read").toBe(0);
+  });
+
   it("never classifies a dispatch-watchdog token as a human gate", async () => {
     // Announcing it as one would ask the row's owner to chase a decision nobody
     // owes — the queue is not a person — which is why the prefix is its own
@@ -574,6 +605,60 @@ describe("resolveTerminalGate", () => {
   });
 });
 
+// PEN-6381. The three announcement keys share one digest, and that digest was
+// taken over the RAW declared set — including the dispatch-watchdog token. Every
+// dispatch lapse writes a different run id, so a row whose declared gates were
+// byte-identical minted a fresh key per lapse, missed the idempotency index, and
+// could be announced again. An announcement is a comment, and a comment on an
+// open row costs its assignee a whole run.
+//
+// These assertions pin the TS half on its own. The integration test
+// "TGW" pins the SQL half via `scanned`, and the two are separately
+// revertible, so neither can stand in for the other.
+describe("gate-signal digest, dispatch-watchdog subtraction (PEN-6381)", () => {
+  const declared = ["pr:blockcast/paperclip#1281:merged"];
+  const lapseA = [...declared, "heartbeat_run:5ba0efe5-be46-4f22-89f7-ca704ab5e722"];
+  const lapseB = [...declared, "heartbeat_run:c6a5c284-6f0d-4a1e-9b77-2f1c0d9ae431"];
+
+  it("is unchanged by a watchdog token, and by a lapse that rewrites it", () => {
+    const bare = terminalGateResolutionIdempotencyKey(declared);
+    expect(terminalGateResolutionIdempotencyKey(lapseA)).toBe(bare);
+    expect(terminalGateResolutionIdempotencyKey(lapseB)).toBe(bare);
+  });
+
+  it("subtracts it from all three keys, since they are invalidated by one event", () => {
+    expect(terminalGateHumanOnlyIdempotencyKey(lapseA))
+      .toBe(terminalGateHumanOnlyIdempotencyKey(declared));
+    expect(terminalGateHeldIdempotencyKey(lapseA))
+      .toBe(terminalGateHeldIdempotencyKey(declared));
+    expect(terminalGateHumanOnlyIdempotencyKey(lapseA))
+      .toBe(terminalGateHumanOnlyIdempotencyKey(lapseB));
+    expect(terminalGateHeldIdempotencyKey(lapseA))
+      .toBe(terminalGateHeldIdempotencyKey(lapseB));
+  });
+
+  // The must-pass half. A filter that subtracted too much — or a digest that
+  // stopped reading the signals at all — would satisfy every assertion above
+  // while destroying the property these keys exist for.
+  it("still changes when the monitor is re-armed on different gates", () => {
+    expect(terminalGateResolutionIdempotencyKey(["pr:blockcast/paperclip#1282:merged", ...lapseA]))
+      .not.toBe(terminalGateResolutionIdempotencyKey(lapseA));
+    expect(terminalGateResolutionIdempotencyKey(lapseA))
+      .not.toBe(terminalGateResolutionIdempotencyKey(["heartbeat_run:5ba0efe5-be46-4f22-89f7-ca704ab5e722"]));
+  });
+
+  // `parseTerminalGateSignal` classifies `raw.trim()`, and the SQL side
+  // `btrim`s for the same reason, so a legacy row storing a padded token must
+  // be subtracted here too — otherwise the two layers disagree on exactly the
+  // row nobody would think to check.
+  it("subtracts a padded watchdog token, as both the parser and the SQL do", () => {
+    expect(terminalGateResolutionIdempotencyKey([
+      ...declared,
+      "  heartbeat_run:5ba0efe5-be46-4f22-89f7-ca704ab5e722  ",
+    ])).toBe(terminalGateResolutionIdempotencyKey(declared));
+  });
+});
+
 describe("terminalGateResolutionIdempotencyKey", () => {
   it("is order-insensitive but signal-set-sensitive, so a re-arm on new gates stops matching", () => {
     const a = terminalGateResolutionIdempotencyKey(["pr:o/r#1:merged", "pr:o/r#2:merged"]);
@@ -854,6 +939,34 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
       });
     }
     return id;
+  }
+
+  /**
+   * A second dispatch lapse, in the one respect this test needs: the watchdog
+   * re-arms on the SAME declared gates and writes a NEW run id.
+   * `rearmIssueMonitorAfterDispatchLapse` (issue-execution-policy.ts) strips
+   * any previous watchdog token before appending its own, so the stored set
+   * carries exactly one — reproduced here rather than approximated, because a
+   * fixture that accumulated them would change the declared set for real and
+   * the test would pass for the wrong reason.
+   *
+   * Stored sorted, as `normalizeIssueMonitorGateSignals` writes it.
+   */
+  async function relapseDispatchWatchdog(issueId: string, watchedRunId: string) {
+    const [row] = await db
+      .select({ executionState: issues.executionState })
+      .from(issues)
+      .where(eq(issues.id, issueId));
+    const state = row!.executionState as { monitor: { gateSignals: string[] } };
+    const gateSignals = [
+      ...state.monitor.gateSignals.filter((signal) => !signal.startsWith("heartbeat_run:")),
+      `heartbeat_run:${watchedRunId}`,
+    ].sort();
+    await db
+      .update(issues)
+      .set({ executionState: { ...state, monitor: { ...state.monitor, gateSignals } } as never })
+      .where(eq(issues.id, issueId));
+    return gateSignals;
   }
 
   async function commentsFor(issueId: string) {
@@ -1692,6 +1805,57 @@ describeEmbeddedPostgres("reconcileTerminalGates", () => {
     // The resolved copy's two load-bearing phrases must be absent.
     expect(comments[0]!.body).not.toContain("Terminal gate resolved");
     expect(comments[0]!.body).not.toContain("nothing left to chase");
+  });
+
+  // TGW — PEN-6381. The dedupe material and the adjudicated set were not the
+  // same set: the watchdog token was digested into all three announcement keys
+  // while being excluded from adjudication. `ISSUE_MONITOR_DISPATCH_LAPSE_MS`
+  // is 15 minutes and rows carrying 7 and 8 redispatches were measured on one
+  // pass, so a row could mint one key per lapse for a declared gate set that
+  // never changed — and each extra announcement is a comment, which on an open
+  // row costs the assignee a whole run.
+  //
+  // Reachable only since PEN-6346. Before it the watchdog REPLACED the declared
+  // set, every such row adjudicated `unresolvable_signal`, and nothing was ever
+  // announced; the key churn existed and was moot.
+  //
+  // `scanned` is the assertion that matters, and it is why this is not a
+  // JS-only change: it is `candidates.length` straight off `listCandidateIssues`,
+  // so `scanned: 0` can only hold if `gateSignalDigestSql` made the same
+  // subtraction the TS digest did. Revert the SQL half alone and this reads
+  // `scanned: 1` — the row is re-admitted, consumes a window slot on every
+  // pass, and `updatedAt ASC` ages it to the front of a budget the starving
+  // rows share.
+  it("announces once across two dispatch lapses that re-arm on the same declared gates", async () => {
+    const { companyId, agentId } = await createCompany("TGW");
+    const declared = "pr:blockcast/paperclip#1281:merged";
+    const firstLapse = [declared, "heartbeat_run:5ba0efe5-be46-4f22-89f7-ca704ab5e722"].sort();
+    const issueId = await insertStrandedGateIssue({
+      companyId,
+      agentId,
+      identifier: "TGW-1",
+      gateSignals: firstLapse,
+    });
+    const readPullRequestGate = mergedReader(new Set(["blockcast/paperclip#1281"]));
+
+    const first = await reconcileTerminalGates(db, { now: NOW, readPullRequestGate });
+    expect(first).toMatchObject({ scanned: 1, resolved: 1 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
+
+    const secondLapse = await relapseDispatchWatchdog(
+      issueId,
+      "c6a5c284-6f0d-4a1e-9b77-2f1c0d9ae431",
+    );
+    // The stored set really did change, so a digest over the raw declaration
+    // really would differ. Without this the test could pass by the fixture
+    // having written nothing.
+    expect(secondLapse).not.toEqual(firstLapse);
+    expect(secondLapse.filter((signal) => signal.startsWith("heartbeat_run:"))).toHaveLength(1);
+    expect(secondLapse).toContain(declared);
+
+    const second = await reconcileTerminalGates(db, { now: NOW, readPullRequestGate });
+    expect(second).toMatchObject({ scanned: 0, resolved: 0, pullRequestReads: 0 });
+    expect(await commentsFor(issueId)).toHaveLength(1);
   });
 
   // TGH — the lost post-merge notice, also from #2974. The held finding is
