@@ -3634,6 +3634,23 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("one that refuses everything is not a probe");
     // Scope, so the rule is not widened into a claim about the GitHub API itself.
     expect(markdown).toContain("`mcp__github__*` tools fail loudly");
+    // PEN-6385 review pass. rc 1 is jq -e's false branch and is the MODAL live outcome on
+    // both shapes -- a three-value rc table that omits it invites a reader to treat the
+    // commonest correct refusal as an undocumented failure, which is the exact defect
+    // this section exists to name. Pinned on both arms because they drifted apart once.
+    expect(markdown).toContain("rc 1 when reviews exist but none are that login");
+    expect(markdown).toContain("rc 1 when the set is non-empty and does not contain it");
+    expect(markdown).toContain("MODAL live outcome on BOTH shapes");
+    // The operands are placeholders. Pasted verbatim they refuse everything, which reads
+    // exactly like a working gate, so the warning has to travel with the recipe.
+    expect(markdown).toContain("are PLACEHOLDERS");
+    // The `// []` claim must carry its mechanism in the EMITTED text: runs never see the
+    // TS comment that explains it.
+    expect(markdown).toContain("MANUFACTURES the empty list");
+    // A permanent rc 4 is a fact about the SURFACE, not the gate. Three repos, three
+    // shapes -- so neither protection route may be named as the in-effect one.
+    expect(markdown).toContain("Three repos, three shapes");
+    expect(markdown).toContain("take the UNION, per repo, live");
   });
 
   // PEN-5802. The head check above is push-scoped, and the directive's own verb list
