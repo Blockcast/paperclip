@@ -1,14 +1,19 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { describe, it } from "node:test";
 
 import {
   EXIT_UNMEASURED,
   EXIT_VIOLATION,
+  SECRET_SCAN_SILENCING_PATHS,
   fetchCodeownersErrors,
   ghErrorText,
   isTransientGhError,
+  ownersForExactPattern,
+  parseCodeownersRules,
   runGuard,
   summarizeErrors,
+  uncoveredSecretScanPaths,
 } from "./check-codeowners.mjs";
 import { withRetry } from "./mirror-comment-review-gate-to-merge-group.mjs";
 
@@ -289,5 +294,157 @@ describe("runGuard exit-code contract", () => {
 
     assert.equal(code, 0);
     assert.equal(calls, 2);
+  });
+});
+
+// PEN-6393. The gap this pins shut: `.github/**` code-owns the `secret_scan` lane
+// that RUNS gitleaks, while the root-level files that can SWITCH IT OFF matched no
+// rule at all — so an edit to the mechanism drew a reviewer and an edit to the
+// allowlist drew nothing.
+//
+// ⚠ What a CODEOWNERS entry buys on this repository, so nobody reads this suite as
+// proving more than it does: GitHub does not enforce CODEOWNERS here (there is no
+// `require_code_owner_review`), so these rules are NOT a merge gate. They
+// auto-request @kkroo, and the landing routine then holds the PR on that
+// outstanding request rather than enqueuing it — a hold plus a named reviewer.
+describe("secret-scan silencing paths stay code-owned (PEN-6393)", () => {
+  // The one assertion about the real file. Deliberately the ONLY one: every
+  // control below runs against the synthetic fixture instead, so that deleting a
+  // rule from `.github/CODEOWNERS` reds exactly this test, naming the path that
+  // lost its owner, rather than cascading through the controls as well.
+  it("every file that can silence the secret-scan lane has an owner", () => {
+    const codeowners = readFileSync(
+      new URL("../.github/CODEOWNERS", import.meta.url),
+      "utf8",
+    );
+    assert.deepEqual(uncoveredSecretScanPaths(codeowners), []);
+  });
+
+  // Pins the LIST, not just the lookup. Without this, the cheapest way to green a
+  // failing run above is to delete the path from SECRET_SCAN_SILENCING_PATHS —
+  // which silently shrinks the control instead of restoring it.
+  it("pins the full set of silencing channels, so coverage cannot be narrowed quietly", () => {
+    assert.deepEqual([...SECRET_SCAN_SILENCING_PATHS].sort(), [
+      ".gitleaks-staging.toml",
+      ".gitleaks.toml",
+      ".gitleaksignore",
+    ]);
+  });
+});
+
+// ⛔ The controls for the check above. They run on a CONSTRUCTED fixture, never on
+// `.github/CODEOWNERS`: a control whose baseline is the real file stops being a
+// counter-example the moment that file changes, and then agrees with the subject
+// for a reason that has nothing to do with the code under test.
+describe("uncoveredSecretScanPaths", () => {
+  const FIXTURE = [
+    "# Code owners.",
+    ".github/** @kkroo",
+    "package.json @kkroo",
+    ".gitleaks.toml @kkroo",
+    ".gitleaks-staging.toml @kkroo",
+    ".gitleaksignore @kkroo",
+    "",
+  ].join("\n");
+
+  // The must-PASS arm. Without it, a function that reported every path as
+  // uncovered would satisfy every must-FAIL arm below.
+  it("reports nothing when all three paths are owned", () => {
+    assert.deepEqual(uncoveredSecretScanPaths(FIXTURE), []);
+  });
+
+  it("⛔ reports a path whose rule was DELETED", () => {
+    const mutated = FIXTURE.replace(/^\.gitleaks\.toml .*\n/m, "");
+    // The tamper must actually tamper. A `replace` that matches nothing returns
+    // its input unchanged, and the control then silently re-tests the must-pass
+    // arm while still reporting as a control.
+    assert.notEqual(mutated, FIXTURE, "control did not mutate the fixture");
+    assert.deepEqual(uncoveredSecretScanPaths(mutated), [".gitleaks.toml"]);
+  });
+
+  it("⛔ reports a path whose rule was COMMENTED OUT", () => {
+    const mutated = FIXTURE.replace(/^\.gitleaks-staging\.toml /m, "# .gitleaks-staging.toml ");
+    assert.notEqual(mutated, FIXTURE, "control did not mutate the fixture");
+    assert.deepEqual(uncoveredSecretScanPaths(mutated), [".gitleaks-staging.toml"]);
+  });
+
+  // Last-match-wins: an owner-less line for the same pattern REMOVES ownership.
+  // Reading only the first match would score this as still covered.
+  it("⛔ reports a path overridden by a later owner-less rule", () => {
+    assert.deepEqual(uncoveredSecretScanPaths(`${FIXTURE}.gitleaksignore\n`), [
+      ".gitleaksignore",
+    ]);
+  });
+
+  it("⛔ reports all three when the rules are absent entirely", () => {
+    assert.deepEqual(uncoveredSecretScanPaths(".github/** @kkroo\n"), [
+      ".gitleaks.toml",
+      ".gitleaks-staging.toml",
+      ".gitleaksignore",
+    ]);
+  });
+
+  it("is null-safe", () => {
+    assert.deepEqual(uncoveredSecretScanPaths(null).length, 3);
+  });
+});
+
+describe("parseCodeownersRules", () => {
+  it("reads a pattern and its owners, numbering lines from 1", () => {
+    assert.deepEqual(parseCodeownersRules("\n.gitleaks.toml @kkroo\n"), [
+      { line: 2, pattern: ".gitleaks.toml", owners: ["@kkroo"] },
+    ]);
+  });
+
+  it("keeps multiple owners in order", () => {
+    assert.deepEqual(parseCodeownersRules("docs/** @a @b @org/team")[0].owners, [
+      "@a",
+      "@b",
+      "@org/team",
+    ]);
+  });
+
+  it("drops comments, trailing comments, and blank lines", () => {
+    assert.deepEqual(parseCodeownersRules("# a comment\n\n   \nx @o # trailing"), [
+      { line: 4, pattern: "x", owners: ["@o"] },
+    ]);
+  });
+
+  // An owner-less rule is the mechanism CODEOWNERS uses to REMOVE ownership, so
+  // discarding it here would make the coverage check blind to the override case.
+  it("keeps an owner-less rule rather than discarding it", () => {
+    assert.deepEqual(parseCodeownersRules("x"), [{ line: 1, pattern: "x", owners: [] }]);
+  });
+
+  it("is null-safe and tolerates CRLF", () => {
+    assert.deepEqual(parseCodeownersRules(null), []);
+    assert.deepEqual(parseCodeownersRules(undefined), []);
+    assert.deepEqual(
+      parseCodeownersRules("a @o\r\nb @o\r\n").map((rule) => rule.pattern),
+      ["a", "b"],
+    );
+  });
+});
+
+describe("ownersForExactPattern", () => {
+  const rules = parseCodeownersRules("a @first\nb @other\na @last\n");
+
+  it("takes the LAST match, because CODEOWNERS is last-match-wins", () => {
+    assert.deepEqual(ownersForExactPattern(rules, "a"), ["@last"]);
+  });
+
+  it("returns [] for a pattern with no rule", () => {
+    assert.deepEqual(ownersForExactPattern(rules, "absent"), []);
+  });
+
+  // ⛔ Exact string equality, never a prefix or substring test: `.gitleaks.toml`
+  // must not be credited to a rule written for `.gitleaks.toml.bak`.
+  it("⛔ does not credit a different pattern that merely shares a prefix", () => {
+    const near = parseCodeownersRules(".gitleaks.toml.bak @o\n");
+    assert.deepEqual(ownersForExactPattern(near, ".gitleaks.toml"), []);
+  });
+
+  it("is null-safe", () => {
+    assert.deepEqual(ownersForExactPattern(null, "a"), []);
   });
 });
