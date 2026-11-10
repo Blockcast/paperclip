@@ -106,6 +106,92 @@ afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()?.();
 }, 120_000);
 
+/**
+ * The visibility fraction this file's plan assertions require, and the helper
+ * that establishes AND VERIFIES it.
+ *
+ * PEN-6336. Every `VACUUM ANALYZE` below is load-bearing for the reason the
+ * long comment in `seed` gives: an index-only scan is costed against the
+ * visibility map, so `relallvisible / relpages` decides whether the ordered
+ * index-only plan or `heartbeat_runs_queued_age_idx` + Sort is cheaper. What
+ * was missing is that nothing CHECKED the VACUUM got what the assertions need.
+ * When it does not, the plan assertions fail — correctly, for the plan they
+ * are handed — and the failure reads as a planner-choice regression in the
+ * code under test rather than as a fixture that was not built.
+ *
+ * That is not hypothetical: it is the signature of the merge-queue flake this
+ * constant was added for. Measured 2026-11-10 on this fixture, both depths,
+ * varying only `relallvisible` (total cost of the head probe; the right-hand
+ * column is `heartbeat_runs_queued_age_idx` + Sort, which is what wins once
+ * the ordered path crosses it):
+ *
+ *   relallvisible/relpages   depth 1000            depth 5000
+ *   1.00                       4.39  ordered        11.01  ordered
+ *   0.90                       8.39  ordered        59.00  ordered
+ *   0.75                      12.39  ordered       134.98  ordered
+ *   0.50                      16.39  ordered       250.95  ordered
+ *   0.25                      20.39  ordered       370.93  ordered
+ *   0.10                      24.09  BITMAP+SORT   446.91  ordered (3.5% margin)
+ *   0.00                      24.09  BITMAP+SORT   445.73  AGE INDEX + SORT
+ *
+ * The bottom-right cell is the reported failure verbatim — `expected one of
+ * heartbeat_runs_agent_queued_dispatch_idx | heartbeat_runs_agent_dispatch_idx,
+ * got [heartbeat_runs_queued_age_idx]`. At depth 1000 the same collapse lands
+ * on a bitmap over the ordered index instead, because the two bitmap paths tie
+ * exactly at 24.09 — so the reported INDEX NAME is a coin flip while the
+ * trigger is the same, which is why the name in the failure message is a poor
+ * guide to the cause.
+ *
+ * The floor is 0.90 rather than 1.00 so an unlucky page cannot fail a fixture
+ * that is otherwise exactly right, and rather than 0.25 because the margin at
+ * 0.10 is 3.5% — inside the fuzz this whole file exists to stay out of.
+ *
+ * ⚠ The CAUSE of a collapse is NOT established. Every local run measured —
+ * 18 fixture builds across both depths, six concurrent, under load — came back
+ * at exactly 1.00, and a concurrent open snapshot did not move it. So this
+ * helper is written to cure the transient case (it retries, and the retry
+ * forces a full-page scan) and to make the persistent case SAY SO. It is not
+ * written on a diagnosis it does not have.
+ */
+const VISIBILITY_FLOOR = 0.9;
+
+/**
+ * `VACUUM (ANALYZE)` the table, then verify the visibility map actually reached
+ * VISIBILITY_FLOOR; retry with page-skipping disabled before giving up.
+ *
+ * Returns the achieved fraction so a caller can record it in a plan report.
+ */
+async function vacuumAnalyzeUntilVisible(sql: postgres.Sql, table: string): Promise<number> {
+  let fraction = 0;
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    // DISABLE_PAGE_SKIPPING on the retries: a plain VACUUM may skip pages it
+    // cannot get a cleanup lock on, and a skipped page is a page whose
+    // all-visible bit is not set. Insurance against one known way to land
+    // short, not a claim that it is the way this fixture lands short.
+    await sql.unsafe(
+      attempt === 1
+        ? `VACUUM (ANALYZE) ${table}`
+        : `VACUUM (ANALYZE, DISABLE_PAGE_SKIPPING) ${table}`,
+    );
+    const [stats] = await sql.unsafe(
+      `SELECT relpages::int AS relpages, relallvisible::int AS relallvisible
+         FROM pg_class WHERE oid = '${table}'::regclass`,
+    ) as Array<{ relpages: number; relallvisible: number }>;
+    if (stats && stats.relpages > 0) {
+      fraction = stats.relallvisible / stats.relpages;
+      if (fraction >= VISIBILITY_FLOOR) return fraction;
+    }
+  }
+  throw new Error(
+    `${table}: VACUUM left relallvisible/relpages at ${fraction.toFixed(4)}, below the `
+    + `${VISIBILITY_FLOOR} this fixture's plan assertions require. The index-only plan they `
+    + `assert is only the cheapest plan above roughly 0.15; below that PostgreSQL legitimately `
+    + `prefers a bitmap scan plus Sort, so the plan assertions downstream would fail for a `
+    + `FIXTURE reason and read as a planner regression in the code under test. Fix the fixture, `
+    + `not the assertions.`,
+  );
+}
+
 /** Collect every node in an EXPLAIN (FORMAT JSON) plan tree. */
 function planNodes(node: Record<string, unknown>): Array<Record<string, unknown>> {
   const children = (node.Plans as Array<Record<string, unknown>> | undefined) ?? [];
@@ -407,7 +493,10 @@ async function seed(sql: postgres.Sql) {
   // heartbeat_runs is continuously autovacuumed in production and the cost model
   // reads the table-wide relallvisible/relpages fraction, so vacuuming here is
   // what makes the fixture honest rather than what makes it pass.
-  await sql.unsafe(`VACUUM ANALYZE heartbeat_runs`);
+  // PEN-6336: VERIFIED, not merely issued — see VISIBILITY_FLOOR for the
+  // measured cliff and for what a fixture that lands short does to the
+  // assertions below.
+  await vacuumAnalyzeUntilVisible(sql, "heartbeat_runs");
   await sql.unsafe(`ANALYZE issues`);
 }
 
@@ -678,7 +767,8 @@ async function seedInterleavedQueue(sql: postgres.Sql, depth: number) {
     FROM generate_series(1, ${TOTAL_RUNS}) AS series
   `);
   await sql.unsafe(`SET session_replication_role = origin`);
-  await sql.unsafe(`VACUUM ANALYZE heartbeat_runs`);
+  // PEN-6336: VERIFIED, not merely issued — see VISIBILITY_FLOOR.
+  return vacuumAnalyzeUntilVisible(sql, "heartbeat_runs");
 }
 
 
@@ -1028,7 +1118,7 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       const sql = postgres(database.connectionString, { max: 1, onnotice: () => {} });
       cleanups.push(async () => sql.end());
 
-      await seedInterleavedQueue(sql, depth);
+      const visibleFraction = await seedInterleavedQueue(sql, depth);
       const [{ queued }] = await sql.unsafe(
         `SELECT count(*)::int AS queued FROM heartbeat_runs
           WHERE agent_id = '${AGENT}'::uuid AND status = 'queued'`,
@@ -1043,7 +1133,14 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       record(`depth ${depth}: head scan BEFORE (SELECT *)`, await explain(sql, DISPATCH_QUERY_BEFORE));
 
       const probe = await explain(sql, DISPATCH_HEAD_PROBE);
-      record(`depth ${depth}: head probe (created_at, id only)`, probe);
+      // The visibility fraction rides in the title because it is the fixture
+      // precondition that decides this plan, and the report is what a human
+      // reads when the assertions below go red (PEN-6336).
+      record(
+        `depth ${depth}: head probe (created_at, id only), `
+        + `relallvisible/relpages=${visibleFraction.toFixed(4)}`,
+        probe,
+      );
 
       expectOrderedDispatchIndex(probe.root);
       expect(scanKinds(probe.root)).not.toContain("Seq Scan");
@@ -1053,6 +1150,66 @@ describeEmbeddedPostgres("BLO-20396 dispatch query plans", () => {
       expect(planNodes(probe.root).map((n) => n["Node Type"])).not.toContain("Sort");
       expect(scanKinds(probe.root)).toContain("Index Only Scan");
       expect(rowsInspected(probe.root)).toBeLessThanOrEqual(HEAD_ABSOLUTE_BOUND);
+
+      /**
+       * MUTATION CONTROL (PEN-6336) — the assertions immediately above are
+       * worth nothing unless a genuinely regressed plan fails them, and this
+       * is the only place that demonstrates it rather than asserting it.
+       *
+       * Drop BOTH ordering-capable indexes inside a transaction that is always
+       * rolled back. `heartbeat_runs_queued_age_idx` is then the only
+       * applicable index, and its second key is
+       * `coalesce(queued_at, created_at)`, so it cannot supply this ORDER BY at
+       * any cost — the Sort is structural rather than a cost margin, exactly
+       * like the generic-plan control further down, and for the same reason it
+       * cannot itself become the next knife-edge flake.
+       *
+       * The raw BEGIN/ROLLBACK is correct only because this pool is `max: 1`;
+       * see the longer note on the generic-plan control below before widening
+       * it.
+       */
+      await sql.unsafe("BEGIN");
+      try {
+        await sql.unsafe(`DROP INDEX ${QUEUED_DISPATCH_INDEX}`);
+        await sql.unsafe(`DROP INDEX ${DISPATCH_INDEX}`);
+        const regressed = await explain(sql, DISPATCH_HEAD_PROBE);
+        record(`depth ${depth}: MUTATION CONTROL, both ordered indexes dropped`, regressed);
+        expect(() => expectOrderedDispatchIndex(regressed.root)).toThrow();
+        expect(planNodes(regressed.root).map((n) => n["Node Type"])).toContain("Sort");
+        expect(scanKinds(regressed.root)).not.toContain("Index Only Scan");
+      } finally {
+        await sql.unsafe("ROLLBACK");
+      }
+
+      /**
+       * VISIBILITY CONTROL (PEN-6336) — proves VISIBILITY_FLOOR is load-bearing
+       * rather than ceremony, so a later simplification that drops the
+       * verification has something that goes red.
+       *
+       * Forging `relallvisible` is a catalog write, which is transactional, so
+       * the rollback restores it; the re-check after the rollback is what
+       * proves the control cleaned up after itself rather than leaving every
+       * later assertion in this test running against a degraded fixture.
+       *
+       * Only the Sort is asserted. WHICH index the degraded plan reaches for is
+       * genuinely depth-dependent — at depth 5000 it is the queue-age index,
+       * at depth 1000 the two bitmap paths tie to the cent and the winner is
+       * arbitrary — so pinning the name here would re-import the exact
+       * instability this control exists to document.
+       */
+      await sql.unsafe("BEGIN");
+      try {
+        await sql.unsafe(
+          `UPDATE pg_class SET relallvisible = 0 WHERE oid = 'heartbeat_runs'::regclass`,
+        );
+        const blind = await explain(sql, DISPATCH_HEAD_PROBE);
+        record(`depth ${depth}: VISIBILITY CONTROL, relallvisible forced to 0`, blind);
+        expect(planNodes(blind.root).map((n) => n["Node Type"])).toContain("Sort");
+      } finally {
+        await sql.unsafe("ROLLBACK");
+      }
+      const restored = await explain(sql, DISPATCH_HEAD_PROBE);
+      expect(planNodes(restored.root).map((n) => n["Node Type"])).not.toContain("Sort");
 
       // Same, resumed mid-queue: the cursor must be satisfied BY the index, not
       // rechecked after it, or every resumed pass re-walks the discarded prefix.
