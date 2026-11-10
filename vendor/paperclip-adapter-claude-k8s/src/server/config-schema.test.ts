@@ -27,12 +27,15 @@ describe("getConfigSchema", () => {
     expect(keys).not.toContain("graceSec");
   });
 
-  it("exposes claudeCodeVersion defaulting to the adapter pin", () => {
+  it("exposes claudeCodeVersion with no default, so an unset agent follows the adapter pin", () => {
+    // The UI create form copies field defaults into the saved adapterConfig. A
+    // default here would pin every UI-hired agent to today's version.
     const schema = getConfigSchema();
     const field = schema.fields.find((f: ConfigFieldSchema) => f.key === "claudeCodeVersion");
     expect(field).toBeDefined();
     expect(field!.type).toBe("text");
-    expect(field!.default).toBe(DEFAULT_CLAUDE_CODE_VERSION);
+    expect(field!.default).toBeUndefined();
+    expect((field as ConfigFieldSchema & { hint?: string }).hint).toContain(DEFAULT_CLAUDE_CODE_VERSION);
   });
 
   it("maxTurnsPerRun defaults to 1000", () => {
