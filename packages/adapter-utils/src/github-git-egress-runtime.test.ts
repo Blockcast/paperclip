@@ -1,7 +1,8 @@
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -30,8 +31,20 @@ function tempDir(prefix: string): string {
   tempDirs.add(dir);
   return dir;
 }
-afterAll(() => {
-  for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
+// Removed concurrently, and off the event loop. The serial `rmSync` form this
+// replaces blocked the single thread for the whole teardown, and PEN-6455
+// measured a >10s overrun of the 10s hook default that evicted #3583 from the
+// merge queue. Local measurement could NOT reproduce that cost -- 45 fixture
+// repos of 5 commits each tear down in 291ms, 2.4x this suite's fixture count
+// -- so the budget now declared in this package's vitest.config.ts is the
+// load-bearing fix and this is hardening. It is worth having anyway: the one
+// hypothesis that survives that measurement is pathologically slow unlinks on
+// a contended CI filesystem, and that is exactly the case a parallel removal
+// across libuv's threadpool improves. A per-test drain is NOT available as an
+// alternative -- the `beforeAll` blocks below register fixtures that later
+// tests in their describe still read.
+afterAll(async () => {
+  await Promise.all([...tempDirs].map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
 const HOOKS = "/hooks";
