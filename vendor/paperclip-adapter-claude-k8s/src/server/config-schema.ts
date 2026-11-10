@@ -94,8 +94,10 @@ export function getConfigSchema(): AdapterConfigSchema {
       type: "text",
       key: "claudeCodeVersion",
       label: "Claude Code Version",
-      hint: `Exact @anthropic-ai/claude-code version the Job installs once onto the shared data PVC and runs instead of the image's bundled CLI (default ${DEFAULT_CLAUDE_CODE_VERSION}). Set to "image" to run the CLI bundled in the container image. New Claude models require a minimum CLI version; the image's copy only changes on an image rebuild.`,
-      default: DEFAULT_CLAUDE_CODE_VERSION,
+      hint: `Exact @anthropic-ai/claude-code version the Job installs once onto the shared data PVC and runs instead of the image's bundled CLI. Leave empty to follow the adapter's pin, currently ${DEFAULT_CLAUDE_CODE_VERSION}, which moves when a new model needs a newer CLI. Set to "image" to run the CLI bundled in the container image; that copy only changes on an image rebuild.`,
+      // No `default`: the create form copies field defaults into the saved
+      // config, which would pin every UI-hired agent to today's version and
+      // leave it behind on the next bump. Unset means "follow the adapter pin".
     },
     {
       type: "text",
