@@ -477,6 +477,101 @@ export function classifyAdmissionEvidence({
 }
 
 /**
+ * PEN-6460: the sentinel `ghRunHasFailedJob` returns when it could not read a
+ * run's job list at all. It is deliberately a string and not `null`/`false`:
+ * the BLO-51600 probe answered `false` on a read failure, which is the same
+ * value a genuinely clean run produces, so "I could not look" and "I looked
+ * and nothing failed" were indistinguishable and both landed on `manual` --
+ * a verdict that names a person as the cause.
+ */
+export const HAS_FAILED_JOB_UNKNOWN = "unknown";
+
+/**
+ * PEN-6460: GitHub states why it removed an entry from the merge queue, on
+ * the timeline's `RemovedFromMergeQueueEvent.reason`. Everything else this
+ * module classifies from is an inference -- run counts, run conclusions, the
+ * removal actor -- and #3591 (2026-11-10T22:41:30Z) is the case where every
+ * inference was false and the report was right: `reason: "failed_checks"`
+ * against a `merge_group` run that read `cancelled`, reported to its reader
+ * as a "manual / administrative dequeue" with an instruction to go and find
+ * whoever dequeued it. Nobody had.
+ *
+ * NOTE -- the field is REST-INVISIBLE. `GET /repos/:o/:r/issues/:n/timeline`
+ * returns a `removed_from_merge_queue` event with keys
+ * `[actor, commit_id, commit_url, created_at, event, id, node_id,
+ * performed_via_github_app, url]` and NO `reason` -- measured first-party on
+ * #3591, 2026-11-10. Only the GraphQL node carries it, which is why
+ * `ghDequeueReason` below is the single GraphQL call in an otherwise
+ * REST-only script. Do not "simplify" it back onto the REST timeline the rest
+ * of this module reads; the field is simply not there.
+ *
+ * NOTE -- and do not take the ACTOR from that GraphQL node while you are there:
+ * GraphQL renders it `github-merge-queue` where REST renders
+ * `github-merge-queue[bot]`, and `MERGE_QUEUE_REMOVAL_ACTOR` -- the sole
+ * input to `isQueueInitiatedRemoval` -- is the REST spelling. Swapping the
+ * source would silently make every queue-initiated removal look
+ * human-initiated. Both spellings measured on #3591.
+ *
+ * `reason` is a nullable `String` in the schema, NOT an enum, so its value
+ * space is not introspectable and this map is necessarily a sample. Measured
+ * on `Blockcast/paperclip` 2026-11-10 over the 60 most-recently-updated PRs,
+ * 29 removals: `failed_checks` 15, `merged` 7, `merge_conflict` 6, `manual`
+ * 1. An unrecognised or absent reason maps to `null` and changes nothing --
+ * the inference ladder runs exactly as it did before.
+ */
+export const MERGE_QUEUE_DEQUEUE_REASON_CAUSES = Object.freeze({
+  merged: "merged",
+  failed_checks: "check_failure",
+  merge_conflict: "conflict_unstageable",
+  manual: "manual",
+});
+
+/**
+ * @param {string | null | undefined} reason
+ * @returns {"merged" | "check_failure" | "conflict_unstageable" | "manual" | null}
+ */
+export function causeFromDequeueReason(reason) {
+  if (typeof reason !== "string") return null;
+  const key = reason.trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(MERGE_QUEUE_DEQUEUE_REASON_CAUSES, key)
+    ? MERGE_QUEUE_DEQUEUE_REASON_CAUSES[key]
+    : null;
+}
+
+/**
+ * Picks the removal this run's attempt window anchored to, out of every
+ * `RemovedFromMergeQueueEvent` on the PR. A PR can be enqueued and evicted
+ * many times -- #3591 carried three queue attempts on 2026-11-10 alone -- so
+ * taking "the last removal" would read a different attempt's reason onto this
+ * one, which is the exact failure `selectLatestQueueAttemptWindow` exists to
+ * avoid on the REST side.
+ *
+ * Matched at SECOND resolution rather than on the raw strings: the two
+ * surfaces render the same instant independently (`created_at` vs
+ * `createdAt`) and a sub-second difference must not silently drop the
+ * enhancement. Two removals on one PR inside one second is not a shape this
+ * queue produces.
+ *
+ * @param {Array<{ createdAt?: string, reason?: string | null }>} removalEvents
+ * @param {string | null} dequeuedAt
+ * @returns {string | null} the raw reason string, lower-cased, or `null`
+ */
+export function selectDequeueReasonAt(removalEvents, dequeuedAt) {
+  if (typeof dequeuedAt !== "string") return null;
+  const target = new Date(dequeuedAt).getTime();
+  if (!Number.isFinite(target)) return null;
+  const targetSecond = Math.floor(target / 1000);
+  const match = (removalEvents ?? []).find((event) => {
+    const at = new Date(event?.createdAt).getTime();
+    return Number.isFinite(at) && Math.floor(at / 1000) === targetSecond;
+  });
+  const reason = match?.reason;
+  if (typeof reason !== "string") return null;
+  const trimmed = reason.trim().toLowerCase();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
  * Deliberately takes no `mergeable`/`mergeStateStatus` input. On a `REBASE`
  * merge queue (this repo's configuration: `mergeMethod: REBASE`), a PR can
  * read `mergeable: CLEAN` throughout an eviction -- the final tree merges
@@ -501,11 +596,20 @@ export function classifyAdmissionEvidence({
  * head's checks had finished reporting by the removal, never whether the tree
  * merges. See `classifyAdmissionEvidence` above for why the trap stays closed.
  *
+ * PEN-6460 adds `dequeueReason`, which is NOT that forbidden check either:
+ * it is GitHub's own stated reason for the removal, read off the timeline's
+ * `RemovedFromMergeQueueEvent`, and says nothing about whether the tree
+ * merges. It is the only input here that is a REPORT rather than an
+ * inference -- every other signal in this function is reconstructed from run
+ * counts, run conclusions and actors. See `causeFromDequeueReason` for the
+ * measured value space and for why it is not trusted in the zero-run branch.
+ *
  * @param {{
  *   merged: boolean,
- *   mergeGroupRuns: Array<{ conclusion: string | null, hasFailedJob?: boolean }>,
+ *   mergeGroupRuns: Array<{ conclusion: string | null, hasFailedJob?: boolean | "unknown" }>,
  *   truncated?: boolean,
  *   dequeueActor?: string | null,
+ *   dequeueReason?: string | null,
  *   admissionEvidence?: ReturnType<typeof classifyAdmissionEvidence>,
  * }} input
  * @returns {"merged" | "conflict_unstageable" | "requirements_unmet" | "check_failure" | "manual" | "unknown"}
@@ -515,9 +619,18 @@ export function classifyMergeQueueEviction({
   mergeGroupRuns,
   truncated = false,
   dequeueActor = null,
+  dequeueReason = null,
   admissionEvidence = null,
 }) {
+  const reasonCause = causeFromDequeueReason(dequeueReason);
   if (merged) return "merged";
+  // PEN-6460: `reason: "merged"` is the queue saying it removed the entry
+  // BECAUSE it merged the PR. `pr.merged` is read from a different surface
+  // and can still be lagging after the grace window, and when it is, every
+  // branch below produces an eviction notice for a PR that landed. Measured
+  // 2026-11-10 over 29 removals on this repo: 7 carried this reason and all
+  // 7 were successful merges.
+  if (reasonCause === "merged") return "merged";
   // Ally review #1220: a `gh run list` sample that hit its cap is not proof
   // of absence. Only trust "zero runs found" -> conflict_unstageable when
   // the sample is known-complete; otherwise say so explicitly rather than
@@ -546,15 +659,45 @@ export function classifyMergeQueueEviction({
   // commit and is enqueued seconds later, before anything has run on it.
   // `admissionEvidence.rejected` is only ever `true` on positive evidence, so
   // an absent or unusable read falls through to the verdict above.
+  //
+  // PEN-6460 deliberately does NOT consult `dequeueReason` in this branch,
+  // and the omission is the point. GitHub's vocabulary is coarser than this
+  // ladder: a PEN-4887 admission rejection IS a removal for checks that did
+  // not pass, so `reason: "failed_checks"` is the expected report for it --
+  // and answering `check_failure` there would retire `requirements_unmet`,
+  // whose whole value is telling the reader to wait for the head's checks or
+  // arm auto-merge instead of hunting a failing one. `reason` is a REPORT and
+  // is therefore authoritative about what it says; it is not more specific
+  // than a classification built from three other signals. Reinstate it here
+  // only with a measured specimen of a zero-run eviction whose reason
+  // contradicts the ladder.
   if (!mergeGroupRuns || mergeGroupRuns.length === 0) {
     if (!isQueueInitiatedRemoval(dequeueActor)) return "manual";
     if (admissionEvidence?.rejected === true) return "requirements_unmet";
     return "conflict_unstageable";
   }
+  // PEN-6460: GitHub's own reason outranks every inference below it, because
+  // the inferences reconstruct from run conclusions what this field states
+  // outright. Measured on #3591 (2026-11-10T22:41:30Z): the removal carried
+  // `reason: "failed_checks"` while the run read `cancelled`, so both
+  // disjuncts below were false and this eviction was reported as a manual
+  // dequeue -- sending its reader to find a person who did not exist.
+  if (reasonCause === "check_failure") return "check_failure";
   // BLO-51600: the orphan sweeper cancels a run once a job has failed, so a
   // `cancelled` run carrying a failed job is a check failure, not a dequeue.
   if (mergeGroupRuns.some((run) => run?.conclusion === "failure" || run?.hasFailedJob === true)) {
     return "check_failure";
+  }
+  if (reasonCause === "conflict_unstageable") return "conflict_unstageable";
+  if (reasonCause === "manual") return "manual";
+  // PEN-6460: a `cancelled` run whose job list could not be read is NOT
+  // evidence that no job failed -- before this, `ghRunHasFailedJob` returned
+  // `false` on a read failure and that answer fell straight through to
+  // `manual`, which asserts a person dequeued the PR. An unreadable probe now
+  // says so. This arm is reached only after the two positive-evidence checks
+  // above, so a run that demonstrably failed is still `check_failure`.
+  if (mergeGroupRuns.some((run) => run?.hasFailedJob === HAS_FAILED_JOB_UNKNOWN)) {
+    return "unknown";
   }
   // A merge_group run exists and did not fail, yet the PR was evicted
   // unmerged: an administrative/manual dequeue (see
@@ -748,17 +891,105 @@ export function isGatingJobName(name) {
   return MERGE_GROUP_GATING_JOBS.some((g) => name === g || name.startsWith(`${g} (`));
 }
 
-// BLO-51600: one call per CANCELLED run only. A read failure returns false,
-// which keeps the pre-BLO-51600 verdict for that run.
-function ghRunHasFailedJob(repo, runId) {
+/**
+ * PEN-6460: the job names whose FAILURE witnesses that a gating job did not
+ * pass. Strictly wider than `MERGE_GROUP_GATING_JOBS`, which stays pinned
+ * byte-for-byte to pr.yml and to GATING_JOBS in
+ * .github/scripts/sweep-orphaned-merge-group-runs.sh and must not grow for
+ * this -- the sweeper's question ("may I cancel this run?") is not this
+ * module's question ("did a required check fail?").
+ *
+ * `verify` is added because it is pr.yml's required aggregate over exactly
+ * the ten gating jobs, declared `if: always() && !cancelled()`. That guard is
+ * what makes it a DISCRIMINATOR rather than another name on a list:
+ *
+ *   - a gating job killed by its own `timeout-minutes` does not cancel the
+ *     RUN, so `!cancelled()` holds, `verify` runs, sees a cancelled need and
+ *     concludes `failure`;
+ *   - a run cancelled from outside (the orphan sweeper, or a dequeue) makes
+ *     `cancelled()` true, so `verify` never runs and concludes `cancelled`.
+ *
+ * Measured first-party 2026-11-10 on both arms: run 42910342037 (#3591, the
+ * PEN-6460 case) -- `Build` `cancelled` after 25.4m against its
+ * `timeout-minutes: 25`, `verify` FAILURE; run 42900870003 (#3586, control)
+ * -- `General tests (workspaces-a)` `failure`, eleven jobs cancelled by the
+ * sweeper, `verify` CANCELLED.
+ *
+ * NOTE -- this is why the jq below still admits only `failure`/`timed_out`
+ * and NOT `cancelled`, which looks like the obvious fix and is a fail-open in
+ * the opposite direction: a dequeue cancels the run, so EVERY gating job in a
+ * genuinely manual dequeue reads `cancelled` (eleven of them in the control
+ * above) and admitting that conclusion by name would report every manual
+ * dequeue as a check failure. The step list does not rescue it either --
+ * measured on both runs, the interrupted step reads `cancelled` in the
+ * timeout case exactly as it does in the external-cancel case, so steps
+ * discriminate nothing. `verify`'s conclusion is the signal that does.
+ */
+export const MERGE_GROUP_FAILURE_WITNESS_JOBS = [...MERGE_GROUP_GATING_JOBS, "verify"];
+
+export function isFailureWitnessJobName(name) {
+  return MERGE_GROUP_FAILURE_WITNESS_JOBS.some((g) => name === g || name.startsWith(`${g} (`));
+}
+
+/**
+ * BLO-51600: one call per CANCELLED run only.
+ *
+ * PEN-6460: returns `HAS_FAILED_JOB_UNKNOWN` on a read failure, where it used
+ * to return `false`. `false` is also what a genuinely clean run returns, so
+ * an unreadable probe was indistinguishable from a clean one and fell
+ * through to `manual` -- a verdict that asserts a person dequeued the PR.
+ * This surface is the first to go dark under an exhausted REST `core`
+ * bucket, which is exactly when a confident wrong answer is most likely.
+ *
+ * @returns {boolean | typeof HAS_FAILED_JOB_UNKNOWN}
+ */
+export function ghRunHasFailedJob(repo, runId, exec = run) {
+  let out;
   try {
-    const out = run([
+    out = exec([
       "gh", "api", `repos/${repo}/actions/runs/${runId}/jobs?per_page=100`,
-      "--jq", '.jobs[]|select(.conclusion=="failure" or .conclusion=="timed_out")|.name',
+      '--jq', '.jobs[]|select(.conclusion=="failure" or .conclusion=="timed_out")|.name',
     ]);
-    return out.split("\n").some((name) => isGatingJobName(name.trim()));
   } catch {
-    return false;
+    return HAS_FAILED_JOB_UNKNOWN;
+  }
+  return out.split("\n").some((name) => isFailureWitnessJobName(name.trim()));
+}
+
+/**
+ * PEN-6460: the one GraphQL call in this module. See
+ * `MERGE_QUEUE_DEQUEUE_REASON_CAUSES` for why the REST timeline the rest of
+ * the script reads cannot answer this, and for the measured value space.
+ *
+ * Fails to `null` on any error, which restores the pre-PEN-6460 behaviour
+ * exactly: the inference ladder runs untouched. That direction is deliberate
+ * -- this read must never be able to manufacture a verdict it did not get.
+ */
+export const DEQUEUE_REASON_QUERY = `query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      timelineItems(last:50, itemTypes:[REMOVED_FROM_MERGE_QUEUE_EVENT]){
+        nodes{ ... on RemovedFromMergeQueueEvent { createdAt reason } }
+      }
+    }
+  }
+}`;
+
+export function ghDequeueReason(repo, prNumber, dequeuedAt, exec = run) {
+  const [owner, name] = String(repo ?? "").split("/");
+  if (!owner || !name) return null;
+  try {
+    const out = exec([
+      "gh", "api", "graphql",
+      "-f", `query=${DEQUEUE_REASON_QUERY}`,
+      "-F", `owner=${owner}`,
+      "-F", `name=${name}`,
+      "-F", `number=${prNumber}`,
+      "--jq", ".data.repository.pullRequest.timelineItems.nodes[] | {createdAt, reason}",
+    ]);
+    return selectDequeueReasonAt(parseNdjson(out), dequeuedAt);
+  } catch {
+    return null;
   }
 }
 
@@ -796,6 +1027,8 @@ export function buildEvictionCommentBody({
   base,
   identifiers,
   dequeueActor = null,
+  dequeueReason = null,
+  unknownReason = "truncated_sample",
   admissionEvidence = null,
 }) {
   // PEN-3926: `manual` is now reachable with ZERO runs (a dequeue that beat
@@ -851,13 +1084,31 @@ export function buildEvictionCommentBody({
       "during this queue attempt (0 runs found), so no check failure exists to explain it. The branch could " +
       "not be staged against a moving base. See `runbooks/merge-queue-stalled-head.md` (\"Silent eviction: " +
       "un-stageable rebase\").",
+    // PEN-6460: the run itself does NOT have to read `failure`. A gating job
+    // killed by its own `timeout-minutes` budget is recorded by GitHub as
+    // `cancelled`, and so is a run the orphan sweeper cancelled after a job
+    // failed -- both are failing required checks, and saying "concluded
+    // failing" sent readers of the cancelled shape looking for a red run that
+    // does not exist.
     check_failure:
-      "**failing required check** -- a `merge_group` run was created for this PR's head and concluded failing.",
+      "**failing required check** -- a `merge_group` run was created for this PR's head and a required check on " +
+      "it did not pass. The run itself may read `cancelled` rather than `failure`: a gating job killed by its " +
+      "own `timeout-minutes` budget is recorded as `cancelled`, and the orphan sweeper cancels a run once a " +
+      "gating job has failed. Open the run and look for the job that did not finish clean, not for a red run.",
     manual: manualCause,
+    // PEN-6460: `unknown` now has two causes and they need different words.
+    // The notice must not assert a manual dequeue when the truth is that a
+    // probe could not read -- naming a cause nobody can act on is the defect
+    // this whole row is about.
     unknown:
-      "**undetermined** -- the `merge_group` run lookup for this PR's queue attempt hit its sample cap with no " +
-      "match, so an incomplete sample can't be told apart from a genuine zero. Diagnose manually via " +
-      "`runbooks/merge-queue-stalled-head.md` before assuming a conflict.",
+      unknownReason === "unreadable_jobs"
+        ? "**undetermined** -- a `merge_group` run for this PR's head ended `cancelled` and its job list could " +
+          "not be read, so a check failure the sweeper cancelled cannot be told apart from a deliberate " +
+          "dequeue. This is usually an exhausted GitHub REST quota rather than anything about this PR: open " +
+          "the run's jobs by hand, or re-run this workflow once the quota resets, before acting."
+        : "**undetermined** -- the `merge_group` run lookup for this PR's queue attempt hit its sample cap " +
+          "with no match, so an incomplete sample can't be told apart from a genuine zero. Diagnose manually " +
+          "via `runbooks/merge-queue-stalled-head.md` before assuming a conflict.",
   }[classification];
   return [
     MERGE_QUEUE_EVICTION_MARKER,
@@ -865,7 +1116,15 @@ export function buildEvictionCommentBody({
     "",
     `Cause: ${causeLine}`,
     "",
-    `(${mergeGroupRunCount} \`merge_group\` run(s) found for this PR's queue head at ${repo}.)`,
+    `(${mergeGroupRunCount} \`merge_group\` run(s) found for this PR's queue head at ${repo}.` +
+      // PEN-6460: GitHub's own word for the removal, printed verbatim beside
+      // the inferred cause so a reader can see the two agree -- or, when a
+      // future reason value this module does not yet map shows up, see that
+      // the cause line was inferred without it.
+      (typeof dequeueReason === "string" && dequeueReason.trim().length > 0
+        ? ` GitHub's stated removal reason: \`${dequeueReason.trim()}\`.`
+        : "") +
+      ")",
     "",
     // PEN-3926: a `manual` notice must not lead with "rebase onto the current
     // base". That instruction is what made the false notices harmful -- it is
@@ -997,13 +1256,21 @@ async function main() {
           dequeuedAt: attemptWindow.dequeuedAt,
         })
       : null;
+  // PEN-6460: GitHub's own stated reason for THIS attempt's removal. One
+  // GraphQL call, unconditional -- unlike `admissionEvidence` it can change
+  // any verdict, including the run-outcome ones, which is the whole point.
+  const dequeueReason = ghDequeueReason(repo, prNumber, attemptWindow.dequeuedAt);
   const classification = classifyMergeQueueEviction({
     merged: pr.merged,
     mergeGroupRuns,
     truncated,
     dequeueActor: attemptWindow.dequeuedBy,
+    dequeueReason,
     admissionEvidence,
   });
+  const unknownReason = mergeGroupRuns.some((r) => r?.hasFailedJob === HAS_FAILED_JOB_UNKNOWN)
+    ? "unreadable_jobs"
+    : "truncated_sample";
 
   const result = {
     repo,
@@ -1014,6 +1281,7 @@ async function main() {
     classification,
     truncated,
     attemptWindow,
+    dequeueReason,
     mergeGroupRunCount: mergeGroupRuns.length,
     mergeGroupRuns,
     admissionEvidence,
@@ -1030,6 +1298,8 @@ async function main() {
       base: pr.baseRefName,
       identifiers,
       dequeueActor: attemptWindow.dequeuedBy,
+      dequeueReason,
+      unknownReason,
       admissionEvidence,
     });
     run(["gh", "pr", "comment", String(prNumber), "--repo", repo, "--body", body]);

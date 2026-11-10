@@ -285,17 +285,40 @@ the eviction:
   deliberately held. An absent or unparseable actor falls back to
   `conflict_unstageable`, so the classifier cannot be made quieter by a missing
   field,
+- **GitHub's own stated removal reason says so → that cause** (PEN-6460). The
+  timeline's `RemovedFromMergeQueueEvent.reason` is the only input here that is
+  a *report* rather than an inference, and it outranks the run-outcome tests
+  below. Measured 2026-11-10 over the 60 most-recently-updated PRs, 29
+  removals: `failed_checks` 15, `merged` 7, `merge_conflict` 6, `manual` 1.
+  The field is **GraphQL-only** — the REST timeline event carries no `reason`
+  at all — and it is deliberately *not* consulted in the zero-run branch,
+  because a `requirements_unmet` admission rejection is also reported as
+  `failed_checks` and is the more useful thing to tell a reader,
 - **a run exists and concluded `failure` → `check_failure`** (the automatic
   shape above — should already have produced its own signal; a detector hit
   here means something upstream is missing evidence). The actor does *not*
   override this: a human who dequeues a PR whose run already failed still
   reports `check_failure`,
+- **a gating job failed inside a run that reads `cancelled` → `check_failure`**
+  (BLO-51600, widened by PEN-6460). Two shapes produce it: the orphan sweeper
+  cancels a run once a job has failed, and **a job killed by its own
+  `timeout-minutes` budget is recorded by GitHub as `cancelled`, never
+  `timed_out`** — so do not go looking for a red run. `verify` is the
+  discriminator, because `if: always() && !cancelled()` makes it FAIL on a
+  budget kill and read `cancelled` when the run was cancelled from outside
+  (measured 2026-11-10: #3591 `Build` cancelled at 25.4m/25m with `verify`
+  FAILURE, against #3586 with eleven sweeper-cancelled jobs and `verify`
+  CANCELLED),
 - **a run exists, did not fail, PR still unmerged → `manual`** (the stalled-head
   procedure's manual dequeue, or a GitHub-side timeout),
-- **the run-list lookup hit its 500-run sample cap with no match → `unknown`**
-  (an incomplete sample isn't proof of zero — don't guess conflict on a
-  truncated result; this is a deliberately conservative bailout, distinct
-  from the three real causes above).
+- **the cause could not be determined → `unknown`** (a deliberately
+  conservative bailout, distinct from the real causes above). Two things reach
+  it: the run-list lookup hit its 500-run sample cap with no match (an
+  incomplete sample isn't proof of zero — don't guess conflict on a truncated
+  result), or a `cancelled` run's job list could not be read at all, usually an
+  exhausted REST quota (PEN-6460; that probe used to answer "no job failed" on
+  a failed read, which reported the eviction as a manual dequeue). The notice
+  says which.
 
 #### Why `requirements_unmet` does not read `mergeable` (PEN-4887)
 
