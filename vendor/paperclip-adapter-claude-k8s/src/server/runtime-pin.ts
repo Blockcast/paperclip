@@ -57,7 +57,7 @@ export const CLAUDE_CODE_PACKAGE = "@anthropic-ai/claude-code";
  * client (the API error names the minimum). Operators can override per agent
  * with adapterConfig.claudeCodeVersion.
  */
-export const DEFAULT_CLAUDE_CODE_VERSION = "2.1.321";
+export const DEFAULT_CLAUDE_CODE_VERSION = "2.1.322";
 
 /** Config sentinel: run the CLI bundled in the container image, no bootstrap. */
 export const CLAUDE_CODE_RUNTIME_FROM_IMAGE = "image";
