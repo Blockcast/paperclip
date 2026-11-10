@@ -3934,7 +3934,28 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // Collapsing them is what made the first version of this segment unperformable: the
     // digest has to cover the raw description text, and the request body cannot BE that text.
     expect(markdown).toContain("It takes TWO files and they are not interchangeable");
-    expect(markdown).toContain("jq -Rs '{description: .}' desc.md > body.json");
+    // The encoder is itself a transcription, and the one published here until 2026-11-10 was a
+    // LOSSY one: jq-1.7's `-R` raw input replaces a multi-byte UTF-8 character straddling its
+    // ~4096-byte in-line read chunk with two U+FFFD, at exit 0 and `200 OK`. Measured destroying
+    // two characters in one 145 KB description write -- one of them inside a paragraph that write
+    // never touched, which is why it reads as somebody's bad paste rather than a transport fault.
+    // Reproduced synthetically: 2- and 3-byte characters corrupt from line-byte 4093 and 4-byte
+    // ones from 4092, while 4095 and the later chunk boundaries are clean, so there is no safe
+    // offset to code around and the fix has to be the encoder. The claim this transport is sold
+    // on -- "nothing is retyped, so nothing can be mistyped" -- is true of the HUMAN step and
+    // false of the ENCODER, which is the step it quietly substituted.
+    expect(markdown).toContain('python3 -I -c "import io,json;');
+    expect(markdown).toContain(
+      "json.dumps({'description':io.open('desc.md',encoding='utf-8').read()})",
+    );
+    expect(markdown).toContain("two U+FFFD REPLACEMENT CHARACTERS");
+    // Published as a PROHIBITION, not merely dropped. A command this directive taught for days is
+    // still reachable from memory and from every seat root that copied it, and three runs of one
+    // seat reached for it in a single day against a memory forbidding it -- a published command is
+    // re-taught every run where a correction only arrives on recall. So the text has to say the
+    // old one is wrong, not just stop saying it is right.
+    expect(markdown).toContain("Do NOT build it with `jq -Rs '{description: .}'`");
+    expect(markdown).not.toContain("by hand: `jq -Rs '{description: .}' desc.md > body.json`");
     // Both credential and content type, because dropping either one fails and they fail
     // DIFFERENTLY -- measured 2026-11-09T16:1xZ with a discriminating control on each arm.
     expect(markdown).toContain("Authorization: Bearer $PAPERCLIP_API_KEY");
