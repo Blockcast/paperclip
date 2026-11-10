@@ -3485,10 +3485,29 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("tracks the SHAPE of the document that arrived, never the cause");
     expect(markdown).toContain("prints NO headers without `-i`");
     expect(markdown).toContain("CANNOT be run on the probe's own response");
-    expect(markdown).toContain("is an artifact of the missing flag");
+    // Was pinned on "is an artifact of the missing flag". The third review pass widened
+    // that sentence from the missing `-i` flag to the RECIPE generally, so the old
+    // fragment no longer occurs. The CLAIM is unchanged and is still pinned, on both of
+    // its halves -- the `-i` half here and the truncation half below.
+    expect(markdown).toContain("on a call made WITHOUT `-i`");
     expect(markdown).toContain("`Retry-After` header is a SECONDARY rate limit");
     expect(markdown).toContain("the causes are open-ended");
     expect(markdown).toContain("refuses at rc 4 at full quota");
+    // PEN-6385 third review pass (Ally, Important). The header diagnostic used to end
+    // `| head -20`, which CUTS OFF the very header it tells the reader to look for:
+    // `gh api -i` prints headers alphabetically and the line they land on moves with the
+    // response -- `X-Ratelimit-Remaining` measured at line 22 on a 200 and line 19 on a
+    // permission-403. So the positional cut WORKED on one response and silently dropped
+    // the header on another, and a reader who saw no zero-remaining line would conclude
+    // it was not a rate limit and stand down -- the exact behaviour the next sentence
+    // forbids. Select by NAME instead; pinned so nobody reintroduces a positional cut.
+    expect(markdown).toContain("grep -iE '^(HTTP|x-ratelimit-|retry-after|x-accepted-github-permissions)'");
+    expect(markdown).toContain("never truncate with `head -n`");
+    expect(markdown).toContain("MOVES with the response");
+    expect(markdown).toContain("line 22 on a 200 and line 19 on a permission-403");
+    expect(markdown).toContain("Keep the `2>&1` or a transport error is hidden");
+    expect(markdown).toContain("is an artifact of the RECIPE");
+    expect(markdown).toContain("no `X-Ratelimit-Remaining` on a TRUNCATED one");
   });
 
   // PEN-5802. The head check above is push-scoped, and the directive's own verb list
