@@ -98,7 +98,7 @@ RUN usermod -u "$USER_UID" --non-unique node \
 # OpenCode 1.18.5 reverted unsafe OpenAI Responses phase handling that could hand
 # an intermediate response.in_progress frame to the final JSON parser. Keep the
 # replay smoke next to the pin so every runtime image proves the released binary.
-ARG CLAUDE_CODE_VERSION=2.1.321
+ARG CLAUDE_CODE_VERSION=2.1.322
 ARG CODEX_CLI_VERSION=0.167.0
 ARG OPENCODE_AI_VERSION=1.19.5
 ARG GEMINI_CLI_VERSION=0.50.0
