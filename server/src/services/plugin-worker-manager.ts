@@ -305,10 +305,18 @@ export function anthropicRoutingEnv(
  * Non-secret host settings forwarded to every plugin worker, only when set.
  * `PAPERCLIP_ALERTMANAGER_API_URL` is the deploy-time default for the
  * alertmanager plugin's `alertmanagerApiUrl` (BLO-42694); a value set in the
- * plugin's instance config still wins. Same narrow-allowlist rule as above:
- * never add a credential here.
+ * plugin's instance config still wins. `PAPERCLIP_PROMETHEUS_API_URL` is the
+ * same arrangement for that plugin's `prometheusApiUrl` (PEN-6236): the cover
+ * CLOSE path reads it to ask whether a source alertname still has any `ALERTS`
+ * series, which is the `pending` state Alertmanager cannot represent at all.
+ * Without it the close records `liveness_check_unconfigured` and closes a cover
+ * whose source may still be re-arming. Same narrow-allowlist rule as above:
+ * never add a credential here. Both of these are in-cluster base URLs.
  */
-const PLUGIN_PASSTHROUGH_ENV_KEYS = ["PAPERCLIP_ALERTMANAGER_API_URL"] as const;
+const PLUGIN_PASSTHROUGH_ENV_KEYS = [
+  "PAPERCLIP_ALERTMANAGER_API_URL",
+  "PAPERCLIP_PROMETHEUS_API_URL",
+] as const;
 
 export function pluginPassthroughEnv(
   source: NodeJS.ProcessEnv = process.env,
