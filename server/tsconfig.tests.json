@@ -17,6 +17,7 @@
     "src/__tests__/accepted-interaction-outcome-sweep-postgres.test.ts",
     "src/__tests__/access-column-projections.test.ts",
     "src/__tests__/agent-grants-routes.test.ts",
+    "src/__tests__/board-only-permission-keys.test.ts",
     "src/__tests__/agent-model-registry-validation.test.ts",
     "src/__tests__/agent-scope-pinned-config-keys-routes.test.ts",
     "src/__tests__/agent-pinned-config-keys-survive-heartbeat-mock.test.ts",
