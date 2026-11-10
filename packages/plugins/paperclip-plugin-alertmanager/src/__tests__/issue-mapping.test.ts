@@ -461,11 +461,39 @@ describe("buildIssueDescription", () => {
    * The notice is only useful if it names somewhere else to write. A version
    * trimmed to "machine-generated" tells a reader their text is doomed and
    * leaves them nowhere to put it, which is the state this row was filed from.
+   *
+   * The negative is the review finding, pinned. The first draft offered this
+   * row's own `monitorNotes` as the second carrier, which swaps one silently
+   * destroyed field for another on a different clock: the same plugin cancels
+   * the row when its alert resolves, the monitor is cleared as undeliverable
+   * and the notes go with it -- 13 of 13 measured destructions, every one
+   * paired with the plugin's own cancel (runbook Rule 2). A monitor that has
+   * to outlive the alert belongs on a row of the reader's own.
    */
-  it("names a durable alternative carrier in the notice", () => {
-    expect(MACHINE_RENDERED_NOTICE).toContain("COMMENT");
-    expect(MACHINE_RENDERED_NOTICE).toContain("monitorNotes");
-    expect(MACHINE_RENDERED_NOTICE).toContain("PEN-6404");
+  it("routes to a carrier that survives, and never to this row's monitor", () => {
+    // Positive first: a notice that only forbids leaves the reader nowhere to write.
+    expect(MACHINE_RENDERED_NOTICE).toContain("COMMENT on this row");
+    expect(MACHINE_RENDERED_NOTICE).toContain(
+      "runbooks/alertmanager-alert-row-status-volatility.md",
+    );
+
+    expect(MACHINE_RENDERED_NOTICE).not.toContain("monitorNotes");
+  });
+
+  /**
+   * This string renders into every alert row of every company that installs
+   * the plugin, so it may carry nothing true of only one of them.
+   *
+   * The delivery spacing is a property of each install's Alertmanager route
+   * (`group_interval`/`repeat_interval`) and not of this code -- the runbook
+   * measures it here and says in as many words not to quote the figure as a
+   * property of anything. An issue key resolves in exactly one company's
+   * identifier space and is a dead reference everywhere else. The runbook
+   * path is in this repo and reads the same from anywhere.
+   */
+  it("carries no per-install spacing figure and no company-scoped issue key", () => {
+    expect(MACHINE_RENDERED_NOTICE).not.toMatch(/\d+\s*-\s*\d+\s*min/);
+    expect(MACHINE_RENDERED_NOTICE).not.toMatch(/\b[A-Z]{2,}-\d+\b/);
   });
 
   /**
