@@ -19,6 +19,19 @@ RUN apt-get update -qq \
  && apt-get upgrade -y -qq \
  && rm -rf /var/lib/apt/lists/*
 
+# The upgrade above refreshes the nodesource `nodejs` deb, which re-ships its
+# own npm 10.9.x into /usr/lib/node_modules/npm over the npm@11.21.1 the base
+# installed there. That npm bundles the pacote, sigstore, ip-address,
+# brace-expansion and picomatch versions Harbor flags High (BLO-55433), so
+# re-pin it. Also drop what figma-bot never runs: webflow-bot's npm
+# playwright@1.49.1 (figma-bot drives Camoufox through the Python playwright
+# package), and the gstreamer "bad" plugins, whose CVE-2025-3887 has no fix and
+# which only Playwright's WebKit loads. dpkg --purge (not apt) fails the build
+# if anything still depends on them instead of removing the dependents too.
+RUN npm install -g --no-audit --no-fund npm@11.21.1 \
+ && rm -rf /app/node_modules /app/package.json /app/package-lock.json \
+ && dpkg --purge gstreamer1.0-plugins-bad libgstreamer-plugins-bad1.0-0
+
 # Copy the figma_bot package into the image. Build context is the
 # paperclip monorepo root (see docker-figma-bot.yml); paths below are
 # relative to that root.
