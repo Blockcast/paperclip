@@ -177,42 +177,66 @@ const PENDING_STATUS = "pending";
  * reads it: this query is scoped to `pending`, and the column has no
  * `$onUpdate` and no trigger, so it moves solely where a write sets it.
  *
- * ⚠ THAT PROOF NO LONGER HOLDS, and the re-runnable survey it was stated as is
- * what caught it (PEN-5818). The survey -- `grep -rn 'update(approvals)'
- * server/src --include='*.ts' | grep -v __tests__` -- returned eleven sites
- * when this constant was written, of which exactly one left a row `pending`
- * while touching `updated_at`: `resubmit`. It now returns TWELVE, and TWO
- * qualify. The new one is the in-place payload correction in
- * `services/approvals.ts` (`updatePayload`, the route behind
- * `PATCH /approvals/{id}`), which sets `payloadEditedAt` AND
- * `updatedAt` under a `where ... status = 'pending'` guard -- so it leaves the
- * row pending by construction. `services/agents.ts` is still the nearest miss
- * and is still harmless for the stated reason: it edits `payload` on pending
- * rows without setting `updated_at`.
+ * ⚠ THAT PROOF NO LONGER HELD, AND THIS EXPRESSION NOW DISCRIMINATES (PEN-6322).
+ * The re-runnable survey it was stated as is what caught it (PEN-5818). The
+ * survey -- `grep -rn 'update(approvals)' server/src --include='*.ts' | grep -v
+ * __tests__` -- returned eleven sites when this constant was written, of which
+ * exactly one left a row `pending` while touching `updated_at`: `resubmit`. It
+ * now returns TWELVE, and TWO qualify. The new one is the in-place payload
+ * correction in `services/approvals.ts` (`updatePayload`, the route behind
+ * `PATCH /approvals/{id}`), which sets `payloadEditedAt` AND `updatedAt` under a
+ * `where ... status = 'pending'` guard -- so it leaves the row pending by
+ * construction. `services/agents.ts` is still the nearest miss and is still
+ * harmless for the stated reason: it edits `payload` on pending rows without
+ * setting `updated_at`.
  *
- * So on a pending row `updated_at` no longer carries exactly one signal. It
- * carries "resubmitted" OR "payload corrected in place", and this expression
- * cannot tell them apart. The second is the opposite of what the gauge wants:
- * an in-place correction exists precisely so a filer can fix stale evidence
- * WITHOUT moving the card in the queue (see the route's own contract), and it
- * re-dates the age as though the card were freshly filed. The failure is in
- * the flattering direction -- the queue reads healthier every time a filer does
- * the diligent thing -- and three in-place amendments on the current band were
- * measured to be enough to clear a live `PaperclipApprovalStarved` page with
- * zero board decisions.
+ * So on a pending row `updated_at` carries "resubmitted" OR "payload corrected
+ * in place". The second is the opposite of what the gauge wants: an in-place
+ * correction exists precisely so a filer can fix stale evidence WITHOUT moving
+ * the card in the queue (see the route's own contract), and company policy
+ * forbids the withdraw-and-refile it replaces -- so re-dating the age from the
+ * correction punishes the sanctioned repair. The failure was in the FLATTERING
+ * direction: the queue read healthier every time a filer did the diligent thing,
+ * while a card left to rot preserved the signal perfectly.
  *
- * The discriminator already exists on the row and this expression does not yet
- * consult it: `payload_edited_at` equals `updated_at` exactly when the bump was
- * an in-place edit, which was clean on 7/7 of the pending band over 7d on
- * 2026-11-08. Fixing that is a query change and is tracked separately; this
- * comment and the gauge's HELP text are deliberately the only thing PEN-5818
- * moved, so the correction is not mistaken for a silent semantics change.
+ * Measured in production before this fix (2026-11-11, PEN-6322): pending card
+ * `e1b6747a`, filed 10-30T08:15:10Z and corrected in place twice on 11-10, was
+ * 11.923d old and read 0.797d here. Across the same queue 36 of 59 pending
+ * agent cards carried an in-place edit, and the >=7d starvation band read 5
+ * against a true 14 -- the band being the quantity the page exists to measure.
+ * The page survived only because the next anchor behind it (9.878d) still
+ * cleared the 7d threshold, which is luck about the band's depth.
  *
- * Note what did NOT catch this: no test does. `approval-queue-metrics.test.ts`
- * drives the revision->resubmit chain, but it sets `updatedAt` directly, so it
- * cannot distinguish which writer moved it. Re-running the survey above is
- * still the only control. Re-run it rather than trusting the count in this
- * paragraph, which is itself a measurement with a date on it.
+ * THE DISCRIMINATOR is `payload_edited_at`, written only by `updatePayload`:
+ * it equals `updated_at` exactly when the most recent bump was an in-place edit,
+ * and `resubmit` leaves it null. Clean on 59/59 of the pending queue with zero
+ * ambiguous rows on 2026-11-11, and agreeing exactly with the independent
+ * `payload_revision > 0` marker (36 rows by both).
+ *
+ * ⛔ THE `else` BRANCH MUST STAY `GREATEST(created_at, updated_at)`. Writing this
+ * as a three-way partition in which "never edited" ages from `created_at` is
+ * harmless for a genuinely untouched card and re-introduces, for a RESUBMITTED
+ * one, the exact overstatement #3477 removed. It is also the attractive mistake:
+ * on the 2026-11-11 queue it returned a head of 12.135d against the true 11.923d
+ * -- a LARGER, more alarming number -- and two seats reached for it
+ * independently that day before measuring.
+ *
+ * ⚠ RESIDUAL, recorded rather than silently accepted: a card RESUBMITTED and
+ * THEN corrected in place has its resubmit instant overwritten in `updated_at`,
+ * and no column retains it, so it ages from its original filing. That
+ * OVER-reports, which is the safe direction for a starvation alarm, and it is
+ * the one case this discriminator provably cannot recover. Empty on the
+ * 2026-11-11 queue (both resubmissions carried `payload_revision: 0`).
+ *
+ * What caught it, and what now holds it: `approval-queue-metrics.test.ts` drives
+ * BOTH real writers against this expression (`updatePayload` and `resubmit`) and
+ * asserts the age gauge for each. Before PEN-6322 no test did: the test named
+ * "ages a resubmitted card from its resubmission, not its original filing" never
+ * called `resubmit` -- it hand-seeded `updatedAt` -- while both tests that did
+ * call `svc.resubmit` asserted on the last-decision timestamp rather than on
+ * this gauge. The gap was a missing JOIN between the two, not a technique
+ * choice, which is why re-running the survey was the only control. It no longer
+ * is; the survey count in this comment is still a measurement with a date on it.
  *
  * GREATEST, not a bare `updated_at`, because `updated_at >= created_at` is a
  * convention and rows that violate it already exist: pending approval
@@ -227,7 +251,11 @@ const PENDING_STATUS = "pending";
  * and against that GREATEST is actively unhelpful, since it would prefer the
  * future timestamp. The two guards cover opposite ends and are both load-bearing.
  */
-const PENDING_SINCE = sql`greatest(${approvals.createdAt}, ${approvals.updatedAt})`;
+const PENDING_SINCE = sql`case
+  when ${approvals.payloadEditedAt} is not null and ${approvals.updatedAt} = ${approvals.payloadEditedAt}
+    then ${approvals.createdAt}
+  else greatest(${approvals.createdAt}, ${approvals.updatedAt})
+end`;
 
 /**
  * Refresh the board-approval-queue depth/staleness gauges (BLO-29850).

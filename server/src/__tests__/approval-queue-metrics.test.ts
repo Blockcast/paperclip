@@ -96,18 +96,22 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     gateSatisfied?: boolean | null;
     decisionNote?: string;
   }) {
-    await db.insert(approvals).values({
-      companyId: input.companyId,
-      requestedByAgentId: input.requestedByAgentId ?? null,
-      type: input.type ?? "request_board_approval",
-      status: input.status,
-      payload: input.gate ? { gate: input.gate } : {},
-      createdAt: input.createdAt,
-      updatedAt: input.updatedAt ?? input.createdAt,
-      decidedAt: input.decidedAt ?? null,
-      gateSatisfied: input.gateSatisfied ?? null,
-      decisionNote: input.decisionNote ?? null,
-    });
+    const [row] = await db
+      .insert(approvals)
+      .values({
+        companyId: input.companyId,
+        requestedByAgentId: input.requestedByAgentId ?? null,
+        type: input.type ?? "request_board_approval",
+        status: input.status,
+        payload: input.gate ? { gate: input.gate } : {},
+        createdAt: input.createdAt,
+        updatedAt: input.updatedAt ?? input.createdAt,
+        decidedAt: input.decidedAt ?? null,
+        gateSatisfied: input.gateSatisfied ?? null,
+        decisionNote: input.decisionNote ?? null,
+      })
+      .returning({ id: approvals.id });
+    return row!.id;
   }
 
   it("counts pending by type and ages the oldest off createdAt", async () => {
@@ -175,6 +179,129 @@ describeEmbeddedPostgres("refreshApprovalQueueMetrics (BLO-29850)", () => {
     expect(age).toBe(5_400);
     expect(age!).toBeLessThan(604_800);
     expect(series(body, APPROVALS_PENDING_METRIC, { ...agent, type: "request_board_approval", gated: "false" })).toBe(1);
+  });
+
+  /**
+   * PEN-6322. The two tests below drive the TWO REAL WRITERS that leave a row
+   * `pending` while moving `updated_at`, which is the whole point of them: the
+   * suite above seeds `updatedAt` by hand, so it cannot tell which writer moved
+   * it and is structurally blind to this defect. The survey comment on
+   * {@link PENDING_SINCE} was the only control; these replace it with a test.
+   *
+   * `updatePayload` is the in-place payload correction behind
+   * `PATCH /approvals/{id}`. It exists precisely so a filer can fix stale
+   * evidence WITHOUT moving the card in the queue, and company policy forbids
+   * the withdraw-and-refile it replaces -- so re-dating the age from the
+   * correction punishes the sanctioned repair. It degrades in the FLATTERING
+   * direction: the queue reads healthier every time a filer does the diligent
+   * thing, while a card left to rot preserves the signal perfectly.
+   *
+   * Observed in production before this fix: pending card `e1b6747a`, filed
+   * 2026-10-30T08:15:10Z and corrected in place twice on 2026-11-10, was 11.9
+   * days old and read 0.8 days on this gauge. Across the same queue 36 of 59
+   * pending cards carried an in-place edit and the >=7d starvation band read 5
+   * against a true 14.
+   */
+  it("ages a card corrected IN PLACE from its filing, not its correction (PEN-6322)", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId);
+    // Dated off the real clock, not `NOW`: `updatePayload` stamps `updated_at`
+    // with `new Date()`, so anchoring the filing to the fixed `NOW` would make
+    // the gap read as months rather than as the 8 days this case is about.
+    const filedAt = new Date(Date.now() - 8 * 86_400_000);
+    const approvalId = await insertApproval({
+      companyId,
+      status: "pending",
+      requestedByAgentId: agentId,
+      createdAt: filedAt,
+    });
+
+    // The real writer, not a hand-seeded column.
+    await approvalService(db).updatePayload(approvalId, { corrected: "in place" }, { agentId });
+
+    const row = await db
+      .select({
+        createdAt: approvals.createdAt,
+        updatedAt: approvals.updatedAt,
+        payloadEditedAt: approvals.payloadEditedAt,
+      })
+      .from(approvals)
+      .where(eq(approvals.id, approvalId))
+      .then((rows) => rows[0]!);
+    // The discriminator's premise, asserted rather than assumed: this writer
+    // sets both columns to the same instant, which is what distinguishes it
+    // from `resubmit` (which leaves `payload_edited_at` null).
+    expect(row.payloadEditedAt).not.toBeNull();
+    expect(row.updatedAt!.getTime()).toBe(row.payloadEditedAt!.getTime());
+
+    // Refresh a minute after the correction, so the expected values are exact
+    // rather than dependent on wall-clock drift during the test.
+    const refreshAt = new Date(row.updatedAt!.getTime() + 60_000);
+    await refreshApprovalQueueMetrics(db, refreshAt);
+    const { body } = await renderMetrics();
+
+    const age = series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, {
+      ...agent,
+      type: "request_board_approval",
+      gated: "false",
+    });
+    // Derived from the row's own stored `created_at` so the expectation is exact
+    // rather than racing the millisecond the insert landed on. The gauge carries
+    // sub-second precision, so compare to the millisecond rather than rounding.
+    const sinceFiling = (refreshAt.getTime() - row.createdAt!.getTime()) / 1000;
+    expect(age).toBeCloseTo(sinceFiling, 3);
+    // ~8 days, not the ~60s the correction would have reset it to.
+    expect(age).toBeGreaterThan(691_000);
+    // And specifically still ABOVE the 7d PaperclipApprovalStarved threshold:
+    // before this fix the correction reset it to 60s and cleared the page.
+    expect(age!).toBeGreaterThan(604_800);
+  });
+
+  /**
+   * The guard on the fix itself, and the reason the `else` branch must stay
+   * `GREATEST(created_at, updated_at)` rather than collapsing to `created_at`.
+   *
+   * A genuine resubmission IS a new board-owned wait and must still reset the
+   * clock -- that is BLO-29850/#3477's behaviour and this must not regress it.
+   * Implementing PEN-6322 as a three-way partition in which "never edited"
+   * ages from `created_at` re-introduces the exact overstatement #3477 removed,
+   * and it does so while producing a LARGER, more alarming number, which is why
+   * two seats reached for it independently on 2026-11-11 before measuring.
+   */
+  it("still ages a RESUBMITTED card from its resubmission, driving the real resubmit writer (PEN-6322)", async () => {
+    const companyId = await insertCompany();
+    const agentId = await insertAgent(companyId);
+    const filedAt = new Date(NOW.getTime() - 8 * 86_400_000);
+    const approvalId = await insertApproval({
+      companyId,
+      status: "revision_requested",
+      requestedByAgentId: agentId,
+      createdAt: filedAt,
+      updatedAt: filedAt,
+    });
+
+    await approvalService(db).resubmit(approvalId);
+
+    const row = await db
+      .select({ updatedAt: approvals.updatedAt, payloadEditedAt: approvals.payloadEditedAt })
+      .from(approvals)
+      .where(eq(approvals.id, approvalId))
+      .then((rows) => rows[0]!);
+    // `resubmit` moves `updated_at` and leaves `payload_edited_at` null; that
+    // asymmetry is the entire discriminator.
+    expect(row.payloadEditedAt).toBeNull();
+
+    const refreshAt = new Date(row.updatedAt!.getTime() + 60_000);
+    await refreshApprovalQueueMetrics(db, refreshAt);
+    const { body } = await renderMetrics();
+
+    const age = series(body, APPROVAL_OLDEST_PENDING_AGE_METRIC, {
+      ...agent,
+      type: "request_board_approval",
+      gated: "false",
+    });
+    expect(age).toBe(60);
+    expect(age!).toBeLessThan(604_800);
   });
 
   // The guard on the fix itself: GREATEST must not let a backdated `updated_at`
