@@ -10,6 +10,7 @@ import {
   classifyAdmissionEvidence,
   ghDequeueReason,
   ghHeadChecks,
+  ghQueueMembership,
   ghRunHasFailedJob,
   classifyMergeQueueEviction,
   extractPaperclipIdentifiers,
@@ -22,6 +23,7 @@ import {
   MERGE_GROUP_GATING_JOBS,
   MERGE_QUEUE_DEQUEUE_REASON_CAUSES,
   mergeQueueHeadBranchPrefix,
+  QUEUE_MEMBERSHIP_QUERY,
   selectDequeueReasonAt,
   selectLatestQueueAttemptWindow,
 } from "../merge-queue-eviction-detector.mjs";
@@ -1672,4 +1674,266 @@ test("PEN-6460: the check_failure notice does not promise a `failure` run, and p
   });
   assert.ok(!/stated removal reason/.test(noReason));
   assert.match(noReason, /\(3 `merge_group` run\(s\) found for this PR's queue head at Blockcast\/paperclip\.\)/);
+});
+
+
+// ---------------------------------------------------------------------------
+// PEN-5530: the notice's ACTION line never read whether the PR was already
+// back in the queue.
+//
+// Measured on #3215 (2026-11-04): removed 12:23:33Z, re-enqueued 12:23:41Z
+// (+8s), notice posted 12:25:13Z -- 92s after the PR was back at queue
+// position 1 with a `merge_group` build 80s into its run. The notice told its
+// reader to confirm the hold was over and re-add. Both offered actions EJECT
+// the live entry and void that build, so this was not a stale sentence: it
+// was a destructive instruction that read as routine.
+// ---------------------------------------------------------------------------
+
+const REQUEUED = Object.freeze({ inQueue: true, position: 1, enqueuedAt: "2026-11-04T12:23:41Z" });
+const NOT_QUEUED = Object.freeze({ inQueue: false, position: null, enqueuedAt: null });
+
+const EVICTION_BODY_BASE = Object.freeze({
+  repo: "Blockcast/paperclip",
+  prNumber: 3215,
+  base: "master",
+  mergeGroupRunCount: 1,
+  identifiers: ["PEN-5530"],
+});
+
+// The two literal instruction openings, and the `requirements_unmet` variant.
+// Asserted as the INSTRUCTION rather than as the bare word "re-add", because
+// the already-queued action line legitimately contains "do **not** re-add it"
+// -- a test keyed on the word alone would pass on a notice that still told
+// the reader to re-add, and fail on the one that tells them not to.
+const RE_ADD_INSTRUCTION = /Re-add this PR to the merge queue|then re-add --/;
+
+test("PEN-5530 (Done-when 1-3): dequeue -> re-enqueue -> comment drops the re-add instruction", () => {
+  const body = buildEvictionCommentBody({
+    ...EVICTION_BODY_BASE,
+    classification: "manual",
+    dequeueActor: "allyblockcast[bot]",
+    queueMembership: REQUEUED,
+  });
+
+  assert.ok(
+    !RE_ADD_INSTRUCTION.test(body),
+    `a PR already back in the queue must not be told to re-add; got:\n${body}`,
+  );
+  assert.match(body, /already back in the merge queue/);
+  assert.match(body, /Do \*\*not\*\* re-add it/);
+  assert.match(body, /eject the live entry/);
+  // Done-when 2: "says so plainly" -- with the timestamp and position, which
+  // is what lets a reader confirm it against their own read.
+  assert.match(body, /back in the `master` merge queue/);
+  assert.match(body, /re-added at 2026-11-04T12:23:41Z/);
+  assert.match(body, /position 1/);
+
+  // The CAUSE is unchanged: why the PR left the queue is history, and being
+  // re-enqueued does not reinterpret it. Only the action line moves.
+  assert.match(body, /manual \/ administrative dequeue/);
+});
+
+test("PEN-5530: the membership check binds EVERY classification, not just `manual`", () => {
+  // The row scoped Done-when 1 to the `manual` cause, but every branch of the
+  // action line ends in a re-add instruction and the harm -- ejecting a live
+  // entry and voiding its build -- is a property of the CURRENT queue state,
+  // never of why the PR left. A fix that covered only `manual` would leave
+  // the identical destructive instruction on four other classifications.
+  for (const classification of [
+    "manual",
+    "check_failure",
+    "conflict_unstageable",
+    "requirements_unmet",
+    "unknown",
+  ]) {
+    const body = buildEvictionCommentBody({
+      ...EVICTION_BODY_BASE,
+      classification,
+      dequeueActor: "allyblockcast[bot]",
+      queueMembership: REQUEUED,
+    });
+    assert.ok(
+      !RE_ADD_INSTRUCTION.test(body),
+      `classification \`${classification}\` still instructs a re-add while queued; got:\n${body}`,
+    );
+    assert.match(body, /already back in the merge queue/);
+  }
+});
+
+test("PEN-5530: an UNREADABLE membership read never fabricates either claim", () => {
+  // The tri-state is the whole safety property. `null` is not `false`:
+  // `false` is a positive claim that the PR is out of the queue, and it is
+  // what licenses printing the re-add instruction. A 403, an exhausted quota,
+  // a schema error or a PR that does not resolve must restore the
+  // pre-PEN-5530 notice exactly and say plainly that it could not look.
+  const unreadable = buildEvictionCommentBody({
+    ...EVICTION_BODY_BASE,
+    classification: "manual",
+    dequeueActor: "allyblockcast[bot]",
+    queueMembership: null,
+  });
+  assert.match(unreadable, RE_ADD_INSTRUCTION);
+  assert.match(unreadable, /could not be read/);
+  assert.ok(!/already back in the merge queue/.test(unreadable), "an unreadable probe must assert nothing");
+
+  // A caller that passes no membership at all (every pre-PEN-5530 call site)
+  // is the same case, and must behave identically.
+  const omitted = buildEvictionCommentBody({
+    ...EVICTION_BODY_BASE,
+    classification: "manual",
+    dequeueActor: "allyblockcast[bot]",
+  });
+  assert.match(omitted, RE_ADD_INSTRUCTION);
+
+  // A genuine `false` is the one reading that licenses the re-add line.
+  const out = buildEvictionCommentBody({
+    ...EVICTION_BODY_BASE,
+    classification: "manual",
+    dequeueActor: "allyblockcast[bot]",
+    queueMembership: NOT_QUEUED,
+  });
+  assert.match(out, RE_ADD_INSTRUCTION);
+  assert.match(out, /not in the `master` merge queue/);
+  assert.ok(!/could not be read/.test(out), "a successful `false` read is not an unreadable one");
+});
+
+test("PEN-5530 (the #3591 bound): the notice tells its reader to re-read membership before acting", () => {
+  // A write-time membership read is necessary and NOT sufficient. Measured
+  // 2026-11-10 on #3591: the notice was accurate for 4m40s, and the run that
+  // acted on it did so ~8 minutes later, by which time the PR had been back
+  // in the queue for ~8 minutes. Queue membership is CYCLIC, so every
+  // statement this notice makes about it is a dated reading with a short
+  // half-life -- the only part that survives reader latency is telling the
+  // reader to take the reading again.
+  for (const queueMembership of [REQUEUED, NOT_QUEUED, null]) {
+    const body = buildEvictionCommentBody({
+      ...EVICTION_BODY_BASE,
+      classification: "manual",
+      dequeueActor: "allyblockcast[bot]",
+      queueMembership,
+    });
+    assert.match(body, /not a standing fact/);
+    assert.match(body, /Re-read it immediately before you act/);
+    // And it must name the field that reports it. `gh pr view` has no
+    // `isInMergeQueue`, and `mergeStateStatus` does not report membership
+    // (measured: `CLEAN` on a queued PR), so a reader handed either would
+    // check the wrong thing and conclude the queue was empty.
+    assert.match(body, /isInMergeQueue/);
+    assert.match(body, /gh api graphql/);
+    assert.match(body, /number:3215/);
+  }
+});
+
+test("PEN-5530: queue membership is read over GraphQL, and refuses rather than guessing", () => {
+  // Asserted behaviourally through the `exec` seam rather than by grepping
+  // the query text, which a dropped result would also satisfy.
+  const calls = [];
+  const exec = (args) => {
+    calls.push(args.join(" "));
+    return '{"inQueue":true,"position":1,"enqueuedAt":"2026-11-04T12:23:41Z"}\n';
+  };
+
+  assert.deepEqual(ghQueueMembership("Blockcast/paperclip", 3215, exec), {
+    inQueue: true,
+    position: 1,
+    enqueuedAt: "2026-11-04T12:23:41Z",
+  });
+  assert.equal(calls.length, 1);
+  assert.ok(calls[0].includes("gh api graphql"), `expected a GraphQL read; got: ${calls[0]}`);
+  assert.ok(calls[0].includes("isInMergeQueue"), `the query must select membership; got: ${calls[0]}`);
+  assert.ok(calls[0].includes("number=3215"), `the PR number must be bound as a variable; got: ${calls[0]}`);
+  assert.match(QUEUE_MEMBERSHIP_QUERY, /mergeQueueEntry/);
+
+  // Not in the queue: a real reading, and distinguishable from a failed one.
+  assert.deepEqual(
+    ghQueueMembership("Blockcast/paperclip", 3215, () => '{"inQueue":false,"position":null,"enqueuedAt":null}\n'),
+    { inQueue: false, position: null, enqueuedAt: null },
+  );
+
+  // Every failure shape collapses to `null`, never to `inQueue: false`.
+  // The third case is the one measured live against the API: a PR that does
+  // not resolve returns `{"data":{"repository":{"pullRequest":null}}}` at
+  // EXIT 0, so the jq projection yields nulls and only the boolean guard
+  // refuses it.
+  assert.equal(
+    ghQueueMembership("Blockcast/paperclip", 3215, () => {
+      throw new Error("HTTP 403");
+    }),
+    null,
+  );
+  assert.equal(ghQueueMembership("not-a-repo", 3215, exec), null);
+  assert.equal(
+    ghQueueMembership("Blockcast/paperclip", 3215, () => '{"inQueue":null,"position":null,"enqueuedAt":null}\n'),
+    null,
+  );
+  assert.equal(ghQueueMembership("Blockcast/paperclip", 3215, () => ""), null);
+  assert.equal(
+    ghQueueMembership("Blockcast/paperclip", 3215, () => '{"message":"API rate limit exceeded"}\n'),
+    null,
+  );
+});
+
+test("PEN-5530: main() reads membership and threads it into the notice", () => {
+  // Same guard shape as the PEN-6460 handoff test: every assertion above
+  // passes membership to `buildEvictionCommentBody` directly, so a main()
+  // that forgot to read it would leave this suite green while every live
+  // notice kept telling queued PRs to re-add.
+  const source = readFileSync(DETECTOR_SOURCE_PATH, "utf8");
+  const handoffs = source.match(/^\s*queueMembership,$/gm) ?? [];
+  assert.equal(
+    handoffs.length,
+    2,
+    "expected `queueMembership` shorthand at exactly two sites -- the printed result and " +
+      `\`buildEvictionCommentBody\` -- found ${handoffs.length}.`,
+  );
+  assert.match(
+    source,
+    /const queueMembership = ghQueueMembership\(repo, prNumber\)/,
+    "membership must be read in main(), not assumed by the caller",
+  );
+  // Deliberately NOT handed to the classifier: the classification explains
+  // why the PR LEFT the queue, which is history and cannot be changed by what
+  // the queue looks like now. Only the action line depends on the present.
+  const classifierCall = source.slice(
+    source.indexOf("const classification = classifyMergeQueueEviction({"),
+    source.indexOf("const unknownReason ="),
+  );
+  assert.ok(
+    !/queueMembership/.test(classifierCall),
+    "membership must not reach the classifier -- it would let a re-enqueue rewrite the cause",
+  );
+});
+
+test("PEN-5530 (Done-when 5): the check_failure cause does not assert WHERE the failing check lives", () => {
+  // Handed off from PEN-6460. GitHub's `reason: failed_checks` says a
+  // required check for the queue head did not pass; it does NOT say the check
+  // was produced by the `merge_group` run, and a required context can be
+  // posted at the queue head by something that is not a `merge_group`
+  // workflow. Measured LATENT on this repo -- 47 `failed_checks` removals
+  // 2026-11-04..11, and on 47 of 47 the failing check was a job inside a run
+  // the reader could open -- so this is a precision fix, not a live
+  // misdirection, and it ships here because this row already edits these
+  // cause lines.
+  const body = buildEvictionCommentBody({
+    ...EVICTION_BODY_BASE,
+    classification: "check_failure",
+    dequeueReason: "failed_checks",
+    queueMembership: NOT_QUEUED,
+  });
+  assert.ok(
+    !/required check on it did not pass/.test(body),
+    "`on it` asserts the failing check belongs to the merge_group run, which the reason does not entail",
+  );
+  assert.match(body, /a required check for this PR's queue head did not pass/);
+  // That a run EXISTS is still entailed and still stated: the zero-run branch
+  // of classifyMergeQueueEviction returns before `check_failure` is
+  // reachable, so this classification implies at least one run. Dropping that
+  // sentence would cost the reader the one place to start looking.
+  assert.match(body, /A `merge_group` run was created for this head/);
+  assert.match(body, /start there/);
+  // The reader gets the fallback for the case the over-specification hid.
+  assert.match(body, /If every run is clean/);
+  // PEN-6460's cancelled-vs-failure teaching is load-bearing and survives.
+  assert.match(body, /timeout-minutes/);
+  assert.ok(!/concluded failing/.test(body), "the run itself is often `cancelled`, not `failure`");
 });
