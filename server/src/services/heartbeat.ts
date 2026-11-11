@@ -37359,8 +37359,16 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // here is the one the route guards will test — a wake that coalesced onto a queued
       // status-only one is therefore announced as what it will actually execute as.
       recoveryRunWriteClassNotice: recoveryRunWriteClassNotice(context),
-      // PEN-6271: supplied only while the monitor is `triggered`, so the directive
-      // fires exactly for the run the monitor woke. Derived through the same
+      // PEN-6271: supplied whenever the row DERIVES as `triggered` at the moment
+      // this run's prompt is built -- which is ANY run in that window, not only
+      // the one the monitor woke. That breadth is deliberate and must not be
+      // narrowed: the obligation is a property of the ROW, so a run that arrives
+      // on a `triggered` row and ends without discharging it produces the same
+      // `trigger_stalled` clear and the same recovery wake whatever woke it.
+      // Keying this on the wake reason instead (`context.wakeReason` is in scope
+      // here) would silence the directive for exactly the runs least likely to
+      // know they are holding an obligation -- a comment-woken or park-expiry run
+      // that never saw the fire. Derived through the same
       // `derivePersistedMonitorState` the sweep uses, over the `monitor*` columns
       // AND `executionState` that `getIssueExecutionContext` selects -- the columns
       // take precedence there, so reading the JSON alone would be a different
