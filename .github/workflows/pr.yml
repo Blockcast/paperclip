@@ -1516,6 +1516,16 @@ jobs:
         run: pnpm run test:measure-cancelled-monitor-recovery
         timeout-minutes: 1
 
+      # PEN-5828. Pins the per-shape residual reporting in
+      # scripts/residual-report.mjs: that the group-count bins cannot collapse
+      # back to a family average, and that a 0/0 rate ("the detector never
+      # fired") stays distinguishable from a measured 0 ("it fired and the
+      # conjunct held"). Both are live in isGitRefName's own grid.
+      - name: Test residual per-shape reporting (PEN-5828)
+        if: ${{ !cancelled() }}
+        run: pnpm run test:residual-report
+        timeout-minutes: 1
+
       - name: Verify release package bootstrap for changed manifests
         if: ${{ !cancelled() }}
         run: |

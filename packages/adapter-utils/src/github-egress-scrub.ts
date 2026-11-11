@@ -700,6 +700,31 @@ const GIT_OBJECT_NAME_VALUE_NAMES = new Set([
  *    base36, 3-4 varying groups of 3-9, `.` ...................... 2.96e-3
  *    k8s suffix alphabet, 3-5 varying groups of 3-9, `-` ......... 9.85e-3
  *
+ *  THE k8s SUFFIX ALPHABET IS `bcdfghjklmnpqrstvwxz2456789` — 20 consonants
+ *  and 7 digits, vowels and ambiguous glyphs removed. It is
+ *  `k8s.io/apimachinery/pkg/util/rand`'s `alphanums`, which is what the
+ *  apiserver draws a generated name suffix from. Recorded here because it
+ *  appears nowhere in this repository, so the row above was the one published
+ *  figure that could not be reproduced from the tree alone — PEN-3920 6.5 now
+ *  requires that every published residual generator can be, and that a
+ *  borrowed alphabet names its source.
+ *
+ *  ⛔ PEN-5828: THE ROW ABOVE IS A FAMILY AVERAGE over 3/4/5 groups, whose
+ *  bins are not equally reachable — measured population 0.161 / 0.793 / 0.988,
+ *  the low bin starved by the same HIGH_ENTROPY_MIN_LENGTH floor that starves
+ *  `isGitRefName`'s. Per shape the worst is FIVE groups at 1.99e-2, 95% CI
+ *  [1.92e-2, 2.06e-2] on 2988 of 150,000 trials; 2.02e-2 [1.94e-2, 2.09e-2]
+ *  against the population denominator. Dilution 2.06x. The mixture itself
+ *  re-measures at 9.68e-3 against the 9.85e-3 published, so that figure is
+ *  sound — it is the SHAPE it averages over that was missing.
+ *
+ *  ⚠ MEASURE THIS UNDER AN ANCHORED NAME THAT IS NOT `pod`. `pod` additionally
+ *  carries `isGeneratedPodName` (PEN-5921), so anchoring a re-measurement
+ *  there reports the UNION of two rules and not this one: the same sweep reads
+ *  1.43e-2 under `pod` against 9.68e-3 under `instance`, and the whole gap is
+ *  the other rule. The populations are identical either way, so nothing in the
+ *  output says which rule you measured.
+ *
  *  Every FLAT token family is zero: a credential is one opaque run, and one
  *  run reaches neither the word mass nor the segment floor. Also measured: 28
  *  real credential formats (GitHub PAT classic and fine-grained, Slack, Stripe,
@@ -1216,7 +1241,7 @@ function shannonEntropyBitsPerChar(value: string): number {
  *     mixed-case letters, 6- and 8-character runs ........... 8.0e-6–3.2e-5
  *     mixed-case letters or base62, 4-character runs ................. 0
  *
- * For scale: `isLexicalIdentifier` carries 2.96e-3 to 3.57e-3 name-free today,
+ * For scale: `isLexicalIdentifier` carries 2.91e-3 to 3.57e-3 name-free today,
  * and the name-ANCHORED Kubernetes rule above carries up to 9.85e-3. The worst
  * family here is 7.2e-5, roughly forty times below the name-free exemption
  * this file already ships.
@@ -1427,7 +1452,7 @@ const GIT_REF_MAX_COMPONENTS = 4;
  *  10 publishes 518 of those 847 and carries 7.25e-3, 14 publishes 511 and
  *  carries 2.33e-3, 16 publishes 502 and carries 2.30e-3. So 14 buys a 3x
  *  reduction in residual for seven real branches out of 518, and 16 buys
- *  nothing further while costing nine more. Full table: PEN-3920 11.3.
+ *  nothing further while costing nine more. Full table: PEN-3920 12.3.
  *
  *  DO NOT LOWER THIS TO 10 on the strength of the corpus minimum alone — that
  *  is the 7.25e-3 row above, about 3x the shipped residual. A failing mutation
@@ -1463,7 +1488,9 @@ const GIT_REF_MIN_WORD_MASS = 14;
  * values per family, fraction NEWLY exonerated under the `--force-with-lease`
  * anchor, i.e. values the shipped detector refuses that this rule admits.
  * Reproduce with `scripts/measure-force-with-lease-residual.mjs`; the full
- * table and the knee analysis are in PEN-3920 §11.3.
+ * table and the knee analysis are in PEN-3920 §12.3. (§11.3 until PEN-6152
+ * inserted D9 ahead of this section — a cross-reference, not a figure, but it
+ * now resolves to a different rule's refusal analysis.)
  *
  *   base64url, base62, base36, base32, hex upper and lower, mixed-case
  *   letters, alphanumeric, at 24 / 32 / 43 / 64 characters .......... 0 each
@@ -1486,10 +1513,64 @@ const GIT_REF_MIN_WORD_MASS = 14;
  * holding it are GIT_REF_MIN_WORD_MASS and GIT_REF_MAX_COMPONENTS — without
  * them the same families measure 8.5e-3.
  *
- * For scale, `isLexicalIdentifier` carries 2.96e-3 to 3.57e-3 NAME-FREE today,
- * and the name-anchored Kubernetes rule up to 9.85e-3 under an anchor of eight
- * common label names. This sits below both, under an anchor of one literal
- * flag.
+ * ⛔ PEN-5828: EVERY FIGURE ABOVE IS A FAMILY AVERAGE OVER AN UNEVENLY
+ * REACHABLE MIXTURE, and the worst reachable SHAPE is what PEN-3920 6.5 now
+ * requires. The generator drew its component count at random per trial, and
+ * for the worst family two of the three bins contribute exactly zero — one
+ * below HIGH_ENTROPY_MIN_LENGTH so the detector never fired, one refused by
+ * GIT_REF_MAX_COMPONENTS — so 2.33e-3 is the hot bin divided by three. Per
+ * shape, mixed-case letters chopped by `/` into ~6-character runs at FOUR
+ * components measures 6.88e-3, 95% CI [6.65e-3, 7.11e-3], pooled 3439 over
+ * 500,000 trials across five independent runs and three seats; 6.96e-3
+ * against the population denominator. Dilution 3.000x, exact rather than
+ * approximate. Nothing newly REFUSED anywhere: 0 across every cell.
+ *
+ * ⛔ AND THE GRID WAS BLIND TO ITS OWN HOT REGION. Two of its three chopped
+ * alphabets were BYTE-IDENTICAL (`base36` and `lower-alnum` were both
+ * lowercase+digits), so it sampled two letter densities, not three: 72% and
+ * 100%. The residual peaks BETWEEN them. Replacing the duplicate with base32
+ * (`A-Z234567`, 81% letters — enough digits to escape `isLexicalIdentifier`'s
+ * exoneration and so stay IN population, enough letters to clear the word-mass
+ * floor) measures a worst shape of 4.40e-2 at `/` ~6-char runs x4 — 6.3x the
+ * figure above, and reachable by a REAL base32 credential: an RFC 4648 TOTP
+ * seed chopped the same way measures 4.33e-2, against 0/50,000 for the same
+ * seed in its native flat form.
+ *
+ * ⚠ THAT IS A NUMBER, NOT A DECISION, AND NO CONSTANT MOVED FOR IT. The
+ * threat-model verdict below is unchanged — a flat credential of any alphabet
+ * still measures 0, and reaching 4.40e-2 still means deliberately slicing a
+ * secret across slashes. What it does change is the comparison that used to
+ * close this comment, which is withdrawn:
+ *
+ *     WITHDRAWN PEN-5828: "For scale, `isLexicalIdentifier` carries 2.96e-3 to
+ *     WITHDRAWN PEN-5828: 3.57e-3 NAME-FREE today, and the name-anchored
+ *     WITHDRAWN PEN-5828: Kubernetes rule up to 9.85e-3 under an anchor of
+ *     WITHDRAWN PEN-5828: eight common label names. This sits below both,
+ *     WITHDRAWN PEN-5828: under an anchor of one literal flag."
+ *
+ * It compared a family average here against family averages there, and BOTH
+ * reference figures are themselves diluted mixtures (PEN-3920 6.3 and 9.4).
+ * Like-for-like, worst shape against worst shape and on the SAME population
+ * denominator: `isLexicalIdentifier` carries 6.21e-3 [5.46e-3, 6.95e-3] and
+ * `isKubernetesObjectName` 2.02e-2 [1.94e-2, 2.09e-2]. Against those, the
+ * three originally-published alphabets put this rule WITHIN MEASUREMENT ERROR
+ * of `isLexicalIdentifier` (6.96e-3) and ~2.9x below the Kubernetes rule — 65%
+ * headroom, not the ~30% a diluted 9.85e-3 implies — while base32 puts it
+ * ~2.2x ABOVE the Kubernetes rule. Whether the floor should move on that
+ * evidence is NOT decided here, and no constant moved for it: the corpus half
+ * of that trade — what a higher floor costs in real branch names — is
+ * unmeasured, and a residual table alone cannot settle a floor. See PEN-5828
+ * and PEN-3920 12.3a.
+ *
+ * ⛔ Do NOT write an ORDERING against `isLexicalIdentifier` in either
+ * direction, and do NOT write a ratio. The sign is not established and it is
+ * not a question of sample size: the two operands sit on very different
+ * population fractions (0.99 here against 0.43 there), so the comparison
+ * INVERTS with the denominator — 1.12x on the population denominator, 1.76x
+ * the other way. An ordering becomes available only if both operands are
+ * restated on one denominator at one evidential standard. "Within measurement
+ * error" is the whole claim. The Kubernetes half IS ordering-safe: no
+ * plausible correction to it closes a 2.9x gap.
  *
  * WHAT IT ADMITS, stated plainly. A deliberately constructed value — a secret
  * chopped into short case-homogeneous word-shaped runs and spelled as a branch
@@ -1720,6 +1801,24 @@ const LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH = 3 * LEXICAL_LONG_SEGMENT_LENGTH;
  * Those figures predate the mixed-segment branch and hold for the all-plain
  * path only; that branch's own residual is on MIXED_LEXICAL_SEGMENT_RE.
  * A UUID stays opaque, because `386c81e8` is neither a word nor a number.
+ *
+ * ⛔ PEN-5828: THE NAME-FREE RESIDUAL THIS RULE IS QUOTED AT ACROSS THE FILE —
+ * "2.91e-3 to 3.57e-3" — IS A BRACKET OVER THREE FAMILY AVERAGES, each itself
+ * a mixture over 4-6 (or 4-5) groups whose bins are not equally reachable;
+ * measured population runs 0.43 / 0.89 / 0.99, the low bin starved by
+ * HIGH_ENTROPY_MIN_LENGTH. Per shape, the worst is 3-7 characters at FOUR
+ * groups: 6.21e-3, 95% CI [5.46e-3, 6.95e-3], on 266 of 42,870 in-population
+ * draws. Baseline is this predicate neutered in a copy of this module, so
+ * "newly exonerated" means exonerated BY THIS RULE and not by something else.
+ * Re-measured mixtures 2.45e-3 / 2.89e-3 / 3.27e-3 against the published
+ * 2.96e-3 / 2.91e-3 / 3.57e-3 — the published figures reproduce; it is the
+ * SHAPE they average over that was missing. PEN-3920 6.3 and 6.5.
+ *
+ * ⚠ The denominator is load-bearing when this figure is used "for scale"
+ * against another rule. On the population denominator the worst shape is
+ * 6.21e-3; on a raw trial denominator it is 3.90e-3, because the hot bin runs
+ * a population of only 0.43. Quote which one, or a comparison built on it
+ * inherits a factor of 1.6 nobody can see.
  */
 function isLexicalIdentifier(value: string): boolean {
   const segments = value.split(/[-._]/);

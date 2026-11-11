@@ -327,6 +327,42 @@ the cost:
 | 2-8 chars, 4-6 groups, `_` | 2.91e-3 | **1.19e-2** | 2.49e-2 |
 | 3-7 chars, 4-5 groups, `-` | 3.57e-3 | **1.54e-2** | 3.34e-2 |
 
+**PEN-5828: the cap=1 column is a FAMILY AVERAGE, and the bracket quoted from it
+elsewhere excluded one of its own rows.** This document and
+`github-egress-scrub.ts` both quoted `isLexicalIdentifier` as carrying *"2.96e-3
+to 3.57e-3"*; the `_` row above measures **2.91e-3**, below that lower bound. The
+bracket is **2.91e-3 to 3.57e-3** and is corrected everywhere it appears.
+
+Per shape, with the group count pinned instead of drawn per trial, and against
+the population denominator — the draws the detector would otherwise redact,
+which are the only ones this exemption can save:
+
+| family | groups | population | per-population | per-trial |
+|---|---|---|---|---|
+| 2-8 chars, `-` | 4 | 0.450 | 5.29e-3 | 2.38e-3 |
+| 2-8 chars, `-` | 5 | 0.885 | 3.56e-3 | 3.15e-3 |
+| 2-8 chars, `-` | 6 | 0.991 | 1.84e-3 | 1.82e-3 |
+| 2-8 chars, `_` | 4 | 0.452 | 6.11e-3 | 2.76e-3 |
+| 2-8 chars, `_` | 5 | 0.883 | 4.42e-3 | 3.90e-3 |
+| 2-8 chars, `_` | 6 | 0.991 | 2.03e-3 | 2.01e-3 |
+| **3-7 chars, `-`** | **4** | **0.429** | **6.21e-3** | 2.66e-3 |
+| 3-7 chars, `-` | 5 | 0.958 | 4.05e-3 | 3.88e-3 |
+
+100,000 trials per shape against the shipped module at `master`, 2026-11-11;
+baseline is this predicate neutered in a copy of the module, so *newly
+exonerated* means exonerated **by this rule** and not by something else. The
+re-measured mixtures are 2.45e-3 / 2.89e-3 / 3.27e-3 against the published
+2.96e-3 / 2.91e-3 / 3.57e-3, so **the published figures reproduce** — what was
+missing is the shape they average over.
+
+**Worst shape 6.21e-3, 95% CI [5.46e-3, 6.95e-3]** (266 of 42,870 in-population
+draws), at 3-7 characters and four groups. ⚠ **The denominator is load-bearing
+whenever this figure is quoted "for scale" against another rule**: the hot bin
+runs a population of 0.43, so the same cell reads 3.90e-3 per trial. A
+comparison that takes one rule's per-population worst shape against another's
+per-trial worst shape inherits a factor of ~1.6 that nothing in either number
+discloses.
+
 Raising the cap from 1 to 2 is a consistent **4x widening**, and it applies under every
 binding name in the fleet. Note the measurement trap for anyone re-deriving this: with
 *fixed*-length segment generators the cap appears to cost exactly nothing (identical residuals
@@ -359,6 +395,48 @@ letters-only tokens (section 3). That figure belongs in the comment above `ALERT
 alongside the reasoning in section 4 that makes it acceptable. The current comment records
 the shape measurement that led to the name anchor but not the residual the anchor is
 carrying, and a future reader widening this rule needs the second number more than the first.
+
+**PEN-5828 — three clauses every rule in this family is now measured against.** The
+generator that prompted them is one instance; the reporting convention is the defect worth
+fixing, because every future rule in the family inherits it.
+
+**(a) REPORT THE WORST REACHABLE SHAPE, NOT THE FAMILY AVERAGE.** A generator that varies a
+structural parameter — group count, segment count, length — inside the trial loop reports an
+average over a mixture whose bins are usually *not* equally reachable, and the dilution is
+the number of dead bins. Measured across this family: `isGitRefName` 3.00x, 
+`isKubernetesObjectName` 2.06x, `isLexicalIdentifier` 1.19x per trial. Pin the parameter and
+report per shape; print the family average beside it if it helps comparison with older
+figures, but the worst shape is the figure the decision rests on.
+
+**(b) CARRY A POPULATION DENOMINATOR, AND PRINT TWO KINDS OF ZERO DIFFERENTLY.** `admitted /
+trials` divides by draws the shipped detector never redacted, which cannot become `after &&
+!before` at all. The honest denominator is the draws it *did* redact. And a population
+denominator only half-fixes the report unless the two zeros render apart:
+
+| | meaning | print |
+|---|---|---|
+| population-side | the detector never fired; the rate is 0/0 and **undefined** | `n/a` |
+| admission-side | the detector fired and the conjunct refused every draw | `0` |
+
+A report that prints `0` for both cannot distinguish *"we never looked"* from *"we looked and
+it held"* — the first is the absence of evidence, the second is evidence. Both are live in
+`isGitRefName`'s own grid: at ~6-character runs, three components is `n/a` (below
+`HIGH_ENTROPY_MIN_LENGTH`) and five is a measured `0` (`GIT_REF_MAX_COMPONENTS` doing its
+job). `scripts/residual-report.test.mjs` pins this; a mutation that collapses the bins back
+to an average fails it.
+
+**(c) EVERY PUBLISHED RESIDUAL GENERATOR IS REPRODUCIBLE FROM THE REPOSITORY ALONE, AND A
+BORROWED ALPHABET OR PARAMETER NAMES ITS SOURCE IN THE COMMENT.** 9.4's *"Kubernetes suffix
+alphabet"* row was the instance that forced this: the alphabet appeared nowhere in the tree,
+so the one figure a reader was most likely to check was the one they could not. It is
+`bcdfghjklmnpqrstvwxz2456789`, from `k8s.io/apimachinery/pkg/util/rand`, and it is now
+recorded beside the figure.
+
+⚠ **And name the rule you measured, not the name you anchored on.** A re-measurement is
+sound only if the anchor reaches exactly one exemption. `pod` reaches two —
+`isKubernetesObjectName` and, since PEN-5921, `isGeneratedPodName` — so anchoring there
+reports their union (1.43e-2) rather than either (9.68e-3 under `instance`). The populations
+are identical both ways, so nothing in the output says which you got.
 
 ## 7. Reproducing
 
@@ -440,13 +518,41 @@ measurement trap in 6.3.
 | base36, 3-4 varying groups of 3-9, `.` | 2.96e-3 |
 | Kubernetes suffix alphabet, 3-5 varying groups of 3-9, `-` | 9.85e-3 |
 
+**The Kubernetes suffix alphabet is `bcdfghjklmnpqrstvwxz2456789`** — 20 consonants and 7
+digits, vowels and ambiguous glyphs removed — from `k8s.io/apimachinery/pkg/util/rand`,
+which is what the apiserver draws a generated name suffix from. Recorded per 6.5(c): it
+appears nowhere in this repository, so this was the one published row a reader could not
+reproduce from the tree.
+
+**PEN-5828: per shape.** Every row above is a family average over 3/4/5 groups, whose bins
+are not equally reachable — the low bin is starved by the same `HIGH_ENTROPY_MIN_LENGTH`
+floor that starves D10's.
+
+| groups | population | per-trial | per-population |
+|---|---|---|---|
+| 3 | 0.161 | 9.93e-4 | 6.19e-3 |
+| 4 | 0.793 | 8.13e-3 | 1.03e-2 |
+| **5** | **0.988** | **1.99e-2** | **2.02e-2** |
+
+150,000 trials per shape against the shipped module at `master`, 2026-11-11, anchored on
+`instance`. **Worst shape 1.99e-2, 95% CI [1.92e-2, 2.06e-2]** (2988 of 150,000); 2.02e-2
+[1.94e-2, 2.09e-2] per population. **Dilution 2.06x.** The mixture itself re-measures at
+9.68e-3 against the 9.85e-3 published, so that figure is sound — it is the shape it averages
+over that was missing. Independently measured at 2.00e-2 [1.94e-2, 2.06e-2] by a second seat
+on 2026-11-07 against a different tree.
+
+⚠ **Anchor on `instance`, not `pod`, when re-deriving this.** Since PEN-5921, `pod`
+additionally reaches `isGeneratedPodName`, so a sweep anchored there reports the union of two
+rules — 1.43e-2 against this rule's 9.68e-3, with identical populations either way, so
+nothing in the output says which you measured. 6.5(c).
+
 Credential-format check: 28 real formats (GitHub classic and fine-grained PATs, Slack, Stripe,
 AWS id and secret, Google, Anthropic, OpenAI, Vault, GitLab, npm, Grafana, JWT, base32 TOTP
 seed, Kubernetes bootstrap token, UUID, raw hex and base64 blobs), 20,000 synthesized samples
 each: **0 of 560,000** newly exonerated.
 
 For scale, the name-anchored CamelCase exemption this file already accepts carries 2.33e-1
-(6.5), and `isLexicalIdentifier` carries 2.96e-3 to 3.57e-3 *name-free*. This rule sits
+(6.5), and `isLexicalIdentifier` carries 2.91e-3 to 3.57e-3 *name-free*. This rule sits
 between them and is anchored.
 
 ### 9.5 What it does admit, stated plainly
@@ -584,7 +690,7 @@ of the leading slash, 0 of 3,000,000 at every length.** That is the number that 
 and the forced-slash row is reported beside it so the margin is visible rather than hidden
 inside a probability nobody re-derived.
 
-For scale: `isLexicalIdentifier` carries 2.96e-3 to 3.57e-3 **name-free** today, and the
+For scale: `isLexicalIdentifier` carries 2.91e-3 to 3.57e-3 **name-free** today, and the
 name-ANCHORED D7 rule carries up to 9.85e-3. D8's worst family is 7.2e-5 — roughly forty
 times below the name-free exemption this file already ships. It is the loosest-looking
 exemption here by vocabulary and the tightest by measurement.
@@ -1019,12 +1125,140 @@ configurations); the shipped row was then re-measured at the full 200,000.
 The knee is at 14: a 3x reduction for seven real branches out of 518, and 16 buys nothing
 further on residual while costing nine more.
 
+### 12.3a Per shape, and the alphabet the grid was blind to (PEN-5828)
+
+Every figure in 12.3 is a **family average**, and the generator drew its component count at
+random inside the trial loop. The bins are not equally reachable, and they are unreachable
+for two **different** reasons, one at each end — so neither correction in 6.5 is sufficient
+alone. At `letters-mixed` chopped by `/` into ~6-character runs:
+
+| components | population | per-trial | mechanism |
+|---|---|---|---|
+| 3 | **0.000** | `n/a` | 17-23 characters, below `HIGH_ENTROPY_MIN_LENGTH`; the detector never fires, so word mass is never consulted |
+| **4** | 0.988 | **6.88e-3** | the hot shape |
+| 5 | 1.000 | **0** | refused by `GIT_REF_MAX_COMPONENTS` — a measured zero, a conjunct doing its job |
+
+Two of three bins contribute exactly zero, so the published 2.33e-3 is the hot bin divided by
+three: **dilution 3.000x, exact rather than approximate.**
+
+**Worst shape 6.88e-3, 95% CI [6.65e-3, 7.11e-3]** — pooled 3439 of 500,000 trials over five
+independent runs across three seats (671 / 681 / 709 / 716 / 662 per 100,000; widest pairwise
+gap 1.46σ, so all five agree). 6.96e-3 against the population denominator; the population
+correction moves this cell by 1.2% because it already runs at 0.988, which is why **binning,
+not the denominator, is the whole 3x here**. Nothing newly **refused** anywhere: 0 across
+every cell of the grid.
+
+**The `-` arm is population-bounded by a constant outside `isGitRefName`**, which is why its
+dead bins are at the opposite end. `-` is not a ref component separator, so the component cap
+never fires on it; instead `isOpaqueSecretValue` bails on `isLexicalIdentifier`, which splits
+on `[-._]` and exonerates any value whose segments sum to at most
+`LEXICAL_IDENTIFIER_MAX_CONTENT_LENGTH` (30). So a `-`-joined draw is in population iff its
+summed run length exceeds 30, and a `/`-joined one iff its total length reaches 24 — closed
+form, and it predicts the measured populations to three decimals. ⚠ The emptiness is **not**
+uniform across the arm: six of nine `-` bins are dead for `letters-mixed`, but only three of
+nine for the lowercase alphabets, whose digits stop their segments being plain. A blanket
+"the `-` arm is population-bounded" note in the driver would be false for two thirds of those
+cells, so the report prints it per bin instead.
+
+**And the grid was blind to its own hot region.** Two of its three chopped alphabets were
+byte-identical — `base36` and `lower-alnum` were both lowercase+digits — so it sampled two
+letter densities, not three: 72% and 100%. The residual peaks **between** them, because the
+hot alphabet is the one with enough digits to escape `isLexicalIdentifier`'s exoneration (and
+so stay in population) and enough letters to clear the word-mass floor:
+
+| alphabet | letters | worst family | worst shape |
+|---|---|---|---|
+| `base36` `a-z0-9` | 72% | 1.67e-3 | 5.00e-3 |
+| `upper-alnum` `A-Z0-9` | 72% | 1.78e-3 | 5.35e-3 |
+| `letters-mixed` `a-zA-Z` | 100% | 2.31e-3 | 6.93e-3 |
+| **`base32` `A-Z234567`** | **81%** | **1.66e-2** | **4.40e-2** |
+
+40,000 trials per shape. `upper-alnum` tracking `base36` is the control: it is the same letter
+density in the other case, and it lands in the same place, so the driver is **density, not
+case**. Replacing the duplicate slot with base32 therefore does not merely de-duplicate the
+grid — it moves the worst shape by **6.3x**.
+
+⚠ **This is reachable by a real credential, and still only by deliberate construction.** An
+RFC 4648 base32 TOTP seed — the alphabet is exactly `A-Z2-7` — measures **0 of 50,000** in its
+native flat form, and **4.33e-2** when sliced across `/` into four runs, matching the
+synthetic cell (4.30e-2) to within noise. So the threat-model verdict in 12.4 is unchanged: a
+flat credential of any alphabet is refused, and reaching 4.4e-2 means setting out to, which
+section 4 and PEN-3183 put outside this control. What changes is the **number**, and the
+comparison built on it.
+
+**The knee, per shape.** Re-measured with the component count pinned, 20,000 trials per shape,
+worst over the whole grid:
+
+| `GIT_REF_MIN_WORD_MASS` | three published alphabets: family / shape | with `base32`: family / shape |
+|---|---|---|
+| 10 | 6.83e-3 / 2.05e-2 | 3.95e-2 / 1.13e-1 |
+| **14 (shipped)** | **2.20e-3 / 6.60e-3** | **1.66e-2 / 4.40e-2** |
+| 16 | 1.87e-3 / 5.60e-3 | 1.29e-2 / 3.81e-2 |
+| 18 | — | 7.28e-3 / 2.13e-2 |
+| 20 | — | 3.43e-3 / 8.05e-3 |
+
+**THE CONSTANT IS UNCHANGED.** On the three published alphabets the knee analysis holds and
+is *stronger* per shape than the family figures implied — 14 buys a 3.1x reduction over 10
+(2.05e-2 → 6.60e-3) rather than ~2.7x, and 16 still buys only 1.18x more. The 12.3 statement
+that a floor of 10 "carries 7.25e-3" is a family average whose worst shape is **2.05e-2**, so
+the rejected option sat at the Kubernetes rule's *own* worst shape (2.02e-2) rather than
+safely inside a diluted 9.85e-3. **Dilution flattered the rejected alternative as well as the
+choice.**
+
+⛔ **What is NOT decided here.** With `base32` in the grid the residual no longer flattens at
+16: 14→16 buys 1.15x, 16→18 buys 1.79x, 18→20 buys 2.64x. So the knee argument that selected
+14 does not obviously survive the wider grid, and a floor of 18 would return the worst shape
+to roughly the Kubernetes precedent. **This row changes no constant and takes no position on
+that**, for one concrete reason: the other half of the trade is the corpus cost — 14 publishes
+511 real branches of 847 and 16 publishes 502 — and **the corpus cost at 18 and 20 is
+unmeasured.** A residual table alone cannot settle a floor. Tracked as the follow-up to
+PEN-5828.
+
+### 12.3b The comparison, like-for-like
+
+12.3's closing "for scale" sentence is withdrawn above. Worst shape against worst shape, on
+the **population** denominator, which is the one 6.5(b) makes the honest default:
+
+| rule | worst shape, per population | anchor |
+|---|---|---|
+| `isLexicalIdentifier` | 6.21e-3 [5.46e-3, 6.95e-3] | none — name-free |
+| **`isGitRefName` (D10)**, three published alphabets | **6.96e-3** | one literal flag |
+| `isKubernetesObjectName` | 2.02e-2 [1.94e-2, 2.09e-2] | eight common label names |
+| `isGitRefName` (D10), with `base32` | 4.49e-2 | one literal flag |
+
+On the three published alphabets, D10 is **within measurement error of
+`isLexicalIdentifier`** and **~2.9x below** the name-anchored Kubernetes rule — 65% headroom,
+not the ~30% a diluted 9.85e-3 implies. With `base32` it is ~2.2x **above** the Kubernetes
+rule, which is the open question in 12.3a.
+
+⛔ **No ordering against `isLexicalIdentifier` may be written in either direction, and no
+ratio.** This is not a sample-size limit that more trials would lift. The two operands sit on
+very different population fractions — 0.99 here against 0.43 there — so **the comparison
+inverts with the denominator**: 1.12x on the population denominator, 1.76x per trial. An
+ordering becomes available only once both operands are restated on one denominator at one
+evidential standard; absent that the stronger claim is not available at any price, and
+"within measurement error" is the whole claim. ⚠ Do **not** rest it on "the confidence
+intervals overlap" either: that is true today and is not robust, because pooling the
+`isLexicalIdentifier` operand and correcting the instrument push the overlap in opposite
+directions. The Kubernetes half **is** ordering-safe — no plausible correction closes a 2.9x
+gap — so exactly one of the two comparisons may be stated as an ordering, which is a
+different "exactly one" from 12.3's *"one comparison breaks, not both"*.
+
 At the full 200,000 trials the shipped configuration measures **2.33e-3** worst, over 164
 families. The chopped-token families span 7.5e-5 to 2.33e-3; a `release/`-prefixed Kubernetes
 bootstrap token sits at 1.80e-3; every flat token family, every other real credential format,
-and every expectation-slot family measure 0. For scale, `isLexicalIdentifier` carries 2.96e-3
-to 3.57e-3 **name-free** today and §9's Kubernetes rule up to 9.85e-3 under an anchor of eight
-common label names; D10's 2.33e-3 sits below both, under an anchor of one literal flag.
+and every expectation-slot family measure 0.
+
+> ⛔ **The "for scale" sentence that closed this paragraph is WITHDRAWN (PEN-5828)**, re-quoted
+> one marked line per line so a `grep` arrival meets the retraction rather than the claim:
+>
+> WITHDRAWN 2026-11-11: "For scale, `isLexicalIdentifier` carries 2.96e-3 to 3.57e-3"
+> WITHDRAWN 2026-11-11: "**name-free** today and §9's Kubernetes rule up to 9.85e-3 under an"
+> WITHDRAWN 2026-11-11: "anchor of eight common label names; D10's 2.33e-3 sits below both,"
+> WITHDRAWN 2026-11-11: "under an anchor of one literal flag."
+>
+> It compares a family average against two family averages, and all three are diluted
+> mixtures. The like-for-like replacement is in 12.3a below.
 
 **The corpus.** 1192 distinct branch names from `Blockcast/paperclip`'s history. **847 of them
 are refused inside a lease by the shipped detector** — 71% — which is the scale of the false
