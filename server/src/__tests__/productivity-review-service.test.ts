@@ -3573,6 +3573,112 @@ describeEmbeddedPostgres("productivity review service", () => {
     );
   });
 
+  // PEN-6528: `external_wait_yield` is the platform's OWN slot-release. The run
+  // durably armed an external-service monitor and handed its execution slot back
+  // (`yieldCurrentRunForExternalWait`, routes/issues.ts) so the wait would not hold
+  // a runtime seat. Nothing failed — and recovery/service.ts has classified it that
+  // way since BLO-27463, while this layer, the one that bills an agent, did not.
+  //
+  // It satisfied every arm of `isInfraFailureRun` by accident: the code is not
+  // `issue_dependencies_blocked`, `classifyRunLiveness` stamps any non-`succeeded`
+  // run `failed`, and the cancellation precedes the telemetry flush so `usageJson`
+  // and `logBytes` are both null. Measured on PEN-6381: 21 consecutive yields
+  // rendered as `runtime_failure_streak: 21`, "no evidence of a model turn", while
+  // one of those runs had posted an 8,822-character comment.
+  //
+  // `logStore` is the load-bearing half of this fixture. A yield DID execute, so
+  // `executeRun` opened a log store for it — that is what separates it from the
+  // dependency-gate and never-invoked fixtures above, and it is why the run survives
+  // into `commentCapableRuns` once `isInfraFailureRun` stops claiming it. Excluding
+  // it from only ONE of the two streaks does not fix the misattribution, it moves it:
+  // the same parked runs stop reading as an infrastructure failure and start reading
+  // as agent silence (PEN-6518, `no_comment_streak: 21` over exactly this shape).
+  it("excludes external-wait yields from BOTH streaks rather than moving them between triggers (PEN-6528)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Anchored outside the 1h/6h high_churn windows so that a correctly suppressed
+    // streak cannot be masked by a different trigger firing on run volume.
+    const insertNow = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS + 2,
+      now: insertNow,
+      spacingMs: 10 * 60_000,
+      status: "cancelled",
+      // The production row, field for field: see the PEN-6528 evidence table.
+      livenessState: "failed",
+      usageJson: null,
+      logBytes: null,
+      logStore: "local_file",
+      errorCode: "external_wait_yield",
+      issueCommentStatus: "not_applicable",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(0);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews).toHaveLength(0);
+  });
+
+  // PEN-6528 (the other direction): excluding the yield must not blind the detector.
+  // A genuine infra-failure streak with newer yields layered on top still reads as a
+  // streak — the yields are transparent to the walk, exactly as dependency-gate
+  // cancellations are in the test above, and for the mirror-image reason. A
+  // cancelled-before-dispatch run is no evidence the runtime was HEALTHY because
+  // nothing was attempted; a yield is no evidence it was BROKEN, because the run
+  // reached the adapter and parked itself on purpose. Breaking the walk on either
+  // would mask the real infra streak behind them, which is the one signal a platform
+  // owner needs.
+  it("still sees a genuine infra-failure streak through newer external-wait yields (PEN-6528)", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    // Newest: the designed slot yields.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 3,
+      now,
+      status: "cancelled",
+      livenessState: "failed",
+      usageJson: null,
+      logBytes: null,
+      logStore: "local_file",
+      errorCode: "external_wait_yield",
+      issueCommentStatus: "not_applicable",
+    });
+    // Older: a genuine zero-token infra-failure streak, which must still be reported.
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now: new Date(now.getTime() - 4 * 60_000),
+      status: "failed",
+      livenessState: "failed",
+      usageJson: null,
+      errorCode: "job_failed",
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+
+    expect(result.created).toBe(1);
+    const reviews = await listProductivityReviews(seeded.companyId);
+    expect(reviews[0]?.description).toContain("Primary trigger: `runtime_failure_streak`");
+    expect(reviews[0]?.description).toContain("Runtime-failure streak (terminal, never-executed runs): 10");
+    expect(reviews[0]?.description).toContain("No-comment streak (terminal, turn-executing runs): 0");
+    // Reported, not silently dropped: a reader who sees a streak of 10 needs to know
+    // three runs in the window were parked by design rather than counted either way.
+    expect(reviews[0]?.description).toContain(
+      "External-wait yields excluded (terminal, executed a turn then handed the execution slot back after arming a monitor — `external_wait_yield`, PEN-6528): 3",
+    );
+  });
+
   // BLO-22436 (review follow-up): with an even split, naming a "dominant"
   // errorCode would be decided by run ordering and read as a definite diagnosis
   // of the window. Report that there isn't one instead.

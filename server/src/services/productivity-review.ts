@@ -56,6 +56,7 @@ import {
 import { resolveOwningPaperclipIdentifiers } from "./paperclip-identifiers.js";
 import {
   isDependencyBlockedRun,
+  isExternalWaitYieldRun,
   isInfraClassErrorCodeRun,
   isInfraFailureRun,
   runUsageTokenCounts,
@@ -479,6 +480,14 @@ type ProductivityReviewEvidence = {
   // see how much of the window was taken by infrastructure without re-deriving
   // it from raw run telemetry.
   infraClassKilledRunCount: number;
+  // PEN-6528: terminal runs in the window that ended in the external-wait slot
+  // yield — the run durably armed an external-service monitor and handed its
+  // execution slot back (`yieldCurrentRunForExternalWait`, routes/issues.ts).
+  // Excluded from BOTH streaks and reported here, because a yield is the
+  // platform's own parking mechanism working: counting it as an infrastructure
+  // failure bills correct conduct as a fault, and counting it as silence bills
+  // the same conduct twice under a different trigger.
+  externalWaitYieldRunCount: number;
   // BLO-26165 (narrowing): of the runs eligible for the `noCommentStreak` walk,
   // how many carry `issueCommentStatus: "not_applicable"` —
   // `finalizeIssueCommentPolicy` exempted them from the comment requirement
@@ -4799,7 +4808,18 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     // newer dependency-gate cancellations layered on top, and breaking the walk
     // would mask the real infra streak behind them exactly when a platform
     // owner needs to see it.
-    const infraCandidateRuns = terminalRuns.filter((run) => !isDependencyBlockedRun(run));
+    // PEN-6528: external-wait yields are transparent to this walk too, for the
+    // same reason as the dependency gate and with the opposite argument. A
+    // cancelled-before-dispatch run is no evidence the runtime was healthy
+    // because nothing was attempted; a yield is no evidence it was BROKEN,
+    // because the run reached the adapter, executed, and parked itself on
+    // purpose. Excluded rather than streak-breaking so a genuine infra streak
+    // either side of a park still reads as one contiguous streak — the walk is
+    // a detector for platform faults and must not be blinded by an agent doing
+    // the right thing in the middle of one.
+    const infraCandidateRuns = terminalRuns.filter(
+      (run) => !isDependencyBlockedRun(run) && !isExternalWaitYieldRun(run),
+    );
     let runtimeFailureStreak = 0;
     let runtimeFailureSawMeasuredZero = false;
     let runtimeFailureSawInferred = false;
@@ -4883,7 +4903,28 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
     const isInfraKilledSilentRun = (run: (typeof commentCapableRuns)[number]) =>
       isInfraClassErrorCodeRun(run) && !commentRunIds.has(run.id);
     const infraClassKilledRunCount = commentCapableRuns.filter(isInfraKilledSilentRun).length;
-    const noCommentEligibleRuns = commentCapableRuns.filter((run) => !isInfraKilledSilentRun(run));
+    // PEN-6528: a yield is reachable here, and only here, because it is the one
+    // excluded population that DID execute — `isInfraFailureRun` now
+    // short-circuits it, so it is not `isNeverExecutedRun` and it survives into
+    // `commentCapableRuns`. Without this it would simply change triggers: the
+    // same parked runs would stop reading as an infrastructure failure and
+    // start reading as agent silence, which is the other false review this
+    // issue was opened out of (PEN-6518, `no_comment_streak: 21` over the same
+    // kind of window). Excluding it from exactly one of the two streaks fixes
+    // nothing; it moves the misattribution.
+    //
+    // `&& !commentRunIds.has(run.id)` is load-bearing for the reason given on
+    // `isInfraKilledSilentRun` directly above, and more sharply here: a yield
+    // happens AFTER the run has done its work, so commenting-then-yielding is
+    // the modal shape, not the corner. Run 3e7c4d58 posted 8,822 characters and
+    // then yielded. A run that spoke is evidence, not an exclusion — leave it in
+    // the array so it still BREAKS the streak.
+    const isExternalWaitYieldSilentRun = (run: (typeof commentCapableRuns)[number]) =>
+      isExternalWaitYieldRun(run) && !commentRunIds.has(run.id);
+    const externalWaitYieldRunCount = commentCapableRuns.filter(isExternalWaitYieldSilentRun).length;
+    const noCommentEligibleRuns = commentCapableRuns.filter(
+      (run) => !isInfraKilledSilentRun(run) && !isExternalWaitYieldSilentRun(run),
+    );
     // Of the runs actually eligible for the streak walk, how many carry the
     // comment-policy-exempt status. Scoped to the eligible population (not all
     // terminal runs) so the "DID execute" claim is literally true of every run
@@ -5489,7 +5530,10 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       const infraKilledNote = infraClassKilledRunCount > 0
         ? ` (${infraClassKilledRunCount} run(s) in the sampled window executed a turn and were then killed by an infrastructure fault; they are excluded, not counted toward this streak, and unlike the never-invoked runs above they do NOT overlap the non-executing count, which is zero-token by construction)`
         : "";
-      triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}${infraKilledNote}`);
+      const externalWaitYieldNote = externalWaitYieldRunCount > 0
+        ? ` (${externalWaitYieldRunCount} run(s) in the sampled window ended in the external-wait slot yield after durably arming a monitor; they are excluded, not counted toward this streak, because the run parked itself on purpose rather than falling silent)`
+        : "";
+      triggerReasons.push(`${noCommentStreak} consecutive terminal, turn-executing issue-linked runs had no run-created issue comment${neverInvokedNote}${infraKilledNote}${externalWaitYieldNote}`);
     }
     if (runawayExecution) {
       triggerReasons.push(
@@ -5767,6 +5811,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       runtimeFailureUsageBasis,
       neverInvokedRunCount,
       infraClassKilledRunCount,
+      externalWaitYieldRunCount,
       commentExemptExecutedRunCount,
       nonExecutingRunCount,
       nonExecutingDominantErrorCode,
@@ -5912,6 +5957,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       // so the two counts do sum, unlike the never-invoked/non-executing pair
       // below.
       `- Infra-killed runs excluded (terminal, executed a turn then died of an infrastructure fault — \`errorCode\` in the shared infra-class set, BLO-36535): ${evidence.infraClassKilledRunCount}`,
+      `- External-wait yields excluded (terminal, executed a turn then handed the execution slot back after arming a monitor — \`external_wait_yield\`, PEN-6528): ${evidence.externalWaitYieldRunCount}`,
       // BLO-29535 (Ally suggestion on a38c12fe2): "eligible for the streak
       // walk", NOT "counted toward the streak". This count is taken over every
       // run in `noCommentEligibleRuns`, while `noCommentStreak` is only the
@@ -6087,6 +6133,7 @@ export function productivityReviewService(db: Db, deps?: ProductivityReviewServi
       `- Runtime-failure streak: ${evidence.runtimeFailureStreak}`,
       `- Never-invoked runs excluded (no adapter created): ${evidence.neverInvokedRunCount}`,
       `- Infra-killed runs excluded (executed a turn, then killed by infrastructure): ${evidence.infraClassKilledRunCount}`,
+      `- External-wait yields excluded (parked on an external wait by design): ${evidence.externalWaitYieldRunCount}`,
       // BLO-29535: same wording fix as the description's evidence block — this
       // count is every streak-eligible exempt run, not the streak prefix, and
       // a bare "(counted)" sitting under "No-comment streak" read as "counted
