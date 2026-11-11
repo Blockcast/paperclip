@@ -982,8 +982,14 @@ export function ghDequeueReason(repo, prNumber, dequeuedAt, exec = run) {
     const out = exec([
       "gh", "api", "graphql",
       "-f", `query=${DEQUEUE_REASON_QUERY}`,
-      "-F", `owner=${owner}`,
-      "-F", `name=${name}`,
+      // `-f` is a literal STRING; `-F` lets gh infer a type, so a
+      // numeric-looking owner or repo name is sent as an Int and the
+      // `String!` variable raises a GraphQL type error. Both readers fail
+      // closed on that, so this is a correctness fix rather than a safety
+      // one -- but a repo that cannot be read is a notice that cannot be
+      // written. `number` stays `-F`: `Int!` genuinely wants the coercion.
+      "-f", `owner=${owner}`,
+      "-f", `name=${name}`,
       "-F", `number=${prNumber}`,
       "--jq", ".data.repository.pullRequest.timelineItems.nodes[] | {createdAt, reason}",
     ]);
@@ -1023,8 +1029,14 @@ export function ghQueueMembership(repo, prNumber, exec = run) {
     const out = exec([
       "gh", "api", "graphql",
       "-f", `query=${QUEUE_MEMBERSHIP_QUERY}`,
-      "-F", `owner=${owner}`,
-      "-F", `name=${name}`,
+      // `-f` is a literal STRING; `-F` lets gh infer a type, so a
+      // numeric-looking owner or repo name is sent as an Int and the
+      // `String!` variable raises a GraphQL type error. Both readers fail
+      // closed on that, so this is a correctness fix rather than a safety
+      // one -- but a repo that cannot be read is a notice that cannot be
+      // written. `number` stays `-F`: `Int!` genuinely wants the coercion.
+      "-f", `owner=${owner}`,
+      "-f", `name=${name}`,
       "-F", `number=${prNumber}`,
       "--jq",
       ".data.repository.pullRequest | {inQueue: .isInMergeQueue, " +
