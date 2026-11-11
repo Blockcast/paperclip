@@ -329,12 +329,16 @@ console.log(
     `   per-population ${worstCell === null ? "n/a" : (populationRate(worstCell) ?? 0).toExponential(2)}`,
 );
 console.log(`total newly-refused across all families: ${totalNewlyRefused}`);
+// ⛔ NO "for scale" FIGURES HERE. An earlier draft restated the other rules'
+// worst shapes inline, and a number copied into a second carrier drifts from
+// the first the next time either rule is re-measured — which is the same
+// family of defect PEN-5828 reports, one carrier over. The comparison lives in
+// PEN-3920 6.5 / 12.3b, beside the measurement that produced it.
 console.log(
-  "\nFor scale, worst SHAPE against worst SHAPE and on the SAME denominator —\n" +
-    "see PEN-3920 6.5, which is why these are no longer family averages:\n" +
-    "  isLexicalIdentifier        6.21e-3 per-population (name-free)\n" +
-    "  isKubernetesObjectName     2.02e-2 per-population (name-anchored)\n" +
-    "⚠ Measure isKubernetesObjectName under an anchored name that is NOT `pod`:\n" +
-    "  `pod` additionally carries isGeneratedPodName (PEN-5921), so anchoring\n" +
-    "  there reports the UNION of two rules (1.43e-2) rather than this one.",
+  "\nFor scale, worst SHAPE against worst SHAPE and on one denominator: see\n" +
+    "docs/security/PEN-3920-egress-entropy-identifier-decision.md 6.5 and 12.3b.\n" +
+    "⚠ Re-measuring a reference rule? Anchor isKubernetesObjectName on a name\n" +
+    "  that is NOT `pod` — `pod` also reaches isGeneratedPodName (PEN-5921), so\n" +
+    "  a sweep anchored there reports the union of two rules, with identical\n" +
+    "  populations either way, and nothing says which you measured.",
 );

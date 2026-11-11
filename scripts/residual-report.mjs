@@ -108,9 +108,27 @@ export function worstShape(cells) {
 }
 
 /**
+ * Worst cell by TRIAL rate. Separate from `worstShape` on purpose: the two can
+ * pick DIFFERENT cells, because the bins run different populations, and the
+ * one you want depends on the denominator of whatever you are comparing it to.
+ */
+export function worstByTrialRate(cells) {
+  let best = null;
+  for (const cell of cells) {
+    const rate = trialRate(cell);
+    if (rate === null) continue;
+    if (best === null || rate > trialRate(best)) best = cell;
+  }
+  return best;
+}
+
+/**
  * Collapse per-shape cells back into the FAMILY average the old report
  * published. Retained ONLY so the report can print both and show the gap; it
  * is the number PEN-5828 found to be diluted, never the number to quote.
+ *
+ * Note the denominator: this is `sum(admitted) / sum(trials)`, a TRIAL rate.
+ * Anything divided by it must be a trial rate too — see `dilution`.
  */
 export function familyAverage(cells) {
   const admitted = cells.reduce((n, c) => n + c.admitted, 0);
@@ -119,12 +137,23 @@ export function familyAverage(cells) {
 }
 
 /**
- * The dilution a family average carries against its own worst shape, on the
- * SAME denominator. Reported beside both so a reader can see the gap rather
- * than having to derive it — the gap is the finding.
+ * The dilution a family average carries against its own worst shape.
+ *
+ * ⛔ BOTH OPERANDS ARE TRIAL RATES, deliberately, and the first version of this
+ * function got it wrong in precisely the way PEN-5828 exists to correct: it
+ * took the worst cell by POPULATION rate and divided that cell's TRIAL rate by
+ * the family TRIAL average. The cells run different populations, so the
+ * worst-by-population cell need not be the worst-by-trial cell, and the printed
+ * factor could then understate the gap it claims to report — a mixed-denominator
+ * ratio inside the fix for mixed-denominator ratios.
+ *
+ * The headline worst SHAPE is still chosen by population rate (`worstShape`),
+ * because that is the honest rate for a residual. These are two different
+ * questions and the report prints both; what they must never do is share half
+ * of each other's arithmetic.
  */
 export function dilution(cells) {
-  const worst = worstShape(cells);
+  const worst = worstByTrialRate(cells);
   if (worst === null) return null;
   const family = familyAverage(cells);
   if (family === null || family === 0) return null;
