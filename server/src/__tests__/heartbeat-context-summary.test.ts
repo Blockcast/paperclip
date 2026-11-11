@@ -3550,7 +3550,19 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
 
     expect(markdown).toContain("Triggered monitor -- the two exits that discharge it:");
     expect(markdown).toContain("is sitting `triggered`. It stays `triggered`");
-    expect(markdown).not.toContain("()");
+
+    // Scoped to THIS directive's own fact line on purpose. The assertion used to
+    // range over the WHOLE markdown, which quietly made it a tripwire on every
+    // other directive: #3665 (PEN-6435) landed a `python3 -I -c "... .read()"`
+    // recipe in the constraint-recording block at 2026-11-11T17:07Z and reddened
+    // `General tests (server 1/6)` repo-wide on a property this test does not own.
+    // `toBeDefined` first so a `find` that matches nothing fails here rather than
+    // passing the `not.toContain` vacuously on `undefined`.
+    const factLine = markdown
+      .split("\n")
+      .find((line) => line.startsWith("This row's monitor has FIRED"));
+    expect(factLine).toBeDefined();
+    expect(factLine).not.toContain("()");
   });
 
   // `attemptCount` without `maxAttempts` is a real shape (the bound defaults), and the
@@ -3566,8 +3578,14 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
       },
     });
 
-    expect(markdown).toContain("(attempt 2)");
-    expect(markdown).not.toContain("attempt 2/");
+    // Same scoping as the sibling case above, for the same reason: the negative
+    // belongs to this directive's fact line, not to every directive on the wake.
+    const factLine = markdown
+      .split("\n")
+      .find((line) => line.startsWith("This row's monitor has FIRED"));
+    expect(factLine).toBeDefined();
+    expect(factLine).toContain("(attempt 2)");
+    expect(factLine).not.toContain("attempt 2/");
   });
 });
 
