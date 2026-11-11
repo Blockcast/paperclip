@@ -18,6 +18,7 @@ import {
   mintAppJwt,
   getInstallationToken,
   getInstallationTokenResult,
+  githubFetchPrAuthorLogin,
   githubFetchPrHeadSha,
   githubGetPullRequestGate,
   githubGetWorkflowRun,
@@ -497,10 +498,20 @@ describe("githubGetPrRequiredStatusContext", () => {
       if (href.includes("/access_tokens")) {
         return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
       }
-      if (href.includes("/pulls/")) {
+      // PEN-6341: the PR read is GraphQL now. The `pull` input keeps its REST
+      // shape so no CASE in the table below had to change -- only the transport
+      // moved, which is the whole claim this migration makes.
+      if (href.endsWith("/graphql")) {
         const status = input.pull?.status ?? 200;
-        return jsonResponse(input.pull?.body ?? { base: { ref: "master" } }, status < 400, status);
+        if (status >= 400) return jsonResponse({ message: "refused" }, false, status);
+        const body = (input.pull?.body ?? { base: { ref: "master" } }) as { base?: { ref?: string } };
+        return jsonResponse({
+          data: { repository: { pullRequest: { baseRefName: body.base?.ref ?? null } } },
+        });
       }
+      // Reaching the REST pull-request route again would mean the saving had
+      // silently been given back, so fail loudly rather than answering.
+      if (href.includes("/pulls/")) throw new Error(`REST pull-request read regressed: ${href}`);
       // Must precede the branch arm: `/rules/branches/{ref}` also contains
       // `/branches/`, and matching it as the classic read would make every
       // ruleset assertion below silently test the wrong endpoint.
@@ -796,15 +807,27 @@ describe("githubGetWorkflowRun 404 disambiguation", () => {
 describe("githubFetchPrHeadSha", () => {
   it("uses the installation token to resolve the complete current head", async () => {
     setCreds();
-    vi.stubGlobal("fetch", vi.fn(async (url: string | URL) => {
+    const bodies: Array<{ variables?: Record<string, unknown> }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
       const value = String(url);
       if (value.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
-      expect(value).toContain("/repos/Blockcast/paperclip/pulls/1049");
-      return jsonResponse({ head: { sha: "ABCDEF1234567890ABCDEF1234567890ABCDEF12" } });
+      // PEN-6341: resolved over GraphQL. The PR is still named -- as variables
+      // rather than in the path -- so the identity assertion survives the move.
+      expect(value).toBe("https://api.github.com/graphql");
+      bodies.push(JSON.parse(String(init?.body ?? "{}")));
+      return jsonResponse({
+        data: {
+          repository: {
+            pullRequest: { headRefOid: "ABCDEF1234567890ABCDEF1234567890ABCDEF12" },
+          },
+        },
+      });
     }));
 
     await expect(githubFetchPrHeadSha({ repoFullName: "Blockcast/paperclip", prNumber: 1049 }))
       .resolves.toBe("abcdef1234567890abcdef1234567890abcdef12");
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0].variables).toEqual({ owner: "Blockcast", name: "paperclip", number: 1049 });
   });
 });
 
@@ -947,9 +970,16 @@ describe("githubHasReviewerEvidenceForPr", () => {
           }
           return jsonResponse(routes.reviews ?? []);
         }
-        if (u.includes("/pulls/")) {
-          return jsonResponse(routes.prHead !== undefined ? { head: { sha: routes.prHead } } : {});
+        // PEN-6341: only the pull-request FIELD read moved to GraphQL. The
+        // reviews pagination above is still REST and is deliberately untouched
+        // by this change -- `commit_id`/`submitted_at` carry their own
+        // semantics and get their own migration.
+        if (u.endsWith("/graphql")) {
+          return jsonResponse({
+            data: { repository: { pullRequest: { headRefOid: routes.prHead ?? null } } },
+          });
         }
+        if (u.includes("/pulls/")) throw new Error(`REST pull-request read regressed: ${u}`);
         if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse(routes.comments ?? []);
         throw new Error(`unexpected url ${u}`);
       }),
@@ -2379,5 +2409,147 @@ describe("ghGraphQlQuery (PEN-6341)", () => {
     // The point is not the verdict but that nothing was sent.
     expect(urls).toEqual([]);
     expect(errorSpy).toHaveBeenCalled();
+  });
+});
+
+/**
+ * PEN-6341 item 2: the plain `GET /repos/{o}/{r}/pulls/{n}` readers that want one
+ * or two scalar fields now ask GraphQL instead.
+ *
+ * Every test here pins POLARITY as well as the happy path, because that is the
+ * property the migration could silently lose: each of these sites already
+ * answered a safe value when the PR could not be read, and a GraphQL refusal --
+ * a rate limit, a NOT_FOUND, a nulled subtree -- has to land on that same value
+ * rather than on a confident wrong one.
+ */
+describe("PEN-6341 pull-request field reads over GraphQL", () => {
+  const repoFullName = "Blockcast/paperclip";
+  const prNumber = 3669;
+  const headSha = "eef8acaf063f7e064008c4b676a6bbe8ddf5bb86";
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    _resetInstallationTokenCache();
+  });
+
+  /** Token mint plus one GraphQL envelope, sent verbatim. Returns the recorded calls. */
+  function stubGraphQlEnvelope(envelope: unknown, ok = true, status = 200) {
+    const calls: Array<{
+      url: string;
+      body: { query?: string; variables?: Record<string, unknown> };
+      signal?: AbortSignal | null;
+    }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const value = String(url);
+      if (value.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
+      calls.push({ url: value, body: JSON.parse(String(init?.body ?? "{}")), signal: init?.signal ?? null });
+      return jsonResponse(envelope, ok, status);
+    }));
+    return calls;
+  }
+
+  const stubPr = (pullRequest: unknown) =>
+    stubGraphQlEnvelope({ data: { repository: { pullRequest } } });
+
+  describe("githubFetchPrHeadSha", () => {
+    it("reads headRefOid in one GraphQL call and never touches the REST route", async () => {
+      setCreds();
+      const calls = stubPr({ headRefOid: headSha, baseRefName: "master", url: null, author: null });
+
+      await expect(githubFetchPrHeadSha({ repoFullName, prNumber })).resolves.toBe(headSha);
+
+      expect(calls).toHaveLength(1);
+      expect(calls[0].url).toBe("https://api.github.com/graphql");
+      expect(calls[0].body.variables).toEqual({ owner: "Blockcast", name: "paperclip", number: prNumber });
+      // The saving IS the REST route not being reached; a silent fallback would
+      // spend the shard-B budget anyway and the migration would buy nothing.
+      expect(calls[0].body.query).not.toContain("pulls/");
+      expect(calls[0].body.query).toContain("headRefOid");
+    });
+
+    it("returns null when GraphQL reports NOT_FOUND, rather than inventing a head", async () => {
+      setCreds();
+      // What `pullRequest(number:)` really answers for an absent number AND for
+      // an ISSUE number: a null node beside an errors entry. Indistinguishable,
+      // which is exactly why the sites that must tell those apart are not here.
+      stubGraphQlEnvelope({
+        data: { repository: { pullRequest: null } },
+        errors: [{ type: "NOT_FOUND", message: "Could not resolve to a PullRequest with the number of 3669." }],
+      });
+      await expect(githubFetchPrHeadSha({ repoFullName, prNumber })).resolves.toBeNull();
+    });
+
+    it("returns null when the GraphQL bucket refuses the read", async () => {
+      setCreds();
+      stubGraphQlEnvelope({ message: "API rate limit exceeded" }, false, 403);
+      await expect(githubFetchPrHeadSha({ repoFullName, prNumber })).resolves.toBeNull();
+    });
+
+    it("carries the caller's abort signal through to the request", async () => {
+      setCreds();
+      const calls = stubPr({ headRefOid: headSha });
+      const controller = new AbortController();
+      await githubFetchPrHeadSha({ repoFullName, prNumber, signal: controller.signal });
+      // A GraphQL read has to be as cancellable as the REST read it replaced;
+      // dropping the signal would let an aborted request outlive its caller.
+      expect(calls[0].signal).toBeInstanceOf(AbortSignal);
+      expect(calls[0].signal?.aborted).toBe(false);
+    });
+  });
+
+  describe("githubFetchPrAuthorLogin", () => {
+    it("reads author.login", async () => {
+      setCreds();
+      stubPr({ author: { login: "allyblockcast[bot]" } });
+      await expect(githubFetchPrAuthorLogin({ repoFullName, prNumber }))
+        .resolves.toBe("allyblockcast[bot]");
+    });
+
+    it.each([
+      ["a deleted account nulls author", { author: null }],
+      ["a blank login", { author: { login: "   " } }],
+    ])("returns null for %s", async (_label, pr) => {
+      setCreds();
+      stubPr(pr);
+      await expect(githubFetchPrAuthorLogin({ repoFullName, prNumber })).resolves.toBeNull();
+    });
+  });
+
+  describe("githubGetPrRequiredStatusContext", () => {
+    it("fails to `unknown`, keeping the helper's reason under the REST prefix", async () => {
+      setCreds();
+      stubGraphQlEnvelope({ message: "API rate limit exceeded" }, false, 403);
+      const result = await githubGetPrRequiredStatusContext({
+        repoFullName,
+        prNumber,
+        context: "verify",
+      });
+      // OUTCOME is what this site gates on and it is unchanged -- an unreadable
+      // pull request was always `unknown`. Only the diagnostic string moves,
+      // from the REST classifier's to the GraphQL helper's, under the same prefix.
+      expect(result.outcome).toBe("unknown");
+      expect(result.reason).toBe("required_context_pull_request_http_403");
+    });
+
+    it("still reports a missing base ref distinctly from an unreadable PR", async () => {
+      setCreds();
+      stubPr({ baseRefName: "   " });
+      const result = await githubGetPrRequiredStatusContext({
+        repoFullName,
+        prNumber,
+        context: "verify",
+      });
+      expect(result.outcome).toBe("unknown");
+      expect(result.reason).toBe("required_context_base_ref_missing");
+    });
+  });
+
+  it("refuses a malformed repo full name without sending anything", async () => {
+    setCreds();
+    const calls = stubPr({ headRefOid: headSha });
+    await expect(githubFetchPrHeadSha({ repoFullName: "no-slash", prNumber })).resolves.toBeNull();
+    // Nothing is sent: a bad owner/name would otherwise become a GraphQL
+    // variable error and spend a request to learn what we already knew.
+    expect(calls).toEqual([]);
   });
 });

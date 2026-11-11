@@ -164,17 +164,28 @@ function installGithubStub(options: {
         options.tokenStatus ?? 201,
       );
     }
-    if (target.endsWith(`/repos/${REPO}/pulls/${PR_NUMBER}`)) {
-      return response(
-        options.pullStatus && options.pullStatus >= 400
-          ? { message: "pull unavailable" }
-          : {
-              base: { ref: options.liveBaseRef ?? "main" },
-              head: { sha: options.liveHeadSha ?? LIVE_HEAD },
-              html_url: PR_URL,
+    if (target.endsWith("/graphql")) {
+      // PEN-6341: the worker reads the pull request over GraphQL now, so the
+      // options below keep their REST-shaped names while the transport moves.
+      if (options.pullStatus && options.pullStatus >= 400) {
+        return response({ message: "pull unavailable" }, options.pullStatus);
+      }
+      return response({
+        data: {
+          repository: {
+            pullRequest: {
+              baseRefName: options.liveBaseRef ?? "main",
+              headRefOid: options.liveHeadSha ?? LIVE_HEAD,
+              url: PR_URL,
             },
-        options.pullStatus ?? 200,
-      );
+          },
+        },
+      }, 200);
+    }
+    // A REST pull-request read here would mean the shard-B saving had silently
+    // been given back, so refuse to answer one.
+    if (target.endsWith(`/repos/${REPO}/pulls/${PR_NUMBER}`)) {
+      throw new Error(`REST pull-request read regressed: ${target}`);
     }
     const statusMatch = target.match(/\/statuses\/([0-9a-f]{40})$/i);
     if (statusMatch) {
@@ -547,7 +558,7 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
     const relevantCalls = fetchMock.mock.calls.filter(([url]) => {
       const target = String(url);
       return target.includes("/access_tokens")
-        || target.endsWith(`/pulls/${PR_NUMBER}`)
+        || target.endsWith("/graphql")
         || target.includes("/statuses/")
         || target.endsWith("/dispatches");
     });
@@ -623,16 +634,18 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
       if (target.includes("/access_tokens")) {
         return response({ token: "ghs_review_gate", expires_at: FUTURE_ISO }, 201);
       }
-      if (target.endsWith(`/repos/${REPO}/pulls/${PR_NUMBER}`)) {
+      if (target.endsWith("/graphql")) {
         pullCalls += 1;
         if (pullCalls === 1) {
           markFirstPullStarted();
           await firstPullBlocked;
         }
         return response({
-          base: { ref: "main" },
-          head: { sha: LIVE_HEAD },
-          html_url: PR_URL,
+          data: {
+            repository: {
+              pullRequest: { baseRefName: "main", headRefOid: LIVE_HEAD, url: PR_URL },
+            },
+          },
         });
       }
       if (target.match(/\/statuses\/[0-9a-f]{40}$/i)) return response({ id: 1 }, 201);
@@ -701,13 +714,15 @@ describeEmbeddedPostgres("GitHub review-gate durable authority", () => {
     const fetchMock = installGithubStub();
     fetchMock.mockImplementation(async (url: string | URL, init?: RequestInit) => {
       const target = String(url);
-      if (target.endsWith(`/repos/${REPO}/pulls/${PR_NUMBER}`)) {
+      if (target.endsWith("/graphql")) {
         markPullRequestStarted();
         await pullRequestBlocked;
         return response({
-          base: { ref: "main" },
-          head: { sha: LIVE_HEAD },
-          html_url: PR_URL,
+          data: {
+            repository: {
+              pullRequest: { baseRefName: "main", headRefOid: LIVE_HEAD, url: PR_URL },
+            },
+          },
         });
       }
       if (target.includes("/access_tokens")) {

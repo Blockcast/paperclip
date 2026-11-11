@@ -8,6 +8,7 @@ import {
   getInstallationTokenResult,
   gitHubIdentityFieldRedaction,
   scrubOutboundGitHubText,
+  ghGraphQlPullRequestFields,
 } from "./github-app-auth.js";
 import { ghFetch, gitHubApiBase, GITHUB_REQUEST_TIMEOUT_MS } from "./github-fetch.js";
 
@@ -314,19 +315,22 @@ async function fetchPullRequest(token: string, row: DeliveryRow, candidate: Cand
   | { ok: false; reason: string }
 > {
   try {
-    const response = await ghFetch(
-      `${gitHubApiBase(GITHUB_HOST)}/repos/${row.repoFullName}/pulls/${candidate.prNumber}`,
-      {
-        headers: { accept: "application/vnd.github+json", authorization: `Bearer ${token}` },
-        signal: requestSignal(),
-      },
-    );
-    if (!response.ok) return { ok: false, reason: `review_gate_pull_http_${response.status}` };
-    const body = record(await response.json().catch(() => null));
-    const baseRef = stringField(record(body?.base)?.ref);
-    const headSha = fullSha(record(body?.head)?.sha);
+    // PEN-6341: three fields off GraphQL instead of a REST pull-request payload,
+    // moving this read off the exhausted `core` shard. REST `html_url` is
+    // GraphQL `url` (`resourcePath` is the path-only sibling, and is not what
+    // this publishes as a status target). The abort signal is carried through,
+    // so cancellation behaves exactly as before.
+    const pr = await ghGraphQlPullRequestFields({
+      token,
+      repoFullName: row.repoFullName,
+      prNumber: candidate.prNumber,
+      signal: requestSignal(),
+    });
+    if (!pr.ok) return { ok: false, reason: `review_gate_pull_${pr.reason}` };
+    const baseRef = stringField(pr.data.baseRefName);
+    const headSha = fullSha(pr.data.headRefOid);
     if (!baseRef || !headSha) return { ok: false, reason: "review_gate_pull_payload_invalid" };
-    return { ok: true, baseRef, headSha, targetUrl: stringField(body?.html_url) };
+    return { ok: true, baseRef, headSha, targetUrl: stringField(pr.data.url) };
   } catch {
     return { ok: false, reason: "review_gate_pull_fetch_failed" };
   }
