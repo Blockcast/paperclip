@@ -25,6 +25,19 @@
 // figure is therefore 0 by construction and the interesting number is the
 // NEWLY REFUSED one, printed beside it.
 //
+// ⚠ PEN-5828: THE TRIAL COUNT IS PER SHAPE, NOT PER FAMILY. The chopped-token
+// families are split by component count (3, 4, 5) because their bins are not
+// equally reachable and averaging over them understated the worst reachable
+// shape by 3x. The report prints, for every cell, the rate against TRIALS (the
+// denominator the published figures used) and against POPULATION (the draws
+// the shipped detector actually redacts), plus a worst-SHAPE headline beside
+// the worst-FAMILY one. `n/a` is a rate of 0/0 — the detector never fired, so
+// nothing was measured; a plain `0` means it fired and the conjunct refused
+// every draw. Those are different findings and the report keeps them apart.
+// `docs/security/PEN-3920-egress-entropy-identifier-decision.md` 6.5 is the
+// standard; `scripts/residual-report.mjs` is the reporting core and
+// `scripts/residual-report.test.mjs` pins it against collapsing back.
+//
 // Usage:
 //   node scripts/measure-force-with-lease-residual.mjs [trials]
 //
