@@ -233,6 +233,57 @@ describe("merge-gate reader", () => {
     assert.deepEqual(lines, ["STOP\tsecurity-tests" + LEGACY + "\tfailure\trun=501"]);
   });
 
+  // PEN-6495: the `${{` carve-out reached the PRINT site and not the TWIN test,
+  // so a job whose trusted arm registers but never EXPANDS looked identical to a
+  // job whose trusted arm never RAN. Measured on penstock-llm-proxy-core
+  // `portal-copy-scan`, which publishes only
+  // `portal-copy-scan${{ … }}` (`skipped`) and has ZERO bare registration at any
+  // head: its refusal STOPped on every head of the repo, including `9e20ce6b`,
+  // the head of #3263, which MERGED 2026-11-10T15:26:21Z carrying that exact row.
+  // The malformed row is `skipped`, so it is filtered out before MALFORMED is
+  // reached — this label is the only line that reports it.
+  const TMPL = "${{ (((github.event_name == 'pull_request') && ' x') || '') }}";
+  it("labels a twin-less refusal MALFORMED-TWIN when the trusted arm registered un-expanded", () => {
+    const lines = read([
+      ["lint", "success", "t1", "500"],
+      ["portal-copy-scan" + TMPL, "skipped", "t1", "500"],
+      ["portal-copy-scan" + LEGACY, "failure", "t1", "501"],
+    ]);
+    assert.deepEqual(lines, ["MALFORMED-TWIN\tportal-copy-scan" + LEGACY + "\tfailure\trun=501"]);
+    assert.equal(stops(lines).length, 0);
+  });
+
+  // The must-fail arm of the same discriminator. A label that cannot STOP is not
+  // a discriminator, so these two cases must DIFFER — identical fixtures bar the
+  // malformed registration, opposite verdicts.
+  it("keeps STOP when no row carries a `${{` stem for the refused job", () => {
+    const lines = read([
+      ["lint", "success", "t1", "500"],
+      ["portal-copy-scan" + LEGACY, "failure", "t1", "501"],
+    ]);
+    assert.deepEqual(lines, ["STOP\tportal-copy-scan" + LEGACY + "\tfailure\trun=501"]);
+  });
+
+  // The stem is the text before the FIRST `${{`, matched whole. A matrix name
+  // yields `postgres-tests (heavy ` and must not rescue `postgres-tests`.
+  it("does not let a matrix-templated name rescue a different job's refusal", () => {
+    const lines = read([
+      ["lint", "success", "t1", "500"],
+      ["postgres-tests (heavy ${{ matrix.shard }}/${{ strategy.job-total }})", "skipped", "t1", "500"],
+      ["postgres-tests" + LEGACY, "failure", "t1", "501"],
+    ]);
+    assert.deepEqual(lines, ["STOP\tpostgres-tests" + LEGACY + "\tfailure\trun=501"]);
+  });
+
+  it("prefers a real twin over a malformed one", () => {
+    const lines = read([
+      ["ci-preflight", "success", "t1", "500"],
+      ["ci-preflight" + TMPL, "skipped", "t1", "500"],
+      ["ci-preflight" + LEGACY, "failure", "t1", "501"],
+    ]);
+    assert.deepEqual(lines, ["REFUSED-LEGACY\tci-preflight" + LEGACY + "\tfailure\trun=501"]);
+  });
+
   it("labels each refusal by its own twin, whatever the row order", () => {
     const lines = read([
       ["ci-preflight" + LEGACY, "failure", "t1", "501"],

@@ -30,6 +30,19 @@
 #                          no twin, or in any other conclusion, it STOPs: the
 #                          refusal is then the only signal that the trusted
 #                          arm never spoke for that job.
+#   MALFORMED-TWIN       — a twin-less REFUSED-LEGACY row whose trusted-arm
+#                          registration IS at this head but never expanded: some
+#                          row is named `<job>${{…`. That registration is the
+#                          MALFORMED class above, which this legend already calls
+#                          non-blocking, so the refusal it leaves twin-less is not
+#                          evidence the trusted arm skipped the job. NOT blocking.
+#                          It is also the ONLY line that reports the malformed
+#                          registration: that row is `skipped` on penstock, and
+#                          `skipped` is filtered out before the MALFORMED label is
+#                          ever reached, so dropping this row to REFUSED-LEGACY
+#                          would lose the signal entirely. Measured on
+#                          penstock-llm-proxy-core `portal-copy-scan`, which has no
+#                          bare registration at any head (PEN-6495).
 #   RENAMED-LEGACY       — a twin-less REFUSED-LEGACY row whose `<job>` appears
 #                          in NO workflow file on the PR's base sha (BLO-48833).
 #                          The PR renames that job: the trusted
@@ -822,7 +835,17 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD, $4 = RENAME
         # remaining sign that the trusted arm never ran that job, so it STOPs
         # (raised by @ally on #2956).
         { legacy = ($2 == "failure" && $1 ~ / \(legacy arm - refused, nothing ran\)$/) }
-        {twin[$1] = 1}
+        # A name carrying an un-expanded `${{` is the MALFORMED class the legend
+        # declares non-blocking, and the stem before that `${{` is the job it
+        # FAILED to register under. Record it: without this the carve-out reaches
+        # the print site and not the twin test, so a job whose trusted arm never
+        # expands looks like a job whose trusted arm never RAN, and its legacy
+        # refusal STOPs forever (PEN-6495). Exact stem only — a matrix name such as
+        # `postgres-tests (heavy ${{ matrix.shard }}…` yields `postgres-tests (heavy `
+        # and cannot collide with any legacy stem.
+        {twin[$1] = 1
+         tp = index($1, "${{")
+         if (tp > 1) tmpl[substr($1, 1, tp - 1)] = 1}
         legacy{lq++; lname[lq] = $1; lrow[lq] = $1 "\t" $2 "\trun=" $4; next}
         # Survivors are check-run verdicts only. On a repo that publishes ONLY
         # legacy statuses this fires ABSENT on every head — the documented
@@ -868,7 +891,9 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD, $4 = RENAME
         END{if(ledger) print (acs == "success" && acs_trusted ? "ADVISORY" : "STOP") "\treview/ally-ledger\tpending\trun=status"
             for (i = 1; i <= lq; i++)
               { b = substr(lname[i], 1, length(lname[i]) - 36)
-                print ((b in twin) ? "REFUSED-LEGACY" : (b in renamed) ? "RENAMED-LEGACY" : "STOP") "\t" lrow[i] }
+                print ((b in twin) ? "REFUSED-LEGACY" \
+                     : (b in tmpl) ? "MALFORMED-TWIN" \
+                     : (b in renamed) ? "RENAMED-LEGACY" : "STOP") "\t" lrow[i] }
             for (i = 1; i <= nq; i++) if (rq[i] != "" && !(rq[i] in twin) && !(rq[i] in rqs)) {
               rqs[rq[i]] = 1; miss = 1
               printf "STOP\t%s\tABSENT\trun=-\n", rq[i] }
