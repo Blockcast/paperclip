@@ -8103,18 +8103,26 @@ function ensureRegistry(): {
         + "discharged by ruling on it. Not hypothetical -- PEN-5719 fired on a card the board "
         + "HAD served, whose true pending age was 1.8d against a 7d threshold while this gauge "
         + "read 7.2d. "
-        + "KNOWN OVER-RESET, so do not read this series as resubmission-only (PEN-5818): "
-        + "`resubmit` is no longer the only write that leaves a row `pending` while moving "
-        + "`updated_at`. An in-place payload correction by the filing agent "
-        + "(`PATCH /approvals/{id}`, `updatePayload`) does so too, and this query cannot tell "
-        + "the two apart -- so a card corrected in place, which by design keeps its queue "
-        + "position and never leaves the board's court, reads here as though it were freshly "
-        + "filed. That is "
-        + "the FLATTERING direction: the series improves when a filer does the diligent thing. "
-        + "The card's own `payload_revision`/`payload_edited_at` markers separate an edit from "
-        + "a resubmission and this query does not yet consult them, so cross-check a "
-        + "suspiciously low reading against " + APPROVAL_LAST_DECISION_TIMESTAMP_METRIC
-        + ", which no payload edit can move.",
+        + "AN IN-PLACE CORRECTION DOES NOT RESET THIS AGE (PEN-5818, fixed PEN-6322). "
+        + "`resubmit` is not the only write that leaves a row `pending` while moving "
+        + "`updated_at`: an in-place payload correction by the filing agent "
+        + "(`PATCH /approvals/{id}`, `updatePayload`) does so too. Such a card keeps its queue "
+        + "position by design and never leaves the board's court, so it is aged from its "
+        + "FILING, not from its correction. The query discriminates the two on "
+        + "`payload_edited_at`, which `updatePayload` sets equal to `updated_at` and `resubmit` "
+        + "leaves null; a genuine resubmission still resets the clock. Until PEN-6322 it did "
+        + "not, and the error ran in the FLATTERING direction -- the series improved whenever a "
+        + "filer did the diligent thing (measured: a card 11.9d old reading 0.8d, and a >=7d "
+        + "band of 5 against a true 14). "
+        + "ONE RESIDUAL: a card resubmitted and THEN corrected in place loses its resubmit "
+        + "instant (no column retains it) and ages from its original filing, which OVER-reports "
+        + "-- the safe direction here. "
+        + "\u26d4 Do NOT cross-check a suspiciously low reading against "
+        + APPROVAL_LAST_DECISION_TIMESTAMP_METRIC + " and read agreement as confirmation: no "
+        + "payload edit can move that gauge, but a satisfied MERGE gate can (PEN-5885), so on a "
+        + "queue whose cards carry `payload.gate` it can advance while no board decision has "
+        + "happened at all -- measured 2026-11-11, it read 5.4h fresh against a true 176.9h "
+        + "since the last decision carrying a `decided_by_user_id`.",
       labelNames: ["type", "company_id", "requester", "gated"],
       registers: [registry],
     });
