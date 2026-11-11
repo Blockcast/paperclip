@@ -62,6 +62,110 @@ export const DEFAULT_MIN_SIBLING_CHECKS = 3;
 /** Belt-and-braces only; the sibling-check test above does the real work. */
 export const DEFAULT_GRACE_MINUTES = 20;
 
+/**
+ * A verdict was COMPUTED. These are the only conclusions that answer the
+ * question this sweep asks -- note `FAILURE` and `ACTION_REQUIRED` belong here:
+ * a red `review` is a verdict, and conflating absence with failure would make
+ * this re-report every genuinely failing PR.
+ */
+export const CONCLUSIVE_VERDICTS = new Set([
+  "SUCCESS",
+  "FAILURE",
+  "NEUTRAL",
+  "ACTION_REQUIRED",
+  // `StatusState.ERROR`, the commit-status surface's analogue of FAILURE.
+  "ERROR",
+]);
+/**
+ * The row EXISTS and carries NO verdict, and none is coming: the run was
+ * aborted, superseded or never started. PEN-6481.
+ *
+ * This is the same class PEN-6352 exists for -- a head with no computed
+ * verdict and nothing anywhere reporting it -- reached by a different
+ * mechanism than the `startup_failure` burst. A bare `byName.has(name)` test
+ * reads every one of these as verdict-present FOREVER, because unlike an
+ * in-flight row they never self-heal. `STARTUP_FAILURE` is listed because a
+ * check-run can carry it as a CONCLUSION, which is distinct from the
+ * workflow-run conclusion that publishes no check-run at all.
+ */
+export const INCONCLUSIVE_VERDICTS = new Set([
+  "CANCELLED",
+  "TIMED_OUT",
+  "STALE",
+  "SKIPPED",
+  "STARTUP_FAILURE",
+]);
+/**
+ * No verdict YET, and the row self-heals without anyone acting -- measured on
+ * #3602, `in_progress` 18:31:02Z -> `success` 18:31:10Z, 8 seconds.
+ *
+ * These must decide NOTHING. Scoring them absent is the literal "require a
+ * non-null conclusion" remedy, and it re-introduces the one-row-per-hour
+ * flapping the anti-flap guard removed: post a `neutral` row, retire it next
+ * tick, post another the tick after.
+ */
+export const UNDECIDED_VERDICTS = new Set([
+  "PENDING",
+  "EXPECTED",
+  "QUEUED",
+  "IN_PROGRESS",
+  "WAITING",
+  "REQUESTED",
+]);
+
+/**
+ * Three-way read of the watched row's own conclusion. Returns
+ * "conclusive" | "inconclusive" | "undecided" | "unknown".
+ *
+ * `unknown` is deliberately its own answer rather than folded into either
+ * neighbour. Both defaults are wrong in a way nothing would report: reading an
+ * unrecognised token as conclusive restores the exact hole above, and reading
+ * it as absent publishes a finding about a head we did not understand. Three
+ * values, and the third one says so in the report.
+ */
+export function verdictRowState(run) {
+  const conclusion = String(run?.conclusion ?? "").trim().toUpperCase();
+  // A check-run that has not completed carries a null conclusion.
+  if (conclusion === "") return "undecided";
+  if (CONCLUSIVE_VERDICTS.has(conclusion)) return "conclusive";
+  if (INCONCLUSIVE_VERDICTS.has(conclusion)) return "inconclusive";
+  if (UNDECIDED_VERDICTS.has(conclusion)) return "undecided";
+  return "unknown";
+}
+
+/**
+ * Is this context name written by an attestation producer rather than by this
+ * repository's own CI? PEN-6481.
+ *
+ * `collapseHeadChecks` unions check-runs and commit statuses into one map, so
+ * ANY context name counts toward the sibling test -- including the ally family,
+ * which `paperclip-api` writes and this repo's CI does not. Measured live
+ * 2026-11-11 on #3205 @ `eb2dc737`: four distinct names, three of them ally
+ * (`gate/ally-comment-findings`, `ci/ally-head-attested`, `review/ally-comment`)
+ * plus this sweep's own row, and ZERO repo CI. That cleared the threshold of 3
+ * EXACTLY and the head was classified `missing`.
+ *
+ * The finding was literally true -- that head has no `review` verdict -- but
+ * the sibling test's own stated purpose is "CI has not reported yet", so the
+ * row implied repo CI had run when none ever did.
+ *
+ * A DENYLIST, not an allowlist of known CI job names, and the polarity is the
+ * whole argument: an allowlist goes stale every time CI renames a job, and it
+ * fails by under-counting siblings, which makes every head look pre-CI and
+ * takes this guard SILENTLY inert. A denylist fails by counting one
+ * externally-written name we have not met, which costs one over-stated
+ * implication on one row and is visible in the report.
+ *
+ * Matched on `/`- and `-`-delimited SEGMENTS so that an ordinary CI job whose
+ * name merely contains the letters ("finally", "tally") is not swept up.
+ */
+export function isAttestationContext(name) {
+  return String(name ?? "")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .includes("ally");
+}
+
 export const PR_PAGE_SIZE = 20;
 export const SUITE_PAGE_SIZE = 20;
 export const RUN_PAGE_SIZE = 50;
@@ -168,9 +272,22 @@ export function classifyPullRequest(pr, options = {}) {
     return { verdict: "skipped", reason: "head check surface incomplete; UNPROVEN, not clean" };
   }
 
-  // Our own row is evidence we wrote. Counting it as a sibling check would let
-  // the detector bootstrap its own in-flight test one head at a time.
-  const siblingCount = [...byName.keys()].filter((name) => name !== selfCheckName).length;
+  // Three names are excluded from the sibling test, for three different
+  // reasons, and each one is load-bearing:
+  //
+  //   - OUR OWN row is evidence we wrote. Counting it would let the detector
+  //     bootstrap its own in-flight test one head at a time.
+  //   - The WATCHED name itself. Before PEN-6481 this was unreachable -- the
+  //     sibling test ran only when `review` was absent -- but an INCONCLUSIVE
+  //     `review` now falls through to it, and counting it would have the
+  //     watched check vouch for its own absence. Same self-counting class, new
+  //     arm.
+  //   - ATTESTATION contexts, which a different producer writes. See
+  //     `isAttestationContext`.
+  const attestationNames = [...byName.keys()].filter((name) => isAttestationContext(name));
+  const siblingCount = [...byName.keys()].filter(
+    (name) => name !== selfCheckName && name !== checkName && !isAttestationContext(name),
+  ).length;
   const own = byName.get(selfCheckName);
   const ownIsOpenFinding = Boolean(own) && String(own.run.conclusion ?? "").toUpperCase() === "NEUTRAL";
 
@@ -183,13 +300,44 @@ export function classifyPullRequest(pr, options = {}) {
     checkNamesPresent: siblingCount,
   };
 
-  if (byName.has(checkName)) {
+  // Presence of the NAME is not presence of a VERDICT. PEN-6481.
+  const watched = byName.get(checkName);
+  const verdictState = watched ? verdictRowState(watched.run) : "absent";
+
+  if (verdictState === "conclusive") {
     if (!ownIsOpenFinding) return { verdict: "present" };
     return { verdict: "resolved", resolution: identity };
   }
 
+  if (verdictState === "undecided") {
+    // Decide nothing: this self-heals in seconds, and our own standing row (if
+    // any) must NOT be retired on a verdict that has not been computed.
+    return {
+      verdict: "skipped",
+      reason: `\`${checkName}\` is still in flight at head; no verdict computed yet`,
+    };
+  }
+
+  if (verdictState === "unknown") {
+    return {
+      verdict: "skipped",
+      reason:
+        `\`${checkName}\` carries unrecognised conclusion \`${watched.run.conclusion}\`; ` +
+        `UNPROVEN, not absent`,
+    };
+  }
+
+  // verdictState is "absent" or "inconclusive": no verdict was computed at
+  // this head, and -- unlike the in-flight arm above -- none is coming.
+
   if (siblingCount < minSiblingChecks) {
-    return { verdict: "skipped", reason: `only ${siblingCount} check(s) at head; CI has not reported yet` };
+    const excluded = attestationNames.length
+      ? ` (${attestationNames.length} attestation context(s) excluded)`
+      : "";
+    return {
+      verdict: "skipped",
+      reason: `only ${siblingCount} check(s) at head; CI has not reported yet${excluded}`,
+    };
   }
 
   const ageMinutes = commit.committedDate
