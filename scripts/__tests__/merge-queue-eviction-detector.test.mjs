@@ -1586,6 +1586,11 @@ test("PEN-6460: the reason is read over GraphQL, because REST does not carry it"
   assert.ok(calls[0].includes("gh api graphql"), `expected a GraphQL read; got: ${calls[0]}`);
   assert.ok(calls[0].includes("RemovedFromMergeQueueEvent"), `the query must select the removal node; got: ${calls[0]}`);
   assert.ok(calls[0].includes("number=3591"), `the PR number must be bound as a variable; got: ${calls[0]}`);
+  // PEN-5530: same `String!` typing as ghQueueMembership. Pinned HERE too --
+  // this reader carries the identical flags, and covering only its sibling
+  // would leave a revert on this one green.
+  assert.ok(calls[0].includes("-f owner="), `owner must be a literal string; got: ${calls[0]}`);
+  assert.ok(calls[0].includes("-f name="), `name must be a literal string; got: ${calls[0]}`);
 
   // A failed read restores the pre-PEN-6460 behaviour exactly. This read must
   // never be able to manufacture a verdict it did not get.
