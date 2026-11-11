@@ -1295,7 +1295,72 @@ jobs:
         # indistinguishable from an unkilled guard. Check that a surviving
         # mutation could have changed behaviour at all before recording it.
         run: node --test ./scripts/merge-gate-read.test.mjs
-        timeout-minutes: 1
+        # PEN-5671. At 1m this killed `pull_request` run 42948108216 on #3622
+        # (2026-11-11T02:44:53Z, 66s, runner arc-paperclip-light-97jh6-runner-nw4q5)
+        # AFTER the suite had printed `pass 203 / fail 0` -- so `policy` went red
+        # on a passing suite, the required `verify` went red behind it, and
+        # `General tests`, `Build` and `e2e` were all skipped with the matrix
+        # expression unexpanded. Reported by the CTO seat; re-measured
+        # first-party here.
+        #
+        # THE CAP NEVER CHANGED; THE WORK DID -- the PEN-5640 shape, not the
+        # PEN-5561 one. scripts/merge-gate-read.test.mjs went 146 -> 168 `it(`
+        # declarations (203 executed tests) between 2026-11-01 and 2026-11-10,
+        # +17 of them inside the 11-02..11-05 window whose p95 climb 13s -> 34s
+        # filed this issue: BLO-51266, BLO-48830, PEN-5247, the authoritative
+        # -ally-status change, and last BLO-55385 at 1e502e306, 2026-11-10.
+        # `it(` is a PROXY for the runner's own count and undercounts
+        # loop-generated cases -- 168 declarations execute as 203 tests at this
+        # head; the growth RATE is what it is being read for, not the level.
+        #
+        # n=744 EXECUTED observations, 2026-11-08T09:31Z..2026-11-11T06:21Z.
+        # BOTH pools, because the kill landed on the one this issue did not
+        # sample:
+        #   arc-merge-queue      n=178  p50 10s  p95 30s  p100 60s*  1 at the wall
+        #   arc-paperclip-light  n=566  p50 12s  p95 24s  p100 66s*  1 kill
+        #   * censored AT the bound -- this sample cannot bound p100 from above.
+        # Counted from 500 runs PLUS 275 recovered earlier attempts:
+        # `/actions/runs/:id/jobs` serves only the LATEST attempt, 245 of those
+        # 500 runs carry more than one, and the kill above survives ONLY in
+        # attempt 1. A latest-attempt-only sweep scores this step clean, so the
+        # kill count here is a LOWER bound on any window measured that way.
+        #
+        # It overruns on CONTENTION, not on its own growth alone: wall time
+        # tracks the in-band `Checkout repository` barometer at r = 0.436
+        # (n=469), the high-contention tercile runs 1.83x the low one at p95,
+        # and the killed job itself took 1167s against a 561s p50 -- every step
+        # in it inflated, not just this one. Same signature PEN-5640 measured
+        # on its own step (r = 0.443, 1.86x).
+        #
+        # Sized by the BLO-35615 rule. Unlike the brace-expansion step above the
+        # primary form is NOT blind here: F already prices worst-case supply,
+        # and at that supply this step needs more than the 1m it had.
+        #   primary: ceil( W95 / (F * 60) ) = ceil( 20.4 / 12.6 ) = 2
+        #            W95 = 20.4 CPU-seconds, the max of n=8 off-runner
+        #                  invocations (user+sys), measured as #3389 and #3416
+        #                  measured their own. 10.8s user / 9.6s sys -- near
+        #                  even, so it is neither the fork/exec signature of
+        #                  `Test gh token wrapper` nor pure compute.
+        #            F   = 0.21 cores, the arc-light supply floor this job's own
+        #                  cap is derived from -- the worse of its two pools.
+        #   floor:   ceil( 6 * T_best / 60 ) = ceil( 6 * 5 / 60 ) = 1
+        #            T_best = 5s, fastest EXECUTED run, n=744. A `skipped` step
+        #                  carries started_at == completed_at and renders as 0s;
+        #                  31 such rows are excluded here, or T_best reads 0 and
+        #                  the floor form silently returns 1 for the wrong reason.
+        # Rule output is 2; CONTENTION_SENSITIVE_STEPS floors it at 3, and that
+        # floor is what binds. p100 is 110% of the old one-minute budget, far
+        # past that list's 50% criterion.
+        #
+        # Cross-check: 20.4 CPU-s at F = 0.21 is 97s of wall at the supply
+        # floor, which already exceeds the 66s the kill needed -- i.e. the 1m
+        # cap sat BELOW the rule's own primary form, which is the defect in one
+        # line. 3m is 1.9x that supply-floor figure, 2.7x the worst observed
+        # need and 8.8x the off-runner p100 (20.6s), so it reads as a hang
+        # detector rather than a performance budget.
+        # Held at or above the floor by CONTENTION_SENSITIVE_STEPS in
+        # policy-node-test-timeouts.test.mjs.
+        timeout-minutes: 3
 
       - name: Test comment-review-gate merge-queue mirror
         if: ${{ !cancelled() }}
