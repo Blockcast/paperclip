@@ -251,7 +251,14 @@ const PENDING_STATUS = "pending";
  * and against that GREATEST is actively unhelpful, since it would prefer the
  * future timestamp. The two guards cover opposite ends and are both load-bearing.
  */
-const PENDING_SINCE = sql`case
+/**
+ * EXPORTED so `hasPendingBoardApprovalWakePath` in `recovery/service.ts` reuses
+ * this exact expression rather than hand-copying it (PEN-6322 review). This PR
+ * exists because two readers of `updated_at` drifted apart on what it meant; a
+ * second hand-written copy of the discriminator is the same drift waiting to
+ * happen, so a future change to it has to land in both readers by construction.
+ */
+export const PENDING_SINCE = sql`case
   when ${approvals.payloadEditedAt} is not null and ${approvals.updatedAt} = ${approvals.payloadEditedAt}
     then ${approvals.createdAt}
   else greatest(${approvals.createdAt}, ${approvals.updatedAt})

@@ -50,6 +50,7 @@ import {
 import { loadConfig } from "../../config.js";
 import { parseObject, asBoolean, asNumber } from "../../adapters/utils.js";
 import { runningProcesses } from "../../adapters/index.js";
+import { PENDING_SINCE } from "../approval-queue-metrics.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { wakeRequestTargetsIssueCondition } from "../agent-wakeup-target.js";
 import { isDeliberateParkActive } from "../issue-park-expiry.js";
@@ -3741,21 +3742,17 @@ export function recoveryService(
           eq(approvals.companyId, issue.companyId),
           eq(approvals.status, "pending"),
           eq(approvals.requestedByAgentId, issue.assigneeAgentId),
-          // PEN-6322: same discrimination as `PENDING_SINCE` in
-          // `approval-queue-metrics.ts`, and for the same reason -- `updated_at` on a
-          // pending row means "resubmitted" OR "payload corrected in place", and only
-          // the first is a fresh board-owned wait. Reading an in-place correction as a
-          // resubmission here OVER-EXEMPTS: it reports a live decision wake for up to
-          // the full grace on a card whose decision may not be coming, so the issue
-          // stays unattended. Keep the two expressions in step; a test in
-          // `approval-queue-metrics.test.ts` drives both real writers against the
-          // gauge, and this predicate shares the semantics but not that coverage.
-          sql`(case
-                 when ${approvals.payloadEditedAt} is not null
-                   and ${approvals.updatedAt} = ${approvals.payloadEditedAt}
-                 then ${approvals.createdAt}
-                 else GREATEST(${approvals.createdAt}, ${approvals.updatedAt})
-               end) > ${filedSinceIso}::timestamptz`,
+          // PEN-6322: `updated_at` on a pending row means "resubmitted" OR "payload
+          // corrected in place", and only the first is a fresh board-owned wait.
+          // Reading an in-place correction as a resubmission OVER-EXEMPTS here: it
+          // reports a live decision wake for up to the full grace on a card whose
+          // decision may not be coming, so the issue stays unattended.
+          //
+          // IMPORTED, not re-derived. The defect this fixes was two readers of the same
+          // column disagreeing about what it meant, so a hand-copied discriminator is
+          // that same drift waiting to recur -- sharing the expression makes a future
+          // change land in both readers by construction.
+          sql`(${PENDING_SINCE}) > ${filedSinceIso}::timestamptz`,
         ),
       )
       .limit(1)
