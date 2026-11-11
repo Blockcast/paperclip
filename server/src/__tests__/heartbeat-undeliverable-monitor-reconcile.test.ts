@@ -165,6 +165,48 @@ describeEmbeddedPostgres("heartbeat reconcileUndeliverableIssueMonitors", () => 
     return issueId;
   }
 
+  /**
+   * PEN-6202 — a row that derives as `triggered` from LEFTOVER COLUMNS ALONE.
+   *
+   * The clear patch nulls `monitorNextCheckAt`, `monitorWakeRequestedAt` and
+   * `monitorNotes`; it leaves `monitorLastTriggeredAt` and
+   * `monitorAttemptCount` standing. A later reopen writes
+   * `{status: 'todo', executionState: null}`, so the row ends up with no
+   * monitor JSON at all beside two retained trigger columns — and
+   * `derivePersistedMonitorState` reaches its third branch off those columns
+   * and reports `triggered` for a monitor that died long ago.
+   *
+   * Modelled on the one live instance, PEN-389: `executionState` null,
+   * `monitorAttemptCount` 2, `monitorLastTriggeredAt` 2026-06-19, notes still
+   * populated. (Notes survive here because this row's columns were left behind
+   * by an older path than the one that nulls them; the guard does not depend on
+   * which, only on the monitor JSON being absent.)
+   */
+  async function seedTriggerColumnsOnlyIssue(
+    companyId: string,
+    assigneeAgentId: string | null,
+    opts?: { status?: string; firedAt?: Date },
+  ) {
+    const issueId = randomUUID();
+    const firedAt = opts?.firedAt ?? new Date(Date.now() - 145 * 24 * 60 * 60 * 1000);
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Reopened after a clear, with only the trigger columns left",
+      status: opts?.status ?? "todo",
+      priority: "high",
+      assigneeAgentId,
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: null,
+      monitorLastTriggeredAt: firedAt,
+      monitorNotes: MONITOR_NOTES,
+      monitorScheduledBy: "assignee",
+      monitorAttemptCount: 2,
+    });
+    return { issueId, firedAt };
+  }
+
   function readIssue(issueId: string) {
     return db
       .select({
@@ -428,5 +470,64 @@ describeEmbeddedPostgres("heartbeat reconcileUndeliverableIssueMonitors", () => 
     expect(result).toMatchObject({ scanned: 1, cleared: 0, skipped: 1, failed: 0 });
     expect((await readIssue(issueId)).executionState as { monitor?: { clearReason?: string } } | null)
       .toMatchObject({ monitor: { clearReason: "manual" } });
+  });
+
+  /**
+   * MUST-NOT-FIRE, and it carries its own discrimination control.
+   *
+   * Raised by Ally on #3660 and ruled on PEN-6202 2026-11-10: a row can derive
+   * as `triggered` from retained COLUMNS with no monitor JSON at all. Selecting
+   * it is not the free over-selection the candidate scan's other arms are —
+   * `holdsTriggeredMonitor` reads the same derivation, so the patch builder
+   * does NOT return an empty patch. It computes `invalid_status` and this pass
+   * stamps a fresh `clearedAt`/`clearReason` over a monitor that died months
+   * earlier, which is the falsified-death-date class PEN-5902 is about. The
+   * fired arm's `executionState.monitor.status` CAS cannot catch it either:
+   * the row carries no monitor JSON before OR after, so both sides of
+   * `is not distinct from` are null and the CAS passes.
+   *
+   * Two rows, one sweep. The second row is the control, and it is what stops
+   * this test passing for the wrong reason: a guard that disabled the fired arm
+   * outright would also leave the control uncleared and fail here. A bare
+   * `scanned: 0` assertion on the first row alone cannot tell "correctly
+   * skipped" from "arm is dead".
+   */
+  it("skips a row deriving `triggered` from leftover columns, and still sweeps a real fired monitor (PEN-6202)", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const { issueId: leftoverId, firedAt } = await seedTriggerColumnsOnlyIssue(companyId, agentId);
+    const firedId = await seedFiredIssue(companyId, agentId, { status: "blocked" });
+
+    const result = await heartbeat.reconcileUndeliverableIssueMonitors();
+
+    // The control proves the arm is still live: exactly the real fired monitor
+    // is scanned and cleared, and the leftover-columns row reaches neither.
+    expect(result).toMatchObject({ scanned: 1, cleared: 1, skipped: 0, failed: 0 });
+    expect((await readIssue(firedId)).executionState as { monitor?: { status?: string } } | null)
+      .toMatchObject({ monitor: { status: "cleared" } });
+
+    // The leftover-columns row is untouched: no monitor JSON invented, and in
+    // particular no `clearedAt` dated today over a monitor that died in June.
+    const leftover = await db
+      .select({
+        executionState: issues.executionState,
+        monitorLastTriggeredAt: issues.monitorLastTriggeredAt,
+        monitorAttemptCount: issues.monitorAttemptCount,
+        monitorNotes: issues.monitorNotes,
+      })
+      .from(issues)
+      .where(eq(issues.id, leftoverId))
+      .then((rows) => rows[0]!);
+    expect(leftover.executionState).toBeNull();
+    expect(leftover.monitorLastTriggeredAt?.toISOString()).toBe(firedAt.toISOString());
+    expect(leftover.monitorAttemptCount).toBe(2);
+    expect(leftover.monitorNotes).toBe(MONITOR_NOTES);
+
+    // And nothing was logged against it, so no census or ledger reading this
+    // pass's activity rows can date its death to today.
+    const logged = await db
+      .select({ issueId: activityLog.issueId })
+      .from(activityLog)
+      .where(eq(activityLog.issueId, leftoverId));
+    expect(logged).toHaveLength(0);
   });
 });
