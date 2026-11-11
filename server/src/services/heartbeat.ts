@@ -14727,7 +14727,21 @@ export function buildPaperclipTaskMarkdown(input: {
     // UNDERSTOOD. `listOwnersByExternalId` matches `(companyId, provider, type,
     // externalId)` exactly, so a 200 means it PARSED and nothing more, and every error
     // class that actually occurs -- wrong repo, wrong number, an issue number where a PR
-    // number was meant -- is shape-valid and lands silently in the empty bucket.
+    // number was meant -- is shape-valid and never announced.
+    //
+    // Those five probes sampled ONE stratum: every wrong key among them named nothing
+    // tracked, so every one landed in the empty bucket. That is why the first draft of
+    // the string below generalised to "each return 200 with an empty `owners`". The
+    // stratum they missed is the one master's paragraph above is about, and exact
+    // matching is why it differs: a wrong key naming a DIFFERENT TRACKED PR returns
+    // that PR's rows, fully populated. Measured 2026-11-11, the missing stratum --
+    // `Blockcast/penstock-llm-proxy-core#3110` returns 5 owners (PEN-5455 owning) and
+    // `Blockcast/paperclip#3110` returns 4 (PEN-4932 owning); both tracked, disjoint
+    // sets, each `ownerListComplete: true` with `withheldForAuthorizationCount: 0`.
+    // Nothing a caller can read distinguishes the wrong one from the right one. Of 10
+    // PR numbers probed across those two repos in a band where both are active, 7 are
+    // tracked in both -- that band was chosen for overlap and is not a fleet-wide
+    // collision rate, but the collision is ordinary rather than contrived.
     //
     // Stated HERE, on the ownership question, because this is the dangerous half. A
     // reader asking "has #NNNN merged" needs a populated `workProduct` to answer at all,
