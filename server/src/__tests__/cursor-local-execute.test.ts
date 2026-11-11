@@ -116,6 +116,16 @@ async function createSkillDir(root: string, name: string) {
   return skillDir;
 }
 
+/**
+ * Same inversion as `claude-local-execute.test.ts`, same remedy: a vitest
+ * deadline at or below the `executionTarget` budget the test awaits can never
+ * let that budget express itself, so a loaded ARC runner reports `Test timed
+ * out` instead of the behaviour under test. This one carried 10_000ms against a
+ * 30_000ms budget. PEN-3381.
+ */
+const SANDBOX_EXECUTE_TIMEOUT_MS = 30_000;
+const SANDBOX_TEST_DEADLINE_MS = SANDBOX_EXECUTE_TIMEOUT_MS * 4;
+
 describe("cursor execute", () => {
   it("injects paperclip env vars and prompt note by default", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-execute-"));
@@ -356,7 +366,7 @@ describe("cursor execute", () => {
           transport: "sandbox",
           remoteCwd: remoteWorkspace,
           runner: createLocalSandboxRunner(),
-          timeoutMs: 30_000,
+          timeoutMs: SANDBOX_EXECUTE_TIMEOUT_MS,
         },
         config: {
           command: "agent",
@@ -383,7 +393,7 @@ describe("cursor execute", () => {
       else process.env.HOME = previousHome;
       await fs.rm(root, { recursive: true, force: true });
     }
-  }, 10_000);
+  }, SANDBOX_TEST_DEADLINE_MS);
 
   it("keeps explicit command overrides for remote sandbox execution", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-cursor-sandbox-explicit-"));
@@ -422,7 +432,7 @@ describe("cursor execute", () => {
           transport: "sandbox",
           remoteCwd: remoteWorkspace,
           runner: createLocalSandboxRunner(),
-          timeoutMs: 30_000,
+          timeoutMs: SANDBOX_EXECUTE_TIMEOUT_MS,
         },
         config: {
           command: customCommandPath,
