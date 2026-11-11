@@ -183,12 +183,21 @@ const ALLOWLIST = [
   {
     file: "scripts/github-publish-broker-soak-queries.test.mjs",
     reason:
-      "Registration for this file is the sole unique residue of PR #3205, " +
-      "which is open and held on its code-owner review request. PEN-5272 " +
-      "forbids routing around that hold, so the step is NOT duplicated here " +
-      "and this entry stands in for it. DELETE THIS ENTRY when #3205 lands " +
-      "(arm 4 will print a notice telling you to); if #3205 is closed " +
-      "unmerged, re-land its 23-line pr.yml step and delete this entry then.",
+      "Registration for this file is the sole unique residue of PR #3205. " +
+      "That PR's operative hold is the `do-not-merge` label, NOT the " +
+      "code-owner review request this entry named until 2026-11-11: " +
+      "`land-clean-prs.mjs` opts out on `SKIP_LABELS` before it reaches any " +
+      "code-owner handling, so no CODEOWNERS ruling releases it and clearing " +
+      "the review request would achieve nothing. Measured live 2026-11-11: " +
+      "#3205 OPEN, CONFLICTING/DIRTY, labels ['do-not-merge'], " +
+      "reviewDecision null, head eb2dc737 unmoved since 2026-11-03. " +
+      "Removing that label is the CEO's to authorise and is ALREADY asked on " +
+      "board card c4bfaa88 (annotation c5350051) -- a second ask is a " +
+      "duplicate, not an escalation. PEN-5272 forbids routing around the " +
+      "hold, so the step is NOT duplicated here and this entry stands in for " +
+      "it. DELETE THIS ENTRY when #3205 lands (arm 4 will print a notice " +
+      "telling you to); if #3205 is closed unmerged, re-land its 23-line " +
+      "pr.yml step and delete this entry then.",
     pendingRegistrationPr: 3205,
   },
 ];
