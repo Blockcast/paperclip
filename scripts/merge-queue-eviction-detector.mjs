@@ -993,6 +993,56 @@ export function ghDequeueReason(repo, prNumber, dequeuedAt, exec = run) {
   }
 }
 
+// PEN-5530: `isInMergeQueue` / `mergeQueueEntry` are GraphQL-only -- `gh pr
+// view` has no such field (it errors with the field list), and
+// `mergeStateStatus` does NOT report queue membership: measured 2026-11-11 on
+// two PRs sitting at queue positions 1 and 2, both read `UNKNOWN`, and it has
+// separately been measured `CLEAN` on a queued PR -- neither value carries the
+// fact. Anything that branches on queue membership has to come through here.
+export const QUEUE_MEMBERSHIP_QUERY = `query($owner:String!,$name:String!,$number:Int!){
+  repository(owner:$owner,name:$name){
+    pullRequest(number:$number){
+      isInMergeQueue
+      mergeQueueEntry{ position enqueuedAt }
+    }
+  }
+}`;
+
+// Returns `{inQueue, position, enqueuedAt}` on a successful read, or `null`
+// when the read failed for ANY reason. The tri-state is load-bearing and the
+// null arm must never collapse into `inQueue: false`: `false` is a positive
+// claim that this PR is out of the queue, and the notice drops its re-add
+// instruction on the strength of the opposite claim. A 403, an exhausted REST
+// quota, a schema error and a PR that does not resolve all arrive here as an
+// absent or non-boolean `isInMergeQueue`, so membership is asserted only when
+// GitHub actually said a boolean.
+export function ghQueueMembership(repo, prNumber, exec = run) {
+  const [owner, name] = String(repo ?? "").split("/");
+  if (!owner || !name) return null;
+  try {
+    const out = exec([
+      "gh", "api", "graphql",
+      "-f", `query=${QUEUE_MEMBERSHIP_QUERY}`,
+      "-F", `owner=${owner}`,
+      "-F", `name=${name}`,
+      "-F", `number=${prNumber}`,
+      "--jq",
+      ".data.repository.pullRequest | {inQueue: .isInMergeQueue, " +
+        "position: .mergeQueueEntry.position, enqueuedAt: .mergeQueueEntry.enqueuedAt}",
+    ]);
+    const rows = parseNdjson(out);
+    const row = rows.length > 0 ? rows[rows.length - 1] : null;
+    if (typeof row?.inQueue !== "boolean") return null;
+    return {
+      inQueue: row.inQueue,
+      position: Number.isFinite(row.position) ? row.position : null,
+      enqueuedAt: typeof row.enqueuedAt === "string" && row.enqueuedAt.trim().length > 0 ? row.enqueuedAt : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function parseArgs(argv) {
   const args = {};
   for (let i = 0; i < argv.length; i += 1) {
@@ -1030,7 +1080,9 @@ export function buildEvictionCommentBody({
   dequeueReason = null,
   unknownReason = "truncated_sample",
   admissionEvidence = null,
+  queueMembership = null,
 }) {
+  const [repoOwner = "", repoName = ""] = String(repo ?? "").split("/");
   // PEN-3926: `manual` is now reachable with ZERO runs (a dequeue that beat
   // the queue to staging), so its cause line can no longer assert that a run
   // was created. The branch below is keyed on the ACTOR, not on the run
@@ -1090,11 +1142,25 @@ export function buildEvictionCommentBody({
     // failed -- both are failing required checks, and saying "concluded
     // failing" sent readers of the cancelled shape looking for a red run that
     // does not exist.
+    // PEN-5530 (Done-when 5): the old wording said a required check "on" the
+    // `merge_group` run did not pass. GitHub's `reason: failed_checks` does
+    // not entail that -- it says a required check for the queue head failed,
+    // not which producer posted it, and a required context can be written at
+    // the queue head by something that is not a `merge_group` workflow. That
+    // a run EXISTS is still entailed and is still stated: the zero-run branch
+    // of `classifyMergeQueueEviction` returns before this classification is
+    // reachable, so `check_failure` implies at least one run. Measured latent
+    // on this repo -- 47 `failed_checks` removals 2026-11-04..11, and on 47
+    // of 47 the failing check was a job inside a run the reader could open --
+    // so this is a precision fix, not a live misdirection.
     check_failure:
-      "**failing required check** -- a `merge_group` run was created for this PR's head and a required check on " +
-      "it did not pass. The run itself may read `cancelled` rather than `failure`: a gating job killed by its " +
-      "own `timeout-minutes` budget is recorded as `cancelled`, and the orphan sweeper cancels a run once a " +
-      "gating job has failed. Open the run and look for the job that did not finish clean, not for a red run.",
+      "**failing required check** -- a required check for this PR's queue head did not pass. A `merge_group` run " +
+      "was created for this head, and the failing check is normally a job inside it -- start there. The run " +
+      "itself may read `cancelled` rather than `failure`: a gating job killed by its own `timeout-minutes` " +
+      "budget is recorded as `cancelled`, and the orphan sweeper cancels a run once a gating job has failed. " +
+      "Look for the job that did not finish clean, not for a red run. If every run is clean, the failing " +
+      "required check was posted at the queue head by something other than a `merge_group` run -- read the " +
+      "head's check list directly.",
     manual: manualCause,
     // PEN-6460: `unknown` now has two causes and they need different words.
     // The notice must not assert a manual dequeue when the truth is that a
@@ -1110,6 +1176,69 @@ export function buildEvictionCommentBody({
           "with no match, so an incomplete sample can't be told apart from a genuine zero. Diagnose manually " +
           "via `runbooks/merge-queue-stalled-head.md` before assuming a conflict.",
   }[classification];
+  // PEN-5530: the action line used to be written WITHOUT reading whether the
+  // PR is already back in the queue. Measured on #3215 (2026-11-04): removed
+  // at 12:23:33Z, re-enqueued at 12:23:41Z (+8s), and this notice posted at
+  // 12:25:13Z telling its reader to "confirm the hold is over" and re-add a
+  // PR that was by then at queue position 1 with a `merge_group` build 80s
+  // into its run. Re-adding or rebasing there EJECTS the live entry and voids
+  // that build, so the instruction was not merely stale -- acting on it was
+  // destructive.
+  //
+  // Applied to EVERY classification, not only `manual` as the row originally
+  // scoped it: every branch below ends in a re-add instruction, and the harm
+  // is a property of the CURRENT queue state, never of why the PR left the
+  // queue.
+  //
+  // `queueMembership === null` is a THIRD state and must not collapse into
+  // `inQueue: false`. `false` is a positive claim that this PR is out of the
+  // queue, and it is what licenses printing the re-add instruction; a failed
+  // read is not entitled to make either claim, so it falls through to the
+  // pre-PEN-5530 wording and says plainly that it could not look.
+  const backInQueue = queueMembership?.inQueue === true;
+  const requeuedAt = typeof queueMembership?.enqueuedAt === "string" ? queueMembership.enqueuedAt : null;
+  const queuePosition = Number.isFinite(queueMembership?.position) ? queueMembership.position : null;
+  const membershipLine = backInQueue
+    ? `Queue status when this notice was written: **back in the \`${base}\` merge queue**` +
+      (requeuedAt ? `, re-added at ${requeuedAt}` : "") +
+      (queuePosition !== null ? ` (GitHub-reported position ${queuePosition})` : "") +
+      "."
+    : queueMembership?.inQueue === false
+      ? `Queue status when this notice was written: not in the \`${base}\` merge queue.`
+      : "Queue status when this notice was written: **could not be read** -- check it yourself before acting.";
+  // PEN-5530 (the #3591 bound): a write-time membership read is necessary and
+  // NOT sufficient. Measured 2026-11-10 on #3591 the notice was accurate for
+  // 4m40s and the reader acted ~8 minutes later, by which time the PR had
+  // been back in the queue for ~8 minutes. Membership is a CYCLIC value, so
+  // every statement this notice makes about it is a dated reading with a
+  // short half-life. The only part that survives reader latency is telling
+  // the reader to take the reading again, and naming the one field that
+  // reports it -- `gh pr view` has no `isInMergeQueue`, and
+  // `mergeStateStatus` does not report membership.
+  const reReadLines = [
+    "",
+    "That queue status is a reading taken when this notice was posted, **not a standing fact** -- a PR can be " +
+      "re-added or evicted again at any time and this comment will not change. Re-read it immediately before " +
+      "you act:",
+    "",
+    "```",
+    `gh api graphql -f query='{repository(owner:"${repoOwner}",name:"${repoName}")` +
+      `{pullRequest(number:${prNumber}){isInMergeQueue mergeQueueEntry{position state enqueuedAt}}}}'`,
+    "```",
+  ];
+  const actionLine = backInQueue
+    ? "**No queue action is required right now: this PR is already back in the merge queue.** Do **not** re-add " +
+      "it and do **not** rebase it on the strength of this notice -- either would eject the live entry and void " +
+      "the `merge_group` run building on it. The cause above explains the EARLIER removal and is still worth " +
+      "reading; act on it only if this new attempt fails the same way."
+    : classification === "manual"
+      ? "Re-add this PR to the merge queue once whoever dequeued it confirms the hold is over."
+      : classification === "requirements_unmet"
+        ? "Wait for this head's required checks to complete, then re-add -- or arm auto-merge (`gh pr merge " +
+          "--auto --rebase`) and let GitHub enqueue it when the requirements are met. Do not rebase on the " +
+          "strength of this notice."
+        : "Re-add this PR to the merge queue once the underlying issue is resolved (rebase onto the current base " +
+          "for an un-stageable eviction; fix the failing check; or confirm with whoever dequeued it manually).";
   return [
     MERGE_QUEUE_EVICTION_MARKER,
     `PR #${prNumber} was removed from the \`${base}\` merge queue and is **not merged**.`,
@@ -1126,6 +1255,8 @@ export function buildEvictionCommentBody({
         : "") +
       ")",
     "",
+    membershipLine,
+    "",
     // PEN-3926: a `manual` notice must not lead with "rebase onto the current
     // base". That instruction is what made the false notices harmful -- it is
     // an action against a clean branch under a deliberate hold, and both a
@@ -1133,14 +1264,10 @@ export function buildEvictionCommentBody({
     // PEN-4887: `requirements_unmet` joins `manual` in getting its own closing
     // line. The generic one leads with "rebase onto the current base", which is
     // precisely the no-op this class was being mislabelled into.
-    classification === "manual"
-      ? "Re-add this PR to the merge queue once whoever dequeued it confirms the hold is over."
-      : classification === "requirements_unmet"
-        ? "Wait for this head's required checks to complete, then re-add -- or arm auto-merge (`gh pr merge " +
-          "--auto --rebase`) and let GitHub enqueue it when the requirements are met. Do not rebase on the " +
-          "strength of this notice."
-        : "Re-add this PR to the merge queue once the underlying issue is resolved (rebase onto the current base " +
-          "for an un-stageable eviction; fix the failing check; or confirm with whoever dequeued it manually).",
+    // PEN-5530: and none of them is emitted at all when the PR is already back
+    // in the queue -- see `actionLine` above.
+    actionLine,
+    ...reReadLines,
     // Ally review #1220 (4th pass): embedded so the webhook's issue_comment
     // handler (which has no branch name to fall back on) can still route the
     // wake for a PR linked to Paperclip only through its branch.
@@ -1272,6 +1399,13 @@ async function main() {
     ? "unreadable_jobs"
     : "truncated_sample";
 
+  // PEN-5530: read LAST, immediately before the notice is built, because
+  // queue membership is cyclic and every second between the read and the
+  // write is staleness the reader inherits. Deliberately NOT passed to
+  // `classifyMergeQueueEviction`: the classification explains why the PR left
+  // the queue, which is history and cannot be changed by what the queue looks
+  // like now. Only the ACTION line depends on the present state.
+  const queueMembership = ghQueueMembership(repo, prNumber);
   const result = {
     repo,
     prNumber,
@@ -1282,6 +1416,7 @@ async function main() {
     truncated,
     attemptWindow,
     dequeueReason,
+    queueMembership,
     mergeGroupRunCount: mergeGroupRuns.length,
     mergeGroupRuns,
     admissionEvidence,
@@ -1301,6 +1436,7 @@ async function main() {
       dequeueReason,
       unknownReason,
       admissionEvidence,
+      queueMembership,
     });
     run(["gh", "pr", "comment", String(prNumber), "--repo", repo, "--body", body]);
   }
