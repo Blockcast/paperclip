@@ -275,6 +275,69 @@ describe("merge-gate reader", () => {
     assert.deepEqual(lines, ["STOP\tpostgres-tests" + LEGACY + "\tfailure\trun=501"]);
   });
 
+  // @ally, Important, on this PR. The `$2 == "skipped"` conjunct is the whole
+  // guard: without it a malformed trusted row that is ALSO `failure` prints
+  // MALFORMED (non-blocking) while the refusal it excuses prints MALFORMED-TWIN
+  // (non-blocking), taking the head from one STOP to ZERO -- a merge-authorizing
+  // false GREEN on the reader whose entire recent history is that class. A real
+  // twin can ignore conclusion because a bare `<job> failure` STOPs on its own
+  // line; a malformed twin cannot, its line being carved out already.
+  // Mutation: dropping `&& $2 == "skipped"` turns this red.
+  it("does not excuse a refusal when the malformed registration is itself failure", () => {
+    const lines = read([
+      ["lint", "success", "t1", "500"],
+      ["portal-copy-scan" + TMPL, "failure", "t1", "500"],
+      ["portal-copy-scan" + LEGACY, "failure", "t1", "501"],
+    ]);
+    assert.deepEqual(lines, [
+      "MALFORMED\tportal-copy-scan" + TMPL + "\tfailure\trun=500",
+      "STOP\tportal-copy-scan" + LEGACY + "\tfailure\trun=501",
+    ]);
+    assert.equal(stops(lines).length, 1);
+  });
+
+  // @ally, Suggestion, on this PR: `tmpl` is consulted BEFORE `renamed`, so pin
+  // that order. A malformed registration at THIS head is direct evidence the
+  // trusted arm registered the job and can never report it; `renamed` is an
+  // inference from base-workflow TEXT. The direct reading wins.
+  it("prefers MALFORMED-TWIN over RENAMED-LEGACY when a stem is in both", () => {
+    const lines = read(
+      [
+        ["lint", "success", "t1", "500"],
+        ["portal-copy-scan" + TMPL, "skipped", "t1", "500"],
+        ["portal-copy-scan" + LEGACY, "failure", "t1", "501"],
+      ],
+      "__none__", "", "", "portal-copy-scan",
+    );
+    assert.deepEqual(lines, ["MALFORMED-TWIN\tportal-copy-scan" + LEGACY + "\tfailure\trun=501"]);
+    assert.equal(stops(lines).length, 0);
+  });
+
+  // The `tp > 1` guard is UNKILLED by the fixtures above: mutating it to
+  // `tp > 0` leaves the suite green. An expression-only name stems to "", which
+  // matches no ordinary job, so the obvious probe passes in BOTH states; the
+  // only discriminating input is a refusal whose own job name is EMPTY -- a row
+  // named exactly the 36-char suffix, which also strips to "".
+  // Mutation: `tp > 0` turns this red, in the merge-authorizing direction.
+  it("does not let an expression-only name rescue an empty-stemmed refusal", () => {
+    assert.deepEqual(
+      read([
+        ["lint", "success", "t1", "500"],
+        ["${{ matrix.name }}", "skipped", "t1", "500"],
+        ["portal-copy-scan" + LEGACY, "failure", "t1", "501"],
+      ]),
+      ["STOP\tportal-copy-scan" + LEGACY + "\tfailure\trun=501"],
+    );
+    assert.deepEqual(
+      read([
+        ["lint", "success", "t1", "500"],
+        ["${{ matrix.name }}", "skipped", "t1", "500"],
+        [LEGACY, "failure", "t1", "501"],
+      ]),
+      ["STOP\t" + LEGACY + "\tfailure\trun=501"],
+    );
+  });
+
   it("prefers a real twin over a malformed one", () => {
     const lines = read([
       ["ci-preflight", "success", "t1", "500"],
