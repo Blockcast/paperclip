@@ -5671,6 +5671,17 @@ function issueRef(row: Pick<IssueRow, "id" | "identifier" | "title" | "status" |
  */
 export const ISSUE_SEARCH_ARMS_ALIAS = "issue_search_arms";
 
+/**
+ * Alias of the deferred-join page subquery in `list()` (PEN-3596).
+ *
+ * Distinct from {@link ISSUE_SEARCH_ARMS_ALIAS}: the arms table answers "which
+ * issues match the search term, and at what rank", and this one answers "which
+ * `limit` of those, in which order, is this page". On a search they nest --
+ * the arms join lives INSIDE this subquery -- so both aliases appear in one
+ * statement and neither may be renamed to the other.
+ */
+export const ISSUE_LIST_PAGE_ALIAS = "issue_list_page";
+
 export function issueSearchArmsSubquery(
   companyId: string,
   startsWithPattern: string,
@@ -9395,6 +9406,63 @@ export function issueService(db: Db) {
       // `issueSearchArmsSubquery` for the equivalence argument and the
       // production measurement that motivated it.
       const searchOrder = issueSearchRankExpr();
+      const orderBySpec = {
+        hasSearch,
+        priorityOrder,
+        sortField: filters?.sortField,
+        sortDir: filters?.sortDir,
+      };
+      // PEN-3596: DEFERRED JOIN (late row lookup). The page is chosen on a
+      // NARROW tuple -- `issues.id` plus the relevance rank -- and only the
+      // `limit` rows that survive `ORDER BY ... LIMIT` are then widened to the
+      // full `issueListSelect` column set.
+      //
+      // WHY. `issueListSelect` is 41 columns and three of them are PER-ROW
+      // COMPUTATION, not a column read: `executionState` is a `jsonb_each` +
+      // `jsonb_object_agg` round trip, `monitorStatus` a second jsonb descent,
+      // and `description` a `substring()` over a TOAST'd value. In the single-
+      // statement shape those run for EVERY candidate row the WHERE admits,
+      // because the Sort node carries the full output tuple and `LIMIT` cannot
+      // discard a row until after it has been produced. The cost was therefore
+      // CANDIDATE-bound while the result is PAGE-bound -- `limit=15` and
+      // `limit=1000` paid the same widening bill. That is the same defect class
+      // #3539 removed from the relevance key and PEN-5213 removed from the sort
+      // key; this is the third and last instance of it in this statement.
+      //
+      // The inner query keeps the arms join, the full `conditions` set and the
+      // exact `issueListOrderBy` ordering, so the set of ids and their order are
+      // unchanged by construction. The outer re-applies the SAME ordering --
+      // a join does not preserve subquery order, so this is required for
+      // correctness, not belt-and-braces -- reading the rank off the subquery
+      // rather than recomputing it.
+      //
+      // ⚠️ Gated on `limit !== undefined`. With no limit every candidate row is
+      // returned anyway, so the widening is not avoidable and the extra join
+      // would be pure overhead; that path keeps the previous single-statement
+      // shape byte-identical.
+      //
+      // ⛔ `searchRank` is selected unconditionally (a literal `0` when there is
+      // no search) so the subquery's row type does not vary with `hasSearch`.
+      // `issueListOrderBy` still ignores it on the no-search branch, so the
+      // no-search ORDER BY is unchanged.
+      // ⛔ `.as(...)` is REQUIRED, not cosmetic: drizzle refuses to reference a
+      // raw-SQL field of a subquery that carries no alias, and the refusal is a
+      // runtime throw from the selection proxy rather than a type error.
+      const narrowPageSelect = {
+        id: issues.id,
+        searchRank: (hasSearch ? searchOrder : sql<number>`0`).as("search_rank"),
+      };
+      const scopedKeyQuery = db.select(narrowPageSelect).from(issues).$dynamic();
+      const joinedKeyQuery = hasSearch
+        ? scopedKeyQuery.innerJoin(
+          issueSearchArmsSubquery(companyId, startsWithPattern, containsPattern),
+          issueSearchArmsJoinOn(),
+        )
+        : scopedKeyQuery;
+      const orderedKeyQuery = joinedKeyQuery
+        .where(and(...conditions))
+        .orderBy(...issueListOrderBy({ ...orderBySpec, searchOrder }));
+
       // `$dynamic()` so the join can be conditional without the builder type
       // changing under the assignment; the no-search statement is byte-identical
       // to what it was before this change.
@@ -9407,16 +9475,25 @@ export function issueService(db: Db) {
         : scopedQuery;
       const baseQuery = joinedQuery
         .where(and(...conditions))
-        .orderBy(...issueListOrderBy({
-          hasSearch,
-          priorityOrder,
-          searchOrder,
-          sortField: filters?.sortField,
-          sortDir: filters?.sortDir,
-        }));
-      const pageQuery = offset > 0
-        ? (limit === undefined ? baseQuery.offset(offset) : baseQuery.limit(limit).offset(offset))
-        : (limit === undefined ? baseQuery : baseQuery.limit(limit));
+        .orderBy(...issueListOrderBy({ ...orderBySpec, searchOrder }));
+
+      let pageQuery: any;
+      if (limit === undefined) {
+        pageQuery = offset > 0 ? baseQuery.offset(offset) : baseQuery;
+      } else {
+        const keyPageQuery = offset > 0
+          ? orderedKeyQuery.limit(limit).offset(offset)
+          : orderedKeyQuery.limit(limit);
+        const pageSubquery = keyPageQuery.as(ISSUE_LIST_PAGE_ALIAS);
+        pageQuery = db
+          .select(issueListSelect)
+          .from(issues)
+          .innerJoin(pageSubquery, eq(pageSubquery.id, issues.id))
+          .orderBy(...issueListOrderBy({
+            ...orderBySpec,
+            searchOrder: sql<number>`${pageSubquery.searchRank}`,
+          }));
+      }
       // PEN-4450: this is the primary list surface and it had NO description post-step —
       // it returned the raw `issueListSelect` slice. With the probe in that slice, omitting
       // the mapper here would ship 1201 code points and no flag; it is also the path whose

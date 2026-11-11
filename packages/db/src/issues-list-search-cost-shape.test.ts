@@ -390,6 +390,79 @@ END)`;
 
 const PAGE_TAIL = `i.priority, i.last_activity_at DESC, i.updated_at DESC, i.id DESC`;
 
+/**
+ * PEN-3596: the expensive half of `issueListSelect`, verbatim in spirit.
+ *
+ * The list projection is 41 columns and three of them are PER-ROW COMPUTATION
+ * rather than a column read -- a `jsonb_each` + `jsonb_object_agg` round trip
+ * over `execution_state`, a second jsonb descent for `monitorStatus`, and a
+ * `substring()` over a TOAST'd ~6KB `description`. Every query above this line
+ * selects `i.id` alone, so none of them can see that cost at all; these two
+ * shapes exist to make it visible.
+ */
+const WIDE_PROJECTION = `
+  i.id,
+  i.company_id,
+  i.title,
+  i.status,
+  i.priority,
+  i.updated_at,
+  substring(i.description, 1, 1201) AS description,
+  CASE
+    WHEN i.execution_state IS NULL THEN NULL
+    ELSE (SELECT jsonb_object_agg(key, value) FROM jsonb_each(i.execution_state))
+  END AS execution_state,
+  i.execution_state -> 'monitor' ->> 'status' AS monitor_status`;
+
+/**
+ * The SHIPPED single-statement shape, with the real projection on it.
+ *
+ * `ORDER BY ... LIMIT` cannot discard a row until it has been produced, and
+ * PostgreSQL evaluates the target list before the sort, so every one of these
+ * expressions runs once per CANDIDATE row -- not once per row on the page.
+ */
+function wideSingleStatementQuery(limit = 15) {
+  return `
+    SELECT ${WIDE_PROJECTION} FROM issues i
+    INNER JOIN ${SHIPPED_SEARCH_ARMS} ON issue_search_arms.issue_id = i.id
+    WHERE i.company_id = '${COMPANY}'::uuid AND i.hidden_at IS NULL
+    ORDER BY issue_search_arms.search_rank, ${PAGE_TAIL}
+    LIMIT ${limit}`;
+}
+
+/**
+ * The DEFERRED JOIN (late row lookup) this file's companion change ships.
+ *
+ * The page is chosen on a narrow tuple (`id` + rank), and only the rows that
+ * survive `LIMIT` are widened. The outer `ORDER BY` is re-applied because a
+ * join does not preserve subquery order -- that is a correctness requirement,
+ * not belt-and-braces, and `returns the same page, in the same order` below is
+ * what would catch its removal.
+ */
+function wideDeferredJoinQuery(limit = 15) {
+  return `
+    SELECT ${WIDE_PROJECTION} FROM issues i
+    INNER JOIN (
+      SELECT i2.id, issue_search_arms.search_rank
+      FROM issues i2
+      INNER JOIN ${SHIPPED_SEARCH_ARMS} ON issue_search_arms.issue_id = i2.id
+      WHERE i2.company_id = '${COMPANY}'::uuid AND i2.hidden_at IS NULL
+      ORDER BY issue_search_arms.search_rank,
+               i2.priority, i2.last_activity_at DESC, i2.updated_at DESC, i2.id DESC
+      LIMIT ${limit}
+    ) issue_list_page ON issue_list_page.id = i.id
+    ORDER BY issue_list_page.search_rank, ${PAGE_TAIL}`;
+}
+
+/** Every `Limit` node in the plan, paired with whether it is the plan ROOT. */
+function limitNodeDepths(node: any, depth = 0, found: number[] = []): number[] {
+  if (!node || typeof node !== "object") return found;
+  if (node["Node Type"] === "Limit") found.push(depth);
+  const children: any[] = Array.isArray(node.Plans) ? node.Plans : [];
+  for (const child of children) limitNodeDepths(child, depth + 1, found);
+  return found;
+}
+
 /** The whole shipped statement: arms joined, rank read off the join. */
 function rankedPageQuery(limit = 15) {
   return `
@@ -465,6 +538,38 @@ function outermostIssuesScan(node: any): any {
 afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()?.();
 }, 60_000);
+
+/**
+ * PEN-3596 deferred join: `populateMultiCompany` plus a non-null
+ * `execution_state`, so the projection's `jsonb_each` + `jsonb_object_agg`
+ * round trip actually RUNS.
+ *
+ * ⛔ Separate rather than folded into `populate()` on purpose. With
+ * `execution_state` NULL the projection's `CASE` short-circuits and the
+ * jsonb work is skipped entirely -- a seed that cannot exhibit the cost the
+ * change exists to remove, which is the exact mistake migration 0269's header
+ * records 0268 making with its single-company corpus.
+ */
+async function populateWide(sql: postgres.Sql) {
+  await populateMultiCompany(sql);
+  await sql.unsafe(`
+    SET session_replication_role = replica;
+    UPDATE issues
+       SET execution_state = jsonb_build_object(
+             'status', 'idle',
+             'currentStageId', null,
+             'currentStageIndex', null,
+             'currentStageType', null,
+             'currentParticipant', null,
+             'returnAssignee', null,
+             'lastDecisionOutcome', null,
+             'monitor', jsonb_build_object('status', 'scheduled', 'attemptCount', 3)
+           )
+     WHERE company_id = '${COMPANY}'::uuid;
+    SET session_replication_role = origin;
+    ANALYZE issues;
+  `);
+}
 
 describeEmbeddedPostgres("issues-list search cost shape (PEN-3596)", () => {
   // Lead 3, refuted. This is the assertion that makes the refutation durable:
@@ -614,6 +719,74 @@ describeEmbeddedPostgres("issues-list search cost shape (PEN-3596)", () => {
 
   // Migration 0268. The restructure is worth ~1.6x without these and ~8x with
   // them, so a silently-missing migration is a silent ~2.7x regression on top of the restructure.
+  // ── PEN-3596: the DEFERRED JOIN (late row lookup) ────────────────────────
+  //
+  // Third and last instance on this statement of one defect class: work that is
+  // CANDIDATE-bound while the result is PAGE-bound. #3539 took it out of the
+  // relevance key, PEN-5213 took it out of the sort key, and what was left was
+  // the PROJECTION -- 41 columns, three of them per-row computation, evaluated
+  // for every row the WHERE admits because `LIMIT` cannot discard a row before
+  // it has been produced.
+
+  // Semantics first, and at a limit large enough to span several ranks: the
+  // deferred shape must return the SAME page in the SAME order. The outer
+  // ORDER BY is what makes that true -- a join does not preserve subquery
+  // order -- so deleting it would fail here rather than in production.
+  it("the deferred join returns the same page, in the same order, as the single statement", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-deferred-equivalence-");
+    await populateWide(sql);
+
+    for (const limit of [15, 200]) {
+      const single = (await sql.unsafe(wideSingleStatementQuery(limit))) as any[];
+      const deferred = (await sql.unsafe(wideDeferredJoinQuery(limit))) as any[];
+
+      expect(deferred.length).toBeGreaterThan(0);
+      expect(deferred.length).toBe(single.length);
+      expect(deferred.map((row) => row.id)).toEqual(single.map((row) => row.id));
+      // Not just the ids: the widened columns must agree value-for-value, or
+      // the "only the page is widened" claim would be hiding a projection bug.
+      expect(deferred.map((row) => row.description)).toEqual(single.map((row) => row.description));
+      expect(deferred.map((row) => row.execution_state)).toEqual(
+        single.map((row) => row.execution_state),
+      );
+      expect(deferred.map((row) => row.monitor_status)).toEqual(
+        single.map((row) => row.monitor_status),
+      );
+    }
+  }, 180_000);
+
+  // ⭐ THE LOAD-BEARING STRUCTURAL GUARANTEE. A deferred join buys nothing if
+  // the planner PULLS THE SUBQUERY UP into the parent -- it would flatten back
+  // into exactly the single-statement shape and the widening would go back to
+  // being candidate-bound, silently and with every other test still green.
+  //
+  // `LIMIT` is what forbids the pullup (`is_simple_subquery()` in
+  // src/backend/optimizer/plan/subselect.c refuses a subquery carrying
+  // limitCount/limitOffset), which is also why the shipped code applies the
+  // deferred shape ONLY when a limit is present. This asserts the consequence
+  // rather than the rule: a `Limit` node survives BELOW the plan root.
+  it("the deferred join is not flattened back by subquery pullup", async () => {
+    const { sql } = await startDatabase("paperclip-pen3596-deferred-no-pullup-");
+    await populateWide(sql);
+
+    const deferred = (await sql.unsafe(
+      `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${wideDeferredJoinQuery()}`,
+    )) as any[];
+    const deferredRoot = deferred[0]["QUERY PLAN"][0].Plan;
+    const deferredLimits = limitNodeDepths(deferredRoot);
+    expect(deferredLimits.length).toBeGreaterThan(0);
+    // At least one Limit is NOT the root => the subquery survived as a subquery.
+    expect(Math.max(...deferredLimits)).toBeGreaterThan(0);
+
+    // The control, and it is what makes the assertion above mean something:
+    // the single-statement shape has exactly one Limit and it IS the root.
+    const single = (await sql.unsafe(
+      `EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ${wideSingleStatementQuery()}`,
+    )) as any[];
+    const singleLimits = limitNodeDepths(single[0]["QUERY PLAN"][0].Plan);
+    expect(singleLimits).toEqual([0]);
+  }, 180_000);
+
   it("ships the company-scoped trigram indexes the restructure depends on", async () => {
     const { sql } = await startDatabase("paperclip-pen3596-indexes-");
 
