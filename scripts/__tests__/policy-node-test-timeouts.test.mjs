@@ -273,6 +273,28 @@ const CONTENTION_SENSITIVE_STEPS = [
   // stops fitting is indistinguishable from one that always fit until it
   // starts killing verdicts. Sized to 8m at the step, above this floor.
   "Test gh token wrapper",
+  // PEN-5671. Reaches this list by a third road again: not fork-heavy like
+  // `Test gh token wrapper` above, and not registry-bound like the
+  // brace-expansion step. It is a shell-harness suite -- 203 tests forking
+  // merge-gate-read.sh per case -- and its off-runner user/sys split is near
+  // even (10.8s / 9.6s), so neither the fork/exec signature nor pure compute.
+  // What puts it here is wall time that tracks runner contention: r = 0.436
+  // against the in-band `Checkout repository` barometer (n=469), and a
+  // high-contention tercile running 1.83x the low one at p95.
+  //
+  // At the 1m bound it killed 1 of 744 executed runs over 2026-11-08..11, on
+  // arc-paperclip-light -- where the cost is NOT a queue eviction but a red
+  // required `verify` on a PR whose suite had printed `pass 203 / fail 0`,
+  // which reads as a code defect and sends the author diagnosing their own
+  // diff. A second run completed AT the bound on arc-merge-queue. Both p100s
+  // are censored at that bound, so neither sample bounds it from above.
+  //
+  // Same growth story as `Test gh token wrapper`: the suite went 146 -> 168
+  // `it(` declarations between 2026-11-01 and 2026-11-10 against an unchanged
+  // 60s wall, and the BLO-35615 primary form at the arc-light supply floor
+  // wants 97s -- so the cap had fallen below the rule's own output before it
+  // ever killed anything. Sized to 3m at the step, at this floor.
+  "Test merge-gate reader",
 ];
 
 function assertContentionFloor(steps) {
