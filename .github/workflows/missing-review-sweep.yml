@@ -62,6 +62,10 @@ permissions:
 jobs:
   sweep:
     runs-on: arc-paperclip-light
+    # BLO-54910: onprem-k8s check-unbounded-self-hosted-jobs fails on any new
+    # self-hosted job with no bound (GitHub's default is 360m). Observed runs
+    # take 75-105s wall clock; 10m matches the sibling review-gate-sweep jobs.
+    timeout-minutes: 10
     steps:
       - name: Checkout default branch
         # Pinned to the default branch on purpose. This job holds a
