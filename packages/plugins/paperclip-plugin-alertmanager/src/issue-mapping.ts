@@ -250,14 +250,27 @@ function renderLabelsTable(labels: Record<string, string>): string {
 }
 
 /**
- * PEN-6404 -- the body says, in the body, that the body is not a record surface.
+ * PEN-6404 -- this section says, in the body, that this SECTION is not a record
+ * surface.
  *
- * Every write site below replaces this column wholesale: the firing path's
- * `refresh` branch re-renders from the members table on EVERY delivery of a
- * still-firing alert and never reads what it is replacing. An agent that
- * records a constraint here loses it on the next delivery, with no error, and
- * no in-run check can detect it, because the overwrite lands after the
- * writing run has ended.
+ * Scoped to THIS SECTION, not to the whole body, and that is a correction.
+ *
+ * The first draft said "This description ... is REPLACED" and "anything written
+ * here is destroyed". Since PEN-6218 (`description-notes.ts`) every write goes
+ * through `composeDescription`, which carries forward verbatim everything below
+ * {@link AGENT_NOTES_MARKER} and renders a banner above it saying so. A notice
+ * claiming the whole body is destroyed would therefore open a body that ends by
+ * promising the opposite -- the same row contradicting itself, twice over.
+ *
+ * So this string keeps only what the banner does NOT say: that the loss is
+ * undetectable from inside the writing run, and that the row's own monitor is
+ * not an escape. The carrier question is the banner's, and this defers to it.
+ *
+ * What IS replaced is the rendered half above the marker: the firing path's
+ * `refresh` branch re-renders this section from the members table on EVERY
+ * delivery of a still-firing alert. A constraint recorded in the rendered half
+ * is lost on the next delivery, with no error, and no in-run check can detect
+ * it, because the overwrite lands after the writing run has ended.
  *
  * The generated `Recording a constraint` directive now carries the same rule
  * (`server/src/services/heartbeat.ts`), and that is the load-bearing copy: it
@@ -284,20 +297,6 @@ function renderLabelsTable(labels: Record<string, string>): string {
  * undeliverable, and the notes go with it -- 13 of 13 measured destructions,
  * see Rule 2 of the runbook. A monitor that has to outlive the alert belongs
  * on a row of your own.
- */
-/**
- * Scoped to THIS SECTION, not to the whole body, and that is a correction.
- *
- * The first draft said "This description ... is REPLACED" and "anything written
- * here is destroyed". Since PEN-6218 (`description-notes.ts`) every write goes
- * through `composeDescription`, which carries forward verbatim everything below
- * {@link AGENT_NOTES_MARKER} and renders a banner above it saying so. A notice
- * claiming the whole body is destroyed would therefore open a body that ends by
- * promising the opposite -- the same row contradicting itself, twice over.
- *
- * So this string keeps only what the banner does NOT say: that the loss is
- * undetectable from inside the writing run, and that the row's own monitor is
- * not an escape. The carrier question is the banner's, and this defers to it.
  */
 export const MACHINE_RENDERED_NOTICE =
   "> **This section is machine-generated and is REPLACED on every alert delivery.**" +
