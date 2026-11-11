@@ -4422,4 +4422,42 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
       markdown.indexOf("Use this task context as the current assignment."),
     );
   });
+  // PEN-5788: the lookup can SUCCEED, be authoritative, and name nobody -- a pull
+  // request with a valid external id whose only issue key belongs to an external
+  // tracker. The `Look the owner up` string already refuses the inference ("an empty
+  // `owners` list is NOT proof the artifact is unowned"), which tells a run what not to
+  // conclude and gives the constraint nowhere to go. The two placement clauses around it
+  // do not reach this state either: `403 deny_missing_grant` is a row that exists and
+  // refuses you, and the no-external-id clause is an artifact the lookup is undefined
+  // for. Pinned because the gap is invisible from any one of the three.
+  it("names the pull request itself as the home when the lookup succeeds and names nobody", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: {
+        id: "issue-pen-5788",
+        identifier: "PAP-5788",
+        title: "Owner lookup returns nobody",
+        workMode: "standard",
+        description: null,
+      },
+    });
+
+    expect(markdown).toContain("this artifact has NO Paperclip owning row, for anyone");
+    expect(markdown).toContain("record it as a COMMENT ON THE PULL REQUEST itself");
+    // The TRIGGER, pinned on BOTH arms. Keyed on `owners: []` alone, a non-empty result
+    // whose every entry is a mention leaves the run with zero homes AND no fallback,
+    // silently dropping the constraint -- strictly worse than the empty case this clause
+    // was written for, because nothing about it looks unusual.
+    expect(markdown).toContain("`owners` empty, or non-empty with every entry `relation: \"mention\"`");
+    // Keyed on `relation`, NOT on a caller-side `owningIdentifiers` predicate: PEN-5836
+    // moved that discrimination server-side. If this assertion ever has to change back,
+    // the directive has regrown the second spelling the supersession removed.
+    expect(markdown).toContain("`relation: \"mention\"`");
+    // That this is a THIRD state is the whole finding -- a reader who collapses it into
+    // either neighbour loses the clause.
+    expect(markdown).toContain("That is a THIRD state");
+    // Scope, pinned because `withheldForAuthorizationCount: 0` reads as a global
+    // all-clear and is not one: the service filters by company before the route ever
+    // computes the count, so an owner in another company is invisible AND uncounted.
+    expect(markdown).toContain("scoped to the company you queried");
+  });
 });
