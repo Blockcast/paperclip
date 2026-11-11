@@ -414,6 +414,32 @@ function createLocalSandboxRunner() {
   };
 }
 
+/**
+ * The sandbox `executionTarget` budget these tests hand to `execute()`, and the
+ * per-test deadline derived from it.
+ *
+ * A vitest deadline at or below the budget of the operation the test awaits can
+ * never let that budget express itself: vitest kills the test with `Test timed
+ * out in <n>ms` before the subject's own timeout can fire, so a loaded runner
+ * reports a harness failure in place of the behaviour under test. Two tests here
+ * and one in `cursor-local-execute.test.ts` carried a 10_000ms deadline against
+ * this 30_000ms budget — a 3x inversion — and `omits --effort for sandbox-managed
+ * runs ...` failed exactly that way on paperclip#3678 (job 130401537501,
+ * 2026-11-11), 10210ms into a shard whose wall time was 1704s.
+ *
+ * 4x the budget is not a new number: it is what the sibling `passes through
+ * --effort ...` test already uses for the same sandbox path a few lines below.
+ * The two halves of that pair had drifted 12x apart. Deriving the deadline keeps
+ * them from drifting again. Note also that `server/vitest.config.ts` sets a
+ * 60_000ms global precisely for ARC-pool contention (BLO-17026) and says the
+ * tight per-test overrides are to be raised alongside it; these were missed by
+ * that sweep, and a per-test override must not silently undercut the global.
+ *
+ * PEN-3381, sibling of PEN-3038.
+ */
+const SANDBOX_EXECUTE_TIMEOUT_MS = 30_000;
+const SANDBOX_TEST_DEADLINE_MS = SANDBOX_EXECUTE_TIMEOUT_MS * 4;
+
 describe("claude execute", () => {
   it("bounds a zero-output process and emits value-safe lifecycle evidence", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-zero-output-"));
@@ -1155,7 +1181,7 @@ describe("claude execute", () => {
           environmentId: "env-1",
           leaseId: "lease-1",
           remoteCwd: remoteWorkspace,
-          timeoutMs: 30_000,
+          timeoutMs: SANDBOX_EXECUTE_TIMEOUT_MS,
           runner: createLocalSandboxRunner(),
         },
         authToken: "run-jwt-token",
@@ -1191,7 +1217,7 @@ describe("claude execute", () => {
       else process.env.PATH = previousPath;
       await fs.rm(root, { recursive: true, force: true });
     }
-  }, 10_000);
+  }, SANDBOX_TEST_DEADLINE_MS);
 
   it("omits --effort for sandbox-managed runs when the installed Claude CLI does not advertise it", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-sandbox-effort-"));
@@ -1235,7 +1261,7 @@ describe("claude execute", () => {
           environmentId: "env-1",
           leaseId: "lease-1",
           remoteCwd: remoteWorkspace,
-          timeoutMs: 30_000,
+          timeoutMs: SANDBOX_EXECUTE_TIMEOUT_MS,
           runner: createLocalSandboxRunner(),
         },
         authToken: "run-jwt-token",
@@ -1249,7 +1275,7 @@ describe("claude execute", () => {
       restore();
       await fs.rm(root, { recursive: true, force: true });
     }
-  }, 10_000);
+  }, SANDBOX_TEST_DEADLINE_MS);
 
   it("passes through --effort and reuses the sandbox capability probe across sandbox leases when the installed Claude CLI advertises it", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-claude-execute-sandbox-effort-supported-"));
@@ -1293,7 +1319,7 @@ describe("claude execute", () => {
         environmentId: "env-1",
         leaseId: "lease-1",
         remoteCwd: remoteWorkspace,
-        timeoutMs: 30_000,
+        timeoutMs: SANDBOX_EXECUTE_TIMEOUT_MS,
         runner: createLocalSandboxRunner(),
       },
       authToken: "run-jwt-token",
@@ -1324,7 +1350,7 @@ describe("claude execute", () => {
       restore();
       await fs.rm(root, { recursive: true, force: true });
     }
-  }, 120_000);
+  }, SANDBOX_TEST_DEADLINE_MS);
 
   it("degrades to the conservative fallback (returns null) when the sandbox probe throws, and retries on the next lease", async () => {
     let calls = 0;
@@ -1341,7 +1367,7 @@ describe("claude execute", () => {
       environmentId: "env-1",
       leaseId: "lease-1",
       remoteCwd: "/remote/workspace",
-      timeoutMs: 30_000,
+      timeoutMs: SANDBOX_EXECUTE_TIMEOUT_MS,
       runner: throwingRunner,
     };
     const probeInput = {

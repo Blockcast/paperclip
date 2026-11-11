@@ -569,9 +569,19 @@ describe("registerWorkerTierProxyRoutes", () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
       return { status: 200, body: JSON.stringify({ ok: true }) };
     });
+    // The contract is that the plugin budget EXCEEDS the generic one, and only
+    // the lower bound of that needs to be tight: the stub's 100ms sleep is what
+    // proves the generic 50ms budget would have timed out, and load can only
+    // push elapsed time further above 50ms, never below it. The upper bound is
+    // the fragile half — at 250ms the whole round trip had ~150ms of headroom,
+    // and on a contended ARC runner it did not fit, so this test returned 504
+    // and read as a regression in the plugin path (PEN-3381). 10_000ms keeps the
+    // assertion identical while removing the race, and is still two orders below
+    // production's PROXY_PLUGIN_API_REQUEST_TIMEOUT_MS = 150_000, so nothing
+    // here stands in for a production value.
     const app = buildAppWithProxyOptions(worker.url, {
       requestTimeoutMs: 50,
-      pluginApiRequestTimeoutMs: 250,
+      pluginApiRequestTimeoutMs: 10_000,
     });
 
     const res = await request(app)

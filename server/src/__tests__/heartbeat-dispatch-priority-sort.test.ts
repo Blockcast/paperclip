@@ -103,21 +103,47 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+/**
+ * Waits for a dispatched run to leave `queued`/`running`.
+ *
+ * The default was `10_000`, against tests in this file whose own vitest
+ * deadlines are 120_000-300_000 — so the settle budget was 12-30x tighter than
+ * the deadline of the test that owns it, and on a contended ARC runner it was
+ * the settle budget that ran out first. Nine call sites below had already
+ * discovered this and pass `60_000` or `120_000` explicitly, one at a time; the
+ * default itself was never moved, so the fifteen bare callers kept the tight
+ * budget. `60_000` is that converged value, and it also matches the global
+ * `testTimeout` in server/vitest.config.ts, which is sized for exactly this
+ * contention (BLO-17026).
+ *
+ * Expiry now THROWS rather than returning an unsettled run. Every call site
+ * either discards the result or asserts `status` is not `queued`, so an
+ * unsettled return was always a failure — just one that surfaced as a confusing
+ * assertion about dispatch ordering several lines later, which is precisely why
+ * this file's failures read as unrelated one-offs and were re-run away instead
+ * of recorded (PEN-3381).
+ */
 async function waitForRunToSettle(
   heartbeat: ReturnType<typeof heartbeatService>,
   runId: string,
-  timeoutMs = 10_000,
+  timeoutMs = 60_000,
 ) {
   const deadline = Date.now() + timeoutMs;
+  let lastStatus: string | undefined;
   while (Date.now() < deadline) {
     const run = await heartbeat.getRun(runId);
     if (!run || (run.status !== "queued" && run.status !== "running")) {
       await heartbeat.drainInFlightExecutions(timeoutMs);
       return run;
     }
+    lastStatus = run.status;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  return heartbeat.getRun(runId);
+  throw new Error(
+    `run ${runId} did not settle within ${timeoutMs}ms (last status: ${lastStatus ?? "unknown"}). ` +
+      `This is the harness deadline, not a dispatch-ordering assertion: on a contended runner ` +
+      `raise the timeoutMs argument rather than reading it as a priority-sort regression.`,
+  );
 }
 
 function buildQueuedRetryContext(index: number) {
