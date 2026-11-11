@@ -78,4 +78,16 @@ describe("workProductExternalIdMatchMode", () => {
   it("leaves another provider's pull request matching byte-exactly", () => {
     expect(workProductExternalIdMatchMode("gitlab", "pull_request")).toBe("exact");
   });
+
+  // The mode this function returns is REPORTED to the caller as `externalIdMatch`,
+  // and `listOwnersByExternalId` filters the provider column with a plain `eq`.
+  // So the provider must be compared here the way it is compared there. Folding it
+  // here alone made `provider=GitHub` return no row -- the stored value is
+  // `github` -- while announcing that the casing had been folded, which is this
+  // row's own defect reappearing one field over, now with a signal that denies it.
+  it("decides the provider the way the query does, so the reported mode is true", () => {
+    expect(workProductExternalIdMatchMode("GitHub", "pull_request")).toBe("exact");
+    expect(workProductExternalIdMatchKey("GitHub", "pull_request", "Blockcast/Paperclip#3205"))
+      .toBe("Blockcast/Paperclip#3205");
+  });
 });

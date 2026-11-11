@@ -166,6 +166,17 @@ export function normalizeWorkProductExternalId(raw: string): string {
  * Folding the WHOLE canonical `owner/repo#123` is both safe and sufficient: the
  * `#123` is digits, which no case fold can touch, so the number stays exact
  * without being split out and compared separately.
+ *
+ * `provider` IS COMPARED BYTE-EXACTLY HERE, and that is load-bearing rather than
+ * an omission. This function decides the mode that the lookup REPORTS back as
+ * `externalIdMatch`, while `listOwnersByExternalId` filters the provider column
+ * with a plain `eq`. Folding the provider here and not there made the report
+ * false in the one direction this row exists to close: `provider=GitHub` matched
+ * no row, because the stored value is `github`, and the response nonetheless
+ * announced `externalIdMatch: "case_insensitive"` -- an empty answer carrying a
+ * signal that says the casing was handled. A caller reading that concludes the
+ * artifact is unowned. The two sides must decide provider equality the same way,
+ * so the mode helper decides it the way the query does.
  */
 export type WorkProductExternalIdMatchMode = "case_insensitive" | "exact";
 
@@ -173,7 +184,7 @@ export function workProductExternalIdMatchMode(
   provider: string,
   type: string,
 ): WorkProductExternalIdMatchMode {
-  return provider.toLowerCase() === "github" && type === "pull_request"
+  return provider === "github" && type === "pull_request"
     ? "case_insensitive"
     : "exact";
 }
