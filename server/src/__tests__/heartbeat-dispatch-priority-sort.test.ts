@@ -106,15 +106,17 @@ if (!embeddedPostgresSupport.supported) {
 /**
  * Waits for a dispatched run to leave `queued`/`running`.
  *
- * The default was `10_000`, against tests in this file whose own vitest
- * deadlines are 120_000-300_000 — so the settle budget was 12-30x tighter than
- * the deadline of the test that owns it, and on a contended ARC runner it was
- * the settle budget that ran out first. Nine call sites below had already
- * discovered this and pass `60_000` or `120_000` explicitly, one at a time; the
- * default itself was never moved, so the fifteen bare callers kept the tight
- * budget. `60_000` is that converged value, and it also matches the global
- * `testTimeout` in server/vitest.config.ts, which is sized for exactly this
- * contention (BLO-17026).
+ * The default was `10_000`. Nine call sites had already discovered that was
+ * too tight and pass `60_000` or `120_000` explicitly (their tests carry
+ * explicit vitest deadlines of 120-180 s). The fifteen bare callers sit in
+ * `it(...)` blocks with NO per-test deadline, so they run under the global
+ * `testTimeout: 60_000` in server/vitest.config.ts (BLO-17026) — after
+ * embedded-postgres setup and seeding have already spent part of it, and some
+ * call this twice in sequence. The default is therefore `30_000`: triple the
+ * old budget, yet clearly below that 60 s deadline, so the settle budget (and
+ * its drain) can still express itself as the self-describing throw below
+ * instead of being pre-empted by an opaque vitest timeout. A test that needs
+ * longer must raise BOTH its own `it` deadline and this argument.
  *
  * Expiry now THROWS rather than returning an unsettled run. Every call site
  * either discards the result or asserts `status` is not `queued`, so an
@@ -126,7 +128,7 @@ if (!embeddedPostgresSupport.supported) {
 async function waitForRunToSettle(
   heartbeat: ReturnType<typeof heartbeatService>,
   runId: string,
-  timeoutMs = 60_000,
+  timeoutMs = 30_000,
 ) {
   const deadline = Date.now() + timeoutMs;
   let lastStatus: string | undefined;
