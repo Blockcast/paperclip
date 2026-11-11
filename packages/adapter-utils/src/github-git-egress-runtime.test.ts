@@ -30,9 +30,13 @@ function tempDir(prefix: string): string {
   tempDirs.add(dir);
   return dir;
 }
+// The removal is synchronous disk I/O over every fixture repo. On an I/O-slow
+// merge-queue runner it outran vitest's 10 s default hookTimeout, failed the
+// whole file, and ejected an unrelated PR (merge_group run 42983619419,
+// 2026-11-11). Cleanup is not under test, so give it room.
 afterAll(() => {
   for (const dir of tempDirs) rmSync(dir, { recursive: true, force: true });
-});
+}, 60_000);
 
 const HOOKS = "/hooks";
 
