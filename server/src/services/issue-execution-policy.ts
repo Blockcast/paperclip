@@ -1796,10 +1796,20 @@ export function buildIssueMonitorDispatchRearmPatch(input: {
    * wake consumed — the tick-detected lapse path, where the wake never ran and
    * so must not count against maxAttempts.
    *
-   * The watchdog *dispatch* path passes the already-incremented count instead:
-   * that fire did real work (it re-dispatched the stuck run), so it consumes an
-   * attempt and the retry loop stays bounded by maxAttempts rather than
-   * re-arming forever against a run that never moves (BLO-22860).
+   * The watchdog *dispatch* path passes the count UNCHANGED (PEN-6286). It used
+   * to pass the already-incremented one, reasoning that the fire did real work
+   * and so should keep the retry loop bounded by maxAttempts. The boundedness
+   * requirement is right and still holds (BLO-22860) — what changed is who pays
+   * for it. `maxAttempts` is the ASSIGNEE's budget for observing its own declared
+   * gates, and a watchdog monitor does not carry those gates: the lapse sweep
+   * replaced `gateSignals` with `heartbeat_run:<id>` when it minted the watchdog.
+   * Charging nudges to that budget made a queue backlog indistinguishable from a
+   * monitor whose gates ran out, and bought zero gate observations doing it.
+   *
+   * The loop is now bounded by ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS
+   * (heartbeat.ts) on the watched run's age. Do not restore the increment here
+   * without also removing that ceiling — they are one mechanism, and the ceiling
+   * is the half that satisfies BLO-22860.
    */
   attemptCount?: number;
 }) {
