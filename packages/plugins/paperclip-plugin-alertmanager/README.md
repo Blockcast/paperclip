@@ -271,6 +271,7 @@ withholding and the PEN-4337 monitor deferral are all unchanged.
 |---|---|---|
 | `attended_monitor` | the owner has armed a monitor (PEN-4337) | no |
 | `attended_blocker` | an unresolved `blockedBy` edge (BLO-40673) | no |
+| `attended_park` | a live deliberate park, inside the deferral bound (PEN-6486) | no |
 | `unattended_rung` | neither held; a rung advanced | yes |
 | `unattended_cover` | neither held; the agent chain was exhausted | no — the `[user-cover]` assignment is the notification |
 | `held_alert_clear` | Alertmanager says the alert is not firing (BLO-40739) | no |
@@ -384,6 +385,17 @@ notification, and nothing is obliged to poll it.
 > table itself with `COMMENT ON`, which is the one adjacent channel that file
 > has — `\d+` and `obj_description()` reach it, a reader of the raw `.sql` does
 > not.
+>
+> ⚠️ **`008` is now itself a known-stale carrier, for the same structural
+> reason (PEN-6486).** Its `COMMENT ON TABLE` ends *"CAVEAT: the ladder tests
+> attendance as an armed monitor or a live blockedBy edge ONLY -- parkedUntil is
+> not consulted"*, which has been false since 2026-11-11, and `008` is frozen by
+> the same checksum. `migrations/012_attendance_park_disposition.sql` supersedes
+> it on the table and on the `disposition` column. **The generalisation worth
+> keeping: a `--` header comment in an applied plugin migration is write-once
+> and has no successor channel, so put any falsifiable claim in `COMMENT ON`,
+> which does.** Three corrections on one table have now been needed; all three
+> were claims about behaviour written into a carrier that cannot be edited.
 
 ### Reading the record (PEN-2918 (D))
 
@@ -429,17 +441,53 @@ an inference from the wrong population, since rows are appended per ladder
 **determination over an already-open alert row**, not per alert row created. An
 instrument nobody can read cannot be caught being wrong.
 
-⚠️ **Expect the first summary to look like mass neglect, and do not report it
-as such.** The ladder's attendance test is `hasArmedMonitor(issue, now) ||
-hasLiveBlocker(...)` and nothing else — **`parkedUntil` appears nowhere in it**.
-A deliberately parked row carrying its owner's unpark conditions is attended by
-this estate's primary attendance instrument and is still classified
-`unattended_*` here. Measured 2026-11-07: of the six open alertmanager-origin
-rows, five were attended solely by a park. So a high `unattended_*` count is
-**first** evidence that the instrument is miscalibrated against how this company
-works. That caveat is returned **inside the summary response body**, not only
-here, because a qualification a reader has to go and find is precisely the
-failure PEN-2918 measures.
+⛔ **Amended 2026-11-11 (PEN-6486). This paragraph used to read: *"Expect the
+first summary to look like mass neglect, and do not report it as such. The
+ladder's attendance test is `hasArmedMonitor(issue, now) || hasLiveBlocker(...)`
+and nothing else — `parkedUntil` appears nowhere in it … Measured 2026-11-07: of
+the six open alertmanager-origin rows, five were attended solely by a park. So a
+high `unattended_*` count is first evidence that the instrument is miscalibrated
+against how this company works."* It was accurate, and it was a caveat about the
+wrong path.** The ladder consumed that same predicate when it DECIDED, not only
+when it reported: a park-only row satisfied neither term, fell through the
+deferral, climbed rungs, and at the top of the chain minted a founder-assigned
+`[user-cover]` over a row that was deliberately parked and being worked.
+Measured on PEN-6294 — parked 2026-11-10T16:18:51Z to 2026-11-16T10:00Z, rung 2
+answered and recorded in its own park reason — whose cover PEN-6464 was minted
+7h53m inside that park and sat `todo` with zero comments. 3 of the 13 open
+alertmanager-origin rows were park-only that day, and 2 of the 2 open covers
+stood over exactly those rows.
+
+**What makes this worth writing down twice:** a blindness documented as a
+REPORTING caveat on a read path is silently also a BEHAVIOURAL defect on the
+write path whenever both consume the same predicate — and the caveat's own
+accuracy and prominence are what stop anyone asking the second question. Three
+separate sites (this one, the module header in `src/attendance-read.ts`, and the
+`COMMENT ON` in migration `008`) described the quirk correctly and none asked
+what the ladder DID with it.
+
+⚠️ **`unattended_*` still does not mean nobody is attending, and the window
+matters.** The test is now `hasArmedMonitor || hasLiveBlocker || hasLivePark`,
+and the park term is **bounded**: a park holds a rung for at most
+`MAX_PARK_DEFERRAL_RUNGS` intervals from `parkedAt` — 3h for a `critical` or
+`page`, 24h for a `warning` at the default deadlines — after which the ladder
+proceeds over a live park. A parked row can therefore still read `unattended_*`,
+now meaning *"parked for longer than the ladder will wait"*, which is a finding
+about the park rather than a miscalibration of the instrument. Rows are
+append-only and never rewritten, so **any window reaching before 2026-11-11 is a
+mixture**: some `unattended_*` rows in it were written by the two-term test,
+which could not see a park at all. `attended_park` cannot appear before the
+change, so the earliest one dates the boundary from the table itself. That
+caveat is returned **inside the summary response body**, not only here, because
+a qualification a reader has to go and find is precisely the failure PEN-2918
+measures.
+
+⚠️ **The bound leaves a residual, deliberately.** The host restamps `parkedAt`
+on every park write, so a re-park reopens the window — which is right, because a
+re-park is a run that woke, read the row and re-committed. The consequence is
+that an owner who re-parks indefinitely defers this ladder indefinitely. That is
+named rather than closed: closing it would mean treating a run's own repeated
+observation of a row as evidence of neglect.
 
 ⛔ **Still true, and unchanged by these routes:** nothing polls them, nothing
 alerts on them, nothing pages, and no schedule or dashboard depends on them.

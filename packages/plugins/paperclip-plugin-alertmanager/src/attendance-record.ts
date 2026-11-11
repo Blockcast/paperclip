@@ -98,14 +98,27 @@ export const ATTENDANCE_TABLE = "alert_attendance_observations";
 /**
  * The ladder's determination for one pass, in the ladder's own vocabulary.
  *
- * `attended_*` are the two mechanisms this platform treats as attendance.
- * Neither is a promise that the work happens — only that a wake exists — which
+ * `attended_*` are the three mechanisms this platform treats as attendance.
+ * None is a promise that the work happens — only that a wake exists — which
  * is why the ladder defers rather than stops, and why a long run of
  * `attended_monitor` rows on one issue is a finding rather than a reassurance.
+ *
+ * `attended_park` (PEN-6486) is the newest and the narrowest. It is recorded if
+ * and only if the ladder would otherwise have ADVANCED A RUNG — the park term
+ * is evaluated last, behind both older mechanisms — so it never absorbs a
+ * determination that would previously have read `attended_monitor` or
+ * `attended_blocker`, and the count of it is a direct before/after measure of
+ * one defect. Unlike its two siblings it is BOUNDED: a park holds the rung for
+ * a fixed number of intervals from `parkedAt` and no longer, because a park can
+ * run for days and an unbounded park term would be a permanent skip wearing a
+ * deferral's name. See `hasLivePark` in `escalation.ts` for the bound and for
+ * the residual it leaves (an owner who re-parks indefinitely defers
+ * indefinitely, because the host restamps `parkedAt` on every park write).
  */
 export type AttendanceDisposition =
   | "attended_monitor"
   | "attended_blocker"
+  | "attended_park"
   | "unattended_rung"
   | "unattended_cover"
   | "held_alert_clear";
