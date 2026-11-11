@@ -5012,5 +5012,15 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("identifier PARSED, never that it was understood");
     expect(markdown).toContain("`metadata.repoFullName` and `metadata.prNumber`");
     expect(markdown).toContain("re-check the identifier before concluding anything in EITHER direction");
+    // Both failure shapes, pinned. The master string directly above this one ends
+    // "the lookup answers a wrong-repo key confidently rather than emptily", so a
+    // clause naming only the EMPTY shape reads as contradicting its own neighbour --
+    // and a reader who sees two adjacent sentences disagree improvises, which is the
+    // one thing this block exists to stop.
+    expect(markdown).toContain("with an EMPTY `owners` when the key names nothing tracked");
+    expect(markdown).toContain("some OTHER pull request's owners when it names one that is");
+    // No unmeasured frequency claim: the probes establish the SHAPE of the failure and
+    // measure nothing about how often it happens against a withheld row.
+    expect(markdown).not.toContain("authorization is the rarer one");
   });
 });
