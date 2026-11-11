@@ -1049,21 +1049,26 @@ export async function githubGetPrRequiredStatusContext(input: {
   const apiBase = gitHubApiBase(GITHUB_HOST);
 
   let baseRef: string;
-  try {
-    const res = await ghFetch(`${apiBase}/repos/${input.repoFullName}/pulls/${input.prNumber}`, {
-      headers,
+  {
+    // PEN-6341: one GraphQL field instead of a whole REST pull-request payload.
+    // `ghGraphQlPullRequestFields` never throws, so the try/catch this replaced
+    // has no remaining job. The failure REASON is now the helper's own
+    // (`http_403`, `graphql_errors`, `transport`, ...) under the same prefix the
+    // REST classifier used, so the diagnostic stays readable while the OUTCOME
+    // is unchanged: every unreadable response was already `unknown`, and still
+    // is.
+    const pr = await ghGraphQlPullRequestFields({
+      token: tokenResult.token,
+      repoFullName: input.repoFullName,
+      prNumber: input.prNumber,
       signal: input.signal,
     });
-    if (!res.ok) {
-      const classified = await classifyGithubHttpFailure("required_context_pull_request", res);
-      return { outcome: "unknown", reason: classified.reason };
+    if (!pr.ok) {
+      return { outcome: "unknown", reason: `required_context_pull_request_${pr.reason}` };
     }
-    const body = (await res.json().catch(() => null)) as { base?: { ref?: string } } | null;
-    const ref = typeof body?.base?.ref === "string" ? body.base.ref.trim() : "";
+    const ref = typeof pr.data.baseRefName === "string" ? pr.data.baseRefName.trim() : "";
     if (!ref) return { outcome: "unknown", reason: "required_context_base_ref_missing" };
     baseRef = ref;
-  } catch {
-    return { outcome: "unknown", reason: "required_context_pull_request_fetch_failed" };
   }
 
   const classic = await readClassicRequiredContexts(
@@ -1371,24 +1376,18 @@ function headShaHex(headSha: string | null | undefined): string | null {
  * fails closed rather than accepting review evidence for an arbitrary commit.
  */
 async function fetchPrHeadSha(
-  apiBase: string,
+  token: string,
   repoFullName: string,
   prNumber: number,
-  headers: Record<string, string>,
   signal?: AbortSignal,
 ): Promise<string | null> {
-  try {
-    const res = await ghFetch(`${apiBase}/repos/${repoFullName}/pulls/${prNumber}`, {
-      headers,
-      signal,
-    });
-    if (!res.ok) return null;
-    const body = (await res.json().catch(() => null)) as { head?: { sha?: string } } | null;
-    const sha = body?.head?.sha;
-    return typeof sha === "string" ? headShaHex(sha) : null;
-  } catch {
-    return null;
-  }
+  // PEN-6341: takes the raw token rather than a prebuilt `apiBase`/`headers`
+  // pair, because the GraphQL helper builds its own request. Both callers
+  // already hold the token.
+  const pr = await ghGraphQlPullRequestFields({ token, repoFullName, prNumber, signal });
+  if (!pr.ok) return null;
+  const sha = pr.data.headRefOid;
+  return typeof sha === "string" ? headShaHex(sha) : null;
 }
 
 /** Fetch the current SHA for a pull request when a webhook payload lacks it. */
@@ -1399,13 +1398,7 @@ export async function githubFetchPrHeadSha(input: {
 }): Promise<string | null> {
   const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return null;
-  return fetchPrHeadSha(
-    gitHubApiBase(GITHUB_HOST),
-    input.repoFullName,
-    input.prNumber,
-    { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
-    input.signal,
-  );
+  return fetchPrHeadSha(token, input.repoFullName, input.prNumber, input.signal);
 }
 
 /**
@@ -1426,21 +1419,18 @@ export async function githubFetchPrAuthorLogin(input: {
 }): Promise<string | null> {
   const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return null;
-  try {
-    const res = await ghFetch(
-      `${gitHubApiBase(GITHUB_HOST)}/repos/${input.repoFullName}/pulls/${input.prNumber}`,
-      {
-        headers: { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` },
-        signal: input.signal,
-      },
-    );
-    if (!res.ok) return null;
-    const body = (await res.json().catch(() => null)) as { user?: { login?: string } } | null;
-    const login = body?.user?.login;
-    return typeof login === "string" && login.trim().length > 0 ? login : null;
-  } catch {
-    return null;
-  }
+  // PEN-6341: REST `user.login` is GraphQL `author { login }`. `author` is
+  // nullable for a deleted account, which lands on the same `null` the
+  // unreadable-response branch already returned.
+  const pr = await ghGraphQlPullRequestFields({
+    token,
+    repoFullName: input.repoFullName,
+    prNumber: input.prNumber,
+    signal: input.signal,
+  });
+  if (!pr.ok) return null;
+  const login = pr.data.author?.login;
+  return typeof login === "string" && login.trim().length > 0 ? login : null;
 }
 
 /**
@@ -1964,7 +1954,7 @@ export async function githubHasReviewerEvidenceForPr(input: {
   const headers = { ...GITHUB_API_HEADERS, authorization: `Bearer ${token}` };
   const apiBase = gitHubApiBase(GITHUB_HOST);
   const headSha =
-    headShaHex(input.headSha) ?? (await fetchPrHeadSha(apiBase, input.repoFullName, input.prNumber, headers));
+    headShaHex(input.headSha) ?? (await fetchPrHeadSha(token, input.repoFullName, input.prNumber));
   if (!headSha) return { found: false };
 
   const args = { apiBase, repoFullName: input.repoFullName, prNumber: input.prNumber, headers, botLogin };
@@ -2604,6 +2594,15 @@ export async function ghGraphQlQuery<T>(input: {
   token: string;
   query: string;
   variables?: Record<string, unknown>;
+  /**
+   * PEN-6341: carried through to `ghFetch` so a GraphQL read is as cancellable
+   * as the REST read it replaces. `githubHeadChecksSettlement` -- the first
+   * caller -- has no signal to pass, which is why this parameter did not exist
+   * until a caller that does arrived. Every `/pulls/{n}` reader moved here
+   * carries one, and dropping it would make an aborted request outlive its
+   * caller rather than failing with it.
+   */
+  signal?: AbortSignal;
 }): Promise<GhGraphQlResult<T>> {
   if (!/^\s*query[\s({]/.test(input.query)) {
     // A caller bug, not a runtime condition: surfaced loudly, and still
@@ -2622,6 +2621,7 @@ export async function ghGraphQlQuery<T>(input: {
         "content-type": "application/json",
       },
       body: JSON.stringify({ query: input.query, variables: input.variables ?? {} }),
+      signal: input.signal,
     });
   } catch {
     return { ok: false, reason: "transport" };
@@ -2639,6 +2639,83 @@ export async function ghGraphQlQuery<T>(input: {
   if (Array.isArray(body.errors) && body.errors.length > 0) return { ok: false, reason: "graphql_errors" };
   if (body.data === null || body.data === undefined) return { ok: false, reason: "no_data" };
   return { ok: true, data: body.data };
+}
+
+/**
+ * PEN-6341 item 2: the GraphQL replacement for a plain `GET /repos/{o}/{r}/pulls/{n}`.
+ *
+ * ## Which call sites this is for, and which it is NOT for
+ *
+ * Only the readers that want ONE OR TWO SCALAR FIELDS off a pull request and
+ * already fail to a safe value when it cannot be read. Those sites never
+ * disambiguated their 404s, so folding every unreadable response into one
+ * failure loses nothing they were using.
+ *
+ * ⛔ It is deliberately NOT for `githubGetPullRequestGate`, which does two
+ * things this cannot reproduce. It reads `state` and `merged` as SEPARATE
+ * fields, where GraphQL folds them into one `PullRequestState` whose `MERGED`
+ * member REST has no equivalent of -- so a positional mapping makes that
+ * function bail on exactly the merged PRs it exists to classify. And it tells a
+ * missing PR apart from an ISSUE number by probing the repo, a distinction
+ * GraphQL reports identically here: `pullRequest(number:)` answers `null` plus
+ * a NOT_FOUND error for both, with the same message modulo the number. That
+ * site needs `issueOrPullRequest`, whose `__typename` discriminates in one
+ * call, plus a `merged`/`closedAt` read -- a separate change with its own
+ * argument, not a mechanical swap.
+ *
+ * ## Polarity
+ *
+ * `ghGraphQlQuery` already fails closed on every path -- transport, non-2xx
+ * (including the synthetic 403 `ghFetch` serves from its own rate-limit hold),
+ * an unreadable body, any `errors` entry, and a null `data`. A `NOT_FOUND`
+ * therefore arrives as `graphql_errors` rather than as a null node, and the
+ * null-node branch below is a belt-and-braces default rather than the expected
+ * path. Every caller maps a failure onto the value it already used for an
+ * unreadable REST response, so no caller gains a new way to read a refusal as
+ * a fact.
+ */
+const PULL_REQUEST_FIELDS_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      baseRefName
+      headRefOid
+      url
+      author { login }
+    }
+  }
+}`;
+
+export type GraphQlPullRequestFields = {
+  baseRefName?: string | null;
+  headRefOid?: string | null;
+  url?: string | null;
+  author?: { login?: string | null } | null;
+};
+
+type PullRequestFieldsResponse = {
+  repository?: { pullRequest?: GraphQlPullRequestFields | null } | null;
+};
+
+export async function ghGraphQlPullRequestFields(input: {
+  token: string;
+  repoFullName: string;
+  prNumber: number;
+  signal?: AbortSignal;
+}): Promise<GhGraphQlResult<GraphQlPullRequestFields>> {
+  const [owner, name, ...rest] = input.repoFullName.split("/");
+  if (!owner || !name || rest.length > 0) {
+    return { ok: false, reason: "repo_full_name_invalid" };
+  }
+  const result = await ghGraphQlQuery<PullRequestFieldsResponse>({
+    token: input.token,
+    query: PULL_REQUEST_FIELDS_QUERY,
+    variables: { owner, name, number: input.prNumber },
+    signal: input.signal,
+  });
+  if (!result.ok) return result;
+  const pr = result.data.repository?.pullRequest;
+  if (!pr || typeof pr !== "object") return { ok: false, reason: "pull_request_absent" };
+  return { ok: true, data: pr };
 }
 
 /**
