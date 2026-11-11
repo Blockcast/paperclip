@@ -277,15 +277,41 @@ re-drivable and does not re-emit.
 
 Carried on PEN-6556.
 
-## Rule 5 — the `description` is machine-owned; never record anything there
+## Rule 5 — the `description` is machine-owned ABOVE the notes marker; record below it, or in a comment
 
-**The firing path replaces this column wholesale on every delivery of a
-still-firing alert, and never reads what it replaces.** `decideRefire` returns
-`{kind: "refresh"}` for *every* non-terminal row — there is no has-it-changed
-test and no diff — and the `refresh` branch writes `{description:
-newDescription}`, where `newDescription` comes from `describeAggregate`: a pure
-render off the `aggregate_members` table. The row's current body is never an
-input. The terminal and reopen/rebind branches write it the same way.
+**The firing path re-renders this column on every delivery of a still-firing
+alert.** `decideRefire` returns `{kind: "refresh"}` for *every* non-terminal row
+— there is no has-it-changed test and no diff — and the `refresh` branch writes a
+`description`, where the rendered half comes from `describeAggregate`: a pure
+render off the `aggregate_members` table. The terminal and reopen/rebind branches
+write it the same way.
+
+⛔ **AMENDED 2026-11-11 (PEN-6218), and the amendment reverses this rule's
+strongest claim.** Until PEN-6218 this section read *"replaces this column
+wholesale … and never reads what it replaces"* and *"the row's current body is
+never an input"*. **Both are now false.** Every description write in
+`webhook-handler.ts` goes through `composeDescription(rendered, current)`
+(`description-notes.ts`), which **takes the current body as an input**, carries
+forward verbatim everything below `AGENT_NOTES_MARKER`
+(`<!-- paperclip-plugin-alertmanager:notes-below -->`), and renders a banner
+immediately above the marker telling the reader so.
+
+✅ **Deployed, and dated first-party rather than assumed** — a merge is not a
+deploy. On PEN-6292's own field revisions the step is exact: rev 32
+(`2026-11-11T07:42:00Z`, 10,305 B, **no** marker) → rev 33 (`08:47:03Z`,
+10,688 B, **marker present**), **+383 bytes**, and the marker persists on 4 of 4
+revisions since. ⇒ PEN-6218 went live between **07:42:00Z and 08:47:03Z on
+2026-11-11**.
+
+⭐⭐⭐ **Read the correction for what it changes and what it does NOT.** The
+measurement below is untouched and still correct: the column is still written by
+a machine on every delivery, and the authorship signature is identical before and
+after PEN-6218 — **12 of 12 null-authored revisions straddle the deploy**. That is
+the trap worth carrying: **machine-AUTHORSHIP and total REPLACEMENT are different
+properties, and a revisions census only sees the first.** A detector that returns
+the same answer on both sides of a content-policy change cannot, by itself,
+license *"never record anything there"*. ⇒ establish the writer's content policy —
+here, read the body for the marker — before concluding depth 0 is refused.
 
 Measured on PEN-6292, 2026-11-10 (`paperclipListIssueFieldRevisions`):
 

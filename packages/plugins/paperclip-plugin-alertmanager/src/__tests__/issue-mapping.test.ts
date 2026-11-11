@@ -13,6 +13,10 @@ import {
   resolveAlertPriority,
   severityToPriority,
 } from "../issue-mapping.js";
+import {
+  AGENT_NOTES_MARKER,
+  composeDescription,
+} from "../description-notes.js";
 import type { AlertmanagerAlert } from "../types.js";
 
 const baseAlert = (overrides: Partial<AlertmanagerAlert> = {}): AlertmanagerAlert => ({
@@ -494,6 +498,42 @@ describe("buildIssueDescription", () => {
   it("carries no per-install spacing figure and no company-scoped issue key", () => {
     expect(MACHINE_RENDERED_NOTICE).not.toMatch(/\d+\s*-\s*\d+\s*min/);
     expect(MACHINE_RENDERED_NOTICE).not.toMatch(/\b[A-Z]{2,}-\d+\b/);
+  });
+
+  /**
+   * PEN-6404 / PEN-6218. The notice is rendered as the FIRST section of the
+   * re-rendered head; `composeDescription` then appends the notes banner and
+   * marker BELOW it. So the two strings always ship in the same body, and a
+   * notice scoped to the whole description contradicts the banner outright --
+   * the body would open by saying every write is destroyed and close by saying
+   * writes below the line are kept.
+   *
+   * This is pinned on the COMPOSED body rather than on the constant, because
+   * that is the only place the contradiction exists. Asserting the constant
+   * alone is what let the first draft through: every assertion on
+   * MACHINE_RENDERED_NOTICE passed, and the defect was in how it reads beside
+   * a string from another module.
+   */
+  it("does not contradict the preserved-notes banner it ships beside", () => {
+    const composed = composeDescription(buildIssueDescription(baseAlert()), null);
+
+    // Both halves really are present, or the rest of this test is vacuous.
+    expect(composed).toContain(MACHINE_RENDERED_NOTICE);
+    expect(composed).toContain(AGENT_NOTES_MARKER);
+    expect(composed).toContain("preserved across syncs");
+
+    // The notice must scope its claim to its own section, never to the body.
+    expect(MACHINE_RENDERED_NOTICE).toContain("This section is machine-generated");
+    expect(MACHINE_RENDERED_NOTICE).not.toContain("This description is machine-generated");
+    expect(MACHINE_RENDERED_NOTICE).not.toContain("Anything written here is destroyed");
+
+    // And it must route to the preserved region rather than deny one exists.
+    expect(MACHINE_RENDERED_NOTICE).toContain("BELOW the notes marker");
+
+    // The notice sits above the marker, i.e. inside the half that is replaced.
+    expect(composed.indexOf(MACHINE_RENDERED_NOTICE)).toBeLessThan(
+      composed.indexOf(AGENT_NOTES_MARKER),
+    );
   });
 
   /**

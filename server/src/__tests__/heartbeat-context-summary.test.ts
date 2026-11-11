@@ -4375,6 +4375,36 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(exception).toBeGreaterThan(rule);
   });
 
+  /**
+   * PEN-6404 / PEN-6218. The clause's first draft inferred "your bytes are destroyed"
+   * from a revisions census that only establishes "a machine writes this field". Those
+   * are different properties, and the alertmanager plugin is the existence proof: its
+   * twelve null-authored revisions on PEN-6292 straddle the hour it started preserving
+   * everything below a notes marker, so the detector's output is identical on both sides
+   * of the change. The two-step shape is what keeps step 1's evidence from being spent
+   * on step 2's conclusion, so it is pinned rather than left to the prose.
+   */
+  it("separates the authorship check from the content-policy check", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    // Step 1 names the instrument; step 2 names reading the body.
+    expect(markdown).toContain("AUTHORSHIP");
+    expect(markdown).toContain("CONTENT POLICY");
+    expect(markdown).toContain("READ THE");
+
+    // The inference the first draft drew must be refused in as many words.
+    expect(markdown).toContain("NEVER 'your bytes are destroyed'");
+
+    // A preserved region is a place to write, not only a hazard to avoid.
+    expect(markdown).toContain("preserved region");
+
+    // And the overstatement must not come back.
+    expect(markdown).not.toContain("destroying whatever you put there");
+
+    // Ordering: the authorship step reads before the content-policy step.
+    expect(markdown.indexOf("AUTHORSHIP")).toBeLessThan(markdown.indexOf("CONTENT POLICY"));
+  });
+
   // The two ways the row-axis rule ends with no row to write on. They are different
   // failures -- no target at all, versus a known target that refuses the write -- and they
   // end in the same place, which is why both are pinned here: the constraint lands
