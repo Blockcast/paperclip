@@ -3908,7 +3908,8 @@ export const GITHUB_API_REQUESTS_BY_ROUTE_METRIC = "paperclip_github_api_request
 
 /**
  * GitHub calls this process REFUSED LOCALLY without sending them, because a
- * hold from BLO-53662 was in force for that credential and budget (PEN-6243).
+ * hold from BLO-53662 was in force for that credential, budget and route
+ * (PEN-6243; PEN-6520 added the route term).
  *
  * Deliberately a SEPARATE metric rather than a child of
  * {@link GITHUB_API_REFUSALS_METRIC}, and the separation is the whole point.
@@ -8520,7 +8521,8 @@ function ensureRegistry(): {
       name: GITHUB_API_HELD_METRIC,
       help:
         "Count of GitHub API calls this process refused LOCALLY, without sending them, while a "
-        + "BLO-53662 rate-limit hold was in force for that credential and budget (PEN-6243). "
+        + "BLO-53662 rate-limit hold was in force for that credential, budget and route "
+        + "(PEN-6243; PEN-6520 added the route term). "
         + "Deliberately NOT folded into "
         + GITHUB_API_REFUSALS_METRIC
         + " (which would re-inflate it with calls that cost GitHub nothing and destroy its use "

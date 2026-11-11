@@ -35,14 +35,18 @@
  *
  * Three independent reasons, each measured rather than assumed:
  *
- * 1. The local rate-limit hold (BLO-53662) is SHARD-BLIND. `rateLimitHoldKey`
- *    keys on `host : sha256(authorization) : resource`, and
- *    `inferRateLimitResource` returns `core` for every non-search,
- *    non-graphql route — so one shard's exhaustion makes `ghFetch` synthesize a
- *    local 403 for the other shard's routes too. A sampler behind it would
- *    report a shard with thousands of requests free as exhausted, reproducing
- *    inside this process exactly the single-counter error that makes
- *    `GET /rate_limit` unusable as a budget instrument.
+ * 1. The local rate-limit hold (BLO-53662) WAS shard-blind, and narrowing it
+ *    does not make it safe to sample through. `rateLimitHoldKey` keyed on
+ *    `host : sha256(authorization) : resource`, and `inferRateLimitResource`
+ *    returns `core` for every non-search, non-graphql route — so one shard's
+ *    exhaustion made `ghFetch` synthesize a local 403 for the other shard's
+ *    routes too, reproducing inside this process exactly the single-counter
+ *    error that makes `GET /rate_limit` unusable as a budget instrument.
+ *    PEN-6520 added the route to that key, so a hold is now no wider than the
+ *    route the refusal was drawn on. That shrinks the blast radius; it does
+ *    NOT retire this reason, because a sampler probes one route per shard and
+ *    would still be answered from a hold its own previous probe armed. Reasons
+ *    2 and 3 never depended on the key's width and are each sufficient alone.
  * 2. A held call answers from `heldResponse`, whose headers are a frozen echo
  *    of the last real reading. The sampler would therefore keep publishing the
  *    moment of exhaustion long after the bucket refilled, destroying the one
@@ -54,8 +58,10 @@
  *    to answer this very question.
  *
  * It must also never ARM the hold: a probe deliberately reads one shard, and
- * recording its exhaustion under a `core`-wide key is the defect above, not a
- * use of it.
+ * recording its exhaustion under a key that other calls share is the defect
+ * above, not a use of it. PEN-6520 narrowed that key from `core`-wide to
+ * per-route, which shrinks the set of calls a probe could wrongly hold without
+ * emptying it — the probe's own route is still shared with ordinary traffic.
  *
  * ## Two measured properties a future reader should not have to rediscover
  *

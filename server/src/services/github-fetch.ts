@@ -433,8 +433,9 @@ async function countGithubRefusal(url: string, response: Response, graphQlBudget
  * inside the exhausted window, whatever its own retry loop does.
  *
  * Keyed on the host, a hash of the Authorization header (never the token
- * itself) and the budget, so one installation's exhaustion never blocks another
- * credential, `search` never blocks `core`, and an exhausted `api.github.com`
+ * itself), the budget and the ROUTE, so one installation's exhaustion never
+ * blocks another credential, `search` never blocks `core`, one `core` route
+ * never blocks another (PEN-6520), and an exhausted `api.github.com`
  * never blocks `raw.githubusercontent.com` or a GHES host — which matters most
  * for unauthenticated callers, who all share the empty-header hash. The request-side budget is inferred from the
  * URL; a wrong inference only means no hold, which is today's behaviour.
@@ -449,7 +450,14 @@ export function _resetGhFetchRateLimitHoldsForTest() {
   rateLimitHolds.clear();
 }
 
-function inferRateLimitResource(url: string): string {
+/**
+ * Which of GitHub's budgets a request draws against, inferred from the URL
+ * because the request carries no header saying so. Exported for its test:
+ * the route-scope pin needs to assert that its fixtures really are `core`,
+ * and a test that re-derives this predicate inline controls nothing once
+ * the two copies drift (PEN-6520).
+ */
+export function inferRateLimitResource(url: string): string {
   if (isGraphQlEndpoint(url)) return "graphql";
   const path = new URL(url).pathname;
   if (path.includes("/search/code")) return "code_search";
@@ -457,6 +465,44 @@ function inferRateLimitResource(url: string): string {
   return "core";
 }
 
+/**
+ * The key one local hold is armed and looked up under: `(host, credential,
+ * budget, route)`.
+ *
+ * ## Why the route is a term (PEN-6520)
+ *
+ * GitHub's `core` budget is not one bucket. It is two route-pinned shards of
+ * ~9,650/h that drain INDEPENDENTLY (PEN-5710), and `x-ratelimit-resource`
+ * reports `core` for both of them. Without a route term, a refusal drawn
+ * against one shard armed a hold that answered every `core` route locally --
+ * including the routes on the OTHER shard, which would have served 200. The
+ * seven `core` route families this process actually calls shared a single key.
+ *
+ * The route does NOT identify the shard, and deliberately does not try: a
+ * recorded route->shard map decays, placement having been observed to move
+ * within hours. It is a PARTITION, not a prediction. Keying on it makes the
+ * hold no wider than the refusal that armed it, which is the most any evidence
+ * here supports.
+ *
+ * ## Why it is derived here and not passed in
+ *
+ * Both call sites -- the arm in {@link rememberRateLimitHold} and the lookup in
+ * {@link ghFetch} -- must agree on every term, or a hold is armed under a key
+ * nothing ever asks for. That failure is SILENT: it holds nothing and looks
+ * exactly like a budget that was never exhausted. `resource` already carries
+ * the scar of it (the arm side defaulted to a hardcoded "core" while the lookup
+ * side inferred it from the URL), and it has to stay a parameter because the
+ * arm side legitimately prefers what GitHub reported. The route has no such
+ * split -- there is no route header, and `url` is already in hand -- so
+ * deriving it in one place makes the two sides UNABLE to drift, rather than
+ * merely tested against drifting.
+ *
+ * {@link classifyGithubApiRoute} is a closed template built only from fixed
+ * segment sets, so owner, repo, numbers and SHAs can never reach this key: the
+ * map stays bounded by (credentials x budgets x a fixed route set), and the
+ * expiry sweep in `rememberRateLimitHold` continues to bound it in time. It
+ * never throws, and returns "other" for a URL it cannot parse.
+ */
 function rateLimitHoldKey(url: string, init: RequestInit | undefined, resource: string): string {
   let auth = "";
   try {
@@ -464,7 +510,8 @@ function rateLimitHoldKey(url: string, init: RequestInit | undefined, resource: 
   } catch {
     // Unreadable headers: hold under the anonymous key, as an unauthenticated call would be.
   }
-  return `${new URL(url).host}:${createHash("sha256").update(auth).digest("hex").slice(0, 16)}:${resource}`;
+  const credential = createHash("sha256").update(auth).digest("hex").slice(0, 16);
+  return `${new URL(url).host}:${credential}:${resource}:${classifyGithubApiRoute(url)}`;
 }
 
 function heldResponse(resetMs: number, resource: string): Response {
