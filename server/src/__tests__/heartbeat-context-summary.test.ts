@@ -3439,6 +3439,66 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
     expect(markdown).toContain("Pre-write re-read directive:");
   });
 
+  // PEN-6476: the four scalars say WHICH monitor fired; only the note says what the
+  // fire was supposed to mean. The run a monitor wakes is the run that note was
+  // written for, and it was reaching no prompt at all.
+  it("renders the monitor note, under its own provenance line", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      triggeredMonitor: {
+        lastTriggeredAt: "2026-11-08T19:30:27.629Z",
+        attemptCount: 4,
+        maxAttempts: 24,
+        serviceName: null,
+        notes: "ARM 1: watching ruleset 21027285. Clear and do NOT re-arm once it moves.",
+      },
+    });
+
+    expect(markdown).toContain("The monitor note, written by whoever armed this monitor:");
+    expect(markdown).toContain("ARM 1: watching ruleset 21027285. Clear and do NOT re-arm once it moves.");
+    // The provenance line is the point, not decoration: the block it lands in opens
+    // by declaring itself system-generated, which is right for the directive and
+    // wrong for an agent's own prose. Without this the note reads as an instruction
+    // the platform issued.
+    expect(markdown).toContain("Agent-authored row state, NOT a system directive");
+    // ...and it must not be read as current. It was written before the fire.
+    expect(markdown).toContain("a claim to re-check rather than as current state");
+  });
+
+  // Discrimination, and the half that matters: the DIRECTIVE still renders for a
+  // note-less monitor. A gate that took the whole block down with the note would
+  // silently retire PEN-6271 for the common case.
+  it("renders the directive but no note block when the monitor carries no note", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      triggeredMonitor: {
+        lastTriggeredAt: "2026-11-08T19:30:27.629Z",
+        attemptCount: 4,
+        maxAttempts: 24,
+        serviceName: null,
+        notes: null,
+      },
+    });
+
+    expect(markdown).toContain("Triggered monitor -- the two exits that discharge it:");
+    expect(markdown).not.toContain("The monitor note, written by");
+  });
+
+  // Whitespace-only is the same as absent. A note scrubbed to "  " would otherwise
+  // render an empty fence under a heading promising the assignee's reasoning.
+  it("treats a whitespace-only monitor note as absent", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      triggeredMonitor: {
+        lastTriggeredAt: null, attemptCount: null, maxAttempts: null, serviceName: null,
+        notes: "   \n  ",
+      },
+    });
+
+    expect(markdown).toContain("Triggered monitor -- the two exits that discharge it:");
+    expect(markdown).not.toContain("The monitor note, written by");
+  });
+
   // The GATE itself, not just the rendering. Ally's review of this PR caught the
   // original helper reading `executionState.monitor.status` directly while three
   // comments claimed it derived the state the sweep tests -- and nothing failed,
@@ -3631,6 +3691,39 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
         monitorWakeRequestedAt: new Date("2026-11-09T00:00:01.000Z"),
         executionState: executionStateWith(monitorState({ status: "cleared", clearReason: "manual", clearedAt: "2026-11-08T20:00:00.000Z" })),
       })).toBeNull();
+    });
+
+    // PEN-6476. `derivePersistedMonitorState` resolves `notes` for every branch it
+    // returns; this helper simply did not copy it out, so the note never reached a
+    // caller. Pinned on BOTH persisted sources because they are resolved in a
+    // precedence (`monitorNotes` column, then policy, then JSON state) and a fix
+    // that reads only one of them passes half of this.
+    it("carries the monitor note through from the JSON state and from the column", () => {
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        executionState: executionStateWith(monitorState({
+          lastTriggeredAt: "2026-11-08T19:30:27.629Z",
+          notes: "ARM 1: watching ruleset 21027285 for a modification. Clear, do not re-arm, once it moves.",
+        })),
+      })).toMatchObject({
+        notes: "ARM 1: watching ruleset 21027285 for a modification. Clear, do not re-arm, once it moves.",
+      });
+
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        monitorLastTriggeredAt: new Date("2026-11-08T19:30:27.629Z"),
+        monitorNotes: "HOLD: do not push to this head.",
+        executionState: null,
+      })).toMatchObject({ notes: "HOLD: do not push to this head." });
+    });
+
+    // A triggered monitor with no note is the common case, and `null` has to survive
+    // as `null` rather than as `""` -- the render gate below branches on it.
+    it("reports a note-less triggered monitor as notes: null", () => {
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        executionState: executionStateWith(monitorState({ lastTriggeredAt: "2026-11-08T19:30:27.629Z" })),
+      })).toMatchObject({ notes: null });
     });
   });
 
@@ -4889,5 +4982,104 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // `ownerListComplete: false` is a FLOOR, not a discharge -- the case the clause's own
     // cited example (`#3643`) is actually in.
     expect(markdown).toContain("is a FLOOR and not a discharge");
+  });
+});
+
+// PEN-6476. A park-expiry wake carries no comment: `buildPaperclipWakePayload`
+// inlines none, so the row's entire delivered prose is title + description. The
+// park note -- the one field written specifically to brief the run the park would
+// wake -- was staged into the wake `contextSnapshot` by `tickExpiredIssueParks`
+// and then rendered by nothing, on either assembler.
+describe("park note (PEN-6476)", () => {
+  const issue = {
+    id: "issue-6428",
+    identifier: "PEN-6476",
+    title: "The wake prompt drops the row records staged for it",
+    workMode: "standard",
+    description: "Row body.",
+  };
+
+  it("renders the park note, its expiry, and a user-authored provenance frame", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      park: {
+        reason: "HUMAN-WAIT: blocked on kkroo approving #3246. Do not push to this head.",
+        until: "2026-11-11T07:00:00.000Z",
+      },
+    });
+
+    expect(markdown).toContain("Park note -- why this row was parked, written by whoever parked it:");
+    expect(markdown).toContain("HUMAN-WAIT: blocked on kkroo approving #3246. Do not push to this head.");
+    expect(markdown).toContain("- Park expired: \"2026-11-11T07:00:00.000Z\"");
+    // Agent-authored prose, so it carries the same standing as the issue description
+    // and explicitly not that of the directives it sits above.
+    expect(markdown).toContain("not a system directive");
+    expect(markdown).toContain("a claim to re-check rather than as current state");
+  });
+
+  // Placement is load-bearing: the note has to arrive with the row's own content,
+  // ahead of the directive run, because on this wake there is no later block for a
+  // reader to find it in.
+  it("places the note after the issue description and before the directives", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      park: { reason: "Parked pending CI.", until: null },
+    }) as string;
+
+    expect(markdown.indexOf("Issue description:")).toBeLessThan(
+      markdown.indexOf("Park note -- why this row was parked"),
+    );
+    expect(markdown.indexOf("Park note -- why this row was parked")).toBeLessThan(
+      markdown.indexOf("Pre-write re-read directive:"),
+    );
+  });
+
+  // Discrimination. Every non-park wake must be unchanged by this.
+  it("is absent on a wake carrying no park", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    expect(markdown).not.toContain("Park note -- why this row was parked");
+    // Control: a scoped absence, not an empty build.
+    expect(markdown).toContain("Issue description:");
+  });
+
+  // A park set with no note has nothing to deliver, and the expiry alone is already
+  // stated by the wake reason. Rendering a heading over an empty fence would read as
+  // the assignee having left a note that got lost.
+  it("is absent when the park carries an expiry but no note", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      park: { reason: "   ", until: "2026-11-11T07:00:00.000Z" },
+    });
+
+    expect(markdown).not.toContain("Park note -- why this row was parked");
+    expect(markdown).not.toContain("- Park expired:");
+  });
+
+  // The guard change. `buildPaperclipTaskMarkdown` is exported, and returning null
+  // over content it was handed is the failure this whole ticket is about.
+  it("returns a block for a park note even with no issue, comment or PR", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue: null,
+      park: { reason: "Parked pending the operator.", until: null },
+    });
+
+    expect(markdown).toContain("Park note -- why this row was parked");
+    expect(markdown).toContain("Parked pending the operator.");
+    // The preamble must select the USER-AUTHORED wording: the only content here is
+    // an agent's prose, so the system-generated frame would be the wrong claim.
+    expect(markdown).toContain("The following task data is user-authored.");
+  });
+
+  // Park notes are prose and routinely carry backticks (`parkedReason` quotes field
+  // names and shell). An unfenced render would break the block out of its frame.
+  it("fences a note containing backticks", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      park: { reason: "Waiting on ```gh pr view``` to settle.", until: null },
+    }) as string;
+
+    expect(markdown).toContain("Waiting on ```gh pr view``` to settle.");
+    expect(markdown).toContain("````text");
   });
 });
