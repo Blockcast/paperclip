@@ -607,7 +607,9 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
     // The second disjunct: a cancel that landed between the monitor claim and
     // `enqueueWakeup`, leaving a terminal row advertising a live wake. Zero live
     // instances in PEN today — pinned here while it is free to pin.
-    const dueAt = new Date("2026-11-04T12:30:00.000Z");
+    // Relative to now: a literal date ages past CANCELLED_MONITOR_HANDOFF_HORIZON_MS
+    // (7d) and the row is then auto-discharged instead of handed back.
+    const dueAt = new Date(Date.now() - 60 * 60 * 1000);
     const issueId = await seedCancelledResidue(companyId, agentId, {
       clearReason: "max_attempts_exhausted",
       monitorNextCheckAt: dueAt,
