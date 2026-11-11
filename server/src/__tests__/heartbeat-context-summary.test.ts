@@ -4124,7 +4124,23 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // Collapsing them is what made the first version of this segment unperformable: the
     // digest has to cover the raw description text, and the request body cannot BE that text.
     expect(markdown).toContain("It takes TWO files and they are not interchangeable");
-    expect(markdown).toContain("jq -Rs '{description: .}' desc.md > body.json");
+    // PEN-6487: the envelope builder sits BETWEEN the digest and the wire, so it is the one
+    // step the two-file discipline cannot check. `jq -Rs` corrupts a multi-byte UTF-8
+    // character straddling a 16,380-byte LINE-INTERNAL buffer boundary -- measured
+    // first-party on a real 100,413-byte description, 3 runs of 3, and clean on every
+    // short-lined input, so the regime where this command is mandatory is the only regime
+    // where it fails. The negative assertion is deliberate: a later edit that reinstates the
+    // corrupting form must fail here rather than pass by omission.
+    expect(markdown).toContain("jq -n --rawfile d desc.md '{description: $d}' > body.json");
+    expect(markdown).not.toContain("jq -Rs '{description: .}' desc.md");
+    // The named tool is replaceable; the round-trip assertion is what survives the next
+    // encoding edge, so pin it and pin the reason it is there.
+    expect(markdown).toContain("ASSERT that the envelope round-trips before a byte reaches the wire");
+    expect(markdown).toContain("treat the ASSERTION, not the named tool, as the load-bearing half");
+    // A reader cannot act on a failure they cannot recognise: this one is silent on every
+    // surface they can see, and the exposure is LINE LENGTH, not file size.
+    expect(markdown).toContain("The exposure is LINE LENGTH and not file size");
+    expect(markdown).toContain("`jq` exits 0, `curl` returns `200 OK`, the row renders");
     // Both credential and content type, because dropping either one fails and they fail
     // DIFFERENTLY -- measured 2026-11-09T16:1xZ with a discriminating control on each arm.
     expect(markdown).toContain("Authorization: Bearer $PAPERCLIP_API_KEY");
