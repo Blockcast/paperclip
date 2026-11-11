@@ -843,24 +843,45 @@ describe.sequential("issue comment reopen routes", () => {
       explanation: "Peer agent is outside this low-trust boundary.",
     }));
 
-    // A nested object with a huge leaf string, via a request field
-    // (executionWorkspaceSettings.workspaceRuntime) whose schema is a bare
-    // `z.record(z.string(), z.unknown())` and so permits arbitrary nested
-    // values — the original truncation only capped top-level string fields,
-    // so this would have passed through unbounded.
+    // A NESTED huge leaf string. The property under test is that the walk
+    // bounds every branch of the payload: the original truncation capped only
+    // TOP-LEVEL string fields, so a string one level down passed through
+    // unbounded.
     //
-    // PEN-6418 moved this fixture off `assigneeAdapterOverrides.adapterConfig`,
-    // which carried the same open record until an agent-actor ALLOWLIST closed
-    // it. That guard refuses before the authorization decision, so an
-    // adapterConfig body now 403s without ever reaching the denied-write
-    // recorder this test is about. `workspaceRuntime` is the remaining
-    // agent-writable open record on this route and is tracked as the residual
-    // that allowlist does not cover.
+    // ⚠ THIS FIXTURE IS DELIBERATELY BUILT FROM TYPED FIELDS, and that is a
+    // change of FORM rather than a third relocation. It has moved twice
+    // already, each time because the open record it rode was closed:
+    // `assigneeAdapterOverrides.adapterConfig` (PEN-6418, agent-actor key
+    // ALLOWLIST, empty) and then `executionWorkspaceSettings.workspaceRuntime`
+    // (PEN-6430, agent-actor FIELD refusal). Both guards run inside
+    // `assertNoAgentIssueHostControlledMutation`, which fires BEFORE the
+    // authorization decision, so either body now 403s without ever reaching
+    // the denied-write recorder this test is about — the test would pass for
+    // the wrong reason, on a 403 from the wrong guard.
+    //
+    // As of PEN-6430 there is no bare `z.record(z.string(), z.unknown())` left
+    // on the agent-reachable issue write surface at all, which is a result in
+    // its own right. `watchdogDiscovery` is a typed `.strict()` object whose
+    // `evidenceMarkdown` is free text, so it supplies the one thing this test
+    // actually needs — a string leaf BELOW the top level — and it cannot be
+    // invalidated by some future guard closing an open record, because it no
+    // longer depends on one existing.
     const hugeLeaf = "x".repeat(50_000);
-    const secret = "sk-denied-secret-value";
+    // Deliberately NOT a credential-shaped literal. `redactSensitiveText`
+    // redacts the token after `Authorization: Bearer ` on the HEADER shape
+    // rather than on the token's own shape — measured here, both this token and
+    // a vendor-prefixed one redact, and a control string with no header shape
+    // does NOT — so the fixture gets the same coverage without adding another
+    // pasteable `sk-…` string to the tree.
+    const secret = "notacredentialshape0987654321";
     const res = await request(await installActor(createApp(), agentActor(outsideAgentId)))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      .send({ executionWorkspaceSettings: { workspaceRuntime: { apiKey: secret, a: { b: { c: hugeLeaf } } } } });
+      .send({
+        watchdogDiscovery: {
+          kind: "product_bug",
+          evidenceMarkdown: `Authorization: Bearer ${secret}\n${hugeLeaf}`,
+        },
+      });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     const call = mockLogActivity.mock.calls.find(
@@ -871,6 +892,17 @@ describe.sequential("issue comment reopen routes", () => {
     const details = (call![1] as { details: Record<string, unknown> }).details;
     expect(details.quarantined).toBe(true);
     expect(details.sourceTrust).toBe("untrusted_boundary_denied");
+    // PROGRESS MARKER, and it is not optional: the three bounds below are all
+    // ABSENCE assertions, so every one of them passes vacuously on a payload
+    // that dropped `watchdogDiscovery` entirely. This arm is what makes them
+    // evidence that the NESTED branch was walked and truncated rather than
+    // evidence that it was never recorded.
+    const recordedEvidence = (details.payload as {
+      watchdogDiscovery?: { evidenceMarkdown?: unknown };
+    } | undefined)?.watchdogDiscovery?.evidenceMarkdown;
+    expect(typeof recordedEvidence, JSON.stringify(details.payload).slice(0, 400)).toBe("string");
+    expect((recordedEvidence as string).length).toBeGreaterThan(0);
+    expect((recordedEvidence as string).length).toBeLessThan(hugeLeaf.length);
     // Whatever shape survives, it must not contain the raw 50k-char leaf —
     // either the nested string got truncated, or the whole payload got
     // replaced by a bounded preview.
@@ -918,14 +950,19 @@ describe.sequential("issue comment reopen routes", () => {
       explanation: "Peer agent is outside this low-trust boundary.",
     }));
 
-    const escapingHeavyConfig = Object.fromEntries(
-      Array.from({ length: 8 }, (_, index) => [`field${index}`, "\"\\\n".repeat(900)]),
-    );
+    // Escaping-heavy content on three TYPED top-level string fields — see the
+    // fixture note on the nested-leaf test above for why this no longer rides
+    // an open record. Each field is independently capped at
+    // DENIED_ISSUE_WRITE_FIELD_MAX_CHARS (4,000) by the per-leaf truncation, so
+    // the per-field bound alone cannot hold the TOTAL: every one of these three
+    // chars escapes to two JSON bytes, so three capped fields serialize to
+    // ~24,000 bytes against the 16,000-byte total cap. That is exactly the gap
+    // this test exists to pin, and it needs several fields rather than one
+    // large one precisely because the per-field cap would otherwise absorb it.
+    const escapingHeavy = "\"\\\n".repeat(3_000);
     const res = await request(await installActor(createApp(), agentActor(outsideAgentId)))
       .patch("/api/issues/11111111-1111-4111-8111-111111111111")
-      // PEN-6418: see the fixture note above — `adapterConfig` is now refused
-      // by an agent-actor allowlist before the denied-write recorder runs.
-      .send({ executionWorkspaceSettings: { workspaceRuntime: escapingHeavyConfig } });
+      .send({ title: escapingHeavy, description: escapingHeavy, billingCode: escapingHeavy });
 
     expect(res.status, JSON.stringify(res.body)).toBe(403);
     const call = mockLogActivity.mock.calls.find(
