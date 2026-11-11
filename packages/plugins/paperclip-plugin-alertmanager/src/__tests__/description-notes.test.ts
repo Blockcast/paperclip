@@ -75,6 +75,7 @@ import {
 import {
   buildAggregateIssueDescription,
   buildIssueDescription,
+  MACHINE_RENDERED_NOTICE,
 } from "../issue-mapping.js";
 import type {
   AlertmanagerAlert,
@@ -354,6 +355,39 @@ describe("PEN-6218 — composing a body around the notes marker", () => {
   it("rescues an append made on a body written before the marker existed", () => {
     const legacy = `**Summary**: s\n\n${AGENT_NOTE}`;
     expect(preservedNotes("**Summary**: s", legacy)).toBe(`\n\n${AGENT_NOTE}`);
+  });
+
+  /**
+   * PEN-6404 — the same rescue against the REAL renderer, which is where it
+   * broke and where the case above cannot see it.
+   *
+   * That case hands `preservedNotes` a hand-written `rendered` carrying no
+   * notice, so it went on passing while the live path could no longer fire at
+   * all: once the notice is prepended, `buildIssueDescription` output can never
+   * be a prefix of a body written before the notice existed. A unit test whose
+   * fixture predates the change under test is not evidence about the change.
+   *
+   * Not a theoretical population. Measured the day PEN-6218 deployed: of 107
+   * alertmanager-owned rows, 17 carried the marker and 90 did not — so the
+   * legacy rows this rescue exists for were 84% of the estate at the moment the
+   * notice would have retired it.
+   *
+   * The legacy body is built by removing the notice from today's render, which
+   * is precisely what the pre-notice renderer emitted: prepending it was the
+   * only change made to that output.
+   */
+  it("rescues an append on a pre-notice body built by the real renderer", () => {
+    const rendered = buildIssueDescription(alertFor(FP_A, STARTS_A));
+    expect(rendered.startsWith(MACHINE_RENDERED_NOTICE)).toBe(true);
+
+    const preNotice = rendered.slice(`${MACHINE_RENDERED_NOTICE}\n\n`.length);
+    // Control: the legacy body must NOT be rescuable by the exact-match arm,
+    // or this passes for the wrong reason.
+    expect(preNotice.startsWith(MACHINE_RENDERED_NOTICE)).toBe(false);
+
+    const legacy = `${preNotice}\n\n${AGENT_NOTE}`;
+
+    expect(preservedNotes(rendered, legacy)).toBe(`\n\n${AGENT_NOTE}`);
   });
 
   it("preserves nothing when a markerless body does not start with this render", () => {

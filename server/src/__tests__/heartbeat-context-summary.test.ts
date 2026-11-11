@@ -4405,6 +4405,25 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown.indexOf("AUTHORSHIP")).toBeLessThan(markdown.indexOf("CONTENT POLICY"));
   });
 
+  // PEN-6404, third round -- the directive contradicting ITSELF, which neither review round
+  // caught because each clause is correct about its own case. Concurrency says "PREPEND your
+  // constraint block"; on a row whose body carries a preserved region the durable half is at
+  // the FOOT, so a prepend lands at position 0, inside the re-rendered half, and is the one act
+  // that loses the write. Ordering is asserted as well as presence: an inversion that reads
+  // BEFORE the instruction it inverts is indistinguishable from the instruction itself.
+  it("names the PREPEND inversion, after the concurrency clause that tells you to prepend", () => {
+    const markdown = buildPaperclipTaskMarkdown({ issue });
+
+    const prependRule = markdown.indexOf("PREPEND your constraint block");
+    const inversion = markdown.indexOf("is the DESTRUCTIVE act on this one");
+
+    expect(prependRule).toBeGreaterThan(-1);
+    expect(inversion).toBeGreaterThan(prependRule);
+    // It must route, not only forbid -- otherwise the reader is told their
+    // default is wrong and given nowhere to put the constraint.
+    expect(markdown).toContain("APPEND below the marker instead");
+  });
+
   // The two ways the row-axis rule ends with no row to write on. They are different
   // failures -- no target at all, versus a known target that refuses the write -- and they
   // end in the same place, which is why both are pinned here: the constraint lands
