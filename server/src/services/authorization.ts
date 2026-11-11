@@ -2819,14 +2819,34 @@ export function authorizationService(db: Db) {
           // asserting a holder nobody here observed. Collapsing the two would
           // re-create this fix's own defect one branch over.
           reason: humanHeldRefusal === "human_held" ? "deny_human_assigned_issue" : "deny_missing_grant",
+          // PEN-6438: the explanation is selected from the SAME value as the
+          // reason, one field over, and it matters MORE here: `reason` is what a
+          // caller or metric reads, but `explanation` is the sentence an
+          // operator actually sees, because assertCanAssignTasks throws
+          // `forbidden(decision.explanation, authorizationDeniedDetails(decision))`.
+          // A single shared string here asserted "this issue is assigned to a
+          // person" on the `unreadable` branch too — a branch reached only when
+          // this company could NOT read the row, so where no holder was ever
+          // observed. That is the same mislabelling PEN-6266 removed from the
+          // reason, surviving one field over.
           explanation:
-            "This issue is assigned to a person, so agents cannot reassign it — including to themselves. " +
-            // Kept in step with issueMutationGrantRemediation in routes/issues.ts:
-            // an agent that hits the service-level denial (checkout's 403) sees
-            // only this string, so naming the same non-bypass routes here is what
-            // stops it from going looking for a door that is merely less guarded.
-            "Comment here with what you would have written and let them make the change, or write your " +
-            "findings on an issue you are assigned to and reference this one.",
+            humanHeldRefusal === "human_held"
+              ? "This issue is assigned to a person, so agents cannot reassign it — including to themselves. " +
+                // Kept in step with issueMutationGrantRemediation in routes/issues.ts:
+                // an agent that hits the service-level denial (checkout's 403) sees
+                // only this string, so naming the same non-bypass routes here is what
+                // stops it from going looking for a door that is merely less guarded.
+                "Comment here with what you would have written and let them make the change, or write your " +
+                "findings on an issue you are assigned to and reference this one."
+              : // No remedy is named on this branch because there is none to name.
+                // Every route the human_held string offers — comment on the row,
+                // write findings on a row you are assigned to — presupposes a
+                // readable row and a holder to hand it to, and this branch has
+                // neither. Say only what is true, and diagnose rather than offer a
+                // door: the refusal is about the id, not about who holds it.
+                "This issue is not readable by this company, so assignment is refused without determining who " +
+                "holds it. An id that is foreign or dangling is refused here rather than resolved — check the " +
+                "issue identifier.",
         });
       }
       if (policyEffect.kind === "restricted") {

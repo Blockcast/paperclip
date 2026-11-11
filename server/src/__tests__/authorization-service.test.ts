@@ -2495,7 +2495,11 @@ describeEmbeddedPostgres("authorization service", () => {
     // assignmentOntoHumanHeldIssueRefusal. Do not "align" this with the
     // human-held cases below; asserting a holder nobody here can see is the
     // very mislabelling PEN-6266 exists to remove.
-    await expect(authorization.decide({
+    // PEN-6438: the same now holds of the EXPLANATION, which was one shared
+    // string for both branches until this row selected it from
+    // `humanHeldRefusal` the way the reason already was. Both fields are
+    // picked from that one value; keep them in step, and keep BOTH arms below.
+    const unreadableDecision = await authorization.decide({
       actor: actorContext,
       action: "tasks:assign",
       resource: {
@@ -2506,7 +2510,15 @@ describeEmbeddedPostgres("authorization service", () => {
         currentAssigneeAgentId: null,
         originKind: null,
       },
-    })).resolves.toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    });
+    expect(unreadableDecision).toMatchObject({ allowed: false, reason: "deny_missing_grant" });
+    // The NEGATIVE arm is the load-bearing half and must not be dropped as
+    // redundant. Pinning only the positive string still passes if a later edit
+    // re-collapses the two branches into one shared sentence — which is the
+    // exact regression this pins against, because that sentence would again
+    // assert a holder on a row nobody here can read.
+    expect(unreadableDecision.explanation).toContain("not readable by this company");
+    expect(unreadableDecision.explanation).not.toContain("assigned to a person");
   });
 
   it("does not let an agent self-appoint onto a review shell through tasks:assign", async () => {
