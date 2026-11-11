@@ -418,7 +418,12 @@ probes above were paired with a sibling needle on the same stream, differing onl
 `{namespace="paperclip",container="paperclip"} |= "\"event\":\"claude_k8s.prompt_bundle_projection_sized\""`,
 which returned **7928 / 2d** — a non-zero, which is what makes the `"event":` form's **0** above a
 real zero and not a mute matcher. ⚠️ This was measured for #3590 on 2026-11-08/09 and recorded only
-in that PR's body until now. Re-run it beside the probe rather than citing this number: if the
+in that PR's body until now. ⛔ **The window is NOT recoverable and the figure is NOT a baseline.**
+#3590's body states two different windows for this one reading — "identical 14-day window" in the
+probe-table header and again in its own prose, against `7928 / 2d` in the cell and in that same
+prose sentence — so the record asserts both and privileges neither. Keep it only as evidence that
+this needle once fired; never compare a fresh magnitude against it.
+Re-run it beside the probe rather than citing this number: if the
 sibling needle ever returns zero, the matcher is mute and there is no reading.
 
 ✅ The standing §7.2 detector `scripts/check-git-egress-residual-triggers.mjs` (run by
