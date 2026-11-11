@@ -31,8 +31,13 @@
 #                          refusal is then the only signal that the trusted
 #                          arm never spoke for that job.
 #   MALFORMED-TWIN       — a twin-less REFUSED-LEGACY row whose trusted-arm
-#                          registration IS at this head but never expanded: some
-#                          row is named `<job>${{…`. That registration is the
+#                          registration IS at this head, is `skipped`, and never
+#                          expanded: some row is named `<job>${{…`. Only
+#                          `skipped` counts — a malformed row in any other
+#                          conclusion leaves the refusal STOPping, because the
+#                          malformed row's own line is already non-blocking and
+#                          excusing the refusal too would take the head to zero
+#                          stops. That registration is the
 #                          MALFORMED class above, which this legend already calls
 #                          non-blocking, so the refusal it leaves twin-less is not
 #                          evidence the trusted arm skipped the job. NOT blocking.
@@ -843,9 +848,22 @@ verdicts() { # $1 = DEAD alternation, $2 = PENDING rows, $3 = WDEAD, $4 = RENAME
         # refusal STOPs forever (PEN-6495). Exact stem only — a matrix name such as
         # `postgres-tests (heavy ${{ matrix.shard }}…` yields `postgres-tests (heavy `
         # and cannot collide with any legacy stem.
+        # `skipped` ONLY, and that conjunct is load-bearing (@ally on this PR).
+        # Recording the stem from a malformed row in ANY conclusion opens a new
+        # merge-authorizing false GREEN: a trusted-arm row that is malformed AND
+        # `failure` prints MALFORMED (non-blocking, the carve-out below) while the
+        # refusal it excuses prints MALFORMED-TWIN (also non-blocking), so the head
+        # ends with ZERO stop lines where master STOPped. A REAL twin can afford to
+        # ignore conclusion -- a bare `<job> failure` twin STOPs on its own line --
+        # but a malformed twin cannot, because its own line is already carved out.
+        # Un-expanded names also come from jobs that never started, including
+        # startup and expression-evaluation failures, not just `if:`-skips.
+        # `skipped` is the only shape measured live (penstock #3285 @ 6598ab39,
+        # run 42898970215, pull_request_target), so every other conclusion fails
+        # closed here on purpose.
         {twin[$1] = 1
          tp = index($1, "${{")
-         if (tp > 1) tmpl[substr($1, 1, tp - 1)] = 1}
+         if (tp > 1 && $2 == "skipped") tmpl[substr($1, 1, tp - 1)] = 1}
         legacy{lq++; lname[lq] = $1; lrow[lq] = $1 "\t" $2 "\trun=" $4; next}
         # Survivors are check-run verdicts only. On a repo that publishes ONLY
         # legacy statuses this fires ABSENT on every head — the documented
