@@ -6,10 +6,11 @@ import {
   EXIT_UNMEASURED,
   EXIT_VIOLATION,
   SECRET_SCAN_SILENCING_PATHS,
+  classifyRootPathMatch,
   fetchCodeownersErrors,
   ghErrorText,
   isTransientGhError,
-  ownersForExactPattern,
+  ownersForRootPath,
   parseCodeownersRules,
   runGuard,
   summarizeErrors,
@@ -320,6 +321,28 @@ describe("secret-scan silencing paths stay code-owned (PEN-6393)", () => {
     assert.deepEqual(uncoveredSecretScanPaths(codeowners), []);
   });
 
+  // ⚠ A SECOND assertion against the real file, where the comment above says one
+  // is deliberately all there is. It earns its place by asking a different
+  // question and by being unable to cascade: deleting a rule leaves
+  // `ownersForRootPath` returning [] — an answer — not null, so this stays green
+  // and the test above reds alone, naming the path. What DOES red this is a glob
+  // landing after these rules, i.e. PEN-6444's conservative arm firing on the
+  // real file. That is the one way the arm could turn an hourly cron guard into
+  // permanent noise, so it has to be visible as itself rather than as an
+  // unexplained failure of the check above.
+  it('no silencing path resolves to "cannot tell" on the real file', () => {
+    const rules = parseCodeownersRules(
+      readFileSync(new URL("../.github/CODEOWNERS", import.meta.url), "utf8"),
+    );
+    for (const path of SECRET_SCAN_SILENCING_PATHS) {
+      assert.notEqual(
+        ownersForRootPath(rules, path),
+        null,
+        `${path}: a rule this parser cannot model sits after the rule that owns it`,
+      );
+    }
+  });
+
   // Pins the LIST, not just the lookup. Without this, the cheapest way to green a
   // failing run above is to delete the path from SECRET_SCAN_SILENCING_PATHS —
   // which silently shrinks the control instead of restoring it.
@@ -376,6 +399,39 @@ describe("uncoveredSecretScanPaths", () => {
     ]);
   });
 
+  // ⛔ THE PEN-6444 REGRESSION PIN, and the one above is why it is needed rather
+  // than redundant: that override is spelled IDENTICALLY to the rule it cancels,
+  // so comparing pattern strings already caught it. This one is spelled
+  // DIFFERENTLY and means the same thing — a leading `/` anchors to the
+  // repository root, where this file is — so GitHub removes the owner and the
+  // string comparison never saw the two rules as being about one file.
+  it("⛔ reports a path overridden by a later ANCHORED owner-less rule", () => {
+    const mutated = `${FIXTURE}/.gitleaks.toml\n`;
+    assert.notEqual(mutated, FIXTURE, "control did not mutate the fixture");
+    assert.deepEqual(uncoveredSecretScanPaths(mutated), [".gitleaks.toml"]);
+  });
+
+  // An anchored rule that is the ONLY rule for the path is COVERED, because
+  // GitHub routes it. Pinned because the obvious way to green the pin above —
+  // treating any leading `/` as a non-match — would pass that one while breaking
+  // this, and the two together force an equivalence rather than a veto.
+  it("credits an anchored rule that is the only rule for the path", () => {
+    const anchored = ".github/** @kkroo\n/.gitleaks.toml @kkroo\n";
+    assert.deepEqual(uncoveredSecretScanPaths(anchored, [".gitleaks.toml"]), []);
+  });
+
+  // ⛔ The rest of the class, failing CLOSED. A later glob could remove the
+  // owner; this parser does not expand globs, so it refuses rather than guesses.
+  it("⛔ reports every path a later unmodelled glob could have overridden", () => {
+    const mutated = `${FIXTURE}* @someone\n`;
+    assert.notEqual(mutated, FIXTURE, "control did not mutate the fixture");
+    assert.deepEqual(uncoveredSecretScanPaths(mutated), [
+      ".gitleaks.toml",
+      ".gitleaks-staging.toml",
+      ".gitleaksignore",
+    ]);
+  });
+
   it("⛔ reports all three when the rules are absent entirely", () => {
     assert.deepEqual(uncoveredSecretScanPaths(".github/** @kkroo\n"), [
       ".gitleaks.toml",
@@ -426,25 +482,111 @@ describe("parseCodeownersRules", () => {
   });
 });
 
-describe("ownersForExactPattern", () => {
+// The verdict table behind the coverage check. Read it as the statement of what
+// this parser claims to understand: every row in the third bucket is a shape it
+// refuses to interpret, and refusing is what makes the check above fail closed.
+describe("classifyRootPathMatch (PEN-6444)", () => {
+  const TARGET = ".gitleaks.toml";
+
+  const TABLE = [
+    [".gitleaks.toml", "matches", "a slashless pattern matches that name at any depth, root included"],
+    ["/.gitleaks.toml", "matches", "a leading slash anchors to the root, which is where this file is"],
+    ["**/.gitleaks.toml", "matches", "a leading globstar segment reaches the root too"],
+    ["/**/.gitleaks.toml", "matches", "anchored globstar, same file"],
+
+    [".gitleaks.toml.bak", "cannot-match", "a different file that merely shares a prefix"],
+    [".GITLEAKS.TOML", "cannot-match", "GitHub resolves CODEOWNERS case-sensitively"],
+    [".github/**", "cannot-match", "an interior slash demands a directory this file is not in"],
+    ["scripts/release-*.mjs", "cannot-match", "same, so the glob never gets a chance to matter"],
+    ["docs/.gitleaks.toml", "cannot-match", "the same NAME, but nested"],
+    [".gitleaks.toml/", "cannot-match", "a trailing slash names a directory, not a file"],
+    ["", "cannot-match", "an empty pattern governs nothing"],
+
+    ["*", "unmodelled", "a glob that WOULD match; not expanded here, so refuse"],
+    ["*.toml", "unmodelled", "same"],
+    ["/*", "unmodelled", "anchored glob"],
+    ["**", "unmodelled", "bare globstar"],
+    [".gitleaks?toml", "unmodelled", "`?` is a supported wildcard this parser does not expand"],
+    ["[.]gitleaks.toml", "unmodelled", "`[ ]` is documented as NOT working, so its effect is undefined"],
+    ["!.gitleaks.toml", "unmodelled", "`!` negation is documented as NOT working, likewise"],
+  ];
+
+  for (const [pattern, expected, why] of TABLE) {
+    it(`${JSON.stringify(pattern)} → ${expected} — ${why}`, () => {
+      assert.equal(classifyRootPathMatch(pattern, TARGET), expected);
+    });
+  }
+
+  // A table that landed everything in one bucket would pass every row above and
+  // prove nothing about the function.
+  it("populates all three verdicts, so no bucket is vacuous", () => {
+    const seen = new Set(TABLE.map(([, verdict]) => verdict));
+    assert.deepEqual([...seen].sort(), ["cannot-match", "matches", "unmodelled"]);
+  });
+
+  // ⛔ The model is about files sitting AT the root, which is all
+  // SECRET_SCAN_SILENCING_PATHS holds today. A nested path added to that list
+  // later is outside the model, and has to red the guard rather than be answered
+  // confidently and wrongly.
+  it("⛔ refuses a NESTED target rather than answering about it", () => {
+    assert.equal(
+      classifyRootPathMatch("config/.gitleaks.toml", "config/.gitleaks.toml"),
+      "unmodelled",
+    );
+  });
+
+  it("is null-safe on both arguments", () => {
+    assert.equal(classifyRootPathMatch(null, TARGET), "cannot-match");
+    assert.equal(classifyRootPathMatch(".gitleaks.toml", null), "unmodelled");
+  });
+});
+
+describe("ownersForRootPath", () => {
   const rules = parseCodeownersRules("a @first\nb @other\na @last\n");
 
   it("takes the LAST match, because CODEOWNERS is last-match-wins", () => {
-    assert.deepEqual(ownersForExactPattern(rules, "a"), ["@last"]);
+    assert.deepEqual(ownersForRootPath(rules, "a"), ["@last"]);
   });
 
-  it("returns [] for a pattern with no rule", () => {
-    assert.deepEqual(ownersForExactPattern(rules, "absent"), []);
+  it("returns [] for a path no rule names", () => {
+    assert.deepEqual(ownersForRootPath(rules, "absent"), []);
   });
 
-  // ⛔ Exact string equality, never a prefix or substring test: `.gitleaks.toml`
-  // must not be credited to a rule written for `.gitleaks.toml.bak`.
+  // ⛔ Never a prefix or substring test: `.gitleaks.toml` must not be credited to
+  // a rule written for `.gitleaks.toml.bak`.
   it("⛔ does not credit a different pattern that merely shares a prefix", () => {
     const near = parseCodeownersRules(".gitleaks.toml.bak @o\n");
-    assert.deepEqual(ownersForExactPattern(near, ".gitleaks.toml"), []);
+    assert.deepEqual(ownersForRootPath(near, ".gitleaks.toml"), []);
+  });
+
+  // ⛔ PEN-6444 at the resolution layer: a different SPELLING of the same file,
+  // carrying no owners, removes the owner found above it.
+  it("⛔ lets a later ANCHORED owner-less rule remove an owner", () => {
+    const over = parseCodeownersRules(".gitleaks.toml @kkroo\n/.gitleaks.toml\n");
+    assert.deepEqual(ownersForRootPath(over, ".gitleaks.toml"), []);
+  });
+
+  it("credits an anchored rule that is the only rule for the path", () => {
+    const anchored = parseCodeownersRules("/.gitleaks.toml @kkroo\n");
+    assert.deepEqual(ownersForRootPath(anchored, ".gitleaks.toml"), ["@kkroo"]);
+  });
+
+  // ⚠ null is "cannot tell", NOT "no owners". They are the same verdict to the
+  // coverage check and different facts to a reader, so they are pinned apart.
+  it("⚠ answers null, not [], when a later unmodelled rule could have overridden", () => {
+    const globbed = parseCodeownersRules(".gitleaks.toml @kkroo\n* @someone\n");
+    assert.equal(ownersForRootPath(globbed, ".gitleaks.toml"), null);
+  });
+
+  // ...and a definite later match settles it again, which is just last-match-wins
+  // applied to the refusal. Without this, "once unknown, always unknown" would
+  // pass every other arm here.
+  it("lets a definite later match settle an earlier unmodelled rule", () => {
+    const resettled = parseCodeownersRules("* @glob\n.gitleaks.toml @kkroo\n");
+    assert.deepEqual(ownersForRootPath(resettled, ".gitleaks.toml"), ["@kkroo"]);
   });
 
   it("is null-safe", () => {
-    assert.deepEqual(ownersForExactPattern(null, "a"), []);
+    assert.deepEqual(ownersForRootPath(null, "a"), []);
   });
 });

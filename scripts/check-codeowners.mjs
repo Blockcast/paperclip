@@ -116,8 +116,12 @@ export const SECRET_SCAN_SILENCING_PATHS = [
  * seeing it.
  *
  * Bound, stated because the parser looks more general than it is: a `#` anywhere
- * on a line starts a comment. CODEOWNERS has no escape for a literal `#` in a
- * pattern, and no rule here contains one.
+ * on a line starts a comment. CODEOWNERS has no escape for a literal `#`, and no
+ * rule here contains one. That is GitHub's own documented behaviour rather than
+ * an assumption about it: "About code owners" lists escaping a pattern starting
+ * with `#` using a backslash among the gitignore rules that do NOT work, and its
+ * example file shows `#` opening an inline comment too. (Re-checked 2026-11-11
+ * for PEN-6444, which queried the absolute.)
  *
  * @param {string} text
  * @returns {{line: number, pattern: string, owners: string[]}[]}
@@ -136,15 +140,77 @@ export function parseCodeownersRules(text) {
 }
 
 /**
- * Owners of the LAST rule whose pattern is EXACTLY `pattern`, or `[]`.
+ * Three-way verdict on whether a CODEOWNERS pattern can govern a ROOT-LEVEL file.
  *
- * Last, not first, because CODEOWNERS resolves by last-match-wins — so a later
- * owner-less line for the same pattern silently removes ownership, and taking the
- * first match would report that as still covered.
+ * The third value is the point of it. A two-way match/no-match answer has to
+ * guess for every pattern shape this parser does not implement, and the cheap
+ * guess is "does not match" — which the caller reads as "ownership unchanged",
+ * i.e. still covered. Naming the undecidable case instead lets the caller fail
+ * CLOSED on it.
+ *
+ * The semantics, from GitHub's "About code owners": a CODEOWNERS pattern follows
+ * most gitignore rules; a leading `/` anchors to the repository root; a pattern
+ * containing no slash matches that name at ANY depth, root included; a leading
+ * globstar segment likewise reaches the root; a trailing `/` names a directory;
+ * matching is case-sensitive. Negation with `!` and character ranges with `[ ]`
+ * are documented as NOT working, so a pattern using either has undefined effect
+ * rather than no effect — a reason to refuse to interpret it, not to ignore it.
+ *
+ * @param {string} pattern a CODEOWNERS pattern
+ * @param {string} path a root-relative file name, e.g. `.gitleaks.toml`
+ * @returns {"matches" | "cannot-match" | "unmodelled"}
  */
-export function ownersForExactPattern(rules, pattern) {
-  const matching = (rules ?? []).filter((rule) => rule.pattern === pattern);
-  return matching.length === 0 ? [] : matching[matching.length - 1].owners;
+export function classifyRootPathMatch(pattern, path) {
+  const target = String(path ?? "");
+  // Everything below reasons about a file sitting AT the repository root, which
+  // is all `SECRET_SCAN_SILENCING_PATHS` contains. Asked about anything else —
+  // a nested path added to that list later — the model does not apply, and
+  // saying so reds the guard instead of answering confidently and wrongly.
+  if (target === "" || target.includes("/")) return "unmodelled";
+
+  const raw = String(pattern ?? "");
+  if (raw === "") return "cannot-match";
+
+  let rest = raw.startsWith("/") ? raw.slice(1) : raw;
+  // A leading globstar segment is the one slash-bearing shape that still reaches
+  // a root-level file: `**` + `/name` matches `name` at any depth.
+  if (rest.startsWith("**/")) rest = rest.slice(3);
+  // Any surviving `/` demands a directory component the target does not have.
+  // This subsumes the DIRECTORY form too — a pattern ending in `/` either keeps
+  // a slash here or reduces to the empty string, and neither can equal a
+  // non-empty root-level name. An explicit `raw.endsWith("/")` branch was
+  // written first and dropped: it agreed with this line on all 690 verdicts of a
+  // pattern corpus built to over-sample slash shapes, so no mutation could red
+  // it, and a branch no test can kill is not a second layer of defence.
+  if (rest.includes("/")) return "cannot-match";
+
+  // `*` and `?` work on GitHub and are not modelled here; `[`, `]` and `!` do
+  // not work there, so their effect is undefined. Both are reasons to refuse.
+  if (/[*?[\]!]/.test(rest)) return "unmodelled";
+
+  return rest === target ? "matches" : "cannot-match";
+}
+
+/**
+ * Owners of a ROOT-LEVEL path under last-match-wins, or `null` when a rule this
+ * parser does not model could have changed the answer.
+ *
+ * One pass in file order IS last-match-wins: a later `matches` replaces whatever
+ * stood before it — including a `null` — and a later owner-less rule replaces an
+ * owner with `[]`, which is how CODEOWNERS removes ownership.
+ *
+ * ⚠ `null` means "cannot tell", NOT "no owners". The caller has to fold it into
+ * the UNCOVERED side; folding it into the covered side restores the fail-open
+ * this function was written to close.
+ */
+export function ownersForRootPath(rules, path) {
+  let owners = [];
+  for (const rule of rules ?? []) {
+    const verdict = classifyRootPathMatch(rule?.pattern, path);
+    if (verdict === "matches") owners = rule?.owners ?? [];
+    else if (verdict === "unmodelled") owners = null;
+  }
+  return owners;
 }
 
 /**
@@ -162,15 +228,32 @@ export function ownersForExactPattern(rules, pattern) {
  * (`runGuard` passes — it only ever sees rules that are present — and this
  * fails). Removing either leaves a real hole, so each carries its own assertion.
  *
- * ⚠ Bound: coverage is matched on the EXACT pattern string. Rewriting a rule to
- * an equivalent form (`/.gitleaks.toml`) reds this check even though GitHub would
- * still route it — conservative, and the fix is to update the literal list. Glob
- * precedence is not modelled, so a later `*` rule could override a match this
- * still reports as covered.
+ * ## Where the pattern model stops, and which way it falls over (PEN-6444)
+ *
+ * Coverage used to be decided by comparing pattern STRINGS, which modelled
+ * last-match-wins only for an IDENTICALLY SPELLED rule. A later anchored
+ * `/.gitleaks.toml` carrying no owners — which GitHub resolves as REMOVING
+ * ownership of the root file — is a different string, was never compared, and
+ * this returned []. The check reported covered on a file GitHub had just left
+ * unowned: fail-open, in a guard whose entire job is to notice that. The
+ * docstring that stood here called the anchored form conservative, which was
+ * true only when it was the sole rule for the path.
+ *
+ * `ownersForRootPath` resolves by what a pattern MEANS for a root-level file
+ * instead, and answers `null` for any shape it does not model — a glob, a
+ * character range, a nested target. That `null` is folded in as UNCOVERED below,
+ * so a rule this parser cannot read reds the check instead of passing it. The
+ * residual bound is therefore NOISE rather than silence: a glob landing after
+ * one of these rules asks a human to look, which is the direction a security
+ * guard should fail in. The cost is real and is the right trade — this guard
+ * runs hourly on cron, so a spurious red is visible and fixable, where a
+ * spurious green is neither.
  */
 export function uncoveredSecretScanPaths(text, paths = SECRET_SCAN_SILENCING_PATHS) {
   const rules = parseCodeownersRules(text);
-  return paths.filter((path) => ownersForExactPattern(rules, path).length === 0);
+  // `?? []` is the line where "cannot tell" becomes "uncovered". Changing it to
+  // treat `null` as covered re-opens PEN-6444. See `ownersForRootPath`.
+  return paths.filter((path) => (ownersForRootPath(rules, path) ?? []).length === 0);
 }
 
 function gh(args) {
