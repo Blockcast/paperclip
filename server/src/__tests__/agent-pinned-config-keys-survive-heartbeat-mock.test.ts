@@ -297,8 +297,13 @@ describe("PATCH /api/agents/:id pinned-key guard survives a TOTAL heartbeat mock
     // degraded, it is unreachable. The arms can only pass because the route
     // reads these names from the leaf instead.
     for (const name of ["agentActorUnwritableConfigKeys", "agentScopeOnlyConfigKeysFor"]) {
+      // The matcher is the planted symbol name rather than vitest's own
+      // sentence: the property under test is that ACCESS THROWS and that the
+      // throw names the symbol, which is what makes a failure here readable.
+      // vitest's wording is an implementation detail of the mock namespace and
+      // is not part of the mechanism this arm reproduces.
       expect(() => (mockedHeartbeat as Record<string, unknown>)[name]).toThrowError(
-        new RegExp(`No "${name}" export is defined`),
+        new RegExp(name),
       );
     }
 
