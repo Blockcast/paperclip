@@ -4,10 +4,14 @@ import { describe, it } from "node:test";
 import {
   DEFAULT_GRACE_MINUTES,
   DEFAULT_MIN_SIBLING_CHECKS,
+  INCONCLUSIVE_VERDICTS,
   SELF_CHECK_NAME,
+  UNDECIDED_VERDICTS,
   classifyPullRequest,
   collapseHeadChecks,
+  isAttestationContext,
   sweep,
+  verdictRowState,
 } from "./sweep-missing-review.mjs";
 import { publishableCount, renderSummary } from "./report-missing-review-sweep.mjs";
 
@@ -384,5 +388,187 @@ describe("report", () => {
     const summary = renderSummary({ ...base, resolutions: [{ number: 42, head: "c".repeat(40) }] });
     assert.match(summary, /supersedes with a `success` row|supersedes/);
     assert.match(summary, /#42/);
+  });
+});
+
+function reviewRow(conclusion, status = "COMPLETED") {
+  return { name: "review", conclusion, status, completedAt: "2026-11-09T18:00:00Z" };
+}
+
+function ally(names) {
+  return names.map((name) => ({
+    name,
+    conclusion: "SUCCESS",
+    status: "COMPLETED",
+    completedAt: "2026-11-09T17:00:00Z",
+  }));
+}
+
+// The three attestation contexts measured live at #3205 @ `eb2dc737`,
+// 2026-11-11. Every one is written by `paperclip-api`, not by this repo's CI.
+const ALLY_FAMILY = ["gate/ally-comment-findings", "ci/ally-head-attested", "review/ally-comment"];
+
+describe("the watched row's own CONCLUSION decides whether a verdict exists (PEN-6481)", () => {
+  for (const conclusion of INCONCLUSIVE_VERDICTS) {
+    it(`treats a \`${conclusion}\` row as ABSENT, because it never self-heals`, () => {
+      // The row exists, so a bare `byName.has(name)` test reads this head as
+      // verdict-present FOREVER. That is the PEN-6352 class -- a head with no
+      // computed verdict and nothing reporting it -- reached by a different
+      // mechanism than the `startup_failure` burst.
+      const result = classifyPullRequest(
+        pr(head({ suites: [suite([...filler(19), reviewRow(conclusion)])] })),
+        { now: NOW },
+      );
+      assert.equal(result.verdict, "missing");
+      assert.equal(result.finding.number, 3602);
+    });
+  }
+
+  for (const conclusion of ["SUCCESS", "FAILURE", "NEUTRAL", "ACTION_REQUIRED", "ERROR"]) {
+    it(`treats a \`${conclusion}\` row as a computed verdict`, () => {
+      const result = classifyPullRequest(
+        pr(head({ suites: [suite([...filler(19), reviewRow(conclusion)])] })),
+        { now: NOW },
+      );
+      assert.equal(result.verdict, "present");
+    });
+  }
+
+  it("decides NOTHING while the row is still in flight, rather than flagging it", () => {
+    // Measured on #3602: `in_progress` 18:31:02Z -> `success` 18:31:10Z, 8
+    // seconds. Scoring this `missing` is the literal "require a non-null
+    // conclusion" remedy, and it posts a row, retires it, and posts another.
+    const result = classifyPullRequest(
+      pr(head({ suites: [suite([...filler(19), reviewRow(null, "IN_PROGRESS")])] })),
+      { now: NOW },
+    );
+    assert.equal(result.verdict, "skipped");
+    assert.match(result.reason, /in flight/);
+    assert.doesNotMatch(result.reason, /UNPROVEN/);
+  });
+
+  it("does NOT retire our standing row on a verdict that has not been computed", () => {
+    // The retirement arm supersedes our `neutral` row with a `success` one. On
+    // an in-flight `review` that would assert a verdict exists when none does.
+    const result = classifyPullRequest(
+      pr(head({ suites: [suite([...filler(19), reviewRow(null, "QUEUED"), ownRow("NEUTRAL")])] })),
+      { now: NOW },
+    );
+    assert.equal(result.verdict, "skipped");
+  });
+
+  it("reports an unrecognised conclusion as UNPROVEN rather than guessing either way", () => {
+    // Folding the unknown token into either neighbour is wrong in a way
+    // nothing would report: "conclusive" restores the hole above, "absent"
+    // publishes a finding about a head we did not understand.
+    const result = classifyPullRequest(
+      pr(head({ suites: [suite([...filler(19), reviewRow("SOME_FUTURE_TOKEN")])] })),
+      { now: NOW },
+    );
+    assert.equal(result.verdict, "skipped");
+    assert.match(result.reason, /UNPROVEN/);
+    assert.match(result.reason, /SOME_FUTURE_TOKEN/);
+  });
+
+  it("reads a PENDING commit status as in-flight, not as a verdict", () => {
+    // `collapseHeadChecks` synthesises `status: "COMPLETED"` for every commit
+    // status, so the conclusion is the only field carrying the distinction.
+    const result = classifyPullRequest(
+      pr(
+        head({
+          suites: [suite(filler(19))],
+          contexts: [{ context: "review", state: "PENDING", createdAt: "2026-11-09T18:31:02Z" }],
+        }),
+      ),
+      { now: NOW },
+    );
+    assert.equal(result.verdict, "skipped");
+    assert.match(result.reason, /in flight/);
+  });
+
+  it("keeps the anti-flap guard across the new arm: a cancelled row is not re-posted hourly", () => {
+    const result = classifyPullRequest(
+      pr(head({ suites: [suite([...filler(19), reviewRow("CANCELLED"), ownRow("NEUTRAL")])] })),
+      { now: NOW },
+    );
+    assert.equal(result.verdict, "missing");
+    assert.equal(result.finding.alreadyPublished, true);
+  });
+
+  it("does not let an inconclusive watched row vouch for its own absence", () => {
+    // New self-counting arm. Before this change the sibling test was reachable
+    // only when `review` was absent from the map, so it could not count
+    // itself; an INCONCLUSIVE row now falls through to it and is present.
+    const runs = [...filler(DEFAULT_MIN_SIBLING_CHECKS - 1), reviewRow("CANCELLED")];
+    const result = classifyPullRequest(pr(head({ suites: [suite(runs)] })), { now: NOW });
+    assert.equal(result.verdict, "skipped");
+    assert.match(result.reason, new RegExp(`only ${DEFAULT_MIN_SIBLING_CHECKS - 1} check`));
+  });
+
+  it("classifies every state token it is handed", () => {
+    assert.equal(verdictRowState({ conclusion: "SUCCESS" }), "conclusive");
+    assert.equal(verdictRowState({ conclusion: "cancelled" }), "inconclusive");
+    assert.equal(verdictRowState({ conclusion: null }), "undecided");
+    assert.equal(verdictRowState({}), "undecided");
+    assert.equal(verdictRowState({ conclusion: "WAT" }), "unknown");
+    for (const token of UNDECIDED_VERDICTS) {
+      assert.equal(verdictRowState({ conclusion: token }), "undecided");
+    }
+  });
+});
+
+describe("the sibling test counts repo CI, not attestation contexts (PEN-6481)", () => {
+  it("excludes the ally family and admits ordinary CI names that merely contain the letters", () => {
+    for (const name of [...ALLY_FAMILY, "review/ally-complete", "ally-verdict"]) {
+      assert.equal(isAttestationContext(name), true, name);
+    }
+    for (const name of ["review", "verify", "finally-tests", "tally", "general-tests (1/6)"]) {
+      assert.equal(isAttestationContext(name), false, name);
+    }
+  });
+
+  it("does not flag a head whose only siblings are attestation contexts", () => {
+    // MEASURED LIVE 2026-11-11, #3205 @ `eb2dc737`: four distinct names, three
+    // of them ally and one our own row, ZERO repo CI. That cleared the
+    // threshold of 3 EXACTLY and was classified `missing`. The finding was
+    // literally true -- the head has no `review` verdict -- but the sibling
+    // test's stated purpose is "CI has not reported yet", so the row implied
+    // repo CI had run when none ever did.
+    const result = classifyPullRequest(
+      pr(head({ suites: [suite([...ally(ALLY_FAMILY), ownRow("NEUTRAL")])] })),
+      { now: NOW },
+    );
+    assert.equal(result.verdict, "skipped");
+    assert.match(result.reason, /only 0 check/);
+    assert.match(result.reason, /3 attestation context\(s\) excluded/);
+  });
+
+  it("still flags a head where real CI reported alongside the attestation contexts", () => {
+    // The exclusion must narrow what counts as evidence of CI, never suppress
+    // a genuine finding.
+    const result = classifyPullRequest(
+      pr(head({ suites: [suite([...ally(ALLY_FAMILY), ...filler(DEFAULT_MIN_SIBLING_CHECKS)])] })),
+      { now: NOW },
+    );
+    assert.equal(result.verdict, "missing");
+    assert.equal(result.finding.checkNamesPresent, DEFAULT_MIN_SIBLING_CHECKS);
+  });
+
+  it("does not let attestation contexts top a head up to the threshold", () => {
+    const runs = [...ally(ALLY_FAMILY), ...filler(DEFAULT_MIN_SIBLING_CHECKS - 1)];
+    const result = classifyPullRequest(pr(head({ suites: [suite(runs)] })), { now: NOW });
+    assert.equal(result.verdict, "skipped");
+    assert.match(result.reason, new RegExp(`only ${DEFAULT_MIN_SIBLING_CHECKS - 1} check`));
+  });
+
+  it("retires a standing row on a real verdict even when every sibling is attestation-only", () => {
+    // Retirement is gated on the VERDICT, never on the sibling count, so a
+    // head with no repo CI can still have our marker cleared when `review`
+    // finally reports. Without that the row would sit at that SHA forever.
+    const result = classifyPullRequest(
+      pr(head({ suites: [suite([...ally(ALLY_FAMILY), REVIEW_OK, ownRow("NEUTRAL")])] })),
+      { now: NOW },
+    );
+    assert.equal(result.verdict, "resolved");
   });
 });
