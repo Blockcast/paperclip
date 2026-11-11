@@ -194,10 +194,13 @@ platform cannot resolve automatically. Each runbook should be:
   its `status` is a sample rather than a fact (64 plugin-authored transitions on
   one row in 14 days) and each cancel silently destroys the assignee's armed
   monitor (13 of 13 clears paired with a plugin cancel, lag 3-26 s, none ever
-  fired). Its `description` is machine-owned the same way — replaced wholesale
+  fired). Its `description` is machine-owned the same way — re-rendered
   on every delivery of a still-firing alert, measured 40-65 min apart, so a
   constraint recorded at depth 0 there is destroyed with no error and no
-  in-run check that can see it (PEN-6404). Covers how to read the row safely,
+  in-run check that can see it (PEN-6404). Since PEN-6218 that is true only
+  ABOVE the plugin's notes marker: everything below it is carried forward
+  verbatim, so the body has a preserved region and *"never write here"* is no
+  longer the right reading. Covers how to read the row safely,
   where to record a constraint instead, and how to tell a destroyed monitor
   from one that was never armed. Trigger: two agents reporting contradictory
   `status` for the same alert row, text written into an alert row's

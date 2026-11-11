@@ -285,12 +285,27 @@ function renderLabelsTable(labels: Record<string, string>): string {
  * see Rule 2 of the runbook. A monitor that has to outlive the alert belongs
  * on a row of your own.
  */
+/**
+ * Scoped to THIS SECTION, not to the whole body, and that is a correction.
+ *
+ * The first draft said "This description ... is REPLACED" and "anything written
+ * here is destroyed". Since PEN-6218 (`description-notes.ts`) every write goes
+ * through `composeDescription`, which carries forward verbatim everything below
+ * {@link AGENT_NOTES_MARKER} and renders a banner above it saying so. A notice
+ * claiming the whole body is destroyed would therefore open a body that ends by
+ * promising the opposite -- the same row contradicting itself, twice over.
+ *
+ * So this string keeps only what the banner does NOT say: that the loss is
+ * undetectable from inside the writing run, and that the row's own monitor is
+ * not an escape. The carrier question is the banner's, and this defers to it.
+ */
 export const MACHINE_RENDERED_NOTICE =
-  "> **This description is machine-generated and is REPLACED on every alert delivery.**" +
-  " Anything written here is destroyed with no error and no signal, and a same-run re-read" +
-  " cannot detect it. Put durable notes in a COMMENT on this row, or in the artifact's own" +
-  " text (a PR body). Not in this row's monitor: the same plugin cancels this row when the" +
-  " alert resolves, which clears the monitor too. See" +
+  "> **This section is machine-generated and is REPLACED on every alert delivery.**" +
+  " A write here succeeds and a same-run re-read confirms it, so nothing inside the" +
+  " writing run can detect the loss. Durable notes belong BELOW the notes marker at the" +
+  " foot of this body, or in a COMMENT on this row, or in the artifact's own text (a PR" +
+  " body). Not in this row's monitor: the same plugin cancels this row when the alert" +
+  " resolves, which clears the monitor too. See" +
   " `runbooks/alertmanager-alert-row-status-volatility.md`.";
 
 /**
