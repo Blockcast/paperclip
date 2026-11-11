@@ -41,13 +41,20 @@ export const agentWakeupRequests = pgTable(
     // (`MAX(requested_at) ... WHERE source = 'timer' GROUP BY agent_id`), which
     // runs on every scheduler pass. `agentRequestedIdx` above cannot: it has no
     // `source` column, so Postgres must read each agent's entire history and
-    // filter — and this is the largest table in the schema, pruned only to a
-    // 14-day window, so that scan grows with the whole retained window.
+    // filter — and this is the largest table in the schema, pruned to a
+    // 30-day window, so that scan grows with the whole retained window.
     // ⚠️ The pruning is OUT OF THIS REPO and cannot be found by grepping it:
     // onprem-k8s `paperclip/postgres-retention.yaml`, CronJob
-    // `paperclip-pg-retention` (ns `paperclip`, 04:30Z daily, runtime_days=14).
-    // It nulls `heartbeat_runs.wakeup_request_id` past the same cutoff FIRST,
-    // which releases the FK exemption on the DELETE below it.
+    // `paperclip-pg-retention` (ns `paperclip`, schedule `5 8 * * *` = 08:05Z
+    // daily). PEN-6173: this table alone is pruned on that file's `wake_days`
+    // (30) and DELIBERATELY NOT `runtime_days` (14); its header says at length
+    // why the two must not be collapsed back together.
+    // ⚠️ Those are two DIFFERENT cutoffs, not one. The heartbeat_runs payload
+    // trim nulls `heartbeat_runs.wakeup_request_id` past `runtime_before`
+    // (14 d), and runs BEFORE the delete on this table past `wake_before`
+    // (30 d) — a strictly more aggressive cutoff reached ~16 days earlier, so
+    // the FK exemption is long released by the time a row here is deletable.
+    // That ordering is what keeps the FK's ON DELETE NO ACTION satisfied.
     // Partial on `source = 'timer'` keeps it O(1) per agent regardless of size.
     timerBaselineIdx: index("agent_wakeup_requests_timer_baseline_idx")
       .on(table.agentId, table.requestedAt.desc())
