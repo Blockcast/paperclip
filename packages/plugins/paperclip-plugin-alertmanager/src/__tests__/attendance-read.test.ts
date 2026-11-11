@@ -202,7 +202,22 @@ describe("PEN-2918 (D) — acceptance, against real Postgres", () => {
     expect(body.totalIssues).toBe(2);
     // The caveat travels with the number it qualifies.
     expect(body.caveats).toEqual([...SUMMARY_CAVEATS]);
-    expect(body.caveats.join(" ")).toContain("parkedUntil");
+    // PEN-6486: this used to assert only `toContain("parkedUntil")`, back when
+    // the caveat said the ladder could not see a park. The ladder now can, so
+    // the thing worth pinning is the pair of facts a reader of these counts
+    // needs: that the park is a real attendance term, and that it is BOUNDED,
+    // which is why a parked row can still read `unattended_*`.
+    const caveats = body.caveats.join(" ");
+    expect(caveats).toContain("live deliberate park");
+    expect(caveats).toContain("BOUNDED");
+    // And the window warning, which is what makes a count spanning 2026-11-11
+    // readable at all: rows are never rewritten, so a window reaching back
+    // past the change still holds determinations the two-term test made.
+    expect(caveats).toContain("2026-11-11");
+    // Negative control, and the failure mode it guards is a well-meant
+    // re-widening: nothing may restate the retired claim as a live one.
+    expect(caveats).not.toContain("parkedUntil appears nowhere");
+    expect(caveats).not.toContain("parkedUntil is not consulted");
   });
 
   it("(a) excludes the other tenant even when it is the louder one", async () => {
@@ -289,16 +304,55 @@ describe("PEN-2918 (D) — acceptance, against real Postgres", () => {
     });
   });
 
-  it("applies migration 008, which corrects the frozen claim in 007 at the table itself", async () => {
-    // `007`'s header says no route or SDK read exists. Applied migrations are
-    // sha256-checksummed by the host, so that file cannot be edited — COMMENT
-    // ON is the only channel that reaches a reader of the table.
+  it("corrects the frozen claims in 007 and 008 at the table itself", async () => {
+    // `007`'s header says no route or SDK read exists; `008`'s COMMENT says
+    // parkedUntil is not consulted. Applied migrations are sha256-checksummed
+    // by the host, so neither file can be edited — COMMENT ON is the only
+    // channel that reaches a reader of the table, and it is the only one with
+    // a successor, which is why `012` could correct `008` the same way `008`
+    // corrected `007`.
     const { rows } = await db.query<{ comment: string | null }>(
       `SELECT obj_description($1::regclass, 'pg_class') AS comment`, [TABLE]);
     const comment = rows[0]!.comment ?? "";
     expect(comment).toContain("SUPERSEDES the header of migration 007");
     expect(comment).toContain("per determination over an already-open alert row");
-    expect(comment).toContain("parkedUntil is not consulted");
+    // PEN-6486 — the live attendance test, and the bound that makes
+    // `unattended_*` readable on a parked row.
+    expect(comment).toContain("an armed monitor, a live blockedBy edge, or a live deliberate park");
+    expect(comment).toContain("BOUNDED");
+    expect(comment).toContain("the CAVEAT in migration 008");
+
+    // ⚠️ The retired phrase is still IN this comment, inside the clause that
+    // retires it — this package re-quotes a superseded claim so that a grep for
+    // it lands on its correction rather than on nothing. That is exactly why
+    // `toContain("parkedUntil is not consulted")` is NOT a usable assertion
+    // here: it was the old test, it passes against the new comment, and it
+    // passes because the text now says the OPPOSITE of what it checked for. A
+    // substring test cannot see a negation. Pin the ORDER instead, which is
+    // the thing that actually distinguishes the two readings.
+    const supersedes = comment.indexOf("SUPERSEDES the header of migration 007");
+    const retired = comment.indexOf("parkedUntil is not consulted");
+    expect(retired).toBeGreaterThan(supersedes);
+  });
+
+  it("names every disposition the ladder can write, including the newest", async () => {
+    // `007` left `disposition` unconstrained on purpose, so that a later ladder
+    // branch could record a determination it did not anticipate. PEN-6486 is
+    // the first use of that allowance, and the column comment is where a reader
+    // of the table finds out the vocabulary grew.
+    const { rows } = await db.query<{ comment: string | null }>(
+      `SELECT col_description($1::regclass, (
+         SELECT attnum FROM pg_attribute
+         WHERE attrelid = $1::regclass AND attname = 'disposition'
+       )) AS comment`, [TABLE]);
+    const comment = rows[0]!.comment ?? "";
+    for (const token of [
+      "attended_monitor", "attended_blocker", "attended_park",
+      "unattended_rung", "unattended_cover", "held_alert_clear",
+    ]) expect(comment).toContain(token);
+    // The ordering property is the one that makes `attended_park` a measure
+    // rather than a reshuffle, so it is recorded where the counts are read.
+    expect(comment).toContain("evaluated LAST");
   });
 });
 

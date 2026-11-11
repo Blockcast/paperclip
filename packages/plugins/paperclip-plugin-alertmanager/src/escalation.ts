@@ -131,10 +131,99 @@ export async function hasLiveBlocker(ctx: PluginContext, issueId: string, compan
  * firing alert forever.
  */
 export function hasArmedMonitor(issue: { monitorNextCheckAt?: Date | string | null }, now: Date): boolean {
-  const raw = issue.monitorNextCheckAt;
-  if (raw === null || raw === undefined) return false;
+  const at = stampMs(issue.monitorNextCheckAt);
+  return at !== null && at > now.getTime();
+}
+
+/**
+ * Both wire shapes of a host timestamp column, or `null` for every value that
+ * is not one.
+ *
+ * Extracted so the attendance guards cannot drift apart in how they read a
+ * stamp. `hasArmedMonitor` shipped its own copy of this parse, and
+ * `hasLivePark` needs the same one on two more columns; two hand-written
+ * copies of "accepts `Date` and `string`" is how one of them quietly becomes
+ * `Date`-only and goes inert in production, which is the failure
+ * `hasArmedMonitor`'s own header is about.
+ */
+function stampMs(raw: Date | string | null | undefined): number | null {
+  if (raw === null || raw === undefined) return null;
   const at = raw instanceof Date ? raw.getTime() : Date.parse(String(raw));
-  return Number.isFinite(at) && at > now.getTime();
+  return Number.isFinite(at) ? at : null;
+}
+
+/**
+ * Rung intervals a deliberate park may hold the ladder for, counted from the
+ * instant THIS park was placed.
+ *
+ * Expressed in rungs rather than hours so the bound tracks severity: at the
+ * defaults that is 3h for a `critical` or `page` (30 min rungs) and 24h for a
+ * `warning` (240 min). An absolute hour count would be either far too generous
+ * for a critical or far too mean for a warning, and the ladder already has a
+ * per-severity clock to borrow.
+ */
+const MAX_PARK_DEFERRAL_RUNGS = 6;
+
+/**
+ * True when `issue` carries a deliberate park that is still live AND still
+ * inside the deferral bound above (PEN-6486).
+ *
+ * ## Why this is a third attendance term and not a reporting caveat
+ *
+ * A park is a dated commitment by the row's owner, written in the one field
+ * this ladder could not read, and its expiry raises a wake exactly as an armed
+ * monitor's does. The blindness was already documented — twice, prominently,
+ * in `attendance-read.ts` — but only ever as a caveat on how the attendance
+ * table REPORTS. Nobody asked what the LADDER does with the same predicate,
+ * and the answer is that it climbs rungs and mints a founder-assigned
+ * `[user-cover]` over a row somebody is deliberately attending.
+ *
+ * Measured on PEN-6294, a `[warning]` parked 2026-11-10T16:18:51Z to
+ * 2026-11-16T10:00Z whose park reason records `run 25075c04, esc 2/3, Cto` —
+ * i.e. an agent answered rung 2 and re-confirmed the park. Cover PEN-6464 was
+ * minted 2026-11-11T00:12:18Z, 7h53m inside that park, and sat `todo` with
+ * zero comments. 3 of the 13 open alertmanager-origin rows were attended
+ * SOLELY by a park on the day this shipped, and 2 of the 2 open covers stood
+ * over exactly those rows.
+ *
+ * ## The bound, and the trade it makes
+ *
+ * `hasArmedMonitor` and `hasLiveBlocker` defer without a bound. This one does
+ * not, because a park can be long — PEN-6294's runs 5 days, PEN-6401's to
+ * 11-17 — and an unbounded park term would let one park-and-go-quiet hold a
+ * firing alert unreachable for the whole of it, which is the defect the ladder
+ * exists to close. So the park holds the rung for at most
+ * `MAX_PARK_DEFERRAL_RUNGS` intervals from `parkedAt`, and after that the
+ * ladder proceeds over a live park.
+ *
+ * `parkedAt` is the right clock and the choice is load-bearing: the host
+ * RESTAMPS it on every `parkedDisposition` write (`services/issues.ts`), so a
+ * re-park reopens the window. That is deliberate here — a re-park is a run
+ * that woke, read the row and re-committed, which is the strongest attendance
+ * evidence on offer — and it is the residual to name rather than hide: an
+ * owner who re-parks indefinitely defers this ladder indefinitely. Two other
+ * services (`issue-park-expiry.ts`, `productivity-review.ts`) scope their own
+ * measures to the current park through the same field and both carry an
+ * explicit "do not carry the earliest `parkedAt` forward" warning; for THEM
+ * the restamp is a loophole, for this guard it is the feature, and the
+ * difference is only which direction the measure is read in.
+ *
+ * Fails toward `false`, matching both siblings: a park with no `parkedAt` to
+ * date it, an unparseable stamp, or a nonsense rung interval is NOT
+ * attendance. That direction keeps a firing alert reachable, and it is why
+ * this guard can never be the reason an alert goes unescalated.
+ */
+export function hasLivePark(
+  issue: { parkedUntil?: Date | string | null; parkedAt?: Date | string | null },
+  now: Date,
+  rungMs: number,
+): boolean {
+  const until = stampMs(issue.parkedUntil);
+  if (until === null || until <= now.getTime()) return false;
+  const since = stampMs(issue.parkedAt);
+  if (since === null) return false;
+  if (!Number.isFinite(rungMs) || rungMs <= 0) return false;
+  return now.getTime() - since <= MAX_PARK_DEFERRAL_RUNGS * rungMs;
 }
 
 function holdUntil(comments: Array<{ body: string }>): number | null {
@@ -1224,7 +1313,7 @@ async function advanceIssueLadder(
     return;
   }
 
-  // The row is ATTENDED, by either of the two mechanisms this platform uses.
+  // The row is ATTENDED, by one of the three mechanisms this platform uses.
   // Defer the rung by one interval; whichever mechanism clears puts the ladder
   // back on its normal schedule at the next sweep.
   //
@@ -1239,11 +1328,14 @@ async function advanceIssueLadder(
   // that was never abandoned. Deliberately checked FIRST: it reads a field the
   // sweep already has, so an attended row costs no `relations.get` round trip.
   //
-  // Both are deferrals rather than permanent skips, which is what keeps a
-  // genuinely abandoned row reachable: neither mechanism is a promise that the
-  // work happens, only that a wake exists, so the ladder has to re-ask.
+  // All three are deferrals rather than permanent skips, which is what keeps a
+  // genuinely abandoned row reachable: no mechanism here is a promise that the
+  // work happens, only that a wake exists, so the ladder has to re-ask. The
+  // park term carries a second bound on top of that, for the reason its own
+  // header gives: a park can run for days, and days of deferral would be a
+  // skip in all but name.
   //
-  // The two are evaluated into named locals rather than inlined into the `||`
+  // The three are evaluated into named locals rather than inlined into the `||`
   // so the deferral can say WHICH mechanism held the rung. The short-circuit is
   // preserved deliberately: `hasLiveBlocker` is an RPC and is still not called
   // when the monitor is armed.
@@ -1255,17 +1347,34 @@ async function advanceIssueLadder(
   // so "the guard is working" could not be told apart from "the guard never
   // ran" on live traffic — the gap that left this fix unverifiable in
   // production after it shipped.
+  //
+  // PEN-6486 — a live deliberate park, checked THIRD and deliberately LAST.
+  //
+  // Cost argues for second: like the monitor it reads a field the sweep already
+  // has, so putting it ahead of `hasLiveBlocker` would save that RPC on a
+  // park-only row. MEASURABILITY wins, and the trade is one-sided: park-last
+  // adds no RPC that today's code does not already make, because the blocker
+  // read already runs on every non-monitor row. What it buys is that
+  // `attended_park` appears if and only if the ladder would OTHERWISE HAVE
+  // ADVANCED A RUNG. No determination that reads `attended_monitor` or
+  // `attended_blocker` today changes, so this fix's own effect is readable as a
+  // before/after on the attendance table instead of being mixed into an
+  // existing bucket — which is the one thing PEN-2918 keeps finding it cannot
+  // do about its own remedies.
   const monitorArmed = hasArmedMonitor(issue, now);
   const blockerLive = monitorArmed ? false : await hasLiveBlocker(ctx, issue.id, companyId);
-  if (monitorArmed || blockerLive) {
-    const deferredTo = new Date(now.getTime() + rungIntervalMs(state, config)).toISOString();
+  const rungMs = rungIntervalMs(state, config);
+  const parkHeld = monitorArmed || blockerLive ? false : hasLivePark(issue, now, rungMs);
+  if (monitorArmed || blockerLive || parkHeld) {
+    const deferredTo = new Date(now.getTime() + rungMs).toISOString();
     const deferred = await casAlertState(ctx, ref, state, { ...state, nextEscalationAt: deferredTo });
     if (!deferred) {
       ctx.logger.info(`alert-escalation: abandoned deferral for ${issue.identifier ?? issue.id}; alert state changed under the sweep`);
       return;
     }
+    const attendedBy = monitorArmed ? "armed monitor" : blockerLive ? "unresolved blocker" : "live park";
     ctx.logger.info(
-      `alert-escalation: deferred rung for ${issue.identifier ?? issue.id}; attended by ${monitorArmed ? "armed monitor" : "unresolved blocker"}; next attempt ${deferredTo}`,
+      `alert-escalation: deferred rung for ${issue.identifier ?? issue.id}; attended by ${attendedBy}; next attempt ${deferredTo}`,
     );
     // PEN-2918: this is the acknowledgement signal, and until now it existed
     // only as the log line above. It is recorded from an OBSERVATION OF
@@ -1275,14 +1384,14 @@ async function advanceIssueLadder(
     // action, so an `acknowledged` derived from delivery would be the same
     // defect with a schema on it.
     //
-    // `alertLiveness: "not_read"` is accurate rather than lazy: both branches
-    // above short-circuit ahead of `readLiveness`, so the determination
-    // genuinely was made without consulting Alertmanager.
+    // `alertLiveness: "not_read"` is accurate rather than lazy: all three
+    // branches above short-circuit ahead of `readLiveness`, so the
+    // determination genuinely was made without consulting Alertmanager.
     await recordAttendanceObservation(ctx, {
       companyId,
       alertIssueId: issue.id,
       alertname: state.alertname,
-      disposition: monitorArmed ? "attended_monitor" : "attended_blocker",
+      disposition: monitorArmed ? "attended_monitor" : blockerLive ? "attended_blocker" : "attended_park",
       alertLiveness: "not_read",
       wakeOutcome: "not_attempted",
       escalationAttempt: state.escalationAttempt ?? 0,

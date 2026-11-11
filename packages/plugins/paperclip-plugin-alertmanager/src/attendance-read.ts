@@ -57,20 +57,40 @@ import {
  * 3. **It does not record `executed`.** It reports what the ladder observed
  *    about *attendance*. Whether the work was done has a different source.
  *
- * ## ⚠️ The first answer will look like mass neglect. It is not.
+ * ## ⚠️ `unattended_*` still does not mean nobody is attending — but the
+ * reason changed on 2026-11-11, and a window spanning that date mixes two
+ * regimes.
  *
- * The ladder's attendance test is `hasArmedMonitor(issue, now) ||
- * hasLiveBlocker(...)` and nothing else — **`parkedUntil` appears nowhere in
- * it**. A deliberately parked row, with an unpark condition written on it by
- * its owner, is attended by this estate's primary attendance instrument and is
- * nevertheless classified `unattended_*` here. Measured 2026-11-07: of the six
- * open alertmanager-origin rows, five were attended solely by a park.
+ * ⛔ **This section used to read: "The ladder's attendance test is
+ * `hasArmedMonitor(issue, now) || hasLiveBlocker(...)` and nothing else —
+ * `parkedUntil` appears nowhere in it … Measured 2026-11-07: of the six open
+ * alertmanager-origin rows, five were attended solely by a park." That is no
+ * longer true of the ladder, and leaving it would be worse than having never
+ * written it.** PEN-6486 made the park a third attendance term, because the
+ * blindness was never only a reporting quirk: the ladder consumed the same
+ * predicate on its WRITE path, so it climbed rungs and minted a
+ * founder-assigned `[user-cover]` over rows that were deliberately parked and
+ * being worked. Two accurate, prominent caveats here described how the table
+ * REPORTED and neither asked what the ladder DID — and their accuracy is what
+ * made the second question look answered.
  *
- * So a high `unattended_*` count is **first** evidence that the instrument is
- * miscalibrated against how this company works, and only after that evidence
- * about the estate. That caveat ships *inside the response body* rather than
- * only in this comment, because a qualification a reader has to go and find is
- * the exact failure PEN-2918 measures. See `SUMMARY_CAVEATS`.
+ * What is true now: the test is `hasArmedMonitor || hasLiveBlocker ||
+ * hasLivePark`, and the park term is **bounded**. A park holds the rung for at
+ * most `MAX_PARK_DEFERRAL_RUNGS` intervals from `parkedAt`; past that the
+ * ladder proceeds over a live park and the determination is recorded
+ * `unattended_*` again. So a parked row can still appear here as unattended —
+ * now meaning "parked for longer than the ladder will wait", which is a
+ * finding about the park rather than a miscalibration of the instrument.
+ *
+ * ⚠️ **Rows are append-only and are never rewritten, so dispositions written
+ * before 2026-11-11 were computed by the two-term ladder.** A window crossing
+ * that date is a mixture: some `unattended_*` rows in it are parked rows the
+ * old predicate could not see. `attended_park` cannot appear before it, so its
+ * first occurrence dates the boundary from the table itself.
+ *
+ * The caveat ships *inside the response body* rather than only in this comment,
+ * because a qualification a reader has to go and find is the exact failure
+ * PEN-2918 measures. See `SUMMARY_CAVEATS`.
  */
 
 /** Route keys; must match `apiRoutes` in `manifest.ts`. */
@@ -96,7 +116,7 @@ export const MAX_UNDELIVERED_LIMIT = 500;
  * message — so they add no channel and leak nothing.
  */
 export const SUMMARY_CAVEATS: readonly string[] = [
-  "unattended_* does not mean nobody is attending: the ladder's attendance test is an armed monitor or a live blockedBy edge only, and parkedUntil appears nowhere in it. A deliberately parked row reads unattended here.",
+  "unattended_* does not mean nobody is attending. Since 2026-11-11 (PEN-6486) the ladder's attendance test is an armed monitor, a live blockedBy edge, or a live deliberate park, and the park term is BOUNDED: a park holds a rung for a fixed number of intervals from parkedAt, after which the ladder proceeds and the row reads unattended again. Rows are never rewritten, so any window reaching before 2026-11-11 also contains unattended_* rows written by the earlier two-term test, which could not see a park at all; the first attended_park row in this table dates that boundary.",
   "enqueued means the host accepted the wake. It is not evidence that a run started, and it is never acknowledgement. Acknowledgement is recorded only from the attended_* dispositions.",
   "This table records attendance, never whether the work was executed. That is a different question with a different source.",
 ];

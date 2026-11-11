@@ -7,6 +7,7 @@ import {
   COVER_ORIGIN,
   escalationDeadlineMs,
   hasArmedMonitor,
+  hasLivePark,
   reopenOpenCoverMembership,
   recordSourceResolvedAndCloseCovers,
   resolveAlertmanagerApiUrl,
@@ -259,11 +260,17 @@ function sweepContext(
   // `Date | string` because the worker boundary is JSON-RPC, so production
   // sees the string form; tests exercise both.
   monitorNextCheckAt: Date | string | null = null,
+  // PEN-6486: the deliberate-park pair, projected onto the same list row. Both
+  // columns, because the guard needs BOTH — `parkedUntil` says the park is
+  // live, `parkedAt` dates it so the deferral can be bounded.
+  park: { parkedUntil?: Date | string | null; parkedAt?: Date | string | null } = {},
 ) {
   const issue = {
     id: "issue-1", identifier: "BLO-1", title: "Alert", status: "todo", priority: "critical",
     originId: "fp-1", assigneeAgentId: "engineer", projectId: null, goalId: null,
     monitorNextCheckAt,
+    parkedUntil: park.parkedUntil ?? null,
+    parkedAt: park.parkedAt ?? null,
   };
   const mocks = {
     state: { get: vi.fn(async () => state), set: vi.fn(async () => undefined) },
@@ -624,6 +631,152 @@ describe("alert escalation", () => {
       expect(hasArmedMonitor({ monitorNextCheckAt: null }, now)).toBe(false);
       expect(hasArmedMonitor({}, now)).toBe(false);
       expect(hasArmedMonitor({ monitorNextCheckAt: "garbage" }, now)).toBe(false);
+    });
+  });
+
+  // PEN-6486: a live deliberate park is the THIRD attendance mechanism, and the
+  // one the ladder could not see. The blindness was documented at three sites
+  // and every one described it as a caveat on how the attendance table REPORTS;
+  // none asked what the ladder DID with the same predicate. It escalated, and
+  // at the top of the chain minted a founder-assigned [user-cover] over a row
+  // that was deliberately parked and being worked. Measured on PEN-6294/PEN-6464
+  // 2026-11-10/11: parked to 11-16 with rung 2 answered and recorded in its own
+  // park reason; cover minted 7h53m inside the park, `todo`, zero comments.
+  describe("live deliberate park (PEN-6486)", () => {
+    const due = {
+      paperclipIssueId: "issue-1", paperclipCompanyId: "company-1", assigneeUserId: null,
+      assigneeAgentId: "engineer", alertname: "SyntheticAlert", severity: "critical",
+      firstSeenAt: "x", lastFiredAt: "x", resolvedAt: null,
+      nextEscalationAt: "2026-07-11T00:00:00Z", escalationAttempt: 1, escalationIntervalMs: 30 * 60_000,
+    };
+    const NOW = new Date("2026-07-11T01:00:00Z");
+    // 30-minute rungs x MAX_PARK_DEFERRAL_RUNGS (6) = a 3h bound from `parkedAt`.
+    const PARKED_AT = "2026-07-11T00:00:00.000Z";       // 1h ago: inside the bound
+    const PARKED_UNTIL = "2026-07-16T10:00:00.000Z";    // days out, as the real one was
+
+    // Both wire shapes, for the reason the monitor guard gives: the host
+    // projects `Date` columns and the worker boundary is JSON-RPC over stdio,
+    // so a guard written against `Date` alone passes in-process and is inert in
+    // the deployment it was written for.
+    it.each([
+      ["Date", new Date(PARKED_UNTIL), new Date(PARKED_AT)],
+      ["ISO string", PARKED_UNTIL, PARKED_AT],
+    ])("defers the rung instead of waking or reassigning a parked row (%s)", async (_shape, until, at) => {
+      const { ctx, mocks } = sweepContext(due, "cto", buildFakeAlertmanagerStore(), null, { parkedUntil: until, parkedAt: at });
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.issues.requestWakeup).not.toHaveBeenCalled();
+      expect(mocks.issues.update).not.toHaveBeenCalled();
+      expect(mocks.issues.createComment).not.toHaveBeenCalled();
+      expect(mocks.state.set).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ escalationAttempt: 1, nextEscalationAt: "2026-07-11T01:30:00.000Z" }),
+        expect.anything(),
+      );
+    });
+
+    // The literal defect, and the shape PEN-6294 was in: top of chain, so the
+    // next rung IS the cover.
+    it("mints no founder-assigned [user-cover] over a parked row", async () => {
+      const store = buildFakeAlertmanagerStore();
+      const { ctx, mocks } = sweepContext(due, null, store, null, { parkedUntil: PARKED_UNTIL, parkedAt: PARKED_AT });
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.issues.create).not.toHaveBeenCalled();
+      expect(store.covers.size).toBe(0);
+      // Deferred, never terminated: an `escalationComplete` skip is
+      // short-circuited by the guard at the top of every later sweep, so a row
+      // that later goes genuinely unattended could never be covered at all.
+      const writes = mocks.state.set.mock.calls as unknown as Array<[unknown, { escalationComplete?: boolean }, unknown]>;
+      expect(writes.at(-1)?.[1].escalationComplete).not.toBe(true);
+    });
+
+    // Negative controls. Without these the guard above is satisfied by a ladder
+    // that never advances for any reason, which is not what was built. The
+    // fourth is the BOUND — the one case where a live park deliberately does
+    // NOT hold the rung.
+    it.each([
+      ["a lapsed park", "2026-07-11T00:30:00.000Z", PARKED_AT],
+      ["no park at all", null, null],
+      ["an unparseable parkedUntil", "not-a-date", PARKED_AT],
+      ["a live park with no parkedAt to date it", PARKED_UNTIL, null],
+      ["a live park older than the deferral bound", PARKED_UNTIL, "2026-07-10T20:00:00.000Z"],
+    ])("still advances the ladder with %s", async (_label, until, at) => {
+      const { ctx, mocks } = sweepContext(due, "cto", buildFakeAlertmanagerStore(), null, { parkedUntil: until, parkedAt: at });
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.issues.update).toHaveBeenCalledWith("issue-1", { assigneeAgentId: "cto", assigneeUserId: null }, "company-1");
+      expect(mocks.issues.requestWakeup).toHaveBeenCalledTimes(1);
+    });
+
+    it("logs the deferral and names the live park", async () => {
+      const { ctx, mocks } = sweepContext(due, "cto", buildFakeAlertmanagerStore(), null, { parkedUntil: PARKED_UNTIL, parkedAt: PARKED_AT });
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("deferred rung for BLO-1"));
+      expect(mocks.logger.info).toHaveBeenCalledWith(expect.stringContaining("live park"));
+      expect(mocks.logger.info).not.toHaveBeenCalledWith(expect.stringContaining("armed monitor"));
+      expect(mocks.logger.info).not.toHaveBeenCalledWith(expect.stringContaining("unresolved blocker"));
+    });
+
+    // ORDERING, and this is the property that makes the fix measurable rather
+    // than a reshuffle between buckets: the park term is evaluated LAST, so a
+    // row that is both parked and blocked still records `attended_blocker`.
+    // Nothing that reads `attended_monitor` or `attended_blocker` today becomes
+    // `attended_park`, so the count of `attended_park` is a direct before/after
+    // measure of exactly the rungs this change held.
+    it("does not absorb a determination an older mechanism already made", async () => {
+      const store = buildFakeAlertmanagerStore();
+      const { ctx, mocks } = sweepContext(due, "cto", store, null, { parkedUntil: PARKED_UNTIL, parkedAt: PARKED_AT });
+      mocks.issues.relations.get = vi.fn(async () => ({ blockedBy: [{ id: "blocker-1", status: "in_progress" }], blocks: [] }));
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(store.attendance[0]).toMatchObject({ disposition: "attended_blocker" });
+
+      const monitorStore = buildFakeAlertmanagerStore();
+      const monitored = sweepContext(due, "cto", monitorStore, "2026-07-11T09:00:00.000Z", { parkedUntil: PARKED_UNTIL, parkedAt: PARKED_AT });
+      await runAlertEscalationSweep(monitored.ctx, config(), NOW);
+      expect(monitorStore.attendance[0]).toMatchObject({ disposition: "attended_monitor" });
+    });
+
+    it("records the park deferral under its own disposition", async () => {
+      const store = buildFakeAlertmanagerStore();
+      const { ctx } = sweepContext(due, "cto", store, null, { parkedUntil: PARKED_UNTIL, parkedAt: PARKED_AT });
+      await runAlertEscalationSweep(ctx, config(), NOW);
+      expect(store.attendance).toHaveLength(1);
+      expect(store.attendance[0]).toMatchObject({
+        disposition: "attended_park",
+        wake_outcome: "not_attempted",
+        alert_liveness: "not_read",
+      });
+    });
+
+    it("reads both stamps directly, for both wire shapes", () => {
+      const now = new Date("2026-07-11T01:00:00Z");
+      const rung = 30 * 60_000;
+      const at = "2026-07-11T00:00:00.000Z";
+      expect(hasLivePark({ parkedUntil: "2026-07-11T02:00:00.000Z", parkedAt: at }, now, rung)).toBe(true);
+      expect(hasLivePark({ parkedUntil: new Date("2026-07-11T02:00:00Z"), parkedAt: new Date(at) }, now, rung)).toBe(true);
+      // lapsed park
+      expect(hasLivePark({ parkedUntil: "2026-07-11T00:30:00.000Z", parkedAt: at }, now, rung)).toBe(false);
+      // absent / unparseable, both columns
+      expect(hasLivePark({ parkedUntil: null, parkedAt: at }, now, rung)).toBe(false);
+      expect(hasLivePark({}, now, rung)).toBe(false);
+      expect(hasLivePark({ parkedUntil: "garbage", parkedAt: at }, now, rung)).toBe(false);
+      expect(hasLivePark({ parkedUntil: "2026-07-11T02:00:00.000Z", parkedAt: null }, now, rung)).toBe(false);
+      expect(hasLivePark({ parkedUntil: "2026-07-11T02:00:00.000Z", parkedAt: "garbage" }, now, rung)).toBe(false);
+      // the bound: 6 rungs x 30min = 3h from `parkedAt`
+      expect(hasLivePark({ parkedUntil: "2026-07-16T00:00:00.000Z", parkedAt: "2026-07-10T22:00:01.000Z" }, now, rung)).toBe(true);
+      expect(hasLivePark({ parkedUntil: "2026-07-16T00:00:00.000Z", parkedAt: "2026-07-10T21:59:59.000Z" }, now, rung)).toBe(false);
+      // a nonsense rung interval fails toward NOT attendance
+      expect(hasLivePark({ parkedUntil: "2026-07-11T02:00:00.000Z", parkedAt: at }, now, 0)).toBe(false);
+      expect(hasLivePark({ parkedUntil: "2026-07-11T02:00:00.000Z", parkedAt: at }, now, Number.NaN)).toBe(false);
+    });
+
+    // The bound tracks SEVERITY, which is the whole reason it is counted in
+    // rungs rather than hours: a 4h-rung warning gets 24h of park, a 30min-rung
+    // critical gets 3h. An absolute hour count would be far too generous for
+    // one and far too mean for the other.
+    it("scales the bound with the rung interval", () => {
+      const now = new Date("2026-07-11T12:00:00Z");
+      const parked = { parkedUntil: "2026-07-20T00:00:00.000Z", parkedAt: "2026-07-11T00:00:00.000Z" }; // 12h old
+      expect(hasLivePark(parked, now, 240 * 60_000)).toBe(true);  // warning: 24h bound
+      expect(hasLivePark(parked, now, 30 * 60_000)).toBe(false);  // critical: 3h bound
     });
   });
 
