@@ -2050,8 +2050,11 @@ registry.registerPath({
     "`externalIdMatch` reports how the key was compared: `case_insensitive` for a GitHub pull " +
     "request, whose `owner/repo` GitHub itself treats case-insensitively, and `exact` for every " +
     "other artifact kind, because a branch key names a git ref and refs ARE case-sensitive. The " +
-    "pull-request number is matched exactly either way. Read it when `owners` is empty: it is " +
-    "what distinguishes a server that folds the casing from one that does not (PEN-6056).",
+    "pull-request number is matched exactly either way. `provider` is itself compared exactly, " +
+    "so a `provider` in any other casing than `github` reports `exact` and matches nothing -- the " +
+    "reported mode always describes the comparison that was performed. Read it when `owners` is " +
+    "empty: it is what distinguishes a server that folds the casing from one that does not " +
+    "(PEN-6056).",
 
   request: {
     params: z.object({ companyId: z.string() }),

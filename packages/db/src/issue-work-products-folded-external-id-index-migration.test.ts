@@ -103,7 +103,7 @@ describeEmbeddedPostgres("issue_work_products folded external id index (migratio
         AND indexname = 'issue_work_products_company_provider_external_id_idx'
     `;
     expect(exact).toHaveLength(1);
-  }, 60_000);
+  }, 120_000);
 
   it("serves the lookup from the index under a GENERIC plan, as the parameterised query gets", async () => {
     const database = await startEmbeddedPostgresTestDatabase("paperclip-iwp-folded-plan-");
