@@ -150,11 +150,13 @@ export function parseCodeownersRules(text) {
  *
  * The semantics, from GitHub's "About code owners": a CODEOWNERS pattern follows
  * most gitignore rules; a leading `/` anchors to the repository root; a pattern
- * containing no slash matches that name at ANY depth, root included; a leading
- * globstar segment likewise reaches the root; a trailing `/` names a directory;
- * matching is case-sensitive. Negation with `!` and character ranges with `[ ]`
- * are documented as NOT working, so a pattern using either has undefined effect
- * rather than no effect — a reason to refuse to interpret it, not to ignore it.
+ * containing no slash matches that name at ANY depth, root included; any run of
+ * leading globstar segments likewise reaches the root; a trailing `/` names a
+ * directory; matching is case-sensitive. Negation with `!` and character ranges
+ * with `[ ]` are documented as NOT working, and `\` escaping is documented only
+ * for the `#` case (where it also does not work) and left unstated otherwise, so
+ * a pattern using any of them has UNDEFINED effect rather than no effect — a
+ * reason to refuse to interpret it, not to ignore it.
  *
  * @param {string} pattern a CODEOWNERS pattern
  * @param {string} path a root-relative file name, e.g. `.gitleaks.toml`
@@ -173,8 +175,12 @@ export function classifyRootPathMatch(pattern, path) {
 
   let rest = raw.startsWith("/") ? raw.slice(1) : raw;
   // A leading globstar segment is the one slash-bearing shape that still reaches
-  // a root-level file: `**` + `/name` matches `name` at any depth.
-  if (rest.startsWith("**/")) rest = rest.slice(3);
+  // a root-level file: `**` + `/name` matches `name` at any depth. REPEATED, not
+  // once: a doubled prefix is still a prefix, and stripping only the first left
+  // the slash test below answering `cannot-match` — the same fail-open this
+  // function exists to close, respelled. Not `replaceAll`: only a run of them at
+  // the START is a no-op, and an INTERIOR one demands a directory component.
+  while (rest.startsWith("**/")) rest = rest.slice(3);
   // Any surviving `/` demands a directory component the target does not have.
   // This subsumes the DIRECTORY form too — a pattern ending in `/` either keeps
   // a slash here or reduces to the empty string, and neither can equal a
@@ -184,9 +190,12 @@ export function classifyRootPathMatch(pattern, path) {
   // it, and a branch no test can kill is not a second layer of defence.
   if (rest.includes("/")) return "cannot-match";
 
-  // `*` and `?` work on GitHub and are not modelled here; `[`, `]` and `!` do
-  // not work there, so their effect is undefined. Both are reasons to refuse.
-  if (/[*?[\]!]/.test(rest)) return "unmodelled";
+  // `*` and `?` work on GitHub and are not modelled here; `[`, `]` and `!` are
+  // documented as NOT working, and GitHub is SILENT on `\` outside the `#` case,
+  // so its effect is undefined. Not-modelled and undefined are both reasons to
+  // refuse: the alternative is picking one reading of a rule whose behaviour
+  // nobody has stated, and picking wrong reads as covered.
+  if (/[*?[\]!\\]/.test(rest)) return "unmodelled";
 
   return rest === target ? "matches" : "cannot-match";
 }

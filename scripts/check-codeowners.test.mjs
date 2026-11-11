@@ -420,6 +420,31 @@ describe("uncoveredSecretScanPaths", () => {
     assert.deepEqual(uncoveredSecretScanPaths(anchored, [".gitleaks.toml"]), []);
   });
 
+  // ⛔ Two further SPELLINGS of the same file, each found by review after the
+  // first fix landed and each reproduced here. They are the same fail-open the
+  // pin above closes — which is the point: the defect is the class, and a fix
+  // that closes one spelling has not closed it.
+  it("⛔ reports a path overridden by a later DOUBLE-globstar owner-less rule", () => {
+    const mutated = `${FIXTURE}**/**/.gitleaks.toml\n`;
+    assert.notEqual(mutated, FIXTURE, "control did not mutate the fixture");
+    assert.deepEqual(uncoveredSecretScanPaths(mutated), [".gitleaks.toml"]);
+  });
+
+  // ⚠ ALL THREE, not just the one the pattern resembles. A refusal is scoped to
+  // the PATTERN, not to a path: having declined to interpret `.gitleaks\.toml`
+  // at all, this cannot then claim to know which files it does not match. Blunt
+  // and in the safe direction — the same shape as the `*` pin below, and the
+  // reason the real-file control exists to prove it stays quiet on master.
+  it("⛔ refuses EVERY path once a later BACKSLASH-escaped rule appears", () => {
+    const mutated = `${FIXTURE}.gitleaks\\.toml\n`;
+    assert.notEqual(mutated, FIXTURE, "control did not mutate the fixture");
+    assert.deepEqual(uncoveredSecretScanPaths(mutated), [
+      ".gitleaks.toml",
+      ".gitleaks-staging.toml",
+      ".gitleaksignore",
+    ]);
+  });
+
   // ⛔ The rest of the class, failing CLOSED. A later glob could remove the
   // owner; this parser does not expand globs, so it refuses rather than guesses.
   it("⛔ reports every path a later unmodelled glob could have overridden", () => {
@@ -492,6 +517,7 @@ describe("classifyRootPathMatch (PEN-6444)", () => {
     [".gitleaks.toml", "matches", "a slashless pattern matches that name at any depth, root included"],
     ["/.gitleaks.toml", "matches", "a leading slash anchors to the root, which is where this file is"],
     ["**/.gitleaks.toml", "matches", "a leading globstar segment reaches the root too"],
+    ["**/**/.gitleaks.toml", "matches", "a RUN of them is still a prefix — stripping only one fails open"],
     ["/**/.gitleaks.toml", "matches", "anchored globstar, same file"],
 
     [".gitleaks.toml.bak", "cannot-match", "a different file that merely shares a prefix"],
@@ -509,6 +535,8 @@ describe("classifyRootPathMatch (PEN-6444)", () => {
     [".gitleaks?toml", "unmodelled", "`?` is a supported wildcard this parser does not expand"],
     ["[.]gitleaks.toml", "unmodelled", "`[ ]` is documented as NOT working, so its effect is undefined"],
     ["!.gitleaks.toml", "unmodelled", "`!` negation is documented as NOT working, likewise"],
+    [".gitleaks\\.toml", "unmodelled", "GitHub is silent on `\\` outside the `#` case, so its effect is undefined"],
+    ["**/*.toml", "unmodelled", "globstar prefix stripped, and the tail is still a glob"],
   ];
 
   for (const [pattern, expected, why] of TABLE) {
