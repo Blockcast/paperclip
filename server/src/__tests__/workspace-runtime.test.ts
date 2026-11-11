@@ -8094,6 +8094,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     actualBranch: string;
     ids: Awaited<ReturnType<typeof seedDirtyQuarantineRecords>>;
     recorder?: WorkspaceOperationRecorder | null;
+    baseRef?: string;
   }) {
     return ensurePersistedExecutionWorkspaceAvailable({
       db,
@@ -8114,7 +8115,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
         projectId: input.ids.projectId,
         projectWorkspaceId: input.ids.projectWorkspaceId,
         repoUrl: null,
-        baseRef: "HEAD",
+        baseRef: input.baseRef ?? "HEAD",
         branchName: input.expectedBranch,
       },
       issue: {
@@ -8253,6 +8254,42 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     await expect(readGit(repoRoot, ["rev-parse", actualBranch])).resolves.toBe(actualBranchHead);
     await expect(readGit(repoRoot, ["show", `${rescueBranch}:untracked.txt`])).resolves.toBe("dirty untracked work");
     await expect(readGit(repoRoot, ["show", `${rescueBranch}:README.md`])).resolves.toContain("dirty tracked work");
+  }, 20_000);
+
+  it("recreates a locally-missing recorded branch from origin/<branch> so its pushed history survives", async () => {
+    const expectedBranch = "PAP-461-recorded-pruned";
+    const actualBranch = "PAP-461-live";
+    const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    const tree = await readGit(repoRoot, ["rev-parse", `${expectedBranch}^{tree}`]);
+    const pushedSha = await readGit(repoRoot, ["commit-tree", tree, "-p", expectedBranch, "-m", "pushed task commit"]);
+    await runGit(repoRoot, ["update-ref", `refs/remotes/origin/${expectedBranch}`, pushedSha]);
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot, worktreePath, expectedBranch, actualBranch, sourceIdentifier: "PAP-461", claimant: "none",
+    });
+
+    const restored = await restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids });
+
+    expect(restored?.branchName).toBe(expectedBranch);
+    expect(restored?.warnings.join("\n")).toContain(`recreated from origin/${expectedBranch}`);
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(pushedSha);
+  }, 20_000);
+
+  it("refuses and leaves the dirty tree untouched when the recorded branch and base ref are both missing", async () => {
+    const expectedBranch = "PAP-462-recorded-missing";
+    const actualBranch = "PAP-462-live";
+    const { repoRoot, worktreePath, actualBranchHead } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot, worktreePath, expectedBranch, actualBranch, sourceIdentifier: "PAP-462", claimant: "none",
+    });
+
+    await expect(restoreDirtyQuarantine({
+      repoRoot, worktreePath, expectedBranch, actualBranch, ids, baseRef: "no-such-base",
+    })).rejects.toThrow(/base ref "no-such-base" to resolve/);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(actualBranchHead);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.not.toBe("");
   }, 20_000);
 
   it("quarantines a worktree wedged mid-rebase and clears the interrupted rebase state", async () => {
