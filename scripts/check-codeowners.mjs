@@ -154,9 +154,15 @@ export function parseCodeownersRules(text) {
  * leading globstar segments likewise reaches the root; a trailing `/` names a
  * directory; matching is case-sensitive. Negation with `!` and character ranges
  * with `[ ]` are documented as NOT working, and `\` escaping is documented only
- * for the `#` case (where it also does not work) and left unstated otherwise, so
- * a pattern using any of them has UNDEFINED effect rather than no effect — a
- * reason to refuse to interpret it, not to ignore it.
+ * for the `#` case (where it also does not work) and left unstated otherwise.
+ *
+ * Those two groups are NOT the same thing and this function keeps them apart.
+ * `*` and `?` are DEFINED and merely unexpanded here, so reasoning about a
+ * pattern's slashes stays valid and the structural tests run first. `[`, `]`,
+ * `!` and `\` are UNDEFINED, so nothing about such a pattern can be reasoned
+ * about at all — including its slashes — and they are refused before any
+ * structural step. Collapsing the two into one test is what let a `\` sitting
+ * before a slash reach the slash test and answer `cannot-match`.
  *
  * @param {string} pattern a CODEOWNERS pattern
  * @param {string} path a root-relative file name, e.g. `.gitleaks.toml`
@@ -172,6 +178,14 @@ export function classifyRootPathMatch(pattern, path) {
 
   const raw = String(pattern ?? "");
   if (raw === "") return "cannot-match";
+
+  // UNDEFINED before STRUCTURAL, and this order is the whole of it. `[`, `]`,
+  // `!` and `\` have no agreed meaning here — GitHub documents the first three
+  // as NOT working and says nothing about `\` beyond the `#` case — so a
+  // pattern containing one has no agreed meaning for its SLASHES either, and no
+  // structural step below may run on it. Tested against `raw`, not `rest`, for
+  // the same reason: stripping a prefix is already a structural claim.
+  if (/[[\]!\\]/.test(raw)) return "unmodelled";
 
   let rest = raw.startsWith("/") ? raw.slice(1) : raw;
   // A leading globstar segment is the one slash-bearing shape that still reaches
@@ -190,12 +204,14 @@ export function classifyRootPathMatch(pattern, path) {
   // it, and a branch no test can kill is not a second layer of defence.
   if (rest.includes("/")) return "cannot-match";
 
-  // `*` and `?` work on GitHub and are not modelled here; `[`, `]` and `!` are
-  // documented as NOT working, and GitHub is SILENT on `\` outside the `#` case,
-  // so its effect is undefined. Not-modelled and undefined are both reasons to
-  // refuse: the alternative is picking one reading of a rule whose behaviour
-  // nobody has stated, and picking wrong reads as covered.
-  if (/[*?[\]!\\]/.test(rest)) return "unmodelled";
+  // `*` and `?` are DEFINED on GitHub and merely not expanded here, which is a
+  // weaker thing than undefined and is why this runs AFTER the slash test
+  // rather than before it: their meaning is known well enough to trust that
+  // analysis — neither crosses a `/` — so `scripts/release-*.mjs` is still
+  // provably unable to name a root-level file. Moving this up with the
+  // undefined set would make every `*`-bearing rule in the real
+  // `.github/CODEOWNERS` unmodelled and red this guard permanently.
+  if (/[*?]/.test(rest)) return "unmodelled";
 
   return rest === target ? "matches" : "cannot-match";
 }

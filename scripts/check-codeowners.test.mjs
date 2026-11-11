@@ -445,6 +445,16 @@ describe("uncoveredSecretScanPaths", () => {
     ]);
   });
 
+  it("⛔ refuses EVERY path once a later rule hides a backslash before a slash", () => {
+    const mutated = `${FIXTURE}foo\\/.gitleaks.toml\n`;
+    assert.notEqual(mutated, FIXTURE, "control did not mutate the fixture");
+    assert.deepEqual(uncoveredSecretScanPaths(mutated), [
+      ".gitleaks.toml",
+      ".gitleaks-staging.toml",
+      ".gitleaksignore",
+    ]);
+  });
+
   // ⛔ The rest of the class, failing CLOSED. A later glob could remove the
   // owner; this parser does not expand globs, so it refuses rather than guesses.
   it("⛔ reports every path a later unmodelled glob could have overridden", () => {
@@ -536,6 +546,8 @@ describe("classifyRootPathMatch (PEN-6444)", () => {
     ["[.]gitleaks.toml", "unmodelled", "`[ ]` is documented as NOT working, so its effect is undefined"],
     ["!.gitleaks.toml", "unmodelled", "`!` negation is documented as NOT working, likewise"],
     [".gitleaks\\.toml", "unmodelled", "GitHub is silent on `\\` outside the `#` case, so its effect is undefined"],
+    ["**\\/.gitleaks.toml", "unmodelled", "an undefined `\\` BEFORE a slash — the structural tests must not run at all"],
+    ["foo\\/.gitleaks.toml", "unmodelled", "same, with no globstar to hide behind"],
     ["**/*.toml", "unmodelled", "globstar prefix stripped, and the tail is still a glob"],
   ];
 
@@ -561,6 +573,31 @@ describe("classifyRootPathMatch (PEN-6444)", () => {
       classifyRootPathMatch("config/.gitleaks.toml", "config/.gitleaks.toml"),
       "unmodelled",
     );
+  });
+
+  // ⛔ THE ORDER, pinned from BOTH sides, because one assertion cannot hold it.
+  // UNDEFINED (`[ ] ! \`) and MERELY-UNMODELLED (`* ?`) are different things:
+  // the first denies any reading of the pattern INCLUDING its slashes, so it
+  // must short-circuit before the structural tests; the second is well defined
+  // on GitHub and simply unexpanded here, so the slash analysis stays valid and
+  // must still run. Collapse the two into one test and exactly one of these
+  // two assertions fails, whichever way you collapse them.
+  it("⛔ refuses an UNDEFINED character before any structural test", () => {
+    assert.equal(classifyRootPathMatch("foo\\/.gitleaks.toml", TARGET), "unmodelled");
+  });
+
+  it("⛔ still answers cannot-match for a DEFINED glob behind a directory", () => {
+    // The real `.github/CODEOWNERS` carries four of these. Hoisting the glob
+    // test above the slash test makes every one of them `unmodelled` and reds
+    // the guard permanently — the review option rejected in the commit before.
+    for (const pattern of [
+      "scripts/release-*.mjs",
+      "scripts/release*.sh",
+      ".github/**",
+      "skills/**",
+    ]) {
+      assert.equal(classifyRootPathMatch(pattern, TARGET), "cannot-match", pattern);
+    }
   });
 
   it("is null-safe on both arguments", () => {
