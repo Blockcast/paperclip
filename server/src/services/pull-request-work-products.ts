@@ -40,6 +40,15 @@ export interface PullRequestWorkProductInput {
    *
    * Keeping `source` and adding a separate marker lets a census still tell a
    * backfill from a delivery without taking the row out of any reader.
+   *
+   * The marker is NOT durable, so a census filtering on `repairedBy is not
+   * null` is a LOWER BOUND on repairs, never a total. Any later
+   * `pull_request` event for the PR -- a `labeled`, a stray `synchronize` --
+   * carries a strictly later timestamp, so `acceptIncoming` takes it and
+   * replaces `metadata` WHOLESALE, resetting `repairedBy` to null. That is
+   * the right outcome for `status`, which the later event restates
+   * correctly; it just means the repair stops being visible. Count an
+   * absence as `unknown`, never as `was never repaired`.
    */
   repairedBy?: string | null;
   /** ISO instant the repair above was written. Null when `repairedBy` is. */
