@@ -255,6 +255,18 @@ env:
   #     — an identity like any other, which the command above prints as `<none>`
   #     rather than by name. Setting the allowlist refuses it unless you list
   #     `default` explicitly.
+  #
+  # This list matches the bare ServiceAccount NAME, with no namespace part, and
+  # the namespace is not derived from it: `namespace` is resolved from the same
+  # merged config as `serviceAccountName` (`config.namespace`, falling back to
+  # the control plane's own namespace). The two keys are not even writable from
+  # the same set of scopes -- PEN-6247 pinned `serviceAccountName` out of the
+  # issue-scope overlay, and `namespace` is not pinned, so it is still writable
+  # from all three. So the allowlist bounds WHICH identity a Job pod may run as,
+  # never WHERE that Job is created: a name you add because it is harmless in
+  # the release namespace is admitted just as readily in any other namespace,
+  # against whatever account carries that name there. What bounds the WHERE is
+  # the control plane's own Job-create RBAC, not this value.
 
 # -- Additional pod-level volumes. Used to mount Secrets/ConfigMaps that
 # plugins or runtime helpers read from disk (for example Authbot service keys).
