@@ -181,6 +181,7 @@ import {
   setColdInReviewIssueOldestAgeMetrics,
 } from "../metrics.js";
 import {
+  EXTERNAL_WAIT_YIELD_ERROR_CODE,
   isInfraFailureRun,
   isLegacySessionUnavailableAdapterMismatch,
   ROUTE_TO_ORIGINAL_INFRA_ERROR_CODES,
@@ -1677,8 +1678,9 @@ function isTerminalDispatchRaceRun(
 //
 // #1195 shipped the yield half; this is the classification half, and they are
 // different layers.
-const EXTERNAL_WAIT_YIELD_ERROR_CODE = "external_wait_yield";
-
+// PEN-6528: the code moved to zero-token-startup-failure.ts, which the
+// productivity review reads it from too. One string, one definition, so the
+// recovery layer and the review layer cannot drift apart on the spelling.
 function isExternalWaitYieldRun(
   latestRun: LatestIssueRun,
 ): latestRun is NonNullable<LatestIssueRun> {

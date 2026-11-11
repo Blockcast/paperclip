@@ -147,6 +147,37 @@ export function isDependencyBlockedRun(run: Pick<NeverExecutedRunInput, "errorCo
   return run.errorCode === "issue_dependencies_blocked";
 }
 
+// The external-wait slot yield (#1195 / PEN-2074): the run cancels ITSELF, by
+// calling `yieldCurrentRunForExternalWait` (routes/issues.ts), after it has
+// durably persisted an external-service wait monitor. Nothing failed. The run
+// gave its execution slot back precisely so the wait would not hold a runtime
+// seat, and the wake path it left behind is the monitor it just armed.
+export const EXTERNAL_WAIT_YIELD_ERROR_CODE = "external_wait_yield";
+
+// True for that yield. Disjoint from `isInfraFailureRun` below for the same
+// reason `isDependencyBlockedRun` is — a deliberate control-plane cancellation
+// is not an infrastructure fault — but on the opposite side of the adapter: the
+// dependency gate cancels a run that never reached one, while a yield is emitted
+// BY a run that reached the adapter and executed.
+//
+// PEN-6528: recovery/service.ts has understood this since BLO-27463; the
+// productivity review did not, and it is the layer that bills an agent. A yield
+// satisfies every arm of `isInfraFailureRun` by accident — the code is not
+// `issue_dependencies_blocked`, `classifyRunLiveness` stamps any non-`succeeded`
+// run `failed`, and the cancellation precedes the telemetry flush so `usageJson`
+// and `logBytes` are both null — so a correctly parked agent accrued a
+// `runtime_failure_streak` at exactly the rate it behaved well. Measured on
+// PEN-6381: 21 consecutive yields reported as "no evidence of a model turn",
+// while one of them (3e7c4d58 on PEN-6206) had posted an 8,822-character
+// comment. Null usage on this path is unflushed telemetry, not silence.
+//
+// Spelled as a literal rather than imported, like every other code in this
+// module: it stays a dependency-free pure classifier. recovery/service.ts
+// imports THIS const so the two layers cannot drift on the spelling.
+export function isExternalWaitYieldRun(run: Pick<NeverExecutedRunInput, "errorCode">): boolean {
+  return run.errorCode === EXTERNAL_WAIT_YIELD_ERROR_CODE;
+}
+
 // Error codes that name an infrastructure fault by the code ALONE: the run
 // never got to succeed or fail on its own merits, and the assignee had no part
 // in it.
@@ -383,6 +414,7 @@ export function isInfraClassErrorCodeRun(run: Pick<NeverExecutedRunInput, "error
 // `openPullRequestWakePathConditions`, which was extracted for the same hazard.
 export function isInfraFailureRun(run: NeverExecutedRunInput): boolean {
   if (isDependencyBlockedRun(run)) return false;
+  if (isExternalWaitYieldRun(run)) return false;
   if (run.livenessState !== "failed") return false;
   if (run.usageJson == null) {
     return (run.logBytes ?? 0) <= NEVER_EXECUTED_UNKNOWN_USAGE_LOG_BYTES_CEILING;
