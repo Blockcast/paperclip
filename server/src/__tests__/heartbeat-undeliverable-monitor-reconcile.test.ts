@@ -525,9 +525,9 @@ describeEmbeddedPostgres("heartbeat reconcileUndeliverableIssueMonitors", () => 
     // And nothing was logged against it, so no census or ledger reading this
     // pass's activity rows can date its death to today.
     const logged = await db
-      .select({ issueId: activityLog.issueId })
+      .select({ action: activityLog.action })
       .from(activityLog)
-      .where(eq(activityLog.issueId, leftoverId));
+      .where(eq(activityLog.entityId, leftoverId));
     expect(logged).toHaveLength(0);
   });
 });
