@@ -4226,6 +4226,55 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(updated?.status).toBe("in_progress");
     });
 
+    /**
+     * PEN-6322. This closes the residual the test above names as "deliberately left
+     * visible": a NEW writer that bumps `updated_at` on a row it leaves `pending`
+     * silently widens the exemption by up to the full grace. That writer shipped --
+     * `updatePayload`, the in-place payload correction behind `PATCH /approvals/{id}`.
+     *
+     * An in-place correction exists precisely so a filer can fix stale evidence WITHOUT
+     * moving the card in the queue, so it is NOT a fresh board-owned wait and must not
+     * buy another grace window. Before the fix this row read as attended for up to 14
+     * days on a decision that may not be coming.
+     *
+     * Driven through the real writer rather than hand-seeded, for the reason the
+     * resubmit test above gives: the shape is only meaningful if production can still
+     * make it, and a fixture cannot fail when the writer changes underneath it.
+     */
+    it("stops believing a stale-filed approval that was only corrected IN PLACE", async () => {
+      const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
+      const graceMs = loadConfig().pendingBoardApprovalAttendanceGraceMs;
+      const filedAt = new Date(Date.now() - (graceMs + 7 * 24 * 60 * 60_000));
+      const approvalId = await insertBoardApproval({
+        companyId,
+        issueId: sourceIssueId,
+        requestedByAgentId: coderId,
+        createdAt: filedAt,
+      });
+
+      const edited = await approvalService(db).updatePayload(
+        approvalId,
+        { corrected: "in place" },
+        { agentId: coderId },
+      );
+
+      // Guard the premise before measuring the behaviour, so a change to the writer
+      // fails HERE with a legible cause rather than as an unexplained escalation count.
+      // The card is still pending, still filed outside the grace, and its `updated_at`
+      // is now fresh -- which is exactly what used to exempt it.
+      expect(edited.status).toBe("pending");
+      expect(edited.createdAt.getTime()).toBe(filedAt.getTime());
+      expect(edited.updatedAt.getTime()).toBeGreaterThan(filedAt.getTime());
+      expect(edited.payloadEditedAt).not.toBeNull();
+      expect(edited.updatedAt.getTime()).toBe(edited.payloadEditedAt!.getTime());
+
+      const result = await sweep();
+
+      expect(result.escalated).toBe(1);
+      const [updated] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(updated?.status).toBe("blocked");
+    });
+
     it("does not exempt a row whose fresh approval is linked to a different issue", async () => {
       const { companyId, coderId, sourceIssueId } = await seedSeizableProductiveRow();
       // Same company, same requester, same `pending` status, inside the grace — differing
