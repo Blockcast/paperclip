@@ -859,9 +859,14 @@ describe.sequential("issue comment reopen routes", () => {
     // the denied-write recorder this test is about — the test would pass for
     // the wrong reason, on a 403 from the wrong guard.
     //
-    // As of PEN-6430 there is no bare `z.record(z.string(), z.unknown())` left
-    // on the agent-reachable issue write surface at all, which is a result in
-    // its own right. `watchdogDiscovery` is a typed `.strict()` object whose
+    // As of PEN-6430 no bare `z.record(z.string(), z.unknown())` is reachable
+    // through these four ISSUE WRITE ROUTES, which is a result in its own
+    // right — and it is a claim about the ROUTES, not about the fields: the
+    // same `workspaceRuntime` record is still reachable through
+    // `runRoutineSchema` and the two pipeline stage-settings schemas, which
+    // never call `assertNoAgentIssueHostControlledMutation` (named in that
+    // guard's own doc comment and carried as a follow-up).
+    // `watchdogDiscovery` is a typed `.strict()` object whose
     // `evidenceMarkdown` is free text, so it supplies the one thing this test
     // actually needs — a string leaf BELOW the top level — and it cannot be
     // invalidated by some future guard closing an open record, because it no

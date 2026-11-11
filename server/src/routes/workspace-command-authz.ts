@@ -192,10 +192,13 @@ export function collectIssueWorkspaceCommandPaths(input: {
  * justifies an empty permitted set was taken over `adapterConfig` alone — and
  * PEN-6430 has since CLOSED it, with its own census, through a separate
  * field-level refusal below (`collectAgentDisallowedIssueWorkspaceRuntimePaths`)
- * rather than by extending this list. ⇒ as of PEN-6430 there is no bare open
- * record left on the agent-reachable issue write surface, which is why
+ * rather than by extending this list. ⇒ no bare open record is reachable
+ * through the four ISSUE WRITE ROUTES this guard runs at, which is why
  * `issue-comment-reopen-routes.test.ts` no longer bounds its denied-payload
- * fixtures on one.
+ * fixtures on one. ⛔ That is a claim about THESE FOUR ROUTES and nothing
+ * wider — see the carrier list on
+ * `collectAgentDisallowedIssueWorkspaceRuntimePaths` below for the routine and
+ * pipeline surfaces that reach the same field without passing through here.
  *
  * ⚠ THIS IS THE WRITE SIDE ONLY. `AGENT_SCOPE_ONLY_CONFIG_KEYS` in
  * `services/heartbeat.ts` answers a different question — which SCOPE wins at
@@ -276,6 +279,39 @@ export function assertNoAgentIssueAdapterConfigMutation(req: Request, paths: str
  * ⚠ SCOPE. `executionWorkspaceSettings.workspaceStrategy` is untouched — its two
  * host-command keys stay with the denylist in `collectIssueWorkspaceCommandPaths`
  * and the rest of that typed object remains agent-writable.
+ *
+ * ⛔⛔ AND THE SCOPE IS THE FOUR ISSUE WRITE ROUTES, NOT THE FIELD. Do not read
+ * this guard — or the refusal message below — as "`workspaceRuntime` is
+ * agent-immutable". `issueExecutionWorkspaceSettingsSchema` is embedded by
+ * THREE other request schemas that never reach `assertNoAgentIssueHostControlledMutation`,
+ * measured at source 2026-11-11 (PEN-6430 review, `routes/routines.ts` and
+ * `routes/pipelines.ts` each carry ZERO references to this module):
+ *
+ *   1. `runRoutineSchema` (`packages/shared/src/validators/routine.ts`) →
+ *      `POST /routines/:id/run`. Its only agent gate is
+ *      `assertCanManageExistingRoutine` ("the routine is assigned to me"), and
+ *      `assertBoardCanAssignTasks` RETURNS EARLY for a non-board actor, so an
+ *      agent running its OWN routine reaches `services/routines.ts`, which
+ *      passes `input.executionWorkspaceSettings` straight into
+ *      `issueSvc.create` — the same path into `config.workspaceRuntime`.
+ *   2 & 3. The two pipeline stage-settings schemas
+ *      (`packages/shared/src/validators/pipeline.ts`), carried by
+ *      `services/pipelines.ts`. Agent reachability there turns on how
+ *      `pipelines:write` is granted and was NOT measured.
+ *
+ * Those carriers are PRE-EXISTING and are deliberately NOT closed here: the
+ * same routes are equally unguarded for the PEN-5225 command denylist, which is
+ * the larger and older hole, and no census of live routines or pipeline stages
+ * carrying these fields has been taken — refusing an unmeasured surface is the
+ * unscoped change PEN-6418 and PEN-6430 both exist to avoid. Carried as
+ * PEN-6532 rather than left as a silence, because a comment that wrongly says
+ * "closed" on a security boundary is worse than one that names the gap. ⚠ When
+ * PEN-6532 lands, correct this list — it will otherwise read as still-open.
+ *
+ * ⚠ And do NOT route a reader to PEN-3266 for this. That row is `done` and is
+ * the READ side of the same schema; it states "Routines are input-only for this
+ * field", which is true of RESPONSES and says nothing about an agent WRITING
+ * one. A title search for this class lands there first and it reads as closed.
  */
 export function collectAgentDisallowedIssueWorkspaceRuntimePaths(input: {
   executionWorkspaceSettings?: unknown;
@@ -322,8 +358,8 @@ export function assertNoAgentIssueWorkspaceRuntimeMutation(req: Request, paths: 
   throw forbidden(
     `Agent keys cannot set issue execution workspace runtime config (${paths.join(", ")}). `
       + "`executionWorkspaceSettings.workspaceRuntime` is an open record that reaches host "
-      + "process execution and is withheld from agent reads, so it is agent-immutable on an "
-      + "issue; send `null` to clear it.",
+      + "process execution and is withheld from agent reads, so an agent cannot set it on "
+      + "the issue write routes; send `null` to clear it.",
   );
 }
 
