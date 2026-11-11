@@ -1842,6 +1842,12 @@ test("PEN-5530: queue membership is read over GraphQL, and refuses rather than g
   assert.ok(calls[0].includes("gh api graphql"), `expected a GraphQL read; got: ${calls[0]}`);
   assert.ok(calls[0].includes("isInMergeQueue"), `the query must select membership; got: ${calls[0]}`);
   assert.ok(calls[0].includes("number=3215"), `the PR number must be bound as a variable; got: ${calls[0]}`);
+  // `owner`/`name` are `String!` and must be passed with `-f`. `-F` lets gh
+  // infer a type, so a numeric-looking owner or repo name is sent as an Int
+  // and the query raises a type error -- fail-closed, but a repo that cannot
+  // be read is a notice that cannot be written.
+  assert.ok(calls[0].includes("-f owner="), `owner must be a literal string; got: ${calls[0]}`);
+  assert.ok(calls[0].includes("-f name="), `name must be a literal string; got: ${calls[0]}`);
   assert.match(QUEUE_MEMBERSHIP_QUERY, /mergeQueueEntry/);
 
   // Not in the queue: a real reading, and distinguishable from a failed one.
@@ -1879,12 +1885,19 @@ test("PEN-5530: main() reads membership and threads it into the notice", () => {
   // that forgot to read it would leave this suite green while every live
   // notice kept telling queued PRs to re-add.
   const source = readFileSync(DETECTOR_SOURCE_PATH, "utf8");
-  const handoffs = source.match(/^\s*queueMembership,$/gm) ?? [];
-  assert.equal(
-    handoffs.length,
-    2,
-    "expected `queueMembership` shorthand at exactly two sites -- the printed result and " +
-      `\`buildEvictionCommentBody\` -- found ${handoffs.length}.`,
+  const sliceBetween = (from, to) => source.slice(source.indexOf(from), source.indexOf(to));
+  // Scoped to the two call sites rather than counted across the whole file,
+  // so an unrelated future use of the same shorthand cannot red this test and
+  // a hand-off dropped from one site cannot be masked by the other.
+  assert.match(
+    sliceBetween("const result = {", "console.log(JSON.stringify(result"),
+    /^\s*queueMembership,$/m,
+    "the printed result must carry the membership reading, so a manual run can see it",
+  );
+  assert.match(
+    sliceBetween("const body = buildEvictionCommentBody({", "run([\"gh\", \"pr\", \"comment\""),
+    /^\s*queueMembership,$/m,
+    "buildEvictionCommentBody must receive the membership reading",
   );
   assert.match(
     source,
