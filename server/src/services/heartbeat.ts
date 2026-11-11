@@ -33623,12 +33623,45 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // requires a null `monitorNextCheckAt`), and the triggered arm is a
           // deliberate SUPERSET of `derivePersistedMonitorState`'s triggered
           // branch -- it is a cheap SQL prefilter, and
-          // `buildIssueMonitorEligibilityPatch` remains the authority. Anything
-          // over-selected returns an empty patch and is counted `skipped`.
+          // `buildIssueMonitorEligibilityPatch` remains the authority for an
+          // over-selected row whose monitor JSON is PRESENT.
+          //
+          // PEN-6202 fail-closed guard -- `jsonb_typeof(... ->'monitor') =
+          // 'object'`, NOT `->'monitor' is not null`: `'{"monitor": null}'`
+          // yields JSON null, which is not SQL NULL, so the `is not null` form
+          // would wave through a row whose monitor JSON is explicitly null --
+          // and `parseIssueExecutionState(...)?.monitor` reads that as absent,
+          // which is exactly the shape being guarded against.
+          // "Over-selection is free, the patch builder returns an empty
+          // patch" holds in every direction but one, and that one is
+          // destructive. A row that was cleared and later reopened by a
+          // deferred comment is written `{status: 'todo', executionState: null}`
+          // while KEEPING `monitorLastTriggeredAt` / `monitorAttemptCount` --
+          // the clear patch nulls `monitorNextCheckAt`, `monitorWakeRequestedAt`
+          // and `monitorNotes`, and neither trigger column.
+          // `derivePersistedMonitorState` then reaches its third branch off the
+          // retained COLUMN and derives `triggered`, so `holdsTriggeredMonitor`
+          // is true, `monitorClearReasonForIssue` returns `invalid_status`, and
+          // this pass stamps a FRESH `clearedAt`/`clearReason` over a monitor
+          // that died months earlier. That is the falsified-death-date class
+          // PEN-5902 is about, and it is what PEN-6202's attribution ledger
+          // reads. The CAS below cannot catch it either: the row carries no
+          // monitor JSON before OR after, so both sides of
+          // `is not distinct from` are null and it passes.
+          //
+          // Measured 2026-11-11 across all 5868 company rows: this conjunct
+          // keeps 383 of the 384 ineligible rows the arm selects -- including
+          // all three non-terminal dark rows this pass exists to reach
+          // (PEN-2077, PEN-6022, PEN-5146) -- and excludes exactly one,
+          // PEN-389, a `done` row untouched since 2026-06-19. Recall cost on
+          // the population that matters is zero, and an excluded row stays
+          // visible to the next census rather than being retired under a date
+          // that never happened.
           sql`(
             ${issues.monitorNextCheckAt} is not null
             or (
               ${issues.monitorNextCheckAt} is null
+              and jsonb_typeof(${issues.executionState}->'monitor') = 'object'
               and coalesce(${issues.executionState}->'monitor'->>'status', '') <> 'cleared'
               and (
                 ${issues.executionState}->'monitor'->>'status' = 'triggered'
