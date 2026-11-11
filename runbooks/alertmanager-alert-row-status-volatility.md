@@ -350,13 +350,44 @@ cadence, is a machine-owned field. That read is the only instrument that
 settles it, and it settles it for any writer rather than for a list of plugins
 somebody has to keep current.
 
+⛔ **If you record below the marker, APPEND — do not PREPEND.** The generated
+*Recording a constraint* directive says *"PREPEND your constraint block and keep
+every existing byte"*, which is right on a row an agent owns and is the one act
+that loses the write here: `composeDescription` returns
+`<render>` + `<banner>` + `<marker>` + `<notes>`, so position 0 is inside the
+re-rendered half and the durable half is at the **foot** of the body. The two
+instructions are reachable in either order and each is correct about its own
+case, which is why the directive's machine-owned clause now names the inversion
+explicitly.
+
+⚠️ **Which rows have the marker, and why that matters for a legacy body.** A row
+acquires the marker on its next delivery and keeps it; until then its body is
+legacy, and `preservedNotes` can only rescue an append on it through the
+`current.startsWith(<render>)` prefix match. That match is sensitive to **any**
+change in the rendered text, so a renderer change silently retires the rescue
+for exactly the rows it exists for. Measured 2026-11-11T13:2xZ, the day PEN-6218
+deployed, across all **107** alertmanager-owned rows in this company:
+
+| | |
+|---|---|
+| carrying the marker | **17** |
+| no marker (legacy) | **90** — 71 `cancelled`, 16 `done`, 3 `todo` |
+
+⇒ the legacy population was **84%** of the estate at that instant, so this is a
+live concern and not a theoretical one. `legacyRenderHeads` in
+`description-notes.ts` buys back exactly one renderer change — the
+machine-rendered notice — and is not a general solution, because there is none.
+
 **Where to put it instead**, in order:
 
-1. the **artifact's own durable text** — a PR body is not regenerated, and is
+1. **below the notes marker** on this row — carried forward verbatim across
+   every sync, and the half the row's own banner points at (append, never
+   prepend);
+2. the **artifact's own durable text** — a PR body is not regenerated, and is
    usually also the surface the human actor reads;
-2. a **comment** on the alert row — append-only, and it survives every rewrite
+3. a **comment** on the alert row — append-only, and it survives every rewrite
    above;
-3. **`monitorNotes` on a monitor armed on a row of your OWN** — 500 chars,
+4. **`monitorNotes` on a monitor armed on a row of your OWN** — 500 chars,
    and it is what the next woken run reads first.
 
 ⛔ **Not this row's monitor.** `monitorNotes` here survives the description

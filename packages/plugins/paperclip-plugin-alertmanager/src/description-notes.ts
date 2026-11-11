@@ -18,6 +18,8 @@
  * reads this file — it reads the field it is about to overwrite.
  */
 
+import { MACHINE_RENDERED_NOTICE } from "./issue-mapping.js";
+
 /**
  * The split point. An HTML comment so it does not render, plugin-namespaced so
  * an alert annotation cannot collide with it by accident.
@@ -81,8 +83,9 @@ export function preservedNotes(
   // 69 times). Anything else falls through to "no notes", i.e. exactly the
   // pre-PEN-6218 behaviour: this can lose nothing that was not already lost.
   const head = trimTrailingSpace(rendered);
-  if (current.startsWith(head)) {
-    const remainder = current.slice(head.length);
+  for (const candidate of legacyRenderHeads(head)) {
+    if (!current.startsWith(candidate)) continue;
+    const remainder = current.slice(candidate.length);
     // ...unless the render SHRANK. A prefix match says only that the stored
     // body begins with this render, and a smaller render of the same alert is
     // a prefix of a bigger one — our sections are appended in a fixed order
@@ -104,6 +107,38 @@ export function preservedNotes(
     if (remainder.trim() !== "" && !looksSelfRendered(remainder)) return remainder;
   }
   return "\n";
+}
+
+/**
+ * PEN-6404 — the prefix rescue above matches a stored body against THIS render,
+ * so every change to the render silently retires it for rows that have not yet
+ * synced. Prepending {@link MACHINE_RENDERED_NOTICE} is such a change: a body
+ * written before the notice existed cannot begin with a render that now leads
+ * with it, so the single-candidate match could never fire again on a legacy row
+ * and the rescue became dead code the moment the notice shipped.
+ *
+ * Measured 2026-11-11, the day PEN-6218 deployed: of 107 alertmanager-owned
+ * rows, 17 carried the marker and **90 did not** (71 cancelled, 16 done, 3
+ * todo). The legacy population is the rescue's whole reason to exist and it was
+ * still the large majority, so this is a live regression rather than a
+ * theoretical one.
+ *
+ * So try the render as it is, then the render as a pre-notice version of this
+ * plugin would have emitted it. Order matters: the exact match is tried first,
+ * so a row that DOES begin with the current render keeps the longer, more
+ * specific prefix and the shorter one never shortens a remainder that the exact
+ * match already explained.
+ *
+ * ⚠ This buys back exactly one renderer change — the notice. It is not a
+ * general solution, and there is none: any edit to a rendered section moves the
+ * prefix. What makes it worth doing is that the notice is the change shipping
+ * alongside it, in the same release, against a population that is 84% legacy.
+ */
+function legacyRenderHeads(head: string): readonly string[] {
+  const withoutNotice = MACHINE_RENDERED_NOTICE + "\n\n";
+  return head.startsWith(withoutNotice)
+    ? [head, trimTrailingSpace(head.slice(withoutNotice.length))]
+    : [head];
 }
 
 /**
