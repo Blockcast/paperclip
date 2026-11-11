@@ -65,14 +65,20 @@ function jsonResponse(data: unknown, ok = true, status = 200): Response {
 
 type FakeReview = { user: { login: string }; commit_id: string; state: string };
 
-/** Fake GitHub. `prHead` is what `/pulls/{n}` reports as the CURRENT head. */
+/** Fake GitHub. `prHead` is the CURRENT head, now reported over GraphQL (PEN-6341). */
 function stubGithub(routes: { reviews?: FakeReview[]; comments?: unknown[]; prHead?: string }) {
   const fetchMock = vi.fn(async (url: string | URL) => {
     const u = String(url);
     if (u.includes("/access_tokens")) return jsonResponse({ token: "ghs_test", expires_at: FUTURE_ISO });
     if (u.includes("/pulls/") && u.includes("/reviews")) return jsonResponse(routes.reviews ?? []);
     if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse(routes.comments ?? []);
-    if (u.includes("/pulls/")) return jsonResponse({ head: { sha: routes.prHead ?? LIVE_HEAD } });
+    // PEN-6341: the head read is GraphQL now. Reviews above are still REST and
+    // are deliberately untouched -- only the pull-request FIELD read moved.
+    if (u.endsWith("/graphql")) {
+      return jsonResponse({
+        data: { repository: { pullRequest: { headRefOid: routes.prHead ?? LIVE_HEAD } } },
+      });
+    }
     throw new Error(`unexpected url ${u}`);
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -243,7 +249,9 @@ describe("BLO-28920: reviewer-evidence attestation accepts the live head as well
           return reviewsCalls === 1 ? jsonResponse([]) : jsonResponse({ message: "boom" }, false, 500);
         }
         if (u.includes("/issues/") && u.includes("/comments")) return jsonResponse([]);
-        if (u.includes("/pulls/")) return jsonResponse({ head: { sha: LIVE_HEAD } });
+        if (u.endsWith("/graphql")) {
+          return jsonResponse({ data: { repository: { pullRequest: { headRefOid: LIVE_HEAD } } } });
+        }
         throw new Error(`unexpected url ${u}`);
       }),
     );
