@@ -3203,11 +3203,21 @@ export async function ensureGitWorktreeBranchCoherent(input: {
     });
     // BLO-55723: a recorded branch that no longer exists (deleted, or never
     // pushed) used to refuse forever. The rescue commit does not need it, so
-    // quarantine anyway and recreate the recorded branch from the base ref.
+    // quarantine anyway and recreate the recorded branch. Prefer
+    // origin/<recorded> so a branch pruned only locally keeps its pushed
+    // history; fall back to the base ref only when neither ref exists.
     let recreateExpectedBranch: { baseRef: string; sha: string } | null = null;
     if (!evidence.provenance.expectedBranchExists) {
-      const { baseRef } = await resolveAuthoritativeBaseRef(input.repoRoot, input.baseRef ?? null);
-      const sha = await resolveBaseRefSha(input.repoRoot, baseRef);
+      const remoteExpected = `origin/${expectedBranchName}`;
+      const remoteSha = await resolveBaseRefSha(input.repoRoot, remoteExpected);
+      // Callers pass an already-resolved base; only the default-branch fallback is detected here (no fetch).
+      const configuredBaseRef = input.baseRef?.trim();
+      const baseRef = remoteSha
+        ? remoteExpected
+        : configuredBaseRef && configuredBaseRef !== "HEAD"
+          ? configuredBaseRef
+          : (await resolveAuthoritativeBaseRef(input.repoRoot, null)).baseRef;
+      const sha = remoteSha ?? await resolveBaseRefSha(input.repoRoot, baseRef);
       if (!sha) {
         evidence.safeRepair.reason =
           `dirty quarantine repair requires the recorded branch to exist, or base ref "${baseRef}" to resolve so it can be recreated`;
