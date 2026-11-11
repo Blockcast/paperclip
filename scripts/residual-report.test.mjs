@@ -30,6 +30,7 @@ import {
   formatCell,
   populationRate,
   trialRate,
+  worstByTrialRate,
   worstShape,
 } from "./residual-report.mjs";
 
@@ -124,4 +125,41 @@ test("a family with no reachable bin reports nothing rather than zero", () => {
   assert.equal(worstShape(dead), null);
   assert.equal(dilution(dead), null);
   for (const cell of dead) assert.equal(classifyCell(cell), "unreachable");
+});
+
+/** `isLexicalIdentifier`'s 3-7 character / `-` family, measured 2026-11-11 at
+ *  100,000 trials per shape. Included because its worst-by-POPULATION cell and
+ *  its worst-by-TRIAL cell are DIFFERENT cells — the bins run populations of
+ *  0.43 and 0.96 — which is the only fixture that can catch a dilution factor
+ *  built from half of each. */
+const DENOMINATORS_DISAGREE = [
+  { label: "3-7 chars '-' grp=4", admitted: 266, population: 42870, trials: 100000 },
+  { label: "3-7 chars '-' grp=5", admitted: 388, population: 95800, trials: 100000 },
+];
+
+test("dilution is built from ONE denominator, end to end", () => {
+  const [g4, g5] = DENOMINATORS_DISAGREE;
+  // The premise: the two rankings genuinely disagree on this family.
+  assert.equal(worstShape(DENOMINATORS_DISAGREE).label, g4.label);
+  assert.equal(worstByTrialRate(DENOMINATORS_DISAGREE).label, g5.label);
+
+  // mixed-denominator: `familyAverage` is a TRIAL rate, so the numerator must
+  // be one too. Taking the worst-by-POPULATION cell's trial rate instead
+  // reports 0.81 here — a "dilution" BELOW 1, i.e. a worst shape apparently
+  // weaker than the average it is drawn from, which is impossible.
+  const factor = dilution(DENOMINATORS_DISAGREE);
+  assert.ok(factor >= 1, `dilution must never be < 1; got ${factor}`);
+  assert.ok(Math.abs(factor - trialRate(g5) / familyAverage(DENOMINATORS_DISAGREE)) < 1e-12);
+  assert.ok(Math.abs(factor - 1.187) < 0.01, `expected ~1.187, got ${factor}`);
+});
+
+test("dilution is never below 1 on any measured family", () => {
+  // A worst shape cannot be weaker than the average that contains it. This is
+  // the cheap invariant that catches any future denominator mix, on any
+  // fixture, without needing one where the two rankings disagree.
+  for (const family of [HOT_FAMILY, MAX_IS_LAST, DENOMINATORS_DISAGREE]) {
+    const factor = dilution(family);
+    if (factor === null) continue;
+    assert.ok(factor >= 1, `dilution < 1 on ${family[0].label}: ${factor}`);
+  }
 });
