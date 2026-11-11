@@ -960,8 +960,8 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
   describe("BLO-51129: rows that need no action do not page", () => {
     afterEach(() => githubPrs.clear());
 
-    // Each test uses its own PR numbers: the probe cache lives for the life of
-    // the service instance, which this file shares across tests.
+    // Each test uses its own PR numbers. The verdict is stamped on the row
+    // (BLO-55751), so the per-test TRUNCATE clears it.
     async function seedPair(closedOrReviewed: { state: "open" | "closed"; merged: boolean; reviewedAtHead: boolean }, n: number) {
       const { agentId, companyId } = await seedCompanyAndAgent();
       const now = new Date();
@@ -1056,6 +1056,75 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       vi.mocked(githubGetPullRequestGate).mockClear();
       await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
       expect(vi.mocked(githubGetPullRequestGate).mock.calls.map(([input]) => input.prNumber)).not.toContain(7400);
+    });
+  });
+
+  describe("BLO-55751: the no-action verdict is fleet-wide, not per replica", () => {
+    afterEach(() => githubPrs.clear());
+
+    it("a second replica publishes the same age without probing GitHub again", async () => {
+      const replicaB = heartbeatService(db, { skipQueuedRunDispatch: true });
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      githubPrs.set("blockcast/onprem-k8s#7600", { state: "closed", merged: false, reviewedAtHead: false });
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: new Date(now.getTime() - 3_600_000),
+        taskKey: "pr_review:Blockcast/onprem-k8s:7600",
+        errorCode: "pr_review_output_missing",
+      });
+      vi.mocked(githubGetPullRequestGate).mockClear();
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+      expect(vi.mocked(githubGetPullRequestGate)).toHaveBeenCalledTimes(1);
+      // Replica B: GitHub now errors for this PR, as under rate-limit
+      // exhaustion. Before BLO-55751 B had its own empty cache and paged.
+      githubPrs.clear();
+      vi.mocked(githubGetPullRequestGate).mockClear();
+      __resetMetricsForTest();
+      await replicaB.publishAgentWakeupTerminalFailedGauge(new Date(now.getTime() + 1_000));
+      expect(vi.mocked(githubGetPullRequestGate)).not.toHaveBeenCalled();
+      expect(await gaugeTotal({ errorCode: "pr_review_output_missing", scope: "pr_review" })).toBe(0);
+      expect(await oldestAgeSeconds("pr_review")).toBeLessThan(1_800);
+    });
+
+    it("a positive verdict survives an erroring re-probe after the TTL", async () => {
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      githubPrs.set("blockcast/onprem-k8s#7601", { state: "open", merged: false, reviewedAtHead: true });
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: new Date(now.getTime() - 3_600_000),
+        taskKey: "pr_review:Blockcast/onprem-k8s:7601",
+        errorCode: "pr_review_output_missing",
+      });
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+      githubPrs.clear();
+      __resetMetricsForTest();
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(new Date(now.getTime() + 11 * 60_000));
+      expect(await gaugeTotal({ errorCode: "pr_review_output_missing", scope: "pr_review" })).toBe(0);
+    });
+
+    it("an errored probe is not retried by any replica until the TTL lapses", async () => {
+      const replicaB = heartbeatService(db, { skipQueuedRunDispatch: true });
+      const { agentId, companyId } = await seedCompanyAndAgent();
+      const now = new Date();
+      await seedFailedWake({
+        companyId,
+        agentId,
+        finishedAt: new Date(now.getTime() - 3_600_000),
+        taskKey: "pr_review:Blockcast/onprem-k8s:7602",
+        errorCode: "adapter_failed",
+      });
+      vi.mocked(githubGetPullRequestGate).mockClear();
+      await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
+      await replicaB.publishAgentWakeupTerminalFailedGauge(new Date(now.getTime() + 60_000));
+      expect(vi.mocked(githubGetPullRequestGate)).toHaveBeenCalledTimes(1);
+      // Still pages: an error resolves nothing.
+      expect(await gaugeTotal({ errorCode: "adapter_failed", scope: "pr_review" })).toBe(1);
+      await replicaB.publishAgentWakeupTerminalFailedGauge(new Date(now.getTime() + 11 * 60_000));
+      expect(vi.mocked(githubGetPullRequestGate)).toHaveBeenCalledTimes(2);
     });
   });
 

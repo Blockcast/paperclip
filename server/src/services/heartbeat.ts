@@ -47149,48 +47149,67 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    */
   const PR_REVIEW_NO_ACTION_PROBE_TTL_MS = 10 * 60 * 1000;
   const PR_REVIEW_NO_ACTION_PROBES_PER_TICK = 10;
-  const prReviewNoActionProbeCache = new Map<string, { checkedAt: number; noAction: boolean }>();
   let prReviewNoActionProbing = false;
 
-  async function selectNoActionPrReviewTaskKeys(cutoff: Date, now: Date): Promise<Set<string>> {
-    for (const [key, entry] of prReviewNoActionProbeCache) {
-      if (now.getTime() - entry.checkedAt >= PR_REVIEW_NO_ACTION_PROBE_TTL_MS) prReviewNoActionProbeCache.delete(key);
-    }
-    const taskKeyLower = sql<string | null>`lower(${agentWakeupRequests.payload} ->> 'taskKey')`;
-    const keys = await db
-      .select({ taskKey: taskKeyLower })
-      .from(agentWakeupRequests)
-      .where(
-        and(
-          eq(agentWakeupRequests.status, "failed"),
-          gte(agentWakeupRequests.finishedAt, cutoff),
-          sql`coalesce(${agentWakeupRequests.payload} ->> 'taskKey' like 'pr\\_review:%', false)`,
-          ...terminalFailedWakeSuccessorPredicates(cutoff),
-        ),
-      )
-      .groupBy(taskKeyLower)
-      .orderBy(sql`min(${agentWakeupRequests.finishedAt}) asc`);
-    const noAction = new Set<string>();
-    const mayProbe = !prReviewNoActionProbing;
-    if (mayProbe) prReviewNoActionProbing = true;
+  /**
+   * BLO-55751: the verdict lives on the failed wake row itself
+   * (`payload.prReviewNoActionProbe = {checkedAt, noAction}`), not in a
+   * per-process Map. The publisher runs on every worker replica, and a
+   * per-process cache made replicas publish different ages for the same row,
+   * so `max()` paged on whichever replica's probe had not landed. In the DB
+   * every replica reads the same verdict, and the `checkedAt` stamp is a
+   * fleet-wide claim, so one replica probes a key per TTL instead of each one.
+   * A positive verdict is sticky for the row's life in the 24h window; a new
+   * failure for the same PR is a new, unstamped row and is probed afresh.
+   */
+  const prReviewNoActionStamped = sql<boolean>`coalesce((${agentWakeupRequests.payload} #>> '{prReviewNoActionProbe,noAction}')::boolean, false)`;
+
+  async function probeNoActionPrReviewRows(cutoff: Date, now: Date): Promise<void> {
+    if (prReviewNoActionProbing) return;
+    prReviewNoActionProbing = true;
     try {
-      let probes = 0;
+      const taskKeyLower = sql<string | null>`lower(${agentWakeupRequests.payload} ->> 'taskKey')`;
+      const checkedAt = sql`(${agentWakeupRequests.payload} #>> '{prReviewNoActionProbe,checkedAt}')::timestamptz`;
+      const staleBefore = new Date(now.getTime() - PR_REVIEW_NO_ACTION_PROBE_TTL_MS).toISOString();
+      const probeable = and(
+        eq(agentWakeupRequests.status, "failed"),
+        gte(agentWakeupRequests.finishedAt, cutoff),
+        sql`coalesce(${agentWakeupRequests.payload} ->> 'taskKey' like 'pr\\_review:%', false)`,
+        ...terminalFailedWakeSuccessorPredicates(cutoff),
+        not(prReviewNoActionStamped),
+        sql`(${checkedAt} is null or ${checkedAt} < ${staleBefore}::timestamptz)`,
+      );
+      const stamp = (noAction: boolean) =>
+        sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) || jsonb_build_object('prReviewNoActionProbe', jsonb_build_object('checkedAt', ${now.toISOString()}::text, 'noAction', ${noAction}::boolean))`;
+      const keys = await db
+        .select({ taskKey: taskKeyLower })
+        .from(agentWakeupRequests)
+        .where(probeable)
+        .groupBy(taskKeyLower)
+        .orderBy(sql`min(${agentWakeupRequests.finishedAt}) asc`)
+        .limit(PR_REVIEW_NO_ACTION_PROBES_PER_TICK);
       for (const { taskKey } of keys) {
-        if (!taskKey) continue;
-        const cached = prReviewNoActionProbeCache.get(taskKey);
-        if (!cached) {
-          const pr = parsePrReviewTaskKey(taskKey);
-          if (!mayProbe || !pr || probes >= PR_REVIEW_NO_ACTION_PROBES_PER_TICK) continue;
-          probes += 1;
-          const verdict = await prReviewGateNoticeSuppression({ ...pr, sha: null });
-          prReviewNoActionProbeCache.set(taskKey, { checkedAt: now.getTime(), noAction: verdict !== null });
-        }
-        if (prReviewNoActionProbeCache.get(taskKey)?.noAction) noAction.add(taskKey);
+        const pr = parsePrReviewTaskKey(taskKey);
+        if (!pr) continue;
+        // Claim before probing: a sibling replica's tick now sees a fresh
+        // checkedAt and skips this key. An errored probe leaves noAction=false,
+        // so the failure direction is still "page".
+        const claimed = await db
+          .update(agentWakeupRequests)
+          .set({ payload: stamp(false) })
+          .where(and(probeable, sql`${taskKeyLower} = ${taskKey}`))
+          .returning({ id: agentWakeupRequests.id });
+        if (claimed.length === 0) continue;
+        const verdict = await prReviewGateNoticeSuppression({ ...pr, sha: null });
+        if (verdict === null) continue;
+        await db
+          .update(agentWakeupRequests)
+          .set({ payload: stamp(true) })
+          .where(inArray(agentWakeupRequests.id, claimed.map((row) => row.id)));
       }
     } finally {
-      if (mayProbe) prReviewNoActionProbing = false;
+      prReviewNoActionProbing = false;
     }
-    return noAction;
   }
 
   /**
@@ -47234,15 +47253,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function publishAgentWakeupTerminalFailedGauge(now: Date) {
     try {
       const cutoff = new Date(now.getTime() - TERMINAL_FAILED_WAKE_GAUGE_WINDOW_MS);
-      const noActionPrReviewTaskKeys = await selectNoActionPrReviewTaskKeys(cutoff, now);
-      // `coalesce(..., true)`: a null taskKey makes `not in` null, which would
-      // silently drop exactly the unmatchable rows this gauge must count.
-      const notNoActionPrReview = noActionPrReviewTaskKeys.size === 0
-        ? undefined
-        : sql`coalesce(lower(${agentWakeupRequests.payload} ->> 'taskKey') not in (${sql.join(
-          [...noActionPrReviewTaskKeys].map((key) => sql`${key}`),
-          sql`, `,
-        )}), true)`;
+      await probeNoActionPrReviewRows(cutoff, now);
+      const notNoActionPrReview = not(prReviewNoActionStamped);
       const wakeTaskKey = sql<string | null>`${agentWakeupRequests.payload} ->> 'taskKey'`;
       // Scope must be decided in SQL, not in JS, so that the per-scope `limit`
       // discards rows from the scope it is budgeting rather than from whichever
