@@ -86,6 +86,24 @@ function isApiPath(path: string): boolean {
  * one this counter exists to make visible, so a rising `0` rate is a signal in
  * its own right rather than noise to filter out.
  *
+ * ## The search/no-search split (PEN-3596)
+ *
+ * One route template can serve two query shapes with different costs, different
+ * causes and different fixes -- the issues list is the measured case, where
+ * `?q=` joins four `ILIKE` search arms and the plain shape has no `body`
+ * predicate at all. A refusal counted on the route label alone is therefore a
+ * MIXED population, and a condition written about only one of the shapes cannot
+ * be decided from it in either direction.
+ *
+ * `req.query.q` is read at record time and reduced to a bounded `variant` label
+ * on the transient-database subset only. It has to be read HERE rather than at
+ * the error handler, which is where the refusal is classified: by the time an
+ * error unwinds there Express has restored `req.baseUrl`, and the whole seam
+ * below exists because the label set must be the one captured on the request.
+ *
+ * ⛔ The query VALUE never becomes a label. It is user text -- unbounded
+ * cardinality and a privacy leak in one. Only "was it a non-empty string".
+ *
  * ## Why the duration is only reported for completed responses (PEN-5136)
  *
  * The same `record()` latch feeds `paperclip_http_request_duration_seconds`,
@@ -250,6 +268,12 @@ export function httpMetricsMiddleware(): RequestHandler {
           status: res.writableFinished ? res.statusCode : null,
           emptyList,
           transientDb: instrumentable[TRANSIENT_DB] ?? null,
+          // Read here rather than at the error handler for the same reason the
+          // route label is: this is a property of the REQUEST, and `req.query`
+          // is still the parsed query object at finish-or-close on every path.
+          // Only the derived boolean becomes a label -- see
+          // `normalizeHttpQueryVariant`.
+          searchQuery: (req.query as Record<string, unknown> | undefined)?.q,
           // Only a completed response carries an honest elapsed time; see the
           // block comment above.
           durationSeconds: res.writableFinished

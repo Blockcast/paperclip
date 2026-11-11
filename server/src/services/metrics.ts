@@ -200,6 +200,36 @@ export const HTTP_EMPTY_LIST_RESPONSES_METRIC = "paperclip_http_empty_list_respo
  * {@link TRANSIENT_DB_SQLSTATES} plus an `other` bucket, so the subset adds at
  * most a handful of series per route that actually refuses — and none at all
  * for a route that never does, because nothing is zero-initialized here.
+ * `variant` is the two values of {@link normalizeHttpQueryVariant}, and it
+ * multiplies only the routes that actually refuse in BOTH shapes.
+ *
+ * ## ⚠️ `variant` changes series identity: aggregate, do not select
+ *
+ * A reading taken before this label shipped selected one series per pod for a
+ * route; it now selects one PER VARIANT. No recorded total changes and nothing
+ * is lost, but a bare instant selection returns more rows than it used to, so a
+ * reader who takes the first row — or who eyeballs a single number — now
+ * undercounts. Use `sum by (variant) (...)` for the split this label exists
+ * for, or `sum without (variant) (...)` to reproduce the pre-label total
+ * exactly.
+ *
+ * ## What `variant` does and does not license
+ *
+ * It makes the search/no-search split RETROACTIVE and GUARANTEED from its own
+ * deploy forward, which the previous method — reading the `STATEMENT:` record
+ * out of the database pod's log — was neither. That log is `tail`-only and
+ * shares a rotation budget with every other statement, so its reach-back is a
+ * function of unrelated load: measured between ~3 minutes and ~5 hours on the
+ * same instrument within three days (PEN-3596, sixth and tenth limits). An
+ * instrument that is sometimes lucky can prove a class of event DID occur and
+ * can never prove that none did, because "none fired" and "I could not see the
+ * ones that did" read identically.
+ *
+ * It does NOT make an absent series mean "no timeouts". Nothing is
+ * zero-initialized, so a route that has never refused in the search shape has
+ * no `variant="search"` series at all, and that absence means "none recorded
+ * since this process started". Read it with the `increase()` caveat below and
+ * against a known-positive control from the same scrape.
  *
  * ## ⛔ How to read it: `increase()` and `rate()` CANNOT see a series' first event
  *
@@ -5018,6 +5048,63 @@ export function normalizeHttpTransientDbSqlstate(sqlstate: string | null | undef
 }
 
 /**
+ * Label values for the search/no-search split on a transient-database refusal
+ * (PEN-3596).
+ *
+ * The issues-list route serves two query shapes under one route template, and
+ * they have different causes and different fixes. The `?q=` shape joins four
+ * `ILIKE` search arms; the plain shape has no `body` predicate at all and no
+ * trigram index is reachable by it. Done-when 2 on PEN-3596 names only the
+ * first of them, so a count on the route label alone answers a MIXED
+ * population and cannot decide the row in either direction.
+ *
+ * Until this label existed the split was recoverable only by reading the
+ * `STATEMENT:` record out of `paperclip-pg-0`'s log, which is a `tail`-only
+ * interface sharing a rotation budget with whatever else is logging. That
+ * worked when the log happened to be quiet and reached nothing older than its
+ * tail when it was not -- measured reach-back has ranged from ~3 minutes to
+ * ~5 hours on the same instrument, purely with unrelated load. An instrument
+ * that is sometimes lucky can establish that a class of event DID fire; it can
+ * never establish that none did, because "none fired" and "I could not see the
+ * ones that did" are the same reading. Done-when 2's acceptance condition is an
+ * absence, so it is unfalsifiable from the log and decidable from this label.
+ */
+export const HTTP_QUERY_VARIANT_SEARCH = "search";
+export const HTTP_QUERY_VARIANT_NO_SEARCH = "no_search";
+
+/**
+ * Classify a request by whether it carried a non-empty `q`, bounded to the two
+ * values above.
+ *
+ * ## This is the query builder's own predicate, not a proxy for it
+ *
+ * `listIssues` gates its search arms on exactly
+ *
+ *     const rawSearch = filters?.q?.trim() ?? "";
+ *     const hasSearch = rawSearch.length > 0;
+ *
+ * (`services/issues.ts`), so the test here is written to be the same test
+ * rather than one that merely correlates with it. A whitespace-only `?q=%20`
+ * therefore reports `no_search`, which is correct and is NOT an edge case
+ * swept aside: that request runs the plain shape, so counting it as a search
+ * would attribute a plain-shape timeout to the search population.
+ *
+ * ## Why a non-string `q` is `no_search` rather than a third bucket
+ *
+ * Express parses `?q=a&q=b` into an array and `?q[x]=1` into an object. Both
+ * reach `filters.q.trim`, which is not a function on either, so such a request
+ * throws before any query runs and can never produce a transient-database
+ * refusal to label. The value is unreachable through the counter's only live
+ * path rather than wrong on it -- stated because "this cannot happen" and "I
+ * did not handle this" are indistinguishable in code.
+ */
+export function normalizeHttpQueryVariant(value: unknown): string {
+  return typeof value === "string" && value.trim().length > 0
+    ? HTTP_QUERY_VARIANT_SEARCH
+    : HTTP_QUERY_VARIANT_NO_SEARCH;
+}
+
+/**
  * Normalize a route label, enforcing the cardinality cap.
  *
  * The input is expected to be an Express route *template*
@@ -6198,7 +6285,9 @@ let runDispatchWait: Histogram | null = null;
 let authRequest: Counter<"operation" | "outcome"> | null = null;
 let httpRequests: Counter<"route" | "method" | "status"> | null = null;
 let httpEmptyListResponses: Counter<"route" | "method" | "status"> | null = null;
-let httpTransientDbResponses: Counter<"route" | "method" | "status" | "code" | "sqlstate"> | null = null;
+let httpTransientDbResponses:
+  | Counter<"route" | "method" | "status" | "code" | "sqlstate" | "variant">
+  | null = null;
 let httpRequestDuration: Histogram<"route" | "method"> | null = null;
 let gbrainRecallTotal: Counter<"status"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
@@ -6381,7 +6470,9 @@ function ensureRegistry(): {
   authRequestCounter: Counter<"operation" | "outcome">;
   httpRequestsCounter: Counter<"route" | "method" | "status">;
   httpEmptyListResponsesCounter: Counter<"route" | "method" | "status">;
-  httpTransientDbResponsesCounter: Counter<"route" | "method" | "status" | "code" | "sqlstate">;
+  httpTransientDbResponsesCounter: Counter<
+    "route" | "method" | "status" | "code" | "sqlstate" | "variant"
+  >;
   httpRequestDurationHistogram: Histogram<"route" | "method">;
   gbrainRecallCounter: Counter<"status">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
@@ -8981,9 +9072,20 @@ function ensureRegistry(): {
         + "series means no refusal was ever recorded, not that the counter is missing. "
         + `The "${HTTP_TRANSIENT_DB_SQLSTATE_OTHER}" sqlstate is a cardinality guard, NOT `
         + "a drift detector: the only caller is gated on the same set the label is bounded "
-        + "to, so no live path can emit it and its absence is evidence of nothing. No "
-        + "user, company, agent, query string, or statement text is exposed.",
-      labelNames: ["route", "method", "status", "code", "sqlstate"],
+        + "to, so no live path can emit it and its absence is evidence of nothing. "
+        + `The variant label splits one route template's two query shapes: "`
+        + `${HTTP_QUERY_VARIANT_SEARCH}" is a request carrying a non-empty q, "`
+        + `${HTTP_QUERY_VARIANT_NO_SEARCH}" is one that is not, which on the issues-list `
+        + "route is the difference between the ILIKE search arms and a plan with no body "
+        + "predicate at all -- different causes, different fixes, and before this they "
+        + "shared one route label with no way to tell them apart after the fact. It is "
+        + "the query builder's own hasSearch predicate, not a proxy for it. ONLY THE "
+        + "RAW BOOLEAN IS EXPOSED: the q value itself is never a label. Note for anyone "
+        + "carrying forward a reading taken before this label shipped -- a bare instant "
+        + "selection on route now returns one series PER VARIANT where it returned one, "
+        + "so aggregate (sum by (variant), or sum without (variant) for the old total). "
+        + "No user, company, agent, query string, or statement text is exposed.",
+      labelNames: ["route", "method", "status", "code", "sqlstate", "variant"],
       registers: [registry],
     });
     httpRequestDuration = new Histogram({
@@ -12587,6 +12689,27 @@ export function recordHttpRequest(input: {
    */
   transientDb?: { code: string | null | undefined; sqlstate: string | null | undefined } | null;
   /**
+   * The raw `req.query.q` of this request, used ONLY to derive the bounded
+   * `variant` label on the transient-database subset (PEN-3596). Passed raw
+   * and normalized here rather than at the middleware so the counter and its
+   * tests share one definition of the split; see
+   * {@link normalizeHttpQueryVariant} for why that definition is the query
+   * builder's own predicate.
+   *
+   * ⛔ The VALUE is never exposed as a label -- only whether it was a
+   * non-empty string. A search term is user text and would be unbounded
+   * cardinality and a privacy leak at once.
+   *
+   * Deliberately NOT applied to {@link HTTP_REQUESTS_METRIC}: that counter is
+   * the largest family in the process, and the question this label exists to
+   * answer (did a SEARCH-shape request time out) is an absolute count, not a
+   * rate, so it needs no per-variant denominator. The consequence is worth
+   * stating plainly rather than discovering later -- after this you can count
+   * search-shape refusals exactly and you still cannot divide them by
+   * search-shape requests.
+   */
+  searchQuery?: unknown;
+  /**
    * Server-side elapsed seconds, supplied ONLY for a response that actually
    * completed (PEN-5136). Threaded through this recorder rather than observed
    * at the middleware so the histogram is guaranteed the SAME normalized route
@@ -12601,7 +12724,7 @@ export function recordHttpRequest(input: {
   route: string;
   method: string;
   status: string;
-  transientDb: { code: string; sqlstate: string } | null;
+  transientDb: { code: string; sqlstate: string; variant: string } | null;
   durationSeconds: number | null;
 } {
   const labels = {
@@ -12614,11 +12737,17 @@ export function recordHttpRequest(input: {
   if (input.emptyList) {
     registered.httpEmptyListResponsesCounter.inc(labels);
   }
-  let transientDb: { code: string; sqlstate: string } | null = null;
+  let transientDb: { code: string; sqlstate: string; variant: string } | null = null;
   if (input.transientDb) {
     transientDb = {
       code: normalizeHttpTransientDbCode(input.transientDb.code),
       sqlstate: normalizeHttpTransientDbSqlstate(input.transientDb.sqlstate),
+      // Normalized unconditionally rather than only when a `q` was supplied:
+      // `no_search` is a positive claim about the request, not a default for
+      // "the caller did not tell me". A caller that omits this argument is
+      // therefore recorded as `no_search`, which is right for every route that
+      // has no search shape and is the reason the middleware always passes it.
+      variant: normalizeHttpQueryVariant(input.searchQuery),
     };
     // `labels.status`, not a literal "503": an abandoned refusal records "0"
     // on the parent, and reusing the same value is what keeps this a strict
