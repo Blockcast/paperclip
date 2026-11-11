@@ -65,6 +65,13 @@
 import { writeFileSync } from 'node:fs';
 import { ghFetch } from './get-bot-token.mjs';
 
+// The shared App installation's core bucket hits 0 late in most hourly windows,
+// and the default 120s retry budget then reports UNREADABLE (a critical page)
+// although the reset is minutes away (BLO-55341). A primary-limit reset is at
+// most an hour out, so wait it out: a scheduled guard has no caller waiting.
+// Keep the workflow's timeout-minutes above this.
+export const ENV_READ_RETRY_BUDGET_MS = 65 * 60_000;
+
 /**
  * The ratified reviewer set. EMPTY since Blockcast/onprem-k8s#4913 (2026-10-07)
  * removed the reviewer gate by owner decision — see the header.
@@ -233,9 +240,9 @@ export function evaluateEnvironmentProtection(env, options = {}) {
   };
 }
 
-export async function fetchEnvironment(fetchFn, token, repo, environmentName) {
+export async function fetchEnvironment(fetchFn, token, repo, environmentName, options) {
   try {
-    return await fetchFn(`/repos/${repo}/environments/${environmentName}`, token);
+    return await fetchFn(`/repos/${repo}/environments/${environmentName}`, token, options);
   } catch (err) {
     throw new Error(
       `Could not read environment '${environmentName}' on ${repo}: ${err.message}`,
@@ -284,7 +291,9 @@ async function main() {
 
   let env;
   try {
-    env = await fetchEnvironment(ghFetch, token, repo, environmentName);
+    env = await fetchEnvironment(ghFetch, token, repo, environmentName, {
+      retryBudgetMs: ENV_READ_RETRY_BUDGET_MS,
+    });
   } catch (err) {
     console.error(`UNREADABLE: ${err.message}`);
     writeSummary({ status: 'unreadable', repo, environment: environmentName, reason: err.message });

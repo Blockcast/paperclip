@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import {
+  ENV_READ_RETRY_BUDGET_MS,
   RATIFIED_REVIEWERS,
   evaluateEnvironmentProtection,
   fetchEnvironment,
@@ -396,6 +398,29 @@ test('fetchEnvironment: passes through the environment path, repo, and token', a
   assert.deepEqual(calls, [
     { path: '/repos/Blockcast/paperclip/environments/paperclip-production', token: 'tok' },
   ]);
+});
+
+test('fetchEnvironment: forwards the retry budget so a late-window rate limit is waited out (BLO-55341)', async () => {
+  let seen;
+  const fakeFetch = async (_path, _token, options) => {
+    seen = options;
+    return COMPLIANT_ENV;
+  };
+  await fetchEnvironment(fakeFetch, 'tok', 'Blockcast/paperclip', 'paperclip-production', {
+    retryBudgetMs: ENV_READ_RETRY_BUDGET_MS,
+  });
+  assert.equal(seen.retryBudgetMs, ENV_READ_RETRY_BUDGET_MS);
+  // A primary-limit reset is at most an hour out.
+  assert.ok(ENV_READ_RETRY_BUDGET_MS >= 60 * 60_000);
+});
+
+test('guard workflow timeout outlasts the environment-read retry budget', () => {
+  const wf = readFileSync(
+    new URL('../../workflows/production-environment-protection-guard.yml', import.meta.url),
+    'utf8',
+  );
+  const minutes = Number(wf.match(/timeout-minutes:\s*(\d+)/)[1]);
+  assert.ok(minutes * 60_000 > ENV_READ_RETRY_BUDGET_MS, `timeout-minutes ${minutes} must exceed the retry budget`);
 });
 
 test('fetchEnvironment: wraps a 403/network failure in a distinguishable error rather than swallowing it', async () => {

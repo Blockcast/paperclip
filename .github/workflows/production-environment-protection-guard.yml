@@ -25,7 +25,8 @@ permissions:
 jobs:
   guard:
     runs-on: arc-paperclip-light
-    timeout-minutes: 10
+    # Above ENV_READ_RETRY_BUDGET_MS (65 min): the read waits out a rate-limit reset (BLO-55341).
+    timeout-minutes: 75
     steps:
       - name: Checkout repository
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
