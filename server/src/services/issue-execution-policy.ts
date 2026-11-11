@@ -1549,9 +1549,20 @@ function applyMonitorTransition(
     stagePatch.executionState !== undefined
       ? parseIssueExecutionState(stagePatch.executionState)
       : existingState;
-  const invalidReason = input.policy?.monitor
-    ? monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId)
-    : null;
+  // PEN-6202: the ineligibility verdict for the shape this write is about to
+  // produce. Computed UNCONDITIONALLY, because the `else if` chain below has to
+  // see it for a monitor that has already FIRED: `buildIssueMonitorTriggeredPatch`
+  // strips `monitor` out of `executionPolicy` at trigger time, so on those rows
+  // `input.policy?.monitor` is absent and every gate keyed on it reads a field
+  // that is gone.
+  //
+  // `invalidReason` KEEPS its own `input.policy?.monitor` gate, so the arm that
+  // throws `MONITOR_INVALID_MESSAGE` is byte-identical. That arm is reachable
+  // only with a live `policy.monitor`, which a fired monitor by construction
+  // does not have, so this widening cannot make the public API throw on any
+  // input that succeeds today.
+  const ineligibleReason = monitorClearReasonForIssue(nextStatus, assigneeAgentId, assigneeUserId);
+  const invalidReason = input.policy?.monitor ? ineligibleReason : null;
 
   let targetMonitorState = currentMonitorState;
   const resetConvergenceAfterStalledClear = Boolean(
@@ -1728,7 +1739,39 @@ function applyMonitorTransition(
     // `triggered` state that `tickExpiredIssueMonitors` needs to run the
     // monitor's `recoveryPolicy`, trading a visible no-op for a silent
     // cancellation. Only a caller who explicitly wrote the monitor clears it.
-    (input.monitorExplicitlyUpdated && currentMonitorState && currentMonitorState.status !== "cleared")
+    (input.monitorExplicitlyUpdated && currentMonitorState && currentMonitorState.status !== "cleared") ||
+    // PEN-6202 — the service-layer twin of `buildIssueMonitorEligibilityPatch`.
+    //
+    // A monitor that has FIRED survives only in `executionState`, so neither
+    // disjunct above sees it on an ordinary transition: `previousPolicy.monitor`
+    // was stripped at trigger time, and `monitorExplicitlyUpdated` is false for a
+    // write that merely moves status or assignee. A `PATCH /api/issues/:id` that
+    // demotes such a row out of `in_progress`/`in_review` — or drops its agent
+    // assignee — therefore left the monitor `triggered` forever:
+    // `tickExpiredIssueMonitors` is the only net that clears a fired monitor and
+    // its outer `where` carries exactly the eligibility the row has just LOST, so
+    // the two nets handed the case to each other. Measured on 5,615 company rows
+    // 2026-11-08: 19 non-terminal rows held a permanently unclearable `triggered`
+    // monitor, 3 of them for 91-106 days, every one watching a pull request that
+    // had already merged.
+    //
+    // BLO-28900 fixed this for the raw set-based writes (checkout-restore,
+    // release) via `buildIssueMonitorEligibilityPatch`; PEN-6202 extended that
+    // helper to fired monitors. This is the same reconciliation for writes routed
+    // through `issuesSvc.update`, which that helper does not reach.
+    //
+    // Narrow on PURPOSE, and the narrowness is what keeps the existing guard
+    // above intact: this fires ONLY when the resulting shape is INELIGIBLE. On a
+    // row that stays eligible `ineligibleReason` is null and a `triggered`
+    // monitor is left exactly as it is, so an incidental carry-forward transition
+    // still cannot cancel the `recoveryPolicy` that `tickExpiredIssueMonitors`
+    // owes it. This fires at the instant the row leaves eligibility — the instant
+    // that sweep loses reach — and never before.
+    //
+    // Like its raw-write sibling this CLEARS but does not WAKE; the recovery wake
+    // stays with `tickExpiredIssueMonitors`. See PEN-6202 for the part that is
+    // deliberately still open.
+    (currentMonitorState?.status === "triggered" && ineligibleReason !== null)
   ) {
     clearArmedMonitorColumns(patch);
     targetMonitorState = buildClearedMonitorState({

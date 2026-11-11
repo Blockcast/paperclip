@@ -54,19 +54,32 @@ const triggeredIssue = () => ({
   monitorScheduledBy: "assignee",
 });
 
-const transition = (policy: unknown, monitorExplicitlyUpdated: boolean) =>
+type MonitorPatch = {
+  executionState?: { monitor?: { status?: string; notes?: string; clearReason?: string } };
+  monitorNotes?: unknown;
+  monitorNextCheckAt?: unknown;
+};
+
+const transitionWith = (
+  policy: unknown,
+  monitorExplicitlyUpdated: boolean,
+  move: {
+    requestedStatus?: string;
+    requestedAssigneePatch?: { assigneeAgentId?: string | null; assigneeUserId?: string | null };
+  } = {},
+) =>
   applyIssueExecutionPolicyTransition({
     issue: triggeredIssue(),
     policy: normalizeIssueExecutionPolicy(policy as never),
-    requestedAssigneePatch: {},
+    requestedAssigneePatch: move.requestedAssigneePatch ?? {},
+    ...(move.requestedStatus === undefined ? {} : { requestedStatus: move.requestedStatus }),
     actor: { agentId },
     unresolvedBlockerIssueIds: [],
     monitorExplicitlyUpdated,
-  }).patch as {
-    executionState?: { monitor?: { status?: string; notes?: string; clearReason?: string } };
-    monitorNotes?: unknown;
-    monitorNextCheckAt?: unknown;
-  };
+  }).patch as MonitorPatch;
+
+const transition = (policy: unknown, monitorExplicitlyUpdated: boolean) =>
+  transitionWith(policy, monitorExplicitlyUpdated);
 
 describe("BLO-27586 AC1 — clearing a `triggered` monitor", () => {
   it("clears the monitor and drops the stale notes", () => {
@@ -131,5 +144,97 @@ describe("BLO-27586 AC1 — clearing a `triggered` monitor", () => {
     });
     expect(patch).not.toHaveProperty("monitorNotes");
     expect(patch).not.toHaveProperty("monitorNextCheckAt");
+  });
+});
+
+/**
+ * PEN-6202 — the SERVICE-LAYER twin of `buildIssueMonitorEligibilityPatch`.
+ *
+ * The block above pins what a monitor write does to a FIRED monitor. This one
+ * pins what an ORDINARY write does — one that moves status or assignee and
+ * never mentions the monitor at all.
+ *
+ * Before the fix, `applyMonitorTransition` reached its clear only via
+ * `previousPolicy.monitor` (stripped at trigger time) or
+ * `monitorExplicitlyUpdated` (false here), so a `PATCH /api/issues/:id` that
+ * demoted such a row out of `in_progress`/`in_review` left the monitor
+ * `triggered` FOREVER: `tickExpiredIssueMonitors` is the only net that clears a
+ * fired monitor and its outer `where` carries exactly the eligibility the row
+ * had just lost.
+ *
+ * Measured across all 5,615 company rows on 2026-11-08: 19 non-terminal rows
+ * held a permanently unclearable `triggered` monitor, 3 of them for 91-106 days,
+ * every one watching a pull request that had already merged. The sharpest wrote
+ * its final note seven minutes AFTER the merge it was reporting as still open.
+ */
+describe("PEN-6202 — an ordinary write that makes the row INELIGIBLE", () => {
+  it("clears a fired monitor when the row is demoted out of the monitor window", () => {
+    // The demotion a checkout release performs through the service layer. The
+    // monitor is never mentioned: `monitorExplicitlyUpdated` is false and the
+    // requested policy is empty.
+    const patch = transitionWith({}, false, { requestedStatus: "todo" });
+
+    expect(patch.executionState?.monitor).toMatchObject({
+      status: "cleared",
+      // NOT "manual" — the reason has to name what actually retired it, because
+      // this row's attribution ledger reads `clearReason` to tell a scheduler
+      // clear from an assignee's deliberate one.
+      clearReason: "invalid_status",
+    });
+    expect(patch.monitorNextCheckAt).toBeNull();
+  });
+
+  it("clears a fired monitor when the row loses its agent assignee", () => {
+    // The OTHER axis of ineligibility, and the one that stranded the single row
+    // outside every agent intake surface (PEN-2077: `in_review`, human-held,
+    // 91 days on a gate that had been satisfied the whole time). A fix keyed on
+    // status alone does not reach it.
+    const patch = transitionWith({}, false, {
+      requestedAssigneePatch: { assigneeAgentId: null, assigneeUserId: null },
+    });
+
+    expect(patch.executionState?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "invalid_assignee",
+    });
+  });
+
+  it("MUST NOT fire while the row is still ELIGIBLE — the recovery wake is not ours to cancel", () => {
+    // The discrimination control, and the constraint that makes the fix safe.
+    // `in_progress` -> `in_review` keeps the row inside the monitor window, so
+    // `tickExpiredIssueMonitors` can still reach it and still owes it the
+    // monitor's `recoveryPolicy`. Clearing here would trade a visible no-op for
+    // a silent cancellation — strictly worse than the defect.
+    //
+    // Without this case the two above are satisfied by a transition that clears
+    // UNCONDITIONALLY, which is the naive fix the comment at the call site
+    // rejects.
+    const patch = transitionWith({}, false, { requestedStatus: "in_review" });
+
+    expect(patch.executionState?.monitor).toMatchObject({
+      status: "triggered",
+      clearReason: null,
+      notes: "Awaiting CI + Copilot review on head b231d2d2d",
+    });
+  });
+
+  it("MUST NOT change when `MONITOR_INVALID_MESSAGE` throws — the 422 arm is untouched", () => {
+    // The widened `ineligibleReason` is computed unconditionally, but
+    // `invalidReason` keeps its own `policy.monitor` gate, so the throwing arm
+    // is reachable only with a LIVE `policy.monitor`. A fired monitor has none
+    // by construction, so an ineligible demotion that carries no monitor must
+    // still return a patch rather than a 422.
+    expect(() => transitionWith({}, false, { requestedStatus: "done" })).not.toThrow();
+
+    // ...while an EXPLICIT arm against an ineligible row still throws, exactly
+    // as it did before. (`maxAttempts: 5` keeps the bounds arm out of the way,
+    // so this asserts the invalid-status arm and not the exhausted one.)
+    expect(() =>
+      transitionWith(
+        { monitor: { nextCheckAt: "2026-12-01T00:00:00.000Z", scheduledBy: "assignee", maxAttempts: 5 } },
+        true,
+        { requestedStatus: "todo" },
+      ),
+    ).toThrowError(/monitor/i);
   });
 });
