@@ -4422,6 +4422,15 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // It must route, not only forbid -- otherwise the reader is told their
     // default is wrong and given nowhere to put the constraint.
     expect(markdown).toContain("APPEND below the marker instead");
+
+    // Round 4 (Ally @ `3538a739`): inserting the paragraph above moved the antecedent of
+    // the sentence after it. "Where it does not" used to follow "Where the body carries a
+    // preserved region, write there" directly; with the inversion between them the nearest
+    // referent became "a COMMENT", so the fallback read as "where a comment does not
+    // survive, put it in a comment". Both arms are asserted because the broken form is
+    // grammatical: a presence-only check on the fallback passes straight over it.
+    expect(markdown).toContain("Where the body carries NO preserved region");
+    expect(markdown).not.toContain("Where it does not, record the constraint");
   });
 
   // The two ways the row-axis rule ends with no row to write on. They are different
