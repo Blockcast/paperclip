@@ -8220,6 +8220,41 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     ]));
   }, 20_000);
 
+  // BLO-55723: the recorded branch was deleted (closed PR) while the worktree sat
+  // dirty on another branch; the repair used to refuse forever.
+  it("quarantines dirty work and recreates the recorded branch when it no longer exists", async () => {
+    const expectedBranch = "PAP-460-recorded-missing";
+    const actualBranch = "PAP-460-live";
+    const { repoRoot, worktreePath, actualBranchHead } = await createDirtyMismatchRepo({
+      expectedBranch,
+      actualBranch,
+    });
+    await runGit(repoRoot, ["branch", "-D", expectedBranch]);
+    const baseHead = await readGit(repoRoot, ["rev-parse", "HEAD"]);
+    const ids = await seedDirtyQuarantineRecords({
+      repoRoot,
+      worktreePath,
+      expectedBranch,
+      actualBranch,
+      sourceIdentifier: "PAP-460",
+      claimant: "none",
+    });
+
+    const restored = await restoreDirtyQuarantine({ repoRoot, worktreePath, expectedBranch, actualBranch, ids });
+
+    expect(restored?.branchName).toBe(expectedBranch);
+    const warning = restored?.warnings.find((entry) => entry.includes("dirty worktree state was quarantined"));
+    expect(warning).toContain("did not exist, so it was recreated from");
+    const rescueBranch = warning?.match(/"([^"]+)"/)?.[1] ?? "";
+    expect(rescueBranch).toMatch(/^paperclip\/rescue\/PAP-460\/\d{8}T\d{6}Z$/);
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["rev-parse", "HEAD"])).resolves.toBe(baseHead);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
+    await expect(readGit(repoRoot, ["rev-parse", actualBranch])).resolves.toBe(actualBranchHead);
+    await expect(readGit(repoRoot, ["show", `${rescueBranch}:untracked.txt`])).resolves.toBe("dirty untracked work");
+    await expect(readGit(repoRoot, ["show", `${rescueBranch}:README.md`])).resolves.toContain("dirty tracked work");
+  }, 20_000);
+
   it("quarantines a worktree wedged mid-rebase and clears the interrupted rebase state", async () => {
     const expectedBranch = "PAP-456-recorded";
     const repoRoot = await createTempRepo("master");

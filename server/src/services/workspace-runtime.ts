@@ -2759,6 +2759,7 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
   evidence: GitWorktreeBranchIncoherenceEvidence;
   phase?: "worktree_prepare" | "workspace_finalize";
   recorder?: WorkspaceOperationRecorder | null;
+  recreateExpectedBranch?: { baseRef: string; sha: string } | null;
 }): Promise<DirtyQuarantineRepairResult> {
   const companyId = await readIssueCompanyId(input.db, input.evidence.sourceIssueId);
   if (!companyId) {
@@ -2842,13 +2843,19 @@ async function quarantineDirtyWorktreeBranchIncoherence(input: {
     const rescueCommitSha = await runGit(["rev-parse", "HEAD"], input.worktreePath);
     await recordGitOperation(input.recorder, {
       phase: input.phase ?? "worktree_prepare",
-      args: ["checkout", input.expectedBranchName],
+      // `-b` (not `-B`) so a branch that appeared since inspection is never overwritten.
+      args: input.recreateExpectedBranch
+        ? ["checkout", "-b", input.expectedBranchName, input.recreateExpectedBranch.sha]
+        : ["checkout", input.expectedBranchName],
       cwd: input.worktreePath,
       metadata: {
         ...baseMetadata,
         rescueCommitSha,
+        recreatedExpectedBranchFrom: input.recreateExpectedBranch ?? null,
       },
-      successMessage: `Restored recorded branch ${input.expectedBranchName} after dirty workspace rescue ${rescueBranch}\n`,
+      successMessage: input.recreateExpectedBranch
+        ? `Recreated missing recorded branch ${input.expectedBranchName} from ${input.recreateExpectedBranch.baseRef} after dirty workspace rescue ${rescueBranch}\n`
+        : `Restored recorded branch ${input.expectedBranchName} after dirty workspace rescue ${rescueBranch}\n`,
       failureLabel: `git checkout ${input.expectedBranchName}`,
     });
     expectedBranchRestored = true;
@@ -3119,6 +3126,8 @@ export async function ensureGitWorktreeBranchCoherent(input: {
   persistForwardReconcile?: boolean;
   reconcileOperationPhase?: "worktree_prepare" | "workspace_finalize";
   recorder?: WorkspaceOperationRecorder | null;
+  /** Base to recreate a missing recorded branch from during dirty quarantine; defaults to the repo's default branch. */
+  baseRef?: string | null;
 }): Promise<GitWorktreeBranchCoherenceResult> {
   const expectedBranchName = input.expectedBranchName?.trim();
   if (!expectedBranchName) return { branchName: null, reconciledForward: false, warnings: [] };
@@ -3182,10 +3191,6 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       evidence.safeRepair.reason = "dirty quarantine repair requires a registered git worktree path";
       throw branchIncoherenceValidationFailure(evidence);
     }
-    if (!evidence.provenance.expectedBranchExists) {
-      evidence.safeRepair.reason = "dirty quarantine repair requires the recorded branch to exist";
-      throw branchIncoherenceValidationFailure(evidence);
-    }
     if (evidence.contention) {
       evidence.safeRepair.eligible = false;
       evidence.safeRepair.reason = formatDirtyQuarantineContentionRefusal(evidence.contention);
@@ -3196,6 +3201,20 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       executionWorkspaceId: input.executionWorkspaceId ?? null,
       evidence,
     });
+    // BLO-55723: a recorded branch that no longer exists (deleted, or never
+    // pushed) used to refuse forever. The rescue commit does not need it, so
+    // quarantine anyway and recreate the recorded branch from the base ref.
+    let recreateExpectedBranch: { baseRef: string; sha: string } | null = null;
+    if (!evidence.provenance.expectedBranchExists) {
+      const { baseRef } = await resolveAuthoritativeBaseRef(input.repoRoot, input.baseRef ?? null);
+      const sha = await resolveBaseRefSha(input.repoRoot, baseRef);
+      if (!sha) {
+        evidence.safeRepair.reason =
+          `dirty quarantine repair requires the recorded branch to exist, or base ref "${baseRef}" to resolve so it can be recreated`;
+        throw branchIncoherenceValidationFailure(evidence);
+      }
+      recreateExpectedBranch = { baseRef, sha };
+    }
     evidence.safeRepair.eligible = true;
     evidence.safeRepair.attempted = true;
     evidence.safeRepair.reason = "dirty worktree can be quarantined on a rescue branch before restoring the recorded branch";
@@ -3210,6 +3229,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       evidence,
       phase: input.reconcileOperationPhase,
       recorder: input.recorder ?? null,
+      recreateExpectedBranch,
     });
     evidence.safeRepair.succeeded = true;
     evidence.safeRepair.reason = result.clearedInProgressOperation
@@ -3220,7 +3240,7 @@ export async function ensureGitWorktreeBranchCoherent(input: {
       reconciledForward: false,
       dirtyQuarantineRepair: result,
       warnings: [
-        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}${result.quarantinedIndexLockPath ? ` An abandoned 0-byte git index lock was broken first; no process visible to this pod held it open, and it was preserved at "${result.quarantinedIndexLockPath}".` : ""}`,
+        `Execution workspace dirty worktree state was quarantined on rescue branch "${result.rescueBranch}" (${formatShortSha(result.rescueCommitSha)}; ${result.fileCount} ${result.fileCount === 1 ? "file" : "files"}) before restoring recorded branch "${expectedBranchName}".${recreateExpectedBranch ? ` The recorded branch did not exist, so it was recreated from ${recreateExpectedBranch.baseRef} (${formatShortSha(recreateExpectedBranch.sha)}).` : ""}${result.clearedInProgressOperation ? ` An interrupted git ${GIT_IN_PROGRESS_OPERATION_LABELS[result.clearedInProgressOperation]} was also cleared; its in-flight state is preserved on the rescue branch.` : ""}${result.quarantinedIndexLockPath ? ` An abandoned 0-byte git index lock was broken first; no process visible to this pod held it open, and it was preserved at "${result.quarantinedIndexLockPath}".` : ""}`,
       ],
     };
   }
@@ -5498,6 +5518,7 @@ export async function realizeExecutionWorkspace(input: {
         enableWorkspaceDirtyQuarantineRepair: input.enableWorkspaceDirtyQuarantineRepair === true,
         reconcileOperationPhase: "worktree_prepare",
         recorder: input.recorder ?? null,
+        baseRef,
       });
       const effectiveBranchName = coherence.branchName ?? branchName;
       if (coherence.reconciledForward) {
@@ -5761,6 +5782,7 @@ export async function ensurePersistedExecutionWorkspaceAvailable(input: {
         persistForwardReconcile: false,
         reconcileOperationPhase: "worktree_prepare",
         recorder: input.recorder ?? null,
+        baseRef: reuseBaseRef,
       });
       if (coherence.branchName) {
         realized.branchName = coherence.branchName;
