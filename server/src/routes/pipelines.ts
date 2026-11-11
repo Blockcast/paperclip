@@ -57,6 +57,10 @@ import { authorizationService } from "../services/authorization.js";
 import { issueService } from "../services/issues.js";
 import { assertCompanyAccess } from "./authz.js";
 import {
+  assertNoAgentHostWorkspaceCommandMutation,
+  collectIssueWorkspaceCommandPaths,
+} from "./workspace-command-authz.js";
+import {
   computePipelineHealth,
   deriveCaseType,
   envConfigSchema,
@@ -402,6 +406,52 @@ function assertPipelineCompanyAccess(req: Request, companyId: string) {
     }
     throw error;
   }
+}
+
+/**
+ * PEN-6532 — a pipeline stage config is a DURABLE carrier of the same host-executed
+ * workspace commands the four issue write routes refuse for agent actors.
+ *
+ * `pipelineStageOnEnterSchema` and `pipelineStageAutomationSchema`
+ * (`packages/shared/src/validators/pipeline.ts`) each embed
+ * `issueExecutionWorkspaceSettingsSchema`, and both fire a routine run whose
+ * `executionWorkspaceSettings` lands on the created issue's column — from there
+ * `buildReusedExecutionWorkspaceConfigPatchFromIssueSettings` (`services/issues.ts`)
+ * copies `workspaceStrategy.provisionCommand` onto `config.provisionCommand`, which the
+ * control plane runs as `bash -lc <string>`.
+ *
+ * ⚠ THE ROUTE IMPOSES NO SHAPE. `stageConfigSchema` here is a bare
+ * `z.record(z.string(), z.unknown())`, so the two shared schemas above describe how the
+ * SERVICE reads a stage config and constrain nothing at the door. This walk therefore keys
+ * on the two carrier names rather than on a parsed type, and `hasOwnProperty` semantics in
+ * the shared collector mean an explicit `null` is refused as well as a string — setting a
+ * command to `null` is still setting it.
+ *
+ * ⚠ THREE ROUTES, NOT TWO. `config` reaches the store through stage CREATE, stage PATCH and
+ * the `stages[]` array of pipeline CREATE. The third is easy to miss because it is a
+ * different schema in a different route; it writes the same column.
+ *
+ * Non-agent actors are unaffected: `assertNoAgentHostWorkspaceCommandMutation` returns early
+ * for every actor type that is not an agent, so the board and the pipeline UI keep working.
+ */
+function collectStageConfigWorkspaceCommandPaths(config: unknown, prefix: string): string[] {
+  if (typeof config !== "object" || config === null || Array.isArray(config)) return [];
+  const record = config as Record<string, unknown>;
+  const paths: string[] = [];
+  for (const carrier of ["onEnter", "automation"] as const) {
+    const branch = record[carrier];
+    if (typeof branch !== "object" || branch === null || Array.isArray(branch)) continue;
+    paths.push(
+      ...collectIssueWorkspaceCommandPaths({
+        executionWorkspaceSettings: (branch as Record<string, unknown>).executionWorkspaceSettings,
+      }).map((path) => `${prefix}.${carrier}.${path}`),
+    );
+  }
+  return paths;
+}
+
+function assertNoAgentStageConfigCommandMutation(req: Request, config: unknown, prefix: string) {
+  assertNoAgentHostWorkspaceCommandMutation(req, collectStageConfigWorkspaceCommandPaths(config, prefix));
 }
 
 function actorForMutation(req: Request): PipelineActor {
@@ -920,6 +970,9 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const companyId = req.params.companyId as string;
     assertPipelineCompanyAccess(req, companyId);
     const actor = actorForMutation(req);
+    for (const [index, stage] of ((req.body.stages ?? []) as { config?: unknown }[]).entries()) {
+      assertNoAgentStageConfigCommandMutation(req, stage?.config, `stages[${index}].config`);
+    }
     const decision = await access.decide({
       actor: req.actor,
       action: "pipelines:write",
@@ -1254,6 +1307,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const pipelineId = req.params.pipelineId as string;
     const companyId = await assertPipelineAccess(db, req, pipelineId);
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+    assertNoAgentStageConfigCommandMutation(req, req.body.config, "config");
     const actor = actorForMutation(req);
     try {
       const stage = await svc.createStage({
@@ -1278,6 +1332,7 @@ export function pipelineRoutes(db: Db, options: Parameters<typeof pipelineServic
     const stageId = req.params.stageId as string;
     const companyId = await assertPipelineAccess(db, req, pipelineId);
     await assertPipelineWriteAccess(req, { access, companyId, pipelineId });
+    assertNoAgentStageConfigCommandMutation(req, req.body.config, "config");
     const actor = actorForMutation(req);
     try {
       const updatedStage = await svc.updateStage({ companyId, pipelineId, stageId, patch: req.body, actor });
