@@ -10,6 +10,7 @@ import {
   classifyPullRequest,
   collapseHeadChecks,
   isAttestationContext,
+  isPendingAttempt,
   sweep,
   verdictRowState,
 } from "./sweep-missing-review.mjs";
@@ -392,7 +393,10 @@ describe("report", () => {
 });
 
 function reviewRow(conclusion, status = "COMPLETED") {
-  return { name: "review", conclusion, status, completedAt: "2026-11-09T18:00:00Z" };
+  // A running attempt carries a NULL `completedAt`; that is the field the
+  // attempt ranking turns on, so the fixture has to match the real shape.
+  const completedAt = status === "COMPLETED" ? "2026-11-09T18:00:00Z" : null;
+  return { name: "review", conclusion, status, completedAt };
 }
 
 function ally(names) {
@@ -570,5 +574,99 @@ describe("the sibling test counts repo CI, not attestation contexts (PEN-6481)",
       { now: NOW },
     );
     assert.equal(result.verdict, "resolved");
+  });
+});
+
+describe("an in-flight re-run outranks an older completed attempt (PEN-6481)", () => {
+  // Found by Ally on #3682. PEN-6481 made the watched row's CONCLUSION decide
+  // the verdict, which promoted "which attempt wins" from cosmetic to
+  // load-bearing -- and the collapse ranked on `completedAt ?? ""`, so an
+  // in-flight attempt (null `completedAt`) lost to ANY older completed one.
+  //
+  // Not exotic: `commitperclip-review.yml` subscribes to `edited`, and GitHub
+  // ADDS a check-run rather than replacing the old one (BLO-26636), so a
+  // second `review` attempt beside a dead first one is the ordinary shape.
+  const cancelled = {
+    name: "review",
+    conclusion: "CANCELLED",
+    status: "COMPLETED",
+    completedAt: "2026-11-09T17:30:00Z",
+  };
+  const inFlight = { name: "review", conclusion: null, status: "IN_PROGRESS", completedAt: null };
+
+  function winner(suites, totalCount) {
+    const { byName, unreadable } = collapseHeadChecks(head({ suites, totalCount }));
+    assert.equal(unreadable, false);
+    return byName.get("review").run;
+  }
+
+  it("keeps the in-flight attempt when the dead one is seen FIRST", () => {
+    assert.equal(winner([suite([cancelled, inFlight])]).status, "IN_PROGRESS");
+  });
+
+  it("keeps the in-flight attempt when the dead one is seen SECOND", () => {
+    // Both orders have to be asserted: the broken ranking lost in BOTH, by two
+    // different routes (`"" >= "<ts>"` is false, and `"<ts>" >= ""` is true).
+    assert.equal(winner([suite([inFlight, cancelled])]).status, "IN_PROGRESS");
+  });
+
+  it("keeps the in-flight attempt across SEPARATE suites, which is the real shape", () => {
+    // A re-run lands in a new check SUITE, so the two attempts are not
+    // siblings in one `checkRuns` list -- the collapse unions across suites.
+    assert.equal(winner([suite([cancelled]), suite([inFlight])]).status, "IN_PROGRESS");
+    assert.equal(winner([suite([inFlight]), suite([cancelled])]).status, "IN_PROGRESS");
+  });
+
+  it("decides NOTHING on a head whose dead `review` already has a re-run going", () => {
+    // The end-to-end case, and the one that was publishing: before this
+    // ranking the head collapsed to CANCELLED, `verdictRowState` returned
+    // `inconclusive`, and a `neutral` row was posted while a verdict was being
+    // computed -- then retired next tick. The flap the `undecided` arm exists
+    // to prevent, defeated one layer below it.
+    const result = classifyPullRequest(
+      pr(head({ suites: [suite([...filler(19), cancelled, inFlight])] })),
+      { now: NOW },
+    );
+    assert.equal(result.verdict, "skipped");
+    assert.match(result.reason, /in flight/);
+  });
+
+  it("still FLAGS a head whose every `review` attempt is dead -- the arm stays live", () => {
+    // Negative control. Ranking in-flight first must not make the new arm
+    // inert: with no attempt running, nothing is coming and the finding stands.
+    const stale = { ...cancelled, completedAt: "2026-11-09T17:00:00Z" };
+    const result = classifyPullRequest(
+      pr(head({ suites: [suite([...filler(19), stale, cancelled])] })),
+      { now: NOW },
+    );
+    assert.equal(result.verdict, "missing");
+  });
+
+  it("still takes the NEWEST attempt when both have completed", () => {
+    // Negative control on the other side: the pre-existing ordering among
+    // completed attempts is unchanged.
+    const run = winner([
+      suite([{ ...cancelled, conclusion: "FAILURE", completedAt: "2026-11-09T17:00:00Z" }]),
+      suite([{ ...cancelled, conclusion: "SUCCESS", completedAt: "2026-11-09T18:00:00Z" }]),
+    ]);
+    assert.equal(run.conclusion, "SUCCESS");
+  });
+
+  it("reads a commit-status context as completed, never as in flight", () => {
+    // The synthetic rows the status branch builds carry no `completedAt`, so a
+    // `completedAt`-only test would rank every one of them as pending and
+    // suppress findings wholesale.
+    assert.equal(isPendingAttempt({ name: "x", conclusion: "SUCCESS", status: "COMPLETED" }), false);
+  });
+
+  it("calls an attempt pending on STATUS first, falling back to `completedAt`", () => {
+    assert.equal(isPendingAttempt({ status: "COMPLETED", completedAt: null }), false);
+    assert.equal(isPendingAttempt({ status: "IN_PROGRESS", completedAt: null }), true);
+    assert.equal(isPendingAttempt({ status: "QUEUED", completedAt: null }), true);
+    // Contradictory row: a stale `completedAt` must not outvote a live status.
+    assert.equal(isPendingAttempt({ status: "IN_PROGRESS", completedAt: "2026-11-09T18:00:00Z" }), true);
+    // No status at all -- `completedAt` is the only signal left.
+    assert.equal(isPendingAttempt({ completedAt: null }), true);
+    assert.equal(isPendingAttempt({ completedAt: "2026-11-09T18:00:00Z" }), false);
   });
 });

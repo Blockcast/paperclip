@@ -158,6 +158,15 @@ export function verdictRowState(run) {
  *
  * Matched on `/`- and `-`-delimited SEGMENTS so that an ordinary CI job whose
  * name merely contains the letters ("finally", "tally") is not swept up.
+ *
+ * Known producers, so the next family is a one-line add rather than a
+ * rediscovery. Every name below is written by `paperclip-api`, not by this
+ * repository's CI, and every one matches on the `ally` segment:
+ * `gate/ally-comment-findings`, `ci/ally-head-attested`, `review/ally-comment`,
+ * `review/ally-complete`, and the check-run `ally-verdict`. A future
+ * attestation context that does NOT carry an `ally` segment is the case this
+ * predicate misses, and it misses it by counting the name as repo CI -- the
+ * denylist's stated failure direction, visible in the report.
  */
 export function isAttestationContext(name) {
   return String(name ?? "")
@@ -189,6 +198,61 @@ query($o:String!,$r:String!,$cursor:String){
     }
   }
 }`;
+
+/**
+ * Has this attempt NOT finished? PEN-6481.
+ *
+ * `status` is a non-null enum on a GraphQL CheckRun, and the synthetic rows
+ * the commit-status branch of `collapseHeadChecks` builds set it explicitly,
+ * so it is the reliable signal. `completedAt` is the corroborator, used only
+ * for a row carrying no status at all.
+ */
+export function isPendingAttempt(run) {
+  const status = String(run?.status ?? "").trim().toUpperCase();
+  if (status === "COMPLETED") return false;
+  if (status !== "") return true;
+  return run?.completedAt == null;
+}
+
+/**
+ * Rank two attempts of ONE check name: should `candidate` replace `incumbent`?
+ *
+ * An attempt that has not finished outranks every completed attempt, and that
+ * is the answer to the question the collapsed row is asked rather than a
+ * tie-break convenience. PEN-6481 made the watched row's CONCLUSION decide the
+ * verdict, so "which attempt wins" stopped being cosmetic. An in-flight
+ * re-run carries a null `completedAt`, so ranking on `completedAt ?? ""` alone
+ * makes it lose to ANY older completed attempt -- `"" >= "<ts>"` is false, and
+ * the reverse insertion order loses too because `"<ts>" >= ""` is true.
+ *
+ * Measured before this ranking existed, 4 of 4 orderings including the real
+ * two-suite shape: `review` attempt 1 `CANCELLED` beside attempt 2 in flight
+ * at one head collapsed to the CANCELLED row, `verdictRowState` returned
+ * `inconclusive`, and the head was classified `missing` -- publishing a
+ * `neutral` row while a verdict was actively being computed, then retiring it
+ * the next tick. That is precisely the post/retire flap the `undecided` arm
+ * exists to prevent, defeated one layer below it.
+ *
+ * Same-head re-runs are ROUTINE on this repo, not exotic:
+ * `commitperclip-review.yml` subscribes to `edited` (BLO-26636), and GitHub
+ * ADDS a check-run rather than replacing the old one -- that workflow's own
+ * header records both facts and asks for exactly this reader-side collapse.
+ *
+ * RESIDUAL, stated because it is deliberate and not an oversight: among
+ * attempts that have all COMPLETED, the newest `completedAt` still wins, so a
+ * slow older attempt finishing after a fast newer one outranks it. BLO-26636
+ * prescribes ranking on run id instead. That is not fixed here because it
+ * cannot change THIS consumer's answer: `verdictRowState` folds every computed
+ * verdict into one `conclusive` bucket, so picking the stale attempt returns
+ * the same classification unless one attempt is conclusive and the other
+ * inconclusive -- and a cancellation completes at the instant it is cancelled,
+ * so it cannot be the later `completedAt`. Unmeasured, not ruled out; it needs
+ * `databaseId` in the query, which is a separate change.
+ */
+function outranksAttempt(candidate, incumbent) {
+  if (candidate.pending !== incumbent.pending) return candidate.pending;
+  return candidate.key >= incumbent.key;
+}
 
 /**
  * Collapse a head's check surface to one row per NAME, newest attempt winning,
@@ -227,15 +291,16 @@ export function collapseHeadChecks(commit) {
     for (const run of runs) {
       // One check NAME can have several attempts at one head; a merge gate
       // reads the latest per name. A flat scan is a history, not a state.
+      const candidate = { pending: isPendingAttempt(run), key: run.completedAt ?? "", run };
       const previous = byName.get(run.name);
-      const key = run.completedAt ?? "";
-      if (!previous || key >= previous.key) byName.set(run.name, { key, run });
+      if (!previous || outranksAttempt(candidate, previous)) byName.set(run.name, candidate);
     }
   }
 
   for (const context of commit?.status?.contexts ?? []) {
     if (byName.has(context.context)) continue;
     byName.set(context.context, {
+      pending: false,
       key: context.createdAt ?? "",
       run: { name: context.context, conclusion: context.state, status: "COMPLETED" },
     });
