@@ -433,6 +433,19 @@ function assertPipelineCompanyAccess(req: Request, companyId: string) {
  *
  * Non-agent actors are unaffected: `assertNoAgentHostWorkspaceCommandMutation` returns early
  * for every actor type that is not an agent, so the board and the pipeline UI keep working.
+ *
+ * ⛔ KNOWN RESIDUAL, AND IT IS THE NEXT ONE-ROUTE-OVER GAP. This collector covers the two
+ * COMMAND paths and nothing else. `POST /routines/:id/run` calls the compound
+ * `assertNoAgentIssueHostControlledMutation` instead, so it inherits every future addition to
+ * the issue host-controlled set automatically; THESE THREE ROUTES DO NOT. When PEN-6430 lands
+ * `collectAgentDisallowedIssueWorkspaceRuntimePaths` (it does not exist on `master` as this is
+ * written, which is why it is not called here), `config.{onEnter,automation}
+ * .executionWorkspaceSettings.workspaceRuntime` becomes settable by an agent at these three
+ * routes while being refused at the four issue routes — the exact shape PEN-6532 was filed for.
+ *
+ * ⇒ whoever lands that change: extend this collector in the SAME commit, or route each
+ * `onEnter` / `automation` branch through the compound guard and re-prefix its paths. Do not
+ * leave it to be noticed. (Raised by Ally on `#3701` and accepted; it could not be wired then.)
  */
 function collectStageConfigWorkspaceCommandPaths(config: unknown, prefix: string): string[] {
   if (typeof config !== "object" || config === null || Array.isArray(config)) return [];
