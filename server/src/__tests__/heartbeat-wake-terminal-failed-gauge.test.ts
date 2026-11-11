@@ -1088,7 +1088,7 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       expect(await oldestAgeSeconds("pr_review")).toBeLessThan(1_800);
     });
 
-    it("a positive verdict survives an erroring re-probe after the TTL", async () => {
+    it("a positive verdict is not re-probed after the TTL, so a failing GitHub cannot re-page it", async () => {
       const { agentId, companyId } = await seedCompanyAndAgent();
       const now = new Date();
       githubPrs.set("blockcast/onprem-k8s#7601", { state: "open", merged: false, reviewedAtHead: true });
@@ -1102,7 +1102,9 @@ describeEmbeddedPostgres("terminal-failed wake gauge (BLO-20255)", () => {
       await heartbeat.publishAgentWakeupTerminalFailedGauge(now);
       githubPrs.clear();
       __resetMetricsForTest();
+      vi.mocked(githubGetPullRequestGate).mockClear();
       await heartbeat.publishAgentWakeupTerminalFailedGauge(new Date(now.getTime() + 11 * 60_000));
+      expect(vi.mocked(githubGetPullRequestGate)).not.toHaveBeenCalled();
       expect(await gaugeTotal({ errorCode: "pr_review_output_missing", scope: "pr_review" })).toBe(0);
     });
 

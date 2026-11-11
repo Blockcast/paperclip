@@ -46984,6 +46984,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * fleet-wide claim, so one replica probes a key per TTL instead of each one.
    * A positive verdict is sticky for the row's life in the 24h window; a new
    * failure for the same PR is a new, unstamped row and is probed afresh.
+   * Accepted on purpose: a reopened PR's old stamped rows stay excluded; the
+   * reopen raises a new wake, whose row is unstamped and pages if it fails.
    */
   const prReviewNoActionStamped = sql<boolean>`coalesce((${agentWakeupRequests.payload} #>> '{prReviewNoActionProbe,noAction}')::boolean, false)`;
 
@@ -47076,7 +47078,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   async function publishAgentWakeupTerminalFailedGauge(now: Date) {
     try {
       const cutoff = new Date(now.getTime() - TERMINAL_FAILED_WAKE_GAUGE_WINDOW_MS);
-      await probeNoActionPrReviewRows(cutoff, now);
+      // The probe now writes (claim UPDATE); a lock error there must not stop
+      // this tick's age publication, so it is isolated from the gauge's try.
+      try {
+        await probeNoActionPrReviewRows(cutoff, now);
+      } catch (err) {
+        logger.warn({ err }, "pr_review no-action probe failed; publishing gauge without it");
+      }
       const notNoActionPrReview = not(prReviewNoActionStamped);
       const wakeTaskKey = sql<string | null>`${agentWakeupRequests.payload} ->> 'taskKey'`;
       // Scope must be decided in SQL, not in JS, so that the per-scope `limit`
