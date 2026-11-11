@@ -59,7 +59,10 @@ COMMENT ON COLUMN plugin_alertmanager_184163d1ba.alert_attendance_observations.d
   'held_alert_clear (BLO-40739). Deliberately unconstrained text so a later ladder branch can '
   'record a determination no migration anticipated -- migration 007 says so and this is the first '
   'use of that allowance. '
-  'attended_park is evaluated LAST, behind both older mechanisms, so it is written if and only if '
-  'the ladder would otherwise have ADVANCED A RUNG: it never absorbs a determination that would '
-  'previously have read attended_monitor or attended_blocker, which is what makes the count of it '
-  'a direct before/after measure rather than a reshuffle between buckets.';
+  'attended_park is evaluated LAST, behind both older mechanisms, so it never absorbs a '
+  'determination that would previously have read attended_monitor or attended_blocker. It DOES '
+  'absorb some held_alert_clear: the deferral returns before the Alertmanager liveness read, so a '
+  'park-only row whose alert has silently cleared now records attended_park instead. Behaviour is '
+  'identical -- both re-arm the same rung one interval out and neither reassigns -- but read the '
+  'before/after as attended_park against unattended_rung PLUS held_alert_clear, never against '
+  'unattended_rung alone.';

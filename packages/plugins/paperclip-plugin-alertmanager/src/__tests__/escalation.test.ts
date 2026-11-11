@@ -715,12 +715,13 @@ describe("alert escalation", () => {
       expect(mocks.logger.info).not.toHaveBeenCalledWith(expect.stringContaining("unresolved blocker"));
     });
 
-    // ORDERING, and this is the property that makes the fix measurable rather
-    // than a reshuffle between buckets: the park term is evaluated LAST, so a
-    // row that is both parked and blocked still records `attended_blocker`.
-    // Nothing that reads `attended_monitor` or `attended_blocker` today becomes
-    // `attended_park`, so the count of `attended_park` is a direct before/after
-    // measure of exactly the rungs this change held.
+    // ORDERING, and this is the half of the measurability argument the test
+    // can pin: the park term is evaluated LAST, so a row that is both parked
+    // and blocked still records `attended_blocker`. Nothing that reads
+    // `attended_monitor` or `attended_blocker` becomes `attended_park`.
+    // It is NOT the whole before/after — the deferral returns ahead of the
+    // liveness read, so `attended_park` does absorb some `held_alert_clear` —
+    // so read the count against `unattended_rung` PLUS `held_alert_clear`.
     it("does not absorb a determination an older mechanism already made", async () => {
       const store = buildFakeAlertmanagerStore();
       const { ctx, mocks } = sweepContext(due, "cto", store, null, { parkedUntil: PARKED_UNTIL, parkedAt: PARKED_AT });

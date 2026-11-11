@@ -109,8 +109,9 @@ export async function hasLiveBlocker(ctx: PluginContext, issueId: string, compan
 /**
  * True when `issue` carries a monitor wake still in the future (PEN-4337).
  *
- * Attendance in this platform is the UNION of two mechanisms — an unresolved
- * `blockedBy` edge and an armed monitor — and this ladder only consulted the
+ * Attendance in this platform is the UNION of three mechanisms — an unresolved
+ * `blockedBy` edge, an armed monitor, and a live deliberate park (PEN-6486,
+ * added last) — and when PEN-4337 was filed this ladder consulted only the
  * first. An alert row whose owner has deliberately scheduled their own return
  * was therefore indistinguishable from an abandoned one, so the ladder woke
  * them early, reassigned the row out from under the monitor they armed, and
@@ -1356,11 +1357,17 @@ async function advanceIssueLadder(
   // adds no RPC that today's code does not already make, because the blocker
   // read already runs on every non-monitor row. What it buys is that
   // `attended_park` appears if and only if the ladder would OTHERWISE HAVE
-  // ADVANCED A RUNG. No determination that reads `attended_monitor` or
-  // `attended_blocker` today changes, so this fix's own effect is readable as a
-  // before/after on the attendance table instead of being mixed into an
-  // existing bucket — which is the one thing PEN-2918 keeps finding it cannot
-  // do about its own remedies.
+  // ADVANCED OR HELD THE RUNG. No determination that reads `attended_monitor`
+  // or `attended_blocker` changes — park is evaluated behind both, so it can
+  // never absorb either, and that is the half the measurability argument needs.
+  //
+  // It is NOT the whole before/after, and the gap is named here rather than
+  // left to be discovered from the table: this deferral returns ahead of
+  // `readLiveness` below, so a park-only row whose alert has silently cleared
+  // records `attended_park` where it would have recorded `held_alert_clear`.
+  // Both arms re-arm the same rung one interval out and neither reassigns, so
+  // nothing observable moves — only the bookkeeping. `held_alert_clear` on
+  // park-only rows falls by however much `attended_park` absorbs.
   const monitorArmed = hasArmedMonitor(issue, now);
   const blockerLive = monitorArmed ? false : await hasLiveBlocker(ctx, issue.id, companyId);
   const rungMs = rungIntervalMs(state, config);

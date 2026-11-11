@@ -103,12 +103,17 @@ export const ATTENDANCE_TABLE = "alert_attendance_observations";
  * is why the ladder defers rather than stops, and why a long run of
  * `attended_monitor` rows on one issue is a finding rather than a reassurance.
  *
- * `attended_park` (PEN-6486) is the newest and the narrowest. It is recorded if
- * and only if the ladder would otherwise have ADVANCED A RUNG — the park term
- * is evaluated last, behind both older mechanisms — so it never absorbs a
+ * `attended_park` (PEN-6486) is the newest and the narrowest. The park term is
+ * evaluated last, behind both older mechanisms, so it never absorbs a
  * determination that would previously have read `attended_monitor` or
- * `attended_blocker`, and the count of it is a direct before/after measure of
- * one defect. Unlike its two siblings it is BOUNDED: a park holds the rung for
+ * `attended_blocker`. It DOES absorb some `held_alert_clear`: the deferral
+ * returns ahead of the liveness read, so a park-only row whose alert has
+ * silently cleared records `attended_park` now. The arms are behaviourally
+ * identical — both re-arm the same rung one interval out and neither reassigns
+ * — so read the before/after as `attended_park` against `unattended_rung` PLUS
+ * `held_alert_clear`, never against `unattended_rung` alone.
+ *
+ * Unlike its two siblings it is BOUNDED: a park holds the rung for
  * a fixed number of intervals from `parkedAt` and no longer, because a park can
  * run for days and an unbounded park term would be a permanent skip wearing a
  * deferral's name. See `hasLivePark` in `escalation.ts` for the bound and for

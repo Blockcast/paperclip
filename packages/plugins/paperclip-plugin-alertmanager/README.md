@@ -272,8 +272,8 @@ withholding and the PEN-4337 monitor deferral are all unchanged.
 | `attended_monitor` | the owner has armed a monitor (PEN-4337) | no |
 | `attended_blocker` | an unresolved `blockedBy` edge (BLO-40673) | no |
 | `attended_park` | a live deliberate park, inside the deferral bound (PEN-6486) | no |
-| `unattended_rung` | neither held; a rung advanced | yes |
-| `unattended_cover` | neither held; the agent chain was exhausted | no — the `[user-cover]` assignment is the notification |
+| `unattended_rung` | none held; a rung advanced | yes |
+| `unattended_cover` | none held; the agent chain was exhausted | no — the `[user-cover]` assignment is the notification |
 | `held_alert_clear` | Alertmanager says the alert is not firing (BLO-40739) | no |
 
 `wake_outcome` is `enqueued`, `refused`, `declined`, or `not_attempted`.
