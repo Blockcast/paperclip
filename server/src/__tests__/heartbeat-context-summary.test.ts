@@ -4250,8 +4250,11 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
       },
     });
 
-    expect(markdown).toContain("this artifact has NO Paperclip owning row, for anyone");
     expect(markdown).toContain("record it as a COMMENT ON THE PULL REQUEST itself");
+    // The TRIGGER is "no row I can write to", never "the artifact is unowned". Pinned as
+    // a positive AND a negative because the two readings produce the same remedy and
+    // diverge only on what the run does NEXT.
+    expect(markdown).toContain("Take that step WITHOUT first deciding whether the artifact is unowned");
     // The TRIGGER, pinned on BOTH arms. Keyed on `owners: []` alone, a non-empty result
     // whose every entry is a mention leaves the run with zero homes AND no fallback,
     // silently dropping the constraint -- strictly worse than the empty case this clause
@@ -4261,12 +4264,16 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // moved that discrimination server-side. If this assertion ever has to change back,
     // the directive has regrown the second spelling the supersession removed.
     expect(markdown).toContain("`relation: \"mention\"`");
-    // That this is a THIRD state is the whole finding -- a reader who collapses it into
-    // either neighbour loses the clause.
-    expect(markdown).toContain("That is a THIRD state");
-    // Scope, pinned because `withheldForAuthorizationCount: 0` reads as a global
-    // all-clear and is not one: the service filters by company before the route ever
-    // computes the count, so an owner in another company is invisible AND uncounted.
-    expect(markdown).toContain("scoped to the company you queried");
+    // PEN-5340 item 5 guard. An earlier draft keyed the trigger on
+    // `withheldForAuthorizationCount` being 0 and concluded there was no owner "for
+    // anyone" -- the exact reading item 5 removed, since that count reports only the
+    // authorization cause. These two arms red if the count-keyed trigger or the
+    // negative-existence claim is reintroduced; reverting the fix alone reds them and
+    // nothing else.
+    expect(markdown).not.toContain("NO Paperclip owning row, for anyone");
+    expect(markdown).toContain("do not key it on `withheldForAuthorizationCount`");
+    // `ownerListComplete: false` is a FLOOR, not a discharge -- the case the clause's own
+    // cited example (`#3643`) is actually in.
+    expect(markdown).toContain("is a FLOOR and not a discharge");
   });
 });

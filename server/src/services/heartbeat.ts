@@ -14638,21 +14638,33 @@ export function buildPaperclipTaskMarkdown(input: {
     // `owners` is not proof of unownedness -- correctly -- but that tells a run only
     // what NOT to conclude, and leaves the constraint with no home at all.
     //
-    // Measured 2026-11-07 on `Blockcast/onprem-k8s`: 59 of 107 open PRs (55%) return
-    // `owners: []` with `withheldForAuthorizationCount: 0`, and that is the TRUTH rather
-    // than a binding failure -- their only issue key is an external tracker's (`BLO-*`),
-    // which is not a Paperclip row here, so nothing resolves and nothing is written.
-    // Verified 13/13 against the live endpoint: 7 PRs with no `PEN-*` reference all
-    // empty, 6 with one all bound. Re-measured 2026-11-11 on `Blockcast/paperclip#3643`,
-    // which returns 0 owners with `owningIdentifiersUnrecorded: true` -- so the state is
-    // live on this repo too, not an `onprem-k8s` idiom.
+    // The TRIGGER is "no row I can write to", NOT "the artifact is unowned", and the
+    // difference is the whole of PEN-5340 item 5. An earlier draft of this clause keyed
+    // on `withheldForAuthorizationCount` being 0 and concluded there was no owner "for
+    // anyone". That is the exact reading item 5 removed: the count reports only the
+    // AUTHORIZATION cause, and #3114 declared five owners, returned four and reported
+    // `0` -- the fifth was another company's identifier, withheld by nothing. A
+    // negative-existence claim is not this endpoint's to make, and the remedy below
+    // never needed one.
+    //
+    // The two sub-cases are evidence for different things and must not be pooled.
+    // GENUINELY UNOWNED, measured 2026-11-07 on `Blockcast/onprem-k8s`: 59 of 107 open
+    // PRs (55%) return `owners: []`, and that is the TRUTH rather than a binding failure
+    // -- their only issue key is an external tracker's (`BLO-*`), which is not a
+    // Paperclip row here, so nothing resolves and nothing is written. Verified 13/13
+    // against the live endpoint: 7 PRs with no `PEN-*` reference all empty, 6 with one
+    // all bound. COMPLETENESS UNVERIFIABLE, measured 2026-11-11 on
+    // `Blockcast/paperclip#3643`: 0 owners, `owningIdentifiersUnrecorded: true` AND
+    // `ownerListComplete: false` -- which the `Look the owner up` string defines as
+    // owners MAY be missing. It shows the state is reachable on this repo too; it is NOT
+    // evidence of unownedness, and citing it as such was the defect above.
     //
     // Keyed on `relation` rather than on a caller-side `owningIdentifiers` predicate.
     // This clause was first written as that predicate; PEN-5836 then moved the same
     // discrimination server-side, and the `Read relation, NOT provenance` string above
     // already tells the reader to use it. Two spellings of one test is how the two
     // drift apart, so the superseded half was dropped rather than rebased.
-    "When the lookup SUCCEEDS and still leaves you nowhere to write -- `owners` empty, or non-empty with every entry `relation: \"mention\"` -- AND `withheldForAuthorizationCount` is 0, this artifact has NO Paperclip owning row, for anyone. That is a THIRD state, distinct from both clauses around it: the `403 deny_missing_grant` case is a row that exists and refuses you, and the no-external-id case is an artifact this lookup is not defined for. Here the lookup is defined, authoritative, and names nobody -- usually correctly, because a pull request whose only issue key belongs to an external tracker references no Paperclip row, so none is ever written (measured 2026-11-07: 55% of open `Blockcast/onprem-k8s` PRs; and 2026-11-11 on `Blockcast/paperclip#3643`, 0 owners with `owningIdentifiersUnrecorded: true`). You still owe the constraint a home, and the artifact is the only one left: record it as a COMMENT ON THE PULL REQUEST itself, which is where a run working that artifact will look. Note `withheldForAuthorizationCount` is scoped to the company you queried, so it can never reveal an owner outside it.",
+    "When the lookup leaves you no owning row to write to -- `owners` empty, or non-empty with every entry `relation: \"mention\"` -- you still owe the constraint a home, and the artifact is the only one left: record it as a COMMENT ON THE PULL REQUEST itself, which is where a run working that artifact will look. Take that step WITHOUT first deciding whether the artifact is unowned, and do not key it on `withheldForAuthorizationCount`: the remedy is identical whether the list is genuinely empty (a pull request whose only issue key belongs to an external tracker references no Paperclip row, so none is ever written -- measured 2026-11-07: 55% of open `Blockcast/onprem-k8s` PRs), or short because a row was withheld from your seat, or unverifiable because `ownerListComplete` is `false`. A negative-existence claim is not this endpoint's to make and the remedy never needed one. Where `ownerListComplete` is `false`, the pull-request comment is a FLOOR and not a discharge: an owner may exist that this lookup could not return, so say on your own row that the constraint may not have reached an owning row, and keep looking.",
     // PEN-5904: the SURFACE axis, plus the two cases where the row-axis rule above has
     // no target or no write access. The three paragraphs above say which ROWS a
     // constraint goes on and nothing about which surface of those rows, and a run that
