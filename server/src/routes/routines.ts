@@ -16,6 +16,7 @@ import { validate } from "../middleware/validate.js";
 import { accessService, documentAnnotationService, logActivity, routineService } from "../services/index.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { forbidden, unauthorized } from "../errors.js";
+import { assertNoAgentIssueHostControlledMutation } from "./workspace-command-authz.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 import { maskProjectEnv } from "./project-env-response.js";
@@ -664,6 +665,29 @@ export function routineRoutes(
       return;
     }
     await assertBoardCanAssignTasks(req, routine.companyId);
+    // PEN-6532: `runRoutineSchema` embeds `issueExecutionWorkspaceSettingsSchema`, and
+    // `dispatchRoutineRun` hands `input.executionWorkspaceSettings` straight to
+    // `issueSvc.create`. That is the same column, and the same bytes, that the four issue
+    // write routes guard — `buildReusedExecutionWorkspaceConfigPatchFromIssueSettings`
+    // (`services/issues.ts`) copies `workspaceStrategy.provisionCommand` onto
+    // `config.provisionCommand`, which the CONTROL PLANE runs as `bash -lc <string>`
+    // (`services/environment-run-orchestrator.ts`). So without this call the PEN-5225
+    // command denylist, live on `POST /companies/:companyId/issues` since that row landed,
+    // was reachable one route over.
+    //
+    // It is cross-seat, which is what decides the grading: `dispatchRoutineRun` resolves
+    // `input.assigneeAgentId ?? input.routine.assigneeAgentId`, and the only check on the
+    // override is `assertAssignableAgent` (company membership + work eligibility, no actor
+    // term). An agent running a routine assigned to itself could therefore place an issue
+    // carrying an arbitrary provision command on ANOTHER agent's row.
+    //
+    // The compound issue guard is called rather than `assertNoAgentHostWorkspaceCommandMutation`
+    // alone, deliberately: its adapter-config arm is a no-op on this body (`runRoutineSchema`
+    // has no `assigneeAdapterOverrides`, and the collector returns `[]` for an absent key), and
+    // calling the compound one means this route inherits any future addition to the issue
+    // host-controlled set — PEN-6430's `workspaceRuntime` refusal among them — in the commit
+    // that adds it, rather than needing to be remembered on the day.
+    assertNoAgentIssueHostControlledMutation(req, req.body);
     const run = await svc.runRoutine(routine.id, req.body, {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? null : null,
