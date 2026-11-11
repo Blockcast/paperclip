@@ -9,11 +9,14 @@ import { STATEMENT_TIMEOUT_SQLSTATE, TRANSIENT_DB_SQLSTATES } from "../lib/db-re
 import { errorHandler } from "../middleware/error-handler.js";
 import { httpMetricsMiddleware, noteTransientDbResponse } from "../middleware/http-metrics.js";
 import {
+  HTTP_QUERY_VARIANT_NO_SEARCH,
+  HTTP_QUERY_VARIANT_SEARCH,
   HTTP_REQUESTS_METRIC,
   HTTP_TRANSIENT_DB_RESPONSES_METRIC,
   HTTP_TRANSIENT_DB_SQLSTATE_OTHER,
   __resetMetricsForTest,
   getMetricsRegistry,
+  normalizeHttpQueryVariant,
   normalizeHttpTransientDbCode,
   normalizeHttpTransientDbSqlstate,
   recordHttpRequest,
@@ -71,8 +74,17 @@ function buildApp() {
   router.get("/companies/:companyId/fail-unknown", () => {
     throw pgError("23505");
   });
-  router.get("/companies/:companyId/issues", (_req, res) => {
+  router.get("/companies/:companyId/issues", (req, res) => {
+    // Shaped like the real route: one template, two query shapes. The `?q=`
+    // shape is the one that joins the ILIKE search arms and the one PEN-3596
+    // Done-when 2 is written about; the plain shape is explicitly not.
+    if (typeof req.query.q === "string" && req.query.q.trim().length > 0) {
+      throw pgError(STATEMENT_TIMEOUT_SQLSTATE);
+    }
     res.json([]);
+  });
+  router.get("/companies/:companyId/issues-always-fail", () => {
+    throw pgError(STATEMENT_TIMEOUT_SQLSTATE);
   });
   api.use(router);
   app.use("/api", api);
@@ -218,6 +230,96 @@ describe("transient-database 503 sqlstate instrumentation (PEN-3596)", () => {
     // increments the subset, so an absent series means "never refused".
     expect(await requests({ route: "/api/companies/:companyId/issues" })).toBe(1);
     expect(await refusals({})).toBe(0);
+  });
+
+  it("splits one route's search and no-search timeouts, which the route label alone cannot", async () => {
+    // THE defect this label closes. Both calls are `57014` on the same route,
+    // the same method and the same status, so every pre-existing dimension of
+    // this counter reports them as one population -- and PEN-3596 Done-when 2
+    // is written about only the search half of it. Before this label the split
+    // was recoverable only by reading the `STATEMENT:` record out of the
+    // database pod's tail-only log, which reaches back as far as unrelated load
+    // happens to allow.
+    const route = "/api/companies/:companyId/issues";
+    await call(app, "/api/companies/c1/issues?q=needle", 503);
+    await call(app, "/api/companies/c1/issues-always-fail", 503);
+
+    expect(await refusals({ route, variant: HTTP_QUERY_VARIANT_SEARCH })).toBe(1);
+    expect(await refusals({ route, variant: HTTP_QUERY_VARIANT_NO_SEARCH })).toBe(0);
+    // And the other route's timeout is `no_search`, so "no q" is recorded as a
+    // positive claim about every request rather than left unlabelled.
+    expect(await refusals({
+      route: "/api/companies/:companyId/issues-always-fail",
+      variant: HTTP_QUERY_VARIANT_NO_SEARCH,
+    })).toBe(1);
+
+    // Aggregating the label away reproduces the pre-label total exactly, which
+    // is what keeps every reading already recorded on PEN-3596 valid.
+    expect(await refusals({ sqlstate: STATEMENT_TIMEOUT_SQLSTATE })).toBe(2);
+  });
+
+  it("does not expose the search TERM, only whether there was one", async () => {
+    // A search term is user text. As a label it would be unbounded cardinality
+    // and a privacy leak in one, and a metrics endpoint is scraped by things
+    // that are not the people who typed it.
+    await call(app, "/api/companies/c1/issues?q=zzq-term-must-not-appear", 503);
+
+    const snapshot = await getMetricsRegistry().metrics();
+    expect(snapshot).toContain(`variant="${HTTP_QUERY_VARIANT_SEARCH}"`);
+    expect(snapshot).not.toContain("zzq-term-must-not-appear");
+  });
+
+  it("stays a strict subset per variant, including on the abandoned \"0\" status", async () => {
+    // Companion to the status test above. A search-shape refusal whose socket
+    // closed must land on `0` with its variant intact: those are exactly the
+    // `57014`s most worth seeing, since a statement that ran past the timeout
+    // is the one whose client is likeliest to have given up, and losing them
+    // would bias the count in the direction that reads as a pass.
+    const route = "/api/companies/:companyId/issues";
+    recordHttpRequest({
+      route,
+      method: "GET",
+      status: null,
+      emptyList: false,
+      transientDb: { code: "statement_timeout", sqlstate: STATEMENT_TIMEOUT_SQLSTATE },
+      searchQuery: "needle",
+    });
+
+    expect(await refusals({ route, status: "0", variant: HTTP_QUERY_VARIANT_SEARCH })).toBe(1);
+    expect(await refusals({ route, status: "503", variant: HTTP_QUERY_VARIANT_SEARCH })).toBe(0);
+    expect(await requests({ route, status: "0" })).toBe(1);
+  });
+
+  it("is the query builder's own hasSearch predicate, not an approximation of it", () => {
+    // `listIssues` gates its search arms on `filters?.q?.trim()` being
+    // non-empty. Pinning the same inputs here is what stops the two drifting:
+    // a whitespace-only `q` runs the PLAIN shape, so labelling it `search`
+    // would attribute a plain-shape timeout to the search population -- in the
+    // direction that invents a failure of Done-when 2 rather than hiding one,
+    // but wrong either way.
+    expect(normalizeHttpQueryVariant("needle")).toBe(HTTP_QUERY_VARIANT_SEARCH);
+    expect(normalizeHttpQueryVariant("  needle  ")).toBe(HTTP_QUERY_VARIANT_SEARCH);
+    for (const notASearch of ["", "   ", "\t\n", undefined, null]) {
+      expect(normalizeHttpQueryVariant(notASearch)).toBe(HTTP_QUERY_VARIANT_NO_SEARCH);
+    }
+    // Express parses `?q=a&q=b` to an array and `?q[x]=1` to an object. Both
+    // reach `filters.q.trim`, which is not a function on either, so such a
+    // request throws before any query runs and can never produce a refusal to
+    // label. Bounded here anyway: a normalizer that can throw would turn a
+    // metrics concern into a request failure.
+    for (const notAString of [["a", "b"], { x: 1 }, 7, true]) {
+      expect(normalizeHttpQueryVariant(notAString)).toBe(HTTP_QUERY_VARIANT_NO_SEARCH);
+    }
+  });
+
+  it("bounds the variant label to two values", async () => {
+    await call(app, "/api/companies/c1/issues?q=needle", 503);
+    await call(app, "/api/companies/c1/issues-always-fail", 503);
+
+    const metric = getMetricsRegistry().getSingleMetric(HTTP_TRANSIENT_DB_RESPONSES_METRIC);
+    const snapshot = (await metric!.get()) as { values: Series[] };
+    const variants = new Set(snapshot.values.map((s) => String(s.labels.variant)));
+    expect([...variants].sort()).toEqual([HTTP_QUERY_VARIANT_NO_SEARCH, HTTP_QUERY_VARIANT_SEARCH]);
   });
 
   it("bounds the sqlstate label to the retry classifier's own set", () => {
