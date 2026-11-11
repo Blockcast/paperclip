@@ -829,6 +829,149 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     ).not.toBe("max_attempts_exhausted");
   });
 
+  it("honours an explicit timeoutAt while the watchdog is active, under its own reason (PEN-6286)", async () => {
+    // PEN-6286 took the ATTEMPT bound out of the watchdog's way; it deliberately
+    // left the wall-clock one in. `timeoutAt` is a deadline the assignee set
+    // against the wall clock, which is the same currency the watchdog ceiling is
+    // denominated in, so the two compose rather than competing. The PR made that
+    // claim in prose and did not pin it — this is that pin.
+    //
+    // The discrimination that matters: the give-up below must report
+    // `timeout_exceeded`, NOT `dispatch_watchdog_exhausted`. The assignee is owed
+    // its own deadline by name.
+    const timeoutAt = new Date("2026-04-11T12:50:00.000Z");
+    const { issueId } = await seedFixture({ monitor: { timeoutAt: timeoutAt.toISOString() } });
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    const runCreatedAt = new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await db.update(heartbeatRuns).set({ createdAt: runCreatedAt }).where(eq(heartbeatRuns.id, queuedRun.id));
+    await db.update(issues).set({ executionRunId: queuedRun.id }).where(eq(issues.id, issueId));
+
+    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await heartbeat.tickTimers(lapseDetectedAt);
+    const armed = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(armed.monitorNextCheckAt, "watchdog armed").not.toBeNull();
+    const watchdogDueAt = armed.monitorNextCheckAt!;
+
+    const firedAt = new Date(watchdogDueAt.getTime() + 1000);
+    // CONTROL: without this the test could pass for the wrong reason. The
+    // watched run must be comfortably INSIDE the watchdog's own ceiling at the
+    // moment of the fire, so the only thing that can stop the re-arm is
+    // `timeoutAt`. If this ever fails, the test below is measuring
+    // `dispatch_watchdog_exhausted` wearing a timeout's name.
+    expect(
+      firedAt.getTime() - runCreatedAt.getTime(),
+      "the watched run must still be inside the watchdog ceiling, or this tests the wrong branch",
+    ).toBeLessThan(ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS);
+    expect(firedAt.getTime(), "the fire must land at or after the assignee's deadline").toBeGreaterThanOrEqual(
+      timeoutAt.getTime(),
+    );
+
+    await heartbeat.tickTimers(firedAt);
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: firedAt })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    expect(issue.monitorNextCheckAt, "an elapsed timeoutAt stops the watchdog re-arming").toBeNull();
+    const monitor = parseIssueExecutionState(issue.executionState)?.monitor;
+    expect(monitor).toMatchObject({ status: "cleared", clearReason: "timeout_exceeded" });
+    expect(
+      monitor?.clearReason,
+      "the assignee's own deadline outranks the watchdog's reason, and keeps its name",
+    ).not.toBe("dispatch_watchdog_exhausted");
+  });
+
+  it("widens the watchdog re-arm cadence with the watched run's age, capped at an hour (PEN-6286)", async () => {
+    // The ceiling that replaced the attempt bound is ~34x longer than the budget
+    // it replaced, so a flat 5-minute re-arm would mean ~288 row writes and
+    // activity rows per strand. The ladder is what makes the longer ceiling
+    // affordable, and it is asserted here THROUGH THE SCHEDULER rather than by
+    // exporting the module-private helper — what matters is the gap the re-arm
+    // actually persists, not the function in isolation.
+    const minutes = (n: number) => n * 60 * 1000;
+    // 5 min for the first half hour, doubling per 30-minute band, capped at 60.
+    const ladder: Array<{ ageMinutes: number; expectedDelayMinutes: number }> = [
+      { ageMinutes: 10, expectedDelayMinutes: 5 },
+      { ageMinutes: 45, expectedDelayMinutes: 10 },
+      { ageMinutes: 70, expectedDelayMinutes: 20 },
+      { ageMinutes: 100, expectedDelayMinutes: 40 },
+      { ageMinutes: 130, expectedDelayMinutes: 60 },
+      { ageMinutes: 400, expectedDelayMinutes: 60 },
+    ];
+
+    const { issueId } = await seedFixture();
+    const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });
+    heartbeatServices.add(heartbeat);
+    const triggeredAt = new Date("2026-04-11T12:31:00.000Z");
+
+    await heartbeat.tickTimers(triggeredAt);
+    const queuedRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "queued"))
+      .then((rows) => rows[0]!);
+    await db
+      .update(heartbeatRuns)
+      .set({ createdAt: new Date(triggeredAt.getTime() - ISSUE_MONITOR_DISPATCH_LAPSE_MS) })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+    await db.update(issues).set({ executionRunId: queuedRun.id }).where(eq(issues.id, issueId));
+
+    const lapseDetectedAt = new Date(triggeredAt.getTime() + ISSUE_MONITOR_DISPATCH_LAPSE_MS);
+    await heartbeat.tickTimers(lapseDetectedAt);
+    let dueAt = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]!.monitorNextCheckAt!);
+    expect(dueAt, "watchdog armed").not.toBeNull();
+
+    for (const { ageMinutes, expectedDelayMinutes } of ladder) {
+      const firedAt = new Date(dueAt.getTime() + 1000);
+      // Drive the age directly: the delay is derived from the watched run's age
+      // at the moment of the fire, deliberately rather than from a persisted
+      // retry counter.
+      await db
+        .update(heartbeatRuns)
+        .set({ createdAt: new Date(firedAt.getTime() - minutes(ageMinutes)) })
+        .where(eq(heartbeatRuns.id, queuedRun.id));
+      // CONTROL: every rung must sit inside the watchdog ceiling, or the branch
+      // under test is the give-up rather than the re-arm.
+      expect(
+        minutes(ageMinutes),
+        `rung ${ageMinutes}min must be inside the watchdog ceiling to exercise the re-arm`,
+      ).toBeLessThan(ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS);
+
+      await heartbeat.tickTimers(firedAt);
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+      expect(issue.monitorNextCheckAt, `re-armed at age ${ageMinutes}min`).not.toBeNull();
+      expect(
+        issue.monitorNextCheckAt!.getTime() - firedAt.getTime(),
+        `watched run aged ${ageMinutes}min should re-arm ${expectedDelayMinutes}min out`,
+      ).toBe(minutes(expectedDelayMinutes));
+      expect(
+        issue.monitorAttemptCount,
+        "no rung of the ladder may spend the assignee's gate budget",
+      ).toBe(0);
+      dueAt = issue.monitorNextCheckAt!;
+    }
+
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: dueAt })
+      .where(eq(heartbeatRuns.id, queuedRun.id));
+  });
+
   it("clears the watchdog once the watched run leaves the dispatch queue", async () => {
     const { issueId } = await seedFixture();
     const heartbeat = heartbeatService(db, { skipQueuedRunDispatch: true });

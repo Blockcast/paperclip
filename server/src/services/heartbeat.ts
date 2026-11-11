@@ -18282,6 +18282,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...policy,
           monitor: { ...monitor, nextCheckAt: retryCheckAt.toISOString() },
         });
+        // This guard cannot currently be false, and the give-up below would
+        // mislabel an in-ceiling run as `dispatch_watchdog_exhausted` if it were.
+        // Two conjuncts hold it: `monitor` is non-null inside this branch by its
+        // own entry condition (`monitor?.serviceName === …WATCHDOG_SERVICE`), and
+        // `normalizeIssueExecutionPolicy` THROWS on a monitor its schema rejects
+        // rather than returning a policy with the monitor dropped. If the second
+        // ever changes — dropping an invalid monitor instead of throwing is a
+        // plausible hardening — this needs its own branch and its own reason,
+        // because the run may be well inside the ceiling here.
         if (retryPolicy?.monitor) {
           // PEN-3554: guarded. The watchdog re-arms after an explicit dispatch
           // pass, which is a wider claim→write window than either deferral.
@@ -18343,6 +18352,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // — re-arm and keep waiting versus stop waiting, the gate is not coming.
       // An explicit `timeoutAt` keeps its own reason: the assignee set that
       // deadline and is owed it by name.
+      //
+      // PRECEDENCE, stated because the code decides it silently: when the
+      // watchdog has expired AND `clearReason` is already
+      // `max_attempts_exhausted`, only the watchdog's reason is reported. That
+      // is deliberate — the assignee's gates were never observed while the
+      // watchdog held the monitor, so "its gate budget ran out" is not the
+      // informative fact about this strand; "the run we queued never started"
+      // is. `timeout_exceeded` is the one reason that outranks it, above.
       return clearIssueMonitorAndRecover({
         claimed,
         policy,
