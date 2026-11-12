@@ -9,7 +9,12 @@ import {
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
-import { logActivity, logIssueMonitorClearedUndeliverable, type LogActivityInput } from "./activity-log.js";
+import {
+  logActivity,
+  logIssueMonitorClearedUndeliverable,
+  type ActivityPublish,
+  type LogActivityInput,
+} from "./activity-log.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
 import { buildIssueMonitorEligibilityClear } from "./issue-execution-policy.js";
@@ -330,7 +335,12 @@ export function accessService(db: Db) {
   }
 
   async function archiveMember(companyId: string, memberId: string, input: MemberArchiveInput = {}) {
-    return db.transaction(async (tx) => {
+    // PEN-6577: the monitor-clear activity rows below are logged on `tx`, so
+    // their live events are withheld until this transaction commits. A throw
+    // skips the drain entirely, which is the point: a rolled-back clear must
+    // not have announced itself.
+    const publishes: ActivityPublish[] = [];
+    const result = await db.transaction(async (tx) => {
       await tx.execute(sql`
         select ${companyMemberships.id}
         from ${companyMemberships}
@@ -408,14 +418,14 @@ export function accessService(db: Db) {
         // holding, which nulls their notes. Gated on the CAS matching so a
         // losing write is not reported as a clear.
         if (cleared.length === 0) continue;
-        await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
+        publishes.push(await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
           companyId: issue.companyId,
           issueId: issue.id,
           identifier: issue.identifier,
           status: issue.status,
           audit: clear.audit,
           source: "access.archive_member",
-        });
+        }, { deferPublish: true }));
       }
 
       await tx
@@ -443,6 +453,8 @@ export function accessService(db: Db) {
         reassignedIssueCount: resetInProgress.length + reassigned.length,
       };
     });
+    for (const publish of publishes) await publish();
+    return result;
   }
 
   async function promoteInstanceAdmin(userId: string) {
@@ -487,6 +499,8 @@ export function accessService(db: Db) {
     const existingByCompany = new Map(existing.map((row) => [row.companyId, row]));
     const target = new Set(companyIds);
 
+    // PEN-6577: see `archiveMember` — logged on `tx`, published after commit.
+    const publishes: ActivityPublish[] = [];
     await db.transaction(async (tx) => {
       const toArchive = existing.filter((row) => !target.has(row.companyId) && row.status !== "archived");
       if (toArchive.length > 0 && options.actorUserId && options.actorUserId === userId) {
@@ -549,14 +563,14 @@ export function accessService(db: Db) {
         // PEN-6571: as above — revoking a user's company access clears the
         // monitors on the issues they held, destroying the notes with them.
         if (cleared.length === 0) continue;
-        await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
+        publishes.push(await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
           companyId: issue.companyId,
           issueId: issue.id,
           identifier: issue.identifier,
           status: issue.status,
           audit: clear.audit,
           source: "access.set_user_company_access",
-        });
+        }, { deferPublish: true }));
       }
       if (toArchive.length > 0) {
         await tx
@@ -598,6 +612,7 @@ export function accessService(db: Db) {
         });
       }
     });
+    for (const publish of publishes) await publish();
 
     return listUserCompanyAccess(userId);
   }

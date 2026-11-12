@@ -50,7 +50,7 @@ import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 // imports this one. See PEN-3757 at `activatePendingApproval`.
 import { restoreRedactedAgentMetadata, restoreRedactedAgentRuntimeConfig } from "../agent-redaction.js";
 import { buildIssueMonitorEligibilityClear } from "./issue-execution-policy.js";
-import { logIssueMonitorClearedUndeliverable } from "./activity-log.js";
+import { logIssueMonitorClearedUndeliverable, type ActivityPublish } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import {
   builtInAgentMarkersEqual,
@@ -1036,7 +1036,12 @@ export function agentService(db: Db) {
         });
       }
 
-      return db.transaction(async (tx) => {
+      // PEN-6577: the monitor-clear activity rows below are logged on `tx`, so
+      // their live events are withheld until this transaction commits. A throw
+      // skips the drain, which is the point — a rolled-back clear must not have
+      // announced itself.
+      const publishes: ActivityPublish[] = [];
+      const removed = await db.transaction(async (tx) => {
         await tx.update(agents).set({ reportsTo: null }).where(eq(agents.reportsTo, id));
         const reassignedIssues = await tx
           .update(issues)
@@ -1064,14 +1069,14 @@ export function agentService(db: Db) {
           // runs, so a row attributed to that agent would be erased in the same
           // transaction that wrote it.
           if (cleared.length === 0) continue;
-          await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
+          publishes.push(await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
             companyId: issue.companyId,
             issueId: issue.id,
             identifier: issue.identifier,
             status: issue.status,
             audit: clear.audit,
             source: "agents.remove",
-          });
+          }, { deferPublish: true }));
         }
         await tx.delete(heartbeatRunEvents).where(
           or(
@@ -1144,6 +1149,8 @@ export function agentService(db: Db) {
           .then((rows) => rows[0] ?? null);
         return deleted ? normalizeAgentRow(deleted) : null;
       });
+      for (const publish of publishes) await publish();
+      return removed;
     },
 
     activatePendingApproval: async (id: string, approvedPayload?: Record<string, unknown> | null) => {

@@ -129,7 +129,7 @@ import {
 } from "./execution-workspace-policy.js";
 import { mergeExecutionWorkspaceConfig } from "./execution-workspaces.js";
 import { buildInitialIssueMonitorFields, buildIssueMonitorEligibilityClear, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
-import { logIssueMonitorClearedUndeliverable } from "./activity-log.js";
+import { logIssueMonitorClearedUndeliverable, type ActivityPublish } from "./activity-log.js";
 import { isDeliberateParkActive, isIssueParkExpiryWakeStatus } from "./issue-park-expiry.js";
 import {
   ISSUE_EXECUTION_LOCK_REAPABLE_NEVER_STARTED_RUN_STATUSES,
@@ -8727,6 +8727,10 @@ export function issueService(db: Db) {
     issueId: string,
     mode: TerminalIssueRunCleanupMode,
     companyId: string,
+    // PEN-6577: optional sink for the monitor-clear activity events the restore
+    // below may log on `tx`. Omitted, publication stays inline — previous
+    // behaviour, and the only option for a caller with no commit to drain after.
+    deferredPublishes?: ActivityPublish[],
   ): Promise<boolean> {
     const [issue] = await tx
       .select({
@@ -8819,7 +8823,7 @@ export function issueService(db: Db) {
       .returning({ id: issues.id })
       .then((rows) => rows[0] ?? null);
     if (updated) {
-      await restoreCheckoutPromotedStatus(tx, { issueId, companyId });
+      await restoreCheckoutPromotedStatus(tx, { issueId, companyId }, { deferredPublishes });
     }
     return Boolean(updated);
   }
@@ -8828,8 +8832,14 @@ export function issueService(db: Db) {
     issueId: string,
     mode: TerminalIssueRunCleanupMode,
   ): Promise<boolean> {
-    return withIssueOwnershipTransaction(issueId, false, (tx, companyId) =>
-      clearTerminalIssueRunLocksInTx(tx, issueId, mode, companyId));
+    // PEN-6577: drained after `withIssueOwnershipTransaction` commits. The
+    // generic helper's `operation` contract is untouched — the sink is closed
+    // over by the callback rather than threaded through its return type.
+    const publishes: ActivityPublish[] = [];
+    const cleared = await withIssueOwnershipTransaction(issueId, false, (tx, companyId) =>
+      clearTerminalIssueRunLocksInTx(tx, issueId, mode, companyId, publishes));
+    for (const publish of publishes) await publish();
+    return cleared;
   }
 
   async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
@@ -14572,8 +14582,13 @@ export function issueService(db: Db) {
       });
     },
 
-    release: async (id: string, actorAgentId?: string, actorRunId?: string | null) =>
-      db.transaction(async (tx) => {
+    release: async (id: string, actorAgentId?: string, actorRunId?: string | null) => {
+      // PEN-6577: the monitor-clear activity row below is logged on `tx`, so its
+      // live event is withheld until this transaction commits. A throw skips the
+      // drain, which is the point — a rolled-back clear must not have announced
+      // itself.
+      const publishes: ActivityPublish[] = [];
+      const released = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select ${issues.id} from ${issues} where ${issues.id} = ${id} for update`,
         );
@@ -14721,14 +14736,14 @@ export function issueService(db: Db) {
         // destruction happens here, and `release` is reachable from more than
         // one caller.
         if (monitorClear) {
-          await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
+          publishes.push(await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
             companyId: updated.companyId,
             issueId: updated.id,
             identifier: updated.identifier,
             status: "todo",
             audit: monitorClear.audit,
             source: "issues.release",
-          });
+          }, { deferPublish: true }));
         }
         await cancelStaleIssueContextRuns({
           companyId: updated.companyId,
@@ -14738,7 +14753,10 @@ export function issueService(db: Db) {
         }, tx);
         const [enriched] = await withIssueLabels(tx, [updated]);
         return enriched;
-      }),
+      });
+      for (const publish of publishes) await publish();
+      return released;
+    },
 
     // BLO-29601: release the execution lock ONLY when no owner run is still executing.
     //

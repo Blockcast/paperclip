@@ -42459,6 +42459,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       ? await resolveSessionBeforeForWakeup(recoveryAgent, taskKey)
       : null;
     let gateDelivery: Awaited<ReturnType<typeof enqueueGithubCommitStatusDelivery>> | null = null;
+    const restoredMonitorClearPublishes: ActivityPublish[] = [];
     const promotionResult = await db.transaction(async (tx) => {
       // Lock the context issue (if any) AND every issue that still references this run.
       //
@@ -42589,10 +42590,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         const issueIds = retainPrimaryCheckoutPromotion && primaryIssueId
           ? candidateIssueIds.filter((issueId) => issueId !== primaryIssueId)
           : candidateIssueIds;
+        // PEN-6577: the monitor-clear activity rows this restore writes are
+        // logged on `tx`; their live events are withheld until the commit below.
         await restoreCheckoutPromotedStatuses(tx, {
           issueIds,
           companyId: run.companyId,
-        });
+        }, { deferredPublishes: restoredMonitorClearPublishes });
         return result;
       };
 
@@ -43439,6 +43442,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       );
     });
 
+    // PEN-6577: the promotion transaction has committed; release the live
+    // events for any monitor clears its checkout-restore performed.
+    for (const publish of restoredMonitorClearPublishes) {
+      try {
+        await publish();
+      } catch (err) {
+        logger.warn({ err }, "failed to publish restored-monitor clear activity event");
+      }
+    }
+    restoredMonitorClearPublishes.length = 0;
+
     if (gateDelivery) {
       const target = resolvePrReviewGateStatusTarget(
         runContext,
@@ -44082,6 +44096,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     }
 
     let manualCapacityActivityPublishes: ActivityPublish[] = [];
+    // PEN-6577: distinct from the array above, which is REASSIGNED from
+    // `supersession.publishes` inside the transaction and would discard
+    // anything pushed before that. Drained beside it after each commit.
+    const restoredMonitorClearPublishes: ActivityPublish[] = [];
     let manualCapacityReleasedIssueIds: string[] = [];
 
     if (issueId) {
@@ -44281,7 +44299,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await restoreCheckoutPromotedStatuses(tx, {
             issueIds: manualCapacityReleasedIssueIds,
             companyId: issue.companyId,
-          });
+          }, { deferredPublishes: restoredMonitorClearPublishes });
         };
 
         // Fires on reassignment or issue cancellation. The dep-blocked age origin RESETS
@@ -45585,6 +45603,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "queued" as const, run: newRun };
       });
 
+      for (const publish of restoredMonitorClearPublishes) {
+        try {
+          await publish();
+        } catch (err) {
+          logger.warn({ err }, "failed to publish restored-monitor clear activity event");
+        }
+      }
+      restoredMonitorClearPublishes.length = 0;
+
       for (const publish of manualCapacityActivityPublishes) {
         try {
           await publish();
@@ -45820,7 +45847,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await restoreCheckoutPromotedStatuses(tx, {
           issueIds: manualCapacityReleasedIssueIds,
           companyId: agent.companyId,
-        });
+        }, { deferredPublishes: restoredMonitorClearPublishes });
       };
 
       // The optimistic same-scope lookup above avoids taking the lock in the
@@ -46065,6 +46092,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           + "interval (PEN-1990; rule added in PEN-1995)",
       );
     }
+
+    for (const publish of restoredMonitorClearPublishes) {
+      try {
+        await publish();
+      } catch (err) {
+        logger.warn({ err }, "failed to publish restored-monitor clear activity event");
+      }
+    }
+    restoredMonitorClearPublishes.length = 0;
 
     for (const publish of manualCapacityActivityPublishes) {
       try {
