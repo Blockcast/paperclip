@@ -454,7 +454,15 @@ which §4 says makes them incomparable in **both** directions.
 
 ⚠ **Re-taken again 2026-11-09 on a third surface (`b46cfbd8…`): the 26 reaches from
 `test/secret-scan-budget.test.ts` are gone AT THAT SITE — mitigated, not closed as a class.**
-Windows eight and nine (PEN-5663; `PEN-4989-…-widening.md` §1.4). PEN-5012's
+Windows eight and nine (PEN-5663; `PEN-4989-…-widening.md` §1.4).
+⚠ **§1.4 documents THREE windows — A, B and C — and the count above deliberately counts only A and B.**
+Window C is a **control, not an observation of the deployed population**: same pod, same image, same
+fingerprint, with one line of `test/secret-scan-budget.test.ts` reverted to its pre-fix `PATH` form.
+It was built to attribute window B's zero to `guardedPath()` rather than to the egress-runtime change,
+and the reverted line was restored with `git diff` confirmed empty. A deliberately mutated tree is not
+a window onto the deployed fleet, so counting it would inflate the total and report a constructed arm
+as a measurement — a reader who recounts §1.4's windows and reaches ten should stop at nine.
+PEN-5012's
 `guardedPath()` landed on `penstock-llm-proxy-core` `main` 2026-11-07T13:21Z (#2983) and restores the
 guard directory to the narrowed `PATH`. A site-scoped window over that exact file measured **266 reaches,
 266 wrapped, 0 unwrapped, 0 indeterminate**; the full root `pnpm test` window measured **0 unwrapped
