@@ -2668,7 +2668,9 @@ export async function startServer(): Promise<StartedServer> {
                 }
               })
               .then(chainTimer.pass(2, "reconcileIssueGraphLiveness", async () => {
-                const reconciled = await heartbeat.reconcileIssueGraphLiveness();
+                const reconciled = await heartbeat.reconcileIssueGraphLiveness({
+                  recoveryChainId: chainTimer.chainId,
+                });
                 // BLO-29601: auto-resolving a dead escalation is a change to the issue
                 // graph too. Without it in this gate the drain runs silently and the only
                 // evidence it happened at all is the cancelled rows themselves.
