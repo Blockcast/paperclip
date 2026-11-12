@@ -9,10 +9,10 @@ import {
 import type { PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { conflict, notFound } from "../errors.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
-import { logActivity, type LogActivityInput } from "./activity-log.js";
+import { logActivity, logIssueMonitorClearedUndeliverable, type LogActivityInput } from "./activity-log.js";
 import { authorizationService, type AuthorizationActor, type AuthorizationResource } from "./authorization.js";
 import { ensureHumanRoleDefaultGrants } from "./principal-access-compatibility.js";
-import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
+import { buildIssueMonitorEligibilityClear } from "./issue-execution-policy.js";
 import { membershipColumns, principalGrantColumns } from "./access-columns.js";
 
 type MembershipRow = typeof companyMemberships.$inferSelect;
@@ -396,14 +396,26 @@ export function accessService(db: Db) {
         .returning();
 
       for (const issue of [...resetInProgress, ...reassigned]) {
-        const monitorPatch = buildIssueMonitorEligibilityPatch(issue);
-        if (Object.keys(monitorPatch).length === 0) continue;
-        await tx.update(issues).set({ ...monitorPatch, updatedAt: new Date() }).where(and(
+        const clear = buildIssueMonitorEligibilityClear(issue);
+        if (!clear) continue;
+        const cleared = await tx.update(issues).set({ ...clear.patch, updatedAt: new Date() }).where(and(
           eq(issues.id, issue.id),
           issue.monitorNextCheckAt
             ? eq(issues.monitorNextCheckAt, issue.monitorNextCheckAt)
             : sql`${issues.monitorNextCheckAt} is null`,
-        ));
+        )).returning({ id: issues.id });
+        // PEN-6571: archiving a member clears every monitor its issues were
+        // holding, which nulls their notes. Gated on the CAS matching so a
+        // losing write is not reported as a clear.
+        if (cleared.length === 0) continue;
+        await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          identifier: issue.identifier,
+          status: issue.status,
+          audit: clear.audit,
+          source: "access.archive_member",
+        });
       }
 
       await tx
@@ -525,15 +537,26 @@ export function accessService(db: Db) {
             )
         : [];
       for (const issue of assignedIssues) {
-        const monitorPatch = buildIssueMonitorEligibilityPatch(issue);
-        if (Object.keys(monitorPatch).length === 0) continue;
-        await tx.update(issues).set({ ...monitorPatch, updatedAt: new Date() }).where(and(
+        const clear = buildIssueMonitorEligibilityClear(issue);
+        if (!clear) continue;
+        const cleared = await tx.update(issues).set({ ...clear.patch, updatedAt: new Date() }).where(and(
           eq(issues.id, issue.id),
           eq(issues.assigneeUserId, userId),
           issue.monitorNextCheckAt
             ? eq(issues.monitorNextCheckAt, issue.monitorNextCheckAt)
             : sql`${issues.monitorNextCheckAt} is null`,
-        ));
+        )).returning({ id: issues.id });
+        // PEN-6571: as above — revoking a user's company access clears the
+        // monitors on the issues they held, destroying the notes with them.
+        if (cleared.length === 0) continue;
+        await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          identifier: issue.identifier,
+          status: issue.status,
+          audit: clear.audit,
+          source: "access.set_user_company_access",
+        });
       }
       if (toArchive.length > 0) {
         await tx

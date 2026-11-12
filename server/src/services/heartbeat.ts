@@ -387,8 +387,8 @@ import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   ISSUE_MONITOR_DISPATCH_WATCHDOG_GATE_PREFIX,
   buildIssueMonitorDispatchRearmPatch,
-  buildIssueMonitorClearedPatch,
-  buildIssueMonitorEligibilityPatch,
+  buildIssueMonitorClear,
+  buildIssueMonitorEligibilityClear,
   buildIssueMonitorTriggeredPatch,
   derivePersistedMonitorState,
   dispatchWatchdogGateSignals,
@@ -18170,12 +18170,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     await db
       .update(issues)
       .set({
-        ...buildIssueMonitorClearedPatch({
+        ...buildIssueMonitorClear({
           issue: input.claimed,
           policy: input.policy,
           clearReason: input.clearReason,
           clearedAt: input.now,
-        }),
+        }).patch,
         updatedAt: input.now,
       })
       .where(eq(issues.id, input.claimed.id));
@@ -18262,7 +18262,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    *  - `cleared` — no longer deliverable AND still holding a `monitorNextCheckAt`,
    *    i.e. some writer demoted the row without clearing its monitor. Cleared
    *    with the reason the row's own status/assignee implies, through the same
-   *    primitive (`buildIssueMonitorEligibilityPatch`) and reported under the
+   *    primitive (`buildIssueMonitorEligibilityClear`) and reported under the
    *    same activity action (`issue.monitor_cleared_undeliverable`) as the
    *    periodic backstop, so the two agree by construction rather than by
    *    matching comments.
@@ -18321,21 +18321,23 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         return { kind: "landed" as const };
       }
 
-      const clearPatch = buildIssueMonitorEligibilityPatch(fresh);
-      // Empty patch means `monitorNextCheckAt` is already null — the cancel (or
+      const clear = buildIssueMonitorEligibilityClear(fresh);
+      // `null` means `monitorNextCheckAt` is already null — the cancel (or
       // whatever else demoted the row) cleared the monitor itself. Writing here
       // would only risk disturbing state that is already correct.
-      if (Object.keys(clearPatch).length === 0) return { kind: "already_cleared" as const, clearReason: null };
+      if (!clear) return { kind: "already_cleared" as const, clearReason: null };
 
       await tx
         .update(issues)
-        .set({ ...clearPatch, updatedAt: new Date() })
+        .set({ ...clear.patch, updatedAt: new Date() })
         .where(eq(issues.id, fresh.id));
 
       return {
         kind: "cleared" as const,
-        clearReason: (clearPatch.executionState as { monitor?: { clearReason?: string } } | null)
-          ?.monitor?.clearReason ?? null,
+        // PEN-6571: was an unchecked cast back into `patch.executionState` to
+        // recover the reason from the object that had just discarded it. The
+        // builder now returns it.
+        clearReason: clear.audit.clearReason,
         identifier: fresh.identifier,
         companyId: fresh.companyId,
         status: fresh.status,
@@ -18462,7 +18464,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     // ceiling have to be read from the same place or neither reading is coherent.
     //
     // It also matches what this row's own next write records:
-    // `buildIssueMonitorClearedPatch` and `buildIssueMonitorTriggeredPatch` both
+    // `buildIssueMonitorClear` and `buildIssueMonitorTriggeredPatch` both
     // derive their `previous` through this same helper, unfiltered, and carry that
     // metadata forward. Filtering here and not there would reinstate the PEN-5170
     // contradiction from the other end — a decision reported against one monitor
@@ -18557,12 +18559,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         await db
           .update(issues)
           .set({
-            ...buildIssueMonitorClearedPatch({
+            ...buildIssueMonitorClear({
               issue: claimed,
               policy,
               clearReason: "dispatch_watchdog_recovered",
               clearedAt: input.now,
-            }),
+            }).patch,
             updatedAt: input.now,
           })
           .where(eq(issues.id, claimed.id));
@@ -19232,12 +19234,12 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           await db
             .update(issues)
             .set({
-              ...buildIssueMonitorClearedPatch({
+              ...buildIssueMonitorClear({
                 issue: claimed,
                 policy,
                 clearReason: "dispatch_skipped",
                 clearedAt: input.now,
-              }),
+              }).patch,
               updatedAt: new Date(),
             })
             .where(eq(issues.id, claimed.id));
@@ -33945,7 +33947,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * indistinguishable, on every triage surface, from a monitor that is simply
    * not due yet.
    *
-   * `applyMonitorTransition` and `buildIssueMonitorEligibilityPatch` already
+   * `applyMonitorTransition` and `buildIssueMonitorEligibilityClear` already
    * close this at the instant of a demotion, and three such transition-time
    * fixes have shipped (checkout-restore, raw assignee demotion, bulk user
    * removal). Each one has to be taught about one specific producer, and the
@@ -33984,7 +33986,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
    * The monitor's `notes` are the whole record of what the run was waiting for,
    * so the activity entry below carries them alongside the clear reason, read
    * from the pre-clear row. PEN-5902: that entry is now the ONLY copy for this
-   * clear reason — `buildIssueMonitorClearedPatch` keeps the audit copy on
+   * clear reason — `buildIssueMonitorClear` keeps the audit copy on
    * `executionState.monitor.notes` for `cancelled` alone, because a cancelled
    * row's recovery handoff is emitted on a later tick and has nowhere else to
    * read them from. Deliberately an activity row and not an issue comment — a
@@ -34036,7 +34038,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           // requires a null `monitorNextCheckAt`), and the triggered arm is a
           // deliberate SUPERSET of `derivePersistedMonitorState`'s triggered
           // branch -- it is a cheap SQL prefilter, and
-          // `buildIssueMonitorEligibilityPatch` remains the authority for an
+          // `buildIssueMonitorEligibilityClear` remains the authority for an
           // over-selected row whose monitor JSON is PRESENT.
           //
           // PEN-6202 fail-closed guard -- `jsonb_typeof(... ->'monitor') =
@@ -34104,8 +34106,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     for (const candidate of candidates) {
       try {
-        const patch = buildIssueMonitorEligibilityPatch(candidate);
-        if (Object.keys(patch).length === 0) {
+        const clear = buildIssueMonitorEligibilityClear(candidate);
+        if (!clear) {
           skipped += 1;
           continue;
         }
@@ -34113,7 +34115,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
         const updated = await db
           .update(issues)
-          .set({ ...patch, updatedAt: new Date() })
+          .set({ ...clear.patch, updatedAt: new Date() })
           .where(
             and(
               eq(issues.id, candidate.id),
@@ -34164,8 +34166,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         }
         cleared += 1;
 
-        const clearReason = (patch.executionState as { monitor?: { clearReason?: string } } | null)
-          ?.monitor?.clearReason ?? null;
+        // PEN-6571: second of the two sites that cast back into
+        // `patch.executionState` to recover the reason the builder had just
+        // computed. The builder returns it on `audit` now.
+        const clearReason = clear.audit.clearReason;
         await logActivity(db, {
           companyId: candidate.companyId,
           actorType: "system",
@@ -34494,7 +34498,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // eligibility sweep does — selection and write are separate statements,
       // and a concurrent reopen can arm a fresh monitor in between.
       if (row.monitorNextCheckAt && row.status === "cancelled") {
-        const clearPatch = buildIssueMonitorClearedPatch({
+        const clear = buildIssueMonitorClear({
           issue: row,
           policy: normalizeIssueExecutionPolicy(row.executionPolicy ?? null),
           clearReason: "cancelled",
@@ -34502,7 +34506,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         const updated = await db
           .update(issues)
-          .set({ ...clearPatch, updatedAt: now })
+          .set({ ...clear.patch, updatedAt: now })
           .where(
             and(
               eq(issues.id, row.id),
@@ -34535,8 +34539,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         });
         row = {
           ...row,
-          executionPolicy: clearPatch.executionPolicy as Record<string, unknown> | null,
-          executionState: clearPatch.executionState as Record<string, unknown> | null,
+          executionPolicy: clear.patch.executionPolicy as Record<string, unknown> | null,
+          executionState: clear.patch.executionState as Record<string, unknown> | null,
           monitorNextCheckAt: null,
           monitorWakeRequestedAt: null,
           monitorNotes: null,
@@ -34677,7 +34681,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       if (opts?.beforeRecover) await opts.beforeRecover();
 
-      // `buildIssueMonitorClearedPatch` nulls `monitorNotes` (PEN-1995) and
+      // `buildIssueMonitorClear` nulls `monitorNotes` (PEN-1995) and
       // keeps the audit copy on the state, so the column is empty by the time
       // this pass runs. Re-hydrate from the audit copy: the notes are the
       // whole record of what the run was waiting for, and they feed the

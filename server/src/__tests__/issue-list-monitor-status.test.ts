@@ -14,7 +14,7 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 // on `issueListSelect` justified that by saying it is "mirrored by the monitor_* columns".
 // That holds for the monitor's SCHEDULING fields and not for its lifecycle state: a fire
 // nulls `monitorNextCheckAt` and leaves `monitorLastTriggeredAt` standing, and so does
-// `buildIssueMonitorClearedPatch` — so `triggered` and `cleared` are byte-identical on this
+// `buildIssueMonitorClear` — so `triggered` and `cleared` are byte-identical on this
 // surface while their attendance verdicts are opposite. Every list-based attendance sweep
 // (DevOps's `check-in-review-dark-rows.mjs`, the CTO HEARTBEAT §S7 predicate) was reading a
 // surface that could not answer the question it was asking.

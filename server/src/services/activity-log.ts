@@ -11,6 +11,7 @@ import { sanitizeRecord } from "../redaction.js";
 import { logger } from "../middleware/logger.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import type { IssueMonitorClearAudit } from "./issue-execution-policy.js";
 
 const PLUGIN_EVENT_SET: ReadonlySet<string> = new Set(PLUGIN_EVENT_TYPES);
 const ACTIVITY_ACTION_TO_PLUGIN_EVENT: Readonly<Record<string, PluginEventType>> = {
@@ -397,4 +398,64 @@ export async function logActivity(
     }
   }
   return NOOP_ACTIVITY_PUBLISH;
+}
+
+
+/**
+ * PEN-6571 — record a monitor clear that destroyed the row's `monitorNotes`.
+ *
+ * `clearArmedMonitorColumns` factors the DESTRUCTIVE half of the monitor-clear
+ * invariant, so no clear site can forget to null the column. The PRESERVING
+ * half was open-coded at every caller, and so eight of sixteen clear sites did
+ * forget: five wrote no activity row at all, three wrote an `issue.updated`
+ * carrying no monitor payload. This is the preserving half in the same
+ * factored position, so the two travel together.
+ *
+ * Deliberately one action name. The clear sites that already reported used
+ * five between them, which makes "when was this cleared, and what did it say?"
+ * a five-name search; every site reached through
+ * `buildIssueMonitorEligibilityClear` shares a condition and a primitive, so
+ * it reports under the name the heartbeat backstop already uses for exactly
+ * that condition.
+ *
+ * Callers pass the `audit` their `buildIssueMonitorClear` returned. It is read
+ * from the PRE-clear row, so it must be captured before the write lands —
+ * which is why it travels on the return value rather than being re-derived
+ * here from a row that no longer carries it.
+ */
+export async function logIssueMonitorClearedUndeliverable(
+  db: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    identifier?: string | null;
+    status: string;
+    audit: IssueMonitorClearAudit;
+    source: string;
+    actorType?: LogActivityInput["actorType"];
+    actorId?: string;
+    agentId?: string | null;
+    runId?: string | null;
+  },
+): Promise<void> {
+  await logActivity(db, {
+    companyId: input.companyId,
+    actorType: input.actorType ?? "system",
+    actorId: input.actorId ?? "system",
+    agentId: input.agentId ?? null,
+    runId: input.runId ?? null,
+    action: "issue.monitor_cleared_undeliverable",
+    entityType: "issue",
+    entityId: input.issueId,
+    details: {
+      identifier: input.identifier ?? null,
+      clearReason: input.audit.clearReason,
+      status: input.status,
+      nextCheckAt: input.audit.nextCheckAt,
+      attemptCount: input.audit.attemptCount,
+      lastTriggeredAt: input.audit.lastTriggeredAt,
+      notes: input.audit.notes,
+      source: input.source,
+    },
+  });
 }

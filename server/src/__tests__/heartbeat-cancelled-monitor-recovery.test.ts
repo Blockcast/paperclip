@@ -123,7 +123,7 @@ describeEmbeddedPostgres("heartbeat reconcileCancelledIssueMonitorRecoveries", (
   }
 
   /**
-   * The row as `buildIssueMonitorClearedPatch` leaves it after a cancel: live
+   * The row as `buildIssueMonitorClear` leaves it after a cancel: live
    * columns empty, the whole record of what was owed on the audit copy. Note
    * `monitorNotes` is deliberately null — PEN-1995 nulls the column on every
    * clear, which is why the handoff has to read the audit copy instead.
