@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
   agents,
   companies,
   companyMemberships,
@@ -56,6 +57,13 @@ describeEmbeddedPostgres("access service", () => {
   });
 
   afterEach(async () => {
+    // PEN-6571: `archiveMember` and `setUserCompanyAccess` now record the
+    // monitor clears they perform, so these cases write activity rows that
+    // reference the company. Deleted first, ahead of `companies`, or the
+    // company delete trips `activity_log_company_id_companies_id_fk`. The
+    // suite passed before only because those paths wrote nothing at all,
+    // which is the defect PEN-6571 is about.
+    await db.delete(activityLog);
     await db.delete(issues);
     await db.delete(principalPermissionGrants);
     await db.delete(instanceUserRoles);
