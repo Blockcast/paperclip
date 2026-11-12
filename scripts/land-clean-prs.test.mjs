@@ -68,6 +68,9 @@ import {
   unsatisfiedOwners,
   codeownersPatternToRegExp,
   fetchCodeownerRules,
+  fetchCodeownerEnforcement,
+  landRepoHoldReason,
+  CODEOWNER_ENFORCEMENT,
   fetchMergeQueueEntries,
   liveMergeQueueEntry,
   impliedOwners,
@@ -1393,8 +1396,14 @@ describe("notify-only repos (PEN-5430)", () => {
     assert.doesNotMatch(notifyBody, /does not enforce CODEOWNERS/);
     assert.match(notifyBody, /does not land pull requests in this repository/);
     assert.match(notifyBody, /waiting on the requested review/);
-    // Control: the land-repo wording is unchanged, and the two really do differ.
-    assert.match(landBody, /does not enforce CODEOWNERS/);
+    // Control: the two appliers really do differ.
+    //
+    // PEN-6522 narrowed what the land arm says but not THAT it differs. The
+    // land sentence is now derived per repo, and this row carries no
+    // verdict, so it is the UNKNOWN wording — which still must not tell
+    // anyone their review is unenforced.
+    assert.match(landBody, /could not be read from here/);
+    assert.doesNotMatch(landBody, /does not enforce CODEOWNERS/);
     assert.notEqual(notifyBody, landBody);
     // Both still carry the dedupe marker and the outstanding owner.
     for (const body of [notifyBody, landBody]) {
@@ -1900,6 +1909,354 @@ describe("fetchCodeownerRules fails closed on anything it did not read", () => {
     // A 404 named only in prose is not a status; the caller must fail closed.
     assert.ok(!isNotFoundGhError("Not Found"));
     assert.ok(!isNotFoundGhError(undefined));
+  });
+});
+
+/**
+ * PEN-6522. The hold SENTENCE used to be a repo-independent constant that
+ * asserted "GitHub does not enforce CODEOWNERS on this repository". Measured
+ * 2026-11-12 it is false on `Blockcast/trafficcontrol@master` and
+ * `Blockcast/magma@main`, and it was emitted on `trafficcontrol`#2959 anyway.
+ *
+ * These pin the derivation and, above all, the direction: an unreadable plane
+ * must produce a sentence that claims NOTHING, never one that claims absence.
+ */
+describe("the code-owner hold reason is derived per repo, and fails to claiming nothing", () => {
+  const { ENFORCED, UNENFORCED, UNKNOWN } = CODEOWNER_ENFORCEMENT;
+
+  function ghError(stderr) {
+    return Object.assign(new Error("Command failed"), { stderr: Buffer.from(stderr) });
+  }
+
+  /** What `gh` does on a partial FORBIDDEN: exit non-zero. Measured 2026-11-12. */
+  const forbidden = () => ghError("gh: Resource not accessible by integration\n");
+
+  const ownerRule = (requireCodeOwnerReview) => ({
+    type: "PULL_REQUEST",
+    parameters: { requireCodeOwnerReview },
+  });
+  const rulesRef = (nodes, totalCount = nodes.length) => ({ rules: { totalCount, nodes } });
+  const protectionRef = (branchProtectionRule) => ({ branchProtectionRule });
+
+  /**
+   * Answers the two planes SEPARATELY, and records which were asked — the
+   * split is the safety property, so the call log is part of the assertion.
+   * A function answer throws; a string answer is returned verbatim.
+   */
+  function planes({ rules, protection }, calls = []) {
+    return (args) => {
+      const query = String(args.find((arg) => String(arg).startsWith("query=")) ?? "");
+      const plane = query.includes("branchProtectionRule") ? "protection" : "rules";
+      calls.push(plane);
+      const answer = plane === "protection" ? protection : rules;
+      if (typeof answer === "function") throw answer();
+      if (typeof answer === "string") return answer;
+      return JSON.stringify({ data: { repository: { ref: answer ?? null } } });
+    };
+  }
+
+  it("reads ENFORCED off the rules plane and does not probe the second one", () => {
+    // `Blockcast/trafficcontrol@master` and `Blockcast/magma@main`, measured
+    // 2026-11-12: an ACTIVE ruleset whose `PULL_REQUEST` rule carries
+    // `requireCodeOwnerReview: true`. No second read can retract that, so the
+    // withheld classic plane is never consulted.
+    const calls = [];
+    assert.equal(
+      fetchCodeownerEnforcement(
+        "Blockcast/trafficcontrol",
+        "master",
+        planes({ rules: rulesRef([ownerRule(true)]) }, calls),
+      ),
+      ENFORCED,
+    );
+    assert.deepEqual(calls, ["rules"]);
+  });
+
+  it("does not read a PULL_REQUEST rule that requires approvals but NOT an owner", () => {
+    // `Blockcast/onprem-k8s@master`, measured 2026-11-12:
+    // `requiredApprovingReviewCount: 0, requireCodeOwnerReview: false`. A
+    // PULL_REQUEST rule is not by itself a code-owner requirement.
+    const calls = [];
+    assert.equal(
+      fetchCodeownerEnforcement(
+        "o/r",
+        "master",
+        planes({ rules: rulesRef([ownerRule(false)]), protection: forbidden }, calls),
+      ),
+      UNKNOWN,
+    );
+    assert.deepEqual(calls, ["rules", "protection"], "a silent rules plane must still try the second");
+  });
+
+  it("reaches UNENFORCED only when the classic plane POSITIVELY says nothing protects the branch", () => {
+    // `Blockcast/Network-Operator-Portal@main`, measured 2026-11-12: no
+    // PULL_REQUEST rule, and `ref.branchProtectionRule` answers a CLEAN null
+    // at `gh` exit 0 with NO errors — a readable "no classic rule here".
+    const calls = [];
+    assert.equal(
+      fetchCodeownerEnforcement(
+        "o/r",
+        "main",
+        planes({ rules: rulesRef([]), protection: protectionRef(null) }, calls),
+      ),
+      UNENFORCED,
+    );
+    assert.deepEqual(calls, ["rules", "protection"]);
+  });
+
+  it("⛔ a WITHHELD classic plane is UNKNOWN, never UNENFORCED", () => {
+    // The whole row. `ref.branchProtectionRule` needs `administration: read`,
+    // which no agent seat on this fleet holds, so this is the LIVE answer on
+    // `paperclip` and `trafficcontrol` alike: `null` at exit 1 carrying
+    // `errors[0].type: FORBIDDEN`.
+    //
+    // The counter-example that makes the distinction load-bearing:
+    // `Blockcast/penstock-llm-proxy-core@main` returns ZERO rules on the
+    // readable plane while 20 of 20 sampled open PRs there read
+    // `REVIEW_REQUIRED` against a `*` catch-all CODEOWNERS. A silent rules
+    // plane is NOT evidence of absence.
+    assert.equal(
+      fetchCodeownerEnforcement(
+        "Blockcast/paperclip",
+        "master",
+        planes({ rules: rulesRef([]), protection: forbidden }),
+      ),
+      UNKNOWN,
+    );
+    for (const stderr of ["gh: Internal Server Error (HTTP 500)\n", "spawnSync gh ENOENT"]) {
+      assert.equal(
+        fetchCodeownerEnforcement(
+          "o/r",
+          "main",
+          planes({ rules: rulesRef([]), protection: () => ghError(stderr) }),
+        ),
+        UNKNOWN,
+      );
+    }
+  });
+
+  it("⛔ a 200 carrying `errors` is unread too, even though `gh` exited cleanly", () => {
+    // The second guard, kept beside the `catch` because it is a different
+    // shape: a payload that parsed, with a null body and an error beside it.
+    const withErrors = JSON.stringify({
+      data: { repository: { ref: { branchProtectionRule: null } } },
+      errors: [{ type: "FORBIDDEN", message: "Resource not accessible by integration" }],
+    });
+    assert.equal(
+      fetchCodeownerEnforcement("o/r", "main", planes({ rules: rulesRef([]), protection: withErrors })),
+      UNKNOWN,
+    );
+    // And on the FIRST plane it is equally unread — never an empty rule set.
+    assert.equal(fetchCodeownerEnforcement("o/r", "main", planes({ rules: withErrors })), UNKNOWN);
+  });
+
+  it("reads the classic plane when it answers, in both directions", () => {
+    const served = (rule) =>
+      fetchCodeownerEnforcement(
+        "o/r",
+        "main",
+        planes({ rules: rulesRef([]), protection: protectionRef(rule) }),
+      );
+    assert.equal(served({ requiresCodeOwnerReviews: true }), ENFORCED);
+    assert.equal(served({ requiresCodeOwnerReviews: false }), UNENFORCED);
+    // ⛔ A rule object carrying neither boolean is a shape this seat has never
+    // observed, so it must not be read as "measured, nothing required".
+    assert.equal(served({}), UNKNOWN);
+  });
+
+  it("⛔ a TRUNCATED rules page is unread, not an empty rule set", () => {
+    // The rule that requires an owner could be the one that fell off the end,
+    // and this plane is the only one that can ever say ENFORCED on this fleet.
+    assert.equal(
+      fetchCodeownerEnforcement(
+        "o/r",
+        "main",
+        planes({ rules: rulesRef([ownerRule(false)], 51), protection: protectionRef(null) }),
+      ),
+      UNKNOWN,
+    );
+    // Control: the same page, not truncated, reaches the second plane.
+    assert.equal(
+      fetchCodeownerEnforcement(
+        "o/r",
+        "main",
+        planes({ rules: rulesRef([ownerRule(false)], 1), protection: protectionRef(null) }),
+      ),
+      UNENFORCED,
+    );
+  });
+
+  it("⛔ a failed rules read short-circuits, so a dead ref never reaches the UNENFORCED arm", () => {
+    // Ordering guard. A branch that does not resolve answers `ref: null` on
+    // BOTH planes, and on the second that is indistinguishable from "nothing
+    // protects it". Running the readable plane FIRST keeps a dead ref out of
+    // the UNENFORCED branch. Measured: `Blockcast/remote-key-server` answers
+    // `ref: null` for `refs/heads/main`.
+    const calls = [];
+    assert.equal(
+      fetchCodeownerEnforcement(
+        "o/r",
+        "main",
+        planes({ rules: null, protection: protectionRef(null) }, calls),
+      ),
+      UNKNOWN,
+    );
+    assert.deepEqual(calls, ["rules"], "the classic plane is never asked");
+  });
+
+  it("⛔ a ref that stops resolving BETWEEN the two reads is UNKNOWN, not UNPROTECTED", () => {
+    // The `?? null` on the ref is not redundant with the non-array guard above
+    // it: that one catches an unreadable body on the FIRST plane, this one
+    // catches a ref that did not resolve on the SECOND. They differ in
+    // direction — a null ref reaching the classic plane as `{}` would read as
+    // "nothing protects this branch", which is the fail-open. Reachable as a
+    // race: the branch is deleted between the two reads.
+    const calls = [];
+    assert.equal(
+      fetchCodeownerEnforcement("o/r", "main", planes({ rules: rulesRef([]), protection: null }, calls)),
+      UNKNOWN,
+    );
+    assert.deepEqual(calls, ["rules", "protection"], "it really did reach the second plane");
+  });
+
+  it("treats an unreadable repo or branch as UNKNOWN and asks nothing", () => {
+    const calls = [];
+    for (const branch of ["", null, undefined]) {
+      assert.equal(fetchCodeownerEnforcement("o/r", branch, planes({ rules: rulesRef([]) }, calls)), UNKNOWN);
+    }
+    for (const repo of ["", "no-slash", null]) {
+      assert.equal(fetchCodeownerEnforcement(repo, "main", planes({ rules: rulesRef([]) }, calls)), UNKNOWN);
+    }
+    assert.deepEqual(calls, [], "an unread repo or default branch costs no API call");
+    // A non-array `nodes` is an answer this function cannot read.
+    assert.equal(
+      fetchCodeownerEnforcement("o/r", "main", planes({ rules: { rules: { totalCount: 0, nodes: null } } })),
+      UNKNOWN,
+    );
+  });
+
+  it("names the branch, holds in every state, and the three sentences differ", () => {
+    const say = (codeownerEnforcement) => landRepoHoldReason({ baseRefName: "master", codeownerEnforcement });
+    const enforced = say(ENFORCED);
+    const unenforced = say(UNENFORCED);
+    const unknown = say(UNKNOWN);
+
+    assert.equal(new Set([enforced, unenforced, unknown]).size, 3, "three distinct sentences");
+    for (const sentence of [enforced, unenforced, unknown]) {
+      assert.match(sentence, /`master`/, "every sentence names the base branch");
+      assert.match(sentence, /holds it here rather than enqueuing it\.$/, "the HOLD never varies");
+    }
+    // ⛔ The UNKNOWN wording must assert NOTHING about GitHub in either
+    // direction. That is the whole correction: the constant it replaces
+    // asserted absence from a read nobody had taken.
+    assert.match(unknown, /could not be read/);
+    assert.doesNotMatch(unknown, /No branch rule/);
+    assert.doesNotMatch(unknown, /will not merge until/);
+    assert.doesNotMatch(unknown, /does not enforce CODEOWNERS/);
+    // An unnamed base degrades the wording and nothing else.
+    assert.match(landRepoHoldReason({ codeownerEnforcement: UNKNOWN }), /base branch/);
+  });
+
+  it("CONTROL: the two arms differ end to end, trafficcontrol vs Network-Operator-Portal", () => {
+    // Done-when #2 of PEN-6522, with both repos' measured 2026-11-12 shapes
+    // driven through the real reader rather than asserted.
+    const sentenceFor = (shape, branch) =>
+      landRepoHoldReason({
+        baseRefName: branch,
+        codeownerEnforcement: fetchCodeownerEnforcement("o/r", branch, planes(shape)),
+      });
+
+    const trafficcontrol = sentenceFor({ rules: rulesRef([ownerRule(true)]) }, "master");
+    const networkOperatorPortal = sentenceFor(
+      { rules: rulesRef([]), protection: protectionRef(null) },
+      "main",
+    );
+
+    assert.notEqual(trafficcontrol, networkOperatorPortal, "the whole point: the text is per-repo");
+    assert.match(trafficcontrol, /GitHub requires a code-owner review on `master`/);
+    assert.doesNotMatch(trafficcontrol, /would not block/);
+    assert.match(networkOperatorPortal, /No branch rule on `main` requires a code-owner review/);
+    // And neither repo gets the constant this row removed.
+    for (const sentence of [trafficcontrol, networkOperatorPortal]) {
+      assert.doesNotMatch(sentence, /does not enforce CODEOWNERS on this repository/);
+    }
+  });
+
+  it("⛔ the verdict chooses a SENTENCE and never an action: all three still hold, and none merges", () => {
+    // A misread here must cost a wrong sentence and nothing else.
+    const bodies = new Set();
+    for (const codeownerEnforcement of [ENFORCED, UNENFORCED, UNKNOWN, undefined]) {
+      const issued = [];
+      const outcome = applyRow(
+        "o/r",
+        {
+          number: 2959,
+          action: "codeowner-review-requested",
+          detail: "kkroo",
+          baseRefName: "master",
+          codeownerEnforcement,
+        },
+        (args) => {
+          issued.push(args);
+          if (args[0] === "api") return "[]";
+          return "";
+        },
+      );
+      assert.equal(outcome, "posted");
+      assert.deepEqual(
+        issued.filter((args) => args[0] === "pr" && args[1] === "merge"),
+        [],
+        "no state of the verdict reaches `gh pr merge`",
+      );
+      const posted = issued.find((args) => args[0] === "pr" && args[1] === "comment").at(-1);
+      assert.ok(posted.startsWith(CODEOWNER_REQUEST_MARKER), "still under the dedupe marker");
+      assert.match(posted, /outstanding code-owner review request \(kkroo\)/, "still names the owner");
+      bodies.add(posted);
+    }
+    // Four inputs, three distinct bodies: an ABSENT verdict is the UNKNOWN one.
+    assert.equal(bodies.size, 3);
+  });
+
+  it("carries the verdict and the base branch from the PR onto the held row", () => {
+    const held = (overrides) =>
+      classifyPr(pr({ reviewRequests: [{ login: "kkroo" }], baseRefName: "master", ...overrides }), {
+        now: NOW,
+      });
+
+    const withVerdict = held({ codeownerEnforcement: ENFORCED });
+    assert.equal(withVerdict.action, "codeowner-review-requested");
+    assert.equal(withVerdict.codeownerEnforcement, ENFORCED);
+    assert.equal(withVerdict.baseRefName, "master");
+    // ⛔ An unread verdict defaults to UNKNOWN rather than to absence, so a
+    // row built by any path that does not carry one still claims nothing.
+    assert.equal(held({}).codeownerEnforcement, UNKNOWN);
+    assert.equal(held({ baseRefName: undefined }).baseRefName, null);
+  });
+
+  it("reads the enforcement once per repo, against the repo's DEFAULT branch", () => {
+    // Same placement argument as `fetchCodeownerRules` and `fetchDefaultBranch`:
+    // the requirement is a property of the base branch, not of a PR.
+    const asked = [];
+    const prs = fetchOpenPrs("o/r", {
+      run: (args) => {
+        if (args[0] === "pr" && args[1] === "list") {
+          return JSON.stringify([
+            { number: 1, headRefOid: HEAD, baseRefName: "master", reviewRequests: [] },
+            { number: 2, headRefOid: OTHER, baseRefName: "master", reviewRequests: [] },
+          ]);
+        }
+        if (args[0] === "api") return "[]";
+        return "{}";
+      },
+      mergeStates: () => new Map([[1, "BLOCKED"], [2, "BLOCKED"]]),
+      defaultBranch: () => "master",
+      enforcement: (repo, branch) => {
+        asked.push([repo, branch]);
+        return ENFORCED;
+      },
+    });
+    assert.deepEqual(asked, [["o/r", "master"]], "one read per repo, keyed on the default branch");
+    for (const pr of prs) assert.equal(pr.codeownerEnforcement, ENFORCED);
   });
 });
 

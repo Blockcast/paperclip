@@ -1505,7 +1505,14 @@ export function classifyPr(pr, { now = Date.now(), settleMinutes = CHECK_SETTLE_
 
   const owners = unsatisfiedOwners(pr);
   if (owners.length > 0) {
-    return row("codeowner-review-requested", "owner-approval-pending", owners.join(", "));
+    const held = row("codeowner-review-requested", "owner-approval-pending", owners.join(", "));
+    // PEN-6522. Carried onto the row because the hold SENTENCE is a
+    // property of the base branch, and `applyRow` is handed a row rather
+    // than a PR. Both default to "say nothing": a row built without them
+    // gets the `unknown` wording, never an assertion about GitHub.
+    held.baseRefName = typeof pr?.baseRefName === "string" ? pr.baseRefName : null;
+    held.codeownerEnforcement = pr?.codeownerEnforcement ?? CODEOWNER_ENFORCEMENT.UNKNOWN;
+    return held;
   }
 
   if (UNLANDABLE_MERGE_STATES.has(mergeState)) return row("skip", `mergestate:${mergeState}`);
@@ -2659,6 +2666,150 @@ export function fetchCodeownerRules(repo, run = gh) {
 }
 
 /**
+ * Whether GitHub requires a CODE-OWNER review on `branch` of `repo`: one of
+ * `enforced`, `unenforced`, or `unknown`.
+ *
+ * This decides only what the hold SENTENCE says. The hold itself is
+ * unconditional — all three states hold the PR — so a misread here costs a
+ * wrong sentence and can never cost a wrong merge.
+ */
+export const CODEOWNER_ENFORCEMENT = {
+  ENFORCED: "enforced",
+  UNENFORCED: "unenforced",
+  UNKNOWN: "unknown",
+};
+
+/** A `Ref.rules` entry that requires a code-owner review. */
+function ruleRequiresCodeOwnerReview(rule) {
+  return rule?.type === "PULL_REQUEST" && rule?.parameters?.requireCodeOwnerReview === true;
+}
+
+/** How many branch rules one read asks for. More than any branch on this fleet carries. */
+const BRANCH_RULE_PAGE = 50;
+
+/**
+ * Reads that requirement for one repo and branch.
+ *
+ * PEN-6522. The hold sentence used to be a repo-independent CONSTANT —
+ * "GitHub does not enforce CODEOWNERS on this repository" — asserted rather
+ * than derived, and it is measurably false in repos this routine is pointed
+ * at. Measured 2026-11-12: `Blockcast/trafficcontrol@master` and
+ * `Blockcast/magma@main` each carry an ACTIVE ruleset whose `PULL_REQUEST`
+ * rule sets `requireCodeOwnerReview: true`, and each has a CODEOWNERS that
+ * designates owners for paths under review. The sentence was emitted on
+ * `Blockcast/trafficcontrol`#2959 on 2026-11-10 regardless, and `commentOnce`
+ * dedupes on the marker, so it is permanent on that PR.
+ *
+ * ## Three states, because the requirement lives on TWO planes and only one of
+ * them is readable from an agent seat
+ *
+ * A branch can acquire a code-owner requirement from a RULESET or from CLASSIC
+ * branch protection. Measured 2026-11-12 from this App, `gh` exit code and
+ * body both recorded:
+ *
+ *   - `Ref.rules` answers everywhere — 6 of 6 repos whose ref resolved;
+ *   - `Ref.branchProtectionRule` does NOT. It needs `administration: read`,
+ *     granted to no agent seat on this fleet. On `paperclip` and
+ *     `trafficcontrol` it answers `null` at `gh` exit 1 WITH
+ *     `errors[0].type: FORBIDDEN`; on `Network-Operator-Portal` it answers a
+ *     clean `null` at exit 0 with NO errors, which is a readable "no classic
+ *     rule protects this branch".
+ *
+ * ⛔ So a rules-only read CANNOT establish NON-enforcement, and the
+ * counter-example is first-party: `Blockcast/penstock-llm-proxy-core@main`
+ * returns ZERO rules while 20 of 20 sampled open PRs there read
+ * `reviewDecision: REVIEW_REQUIRED` against a `*` catch-all CODEOWNERS. A
+ * review requirement is in force and is invisible to the plane this routine
+ * can read. Concluding "not enforced" from a silent rules plane would
+ * reproduce the defect this function replaces, one surface over.
+ *
+ * ⚠ That sample shows the classic plane carries a REVIEW requirement there; it
+ * does not isolate the code-owner bit, since `requiredApprovingReviewCount`
+ * alone also produces `REVIEW_REQUIRED`. Either way the plane is load-bearing
+ * and withheld, which is what this function has to survive.
+ *
+ * `UNKNOWN` is therefore the default and the fallback for every unreadable
+ * answer, and its sentence claims nothing about GitHub at all. `UNENFORCED` is
+ * reached only when BOTH planes positively answered.
+ *
+ * ## Two reads, not one, and GraphQL rather than REST
+ *
+ * The planes are asked SEPARATELY on purpose: a combined selection would let
+ * the withheld field's `FORBIDDEN` take down the readable one in the same
+ * response, which is the fail-open this whole function exists to avoid.
+ *
+ * GraphQL rather than `rules/branches/:branch`, for two measured reasons.
+ * `gh api graphql` draws on a DIFFERENT quota bucket, and this fleet's REST
+ * `core` bucket is routinely exhausted — 0 of 9750 for most of 2026-11-12 —
+ * so a REST implementation would answer `UNKNOWN` in exactly the conditions
+ * the routine runs in. And the clean-null-versus-FORBIDDEN discrimination
+ * above was measured on this surface; the REST equivalent was not.
+ */
+export function fetchCodeownerEnforcement(repo, branch, run = gh) {
+  const [owner, name] = String(repo ?? "").split("/");
+  if (!owner || !name || typeof branch !== "string" || branch === "") {
+    return CODEOWNER_ENFORCEMENT.UNKNOWN;
+  }
+
+  /** One isolated read of `selection` on this ref, or `null` when unread. */
+  const ask = (selection) => {
+    let response;
+    try {
+      response = JSON.parse(
+        run([
+          "api",
+          "graphql",
+          "-f",
+          `query=query($owner:String!,$name:String!,$ref:String!){
+            repository(owner:$owner,name:$name){ ref(qualifiedName:$ref){ ${selection} } }
+          }`,
+          "-f",
+          `owner=${owner}`,
+          "-f",
+          `name=${name}`,
+          "-f",
+          `ref=refs/heads/${branch}`,
+        ]),
+      );
+    } catch {
+      return null;
+    }
+    // Kept beside the `catch` rather than folded into it: `gh` exits non-zero
+    // on a partial `FORBIDDEN`, but a 200 carrying `errors` with a null
+    // payload is a separate shape, and it is unread rather than empty — the
+    // same distinction `fetchMergeQueueEntries` draws.
+    if (Array.isArray(response?.errors) && response.errors.length > 0) return null;
+    // A null ref is a branch that did not resolve, which is unread too.
+    return response?.data?.repository?.ref ?? null;
+  };
+
+  const rulesRef = ask(
+    `rules(first:${BRANCH_RULE_PAGE}){ totalCount nodes{ type parameters{ ` +
+      `... on PullRequestParameters{ requireCodeOwnerReview } } } }`,
+  );
+  const rules = rulesRef?.rules?.nodes;
+  if (!Array.isArray(rules)) return CODEOWNER_ENFORCEMENT.UNKNOWN;
+  if (rules.some(ruleRequiresCodeOwnerReview)) return CODEOWNER_ENFORCEMENT.ENFORCED;
+  // A truncated page is unread, not an empty rule set: the rule that requires
+  // an owner could be the one that fell off the end.
+  if (rulesRef.rules.totalCount > rules.length) return CODEOWNER_ENFORCEMENT.UNKNOWN;
+
+  // Only reached once the readable plane has positively said "no such rule".
+  const protectionRef = ask("branchProtectionRule{ requiresCodeOwnerReviews }");
+  if (!protectionRef) return CODEOWNER_ENFORCEMENT.UNKNOWN;
+  const protection = protectionRef.branchProtectionRule;
+  // A CLEAN null — no error anywhere in the response — is GitHub positively
+  // saying no classic rule protects this branch. The withheld answer never
+  // reaches here; it is the `null` ref above.
+  if (protection == null) return CODEOWNER_ENFORCEMENT.UNENFORCED;
+  if (protection.requiresCodeOwnerReviews === true) return CODEOWNER_ENFORCEMENT.ENFORCED;
+  if (protection.requiresCodeOwnerReviews === false) return CODEOWNER_ENFORCEMENT.UNENFORCED;
+  // Selected, non-null, and carrying neither boolean is a shape this seat has
+  // never observed. An unobserved shape claims nothing.
+  return CODEOWNER_ENFORCEMENT.UNKNOWN;
+}
+
+/**
  * A repo's default branch name, or `null` when it could not be read.
  *
  * One call per repo, not per PR — the default branch is a property of the
@@ -2813,7 +2964,12 @@ export function fetchPrFiles(repo, number, run = gh) {
  */
 export function fetchOpenPrs(
   repo,
-  { run = gh, mergeStates = fetchMergeStates, defaultBranch = fetchDefaultBranch } = {},
+  {
+    run = gh,
+    mergeStates = fetchMergeStates,
+    defaultBranch = fetchDefaultBranch,
+    enforcement = fetchCodeownerEnforcement,
+  } = {},
 ) {
   const rows = JSON.parse(
     run(["pr", "list", "--repo", repo, "--state", "open", "--limit", "500", "--json", PR_LIST_FIELDS]),
@@ -2832,6 +2988,12 @@ export function fetchOpenPrs(
   // needs the expensive hydration below at all — the same placement argument
   // as the merge-queue read above.
   const repoDefaultBranch = defaultBranch(repo, run);
+
+  // Likewise one per repo, and read AFTER the default branch because it is
+  // keyed on it. PEN-6522: this decides only what the code-owner hold
+  // SENTENCE says — every state of it still holds — so an unreadable answer
+  // degrades the wording and nothing else.
+  const codeownerEnforcement = enforcement(repo, repoDefaultBranch, run);
 
   // One merge-queue read per DISTINCT BASE, not per PR: a queue belongs to a
   // branch, so every PR targeting that branch is answered by the same read.
@@ -2881,6 +3043,7 @@ export function fetchOpenPrs(
       // `null` when unread, and `classifyFromListing` treats that as "cannot
       // prove this PR is stacked" rather than as a licence to skip it.
       repoDefaultBranch,
+      codeownerEnforcement,
     };
     if (classifyFromListing(joined)) return joined;
     return {
@@ -3246,19 +3409,52 @@ export function applyRow(repo, row, run = gh) {
     );
   }
   if (row.action === "codeowner-review-requested") {
-    return codeownerRequestComment(repo, row, run, LAND_REPO_HOLD_REASON);
+    return codeownerRequestComment(repo, row, run, landRepoHoldReason(row));
   }
   return null;
 }
 
 /**
- * Why a LAND repo's clean PR is being held rather than enqueued: the routine
- * would land it, and is declining because CODEOWNERS is advisory here and
- * enqueuing would merge past an owner who was asked to look.
+ * Why a LAND repo's clean PR is being held rather than enqueued, derived per
+ * repo and branch from `fetchCodeownerEnforcement` rather than asserted.
+ *
+ * PEN-6522. The three sentences differ, and that difference is the whole
+ * point: the constant this replaces read "GitHub does not enforce CODEOWNERS
+ * on this repository" everywhere, which is false on `trafficcontrol` and
+ * `magma` and unestablished on `paperclip`.
+ *
+ * ⛔ The HOLD is identical in all three and must stay so. The verdict chooses
+ * a sentence and nothing else, so the worst a misread can do is describe a
+ * correct hold badly. Read `applyRow`: nothing downstream of here branches on
+ * the enforcement state.
+ *
+ * ⚠ `UNKNOWN` deliberately claims nothing about GitHub. It is the state this
+ * fleet is in on every repo whose classic branch protection is withheld, which
+ * today is most of them — saying "not enforced" there is exactly the
+ * unsupported assertion this row removed.
  */
-const LAND_REPO_HOLD_REASON =
-  "GitHub does not enforce CODEOWNERS on this repository, so the landing routine holds it here " +
-  "rather than enqueuing it.";
+export function landRepoHoldReason(row) {
+  const base = typeof row?.baseRefName === "string" && row.baseRefName !== "" ? row.baseRefName : null;
+  const branch = base ? `\`${base}\`` : "this PR's base branch";
+  const held = "the landing routine holds it here rather than enqueuing it.";
+  switch (row?.codeownerEnforcement) {
+    case CODEOWNER_ENFORCEMENT.ENFORCED:
+      return (
+        `GitHub requires a code-owner review on ${branch}, so this will not merge until an owner ` +
+        `approves it — ${held}`
+      );
+    case CODEOWNER_ENFORCEMENT.UNENFORCED:
+      return (
+        `No branch rule on ${branch} requires a code-owner review, so GitHub would not block this ` +
+        `merge — ${held}`
+      );
+    default:
+      return (
+        `Whether GitHub requires a code-owner review on ${branch} could not be read from here, so ` +
+        `${held}`
+      );
+  }
+}
 
 /**
  * Why a NOTIFY-ONLY repo's clean PR is being held: because this routine does
