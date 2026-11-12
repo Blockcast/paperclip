@@ -1873,6 +1873,13 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    // The STORED config of the outer scope whose keys `constraintAdapterConfig`
+    // merges forward. Symmetric on purpose, and the symmetry is the invariant:
+    // a scope that can contribute a value to the validated config must also be
+    // able to vouch that the value was already there. Merge one direction only
+    // and an introduce-only guard reads a fall-through key as newly introduced
+    // (PEN-6586 review).
+    constraintPreviousAdapterConfig?: Record<string, unknown> | null;
     previous?: { adapterType?: string | null; adapterConfig?: Record<string, unknown> | null } | null;
     actor?: { userId?: string | null; agentId?: string | null };
   }): Promise<Record<string, unknown>> {
@@ -1891,6 +1898,9 @@ export function agentRoutes(
         ? { ...input.constraintAdapterConfig, ...normalizedAdapterConfig }
         : normalizedAdapterConfig,
       input.previous,
+      input.constraintPreviousAdapterConfig
+        ? { adapterConfig: input.constraintPreviousAdapterConfig }
+        : null,
     );
     return normalizedAdapterConfig;
   }
@@ -1901,7 +1911,14 @@ export function agentRoutes(
     runtimeConfig: Record<string, unknown>,
     baseAdapterConfig: Record<string, unknown>,
     actor?: { userId?: string | null; agentId?: string | null },
-    previous?: { adapterType?: string | null; runtimeConfig?: unknown } | null,
+    previous?: {
+      adapterType?: string | null;
+      runtimeConfig?: unknown;
+      // The agent's STORED top-level adapterConfig. `baseAdapterConfig` above
+      // is the EFFECTIVE one (request merged over stored), so it cannot answer
+      // "was this already on the agent?" on a write that changes it.
+      adapterConfig?: Record<string, unknown> | null;
+    } | null,
   ): Promise<Record<string, unknown>> {
     const entries = listRuntimeModelProfileAdapterConfigs(runtimeConfig);
     if (entries.length === 0) return runtimeConfig;
@@ -1929,6 +1946,11 @@ export function agentRoutes(
           ...baseAdapterConfig,
           ...adapterDefaultConfig,
         },
+        // `baseAdapterConfig` is merged forward above, so its stored
+        // counterpart has to be available to the introduce test. Without it a
+        // key that falls through from agent scope reads as introduced by a
+        // profile write that never mentioned it (PEN-6586 review).
+        constraintPreviousAdapterConfig: previous ? (asRecord(previous.adapterConfig) ?? null) : null,
         // A profile's model is introduced relative to the SAME profile's stored
         // config, not the agent's top-level one.
         previous: previous
@@ -2030,6 +2052,10 @@ export function agentRoutes(
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
     previous?: { adapterType?: string | null; adapterConfig?: Record<string, unknown> | null } | null,
+    // Stored config of an OUTER scope merged into `adapterConfig` by the
+    // caller. Consulted by the `claudeCodeVersion` check only — see the note
+    // at that call for why the model check must NOT read it.
+    inheritedPrevious?: { adapterConfig?: Record<string, unknown> | null } | null,
   ) {
     // PEN-4447: a model id the target adapter does not register is accepted
     // here and then kills the lane at its next pod boot, so refuse it at the
@@ -2057,7 +2083,38 @@ export function agentRoutes(
     // this key on itself, and a bricked agent cannot run, so the one actor
     // positioned to notice the fault is the one the fault disables. Refuse at
     // the write, where the caller is still alive to read the refusal.
-    const inadmissibleVersion = findInadmissibleClaudeCodeVersion(adapterConfig, previous);
+    //
+    // WHICH WRITE PATHS THIS REACHES, enumerated against the call sites rather
+    // than from memory (PEN-6586 review). Everything routed through
+    // `normalizeMediatedAdapterConfigForPersistence`: agent create, hire, the
+    // top-level `PATCH /api/agents/:id` adapterConfig, and each
+    // `runtimeConfig.modelProfiles.*.adapterConfig`.
+    //
+    // ⛔ NOT `POST /agents/:id/config-revisions/:revisionId/rollback`, which
+    // restores a stored `adapterConfig` wholesale and reaches neither this
+    // check nor the PEN-4447 model check above — so a revision predating a
+    // guard can bring back, at 200, a value that guard would refuse. Shared
+    // with the model check rather than introduced here, and bounded: once a
+    // guard ships, no later revision can be minted carrying a value it
+    // refuses, so the exposed set only shrinks. Stated as a decision, not an
+    // omission — that route's own comment block enumerates what it does and
+    // does not cover for exactly this reason, and a coverage list a reader
+    // takes for complete is worse than no list.
+    //
+    // `previous` is a LIST here and `findUnregisteredAdapterModel`'s is not.
+    // On the model-profile path `adapterConfig` is a merge of the agent's
+    // top-level config, the adapter's profile default and the profile's own,
+    // while `previous` is the profile's stored config alone. `model` is
+    // profile-scoped, so that single reference is the right one. This key
+    // FALLS THROUGH from agent scope, so testing it against the profile alone
+    // reported a stored top-level value as newly introduced and refused
+    // `runtimeConfig` writes that never named the key — the wedge the
+    // introduce-only test exists to prevent, through another door (PEN-6586
+    // review). Give it every scope that fed the merge.
+    const inadmissibleVersion = findInadmissibleClaudeCodeVersion(
+      adapterConfig,
+      [previous, inheritedPrevious],
+    );
     if (inadmissibleVersion) {
       throw unprocessable(describeInadmissibleClaudeCodeVersion(inadmissibleVersion));
     }
@@ -4741,7 +4798,11 @@ export function agentRoutes(
         requestedRuntimeConfig,
         baseAdapterConfig,
         req.actor,
-        { adapterType: existing.adapterType, runtimeConfig: existing.runtimeConfig },
+        {
+          adapterType: existing.adapterType,
+          runtimeConfig: existing.runtimeConfig,
+          adapterConfig: asRecord(existing.adapterConfig) ?? null,
+        },
       );
     }
     if (touchesAdapterConfiguration || Object.prototype.hasOwnProperty.call(patchData, "defaultEnvironmentId")) {
