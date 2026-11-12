@@ -619,23 +619,29 @@ export const NUMERIC_SETTING_BOUNDS = {
   // over-exemption direction — and that is no longer hypothetical: the in-place payload
   // correction named above is exactly such a write, and it shipped.
   //
-  // THE SURVEY IS NO LONGER THE CONTROL (PEN-6322). It used to be, and that was the whole
-  // defect: a grep a human has to remember to re-run is not a guard, and whoever adds the
-  // next writer is by construction the one person with no reason to read this comment.
-  // `issue-recovery-actions.test.ts` now drives the real `updatePayload` writer against
-  // `hasPendingBoardApprovalWakePath` and asserts the row IS seized, so a thirteenth
-  // writer of this shape turns a test red instead of silently widening this bound.
+  // WHAT A TEST NOW HOLDS, AND WHAT IT DOES NOT (PEN-6322).
+  // `issue-recovery-actions.test.ts` drives the real `updatePayload` writer against
+  // `hasPendingBoardApprovalWakePath` and asserts the row IS seized, so a regression in
+  // THAT writer, or in `PENDING_SINCE`'s discriminator, now turns a test red instead of
+  // silently widening this bound.
   //
-  // What that does NOT close, stated rather than glossed over: the new coverage is of a
-  // NEW writer APPEARING, not of an existing one being REMOVED. Freshness in this
-  // suite's revision→resubmit chain is still produced by the two writers JOINTLY
+  // It does NOT cover a NEW writer, and the survey above is STILL the control for that
+  // case. The test names `updatePayload` rather than enumerating `update(approvals)`
+  // sites, and a writer that moves `updated_at` WITHOUT setting `payload_edited_at`
+  // falls through `PENDING_SINCE`'s `else` to `greatest(created_at, updated_at)` —
+  // the "nearest miss" shape named directly above — widening this exemption by up to
+  // the full grace with every test still green. Re-running the survey therefore remains
+  // the only thing that catches a new writer, and the count in the paragraph above
+  // remains a measurement with a date on it rather than an invariant.
+  //
+  // An existing writer being REMOVED is likewise uncovered here: this suite's
+  // revision→resubmit chain produces freshness from the two writers JOINTLY
   // (`requestRevision` moves `updated_at` first), so deleting it from `resubmit` alone
-  // would still leave the recovery-side resubmit case green. That one case IS isolated in
-  // `approval-queue-metrics.test.ts`, which calls `resubmit` on a row it seeded with
+  // would still leave the recovery-side resubmit case green. That one case IS isolated
+  // in `approval-queue-metrics.test.ts`, which calls `resubmit` on a row it seeded with
   // `updatedAt == createdAt` and asserts the age gauge — but that covers the GAUGE's
-  // reader, not this bound. The count in the paragraph above therefore remains a
-  // measurement with a date on it rather than an invariant. Do not lift this bound to a
-  // predicate that also admits decided or withdrawn rows without redoing it.
+  // reader, not this bound. Do not lift this bound to a predicate that also admits
+  // decided or withdrawn rows without redoing it.
   //
   // Ceiling is 30d, matching the PR entry and the observed maximum: past a month
   // "waiting on the board" is not a description of the card but of a problem nobody is
