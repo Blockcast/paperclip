@@ -8774,22 +8774,27 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     const before = await snapshot();
     const warn = vi.spyOn(logger, "warn");
 
-    const result = await ensureGitWorktreeBranchCoherent({
-      db,
-      repoRoot,
-      worktreePath,
-      expectedBranchName: expectedBranch,
-      sourceIssue: { id: ids.sourceIssueId, identifier: ids.sourceIdentifier, title: "Husk worktree" },
-      executionWorkspaceId: ids.sourceWorkspaceId,
-      heartbeatRunId: ids.runId,
-      enableWorkspaceDirtyQuarantineRepair: true,
-    });
+    let result: Awaited<ReturnType<typeof ensureGitWorktreeBranchCoherent>>;
+    let relinkLog: unknown[] | undefined;
+    try {
+      result = await ensureGitWorktreeBranchCoherent({
+        db,
+        repoRoot,
+        worktreePath,
+        expectedBranchName: expectedBranch,
+        sourceIssue: { id: ids.sourceIssueId, identifier: ids.sourceIdentifier, title: "Husk worktree" },
+        executionWorkspaceId: ids.sourceWorkspaceId,
+        heartbeatRunId: ids.runId,
+        enableWorkspaceDirtyQuarantineRepair: true,
+      });
+      // The server-side trace that keeps the deleter measurable (BLO-49622): a populated husk, not a kubelet mkdir.
+      relinkLog = warn.mock.calls.find(([, msg]) => String(msg).includes("re-linked a worktree"));
+    } finally {
+      warn.mockRestore();
+    }
 
     expect(result.branchName).toBe(expectedBranch);
     expect(result.warnings[0]).toContain("re-linked");
-    // The server-side trace that keeps the deleter measurable (BLO-49622): a populated husk, not a kubelet mkdir.
-    const relinkLog = warn.mock.calls.find(([, msg]) => String(msg).includes("re-linked a worktree"));
-    warn.mockRestore();
     expect(relinkLog?.[0]).toMatchObject({ worktreePath, entryCount: expect.any(Number), worktreeDirMtime: expect.any(String) });
     expect((relinkLog?.[0] as { entryCount: number }).entryCount).toBeGreaterThan(0);
     expect((await readGit(worktreePath, ["rev-parse", "--show-toplevel"])).trim())

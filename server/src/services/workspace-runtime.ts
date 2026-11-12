@@ -4760,18 +4760,23 @@ export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: stri
   return false;
 }
 
-/** Best-effort forensics for the re-link log; never throws, never blocks a wake. */
+/**
+ * Best-effort forensics for the re-link log; never throws, delays a wake by at
+ * most 1s. Deliberately NOT under withReclaimFsDeadline: a timeout there marks
+ * the worktree's parent wedged, which flips resolvesToSelf() to the unresolved
+ * path and can delete a correct link (PEN-4878) -- a log line must not do that.
+ */
 async function describeHusk(worktreePath: string, adminDir: string) {
+  const unavailable = { forensicsUnavailable: true } as const;
+  if (isReclaimFsWedgedDir(path.dirname(worktreePath))) return unavailable;
   const mtime = (p: string) => fs.stat(p).then((st) => st.mtime.toISOString(), () => null);
-  return withReclaimFsDeadline(
-    (async () => ({
-      entryCount: await fs.readdir(worktreePath).then((e) => e.filter((n) => n !== ".git").length, () => null),
-      worktreeDirMtime: await mtime(worktreePath),
-      adminHeadMtime: await mtime(path.join(adminDir, "HEAD")),
-      adminIndexMtime: await mtime(path.join(adminDir, "index")),
-    }))(),
-    worktreePath,
-  ).catch(() => ({ forensicsUnavailable: true }));
+  const read = (async () => ({
+    entryCount: await fs.readdir(worktreePath).then((e) => e.filter((n) => n !== ".git").length, () => null),
+    worktreeDirMtime: await mtime(worktreePath),
+    adminHeadMtime: await mtime(path.join(adminDir, "HEAD")),
+    adminIndexMtime: await mtime(path.join(adminDir, "index")),
+  }))().catch(() => unavailable);
+  return Promise.race([read, delay(1_000, unavailable, { ref: false })]);
 }
 
 export async function inspectManagedGitWorktreeBranch(input: {
