@@ -44,7 +44,7 @@ import {
 // A second list here would let a sqlstate be added to the retry path and
 // silently land in the `other` bucket forever. `lib/db-retry` has NO imports of
 // its own -- it is a pure leaf predicate module -- so this cannot form a cycle.
-import { TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
+import { findPgError, TRANSIENT_DB_SQLSTATES } from "../lib/db-retry.js";
 import { logger } from "../middleware/logger.js";
 // Type-only, so it is erased at runtime and creates no import cycle with the
 // reaper (which imports the recorder below). Structurally restating the result
@@ -265,6 +265,108 @@ export const HTTP_EMPTY_LIST_RESPONSES_METRIC = "paperclip_http_empty_list_respo
  * the series' own age measures the instrument's youth, not the system's health.
  */
 export const HTTP_TRANSIENT_DB_RESPONSES_METRIC = "paperclip_http_transient_db_responses_total";
+/**
+ * Count of database errors raised by a BACKGROUND writer -- one holding no HTTP
+ * request -- labeled by the writer, its primary target table, and the SQLSTATE
+ * (PEN-6581).
+ *
+ * ## Why a second counter instead of a label on the first
+ *
+ * {@link HTTP_TRANSIENT_DB_RESPONSES_METRIC} is written on the HTTP response
+ * path, so it can only observe a database error that was about to become a
+ * response. It is structurally blind to a statement that dies with no request
+ * behind it, and that blindness is not a small corner: in the October 2026
+ * class-D census on PEN-5019, `heartbeat_runs` alone was 14 of 26 events, none
+ * of them reachable from a route.
+ *
+ * Nothing else could see them either. The database-side route is closed BY
+ * RULING, not by capability -- BLO-47427 declined `pg_read_all_stats` for the
+ * exporter role and onprem-k8s#6136 enacted it, so `pg_stat_activity` and
+ * `pg_stat_statements` are unavailable by design and must NOT be re-granted to
+ * close this gap. The remaining instrument was the `paperclip-pg-0` log read
+ * through `pods_log`, which is `tail`-only and shares a rotation budget with
+ * every other statement: measured reach-back has ranged from ~3 minutes to
+ * ~5 hours on the same instrument within three days. That can establish a class
+ * of event DID occur and can never establish that none did, because "none
+ * fired" and "I could not see the ones that did" are the same reading.
+ *
+ * So the only layer that can see a background database failure is the writer
+ * itself, which is where this counter sits. It needs no database privilege, no
+ * grant, no SQL and no log reading.
+ *
+ * ## ⛔ It counts ERROR EVENTS, not failed operations
+ *
+ * An error that a {@link runWithTransientDbRetry} replay then wins is counted,
+ * exactly like one that exhausts its attempts and throws. That is deliberate
+ * and it is what makes this counter COMPARABLE to the census it exists to
+ * serve: the `STATEMENT:` records behind PEN-5019's class D are every cancelled
+ * statement, whether or not a retry later succeeded. A counter of operations
+ * that ultimately failed would answer a different question and would undercount
+ * the census population by every successful retry.
+ *
+ * ⇒ Do NOT read a non-zero value here as "a background write was lost". It
+ * says a statement died; it does not say the operation did. The run-status
+ * writers retry up to 4 times, so the two numbers can differ by a lot.
+ *
+ * ## ⭐ Zero-initialized -- the OPPOSITE of the HTTP sibling, deliberately
+ *
+ * Every `writer` x `sqlstate` pair is registered at 0 at process start, so a
+ * quiet writer reads `0` rather than being absent. If you are carrying the
+ * caveats from {@link HTTP_TRANSIENT_DB_RESPONSES_METRIC}, note that its two
+ * loudest ones DO NOT APPLY HERE and inverting them is the point:
+ *
+ * - `increase()` and `rate()` CAN see a series' first event here, because the
+ *   series is born at 0 at boot rather than at 1 on its own first error.
+ * - An absent series is NOT "no errors recorded". It means the process has not
+ *   registered this metric at all, or this writer is not instrumented -- see
+ *   coverage below.
+ *
+ * ⛔ Do NOT alert on `absent()` here; the zero-init deliberately defeats it.
+ * The reason for the inversion is the one PEN-6581 was filed on: an error-path
+ * counter that is born on first use is absent during a quiet period AND absent
+ * during a total outage, and an empty Prometheus read is indistinguishable from
+ * "healthy". It fails in the no-signal-reads-as-pass direction, which for an
+ * instrument whose whole job is to census failures is the wrong direction.
+ *
+ * ## Coverage is readable off the instrument
+ *
+ * Because the grid is zero-initialized, the set of instrumented writers is
+ * exactly what the metric enumerates:
+ *
+ *   count by (writer, table) (paperclip_background_db_errors_total)
+ *
+ * A background writer missing from that list is NOT covered, and its silence
+ * means nothing. This counter censuses {@link BACKGROUND_DB_WRITERS} and
+ * nothing else -- it is not a census of all background database errors in the
+ * process, and must not be reported as one.
+ *
+ * ## ⚠️ `table` is DERIVED FROM `writer`, not read off the failing statement
+ *
+ * PostgreSQL does not report a relation on a `57014` or a `55P03`, so there is
+ * nothing to read. `table` is the writer's DECLARED primary target
+ * ({@link BACKGROUND_DB_WRITER_TABLES}), which makes `sum by (table)` aggregate
+ * writers that share one (both run-status writers target `heartbeat_runs`), and
+ * makes the label agree with the class-D census's own table bucketing. It is
+ * fixed per writer and carries no independent information about the statement
+ * that failed. A writer touching several relations reports one; do NOT read
+ * `table` as "the relation that raised".
+ *
+ * ## Cardinality and exposure
+ *
+ * Fixed at |{@link BACKGROUND_DB_WRITERS}| x |{@link BACKGROUND_DB_SQLSTATES}|,
+ * independent of fleet, company or issue count, because both label sets are
+ * compile-time allow-lists. No statement text, bind parameter, user, company,
+ * agent, run or issue id is ever a label.
+ *
+ * `sqlstate` is bounded to {@link TRANSIENT_DB_SQLSTATES} plus
+ * {@link BACKGROUND_DB_SQLSTATE_OTHER}. ⚠️ Unlike the identically-named bucket
+ * on the HTTP sibling -- which is an unreachable cardinality guard whose
+ * absence is evidence of nothing -- `other` HERE IS REACHABLE AND MEANINGFUL:
+ * these call sites are not gated on the transient set, so any non-transient
+ * SQLSTATE (a `23505`, an `08006`) lands there. It is a genuine mixed bucket,
+ * and a spike in it is a real signal that something non-transient is failing.
+ */
+export const BACKGROUND_DB_ERRORS_METRIC = "paperclip_background_db_errors_total";
 /**
  * Server-side duration of one completed HTTP response, in seconds (PEN-5136).
  *
@@ -5079,6 +5181,75 @@ export function normalizeHttpTransientDbSqlstate(sqlstate: string | null | undef
 }
 
 /**
+ * The background writers {@link BACKGROUND_DB_ERRORS_METRIC} censuses, mapped
+ * to the primary table each one targets (PEN-6581).
+ *
+ * This map is the single source of truth for BOTH label values, which is why
+ * the recorder takes only a `writer` and derives `table` from it: a call site
+ * cannot drift the pair apart, and the zero-init grid cannot disagree with what
+ * the live increments emit.
+ *
+ * ⛔ THIS LIST IS THE COUNTER'S COVERAGE, and adding a writer here is adding it
+ * to the census. A background writer that is not in this map is not counted,
+ * and its silence in the metric means NOTHING -- so when you extend it, extend
+ * it at the call site in the same change, or the zero-init will publish a
+ * permanently-0 series that reads as a healthy writer rather than an
+ * uninstrumented one. That failure mode is strictly worse than being absent.
+ *
+ * The three starting members are PEN-5019's largest class-D contributors that
+ * hold no HTTP request: the two `heartbeat_runs` run-status finalizers (14 of
+ * 26 class-D events in the October census) and the continuation-summary
+ * document writer (the `update "documents" set "title" = $1` event).
+ */
+export const BACKGROUND_DB_WRITER_TABLES = {
+  /** `setRunStatus` -- the unguarded run-status finalize UPDATE. */
+  heartbeat_run_status: "heartbeat_runs",
+  /** `setRunStatusIfRunning` -- the same finalize gated on the expected status. */
+  heartbeat_run_status_guarded: "heartbeat_runs",
+  /** `refreshIssueContinuationSummary` -- the continuation-summary document upsert. */
+  issue_continuation_summary: "documents",
+} as const satisfies Record<string, string>;
+
+/** The `writer` label values of {@link BACKGROUND_DB_ERRORS_METRIC}. */
+export type BackgroundDbWriter = keyof typeof BACKGROUND_DB_WRITER_TABLES;
+
+/** Every instrumented writer, for the zero-init grid and for tests. */
+export const BACKGROUND_DB_WRITERS = Object.keys(
+  BACKGROUND_DB_WRITER_TABLES,
+) as readonly BackgroundDbWriter[];
+
+/**
+ * Label value for a SQLSTATE outside {@link TRANSIENT_DB_SQLSTATES}.
+ *
+ * ⚠️ Deliberately NOT the same kind of value as
+ * {@link HTTP_TRANSIENT_DB_SQLSTATE_OTHER}, despite the identical spelling.
+ * That one is an unreachable cardinality guard -- its only caller is gated on
+ * the transient set, so no live path can emit it. THIS one is reachable: the
+ * background call sites count every database error their writer raises, not
+ * only the retryable ones, so a `23505` or an `08006` lands here. It is a
+ * genuine mixed bucket and a rise in it is a real signal.
+ */
+export const BACKGROUND_DB_SQLSTATE_OTHER = "other";
+
+/** Every `sqlstate` label value, for the zero-init grid and for tests. */
+export const BACKGROUND_DB_SQLSTATES: readonly string[] = [
+  ...TRANSIENT_DB_SQLSTATES,
+  BACKGROUND_DB_SQLSTATE_OTHER,
+];
+
+/**
+ * Normalize a SQLSTATE to a bounded label. Anything outside
+ * {@link TRANSIENT_DB_SQLSTATES} collapses to
+ * {@link BACKGROUND_DB_SQLSTATE_OTHER}, so a driver error carrying an arbitrary
+ * `code` cannot mint an unbounded series.
+ */
+export function normalizeBackgroundDbSqlstate(sqlstate: string | null | undefined): string {
+  return typeof sqlstate === "string" && TRANSIENT_DB_SQLSTATES.has(sqlstate)
+    ? sqlstate
+    : BACKGROUND_DB_SQLSTATE_OTHER;
+}
+
+/**
  * Label values for the search/no-search split on a transient-database refusal
  * (PEN-3596).
  *
@@ -6352,6 +6523,7 @@ let httpEmptyListResponses: Counter<"route" | "method" | "status"> | null = null
 let httpTransientDbResponses:
   | Counter<"route" | "method" | "status" | "code" | "sqlstate" | "variant">
   | null = null;
+let backgroundDbErrors: Counter<"table" | "sqlstate" | "writer"> | null = null;
 let httpRequestDuration: Histogram<"route" | "method"> | null = null;
 let gbrainRecallTotal: Counter<"status"> | null = null;
 let agentHeartbeatAge: Gauge<"agent_id"> | null = null;
@@ -6540,6 +6712,7 @@ function ensureRegistry(): {
   httpTransientDbResponsesCounter: Counter<
     "route" | "method" | "status" | "code" | "sqlstate" | "variant"
   >;
+  backgroundDbErrorsCounter: Counter<"table" | "sqlstate" | "writer">;
   httpRequestDurationHistogram: Histogram<"route" | "method">;
   gbrainRecallCounter: Counter<"status">;
   agentHeartbeatAgeGauge: Gauge<"agent_id">;
@@ -6722,6 +6895,7 @@ function ensureRegistry(): {
     || !httpRequests
     || !httpEmptyListResponses
     || !httpTransientDbResponses
+    || !backgroundDbErrors
     || !httpRequestDuration
     || !gbrainRecallTotal
     || !agentHeartbeatAge
@@ -9194,6 +9368,46 @@ function ensureRegistry(): {
       labelNames: ["route", "method", "status", "code", "sqlstate", "variant"],
       registers: [registry],
     });
+    backgroundDbErrors = new Counter({
+      name: BACKGROUND_DB_ERRORS_METRIC,
+      help:
+        "Count of database errors raised by a BACKGROUND writer -- one holding no HTTP "
+        + "request -- labeled by writer, its primary target table, and SQLSTATE "
+        + "(PEN-6581). The non-HTTP sibling of " + HTTP_TRANSIENT_DB_RESPONSES_METRIC + ", "
+        + "which is written on the response path and is therefore structurally blind to a "
+        + "statement with no request behind it: in PEN-5019's October class-D census "
+        + "heartbeat_runs alone was 14 of 26 such events, reachable from no route, from no "
+        + "pg_stat view (pg_read_all_stats is declined by ruling, not missing by accident), "
+        + "and from the database log only when its tail happened to still reach them. "
+        + "COUNTS ERROR EVENTS, NOT FAILED OPERATIONS: an error a bounded retry then wins "
+        + "is counted, which is what makes this comparable to that census -- the STATEMENT: "
+        + "records behind it are every cancelled statement, successful replay or not. So a "
+        + "non-zero value does NOT mean a write was lost. ZERO-INITIALIZED across the full "
+        + "writer x sqlstate grid, which is the OPPOSITE of the HTTP sibling and is the "
+        + "point: an error counter born on first use is absent while quiet AND absent "
+        + "during a total outage, and an empty read is then indistinguishable from healthy. "
+        + "Consequently increase() CAN see a first event here, and absent() must NOT be "
+        + "alerted on. Because the grid is zero-initialized, count by (writer) (...) "
+        + "enumerates exactly which writers are covered -- a background writer missing from "
+        + "that list is NOT instrumented and its silence means nothing; this is a census of "
+        + "the enumerated writers only, never of all background database errors. The table "
+        + "label is DERIVED from writer (PostgreSQL reports no relation on a 57014 or a "
+        + "55P03), so it names the writer's declared primary target and lets sum by (table) "
+        + "aggregate writers that share one; it is not the relation that raised. "
+        + `Unlike the HTTP sibling's identically-spelled bucket, "`
+        + `${BACKGROUND_DB_SQLSTATE_OTHER}" here is REACHABLE and meaningful: these call `
+        + "sites are not gated on the transient set, so a non-transient SQLSTATE lands "
+        + "there and a rise in it is a real signal. Cardinality is fixed at writers x "
+        + "sqlstates regardless of fleet size. No statement text, bind parameter, user, "
+        + "company, agent, run or issue id is exposed.",
+      labelNames: ["table", "sqlstate", "writer"],
+      registers: [registry],
+    });
+    for (const [writer, table] of Object.entries(BACKGROUND_DB_WRITER_TABLES)) {
+      for (const sqlstate of BACKGROUND_DB_SQLSTATES) {
+        backgroundDbErrors.inc({ writer, table, sqlstate }, 0);
+      }
+    }
     httpRequestDuration = new Histogram({
       name: HTTP_REQUEST_DURATION_METRIC,
       help:
@@ -9999,6 +10213,7 @@ function ensureRegistry(): {
     httpRequestsCounter: httpRequests,
     httpEmptyListResponsesCounter: httpEmptyListResponses,
     httpTransientDbResponsesCounter: httpTransientDbResponses,
+    backgroundDbErrorsCounter: backgroundDbErrors,
     httpRequestDurationHistogram: httpRequestDuration,
     gbrainRecallCounter: gbrainRecallTotal,
     agentHeartbeatAgeGauge: agentHeartbeatAge,
@@ -12365,6 +12580,70 @@ export function recordGithubWebhookDelivery(input: {
 }
 
 /**
+ * Record one database error raised by a background writer (PEN-6581).
+ *
+ * Takes the raw `error` rather than a SQLSTATE string, on purpose. Two things
+ * follow from that, and both are the reason the call sites can be placed in
+ * broad `catch` blocks without lying:
+ *
+ * - **A non-database error is NOT counted.** {@link findPgError} walks the
+ *   cause chain for a real PostgreSQL SQLSTATE and yields `null` otherwise, so
+ *   a `TypeError` thrown inside the same `try` returns `null` here and
+ *   increments nothing. A `catch (err)` that catches everything therefore does
+ *   not pollute a counter whose whole purpose is a SQLSTATE census.
+ * - **The call site cannot mislabel the SQLSTATE**, because it never extracts
+ *   one. Drizzle hangs the PostgreSQL error off `.cause`, so the obvious
+ *   `(error as { code?: string }).code` reads `undefined` on exactly the errors
+ *   that matter and would silently bucket every one of them as
+ *   {@link BACKGROUND_DB_SQLSTATE_OTHER}.
+ *
+ * `table` is derived from `writer` via {@link BACKGROUND_DB_WRITER_TABLES}
+ * rather than passed, so the two labels cannot drift apart at a call site.
+ *
+ * Returns the `sqlstate` label that was recorded, or `null` when the error
+ * carried no SQLSTATE and nothing was counted -- which makes it convenient to
+ * fold into the log line the call site was already writing, so the metric and
+ * the log agree on what was observed.
+ *
+ * ## ⛔ Total by construction: this function can never throw
+ *
+ * Its call sites sit between a caught database error and the decision to
+ * rethrow it, and two of them are the `heartbeat_runs` finalize that BLO-16998
+ * made retryable precisely because a throw there "leaves the run stuck in
+ * `running` forever and the agent never dispatches its next work". An
+ * observability counter must not be able to re-create the outage it was added
+ * to measure, and it must not replace the database error the caller is
+ * entitled to see with a metrics fault. So a registry failure is swallowed to
+ * a `logger.warn` and reported as `null`.
+ *
+ * The cost of that is stated rather than hidden: a registry fault makes this
+ * counter UNDERCOUNT silently, in the direction that reads as health. The log
+ * line is the only signal, which is why it is a `warn` and names the metric.
+ */
+export function recordBackgroundDbError(input: {
+  writer: BackgroundDbWriter;
+  error: unknown;
+}): string | null {
+  const pgError = findPgError(input.error);
+  if (!pgError) return null;
+  const sqlstate = normalizeBackgroundDbSqlstate(pgError.code);
+  try {
+    ensureRegistry().backgroundDbErrorsCounter.inc({
+      writer: input.writer,
+      table: BACKGROUND_DB_WRITER_TABLES[input.writer],
+      sqlstate,
+    });
+  } catch (err) {
+    logger.warn(
+      { err, metric: BACKGROUND_DB_ERRORS_METRIC, writer: input.writer, sqlstate },
+      "failed to record a background database error; the counter is undercounting",
+    );
+    return null;
+  }
+  return sqlstate;
+}
+
+/**
  * Snapshot the oldest-overdue-`scheduled_retry`-row age per agent (BLO-22094).
  * Same reset-then-set contract as {@link setQueuedRunOldestAgeMetrics}: an
  * agent absent from `entries` must read back an explicit 0, not a frozen
@@ -13663,6 +13942,7 @@ export function __resetMetricsForTest(): void {
   httpRequests = null;
   httpEmptyListResponses = null;
   httpTransientDbResponses = null;
+  backgroundDbErrors = null;
   httpRequestDuration = null;
   seenHttpRouteLabels.clear();
   agentHeartbeatAge = null;
