@@ -3554,9 +3554,22 @@ jobs:
       #     failure due to its own setup/runner trouble — check that lane's
       #     logs rather than assuming the diff is at fault.
       #   - cancelled: the lane was interrupted before it produced a result —
-      #     possibly a CI infrastructure interruption (see BLO-20867), but
-      #     also possibly a manual cancellation or another cause this job
-      #     cannot distinguish from here. Not evidence of a diff problem.
+      #     possibly the lane hitting its own `timeout-minutes` cap, possibly
+      #     a CI infrastructure interruption (see BLO-20867), possibly a
+      #     manual cancellation, and this job cannot distinguish them from
+      #     here. Not evidence of a diff problem.
+      #     PEN-6599: the cap case was missing from the wording and is the one
+      #     that matters, because the advice differs. This file already models
+      #     the split — see the PEN-6034 note on the mcp-gateway alert-channel
+      #     step in `policy`: "a step timeout reports `failure`, a job timeout
+      #     reports `cancelled`". So a STEP cap expiry lands in the `failure`
+      #     branch and reaches `classifyJobFailure`, which already calls it a
+      #     REAL failure on the stated ground that announcing it as a pool kill
+      #     "would invite re-running a hung test forever" — while a JOB cap
+      #     expiry lands HERE, never reaches that classifier, and used to be
+      #     told to re-run. Two branches, one cause, opposite advice. They now
+      #     agree. Wording only: the gate below is unchanged and still fails on
+      #     a cancelled lane.
       #   - skipped:   the lane never ran because a dependency it needs
       #     (typically `policy`) did not succeed. The defect, if any, is in
       #     that dependency, not in this lane.
@@ -3689,7 +3702,7 @@ jobs:
           fi
 
           if [ "${#cancelled_lanes[@]}" -gt 0 ]; then
-            echo "::error title=verify: lane cancelled::Upstream lane(s) were CANCELLED, not failed: ${cancelled_lanes[*]}. This is not a report of a defect in this PR's diff — the lane was interrupted before it could produce a result (possible causes include a CI infrastructure interruption, see BLO-20867, or a manual cancellation). Re-run the job to get a real result."
+            echo "::error title=verify: lane cancelled::Upstream lane(s) were CANCELLED, not failed: ${cancelled_lanes[*]}. This is not a report of a defect in this PR's diff — the lane was interrupted before it could produce a result. This job cannot tell the causes apart from here, so read the lane's own log and compare its elapsed time against its own 'timeout-minutes' cap FIRST: (1) the lane hit that cap — its log then carries 'has exceeded the maximum execution time of Nm0s', its elapsed matches the cap, and its post-steps still ran; (2) a CI infrastructure interruption (see BLO-20867); (3) a manual cancellation. Re-running gets a real result for (2) and (3). It does NOT for (1): a lane that blew its cap will usually blow it again, so a re-run costs a full cycle and returns the same outcome — fix the slow work or raise that lane's cap instead."
             any_non_success=1
           fi
 

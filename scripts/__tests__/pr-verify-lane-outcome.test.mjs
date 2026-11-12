@@ -173,6 +173,68 @@ test("verify step exits non-zero and annotates a cancelled lane without assertin
   assert.doesNotMatch(result.stdout, /::error title=verify: lane skipped::/);
 });
 
+// PEN-6599: the cancelled wording used to list only "a CI infrastructure
+// interruption ... or a manual cancellation" and then say, flatly, "Re-run the
+// job to get a real result."
+//
+// A lane hitting its own JOB-level `timeout-minutes` cap also lands here as
+// `cancelled` (not `failure`), so it never reaches `classifyJobFailure` — which
+// already treats a cap expiry as a REAL failure, on the stated ground that
+// calling it a pool kill "would invite re-running a hung test forever". The
+// `cancelled` branch was giving exactly the advice the `failure` branch exists
+// to avoid, and it misread as "infrastructure" to two readers before it was
+// caught. These assertions pin the two halves of the repair.
+function cancelledAnnotation(stdout) {
+  const line = stdout
+    .split("\n")
+    .find((candidate) => candidate.startsWith("::error title=verify: lane cancelled::"));
+  assert.ok(line, "expected a cancelled-lane annotation on stdout");
+  return line;
+}
+
+test("the cancelled wording names a timeout-minutes cap and how to recognise one", () => {
+  const annotation = cancelledAnnotation(runVerifyStep({ general_tests: "cancelled" }).stdout);
+
+  // The cause must be named, or a reader goes looking for infrastructure.
+  assert.match(annotation, /timeout-minutes/);
+  // ...and named checkably: the reader needs the signature, not a hint. This
+  // string is what the runner itself writes into the killed lane's log.
+  assert.match(annotation, /has exceeded the maximum execution time/);
+
+  // Still a LIST of possible causes, never an assertion of one -- the invariant
+  // the test above locks. This job genuinely cannot tell them apart from here.
+  assert.match(annotation, /BLO-20867/);
+  assert.match(annotation, /manual cancellation/);
+  assert.doesNotMatch(annotation, /This is a CI infrastructure interruption/);
+});
+
+test("the cancelled wording does not tell a capped-out lane to just re-run", () => {
+  const annotation = cancelledAnnotation(runVerifyStep({ general_tests: "cancelled" }).stdout);
+
+  // The regression: an unqualified re-run instruction. A lane that blew its cap
+  // will usually blow it again, so this costs a full merge-group cycle and
+  // returns the same verdict.
+  assert.doesNotMatch(
+    annotation,
+    /(?:^|[^a-z])Re-run the job to get a real result\.(?:\s|$)/,
+    "the cancelled branch must qualify its re-run advice -- an unconditional " +
+      "'Re-run the job to get a real result.' is the PEN-6599 regression",
+  );
+  assert.match(annotation, /does NOT/i);
+
+  // Falsification: the assertion above must be capable of firing. The
+  // infrastructure branch still carries that exact unqualified sentence --
+  // correctly, since a pool kill really is worth re-running -- so the same
+  // predicate applied there must FAIL. Without this the test could pass by
+  // matching nothing at all.
+  const infra = runVerifyStep({ build: "failure", INFRA_LANES: "build" }).stdout;
+  const infraAnnotation = infra
+    .split("\n")
+    .find((line) => line.startsWith("::error title=verify: lane infrastructure kill::"));
+  assert.ok(infraAnnotation, "expected an infrastructure-kill annotation to control against");
+  assert.match(infraAnnotation, /Re-run the job to get a real result\./);
+});
+
 test("verify step exits non-zero and annotates a real lane failure distinctly from a cancellation", () => {
   const result = runVerifyStep({ build: "failure" });
   assert.notEqual(result.status, 0);
