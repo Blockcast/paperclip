@@ -258,6 +258,35 @@ export interface TransientDbRetryOptions {
   jitterMs?: number;
   /** Observability hook fired before each retry (not on the final failure). */
   onRetry?: (info: { attempt: number; error: unknown }) => void;
+  /**
+   * Observability hook fired for EVERY caught error, including a non-transient
+   * one that is about to be rethrown unretried and the transient one on the
+   * final attempt (PEN-6581). `willRetry` says which of those it is.
+   *
+   * This is deliberately a different hook from {@link onRetry}, not a widening
+   * of it. `onRetry` answers "how much replay is this write costing", so it
+   * must stay silent on an error that is not replayed; a census of database
+   * errors needs the opposite, because the events it exists to count are
+   * precisely the ones that are NOT followed by a retry -- the final failure of
+   * an exhausted sequence, and every non-transient error. Counting on `onRetry`
+   * would undercount by exactly one event per failing operation and would miss
+   * a single-attempt failure entirely.
+   *
+   * Fired BEFORE the rethrow and before the backoff sleep, so it observes every
+   * error even when the caller discards the thrown value.
+   *
+   * ⛔ A throw from this hook is SWALLOWED, and that is not politeness. The
+   * two call sites that motivated it are the `heartbeat_runs` finalize writes
+   * this module exists to protect, where the file header records the cost of
+   * an unhandled throw: "the run is left in `running` forever and the agent
+   * never dispatches its next work". An observability hook must not be able to
+   * re-create the outage it was added to measure, and must not replace the
+   * database error the caller is entitled to see with a metrics fault. The
+   * swallow is scoped to THIS hook -- `onRetry`'s behaviour is unchanged -- and
+   * a hook that needs its failures visible must report them itself (the
+   * `recordBackgroundDbError` recorder logs its own).
+   */
+  onError?: (info: { attempt: number; error: unknown; willRetry: boolean }) => void;
   /** Injectable for deterministic tests. */
   sleep?: (ms: number) => Promise<void>;
   /** Injectable for deterministic tests. */
@@ -288,7 +317,15 @@ export async function runWithTransientDbRetry<T>(
     try {
       return await fn();
     } catch (error) {
-      if (!isTransientDbError(error) || attempt === maxAttempts) throw error;
+      const willRetry = isTransientDbError(error) && attempt < maxAttempts;
+      try {
+        options.onError?.({ attempt, error, willRetry });
+      } catch {
+        // See onError's contract: the database error must win. Deliberately
+        // not logged here -- this module is a pure leaf with no imports, and a
+        // hook that needs its failures visible reports them itself.
+      }
+      if (!willRetry) throw error;
       options.onRetry?.({ attempt, error });
       // Jittered backoff so concurrent retriers don't re-collide on the same
       // lock-acquisition order (matches services/recovery/service.ts).
