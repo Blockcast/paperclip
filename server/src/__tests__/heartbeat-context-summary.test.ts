@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildIssueParkWakeSnapshotFields,
   buildPaperclipTaskMarkdown,
   derivePaperclipPrReview,
+  parkForPrompt,
   triggeredMonitorForPrompt,
   evaluatePrReviewCompletionEvidence,
   mergeCoalescedContextSnapshot,
@@ -5081,5 +5083,83 @@ describe("park note (PEN-6476)", () => {
 
     expect(markdown).toContain("Waiting on ```gh pr view``` to settle.");
     expect(markdown).toContain("````text");
+  });
+
+  // PEN-6476 round 2, the OWED wiring test. Every case above hands `park` to
+  // `buildPaperclipTaskMarkdown` DIRECTLY, so none of them traverses the snapshot
+  // the sweep actually writes: rename a key at the staging site and all of them stay
+  // green while the note stops rendering -- a field staged under one name and read
+  // under another, with nothing reporting the gap, which is verbatim the defect this
+  // ticket exists to close.
+  //
+  // The monitor arm never had this hole: `triggeredMonitorForPrompt` is a named
+  // producer driven over real row shapes above. The park arm's read was an inline
+  // object literal at a call site ~17,800 lines from its writer, asserted nowhere.
+  // These cases drive the REAL producer into the REAL reader, so a rename on either
+  // side fails here rather than in production.
+  describe("snapshot wiring (PEN-6476 round 2)", () => {
+    const parkedAtFire = {
+      parkedUntil: new Date("2026-11-11T07:00:00.000Z"),
+      parkedReason: "HUMAN-WAIT: blocked on kkroo approving #3246. Do not push to this head.",
+    };
+
+    it("round-trips the staged park from the sweep's snapshot into the prompt input", () => {
+      const staged = buildIssueParkWakeSnapshotFields(parkedAtFire);
+
+      expect(parkForPrompt(staged)).toEqual({
+        reason: "HUMAN-WAIT: blocked on kkroo approving #3246. Do not push to this head.",
+        until: "2026-11-11T07:00:00.000Z",
+      });
+    });
+
+    // The end-to-end claim, and the only one that would have caught the gap: the
+    // bytes the sweep stages must reach the rendered block.
+    it("renders a note staged by the producer, with no hand-built park input", () => {
+      const markdown = buildPaperclipTaskMarkdown({
+        issue,
+        park: parkForPrompt(buildIssueParkWakeSnapshotFields(parkedAtFire)),
+      }) as string;
+
+      expect(markdown).toContain("Park note -- why this row was parked, written by whoever parked it:");
+      expect(markdown).toContain("HUMAN-WAIT: blocked on kkroo approving #3246. Do not push to this head.");
+      expect(markdown).toContain("- Park expired: \"2026-11-11T07:00:00.000Z\"");
+    });
+
+    // `parkedUntil` is a `Date` on the candidate row and a string in the snapshot.
+    // The serialization lives in the producer, so pin it there rather than inferring
+    // it from a rendered timestamp.
+    it("serializes the expiry to ISO and tolerates a string already", () => {
+      expect(buildIssueParkWakeSnapshotFields({ parkedUntil: new Date("2026-11-11T07:00:00.000Z") }).parkedUntil)
+        .toBe("2026-11-11T07:00:00.000Z");
+      expect(buildIssueParkWakeSnapshotFields({ parkedUntil: "2026-11-11T07:00:00.000Z" }).parkedUntil)
+        .toBe("2026-11-11T07:00:00.000Z");
+      expect(buildIssueParkWakeSnapshotFields({}).parkedUntil).toBeNull();
+    });
+
+    // A park with no note is common. The producer stays byte-faithful to the column
+    // -- it writes the persisted wake payload too -- and the READER is what collapses
+    // an empty or whitespace-only note, because the render gate branches on `null`
+    // and `""` would emit the heading over an empty fence.
+    it("leaves an empty note to the reader to collapse, and renders nothing for it", () => {
+      expect(buildIssueParkWakeSnapshotFields({ parkedReason: "   " }).parkedReason).toBe("   ");
+      expect(buildIssueParkWakeSnapshotFields({ parkedUntil: parkedAtFire.parkedUntil }).parkedReason).toBeNull();
+      expect(parkForPrompt(buildIssueParkWakeSnapshotFields({ parkedReason: "   " })).reason).toBeNull();
+
+      const markdown = buildPaperclipTaskMarkdown({
+        issue,
+        park: parkForPrompt(buildIssueParkWakeSnapshotFields({ parkedUntil: parkedAtFire.parkedUntil })),
+      }) as string;
+
+      expect(markdown).not.toContain("Park note -- why this row was parked");
+    });
+
+    // A run woken for any other reason carries neither key. The reader must yield
+    // nulls rather than throw, because it is called unconditionally at the call site.
+    it("yields nulls for a snapshot that carries no park, and for no snapshot at all", () => {
+      expect(parkForPrompt({ issueId: "issue-1", wakeReason: "issue_commented" }))
+        .toEqual({ reason: null, until: null });
+      expect(parkForPrompt(null)).toEqual({ reason: null, until: null });
+      expect(parkForPrompt(undefined)).toEqual({ reason: null, until: null });
+    });
   });
 });

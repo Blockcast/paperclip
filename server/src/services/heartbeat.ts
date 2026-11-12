@@ -13884,6 +13884,60 @@ export function triggeredMonitorForPrompt(
   };
 }
 
+/**
+ * PEN-6476 round 2: the two halves of the park wake's `contextSnapshot` contract,
+ * named as functions so a test can compose them.
+ *
+ * The producer below is what `tickExpiredIssueParks` stages; `parkForPrompt` is what
+ * the prompt builder's call site reads back. They were previously two independent
+ * object literals ~17,800 lines apart, keyed on string names nothing compared: rename
+ * either side and the note silently stops rendering while every renderer test stays
+ * green, because those tests hand `park` to `buildPaperclipTaskMarkdown` directly and
+ * never traverse the snapshot. That is the same shape as the defect this ticket
+ * exists to close -- a record staged for a run and not delivered, with nothing
+ * reporting the gap -- so it gets the wiring test the monitor arm already had.
+ *
+ * ⚠ The composition is the contract. Neither function is interesting alone, and a
+ * test that exercises only one of them re-opens the gap.
+ */
+export function buildIssueParkWakeSnapshotFields(park: {
+  parkedUntil?: Date | string | null;
+  parkedReason?: string | null;
+}): { parkedUntil: string | null; parkedReason: string | null } {
+  const until = park.parkedUntil ?? null;
+  return {
+    parkedUntil: until instanceof Date ? until.toISOString() : (typeof until === "string" ? until : null),
+    // Staged verbatim, NOT normalized: this writes the persisted wake payload as
+    // well as the snapshot, so the producer must stay byte-faithful to the column.
+    // Collapsing an empty note to `null` is the READER's job (`parkForPrompt`), and
+    // doing it here would be a silent change to a stored record for the benefit of
+    // one consumer.
+    parkedReason: park.parkedReason ?? null,
+  };
+}
+
+/**
+ * PEN-6476 round 2: read the staged park back off this run's persisted
+ * `contextSnapshot`.
+ *
+ * Tolerant of a missing snapshot and of either key being absent -- a run woken for
+ * any other reason carries neither, and the renderer gates on `reason`, so the
+ * absent case must be `null` rather than a throw. `readNonEmptyString` also collapses
+ * a whitespace-only note to `null` here, so the gate downstream never sees one.
+ */
+export function parkForPrompt(contextSnapshot: unknown): {
+  reason: string | null;
+  until: string | null;
+} {
+  const snapshot = (contextSnapshot && typeof contextSnapshot === "object")
+    ? contextSnapshot as Record<string, unknown>
+    : {};
+  return {
+    reason: readNonEmptyString(snapshot.parkedReason),
+    until: readNonEmptyString(snapshot.parkedUntil),
+  };
+}
+
 // Every agent authors through the same GitHub App installation, so we cannot
 // tell WHICH agent wrote a bot-authored PR -- but we can tell for certain when
 // NO agent did. A PR authored by anyone other than the configured bot identity
@@ -20175,16 +20229,17 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           requestedByActorId: "heartbeat_scheduler",
           payload: {
             issueId: candidate.id,
-            parkedUntil: candidate.parkedUntil?.toISOString() ?? null,
-            parkedReason: candidate.parkedReason,
+            // PEN-6476 round 2: staged through the shared producer, so the prompt-side
+            // read (`parkForPrompt`) is pinned against this site by a test rather than
+            // by two string literals 17,800 lines apart agreeing by habit.
+            ...buildIssueParkWakeSnapshotFields(candidate),
           },
           contextSnapshot: {
             issueId: candidate.id,
             taskId: candidate.id,
             wakeReason: ISSUE_PARK_EXPIRED_WAKE_REASON,
             source: "issue.park_expired",
-            parkedUntil: candidate.parkedUntil?.toISOString() ?? null,
-            parkedReason: candidate.parkedReason,
+            ...buildIssueParkWakeSnapshotFields(candidate),
           },
           idempotencyKey,
         });
@@ -38082,10 +38137,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // `recoveryRunWriteClassNotice` above reads, and the correct one here. The
       // sweep stages these two keys at the fire; see the `park` input's own note
       // for why the live columns are the wrong read even though they survive.
-      park: {
-        reason: readNonEmptyString(context.parkedReason),
-        until: readNonEmptyString(context.parkedUntil),
-      },
+      park: parkForPrompt(context),
       // PEN-6271: supplied whenever the row DERIVES an outstanding monitor
       // obligation at the moment this run's prompt is built -- `triggered`, or
       // (PEN-6553) a fire already CLAIMED whose triggered patch has not committed
