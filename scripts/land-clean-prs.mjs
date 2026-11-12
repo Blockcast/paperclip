@@ -3444,9 +3444,15 @@ export function landRepoHoldReason(row) {
         `approves it — ${held}`
       );
     case CODEOWNER_ENFORCEMENT.UNENFORCED:
+      // Narrowed to the code-owner bit on purpose (Ally review, PR #3711).
+      // This function reads ONE requirement; an approval COUNT or a required
+      // check can still block the merge, and `Blockcast/Network-Operator-Portal`
+      // is the live case — it reaches UNENFORCED and carries a
+      // REQUIRED_STATUS_CHECKS rule. A bare "GitHub would not block this merge"
+      // would overclaim in the mirror direction of the constant this replaces.
       return (
         `No branch rule on ${branch} requires a code-owner review, so GitHub would not block this ` +
-        `merge — ${held}`
+        `merge for a missing owner approval — ${held}`
       );
     default:
       return (
