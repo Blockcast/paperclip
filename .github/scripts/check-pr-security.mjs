@@ -416,12 +416,17 @@ export function formatCheckRunFlagList(flags) {
   return text;
 }
 
+// `prTitle` is author free text and so is repo-controlled, exactly like the
+// `file` / `line` / `packages` fields `formatFlagList` fences -- but it is
+// interpolated HERE, one function away, so those fences never reached it
+// (PEN-6561). Fence the FIELD wherever it is interpolated; do not reason
+// about which function happens to carry it today.
 export function buildAdvisoryPayload(prNumber, prTitle, flags) {
   const checkNames = [...new Set(flags.map(f => f.check))].join(', ');
   return {
     summary: `🚨 Security flag — PR #${prNumber}: ${checkNames}`,
     description: [
-    `**PR:** #${prNumber} — ${prTitle}`,
+    `**PR:** #${prNumber} — ${mdCode(prTitle)}`,
     `**Checks triggered:** ${checkNames}`,
     '',
     '**Details:**',
