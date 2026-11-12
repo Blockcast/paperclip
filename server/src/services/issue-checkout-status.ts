@@ -228,10 +228,17 @@ const hasCancelledBlocker = sql`exists (
  * So `blocked` is restored only when the row has at least one pending blocker
  * and no cancelled one; otherwise the row lands in `todo`, which keeps it in
  * `inbox-lite` and re-dispatchable. Every other marker restores verbatim.
- */
-/**
+ *
+ * ---
+ *
  * PEN-6587 — a declared external wait is the fourth arm, and it is why the `blocked`
  * marker is no longer the whole question.
+ *
+ * Kept in the SAME block as the BLO-33144 rationale above deliberately. JSDoc attaches
+ * the nearest preceding block and only that one, so splitting these into two adjacent
+ * JSDoc blocks silently orphans whichever ends up higher — and the one that would be
+ * orphaned here is the 141-of-141 argument this arm is careful not to reopen. If a
+ * fifth arm ever lands, extend this block rather than prefixing another one (PEN-6593).
  *
  * The 141-of-141 measurement above is sound and is not reopened: when it was taken, a
  * zero-blocker `blocked` row really was indistinguishable from a strand, so draining it
