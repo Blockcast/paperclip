@@ -1,5 +1,10 @@
 # PEN-4989 — widening the absolute-path-`git` measurement past one pod
 
+<!-- anchor-external: penstock-llm-proxy-core -->
+<!-- Every source citation in this document names the penstock-llm-proxy-core tree,
+     not this one. Declared so check-doc-line-anchors reports and skips them rather
+     than resolving them against a path that happens to exist here. -->
+
 [`PEN-4986-absolute-path-git-runtime-measurement.md`](./PEN-4986-absolute-path-git-runtime-measurement.md)
 took the measurement that §7.1 of
 [`PEN-3183-git-egress-enforcement-boundary-decision.md`](./PEN-3183-git-egress-enforcement-boundary-decision.md)

@@ -129,7 +129,7 @@ unguarded git **can authenticate** — and it does so *by itself*, with no crede
 the caller at all. Measured today:
 
 - The agent image's **system** git scope carries a credential helper for github.com.
-  `Dockerfile.runtime:82-83` writes, as the only `git config --system` in the whole build chain:
+  `Dockerfile.runtime:87-88` writes, as the only `git config --system` in the whole build chain:
 
   ```
   git config --system credential.https://github.com.helper '!/usr/bin/gh auth git-credential'
@@ -141,7 +141,8 @@ the caller at all. Measured today:
   injected only as `-c` flags on the wrapper's exec line. Skipping the wrapper therefore drops the
   paperclip helper and keeps the gh one.
 - That helper deliberately points at `/usr/bin/gh`, the wrapper — not `gh.real` — precisely
-  *because* the wrapper reads the token file (`Dockerfile.runtime:65-70`, BLO-25702). So the helper
+  *because* the wrapper reads the token file (`Dockerfile.runtime:65-70`
+  (`Must point at /usr/bin/gh`), BLO-25702). So the helper
   resolves the credential on git's behalf.
 - The push credential is a Secret mounted at `/etc/paperclip/secrets/github-token/` with
   `defaultMode: 292` — octal **0444**, world-readable within the pod.
@@ -230,7 +231,8 @@ The boundary must therefore hold the credential and **perform the publish itself
   `~/.config/gh/hosts.yml` — the unmaintained state BLO-13241 wrapped `gh` to stop using in the
   first place. Either one re-authenticates the unguarded binary with the mount already gone.
   Prefer removing the helper from the image's system scope outright; if it stays (the wrapped
-  doors still need it), D1 must assert it yields no credential. Note `Dockerfile.runtime:82` is
+  doors still need it), D1 must assert it yields no credential. Note `Dockerfile.runtime:87`
+  (`credential.https://github.com.helper`) is
   guarded by two equality checks (`scripts/check-agent-image-git-config.mjs` and assertion (a) in
   `agent-egress-path.test.mjs`) whose expectations live in `scripts/git-config-surface.mjs` —
   changing that line means changing those in the same commit, by construction.
@@ -438,6 +440,8 @@ the cluster**, so nothing would currently report trigger 4 firing in another pod
 on the §7.2 triggers is already permitted by §8 without further security review, and is the cheapest
 remaining improvement here.
 
+<!-- anchor-external: penstock-llm-proxy-core -->
+
 ⚠ **That re-take has since been owed three times and taken twice — so the "six windows" above is now
 nine (PEN-5663, latest 2026-11-09).** The egress-relevant surface changed on 2026-11-03 (`50aab1b9…`) and again on
 2026-11-05 (`83aef063…`), against the `d81423fe…` the six windows were taken on — a roughly
@@ -483,6 +487,8 @@ against over-reading this:
   counting 11 indeterminate samples.
 - ⚠ `guardedPath()` is a **mitigation, not a fix**, by its own header: a caller that does not use it is
   unaffected. The durable close remains D1 (§7.3). PEN-5012 is `in_review`, not closed.
+
+<!-- anchor-local -->
 
 ⚠ **Status, 2026-10-29 (PEN-4933):** D1 is **built** and merged behind a default-off rollout gate;
 see §7.3. The residual statement above still describes the deployed fleet — but it is **no longer
@@ -965,24 +971,32 @@ Four things a reader should not infer from that paragraph:
    `paperclip-github-token-env` as the binary that starves, and routed the
    answer through the broker's refusal of the `auth` verb. **Neither is on
    this path.** That wrapper installs to `/usr/local/libexec/paperclip/bin/`
-   (`Dockerfile:674`) and is reached through `PATH` — which is precisely what
+   (`Dockerfile:674` (`/usr/local/libexec/paperclip/bin/`)) and is reached through `PATH`
+   — which is precisely what
    bypass 4 sidesteps. The system helper is `!/usr/bin/gh auth git-credential`
-   (`Dockerfile.runtime:83`), an **absolute** path, so `PATH` is not consulted
+   (`Dockerfile.runtime:88` (`!/usr/bin/gh auth git-credential`)), an **absolute** path,
+   so `PATH` is not consulted
    and no egress wrapper is involved; and the broker is never asked, because
    nothing on this path speaks to it. Pointing an assertion at the documented
    mechanism would have pinned a file the chain does not execute, and stayed
    green while the real chain broke. Security traced this independently on
    master `8055be2a6`.
 
+<!-- anchor-file: scripts/gh-token-wrapper.sh -->
+
    The real mechanism, which is what the assertion confirms: `/usr/bin/gh` is
-   a symlink to `scripts/gh-token-wrapper.sh` (`Dockerfile.runtime:53-55`), and
+   a symlink to `scripts/gh-token-wrapper.sh` (`Dockerfile.runtime:59-61`
+   (`ln -s /usr/bin/gh-token-wrapper.sh /usr/bin/gh`)), and
    the decisive conjunct is its `TOKEN_FILE_REQUIRED`, set to `yes` **iff
-   `PAPERCLIP_GITHUB_TOKEN_FILE` is present in the environment** (`:404-406`,
-   tested with `${VAR+x}`, so set-empty counts). `auth git-credential` is not
-   in the exempt list that follows (`:412`), so with the variable set and the
-   file absent the wrapper reaches `reject_token_file "is absent"` (`:525`) and
+   `PAPERCLIP_GITHUB_TOKEN_FILE` is present in the environment** (`:1911-1912`
+   (`TOKEN_FILE_REQUIRED=yes`), tested with
+   `${VAR+x}`, so set-empty counts). `auth git-credential` is not
+   in the exempt list that follows (`:1918`
+   (`"auth setup-git" | "auth login") TOKEN_FILE_REQUIRED=no ;;`)), so with the variable set and the
+   file absent the wrapper reaches `reject_token_file "is absent"` (`:2021`) and
    exits non-zero. With the variable **unset** it falls through to
-   `exec_real_gh` (`:528`) under whatever ambient auth exists.
+   the unconditional `exec_real_gh "$@"` (`:2024`) that ends the wrapper, under
+   whatever ambient auth exists.
    ⚠ That mechanism is now **asserted**, not merely probable — which was the
    whole of §5's objection to the paragraph above.
 
