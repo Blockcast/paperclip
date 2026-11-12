@@ -3724,15 +3724,20 @@ export function recoveryService(
    * about what it meant, so a second hand-written copy of the discriminator is that same
    * drift waiting to recur.
    *
-   * THE SURVEY IS NO LONGER THE CONTROL, which is the half worth carrying out of this
-   * row. The count in the paragraph above is still a measurement with a date on it, but a
-   * THIRTEENTH writer that leaves a row `pending` while moving its `updatedAt` is now
-   * caught by a test rather than by someone remembering to re-run a grep:
-   * `issue-recovery-actions.test.ts` drives the real `updatePayload` writer against THIS
-   * predicate and asserts the row IS seized ("stops believing a stale-filed approval that
-   * was only corrected IN PLACE"), with the resubmit exemption asserted beside it. See
-   * `pendingBoardApprovalAttendanceGraceMs` for the measured decision-latency
-   * distribution behind the 14d default.
+   * WHAT THE TEST HOLDS, AND WHAT IT DOES NOT. `issue-recovery-actions.test.ts` drives
+   * the real `updatePayload` writer against THIS predicate and asserts the row IS seized
+   * ("stops believing a stale-filed approval that was only corrected IN PLACE"), with
+   * the resubmit exemption asserted beside it. That pins the EXISTING writer and
+   * `PENDING_SINCE`'s discriminator: a regression in either goes red.
+   *
+   * It does NOT catch a NEW writer, and the survey above is STILL the control for that
+   * case. The test names `updatePayload` rather than enumerating `update(approvals)`
+   * sites, and a writer that moves `updatedAt` WITHOUT setting `payloadEditedAt` falls
+   * through `PENDING_SINCE`'s `else` to `greatest(created_at, updated_at)` and widens
+   * this exemption exactly as before — the "nearest miss" shape `config.ts` names.
+   * So re-run the survey rather than trusting the count in the paragraph above, which
+   * remains a measurement with a date on it. See `pendingBoardApprovalAttendanceGraceMs`
+   * for the measured decision-latency distribution behind the 14d default.
    */
   async function hasPendingBoardApprovalWakePath(
     issue: typeof issues.$inferSelect,
