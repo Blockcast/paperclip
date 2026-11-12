@@ -217,6 +217,88 @@ describe("plugin database SQL validation", () => {
       validatePluginMigrationStatement("DO $$ BEGIN END $$;", "plugin_test")
     ).toThrow(/disallowed/i);
   });
+
+  it("reads the write target through a comment instead of adjudicating some other ref", () => {
+    // PEN-5951 review round. Mapping a comment to whitespace made the keyword scan
+    // read what Postgres reads, but `extractQualifiedRefs` still regexed the RAW
+    // statement, where `update` is not followed by whitespace. The real target was
+    // therefore never extracted and the namespace check settled for the in-namespace
+    // `FROM` ref instead, accepting a write to public. Both halves read one text now.
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "UPDATE/**/public.agents SET name = 'x' FROM plugin_test.rows",
+        "plugin_test",
+      )
+    ).toThrow(/inside plugin namespace/i);
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "DELETE FROM/**/other_ns.t WHERE id IN (SELECT id FROM plugin_test.rows)",
+        "plugin_test",
+      )
+    ).toThrow(/inside plugin namespace/i);
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "INSERT INTO/**/public.agents (id) SELECT id FROM plugin_test.rows",
+        "plugin_test",
+      )
+    ).toThrow(/inside plugin namespace/i);
+    // Control: the same statement without the comment was refused before and after.
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "UPDATE public.agents SET name = 'x' FROM plugin_test.rows",
+        "plugin_test",
+      )
+    ).toThrow(/inside plugin namespace/i);
+    // Control: an in-namespace write is still allowed.
+    expect(() =>
+      validatePluginRuntimeExecute("UPDATE plugin_test.rows SET name = 'x'", "plugin_test")
+    ).not.toThrow();
+  });
+
+  it("sees a commented-out read of a core table that no ref would otherwise report", () => {
+    // Pre-existing on master and closed by the same fix: with no ref extracted at
+    // all, the namespace loop ran zero times and a missing ref read as allowed.
+    expect(() =>
+      validatePluginRuntimeQuery("SELECT * FROM/**/public.secrets", "plugin_test")
+    ).toThrow(/public\.secrets/i);
+    expect(() =>
+      validatePluginRuntimeQuery("SELECT * FROM plugin_test.rows", "plugin_test")
+    ).not.toThrow();
+  });
+
+  it("refuses escape string literals, which hide a second statement from the splitter", () => {
+    // `scanSqlSpans` does not lex backslashes, so it reads the `''` in E'\'' as a
+    // doubled quote and runs to end of input. The splitter then reports ONE
+    // statement and the keyword scan sees only the blanked literal, so a whole
+    // second statement rides along. Refusing the prefix is the fail-closed answer;
+    // no .sql file in this repo uses one.
+    expect(() =>
+      validatePluginRuntimeQuery(String.raw`SELECT E'\'' ; DROP SCHEMA public CASCADE; --'`, "plugin_test")
+    ).toThrow(/escape string literal/i);
+    expect(() =>
+      validatePluginRuntimeExecute(String.raw`UPDATE plugin_test.rows SET n = e'\n'`, "plugin_test")
+    ).toThrow(/escape string literal/i);
+    // Control: the smuggling only works through the escape string. A bare second
+    // statement is still caught by the splitter.
+    expect(() =>
+      validatePluginRuntimeQuery("SELECT 1; DROP SCHEMA public CASCADE", "plugin_test")
+    ).toThrow(/exactly one statement/i);
+    // Control: `LIKE'x'` is legal SQL that ends in an E. Only a STANDALONE e/E is a
+    // prefix, so this must still pass.
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "UPDATE plugin_test.rows SET n = 'y' WHERE n LIKE'%a%'",
+        "plugin_test",
+      )
+    ).not.toThrow();
+    // Control: an apostrophe in a line comment is not a literal at all.
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "-- it's a write\nUPDATE plugin_test.rows SET n = 'x'",
+        "plugin_test",
+      )
+    ).not.toThrow();
+  });
 });
 
 describe("buildPluginWorkerEnv", () => {

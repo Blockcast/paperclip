@@ -173,6 +173,61 @@ function stripSqlForKeywordScan(input: string): string {
   return out;
 }
 
+/**
+ * The same input with comments replaced by a single space, and everything else --
+ * code AND quoted spans -- kept verbatim.
+ *
+ * This is what `extractQualifiedRefs` must read. The keyword scan blanks quoted
+ * spans because it only cares about keywords; the ref extractor cannot, because a
+ * quoted IDENTIFIER (`"schema"."table"`) is a ref, and because blanking literals
+ * would hide the text the splitter already mis-lexed into one giant quoted span.
+ *
+ * Before PEN-5951 the ref extractor regexed the RAW statement while the keyword
+ * scan read comment-stripped text, so the two halves of the validator disagreed
+ * about a block comment placed between `UPDATE` and the table name: the keyword
+ * scan saw a legal `UPDATE`, while `(update|into|from)` followed by whitespace
+ * could not match across the comment. The real write target was therefore never
+ * extracted, and the namespace check adjudicated some other in-namespace ref
+ * instead. Both halves now read the same text.
+ */
+function stripSqlComments(input: string): string {
+  let out = "";
+  for (const span of scanSqlSpans(input)) {
+    out += span.kind === "comment" ? " " : input.slice(span.start, span.end);
+  }
+  return out;
+}
+
+/**
+ * Postgres escape strings (`E'...'`) treat a backslash as an escape, so `E'\''`
+ * is a literal containing one quote. `scanSqlSpans` does not lex backslashes -- it
+ * reads `''` as a doubled quote and keeps going -- so an escape string lets a
+ * caller hide a `;` and a whole second statement inside what the lexer believes is
+ * one unterminated literal. `splitSqlStatements` then reports a single statement
+ * and the keyword scan sees only the blanked literal.
+ *
+ * Refusing the prefix is the fail-closed answer and costs nothing: no `.sql` file
+ * in this repo uses one. Lexing backslash escapes would mean tracking
+ * `standard_conforming_strings`, which the host cannot see.
+ *
+ * Dollar-quoting (`$$ ... $$`) is NOT in this family: the lexer does not know it
+ * either, but that makes a `;` inside it read as CODE, so the statement splitter
+ * refuses it as more than one statement rather than swallowing it.
+ */
+function assertNoEscapeStringLiterals(statement: string): void {
+  for (const span of scanSqlSpans(statement)) {
+    if (span.kind !== "quoted" || span.quote !== "'") continue;
+    const prefix = statement[span.start - 1];
+    if (prefix !== "e" && prefix !== "E") continue;
+    // `LIKE'x'` is legal SQL and ends in an E; only a STANDALONE e/E is a prefix.
+    const beforePrefix = statement[span.start - 2];
+    if (beforePrefix !== undefined && /[A-Za-z0-9_]/.test(beforePrefix)) continue;
+    throw new Error(
+      "Plugin SQL cannot use escape string literals (E'...'): backslash escapes are not lexed",
+    );
+  }
+}
+
 function normaliseSql(input: string): string {
   return stripSqlForKeywordScan(input).replace(/\s+/g, " ").trim().toLowerCase();
 }
@@ -221,6 +276,7 @@ function assertAllowedPublicRead(
 }
 
 function assertNoBannedSql(statement: string): void {
+  assertNoEscapeStringLiterals(statement);
   const normalized = normaliseSql(statement);
   const banned = [
     /\bcreate\s+extension\b/,
@@ -265,7 +321,7 @@ export function validatePluginMigrationStatement(
     throw new Error("Plugin migrations may contain DDL or namespace-scoped backfill statements only");
   }
 
-  const refs = extractQualifiedRefs(statement);
+  const refs = extractQualifiedRefs(stripSqlComments(statement));
   if (refs.length === 0 && !normalized.startsWith("comment ")) {
     throw new Error("Plugin migration objects must use fully qualified schema names");
   }
@@ -316,7 +372,7 @@ export function validatePluginRuntimeQuery(
   }
 
   const allowedCoreReadTables = new Set(coreReadTables);
-  for (const ref of extractQualifiedRefs(statement)) {
+  for (const ref of extractQualifiedRefs(stripSqlComments(statement))) {
     if (ref.schema === namespace) continue;
     if (ref.schema === "public") {
       assertAllowedPublicRead(ref, allowedCoreReadTables);
@@ -341,7 +397,7 @@ export function validatePluginRuntimeExecute(query: string, namespace: string): 
     throw new Error("ctx.db.execute cannot contain DDL keywords");
   }
 
-  const refs = extractQualifiedRefs(statement);
+  const refs = extractQualifiedRefs(stripSqlComments(statement));
   const target = refs.find((ref) => ["into", "update", "from"].includes(ref.keyword));
   if (!target || target.schema !== namespace) {
     throw new Error(`ctx.db.execute target must be inside plugin namespace "${namespace}"`);
