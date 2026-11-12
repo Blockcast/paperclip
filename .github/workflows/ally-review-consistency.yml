@@ -41,6 +41,27 @@ name: Ally Review Consistency Guard
 # against, so a clean month-old PR merges on a click with no transition and no
 # run in between, and CLEAN/BEHIND/UNSTABLE therefore stay fatal at any age.
 # See prDormancy() in the script for the three tiers and the measurement.
+#
+# Since PEN-5793 this run also carries a second, independent check: the
+# unattested-head strand detector. Everything above audits the SHAPE of the
+# reviews a head already has, so a head carrying ZERO reviews passes vacuously —
+# the gap PR #3452 fell through when it sat unreviewed for 3h23m53s with this
+# guard green throughout. The detector reports any non-draft open head that has
+# been unattested for longer than the threshold (30 minutes by default; see
+# parseStrandThresholdMinutes for the measured band behind that number), clocked
+# from the head's check-suite created_at rather than its client-set committer
+# date, and classifies each by K — how many other heads the reviewer attested in
+# the same window — to separate a single-PR strand from a reviewer-wide stall.
+#
+# It REPORTS and does not fail the run. A strand is a latency condition that
+# resolves itself, it carries no stable fingerprint, and it must not enter the
+# baseline ratchet above. More to the point, the pr_review dispatch backlog this
+# detector observes is currently saturated (PEN-5793 done-when #3: a floor of 2
+# and a 72-hour high of 11 unresolved terminal failures as of 2026-11-12), so a
+# failing detector would go red most hours and carry no more information than no
+# detector — the same argument the ratchet paragraph above makes. Set
+# ALLY_STRAND_FAIL=1 to promote it to a hard failure once that backlog is
+# drained, which is the sequencing PEN-5793 itself records.
 
 on:
   schedule:
@@ -55,6 +76,10 @@ on:
 permissions:
   contents: read
   pull-requests: read
+  # The strand detector clocks an unattested head from its check-suite
+  # created_at. Without checks:read that read 403s and EVERY unattested head
+  # reports `unclocked` — the detector stays loud but stops discriminating.
+  checks: read
 
 jobs:
   one-verdict-per-head:
