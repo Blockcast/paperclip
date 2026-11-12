@@ -39,9 +39,10 @@ import type { Db } from "./client.js";
  *   2. Rows written by a replica still serving the pre-attribution image during a roll.
  *   3. Rows this pass deliberately DEFERS -- see the next section.
  *
- * A once-per-lease pass leaves all three invisible to `by-project` until the next deploy
- * or failover, which is hours to days. The interval converges them without an operator
- * and without a deploy. A drained pass is one index scan over
+ * A once-per-lease pass leaves all three MISATTRIBUTED -- reported in `by-project`'s
+ * unattributed bucket (PEN-6084) rather than against the project that incurred them --
+ * until the next deploy or failover, which is hours to days. The interval converges
+ * them without an operator and without a deploy. A drained pass is one index scan over
  * `cost_events_unattributed_idx` (the `cost_events_unattributed_index` migration), a
  * partial index whose entries are
  * exactly the rows still awaiting a watermark -- so once drained it holds the in-flight
@@ -124,8 +125,9 @@ import type { Db } from "./client.js";
  *
  * ## What deferral costs while it holds
  *
- * A deferred row is attributed to nothing, so `costs/by-project` drops it until its run
- * is over -- the read-time join this replaces attributed such a row live. Only rows with
+ * A deferred row is attributed to nothing, so `costs/by-project` reports it in the
+ * unattributed bucket (PEN-6084) rather than against its project, until its run is over
+ * -- the read-time join this replaces attributed such a row live. Only rows with
  * NO write-time `project_id` are affected; the rest are returned immediately through
  * `coalesce(project_id, attributed_project_id)`. The window closes on its own, and a run
  * that dies without finalizing is finalized for it by `reapOrphanedRunsPeriodic`
