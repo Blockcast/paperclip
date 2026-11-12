@@ -18914,6 +18914,21 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // no claim marker. Neither call site can do that today; if one ever does,
       // there is no claim to assert, and today's behaviour is the right default
       // rather than a monitor that silently never triggers again.
+      //
+      // Named consequence, because it is real and it is the thing a reader will
+      // ask about: a superseded fire consumes no attempt. The increment lives in
+      // the patch, so skipping the patch skips it, and an assignee re-arm carries
+      // the previous count forward. Neither does the convergence counter advance,
+      // since that only moves when the previous state was `triggered`. So a
+      // monitor whose EVERY fire were raced would never reach `maxAttempts`. That
+      // is the right side of the trade: losing the discharge is measured and
+      // certain in this window, while exhausting the budget requires an unbroken
+      // streak of races on a lane whose median dispatch delay (29.4 s) already
+      // sits outside the 7.56-22 s band -- and every cycle of such a streak is an
+      // assignee deliberately choosing to keep polling, not a machine loop. Do not
+      // "fix" it by bumping the count in a second write: on the clear path that
+      // would scribble on a cleared monitor's audit record, and on the re-arm path
+      // it would have to reach the JSON copy too or leave the two disagreeing.
       const claimMarker = claimed.monitorWakeRequestedAt;
       const triggeredRows = await db
         .update(issues)
