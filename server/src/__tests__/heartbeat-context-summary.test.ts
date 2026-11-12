@@ -3402,6 +3402,7 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
     const markdown = buildPaperclipTaskMarkdown({
       issue,
       triggeredMonitor: {
+        phase: "triggered",
         lastTriggeredAt: "2026-11-08T19:30:27.629Z",
         attemptCount: 4,
         maxAttempts: 24,
@@ -3572,7 +3573,7 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
     // inside it. Before PEN-6553 this returned null and the run held the
     // obligation for its whole life with the directive never emitted.
     it("derives an obligation while the fire is claimed and the triggered patch has not landed", () => {
-      expect(triggeredMonitorForPrompt(claimedFireRow)).toMatchObject({ serviceName: "github-pr-human-approval", maxAttempts: 24 });
+      expect(triggeredMonitorForPrompt(claimedFireRow)).toMatchObject({ phase: "claimed", serviceName: "github-pr-human-approval", maxAttempts: 24 });
     });
 
     // The two facts the triggered patch WRITES are not written yet, so the
@@ -3641,6 +3642,7 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
     const markdown = buildPaperclipTaskMarkdown({
       issue,
       triggeredMonitor: {
+        phase: "triggered",
         lastTriggeredAt: null,
         attemptCount: null,
         maxAttempts: null,
@@ -3671,6 +3673,7 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
     const markdown = buildPaperclipTaskMarkdown({
       issue,
       triggeredMonitor: {
+        phase: "triggered",
         lastTriggeredAt: null,
         attemptCount: 2,
         maxAttempts: null,
@@ -3686,6 +3689,69 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
     expect(factLine).toBeDefined();
     expect(factLine).toContain("(attempt 2)");
     expect(factLine).not.toContain("attempt 2/");
+  });
+  // PEN-6553 review round 2. The claim-window shape is the one the gate newly
+  // produces, and it is NOT the all-null shape above: two facts WITHHELD (the
+  // triggered patch has not written them) beside two already correct (they come
+  // from the policy monitor, which that patch is what strips). Pinned as one
+  // case because the defect is a COMBINATION -- a fact line asserting
+  // `triggered` while the row still reads `scheduled`, next to facts that would
+  // be wrong rather than missing if they were rendered.
+  it("renders the claim-window directive without the facts the patch has not written", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      triggeredMonitor: {
+        phase: "claimed",
+        lastTriggeredAt: null,
+        attemptCount: null,
+        maxAttempts: 24,
+        serviceName: "github-pr-human-approval",
+      },
+    });
+
+    const factLine = markdown
+      .split("\n")
+      .find((line) => line.startsWith("This row's monitor has FIRED"));
+    expect(factLine).toBeDefined();
+    // The status claim a run in this window can falsify with a single
+    // `paperclipGetIssue` is NOT made. A directive caught being wrong about the
+    // state is one the fleet learns to discount, and this window is where it
+    // most needs acting on.
+    expect(factLine).not.toContain("is sitting `triggered`");
+    expect(factLine).toContain("may still read `scheduled`");
+    // Exact parenthetical, which pins the withholding as well as the rendering:
+    // had `lastTriggeredAt`/`attemptCount` leaked through, this would read
+    // "(fired ..., attempt ..., waiting on ...)" and not match.
+    expect(factLine).toContain("(waiting on `github-pr-human-approval`)");
+    // The obligation and both exits are unchanged between the two windows. This
+    // is a wording fix to ONE clause, not a second directive.
+    expect(markdown).toContain("ENDING YOUR RUN IS NOT ONE OF THE WAYS");
+    expect(markdown).toContain("`paperclipSetIssueMonitor`");
+    expect(markdown).toContain("`paperclipClearIssueMonitor(issueId)`");
+  });
+
+  // Control for the case above: the SETTLED window keeps the status claim,
+  // because there it is true and it is the fact that makes the directive
+  // concrete. Without this, the assertion above would also pass against a change
+  // that simply deleted the clause from both windows.
+  it("keeps the settled wording when the triggered patch has committed", () => {
+    const markdown = buildPaperclipTaskMarkdown({
+      issue,
+      triggeredMonitor: {
+        phase: "triggered",
+        lastTriggeredAt: "2026-11-08T19:30:27.629Z",
+        attemptCount: 4,
+        maxAttempts: 24,
+        serviceName: "github-pr-human-approval",
+      },
+    });
+
+    const factLine = markdown
+      .split("\n")
+      .find((line) => line.startsWith("This row's monitor has FIRED"));
+    expect(factLine).toBeDefined();
+    expect(factLine).toContain("is sitting `triggered`");
+    expect(factLine).not.toContain("may still read `scheduled`");
   });
 });
 
