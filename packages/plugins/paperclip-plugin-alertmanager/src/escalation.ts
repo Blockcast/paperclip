@@ -1365,8 +1365,20 @@ async function advanceIssueLadder(
   // left to be discovered from the table: this deferral returns ahead of
   // `readLiveness` below, so a park-only row whose alert has silently cleared
   // records `attended_park` where it would have recorded `held_alert_clear`.
-  // Both arms re-arm the same rung one interval out and neither reassigns, so
-  // nothing observable moves — only the bookkeeping. `held_alert_clear` on
+  // Both arms re-arm the same rung one interval out and neither reassigns or
+  // closes the row — but they are NOT otherwise identical, and the difference
+  // is visible on the issue thread. `holdLadderForClearedAlert` also posts the
+  // one-time `NOT_FIRING_MARKER` notice and records `alertLiveness:
+  // "not_firing"`; this deferral returns before either, so it posts nothing and
+  // records `"not_read"`. While a park holds, a park-only row whose alert has
+  // silently cleared is therefore not told so on its own thread. The notice is
+  // DEFERRED, not dropped: the marker dedups against the issue comments, so the
+  // first pass taken after the park term goes false posts it if the alert is
+  // still clear, bounded by `parkedUntil` and by `MAX_PARK_DEFERRAL_RUNGS`
+  // intervals from `parkedAt`, whichever lapses first. Whether suppressing it
+  // for the life of a park is RIGHT is open and is not decided here; moving
+  // this check behind `readLiveness` would restore the notice and add an
+  // Alertmanager read on park-only rows. `held_alert_clear` on
   // park-only rows falls by however much `attended_park` absorbs.
   const monitorArmed = hasArmedMonitor(issue, now);
   const blockerLive = monitorArmed ? false : await hasLiveBlocker(ctx, issue.id, companyId);
