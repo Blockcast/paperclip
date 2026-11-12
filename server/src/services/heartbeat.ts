@@ -13614,11 +13614,15 @@ const AUTHOR_REVIEW_CONTENT_WAKE_REASONS = new Set([
 // non-bot author (#953 did), since a bot commit destroys that independence.
 //
 /**
- * PEN-6271: the row's monitor when and only when it is sitting `triggered`.
+ * PEN-6271: the row's monitor when and only when it carries an OUTSTANDING
+ * obligation.
  *
- * Returns null in every other state -- including `scheduled` and `cleared` --
- * because the directive it feeds is about an OUTSTANDING obligation, and a
- * scheduled monitor carries none.
+ * That is `triggered`, plus the one `scheduled` case where the fire has been
+ * CLAIMED and its triggered patch has not committed yet -- PEN-6553, see the
+ * claim-marker branch below, which is where the reasoning lives. Returns null in
+ * every other state, including an ordinarily scheduled monitor and a cleared
+ * one, because the directive it feeds is about an obligation and those carry
+ * none.
  *
  * Derived through `derivePersistedMonitorState`, the SAME function
  * `tickExpiredIssueMonitors` uses, so the prompt and the sweep cannot disagree
@@ -13656,10 +13660,66 @@ export function triggeredMonitorForPrompt(
     state: parseIssueExecutionState(issueContext.executionState ?? null),
     policy: normalizeIssueExecutionPolicy(issueContext.executionPolicy ?? null),
   });
-  if (!monitor || monitor.status !== "triggered") return null;
+  if (!monitor) return null;
+  if (monitor.status === "triggered") {
+    return {
+      lastTriggeredAt: monitor.lastTriggeredAt ?? null,
+      attemptCount: typeof monitor.attemptCount === "number" ? monitor.attemptCount : null,
+      maxAttempts: typeof monitor.maxAttempts === "number" ? monitor.maxAttempts : null,
+      serviceName: monitor.serviceName ?? null,
+    };
+  }
+
+  // PEN-6553: the branch above reads the monitor's SETTLED state, and this
+  // function is the one consumer that routinely does not get to see it.
+  //
+  // A fire is three writes, in this order: the CLAIM (`monitorWakeRequestedAt =
+  // now`, in its own transaction), then `enqueueWakeup`, then -- 158 lines and
+  // several awaits later -- the triggered patch that nulls `monitorNextCheckAt`
+  // and writes `triggered`. The wake is what creates the queued run, and the
+  // run's prompt is built at DISPATCH off a live read of the row. So a run
+  // dispatched before that last write commits reads `monitorNextCheckAt` still
+  // populated, derives `scheduled`, and the directive is omitted -- for a run
+  // that holds the obligation for its entire life. Measured margins between the
+  // run row and `issue.monitor_triggered`: 7.56 s, 9.77 s, 22 s; 7 of 15
+  // `issue_monitor_due` runs on one seat dispatched inside that band.
+  //
+  // The ordering is NOT the thing to fix, and moving the patch above the enqueue
+  // would reintroduce two defects this file already carries fixes for: the patch
+  // is CONDITIONAL on what `enqueueWakeup` did. A wake parked behind an
+  // unresolved blocker returns null without throwing (BLO-22048) and a declined
+  // wake returns a `durableSkipReason` (PEN-3326); both re-arm instead of
+  // triggering. Patching first would consume the timer and log
+  // `issue.monitor_triggered` for a wake that was never queued -- in PEN-3326's
+  // own words, "an activity row asserting a wake that was never queued".
+  //
+  // So gate on the CLAIM, which is strictly earlier than the wake and therefore
+  // cannot race it. `monitorWakeRequestedAt` is set only by the three claim
+  // sites, each in the same transaction that selects the row for dispatch, and
+  // is nulled by every exit: the triggered patch, every re-arm builder
+  // (`buildIssueMonitorDispatchRearmPatch`), the cleared patch, and the catch
+  // block that releases a claim whose dispatch threw. A row therefore carries
+  // BOTH columns only between the claim and the end of that dispatch -- which is
+  // exactly "a fire is claimed and its triggered patch has not committed yet".
+  //
+  // This is deliberately NOT a `wakeReason === "issue_monitor_due"` gate, which
+  // was considered and refused: that fires on the slow arm too, where the
+  // dispatch-lapse watchdog has already re-armed the monitor (15m) and the
+  // `trigger_stalled` sweep -- which selects on `isNull(monitorNextCheckAt)` --
+  // can no longer reach the row. Telling such a run it is about to strand a
+  // monitor would be FALSE, which is worse than silent. The claim marker gets
+  // that arm right for free, because every re-arm nulls it.
+  if (monitor.status !== "scheduled") return null;
+  if (!issueContext.monitorNextCheckAt || !issueContext.monitorWakeRequestedAt) return null;
+  // `lastTriggeredAt` and `attemptCount` are the only two facts the triggered
+  // patch WRITES, so in this window the columns still hold the previous fire's
+  // instant and the pre-increment count. Omitted rather than rendered stale --
+  // the renderer drops each absent fact instead of emptying it. `maxAttempts`
+  // and `serviceName` come from the policy monitor, which is still present here
+  // (the triggered patch is what strips it), so they are already correct.
   return {
-    lastTriggeredAt: monitor.lastTriggeredAt ?? null,
-    attemptCount: typeof monitor.attemptCount === "number" ? monitor.attemptCount : null,
+    lastTriggeredAt: null,
+    attemptCount: null,
     maxAttempts: typeof monitor.maxAttempts === "number" ? monitor.maxAttempts : null,
     serviceName: monitor.serviceName ?? null,
   };
@@ -13809,6 +13869,14 @@ export function buildPaperclipTaskMarkdown(input: {
    * nothing clears it until a run re-arms or clears, or `tickExpiredIssueMonitors`
    * sweeps it. Every row in the PEN-6271 census reached its sweep still
    * `triggered`, and the run it woke ran inside that interval.
+   *
+   * PEN-6553: the converse -- that the gate is satisfiable from the START of the
+   * woken run -- did NOT hold, and the claim-marker branch in
+   * `triggeredMonitorForPrompt` is what repairs it. The run exists from
+   * `enqueueWakeup`, which precedes the triggered write by 158 lines, so a fast
+   * dispatch built its prompt against a row that still read `scheduled`.
+   * "Outstanding for the whole run" was true; "DERIVABLE for the whole run" was
+   * not, and this gate tests the second.
    */
   triggeredMonitor?: {
     lastTriggeredAt: string | null;
@@ -37488,9 +37556,13 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // here is the one the route guards will test — a wake that coalesced onto a queued
       // status-only one is therefore announced as what it will actually execute as.
       recoveryRunWriteClassNotice: recoveryRunWriteClassNotice(context),
-      // PEN-6271: supplied whenever the row DERIVES as `triggered` at the moment
-      // this run's prompt is built -- which is ANY run in that window, not only
-      // the one the monitor woke. That breadth is deliberate and must not be
+      // PEN-6271: supplied whenever the row DERIVES an outstanding monitor
+      // obligation at the moment this run's prompt is built -- `triggered`, or
+      // (PEN-6553) a fire already CLAIMED whose triggered patch has not committed
+      // yet, which is the state a fast dispatch reads. That second case is read
+      // off the ROW too, from the claim marker rather than from the wake, so the
+      // breadth argument below covers it unchanged. Either way this is ANY run in
+      // that window, not only the one the monitor woke. That breadth is deliberate and must not be
       // narrowed: the obligation is a property of the ROW, so a run that arrives
       // on a `triggered` row and ends without discharging it produces the same
       // `trigger_stalled` clear and the same recovery wake whatever woke it.

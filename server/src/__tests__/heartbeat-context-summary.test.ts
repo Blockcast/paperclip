@@ -3531,6 +3531,88 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
       })).toBeNull();
       expect(triggeredMonitorForPrompt(null)).toBeNull();
     });
+
+    // PEN-6553. The three cases below all carry a live `monitorNextCheckAt`, so
+    // they are indistinguishable to the derived status -- every one reads
+    // `scheduled`. `monitorWakeRequestedAt` is the claim marker that separates
+    // them, and it is why this gate is not keyed on the wake reason: it is read
+    // off the ROW.
+    const scheduledPolicy = (overrides: Record<string, unknown> = {}) => ({
+      mode: "normal",
+      commentRequired: true,
+      stages: [],
+      monitor: {
+        nextCheckAt: "2026-11-09T00:00:00.000Z",
+        notes: "waiting on the merge",
+        scheduledBy: "assignee",
+        serviceName: "github-pr-human-approval",
+        maxAttempts: 24,
+        ...overrides,
+      },
+    });
+
+    // THE defect this repairs. The fire has been CLAIMED but its triggered patch
+    // has not committed, which is the row a fast dispatch reads -- measured at
+    // 7.56-22 s after the claim, and 7 of 15 monitor wakes on one seat landed
+    // inside it. Before PEN-6553 this returned null and the run held the
+    // obligation for its whole life with the directive never emitted.
+    it("derives an obligation while the fire is claimed and the triggered patch has not landed", () => {
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        executionPolicy: scheduledPolicy(),
+        monitorNextCheckAt: new Date("2026-11-09T00:00:00.000Z"),
+        monitorWakeRequestedAt: new Date("2026-11-09T00:00:01.000Z"),
+        monitorAttemptCount: 3,
+        monitorLastTriggeredAt: new Date("2026-11-08T23:00:00.000Z"),
+        executionState: null,
+      })).toMatchObject({ serviceName: "github-pr-human-approval", maxAttempts: 24 });
+    });
+
+    // The two facts the triggered patch WRITES are not written yet, so the
+    // columns still hold the PREVIOUS fire's instant and the PRE-increment
+    // count. Rendering either would state a fact that is wrong rather than
+    // missing, so both are withheld and the renderer omits them.
+    it("withholds the two facts the triggered patch has not written yet", () => {
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        executionPolicy: scheduledPolicy(),
+        monitorNextCheckAt: new Date("2026-11-09T00:00:00.000Z"),
+        monitorWakeRequestedAt: new Date("2026-11-09T00:00:01.000Z"),
+        monitorAttemptCount: 3,
+        monitorLastTriggeredAt: new Date("2026-11-08T23:00:00.000Z"),
+        executionState: null,
+      })).toMatchObject({ lastTriggeredAt: null, attemptCount: null });
+    });
+
+    // The arm that must stay SILENT, and the reason a bare
+    // `wakeReason === "issue_monitor_due"` gate was refused: after the 15-minute
+    // dispatch-lapse watchdog re-arms, `tickExpiredIssueMonitors` selects on
+    // `isNull(monitorNextCheckAt)` and can no longer reach the row, so there is
+    // no obligation to announce. Every re-arm builder nulls the claim marker,
+    // which is exactly what makes this row distinguishable from the one above.
+    it("stays silent once a re-arm has released the claim", () => {
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        executionPolicy: scheduledPolicy({ nextCheckAt: "2026-11-09T00:15:00.000Z" }),
+        monitorNextCheckAt: new Date("2026-11-09T00:15:00.000Z"),
+        monitorWakeRequestedAt: null,
+        monitorAttemptCount: 4,
+        monitorLastTriggeredAt: new Date("2026-11-09T00:00:02.000Z"),
+        executionState: null,
+      })).toBeNull();
+    });
+
+    // A claim marker alone is not an obligation. Nothing writes this shape today
+    // -- the cleared patch nulls both columns together -- but the branch is
+    // keyed on `scheduled`, not on the marker, and this pins that.
+    it("stays silent when a claim marker survives on a row with no armed check", () => {
+      expect(triggeredMonitorForPrompt({
+        ...base,
+        monitorNextCheckAt: null,
+        monitorWakeRequestedAt: new Date("2026-11-09T00:00:01.000Z"),
+        executionState: executionStateWith(monitorState({ status: "cleared", clearReason: "manual", clearedAt: "2026-11-08T20:00:00.000Z" })),
+      })).toBeNull();
+    });
   });
 
   // A monitor can be triggered with none of its descriptive fields populated. The
