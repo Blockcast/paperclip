@@ -2865,12 +2865,14 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       startedAt: Date;
       checkoutRestoreStatus?: string | null;
       monitorNextCheckAt?: Date | null;
+      description?: string | null;
     }) {
       const issueId = randomUUID();
       await db.insert(issues).values({
         id: issueId,
         companyId: input.companyId,
         title: "Stranded checkout promotion",
+        description: input.description ?? null,
         status: "in_progress",
         priority: "high",
         assigneeAgentId: input.agentId,
@@ -3025,6 +3027,75 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       // happened while this row was `in_progress`. Restoring `blocked` now
       // would wait for an event that has been and gone.
       await seedBlocker({ companyId, blockedIssueId: issueId, blockerStatus: "done" });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect((await readRow(issueId))?.status).toBe("todo");
+    });
+
+    // PEN-6587: the declaration is the one thing that distinguishes a deliberate park
+    // from the strand the 141-of-141 drain above exists for. A checkout is taken at
+    // DISPATCH, so without this the hold is destroyed simply by the row being worked —
+    // and the restore writes no activity row, so nothing records that it happened.
+    const EXTERNAL_WAIT_DECLARATION =
+      "external owner: Anthropic support\nexternal action: enable Admin API key minting on workspace df8303ae";
+
+    it("keeps a blocked marker with no edge blocked when the description declares an external wait", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+        description: `Waiting on a human.\n\n${EXTERNAL_WAIT_DECLARATION}\n`,
+      });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      const row = await readRow(issueId);
+      // Zero blocker edges, exactly like the drained case above — the difference is that
+      // this row names the person who has to act, so its wake path is a human rather than
+      // an edge and `blocked` is not a dead end.
+      expect(row?.status).toBe("blocked");
+      // Still a completed restore in every other respect: the promotion is undone.
+      expect(row?.startedAt).toBeNull();
+      expect(row?.checkoutRestoreStatus).toBeNull();
+      expect(row?.assigneeAgentId).toBe(agentId);
+    });
+
+    it("keeps a declared external wait blocked even when its only blocker edge is cancelled", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+        description: EXTERNAL_WAIT_DECLARATION,
+      });
+      // A cancelled edge can never resolve, so the blocker arm correctly declines it.
+      // The declared human can still act, so the row is parked rather than stranded.
+      await seedBlocker({ companyId, blockedIssueId: issueId, blockerStatus: "cancelled" });
+
+      await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect((await readRow(issueId))?.status).toBe("blocked");
+    });
+
+    it("still drains a blocked marker whose description only half-declares a wait", async () => {
+      const { companyId, agentId, failedRunId } = await seed();
+      const issueId = await seedStrandedPromotion({
+        companyId,
+        agentId,
+        lockRunId: failedRunId,
+        startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+        checkoutRestoreStatus: "blocked",
+        // `externalWaitFromDescription` requires BOTH lines. One alone is prose, not a
+        // declaration, and must not buy a hold — this is the arm that keeps the fourth
+        // case narrow rather than widening BLO-33144's drain.
+        description: "external owner: Anthropic support\n(no action line)",
+      });
 
       await heartbeatService(db).sweepStaleIssueLocks();
 

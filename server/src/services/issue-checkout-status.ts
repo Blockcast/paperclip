@@ -1,7 +1,8 @@
-import { and, eq, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-orm";
 import { heartbeatRuns, issueRelations, issues, type Db, type DbTransaction } from "@paperclipai/db";
 import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "./issue-execution-lock.js";
 import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
+import { externalWaitFromDescription } from "./external-wait-declaration.js";
 
 type DbOrTransaction = Db | DbTransaction;
 
@@ -228,11 +229,85 @@ const hasCancelledBlocker = sql`exists (
  * and no cancelled one; otherwise the row lands in `todo`, which keeps it in
  * `inbox-lite` and re-dispatchable. Every other marker restores verbatim.
  */
-const checkoutRestoreTargetStatus = sql`case
-  when ${issues.checkoutRestoreStatus} <> 'blocked' then ${issues.checkoutRestoreStatus}
-  when ${hasPendingBlocker} and not ${hasCancelledBlocker} then 'blocked'
-  else 'todo'
-end`;
+/**
+ * PEN-6587 — a declared external wait is the fourth arm, and it is why the `blocked`
+ * marker is no longer the whole question.
+ *
+ * The 141-of-141 measurement above is sound and is not reopened: when it was taken, a
+ * zero-blocker `blocked` row really was indistinguishable from a strand, so draining it
+ * to `todo` was the only reading available. What has moved since is that such a row CAN
+ * now say why it is waiting. A `doc/execution-semantics.md` two-line declaration names a
+ * human and a concrete action (BLO-30445), and the stranded-blocked reconciler already
+ * honours it — it is the one `blocked` row whose wake path is a person rather than an
+ * edge, so "no edge" stops implying "no wake path" for exactly this population.
+ *
+ * Without this arm the two protections cancel out. The reconciler and the re-checker
+ * both leave a declared wait alone, and this drain then flips it to `todo` on the next
+ * checkout release — and a checkout is taken at DISPATCH, so the demotion is armed
+ * before the woken run can read anything and cannot be declined by being careful.
+ * Worse, it is invisible: the restore writes no activity row, so the audit instrument
+ * that enumerated the other two actors cannot see this one by construction.
+ *
+ * Deliberately placed AFTER the blocker arms, so nothing about edge handling changes.
+ * A declared row carrying a CANCELLED edge still lands here rather than on arm 2, which
+ * is correct: the edge can never resolve, but the declared human still can, so the wake
+ * path exists and the row is not a strand. An undeclared zero-blocker row is untouched
+ * and still lands in `todo`.
+ */
+function checkoutRestoreTargetStatus(declaredExternalWaitIds: readonly string[]) {
+  // No declaration in this batch is the overwhelmingly common case, and the arm is then
+  // omitted entirely rather than emitted as a tautologically-false `in ()` — the
+  // statement is then byte-for-byte the three-arm form that shipped before PEN-6587.
+  const declaredArm =
+    declaredExternalWaitIds.length > 0
+      ? sql`when ${inArray(issues.id, [...declaredExternalWaitIds])} then 'blocked' `
+      : sql``;
+  return sql`case
+    when ${issues.checkoutRestoreStatus} <> 'blocked' then ${issues.checkoutRestoreStatus}
+    when ${hasPendingBlocker} and not ${hasCancelledBlocker} then 'blocked'
+    ${declaredArm}else 'todo'
+  end`;
+}
+
+/**
+ * The ids in scope that carry an external-wait declaration, resolved in TS because the
+ * predicate is a regex over the description and the restore is a SQL `UPDATE`.
+ *
+ * Resolved by calling {@link externalWaitFromDescription} rather than by restating it as
+ * a Postgres `~*` match. A second definition is the failure this avoids: the predicate is
+ * already read at four sites and has been corrected once for whitespace handling alone
+ * (BLO-28618),
+ * so a SQL copy would be a fifth spelling nothing keeps in step — and the first divergence
+ * shows up as a hold silently dropped. This is the same shape the stranded-blocked
+ * reconciler uses for the same predicate: select the candidates, then decide in TS.
+ *
+ * Narrowed to rows whose marker is `blocked`, because no other marker can reach the arm.
+ * That is what keeps the extra statement cheap: on a batch with no `blocked` marker it
+ * returns zero rows and the `case` is unchanged.
+ *
+ * Reads the FULL `description` column, never a `substring(...)` preview — a declaration
+ * written past `ISSUE_LIST_DESCRIPTION_MAX_CHARS` parses as `null` from a preview, which
+ * here would silently drain the row it exists to protect (BLO-31839).
+ *
+ * The read and the write are separate statements, so a description edit can land between
+ * them. Both directions are benign and self-correcting: a declaration added in the window
+ * restores `todo`, which is exactly today's behaviour and what the reconciler then leaves
+ * alone; one removed in the window restores `blocked`, which the reconciler drains on its
+ * next pass. Neither can strand a row, which is why this is not worth a lock.
+ */
+async function selectDeclaredExternalWaitIds(
+  dbOrTx: DbOrTransaction,
+  scope: SQL | undefined,
+): Promise<string[]> {
+  const candidates = await dbOrTx
+    .select({ id: issues.id, description: issues.description })
+    .from(issues)
+    .where(and(scope, eq(issues.checkoutRestoreStatus, "blocked"), restorableCheckoutPromotion));
+
+  return candidates
+    .filter((row: { description: string | null }) => externalWaitFromDescription(row.description) !== null)
+    .map((row: { id: string }) => row.id);
+}
 
 /**
  * BLO-29913 — `started_at` is part of the promotion, so undoing the promotion
@@ -252,8 +327,8 @@ end`;
  * tier it is no longer being worked in, and mints a productivity review at 6h
  * for an episode that ended when the run died.
  */
-const restoreCheckoutPromotionSet = () => ({
-  status: checkoutRestoreTargetStatus,
+const restoreCheckoutPromotionSet = (declaredExternalWaitIds: readonly string[] = []) => ({
+  status: checkoutRestoreTargetStatus(declaredExternalWaitIds),
   checkoutRestoreStatus: null,
   startedAt: null,
   updatedAt: new Date(),
@@ -419,16 +494,16 @@ export async function restoreCheckoutPromotedStatus(
   dbOrTx: DbOrTransaction,
   target: { issueId: string; companyId: string },
 ): Promise<boolean> {
+  // One `scope` feeding both statements, so the rows the declaration pass considers and
+  // the rows the update touches cannot drift apart — the same reason the restore guard
+  // itself is shared rather than repeated.
+  const scope = and(eq(issues.id, target.issueId), eq(issues.companyId, target.companyId));
+  const declaredExternalWaitIds = await selectDeclaredExternalWaitIds(dbOrTx, scope);
+
   const restored = await dbOrTx
     .update(issues)
-    .set(restoreCheckoutPromotionSet())
-    .where(
-      and(
-        eq(issues.id, target.issueId),
-        eq(issues.companyId, target.companyId),
-        restorableCheckoutPromotion,
-      ),
-    )
+    .set(restoreCheckoutPromotionSet(declaredExternalWaitIds))
+    .where(and(scope, restorableCheckoutPromotion))
     .returning(restoreReturning);
 
   await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[]);
@@ -453,16 +528,16 @@ export async function restoreCheckoutPromotedStatuses(
 ): Promise<string[]> {
   if (target.issueIds.length === 0) return [];
 
+  const scope = and(
+    inArray(issues.id, [...target.issueIds]),
+    eq(issues.companyId, target.companyId),
+  );
+  const declaredExternalWaitIds = await selectDeclaredExternalWaitIds(dbOrTx, scope);
+
   const restored = await dbOrTx
     .update(issues)
-    .set(restoreCheckoutPromotionSet())
-    .where(
-      and(
-        inArray(issues.id, [...target.issueIds]),
-        eq(issues.companyId, target.companyId),
-        restorableCheckoutPromotion,
-      ),
-    )
+    .set(restoreCheckoutPromotionSet(declaredExternalWaitIds))
+    .where(and(scope, restorableCheckoutPromotion))
     .returning(restoreReturning);
 
   await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[]);
@@ -532,17 +607,17 @@ export async function restoreCheckoutPromotedStatuses(
 export async function restoreStrandedCheckoutPromotions(
   dbOrTx: DbOrTransaction,
 ): Promise<string[]> {
+  const scope = and(
+    isNull(issues.checkoutRunId),
+    isNull(issues.executionRunId),
+    sql`(${issues.assigneeAgentId} is not null or ${issues.assigneeUserId} is not null)`,
+  );
+  const declaredExternalWaitIds = await selectDeclaredExternalWaitIds(dbOrTx, scope);
+
   const restored = await dbOrTx
     .update(issues)
-    .set(restoreCheckoutPromotionSet())
-    .where(
-      and(
-        isNull(issues.checkoutRunId),
-        isNull(issues.executionRunId),
-        sql`(${issues.assigneeAgentId} is not null or ${issues.assigneeUserId} is not null)`,
-        restorableCheckoutPromotion,
-      ),
-    )
+    .set(restoreCheckoutPromotionSet(declaredExternalWaitIds))
+    .where(and(scope, restorableCheckoutPromotion))
     .returning(restoreReturning);
 
   await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[]);
