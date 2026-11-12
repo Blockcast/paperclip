@@ -1836,8 +1836,292 @@ export function scopeSummary(prs, deferred, now = Date.now()) {
  * test over its output at all — which is how `liveCount` came to be computed and
  * then printed exclusively on the branch that never runs.
  */
+// ---------------------------------------------------------------------------
+// Unattested-head strand detector (PEN-5793 done-when #4).
+//
+// Everything above audits the SHAPE of the reviews a head already has, so a
+// head carrying ZERO reviews satisfies every invariant vacuously. That is the
+// exact gap PR #3452 fell through: pushed 2026-11-06T10:49:39Z, unreviewed
+// across three separate triggers, serviced unaided 3h23m53s later, with this
+// guard green throughout. The detector below asks the complementary question —
+// is this head attested AT ALL, and for how long has it not been?
+//
+// Deliberately NOT a violation: a strand is a latency condition that resolves
+// itself, so it carries no stable fingerprint (there are no review IDs to key
+// on) and must never enter the baseline ratchet above. It is reported, and by
+// default it does not fail the run. See STRAND_FAIL_ENV for why, and for the
+// condition under which that default should flip.
+// ---------------------------------------------------------------------------
+
+/** Minutes a non-draft head may sit unattested before it is reported. */
+export const DEFAULT_STRAND_THRESHOLD_MINUTES = 30;
+
+/**
+ * 30 minutes is measured, not chosen for roundness. Against the healthy band
+ * (n=29, 2026-11-07, every non-draft head of the 30 most recent PRs) push to
+ * verdict ran median 2m56s, p95 15m18s, max 15m36s, with ZERO over 20m; on the
+ * tight clock below a second window returned 0 of 39 over 30m. #3452's
+ * 3h23m53s is 13.1x that observed maximum.
+ *
+ * ⛔ Do NOT raise this to silence fires. The band above describes a healthy
+ * reviewer; the queue-drain tail is real and is SUPPOSED to fire — #3507 sat
+ * 43m30s unattested inside a measured 111-minute reviewer-wide silence on
+ * 2026-11-07, and that is a genuine small instance of the same failure, not a
+ * false positive. A tuner who raises N until the output is quiet arrives at the
+ * N that cannot see #3452 either.
+ */
+export function parseStrandThresholdMinutes(raw, fallback = DEFAULT_STRAND_THRESHOLD_MINUTES) {
+  if (raw === undefined || raw === null || String(raw).trim() === "") return fallback;
+  const parsed = Number(String(raw).trim());
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(
+      `ALLY_STRAND_THRESHOLD_MINUTES must be a positive number of minutes, got ${JSON.stringify(raw)}.`,
+    );
+  }
+  return parsed;
+}
+
+export const STRAND_THRESHOLD_MS =
+  parseStrandThresholdMinutes(process.env.ALLY_STRAND_THRESHOLD_MINUTES) * 60_000;
+
+/** Set to "1" to make an unattested head fail the run rather than report. */
+export const STRAND_FAIL_ENV = "ALLY_STRAND_FAIL";
+
+/**
+ * The push instant, from the check-suite GitHub stamps on the push event.
+ *
+ * ⛔ NEVER the commit's committer date, which is client-set and therefore not
+ * merely loose but unsigned. Measured first-party 2026-11-09 over six heads,
+ * committer date vs earliest check-suite `created_at`: #3530 overstated by
+ * 25m13s, #3558 by 16m22s, #3542 by 8m35s, the rest by seconds. Control: on
+ * #3452, whose true push instant this guard's own incident record establishes
+ * independently (10:49:39Z), the suite stamp lands 12s later — so the
+ * instrument carries no systematic offset and the 25m13s is signal.
+ *
+ * That matters here specifically because a committer-date clock over-fires by
+ * up to ~25 minutes, and those over-fires land in the 20-40 minute band, which
+ * is indistinguishable on its face from a genuine small strand. A tuner then
+ * correctly calls them false positives and raises the threshold — reaching the
+ * end state the ⛔ on parseStrandThresholdMinutes exists to prevent, via a tail
+ * the clock invented.
+ *
+ * ⚠️ Two residuals, both in the MUTE direction. (i) The suite stamp is a
+ * tighter LOWER bound, not an upper one: a SHA pushed to another branch first
+ * carries suites created then, so on a reused SHA this under-reports age by the
+ * reuse gap. (ii) Earliest check-RUN `started_at` is an acceptable fallback but
+ * is runner-dependent and so fails mute under CI starvation; the suite is
+ * stamped on the push event and is independent of runner availability. Measured
+ * the two agree within 6-71s across those six heads.
+ */
+export function earliestCheckSuiteCreatedAt(stdout) {
+  const stamps = String(stdout ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => Date.parse(line))
+    .filter((ms) => Number.isFinite(ms));
+  if (stamps.length === 0) return null;
+  return Math.min(...stamps);
+}
+
+/**
+ * Reads the push stamp for one head, converting every failure into an
+ * `unclocked` classification rather than letting it reach the caller as a pass.
+ *
+ * Gate polarity (PEN-5445): the no-alarm state must require a PRESENT stamp. A
+ * 403, a rate limit, a bad id and a pagination bug all land on *report* here,
+ * never on *quiet* — this detector exists to catch silence, so a reader that
+ * fails silent reproduces the defect it was built for. `commits/:ref/check-suites`
+ * sits on a rate-limit shard this installation measurably exhausted on
+ * 2026-11-09 (23 consecutive 403s over 62s), so the failure path is live, not
+ * theoretical.
+ */
+export function fetchHeadClock(repo, pr, ghFn = gh) {
+  try {
+    const stdout = ghFn([
+      "api",
+      `repos/${repo}/commits/${pr.headSha}/check-suites`,
+      "--paginate",
+      "--jq",
+      ".check_suites[].created_at",
+    ]);
+    const pushedAtMs = earliestCheckSuiteCreatedAt(stdout);
+    if (pushedAtMs === null) {
+      return { pushedAtMs: null, reason: "no check suite carries a usable created_at" };
+    }
+    return { pushedAtMs };
+  } catch (error) {
+    const first = String(error?.message ?? error).split("\n")[0];
+    return { pushedAtMs: null, reason: `check-suite read failed: ${first.slice(0, 200)}` };
+  }
+}
+
+/**
+ * "Attested" = an Ally APP review whose BODY carries a `Reviewed head: <40-hex>`
+ * marker equal to the head.
+ *
+ * ⛔ Never the review's `commit_id`. GitHub re-anchors an APPROVED review's
+ * `commit_id` FORWARD onto the current head on a push, so it is satisfied by a
+ * review of a tree that never existed and therefore cannot witness that the
+ * head was read. The two agree 40 of 40 on non-draft open heads here and the
+ * divergence has no live instance in this repo (1 APPROVED across 100 PRs /
+ * 189 reviews) — latent, not live, and specified this way because it costs
+ * nothing at build time and the re-anchoring is silent when it does arrive.
+ *
+ * A PENDING review is not yet submitted, so its body is not a verdict and it
+ * does not attest anything. Excluding it is fail-closed toward alarming, which
+ * is the right direction: a head whose only review is pending has not been
+ * reviewed. A DISMISSED review is NOT excluded — dismissal retracts the verdict
+ * but not the fact that the reviewer read this head, and this detector asks
+ * only whether the head was looked at.
+ */
+export function isAttestedAtHead(pr) {
+  const head = String(pr?.headSha ?? "").toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(head)) return false;
+  return (pr?.reviews ?? []).some(
+    (review) =>
+      isAllyAppReviewer(review?.user) &&
+      reviewState(review) !== "PENDING" &&
+      attestedHead(review?.body) === head,
+  );
+}
+
+/**
+ * K — how many OTHER heads the reviewer attested inside this strand's window.
+ *
+ * ⛔ This is a CLASSIFIER on the alarm body, never a term in the firing
+ * predicate. An earlier draft of done-when #4 had "while the reviewer is
+ * servicing other PRs" as a conjunct; as an `a && b` a reviewer that stops
+ * dispatching entirely makes `b` false on every PR and the detector emits ZERO
+ * alarms at maximum blast radius. Measured instance: through the whole
+ * 111-minute reviewer silence of 2026-11-07, `b` was false while #3507 sat
+ * 43m30s unattested, so a detector built to that text would have stayed silent
+ * for the entire event. Reporting K instead keeps the discrimination and drops
+ * the suppressor.
+ *
+ *   K >= 1 ⇒ single-PR strand (the #3452 shape: reviewer alive, this PR skipped)
+ *   K == 0 ⇒ reviewer-wide stall
+ *
+ * ⚠️ K is a FLOOR: only open PRs' reviews are in hand, so an attestation on a
+ * PR that has since closed is invisible here. Under-counting pushes K toward 0,
+ * i.e. toward reporting "reviewer-wide stall" — it can misclassify a strand,
+ * never suppress one.
+ */
+export function attestedHeadsDuring(prs, excludeNumber, startMs, endMs) {
+  const heads = new Set();
+  for (const pr of prs ?? []) {
+    if (pr?.number === excludeNumber) continue;
+    for (const review of pr?.reviews ?? []) {
+      if (!isAllyAppReviewer(review?.user)) continue;
+      const head = attestedHead(review?.body);
+      if (!head) continue;
+      const at = Date.parse(review?.submitted_at ?? "");
+      if (!Number.isFinite(at) || at < startMs || at > endMs) continue;
+      heads.add(head);
+    }
+  }
+  return heads.size;
+}
+
+/**
+ * Partitions non-draft open PRs into strands and unclocked heads.
+ *
+ * Drafts are the ONLY exclusion. In particular a PR carrying no
+ * `paperclip:review-request` comment is NOT excluded: push alone triggers a
+ * review, and measured over the 18 most recent non-draft open PRs, 18/18 were
+ * attested at head while 8/18 carried zero request comments anywhere. At head
+ * granularity that exclusion would have muted #3452 — the founding incident —
+ * for its first 71 minutes, at 2.4x the threshold.
+ *
+ * Only UNATTESTED heads are clocked. An attested head cannot be a strand at any
+ * age, so its push stamp is never needed; this is what keeps the hourly cost at
+ * the number of unattested heads (normally 0-3) rather than one read per open
+ * head per hour against a shard that drains to zero under fleet load. The
+ * no-alarm path still requires a present POSITIVE value — the attestation
+ * itself — so skipping the clock there does not weaken the gate polarity above.
+ */
+export function findStrands({ prs, clockFor, now = Date.now(), thresholdMs = STRAND_THRESHOLD_MS }) {
+  const strands = [];
+  const unclocked = [];
+
+  for (const pr of prs ?? []) {
+    if (pr?.isDraft) continue;
+    if (isAttestedAtHead(pr)) continue;
+
+    const clock = clockFor(pr);
+    if (!Number.isFinite(clock?.pushedAtMs)) {
+      unclocked.push({
+        number: pr?.number,
+        headSha: pr?.headSha,
+        reason: clock?.reason ?? "push stamp unreadable",
+      });
+      continue;
+    }
+
+    const ageMs = now - clock.pushedAtMs;
+    if (ageMs <= thresholdMs) continue;
+
+    strands.push({
+      number: pr?.number,
+      headSha: pr?.headSha,
+      pushedAtMs: clock.pushedAtMs,
+      ageMs,
+      otherHeadsAttested: attestedHeadsDuring(prs, pr?.number, clock.pushedAtMs, now),
+    });
+  }
+
+  return { strands, unclocked };
+}
+
+export function formatDuration(ms) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return h > 0 ? `${h}h${String(m).padStart(2, "0")}m` : m > 0 ? `${m}m${String(s).padStart(2, "0")}s` : `${s}s`;
+}
+
+export function formatStrand(strand, thresholdMs = STRAND_THRESHOLD_MS) {
+  const shape =
+    strand.otherHeadsAttested >= 1
+      ? `single-PR strand (reviewer attested ${strand.otherHeadsAttested} other head(s) in this window)`
+      : "reviewer-wide stall (no other head attested in this window)";
+  return (
+    `#${strand.number} head ${strand.headSha} has been unattested for ` +
+    `${formatDuration(strand.ageMs)} (threshold ${formatDuration(thresholdMs)}), ` +
+    `pushed ${new Date(strand.pushedAtMs).toISOString()}. K=${strand.otherHeadsAttested} ⇒ ${shape}.`
+  );
+}
+
+/**
+ * One aggregated line for every unclocked head, never one per head.
+ *
+ * During a rate-limit exhaustion window EVERY head reads unclocked at once, so
+ * a per-head report emits N findings and no information — which is the
+ * saturated-signal failure this row's done-when #3 is about, reintroduced by
+ * the very clause that demands unclocked heads be reported. Kept a distinct
+ * class from the strand alarm so neither can mask or ratchet the other.
+ */
+export function formatUnclocked(unclocked) {
+  const reasons = new Map();
+  for (const entry of unclocked) {
+    reasons.set(entry.reason, (reasons.get(entry.reason) ?? 0) + 1);
+  }
+  const breakdown = [...reasons.entries()]
+    .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
+    .map(([reason, count]) => `${count}x ${reason}`)
+    .join("; ");
+  const prs = unclocked.map((entry) => `#${entry.number}`).join(", ");
+  return (
+    `${unclocked.length} unattested head(s) unclocked: push stamp unreadable, so their age ` +
+    `could not be decided either way (${breakdown}). PRs: ${prs}.`
+  );
+}
+
 export function main({
   fetchPrs = fetchOpenPrs,
+  fetchClock = fetchHeadClock,
+  strandFail = process.env[STRAND_FAIL_ENV] === "1",
   baseline = loadBaseline,
   log = console.log,
   err = console.error,
@@ -1861,6 +2145,28 @@ export function main({
       log(`::notice title=Superseded Ally review at one head::${notice}`);
     }
   }
+
+  // Unattested-head strands (PEN-5793 done-when #4). Reported alongside the
+  // shape audit because they share the one expensive fetch, but kept out of the
+  // baseline ratchet: a strand has no review IDs to key a fingerprint on, and it
+  // resolves itself the moment the reviewer catches up.
+  const { strands, unclocked } = findStrands({
+    prs,
+    clockFor: (pr) => fetchClock(repo, pr),
+    now,
+  });
+
+  log(
+    `Unattested-head strand detector (threshold ${formatDuration(STRAND_THRESHOLD_MS)}): ` +
+      `${strands.length} strand(s), ${unclocked.length} unclocked head(s).`,
+  );
+  for (const strand of strands) {
+    log(`::warning title=Unattested PR head::${formatStrand(strand)}`);
+  }
+  if (unclocked.length > 0) {
+    log(`::warning title=Ally strand clock unreadable::${formatUnclocked(unclocked)}`);
+  }
+  log("");
 
   for (const entry of staleEntries) {
     log(
@@ -1908,6 +2214,16 @@ export function main({
         `${BASELINE_PATH} with the PR number, the owning issue, and a note. A baseline entry is ` +
         `pinned to the head SHA and review IDs above, so it expires the moment the PR is touched.`,
     );
+    exit(1);
+    return;
+  }
+
+  if (strandFail && strands.length > 0) {
+    err(
+      `Ally review-consistency guard FAILED for ${repo}: ${strands.length} non-draft open ` +
+        `head(s) unattested past ${formatDuration(STRAND_THRESHOLD_MS)}.\n`,
+    );
+    for (const strand of strands) err(`  ${formatStrand(strand)}`);
     exit(1);
     return;
   }

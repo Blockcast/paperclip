@@ -52,6 +52,14 @@ import {
   supersedingAttestation,
   violationFingerprint,
   gh,
+  attestedHeadsDuring,
+  earliestCheckSuiteCreatedAt,
+  fetchHeadClock,
+  findStrands,
+  formatStrand,
+  formatUnclocked,
+  isAttestedAtHead,
+  parseStrandThresholdMinutes,
 } from "./check-ally-review-consistency.mjs";
 
 const HEAD = "ff1c72dbfd18014c838cf1373b1640dd17378f3e";
@@ -3171,5 +3179,384 @@ describe("gh (BLO-48423)", () => {
     };
     assert.throws(() => gh(["pr", "list"], exec, { delayMs: 0 }), /502/);
     assert.equal(calls, 3);
+  });
+});
+
+describe("unattested-head strand detector (PEN-5793 done-when #4)", () => {
+  // #3452's real numbers: pushed 10:49:39Z, check-suite stamped 10:49:51Z,
+  // serviced unaided 14:13:32Z — 3h23m53s later, with this guard green all the
+  // way through because the head carried no reviews to audit the shape of.
+  const PUSHED = Date.parse("2026-11-06T10:49:51Z");
+  const NOW = Date.parse("2026-11-06T14:13:32Z");
+  const minutes = (n) => n * 60_000;
+
+  const clockAt = (ms) => () => ({ pushedAtMs: ms });
+  const unclockable = (reason = "check-suite read failed: HTTP 403") => () => ({
+    pushedAtMs: null,
+    reason,
+  });
+
+  function openPr(overrides = {}) {
+    return {
+      number: 3452,
+      headSha: HEAD,
+      isDraft: false,
+      updatedAt: new Date(NOW - minutes(10)).toISOString(),
+      mergeStateStatus: "CLEAN",
+      author: { login: "someone" },
+      reviews: [],
+      ...overrides,
+    };
+  }
+
+  describe("parseStrandThresholdMinutes", () => {
+    it("defaults to the measured 30 minutes", () => {
+      assert.equal(parseStrandThresholdMinutes(undefined), 30);
+      assert.equal(parseStrandThresholdMinutes(""), 30);
+      assert.equal(parseStrandThresholdMinutes(null), 30);
+    });
+
+    it("honours an explicit override", () => {
+      assert.equal(parseStrandThresholdMinutes("45"), 45);
+    });
+
+    it("refuses a value that would make the detector never fire", () => {
+      for (const bad of ["0", "-5", "soon", "NaN"]) {
+        assert.throws(() => parseStrandThresholdMinutes(bad), /positive number of minutes/);
+      }
+    });
+  });
+
+  describe("earliestCheckSuiteCreatedAt", () => {
+    it("takes the earliest stamp, not the first line", () => {
+      const out = ["2026-11-06T11:20:00Z", "2026-11-06T10:49:51Z", "2026-11-06T12:00:00Z"].join("\n");
+      assert.equal(earliestCheckSuiteCreatedAt(out), Date.parse("2026-11-06T10:49:51Z"));
+    });
+
+    it("tolerates blank lines and trailing newlines", () => {
+      assert.equal(
+        earliestCheckSuiteCreatedAt("\n2026-11-06T10:49:51Z\n\n"),
+        Date.parse("2026-11-06T10:49:51Z"),
+      );
+    });
+
+    // Gate polarity: an empty or unparseable read must NOT become "age 0", which
+    // would silently place the head under every threshold and report a pass.
+    it("returns null rather than a usable instant when nothing parses", () => {
+      assert.equal(earliestCheckSuiteCreatedAt(""), null);
+      assert.equal(earliestCheckSuiteCreatedAt("not-a-date\nalso-not"), null);
+      assert.equal(earliestCheckSuiteCreatedAt(undefined), null);
+    });
+  });
+
+  describe("isAttestedAtHead", () => {
+    it("credits an App review whose BODY attests this head", () => {
+      assert.equal(isAttestedAtHead(openPr({ reviews: [appReview({ body: canonicalBody(HEAD) })] })), true);
+    });
+
+    // The trap the done-when calls out by name. GitHub re-anchors an APPROVED
+    // review's commit_id forward onto the current head on a push, so commit_id
+    // is satisfied by a review of a tree that never existed.
+    it("does NOT credit a review whose commit_id matches but whose body attests another head", () => {
+      const pr = openPr({
+        reviews: [appReview({ state: "APPROVED", commit_id: HEAD, body: canonicalBody(OTHER) })],
+      });
+      assert.equal(pr.reviews[0].commit_id, pr.headSha);
+      assert.equal(isAttestedAtHead(pr), false);
+    });
+
+    it("does not credit a review carrying no attestation marker at all", () => {
+      assert.equal(isAttestedAtHead(openPr({ reviews: [appReview({ body: "lgtm" })] })), false);
+    });
+
+    it("does not credit the seat lane", () => {
+      assert.equal(isAttestedAtHead(openPr({ reviews: [seatReview({ body: canonicalBody(HEAD) })] })), false);
+    });
+
+    it("does not credit an impostor matching the login but not the immutable id", () => {
+      const impostor = appReview({ user: { login: "allyblockcast[bot]", id: 1, type: "Bot" } });
+      assert.equal(isAttestedAtHead(openPr({ reviews: [impostor] })), false);
+    });
+
+    // Fail-closed toward alarming: a head whose only review is unsubmitted has
+    // not been reviewed.
+    it("does not credit a PENDING review", () => {
+      assert.equal(
+        isAttestedAtHead(openPr({ reviews: [appReview({ state: "PENDING", body: canonicalBody(HEAD) })] })),
+        false,
+      );
+    });
+
+    // Dismissal retracts the verdict, not the fact that the head was read.
+    it("credits a DISMISSED review, which still read this head", () => {
+      assert.equal(
+        isAttestedAtHead(openPr({ reviews: [appReview({ state: "DISMISSED", body: canonicalBody(HEAD) })] })),
+        true,
+      );
+    });
+  });
+
+  describe("attestedHeadsDuring — the K classifier", () => {
+    const other = (number, head, at) => ({
+      number,
+      headSha: head,
+      isDraft: false,
+      reviews: [appReview({ body: canonicalBody(head), submitted_at: at })],
+    });
+
+    it("counts other heads attested inside the window", () => {
+      const prs = [
+        openPr(),
+        other(3454, OTHER, new Date(PUSHED + minutes(30)).toISOString()),
+      ];
+      assert.equal(attestedHeadsDuring(prs, 3452, PUSHED, NOW), 1);
+    });
+
+    it("excludes the stranded PR itself", () => {
+      const self = openPr({
+        reviews: [appReview({ body: canonicalBody(HEAD), submitted_at: new Date(PUSHED + minutes(5)).toISOString() })],
+      });
+      assert.equal(attestedHeadsDuring([self], 3452, PUSHED, NOW), 0);
+    });
+
+    it("excludes attestations outside the window on either side", () => {
+      const prs = [
+        other(1, OTHER, new Date(PUSHED - minutes(1)).toISOString()),
+        other(2, OTHER, new Date(NOW + minutes(1)).toISOString()),
+      ];
+      assert.equal(attestedHeadsDuring(prs, 3452, PUSHED, NOW), 0);
+    });
+
+    it("counts distinct heads, not reviews", () => {
+      const twice = {
+        number: 3454,
+        headSha: OTHER,
+        isDraft: false,
+        reviews: [
+          appReview({ id: 1, body: canonicalBody(OTHER), submitted_at: new Date(PUSHED + minutes(5)).toISOString() }),
+          appReview({ id: 2, body: canonicalBody(OTHER), submitted_at: new Date(PUSHED + minutes(6)).toISOString() }),
+        ],
+      };
+      assert.equal(attestedHeadsDuring([twice], 3452, PUSHED, NOW), 1);
+    });
+
+    it("ignores a review with no placeable submitted_at", () => {
+      const undated = { number: 3454, headSha: OTHER, isDraft: false, reviews: [appReview({ body: canonicalBody(OTHER) })] };
+      assert.equal(attestedHeadsDuring([undated], 3452, PUSHED, NOW), 0);
+    });
+  });
+
+  describe("findStrands", () => {
+    it("reports a non-draft head unattested past the threshold", () => {
+      const { strands, unclocked } = findStrands({
+        prs: [openPr()],
+        clockFor: clockAt(PUSHED),
+        now: NOW,
+      });
+      assert.equal(unclocked.length, 0);
+      assert.equal(strands.length, 1);
+      assert.equal(strands[0].number, 3452);
+      assert.equal(strands[0].ageMs, NOW - PUSHED);
+    });
+
+    it("stays silent on a head younger than the threshold", () => {
+      const { strands } = findStrands({
+        prs: [openPr()],
+        clockFor: clockAt(NOW - minutes(29)),
+        now: NOW,
+      });
+      assert.deepEqual(strands, []);
+    });
+
+    // Drafts are the ONLY exclusion. In particular a PR carrying no
+    // review-request comment is not excluded: at head granularity that would
+    // have muted #3452 for its first 71 minutes.
+    it("excludes drafts and nothing else", () => {
+      const { strands } = findStrands({
+        prs: [openPr({ isDraft: true })],
+        clockFor: clockAt(PUSHED),
+        now: NOW,
+      });
+      assert.deepEqual(strands, []);
+    });
+
+    it("does not clock an attested head at all", () => {
+      let clockCalls = 0;
+      const { strands } = findStrands({
+        prs: [openPr({ reviews: [appReview({ body: canonicalBody(HEAD) })] })],
+        clockFor: () => {
+          clockCalls += 1;
+          return { pushedAtMs: PUSHED };
+        },
+        now: NOW,
+      });
+      assert.deepEqual(strands, []);
+      assert.equal(clockCalls, 0, "an attested head cannot be a strand, so it needs no clock read");
+    });
+
+    // The gate-polarity requirement: an unreadable clock must land on *report*,
+    // never on *quiet*. A detector built to catch silence that fails silent
+    // reproduces the defect it exists for.
+    it("classifies an unclockable head as unclocked rather than passing it", () => {
+      const { strands, unclocked } = findStrands({
+        prs: [openPr()],
+        clockFor: unclockable(),
+        now: NOW,
+      });
+      assert.deepEqual(strands, []);
+      assert.equal(unclocked.length, 1);
+      assert.equal(unclocked[0].number, 3452);
+      assert.match(unclocked[0].reason, /403/);
+    });
+
+    it("reports K=0 as a reviewer-wide stall and K>=1 as a single-PR strand", () => {
+      const busy = {
+        number: 3454,
+        headSha: OTHER,
+        isDraft: false,
+        reviews: [appReview({ body: canonicalBody(OTHER), submitted_at: new Date(PUSHED + minutes(30)).toISOString() })],
+      };
+
+      const alone = findStrands({ prs: [openPr()], clockFor: clockAt(PUSHED), now: NOW });
+      assert.equal(alone.strands[0].otherHeadsAttested, 0);
+      assert.match(formatStrand(alone.strands[0]), /reviewer-wide stall/);
+
+      const skipped = findStrands({ prs: [openPr(), busy], clockFor: clockAt(PUSHED), now: NOW });
+      const strand = skipped.strands.find((s) => s.number === 3452);
+      assert.equal(strand.otherHeadsAttested, 1);
+      assert.match(formatStrand(strand), /single-PR strand/);
+    });
+  });
+
+  describe("fetchHeadClock", () => {
+    it("reads the earliest check-suite stamp", () => {
+      const clock = fetchHeadClock("o/r", { headSha: HEAD }, () => "2026-11-06T10:49:51Z\n");
+      assert.equal(clock.pushedAtMs, PUSHED);
+    });
+
+    it("asks GitHub for the check suites of this exact head", () => {
+      const seen = [];
+      fetchHeadClock("o/r", { headSha: HEAD }, (args) => {
+        seen.push(args);
+        return "2026-11-06T10:49:51Z";
+      });
+      assert.deepEqual(seen[0].slice(0, 2), ["api", `repos/o/r/commits/${HEAD}/check-suites`]);
+      assert.ok(seen[0].includes("--paginate"), "must page: a head can carry more suites than one page");
+    });
+
+    // A rate-limited 403 is the live failure here: this endpoint sits on a shard
+    // this installation measurably exhausted on 2026-11-09.
+    it("converts a throwing read into unclocked, never into a pass", () => {
+      const clock = fetchHeadClock("o/r", { headSha: HEAD }, () => {
+        throw new Error("HTTP 403: API rate limit exceeded\nsecond line");
+      });
+      assert.equal(clock.pushedAtMs, null);
+      assert.match(clock.reason, /check-suite read failed/);
+      assert.ok(!clock.reason.includes("second line"), "reason is one line, for an aggregated report");
+    });
+
+    it("treats a head with no usable suite stamp as unclocked", () => {
+      const clock = fetchHeadClock("o/r", { headSha: HEAD }, () => "");
+      assert.equal(clock.pushedAtMs, null);
+      assert.match(clock.reason, /no check suite/);
+    });
+  });
+
+  describe("formatUnclocked", () => {
+    // One line for all of them. During a rate-limit window every head reads
+    // unclocked at once, and a per-head report emits N findings and no
+    // information — the saturated-signal failure done-when #3 is about.
+    it("aggregates every unclocked head into a single line with a reason breakdown", () => {
+      const line = formatUnclocked([
+        { number: 1, headSha: HEAD, reason: "check-suite read failed: HTTP 403" },
+        { number: 2, headSha: OTHER, reason: "check-suite read failed: HTTP 403" },
+        { number: 3, headSha: OTHER, reason: "no check suite carries a usable created_at" },
+      ]);
+      assert.equal(line.split("\n").length, 1);
+      assert.match(line, /^3 unattested head\(s\) unclocked/);
+      assert.match(line, /2x check-suite read failed: HTTP 403/);
+      assert.match(line, /1x no check suite carries a usable created_at/);
+      assert.match(line, /#1, #2, #3/);
+    });
+  });
+
+  describe("main — the #3452 regression", () => {
+    const cleanLive = {
+      number: 9001,
+      headSha: HEAD,
+      updatedAt: new Date(NOW - 86_400_000).toISOString(),
+      mergeStateStatus: "CLEAN",
+      isDraft: false,
+      author: { login: "someone" },
+      reviews: [appReview({ id: 9001, state: "APPROVED" })],
+    };
+
+    // An unreviewed head: zero reviews, so the shape audit has nothing to
+    // audit. This is exactly #3452 at 13:35Z on 2026-11-06.
+    const unreviewed = {
+      number: 3452,
+      headSha: OTHER,
+      updatedAt: new Date(NOW - minutes(60)).toISOString(),
+      mergeStateStatus: "CLEAN",
+      isDraft: false,
+      author: { login: "someone" },
+      reviews: [],
+    };
+
+    function run(prs, opts = {}) {
+      const out = [];
+      const errs = [];
+      const exits = [];
+      main({
+        fetchPrs: () => prs,
+        fetchClock: () => ({ pushedAtMs: PUSHED }),
+        baseline: () => [],
+        log: (m) => out.push(String(m)),
+        err: (m) => errs.push(String(m)),
+        exit: (c) => exits.push(c),
+        now: NOW,
+        repo: "o/r",
+        ...opts,
+      });
+      return { out: out.join("\n"), errs: errs.join("\n"), exits };
+    }
+
+    it("the shape audit alone passes an unreviewed head — the gap this closes", () => {
+      assert.deepEqual(findPrViolations(unreviewed), []);
+    });
+
+    it("reports the unreviewed head as a strand", () => {
+      const { out } = run([cleanLive, unreviewed]);
+      assert.match(out, /::warning title=Unattested PR head::#3452/);
+      assert.match(out, /unattested for 3h23m/);
+    });
+
+    // A strand is a latency condition that resolves itself and carries no
+    // fingerprint. Failing on it would turn an hourly auditor into a constant
+    // while the dispatch backlog it observes is saturated.
+    it("does not fail the run by default", () => {
+      const { exits } = run([cleanLive, unreviewed]);
+      assert.deepEqual(exits, []);
+    });
+
+    it("fails the run when the strand switch is set", () => {
+      const { errs, exits } = run([cleanLive, unreviewed], { strandFail: true });
+      assert.deepEqual(exits, [1]);
+      assert.match(errs, /unattested past 30m/);
+    });
+
+    it("prints the detector summary even when nothing is stranded", () => {
+      const { out, exits } = run([cleanLive]);
+      assert.match(out, /Unattested-head strand detector \(threshold 30m00s\): 0 strand\(s\), 0 unclocked head\(s\)\./);
+      assert.deepEqual(exits, []);
+    });
+
+    it("reports unclocked heads without failing and without claiming they are fine", () => {
+      const { out } = run([cleanLive, unreviewed], {
+        fetchClock: () => ({ pushedAtMs: null, reason: "check-suite read failed: HTTP 403" }),
+      });
+      assert.match(out, /::warning title=Ally strand clock unreadable::1 unattested head\(s\) unclocked/);
+      assert.doesNotMatch(out, /::warning title=Unattested PR head/);
+    });
   });
 });
