@@ -361,7 +361,7 @@ describe("PEN-2918 (D) — acceptance, against real Postgres", () => {
     // (the two arms differ by the one-time not-firing notice, so `013` must not
     // call them identical).
     expect(comment).toContain("PLUS held_alert_clear");
-    expect(comment).toContain("not_read rather than not_firing");
+    expect(comment).toContain("not_firing, where attended_park posts nothing and records not_read");
   });
 });
 
