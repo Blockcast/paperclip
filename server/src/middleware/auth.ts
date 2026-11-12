@@ -1,5 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { Request, RequestHandler } from "express";
+import type { NextFunction, Request, RequestHandler } from "express";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -13,7 +13,7 @@ import {
   instanceUserRoles,
 } from "@paperclipai/db";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
-import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
+import { isUuidLike, normalizeAgentApiKeyScope, type AgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { logger } from "./logger.js";
 import { urlForLog } from "./http-log-policy.js";
@@ -473,12 +473,14 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         agentId: claims.sub,
         companyId: claims.company_id,
       });
+      const jwtKeyScope = normalizeAgentApiKeyScope(claims.key_scope);
+      if (refuseReadOnlyWrite(req, jwtKeyScope, next)) return;
       req.actor = {
         type: "agent",
         agentId: claims.sub,
         companyId: claims.company_id,
         keyId: undefined,
-        keyScope: normalizeAgentApiKeyScope(claims.key_scope),
+        keyScope: jwtKeyScope,
         runId: runAttribution?.id,
         onBehalfOfUserId,
         onBehalfOfMemberships,
@@ -528,12 +530,14 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    const keyScope = normalizeAgentApiKeyScope(key.scopeConfig);
+    if (refuseReadOnlyWrite(req, keyScope, next)) return;
     req.actor = {
       type: "agent",
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
-      keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
+      keyScope,
       onBehalfOfUserId: responsibleUserId,
       onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
         companyId: key.companyId,
@@ -545,6 +549,16 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     next();
   };
+}
+
+const READ_ONLY_SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+
+// BLO-56152: a `read_only` agent key may never mutate, regardless of the
+// agent's grants. Refused here, before any route runs, so no route can forget it.
+function refuseReadOnlyWrite(req: Request, scope: AgentApiKeyScope, next: NextFunction): boolean {
+  if (scope.kind !== "read_only" || READ_ONLY_SAFE_METHODS.has(req.method.toUpperCase())) return false;
+  next(forbidden("read_only agent keys cannot use non-safe HTTP methods", { code: "READ_ONLY_KEY_SCOPE" }));
+  return true;
 }
 
 export async function resolveCloudTenantActor(db: Db, req: Request): Promise<Express.Request["actor"] | null> {
