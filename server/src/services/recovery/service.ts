@@ -3697,9 +3697,9 @@ export function recoveryService(
    * answered: the next move is the requester resubmitting, which is the assignee acting,
    * not an event arriving. Counting it would credit a wake that has already been spent.
    *
-   * The other half of that story is the resubmission, and it is why the grace reads
-   * `GREATEST(createdAt, updatedAt)` rather than `createdAt`: when the requester does
-   * resubmit, the row returns to `pending` and a fresh board decision is owed again.
+   * The other half of that story is the resubmission, and it is why the grace is bounded
+   * on `PENDING_SINCE` rather than on `createdAt`: when the requester does resubmit, the
+   * row returns to `pending` and a fresh board decision is owed again.
    * Bounding on `createdAt` alone would date that live wait from the original filing, so
    * a card filed on day 0 and resubmitted on day 20 reports no path and is seizable while
    * a genuine decision is still coming.
@@ -3714,15 +3714,27 @@ export function recoveryService(
    * column still has no `$onUpdate` and no trigger, and `services/agents.ts` is still the
    * nearest miss, harmless only because it does not set `updatedAt`.
    *
-   * The consequence HERE is the over-exemption direction `config.ts` predicted: a card
-   * whose payload was corrected in place reports a live wake path for up to the full
-   * grace, so its issue stays unattended on the strength of a decision that may not be
-   * coming. That is the safer of the two directions and it is still wrong. The row's
-   * `payload_edited_at` discriminates an edit from a resubmission and this predicate does
-   * not consult it; tracked separately rather than changed here. See
+   * The consequence HERE WAS the over-exemption direction `config.ts` predicted: a card
+   * whose payload was corrected in place reported a live wake path for up to the full
+   * grace, so its issue stayed unattended on the strength of a decision that might not be
+   * coming. That is the safer of the two directions and it was still wrong.
+   *
+   * FIXED IN PEN-6322 by the predicate below: it now bounds on `PENDING_SINCE`,
+   * which consults `payload_edited_at` and so dates an in-place correction from the
+   * card's FILING. `PENDING_SINCE` is IMPORTED from `approval-queue-metrics.ts`, never
+   * re-derived here — the defect being fixed was two readers of one column disagreeing
+   * about what it meant, so a second hand-written copy of the discriminator is that same
+   * drift waiting to recur.
+   *
+   * THE SURVEY IS NO LONGER THE CONTROL, which is the half worth carrying out of this
+   * row. The count in the paragraph above is still a measurement with a date on it, but a
+   * THIRTEENTH writer that leaves a row `pending` while moving its `updatedAt` is now
+   * caught by a test rather than by someone remembering to re-run a grep:
+   * `issue-recovery-actions.test.ts` drives the real `updatePayload` writer against THIS
+   * predicate and asserts the row IS seized ("stops believing a stale-filed approval that
+   * was only corrected IN PLACE"), with the resubmit exemption asserted beside it. See
    * `pendingBoardApprovalAttendanceGraceMs` for the measured decision-latency
-   * distribution behind the 14d default, and re-run the survey rather than trusting the
-   * count in this paragraph.
+   * distribution behind the 14d default.
    */
   async function hasPendingBoardApprovalWakePath(
     issue: typeof issues.$inferSelect,

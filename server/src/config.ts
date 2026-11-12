@@ -605,23 +605,37 @@ export const NUMERIC_SETTING_BOUNDS = {
   // guard. Comments are still inserted into `approval_comments` without touching the
   // parent, so `updated_at` still cannot carry comment noise — but it no longer carries
   // "a resubmission instant or nothing". It carries a resubmission OR an in-place
-  // correction, and this bound cannot tell them apart, which silently extends the
-  // exemption by up to the full grace on any card its filer corrected.
+  // correction. This bound COULD NOT tell them apart, which silently extended the
+  // exemption by up to the full grace on any card its filer corrected. FIXED IN PEN-6322:
+  // `hasPendingBoardApprovalWakePath` now bounds on the shared `PENDING_SINCE` expression
+  // (`approval-queue-metrics.ts`), which consults `payload_edited_at` and so dates an
+  // in-place correction from the card's filing rather than from the correction.
   //
   // The nearest miss is worth naming, because it is the shape that would break this and
   // it already exists: `services/agents.ts` edits `payload` on rows explicitly scoped to
   // `pending`/`revision_requested`. It is safe here for one reason only — it does not set
   // `updatedAt`. A "bump"/nudge write, or an idempotency replay that touches a pending
-  // row's `updated_at`, silently extends this exemption by up to the full grace, which is
-  // the over-exemption direction — and that is no longer hypothetical: the in-place
-  // payload correction named above is exactly such a write, and it shipped. No test
-  // covers that drift, and the
-  // obvious candidate does not: `issue-recovery-actions.test.ts` drives the real
-  // revision→resubmit chain, but freshness there is produced by the two writers jointly
-  // (`requestRevision` moves `updated_at` first), so removing it from `resubmit` alone
-  // leaves that test green. The survey above is therefore the control, and re-running it
-  // is the only thing that catches a new writer. Do not lift this bound to a predicate
-  // that also admits decided or withdrawn rows without redoing it.
+  // row's `updated_at`, widens this exemption by up to the full grace, which is the
+  // over-exemption direction — and that is no longer hypothetical: the in-place payload
+  // correction named above is exactly such a write, and it shipped.
+  //
+  // THE SURVEY IS NO LONGER THE CONTROL (PEN-6322). It used to be, and that was the whole
+  // defect: a grep a human has to remember to re-run is not a guard, and whoever adds the
+  // next writer is by construction the one person with no reason to read this comment.
+  // `issue-recovery-actions.test.ts` now drives the real `updatePayload` writer against
+  // `hasPendingBoardApprovalWakePath` and asserts the row IS seized, so a thirteenth
+  // writer of this shape turns a test red instead of silently widening this bound.
+  //
+  // What that does NOT close, stated rather than glossed over: the new coverage is of a
+  // NEW writer APPEARING, not of an existing one being REMOVED. Freshness in this
+  // suite's revision→resubmit chain is still produced by the two writers JOINTLY
+  // (`requestRevision` moves `updated_at` first), so deleting it from `resubmit` alone
+  // would still leave the recovery-side resubmit case green. That one case IS isolated in
+  // `approval-queue-metrics.test.ts`, which calls `resubmit` on a row it seeded with
+  // `updatedAt == createdAt` and asserts the age gauge — but that covers the GAUGE's
+  // reader, not this bound. The count in the paragraph above therefore remains a
+  // measurement with a date on it rather than an invariant. Do not lift this bound to a
+  // predicate that also admits decided or withdrawn rows without redoing it.
   //
   // Ceiling is 30d, matching the PR entry and the observed maximum: past a month
   // "waiting on the board" is not a description of the card but of a problem nobody is
