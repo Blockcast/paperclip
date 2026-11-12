@@ -266,9 +266,28 @@ export const HTTP_EMPTY_LIST_RESPONSES_METRIC = "paperclip_http_empty_list_respo
  */
 export const HTTP_TRANSIENT_DB_RESPONSES_METRIC = "paperclip_http_transient_db_responses_total";
 /**
- * Count of database errors raised by a BACKGROUND writer -- one holding no HTTP
- * request -- labeled by the writer, its primary target table, and the SQLSTATE
- * (PEN-6581).
+ * Count of database errors raised by one of the enumerated BACKGROUND writers
+ * ({@link BACKGROUND_DB_WRITERS}), labeled by the writer, its primary target
+ * table, and the SQLSTATE (PEN-6581).
+ *
+ * ## ⚠️ "Background" names the WRITER, not a guarantee about the caller
+ *
+ * These writers are reached overwhelmingly from timers, sweeps and reapers that
+ * hold no HTTP request -- that is why they were uninstrumented and why this
+ * counter exists. But two of them are ALSO reachable from a route, so a given
+ * increment is not PROOF that no request was in flight:
+ *
+ * - `heartbeat_run_status_guarded` <- `POST /heartbeat-runs/:runId/cancel`
+ *   -> `cancelRunInternal` -> `setRunStatusIfCurrentStatus`.
+ * - `heartbeat_run_status` <- `POST /agents/:id/pause`
+ *   -> `cancelActiveForAgentInternal` -> `setRunStatus`.
+ *
+ * ⛔ The operative consequence is for the PEN-5019 census, not for this
+ * counter's own correctness: an error on either path that propagates to the
+ * response is counted HERE and by {@link HTTP_TRANSIENT_DB_RESPONSES_METRIC},
+ * so the two MUST NOT be summed for a class-D total. The overlap is a subset of
+ * those two writers' series and its size is not readable off the labels, so
+ * treat each counter as its own census and the sum as an upper bound.
  *
  * ## Why a second counter instead of a label on the first
  *
@@ -276,8 +295,8 @@ export const HTTP_TRANSIENT_DB_RESPONSES_METRIC = "paperclip_http_transient_db_r
  * path, so it can only observe a database error that was about to become a
  * response. It is structurally blind to a statement that dies with no request
  * behind it, and that blindness is not a small corner: in the October 2026
- * class-D census on PEN-5019, `heartbeat_runs` alone was 14 of 26 events, none
- * of them reachable from a route.
+ * class-D census on PEN-5019, `heartbeat_runs` alone was 14 of 26 events, the
+ * bulk of them raised by sweeps and reapers no route can reach.
  *
  * Nothing else could see them either. The database-side route is closed BY
  * RULING, not by capability -- BLO-47427 declined `pg_read_all_stats` for the
@@ -5196,15 +5215,30 @@ export function normalizeHttpTransientDbSqlstate(sqlstate: string | null | undef
  * permanently-0 series that reads as a healthy writer rather than an
  * uninstrumented one. That failure mode is strictly worse than being absent.
  *
- * The three starting members are PEN-5019's largest class-D contributors that
- * hold no HTTP request: the two `heartbeat_runs` run-status finalizers (14 of
- * 26 class-D events in the October census) and the continuation-summary
- * document writer (the `update "documents" set "title" = $1` event).
+ * The three starting members are PEN-5019's largest class-D contributors: the
+ * two `heartbeat_runs` run-status finalizers (14 of 26 class-D events in the
+ * October census) and the continuation-summary document writer (the
+ * `update "documents" set "title" = $1` event).
+ *
+ * ⚠️ Each is reached overwhelmingly from timers, sweeps and reapers, but the
+ * two run-status writers are ALSO reachable from a route -- see the route table
+ * on {@link BACKGROUND_DB_ERRORS_METRIC} and the ⛔ there about not summing
+ * this counter with the HTTP sibling.
  */
 export const BACKGROUND_DB_WRITER_TABLES = {
-  /** `setRunStatus` -- the unguarded run-status finalize UPDATE. */
+  /**
+   * `setRunStatus` -- the unguarded run-status finalize UPDATE. Mostly reapers
+   * and sweeps; also reachable from `POST /agents/:id/pause` via
+   * `cancelActiveForAgentInternal`.
+   */
   heartbeat_run_status: "heartbeat_runs",
-  /** `setRunStatusIfRunning` -- the same finalize gated on the expected status. */
+  /**
+   * `setRunStatusIfCurrentStatus` -- the same finalize gated on an expected
+   * status. Covers all THREE of its callers, not just the first:
+   * `setRunStatusIfRunning`, `setRunStatusIfQueued`, and the
+   * `cancelRunInternal` CAS -- which is reachable from
+   * `POST /heartbeat-runs/:runId/cancel`.
+   */
   heartbeat_run_status_guarded: "heartbeat_runs",
   /** `refreshIssueContinuationSummary` -- the continuation-summary document upsert. */
   issue_continuation_summary: "documents",
@@ -9371,14 +9405,21 @@ function ensureRegistry(): {
     backgroundDbErrors = new Counter({
       name: BACKGROUND_DB_ERRORS_METRIC,
       help:
-        "Count of database errors raised by a BACKGROUND writer -- one holding no HTTP "
-        + "request -- labeled by writer, its primary target table, and SQLSTATE "
-        + "(PEN-6581). The non-HTTP sibling of " + HTTP_TRANSIENT_DB_RESPONSES_METRIC + ", "
+        "Count of database errors raised by one of the enumerated BACKGROUND writers -- "
+        + "labeled by writer, its primary target table, and SQLSTATE (PEN-6581). The "
+        + "mostly-non-HTTP sibling of " + HTTP_TRANSIENT_DB_RESPONSES_METRIC + ", "
         + "which is written on the response path and is therefore structurally blind to a "
         + "statement with no request behind it: in PEN-5019's October class-D census "
-        + "heartbeat_runs alone was 14 of 26 such events, reachable from no route, from no "
-        + "pg_stat view (pg_read_all_stats is declined by ruling, not missing by accident), "
-        + "and from the database log only when its tail happened to still reach them. "
+        + "heartbeat_runs alone was 14 of 26 such events, raised mostly by sweeps and "
+        + "reapers no route can reach, visible in no pg_stat view (pg_read_all_stats is "
+        + "declined by ruling, not missing by accident), and in the database log only when "
+        + "its tail happened to still reach them. BACKGROUND NAMES THE WRITER, NOT THE "
+        + "CALLER: heartbeat_run_status_guarded is also reachable from POST /heartbeat-runs/"
+        + ":runId/cancel and heartbeat_run_status from POST /agents/:id/pause, so an error "
+        + "on either path that reaches the response is counted here AND by the HTTP "
+        + "sibling. DO NOT SUM THE TWO for a class-D total; the overlap is a subset of "
+        + "those two writers' series, its size is not readable off these labels, and the "
+        + "sum is an upper bound. "
         + "COUNTS ERROR EVENTS, NOT FAILED OPERATIONS: an error a bounded retry then wins "
         + "is counted, which is what makes this comparable to that census -- the STATEMENT: "
         + "records behind it are every cancelled statement, successful replay or not. So a "
