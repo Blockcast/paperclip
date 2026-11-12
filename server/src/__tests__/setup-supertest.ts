@@ -4,7 +4,7 @@ import type { AddressInfo, Server as NetServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Server as TlsServer } from "node:tls";
-import { afterAll } from "vitest";
+import { afterAll, vi } from "vitest";
 
 type SupertestServer = NetServer & {
   address(): ReturnType<NetServer["address"]>;
@@ -72,6 +72,48 @@ for (const envVar of INSTANCE_ROOT_ARTIFACT_STORE_ENV_VARS) {
     fs.rmSync(dir, { recursive: true, force: true });
     if (process.env[envVar] === dir) delete process.env[envVar];
   });
+}
+
+// `vi.waitFor`'s timeout is NOT reachable from vitest.config.ts: it is a
+// hard-coded `timeout = 1e3` default inside the runner's own `waitFor`
+// (vitest 4.1.8), so the BLO-17026 lift of testTimeout/hookTimeout/
+// teardownTimeout onto the shared ARC pool could not reach it. That leaves a
+// 1s budget as the tightest clock in the suite — 60x tighter than the
+// testTimeout chosen for this very environment — on call sites that are
+// SYNCHRONISATION waits, not latency assertions: they wait for an async
+// chain to reach a point, and the assertion that follows is about ordering
+// or arguments, never about how long the wait took.
+//
+// Measured on `server-startup-feedback-export.test.ts`, whose
+// `vi.waitFor(() => expect(fakeServer.close).toHaveBeenCalled())` after a
+// SIGTERM takes 51/53/51 ms on an idle host — essentially one 50ms poll
+// interval — and which failed twice at >1000ms on a merge-group shard that
+// took 1217s with 451s of imports (PEN-3381). A false red there ejected the
+// queue head and cost a full re-queue.
+//
+// 5_000 matches the headroom already hand-applied at the three call sites
+// that carry an explicit `timeout: 5_000` (a fourth carries 2_000). Raising
+// the DEFAULT cannot weaken an assertion: no site asserts that a
+// default-budget `vi.waitFor` rejects, and each test's own `testTimeout`
+// (60_000) still bounds the wait. An explicit per-call timeout still wins, so
+// a site that genuinely means to assert a short bound keeps it — which is the
+// case `waitfor-default-budget.test.ts` pins.
+const PAPERCLIP_WAIT_FOR_DEFAULT_TIMEOUT_MS = 5_000;
+
+type WaitForOptions = Parameters<typeof vi.waitFor>[1];
+
+const viWithPatchFlag = vi as typeof vi & { __paperclipWaitForDefaultPatched?: boolean };
+
+if (!viWithPatchFlag.__paperclipWaitForDefaultPatched) {
+  const originalWaitFor = vi.waitFor.bind(vi) as typeof vi.waitFor;
+
+  vi.waitFor = (<T,>(callback: () => T | Promise<T>, options?: WaitForOptions) => {
+    if (typeof options === "number") return originalWaitFor(callback, options);
+    if (options && typeof options.timeout === "number") return originalWaitFor(callback, options);
+    return originalWaitFor(callback, { ...options, timeout: PAPERCLIP_WAIT_FOR_DEFAULT_TIMEOUT_MS });
+  }) as typeof vi.waitFor;
+
+  viWithPatchFlag.__paperclipWaitForDefaultPatched = true;
 }
 
 if (!SupertestTest.prototype.__paperclipLoopbackPatched) {
