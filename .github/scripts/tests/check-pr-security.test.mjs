@@ -893,6 +893,47 @@ test('formatFlagList: an ordinary flag renders exactly as before, plus the fence
   assert.equal(out, '- `secret-scan`: `src/config.ts` (pattern: OpenAI API key)');
 });
 
+// ── buildAdvisoryPayload: the PR title is repo-controlled too (PEN-6561) ─────
+//
+// `prTitle` is author free text, so it is repo-controlled exactly like `file`,
+// `line` and `packages`. It is interpolated in `buildAdvisoryPayload`, one
+// function away from the `formatFlagList` fences above, so an enumeration keyed
+// on "which fields does formatFlagList interpolate?" cannot reach it. These pin
+// the FIELD at its own interpolation site, not the function that carries it.
+
+const advisoryTitleFlags = [{ check: 'secret-scan', file: 'server/src/a.ts', pattern: 'OpenAI API key' }];
+
+// The advisory's PR line is the first line of the description; scoping to it
+// keeps these assertions off the flag list's own (already fenced) spans.
+function advisoryTitleLine(title) {
+  return buildAdvisoryPayload(6469, title, advisoryTitleFlags).description.split('\n')[0];
+}
+
+test('buildAdvisoryPayload: a backtick in the PR title stays inside one code span', () => {
+  const title = 'fix: drop the `--force` flag';
+  const line = advisoryTitleLine(title);
+  assert.ok(codeSpans(line).includes(title), `title is not inside a code span: ${line}`);
+});
+
+test('buildAdvisoryPayload: bold markers in the PR title do not render as emphasis', () => {
+  const title = 'fix: **really** important';
+  const line = advisoryTitleLine(title);
+  assert.ok(codeSpans(line).includes(title), `title is not inside a code span: ${line}`);
+});
+
+test('buildAdvisoryPayload: a link in the PR title cannot forge advisory prose', () => {
+  const title = 'fix [click here](https://evil.example) now';
+  const line = advisoryTitleLine(title);
+  assert.ok(codeSpans(line).includes(title), `title is not inside a code span: ${line}`);
+});
+
+test('buildAdvisoryPayload: an ordinary PR title round-trips unchanged', () => {
+  const title = 'Add a retry to the uploader';
+  const line = advisoryTitleLine(title);
+  assert.deepEqual(codeSpans(line), [title], `ordinary title did not round-trip: ${line}`);
+  assert.ok(line.startsWith('**PR:** #6469 — '), `the PR line lost its shape: ${line}`);
+});
+
 // ── formatCheckRunFlagList: the check-run summary ────────────────────────────
 
 test('formatCheckRunFlagList: a __tests__ path is fenced in the check-run summary too', () => {
