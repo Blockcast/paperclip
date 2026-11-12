@@ -1419,9 +1419,24 @@ export async function githubFetchPrAuthorLogin(input: {
 }): Promise<string | null> {
   const token = await getInstallationToken(Date.now(), { signal: input.signal });
   if (!token) return null;
-  // PEN-6341: REST `user.login` is GraphQL `author { login }`. `author` is
-  // nullable for a deleted account, which lands on the same `null` the
-  // unreadable-response branch already returned.
+  // PEN-6341: REST `user.login` maps to GraphQL `author { login }` for a USER
+  // and NOT for an App. GraphQL types an App author as a `Bot` and returns the
+  // BARE slug (`allyblockcast`) where REST returns `allyblockcast[bot]`
+  // -- measured on this PR, both surfaces, 2026-11-12.
+  //
+  // That difference is not cosmetic here. `githubReviewerIdentityMatches`
+  // accepts only `<slug>[bot]` or `app/<slug>`, and its own doc records the
+  // bare `<slug>` as the separate User seat that must never count as the
+  // reviewer bot -- the two identities the R4 policy exists to tell apart. So
+  // handing back the bare form would make every App-authored PR fail that
+  // match and silently stop crediting `self_review_skipped` on
+  // assignment-sourced reviewer wakes (BLO-9293). It fails CLOSED, which is
+  // why nothing would have reported it.
+  //
+  // Re-attach the suffix from `__typename` so this helper's output stays
+  // byte-identical to the REST one it replaced. `author` is nullable for a
+  // deleted account, which lands on the same `null` the unreadable-response
+  // branch already returned.
   const pr = await ghGraphQlPullRequestFields({
     token,
     repoFullName: input.repoFullName,
@@ -1429,8 +1444,11 @@ export async function githubFetchPrAuthorLogin(input: {
     signal: input.signal,
   });
   if (!pr.ok) return null;
-  const login = pr.data.author?.login;
-  return typeof login === "string" && login.trim().length > 0 ? login : null;
+  const author = pr.data.author;
+  const login = author?.login;
+  if (typeof login !== "string" || login.trim().length === 0) return null;
+  if (author?.__typename !== "Bot") return login;
+  return login.endsWith("[bot]") ? login : `${login}[bot]`;
 }
 
 /**
@@ -2680,7 +2698,7 @@ const PULL_REQUEST_FIELDS_QUERY = `query($owner: String!, $name: String!, $numbe
       baseRefName
       headRefOid
       url
-      author { login }
+      author { login __typename }
     }
   }
 }`;
@@ -2689,7 +2707,7 @@ export type GraphQlPullRequestFields = {
   baseRefName?: string | null;
   headRefOid?: string | null;
   url?: string | null;
-  author?: { login?: string | null } | null;
+  author?: { login?: string | null; __typename?: string | null } | null;
 };
 
 type PullRequestFieldsResponse = {

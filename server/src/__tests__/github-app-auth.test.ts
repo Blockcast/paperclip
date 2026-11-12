@@ -2495,14 +2495,64 @@ describe("PEN-6341 pull-request field reads over GraphQL", () => {
       expect(calls[0].signal).toBeInstanceOf(AbortSignal);
       expect(calls[0].signal?.aborted).toBe(false);
     });
+
+    // The assertions above are satisfied by ANY `AbortSignal`, and `ghFetch`
+    // composes one of its own -- so they prove a signal ARRIVED, never that it
+    // is the CALLER's. Pre-aborting is what discriminates: a composed signal is
+    // aborted only if one of its inputs was, and the stub never honours abort,
+    // so a DROPPED caller signal would record one un-aborted call and return
+    // the head -- which neither branch below admits.
+    it("propagates the caller's abort state, not merely some signal", async () => {
+      setCreds();
+      const calls = stubPr({ headRefOid: headSha });
+      const controller = new AbortController();
+      controller.abort();
+      const result = await githubFetchPrHeadSha({ repoFullName, prNumber, signal: controller.signal });
+      if (calls.length === 0) {
+        expect(result).toBeNull();
+      } else {
+        expect(calls[0].signal?.aborted).toBe(true);
+      }
+    });
   });
 
   describe("githubFetchPrAuthorLogin", () => {
-    it("reads author.login", async () => {
+    // GraphQL types an App author as a `Bot` and returns the BARE slug, where
+    // REST `user.login` returns `<slug>[bot]` -- measured on BOTH surfaces for
+    // this PR, 2026-11-12. This double previously carried the REST-shaped
+    // value, which is a shape GraphQL never emits, so it AGREED with the
+    // migration instead of testing it -- which is why the regression below
+    // reached review green.
+    it("re-attaches the [bot] suffix GraphQL drops for an App author", async () => {
       setCreds();
-      stubPr({ author: { login: "allyblockcast[bot]" } });
+      stubPr({ author: { login: "allyblockcast", __typename: "Bot" } });
+      // `githubReviewerIdentityMatches` accepts ONLY `<slug>[bot]` or
+      // `app/<slug>` and records the bare `<slug>` as the separate User seat
+      // that must never count as the reviewer bot, so the bare form silently
+      // stops crediting BLO-9293 self-review corroboration. It fails CLOSED,
+      // which is exactly why nothing would have reported it.
       await expect(githubFetchPrAuthorLogin({ repoFullName, prNumber }))
         .resolves.toBe("allyblockcast[bot]");
+    });
+
+    it("keeps a User login exactly as GraphQL returns it", async () => {
+      setCreds();
+      stubPr({ author: { login: "kkroo", __typename: "User" } });
+      await expect(githubFetchPrAuthorLogin({ repoFullName, prNumber })).resolves.toBe("kkroo");
+    });
+
+    it("does not double a suffix a Bot login already carries", async () => {
+      setCreds();
+      stubPr({ author: { login: "allyblockcast[bot]", __typename: "Bot" } });
+      await expect(githubFetchPrAuthorLogin({ repoFullName, prNumber }))
+        .resolves.toBe("allyblockcast[bot]");
+    });
+
+    it("asks for __typename, without which the suffix cannot be restored", async () => {
+      setCreds();
+      const calls = stubPr({ author: { login: "allyblockcast", __typename: "Bot" } });
+      await githubFetchPrAuthorLogin({ repoFullName, prNumber });
+      expect(calls[0].body.query).toContain("__typename");
     });
 
     it.each([
