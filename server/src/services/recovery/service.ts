@@ -70,7 +70,7 @@ import {
   AGENT_POD_BUSY_MAX_STALE_MS,
   probeAgentPodActivity,
 } from "../k8s-job-liveness.js";
-import { logActivity } from "../activity-log.js";
+import { logActivity, type ActivityPublish } from "../activity-log.js";
 import { budgetService } from "../budgets.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import {
@@ -4970,6 +4970,9 @@ export function recoveryService(
         cleanup,
       },
     });
+    // PEN-6577: the checkout-restore inside this transaction may clear a monitor
+    // and log it on `tx`; its live event waits for the commit below.
+    const restoredMonitorClearPublishes: ActivityPublish[] = [];
     const finalizedRun = await db.transaction(async (tx) => {
       // Lock order: issues before heartbeat_runs.
       //
@@ -5031,10 +5034,19 @@ export function recoveryService(
       await restoreCheckoutPromotedStatus(tx, {
         issueId: input.sourceIssue.id,
         companyId: input.run.companyId,
-      });
+      }, { deferredPublishes: restoredMonitorClearPublishes });
 
       return updatedRun;
     });
+    // Drained before the early return: the transaction committed either way, so
+    // a skipped outcome must not swallow an event for a clear that did happen.
+    for (const publish of restoredMonitorClearPublishes) {
+      try {
+        await publish();
+      } catch (err) {
+        logger.warn({ err }, "failed to publish restored-monitor clear activity event");
+      }
+    }
     if (!finalizedRun) return { kind: "skipped" as const };
 
     if (input.existingEvaluation && !isTerminalIssueStatus(input.existingEvaluation.status)) {
@@ -7682,7 +7694,13 @@ export function recoveryService(
           status: "blocked",
           previousStatus: input.previousStatus,
           source: "recovery.reconcile_stranded_recovery_issue",
-          monitorCleared: monitorClear.audit,
+          // PEN-6577: `clearedAudit`, not `audit` — null when `fresh` held no
+          // monitor, so this key means the same thing here as it does on the
+          // `escalateStrandedAssignedIssue` sibling below, which reports it off
+          // the nullable eligibility builder. `buildIssueMonitorClear` is
+          // unconditional, so `audit` here would report an all-empty object as
+          // a clear on every escalation of a monitor-less row.
+          monitorCleared: monitorClear.clearedAudit,
           latestRunId: input.latestRun?.id ?? null,
           latestRunStatus: input.latestRun?.status ?? null,
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
@@ -9128,7 +9146,11 @@ export function recoveryService(
           recoveryPathAbsent: hasNoRecoveryPath,
           // PEN-6571: null when the escalated status still allows a monitor, so
           // this key doubles as "did this escalation clear one".
-          monitorCleared: monitorClear?.audit ?? null,
+          // PEN-6577: `clearedAudit` is identical to `audit` on this path —
+          // `buildIssueMonitorEligibilityClear` returns non-null only when the
+          // row held a monitor — but all three sibling payloads now read the
+          // same field, so the shared meaning survives a reader who checks one.
+          monitorCleared: monitorClear?.clearedAudit ?? null,
           source: recoveryCause === SUCCESSFUL_RUN_MISSING_STATE_REASON
             ? "recovery.reconcile_successful_run_handoff_missing_state"
             : recoveryCause === "workspace_validation_failed"
@@ -9378,7 +9400,9 @@ export function recoveryService(
           status: "blocked",
           previousStatus: input.previousStatus,
           source: "recovery.reconcile_stranded_assigned_issue.zero_token_startup_failure",
-          monitorCleared: monitorClear.audit,
+          // PEN-6577: `clearedAudit`, not `audit` — see the sibling escalation
+          // above. Same key, same meaning, one definition.
+          monitorCleared: monitorClear.clearedAudit,
           latestRunId: input.latestRun?.id ?? null,
           latestRunStatus: input.latestRun?.status ?? null,
           latestRunErrorCode: input.latestRun?.errorCode ?? null,
@@ -17049,6 +17073,8 @@ export function recoveryService(
       if (!isCleanable(issue.checkoutRunId) && !checkoutHeldBySameExpiredRun) continue;
       if (!isCleanable(issue.executionRunId) && !executionLockExpired) continue;
 
+      // PEN-6577: as above — logged on `tx`, published after this commits.
+      const restoredMonitorClearSweepPublishes: ActivityPublish[] = [];
       const sweepOutcome = await db.transaction(async (tx) => {
         await deps.beforeStaleIssueLockSweepClearForTest?.(issue);
 
@@ -17339,7 +17365,7 @@ export function recoveryService(
             await restoreCheckoutPromotedStatus(tx, {
               issueId: updated.id,
               companyId: updated.companyId,
-            });
+            }, { deferredPublishes: restoredMonitorClearSweepPublishes });
             return {
               updated,
               promotedRunId: null,
@@ -17602,6 +17628,14 @@ export function recoveryService(
           };
         }
       });
+
+      for (const publish of restoredMonitorClearSweepPublishes) {
+        try {
+          await publish();
+        } catch (err) {
+          logger.warn({ err }, "failed to publish restored-monitor clear activity event");
+        }
+      }
 
       if (sweepOutcome === LOCK_CHANGED_UNDER_SWEEP) {
         result.skippedByConcurrentLockChange += 1;

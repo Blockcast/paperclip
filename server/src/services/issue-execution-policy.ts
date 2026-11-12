@@ -1988,7 +1988,50 @@ export type IssueMonitorClearAudit = {
 export type IssueMonitorClear = {
   patch: Record<string, unknown>;
   audit: IssueMonitorClearAudit;
+  /**
+   * PEN-6577: `audit`, narrowed to `null` when the PRE-clear row held no
+   * monitor for this clear to destroy.
+   *
+   * `audit` answers "what state did this write replace?" and is always
+   * well-defined, because `buildIssueMonitorClear` is unconditional. The
+   * `monitorCleared` key of an `issue.updated` payload asks the different
+   * question "did this escalation clear a monitor?", and on a row holding
+   * none the honest answer is `null`, not an all-empty audit object.
+   *
+   * Both meanings were live at once: the two `suppressed_by_status`
+   * escalations reported `clear.audit` unconditionally while their sibling
+   * reported `clear?.audit ?? null` off the nullable eligibility builder, so
+   * a consumer filtering `monitorCleared != null` scored every
+   * `suppressed_by_status` escalation as a clear, including those over rows
+   * that held no monitor at all. Reporting this field instead of `audit`
+   * makes the three sites agree by construction rather than by three callers
+   * each remembering to narrow.
+   */
+  clearedAudit: IssueMonitorClearAudit | null;
 };
+
+/**
+ * PEN-6577 — does this row hold a monitor a clear could destroy?
+ *
+ * One definition, so the nullability of `IssueMonitorClear.clearedAudit` and
+ * the `null` return of `buildIssueMonitorEligibilityClear` are provably the
+ * same predicate rather than two copies that can drift apart. That drift is
+ * exactly what produced two meanings for one `monitorCleared` key.
+ *
+ * Deliberately NOT the whole eligibility question: this asks only whether a
+ * monitor is present. `buildIssueMonitorEligibilityClear` additionally asks
+ * whether the row has become ineligible to run it, which is a different test
+ * and the one that decides whether a clear should happen at all.
+ */
+export function issueHoldsClearableMonitor(
+  issue: IssueLike,
+  policy?: IssueExecutionPolicy | null,
+): boolean {
+  const resolved = policy === undefined
+    ? normalizeIssueExecutionPolicy(issue.executionPolicy ?? null)
+    : policy;
+  return Boolean(issue.monitorNextCheckAt) || holdsTriggeredMonitor(issue, resolved);
+}
 
 export function buildIssueMonitorClear(input: {
   issue: IssueLike;
@@ -2008,6 +2051,14 @@ export function buildIssueMonitorClear(input: {
     clearedAt: input.clearedAt ?? new Date(),
   });
 
+  const audit: IssueMonitorClearAudit = {
+    clearReason: input.clearReason,
+    notes: currentMonitorState?.notes ?? null,
+    lastTriggeredAt: currentMonitorState?.lastTriggeredAt ?? null,
+    nextCheckAt: currentMonitorState?.nextCheckAt ?? null,
+    attemptCount: currentMonitorState?.attemptCount ?? 0,
+  };
+
   return {
     patch: {
       executionPolicy: stripMonitorFromExecutionPolicy(input.policy) as Record<string, unknown> | null,
@@ -2019,13 +2070,9 @@ export function buildIssueMonitorClear(input: {
       // null is no longer the end of the record.
       monitorNotes: null,
     },
-    audit: {
-      clearReason: input.clearReason,
-      notes: currentMonitorState?.notes ?? null,
-      lastTriggeredAt: currentMonitorState?.lastTriggeredAt ?? null,
-      nextCheckAt: currentMonitorState?.nextCheckAt ?? null,
-      attemptCount: currentMonitorState?.attemptCount ?? 0,
-    },
+    audit,
+    // PEN-6577: computed from the PRE-clear row, beside the audit it narrows.
+    clearedAudit: issueHoldsClearableMonitor(input.issue, input.policy) ? audit : null,
   };
 }
 
@@ -2089,7 +2136,7 @@ export function buildIssueMonitorClear(input: {
  */
 export function buildIssueMonitorEligibilityClear(issue: IssueLike): IssueMonitorClear | null {
   const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
-  if (!issue.monitorNextCheckAt && !holdsTriggeredMonitor(issue, policy)) return null;
+  if (!issueHoldsClearableMonitor(issue, policy)) return null;
   const clearReason = monitorClearReasonForIssue(
     issue.status,
     issue.assigneeAgentId ?? null,

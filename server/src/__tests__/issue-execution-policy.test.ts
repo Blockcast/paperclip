@@ -3375,7 +3375,17 @@ describe("a monitor clear returns the evidence it destroys (PEN-6571)", () => {
     // Pinned deliberately. A future change that folds `audit` back into the
     // patch, or drops it, fails here rather than silently returning a caller
     // the thing it used to have to cast out of `patch.executionState`.
-    expect(Object.keys(clear).sort()).toEqual(["audit", "patch"]);
+    //
+    // PEN-6577 added `clearedAudit`, the same payload narrowed to `null` when
+    // the PRE-clear row held no monitor. Kept EXACT rather than relaxed to a
+    // containment check: the point of this assertion is that the shape cannot
+    // drift unnoticed, and a third near-identical key is exactly the drift it
+    // should catch.
+    expect(Object.keys(clear).sort()).toEqual(["audit", "clearedAudit", "patch"]);
+
+    // ...and the two are distinguishable, so neither can quietly become an
+    // alias of the other: this row holds a monitor, so they agree here.
+    expect(clear.clearedAudit).toEqual(clear.audit);
   });
 
   it("gives the eligibility clear the same guarantee, and null when nothing is cleared", () => {
