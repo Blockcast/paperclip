@@ -758,6 +758,49 @@ this duty cannot be discharged by a document:
 a roughly **2-to-5-day** cadence. A measurement is stale about that fast. ⚠ The 2026-11-03 evaluation was a *fingerprint* reading only:
 no count was taken against it, so no result is cited for that row.
 
+⛔ **Every row above is a *firing* — the surface moved. Until now the table had no row type for the
+opposite observation, and that gap has a cost: a reader cannot distinguish a surface that was
+*measured and found unchanged* from one that was *never evaluated*, and the conservative reading of
+that ambiguity is an unnecessary root `pnpm test` window.** The non-firings are recorded below for
+exactly that reason.
+
+#### 4.1.1 Non-firings — the image moved and the surface did not
+
+| evaluated | image tag | node | fingerprint (rule v2) | vs §1.4 |
+|---|---|---|---|---|
+| 2026-11-09 (§1.4) | `sha-972f4e5` | `k8s-paperclip-3` | `b46cfbd8…` | baseline of this series |
+| 2026-11-11 ~09:14Z | `sha-d8f5f7f` | `k8s-paperclip-7` | `b46cfbd8…` | **same** |
+| 2026-11-11T18:04Z | `sha-80a5c09` | `k8s-paperclip-3` | `b46cfbd8…` | **same** |
+| 2026-11-12T05:2xZ | `sha-8cb220d` | `k8s-paperclip-3` | `b46cfbd8…` | **same** |
+| 2026-11-12T11:54Z | `sha-5baf4d7` | `k8s-paperclip-3` | `b46cfbd8…` | **same** |
+| 2026-11-12T13:3xZ | `sha-bee76fd` | `k8s-paperclip-3` | `b46cfbd8…` | **same** |
+
+All five per-file components — not merely the composite digest — were byte-identical at every row.
+Each was taken first-party from an agent pod and recorded on PEN-5663 at the time, and every image
+tag was read from the running pod's `containerStatuses[].image`, never from the desired-image
+config, which carries a `pendingImageBump` beside it and so can name an image the pod is not
+running.
+
+⇒ **Sampled series, not continuous:** at every evaluation taken since 2026-11-09 the surface has
+read `b46cfbd8…` — ≈3.1 days across six distinct image tags, five of which this record does not
+otherwise name.
+
+§4 narrows the trigger from the image to the egress-relevant surface. These rows are the first
+direct observations supporting that narrowing; they are a sampled series and do **not** measure how
+often an image change leaves the surface alone — only that it does.
+
+⚠ **Three bounds, because this is the easiest table in the record to over-read.**
+**(a)** It is **sampled, not continuous** — the surface could have moved and returned between two
+rows, and nothing here excludes that. **(b)** ≈3.1 days sits **inside** the 2-to-5-day cadence above,
+so it **corroborates** that figure; it is **not** a counter-example and **not** evidence that the
+surface has slowed down. **(c)** ⛔ **No count was taken at any of these rows. Population: none.
+Window: none.** A non-firing licenses citing the window whose fingerprint it matches — it is not
+itself a measurement of the class, and must never be cited as one.
+
+⛔ **A non-firing is not a weaker firing; it is a different observation, and it does not relax §4.**
+The three branches are unchanged: match ⇒ cite the matching window · differs with `wrapperAhead:
+true` ⇒ staleness, re-measure · `wrapperAhead: false` ⇒ control failure, escalate.
+
 ⭐ **§1's fingerprint is no longer the only citable one.** §4's first rule — "a later run whose
 fingerprint **equals** the one in §1 may cite this measurement" — now reads: a run may cite the
 window whose fingerprint it matches, `d81423fe…` for §1, `83aef063…` for §1.3 and `b46cfbd8…` for
