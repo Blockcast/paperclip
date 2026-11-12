@@ -13707,10 +13707,42 @@ export function triggeredMonitorForPrompt(
   // dispatch-lapse watchdog has already re-armed the monitor (15m) and the
   // `trigger_stalled` sweep -- which selects on `isNull(monitorNextCheckAt)` --
   // can no longer reach the row. Telling such a run it is about to strand a
-  // monitor would be FALSE, which is worse than silent. The claim marker gets
-  // that arm right for free, because every re-arm nulls it.
+  // monitor would be FALSE, which is worse than silent.
+  //
+  // The claim marker gets that arm right BETWEEN fires, because every re-arm
+  // nulls it -- but NOT during the watchdog's OWN fire, and that is the whole
+  // reason for the `serviceName` guard below. The lapse sweep re-arms the row's
+  // monitor under `serviceName = ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE`, with
+  // its gate signals replaced by `heartbeat_run:<id>`. When that monitor comes
+  // due, `tickDueIssueMonitors` claims it exactly like any other -- it selects
+  // on `monitorNextCheckAt`, never on the service -- so both columns are set
+  // again. `dispatchClaimedIssueMonitor` then takes its watchdog arm, and that
+  // arm calls `startNextQueuedRunForAgent` ITSELF: the fire is what starts the
+  // watched run, so the watched run's prompt is built inside this window BY
+  // CONSTRUCTION rather than by luck. Every exit from that arm is a clear
+  // (`dispatch_watchdog_recovered`) or a re-arm; none writes `triggered`. So the
+  // obligation this block would announce does not exist, it would name an
+  // internal service as the thing being waited on, and acting on it fights the
+  // scheduler for a monitor the scheduler is about to settle.
+  //
+  // `serviceName` is the right discriminator and not merely a convenient one: it
+  // is written by the re-arm BEFORE the claim, so unlike `monitorNextCheckAt` it
+  // is not mid-transition in this window, and it is the same field
+  // `dispatchClaimedIssueMonitor` keys its own watchdog arm on. The guard is
+  // scoped to THIS branch on purpose -- a watchdog monitor never reaches
+  // `triggered`, so if one ever derived that status it would be a real stranded
+  // obligation and the branch above should still announce it.
+  //
+  // Known and accepted, listed with the stale-claim bound rather than guarded: a
+  // claim whose `enqueueWakeup` then parks (BLO-22048) or declines (PEN-3326)
+  // also re-arms rather than triggering, so both columns are briefly set with no
+  // obligation behind them. Neither creates a run, so the only reader is a
+  // concurrent unrelated wake on the same row -- and the window closes on the
+  // re-arm in that same tick iteration, not at the 5-minute stale-claim
+  // threshold.
   if (monitor.status !== "scheduled") return null;
   if (!issueContext.monitorNextCheckAt || !issueContext.monitorWakeRequestedAt) return null;
+  if (monitor.serviceName === ISSUE_MONITOR_DISPATCH_WATCHDOG_SERVICE) return null;
   // `lastTriggeredAt` and `attemptCount` are the only two facts the triggered
   // patch WRITES, so in this window the columns still hold the previous fire's
   // instant and the pre-increment count. Omitted rather than rendered stale --

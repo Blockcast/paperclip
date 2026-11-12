@@ -3551,21 +3551,28 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
       },
     });
 
+    // Byte-identical across the two assertions below, so it is stated once.
+    // They stay TWO tests on purpose: they pin two independent claims about one
+    // call -- that the obligation is derived at all, and that the two facts the
+    // patch has not written are withheld -- and a merged assertion reports a
+    // regression in either under a name describing the other.
+    const claimedFireRow = {
+      ...base,
+      executionPolicy: scheduledPolicy(),
+      monitorNextCheckAt: new Date("2026-11-09T00:00:00.000Z"),
+      monitorWakeRequestedAt: new Date("2026-11-09T00:00:01.000Z"),
+      monitorAttemptCount: 3,
+      monitorLastTriggeredAt: new Date("2026-11-08T23:00:00.000Z"),
+      executionState: null,
+    };
+
     // THE defect this repairs. The fire has been CLAIMED but its triggered patch
     // has not committed, which is the row a fast dispatch reads -- measured at
     // 7.56-22 s after the claim, and 7 of 15 monitor wakes on one seat landed
     // inside it. Before PEN-6553 this returned null and the run held the
     // obligation for its whole life with the directive never emitted.
     it("derives an obligation while the fire is claimed and the triggered patch has not landed", () => {
-      expect(triggeredMonitorForPrompt({
-        ...base,
-        executionPolicy: scheduledPolicy(),
-        monitorNextCheckAt: new Date("2026-11-09T00:00:00.000Z"),
-        monitorWakeRequestedAt: new Date("2026-11-09T00:00:01.000Z"),
-        monitorAttemptCount: 3,
-        monitorLastTriggeredAt: new Date("2026-11-08T23:00:00.000Z"),
-        executionState: null,
-      })).toMatchObject({ serviceName: "github-pr-human-approval", maxAttempts: 24 });
+      expect(triggeredMonitorForPrompt(claimedFireRow)).toMatchObject({ serviceName: "github-pr-human-approval", maxAttempts: 24 });
     });
 
     // The two facts the triggered patch WRITES are not written yet, so the
@@ -3573,15 +3580,7 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
     // count. Rendering either would state a fact that is wrong rather than
     // missing, so both are withheld and the renderer omits them.
     it("withholds the two facts the triggered patch has not written yet", () => {
-      expect(triggeredMonitorForPrompt({
-        ...base,
-        executionPolicy: scheduledPolicy(),
-        monitorNextCheckAt: new Date("2026-11-09T00:00:00.000Z"),
-        monitorWakeRequestedAt: new Date("2026-11-09T00:00:01.000Z"),
-        monitorAttemptCount: 3,
-        monitorLastTriggeredAt: new Date("2026-11-08T23:00:00.000Z"),
-        executionState: null,
-      })).toMatchObject({ lastTriggeredAt: null, attemptCount: null });
+      expect(triggeredMonitorForPrompt(claimedFireRow)).toMatchObject({ lastTriggeredAt: null, attemptCount: null });
     });
 
     // The arm that must stay SILENT, and the reason a bare
@@ -3599,6 +3598,25 @@ describe("triggered-monitor exits directive (PEN-6271)", () => {
         monitorAttemptCount: 4,
         monitorLastTriggeredAt: new Date("2026-11-09T00:00:02.000Z"),
         executionState: null,
+      })).toBeNull();
+    });
+
+    // The dispatch-lapse watchdog re-arms the row under its OWN service name, and
+    // when that monitor comes due it is claimed exactly like any other -- so both
+    // columns are set again and the claim branch would otherwise fire. It must
+    // not: that arm of `dispatchClaimedIssueMonitor` calls
+    // `startNextQueuedRunForAgent` itself, so the watched run's prompt is built
+    // inside this very window by construction, and every exit from the arm is a
+    // clear or a re-arm, never a trigger. Announcing an obligation there is the
+    // FALSE directive this gate exists to avoid.
+    //
+    // The service name is written as a literal rather than imported because the
+    // constant is module-private, and because the literal is what the watchdog
+    // arm and this guard must agree on -- the wire value is the contract.
+    it("stays silent while a dispatch-watchdog fire is claimed", () => {
+      expect(triggeredMonitorForPrompt({
+        ...claimedFireRow,
+        executionPolicy: scheduledPolicy({ serviceName: "paperclip_monitor_dispatch" }),
       })).toBeNull();
     });
 
