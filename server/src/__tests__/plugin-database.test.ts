@@ -962,6 +962,104 @@ describe("plugin database SQL validation", () => {
     });
   });
 
+  describe("a schema the shape allowlist did not anticipate (PEN-6604)", () => {
+    // `SCHEMA_SHAPED_RE` used to decide whether a left side was a schema AT ALL, so a
+    // real schema outside its pattern was skipped as if it were a table alias. The
+    // same name in FIRST position was refused, because a keyword-anchored pattern
+    // reaches it -- so the two positions disagreed about one statement.
+    it("refuses a non-public schema in a position no keyword reaches", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows, drizzle.__drizzle_migrations",
+          "plugin_test",
+        )
+      ).toThrow(/cannot adjudicate/i);
+    });
+
+    it("refuses it identically in first position, which already worked", () => {
+      // The control for the test above: the defect was the DISAGREEMENT between the
+      // two positions, so a fix that only moved the second one is not enough.
+      expect(() =>
+        validatePluginRuntimeQuery("SELECT * FROM drizzle.__drizzle_migrations", "plugin_test")
+      ).toThrow(/drizzle/i);
+    });
+
+    it("refuses a migration that reaches such a schema the same way", () => {
+      expect(() =>
+        validatePluginMigrationStatement(
+          "INSERT INTO plugin_test.rows (id) SELECT id FROM plugin_test.src, drizzle.__drizzle_migrations",
+          "plugin_test",
+        )
+      ).toThrow(/cannot adjudicate/i);
+    });
+
+    it("still leaves a column read through a table alias alone", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT s.id, s.label FROM plugin_test.rows s WHERE s.id = $1",
+          "plugin_test",
+        )
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeExecute(
+          "INSERT INTO plugin_test.rows (id, y) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET y = EXCLUDED.y",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    it("still leaves an alias declared on a subquery or a function alone", () => {
+      // The alias here follows `)`, not a relation name, so the relation-alias anchor
+      // cannot see it. Refusing these is the false-refusal this exemption exists to
+      // avoid, and a false refusal breaks a live plugin at request time.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT sub.id FROM (SELECT id FROM plugin_test.rows) sub WHERE sub.id = $1",
+          "plugin_test",
+        )
+      ).not.toThrow();
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT e.value FROM plugin_test.rows r, jsonb_array_elements(r.payload) AS e",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    it("still leaves an alias on a comma-continued relation alone", () => {
+      // `y` is declared after a comma, which is also where an output-column alias
+      // lives, so this exemption cannot tell the two apart and takes both. Refusing
+      // it would be a false refusal on ordinary in-namespace SQL.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT y.label FROM plugin_test.rows x, other_rows y WHERE y.id = x.id",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    it("still leaves a CTE name alone", () => {
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "WITH recent AS (SELECT id FROM plugin_test.rows) SELECT recent.id FROM recent",
+          "plugin_test",
+        )
+      ).not.toThrow();
+    });
+
+    it("does not let an alias buy an exemption for a real schema name", () => {
+      // The exemption is consulted ONLY for a left side that is neither the namespace
+      // nor schema-shaped, so aliasing a relation `public` cannot make `public.secrets`
+      // skippable. Without that ordering the exemption would be a bypass.
+      expect(() =>
+        validatePluginRuntimeQuery(
+          "SELECT * FROM plugin_test.rows public, public.secrets",
+          "plugin_test",
+        )
+      ).toThrow(/cannot adjudicate|public/i);
+    });
+  });
+
   it("targets anonymous DO blocks without rejecting do-prefixed aliases", () => {
     expect(() =>
       validatePluginRuntimeQuery(
@@ -1461,6 +1559,117 @@ describeEmbeddedPostgres("plugin database namespaces", () => {
       [["a", "b"]],
     );
     expect(rows).toEqual([{ label: "c" }]);
+  });
+
+  describe("runtime search_path is pinned to the plugin namespace (PEN-6604)", () => {
+    /**
+     * An UNQUALIFIED relation name is not a schema-qualified name, so no lexical
+     * validator in this file adjudicates it, and `FROM <ns>.rows, secrets` qualifies
+     * one relation so the `refs.length === 0` floor cannot fire either. Postgres then
+     * resolved `secrets` through `search_path`, which nothing set -- so it reached
+     * `public`. These prove the resolution, not the verdict: all three statements
+     * below are ALLOWED by the validators, before and after.
+     */
+    async function installShadowFixture() {
+      const pluginManifest = manifest();
+      const namespace = derivePluginDatabaseNamespace(pluginManifest.id);
+      const packageRoot = await createPluginPackage(
+        pluginManifest,
+        `
+        CREATE TABLE ${namespace}.anchor (id int PRIMARY KEY);
+        CREATE TABLE ${namespace}.shadow_rows (label text NOT NULL);
+        CREATE TABLE ${namespace}.sink (label text NOT NULL);
+        `,
+      );
+      const pluginId = await installPluginRecord(pluginManifest);
+      const pluginDb = pluginDatabaseService(db);
+      await pluginDb.applyMigrations(pluginId, pluginManifest, packageRoot);
+      await db.execute(sql.raw(`INSERT INTO "${namespace}".anchor (id) VALUES (1)`));
+      await db.execute(sql.raw(`INSERT INTO "${namespace}".shadow_rows (label) VALUES ('from-namespace')`));
+      // The core-schema objects an unpinned statement used to reach.
+      await db.execute(sql.raw("CREATE TABLE public.shadow_rows (label text NOT NULL)"));
+      await db.execute(sql.raw("INSERT INTO public.shadow_rows (label) VALUES ('from-public')"));
+      await db.execute(sql.raw("CREATE TABLE public.pen6604_only_public (label text NOT NULL)"));
+      await db.execute(sql.raw("INSERT INTO public.pen6604_only_public (label) VALUES ('from-public')"));
+      return { pluginId, namespace, pluginDb };
+    }
+
+    afterEach(async () => {
+      await db.execute(sql.raw("DROP TABLE IF EXISTS public.shadow_rows"));
+      await db.execute(sql.raw("DROP TABLE IF EXISTS public.pen6604_only_public"));
+    });
+
+    it("resolves an unqualified name inside the namespace when public also has it", async () => {
+      const { pluginId, namespace, pluginDb } = await installShadowFixture();
+
+      // Control: both tables exist and carry DIFFERENT values, so the assertion below
+      // discriminates rather than matching whichever row happens to be there.
+      const shadowed = await db.execute(sql.raw("SELECT label FROM public.shadow_rows"));
+      expect(Array.from(shadowed as Iterable<{ label: string }>)).toEqual([{ label: "from-public" }]);
+
+      const rows = await pluginDb.query<{ label: string }>(
+        pluginId,
+        `SELECT label FROM ${namespace}.anchor, shadow_rows`,
+      );
+      expect(rows).toEqual([{ label: "from-namespace" }]);
+    });
+
+    it("cannot reach a core table the namespace does not shadow", async () => {
+      const { pluginId, namespace, pluginDb } = await installShadowFixture();
+
+      // Control: the table is really there, so the rejection below is `search_path`
+      // and not a missing relation.
+      const present = await db.execute(sql.raw("SELECT label FROM public.pen6604_only_public"));
+      expect(Array.from(present as Iterable<{ label: string }>)).toEqual([{ label: "from-public" }]);
+
+      await expect(
+        pluginDb.query(pluginId, `SELECT label FROM ${namespace}.anchor, pen6604_only_public`),
+      ).rejects.toThrow(/pen6604_only_public/i);
+    });
+
+    it("pins the execute path too", async () => {
+      const { pluginId, namespace, pluginDb } = await installShadowFixture();
+
+      await pluginDb.execute(
+        pluginId,
+        `INSERT INTO ${namespace}.sink (label) SELECT label FROM shadow_rows`,
+      );
+      const rows = await pluginDb.query<{ label: string }>(
+        pluginId,
+        `SELECT label FROM ${namespace}.sink`,
+      );
+      expect(rows).toEqual([{ label: "from-namespace" }]);
+    });
+
+    it("leaves no search_path behind on the pooled connection", async () => {
+      // `SET LOCAL` is scoped to the transaction the pin opens. A session-level `SET`
+      // would leak this plugin's namespace onto every later user of the pool, which is
+      // the reason this runs in a transaction at all.
+      const { pluginId, namespace, pluginDb } = await installShadowFixture();
+      await pluginDb.query(pluginId, `SELECT label FROM ${namespace}.anchor, shadow_rows`);
+
+      const after = await db.execute(sql.raw("SELECT label FROM shadow_rows"));
+      expect(Array.from(after as Iterable<{ label: string }>)).toEqual([{ label: "from-public" }]);
+    });
+
+    it("refuses to run plugin SQL on a client it cannot pin", async () => {
+      // Every production caller passes a full `Db`, so this is unreachable there. It
+      // is asserted because the alternative -- running unpinned when `transaction` is
+      // missing -- would silently restore the hole on exactly this path.
+      const { pluginId, namespace } = await installShadowFixture();
+      // Built by hand rather than spread: `{ ...db }` drops the prototype methods and
+      // fails on `db.select` long before it reaches the pin.
+      const unpinnable = pluginDatabaseService({
+        select: db.select.bind(db),
+        insert: db.insert.bind(db),
+        update: db.update.bind(db),
+        execute: db.execute.bind(db),
+      });
+
+      await expect(
+        unpinnable.query(pluginId, `SELECT label FROM ${namespace}.anchor`),
+      ).rejects.toThrow(/transactional database client/i);
+    });
   });
 
   it("rejects runtime writes to public core tables", async () => {
