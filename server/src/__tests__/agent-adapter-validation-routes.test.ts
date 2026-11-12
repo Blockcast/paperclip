@@ -906,4 +906,60 @@ describe("agent routes adapter validation", () => {
 
     expect(res.status, JSON.stringify(res.body)).toBe(422);
   });
+
+  /**
+   * PEN-6586 review. The two tests above cover the TOP-LEVEL adapterConfig
+   * PATCH, where the validated config and the introduce reference are the same
+   * scope. The model-profile path is not: it validates
+   * `{...agent top-level, ...adapter profile default, ...the profile's own}`
+   * against the PROFILE's stored config alone, so a `claudeCodeVersion` that
+   * falls through from agent scope was read as introduced by a write that
+   * never named it — refusing `runtimeConfig` PATCHes on exactly the agents
+   * the introduce-only test exists to keep repairable.
+   */
+  async function patchModelProfile(adapterConfig: Record<string, unknown>) {
+    const app = await createApp();
+    return requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ runtimeConfig: { modelProfiles: { cheap: { adapterConfig } } } }),
+    );
+  }
+
+  it("does not refuse a model-profile write over a stored malformed version (PEN-6586)", async () => {
+    mockAgentService.getById.mockResolvedValue(
+      claudeK8sAgentRow({ claudeCodeVersion: "latest", model: "claude-opus-5" }),
+    );
+
+    const res = await patchModelProfile({ model: "claude-haiku-5-5" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  it("still refuses a malformed version the model profile itself introduces (PEN-6586)", async () => {
+    // The control for the test above. Tolerating the fall-through must not
+    // turn into tolerating anything written through this path.
+    mockAgentService.getById.mockResolvedValue(
+      claudeK8sAgentRow({ claudeCodeVersion: "latest", model: "claude-opus-5" }),
+    );
+
+    const res = await patchModelProfile({ claudeCodeVersion: "^2.1.0" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(JSON.stringify(res.body)).toContain("claudeCodeVersion");
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("refuses a malformed version on a model profile of a clean agent (PEN-6586)", async () => {
+    // Nothing stored anywhere, so no scope can vouch for it. This is the arm
+    // that would break if the fix had been written as "skip the key on the
+    // profile path" rather than "ask every scope that fed the merge".
+    mockAgentService.getById.mockResolvedValue(claudeK8sAgentRow({ model: "claude-opus-5" }));
+
+    const res = await patchModelProfile({ claudeCodeVersion: "latest" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
 });

@@ -107,16 +107,52 @@ export interface InadmissibleClaudeCodeVersion {
  * is untouched. This grammar is adapter-independent and static — it is decided
  * by shell-interpolation safety, not by a registry that can narrow — so the
  * same string is admissible or not regardless of which adapter reads it.
+ *
+ * ## `previous` is a LIST of scopes, and that is load-bearing
+ *
+ * The config handed to the check is a MERGE — on the model-profile path it is
+ * `{...agent top-level, ...adapter profile default, ...the profile's own}`. An
+ * introduce test is only sound against the SAME scopes that fed the merge: ask
+ * one layer whether it already held the value and the other layers' values all
+ * read as new. Concretely, before this took a list (PEN-6586 review): an agent
+ * storing a malformed top-level version was refused on a `runtimeConfig`
+ * model-profile PATCH that never named this key, because the merge carried the
+ * stored value forward while `previous` was the profile's config, which had
+ * none. That is the exact wedge the paragraph above exists to prevent, reached
+ * through a different write path.
+ *
+ * So: NOT introduced when the value equals the stored value in ANY supplied
+ * scope. Equality with any one of them means the agent is already in that
+ * state, and refusing repairs nothing — which is the whole introduce-only
+ * rationale, applied per scope.
+ *
+ * ⛔ Do NOT widen `introducesModel` the same way. A model is profile-scoped:
+ * the agent's top-level model is not what that profile dispatches with, so the
+ * profile's own stored config is the only honest reference. The difference is
+ * not stylistic — this key FALLS THROUGH from agent scope and `model` does not.
  */
+
+/** One stored config the merged value could have fallen through from. */
+export type ClaudeCodeVersionPreviousScope =
+  | { adapterConfig?: Record<string, unknown> | null }
+  | null
+  | undefined;
+
+function storedClaudeCodeVersion(scope: ClaudeCodeVersionPreviousScope): string | null {
+  if (!scope) return null;
+  const stored = scope.adapterConfig?.[CLAUDE_CODE_VERSION_CONFIG_KEY];
+  return typeof stored === "string" ? stored.trim() : "";
+}
+
 export function introducesClaudeCodeVersion(input: {
   value: string;
-  previous?: { adapterConfig?: Record<string, unknown> | null } | null;
+  previous?: ClaudeCodeVersionPreviousScope | ClaudeCodeVersionPreviousScope[];
 }): boolean {
-  const previous = input.previous;
-  if (!previous) return true;
-  const stored = previous.adapterConfig?.[CLAUDE_CODE_VERSION_CONFIG_KEY];
-  const previousValue = typeof stored === "string" ? stored.trim() : "";
-  return previousValue !== input.value;
+  const scopes = Array.isArray(input.previous) ? input.previous : [input.previous];
+  for (const scope of scopes) {
+    if (storedClaudeCodeVersion(scope) === input.value) return false;
+  }
+  return true;
 }
 
 /**
@@ -133,7 +169,7 @@ export function introducesClaudeCodeVersion(input: {
  */
 export function findInadmissibleClaudeCodeVersion(
   adapterConfig: Record<string, unknown>,
-  previous?: { adapterConfig?: Record<string, unknown> | null } | null,
+  previous?: ClaudeCodeVersionPreviousScope | ClaudeCodeVersionPreviousScope[],
 ): InadmissibleClaudeCodeVersion | null {
   const raw = adapterConfig[CLAUDE_CODE_VERSION_CONFIG_KEY];
   if (isAdmissibleClaudeCodeVersion(raw)) return null;

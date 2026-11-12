@@ -141,6 +141,56 @@ describe("findInadmissibleClaudeCodeVersion", () => {
       findInadmissibleClaudeCodeVersion({ [key]: "2.1.322" }, { adapterConfig: { [key]: "latest" } }),
     ).toBeNull();
   });
+
+  /**
+   * PEN-6586 review. The config reaching this check is a MERGE whenever the
+   * caller validates one scope's write against another scope's fall-through —
+   * the model-profile path merges the agent's top-level config, the adapter's
+   * profile default and the profile's own. An introduce test asked about ONE
+   * of those layers calls every other layer's stored value new.
+   */
+  describe("previous ranges over every scope that fed the merge", () => {
+    const profileScope = { adapterConfig: { model: "claude-opus-5" } };
+    const agentScope = { adapterConfig: { [key]: "latest" } };
+
+    it("tolerates a value that fell through from a scope that already stored it", () => {
+      // The merged config carries "latest" from agent scope; the profile that
+      // is actually being written never mentions the key. Refusing here would
+      // wedge the agent out of unrelated model-profile writes.
+      expect(
+        findInadmissibleClaudeCodeVersion(
+          { [key]: "latest", model: "claude-opus-5" },
+          [profileScope, agentScope],
+        ),
+      ).toBeNull();
+    });
+
+    it("still refuses a value no supplied scope stored", () => {
+      // The control. Tolerating a fall-through must not become tolerating
+      // everything: a profile write that genuinely introduces a bad version is
+      // refused exactly as before.
+      expect(
+        findInadmissibleClaudeCodeVersion(
+          { [key]: "^2.1.0", model: "claude-opus-5" },
+          [profileScope, agentScope],
+        ),
+      ).toEqual({ value: "^2.1.0" });
+    });
+
+    it("ignores null and undefined scopes rather than treating them as a match", () => {
+      // A create supplies no scopes at all, and the profile path supplies a
+      // null one whenever the agent has no stored config. Neither may read as
+      // "already stored".
+      expect(findInadmissibleClaudeCodeVersion({ [key]: "latest" }, [null, undefined])).toEqual({
+        value: "latest",
+      });
+      expect(findInadmissibleClaudeCodeVersion({ [key]: "latest" }, [])).toEqual({ value: "latest" });
+    });
+
+    it("accepts a bare scope, so existing single-scope callers are unchanged", () => {
+      expect(findInadmissibleClaudeCodeVersion({ [key]: "latest" }, agentScope)).toBeNull();
+    });
+  });
 });
 
 describe("read-back: an agent can verify the version it stored (PEN-6586)", () => {
@@ -172,6 +222,29 @@ describe("read-back: an agent can verify the version it stored (PEN-6586)", () =
     const jwt = [b64u({ alg: "HS256" }), b64u({ sub: "1" }), "s".repeat(43)].join(".");
     expect(jwt.startsWith("ey")).toBe(true);
     expect(read({ [key]: jwt })[key]).toBe("***REDACTED***");
+  });
+
+  it("reads back a long prerelease tail unmasked, which is the exemption's residual", () => {
+    // PEN-6586 review. The comment at `isVersionShapedConfigValue` used to
+    // claim the value test "cannot widen to anything secret-shaped". It rules
+    // out JWTs — that argument is sound — and nothing wider: the prerelease
+    // tail is `[0-9A-Za-z.-]+` with no length bound, mirroring the adapter, so
+    // a 40-character hex tail satisfies the grammar and JWT_VALUE_RE at once.
+    //
+    // Pinned rather than fixed. Capping the tail would narrow a grammar whose
+    // whole point is to mirror the vendored one, and capping it in the
+    // redactor alone would re-break the read-back for legal values. This test
+    // exists so the residual is a measurement in the suite rather than a
+    // sentence in a comment, and so narrowing the grammar reds here.
+    const tail = "a1b2c3d4".repeat(5);
+    expect(tail).toHaveLength(40);
+    const versionShapedSecret = `1.0.0-${tail}`;
+    expect(isAdmissibleClaudeCodeVersion(versionShapedSecret)).toBe(true);
+    expect(read({ [key]: versionShapedSecret })[key]).toBe(versionShapedSecret);
+    // The control: the same 40 characters WITHOUT the version prefix is not
+    // admissible, so it is the prefix doing the work, not the exemption
+    // matching everything.
+    expect(isAdmissibleClaudeCodeVersion(tail)).toBe(false);
   });
 
   it("does not exempt the key outside an agent-config read", () => {

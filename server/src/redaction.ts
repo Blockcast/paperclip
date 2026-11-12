@@ -698,8 +698,30 @@ function sanitizeSecretMatchedValue(value: unknown, options: SanitizeOptions | u
  * scope by. So the exemption is gated on the value ALREADY matching the
  * admissible grammar, which no JWT can — a JWT's first segment is base64url of
  * a JSON header and so always begins `ey`, while this grammar admits only
- * digits before the first dot. The exemption therefore cannot widen to
- * anything secret-shaped no matter what is stored.
+ * digits before the first dot.
+ *
+ * ⚠ THAT ARGUMENT RULES OUT JWTs AND NOTHING WIDER, and an earlier draft of
+ * this comment claimed it ruled out everything secret-shaped (PEN-6586
+ * review). It does not. The grammar's prerelease tail is `[0-9A-Za-z.-]+` with
+ * NO LENGTH BOUND, mirroring the vendored adapter, so `1.0.0-<40 hex chars>`
+ * satisfies both the grammar and {@link JWT_VALUE_RE} and reads back unmasked.
+ * `claude-code-version.test.ts` pins exactly that value so the residual stays
+ * measured rather than asserted.
+ *
+ * What actually bounds the disclosure is three things, none of them the `ey`
+ * argument. The value must be SHAPED like a version to get here at all, which
+ * no opaque secret is by accident — only one deliberately prefixed `N.N.N-`.
+ * The key is not a credential field, and nothing in this system writes a
+ * secret to it. And the exemption is scoped to `agentConfig` reads, where
+ * `adapterConfig` is withheld cross-seat, so the principal who can read an
+ * exempted value is the one who wrote it.
+ *
+ * ⛔ Do NOT cap the prerelease here to recover the stronger claim. This
+ * grammar is a MIRROR of the adapter's, pinned by a test that parses the
+ * vendored source; narrowing it would refuse at the write a version the
+ * adapter accepts, and narrowing it HERE ALONE would silently re-break the
+ * read-back this exemption exists to restore, for the exotic-but-legal values
+ * nobody would think to re-test.
  *
  * Scoped to `agentConfig` reads, which is the surface the capability needs
  * (`GET /api/agents/:id` -> `redactAgentSecrets`); a generic event payload
