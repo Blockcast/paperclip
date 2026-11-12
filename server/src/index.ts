@@ -3177,10 +3177,13 @@ export async function startServer(): Promise<StartedServer> {
   // never get a watermark keep arriving: `POST /companies/:id/cost-events`
   // takes a `heartbeatRunId` and writes no attribution, a replica on the old
   // image writes none during a roll, and this repair itself defers rows whose
-  // run is still in flight. Each of those is INVISIBLE to `by-project` until a
-  // pass reaches it -- the inner join drops a NULL effective project -- so at
-  // once-per-lease they would wait for the next deploy or failover. A drained
-  // pass is one scan of `cost_events_unattributed_idx`, the partial
+  // run is still in flight. Each of those is MISATTRIBUTED by `by-project`
+  // until a pass reaches it: since PEN-6084 a NULL effective project is
+  // bucketed as unattributed rather than dropped, so the spend is still
+  // reported -- just against no project instead of the one that incurred it.
+  // At once-per-lease those rows would sit in that bucket until the next
+  // deploy or failover. A drained pass is one scan of
+  // `cost_events_unattributed_idx`, the partial
   // index that holds exactly the rows still awaiting a watermark, and reads no
   // activity_log row at all.
   if (config.paperclipNodeRole !== "api") {

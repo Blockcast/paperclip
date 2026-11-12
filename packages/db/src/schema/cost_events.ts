@@ -76,8 +76,11 @@ export const costEvents = pgTable(
     //
     // No DB-level FK on `attributed_project_id` on purpose: adding one to a populated
     // table takes a lock and a validation scan to protect a DERIVED, advisory value. A
-    // deleted project leaves a dangling id, which `byProject`'s `innerJoin(projects)`
-    // drops exactly as it drops a NULL -- the same outcome a FK's ON DELETE would give.
+    // deleted project leaves a dangling id, which `byProject`'s `leftJoin(projects)`
+    // buckets as unattributed exactly as it buckets a NULL (PEN-6084) -- the same outcome
+    // a FK's ON DELETE SET NULL would give. It groups on the LEFT-joined `projects.id`
+    // precisely so a dangling reference joins that one bucket instead of becoming an
+    // anonymous row of its own.
     attributedProjectAt: timestamp("attributed_project_at", { withTimezone: true }),
     occurredAt: timestamp("occurred_at", { withTimezone: true }).notNull(),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
