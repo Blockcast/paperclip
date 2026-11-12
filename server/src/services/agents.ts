@@ -49,7 +49,8 @@ import { REDACTED_EVENT_VALUE, sanitizeRecord } from "../redaction.js";
 // import cycle the way reaching into `routes/agents.ts` would — that module
 // imports this one. See PEN-3757 at `activatePendingApproval`.
 import { restoreRedactedAgentMetadata, restoreRedactedAgentRuntimeConfig } from "../agent-redaction.js";
-import { buildIssueMonitorEligibilityPatch } from "./issue-execution-policy.js";
+import { buildIssueMonitorEligibilityClear } from "./issue-execution-policy.js";
+import { logIssueMonitorClearedUndeliverable } from "./activity-log.js";
 import { secretService } from "./secrets.js";
 import {
   builtInAgentMarkersEqual,
@@ -1043,18 +1044,34 @@ export function agentService(db: Db) {
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)))
           .returning();
         for (const issue of reassignedIssues) {
-          const monitorPatch = buildIssueMonitorEligibilityPatch(issue);
-          if (Object.keys(monitorPatch).length === 0) continue;
-          await tx
+          const clear = buildIssueMonitorEligibilityClear(issue);
+          if (!clear) continue;
+          const cleared = await tx
             .update(issues)
-            .set({ ...monitorPatch, updatedAt: new Date() })
+            .set({ ...clear.patch, updatedAt: new Date() })
             .where(and(
               eq(issues.id, issue.id),
               isNull(issues.assigneeAgentId),
               issue.monitorNextCheckAt
                 ? eq(issues.monitorNextCheckAt, issue.monitorNextCheckAt)
                 : isNull(issues.monitorNextCheckAt),
-            ));
+            ))
+            .returning({ id: issues.id });
+          // PEN-6571: deleting an agent unassigns every issue it held and
+          // clears their monitors, nulling the notes. Logged with a null
+          // `agentId`/`runId` deliberately — the `activityLog` delete a few
+          // statements below is keyed on the deleted agent's id and on its
+          // runs, so a row attributed to that agent would be erased in the same
+          // transaction that wrote it.
+          if (cleared.length === 0) continue;
+          await logIssueMonitorClearedUndeliverable(tx as unknown as Db, {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            identifier: issue.identifier,
+            status: issue.status,
+            audit: clear.audit,
+            source: "agents.remove",
+          });
         }
         await tx.delete(heartbeatRunEvents).where(
           or(

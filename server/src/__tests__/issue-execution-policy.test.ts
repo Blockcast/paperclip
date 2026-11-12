@@ -4,8 +4,8 @@ import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
   applyIssueExecutionPolicyTransition,
   applyIssueMonitorPolicyTransition,
-  buildIssueMonitorClearedPatch,
-  buildIssueMonitorEligibilityPatch,
+  buildIssueMonitorClear,
+  buildIssueMonitorEligibilityClear,
   derivePersistedMonitorState,
   dispatchWatchdogGateSignals,
   exhaustedMonitorClearReason,
@@ -22,9 +22,9 @@ const ctoAgentId = "33333333-3333-4333-8333-333333333333";
 const ctoUserId = "cto-user";
 const boardUserId = "board-user";
 
-describe("buildIssueMonitorEligibilityPatch", () => {
+describe("buildIssueMonitorEligibilityClear", () => {
   it("clears an armed monitor after an agent assignee is removed", () => {
-    const patch = buildIssueMonitorEligibilityPatch({
+    const patch = buildIssueMonitorEligibilityClear({
       status: "in_progress",
       assigneeAgentId: null,
       assigneeUserId: null,
@@ -32,7 +32,7 @@ describe("buildIssueMonitorEligibilityPatch", () => {
       executionPolicy: {
         monitor: { nextCheckAt: "2026-08-31T17:00:00.000Z", scheduledBy: "assignee" },
       },
-    });
+    })!.patch;
 
     expect(patch).toMatchObject({
       monitorNextCheckAt: null,
@@ -44,7 +44,7 @@ describe("buildIssueMonitorEligibilityPatch", () => {
   });
 
   it("clears an armed monitor after an active issue is demoted", () => {
-    const patch = buildIssueMonitorEligibilityPatch({
+    const patch = buildIssueMonitorEligibilityClear({
       status: "todo",
       assigneeAgentId: coderAgentId,
       assigneeUserId: null,
@@ -52,7 +52,7 @@ describe("buildIssueMonitorEligibilityPatch", () => {
       executionPolicy: {
         monitor: { nextCheckAt: "2026-08-31T17:00:00.000Z", scheduledBy: "assignee" },
       },
-    });
+    })!.patch;
 
     expect((patch.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
       .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
@@ -76,9 +76,9 @@ describe("buildIssueMonitorEligibilityPatch", () => {
     };
 
     // Evaluated against the row as-is, there is nothing to do — this is the trap.
-    expect(buildIssueMonitorEligibilityPatch(armed)).toEqual({});
+    expect(buildIssueMonitorEligibilityClear(armed)).toBeNull();
 
-    const patch = buildIssueMonitorEligibilityPatch({ ...armed, status: "blocked" });
+    const patch = buildIssueMonitorEligibilityClear({ ...armed, status: "blocked" })!.patch;
     expect(patch.monitorNextCheckAt).toBeNull();
     expect((patch.executionState as { monitor?: { status?: string; clearReason?: string } }).monitor)
       .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
@@ -88,7 +88,7 @@ describe("buildIssueMonitorEligibilityPatch", () => {
   // branch must keep its monitor, so the unconditional spread has to stay a no-op there.
   it("leaves the monitor armed when the escalation status still allows one", () => {
     expect(
-      buildIssueMonitorEligibilityPatch({
+      buildIssueMonitorEligibilityClear({
         status: "in_review",
         assigneeAgentId: coderAgentId,
         assigneeUserId: null,
@@ -97,7 +97,7 @@ describe("buildIssueMonitorEligibilityPatch", () => {
           monitor: { nextCheckAt: "2026-09-19T10:07:00.000Z", scheduledBy: "assignee" },
         },
       }),
-    ).toEqual({});
+    ).toBeNull();
   });
 });
 
@@ -114,7 +114,7 @@ describe("buildIssueMonitorEligibilityPatch", () => {
 // clear did not keep, so the row could not answer "was a wake owed here, and
 // when" without a per-issue activity-feed pull. These pin the due time onto the
 // row's own cleared state.
-describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343)", () => {
+describe("buildIssueMonitorClear records the destroyed due time (PEN-5343)", () => {
   const armedAt = "2026-11-03T12:30:00.000Z";
   const armed = {
     status: "in_progress",
@@ -151,7 +151,7 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
   it("keeps the due time the plugin's cancel destroyed", () => {
     // The alert resolved while no run held the row: exactly the 11-02T21:46:42Z
     // cancel that took a monitor due 14h43m later.
-    const monitor = monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" }));
+    const monitor = monitorOf(buildIssueMonitorEligibilityClear({ ...armed, status: "cancelled" })!.patch);
 
     expect(monitor).toMatchObject({
       status: "cleared",
@@ -164,7 +164,7 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
   });
 
   it("distinguishes a destroyed monitor from a row that never armed one", () => {
-    const destroyed = monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" }));
+    const destroyed = monitorOf(buildIssueMonitorEligibilityClear({ ...armed, status: "cancelled" })!.patch);
     expect(destroyed.clearedNextCheckAt).toBe(armedAt);
 
     // A row that never armed a monitor produces no patch at all, so there is
@@ -172,13 +172,13 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
     // the top-level columns cannot make: `monitorAttemptCount` reads 0 on both
     // (8 of the 9 PEN-4365 casualties were destroyed at attempt 0).
     expect(
-      buildIssueMonitorEligibilityPatch({
+      buildIssueMonitorEligibilityClear({
         status: "cancelled",
         assigneeAgentId: coderAgentId,
         assigneeUserId: null,
         monitorNextCheckAt: null,
       }),
-    ).toEqual({});
+    ).toBeNull();
   });
 
   it("does not erase the original due time when an already-cleared monitor is re-cleared", () => {
@@ -186,10 +186,10 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
     // plugin-authored. A second clear arrives with `nextCheckAt` already null,
     // so a naive assignment would overwrite the record with null and lose the
     // only evidence that a wake was ever owed.
-    const first = monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" }));
+    const first = monitorOf(buildIssueMonitorEligibilityClear({ ...armed, status: "cancelled" })!.patch);
     expect(first.clearedNextCheckAt).toBe(armedAt);
 
-    const second = buildIssueMonitorClearedPatch({
+    const second = buildIssueMonitorClear({
       issue: {
         status: "cancelled",
         assigneeAgentId: coderAgentId,
@@ -199,7 +199,7 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
       },
       policy: null,
       clearReason: "cancelled",
-    });
+    })!.patch;
 
     expect(monitorOf(second)).toMatchObject({
       status: "cleared",
@@ -224,7 +224,7 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
         assigneeUserId: null,
         executionPolicy: null,
         executionState: stateWithMonitor(
-          monitorOf(buildIssueMonitorEligibilityPatch({ ...armed, status: "cancelled" })),
+          monitorOf(buildIssueMonitorEligibilityClear({ ...armed, status: "cancelled" })!.patch),
         ),
         monitorAttemptCount: 0,
         monitorNextCheckAt: null,
@@ -313,7 +313,7 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
       // original was never recorded, so there is nothing to carry forward —
       // and writing `null` here would assert "no wake was owed" about a row
       // whose wake we simply never captured.
-      const recleared = buildIssueMonitorClearedPatch({
+      const recleared = buildIssueMonitorClear({
         issue: {
           status: "cancelled",
           assigneeAgentId: coderAgentId,
@@ -323,7 +323,7 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
         },
         policy: null,
         clearReason: "done",
-      });
+      })!.patch;
 
       const monitor = monitorOf(recleared);
       expect(monitor.status).toBe("cleared");
@@ -343,7 +343,7 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
       } as const;
 
       const monitor = monitorOf(
-        buildIssueMonitorClearedPatch({
+        buildIssueMonitorClear({
           issue: {
             status: "cancelled",
             assigneeAgentId: coderAgentId,
@@ -353,7 +353,7 @@ describe("buildIssueMonitorClearedPatch records the destroyed due time (PEN-5343
           },
           policy: null,
           clearReason: "cancelled",
-        }),
+        })!.patch,
       );
 
       expect(monitor).toMatchObject({ status: "cleared", clearedNextCheckAt: null });
@@ -408,7 +408,7 @@ describe("monitor recovery handoff bookkeeping (PEN-5346)", () => {
 
   it("leaves a fresh cancel owing a handoff", () => {
     const policy = armedPolicy();
-    const patch = buildIssueMonitorClearedPatch({
+    const patch = buildIssueMonitorClear({
       issue: {
         status: "cancelled",
         assigneeAgentId: coderAgentId,
@@ -419,7 +419,7 @@ describe("monitor recovery handoff bookkeeping (PEN-5346)", () => {
       },
       policy,
       clearReason: "cancelled",
-    });
+    })!.patch;
 
     expect(monitorOf(patch.executionState)).toMatchObject({
       status: "cleared",
@@ -433,7 +433,7 @@ describe("monitor recovery handoff bookkeeping (PEN-5346)", () => {
     // second cancel destroys a DIFFERENT monitor and owes its own handoff —
     // inheriting the stamp would silently drop it.
     const policy = armedPolicy();
-    const patch = buildIssueMonitorClearedPatch({
+    const patch = buildIssueMonitorClear({
       issue: {
         status: "cancelled",
         assigneeAgentId: coderAgentId,
@@ -451,7 +451,7 @@ describe("monitor recovery handoff bookkeeping (PEN-5346)", () => {
       },
       policy,
       clearReason: "cancelled",
-    });
+    })!.patch;
 
     expect(monitorOf(patch.executionState)).toMatchObject({ recoveryEmittedAt: null });
   });
@@ -621,9 +621,9 @@ describe("a clear scrubs the archived monitor notes (PEN-5902)", () => {
     // The commonest path by far, and the one that accumulates the carriers:
     // park on an external wait with notes, finish the work, set `done`.
     // Nobody calls the clear verb here at all.
-    const patch = buildIssueMonitorEligibilityPatch(
+    const patch = buildIssueMonitorEligibilityClear(
       armedIssue({ status: "done", executionPolicy: armedPolicy() }),
-    );
+    )!.patch;
 
     expect(monitorOf(patch.executionState)).toMatchObject({ status: "cleared", notes: null });
   });
@@ -634,9 +634,9 @@ describe("a clear scrubs the archived monitor notes (PEN-5902)", () => {
     // here and that re-hydration silently reads null, so the recovery issue —
     // possibly the only surviving carrier, since the source row is cancelled —
     // loses the whole record of what was being waited on.
-    const patch = buildIssueMonitorEligibilityPatch(
+    const patch = buildIssueMonitorEligibilityClear(
       armedIssue({ status: "cancelled", executionPolicy: armedPolicy() }),
-    );
+    )!.patch;
 
     expect(monitorOf(patch.executionState)).toMatchObject({
       status: "cleared",
@@ -2409,7 +2409,7 @@ describe("issue execution policy transitions", () => {
         stages: [],
         monitor: { nextCheckAt: "2099-04-11T12:30:00.000Z", scheduledBy: "assignee" },
       })!;
-      const result = buildIssueMonitorClearedPatch({
+      const result = buildIssueMonitorClear({
         issue: {
           status: "in_progress",
           assigneeAgentId: coderAgentId,
@@ -2420,7 +2420,7 @@ describe("issue execution policy transitions", () => {
         },
         policy,
         clearReason: "suppressed_by_status",
-      });
+      })!.patch;
       expect(result.monitorNextCheckAt).toBeNull();
       expect(result.executionPolicy).toBeNull();
       expect(result.executionState).toMatchObject({
@@ -3079,7 +3079,7 @@ describe("stage discharge on terminal status", () => {
 // PEN-6202 — a monitor that has already FIRED must be cleared by the same
 // eligibility pass that clears an armed one.
 //
-// `buildIssueMonitorEligibilityPatch` used to open `if (!issue.monitorNextCheckAt)
+// `buildIssueMonitorEligibilityClear` used to open `if (!issue.monitorNextCheckAt)
 // return {}`, deferring the fired case to BLO-25865 as "a different defect". It
 // is a different defect, and BLO-25865's net cannot reach the rows this pass
 // creates: `tickExpiredIssueMonitors` is the only thing that clears a fired
@@ -3091,7 +3091,7 @@ describe("stage discharge on terminal status", () => {
 // Census over all 5615 company rows, 2026-11-08: 19 non-terminal rows held a
 // permanently unclearable `triggered` monitor, 3 of them for 91-106 days, each
 // watching a pull request that had already merged.
-describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", () => {
+describe("buildIssueMonitorEligibilityClear clears a FIRED monitor (PEN-6202)", () => {
   const triggeredState = (overrides: Record<string, unknown> = {}) =>
     ({
       status: "idle",
@@ -3139,7 +3139,7 @@ describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", 
   // the run ends and checkout release restores the row to `todo`. Both sat at
   // 106 and 91 days with `attemptCount` frozen.
   it("clears when a checkout release demotes the row out of the dispatch window", () => {
-    const patch = buildIssueMonitorEligibilityPatch({ ...fired, status: "todo" });
+    const patch = buildIssueMonitorEligibilityClear({ ...fired, status: "todo" })!.patch;
     const patchNotes = patch.monitorNotes;
     const monitor = monitorOf(patch);
 
@@ -3158,7 +3158,7 @@ describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", 
   });
 
   it("clears on `blocked` too, not just `todo`", () => {
-    expect(monitorOf(buildIssueMonitorEligibilityPatch({ ...fired, status: "blocked" })))
+    expect(monitorOf(buildIssueMonitorEligibilityClear({ ...fired, status: "blocked" })!.patch))
       .toMatchObject({ status: "cleared", clearReason: "invalid_status" });
   });
 
@@ -3170,12 +3170,12 @@ describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", 
   it("clears when the row passes to a human assignee, on a status the net allows", () => {
     expect(
       monitorOf(
-        buildIssueMonitorEligibilityPatch({
+        buildIssueMonitorEligibilityClear({
           ...fired,
           status: "in_review",
           assigneeAgentId: null,
           assigneeUserId: ctoUserId,
-        }),
+        })!.patch,
       ),
     ).toMatchObject({ status: "cleared", clearReason: "invalid_assignee" });
   });
@@ -3186,8 +3186,8 @@ describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", 
   // waits out a grace window before reaping it. This pass must not pre-empt
   // that — it fires at the instant the row leaves eligibility, never before.
   it("leaves a fired monitor alone while the row can still be dispatched", () => {
-    expect(buildIssueMonitorEligibilityPatch({ ...fired, status: "in_progress" })).toEqual({});
-    expect(buildIssueMonitorEligibilityPatch({ ...fired, status: "in_review" })).toEqual({});
+    expect(buildIssueMonitorEligibilityClear({ ...fired, status: "in_progress" })).toBeNull();
+    expect(buildIssueMonitorEligibilityClear({ ...fired, status: "in_review" })).toBeNull();
   });
 
   // Idempotence, and the falsification guard. `clearReason` is provenance — it
@@ -3205,18 +3205,18 @@ describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", 
       }),
     };
 
-    expect(buildIssueMonitorEligibilityPatch(alreadyCleared)).toEqual({});
+    expect(buildIssueMonitorEligibilityClear(alreadyCleared)).toBeNull();
 
     // And the clear this pass produces is itself a fixed point.
-    const cleared = buildIssueMonitorEligibilityPatch({ ...fired, status: "todo" });
+    const cleared = buildIssueMonitorEligibilityClear({ ...fired, status: "todo" })!.patch;
     expect(
-      buildIssueMonitorEligibilityPatch({
+      buildIssueMonitorEligibilityClear({
         ...fired,
         status: "todo",
         executionState: cleared.executionState as IssueExecutionState,
         monitorNotes: null,
       }),
-    ).toEqual({});
+    ).toBeNull();
   });
 
   // A row whose trigger survives only in the columns — no `executionState.monitor`
@@ -3227,7 +3227,7 @@ describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", 
   it("clears a legacy row whose trigger is recorded only in the columns", () => {
     expect(
       monitorOf(
-        buildIssueMonitorEligibilityPatch({
+        buildIssueMonitorEligibilityClear({
           status: "todo",
           assigneeAgentId: coderAgentId,
           assigneeUserId: null,
@@ -3236,7 +3236,7 @@ describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", 
           monitorNextCheckAt: null,
           monitorLastTriggeredAt: new Date("2026-08-09T13:22:20.000Z"),
           monitorAttemptCount: 4,
-        }),
+        })!.patch,
       ),
     ).toMatchObject({ status: "cleared", clearReason: "invalid_status" });
   });
@@ -3247,7 +3247,7 @@ describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", 
   it("still produces nothing for a row that never armed a monitor", () => {
     for (const status of ["todo", "blocked", "done", "cancelled", "in_progress"]) {
       expect(
-        buildIssueMonitorEligibilityPatch({
+        buildIssueMonitorEligibilityClear({
           status,
           assigneeAgentId: coderAgentId,
           assigneeUserId: null,
@@ -3256,7 +3256,7 @@ describe("buildIssueMonitorEligibilityPatch clears a FIRED monitor (PEN-6202)", 
           monitorNextCheckAt: null,
           monitorAttemptCount: 0,
         }),
-      ).toEqual({});
+      ).toBeNull();
     }
   });
 });
@@ -3306,5 +3306,115 @@ describe("dispatchWatchdogGateSignals reserves the watchdog slot on overflow (PE
 
     expect(result.dropped).toBe(0);
     expect(result.gateSignals).toEqual([...fits, watchdogToken].sort());
+  });
+});
+
+/**
+ * PEN-6571 — the audit payload travels with the patch that destroys it.
+ *
+ * These are the must-fail control for the change. Revert
+ * `buildIssueMonitorClear` to returning a bare patch and every test in this
+ * block REDs: `clear.audit` becomes `undefined`, the key assertion sees
+ * `["executionPolicy", ...]` instead of `["audit", "patch"]`, and the
+ * pre-clear read has nothing to read from.
+ *
+ * The property under test is NOT "the function returns two keys". It is that
+ * the evidence a clear destroys is returned BY THE CALL THAT DESTROYS IT, so a
+ * caller recording the clear cannot be reading a row the write has already
+ * emptied.
+ */
+describe("a monitor clear returns the evidence it destroys (PEN-6571)", () => {
+  const notes = "waiting on Blockcast/paperclip#3673 to merge";
+  const armed = () => ({
+    status: "in_progress",
+    assigneeAgentId: coderAgentId,
+    assigneeUserId: null,
+    executionPolicy: normalizeIssueExecutionPolicy({
+      stages: [],
+      monitor: { nextCheckAt: "2099-04-11T12:30:00.000Z", scheduledBy: "assignee", notes },
+    }),
+    executionState: null,
+    monitorNextCheckAt: new Date("2099-04-11T12:30:00.000Z"),
+    monitorLastTriggeredAt: new Date("2026-11-12T09:15:00.000Z"),
+    monitorAttemptCount: 7,
+    monitorNotes: notes,
+  });
+
+  it("hands back the notes in the same call that nulls them", () => {
+    const issue = armed();
+    const clear = buildIssueMonitorClear({
+      issue,
+      policy: issue.executionPolicy,
+      clearReason: "invalid_status",
+    });
+
+    // The destructive half, unchanged.
+    expect(clear.patch.monitorNotes).toBeNull();
+    expect(clear.patch.monitorNextCheckAt).toBeNull();
+    expect(clear.patch.monitorWakeRequestedAt).toBeNull();
+
+    // The preserving half, which before this change did not exist and so
+    // could not be forgotten — it simply was not there to forward.
+    expect(clear.audit).toEqual({
+      clearReason: "invalid_status",
+      notes,
+      lastTriggeredAt: "2026-11-12T09:15:00.000Z",
+      nextCheckAt: "2099-04-11T12:30:00.000Z",
+      attemptCount: 7,
+    });
+  });
+
+  it("exposes the audit payload as a named key, not as something a caller must dig out", () => {
+    const issue = armed();
+    const clear = buildIssueMonitorClear({
+      issue,
+      policy: issue.executionPolicy,
+      clearReason: "cancelled",
+    });
+
+    // Pinned deliberately. A future change that folds `audit` back into the
+    // patch, or drops it, fails here rather than silently returning a caller
+    // the thing it used to have to cast out of `patch.executionState`.
+    expect(Object.keys(clear).sort()).toEqual(["audit", "patch"]);
+  });
+
+  it("gives the eligibility clear the same guarantee, and null when nothing is cleared", () => {
+    // Nothing to clear -> null, so a caller cannot confuse "no clear happened"
+    // with "a clear whose evidence I am dropping". That distinction is the
+    // reason this returns null rather than an empty patch.
+    expect(buildIssueMonitorEligibilityClear(armed())).toBeNull();
+
+    const cleared = buildIssueMonitorEligibilityClear({ ...armed(), status: "blocked" });
+    expect(cleared).not.toBeNull();
+    expect(cleared!.patch.monitorNotes).toBeNull();
+    expect(cleared!.audit.notes).toBe(notes);
+    expect(cleared!.audit.clearReason).toBe("invalid_status");
+  });
+
+  it("reads the audit from the PRE-clear row, which is the only place it exists", () => {
+    // Feed the builder the row as it would look AFTER its own patch landed.
+    // A re-derivation from the post-write row returns nothing, which is
+    // exactly why the payload has to come back from the destroying call.
+    const issue = armed();
+    const clear = buildIssueMonitorClear({
+      issue,
+      policy: issue.executionPolicy,
+      clearReason: "invalid_status",
+    });
+    expect(clear.audit.notes).toBe(notes);
+
+    const afterWrite = {
+      ...issue,
+      executionPolicy: clear.patch.executionPolicy as IssueExecutionPolicy | null,
+      executionState: clear.patch.executionState as IssueExecutionState | null,
+      monitorNextCheckAt: null,
+      monitorNotes: null,
+    };
+    const second = buildIssueMonitorClear({
+      issue: afterWrite,
+      policy: afterWrite.executionPolicy,
+      clearReason: "invalid_status",
+    });
+    expect(second.audit.notes).toBeNull();
   });
 });

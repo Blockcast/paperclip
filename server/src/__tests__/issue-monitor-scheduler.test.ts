@@ -2540,7 +2540,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   // retired monitor's metadata is the only declared bound such a row carries,
   // `monitorAttemptCount` survives a clear so its ceiling has to survive with it
   // or a 26-attempt row is judged against the default 24, and the row's own next
-  // write (`buildIssueMonitorClearedPatch`) derives its `previous` through this
+  // write (`buildIssueMonitorClear`) derives its `previous` through this
   // same unfiltered helper. A `status !== "cleared"` filter flips this test to a
   // dispatch, and would have to move those builders in the same commit — the
   // lesson of PEN-5170, applied to the siblings that actually share this helper
