@@ -4529,9 +4529,10 @@ async function resolveManagedProjectWorkspaceCheckout(input: {
   const gitMetadataExists = await fs
     .lstat(path.resolve(cwd, ".git"))
     .then((entry) => entry.isDirectory() || entry.isFile())
-    // Only ENOENT means "absent": an indeterminate read (ESTALE, EACCES) must not reach the
-    // throw below, which latches manual_repair_required (BLO-47335 latches only on a positive).
-    .catch((error: NodeJS.ErrnoException) => error?.code !== "ENOENT");
+    // Only ENOENT/ENOTDIR mean "absent" (ENOTDIR: the managed path is a regular file, which the
+    // rm below clears). An indeterminate read (ESTALE, EACCES) must not reach the throw below,
+    // which latches manual_repair_required (BLO-47335 latches only on a positive).
+    .catch((error: NodeJS.ErrnoException) => error?.code !== "ENOENT" && error?.code !== "ENOTDIR");
   if (gitMetadataExists) {
     return { cwd, warning: null };
   }
