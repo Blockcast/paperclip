@@ -247,12 +247,20 @@ jobs:
           # exporting nothing.
           probe_solve() {
             local host="$1" budget="$2" ctx builder rc=0
-            # "Cannot measure" is not "unhealthy". Without a client this
-            # degrades to the pre-PEN-6371 behaviour (keep the preferred
+            # "Cannot measure" is not "unhealthy". Without a usable client
+            # this degrades to the pre-PEN-6371 behaviour (keep the preferred
             # ordinal) rather than silently routing every build to the
             # ClusterIP and dissolving the cache affinity above.
-            if ! command -v docker >/dev/null 2>&1; then
-              echo "::warning::docker is unavailable; cannot verify ${host} can complete a solve"
+            #
+            # PEN-6579 item 2. The probe needs buildx, not the docker CLI, so
+            # the guard tests the plugin. `command -v docker` scored a CLI
+            # without the plugin as "can measure": `buildx create` below then
+            # failed, rc=1 came back as "unhealthy", and EVERY build routed to
+            # the ClusterIP -- the exact silent dissolution the paragraph above
+            # promises not to do. Unreachable on today's arc-paperclip-buildkit
+            # image (buildx v0.36.1); this makes the code do what it says.
+            if ! docker buildx version >/dev/null 2>&1; then
+              echo "::warning::docker buildx is unavailable; cannot verify ${host} can complete a solve"
               return 0
             fi
             ctx="$(mktemp -d)"
@@ -269,26 +277,51 @@ jobs:
           }
 
           preferred="buildkit-amd64-${PREFERRED_ORDINAL}.buildkit-amd64-headless.ci.svc.cluster.local"
+          sibling="buildkit-amd64-$((1 - PREFERRED_ORDINAL)).buildkit-amd64-headless.ci.svc.cluster.local"
           fallback="buildkit-amd64.ci.svc.cluster.local"
           host="${preferred}"
           if ! probe_tcp "${preferred}" 5; then
-            echo "::warning::Preferred BuildKit ${preferred} does not accept connections; using the healthy service endpoint"
-            host="${fallback}"
+            echo "::warning::Preferred BuildKit ${preferred} does not accept connections"
+            host=""
           elif ! probe_solve "${preferred}" 90; then
-            echo "::warning::Preferred BuildKit ${preferred} accepts connections but cannot complete a solve; using the healthy service endpoint"
-            host="${fallback}"
+            echo "::warning::Preferred BuildKit ${preferred} accepts connections but cannot complete a solve"
+            host=""
           fi
 
-          if [ "${host}" = "${fallback}" ]; then
-            # The ClusterIP is the last endpoint there is -- it balances over
-            # whichever pods the Service reports Ready, so there is nothing
-            # further to demote to. Keep the pre-existing hard gate on
-            # reachability, and report an unserviceable fallback as a warning
-            # rather than failing here: buildx's own error on the real build is
-            # strictly more informative than anything this step could print.
-            probe_tcp "${fallback}" 10
-            probe_solve "${fallback}" 90 \
-              || echo "::warning::Fallback BuildKit ${fallback} accepts connections but did not complete a probe solve; continuing"
+          if [ -z "${host}" ]; then
+            # PEN-6579 item 1. Demote to the OTHER ordinal before the ClusterIP.
+            #
+            # The ClusterIP balances over whichever pods the Service reports
+            # Ready, and the pod just rejected above can stay Ready for ~15 min
+            # (livenessProbe periodSeconds 60 x failureThreshold 15), so
+            # demoting straight to it is a coin flip that re-selects the daemon
+            # this step has just measured as sick. The sibling ordinal is the
+            # good half of that coin flip made deterministic, and it is probed
+            # on a solve before being used -- so it is no worse than the
+            # ClusterIP for cache locality (the ClusterIP would have landed on
+            # one of these two anyway) and strictly better for health.
+            #
+            # This also applies when workflow_dispatch pinned an ordinal: the
+            # operator cannot have the one they asked for, and the question is
+            # only what to use instead. The ClusterIP already deviates from
+            # that choice half the time, silently; this deviates once, visibly,
+            # and only to an endpoint it has verified.
+            if probe_tcp "${sibling}" 5 && probe_solve "${sibling}" 90; then
+              echo "::warning::Using BuildKit ${sibling}; its cache is cold for this build class"
+              host="${sibling}"
+            else
+              echo "::warning::Neither ordinal can complete a solve; using the service endpoint"
+              host="${fallback}"
+              # The ClusterIP is the last endpoint there is, so there is
+              # nothing further to demote to. Keep the pre-existing hard gate
+              # on reachability, and report an unserviceable fallback as a
+              # warning rather than failing here: buildx's own error on the
+              # real build is strictly more informative than anything this
+              # step could print.
+              probe_tcp "${fallback}" 10
+              probe_solve "${fallback}" 90 \
+                || echo "::warning::Fallback BuildKit ${fallback} accepts connections but did not complete a probe solve; continuing"
+            fi
           fi
 
           echo "endpoint=tcp://${host}:1234" >> "$GITHUB_OUTPUT"
