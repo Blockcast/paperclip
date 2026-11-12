@@ -1,13 +1,57 @@
 # Code owners for Blockcast/paperclip.
 #
+# ---------------------------------------------------------------------------
+# WHAT THIS FILE DOES, AND WHAT IT DOES NOT DO. Read this before editing.
+# ---------------------------------------------------------------------------
+#
+# GitHub does NOT enforce CODEOWNERS on this repository. `master` requires zero
+# approving reviews, so `require_code_owner_reviews` has nothing to attach to
+# and no entry below is a merge gate. What an entry buys is an auto-requested
+# review from the named owner, which the landing routine then holds the PR on
+# rather than enqueuing it. That is a hold plus a named reviewer — not
+# guaranteed scrutiny, and not a blocking check. Tracking: PEN-5119.
+#
+# Measure that claim on a PULL REQUEST, not on the branch-protection routes.
+# Measured 2026-11-12: `reviewDecision` is null on the 8 most-recently-updated
+# open PRs here, and REVIEW_REQUIRED on 8 of 8 in `penstock-llm-proxy-core`,
+# where the requirement IS live. The two protection routes readable without
+# `administration` — `repos/:o/:r/branches/:b` and
+# `repos/:o/:r/rules/branches/:b` — report NO review requirement for BOTH of
+# those repositories, so they cannot tell the two states apart. Use
+# `reviewDecision`.
+#
+# ---------------------------------------------------------------------------
+# VERIFYING AN EDIT, AND THE ONE THING THE CHECK CANNOT SEE.
+# ---------------------------------------------------------------------------
+#
 # GitHub silently ignores any entry naming an account without write access to
-# this repository. Such a rule parses fine but enforces nothing — no auto-requested
-# review, no code-owner gate. Verify after editing:
+# this repository. Such a rule parses fine and enforces nothing — no
+# auto-requested review, no hold. Catch that with:
 #
 #   gh api "repos/Blockcast/paperclip/codeowners/errors?ref=master"   # expect {"errors":[]}
 #
-# Replace @kkroo if a different maintainer or team should own a surface. Prefer an
-# org team over a single human once one exists.
+# That is ALL this check answers: every owner RESOLVES and has write access. It
+# says nothing about whether that owner ever reviews, so `{"errors":[]}` cannot
+# tell a working owner from an inert one and is not evidence a rule does
+# anything. Measured 2026-11-12: `penstock-llm-proxy-core` owns `*` with
+# `@Blockcast/onprem-k8s-ally-reviewer @kkroo` and returns `{"errors":[]}`,
+# while the team arm satisfies nothing there — 12 of 12 approvals by that
+# identity left PRs at REVIEW_REQUIRED and @kkroo carried 100% of the
+# satisfactions (PEN-5119 rev 15).
+#
+# ---------------------------------------------------------------------------
+# CHOOSING AN OWNER.
+# ---------------------------------------------------------------------------
+#
+# Replace @kkroo if a different maintainer should own a surface. Do NOT
+# substitute an org team for a human on the assumption that a team is
+# equivalent — that is the proxy-core configuration above, and a team can
+# satisfy the check above while contributing zero reviews. Before naming an
+# additional owner, VERIFY that the account moves `reviewDecision` to APPROVED
+# on THIS repository; the `errors` check above cannot establish it, and a team
+# is not an account that reviews. Keep co-owners on ONE line per rule:
+# CODEOWNERS is last-match-wins, so a second line for the same pattern REPLACES
+# the first instead of adding to it.
 
 .github/** @kkroo
 scripts/release*.sh @kkroo
@@ -44,11 +88,8 @@ pnpm-workspace.yaml @kkroo
 # Listed by exact name rather than a glob: a config under a NEW name is not
 # covered — add a line here when you add one.
 #
-# What this buys, and what it does not: GitHub does not enforce CODEOWNERS on
-# this repository (no `require_code_owner_review`), so these entries are not a
-# merge gate. They auto-request @kkroo and the landing routine then holds the PR
-# on that outstanding request rather than enqueuing it. That is a hold plus a
-# named reviewer — not guaranteed scrutiny, and not a blocking check.
+# What these entries buy is what the header at the top of this file describes:
+# an auto-requested review plus a landing hold, not a merge gate.
 .gitleaks.toml @kkroo
 .gitleaks-staging.toml @kkroo
 .gitleaksignore @kkroo
