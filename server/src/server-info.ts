@@ -127,20 +127,23 @@ function readGitInfo(
     if (!buildCommit) {
       return { available: false, unavailableReason: "git_unavailable" };
     }
-
-    return {
-      available: true,
-      fullSha: buildCommit,
-      shortSha: buildCommit.slice(0, 7),
-      branchName: null,
-      subject: "Source build",
-      committedAt: null,
-      localChanges: {
-        available: false,
-        unavailableReason: "git_status_unavailable",
-      },
-    };
+    return buildCommitGitInfo(buildCommit);
   }
+}
+
+function buildCommitGitInfo(buildCommit: string): ServerGitInfo {
+  return {
+    available: true,
+    fullSha: buildCommit,
+    shortSha: buildCommit.slice(0, 7),
+    branchName: null,
+    subject: "Source build",
+    committedAt: null,
+    localChanges: {
+      available: false,
+      unavailableReason: "git_status_unavailable",
+    },
+  };
 }
 
 export function createServerInfoSnapshot(
@@ -171,6 +174,7 @@ export function createServerInfoSnapshot(
 const GIT_INFO_CACHE_TTL_MS = 3000;
 const processStartedAt = new Date().toISOString();
 let gitInfoCache: { value: ServerGitInfo; expiresAt: number } | null = null;
+let buildCommitInfo: ServerGitInfo | null | undefined;
 
 export function getServerInfoSnapshot(
   opts: {
@@ -182,6 +186,15 @@ export function getServerInfoSnapshot(
   } = {},
 ): ServerInfoSnapshot {
   const now = opts.now ?? Date.now();
+  // A stamped image ships no `.git` (see Dockerfile), so `git show` can only
+  // fail there and the build commit is the answer for the process lifetime.
+  // Skip the spawn entirely: execFileSync on /health blocked the worker event
+  // loop for up to 4.4 s per call (BLO-56438).
+  if (buildCommitInfo === undefined) {
+    const buildCommit = parseBuildCommit((opts.buildCommitCommand ?? readBuildCommit)());
+    buildCommitInfo = buildCommit ? buildCommitGitInfo(buildCommit) : null;
+  }
+  if (buildCommitInfo) return { processStartedAt, git: buildCommitInfo };
   if (!gitInfoCache || now >= gitInfoCache.expiresAt) {
     gitInfoCache = {
       value: readGitInfo(
@@ -198,4 +211,5 @@ export function getServerInfoSnapshot(
 
 export function resetServerInfoCacheForTests(): void {
   gitInfoCache = null;
+  buildCommitInfo = undefined;
 }
