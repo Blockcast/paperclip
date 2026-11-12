@@ -4415,6 +4415,8 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
   // BLO-55927: runs read the mode from `executionWorkspaceSettings.mode`, so a preference-only
   // PATCH must carry into it, or an inherited `shared_workspace` mode survives the unbind.
   it("BLO-55927: a preference-only PATCH to isolated_workspace updates executionWorkspaceSettings.mode", async () => {
+    // update() drops workspace fields entirely while the flag is off.
+    await instanceSettingsService(db).updateExperimental({ enableIsolatedWorkspaces: true });
     const companyId = randomUUID();
     const issueId = randomUUID();
     await db.insert(companies).values({
