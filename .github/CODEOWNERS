@@ -12,13 +12,25 @@
 # guaranteed scrutiny, and not a blocking check. Tracking: PEN-5119.
 #
 # Measure that claim on a PULL REQUEST, not on the branch-protection routes.
-# Measured 2026-11-12: `reviewDecision` is null on the 8 most-recently-updated
-# open PRs here, and REVIEW_REQUIRED on 8 of 8 in `penstock-llm-proxy-core`,
+# The discriminating token is the PRESENCE of REVIEW_REQUIRED over a census of
+# open PRs BASED ON the protected branch — never the ABSENCE of a value over a
+# recent-activity sample. On a repository with no requirement `reviewDecision`
+# still reads APPROVED as soon as any write-access approval lands, so a sample
+# that happens to catch approved PRs comes back populated, confident and
+# uninformative; and a PR based on a feature branch reports on THAT base, not
+# on the protected one. Measured 2026-11-12, full censuses with completeness
+# asserted: of 70 open PRs based on `master` here, REVIEW_REQUIRED 0 (APPROVED
+# 8, empty 62), against 145 of 146 based on `main` in `penstock-llm-proxy-core`,
 # where the requirement IS live. The two protection routes readable without
 # `administration` — `repos/:o/:r/branches/:b` and
 # `repos/:o/:r/rules/branches/:b` — report NO review requirement for BOTH of
-# those repositories, so they cannot tell the two states apart. Use
-# `reviewDecision`.
+# those repositories, so they cannot tell the two states apart.
+#
+# Do not carry a `reviewDecision` reading across repositories: its mapping to
+# configuration is repo-dependent. On `Blockcast/onprem-k8s`, whose ruleset sets
+# `required_approving_review_count: 0`, the field reads empty whether or not an
+# approval exists at the head (measured 2026-11-12). Run the census on the
+# repository you are asking about, with a control repository in the same window.
 #
 # ---------------------------------------------------------------------------
 # VERIFYING AN EDIT, AND THE ONE THING THE CHECK CANNOT SEE.
@@ -35,8 +47,9 @@
 # tell a working owner from an inert one and is not evidence a rule does
 # anything. Measured 2026-11-12: `penstock-llm-proxy-core` owns `*` with
 # `@Blockcast/onprem-k8s-ally-reviewer @kkroo` and returns `{"errors":[]}`,
-# while the team arm satisfies nothing there — 12 of 12 approvals by that
-# identity left PRs at REVIEW_REQUIRED and @kkroo carried 100% of the
+# while the team arm satisfies nothing there: measured 2026-11-07, 12 of 12
+# approvals by `allyblockcast` — a member of that owning team — left
+# `kkroo`-authored PRs at REVIEW_REQUIRED, and @kkroo carried 100% of the
 # satisfactions (PEN-5119 rev 15).
 #
 # ---------------------------------------------------------------------------
@@ -46,12 +59,26 @@
 # Replace @kkroo if a different maintainer should own a surface. Do NOT
 # substitute an org team for a human on the assumption that a team is
 # equivalent — that is the proxy-core configuration above, and a team can
-# satisfy the check above while contributing zero reviews. Before naming an
-# additional owner, VERIFY that the account moves `reviewDecision` to APPROVED
-# on THIS repository; the `errors` check above cannot establish it, and a team
-# is not an account that reviews. Keep co-owners on ONE line per rule:
-# CODEOWNERS is last-match-wins, so a second line for the same pattern REPLACES
-# the first instead of adding to it.
+# satisfy the `errors` check while contributing zero reviews.
+#
+# There is NO single-query test here of whether a candidate owner reviews, and
+# this file is the wrong place to invent one. `reviewDecision` cannot do it:
+# with zero required reviews ANY write-access approval flips it to APPROVED, so
+# an inert owner passes — the same shape as the `errors` check two sections up.
+# A `reviewed-by:` search fails the other way round: it counts GitHub review
+# OBJECTS, and this repository's working owner stopped producing those on
+# ~2026-10-29 and signs off as a PR COMMENT instead (`code-owner sign-off:
+# <40-hex>`; 47 PRs carried one between 2026-10-23 and 2026-11-11, 43 of them
+# merged — PEN-5119 rev 19). A query that counts only review objects returns
+# zero for the one owner we have measured to work.
+#
+# So judge a candidate on EVIDENCE, not on a check: a record of code-owner acts
+# on THIS repository, in EITHER channel — submitted reviews or sign-off
+# comments at the head — and the penstock measurement above as the thing to
+# reason from. Say in the PR which evidence you looked at.
+#
+# Keep co-owners on ONE line per rule: CODEOWNERS is last-match-wins, so a
+# second line for the same pattern REPLACES the first instead of adding to it.
 
 .github/** @kkroo
 scripts/release*.sh @kkroo
