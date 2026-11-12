@@ -2176,6 +2176,13 @@ describe("the code-owner hold reason is derived per repo, and fails to claiming 
     assert.match(trafficcontrol, /GitHub requires a code-owner review on `master`/);
     assert.doesNotMatch(trafficcontrol, /would not block/);
     assert.match(networkOperatorPortal, /No branch rule on `main` requires a code-owner review/);
+    // ⛔ Scoped to the code-owner bit, and it must stay scoped. This function
+    // reads ONE requirement; an approval count or a required check can still
+    // block, and `Network-Operator-Portal` — the repo this arm is modelled on
+    // — carries a REQUIRED_STATUS_CHECKS rule. A bare "would not block this
+    // merge" overclaims in the mirror direction of the constant removed here.
+    assert.match(networkOperatorPortal, /would not block this merge for a missing owner approval/);
+    assert.doesNotMatch(networkOperatorPortal, /would not block this merge —/);
     // And neither repo gets the constant this row removed.
     for (const sentence of [trafficcontrol, networkOperatorPortal]) {
       assert.doesNotMatch(sentence, /does not enforce CODEOWNERS on this repository/);
