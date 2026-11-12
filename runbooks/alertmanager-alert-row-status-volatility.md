@@ -1,7 +1,7 @@
-# An alert row's `status` disagrees between two agents, or its armed monitor vanished
+# An alert row's `status` disagrees between two agents, or the monitor / park you left on it vanished
 
-Source: `packages/plugins/paperclip-plugin-alertmanager/src/webhook-handler.ts` (`handleResolved`, `decideRefire`, `ensureCancelWithheldComment`), `server/src/services/heartbeat.ts` (`reconcileUndeliverableIssueMonitors`), `server/src/services/issue-execution-policy.ts` (`buildIssueMonitorEligibilityPatch`, `buildClearedMonitorState`)
-Trigger: two agents report contradictory `status` for the same alert-backed issue; or an alert row you armed a monitor on produced no wake and now reads `monitorNextCheckAt: null` with `monitorAttemptCount` unmoved.
+Source: `packages/plugins/paperclip-plugin-alertmanager/src/webhook-handler.ts` (`handleResolved`, `decideRefire`, `ensureCancelWithheldComment`), `server/src/services/heartbeat.ts` (`reconcileUndeliverableIssueMonitors`), `server/src/services/issue-execution-policy.ts` (`buildIssueMonitorEligibilityPatch`, `buildClearedMonitorState`), `server/src/services/issue-park-expiry.ts` (`issueParkOwesReleaseWake`, `ISSUE_PARK_EXPIRY_WAKE_STATUSES`)
+Trigger: two agents report contradictory `status` for the same alert-backed issue; or an alert row you armed a monitor on produced no wake and now reads `monitorNextCheckAt: null` with `monitorAttemptCount` unmoved; or an alert row you parked produced no wake at its due time and still reads `parkedWakeFiredAt: null`.
 Owner: Platform / DevOps (PEN-5343)
 
 ## The hazard in one line
@@ -143,6 +143,113 @@ alert rows reads it:
 Re-arming after a destroyed wake is a normal recovery; note in the new
 monitor's `notes` that the previous one was lost, so the next reader does not
 count the gap as idleness.
+
+## Rule 4 — a `parkedUntil` on an alert row is not attendance either, and unlike a monitor nothing hands it back
+
+A park is the *other* attendance mechanism an agent can leave on a row, and the
+cancel destroys it by the same route: `issueParkOwesReleaseWake`
+(`server/src/services/issue-park-expiry.ts`) opens with
+`if (!isIssueParkExpiryWakeStatus(issue.status)) return false`, and
+`ISSUE_PARK_EXPIRY_WAKE_STATUSES` is `["backlog", "todo", "in_progress",
+"in_review"]`. `cancelled` and `done` are both outside it. So from the instant
+the plugin cancels, the park owes no wake — whatever its due time says.
+
+**The park is the dominant attendance mechanism on exactly these rows.** The
+plugin's own escalation ladder records it: of the six open alertmanager-origin
+rows measured 2026-11-07, five were attended *solely* by a park
+(`attendance-read.ts`, `SUMMARY_CAVEATS`).
+
+### Why this is worse than the monitor case, not the same
+
+Rule 2's loss is silent but it leaves forensics and, since PEN-5346, a carrier:
+the monitor is **cleared**, stamped `clearReason: "cancelled"`, and handed to a
+recovery row. The park gets none of those three. Nothing clears it, nothing
+stamps it, nothing hands it back — and because nothing clears it, **all four
+park fields survive intact**. `parkedUntil`, `parkedReason`, `parkedAt` and
+`parkedByAgentId` on a dead park are byte-identical to a healthy one.
+
+A cleared monitor at least reads as cleared. A dead park reads as attended on
+every surface there is.
+
+**PEN-4729 is the whole asymmetry on one row, from one cancel.** Cancelled
+2026-10-26T01:26:13Z, 7 h 34 m *before* its park was due:
+
+- its **monitor** was cleared `clearReason: "cancelled"`, stamped
+  `recoveryEmittedAt: 2026-11-11T22:07:39Z`, `recoveryDisposition:
+  "recovery_issue"`, and carried to PEN-6538 — which was worked and closed;
+- its **park** (`parkedUntil: 2026-10-26T09:00:00Z`, `parkedWakeFiredAt:
+  null`) is still sitting there untouched, **16.9 days overdue**, and no sweep
+  has ever looked at it.
+
+Same row, same cancel, same instant. One obligation recovered, one dropped.
+
+### The wake you eventually get is coupled to the alert, not to your due time
+
+A lapsed park is not discarded — it is suspended. The moment the plugin
+reopens the row to `todo`, the status conjunct passes and the long-expired park
+fires within seconds. On PEN-4881 that was **15 s after the reopen and 12 d
+21 h after the due time**.
+
+So the delay is bounded by the alert's own re-fire schedule and by nothing
+else, and it is **unbounded in the one case that matters**: a subject that is
+genuinely broken but has stopped being noisy produces no re-fire, so the park
+never fires at all. PEN-4881 was parked explicitly to outlast a node that had
+gone quiet *without* recovering — the park was killed by the quiet it was set
+to see through.
+
+### Measured incidence (2026-11-12, all 94 alertmanager-origin rows in PEN)
+
+| | |
+|---|---|
+| rows carrying a park (`parkedUntil` non-null) | 22 |
+| of those, in a terminal status — park cannot fire | 13 |
+| of those, lapsed, agent-assigned, and never fired for this park | **6** |
+| oldest | PEN-4729, **16.9 days** overdue |
+
+The 6 apply every conjunct of `issueParkOwesReleaseWake`, so they are blocked
+by the status term alone. PEN-5719 is the discriminating control: lapsed and
+never fired, but `todo`, so it will fire — the count separates "dead" from
+"owed for some other reason" rather than counting all lapsed parks.
+
+### To tell a dead park from a healthy one
+
+There is no nested state to read, as there is for a monitor in Rule 3 — the
+columns are all you get, and they look fine. The test is the conjunction:
+
+```
+status NOT IN (backlog, todo, in_progress, in_review)
+  AND parkedUntil IS NOT NULL
+  AND assigneeAgentId IS NOT NULL AND assigneeUserId IS NULL
+  AND (parkedWakeFiredAt IS NULL OR parkedWakeFiredAt < parkedAt)
+```
+
+`parkedWakeFiredAt` is per-PARK, not per-row, which is why the comparison is
+against `parkedAt` and not a null check alone.
+
+### So: do not use a park as the only observer on an alert row
+
+Same remedy as Rule 2, and for the same reason. If the follow-up outlives the
+alert, give it its own issue and park *that*; link the alert row to it. A park
+is safe on an alert row only for something you are also holding open some other
+way — a live `blockedBy` edge, a pending card, or a row of your own.
+
+If you park one anyway, say so in the `parkedReason`, because the next reader
+cannot tell from the fields.
+
+### What is NOT yet built
+
+**There is no park equivalent of PEN-5346.** No sweep selects a parked
+terminal row, nothing stamps the obligation as owed, and no carrier is emitted.
+The six rows above are owed wakes that nothing will ever deliver.
+
+One note for whoever builds it: the park needs no PEN-5343-equivalent first.
+The due time a monitor loses on clear is exactly what PEN-5343 had to start
+recording — but `parkedUntil` *survives the cancel*, so the park's own due time
+and its `parkedReason` are already persisted and already readable. What is
+missing is only the sweep and a place to stamp "handed off", so that it is
+re-drivable and does not re-emit.
+
+Carried on PEN-6556.
 
 ## What this runbook deliberately does not do
 
