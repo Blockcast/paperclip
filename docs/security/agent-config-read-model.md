@@ -1054,7 +1054,7 @@ Three rules, each of which has already caught someone:
    snapshots the whole row. Identify the partial population by its **shape** —
    `changedKeys` is the row's own coverage declaration — and never by `source`.
    `source` is free-form caller text, so it cannot key a filter: the retry path
-   hardcodes `auto-retry-on-completion` (`agent-image-bump.ts:264`), but
+   hardcodes `auto-retry-on-completion` (`server/src/services/agent-image-bump.ts:264`), but
    `POST /admin/agents/bump-agent-image` takes the value from the request body
    (`z.string().min(1).max(120).prefault("admin:manual")`) and *suffixes* it with
    `@<buildSha>` when one is supplied, so even an exact match on a label you have
