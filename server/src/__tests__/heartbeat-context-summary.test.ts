@@ -4984,9 +4984,11 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     expect(markdown).toContain("not the command to run");
   });
 
-  // Reachability is the entire deliverable: a scoped wake that renders a park note and no
-  // PR context is exactly the run this rule has to reach, and it is the one a per-agent
-  // file or a `prReview` branch would miss.
+  // Reachability is the entire deliverable: a scoped wake renders neither the park note
+  // nor any PR context -- `buildPaperclipTaskMarkdown` has no park slot, measured
+  // 2026-11-11 -- so the run that most needs this rule is exactly the one a per-agent
+  // file or a `prReview` branch would miss. It has to be in this markdown or it
+  // reaches nobody.
   it("renders the fallback rule on a bare wake with no PR context, and on the containment-only path", () => {
     const scoped = buildPaperclipTaskMarkdown({
       issue,

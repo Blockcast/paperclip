@@ -14738,7 +14738,8 @@ export function buildPaperclipTaskMarkdown(input: {
     // `Blockcast/penstock-llm-proxy-core#3110` returns 5 owners (PEN-5455 owning) and
     // `Blockcast/paperclip#3110` returns 4 (PEN-4932 owning); both tracked, disjoint
     // sets, each `ownerListComplete: true` with `withheldForAuthorizationCount: 0`.
-    // Nothing a caller can read distinguishes the wrong one from the right one. Of 10
+    // Nothing in the response distinguishes it, short of checking the echoed repo/number
+    // against the PR you meant. Of 10
     // PR numbers probed across those two repos in a band where both are active, 7 are
     // tracked in both -- that band was chosen for overlap and is not a fleet-wide
     // collision rate, but the collision is ordinary rather than contrived.
