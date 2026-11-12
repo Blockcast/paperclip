@@ -805,4 +805,105 @@ describe("agent routes adapter validation", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     expect(res.body.adapterType).toBe("codex_local");
   });
+  /**
+   * PEN-6586. `adapterConfig.claudeCodeVersion` is interpolated into the agent
+   * Job's shell command, so the vendored claude_k8s adapter's
+   * `resolveClaudeCodeVersion` throws on anything outside its grammar. It was
+   * called from exactly one place — while BUILDING THE JOB MANIFEST — and from
+   * no write path, so a malformed value was accepted at 200 and surfaced later
+   * as the agent simply failing to dispatch.
+   *
+   * That is the PEN-4447 shape with one extra turn of the screw: an agent may
+   * write this key on itself, and a bricked agent cannot run, so the lock lands
+   * on the only principal positioned to notice it.
+   */
+  function claudeK8sAgentRow(adapterConfig: Record<string, unknown>) {
+    return {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      name: "Pinned",
+      urlKey: "pinned",
+      role: "engineer",
+      title: null,
+      icon: null,
+      status: "running",
+      reportsTo: null,
+      capabilities: null,
+      adapterType: "claude_k8s",
+      adapterConfig,
+      runtimeConfig: {},
+      budgetMonthlyCents: 0,
+      spentMonthlyCents: 0,
+      pauseReason: null,
+      pausedAt: null,
+      permissions: { canCreateAgents: false },
+      lastHeartbeatAt: null,
+      metadata: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
+  async function patchAdapterConfig(adapterConfig: Record<string, unknown>) {
+    const app = await createApp();
+    return requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .send({ adapterConfig }),
+    );
+  }
+
+  it("refuses a malformed claudeCodeVersion at the write (PEN-6586)", async () => {
+    mockAgentService.getById.mockResolvedValue(claudeK8sAgentRow({ model: "claude-opus-5" }));
+
+    const res = await patchAdapterConfig({ claudeCodeVersion: "latest" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+    expect(JSON.stringify(res.body)).toContain("claudeCodeVersion");
+    // The refusal has to land BEFORE persistence, or the brick is stored and
+    // the 4xx is cosmetic.
+    expect(mockAgentService.update).not.toHaveBeenCalled();
+  });
+
+  it("accepts an exact claudeCodeVersion, so the guard does not cost the pin (PEN-6586)", async () => {
+    mockAgentService.getById.mockResolvedValue(claudeK8sAgentRow({ model: "claude-opus-5" }));
+
+    const res = await patchAdapterConfig({ claudeCodeVersion: "2.1.292" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    expect(mockAgentService.update).toHaveBeenCalled();
+  });
+
+  it("accepts the image sentinel and a cleared pin (PEN-6586)", async () => {
+    mockAgentService.getById.mockResolvedValue(claudeK8sAgentRow({ model: "claude-opus-5" }));
+    expect((await patchAdapterConfig({ claudeCodeVersion: "image" })).status).toBe(200);
+    expect((await patchAdapterConfig({ claudeCodeVersion: null })).status).toBe(200);
+  });
+
+  it("leaves an agent that already stores a malformed version repairable (PEN-6586)", async () => {
+    // The PATCH path validates the EFFECTIVE config — stored shallow-merged
+    // with the request — so a stored bad value rides into every later write.
+    // Refusing on it would wedge the agent out of unrelated repairs AND out of
+    // the repair to this very key, which is the opposite of the intent: the
+    // agent is already undispatchable, and the guard must keep it fixable.
+    mockAgentService.getById.mockResolvedValue(
+      claudeK8sAgentRow({ claudeCodeVersion: "latest", model: "claude-opus-5" }),
+    );
+
+    const unrelated = await patchAdapterConfig({ nodeSelector: { workload: "paperclip" } });
+    expect(unrelated.status, JSON.stringify(unrelated.body)).toBe(200);
+
+    const repair = await patchAdapterConfig({ claudeCodeVersion: "2.1.292" });
+    expect(repair.status, JSON.stringify(repair.body)).toBe(200);
+  });
+
+  it("refuses a change from one malformed version to another (PEN-6586)", async () => {
+    mockAgentService.getById.mockResolvedValue(
+      claudeK8sAgentRow({ claudeCodeVersion: "latest", model: "claude-opus-5" }),
+    );
+
+    const res = await patchAdapterConfig({ claudeCodeVersion: "^2.1.0" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(422);
+  });
 });
