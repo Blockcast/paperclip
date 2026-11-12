@@ -350,8 +350,9 @@ describe("PEN-2918 (D) — acceptance, against real Postgres", () => {
       "attended_monitor", "attended_blocker", "attended_park",
       "unattended_rung", "unattended_cover", "held_alert_clear",
     ]) expect(comment).toContain(token);
-    // The ordering property is the one that makes `attended_park` a measure
-    // rather than a reshuffle, so it is recorded where the counts are read.
+    // The ordering property is what stops `attended_park` absorbing either
+    // older attended_* bucket, so it is recorded where the counts are read.
+    // It does absorb some `held_alert_clear`; the column comment says so too.
     expect(comment).toContain("evaluated LAST");
   });
 });

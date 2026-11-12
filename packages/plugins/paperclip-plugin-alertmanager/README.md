@@ -272,8 +272,8 @@ withholding and the PEN-4337 monitor deferral are all unchanged.
 | `attended_monitor` | the owner has armed a monitor (PEN-4337) | no |
 | `attended_blocker` | an unresolved `blockedBy` edge (BLO-40673) | no |
 | `attended_park` | a live deliberate park, inside the deferral bound (PEN-6486) | no |
-| `unattended_rung` | neither held; a rung advanced | yes |
-| `unattended_cover` | neither held; the agent chain was exhausted | no — the `[user-cover]` assignment is the notification |
+| `unattended_rung` | none held; a rung advanced | yes |
+| `unattended_cover` | none held; the agent chain was exhausted | no — the `[user-cover]` assignment is the notification |
 | `held_alert_clear` | Alertmanager says the alert is not firing (BLO-40739) | no |
 
 `wake_outcome` is `enqueued`, `refused`, `declined`, or `not_attempted`.
@@ -394,8 +394,37 @@ notification, and nothing is obliged to poll it.
 > it on the table and on the `disposition` column. **The generalisation worth
 > keeping: a `--` header comment in an applied plugin migration is write-once
 > and has no successor channel, so put any falsifiable claim in `COMMENT ON`,
-> which does.** Three corrections on one table have now been needed; all three
-> were claims about behaviour written into a carrier that cannot be edited.
+> which does.**
+>
+> ⚠️ **`012` is now a known-stale carrier too, and it is the one that
+> qualifies the generalisation above (PEN-6486).** Its `COMMENT ON COLUMN
+> ...disposition` claims `attended_park` is written *"if and only if the ladder
+> would otherwise have ADVANCED A RUNG"* and that its count is therefore *"a
+> direct before/after measure rather than a reshuffle between buckets"*. The
+> ordering half is true and the rest is false: the park deferral returns ahead
+> of the Alertmanager liveness read, so `attended_park` absorbs some
+> `held_alert_clear`. `migrations/013_attended_park_absorbs_held_alert_clear.sql`
+> supersedes it on the column, and deliberately leaves the `012` table comment
+> alone because that one is accurate.
+>
+> **Four corrections on one table have now been needed, and the fourth landed
+> in a `COMMENT ON` rather than in a frozen header** — so a correctable channel
+> is what makes a correction cheap, and it is not what makes a claim true. The
+> sharper rule, which `012` needed and did not have: a claim about what a
+> determination MEASURES is a claim about every branch that can reach it, so
+> enumerate the branches before writing it down. The branch that falsified
+> `012` is the `return` a few lines above the one its comment describes.
+>
+> ⚠️ **Authoring constraint for the next migration in this directory: do not
+> put an APOSTROPHE in a `--` header comment.** `stripSqlForKeywordScan` in
+> `server/src/services/plugin-database.ts` strips single-quoted STRING LITERALS
+> before it strips `--` COMMENTS, so a header apostrophe is parsed as a SQL
+> quote. An ODD number across the header shifts the quote parity, swallows the
+> real statement, and `normaliseSql` returns the empty string — at which point
+> the host refuses the migration at worker startup for every company. Every
+> applied file in this directory happens to carry an EVEN count, so the
+> landmine has never gone off and nothing else in the repo warns of it; the
+> first draft of `013` carried three and was refused.
 
 ### Reading the record (PEN-2918 (D))
 
