@@ -4412,6 +4412,44 @@ describeEmbeddedPostgres("issueService.create workspace inheritance", () => {
     expect(escalation.executionWorkspacePreference).toBeNull();
   });
 
+  // BLO-55927: runs read the mode from `executionWorkspaceSettings.mode`, so a preference-only
+  // PATCH must carry into it, or an inherited `shared_workspace` mode survives the unbind.
+  it("BLO-55927: a preference-only PATCH to isolated_workspace updates executionWorkspaceSettings.mode", async () => {
+    const companyId = randomUUID();
+    const issueId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      defaultResponsibleUserId: "responsible-user",
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Inherited a shared workspace",
+      status: "todo",
+      priority: "medium",
+      executionWorkspacePreference: "reuse_existing",
+      executionWorkspaceSettings: { mode: "shared_workspace", workspaceRuntime: { keep: true } },
+    });
+
+    const updated = await svc.update(issueId, {
+      executionWorkspaceId: null,
+      executionWorkspacePreference: "isolated_workspace",
+    });
+
+    expect(updated?.executionWorkspacePreference).toBe("isolated_workspace");
+    expect(updated?.executionWorkspaceSettings).toEqual({
+      mode: "isolated_workspace",
+      workspaceRuntime: { keep: true },
+    });
+
+    // reuse_existing is not a mode; the stored mode is left alone.
+    const reused = await svc.update(issueId, { executionWorkspacePreference: "reuse_existing" });
+    expect((reused?.executionWorkspaceSettings as { mode?: string } | null)?.mode).toBe("isolated_workspace");
+  });
+
   // Ally review (PR #811): archival is the only exclusion, so an archived led project
   // must not be inferred even though it is the agent's sole lead.
   it("BLO-18760: excludes archived led projects from inference", async () => {
