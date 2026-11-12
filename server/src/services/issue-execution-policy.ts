@@ -1498,11 +1498,39 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
  * hide — it is reachable by every reader of the row, named identically to the
  * live field, and no verb could write to it. `buildClearedMonitorState` now
  * keeps it only for the one clear reason with a deferred consumer
- * (`clearedMonitorKeepsNotes`). What makes nulling the column lossless is the
- * `issue.monitor_cleared` activity entry, which records `notes` read from the
- * pre-clear row on every clear path.
+ * (`clearedMonitorKeepsNotes`).
  *
- * Applied by every clear site so a future branch cannot forget one.
+ * PEN-6571: this used to continue "what makes nulling the column lossless is
+ * the `issue.monitor_cleared` activity entry, which records `notes` read from
+ * the pre-clear row on every clear path". That was false, and it was false as a
+ * PERMISSION rather than as a description — it told the next author that
+ * nulling the column was lossless, and PEN-5902 spent it once to justify
+ * exactly that. Measured over this tree 2026-11-12, 16 clear-producing call
+ * sites: 5 emitted no activity row at all, 3 emitted an `issue.updated` row
+ * carrying no monitor payload, and the 8 that did report the clear used FIVE
+ * different action names, only one of which is `issue.monitor_cleared`.
+ *
+ * The line that used to close this block — "applied by every clear site so a
+ * future branch cannot forget one" — was true, and true only of the half that
+ * DESTROYS. The null is factored into this helper and enforced by
+ * construction; the preservation was open-coded at every caller, so it drifted,
+ * and it drifted destructive. Factoring one half of an invariant and not the
+ * other guarantees exactly that.
+ *
+ * `buildIssueMonitorClear` now returns the audit payload BESIDE the patch
+ * (`{ patch, audit }`), so the evidence a clear destroys travels with the write
+ * that destroys it. The rename (it was `buildIssueMonitorClearedPatch`) is
+ * load-bearing, not cosmetic: measured on this tree 2026-11-12, changing only
+ * the return shape and leaving every caller stale produced just 2 errors
+ * across 15 call sites, both at the two sites that READ a property off the
+ * result. Every `...spread` site compiled silently, because spreading an extra
+ * key into a Drizzle `.set()` is not an error — so a stale caller would have
+ * written a patch with no `monitorNotes` null in it and no type error.
+ * Renaming is what makes a stale caller fail to compile instead.
+ *
+ * This helper is still applied by every clear site, and it still only
+ * destroys. It is `buildIssueMonitorClear`'s return type that now carries the
+ * other half.
  */
 function clearArmedMonitorColumns(patch: Record<string, unknown>) {
   patch.monitorNextCheckAt = null;
@@ -1930,12 +1958,44 @@ export function buildIssueMonitorDispatchRearmPatch(input: {
   };
 }
 
-export function buildIssueMonitorClearedPatch(input: {
+/**
+ * PEN-6571: the evidence a monitor clear destroys, read off the PRE-clear row.
+ *
+ * `notes` is the operating text the clear is about to null; the rest is the
+ * scheduling state that disappears with it. Every field is already in the
+ * shape an activity `details` payload wants, so a caller forwards it rather
+ * than re-deriving it — the re-derivation is what used to be open-coded, and
+ * one site was reaching into `patch.executionState` through an unchecked cast
+ * to recover `clearReason` from the very object that had just discarded it.
+ */
+export type IssueMonitorClearAudit = {
+  clearReason: IssueExecutionMonitorClearReason;
+  notes: string | null;
+  lastTriggeredAt: string | null;
+  nextCheckAt: string | null;
+  attemptCount: number;
+};
+
+/**
+ * PEN-6571: a monitor clear as one value — the columns to write, and the
+ * evidence writing them destroys.
+ *
+ * Mirrors `applyMonitorTransition`'s `{ patch, convergence }`. Spread
+ * `.patch`; forward `.audit` to whatever records the clear. A caller that
+ * drops `.audit` is now dropping something the signature names, which is the
+ * whole point: before this, the payload did not exist to be dropped.
+ */
+export type IssueMonitorClear = {
+  patch: Record<string, unknown>;
+  audit: IssueMonitorClearAudit;
+};
+
+export function buildIssueMonitorClear(input: {
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
   clearReason: IssueExecutionMonitorClearReason;
   clearedAt?: Date;
-}) {
+}): IssueMonitorClear {
   const existingState = parseIssueExecutionState(input.issue.executionState);
   const currentMonitorState = derivePersistedMonitorState({
     issue: input.issue,
@@ -1949,13 +2009,23 @@ export function buildIssueMonitorClearedPatch(input: {
   });
 
   return {
-    executionPolicy: stripMonitorFromExecutionPolicy(input.policy) as Record<string, unknown> | null,
-    executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
-    monitorNextCheckAt: null,
-    monitorWakeRequestedAt: null,
-    // PEN-1995: see clearArmedMonitorColumns — the notes describe the armed
-    // monitor, and the audit copy is on executionState.monitor.notes.
-    monitorNotes: null,
+    patch: {
+      executionPolicy: stripMonitorFromExecutionPolicy(input.policy) as Record<string, unknown> | null,
+      executionState: executionStateWithMonitor(existingState, nextMonitorState) as Record<string, unknown> | null,
+      monitorNextCheckAt: null,
+      monitorWakeRequestedAt: null,
+      // PEN-1995: see clearArmedMonitorColumns — the notes describe the armed
+      // monitor. PEN-6571: the pre-clear copy leaves on `audit` below, so this
+      // null is no longer the end of the record.
+      monitorNotes: null,
+    },
+    audit: {
+      clearReason: input.clearReason,
+      notes: currentMonitorState?.notes ?? null,
+      lastTriggeredAt: currentMonitorState?.lastTriggeredAt ?? null,
+      nextCheckAt: currentMonitorState?.nextCheckAt ?? null,
+      attemptCount: currentMonitorState?.attemptCount ?? 0,
+    },
   };
 }
 
@@ -2006,19 +2076,27 @@ export function buildIssueMonitorClearedPatch(input: {
  * live-consumer grace intact: this fires at the instant the row leaves
  * eligibility — the instant the hole opens — and never before.
  *
- * Returns an empty patch when the row holds no monitor or the monitor is still
- * deliverable, so callers can spread it unconditionally.
+ * Returns `null` when the row holds no monitor or the monitor is still
+ * deliverable — i.e. when no clear happens.
+ *
+ * PEN-6571: this used to return an empty patch for that case, so callers could
+ * spread it unconditionally. `null` is the honest encoding now that there is a
+ * second half to return: an empty patch cannot say whether a clear happened,
+ * and a caller that spread it unconditionally had no way to tell "nothing to
+ * do" from "a clear whose evidence I am about to drop". Callers that still
+ * want the unconditional spread write `...(clear?.patch ?? {})`; callers that
+ * record the clear branch on the `null` and then have a non-optional `audit`.
  */
-export function buildIssueMonitorEligibilityPatch(issue: IssueLike): Record<string, unknown> {
+export function buildIssueMonitorEligibilityClear(issue: IssueLike): IssueMonitorClear | null {
   const policy = normalizeIssueExecutionPolicy(issue.executionPolicy ?? null);
-  if (!issue.monitorNextCheckAt && !holdsTriggeredMonitor(issue, policy)) return {};
+  if (!issue.monitorNextCheckAt && !holdsTriggeredMonitor(issue, policy)) return null;
   const clearReason = monitorClearReasonForIssue(
     issue.status,
     issue.assigneeAgentId ?? null,
     issue.assigneeUserId ?? null,
   );
-  if (!clearReason) return {};
-  return buildIssueMonitorClearedPatch({ issue, policy, clearReason });
+  if (!clearReason) return null;
+  return buildIssueMonitorClear({ issue, policy, clearReason });
 }
 
 /**
@@ -2028,7 +2106,7 @@ export function buildIssueMonitorEligibilityPatch(issue: IssueLike): Record<stri
  * Read through `derivePersistedMonitorState` rather than off
  * `executionState.monitor.status` directly, so this agrees with the two other
  * places that decide the same question (`tickExpiredIssueMonitors`' post-claim
- * re-check, and `buildIssueMonitorClearedPatch` above) — including legacy rows whose
+ * re-check, and `buildIssueMonitorClear` above) — including legacy rows whose
  * trigger survives only in the `monitorLastTriggeredAt` / `monitorAttemptCount`
  * columns with no `executionState` to read.
  *
