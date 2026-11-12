@@ -130,6 +130,82 @@ describe("plugin database SQL validation", () => {
     ).toThrow(/namespace/i);
   });
 
+  it("accepts a migration whose line comment carries an odd number of apostrophes", () => {
+    // The comment's last unpaired apostrophe used to pair with the opening quote of
+    // the first real literal, swallowing the statement keyword with it (PEN-5951).
+    expect(() =>
+      validatePluginMigrationStatement(
+        "-- it's a note\nCOMMENT ON TABLE plugin_test.rows IS 'the attendance note'",
+        "plugin_test",
+      )
+    ).not.toThrow();
+    expect(() =>
+      validatePluginMigrationStatement(
+        "-- it's the operator's own 'note\nCOMMENT ON TABLE plugin_test.rows IS 'note'",
+        "plugin_test",
+      )
+    ).not.toThrow();
+    // The even-apostrophe cases were always fine; they are the control.
+    expect(() =>
+      validatePluginMigrationStatement(
+        "-- it's the operator's note\nCOMMENT ON TABLE plugin_test.rows IS 'note'",
+        "plugin_test",
+      )
+    ).not.toThrow();
+  });
+
+  it("still sees a banned statement hidden behind an apostrophe in a line comment", () => {
+    const bannedFunction =
+      "CREATE OR REPLACE FUNCTION plugin_test.f() RETURNS int AS " +
+      "'update plugin_test.rows set id = id; select 1' LANGUAGE sql";
+    expect(() => validatePluginMigrationStatement(bannedFunction, "plugin_test")).toThrow(
+      /disallowed/i,
+    );
+    // Same statement, preceded by an allowed keyword and a comment holding one
+    // apostrophe. That used to normalise to a bare "create" and be accepted.
+    expect(() =>
+      validatePluginMigrationStatement(`CREATE -- it's fine\n${bannedFunction}`, "plugin_test")
+    ).toThrow(/disallowed/i);
+  });
+
+  it("hides neither comments nor literals from the runtime validators", () => {
+    expect(() =>
+      validatePluginRuntimeQuery(
+        "-- it's a read\nSELECT id FROM plugin_test.rows WHERE note = 'x'",
+        "plugin_test",
+      )
+    ).not.toThrow();
+    expect(() =>
+      validatePluginRuntimeExecute(
+        "-- it's a write\nUPDATE plugin_test.rows SET note = 'x'",
+        "plugin_test",
+      )
+    ).not.toThrow();
+  });
+
+  it("keeps a string literal that legitimately contains a double hyphen", () => {
+    // Guards the tempting fix of stripping `--` first, which would truncate this
+    // literal and leave the statement with an unbalanced quote.
+    expect(() =>
+      validatePluginMigrationStatement(
+        "COMMENT ON TABLE plugin_test.rows IS 'an operator pause -- the one that matters'",
+        "plugin_test",
+      )
+    ).not.toThrow();
+  });
+
+  it("treats a block comment as whitespace rather than gluing the tokens either side", () => {
+    // Postgres reads `CREATE/**/EXTENSION` as `CREATE EXTENSION`; replacing the
+    // comment with "" produced the single token `createextension`, which the ban
+    // list could not see.
+    expect(() =>
+      validatePluginMigrationStatement("CREATE/**/EXTENSION pg_trgm", "plugin_test")
+    ).toThrow(/disallowed/i);
+    expect(() =>
+      validatePluginMigrationStatement("DO/**/$$ BEGIN END $$", "plugin_test")
+    ).toThrow(/disallowed/i);
+  });
+
   it("targets anonymous DO blocks without rejecting do-prefixed aliases", () => {
     expect(() =>
       validatePluginRuntimeQuery(
