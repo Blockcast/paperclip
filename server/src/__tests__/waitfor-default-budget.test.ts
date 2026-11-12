@@ -28,7 +28,10 @@ describe("vi.waitFor default budget", () => {
   it("still honours an explicit per-call timeout, so a real bound is not widened", async () => {
     const startedAt = Date.now();
     await expect(vi.waitFor(() => expect(false).toBe(true), { timeout: 150 })).rejects.toThrow();
-    // Would be ~5_000 if the lift clobbered the caller's own option.
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    // Would be ~5_000 if the lift clobbered the caller's own option. This bound only has
+    // to separate ~150 from ~5_000, so it is a discriminator and not a latency claim:
+    // keep it well clear of 5_000 but far enough above 150 that a loaded ARC runner
+    // cannot trip it, which is the exact failure mode this file exists to remove.
+    expect(Date.now() - startedAt).toBeLessThan(4_000);
   }, 60_000);
 });
