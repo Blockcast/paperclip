@@ -91,10 +91,61 @@ const OVERLAPPING_QUALIFIED_NAME = new RegExp(
  * `public` (the core schema), the catalogs, and every other plugin's namespace --
  * `derivePluginDatabaseNamespace` always emits a `plugin_` prefix.
  *
- * A qualified name whose left side is none of these is a column read through a table
- * alias (`cursor.id`, `EXCLUDED.y`), which is not this validator's business.
+ * A left side matching this is ALWAYS adjudicated, whatever else the statement used
+ * that word for -- so a statement cannot buy an exemption for `public.secrets` by
+ * also aliasing something `public`.
+ *
+ * It is NOT the test for "is this a schema?". It used to be: a left side outside this
+ * set was skipped as a column read through a table alias (`cursor.id`, `EXCLUDED.y`),
+ * which made the set an allowlist of schemas to CHECK and left every other real schema
+ * unchecked -- `drizzle.__drizzle_migrations` in a non-first position was ignored,
+ * while the same name in first position was correctly refused (PEN-6604). The skip is
+ * now `assertNoUnextractedSchemaRefs`'s correlation-name exemption instead.
  */
 const SCHEMA_SHAPED_RE = /^(?:public|information_schema|pg_[a-z0-9_]*|plugin_[a-z0-9_]*)$/;
+
+/**
+ * Names a statement may legally use on the left of a dot WITHOUT naming a schema:
+ * a relation alias, a CTE name, or one of SQL's own correlation names.
+ *
+ * These anchors are deliberately OVER-generous -- they capture keywords and column
+ * aliases too -- because the direction of the error matters. An over-collected name
+ * is skipped, which is what the old `SCHEMA_SHAPED_RE` test did for EVERY name
+ * outside its allowlist; an under-collected one is refused, which breaks a live
+ * plugin. So this is strictly narrower than what it replaces, never wider, and the
+ * clause above keeps every real schema name out of the exemption regardless.
+ */
+const CORRELATION_ANCHORS: readonly RegExp[] = [
+  // FROM/JOIN/UPDATE/INTO <relation> [AS] alias
+  new RegExp(
+    String.raw`\b(?:from|join|update|into)\s+(?:"?[A-Za-z_][A-Za-z0-9_]*"?\s*\.\s*)?"?[A-Za-z_][A-Za-z0-9_]*"?\s+(?:as\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?`,
+    "gi",
+  ),
+  // FROM (SELECT ...) sub, FROM jsonb_array_elements(x) AS e -- the alias follows `)`
+  /\)\s+(?:as\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
+  // WITH x AS ( ... ), y (c1, c2) AS ( ... ) -- `AS (` is what makes this unambiguous
+  // against a `SELECT a, b AS c` list, where no open paren follows the alias.
+  /(?:\bwith\s+(?:recursive\s+)?|,)\s*"?([A-Za-z_][A-Za-z0-9_]*)"?\s*(?:\([^()]*\)\s*)?as\s*\(/gi,
+  // A comma-continued relation and its alias: `FROM ns.a x, other_t y`. This one
+  // cannot be told apart from a `SELECT a, b c` output-column alias without knowing
+  // which clause the comma is in, so it collects both. That is deliberate: refusing
+  // `y.col` there would be a false refusal on ordinary in-namespace SQL, and an
+  // over-collected name only ever restores the OLD behaviour for that one word. It
+  // does not reopen the case this closes -- `, drizzle.__drizzle_migrations` is one
+  // dotted token, so there is no second identifier for this to capture.
+  /,\s*"?[A-Za-z_][A-Za-z0-9_]*"?\s+(?:as\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
+];
+
+/** Correlation names SQL supplies itself; they are never declared in the statement. */
+const IMPLICIT_CORRELATION_NAMES: ReadonlySet<string> = new Set(["excluded", "new", "old"]);
+
+function collectCorrelationNames(statement: string): ReadonlySet<string> {
+  const names = new Set(IMPLICIT_CORRELATION_NAMES);
+  for (const anchor of CORRELATION_ANCHORS) {
+    for (const match of statement.matchAll(anchor)) names.add(match[1]!.toLowerCase());
+  }
+  return names;
+}
 
 type SqlRef = { schema: string; table: string; keyword: string };
 type QualifiedRefPattern =
@@ -587,11 +638,23 @@ function assertNoUnextractedSchemaRefs(
   const extracted = new Set(
     refs.map((ref) => `${ref.schema.toLowerCase()}.${ref.table.toLowerCase()}`),
   );
+  // Collected lazily: the overwhelming majority of statements never reach a name the
+  // extractor missed, and this scan is three more passes over the statement.
+  let correlations: ReadonlySet<string> | undefined;
   for (const match of statement.matchAll(OVERLAPPING_QUALIFIED_NAME)) {
     const schema = match[1]!;
     const table = match[2]!;
     if (extracted.has(`${schema.toLowerCase()}.${table.toLowerCase()}`)) continue;
-    if (schema !== namespace && !SCHEMA_SHAPED_RE.test(schema.toLowerCase())) continue;
+    const schemaLower = schema.toLowerCase();
+    // A name this database really does use as a schema is adjudicated unconditionally;
+    // only a left side that is NEITHER a known schema NOR a name the statement declared
+    // for itself is exempt. The old test was the other way round -- skip unless the
+    // left side LOOKED like a schema -- which silently exempted every real schema the
+    // pattern did not anticipate, `drizzle` among them (PEN-6604).
+    if (schemaLower !== namespace.toLowerCase() && !SCHEMA_SHAPED_RE.test(schemaLower)) {
+      correlations ??= collectCorrelationNames(statement);
+      if (correlations.has(schemaLower)) continue;
+    }
     throw new Error(
       `Plugin SQL names ${schema}.${table} in a position this validator cannot adjudicate`,
     );
@@ -1071,6 +1134,56 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
     return rows[0] ?? null;
   }
 
+  /**
+   * Runs one already-validated plugin statement with `search_path` pinned to the
+   * plugin's own namespace, inside its own transaction.
+   *
+   * WHY, and it is not a second validator: the lexical validators above adjudicate
+   * SCHEMA-QUALIFIED names. An UNQUALIFIED relation name is not one, so
+   * `FROM plugin_ns.rows, secrets` names `secrets` in a position no pattern is
+   * anchored on, the `refs.length === 0` floor cannot fire because the statement
+   * qualifies one relation, and `assertNoUnextractedSchemaRefs` sees qualified names
+   * only, by construction. Postgres then resolved `secrets` through `search_path`,
+   * which nothing on this path set -- so it reached `public` (PEN-6604).
+   *
+   * Telling a relation name from a column name lexically needs a real parse of the
+   * relation list, and the shipped corpus contains the shapes that make that
+   * dangerous (`SELECT EXTRACT(DOW FROM created_at) ... FROM ns.rows` is an existing
+   * positive control in `plugin-database.test.ts`). A false refusal here breaks a
+   * live plugin at request time, which is worse than the residual it would close.
+   * Pinning `search_path` needs no parse and cannot false-refuse: an unqualified name
+   * now resolves inside the namespace or does not resolve at all.
+   *
+   * `pg_catalog` stays implicitly searched whatever this sets, so `now()`, `count()`,
+   * `EXTRACT`, `gen_random_uuid()` (core since PG 13) and every built-in type keep
+   * resolving. `public` is deliberately NOT in the path: a plugin that wants a
+   * core-schema object must name it `public.x`, which is exactly what the validators
+   * adjudicate against `coreReadTables`. Measured on this repo's plugin corpus: no
+   * plugin SQL calls a function or uses an operator class that lives in `public`
+   * (`pg_trgm`, `btree_gin` and `fuzzystrmatch` ARE installed there by the core
+   * migrations -- nothing in a plugin reaches for them).
+   *
+   * `SET LOCAL` and not `SET`: `db` is the shared pool, so a session-level `SET`
+   * would leak this plugin's namespace onto every later user of that connection.
+   * `SET LOCAL` is scoped to the surrounding transaction, which is why this opens
+   * one. A client with no `transaction` is REFUSED rather than run unpinned -- an
+   * unpinned fallback would silently restore the hole on exactly the path this
+   * exists to close. Every production caller passes a full `Db`
+   * (`buildHostServices`), so the refusal is unreachable there; the `Partial<>` in
+   * `PluginDatabaseRootClient` exists for narrower test doubles.
+   */
+  async function runWithPinnedSearchPath(namespace: string, statement: SQL): Promise<unknown> {
+    if (typeof db.transaction !== "function") {
+      throw new Error(
+        "Plugin runtime SQL needs a transactional database client so search_path can be pinned to the plugin namespace",
+      );
+    }
+    return db.transaction(async (tx) => {
+      await tx.execute(sql.raw(`SET LOCAL search_path TO ${quoteIdentifier(namespace)}`));
+      return tx.execute(statement);
+    });
+  }
+
   async function getRuntimeNamespace(pluginId: string) {
     const namespace = await getNamespace(pluginId);
     if (!namespace || namespace.status !== "active") {
@@ -1219,14 +1332,14 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
       const plugin = await getPluginRecord(pluginId);
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeQuery(statement, namespace, plugin.manifestJson.database?.coreReadTables ?? []);
-      const result = await db.execute(bindSql(statement, params));
+      const result = await runWithPinnedSearchPath(namespace, bindSql(statement, params));
       return Array.from(result as Iterable<T>);
     },
 
     async execute(pluginId: string, statement: string, params?: unknown[]): Promise<{ rowCount: number }> {
       const namespace = await getRuntimeNamespace(pluginId);
       validatePluginRuntimeExecute(statement, namespace);
-      const result = await db.execute(bindSql(statement, params));
+      const result = await runWithPinnedSearchPath(namespace, bindSql(statement, params));
       return { rowCount: Number((result as { count?: number | string }).count ?? 0) };
     },
   };
