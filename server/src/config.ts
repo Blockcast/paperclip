@@ -295,10 +295,18 @@ export interface Config {
   telemetryEnabled: boolean;
 }
 
+// loadConfig() runs on hot paths (e.g. githubHasReviewerEvidenceForPr per call),
+// so the sync `tailscale` spawn is done at most once per process (BLO-56438).
+let detectedTailnetHost: { value: string | undefined } | undefined;
+
 function detectTailnetBindHost(): string | undefined {
   const explicit = process.env.PAPERCLIP_TAILNET_BIND_HOST?.trim();
   if (explicit) return explicit;
+  detectedTailnetHost ??= { value: probeTailscaleIp() };
+  return detectedTailnetHost.value;
+}
 
+function probeTailscaleIp(): string | undefined {
   try {
     const stdout = execFileSync("tailscale", ["ip", "-4"], {
       encoding: "utf8",

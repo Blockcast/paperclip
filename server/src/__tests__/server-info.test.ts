@@ -177,6 +177,7 @@ describe("getServerInfoSnapshot", () => {
     const first = getServerInfoSnapshot({
       now: 0,
       gitCommand: gitCommandFor("aaaaaaa", "First boot"),
+      buildCommitCommand: () => null,
     });
     expect(first.git).toMatchObject({ shortSha: "aaaaaaa", subject: "First boot" });
 
@@ -196,8 +197,26 @@ describe("getServerInfoSnapshot", () => {
   });
 
   it("keeps processStartedAt stable across refreshes", () => {
-    const first = getServerInfoSnapshot({ now: 0, gitCommand: gitCommandFor("aaaaaaa", "a") });
+    const first = getServerInfoSnapshot({
+      now: 0,
+      gitCommand: gitCommandFor("aaaaaaa", "a"),
+      buildCommitCommand: () => null,
+    });
     const second = getServerInfoSnapshot({ now: 5000, gitCommand: gitCommandFor("bbbbbbb", "b") });
     expect(second.processStartedAt).toBe(first.processStartedAt);
+  });
+
+  it("never spawns git when a build commit is stamped (BLO-56438)", () => {
+    let gitCalls = 0;
+    const gitCommand = () => {
+      gitCalls += 1;
+      throw new Error("no .git in the image");
+    };
+    const commit = "0123456789abcdef0123456789abcdef01234567";
+    for (const now of [0, 5000, 60_000]) {
+      const snapshot = getServerInfoSnapshot({ now, gitCommand, buildCommitCommand: () => commit });
+      expect(snapshot.git).toMatchObject({ available: true, fullSha: commit, shortSha: "0123456" });
+    }
+    expect(gitCalls).toBe(0);
   });
 });

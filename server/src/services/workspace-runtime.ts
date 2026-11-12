@@ -3824,7 +3824,63 @@ export async function readGitOriginUrl(
   cwd: string,
   options: { timeoutMs?: number } = {},
 ): Promise<string | null> {
+  // BLO-56438: each `git` spawn costs the parent seconds of event-loop time on
+  // the worker (fork of a ~1.6 GB process), and the reconciler probes every
+  // checkout every 5 min. Read the config file instead; spawn only when the
+  // file is in a shape this reader declines to interpret.
+  const fromFile = await readOriginUrlFromGitConfig(cwd).catch(() => undefined);
+  if (fromFile !== undefined) return fromFile;
   return runGit(["config", "--get", "remote.origin.url"], cwd, options).catch(() => null);
+}
+
+/**
+ * `remote.origin.url` from `<cwd>/.git` config without spawning git, matching
+ * `git config --get` (last value wins). Returns `undefined` -- "ask git" --
+ * whenever the answer could differ from git's: no `.git` at `cwd` (cwd may be
+ * a subdirectory), `include`/`includeIf`, legacy `[remote.origin]`, or a value
+ * carrying quotes, escapes or comment characters.
+ */
+export async function readOriginUrlFromGitConfig(cwd: string): Promise<string | null | undefined> {
+  const dotGit = path.join(cwd, ".git");
+  const stat = await fs.stat(dotGit).catch(() => null);
+  if (!stat) return undefined;
+  let gitDir = dotGit;
+  if (stat.isFile()) {
+    const match = /^gitdir:\s*(.+?)\s*$/m.exec(await fs.readFile(dotGit, "utf8"));
+    if (!match) return undefined;
+    gitDir = path.resolve(cwd, match[1]);
+    // Linked worktree: shared config lives in the common dir.
+    const commondir = await fs.readFile(path.join(gitDir, "commondir"), "utf8").catch(() => null);
+    if (commondir !== null) gitDir = path.resolve(gitDir, commondir.trim());
+  }
+  const text = await fs.readFile(path.join(gitDir, "config"), "utf8");
+  return parseOriginUrlFromGitConfig(text);
+}
+
+export function parseOriginUrlFromGitConfig(text: string): string | null | undefined {
+  let inOrigin = false;
+  let url: string | null = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+    if (line.startsWith("[")) {
+      const header = /^\[\s*([A-Za-z0-9.-]+)(?:\s+"([^"\\]*)")?\s*\]$/.exec(line);
+      if (!header) return undefined;
+      const section = header[1].toLowerCase();
+      // `[remote.origin]` is the legacy subsection spelling; let git read it.
+      if (section === "include" || section === "includeif" || section.includes(".")) return undefined;
+      inOrigin = section === "remote" && header[2] === "origin";
+      continue;
+    }
+    if (!inOrigin) continue;
+    const kv = /^([A-Za-z][A-Za-z0-9-]*)\s*=\s*(.*)$/.exec(line);
+    if (!kv || kv[1].toLowerCase() !== "url") continue;
+    const value = kv[2].trim();
+    // Quotes, escapes and comment chars change git's reading of the value.
+    if (/["\\#;]/.test(value)) return undefined;
+    url = value;
+  }
+  return url;
 }
 
 async function validateProjectPrimaryRepoOrigin(input: {
