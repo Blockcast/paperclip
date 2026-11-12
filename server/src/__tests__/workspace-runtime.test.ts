@@ -8772,6 +8772,7 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
       mainRefs: await readGit(repoRoot, ["for-each-ref", "--format=%(refname) %(objectname)", "refs/heads/main"]),
     });
     const before = await snapshot();
+    const warn = vi.spyOn(logger, "warn");
 
     const result = await ensureGitWorktreeBranchCoherent({
       db,
@@ -8786,6 +8787,11 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
 
     expect(result.branchName).toBe(expectedBranch);
     expect(result.warnings[0]).toContain("re-linked");
+    // The server-side trace that keeps the deleter measurable (BLO-49622): a populated husk, not a kubelet mkdir.
+    const relinkLog = warn.mock.calls.find(([, msg]) => String(msg).includes("re-linked a worktree"));
+    warn.mockRestore();
+    expect(relinkLog?.[0]).toMatchObject({ worktreePath, entryCount: expect.any(Number), worktreeDirMtime: expect.any(String) });
+    expect((relinkLog?.[0] as { entryCount: number }).entryCount).toBeGreaterThan(0);
     expect((await readGit(worktreePath, ["rev-parse", "--show-toplevel"])).trim())
       .toBe(await fs.realpath(worktreePath));
     expect((await readGit(worktreePath, ["symbolic-ref", "--short", "HEAD"])).trim()).toBe(expectedBranch);

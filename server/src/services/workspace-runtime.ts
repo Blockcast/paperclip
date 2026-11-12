@@ -4678,6 +4678,8 @@ export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: stri
   };
   const adminDir = await withReclaimFsDeadline(findAdminDir(), adminRoot).catch(() => null);
   if (!adminDir) return false;
+  // Read before the link is written: writing it bumps the dir mtime we want.
+  const husk = await describeHusk(worktreePath, adminDir);
   /**
    * Tri-state on purpose (PEN-4877):
    * - `true`  -- git resolved this path as its own top level.
@@ -4728,7 +4730,16 @@ export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: stri
     return (await resolvesToSelf()) === true;
   }
   const verdict = await resolvesToSelf();
-  if (verdict === true) return true;
+  if (verdict === true) {
+    // BLO-49622: the only server-side trace of a husk, so the deleter stays
+    // measurable once heals are silent. An EMPTY dir points at a kubelet subPath
+    // mkdir of an absent worktree; a populated one at something unlinking .git alone.
+    logger.warn(
+      { worktreePath, adminDir, ...husk },
+      "relinkHuskGitWorktree: re-linked a worktree whose .git link was missing",
+    );
+    return true;
+  }
   // Only a verdict earns the removal. Deleting the link on an inconclusive
   // probe would re-husk a worktree we just repaired, turning a transient git
   // failure into persistent damage -- strictly worse than refusing this wake.
@@ -4747,6 +4758,20 @@ export async function relinkHuskGitWorktree(repoRoot: string, worktreePath: stri
   if (verdict === null) return false;
   await fs.rm(dotGit, { force: true });
   return false;
+}
+
+/** Best-effort forensics for the re-link log; never throws, never blocks a wake. */
+async function describeHusk(worktreePath: string, adminDir: string) {
+  const mtime = (p: string) => fs.stat(p).then((st) => st.mtime.toISOString(), () => null);
+  return withReclaimFsDeadline(
+    (async () => ({
+      entryCount: await fs.readdir(worktreePath).then((e) => e.filter((n) => n !== ".git").length, () => null),
+      worktreeDirMtime: await mtime(worktreePath),
+      adminHeadMtime: await mtime(path.join(adminDir, "HEAD")),
+      adminIndexMtime: await mtime(path.join(adminDir, "index")),
+    }))(),
+    worktreePath,
+  ).catch(() => ({ forensicsUnavailable: true }));
 }
 
 export async function inspectManagedGitWorktreeBranch(input: {
