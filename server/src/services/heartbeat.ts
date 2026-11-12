@@ -34726,6 +34726,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     unchangedTargetSuppressionMs?: number;
     /** Idle bound after which an untouched recovery row is retired (BLO-28957). 0 disables. */
     abandonedRecoveryMs?: number;
+    /** Join key for the pass's `issue graph liveness phase timing` line (BLO-56185). */
+    recoveryChainId?: string;
   }) {
     return recovery.reconcileIssueGraphLiveness({ ...opts, issueCreatedAtGte: await getWorktreeExecutionCutoff() });
   }

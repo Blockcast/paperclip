@@ -95,6 +95,7 @@ vi.mock("../services/issues.ts", async () => {
   };
 });
 
+import { logger } from "../middleware/logger.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { issueService } from "../services/issues.ts";
@@ -525,6 +526,43 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
     expect(escalations).toHaveLength(0);
+  });
+
+  it("emits one phase-timing line per pass carrying the population it walked (BLO-56185)", async () => {
+    await instanceSettingsService(db).updateExperimental({
+      enableIssueGraphLivenessAutoRecovery: false,
+    });
+    await seedBlockedChain();
+    const infoSpy = vi.spyOn(logger, "info");
+    try {
+      const result = await heartbeatSvc.reconcileIssueGraphLiveness({ recoveryChainId: "chain-56185" });
+
+      const lines = infoSpy.mock.calls.filter((call) => call[1] === "issue graph liveness phase timing");
+      // Unconditional: this pass changed no graph state, which is exactly when the
+      // pre-BLO-56185 result log stayed silent.
+      expect(lines).toHaveLength(1);
+      const fields = lines[0]![0] as {
+        recoveryChainId?: string;
+        population: Record<string, number> | null;
+        phases: Record<string, { calls: number }>;
+        counts: { findings: number } | null;
+      };
+      expect(fields.recoveryChainId).toBe("chain-56185");
+      expect(fields.population?.issues).toBeGreaterThanOrEqual(1);
+      expect(fields.population?.relations).toBeGreaterThanOrEqual(1);
+      expect(fields.population?.findings).toBe(result.findings);
+      expect(fields.counts?.findings).toBe(result.findings);
+      for (const phase of [
+        "collect.query",
+        "collect.classifyMinting",
+        "collect.classifyEscalationBlind",
+        "sweep.resolvedDependencyWakeBackstop",
+      ]) {
+        expect(fields.phases[phase]?.calls, phase).toBe(1);
+      }
+    } finally {
+      infoSpy.mockRestore();
+    }
   });
 
   it("keeps resolved dependency wake reconciliation active when liveness auto recovery is disabled", async () => {

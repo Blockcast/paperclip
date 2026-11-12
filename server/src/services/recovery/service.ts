@@ -11861,7 +11861,11 @@ export function recoveryService(
     return result;
   }
 
-  async function collectIssueGraphLiveness() {
+  async function collectIssueGraphLiveness(timer?: PassTimer) {
+    // BLO-56185: optional so the preview and `collectIssueGraphLivenessFindings` stay
+    // untimed: with no timer the call runs unwrapped.
+    const timed = <T,>(phase: string, fn: () => PromiseLike<T>): Promise<T> =>
+      timer ? timer.time(phase, fn) : Promise.resolve(fn());
     // One read per pass, not one per issue: `loadConfig()` shells out to `tailscale` on
     // the default config, so a per-row read would turn this sweep into a subprocess per
     // candidate. Resolving here (rather than at module scope) keeps the operator's
@@ -11900,7 +11904,7 @@ export function recoveryService(
       recoveryIssueRows,
       recoveryActionRows,
       openPullRequestRows,
-    ] = await Promise.all([
+    ] = await timed("collect.query", () => Promise.all([
       db
         .select({
           id: issues.id,
@@ -12093,7 +12097,7 @@ export function recoveryService(
             sql`${issues.identifier}`,
           ),
         )),
-    ]);
+    ]));
 
     // Waiting paths contributed by OPEN liveness escalations, kept separate from every
     // other recovery-shaped waiting path (stranded-issue recoveries, open recovery
@@ -12163,7 +12167,33 @@ export function recoveryService(
       .concat(nonEscalationRecoveryIssues)
       .concat(recoveryActionRows);
 
+    // Synchronous CPU, but timed: two full classifications over the whole graph run on
+    // the event loop, and that cost is invisible to every DB-side instrument.
+    const findings = await timed("collect.classifyMinting", async () => classifyIssueGraphLiveness({
+      ...sharedInput,
+      openRecoveryIssues: baselineRecoveryIssues,
+    }));
+    const escalationBlindFindings = await timed("collect.classifyEscalationBlind", async () =>
+      classifyIssueGraphLiveness({
+        ...sharedInput,
+        openRecoveryIssues: nonEscalationRecoveryIssues.concat(recoveryActionRows),
+      }));
+
     return {
+      // BLO-56185 AC3: the input sizes the classifier walked, so the next regression can
+      // tell population growth from per-candidate slowness without a DB census.
+      population: {
+        issues: issueRows.length,
+        relations: relationRows.length,
+        agents: agentRows.length,
+        activeRuns: activeRunRows.length + activeIssueRunRows.length,
+        queuedWakeRequests: wakeRows.length,
+        pendingInteractions: interactionRows.length,
+        pendingApprovals: approvalRows.length,
+        recoveryIssues: recoveryIssueRows.length,
+        recoveryActions: recoveryActionRows.length,
+        openPullRequests: openPullRequestRows.length,
+      },
       // Carried out so `reconcileIssueGraphLiveness` can age a finding without
       // re-reading `issues`: `IssueLivenessFinding` has no assignee and no
       // timestamp, and both already sit in this snapshot (PEN-4652).
@@ -12180,10 +12210,7 @@ export function recoveryService(
       // subject and leaf, which is what stops the detector re-firing the same incident
       // every 30s tick while somebody is already on it (BLO-15200). Everything that
       // creates escalations must keep reading this one.
-      findings: classifyIssueGraphLiveness({
-        ...sharedInput,
-        openRecoveryIssues: baselineRecoveryIssues,
-      }),
+      findings,
       // BLO-29601: the PREMISE RE-CHECK view, and the reason this function classifies
       // twice. `hasExplicitWaitingPath` treats an open recovery issue as a satisfier, so
       // an escalation supplies the action path for the very issue it was minted about.
@@ -12199,10 +12226,7 @@ export function recoveryService(
       // independently-owned action paths.
       //
       // Strictly a read: this set is never used to create anything.
-      escalationBlindFindings: classifyIssueGraphLiveness({
-        ...sharedInput,
-        openRecoveryIssues: nonEscalationRecoveryIssues.concat(recoveryActionRows),
-      }),
+      escalationBlindFindings,
     };
   }
 
@@ -15631,7 +15655,7 @@ export function recoveryService(
     reconcileStrandedRecoveryHandBacksImpl,
   );
 
-  async function reconcileIssueGraphLiveness(opts?: {
+  type ReconcileIssueGraphLivenessOpts = {
     runId?: string | null;
     force?: boolean;
     lookbackHours?: number;
@@ -15641,14 +15665,78 @@ export function recoveryService(
     unchangedTargetSuppressionMs?: number;
     /** Idle bound after which an untouched recovery row is retired (BLO-28957). 0 disables. */
     abandonedRecoveryMs?: number;
-  }) {
-    const collected = await collectIssueGraphLiveness().catch((error: unknown) => {
+    /** Join key onto the chain's `periodic heartbeat recovery pass timing` line (BLO-56185). */
+    recoveryChainId?: string;
+  };
+
+  /**
+   * BLO-56185 AC3. Pass 2 of the recovery chain went from 50-357s to 862s on 2026-11-12
+   * and nothing recorded what it was spending that time on: its result object is logged
+   * only when the pass changed graph state, and it carried no population at all. This
+   * emits ONE line per pass, unconditionally, mirroring the stranded sweep's
+   * `stranded assigned issue sweep phase timing` (BLO-48950 AC2). Read `population`
+   * against `phases`: growth in the former with flat per-phase cost is load; flat
+   * population with growing phase cost is per-candidate slowness or pool starvation
+   * (check `paperclip_db_pool_waiting_queries` before calling it either).
+   */
+  async function reconcileIssueGraphLiveness(opts?: ReconcileIssueGraphLivenessOpts) {
+    const passTimer = createPassTimer();
+    let population: Record<string, number> | null = null;
+    let result: Awaited<ReturnType<typeof reconcileIssueGraphLivenessTimed>> | null = null;
+    try {
+      result = await reconcileIssueGraphLivenessTimed(opts, passTimer, (counts) => {
+        population = counts;
+      });
+      return result;
+    } finally {
+      // Bare catch for the same reason as the stranded sweep's phase-timing line: a
+      // throw from a `finally` replaces the pass's real error.
+      try {
+        logger.info(
+          {
+            recoveryChainId: opts?.recoveryChainId,
+            ...passTimer.summary(),
+            population,
+            // null when the pass threw before producing a result.
+            counts: result
+              ? {
+                findings: result.findings,
+                escalationsCreated: result.escalationsCreated,
+                existingEscalations: result.existingEscalations,
+                skipped: result.skipped,
+                staleEscalationsChecked: result.staleEscalationsChecked,
+                dependencyWakeBackstopChecked: result.dependencyWakeBackstopChecked,
+                dependencyWakeCandidateLimitSkipped: result.dependencyWakeCandidateLimitSkipped,
+                strandedRecoveryWakeBackstopChecked: result.strandedRecoveryWakeBackstopChecked,
+                failedSweeps: result.failedSweeps,
+              }
+              : null,
+          },
+          "issue graph liveness phase timing",
+        );
+      } catch {
+        // Intentionally empty — see above.
+      }
+    }
+  }
+
+  async function reconcileIssueGraphLivenessTimed(
+    opts: ReconcileIssueGraphLivenessOpts | undefined,
+    passTimer: PassTimer,
+    reportPopulation: (counts: Record<string, number>) => void,
+  ) {
+    const collected = await collectIssueGraphLiveness(passTimer).catch((error: unknown) => {
       // PEN-4652: the cold-`in_review` gauge is published from this snapshot, so
       // a failed collect has to mark it stale. Without this the previous pass's
       // ages keep being served and read as current — the freezing-at-last-value
       // failure the freshness gauge exists to make visible.
       setColdInReviewIssueMetricsRefreshSuccess(false);
       throw error;
+    });
+    reportPopulation({
+      ...collected.population,
+      findings: collected.findings.length,
+      escalationBlindFindings: collected.escalationBlindFindings.length,
     });
 
     // PEN-4652: publish the cold-`in_review` gauge from the verdicts this pass
@@ -15692,10 +15780,11 @@ export function recoveryService(
     // action path. Unfiltered by `issueCreatedAtGte` on purpose: that knob narrows which
     // findings may CREATE escalations, and applying it here would leave the pre-cutoff
     // backlog — the population this exists to drain — permanently unreachable.
-    const staleEscalationCleanup = await autoResolveStaleLivenessEscalations(
-      collected.escalationBlindFindings,
-      { runId: opts?.runId ?? null },
-    );
+    const staleEscalationCleanup = await passTimer.time("autoResolveStaleEscalations", () =>
+      autoResolveStaleLivenessEscalations(
+        collected.escalationBlindFindings,
+        { runId: opts?.runId ?? null },
+      ));
     if (opts?.issueCreatedAtGte) {
       const findingIssueIds = [...new Set(findings.map((finding) => finding.recoveryIssueId))];
       const eligibleIssueIds = new Set(
@@ -15729,15 +15818,18 @@ export function recoveryService(
     // about the default windows (BLO-27676 review).
     const { reescalationCooldownMs, unchangedTargetSuppressionMs } =
       normalizeLivenessSuppressionWindows(opts);
-    const obsoleteRecoveryCleanup = await retireObsoleteLivenessRecoveryIssues(findings, {
-      now,
-      abandonedAfterMs: Math.max(
-        0,
-        Math.floor(asNumber(opts?.abandonedRecoveryMs, DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS)),
-      ),
-    });
-    const activityByIssueKey = await loadLivenessRecoveryIssueLastActivityByKey(findings);
-    const doneRecoveryBlockerCleanup = await retireDoneLivenessRecoveryBlockers();
+    const obsoleteRecoveryCleanup = await passTimer.time("retireObsoleteRecoveries", () =>
+      retireObsoleteLivenessRecoveryIssues(findings, {
+        now,
+        abandonedAfterMs: Math.max(
+          0,
+          Math.floor(asNumber(opts?.abandonedRecoveryMs, DEFAULT_LIVENESS_ABANDONED_RECOVERY_MS)),
+        ),
+      }));
+    const activityByIssueKey = await passTimer.time("loadRecoveryActivity", () =>
+      loadLivenessRecoveryIssueLastActivityByKey(findings));
+    const doneRecoveryBlockerCleanup = await passTimer.time("retireDoneRecoveryBlockers", () =>
+      retireDoneLivenessRecoveryBlockers());
     const result = {
       findings: findings.length,
       autoRecoveryEnabled,
@@ -15823,34 +15915,38 @@ export function recoveryService(
     // PEN-4094: isolated, so a throw from any one of these cannot skip the others for this
     // tick. Each is itself a recovery backstop; see `runActionScopedRecoverySweeps`.
     const actionScopedSweeps = await runActionScopedRecoverySweeps({
-      resolvedDependencyWakeBackstop: () => reconcileResolvedDependencyWakeBackstop({
-        runId: opts?.runId ?? null,
-      }),
+      resolvedDependencyWakeBackstop: () => passTimer.time("sweep.resolvedDependencyWakeBackstop", () =>
+        reconcileResolvedDependencyWakeBackstop({
+          runId: opts?.runId ?? null,
+        })),
       // PEN-3976. Ordered ahead of the two sweeps below, and that is load-bearing rather than
       // stylistic: a dischargeable action should not be woken for (the stranded backstop) or
       // escalated with an announcement comment (the horizon sweep) one tick before it is
       // discharged. Like them it is independent of liveness findings and stays enabled when
       // automatic liveness escalation is off, because it retires an already-committed action
       // rather than creating recovery work.
-      restoredExecutionRecoveryActions: () => reconcileRestoredExecutionRecoveryActions({
-        runId: opts?.runId ?? null,
-        now,
-      }),
+      restoredExecutionRecoveryActions: () => passTimer.time("sweep.restoredExecutionRecoveryActions", () =>
+        reconcileRestoredExecutionRecoveryActions({
+          runId: opts?.runId ?? null,
+          now,
+        })),
       // This sibling backstop is independent of liveness findings and remains enabled even
       // when automatic liveness escalation is disabled: it only redelivers an already-committed
       // recovery action rather than creating or re-routing recovery work.
-      strandedRecoveryWakeBackstop: () => reconcileStrandedRecoveryWakeBackstop({
-        runId: opts?.runId ?? null,
-        now,
-      }),
+      strandedRecoveryWakeBackstop: () => passTimer.time("sweep.strandedRecoveryWakeBackstop", () =>
+        reconcileStrandedRecoveryWakeBackstop({
+          runId: opts?.runId ?? null,
+          now,
+        })),
       // Also independent of liveness findings, and for the same reason: this only retires an
       // already-committed action that has stopped waking anyone, so it must keep running when
       // automatic liveness escalation is disabled. It is the pass that stops a spent recovery
       // from reading as healthy (BLO-24662).
-      expiredRecoveryWakeHorizons: () => reconcileExpiredRecoveryWakeHorizons({
-        runId: opts?.runId ?? null,
-        now,
-      }),
+      expiredRecoveryWakeHorizons: () => passTimer.time("sweep.expiredRecoveryWakeHorizons", () =>
+        reconcileExpiredRecoveryWakeHorizons({
+          runId: opts?.runId ?? null,
+          now,
+        })),
     });
     result.failedSweeps = actionScopedSweeps.failedSweeps;
 
@@ -15916,13 +16012,13 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
-      const escalation = await createIssueGraphLivenessEscalation({
+      const escalation = await passTimer.time("escalate", () => createIssueGraphLivenessEscalation({
         finding,
         runId: opts?.runId ?? null,
         now,
         reescalationCooldownMs,
         unchangedTargetSuppressionMs,
-      });
+      }));
       if (escalation.kind === "created") {
         result.escalationsCreated += 1;
         result.issueIds.push(finding.issueId);
