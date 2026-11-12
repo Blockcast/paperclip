@@ -1,5 +1,9 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
 import { envBindingSecretRefSchema, envBindingUserSecretRefSchema, REDACTED_VALUE_SENTINEL } from "@paperclipai/shared";
+import {
+  CLAUDE_CODE_VERSION_CONFIG_KEY,
+  isAdmissibleClaudeCodeVersion,
+} from "./adapters/claude-code-version.js";
 
 /**
  * Tier 1: key-name stems with no ambiguous benign reading (BLO-20810 / CEO
@@ -667,6 +671,55 @@ function sanitizeSecretMatchedValue(value: unknown, options: SanitizeOptions | u
   return value;
 }
 
+/**
+ * PEN-6586 — the one false positive of {@link JWT_VALUE_RE} that costs a
+ * capability rather than merely looking odd.
+ *
+ * That regex masks any 3-or-4-segment dot-delimited base64url-ish string, with
+ * no key-name term. An exact npm version IS one: `2.1.292` is three segments
+ * of `[A-Za-z0-9_-]`. So `adapterConfig.claudeCodeVersion` — whose admissible
+ * values are blank, `"image"`, or exactly `x.y.z[-prerelease]` — reads back as
+ * `***REDACTED***` to its own writer for every version anyone would pin, with
+ * `withheldFields` null, because this is a generic value-shape scrub and not a
+ * withholding that has somewhere to announce itself.
+ *
+ * Measured 2026-11-12 over 420 values the adapter's own validator accepts:
+ * 300 masked, and every one of the 120 readable ones carries a prerelease with
+ * two or more dots, which overruns the regex's four-segment ceiling. All 60
+ * plain `x.y.z` forms mask. The remaining correlation is the bad half: the
+ * malformed values that THROW at dispatch — `latest`, `^2.1.0`, `2.1` — are
+ * not dot-shaped, so they read back perfectly. The field was legible exactly
+ * when it was wrong.
+ *
+ * ## Why this is a value test and not a key allowlist
+ *
+ * Exempting the key outright would be a hole: nothing stops some other writer
+ * storing a real JWT under that name, and this redactor has no adapter type to
+ * scope by. So the exemption is gated on the value ALREADY matching the
+ * admissible grammar, which no JWT can — a JWT's first segment is base64url of
+ * a JSON header and so always begins `ey`, while this grammar admits only
+ * digits before the first dot. The exemption therefore cannot widen to
+ * anything secret-shaped no matter what is stored.
+ *
+ * Scoped to `agentConfig` reads, which is the surface the capability needs
+ * (`GET /api/agents/:id` -> `redactAgentSecrets`); a generic event payload
+ * that happens to carry the key keeps the mask.
+ *
+ * ⛔ Read this as a one-key exemption, not a precedent to extend by adding
+ * names. Any key added here needs its own write-time grammar guard first —
+ * that guard is what makes the value test exhaustive. For this key it is
+ * `findInadmissibleClaudeCodeVersion`, enforced in `routes/agents.ts`.
+ */
+function isVersionShapedConfigValue(
+  options: SanitizeOptions | undefined,
+  key: string,
+  value: string,
+): boolean {
+  if (options?.agentConfig !== true) return false;
+  if (key !== CLAUDE_CODE_VERSION_CONFIG_KEY) return false;
+  return isAdmissibleClaudeCodeVersion(value);
+}
+
 export function sanitizeRecord(record: Record<string, unknown>, options?: SanitizeOptions): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
@@ -694,7 +747,7 @@ export function sanitizeRecord(record: Record<string, unknown>, options?: Saniti
       assignRecordKey(redacted, key, sanitizeSecretMatchedValue(value, options, keyTier));
       continue;
     }
-    if (typeof value === "string" && JWT_VALUE_RE.test(value)) {
+    if (typeof value === "string" && JWT_VALUE_RE.test(value) && !isVersionShapedConfigValue(options, key, value)) {
       assignRecordKey(redacted, key, REDACTED_EVENT_VALUE);
       continue;
     }

@@ -145,6 +145,10 @@ import {
   findUnregisteredAdapterModel,
 } from "../adapters/model-validation.js";
 import {
+  describeInadmissibleClaudeCodeVersion,
+  findInadmissibleClaudeCodeVersion,
+} from "../adapters/claude-code-version.js";
+import {
   loadDefaultAgentInstructionsBundle,
   resolveDefaultAgentInstructionsBundleRole,
 } from "../services/default-agent-instructions.js";
@@ -2039,6 +2043,23 @@ export function agentRoutes(
     const unregisteredModel = await findUnregisteredAdapterModel(adapterType, adapterConfig, previous);
     if (unregisteredModel) {
       throw unprocessable(describeUnregisteredModel(unregisteredModel));
+    }
+    // PEN-6586: the same shape as the model check above, for
+    // `adapterConfig.claudeCodeVersion`. That value is interpolated into the
+    // agent Job's shell command, so the adapter's `resolveClaudeCodeVersion`
+    // THROWS on anything outside its grammar — correctly, and at the worst
+    // possible moment. It was called from exactly one place, while building
+    // the Job manifest, and from no write path at all, so a malformed value
+    // was accepted at 200 and surfaced as the agent failing to dispatch.
+    //
+    // Worse than the model case in one respect, which is why it is worth its
+    // own guard rather than a note: the agent is the principal that can write
+    // this key on itself, and a bricked agent cannot run, so the one actor
+    // positioned to notice the fault is the one the fault disables. Refuse at
+    // the write, where the caller is still alive to read the refusal.
+    const inadmissibleVersion = findInadmissibleClaudeCodeVersion(adapterConfig, previous);
+    if (inadmissibleVersion) {
+      throw unprocessable(describeInadmissibleClaudeCodeVersion(inadmissibleVersion));
     }
     if (adapterType !== "opencode_local") return;
     try {
