@@ -2838,12 +2838,14 @@ export function authorizationService(db: Db) {
                 // stops it from going looking for a door that is merely less guarded.
                 "Comment here with what you would have written and let them make the change, or write your " +
                 "findings on an issue you are assigned to and reference this one."
-              : // No remedy is named on this branch because there is none to name.
-                // Every route the human_held string offers — comment on the row,
-                // write findings on a row you are assigned to — presupposes a
-                // readable row and a holder to hand it to, and this branch has
-                // neither. Say only what is true, and diagnose rather than offer a
-                // door: the refusal is about the id, not about who holds it.
+              : // No route to the HOLDER is named on this branch, because there is
+                // none to name. Every route the human_held string offers — comment
+                // on the row, write findings on a row you are assigned to —
+                // presupposes a readable row and a holder to hand it to, and this
+                // branch has neither. What this string offers instead is diagnostic
+                // rather than a door: "check the issue identifier" points at the id,
+                // which is the only true thing there is to say here, because the
+                // refusal is about the id and not about who holds it.
                 "This issue is not readable by this company, so assignment is refused without determining who " +
                 "holds it. An id that is foreign or dangling is refused here rather than resolved — check the " +
                 "issue identifier.",
