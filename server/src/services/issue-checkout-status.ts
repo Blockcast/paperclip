@@ -2,10 +2,29 @@ import { and, eq, inArray, isNotNull, isNull, or, sql, type SQL } from "drizzle-
 import { heartbeatRuns, issueRelations, issues, type Db, type DbTransaction } from "@paperclipai/db";
 import { TERMINAL_HEARTBEAT_RUN_STATUS_VALUES } from "./issue-execution-lock.js";
 import { buildIssueMonitorEligibilityClear } from "./issue-execution-policy.js";
-import { logIssueMonitorClearedUndeliverable } from "./activity-log.js";
+import { logIssueMonitorClearedUndeliverable, type ActivityPublish } from "./activity-log.js";
 import { externalWaitFromDescription } from "./external-wait-declaration.js";
 
 type DbOrTransaction = Db | DbTransaction;
+
+/**
+ * PEN-6577 — opt in to deferred publication of the monitor-clear activity
+ * events this module logs.
+ *
+ * These entry points take `Db | DbTransaction`, so they cannot know whether
+ * there is a commit to wait for, and they cannot see it if there is. Pass an
+ * array from a TRANSACTIONAL caller and drain it after the transaction
+ * commits; the live events are then withheld until the activity rows they
+ * describe are visible, and a rollback drops them with the rows.
+ *
+ * Omitting it keeps publication inline. That is correct on a plain pool handle
+ * and is the previous behaviour everywhere else, so adopting this is per-caller
+ * and never loses an event — the failure mode of returning the publishes and
+ * letting a caller forget to run them.
+ */
+export type RestoreCheckoutPromotionOptions = {
+  deferredPublishes?: ActivityPublish[];
+};
 
 /**
  * The issue columns that jointly identify the current execution owner.
@@ -439,6 +458,7 @@ type RestoredRow = {
 async function reconcileRestoredMonitors(
   dbOrTx: DbOrTransaction,
   rows: readonly RestoredRow[],
+  deferredPublishes?: ActivityPublish[],
 ): Promise<void> {
   for (const row of rows) {
     const clear = buildIssueMonitorEligibilityClear({
@@ -478,14 +498,23 @@ async function reconcileRestoredMonitors(
     // worse than none, because the reader cannot tell the two apart.
     //
     if (cleared.length === 0) continue;
-    await logIssueMonitorClearedUndeliverable(dbOrTx as Db, {
+    // PEN-6577: this pass is the one clear site whose handle is CONDITIONALLY a
+    // transaction — 6 of the 14 calls to its three entry points pass a `tx` —
+    // and it cannot see the commit from here. A caller that passes a sink is
+    // telling us it will drain after committing, so publication is deferred. A
+    // caller that passes none is either on a plain pool handle (where inline is
+    // correct, there being no enclosing transaction to outlive) or has not
+    // opted in yet, and keeps the previous behaviour rather than silently
+    // losing the event.
+    const publish = await logIssueMonitorClearedUndeliverable(dbOrTx as Db, {
       companyId: row.companyId,
       issueId: row.id,
       identifier: row.identifier,
       status: row.status,
       audit: clear.audit,
       source: "issue_checkout_status.reconcile_restored_monitors",
-    });
+    }, { deferPublish: deferredPublishes !== undefined });
+    deferredPublishes?.push(publish);
   }
 }
 
@@ -524,6 +553,7 @@ async function reconcileRestoredMonitors(
 export async function restoreCheckoutPromotedStatus(
   dbOrTx: DbOrTransaction,
   target: { issueId: string; companyId: string },
+  options?: RestoreCheckoutPromotionOptions,
 ): Promise<boolean> {
   // One `scope` feeding both statements, so the rows the declaration pass considers and
   // the rows the update touches cannot drift apart — the same reason the restore guard
@@ -537,7 +567,7 @@ export async function restoreCheckoutPromotedStatus(
     .where(and(scope, restorableCheckoutPromotion))
     .returning(restoreReturning);
 
-  await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[]);
+  await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[], options?.deferredPublishes);
 
   return restored.length > 0;
 }
@@ -556,6 +586,7 @@ export async function restoreCheckoutPromotedStatus(
 export async function restoreCheckoutPromotedStatuses(
   dbOrTx: DbOrTransaction,
   target: { issueIds: readonly string[]; companyId: string },
+  options?: RestoreCheckoutPromotionOptions,
 ): Promise<string[]> {
   if (target.issueIds.length === 0) return [];
 
@@ -571,7 +602,7 @@ export async function restoreCheckoutPromotedStatuses(
     .where(and(scope, restorableCheckoutPromotion))
     .returning(restoreReturning);
 
-  await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[]);
+  await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[], options?.deferredPublishes);
 
   return restored.map((row: { id: string }) => row.id);
 }
@@ -637,6 +668,7 @@ export async function restoreCheckoutPromotedStatuses(
  */
 export async function restoreStrandedCheckoutPromotions(
   dbOrTx: DbOrTransaction,
+  options?: RestoreCheckoutPromotionOptions,
 ): Promise<string[]> {
   const scope = and(
     isNull(issues.checkoutRunId),
@@ -651,7 +683,7 @@ export async function restoreStrandedCheckoutPromotions(
     .where(and(scope, restorableCheckoutPromotion))
     .returning(restoreReturning);
 
-  await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[]);
+  await reconcileRestoredMonitors(dbOrTx, restored as RestoredRow[], options?.deferredPublishes);
 
   return restored.map((row: { id: string }) => row.id);
 }

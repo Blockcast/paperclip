@@ -422,6 +422,16 @@ export async function logActivity(
  * from the PRE-clear row, so it must be captured before the write lands —
  * which is why it travels on the return value rather than being re-derived
  * here from a row that no longer carries it.
+ *
+ * PEN-6577 — every clear site that reaches this is inside a transaction, or
+ * can be. `options` forwards to `logActivity` unchanged, so a transactional
+ * caller passes `{ deferPublish: true }` and runs the returned
+ * `ActivityPublish` after commit; publishing inline from inside a transaction
+ * lets consumers race the activity row's visibility and turns a rollback into
+ * a phantom event for an activity that never happened. The returned function
+ * is a no-op unless `deferPublish` was set, so a caller that ignores it keeps
+ * the previous behaviour — which is correct on a non-transactional handle, and
+ * is what makes this additive.
  */
 export async function logIssueMonitorClearedUndeliverable(
   db: Db,
@@ -437,8 +447,9 @@ export async function logIssueMonitorClearedUndeliverable(
     agentId?: string | null;
     runId?: string | null;
   },
-): Promise<void> {
-  await logActivity(db, {
+  options?: { deferPublish?: boolean },
+): Promise<ActivityPublish> {
+  return logActivity(db, {
     companyId: input.companyId,
     actorType: input.actorType ?? "system",
     actorId: input.actorId ?? "system",
@@ -457,5 +468,5 @@ export async function logIssueMonitorClearedUndeliverable(
       notes: input.audit.notes,
       source: input.source,
     },
-  });
+  }, options);
 }
