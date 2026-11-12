@@ -12,8 +12,9 @@
  * embedded-Postgres case in `costs-service.test.ts` populates the column THROUGH it. So
  * without this file the writer is untested, and a writer that silently stopped stamping
  * would still look green everywhere: rows would simply fall to the backfill, which runs
- * on an interval and would quietly paper over it until the aggregate dropped a row in
- * the gap between the cost event and the next pass.
+ * on an interval and would quietly paper over it until the aggregate reported a row in
+ * its unattributed bucket (PEN-6084), rather than against the project that incurred it,
+ * in the gap between the cost event and the next pass.
  *
  * The run here finalizes with a PROJECT-LESS context snapshot -- no `issueId`, no
  * `projectId` -- which is the case the whole row exists for: an agent that picked work up

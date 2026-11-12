@@ -8021,7 +8021,8 @@ const CANONICAL_UUID_PATTERN =
  *
  * That ordering has a visible cost, stated here rather than left to be rediscovered:
  * between a cost event being written and its run finishing, a row carrying NO write-time
- * `project_id` is attributed to nothing, so `costs/by-project` drops it. The deleted
+ * `project_id` is attributed to nothing, so `costs/by-project` reports it in the
+ * unattributed bucket (PEN-6084) rather than against its project. The deleted
  * read-time join attributed those rows live. Rows that DO carry a write-time
  * `project_id` are unaffected -- `coalesce(project_id, attributed_project_id)` returns
  * them immediately. The window is therefore one run's remaining lifetime, for its
