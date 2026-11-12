@@ -871,8 +871,11 @@ const K8S_LAYOUT_MAX_INLINE_MASS = 5;
  *  kube-state-metrics and node-exporter label it). Same shape, same
  *  conjuncts; a credential-shaped value under these names is still refused.
  *  BLO-49668 added `job_name` (kube-state-metrics' Job object name, i.e.
- *  `<cronjob>-<scheduled-time>`). */
+ *  `<cronjob>-<scheduled-time>`). BLO-56073 added `anchor` / `target`: an
+ *  xml2rfc section anchor and the `<xref target=...>` naming it are kebab-case
+ *  slugs of the same shape (`test-vectors-bc-provenance-version-2`). */
 const K8S_OBJECT_NAME_VALUE_NAMES = new Set([
+  "anchor",
   "cronjob",
   "host_name",
   "instance",
@@ -881,7 +884,16 @@ const K8S_OBJECT_NAME_VALUE_NAMES = new Set([
   "namespace",
   "node",
   "pod",
+  "target",
 ]);
+
+/** BLO-56073: an Internet-Draft name, as xml2rfc binds it in
+ *  `<seriesInfo name="Internet-Draft" value="draft-...-01"/>` and
+ *  `<rfc docName="draft-...-02">`. The literal
+ *  `draft-` prefix, kebab-case words and a two-digit revision are the I-D
+ *  naming rule; `value` is too generic a name to take the Kubernetes rule. */
+const INTERNET_DRAFT_NAME_VALUE_NAMES = new Set(["docName", "value"]);
+const INTERNET_DRAFT_NAME_RE = /^draft-[a-z0-9]+(?:-[a-z0-9]+)+-\d{2}$/;
 
 interface K8sNameParts {
   /** Every hyphen-separated segment, in order, across every dot-label. */
@@ -1168,6 +1180,7 @@ function isContentDigestAssignment(name: string, value: string): boolean {
     if (ERROR_CODE_VALUE_NAMES.has(name) && isErrorCodeValue(value)) return true;
   }
   if (K8S_OBJECT_NAME_VALUE_NAMES.has(name) && isKubernetesObjectName(value)) return true;
+  if (INTERNET_DRAFT_NAME_VALUE_NAMES.has(name) && INTERNET_DRAFT_NAME_RE.test(value) && isKubernetesObjectName(value)) return true;
   if (name === "pod" && isGeneratedPodName(value)) return true;
   if (GIT_OBJECT_NAME_VALUE_NAMES.has(name) && GIT_COMMIT_SHA_RE.test(value)) return true;
   if (UUID_VALUE_NAMES.has(name) && CANONICAL_UUID_RE.test(value)) return true;

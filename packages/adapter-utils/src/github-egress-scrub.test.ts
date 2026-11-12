@@ -2176,6 +2176,37 @@ describe("scrubGitHubEgressText", () => {
     });
   });
 
+  describe("BLO-56073 regression: xml2rfc anchors and Internet-Draft names are not credentials", () => {
+    // Derived, not embedded, so this file stays pushable before the fix deploys.
+    const pair = (name: string, value: string) => [name, value].join("=");
+    const SLUG = ["test", "vectors", "bc", "provenance", "version", "2"].join("-");
+    const DRAFT = ["draft", "ramadan", "mboned", "mcast", "manifest", "01"].join("-");
+
+    it.each([
+      [`<section ${pair("anchor", `"${SLUG}"`)}><name>Test Vectors</name>`],
+      [`are in <xref ${pair("target", `"${SLUG}"`)}></xref>.</t>`],
+      [`<seriesInfo name="Internet-Draft" ${pair("value", `"${DRAFT}"`)}></seriesInfo>`],
+      [`<rfc version="3" ${pair("docName", `"${DRAFT}"`)} category="std">`],
+    ])("passes %s byte-exact", (text) => {
+      expect(scrubGitHubEgressText(text).text).toBe(text);
+      expect(locateGitHubEgressMatches(text)).toEqual([]);
+    });
+
+    // Positive controls: the name anchor narrows, it does not licence.
+    it.each([
+      ["anchor", "a3f91c8e2b7d405fa6c19e83bd27f04a1c6e59b8"],
+      ["target", SYNTHETIC_OPAQUE_VALUE],
+      ["value", SLUG],
+      ["value", ["draft", "a3f91c8e2b7d405fa6c19e83bd27f04a", "01"].join("-")],
+      ["docName", SYNTHETIC_OPAQUE_VALUE],
+      ["password", DRAFT],
+    ])("still refuses a credential-shaped value under %s", (name, value) => {
+      const result = scrubGitHubEgressText(pair(name, `"${value}"`));
+      expect(result.classes).toContain("high-entropy-assignment");
+      expect(result.text).not.toContain(value);
+    });
+  });
+
   describe("BLO-50225 regression: an orc8r network id under networkID is not a credential", () => {
     // Derived, not embedded, so this file stays pushable before the fix deploys.
     const pair = (name: string, value: string) => [name, value].join("=");
