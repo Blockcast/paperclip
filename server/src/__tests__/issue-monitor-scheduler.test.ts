@@ -32,6 +32,7 @@ import { instanceSettingsService } from "../services/instance-settings.js";
 import { heartbeatService, ISSUE_MONITOR_DISPATCH_LAPSE_MS, ISSUE_MONITOR_DISPATCH_WATCHDOG_MAX_WAIT_MS, ISSUE_MONITOR_LIVE_CONSUMER_MAX_AGE_MS, ISSUE_MONITOR_TRIGGERED_STALL_GRACE_MS, TIMER_PRE_DISPATCH_EXCLUSION_SOURCE } from "../services/heartbeat.js";
 import {
   DEFAULT_ISSUE_MONITOR_MAX_ATTEMPTS,
+  buildIssueMonitorClearedPatch,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../services/issue-execution-policy.js";
@@ -2109,6 +2110,112 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
     expect(issue.monitorNextCheckAt?.toISOString()).toBe("2026-04-11T12:36:00.000Z");
     expect(issue.monitorAttemptCount).toBe(1);
+  });
+
+  // PEN-6553 review round 2. The triggered patch used to key on the issue id
+  // alone, so it landed on top of anything the woken run had already written.
+  // That race predates PEN-6553 -- a run could always discharge unprompted
+  // inside the window -- but PEN-6553's wake directive now ASKS the run to
+  // discharge, and it fires in exactly this window, so the race went from an
+  // accident to a prompted one. A prompted act that is silently reverted is the
+  // worse failure: the run reports success, and the row goes back on the
+  // `trigger_stalled` -> recovery-wake path the directive exists to keep it off.
+  //
+  // `beforeDispatch` is the seam that reaches the window, as it is for the
+  // PEN-3554 cases above. The issue stays `in_progress` throughout: the point is
+  // a row that is still perfectly deliverable, where only the MONITOR has moved.
+  //
+  // Control arm for both cases below is the suite's own
+  // "triggers due issue monitors once and clears the one-shot schedule" --
+  // an unraced dispatch must still trigger, or the compare-and-swap would be a
+  // new way to lose every monitor rather than a guard on one window.
+  async function dischargeByClearing(issueId: string) {
+    const row = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    // The real builder, not a hand-rolled column write: what makes the guard
+    // work is that every discharge path nulls `monitorWakeRequestedAt`, and
+    // asserting that against a fixture that nulls it by hand would be asserting
+    // the fixture.
+    await db
+      .update(issues)
+      .set(buildIssueMonitorClearedPatch({
+        issue: row,
+        policy: normalizeIssueExecutionPolicy(row.executionPolicy ?? null),
+        clearReason: "manual",
+        clearedAt: new Date("2026-04-11T12:31:02.000Z"),
+      }))
+      .where(eq(issues.id, issueId));
+  }
+
+  it("leaves a clear that landed between the claim and the triggered patch standing (PEN-6553)", async () => {
+    const { issueId } = await seedFixture();
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+
+    const result = await heartbeat.__test_tickDueIssueMonitors(tickAt, {
+      beforeDispatch: async () => {
+        await dischargeByClearing(issueId);
+      },
+    });
+
+    expect(result.triggered).toBe(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    // THE assertion. `monitorNextCheckAt` is null either way -- the triggered
+    // patch nulls it too -- so the column cannot discriminate and the derived
+    // status is what does.
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({
+      status: "cleared",
+      clearReason: "manual",
+    });
+    expect(issue.monitorNextCheckAt).toBeNull();
+    // The patch would have stamped both of these from the stale claimed snapshot.
+    expect(issue.monitorLastTriggeredAt).toBeNull();
+    expect(issue.monitorAttemptCount).toBe(0);
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(actions).not.toContain("issue.monitor_triggered");
+    // The fire WAS delivered -- the wake is queued and the run exists -- so the
+    // absence of a triggered row is recorded rather than left to read as the
+    // `trigger_stalled` signature it is the opposite of.
+    expect(actions).toContain("issue.monitor_trigger_superseded");
+  });
+
+  it("leaves a re-arm that landed between the claim and the triggered patch standing (PEN-6553)", async () => {
+    const { issueId } = await seedFixture();
+    const heartbeat = createHeartbeat();
+    const tickAt = new Date("2026-04-11T12:31:00.000Z");
+    const rearmedTo = new Date("2026-04-11T16:00:00.000Z");
+
+    await heartbeat.__test_tickDueIssueMonitors(tickAt, {
+      beforeDispatch: async () => {
+        // The columns an assignee re-arm writes through `applyMonitorTransition`:
+        // a future check time, and the claim marker released.
+        await db
+          .update(issues)
+          .set({ monitorNextCheckAt: rearmedTo, monitorWakeRequestedAt: null, monitorNotes: "re-armed by the woken run" })
+          .where(eq(issues.id, issueId));
+      },
+    });
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0]!);
+    // This is the half that loses real work: the triggered patch nulls
+    // `monitorNextCheckAt`, so an overwritten re-arm stops polling the gate
+    // entirely and the row only hears about it again via the 4h stall sweep.
+    expect(issue.monitorNextCheckAt?.toISOString()).toBe(rearmedTo.toISOString());
+    expect(issue.monitorNotes).toBe("re-armed by the woken run");
+    expect(issue.monitorLastTriggeredAt).toBeNull();
+
+    const actions = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, issueId))
+      .then((rows) => rows.map((row) => row.action));
+    expect(actions).not.toContain("issue.monitor_triggered");
+    expect(actions).toContain("issue.monitor_trigger_superseded");
   });
 
   // The suppressed-dispatch deferral above is only ONE of the three branches the

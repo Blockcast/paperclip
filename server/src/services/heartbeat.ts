@@ -13663,6 +13663,7 @@ export function triggeredMonitorForPrompt(
   if (!monitor) return null;
   if (monitor.status === "triggered") {
     return {
+      phase: "triggered" as const,
       lastTriggeredAt: monitor.lastTriggeredAt ?? null,
       attemptCount: typeof monitor.attemptCount === "number" ? monitor.attemptCount : null,
       maxAttempts: typeof monitor.maxAttempts === "number" ? monitor.maxAttempts : null,
@@ -13750,6 +13751,7 @@ export function triggeredMonitorForPrompt(
   // and `serviceName` come from the policy monitor, which is still present here
   // (the triggered patch is what strips it), so they are already correct.
   return {
+    phase: "claimed" as const,
     lastTriggeredAt: null,
     attemptCount: null,
     maxAttempts: typeof monitor.maxAttempts === "number" ? monitor.maxAttempts : null,
@@ -13911,6 +13913,19 @@ export function buildPaperclipTaskMarkdown(input: {
    * not, and this gate tests the second.
    */
   triggeredMonitor?: {
+    /**
+     * PEN-6553 review round 2: WHICH of the two gate branches produced this.
+     *
+     * `"triggered"` is the settled state -- the patch has committed and the
+     * row reads `triggered` on every surface the run can check. `"claimed"`
+     * is the window between the claim and that patch: the obligation is
+     * real, and the row still reads `scheduled`. The fact line below branches
+     * on this because a directive that asserts a status the reader can
+     * falsify with one `paperclipGetIssue` is a directive the fleet learns to
+     * discount -- and the claim window is exactly where it most needs acting
+     * on.
+     */
+    phase: "claimed" | "triggered";
     lastTriggeredAt: string | null;
     attemptCount: number | null;
     maxAttempts: number | null;
@@ -14693,7 +14708,12 @@ export function buildPaperclipTaskMarkdown(input: {
       // having fired on a row with no monitor, which is the one impression this
       // block must not give.
       [
-        "This row's monitor has FIRED and is sitting `triggered`",
+        // The two windows differ in exactly one fact -- whether the triggered
+        // write has committed -- and the tail below is identical for both,
+        // because the obligation and its two exits are the same either way.
+        monitor.phase === "claimed"
+          ? "This row's monitor has FIRED -- the scheduler has claimed the fire and this run IS its wake. The `triggered` write lands moments from now, so the row may still read `scheduled` while you look at it"
+          : "This row's monitor has FIRED and is sitting `triggered`",
         monitorFacts.length > 0 ? ` (${monitorFacts.join(", ")})` : "",
         ". It stays `triggered` until a run discharges it, and ENDING YOUR RUN IS NOT ONE OF THE WAYS.",
         " Exactly two acts are:",
@@ -18855,7 +18875,47 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         // the pre-existing behaviour for policy drift, unchanged.
       }
 
-      await db
+      // PEN-6553 review round 2: compare-and-swap on the claim THIS dispatch
+      // made, rather than on the issue id alone.
+      //
+      // `enqueueWakeup` above has already created the run, and that run's
+      // prompt now carries the triggered-monitor directive -- which asks it to
+      // re-arm or clear. Both of those commit through `applyMonitorTransition`,
+      // and both null `monitorWakeRequestedAt` (`clearArmedMonitorColumns` on
+      // the clear path, an explicit null on the re-arm path). An id-only patch
+      // therefore lands ON TOP of a discharge that beat it, rebuilding
+      // `triggered` from the stale `claimed` snapshot: the clear is undone, a
+      // re-arm loses its `nextCheckAt` and its notes, and the row goes back on
+      // the `trigger_stalled` -> recovery-wake path this directive exists to
+      // keep it off. The run reports success and nothing records the loss.
+      //
+      // The race predates PEN-6553 -- a run could always discharge unprompted
+      // inside the window -- but the directive now ASKS for the act, and the
+      // band it newly fires in (7.56-22 s; 7 of 15 monitor wakes on one seat)
+      // is the same window. A prompted act that is silently reverted is worse
+      // than an unprompted one, because the run reports it as done.
+      //
+      // The marker is the right CAS key because it is unique to this fire: the
+      // claim sets it to `now` inside the transaction that selects the row, and
+      // `claimed` is that update's own `.returning()` row at BOTH call sites,
+      // so the value compared is the value written. A mismatch means somebody
+      // else has already moved this monitor on -- the woken run discharging it,
+      // or a later tick re-claiming a stale claim -- and in every one of those
+      // cases leaving their write standing is the correct answer.
+      //
+      // Scoped to the triggered patch alone, and that is not an oversight. The
+      // sibling writes in this function -- the dependency-blocked and suppressed
+      // deferrals, and the clear in the catch -- all run on paths where
+      // `enqueueWakeup` queued nothing, so no run exists to have been told to
+      // discharge anything. The triggered patch is the only write the directive
+      // can race.
+      //
+      // Falls back to the id-only predicate when the caller hands us a row with
+      // no claim marker. Neither call site can do that today; if one ever does,
+      // there is no claim to assert, and today's behaviour is the right default
+      // rather than a monitor that silently never triggers again.
+      const claimMarker = claimed.monitorWakeRequestedAt;
+      const triggeredRows = await db
         .update(issues)
         .set({
           ...buildIssueMonitorTriggeredPatch({
@@ -18865,7 +18925,40 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           }),
           updatedAt: new Date(),
         })
-        .where(eq(issues.id, claimed.id));
+        .where(
+          claimMarker
+            ? and(eq(issues.id, claimed.id), eq(issues.monitorWakeRequestedAt, claimMarker))
+            : eq(issues.id, claimed.id),
+        )
+        .returning({ id: issues.id });
+
+      if (triggeredRows.length === 0) {
+        // Not a `skipped` dispatch in the sense the other returns mean it: the
+        // wake WAS queued and the run exists. What did not happen is the state
+        // transition, and it did not happen because the thing it would have
+        // asked for has already been done. Recorded under its own action so a
+        // later reader asking why this fire has no `issue.monitor_triggered`
+        // row finds the answer, instead of reading the absence as the
+        // `trigger_stalled` signature it is the opposite of.
+        await logActivity(db, {
+          companyId: claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_trigger_superseded",
+          entityType: "issue",
+          entityId: claimed.id,
+          details: {
+            identifier: claimed.identifier,
+            nextCheckAt: scheduledAtIso,
+            claimedAt: claimMarker?.toISOString() ?? null,
+            ...monitorMetadata,
+            source: input.activitySource,
+          },
+        });
+        return { outcome: "skipped" as const, reason: "monitor_discharged_before_trigger" };
+      }
 
       await logActivity(db, {
         companyId: claimed.companyId,
