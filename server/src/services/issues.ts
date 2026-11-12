@@ -12867,6 +12867,18 @@ export function issueService(db: Db) {
         patch.executionWorkspaceSettings = nextExecutionWorkspaceSettings
           ? { ...nextExecutionWorkspaceSettings }
           : null;
+      } else if (
+        issueData.executionWorkspacePreference === "isolated_workspace" ||
+        issueData.executionWorkspacePreference === "shared_workspace" ||
+        issueData.executionWorkspacePreference === "operator_branch" ||
+        issueData.executionWorkspacePreference === "agent_default"
+      ) {
+        // BLO-55927: runs resolve their mode from `executionWorkspaceSettings.mode`, never from the
+        // preference, so a preference-only PATCH left an inherited `shared_workspace` mode in force.
+        patch.executionWorkspaceSettings = {
+          ...((existing.executionWorkspaceSettings as Record<string, unknown> | null) ?? {}),
+          mode: issueData.executionWorkspacePreference,
+        };
       }
 
       applyStatusSideEffects(issueData.status, patch);

@@ -4537,10 +4537,13 @@ async function resolveManagedProjectWorkspaceCheckout(input: {
   if (stats) {
     const entries = await fs.readdir(cwd).catch(() => []);
     if (entries.length > 0) {
-      return {
-        cwd,
-        warning: `Managed workspace path "${cwd}" already exists but is not a git checkout. Using it as-is.`,
-      };
+      // BLO-55927: this used to warn and return the directory "as-is". A run-isolated pod then
+      // bootstraps from a tree that is not a checkout and starts in a cwd that does not exist.
+      // Throwing lets resolveWorkspaceForRun refuse loudly (project_workspace_unrealizable),
+      // naming this path. Not auto-moved aside: other shared_workspace runs may have it as cwd.
+      throw new Error(
+        `Managed workspace path "${cwd}" already exists but is not a git checkout; move it aside so it can be re-cloned.`,
+      );
     }
     await fs.rm(cwd, { recursive: true, force: true });
   }
@@ -4565,8 +4568,7 @@ async function resolveManagedProjectWorkspaceCheckout(input: {
  * the common case, and it is the one the 2026-08-10 sweep found broken -- a fix
  * applied only after a successful `git clone` would never reach any of the 29
  * misconfigured checkouts. Provisioning here covers the pre-existing-`.git`
- * return, the "exists but isn't a checkout" return (which includes linked
- * worktrees), the repo-less return (a no-op, since there is no git metadata to
+ * return (which includes linked worktrees, whose `.git` is a file), the repo-less return (a no-op, since there is no git metadata to
  * write into), and the post-clone return alike.
  *
  * BLO-31351 adds the partial-clone guard here for the same reason, and the

@@ -21,7 +21,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { cleanupHeartbeatTestState } from "./helpers/cleanup-heartbeat-test-state.js";
 import { heartbeatService } from "../services/heartbeat.js";
-import { resolveDefaultAgentWorkspaceDir } from "../home-paths.js";
+import { resolveDefaultAgentWorkspaceDir, resolveManagedProjectWorkspaceDir } from "../home-paths.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -226,7 +226,7 @@ describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
   // labelled `project_primary`, and be persisted as a shared_workspace
   // execution workspace pinned to that agent home — even for an issue whose
   // preference is isolated_workspace.
-  async function seedLocalFolderPrimary(cwd: string) {
+  async function seedLocalFolderPrimary(cwd: string | null) {
     const companyId = randomUUID();
     const projectId = randomUUID();
     const workspaceId = randomUUID();
@@ -288,7 +288,7 @@ describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
       createdAt: new Date(),
       updatedAt: new Date(),
     });
-    return { workspaceId, issueId, agentId };
+    return { workspaceId, issueId, agentId, companyId, projectId };
   }
 
   async function expectRefusedWithoutAgentHomeFallback(
@@ -346,5 +346,20 @@ describeEmbeddedPostgres("preferred non-primary workspace fail-loud", () => {
     tempRoots.push(notARepo);
     const seeded = await seedLocalFolderPrimary(notARepo);
     await expectRefusedWithoutAgentHomeFallback(seeded, notARepo, "path is not a git checkout");
+  }, 120_000);
+
+  // BLO-55927: the MANAGED checkout path (no configured cwd) used to be accepted "as-is" when it
+  // existed non-empty without `.git`, and the run started in a tree that was not a checkout.
+  it("refuses a managed checkout path that exists but is not a git checkout", async () => {
+    const seeded = await seedLocalFolderPrimary(null);
+    const managedDir = resolveManagedProjectWorkspaceDir({
+      companyId: seeded.companyId,
+      projectId: seeded.projectId,
+      repoName: "local-folder",
+    });
+    await mkdir(managedDir, { recursive: true });
+    tempRoots.push(managedDir);
+    await writeFile(path.join(managedDir, "stray.txt"), "not a checkout\n");
+    await expectRefusedWithoutAgentHomeFallback(seeded, managedDir, "already exists but is not a git checkout");
   }, 120_000);
 });
