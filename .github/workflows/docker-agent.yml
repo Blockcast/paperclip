@@ -115,6 +115,25 @@ jobs:
       # cache on ordinal 0. The local DinD daemon is still used for the fresh
       # ffmpeg smoke run below; only BuildKit execution moves to the persistent
       # remote cache owner.
+      #
+      # PEN-6579 item 3, DECIDED: this probe stays a TCP connect, where
+      # docker.yml's is a solve (PEN-6371) plus a sibling-ordinal demotion.
+      # The divergence is a decision, not drift.
+      #
+      # This lane already retries the entire build against the ClusterIP when
+      # the first attempt fails ("Retarget BuildKit after failed build" below,
+      # BLO-49674). That covers a daemon which sickens MID-build as well as one
+      # that is already sick, so it is strictly wider than a pre-flight probe —
+      # it is only later and more expensive. docker.yml needed the pre-flight
+      # one because a failure there burned a scheduled production-deploy slot
+      # and froze delivery for 10 h; a failure here costs one extra agent-image
+      # build and nothing else. Against that, a probe solve would be paid on
+      # every run of this lane, including the overwhelming majority that are
+      # healthy.
+      #
+      # Revisit if that retry is removed, or if this lane ever gates something
+      # with a scarce dispatch budget. Until then the cheaper signal is the
+      # right one here, and this comment is the record that it was weighed.
       - name: Select BuildKit endpoint
         id: buildkit-endpoint
         env:

@@ -137,6 +137,13 @@ function save(v) { fs.writeFileSync(state, JSON.stringify(v)); }
 
 if (argv[0] !== "buildx") process.exit(1);
 
+if (argv[1] === "version") {
+  // The guard's only question: is the plugin here? A CLI without it answers
+  // this non-zero, which is what DOCKER_WITHOUT_BUILDX_SOURCE reproduces.
+  process.stdout.write("github.com/docker/buildx v0.36.1\\n");
+  process.exit(0);
+}
+
 if (argv[1] === "create") {
   // Real \`docker buildx create --driver remote\` records an endpoint; it does
   // not dial. Keeping that faithful is what makes \`build\` the only seam that
@@ -180,6 +187,17 @@ if (argv[1] === "build") {
 }
 `;
 
+// PEN-6579 item 2. A Docker CLI whose buildx plugin is absent: every buildx
+// subcommand, `version` included, exits non-zero the way a real CLI does. It
+// still writes the ledger, so a case can prove the step stopped AT the guard
+// rather than going on to create a builder and score the absence as a red.
+const DOCKER_WITHOUT_BUILDX_SOURCE = `#!${NODE}
+const fs = require("node:fs");
+fs.appendFileSync(process.env.PROBE_LEDGER, process.argv.slice(2).join(" ") + "\\n");
+process.stderr.write("docker: 'buildx' is not a docker command.\\n");
+process.exit(1);
+`;
+
 // A sealed PATH: only the utilities the step actually invokes. That is what
 // lets the "no docker client" arm be a genuine absence rather than a stub
 // that reports one.
@@ -196,7 +214,7 @@ function resolveBinary(name) {
 // cases here would otherwise read as the step's own refusal.
 const BASH = resolveBinary("bash");
 
-function makePath({ withDocker = true } = {}) {
+function makePath({ withDocker = true, withBuildx = true } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), "buildkit-probe-path-"));
   for (const utility of REAL_UTILITIES) {
     symlinkSync(resolveBinary(utility), path.join(dir, utility));
@@ -204,7 +222,7 @@ function makePath({ withDocker = true } = {}) {
   writeFileSync(path.join(dir, "nc"), NC_SOURCE);
   chmodSync(path.join(dir, "nc"), 0o755);
   if (withDocker) {
-    writeFileSync(path.join(dir, "docker"), DOCKER_SOURCE);
+    writeFileSync(path.join(dir, "docker"), withBuildx ? DOCKER_SOURCE : DOCKER_WITHOUT_BUILDX_SOURCE);
     chmodSync(path.join(dir, "docker"), 0o755);
   }
   return dir;
@@ -222,8 +240,10 @@ function makePath({ withDocker = true } = {}) {
 async function runStep({
   ordinal = "1",
   preferred = listeningOnlyPort,
+  sibling = null,
   fallback = servingPort,
   withDocker = true,
+  withBuildx = true,
   shell = STEP,
 } = {}) {
   const root = mkdtempSync(path.join(tmpdir(), "buildkit-probe-"));
@@ -234,13 +254,19 @@ async function runStep({
   writeFileSync(ledger, "");
   writeFileSync(builders, "{}");
 
+  // The sibling ordinal is UNMAPPED unless a case asks for it, and the fake
+  // `nc` reports an unmapped host as refusing connections. That is deliberate:
+  // every case written before PEN-6579 added the sibling arm keeps exercising
+  // the ClusterIP arm it was written for, so its assertions still mean what
+  // they said.
   const map = { [FALLBACK]: fallback };
   map[ordinal === "1" ? PREFERRED_1 : PREFERRED_0] = preferred;
+  if (sibling !== null) map[ordinal === "1" ? PREFERRED_0 : PREFERRED_1] = sibling;
 
   const result = await new Promise((resolve, reject) => {
     const child = spawn(BASH, ["-c", shell], {
       env: {
-        PATH: makePath({ withDocker }),
+        PATH: makePath({ withDocker, withBuildx }),
         PREFERRED_ORDINAL: ordinal,
         GITHUB_OUTPUT: output,
         PROBE_MAP: JSON.stringify(map),
@@ -370,7 +396,92 @@ test("without a docker client the step keeps the preferred ordinal and says so",
 
   assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
   assert.equal(result.host, PREFERRED_1);
-  assert.match(result.stdout, /::warning::docker is unavailable/);
+  assert.match(result.stdout, /::warning::docker buildx is unavailable/);
+});
+
+// ---------------------------------------------- PEN-6579 item 2: which binary
+
+test("a docker CLI without the buildx plugin also keeps the preferred ordinal", async () => {
+  // The case `command -v docker` could not see. The CLI is present, so the old
+  // guard passed; the plugin is not, so `buildx create` failed, rc=1 came back
+  // as "unhealthy", and EVERY build routed to the ClusterIP -- silently
+  // dissolving the affinity the comment above promises to keep. "Cannot
+  // measure" has to reach the same answer here as with no client at all.
+  const result = await runStep({ preferred: listeningOnlyPort, withBuildx: false });
+
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  assert.equal(result.host, PREFERRED_1);
+  assert.match(result.stdout, /::warning::docker buildx is unavailable/);
+  // Stopped AT the guard: no builder was ever created, so nothing could have
+  // been scored unhealthy on the plugin's absence.
+  assert.match(result.ledger, /buildx version/);
+  assert.doesNotMatch(result.ledger, /buildx create/);
+});
+
+test("MUTATION: the old `command -v docker` guard sends that same CLI to the ClusterIP", async () => {
+  // Proves the guard change is load-bearing rather than cosmetic: restore the
+  // predicate item 2 replaced and the case above inverts.
+  const anchor = 'if ! docker buildx version >/dev/null 2>&1; then';
+  assert.ok(STEP.includes(anchor), "mutation anchor not found -- this test is vacuous");
+  const mutated = STEP.replace(anchor, 'if ! command -v docker >/dev/null 2>&1; then');
+
+  const result = await runStep({ preferred: listeningOnlyPort, withBuildx: false, shell: mutated });
+
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  assert.equal(result.host, FALLBACK, "the old guard must reinstate the defect, or the case above tests nothing");
+});
+
+// --------------------------------------------- PEN-6579 item 1: the sibling arm
+
+test("a sick preferred ordinal demotes to the sibling ordinal, not the ClusterIP", async () => {
+  // The ClusterIP balances over whichever pods the Service reports Ready, and
+  // the pod just rejected can stay Ready for ~15 min (livenessProbe
+  // periodSeconds 60 x failureThreshold 15), so demoting straight to it is a
+  // coin flip that can re-select the daemon this step just measured as sick.
+  const result = await runStep({ preferred: listeningOnlyPort, sibling: servingPort });
+
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  assert.equal(result.host, PREFERRED_0, "ordinal 1 cannot serve and ordinal 0 can, so ordinal 0 is the endpoint");
+  assert.match(result.stdout, /its cache is cold for this build class/);
+});
+
+test("the sibling is probed on a solve, not trusted", async () => {
+  // Same shape as the defect in the preferred arm: a sibling can accept TCP
+  // and be unable to serve. Taking it on a connect would move the 2026-11-09
+  // failure one endpoint to the right rather than removing it.
+  const result = await runStep({ preferred: listeningOnlyPort, sibling: listeningOnlyPort });
+
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  assert.equal(result.host, FALLBACK);
+  assert.match(result.stdout, /Neither ordinal can complete a solve/);
+  assert.match(result.ledger, /buildx create --name \S+ --driver remote tcp:\/\/buildkit-amd64-0\S*:1234/);
+});
+
+test("MUTATION: dropping the sibling's solve makes a sick sibling get selected", async () => {
+  const anchor = 'if probe_tcp "${sibling}" 5 && probe_solve "${sibling}" 90; then';
+  assert.ok(STEP.includes(anchor), "mutation anchor not found -- this test is vacuous");
+  const mutated = STEP.replace(anchor, 'if probe_tcp "${sibling}" 5; then');
+
+  const result = await runStep({ preferred: listeningOnlyPort, sibling: listeningOnlyPort, shell: mutated });
+
+  assert.equal(result.host, PREFERRED_0, "gutting the sibling solve must reinstate the defect, or the case above is not testing it");
+});
+
+test("the sibling arm honours whichever ordinal was preferred", async () => {
+  // Symmetry. A push build prefers ordinal 0, so its sibling is ordinal 1.
+  const result = await runStep({ ordinal: "0", preferred: listeningOnlyPort, sibling: servingPort });
+
+  assert.equal(result.status, 0, `${result.stdout}${result.stderr}`);
+  assert.equal(result.host, PREFERRED_1);
+});
+
+test("a healthy preferred ordinal never probes the sibling", async () => {
+  // The added arm must cost nothing on the happy path: no extra dial, no extra
+  // solve, and the same endpoint as before.
+  const result = await runStep({ preferred: servingPort, sibling: servingPort });
+
+  assert.equal(result.host, PREFERRED_1);
+  assert.doesNotMatch(result.ledger, /buildkit-amd64-0/, "the sibling must not be touched while the preferred ordinal serves");
 });
 
 test("an ordinal outside the StatefulSet is refused before any probe", async () => {
