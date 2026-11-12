@@ -54,53 +54,95 @@ function quoteIdentifier(value: string): string {
   return `"${assertIdentifier(value).replaceAll("\"", "\"\"")}"`;
 }
 
-function splitSqlStatements(input: string): string[] {
-  const statements: string[] = [];
-  let start = 0;
-  let quote: "'" | "\"" | null = null;
-  let lineComment = false;
-  let blockComment = false;
+type SqlSpanKind = "code" | "quoted" | "comment";
+type SqlSpan = { kind: SqlSpanKind; start: number; end: number; quote?: "'" | "\"" };
+
+/**
+ * The single SQL lexer shared by statement splitting and the keyword scan.
+ *
+ * Returns contiguous spans covering the whole input, classifying each region as
+ * executable code, a quoted literal/identifier, or a comment.
+ *
+ * Both consumers MUST agree on what is a comment and what is a literal. They used
+ * not to: `splitSqlStatements` scanned characters and tracked line comments, while
+ * `stripSqlForKeywordScan` ran a chain of regexes that replaced quoted literals
+ * BEFORE line comments. An apostrophe inside a `--` comment was therefore live when
+ * the literal regex ran and paired with the opening quote of the next real string,
+ * swallowing everything between them -- including the statement keyword. That cut
+ * both ways: it refused valid migrations whose comment carried an odd number of
+ * apostrophes, and it hid banned statements from `assertNoBannedSql` (PEN-5951).
+ *
+ * Fixing it by reordering the regexes is NOT equivalent and is not safe: stripping
+ * `--` first truncates any string literal that legitimately contains `--`, leaving
+ * unbalanced quotes. Only one lexer settles both directions.
+ */
+function scanSqlSpans(input: string): SqlSpan[] {
+  const spans: SqlSpan[] = [];
+  let codeStart = 0;
+
+  const closeCode = (end: number): void => {
+    if (end > codeStart) spans.push({ kind: "code", start: codeStart, end });
+  };
 
   for (let i = 0; i < input.length; i += 1) {
     const char = input[i]!;
     const next = input[i + 1];
 
-    if (lineComment) {
-      if (char === "\n") lineComment = false;
-      continue;
-    }
-    if (blockComment) {
-      if (char === "*" && next === "/") {
-        blockComment = false;
-        i += 1;
-      }
-      continue;
-    }
-    if (quote) {
-      if (char === quote) {
-        if (next === quote) {
-          i += 1;
-        } else {
-          quote = null;
-        }
-      }
-      continue;
-    }
     if (char === "-" && next === "-") {
-      lineComment = true;
-      i += 1;
+      closeCode(i);
+      const newline = input.indexOf("\n", i);
+      const end = newline === -1 ? input.length : newline;
+      spans.push({ kind: "comment", start: i, end });
+      // The newline itself stays code, so it still separates tokens.
+      i = end - 1;
+      codeStart = end;
       continue;
     }
+
     if (char === "/" && next === "*") {
-      blockComment = true;
-      i += 1;
+      closeCode(i);
+      const closed = input.indexOf("*/", i + 2);
+      const end = closed === -1 ? input.length : closed + 2;
+      spans.push({ kind: "comment", start: i, end });
+      i = end - 1;
+      codeStart = end;
       continue;
     }
+
     if (char === "'" || char === "\"") {
-      quote = char;
+      closeCode(i);
+      const quote = char;
+      let j = i + 1;
+      for (; j < input.length; j += 1) {
+        if (input[j] !== quote) continue;
+        // A doubled quote is an escaped quote, not the end of the literal.
+        if (input[j + 1] === quote) {
+          j += 1;
+          continue;
+        }
+        break;
+      }
+      // An unterminated literal runs to end of input, as the splitter always did.
+      const end = j < input.length ? j + 1 : input.length;
+      spans.push({ kind: "quoted", start: i, end, quote });
+      i = end - 1;
+      codeStart = end;
       continue;
     }
-    if (char === ";") {
+  }
+
+  closeCode(input.length);
+  return spans;
+}
+
+function splitSqlStatements(input: string): string[] {
+  const statements: string[] = [];
+  let start = 0;
+
+  for (const span of scanSqlSpans(input)) {
+    if (span.kind !== "code") continue;
+    for (let i = span.start; i < span.end; i += 1) {
+      if (input[i] !== ";") continue;
       const statement = input.slice(start, i).trim();
       if (statement) statements.push(statement);
       start = i + 1;
@@ -113,11 +155,22 @@ function splitSqlStatements(input: string): string[] {
 }
 
 function stripSqlForKeywordScan(input: string): string {
-  return input
-    .replace(/'([^']|'')*'/g, "''")
-    .replace(/"([^"]|"")*"/g, "\"\"")
-    .replace(/--.*$/gm, "")
-    .replace(/\/\*[\s\S]*?\*\//g, "");
+  let out = "";
+  for (const span of scanSqlSpans(input)) {
+    if (span.kind === "code") {
+      out += input.slice(span.start, span.end);
+      continue;
+    }
+    if (span.kind === "quoted") {
+      out += span.quote === "'" ? "''" : "\"\"";
+      continue;
+    }
+    // A comment is whitespace to Postgres, so it must SEPARATE the tokens either
+    // side of it. Replacing it with "" glued `create/**/extension` into a single
+    // token that `\bcreate\s+extension\b` could not see.
+    out += " ";
+  }
+  return out;
 }
 
 function normaliseSql(input: string): string {
