@@ -108,10 +108,15 @@ export const ATTENDANCE_TABLE = "alert_attendance_observations";
  * determination that would previously have read `attended_monitor` or
  * `attended_blocker`. It DOES absorb some `held_alert_clear`: the deferral
  * returns ahead of the liveness read, so a park-only row whose alert has
- * silently cleared records `attended_park` now. The arms are behaviourally
- * identical — both re-arm the same rung one interval out and neither reassigns
- * — so read the before/after as `attended_park` against `unattended_rung` PLUS
- * `held_alert_clear`, never against `unattended_rung` alone.
+ * silently cleared records `attended_park` now. The LADDER behaviour is the
+ * same — both re-arm the same rung one interval out and neither reassigns —
+ * but the arms are NOT identical: `held_alert_clear` also posts the one-time
+ * not-firing notice to the issue and records `alertLiveness: "not_firing"`,
+ * where this arm posts nothing and records `"not_read"`. So while a park holds,
+ * a cleared alert is not announced on the thread — deferred, not dropped, since
+ * the first pass after the park term lapses posts it. Read the before/after as
+ * `attended_park` against `unattended_rung` PLUS `held_alert_clear`, never
+ * against `unattended_rung` alone.
  *
  * Unlike its two siblings it is BOUNDED: a park holds the rung for
  * a fixed number of intervals from `parkedAt` and no longer, because a park can

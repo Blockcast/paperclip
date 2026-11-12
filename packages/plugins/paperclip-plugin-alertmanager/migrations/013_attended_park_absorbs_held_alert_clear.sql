@@ -17,10 +17,32 @@
 -- recorded held_alert_clear. That is a reshuffle between buckets, in the one
 -- dimension the retired sentence denies.
 --
--- NOTHING OBSERVABLE MOVED. Both arms CAS the same `nextEscalationAt` one rung
--- interval out and neither reassigns the row, so this is a measurement-claim
--- defect and not a behaviour change. It matters because the count of
--- attended_park is what PEN-6486 is to be re-measured on, and read against
+-- THE LADDER BEHAVIOUR IS THE SAME; ONE THREAD-VISIBLE SIDE EFFECT IS NOT.
+-- Both arms CAS the same `nextEscalationAt` one rung interval out and neither
+-- reassigns or closes the row. They are not otherwise identical.
+-- `holdLadderForClearedAlert` does two further things that the park arm, which
+-- returns AHEAD of `readLiveness`, therefore skips: it posts the one-time
+-- `NOT_FIRING_MARKER` notice to the issue, and it records
+-- `alertLiveness: not_firing` where the park arm records `not_read`. So while a
+-- park holds, a park-only row whose alert has silently cleared is NOT told so on
+-- its own thread.
+--
+-- That notice is DEFERRED, not dropped: the marker dedups against the issue
+-- comments, so the first pass taken after the park term goes false posts it if
+-- the alert is still clear. The park term is bounded by `parkedUntil` and by
+-- MAX_PARK_DEFERRAL_RUNGS intervals from `parkedAt`, whichever lapses first.
+--
+-- An earlier draft of this file said NOTHING OBSERVABLE MOVED. That is the
+-- branch-enumeration miss the section below warns against, committed in the
+-- file that warns against it: the comment post is a branch of the very arm
+-- being absorbed, and it was not enumerated. Whether suppressing the notice for
+-- the life of a park is the RIGHT behaviour is a live question and is NOT
+-- settled here. Moving the park check behind `readLiveness` would restore the
+-- notice at the cost of an Alertmanager read on park-only rows; that is a
+-- behaviour change and belongs to PEN-6486, not to a comment-accuracy fix.
+--
+-- It still matters for measurement, which is what this file is for: the count
+-- of attended_park is what PEN-6486 is to be re-measured on, and read against
 -- unattended_rung alone it over-reports by however much it absorbed.
 --
 -- WHY A WHOLE MIGRATION FOR A COMMENT, FOR THE THIRD TIME. `012` is
@@ -73,10 +95,14 @@ COMMENT ON COLUMN plugin_alertmanager_184163d1ba.alert_attendance_observations.d
   'attended_park is evaluated LAST, behind both older mechanisms, so it never absorbs a '
   'determination that would previously have read attended_monitor or attended_blocker. It DOES '
   'absorb some held_alert_clear: the deferral returns before the Alertmanager liveness read, so a '
-  'park-only row whose alert has silently cleared now records attended_park instead. Behaviour is '
-  'identical -- both re-arm the same rung one interval out and neither reassigns -- but read the '
-  'before/after as attended_park against unattended_rung PLUS held_alert_clear, never against '
-  'unattended_rung alone. '
+  'park-only row whose alert has silently cleared now records attended_park instead. Ladder '
+  'behaviour is the same -- both re-arm the same rung one interval out and neither reassigns -- '
+  'but the two arms are NOT identical: held_alert_clear also posts the one-time not-firing notice '
+  'to the issue and records alertLiveness not_read rather than not_firing, so while the park holds '
+  'the cleared alert is not announced on the thread. The notice is deferred rather than dropped, '
+  'because the first pass taken after the park term lapses posts it if the alert is still clear. '
+  'Read the before/after as attended_park against unattended_rung PLUS held_alert_clear, never '
+  'against unattended_rung alone. '
   'This SUPERSEDES the COMMENT ON COLUMN written by migration 012, which stated that attended_park '
   'is written if and only if the ladder would otherwise have ADVANCED A RUNG and that its count is '
   'therefore not a reshuffle between buckets; 012 is checksum-frozen once applied and cannot be '

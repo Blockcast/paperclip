@@ -352,8 +352,16 @@ describe("PEN-2918 (D) — acceptance, against real Postgres", () => {
     ]) expect(comment).toContain(token);
     // The ordering property is what stops `attended_park` absorbing either
     // older attended_* bucket, so it is recorded where the counts are read.
-    // It does absorb some `held_alert_clear`; the column comment says so too.
     expect(comment).toContain("evaluated LAST");
+    // `evaluated LAST` and every token above also hold for the SUPERSEDED `012`
+    // comment, so on their own they cannot tell whether `col_description()` is
+    // returning `012` or `013` — i.e. whether `013` applied at all. These two
+    // are absent from `012` and present only in `013`: the first pins the
+    // absorption `013` exists to record, the second pins the correction to it
+    // (the two arms differ by the one-time not-firing notice, so `013` must not
+    // call them identical).
+    expect(comment).toContain("PLUS held_alert_clear");
+    expect(comment).toContain("not_read rather than not_firing");
   });
 });
 
