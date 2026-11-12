@@ -40,6 +40,10 @@ import { AGENT_POD_BUSY_MAX_STALE_MS } from "../services/k8s-job-liveness.ts";
 import { STALE_RUNNING_ISSUE_LOCK_MS } from "../services/recovery/service.ts";
 import { LOCKLESS_DEFERRED_WAKE_MIN_AGE_MS } from "../services/recovery/service.ts";
 import { NON_LIVE_EXECUTION_SILENCE_MS } from "../services/productivity-review.ts";
+import {
+  restoreCheckoutPromotedStatus,
+  restoreCheckoutPromotedStatuses,
+} from "../services/issue-checkout-status.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -3100,6 +3104,85 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       await heartbeatService(db).sweepStaleIssueLocks();
 
       expect((await readRow(issueId))?.status).toBe("todo");
+    });
+
+    // PEN-6593 — every case above enters through `sweepStaleIssueLocks()`, which is one
+    // of three callers of `restoreCheckoutPromotionSet`. The two RELEASE entry points
+    // share that helper today, so they already behave identically; what was missing is
+    // anything that would fail if they stopped. This drain cannot afford that divergence
+    // quietly: the restore writes no activity row, so a hold dropped on the release path
+    // is dropped silently — the exact property PEN-6587 exists to fix.
+    describe("release entry points honour the declaration too (PEN-6593)", () => {
+      async function seedDeclaredAndUndeclared(input: {
+        companyId: string;
+        agentId: string;
+        lockRunId: string;
+      }) {
+        const common = {
+          ...input,
+          startedAt: new Date(Date.now() - 9 * 60 * 60 * 1000),
+          checkoutRestoreStatus: "blocked",
+        };
+        // Identical in every respect a restore looks at except the declaration, so the
+        // two rows differ by exactly the variable under test.
+        const declaredId = await seedStrandedPromotion({
+          ...common,
+          description: `Waiting on a human.\n\n${EXTERNAL_WAIT_DECLARATION}\n`,
+        });
+        const undeclaredId = await seedStrandedPromotion({
+          ...common,
+          description: "Waiting on a human, but nowhere in the declared two-line form.",
+        });
+        return { declaredId, undeclaredId };
+      }
+
+      it("keeps a declared zero-blocker wait blocked across a single-row release", async () => {
+        const { companyId, agentId, failedRunId } = await seed();
+        const { declaredId, undeclaredId } = await seedDeclaredAndUndeclared({
+          companyId,
+          agentId,
+          lockRunId: failedRunId,
+        });
+
+        expect(await restoreCheckoutPromotedStatus(db, { issueId: declaredId, companyId }))
+          .toBe(true);
+        expect(await restoreCheckoutPromotedStatus(db, { issueId: undeclaredId, companyId }))
+          .toBe(true);
+
+        const declared = await readRow(declaredId);
+        // The hold survives the release...
+        expect(declared?.status).toBe("blocked");
+        // ...and it is a COMPLETED restore in every other respect, not a skipped one:
+        // the promotion is undone, only the status is held.
+        expect(declared?.startedAt).toBeNull();
+        expect(declared?.checkoutRestoreStatus).toBeNull();
+        expect(declared?.assigneeAgentId).toBe(agentId);
+
+        // Control through the SAME entry point. Without it, an arm that held every
+        // `blocked` marker would pass the assertions above just as happily.
+        expect((await readRow(undeclaredId))?.status).toBe("todo");
+      });
+
+      it("keeps a declared zero-blocker wait blocked across a batch release", async () => {
+        const { companyId, agentId, failedRunId } = await seed();
+        const { declaredId, undeclaredId } = await seedDeclaredAndUndeclared({
+          companyId,
+          agentId,
+          lockRunId: failedRunId,
+        });
+
+        // Both rows in ONE statement: the batch form resolves declarations per row, so a
+        // declared and an undeclared row released together must still diverge. A batch
+        // that decided once for the whole set would fail here and nowhere else.
+        const restored = await restoreCheckoutPromotedStatuses(db, {
+          issueIds: [declaredId, undeclaredId],
+          companyId,
+        });
+
+        expect([...restored].sort()).toEqual([declaredId, undeclaredId].sort());
+        expect((await readRow(declaredId))?.status).toBe("blocked");
+        expect((await readRow(undeclaredId))?.status).toBe("todo");
+      });
     });
 
     it("does not demote a row holding a dispatchable monitor with a future check", async () => {
