@@ -288,19 +288,32 @@ export const skillTestAgentKeyScopeSchema = z.object({
   issueId: z.string().guid(),
 }).strict();
 
+// BLO-56152: refused on every non-safe HTTP method by the auth middleware,
+// whatever the agent's grants; otherwise reads like `standard`.
+export const readOnlyAgentKeyScopeSchema = z.object({
+  kind: z.literal("read_only"),
+}).strict();
+
 export const agentApiKeyScopeSchema = z.union([
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,
+  readOnlyAgentKeyScopeSchema,
 ]);
 
 export type AgentApiKeyScope = z.infer<typeof agentApiKeyScopeSchema>;
 export type TaskBridgeAgentKeyScope = z.infer<typeof taskBridgeAgentKeyScopeSchema>;
 export type SkillTestAgentKeyScope = z.infer<typeof skillTestAgentKeyScopeSchema>;
+export type ReadOnlyAgentKeyScope = z.infer<typeof readOnlyAgentKeyScopeSchema>;
 
 export function normalizeAgentApiKeyScope(value: unknown): AgentApiKeyScope {
   const parsed = agentApiKeyScopeSchema.safeParse(value);
-  return parsed.success ? parsed.data : { kind: "standard" };
+  if (parsed.success) return parsed.data;
+  // A malformed read_only config must never widen to `standard` write power.
+  if (typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "read_only") {
+    return { kind: "read_only" };
+  }
+  return { kind: "standard" };
 }
 
 export const createAgentKeySchema = z.object({

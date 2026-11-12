@@ -32,7 +32,7 @@ function createSelectChain(rowsForTable: (table: unknown) => unknown[]) {
 
 function createDbState(input: {
   agent: { id: string; companyId: string; status?: string };
-  agentKey?: { id: string; agentId: string; companyId: string; keyHash: string; responsibleUserId?: string | null };
+  agentKey?: { id: string; agentId: string; companyId: string; keyHash: string; responsibleUserId?: string | null; scopeConfig?: unknown };
   run?: { id: string; companyId: string; agentId: string; responsibleUserId?: string | null };
 }) {
   const activity: Array<Record<string, unknown>> = [];
@@ -49,7 +49,7 @@ function createDbState(input: {
         keyHash: input.agentKey.keyHash,
         responsibleUserId: input.agentKey.responsibleUserId ?? null,
         revokedAt: null,
-        scopeConfig: null,
+        scopeConfig: input.agentKey.scopeConfig ?? null,
       }
     : null;
   const runRow = input.run
@@ -113,6 +113,14 @@ function createApp(db: any) {
   app.patch("/companies/:companyId/issues/:issueId", (req, res) => {
     assertCompanyAccess(req, req.params.companyId);
     res.json({ id: req.params.issueId, writable: true });
+  });
+  app.post("/companies/:companyId/issues/:issueId/comments", (req, res) => {
+    assertCompanyAccess(req, req.params.companyId);
+    res.status(201).json({ commented: true });
+  });
+  app.post("/companies/:companyId/issues", (req, res) => {
+    assertCompanyAccess(req, req.params.companyId);
+    res.status(201).json({ created: true });
   });
   app.use(errorHandler);
   return app;
@@ -406,5 +414,94 @@ describe("agent auth middleware", () => {
       entityId: keyId,
       details: { method: "GET", url: `/companies/${companyId}/protected` },
     });
+  });
+
+  it("refuses every non-safe method for read_only agent keys and still serves reads (BLO-56152)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = "pcp_test_read_only_key";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+      agentKey: {
+        id: randomUUID(),
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        responsibleUserId: "user-key",
+        scopeConfig: { kind: "read_only" },
+      },
+    });
+    const app = createApp(db);
+    const auth = `Bearer ${token}`;
+
+    // Reads pass the middleware with the scope intact; route-level authz is out of scope here.
+    const read = await request(app).get("/actor").set("Authorization", auth);
+    expect(read.status).toBe(200);
+    expect(read.body).toMatchObject({ agentId, source: "agent_key", keyScope: { kind: "read_only" } });
+
+    const writes = [
+      request(app).patch(`/companies/${companyId}/issues/BLO-1`).send({ status: "done" }),
+      request(app).post(`/companies/${companyId}/issues/BLO-1/comments`).send({ body: "x" }),
+      request(app).post(`/companies/${companyId}/issues`).send({ title: "x" }),
+      request(app).delete(`/companies/${companyId}/issues/BLO-1`),
+      request(app).put(`/companies/${companyId}/issues/BLO-1`).send({}),
+    ];
+    for (const write of writes) {
+      const res = await write.set("Authorization", auth);
+      expect(res.status).toBe(403);
+      expect(res.body.code).toBe("READ_ONLY_KEY_SCOPE");
+    }
+  });
+
+  it("refuses non-safe methods for agent JWTs carrying a read_only key scope (BLO-56152)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+      run: { id: runId, companyId, agentId, responsibleUserId: "user-run" },
+    });
+    const token = createLocalAgentJwt(agentId, companyId, "process", runId, "user-run", { kind: "read_only" });
+    expect(token).toBeTruthy();
+    const app = createApp(db);
+
+    const read = await request(app)
+      .get("/actor")
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", runId);
+    expect(read.status).toBe(200);
+    expect(read.body).toMatchObject({ agentId, source: "agent_jwt", keyScope: { kind: "read_only" } });
+
+    const write = await request(app)
+      .patch(`/companies/${companyId}/issues/BLO-1`)
+      .set("Authorization", `Bearer ${token}`)
+      .set("X-Paperclip-Run-Id", runId)
+      .send({ status: "done" });
+    expect(write.status).toBe(403);
+    expect(write.body.code).toBe("READ_ONLY_KEY_SCOPE");
+  });
+
+  it("keeps a malformed read_only key config read-only instead of widening it to standard (BLO-56152)", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = "pcp_test_malformed_read_only_key";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId },
+      agentKey: {
+        id: randomUUID(),
+        agentId,
+        companyId,
+        keyHash: hashToken(token),
+        responsibleUserId: "user-key",
+        scopeConfig: { kind: "read_only", unexpected: true },
+      },
+    });
+
+    const res = await request(createApp(db))
+      .patch(`/companies/${companyId}/issues/BLO-1`)
+      .set("Authorization", `Bearer ${token}`)
+      .send({ status: "done" });
+    expect(res.status).toBe(403);
+    expect(res.body.code).toBe("READ_ONLY_KEY_SCOPE");
   });
 });
