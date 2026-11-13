@@ -82,7 +82,7 @@ const EMITTING_FILES: EmittingFile[] = [
       // buildExecutionReviewParticipantRecoveryComment + ...UnavailableComment
       { leadIn: '"restore the review stage, or "', knownSites: 2 },
       // the recovery-issue requiredAction bullet, review-participant arm
-      { leadIn: 'with a live participant, or "', knownSites: 1 },
+      { leadIn: 'with a live participant, or, on the source issue, "', knownSites: 1 },
       // the recovery-horizon retirement discharge comment
       { leadIn: 'discharge or cancel this recovery action, or "', knownSites: 1 },
     ],
@@ -167,3 +167,35 @@ for (const file of EMITTING_FILES) {
     }
   });
 }
+
+/**
+ * PEN-5714 / Ally on #3760. The guidance prose promises an OUTCOME, and the only
+ * thing that makes that promise checkable is the derivation living in
+ * `packages/shared`, where the builder's own test can call it.
+ *
+ * While it sat inline in this route handler the prose could be pinned only against
+ * `isContradictedRestoredClaim` -- the first of four arms -- so a sentence that was
+ * wrong about the hand-back arm passed every test and shipped to nine emitting
+ * sites. Re-inlining the chain here would restore exactly that blind spot, and it
+ * would do it silently: every existing test would still pass.
+ */
+describe("the resolve route derives its recorded outcome in shared", () => {
+  const ROUTES_FILE = join(dirname(fileURLToPath(import.meta.url)), "..", "routes", "issues.ts");
+  const source = readFileSync(ROUTES_FILE, "utf8");
+
+  it("was actually read, so a clean result means clean and not absent", () => {
+    // Same reason as the sweeps above: "" contains no inline chain either.
+    expect(source.length).toBeGreaterThan(500_000);
+    expect(source).toContain("const handBackAgentId =");
+  });
+
+  it("calls the shared derivation", () => {
+    expect(source).toContain("deriveRecordedResolveOutcome({");
+  });
+
+  it("carries no second copy of the precedence it replaced", () => {
+    // The inline ternary chain. A copy here is a second place for the route and
+    // the prose that describes it to drift apart.
+    expect(stripFullLineComments(source)).not.toContain('? "handed_back"');
+  });
+});

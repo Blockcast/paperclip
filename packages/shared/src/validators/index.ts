@@ -397,6 +397,7 @@ export {
   issueRecoveryActionResolvePath,
   buildManualResolutionGuidance,
   isContradictedRestoredClaim,
+  deriveRecordedResolveOutcome,
   RESTORED_CONTRADICTING_ISSUE_STATUSES,
   issueReviewRequestSchema,
   issueExecutionWorkspaceSettingsSchema,

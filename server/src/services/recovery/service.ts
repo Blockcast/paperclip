@@ -6338,7 +6338,11 @@ export function recoveryService(
     const requiredAction = isReviewParticipantRecovery
       ? [
         "- Inspect the latest reviewer run and the pending execution-review stage.",
-        "- Fix the reviewer runtime, restore the source issue to `in_review` with a live participant, or "
+        // This bullet is rendered into the RECOVERY issue's body, so the builder's
+        // own "it resolves this issue's active action" would read as the row the
+        // agent is looking at. The rendered path already carries the source id;
+        // name the target in prose too, at this one site (Ally on #3760).
+        "- Fix the reviewer runtime, restore the source issue to `in_review` with a live participant, or, on the source issue, "
           + buildManualResolutionGuidance(input.issue.id),
         "- When the source issue has a live review path or has been intentionally resolved, mark this recovery issue done.",
       ]
