@@ -4061,7 +4061,7 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
   // heading: this rule is also paraphrased into per-seat instruction roots under several
   // headings with a licence to re-word, so a heading anchor is dissolved by exactly the
   // seats that complied and reports ABSENT on text that is already correct.
-  it("names the artifact-scoped sibling check and its union / lower-bound / race caveats (PEN-5802 arm 3)", () => {
+  it("names the artifact-scoped sibling check and its no-filter / lower-bound / race caveats (PEN-5802 arm 3)", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
     // The distinction the bullet exists for. `activeRun` is not wrong, it answers a
@@ -4081,11 +4081,20 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // PEN-5340 held this lookup back until #3310 landed.
     expect(markdown).toContain("truncated as a URL fragment unless sent as `%23`");
 
-    // The UNION clause: the assertion most likely to be deleted as over-caution, because
-    // `owner` reads as the precise relation and `mention` reads as noise. Measured the
-    // other way on #3322 -- owner row done with no run, live sibling on a mentioning row.
-    expect(markdown).toContain("never owners alone");
-    expect(markdown).toContain("held a MENTIONING row");
+    // The no-filter clause: the assertion most likely to be deleted as over-caution, because
+    // `owner` reads as the precise relation and everything else reads as noise. Measured the
+    // other way on #3322 -- owner row done with no run, live sibling on a non-owner row.
+    //
+    // Pinned as EVERY row rather than as a union of named relations. The endpoint returns
+    // three (`PullRequestOwnershipRelation`), and an enumerated union drops whichever value it
+    // omits in the fail-open direction -- those rows are absent from the contention set, which
+    // reads as "no sibling". The `"undetermined"` pin is here so that omission cannot come back
+    // silently: it is the value an enumerated union dropped once already.
+    expect(markdown).toContain("EVERY returned row, whatever its `relation`");
+    expect(markdown).toContain("never filter to owners");
+    expect(markdown).toContain("held a NON-OWNER row");
+    expect(markdown).toContain("THREE relations, not two");
+    expect(markdown).toContain('`"undetermined"`');
 
     // The completeness gate. Without it an authorization-withheld or unverifiable owner
     // list renders as an empty contention set -- the fail-open direction.

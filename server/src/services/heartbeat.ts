@@ -14447,11 +14447,20 @@ export function buildPaperclipTaskMarkdown(input: {
     // row (PEN-5350) `done` with no run, and the live sibling holding PEN-5119 -- a row the
     // writing run did NOT hold. Two uses of one route, sited where each use's actor stands.
     //
-    // The UNION clause is the load-bearing half and the one an implementer trims as
-    // over-caution, because `relation: "owner"` reads as the precise answer and `mention`
+    // The no-filter clause is the load-bearing half and the one an implementer trims as
+    // over-caution, because `relation: "owner"` reads as the precise answer and everything else
     // reads as noise. #3322 is the counter-example: owner-only returns "no contention" at the
     // exact moment there is some -- the fail-open direction. A row is bound to a PR because it
     // can write to it, which is the contention question; which row OWNS it is bookkeeping.
+    //
+    // It says EVERY row rather than naming a union of relations because the endpoint returns
+    // THREE (`PullRequestOwnershipRelation`, server/src/services/pull-request-work-products.ts)
+    // and "undetermined" -- ownership never recorded, which that type's docblock calls the
+    // common case for agent-registered rows and load-bearing indefinitely -- is explicitly NOT
+    // a negative. An enumerated union is a list that goes stale the moment the enum grows, and
+    // it goes stale in the fail-open direction: the omitted value's rows are simply absent from
+    // the contention set, which reads as "no sibling". The author-side paragraph under
+    // "Recording a constraint" already says "undetermined" is a possible owner, never a no.
     //
     // It reads the rows the ARTIFACT names rather than filtering the seat's own lane on
     // purpose: bounded by the rows bound to the artifact (1-8 on the four probed), so it needs
@@ -14465,7 +14474,7 @@ export function buildPaperclipTaskMarkdown(input: {
     // strictly weaker than serialisation. A reader who takes it for a lock skips the
     // redemption, which is the only step that fails closed, and the race window is exactly
     // where the measured double-spend lived.
-    "- That `activeRun` check is ROW-scoped: it answers whether a sibling holds THAT ROW, never whether one holds the ARTIFACT, and one pull request is routinely bound to several rows. To ask the artifact question, read `GET /api/companies/<companyId>/work-products/by-external-id?externalId=<the PR's URL>` -- the same lookup spelled out under \"Recording a constraint\" below, whose completeness rules apply here unchanged -- then read `activeRun` on each returned `issueId` with `paperclipGetIssue`, which is the only surface that hydrates it; on a list row or a write response the key is ABSENT and absent reads as \"no sibling\". Pass the full pull-request URL: a bare `#` in `owner/repo#123` is truncated as a URL fragment unless sent as `%23`. Take the UNION of `relation: \"owner\"` and `relation: \"mention\"`, never owners alone -- measured on Blockcast/paperclip#3322, the owner row was `done` with no run while a live sibling of the same seat held a MENTIONING row, so an owner-only read reports no contention at the moment there is some. Treat the answer as a LOWER BOUND: score it UNKNOWN unless `ownerListComplete` is `true` and `withheldForAuthorizationCount` is `0`, and a successor row that inherited the work is bound to nothing and cannot appear at all. This is a DETECTOR WITH A RACE, not a lock -- a sibling can start between your read and your write, so it never replaces redeeming the receipt key, which is the only step that fails closed.",
+    "- That `activeRun` check is ROW-scoped: it answers whether a sibling holds THAT ROW, never whether one holds the ARTIFACT, and one pull request is routinely bound to several rows. To ask the artifact question, read `GET /api/companies/<companyId>/work-products/by-external-id?externalId=<the PR's URL>` -- the same lookup spelled out under \"Recording a constraint\" below, whose completeness rules apply here unchanged -- then read `activeRun` on each returned `issueId` with `paperclipGetIssue`, which is the only surface that hydrates it; on a list row or a write response the key is ABSENT and absent reads as \"no sibling\". Pass the full pull-request URL: a bare `#` in `owner/repo#123` is truncated as a URL fragment unless sent as `%23`. Read `activeRun` on EVERY returned row, whatever its `relation`, and never filter to owners: a row is bound to this pull request because it can write to it, which is the contention question, while which row OWNS it is bookkeeping. Measured on Blockcast/paperclip#3322, the owner row was `done` with no run while a live sibling of the same seat held a NON-OWNER row, so an owner-filtered read reports no contention at the moment there is some. The endpoint returns THREE relations, not two: `\"undetermined\"` -- ownership never recorded, which is the common case for agent-registered rows -- is NOT a negative, so a two-value union drops it in the same fail-open direction as owners alone. Treat the answer as a LOWER BOUND: score it UNKNOWN unless `ownerListComplete` is `true` and `withheldForAuthorizationCount` is `0`, and a successor row that inherited the work is bound to nothing and cannot appear at all. This is a DETECTOR WITH A RACE, not a lock -- a sibling can start between your read and your write, so it never replaces redeeming the receipt key, which is the only step that fails closed.",
     // PEN-5876: the directive above is scoped to PULL REQUEST write verbs, and the gap it
     // leaves is a row FIELD write. Measured twice on one row inside 16 minutes, same field,
     // both times by two runs of ONE seat: first a run claimed edits in the past tense that
