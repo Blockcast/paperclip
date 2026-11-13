@@ -42,7 +42,7 @@
     "smoke": "bash scripts/install-smoke.sh"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.96.0",
+    "@anthropic-ai/sdk": "^0.137.0",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "cross-spawn": "^7.0.6",
     "zod": "^4.6.6"
