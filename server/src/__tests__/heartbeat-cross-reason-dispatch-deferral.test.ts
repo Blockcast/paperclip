@@ -239,9 +239,44 @@ describe("the duplicate-dispatch cancel reason", () => {
     // was the only account anyone had of why their wake vanished.
     const start = HEARTBEAT_SOURCE.indexOf("async function cancelQueuedRunForDuplicateDispatch(");
     expect(start).toBeGreaterThanOrEqual(0);
-    const body = HEARTBEAT_SOURCE.slice(start, start + 2_000);
-    expect(body).not.toContain("the surviving run will continue the work");
+    // PEN-6575 widened this window from 2_000: the function grew a comment
+    // block and the reason string now starts past the old cut, so the slice
+    // ended BEFORE the text being asserted. A short slice fails toward
+    // `not.toContain` passing vacuously, which is the direction that reads green.
+    const body = HEARTBEAT_SOURCE.slice(start, start + 4_000);
     expect(body).toContain("sibling run is already dispatched");
+    expect(body).not.toContain("the surviving run will continue the work");
+  });
+
+  it("no longer asserts that the arriving wake needed no dispatch of its own", () => {
+    // PEN-6575 done-when 4. Reaching the cancel establishes only that a sibling
+    // is dispatched. Measured 2026-11-13 over 24h77: all 10 `issue_commented`
+    // cancels were created AFTER the incumbent had started, so the incumbent's
+    // context predates the comment and provably cannot carry it.
+    //
+    // Asserted over the WHOLE file, not the function slice: the claim is that
+    // the literal survives nowhere, so the construct above paraphrases it
+    // rather than quoting it. A quotation here would satisfy this test with the
+    // defect still live — the junk a worked example generates is indistinguishable
+    // from signal.
+    expect(HEARTBEAT_SOURCE).not.toContain("does not require its own dispatch");
+    expect(HEARTBEAT_SOURCE).not.toContain("require its own dispatch");
+  });
+
+  it("tells a non-github arrival which branch of the deferral arm it missed", () => {
+    // The retired tail named the github-arrival branch unconditionally, so the
+    // largest reader of this string — a non-github arrival, 26 of 112 cancels
+    // in the measured window — was pointed at an arm it fails in BOTH positions.
+    const start = HEARTBEAT_SOURCE.indexOf("async function cancelQueuedRunForDuplicateDispatch(");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const body = HEARTBEAT_SOURCE.slice(start, start + 4_000);
+    // The branch is computed from the arrival, not stated unconditionally.
+    expect(body).toContain("const deferralMiss = contextCarriesGithubWake(arrivalSnapshot)");
+    expect(body).toContain("and this arrival is ");
+    expect(body).toContain("the incumbent already carries a github wake");
+    // Reaching the cancel falsifies `carriesGithubWake(arrival) && !incumbent.has(github)`,
+    // so the two branches are exhaustive — there is no third, unhandled case.
+    expect(body).toContain("The duplicate_dispatch_cross_reason_deferred arm did not apply");
   });
 
   it("keeps the routine-execution cancel's wording, which a sibling matches verbatim", () => {
