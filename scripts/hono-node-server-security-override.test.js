@@ -22,12 +22,20 @@ import test from "node:test";
 // override is the only artifact holding designer on the 1.x line, and JSON
 // cannot carry a comment saying so, which is why it is said here.
 //
+// BLO-56715 raised the floor to 1.19.18 for GHSA-jpvv-r467-5p4w (moderate):
+// a backslash in the request path is parsed as a path separator, so a
+// path-based access rule at a reverse proxy can be bypassed. Its windows are
+// `< 1.19.18` and `>= 2.0.0 < 2.1.6`, which contain GHSA-frvp's, so the
+// assertion below tests the wider pair. The ROOT pnpm workspace reaches the
+// package the same way (every MCP server package -> @modelcontextprotocol/sdk)
+// and is asserted too: the scheduled dependency-audit lane reads that lockfile.
+//
 // Consequence worth knowing rather than fixing: when the SDK eventually drops
 // 1.x and requires `^2.0.5` alone, this cap turns into a hard ERESOLVE rather
 // than a quiet bump. That is the better failure mode — but it will read as
 // mysterious, and this file is where the explanation lives.
 
-const PATCHED_FLOOR = ">=1.19.15 <2";
+const PATCHED_FLOOR = ">=1.19.18 <2";
 
 const designerRoot = new URL(
   "../packages/services/designer/",
@@ -49,14 +57,14 @@ function assertPatched(versions, where) {
     // correct here and smaller than ordering them.
     assert.ok(
       !prerelease,
-      `${where} resolved prerelease @hono/node-server ${major}.${minor}.${patch}${prerelease} (sorts below ${major}.${minor}.${patch}, i.e. inside GHSA-frvp-7c67-39w9)`,
+      `${where} resolved prerelease @hono/node-server ${major}.${minor}.${patch}${prerelease} (sorts below ${major}.${minor}.${patch}, i.e. inside GHSA-jpvv-r467-5p4w)`,
     );
     const inFirstWindow =
-      major < 1 || (major === 1 && (minor < 19 || (minor === 19 && patch < 15)));
-    const inSecondWindow = major === 2 && minor === 0 && patch < 5;
+      major < 1 || (major === 1 && (minor < 19 || (minor === 19 && patch < 18)));
+    const inSecondWindow = major === 2 && (minor === 0 || (minor === 1 && patch < 6));
     assert.ok(
       !inFirstWindow && !inSecondWindow,
-      `${where} resolved vulnerable @hono/node-server ${major}.${minor}.${patch} (GHSA-frvp-7c67-39w9 affects < 1.19.15 and >= 2.0.0 < 2.0.5)`,
+      `${where} resolved vulnerable @hono/node-server ${major}.${minor}.${patch} (GHSA-jpvv-r467-5p4w affects < 1.19.18 and >= 2.0.0 < 2.1.6)`,
     );
   }
 }
@@ -116,4 +124,39 @@ test("the designer lockfile resolves above the same floor", async () => {
     });
 
   assertPatched(versions, designerPath);
+});
+
+test("the root pnpm workspace pins and resolves above the same floor", async () => {
+  const rootUrl = new URL("../", import.meta.url);
+  const packageJson = JSON.parse(
+    await readFile(new URL("package.json", rootUrl), "utf8"),
+  );
+  const lockfile = await readFile(new URL("pnpm-lock.yaml", rootUrl), "utf8");
+
+  assert.equal(packageJson.pnpm.overrides["@hono/node-server"], PATCHED_FLOOR);
+  assert.deepEqual(
+    packageJson.securityAuditRemediations["BLO-56715"]["@hono/node-server"],
+    {
+      patchedRange: PATCHED_FLOOR,
+      advisories: ["GHSA-jpvv-r467-5p4w", "GHSA-frvp-7c67-39w9"],
+    },
+  );
+
+  // Positive control, as above: a lockfile that resolves nothing passes
+  // every per-version assertion.
+  assert.match(lockfile, /^lockfileVersion: '9\.\d+'$/m);
+  assert.ok(lockfile.length > 100_000, "pnpm-lock.yaml is too small to be real");
+
+  // Top-level package keys only: `  '@hono/node-server@1.19.19':`.
+  const versions = [
+    ...lockfile.matchAll(
+      /^  '@hono\/node-server@(\d+)\.(\d+)\.(\d+)(-[\w.+-]*)?':$/gm,
+    ),
+  ].map((m) => ({
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: Number(m[3]),
+    prerelease: m[4],
+  }));
+  assertPatched(versions, "pnpm-lock.yaml");
 });

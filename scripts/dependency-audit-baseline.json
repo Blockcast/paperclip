@@ -11,34 +11,19 @@
   "note": "Triage of every advisory at or above the fail threshold on master at the commit above. One entry per (advisory, package) — a GHSA id can appear under more than one package, and GHSA-82fw-gwwq-j7x9 does so here (vitest and @vitest/mocker). Entries are suppressions WITH AN EXPIRY: past reviewBy, the scheduled lane fails while the advisory is still live. Advisories below the fail threshold are reported, not baselined, so one escalating into moderate arrives as a new finding. See runbooks/dependency-audit.md.",
   "entries": [
     {
-      "ghsa": "GHSA-frvp-7c67-39w9",
-      "package": "@hono/node-server",
-      "severity": "moderate",
-      "cve": null,
-      "title": "Node.js Adapter for Hono: Path traversal in `serve-static` on Windows via encoded backslash (`%5C`)",
-      "observedVersions": [
-        "1.19.13"
-      ],
-      "patched": ">=1.19.15",
-      "introducedVia": "every MCP server package via @modelcontextprotocol/sdk@1.32.1 > @hono/node-server@1.19.13",
-      "verdict": "risk-accept",
-      "reviewBy": "2027-02-02",
-      "reason": "Two advisories with different floors. GHSA-frvp-7c67-39w9 is fixed within 1.x (>=1.19.15) and is a Windows-only serve-static path traversal; GHSA-rmxm-3fg6-px4f needs >=2.1.3, a major bump of a package @modelcontextprotocol/sdk pins as a peer of hono, so it cannot be floored independently of the SDK. Both concern serveStatic, which no package here calls — but that is read from our own source, not proven by a reachability tool, so this is an acceptance and not a not-applicable."
-    },
-    {
       "ghsa": "GHSA-rmxm-3fg6-px4f",
       "package": "@hono/node-server",
       "severity": "moderate",
       "cve": "CVE-2026-118663",
       "title": "@hono/node-server: `serveStatic` decodes the request path a second time, leading to bypass of middleware on static paths",
       "observedVersions": [
-        "1.19.13"
+        "1.19.19"
       ],
       "patched": ">=2.1.3",
-      "introducedVia": "every MCP server package via @modelcontextprotocol/sdk@1.32.1 > @hono/node-server@1.19.13",
+      "introducedVia": "every MCP server package via @modelcontextprotocol/sdk@1.32.1 > @hono/node-server@1.19.19",
       "verdict": "risk-accept",
       "reviewBy": "2027-02-02",
-      "reason": "Two advisories with different floors. GHSA-frvp-7c67-39w9 is fixed within 1.x (>=1.19.15) and is a Windows-only serve-static path traversal; GHSA-rmxm-3fg6-px4f needs >=2.1.3, a major bump of a package @modelcontextprotocol/sdk pins as a peer of hono, so it cannot be floored independently of the SDK. Both concern serveStatic, which no package here calls — but that is read from our own source, not proven by a reachability tool, so this is an acceptance and not a not-applicable."
+      "reason": "Needs >=2.1.3, a major bump of a package @modelcontextprotocol/sdk pins as a peer of hono, so it cannot be floored independently of the SDK; BLO-56715 floors the 1.x line at >=1.19.18 <2 (clearing GHSA-jpvv-r467-5p4w and GHSA-frvp-7c67-39w9) and leaves this one open. It concerns serveStatic, which no package here calls — but that is read from our own source, not proven by a reachability tool, so this is an acceptance and not a not-applicable."
     },
     {
       "ghsa": "GHSA-82fw-gwwq-j7x9",
