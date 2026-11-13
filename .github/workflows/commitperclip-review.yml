@@ -126,7 +126,9 @@ jobs:
           # package WITHIN an accepted range (e.g. flooring @hono/node-server
           # 1.19.13 -> 1.19.19, still inside GHSA-rmxm) is red here while
           # strictly reducing exposure (BLO-56715). Guarded by
-          # run-quality-gates.test.mjs.
+          # run-quality-gates.test.mjs. allow-ghsas is keyed on the advisory
+          # only, the baseline on (advisory, package): if this GHSA ever widens
+          # to another package, the scheduled audit lane is the backstop.
           allow-ghsas: GHSA-rmxm-3fg6-px4f
 
       # Only the commitperclip bot steps below use Node. Where no App key is

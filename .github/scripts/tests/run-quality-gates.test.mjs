@@ -445,21 +445,24 @@ test('main routes every read through the shared budget, not bare ghFetch', () =>
   assert.match(main, /checkDependencies\([^)]*, gh\)/);
 });
 
-// BLO-56715: Dependency Review's allow-ghsas must never outlive the audit
-// baseline's risk acceptance, or it silently waives an advisory nobody owns.
-test('commitperclip-review: every allow-ghsas id is a live risk-accept baseline entry', () => {
-  const line = workflow.match(/^\s*allow-ghsas:\s*(.+)$/m);
-  assert.ok(line, 'allow-ghsas line not found');
-  const ids = line[1].split(',').map((s) => s.trim()).filter(Boolean);
-  assert.ok(ids.length > 0);
+// BLO-56715: Dependency Review's allow-ghsas must never waive an advisory the
+// audit baseline does not risk-accept. Clock-free on purpose: pr.yml runs this,
+// and reviewBy expiry is enforced by evaluateAudit() on the scheduled lane only
+// (scripts/check-dependency-audit.mjs), whose red is the prompt to drop the id.
+test('commitperclip-review: every allow-ghsas id is a risk-accept baseline entry', () => {
+  const lines = [...workflow.matchAll(/^\s*allow-ghsas:\s*(.+)$/gm)];
+  assert.ok(lines.length > 0, 'allow-ghsas line not found');
   const baseline = JSON.parse(readFileSync(
     path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../scripts/dependency-audit-baseline.json'),
     'utf8',
   ));
-  const today = new Date().toISOString().slice(0, 10);
-  for (const id of ids) {
-    const entry = baseline.entries.find((e) => e.ghsa === id && e.verdict === 'risk-accept');
-    assert.ok(entry, `${id} is allowed in Dependency Review but has no risk-accept baseline entry`);
-    assert.ok(entry.reviewBy >= today, `${id} baseline acceptance expired ${entry.reviewBy}; drop it from allow-ghsas`);
+  for (const line of lines) {
+    const ids = line[1].split(',').map((s) => s.trim()).filter(Boolean);
+    assert.ok(ids.length > 0);
+    for (const id of ids) {
+      const entry = baseline.entries.find((e) => e.ghsa === id && e.verdict === 'risk-accept');
+      assert.ok(entry, `${id} is allowed in Dependency Review but has no risk-accept baseline entry`);
+      assert.match(entry.reviewBy, /^\d{4}-\d{2}-\d{2}$/, `${id} baseline entry has no yyyy-mm-dd reviewBy`);
+    }
   }
 });
