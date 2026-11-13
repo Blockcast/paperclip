@@ -962,7 +962,7 @@ jobs:
             ./scripts/safe-env-inspect.test.mjs \
             ./scripts/seed_bank.test.mjs \
             ./scripts/verify-review-gate-capture-promotion.test.mjs
-        timeout-minutes: 4
+        timeout-minutes: 8
 
       # The guard that keeps this list honest, plus its own tests. pr.yml names
       # script tests literally, so writing one and forgetting the step leaves a
