@@ -14,7 +14,13 @@
  * argv[4] — "prefill-stderr" fills stderr until the stream reports backpressure,
  *           reports that on stdout, then waits for a parent ack on stdin before
  *           triggering the crash.
+ *
+ * CRASH_GUARD_EXIT_TIMING_PATH (env) — when set, report the guard's OWN elapsed
+ *           time, crash to `exit`, as JSON at that path. Unset, this fixture
+ *           behaves exactly as before.
  */
+
+import fs from "node:fs";
 
 import { installProcessCrashGuard } from "../../process-crash-guard.js";
 
@@ -28,9 +34,40 @@ installProcessCrashGuard({
   logger: { error: () => {}, flush: () => {} },
 });
 
+/**
+ * The guard's own elapsed time, measured INSIDE this process: from the crash
+ * trigger to the `exit` event the guard's `process.exit()` raises.
+ *
+ * The parent can only time spawn-to-exit, which additionally spans the stdin
+ * ack's trip down the pipe and the kernel's teardown of this process — both
+ * scheduler-bound, and measured (BLO-55723) to carry 80-86% of the inflation a
+ * contended runner adds. That is why the deadline in the suite asserts on THIS
+ * number and the parent's stays a diagnostic.
+ *
+ * A regular file, not stdout: an `exit` handler is the one place this repo has
+ * already established that a stream write can be discarded mid-flight (the whole
+ * subject of this fixture), so reporting the measurement through a stream would
+ * put the instrument inside the defect it measures. `writeFileSync` to a regular
+ * fd is the same guaranteed path `writeShutdownBreadcrumbsBounded` takes when it
+ * finds one.
+ */
+const timingPath = process.env.CRASH_GUARD_EXIT_TIMING_PATH;
+let crashTriggeredAt: number | undefined;
+if (timingPath !== undefined && timingPath !== "") {
+  process.on("exit", () => {
+    if (crashTriggeredAt === undefined) return;
+    try {
+      fs.writeFileSync(timingPath, JSON.stringify({ guardElapsedMs: Date.now() - crashTriggeredAt }));
+    } catch {
+      /* the suite fails on the missing file; never preempt the exit to report it */
+    }
+  });
+}
+
 const message = `BOOM_SENTINEL${padBytes > 0 ? ` ${"P".repeat(padBytes)}` : ""}`;
 
 function triggerCrash(): void {
+  crashTriggeredAt = Date.now();
   if (kind === "reject") {
     setImmediate(() => {
       void Promise.reject(new Error(message));
