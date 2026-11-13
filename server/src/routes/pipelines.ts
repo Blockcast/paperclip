@@ -434,18 +434,35 @@ function assertPipelineCompanyAccess(req: Request, companyId: string) {
  * Non-agent actors are unaffected: `assertNoAgentHostWorkspaceCommandMutation` returns early
  * for every actor type that is not an agent, so the board and the pipeline UI keep working.
  *
- * ⛔ KNOWN RESIDUAL, AND IT IS THE NEXT ONE-ROUTE-OVER GAP. This collector covers the two
- * COMMAND paths and nothing else. `POST /routines/:id/run` calls the compound
+ * ⛔ KNOWN RESIDUAL, AND IT IS LIVE — NOT PROSPECTIVE — SINCE 2026-11-13. This collector
+ * covers the two COMMAND paths and nothing else. `POST /routines/:id/run` calls the compound
  * `assertNoAgentIssueHostControlledMutation` instead, so it inherits every future addition to
- * the issue host-controlled set automatically; THESE THREE ROUTES DO NOT. When PEN-6430 lands
- * `collectAgentDisallowedIssueWorkspaceRuntimePaths` (it does not exist on `master` as this is
- * written, which is why it is not called here), `config.{onEnter,automation}
- * .executionWorkspaceSettings.workspaceRuntime` becomes settable by an agent at these three
- * routes while being refused at the four issue routes — the exact shape PEN-6532 was filed for.
+ * the issue host-controlled set automatically; THESE THREE ROUTES DO NOT — and that prediction
+ * has now been borne out in both directions at once. `#3699` (PEN-6430) landed
+ * `collectAgentDisallowedIssueWorkspaceRuntimePaths` on `master`: the routine route picked the
+ * refusal up with no edit, while `config.{onEnter,automation}
+ * .executionWorkspaceSettings.workspaceRuntime` is settable by an agent at these three routes
+ * TODAY and refused at the four issue routes — the exact shape PEN-6532 was filed for. (The
+ * sentence replaced here said that collector "does not exist on `master`", which is why it was
+ * not called. It exists, in `./workspace-command-authz.js`, exported beside the two asserts.)
  *
- * ⇒ whoever lands that change: extend this collector in the SAME commit, or route each
- * `onEnter` / `automation` branch through the compound guard and re-prefix its paths. Do not
- * leave it to be noticed. (Raised by Ally on `#3701` and accepted; it could not be wired then.)
+ * ⛔ THE OBVIOUS FIX IS NOT FREE, AND THE REASON IS ON THIS SURFACE RATHER THAN IN THE GUARD.
+ * The issue routes refuse a non-nullish `workspaceRuntime` partly to stop a withheld reader
+ * PATCHing redaction markers over a live operator record. Stage configs already solve that
+ * differently: `restoreWithheldPipelineStageConfig` (`../redaction.ts`, PEN-3266/PEN-3288)
+ * restores the stored value, and `services/pipelines.ts` calls it on the stage-PATCH path. No
+ * agent resolves `revealRuntimeConfig` (`routes/agents.ts`), so every agent read here is
+ * masked, and `maskWorkspaceRuntimeForRead` returns an OBJECT with masked leaves — not `null`.
+ * Dropping `collectAgentDisallowedIssueWorkspaceRuntimePaths` into the loop below would refuse
+ * that faithful round-trip, because this guard runs BEFORE the service restore, and the issue
+ * refusal's own remedy ("send `null`") deletes the operator's config rather than clearing a
+ * marker.
+ *
+ * ⇒ whoever closes this: admit an all-sentinel echo and refuse a fresh value, or route the
+ * branches through the compound guard only after the restore has run. Do not leave it to be
+ * noticed. Measured and carried on PEN-6595, graded Low there because a grant row is the only
+ * way an agent reaches these routes at all. (Raised by Ally on `#3701` and accepted; it could
+ * not be wired then.)
  */
 function collectStageConfigWorkspaceCommandPaths(config: unknown, prefix: string): string[] {
   if (typeof config !== "object" || config === null || Array.isArray(config)) return [];

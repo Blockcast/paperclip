@@ -4,9 +4,19 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
  * PEN-6532 — `issueExecutionWorkspaceSettingsSchema` is embedded by three request schemas
- * outside `routes/issues.ts`, and none of them reached
- * `assertNoAgentIssueHostControlledMutation`. These tests pin the refusal at the four routes
- * that carry them.
+ * outside `routes/issues.ts`, none of which reached
+ * `assertNoAgentIssueHostControlledMutation` before that row. These tests pin the refusal at
+ * the four routes that carry them.
+ *
+ * ⚠ SCOPE, NARROWED 2026-11-13 (PEN-6595) — every case below is a COMMAND case, and the two
+ * halves of the field stopped being symmetric when `#3699` (PEN-6430) landed.
+ * `POST /routines/:id/run` calls the COMPOUND guard, so it ALSO refuses
+ * `executionWorkspaceSettings.workspaceRuntime`, inherited with no edit in this file. The three
+ * pipeline stage-config routes call the command-only
+ * `assertNoAgentHostWorkspaceCommandMutation`, so `workspaceRuntime` stays agent-settable there
+ * and NOTHING below asserts otherwise — this suite contains no `workspaceRuntime` case at all.
+ * Do not read a green run here as covering that field at the pipeline routes. The gap, its
+ * measured reachability bound, and the shape a close has to take are carried on PEN-6595.
  *
  * Each denial case asserts BOTH the 403 AND that the service mock was never called. A bare
  * status assertion passes when the request dies at an earlier gate for an unrelated reason,

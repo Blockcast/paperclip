@@ -862,10 +862,13 @@ describe.sequential("issue comment reopen routes", () => {
     // As of PEN-6430 no bare `z.record(z.string(), z.unknown())` is reachable
     // through these four ISSUE WRITE ROUTES, which is a result in its own
     // right — and it is a claim about the ROUTES, not about the fields: the
-    // same `workspaceRuntime` record is still reachable through
-    // `runRoutineSchema` and the two pipeline stage-settings schemas, which
-    // never call `assertNoAgentIssueHostControlledMutation` (named in that
-    // guard's own doc comment and carried as a follow-up).
+    // same `workspaceRuntime` record is still reachable through the two
+    // pipeline stage-settings schemas, which call the command-only
+    // `assertNoAgentHostWorkspaceCommandMutation` rather than the compound
+    // guard (named in that guard's own doc comment and carried on PEN-6595).
+    // `runRoutineSchema` was in that list until 2026-11-13 and is NOT any more:
+    // `routes/routines.ts` has called the compound guard since `#3701`, so it
+    // inherited this refusal when `#3699` landed, with no edit of its own.
     // `watchdogDiscovery` is a typed `.strict()` object whose
     // `evidenceMarkdown` is free text, so it supplies the one thing this test
     // actually needs — a string leaf BELOW the top level — and it cannot be
