@@ -8660,52 +8660,91 @@ describeEmbeddedPostgres("workspace dirty quarantine branch repair", () => {
     expect(contention?.activeRun?.id).not.toBe(ids.runId);
   }, 20_000);
 
-  it("lets a self-contending dirty worktree reach the remaining quarantine preconditions", async () => {
-    const expectedBranch = "PAP-463-recorded";
-    const actualBranch = "PAP-463-live";
+  // BLO-55723: the standard recovery recipe unbinds executionWorkspaceId. The runtime-service
+  // precondition used to fail-close on the null id forever; it now scopes the check by path.
+  async function seedUnboundDirtyMismatch(prefix: string) {
+    const expectedBranch = `${prefix}-recorded`;
+    const actualBranch = `${prefix}-live`;
     const { repoRoot, worktreePath } = await createDirtyMismatchRepo({ expectedBranch, actualBranch });
     const ids = await seedDirtyQuarantineRecords({
       repoRoot,
       worktreePath,
       expectedBranch,
       actualBranch,
-      sourceIdentifier: "PAP-463",
+      sourceIdentifier: prefix,
       claimant: "none",
     });
     await db
       .update(issues)
       .set({ executionWorkspaceId: null })
       .where(eq(issues.id, ids.sourceIssueId));
-
-    // The self-contention gate no longer fires, so validation advances to the runtime-service
-    // precondition, which fail-closes on a null workspace id on its own merits. The operator-visible
-    // reason must name that gate, not a claim the issue made against itself.
-    await expect(ensureGitWorktreeBranchCoherent({
+    const coherent = () => ensureGitWorktreeBranchCoherent({
       db,
       repoRoot,
       worktreePath,
       expectedBranchName: expectedBranch,
-      sourceIssue: {
-        id: ids.sourceIssueId,
-        identifier: ids.sourceIdentifier,
-        title: "Repair dirty branch mismatch",
-      },
+      sourceIssue: { id: ids.sourceIssueId, identifier: ids.sourceIdentifier, title: "Repair dirty branch mismatch" },
       executionWorkspaceId: null,
       heartbeatRunId: ids.runId,
       enableWorkspaceDirtyQuarantineRepair: true,
-    })).rejects.toMatchObject({
+    });
+    return { expectedBranch, actualBranch, repoRoot, worktreePath, ids, coherent };
+  }
+
+  it("quarantines a self-contending dirty worktree whose issue has no execution workspace id", async () => {
+    const { expectedBranch, repoRoot, worktreePath, coherent } = await seedUnboundDirtyMismatch("PAP-463");
+
+    await coherent();
+
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(expectedBranch);
+    await expect(readGit(worktreePath, ["status", "--porcelain", "--untracked-files=all"])).resolves.toBe("");
+    const rescue = (await readGit(repoRoot, ["branch", "--list", "paperclip/rescue/PAP-463/*", "--format=%(refname:short)"])).trim();
+    expect(rescue).toMatch(/^paperclip\/rescue\/PAP-463\/\d{8}T\d{6}Z$/);
+    await expect(readGit(repoRoot, ["show", `${rescue}:untracked.txt`])).resolves.toBe("dirty untracked work");
+  }, 20_000);
+
+  it("still refuses an unbound dirty quarantine while a runtime service runs inside the worktree", async () => {
+    const { actualBranch, worktreePath, ids, coherent } = await seedUnboundDirtyMismatch("PAP-464");
+    await db.insert(workspaceRuntimeServices).values({
+      id: randomUUID(),
+      companyId: ids.companyId,
+      projectId: ids.projectId,
+      projectWorkspaceId: ids.projectWorkspaceId,
+      executionWorkspaceId: null,
+      issueId: ids.sourceIssueId,
+      scopeType: "execution_workspace",
+      scopeId: ids.sourceWorkspaceId,
+      serviceName: "orphan-dev",
+      status: "running",
+      lifecycle: "shared",
+      reuseKey: "orphan-dev",
+      command: "pnpm dev",
+      cwd: path.join(worktreePath, "server"),
+      port: 49196,
+      url: "http://127.0.0.1:49196",
+      provider: "local_process",
+      providerRef: "999998",
+      ownerAgentId: ids.agentId,
+      startedByRunId: ids.runId,
+      lastUsedAt: new Date(),
+      startedAt: new Date(),
+      stoppedAt: null,
+      stopPolicy: { type: "manual" },
+      healthStatus: "healthy",
+    });
+
+    await expect(coherent()).rejects.toMatchObject({
       code: "workspace_validation_failed",
       resultJson: {
         workspaceValidation: expect.objectContaining({
-          cleanliness: "dirty",
-          contention: null,
           safeRepair: expect.objectContaining({
             eligible: false,
-            reason: "dirty quarantine repair requires an execution workspace id for runtime-service checks",
+            reason: expect.stringContaining('runtime service "orphan-dev"'),
           }),
         }),
       },
     });
+    await expect(readGit(worktreePath, ["branch", "--show-current"])).resolves.toBe(actualBranch);
   }, 20_000);
 
   it("refuses branch repair with zero git writes when the worktree's .git link is gone (BLO-47493)", async () => {
