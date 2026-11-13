@@ -39,6 +39,21 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+/**
+ * The schemas a real Paperclip database carries. `knownSchemas` is REQUIRED on every
+ * validator rather than optional (#3739 review): omitting it used to fall back to the
+ * `SCHEMA_SHAPED_RE` shape guess, which is exactly the bypass this change closes, and
+ * nothing enforced the code comment promising every call site passed one.
+ */
+const KNOWN_SCHEMAS: ReadonlySet<string> = new Set([
+  "public",
+  "information_schema",
+  "pg_catalog",
+  "pg_toast",
+  "drizzle",
+  "plugin_test",
+]);
+
 describe("plugin database SQL validation", () => {
   it("allows namespace migrations with whitelisted public foreign keys", () => {
     expect(() =>
@@ -46,6 +61,7 @@ describe("plugin database SQL validation", () => {
         "CREATE TABLE plugin_test.rows (id uuid PRIMARY KEY, issue_id uuid REFERENCES public.issues(id))",
         "plugin_test",
         ["issues"],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
   });
@@ -55,6 +71,8 @@ describe("plugin database SQL validation", () => {
       validatePluginMigrationStatement(
         "CREATE INDEX IF NOT EXISTS rows_issue_idx ON plugin_test.rows (issue_id)",
         "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
     expect(() =>
@@ -68,6 +86,8 @@ describe("plugin database SQL validation", () => {
         ON CONFLICT (id) DO NOTHING
         `,
         "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
     expect(() =>
@@ -79,6 +99,8 @@ describe("plugin database SQL validation", () => {
         WHERE s.id = r.id
         `,
         "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
   });
@@ -89,6 +111,7 @@ describe("plugin database SQL validation", () => {
         "CREATE TABLE rows (id uuid PRIMARY KEY, issue_id uuid REFERENCES public.issues(id))",
         "plugin_test",
         ["issues"],
+        KNOWN_SCHEMAS,
       )
     ).toThrow(/fully qualified/i);
     expect(() =>
@@ -96,6 +119,7 @@ describe("plugin database SQL validation", () => {
         "WITH source_rows AS (SELECT id FROM plugin_test.rows) INSERT INTO public.issues (id) SELECT id FROM source_rows",
         "plugin_test",
         ["issues"],
+        KNOWN_SCHEMAS,
       )
     ).toThrow(/public/i);
     expect(() =>
@@ -103,6 +127,7 @@ describe("plugin database SQL validation", () => {
         "UPDATE public.issues SET title = 'bad'",
         "plugin_test",
         ["issues"],
+        KNOWN_SCHEMAS,
       )
     ).toThrow(/public/i);
   });
@@ -113,6 +138,7 @@ describe("plugin database SQL validation", () => {
         "CREATE TABLE public.rows (id uuid PRIMARY KEY)",
         "plugin_test",
         ["issues"],
+        KNOWN_SCHEMAS,
       )
     ).toThrow(/public/i);
   });
@@ -123,10 +149,11 @@ describe("plugin database SQL validation", () => {
         "SELECT r.id FROM plugin_test.rows r JOIN public.issues i ON i.id = r.issue_id",
         "plugin_test",
         ["issues"],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
     expect(() =>
-      validatePluginRuntimeExecute("UPDATE public.issues SET title = $1", "plugin_test")
+      validatePluginRuntimeExecute("UPDATE public.issues SET title = $1", "plugin_test", KNOWN_SCHEMAS)
     ).toThrow(/namespace/i);
   });
 
@@ -226,7 +253,7 @@ describe("plugin database SQL validation", () => {
 
     for (const [label, statement] of Object.entries(unreadableReads)) {
       it(`refuses a cross-schema read written with ${label}`, () => {
-        expect(() => validatePluginRuntimeQuery(statement, "plugin_test", ["issues"])).toThrow();
+        expect(() => validatePluginRuntimeQuery(statement, "plugin_test", ["issues"], KNOWN_SCHEMAS)).toThrow();
       });
     }
 
@@ -238,12 +265,14 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeExecute(
           'UPDATE "public" . "agents" SET name = $1 FROM plugin_test.rows',
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).toThrow();
       expect(() =>
         validatePluginRuntimeExecute(
           "INSERT INTO public . agents SELECT id FROM plugin_test.rows",
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).toThrow();
     });
@@ -252,13 +281,13 @@ describe("plugin database SQL validation", () => {
       // The positive control for the pattern change: tolerating whitespace must not
       // stop the extractor reading the ordinary form, in either verdict direction.
       expect(() =>
-        validatePluginRuntimeQuery("SELECT * FROM plugin_test.rows", "plugin_test")
+        validatePluginRuntimeQuery("SELECT * FROM plugin_test.rows", "plugin_test", [], KNOWN_SCHEMAS)
       ).not.toThrow();
       expect(() =>
-        validatePluginRuntimeQuery("SELECT * FROM public.issues", "plugin_test", ["issues"])
+        validatePluginRuntimeQuery("SELECT * FROM public.issues", "plugin_test", ["issues"], KNOWN_SCHEMAS)
       ).not.toThrow();
       expect(() =>
-        validatePluginRuntimeQuery("SELECT * FROM public.secrets", "plugin_test", ["issues"])
+        validatePluginRuntimeQuery("SELECT * FROM public.secrets", "plugin_test", ["issues"], KNOWN_SCHEMAS)
       ).toThrow(/whitelisted/i);
     });
   });
@@ -273,9 +302,9 @@ describe("plugin database SQL validation", () => {
       // statement qualifies NOTHING -- `FROM plugin_test.rows, secrets` makes the ref
       // count 1 and still reads `public.secrets`. See PEN-6604; do not read these two
       // cases as the hole being shut.
-      expect(() => validatePluginRuntimeQuery("SELECT * FROM issues", "plugin_test", ["issues"]))
+      expect(() => validatePluginRuntimeQuery("SELECT * FROM issues", "plugin_test", ["issues"], KNOWN_SCHEMAS))
         .toThrow(/schema\.table/i);
-      expect(() => validatePluginRuntimeQuery("SELECT * FROM secrets", "plugin_test"))
+      expect(() => validatePluginRuntimeQuery("SELECT * FROM secrets", "plugin_test", [], KNOWN_SCHEMAS))
         .toThrow(/schema\.table/i);
     });
 
@@ -287,12 +316,14 @@ describe("plugin database SQL validation", () => {
           "SELECT * FROM plugin_test.rows, public.secrets",
           "plugin_test",
           ["issues"],
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/adjudicate/i);
       expect(() =>
         validatePluginRuntimeExecute(
           "UPDATE plugin_test.a SET x = 1 FROM plugin_test.b, public.secrets",
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/adjudicate/i);
     });
@@ -306,12 +337,14 @@ describe("plugin database SQL validation", () => {
           "SELECT c.id, p.name FROM plugin_test.cursors c LEFT JOIN public.issues p ON p.id = c.issue_id",
           "plugin_test",
           ["issues"],
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
       expect(() =>
         validatePluginRuntimeExecute(
           "INSERT INTO plugin_test.a (id) VALUES ($1) ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id",
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
     });
@@ -325,6 +358,8 @@ describe("plugin database SQL validation", () => {
         validatePluginMigrationStatement(
           "COMMENT ON COLUMN plugin_test.rows.id IS 'the row id'",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
     });
@@ -344,6 +379,7 @@ describe("plugin database SQL validation", () => {
           "SELECT * FROM plugin_test.rows, public/**/.secrets",
           "plugin_test",
           ["issues"],
+          KNOWN_SCHEMAS,
         )
       ).toThrow();
       expect(() =>
@@ -351,12 +387,14 @@ describe("plugin database SQL validation", () => {
           "SELECT * FROM plugin_test.rows JOIN public/**/.secrets ON true",
           "plugin_test",
           ["issues"],
+          KNOWN_SCHEMAS,
         )
       ).toThrow();
       expect(() =>
         validatePluginRuntimeExecute(
           "UPDATE public/**/.agents SET name = $1 FROM plugin_test.rows",
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).toThrow();
     });
@@ -370,16 +408,18 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeExecute(
           "UPDATE agents SET name = $1 FROM plugin_test.rows",
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/schema\.table/i);
       expect(() =>
         validatePluginRuntimeExecute(
           "INSERT INTO agents SELECT * FROM plugin_test.rows",
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/schema\.table/i);
       expect(() =>
-        validatePluginRuntimeExecute("DELETE FROM issues WHERE id = $1", "plugin_test")
+        validatePluginRuntimeExecute("DELETE FROM issues WHERE id = $1", "plugin_test", KNOWN_SCHEMAS)
       ).toThrow(/schema\.table/i);
     });
 
@@ -391,24 +431,28 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeExecute(
           "UPDATE plugin_test.members AS m SET resolved_at = NULL FROM plugin_test.covers c WHERE c.id = m.cover_id",
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
       expect(() =>
         validatePluginRuntimeExecute(
           "INSERT INTO plugin_test.spaces AS s (id, name) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
       expect(() =>
         validatePluginRuntimeExecute(
           "DELETE FROM plugin_test.claims WHERE company_id = $1",
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
       expect(() =>
         validatePluginRuntimeExecute(
           'UPDATE "plugin_test"."rows" SET name = $1',
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
     });
@@ -421,12 +465,16 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeQuery(
           "SELECT id -- the row id\nFROM plugin_test.rows",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
       expect(() =>
         validatePluginMigrationStatement(
           "CREATE TABLE plugin_test.t /* new */ (id uuid PRIMARY KEY)",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
     });
@@ -449,12 +497,14 @@ describe("plugin database SQL validation", () => {
           String.raw`SELECT * FROM plugin_test.rows, U&"\0070ublic".secrets`,
           "plugin_test",
           ["issues"],
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/unicode-escape identifier/i);
       expect(() =>
         validatePluginRuntimeExecute(
           String.raw`INSERT INTO plugin_test.rows SELECT * FROM U&"\0070ublic".secrets`,
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/unicode-escape identifier/i);
       expect(() =>
@@ -462,6 +512,7 @@ describe("plugin database SQL validation", () => {
           String.raw`WITH t AS (UPDATE U&"\0070ublic".agents SET name='x' RETURNING id) INSERT INTO plugin_test.log SELECT id FROM t`,
           "plugin_test",
           ["agents"],
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/unicode-escape identifier/i);
     });
@@ -488,18 +539,21 @@ describe("plugin database SQL validation", () => {
           String.raw`SELECT * FROM plugin_test.rows WHERE a = E'\'' AND b IN (SELECT 1 FROM U&"\0070ublic".secrets) AND c = ''`,
           "plugin_test",
           ["issues"],
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/escape string literal|unicode-escape identifier/i);
       expect(() =>
         validatePluginRuntimeExecute(
           String.raw`INSERT INTO plugin_test.rows SELECT E'\'' FROM U&"\0070ublic".secrets WHERE ''=''`,
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/escape string literal|unicode-escape identifier/i);
       expect(() =>
         validatePluginRuntimeExecute(
           String.raw`UPDATE plugin_test.rows SET a = E'\'' FROM U&"\0070ublic".secrets WHERE ''=''`,
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/escape string literal|unicode-escape identifier/i);
       // Control: plain `public.secrets` in the same shape was refused before this fix
@@ -509,6 +563,7 @@ describe("plugin database SQL validation", () => {
           String.raw`SELECT * FROM plugin_test.rows WHERE a = E'\'' AND b IN (SELECT 1 FROM public.secrets) AND c = ''`,
           "plugin_test",
           ["issues"],
+          KNOWN_SCHEMAS,
         )
       ).toThrow();
     });
@@ -521,16 +576,18 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeQuery(
           'SELECT menu&"mask" AS flags FROM plugin_test.rows',
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
     });
 
     it("keeps allowing the quoted identifiers the shipped plugins do use", () => {
       expect(() =>
-        validatePluginRuntimeQuery('SELECT * FROM "plugin_test".rows', "plugin_test")
+        validatePluginRuntimeQuery('SELECT * FROM "plugin_test".rows', "plugin_test", [], KNOWN_SCHEMAS)
       ).not.toThrow();
       expect(() =>
-        validatePluginRuntimeQuery('SELECT * FROM "plugin_test"."rows"', "plugin_test")
+        validatePluginRuntimeQuery('SELECT * FROM "plugin_test"."rows"', "plugin_test", [], KNOWN_SCHEMAS)
       ).not.toThrow();
     });
 
@@ -552,6 +609,7 @@ describe("plugin database SQL validation", () => {
           "SELECT * FROM plugin_test.rows WHERE a = $$x'y$$ AND b IN (SELECT secrets.c FROM plugin_test.t, public.secrets)",
           "plugin_test",
           ["issues"],
+          KNOWN_SCHEMAS,
         )
       ).toThrow();
     });
@@ -972,6 +1030,8 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeQuery(
           "SELECT * FROM plugin_test.rows, drizzle.__drizzle_migrations",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/cannot adjudicate/i);
     });
@@ -980,7 +1040,7 @@ describe("plugin database SQL validation", () => {
       // The control for the test above: the defect was the DISAGREEMENT between the
       // two positions, so a fix that only moved the second one is not enough.
       expect(() =>
-        validatePluginRuntimeQuery("SELECT * FROM drizzle.__drizzle_migrations", "plugin_test")
+        validatePluginRuntimeQuery("SELECT * FROM drizzle.__drizzle_migrations", "plugin_test", [], KNOWN_SCHEMAS)
       ).toThrow(/drizzle/i);
     });
 
@@ -989,6 +1049,8 @@ describe("plugin database SQL validation", () => {
         validatePluginMigrationStatement(
           "INSERT INTO plugin_test.rows (id) SELECT id FROM plugin_test.src, drizzle.__drizzle_migrations",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/cannot adjudicate/i);
     });
@@ -998,12 +1060,15 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeQuery(
           "SELECT s.id, s.label FROM plugin_test.rows s WHERE s.id = $1",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
       expect(() =>
         validatePluginRuntimeExecute(
           "INSERT INTO plugin_test.rows (id, y) VALUES ($1, $2) ON CONFLICT (id) DO UPDATE SET y = EXCLUDED.y",
           "plugin_test",
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
     });
@@ -1016,12 +1081,16 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeQuery(
           "SELECT sub.id FROM (SELECT id FROM plugin_test.rows) sub WHERE sub.id = $1",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
       expect(() =>
         validatePluginRuntimeQuery(
           "SELECT e.value FROM plugin_test.rows r, jsonb_array_elements(r.payload) AS e",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
     });
@@ -1034,6 +1103,8 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeQuery(
           "SELECT y.label FROM plugin_test.rows x, other_rows y WHERE y.id = x.id",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
     });
@@ -1043,6 +1114,8 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeQuery(
           "WITH recent AS (SELECT id FROM plugin_test.rows) SELECT recent.id FROM recent",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
     });
@@ -1053,13 +1126,12 @@ describe("plugin database SQL validation", () => {
       // schema -- used to put `drizzle` in the correlation set and skip the real
       // reference. A relation alias cannot shadow a schema in a FROM list, so Postgres
       // still read `drizzle.__drizzle_migrations`.
-      const schemas = new Set(["public", "information_schema", "drizzle", "plugin_test"]);
       expect(() =>
         validatePluginRuntimeQuery(
           "SELECT * FROM plugin_test.rows drizzle, drizzle.__drizzle_migrations",
           "plugin_test",
           [],
-          schemas,
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/cannot adjudicate/i);
       expect(() =>
@@ -1067,14 +1139,14 @@ describe("plugin database SQL validation", () => {
           "WITH drizzle AS (SELECT 1) SELECT * FROM plugin_test.rows, drizzle.__drizzle_migrations",
           "plugin_test",
           [],
-          schemas,
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/cannot adjudicate/i);
       expect(() =>
         validatePluginRuntimeExecute(
           "INSERT INTO plugin_test.rows SELECT * FROM plugin_test.src drizzle, drizzle.__drizzle_migrations",
           "plugin_test",
-          schemas,
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/cannot adjudicate/i);
     });
@@ -1083,13 +1155,12 @@ describe("plugin database SQL validation", () => {
       // The control for the test above, and the reason the schema set is a set rather
       // than a refusal of every declared name: `s` and `sub` are not schemas, so
       // exempting them cannot hide a relation reference.
-      const schemas = new Set(["public", "information_schema", "drizzle", "plugin_test"]);
       expect(() =>
         validatePluginRuntimeQuery(
           "SELECT s.id, sub.n FROM plugin_test.rows s, (SELECT count(*) AS n FROM plugin_test.rows) sub",
           "plugin_test",
           [],
-          schemas,
+          KNOWN_SCHEMAS,
         )
       ).not.toThrow();
     });
@@ -1102,6 +1173,8 @@ describe("plugin database SQL validation", () => {
         validatePluginRuntimeQuery(
           "SELECT * FROM plugin_test.rows public, public.secrets",
           "plugin_test",
+          [],
+          KNOWN_SCHEMAS,
         )
       ).toThrow(/cannot adjudicate|public/i);
     });
@@ -1112,10 +1185,12 @@ describe("plugin database SQL validation", () => {
       validatePluginRuntimeQuery(
         "SELECT EXTRACT(DOW FROM created_at) AS do_flag FROM plugin_test.rows",
         "plugin_test",
+        [],
+        KNOWN_SCHEMAS,
       )
     ).not.toThrow();
     expect(() =>
-      validatePluginMigrationStatement("DO $$ BEGIN END $$;", "plugin_test")
+      validatePluginMigrationStatement("DO $$ BEGIN END $$;", "plugin_test", [], KNOWN_SCHEMAS)
     ).toThrow(/disallowed/i);
   });
 

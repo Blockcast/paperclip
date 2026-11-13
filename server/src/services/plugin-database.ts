@@ -643,7 +643,7 @@ function assertNoUnextractedSchemaRefs(
   statement: string,
   refs: readonly SqlRef[],
   namespace: string,
-  knownSchemas?: ReadonlySet<string>,
+  knownSchemas: ReadonlySet<string>,
 ): void {
   const extracted = new Set(
     refs.map((ref) => `${ref.schema.toLowerCase()}.${ref.table.toLowerCase()}`),
@@ -671,7 +671,7 @@ function assertNoUnextractedSchemaRefs(
     const namesAnExistingSchema =
       schemaLower === namespace.toLowerCase() ||
       SCHEMA_SHAPED_RE.test(schemaLower) ||
-      knownSchemas?.has(schemaLower) === true;
+      knownSchemas.has(schemaLower);
     if (!namesAnExistingSchema) {
       correlations ??= collectCorrelationNames(statement);
       if (correlations.has(schemaLower)) continue;
@@ -872,7 +872,7 @@ export function validatePluginMigrationStatement(
   statement: string,
   namespace: string,
   coreReadTables: readonly PluginDatabaseCoreReadTable[] = [],
-  knownSchemas?: ReadonlySet<string>,
+  knownSchemas: ReadonlySet<string>,
 ): void {
   assertIdentifier(namespace, "namespace");
   assertNoBannedSql(statement);
@@ -938,7 +938,7 @@ export function validatePluginRuntimeQuery(
   query: string,
   namespace: string,
   coreReadTables: readonly PluginDatabaseCoreReadTable[] = [],
-  knownSchemas?: ReadonlySet<string>,
+  knownSchemas: ReadonlySet<string>,
 ): void {
   // BEFORE the split, deliberately. The whole reason this prefix is banned is that a
   // backslash escape can hide a statement boundary, so the splitter must not be the
@@ -996,7 +996,7 @@ export function validatePluginRuntimeQuery(
 export function validatePluginRuntimeExecute(
   query: string,
   namespace: string,
-  knownSchemas?: ReadonlySet<string>,
+  knownSchemas: ReadonlySet<string>,
 ): void {
   // BEFORE the split, deliberately. The whole reason this prefix is banned is that a
   // backslash escape can hide a statement boundary, so the splitter must not be the
@@ -1352,8 +1352,11 @@ export function pluginDatabaseService(db: PluginDatabaseRootClient) {
           }
 
           const statements = splitSqlStatements(content);
-          const knownSchemas = await loadKnownSchemaNames(client);
           try {
+            // Inside the `try`, so a failed schema read records a migration failure row
+            // like every other validation refusal on this path rather than throwing past
+            // the ledger (#3739 review). It still fails closed either way.
+            const knownSchemas = await loadKnownSchemaNames(client);
             if (statements.length === 0) {
               throw new Error(`Plugin migration ${migrationKey} is empty`);
             }
