@@ -18,6 +18,84 @@ import type {
 const IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const MAX_POSTGRES_IDENTIFIER_LENGTH = 63;
 
+/**
+ * Everything Postgres treats as nothing between two tokens: whitespace, a line
+ * comment, a block comment.
+ *
+ * A comment is not decoration here, it is a SEPARATOR -- `public/**\/.secrets` and
+ * `public--x\n.secrets` are both exactly `public.secrets` to the database. Spanning
+ * it in the pattern itself is what makes the RAW statement sufficient to see a
+ * qualified name, and that is the whole point: the raw statement is the bytes the
+ * database gets, so a pattern that spans this gap cannot be blinded by a lexer bug
+ * (PEN-6600). Relying on `stripSqlComments` to remove the comment first put the
+ * lexer back on the trust path, and a mis-lex there deleted the name outright.
+ *
+ * A line comment ends at a CARRIAGE RETURN as well as a newline -- Postgres's
+ * `scan.l` defines `newline [\n\r]`, so `--x\r` is a complete comment. Matching only
+ * `\n` meant this fragment could not span `public--x\r.secrets`, and `scanSqlSpans`
+ * ran the same comment to end of input and DELETED the name from the stripped text:
+ * one byte, both texts blind, no literal and no desync needed (PEN-6600 round 7).
+ *
+ * ⚠ WHAT THIS FRAGMENT STILL CANNOT SPAN, and why that is no longer a residual:
+ * Postgres block comments NEST, and a regular expression provably cannot count, so
+ * the block-comment branch stops at the first `*\/` and always will. Round 6 left
+ * that form to the lexer alone -- and a lexer desync combined with a nested comment
+ * is exactly how both round-7 findings reached `public.secrets`. `assertNoBannedSql`
+ * now REFUSES a nested block comment in the raw statement instead, so this fragment
+ * never has to span one. See `hasNestedBlockComment`.
+ *
+ * The branches are written to be unambiguous (no two can match the same first
+ * character, and the block-comment branch is the linear-time form) so the outer `*`
+ * cannot backtrack catastrophically.
+ */
+const SQL_TOKEN_GAP = String.raw`(?:\s|--[^\n\r]*[\n\r]|/\*[^*]*\*+(?:[^/*][^*]*\*+)*/)*`;
+
+/**
+ * One schema-qualified name, as Postgres lexes it.
+ *
+ * `.` is an ordinary token to Postgres rather than part of an identifier, so
+ * whitespace, a newline or a comment may sit on either side of it. `public . secrets`,
+ * `public .secrets`, `public. secrets`, `"public" . "secrets"` and
+ * `public/**\/.secrets` all name public.secrets and all of them execute.
+ *
+ * This used to be written inline in each of the three patterns below with a BARE
+ * `\.`, so none of those forms extracted a ref at all. That is only half a defect on
+ * its own; the other half is that `validatePluginRuntimeQuery` had no floor, so an
+ * empty ref set fell out of its loop and returned normally -- i.e. ALLOWED (PEN-6600).
+ *
+ * It is ONE shared fragment so the three patterns cannot drift apart again.
+ */
+const QUALIFIED_NAME =
+  String.raw`"?([A-Za-z_][A-Za-z0-9_]*)"?` +
+  SQL_TOKEN_GAP +
+  String.raw`\.` +
+  SQL_TOKEN_GAP +
+  String.raw`"?([A-Za-z_][A-Za-z0-9_]*)"?`;
+
+/**
+ * Every ADJACENT qualified pair in a name chain, including the overlapping ones.
+ *
+ * A zero-width lookahead makes the matches overlap, so `a.b.c` yields `a.b` AND `b.c`;
+ * the lookbehind refuses a start in the middle of an identifier, so `xpublic.secrets`
+ * yields only `xpublic.secrets` and never `public.secrets`. The capture groups sit
+ * inside the lookahead, so groups 1 and 2 stay schema and table exactly as in
+ * `QUALIFIED_NAME`.
+ */
+const OVERLAPPING_QUALIFIED_NAME = new RegExp(
+  String.raw`(?<![A-Za-z0-9_])(?=` + QUALIFIED_NAME + String.raw`)`,
+  "gi",
+);
+
+/**
+ * The schemas that can exist in this database besides a plugin's own namespace:
+ * `public` (the core schema), the catalogs, and every other plugin's namespace --
+ * `derivePluginDatabaseNamespace` always emits a `plugin_` prefix.
+ *
+ * A qualified name whose left side is none of these is a column read through a table
+ * alias (`cursor.id`, `EXCLUDED.y`), which is not this validator's business.
+ */
+const SCHEMA_SHAPED_RE = /^(?:public|information_schema|pg_[a-z0-9_]*|plugin_[a-z0-9_]*)$/;
+
 type SqlRef = { schema: string; table: string; keyword: string };
 type QualifiedRefPattern =
   | { pattern: RegExp; groups: "keyword-schema-table" }
@@ -54,27 +132,54 @@ function quoteIdentifier(value: string): string {
   return `"${assertIdentifier(value).replaceAll("\"", "\"\"")}"`;
 }
 
+/**
+ * A character that can appear inside an unquoted identifier.
+ *
+ * Postgres: `ident_cont [A-Za-z\200-\377_0-9\$]`. The `\200-\377` is every byte a
+ * non-ASCII character is encoded from, so `\u0080-\uFFFF` is the UTF-16 equivalent.
+ * Leaving it out made `e$b$c` read as an identifier and `\u00e9$b$c` read as a
+ * non-identifier followed by a dollar-quote opener, which opened a span to the end
+ * of the statement and inverted this lexer's parity (PEN-6600 round 7).
+ */
+const IDENTIFIER_CHAR_RE = /[A-Za-z0-9_$\u0080-\uFFFF]/;
+
+/**
+ * The opening (and therefore closing) tag of a dollar-quoted string, matched
+ * STICKILY at a candidate `$`. The tag body is optional, so both `$$` and `$tag$`
+ * are openers; a bare `$1` placeholder is not, because the trailing `$` is required.
+ */
+const DOLLAR_QUOTE_TAG = /\$(?:[A-Za-z_\u0080-\uFFFF][A-Za-z0-9_\u0080-\uFFFF]*)?\$/y;
+
 type SqlSpanKind = "code" | "quoted" | "comment";
 type SqlSpan = { kind: SqlSpanKind; start: number; end: number; quote?: "'" | "\"" };
 
 /**
- * The single SQL lexer shared by statement splitting and the keyword scan.
+ * A SQL lexer: contiguous spans covering the whole input, classifying each region
+ * as executable code, a quoted literal/identifier, or a comment.
  *
- * Returns contiguous spans covering the whole input, classifying each region as
- * executable code, a quoted literal/identifier, or a comment.
+ * Its only consumer HERE is `stripSqlComments`, which the ref extractor and the
+ * qualified-name detector both read. A comment is whitespace to Postgres, so a
+ * regex that spans `\s*` cannot see `public/**\/.secrets` -- and neither could the
+ * detector meant to backstop it, because it matched the same raw text (PEN-6600).
+ * Lexing is the only way to tell a comment from the `/` of an operator or from a
+ * `--` living inside a string literal, and a chain of regexes provably cannot:
+ * strip quotes first and an apostrophe in a comment pairs with the next real
+ * string; strip `--` first and it truncates a literal that legitimately contains
+ * one.
  *
- * Both consumers MUST agree on what is a comment and what is a literal. They used
- * not to: `splitSqlStatements` scanned characters and tracked line comments, while
- * `stripSqlForKeywordScan` ran a chain of regexes that replaced quoted literals
- * BEFORE line comments. An apostrophe inside a `--` comment was therefore live when
- * the literal regex ran and paired with the opening quote of the next real string,
- * swallowing everything between them -- including the statement keyword. That cut
- * both ways: it refused valid migrations whose comment carried an odd number of
- * apostrophes, and it hid banned statements from `assertNoBannedSql` (PEN-5951).
+ * ⚠ `splitSqlStatements` and `stripSqlForKeywordScan` in this file do NOT yet read
+ * these spans -- they still carry their own scanner and regex chain respectively,
+ * exactly as on `master`. Routing those two through this lexer is PEN-5951 /
+ * `Blockcast/paperclip#3734`.
  *
- * Fixing it by reordering the regexes is NOT equivalent and is not safe: stripping
- * `--` first truncates any string literal that legitimately contains `--`, leaving
- * unbalanced quotes. Only one lexer settles both directions.
+ * ⛔ THIS FUNCTION IS NO LONGER BYTE-IDENTICAL TO `#3734`'s COPY, and that changes
+ * the rebase obligation recorded on PEN-5951. Until PEN-6600 round 6 the two copies
+ * matched and whichever PR landed second could simply DELETE its duplicate. This
+ * version adds the three literal and comment forms whose absence let a mis-lex delete
+ * real SQL -- `E'\''` backslash escapes, dollar quotes, and nested block comments --
+ * so the copy in `#3734` is now the STRICTLY OLDER one. Whichever lands second must
+ * keep THIS body, not drop it; `#3734` routes two more callers through the lexer, and
+ * routing them through the older copy reintroduces the parity desync for all three.
  */
 function scanSqlSpans(input: string): SqlSpan[] {
   const spans: SqlSpan[] = [];
@@ -90,8 +195,13 @@ function scanSqlSpans(input: string): SqlSpan[] {
 
     if (char === "-" && next === "-") {
       closeCode(i);
-      const newline = input.indexOf("\n", i);
-      const end = newline === -1 ? input.length : newline;
+      // Postgres: `newline [\n\r]`, so a CARRIAGE RETURN ends a line comment too.
+      // Stopping only at `\n` ran `--x\r.secrets` to end of input and deleted the
+      // qualified name from `stripSqlComments` output (PEN-6600 round 7).
+      const lf = input.indexOf("\n", i);
+      const cr = input.indexOf("\r", i);
+      const terminator = lf === -1 ? cr : cr === -1 ? lf : Math.min(lf, cr);
+      const end = terminator === -1 ? input.length : terminator;
       spans.push({ kind: "comment", start: i, end });
       // The newline itself stays code, so it still separates tokens.
       i = end - 1;
@@ -101,19 +211,77 @@ function scanSqlSpans(input: string): SqlSpan[] {
 
     if (char === "/" && next === "*") {
       closeCode(i);
-      const closed = input.indexOf("*/", i + 2);
-      const end = closed === -1 ? input.length : closed + 2;
+      // Postgres block comments NEST: `/* a /* b */ c */` is ONE comment, so a scan
+      // that stopped at the first `*/` ended the comment early and handed the rest
+      // of it back as executable code.
+      let depth = 1;
+      let j = i + 2;
+      while (j < input.length && depth > 0) {
+        if (input[j] === "/" && input[j + 1] === "*") {
+          depth += 1;
+          j += 2;
+          continue;
+        }
+        if (input[j] === "*" && input[j + 1] === "/") {
+          depth -= 1;
+          j += 2;
+          continue;
+        }
+        j += 1;
+      }
+      // An unterminated comment runs to end of input, as an unterminated literal does.
+      const end = depth === 0 ? j : input.length;
       spans.push({ kind: "comment", start: i, end });
       i = end - 1;
       codeStart = end;
       continue;
     }
 
+    // A dollar-quoted string: `$tag$ ... $tag$`, tag optional. Nothing inside it is
+    // escaped and nothing inside it ends it except the matching tag, so an
+    // apostrophe in `$$'$$` is ordinary text. Reading it as a quote-open was what
+    // inverted this lexer's parity and let the strip delete real SQL (PEN-6600).
+    // `$1` is a parameter placeholder, not an opener: DOLLAR_QUOTE_TAG requires the
+    // closing `$` of the tag, which a placeholder does not have.
+    //
+    // `$` is also a legal NON-INITIAL identifier character, so `a$b$c` is ONE
+    // identifier to Postgres and its `$b$` is not an opener. Without the preceding
+    // character test, lexing it as one would open a span to the end of the statement
+    // -- reintroducing, through this very fix, the parity inversion it closes.
+    if (char === "$" && !IDENTIFIER_CHAR_RE.test(input[i - 1] ?? "")) {
+      DOLLAR_QUOTE_TAG.lastIndex = i;
+      const opener = DOLLAR_QUOTE_TAG.exec(input);
+      if (opener) {
+        closeCode(i);
+        const tag = opener[0]!;
+        const closed = input.indexOf(tag, i + tag.length);
+        const end = closed === -1 ? input.length : closed + tag.length;
+        spans.push({ kind: "quoted", start: i, end });
+        i = end - 1;
+        codeStart = end;
+        continue;
+      }
+    }
+
     if (char === "'" || char === "\"") {
       closeCode(i);
       const quote = char;
+      // `E'...'` is an escape-string literal, where a backslash escapes the next
+      // character -- so Postgres reads `E'\''` as ONE complete one-character literal.
+      // Without this rule the span closed at the second quote and a new one opened at
+      // the third, inverting quote parity for the whole rest of the statement
+      // (PEN-6600). Plain `'...'` has no backslash escape under the default
+      // `standard_conforming_strings`, so this must stay keyed on the `E`.
+      const escapeString =
+        quote === "'" &&
+        (input[i - 1] === "E" || input[i - 1] === "e") &&
+        !IDENTIFIER_CHAR_RE.test(input[i - 2] ?? "");
       let j = i + 1;
       for (; j < input.length; j += 1) {
+        if (escapeString && input[j] === "\\") {
+          j += 1;
+          continue;
+        }
         if (input[j] !== quote) continue;
         // A doubled quote is an escaped quote, not the end of the literal.
         if (input[j + 1] === quote) {
@@ -134,6 +302,57 @@ function scanSqlSpans(input: string): SqlSpan[] {
   closeCode(input.length);
   return spans;
 }
+
+/**
+ * The same input with comments replaced by a single space, and everything else --
+ * code AND quoted spans -- kept verbatim.
+ *
+ * ⛔ LIMIT, and it is a trust boundary: "verbatim" holds only while `scanSqlSpans`
+ * gets the quote parity RIGHT. Once parity is inverted, a `/*` inside a REAL string
+ * literal is read as a comment open and every byte up to the next `*\/` is DELETED
+ * from the output -- arbitrary real SQL, not just a comment. That is not a
+ * hypothetical: it shipped here, and `master` refused statements this file allowed
+ * (PEN-6600).
+ *
+ * The literal and comment forms that inverted parity -- `E'\''`, `$tag$...$`, a
+ * NESTED block comment, a `\r`-terminated line comment and a high-bit character in
+ * an identifier or a dollar-quote tag -- are now lexed. "No form I currently know
+ * of" is the honest strength of that claim, and it is weaker than the one this
+ * output needs: round 6 wrote "no form Postgres has is known to desync it" and two
+ * more forms were found against the very next head. Do not promote it again.
+ *
+ * ⇒ Do NOT route a check through this function on the assumption that its output is
+ * a superset, or even a faithful rendering, of the statement. A check must read this
+ * output IN ADDITION TO the raw statement, never instead of it; see
+ * `collectQualifiedRefs`, which exists for exactly that reason. Collapsing the three
+ * scanners in this file onto this one lexer is still PEN-5951.
+ *
+ * This is what `extractQualifiedRefs` must read. The keyword scan blanks quoted
+ * spans because it only cares about keywords; the ref extractor cannot, because a
+ * quoted IDENTIFIER (`"schema"."table"`) is a ref, and because blanking literals
+ * would hide the text the splitter already mis-lexed into one giant quoted span.
+ *
+ * The ref extractor used to regex the RAW statement while the keyword scan read
+ * comment-stripped text, so the two halves of the validator disagreed about a block
+ * comment placed between `UPDATE` and the table name: the keyword scan saw a legal
+ * `UPDATE`, while `(update|into|from)` followed by whitespace could not match across
+ * the comment. The real write target was therefore never extracted, and the
+ * namespace check adjudicated some other in-namespace ref instead.
+ *
+ * ⚠ This closes that disagreement for the REF half only -- the extractor and the
+ * detector now read one text. The keyword scan still reads its own
+ * `stripSqlForKeywordScan` output, which blanks quoted spans because it only cares
+ * about keywords; the ref extractor cannot blank them, because a quoted IDENTIFIER
+ * (`"schema"."table"`) is a ref. Making all three read ONE lexer is PEN-5951.
+ */
+function stripSqlComments(input: string): string {
+  let out = "";
+  for (const span of scanSqlSpans(input)) {
+    out += span.kind === "comment" ? " " : input.slice(span.start, span.end);
+  }
+  return out;
+}
+
 
 function splitSqlStatements(input: string): string[] {
   const statements: string[] = [];
@@ -162,7 +381,13 @@ function stripSqlForKeywordScan(input: string): string {
       continue;
     }
     if (span.kind === "quoted") {
-      out += span.quote === "'" ? "''" : "\"\"";
+      // `quote` is set only for `'` and `"`. A DOLLAR-quoted span (`$tag$ ... $tag$`)
+      // has none, and this arm used to render it `""` -- erasing the `$$` that
+      // `\bdo\s+\$\$` keys on, so `DO $$ ... $$` stopped matching the ban the moment
+      // the lexer learned dollar-quoting (PEN-6600 rebase onto PEN-5951). An EMPTY
+      // dollar-quoted string is the exact analogue of `''` and `""`: it hides the
+      // body and keeps the delimiter the keyword scan reads.
+      out += span.quote === "'" ? "''" : span.quote === '"' ? '""' : "$$$$";
       continue;
     }
     // A comment is whitespace to Postgres, so it must SEPARATE the tokens either
@@ -173,29 +398,303 @@ function stripSqlForKeywordScan(input: string): string {
   return out;
 }
 
-/**
- * The same input with comments replaced by a single space, and everything else --
- * code AND quoted spans -- kept verbatim.
- *
- * This is what `extractQualifiedRefs` must read. The keyword scan blanks quoted
- * spans because it only cares about keywords; the ref extractor cannot, because a
- * quoted IDENTIFIER (`"schema"."table"`) is a ref, and because blanking literals
- * would hide the text the splitter already mis-lexed into one giant quoted span.
- *
- * Before PEN-5951 the ref extractor regexed the RAW statement while the keyword
- * scan read comment-stripped text, so the two halves of the validator disagreed
- * about a block comment placed between `UPDATE` and the table name: the keyword
- * scan saw a legal `UPDATE`, while `(update|into|from)` followed by whitespace
- * could not match across the comment. The real write target was therefore never
- * extracted, and the namespace check adjudicated some other in-namespace ref
- * instead. Both halves now read the same text.
- */
-function stripSqlComments(input: string): string {
-  let out = "";
-  for (const span of scanSqlSpans(input)) {
-    out += span.kind === "comment" ? " " : input.slice(span.start, span.end);
+function normaliseSql(input: string): string {
+  return stripSqlForKeywordScan(input).replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function extractQualifiedRefs(statement: string): SqlRef[] {
+  const refs: SqlRef[] = [];
+  const patterns: QualifiedRefPattern[] = [
+    {
+      pattern: new RegExp(String.raw`\b(from|join|references|into|update)\s+` + QUALIFIED_NAME, "gi"),
+      groups: "keyword-schema-table",
+    },
+    {
+      pattern: new RegExp(
+        String.raw`\b(alter\s+table|create\s+table|create\s+view|drop\s+table|truncate\s+table)\s+(?:if\s+(?:not\s+)?exists\s+)?` +
+          QUALIFIED_NAME,
+        "gi",
+      ),
+      groups: "keyword-schema-table",
+    },
+    {
+      pattern: new RegExp(
+        String.raw`\bcreate\s+(?:unique\s+)?index(?:\s+concurrently)?\s+(?:if\s+not\s+exists\s+)?"?[A-Za-z_][A-Za-z0-9_]*"?\s+on\s+` +
+          QUALIFIED_NAME,
+        "gi",
+      ),
+      groups: "schema-table",
+      keyword: "create index",
+    },
+  ];
+
+  for (const { pattern, ...mapping } of patterns) {
+    for (const match of statement.matchAll(pattern)) {
+      if (mapping.groups === "keyword-schema-table") {
+        refs.push({ keyword: match[1]!.toLowerCase(), schema: match[2]!, table: match[3]! });
+      } else {
+        refs.push({ keyword: mapping.keyword, schema: match[1]!, table: match[2]! });
+      }
+    }
   }
-  return out;
+  return refs;
+}
+
+/**
+ * Every qualified ref visible in EITHER the raw statement or its comment-stripped
+ * form, plus both texts, so a caller can adjudicate against both.
+ *
+ * `stripSqlComments` is a PRE-PASS, and a pre-pass may only ever ADD to what gets
+ * checked -- never remove. It removed: once `scanSqlSpans` had its quote parity
+ * inverted, a `/*` sitting inside a REAL string literal was lexed as the start of a
+ * comment and everything up to the next `*\/` -- arbitrary real SQL, including
+ * `public.secrets` -- was replaced by a single space. Reading only the stripped text
+ * then adjudicates a statement the database never sees, which `master` refused and
+ * this file briefly allowed (PEN-6600).
+ *
+ * ⛔ READING BOTH IS NOT, BY ITSELF, SOUND, AND THIS DOCBLOCK SAID IT WAS. The
+ * claim was that "a mis-lex can only ever hide a name from ONE of them". It is false
+ * whenever TWO mechanisms are combined, because the two texts have two different
+ * blind spots and one statement can carry both:
+ *
+ *   - a comment INSIDE the name (`public/**\/.secrets`, `public--x\n.secrets`) hid it
+ *     from the RAW text, because `QUALIFIED_NAME` spanned `\s*` and not a comment;
+ *   - an `E'\''` or `$$'$$` desync hid it from the STRIPPED text, by deleting it.
+ *
+ * Measured: six such statements -- on the query, execute and migration paths, one of
+ * them an `INSERT ... SELECT` that copies core rows into a plugin-readable table --
+ * were ALLOWED (PEN-6600 round 5, found by Ally). So the two blind spots are closed
+ * SEPARATELY, and the union is what is left over rather than the argument:
+ *
+ *   1. `QUALIFIED_NAME` now spans `SQL_TOKEN_GAP`, so the RAW statement -- the exact
+ *      bytes the database receives -- shows a comment-separated name with no lexer
+ *      involved at all. This is the half that cannot be broken by a lexer bug.
+ *   2. `scanSqlSpans` now lexes `E'\''`, dollar quotes, NESTED block comments,
+ *      `\r`-terminated line comments and high-bit identifier and tag characters.
+ *
+ * ⛔ ROUND 6 STATED A RESIDUAL HERE AND THE RESIDUAL WAS THE NEXT TWO FINDINGS. It
+ * read: "a NESTED block comment inside a qualified name is spanned by (2) and NOT by
+ * (1), so for that one form the control does rest on the lexer being right. Every
+ * other comment form is covered by both." Both halves were wrong. A `\r`-terminated
+ * line comment was covered by NEITHER text, and the nested form was reachable by
+ * pairing it with any lexer desync -- which is what a residual resting on the lexer
+ * MEANS, and it was written down as though stating it made it safe.
+ *
+ * ⇒ A stated residual is not a closed one. (1) can never span a nested comment
+ * because a regular expression cannot count, so the nesting is REFUSED in the raw
+ * statement instead (`hasNestedBlockComment`) and (1) never meets one.
+ *
+ * That turns (1) from "covers every form we thought of" into a COMPLETENESS claim
+ * for the one position that matters -- a comment sitting INSIDE a qualified name.
+ * Such a comment has text after it, so it is terminated, so it is one of exactly
+ * three forms, and every one is accounted for without consulting the lexer:
+ *
+ *   - a line comment ended by `\n` or `\r`  -> SPANNED by SQL_TOKEN_GAP
+ *   - a non-nested block comment             -> SPANNED by SQL_TOKEN_GAP
+ *   - a NESTED block comment                 -> REFUSED by `hasNestedBlockComment`
+ *
+ * (an unterminated comment is not a fourth case: Postgres rejects the statement.)
+ *
+ * ⚠ MEASURED CONSEQUENCE, recorded because it looks like a reason to delete (2):
+ * once (1) is complete, (2) cannot change a VERDICT, so no test in this file pins
+ * the high-bit character classes -- reverting them leaves the suite green (measured,
+ * PEN-6600 round 7). They are kept anyway, and NOT as belt-and-braces: `scanSqlSpans`
+ * is a lexer, its correctness is its own property, and PEN-5951 routes
+ * `splitSqlStatements` and `stripSqlForKeywordScan` through it. Against THOSE callers
+ * a desync is redundant with nothing. Do not drop them because the suite stays green.
+ *
+ * Measured over the 204 shipped plugin statements: 0 carry a schema-shaped qualified
+ * name visible in one of these texts and not the other, so adjudicating both refuses
+ * nothing that ships today.
+ */
+function collectQualifiedRefs(statement: string): {
+  refs: SqlRef[];
+  texts: readonly string[];
+} {
+  const stripped = stripSqlComments(statement);
+  const texts = stripped === statement ? [statement] : [statement, stripped];
+  const refs: SqlRef[] = [];
+  const seen = new Set<string>();
+  for (const text of texts) {
+    for (const ref of extractQualifiedRefs(text)) {
+      const key = `${ref.keyword}\u0000${ref.schema.toLowerCase()}\u0000${ref.table.toLowerCase()}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      refs.push(ref);
+    }
+  }
+  return { refs, texts };
+}
+
+/**
+ * Runs the unextracted-ref detector over every text the refs were collected from.
+ *
+ * Both halves of the control must read every text, not one each: a name the extractor
+ * could not reach in the text where it IS visible is exactly what the detector exists
+ * to refuse.
+ */
+function assertNoUnextractedSchemaRefsInAll(
+  texts: readonly string[],
+  refs: readonly SqlRef[],
+  namespace: string,
+): void {
+  for (const text of texts) assertNoUnextractedSchemaRefs(text, refs, namespace);
+}
+
+/**
+ * Refuses a statement that names a schema-qualified object the ref patterns did not
+ * extract.
+ *
+ * Every pattern above is anchored on a keyword (`FROM x.y`, `UPDATE x.y`, ...), so
+ * each one only ever reads the FIRST operand of a relation list. In
+ * `FROM plugin_ns.rows, public.secrets` the second relation is matched by nothing,
+ * and the loops below then adjudicate the statement on the one ref that WAS read.
+ * A `refs.length === 0` floor cannot see that case, because the ref count is 1.
+ *
+ * Rather than enumerate the positions a keyword-anchored pattern misses -- that is a
+ * blocklist, and the next form nobody anticipated reopens the hole -- this asserts
+ * the invariant the callers actually rely on: every schema-qualified name in the
+ * statement was adjudicated. Anything the extractor could not read is refused
+ * instead of ignored.
+ *
+ * It reads the SAME text the extractor read, for the reason recorded on PEN-5951:
+ * two halves of one control that disagree about what the text says are exploitable
+ * in whichever direction the gap opens.
+ *
+ * This reads the CHARACTERS of a name, so it holds only while the characters are the
+ * name. `assertNoBannedSql` refuses `U&"..."` to keep that true -- see
+ * `UNICODE_ESCAPE_IDENTIFIER`.
+ *
+ * The scan OVERLAPS, which a plain `matchAll` does not. Postgres accepts a three-part
+ * `catalog.schema.table` when the catalog is the current database, and a plugin can
+ * learn that name with `SELECT current_database()`. A non-overlapping scan of
+ * `paperclip.public.secrets` matches `paperclip.public` -- whose schema `paperclip` is
+ * neither the namespace nor schema-shaped, so it is skipped as a table alias -- and
+ * then resumes AFTER `public`, so `public.secrets` is never considered at all and the
+ * invariant this function exists to assert quietly did not hold (PEN-6600).
+ *
+ * Matching every adjacent pair instead of every other one closes that for any depth,
+ * rather than banning the three-part form -- a ban is a blocklist, and the four-part
+ * name reopens it. The lookbehind keeps the scan anchored to identifier starts: without
+ * it, a lookahead scan also matches `public.secrets` INSIDE `xpublic.secrets`, which
+ * refuses a statement naming a schema nobody asked about.
+ */
+function assertNoUnextractedSchemaRefs(
+  statement: string,
+  refs: readonly SqlRef[],
+  namespace: string,
+): void {
+  const extracted = new Set(
+    refs.map((ref) => `${ref.schema.toLowerCase()}.${ref.table.toLowerCase()}`),
+  );
+  for (const match of statement.matchAll(OVERLAPPING_QUALIFIED_NAME)) {
+    const schema = match[1]!;
+    const table = match[2]!;
+    if (extracted.has(`${schema.toLowerCase()}.${table.toLowerCase()}`)) continue;
+    if (schema !== namespace && !SCHEMA_SHAPED_RE.test(schema.toLowerCase())) continue;
+    throw new Error(
+      `Plugin SQL names ${schema}.${table} in a position this validator cannot adjudicate`,
+    );
+  }
+}
+
+function assertAllowedPublicRead(
+  ref: SqlRef,
+  allowedCoreReadTables: ReadonlySet<string>,
+): void {
+  if (ref.schema !== "public") return;
+  if (!allowedCoreReadTables.has(ref.table)) {
+    throw new Error(`Plugin SQL references public.${ref.table}, which is not whitelisted`);
+  }
+  if (!["from", "join", "references"].includes(ref.keyword)) {
+    throw new Error(`Plugin SQL cannot mutate or define objects in public.${ref.table}`);
+  }
+}
+
+/**
+ * Postgres lets an identifier be spelled with Unicode escapes, so `U&"\0070ublic"` IS
+ * `public` -- the characters that write the name and the name it resolves to are two
+ * different strings. Every control in this file reads the characters. `QUALIFIED_NAME`
+ * matches its leftmost candidate inside `U&"\0070ublic".secrets` at `ublic".secrets`,
+ * yielding schema `ublic`, which `SCHEMA_SHAPED_RE` then skips as a table alias -- so
+ * the extractor, the detector and the write-target reader all agree the statement does
+ * not touch `public`, and it reads `public.secrets`. Measured against a real Postgres
+ * engine: it returns the row.
+ *
+ * This is NOT one more entry in a blocklist of positions, which is the shape this
+ * validator is built to avoid. `U&"..."` is the ONLY form in the grammar where a
+ * quoted identifier's decoded name differs from the characters spelling it: the sole
+ * escape inside a plain `"..."` is `""`, which can produce a literal quote and so can
+ * never spell a DIFFERENT schema. Refusing the form closes the class.
+ *
+ * ⛔ It closes the class ONLY BECAUSE IT READS THE RAW STATEMENT. Testing `normaliseSql`
+ * output instead -- which is what this guard did when it was first written -- blanks
+ * quoted spans through `stripSqlForKeywordScan`, whose regex chain has no
+ * backslash-escape rule. (`scanSqlSpans` has had one since PEN-6600 round 6, but this
+ * guard does not read it, and the keyword chain is a SEPARATE scanner -- that is what
+ * PEN-5951 exists to collapse.) Postgres reads `E'\''` as a complete one-character
+ * literal; the chain closes the span at the second quote and opens a new one at the
+ * third, so every character up to the next quote is blanked -- including a `U&"` living
+ * in it. Measured: `… WHERE a = E'\'' AND b IN (SELECT 1 FROM
+ * U&"\0070ublic".secrets) …` ALLOWED on all three paths against the blanked text and
+ * REFUSES against the raw text, while the same statement naming a plain `public.secrets`
+ * refused either way -- so the desync was specific to this guard.
+ *
+ * Reading raw costs nothing a blanked read was buying: a genuine `"..."` identifier can
+ * never contain a `U&"` (it would have to open a second quote), so blanking could only
+ * ever hide the thing this looks for. A `U&"` inside a string literal or a comment is
+ * now refused too. That fails CLOSED and matches 0 shipped statements -- there are 0
+ * occurrences of `u&"` anywhere in this repo's plugin corpus.
+ *
+ * The alternative -- decoding the escapes here -- would put a second identifier lexer
+ * in the file that PEN-5951 exists to collapse to one, to buy a syntax no plugin uses.
+ *
+ * `U&'...'` -- the STRING form -- stays allowed on purpose: a literal cannot name a
+ * relation, so it reaches none of this. `\b` is load-bearing; without it a column
+ * named `menu` bitwise-anded with a quoted name (`menu&"x"`) would be refused, and
+ * that is not this form.
+ */
+const UNICODE_ESCAPE_IDENTIFIER = /\bu&"/;
+
+/**
+ * A block comment that contains another block-comment opener.
+ *
+ * Postgres block comments NEST: `/* a /* b *\/ c *\/` is ONE comment. `SQL_TOKEN_GAP`
+ * reads the RAW statement and so is the half of this control that a lexer bug cannot
+ * blind -- but a regular expression provably cannot count, so it stops at the first
+ * `*\/` and can never span a nested comment. Round 6 recorded that as a residual
+ * covered "by the lexer instead", and round 7 found both of the statements that
+ * residual admits: pair a nested comment with ANY desync of `scanSqlSpans` and the
+ * name is invisible to both texts at once.
+ *
+ * Refusing the form is what removes the dependency rather than restating it. The
+ * check reads the raw statement and deliberately does NOT lex: consulting
+ * `scanSqlSpans` to find out which `/*` are "really" comments would put this guard
+ * back on the trust path it exists to leave.
+ *
+ * ⚠ The cost of not lexing, stated because it is a real false refusal: a statement
+ * whose STRING LITERALS carry an unbalanced `/*` (`a = '/*' AND b = '/*'`) is counted
+ * as nesting and refused. That fails CLOSED, and it is measured: 0 of the 190 shipped
+ * plugin statements contain `/*` at all, so nothing that ships today pays it. Two
+ * separate, properly closed block comments are NOT nesting and stay allowed -- that
+ * is the control in the tests, because "refuse a second comment" would be a far
+ * wider rule wearing the same name.
+ */
+function hasNestedBlockComment(statement: string): boolean {
+  let depth = 0;
+  for (let i = 0; i + 1 < statement.length; i += 1) {
+    if (statement[i] === "/" && statement[i + 1] === "*") {
+      depth += 1;
+      if (depth > 1) return true;
+      i += 1;
+      continue;
+    }
+    if (statement[i] === "*" && statement[i + 1] === "/") {
+      if (depth > 0) depth -= 1;
+      i += 1;
+    }
+  }
+  return false;
 }
 
 /**
@@ -228,56 +727,21 @@ function assertNoEscapeStringLiterals(statement: string): void {
   }
 }
 
-function normaliseSql(input: string): string {
-  return stripSqlForKeywordScan(input).replace(/\s+/g, " ").trim().toLowerCase();
-}
-
-function extractQualifiedRefs(statement: string): SqlRef[] {
-  const refs: SqlRef[] = [];
-  const patterns: QualifiedRefPattern[] = [
-    {
-      pattern: /\b(from|join|references|into|update)\s+"?([A-Za-z_][A-Za-z0-9_]*)"?\."?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
-      groups: "keyword-schema-table",
-    },
-    {
-      pattern: /\b(alter\s+table|create\s+table|create\s+view|drop\s+table|truncate\s+table)\s+(?:if\s+(?:not\s+)?exists\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?\."?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
-      groups: "keyword-schema-table",
-    },
-    {
-      pattern: /\bcreate\s+(?:unique\s+)?index(?:\s+concurrently)?\s+(?:if\s+not\s+exists\s+)?"?[A-Za-z_][A-Za-z0-9_]*"?\s+on\s+"?([A-Za-z_][A-Za-z0-9_]*)"?\."?([A-Za-z_][A-Za-z0-9_]*)"?/gi,
-      groups: "schema-table",
-      keyword: "create index",
-    },
-  ];
-
-  for (const { pattern, ...mapping } of patterns) {
-    for (const match of statement.matchAll(pattern)) {
-      if (mapping.groups === "keyword-schema-table") {
-        refs.push({ keyword: match[1]!.toLowerCase(), schema: match[2]!, table: match[3]! });
-      } else {
-        refs.push({ keyword: mapping.keyword, schema: match[1]!, table: match[2]! });
-      }
-    }
-  }
-  return refs;
-}
-
-function assertAllowedPublicRead(
-  ref: SqlRef,
-  allowedCoreReadTables: ReadonlySet<string>,
-): void {
-  if (ref.schema !== "public") return;
-  if (!allowedCoreReadTables.has(ref.table)) {
-    throw new Error(`Plugin SQL references public.${ref.table}, which is not whitelisted`);
-  }
-  if (!["from", "join", "references"].includes(ref.keyword)) {
-    throw new Error(`Plugin SQL cannot mutate or define objects in public.${ref.table}`);
-  }
-}
-
 function assertNoBannedSql(statement: string): void {
   assertNoEscapeStringLiterals(statement);
   const normalized = normaliseSql(statement);
+  // RAW text, deliberately -- NOT `normalized`. See `hasNestedBlockComment`.
+  if (hasNestedBlockComment(statement)) {
+    throw new Error(
+      "Plugin SQL contains a nested block comment, which the raw-statement name scan cannot span",
+    );
+  }
+  // RAW text, deliberately -- NOT `normalized`. See `UNICODE_ESCAPE_IDENTIFIER`.
+  if (UNICODE_ESCAPE_IDENTIFIER.test(statement.toLowerCase())) {
+    throw new Error(
+      "Plugin SQL uses a Unicode-escape identifier (U&\"...\"), whose decoded name this validator cannot adjudicate",
+    );
+  }
   const banned = [
     /\bcreate\s+extension\b/,
     /\bcreate\s+(?:event\s+)?trigger\b/,
@@ -294,6 +758,30 @@ function assertNoBannedSql(statement: string): void {
   if (matched) {
     throw new Error(`Plugin SQL contains a disallowed statement or clause: ${matched.source}`);
   }
+}
+
+/**
+ * The write target of a runtime `execute`, read from the statement's LEADING
+ * keyword rather than found among the refs.
+ *
+ * `refs.find(keyword in {into, update, from})` returned the first ref carrying ANY
+ * write-ish keyword, and `from` is in that set because `DELETE FROM x.y` needs it.
+ * So in `UPDATE agents SET name = $1 FROM plugin_ns.rows` -- whose real target is
+ * unqualified and therefore extracted by nothing -- the in-namespace `FROM` operand
+ * was promoted into the target slot and the statement passed, writing `public.agents`
+ * through `search_path`. The target has to come from the one position that IS the
+ * target, and an operand that is not a qualified name there is refused rather than
+ * replaced by a later one.
+ */
+const LEADING_WRITE_TARGET = new RegExp(
+  String.raw`^\s*(?:insert\s+into|update|delete\s+from)\s+` + QUALIFIED_NAME,
+  "i",
+);
+
+function extractLeadingWriteTarget(scanText: string): { schema: string; table: string } | null {
+  const match = LEADING_WRITE_TARGET.exec(scanText);
+  if (!match) return null;
+  return { schema: match[1]!, table: match[2]! };
 }
 
 export function validatePluginMigrationStatement(
@@ -321,9 +809,18 @@ export function validatePluginMigrationStatement(
     throw new Error("Plugin migrations may contain DDL or namespace-scoped backfill statements only");
   }
 
-  const refs = extractQualifiedRefs(stripSqlComments(statement));
+  const { refs, texts } = collectQualifiedRefs(statement);
   if (refs.length === 0 && !normalized.startsWith("comment ")) {
     throw new Error("Plugin migration objects must use fully qualified schema names");
+  }
+
+  // `COMMENT ON COLUMN` names a THREE-part object (schema.table.column) that the ref
+  // patterns were never built to read, which is why the floor above already exempts
+  // it. The detector inherits that same carve-out rather than inventing a second rule
+  // which would disagree with it. Measured: without this, five shipped
+  // `COMMENT ON TABLE`/`COMMENT ON COLUMN` statements change verdict.
+  if (!normalized.startsWith("comment ")) {
+    assertNoUnextractedSchemaRefsInAll(texts, refs, namespace);
   }
 
   const objectRefKeywords = new Set([
@@ -357,6 +854,11 @@ export function validatePluginRuntimeQuery(
   namespace: string,
   coreReadTables: readonly PluginDatabaseCoreReadTable[] = [],
 ): void {
+  // BEFORE the split, deliberately. The whole reason this prefix is banned is that a
+  // backslash escape can hide a statement boundary, so the splitter must not be the
+  // first thing to adjudicate input that carries one. `assertNoBannedSql` also calls
+  // this, which is what covers the migration path -- it is handed a single statement.
+  assertNoEscapeStringLiterals(query);
   const statements = splitSqlStatements(query);
   if (statements.length !== 1) {
     throw new Error("Plugin runtime SQL must contain exactly one statement");
@@ -372,7 +874,30 @@ export function validatePluginRuntimeQuery(
   }
 
   const allowedCoreReadTables = new Set(coreReadTables);
-  for (const ref of extractQualifiedRefs(stripSqlComments(statement))) {
+  const { refs, texts } = collectQualifiedRefs(statement);
+  // `validatePluginMigrationStatement` has carried this floor all along; this path did
+  // not, so a statement the extractor could not read fell straight out of the loop
+  // below and returned normally -- ALLOWED. This is the half of PEN-6600 that fails
+  // closed on a lexical form nobody anticipated, where the pattern fix only closes the
+  // forms we did think of.
+  //
+  // Measured against the `ctx.db.query`/`ctx.db.execute` statements shipped in this
+  // repo: every one of them already qualifies at least one relation, so no currently
+  // valid statement changes verdict.
+  //
+  // LIMIT, stated because an earlier draft of this comment claimed more than the code
+  // does: the floor closes an UNQUALIFIED relation name -- which `search_path` resolves
+  // against `public` -- only when the statement qualifies NOTHING. One in-namespace
+  // relation makes the count 1 and the floor cannot fire, so `FROM plugin_ns.rows,
+  // secrets` still reads `public.secrets`. Nothing here can close that: the detector
+  // below sees qualified names only, and telling a relation name from a column name
+  // needs a real parse. The structural answer is to pin `search_path` on the
+  // connection that runs plugin SQL, which is PEN-6604, not this validator.
+  if (refs.length === 0) {
+    throw new Error("ctx.db.query must name every relation it reads as schema.table");
+  }
+  assertNoUnextractedSchemaRefsInAll(texts, refs, namespace);
+  for (const ref of refs) {
     if (ref.schema === namespace) continue;
     if (ref.schema === "public") {
       assertAllowedPublicRead(ref, allowedCoreReadTables);
@@ -383,6 +908,11 @@ export function validatePluginRuntimeQuery(
 }
 
 export function validatePluginRuntimeExecute(query: string, namespace: string): void {
+  // BEFORE the split, deliberately. The whole reason this prefix is banned is that a
+  // backslash escape can hide a statement boundary, so the splitter must not be the
+  // first thing to adjudicate input that carries one. `assertNoBannedSql` also calls
+  // this, which is what covers the migration path -- it is handed a single statement.
+  assertNoEscapeStringLiterals(query);
   const statements = splitSqlStatements(query);
   if (statements.length !== 1) {
     throw new Error("Plugin runtime SQL must contain exactly one statement");
@@ -397,10 +927,30 @@ export function validatePluginRuntimeExecute(query: string, namespace: string): 
     throw new Error("ctx.db.execute cannot contain DDL keywords");
   }
 
-  const refs = extractQualifiedRefs(stripSqlComments(statement));
-  const target = refs.find((ref) => ["into", "update", "from"].includes(ref.keyword));
-  if (!target || target.schema !== namespace) {
-    throw new Error(`ctx.db.execute target must be inside plugin namespace "${namespace}"`);
+  const { refs, texts } = collectQualifiedRefs(statement);
+  // Before the target is chosen, not after: a write target the extractor could not
+  // read used to promote some other in-namespace ref into its place, so the namespace
+  // check adjudicated the wrong object.
+  assertNoUnextractedSchemaRefsInAll(texts, refs, namespace);
+  // Read from the leading keyword, so an unqualified target is REFUSED rather than
+  // replaced by a later in-namespace ref. See `extractLeadingWriteTarget`.
+  //
+  // Read from EVERY text for the same reason the refs are: a mis-lex can only hide
+  // the target from one of them, and a target that is out of namespace in ANY reading
+  // is refused. A comment between the keyword and the name (`INSERT INTO /*c*/ x.y`)
+  // yields no target in the raw text at all, which is why one non-null is enough.
+  const targets = texts
+    .map((text) => extractLeadingWriteTarget(text))
+    .filter((t): t is { schema: string; table: string } => t !== null);
+  if (targets.length === 0) {
+    throw new Error(
+      "ctx.db.execute must name its write target as schema.table directly after INSERT INTO, UPDATE or DELETE FROM",
+    );
+  }
+  for (const target of targets) {
+    if (target.schema !== namespace) {
+      throw new Error(`ctx.db.execute target must be inside plugin namespace "${namespace}"`);
+    }
   }
   for (const ref of refs) {
     if (ref.schema !== namespace) {
