@@ -77,9 +77,10 @@ import type { PluginContext } from "@paperclipai/plugin-sdk";
  * creates the run inside `heartbeat.wakeup()` and only then writes its
  * `issue.assignment_wakeup_requested` activity row, so a throw after the first
  * step rejects the call with the run already alive. Every coded gate refuses
- * BEFORE that point and attaches `details.code`; an UNCODED rejection
- * therefore comes from downstream and establishes nothing. Measured once on
- * PEN-5911: the run existed, started and succeeded while this table read
+ * BEFORE that point and attaches `details.code`; an UNCODED rejection comes
+ * from OUTSIDE them — from before `heartbeat.wakeup()`, where no run exists,
+ * or from after it, where one may — and so establishes nothing either way.
+ * Measured once on PEN-5911: the run existed, started and succeeded while this table read
  * `refused`. The ladder now records a distinct `wake_detail` for that case and
  * the thread stops asserting the negative — see `wakeDetailFor` and
  * `wakeSentence` in `escalation.ts`, and migration `014`.
