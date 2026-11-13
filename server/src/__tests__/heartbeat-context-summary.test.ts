@@ -4064,22 +4064,37 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
   it("names the artifact-scoped sibling check and its no-filter / lower-bound / race caveats (PEN-5802 arm 3)", () => {
     const markdown = buildPaperclipTaskMarkdown({ issue });
 
+    // SCOPE EVERY CONTENT PIN TO THE BULLET'S OWN SUBSTRING, never to the whole
+    // directive. Most of the vocabulary below also occurs in the author-side
+    // "Recording a constraint" paragraph -- `work-products/by-external-id`,
+    // `ownerListComplete`, `withheldForAuthorizationCount`, `paperclipGetIssue` and
+    // `"undetermined"` are all there too -- so a whole-markdown `toContain` is
+    // satisfied by the OTHER paragraph and keeps passing after the clause it claims
+    // to pin is deleted from this bullet. That is a pin that cannot fail: it reads as
+    // a guard, reports green, and guards nothing. Slicing first is what makes each
+    // assertion discriminate, and it is why the `"undetermined"` pin can be described
+    // as stopping the omission coming back.
+    const bulletStart = markdown.indexOf("That `activeRun` check is ROW-scoped");
+    expect(bulletStart).toBeGreaterThan(-1);
+    const bulletEnd = markdown.indexOf("\n- ", bulletStart);
+    expect(bulletEnd).toBeGreaterThan(bulletStart);
+    const bullet = markdown.slice(bulletStart, bulletEnd);
+
     // The distinction the bullet exists for. `activeRun` is not wrong, it answers a
     // different question, and until now nothing said which.
-    expect(markdown).toContain("That `activeRun` check is ROW-scoped");
-    expect(markdown).toContain("never whether one holds the ARTIFACT");
+    expect(bullet).toContain("never whether one holds the ARTIFACT");
 
     // The route, and the one surface that hydrates `activeRun`. Pinned together because
     // reading the route and then taking `activeRun` off a list row or a write response
     // is the failure that returns a confident "no sibling" from an ABSENT key.
-    expect(markdown).toContain("work-products/by-external-id");
-    expect(markdown).toContain("`paperclipGetIssue`");
-    expect(markdown).toContain("the key is ABSENT and absent reads as");
+    expect(bullet).toContain("work-products/by-external-id");
+    expect(bullet).toContain("`paperclipGetIssue`");
+    expect(bullet).toContain("the key is ABSENT and absent reads as");
 
     // The URL form. A bare `#` is truncated as a URL fragment, and a directive citing a
     // form that comes back empty teaches a run the lookup is broken -- the exact reason
     // PEN-5340 held this lookup back until #3310 landed.
-    expect(markdown).toContain("truncated as a URL fragment unless sent as `%23`");
+    expect(bullet).toContain("truncated as a URL fragment unless sent as `%23`");
 
     // The no-filter clause: the assertion most likely to be deleted as over-caution, because
     // `owner` reads as the precise relation and everything else reads as noise. Measured the
@@ -4090,23 +4105,23 @@ describe("unconditional pre-write re-read directive (PEN-5350 / PEN-5082 deliver
     // omits in the fail-open direction -- those rows are absent from the contention set, which
     // reads as "no sibling". The `"undetermined"` pin is here so that omission cannot come back
     // silently: it is the value an enumerated union dropped once already.
-    expect(markdown).toContain("EVERY returned row, whatever its `relation`");
-    expect(markdown).toContain("never filter to owners");
-    expect(markdown).toContain("held a NON-OWNER row");
-    expect(markdown).toContain("THREE relations, not two");
-    expect(markdown).toContain('`"undetermined"`');
+    expect(bullet).toContain("EVERY returned row, whatever its `relation`");
+    expect(bullet).toContain("never filter to owners");
+    expect(bullet).toContain("held a NON-OWNER row");
+    expect(bullet).toContain("THREE relations, not two");
+    expect(bullet).toContain('`"undetermined"`');
 
     // The completeness gate. Without it an authorization-withheld or unverifiable owner
     // list renders as an empty contention set -- the fail-open direction.
-    expect(markdown).toContain("LOWER BOUND");
-    expect(markdown).toContain("`ownerListComplete`");
-    expect(markdown).toContain("`withheldForAuthorizationCount`");
+    expect(bullet).toContain("LOWER BOUND");
+    expect(bullet).toContain("`ownerListComplete`");
+    expect(bullet).toContain("`withheldForAuthorizationCount`");
 
     // The honest bound. A reader who takes this for a lock skips the redemption, which is
     // the only step that fails closed, and the race window is where the measured
     // double-spend actually lived. Trim this and the bullet over-promises.
-    expect(markdown).toContain("DETECTOR WITH A RACE, not a lock");
-    expect(markdown).toContain("never replaces redeeming the receipt key");
+    expect(bullet).toContain("DETECTOR WITH A RACE, not a lock");
+    expect(bullet).toContain("never replaces redeeming the receipt key");
 
     // Ordering: the artifact check is an ADDITION to the row check, not a replacement.
     // Reversing them would read as licence to skip the row check.
