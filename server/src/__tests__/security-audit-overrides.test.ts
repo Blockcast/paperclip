@@ -86,6 +86,9 @@ describe("securityAuditRemediations ledger", () => {
     // "documents the advisories ..." test below, which covers PEN-1198 only.
     // So this entry's `advisories` array is UNGUARDED.
     "BLO-40607": ["proxy-addr"],
+    // scripts/hono-node-server-security-override.test.js — asserts the whole
+    // entry (patchedRange and the exact advisories array) by deepEqual.
+    "BLO-56715": ["@hono/node-server"],
     "PEN-1198": [
       // UNGUARDED: no advisories assertion anywhere in the repo.
       "@babel/core",

@@ -191,6 +191,15 @@
           "GHSA-xhq7-xmqj-769h"
         ]
       }
+    },
+    "BLO-56715": {
+      "@hono/node-server": {
+        "patchedRange": ">=1.19.18 <2",
+        "advisories": [
+          "GHSA-jpvv-r467-5p4w",
+          "GHSA-frvp-7c67-39w9"
+        ]
+      }
     }
   },
   "pnpm": {
@@ -248,7 +257,8 @@
       "@lexical/utils": "0.46.0",
       "proxy-addr": ">=2.0.8 <3",
       "zod": ">=4.6.6 <5",
-      "body-parser": ">=2.4.0 <3"
+      "body-parser": ">=2.4.0 <3",
+      "@hono/node-server": ">=1.19.18 <2"
     }
   }
 }
