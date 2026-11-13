@@ -10861,24 +10861,40 @@ export function setQueuedRunAgeMetricsRefreshSuccess(success: boolean): void {
 
 /**
  * Publish the outcome of a COMPLETED `issues.last_activity_at` drift repair
- * pass (PEN-5385).
+ * pass (PEN-5385). Returns whether it published.
  *
- * Call this only on completion. A pass that threw leaves the previous values
- * standing, which is correct: the gauges describe the last pass that actually
- * finished, and the completion timestamp is what tells a reader how old that
- * statement is. Writing partial values on failure would make a stale
- * `repaired: 0` look like a fresh all-clear.
+ * Only a pass that ran to completion may be published, and `stopped` is
+ * REQUIRED rather than defaulted so that a caller has to state which it had.
+ * The repair's loop exits both on exhausting the table and on `shouldStop()`
+ * and returns the same shape either way
+ * (`packages/db/src/issues-last-activity-drift-repair.ts`), so the caller is
+ * the only party that can tell a full pass from one cut short by lease loss.
+ * An earlier revision of this function documented that requirement in prose
+ * and left it unenforced; the single caller then published partial passes.
+ *
+ * A pass that was stopped, like a pass that threw, leaves the previous values
+ * standing -- which is correct. The gauges describe the last pass that
+ * actually finished, and the completion timestamp is what tells a reader how
+ * old that statement is. Publishing partial counts beside a fresh timestamp
+ * would make a `repaired: 0` that covered a tenth of the table read as a real
+ * all-clear: precisely the fail-open the help text on these gauges promises a
+ * reader they prevent.
  */
-export function recordIssuesLastActivityDriftRepairPass(result: {
-  repaired: number;
-  failedBatches: number;
-}): void {
+export function recordIssuesLastActivityDriftRepairPass(
+  result: {
+    repaired: number;
+    failedBatches: number;
+  },
+  options: { stopped: boolean },
+): boolean {
+  if (options.stopped) return false;
   const registry = ensureRegistry();
   registry.issuesLastActivityDriftRepairLastRepairedGauge.set(result.repaired);
   registry.issuesLastActivityDriftRepairLastFailedBatchesGauge.set(result.failedBatches);
   // Set last, so a scrape that interleaves cannot pair a fresh timestamp with
   // the previous pass's counts.
   registry.issuesLastActivityDriftRepairLastCompletionGauge.set(Date.now() / 1000);
+  return true;
 }
 
 /**

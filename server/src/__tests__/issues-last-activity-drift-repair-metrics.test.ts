@@ -76,7 +76,7 @@ describe("issues.last_activity_at drift repair pass metrics", () => {
   it("publishes a completed pass's repaired count, failed batches and completion time", async () => {
     const before = Date.now() / 1000;
     // The real 2026-11-02T09:42:47Z pass, as read from paperclip-1.
-    recordIssuesLastActivityDriftRepairPass({ repaired: 33521, failedBatches: 0 });
+    recordIssuesLastActivityDriftRepairPass({ repaired: 33521, failedBatches: 0 }, { stopped: false });
 
     expect(await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_REPAIRED_METRIC)).toBe(33521);
     expect(await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_FAILED_BATCHES_METRIC)).toBe(0);
@@ -86,10 +86,10 @@ describe("issues.last_activity_at drift repair pass metrics", () => {
   });
 
   it("lets a later pass reading 0 stand as proof the ordering column is not drifting", async () => {
-    recordIssuesLastActivityDriftRepairPass({ repaired: 33521, failedBatches: 0 });
+    recordIssuesLastActivityDriftRepairPass({ repaired: 33521, failedBatches: 0 }, { stopped: false });
     const firstAt = (await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_COMPLETION_METRIC))!;
 
-    recordIssuesLastActivityDriftRepairPass({ repaired: 0, failedBatches: 0 });
+    recordIssuesLastActivityDriftRepairPass({ repaired: 0, failedBatches: 0 }, { stopped: false });
 
     // Last-pass values, not counters: the second pass REPLACES the first.
     expect(await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_REPAIRED_METRIC)).toBe(0);
@@ -98,12 +98,46 @@ describe("issues.last_activity_at drift repair pass metrics", () => {
     ).toBeGreaterThanOrEqual(firstAt);
   });
 
+  it("does not move the gauges for a pass stopped by lease loss", async () => {
+    recordIssuesLastActivityDriftRepairPass({ repaired: 33521, failedBatches: 0 }, { stopped: false });
+    const completedAt = (await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_COMPLETION_METRIC))!;
+
+    // The repair returns its PARTIAL result normally when `shouldStop()` turns
+    // true -- same shape as a full pass -- so nothing downstream of the call
+    // can tell the two apart. Publishing this would put a tenth-of-the-table
+    // `repaired` beside a fresh completion timestamp, which is the exact
+    // reading the completion-timestamp gate exists to make impossible.
+    const published = recordIssuesLastActivityDriftRepairPass(
+      { repaired: 11, failedBatches: 0 },
+      { stopped: true },
+    );
+
+    expect(published).toBe(false);
+    // The last COMPLETED pass still stands, timestamp included: stale, and
+    // legible as stale, rather than wrong.
+    expect(await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_REPAIRED_METRIC)).toBe(33521);
+    expect(await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_COMPLETION_METRIC)).toBe(completedAt);
+  });
+
+  it("leaves the gauges at 0 when the very first pass is stopped", async () => {
+    // The follower case: no completed pass has ever run, so there is nothing
+    // to leave standing. The completion timestamp must stay at epoch, which is
+    // what keeps a `time() - <series>` staleness bound failing CLOSED.
+    expect(
+      recordIssuesLastActivityDriftRepairPass({ repaired: 9, failedBatches: 2 }, { stopped: true }),
+    ).toBe(false);
+
+    expect(await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_REPAIRED_METRIC)).toBe(0);
+    expect(await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_FAILED_BATCHES_METRIC)).toBe(0);
+    expect(await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_COMPLETION_METRIC)).toBe(0);
+  });
+
   it("keeps a partial pass's skipped batches visible beside its repaired count", async () => {
     // failedBatches > 0 means the pass completed but did not cover every issue,
     // so its repaired count is a lower bound and a 0 beside it is NOT an
     // all-clear. The two have to be readable together or that distinction is
     // lost at alert-authoring time.
-    recordIssuesLastActivityDriftRepairPass({ repaired: 0, failedBatches: 7 });
+    recordIssuesLastActivityDriftRepairPass({ repaired: 0, failedBatches: 7 }, { stopped: false });
 
     expect(await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_REPAIRED_METRIC)).toBe(0);
     expect(await gauge(ISSUES_LAST_ACTIVITY_DRIFT_REPAIR_LAST_FAILED_BATCHES_METRIC)).toBe(7);

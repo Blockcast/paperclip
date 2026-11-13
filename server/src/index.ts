@@ -3171,8 +3171,29 @@ export async function startServer(): Promise<StartedServer> {
           // — the one misreading that would send a reader hunting a repair
           // that in fact succeeded.
           logger.info(result, "issues.last_activity_at drift repair pass finished");
+          // Only a pass that ran to completion is published. The repair's loop
+          // exits BOTH on exhausting the table and on `shouldStop()`, and it
+          // returns the same shape either way -- so a pass cut short by lease
+          // loss would otherwise publish its partial counts beside a fresh
+          // completion timestamp. That is exactly the fail-open the help text
+          // on these gauges tells a reader they prevent: `repaired 0` from a
+          // pass that covered a tenth of the table, carrying a timestamp that
+          // says it finished a moment ago, is indistinguishable from a real
+          // all-clear. Leaving the previous pass's values standing is correct
+          // -- they are stale, and the completion timestamp says so.
+          //
+          // `stopped` is read here rather than at the loop's exit, so a pass
+          // that finished the table moments before the lease went away is also
+          // withheld. That race is resolved deliberately in this direction:
+          // under-publishing costs one stale timestamp, over-publishing costs
+          // the distinction the whole family is built on.
           try {
-            recordIssuesLastActivityDriftRepairPass(result);
+            if (!recordIssuesLastActivityDriftRepairPass(result, { stopped })) {
+              logger.info(
+                result,
+                "issues.last_activity_at drift repair pass stopped early; metrics not published",
+              );
+            }
           } catch (err) {
             logger.warn({ err }, "issues.last_activity_at drift repair metrics publish failed");
           }
